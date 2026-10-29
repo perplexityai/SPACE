@@ -738,6 +738,7 @@ fn build_process_start_request(
     let client_key = process_start_client_idempotency_key(headers)?;
 
     let mut operation = spaced_ops::StartRequest {
+        recovery: None,
         command,
         cwd: request
             .process

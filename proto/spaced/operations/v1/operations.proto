@@ -194,14 +194,26 @@ message GetModifiedFilesResponse {
   bool overflowed = 6;
 }
 
-// Observation of one in-memory execution service. It is not an authorization
-// token or a request fence. Adapters retain only capabilities they preserve.
-// A memory snapshot preserves this identity; bind handles to their sandbox too.
+// Discovery of one in-memory execution service, not an authorization token.
+// Recovery envelopes use both instance and activation as request fences.
+// Adapters retain only capabilities they preserve. Bind handles to their sandbox too.
 message ProcessExecutionInfo {
   // Changes when the execution service is constructed again, not on reconnect.
   string instance_id = 1;
   // Unknown names may be ignored. Absence means unsupported.
   repeated string capabilities = 2;
+  // External activation fence. Absent while recovery requests are disabled.
+  optional string activation_id = 3;
+  // Bound retries from the first attempt; records may be unavailable earlier.
+  google.protobuf.Duration idempotency_retention = 4;
+}
+
+// Legacy readers see an empty StartRequest.command and refuse before launch.
+message RecoveryStart {
+  uint32 contract_version = 1;
+  string expected_instance_id = 2;
+  string expected_activation_id = 3;
+  repeated string command = 4;
 }
 
 message StartRequest {
@@ -225,6 +237,9 @@ message StartRequest {
   // process exits, for as long as the guest retains the exit (15 minutes, or
   // less once many newer processes start).
   optional string process_id = 12;
+  // Version 1 binds the key to this request and checks both recovery fences.
+  // Mutually exclusive with command; never copy this command into that field.
+  RecoveryStart recovery = 13;
 }
 message PtySize {
   uint32 rows = 1;
@@ -321,7 +336,12 @@ message ProcessEvent {
     ProcessOutputGap output_gap = 8;
   }
 }
-message ProcessStarted { optional google.protobuf.Timestamp start_time = 1; }
+message ProcessStarted {
+  optional google.protobuf.Timestamp start_time = 1;
+  // Present for a recovery start; replay preserves both values.
+  optional string instance_id = 2;
+  optional string process_incarnation = 3;
+}
 message ProcessConnected {
   // The initial journal cursor when the request set `output_cursor`: that
   // cursor, or a later one when

@@ -494,3 +494,44 @@ async fn idempotency_store_honors_its_configured_window() {
     };
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
 }
+
+#[tokio::test]
+async fn bound_keys_refuse_conflicts_without_waiting_and_release_unstarted_claims() {
+    use crate::recovery::RequestBinding;
+    let store = IdempotencyStore::new("test");
+    let key = IdempotencyKey::parse("bound-start").unwrap();
+    let bound = RequestBinding::Recovery([1; 32]);
+    let IdempotencyLookup::Reserved(owner) = store.reserve_bound(key.clone(), bound).await.unwrap()
+    else {
+        panic!("new key")
+    };
+    for (binding, code) in [
+        (
+            RequestBinding::Recovery([2; 32]),
+            tonic::Code::InvalidArgument,
+        ),
+        (RequestBinding::Legacy, tonic::Code::FailedPrecondition),
+    ] {
+        let result = store.reserve_bound(key.clone(), binding);
+        tokio::pin!(result);
+        let std::task::Poll::Ready(Err(error)) = futures_util::poll!(result) else {
+            panic!("conflict must not wait for owner")
+        };
+        assert_eq!(error.code(), code);
+    }
+    drop(owner);
+    let IdempotencyLookup::Reserved(owner) = store.reserve_bound(key.clone(), bound).await.unwrap()
+    else {
+        panic!("cancelled reservation releases binding")
+    };
+    owner
+        .begin()
+        .unwrap()
+        .complete(Err(Status::permission_denied("launch denied")));
+    assert!(
+        matches!(store.reserve_bound(key.clone(), bound).await.unwrap(), IdempotencyLookup::Completed(Err(error)) if error.code() == tonic::Code::PermissionDenied)
+    );
+    assert!(
+        matches!(store.reserve_bound(key, RequestBinding::Recovery([2; 32])).await, Err(error) if error.code() == tonic::Code::InvalidArgument)
+    );
+}

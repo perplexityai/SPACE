@@ -2,6 +2,7 @@ use super::*;
 
 fn populated_request() -> spaced_ops::StartRequest {
     spaced_ops::StartRequest {
+        recovery: None,
         command: vec!["/bin/sh".into(), "-c".into(), "true".into()],
         cwd: Some("/workspace".into()),
         env: [("KEY".to_string(), "value".to_string())]

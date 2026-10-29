@@ -54,6 +54,7 @@ fn process_events_encode_connect_wire_shape() {
             pid: Some(7),
             event: Some(spaced_process_event::Event::Started(SpacedProcessStarted {
                 start_time: None,
+                ..Default::default()
             })),
         },
         false,

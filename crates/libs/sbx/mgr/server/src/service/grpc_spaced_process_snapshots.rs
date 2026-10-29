@@ -91,6 +91,12 @@ impl SandboxManagerService {
             .operation
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("spaced operation payload is required"))?;
+        if operation.recovery.is_some() {
+            return Err(pplx_space_common_grpc::guest_capability_unsupported_status(
+                pplx_space_common_grpc::GuestCapability::ProcessRecoveryStart,
+                "process recovery routing is unsupported",
+            ));
+        }
         if operation.command.is_empty() {
             return Err(Status::invalid_argument("command is required"));
         }

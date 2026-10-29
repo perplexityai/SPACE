@@ -39,6 +39,53 @@ pub const DEFAULT_GUEST_USER: &str = "user";
 #[error("{0}")]
 pub struct ProcessParseError(&'static str);
 
+/// Opaque identity for an execution, activation or process recovery lifetime.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(try_from = "String", into = "String"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct ProcessRecoveryToken(Uuid);
+
+impl ProcessRecoveryToken {
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+    pub fn parse(value: impl AsRef<str>) -> Result<Self, ProcessParseError> {
+        let value = Uuid::parse_str(value.as_ref())
+            .map_err(|_| ProcessParseError("invalid process recovery token"))?;
+        if value.is_nil() {
+            return Err(ProcessParseError("empty process recovery token"));
+        }
+        Ok(Self(value))
+    }
+}
+impl Default for ProcessRecoveryToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl fmt::Display for ProcessRecoveryToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl FromStr for ProcessRecoveryToken {
+    type Err = ProcessParseError;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+impl TryFrom<String> for ProcessRecoveryToken {
+    type Error = ProcessParseError;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::parse(value)
+    }
+}
+impl From<ProcessRecoveryToken> for String {
+    fn from(value: ProcessRecoveryToken) -> String {
+        value.to_string()
+    }
+}
+
 /// Identifier for a process tracked by SPACE.
 ///
 /// Generated IDs are UUIDv7 strings, but parsing also accepts bounded external

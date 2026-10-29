@@ -44,6 +44,7 @@ pub(in crate::service) fn process_event_to_spaced(
     let event_payload = match host_event {
         HostEvent::Started(started) => SpacedEvent::Started(SpacedProcessStarted {
             start_time: started.start_time,
+            ..Default::default()
         }),
         HostEvent::Connected(connected) => SpacedEvent::Connected(SpacedProcessConnected {
             output_cursor: connected.output_cursor,

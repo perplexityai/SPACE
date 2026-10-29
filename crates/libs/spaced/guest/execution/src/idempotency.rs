@@ -1,4 +1,5 @@
 use super::*;
+use crate::recovery::RequestBinding;
 use pplx_space_common_core::types::{IdempotencyKey, ProcessId};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -89,15 +90,23 @@ impl Default for IdempotencyState {
 
 #[derive(Clone)]
 pub(super) enum IdempotencyRecord {
-    ProcessStarted { process_id: ProcessId },
+    ProcessStarted {
+        process_id: ProcessId,
+    },
+    RecoveryProcessStarted {
+        process_id: ProcessId,
+        incarnation: pplx_space_common_core::types::ProcessRecoveryToken,
+    },
 }
 
 enum StoredIdempotencyRecord {
     InProgress {
+        binding: RequestBinding,
         created_at: Instant,
         notify: Arc<Notify>,
     },
     Completed {
+        binding: RequestBinding,
         result: Result<IdempotencyRecord, Status>,
         created_at: Instant,
     },
@@ -136,6 +145,14 @@ impl IdempotencyStore {
         &self,
         key: IdempotencyKey,
     ) -> Result<IdempotencyLookup, Status> {
+        self.reserve_bound(key, RequestBinding::Legacy).await
+    }
+
+    pub(super) async fn reserve_bound(
+        &self,
+        key: IdempotencyKey,
+        binding: RequestBinding,
+    ) -> Result<IdempotencyLookup, Status> {
         // Hold a slot through duplicate waiting, including every wake/recheck
         // loop. `OwnedSemaphorePermit` releases on completion, timeout, and
         // request cancellation, bounding waiters that do not consume records.
@@ -152,7 +169,12 @@ impl IdempotencyStore {
                 let now = Instant::now();
                 state.prune_if_due(now);
                 match state.records.get(&key) {
-                    Some(StoredIdempotencyRecord::Completed { result, created_at }) => {
+                    Some(StoredIdempotencyRecord::Completed {
+                        result,
+                        created_at,
+                        binding: stored,
+                    }) => {
+                        stored.require_match(binding)?;
                         if created_at.elapsed() > window {
                             state.records.insert(
                                 key,
@@ -165,7 +187,12 @@ impl IdempotencyStore {
                         }
                         return Ok(IdempotencyLookup::Completed(result.clone()));
                     }
-                    Some(StoredIdempotencyRecord::InProgress { created_at, notify }) => {
+                    Some(StoredIdempotencyRecord::InProgress {
+                        created_at,
+                        notify,
+                        binding: stored,
+                    }) => {
+                        stored.require_match(binding)?;
                         if created_at.elapsed() > IN_PROGRESS_LIMIT {
                             let notify = notify.clone();
                             notify.notify_waiters();
@@ -204,6 +231,7 @@ impl IdempotencyStore {
                         state.insert(
                             key.clone(),
                             StoredIdempotencyRecord::InProgress {
+                                binding,
                                 created_at: Instant::now(),
                                 notify: generation.clone(),
                             },
@@ -235,12 +263,15 @@ impl IdempotencyStore {
         match state.records.get(key) {
             Some(StoredIdempotencyRecord::InProgress {
                 notify: current_generation,
+                binding,
                 ..
             }) if Arc::ptr_eq(current_generation, generation) => {
+                let binding = *binding;
                 notify = Some(current_generation.clone());
                 state.records.insert(
                     key.clone(),
                     StoredIdempotencyRecord::Completed {
+                        binding,
                         result,
                         created_at: Instant::now(),
                     },
@@ -295,6 +326,7 @@ impl IdempotencyStore {
         self.state().insert(
             key,
             StoredIdempotencyRecord::Completed {
+                binding: RequestBinding::Legacy,
                 result: Ok(record),
                 created_at: Instant::now() - IDEMPOTENCY_RECORD_TTL - Duration::from_secs(1),
             },
@@ -389,6 +421,7 @@ impl IdempotencyState {
                 StoredIdempotencyRecord::InProgress {
                     created_at,
                     notify: waiter,
+                    ..
                 } if now.duration_since(*created_at) > IN_PROGRESS_LIMIT => {
                     notify.push(waiter.clone());
                     *record = StoredIdempotencyRecord::Expired {

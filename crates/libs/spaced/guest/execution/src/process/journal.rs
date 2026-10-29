@@ -695,6 +695,7 @@ pub(super) fn process_started_event(
             pplx_space_spaced_guest_protocol::proto::bridge_guest::process_event::Event::Started(
                 pplx_space_spaced_guest_protocol::proto::bridge_guest::ProcessStarted {
                     start_time: Some(start_time),
+                    ..Default::default()
                 },
             ),
         ),

@@ -221,7 +221,7 @@ The first started event identifies both the engine instance and a fresh opaque
 process incarnation. A recovery handle is the tuple:
 
 ```
-(sandbox identity, engine instance, process ID, process incarnation)
+(sandbox identity, engine instance, activation, process ID, process incarnation)
 ```
 
 The incarnation distinguishes reuse of a caller-assigned process ID after record
@@ -229,15 +229,15 @@ expiry within the same engine. Connect and control operations check the engine,
 then the selected record's incarnation, before replay or effects. A different
 incarnation returns `FailedPrecondition` with a distinct reason; a missing record
 remains `NotFound`. Tokens identify state; they are not authorization credentials.
-Memory snapshots preserve both tokens and their records, so the sandbox identity
+Memory snapshots preserve these tokens and their records, so the sandbox identity
 remains part of the caller's handle. It is not sufficient for rollback into the
 same sandbox: restoring an earlier image also rewinds keys and mutation receipts.
 
 Before recovery requests are admitted after a memory restore, the supervisor
-must install a fresh activation epoch from outside the snapshot. The effective
-engine instance incorporates that epoch; repeated notification of the same
-activation is idempotent. The routing path gates recovery traffic until this
-handshake completes. A native host supporting memory restore must supply the
+must install a fresh activation epoch from outside the snapshot. Recovery
+requests carry both the in-memory instance ID and that activation epoch;
+repeated notification of the same activation is idempotent. The routing path
+gates recovery traffic until this handshake completes. A native host supporting memory restore must supply the
 same lifecycle boundary. Discovery's current in-memory ID alone does not provide
 this guarantee. Conservatively invalidate recovery handles on every memory
 restore, including suspend/restore; resident pause/resume keeps the instance.
@@ -314,8 +314,11 @@ receiving that result, but cannot infer rollback or claim exactly-once execution
 ### Rollout and capability handling
 
 Ship contracts in dependency order: discovery, recovery Start with key binding,
-fenced reconnect/control handles, then mutation receipts. Each implementation
-includes every affected public adapter and only then advertises its capability.
+fenced reconnect/control handles, then mutation receipts. A path advertises its
+capability only after its affected adapters and lifecycle boundary implement
+the contract. The native Start foundation may ship first;
+the daemon routing path filters its capability until the external activation
+handshake and forwarding are implemented.
 A client must discover support before selecting the recovery encoding; absent
 or filtered capabilities select the existing path only for new work. Never
 translate an uncertain recovery retry into a legacy request.
