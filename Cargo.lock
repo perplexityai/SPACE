@@ -5719,6 +5719,7 @@ dependencies = [
  "pplx-space-node-api-client",
  "pplx-space-public-api",
  "pplx-space-sbx-mgr-client",
+ "pplx-space-spaced-guest-protocol",
  "pplx-space-test-env",
  "prost",
  "prost-types",

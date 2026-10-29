@@ -15,13 +15,13 @@ guest daemon or an embedding application.
 | --- | --- |
 | Configurable exit, output and completed-start retention | [Separate retention implementation](https://github.com/perplexityai/SPACE/pull/888). |
 | Counted output gaps with opt-in replay | [Gap-recovery implementation](https://github.com/perplexityai/SPACE/pull/889). |
-| Bind a start key to the request it identifies | Proposed opt-in recovery start; equality and compatibility are specified below. |
-| Reject stale engine and process handles | Proposed recovery handle, using discovery before the first start. |
-| Deduplicate process input, stdin closure and signals | Proposed ordered, bounded mutation receipts below. |
-| Capability discovery and end-to-end forwarding | Initial readiness/status discovery is described below. Operation enforcement and complete external API exposure remain proposed. |
+| Bind a start key to the request it identifies | [Bound recovery starts](https://github.com/perplexityai/SPACE/pull/966). |
+| Reject stale engine and process handles | [Fenced handles](https://github.com/perplexityai/SPACE/pull/967), using discovery before the first start. |
+| Deduplicate process input, stdin closure and signals | [Ordered mutation receipts](https://github.com/perplexityai/SPACE/pull/968). |
+| Capability discovery and end-to-end forwarding | [Routed enforcement](https://github.com/perplexityai/SPACE/pull/969) and the [public command transport](../../process-recovery.md). |
 
-The first two changes do not provide the remaining guarantees. Field names for
-later changes are provisional; do not reserve wire numbers until implementation.
+Retention and gaps are independently useful. The opt-in operations additionally
+require the discovery, enforcement, routing and lifecycle changes below.
 The [operation schema](../../../proto/spaced/operations/v1/operations.proto) is
 the source of truth for existing field numbers and types.
 
@@ -204,9 +204,8 @@ The identity belongs to the in-memory execution state. Cloning a service handle
 or reconnecting does not change it; constructing a replacement does. A memory
 snapshot preserves the state and identity, including when cloned to a different
 sandbox. Handles therefore include the sandbox identity as well as the instance.
-This addition advertises only implemented capabilities, initially output-gap
-recovery. It does not yet implement fencing, bound starts or mutation receipts.
-Those operations must separately enforce their expectations before effects;
+Discovery advertises only capabilities enforced by the complete request path.
+The operations separately enforce their expectations before effects;
 discovery followed by an unchecked mutation would still have a restart race.
 
 ### Fence engine and process lifetimes

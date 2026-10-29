@@ -4,6 +4,7 @@
 
 - [Using the API](using-api.md)
   - [Your first sandbox](first-sandbox.md)
+  - [Recovering process clients](process-recovery.md)
   - [Native template startup](native-template-runtime.md)
   - [E2B Compatibility Wrapper](ecw.md)
   - [Full network policies through ECW](ecw-network-policy.md)

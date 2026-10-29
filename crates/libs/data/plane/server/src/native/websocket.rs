@@ -27,10 +27,12 @@ pub(crate) async fn attach_session(
     // HTTP connection finishes when the socket is handed off, and the drain
     // must not see zero tasks in between.
     let task = state.upgrade_tasks.token();
-    Ok(upgrade.on_upgrade(move |socket| async move {
-        let _task = task;
-        handle_socket(state, peer.ip(), session_id, header_token, socket).await;
-    }))
+    Ok(upgrade
+        .protocols([pplx_space_public_api::recovery::RECOVERY_WEBSOCKET_PROTOCOL])
+        .on_upgrade(move |socket| async move {
+            let _task = task;
+            handle_socket(state, peer.ip(), session_id, header_token, socket).await;
+        }))
 }
 
 pub(crate) async fn handle_socket(
@@ -81,20 +83,37 @@ pub(crate) async fn handle_socket(
         send_restart_close(&mut socket, DRAINING_CLOSE_REASON).await;
         return;
     };
-    let native_session_permit = match state.native_sessions.try_acquire(session_id, attached.kind) {
-        Ok(permit) => permit,
-        Err(()) => {
-            pplx_space_metrics::data_plane::attach(
-                session_id.kind().as_str(),
-                "session_already_attached",
-            );
-            let _ = socket
-                .send(Message::Text(
-                    error_json(DataPlaneErrorCode::SessionAlreadyAttached).into(),
-                ))
-                .await;
-            let _ = socket.close().await;
-            return;
+    let recovery_session = recovery::is_recovery_session(&attached);
+    let recovery_protocol = socket.protocol().is_some_and(|protocol| {
+        protocol == pplx_space_public_api::recovery::RECOVERY_WEBSOCKET_PROTOCOL
+    });
+    if recovery_session != recovery_protocol {
+        pplx_space_metrics::data_plane::attach(
+            session_id.kind().as_str(),
+            "unsupported_session_kind",
+        );
+        state.revocation_cache.forget(session_id);
+        close_with_error(socket, DataPlaneErrorCode::UnsupportedSessionKind, false).await;
+        return;
+    }
+    let native_session_permit = if recovery_session {
+        None
+    } else {
+        match state.native_sessions.try_acquire(session_id, attached.kind) {
+            Ok(permit) => Some(permit),
+            Err(()) => {
+                pplx_space_metrics::data_plane::attach(
+                    session_id.kind().as_str(),
+                    "session_already_attached",
+                );
+                let _ = socket
+                    .send(Message::Text(
+                        error_json(DataPlaneErrorCode::SessionAlreadyAttached).into(),
+                    ))
+                    .await;
+                let _ = socket.close().await;
+                return;
+            }
         }
     };
     let stream_permit = match state.attached_streams.try_acquire_attached(&attached) {
@@ -199,6 +218,10 @@ pub(crate) async fn bridge_attached_session(
     attached: AttachedSession,
     socket: WebSocket,
 ) {
+    if recovery::is_recovery_session(&attached) {
+        recovery::bridge(state, attached, socket).await;
+        return;
+    }
     match attached.kind {
         SessionKind::Terminal | SessionKind::Process => {
             let kind = attached.kind.as_str();

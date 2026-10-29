@@ -2062,7 +2062,18 @@ async fn attach_native_websocket(
     endpoint: &str,
     session_id: DataPlaneSessionId,
 ) -> tokio::net::TcpStream {
+    attach_native_websocket_with_protocol(endpoint, session_id, None).await
+}
+
+async fn attach_native_websocket_with_protocol(
+    endpoint: &str,
+    session_id: DataPlaneSessionId,
+    protocol: Option<&str>,
+) -> tokio::net::TcpStream {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let protocol = protocol
+        .map(|protocol| format!("Sec-WebSocket-Protocol: {protocol}\r\n"))
+        .unwrap_or_default();
     let mut state = crate::tests::test_data_plane_state().await;
     state.cluster_api = ClusterApiClients::service_only(
         pplx_space_node_api_client::cluster::connect(endpoint.to_string(), "test")
@@ -2089,7 +2100,7 @@ async fn attach_native_websocket(
              Connection: Upgrade\r\n\
              Upgrade: websocket\r\n\
              Sec-WebSocket-Version: 13\r\n\
-             Sec-WebSocket-Key: {}\r\n\r\n",
+             Sec-WebSocket-Key: {}\r\n{protocol}\r\n",
             "c".repeat(64),
             BASE64_STANDARD.encode(b"native-test-nonc"),
         )
@@ -3754,4 +3765,91 @@ fn a_route_refusal_marked_at_rest_is_not_a_route_that_is_coming() {
         route_resolution_error(&other),
         RouteResolutionError::ResolutionFailed
     );
+}
+
+#[tokio::test]
+async fn recovery_protocol_must_match_the_session_and_ping_does_not_dispatch() {
+    use pplx_space_public_api::recovery::RECOVERY_WEBSOCKET_PROTOCOL;
+    use prost::Message as _;
+    use std::sync::atomic::AtomicUsize;
+    use tokio::io::AsyncWriteExt;
+    if !binding_fake_test_process() {
+        return;
+    }
+    for (recovery, protocol) in [
+        (true, None),
+        (false, Some(RECOVERY_WEBSOCKET_PROTOCOL)),
+        (true, Some(RECOVERY_WEBSOCKET_PROTOCOL)),
+    ] {
+        let session = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let mut route = crate::tests::route_response_with_token(session, None);
+        route.backend.as_mut().unwrap().endpoint = endpoint.clone();
+        route.adapter_state_json = if recovery {
+            serde_json::json!({"command": [], "recovery": {
+                "contract_version": 1,
+                "expected_instance_id": uuid::Uuid::now_v7(),
+                "expected_activation_id": uuid::Uuid::now_v7(),
+                "command": ["true"]
+            }})
+            .to_string()
+        } else {
+            r#"{"command":["true"]}"#.to_owned()
+        };
+        let route = route.encode_to_vec();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let dispatched = calls.clone();
+        let backend = axum::Router::new().fallback(move |request: Request<Body>| {
+            let route = route.clone();
+            let dispatched = dispatched.clone();
+            async move {
+                let path = request.uri().path();
+                if path.ends_with("/Check") {
+                    return crate::tests::grpc_test_response(vec![8, 1]);
+                }
+                if path.ends_with("/ResolveDataPlaneSessionRoute") {
+                    return crate::tests::grpc_test_response(route);
+                }
+                assert!(
+                    path.ends_with("/SpacedStartProcess"),
+                    "unexpected call {path}"
+                );
+                dispatched.fetch_add(1, Ordering::SeqCst);
+                tonic::Status::not_found("synthetic process refusal").into_http::<Body>()
+            }
+        });
+        let server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            axum::serve(listener, backend).await.unwrap();
+        }));
+        let mut socket = attach_native_websocket_with_protocol(&endpoint, session, protocol).await;
+        let (_, frame) = crate::tests::read_server_frame(&mut socket).await;
+        let frame: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+        if !recovery || protocol.is_none() {
+            assert_eq!(frame["code"], "unsupported_session_kind");
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        } else {
+            assert_eq!(frame["type"], "attached");
+            // Masked empty Ping, then the first application request.
+            socket.write_all(&[0x89, 0x80, 0, 0, 0, 0]).await.unwrap();
+            send_websocket_text(&mut socket, r#"{"type":"recovery_start"}"#).await;
+            let frame = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let (opcode, payload) = crate::tests::read_server_frame(&mut socket).await;
+                    if opcode == 0xA {
+                        continue;
+                    }
+                    assert_eq!(opcode, 1);
+                    break serde_json::from_slice::<serde_json::Value>(&payload).unwrap();
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(frame["type"], "recovery_error");
+            assert_eq!(frame["code"], 5);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+        drop(socket);
+        drop(server);
+    }
 }

@@ -11,6 +11,7 @@ fn process_request_with_cwd(cwd: &str) -> CreateProcessRequest {
 
 fn process_request(cwd: Option<String>, user: Option<String>) -> CreateProcessRequest {
     CreateProcessRequest {
+        recovery: None,
         command: vec!["echo".to_string()],
         cwd,
         env: Default::default(),
@@ -203,8 +204,9 @@ mod not_running {
         Ok(sandbox_id)
     }
 
-    /// The two routes that start a process: commands and process sessions.
-    const PROCESS_ROUTES: [&str; 2] = ["commands", "process-sessions"];
+    const LEGACY_PROCESS_ROUTES: [&str; 2] = ["commands", "process-sessions"];
+    /// Every route that creates a session for a process start.
+    const PROCESS_ROUTES: [&str; 3] = ["commands", "process-sessions", "recovery-commands"];
 
     async fn command(
         fixture: &Fixture,
@@ -229,6 +231,16 @@ mod not_running {
         key: &str,
         body: Value,
     ) -> TestDbResult<(StatusCode, Option<String>, Value)> {
+        let body = if route == "recovery-commands" {
+            json!({
+                "contract_version": 1,
+                "expected_instance_id": "01900000-0000-7000-8000-000000000001",
+                "expected_activation_id": "01900000-0000-7000-8000-000000000002",
+                "process": body,
+            })
+        } else {
+            body
+        };
         let request = Request::builder()
             .method(Method::POST)
             .uri(format!("/v1/sandboxes/{sandbox_id}/{route}"))
@@ -312,11 +324,50 @@ mod not_running {
             ("restoring", &[]),
         ] {
             let sandbox_id = sandbox(&fixture, lifecycle, wake_on).await?;
-            for route in PROCESS_ROUTES {
+            for route in LEGACY_PROCESS_ROUTES {
                 let (status, _, body) = command(&fixture, sandbox_id, route).await?;
                 assert_eq!(status, StatusCode::CREATED, "{route} {lifecycle}: {body}");
             }
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recovery_creation_never_queues_a_wake_and_legacy_sessions_reject_envelopes()
+    -> TestDbResult<()> {
+        let fixture = fixture().await?;
+        for lifecycle in ["starting", "paused", "suspended", "restoring"] {
+            let id = sandbox(&fixture, lifecycle, &["command", "access"]).await?;
+            let (status, _, _) = command(&fixture, id, "recovery-commands").await?;
+            assert_eq!(status, StatusCode::CONFLICT, "{lifecycle}");
+            assert!(wakes(&fixture, id).await?.is_empty());
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri(format!("/v1/sandboxes/{id}/process-execution"))
+                .header("authorization", format!("Bearer {KEY}"))
+                .body(Body::empty())?;
+            let response = fixture.app.clone().oneshot(request).await?;
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+        let id = sandbox(&fixture, "started", &[]).await?;
+        let (status, _, _) = send(
+            &fixture,
+            id,
+            "process-sessions",
+            "wrong-route",
+            json!({"command": [], "recovery": {
+                "contract_version": 1,
+                "expected_instance_id": Uuid::now_v7(),
+                "expected_activation_id": Uuid::now_v7(),
+                "command": ["true"]
+            }}),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let sessions: i64 = sqlx::query_scalar(sql!("SELECT count(*) FROM data_plane_sessions"))
+            .fetch_one(&fixture.db.pool)
+            .await?;
+        assert_eq!(sessions, 0);
         Ok(())
     }
 
@@ -353,7 +404,7 @@ mod not_running {
         let fixture = fixture().await?;
         let sandbox_id = sandbox(&fixture, "suspended", &["access"]).await?;
         let answers = futures_util::future::try_join_all((0..20).map(|index| {
-            let route = PROCESS_ROUTES[index % PROCESS_ROUTES.len()];
+            let route = LEGACY_PROCESS_ROUTES[index % LEGACY_PROCESS_ROUTES.len()];
             command(&fixture, sandbox_id, route)
         }))
         .await?;
@@ -821,10 +872,10 @@ mod not_running {
             let (status, _, replayed) =
                 send(&fixture, sandbox_id, route, &key, body.clone()).await?;
             assert_eq!(status, StatusCode::CREATED, "{route} replay: {replayed}");
-            let id = if route == "commands" {
-                "session_id"
-            } else {
+            let id = if route == "process-sessions" {
                 "id"
+            } else {
+                "session_id"
             };
             assert!(created[id].is_string(), "{route}: {created}");
             assert_eq!(replayed[id], created[id], "{route}");
@@ -846,4 +897,38 @@ mod not_running {
         }
         Ok(())
     }
+}
+
+#[test]
+fn recovery_commands_are_fenced_and_cannot_be_lowered_to_legacy() {
+    let mut request = process_request(None, None);
+    request.recovery = Some(pplx_space_public_api::recovery::RecoveryStart {
+        contract_version: 1,
+        expected_instance_id: uuid::Uuid::now_v7().to_string(),
+        expected_activation_id: uuid::Uuid::now_v7().to_string(),
+        command: vec!["true".to_string()],
+    });
+    assert!(
+        validate_process_request(&request).is_err(),
+        "both argv locations are invalid"
+    );
+    request.command.clear();
+    validate_process_request(&request).expect("explicit recovery command");
+    let original = request.recovery.clone().unwrap();
+    for change in 0..4 {
+        let recovery = request.recovery.as_mut().unwrap();
+        *recovery = original.clone();
+        match change {
+            0 => recovery.contract_version = 2,
+            1 => recovery.expected_instance_id = uuid::Uuid::nil().to_string(),
+            2 => recovery.expected_activation_id.clear(),
+            _ => recovery.command.clear(),
+        }
+        assert!(validate_process_request(&request).is_err());
+    }
+    request.recovery = None;
+    assert!(
+        validate_process_request(&request).is_err(),
+        "an older reader sees empty argv"
+    );
 }

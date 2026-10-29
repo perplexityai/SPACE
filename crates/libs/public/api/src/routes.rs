@@ -216,6 +216,8 @@ native_operations! {
     CLOSE_PORT = NativeOperation::new("/v1/sandboxes/{sandbox_id}/ports/{port}/close", Post, "closePort", Incubating);
     OPEN_PORT = NativeOperation::new("/v1/sandboxes/{sandbox_id}/ports/{port}/open", Post, "openPort", Incubating);
     CREATE_PROCESS_SESSION = NativeOperation::new("/v1/sandboxes/{sandbox_id}/process-sessions", Post, "createProcessSession", Incubating);
+    CREATE_RECOVERY_COMMAND = NativeOperation::new("/v1/sandboxes/{sandbox_id}/recovery-commands", Post, "createRecoveryCommand", Incubating);
+    GET_PROCESS_EXECUTION = NativeOperation::new("/v1/sandboxes/{sandbox_id}/process-execution", Get, "getProcessExecution", Incubating);
     LIST_PROCESSES = NativeOperation::new("/v1/sandboxes/{sandbox_id}/processes", Get, "listProcesses", M1Supported);
     GET_PROCESS = NativeOperation::new("/v1/sandboxes/{sandbox_id}/processes/{process_id}", Get, "getProcess", M1Supported);
     KILL_PROCESS = NativeOperation::with_runtime_path("/v1/sandboxes/{sandbox_id}/processes/{process_id}:kill", PROCESS_ACTION_RUNTIME_PATH, Post, "killProcess", M1Supported);

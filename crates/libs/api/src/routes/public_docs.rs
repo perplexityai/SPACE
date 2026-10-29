@@ -274,9 +274,13 @@ fn public_openapi_value() -> Value {
             "/sessions/{session_id}/attach": {
                 "get": {
                     "summary": "Attach to a terminal, process, or file-watch session over WebSocket",
-                    "description": "Send the scoped data-plane token using `Sec-WebSocket-Protocol` or a first `attach` frame. Query-string tokens are rejected. Native terminal and process sessions permit one attached interactive writer per session; accepted stdin frames are acknowledged with `input_accepted`, while `signal`, `close_stdin`, and `heartbeat` frames are acknowledged with `control_accepted`. The `close` frame closes the stream only. A process the sandbox cannot run because it is not running and may not be woken ends with a non-retryable `error` frame, code `backend_stream_error`, whose `details` match createCommand's `sandbox_not_running` conflict; SSE answers the same refusal as a 409 `conflict`, so branch on `details` `reason`. A `session_not_ready` frame is retryable: something is about to give the sandbox a node. When nothing is, the attach ends with that same non-retryable `backend_stream_error` frame.",
+                    "description": "Send the scoped data-plane token using `Sec-WebSocket-Protocol` or a first `attach` frame. Query-string tokens are rejected. Legacy terminal and process sessions permit one attached interactive writer per session; accepted stdin frames are acknowledged with `input_accepted`, while `signal`, `close_stdin`, and `heartbeat` frames are acknowledged with `control_accepted`. The `close` frame closes the stream only. A process the sandbox cannot run because it is not running and may not be woken ends with a non-retryable `error` frame, code `backend_stream_error`, whose `details` match createCommand's `sandbox_not_running` conflict; SSE answers the same refusal as a 409 `conflict`, so branch on `details` `reason`. A `session_not_ready` frame is retryable: something is about to give the sandbox a node. When nothing is, the attach ends with that same non-retryable `backend_stream_error` frame.",
                     "responses": {
-                        "101": { "description": "WebSocket stream using DataPlaneClientFrame and DataPlaneServerFrame" },
+                        "101": {
+                            "description": "Legacy sessions use DataPlaneClientFrame and DataPlaneServerFrame. Recovery command sessions authenticate in the same way, then carry one explicit RecoveryClientFrame request per socket. Responses are RecoveryServerFrame values; EOF without recovery_complete or recovery_error is uncertain.",
+                            "x-space-recovery-request-schema": {"$ref": "#/components/schemas/RecoveryClientFrame"},
+                            "x-space-recovery-response-schema": {"$ref": "#/components/schemas/RecoveryServerFrame"}
+                        },
                         "401": { "description": "Invalid or expired data-plane token" },
                         "409": { "description": "Native interactive session is already attached" }
                     }

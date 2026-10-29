@@ -34,6 +34,7 @@ fn a_process_request_without_a_user_serializes_to_its_pre_user_shape() {
     // the fingerprint of an unchanged request, so a retry spanning the
     // deploy would conflict rather than replay.
     let request = CreateProcessRequest {
+        recovery: None,
         command: vec!["true".to_string()],
         cwd: None,
         env: Default::default(),
@@ -46,6 +47,7 @@ fn a_process_request_without_a_user_serializes_to_its_pre_user_shape() {
     let value = serde_json::to_value(&request).expect("request should serialize");
 
     assert_eq!(value.get("user"), None);
+    assert_eq!(value.get("recovery"), None);
     assert_eq!(
         serde_json::from_value::<CreateProcessRequest>(value).expect("round trip"),
         request
@@ -56,6 +58,7 @@ fn a_process_request_without_a_user_serializes_to_its_pre_user_shape() {
 #[test]
 fn a_process_request_with_a_user_carries_it() {
     let request = CreateProcessRequest {
+        recovery: None,
         command: vec!["true".to_string()],
         cwd: None,
         env: Default::default(),

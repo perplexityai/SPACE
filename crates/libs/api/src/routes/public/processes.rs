@@ -51,6 +51,68 @@ impl FromStr for ProcessAction {
     }
 }
 
+pub async fn get_process_execution(
+    State(state): State<AppState>,
+    Extension(AuthOrg(org)): Extension<AuthOrg>,
+    authorized: Option<Extension<AuthorizedSandbox>>,
+    Path(sandbox_id): Path<String>,
+) -> Result<Json<pplx_space_public_api::recovery::ProcessExecution>, PublicApiError> {
+    let sandbox = ensure_sandbox_owner(authorized, &state, org.id, &sandbox_id).await?;
+    if sandbox
+        .lifecycle
+        .parse::<pplx_space_common_core::types::SandboxLifecycle>()
+        .map_err(|_| PublicApiError::internal())?
+        != pplx_space_common_core::types::SandboxLifecycle::Started
+    {
+        return Err(PublicApiError::service_unavailable(
+            "sandbox is not ready for process discovery",
+        ));
+    }
+    let ready = state
+        .sandbox_controller
+        .spaced_wait_ready(
+            &state.pool,
+            &sandbox,
+            SandboxApiMetricIdentity::native("process_execution"),
+            sandbox.id,
+            None,
+        )
+        .await
+        .map_err(process_discovery_error)?;
+    let info = ready.process_execution.ok_or_else(|| {
+        PublicApiError::failed_precondition("process recovery discovery is unavailable")
+    })?;
+    let retention = info
+        .idempotency_retention
+        .and_then(|duration| std::time::Duration::try_from(duration).ok())
+        .ok_or_else(|| {
+            PublicApiError::failed_precondition("process recovery retention is unavailable")
+        })?;
+    Ok(Json(pplx_space_public_api::recovery::ProcessExecution {
+        instance_id: info.instance_id,
+        activation_id: info.activation_id,
+        capabilities: info
+            .capabilities
+            .into_iter()
+            .filter_map(|value| {
+                use pplx_space_common_grpc::GuestCapability;
+                let capability = value.parse::<GuestCapability>().ok()?;
+                match capability {
+                    GuestCapability::InteractiveProcessControl
+                    | GuestCapability::ProcessOutputGapResume
+                    | GuestCapability::ProcessRecoveryStart
+                    | GuestCapability::ProcessRecoveryHandles
+                    | GuestCapability::ProcessMutationReceipts => {
+                        Some(capability.as_str().to_owned())
+                    }
+                }
+            })
+            .collect(),
+        idempotency_retention_ms: u64::try_from(retention.as_millis())
+            .map_err(|_| PublicApiError::internal())?,
+    }))
+}
+
 pub async fn list_processes(
     State(state): State<AppState>,
     Extension(AuthOrg(org)): Extension<AuthOrg>,
@@ -256,6 +318,14 @@ async fn ensure_sandbox_owner(
 ) -> Result<Sandbox, PublicApiError> {
     let sandbox_id = parse_public_sandbox_id(sandbox_id)?;
     authorized_sandbox(authorized, &state.pool, org_id, sandbox_id).await
+}
+
+fn process_discovery_error(error: ControllerError) -> PublicApiError {
+    if error.is_sandbox_not_running() {
+        PublicApiError::service_unavailable("sandbox is not ready for process discovery")
+    } else {
+        controller_error(error)
+    }
 }
 
 pub(in crate::routes::public) fn controller_error(error: ControllerError) -> PublicApiError {

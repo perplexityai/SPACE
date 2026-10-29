@@ -8,6 +8,7 @@ use pplx_space_metrics::data_plane::{
 mod auth;
 mod protocol;
 mod proxy;
+mod recovery;
 mod sse;
 mod streams;
 mod websocket;
