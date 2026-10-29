@@ -2209,3 +2209,168 @@ async fn graceful_drain_waits_for_an_admitted_start_without_killing_it() {
     draining.await.expect("complete drain");
     assert!(!service.inner.shutdown.is_cancelled());
 }
+
+#[tokio::test]
+async fn completed_process_replay_follows_configured_retention() {
+    use pplx_space_spaced_guest_protocol::proto::bridge_guest::process_event::Event;
+    use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
+        ConnectProcessRequest, process_exit,
+    };
+
+    let retention = Duration::from_secs(600);
+    let output_retention = Duration::from_secs(120);
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::current())
+        .expect("current user lookup")
+        .expect("process tests require a passwd entry for the current uid");
+    let service = ExecutionService::with_config(
+        CancellationToken::new(),
+        ExecutionServiceConfig {
+            default_operation_user: GuestUserName::parse(user.name).expect("valid current user"),
+            filesystem_execution: FilesystemExecutionMode::Direct,
+            identity_policy: IdentityPolicy::Guest,
+            process_retention: ProcessRetention {
+                completed: retention,
+                output: output_retention,
+                idempotency: retention * 3,
+            },
+            ..ExecutionServiceConfig::default()
+        },
+    )
+    .expect("direct execution service");
+    let request = StartRequest {
+        command: vec!["/bin/sh".into(), "-c".into(), "printf done; exit 3".into()],
+        idempotency_key: Some("long-retention".into()),
+        ..Default::default()
+    };
+    let mut events = Process::start(&service, Request::new(request.clone()))
+        .await
+        .expect("process starts")
+        .into_inner();
+    let started = events.next().await.unwrap().unwrap();
+    assert!(matches!(started.event, Some(Event::Started(_))));
+    let process_id = ProcessId::parse(started.process_id).unwrap();
+    while let Some(event) = events.next().await {
+        event.expect("process stream remains successful");
+    }
+    let registry = &service.inner.processes;
+    let backdate = |by: Duration| {
+        for entry in registry.records.iter() {
+            entry
+                .record()
+                .expect("published")
+                .journal
+                .backdate_completion(by);
+        }
+    };
+
+    backdate(IDEMPOTENCY_RECORD_TTL + Duration::from_secs(1));
+    registry.remove_expired();
+    let mut replay = Process::connect_process(
+        &service,
+        Request::new(ConnectProcessRequest {
+            process_id: process_id.as_str().to_string(),
+            output_cursor: Some(0),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("a record inside its retention replays")
+    .into_inner();
+    let mut stdout = Vec::new();
+    let mut exit_code = None;
+    while let Some(event) = replay.next().await {
+        match event.expect("replay remains successful").event {
+            Some(Event::Stdout(output)) => stdout.extend(output.data),
+            Some(Event::Exit(exit)) => {
+                exit_code = match exit.outcome {
+                    Some(process_exit::Outcome::Exited(exited)) => Some(exited.exit_code),
+                    other => panic!("unexpected exit outcome: {other:?}"),
+                };
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(stdout, b"done");
+    assert_eq!(exit_code, Some(3));
+
+    // Output expires independently; a cursorless reconnect still sees the exit.
+    backdate(output_retention);
+    registry.remove_expired();
+    let mut replay = Process::connect_process(
+        &service,
+        Request::new(ConnectProcessRequest {
+            process_id: process_id.as_str().to_string(),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("exit outlives output")
+    .into_inner();
+    let mut exited = false;
+    while let Some(event) = replay.next().await {
+        match event.expect("retained exit").event {
+            Some(Event::Stdout(_) | Event::Stderr(_)) => panic!("expired output was retained"),
+            Some(Event::Exit(exit)) => {
+                assert!(
+                    matches!(exit.outcome, Some(process_exit::Outcome::Exited(exited)) if exited.exit_code == 3)
+                );
+                exited = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(exited);
+    let record = registry
+        .get_record(&process_id)
+        .expect("exit still retained");
+    assert!(record.journal.state.lock().unwrap().output.is_empty());
+    drop(record);
+
+    // A key keeps the original identity, not a second copy of its output.
+    let mut retry = Process::start(&service, Request::new(request.clone()))
+        .await
+        .expect("the key still identifies the completed process")
+        .into_inner();
+    let started = retry.next().await.unwrap().unwrap();
+    assert_eq!(started.process_id, process_id.as_str());
+    assert!(matches!(started.event, Some(Event::Started(_))));
+    let error = retry.next().await.unwrap().unwrap_err();
+    assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    assert!(
+        error
+            .metadata()
+            .get(pplx_space_common_core::spaced::PROCESS_OUTPUT_FIRST_SEQUENCE_METADATA_KEY)
+            .is_some()
+    );
+    assert!(retry.next().await.is_none());
+    drop(retry);
+
+    backdate(retention);
+    registry.remove_expired();
+    assert_eq!(registry.records.len(), 0);
+    let error = match Process::connect_process(
+        &service,
+        Request::new(ConnectProcessRequest {
+            process_id: process_id.as_str().to_string(),
+            output_cursor: Some(0),
+            ..Default::default()
+        }),
+    )
+    .await
+    {
+        Ok(_) => panic!("an expired record must not replay"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), tonic::Code::NotFound);
+    let error = match Process::start(&service, Request::new(request)).await {
+        Ok(_) => panic!("a live key must not rerun a process whose record expired"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(error.message(), "process replay state expired");
+    assert!(
+        registry.records.is_empty(),
+        "the retry must not spawn a new process"
+    );
+    shut_down(&service).await;
+}

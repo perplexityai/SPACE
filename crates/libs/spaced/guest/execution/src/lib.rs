@@ -30,6 +30,9 @@ type GuestFileInfoStream =
 type GuestFileChunkStream =
     std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<FileChunk, Status>> + Send>>;
 const IDEMPOTENCY_RECORD_TTL: Duration = Duration::from_secs(60);
+// A window this long is an operator error, and bounding it keeps every
+// `Instant + window` representable.
+const MAX_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const MAX_PROCESS_TAG_BYTES: usize = 4 * 1024;
 
 mod execution;
@@ -45,7 +48,9 @@ mod payload;
 mod placement;
 mod process;
 mod worker_executable;
-pub use execution::{CreateExecutionServiceError, ExecutionService, ExecutionServiceConfig};
+pub use execution::{
+    CreateExecutionServiceError, ExecutionService, ExecutionServiceConfig, ProcessRetention,
+};
 use idempotency::IdempotencyStore;
 pub use identity_policy::IdentityPolicy;
 pub use placement::ExecutionCgroups;
