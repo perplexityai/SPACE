@@ -43,6 +43,7 @@ from space_smoke.capabilities import (
     SandboxInfo,
     SandboxPages,
     StoppableLifecycleSandbox,
+    StoppedReplacementControl,
     WarmPoolCandidate,
 )
 from space_smoke.config import SandboxConfig
@@ -463,6 +464,9 @@ class SmokeServices:
             ),
             _encrypted_resuspend_control=(
                 cast(EncryptedResuspendControl, kind) if kind is not None else None
+            ),
+            _stopped_replacement_control=(
+                cast(StoppedReplacementControl, kind) if kind is not None else None
             ),
             _processes=cast(ProcessSandbox, sandboxes[0]),
         )

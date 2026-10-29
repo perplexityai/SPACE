@@ -87,3 +87,78 @@ fn deferred_capture_is_on_unless_a_deployment_opts_out() {
     assert!(retain_send_sources_from(None));
     assert!(!retain_send_sources_from(Some("false")));
 }
+
+/// A restore that writes its own rootfs asks node-manager for an empty
+/// `instance/` subvolume, and reads back what is there: a subvolume, a plain
+/// directory node-manager kept, or nothing on a node-manager that predates the
+/// RPC, where the caller may fall back to the plain directory it always made. Any other refusal is an error the restore fails on, not a silent
+/// fallback to a directory nothing can snapshot later.
+#[tokio::test(flavor = "current_thread")]
+async fn a_sandbox_instance_is_created_as_a_subvolume_or_reported_unsupported() {
+    use pplx_space_node_mgr_client::proto::{
+        BtrfsCreateSandboxInstanceRequest, BtrfsCreateSandboxInstanceResponse,
+    };
+    let target =
+        || InstanceTarget::RestoreScope(pplx_space_common_core::types::TransferScopeId::new());
+
+    let created = crate::node_manager_transport::fake::FakeNodeManager::default()
+        .unary(
+            "BtrfsCreateSandboxInstance",
+            |request: BtrfsCreateSandboxInstanceRequest| {
+                assert_eq!(request.sandbox_id, "sbx");
+                assert!(request.target.is_some(), "the target must be sent");
+                Ok(BtrfsCreateSandboxInstanceResponse { subvolume: true })
+            },
+        )
+        .serve();
+    assert_eq!(
+        create_sandbox_instance("sbx", target(), &created.connector())
+            .await
+            .unwrap(),
+        PreparedInstance::Subvolume
+    );
+    assert_eq!(
+        created.calls(),
+        vec!["BtrfsCreateSandboxInstance".to_owned()]
+    );
+
+    let kept = crate::node_manager_transport::fake::FakeNodeManager::default()
+        .unary(
+            "BtrfsCreateSandboxInstance",
+            |_: BtrfsCreateSandboxInstanceRequest| {
+                Ok(BtrfsCreateSandboxInstanceResponse { subvolume: false })
+            },
+        )
+        .serve();
+    assert_eq!(
+        create_sandbox_instance("sbx", target(), &kept.connector())
+            .await
+            .unwrap(),
+        PreparedInstance::PlainDirectory,
+        "a kept plain directory must not read as a subvolume"
+    );
+
+    let old = crate::node_manager_transport::fake::FakeNodeManager::default().serve();
+    assert_eq!(
+        create_sandbox_instance("sbx", target(), &old.connector())
+            .await
+            .unwrap(),
+        PreparedInstance::Unsupported,
+        "a node-manager without the RPC must read as unsupported"
+    );
+
+    let refusing = crate::node_manager_transport::fake::FakeNodeManager::default()
+        .unary(
+            "BtrfsCreateSandboxInstance",
+            |_: BtrfsCreateSandboxInstanceRequest| -> Result<BtrfsCreateSandboxInstanceResponse, Status> {
+                Err(Status::failed_precondition("instance exists and is not a subvolume"))
+            },
+        )
+        .serve();
+    assert!(
+        create_sandbox_instance("sbx", target(), &refusing.connector())
+            .await
+            .is_err(),
+        "a refusal must fail the restore"
+    );
+}

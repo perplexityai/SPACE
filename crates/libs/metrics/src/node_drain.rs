@@ -221,10 +221,13 @@ pub fn store_query_duration(node_id: &str, query: &str, outcome: &str, started_a
 /// Per-sandbox migration failure. `phase` identifies which step in the
 /// migration pipeline failed (`suspend`, `restore`, `lookup`, ...).
 /// `pre_lifecycle` is the user-visible lifecycle the sandbox was in
-/// at evacuation start (`started` or `paused`). A cohort-restore wake
-/// that timed out while the node was still restoring is NOT a failure —
-/// it counts in [`restore_converging`], which carries the readiness step
-/// that stalled in its own `phase` tag.
+/// at evacuation start (`started`, `paused`, or `stopped` for a stopped
+/// resident's evacuation and re-placement). A `started` or `paused`
+/// cohort-restore wake that timed out while the node was still restoring is
+/// NOT a failure — it counts in [`restore_converging`], which carries the
+/// readiness step that stalled in its own `phase` tag. A `stopped`
+/// re-placement's timed-out wake is a failure here (`phase=restore`), since
+/// it has no guest readiness to converge on.
 pub fn failure(node_id: &str, phase: &str, pre_lifecycle: &str) {
     counter(
         "node_drain.failures",
@@ -238,7 +241,9 @@ pub fn failure(node_id: &str, phase: &str, pre_lifecycle: &str) {
 }
 
 /// A cohort-restore attempt that has not finished but is still progressing:
-/// its blocking wake wait timed out while the node was still restoring, or the
+/// its blocking wake wait timed out while the node was still restoring (a
+/// `started` or `paused` target only; a `stopped` re-placement's timeout is a
+/// [`failure`]), or the
 /// substrate reported a restore or suspend already in flight, or a restore
 /// source not yet available. Not a failure (see [`failure`]): the next sweep
 /// re-drives the same sandbox until it converges. `phase` names the readiness
@@ -352,12 +357,15 @@ pub fn stopped_evacuation(node_id: &str, outcome: &str) {
 /// Evacuated `stopped` sandboxes waiting to be re-placed onto a node —
 /// cluster-wide, emitted on every periodic restore sweep including zero.
 ///
-/// Each counted row carries the `'stopped'` marker, reads `stopped` (or
-/// `restoring`, which nothing reaches yet), and has no `active_node_id`, so no
-/// node can serve its `start`. The drain's
-/// teardown leaves a row in that shape after proving its disk artifact durable
-/// in S3; the query doesn't check how a row got there, so a marked row unplaced
-/// some other way counts too. That makes a sustained nonzero value an
+/// Each counted row carries the `'stopped'` marker and either reads `stopped`
+/// with no `active_node_id` (released, so no node can serve its `start`) or
+/// reads `restoring` (claimed for re-placement and not yet settled, on a node
+/// or not). The drain's teardown leaves a row in the first shape after proving
+/// its disk artifact durable in S3, and the restore sweep's claim moves it to
+/// the second; the query doesn't check how a row got there, so a marked row
+/// unplaced some other way counts too. A re-placement that never converges,
+/// such as one whose destination runs a shim that predates stopped
+/// materialization, stays in the second shape and keeps the gauge up. That makes a sustained nonzero value an
 /// availability incident in the usual case, which is the condition worth
 /// paging on. Durability is deliberately not re-checked here: a row whose
 /// backup stopped resolving after the teardown is still counted, because

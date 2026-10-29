@@ -127,10 +127,13 @@ fn parse_sandbox_lifecycle(lifecycle: &str) -> Result<SandboxLifecycle, Substrat
 }
 
 /// Map a `SandboxLifecycle` target into the proto `WakeTargetState`
-/// wire enum that sbx-mgr's `Wake` and `Start` accept. Only `Started`
-/// and `Paused` are valid restore targets today; anything else is a
-/// caller bug (and the substrate-trait `restore_execution` enforces
-/// `Started` at its boundary, so the user-API path is unaffected).
+/// wire enum that sbx-mgr's `Wake` and `Start` accept. `Started`, `Paused`
+/// and `Stopped` are the restore targets; anything else is a caller bug (and
+/// the substrate-trait `restore_execution` enforces `Started` at its boundary,
+/// so the user-API path is unaffected). `Stopped` is the drain's re-placement
+/// of an evacuated stopped sandbox, which
+/// [`KubernetesSubstrate::restore_execution_inner`] admits for evacuation
+/// restores only.
 fn sandbox_lifecycle_to_wake_target_proto(
     lifecycle: SandboxLifecycle,
 ) -> Result<i32, SubstrateError> {
@@ -138,6 +141,7 @@ fn sandbox_lifecycle_to_wake_target_proto(
     match restore_transition_target_state(lifecycle)? {
         SandboxTransitionTargetState::Started => Ok(WakeTargetState::Started as i32),
         SandboxTransitionTargetState::Paused => Ok(WakeTargetState::Paused as i32),
+        SandboxTransitionTargetState::Stopped => Ok(WakeTargetState::Stopped as i32),
         other => Err(SubstrateError::Conflict {
             message: format!("restore target {other:?} has no wake target state"),
         }),
@@ -154,8 +158,11 @@ fn restore_transition_target_state(
     match lifecycle {
         SandboxLifecycle::Started => Ok(SandboxTransitionTargetState::Started),
         SandboxLifecycle::Paused => Ok(SandboxTransitionTargetState::Paused),
+        SandboxLifecycle::Stopped => Ok(SandboxTransitionTargetState::Stopped),
         other => Err(SubstrateError::Conflict {
-            message: format!("restore target_state must be Started or Paused, got {other}"),
+            message: format!(
+                "restore target_state must be Started, Paused or Stopped, got {other}"
+            ),
         }),
     }
 }
@@ -217,7 +224,8 @@ struct RestoreClaimHandling {
 }
 
 /// Implicit wake always targets Started and retains its policy source through
-/// detached activation and recovery; explicit evacuation can target Paused.
+/// detached activation and recovery; explicit evacuation can target Paused or
+/// Stopped.
 #[derive(Clone, Copy)]
 enum WakeTarget {
     Explicit(SandboxLifecycle),
@@ -1268,6 +1276,15 @@ impl KubernetesSubstrate {
         // the failure cleanup to undo it — which a fresh stopped claim
         // deliberately doesn't do.
         sandbox_lifecycle_to_wake_target_proto(target_state)?;
+        // Only the drain re-places a sandbox as `stopped`: the stopped arm
+        // reads the evacuation's disk artifact and the claim it needs is the
+        // evacuation claim. A user restore asking for it is a caller bug.
+        if target_state == SandboxLifecycle::Stopped && evacuation_placement.is_none() {
+            return Err(SubstrateError::Conflict {
+                message: "a stopped restore target is only valid for an evacuation restore"
+                    .to_string(),
+            });
+        }
         // Evacuation restore (`evacuation_placement` outer `Some`) claims the
         // suspended (or released stopped) → restoring transition atomically on the
         // `evacuation_restore_target` marker, so it can't restore a sandbox a
@@ -1861,7 +1878,9 @@ impl KubernetesSubstrate {
         // `SubstrateError`.
         let wake_was_dispatched = AtomicBool::new(false);
         let wait = async {
-            let restore_plan = if prepared.restore_started
+            let restore_plan = if target_state == SandboxLifecycle::Stopped {
+                Some(self.stopped_evacuation_restore_plan(&sandbox).await?)
+            } else if prepared.restore_started
                 || normalize_lifecycle(&sandbox.lifecycle) == "restoring"
             {
                 Some(
@@ -1893,6 +1912,11 @@ impl KubernetesSubstrate {
                             .restore_claim
                             .and_then(RestoreClaim::restore_lease_token),
                         Some(activation_assignment.clone()),
+                    )
+                    .materializing_stopped(
+                        restore_plan
+                            .as_ref()
+                            .and_then(|plan| plan.expected_local_artifact_id),
                     ),
                 ),
             )
@@ -1923,9 +1947,21 @@ impl KubernetesSubstrate {
                 )
                 .await?;
             let fence_ownership = fence.ownership();
-            let owned_attempt = fence
-                .owned_attempt_id()
-                .map(|attempt_id| (attempt_id, fence.execution.generation));
+            // A stopped materialization is finished once the node confirms it,
+            // whichever attempt it ran under. A re-drive after a timed-out wait
+            // joins the earlier attempt, still inside its lease, rather than
+            // taking one. A join needs the owner's attempt to have the same
+            // target, and only this path assigns a `stopped` one, which the
+            // guard above limits to the drain, so the joined attempt is the
+            // drain's own. Left set,
+            // it keeps the materialization pod from being released and refuses
+            // the owner's next `start` until its lease expires.
+            let owned_attempt = if target_state == SandboxLifecycle::Stopped {
+                fence.driving_attempt_id()
+            } else {
+                fence.owned_attempt_id()
+            }
+            .map(|attempt_id| (attempt_id, fence.execution.generation));
             let active_execution = fence.execution;
             if let Some(trace) = crate::wake_trace::current() {
                 if restore_plan.is_none() {
@@ -1993,7 +2029,10 @@ impl KubernetesSubstrate {
                                     route_identity: Some(wake_request_route_identity(
                                         route_identity,
                                     )),
-                                    expected_local_artifact_id: None,
+                                    expected_local_artifact_id: restore_plan
+                                        .as_ref()
+                                        .and_then(|plan| plan.expected_local_artifact_id)
+                                        .map(|id| id.to_string()),
                                 },
                             ),
                             target_state: wake_target_state,
@@ -2099,8 +2138,20 @@ impl KubernetesSubstrate {
                         .await
                     }
                 }
+                SandboxLifecycle::Stopped => {
+                    // Nothing runs, so there is no readiness to poll and no
+                    // route a stopped Wake could echo: the node clears the
+                    // route fields when it finalizes the row. What the Wake's
+                    // success proves is the node's own check that its row is
+                    // `stopped` and pins exactly the requested artifact. The
+                    // binding only names the pod the row now lives in.
+                    self.completed_execution_binding(sandbox_id, &active_execution, None)
+                        .await
+                }
                 other => Err(SubstrateError::Conflict {
-                    message: format!("restore target_state must be Started or Paused, got {other}"),
+                    message: format!(
+                        "restore target_state must be Started, Paused or Stopped, got {other}"
+                    ),
                 }),
             }?;
 
@@ -2260,13 +2311,31 @@ impl KubernetesSubstrate {
         }
 
         if let Ok((_, Some((activation_attempt_id, generation)))) = &result {
-            self.store
-                .release_activation_attempt_best_effort(
-                    sandbox_id,
-                    *generation,
-                    *activation_attempt_id,
-                )
-                .await;
+            if target_state == SandboxLifecycle::Stopped {
+                // A stopped materialization is finished once the node has
+                // confirmed it: nothing was activated, so no completion receipt
+                // will ever release the attempt. Nor can
+                // `release_activation_attempt_best_effort`: it requires the
+                // row's lifecycle to equal the attempt's target, and the drain
+                // has yet to move it out of `restoring`. Left in place, the
+                // attempt would refuse the owner's next `start` until its lease
+                // expires.
+                self.store
+                    .release_finished_activation_attempt_best_effort(
+                        sandbox_id,
+                        *generation,
+                        *activation_attempt_id,
+                    )
+                    .await;
+            } else {
+                self.store
+                    .release_activation_attempt_best_effort(
+                        sandbox_id,
+                        *generation,
+                        *activation_attempt_id,
+                    )
+                    .await;
+            }
         }
         // The owner of a user restore commits `restoring -> started` itself,
         // under its own lease, before handing out the binding: a user request

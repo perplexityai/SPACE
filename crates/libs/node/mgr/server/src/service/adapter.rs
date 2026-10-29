@@ -583,6 +583,19 @@ impl NodeManager for NodeManagerService {
         NodeManagerService::btrfs_delete_sandbox_instance(self, request).await
     }
 
+    async fn btrfs_create_sandbox_instance(
+        &self,
+        request: Request<crate::proto::BtrfsCreateSandboxInstanceRequest>,
+    ) -> Result<Response<crate::proto::BtrfsCreateSandboxInstanceResponse>, Status> {
+        let sandbox_id = request.get_ref().sandbox_id.clone();
+        observe_rpc(
+            "BtrfsCreateSandboxInstance",
+            sandbox_id,
+            NodeManagerService::btrfs_create_sandbox_instance(self, request),
+        )
+        .await
+    }
+
     async fn prepare_encrypted_rootfs(
         &self,
         request: Request<PrepareEncryptedRootfsRequest>,

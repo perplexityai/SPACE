@@ -293,6 +293,20 @@ service NodeManager {
   rpc BtrfsDeleteSandboxInstance(BtrfsDeleteSandboxInstanceRequest)
       returns (BtrfsDeleteSandboxInstanceResponse);
 
+  // Create a sandbox's empty `instance/` as a btrfs subvolume, owned by
+  // sandbox-manager, for a restore that writes the rootfs into it itself (the
+  // Full codec). A plain directory there would work for the boot, but nothing
+  // could snapshot it afterwards, so every later disk backup of the sandbox,
+  // which snapshots `instance/`, would fail. Keeps a directory already at
+  // that path as it is, subvolume or not, as the plain mkdir it replaces did,
+  // except an empty root-owned one an earlier call created but didn't hand
+  // over (on btrfs, only a subvolume), which it hands to sandbox-manager;
+  // `FailedPrecondition` for a path that isn't a directory. On a cache
+  // filesystem that isn't btrfs it creates a plain directory and reports it.
+  // The required target has the same authority rules as BtrfsReceiveInstance.
+  rpc BtrfsCreateSandboxInstance(BtrfsCreateSandboxInstanceRequest)
+      returns (BtrfsCreateSandboxInstanceResponse);
+
   // ─── BYOK encrypted-volume delegation ────────────────────────────────
   //
   // Privileged device-mapper operations (losetup / cryptsetup / dmsetup /
@@ -1287,6 +1301,16 @@ message BtrfsDeleteSandboxInstanceRequest {
   InstanceTarget target = 2;
 }
 message BtrfsDeleteSandboxInstanceResponse {}
+
+message BtrfsCreateSandboxInstanceRequest {
+  string sandbox_id = 1;
+  InstanceTarget target = 2;
+}
+message BtrfsCreateSandboxInstanceResponse {
+  // Whether `instance/` is now a btrfs subvolume: false for a plain directory
+  // the call kept, or made on a filesystem that isn't btrfs.
+  bool subvolume = 1;
+}
 
 // These node-local capabilities are restricted to volume-manager and operators.
 message BtrfsStageSendSourceRequest {

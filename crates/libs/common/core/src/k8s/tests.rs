@@ -595,6 +595,7 @@ fn build_sandbox_pod_direct_restore_keeps_artifact_kind_and_node_assignment() {
         let pod = build_sandbox_pod(
             &test_pod_config(),
             SandboxPodRequest::Restore {
+                stopped_materialization: None,
                 artifact_kind,
                 common,
                 runtime,
@@ -807,6 +808,7 @@ fn build_sandbox_pod_source_pinned_restore_skips_node_services_bias() {
             ..test_pod_config()
         },
         SandboxPodRequest::Restore {
+            stopped_materialization: None,
             artifact_kind: crate::types::ArtifactKind::Full,
             common,
             runtime,
@@ -917,6 +919,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
     let restore = build_sandbox_pod(
         &config,
         SandboxPodRequest::Restore {
+            stopped_materialization: None,
             artifact_kind: crate::types::ArtifactKind::Full,
             common: common(
                 "space-sbx-019de67463d77ef0a5888e106a878093-g2",
@@ -938,6 +941,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
     let restore_portable = build_sandbox_pod(
         &config,
         SandboxPodRequest::Restore {
+            stopped_materialization: None,
             artifact_kind: crate::types::ArtifactKind::Full,
             common: common(
                 "space-sbx-019de67463d77ef0a5888e106a878093-g3",
@@ -968,6 +972,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
             ..test_pod_config()
         },
         SandboxPodRequest::Restore {
+            stopped_materialization: None,
             artifact_kind: crate::types::ArtifactKind::Full,
             common: common(
                 "space-sbx-019de67463d77ef0a5888e106a878093-g4",
@@ -996,6 +1001,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
             ..test_pod_config()
         },
         SandboxPodRequest::Restore {
+            stopped_materialization: None,
             artifact_kind: crate::types::ArtifactKind::Full,
             common: common(
                 "space-sbx-019de67463d77ef0a5888e106a878093-g6",
@@ -1023,6 +1029,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
     let restore_storage_only = build_sandbox_pod(
         &config,
         SandboxPodRequest::Restore {
+            stopped_materialization: None,
             artifact_kind: crate::types::ArtifactKind::Full,
             common: common(
                 "space-sbx-019de67463d77ef0a5888e106a878093-g5",
@@ -1058,6 +1065,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
     let restore_evacuation = build_sandbox_pod(
         &config,
         SandboxPodRequest::Restore {
+            stopped_materialization: None,
             artifact_kind: crate::types::ArtifactKind::Full,
             common: common(
                 "space-sbx-019de67463d77ef0a5888e106a878093-g4",
@@ -1081,6 +1089,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
     let restore_fork_disk = build_sandbox_pod(
         &config,
         SandboxPodRequest::Restore {
+            stopped_materialization: None,
             artifact_kind: crate::types::ArtifactKind::Disk,
             common: common(
                 "space-sbx-019de67463d77ef0a5888e106a878093-g5",
@@ -1245,6 +1254,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
             ..test_pod_config()
         },
         SandboxPodRequest::Restore {
+            stopped_materialization: None,
             artifact_kind: crate::types::ArtifactKind::Full,
             common: common(
                 "space-sbx-019de67463d77ef0a5888e106a878093-g11",
@@ -1293,6 +1303,7 @@ fn sandbox_pod_shapes_render_expected_yaml() {
     let restore_direct_placed = build_sandbox_pod(
         &config,
         SandboxPodRequest::Restore {
+            stopped_materialization: None,
             artifact_kind: crate::types::ArtifactKind::Full,
             common: common(
                 "space-sbx-019de67463d77ef0a5888e106a878093-g15",
@@ -1464,6 +1475,7 @@ fn every_sandbox_pod_shape_requests_one_network_slot() {
         build_sandbox_pod(
             &config,
             SandboxPodRequest::Restore {
+                stopped_materialization: None,
                 artifact_kind: crate::types::ArtifactKind::Full,
                 common: common("space-sbx-restore-g2", TEST_SANDBOX_ID, 2),
                 runtime,
@@ -1587,6 +1599,7 @@ fn portable_restore_prefers_source_node_and_carries_remote_fallback() {
     let pod = build_sandbox_pod(
         &config,
         SandboxPodRequest::Restore {
+            stopped_materialization: None,
             artifact_kind: crate::types::ArtifactKind::Full,
             common: test_common(
                 "space-sbx-019de67463d77ef0a5888e106a878093-g3",
@@ -1735,6 +1748,7 @@ fn build_sandbox_pod_hard_pins_portable_restore_to_source_node() {
     let pod = build_sandbox_pod(
         &config,
         SandboxPodRequest::Restore {
+            stopped_materialization: None,
             artifact_kind: crate::types::ArtifactKind::Full,
             common: test_common("space-sbx-pin-g2", TEST_SANDBOX_ID, 2, &env),
             runtime,
@@ -1808,6 +1822,7 @@ fn build_sandbox_pod_source_annotation_without_pin_renders_no_source_affinity() 
     let pod = build_sandbox_pod(
         &config,
         SandboxPodRequest::Restore {
+            stopped_materialization: None,
             artifact_kind: crate::types::ArtifactKind::Full,
             common: test_common("space-sbx-redrive-g3", TEST_SANDBOX_ID, 3, &env),
             runtime,
@@ -1868,6 +1883,7 @@ fn build_sandbox_pod_shortlist_renders_or_terms_with_preferred_source() {
     let pod = build_sandbox_pod(
         &config,
         SandboxPodRequest::Restore {
+            stopped_materialization: None,
             artifact_kind: crate::types::ArtifactKind::Full,
             common: test_common("space-sbx-shortlist-g2", TEST_SANDBOX_ID, 2, &env),
             runtime,
@@ -1952,6 +1968,7 @@ fn build_sandbox_pod_hard_pin_without_ssd_affinity_omits_placement_block() {
     let pod = build_sandbox_pod(
         &config,
         SandboxPodRequest::Restore {
+            stopped_materialization: None,
             artifact_kind: crate::types::ArtifactKind::Full,
             common: test_common("space-sbx-pin-noheadroom-g2", TEST_SANDBOX_ID, 2, &env),
             runtime,
@@ -2000,6 +2017,7 @@ fn restore_with_extra_tolerations_renders_pod_tolerations() {
     let pod = build_sandbox_pod(
         &config,
         SandboxPodRequest::Restore {
+            stopped_materialization: None,
             artifact_kind: crate::types::ArtifactKind::Full,
             common: test_common(
                 "space-sbx-019de67463d77ef0a5888e106a878093-g4",
@@ -2115,6 +2133,7 @@ fn extra_required_affinity_renders_into_required_node_selector_term() {
     let pod = build_sandbox_pod(
         &config,
         SandboxPodRequest::Restore {
+            stopped_materialization: None,
             artifact_kind: crate::types::ArtifactKind::Full,
             common: test_common(
                 "space-sbx-019de67463d77ef0a5888e106a878093-g5",
@@ -2408,6 +2427,7 @@ fn node_group_placement_and_drain_cohort_are_anded_in_one_term() {
     let pod = build_sandbox_pod(
         &test_pod_config(),
         SandboxPodRequest::Restore {
+            stopped_materialization: None,
             artifact_kind: crate::types::ArtifactKind::Full,
             common: SandboxPodCommon {
                 pod_name: "space-sbx-node-group-g3",
@@ -2544,6 +2564,7 @@ fn local_only_restore_keeps_direct_node_assignment_under_placement() {
     let pod = build_sandbox_pod(
         &test_pod_config(),
         SandboxPodRequest::Restore {
+            stopped_materialization: None,
             artifact_kind: crate::types::ArtifactKind::Full,
             common: SandboxPodCommon {
                 pod_name: "space-sbx-node-group-g4",
@@ -2724,6 +2745,7 @@ fn soft_pinned_restore_suppresses_the_dedicated_preference() {
     let pod = build_sandbox_pod(
         &test_pod_config(),
         SandboxPodRequest::Restore {
+            stopped_materialization: None,
             artifact_kind: crate::types::ArtifactKind::Full,
             common: SandboxPodCommon {
                 pod_name: "space-sbx-node-group-g14",
@@ -2925,6 +2947,7 @@ fn restore_shortlist_suppresses_dedicated_preference_but_keeps_toleration() {
     let pod = build_sandbox_pod(
         &config,
         SandboxPodRequest::Restore {
+            stopped_materialization: None,
             artifact_kind: crate::types::ArtifactKind::Full,
             common: SandboxPodCommon {
                 pod_name: "space-sbx-node-group-g6",
@@ -3304,6 +3327,7 @@ fn an_empty_preferred_node_name_does_not_drop_the_required_shortlist() {
     let pod = build_sandbox_pod(
         &config,
         SandboxPodRequest::Restore {
+            stopped_materialization: None,
             artifact_kind: crate::types::ArtifactKind::Full,
             common: SandboxPodCommon {
                 pod_name: "space-sbx-node-group-g19",
@@ -3444,4 +3468,130 @@ fn cold_create_env_reaches_infra_pod_contract() {
             );
         }
     }
+}
+
+/// A stopped re-placement pod names its materialization to the shim: the
+/// `stopped-materialization` checkpoint, the exact artifact URI and the artifact
+/// id. Without the id the same evacuation pod keeps the checkpoint its
+/// artifact kind selects, so the field is what changes the shim's intent.
+#[test]
+fn a_stopped_re_placement_pod_names_its_materialization_to_the_shim() {
+    let artifact_id = crate::types::LocalArtifactId::new();
+    let materializing = render_stopped_re_placement(Some(StoppedMaterialization {
+        artifact_id,
+        excluded_node_names: &[],
+    }))
+    .metadata
+    .annotations
+    .expect("sandbox pod should include annotations");
+    assert_eq!(
+        materializing
+            .get(SANDBOX_CHECKPOINT_ANNOTATION)
+            .map(String::as_str),
+        Some(STOPPED_MATERIALIZATION_CHECKPOINT)
+    );
+    assert_eq!(
+        materializing
+            .get(SANDBOX_STOPPED_MATERIALIZATION_ARTIFACT_ID_ANNOTATION)
+            .cloned(),
+        Some(artifact_id.to_string())
+    );
+    assert_eq!(
+        materializing
+            .get(SANDBOX_SUSPEND_RESTORE_STORAGE_URI_ANNOTATION)
+            .map(String::as_str),
+        Some(STOPPED_RE_PLACEMENT_STORAGE_URI)
+    );
+
+    let restoring = render_stopped_re_placement(None)
+        .metadata
+        .annotations
+        .expect("sandbox pod should include annotations");
+    assert_eq!(
+        restoring
+            .get(SANDBOX_CHECKPOINT_ANNOTATION)
+            .map(String::as_str),
+        Some("suspend")
+    );
+    assert!(!restoring.contains_key(SANDBOX_STOPPED_MATERIALIZATION_ARTIFACT_ID_ANNOTATION));
+}
+
+/// A stopped re-placement can't be scheduled onto a node an earlier execution
+/// ran on: each one is a required `metadata.name NotIn`, one value per
+/// requirement as Kubernetes validation requires. With nothing to exclude the
+/// pod's affinity is exactly an ordinary evacuation pod's.
+#[test]
+fn a_stopped_re_placement_pod_is_kept_off_every_prior_host() {
+    let excluded = vec!["worker-a".to_string(), "worker-b".to_string()];
+    let pod = render_stopped_re_placement(Some(StoppedMaterialization {
+        artifact_id: crate::types::LocalArtifactId::new(),
+        excluded_node_names: &excluded,
+    }));
+    let terms = pod
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.affinity.as_ref())
+        .and_then(|affinity| affinity.node_affinity.as_ref())
+        .and_then(|node| {
+            node.required_during_scheduling_ignored_during_execution
+                .as_ref()
+        })
+        .map(|selector| selector.node_selector_terms.clone())
+        .expect("an excluded host must render a required node affinity");
+    assert!(!terms.is_empty());
+    for term in &terms {
+        let fields = term.match_fields.clone().unwrap_or_default();
+        for node in &excluded {
+            assert!(
+                fields.iter().any(|field| field.key == NODE_NAME_MATCH_FIELD
+                    && field.operator == "NotIn"
+                    && field.values.as_deref() == Some(std::slice::from_ref(node))),
+                "every required term must exclude {node}: {fields:?}"
+            );
+        }
+    }
+
+    let affinity = |pod: Pod| pod.spec.and_then(|spec| spec.affinity);
+    assert_eq!(
+        affinity(render_stopped_re_placement(Some(StoppedMaterialization {
+            artifact_id: crate::types::LocalArtifactId::new(),
+            excluded_node_names: &[],
+        }))),
+        affinity(render_stopped_re_placement(None)),
+        "a re-placement with no prior host renders an ordinary evacuation pod's affinity"
+    );
+}
+
+const STOPPED_RE_PLACEMENT_STORAGE_URI: &str = "s3://space-test/stopped-disk?region=us-east-1";
+
+fn render_stopped_re_placement(stopped_materialization: Option<StoppedMaterialization<'_>>) -> Pod {
+    let env = BTreeMap::new();
+    let config = test_pod_config();
+    let auto_lifecycle_json = test_auto_lifecycle_json();
+    let network_policy_json = test_network_policy_json();
+    let sandbox_owner = test_sandbox_owner();
+    let runtime = test_runtime(&sandbox_owner, &auto_lifecycle_json, &network_policy_json);
+    build_sandbox_pod(
+        &config,
+        SandboxPodRequest::Restore {
+            stopped_materialization,
+            artifact_kind: crate::types::ArtifactKind::Full,
+            common: test_common(
+                "space-sbx-019de67463d77ef0a5888e106a878093-g4",
+                TEST_SANDBOX_ID,
+                4,
+                &env,
+            ),
+            runtime,
+            suspend_restore_storage_uri: Some(STOPPED_RE_PLACEMENT_STORAGE_URI),
+            suspend_restore_source_node: None,
+            fork_disk_restore: None,
+            direct_node_name: None,
+            preferred_node_name: None,
+            restore_node_shortlist: Vec::new(),
+            extra_tolerations: &[],
+            extra_required_affinity: None,
+            node_group_placement: None,
+        },
+    )
 }
