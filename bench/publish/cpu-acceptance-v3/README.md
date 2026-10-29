@@ -59,6 +59,7 @@ are not established by these results.
 | --- | --- | ---: | ---: |
 | [753d3b1f](head-753d3b1f/README.md) | [Lane C](baseline-lane-c/README.md) | 3.293 → 3.369 | -2.3079% |
 | [b44c0ce4](head-b44c0ce4/README.md) | [Lane C](baseline-lane-c/README.md) | 3.293 → 3.358 | -1.9739% |
+| [abde4c26](head-abde4c26/README.md) | [Lane C](baseline-lane-c/README.md) | 3.293 → 3.274 | 0.5770% |
 | [23c27a10](head-23c27a10/README.md) | [Lane A](baseline-lane-a/README.md) | 3.338 → 3.398 | -1.7975% |
 | [80a369e3](head-80a369e3/README.md) | [Lane B](baseline-lane-b/README.md) | 3.328 → 3.371 | -1.2921% |
 | [b91ad676](head-b91ad676/README.md) | [Lane C](baseline-lane-c/README.md) | 3.293 → 3.361 | -2.0650% |
@@ -74,17 +75,24 @@ are not established by these results.
 | [f1e3c6b3](head-f1e3c6b3/README.md) | [Lane D](baseline-lane-d/README.md) | 3.319 → 3.268 | 1.5366% |
 | [16243df3](head-16243df3/README.md) | [Lane E](baseline-lane-e/README.md) | 3.338 → 3.343 | -0.1498% |
 | [f1e86c45](head-f1e86c45/README.md) | [Lane F](baseline-lane-f/README.md) | 3.336 → 3.341 | -0.1499% |
+| [640b8d03](head-640b8d03/README.md) | [Lane D](baseline-lane-d/README.md) | 3.319 → 3.310 | 0.2712% |
 | [9dd9201c](head-9dd9201c/README.md) | [Lane E](baseline-lane-e/README.md) | 3.338 → 3.337 | 0.0300% |
+| [5e40025d](head-5e40025d/README.md) | [Lane F](baseline-lane-f/README.md) | 3.336 → 3.330 | 0.1799% |
+| [e7259c92](head-e7259c92/README.md) | [Lane E](baseline-lane-e/README.md) | 3.338 → 3.297 | 1.2283% |
 | [71323bd8](head-71323bd8/README.md) | [Lane G](baseline-lane-g/README.md) | 3.325 → 3.349 | -0.7218% |
 | [8605c444](head-8605c444/README.md) | [Lane G](baseline-lane-g/README.md) | 3.325 → 3.270 | 1.6541% |
 | [de5b086d](head-de5b086d/README.md) | [Lane G](baseline-lane-g/README.md) | 3.325 → 3.271 | 1.6241% |
+| [5a233667](head-5a233667/README.md) | [Lane G](baseline-lane-g/README.md) | 3.325 → 3.310 | 0.4511% |
 | [3b67f748](head-3b67f748/README.md) | [Lane H](baseline-lane-h/README.md) | 3.352 → 3.316 | 1.0740% |
 | [5c832104](head-5c832104/README.md) | [Lane H](baseline-lane-h/README.md) | 3.352 → 3.295 | 1.7005% |
+| [869bce30](head-869bce30/README.md) | [Lane H](baseline-lane-h/README.md) | 3.352 → 3.292 | 1.7900% |
 | [c55485c0](head-c55485c0/README.md) | [Lane B](baseline-lane-b/README.md) | 3.328 → 3.328 | 0.0000% |
 | [ce6bf8df](head-ce6bf8df/README.md) | [Lane C](baseline-lane-c/README.md) | 3.293 → 3.288 | 0.1518% |
 | [a310e90f](head-a310e90f/README.md) | [Lane A](baseline-lane-a/README.md) | 3.338 → 2.802 | 16.0575% |
 | [0a70b4d5](head-0a70b4d5/README.md) | [Lane B](baseline-lane-b/README.md) | 3.328 → 2.080 | 37.5000% |
+| [c63135f5](head-c63135f5/README.md) | [Lane A](baseline-lane-a/README.md) | 3.338 → 1.839 | 44.9071% |
 | [9b9c5e2c](head-9b9c5e2c/README.md) | [Lane B](baseline-lane-b/README.md) | 3.328 → 1.816 | 45.4327% |
+| [813471fe](head-813471fe/README.md) | [Lane B](baseline-lane-b/README.md) | 3.328 → 1.677 | 49.6094% |
 | [938e0cf4](head-938e0cf4/README.md) | [Lane A](baseline-lane-a/README.md) | 3.338 → 1.522 | 54.4038% |
 
 Reductions compare each head with its own lane's fixed reference; negative
