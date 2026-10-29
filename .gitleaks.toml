@@ -128,3 +128,24 @@ targetRules = ["generic-api-key"]
 condition = "AND"
 paths = ['''^bench/publish/cpu-acceptance-v3/head-71323bd8/summary\.json$''']
 regexes = ['''^d9d05a6137966d45c2dd147b836b2fbe11b9cd3b917bcede19b9b3c33fcd2992$''']
+
+[[allowlists]]
+description = "Verified executable SHA-256 for the retained unqualified f373db56 attempt"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''^bench/publish/cpu-acceptance-v3/unqualified-f373db56-attempt-1/summary\.json$''']
+regexes = ['''^8c4c50192abe8eefde83fa8dd293e7b5a9ae76a6e73e83ba45dcfa5de1b227e7$''']
+
+[[allowlists]]
+description = "Verified executable SHA-256 for the retained unqualified ed788ea1 attempt"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''^bench/publish/cpu-acceptance-v3/unqualified-ed788ea1-attempt-1/summary\.json$''']
+regexes = ['''^6eed47d3d7ae733b6b8315215eca5019a26787f9d60c7f01b6dd3ef7a9406488$''']
+
+[[allowlists]]
+description = "Verified executable SHA-256 for the retained unqualified 3b67f748 attempt"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''^bench/publish/cpu-acceptance-v3/unqualified-3b67f748-attempt-1/summary\.json$''']
+regexes = ['''^39eae8522d781e465784dc1777538460cf990a8f94d0ceb17bb4abd53baabbd4$''']
