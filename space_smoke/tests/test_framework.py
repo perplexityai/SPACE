@@ -174,6 +174,7 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "native.aws_secret_network_credential_injection",
                 "native.encrypted_double_restore_retires_prior_pods",
                 "native.m1_generated_sdk_conformance",
+                "native.network_policy_live_update",
                 "native.resident_pause",
                 "native.stopped_restart_preserves_rootfs",
                 "native_concurrency.command_idempotency",

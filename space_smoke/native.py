@@ -207,6 +207,15 @@ class NativeSandboxFactory:
         )
         self._wait_operation(_required_string(response, "operation_id"))
 
+    def get_network_policy(self, sandbox_id: str) -> dict[str, object]:
+        """Read the sandbox's effective desired policy document."""
+
+        return self._json_request(
+            "GET",
+            f"/v1/sandboxes/{quote(sandbox_id, safe='')}/network-policy",
+            expected_status=200,
+        )
+
     def retire_credential_reference(self, credential_reference_id: str) -> None:
         """Retire a detached reference through the public API."""
 
@@ -638,6 +647,9 @@ class _NativeSandbox:
 
     def set_network_policy(self, policy: Mapping[str, object]) -> None:
         self._factory.set_network_policy(self.sandbox_id, policy)
+
+    def get_network_policy(self) -> dict[str, object]:
+        return self._factory.get_network_policy(self.sandbox_id)
 
     def retire_credential_reference(self, credential_reference_id: str) -> None:
         self._factory.retire_credential_reference(credential_reference_id)

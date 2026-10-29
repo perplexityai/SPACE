@@ -143,6 +143,9 @@ _DURATION_SECONDS = {
         # Local Kind runs, with the generator image present or pulled from
         # Docker Hub: 15-18 s, of which SDK generation is 2-5 s.
         "native.m1_generated_sdk_conformance": 20,
+        # Estimate until a bench run refreshes it: two live policy updates,
+        # each waiting for gateway reconcile and four HTTPS probes.
+        "native.network_policy_live_update": 30,
         "native.resident_pause": 5,
         "native_contract.command_validation": 6,
         "native_contract.file_idempotency_conflict": 5,
