@@ -348,6 +348,9 @@ message RegisterTemplateReleaseRequest {
   optional string system_publication_grant_id = 9;
   // Tenant counterpart of `system_publication_grant_id`, for `org_id`.
   optional string tenant_publication_grant_id = 10;
+  // Defaults from the published metadata.json; immutable for this release.
+  optional uint32 vcpu = 11;
+  optional uint32 memory_mib = 12;
 }
 
 message RegisterTemplateReleaseResponse {
@@ -961,9 +964,6 @@ message PublishedSandboxState {
   // Exact activation attempt observed with this state. Generations may be
   // reused by placement retries, so attempt-scoped evidence must carry both.
   optional string activation_attempt_id = 41;
-  // Current activation allocation, forwarded from SandboxInfo.
-  optional uint32 actual_vcpu = 42;
-  optional uint32 actual_memory_mib = 43;
 }
 
 message PublishedTemplateState {

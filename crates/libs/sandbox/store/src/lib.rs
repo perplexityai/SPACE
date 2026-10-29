@@ -75,7 +75,6 @@ use uuid::Uuid;
 mod create;
 pub mod fork_source_lifecycle;
 pub mod lost;
-pub mod runtime_shape;
 
 pub use create::{SandboxCreate, insert_pooled, insert_unplaced};
 

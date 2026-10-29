@@ -685,6 +685,8 @@ async fn register(
     );
     cluster_api
         .register_template_release(RegisterTemplateReleaseRequest {
+            vcpu: None,
+            memory_mib: None,
             system_publication_grant_id: None,
             tenant_publication_grant_id: None,
             template_name: pin.template.as_str().to_string(),

@@ -40,6 +40,8 @@ fn write_metadata(dir: &Path, arch: Arch) {
     let value = serde_json::json!({
         "schema_version": TEMPLATE_METADATA_SCHEMA_VERSION,
         "id": "code-runtime",
+        "vcpu": 4,
+        "memory_mib": 4096,
         "name": "code-runtime",
         "execution": execution_for(arch),
     });
@@ -219,17 +221,25 @@ fn republication_registers_tags_only() {
         pplx_space_execution_common::proto::ExecutionMetadata::from(&execution_for(Arch::X86_64))
     };
 
-    let first = release_registration(false, Some(current), execution());
+    let first = release_registration(false, Some(current), execution(), Some((4, 4096)));
     assert_eq!(first.storage_locations, vec![current.to_string()]);
     assert!(first.execution.is_some());
+    assert_eq!(first.resources, Some((4, 4096)));
+    let dir = tempfile::tempdir().unwrap();
+    write_metadata(dir.path(), Arch::X86_64);
+    assert_eq!(
+        block_on(load_build_resources(dir.path())).unwrap(),
+        (4, 4096)
+    );
 
-    let first_without_store = release_registration(false, None, execution());
+    let first_without_store = release_registration(false, None, execution(), Some((4, 4096)));
     assert!(first_without_store.storage_locations.is_empty());
     assert!(first_without_store.execution.is_some());
 
     for uploaded_to in [Some(current), None] {
-        let republished = release_registration(true, uploaded_to, execution());
+        let republished = release_registration(true, uploaded_to, execution(), Some((4, 4096)));
         assert!(republished.storage_locations.is_empty());
+        assert_eq!(republished.resources, None);
         assert!(
             republished.execution.is_none(),
             "a republish must not describe artifacts it did not upload"
@@ -330,9 +340,12 @@ fn registration_requests_carry_publication_authority() {
             &sample_template(),
             sample_hash(),
             &["latest".to_string()],
-            vec![],
             publication,
-            None,
+            ReleaseRegistration {
+                storage_locations: vec![],
+                execution: None,
+                resources: None,
+            },
         );
         assert_eq!(template.org_id.as_deref(), expected_org);
         assert_eq!(release.org_id.as_deref(), expected_org);
@@ -357,6 +370,8 @@ fn registration_requests_carry_publication_authority() {
 
 fn sample_release_request() -> RegisterRequest {
     RegisterRequest::Release(Box::new(RegisterTemplateReleaseRequest {
+        vcpu: None,
+        memory_mib: None,
         system_publication_grant_id: None,
         tenant_publication_grant_id: None,
         template_name: sample_template().as_str().to_string(),

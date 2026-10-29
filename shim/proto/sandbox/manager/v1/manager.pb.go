@@ -3240,12 +3240,8 @@ type SandboxInfo struct {
 	// artifact matches the disk. A time from any other machine isn't
 	// comparable. Absent means unknown, not old: older nodes never set it.
 	CurrentLocalArtifactCreatedAt *timestamppb.Timestamp `protobuf:"bytes,58,opt,name=current_local_artifact_created_at,json=currentLocalArtifactCreatedAt,proto3,oneof" json:"current_local_artifact_created_at,omitempty"`
-	// Allocation captured when the current runtime was activated. Guest RAM
-	// excludes host cgroup headroom; absent on legacy artifacts or workers.
-	ActualVcpu      *uint32 `protobuf:"varint,59,opt,name=actual_vcpu,json=actualVcpu,proto3,oneof" json:"actual_vcpu,omitempty"`
-	ActualMemoryMib *uint32 `protobuf:"varint,60,opt,name=actual_memory_mib,json=actualMemoryMib,proto3,oneof" json:"actual_memory_mib,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	unknownFields                 protoimpl.UnknownFields
+	sizeCache                     protoimpl.SizeCache
 }
 
 func (x *SandboxInfo) Reset() {
@@ -3640,20 +3636,6 @@ func (x *SandboxInfo) GetCurrentLocalArtifactCreatedAt() *timestamppb.Timestamp 
 		return x.CurrentLocalArtifactCreatedAt
 	}
 	return nil
-}
-
-func (x *SandboxInfo) GetActualVcpu() uint32 {
-	if x != nil && x.ActualVcpu != nil {
-		return *x.ActualVcpu
-	}
-	return 0
-}
-
-func (x *SandboxInfo) GetActualMemoryMib() uint32 {
-	if x != nil && x.ActualMemoryMib != nil {
-		return *x.ActualMemoryMib
-	}
-	return 0
 }
 
 type SandboxHealthObservation struct {
@@ -13193,7 +13175,7 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"\x0emetadata_valid\x18\x04 \x01(\bR\rmetadataValidB\v\n" +
 	"\t_template\"b\n" +
 	"\x12CleanupTargetBatch\x12L\n" +
-	"\atargets\x18\x01 \x03(\v22.space.sandbox.manager.v1.CleanupTargetObservationR\atargets\"\x82 \n" +
+	"\atargets\x18\x01 \x03(\v22.space.sandbox.manager.v1.CleanupTargetObservationR\atargets\"\x85\x1f\n" +
 	"\vSandboxInfo\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12\x1f\n" +
@@ -13251,10 +13233,7 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"\x13quarantine_recovery\x187 \x01(\v27.space.sandbox.manager.v1.QuarantineRecoveryObservationH\"R\x12quarantineRecovery\x88\x01\x01\x127\n" +
 	"\x15activation_attempt_id\x188 \x01(\tH#R\x13activationAttemptId\x88\x01\x01\x12R\n" +
 	"\tlifecycle\x189 \x01(\x0e2/.space.sandbox.manager.v1.SandboxLifecycleStateH$R\tlifecycle\x88\x01\x01\x12i\n" +
-	"!current_local_artifact_created_at\x18: \x01(\v2\x1a.google.protobuf.TimestampH%R\x1dcurrentLocalArtifactCreatedAt\x88\x01\x01\x12$\n" +
-	"\vactual_vcpu\x18; \x01(\rH&R\n" +
-	"actualVcpu\x88\x01\x01\x12/\n" +
-	"\x11actual_memory_mib\x18< \x01(\rH'R\x0factualMemoryMib\x88\x01\x01B\v\n" +
+	"!current_local_artifact_created_at\x18: \x01(\v2\x1a.google.protobuf.TimestampH%R\x1dcurrentLocalArtifactCreatedAt\x88\x01\x01B\v\n" +
 	"\t_templateB\x06\n" +
 	"\x04_pidB\f\n" +
 	"\n" +
@@ -13298,9 +13277,7 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"\x16_activation_attempt_idB\f\n" +
 	"\n" +
 	"_lifecycleB$\n" +
-	"\"_current_local_artifact_created_atB\x0e\n" +
-	"\f_actual_vcpuB\x14\n" +
-	"\x12_actual_memory_mib\"\xe5\x01\n" +
+	"\"_current_local_artifact_created_at\"\xe5\x01\n" +
 	"\x18SandboxHealthObservation\x12;\n" +
 	"\vobserved_at\x18\x01 \x01(\v2\x1a.google.protobuf.TimestampR\n" +
 	"observedAt\x12%\n" +

@@ -1158,8 +1158,6 @@ fn published_sandbox_state_uses_batched_enrichment() {
         template: Some("seed".to_string()),
         lifecycle: Some(pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Started as i32),
         snapshots_enabled: true,
-        actual_vcpu: Some(4),
-        actual_memory_mib: Some(8192),
         state_degraded: true,
         activation_attempt_id: Some(TEST_ACTIVATION_ATTEMPT_ID.to_string()),
         auto_lifecycle_authority: PolicyAuthority::Cluster.as_proto_i32(),
@@ -1231,10 +1229,6 @@ fn published_sandbox_state_uses_batched_enrichment() {
 
     let state = published_sandbox_state(&sandbox, Some(42), Some(&policy), vec![snapshot.clone()]);
 
-    assert_eq!(
-        (state.actual_vcpu, state.actual_memory_mib),
-        (Some(4), Some(8192))
-    );
     assert_eq!(state.sandbox_id, sandbox.sandbox_id);
     assert_eq!(state.status.as_deref(), Some("started"));
     assert_eq!(state.observed_network_policy_generation, 7);

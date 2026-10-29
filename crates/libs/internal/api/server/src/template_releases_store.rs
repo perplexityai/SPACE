@@ -597,3 +597,25 @@ pub(super) async fn fill_execution_metadata(
     .await?;
     Ok(())
 }
+
+/// Attach build defaults once; retries must describe the same published artifact.
+pub(super) async fn fill_build_resources(
+    executor: impl sqlx::PgExecutor<'_>,
+    release_id: Uuid,
+    vcpu: i32,
+    memory_mib: i32,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(sql!(
+        "UPDATE template_releases SET vcpu = $2, memory_mib = $3
+         WHERE id = $1 AND (
+             (vcpu IS NULL AND memory_mib IS NULL) OR
+             (vcpu = $2 AND memory_mib = $3)
+         )"
+    ))
+    .bind(release_id)
+    .bind(vcpu)
+    .bind(memory_mib)
+    .execute(executor)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}

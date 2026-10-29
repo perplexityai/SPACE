@@ -68,7 +68,7 @@ To customize the sandbox, edit the request body in `create_sandbox`. The default
 | `template` | Sandbox | A published reference such as `seed:latest` or a digest reference. |
 | `runtime` | Sandbox | Runtime selection; `fc` means Firecracker. |
 | `name`, `metadata` | Sandbox | A readable name and application labels. Do not put credentials here. |
-| `resources.vcpu`, `resources.memory_mib`, `resources.disk_mib` | Sandbox | Requested shape. On Kubernetes, omitted CPU and memory are filled from the activated allocation when reported; older workers leave them `null`. Omitted disk stays `null`. |
+| `resources.vcpu`, `resources.memory_mib`, `resources.disk_mib` | Sandbox | A requested shape. Omitted fields remain `null` in the response while the deployment applies its defaults; the response does not reveal the resolved shape. |
 | `env` | Sandbox | Environment values inherited by commands. |
 | `command` | Command | Executable and argument array. |
 | `cwd` | Command | Existing guest directory; defaults to the guest user's home directory. |

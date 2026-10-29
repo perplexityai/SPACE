@@ -1837,12 +1837,6 @@ pub async fn publish_sandbox_states(
                 .map(PodUid::parse)
                 .transpose()
                 .map_err(|error| Status::invalid_argument(error.to_string()))?;
-            let activation_attempt_id = state
-                .activation_attempt_id
-                .as_deref()
-                .map(str::parse::<SandboxActivationAttemptId>)
-                .transpose()
-                .map_err(|error| Status::invalid_argument(error.to_string()))?;
             let mut row = serde_json::json!({
                 "sandbox_id": sandbox_uuid,
                 "status": optional_trimmed(state.status.as_deref()),
@@ -1914,26 +1908,6 @@ pub async fn publish_sandbox_states(
             let row_fields = row.as_object_mut().ok_or_else(|| {
                 Status::internal("published sandbox state did not serialize as an object")
             })?;
-            row_fields.insert(
-                "actual_vcpu".into(),
-                serde_json::json!(
-                    state
-                        .actual_vcpu
-                        .and_then(|value| i32::try_from(value).ok())
-                ),
-            );
-            row_fields.insert(
-                "actual_memory_mib".into(),
-                serde_json::json!(
-                    state
-                        .actual_memory_mib
-                        .and_then(|value| i32::try_from(value).ok())
-                ),
-            );
-            row_fields.insert(
-                "activation_attempt_id".into(),
-                serde_json::json!(activation_attempt_id.map(|id| id.as_uuid())),
-            );
             let quarantine_recovery_payload = quarantine_recovery.as_ref().map(|observation| {
                 serde_json::json!({
                     "schema_version": observation.schema_version,
@@ -2632,13 +2606,6 @@ pub async fn publish_sandbox_states(
             "clear published quarantine recovery observation: {err}"
         ))
     })?;
-    // Fill omitted shape before publishing readiness in this transaction. A
-    // template's current defaults are not evidence about an existing runtime;
-    // only the node holding this exact activation can supply the allocation.
-    pplx_space_sandbox_store::runtime_shape::fill_published(&mut *conn, node_id, rows_json.clone())
-        .await
-        .map_err(|error| Status::internal(format!("publish runtime allocation: {error}")))?;
-
     sqlx::query(sql!(
         "WITH input AS (
          SELECT *

@@ -342,6 +342,25 @@ impl ClusterApi for ClusterApiService {
             None => Vec::new(),
         };
         let execution_metadata = validated_execution_metadata(request.execution.as_ref())?;
+        let resources = match (request.vcpu, request.memory_mib) {
+            (None, None) => None,
+            (Some(cpu), Some(memory)) if memory > 0 => {
+                let cpu = pplx_space_common_core::types::VcpuCount::try_from_u32(cpu)
+                    .map_err(|error| Status::invalid_argument(error.to_string()))?;
+                let memory = i32::try_from(memory)
+                    .map_err(|_| Status::invalid_argument("memory_mib exceeds supported range"))?;
+                Some((
+                    i32::try_from(cpu.get().get())
+                        .map_err(|_| Status::invalid_argument("vcpu exceeds supported range"))?,
+                    memory,
+                ))
+            }
+            _ => {
+                return Err(Status::invalid_argument(
+                    "vcpu and memory_mib must be a positive pair",
+                ));
+            }
+        };
 
         let mut tx = self
             .pool
@@ -389,6 +408,20 @@ impl ClusterApi for ClusterApiService {
             execution_metadata.as_ref(),
         )
         .await?;
+
+        if let Some((vcpu, memory_mib)) = resources
+            && !super::template_releases_store::fill_build_resources(
+                &mut *tx, release.id, vcpu, memory_mib,
+            )
+            .await
+            .map_err(|error| {
+                template_publication::storage_status("record release resources", &error)
+            })?
+        {
+            return Err(Status::already_exists(
+                "template release already has different resources",
+            ));
+        }
 
         let mut tag_rows = Vec::with_capacity(tags.len());
         for tag in &tags {

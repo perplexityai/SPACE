@@ -416,8 +416,6 @@ pub(super) fn published_sandbox_state(
         execution_generation: sandbox.execution_generation,
         pod_uid: sandbox.pod_uid.clone(),
         activation_attempt_id: sandbox.activation_attempt_id.clone(),
-        actual_vcpu: sandbox.actual_vcpu,
-        actual_memory_mib: sandbox.actual_memory_mib,
         snapshots,
         pid: sandbox.pid,
         namespace: sandbox.namespace.clone(),

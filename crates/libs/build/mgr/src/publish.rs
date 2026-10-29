@@ -89,6 +89,8 @@ impl TemplatePublication {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PublishError {
+    #[error("template metadata lacks CPU or memory defaults: {path}")]
+    MissingBuildResources { path: PathBuf },
     #[error("authorize operator system build: {0}")]
     AuthorizeSystemBuild(#[source] tonic::Status),
     #[error("invalid system publication grant returned by ClusterApi: {0}")]
@@ -155,6 +157,7 @@ impl PublishError {
             | Self::InvalidTemplateName(_)
             | Self::InvalidContentHash(_)
             | Self::ObjectStoreConfig(_)
+            | Self::MissingBuildResources { .. }
             | Self::MissingArtifact { .. }
             | Self::ReadArtifact { .. }
             | Self::InvalidArtifact { .. }
@@ -278,15 +281,20 @@ async fn publish_build_from_dir(
         recorded_release_locations(cluster_api, template, content_hash, publication.org()).await?;
 
     let Some(object_store) = ObjectStoreConfig::from_env_optional()? else {
-        let registration = release_registration(recorded_locations.is_some(), None, execution);
+        let resources = if recorded_locations.is_none() {
+            Some(load_build_resources(build_dir).await?)
+        } else {
+            None
+        };
+        let registration =
+            release_registration(recorded_locations.is_some(), None, execution, resources);
         register_cluster_release(
             cluster_api,
             template,
             content_hash,
             &release_tags,
-            registration.storage_locations,
             publication,
-            registration.execution,
+            registration,
         )
         .await?;
         tracing::info!(
@@ -298,7 +306,7 @@ async fn publish_build_from_dir(
         return Ok(());
     };
     let storage_uri = build_storage_uri(&object_store, template, content_hash);
-    let published = if let Some(recorded) = &recorded_locations {
+    let (published, resources) = if let Some(recorded) = &recorded_locations {
         if recorded.contains(&storage_uri) {
             tracing::info!(
                 template = template.as_str(),
@@ -314,7 +322,7 @@ async fn publish_build_from_dir(
                  registering tags only, no location at the current object store"
             );
         }
-        true
+        (true, None)
     } else {
         let publication_prefix =
             template_object_prefix(&object_store.key_prefix, template, content_hash);
@@ -331,7 +339,7 @@ async fn publish_build_from_dir(
         match vend {
             Publication::Upload(creds) => {
                 let store = S3ObjectStore::new();
-                upload_build_artifacts(
+                let resources = upload_build_artifacts(
                     &store,
                     &creds,
                     &object_store,
@@ -340,7 +348,7 @@ async fn publish_build_from_dir(
                     build_dir,
                 )
                 .await?;
-                false
+                (false, Some(resources))
             }
             Publication::AlreadyPublished => {
                 // Another publisher registered this hash after the lookup, or
@@ -352,20 +360,19 @@ async fn publish_build_from_dir(
                     "credential manager reports the release as already published; \
                      skipping artifact upload and registering tags only"
                 );
-                true
+                (true, None)
             }
         }
     };
-    let registration = release_registration(published, Some(&storage_uri), execution);
+    let registration = release_registration(published, Some(&storage_uri), execution, resources);
 
     register_cluster_release(
         cluster_api,
         template,
         content_hash,
         &release_tags,
-        registration.storage_locations,
         publication,
-        registration.execution,
+        registration,
     )
     .await?;
     Ok(())
@@ -407,6 +414,7 @@ async fn recorded_release_locations(
 struct ReleaseRegistration {
     storage_locations: Vec<String>,
     execution: Option<pplx_space_execution_common::proto::ExecutionMetadata>,
+    resources: Option<(u32, u32)>,
 }
 
 /// A release that is already published, whether the lookup said so or
@@ -421,16 +429,19 @@ fn release_registration(
     published: bool,
     uploaded_to: Option<&str>,
     execution: pplx_space_execution_common::proto::ExecutionMetadata,
+    resources: Option<(u32, u32)>,
 ) -> ReleaseRegistration {
     if published {
         ReleaseRegistration {
             storage_locations: Vec::new(),
             execution: None,
+            resources: None,
         }
     } else {
         ReleaseRegistration {
             storage_locations: uploaded_to.map(str::to_string).into_iter().collect(),
             execution: Some(execution),
+            resources,
         }
     }
 }
@@ -645,17 +656,15 @@ async fn register_cluster_release(
     template: &TemplateName,
     content_hash: ContentHash,
     tags: &[String],
-    storage_connection_strings: Vec<String>,
     publication: TemplatePublication,
-    execution: Option<pplx_space_execution_common::proto::ExecutionMetadata>,
+    registration: ReleaseRegistration,
 ) -> Result<(), PublishError> {
     let request = RegisterRequest::Release(Box::new(release_registration_request(
         template,
         content_hash,
         tags,
-        storage_connection_strings,
         publication,
-        execution,
+        registration,
     )));
     register_with_transient_retry(cluster_api, template, request)
         .await
@@ -666,9 +675,8 @@ fn release_registration_request(
     template: &TemplateName,
     content_hash: ContentHash,
     tags: &[String],
-    storage_connection_strings: Vec<String>,
     publication: TemplatePublication,
-    execution: Option<pplx_space_execution_common::proto::ExecutionMetadata>,
+    registration: ReleaseRegistration,
 ) -> RegisterTemplateReleaseRequest {
     RegisterTemplateReleaseRequest {
         system_publication_grant_id: publication.system_grant().map(|grant| grant.to_string()),
@@ -677,9 +685,11 @@ fn release_registration_request(
         runtime: RUNTIME_FIRECRACKER_ALIAS.to_string(),
         hash: content_hash.to_string(),
         tags: tags.to_vec(),
-        storage_connection_strings,
+        storage_connection_strings: registration.storage_locations,
         org_id: publication.org().map(|owner| owner.org_id().to_string()),
-        execution,
+        execution: registration.execution,
+        vcpu: registration.resources.map(|(cpu, _)| cpu),
+        memory_mib: registration.resources.map(|(_, memory)| memory),
     }
 }
 
@@ -730,6 +740,31 @@ async fn load_build_execution_metadata(
     ))
 }
 
+/// Read the defaults from the metadata that accompanies the uploaded rootfs.
+/// Tags-only republication deliberately drops these with the other local evidence.
+async fn load_build_resources(build_dir: &Path) -> Result<(u32, u32), PublishError> {
+    let path = build_dir.join(TemplateArtifact::Metadata.file_name());
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|source| PublishError::ReadArtifact {
+            path: path.clone(),
+            source,
+        })?;
+    build_resources(&path, &bytes)
+}
+
+fn build_resources(path: &Path, bytes: &[u8]) -> Result<(u32, u32), PublishError> {
+    let metadata: pplx_space_common_core::types::TemplateMetadata =
+        serde_json::from_slice(bytes).map_err(|source| PublishError::InvalidArtifact {
+            path: path.to_owned(),
+            source,
+        })?;
+    let (vcpu, memory, _) = metadata.runtime_defaults();
+    vcpu.zip(memory).ok_or(PublishError::MissingBuildResources {
+        path: path.to_owned(),
+    })
+}
+
 async fn upload_build_artifacts(
     store: &impl ObjectStore,
     creds: &ObjectCredentials,
@@ -737,7 +772,7 @@ async fn upload_build_artifacts(
     template: &TemplateName,
     content_hash: ContentHash,
     build_dir: &Path,
-) -> Result<(), PublishError> {
+) -> Result<(u32, u32), PublishError> {
     let metadata_path = artifact_path(build_dir, TemplateArtifact::Metadata)?;
     let manifest_path = artifact_path(build_dir, TemplateArtifact::Manifest)?;
     let compressed_rootfs_path = artifact_path(build_dir, TemplateArtifact::RootfsZstd)?;
@@ -762,6 +797,8 @@ async fn upload_build_artifacts(
                 path: metadata_path.clone(),
                 source,
             })?;
+    // Persist the defaults from these exact uploaded bytes, not a later local rebuild.
+    let resources = build_resources(&metadata_path, &metadata_bytes)?;
     store
         .put_bytes(
             creds,
@@ -833,7 +870,7 @@ async fn upload_build_artifacts(
         "publish compressed template rootfs input",
     );
 
-    Ok(())
+    Ok(resources)
 }
 
 const COMPRESSED_ROOTFS_READY_TIMEOUT: Duration = Duration::from_secs(30 * 60);

@@ -116,6 +116,8 @@ async fn run(grant: Grant, expected: Code) -> TestResult {
         tenant_publication_grant_id: proof.clone(),
     };
     let publication = RegisterTemplateReleaseRequest {
+        vcpu: None,
+        memory_mib: None,
         template_name: "direct-output".into(),
         runtime: "fc".into(),
         hash: format!("sha256:{}", "a".repeat(64)),

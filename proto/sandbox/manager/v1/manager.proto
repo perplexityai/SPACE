@@ -697,10 +697,6 @@ message SandboxInfo {
   // artifact matches the disk. A time from any other machine isn't
   // comparable. Absent means unknown, not old: older nodes never set it.
   optional google.protobuf.Timestamp current_local_artifact_created_at = 58;
-  // Allocation captured when the current runtime was activated. Guest RAM
-  // excludes host cgroup headroom; absent on legacy artifacts or workers.
-  optional uint32 actual_vcpu = 59;
-  optional uint32 actual_memory_mib = 60;
 }
 
 enum SandboxHealthStatus {

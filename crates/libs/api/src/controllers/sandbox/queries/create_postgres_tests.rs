@@ -1860,6 +1860,27 @@ async fn postgres_template_build_shape_prefers_the_builder_inventory() -> TestRe
     );
     assert_eq!(load("sha256:partial").await?, None);
     assert_eq!(load("sha256:absent").await?, None);
+    // Release defaults survive eviction and take precedence over node observations.
+    sqlx::query(sql!(
+        "UPDATE template_releases SET vcpu = 6, memory_mib = 6144 WHERE hash = 'sha256:shape'"
+    ))
+    .execute(&db.pool)
+    .await?;
+    for evict in [false, true] {
+        if evict {
+            sqlx::query(sql!("DELETE FROM node_template_inventory"))
+                .execute(&db.pool)
+                .await?;
+        }
+        let shape = load("sha256:shape")
+            .await?
+            .expect("durable release defaults");
+        assert_eq!(
+            (shape.vcpu.get().get(), shape.memory.as_mib_floor()),
+            (6, 6144)
+        );
+    }
+
     Ok(())
 }
 
@@ -1867,7 +1888,12 @@ async fn postgres_template_build_shape_prefers_the_builder_inventory() -> TestRe
 async fn postgres_kubernetes_create_fills_unset_resources_from_the_template_shape() -> TestResult {
     let db = pg_test_db().await?;
     let release_id = insert_template_release(&db.pool, "app-runtime", "sha256:shape").await?;
-    insert_inventory_shape(&db.pool, "builder", "sha256:shape", (4, 4096), 0).await?;
+    sqlx::query(sql!(
+        "UPDATE template_releases SET vcpu = 4, memory_mib = 4096 WHERE id = $1"
+    ))
+    .bind(release_id)
+    .execute(&db.pool)
+    .await?;
     let template = TemplateName::parse("app-runtime").unwrap();
     let k8s = SubstrateCapabilities::KUBERNETES;
     let space = SubstrateCapabilities::DIRECT;
@@ -3381,85 +3407,5 @@ async fn admission_claim_executes_and_runs_under_the_claimed_id(
         ("bound", Some(admitted.claim_id)),
         "the admission claim is the one that bound"
     );
-    Ok(())
-}
-
-/// A ready create must answer info with the resolved allocation before the
-/// periodic node report arrives. Stale execution reports cannot supply it.
-#[tokio::test(flavor = "current_thread")]
-async fn created_image_shape_is_visible_immediately_and_fenced() -> TestResult {
-    use crate::controllers::substrate::ExecutionBinding;
-    let db = pg_test_db().await?;
-    let sandbox_id = SandboxId::new();
-    let node_id = NodeId::new();
-    let attempt = Uuid::now_v7();
-    insert_node(&db.pool, node_id).await?;
-    sqlx::query(sql!("INSERT INTO sandboxes (id, user_id, org_id, managed_by, lifecycle, placement, active_node_id, network_policy_generation)
-        VALUES ($1, $2, $3, 'k8s', 'creating', 'on_node', $4, 1)"))
-        .bind(sandbox_id).bind(SEED_USER_ID).bind(SEED_ORG_ID).bind(node_id).execute(&db.pool).await?;
-    sqlx::query(sql!("INSERT INTO sandbox_k8s_executions (sandbox_id, generation, pod_name, pod_namespace, pod_uid, route_activation_id)
-        VALUES ($1, 1, 'created-pod', 'sandboxes', 'created-uid', $2)"))
-        .bind(sandbox_id).bind(attempt).execute(&db.pool).await?;
-    let binding = ExecutionBinding {
-        execution_object_id: "created-pod".into(),
-        runtime_endpoint: tonic::transport::Endpoint::from_static("http://127.0.0.1:1"),
-        execution_generation: 1,
-    };
-    let info = pplx_space_sbx_mgr_client::proto::SandboxInfo {
-        sandbox_id: sandbox_id.to_string(),
-        execution_generation: Some(1),
-        pod_uid: Some("created-uid".into()),
-        activation_attempt_id: Some(attempt.to_string()),
-        actual_vcpu: Some(4),
-        actual_memory_mib: Some(8192),
-        ..Default::default()
-    };
-    let legacy = pplx_space_sbx_mgr_client::proto::SandboxInfo {
-        actual_vcpu: None,
-        actual_memory_mib: None,
-        ..info.clone()
-    };
-    persist_created_sandbox_shape(&db.pool, sandbox_id, node_id, &binding, &legacy).await?;
-    let mut stale_generation = info.clone();
-    stale_generation.execution_generation = Some(2);
-    let mut stale_pod = info.clone();
-    stale_pod.pod_uid = Some("replaced-uid".into());
-    let mut stale_attempt = info.clone();
-    stale_attempt.activation_attempt_id = Some(Uuid::now_v7().to_string());
-    for stale in [stale_generation, stale_pod, stale_attempt] {
-        persist_created_sandbox_shape(&db.pool, sandbox_id, node_id, &binding, &stale)
-            .await
-            .unwrap_err();
-    }
-    let row = fetch_sandbox(&db.pool, sandbox_id).await?.unwrap();
-    assert_eq!((row.vcpu, row.memory_mib), (None, None));
-    // An actual replacement during the read must survive rejection of the old response.
-    sqlx::query(sql!("UPDATE sandbox_k8s_executions SET generation = 2, pod_uid = 'replacement-uid' WHERE sandbox_id = $1"))
-        .bind(sandbox_id).execute(&db.pool).await?;
-    persist_created_sandbox_shape(&db.pool, sandbox_id, node_id, &binding, &info)
-        .await
-        .unwrap_err();
-    let replacement: (i64, String) = sqlx::query_as(sql!(
-        "SELECT generation, pod_uid FROM sandbox_k8s_executions WHERE sandbox_id = $1 AND active"
-    ))
-    .bind(sandbox_id)
-    .fetch_one(&db.pool)
-    .await?;
-    assert_eq!(replacement, (2, "replacement-uid".into()));
-    assert!(fetch_sandbox(&db.pool, sandbox_id).await?.is_some());
-    sqlx::query(sql!("UPDATE sandbox_k8s_executions SET generation = 1, pod_uid = 'created-uid' WHERE sandbox_id = $1"))
-        .bind(sandbox_id).execute(&db.pool).await?;
-    persist_created_sandbox_shape(&db.pool, sandbox_id, node_id, &binding, &info).await?;
-    let row = fetch_sandbox(&db.pool, sandbox_id).await?.unwrap();
-    assert_eq!((row.vcpu, row.memory_mib), (Some(4), Some(8192)));
-    // Later runtime observations cannot replace a fixed allocation.
-    let changed = pplx_space_sbx_mgr_client::proto::SandboxInfo {
-        actual_vcpu: Some(8),
-        actual_memory_mib: Some(16384),
-        ..info
-    };
-    persist_created_sandbox_shape(&db.pool, sandbox_id, node_id, &binding, &changed).await?;
-    let row = fetch_sandbox(&db.pool, sandbox_id).await?.unwrap();
-    assert_eq!((row.vcpu, row.memory_mib), (Some(4), Some(8192)));
     Ok(())
 }

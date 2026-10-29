@@ -95,12 +95,15 @@ fn builder_completes_same_publication_after_database_lock_releases(
             &template,
             sample_hash(),
             &["latest".into()],
-            vec![],
             TemplatePublication::Tenant {
                 org: TemplateOrg::new(owner),
                 grant: Some(grant),
             },
-            None,
+            ReleaseRegistration {
+                storage_locations: vec![],
+                execution: None,
+                resources: None,
+            },
         )));
         // Keep the real retry loop; eliminate backoff wall time, not RPC or SQL work.
         let schedule = RegisterRetrySchedule {

@@ -43,7 +43,7 @@ fn sandbox_artifact_metadata(
     sandbox_artifact_metadata_in(std::path::Path::new(CACHE_DIR), sandbox_id)
 }
 
-pub(super) fn sandbox_artifact_metadata_in(
+fn sandbox_artifact_metadata_in(
     cache_dir: &std::path::Path,
     sandbox_id: &str,
 ) -> Result<Option<pplx_space_common_core::types::SandboxArtifactMetadata>, RuntimeArtifactReadError>

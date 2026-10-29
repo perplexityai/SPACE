@@ -5027,11 +5027,8 @@ async fn failed_terminal_state_control_plane_routes_return_failed_to_place() -> 
     Ok(())
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn detail_and_list_sandbox_use_cached_runtime_spec() {
-    if !pplx_space_test_env::enter_test_process(&[]) {
-        return;
-    }
+#[test]
+fn detail_sandbox_uses_cached_runtime_spec() {
     let mut sandbox = test_sandbox();
     sandbox.template_id = Some("cached-template".to_string());
     sandbox.vcpu = Some(4);
@@ -5056,11 +5053,6 @@ async fn detail_and_list_sandbox_use_cached_runtime_spec() {
     assert_eq!(detail.memory_mb, 8192);
     assert_eq!(detail.disk_size_mb, 32768);
     assert_eq!(detail.domain.as_deref(), Some(TEST_ECW_HOST));
-    let listed = super::build_listed_sandbox(&test_state().await, &sandbox, &response)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!((listed.cpu_count, listed.memory_mb), (4, 8192));
 }
 
 #[test]

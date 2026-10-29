@@ -52,6 +52,8 @@ fn registration(name: &str, org: Option<Uuid>) -> RegisterTemplateRequest {
 
 fn release(name: &str, org: Option<Uuid>) -> RegisterTemplateReleaseRequest {
     RegisterTemplateReleaseRequest {
+        vcpu: None,
+        memory_mib: None,
         system_publication_grant_id: None,
         tenant_publication_grant_id: None,
         template_name: name.into(),
