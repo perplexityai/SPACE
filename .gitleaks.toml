@@ -177,3 +177,10 @@ targetRules = ["generic-api-key"]
 condition = "AND"
 paths = ['''^bench/publish/cpu-acceptance-v3/head-16243df3/summary\.json$''']
 regexes = ['''^996cb04a1afe7083f79d1bc932e3bca225d0f0b53b58e013ff7cc752d1644796$''']
+
+[[allowlists]]
+description = "Verified SHA-256 of the measured publication executable at 8605c444"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''^bench/publish/cpu-acceptance-v3/head-8605c444/summary\.json$''']
+regexes = ['''^3d29f08c3973152f3b731a8a304bcf69ddd1b88569a840f2d399c58005276c68$''']
