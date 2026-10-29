@@ -111,6 +111,7 @@ async fn node_local_suspend_of_a_superseded_execution_rolls_back() {
                 local_artifact_id,
                 snapshot_dir.to_str().unwrap(),
                 SuspendSnapshotFormat::Full,
+                false,
             )
             .await
             .expect_err("the cluster refuses a superseded execution's capture");

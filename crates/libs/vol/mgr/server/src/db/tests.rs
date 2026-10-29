@@ -1,6 +1,54 @@
 use super::*;
 
 #[tokio::test]
+async fn exact_destination_lookup_finds_old_and_conflicting_transfers_before_limiting() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("volume-manager.sqlite");
+    crate::run::migrate_volume_manager_db(&path).await.unwrap();
+    let conn = Connection::open(&path).unwrap();
+    let subject = "sandbox:synthetic-handoff";
+    let destination = "s3://test-bucket/immutable/metadata";
+    let first = pplx_space_common_jobs::JobId::new();
+    let insert = |id: pplx_space_common_jobs::JobId, uri: &str, status: &str| {
+        conn.execute(
+            "INSERT INTO jobs (job_id, kind, subject_id, status, payload)
+             VALUES (?1, 'push', ?2, ?3, ?4)",
+            params![
+                id,
+                subject,
+                status,
+                serde_json::json!({"s3_uri": uri}).to_string()
+            ],
+        )
+        .unwrap();
+    };
+    insert(first, destination, "completed");
+    for index in 0..120 {
+        insert(
+            pplx_space_common_jobs::JobId::new(),
+            &format!("s3://test-bucket/other/{index}"),
+            "running",
+        );
+    }
+    let jobs = transfer_jobs_at_destination(&conn, subject, destination, 2).unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].job_id, first);
+    assert_eq!(jobs[0].status, "completed");
+    assert!(
+        transfer_jobs_at_destination(&conn, subject, "s3://test-bucket/absent", 2)
+            .unwrap()
+            .is_empty()
+    );
+    insert(pplx_space_common_jobs::JobId::new(), destination, "failed");
+    assert_eq!(
+        transfer_jobs_at_destination(&conn, subject, destination, 2)
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
 async fn send_source_census_keeps_all_unfinished_jobs_including_cancellation() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("volume-manager.sqlite");

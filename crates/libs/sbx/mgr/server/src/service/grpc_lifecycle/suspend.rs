@@ -194,6 +194,7 @@ impl SandboxManagerService {
         }
         let artifact_lock = self.auto_lifecycle.artifact_lock(&sandbox.id);
         let artifact_guard = artifact_lock.lock_owned().await;
+        self.invalidate_auto_suspend_handoff(&sandbox.id)?;
         // A blocking suspend commits the full artifact before replying. If the
         // caller loses the response or its control-plane marker write fails,
         // retrying must return that exact committed artifact instead of trying
@@ -536,6 +537,7 @@ impl SandboxManagerService {
             started_at: create_started_at,
             publish_node_state: context.publish_node_state,
             durability: context.durability,
+            auto_suspend: context.event_trigger == Some(SandboxEventTrigger::AutoLifecycle),
         };
         Ok((blocking_local_artifact_id, publication))
     }

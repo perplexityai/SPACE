@@ -17,6 +17,30 @@ pub fn sandbox(conn: &Connection, id: &str) -> Result<Option<SandboxRow>> {
     crate::db::get_sandbox(conn, id)
 }
 
+/// The newest scheduler-owned suspend handoff, including a terminal result.
+/// The caller must validate its recorded idle epoch and execution before use.
+pub fn auto_suspend_upload(
+    conn: &Connection,
+    sandbox_id: &str,
+) -> Result<Option<pplx_space_common_jobs::Job>> {
+    use rusqlite::OptionalExtension as _;
+    let id: Option<pplx_space_common_core::types::JobId> = conn
+        .raw()
+        .query_row(
+            "SELECT job_id FROM jobs
+         WHERE kind = 'snapshot_upload' AND subject_id = ?1
+           AND CASE WHEN json_valid(payload)
+                    THEN json_type(payload, '$.auto_suspend') = 'object' ELSE 0 END
+         ORDER BY rowid DESC LIMIT 1",
+            [sandbox_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    id.map(|id| pplx_space_common_jobs::db::get_job(conn.raw(), &id))
+        .transpose()
+        .map(Option::flatten)
+        .map_err(Into::into)
+}
 /// [`sandbox`] for a bounded inventory: the row's raw bytes are charged to
 /// `budget` before it is decoded, so a limit failure allocates nothing.
 pub fn sandbox_within_budget(

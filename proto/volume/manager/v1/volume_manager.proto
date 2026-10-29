@@ -439,6 +439,8 @@ message TransferJob {
     // with more than one had a failed attempt; `error` is cleared on
     // completion, `attempts` never is.
     uint32            attempts          = 13;
+    // Durable submission identity, including the retained source for btrfs.
+    optional string   dedup_key         = 14;
 }
 
 message GetTransferJobRequest {
@@ -456,10 +458,15 @@ message ListTransferJobsRequest {
     optional TransferJobStatus status_filter = 2;
     // Maximum number of jobs to return. 0 means server default (100).
     uint32                     limit         = 3;
+    // Exact destination lookup before the limit, for immutable admission rejoin.
+    optional string            s3_uri        = 4;
 }
 
 message ListTransferJobsResponse {
     repeated TransferJob jobs = 1;
+    // Wait for a capable successor rather than interpreting an older peer's
+    // truncated list as proof of absence during a rolling upgrade.
+    bool exact_destination_lookup = 2;
 }
 
 message CancelTransferRequest {

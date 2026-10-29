@@ -540,6 +540,7 @@ fn legacy_payload_deserializes_without_metadata_job_flag() {
 #[test]
 fn new_payload_round_trips_metadata_job_flag() {
     let jobs = SnapshotUploadJobs {
+        auto_suspend: None,
         meta: fixture_meta(None),
         snapshot_id: "snap-1".to_string(),
         snapshot_dir: std::path::PathBuf::from("/space/cache/sbx/snapshot"),
@@ -566,6 +567,7 @@ fn new_payload_round_trips_metadata_job_flag() {
 fn payload_round_trips_execution_generation() {
     let generation = pplx_space_common_core::types::ExecutionGeneration::new(7).unwrap();
     let jobs = SnapshotUploadJobs {
+        auto_suspend: None,
         meta: fixture_meta(None),
         snapshot_id: "snap-1".to_string(),
         snapshot_dir: std::path::PathBuf::from("/space/cache/sbx/snapshot"),
@@ -601,6 +603,7 @@ fn cleanup_metadata_staging_dir_removes_only_owned_staging_dir() {
     std::fs::write(staging_dir.join(SNAPSHOT_METADATA_FILENAME), "{}").unwrap();
 
     let jobs = SnapshotUploadJobs {
+        auto_suspend: None,
         meta: fixture_meta(None),
         snapshot_id: "snap-1".to_string(),
         snapshot_dir: snapshot_dir.clone(),

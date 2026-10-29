@@ -755,6 +755,10 @@ pub struct AutoLifecycleConditionRuntimeState {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct AutoLifecycleRuntimeState {
+    /// Invalidates a pending suspend handoff even when two activity or
+    /// explicit lifecycle operations share the same second.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub handoff_epoch: u64,
     /// A connect-request minimum deadline, independent of actual activity.
     #[cfg_attr(feature = "serde", serde(default))]
     pub access_extended_until: Option<u64>,

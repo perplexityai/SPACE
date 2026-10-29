@@ -316,6 +316,10 @@ pub enum JobError {
     /// shutting-down worker.
     #[error("job execution yielded for restart")]
     YieldedForRestart,
+    /// A durable prerequisite is not ready. Release the execution slot and
+    /// refund this attempt, without applying the executor's failure budget.
+    #[error("job prerequisite deferred for {0:?}")]
+    Deferred(std::time::Duration),
 }
 
 impl JobError {
@@ -325,20 +329,26 @@ impl JobError {
             | Self::PermanentWithReason { message, .. }
             | Self::Retriable(message) => message,
             Self::YieldedForRestart => "job execution yielded for restart",
+            Self::Deferred(_) => "job prerequisite is not ready",
         }
     }
 
     pub const fn kind(&self) -> JobFailureKind {
         match self {
             Self::Permanent(_) | Self::PermanentWithReason { .. } => JobFailureKind::Permanent,
-            Self::Retriable(_) | Self::YieldedForRestart => JobFailureKind::Retriable,
+            Self::Retriable(_) | Self::YieldedForRestart | Self::Deferred(_) => {
+                JobFailureKind::Retriable
+            }
         }
     }
 
     pub const fn failure_reason(&self) -> Option<JobFailureReason> {
         match self {
             Self::PermanentWithReason { reason, .. } => Some(*reason),
-            Self::Permanent(_) | Self::Retriable(_) | Self::YieldedForRestart => None,
+            Self::Permanent(_)
+            | Self::Retriable(_)
+            | Self::YieldedForRestart
+            | Self::Deferred(_) => None,
         }
     }
 

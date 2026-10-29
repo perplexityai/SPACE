@@ -4,6 +4,28 @@ use std::{fmt, str::FromStr};
 
 use crate::VolumeAttachment;
 
+/// Exact destination lookup, before applying any result bound. A caller asking
+/// for two matches can distinguish absent, unique, and conflicting work.
+pub fn transfer_jobs_at_destination(
+    conn: &Connection,
+    subject_id: &str,
+    uri: &str,
+    limit: u32,
+) -> rusqlite::Result<Vec<pplx_space_common_jobs::Job>> {
+    let mut statement = conn.prepare(
+        "SELECT job_id FROM jobs WHERE subject_id = ?1
+         AND CASE WHEN json_valid(payload) THEN json_extract(payload, '$.s3_uri') = ?2 ELSE 0 END
+         ORDER BY created_at DESC LIMIT ?3",
+    )?;
+    let ids = statement
+        .query_map(params![subject_id, uri, limit.max(1)], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<pplx_space_common_jobs::JobId>>>()?;
+    ids.into_iter()
+        .map(|id| pplx_space_common_jobs::db::get_job(conn, &id))
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map(|jobs| jobs.into_iter().flatten().collect())
+}
+
 /// Validated UUID spelling used as an attachment table key.
 ///
 /// Historical rows use case-sensitive TEXT keys supplied by callers. Keep the

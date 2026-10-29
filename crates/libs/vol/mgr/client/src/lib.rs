@@ -86,6 +86,17 @@ pub async fn connect(socket_path: &str) -> Result<ConnectedVolumeManagerClient, 
     Ok(VolumeManagerClient::new(wrap_grpc_client_channel(channel)))
 }
 
+/// A cached, reconnecting channel for callers that already own an RPC deadline.
+/// Dialing happens inside the caller's bounded operation, with no nested
+/// connect-only retry budget.
+pub fn lazy(socket_path: &Path) -> ConnectedVolumeManagerClient {
+    let channel = pplx_space_common_grpc::connect_uds_channel_lazy(
+        socket_path,
+        tonic::transport::Endpoint::from_static("http://tonic"),
+    );
+    VolumeManagerClient::new(wrap_grpc_client_channel(channel))
+}
+
 pub const VOLMGR_SOCKET: &str = pplx_space_common_core::host::linux::paths::VOLUME_MANAGER_SOCKET;
 pub const RESTORE_PRIORITY: i32 = 100;
 pub const VERIFIED_REPLICA_PROVENANCE_VERSION: u32 = 1;

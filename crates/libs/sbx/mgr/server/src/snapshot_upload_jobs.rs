@@ -130,6 +130,24 @@ impl JobExecutor for SnapshotUploadExecutor {
         }
 
         let mut payload: SnapshotUploadJobs = job.payload_as()?;
+        if let Some(owner) = &payload.auto_suspend
+            && payload.job_ids.is_empty()
+        {
+            let current = self
+                .db
+                .lock()
+                .map_err(|_| JobError::retriable("database mutex poisoned"))
+                .and_then(|db| {
+                    crate::db::read::sandbox(&db, &payload.meta.sandbox_id)
+                        .map_err(JobError::retriable)
+                })?;
+            if !current.as_ref().is_some_and(|row| owner.owns(row)) {
+                return Err(JobError::permanent("auto-suspend admission was superseded"));
+            }
+            // Admission has one owner and one foreground budget. In particular,
+            // do not spend the upload worker's retry budget waiting for it.
+            return Err(JobError::Deferred(Duration::from_secs(5)));
+        }
         if !payload.includes_metadata_job {
             let error = JobError::permanent("snapshot upload requires staged metadata");
             converge_failed_upload(&payload, "unstaged_metadata", error.message()).await;

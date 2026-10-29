@@ -486,6 +486,10 @@ impl FakeVolumeManager {
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let transfers = std::sync::Arc::new(std::sync::Mutex::new(transfers));
         let observed = std::sync::Arc::clone(&transfers);
+        let jobs = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            String,
+            vol::TransferJob,
+        >::new()));
         let rpc = tower::service_fn(move |request: http::Request<tonic::body::Body>| {
             let method = request
                 .uri()
@@ -495,12 +499,48 @@ impl FakeVolumeManager {
                 .unwrap_or_default()
                 .to_owned();
             let transfers = *observed.lock().unwrap();
+            let jobs = jobs.clone();
             async move {
                 Ok::<_, std::convert::Infallible>(match method.as_str() {
                     "SubmitPushFile" => {
-                        answer(request, |_: vol::PushFileRequest| {
-                            Ok(vol::SubmitTransferResponse {
-                                job_id: JobId::new().to_string(),
+                        answer(request, move |request: vol::PushFileRequest| {
+                            let id = JobId::new().to_string();
+                            jobs.lock().unwrap().insert(
+                                id.clone(),
+                                vol::TransferJob {
+                                    job_id: id.clone(),
+                                    subject_id: request.subject_id,
+                                    kind: "push".to_owned(),
+                                    local_path: request.local_path,
+                                    s3_uri: request.s3_uri,
+                                    status: vol::TransferJobStatus::Running as i32,
+                                    ..Default::default()
+                                },
+                            );
+                            Ok(vol::SubmitTransferResponse { job_id: id })
+                        })
+                        .await
+                    }
+                    "ListTransferJobs" => {
+                        answer(request, move |request: vol::ListTransferJobsRequest| {
+                            Ok(vol::ListTransferJobsResponse {
+                                exact_destination_lookup: true,
+                                jobs: jobs
+                                    .lock()
+                                    .unwrap()
+                                    .values()
+                                    .filter(|job| {
+                                        request
+                                            .subject_id
+                                            .as_ref()
+                                            .is_none_or(|subject| &job.subject_id == subject)
+                                            && request
+                                                .s3_uri
+                                                .as_ref()
+                                                .is_none_or(|uri| &job.s3_uri == uri)
+                                    })
+                                    .cloned()
+                                    .collect(),
                             })
                         })
                         .await
@@ -517,11 +557,16 @@ impl FakeVolumeManager {
                             };
                             Ok(vol::GetTransferJobResponse {
                                 job: Some(vol::TransferJob {
-                                    job_id: request.job_id,
+                                    job_id: request.job_id.clone(),
                                     status: status as i32,
                                     bytes_transferred: 18,
                                     error,
-                                    ..Default::default()
+                                    ..jobs
+                                        .lock()
+                                        .unwrap()
+                                        .get(&request.job_id)
+                                        .cloned()
+                                        .ok_or_else(|| Status::not_found("transfer"))?
                                 }),
                             })
                         })
@@ -634,6 +679,7 @@ async fn suspended_after_node_local_upload(
             artifact_id,
             snapshot_dir.to_str().unwrap(),
             SuspendSnapshotFormat::Full,
+            false,
         )
         .await;
     match upload {

@@ -89,6 +89,10 @@ from space_smoke.capabilities import (
     WarmPoolCandidate,
     WarmPoolObserver,
 )
+from space_smoke.autosuspend_handoff import (
+    AutosuspendHandoffAssertions,
+    AutosuspendHandoffControl,
+)
 from space_smoke.adapters import (
     BTRFS_SEND_V1,
     NODE_MANAGER,
@@ -2861,6 +2865,15 @@ class KindEcw(Ecw):
 
     _teardown_restart_control: TeardownRestartControl | None = None
     _teardown_restart_assertions: TeardownRestartAssertions | None = None
+
+    _autosuspend_handoff_control: AutosuspendHandoffControl | None = None
+
+    @property
+    def autosuspend_handoff(self) -> AutosuspendHandoffAssertions:
+        """A graceful handoff fault restricted to the isolated Kind backend."""
+        if self._autosuspend_handoff_control is None:
+            raise SmokeConfigurationError("volume handoff requires the isolated Kind backend")
+        return AutosuspendHandoffAssertions(self, self._autosuspend_handoff_control)
 
     @property
     def teardown_restart(self) -> TeardownRestartAssertions:

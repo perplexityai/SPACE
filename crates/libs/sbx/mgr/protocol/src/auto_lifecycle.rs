@@ -488,6 +488,7 @@ impl From<AutoLifecycleStatus> for proto::AutoLifecycleStatus {
 
 pub fn runtime_state_from_status(status: &AutoLifecycleStatus) -> AutoLifecycleRuntimeState {
     AutoLifecycleRuntimeState {
+        handoff_epoch: 0,
         // A replacement execution does not inherit the previous runtime's floor.
         access_extended_until: None,
         conditions: status
