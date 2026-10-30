@@ -49,6 +49,9 @@ pub enum AdmissionRejectReason {
     RateLimited,
     Disabled,
     EmptyCluster,
+    /// The slot check found every start-eligible node with all its network
+    /// slots held. Accompanies a `Rejected` decision answered with a 503.
+    NoFreeSlot,
     /// The shared token-bucket store (Redis) was reachable but a runtime op
     /// (pool checkout / `EVALSHA`) failed. The cluster limiter fails open, so
     /// this accompanies an `Accepted` decision: admitted despite the store
@@ -74,6 +77,7 @@ impl AdmissionRejectReason {
             Self::RateLimited => "rate_limited",
             Self::Disabled => "disabled",
             Self::EmptyCluster => "empty_cluster",
+            Self::NoFreeSlot => "no_free_slot",
             Self::StoreUnavailable => "store_unavailable",
             Self::Misconfigured => "misconfigured",
             Self::CapacityUnavailable => "capacity_unavailable",
@@ -254,6 +258,45 @@ pub fn cluster_refill_rps(value: f64) {
         "cluster.sandbox_admission.rate.refill_rps",
         value,
         &[tag("bucket", "sandbox_activation")],
+    );
+}
+
+metric_vocabulary! {
+    /// What the cluster limiter's slot check read for one activation: whether
+    /// an eligible node has a free network slot, or why it couldn't tell.
+    ClusterSlotHeadroom {
+        Available => "available",
+        /// A free slot exists, but some eligible node advertises no slots,
+        /// usually because node-ctl isn't advertising its slot capacity.
+        AvailableWithSlotlessNodes => "available_with_slotless_nodes",
+        Full => "full",
+        /// No free slot, and some eligible node advertises no slots: it can't
+        /// take a sandbox pod, so it counts as full.
+        FullWithSlotlessNodes => "full_with_slotless_nodes",
+        /// The substrate has no slot pool (Direct runs no pods).
+        Unsupported => "unsupported",
+        NodeCacheCold => "node_cache_cold",
+        PodCacheCold => "pod_cache_cold",
+    }
+}
+
+/// Written once per cold create the slot check reads, which needs only the
+/// check on; while the cluster limiter is on, the empty-cluster guard must have
+/// passed first. Direct writes `unsupported`. A `full`
+/// or `full_with_slotless_nodes` reading is also a `no_free_slot` rejection in
+/// [`cluster_decision`]; every other reading leaves the decision to the gates
+/// after it.
+pub fn cluster_slot_headroom(
+    operation_class: AdmissionOperationClass,
+    headroom: ClusterSlotHeadroom,
+) {
+    counter(
+        "cluster.sandbox_admission.slot_headroom",
+        1,
+        &[
+            tag("operation_class", operation_class.as_str()),
+            tag("headroom", headroom),
+        ],
     );
 }
 

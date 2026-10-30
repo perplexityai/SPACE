@@ -21,6 +21,12 @@ fn cluster_delete_miss_reason_classifies_by_substrate_error() {
         "node_unavailable",
     );
     assert_eq!(
+        cluster_delete_miss_reason(&SubstrateError::Unschedulable {
+            message: "sandbox pod is unschedulable: 0/3 nodes are available".into(),
+        }),
+        "node_unavailable",
+    );
+    assert_eq!(
         cluster_delete_miss_reason(&SubstrateError::Failed {
             message: "node-api delete error".into(),
         }),
@@ -222,12 +228,7 @@ async fn rejected_activation_emits_no_orphaned_requested_event() -> TestResult {
     };
     let admission = crate::cluster_admission::ClusterSandboxAdmission::with_config(
         make_substrate(),
-        crate::cluster_admission::ClusterSandboxAdmissionConfig {
-            enabled: true,
-            refill_rps: 6.0,
-            burst: 60.0,
-            redis_url: None,
-        },
+        crate::test_support::enabled_config(),
         pplx_space_feature_flags::FeatureFlagClient::disabled(),
     );
     let controller = SandboxController::with_cluster_admission(make_substrate(), admission);
@@ -296,12 +297,7 @@ async fn direct_start_restore_spends_deferred_admission_at_entry() -> TestResult
     };
     let admission = crate::cluster_admission::ClusterSandboxAdmission::with_config(
         make_substrate(),
-        crate::cluster_admission::ClusterSandboxAdmissionConfig {
-            enabled: true,
-            refill_rps: 6.0,
-            burst: 60.0,
-            redis_url: None,
-        },
+        crate::test_support::enabled_config(),
         pplx_space_feature_flags::FeatureFlagClient::disabled(),
     );
     let controller = SandboxController::with_cluster_admission(make_substrate(), admission);
@@ -549,12 +545,7 @@ async fn invalid_activation_options_reject_before_admission_and_requested_event(
     };
     let admission = crate::cluster_admission::ClusterSandboxAdmission::with_config(
         make_substrate(),
-        crate::cluster_admission::ClusterSandboxAdmissionConfig {
-            enabled: true,
-            refill_rps: 6.0,
-            burst: 60.0,
-            redis_url: None,
-        },
+        crate::test_support::enabled_config(),
         pplx_space_feature_flags::FeatureFlagClient::disabled(),
     );
     let controller = SandboxController::with_cluster_admission(make_substrate(), admission);
@@ -759,9 +750,7 @@ async fn exhausting_the_finalize_retry_budget_stays_retryable() -> TestResult {
         make_substrate(),
         crate::cluster_admission::ClusterSandboxAdmissionConfig {
             enabled: false,
-            refill_rps: 6.0,
-            burst: 60.0,
-            redis_url: None,
+            ..crate::test_support::enabled_config()
         },
         pplx_space_feature_flags::FeatureFlagClient::disabled(),
     );

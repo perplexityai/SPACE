@@ -984,6 +984,13 @@ impl KubernetesSubstrate {
     /// rather than `nodes.is_empty()` is what keeps a total node outage from
     /// silently failing open forever.
     pub fn eligible_start_node_count(&self) -> Option<u64> {
+        self.eligible_start_nodes()
+            .map(|nodes| u64::try_from(nodes.len()).unwrap_or(u64::MAX))
+    }
+
+    /// The nodes [`Self::eligible_start_node_count`] counts, or `None` while
+    /// the node cache is cold.
+    fn eligible_start_nodes(&self) -> Option<Vec<std::sync::Arc<Node>>> {
         if !self.k8s.caches.nodes_ready() {
             return None;
         }
@@ -994,17 +1001,38 @@ impl KubernetesSubstrate {
         // nodes stay schedulable, so the candidate filter must follow the same
         // switch or admission would report a false `empty_cluster`.
         let exclude_placement_blocked = config.ssd_headroom_tier_affinity;
-        let count = self
-            .k8s
-            .caches
-            .nodes
-            .state()
-            .iter()
-            .filter(|node| adapter::node_schedulable(node))
-            .filter(|node| selector.matches(node))
-            .filter(|node| !exclude_placement_blocked || adapter::node_not_placement_blocked(node))
-            .count();
-        Some(count as u64)
+        Some(
+            self.k8s
+                .caches
+                .nodes
+                .state()
+                .into_iter()
+                .filter(|node| adapter::node_schedulable(node))
+                .filter(|node| selector.matches(node))
+                .filter(|node| {
+                    !exclude_placement_blocked || adapter::node_not_placement_blocked(node)
+                })
+                .collect(),
+        )
+    }
+
+    /// Network-slot headroom over [`Self::eligible_start_nodes`]: allocatable
+    /// `space.pplx.net/network-slots` minus the slots that bound, live sandbox
+    /// pods request, from the node and sandbox-pod reflectors.
+    ///
+    /// Reads low by the pods created but not yet bound, which hold no node's
+    /// slot in the index until the scheduler places them. So concurrent
+    /// activations can pass a nearly full cluster and wait `Pending`; this
+    /// is a guardrail that catches a full cluster, not a reservation.
+    pub fn network_slot_headroom(&self) -> super::NetworkSlotHeadroom {
+        use super::{NetworkSlotHeadroom, NetworkSlotHeadroomUnknown};
+        let Some(nodes) = self.eligible_start_nodes() else {
+            return NetworkSlotHeadroom::Unknown(NetworkSlotHeadroomUnknown::NodeCacheCold);
+        };
+        if !self.pod_reflector_ready.is_ready() {
+            return NetworkSlotHeadroom::Unknown(NetworkSlotHeadroomUnknown::PodCacheCold);
+        }
+        adapter::network_slot_headroom(&nodes, &self.pod_network_slots)
     }
 
     /// Source-aware restore shortlist: the source node first, then up to

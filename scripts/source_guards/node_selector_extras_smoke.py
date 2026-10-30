@@ -324,7 +324,14 @@ def check_rejection_message_matches_the_api(expected: str) -> None:
             f"scenario's own test as well as in this check."
         )
     admission = _join_continuations(_read(ADMISSION))
-    blocks = _brace_blocks(admission, r"(?:ClusterAdmissionError|Self)::EmptyCluster\s*\{")
+    # A variant construction, or a struct construction whose `kind` names the
+    # empty-cluster rejection. The struct opener also matches the definition
+    # and destructurings; neither names the kind, so the filter drops them.
+    blocks = _brace_blocks(admission, r"(?:ClusterAdmissionError|Self)::EmptyCluster\s*\{") + [
+        body
+        for body in _brace_blocks(admission, r"\bClusterAdmissionError\s*\{")
+        if re.search(r"\bkind\s*:\s*ActivationRejectionKind::EmptyCluster\b", body)
+    ]
     if not blocks:
         raise GuardError(
             f"no ClusterAdmissionError::EmptyCluster construction in "

@@ -1605,6 +1605,47 @@ async fn postgres_pooled_federated_sandbox_persists_service_grant() -> TestResul
     Ok(())
 }
 
+/// A cold create reads the slot check, and its refusal comes before the
+/// sandbox row exists.
+#[cfg(feature = "kubernetes")]
+#[tokio::test(flavor = "current_thread")]
+async fn postgres_cold_create_on_a_full_cluster_is_refused_before_its_row() -> TestResult {
+    let db = pg_test_db().await?;
+    let actor = insert_actor(&db.pool).await?;
+    let release_id = insert_template_release(&db.pool, "seed", "sha256:full-cluster-cold").await?;
+    insert_template_release_tag(&db.pool, release_id, "seed", "latest").await?;
+    let controller = SandboxController::with_cluster_admission(
+        crate::controllers::substrate::Substrate::from_direct(
+            crate::controllers::substrate::direct::DirectSubstrate::new(db.pool.clone()),
+        ),
+        crate::test_support::kubernetes::full_cluster_slot_check_admission(&db.pool),
+    );
+    let mut req = pooled_create_request("full-cluster-cold", None);
+    req.boot_mode = Some("cold".to_string());
+    req.template = Some("seed:latest".parse()?);
+
+    let error = controller
+        .create(
+            &db.pool,
+            &actor,
+            &req,
+            SandboxApiMetricIdentity::native("create"),
+            FederatedSandboxCreateContext::new(None, None),
+        )
+        .await
+        .expect_err("a full cluster refuses a cold create");
+
+    assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE, "{error}");
+    assert!(error.retry_after_header().is_some(), "{error}");
+    let (rows,): (i64,) = sqlx::query_as(sql!(
+        "SELECT COUNT(*) FROM sandboxes WHERE name = 'full-cluster-cold'"
+    ))
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(rows, 0);
+    Ok(())
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn postgres_cold_federated_create_is_atomic_with_grant_upsert() -> TestResult {
     let db = pg_test_db().await?;

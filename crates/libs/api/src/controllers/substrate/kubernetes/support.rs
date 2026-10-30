@@ -882,7 +882,10 @@ pub(super) fn classify_wake_rpc_error(error: &tonic::Status) -> WakeRpcErrorDisp
 /// failure, malformed pod IP — is a genuine infra fault that the pod-delete
 /// loop would hit too, so it must propagate.
 pub(super) fn delete_can_skip_runtime_cleanup(err: &SubstrateError) -> bool {
-    matches!(err, SubstrateError::Unavailable { .. })
+    matches!(
+        err,
+        SubstrateError::Unavailable { .. } | SubstrateError::Unschedulable { .. }
+    )
 }
 
 /// Whether an execution teardown destroys node-local sandbox state or

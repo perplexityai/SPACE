@@ -164,6 +164,41 @@ def test_the_message_check_skips_a_destructuring_pattern(
     guard.check_rejection_message_matches_the_api(MESSAGE)
 
 
+def _struct_shape(empty_cluster_message: str) -> str:
+    return (
+        "pub struct ClusterAdmissionError { kind: ActivationRejectionKind, message: String }\n"
+        "fn f(e: E) { let ClusterAdmissionError { kind, message } = e; }\n"
+        "fn shed() -> E { ClusterAdmissionError {\n"
+        "    kind: ActivationRejectionKind::RateLimited,\n"
+        '    message: "Server rate limit: slow down".to_string(),\n'
+        "} }\n"
+        "fn reject() -> E { ClusterAdmissionError {\n"
+        "    kind: ActivationRejectionKind::EmptyCluster,\n"
+        f'    message: "{empty_cluster_message}".to_string(),\n'
+        "} }\n"
+    )
+
+
+def test_the_message_check_reads_a_struct_construction_by_its_kind(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    admission = tmp_path / "cluster_admission.rs"
+    monkeypatch.setattr(guard, "ADMISSION", admission)
+
+    admission.write_text(_struct_shape("Server capacity limit: gone"), encoding="utf-8")
+    with pytest.raises(guard.GuardError, match="Server capacity limit: gone"):
+        guard.check_rejection_message_matches_the_api(MESSAGE)
+
+    # The rate-limit construction's own text isn't read.
+    admission.write_text(
+        _struct_shape(
+            "Server capacity limit: no eligible sandbox activation nodes are available."
+        ),
+        encoding="utf-8",
+    )
+    guard.check_rejection_message_matches_the_api(MESSAGE)
+
+
 def test_a_renderer_reached_through_a_library_is_found(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
