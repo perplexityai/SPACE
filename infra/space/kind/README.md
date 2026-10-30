@@ -2185,6 +2185,22 @@ package. Setting the repository variable `SPACE_KIND_RUST_REUSE` to `off`
 turns PR reuse off without a code change. A reused image goes through the same
 handoff. The runtime images Tilt builds still record the checkout's commit.
 
+A PR whose Rust inputs match no published image builds incrementally from
+main's build state instead. Main's `rust_state` job builds its commit cold in
+incremental mode, off the shards' critical path. It saves three directories to
+the GitHub Actions cache as zstd tar parts
+(`infra/space/kind/scripts/rust-state-cache.sh`): the Cargo target directory,
+the content-synced source mirror, and the Cargo home. A PR or merge-queue
+producer restores the newest state for its toolchain, Cargo config, builder
+image and build scripts, preferring one built from the same `Cargo.lock`, and
+runs `build-rust-artifacts.sh` in incremental mode. The mirror keeps the mtimes
+of files whose content did not change, so Cargo recompiles only the crates
+whose inputs changed since main's build. Without a restored state, or when it
+fails to unpack, the producer builds in Docker mode as before. Main CI's
+`rust_cache_cleanup` prunes superseded states with the other target-directory
+caches. Setting the repository variable `SPACE_KIND_RUST_STATE` to `off` turns
+both the save and the restore off.
+
 To reproduce a shard, use `scripts/tests/smoke-kind-typed.sh all 1/6` (through
 `6/6`) with the same admin-token setup as a full `all` run, on a bench brought
 up with `SPACE_KIND_TELEMETRY_MODE=otel` and that variable still set, as CI
