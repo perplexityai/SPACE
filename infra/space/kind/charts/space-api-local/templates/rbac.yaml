@@ -8,7 +8,8 @@ metadata:
     app.kubernetes.io/instance: {{ .Release.Name }}
 ---
 # Namespaced verbs the KubernetesSubstrate needs to create+observe the
-# per-sandbox pause pods and watch readiness events.
+# per-sandbox pause pods and watch readiness events. `patch` labels and
+# annotates a warm-pool pod when a create adopts it.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -20,7 +21,7 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["create", "delete", "get", "list", "watch"]
+    verbs: ["create", "delete", "get", "list", "patch", "watch"]
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["list", "watch"]

@@ -2,6 +2,9 @@ use pplx_space_common_core::types::SandboxId;
 
 use super::*;
 use crate::controllers::db_contention_error;
+use crate::controllers::substrate::{
+    ActivationAttribution, ActivationClient, CapPolicy, RecoveryCharge,
+};
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{NodeDrainPhase, NodeDrainState, NodeManagedBy, NodeRole};
 use pplx_space_common_svc::sql::contention;
@@ -770,6 +773,26 @@ fn implicit_activation_class(
     SandboxAction::Wake.activation_class(Some(lifecycle))
 }
 
+/// The substrate charge for an implicit activation of `sandbox` (an access,
+/// opening a port, a rollback, the spaced control path): it acts for the
+/// sandbox's recorded client. A dormant sandbox gets a new runtime for
+/// certain, so its live cap would be reserved up front; a live one creates a
+/// pod only if its running pod is gone, so the cap would be checked there.
+pub(super) fn implicit_activation_charge(
+    admission: Option<&std::sync::Arc<crate::cluster_admission::ClusterSandboxAdmission>>,
+    sandbox: &Sandbox,
+) -> RecoveryCharge {
+    let cap = match sandbox.lifecycle.parse::<SandboxLifecycle>() {
+        Ok(lifecycle) if implicit_activation_class(lifecycle).is_some() => CapPolicy::Reserved,
+        _ => CapPolicy::Check,
+    };
+    RecoveryCharge::enforce(
+        admission,
+        cap,
+        ActivationAttribution::inherit(sandbox.activating_client_id.as_ref()),
+    )
+}
+
 /// Charge cluster activation admission for a sandbox about to be implicitly
 /// woken from its observed lifecycle. A `None` handle (limiter not configured)
 /// is a no-op, and an unparseable lifecycle fails open (no charge) — the
@@ -898,17 +921,38 @@ impl SandboxController {
     /// charged by the restore-lease claim-winner inside the substrate
     /// instead of at request entry: coalesced followers never spend a
     /// token, and a lease takeover always does.
-    fn restore_claim_charge(
-        &self,
-        lifecycle: Option<SandboxLifecycle>,
-    ) -> Option<crate::controllers::substrate::RecoveryCharge> {
+    fn defers_to_restore_claim(lifecycle: Option<SandboxLifecycle>) -> bool {
         matches!(
             lifecycle,
             Some(SandboxLifecycle::Suspended) | Some(SandboxLifecycle::Restoring)
         )
-        .then(|| {
-            crate::controllers::substrate::RecoveryCharge::enforce(self.cluster_admission.as_ref())
-        })
+    }
+
+    /// The substrate charge for an explicit lifecycle action on a sandbox
+    /// observed in `lifecycle`:
+    ///
+    /// - entering `suspended` or `restoring`, the restore-lease winner
+    ///   charges it ([`Self::defers_to_restore_claim`]);
+    /// - otherwise, an action [`Self::action`] charged at entry is paid;
+    /// - an action on a live lifecycle isn't charged, and can create a pod
+    ///   only if the running one is gone.
+    fn action_charge(
+        &self,
+        action: SandboxAction,
+        lifecycle: Option<SandboxLifecycle>,
+        attribution: &ActivationAttribution,
+    ) -> RecoveryCharge {
+        if Self::defers_to_restore_claim(lifecycle) {
+            RecoveryCharge::enforce(
+                self.cluster_admission.as_ref(),
+                CapPolicy::ReserveAtClaim,
+                attribution.clone(),
+            )
+        } else if action.activation_class(lifecycle).is_some() {
+            RecoveryCharge::paid(CapPolicy::Reserved, attribution.clone())
+        } else {
+            RecoveryCharge::exempt(CapPolicy::Check, attribution.clone())
+        }
     }
 }
 
@@ -1489,6 +1533,8 @@ impl SandboxController {
         Ok(())
     }
 
+    // The activation request plus the client the activation is for.
+    #[allow(clippy::too_many_arguments)]
     pub async fn action(
         &self,
         pool: &PgPool,
@@ -1497,13 +1543,20 @@ impl SandboxController {
         metric_identity: SandboxApiMetricIdentity,
         action: SandboxAction,
         activation: Option<SandboxActivationRequest>,
+        activating_client: ActivationClient,
     ) -> Result<serde_json::Value, ControllerError> {
         let typed_id = id;
         let Some(sandbox) = sandbox else {
             return self
-                .untracked_action(id, metric_identity, action, activation)
+                .untracked_action(id, metric_identity, action, activation, activating_client)
                 .await;
         };
+        // Resolved once, from the row this action loaded, so the charge and
+        // the pod label agree even if pod tracking moves the record meanwhile.
+        let attribution = ActivationAttribution::resolve(
+            activating_client,
+            sandbox.activating_client_id.as_ref(),
+        );
 
         let reconnect_started_at = std::time::Instant::now();
         if action.affects_lifecycle()
@@ -1544,7 +1597,7 @@ impl SandboxController {
                 // Restore-shaped starts defer admission to the restore-lease
                 // claim-winner too. Direct has no lease and spends the same
                 // policy at its substrate entry.
-                if self.restore_claim_charge(lifecycle).is_none() {
+                if !Self::defers_to_restore_claim(lifecycle) {
                     self.admit_action_cluster_activation(action, lifecycle)
                         .await?;
                 }
@@ -1580,7 +1633,7 @@ impl SandboxController {
                 // error classifier maps the retry-after to exhausted/wait_budget)
                 // before returning — otherwise a storm throttled by the cluster
                 // limiter is invisible to the monitor.
-                if self.restore_claim_charge(Some(lifecycle)).is_none()
+                if !Self::defers_to_restore_claim(Some(lifecycle))
                     && let Err(err) = self
                         .admit_action_cluster_activation(action, Some(lifecycle))
                         .await
@@ -1621,10 +1674,11 @@ impl SandboxController {
                             metric_identity,
                             typed_id,
                             activation,
-                            self.restore_claim_charge(
+                            self.action_charge(
+                                action,
                                 sandbox.lifecycle.parse::<SandboxLifecycle>().ok(),
-                            )
-                            .unwrap_or(crate::controllers::substrate::RecoveryCharge::Exempt),
+                                &attribution,
+                            ),
                         )
                         .await
                     {
@@ -1691,10 +1745,11 @@ impl SandboxController {
                             sandbox,
                             DEFAULT_BLOCKING_WAIT_TIMEOUT,
                             action.wake_activity(),
-                            self.restore_claim_charge(
+                            self.action_charge(
+                                action,
                                 sandbox.lifecycle.parse::<SandboxLifecycle>().ok(),
-                            )
-                            .unwrap_or(crate::controllers::substrate::RecoveryCharge::Exempt),
+                                &attribution,
+                            ),
                         )
                         .await
                     {
@@ -1859,10 +1914,11 @@ impl SandboxController {
                             metric_identity,
                             typed_id,
                             activation,
-                            self.restore_claim_charge(
+                            self.action_charge(
+                                action,
                                 sandbox.lifecycle.parse::<SandboxLifecycle>().ok(),
-                            )
-                            .unwrap_or(crate::controllers::substrate::RecoveryCharge::Exempt),
+                                &attribution,
+                            ),
                         )
                         .await
                     {
@@ -2059,7 +2115,14 @@ impl SandboxController {
                             .substrate
                             .runtime_client(
                                 typed_id,
-                                crate::controllers::substrate::RecoveryCharge::Exempt,
+                                // A rebuild as a side effect of a stop acts
+                                // for the sandbox's recorded client.
+                                RecoveryCharge::exempt(
+                                    CapPolicy::Skip,
+                                    ActivationAttribution::inherit(
+                                        sandbox.activating_client_id.as_ref(),
+                                    ),
+                                ),
                             )
                             .await?;
                         run_stop_or_kill(&mut client, action, typed_id).await?;
@@ -2097,8 +2160,10 @@ impl SandboxController {
                                 .substrate
                                 .runtime_client(
                                     typed_id,
-                                    crate::controllers::substrate::RecoveryCharge::enforce(
+                                    RecoveryCharge::enforce(
                                         self.cluster_admission.as_ref(),
+                                        CapPolicy::Check,
+                                        attribution.clone(),
                                     ),
                                 )
                                 .await?;
@@ -2188,9 +2253,16 @@ impl SandboxController {
         metric_identity: SandboxApiMetricIdentity,
         action: SandboxAction,
         activation: Option<SandboxActivationRequest>,
+        activating_client: ActivationClient,
     ) -> Result<serde_json::Value, ControllerError> {
         let typed_id = id;
         let id_str = id.to_string();
+        // No sandbox was loaded, so an inheriting activation leaves the record
+        // for the substrate to read when it builds the pod.
+        let attribution = match activating_client {
+            ActivationClient::Inherit => ActivationAttribution::inherit_unresolved(),
+            client => ActivationAttribution::resolve(client, None),
+        };
 
         let status = match action {
             SandboxAction::Start => {
@@ -2201,7 +2273,7 @@ impl SandboxController {
                         metric_identity,
                         typed_id,
                         activation,
-                        crate::controllers::substrate::RecoveryCharge::Exempt,
+                        RecoveryCharge::paid(CapPolicy::Reserved, attribution.clone()),
                     )
                     .await
                     .map_err(ControllerError::from)?;
@@ -2212,7 +2284,7 @@ impl SandboxController {
                     .substrate
                     .runtime_client(
                         typed_id,
-                        crate::controllers::substrate::RecoveryCharge::Exempt,
+                        RecoveryCharge::exempt(CapPolicy::Check, attribution.clone()),
                     )
                     .await?;
                 client
@@ -2237,7 +2309,7 @@ impl SandboxController {
                         metric_identity,
                         typed_id,
                         activation,
-                        crate::controllers::substrate::RecoveryCharge::Exempt,
+                        RecoveryCharge::paid(CapPolicy::Reserved, attribution.clone()),
                     )
                     .await
                     .map_err(ControllerError::from)?;
@@ -2255,7 +2327,7 @@ impl SandboxController {
                     .substrate
                     .runtime_client(
                         typed_id,
-                        crate::controllers::substrate::RecoveryCharge::Exempt,
+                        RecoveryCharge::exempt(CapPolicy::Skip, attribution.clone()),
                     )
                     .await?;
                 client
@@ -2273,7 +2345,7 @@ impl SandboxController {
                     .substrate
                     .runtime_client(
                         typed_id,
-                        crate::controllers::substrate::RecoveryCharge::Exempt,
+                        RecoveryCharge::exempt(CapPolicy::Skip, attribution.clone()),
                     )
                     .await?;
                 client
@@ -2288,7 +2360,7 @@ impl SandboxController {
                     .substrate
                     .runtime_client(
                         typed_id,
-                        crate::controllers::substrate::RecoveryCharge::Exempt,
+                        RecoveryCharge::exempt(CapPolicy::Check, attribution.clone()),
                     )
                     .await?;
                 let activation = resolve_activation_options(activation.as_ref(), true)?;
@@ -2308,7 +2380,7 @@ impl SandboxController {
                     .substrate
                     .runtime_client(
                         typed_id,
-                        crate::controllers::substrate::RecoveryCharge::Exempt,
+                        RecoveryCharge::exempt(CapPolicy::Skip, attribution.clone()),
                     )
                     .await?;
                 client
@@ -2325,7 +2397,7 @@ impl SandboxController {
                     .substrate
                     .runtime_client(
                         typed_id,
-                        crate::controllers::substrate::RecoveryCharge::Exempt,
+                        RecoveryCharge::exempt(CapPolicy::Skip, attribution.clone()),
                     )
                     .await?;
                 client

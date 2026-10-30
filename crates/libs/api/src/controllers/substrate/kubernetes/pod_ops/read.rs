@@ -438,6 +438,7 @@ impl KubernetesSubstrate {
         let pod_uid = pod.uid().map(str::to_owned);
         let pod_ip = assigned_pod_ip(&pod)?;
         let pod_ip_string = pod_ip.map(|ip| ip.to_string());
+        let pod_client = pod.client_id();
         if row.pod_uid.as_ref().map(PodUid::as_str) != pod_uid.as_deref()
             || row.pod_ip.as_deref() != pod_ip_string.as_deref()
         {
@@ -448,6 +449,7 @@ impl KubernetesSubstrate {
                     row.generation,
                     pod_uid.as_deref(),
                     pod_ip_string.as_deref(),
+                    pod_client.as_ref(),
                 )
                 .await
             {
@@ -464,6 +466,36 @@ impl KubernetesSubstrate {
                     error = %err,
                     "failed to persist Kubernetes pod metadata after pod lookup"
                 ),
+            }
+        } else if self.k8s.activation_client_attribution.is_enabled()
+            && let Some(pod_uid) = pod_uid.as_deref()
+            && crate::controllers::substrate::kubernetes::store::attribution_update(
+                &row.lifecycle,
+                Some(pod_uid),
+                Some(pod_uid),
+                pod_client.as_ref(),
+                row.activating_client_id.as_ref(),
+            )
+            .is_some()
+        {
+            // The pod is the one the row tracks, and only the record lags its
+            // label: repair the record alone, leaving the row's state as it is.
+            if let Err(err) = self
+                .store
+                .repair_runtime_attribution(
+                    sandbox_id,
+                    row.generation,
+                    pod_uid,
+                    pod_client.as_ref(),
+                )
+                .await
+            {
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    generation = row.generation,
+                    error = %err,
+                    "failed to repair the sandbox's activating client after pod lookup"
+                );
             }
         }
 

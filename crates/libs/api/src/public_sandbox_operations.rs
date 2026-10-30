@@ -797,14 +797,23 @@ impl SandboxLifecycleOperationExecutor {
                 "sandbox rollback completed",
             ));
         }
-        let controller_action = if is_implicit_wake(operation, payload.action) {
+        // A system wake acts for the sandbox's recorded client; a caller's
+        // own native operation is native.
+        let (controller_action, activating_client) = if is_implicit_wake(operation, payload.action)
+        {
             let activity = implicit_wake_activity(payload.wake_activity);
             if !activity.allows_implicit_wake(&sandbox.auto_lifecycle.0) {
                 return Err(SandboxLifecycleExecutionError::ImplicitWakeNotAllowed);
             }
-            SandboxAction::ImplicitWake(activity)
+            (
+                SandboxAction::ImplicitWake(activity),
+                crate::controllers::substrate::ActivationClient::Inherit,
+            )
         } else {
-            sandbox_action(payload.action)?
+            (
+                sandbox_action(payload.action)?,
+                crate::controllers::substrate::ActivationClient::Native,
+            )
         };
         let body = self
             .controller
@@ -815,6 +824,7 @@ impl SandboxLifecycleOperationExecutor {
                 SandboxApiMetricIdentity::native(payload.action.as_str()),
                 controller_action,
                 None,
+                activating_client,
             )
             .await?;
         let updated = fetch_sandbox(&self.pool, sandbox_uuid.into()).await?;

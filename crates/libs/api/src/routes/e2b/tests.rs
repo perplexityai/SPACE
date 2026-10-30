@@ -782,6 +782,7 @@ fn test_sandbox() -> Sandbox {
         last_command_at: None,
         created_at: time::OffsetDateTime::now_utc(),
         updated_at: time::OffsetDateTime::now_utc(),
+        activating_client_id: None,
     }
 }
 
@@ -4367,7 +4368,7 @@ async fn connect_route_rejects_missing_restore_context_and_preserves_recovery_st
         executions,
         vec![
             (1, false, "forgotten".to_string(), None, None, None),
-            (2, true, "recovery_failed".to_string(), None, None, None,),
+            (2, true, "recovery_failed".to_string(), None, None, None),
         ]
     );
 
@@ -4567,7 +4568,7 @@ async fn runtime_client_recovers_missing_suspending_pod(
     fixture
         .app_state
         .substrate
-        .runtime_client(fixture.sandbox_id, RecoveryCharge::Exempt)
+        .runtime_client(fixture.sandbox_id, RecoveryCharge::exempt_for_tests())
         .await?;
 
     // Assert.
@@ -4990,6 +4991,148 @@ fn metadata_uses_sandbox_metadata() {
     );
     assert_eq!(metadata.get("priority").map(String::as_str), Some("3"));
     assert_eq!(metadata.get("debug").map(String::as_str), Some("true"));
+}
+
+/// A connect's wake labels the restore pod with the connecting client's
+/// `X-Client-ID`, not the creating client's, and tracking that pod records the
+/// connecting client. A connect without a valid id activates as `unknown`.
+#[cfg(feature = "kubernetes")]
+#[rstest]
+#[case::named(Some("connecting-client"), "connecting-client")]
+#[case::without_an_id(None, "unknown")]
+#[tokio::test(flavor = "current_thread")]
+async fn connect_route_labels_the_restore_pod_with_the_connecting_client(
+    #[case] header: Option<&'static str>,
+    #[case] expected: &str,
+    #[future] missing_pod_suspend_fixture: TestResult<MissingPodSuspendFixture>,
+) -> TestResult {
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+
+    // Arrange.
+    let fixture = missing_pod_suspend_fixture.await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET activating_client_id = 'creating-client' WHERE id = $1"
+    ))
+    .bind(fixture.sandbox_id)
+    .execute(&fixture.app_state.pool)
+    .await?;
+    let mut request = connect_route_request(
+        fixture.sandbox_id,
+        ConnectRouteRequestShape {
+            label: "empty body",
+            body: None,
+        },
+    )?;
+    if let Some(header) = header {
+        request
+            .headers_mut()
+            .insert("x-client-id", header::HeaderValue::from_static(header));
+    }
+
+    // Act.
+    let response = fixture.app.clone().oneshot(request).await?;
+
+    // Assert.
+    assert_connect_success_response(
+        response,
+        StatusCode::OK,
+        fixture.sandbox_id,
+        "empty body",
+        "missing pod after a current durable suspend snapshot",
+    )
+    .await?;
+    let label = {
+        let pod_creates = fixture
+            .app_state
+            .pod_creates
+            .lock()
+            .expect("capture mutex poisoned");
+        let [pod] = pod_creates.as_slice() else {
+            panic!("expected one restore pod, got {}", pod_creates.len());
+        };
+        pod.pointer("/metadata/labels")
+            .and_then(|labels| {
+                labels.get(pplx_space_common_core::kubernetes::SANDBOX_CLIENT_ID_LABEL)
+            })
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    assert_eq!(label.as_deref(), Some(expected));
+    let record: Option<String> = sqlx::query_scalar(sql!(
+        "SELECT activating_client_id FROM sandboxes WHERE id = $1"
+    ))
+    .bind(fixture.sandbox_id)
+    .fetch_one(&fixture.app_state.pool)
+    .await?;
+    assert_eq!(record.as_deref(), Some(expected));
+    Ok(())
+}
+
+/// A resume restores the sandbox, so with attribution on it takes the client's
+/// concurrency slot like create and connect: with the client's one slot held,
+/// its resume is refused with the per-client 429 before the sandbox is even
+/// read. With attribution off it takes no slot, so the same resume reaches the
+/// failed sandbox and gets its usual answer.
+#[rstest]
+#[case::attribution_on(crate::controllers::substrate::ActivationClientAttribution::Enabled)]
+#[case::attribution_off(crate::controllers::substrate::ActivationClientAttribution::Disabled)]
+#[tokio::test(flavor = "current_thread")]
+async fn resume_route_takes_a_client_concurrency_slot(
+    #[case] attribution: crate::controllers::substrate::ActivationClientAttribution,
+) -> TestResult {
+    use crate::client_concurrency::ClientConcurrencyDecision;
+    use crate::client_concurrency::tests::{redis_limiter, tight_enforce, try_redis_url};
+    use pplx_space_metrics::sandbox::api::client_limit::Operation;
+
+    let Some((_redis, redis_url)) = try_redis_url().await? else {
+        return Ok(());
+    };
+    let db = pg_test_db().await?;
+    let sandbox_id = SandboxId::new();
+    let org = insert_failed_terminal_sandbox(&db.pool, sandbox_id).await?;
+    let client = format!("resumer-{}", Uuid::now_v7());
+    let mut state = AppState::from_pool(db.pool.clone()).await?;
+    state.sandbox_controller = crate::controllers::sandbox::SandboxController::new(
+        crate::controllers::substrate::Substrate::from_direct(
+            crate::controllers::substrate::direct::DirectSubstrate::new(db.pool.clone())
+                .with_activation_client_attribution(attribution),
+        ),
+    );
+    // One slot per client: the one held below fills it.
+    state.client_concurrency = redis_limiter(&redis_url, tight_enforce(&client));
+    let ClientConcurrencyDecision::Admitted(_held) = state
+        .client_concurrency
+        .try_acquire(Operation::Create, Some(&client))
+        .await
+    else {
+        panic!("the client's first slot is free");
+    };
+    let app = e2b_api_routes()
+        .layer(Extension(AuthOrg(org)))
+        .layer(Extension(test_ecw_host_config()))
+        .with_state(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/sandboxes/{sandbox_id}/resume"))
+                .header(header::HOST, TEST_ECW_API_HOST)
+                .header("x-client-id", &client)
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    let expected =
+        if attribution == crate::controllers::substrate::ActivationClientAttribution::Enabled {
+            StatusCode::TOO_MANY_REQUESTS
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+    assert_eq!(response.status(), expected);
+    Ok(())
 }
 
 #[tokio::test(flavor = "current_thread")]

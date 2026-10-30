@@ -55,16 +55,16 @@ impl SandboxController {
         // recreation is a real activation the fallback charge below never sees
         // (recovery makes the call succeed, so we never reach the `Err` arm).
         // A live pod that is merely reconnected to charges nothing.
-        match self
-            .substrate
-            .runtime_client(
-                sandbox.id,
-                crate::controllers::substrate::RecoveryCharge::enforce(
-                    self.cluster_admission.as_ref(),
-                ),
-            )
-            .await
-        {
+        let charge = crate::controllers::substrate::RecoveryCharge::enforce(
+            self.cluster_admission.as_ref(),
+            crate::controllers::substrate::CapPolicy::Check,
+            crate::controllers::substrate::ActivationAttribution::inherit(
+                sandbox.activating_client_id.as_ref(),
+            ),
+        );
+        // The fallback below charges the wake itself.
+        let paid = charge.after_charge();
+        match self.substrate.runtime_client(sandbox.id, charge).await {
             Ok(client) => Ok(client),
             // A recovery admission rejection (429) from the first call must
             // propagate — not fall into the dormant-wake fallback below, which
@@ -96,16 +96,12 @@ impl SandboxController {
                         sandbox,
                         DEFAULT_BLOCKING_WAIT_TIMEOUT,
                         None,
-                        crate::controllers::substrate::RecoveryCharge::Exempt,
+                        // Charged just above.
+                        paid.clone(),
                     )
                     .await
                     .map_err(ControllerError::from)?;
-                self.substrate
-                    .runtime_client(
-                        sandbox.id,
-                        crate::controllers::substrate::RecoveryCharge::Exempt,
-                    )
-                    .await
+                self.substrate.runtime_client(sandbox.id, paid).await
             }
             Err(err) => Err(err),
         }
@@ -702,7 +698,7 @@ pub(crate) async fn connect_spaced_runtime_client(
     )
     .await?;
 
-    let charge = crate::controllers::substrate::RecoveryCharge::enforce(admission);
+    let charge = super::lifecycle::implicit_activation_charge(admission, sandbox);
 
     // The dormant entrypoint charge covers created/stopped/suspended implicit
     // wakes on the initial connect; the non-dormant lost-pod recreate is charged

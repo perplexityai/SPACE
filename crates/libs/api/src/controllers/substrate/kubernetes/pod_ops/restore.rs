@@ -156,6 +156,7 @@ impl KubernetesSubstrate {
                 execution.generation,
                 identity.pod_uid.as_deref(),
                 Some(identity.pod_ip.as_str()),
+                pod.as_ref().and_then(|pod| pod.client_id()).as_ref(),
             )
             .await?
         {

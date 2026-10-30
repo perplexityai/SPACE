@@ -26,11 +26,11 @@ use k8s_openapi::api::core::v1::{ContainerStatus, Pod, PodCondition};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::runtime::{reflector, watcher};
 use pplx_space_common_core::kubernetes::{
-    NODE_NAME_MATCH_FIELD, SANDBOX_CHECKPOINT_ANNOTATION, SANDBOX_EXECUTION_GENERATION_ANNOTATION,
-    SANDBOX_ID_ANNOTATION, SANDBOX_MANAGED_BY_LABEL, SANDBOX_NETWORK_SLOTS_RESOURCE,
-    SANDBOX_POOL_CONFIG_ID_KEY, SANDBOX_POOL_ROLE_KEY, SANDBOX_POOL_SLOT_ID_KEY,
-    SANDBOX_SUSPEND_RESTORE_SOURCE_NODE_ANNOTATION, SANDBOX_SUSPEND_RESTORE_STORAGE_URI_ANNOTATION,
-    SANDBOX_TRACEPARENT_ANNOTATION,
+    NODE_NAME_MATCH_FIELD, SANDBOX_CHECKPOINT_ANNOTATION, SANDBOX_CLIENT_ID_LABEL,
+    SANDBOX_EXECUTION_GENERATION_ANNOTATION, SANDBOX_ID_ANNOTATION, SANDBOX_MANAGED_BY_LABEL,
+    SANDBOX_NETWORK_SLOTS_RESOURCE, SANDBOX_POOL_CONFIG_ID_KEY, SANDBOX_POOL_ROLE_KEY,
+    SANDBOX_POOL_SLOT_ID_KEY, SANDBOX_SUSPEND_RESTORE_SOURCE_NODE_ANNOTATION,
+    SANDBOX_SUSPEND_RESTORE_STORAGE_URI_ANNOTATION, SANDBOX_TRACEPARENT_ANNOTATION,
 };
 
 /// Declares [`SandboxPodKey`] from one list, so a variant can't exist without
@@ -72,6 +72,7 @@ sandbox_pod_keys! {
     PoolRole => SANDBOX_POOL_ROLE_KEY,
     PoolConfigId => SANDBOX_POOL_CONFIG_ID_KEY,
     PoolSlotId => SANDBOX_POOL_SLOT_ID_KEY,
+    ClientId => SANDBOX_CLIENT_ID_LABEL,
 }
 
 impl SandboxPodKey {
@@ -202,6 +203,13 @@ impl SandboxPodView {
 
     pub fn label(&self, key: SandboxPodKey) -> Option<&str> {
         find_key(&self.labels, key)
+    }
+
+    /// The client id whose activation created this pod, from its
+    /// `space.pplx.net/client-id` label; `None` for an unlabeled pod.
+    pub fn client_id(&self) -> Option<pplx_space_common_core::types::ClientId> {
+        self.label(SandboxPodKey::ClientId)
+            .and_then(|value| pplx_space_common_core::types::ClientId::parse(value).ok())
     }
 
     /// The annotation, falling back to the same-keyed label. The shared pod

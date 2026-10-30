@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 
 use pplx_space_common_core::types::{
-    AutoLifecyclePolicy, AutoLifecycleWakePolicy, AutoLifecycleWakeSource, DiskIoLimits,
+    AutoLifecyclePolicy, AutoLifecycleWakePolicy, AutoLifecycleWakeSource, ClientId, DiskIoLimits,
 };
 use pplx_space_placement::StoredSandboxLifecycle;
 use sqlx::types::JsonValue;
@@ -47,6 +47,7 @@ struct Row {
     lease_remaining_secs: Option<f64>,
     preserve_local_artifact_on_restore_failure: bool,
     egress_profiles: Vec<String>,
+    activating_client_id: Option<String>,
 }
 
 async fn row(pool: &PgPool, id: SandboxId) -> TestResult<Row> {
@@ -58,7 +59,8 @@ async fn row(pool: &PgPool, id: SandboxId) -> TestResult<Row> {
                 restore_lease_token,
                 EXTRACT(EPOCH FROM (restore_lease_expires_at - NOW()))::float8
                     AS lease_remaining_secs,
-                preserve_local_artifact_on_restore_failure, egress_profiles
+                preserve_local_artifact_on_restore_failure, egress_profiles,
+                activating_client_id
            FROM sandboxes WHERE id = $1"
     ))
     .bind(id)
@@ -83,6 +85,7 @@ struct Inputs {
     auto_lifecycle: AutoLifecyclePolicy,
     network_policy_override_json: JsonValue,
     egress_profiles: Vec<String>,
+    activating_client_id: ClientId,
 }
 
 impl Inputs {
@@ -123,6 +126,11 @@ impl Inputs {
             },
             network_policy_override_json: serde_json::json!({ "synthetic_policy": variant }),
             egress_profiles: vec!["profile-a".to_owned(), format!("profile-{variant}")],
+            activating_client_id: if variant.is_multiple_of(2) {
+                ClientId::from_header(Some(&format!("client-{variant}")))
+            } else {
+                ClientId::native()
+            },
         })
     }
 
@@ -144,6 +152,7 @@ impl Inputs {
             auto_lifecycle: &self.auto_lifecycle,
             network_policy_override_json: Some(&self.network_policy_override_json),
             egress_profiles,
+            activating_client_id: Some(&self.activating_client_id),
         }
     }
 
@@ -221,6 +230,7 @@ async fn insert_unplaced_stores_every_input_and_starts_by_restore_token() -> Tes
                 lease_remaining_secs: None,
                 preserve_local_artifact_on_restore_failure: restores,
                 egress_profiles: inputs.egress_profiles.clone(),
+                activating_client_id: Some(inputs.activating_client_id.as_str().to_owned()),
             },
             "{case}"
         );
@@ -290,5 +300,28 @@ async fn insert_unplaced_refuses_an_existing_id_in_every_lifecycle() -> TestResu
         assert_eq!(database.constraint(), Some("sandboxes_pkey"), "{lifecycle}");
         assert_eq!(row(&db.pool, id).await?, before, "{lifecycle}");
     }
+    Ok(())
+}
+
+/// A warm-pool adoption records its adopter as the sandbox's activating
+/// client, the same as a cold create.
+#[tokio::test(flavor = "current_thread")]
+async fn insert_pooled_records_the_adopting_client() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let inputs = Inputs::new(4)?;
+    let egress_profiles = inputs.egress_profiles();
+    let id = SandboxId::new();
+
+    crate::insert_pooled(&db.pool, &inputs.create(id, &egress_profiles), None).await?;
+
+    let recorded: Option<String> = sqlx::query_scalar(sql!(
+        "SELECT activating_client_id FROM sandboxes WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(recorded.as_deref(), Some("client-4"));
     Ok(())
 }

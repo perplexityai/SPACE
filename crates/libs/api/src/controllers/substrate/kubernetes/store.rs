@@ -49,6 +49,8 @@ mod pod_placement;
 mod pod_tracking;
 mod restore_lease;
 mod restore_source;
+mod runtime_attribution;
+pub(super) use runtime_attribution::attribution_update;
 mod runtime_upgrade;
 mod started_recovery;
 mod suspend;
@@ -57,6 +59,8 @@ mod suspend;
 pub(super) struct K8sStore {
     pool: PgPool,
     namespace: String,
+    /// Off, pod tracking never writes the sandbox's record.
+    attribution: crate::controllers::substrate::ActivationClientAttribution,
 }
 
 /// Where a sandbox's pod landed. Groups the identity columns
@@ -289,6 +293,8 @@ pub(super) struct ActiveExecutionStatusRow {
     pub(super) create_age_expired: bool,
     pub(super) activation_attempt_id: Option<SandboxActivationAttemptId>,
     pub(super) route_activation_id: Option<SandboxActivationAttemptId>,
+    /// The sandbox's record of whose activation created its runtime.
+    pub(super) activating_client_id: Option<pplx_space_common_core::types::ClientId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -708,8 +714,16 @@ fn emit_started_suspend_recovery_event(
 }
 
 impl K8sStore {
-    pub(super) fn new(pool: PgPool, namespace: String) -> Self {
-        Self { pool, namespace }
+    pub(super) fn new(
+        pool: PgPool,
+        namespace: String,
+        attribution: crate::controllers::substrate::ActivationClientAttribution,
+    ) -> Self {
+        Self {
+            pool,
+            namespace,
+            attribution,
+        }
     }
 
     pub(super) fn pool(&self) -> &PgPool {

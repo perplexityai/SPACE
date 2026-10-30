@@ -120,7 +120,7 @@ async fn live_cpu_update_preserves_allocation_across_cold_restart() -> TestResul
                         blocking: true,
                         ready_timeout: Duration::from_secs(5),
                     },
-                    RecoveryCharge::Exempt,
+                    RecoveryCharge::exempt_for_tests(),
                 )
                 .await?;
             let created: Vec<serde_json::Value> = pod_requests()

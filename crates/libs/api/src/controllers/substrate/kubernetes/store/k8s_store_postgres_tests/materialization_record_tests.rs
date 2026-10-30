@@ -68,7 +68,7 @@ async fn the_first_recorded_pod_stamps_the_execution_once() -> TestResult {
 
     fixture
         .store
-        .persist_pod_metadata(sandbox_id, generation + 1, Some("other-pod"), None)
+        .persist_pod_metadata(sandbox_id, generation + 1, Some("other-pod"), None, None)
         .await?;
     assert_eq!(
         materialized_at(&fixture.pool, sandbox_id, generation).await?,
@@ -78,7 +78,7 @@ async fn the_first_recorded_pod_stamps_the_execution_once() -> TestResult {
 
     fixture
         .store
-        .persist_pod_metadata(sandbox_id, generation, Some("first-pod"), None)
+        .persist_pod_metadata(sandbox_id, generation, Some("first-pod"), None, None)
         .await?;
     let stamped = materialized_at(&fixture.pool, sandbox_id, generation)
         .await?
@@ -90,7 +90,7 @@ async fn the_first_recorded_pod_stamps_the_execution_once() -> TestResult {
     ] {
         fixture
             .store
-            .persist_pod_metadata(sandbox_id, generation, pod_uid, pod_ip)
+            .persist_pod_metadata(sandbox_id, generation, pod_uid, pod_ip, None)
             .await?;
         assert_eq!(
             materialized_at(&fixture.pool, sandbox_id, generation).await?,
@@ -139,7 +139,7 @@ async fn an_unchanged_write_stamps_a_row_from_before_the_record() -> TestResult 
 
     fixture
         .store
-        .persist_pod_metadata(sandbox_id, generation, Some("legacy-pod"), None)
+        .persist_pod_metadata(sandbox_id, generation, Some("legacy-pod"), None, None)
         .await?;
     assert!(
         materialized_at(&fixture.pool, sandbox_id, generation)
@@ -177,7 +177,7 @@ async fn an_unchanged_write_stamps_a_row_from_before_the_record() -> TestResult 
     assert!(
         fixture
             .store
-            .backfill_missing_pod_uid(backfilled, &identity, "observed-pod")
+            .backfill_missing_pod_uid(backfilled, &identity, "observed-pod", None)
             .await?
     );
     assert!(
@@ -210,7 +210,7 @@ async fn every_clearing_writer_stamps_the_pod_it_clears() -> TestResult {
             .await?;
         fixture
             .store
-            .persist_pod_metadata(rewritten, generation, pod_uid, None)
+            .persist_pod_metadata(rewritten, generation, pod_uid, None, None)
             .await?;
         assert!(
             materialized_at(&fixture.pool, rewritten, generation)
@@ -322,7 +322,7 @@ async fn every_clearing_writer_stamps_the_pod_it_clears() -> TestResult {
     };
     fixture
         .store
-        .persist_pod_metadata(recovered, generation, Some("failed-pod"), None)
+        .persist_pod_metadata(recovered, generation, Some("failed-pod"), None, None)
         .await?;
     fixture
         .store
@@ -379,7 +379,7 @@ async fn writers_from_before_the_record_keep_existing_stamps() -> TestResult {
         .generation;
     fixture
         .store
-        .persist_pod_metadata(sandbox_id, generation, Some("recorded-pod"), None)
+        .persist_pod_metadata(sandbox_id, generation, Some("recorded-pod"), None, None)
         .await?;
     let stamped = materialized_at(&fixture.pool, sandbox_id, generation).await?;
     assert!(stamped.is_some());
