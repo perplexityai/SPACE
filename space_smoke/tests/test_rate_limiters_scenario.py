@@ -14,7 +14,7 @@ import unittest
 from types import SimpleNamespace
 from typing import Any, cast
 
-from space_smoke.adapters import KindConfig, KindHarness
+from space_smoke.adapters import LIMITER_ENV_VALUE_MAX, KindConfig, KindHarness
 from space_smoke.capabilities import LimiterProbeOutcome
 from space_smoke.rate_limiters import (
     PER_CLIENT_LIMIT_MESSAGE,
@@ -24,7 +24,12 @@ from space_smoke.rate_limiters import (
     is_limiter_rejection,
     status_histogram,
 )
-from space_smoke.runtime import CommandResult, InvariantViolation, ResourceScope
+from space_smoke.runtime import (
+    CommandResult,
+    InvariantViolation,
+    ResourceScope,
+    SmokeConfigurationError,
+)
 
 
 def _outcome(status: int, message: str = "", retry_after: str | None = None) -> LimiterProbeOutcome:
@@ -160,6 +165,112 @@ class PerClientVerdict(unittest.TestCase):
             assertions.expect_fail_open([_outcome(429, f"{SERVER_LIMIT_MESSAGE} x", "2")])
 
 
+class ControlIsolationVerdict(unittest.TestCase):
+    """The isolation verdict only passes on control reconnects that worked.
+
+    A bench run cannot show this: on a healthy cluster the control arm
+    succeeds, so the cases that matter — a control arm that answered only
+    404, 500, or a cluster-level 429 — never occur there. Each is a response
+    set the per-client gate stays quiet through, which is exactly why
+    "no per-client 429" was never evidence that a second client kept working.
+    """
+
+    def _assertions(self) -> RateLimiterAssertions:
+        return RateLimiterAssertions(
+            cast(Any, _Fixture()), cast(Any, None), cast(Any, None), ResourceScope()
+        )
+
+    @staticmethod
+    def _saturated_noisy() -> list[LimiterProbeOutcome]:
+        # 200, not 201: these stand in for reconnects, and `/connect` answers
+        # 200. A fixture status the path cannot produce is a fixture that has
+        # drifted from what it claims to represent.
+        rejected = _outcome(429, f"{PER_CLIENT_LIMIT_MESSAGE} too many", "1")
+        return [rejected] * 17 + [_outcome(200)] * 3
+
+    def test_a_successful_control_arm_passes_and_records_both_arms(self) -> None:
+        # The recorded evidence is the assertion: without it this passes with
+        # `expect_control_isolated` replaced by `pass`.
+        assertions = self._assertions()
+        control = [_outcome(200)] * 3
+        assertions.expect_control_isolated(self._saturated_noisy(), control)
+        records = cast(Any, assertions)._fixture.records
+        self.assertEqual(records["isolation_control_statuses"], {"200": 3})
+        self.assertEqual(
+            records["isolation_noisy_statuses"], {"200": 3, "429 Per-client rate limit": 17}
+        )
+
+    def test_a_control_arm_that_never_succeeded_fails_whatever_it_answered(self) -> None:
+        # Every response set the per-client gate stays quiet through: not
+        # found, a server error, and the *cluster* limiter's own 429. Each
+        # passes all four per-client verdicts, so only the success verdict
+        # bites — which is the whole reason it exists.
+        for answer in (
+            _outcome(404, "sandbox not found"),
+            _outcome(500, "internal error"),
+            _outcome(429, f"{SERVER_LIMIT_MESSAGE} shedding", "6"),
+        ):
+            with self.subTest(status=answer.status, message=answer.message):
+                with self.assertRaisesRegex(InvariantViolation, "control reconnects succeeded"):
+                    self._assertions().expect_control_isolated(
+                        self._saturated_noisy(), [answer] * 3
+                    )
+
+    def test_a_partly_successful_control_arm_fails(self) -> None:
+        control = [_outcome(200), _outcome(404, "gone"), _outcome(200)]
+        with self.assertRaisesRegex(InvariantViolation, "only 2 of 3"):
+            self._assertions().expect_control_isolated(self._saturated_noisy(), control)
+
+    def test_a_noisy_arm_that_only_ever_lost_fails(self) -> None:
+        # A shape a shared bucket wears when every other verdict holds: the
+        # control requests take all of the bucket's slots, so the noisy arm
+        # sees nothing but per-client 429s while the control arm succeeds.
+        # Requiring one noisy admission rejects that reading. It does not make
+        # the round a proof — slots churn while a wave is in flight, so one
+        # bucket can still satisfy every verdict on favourable timings (see
+        # `expect_control_isolated`); it removes the shape a broken limiter
+        # most often produces.
+        noisy = [_outcome(429, f"{PER_CLIENT_LIMIT_MESSAGE} too many", "1")] * 20
+        control = [_outcome(200)] * 3
+        with self.assertRaisesRegex(InvariantViolation, "admitted nothing"):
+            self._assertions().expect_control_isolated(noisy, control)
+
+    def test_a_bucket_both_arms_share_names_isolation_not_starvation(self) -> None:
+        # A shared bucket rejects both arms, which satisfies neither the
+        # isolation verdict nor the noisy-admitted one. The round has to fail
+        # on the first of those: "not on separate buckets" is the true
+        # statement, and "admitted nothing" would describe the noisy arm as
+        # starved and say nothing about the two clients sharing.
+        rejected = _outcome(429, f"{PER_CLIENT_LIMIT_MESSAGE} too many", "1")
+        with self.assertRaisesRegex(InvariantViolation, "not on separate buckets"):
+            self._assertions().expect_control_isolated([rejected] * 20, [rejected] * 3)
+
+    def test_an_empty_arm_fails_rather_than_passing_by_vacuity(self) -> None:
+        # An empty *control* arm satisfies three verdicts for the wrong
+        # reason: nothing unanswered, nothing rejected, and all zero of its
+        # requests succeeded. An empty *noisy* arm would instead reach the
+        # saturation verdict, which is a true-but-unhelpful reading of the
+        # same mistake. Both mean the round asked the limiter nothing, so the
+        # guard refuses them up front and neither reaches a verdict at all.
+        with self.assertRaisesRegex(InvariantViolation, "an arm was empty"):
+            self._assertions().expect_control_isolated(self._saturated_noisy(), [])
+        with self.assertRaisesRegex(InvariantViolation, "an arm was empty"):
+            self._assertions().expect_control_isolated([], [_outcome(200)] * 3)
+
+    def test_an_idle_limiter_fails_even_with_a_clean_control_arm(self) -> None:
+        # Nothing metered: the control arm's success says nothing about
+        # isolation because no client was ever over cap.
+        noisy = [_outcome(200)] * 20
+        control = [_outcome(200)] * 3
+        with self.assertRaisesRegex(InvariantViolation, "drew no 429"):
+            self._assertions().expect_control_isolated(noisy, control)
+
+    def test_an_unanswered_control_request_is_not_a_clean_one(self) -> None:
+        control = [_outcome(200), _outcome(0, "connection refused"), _outcome(200)]
+        with self.assertRaisesRegex(InvariantViolation, "no status at all"):
+            self._assertions().expect_control_isolated(self._saturated_noisy(), control)
+
+
 class _ScriptedKubectl:
     def __init__(self, results) -> None:
         self.results = list(results)
@@ -171,6 +282,33 @@ class _ScriptedKubectl:
 
 
 class PublicApiEnvOverride(unittest.TestCase):
+    def test_accepts_a_comma_separated_allowlist_and_still_refuses_the_rest(self) -> None:
+        # The kind bench refused `a,b,c` for KNOWN_CLIENTS before the comma was
+        # in the class, which is the one separator that env var's own grammar
+        # requires. Widening it must not let anything else through.
+        harness = KindHarness(_ScriptedKubectl([]), KindConfig())
+        for refused in (
+            "space smoke",
+            "space-smoke;rm -rf /",
+            "$(whoami)",
+            "`id`",
+            "a\nb",
+            "'quoted'",
+            "x" * (LIMITER_ENV_VALUE_MAX + 1),
+            "",
+        ):
+            with self.subTest(value=refused), self.assertRaisesRegex(ValueError, "refusing"):
+                harness.set_public_api_env({"SPACE_API_CLIENT_CONCURRENCY_KNOWN_CLIENTS": refused})
+        # The accepted shape clears both gates the value could fail: the value
+        # class, then the closed key list. `set_public_api_env` checks those in
+        # that order and only then demands the caller's mutation Lease, which
+        # this bare harness does not hold — so being turned away for the Lease,
+        # and not for the value, is what proves the comma got through.
+        with self.assertRaisesRegex(SmokeConfigurationError, "mutation Lease"):
+            harness.set_public_api_env(
+                {"SPACE_API_CLIENT_CONCURRENCY_KNOWN_CLIENTS": "space-smoke,space-smoke-noisy"}
+            )
+
     def test_refuses_keys_outside_the_limiter_list(self) -> None:
         harness = KindHarness(_ScriptedKubectl([]), KindConfig())
         with self.assertRaisesRegex(ValueError, "refusing"):
