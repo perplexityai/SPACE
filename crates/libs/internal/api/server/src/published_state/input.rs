@@ -121,3 +121,27 @@ impl PublishedSandboxRow {
         }
     }
 }
+
+#[derive(serde::Serialize)]
+pub(super) struct PublishedRecoveryObservationRow<'a> {
+    sandbox_id: SandboxId,
+    quarantine_recovery_payload: Option<&'a serde_json::Value>,
+    quarantine_recovery_observation_degraded: bool,
+}
+
+impl PublishedSandboxRow {
+    /// jsonb_to_recordset treats JSON null and an absent value as SQL NULL.
+    pub(super) fn has_recovery_observation(&self) -> bool {
+        self.quarantine_recovery_payload
+            .as_ref()
+            .is_some_and(|payload| !payload.is_null())
+    }
+
+    pub(super) fn recovery_observation_projection(&self) -> PublishedRecoveryObservationRow<'_> {
+        PublishedRecoveryObservationRow {
+            sandbox_id: self.sandbox_id,
+            quarantine_recovery_payload: self.quarantine_recovery_payload.as_ref(),
+            quarantine_recovery_observation_degraded: self.quarantine_recovery_observation_degraded,
+        }
+    }
+}

@@ -2240,93 +2240,7 @@ pub async fn publish_sandbox_states(
             changed_at: row.state_changed_at?,
         })
     }));
-    sqlx::query(sql!(
-        "WITH input AS (
-             SELECT *
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 sandbox_id UUID,
-                 quarantine_recovery_payload JSONB,
-                 quarantine_recovery_observation_degraded BOOLEAN
-             )
-         ),
-         publishable AS (
-             SELECT input.*
-             FROM input
-             WHERE NOT COALESCE(input.quarantine_recovery_observation_degraded, FALSE)
-               AND input.quarantine_recovery_payload IS NOT NULL
-         )
-         INSERT INTO node_facet_observed_status (
-             node_id, facet, element, observed_payload, observed_at, updated_at
-         )
-         SELECT
-             $1,
-             $3,
-             publishable.sandbox_id::TEXT,
-             jsonb_build_object(
-                 'quarantine_recovery',
-                 publishable.quarantine_recovery_payload
-             ),
-             NOW(),
-             NOW()
-         FROM publishable
-         ON CONFLICT (node_id, facet, element) DO UPDATE
-         SET observed_payload =
-                 COALESCE(node_facet_observed_status.observed_payload, '{}'::JSONB)
-                 || EXCLUDED.observed_payload,
-             observed_at = EXCLUDED.observed_at,
-             updated_at = NOW()
-         WHERE node_facet_observed_status.observed_payload -> 'quarantine_recovery'
-               IS DISTINCT FROM EXCLUDED.observed_payload -> 'quarantine_recovery'
-            OR node_facet_observed_status.observed_at
-               < NOW() - make_interval(secs => $4::BIGINT)"
-    ))
-    .bind(node_id)
-    .bind(rows_json.clone())
-    .bind(FACET_SANDBOX_DESIRED_STATE)
-    .bind(QUARANTINE_RECOVERY_OBSERVATION_HEARTBEAT_SECS)
-    .execute(&mut *conn)
-    .await
-    .map_err(|err| {
-        Status::internal(format!(
-            "write published quarantine recovery observation: {err}"
-        ))
-    })?;
-    sqlx::query(sql!(
-        "WITH input AS (
-             SELECT *
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 sandbox_id UUID,
-                 quarantine_recovery_payload JSONB,
-                 quarantine_recovery_observation_degraded BOOLEAN
-             )
-         ),
-         clearable AS (
-             SELECT input.sandbox_id
-             FROM input
-             WHERE NOT COALESCE(input.quarantine_recovery_observation_degraded, FALSE)
-               AND input.quarantine_recovery_payload IS NULL
-         )
-         UPDATE node_facet_observed_status observed
-         SET observed_payload = COALESCE(observed.observed_payload, '{}'::JSONB)
-                                    - 'quarantine_recovery',
-             observed_at = NOW(),
-             updated_at = NOW()
-         FROM clearable
-         WHERE observed.node_id = $1
-           AND observed.facet = $3
-           AND observed.element = clearable.sandbox_id::TEXT
-           AND observed.observed_payload ? 'quarantine_recovery'"
-    ))
-    .bind(node_id)
-    .bind(rows_json.clone())
-    .bind(FACET_SANDBOX_DESIRED_STATE)
-    .execute(&mut *conn)
-    .await
-    .map_err(|err| {
-        Status::internal(format!(
-            "clear published quarantine recovery observation: {err}"
-        ))
-    })?;
+    reconcile_recovery_observations(conn, node_id, &rows).await?;
     update_activity_timestamps(conn, node_id, &rows).await?;
 
     let first_seen_sandbox_ids = accepted_rows
@@ -4085,6 +3999,129 @@ async fn converge_failed_sandboxes(
         Status::internal(format!("serialize failed publication rows: {error}"))
     })?);
     project_node_published_failed_sandboxes(conn, node_id, rows_json).await
+}
+
+/// Reconcile node-scoped recovery evidence while preserving degraded observations.
+async fn reconcile_recovery_observations(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    rows: &[PublishedSandboxRow],
+) -> Result<(), Status> {
+    let recovery_rows = rows
+        .iter()
+        .filter(|row| {
+            !row.quarantine_recovery_observation_degraded && row.has_recovery_observation()
+        })
+        .map(PublishedSandboxRow::recovery_observation_projection)
+        .collect::<Vec<_>>();
+    if !recovery_rows.is_empty() {
+        let recovery_rows = Json(serde_json::to_value(recovery_rows).map_err(|error| {
+            Status::internal(format!("serialize recovery observations: {error}"))
+        })?);
+        sqlx::query(sql!(
+            "WITH input AS (
+             SELECT *
+             FROM jsonb_to_recordset($2::jsonb) AS input(
+                 sandbox_id UUID,
+                 quarantine_recovery_payload JSONB,
+                 quarantine_recovery_observation_degraded BOOLEAN
+             )
+         ),
+         publishable AS (
+             SELECT input.*
+             FROM input
+             WHERE NOT COALESCE(input.quarantine_recovery_observation_degraded, FALSE)
+               AND input.quarantine_recovery_payload IS NOT NULL
+         )
+         INSERT INTO node_facet_observed_status (
+             node_id, facet, element, observed_payload, observed_at, updated_at
+         )
+         SELECT
+             $1,
+             $3,
+             publishable.sandbox_id::TEXT,
+             jsonb_build_object(
+                 'quarantine_recovery',
+                 publishable.quarantine_recovery_payload
+             ),
+             NOW(),
+             NOW()
+         FROM publishable
+         ON CONFLICT (node_id, facet, element) DO UPDATE
+         SET observed_payload =
+                 COALESCE(node_facet_observed_status.observed_payload, '{}'::JSONB)
+                 || EXCLUDED.observed_payload,
+             observed_at = EXCLUDED.observed_at,
+             updated_at = NOW()
+         WHERE node_facet_observed_status.observed_payload -> 'quarantine_recovery'
+               IS DISTINCT FROM EXCLUDED.observed_payload -> 'quarantine_recovery'
+            OR node_facet_observed_status.observed_at
+               < NOW() - make_interval(secs => $4::BIGINT)"
+        ))
+        .bind(node_id)
+        .bind(recovery_rows)
+        .bind(FACET_SANDBOX_DESIRED_STATE)
+        .bind(QUARANTINE_RECOVERY_OBSERVATION_HEARTBEAT_SECS)
+        .execute(&mut *conn)
+        .await
+        .map_err(|err| {
+            Status::internal(format!(
+                "write published quarantine recovery observation: {err}"
+            ))
+        })?;
+    }
+    let clear_recovery_rows = rows
+        .iter()
+        .filter(|row| {
+            !row.quarantine_recovery_observation_degraded && !row.has_recovery_observation()
+        })
+        .map(PublishedSandboxRow::recovery_observation_projection)
+        .collect::<Vec<_>>();
+    if !clear_recovery_rows.is_empty() {
+        let clear_recovery_rows =
+            Json(serde_json::to_value(clear_recovery_rows).map_err(|error| {
+                Status::internal(format!(
+                    "serialize recovery observation withdrawals: {error}"
+                ))
+            })?);
+        sqlx::query(sql!(
+            "WITH input AS (
+             SELECT *
+             FROM jsonb_to_recordset($2::jsonb) AS input(
+                 sandbox_id UUID,
+                 quarantine_recovery_payload JSONB,
+                 quarantine_recovery_observation_degraded BOOLEAN
+             )
+         ),
+         clearable AS (
+             SELECT input.sandbox_id
+             FROM input
+             WHERE NOT COALESCE(input.quarantine_recovery_observation_degraded, FALSE)
+               AND input.quarantine_recovery_payload IS NULL
+         )
+         UPDATE node_facet_observed_status observed
+         SET observed_payload = COALESCE(observed.observed_payload, '{}'::JSONB)
+                                    - 'quarantine_recovery',
+             observed_at = NOW(),
+             updated_at = NOW()
+         FROM clearable
+         WHERE observed.node_id = $1
+           AND observed.facet = $3
+           AND observed.element = clearable.sandbox_id::TEXT
+           AND observed.observed_payload ? 'quarantine_recovery'"
+        ))
+        .bind(node_id)
+        .bind(clear_recovery_rows)
+        .bind(FACET_SANDBOX_DESIRED_STATE)
+        .execute(&mut *conn)
+        .await
+        .map_err(|err| {
+            Status::internal(format!(
+                "clear published quarantine recovery observation: {err}"
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
