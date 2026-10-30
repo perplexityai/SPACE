@@ -748,11 +748,105 @@ helpers = [
   "pplx-space-s3-http-client",
 ]
 
+[rules.layers]
 # The crates being dissolved: they predate the layers and mix SPACE-specific
 # code in until they are split up. Every check covers them, with today's edges
 # baselined.
-[rules.layers]
 legacy = ["pplx-space-common-core", "pplx-space-common-svc", "pplx-space-metrics"]
+
+# An l20_domain crate is a protocol (wire schemas and the conversions between
+# them and the models) if its name ends in -protocol or -proto, or `protocols`
+# lists it; every other one is a model, which never depends on a protocol.
+# These five are protocols without such a name. The mixed crates, which hold
+# model and wire code until they are split, count as models: api-route,
+# credential-injection-core, net-common and spaced-common.
+protocols = [
+  "pplx-space-auto-lifecycle-receipt",
+  "pplx-space-events",
+  "pplx-space-execution-common",
+  "pplx-space-public-api",
+  "pplx-space-rpc-contracts",
+]
+
+# l20_domain crates do no I/O, so none depends on a package that does it:
+# normal and build dependencies, optional ones included. Each family is an
+# exact list, so a new package, such as a new aws-sdk-*, is added by hand;
+# some are not in Cargo.lock today. tonic and prost are allowed. An
+# l20_domain dependency on a database driver, aws-sdk-s3 or a storage helper
+# is storage_access's ([rules.layers.storage]), so no family lists them.
+# aws-lc-rs and aws-lc-sys are cryptography, not cloud SDKs. The workspace's
+# own I/O crates need no entry: an l10_foundation crate, legacy or not, with
+# a required dependency on a fenced package is fenced under that package's
+# family, such as common-grpc (hyper-util), tokio-runtime (tokio) or
+# common-svc (axum). Only declared dependencies are
+# seen: tonic's transport brings tokio and hyper into every tonic user's
+# build regardless. Features are not followed, so observability, which brings
+# tokio in only behind its otel feature, is listed; feature-flags, whose
+# openfeature feature does too, is fenced already by its required dependency
+# on metrics.
+[rules.layers.domain_fences]
+runtime = [
+  "async-std",
+  "pplx-space-observability",
+  "smol",
+  "tokio",
+  "tokio-rustls",
+  "tokio-stream",
+  "tokio-tungstenite",
+  "tokio-util",
+  "tokio-vsock",
+]
+http = [
+  "attohttpc",
+  "axum",
+  "curl",
+  "h2",
+  "h3",
+  "hyper",
+  "hyper-named-pipe",
+  "hyper-rustls",
+  "hyper-timeout",
+  "hyper-util",
+  "hyperlocal",
+  "isahc",
+  "reqwest",
+  "surf",
+  "ureq",
+]
+cloud = [
+  "aws-config",
+  "aws-credential-types",
+  "aws-runtime",
+  "aws-sdk-acmpca",
+  "aws-sdk-ecr",
+  "aws-sdk-secretsmanager",
+  "aws-sdk-sso",
+  "aws-sdk-ssooidc",
+  "aws-sdk-sts",
+  "aws-sigv4",
+  "aws-smithy-async",
+  "aws-smithy-checksums",
+  "aws-smithy-eventstream",
+  "aws-smithy-http",
+  "aws-smithy-http-client",
+  "aws-smithy-json",
+  "aws-smithy-observability",
+  "aws-smithy-query",
+  "aws-smithy-runtime",
+  "aws-smithy-runtime-api",
+  "aws-smithy-runtime-api-macros",
+  "aws-smithy-schema",
+  "aws-smithy-types",
+  "aws-smithy-xml",
+  "aws-types",
+]
+kube = [
+  "k8s-openapi",
+  "kube",
+  "kube-client",
+  "kube-core",
+  "kube-runtime",
+]
 
 [rules.layers.placement]          # every crate has a layer; no new unmoved entries
 mode = "required"
@@ -806,6 +900,30 @@ mode = "required"
 [rules.layers.codec_features.stale_entries]
 mode = "required"
 
+# No l20_domain crate depends on a package [rules.layers.domain_fences] lists,
+# or on an l10_foundation crate that a required dependency on one fences.
+# Today's exceptions are baselined in [layers.domain_dependencies].
+[rules.layers.domain_dependencies.no_crossing]
+mode = "required"
+
+[rules.layers.domain_dependencies.no_new_entries]
+mode = "required"
+
+[rules.layers.domain_dependencies.stale_entries]
+mode = "required"
+
+# No model depends on a protocol. Today's exceptions are baselined in
+# [layers.model_protocol]: common-core, which is legacy, and spaced-common, a
+# mixed crate, until they are deleted and split.
+[rules.layers.model_protocol.no_crossing]
+mode = "required"
+
+[rules.layers.model_protocol.no_new_entries]
+mode = "required"
+
+[rules.layers.model_protocol.stale_entries]
+mode = "required"
+
 [rules.layers.test_only]          # test_support only through dev-dependencies; nothing depends on tools
 mode = "required"
 
@@ -815,7 +933,7 @@ mode = "required"
 [rules.layers.store_edges]        # API and Storage crates use only the stores that list them
 mode = "required"
 
-[rules.layers.stale_entries]      # unmoved, legacy, store_users, allowed_edges and storage entries that no longer apply
+[rules.layers.stale_entries]      # [rules.layers] entries that no longer apply
 mode = "required"
 
 [rules.layers.policy_changed]     # changes to [rules.layers], compared with the base branch

@@ -98,7 +98,9 @@ fn left_out(member: &Member<'_>) -> Option<&'static str> {
 }
 
 /// The normal and build dependencies of `member`.
-fn production<'a>(member: &Member<'a>) -> impl Iterator<Item = &'a Dependency> + use<'a> {
+pub(super) fn production<'a>(
+    member: &Member<'a>,
+) -> impl Iterator<Item = &'a Dependency> + use<'a> {
     let krate: &'a Crate = member.krate;
     krate
         .dependencies
@@ -146,7 +148,7 @@ impl<'a> Storage<'a> {
     }
 
     /// Whether `package` is a driver or a storage helper.
-    fn is_target(&self, config: &LayersConfig, package: &str) -> bool {
+    pub(super) fn is_target(&self, config: &LayersConfig, package: &str) -> bool {
         config.storage.drivers.contains(package) || self.helpers.contains_key(package)
     }
 
