@@ -42,8 +42,9 @@ mod substrate_adapter;
 mod suspend;
 mod teardown;
 pub(super) use node_eligibility::{
-    NetworkSlotCapacityPreflight, network_slot_capacity_preflight, node_network_slot_available,
-    node_not_placement_blocked, node_schedulable, node_services_not_ready,
+    NetworkSlotCapacityPreflight, network_slot_capacity_preflight, network_slot_headroom,
+    node_network_slot_available, node_not_placement_blocked, node_schedulable,
+    node_services_not_ready,
 };
 #[cfg(test)]
 use pooled::pooled_metadata_update_error_is_reclaimable;
