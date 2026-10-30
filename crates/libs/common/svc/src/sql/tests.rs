@@ -176,3 +176,34 @@ async fn a_capped_pool_ignores_the_service_wide_connection_env() {
         "an env floor above the cap must clamp to the cap, never exceed it"
     );
 }
+
+/// Pins the always-on query spans: SQLx keeps the statement level only in
+/// `PgConnectOptions`' private log settings, which `Debug` exposes.
+#[tokio::test]
+async fn service_pools_emit_query_events_at_info() {
+    let url = "postgres://space_admin:admin@127.0.0.1:1/space?sslmode=disable";
+    let identity = DatabaseIdentity::SpaceUser;
+    // The pool is lazy and never connects, so any non-empty password works.
+    // A runtime value keeps CodeQL's hard-coded-credential check quiet.
+    let password = std::process::id().to_string();
+    let pools = [
+        connect_postgres_lazy_as(url, "query-span-test", identity, &password).unwrap(),
+        connect_postgres_lazy_as_capped(
+            url,
+            "query-span-test",
+            identity,
+            &password,
+            std::num::NonZeroU32::new(1).expect("1 is non-zero"),
+            None,
+        )
+        .unwrap(),
+    ];
+
+    for pool in pools {
+        let options = format!("{:?}", pool.connect_options());
+        assert!(
+            options.contains("statements_level: Info"),
+            "service pools must emit sqlx::query events at INFO: {options}"
+        );
+    }
+}
