@@ -493,6 +493,189 @@ async fn operation_sorts_after_one_committed_during_its_idempotency_lock_wait() 
     Ok(())
 }
 
+/// Inserts for one sandbox wait for each other to commit, so the sandbox's
+/// request order is its commit order; another sandbox's inserts don't wait.
+#[tokio::test]
+async fn inserts_for_one_sandbox_commit_in_request_order() -> TestResult {
+    let Some(db) = try_pg_test_db_with_max_connections(6).await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let target_id = PublicSandboxId::new().to_string();
+    let other_target_id = PublicSandboxId::new().to_string();
+
+    let mut first = db.pool.begin().await?;
+    let (created, superseded) = create_operation_tx(
+        &mut first,
+        CreatePublicOperation {
+            org_id,
+            actor_user_id: None,
+            api_product: ApiProduct::Native,
+            kind: OperationKind::WakeSandbox,
+            target_type: Some(OperationTargetType::Sandbox),
+            target_id: Some(&target_id),
+            payload_json: serde_json::json!({}),
+            idempotency: None,
+            traceparent: None,
+        },
+    )
+    .await?;
+    let first_id = created.expect_created();
+    let second = tokio::spawn({
+        let store = store.clone();
+        let target_id = target_id.clone();
+        async move {
+            create_test_operation_for_target(&store, org_id, OperationKind::StopSandbox, &target_id)
+                .await
+        }
+    });
+    wait_for_advisory_lock_waiter(&db.pool).await?;
+    create_test_operation_for_target(&store, org_id, OperationKind::StopSandbox, &other_target_id)
+        .await?
+        .expect_created();
+
+    let committing_at: time::OffsetDateTime = sqlx::query_scalar(sql!("SELECT clock_timestamp()"))
+        .fetch_one(&mut *first)
+        .await?;
+    first.commit().await?;
+    superseded.record();
+    let second_id = second.await??.expect_created();
+
+    let second_requested_at: time::OffsetDateTime = sqlx::query_scalar(sql!(
+        "SELECT requested_at FROM public_operations WHERE operation_id = $1"
+    ))
+    .bind(second_id.as_uuid())
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(
+        second_requested_at > committing_at,
+        "the second insert is stamped after the first commits"
+    );
+    assert_eq!(
+        dispatch_order(&db.pool, org_id, &target_id).await?,
+        vec![first_id.as_uuid(), second_id.as_uuid()]
+    );
+    Ok(())
+}
+
+/// The sandbox queue lock comes before row locks: a delete holds it while it
+/// waits for a create's row, so a later insert for the sandbox waits behind
+/// the delete. Claims and releases, which lock rows, never wait for it, so a
+/// release holding the create's row can't wait on the delete.
+#[tokio::test]
+async fn the_sandbox_queue_lock_is_taken_before_row_locks_and_never_by_claims() -> TestResult {
+    let Some(db) = try_pg_test_db_with_max_connections(8).await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let target_id = PublicSandboxId::new().to_string();
+    let claim_create = || {
+        store.claim_operations(ClaimPublicOperations {
+            limits: ClaimLimits::any(4),
+            claim_stale_after: Duration::from_secs(60),
+            claimable_kinds: &[OperationKind::CreateSandbox],
+        })
+    };
+    let create_id =
+        create_test_operation_for_target(&store, org_id, OperationKind::CreateSandbox, &target_id)
+            .await?
+            .expect_created();
+
+    // While an insert for the sandbox holds its queue, a claim and a
+    // release of its create go ahead.
+    let mut inserting = db.pool.begin().await?;
+    lock_sandbox_queue(&mut inserting, org_id, &target_id).await?;
+    let claim = tokio::time::timeout(Duration::from_secs(5), claim_create()).await??;
+    assert_eq!(claim.operations.len(), 1);
+    let released = tokio::time::timeout(
+        Duration::from_secs(5),
+        store.release_claimed_operation(ReleaseClaimedPublicOperation {
+            claim_token: claim.claim_token,
+            operation_id: create_id,
+            progress_message: "sandbox pod is not ready".to_string(),
+            retry_after: Duration::ZERO,
+            count_attempt: true,
+            undo_first_start: false,
+            cancel_if_superseded: true,
+            carried_error: None,
+        }),
+    )
+    .await??;
+    assert_eq!(released, ReleasedClaim::Requeued);
+    inserting.rollback().await?;
+
+    // Hold the claimed create's row, as a release does until it commits.
+    let claim = claim_create().await?;
+    assert_eq!(claim.operations.len(), 1);
+    let mut releasing = db.pool.begin().await?;
+    sqlx::query(sql!(
+        "SELECT 1 FROM public_operations WHERE operation_id = $1 FOR UPDATE"
+    ))
+    .bind(create_id.as_uuid())
+    .execute(&mut *releasing)
+    .await?;
+    let delete = tokio::spawn({
+        let store = store.clone();
+        let target_id = target_id.clone();
+        async move {
+            create_test_operation_for_target(
+                &store,
+                org_id,
+                OperationKind::DeleteSandbox,
+                &target_id,
+            )
+            .await
+        }
+    });
+    wait_for_row_lock_waiter(&db.pool).await?;
+    let wake = tokio::spawn({
+        let store = store.clone();
+        let target_id = target_id.clone();
+        async move {
+            create_test_operation_for_target(&store, org_id, OperationKind::WakeSandbox, &target_id)
+                .await
+        }
+    });
+    // The wake waits on the queue the delete holds while it waits for the
+    // row.
+    wait_for_advisory_lock_waiter(&db.pool).await?;
+    assert!(!wake.is_finished());
+
+    releasing.commit().await?;
+    let delete_id = delete.await??.expect_created();
+    let wake_id = wake.await??.expect_created();
+    assert_eq!(
+        dispatch_order(&db.pool, org_id, &target_id).await?,
+        vec![create_id.as_uuid(), delete_id.as_uuid(), wake_id.as_uuid()]
+    );
+    Ok(())
+}
+
+/// Returns once some transaction waits for a row another one has locked.
+async fn wait_for_row_lock_waiter(pool: &PgPool) -> TestResult {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(sql!(
+                "SELECT COUNT(*)
+                   FROM pg_stat_activity
+                  WHERE datname = current_database()
+                    AND wait_event_type = 'Lock'
+                    AND wait_event IN ('transactionid', 'tuple')"
+            ))
+            .fetch_one(pool)
+            .await?;
+            if waiting > 0 {
+                return Ok::<_, sqlx::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    Ok(())
+}
+
 /// Returns once some transaction waits on an advisory lock in this database.
 async fn wait_for_advisory_lock_waiter(pool: &PgPool) -> TestResult {
     tokio::time::timeout(Duration::from_secs(10), async {

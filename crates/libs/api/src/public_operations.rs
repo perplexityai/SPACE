@@ -1768,10 +1768,16 @@ pub async fn create_operation_tx(
         .await?;
     }
 
+    if let Some(target_id) = sandbox_queue_target(&input) {
+        lock_sandbox_queue(tx, input.org_id, target_id).await?;
+    }
     let operation_id = OperationId::new();
     // Stamp `requested_at` at insert, not at the transaction's start: a lock
     // wait above or in the caller can outlast an operation for the same
     // target that commits first, and the dispatcher orders by this column.
+    // Under the sandbox's queue lock no other insert for it commits between
+    // this stamp and this transaction's commit, so its operations' request
+    // order is their commit order.
     sqlx::query(sql!(
         "INSERT INTO public_operations (
              operation_id,
@@ -2080,6 +2086,42 @@ async fn lock_active_sandbox_operation(
         "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))"
     ))
     .bind(lock_key)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// The sandbox whose queue an operation joins: its target when it names one,
+/// unless it is a fork, which names its source by a different id form and
+/// is ordered by the source's lifecycle lock instead.
+fn sandbox_queue_target<'a>(input: &CreatePublicOperation<'a>) -> Option<&'a str> {
+    if input.target_type != Some(OperationTargetType::Sandbox)
+        || input.kind == OperationKind::ForkSandbox
+    {
+        return None;
+    }
+    input.target_id
+}
+
+/// Serialize inserting operations for one sandbox, until this transaction
+/// commits.
+///
+/// Every insert into a sandbox's queue takes this lock last, just before its
+/// `INSERT`, so it waits for an earlier insert to commit and nothing checked
+/// earlier in the transaction (idempotency, quota, a joinable operation) is
+/// held up by it. Afterwards only row locks follow: a delete locks its
+/// sandbox's active creates to cancel them. Claims, renewals, releases and
+/// completions take row locks and never this lock, so no transaction waits
+/// for it while holding a row an insert waits for.
+async fn lock_sandbox_queue(
+    tx: &mut Transaction<'_, Postgres>,
+    org_id: OrgId,
+    target_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(sql!(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))"
+    ))
+    .bind(format!("{org_id}:{target_id}:queue"))
     .execute(&mut **tx)
     .await?;
     Ok(())
