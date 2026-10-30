@@ -798,7 +798,8 @@ async fn delete_replay_survives_target_removal_without_crossing_tenant_or_reques
         let mut headers = HeaderMap::new();
         headers.insert(IDEMPOTENCY_KEY_HEADER, key.parse()?);
         let result =
-            enqueue_lifecycle_operation(&db.pool, org, actor, headers, &target, action, None).await;
+            enqueue_lifecycle_operation(&db.pool, None, org, actor, headers, &target, action, None)
+                .await;
         match result {
             Ok((status, Json(response))) => {
                 assert_eq!(status, expected);
@@ -849,6 +850,7 @@ async fn a_delete_admitted_while_its_create_records_the_row_is_not_lost() -> Tes
         async move {
             enqueue_lifecycle_operation(
                 &pool,
+                None,
                 OrgId::from_uuid(SEED_ORG_ID),
                 UserId::from_uuid(SEED_USER_ID),
                 delete_headers(),
@@ -876,6 +878,7 @@ async fn a_delete_never_sees_another_orgs_create_in_flight() -> TestDbResult<()>
     let created = queued_native_create(&db.pool).await?;
     let result = enqueue_lifecycle_operation(
         &db.pool,
+        None,
         OrgId::from_uuid(Uuid::now_v7()),
         UserId::from_uuid(SEED_USER_ID),
         delete_headers(),

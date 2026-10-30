@@ -10,12 +10,13 @@ use pplx_space_common_core::types::{
     AutoLifecyclePolicy, GuestUserName, IdempotencyKey, ProcessCommand, SandboxLifecycle,
     validate_linux_guest_path_input,
 };
+use pplx_space_metrics::operations::InlineAdmissionPath;
 use pplx_space_metrics::response::{ResponseKind, ResponseOrigin};
 use pplx_space_public_api::{
     CreateCommandRequest, CreateFileWatchSessionRequest, CreatePortSessionRequest,
     CreateProcessRequest, CreateProtocolSessionRequest, CreateTerminalSessionRequest,
-    DataPlaneSessionId, PageCursor, PublicCommand, PublicPage, PublicSandboxId, PublicSession,
-    SandboxLifecycleAction, SessionKind, SessionTargetProtocol, TerminalSize,
+    DataPlaneSessionId, OperationKind, PageCursor, PublicCommand, PublicPage, PublicSandboxId,
+    PublicSession, SandboxLifecycleAction, SessionKind, SessionTargetProtocol, TerminalSize,
     routes as native_routes,
 };
 use serde::Deserialize;
@@ -23,6 +24,7 @@ use time::OffsetDateTime;
 
 use crate::{
     controllers::{ControllerError, substrate::ExecutionActivityKind},
+    inline_operations::InlineLifecycle,
     middleware::auth::{AuthOrg, AuthUser},
     models::Sandbox,
     public_operations::{HttpOperationMethod, OperationPathTemplate, PublicOperationStore},
@@ -147,6 +149,7 @@ pub async fn create_process_session(
     if admission == CommandAdmission::AdmitAndWake {
         enqueue_implicit_wake(
             &state.pool,
+            Some(&state.inline_lifecycle),
             org.id,
             sandbox_id,
             ExecutionActivityKind::Command,
@@ -189,6 +192,7 @@ pub async fn create_command(
     if admission == CommandAdmission::AdmitAndWake {
         enqueue_implicit_wake(
             &state.pool,
+            Some(&state.inline_lifecycle),
             org.id,
             sandbox_id,
             ExecutionActivityKind::Command,
@@ -317,8 +321,12 @@ fn sandbox_lifecycle(sandbox: &Sandbox) -> Result<SandboxLifecycle, PublicApiErr
 ///
 /// Called for a replayed session too, so a retry heals a wake that failed to
 /// queue after its session was created.
+///
+/// With `inline`, a wake it creates rather than joins may run in this
+/// process instead (see [`InlineLifecycle`]); the caller does not wait for it.
 async fn enqueue_implicit_wake(
     pool: &sqlx::PgPool,
+    inline: Option<&InlineLifecycle>,
     org_id: OrgId,
     sandbox_id: PublicSandboxId,
     activity: ExecutionActivityKind,
@@ -331,14 +339,37 @@ async fn enqueue_implicit_wake(
         wake_activity: record_activity.then_some(activity.into()),
     }
     .into_json();
-    PublicOperationStore::new(pool.clone())
-        .create_or_join_active_sandbox_wake(
-            org_id,
-            &sandbox_id.to_string(),
-            payload,
-            crate::public_operations::request_traceparent(),
-        )
-        .await?;
+    let store = PublicOperationStore::new(pool.clone());
+    let target_id = sandbox_id.to_string();
+    let traceparent = crate::public_operations::request_traceparent();
+    let offered = inline.and_then(|inline| {
+        inline
+            .offer(
+                org_id,
+                OperationKind::WakeSandbox,
+                InlineAdmissionPath::ImplicitWake,
+            )
+            .map(|permit| (inline, permit))
+    });
+    match offered {
+        None => {
+            store
+                .create_or_join_active_sandbox_wake(org_id, &target_id, payload, traceparent)
+                .await?;
+        }
+        Some((inline, permit)) => {
+            let recorded = store
+                .create_or_join_active_sandbox_wake_claimed_if_sole_active(
+                    org_id,
+                    &target_id,
+                    payload,
+                    traceparent,
+                    inline.org_limit(),
+                )
+                .await?;
+            inline.settle(permit, &store, recorded);
+        }
+    }
     Ok(())
 }
 
@@ -354,6 +385,7 @@ async fn enqueue_implicit_wake(
 /// `record_activity`.
 pub(crate) async fn queue_implicit_wake(
     pool: &sqlx::PgPool,
+    inline: Option<&InlineLifecycle>,
     sandbox: &Sandbox,
     activity: ExecutionActivityKind,
     record_activity: bool,
@@ -398,8 +430,15 @@ pub(crate) async fn queue_implicit_wake(
         CommandAdmission::Admit => Ok(true),
         CommandAdmission::Refuse => Ok(false),
         CommandAdmission::AdmitAndWake => {
-            enqueue_implicit_wake(pool, sandbox.org_id, sandbox_id, activity, record_activity)
-                .await?;
+            enqueue_implicit_wake(
+                pool,
+                inline,
+                sandbox.org_id,
+                sandbox_id,
+                activity,
+                record_activity,
+            )
+            .await?;
             Ok(true)
         }
     }

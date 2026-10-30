@@ -301,3 +301,20 @@ pub const SPACE_NATIVE_CREATE_POOL_CLAIM_FLAG: BoolFlag =
 /// that cannot answer means hidden.
 pub const SPACE_NATIVE_HIDDEN_OPERATIONS_FLAG: BoolFlag =
     BoolFlag::new("space-native-hidden-operations", false);
+
+/// Per-organization gate for executing native lifecycle operations inline,
+/// in the space-api process that admitted them, instead of leaving them
+/// queued for the cluster-controller dispatcher. Evaluated by space-api with
+/// SPACE's org id as the subject, under the static
+/// `SPACE_NATIVE_INLINE_OPERATIONS_ENABLED` env master (off by default) by
+/// [`policy`], and only for the kinds `SPACE_NATIVE_INLINE_KINDS` names.
+///
+/// Falls back **on**, unlike the rollout gates above, because it opens no
+/// new operation: an inline operation is recorded, claimed, retried and
+/// recovered exactly as a queued one, and only the process that runs its
+/// first attempt differs. The env master is the rollout gate; this flag is
+/// a per-organization lever under it, so a deployment with no flag backend
+/// gets what its master says, and one with a backend can hold organizations
+/// back (or let only some through) by targeting.
+pub const SPACE_NATIVE_INLINE_OPERATIONS_FLAG: BoolFlag =
+    BoolFlag::new("space-native-inline-operations", true);

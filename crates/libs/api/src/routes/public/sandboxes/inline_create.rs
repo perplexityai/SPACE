@@ -15,19 +15,21 @@
 //! authority), a create that wins a claim is recorded queued for the
 //! dispatcher instead, as with the kill switch off.
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(test)]
+pub(crate) use crate::inline_operations::InlineExecution;
+pub(crate) use crate::inline_operations::InlineExecutor;
 use crate::inline_operations::{InlineOperations, InlinePermit};
-use crate::public_operation_driver::OperationExecutionResult;
 use crate::public_operations::{ClaimedPublicOperation, PublicOperationStore};
 use crate::public_sandbox_operations::CreateSandboxOperationExecutor;
 use crate::routes::AppState;
 
 /// Kill switch for inline execution, read only while admission-time claims
 /// are on. Off records claimed creates queued for the dispatcher, as before.
+/// It alone governs these creates: the inline master, kinds list and flag
+/// (see `InlineLifecycle`) govern cold creates and wakes, not warm-pool hits.
 const NATIVE_CREATE_INLINE_ENV: &str = "SPACE_NATIVE_CREATE_INLINE_ENABLED";
 const DEFAULT_NATIVE_CREATE_INLINE_ENABLED: bool = true;
 /// How long the request waits for the inline execution before answering.
@@ -35,26 +37,11 @@ const NATIVE_CREATE_INLINE_WAIT_ENV: &str = "SPACE_NATIVE_CREATE_INLINE_WAIT_MS"
 const DEFAULT_NATIVE_CREATE_INLINE_WAIT: Duration = Duration::from_millis(2_000);
 const MAX_NATIVE_CREATE_INLINE_WAIT: Duration = Duration::from_secs(30);
 
-pub(crate) type InlineExecution = Pin<Box<dyn Future<Output = OperationExecutionResult> + Send>>;
-
-/// Runs one claimed create. Production runs the dispatcher's create
-/// executor; tests substitute the execution.
-pub(crate) trait InlineCreateExecutor: Send + Sync + 'static {
-    fn execute(&self, operation: ClaimedPublicOperation) -> InlineExecution;
-}
-
-impl InlineCreateExecutor for CreateSandboxOperationExecutor {
-    fn execute(&self, operation: ClaimedPublicOperation) -> InlineExecution {
-        let executor = self.clone();
-        Box::pin(async move { executor.execute(&operation).await.into() })
-    }
-}
-
 /// How a claimed create runs inline.
 #[derive(Clone)]
 pub(crate) struct InlineCreate {
     pub(crate) wait: Duration,
-    pub(crate) executor: Arc<dyn InlineCreateExecutor>,
+    pub(crate) executor: Arc<dyn InlineExecutor>,
     pub(crate) runner: InlineOperations,
 }
 
