@@ -2198,6 +2198,16 @@ impl SandboxManagerService {
         let memory_policy =
             self.resolve_sandbox_memory_policy(requested_memory_mib, node_memory_policy);
         let mem_mib = memory_policy.effective_memory_mib;
+        // Declared cold-start shapes must be honored; only omitted memory may
+        // fall back to the template/default size clamped by node policy.
+        if req_memory_mib.is_some() && mem_mib < requested_memory_mib {
+            return Err(activation_cleanup.failure(
+                pplx_space_sbx_mgr_client::memory_policy_refusal_status(
+                    requested_memory_mib,
+                    mem_mib,
+                ),
+            ));
+        }
         // Like boot args, the balloon device exists only from a cold boot:
         // snapshots carry the device state they were taken with.
         let balloon = template_defaults
