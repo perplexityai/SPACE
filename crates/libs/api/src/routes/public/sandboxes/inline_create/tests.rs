@@ -21,8 +21,13 @@ mod postgres {
     use pplx_space_public_api::{OperationId, OperationKind, OperationState, PublicErrorCode};
     use tokio::sync::Notify;
 
+    use pplx_space_common_svc::DrainSignal;
+    use tokio_util::task::TaskTracker;
+
     use super::*;
     use crate::controllers::sandbox::SandboxController;
+    use crate::inline_operations::InlineOperationsConfig;
+    use crate::public_operation_driver::{OperationExecutionConfig, OperationExecutor};
     use crate::public_operation_driver::{OperationExecutionResult, drive_claimed_operation};
     use crate::public_operations::{
         ClaimLimits, ClaimPublicOperations, PublicOperationRequeueReason,
@@ -82,14 +87,44 @@ mod postgres {
         }
 
         fn inline(&self, wait: Duration) -> InlineCreate {
+            self.inline_on(
+                wait,
+                runner(
+                    TaskTracker::new(),
+                    DrainSignal::new(),
+                    OperationExecutionConfig::default(),
+                    16,
+                ),
+            )
+        }
+
+        fn inline_on(&self, wait: Duration, runner: InlineOperations) -> InlineCreate {
             InlineCreate {
                 wait,
                 executor: Arc::new(self.clone()),
-                tasks: TaskTracker::new(),
-                drain_signal: DrainSignal::new(),
-                config: OperationExecutionConfig::default(),
+                runner,
             }
         }
+    }
+
+    /// A process's inline execution with `max_concurrent` permits, as
+    /// `AppState` builds it for the API.
+    fn runner(
+        tasks: TaskTracker,
+        drain_signal: DrainSignal,
+        execution: OperationExecutionConfig,
+        max_concurrent: usize,
+    ) -> InlineOperations {
+        InlineOperations::new(
+            InlineOperationsConfig {
+                max_concurrent,
+                ..InlineOperationsConfig::default()
+            },
+            tasks,
+            drain_signal,
+            execution,
+            true,
+        )
     }
 
     impl InlineCreateExecutor for ScriptedCreate {
@@ -735,11 +770,15 @@ mod postgres {
         let script = ScriptedCreate::gated(Script::Succeed);
         let tasks = TaskTracker::new();
         let drain_signal = DrainSignal::new();
-        let inline = InlineCreate {
-            tasks: tasks.clone(),
-            drain_signal: drain_signal.clone(),
-            ..script.inline(Duration::ZERO)
-        };
+        let inline = script.inline_on(
+            Duration::ZERO,
+            runner(
+                tasks.clone(),
+                drain_signal.clone(),
+                OperationExecutionConfig::default(),
+                16,
+            ),
+        );
         let running = fixture
             .create_with(
                 claims(&controller, Some(inline.clone())),
@@ -796,13 +835,18 @@ mod postgres {
         let fixture = AdmissionPoolFixture::new(1).await?;
         let controller = fixture.controller();
         let script = ScriptedCreate::gated(Script::Succeed);
-        let inline = InlineCreate {
-            config: OperationExecutionConfig {
-                claim_stale_after: Duration::from_millis(60),
-                ..OperationExecutionConfig::default()
-            },
-            ..script.inline(Duration::ZERO)
-        };
+        let inline = script.inline_on(
+            Duration::ZERO,
+            runner(
+                TaskTracker::new(),
+                DrainSignal::new(),
+                OperationExecutionConfig {
+                    claim_stale_after: Duration::from_millis(60),
+                    ..OperationExecutionConfig::default()
+                },
+                16,
+            ),
+        );
         let response = fixture
             .create_with(
                 claims(&controller, Some(inline)),
@@ -858,6 +902,68 @@ mod postgres {
             ("queued", 0),
             "a deferred retry gives its attempt back"
         );
+        Ok(())
+    }
+
+    /// A create that wins a slot while every inline permit is held is
+    /// recorded queued, with its slot, for the dispatcher; once a permit
+    /// frees, the next one runs inline again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_create_that_finds_no_free_permit_is_queued_for_the_dispatcher() -> TestDbResult<()> {
+        let fixture = AdmissionPoolFixture::new(3).await?;
+        let controller = fixture.controller();
+        let script = ScriptedCreate::gated(Script::Succeed);
+        let one_permit = runner(
+            TaskTracker::new(),
+            DrainSignal::new(),
+            OperationExecutionConfig::default(),
+            1,
+        );
+        let inline = script.inline_on(Duration::ZERO, one_permit);
+        let holding = fixture
+            .create_with(
+                claims(&controller, Some(inline.clone())),
+                "inline-holds-the-permit",
+                fixture.request(),
+            )
+            .await
+            .expect("create is recorded");
+        script.0.started.notified().await;
+
+        let saturated = fixture
+            .create_with(
+                claims(&controller, Some(inline.clone())),
+                "inline-saturated",
+                fixture.request(),
+            )
+            .await
+            .expect("a create on a saturated pod is recorded");
+        let row = operation_row(&fixture, saturated.operation_id).await?;
+        assert_eq!((row.state.as_str(), row.attempts), ("queued", 0));
+        assert!(
+            fixture
+                .payload(saturated.operation_id)
+                .await?
+                .pool_claim
+                .is_some(),
+            "it keeps its slot for the dispatcher to adopt"
+        );
+        assert_eq!(script.calls(), 1);
+
+        script.open_gate();
+        wait_for_state(&fixture, holding.operation_id, "succeeded").await?;
+        let freed = fixture
+            .create_with(
+                claims(&controller, Some(inline)),
+                "inline-after-the-permit-frees",
+                fixture.request(),
+            )
+            .await
+            .expect("create is recorded");
+        script.0.started.notified().await;
+        script.open_gate();
+        wait_for_state(&fixture, freed.operation_id, "succeeded").await?;
+        assert_eq!(script.calls(), 2);
         Ok(())
     }
 }

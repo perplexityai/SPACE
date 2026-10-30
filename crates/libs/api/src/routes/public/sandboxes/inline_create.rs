@@ -1,34 +1,27 @@
 //! Inline execution of a native create that won an admission-time
 //! warm-pool claim.
 //!
-//! The request records the create already claimed (see
-//! `PublicOperationAdmission::create_claimed_or_roll_back`), so the
-//! dispatcher never picks it up while this process runs it. The execution
-//! runs in its own task through the same driver the dispatcher uses, under
-//! the same execution settings and retry deferral, so it renews the claim and
-//! records the result identically. The request waits for it only up to a
-//! short deadline. Past that deadline, or after a client disconnect, the task
-//! keeps running. If the task dies, the claim goes stale and the dispatcher
-//! re-drives the same operation through the admitted-claim path.
+//! The request takes an inline permit, then records the create already
+//! claimed (see `PublicOperationAdmission::create_claimed_or_roll_back`), so
+//! the dispatcher never picks it up while this process runs it. The
+//! execution runs on [`InlineOperations`], through the same driver and
+//! settings the dispatcher uses, so it renews the claim and records the
+//! result identically. The request waits for it only up to a short deadline.
+//! Past that deadline, or after a client disconnect, the task keeps running.
+//! If the task dies, the claim goes stale and the dispatcher re-drives the
+//! same operation through the admitted-claim path.
 //!
-//! The task is on the API's task tracker, so shutdown waits for it within its
-//! grace period; one still running when the process exits is left to go
-//! stale. Once the process is draining, a create that wins a claim is
-//! recorded queued for the dispatcher instead.
+//! Without a permit (none free, the process draining, no route-signing
+//! authority), a create that wins a claim is recorded queued for the
+//! dispatcher instead, as with the kill switch off.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pplx_space_common_svc::DrainSignal;
-use tokio_util::task::TaskTracker;
-use tracing::Instrument as _;
-
-use crate::public_operation_driver::{
-    OperationExecutionConfig, OperationExecutionResult, OperationExecutor,
-    drive_deferrable_operation, execution_span,
-};
+use crate::inline_operations::{InlineOperations, InlinePermit};
+use crate::public_operation_driver::OperationExecutionResult;
 use crate::public_operations::{ClaimedPublicOperation, PublicOperationStore};
 use crate::public_sandbox_operations::CreateSandboxOperationExecutor;
 use crate::routes::AppState;
@@ -62,10 +55,7 @@ impl InlineCreateExecutor for CreateSandboxOperationExecutor {
 pub(crate) struct InlineCreate {
     pub(crate) wait: Duration,
     pub(crate) executor: Arc<dyn InlineCreateExecutor>,
-    /// The API's tracker, which shutdown waits on.
-    pub(crate) tasks: TaskTracker,
-    pub(crate) drain_signal: DrainSignal,
-    pub(crate) config: OperationExecutionConfig,
+    pub(crate) runner: InlineOperations,
 }
 
 impl InlineCreate {
@@ -84,16 +74,8 @@ impl InlineCreate {
                 state.pool.clone(),
                 state.sandbox_controller.clone(),
             )),
-            tasks: state.task_tracker.clone(),
-            drain_signal: state.drain_signal.clone(),
-            config: state.operation_execution,
+            runner: state.inline_operations.clone(),
         })
-    }
-
-    /// Whether a new create may still be claimed to run here: not once the
-    /// process is draining, when it is left queued for the dispatcher.
-    pub(crate) fn admits_new_work(&self) -> bool {
-        !self.drain_signal.is_draining()
     }
 
     /// Start executing `operation` under `claim_token` in its own task, and
@@ -102,12 +84,16 @@ impl InlineCreate {
     /// deadline, so whatever it recorded is already durable.
     pub(crate) async fn run(
         &self,
+        permit: InlinePermit,
         store: PublicOperationStore,
         claim_token: String,
         operation: ClaimedPublicOperation,
     ) -> bool {
         let operation_id = operation.id;
-        let task = self.spawn(store, claim_token, operation);
+        let execution = self.executor.execute(operation.clone());
+        let task = self
+            .runner
+            .spawn(permit, store, claim_token, operation, execution);
         match tokio::time::timeout(self.wait, task).await {
             Ok(Ok(())) => true,
             Ok(Err(error)) => {
@@ -127,50 +113,6 @@ impl InlineCreate {
                 false
             }
         }
-    }
-
-    /// The detached task that drives `operation` to its recorded outcome.
-    fn spawn(
-        &self,
-        store: PublicOperationStore,
-        claim_token: String,
-        operation: ClaimedPublicOperation,
-    ) -> tokio::task::JoinHandle<()> {
-        let operation_id = operation.id;
-        let span = execution_span(&operation);
-        let execution = self.executor.execute(operation.clone());
-        let config = self.config;
-        self.tasks.spawn(
-            async move {
-                match drive_deferrable_operation(
-                    store,
-                    claim_token,
-                    config,
-                    operation,
-                    OperationExecutor::Inline,
-                    execution,
-                )
-                .await
-                {
-                    Ok(report) => tracing::debug!(
-                        operation_id = %operation_id,
-                        succeeded = report.succeeded,
-                        failed = report.failed,
-                        retried = report.retried,
-                        stale_claims = report.stale_claims,
-                        "inline native create completed"
-                    ),
-                    // The claim is left to go stale, and the dispatcher
-                    // re-drives the operation.
-                    Err(error) => tracing::warn!(
-                        operation_id = %operation_id,
-                        %error,
-                        "inline native create could not record its outcome"
-                    ),
-                }
-            }
-            .instrument(span),
-        )
     }
 }
 

@@ -24,8 +24,8 @@ pub fn claimed(api_product: &str, kind: &str) {
 
 metric_vocabulary!(
     /// Which process ran a claimed operation: the cluster-controller
-    /// dispatcher, or the API request that created it (a native create that
-    /// won an admission-time warm-pool claim). The `executor` tag.
+    /// dispatcher, or the API process that admitted it (see
+    /// `operations.inline.admission`). The `executor` tag.
     OperationExecutor {
         Dispatcher => "dispatcher",
         Inline => "inline",
@@ -220,6 +220,50 @@ pub fn dispatcher_slots(
         other_capacity as f64,
         &[],
     );
+}
+
+metric_vocabulary!(
+    /// Which route offered an operation for inline execution in the API: the
+    /// `path` tag on `operations.inline.admission`.
+    InlineAdmissionPath {
+        /// A native create that won an admission-time warm-pool claim.
+        WarmPoolCreate => "warm_pool_create",
+    }
+);
+
+metric_vocabulary!(
+    /// Whether the API ran an offered operation inline: the `reason` tag on
+    /// `operations.inline.admission`. Every reason but `admitted` records
+    /// the operation queued for the dispatcher.
+    InlineAdmissionReason {
+        Admitted => "admitted",
+        /// `SPACE_NATIVE_INLINE_MAX_CONCURRENT` is `0`.
+        Disabled => "disabled",
+        /// The process has no route-signing authority to execute with.
+        RouteSigningMissing => "route_signing_missing",
+        /// The process is shutting down.
+        Draining => "draining",
+        /// Every one of the process's inline permits is held.
+        Saturated => "saturated",
+        /// An idempotent replay, which records nothing new.
+        Replay => "replay",
+    }
+);
+
+/// One operation the API was offered for inline execution, and whether it
+/// ran it inline or left it queued.
+pub fn inline_admission(path: InlineAdmissionPath, reason: InlineAdmissionReason) {
+    counter(
+        "operations.inline.admission",
+        1,
+        &[tag("path", path), tag("reason", reason)],
+    );
+}
+
+/// Operations the API process is executing inline, against its permits.
+pub fn inline_slots(in_flight: usize, capacity: usize) {
+    gauge("operations.inline.in_flight", in_flight as f64, &[]);
+    gauge("operations.inline.capacity", capacity as f64, &[]);
 }
 
 /// A step that would have slept before retrying returned to the

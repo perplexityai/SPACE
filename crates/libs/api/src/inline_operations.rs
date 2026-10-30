@@ -1,0 +1,326 @@
+//! Executing claimed public operations inline, in the API process that
+//! admitted them.
+//!
+//! A route records its operation durably and, when admission claims it for
+//! this process, runs it here instead of leaving it to the cluster-controller
+//! dispatcher. The execution goes through the dispatcher's driver
+//! ([`drive_deferrable_operation`]) under the same [`OperationExecutionConfig`],
+//! so it renews its claim, defers retry waits and records its outcome exactly
+//! as a dispatcher execution does. If this process dies, the claim goes stale
+//! and the dispatcher re-drives the same operation.
+//!
+//! [`InlineOperations`] bounds that work per process: a fixed number of
+//! permits, the API's task tracker (shutdown waits for executions within its
+//! grace period), and no new work once the process drains or when it has no
+//! route-signing authority to execute with. A route that cannot get a permit
+//! records its operation queued for the dispatcher, exactly as it would with
+//! inline execution off.
+
+use std::future::Future;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use pplx_space_common_svc::DrainSignal;
+use pplx_space_metrics::operations::{InlineAdmissionPath, InlineAdmissionReason};
+use pplx_space_public_api::OperationKind;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio_util::task::TaskTracker;
+use tracing::Instrument as _;
+
+use crate::public_operation_driver::{
+    OperationExecutionConfig, OperationExecutionResult, OperationExecutor,
+    drive_deferrable_operation, execution_span,
+};
+use crate::public_operations::{ClaimedPublicOperation, PublicOperationStore};
+
+/// Env master for executing lifecycle operations inline.
+pub const INLINE_OPERATIONS_ENABLED_ENV: &str = "SPACE_NATIVE_INLINE_OPERATIONS_ENABLED";
+/// Comma-separated operation kinds the master enables inline.
+pub const INLINE_KINDS_ENV: &str = "SPACE_NATIVE_INLINE_KINDS";
+/// Inline executions one API process runs at once; `0` turns inline
+/// execution off entirely, including warm-pool creates.
+pub const INLINE_MAX_CONCURRENT_ENV: &str = "SPACE_NATIVE_INLINE_MAX_CONCURRENT";
+const DEFAULT_INLINE_MAX_CONCURRENT: usize = 128;
+const MAX_INLINE_MAX_CONCURRENT: usize = 1024;
+
+/// The kinds `SPACE_NATIVE_INLINE_KINDS` may name: wakes, which callers wait
+/// on, and creates. Everything else stays on the dispatcher.
+pub const INLINE_CAPABLE_KINDS: &[OperationKind] = &[
+    OperationKind::CreateSandbox,
+    OperationKind::WakeSandbox,
+    OperationKind::ResumeSandbox,
+    OperationKind::StartSandbox,
+];
+
+/// The environment's inline switches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineOperationsConfig {
+    /// `SPACE_NATIVE_INLINE_OPERATIONS_ENABLED`, off by default.
+    pub enabled: bool,
+    /// `SPACE_NATIVE_INLINE_KINDS`, empty by default.
+    pub kinds: Vec<OperationKind>,
+    /// `SPACE_NATIVE_INLINE_MAX_CONCURRENT`.
+    pub max_concurrent: usize,
+}
+
+impl Default for InlineOperationsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            kinds: Vec::new(),
+            max_concurrent: DEFAULT_INLINE_MAX_CONCURRENT,
+        }
+    }
+}
+
+impl InlineOperationsConfig {
+    pub fn from_env() -> Self {
+        Self::from_environment(&pplx_space_common_core::env::ProcessEnvironment)
+    }
+
+    /// A kind outside [`INLINE_CAPABLE_KINDS`], or not a kind at all, is
+    /// left out with a warning. A malformed limit keeps the default, and one
+    /// above 1024 is capped.
+    pub fn from_environment(env: &dyn pplx_space_common_core::env::Environment) -> Self {
+        let default = Self::default();
+        let mut kinds = Vec::new();
+        for name in env
+            .var(INLINE_KINDS_ENV)
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            match name.parse::<OperationKind>() {
+                Ok(kind) if INLINE_CAPABLE_KINDS.contains(&kind) => {
+                    if !kinds.contains(&kind) {
+                        kinds.push(kind);
+                    }
+                }
+                _ => tracing::warn!(
+                    kind = name,
+                    "{INLINE_KINDS_ENV} names a kind that cannot run inline; it stays on the dispatcher"
+                ),
+            }
+        }
+        Self {
+            enabled: pplx_space_common_core::env::env_flag(
+                env.var(INLINE_OPERATIONS_ENABLED_ENV).ok().as_deref(),
+                default.enabled,
+            ),
+            kinds,
+            max_concurrent: env
+                .var(INLINE_MAX_CONCURRENT_ENV)
+                .ok()
+                .and_then(|raw| raw.trim().parse::<usize>().ok())
+                .map_or(default.max_concurrent, |limit| {
+                    limit.min(MAX_INLINE_MAX_CONCURRENT)
+                }),
+        }
+    }
+}
+
+/// Why a route left an operation queued instead of running it inline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InlineRefusal {
+    /// `SPACE_NATIVE_INLINE_MAX_CONCURRENT` is `0`.
+    Disabled,
+    /// The process has no route-signing authority, which the executors
+    /// need to reach sandboxes.
+    RouteSigningMissing,
+    /// The process is shutting down.
+    Draining,
+    /// Every permit is held.
+    Saturated,
+    /// An idempotent replay, which records nothing new.
+    Replay,
+}
+
+impl InlineRefusal {
+    const fn reason(self) -> InlineAdmissionReason {
+        match self {
+            Self::Disabled => InlineAdmissionReason::Disabled,
+            Self::RouteSigningMissing => InlineAdmissionReason::RouteSigningMissing,
+            Self::Draining => InlineAdmissionReason::Draining,
+            Self::Saturated => InlineAdmissionReason::Saturated,
+            Self::Replay => InlineAdmissionReason::Replay,
+        }
+    }
+}
+
+/// One of the process's inline permits, taken before a route claims its
+/// operation, and held by the execution until it ends. Dropping it unused
+/// (the operation was queued after all) frees it.
+pub struct InlinePermit {
+    path: InlineAdmissionPath,
+    _permit: OwnedSemaphorePermit,
+}
+
+/// This process's inline execution: its switches, permits and task tracker.
+#[derive(Clone)]
+pub struct InlineOperations {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    config: InlineOperationsConfig,
+    route_signing: bool,
+    permits: Arc<Semaphore>,
+    in_flight: AtomicUsize,
+    tasks: TaskTracker,
+    drain_signal: DrainSignal,
+    execution: OperationExecutionConfig,
+}
+
+impl InlineOperations {
+    /// Inline execution under `config`, spawned on `tasks`. Without
+    /// `route_signing` (an authority to sign sandbox routes with), nothing
+    /// runs inline: every route records its operation queued.
+    pub fn new(
+        config: InlineOperationsConfig,
+        tasks: TaskTracker,
+        drain_signal: DrainSignal,
+        execution: OperationExecutionConfig,
+        route_signing: bool,
+    ) -> Self {
+        if !route_signing && config.max_concurrent > 0 {
+            tracing::warn!(
+                "inline operation execution is disabled: this process has no route-signing \
+                 authority; operations stay queued for the dispatcher"
+            );
+        }
+        Self {
+            inner: Arc::new(Inner {
+                permits: Arc::new(Semaphore::new(config.max_concurrent)),
+                config,
+                route_signing,
+                in_flight: AtomicUsize::new(0),
+                tasks,
+                drain_signal,
+                execution,
+            }),
+        }
+    }
+
+    /// Whether the env switches let operations of `kind` run inline: the
+    /// master on, and `kind` in the allowlist. A route still needs a permit.
+    pub fn kind_enabled(&self, kind: OperationKind) -> bool {
+        self.inner.config.enabled && self.inner.config.kinds.contains(&kind)
+    }
+
+    /// A permit to run one operation offered on `path` inline, taken before
+    /// the route claims it. A refusal is counted here; the route records the
+    /// operation queued.
+    pub fn try_acquire(&self, path: InlineAdmissionPath) -> Result<InlinePermit, InlineRefusal> {
+        let inner = &self.inner;
+        let permit = if !inner.route_signing {
+            Err(InlineRefusal::RouteSigningMissing)
+        } else if inner.config.max_concurrent == 0 {
+            Err(InlineRefusal::Disabled)
+        } else if inner.drain_signal.is_draining() {
+            Err(InlineRefusal::Draining)
+        } else {
+            Arc::clone(&inner.permits)
+                .try_acquire_owned()
+                .map_err(|_| InlineRefusal::Saturated)
+        };
+        match permit {
+            Ok(permit) => Ok(InlinePermit {
+                path,
+                _permit: permit,
+            }),
+            Err(refusal) => {
+                self.refuse(path, refusal);
+                Err(refusal)
+            }
+        }
+    }
+
+    /// Count an operation offered on `path` that the route left queued for a
+    /// reason only it knows.
+    pub fn refuse(&self, path: InlineAdmissionPath, refusal: InlineRefusal) {
+        pplx_space_metrics::operations::inline_admission(path, refusal.reason());
+    }
+
+    /// Drive `operation`, claimed under `claim_token`, to its recorded
+    /// outcome in a task on the API's tracker, holding `permit` until it
+    /// ends. Dropping the handle detaches the task; it keeps running. If it
+    /// dies, the claim goes stale and the dispatcher re-drives the operation.
+    pub fn spawn<F>(
+        &self,
+        permit: InlinePermit,
+        store: PublicOperationStore,
+        claim_token: String,
+        operation: ClaimedPublicOperation,
+        execution: F,
+    ) -> tokio::task::JoinHandle<()>
+    where
+        F: Future<Output = OperationExecutionResult> + Send + 'static,
+    {
+        pplx_space_metrics::operations::inline_admission(
+            permit.path,
+            InlineAdmissionReason::Admitted,
+        );
+        let in_flight = InFlight::enter(Arc::clone(&self.inner));
+        let execution_config = self.inner.execution;
+        let span = execution_span(&operation);
+        self.inner.tasks.spawn(
+            async move {
+                let _permit = permit;
+                let _in_flight = in_flight;
+                let operation_id = operation.id;
+                let kind = operation.kind;
+                match drive_deferrable_operation(
+                    store,
+                    claim_token,
+                    execution_config,
+                    operation,
+                    OperationExecutor::Inline,
+                    execution,
+                )
+                .await
+                {
+                    Ok(report) => tracing::debug!(
+                        operation_id = %operation_id,
+                        kind = kind.as_str(),
+                        succeeded = report.succeeded,
+                        failed = report.failed,
+                        retried = report.retried,
+                        stale_claims = report.stale_claims,
+                        "inline operation completed"
+                    ),
+                    // The claim is left to go stale, and the dispatcher
+                    // re-drives the operation.
+                    Err(error) => tracing::warn!(
+                        operation_id = %operation_id,
+                        kind = kind.as_str(),
+                        %error,
+                        "inline operation could not record its outcome"
+                    ),
+                }
+            }
+            .instrument(span),
+        )
+    }
+}
+
+/// Counts one inline execution while it runs, including one that panics.
+struct InFlight(Arc<Inner>);
+
+impl InFlight {
+    fn enter(inner: Arc<Inner>) -> Self {
+        let in_flight = inner.in_flight.fetch_add(1, Ordering::AcqRel) + 1;
+        pplx_space_metrics::operations::inline_slots(in_flight, inner.config.max_concurrent);
+        Self(inner)
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        let in_flight = self.0.in_flight.fetch_sub(1, Ordering::AcqRel) - 1;
+        pplx_space_metrics::operations::inline_slots(in_flight, self.0.config.max_concurrent);
+    }
+}
+
+#[cfg(test)]
+mod tests;
