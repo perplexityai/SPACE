@@ -1915,7 +1915,7 @@ and the target node-api's export request to the source:
 | worker WorkerApiInternal | `space-api`, `space-cluster-controller` |
 | worker lifecycle-probe `SpacedWaitReady`, caller-supplied policy, template deletion | `space-api`, `space-cluster-controller` |
 | builder BuilderApi, NodeInfo | `space-api`, `space-cluster-controller`, both node-api accounts |
-| builder `BuildTemplate` (system and tenant), policy, template deletion | `space-api` |
+| builder `BuildTemplate` (system and tenant), template deletion | `space-api` |
 | peer template transfers (`PullTemplate`, `NodeExportTemplate`), both roles | `space-api` (starts a pull), both node-api accounts (the target asks the source for the export) |
 | build-manager (system and tenant builds) | `space-builder-node-api` |
 

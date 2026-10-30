@@ -527,22 +527,10 @@ impl<'a> BuilderApiClient<'a> {
     }
 
     node_api_unary_methods! {
-        sandbox_state, proto::builder_api_client::BuilderApiClient::new, pplx_space_sbx_mgr_client::proto::StateRequest, pplx_space_sbx_mgr_client::proto::StateResponse;
-        list_sandboxes, proto::builder_api_client::BuilderApiClient::new, pplx_space_sbx_mgr_client::proto::ListRequest, pplx_space_sbx_mgr_client::proto::ListResponse;
-        stop_sandbox, proto::builder_api_client::BuilderApiClient::new, pplx_space_sbx_mgr_client::proto::StopRequest, pplx_space_sbx_mgr_client::proto::StopResponse;
-        delete_sandbox, proto::builder_api_client::BuilderApiClient::new, pplx_space_sbx_mgr_client::proto::DeleteRequest, pplx_space_sbx_mgr_client::proto::DeleteResponse;
         delete_template, proto::builder_api_client::BuilderApiClient::new, pplx_space_template_mgr_client::proto::DeleteTemplateRequest, pplx_space_template_mgr_client::proto::DeleteTemplateResponse;
         delete_template_build, proto::builder_api_client::BuilderApiClient::new, pplx_space_template_mgr_client::proto::DeleteTemplateBuildRequest, pplx_space_template_mgr_client::proto::DeleteTemplateBuildResponse;
-        list_templates, proto::builder_api_client::BuilderApiClient::new, pplx_space_template_mgr_client::proto::ListTemplatesRequest, pplx_space_template_mgr_client::proto::ListTemplatesResponse;
-        get_template, proto::builder_api_client::BuilderApiClient::new, pplx_space_template_mgr_client::proto::GetTemplateRequest, pplx_space_template_mgr_client::proto::GetTemplateResponse;
-        update_template_settings, proto::builder_api_client::BuilderApiClient::new, pplx_space_template_mgr_client::proto::UpdateTemplateSettingsRequest, pplx_space_template_mgr_client::proto::UpdateTemplateSettingsResponse;
-        update_template_snapshot_policy, proto::builder_api_client::BuilderApiClient::new, pplx_space_template_mgr_client::proto::UpdateTemplateSnapshotPolicyRequest, pplx_space_template_mgr_client::proto::UpdateTemplateSnapshotPolicyResponse;
-        create_pool, proto::builder_api_client::BuilderApiClient::new, pplx_space_template_mgr_client::proto::CreatePoolRequest, pplx_space_template_mgr_client::proto::CreatePoolResponse;
-        delete_pool, proto::builder_api_client::BuilderApiClient::new, pplx_space_template_mgr_client::proto::DeletePoolRequest, pplx_space_template_mgr_client::proto::DeletePoolResponse;
-        pool_status, proto::builder_api_client::BuilderApiClient::new, pplx_space_template_mgr_client::proto::PoolStatusRequest, pplx_space_template_mgr_client::proto::PoolStatusResponse;
         pull_template, proto::builder_api_client::BuilderApiClient::new, proto::PullTemplateRequest, proto::PullTemplateResponse;
         list_node_templates, proto::builder_api_client::BuilderApiClient::new, proto::ListNodeTemplatesRequest, proto::ListNodeTemplatesResponse;
-        refresh_facet_state, proto::builder_api_client::BuilderApiClient::new, proto::RefreshFacetStateRequest, proto::RefreshFacetStateResponse;
         trigger_state_reconciliation, proto::builder_api_client::BuilderApiClient::new, proto::TriggerStateReconciliationRequest, proto::TriggerStateReconciliationResponse;
         build_template, proto::builder_api_client::BuilderApiClient::new, pplx_space_build_mgr_client::proto::StartBuildRequest, proto::BuildTemplateResponse;
         get_build_template_status, proto::builder_api_client::BuilderApiClient::new, pplx_space_build_mgr_client::proto::GetBuildStatusRequest, pplx_space_build_mgr_client::proto::GetBuildStatusResponse;

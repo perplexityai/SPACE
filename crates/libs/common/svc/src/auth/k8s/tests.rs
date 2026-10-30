@@ -351,7 +351,7 @@ async fn peer_node_identity_is_confined_to_template_export() {
         .unwrap();
     for (method, allowed) in [
         ("/space.node.api.v1.BuilderApi/NodeExportTemplate", true),
-        ("/space.node.api.v1.BuilderApi/SandboxState", false),
+        ("/space.node.api.v1.BuilderApi/DeleteTemplate", false),
         ("/space.node.api.v1.BuilderApi/BuildTemplate", false),
         ("/space.node.api.v1.WorkerApi/NodeExportTemplate", false),
     ] {

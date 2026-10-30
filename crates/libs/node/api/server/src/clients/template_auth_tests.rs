@@ -24,8 +24,6 @@ use crate::{
 enum TemplateRpc {
     DeleteTemplate,
     DeleteTemplateBuild,
-    CreatePool,
-    DeletePool,
 }
 
 #[rstest]
@@ -42,19 +40,8 @@ async fn template_mutation_authority_survives_the_wire(
     #[case] token: &'static str,
     #[case] mutation: bool,
     #[values(NodeRole::Worker, NodeRole::Builder)] role: NodeRole,
-    #[values(
-        TemplateRpc::DeleteTemplate,
-        TemplateRpc::DeleteTemplateBuild,
-        TemplateRpc::CreatePool,
-        TemplateRpc::DeletePool
-    )]
-    rpc: TemplateRpc,
+    #[values(TemplateRpc::DeleteTemplate, TemplateRpc::DeleteTemplateBuild)] rpc: TemplateRpc,
 ) {
-    if role == NodeRole::Worker && matches!(rpc, TemplateRpc::CreatePool | TemplateRpc::DeletePool)
-    {
-        // Only the builder serves pool RPCs.
-        return;
-    }
     let (clients, calls, shutdown, mut servers) = backend().await;
     let _cancel_on_drop = shutdown.clone().drop_guard();
     let auth = auth_layer(role, k8s, username, Arc::new(AtomicUsize::new(0)));
@@ -97,11 +84,6 @@ async fn template_mutation_authority_survives_the_wire(
             }
         }};
     }
-    macro_rules! builder_call {
-        ($method:ident, $body:expr) => {
-            builder.$method(bearer($body, token)).await.map(|_| ())
-        };
-    }
     let result = match rpc {
         TemplateRpc::DeleteTemplate => {
             call!(delete_template, tmpl::DeleteTemplateRequest::default())
@@ -110,8 +92,6 @@ async fn template_mutation_authority_survives_the_wire(
             delete_template_build,
             tmpl::DeleteTemplateBuildRequest::default()
         ),
-        TemplateRpc::CreatePool => builder_call!(create_pool, tmpl::CreatePoolRequest::default()),
-        TemplateRpc::DeletePool => builder_call!(delete_pool, tmpl::DeletePoolRequest::default()),
     };
 
     assert_eq!(

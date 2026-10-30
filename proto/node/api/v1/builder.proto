@@ -2,36 +2,22 @@ syntax = "proto3";
 package space.node.api.v1;
 
 import "build/manager/v1/manager.proto";
-import "sandbox/manager/v1/manager.proto";
 import "template/manager/v1/manager.proto";
-import "node/v1/node.proto";
 import "node/api/v1/common.proto";
 
 // BuilderApi is the external API for a SPACE builder node.
-// Exposes template management and limited sandbox operations (query + cleanup).
-// Sandbox creation/start is internal to template-manager and builder.
+// Exposes template builds, deletion and transfer. Sandbox creation/start is
+// internal to template-manager and builder.
+//
+// Retired in 0.9.0; services cannot reserve names, so do not reuse these:
+// SandboxState, ListSandboxes, StopSandbox, DeleteSandbox, ListTemplates,
+// GetTemplate, UpdateTemplateSettings, UpdateTemplateSnapshotPolicy,
+// CreatePool, DeletePool, PoolStatus, RefreshFacetState.
 service BuilderApi {
-  // ── Sandbox query + cleanup (NO Create/Start/Kill) ─────────────────────────
-
-  rpc SandboxState(space.sandbox.manager.v1.StateRequest) returns (space.sandbox.manager.v1.StateResponse);
-  rpc ListSandboxes(space.sandbox.manager.v1.ListRequest) returns (space.sandbox.manager.v1.ListResponse);
-  rpc StopSandbox(space.sandbox.manager.v1.StopRequest) returns (space.sandbox.manager.v1.StopResponse);
-  rpc DeleteSandbox(space.sandbox.manager.v1.DeleteRequest) returns (space.sandbox.manager.v1.DeleteResponse);
-
   // ── Template management (via template-manager) ─────────────────────────────
 
   rpc DeleteTemplate(space.template.manager.v1.DeleteTemplateRequest) returns (space.template.manager.v1.DeleteTemplateResponse);
   rpc DeleteTemplateBuild(space.template.manager.v1.DeleteTemplateBuildRequest) returns (space.template.manager.v1.DeleteTemplateBuildResponse);
-  rpc ListTemplates(space.template.manager.v1.ListTemplatesRequest) returns (space.template.manager.v1.ListTemplatesResponse);
-  rpc GetTemplate(space.template.manager.v1.GetTemplateRequest) returns (space.template.manager.v1.GetTemplateResponse);
-  rpc UpdateTemplateSettings(space.template.manager.v1.UpdateTemplateSettingsRequest) returns (space.template.manager.v1.UpdateTemplateSettingsResponse);
-  rpc UpdateTemplateSnapshotPolicy(space.template.manager.v1.UpdateTemplateSnapshotPolicyRequest) returns (space.template.manager.v1.UpdateTemplateSnapshotPolicyResponse);
-  rpc CreatePool(space.template.manager.v1.CreatePoolRequest) returns (space.template.manager.v1.CreatePoolResponse);
-  rpc DeletePool(space.template.manager.v1.DeletePoolRequest) returns (space.template.manager.v1.DeletePoolResponse);
-  rpc PoolStatus(space.template.manager.v1.PoolStatusRequest) returns (space.template.manager.v1.PoolStatusResponse);
-
-  // ── Network (via node-manager) ─────────────────────────────────────────────
-
 
   // ── Template transfer ───────────────────────────────────────────────────────
 
@@ -46,7 +32,6 @@ service BuilderApi {
 
   // ── Node-level orchestration ───────────────────────────────────────────────
 
-  rpc RefreshFacetState(RefreshFacetStateRequest) returns (RefreshFacetStateResponse);
   rpc TriggerStateReconciliation(TriggerStateReconciliationRequest) returns (TriggerStateReconciliationResponse);
 
   // ── Template build (proxy to space-buildmgr-svc on this node) ─────────────
