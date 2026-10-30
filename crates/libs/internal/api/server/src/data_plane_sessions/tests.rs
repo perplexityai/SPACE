@@ -591,3 +591,152 @@ async fn a_service_route_reset_is_fenced_by_the_current_route_generation()
     }
     Ok(())
 }
+
+/// An activation owner that queues every wake it is asked for and records it.
+#[derive(Default)]
+struct QueuingOwner(std::sync::Mutex<Vec<ImplicitWakeActivity>>);
+
+#[tonic::async_trait]
+impl crate::ingress_activation::IngressActivation for QueuingOwner {
+    async fn prepare(&self, _: SandboxId, _: std::time::Duration) -> Result<(), Status> {
+        Err(Status::internal("a reattach must not be prepared"))
+    }
+    async fn queue_implicit_wake(
+        &self,
+        _: SandboxId,
+        activity: ImplicitWakeActivity,
+        _: std::time::Duration,
+    ) -> Result<bool, Status> {
+        self.0.lock().unwrap().push(activity);
+        Ok(true)
+    }
+}
+
+/// A worker that idle-suspends a Direct sandbox clears `active_node_id` but
+/// leaves its Direct route identity naming the worker, which no longer holds
+/// it. A reattach to that row must queue its wake, as one to the same
+/// Kubernetes row does, and not route to the worker; a placed Direct row
+/// still routes to its worker.
+#[tokio::test(flavor = "current_thread")]
+async fn a_reattach_wakes_an_unplaced_sandbox_whatever_its_direct_route_names()
+-> pplx_space_test_env::TestResult {
+    use pplx_space_common_core::sql;
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let authority = crate::tests::test_route_ed25519_authority();
+    let node_id = NodeId::new();
+    let endpoint = "https://direct-worker-a:9802";
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role, managed_by, state)
+         VALUES ($1, '10.0.0.48'::INET, 'worker', 'space', 'ready')"
+    ))
+    .bind(node_id)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_direct (node_id, node_api_endpoint) VALUES ($1, $2)"
+    ))
+    .bind(node_id)
+    .bind(endpoint)
+    .execute(pool)
+    .await?;
+
+    #[derive(Debug, Clone, Copy)]
+    enum Row {
+        DirectSuspended,
+        KubernetesSuspended,
+        DirectStarted,
+    }
+    for case in [
+        Row::KubernetesSuspended,
+        Row::DirectStarted,
+        Row::DirectSuspended,
+    ] {
+        let sandbox_id = SandboxId::new();
+        let session_id = format!("term_{}", uuid::Uuid::now_v7());
+        crate::tests::insert_data_plane_active_sandbox(pool, sandbox_id, node_id).await?;
+        crate::tests::insert_data_plane_session(pool, &session_id, sandbox_id).await?;
+        match case {
+            Row::DirectSuspended | Row::DirectStarted => {
+                sqlx::query(sql!(
+                    "UPDATE sandboxes SET managed_by = 'space' WHERE id = $1"
+                ))
+                .bind(sandbox_id)
+                .execute(pool)
+                .await?;
+                sqlx::query(sql!(
+                    "INSERT INTO sandbox_direct_route_identities (
+                         sandbox_id, route_generation, current_node_id, substrate_kind,
+                         execution_generation, activation_attempt_id
+                     )
+                     VALUES ($1, 3, $2, 'space', 3, $3)"
+                ))
+                .bind(sandbox_id)
+                .bind(node_id)
+                .bind(uuid::Uuid::now_v7())
+                .execute(pool)
+                .await?;
+            }
+            Row::KubernetesSuspended => {
+                crate::tests::insert_active_execution(pool, sandbox_id, "10.80.0.48", 3).await?;
+            }
+        }
+        if matches!(case, Row::DirectSuspended | Row::KubernetesSuspended) {
+            rest_sandbox(pool, sandbox_id, SandboxLifecycle::Suspended, None).await?;
+        }
+
+        let owner = QueuingOwner::default();
+        let resolved = Box::pin(resolve_session_route(
+            Duration::from_secs(5),
+            Some(&owner),
+            pool,
+            Some(&authority),
+            Some(DataPlaneSessionRefreshAuthority::Granted),
+            ResolveDataPlaneSessionRouteRequest {
+                session_id,
+                protocol_session_id: None,
+                token_sha256: None,
+                required_scope: None,
+                requested_transport: None,
+            },
+        ))
+        .await;
+        let queued = owner.0.lock().unwrap().clone();
+        match case {
+            Row::DirectSuspended | Row::KubernetesSuspended => {
+                let error = resolved.expect_err(&format!("{case:?} must not be routed"));
+                assert_eq!(
+                    error.code(),
+                    Code::FailedPrecondition,
+                    "{case:?}: {error:?}"
+                );
+                assert!(
+                    error.message().contains("not assigned to a node"),
+                    "{case:?}: {error:?}"
+                );
+                assert_eq!(
+                    queued,
+                    vec![ImplicitWakeActivity::Command],
+                    "{case:?} queues its wake"
+                );
+            }
+            Row::DirectStarted => {
+                let response = resolved?;
+                let backend = response.backend.expect("a placed row has a backend");
+                assert_eq!(backend.node_id, node_id.to_string());
+                assert_eq!(backend.endpoint, endpoint);
+                assert!(queued.is_empty(), "a placed row queues no wake");
+            }
+        }
+        // The service route reads the same placement.
+        let service = fetch_sandbox_service_route_row(pool, sandbox_id).await?;
+        assert_eq!(
+            service.active_node_id,
+            matches!(case, Row::DirectStarted).then_some(node_id),
+            "{case:?}"
+        );
+    }
+    Ok(())
+}
