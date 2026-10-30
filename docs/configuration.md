@@ -104,6 +104,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_NODEMGR_NETWORK_POOL_MAX_SLOTS` | 300 | |
 | `SPACE_NODEMGR_NETWORK_POOL_TARGET`, `SPACE_NODEMGR_NETWORK_POOL_RETAIN_READY`, `SPACE_NODEMGR_NETWORK_POOL_MIN_READY` | `min(max_slots, 100)`, `max_slots`, `min(max_slots, 32)` | Warm network slot pool sizes; set target and retained to `0` to keep the pool off. The pool only serves allocations that use the pool's own network namespace. |
 | `SPACE_NODEMGR_SERVICE_PORT_INGRESS_ISOLATION` | auto | `shared_host` on Kubernetes, else `exclusive_host`. |
+| `SPACE_NODEMGR_SANDBOX_CGROUP_MEMORY_MIB` | 8320 | Firecracker cgroup memory ceiling in MiB, including guest memory and host-process headroom. Precedence: `--sandbox-cgroup-memory-mib`, environment, `[sandbox_cgroup].memory_mib` in TOML, then default. Empty values are unset; invalid integers or values at or below the headroom fail startup. |
 | `SPACE_NODEMGR_ACTIVATE_RUNTIME_SUPERVISOR_ON_START` | off | |
 | `SPACE_RTMGR_INSTALL_KERNELS_DIR` | unset | Enables runtime-manager kernel installs in this versioned kernel root, which must exist on the state directory's filesystem. Unset, installs and uninstalls are refused. |
 | `SPACE_NODEMGR_BTRFS_BALANCE_ENABLED` | on | |
