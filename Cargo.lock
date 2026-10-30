@@ -7578,6 +7578,7 @@ dependencies = [
  "clap",
  "pplx-space-common-cli",
  "pplx-space-common-core",
+ "pplx-space-net-common",
  "pplx-space-sbx-mgr-client",
  "tokio",
 ]
