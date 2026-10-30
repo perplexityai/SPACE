@@ -12,6 +12,7 @@ use pplx_space_observability::test_capture::{CapturedEvent, CapturedEventsLayer,
 use tracing::instrument::WithSubscriber as _;
 use tracing_subscriber::layer::SubscriberExt as _;
 
+mod server_speaks_first;
 mod tls_interception;
 
 fn dns_attribution_denied(reason: DenyReason) -> TcpAdmissionDenial {
@@ -271,7 +272,7 @@ async fn an_address_refused_before_its_client_hello_is_read_does_not_wait_for_on
 async fn tls_interception_waits_for_a_late_client_hello_on_an_allowed_destination() {
     // Interception closes any admitted flow it cannot read SNI from, so under
     // an allow-all policy a late first segment must not read as "no SNI".
-    let (proxy, _) = dns_attributed_pypi_proxy().await;
+    let (proxy, dns_policy) = dns_attributed_pypi_proxy().await;
     let destination: SocketAddr = "203.0.113.9:443".parse().unwrap();
     let with_interception = |interception| {
         let mut policy = v1_allow_all();
@@ -284,8 +285,8 @@ async fn tls_interception_waits_for_a_late_client_hello_on_an_allowed_destinatio
             destination,
             &with_interception(pplx_space_net_common::TlsInterception::On)
         ),
-        sniff::MissingClientHello::Denied,
-        "interception refuses a flow without SNI, so it must wait out a retransmit"
+        sniff::MissingClientHello::ProbesServer,
+        "interception refuses a flow without SNI unless its destination speaks first"
     );
     assert_eq!(
         proxy.missing_client_hello(
@@ -320,6 +321,21 @@ async fn tls_interception_waits_for_a_late_client_hello_on_an_allowed_destinatio
     assert_eq!(
         proxy.missing_client_hello(destination, &TrafficPolicy::Ready(Arc::new(explicit_deny))),
         sniff::MissingClientHello::Proceeds,
+    );
+
+    let mut domain_allow = dns_policy.as_ref().clone();
+    domain_allow.tls_interception = pplx_space_net_common::TlsInterception::On;
+    let resolved: SocketAddr = "93.184.216.34:443".parse().unwrap();
+    assert!(
+        proxy
+            .network_state
+            .dns_allow_cache()
+            .allows_ip(resolved.ip(), &domain_allow)
+    );
+    assert_eq!(
+        proxy.missing_client_hello(resolved, &TrafficPolicy::Ready(Arc::new(domain_allow))),
+        sniff::MissingClientHello::Denied,
+        "a domain allow needs the ClientHello to bind the hostname, so it is not probed"
     );
 }
 
