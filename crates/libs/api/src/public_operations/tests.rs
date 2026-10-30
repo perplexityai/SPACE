@@ -856,6 +856,77 @@ async fn admission_claims_a_new_operation_only_on_an_otherwise_idle_sandbox() ->
     Ok(())
 }
 
+/// An admission that waited on the sandbox's queue lock longer than the
+/// claim staleness window still commits a live claim: it is stamped when it
+/// is taken, not when the admission's transaction began, so the dispatcher
+/// leaves it to its claimant.
+#[tokio::test]
+async fn an_admission_claim_is_stamped_when_taken_not_when_its_transaction_began() -> TestResult {
+    let Some(db) = try_pg_test_db_with_max_connections(4).await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let target_id = PublicSandboxId::new().to_string();
+    let claim_stale_after = Duration::from_secs(1);
+
+    // Another insert for the sandbox holds its queue past the window.
+    let mut holding = db.pool.begin().await?;
+    lock_sandbox_queue(&mut holding, org_id, &target_id).await?;
+    let admission = tokio::spawn({
+        let store = store.clone();
+        let target_id = target_id.clone();
+        async move {
+            let key = IdempotencyKey::parse("stop-after-a-wait")?;
+            let fingerprint = RequestFingerprint::parse("f".repeat(64))?;
+            let idempotency = CreatePublicOperationIdempotency {
+                method: HttpOperationMethod::Post,
+                path_template: OperationPathTemplate::new("/v1/sandboxes/{sandbox_id}:stop"),
+                key: &key,
+                request_fingerprint: &fingerprint,
+            };
+            let recorded = store
+                .begin_operation_admission(org_id, ApiProduct::Native, &idempotency)
+                .await?
+                .create_claimed_if_sole_active(CreatePublicOperation {
+                    org_id,
+                    actor_user_id: None,
+                    api_product: ApiProduct::Native,
+                    kind: OperationKind::StopSandbox,
+                    target_type: Some(OperationTargetType::Sandbox),
+                    target_id: Some(&target_id),
+                    payload_json: serde_json::json!({}),
+                    idempotency: Some(idempotency.clone()),
+                    traceparent: None,
+                })
+                .await?;
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(recorded)
+        }
+    });
+    wait_for_advisory_lock_waiter(&db.pool).await?;
+    tokio::time::sleep(claim_stale_after + Duration::from_millis(500)).await;
+    holding.rollback().await?;
+    let CreateInlinePublicOperationResult::Claimed { operation, .. } =
+        admission.await?.map_err(|error| error.to_string())?
+    else {
+        panic!("admission claims the stop on its otherwise idle sandbox");
+    };
+
+    let dispatched = store
+        .claim_operations(ClaimPublicOperations {
+            limits: ClaimLimits::any(4),
+            claim_stale_after,
+            claimable_kinds: &[OperationKind::StopSandbox],
+        })
+        .await?;
+    assert!(
+        dispatched.operations.is_empty(),
+        "the dispatcher took over {} as stale the moment admission committed its claim",
+        operation.id
+    );
+    Ok(())
+}
+
 /// A system wake is claimed when it is created on an idle sandbox; one that
 /// joins a wake is not, and one queued behind other work stays queued.
 #[tokio::test]

@@ -1145,6 +1145,11 @@ pub enum ObservePublicOperationIdempotency {
 /// [`PublicOperationStore::claim_operations`] would: `running`, one attempt,
 /// a fresh claim token and generation, and a `claimed` event. Committed with
 /// the create, so no other claimant ever sees the operation queued.
+///
+/// The claim is stamped when it is taken, not at the transaction's start:
+/// the transaction may have waited on idempotency, quota, join and queue
+/// locks first, and a claim stamped before that wait could already be stale
+/// to the dispatcher when it commits.
 async fn claim_created_operation_tx(
     tx: &mut Transaction<'_, Postgres>,
     operation_id: OperationId,
@@ -1156,8 +1161,8 @@ async fn claim_created_operation_tx(
              attempts = attempts + 1,
              claim_token = $2,
              claim_generation = claim_generation + 1,
-             claimed_at = NOW(),
-             started_at = COALESCE(started_at, NOW()),
+             claimed_at = clock_timestamp(),
+             started_at = COALESCE(started_at, clock_timestamp()),
              progress_message = 'operation claimed',
              updated_at = NOW()
          WHERE operation_id = $1
