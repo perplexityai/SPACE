@@ -583,6 +583,14 @@ impl SandboxManagerService {
         sandbox_id: &str,
     ) -> Result<crate::db::SandboxRow, Status> {
         let sandbox = self.lookup_sandbox(sandbox_id)?;
+        // A quarantined row starts only after an operator repairs it. Saying
+        // "not started" would tell readiness waiters that keep polling on
+        // that answer to wait for a start that is not coming.
+        if sandbox.state == SandboxState::Quarantined {
+            return Err(Status::failed_precondition(
+                "sandbox is quarantined; operator repair required",
+            ));
+        }
         if sandbox.state != SandboxState::Started {
             return Err(Status::failed_precondition(format!(
                 "sandbox is {}, not started",
