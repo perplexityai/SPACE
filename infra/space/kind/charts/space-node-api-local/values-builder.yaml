@@ -15,8 +15,9 @@ auth:
     - space-builder-node-api
   SPACE_NODE_API_INTERNAL_AUTH_ALLOWED_SERVICE_ACCOUNTS: []
   SPACE_NODE_API_AUTH_TRUSTED_WAIT_READY_SERVICE_ACCOUNTS: []
-  # The api's template deletion, settings and pool calls on the builder
-  # (TemplateController, crates/libs/api/src/controllers/template.rs);
+  # The api's admin template deletes on the builder (DeleteTemplate and
+  # DeleteTemplateBuild from delete_node_template,
+  # crates/libs/api/src/routes/admin/node_maintenance/node_templates.rs);
   # required on builders too (validate_for_role, auth/k8s.rs).
   SPACE_NODE_API_AUTH_TRUSTED_POLICY_SERVICE_ACCOUNTS:
     - space-api

@@ -10127,7 +10127,7 @@ mod kubernetes_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn no_activity_spaced_path_charges_recovery_for_lost_pod() -> Result<(), BoxError> {
         // Public-path regression: the no-activity spaced client path
-        // (`spaced_get_status` / `spaced_wait_ready`, and `reconnect_node_api`'s
+        // (`spaced_wait_ready`, and `reconnect_node_api`'s
         // no-activity reconnect) recovers a lost pod through the plain
         // `runtime_client`. All of them route through this exact
         // `connect_spaced_runtime_client(…, None)` call, so a rejecting
