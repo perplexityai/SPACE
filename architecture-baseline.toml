@@ -186,9 +186,10 @@
 [pattern_ratchet.sbxmgr_sqlite_schema]
 
 # [layers.<check>] maps each workspace package to what it depends on against
-# the layers rule's <check>: workspace packages, drivers and storage helpers,
-# or, for codec_features, the <package>/<feature> it enables. Only remove
-# entries: a pull request that adds one is reported.
+# the layers rule's <check>: workspace packages, drivers, storage helpers and
+# packages Domain may not depend on, or, for codec_features, the
+# <package>/<feature> it enables. Only remove entries: a pull request that
+# adds one is reported.
 [layers.codec_features]
 pplx-space-api = [
   "pplx-space-common-core/sqlx",
@@ -262,6 +263,32 @@ pplx-space-observability = [
 ]
 pplx-space-uds-peer-auth = [
   "pplx-space-common-core",
+]
+
+[layers.domain_dependencies]
+pplx-space-common-core = [
+  "k8s-openapi",
+]
+pplx-space-net-common = [
+  "tokio",
+]
+pplx-space-spaced-common = [
+  "hyper-util",
+  "tokio",
+  "tokio-stream",
+  "tokio-util",
+  "tokio-vsock",
+]
+pplx-space-spaced-guest-protocol = [
+  "tokio",
+]
+
+[layers.model_protocol]
+pplx-space-common-core = [
+  "pplx-space-rpc-contracts",
+]
+pplx-space-spaced-common = [
+  "pplx-space-spaced-guest-protocol",
 ]
 
 [layers.storage_access]
