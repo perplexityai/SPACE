@@ -538,8 +538,10 @@ async fn record_stopped_evacuation_artifact(
 }
 
 /// The inputs `connect_retrying_node_api_client_for_target` needs to reach one
-/// node's node-api, read from the `nodes` row and its substrate-specific
-/// sibling.
+/// node's node-api, read from the `nodes` row and its `node_k8s` sibling.
+///
+/// Node drain runs only on Kubernetes, which addresses a node by its k8s node
+/// name, so `direct_endpoint` is always `None` and the Direct table is not read.
 ///
 /// Shared by the two paths that talk to a *source* node during a drain — the
 /// suspended-artifact promotion and the stopped-disk publish — because both ask
@@ -551,28 +553,26 @@ async fn node_api_row(
     pool: &PgPool,
     node_id: NodeId,
 ) -> Result<Option<OwnedNodeApiTarget>, sqlx::Error> {
-    type Row = (NodeRole, NodeManagedBy, Option<String>, Option<String>);
+    type Row = (NodeRole, NodeManagedBy, Option<String>);
     let row: Option<Row> = sqlx::query_as(sql!(
         "SELECT n.role,
                 n.managed_by,
-                nd.node_api_endpoint AS direct_endpoint,
                 nk.k8s_node_name AS substrate_node_id
            FROM nodes n
-           LEFT JOIN node_direct nd ON nd.node_id = n.id
            LEFT JOIN node_k8s nk ON nk.node_id = n.id
           WHERE n.id = $1"
     ))
     .bind(node_id)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(
-        |(role, managed_by, direct_endpoint, substrate_node_id)| OwnedNodeApiTarget {
+    Ok(
+        row.map(|(role, managed_by, substrate_node_id)| OwnedNodeApiTarget {
             managed_by,
             role,
-            direct_endpoint,
+            direct_endpoint: None,
             substrate_node_id,
-        },
-    ))
+        }),
+    )
 }
 
 async fn revert_evacuation_suspend_claim(
