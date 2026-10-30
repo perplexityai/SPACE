@@ -138,7 +138,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_API_CLIENT_CLASSES` | empty | JSON map; invalid JSON fails startup. |
 | `SPACE_CLUSTER_ACTIVATION_ADMISSION_ENABLED` | on | Fails open (with a warning) when `SPACE_REDIS_URL` is unset. |
 | `SPACE_CLUSTER_ACTIVATION_ADMISSION_REFILL_RPS` | 60 | |
-| `SPACE_PUBLIC_OPERATION_DISPATCHER_EXECUTION_CONCURRENCY` | 16 | Operations the dispatcher runs at once. A larger value clamps to 128; `0` or a non-number keeps the default without a warning. An execution holds its slot while it works. A wake whose restore claim stays fenced by a stale owner retries in place for 2 s, then hands the slot back and is requeued instead (see the retry deferral switch below), so the cap counts active work. Among the operations the dispatcher claims, at most one per sandbox executes under a live claim at a time, across every controller replica, in request order; a stale claim on a sandbox is reclaimed before anything else there starts, and a delete waits for one running under a live claim, an earlier create, or the sandbox's earliest operation while that one is due, but not for other earlier work waiting out a retry backoff. Requesting a delete cancels the sandbox's earlier creates that are queued or waiting out a backoff, so the delete waits only for a create it could not cancel: one whose attempt was running, or whose claim had gone stale, when the delete arrived. That attempt finishes, and if it would retry, or the dispatcher hands the create back unrun, the create ends canceled instead, so a create never runs after its sandbox's delete. A create reclaimed while its earlier execution still runs in the same dispatcher is the exception: it is handed back unchanged, and the delete waits for its next attempt. Lifecycle paths outside the dispatcher (ECW pause, resume and connect, and reconcilers) are not serialized by this. Freed slots refill on the next 25 ms claim tick, at most 64 per tick. So throughput is roughly this divided by mean execution time, up to 2,560 operations a second. Executions draw on the cluster controller's `space_user` Postgres pool, which most other reconcilers share (`POSTGRES_POOL_MAX_CONNECTIONS`, default 25). Raising this adds contention for that pool, and an execution whose claim renewal or final status write can't get a connection within the pool's acquire timeout is abandoned and runs again once its claim goes stale, repeating any work it had already done. |
+| `SPACE_PUBLIC_OPERATION_DISPATCHER_EXECUTION_CONCURRENCY` | 16 | Operations the dispatcher runs at once. A larger value clamps to 128; `0` or a non-number keeps the default without a warning. An execution holds its slot while it works. A wake whose restore claim stays fenced by a stale owner retries in place for 2 s, then hands the slot back and is requeued instead (see the retry deferral switch below), so the cap counts active work. Among the operations the dispatcher claims, at most one per sandbox executes under a live claim at a time, across every controller replica, in request order; a stale claim on a sandbox is reclaimed before anything else there starts, and a delete waits for one running under a live claim, an earlier create, or the sandbox's earliest operation while that one is due, but not for other earlier work waiting out a retry backoff. Requesting a delete cancels the sandbox's earlier creates that are queued or waiting out a backoff, so the delete waits only for a create it could not cancel: one whose attempt was running, or whose claim had gone stale, when the delete arrived. That attempt finishes, and if it would retry, or the dispatcher hands the create back unrun, the create ends canceled instead, so a create never runs after its sandbox's delete. A create reclaimed while its earlier execution still runs in the same dispatcher is the exception: it is handed back unchanged, and the delete waits for its next attempt. Lifecycle paths outside the dispatcher (ECW pause, resume and connect, and reconcilers) are not serialized by this. Freed slots refill on the next 25 ms claim tick, at most 64 per tick. So throughput is roughly this divided by mean execution time, up to 2,560 operations a second. Executions draw on the cluster controller's `space_user` Postgres pool, which most other reconcilers share (`POSTGRES_POOL_MAX_CONNECTIONS`, default 25). Raising this adds contention for that pool, and an execution whose claim renewal or final status write can't get a connection within the pool's acquire timeout is abandoned and runs again once its claim goes stale, repeating any work it had already done. See [Sizing dispatcher execution concurrency](#sizing-dispatcher-execution-concurrency). |
 | `SPACE_PUBLIC_OPERATION_DISPATCHER_TEARDOWN_RESERVED_SLOTS` | 2 | Of the execution slots above, how many only teardowns may use: sandbox deletes, including ECW kills, and Native `:kill`. Deletes and kills share this one reservation; neither has slots of its own. A teardown can then start while other work holds every other slot. Other work never takes a reserved slot, even while no teardown is waiting, because a teardown arriving later would otherwise wait for long-running work to finish. A teardown may also use any other free slot. At least one slot always stays open to other work, so the reservation is at most the slot count minus one. A value above 127 clamps to it, `0` turns the reservation off, and a non-number keeps the default. A delete still waits for an operation running on its sandbox and for an earlier create it could not cancel. While only reserved slots are free, a claim that finds no teardown to start makes the dispatcher wait 250 ms before claiming again, unless an execution finishes first, so a teardown requested then waits up to that long. |
 | `SPACE_PUBLIC_OPERATION_DISPATCHER_OTHER_RESERVED_SLOTS` | 2 | While other work is waiting, teardowns leave free the last this-many free slots that other work may use, however many operations of either class are already running, so other work can start while teardowns hold every other slot. The slots kept are free ones, not a share of the pool: the teardown reservation is never among them. While no other work is waiting, teardowns may use these too; they finish quickly, so other work that arrives later waits only briefly. It never takes the slots owed to teardowns: what is left of their reservation or, with the reservation off, one free slot while no teardown is running, so other work cannot shut teardowns out. So it is at most the slot count minus the teardown reservation, or minus one with the reservation off. A value above 128 clamps to it, `0` turns it off, and a non-number keeps the default. |
 | `SPACE_PUBLIC_OPERATION_DISPATCHER_ORG_SLOT_LIMIT` | 8 | The most execution slots one organization's operations other than teardowns may hold at once while another organization has such work waiting, counted across every controller replica. An organization is waiting while it has such work due and holds fewer slots than this, so organizations already at the limit do not hold each other to it, so one organization's slow or stuck work leaves slots for the others. Teardowns are not limited and do not count. Neither do operations the API runs itself as it creates them, such as a native create that claims a warm-pool sandbox at admission: they hold no dispatcher slot, so the limit bounds the slots an organization holds, not all of its concurrent work. While no other organization is waiting, the organization may go past it, up to the headroom below. A value above 128 clamps to it, `0` turns the limit off, and a non-number keeps the default. Operations past the limit wait in the queue. After a claim takes nothing because this limit holds back every due operation other than a teardown, which with organizations past their limit happens only while no more than the headroom below is free, the dispatcher waits 250 ms before claiming again, unless an execution finishes first, so work another organization submits meanwhile waits up to that long. Work held back only by earlier work on its sandbox, or by a row another transaction holds locked, does not slow the claims. |
@@ -174,6 +174,84 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_DATA_PLANE_UPLOAD_MIN_BODY_BYTES_PER_SECOND`, `SPACE_DATA_PLANE_UPLOAD_MIN_BODY_RATE_WINDOW_MS` | 65536, 15000 | An admitted upload must deliver rate × window bytes in each consecutive window of time spent waiting on the client, or it ends with 408 and frees its permits. Time in the byte-rate bucket or spent spooling and writing to the guest doesn't count. At the defaults that's 960 KiB per 15 s, so an upload smaller than 960 KiB must finish before the pod has waited 15 s on its client in total. It applies to HTTP/1.x uploads only: an HTTP/2 upload shares its connection's flow control with other requests, so it isn't held to the floor; the time limit below bounds how long it holds its permits instead. The rate accepts `off`; every other value, the window included, must be non-zero. Applies only with upload admission on. |
 | `SPACE_DATA_PLANE_UPLOAD_HTTP2_MAX_DURATION_MS` | 600000 | How long after admission an HTTP/2 upload may take to finish before it ends with 408 and frees its permits; a body whose declared length has all arrived gets 5 s more for its end, which an HTTP/2 client may send in a frame of its own. A time rather than a rate, so another stream's slowness on the connection can't trip it early: at the default a full-size 256 MiB upload has it at about 450 KB/s. Accepts `off`, which lets a stalled HTTP/2 upload hold its permits until its client gives up; otherwise it must be non-zero. Applies only with upload admission on. |
 | `SPACE_DATA_PLANE_SHUTDOWN_GRACE_SECS` | unset | Data plane: how long live streams keep running after SIGTERM before they're cancelled. Unset, they run until they end or the termination grace period kills the process; a second stop signal ends the drain either way, without waiting for a `Process.Start` that's still opening. Keep it plus 5 seconds within the pod's termination grace period minus its preStop delay. Values under 8 seconds, the stream-open budget, are rejected, so an ECW `Process.Start` already opening at SIGTERM can report itself. See [architecture](architecture.md) for what each stream kind sees. |
+
+### Sizing dispatcher execution concurrency
+
+`SPACE_PUBLIC_OPERATION_DISPATCHER_EXECUTION_CONCURRENCY` sets how many
+operations the leading cluster-controller replica runs at once. Raising it is
+a configuration change, but five limits bound what it buys, and the first two
+have to change with it:
+
+1. **The controller's Postgres pool.** Executions share the controller's
+   `space_user` pool with most reconcilers. `POSTGRES_POOL_MAX_CONNECTIONS`
+   (default 25) sizes it, and the controller's `space_creds` pool too; a query
+   waits up to `POSTGRES_POOL_ACQUIRE_TIMEOUT_SECS` (default 5) for a free
+   connection. An execution holds a connection only while one of its
+   statements or transactions runs, but every execution renews its claim every
+   20 s and writes its result when it ends, so the pool has to hold the
+   executions' statements on top of what the reconcilers already use. Raise
+   the pool with the concurrency, and confirm the headroom with the pool
+   metrics below rather than by a fixed ratio.
+2. **Postgres `max_connections`.** Every controller process opens both pools
+   and one more connection for the node-drain listener, and the standby
+   replica and a rolling-update surge pod can open as many. With a pool size
+   of P, the controller can hold `(2 × P + 1) × (replicas + surge pods)`
+   server connections: 153 at the default of 25 with two replicas and one
+   surge pod, 387 at 64. The sum over every service has to stay below
+   `max_connections`, less `superuser_reserved_connections` and the sessions
+   operators open, so that a service runs out of its own pool before the
+   server refuses it a connection. The Kind budget in
+   `infra/space/kind/charts/space-postgres/values.yaml` is a worked example:
+   it holds 1,328 of 1,400 connections, so a controller pool of 64 there
+   (234 more) needs `max_connections` raised as well.
+3. **Claim cost.** Each claim reads the whole due backlog under one
+   cluster-wide advisory lock, and a tick that finds the lock held claims
+   nothing, so claim cost grows with the backlog, not with the slot count.
+   Freed slots refill on the next 25 ms tick, at most 64 per tick.
+4. **Node activation admission.** Each sandbox-manager runs at most
+   `SPACE_SBXMGR_ACTIVATION_ADMISSION_MAX_CONCURRENT` (5) activations at once,
+   starting at most 5 a second after a burst of 10, and holds the rest up to
+   30 s before refusing them. Slots beyond that many per worker node wait in
+   the sandbox-manager rather than doing work.
+5. **Cluster activation admission.** Every activation in the cluster draws on
+   one Redis token bucket, 60 a second by default
+   (`SPACE_CLUSTER_ACTIVATION_ADMISSION_REFILL_RPS`). An activation it refuses
+   is requeued without spending a retry attempt.
+
+The slot reservations do not grow with the concurrency. Teardowns keep their
+reservation (`SPACE_PUBLIC_OPERATION_DISPATCHER_TEARDOWN_RESERVED_SLOTS`, 2),
+and an organization alone leaves its headroom free
+(`SPACE_PUBLIC_OPERATION_DISPATCHER_ORG_SLOT_HEADROOM`, 2), so one
+organization on an idle dispatcher gets the concurrency less four: 12 of the
+default 16. While another organization is waiting, each one is held to
+`SPACE_PUBLIC_OPERATION_DISPATCHER_ORG_SLOT_LIMIT` (8) whatever the
+concurrency, so raise that limit too if several organizations should share a
+larger dispatcher.
+
+**What pool starvation looks like.** A claim renewal or result write that
+cannot get a connection within the acquire timeout fails, and the dispatcher
+abandons the execution: it logs `public-operation-dispatcher execution
+failed` with the pool timeout, records nothing, and drops the execution at its
+next await point, though work a node already started keeps going. The
+operation reads `running` until its claim goes stale, 60 s after its last
+renewal. The dispatcher then reclaims it before anything else on its sandbox
+starts and runs it again, repeating any work it had already done; the
+operation's events show a second `claimed` event. Callers see no error, only an
+operation that takes about a minute longer. `operations.stale_claim` counts a
+related case, an execution that finished after its claim went stale and found
+it already taken; it should stay at 0.
+
+**Metrics to watch** while changing the concurrency or the pool:
+
+| Metric | What it shows |
+| --- | --- |
+| `operations.dispatcher.in_flight` against `operations.dispatcher.capacity`, and `operations.dispatcher.other_in_flight` against `operations.dispatcher.other_capacity` | Slot use. The second pair at its capacity means work other than teardowns is waiting for a slot. |
+| `operations.queue_wait_ms` (p50 and p95, by `kind`) | How long a claimable operation waited for a slot. A stale reclaim is not counted. |
+| `db.pool.utilization`, `db.pool.connections_in_use` and `db.pool.acquire_total_ms` for the cluster controller, by `database_identity` | Pool headroom. `space_user` utilization near 1 and acquire times near the acquire timeout come before abandoned executions. |
+| `operations.stale_claim` | Executions that finished after another claimant re-drove them. Should stay at 0. |
+| `operations.requeued` (by `reason`) | `activation_backpressure` counts cluster admission refusals: past that point, more slots only queue behind the bucket. |
+| `node.sandbox_admission.in_flight` and `node.sandbox_admission.queue_wait_ms` | Activations at the node limit, and how long they wait for it. |
+| `cluster.sandbox_admission.rate.decision` | The cluster bucket's admissions and refusals. |
 
 ## Templates and builds
 
