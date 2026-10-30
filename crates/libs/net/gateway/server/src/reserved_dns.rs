@@ -316,6 +316,7 @@ struct RequestFailure {
     id: u16,
     code: ResponseCode,
     qtype: Option<RecordType>,
+    question: Option<Query>,
 }
 
 impl RequestFailure {
@@ -323,6 +324,9 @@ impl RequestFailure {
         let mut response = Message::response(self.id, OpCode::Query);
         response.metadata.recursion_available = true;
         response.metadata.response_code = self.code;
+        // Resolvers can discard even error responses whose question does not match.
+        // Echo only a decoded single query; malformed packets stay header-only.
+        response.queries.extend(self.question);
         encode_message(response)
     }
 }
@@ -337,11 +341,21 @@ fn parse_guest_request(wire: &[u8]) -> Result<GuestRequest, RequestFailure> {
         id,
         code: ResponseCode::FormErr,
         qtype: None,
+        question: None,
     })?;
     let failure = |code| RequestFailure {
         id,
         code,
         qtype: message.queries.first().map(|query| query.query_type),
+        question: match message.queries.as_slice() {
+            [query]
+                if message.metadata.message_type == MessageType::Query
+                    && message.metadata.op_code == OpCode::Query =>
+            {
+                Some(query.clone())
+            }
+            _ => None,
+        },
     };
     if message.metadata.message_type != MessageType::Query
         || message.metadata.op_code != OpCode::Query
