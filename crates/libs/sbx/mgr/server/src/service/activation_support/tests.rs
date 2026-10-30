@@ -182,7 +182,10 @@ async fn start_guest_failure_preserves_terminal_status_and_activation_ownership(
             "start",
             None,
             StartReadiness {
-                guest: std::future::ready(Err(Status::new(code, "guest readiness rejected"))),
+                guest: std::future::ready(Err::<GuestReadyEvidence, _>(Status::new(
+                    code,
+                    "guest readiness rejected",
+                ))),
                 policy: None::<std::future::Ready<Result<(), Status>>>,
             },
         )
@@ -925,7 +928,7 @@ async fn commit_start(service: &SandboxManagerService, id: &str) {
         None,
         StartReadiness {
             guest: std::future::ready(Ok(
-                pplx_space_spaced_host_client::proto::WaitReadyResponse::default(),
+                pplx_space_spaced_host_client::proto::WaitReadyResponse::default().into(),
             )),
             policy: None::<std::future::Ready<Result<(), Status>>>,
         },
