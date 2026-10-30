@@ -1205,7 +1205,8 @@ async fn claim_created_operation_tx(
 /// So when nothing else is active here, the dispatcher has nothing on the
 /// sandbox it could claim beside this one, and any of its claims that sees a
 /// later operation for the sandbox also sees this claim live and holds that
-/// operation back. Forks are not in the sandbox's queue.
+/// operation back. It counts every kind in the sandbox's queue
+/// ([`OUTSIDE_SANDBOX_QUEUE_KINDS`]), not only the ones a claim may take.
 async fn claim_created_if_sole_active_tx(
     tx: &mut Transaction<'_, Postgres>,
     org_id: OrgId,
@@ -1219,7 +1220,7 @@ async fn claim_created_if_sole_active_tx(
               WHERE org_id = $1
                 AND target_type = $2
                 AND target_id = $3
-                AND kind <> $4
+                AND kind <> ALL($4)
                 AND state IN ($5, $6)
                 AND operation_id <> $7
          )"
@@ -1227,7 +1228,7 @@ async fn claim_created_if_sole_active_tx(
     .bind(org_id)
     .bind(OperationTargetType::Sandbox.as_str())
     .bind(target_id)
-    .bind(OperationKind::ForkSandbox.as_str())
+    .bind(outside_sandbox_queue_labels())
     .bind(OperationState::Queued.as_str())
     .bind(OperationState::Running.as_str())
     .bind(operation_id.as_uuid())
@@ -1715,15 +1716,15 @@ impl ClaimedPublicOperation {
     }
 
     /// The work-queue key the dispatcher serializes on: the `sbx_<uuid>`
-    /// target of a sandbox operation. A fork, and any operation that names
-    /// no sandbox, has no key and never waits on another operation.
+    /// target of an operation in a sandbox's queue, the one the queue lock
+    /// is keyed by. A fork, and any operation that names no sandbox, has no
+    /// key and never waits on another operation.
     pub fn work_key(&self) -> Option<&str> {
-        if self.target_type != Some(OperationTargetType::Sandbox)
-            || self.kind == OperationKind::ForkSandbox
-        {
-            return None;
-        }
-        self.target_id.as_deref()
+        sandbox_queue_key(
+            self.target_type.as_ref(),
+            self.kind,
+            self.target_id.as_deref(),
+        )
     }
 
     /// Whether this claim was the operation's first start.
@@ -2277,16 +2278,45 @@ async fn lock_active_sandbox_operation(
     Ok(())
 }
 
-/// The sandbox whose queue an operation joins: its target when it names one,
-/// unless it is a fork, which names its source by a different id form and
-/// is ordered by the source's lifecycle lock instead.
-fn sandbox_queue_target<'a>(input: &CreatePublicOperation<'a>) -> Option<&'a str> {
-    if input.target_type != Some(OperationTargetType::Sandbox)
-        || input.kind == OperationKind::ForkSandbox
+/// Kinds that name a sandbox as their target but are not in its queue. A
+/// fork names its source by a different id form (the bare UUID) and is
+/// ordered by the source's lifecycle lock instead.
+///
+/// This is the one definition of a sandbox's queue: every operation that
+/// targets a sandbox and is not of one of these kinds. [`sandbox_queue_key`]
+/// reads it for the queue lock and the dispatcher's busy keys, and the keyed
+/// claim (`blocked`) and [`claim_created_if_sole_active_tx`] bind it into
+/// their SQL, so who serializes, who holds work back and who counts as other
+/// work for the sandbox cannot drift apart.
+const OUTSIDE_SANDBOX_QUEUE_KINDS: &[OperationKind] = &[OperationKind::ForkSandbox];
+
+/// [`OUTSIDE_SANDBOX_QUEUE_KINDS`] as the labels SQL binds.
+fn outside_sandbox_queue_labels() -> Vec<&'static str> {
+    OUTSIDE_SANDBOX_QUEUE_KINDS
+        .iter()
+        .map(|kind| kind.as_str())
+        .collect()
+}
+
+/// The sandbox whose queue an operation of `kind` on `target_id` joins: its
+/// target when that names a sandbox, unless `kind` is one of
+/// [`OUTSIDE_SANDBOX_QUEUE_KINDS`].
+fn sandbox_queue_key<'a>(
+    target_type: Option<&OperationTargetType>,
+    kind: OperationKind,
+    target_id: Option<&'a str>,
+) -> Option<&'a str> {
+    if target_type != Some(&OperationTargetType::Sandbox)
+        || OUTSIDE_SANDBOX_QUEUE_KINDS.contains(&kind)
     {
         return None;
     }
-    input.target_id
+    target_id
+}
+
+/// The sandbox whose queue `input` joins (see [`sandbox_queue_key`]).
+fn sandbox_queue_target<'a>(input: &CreatePublicOperation<'a>) -> Option<&'a str> {
+    sandbox_queue_key(input.target_type.as_ref(), input.kind, input.target_id)
 }
 
 /// Serialize inserting operations for one sandbox, until this transaction
@@ -2295,7 +2325,8 @@ fn sandbox_queue_target<'a>(input: &CreatePublicOperation<'a>) -> Option<&'a str
 /// Every insert of an operation into a sandbox's queue must go through
 /// [`create_operation_tx`] and take this lock: the sandbox's request order is
 /// then its commit order, and a transaction that claims the operation it
-/// inserts relies on that to see everything queued for the sandbox before it.
+/// inserts ([`claim_created_if_sole_active_tx`]) relies on that to see
+/// everything queued for the sandbox before it.
 /// Dropping the lock, or inserting such an operation any other way, breaks
 /// both. (The only other insert into `public_operations`,
 /// `insert_completed_session_operation_tx`, records a session's operation
@@ -2464,11 +2495,11 @@ async fn claim_operations(
     // with no create requested before it, so a delete is not stuck behind
     // work in retry backoff but never overtakes a create. Only sandboxes with
     // more than one active operation can hold anything back, so the window
-    // pass reads just those, in one sort. Forks name
-    // their source by a different id form and keep their own lifecycle lock,
-    // so they stay outside the key. With `$11` unset (the kill switch)
-    // `blocked` is empty. Teardowns (`$14`: deletes and kills) and other work
-    // are picked apart. At most `$12` of the claim are other work, which keeps
+    // pass reads just those, in one sort. Kinds outside a sandbox's queue
+    // (`$8`, `OUTSIDE_SANDBOX_QUEUE_KINDS`: forks) stay outside the key.
+    // With `$11` unset (the kill switch) `blocked` is empty. Teardowns
+    // (`$14`: deletes and kills) and other work are picked apart. At most
+    // `$12` of the claim are other work, which keeps
     // the slots reserved for teardowns free of it. While other work is due, at
     // most `$13` are teardowns, which keeps the slots reserved for other work
     // free of them; with none due, teardowns may take any free slot. The claim
@@ -2513,7 +2544,7 @@ async fn claim_operations(
                AND target_type = $7
                AND target_id IS NOT NULL
                AND kind = ANY($6)
-               AND kind <> $8
+               AND kind <> ALL($8)
              GROUP BY org_id, target_id
              HAVING COUNT(*) > 1
          ),
@@ -2535,7 +2566,7 @@ async fn claim_operations(
               AND op.target_id = shared.target_id
              WHERE op.state IN ($4, $5)
                AND op.kind = ANY($6)
-               AND op.kind <> $8
+               AND op.kind <> ALL($8)
          ),
          ranked AS (
              SELECT operation_id,
@@ -2754,7 +2785,7 @@ async fn claim_operations(
     .bind(OperationState::Running.as_str())
     .bind(&kind_labels)
     .bind(OperationTargetType::Sandbox.as_str())
-    .bind(OperationKind::ForkSandbox.as_str())
+    .bind(outside_sandbox_queue_labels())
     .bind(OperationKind::DeleteSandbox.as_str())
     .bind(OperationKind::CreateSandbox.as_str())
     .bind(keyed)
