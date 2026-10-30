@@ -114,6 +114,77 @@ fn sandbox_signal_preserves_foreign_process_and_skips_reaped_owner() {
 }
 
 #[test]
+fn process_exit_check_survives_signal_interruption() {
+    use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    // The supervisor's SIGCHLD handler runs whenever a child exits, and poll(2)
+    // is never restarted after a handler, whatever SA_RESTART says.
+    static HANDLED: AtomicUsize = AtomicUsize::new(0);
+    extern "C" fn count_signal(_: libc::c_int) {
+        HANDLED.fetch_add(1, Ordering::Relaxed);
+    }
+    const SIGNALS: usize = 2_000;
+
+    let child = KillAndReapChild(
+        std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap(),
+    );
+    let handle = ProcessHandle::open(child.0.id()).unwrap();
+    let action = SigAction::new(
+        SigHandler::Handler(count_signal),
+        SaFlags::empty(),
+        SigSet::empty(),
+    );
+    // SAFETY: the handler only touches an atomic, and the previous action is
+    // restored before the test returns.
+    let previous = unsafe { sigaction(Signal::SIGCHLD, &action) }.unwrap();
+    let process = rustix::process::getpid();
+    let thread = rustix::thread::gettid();
+    let done = AtomicBool::new(false);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let result = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !done.load(Ordering::Relaxed) {
+                // SAFETY: tgkill signals only this test's own polling thread.
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_tgkill,
+                        process.as_raw_nonzero().get(),
+                        thread.as_raw_nonzero().get(),
+                        libc::SIGCHLD,
+                    );
+                }
+                std::thread::yield_now();
+            }
+        });
+        let result = (|| {
+            while HANDLED.load(Ordering::Relaxed) < SIGNALS {
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "only {} signals arrived",
+                        HANDLED.load(Ordering::Relaxed)
+                    ));
+                }
+                match handle.has_exited() {
+                    Ok(false) => {}
+                    other => return Err(format!("live child observed as {other:?}")),
+                }
+            }
+            Ok(())
+        })();
+        done.store(true, Ordering::Relaxed);
+        result
+    });
+    // SAFETY: restores the action this test replaced.
+    unsafe { sigaction(Signal::SIGCHLD, &previous) }.unwrap();
+    result.unwrap();
+}
+
+#[test]
 fn parses_proc_status_state() {
     let status = "Name:\tfirecracker\nState:\tZ (zombie)\nPid:\t123\n";
     assert_eq!(process_state_from_status(status), Some('Z'));

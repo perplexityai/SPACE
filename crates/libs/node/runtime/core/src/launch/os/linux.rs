@@ -121,7 +121,16 @@ impl ProcessHandle {
     pub fn has_exited(&self) -> std::io::Result<bool> {
         use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
         let mut descriptors = [PollFd::new(self.pidfd.as_fd(), PollFlags::POLLIN)];
-        poll(&mut descriptors, PollTimeout::ZERO)?;
+        // poll(2) is never restarted after a signal handler, and the
+        // supervisor handles SIGCHLD for every child it reaps. A zero-timeout
+        // poll has no side effects, so retrying it is always safe.
+        loop {
+            match poll(&mut descriptors, PollTimeout::ZERO) {
+                Ok(_) => break,
+                Err(nix::errno::Errno::EINTR) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
         let [descriptor] = descriptors;
         let events = descriptor
             .revents()
