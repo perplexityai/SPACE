@@ -531,9 +531,18 @@ async fn inserts_for_one_sandbox_commit_in_request_order() -> TestResult {
         }
     });
     wait_for_advisory_lock_waiter(&db.pool).await?;
-    create_test_operation_for_target(&store, org_id, OperationKind::StopSandbox, &other_target_id)
-        .await?
-        .expect_created();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        create_test_operation_for_target(
+            &store,
+            org_id,
+            OperationKind::StopSandbox,
+            &other_target_id,
+        ),
+    )
+    .await
+    .expect("another sandbox's insert does not wait on this sandbox's queue")?
+    .expect_created();
 
     let committing_at: time::OffsetDateTime = sqlx::query_scalar(sql!("SELECT clock_timestamp()"))
         .fetch_one(&mut *first)

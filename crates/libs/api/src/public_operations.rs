@@ -2106,6 +2106,15 @@ fn sandbox_queue_target<'a>(input: &CreatePublicOperation<'a>) -> Option<&'a str
 /// Serialize inserting operations for one sandbox, until this transaction
 /// commits.
 ///
+/// Every insert of an operation into a sandbox's queue must go through
+/// [`create_operation_tx`] and take this lock: the sandbox's request order is
+/// then its commit order, and a transaction that claims the operation it
+/// inserts relies on that to see everything queued for the sandbox before it.
+/// Dropping the lock, or inserting such an operation any other way, breaks
+/// both. (The only other insert into `public_operations`,
+/// `insert_completed_session_operation_tx`, records a session's operation
+/// born `succeeded`, which joins no sandbox's queue.)
+///
 /// Every insert into a sandbox's queue takes this lock last, just before its
 /// `INSERT`, so it waits for an earlier insert to commit and nothing checked
 /// earlier in the transaction (idempotency, quota, a joinable operation) is
