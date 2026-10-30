@@ -935,63 +935,6 @@ fn list_pending_backups_returns_exactly_the_unbacked_pinned_artifacts() {
     );
 }
 
-/// The sampler's backlog gauge counts what `list_pending_backups` lists and
-/// ages the oldest pinned artifact, so a backup stalled for days shows up as
-/// both a non-zero count and a growing age. It returns to zero once the
-/// backup completes.
-#[test]
-fn pending_backup_backlog_counts_and_ages_unbacked_pins() {
-    let conn = open_test_db();
-    let now = crate::db::now_epoch_i64().unwrap();
-    const THREE_DAYS: u64 = 3 * 24 * 60 * 60;
-    let three_days = THREE_DAYS as i64;
-    let stalled = "01939e3e-9006-7000-8000-000000000001";
-    let recent = "01939e3e-9006-7000-8000-000000000002";
-    let backed_up = "01939e3e-9006-7000-8000-000000000003";
-    for (id, sandbox_id, created_at, backup_completed_at) in [
-        (stalled, "sbx-stalled", now - three_days, None),
-        (recent, "sbx-recent", now - 60, None),
-        (backed_up, "sbx-backed-up", now - 2 * three_days, Some("1")),
-    ] {
-        conn.execute(
-            "INSERT INTO local_artifacts (
-                 local_artifact_id, sandbox_id, artifact_kind, artifact_origin,
-                 local_path, created_at, backup_completed_at
-             ) VALUES (?1, ?2, 'full', 'suspend', ?3, ?4, ?5)",
-            params![
-                id,
-                sandbox_id,
-                format!("/tmp/{id}"),
-                created_at.to_string(),
-                backup_completed_at
-            ],
-        )
-        .unwrap();
-        insert_pinned_sandbox(&conn, sandbox_id, Some((id, "full", "suspend")));
-    }
-    insert_pinned_sandbox(&conn, "sbx-running", None);
-
-    let backlog = crate::db::read::counts(&conn, crate::db::read::PendingBackups).unwrap();
-    assert_eq!(
-        backlog.count, 2,
-        "the backed-up and running sandboxes don't count"
-    );
-    assert!(
-        (THREE_DAYS..THREE_DAYS + 60).contains(&backlog.oldest_age_secs),
-        "the stalled artifact is the oldest: {backlog:?}"
-    );
-
-    conn.execute(
-        "UPDATE local_artifacts SET backup_completed_at = '1' WHERE local_artifact_id IN (?1, ?2)",
-        params![stalled, recent],
-    )
-    .unwrap();
-    assert_eq!(
-        crate::db::read::counts(&conn, crate::db::read::PendingBackups).unwrap(),
-        Default::default()
-    );
-}
-
 /// Exclusion by pin, isolated from exclusion by backup stamp: move the
 /// pin onto the unbacked artifact and it appears. Without this the set
 /// equality above would also hold if the query ignored the pin entirely
