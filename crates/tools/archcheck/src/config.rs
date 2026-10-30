@@ -22,6 +22,13 @@ use crate::{
     context::{LoadError, read},
 };
 
+mod layers;
+
+pub use layers::{
+    DuplicatePackageError, EdgeBehaviours, Entries, Layer, LayersConfig, LayersPolicy, PackageSet,
+    UnknownLayerError, Unmoved, UnmovedError,
+};
+
 pub const CONFIG_FILE: &str = "ARCHITECTURE.toml";
 
 #[derive(Debug, Clone, Deserialize)]
@@ -42,6 +49,9 @@ pub struct RulesConfig {
     /// `[rules.dependency_fence.<instance>]` tables; none when absent.
     #[serde(default)]
     pub dependency_fence: BTreeMap<InstanceName, DependencyFenceConfig>,
+    /// `[rules.layers]`; the rule checks nothing when absent.
+    #[serde(default)]
+    pub layers: Option<LayersConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -437,15 +447,44 @@ struct PolicyRules {
     crate_names: Option<PolicyTable>,
 }
 
-/// The base branch's `[rules.crate_names]`, given with `--base-architecture`.
+/// The base branch's `ARCHITECTURE.toml`, given with `--base-architecture`.
 #[derive(Debug, Default)]
 pub enum BaseArchitecture {
     #[default]
     NotGiven,
-    /// Not TOML, or a `[rules.crate_names]` of another shape.
-    Unusable(UnusableBase),
-    /// `None` when the copy has no `[rules.crate_names]`.
-    Loaded(Option<CrateNamesPolicy>),
+    Loaded(Box<BasePolicies>),
+}
+
+/// The tables of the base branch's `ARCHITECTURE.toml` that rules compare
+/// with, each read on its own, so that one of another shape skips only its
+/// own rule's comparisons.
+#[derive(Debug)]
+pub struct BasePolicies {
+    pub crate_names: BasePolicy<CrateNamesPolicy>,
+    pub layers: BasePolicy<LayersPolicy>,
+}
+
+/// One rule's table of the base branch's copy: `Ok(None)` when the copy has
+/// none, `Err` when the copy is not TOML or the table has another shape.
+pub type BasePolicy<T> = Result<Option<T>, Box<UnusableBase>>;
+
+impl BaseArchitecture {
+    /// The base branch's `ARCHITECTURE.toml` at `path`. Only an unreadable
+    /// file is an error; a table that does not parse is unusable on its own.
+    pub fn load(path: &Path) -> Result<Self, LoadError> {
+        let text = read(path)?;
+        let unusable = |error: toml::de::Error| {
+            Box::new(UnusableBase {
+                path: path.to_path_buf(),
+                line: error.span().map(|span| line_of(&text, span.start)),
+                error,
+            })
+        };
+        Ok(Self::Loaded(Box::new(BasePolicies {
+            crate_names: CrateNamesPolicy::parse(&text).map_err(unusable),
+            layers: LayersPolicy::parse(&text).map_err(unusable),
+        })))
+    }
 }
 
 /// `flatten` and `untagged` would lose the spans, so each behaviour is a
@@ -506,21 +545,6 @@ impl CrateNamesPolicy {
             allow,
             modes,
         }))
-    }
-
-    /// The base branch's `ARCHITECTURE.toml` at `path`, given with
-    /// `--base-architecture`. Only an unreadable file is an error; one that
-    /// does not parse is [`BaseArchitecture::Unusable`].
-    pub fn load_base(path: &Path) -> Result<BaseArchitecture, LoadError> {
-        let text = read(path)?;
-        Ok(match Self::parse(&text) {
-            Ok(policy) => BaseArchitecture::Loaded(policy),
-            Err(error) => BaseArchitecture::Unusable(UnusableBase {
-                path: path.to_path_buf(),
-                line: error.span().map(|span| line_of(&text, span.start)),
-                error,
-            }),
-        })
     }
 }
 

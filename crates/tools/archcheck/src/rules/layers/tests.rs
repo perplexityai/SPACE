@@ -1,0 +1,274 @@
+//! The layers rule's pieces that the command-line tests reach only through
+//! whole workspaces: the layer matrix, paths below a layer directory, the
+//! items a finding names, and the lenient reading of `[rules.layers]`.
+
+use super::graph::{Problem, layer_dir, list, may_depend, name_segments, use_tree, used_items};
+use crate::{
+    config::{Layer, LayersConfig, LayersPolicy},
+    context::{Crate, Dependency, ProductionFile, count_code_lines},
+};
+
+/// Every behaviour of `[rules.layers]`, as its key in `LayersPolicy.modes`.
+/// `LayersConfig` requires each and denies others, so this list is its
+/// list.
+const BEHAVIOURS: [&str; 13] = [
+    "placement",
+    "layout",
+    "direction.no_crossing",
+    "direction.no_new_entries",
+    "direction.stale_entries",
+    "dev_direction.no_crossing",
+    "dev_direction.no_new_entries",
+    "dev_direction.stale_entries",
+    "test_only",
+    "clients",
+    "store_edges",
+    "stale_entries",
+    "policy_changed",
+];
+
+/// Each behaviour as `[<prefix><behaviour>]` with an advisory mode.
+fn behaviour_tables(prefix: &str) -> String {
+    BEHAVIOURS
+        .iter()
+        .map(|behaviour| format!("[{prefix}{behaviour}]\nmode = \"advisory\"\n"))
+        .collect()
+}
+
+/// Each layer that may have a normal or build edge to each other one,
+/// before the client and store rules.
+#[test]
+fn the_layer_matrix() {
+    use Layer::{Api, App, Domain, Foundation, Storage, TestSupport, Tools};
+    let allowed: &[(Layer, &[Layer])] = &[
+        (Foundation, &[Foundation]),
+        (Domain, &[Domain, Foundation]),
+        (Storage, &[Storage, Domain, Foundation]),
+        (Api, &[Api, Storage, Domain, Foundation]),
+        (App, &[Api, Domain, Foundation]),
+        (TestSupport, &Layer::ALL),
+        (Tools, &Layer::ALL),
+    ];
+    for (from, targets) in allowed {
+        for to in Layer::ALL {
+            assert_eq!(
+                may_depend(*from, to),
+                targets.contains(&to),
+                "{from} -> {to}"
+            );
+        }
+    }
+    // The stack is ranked bottom-up; test support and tools are beside it.
+    let ranks: Vec<Option<u8>> = Layer::ALL.iter().map(|layer| layer.rank()).collect();
+    assert_eq!(
+        ranks,
+        [Some(10), Some(20), Some(30), Some(40), Some(50), None, None]
+    );
+    assert!(Problem::Direction < Problem::DevDirection);
+}
+
+#[test]
+fn layer_directories() {
+    let cases: &[(&str, Option<(Layer, &str)>)] = &[
+        ("crates/l10_foundation/x", Some((Layer::Foundation, "x"))),
+        (
+            "crates/l40_api/sbx/mgr/server",
+            Some((Layer::Api, "sbx/mgr/server")),
+        ),
+        (
+            "crates/test_support/fixtures",
+            Some((Layer::TestSupport, "fixtures")),
+        ),
+        ("crates/tools", Some((Layer::Tools, ""))),
+        ("crates/libs/x", None),
+        ("crates", None),
+        ("other/l10_foundation/x", None),
+        ("", None),
+    ];
+    for (member, expected) in cases {
+        assert_eq!(layer_dir(member), *expected, "{member}");
+    }
+    for layer in Layer::ALL {
+        assert_eq!(Layer::from_dir(layer.dir()), Some(layer));
+        assert_eq!(layer.to_string(), layer.dir());
+    }
+    assert_eq!(
+        name_segments("pplx-space-sbx-mgr-client"),
+        ["sbx", "mgr", "client"]
+    );
+    assert_eq!(name_segments("other-name"), ["other", "name"]);
+}
+
+/// The paths a use tree or a path in code names, as a finding lists them.
+#[test]
+fn use_trees() {
+    let cases: &[(&str, &str, &[&str])] = &[
+        ("Item;", "", &["Item"]),
+        ("module::Item;", "", &["module::Item"]),
+        ("module :: Item ;", "", &["module::Item"]),
+        ("{A, b::C};", "", &["A", "b::C"]),
+        (
+            "{\n    a::{B, c::{D, self}},\n    E as F,\n    G,\n};",
+            "",
+            &["a::B", "a::c::D", "a::c", "E", "G"],
+        ),
+        ("{self, A};", "", &["A"]),
+        ("a::{self};", "", &["a"]),
+        ("a::*;", "", &["a"]),
+        ("*;", "", &[]),
+        ("{A,};", "", &["A"]),
+        ("Type::<u8>::new()", "", &["Type"]),
+        ("f(x)", "", &["f"]),
+        ("", "", &[]),
+        ("B, C", "a", &["a::B"]),
+    ];
+    for (text, prefix, expected) in cases {
+        let mut rest = *text;
+        let mut paths = Vec::new();
+        use_tree(&mut rest, prefix, &mut paths);
+        assert_eq!(paths, *expected, "{text:?}");
+    }
+    // The tree is consumed, up to what ends it.
+    let mut rest = "{A as B, C}; rest";
+    use_tree(&mut rest, "", &mut Vec::new());
+    assert_eq!(rest, "; rest");
+}
+
+/// The items a crate's files name through a dependency; none when the
+/// dependency has no name to find, as for a target without a library that
+/// the manifest doesn't rename.
+#[test]
+fn items_used_through_a_dependency() {
+    let text = "use dep::{A, b::C};\nfn f() { other::dep::x(); d::e(); }\n";
+    let files = [ProductionFile {
+        path: "member/src/lib.rs".to_owned(),
+        text: text.to_owned(),
+        code_lines: count_code_lines(text),
+    }];
+    let krate = Crate {
+        name: "pplx-space-member".to_owned(),
+        lib: Some("pplx_space_member".to_owned()),
+        member: "member".to_owned(),
+        name_line: 2,
+        lib_name_line: None,
+        dependencies: Vec::new(),
+    };
+    let dependency = |rename: Option<&str>| Dependency {
+        package: "pplx-space-dep".to_owned(),
+        rename: rename.map(str::to_owned),
+        kind: None,
+        target: None,
+        line: 6,
+    };
+    let used =
+        |rename: Option<&str>, lib: &str| used_items(&files, &krate, &dependency(rename), lib);
+    assert_eq!(used(None, "dep"), ["dep::A", "dep::b::C"]);
+    assert_eq!(used(Some("d"), "dep"), ["d::e"]);
+    assert_eq!(used(None, ""), Vec::<String>::new());
+}
+
+#[test]
+fn lists_for_a_sentence() {
+    let names: Vec<String> = ["a", "b", "c"].map(str::to_owned).to_vec();
+    assert_eq!(list(&names, 5), "a, b, c");
+    assert_eq!(list(&names, 3), "a, b, c");
+    assert_eq!(list(&names, 2), "a, b and 1 more");
+    assert_eq!(list(&[], 2), "");
+}
+
+/// `[rules.layers]` read for its lines: each entry, list item and mode on
+/// its own line, and the table's first header.
+#[test]
+fn the_policy_and_its_lines() {
+    let text = "[rules.file_size]\nlimit = 5\n\
+                [rules.layers.unmoved]\n\
+                l20_domain = [\n  \"pplx-space-b\",\n  \"pplx-space-a\",\n]\n\
+                [rules.layers.store_users]\n\
+                pplx-space-s = [\"pplx-space-a\"]\n\
+                [rules.layers.allowed_edges]\n\
+                pplx-space-p = [\n  \"pplx-space-s\",\n]\n\
+                [rules.layers.direction.no_crossing]\nmode = \"required\"\n\
+                [rules.layers.policy_changed]\nmode = \"advisory\"\n\
+                [rules.layers.retired]\nmode = \"advisory\"\n";
+    let policy = LayersPolicy::parse(text)
+        .expect("the table parses")
+        .expect("the text has the table");
+    assert_eq!(policy.line, 3);
+    assert_eq!(policy.unmoved.line, Some(3));
+    let unmoved: Vec<(&str, &str, usize)> = policy
+        .unmoved
+        .entries
+        .iter()
+        .map(|(package, (layer, line))| (package.as_str(), layer.as_str(), *line))
+        .collect();
+    assert_eq!(
+        unmoved,
+        [
+            ("pplx-space-a", "l20_domain", 6),
+            ("pplx-space-b", "l20_domain", 5)
+        ]
+    );
+    let (users, line) = &policy.store_users.entries["pplx-space-s"];
+    assert_eq!((*line, users["pplx-space-a"]), (9, 9));
+    let (allowed, line) = &policy.allowed_edges.entries["pplx-space-p"];
+    assert_eq!((*line, allowed["pplx-space-s"]), (11, 12));
+    let modes: Vec<(&str, &str, usize)> = policy
+        .modes
+        .iter()
+        .map(|(behaviour, (mode, line))| (behaviour.as_str(), mode.as_str(), *line))
+        .collect();
+    assert_eq!(
+        modes,
+        [
+            ("direction.no_crossing", "required", 15),
+            ("policy_changed", "advisory", 17)
+        ]
+    );
+
+    assert_eq!(
+        LayersPolicy::parse("[rules.file_size]\nlimit = 5\n").ok(),
+        Some(None)
+    );
+    LayersPolicy::parse("[rules.layers]\nunmoved = 5\n").expect_err("unmoved is not a table");
+}
+
+/// The lenient reading of `[rules.layers]` has a mode for every behaviour
+/// `LayersConfig` reads, so that `policy_changed` sees each one change.
+#[test]
+fn every_behaviour_has_a_policy_mode() {
+    toml::from_str::<LayersConfig>(&behaviour_tables(""))
+        .expect("BEHAVIOURS are LayersConfig's behaviours");
+    let policy = LayersPolicy::parse(&behaviour_tables("rules.layers."))
+        .expect("the table parses")
+        .expect("the text has the table");
+    let modes: Vec<&str> = policy.modes.keys().map(String::as_str).collect();
+    let mut expected = BEHAVIOURS.to_vec();
+    expected.sort_unstable();
+    assert_eq!(modes, expected);
+}
+
+/// `unmoved` is read as package to layer, each package in one layer.
+#[test]
+fn unmoved_entries() {
+    let behaviours = behaviour_tables("");
+    let parse = |unmoved: &str| {
+        toml::from_str::<LayersConfig>(&format!("[unmoved]\n{unmoved}{behaviours}"))
+    };
+    let config = parse("l10_foundation = [\"x\"]\ntools = [\"y\"]\n").expect("it parses");
+    assert_eq!(config.unmoved.get("x"), Some(Layer::Foundation));
+    assert_eq!(config.unmoved.get("y"), Some(Layer::Tools));
+    assert_eq!(config.unmoved.get("z"), None);
+    let packages: Vec<&String> = config.unmoved.packages().collect();
+    assert_eq!(packages, ["x", "y"]);
+    for (unmoved, error) in [
+        ("l60_ui = [\"x\"]\n", "unknown layer \"l60_ui\""),
+        (
+            "l10_foundation = [\"x\"]\nl20_domain = [\"x\"]\n",
+            "unmoved lists \"x\" in both l10_foundation and l20_domain",
+        ),
+        ("l10_foundation = [\"x\", \"x\"]\n", "\"x\" is listed twice"),
+    ] {
+        let found = parse(unmoved).expect_err("it is rejected").to_string();
+        assert!(found.contains(error), "{unmoved}: {found}");
+    }
+}
