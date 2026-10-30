@@ -368,27 +368,20 @@ impl KubernetesSubstrate {
         // policy from the preceding set_sandbox_network_policy call.
         if let Some(override_policy) = override_policy.as_ref() {
             use kube::api::{Patch, PatchParams};
-            match serde_json::to_string(override_policy) {
+            match encode_network_policy_annotation(override_policy) {
                 Err(err) => {
                     tracing::warn!(
                         sandbox_id = %sandbox_id,
                         pod_name = %claim.pod_name,
                         %err,
-                        "pool adoption: failed to serialize network policy override for pod annotation"
-                    );
-                }
-                Ok(policy_json) if ensure_network_policy_annotation_size(&policy_json).is_err() => {
-                    tracing::warn!(
-                        sandbox_id = %sandbox_id,
-                        pod_name = %claim.pod_name,
-                        "pool adoption: network policy override too large for pod annotation, skipping"
+                        "pool adoption: failed to encode network policy override for pod annotation"
                     );
                 }
                 Ok(policy_json) => {
                     let patch = serde_json::json!({
                         "metadata": {
                             "annotations": {
-                                SANDBOX_NETWORK_POLICY_ANNOTATION: policy_json,
+                                SANDBOX_NETWORK_POLICY_ANNOTATION: NetworkPolicyAnnotation::as_str(&policy_json),
                                 SANDBOX_NETWORK_POLICY_GENERATION_ANNOTATION: network_policy_generation.to_string(),
                                 SANDBOX_NETWORK_POLICY_AUTHORITY_ANNOTATION: authority.to_string(),
                             }

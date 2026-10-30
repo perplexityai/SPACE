@@ -51,3 +51,13 @@ field out to every sandbox node before any API sets it. On a node whose shim
 predates the field, those cold creates fail with `InvalidArgument` and count in
 `space.shim.operation.error` with `step:parse_network_policy`. Keep the field in
 the shim while any pod annotated with it remains.
+
+Port-scoped TLS exemptions use a separate annotation encoding, not the public
+or stored policy JSON. Its legacy `tls_interception_exemptions` key contains
+only all-port entries; `tls_interception_exemptions_with_ports` contains the
+complete ordered list only when a scoped entry exists. The shim checks that
+the two lists agree. Lenient older shims ignore the new key and continue
+intercepting scoped destinations; strict older shims reject it. Upgrade the
+shim first to avoid cold-create failures. Size limits apply to the final
+annotation, including its repeated all-port entries, while policy identity
+continues to use canonical JSON.

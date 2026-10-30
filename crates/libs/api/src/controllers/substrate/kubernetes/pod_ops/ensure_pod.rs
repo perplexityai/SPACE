@@ -941,11 +941,7 @@ impl KubernetesSubstrate {
                 message: format!("failed to serialize auto lifecycle policy: {err}"),
             })?;
         let network_policy = self.effective_network_policy_for_sandbox(&sandbox).await?;
-        let network_policy_json =
-            serde_json::to_string(&network_policy).map_err(|err| SubstrateError::Failed {
-                message: format!("failed to serialize network policy: {err}"),
-            })?;
-        ensure_network_policy_annotation_size(&network_policy_json)?;
+        let network_policy_json = encode_network_policy_annotation(&network_policy)?;
         let sandbox_owner = self.store.sandbox_owner_for_user(sandbox.user_id);
 
         // Sweep of lingering older-generation pods before a restore create — a

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/hex"
@@ -42,6 +43,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -2107,12 +2109,13 @@ type autoLifecycleStageJSON struct {
 	Action       string `json:"action"`
 }
 
-type networkPolicyJSON struct {
-	Version                   *string                 `json:"version"`
-	Egress                    *egressPolicyJSON       `json:"egress"`
-	TLSInterception           json.RawMessage         `json:"tls_interception"`
-	TLSInterceptionExemptions []egressDestinationJSON `json:"tls_interception_exemptions"`
-	NetworkCredentialRules    json.RawMessage         `json:"network_credential_rules"`
+type networkPolicyAnnotationJSON struct {
+	Version                            *string           `json:"version"`
+	Egress                             *egressPolicyJSON `json:"egress"`
+	TLSInterception                    json.RawMessage   `json:"tls_interception"`
+	TLSInterceptionExemptions          json.RawMessage   `json:"tls_interception_exemptions"`
+	TLSInterceptionExemptionsWithPorts json.RawMessage   `json:"tls_interception_exemptions_with_ports"`
+	NetworkCredentialRules             json.RawMessage   `json:"network_credential_rules"`
 }
 
 type sandboxNetworkPolicyConfig struct {
@@ -2495,7 +2498,7 @@ func (s *ociSpec) sandboxPolicyAuthority(annotation string, defaultToCluster boo
 // The manager stores the converted policy at the annotation's generation, so
 // reject fields the shim cannot represent instead of dropping them.
 func parseNetworkPolicyJSON(raw string) (*netpb.NetworkPolicyV1, error) {
-	var decoded networkPolicyJSON
+	var decoded networkPolicyAnnotationJSON
 	decoder := json.NewDecoder(strings.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&decoded); err != nil {
@@ -2541,7 +2544,8 @@ func parseNetworkPolicyJSON(raw string) (*netpb.NetworkPolicyV1, error) {
 	if err != nil {
 		return nil, err
 	}
-	exemptions, err := parseEgressDestinations(decoded.TLSInterceptionExemptions, "tls_interception_exemptions")
+	exemptions, withPorts, err := parseAnnotationTLSInterceptionExemptions(
+		decoded.TLSInterceptionExemptions, decoded.TLSInterceptionExemptionsWithPorts)
 	if err != nil {
 		return nil, err
 	}
@@ -2550,13 +2554,14 @@ func parseNetworkPolicyJSON(raw string) (*netpb.NetworkPolicyV1, error) {
 		return nil, fmt.Errorf("network policy network_credential_rules: %w", err)
 	}
 	return &netpb.NetworkPolicyV1{
-		Version:                   netpb.NetworkPolicyVersion_NETWORK_POLICY_VERSION_V1,
-		EgressDefaultAction:       action,
-		Allow:                     allow,
-		Deny:                      deny,
-		TlsInterception:           tlsInterception,
-		TlsInterceptionExemptions: exemptions,
-		NetworkCredentialRules:    credentialRules,
+		Version:                            netpb.NetworkPolicyVersion_NETWORK_POLICY_VERSION_V1,
+		EgressDefaultAction:                action,
+		Allow:                              allow,
+		Deny:                               deny,
+		TlsInterception:                    tlsInterception,
+		TlsInterceptionExemptions:          exemptions,
+		TlsInterceptionExemptionsWithPorts: withPorts,
+		NetworkCredentialRules:             credentialRules,
 	}, nil
 }
 
@@ -2665,6 +2670,127 @@ func parseEgressDestination(destination egressDestinationJSON) (*netpb.EgressDes
 	default:
 		return &netpb.EgressDestinationV1{Destination: &netpb.EgressDestinationV1_WildcardDomain{WildcardDomain: values[3]}}, nil
 	}
+}
+
+// The legacy key must be exactly the full list's all-port projection. Never
+// choose one representation over the other when they disagree.
+func parseAnnotationTLSInterceptionExemptions(legacy, full json.RawMessage) ([]*netpb.EgressDestinationV1, []*netpb.TlsInterceptionExemptionV1, error) {
+	allPorts, legacyScoped, err := parseTLSInterceptionExemptions(legacy)
+	if err != nil {
+		return nil, nil, err
+	}
+	if legacyScoped != nil {
+		return nil, nil, errors.New("network policy tls_interception_exemptions must not contain port")
+	}
+	if len(full) == 0 {
+		return allPorts, nil, nil
+	}
+	projection, ordered, err := parseTLSInterceptionExemptions(full)
+	if err != nil {
+		return nil, nil, fmt.Errorf("network policy tls_interception_exemptions_with_ports: %w", err)
+	}
+	if len(ordered) == 0 || len(allPorts) != len(projection) {
+		return nil, nil, errors.New("network policy tls_interception_exemptions_with_ports requires a scoped entry and matching all-port projection")
+	}
+	for index := range allPorts {
+		if !proto.Equal(allPorts[index], projection[index]) {
+			return nil, nil, errors.New("network policy tls_interception_exemptions does not match all-port projection")
+		}
+	}
+	return allPorts, ordered, nil
+}
+
+// parseTLSInterceptionExemptions encodes exemptions as the Rust policy does:
+// field 7 holds the exemptions that cover every port, and field 8 holds the
+// full ordered list when any exemption names a port. A reader that predates
+// ports therefore intercepts a port-scoped destination instead of exempting
+// all of its ports.
+func parseTLSInterceptionExemptions(input json.RawMessage) ([]*netpb.EgressDestinationV1, []*netpb.TlsInterceptionExemptionV1, error) {
+	var raw []json.RawMessage
+	if len(input) != 0 {
+		if err := json.Unmarshal(input, &raw); err != nil {
+			return nil, nil, fmt.Errorf("network policy tls_interception_exemptions: %w", err)
+		}
+		if raw == nil {
+			return nil, nil, errors.New("network policy tls_interception_exemptions must be an array")
+		}
+	}
+	allPorts := make([]*netpb.EgressDestinationV1, 0, len(raw))
+	ordered := make([]*netpb.TlsInterceptionExemptionV1, 0, len(raw))
+	portScoped := false
+	for index, entry := range raw {
+		exemption, err := parseTLSInterceptionExemption(entry)
+		if err != nil {
+			return nil, nil, fmt.Errorf("network policy tls_interception_exemptions[%d]: %w", index, err)
+		}
+		if exemption.Port == nil {
+			allPorts = append(allPorts, exemption.Destination)
+		} else {
+			portScoped = true
+		}
+		ordered = append(ordered, exemption)
+	}
+	if !portScoped {
+		ordered = nil
+	}
+	return allPorts, ordered, nil
+}
+
+// parseTLSInterceptionExemption reads one destination key and an optional
+// port. Like the Rust reader, it rejects unknown, repeated and null keys
+// instead of ignoring them, so it never drops a restriction it does not know.
+func parseTLSInterceptionExemption(raw json.RawMessage) (*netpb.TlsInterceptionExemptionV1, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	if token, err := decoder.Token(); err != nil || token != json.Delim('{') {
+		return nil, fmt.Errorf("exemption must be an object")
+	}
+	var destination egressDestinationJSON
+	var port *uint32
+	seen := map[string]bool{}
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return nil, err
+		}
+		key, _ := token.(string)
+		if seen[key] {
+			return nil, fmt.Errorf("duplicate key %q", key)
+		}
+		seen[key] = true
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return nil, err
+		}
+		if string(value) == "null" {
+			return nil, fmt.Errorf("%s must not be null", key)
+		}
+		switch key {
+		case "ip":
+			err = json.Unmarshal(value, &destination.IP)
+		case "cidr":
+			err = json.Unmarshal(value, &destination.CIDR)
+		case "domain":
+			err = json.Unmarshal(value, &destination.Domain)
+		case "wildcard_domain":
+			err = json.Unmarshal(value, &destination.WildcardDomain)
+		case "port":
+			var parsed uint32
+			if err = json.Unmarshal(value, &parsed); err == nil && (parsed == 0 || parsed > 65535) {
+				err = fmt.Errorf("must be between 1 and 65535")
+			}
+			port = &parsed
+		default:
+			return nil, fmt.Errorf("unknown key %q", key)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("invalid %s: %w", key, err)
+		}
+	}
+	parsed, err := parseEgressDestination(destination)
+	if err != nil {
+		return nil, err
+	}
+	return &netpb.TlsInterceptionExemptionV1{Destination: parsed, Port: port}, nil
 }
 
 // traceparent returns the W3C context of the Rust operation that materialized

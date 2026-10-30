@@ -7430,6 +7430,9 @@ mod kubernetes_tests {
             ..override_sandbox.clone()
         };
         let owner = SandboxOwner::platform_user(override_sandbox.user_id);
+        let network_policy_json =
+            encode_network_policy_annotation(&pplx_space_net_common::NetworkPolicyV1::allow_all())
+                .unwrap();
 
         for (label, sandbox, seeded_generation) in [
             ("inherited", &inherited_sandbox, "0"),
@@ -7441,7 +7444,7 @@ mod kubernetes_tests {
                 crate::controllers::substrate::kubernetes::pod_ops::SandboxPodRequestInputs {
                     sandbox_owner: &owner,
                     auto_lifecycle_json: "{}",
-                    network_policy_json: "{}",
+                    network_policy_json: &network_policy_json,
                     node_group_placement: None,
                 },
                 PodCreateContext::OnDemand,
@@ -7515,7 +7518,9 @@ mod kubernetes_tests {
         .expect("a generic group admits a generic template");
         let owner = SandboxOwner::platform_user(sandbox.user_id);
         let auto_lifecycle_json = "{}";
-        let network_policy_json = "{}";
+        let network_policy_json =
+            encode_network_policy_annotation(&pplx_space_net_common::NetworkPolicyV1::allow_all())
+                .unwrap();
 
         for context in [
             PodCreateContext::OnDemand,
@@ -7542,7 +7547,7 @@ mod kubernetes_tests {
                 crate::controllers::substrate::kubernetes::pod_ops::SandboxPodRequestInputs {
                     sandbox_owner: &owner,
                     auto_lifecycle_json,
-                    network_policy_json,
+                    network_policy_json: &network_policy_json,
                     node_group_placement: Some(&placement),
                 },
                 context,

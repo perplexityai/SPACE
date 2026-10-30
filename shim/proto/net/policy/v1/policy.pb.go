@@ -381,9 +381,17 @@ type NetworkPolicyV1 struct {
 	// of network policy and are delivered to a capable gateway separately.
 	NetworkCredentialRules []*NetworkCredentialRuleV1 `protobuf:"bytes,6,rep,name=network_credential_rules,json=networkCredentialRules,proto3" json:"network_credential_rules,omitempty"`
 	// Skip TLS termination after egress admission; this grants no network access.
+	// Holds only the exemptions that apply on every port, so a reader that does
+	// not know tls_interception_exemptions_with_ports intercepts a port-scoped
+	// destination instead of exempting all of its ports.
 	TlsInterceptionExemptions []*EgressDestinationV1 `protobuf:"bytes,7,rep,name=tls_interception_exemptions,json=tlsInterceptionExemptions,proto3" json:"tls_interception_exemptions,omitempty"`
-	unknownFields             protoimpl.UnknownFields
-	sizeCache                 protoimpl.SizeCache
+	// Set only when at least one exemption is scoped to a port. It then holds
+	// every exemption in order, readers that know it ignore
+	// tls_interception_exemptions, and tls_interception_exemptions must equal its
+	// entries without a port.
+	TlsInterceptionExemptionsWithPorts []*TlsInterceptionExemptionV1 `protobuf:"bytes,8,rep,name=tls_interception_exemptions_with_ports,json=tlsInterceptionExemptionsWithPorts,proto3" json:"tls_interception_exemptions_with_ports,omitempty"`
+	unknownFields                      protoimpl.UnknownFields
+	sizeCache                          protoimpl.SizeCache
 }
 
 func (x *NetworkPolicyV1) Reset() {
@@ -465,6 +473,66 @@ func (x *NetworkPolicyV1) GetTlsInterceptionExemptions() []*EgressDestinationV1 
 	return nil
 }
 
+func (x *NetworkPolicyV1) GetTlsInterceptionExemptionsWithPorts() []*TlsInterceptionExemptionV1 {
+	if x != nil {
+		return x.TlsInterceptionExemptionsWithPorts
+	}
+	return nil
+}
+
+type TlsInterceptionExemptionV1 struct {
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	Destination *EgressDestinationV1   `protobuf:"bytes,1,opt,name=destination,proto3" json:"destination,omitempty"`
+	// Omitted exempts every destination port.
+	Port          *uint32 `protobuf:"varint,2,opt,name=port,proto3,oneof" json:"port,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TlsInterceptionExemptionV1) Reset() {
+	*x = TlsInterceptionExemptionV1{}
+	mi := &file_net_policy_v1_policy_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TlsInterceptionExemptionV1) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TlsInterceptionExemptionV1) ProtoMessage() {}
+
+func (x *TlsInterceptionExemptionV1) ProtoReflect() protoreflect.Message {
+	mi := &file_net_policy_v1_policy_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TlsInterceptionExemptionV1.ProtoReflect.Descriptor instead.
+func (*TlsInterceptionExemptionV1) Descriptor() ([]byte, []int) {
+	return file_net_policy_v1_policy_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *TlsInterceptionExemptionV1) GetDestination() *EgressDestinationV1 {
+	if x != nil {
+		return x.Destination
+	}
+	return nil
+}
+
+func (x *TlsInterceptionExemptionV1) GetPort() uint32 {
+	if x != nil && x.Port != nil {
+		return *x.Port
+	}
+	return 0
+}
+
 type NetworkCredentialRuleV1 struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Caller-chosen key, unique within this policy.
@@ -482,7 +550,7 @@ type NetworkCredentialRuleV1 struct {
 
 func (x *NetworkCredentialRuleV1) Reset() {
 	*x = NetworkCredentialRuleV1{}
-	mi := &file_net_policy_v1_policy_proto_msgTypes[1]
+	mi := &file_net_policy_v1_policy_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -494,7 +562,7 @@ func (x *NetworkCredentialRuleV1) String() string {
 func (*NetworkCredentialRuleV1) ProtoMessage() {}
 
 func (x *NetworkCredentialRuleV1) ProtoReflect() protoreflect.Message {
-	mi := &file_net_policy_v1_policy_proto_msgTypes[1]
+	mi := &file_net_policy_v1_policy_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -507,7 +575,7 @@ func (x *NetworkCredentialRuleV1) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NetworkCredentialRuleV1.ProtoReflect.Descriptor instead.
 func (*NetworkCredentialRuleV1) Descriptor() ([]byte, []int) {
-	return file_net_policy_v1_policy_proto_rawDescGZIP(), []int{1}
+	return file_net_policy_v1_policy_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *NetworkCredentialRuleV1) GetRuleId() string {
@@ -548,7 +616,7 @@ type CredentialHeaderBindingV1 struct {
 
 func (x *CredentialHeaderBindingV1) Reset() {
 	*x = CredentialHeaderBindingV1{}
-	mi := &file_net_policy_v1_policy_proto_msgTypes[2]
+	mi := &file_net_policy_v1_policy_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -560,7 +628,7 @@ func (x *CredentialHeaderBindingV1) String() string {
 func (*CredentialHeaderBindingV1) ProtoMessage() {}
 
 func (x *CredentialHeaderBindingV1) ProtoReflect() protoreflect.Message {
-	mi := &file_net_policy_v1_policy_proto_msgTypes[2]
+	mi := &file_net_policy_v1_policy_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -573,7 +641,7 @@ func (x *CredentialHeaderBindingV1) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CredentialHeaderBindingV1.ProtoReflect.Descriptor instead.
 func (*CredentialHeaderBindingV1) Descriptor() ([]byte, []int) {
-	return file_net_policy_v1_policy_proto_rawDescGZIP(), []int{2}
+	return file_net_policy_v1_policy_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *CredentialHeaderBindingV1) GetHeaderName() string {
@@ -604,7 +672,7 @@ type NetworkCredentialDestinationV1 struct {
 
 func (x *NetworkCredentialDestinationV1) Reset() {
 	*x = NetworkCredentialDestinationV1{}
-	mi := &file_net_policy_v1_policy_proto_msgTypes[3]
+	mi := &file_net_policy_v1_policy_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -616,7 +684,7 @@ func (x *NetworkCredentialDestinationV1) String() string {
 func (*NetworkCredentialDestinationV1) ProtoMessage() {}
 
 func (x *NetworkCredentialDestinationV1) ProtoReflect() protoreflect.Message {
-	mi := &file_net_policy_v1_policy_proto_msgTypes[3]
+	mi := &file_net_policy_v1_policy_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -629,7 +697,7 @@ func (x *NetworkCredentialDestinationV1) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NetworkCredentialDestinationV1.ProtoReflect.Descriptor instead.
 func (*NetworkCredentialDestinationV1) Descriptor() ([]byte, []int) {
-	return file_net_policy_v1_policy_proto_rawDescGZIP(), []int{3}
+	return file_net_policy_v1_policy_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *NetworkCredentialDestinationV1) GetExactHost() string {
@@ -668,7 +736,7 @@ type EgressDestinationV1 struct {
 
 func (x *EgressDestinationV1) Reset() {
 	*x = EgressDestinationV1{}
-	mi := &file_net_policy_v1_policy_proto_msgTypes[4]
+	mi := &file_net_policy_v1_policy_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -680,7 +748,7 @@ func (x *EgressDestinationV1) String() string {
 func (*EgressDestinationV1) ProtoMessage() {}
 
 func (x *EgressDestinationV1) ProtoReflect() protoreflect.Message {
-	mi := &file_net_policy_v1_policy_proto_msgTypes[4]
+	mi := &file_net_policy_v1_policy_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -693,7 +761,7 @@ func (x *EgressDestinationV1) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EgressDestinationV1.ProtoReflect.Descriptor instead.
 func (*EgressDestinationV1) Descriptor() ([]byte, []int) {
-	return file_net_policy_v1_policy_proto_rawDescGZIP(), []int{4}
+	return file_net_policy_v1_policy_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *EgressDestinationV1) GetDestination() isEgressDestinationV1_Destination {
@@ -771,7 +839,7 @@ var File_net_policy_v1_policy_proto protoreflect.FileDescriptor
 
 const file_net_policy_v1_policy_proto_rawDesc = "" +
 	"\n" +
-	"\x1anet/policy/v1/policy.proto\x12\x13space.net.policy.v1\"\xd5\x04\n" +
+	"\x1anet/policy/v1/policy.proto\x12\x13space.net.policy.v1\"\xdb\x05\n" +
 	"\x0fNetworkPolicyV1\x12C\n" +
 	"\aversion\x18\x01 \x01(\x0e2).space.net.policy.v1.NetworkPolicyVersionR\aversion\x12\\\n" +
 	"\x15egress_default_action\x18\x02 \x01(\x0e2(.space.net.policy.v1.EgressDefaultActionR\x13egressDefaultAction\x12>\n" +
@@ -779,7 +847,12 @@ const file_net_policy_v1_policy_proto_rawDesc = "" +
 	"\x04deny\x18\x04 \x03(\v2(.space.net.policy.v1.EgressDestinationV1R\x04deny\x12O\n" +
 	"\x10tls_interception\x18\x05 \x01(\x0e2$.space.net.policy.v1.TlsInterceptionR\x0ftlsInterception\x12f\n" +
 	"\x18network_credential_rules\x18\x06 \x03(\v2,.space.net.policy.v1.NetworkCredentialRuleV1R\x16networkCredentialRules\x12h\n" +
-	"\x1btls_interception_exemptions\x18\a \x03(\v2(.space.net.policy.v1.EgressDestinationV1R\x19tlsInterceptionExemptions\"\xe1\x02\n" +
+	"\x1btls_interception_exemptions\x18\a \x03(\v2(.space.net.policy.v1.EgressDestinationV1R\x19tlsInterceptionExemptions\x12\x83\x01\n" +
+	"&tls_interception_exemptions_with_ports\x18\b \x03(\v2/.space.net.policy.v1.TlsInterceptionExemptionV1R\"tlsInterceptionExemptionsWithPorts\"\x8a\x01\n" +
+	"\x1aTlsInterceptionExemptionV1\x12J\n" +
+	"\vdestination\x18\x01 \x01(\v2(.space.net.policy.v1.EgressDestinationV1R\vdestination\x12\x17\n" +
+	"\x04port\x18\x02 \x01(\rH\x00R\x04port\x88\x01\x01B\a\n" +
+	"\x05_port\"\xe1\x02\n" +
 	"\x17NetworkCredentialRuleV1\x12\x17\n" +
 	"\arule_id\x18\x01 \x01(\tR\x06ruleId\x12U\n" +
 	"\vdestination\x18\x02 \x01(\v23.space.net.policy.v1.NetworkCredentialDestinationV1R\vdestination\x12l\n" +
@@ -847,7 +920,7 @@ func file_net_policy_v1_policy_proto_rawDescGZIP() []byte {
 }
 
 var file_net_policy_v1_policy_proto_enumTypes = make([]protoimpl.EnumInfo, 7)
-var file_net_policy_v1_policy_proto_msgTypes = make([]protoimpl.MessageInfo, 5)
+var file_net_policy_v1_policy_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
 var file_net_policy_v1_policy_proto_goTypes = []any{
 	(EgressDefaultAction)(0),               // 0: space.net.policy.v1.EgressDefaultAction
 	(NetworkPolicyVersion)(0),              // 1: space.net.policy.v1.NetworkPolicyVersion
@@ -857,27 +930,30 @@ var file_net_policy_v1_policy_proto_goTypes = []any{
 	(TlsInterception)(0),                   // 5: space.net.policy.v1.TlsInterception
 	(NetworkCredentialHttpMethodV1)(0),     // 6: space.net.policy.v1.NetworkCredentialHttpMethodV1
 	(*NetworkPolicyV1)(nil),                // 7: space.net.policy.v1.NetworkPolicyV1
-	(*NetworkCredentialRuleV1)(nil),        // 8: space.net.policy.v1.NetworkCredentialRuleV1
-	(*CredentialHeaderBindingV1)(nil),      // 9: space.net.policy.v1.CredentialHeaderBindingV1
-	(*NetworkCredentialDestinationV1)(nil), // 10: space.net.policy.v1.NetworkCredentialDestinationV1
-	(*EgressDestinationV1)(nil),            // 11: space.net.policy.v1.EgressDestinationV1
+	(*TlsInterceptionExemptionV1)(nil),     // 8: space.net.policy.v1.TlsInterceptionExemptionV1
+	(*NetworkCredentialRuleV1)(nil),        // 9: space.net.policy.v1.NetworkCredentialRuleV1
+	(*CredentialHeaderBindingV1)(nil),      // 10: space.net.policy.v1.CredentialHeaderBindingV1
+	(*NetworkCredentialDestinationV1)(nil), // 11: space.net.policy.v1.NetworkCredentialDestinationV1
+	(*EgressDestinationV1)(nil),            // 12: space.net.policy.v1.EgressDestinationV1
 }
 var file_net_policy_v1_policy_proto_depIdxs = []int32{
 	1,  // 0: space.net.policy.v1.NetworkPolicyV1.version:type_name -> space.net.policy.v1.NetworkPolicyVersion
 	0,  // 1: space.net.policy.v1.NetworkPolicyV1.egress_default_action:type_name -> space.net.policy.v1.EgressDefaultAction
-	11, // 2: space.net.policy.v1.NetworkPolicyV1.allow:type_name -> space.net.policy.v1.EgressDestinationV1
-	11, // 3: space.net.policy.v1.NetworkPolicyV1.deny:type_name -> space.net.policy.v1.EgressDestinationV1
+	12, // 2: space.net.policy.v1.NetworkPolicyV1.allow:type_name -> space.net.policy.v1.EgressDestinationV1
+	12, // 3: space.net.policy.v1.NetworkPolicyV1.deny:type_name -> space.net.policy.v1.EgressDestinationV1
 	5,  // 4: space.net.policy.v1.NetworkPolicyV1.tls_interception:type_name -> space.net.policy.v1.TlsInterception
-	8,  // 5: space.net.policy.v1.NetworkPolicyV1.network_credential_rules:type_name -> space.net.policy.v1.NetworkCredentialRuleV1
-	11, // 6: space.net.policy.v1.NetworkPolicyV1.tls_interception_exemptions:type_name -> space.net.policy.v1.EgressDestinationV1
-	10, // 7: space.net.policy.v1.NetworkCredentialRuleV1.destination:type_name -> space.net.policy.v1.NetworkCredentialDestinationV1
-	9,  // 8: space.net.policy.v1.NetworkCredentialRuleV1.credential_header_bindings:type_name -> space.net.policy.v1.CredentialHeaderBindingV1
-	6,  // 9: space.net.policy.v1.NetworkCredentialRuleV1.supported_http_methods:type_name -> space.net.policy.v1.NetworkCredentialHttpMethodV1
-	10, // [10:10] is the sub-list for method output_type
-	10, // [10:10] is the sub-list for method input_type
-	10, // [10:10] is the sub-list for extension type_name
-	10, // [10:10] is the sub-list for extension extendee
-	0,  // [0:10] is the sub-list for field type_name
+	9,  // 5: space.net.policy.v1.NetworkPolicyV1.network_credential_rules:type_name -> space.net.policy.v1.NetworkCredentialRuleV1
+	12, // 6: space.net.policy.v1.NetworkPolicyV1.tls_interception_exemptions:type_name -> space.net.policy.v1.EgressDestinationV1
+	8,  // 7: space.net.policy.v1.NetworkPolicyV1.tls_interception_exemptions_with_ports:type_name -> space.net.policy.v1.TlsInterceptionExemptionV1
+	12, // 8: space.net.policy.v1.TlsInterceptionExemptionV1.destination:type_name -> space.net.policy.v1.EgressDestinationV1
+	11, // 9: space.net.policy.v1.NetworkCredentialRuleV1.destination:type_name -> space.net.policy.v1.NetworkCredentialDestinationV1
+	10, // 10: space.net.policy.v1.NetworkCredentialRuleV1.credential_header_bindings:type_name -> space.net.policy.v1.CredentialHeaderBindingV1
+	6,  // 11: space.net.policy.v1.NetworkCredentialRuleV1.supported_http_methods:type_name -> space.net.policy.v1.NetworkCredentialHttpMethodV1
+	12, // [12:12] is the sub-list for method output_type
+	12, // [12:12] is the sub-list for method input_type
+	12, // [12:12] is the sub-list for extension type_name
+	12, // [12:12] is the sub-list for extension extendee
+	0,  // [0:12] is the sub-list for field type_name
 }
 
 func init() { file_net_policy_v1_policy_proto_init() }
@@ -885,8 +961,9 @@ func file_net_policy_v1_policy_proto_init() {
 	if File_net_policy_v1_policy_proto != nil {
 		return
 	}
-	file_net_policy_v1_policy_proto_msgTypes[3].OneofWrappers = []any{}
-	file_net_policy_v1_policy_proto_msgTypes[4].OneofWrappers = []any{
+	file_net_policy_v1_policy_proto_msgTypes[1].OneofWrappers = []any{}
+	file_net_policy_v1_policy_proto_msgTypes[4].OneofWrappers = []any{}
+	file_net_policy_v1_policy_proto_msgTypes[5].OneofWrappers = []any{
 		(*EgressDestinationV1_Ip)(nil),
 		(*EgressDestinationV1_Cidr)(nil),
 		(*EgressDestinationV1_Domain)(nil),
@@ -898,7 +975,7 @@ func file_net_policy_v1_policy_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_net_policy_v1_policy_proto_rawDesc), len(file_net_policy_v1_policy_proto_rawDesc)),
 			NumEnums:      7,
-			NumMessages:   5,
+			NumMessages:   6,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

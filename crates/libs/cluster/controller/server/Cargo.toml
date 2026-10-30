@@ -85,6 +85,7 @@ pplx-space-api = { workspace = true, features = ["test-hooks"] }
 pplx-space-common-core = { workspace = true, features = ["sqlx", "test-hooks"] }
 pplx-space-common-svc = { workspace = true, features = ["test-support"] }
 pplx-space-metrics = { workspace = true, features = ["test-capture"] }
+pplx-space-net-common = { workspace = true }
 pplx-space-observability = { workspace = true, features = ["test-capture"] }
 axum = { workspace = true }
 bytes = { workspace = true }

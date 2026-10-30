@@ -487,7 +487,7 @@ fn on_demand_request<'a>(
 fn test_runtime<'a>(
     sandbox_owner: &'a SandboxOwner,
     auto_lifecycle_json: &'a str,
-    network_policy_json: &'a str,
+    network_policy_json: &'a NetworkPolicyAnnotation,
 ) -> SandboxRuntimePodMetadata<'a> {
     SandboxRuntimePodMetadata {
         sandbox_owner,
@@ -856,10 +856,10 @@ fn test_auto_lifecycle_json() -> String {
     serde_json::to_string(&policy).expect("auto lifecycle policy should serialize")
 }
 
-fn test_network_policy_json() -> String {
+fn test_network_policy_json() -> NetworkPolicyAnnotation {
     let policy = pplx_space_net_common::NetworkPolicyV1::default();
 
-    serde_json::to_string(&policy).expect("network policy should serialize")
+    NetworkPolicyAnnotation::encode(&policy).expect("network policy should encode")
 }
 
 #[test]
@@ -2504,7 +2504,7 @@ fn pooled_pod_renders_node_group_placement() {
 fn placement_test_runtime<'a>(
     sandbox_owner: &'a SandboxOwner,
     auto_lifecycle_json: &'a str,
-    network_policy_json: &'a str,
+    network_policy_json: &'a NetworkPolicyAnnotation,
 ) -> SandboxRuntimePodMetadata<'a> {
     SandboxRuntimePodMetadata {
         sandbox_owner,

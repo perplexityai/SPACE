@@ -12,12 +12,19 @@ Set `SPACE_TLS_INTERCEPTION_EXEMPTIONS` to the same JSON array on both the API
 service and the cluster-controller process that executes queued operations:
 
 ```json
-[{"domain":"relay.example.test"},{"wildcard_domain":"*.relay.example.test"}]
+[{"domain":"relay.example.test"},{"wildcard_domain":"*.relay.example.test"},
+ {"domain":"push.example.test","port":5228}]
 ```
+
+An entry without `port` exempts every destination port. An entry with `port`
+(1 to 65535) exempts only connections to that destination port; the same host
+on any other port keeps the policy's interception mode. An all-port entry and a
+port-scoped entry for the same host are distinct, not duplicates.
 
 Both processes validate this configuration at initialization, including
 cluster-controller standbys before leader election. Unset means disabled;
-empty, malformed, invalid-domain, and non-hostname destinations fail startup.
+empty, malformed, invalid-domain, invalid-port, and non-hostname destinations
+fail startup.
 There is no built-in destination list. Wildcards match leading-label suffixes,
 not arbitrary patterns, and do not match the suffix's apex domain.
 
@@ -42,7 +49,23 @@ other resolvers, expired attribution, or cached addresses without observed DNS
 can leave interception enabled.
 
 Before enabling, all policy readers and worker gateways must support
-`tls_interception_exemptions`. Removing the environment variable from both
-processes and rolling their replicas stops future composition but does not
+`tls_interception_exemptions`, and before configuring any `port` they must also
+support port-scoped exemptions, including the SPACE runtime shim that forwards
+a Kubernetes sandbox pod's policy. Older API and cluster-controller processes
+fail startup on a configured `port`, and older Rust JSON policy readers reject a
+policy that contains one. The pod annotation carries only all-port entries in
+`tls_interception_exemptions`; when any entry has a port, the complete ordered
+list is in `tls_interception_exemptions_with_ports`. Older lenient shims ignore
+the new key and keep intercepting port-scoped destinations. Strict shims that
+predate this encoding reject the new key, so cold creates using it fail until
+the shim is upgraded. Upgrade the shim and node-ctl first: a sandbox created
+or updated through an older one keeps intercepting its port-scoped
+destinations until its policy next changes. Older gateways
+do not read port-scoped exemptions from the protobuf policy, so they keep
+intercepting those destinations rather than exempting every port. Removing the
+environment variable from both processes and rolling their replicas stops future composition but does not
 remove exemptions already persisted in sandbox overrides; remove those
-explicitly to roll back existing sandboxes.
+explicitly to roll back existing sandboxes. Once a `port` is persisted, do not
+roll the API, internal API, cluster controller, credential store, template
+manager, or sandbox manager back to a version that cannot read port-scoped
+exemptions.
