@@ -1283,6 +1283,7 @@ pub mod reconciler {
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum PodEvidence {
+        Present,
         TerminalSucceeded,
         TerminalFailed,
         Unready,
@@ -1293,6 +1294,7 @@ pub mod reconciler {
     impl PodEvidence {
         pub const fn as_str(self) -> &'static str {
             match self {
+                Self::Present => "present",
                 Self::TerminalSucceeded => "terminal_succeeded",
                 Self::TerminalFailed => "terminal_failed",
                 Self::Unready => "unready",
@@ -1319,8 +1321,9 @@ pub mod reconciler {
     /// `deleted`, `suspended`, `quarantined`, or `deferred`. `mode`
     /// distinguishes dry-run planning from a committed live result.
     /// `from_lifecycle` is the closed sandbox lifecycle vocabulary and
-    /// `pod_evidence` is bounded by the reconciler's presence enum plus
-    /// `not_applicable` for non-pod classifier paths.
+    /// `pod_evidence` is bounded by the reconciler's presence enum, including
+    /// `present` for an expired create attempt whose live pod is cleanup work,
+    /// plus `not_applicable` for non-pod classifier paths.
     pub fn rows_classified(
         reason: ClassificationReason,
         outcome: ClassificationOutcome,

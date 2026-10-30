@@ -874,6 +874,21 @@ impl PublicOperationStore {
         complete_claimed_operation(&self.pool, input).await
     }
 
+    /// Renew the claim `claim_token` holds on `operation`, or report it lost.
+    ///
+    /// **Never waits on the operation's row lock.** The driver awaits this
+    /// with the execution suspended, and the execution can itself hold that
+    /// lock in an open transaction: a payload write (`update_claimed_payload_in_transaction`)
+    /// or a create compensation's teardown record. A blocking `UPDATE` would
+    /// wait on a transaction that can't progress until this returns. So a row
+    /// locked by anyone counts as still owned for this tick, as long as a plain
+    /// read (which takes no lock) still shows the claim; a claim another
+    /// claimant took is seen as lost on the next tick. A skipped tick doesn't
+    /// extend the lease, so a row held across ticks long enough for
+    /// `claimed_at` to go stale can be reclaimed once it's released; the
+    /// operation is re-driven, and the attempt that lost it records nothing.
+    /// The lock taken is the `FOR NO KEY UPDATE` a plain `UPDATE` takes, so a
+    /// foreign-key check against the row doesn't make a tick skip.
     pub async fn renew_claimed_operation(
         &self,
         claim_token: &str,
@@ -882,10 +897,15 @@ impl PublicOperationStore {
         let updated = sqlx::query(sql!(
             "UPDATE public_operations
              SET claimed_at = NOW(), updated_at = NOW()
-             WHERE operation_id = $1
-               AND claim_token = $2
-               AND claim_generation = $3
-               AND state = $4"
+             WHERE operation_id = (
+                 SELECT operation_id
+                   FROM public_operations
+                  WHERE operation_id = $1
+                    AND claim_token = $2
+                    AND claim_generation = $3
+                    AND state = $4
+                  FOR NO KEY UPDATE SKIP LOCKED
+             )"
         ))
         .bind(operation.id.as_uuid())
         .bind(claim_token)
@@ -894,7 +914,25 @@ impl PublicOperationStore {
         .execute(&self.pool)
         .await?
         .rows_affected();
-        Ok(updated == 1)
+        if updated == 1 {
+            return Ok(true);
+        }
+        Ok(sqlx::query_scalar::<_, bool>(sql!(
+            "SELECT EXISTS (
+                 SELECT 1
+                   FROM public_operations
+                  WHERE operation_id = $1
+                    AND claim_token = $2
+                    AND claim_generation = $3
+                    AND state = $4
+             )"
+        ))
+        .bind(operation.id.as_uuid())
+        .bind(claim_token)
+        .bind(operation.claim_generation)
+        .bind(OperationState::Running.as_str())
+        .fetch_one(&self.pool)
+        .await?)
     }
 
     pub async fn fail_claimed_operation(
@@ -1068,11 +1106,71 @@ pub enum ObservePublicOperationIdempotency {
     },
 }
 
+/// Record on a claimed create-compensation operation that its node teardown
+/// has run, so a later attempt only verifies it. Guarded by the claim: an
+/// attempt whose claim went stale records nothing and gets `false`. Runs in the
+/// caller's transaction, so it can be atomic with the write that makes the
+/// marker true.
+pub(crate) async fn mark_create_rollback_teardown_issued_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: OperationId,
+    claim_token: &str,
+    claim_generation: i64,
+) -> Result<bool, sqlx::Error> {
+    let updated = sqlx::query(sql!(
+        "UPDATE public_operations
+            SET payload_json = jsonb_set(
+                    payload_json, '{create_rollback_teardown_issued}', 'true'::jsonb
+                ),
+                updated_at = NOW()
+          WHERE operation_id = $1
+            AND claim_token = $2
+            AND claim_generation = $3
+            AND state = 'running'"
+    ))
+    .bind(operation_id.as_uuid())
+    .bind(claim_token)
+    .bind(claim_generation)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    Ok(updated == 1)
+}
+
+/// Whether a create's rollback still owns `target_id`: a
+/// `compensate_create_sandbox` on it is queued or running. Its create can't
+/// succeed until the compensation has removed the `deleting` row it left.
+pub(crate) async fn create_compensation_pending(
+    pool: &PgPool,
+    org_id: OrgId,
+    target_id: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(sql!(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM public_operations
+             WHERE org_id = $1
+               AND target_type = $2
+               AND target_id = $3
+               AND kind = $4
+               AND state IN ($5, $6)
+         )"
+    ))
+    .bind(org_id.as_uuid())
+    .bind(OperationTargetType::Sandbox.as_str())
+    .bind(target_id)
+    .bind(OperationKind::CompensateCreateSandbox.as_str())
+    .bind(OperationState::Queued.as_str())
+    .bind(OperationState::Running.as_str())
+    .fetch_one(pool)
+    .await
+}
+
 /// Claim an operation this transaction just created, as
 /// [`PublicOperationStore::claim_operations`] would: `running`, one attempt,
 /// a fresh claim token and generation, and a `claimed` event. Committed with
 /// the create, so no other claimant ever sees the operation queued.
-async fn claim_created_operation_tx(
+pub(crate) async fn claim_created_operation_tx(
     tx: &mut Transaction<'_, Postgres>,
     operation_id: OperationId,
 ) -> Result<(String, ClaimedPublicOperation), PublicOperationStoreError> {
@@ -1417,10 +1515,15 @@ pub struct ClaimPublicOperations<'a> {
     pub claimable_kinds: &'a [OperationKind],
 }
 
-/// Sandbox deletes and kills: operations that tear down a sandbox's VM and
-/// so free capacity, which the dispatcher keeps execution slots for.
-pub const TEARDOWN_KINDS: &[OperationKind] =
-    &[OperationKind::DeleteSandbox, OperationKind::KillSandbox];
+/// Sandbox deletes and kills, and create compensation: operations that tear
+/// down a sandbox's VM and so free capacity, which the dispatcher keeps
+/// execution slots for. A compensation's guest is already running, so it
+/// waits on no organization's limit on other work.
+pub const TEARDOWN_KINDS: &[OperationKind] = &[
+    OperationKind::DeleteSandbox,
+    OperationKind::KillSandbox,
+    OperationKind::CompensateCreateSandbox,
+];
 
 /// How many operations one claim may take.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2225,9 +2328,17 @@ async fn claim_operations(
     // sandbox can start beside its old execution; otherwise the
     // earliest-requested one if it is due; otherwise the earliest due delete
     // with no create requested before it, so a delete is not stuck behind
-    // work in retry backoff but never overtakes a create. Only sandboxes with
-    // more than one active operation can hold anything back, so the window
-    // pass reads just those, in one sort. Forks name
+    // work in retry backoff but never overtakes a create. With no live or
+    // stale claim on the sandbox, the earliest due `compensate_create_sandbox`
+    // goes ahead of both of those last two: it exists only because a
+    // create's rollback moved the row to `deleting`, and that create can't
+    // succeed until the compensation has removed the row. The create waits on
+    // it as workflow progress (`create_compensation_pending`), so behind the
+    // create the compensation would never start: a due create runs first and
+    // requeues, and while it's in backoff only a free delete can pass it. The
+    // two rules ship and revert together. Only
+    // sandboxes with more than one active operation can hold anything back,
+    // so the window pass reads just those, in one sort. Forks name
     // their source by a different id form and keep their own lifecycle lock,
     // so they stay outside the key. With `$11` unset (the kill switch)
     // `blocked` is empty. Teardowns (`$14`: deletes and kills) and other work
@@ -2302,6 +2413,8 @@ async fn claim_operations(
          ),
          ranked AS (
              SELECT operation_id,
+                    org_id,
+                    target_id,
                     ROW_NUMBER() OVER queue AS position,
                     FIRST_VALUE(due) OVER queue AS head_due,
                     BOOL_OR(live) OVER whole AS sandbox_live,
@@ -2311,7 +2424,11 @@ async fn claim_operations(
                         AND due
                         AND NOT COALESCE(BOOL_OR(kind = $10) OVER earlier, FALSE)
                         AND NOT COALESCE(BOOL_OR(kind = $9 AND due) OVER earlier, FALSE)
-                        AS first_free_delete
+                        AS first_free_delete,
+                    kind = $18
+                        AND due
+                        AND NOT COALESCE(BOOL_OR(kind = $18 AND due) OVER earlier, FALSE)
+                        AS first_due_compensation
              FROM active
              WINDOW queue AS (
                         PARTITION BY org_id, target_id ORDER BY requested_at, operation_id
@@ -2319,13 +2436,22 @@ async fn claim_operations(
                     whole AS (queue ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING),
                     earlier AS (queue ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)
          ),
+         flagged AS (
+             SELECT ranked.*,
+                    BOOL_OR(first_due_compensation) OVER (
+                        PARTITION BY org_id, target_id
+                    ) AS sandbox_compensating
+             FROM ranked
+         ),
          blocked AS (
              SELECT operation_id
-             FROM ranked
+             FROM flagged
              WHERE sandbox_live
                 OR (sandbox_stale AND NOT first_stale)
-                OR (NOT sandbox_stale AND head_due AND position > 1)
-                OR (NOT sandbox_stale AND NOT head_due AND NOT first_free_delete)
+                OR (NOT sandbox_stale AND sandbox_compensating AND NOT first_due_compensation)
+                OR (NOT sandbox_stale AND NOT sandbox_compensating AND head_due AND position > 1)
+                OR (NOT sandbox_stale AND NOT sandbox_compensating AND NOT head_due
+                    AND NOT first_free_delete)
          ),
          org_live AS (
              SELECT org_id, COUNT(*) AS live
@@ -2542,6 +2668,7 @@ async fn claim_operations(
             .map_or(0, |limit| i64::from(limit.headroom)),
     )
     .bind(ADMISSION_CLAIM_TOKEN_PREFIX)
+    .bind(OperationKind::CompensateCreateSandbox.as_str())
     .fetch_all(&mut *tx)
     .await?;
 

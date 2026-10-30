@@ -543,7 +543,100 @@ async fn deleting_row_retries_through_executor() -> TestResult {
 
     assert_eq!(result.state, OperationState::Queued);
     assert_eq!(result.retry_after, Some(CREATE_RETRY_AFTER));
+    assert_eq!(
+        result.requeue_reason,
+        PublicOperationRequeueReason::TransientFailure,
+        "with no compensation pending, a `deleting` row spends an attempt"
+    );
 
+    Ok(())
+}
+
+async fn queue_compensation_for(
+    pool: &PgPool,
+    org_id: OrgId,
+    sandbox_id: SandboxId,
+) -> TestResult<OperationId> {
+    let public_sandbox_id = PublicSandboxId::from(sandbox_id);
+    let target_id = public_sandbox_id.to_string();
+    let created = crate::public_operations::PublicOperationStore::new(pool.clone())
+        .create_operation(crate::public_operations::CreatePublicOperation {
+            org_id,
+            actor_user_id: None,
+            api_product: ApiProduct::Native,
+            kind: OperationKind::CompensateCreateSandbox,
+            target_type: Some(OperationTargetType::Sandbox),
+            target_id: Some(&target_id),
+            payload_json: SandboxLifecycleOperationPayload {
+                sandbox_id: public_sandbox_id,
+                action: SandboxLifecycleAction::Delete,
+                rollback: None,
+                create_rollback_fence: None,
+                create_rollback_teardown_issued: false,
+                wake_activity: None,
+            }
+            .into_json(),
+            idempotency: None,
+            traceparent: None,
+        })
+        .await?;
+    match created {
+        crate::public_operations::CreatePublicOperationResult::Created(id) => Ok(id),
+        other => Err(format!("compensation was not created: {other:?}").into()),
+    }
+}
+
+/// A create whose rollback left the row `deleting` waits for that rollback
+/// without spending its retry budget, so it is still retrying when the
+/// compensation removes the row and the next attempt creates it again. Only
+/// a compensation on this sandbox that is still queued or running counts.
+#[tokio::test]
+async fn a_create_waits_on_its_pending_compensation_without_spending_attempts() -> TestResult {
+    let db = pg_test_db().await?;
+    let org_id = seed_org(&db.pool).await?;
+    let user_id = seed_user(&db.pool, org_id).await?;
+    let seed = |lifecycle| SandboxSeed {
+        org_id,
+        user_id,
+        lifecycle,
+        placement: SeedSandboxPlacement::Unplaced,
+    };
+    let sandbox_id = seed_sandbox(&db.pool, seed(SandboxLifecycle::Deleting)).await?;
+    // Another sandbox's pending compensation is not this create's.
+    let other = seed_sandbox(&db.pool, seed(SandboxLifecycle::Deleting)).await?;
+    queue_compensation_for(&db.pool, org_id, other).await?;
+    let compensation = queue_compensation_for(&db.pool, org_id, sandbox_id).await?;
+    let executor =
+        CreateSandboxOperationExecutor::new(db.pool.clone(), direct_sandbox_controller(&db.pool));
+    let operation = claimed_create_operation_for(sandbox_id, org_id, user_id);
+
+    let waiting = executor.execute(&operation).await;
+    assert_eq!(waiting.state, OperationState::Queued);
+    assert_eq!(
+        waiting.requeue_reason,
+        PublicOperationRequeueReason::WorkflowProgress
+    );
+
+    for state in [OperationState::Running, OperationState::Succeeded] {
+        sqlx::query(sql!(
+            "UPDATE public_operations SET state = $2 WHERE operation_id = $1"
+        ))
+        .bind(compensation.as_uuid())
+        .bind(state.as_str())
+        .execute(&db.pool)
+        .await?;
+        let result = executor.execute(&operation).await;
+        let expected = if state == OperationState::Running {
+            PublicOperationRequeueReason::WorkflowProgress
+        } else {
+            // Finished but the row is still there: the rollback didn't remove
+            // it, so the create retries as before, even though another
+            // sandbox's compensation is still pending.
+            PublicOperationRequeueReason::TransientFailure
+        };
+        assert_eq!(result.state, OperationState::Queued, "{state:?}");
+        assert_eq!(result.requeue_reason, expected, "{state:?}");
+    }
     Ok(())
 }
 
@@ -569,7 +662,7 @@ async fn existing_rows_are_classified_exhaustively_through_executor() -> TestRes
         (
             SandboxLifecycle::Creating,
             SeedSandboxPlacement::OnNode(NodeId::new()),
-            OperationState::Succeeded,
+            OperationState::Queued,
         ),
         (
             SandboxLifecycle::Starting,
@@ -880,6 +973,48 @@ fn create_operation_payload_is_wire_compatible_with_old_shape() {
     );
 }
 
+#[test]
+fn lifecycle_operation_payload_is_wire_compatible_with_old_shape() {
+    let sandbox_id = PublicSandboxId::new();
+    let ordinary = SandboxLifecycleOperationPayload {
+        sandbox_id,
+        action: SandboxLifecycleAction::Delete,
+        rollback: None,
+        create_rollback_fence: None,
+        create_rollback_teardown_issued: false,
+        wake_activity: None,
+    };
+    let ordinary_value = ordinary.into_json();
+    assert!(
+        ordinary_value.get("create_rollback_fence").is_none(),
+        "user DELETE payloads must remain byte-compatible with old consumers"
+    );
+
+    let old_shape = serde_json::json!({
+        "sandbox_id": sandbox_id,
+        "action": "delete"
+    });
+    let decoded: SandboxLifecycleOperationPayload = serde_json::from_value(old_shape).unwrap();
+    assert!(decoded.create_rollback_fence.is_none());
+
+    let compensation = SandboxLifecycleOperationPayload {
+        sandbox_id,
+        action: SandboxLifecycleAction::Delete,
+        rollback: None,
+        create_rollback_teardown_issued: false,
+        create_rollback_fence: Some(CreateRollbackExecutionFence::Direct {
+            node_id: NodeId::new(),
+            route_identity: None,
+        }),
+        wake_activity: None,
+    }
+    .into_json();
+    assert!(
+        compensation.get("create_rollback_fence").is_some(),
+        "create compensation must persist the execution fence it re-proves on every attempt"
+    );
+}
+
 /// The wake payload as executors from before `wake_activity` parse it.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -899,6 +1034,8 @@ fn wake_payload_without_an_activity_is_wire_compatible_with_old_shape() {
             action: SandboxLifecycleAction::Wake,
             rollback: None,
             wake_activity,
+            create_rollback_fence: None,
+            create_rollback_teardown_issued: false,
         }
         .into_json()
     };
@@ -1294,6 +1431,8 @@ fn claimed_delete_operation(
             action: SandboxLifecycleAction::Delete,
             rollback: None,
             wake_activity: None,
+            create_rollback_fence: None,
+            create_rollback_teardown_issued: false,
         })
         .expect("delete payload serializes"),
         attempts: 1,
@@ -1631,5 +1770,149 @@ async fn an_upload_caught_at_the_locked_check_requeues_the_delete() -> TestResul
     let finished = executor.execute(&operation).await;
     assert_eq!(finished.state, OperationState::Succeeded);
     assert!(fetch_sandbox(&db.pool, sandbox_id).await?.is_none());
+    Ok(())
+}
+
+/// Create compensation whose sandbox row is already gone still has to reach the
+/// node. A best-effort user DELETE retires the row even when its node call
+/// failed, so "the row is gone" says nothing about the guest; on the direct
+/// substrate nothing else would ever tear it down. The fence here names a node
+/// with no row, so reaching it fails, and the operation must not report success.
+///
+/// The control: an ordinary user DELETE of a missing row is still an idempotent
+/// success, so the compensation result above is not just a broken executor.
+#[tokio::test]
+async fn compensation_for_a_missing_row_does_not_report_done_without_the_node() -> TestResult {
+    let db = pg_test_db().await?;
+    let org_id = seed_org(&db.pool).await?;
+    let sandbox_id = PublicSandboxId::from(SandboxId::new());
+    let executor = SandboxLifecycleOperationExecutor::new(
+        db.pool.clone(),
+        direct_sandbox_controller(&db.pool),
+    );
+    let operation = |kind, fence| ClaimedPublicOperation {
+        id: OperationId::new(),
+        org_id,
+        actor_user_id: None,
+        api_product: ApiProduct::Native,
+        kind,
+        target_type: Some(OperationTargetType::Sandbox),
+        target_id: Some(sandbox_id.to_string()),
+        payload: SandboxLifecycleOperationPayload {
+            sandbox_id,
+            action: SandboxLifecycleAction::Delete,
+            rollback: None,
+            create_rollback_fence: fence,
+            create_rollback_teardown_issued: false,
+            wake_activity: None,
+        }
+        .into_json(),
+        attempts: 1,
+        claim_generation: 1,
+        traceparent: None,
+        age_at_first_claim_secs: None,
+    };
+
+    let compensation = executor
+        .execute(&operation(
+            OperationKind::CompensateCreateSandbox,
+            Some(CreateRollbackExecutionFence::Direct {
+                node_id: NodeId::new(),
+                route_identity: None,
+            }),
+        ))
+        .await;
+    assert_ne!(
+        compensation.state,
+        OperationState::Succeeded,
+        "compensation reported a teardown it never confirmed: {}",
+        compensation.progress_message
+    );
+
+    let user_delete = executor
+        .execute(&operation(OperationKind::DeleteSandbox, None))
+        .await;
+    assert_eq!(user_delete.state, OperationState::Succeeded);
+    Ok(())
+}
+
+/// A compensation that finds its sandbox already moved on (here a stop that
+/// landed first) declines without a teardown. It succeeds, but its result
+/// goes out on the tenant's sandbox lifecycle stream, so it must report the
+/// state the sandbox is in, `stopped`, not `deleted`. The result is stored
+/// and read back as a typed `PublicOperationResult`, so it must decode as one.
+#[tokio::test]
+async fn a_declined_compensation_reports_the_sandboxs_current_state() -> TestResult {
+    let db = pg_test_db().await?;
+    let org_id = seed_org(&db.pool).await?;
+    let user_id = seed_user(&db.pool, org_id).await?;
+    let sandbox_id = seed_sandbox(
+        &db.pool,
+        SandboxSeed {
+            org_id,
+            user_id,
+            lifecycle: SandboxLifecycle::Stopped,
+            placement: SeedSandboxPlacement::Unplaced,
+        },
+    )
+    .await?;
+    let public_sandbox_id = PublicSandboxId::from(sandbox_id);
+    let executor = SandboxLifecycleOperationExecutor::new(
+        db.pool.clone(),
+        direct_sandbox_controller(&db.pool),
+    );
+    let operation = ClaimedPublicOperation {
+        id: OperationId::new(),
+        org_id,
+        actor_user_id: None,
+        api_product: ApiProduct::Native,
+        kind: OperationKind::CompensateCreateSandbox,
+        target_type: Some(OperationTargetType::Sandbox),
+        target_id: Some(public_sandbox_id.to_string()),
+        payload: SandboxLifecycleOperationPayload {
+            sandbox_id: public_sandbox_id,
+            action: SandboxLifecycleAction::Delete,
+            rollback: None,
+            create_rollback_fence: Some(CreateRollbackExecutionFence::Direct {
+                node_id: NodeId::new(),
+                route_identity: None,
+            }),
+            create_rollback_teardown_issued: false,
+            wake_activity: None,
+        }
+        .into_json(),
+        attempts: 1,
+        claim_generation: 1,
+        traceparent: None,
+        age_at_first_claim_secs: None,
+    };
+
+    let result = executor.execute(&operation).await;
+    assert_eq!(
+        result.state,
+        OperationState::Succeeded,
+        "{}",
+        result.progress_message
+    );
+    assert!(
+        result.progress_message.contains("declined"),
+        "{}",
+        result.progress_message
+    );
+    let stored = result
+        .result_json
+        .expect("a succeeded operation stores a result");
+    match serde_json::from_value::<PublicOperationResult>(stored)? {
+        PublicOperationResult::Sandbox(sandbox) => {
+            assert_eq!(sandbox.state, SandboxLifecycleState::Stopped);
+        }
+        other => panic!("expected a sandbox result, got {other:?}"),
+    }
+    assert_eq!(
+        fetch_sandbox(&db.pool, sandbox_id)
+            .await?
+            .map(|sandbox| sandbox.lifecycle),
+        Some("stopped".to_string())
+    );
     Ok(())
 }

@@ -702,6 +702,10 @@ async fn post_action_stamps_write_every_stored_lifecycle_but_the_terminal_ones()
 
     let db = pg_test_db_with_max_connections(2).await?;
     let pool = &db.pool;
+    // The post-wake update is a fenced placement writer, so the node it attaches
+    // needs a `nodes` row: a node with none refuses as `MissingNode`.
+    let node_id = NodeId::new();
+    pplx_space_db_test_fixtures::insert_ready_worker_node(pool, node_id).await?;
     let writers = [Writer::Stamp, Writer::StateStamp, Writer::PostWake];
     let matrix = stored_lifecycle_matrix(writers, EXPECTED);
     assert_eq!(known_defects(&matrix), KNOWN_DEFECTS);
@@ -726,8 +730,7 @@ async fn post_action_stamps_write_every_stored_lifecycle_but_the_terminal_ones()
                 }
                 Writer::PostWake => {
                     let updated =
-                        update_and_fetch_post_wake_sandbox(pool, sandbox_id, Some(NodeId::new()))
-                            .await;
+                        update_and_fetch_post_wake_sandbox(pool, sandbox_id, Some(node_id)).await;
                     (Row::new("started", "on_node"), Some(updated.is_ok()))
                 }
             };
@@ -847,6 +850,8 @@ async fn native_start_overwrites_a_stopped_written_mid_flight_without_a_retry() 
             action: SandboxLifecycleAction::Start,
             rollback: None,
             wake_activity: None,
+            create_rollback_fence: None,
+            create_rollback_teardown_issued: false,
         }
         .into_json(),
         attempts: 1,
@@ -1197,6 +1202,8 @@ async fn a_system_wake_operation_runs_only_while_the_policy_allows_its_activity(
             action: SandboxLifecycleAction::Wake,
             rollback: None,
             wake_activity: recorded,
+            create_rollback_fence: None,
+            create_rollback_teardown_issued: false,
         }
         .into_json();
         let case = format!("{actor:?} {wake_on:?} {recorded:?}");

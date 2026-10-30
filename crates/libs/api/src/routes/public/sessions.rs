@@ -329,6 +329,8 @@ async fn enqueue_implicit_wake(
         action: SandboxLifecycleAction::Wake,
         rollback: None,
         wake_activity: record_activity.then_some(activity.into()),
+        create_rollback_fence: None,
+        create_rollback_teardown_issued: false,
     }
     .into_json();
     PublicOperationStore::new(pool.clone())

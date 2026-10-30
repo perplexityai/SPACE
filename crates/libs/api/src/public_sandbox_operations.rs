@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use axum::http::StatusCode;
 use pplx_space_common_core::types::{
-    NodeId, NodePoolName, SandboxId, SandboxLifecycle, SandboxLifecycleParseError,
+    NodePoolName, SandboxId, SandboxLifecycle, SandboxLifecycleParseError,
 };
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
@@ -23,8 +23,9 @@ use tracing::Instrument;
 
 use crate::controllers::sandbox::FederatedSandboxCreateContext;
 use crate::controllers::sandbox::lifecycle::SandboxAction;
-use crate::controllers::sandbox::{SandboxController, fetch_sandbox};
+use crate::controllers::sandbox::{CreateCompensation, SandboxController, fetch_sandbox};
 use crate::controllers::substrate::ExecutionActivityKind;
+use crate::controllers::substrate::{CompensationClaim, CreateRollbackExecutionFence};
 use crate::controllers::{ControllerError, SnapshotUploadCheck, SnapshotUploadInFlight};
 use crate::models::{
     CreateSandboxRequest as ControllerCreateSandboxRequest, SandboxMetadata,
@@ -152,6 +153,30 @@ pub struct SandboxLifecycleOperationPayload {
     /// must run this release before any producer sets it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wake_activity: Option<ImplicitWakeActivity>,
+    /// The exact execution a create started, present exactly on a
+    /// [`OperationKind::CompensateCreateSandbox`] operation.
+    ///
+    /// Create compensation must not use the user DELETE contract, which
+    /// retires the control-plane row after most unconfirmed node failures, and
+    /// a stable sandbox id alone does not name what to tear down: a restore or
+    /// wake can replace the execution while the operation is queued. So the
+    /// strict teardown re-proves this fence on every attempt.
+    ///
+    /// The strict teardown runs even when the `sandboxes` row is already gone:
+    /// another writer can retire it (a best-effort user DELETE against an
+    /// unreachable node) without the guest being gone.
+    ///
+    /// Skipped when absent, so user lifecycle payloads serialize exactly as
+    /// before and a controller that predates this field still decodes them.
+    /// Only compensation operations carry it, and claims select by kind, so a
+    /// controller that predates the kind never sees one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_rollback_fence: Option<CreateRollbackExecutionFence>,
+    /// Set on a compensation operation once an attempt's node teardown has run
+    /// (`mark_create_rollback_teardown_issued_tx`), so every later attempt
+    /// only verifies the teardown. Skipped when false, like the fence.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub create_rollback_teardown_issued: bool,
 }
 
 /// A session's activity, as the wake policy names it, recorded on the
@@ -471,7 +496,25 @@ impl CreateSandboxOperationExecutor {
                 ));
             }
             let lifecycle = existing.lifecycle.parse::<SandboxLifecycle>()?;
-            ensure_existing_row_confirms_create(existing.active_node_id, lifecycle)?;
+            // A rollback left this row `deleting` and queued its compensation.
+            // Waiting for that is progress, not a failed attempt: once the
+            // compensation removes the row, the next attempt creates the
+            // sandbox again. Only a `deleting` row with no compensation pending
+            // falls through to the retry below.
+            if lifecycle == SandboxLifecycle::Deleting
+                && crate::public_operations::create_compensation_pending(
+                    &self.pool,
+                    operation.org_id,
+                    &payload.sandbox_id.to_string(),
+                )
+                .await?
+            {
+                return Ok(PublicOperationExecutionResult::workflow_progress(
+                    "waiting for the create's rollback to remove the sandbox",
+                    CREATE_RETRY_AFTER,
+                ));
+            }
+            ensure_existing_row_confirms_create(lifecycle)?;
             return Ok(create_success_result(
                 payload.sandbox_id,
                 lifecycle,
@@ -571,7 +614,21 @@ impl SandboxLifecycleOperationExecutor {
         &self,
         operation: &ClaimedPublicOperation,
     ) -> PublicOperationExecutionResult {
-        match self.execute_inner(operation).await {
+        match self.execute_inner(operation, None).await {
+            Ok(result) => result,
+            Err(error) => error.into_result(operation),
+        }
+    }
+
+    /// [`Self::execute`] under the claim `claim_token` holds. A create
+    /// compensation records its teardown progress through it, so a later
+    /// attempt only verifies the teardown; without it, it records nothing.
+    pub async fn execute_claimed(
+        &self,
+        claim_token: &str,
+        operation: &ClaimedPublicOperation,
+    ) -> PublicOperationExecutionResult {
+        match self.execute_inner(operation, Some(claim_token)).await {
             Ok(result) => result,
             Err(error) => error.into_result(operation),
         }
@@ -656,6 +713,7 @@ impl SandboxLifecycleOperationExecutor {
     async fn execute_inner(
         &self,
         operation: &ClaimedPublicOperation,
+        claim_token: Option<&str>,
     ) -> Result<PublicOperationExecutionResult, SandboxLifecycleExecutionError> {
         let payload: SandboxLifecycleOperationPayload =
             serde_json::from_value(operation.payload.clone())
@@ -670,7 +728,13 @@ impl SandboxLifecycleOperationExecutor {
                 payload_sandbox_id: payload.sandbox_id,
             });
         }
-        if payload.action.operation_kind() != operation.kind {
+        let compensation = operation.kind == OperationKind::CompensateCreateSandbox;
+        let expected_kind = if compensation && payload.action == SandboxLifecycleAction::Delete {
+            OperationKind::CompensateCreateSandbox
+        } else {
+            payload.action.operation_kind()
+        };
+        if expected_kind != operation.kind {
             return Err(SandboxLifecycleExecutionError::KindMismatch {
                 operation_kind: operation.kind,
                 action: payload.action,
@@ -710,6 +774,66 @@ impl SandboxLifecycleOperationExecutor {
         }
 
         if payload.action == SandboxLifecycleAction::Delete {
+            // Compensation runs before the missing-row shortcut below. Its
+            // fence names the execution on its own, and the row can be gone for
+            // a reason that proves nothing about the guest: a best-effort user
+            // DELETE retires it even when the node call failed. On the direct
+            // substrate nothing else would ever reach that guest.
+            if compensation {
+                let fence = payload
+                    .create_rollback_fence
+                    .as_ref()
+                    .ok_or(SandboxLifecycleExecutionError::MissingCreateRollbackFence)?;
+                let claim = claim_token.map(|claim_token| CompensationClaim {
+                    operation_id: operation.id,
+                    claim_token: claim_token.to_string(),
+                    claim_generation: operation.claim_generation,
+                    teardown_issued: payload.create_rollback_teardown_issued,
+                });
+                let outcome = self
+                    .controller
+                    .delete_created_sandbox_for_rollback(
+                        &self.pool,
+                        sandbox_uuid.into(),
+                        fence,
+                        claim.as_ref(),
+                    )
+                    .await?;
+                let (state, message) = match outcome {
+                    CreateCompensation::TornDown => (
+                        SandboxLifecycleState::Deleted,
+                        "create compensation confirmed its teardown",
+                    ),
+                    // The sandbox left `deleting` before the teardown, so it
+                    // wasn't deleted. The tenant's lifecycle stream carries
+                    // this result, so report the state the sandbox is in now,
+                    // not `deleted`; only a row that's gone is reported deleted.
+                    CreateCompensation::Declined => {
+                        let observed = fetch_sandbox(&self.pool, sandbox_uuid.into()).await?;
+                        let state = match observed {
+                            Some(sandbox) => public_lifecycle_state(&sandbox.lifecycle)?,
+                            None => SandboxLifecycleState::Deleted,
+                        };
+                        (
+                            state,
+                            "create compensation declined: the sandbox left `deleting` \
+                             before its teardown",
+                        )
+                    }
+                };
+                return Ok(lifecycle_success_result(
+                    payload.sandbox_id,
+                    payload.action,
+                    state,
+                    serde_json::json!({
+                        "ok": true,
+                        "action": payload.action.as_str(),
+                        "sandbox_id": payload.sandbox_id.to_string(),
+                        "declined": outcome == CreateCompensation::Declined,
+                    }),
+                    message,
+                ));
+            }
             if sandbox.is_none() && operation.api_product != ApiProduct::Admin {
                 return Ok(lifecycle_success_result(
                     payload.sandbox_id,
@@ -951,11 +1075,14 @@ pub(crate) fn create_success_result(
 /// finish creating. The explicit match makes new lifecycle variants fail to
 /// compile until their create-operation disposition is chosen deliberately.
 fn ensure_existing_row_confirms_create(
-    active_node_id: Option<NodeId>,
     lifecycle: SandboxLifecycle,
 ) -> Result<(), CreateSandboxExecutionError> {
     match lifecycle {
-        SandboxLifecycle::Creating if active_node_id.is_none() => Err(
+        // Placement is not completion. A rollback can claim a live execution
+        // after its node was recorded but before create finalized, so treating
+        // `creating` + `active_node_id` as success lets a stale create claim
+        // race and report success for a sandbox already owned by compensation.
+        SandboxLifecycle::Creating => Err(
             CreateSandboxExecutionError::ExistingRowNotCreateSuccess(lifecycle),
         ),
         SandboxLifecycle::Deleting | SandboxLifecycle::Quarantined | SandboxLifecycle::Failed => {
@@ -964,7 +1091,6 @@ fn ensure_existing_row_confirms_create(
             ))
         }
         SandboxLifecycle::Created
-        | SandboxLifecycle::Creating
         | SandboxLifecycle::Starting
         | SandboxLifecycle::Started
         | SandboxLifecycle::Restoring
@@ -1155,6 +1281,8 @@ enum SandboxLifecycleExecutionError {
     MissingRollbackRequest,
     #[error("rollback action is missing snapshot_name")]
     MissingRollbackSnapshotName,
+    #[error("create rollback delete is missing its execution fence")]
+    MissingCreateRollbackFence,
     #[error("unsupported sandbox lifecycle action '{0}'")]
     UnsupportedAction(SandboxLifecycleAction),
     #[error("the sandbox's wake policy no longer lets the waiting session's activity wake it")]
@@ -1177,6 +1305,7 @@ impl SandboxLifecycleExecutionError {
             | Self::TargetOrgMismatch
             | Self::MissingRollbackRequest
             | Self::MissingRollbackSnapshotName
+            | Self::MissingCreateRollbackFence
             | Self::UnsupportedAction(_)
             | Self::UnknownLifecycle(_) => PublicOperationExecutionResult::failed(
                 "sandbox lifecycle operation is invalid",

@@ -1696,6 +1696,63 @@ async fn renewing_a_claim_prevents_stale_dispatcher_takeover() -> TestResult {
     Ok(())
 }
 
+/// The driver renews a claim with the execution suspended, and the execution
+/// can hold the operation's row lock in an open transaction. The property: a
+/// renewal never waits on that lock. It reports the claim it still holds as
+/// owned, and a claim it doesn't hold as lost, while the row is locked.
+#[tokio::test]
+async fn claim_renewal_does_not_wait_on_the_operations_row_lock() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = seed_org(&db.pool).await?;
+    let store = PublicOperationStore::new(db.pool.clone());
+    let target_id = PublicSandboxId::new().to_string();
+    let CreateClaimedPublicOperationResult::Claimed {
+        claim_token,
+        operation,
+    } = store
+        .create_claimed_operation(delete_operation_input(OrgId::from_uuid(org_id), &target_id))
+        .await?
+    else {
+        panic!("operation should be claimed");
+    };
+
+    let mut holder = db.pool.begin().await?;
+    sqlx::query(sql!(
+        "SELECT 1 FROM public_operations WHERE operation_id = $1 FOR UPDATE"
+    ))
+    .bind(operation.id.as_uuid())
+    .fetch_one(&mut *holder)
+    .await?;
+
+    let renew = |claim_token: String| {
+        let store = store.clone();
+        let operation = operation.clone();
+        async move {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                store.renew_claimed_operation(&claim_token, &operation),
+            )
+            .await
+        }
+    };
+    assert!(
+        renew(claim_token.clone())
+            .await
+            .expect("renewal must not wait on the row lock")?,
+        "the claim this caller holds stays owned while the row is locked"
+    );
+    assert!(
+        !renew("not-the-claim".to_string())
+            .await
+            .expect("renewal must not wait on the row lock")?,
+        "a claim this caller doesn't hold is lost, locked or not"
+    );
+    holder.rollback().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn terminal_fork_failure_scrubs_the_claimed_federated_grant() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
