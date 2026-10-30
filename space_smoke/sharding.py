@@ -161,6 +161,14 @@ _DURATION_SECONDS = {
         # the old pod held open by a stream, then its exit.
         "native_recovery.attached_stream_drains_through_data_plane_restart": 60,
         "native_recovery.command_survives_data_plane_restart": 15,
+        # Estimates until a bench run refreshes them. Inline execution: four
+        # VMs and a controller handover; four concurrent creates around an API
+        # rollout each way; a suspend and a wake; a wake re-driven after the
+        # 60 s claim staleness.
+        "native_recovery.inline_fallback_at_one_permit_loses_no_operation": 120,
+        "native_recovery.inline_load_survives_leader_failover": 150,
+        "native_recovery.inline_wake_survives_api_pod_kill": 150,
+        "native_recovery.inline_wake_waits_behind_queued_suspend": 60,
         "native_recovery.queued_create_survives_api_restart": 25,
         # One local Kind run: two controller rollouts around a 30 s outage.
         "native_recovery.stale_queued_work_expires_after_controller_outage": 75,

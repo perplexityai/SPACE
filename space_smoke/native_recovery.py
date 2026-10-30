@@ -429,14 +429,40 @@ class NativeRecoveryControl:
         before = self.begin_restart(name)
         self._wait(name, self._captures[name].replicas, replaced=before)
 
+    def kill(self, name: str) -> None:
+        """Force-delete `name`'s pods, as a node loss or OOM kill ends them:
+        no SIGTERM, no drain. Waits for the captured count of replacements.
+
+        Only the API is supported: its in-flight inline executions are what
+        a scenario abandons this way, to see the dispatcher re-drive them.
+        """
+        if name != "space-api":
+            raise ValueError("only API pod kills are supported")
+        self._fence()
+        pods = self._pods(name)
+        before = {pod["metadata"]["uid"] for pod in pods}
+        if not before:
+            raise SmokeConfigurationError(f"cannot kill absent {name} pods")
+        for pod in pods:
+            self._fence()
+            result = self.harness.kubectl(
+                "delete", "pod", pod["metadata"]["name"], "--grace-period=0", "--force",
+                "--wait=false", timeout=15,
+            )
+            if result.returncode:
+                raise SmokeConfigurationError(f"failed to kill a captured {name} pod")
+        self.context.record(f"{name}_killed_pods", len(before))
+        self._wait(name, self._captures[name].replicas, replaced=before)
+
     def begin_restart(self, name: str) -> set[str]:
         """Delete `name`'s pods without waiting for them, returning their UIDs.
 
         Each deleted pod gets SIGTERM and exits on its own schedule; a data
         plane serving an open stream keeps running until the stream ends.
+        Restarting every cluster-controller pod hands its leadership over.
         """
-        if name not in {"space-api", "space-data-plane"}:
-            raise ValueError("only API and data-plane restarts are supported")
+        if name not in {"space-api", "space-data-plane", "space-cluster-controller"}:
+            raise ValueError("only API, data-plane and controller restarts are supported")
         self._fence()
         pods = self._pods(name)
         before = {pod["metadata"]["uid"] for pod in pods}
