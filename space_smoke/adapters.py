@@ -680,6 +680,8 @@ UNSELECTED_POD_LABEL = "space.pplx.net/smoke-unselected"
 UNSELECTED_POD_IMAGE = "registry.k8s.io/pause:3.10"
 UNSELECTED_POD_READY_SECONDS = 120
 PUBLIC_API_DEPLOYMENT_SELECTOR = "app.kubernetes.io/name=space-api"
+# "true" runs the API on the Kubernetes substrate, "false" on the Direct one.
+K8S_CONTROL_PLANE_ENV = "SPACE_K8S_CONTROL_PLANE"
 KIND_REDIS_DEPLOYMENT = "space-redis"
 KIND_OBJECT_STORE_DEPLOYMENT = "space-object-store"
 KIND_OBJECT_STORE_POD_SELECTOR = "app.kubernetes.io/name=space-object-store"
@@ -5656,6 +5658,18 @@ ON CONFLICT (key_hash) DO NOTHING;
         if result.returncode != 0:
             raise SmokeConfigurationError(f"the bench runs no single Rust build: {result.detail()}")
         return result.stdout.strip()
+
+    def substrate(self) -> str:
+        # The API Deployment's SPACE_K8S_CONTROL_PLANE, which the bring-up
+        # reads too (space_kind_deployed_substrate, infra/space/kind/lib/substrate.sh).
+        name = self._public_api_deployment()
+        value = self._read_deployment_env(name, (K8S_CONTROL_PLANE_ENV,))[K8S_CONTROL_PLANE_ENV]
+        substrate = {"true": "kubernetes", "false": "direct"}.get(value or "")
+        if substrate is None:
+            raise SmokeConfigurationError(
+                f"{name} runs no known substrate: {K8S_CONTROL_PLANE_ENV}={value or 'unset'}"
+            )
+        return substrate
 
     # --- cluster-controller leader election ------------------------------------
     #

@@ -17,6 +17,11 @@
 #      vendor tree, including when they differ only from the tree this run
 #      stages (a kernel whose pin changed): check-node-vendor.sh runs, for
 #      real, before the stop and after the staging.
+#   5. So does a reused cluster running the other substrate (its API
+#      Deployment's SPACE_K8S_CONTROL_PLANE), which lib/substrate.sh refuses.
+#   6. With no Tilt running, an invalid substrate, or the Direct one without
+#      static storage credentials, is refused before the bring-up, which
+#      would create the cluster that the Tiltfile then refuses.
 #
 # External commands are PATH stubs, and up.sh runs from a shadow of the
 # checkout whose vendor installer and other cluster checks are stubs too; those
@@ -87,8 +92,14 @@ stub docker "case \"\$*\" in
 esac
 exit 0"
 stub kind "[[ \"\$*\" == 'get clusters' && -e '$work/cluster' ]] && echo space-local; exit 0"
+# Its API Deployment runs the Kubernetes substrate, or the Direct one when
+# $work/direct exists; the read also warns on stderr, as kubectl may on a
+# successful read, which is not part of the answer.
 stub kubectl "case \"\$*\" in
   *' get nodes '*) [[ -e '$work/cluster' ]] && printf 'space-local-worker\\nspace-local-builder\\n' ;;
+  *' get deployments -l app.kubernetes.io/name=space-api '*)
+    echo 'Warning: synthetic client warning' >&2
+    [[ -e '$work/direct' ]] && echo false || echo true ;;
   *) exit 99 ;;
 esac"
 stub openssl 'exit 0'
@@ -233,7 +244,31 @@ touch "$work/cluster"
 up_case vendor-copy-matches restart "" "SPACE_KIND_DATADOG_MODE=fakeintake"
 rm -f "$work/cluster"
 
+# 5: so does a reused cluster running the other substrate.
+touch "$work/cluster" "$work/direct"
+up_case other-substrate refuse "" "SPACE_KIND_DATADOG_MODE=fakeintake"
+grep -q "kind cluster space-local runs the direct substrate" "$work/other-substrate.out" \
+    || fail "other-substrate: the refusal must be lib/substrate.sh's" "$(cat "$work/other-substrate.out")"
+rm -f "$work/cluster" "$work/direct"
+
+# 6: with no Tilt running, a substrate the Tiltfile would refuse is refused
+# before the bring-up.
+no_tilt_case() {
+    local name="$1" message="$2" run_env out="$work/$1.out" rc=0
+    read -r -a run_env <<<"$3"
+    : >"$tilt_pidfile"
+    env -i "${base_env[@]}" SPACE_TILT_PIDFILE="$work/tilt.pid" SPACE_TILT_STATE_DIR="$work/state" \
+        "${run_env[@]}" bash "$shadow/infra/space/kind/scripts/up.sh" >"$out" 2>&1 || rc=$?
+    (( rc != 0 )) || fail "$name: the run must be refused" "$(cat "$out")"
+    grep -q "Refusing to run" "$out" \
+        && fail "$name: the refusal must come before the bring-up" "$(cat "$out")"
+    grep -qF "$message" "$out" || fail "$name: the refusal must say why" "$(cat "$out")"
+}
+no_tilt_case invalid-substrate "SPACE_KIND_SUBSTRATE must be kubernetes or direct" "SPACE_KIND_SUBSTRATE=Direct"
+no_tilt_case direct-exchange "SPACE_KIND_SUBSTRATE=direct needs SPACE_KIND_STORAGE_CREDENTIALS=static" \
+    "SPACE_KIND_SUBSTRATE=direct"
+
 if [ "$status" -eq 0 ]; then
-    echo "ok: up.sh restarts Tilt only for a changed setting Tilt reads, and refuses invalid settings, the release build with another profile and a reused cluster's drifted vendor copies before stopping it"
+    echo "ok: up.sh restarts Tilt only for a changed setting Tilt reads, and refuses invalid settings, the release build with another profile, a reused cluster's drifted vendor copies and a reused cluster on the other substrate before stopping it, and a substrate the Tiltfile would refuse before the bring-up"
 fi
 exit "$status"

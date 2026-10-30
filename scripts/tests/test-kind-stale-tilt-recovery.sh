@@ -162,17 +162,18 @@ TILT
         # Its own knob rather than SPACE_TILT_PIDFILE, so a value inherited
         # from the box running this test can never name a real pidfile.
         SPACE_TILT_PIDFILE="${TEST_TILT_PIDFILE:-$work/no-such-pidfile}"
-        unset SPACE_KIND_STORAGE_CREDENTIALS SPACE_KIND_RUST_BUILD
+        unset SPACE_KIND_STORAGE_CREDENTIALS SPACE_KIND_RUST_BUILD SPACE_KIND_SUBSTRATE
         source "$repo_root/scripts/tests/lib/bootstrap-kind-stack.sh"
 
         pgrep() { [[ -z "${TEST_PGREP_PIDS:-}" ]] || printf '%s\n' $TEST_PGREP_PIDS; return 0; }
         curl() { return 0; }
         lsof() { return 0; }
-        # The cluster runs the requested storage credentials mode and Rust
-        # build: the authority's label and the node services' env agree with
-        # the default, each storage DaemonSet's template holding no static key
-        # and running no pod, and the build deployed-rust-build.py reads is the
-        # default. Every other cluster read fails.
+        # The cluster runs the requested storage credentials mode, Rust build
+        # and substrate: the authority's label and the node services' env agree
+        # with the default, each storage DaemonSet's template holding no static
+        # key and running no pod, the build deployed-rust-build.py reads is the
+        # default, and so is the API's SPACE_K8S_CONTROL_PLANE. Every other
+        # cluster read fails.
         python3() {
             case "$*" in
                 *deployed-rust-build.py*) echo test-hooks ;;
@@ -182,6 +183,7 @@ TILT
         kubectl() {
             case "$*" in
                 *" get deployments -l app.kubernetes.io/name=space-credmgr-authority "*) printf 'exchange|' ;;
+                *" get deployments -l app.kubernetes.io/name=space-api "*) echo true ;;
                 *" get pods -o json") printf '{"items": []}' ;;
                 *" get daemonset "*" --ignore-not-found -o json")
                     printf '{"spec": {"template": {"spec": {"containers": [{"name": "service", "env": [{"name": "SPACE_OBJECT_STORE_BUCKET"}]}]}}}}' ;;

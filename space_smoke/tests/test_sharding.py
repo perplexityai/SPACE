@@ -43,6 +43,7 @@ def test_shards_run_every_eligible_scenario_once_and_propagate_failures(surface)
             **{
                 "return_value.telemetry_mode.return_value": "otel",
                 "return_value.storage_credentials.return_value": "exchange",
+                "return_value.substrate.return_value": "kubernetes",
             },
         ),
         mock.patch("space_smoke.__main__.run_scenarios", side_effect=execute),

@@ -10,7 +10,9 @@
 # (`GET /admin/api/v1/nodes`) as the local root account until every Kubernetes
 # node in the sandbox and builder pools appears there with its role, a
 # reachable status observed within the last five minutes, and scheduling
-# status `ready`.
+# status `ready`. A Kubernetes registration names its node by
+# `k8s_node_name`; a Direct one (the Direct substrate lane,
+# scripts/register-direct-nodes.sh) by the `name` it was registered with.
 #
 # The status's `stale` flag is not the test. It says only that the node
 # published something recently, within a window derived from node-ctl's poll
@@ -82,7 +84,7 @@ while true; do
       "$API_URL/admin/api/v1/nodes" 2>/dev/null)"; then
     pending="$(while read -r name role; do
       jq -e --arg name "$name" --arg role "$role" --argjson max_age "$MAX_STATUS_AGE_SECS" '
-        any(.[]; .k8s_node_name == $name and .role == $role and .deleted_at == null
+        any(.[]; (.k8s_node_name // .name) == $name and .role == $role and .deleted_at == null
             and .status.reachable == true and .status.scheduling.status == "ready"
             and ((.status.observed_at // "" | sub("\\.[0-9]+"; "") | fromdateiso8601? // 0)
                  > (now - $max_age)))' <<<"$nodes" >/dev/null \
@@ -97,7 +99,7 @@ while true; do
       printf 'nodes not published as ready within %ss:\n' "$TIMEOUT"
       while read -r name role; do
         printf '  %s (%s): %s\n' "$name" "$role" "$(jq -c --arg name "$name" \
-          '[.[] | select(.k8s_node_name == $name) | {role, scheduling_status, status: (.status // {} | {observed_at, reachable, scheduling: .scheduling.status, error})}]' \
+          '[.[] | select((.k8s_node_name // .name) == $name) | {role, scheduling_status, status: (.status // {} | {observed_at, reachable, scheduling: .scheduling.status, error})}]' \
           <<<"${nodes:-[]}" 2>/dev/null || echo unknown)"
       done <<<"$pending"
     } >&2

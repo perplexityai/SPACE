@@ -77,6 +77,12 @@ rejects the Kind value itself.
 {{- if and (has $c $nodeCharts) (ne (toString (($s.node | default dict).role | default "worker")) (toString $v.role)) -}}
 {{- $fail = append $fail (printf "%s.node.role must equal role %s" $c (toString $v.role)) -}}
 {{- end -}}
+{{- if has $c $nodeCharts -}}
+{{- $substrate := toString (($s.node | default dict).substrate | default "kubernetes") -}}
+{{- if ne $substrate "kubernetes" -}}
+{{- $fail = append $fail (printf "%s.node.substrate must be kubernetes, got %q: the Direct substrate lane is Kind-only; see infra/space/kind/README.md" $c $substrate) -}}
+{{- end -}}
+{{- end -}}
 {{- if eq $c "space-data-plane-local" -}}
 {{- /* The data plane reports no cluster id. */ -}}
 {{- else if or (not $s.clusterId) (eq (toString $s.clusterId) "kind-local") -}}
@@ -94,6 +100,12 @@ rejects the Kind value itself.
 {{- $api := index $v "space-api-local" | default dict -}}
 {{- if ($api.secrets | default dict).create -}}
 {{- $fail = append $fail "space-api-local.secrets.create must be false: its Secrets hold development tokens and keys" -}}
+{{- end -}}
+{{- range $c := list "space-api-local" "space-cluster-controller-local" -}}
+{{- $substrate := toString ((index $v $c | default dict).substrate | default "kubernetes") -}}
+{{- if ne $substrate "kubernetes" -}}
+{{- $fail = append $fail (printf "%s.substrate must be kubernetes, got %q: the Direct substrate lane is Kind-only; see infra/space/kind/README.md" $c $substrate) -}}
+{{- end -}}
 {{- end -}}
 {{- range $c := list "space-api-local" "space-internal-api-local" "space-cluster-controller-local" "space-credmgr-authority-local" -}}
 {{- if not ((index $v $c | default dict).postgres | default dict).rolesSecretName -}}

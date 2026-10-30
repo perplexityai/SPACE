@@ -152,6 +152,14 @@ postgres:
   # max_connections is sized to hold every replica's pools.
   poolMaxConnections: 100
 
+# The substrate the API runs: `kubernetes`, below, or `direct`, the
+# DirectSubstrate (crates/libs/api/src/controllers/substrate/direct.rs), which
+# places sandboxes on the nodes registered through the admin node registry
+# with no pod per sandbox. The `k8s` block still renders on `direct`, which
+# reads none of it. The bring-up selects it with SPACE_KIND_SUBSTRATE; see
+# "Direct substrate lane" in infra/space/kind/README.md.
+substrate: kubernetes
+
 # K8s control-plane substrate. SPACE_K8S_CONTROL_PLANE=true runs the
 # api-server on the KubernetesSubstrate: it discovers nodes through the Pod
 # reflector (watching pods with label app.kubernetes.io/component=node-api, the

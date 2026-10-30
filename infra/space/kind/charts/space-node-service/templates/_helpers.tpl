@@ -29,6 +29,18 @@ The Rust build the bring-up deploys (`rustBuild`, infra/space/kind/lib/rust-buil
 {{- $build -}}
 {{- end -}}
 
+{{/*
+The control plane's substrate (`node.substrate`): `kubernetes`, the default,
+or `direct`. It decides the identity the services report (env.identity).
+*/}}
+{{- define "space-node-service.substrate" -}}
+{{- $substrate := .Values.node.substrate | default "kubernetes" -}}
+{{- if not (has $substrate (list "kubernetes" "direct")) -}}
+{{- fail (printf "node.substrate must be kubernetes or direct, got %q" $substrate) -}}
+{{- end -}}
+{{- $substrate -}}
+{{- end -}}
+
 {{/* DaemonSet and ServiceAccount name: space-node-manager, space-builder-node-manager, ... */}}
 {{- define "space-node-service.name" -}}
 {{- printf "%s-%s" .ctx.Release.Name .component -}}
@@ -90,12 +102,26 @@ Identity every node service reports. SPACE_NODE_ID is the raw kube node name
 from (name, role) via space_k8s_node_id, so nothing hand-rolls an id. The
 node and pod names are the observability identity
 (crates/libs/observability/src/identity.rs).
+
+On the `direct` substrate SPACE_NODE_ID is left unset: a Direct node is
+registered under the UUID its node-api reports (verify_node_endpoint,
+crates/libs/api/src/routes/admin/node_maintenance/node_api.rs), and ClusterApi
+resolves a kube node name only to a Kubernetes registration
+(resolve_origin_node_id, crates/libs/internal/api/server/src/lib.rs). node-api
+and node-ctl then read the UUID the bring-up seeds in /space/etc/node-id
+(scripts/register-direct-nodes.sh) through mount.nodeId. sandbox-manager reads
+it through its own /space/etc mount for its activation identity only; its
+restore placement (service/start.rs) and quarantine recovery
+(snapshot_restore.rs) read only SPACE_NODE_ID. The other node services get no
+node id.
 */}}
 {{- define "space-node-service.env.identity" -}}
+{{- if eq (include "space-node-service.substrate" .) "kubernetes" -}}
 - name: SPACE_NODE_ID
   valueFrom:
     fieldRef:
       fieldPath: spec.nodeName
+{{ end -}}
 - name: SPACE_NODE_ROLE
   value: {{ include "space-node-service.role" . | quote }}
 - name: SPACE_CLUSTER_ID
@@ -276,6 +302,18 @@ pod's own mounts back to the node.
   mountPath: /tmp
 {{- end -}}
 
+{{/*
+The node UUID the bring-up seeds on a `direct` Kind node, read-only, at the
+path node-api and node-ctl read when SPACE_NODE_ID is unset (NODE_ID_PATH in
+crates/libs/node/api/server/src/run.rs and crates/libs/node/ctl/server/src/lib.rs).
+Mounted only on that substrate, with volume.nodeId.
+*/}}
+{{- define "space-node-service.mount.nodeId" -}}
+- name: node-id
+  mountPath: /space/etc/node-id
+  readOnly: true
+{{- end -}}
+
 {{- define "space-node-service.mount.clusterApiToken" -}}
 - name: cluster-api-token
   mountPath: /var/run/space-publication
@@ -331,6 +369,13 @@ pod's own mounts back to the node.
     sizeLimit: 1Mi
 - name: tmp
   emptyDir: {}
+{{- end -}}
+
+{{- define "space-node-service.volume.nodeId" -}}
+- name: node-id
+  hostPath:
+    path: /space/etc/node-id
+    type: File
 {{- end -}}
 
 {{- define "space-node-service.volume.credmgrToken" -}}

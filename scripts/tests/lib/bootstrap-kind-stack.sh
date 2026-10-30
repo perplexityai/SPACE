@@ -54,6 +54,11 @@
 #   SPACE_KIND_RUST_BUILD — test-hooks (default) or release
 #                       (infra/space/kind/lib/rust-build.sh); compared and
 #                       switched like the storage credentials mode
+#   SPACE_KIND_SUBSTRATE — kubernetes (default) or direct
+#                       (infra/space/kind/lib/substrate.sh); an existing
+#                       cluster running the other one is refused, not
+#                       switched, under SKIP_BOOTSTRAP=1 too, and direct
+#                       needs SPACE_KIND_STORAGE_CREDENTIALS=static
 #   BOOTSTRAP_TIMEOUT — seconds each blocking wait may take: Tilt's start, the
 #                       API, the seed Job, each rollout and node publication
 #   SPACE_KIND_RUN_DIR — the run's output directory, where the bring-up writes
@@ -94,6 +99,8 @@
 source "$(dirname "${BASH_SOURCE[0]}")/../../../infra/space/kind/lib/storage-credentials.sh"
 # shellcheck source=../../../infra/space/kind/lib/rust-build.sh
 source "$(dirname "${BASH_SOURCE[0]}")/../../../infra/space/kind/lib/rust-build.sh"
+# shellcheck source=../../../infra/space/kind/lib/substrate.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../../../infra/space/kind/lib/substrate.sh"
 # shellcheck source=../../../infra/space/kind/lib/port-forward-supervisors.sh
 source "$(dirname "${BASH_SOURCE[0]}")/../../../infra/space/kind/lib/port-forward-supervisors.sh"
 
@@ -1126,8 +1133,8 @@ kind_stack_start_detached() {
 # stack. It repeats what can change between two scenarios: another cluster
 # taking the API port, another bring-up switching the storage credentials
 # mode, and node tombstones a scenario left. It leaves out the prerequisite,
-# mount, node vendor copy and Postgres data checks, which only provisioning
-# the box or creating the cluster changes, and the image provenance and Rust
+# mount, node vendor copy, Postgres data and substrate checks, which only
+# provisioning the box or creating the cluster changes, and the image provenance and Rust
 # build checks, which only a Tilt build changes; scenarios restart and
 # reconfigure workloads but build no image. The runner uses this only when its own bootstrap's
 # provenance check passed (KIND_STACK_PROVENANCE_PASSED_FILE), not when a busy
@@ -1197,6 +1204,8 @@ bootstrap_kind_stack__load_mirrored_chart_images() {
 # Prepare the same cluster as the full bootstrap, without starting Tilt or
 # requiring Rust artifacts. CI can do this while its producer compiles.
 kind_stack_prepare_cluster() {
+    # As the Tiltfile refuses it, before a cluster is created for it.
+    kind_stack_assert_substrate_request
     kind_stack_assert_smoke_prereqs
     kind_stack_assert_cluster_mounts
     kind_stack_assert_postgres_data
@@ -1315,6 +1324,21 @@ kind_stack_assert_existing_cluster() {
     # recreated before the per-service node DaemonSets land beside it.
     bash "$REPO_ROOT/infra/space/kind/scripts/check-node-layout.sh" \
         "$KIND_CLUSTER" || exit 1
+    # Its database holds one substrate's node and sandbox rows.
+    space_kind_check_substrate "$KIND_CLUSTER" || exit 1
+}
+
+# Refuses a SPACE_KIND_SUBSTRATE the Tiltfile would refuse: an invalid one,
+# or `direct` without static storage credentials, which the Tiltfile reaches
+# only once the cluster exists. Reads nothing from the cluster.
+kind_stack_assert_substrate_request() {
+    local substrate storage
+    substrate="$(space_kind_substrate)" || exit 1
+    [[ "$substrate" == direct ]] || return 0
+    storage="$(space_kind_storage_credentials)" || exit 1
+    [[ "$storage" == static ]] && return 0
+    echo "ERROR: SPACE_KIND_SUBSTRATE=direct needs SPACE_KIND_STORAGE_CREDENTIALS=static; see \"Direct substrate lane\" in infra/space/kind/README.md" >&2
+    exit 1
 }
 
 # Prints the storage credentials mode the cluster runs when it differs from
@@ -1588,6 +1612,11 @@ bootstrap_kind_stack__bring_up() {
     # one would test what was not asked for.
     local deployed_mode gc_wiring deployed_build
     deployed_build="$(bootstrap_kind_stack__rust_build_mismatch)" || exit 1
+    # Unlike the modes above, a cluster's substrate is never switched: its
+    # database holds that substrate's node and sandbox rows. Before
+    # prepare_cluster, so a request the Tiltfile refuses creates no cluster.
+    kind_stack_assert_substrate_request
+    space_kind_check_substrate "$KIND_CLUSTER" || exit 1
     if [[ "${SKIP_BOOTSTRAP:-0}" == "1" ]]; then
         if [[ -n "$deployed_build" ]]; then
             echo "ERROR: kind cluster $KIND_CLUSTER runs the $deployed_build Rust build (read from its Rust" >&2

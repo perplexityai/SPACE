@@ -37,15 +37,17 @@ whose update failed. It restarts Tilt when Tilt was started with other values of
 the settings Tilt reads from its environment once, at start: the list is
 `TILT_SETTINGS` in `up.sh` (the telemetry, Datadog and storage credentials
 modes, the prune and parallel-update switches, `SPACE_LOOP_DEVICE_TARGET`,
-`SPACE_SEED_OUTPUT_DIR`, the Rust artifact mode and profile, and
-`SPACE_KIND_RUST_BUILD`), each compared with its default, plus the optional
+`SPACE_SEED_OUTPUT_DIR`, the Rust artifact mode and profile,
+`SPACE_KIND_RUST_BUILD` and `SPACE_KIND_SUBSTRATE`), each compared with its default, plus the optional
 AWS credentials when storage credentials are `static`. Nothing else restarts
 it, so a refreshed AWS session token in the default mode keeps the running
 Tilt. Before stopping it, `up.sh` checks its own refusals (the timeout, storage
-mode, Rust build and profile, and parallelism, and the cluster's mounts,
-node image, layout, Postgres data and nodes' vendor copies, after staging the
-vendor tree as the bring-up does); a refusal at Tiltfile load is not
-pre-checked. Tilt's log
+mode, Rust build and profile, substrate, and parallelism, and the cluster's
+mounts, node image, layout, Postgres data, substrate and nodes' vendor copies,
+after staging the vendor tree as the bring-up does), and the telemetry
+configuration and substrate request that the Tiltfile also refuses at load (an
+invalid `SPACE_KIND_SUBSTRATE`, or `direct` without static storage credentials).
+Tilt's log
 is `~/.space-devbox/kind/tilt-space-local.log`, its pid is in
 `~/.space-devbox/kind/tilt-space-local.pid`, and `teardown.sh` stops it.
 
@@ -374,6 +376,90 @@ On demand, `Kind Release-Build CI` (`.github/workflows/kind-release-ci.yml`,
 producer builds the release image in Docker mode, and the four shards check its
 label and run the baseline and their partitions. No required check depends on
 it and nothing schedules it.
+
+## Direct substrate lane
+
+The harness normally runs the Kubernetes substrate: a pod per sandbox, placed
+by kube-scheduler. `SPACE_KIND_SUBSTRATE=direct` (`lib/substrate.sh`; the
+default is `kubernetes`) runs the same cluster and images with the API and
+cluster controller on the Direct substrate
+(`crates/libs/api/src/controllers/substrate/direct.rs`): they place node-local
+VMs on the nodes in the Direct node registry and create no sandbox pods. The
+selection is per cluster, for its lifetime. Its database holds one substrate's
+node and sandbox rows, so the bring-up refuses a cluster running the other one
+and names the teardown that switches it.
+
+- **Charts.** The Tiltfile renders `substrate=direct` into `space-api-local`
+  and `space-cluster-controller-local`, which set `SPACE_K8S_CONTROL_PLANE`
+  to `false`. The default `substrate: kubernetes` renders every chart
+  byte-identically to a chart without the value. The controller also takes
+  `values-direct.yaml`, which sets one replica. On Direct, leader election
+  doesn't contend for the Lease (the substrate's `contends_for_leader_lease`
+  capability), so a second replica would run every reconciler again; the
+  chart refuses any other `replicaCount` there. The node services take
+  `node.substrate=direct` (see below).
+- **Node identity.** A Direct node is known by a node UUID: the admin
+  registry records the id its node-api reports, and ClusterApi resolves a
+  kube node name only to a Kubernetes registration. On this lane the
+  node-service charts leave `SPACE_NODE_ID` unset
+  (`space-node-service.env.identity`). node-api and node-ctl then read
+  `/space/etc/node-id`, mounted on its own (`mount.nodeId`), as on a Direct
+  host. sandbox-manager reads it through its own `/space/etc` mount for its
+  activation identity only: its restore placement and quarantine recovery
+  read only `SPACE_NODE_ID`. The other node services get no node id. Before
+  the node services start, Tilt's
+  `seed-direct-node-ids` writes a random UUID there on each sandbox and
+  builder node that has none (`scripts/register-direct-nodes.sh seed-ids`).
+- **Node registration.** Kubernetes node sync doesn't run on Direct. Once the
+  API and every node-api serve, Tilt's `register-direct-nodes`
+  (`register-direct-nodes.sh register`) registers each sandbox and builder
+  node with `POST /admin/api/v1/nodes`: its kube name, its InternalIP as the
+  address and `<InternalIP>:9800` as the node-api endpoint, with
+  `verify: true`. The API then checks the node-api's id and role before
+  writing the `nodes` and `node_direct` rows, and enqueues the node's first
+  publish. The address must be the source address of the node's host-network
+  ClusterApi calls, which ClusterApi checks against it. The bring-up's
+  publication wait (`wait-node-publication.sh`) matches a Direct registration
+  by its name.
+- **Storage credentials.** The lane runs only with
+  `SPACE_KIND_STORAGE_CREDENTIALS=static`, and the bring-up refuses it
+  otherwise. In `exchange` mode the credential-manager authority admits a
+  node service by its pod's Kubernetes node registration (`node_k8s`,
+  `check_node_registration` in
+  `crates/libs/credential/mgr/server/src/k8s_identity.rs`). A Direct node has
+  none, so the authority refuses every template pull with
+  `node_identity_mismatch` and no worker ever holds a template. The same check
+  guards the authority's other node calls, such as volume keys and network
+  credentials, in either mode.
+- **Scenarios.** The typed suite reads the bench's substrate from the API
+  Deployment's `SPACE_K8S_CONTROL_PLANE`, runs the scenarios it serves and
+  prints the rest as `SKIPPED`; a run whose `SPACE_SMOKE_SUBSTRATE` or
+  `SPACE_KIND_SUBSTRATE` names the other substrate fails. On Direct it runs
+  the scenarios whose fixture needs no Kind-only Kubernetes wiring (`Ecw`,
+  `CommandSandboxFixture`, `NativeHardeningFixture`). A scenario narrows that
+  set with `substrates=` only for what Direct doesn't support by contract: the
+  fork scenarios, and a scenario that asserts sandbox pods, narrow to
+  `kubernetes`. Every Kind scenario serves Kubernetes, so the default lane's
+  inventory is unchanged. On the deployed backend, `SPACE_SMOKE_SUBSTRATE`
+  names the deployment's substrate; unset, it filters nothing.
+- **Defects.** A Direct-only defect is tracked by its issue and fails on the
+  Direct lane. Don't quarantine it: a quarantine withholds the scenario on
+  every substrate, the required Kubernetes lane included.
+
+Bring a cluster up in the lane, run the baseline, then the typed suite:
+
+```bash
+export SPACE_KIND_SUBSTRATE=direct SPACE_KIND_STORAGE_CREDENTIALS=static
+bash infra/space/kind/scripts/up.sh
+python3 examples/first_sandbox.py
+SKIP_BOOTSTRAP=1 bash scripts/tests/smoke-kind-typed.sh all
+```
+
+The suite needs no `SPACE_SMOKE_SUBSTRATE`: it reads the substrate from the
+bench and checks the exported `SPACE_KIND_SUBSTRATE` against it, as the
+bring-up does under `SKIP_BOOTSTRAP=1`. `first_sandbox.py` needs the
+environment from [the first-sandbox guide](../../../docs/first-sandbox.md). No
+CI job runs the lane.
 
 ## Bring it up
 
@@ -1356,13 +1442,13 @@ kind cluster: space-local (kind-cluster.yaml.tmpl — 6 nodes)
 │   ├── space-object-store-iam (Deployment; versitygw's standalone IAM service: the storage exchange's STS and sessions)
 │   ├── space-kind-sts-bridge (Deployment; Kind-only STS front for the authority's storage exchange, and the token issuer the IAM service trusts)
 │   ├── space-redis           (Deployment; the rate limiters' store, which api, admin-api and cluster-controller reach through SPACE_REDIS_URL)
-│   ├── space-api             (Deployment, 2–3 replicas by HPA; SPACE_K8S_CONTROL_PLANE=true)
+│   ├── space-api             (Deployment, 2–3 replicas by HPA; SPACE_K8S_CONTROL_PLANE=true on the default (Kubernetes) lane, see "Direct substrate lane")
 │   ├── space-admin-api       (Deployment; the same binary on the dedicated admin surface)
 │   ├── space-internal-api    (Deployment, 2 replicas; ClusterApi — node state + template releases)
 │   ├── space-credmgr-authority (Deployment, 2 replicas; credential-manager authority — credential tables + platform KEK)
 │   ├── space-kind-key-broker (Deployment; Kind-only intermediate-key broker fixture behind the platform KEK)
 │   ├── space-data-plane      (Deployment, 2–3 replicas by HPA)
-│   ├── space-cluster-controller (Deployment, 2 replicas, one leader; materializes per-sandbox pods)
+│   ├── space-cluster-controller (Deployment, 2 replicas, one leader; materializes per-sandbox pods on the default (Kubernetes) lane; one replica on the Direct substrate lane)
 │   ├── space-kind-fake-ec2   (Deployment; Kind-only fake EC2 endpoint the reconcile-queue GC asks about non-ready nodes)
 │   ├── metrics-server        (Deployment in kube-system; resource metrics for the HPAs)
 │   ├── space-seed-publish    (Job; publishes the locally built seed)
@@ -1538,6 +1624,9 @@ too. Each chart's values cite the code behind its numbers.
   node is gone (see the differences table).
 
 ## How the node registers itself
+
+This section describes the default (Kubernetes) lane; for the Direct one, see
+[Direct substrate lane](#direct-substrate-lane).
 
 Every node-service chart passes `SPACE_NODE_ID` as the raw kube node name
 (fieldRef `spec.nodeName`) plus its worker or builder `SPACE_NODE_ROLE`;
@@ -1815,8 +1904,9 @@ NodeInfo, `space-node-api-internal` for WorkerApiInternal, and
 it, set in `charts/space-node-api-local/values.yaml` (workers),
 `values-builder.yaml` (builders) and `charts/space-build-manager-local/values.yaml`.
 Nothing in Kind starts a peer template transfer by itself: the admin
-template-pull route serves only the direct substrate and answers 501 here, as on
-any Kubernetes deployment. An operator starts one with `PullTemplate` on the
+template-pull route serves only the direct substrate, so on the default
+(Kubernetes) lane it answers 501, as on any Kubernetes deployment, and only the
+[Direct substrate lane](#direct-substrate-lane) serves it. An operator starts one with `PullTemplate` on the
 target node-api and a `space-api` token, and the transfer list admits that call
 and the target node-api's export request to the source:
 

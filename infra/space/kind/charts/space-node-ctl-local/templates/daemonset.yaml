@@ -56,6 +56,9 @@ spec:
             {{- include "space-node-service.mount.clusterApiToken" . | nindent 12 }}
             {{- include "space-node-service.mount.rpcCa" . | nindent 12 }}
             {{- include "space-node-service.mount.private" . | nindent 12 }}
+            {{- if eq (include "space-node-service.substrate" .) "direct" }}
+            {{- include "space-node-service.mount.nodeId" . | nindent 12 }}
+            {{- end }}
           {{- with .Values.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
@@ -65,3 +68,6 @@ spec:
         {{- include "space-node-service.volume.clusterApiToken" . | nindent 8 }}
         {{- include "space-node-service.volume.rpcCa" . | nindent 8 }}
         {{- include "space-node-service.volume.private" . | nindent 8 }}
+        {{- if eq (include "space-node-service.substrate" .) "direct" }}
+        {{- include "space-node-service.volume.nodeId" . | nindent 8 }}
+        {{- end }}

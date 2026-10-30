@@ -1,0 +1,6 @@
+# The Direct substrate lane (SPACE_KIND_SUBSTRATE=direct; "Direct substrate
+# lane" in infra/space/kind/README.md). Direct runs one controller replica: the
+# second would run every reconciler again, with no Lease between them
+# (templates/deployment.yaml).
+substrate: direct
+replicaCount: 1

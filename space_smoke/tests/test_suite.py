@@ -14,8 +14,10 @@ from io import StringIO
 from pathlib import Path
 from unittest import mock
 
-from space_smoke.__main__ import _failure_detail, _run_all
+from space_smoke.__main__ import _apply_substrate, _failure_detail, _run_all
+from space_smoke.adapters import KindConfig, KindHarness
 from space_smoke.registry import ScenarioRegistry
+from space_smoke.runtime import CommandResult
 from space_smoke.scenarios import REGISTRY
 from space_smoke.suite import (
     RESULT_PREFIX,
@@ -54,6 +56,7 @@ class SmokeSuiteTests(unittest.TestCase):
         services = mock.Mock()
         services.telemetry_mode.return_value = "otel"
         services.storage_credentials.return_value = "exchange"
+        services.substrate.return_value = "kubernetes"
         selected = tuple(
             scenario
             for scenario in REGISTRY
@@ -109,6 +112,7 @@ class SmokeSuiteTests(unittest.TestCase):
         services = mock.Mock()
         services.telemetry_mode.return_value = "otel"
         services.storage_credentials.return_value = "exchange"
+        services.substrate.return_value = "kubernetes"
         live = tuple(
             scenario
             for scenario in REGISTRY
@@ -301,10 +305,11 @@ class SmokeSuiteTests(unittest.TestCase):
         stdout = StringIO()
         with (
             mock.patch.dict("space_smoke.__main__.os.environ", environment, clear=True),
-            mock.patch("space_smoke.__main__.SmokeServices.from_environment"),
+            mock.patch("space_smoke.__main__.SmokeServices.from_environment") as from_environment,
             mock.patch("space_smoke.__main__.run_scenarios", return_value=results),
             redirect_stdout(stdout),
         ):
+            from_environment.return_value.substrate.return_value = "kubernetes"
             exit_code = _run_all()
         return exit_code, stdout.getvalue()
 
@@ -458,6 +463,159 @@ class SmokeSuiteTests(unittest.TestCase):
         self.assertEqual(suite_exit_code((warning, infrastructure)), 2)
         self.assertEqual(suite_exit_code((passed, infrastructure)), 2)
         self.assertEqual(suite_exit_code((infrastructure, failed)), 1)
+
+
+class BenchSubstrateTests(unittest.TestCase):
+    """The suite runs only the scenarios its bench's substrate serves."""
+
+    KIND = tuple(scenario for scenario in REGISTRY if "kind" in scenario.backends)
+
+    def _apply(self, environment, *, backend="kind", bench="kubernetes"):
+        services = mock.Mock()
+        if isinstance(bench, Exception):
+            services.substrate.side_effect = bench
+        else:
+            services.substrate.return_value = bench
+        stdout, stderr = StringIO(), StringIO()
+        with (
+            mock.patch.dict("space_smoke.__main__.os.environ", environment, clear=True),
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            runnable, error = _apply_substrate(self.KIND, services, backend)
+        return runnable, error, stdout.getvalue(), stderr.getvalue(), services
+
+    def test_kind_filters_by_the_substrate_read_from_the_bench(self) -> None:
+        for bench in ("kubernetes", "direct"):
+            for requested in ({}, {"SPACE_SMOKE_SUBSTRATE": bench}, {"SPACE_KIND_SUBSTRATE": bench}):
+                with self.subTest(bench=bench, requested=requested):
+                    runnable, error, stdout, _, _ = self._apply(requested, bench=bench)
+                    self.assertIsNone(error)
+                    self.assertEqual(
+                        runnable, tuple(s for s in self.KIND if bench in s.substrates)
+                    )
+                    for skipped in (s for s in self.KIND if s not in runnable):
+                        self.assertIn(f"SKIPPED {skipped.id}: runs only on substrate(s)", stdout)
+        # Every Kind scenario serves the Kubernetes substrate, so the default
+        # lane keeps its whole inventory; the Direct lane does not.
+        self.assertEqual(self._apply({})[0], self.KIND)
+        self.assertLess(len(self._apply({}, bench="direct")[0]), len(self.KIND))
+
+    def test_kind_fails_a_request_for_the_substrate_the_bench_does_not_run(self) -> None:
+        for variable in ("SPACE_SMOKE_SUBSTRATE", "SPACE_KIND_SUBSTRATE"):
+            with self.subTest(variable=variable):
+                _, error, _, _, _ = self._apply({variable: "direct"}, bench="kubernetes")
+                self.assertEqual(
+                    error, f"{variable}=direct, but the bench runs the kubernetes substrate"
+                )
+
+    def test_kind_bench_that_cannot_be_read_fails_only_a_request(self) -> None:
+        unreadable = RuntimeError("no API Deployment")
+        runnable, error, _, stderr, _ = self._apply({}, bench=unreadable)
+        self.assertIsNone(error)
+        self.assertEqual(runnable, self.KIND)
+        self.assertIn("could not read the bench's substrate", stderr)
+        _, error, _, _, _ = self._apply({"SPACE_SMOKE_SUBSTRATE": "direct"}, bench=unreadable)
+        self.assertIn("SPACE_SMOKE_SUBSTRATE=direct, but the bench's substrate could not be read", error)
+
+    def test_deployed_backend_filters_only_by_an_explicit_selector(self) -> None:
+        runnable, error, _, _, services = self._apply({}, backend="deployed")
+        self.assertEqual((runnable, error), (self.KIND, None))
+        runnable, error, _, _, _ = self._apply(
+            {"SPACE_SMOKE_SUBSTRATE": "direct", "SPACE_KIND_SUBSTRATE": "kubernetes"},
+            backend="deployed",
+        )
+        self.assertIsNone(error)
+        self.assertEqual(runnable, tuple(s for s in self.KIND if "direct" in s.substrates))
+        services.substrate.assert_not_called()
+
+    def test_suite_refuses_an_unknown_substrate_before_bootstrap(self) -> None:
+        for variable in ("SPACE_SMOKE_SUBSTRATE", "SPACE_KIND_SUBSTRATE"):
+            with (
+                self.subTest(variable=variable),
+                mock.patch.dict("space_smoke.__main__.os.environ", {variable: "Direct"}, clear=True),
+                mock.patch("space_smoke.__main__.SmokeServices.from_environment") as from_environment,
+                redirect_stderr(StringIO()) as stderr,
+            ):
+                self.assertEqual(_run_all(), 2)
+                self.assertIn(f"{variable} must be one of direct, kubernetes", stderr.getvalue())
+                from_environment.assert_not_called()
+
+    def test_native_suite_reads_the_bench_whatever_its_first_fixture(self) -> None:
+        # The native contract category starts with a NativeHardeningFixture
+        # scenario, whose services carry no Kind fixture controls.
+        category = REGISTRY.select(category="native_contract")
+        self.assertNotEqual(category[0].fixture_type.__name__, "CommandSandboxFixture")
+        environment = {
+            "SPACE_SMOKE_BACKEND": "kind",
+            "SPACE_SMOKE_API_SURFACE": "native",
+            "SPACE_API_TOKEN": "token",
+            "SPACE_KIND_SUBSTRATE": "direct",
+        }
+        with (
+            mock.patch.dict("space_smoke.__main__.os.environ", environment, clear=True),
+            mock.patch("space_smoke.services.shutil.which", return_value="/usr/bin/true"),
+            mock.patch.object(KindHarness, "substrate", return_value="direct") as substrate,
+            mock.patch("space_smoke.__main__.run_scenarios", return_value=()) as run,
+            redirect_stdout(StringIO()) as stdout,
+            redirect_stderr(StringIO()) as stderr,
+        ):
+            exit_code = _run_all(category="native_contract")
+        self.assertEqual(exit_code, 0, stderr.getvalue())
+        substrate.assert_called_once_with()
+        self.assertEqual(
+            run.call_args.args[0], tuple(s for s in category if "direct" in s.substrates)
+        )
+        for skipped in (s for s in category if "direct" not in s.substrates):
+            self.assertIn(f"SKIPPED {skipped.id}: runs only on substrate(s)", stdout.getvalue())
+
+    def test_a_shard_the_other_modes_empty_still_fails_a_substrate_mismatch(self) -> None:
+        environment = {"SPACE_SMOKE_BACKEND": "kind", "SPACE_SMOKE_SUBSTRATE": "direct"}
+        with (
+            mock.patch.dict("space_smoke.__main__.os.environ", environment, clear=True),
+            mock.patch("space_smoke.__main__.SmokeServices.from_environment") as from_environment,
+            mock.patch("space_smoke.__main__._apply_telemetry_mode", return_value=((), None)),
+            mock.patch("space_smoke.__main__.run_scenarios") as run,
+            redirect_stdout(StringIO()),
+            redirect_stderr(StringIO()) as stderr,
+        ):
+            from_environment.return_value.substrate.return_value = "kubernetes"
+            exit_code = _run_all(category="local", shard=(1, 4))
+        self.assertEqual(exit_code, 2)
+        self.assertIn(
+            "SPACE_SMOKE_SUBSTRATE=direct, but the bench runs the kubernetes substrate",
+            stderr.getvalue(),
+        )
+        run.assert_not_called()
+
+    def test_kind_harness_reads_the_api_deployments_control_plane_flag(self) -> None:
+        argv = ("kubectl",)
+        cases = {"true": "kubernetes", "false": "direct", "yes": None, None: None}
+        for value, expected in cases.items():
+            env = [] if value is None else [{"name": "SPACE_K8S_CONTROL_PLANE", "value": value}]
+            harness = KindHarness(
+                _ScriptedKubectl(
+                    [
+                        CommandResult(argv, 0, "space-api\n", ""),
+                        CommandResult(argv, 0, json.dumps({"name": "api", "env": env}), ""),
+                    ]
+                ),
+                KindConfig(),
+            )
+            with self.subTest(value=value):
+                if expected is None:
+                    with self.assertRaisesRegex(Exception, "SPACE_K8S_CONTROL_PLANE"):
+                        harness.substrate()
+                else:
+                    self.assertEqual(harness.substrate(), expected)
+
+
+class _ScriptedKubectl:
+    def __init__(self, results) -> None:
+        self.results = list(results)
+
+    def run(self, command, **_options) -> CommandResult:
+        return self.results.pop(0)
 
 
 if __name__ == "__main__":

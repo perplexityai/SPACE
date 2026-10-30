@@ -6,6 +6,13 @@ node:
   # role the services report. A builder release is the same chart rendered
   # with role=builder (see the `space-builder` releases in the Tiltfile).
   role: worker
+  # The substrate the control plane runs (`substrate` in space-api-local):
+  # `kubernetes` or `direct`. On `direct` SPACE_NODE_ID is left unset, since
+  # the Direct node registry and ClusterApi know a Direct node only by its
+  # UUID: node-api and node-ctl read it from /space/etc/node-id instead of the
+  # kube node name, and sandbox-manager reads it there for its activation
+  # identity only; see "Direct substrate lane" in infra/space/kind/README.md.
+  substrate: kubernetes
   # Node pool label each role's DaemonSets select, from kind-cluster.yaml.tmpl.
   # The builder pool is deliberately not space-enabled, so user sandbox pods
   # never land there.

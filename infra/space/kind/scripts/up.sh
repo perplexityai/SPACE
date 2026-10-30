@@ -17,10 +17,13 @@
 # below, since Tilt reads those once, at start. Before a running Tilt is
 # stopped, this run's own refusals are checked: the timeout, storage mode,
 # Rust build and profile, and parallelism, and the cluster's mounts, node
-# image, layout, data and the nodes' vendor copies, against the vendor tree
-# this run stages (assert_restartable); the Tiltfile's load-time refusals are
-# not, and would leave no watcher. Tilt keeps running afterwards and redeploys
-# whatever changes in the checkout; teardown.sh stops it.
+# image, layout, data, substrate and the nodes' vendor copies, against the
+# vendor tree this run stages (assert_restartable), and the telemetry
+# configuration and substrate request that the Tiltfile also refuses at
+# load (the preflight below, kind_stack_assert_substrate_request). A
+# load-time refusal not checked here would leave no watcher.
+# Tilt keeps running afterwards and redeploys whatever changes in the
+# checkout; teardown.sh stops it.
 #
 # Usage:
 #   bash infra/space/kind/scripts/up.sh
@@ -34,7 +37,7 @@
 #                            included) and node publication (default: 1800)
 #   SPACE_KIND_DATADOG_MODE, SPACE_KIND_TELEMETRY_MODE, SPACE_KIND_OBSERVABILITY,
 #   SPACE_KIND_OBSERVABILITY_CONFIG, SPACE_KIND_STORAGE_CREDENTIALS,
-#   SPACE_KIND_RUST_BUILD, SPACE_LOOP_DEVICE_TARGET,
+#   SPACE_KIND_RUST_BUILD, SPACE_KIND_SUBSTRATE, SPACE_LOOP_DEVICE_TARGET,
 #   SPACE_KIND_PRUNE_SUPERSEDED_IMAGES,
 #   SPACE_TILT_PRUNE_HOST_IMAGES, SPACE_TILT_MAX_PARALLEL_UPDATES,
 #   SPACE_SEED_OUTPUT_DIR    see infra/space/kind/README.md
@@ -104,6 +107,9 @@ SPACE_KIND_CLUSTER="$KIND_CLUSTER" bash "$KIND_DIR/scripts/check-disk-headroom.s
 
 # shellcheck source=../../../../scripts/tests/lib/bootstrap-kind-stack.sh
 source "$REPO_ROOT/scripts/tests/lib/bootstrap-kind-stack.sh"
+# As the Tiltfile refuses it, but before a running Tilt is stopped or a
+# cluster created for it.
+kind_stack_assert_substrate_request
 SKIP_BOOTSTRAP=0
 KIND_STACK_DETACH=0
 
@@ -117,6 +123,7 @@ KIND_STACK_DETACH=0
 TILT_SETTINGS=(
   SPACE_KIND_STORAGE_CREDENTIALS=exchange
   SPACE_KIND_RUST_BUILD=test-hooks
+  SPACE_KIND_SUBSTRATE=kubernetes
   SPACE_KIND_OBSERVABILITY_CONFIG=
   SPACE_TILT_MAX_PARALLEL_UPDATES=8
   SPACE_LOOP_DEVICE_TARGET=
@@ -228,6 +235,7 @@ cat <<MSG
   Datadog:    $DATADOG_MODE
   Telemetry:  $TELEMETRY_MODE
   Rust build: $(space_kind_rust_build)
+  Substrate:  $(space_kind_substrate)
   Login:      root@local
 
   Smoke:      bash scripts/tests/smoke-kind-e2e.sh

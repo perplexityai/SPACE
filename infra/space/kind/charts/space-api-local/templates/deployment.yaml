@@ -254,8 +254,9 @@ spec:
             # KubernetesSubstrate: sandbox placement flows through the Pod
             # reflector and node watcher; node inventory is synthesized from
             # the labelled node-api Pods.
+            {{- /* `substrate: direct` renders "false" (values.yaml). */}}
             - name: SPACE_K8S_CONTROL_PLANE
-              value: "true"
+              value: {{ include "space-api-local.k8sControlPlane" . }}
             - name: SPACE_SANDBOX_NAMESPACE
               value: {{ .Values.k8s.sandboxNamespace | quote }}
             # The node-api DaemonSets run in the release namespace. Unset, the

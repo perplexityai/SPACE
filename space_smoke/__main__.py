@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from space_smoke.registry import Scenario
+from space_smoke.registry import SUBSTRATES, Scenario
 from space_smoke.runtime import SmokeConfigurationError, execute_scenario
 from space_smoke.scenarios import REGISTRY
 from space_smoke.services import (
@@ -326,6 +326,16 @@ def _run_all(
         if skipped not in scenarios:
             backends = ", ".join(sorted(skipped.backends))
             print(f"SKIPPED {skipped.id}: runs only on backend(s) {backends}")
+    # A misspelt substrate is refused before the bootstrap; on Kind the bench's
+    # own substrate is read once it has run (_apply_substrate).
+    for variable, substrate in _substrate_requests(backend).items():
+        if substrate not in SUBSTRATES:
+            print(
+                f"ERROR: {variable} must be one of "
+                f"{', '.join(sorted(SUBSTRATES))}, not {substrate!r}",
+                file=sys.stderr,
+            )
+            return 2
     if shard is not None:
         index, count = shard
         # Partition the eligible inventory, not execution: scenarios mutate
@@ -367,6 +377,12 @@ def _run_all(
         print(f"ERROR: {type(error).__name__}: {error}", file=sys.stderr)
         return 2
 
+    scenarios, substrate_error = _apply_substrate(scenarios, services, backend)
+    if substrate_error is not None:
+        print(f"ERROR: {substrate_error}", file=sys.stderr)
+        return 2
+    if not scenarios:
+        return _mode_emptied(selection, "substrate", shard)
     scenarios, telemetry_error = _apply_telemetry_mode(scenarios, services)
     if not scenarios:
         return _mode_emptied(selection, "telemetry mode", shard)
@@ -576,6 +592,66 @@ def _apply_rust_build(
             "the bench runs release binaries"
         )
     return tuple(scenario for scenario in scenarios if scenario.test_hooks is None), None
+
+
+def _substrate_requests(backend: str) -> dict[str, str]:
+    """The substrate each set variable asks the bench to run, by variable.
+
+    SPACE_SMOKE_SUBSTRATE on any backend, and on Kind the bring-up's
+    SPACE_KIND_SUBSTRATE too, which the runner then checks against the bench.
+    """
+
+    variables = ["SPACE_SMOKE_SUBSTRATE"]
+    if backend == "kind":
+        variables.append("SPACE_KIND_SUBSTRATE")
+    return {variable: value for variable in variables if (value := os.environ.get(variable))}
+
+
+def _apply_substrate(
+    scenarios: tuple[Scenario, ...], services: SmokeServices, backend: str
+) -> tuple[tuple[Scenario, ...], str | None]:
+    """Skip the scenarios the bench's control-plane substrate does not serve.
+
+    On Kind the substrate is read from the bench, as the other modes are. A
+    runner that names one (SPACE_SMOKE_SUBSTRATE or SPACE_KIND_SUBSTRATE)
+    fails the suite when the bench runs the other or cannot be read, before
+    anything runs: every scenario's result depends on it. Unnamed, a bench the
+    probe cannot classify keeps the inventory. On the deployed backend
+    SPACE_SMOKE_SUBSTRATE is the only selector; unset, it filters nothing.
+    """
+
+    requests = _substrate_requests(backend)
+    if backend != "kind":
+        substrate = requests.get("SPACE_SMOKE_SUBSTRATE")
+        if substrate is None:
+            return scenarios, None
+    else:
+        try:
+            substrate = services.substrate()
+        except Exception as error:  # noqa: BLE001 - the scenarios report their own reads
+            if requests:
+                variable, requested = next(iter(requests.items()))
+                return scenarios, (
+                    f"{variable}={requested}, but the bench's substrate could not be read: "
+                    f"{type(error).__name__}: {error}"
+                )
+            print(
+                "WARN: could not read the bench's substrate, so every scenario will run: "
+                f"{type(error).__name__}: {error}",
+                file=sys.stderr,
+            )
+            return scenarios, None
+        for variable, requested in requests.items():
+            if requested != substrate:
+                return scenarios, (
+                    f"{variable}={requested}, but the bench runs the {substrate} substrate"
+                )
+    runnable = tuple(scenario for scenario in scenarios if substrate in scenario.substrates)
+    for skipped in scenarios:
+        if skipped not in runnable:
+            substrates = ", ".join(sorted(skipped.substrates))
+            print(f"SKIPPED {skipped.id}: runs only on substrate(s) {substrates}")
+    return runnable, None
 
 
 def _parse_shard(value: str) -> tuple[int, int]:

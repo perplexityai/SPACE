@@ -28,6 +28,25 @@ FIXTURE_BACKENDS: dict[type[Any], frozenset[str]] = {
     KindEcw: frozenset({"kind"}),
 }
 
+# The control-plane substrates a fixture can drive: the Kubernetes substrate
+# (pod per sandbox) and the Direct substrate (node-local VMs on registered
+# nodes, infra/space/kind/lib/substrate.sh). A fixture that needs no Kind-only
+# Kubernetes wiring (Ecw, CommandSandboxFixture, NativeHardeningFixture) serves
+# both; KindEcw and KindNativeHardeningFixture serve Kubernetes alone. A
+# scenario narrows its fixture's set (`substrates=`) where a substrate does not
+# support what it asserts by contract: one that asserts sandbox pods, or forks,
+# narrows to kubernetes.
+FIXTURE_SUBSTRATES: dict[type[Any], frozenset[str]] = {
+    # A standalone node, outside any cluster control plane.
+    DirectNodeRecoveryFixture: frozenset({"direct"}),
+    NativeHardeningFixture: frozenset({"kubernetes", "direct"}),
+    KindNativeHardeningFixture: frozenset({"kubernetes"}),
+    CommandSandboxFixture: frozenset({"kubernetes", "direct"}),
+    Ecw: frozenset({"kubernetes", "direct"}),
+    KindEcw: frozenset({"kubernetes"}),
+}
+SUBSTRATES = frozenset({"kubernetes", "direct"})
+
 Fixture = TypeVar("Fixture")
 
 
@@ -47,6 +66,7 @@ class Scenario(Generic[Fixture]):
     api_surfaces: frozenset[str]
     timeout_minutes: int
     backends: frozenset[str]
+    substrates: frozenset[str]
     quarantined: str | None
     ignored: str | None
     telemetry_mode: str | None
@@ -90,6 +110,7 @@ def scenario(
     timeout_minutes: int | None = None,
     storage_credentials: str | None = None,
     test_hooks: str | None = None,
+    substrates: Iterable[str] | None = None,
 ) -> Callable[[Callable[[Fixture], None]], Scenario[Fixture]]:
     """Declare a smoke; its typed parameter selects the prepared fixture.
 
@@ -110,6 +131,14 @@ def scenario(
     none.
     `timeout_minutes` raises the fixture's wall-clock budget for a scenario
     whose own waits outlast it; it never lowers it.
+    `substrates` narrows the control-plane substrates the fixture serves
+    (`FIXTURE_SUBSTRATES`) for what a substrate does not support by contract,
+    such as sandbox pods on Direct. A Direct-only defect is not a narrowing:
+    it is tracked by its issue and fails on the Direct lane. Do not quarantine
+    it either: a quarantine withholds the scenario on every substrate, the
+    required Kubernetes lane included. A suite run skips, visibly, the
+    scenarios its bench's substrate does not serve: on Kind it reads the
+    bench's, and on the deployed backend SPACE_SMOKE_SUBSTRATE names it.
     """
 
     if not id or any(part == "" for part in id.split(".")):
@@ -162,6 +191,11 @@ def scenario(
     supported_surfaces = frozenset(api_surfaces)
     if not supported_surfaces or not supported_surfaces <= {"ecw", "native", "node"}:
         raise ValueError("smoke API surfaces must contain ecw, native or node")
+    narrowed_substrates = frozenset(substrates) if substrates is not None else None
+    if narrowed_substrates is not None and (
+        not narrowed_substrates or not narrowed_substrates <= SUBSTRATES
+    ):
+        raise ValueError("smoke substrates must contain kubernetes or direct")
 
     def define(verify: Callable[[Fixture], None]) -> Scenario[Fixture]:
         docstring = inspect.getdoc(verify)
@@ -212,6 +246,12 @@ def scenario(
             )
         if storage_credentials is not None and fixture_type is not KindEcw:
             raise TypeError("a storage credentials mode requires the KindEcw fixture")
+        fixture_substrates = FIXTURE_SUBSTRATES[fixture_type]
+        if narrowed_substrates is not None and not narrowed_substrates < fixture_substrates:
+            raise ValueError(
+                f"smoke {id} substrates may only narrow its fixture's "
+                f"{', '.join(sorted(fixture_substrates))}"
+            )
         return Scenario(
             id=id,
             category=id.split(".", 1)[0],
@@ -227,6 +267,7 @@ def scenario(
             api_surfaces=supported_surfaces,
             timeout_minutes=timeout_minutes or fixture_type.timeout_minutes,
             backends=FIXTURE_BACKENDS[fixture_type],
+            substrates=narrowed_substrates or fixture_substrates,
             quarantined=quarantined,
             ignored=ignored,
             telemetry_mode=telemetry_mode,
@@ -301,6 +342,7 @@ class ScenarioRegistry:
         category: str | None = None,
         template: str | None = None,
         backend: str | None = None,
+        substrate: str | None = None,
         include_quarantined: bool = False,
         include_ignored: bool = False,
     ) -> tuple[Scenario[Any], ...]:
@@ -310,6 +352,7 @@ class ScenarioRegistry:
             if (category is None or scenario.category == category)
             and scenario.applies_to(template)
             and (backend is None or backend in scenario.backends)
+            and (substrate is None or substrate in scenario.substrates)
             and (include_quarantined or scenario.quarantined is None)
             and (include_ignored or scenario.ignored is None)
         )
