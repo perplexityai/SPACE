@@ -183,10 +183,13 @@ impl InlineOperations {
         execution: OperationExecutionConfig,
         route_signing: bool,
     ) -> Self {
+        // Expected on the admin surface, which has no authority by design and
+        // serves no inline work; the public and shared surfaces fail startup
+        // without one. So this is not a misconfiguration to warn about.
         if !route_signing && config.max_concurrent > 0 {
-            tracing::warn!(
-                "inline operation execution is disabled: this process has no route-signing \
-                 authority; operations stay queued for the dispatcher"
+            tracing::info!(
+                "inline operation execution is off: this process has no route-signing \
+                 authority; operations it records stay queued for the dispatcher"
             );
         }
         Self {
