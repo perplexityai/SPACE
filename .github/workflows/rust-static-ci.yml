@@ -186,12 +186,14 @@ jobs:
       # above), once resolve-migration-base.sh has checked the second is this
       # pull request. no_new_entries, no_raised_caps and crate_names.no_new
       # compare with its architecture-baseline.toml, and
-      # crate_names.policy_changed with its ARCHITECTURE.toml; an empty file
+      # crate_names.policy_changed, layers.policy_changed and layers.placement's
+      # check for new unmoved entries with its ARCHITECTURE.toml; an empty file
       # stands in for one the base lacks. The files git detects as renamed
       # since the base are passed too, so that a baseline entry moved with
       # its file is not a new one; without them, it is. If the base can't be
-      # resolved, a warning: the first two and policy_changed are skipped,
-      # and no_new allows only the crates listed when it was added.
+      # resolved, a warning: the first two and the ARCHITECTURE.toml
+      # comparisons are skipped, and no_new allows only the crates listed when
+      # it was added.
       - name: Check repository structure
         id: archcheck
         if: >-
@@ -252,7 +254,7 @@ jobs:
               for file in "${missing[@]}"; do
                 case "${file}" in
                   architecture-baseline.toml) skipped="no_new_entries and no_raised_caps are skipped, and crate_names.no_new allows only the crates listed when it was added" ;;
-                  ARCHITECTURE.toml) skipped="crate_names.policy_changed is skipped" ;;
+                  ARCHITECTURE.toml) skipped="crate_names.policy_changed, layers.policy_changed and the layers.placement check for new unmoved entries are skipped" ;;
                 esac
                 echo "::warning title=archcheck::Could not read the base ${file}; ${skipped}."
               done

@@ -222,7 +222,9 @@ impl Rule for CrateNames {
             ));
         }
 
-        if let BaseArchitecture::Loaded(base) = &ctx.base_architecture {
+        if let BaseArchitecture::Loaded(base) = &ctx.base_architecture
+            && let Ok(base) = &base.crate_names
+        {
             let mode = config.policy_changed.mode;
             findings.extend(
                 policy_changes(base.as_ref(), &ctx.crate_names_policy)
@@ -276,13 +278,13 @@ impl Rule for CrateNames {
     fn other_skips(&self, ctx: &Context) -> Vec<String> {
         let policy = format!("{RULE}.{POLICY_CHANGED} skipped");
         match &ctx.base_architecture {
-            BaseArchitecture::Loaded(_) => Vec::new(),
             BaseArchitecture::NotGiven => {
                 vec![format!("{policy} (no --base-architecture given)")]
             }
-            BaseArchitecture::Unusable(unusable) => {
-                vec![BaseSkip::Unusable(unusable).message(&policy)]
-            }
+            BaseArchitecture::Loaded(base) => match &base.crate_names {
+                Ok(_) => Vec::new(),
+                Err(unusable) => vec![BaseSkip::Unusable(unusable).message(&policy)],
+            },
         }
     }
 

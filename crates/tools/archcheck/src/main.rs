@@ -14,7 +14,7 @@ use std::{
 
 use pplx_space_archcheck::{
     BASELINE_FILE, Baseline, Context, LoadError, Renames, WriteBaselineError, check,
-    config::CrateNamesPolicy,
+    config::BaseArchitecture,
     context::find_workspace_root,
     report::{Format, UnknownFormatError, render, summary},
     skipped, write_baseline, write_baseline_table,
@@ -43,12 +43,14 @@ usage: archcheck [--root <path>] [--format human|rdjson]
                       counted as new (without it, it is)
   --base-architecture <path>
                       the base branch's ARCHITECTURE.toml, which
-                      crate_names.policy_changed compares with (skipped
-                      without it)
+                      crate_names.policy_changed, layers.policy_changed and
+                      layers.placement's new unmoved entries compare with
+                      (skipped without it)
   --write-baseline[=<table>]
                       update or remove the entries of architecture-baseline.toml
                       to match the current tree, or with =<table> (file_size,
-                      crate_names or pattern_ratchet.<instance>) only that
+                      crate_names, pattern_ratchet.<instance> or
+                      layers.<check>) only that
                       table's, keeping the others. It lists each violation
                       without an entry, with the entries to add by hand, and
                       never adds one";
@@ -188,7 +190,7 @@ fn run(options: Options) -> Result<ExitCode, RunError> {
         ctx.renames = Some(Renames::load(path)?);
     }
     if let Some(path) = &options.base_architecture {
-        ctx.base_architecture = CrateNamesPolicy::load_base(path)?;
+        ctx.base_architecture = BaseArchitecture::load(path)?;
     }
     let findings = check(&ctx);
     let report = render(options.format, &findings, ctx.files.len());

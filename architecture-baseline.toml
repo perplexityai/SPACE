@@ -185,6 +185,49 @@
 # database migrator takes them from the store.
 [pattern_ratchet.sbxmgr_sqlite_schema]
 
+# [layers.<check>] maps each workspace package to the workspace packages it
+# depends on against the layers rule's <check>. Only remove entries: a pull
+# request that adds one is reported.
+[layers.dev_direction]
+pplx-space-sbx-mgr-store = [
+  "pplx-space-node-runtime-core",
+]
+
+[layers.direction]
+pplx-space-common-grpc = [
+  "pplx-space-common-core",
+]
+pplx-space-common-jobs = [
+  "pplx-space-common-core",
+]
+pplx-space-common-svc = [
+  "pplx-space-api-route",
+  "pplx-space-auto-lifecycle-receipt",
+  "pplx-space-common-core",
+  "pplx-space-ecw-credential",
+  "pplx-space-federated-grant-store",
+  "pplx-space-federated-identity",
+  "pplx-space-ingress-admission",
+  "pplx-space-k8s-node-id",
+  "pplx-space-node-registration-store",
+  "pplx-space-sandbox-quarantine-store",
+  "pplx-space-sandbox-routability",
+  "pplx-space-state-reconciliation",
+]
+pplx-space-metrics = [
+  "pplx-space-common-core",
+]
+pplx-space-object-store = [
+  "pplx-space-common-core",
+]
+pplx-space-observability = [
+  "pplx-space-cluster-id",
+  "pplx-space-common-core",
+]
+pplx-space-uds-peer-auth = [
+  "pplx-space-common-core",
+]
+
 # [crate_names] maps each workspace package with a catch-all name (a part such
 # as `common`, `utils` or `core`) to its member path. Only remove entries: a pull
 # request that adds one is reported, and fails the check.

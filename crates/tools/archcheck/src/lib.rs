@@ -65,8 +65,9 @@ pub struct WrittenBaseline {
 /// Updates every table of `architecture-baseline.toml` from its entries and
 /// the current tree: entries still in violation are kept and updated, the
 /// rest are removed, and none are added. A `pattern_ratchet` table the
-/// existing baseline lacks is not created; `[file_size]` and `[crate_names]`
-/// are always written.
+/// existing baseline lacks is not created; `[file_size]`, `[crate_names]`
+/// and, with the layers rule configured, each `[layers.<check>]` are always
+/// written.
 pub fn write_baseline(root: &Path) -> Result<WrittenBaseline, WriteBaselineError> {
     let ctx = Context::load(root)?;
     let (baseline, not_added) = update_baseline(&ctx);
@@ -83,7 +84,8 @@ pub fn write_baseline(root: &Path) -> Result<WrittenBaseline, WriteBaselineError
 /// The existing baseline must exist, parse and pass the same checks as for
 /// `cargo arch`, such as every `pattern_ratchet` table naming a configured
 /// instance, so the file written is one the next check accepts. `table` must
-/// be `file_size`, `crate_names` or a configured instance's table.
+/// be `file_size`, `crate_names`, a configured instance's table or, with the
+/// layers rule configured, `layers.<check>`.
 pub fn write_baseline_table(
     root: &Path,
     table: &str,
