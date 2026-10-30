@@ -5154,9 +5154,8 @@ fn detail_reports_authoritative_federated_ownership_not_metadata() {
     "#);
 
     sandbox.upstream_org_id = None;
-    assert!(
-        build_detail_sandbox(&test_ecw_credential_keyring(), &sandbox, &response, None).is_err()
-    );
+    build_detail_sandbox(&test_ecw_credential_keyring(), &sandbox, &response, None)
+        .expect_err("incomplete federated ownership must be rejected");
 }
 
 #[test]
