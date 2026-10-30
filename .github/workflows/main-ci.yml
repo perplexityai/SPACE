@@ -205,7 +205,7 @@ jobs:
   # The only job that writes the Kind runtime images' and the seed builder's
   # tags in ghcr.io/perplexityai/space-kind-build-cache, which every Kind
   # shard's bring-up imports (infra/space/kind/scripts/runtime-image-cache.sh).
-  # It exports only after all four shards of this commit passed, so a layer
+  # It exports only after every shard of this commit passed, so a layer
   # that broke the smoke is not published. It rebuilds a changed stage from
   # upstream at its own time, though: a layer broken then stays in use until
   # SPACE_KIND_LAYER_CACHE_EPOCH (infra/space/kind/lib/build-cache.sh) is
