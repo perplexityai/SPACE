@@ -88,14 +88,63 @@ jobs:
         continue-on-error: true
         run: python3 infra/space/kind/scripts/rust-artifact-handoff.py reuse ghcr.io/perplexityai/space-kind-rust-artifacts
 
+      # A PR that changes Rust inputs restores main's newest incremental build
+      # state instead of compiling the workspace from its dependencies up: the
+      # Cargo target directory, the source mirror whose mtimes tell Cargo what
+      # changed, and the Cargo home (infra/space/kind/scripts/rust-state-cache.sh).
+      # The build below then runs in incremental mode and recompiles only the
+      # crates whose inputs changed; without a restored state it builds in
+      # Docker mode, as before. The key never crosses the toolchain, the Cargo
+      # config, the builder image or the scripts that drive the build. It does
+      # cross Cargo.lock, whose changes Cargo's own fingerprints track. Main
+      # never restores one: rust_state below builds main's cold. Setting the
+      # repository variable SPACE_KIND_RUST_STATE to `off` turns this off.
+      - &rust-state-key
+        name: Name the Kind Rust build state
+        id: state-key
+        if: steps.reuse.outputs.reused != 'true' && inputs.rust_build != 'release' && vars.SPACE_KIND_RUST_STATE != 'off'
+        env:
+          FAMILY: space-target-v2-${{ runner.os }}-${{ runner.arch }}-kind-test-hooks
+          HARD: >-
+            ${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml', 'docker/Dockerfile.rust-build-common',
+            'docker/run-cargo-with-sccache.sh', 'infra/space/kind/scripts/build-rust-artifacts.sh',
+            'infra/space/kind/scripts/sync-rust-sources.py', 'infra/space/kind/scripts/rust-state-cache.sh') }}
+          LOCK: ${{ hashFiles('Cargo.lock') }}
+        run: |
+          {
+            echo "hard=${FAMILY}-${HARD:0:16}-"
+            echo "lock=${FAMILY}-${HARD:0:16}-${LOCK:0:16}-"
+            echo "key=${FAMILY}-${HARD:0:16}-${LOCK:0:16}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          } >>"${GITHUB_OUTPUT}"
+
+      - name: Restore main's Kind Rust build state
+        if: steps.state-key.outcome == 'success' && github.event_name != 'push'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/kind-rust-state-parts
+          key: ${{ steps.state-key.outputs.key }}
+          restore-keys: |
+            ${{ steps.state-key.outputs.lock }}
+            ${{ steps.state-key.outputs.hard }}
+
+      - name: Unpack the Kind Rust build state
+        id: state
+        if: steps.state-key.outcome == 'success' && github.event_name != 'push'
+        run: >-
+          bash infra/space/kind/scripts/rust-state-cache.sh unpack
+          "${RUNNER_TEMP}/kind-rust-state-parts" "${RUNNER_TEMP}/kind-rust-state"
+
       - name: Build the Rust artifact image once
         if: steps.reuse.outputs.reused != 'true'
         env:
           SPACE_CI_IMAGE_MIRROR: ghcr
-          SPACE_KIND_RUST_ARTIFACTS: docker
+          SPACE_KIND_RUST_ARTIFACTS: ${{ steps.state.outputs.restored == 'true' && 'incremental' || 'docker' }}
           SPACE_KIND_RUST_BUILD: ${{ inputs.rust_build == 'release' && 'release' || '' }}
           SPACE_KIND_BUILD_CACHE_REPOSITORY: ghcr.io/perplexityai/space-kind-build-cache
           SPACE_KIND_BUILD_CACHE_WRITE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && '1' || '0' }}
+          SPACE_KIND_RUST_TARGET_DIR: ${{ runner.temp }}/kind-rust-state/target
+          SPACE_KIND_RUST_SRC_DIR: ${{ runner.temp }}/kind-rust-state/src
+          SPACE_KIND_CARGO_HOME: ${{ runner.temp }}/kind-rust-state/cargo-home
         run: bash infra/space/kind/scripts/build-rust-artifacts.sh
 
       - name: Export this run's artifact image
@@ -113,6 +162,59 @@ jobs:
           compression-level: 0
           if-no-files-found: error
           retention-days: 1
+
+  # Main only: the build state pull requests restore in rust_artifacts. A cold
+  # incremental build of main's commit, beside the producer and off the
+  # shards' critical path. Building it cold is what catches an input Cargo was
+  # never told about. Each run saves under a key of its own, and Main CI's
+  # rust_cache_cleanup keeps the newest state for each of the last few build
+  # inputs (ci/scripts/sccache-snapshot.py prune). Best-effort: without a saved
+  # state, pull requests build in Docker mode.
+  rust_state:
+    if: >-
+      github.repository == 'perplexityai/SPACE' && github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' && inputs.rust_build != 'release' &&
+      vars.SPACE_KIND_RUST_STATE != 'off'
+    name: Save the Kind Rust build state
+    runs-on: ubuntu-24.04-16core
+    timeout-minutes: 60
+    continue-on-error: true
+    steps:
+      - name: Check out SPACE
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - *enable-containerd-store
+
+      - name: Expose the existing Actions cache for read-only imports
+        uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4.0.0
+
+      - *ghcr-login
+
+      - *rust-state-key
+
+      - name: Build the Rust artifacts cold in incremental mode
+        env:
+          SPACE_CI_IMAGE_MIRROR: ghcr
+          SPACE_KIND_RUST_ARTIFACTS: incremental
+          SPACE_KIND_BUILD_CACHE_REPOSITORY: ghcr.io/perplexityai/space-kind-build-cache
+          SPACE_KIND_RUST_TARGET_DIR: ${{ runner.temp }}/kind-rust-state/target
+          SPACE_KIND_RUST_SRC_DIR: ${{ runner.temp }}/kind-rust-state/src
+          SPACE_KIND_CARGO_HOME: ${{ runner.temp }}/kind-rust-state/cargo-home
+        run: bash infra/space/kind/scripts/build-rust-artifacts.sh
+
+      - name: Pack the Kind Rust build state for upload
+        run: >-
+          bash infra/space/kind/scripts/rust-state-cache.sh pack
+          "${RUNNER_TEMP}/kind-rust-state" "${RUNNER_TEMP}/kind-rust-state-parts"
+
+      - name: Save the Kind Rust build state
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/kind-rust-state-parts
+          key: ${{ steps.state-key.outputs.key }}
 
   # Main only: push the image main's producer just built under its Rust input
   # key, for PRs with the same key to reuse, and prune the producer's two
