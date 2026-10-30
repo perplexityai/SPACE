@@ -41,7 +41,9 @@ use pplx_space_common_jobs::{BackgroundWorker, Job, JobError, JobExecutor, Worke
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };
-use pplx_space_volmgr_client::proto::{GetTransferJobRequest, TransferJobStatus};
+use pplx_space_volmgr_client::proto::{
+    GetTransferJobRequest, TransferJobFailureKind, TransferJobStatus,
+};
 
 use pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat;
 
@@ -234,7 +236,10 @@ impl JobExecutor for SnapshotUploadExecutor {
                 Ok(observation) => {
                     artifact_results.push(observation);
                 }
-                Err(err) => {
+                Err(ArtifactWaitError::TransferGaveUp(message)) => {
+                    return Err(self.resubmit_on_next_attempt(job, &mut payload, message));
+                }
+                Err(ArtifactWaitError::Job(err)) => {
                     // Best-effort mark the cluster row failed so retention
                     // can prune it. Failure to do so is logged but does
                     // not change the outcome — the worker still reports
@@ -288,7 +293,10 @@ impl JobExecutor for SnapshotUploadExecutor {
             .await
             {
                 Ok(observation) => artifact_results.push(observation),
-                Err(error) => {
+                Err(ArtifactWaitError::TransferGaveUp(message)) => {
+                    return Err(self.resubmit_on_next_attempt(job, &mut payload, message));
+                }
+                Err(ArtifactWaitError::Job(error)) => {
                     if matches!(error, JobError::Permanent(_)) {
                         converge_failed_upload(&payload, "vol_mgr_transfer", error.message()).await;
                     }
@@ -422,6 +430,22 @@ impl JobExecutor for SnapshotUploadExecutor {
 }
 
 impl SnapshotUploadExecutor {
+    /// vol-mgr gave up on a transfer after transient failures. Forget this
+    /// attempt's transfers so the next attempt submits them again from the
+    /// local artifact, which the upload keeps until it is durable.
+    fn resubmit_on_next_attempt(
+        &self,
+        job: &pplx_space_common_jobs::Job,
+        payload: &mut SnapshotUploadJobs,
+        message: String,
+    ) -> JobError {
+        payload.job_ids.clear();
+        if let Err(error) = persist_submitted_transfer_ids(&self.db, &job.job_id, payload) {
+            return error;
+        }
+        JobError::retriable(message)
+    }
+
     /// READY must return success without another await: optional local work,
     /// including the node-manager inspection a reclaim needs, cannot consume
     /// the execution deadline and turn the final attempt into a failed job
@@ -1058,6 +1082,21 @@ struct ArtifactTransferObservation {
     transfer_duration_ms: Option<f64>,
 }
 
+/// Why observing a vol-mgr transfer ended without its bytes.
+#[derive(Debug)]
+enum ArtifactWaitError {
+    /// vol-mgr ran out of retries on transient errors. Polling the same
+    /// transfer again can't succeed, but submitting it again may.
+    TransferGaveUp(String),
+    Job(JobError),
+}
+
+impl From<JobError> for ArtifactWaitError {
+    fn from(error: JobError) -> Self {
+        Self::Job(error)
+    }
+}
+
 /// Observe a durable transfer until terminal, bounded by the worker's overall
 /// attempt deadline. Connect and individual read-only probes each have a
 /// ten-second budget; transport failures retry the upload job, while permanent
@@ -1068,14 +1107,14 @@ async fn wait_for_artifact_job(
     sandbox_id: &str,
     job_id: &JobId,
     cancellation: tokio_util::sync::CancellationToken,
-) -> Result<ArtifactTransferObservation, JobError> {
+) -> Result<ArtifactTransferObservation, ArtifactWaitError> {
     // One reconnecting channel per artifact attempt, not a fresh connection
     // on every poll. These are observation-only requests: timing out does not
     // abandon the durable volume-manager transfer or cancel remote mutation.
     let volume_manager_socket = volume_manager_socket.to_string_lossy();
     let client = tokio::select! {
         biased;
-        _ = cancellation.cancelled() => return Err(JobError::YieldedForRestart),
+        _ = cancellation.cancelled() => return Err(JobError::YieldedForRestart.into()),
         result = tokio::time::timeout(
             TRANSFER_PROBE_TIMEOUT,
             pplx_space_volmgr_client::connect(&volume_manager_socket),
@@ -1104,12 +1143,12 @@ async fn poll_artifact_job(
     job_id: JobId,
     mut client: pplx_space_volmgr_client::ConnectedVolumeManagerClient,
     cancellation: tokio_util::sync::CancellationToken,
-) -> Result<ArtifactTransferObservation, JobError> {
+) -> Result<ArtifactTransferObservation, ArtifactWaitError> {
     let mut interval = ARTIFACT_POLL_INITIAL;
     loop {
         let resp = tokio::select! {
             biased;
-            _ = cancellation.cancelled() => return Err(JobError::YieldedForRestart),
+            _ = cancellation.cancelled() => return Err(JobError::YieldedForRestart.into()),
             response = tokio::time::timeout(TRANSFER_PROBE_TIMEOUT, client.get_transfer_job(GetTransferJobRequest {
                 job_id: job_id.to_string(),
             })) => response
@@ -1156,6 +1195,7 @@ async fn poll_artifact_job(
                 });
             }
             Some(TransferJobStatus::Failed) => {
+                let gave_up = job.failure_kind() == TransferJobFailureKind::Retriable;
                 let error = job.error.unwrap_or_default();
                 emit_sandbox_event(
                     sandbox_id,
@@ -1165,15 +1205,21 @@ async fn poll_artifact_job(
                         .transfer_job_id(job_id.to_string())
                         .error(error.clone()),
                 );
+                if gave_up {
+                    return Err(ArtifactWaitError::TransferGaveUp(format!(
+                        "vol-mgr job {job_id} ran out of retries: {error}"
+                    )));
+                }
                 return Err(JobError::permanent(format!(
                     "vol-mgr job {job_id} failed permanently: {}",
                     error
-                )));
+                ))
+                .into());
             }
             _ => {
                 tokio::select! {
                     biased;
-                    _ = cancellation.cancelled() => return Err(JobError::YieldedForRestart),
+                    _ = cancellation.cancelled() => return Err(JobError::YieldedForRestart.into()),
                     _ = tokio::time::sleep(interval) => {}
                 }
                 interval = next_artifact_poll_interval(interval);

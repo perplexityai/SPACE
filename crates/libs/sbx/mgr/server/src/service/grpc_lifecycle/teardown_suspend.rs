@@ -32,11 +32,13 @@ pub(in crate::service) enum KeyedUploadUse {
 
 /// How many of an artifact's uploads may fail an attempt permanently before a
 /// teardown stops starting new ones: the first, which may have met an outage
-/// such as a transfer vol-mgr gave up on, and one recovery attempt. A failure
-/// that recurs on a fresh attempt is treated as the artifact's own. Refusals
-/// of the artifact don't count against it: after one, the teardown starts an
-/// attempt only once the fence admits the registration, though other callers
-/// under the artifact's key may start their own.
+/// such as a failure vol-mgr misclassified as permanent, and one recovery
+/// attempt. A transfer vol-mgr ran out of retries on is retried, not counted
+/// here. A failure that recurs on a fresh attempt is treated as the
+/// artifact's own. Refusals of the artifact don't count against it: after
+/// one, the teardown starts an attempt only once the fence admits the
+/// registration, though other callers under the artifact's key may start
+/// their own.
 pub(in crate::service) const PERMANENTLY_FAILED_UPLOAD_LIMIT: u64 = 2;
 
 /// The teardown's rule for the newest upload under the artifact's key, in
