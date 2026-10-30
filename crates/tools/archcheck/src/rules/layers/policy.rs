@@ -12,7 +12,7 @@ use super::{
 };
 use crate::{
     config::{BaseArchitecture, CONFIG_FILE, Entries, Layer, LayersConfig, LayersPolicy, Mode},
-    context::Context,
+    context::{CATALOGS_DIR, Context},
     finding::{Finding, Location},
 };
 
@@ -188,10 +188,15 @@ pub(super) fn rule_removed(ctx: &Context) -> Vec<Finding> {
     }]
 }
 
-/// Every difference of `[rules.layers]` from the base branch's copy. A
-/// removed `unmoved` entry is one only when its crate moved into the
-/// directory of another layer than the entry's; otherwise the crate either
-/// moved where the entry said, was deleted, or is a `placement` finding.
+/// Every difference of `[rules.layers]` from the base branch's copy,
+/// including `[rules.layers.state]`'s shared catalogs, added or removed
+/// with or without databases, its co-writer grants and the state checks'
+/// modes. The stores' own declarations are in their
+/// manifests, which the base inputs don't include, so a change to them is
+/// not one. A removed
+/// `unmoved` entry is one only when its crate moved into the directory of
+/// another layer than the entry's; otherwise the crate either moved where
+/// the entry said, was deleted, or is a `placement` finding.
 pub(super) fn policy_changed(
     ctx: &Context,
     config: &LayersConfig,
@@ -276,16 +281,45 @@ fn changes(base: Option<&LayersPolicy>, policy: &LayersPolicy) -> Vec<(usize, St
             Some(_) => {}
         }
     }
-    for (key, what) in [("store_users", "users"), ("allowed_edges", "allowed edges")] {
+    for (key, what) in [
+        ("store_users", "users"),
+        ("allowed_edges", "allowed edges"),
+        ("state.shared_catalogs", "databases"),
+        ("state.co_writers", "co-writers"),
+    ] {
         let (old, new) = match key {
             "store_users" => (&base.store_users, &policy.store_users),
-            _ => (&base.allowed_edges, &policy.allowed_edges),
+            "allowed_edges" => (&base.allowed_edges, &policy.allowed_edges),
+            "state.shared_catalogs" => (&base.shared_catalogs, &policy.shared_catalogs),
+            _ => (&base.co_writers, &policy.co_writers),
         };
         let packages: BTreeSet<&String> = old.entries.keys().chain(new.entries.keys()).collect();
         for package in packages {
             let old_items = old.entries.get(package).map(|(items, _)| items);
             let new_entry = new.entries.get(package);
             let entry_line = new_entry.map_or(new.line.unwrap_or(policy.line), |(_, line)| *line);
+            // A shared catalog is no database of its own even with no
+            // database listed, so adding or removing one changes what the
+            // state checks read, whatever its list.
+            if key == "state.shared_catalogs" {
+                match (old_items, new_entry) {
+                    (None, Some(_)) => changes.push((
+                        entry_line,
+                        format!(
+                            ": `{package}` was added to {table} {key}, so {CATALOGS_DIR}/{package} \
+                             is no database of its own."
+                        ),
+                    )),
+                    (Some(_), None) => changes.push((
+                        entry_line,
+                        format!(
+                            ": `{package}` was removed from {table} {key}, so \
+                             {CATALOGS_DIR}/{package} is a database of its own."
+                        ),
+                    )),
+                    _ => {}
+                }
+            }
             for (item, line) in new_entry.map(|(items, _)| items).into_iter().flatten() {
                 if !old_items.is_some_and(|old| old.contains_key(item)) {
                     changes.push((

@@ -938,3 +938,48 @@ mode = "required"
 
 [rules.layers.policy_changed]     # changes to [rules.layers], compared with the base branch
 mode = "advisory"
+
+# State ownership: each store declares the tables it owns, by database, in
+# its Cargo.toml's [package.metadata.space.state]. db/common is not a database
+# of its own: the migrator applies it to these databases before their own
+# catalog.
+[rules.layers.state.shared_catalogs]
+common = [
+  "build-manager",
+  "runtime-manager",
+  "sandbox-manager",
+  "template-manager",
+  "volume-manager",
+]
+
+# Co-writers: the stores that may write a table another store owns, by
+# database namespace, until those writes fold into the owner. Adding one is a
+# policy change that review approves.
+[rules.layers.state.co_writers.postgres]
+# Placement claims a sandbox for a node; teardown deletes a sandbox's rows.
+sandboxes = ["pplx-space-placement", "pplx-space-sandbox-teardown"]
+# Teardown deletes a sandbox's snapshot locations.
+snapshot_storage_locations = ["pplx-space-sandbox-teardown"]
+
+[rules.layers.state.declarations]  # every store declares its databases; only stores declare state
+mode = "required"
+
+[rules.layers.state.owners]        # no table has two owners
+mode = "required"
+
+[rules.layers.state.writes]        # among the stores, only a table's owner and co-writers write it
+mode = "required"
+
+[rules.layers.state.pending]       # a declared table no migration creates yet
+mode = "advisory"
+
+# Every live table has an owner; today's tables without one are baselined in
+# [layers.unowned].
+[rules.layers.unowned.no_crossing]
+mode = "required"
+
+[rules.layers.unowned.no_new_entries]
+mode = "required"
+
+[rules.layers.unowned.stale_entries]
+mode = "required"

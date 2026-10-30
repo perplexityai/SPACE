@@ -13,7 +13,10 @@ use thiserror::Error;
 use toml::Spanned;
 
 use super::BehaviourConfig;
-use crate::baseline::line_of;
+use crate::{
+    baseline::line_of,
+    context::{Dialect, POSTGRES, declared_table, sqlite_namespace},
+};
 
 /// A layer of the stack, bottom-up, or one of the two sets of crates beside
 /// it. Its name is its directory under `crates/`.
@@ -139,6 +142,110 @@ pub struct LayersConfig {
     pub store_edges: BehaviourConfig,
     pub stale_entries: BehaviourConfig,
     pub policy_changed: BehaviourConfig,
+    /// `[rules.layers.state]`, which store owns each table; the state checks
+    /// run only with it, and need `unowned` too.
+    #[serde(default)]
+    pub state: Option<StateConfig>,
+    /// `[rules.layers.unowned]`: the behaviours of the check that every live
+    /// table has an owner or a baseline entry.
+    #[serde(default)]
+    pub unowned: Option<EdgeBehaviours>,
+}
+
+/// `[rules.layers.state]`: the shared catalogs under `db/`, and the mode of
+/// each state check without a baseline table.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateConfig {
+    /// Each catalog under `db/` that is not a database of its own, to the
+    /// databases it is applied to, before their own catalog.
+    #[serde(default)]
+    pub shared_catalogs: BTreeMap<String, PackageSet>,
+    /// The approved exceptions to `state.writes`.
+    #[serde(default)]
+    pub co_writers: CoWriters,
+    pub owners: BehaviourConfig,
+    pub declarations: BehaviourConfig,
+    pub writes: BehaviourConfig,
+    pub pending: BehaviourConfig,
+}
+
+/// `[rules.layers.state.co_writers]`: by database namespace (`postgres`,
+/// or `sqlite.<database>`), each table a store owns to the other stores that
+/// may write it too. Here and not in the stores' manifests, so that
+/// `layers.policy_changed` reports each grant added or removed. Two keys of
+/// a namespace that name one table, such as `sandboxes` and
+/// `public.sandboxes`, are an error: `policy_changed` keys grants by table,
+/// so one would hide the other's stores.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(try_from = "CoWriterTables")]
+pub struct CoWriters {
+    pub postgres: BTreeMap<String, PackageSet>,
+    /// Database to its tables.
+    pub sqlite: BTreeMap<String, BTreeMap<String, PackageSet>>,
+}
+
+/// `[rules.layers.state.co_writers]` as written.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CoWriterTables {
+    #[serde(default)]
+    postgres: BTreeMap<String, PackageSet>,
+    #[serde(default)]
+    sqlite: BTreeMap<String, BTreeMap<String, PackageSet>>,
+}
+
+#[derive(Debug, Error)]
+#[error(
+    "[rules.layers.state.co_writers.{namespace}] names the table {table} twice, as {first:?} \
+     and {second:?}; merge their stores into one key"
+)]
+pub struct DuplicateGrantError {
+    namespace: String,
+    table: String,
+    first: String,
+    second: String,
+}
+
+impl TryFrom<CoWriterTables> for CoWriters {
+    type Error = DuplicateGrantError;
+
+    fn try_from(tables: CoWriterTables) -> Result<Self, Self::Error> {
+        let grants = Self {
+            postgres: tables.postgres,
+            sqlite: tables.sqlite,
+        };
+        let mut written: BTreeMap<(String, String), &String> = BTreeMap::new();
+        for (namespace, table, _) in grants.grants() {
+            let key = declared_table(Dialect::of(&namespace), table);
+            if let Some(first) = written.get(&(namespace.clone(), key.clone())) {
+                return Err(DuplicateGrantError {
+                    namespace,
+                    table: key,
+                    first: (*first).clone(),
+                    second: table.clone(),
+                });
+            }
+            written.insert((namespace, key), table);
+        }
+        Ok(grants)
+    }
+}
+
+impl CoWriters {
+    /// Each grant's namespace, table as written, and stores.
+    pub fn grants(&self) -> impl Iterator<Item = (String, &String, &PackageSet)> {
+        let postgres = self
+            .postgres
+            .iter()
+            .map(|(table, stores)| (POSTGRES.to_owned(), table, stores));
+        let sqlite = self.sqlite.iter().flat_map(|(database, tables)| {
+            tables
+                .iter()
+                .map(|(table, stores)| (sqlite_namespace(database), table, stores))
+        });
+        postgres.chain(sqlite)
+    }
 }
 
 /// `[rules.layers.unmoved]`: each layer's packages, read as package to
@@ -289,7 +396,8 @@ impl TryFrom<Vec<String>> for Drivers {
     }
 }
 
-/// The behaviours of a layers check with a baseline table of edges.
+/// The behaviours of a layers check with a baseline table: of edges, or of
+/// each database's tables for `unowned`.
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EdgeBehaviours {
@@ -298,7 +406,7 @@ pub struct EdgeBehaviours {
     pub stale_entries: BehaviourConfig,
 }
 
-/// Package names, each listed once.
+/// Package names, or database names in `shared_catalogs`, each listed once.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(try_from = "Vec<String>")]
 pub struct PackageSet(BTreeSet<String>);
@@ -358,6 +466,11 @@ pub struct LayersPolicy {
     /// `[rules.layers.domain_fences]`: each package to its family and the
     /// line it is written on.
     pub domain_fences: Entries<String>,
+    /// Shared catalog to the databases it is applied to.
+    pub shared_catalogs: Entries<BTreeMap<String, usize>>,
+    /// `[rules.layers.state.co_writers]`: each granted table, as
+    /// `<namespace>.<table>`, to the stores that may write it.
+    pub co_writers: Entries<BTreeMap<String, usize>>,
     /// Behaviour name, such as `placement` or `direction.no_crossing`, to
     /// its mode as written and the mode's line.
     pub modes: BTreeMap<String, (String, usize)>,
@@ -371,6 +484,17 @@ pub struct StoragePolicy {
     pub line: Option<usize>,
     pub drivers: BTreeMap<String, usize>,
     pub helpers: BTreeMap<String, usize>,
+}
+
+impl LayersPolicy {
+    /// Whether the policy sets a mode of `check`, such as `unowned`, which
+    /// the checks configured as a whole always do.
+    pub fn has_check(&self, check: &str) -> bool {
+        let prefix = format!("{check}.");
+        self.modes
+            .keys()
+            .any(|behaviour| behaviour.starts_with(&prefix))
+    }
 }
 
 /// One table of `[rules.layers]` keyed by package name.
@@ -417,6 +541,27 @@ struct PolicyTable {
     store_edges: Option<PolicyBehaviour>,
     stale_entries: Option<PolicyBehaviour>,
     policy_changed: Option<PolicyBehaviour>,
+    state: Option<PolicyState>,
+    unowned: Option<PolicyEdgeBehaviours>,
+}
+
+/// Each table to the packages listed for it.
+type PolicyLists = BTreeMap<Spanned<String>, Vec<Spanned<String>>>;
+
+#[derive(Deserialize)]
+struct PolicyState {
+    shared_catalogs: Option<PolicyLists>,
+    co_writers: Option<PolicyCoWriters>,
+    owners: Option<PolicyBehaviour>,
+    declarations: Option<PolicyBehaviour>,
+    writes: Option<PolicyBehaviour>,
+    pending: Option<PolicyBehaviour>,
+}
+
+#[derive(Deserialize)]
+struct PolicyCoWriters {
+    postgres: Option<PolicyLists>,
+    sqlite: Option<BTreeMap<String, PolicyLists>>,
 }
 
 #[derive(Deserialize)]
@@ -511,6 +656,23 @@ impl LayersPolicy {
             None => header_line(text, "[rules.layers]"),
         };
         let protocols = packages(table.protocols.map(Spanned::into_inner));
+        let (shared_catalogs, co_writers, state) = match table.state {
+            Some(state) => (
+                lists("state.shared_catalogs", state.shared_catalogs),
+                co_writers(text, state.co_writers),
+                vec![
+                    ("owners", state.owners),
+                    ("declarations", state.declarations),
+                    ("writes", state.writes),
+                    ("pending", state.pending),
+                ],
+            ),
+            None => (
+                lists("state.shared_catalogs", None),
+                co_writers(text, None),
+                Vec::new(),
+            ),
+        };
         let mut modes = BTreeMap::new();
         let mut mode = |behaviour: String, entry: Option<PolicyBehaviour>| {
             if let Some(mode) = entry.and_then(|entry| entry.mode) {
@@ -528,6 +690,9 @@ impl LayersPolicy {
         ] {
             mode(behaviour.to_owned(), entry);
         }
+        for (behaviour, entry) in state {
+            mode(format!("state.{behaviour}"), entry);
+        }
         for (check, entry) in [
             ("direction", table.direction),
             ("dev_direction", table.dev_direction),
@@ -535,6 +700,7 @@ impl LayersPolicy {
             ("codec_features", table.codec_features),
             ("domain_dependencies", table.domain_dependencies),
             ("model_protocol", table.model_protocol),
+            ("unowned", table.unowned),
         ] {
             let Some(entry) = entry else { continue };
             for (behaviour, entry) in [
@@ -563,8 +729,48 @@ impl LayersPolicy {
             protocols,
             protocols_line,
             domain_fences,
+            shared_catalogs,
+            co_writers,
             modes,
         }))
+    }
+}
+
+/// `[rules.layers.state.co_writers]` of `text`, keyed by
+/// `<namespace>.<table>`, with the table named as the state checks key it
+/// and the stores of two keys that name it merged.
+fn co_writers(text: &str, table: Option<PolicyCoWriters>) -> Entries<BTreeMap<String, usize>> {
+    let line = |span: std::ops::Range<usize>| line_of(text, span.start);
+    let (postgres, sqlite) = table.map_or((None, None), |table| (table.postgres, table.sqlite));
+    let namespaces = postgres
+        .map(|tables| (POSTGRES.to_owned(), tables))
+        .into_iter()
+        .chain(
+            sqlite
+                .into_iter()
+                .flatten()
+                .map(|(database, tables)| (sqlite_namespace(&database), tables)),
+        );
+    let mut entries = BTreeMap::new();
+    for (namespace, tables) in namespaces {
+        for (table, stores) in tables {
+            let at = line(table.span());
+            let stores = stores.into_iter().map(|store| {
+                let at = line(store.span());
+                (store.into_inner(), at)
+            });
+            let table = declared_table(Dialect::of(&namespace), table.get_ref());
+            // A base branch's copy may name a table twice, which grants it
+            // the stores of both.
+            let (granted, _) = entries
+                .entry(format!("{namespace}.{table}"))
+                .or_insert_with(|| (BTreeMap::new(), at));
+            granted.extend(stores);
+        }
+    }
+    Entries {
+        line: header_line(text, "[rules.layers.state.co_writers"),
+        entries,
     }
 }
 
