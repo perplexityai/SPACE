@@ -274,23 +274,6 @@ pub fn btrfs_send_stream_rejected(reason: BtrfsSendStreamRejection) {
     );
 }
 
-/// `node_mgr.btrfs_receive.stream_salvaged`: a restore's `btrfs receive`
-/// rejected the staged stream, which was a send the kernel restarted mid-pipe
-/// (partial output, then a complete stream), and node-manager received its
-/// complete stream instead. Streams stored before the upload framing check
-/// existed take this path; no lease or sandbox tag.
-pub fn btrfs_receive_stream_salvaged() {
-    counter("node_mgr.btrfs_receive.stream_salvaged", 1, &[]);
-}
-
-/// `node_mgr.btrfs_receive.failed`: a restore's `btrfs receive` failed for a
-/// reason other than cancellation, after node-manager tried to salvage a send
-/// restarted mid-pipe from the staged stream. No lease or sandbox tag; the
-/// matching warning carries the sandbox.
-pub fn btrfs_receive_failed() {
-    counter("node_mgr.btrfs_receive.failed", 1, &[]);
-}
-
 /// 1 while node-manager enforces the admit-nothing policy it falls back to
 /// when it can't read the cluster execution policy it persisted, else 0. It
 /// drops to 0 on the first inventory read after an application replaces that

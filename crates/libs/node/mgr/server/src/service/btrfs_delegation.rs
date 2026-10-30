@@ -953,35 +953,12 @@ impl NodeManagerService {
         )?;
 
         let owner = self.artifact_work.clone();
-        let salvaged = self
-            .off_runtime("receive and publish btrfs stream", move || {
-                let receive = artifact_fs::receive::ReceiveRoot::open(&sandbox_root)?;
-                receive.receive_staged(owner.as_ref().map(|owner| &owner.cancel))
-            })
-            .await
-            .inspect_err(|status| {
-                if status.code() != tonic::Code::Cancelled {
-                    pplx_space_metrics::node_manager::btrfs_receive_failed();
-                    tracing::warn!(
-                        sandbox_id,
-                        template = template_name,
-                        content_hash,
-                        code = ?status.code(),
-                        error = status.message(),
-                        "btrfs-send codec: restore receive failed, including any salvage of a send restarted mid-pipe"
-                    );
-                }
-            })?;
-        if let Some(offset) = salvaged {
-            pplx_space_metrics::node_manager::btrfs_receive_stream_salvaged();
-            tracing::warn!(
-                sandbox_id,
-                template = template_name,
-                content_hash,
-                complete_stream_offset = offset,
-                "btrfs-send codec: received the complete stream of a send restarted mid-pipe"
-            );
-        }
+        self.off_runtime("receive and publish btrfs stream", move || {
+            let receive = artifact_fs::receive::ReceiveRoot::open(&sandbox_root)?;
+            let stream = receive.stream()?;
+            receive.receive(stream, owner.as_ref().map(|owner| &owner.cancel))
+        })
+        .await?;
 
         tracing::info!(
             sandbox_id,
