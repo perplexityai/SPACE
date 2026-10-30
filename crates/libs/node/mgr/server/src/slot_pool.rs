@@ -1189,27 +1189,29 @@ impl NetworkPool {
             None => None,
         };
 
-        let row = tx
-            .query_row(
+        let mut statement = tx
+            .prepare(
                 "SELECT slot_id, generation, state, pod_netns_path FROM network_slots
                  WHERE slot_id < ?1 AND sandbox_id IS NULL
                    AND (state = 'missing' OR (state = 'ready' AND health = 'healthy'))
-                 ORDER BY CASE state WHEN 'missing' THEN 0 ELSE 1 END, slot_id
-                 LIMIT 1",
-                params![config.max_slots],
-                |row| {
-                    Ok((
-                        row.get::<_, u32>(0)?,
-                        row.get::<_, SqliteU64>(1)?.0,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                    ))
-                },
+                 ORDER BY CASE state WHEN 'missing' THEN 0 ELSE 1 END, slot_id",
             )
-            .optional()
             .map_err(SlotStoreError::from)?;
+        let mut candidates = statement
+            .query_map(params![config.max_slots], |row| {
+                Ok((
+                    row.get::<_, u32>(0)?,
+                    row.get::<_, SqliteU64>(1)?.0,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .map_err(SlotStoreError::from)?
+            .peekable();
 
-        let Some((slot_id, generation, previous_state, previous_pod_netns)) = row else {
+        if candidates.peek().is_none() {
+            drop(candidates);
+            drop(statement);
             tx.commit().map_err(SlotStoreError::from)?;
             if let Some(slot_id) = stale_slot_to_reset {
                 self.enqueue_reset(slot_id);
@@ -1218,12 +1220,26 @@ impl NetworkPool {
             return Err(AllocateSlotError::ResourceExhausted(
                 "no idle network slots".to_string(),
             ));
-        };
+        }
 
         let memory_reservation_mib = persist_new_lease_memory_reservation(memory_reservation)?;
-        let ownership = ResetClaim::acquire(self, slot_id).ok_or_else(|| {
-            AllocateSlotError::InProgress("slot mutation already in progress".into())
-        })?;
+        // Background slot work publishes a free row before it drops its slot
+        // claim, so a free row can still be claimed. Take the first one that
+        // is not, reading no further rows; only contention on every free row
+        // is a refusal.
+        let mut claimed = None;
+        for candidate in candidates {
+            let candidate = candidate.map_err(SlotStoreError::from)?;
+            if let Some(ownership) = ResetClaim::acquire(self, candidate.0) {
+                claimed = Some((candidate, ownership));
+                break;
+            }
+        }
+        drop(statement);
+        let ((slot_id, generation, previous_state, previous_pod_netns), ownership) = claimed
+            .ok_or_else(|| {
+                AllocateSlotError::InProgress("slot mutation already in progress".into())
+            })?;
         let lease_generation = generation + 1;
         let sandbox_uid = net::sandbox_uid_for_slot(slot_id);
         let committed = (|| -> Result<(), AllocateSlotError> {
