@@ -681,8 +681,9 @@ impl PublicOperationStore {
     /// [`Self::create_or_join_active_sandbox_wake`], except that a wake it
     /// creates is also claimed in the same transaction, for the caller to
     /// execute, when nothing else for the sandbox is queued or running (see
-    /// [`PublicOperationAdmission::create_claimed_if_sole_active`]). A joined
-    /// wake is never claimed: whoever created it, or the dispatcher, runs it.
+    /// [`PublicOperationAdmission::create_claimed_if_sole_active`], and its
+    /// precondition). A joined wake is never claimed: whoever created it, or
+    /// the dispatcher, runs it.
     pub async fn create_or_join_active_sandbox_wake_claimed_if_sole_active(
         &self,
         org_id: OrgId,
@@ -1207,6 +1208,16 @@ async fn claim_created_operation_tx(
 /// later operation for the sandbox also sees this claim live and holds that
 /// operation back. It counts every kind in the sandbox's queue
 /// ([`OUTSIDE_SANDBOX_QUEUE_KINDS`]), not only the ones a claim may take.
+///
+/// Sound only while every process that inserts operations takes the
+/// sandbox's queue lock and the dispatcher claims keyed. An API process on a
+/// release without the lock can insert for the sandbox unseen by this check
+/// and commit before it, and the dispatcher then claims that operation
+/// beside this one; the unkeyed claim (the dispatcher's kill switch) holds
+/// nothing back behind a live claim. Callers must not claim inline
+/// otherwise: a route that adopts this stays off until every API process,
+/// on every surface, runs a release that takes the lock, and is turned off
+/// before the keyed claim is.
 async fn claim_created_if_sole_active_tx(
     tx: &mut Transaction<'_, Postgres>,
     org_id: OrgId,
@@ -1345,7 +1356,9 @@ impl PublicOperationAdmission {
     /// the dispatcher, or not at all for a replay or a conflict.
     ///
     /// The claim takes an admission claim token, which the dispatcher's
-    /// per-organization slot limit does not count.
+    /// per-organization slot limit does not count. It is sound only under
+    /// the precondition on `claim_created_if_sole_active_tx`: every API
+    /// process takes the queue lock, and the dispatcher claims keyed.
     pub async fn create_claimed_if_sole_active(
         mut self,
         input: CreatePublicOperation<'_>,
