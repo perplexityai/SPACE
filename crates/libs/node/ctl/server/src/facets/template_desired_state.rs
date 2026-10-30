@@ -134,7 +134,9 @@ pub(super) async fn refresh_template_desired_state(
         .await
         .map_err(|error| format!("connect template-manager: {error}"))?;
     let local_templates = tmpl
-        .list_templates(Request::new(ListTemplatesRequest {}))
+        .list_templates(Request::new(ListTemplatesRequest {
+            omit_sandbox_counts: true,
+        }))
         .await
         .map_err(|error| format!("list local templates: {error}"))?
         .into_inner()
@@ -143,7 +145,10 @@ pub(super) async fn refresh_template_desired_state(
         .map(|template| (template.name.clone(), template.default_auto_lifecycle))
         .collect::<BTreeMap<_, _>>();
     let local_pools = tmpl
-        .pool_status(Request::new(PoolStatusRequest { template: None }))
+        .pool_status(Request::new(PoolStatusRequest {
+            template: None,
+            omit_sandbox_counts: true,
+        }))
         .await
         .map(|response| {
             response

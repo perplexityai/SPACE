@@ -342,17 +342,9 @@ impl TemplateManagerService {
             .map_err(|e| Status::internal(format!("spawn_blocking: {e}")))??;
 
         // Fetch live sandbox list to compute pool_current
-        let sbx_connect =
-            pplx_space_sbx_mgr_client::connect_with_retry_policy(self.sbx_connect_retry_policy)
-                .await
-                .map_err(|e| e.to_string());
-        let sbx_sandboxes = if let Ok(mut sbx_client) = sbx_connect {
-            pplx_space_sbx_mgr_client::list_all_sandboxes(&mut sbx_client)
-                .await
-                .unwrap_or_default()
-        } else {
-            vec![]
-        };
+        let sbx_sandboxes = self
+            .pool_count_sandboxes(request.get_ref().omit_sandbox_counts)
+            .await;
         let mut effective_snapshot_memory_by_requested = HashMap::new();
         for build in &builds {
             let settings = template_settings.get(&build.name);

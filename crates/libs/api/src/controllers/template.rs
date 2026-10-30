@@ -267,7 +267,7 @@ impl TemplateController {
     pub async fn list_templates(&self) -> Result<Vec<TemplateFullInfo>, ControllerError> {
         let mut client = self.substrate.builder_client().await?;
         client
-            .list_templates(ListTemplatesRequest {})
+            .list_templates(ListTemplatesRequest::default())
             .await
             .map(|resp| resp.into_inner().templates)
             .map_err(|err| ControllerError::internal(format!("node-api: {err}")))

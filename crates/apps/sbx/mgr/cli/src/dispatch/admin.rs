@@ -10,7 +10,7 @@ pub(super) async fn handle(
                 match connect_template_manager().await {
                     Ok(mut template_client) => template_client
                         .list_templates(
-                            pplx_space_template_mgr_client::proto::ListTemplatesRequest {},
+                            pplx_space_template_mgr_client::proto::ListTemplatesRequest::default(),
                         )
                         .await
                         .ok()
@@ -36,7 +36,7 @@ pub(super) async fn handle(
                 };
 
             let resp = client
-                .list_templates(ListTemplatesRequest {})
+                .list_templates(ListTemplatesRequest::default())
                 .await
                 .unwrap_or_else(|e| exit_error(e))
                 .into_inner();

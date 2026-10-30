@@ -1191,6 +1191,7 @@ impl NodeCtlWorker {
         }
 
         let mut jobs = Vec::new();
+        let sandbox_listing = facets::InboundSandboxListing::default();
         for (facet, scope) in scopes {
             if !facet.supports_inbound() {
                 report.insert(facet, Ok(InboundFacetResult::default()));
@@ -1222,6 +1223,7 @@ impl NodeCtlWorker {
                     let node_role = self.node_role;
                     let poll_interval = self.poll_interval;
                     let provisioning = self.runtime_provisioning.clone();
+                    let sandbox_listing = sandbox_listing.clone();
                     let facet_token = shutdown_token.child_token();
                     let (scope_kind, scope_items) = facet_scope_span_fields(&scope);
                     let span = tracing::info_span!(
@@ -1246,7 +1248,7 @@ impl NodeCtlWorker {
                                     facet.name(),
                                     FACET_RUN_TIMEOUT.as_secs()
                                 )),
-                                result = facet.run_inbound(&node_id, node_role, scope, progress.clone(), poll_interval, &provisioning) => result,
+                                result = facet.run_inbound(&node_id, node_role, scope, progress.clone(), poll_interval, facets::InboundPass { provisioning: &provisioning, sandbox_listing: &sandbox_listing }) => result,
                             };
                             (facet, status_name, started_at, result)
                         }

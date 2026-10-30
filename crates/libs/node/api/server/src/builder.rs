@@ -260,7 +260,8 @@ impl BuilderApi for BuilderApiService {
         &self,
         _r: Request<crate::proto::ListNodeTemplatesRequest>,
     ) -> Result<Response<crate::proto::ListNodeTemplatesResponse>, Status> {
-        let request = Request::new(pplx_space_template_mgr_client::proto::ListTemplatesRequest {});
+        let request =
+            Request::new(pplx_space_template_mgr_client::proto::ListTemplatesRequest::default());
         let resp = fwd_retry!(
             "template-manager",
             self.clients.tmpl(),

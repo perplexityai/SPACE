@@ -194,6 +194,7 @@ impl TemplateManagerService {
     ) -> Result<Response<PoolStatusResponse>, Status> {
         self.authorize_peer(&request, "PoolStatus", ALLOW_TEMPLATE_OBSERVER)?;
         let req = request.get_ref();
+        let omit_sandbox_counts = req.omit_sandbox_counts;
         let template = req
             .template
             .as_deref()
@@ -224,16 +225,7 @@ impl TemplateManagerService {
         };
 
         // Fetch sandbox list from sbx-manager to compute pool counts
-        let sbx_connect = pplx_space_sbx_mgr_client::connect()
-            .await
-            .map_err(|e| e.to_string());
-        let sbx_sandboxes = if let Ok(mut sbx_client) = sbx_connect {
-            pplx_space_sbx_mgr_client::list_all_sandboxes(&mut sbx_client)
-                .await
-                .unwrap_or_default()
-        } else {
-            vec![]
-        };
+        let sbx_sandboxes = self.pool_count_sandboxes(omit_sandbox_counts).await;
 
         for sandbox in &sbx_sandboxes {
             sandbox

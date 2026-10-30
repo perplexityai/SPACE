@@ -1607,7 +1607,10 @@ pub async fn prune_replaced_template_builds(template_id: &str, keep_hash: &str) 
         return;
     };
 
-    let response = match tmpl_client.list_templates(ListTemplatesRequest {}).await {
+    let response = match tmpl_client
+        .list_templates(ListTemplatesRequest::default())
+        .await
+    {
         Ok(response) => response.into_inner(),
         Err(error) => {
             eprintln!("  WARNING: could not list templates to prune old local builds: {error}");

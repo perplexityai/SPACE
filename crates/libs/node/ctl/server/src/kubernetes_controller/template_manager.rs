@@ -100,7 +100,9 @@ async fn local_template_presence(
     tmpl: &mut InnerClient,
     timeout: Duration,
 ) -> Result<BTreeMap<String, String>, Status> {
-    let mut request = Request::new(ListTemplatesRequest {});
+    let mut request = Request::new(ListTemplatesRequest {
+        omit_sandbox_counts: true,
+    });
     request.set_timeout(timeout);
 
     let response = tmpl.list_templates(request).await?.into_inner();

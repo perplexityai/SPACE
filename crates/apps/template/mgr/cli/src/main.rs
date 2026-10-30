@@ -237,6 +237,7 @@ async fn main() -> anyhow::Result<()> {
                     } else {
                         Some(template)
                     },
+                    ..PoolStatusRequest::default()
                 })
                 .await?;
             for p in resp.into_inner().pools {
@@ -364,7 +365,7 @@ async fn main() -> anyhow::Result<()> {
             if let Some(mode) = set {
                 warn_if_inbound_reconciliation_active(FACET_NETWORK_POLICY).await;
                 let current_generation = client
-                    .list_templates(ListTemplatesRequest {})
+                    .list_templates(ListTemplatesRequest::default())
                     .await?
                     .into_inner()
                     .templates
@@ -383,7 +384,9 @@ async fn main() -> anyhow::Result<()> {
                     .await?;
             }
 
-            let resp = client.list_templates(ListTemplatesRequest {}).await?;
+            let resp = client
+                .list_templates(ListTemplatesRequest::default())
+                .await?;
             let template_info = resp
                 .into_inner()
                 .templates
@@ -400,7 +403,9 @@ async fn main() -> anyhow::Result<()> {
             println!("policy: {}", mode.as_str());
         }
         Commands::List => {
-            let resp = client.list_templates(ListTemplatesRequest {}).await?;
+            let resp = client
+                .list_templates(ListTemplatesRequest::default())
+                .await?;
             let templates = resp.into_inner().templates;
             if templates.is_empty() {
                 println!("no templates registered");

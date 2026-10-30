@@ -65,6 +65,108 @@ fn insert_ready_build(conn: &rusqlite::Connection, name: &str, content_hash: &st
     .unwrap();
 }
 
+fn pool_sandbox(
+    sandbox_id: &str,
+    pool_template: &str,
+    lifecycle: sbx_proto::SandboxLifecycleState,
+) -> sbx_proto::SandboxListElement {
+    sbx_proto::SandboxListElement {
+        sandbox_id: sandbox_id.to_string(),
+        template: Some(pool_template.to_string()),
+        pool_template: Some(pool_template.to_string()),
+        lifecycle: Some(lifecycle as i32),
+        ..Default::default()
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn omitted_sandbox_counts_skip_the_sandbox_listing_and_keep_the_rest_of_the_reply() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let conn = crate::db::test_conn();
+    insert_ready_build(&conn, "pooled", "sha256:pooled");
+    insert_ready_build(&conn, "unpooled", "sha256:unpooled");
+    crate::db::insert_pool(&conn, "pooled", 3, "snapshot", 2, 1024).unwrap();
+    let listing = vec![
+        pool_sandbox("warm-a", "pooled", sbx_proto::SandboxLifecycleState::Paused),
+        pool_sandbox("warm-b", "pooled", sbx_proto::SandboxLifecycleState::Paused),
+        pool_sandbox(
+            "filling",
+            "pooled",
+            sbx_proto::SandboxLifecycleState::Creating,
+        ),
+    ];
+    let listings = Arc::new(AtomicUsize::new(0));
+    let lister = PoolSandboxLister::new({
+        let listings = Arc::clone(&listings);
+        move |_| {
+            listings.fetch_add(1, Ordering::SeqCst);
+            let listing = listing.clone();
+            Box::pin(async move { listing })
+        }
+    });
+    let service = TemplateManagerService::new(conn)
+        .unwrap()
+        .without_sbx_connect_retries()
+        .with_pool_sandbox_lister(lister);
+
+    let counted_templates = service
+        .list_templates(internal_request(ListTemplatesRequest::default()))
+        .await
+        .unwrap()
+        .into_inner();
+    let counted_pools = service
+        .pool_status(internal_request(PoolStatusRequest::default()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(listings.load(Ordering::SeqCst), 2);
+    let pooled = counted_templates
+        .templates
+        .iter()
+        .find(|template| template.name == "pooled")
+        .expect("pooled template listed");
+    assert_eq!(pooled.pool_current, 2);
+    assert_eq!(counted_pools.pools.len(), 1);
+    assert_eq!(counted_pools.pools[0].current_count, 2);
+    assert_eq!(counted_pools.pools[0].pending_count, 1);
+    assert_eq!(counted_pools.pools[0].sandbox_ids.len(), 3);
+
+    let omitted_templates = service
+        .list_templates(internal_request(ListTemplatesRequest {
+            omit_sandbox_counts: true,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let omitted_pools = service
+        .pool_status(internal_request(PoolStatusRequest {
+            template: None,
+            omit_sandbox_counts: true,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        listings.load(Ordering::SeqCst),
+        2,
+        "omitting the counts must not list the node's sandboxes"
+    );
+
+    let mut expected_templates = counted_templates;
+    for template in &mut expected_templates.templates {
+        template.pool_current = 0;
+    }
+    assert_eq!(omitted_templates, expected_templates);
+    let mut expected_pools = counted_pools;
+    for pool in &mut expected_pools.pools {
+        pool.current_count = 0;
+        pool.pending_count = 0;
+        pool.sandbox_ids.clear();
+    }
+    assert_eq!(omitted_pools, expected_pools);
+}
+
 #[test]
 fn pool_shape_prefers_request_then_template_settings() {
     let conn = crate::db::test_conn();
@@ -156,7 +258,7 @@ fn list_templates_projects_stored_execution_metadata() {
         .build()
         .unwrap();
     let response = runtime
-        .block_on(service.list_templates(internal_request(ListTemplatesRequest {})))
+        .block_on(service.list_templates(internal_request(ListTemplatesRequest::default())))
         .unwrap()
         .into_inner();
 

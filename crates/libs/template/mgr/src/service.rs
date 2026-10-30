@@ -376,6 +376,9 @@ pub struct TemplateManagerService {
     /// deliberately runs without a sandbox-manager socket can decline the wait
     /// instead of buying the full default budget on every enrichment call.
     sbx_connect_retry_policy: pplx_space_sbx_mgr_client::GrpcRetryPolicy,
+    /// Lists the node's sandboxes for pool counts. A field so a test can
+    /// answer and count the listing without a sandbox-manager socket.
+    pool_sandbox_lister: PoolSandboxLister,
     /// Shared by the GC loop, startup recovery and `DeleteIdleTemplate`.
     eviction_gate: crate::eviction::EvictionGate,
 }
@@ -1570,6 +1573,7 @@ impl TemplateManagerService {
             peer_authorizer: template_peer_authorizer(),
             background_worker,
             sbx_connect_retry_policy: pplx_space_sbx_mgr_client::DEFAULT_CONNECT_RETRY_POLICY,
+            pool_sandbox_lister: PoolSandboxLister::sandbox_manager(),
             eviction_gate: crate::eviction::EvictionGate::default(),
         })
     }
@@ -1615,6 +1619,12 @@ impl TemplateManagerService {
     #[cfg(test)]
     fn without_sbx_connect_retries(mut self) -> Self {
         self.sbx_connect_retry_policy = pplx_space_sbx_mgr_client::GrpcRetryPolicy::none();
+        self
+    }
+
+    #[cfg(test)]
+    fn with_pool_sandbox_lister(mut self, lister: PoolSandboxLister) -> Self {
+        self.pool_sandbox_lister = lister;
         self
     }
 

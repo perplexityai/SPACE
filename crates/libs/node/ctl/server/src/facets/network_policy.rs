@@ -92,8 +92,9 @@ pub(super) async fn refresh_network_policy(
     node_role: Option<NodeRole>,
     scope: FacetScope,
     progress: crate::FacetProgress,
+    sandbox_listing: &InboundSandboxListing,
 ) -> Result<ReconcileStats, String> {
-    let (templates, sandbox_ids) = resolve_network_policy_scope(scope).await?;
+    let (templates, sandbox_ids) = resolve_network_policy_scope(scope, sandbox_listing).await?;
     let mut stats = ReconcileStats {
         templates_seen: templates.len() as u64,
         sandboxes_seen: sandbox_ids.len() as u64,
@@ -354,11 +355,12 @@ pub(super) async fn publish_network_policy(
 
 pub(super) async fn resolve_network_policy_scope(
     scope: FacetScope,
+    sandbox_listing: &InboundSandboxListing,
 ) -> Result<(Vec<String>, Vec<String>), String> {
     match scope {
         FacetScope::Full => {
             let templates = list_local_template_names().await?;
-            let sandbox_ids = list_local_sandbox_ids().await?;
+            let sandbox_ids = sandbox_listing.sandbox_ids().await?;
             Ok((templates, sandbox_ids))
         }
         FacetScope::Items(items) => split_network_policy_items(items),

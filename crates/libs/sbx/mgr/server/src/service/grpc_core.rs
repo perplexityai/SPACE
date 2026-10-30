@@ -1190,7 +1190,9 @@ impl SandboxManagerService {
             // Catalog reads do not materialize artifacts and must not inherit
             // GetTemplate's cold-download budget. Includes lazy connection.
             std::time::Duration::from_secs(5),
-            client.list_templates(pplx_space_template_mgr_client::proto::ListTemplatesRequest {}),
+            client.list_templates(
+                pplx_space_template_mgr_client::proto::ListTemplatesRequest::default(),
+            ),
         )
         .await
         .map_err(|_| Status::deadline_exceeded("template catalog lookup timed out"))??
