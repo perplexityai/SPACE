@@ -249,6 +249,7 @@ pub(super) fn insert_created_row(
     crate::db::insert_sandbox(
         conn,
         crate::db::InsertSandboxParams {
+            guest_image: Default::default(),
             id,
             uuid8: &SandboxRuntimeLabel::from_sandbox_id(sandbox_id),
             state,
@@ -808,11 +809,11 @@ async fn explicit_selection_checks_legacy_base_evidence_before_create() {
 }
 
 /// Exercise logical Create and the persisted input used by Start, without a VM
-/// or host-owned cache. Artifact identity remains a separate node admission check.
+/// or host-owned cache. Bound execution is qualified only for x86-64; changing
+/// a descriptor's architecture also changes its identity and is not qualification.
+#[cfg(target_arch = "x86_64")]
 #[tokio::test]
 async fn selected_create_persists_the_binding_used_by_first_start() {
-    use pplx_space_common_core::types::{EnvironmentDescriptor, RuntimeBinding};
-    use pplx_space_execution_common::environment::EnvironmentDefinition;
     use pplx_space_node_mgr_client::proto::{
         ResolveExecutionEnvironmentRequest, ResolveExecutionEnvironmentResponse,
     };
@@ -824,15 +825,11 @@ async fn selected_create_persists_the_binding_used_by_first_start() {
     )
     .unwrap()
     {
-        // The fake node validates protocol plumbing on the test host; it does
-        // not qualify an additional host architecture for execution.
-        let mut spec = environment.definition().descriptor().spec().clone();
-        let arch = std::env::consts::ARCH.parse().unwrap();
-        spec.host.architecture = arch;
-        spec.guest.architecture = arch;
-        let RuntimeBinding::ManagedRelease(runtime) = &mut spec.runtime;
-        runtime.target.architecture = arch;
-        let definition = EnvironmentDefinition::new(EnvironmentDescriptor::try_from(spec).unwrap());
+        if !environment.supports_guest_image(Default::default()) {
+            continue;
+        }
+        // Preserve the catalog's historical identity as well as its descriptor.
+        let definition = environment.definition().clone();
         let execution = definition.execution_requirements().unwrap();
         let firecracker =
             execution.runtime().kind == pplx_space_common_core::types::RuntimeKind::Firecracker;
@@ -845,7 +842,10 @@ async fn selected_create_persists_the_binding_used_by_first_start() {
         }
         // The disk may have been built by an older consumer of the same
         // kernel. The sandbox must keep the newly selected exact consumer.
-        if environment.kernel().version.as_str() == "6.1.155" {
+        if environment
+            .kernel()
+            .is_some_and(|kernel| kernel.version.as_str() == "6.1.155")
+        {
             wire.runtime.as_mut().unwrap().version = "1.15.1".into();
             wire.state_format.as_mut().unwrap().version = "9.0.0".into();
         }

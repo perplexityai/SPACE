@@ -1212,7 +1212,7 @@ fn compatible_selection_preserves_exact_before_fallback() {
                 execution.state_format().unwrap().version.as_str(),
             );
             runtime.guest = execution.guest();
-            let mut component = kernel(entry.kernel().version.as_str(), 0, false, false);
+            let mut component = kernel(entry.kernel().unwrap().version.as_str(), 0, false, false);
             component.metadata = execution.components()[0].clone();
             inventory.environments.insert(
                 entry.definition().reference(),
@@ -1277,7 +1277,7 @@ fn restore_falls_back_after_revocation_without_boot_files() {
     release.release.version = "1.15.2".parse().unwrap();
     catalog.push(CompiledEnvironment::for_test(
         release,
-        catalog[0].kernel().clone(),
+        catalog[0].kernel().unwrap().clone(),
         "9.0.0",
         true,
     ));
@@ -1334,7 +1334,7 @@ fn transient_exact_source_failure_never_selects_another_consumer() {
     release.release.version = "1.15.2".parse().unwrap();
     catalog.push(CompiledEnvironment::for_test(
         release,
-        catalog[0].kernel().clone(),
+        catalog[0].kernel().unwrap().clone(),
         "9.0.0",
         true,
     ));
@@ -1354,7 +1354,8 @@ fn transient_exact_source_failure_never_selects_another_consumer() {
                         execution.state_format().unwrap().version.as_str(),
                     );
                     runtime.guest = execution.guest();
-                    let mut component = kernel(entry.kernel().version.as_str(), 0, false, false);
+                    let mut component =
+                        kernel(entry.kernel().unwrap().version.as_str(), 0, false, false);
                     component.metadata = execution.components()[0].clone();
                     inventory.environments.insert(
                         entry.definition().reference(),
@@ -1416,9 +1417,13 @@ fn compatible_fallback_orders_versions_and_refuses_equal_ranked_identities() {
             let mut release = initial.release().clone();
             release.release.version = version.parse().unwrap();
             release.binaries[0].sha256 = Digest::sha256([digest; 32]);
-            let entry =
-                CompiledEnvironment::for_test(release, initial.kernel().clone(), "9.0.0", true)
-                    .named_for_test(name);
+            let entry = CompiledEnvironment::for_test(
+                release,
+                initial.kernel().unwrap().clone(),
+                "9.0.0",
+                true,
+            )
+            .named_for_test(name);
             let mut runtime = installation(version, "9.0.0");
             runtime.guest = source.guest();
             let mut component = kernel("6.1.155", 0, false, false);
@@ -1537,6 +1542,139 @@ fn cold_only_runtime_has_no_launcher_or_snapshot_claims() {
     }
     let reported = inventory(vec![installation]).to_proto();
     assert!(reported.runtimes[0].state_formats.is_empty());
+}
+
+#[test]
+fn cold_boot_resolves_every_authenticated_boot_input() {
+    let reference = EnvironmentReference::new(Digest::sha256([9; 32]));
+    let mut runtime = installation("54.0", "1");
+    runtime.runtime.kind = RuntimeKind::CloudHypervisor;
+    runtime.state_format = None;
+    let kernel = kernel("6.8.0", 1, false, false);
+    let initramfs = ArtifactComponentInstallation {
+        metadata: ArtifactComponentMetadata {
+            kind: ArtifactComponentKind::Initrd,
+            role: Some("initramfs".parse().unwrap()),
+            version: Some("6.8.0".parse().unwrap()),
+            digest: Some(Digest::sha256([2; 32])),
+            format: Some("cpio".parse().unwrap()),
+        },
+        path: PathBuf::from("/boot-assets/initrd.img"),
+        default_for_new: false,
+        legacy_default: false,
+        integrity: ExecutionSourceIntegrity::CatalogSha256,
+    };
+    let requested = ExecutionMetadata::new(
+        runtime.runtime.clone(),
+        runtime.guest,
+        None,
+        vec![kernel.metadata.clone(), initramfs.metadata.clone()],
+    )
+    .unwrap()
+    .with_environment(reference);
+    for initramfs_present in [true, false] {
+        let mut inventory = inventory(Vec::new());
+        let mut components = vec![kernel.clone()];
+        if initramfs_present {
+            components.push(initramfs.clone());
+        }
+        inventory.environments.insert(
+            reference,
+            InstalledEnvironment {
+                runtime: Ok(runtime.clone()),
+                components: Ok(components),
+            },
+        );
+        let result = inventory.resolve(
+            Some(&requested),
+            RuntimeKind::CloudHypervisor,
+            ExecutionSelectionMode::ExistingColdBoot,
+        );
+        if initramfs_present {
+            let resolved = result.unwrap();
+            assert_eq!(resolved.components.len(), 2);
+            let selected = resolved
+                .component(
+                    ArtifactComponentKind::Initrd,
+                    initramfs.metadata.role.as_ref(),
+                )
+                .unwrap();
+            assert_eq!(selected.path, initramfs.path);
+            assert_eq!(selected.metadata, initramfs.metadata);
+            assert_eq!(selected.integrity, ExecutionSourceIntegrity::CatalogSha256);
+        } else {
+            assert!(matches!(
+                result,
+                Err(RuntimeInventoryError::NoCompatibleComponent(_))
+            ));
+        }
+    }
+}
+
+#[test]
+fn bound_firmware_resolution_never_borrows_a_default_kernel() {
+    use crate::catalog::CompiledEnvironment;
+    let catalog = CompiledEnvironment::for_architecture(Arch::X86_64).unwrap();
+    let entry = catalog
+        .iter()
+        .find(|e| e.name() == "ch-54.0-windows-uefi")
+        .unwrap();
+    let requested = entry.definition().execution_requirements().unwrap();
+    let mut inventory = inventory(Vec::new());
+    let runtime = RuntimeInstallation {
+        runtime: requested.runtime().clone(),
+        guest: requested.guest(),
+        state_format: None,
+        files: RuntimeInstallationFiles::new([(
+            RuntimeFileRole::RuntimeExecutable,
+            "/synthetic/cloud-hypervisor".into(),
+        )]),
+    };
+    inventory.environments.insert(
+        entry.definition().reference(),
+        InstalledEnvironment {
+            runtime: Ok(runtime),
+            components: Ok(vec![ArtifactComponentInstallation {
+                metadata: requested.components()[0].clone(),
+                path: "/synthetic/firmware.fd".into(),
+                integrity: ExecutionSourceIntegrity::CatalogSha256,
+                default_for_new: false,
+                legacy_default: false,
+            }]),
+        },
+    );
+    let resolved = inventory
+        .resolve(
+            Some(&requested),
+            RuntimeKind::CloudHypervisor,
+            ExecutionSelectionMode::NewColdBoot,
+        )
+        .unwrap();
+    assert_eq!(resolved.environment, requested.environment());
+    assert_eq!(
+        entry
+            .definition()
+            .bind_execution(resolved.execution)
+            .unwrap(),
+        requested
+    );
+    assert_eq!(resolved.components.len(), 1);
+    assert_eq!(
+        resolved.components[0].metadata.kind,
+        ArtifactComponentKind::Firmware
+    );
+    inventory
+        .environments
+        .get_mut(&entry.definition().reference())
+        .unwrap()
+        .components = Ok(Vec::new());
+    inventory
+        .resolve(
+            Some(&requested),
+            RuntimeKind::CloudHypervisor,
+            ExecutionSelectionMode::NewColdBoot,
+        )
+        .unwrap_err();
 }
 
 #[test]

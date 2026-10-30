@@ -209,3 +209,53 @@ fn balloon_is_omitted_when_absent_and_rejected_when_invalid() {
     serde_json::from_str::<TemplateMetadata>(r#"{"balloon":{"mode":"shrink"}}"#)
         .expect_err("an unknown balloon mode must not parse");
 }
+
+#[test]
+fn guest_image_contract_requires_a_new_schema_and_an_exact_environment() {
+    use crate::types::guest_image::{GuestDiskLayout, GuestImageContract, GuestReadiness};
+    let mut metadata = TemplateMetadata {
+        guest_image: Some(
+            GuestImageContract::new(
+                GuestDiskLayout::OpaqueRawDisk,
+                GuestReadiness::TcpService {
+                    port: std::num::NonZeroU16::new(3389).unwrap(),
+                },
+                pplx_space_execution_spec::guest_image::GuestNetwork::SlotDhcpV1,
+                pplx_space_execution_spec::guest_image::GuestAgent::Absent,
+            )
+            .unwrap(),
+        ),
+        ..Default::default()
+    };
+    metadata.execution_metadata().unwrap_err();
+    let execution = crate::types::ExecutionMetadata::new(
+        crate::types::RuntimeIdentity {
+            kind: crate::types::RuntimeKind::CloudHypervisor,
+            version: "54.0".parse().unwrap(),
+        },
+        crate::types::GuestPlatform {
+            os: crate::types::GuestOperatingSystem::Windows,
+            architecture: crate::types::Arch::X86_64,
+        },
+        None,
+        Vec::new(),
+    )
+    .unwrap();
+    metadata.set_execution_metadata(execution.clone());
+    metadata.execution_metadata().unwrap_err();
+    metadata.set_execution_metadata(
+        execution.with_environment(format!("sha256:{}", "ab".repeat(32)).parse().unwrap()),
+    );
+    assert_eq!(
+        metadata.schema_version,
+        Some(GUEST_TEMPLATE_METADATA_SCHEMA_VERSION)
+    );
+    metadata.execution_metadata().unwrap();
+    let bytes = serde_json::to_vec(&metadata).unwrap();
+    let roundtrip: TemplateMetadata = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(roundtrip, metadata);
+    for version in [None, Some(2), Some(3)] {
+        metadata.schema_version = version;
+        metadata.execution_metadata().unwrap_err();
+    }
+}

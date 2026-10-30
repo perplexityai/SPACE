@@ -65,7 +65,7 @@ fn compiled_environments_have_complete_distinct_bindings_and_operation_support()
         .map(|entry| entry.definition().reference())
         .collect();
     assert_eq!(references.len(), environments.len());
-    assert_eq!(environments.len(), 5);
+    assert_eq!(environments.len(), 6);
     for (environment, (runtime, kernel, state, memory_state)) in environments.iter().zip([
         ("1.15.1", "6.1.155", "9.0.0", true),
         ("1.17.0", "6.18.44", "12.0.0", true),
@@ -85,7 +85,7 @@ fn compiled_environments_have_complete_distinct_bindings_and_operation_support()
         );
         assert_eq!(
             requirements.components()[0].digest,
-            Some(environment.kernel().sha256)
+            Some(environment.kernel().unwrap().sha256)
         );
         assert_eq!(environment.supports_memory_state(), memory_state);
     }
@@ -103,10 +103,12 @@ fn compiled_environments_have_complete_distinct_bindings_and_operation_support()
     )
     .unwrap();
     assert!(!ch.supports_memory_state());
-    let policy = crate::selection::ExecutionPolicy::parse(None, None, &arm).unwrap();
-    assert!(policy.default_reference().is_none());
-    assert!(!policy.allows(ch.definition().reference()));
-    crate::selection::ExecutionPolicy::parse(Some(ch.name()), Some(ch.name()), &arm).unwrap_err();
+    let execution = ch.definition().execution_requirements().unwrap();
+    assert!(execution.state_format().is_none());
+    assert_eq!(
+        execution.components()[0].digest,
+        Some(ch.kernel().unwrap().sha256)
+    );
     let x86_ch = &environments[3];
     assert_eq!(x86_ch.release().release.kind, RuntimeKind::CloudHypervisor);
     assert!(!x86_ch.supports_memory_state());
@@ -124,31 +126,34 @@ fn compiled_environments_have_complete_distinct_bindings_and_operation_support()
         state_ch.definition().reference(),
         x86_ch.definition().reference()
     );
-    let defaults = crate::selection::ExecutionPolicy::parse(None, None, &environments).unwrap();
-    assert!(!defaults.allows(x86_ch.definition().reference()));
 }
 
 #[test]
-fn initial_identity_and_legacy_restore_do_not_depend_on_display_name() {
-    use crate::runtime_inventory::ExecutionSelectionMode;
-    use crate::selection::ExecutionPolicy;
-    let initial = InitialEnvironment::for_architecture(Arch::X86_64).unwrap();
-    let mut entry = initial.compiled_environment().unwrap();
-    entry.name = "renamed-initial";
-    let bound = entry.definition().execution_requirements().unwrap();
-    let historical = ExecutionMetadata::new(
-        bound.runtime().clone(),
-        bound.guest(),
-        bound.state_format().cloned(),
-        vec![],
-    )
-    .unwrap();
-    let policy = ExecutionPolicy::parse(Some("renamed-initial"), None, &[entry]).unwrap();
-    assert!(!policy.legacy_unbound_allowed());
-    assert_eq!(policy.default_reference(), bound.environment());
-    policy
-        .check_execution(&historical, ExecutionSelectionMode::PersistedStateRestore)
+fn firmware_environment_has_no_kernel_and_is_not_a_default_or_snapshot_loader() {
+    let catalog = CompiledEnvironment::for_architecture(Arch::X86_64).unwrap();
+    let entry = catalog
+        .iter()
+        .find(|e| e.name() == "ch-54.0-windows-uefi")
         .unwrap();
+    let execution = entry.definition().execution_requirements().unwrap();
+    assert!(entry.kernel().is_none());
+    assert!(!entry.supports_memory_state());
+    assert_eq!(execution.guest().os, GuestOperatingSystem::Windows);
+    assert!(execution.state_format().is_none());
+    assert_eq!(execution.components().len(), 1);
+    assert_eq!(
+        execution.components()[0].kind,
+        ArtifactComponentKind::Firmware
+    );
+    assert_eq!(
+        crate::guest::BootSource::from_execution(&execution).unwrap(),
+        crate::guest::BootSource::Uefi
+    );
+    let wire = pplx_space_execution_common::proto::EnvironmentDefinition::from(entry.definition());
+    assert_eq!(
+        EnvironmentDefinition::try_from(&wire).unwrap(),
+        *entry.definition()
+    );
 }
 
 const E1: &str = "fc-1.17.0-linux-6.1.155";
