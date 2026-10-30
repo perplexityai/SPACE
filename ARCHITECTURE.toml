@@ -477,6 +477,110 @@ mode = "advisory"
 [rules.pattern_ratchet.durable_file_writes.stale_entries]     # entries with fewer writes, none, or gone
 mode = "advisory"
 
+# l20_domain crates do no I/O: they read no environment, touch no
+# filesystem, open no socket or connection, spawn no process or task, read no
+# clock and never sleep; the crates that do the I/O pass them plain values. A
+# line can't tell an ID constructor from other code, so UUID generation
+# (`Uuid::now_v7()` in `pub fn new()`), which Domain may do, is not matched at
+# all, nor are tracing and log macros, an injected `Environment`'s
+# `env.var(..)` or an injected sleeper's `.sleep()`. Also not caught: a bare
+# call after a grouped import (`use tokio::{spawn, ..}`) or a renamed one
+# (`use std::env::var` counts only on its `use` line), a socket's `.bind(..)`
+# (sqlx's query `.bind(..)` looks the same), the arguments of a socket2
+# constructor on the lines after it, syscalls such as `setsockopt` and
+# randomness.
+# Dropped for false positives: `.metadata()` (tonic request metadata),
+# `.is_file()` and `.is_dir()` (on `fs::Metadata` values in files listed
+# anyway) and a bare `sleep(` (a retry policy's own `sleep` method).
+# `#[cfg(test)]` helpers inside production files count; move them into a
+# `*_tests.rs` file or test_support. common-core is legacy and counted, so
+# that new I/O does not land in it. Advisory until calibrated.
+[rules.pattern_ratchet.domain_io]
+patterns = [
+  # environment reads and writes; env! and option_env! have no `::`
+  '\benv::(var|var_os|vars|vars_os|set_var|remove_var|args|args_os|current_dir|set_current_dir|current_exe|temp_dir|home_dir)\b',
+  '\bdotenvy?\b',
+  # pplx-space-env-vars' process-environment readers
+  '\b(ProcessEnvironment|env_flag_var|env_destructive_gate_var|parse_positive_f64_env|test_hook_var)\b',
+  # filesystem
+  '\b(std|tokio)::fs\b',
+  '(^|[^:\w])fs::\w',
+  '\bFile::(open|create|create_new|options)\b',
+  '\bOpenOptions\b',
+  '\bread_to_string\b',
+  '\.(exists|try_exists|canonicalize|read_dir|read_link|symlink_metadata)\(\)',
+  # processes
+  '\bCommand::new\b',
+  '\b(std|tokio)::process\b',
+  '\bprocess::(Command|Child|Stdio|exit|abort|id)\b',
+  # clocks
+  '\b(Instant|SystemTime|Utc|Local|Timestamp|Zoned)::now\b',
+  '\bOffsetDateTime::now_(utc|local)\b',
+  '\.elapsed\(\)',
+  # sleeps
+  '\b(thread|time)::sleep(_until)?\b',
+  # tasks and threads
+  '\b(tokio|thread|task)::spawn\w*\b',
+  '\bspawn_(blocking|local)\b',
+  '\bJoinSet\b',
+  '\bthread::(Builder|scope)\b',
+  # sockets: std, tokio and tokio-vsock socket types, which are named only
+  # where one is opened, bound, connected or used, and socket2's constructor
+  '\b(TcpListener|TcpSocket|TcpStream|UdpSocket|UnixDatagram|UnixListener|UnixStream|VsockListener|VsockStream)\b',
+  '\bstd::os::unix::net\b',
+  '\bSocket::(new|new_raw|pair|pair_raw)\b',
+  # connections: tonic's Endpoint::connect, connect_lazy and their
+  # connector forms, a generated client's connect, and sqlx pools'
+  '(\.|::)connect(_lazy|_with_connector|_with_connector_lazy)?\(',
+]
+include_layers = ["l20_domain"]
+allow = []
+
+[rules.pattern_ratchet.domain_io.no_crossing]       # only listed files may do I/O
+mode = "advisory"
+
+[rules.pattern_ratchet.domain_io.no_new_entries]    # a pull request may not add entries to the baseline
+mode = "advisory"
+
+[rules.pattern_ratchet.domain_io.no_raised_caps]    # a pull request may not raise a cap in the baseline
+mode = "advisory"
+
+[rules.pattern_ratchet.domain_io.listed_no_growth]  # listed files may not gain I/O lines
+mode = "advisory"
+
+[rules.pattern_ratchet.domain_io.stale_entries]     # entries with fewer matches, none, or gone
+mode = "advisory"
+
+# l10_foundation names nothing SPACE-specific, so that it stays a set of
+# generic building blocks: no `SPACE_*` environment variable, constant or
+# path. The SPACE names Foundation holds today, in its env readers, error
+# messages, the feature-flag catalog, btrfs's template UUID namespace and the
+# systemd paths, are baselined, the legacy crates (common-svc, metrics)
+# included, so that they cannot become the escape hatch; each moves to the
+# Domain or API crate that owns it. A name built at run time, a lowercase
+# product name (`space-*` metadata keys and flag keys, `space.*` metric names)
+# and a `Space*` type are not matched. A `*_SPACE_*` pattern would match
+# disk-space names too, so it is not used. Advisory until calibrated.
+[rules.pattern_ratchet.foundation_space_names]
+patterns = ['\bSPACE_[A-Z0-9_]+\b']
+include_layers = ["l10_foundation"]
+allow = []
+
+[rules.pattern_ratchet.foundation_space_names.no_crossing]       # only listed files may name SPACE_*
+mode = "advisory"
+
+[rules.pattern_ratchet.foundation_space_names.no_new_entries]    # a pull request may not add entries to the baseline
+mode = "advisory"
+
+[rules.pattern_ratchet.foundation_space_names.no_raised_caps]    # a pull request may not raise a cap in the baseline
+mode = "advisory"
+
+[rules.pattern_ratchet.foundation_space_names.listed_no_growth]  # listed files may not gain SPACE_* lines
+mode = "advisory"
+
+[rules.pattern_ratchet.foundation_space_names.stale_entries]     # entries with fewer matches, none, or gone
+mode = "advisory"
+
 # Only the store may depend on the SQLite drivers that can open sbx-mgr's
 # database, or on the shared helpers that open, migrate and delete one by
 # path, so no other sbx-mgr crate can name them: no normal, dev or build
@@ -803,11 +907,105 @@ helpers = [
   "pplx-space-s3-http-client",
 ]
 
+[rules.layers]
 # The crates being dissolved: they predate the layers and mix SPACE-specific
 # code in until they are split up. Every check covers them, with today's edges
 # baselined.
-[rules.layers]
 legacy = ["pplx-space-common-core", "pplx-space-common-svc", "pplx-space-metrics"]
+
+# An l20_domain crate is a protocol (wire schemas and the conversions between
+# them and the models) if its name ends in -protocol or -proto, or `protocols`
+# lists it; every other one is a model, which never depends on a protocol.
+# These five are protocols without such a name. The mixed crates, which hold
+# model and wire code until they are split, count as models: api-route,
+# credential-injection-core, net-common and spaced-common.
+protocols = [
+  "pplx-space-auto-lifecycle-receipt",
+  "pplx-space-events",
+  "pplx-space-execution-common",
+  "pplx-space-public-api",
+  "pplx-space-rpc-contracts",
+]
+
+# l20_domain crates do no I/O, so none depends on a package that does it:
+# normal and build dependencies, optional ones included. Each family is an
+# exact list, so a new package, such as a new aws-sdk-*, is added by hand;
+# some are not in Cargo.lock today. tonic and prost are allowed. An
+# l20_domain dependency on a database driver, aws-sdk-s3 or a storage helper
+# is storage_access's ([rules.layers.storage]), so no family lists them.
+# aws-lc-rs and aws-lc-sys are cryptography, not cloud SDKs. The workspace's
+# own I/O crates need no entry: an l10_foundation crate, legacy or not, with
+# a required dependency on a fenced package is fenced under that package's
+# family, such as common-grpc (hyper-util), tokio-runtime (tokio) or
+# common-svc (axum). Only declared dependencies are
+# seen: tonic's transport brings tokio and hyper into every tonic user's
+# build regardless. Features are not followed, so observability, which brings
+# tokio in only behind its otel feature, is listed; feature-flags, whose
+# openfeature feature does too, is fenced already by its required dependency
+# on metrics.
+[rules.layers.domain_fences]
+runtime = [
+  "async-std",
+  "pplx-space-observability",
+  "smol",
+  "tokio",
+  "tokio-rustls",
+  "tokio-stream",
+  "tokio-tungstenite",
+  "tokio-util",
+  "tokio-vsock",
+]
+http = [
+  "attohttpc",
+  "axum",
+  "curl",
+  "h2",
+  "h3",
+  "hyper",
+  "hyper-named-pipe",
+  "hyper-rustls",
+  "hyper-timeout",
+  "hyper-util",
+  "hyperlocal",
+  "isahc",
+  "reqwest",
+  "surf",
+  "ureq",
+]
+cloud = [
+  "aws-config",
+  "aws-credential-types",
+  "aws-runtime",
+  "aws-sdk-acmpca",
+  "aws-sdk-ecr",
+  "aws-sdk-secretsmanager",
+  "aws-sdk-sso",
+  "aws-sdk-ssooidc",
+  "aws-sdk-sts",
+  "aws-sigv4",
+  "aws-smithy-async",
+  "aws-smithy-checksums",
+  "aws-smithy-eventstream",
+  "aws-smithy-http",
+  "aws-smithy-http-client",
+  "aws-smithy-json",
+  "aws-smithy-observability",
+  "aws-smithy-query",
+  "aws-smithy-runtime",
+  "aws-smithy-runtime-api",
+  "aws-smithy-runtime-api-macros",
+  "aws-smithy-schema",
+  "aws-smithy-types",
+  "aws-smithy-xml",
+  "aws-types",
+]
+kube = [
+  "k8s-openapi",
+  "kube",
+  "kube-client",
+  "kube-core",
+  "kube-runtime",
+]
 
 [rules.layers.placement]          # every crate has a layer; no new unmoved entries
 mode = "required"
@@ -861,6 +1059,30 @@ mode = "required"
 [rules.layers.codec_features.stale_entries]
 mode = "required"
 
+# No l20_domain crate depends on a package [rules.layers.domain_fences] lists,
+# or on an l10_foundation crate that a required dependency on one fences.
+# Today's exceptions are baselined in [layers.domain_dependencies].
+[rules.layers.domain_dependencies.no_crossing]
+mode = "required"
+
+[rules.layers.domain_dependencies.no_new_entries]
+mode = "required"
+
+[rules.layers.domain_dependencies.stale_entries]
+mode = "required"
+
+# No model depends on a protocol. Today's exceptions are baselined in
+# [layers.model_protocol]: common-core, which is legacy, and spaced-common, a
+# mixed crate, until they are deleted and split.
+[rules.layers.model_protocol.no_crossing]
+mode = "required"
+
+[rules.layers.model_protocol.no_new_entries]
+mode = "required"
+
+[rules.layers.model_protocol.stale_entries]
+mode = "required"
+
 [rules.layers.test_only]          # test_support only through dev-dependencies; nothing depends on tools
 mode = "required"
 
@@ -870,7 +1092,10 @@ mode = "required"
 [rules.layers.store_edges]        # API and Storage crates use only the stores that list them
 mode = "required"
 
-[rules.layers.stale_entries]      # unmoved, legacy, store_users, allowed_edges and storage entries that no longer apply
+[rules.layers.single_user]        # hint: a Domain crate one crate above Domain uses, and nothing else
+mode = "advisory"
+
+[rules.layers.stale_entries]      # [rules.layers] entries that no longer apply
 mode = "required"
 
 [rules.layers.policy_changed]     # changes to [rules.layers], compared with the base branch

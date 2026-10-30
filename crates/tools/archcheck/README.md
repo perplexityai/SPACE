@@ -360,13 +360,18 @@ helpers = ["pplx-space-s3-http-client"]  # storage helpers without a driver depe
 
 [rules.layers]
 legacy = ["pplx-space-common-svc"]     # crates being dissolved; see Storage access below
+protocols = ["pplx-space-events"]      # protocols without a *-protocol or *-proto name; see Domain
+
+[rules.layers.domain_fences]           # packages no Domain crate depends on, by family
+runtime = ["tokio"]
+http = ["hyper", "reqwest"]
 
 [rules.layers.placement]
 mode = "required"
-# ...and layout, test_only, clients, store_edges, stale_entries and
-# policy_changed, each with a mode, and direction, dev_direction,
-# storage_access and codec_features, each with no_crossing, no_new_entries and
-# stale_entries.
+# ...and layout, test_only, clients, store_edges, single_user, stale_entries
+# and policy_changed, each with a mode, and direction, dev_direction,
+# storage_access, codec_features, domain_dependencies and model_protocol, each
+# with no_crossing, no_new_entries and stale_entries.
 ```
 
 The checks, each with its own mode:
@@ -411,37 +416,46 @@ The checks, each with its own mode:
   `store_users` doesn't list it. The fix is the owner's API, or for a store,
   which can't depend on one, moving the read into the owning store; or, if
   the crate owns the state, listing it.
+- `single_user`: a hint, advisory, for a Domain crate that may belong in its
+  one user (see [Domain](#domain)).
 - `stale_entries`: an `unmoved` entry for a crate that is gone or now in a
   layer directory; a `store_users` entry for something that isn't a store, or
   listing a crate that is gone, a client, or one outside API and Storage,
   which allows nothing; an `allowed_edges` entry whose normal or build
   dependency is gone, that needs no exception, or that is for a `test_only`
   edge, which it can't exempt; a `legacy` entry for a crate that is gone;
-  and a `[rules.layers.storage]` `helpers` entry that is gone, outside
+  a `[rules.layers.storage]` `helpers` entry that is gone, outside
   `l10_foundation`, also `legacy`, or a helper by its own driver dependency
-  already. An entry naming a crate without a layer isn't stale: the crate's
+  already; a `protocols` entry that is gone, outside `l20_domain` or a
+  protocol by its name already, and a `[rules.layers.domain_fences]` package
+  that is a driver or a storage helper, which `storage_access` checks
+  instead, or a Foundation crate that its own dependencies fence already.
+  An entry naming a crate without a layer isn't stale: the crate's
   `placement` finding covers it. Each is shown on its line in
   `ARCHITECTURE.toml`.
 - `policy_changed`: every difference in `[rules.layers]` from the base
   branch's `ARCHITECTURE.toml`, given with `--base-architecture`: an
   `unmoved` entry added or moved to another layer, a store user or allowed
-  edge added or removed, a legacy crate added or removed, a driver or helper
-  added to or removed from `[rules.layers.storage]`, a mode changed, or the whole table new. A
-  removed `unmoved` entry is one only if its crate moved into another layer's
-  directory than the entry's (shown on the `unmoved` header, or the first
-  `[rules.layers…]` one); otherwise its crate moved where the entry said, was
-  deleted, or is a `placement` finding. A base with `[rules.layers]` and a
-  branch without it gets one advisory finding on line 1 of
-  `ARCHITECTURE.toml`: the whole rule was removed and no longer runs. The
-  copy is read as for `crate_names`; a
+  edge added or removed, a legacy crate or a protocol added or removed, a
+  driver or helper added to or removed from `[rules.layers.storage]`, a
+  package added to, removed from or moved between
+  `[rules.layers.domain_fences]` families, a mode changed, or the whole
+  table new. A removed `unmoved` entry is one only if its crate moved into
+  another layer's directory than the entry's (shown on the `unmoved` header,
+  or the first `[rules.layers…]` one); otherwise its crate moved where the
+  entry said, was deleted, or is a `placement` finding. A base with
+  `[rules.layers]` and a branch without it gets one advisory finding on line
+  1 of `ARCHITECTURE.toml`: the whole rule was removed and no longer runs.
+  The copy is read as for `crate_names`; a
   `[rules.layers]` of another shape skips this behaviour and `placement`'s
   comparison with a warning (on a branch without the rule, the check for its
   removal), and `crate_names.policy_changed` still runs.
 
 `direction` and `dev_direction` have baseline tables, `[layers.direction]`
 and `[layers.dev_direction]`, which map each package to the packages it
-depends on against the check today, one per line; so do `storage_access` and
-`codec_features` (see [Storage access](#storage-access)). Package names, not
+depends on against the check today, one per line; so do `storage_access`,
+`codec_features` (see [Storage access](#storage-access)),
+`domain_dependencies` and `model_protocol` (see [Domain](#domain)). Package names, not
 paths, so moving a crate into its layer directory leaves its entries alone.
 Each check has three behaviours:
 
@@ -466,12 +480,14 @@ rest, and adds none: it prints `not added: …` for each edge without one,
 saying to fix the dependency, since an entry added by hand fails
 `no_new_entries`; a reviewed, permanent exception to `direction` goes in
 `[rules.layers.allowed_edges]`, which `policy_changed` reports,
-`dev_direction` has no exception path, and a crate that has to reach storage
-for good becomes a store or a storage helper (see [Storage
-access](#storage-access)). As for `crate_names`, it lists no TOML to paste.
-It always writes all four tables, after the tables of caps and before
-`[crate_names]`; `--write-baseline=layers.<check>` updates one, creating it
-if the file lacks it.
+`dev_direction` and `model_protocol` have no exception path, a crate that
+has to reach storage for good becomes a store or a storage helper (see
+[Storage access](#storage-access)), and a Domain crate that needs a fenced
+package is not Domain code and moves to its layer (see [Domain](#domain)).
+As for `crate_names`, it lists no TOML to paste. It always writes all six
+tables, after the tables of caps and before `[crate_names]`;
+`--write-baseline=layers.<check>` updates one, creating it if the file lacks
+it.
 
 ### Storage access
 
@@ -558,6 +574,83 @@ driver dependency is derived, and reviewed in that manifest diff only. A
 violation to fix later gets no entry: a hand-added one fails
 `no_new_entries`.
 
+### Domain
+
+`l20_domain` holds two kinds of crate. A **protocol** holds wire schemas and
+the conversions between them and the models: a Domain crate whose package
+name ends in `-protocol` or `-proto`, or that `[rules.layers] protocols`
+lists, such as `pplx-space-events`. Every other Domain crate is a **model**:
+types and the rules that keep them valid. A crate that holds both, until it
+is split, counts as a model. Domain does no I/O, except generating IDs in ID
+constructors and logging. Two checks, each with the three baselined
+behaviours above and a table keyed by package, and a hint:
+
+- `domain_dependencies`: no Domain crate has a normal or build dependency,
+  optional or not, for any target, on a fenced package. Each family of
+  `[rules.layers.domain_fences]`, such as `runtime`, `http`, `cloud` or
+  `kube`, is an exact list of package names, so a new package is added by
+  hand. tonic and prost are not listed: protocols build on them. The
+  workspace's own I/O crates are derived, as storage helpers are: an
+  `l10_foundation` crate, legacy or not, with a required (normal or build,
+  not optional) dependency on a fenced package is fenced under that
+  package's family, to a fixpoint, so a crate wrapping such a crate is fenced
+  too, and the finding names the dependency that fenced it. Features are
+  not followed, neither in that derivation nor in the features a Domain
+  crate turns on, so a crate that does I/O only behind a feature is listed,
+  such as `pplx-space-observability` under `runtime`, whose `otel` feature
+  brings tokio in, unless a required dependency fences it already, as
+  `pplx-space-metrics` fences `pplx-space-feature-flags`. A listed package
+  that is a driver or a storage helper is left to `storage_access`, which
+  reports it from Domain already, and is a `stale_entries` finding, as is a
+  listed Foundation crate that its own dependencies fence already. The
+  finding is shown on the
+  manifest line that declares the dependency, names the family and the
+  items the crate uses from it, and gives the
+  fixes: move that code into the `l40_api` crate that does the I/O, or into
+  an `l10_foundation` mechanism that names nothing SPACE-specific, and pass
+  the Domain crate plain values or a trait it defines; or move a crate that
+  is not Domain code to its layer. `[layers.domain_dependencies]` maps each
+  package to the fenced packages it depends on, such as
+  `pplx-space-spaced-common = ["tokio"]`. Dev-dependencies are not checked,
+  and only declared dependencies are: a protocol's tonic brings tokio and
+  hyper into its build regardless.
+- `model_protocol`: no model has a normal or build dependency on a protocol.
+  Protocols convert between the wire and the models, so they depend on the
+  models, and on other protocols, never the other way. The finding names the
+  items the model uses from the protocol and the fixes: move them into a
+  model and convert in the protocol, or split the model's wire code into a
+  protocol crate of its own. `[layers.model_protocol]` maps each model to the
+  protocols it depends on.
+- `single_user` (advisory): a Domain crate that exactly one crate uses, in
+  `l30_storage`, `l40_api`, `l50_app`, `test_support` or `tools`, may belong
+  in it; the hint is shown on the Domain crate's `name =` line. Users are
+  the crates with a normal or build dependency on it, and for one whose
+  `src/lib.rs` re-exports it at the top level (`pub use <crate>`, `pub use
+  <crate>::*` or `pub use <crate>::<item>`, under the name it imports the
+  crate by, outside any `mod`, function or other braces, comment or literal,
+  and not `pub(crate)`), as a client that re-exports its protocol does, that
+  crate's users too: moving the crate into one of them would break the
+  others. The
+  crates `[rules.layers] legacy` lists are not counted, and neither are
+  their users: what they re-export, often by glob, can't be told apart by
+  path, so a hint for a crate a legacy crate depends on says that those
+  re-exports can hide real users. Nor is the hint given for a Foundation
+  user, whose edge `direction` reports, or with a second user in Domain,
+  which could not follow the crate up; a legacy crate gets none itself.
+  There is no baseline. Today no crate qualifies: each Domain crate with one
+  direct user outside Domain is re-exported by that user, which has users of
+  its own, or by a legacy crate, or that user is in Foundation.
+
+Two `pattern_ratchet` instances complete the picture by line rather than by
+dependency (`ARCHITECTURE.toml` lists their patterns and what they miss):
+`domain_io`, with `include_layers = ["l20_domain"]`, counts environment
+reads, filesystem calls, sockets and connections, process and task
+spawning, clock reads and sleeps in Domain's production files; `foundation_space_names`, with
+`include_layers = ["l10_foundation"]`, counts `SPACE_*` names in
+Foundation's, which should name nothing SPACE-specific. Both count the
+legacy crates in their layer, with baseline entries, so that new matches do
+not land there.
+
 ### Limits
 
 - The checks see direct dependencies only. An edge through a re-export, such
@@ -603,6 +696,15 @@ violation to fix later gets no entry: a hand-added one fails
   dependency is one already. One that wraps a driver's client without
   depending on the driver goes in `[rules.layers.storage] helpers` with a
   comment saying why, and must name nothing SPACE-specific.
+- **A protocol:** name it `*-protocol` (or `*-proto`); a protocol with
+  another name, such as one that predates the convention, goes in
+  `[rules.layers] protocols`, which `policy_changed` reports.
+- **A Domain dependency:** a package that does I/O, such as a new HTTP
+  client or `aws-sdk-*` crate, goes in its `[rules.layers.domain_fences]`
+  family; a Foundation crate built on one needs no entry. A Domain crate that needs one is not Domain code; there is no
+  per-edge exception, and a hand-added baseline entry fails `no_new_entries`.
+  For a line that `domain_io` matches but that is not I/O, narrow the
+  instance's patterns in a reviewed change.
 - **Moving a crate:** `git mv` it into its layer directory and remove its
   `unmoved` entry, which `stale_entries` asks for. Its layers baseline
   entries keep matching, but path-keyed configuration has to follow the
@@ -618,7 +720,8 @@ sections or modes, a missing file, bad TOML, an invalid regex, glob or instance
 name, an empty `patterns`, `include`, `packages` or `members` list, a layer
 name that is not one of the seven, a package listed twice in `unmoved` or in
 one `store_users` or `allowed_edges` list or in a `[rules.layers.storage]` list,
-an empty `drivers`, an empty `include_layers` or a layer
+a package listed twice in `protocols` or in two `[rules.layers.domain_fences]`
+families, an empty `drivers`, an empty `include_layers` or a layer
 listed twice in it or in `allow_layers`, either of them without
 `[rules.layers]`, a baseline table for an instance or
 layers check that is not configured, and a failing `cargo metadata` exit 2. So

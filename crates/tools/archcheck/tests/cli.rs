@@ -4920,7 +4920,7 @@ fn pattern_ratchet_errors_point_at_the_line() {
 }
 
 /// Every behaviour of the layers rule, as `[rules.layers.<behaviour>]`.
-const LAYERS_BEHAVIOURS: [&str; 19] = [
+const LAYERS_BEHAVIOURS: [&str; 26] = [
     "placement",
     "layout",
     "direction.no_crossing",
@@ -4935,9 +4935,16 @@ const LAYERS_BEHAVIOURS: [&str; 19] = [
     "codec_features.no_crossing",
     "codec_features.no_new_entries",
     "codec_features.stale_entries",
+    "domain_dependencies.no_crossing",
+    "domain_dependencies.no_new_entries",
+    "domain_dependencies.stale_entries",
+    "model_protocol.no_crossing",
+    "model_protocol.no_new_entries",
+    "model_protocol.stale_entries",
     "test_only",
     "clients",
     "store_edges",
+    "single_user",
     "stale_entries",
     "policy_changed",
 ];
@@ -5086,11 +5093,13 @@ impl Layered<'_> {
     }
 }
 
-/// `(code, message, location)` of each layers finding, in reporting order.
+/// `(code, message, location)` of each layers finding, in reporting order,
+/// except `layers.single_user` hints, which [`layers_single_user`] checks:
+/// most workspaces here have a Domain crate with one user.
 fn layer_findings(ctx: &Context) -> Vec<(String, String, String)> {
     check(ctx)
         .into_iter()
-        .filter(|finding| finding.rule == "layers")
+        .filter(|finding| finding.rule == "layers" && finding.behaviour != "single_user")
         .map(|finding| {
             let at = format!("{}:{}", finding.location.path, finding.location.line);
             (finding.code(), finding.message(), at)
@@ -6165,6 +6174,16 @@ fn layers_policy_changed() {
     let legacy = |list: &str| {
         format!("[rules.layers.unmoved]\nl20_domain = []\n[rules.layers]\nlegacy = [{list}]\n")
     };
+    // After another `[rules.layers…]` header, as in the repository's copy.
+    let protocols = |list: &str| {
+        format!("[rules.layers.unmoved]\nl20_domain = []\n[rules.layers]\nprotocols = [{list}]\n")
+    };
+    let fences = |runtime: &str, http: &str, kube: &str| {
+        format!(
+            "[rules.layers.domain_fences]\nruntime = [{runtime}]\nhttp = [\n  {http},\n]\n\
+             kube = [{kube}]\n"
+        )
+    };
     let required = layers_config("", "required");
     let advisory_crossing = required.replace(
         "[rules.layers.direction.no_crossing]\nmode = \"required\"",
@@ -6286,6 +6305,75 @@ fn layers_policy_changed() {
             )],
         ),
         (
+            "protocols changed",
+            layers_config(&protocols("\"pplx-space-old\""), "required"),
+            layers_config(&protocols("\"pplx-space-new\""), "required"),
+            &[
+                (
+                    "protocols = ",
+                    "ARCHITECTURE.toml: `pplx-space-new` was added to [rules.layers] protocols.",
+                ),
+                (
+                    "protocols = ",
+                    "ARCHITECTURE.toml: `pplx-space-old` was removed from [rules.layers] \
+                     protocols.",
+                ),
+            ],
+        ),
+        (
+            "protocols removed",
+            layers_config(&protocols("\"pplx-space-old\""), "required"),
+            layers_config(
+                "[rules.layers.unmoved]\nl20_domain = []\n[rules.layers]\n",
+                "required",
+            ),
+            &[(
+                "[rules.layers]",
+                "ARCHITECTURE.toml: `pplx-space-old` was removed from [rules.layers] protocols.",
+            )],
+        ),
+        (
+            "domain_fences changed",
+            layers_config(
+                &fences("\"async-std\", \"smol\", \"tokio\"", "\"hyper\"", ""),
+                "required",
+            ),
+            layers_config(
+                &fences("\"tokio\"", "\"hyper\",\n  \"reqwest\"", "\"smol\""),
+                "required",
+            ),
+            &[
+                (
+                    "  \"reqwest\"",
+                    "ARCHITECTURE.toml: `reqwest` was added to [rules.layers.domain_fences], in \
+                     http.",
+                ),
+                (
+                    "kube = ",
+                    "ARCHITECTURE.toml: `smol` moved from runtime to kube in \
+                     [rules.layers.domain_fences].",
+                ),
+                (
+                    "[rules.layers.domain_fences]",
+                    "ARCHITECTURE.toml: `async-std` was removed from [rules.layers.domain_fences], \
+                     where it was in runtime.",
+                ),
+            ],
+        ),
+        (
+            "a Domain check's mode changed",
+            required.clone(),
+            required.replace(
+                "[rules.layers.model_protocol.no_crossing]\nmode = \"required\"",
+                "[rules.layers.model_protocol.no_crossing]\nmode = \"advisory\"",
+            ),
+            &[(
+                "[rules.layers.model_protocol.no_crossing]",
+                "ARCHITECTURE.toml: layers.model_protocol.no_crossing mode changed from \
+                 required to advisory.",
+            )],
+        ),
+        (
             "a storage check's mode changed",
             required.clone(),
             required.replace(
@@ -6326,6 +6414,7 @@ fn layers_policy_changed() {
             let mut want = line_with(policy, line);
             if line.starts_with("[rules.layers.direction")
                 || line.starts_with("[rules.layers.codec_features")
+                || line.starts_with("[rules.layers.model_protocol")
             {
                 want += 1;
             }
@@ -6482,8 +6571,9 @@ fn layers_configuration_errors() {
     let tables = |text: &str| layers_config(text, "required");
     let unknown_table = "is not a table of the layers rule: with [rules.layers] in \
                          ARCHITECTURE.toml, its tables are layers.direction, \
-                         layers.dev_direction, layers.storage_access and layers.codec_features, \
-                         and without it there are none";
+                         layers.dev_direction, layers.storage_access, layers.codec_features, \
+                         layers.domain_dependencies and layers.model_protocol, and without it \
+                         there are none";
     let cases: &[(&str, &str, String, &str)] = &[
         (
             "an unknown layer",
@@ -6507,6 +6597,24 @@ fn layers_configuration_errors() {
                 "[rules.layers.unmoved]\nl10_foundation = [\"pplx-space-x\", \"pplx-space-x\"]\n",
             ),
             "\"pplx-space-x\" is listed twice",
+        ),
+        (
+            "a package in two domain_fences families",
+            "ARCHITECTURE.toml",
+            tables("[rules.layers.domain_fences]\nhttp = [\"hyper\"]\nruntime = [\"hyper\"]\n"),
+            "domain_fences lists \"hyper\" in both http and runtime",
+        ),
+        (
+            "a package twice in one domain_fences family",
+            "ARCHITECTURE.toml",
+            tables("[rules.layers.domain_fences]\nhttp = [\"hyper\", \"hyper\"]\n"),
+            "\"hyper\" is listed twice",
+        ),
+        (
+            "a protocol listed twice",
+            "ARCHITECTURE.toml",
+            tables("[rules.layers]\nprotocols = [\"pplx-space-d\", \"pplx-space-d\"]\n"),
+            "\"pplx-space-d\" is listed twice",
         ),
         (
             "a store user listed twice",
@@ -6743,8 +6851,9 @@ fn layers_rdjson_and_exit_codes() {
     let dependencies = [("pplx-space-f", "dependencies", "pplx-space-d")];
     let skips = [
         "archcheck: layers.direction.no_new_entries, layers.dev_direction.no_new_entries, \
-         layers.storage_access.no_new_entries and layers.codec_features.no_new_entries skipped \
-         (no --base-baseline given)",
+         layers.storage_access.no_new_entries, layers.codec_features.no_new_entries, \
+         layers.domain_dependencies.no_new_entries and layers.model_protocol.no_new_entries \
+         skipped (no --base-baseline given)",
         "archcheck: layers.policy_changed and layers.placement's check for new unmoved entries \
          skipped (no --base-architecture given)",
     ];
@@ -6856,7 +6965,9 @@ fn layers_rdjson_and_exit_codes() {
         )) && warnings[0].ends_with(
             "file_size.no_new_entries and file_size.no_raised_caps, \
              layers.direction.no_new_entries, layers.dev_direction.no_new_entries, \
-             layers.storage_access.no_new_entries and layers.codec_features.no_new_entries skipped"
+             layers.storage_access.no_new_entries, layers.codec_features.no_new_entries, \
+             layers.domain_dependencies.no_new_entries and \
+             layers.model_protocol.no_new_entries skipped"
         ),
         "{}",
         warnings[0]
@@ -7961,4 +8072,844 @@ fn layers_storage_configuration_errors() {
         "{}",
         checked.stderr
     );
+}
+
+const DOMAIN_EXTRA: [(&str, &str); 4] = [
+    ("crates/l20_domain/m", "pplx-space-m"),
+    ("crates/l20_domain/w/protocol", "pplx-space-w-protocol"),
+    ("crates/l20_domain/wire", "pplx-space-wire"),
+    ("crates/libs/legacy", "pplx-space-legacy"),
+];
+
+/// `[rules.layers]` tables for [`domain_workspace`].
+const DOMAIN_TABLES: &str = "[rules.layers]\nlegacy = [\"pplx-space-legacy\"]\n\
+                             protocols = [\"pplx-space-wire\"]\n\
+                             [rules.layers.unmoved]\nl20_domain = [\"pplx-space-legacy\"]\n\
+                             [rules.layers.storage]\ndrivers = [\"redis\", \"sqlx\"]\n\
+                             [rules.layers.domain_fences]\nruntime = [\"tokio\"]\n\
+                             http = [\"hyper\", \"reqwest\"]\nkube = [\"kube\"]\n";
+
+/// A layered workspace whose Domain manifests reach fenced packages and
+/// protocols in every way the Domain checks tell apart, with `tables` as
+/// `[rules.layers]`'s and `files` written over the rest:
+///
+/// - `d`, a model, depends on `tokio`, on `hyper` (optional) and `reqwest`
+///   (a build-dependency), and on `sqlx`, a driver, and `aws-lc-rs`, which
+///   no family lists; and on the protocols `w-protocol`, by its name, and
+///   `wire` (a build-dependency), which `protocols` lists;
+/// - `m`, a model, dev-depends on `tokio` and `w-protocol`, and depends on
+///   the model `d`;
+/// - `w-protocol` depends on `tokio` for one target, and on `d` and `wire`;
+/// - the legacy crate, a model, depends on `kube` (optional) and `wire`;
+/// - `a` (API) depends on `tokio` and `w-protocol`.
+fn domain_workspace(tables: &str, files: Vec<(&str, String)>) -> TempDir {
+    let manifest = |name: &str, body: &str| format!("{}{body}", package(name));
+    let mut all: Vec<(&str, String)> = vec![
+        ("ARCHITECTURE.toml", layers_config(tables, "required")),
+        (
+            "crates/l20_domain/d/Cargo.toml",
+            manifest(
+                "pplx-space-d",
+                "[dependencies]\ntokio = \"1\"\nhyper = { version = \"1\", optional = true }\n\
+                 sqlx = \"1\"\naws-lc-rs = \"1\"\n\
+                 pplx-space-w-protocol = { path = \"../w/protocol\" }\n\
+                 [build-dependencies]\nreqwest = \"1\"\n\
+                 pplx-space-wire = { path = \"../wire\" }\n",
+            ),
+        ),
+        (
+            "crates/l20_domain/d/src/lib.rs",
+            "use tokio::sync::Mutex;\nuse pplx_space_w_protocol::v1::Thing;\n".to_owned(),
+        ),
+        (
+            "crates/l20_domain/m/Cargo.toml",
+            manifest(
+                "pplx-space-m",
+                "[dependencies]\npplx-space-d = { path = \"../d\" }\n\
+                 [dev-dependencies]\ntokio = \"1\"\n\
+                 pplx-space-w-protocol = { path = \"../w/protocol\" }\n",
+            ),
+        ),
+        (
+            "crates/l20_domain/w/protocol/Cargo.toml",
+            manifest(
+                "pplx-space-w-protocol",
+                "[dependencies]\npplx-space-d = { path = \"../../d\" }\n\
+                 pplx-space-wire = { path = \"../../wire\" }\n\
+                 [target.'cfg(unix)'.dependencies]\ntokio = \"1\"\n",
+            ),
+        ),
+        (
+            "crates/libs/legacy/Cargo.toml",
+            manifest(
+                "pplx-space-legacy",
+                "[dependencies]\nkube = { version = \"1\", optional = true }\n\
+                 pplx-space-wire = { path = \"../../l20_domain/wire\" }\n",
+            ),
+        ),
+        (
+            "crates/l40_api/a/server/Cargo.toml",
+            manifest(
+                "pplx-space-a",
+                "[dependencies]\ntokio = \"1\"\n\
+                 pplx-space-w-protocol = { path = \"../../../l20_domain/w/protocol\" }\n",
+            ),
+        ),
+    ];
+    all.extend(files);
+    Layered {
+        extra: &DOMAIN_EXTRA,
+        tables,
+        files: all,
+        ..Layered::default()
+    }
+    .build()
+}
+
+/// A baseline of [`layers_baseline`] without edges, plus the Domain checks'
+/// tables with these `(from, to)` entries, each package's on one line.
+fn domain_baseline(dependencies: &[(&str, &str)], model_protocol: &[(&str, &str)]) -> String {
+    let table = |name: &str, edges: &[(&str, &str)]| {
+        let mut grouped: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+        for (from, to) in edges {
+            grouped.entry(from).or_default().push(format!("{to:?}"));
+        }
+        let mut text = format!("[layers.{name}]\n");
+        for (from, to) in grouped {
+            text.push_str(&format!("{from:?} = [{}]\n", to.join(", ")));
+        }
+        text
+    };
+    layers_baseline(&[], &[]).replace(
+        "[crate_names]\n",
+        &format!(
+            "{}{}[crate_names]\n",
+            table("domain_dependencies", dependencies),
+            table("model_protocol", model_protocol)
+        ),
+    )
+}
+
+/// The `domain_dependencies` and `model_protocol` findings, as `(code,
+/// message, location)`.
+fn domain_findings(ctx: &Context) -> Vec<(String, String, String)> {
+    layer_findings(ctx)
+        .into_iter()
+        .filter(|(code, _, _)| {
+            code.starts_with("layers.domain_dependencies.")
+                || code.starts_with("layers.model_protocol.")
+        })
+        .collect()
+}
+
+/// The edges [`domain_workspace`] has against the Domain checks.
+const DOMAIN_DEPENDENCIES: [(&str, &str); 5] = [
+    ("pplx-space-d", "hyper"),
+    ("pplx-space-d", "reqwest"),
+    ("pplx-space-d", "tokio"),
+    ("pplx-space-legacy", "kube"),
+    ("pplx-space-w-protocol", "tokio"),
+];
+const MODEL_PROTOCOL: [(&str, &str); 3] = [
+    ("pplx-space-d", "pplx-space-w-protocol"),
+    ("pplx-space-d", "pplx-space-wire"),
+    ("pplx-space-legacy", "pplx-space-wire"),
+];
+
+/// No Domain crate has a normal or build dependency on a fenced package,
+/// and no model one on a protocol; each finding is on the manifest line
+/// that declares it, says why and how to fix it. Drivers are left to
+/// storage_access, legacy crates are checked, and dev-dependencies and
+/// crates outside Domain are not.
+#[test]
+fn layers_domain_checks() {
+    let ws = domain_workspace(DOMAIN_TABLES, Vec::new());
+    let ctx = load(ws.path(), None);
+    let manifest = |path: &str| fs::read_to_string(ws.path().join(path)).unwrap();
+    let at = |path: &str, needle: &str| format!("{path}:{}", line_with(&manifest(path), needle));
+    let d = "crates/l20_domain/d/Cargo.toml";
+    let legacy = "crates/libs/legacy/Cargo.toml";
+    let w = "crates/l20_domain/w/protocol/Cargo.toml";
+    let expected = [
+        (
+            "layers.domain_dependencies.no_crossing",
+            format!(
+                "{d}: pplx-space-d (l20_domain) depends on hyper, which \
+                 [rules.layers.domain_fences] http lists, a normal dependency (optional, so a \
+                 feature turns it on), but l20_domain crates do no I/O"
+            ),
+            at(d, "hyper ="),
+        ),
+        (
+            "layers.domain_dependencies.no_crossing",
+            format!(
+                "{d}: pplx-space-d (l20_domain) depends on reqwest, which \
+                 [rules.layers.domain_fences] http lists, a build-dependency, but"
+            ),
+            at(d, "reqwest ="),
+        ),
+        (
+            "layers.domain_dependencies.no_crossing",
+            format!(
+                "{d}: pplx-space-d (l20_domain) depends on tokio, which \
+                 [rules.layers.domain_fences] runtime lists, a normal dependency, but l20_domain \
+                 crates do no I/O, and domain_fences lists the packages that do it, such as async \
+                 runtimes, HTTP clients, cloud SDKs and Kubernetes clients. Fix one of: move the \
+                 code that uses it (tokio::sync::Mutex) into the l40_api crate that does the \
+                 I/O, or into an l10_foundation mechanism that names nothing SPACE-specific, and \
+                 have pplx-space-d take plain values or define a trait for it; or, if \
+                 pplx-space-d is not Domain code, move it to its layer. See \
+                 crates/tools/archcheck/README.md#layers."
+            ),
+            at(d, "tokio ="),
+        ),
+        (
+            "layers.domain_dependencies.no_crossing",
+            format!(
+                "{legacy}: pplx-space-legacy (l20_domain) depends on kube, which \
+                 [rules.layers.domain_fences] kube lists, a normal dependency (optional"
+            ),
+            at(legacy, "kube ="),
+        ),
+        (
+            "layers.domain_dependencies.no_crossing",
+            format!(
+                "{w}: pplx-space-w-protocol (l20_domain) depends on tokio, which \
+                 [rules.layers.domain_fences] runtime lists, a normal dependency, for target \
+                 cfg(unix), but"
+            ),
+            at(w, "tokio ="),
+        ),
+        (
+            "layers.model_protocol.no_crossing",
+            format!(
+                "{d}: pplx-space-d (a model in l20_domain) depends on pplx-space-w-protocol (a \
+                 protocol: its name ends in -protocol), a normal dependency, but a model never \
+                 depends on a protocol: protocols hold wire schemas and convert between them and \
+                 the models, so the edge goes the other way. Fix one of: move what pplx-space-d \
+                 uses (pplx_space_w_protocol::v1::Thing) into a model, and have \
+                 pplx-space-w-protocol convert to it; or, if pplx-space-d holds wire code too, \
+                 split that into a protocol crate (named *-protocol), which may depend on both. \
+                 See crates/tools/archcheck/README.md#layers."
+            ),
+            at(d, "pplx-space-w-protocol ="),
+        ),
+        (
+            "layers.model_protocol.no_crossing",
+            format!(
+                "{d}: pplx-space-d (a model in l20_domain) depends on pplx-space-wire (a \
+                 protocol: [rules.layers] protocols lists it), a build-dependency, but"
+            ),
+            at(d, "pplx-space-wire ="),
+        ),
+        (
+            "layers.model_protocol.no_crossing",
+            format!(
+                "{legacy}: pplx-space-legacy (a model in l20_domain) depends on pplx-space-wire"
+            ),
+            at(legacy, "pplx-space-wire ="),
+        ),
+    ];
+    let expected: Vec<(&str, &str, &str)> = expected
+        .iter()
+        .map(|(code, message, at)| (*code, message.as_str(), at.as_str()))
+        .collect();
+    assert_layer_findings("domain", &domain_findings(&ctx), &expected);
+    // The driver is storage_access's, not domain_dependencies'.
+    assert!(
+        layer_findings(&ctx).iter().any(|(code, message, _)| {
+            code == "layers.storage_access.no_crossing" && message.contains("depends on sqlx")
+        }),
+        "{:#?}",
+        layer_findings(&ctx)
+    );
+
+    // Listed, they are tolerated.
+    let ws = domain_workspace(
+        DOMAIN_TABLES,
+        vec![(
+            "architecture-baseline.toml",
+            domain_baseline(&DOMAIN_DEPENDENCIES, &MODEL_PROTOCOL),
+        )],
+    );
+    let found = domain_findings(&load(ws.path(), None));
+    assert!(found.is_empty(), "{found:#?}");
+
+    // Without its `protocols` entry, `wire` is a model, and depending on it
+    // is no finding.
+    let ws = domain_workspace(
+        &DOMAIN_TABLES.replace("[\"pplx-space-wire\"]", "[]"),
+        vec![(
+            "architecture-baseline.toml",
+            domain_baseline(&DOMAIN_DEPENDENCIES, &[]),
+        )],
+    );
+    let found: Vec<String> = domain_findings(&load(ws.path(), None))
+        .into_iter()
+        .map(|(code, _, _)| code)
+        .collect();
+    assert_eq!(found, ["layers.model_protocol.no_crossing"], "{found:#?}");
+}
+
+/// A crate whose name ends in `-proto` is a protocol.
+#[test]
+fn layers_domain_proto_names() {
+    let extra = [
+        ("crates/l20_domain/m", "pplx-space-m"),
+        ("crates/l20_domain/x/proto", "pplx-space-x-proto"),
+    ];
+    let dependencies = [
+        ("pplx-space-m", "dependencies", "pplx-space-x-proto"),
+        ("pplx-space-x-proto", "dependencies", "pplx-space-d"),
+    ];
+    let ws = Layered {
+        extra: &extra,
+        dependencies: &dependencies,
+        ..Layered::default()
+    }
+    .build();
+    let found = domain_findings(&load(ws.path(), None));
+    assert_layer_findings(
+        "proto",
+        &found,
+        &[(
+            "layers.model_protocol.no_crossing",
+            "crates/l20_domain/m/Cargo.toml: pplx-space-m (a model in l20_domain) depends on \
+             pplx-space-x-proto (a protocol: its name ends in -proto), a normal dependency",
+            "crates/l20_domain/m/Cargo.toml:6",
+        )],
+    );
+}
+
+/// An entry that no longer applies is stale, with the reason; so is a
+/// `protocols` entry that is no Domain crate or a protocol by its name, and
+/// a `domain_fences` package that storage_access checks.
+#[test]
+fn layers_domain_stale_entries() {
+    let tables = "[rules.layers]\nlegacy = [\"pplx-space-legacy\"]\n\
+                  protocols = [\n  \"pplx-space-a\",\n  \"pplx-space-gone\",\n  \
+                  \"pplx-space-w-protocol\",\n  \"pplx-space-wire\",\n]\n\
+                  [rules.layers.unmoved]\nl20_domain = [\"pplx-space-legacy\"]\n\
+                  [rules.layers.storage]\ndrivers = [\"redis\", \"sqlx\"]\n\
+                  [rules.layers.domain_fences]\nruntime = [\"tokio\"]\n\
+                  http = [\"hyper\", \"reqwest\"]\nkube = [\"kube\"]\ndb = [\"sqlx\"]\n";
+    let dependencies = [
+        ("pplx-space-a", "tokio"),
+        ("pplx-space-d", "aws-lc-rs"),
+        ("pplx-space-d", "sqlx"),
+        ("pplx-space-gone", "tokio"),
+        ("pplx-space-m", "tokio"),
+    ];
+    let model_protocol = [
+        ("pplx-space-m", "pplx-space-d"),
+        ("pplx-space-m", "pplx-space-gone"),
+        ("pplx-space-m", "pplx-space-w-protocol"),
+        ("pplx-space-w-protocol", "pplx-space-wire"),
+    ];
+    let baseline = domain_baseline(&dependencies, &model_protocol);
+    let ws = domain_workspace(
+        tables,
+        vec![("architecture-baseline.toml", baseline.clone())],
+    );
+    let ctx = load(ws.path(), None);
+    let config = fs::read_to_string(ws.path().join("ARCHITECTURE.toml")).unwrap();
+    let entry = |from: &str, to: &str| {
+        let line = baseline
+            .lines()
+            .position(|line| {
+                line.starts_with(&format!("{from:?} = ")) && line.contains(&format!("{to:?}"))
+            })
+            .expect("the entry is in the baseline");
+        format!("architecture-baseline.toml:{}", line + 1)
+    };
+    let stale = |table: &str, from: &str, to: &str, reason: &str| {
+        (
+            format!("layers.{table}.stale_entries"),
+            format!(
+                "{from} -> {to}: is in [layers.{table}] in architecture-baseline.toml, but \
+                 {reason}. Remove the entry (cargo arch --write-baseline=layers.{table})."
+            ),
+            entry(from, to),
+        )
+    };
+    let expected = vec![
+        stale(
+            "domain_dependencies",
+            "pplx-space-a",
+            "tokio",
+            "pplx-space-a is not in l20_domain",
+        ),
+        stale(
+            "domain_dependencies",
+            "pplx-space-d",
+            "aws-lc-rs",
+            "aws-lc-rs is not fenced: no [rules.layers.domain_fences] family lists it, and it \
+             is no l10_foundation crate with a required dependency on a fenced package",
+        ),
+        stale(
+            "domain_dependencies",
+            "pplx-space-d",
+            "sqlx",
+            "sqlx is a driver or a storage helper, which layers.storage_access checks instead",
+        ),
+        stale(
+            "domain_dependencies",
+            "pplx-space-gone",
+            "tokio",
+            "no workspace member is named pplx-space-gone",
+        ),
+        stale(
+            "domain_dependencies",
+            "pplx-space-m",
+            "tokio",
+            "pplx-space-m has no normal or build dependency on tokio",
+        ),
+        stale(
+            "model_protocol",
+            "pplx-space-m",
+            "pplx-space-d",
+            "pplx-space-d is not a protocol",
+        ),
+        stale(
+            "model_protocol",
+            "pplx-space-m",
+            "pplx-space-gone",
+            "no workspace member is named pplx-space-gone",
+        ),
+        stale(
+            "model_protocol",
+            "pplx-space-m",
+            "pplx-space-w-protocol",
+            "pplx-space-m has no normal or build dependency on pplx-space-w-protocol",
+        ),
+        stale(
+            "model_protocol",
+            "pplx-space-w-protocol",
+            "pplx-space-wire",
+            "pplx-space-w-protocol is a protocol, which may depend on protocols",
+        ),
+    ];
+    let found: Vec<_> = domain_findings(&ctx)
+        .into_iter()
+        .filter(|(code, _, _)| code.ends_with(".stale_entries"))
+        .collect();
+    let expected: Vec<(&str, &str, &str)> = expected
+        .iter()
+        .map(|(code, message, at)| (code.as_str(), message.as_str(), at.as_str()))
+        .collect();
+    assert_layer_findings("stale", &found, &expected);
+
+    let config_at = |needle: &str| format!("ARCHITECTURE.toml:{}", line_with(&config, needle));
+    let protocol = |package: &str, reason: &str| {
+        (
+            format!(
+                "{package}: is in [rules.layers] protocols in ARCHITECTURE.toml, but {reason}. \
+                 Remove it."
+            ),
+            config_at(&format!("  \"{package}\",")),
+        )
+    };
+    let expected = [
+        protocol(
+            "pplx-space-a",
+            "a protocol is an l20_domain crate, and its layer is l40_api",
+        ),
+        protocol("pplx-space-gone", "no workspace member has this name"),
+        protocol(
+            "pplx-space-w-protocol",
+            "its name ends in -protocol, which makes it a protocol",
+        ),
+        (
+            "sqlx: is in [rules.layers.domain_fences] in ARCHITECTURE.toml, but it is a driver \
+             or a storage helper, whose dependents in l20_domain layers.storage_access reports. \
+             Remove it."
+                .to_owned(),
+            config_at("db = "),
+        ),
+    ];
+    let found: Vec<(String, String)> = layer_findings(&ctx)
+        .into_iter()
+        .filter(|(code, _, _)| code == "layers.stale_entries")
+        .map(|(_, message, at)| (message, at))
+        .collect();
+    assert_eq!(found, expected);
+}
+
+/// An l10_foundation crate with a required dependency on a fenced package,
+/// legacy or not, is fenced under its family, to a fixpoint, and the
+/// finding names the dependency; one with an optional dependency only is
+/// not, but can be listed. A listed crate that its dependencies fence is a
+/// stale entry; a `protocols` entry for a crate without a layer is not,
+/// since placement reports the crate.
+#[test]
+fn layers_domain_fences_derive_foundation_crates() {
+    let extra = [
+        ("crates/l10_foundation/o", "pplx-space-o"),
+        ("crates/libs/old", "pplx-space-old"),
+        ("crates/libs/stray", "pplx-space-stray"),
+    ];
+    let tables = "[rules.layers]\nlegacy = [\"pplx-space-old\"]\n\
+                  protocols = [\"pplx-space-stray\"]\n\
+                  [rules.layers.unmoved]\nl10_foundation = [\"pplx-space-old\"]\n\
+                  [rules.layers.storage]\ndrivers = [\"sqlx\"]\n\
+                  [rules.layers.domain_fences]\nruntime = [\"tokio\"]\n\
+                  http = [\"hyper\", \"pplx-space-g\", \"pplx-space-o\", \"reqwest\"]\n";
+    let manifest = |name: &str, body: &str| format!("{}{body}", package(name));
+    let ws = Layered {
+        extra: &extra,
+        tables,
+        files: vec![
+            (
+                "crates/l10_foundation/f/Cargo.toml",
+                manifest(
+                    "pplx-space-f",
+                    "[dependencies]\ntokio = \"1\"\nhyper = \"1\"\n",
+                ),
+            ),
+            (
+                "crates/l10_foundation/g/Cargo.toml",
+                manifest(
+                    "pplx-space-g",
+                    "[dependencies]\nreqwest = { version = \"1\", optional = true }\n\
+                     pplx-space-f = { path = \"../f\" }\n",
+                ),
+            ),
+            (
+                "crates/l10_foundation/o/Cargo.toml",
+                manifest(
+                    "pplx-space-o",
+                    "[dependencies]\ntokio = { version = \"1\", optional = true }\n",
+                ),
+            ),
+            (
+                "crates/libs/old/Cargo.toml",
+                manifest("pplx-space-old", "[dependencies]\ntokio = \"1\"\n"),
+            ),
+            (
+                "crates/l20_domain/d/Cargo.toml",
+                manifest(
+                    "pplx-space-d",
+                    "[dependencies]\npplx-space-f = { path = \"../../l10_foundation/f\" }\n\
+                     pplx-space-g = { path = \"../../l10_foundation/g\" }\n\
+                     pplx-space-o = { path = \"../../l10_foundation/o\" }\n\
+                     pplx-space-old = { path = \"../../libs/old\" }\n",
+                ),
+            ),
+            (
+                "crates/l20_domain/d/src/lib.rs",
+                "use pplx_space_g::Pool;\n".to_owned(),
+            ),
+        ],
+        ..Layered::default()
+    }
+    .build();
+    let ctx = load(ws.path(), None);
+    let d = "crates/l20_domain/d/Cargo.toml";
+    let text = fs::read_to_string(ws.path().join(d)).unwrap();
+    let at = |needle: &str| format!("{d}:{}", line_with(&text, needle));
+    let fenced = |to: &str, why: &str| {
+        (
+            "layers.domain_dependencies.no_crossing",
+            format!(
+                "{d}: pplx-space-d (l20_domain) depends on {to}, {why}, a normal dependency, but"
+            ),
+            at(&format!("{to} =")),
+        )
+    };
+    let expected = [
+        fenced(
+            "pplx-space-f",
+            "an l10_foundation crate whose required dependency on tokio fences it under \
+             [rules.layers.domain_fences] runtime",
+        ),
+        fenced(
+            "pplx-space-g",
+            "an l10_foundation crate whose required dependency on pplx-space-f fences it under \
+             [rules.layers.domain_fences] runtime",
+        ),
+        fenced(
+            "pplx-space-o",
+            "which [rules.layers.domain_fences] http lists",
+        ),
+        fenced(
+            "pplx-space-old",
+            "an l10_foundation crate whose required dependency on tokio fences it under \
+             [rules.layers.domain_fences] runtime",
+        ),
+    ];
+    let expected: Vec<(&str, &str, &str)> = expected
+        .iter()
+        .map(|(code, message, at)| (*code, message.as_str(), at.as_str()))
+        .collect();
+    let found = domain_findings(&ctx);
+    assert_layer_findings("derived", &found, &expected);
+    assert!(found[1].1.contains("(pplx_space_g::Pool)"), "{found:#?}");
+
+    let config = fs::read_to_string(ws.path().join("ARCHITECTURE.toml")).unwrap();
+    let stale: Vec<(String, String)> = layer_findings(&ctx)
+        .into_iter()
+        .filter(|(code, _, _)| code == "layers.stale_entries")
+        .map(|(_, message, at)| (message, at))
+        .collect();
+    assert_eq!(
+        stale,
+        [(
+            "pplx-space-g: is in [rules.layers.domain_fences] in ARCHITECTURE.toml, but its \
+             required dependency on pplx-space-f fences it already, under runtime. Remove it."
+                .to_owned(),
+            format!("ARCHITECTURE.toml:{}", line_with(&config, "http = ")),
+        )]
+    );
+    assert!(
+        layer_findings(&ctx).iter().any(|(code, message, _)| {
+            code == "layers.placement" && message.contains("pplx-space-stray")
+        }),
+        "{:#?}",
+        layer_findings(&ctx)
+    );
+}
+
+/// The Domain tables compare with the base branch's: a base whose layers
+/// rule lacks the check is seeded, with advisory findings, and one with the
+/// check but without the table tolerates nothing. `--write-baseline` keeps
+/// the entries still in violation and lists the others.
+#[test]
+fn layers_domain_base_comparison_and_write_baseline() {
+    let listed = [("pplx-space-d", "tokio"), ("pplx-space-m", "tokio")];
+    let ws = domain_workspace(
+        DOMAIN_TABLES,
+        vec![(
+            "architecture-baseline.toml",
+            domain_baseline(&listed, &MODEL_PROTOCOL[..1]),
+        )],
+    );
+    let config = fs::read_to_string(ws.path().join("ARCHITECTURE.toml")).unwrap();
+    let mut without_domain = String::new();
+    let mut skipping = false;
+    for line in config.lines() {
+        if line.starts_with('[') {
+            skipping = line.starts_with("[rules.layers.domain_dependencies")
+                || line.starts_with("[rules.layers.model_protocol");
+        }
+        if !skipping {
+            without_domain.push_str(line);
+            without_domain.push('\n');
+        }
+    }
+    let base = layers_baseline(&[], &[]);
+    let new_entries = |architecture: &str| {
+        let ctx = load_with(ws.path(), Some(&base), Some(architecture));
+        check(&ctx)
+            .into_iter()
+            .filter(|finding| finding.behaviour == "no_new_entries")
+            .map(|finding| (finding.message(), finding.mode.is_required()))
+            .collect::<Vec<_>>()
+    };
+
+    let seeded = new_entries(&without_domain);
+    assert_eq!(seeded.len(), 3, "{seeded:#?}");
+    assert_eq!(
+        seeded[0].0,
+        "pplx-space-d -> tokio: is in [layers.domain_dependencies] in \
+         architecture-baseline.toml, and the base branch's layers rule has no \
+         domain_dependencies check yet, so this pull request seeds the table. Review each entry."
+    );
+    assert!(
+        seeded[2].0.starts_with(
+            "pplx-space-d -> pplx-space-w-protocol: is in [layers.model_protocol] in \
+             architecture-baseline.toml, and the base branch's layers rule has no model_protocol \
+             check yet"
+        ),
+        "{seeded:#?}"
+    );
+    assert!(seeded.iter().all(|(_, required)| !required));
+
+    let compared = new_entries(&config);
+    assert_eq!(compared.len(), 3, "{compared:#?}");
+    assert!(
+        compared[0].0.starts_with(
+            "pplx-space-d -> tokio: is in [layers.domain_dependencies] in \
+             architecture-baseline.toml but not in the base branch's copy"
+        ),
+        "{compared:#?}"
+    );
+    assert!(compared.iter().all(|(_, required)| *required));
+
+    let write = run(ws.path(), &["--write-baseline=layers.domain_dependencies"]);
+    assert_eq!(write.code, 0, "{}", write.stderr);
+    let not_added: Vec<&str> = write
+        .stdout
+        .lines()
+        .filter(|line| line.starts_with("not added: "))
+        .collect();
+    assert_eq!(
+        not_added,
+        [
+            "not added: pplx-space-d (l20_domain) -> hyper (http) in \
+             [layers.domain_dependencies]; fix the dependency (cargo arch says how): an entry \
+             added by hand fails layers.domain_dependencies.no_new_entries, and a Domain crate \
+             that needs the package for good is not Domain code and moves to its layer's \
+             directory, a move reviewed in the diff",
+            "not added: pplx-space-d (l20_domain) -> reqwest (http) in \
+             [layers.domain_dependencies]; fix the dependency (cargo arch says how): an entry \
+             added by hand fails layers.domain_dependencies.no_new_entries, and a Domain crate \
+             that needs the package for good is not Domain code and moves to its layer's \
+             directory, a move reviewed in the diff",
+            "not added: pplx-space-legacy (l20_domain) -> kube (kube) in \
+             [layers.domain_dependencies]; fix the dependency (cargo arch says how): an entry \
+             added by hand fails layers.domain_dependencies.no_new_entries, and a Domain crate \
+             that needs the package for good is not Domain code and moves to its layer's \
+             directory, a move reviewed in the diff",
+            "not added: pplx-space-w-protocol (l20_domain) -> tokio (runtime) in \
+             [layers.domain_dependencies]; fix the dependency (cargo arch says how): an entry \
+             added by hand fails layers.domain_dependencies.no_new_entries, and a Domain crate \
+             that needs the package for good is not Domain code and moves to its layer's \
+             directory, a move reviewed in the diff",
+        ],
+        "{}",
+        write.stdout
+    );
+    let text = fs::read_to_string(ws.path().join("architecture-baseline.toml")).unwrap();
+    assert_eq!(
+        generated_table(&text, "layers.domain_dependencies"),
+        "[layers.domain_dependencies]\npplx-space-d = [\n  \"tokio\",\n]\n",
+        "{text}"
+    );
+    assert_eq!(
+        generated_table(&text, "layers.model_protocol"),
+        "[layers.model_protocol]\npplx-space-d = [\n  \"pplx-space-w-protocol\",\n]\n",
+        "{text}"
+    );
+}
+
+/// A Domain crate that one crate above Domain and Foundation uses, and
+/// nothing else, gets a hint on its `name =` line. A dependent that
+/// re-exports it at its root counts, and so do its own users; a `pub use`
+/// inside a `mod`, a comment or a string, or a `pub(crate) use`, is no
+/// re-export. A legacy dependent is not counted, and the hint says so; a
+/// legacy crate gets none itself.
+#[test]
+fn layers_single_user() {
+    let extra = [
+        ("crates/l20_domain/e", "pplx-space-e"),
+        ("crates/l20_domain/h", "pplx-space-h"),
+        ("crates/l20_domain/i", "pplx-space-i"),
+        ("crates/l20_domain/j", "pplx-space-j"),
+        ("crates/l20_domain/k", "pplx-space-k"),
+        ("crates/l20_domain/l", "pplx-space-l"),
+        ("crates/l20_domain/n", "pplx-space-n"),
+        ("crates/l40_api/c/client", "pplx-space-c-client"),
+        ("crates/libs/legacy", "pplx-space-legacy"),
+    ];
+    let dependencies = [
+        // d: a alone.
+        ("pplx-space-a", "dependencies", "pplx-space-d"),
+        // e: a-client re-exports an item, and a and p use the client.
+        ("pplx-space-a-client", "dependencies", "pplx-space-e"),
+        ("pplx-space-a", "dependencies", "pplx-space-a-client"),
+        ("pplx-space-p", "dependencies", "pplx-space-a-client"),
+        // h: b-client re-exports it renamed, and q uses the client: moving h
+        // into q would break b-client, so both count.
+        ("pplx-space-b-client", "dependencies", "wire=pplx-space-h"),
+        ("pplx-space-q", "dependencies", "pplx-space-b-client"),
+        // i and j: c-client, whose `pub use` of i is inside a `mod`, indented
+        // or not, and of j is `pub(crate)`, and whose column-zero `pub use`s
+        // of both in a block comment and of j in a string are no code, so
+        // neither passes on p, its user.
+        ("pplx-space-c-client", "dependencies", "pplx-space-i"),
+        ("pplx-space-c-client", "dependencies", "pplx-space-j"),
+        ("pplx-space-p", "dependencies", "pplx-space-c-client"),
+        // k: the legacy crate and s-store; the legacy crate has one user, a.
+        ("pplx-space-legacy", "dependencies", "pplx-space-k"),
+        ("pplx-space-s-store", "dependencies", "pplx-space-k"),
+        ("pplx-space-a", "dependencies", "pplx-space-legacy"),
+        // l: a Foundation crate, against the layer order, and dev-dependents.
+        ("pplx-space-f", "dependencies", "pplx-space-l"),
+        ("pplx-space-t-store", "dev-dependencies", "pplx-space-l"),
+        // n: a and a Domain crate.
+        ("pplx-space-a", "dependencies", "pplx-space-n"),
+        ("pplx-space-e", "dependencies", "pplx-space-n"),
+    ];
+    let tables = "[rules.layers.unmoved]\nl20_domain = [\"pplx-space-legacy\"]\n\
+                  [rules.layers.storage]\ndrivers = [\"sqlx\"]\n\
+                  [rules.layers]\nlegacy = [\"pplx-space-legacy\"]\n";
+    let ws = Layered {
+        extra: &extra,
+        dependencies: &dependencies,
+        tables,
+        files: vec![
+            (
+                "crates/l40_api/a/client/src/lib.rs",
+                "pub use pplx_space_e::Wire;\n".to_owned(),
+            ),
+            (
+                "crates/l40_api/b/client/src/lib.rs",
+                "//! The h client.\n\npub use wire as h;\n".to_owned(),
+            ),
+            (
+                "crates/l40_api/c/client/src/lib.rs",
+                "/* Not yet: /* nested */\npub use pplx_space_i::Wire;\npub use pplx_space_j::*;\n*/\n\n\
+                 pub mod v1 {\n    pub use pplx_space_i::Wire;\n}\n\n\
+                 pub mod v2 {\npub use pplx_space_i::Wire;\n}\n\n\
+                 pub(crate) use pplx_space_j::*;\n\n\
+                 const NOTE: &str = \"\npub use pplx_space_j::*;\n\";\n"
+                    .to_owned(),
+            ),
+            (
+                "crates/libs/legacy/src/lib.rs",
+                "pub use pplx_space_k::*;\n".to_owned(),
+            ),
+        ],
+    }
+    .build();
+    let hints: Vec<(String, String, bool)> = check(&load(ws.path(), None))
+        .into_iter()
+        .filter(|finding| finding.code() == "layers.single_user")
+        .map(|finding| {
+            let at = format!("{}:{}", finding.location.path, finding.location.line);
+            (finding.message(), at, finding.mode.is_required())
+        })
+        .collect();
+    let expected = [
+        (
+            "crates/l20_domain/d/Cargo.toml: pplx-space-d (l20_domain) has one user, pplx-space-a \
+             (l40_api): no other crate depends on it, directly or through a crate that \
+             re-exports it at its root. Consider moving it into pplx-space-a, unless more users \
+             are coming. See crates/tools/archcheck/README.md#layers."
+                .to_owned(),
+            "crates/l20_domain/d/Cargo.toml:2".to_owned(),
+            true,
+        ),
+        (
+            "crates/l20_domain/i/Cargo.toml: pplx-space-i (l20_domain) has one user, \
+             pplx-space-c-client (l40_api): no other crate depends on it, directly or through a \
+             crate that re-exports it at its root. Consider moving it into pplx-space-c-client, \
+             unless more users are coming. See crates/tools/archcheck/README.md#layers."
+                .to_owned(),
+            "crates/l20_domain/i/Cargo.toml:2".to_owned(),
+            true,
+        ),
+        (
+            "crates/l20_domain/j/Cargo.toml: pplx-space-j (l20_domain) has one user, \
+             pplx-space-c-client (l40_api): no other crate depends on it, directly or through a \
+             crate that re-exports it at its root. Consider moving it into pplx-space-c-client, \
+             unless more users are coming. See crates/tools/archcheck/README.md#layers."
+                .to_owned(),
+            "crates/l20_domain/j/Cargo.toml:2".to_owned(),
+            true,
+        ),
+        (
+            "crates/l20_domain/k/Cargo.toml: pplx-space-k (l20_domain) has one user, \
+             pplx-space-s-store (l30_storage): no other crate depends on it, directly or through \
+             a crate that re-exports it at its root. Consider moving it into \
+             pplx-space-s-store, unless more users are coming. Legacy crates' re-exports can \
+             hide real users, and pplx-space-legacy depends on it too ([rules.layers] legacy, \
+             whose users are not counted): check who reaches it through them first. See \
+             crates/tools/archcheck/README.md#layers."
+                .to_owned(),
+            "crates/l20_domain/k/Cargo.toml:2".to_owned(),
+            true,
+        ),
+    ];
+    assert_eq!(hints, expected);
 }

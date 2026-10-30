@@ -22,6 +22,10 @@
 //! - `storage_access` and `codec_features`: only stores and storage helpers
 //!   depend on a database or object storage driver, or turn on another
 //!   crate's driver feature; each with a baseline table ([`storage`]).
+//! - `domain_dependencies` and `model_protocol`: no Domain crate depends on
+//!   a package that does I/O, and no model on a protocol; each with a
+//!   baseline table. `single_user`: a hint for a Domain crate with one user
+//!   ([`domain`]).
 //! - `stale_entries` and `policy_changed`: entries of `[rules.layers]` that
 //!   no longer apply, and every change to it from the base branch's copy,
 //!   including its removal.
@@ -29,6 +33,7 @@
 //! Baseline tables are keyed by package name, so moving a crate into its
 //! layer directory leaves them alone.
 
+mod domain;
 mod graph;
 mod policy;
 mod storage;
@@ -42,6 +47,7 @@ use graph::{
     member_layer, name_segments, production_problem, used_items,
 };
 
+use domain::{DOMAIN_DEPENDENCIES, Domain, MODEL_PROTOCOL};
 use storage::{CODEC_FEATURES, STORAGE_ACCESS, Storage};
 
 use crate::{
@@ -80,7 +86,14 @@ const RULE: &str = Layers::NAME;
 const DIRECTION: &str = "direction";
 const DEV_DIRECTION: &str = "dev_direction";
 /// The checks with a baseline table, `[layers.<check>]`.
-const CHECKS: [&str; 4] = [DIRECTION, DEV_DIRECTION, STORAGE_ACCESS, CODEC_FEATURES];
+const CHECKS: [&str; 6] = [
+    DIRECTION,
+    DEV_DIRECTION,
+    STORAGE_ACCESS,
+    CODEC_FEATURES,
+    DOMAIN_DEPENDENCIES,
+    MODEL_PROTOCOL,
+];
 /// Where a finding sends the reader for what belongs in each layer.
 const GUIDE: &str = "crates/tools/archcheck/README.md#layers";
 /// What the comparisons with the base branch's `ARCHITECTURE.toml` are, for
@@ -191,14 +204,17 @@ struct Checked<'a> {
     graph: &'a Graph<'a>,
     verdicts: Verdicts<'a>,
     storage: Storage<'a>,
+    domain: Domain,
 }
 
 impl<'a> Checked<'a> {
     fn new(ctx: &Context, config: &LayersConfig, graph: &'a Graph<'a>) -> Self {
+        let storage = Storage::new(ctx, config, graph);
         Self {
             graph,
             verdicts: Verdicts::new(ctx, config, graph),
-            storage: Storage::new(ctx, config, graph),
+            domain: Domain::new(ctx, config, graph, &storage),
+            storage,
         }
     }
 
@@ -208,7 +224,9 @@ impl<'a> Checked<'a> {
             DIRECTION => self.verdicts.of(Problem::Direction),
             DEV_DIRECTION => self.verdicts.of(Problem::DevDirection),
             STORAGE_ACCESS => self.storage.access.clone(),
-            _ => self.storage.codecs.clone(),
+            CODEC_FEATURES => self.storage.codecs.clone(),
+            DOMAIN_DEPENDENCIES => self.domain.dependencies.clone(),
+            _ => self.domain.model_protocol.clone(),
         }
     }
 }
@@ -240,10 +258,18 @@ impl Rule for Layers {
             );
         }
         findings.extend(policy::stale_entries(ctx, config, &graph, verdicts));
+        findings.extend(domain::single_user(ctx, config, &graph));
         findings.extend(storage::stale_entries(
             ctx,
             config,
             &graph,
+            &checked.storage,
+        ));
+        findings.extend(domain::stale_entries(
+            ctx,
+            config,
+            &graph,
+            &checked.domain,
             &checked.storage,
         ));
         findings.extend(policy::policy_changed(ctx, config, &graph));
@@ -314,8 +340,8 @@ impl Rule for Layers {
     /// Keeps each entry whose edge still has the check's problem, removes
     /// the rest, and adds none: an edge without an entry is listed, to fix.
     /// A hand-added entry fails `no_new_entries`; a reviewed, permanent
-    /// exception to `direction` goes in `allowed_edges` instead. Both tables
-    /// are always written.
+    /// exception to `direction` goes in `allowed_edges` instead. Every table
+    /// is always written.
     fn update_baseline(&self, ctx: &Context, baseline: &mut Baseline) -> Vec<NotAdded> {
         let Some(config) = &ctx.config.rules.layers else {
             return Vec::new();
@@ -336,13 +362,16 @@ impl Rule for Layers {
                         "a reviewed, permanent exception goes in [rules.{RULE}] allowed_edges in \
                          {CONFIG_FILE}, which {RULE}.policy_changed reports"
                     ),
-                    DEV_DIRECTION => format!("{RULE}.{DEV_DIRECTION} has no exceptions"),
-                    _ => format!(
+                    DEV_DIRECTION | MODEL_PROTOCOL => format!("{RULE}.{check} has no exceptions"),
+                    STORAGE_ACCESS | CODEC_FEATURES => format!(
                         "a crate that has to reach storage for good becomes a store or a storage \
                          helper; listing one in [rules.{RULE}.storage] helpers is a policy change, \
                          which {RULE}.policy_changed reports, and a helper derived from a required \
                          driver dependency is reviewed in the manifest diff"
                     ),
+                    _ => "a Domain crate that needs the package for good is not Domain code and \
+                          moves to its layer's directory, a move reviewed in the diff"
+                        .to_owned(),
                 };
                 not_added.push(NotAdded {
                     table: format!("{RULE}.{check}"),
@@ -642,7 +671,9 @@ fn baselined(
         DIRECTION => &config.direction,
         DEV_DIRECTION => &config.dev_direction,
         STORAGE_ACCESS => &config.storage_access,
-        _ => &config.codec_features,
+        CODEC_FEATURES => &config.codec_features,
+        DOMAIN_DEPENDENCIES => &config.domain_dependencies,
+        _ => &config.model_protocol,
     };
     static EMPTY: EdgeTable = EdgeTable::new();
     let table = ctx.baseline.layers.get(check).unwrap_or(&EMPTY);
@@ -716,9 +747,19 @@ fn baselined(
         }
         let reason = match check {
             DIRECTION | DEV_DIRECTION => edge_stale_reason(checked, check, &key),
-            _ => checked
-                .storage
-                .stale_reason(config, checked.graph, check, from, to),
+            STORAGE_ACCESS | CODEC_FEATURES => {
+                checked
+                    .storage
+                    .stale_reason(config, checked.graph, check, from, to)
+            }
+            _ => checked.domain.stale_reason(
+                config,
+                checked.graph,
+                &checked.storage,
+                check,
+                from,
+                to,
+            ),
         };
         findings.push(entry(
             "stale_entries",

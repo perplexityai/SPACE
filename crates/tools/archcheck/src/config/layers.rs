@@ -119,15 +119,25 @@ pub struct LayersConfig {
     /// baselined.
     #[serde(default)]
     pub legacy: PackageSet,
+    /// Domain crates that are protocols although their names don't end in
+    /// `-protocol` or `-proto`; every other Domain crate is a model.
+    #[serde(default)]
+    pub protocols: PackageSet,
+    /// The packages no Domain crate may depend on, by family.
+    #[serde(default)]
+    pub domain_fences: DomainFences,
     pub placement: BehaviourConfig,
     pub layout: BehaviourConfig,
     pub direction: EdgeBehaviours,
     pub dev_direction: EdgeBehaviours,
     pub storage_access: EdgeBehaviours,
     pub codec_features: EdgeBehaviours,
+    pub domain_dependencies: EdgeBehaviours,
+    pub model_protocol: EdgeBehaviours,
     pub test_only: BehaviourConfig,
     pub clients: BehaviourConfig,
     pub store_edges: BehaviourConfig,
+    pub single_user: BehaviourConfig,
     pub stale_entries: BehaviourConfig,
     pub policy_changed: BehaviourConfig,
 }
@@ -174,6 +184,60 @@ impl TryFrom<BTreeMap<Layer, PackageSet>> for Unmoved {
             }
         }
         Ok(Self(unmoved))
+    }
+}
+
+/// `[rules.layers.domain_fences]`: each family's packages, such as
+/// `runtime = ["tokio"]`, read as package to family, each package in one
+/// family.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(try_from = "BTreeMap<String, PackageSet>")]
+pub struct DomainFences(BTreeMap<String, String>);
+
+#[derive(Debug, Error)]
+#[error("domain_fences lists {package:?} in both {first} and {second}")]
+pub struct DomainFencesError {
+    package: String,
+    first: String,
+    second: String,
+}
+
+impl DomainFences {
+    /// The family that fences `package`, if one does.
+    pub fn family(&self, package: &str) -> Option<&str> {
+        self.0.get(package).map(String::as_str)
+    }
+
+    /// Every package, sorted.
+    pub fn packages(&self) -> impl Iterator<Item = &String> {
+        self.0.keys()
+    }
+
+    /// Every package with its family, sorted by package.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.0
+            .iter()
+            .map(|(package, family)| (package.as_str(), family.as_str()))
+    }
+}
+
+impl TryFrom<BTreeMap<String, PackageSet>> for DomainFences {
+    type Error = DomainFencesError;
+
+    fn try_from(families: BTreeMap<String, PackageSet>) -> Result<Self, Self::Error> {
+        let mut fences = BTreeMap::new();
+        for (family, packages) in families {
+            for package in packages.0 {
+                if let Some(first) = fences.insert(package.clone(), family.clone()) {
+                    return Err(DomainFencesError {
+                        package,
+                        first,
+                        second: family,
+                    });
+                }
+            }
+        }
+        Ok(Self(fences))
     }
 }
 
@@ -358,6 +422,14 @@ pub struct LayersPolicy {
     /// The line of the `legacy` key, or without one, of the
     /// `[rules.layers]` header, if there is one.
     pub legacy_line: Option<usize>,
+    /// `protocols`, each package with the line it is written on.
+    pub protocols: BTreeMap<String, usize>,
+    /// The line of the `protocols` key, or without one, of the
+    /// `[rules.layers]` header, if there is one.
+    pub protocols_line: Option<usize>,
+    /// `[rules.layers.domain_fences]`: each package to its family and the
+    /// line it is written on.
+    pub domain_fences: Entries<String>,
     /// Behaviour name, such as `placement` or `direction.no_crossing`, to
     /// its mode as written and the mode's line.
     pub modes: BTreeMap<String, (String, usize)>,
@@ -402,15 +474,20 @@ struct PolicyTable {
     allowed_edges: Option<BTreeMap<Spanned<String>, Vec<Spanned<String>>>>,
     storage: Option<PolicyStorage>,
     legacy: Option<Spanned<Vec<Spanned<String>>>>,
+    protocols: Option<Spanned<Vec<Spanned<String>>>>,
+    domain_fences: Option<BTreeMap<String, Vec<Spanned<String>>>>,
     placement: Option<PolicyBehaviour>,
     layout: Option<PolicyBehaviour>,
     direction: Option<PolicyEdgeBehaviours>,
     dev_direction: Option<PolicyEdgeBehaviours>,
     storage_access: Option<PolicyEdgeBehaviours>,
     codec_features: Option<PolicyEdgeBehaviours>,
+    domain_dependencies: Option<PolicyEdgeBehaviours>,
+    model_protocol: Option<PolicyEdgeBehaviours>,
     test_only: Option<PolicyBehaviour>,
     clients: Option<PolicyBehaviour>,
     store_edges: Option<PolicyBehaviour>,
+    single_user: Option<PolicyBehaviour>,
     stale_entries: Option<PolicyBehaviour>,
     policy_changed: Option<PolicyBehaviour>,
 }
@@ -443,20 +520,22 @@ impl LayersPolicy {
         };
         let line = |span: std::ops::Range<usize>| line_of(text, span.start);
         let header = |name: &str| header_line(text, &format!("[rules.layers.{name}]"));
-        let unmoved = Entries {
-            line: header("unmoved"),
-            entries: table
-                .unmoved
-                .unwrap_or_default()
-                .into_iter()
-                .flat_map(|(layer, packages)| {
-                    packages.into_iter().map(move |package| {
-                        let at = line(package.span());
-                        (package.into_inner(), (layer.clone(), at))
+        let grouped =
+            |name: &str, groups: Option<BTreeMap<String, Vec<Spanned<String>>>>| Entries {
+                line: header(name),
+                entries: groups
+                    .unwrap_or_default()
+                    .into_iter()
+                    .flat_map(|(group, packages)| {
+                        packages.into_iter().map(move |package| {
+                            let at = line(package.span());
+                            (package.into_inner(), (group.clone(), at))
+                        })
                     })
-                })
-                .collect(),
-        };
+                    .collect(),
+            };
+        let unmoved = grouped("unmoved", table.unmoved);
+        let domain_fences = grouped("domain_fences", table.domain_fences);
         let lists =
             |name: &str, lists: Option<BTreeMap<Spanned<String>, Vec<Spanned<String>>>>| Entries {
                 line: header(name),
@@ -500,6 +579,11 @@ impl LayersPolicy {
             None => header_line(text, "[rules.layers]"),
         };
         let legacy = packages(table.legacy.map(Spanned::into_inner));
+        let protocols_line = match &table.protocols {
+            Some(protocols) => Some(line(protocols.span())),
+            None => header_line(text, "[rules.layers]"),
+        };
+        let protocols = packages(table.protocols.map(Spanned::into_inner));
         let mut modes = BTreeMap::new();
         let mut mode = |behaviour: String, entry: Option<PolicyBehaviour>| {
             if let Some(mode) = entry.and_then(|entry| entry.mode) {
@@ -512,6 +596,7 @@ impl LayersPolicy {
             ("test_only", table.test_only),
             ("clients", table.clients),
             ("store_edges", table.store_edges),
+            ("single_user", table.single_user),
             ("stale_entries", table.stale_entries),
             ("policy_changed", table.policy_changed),
         ] {
@@ -522,6 +607,8 @@ impl LayersPolicy {
             ("dev_direction", table.dev_direction),
             ("storage_access", table.storage_access),
             ("codec_features", table.codec_features),
+            ("domain_dependencies", table.domain_dependencies),
+            ("model_protocol", table.model_protocol),
         ] {
             let Some(entry) = entry else { continue };
             for (behaviour, entry) in [
@@ -547,6 +634,9 @@ impl LayersPolicy {
             storage,
             legacy,
             legacy_line,
+            protocols,
+            protocols_line,
+            domain_fences,
             modes,
         }))
     }

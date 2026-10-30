@@ -1,11 +1,13 @@
 //! The layers rule's pieces that the command-line tests reach only through
 //! whole workspaces: the layer matrix, paths below a layer directory, the
-//! items a finding names, and the lenient reading of `[rules.layers]`.
+//! items a finding names, the top level of a library root, and the lenient
+//! reading of `[rules.layers]`.
 
 use std::collections::BTreeMap;
 
 use super::{
     and_list,
+    domain::{protocol_suffix, top_level},
     graph::{
         Member, Problem, file_owner, layer_dir, list, may_depend, name_segments, use_tree,
         used_items,
@@ -13,14 +15,14 @@ use super::{
     storage::features_of,
 };
 use crate::{
-    config::{Layer, LayersConfig, LayersPolicy},
+    config::{DomainFences, Layer, LayersConfig, LayersPolicy},
     context::{Crate, Dependency, ProductionFile, count_code_lines},
 };
 
 /// Every behaviour of `[rules.layers]`, as its key in `LayersPolicy.modes`.
 /// `LayersConfig` requires each and denies others, so this list is its
 /// list.
-const BEHAVIOURS: [&str; 19] = [
+const BEHAVIOURS: [&str; 26] = [
     "placement",
     "layout",
     "direction.no_crossing",
@@ -35,9 +37,16 @@ const BEHAVIOURS: [&str; 19] = [
     "codec_features.no_crossing",
     "codec_features.no_new_entries",
     "codec_features.stale_entries",
+    "domain_dependencies.no_crossing",
+    "domain_dependencies.no_new_entries",
+    "domain_dependencies.stale_entries",
+    "model_protocol.no_crossing",
+    "model_protocol.no_new_entries",
+    "model_protocol.stale_entries",
     "test_only",
     "clients",
     "store_edges",
+    "single_user",
     "stale_entries",
     "policy_changed",
 ];
@@ -390,4 +399,109 @@ fn unmoved_entries() {
         let found = parse(unmoved).expect_err("it is rejected").to_string();
         assert!(found.contains(error), "{unmoved}: {found}");
     }
+}
+
+/// A Domain crate is a protocol by name when the last part of its name is
+/// `protocol` or `proto`, not when a part only starts or ends with it.
+#[test]
+fn protocol_names() {
+    for (name, suffix) in [
+        ("pplx-space-node-mgr-protocol", Some("-protocol")),
+        ("pplx-space-credential-provider-proto", Some("-proto")),
+        ("pplx-space-protocols", None),
+        ("pplx-space-prototype", None),
+        ("pplx-space-x-proto-types", None),
+        ("pplx-space-rpc-contracts", None),
+    ] {
+        assert_eq!(protocol_suffix(name), suffix, "{name}");
+    }
+}
+
+/// `protocols` and `[rules.layers.domain_fences]` read for their lines, the
+/// `protocols` key's too, each fenced package with its family.
+#[test]
+fn the_domain_policy_and_its_lines() {
+    let text = "[rules.layers]\nprotocols = [\n  \"pplx-space-w\",\n]\n\
+                [rules.layers.domain_fences]\n\
+                runtime = [\"tokio\", \"smol\"]\n\
+                http = [\n  \"hyper\",\n]\n\
+                [rules.layers.single_user]\nmode = \"advisory\"\n\
+                [rules.layers.model_protocol.stale_entries]\nmode = \"required\"\n";
+    let policy = LayersPolicy::parse(text)
+        .expect("the table parses")
+        .expect("the text has the table");
+    assert_eq!(
+        policy.protocols,
+        BTreeMap::from([("pplx-space-w".to_owned(), 3)])
+    );
+    assert_eq!(policy.protocols_line, Some(2));
+    assert_eq!(policy.domain_fences.line, Some(5));
+    let fences: Vec<(&str, &str, usize)> = policy
+        .domain_fences
+        .entries
+        .iter()
+        .map(|(package, (family, line))| (package.as_str(), family.as_str(), *line))
+        .collect();
+    assert_eq!(
+        fences,
+        [
+            ("hyper", "http", 8),
+            ("smol", "runtime", 6),
+            ("tokio", "runtime", 6)
+        ]
+    );
+    let modes: Vec<&str> = policy.modes.keys().map(String::as_str).collect();
+    assert_eq!(modes, ["model_protocol.stale_entries", "single_user"]);
+}
+
+/// `domain_fences` is read as package to family, each package in one family.
+#[test]
+fn domain_fences() {
+    let fences: DomainFences = toml::from_str::<BTreeMap<String, DomainFences>>(
+        "fences = { runtime = [\"tokio\"], kube = [\"kube\", \"k8s-openapi\"] }",
+    )
+    .expect("it parses")
+    .remove("fences")
+    .expect("the key is there");
+    assert_eq!(fences.family("tokio"), Some("runtime"));
+    assert_eq!(fences.family("k8s-openapi"), Some("kube"));
+    assert_eq!(fences.family("tonic"), None);
+    let packages: Vec<&String> = fences.packages().collect();
+    assert_eq!(packages, ["k8s-openapi", "kube", "tokio"]);
+    let error = toml::from_str::<BTreeMap<String, DomainFences>>(
+        "fences = { runtime = [\"tokio\"], http = [\"tokio\"] }",
+    )
+    .expect_err("a package in two families is rejected")
+    .to_string();
+    assert!(
+        error.contains("domain_fences lists \"tokio\" in both http and runtime"),
+        "{error}"
+    );
+}
+
+/// Only a library root's top-level code is left for `single_user`'s
+/// re-exports: literals of every kind, comments and delimited code are
+/// blanked, a lifetime and a delimiter in a literal end nothing, and the
+/// outermost delimiters stay.
+#[test]
+fn top_level_code() {
+    let kept = |text: &str| {
+        top_level(text)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let text = "pub use a;\n\
+                const R: &str = r#\"\"}\npub use b;\"#;\n\
+                const B: &[u8] = br\"{\";\n\
+                const C: char = '{';\n\
+                fn f<'x>(s: &'x str) -> &'x str { s }\n\
+                pub(crate) use c;\n\
+                /* /* */ pub use d; */\n\
+                pub use e::{F, G};\n";
+    assert_eq!(
+        kept(text),
+        "pub use a; const R: &str = ; const B: &[ ] = ; const C: char = ; \
+         fn f<'x>( ) -> &'x str { } pub( ) use c; pub use e::{ };"
+    );
 }

@@ -363,3 +363,142 @@ fn durable_file_writes_match_writes_only() {
         assert!(found.is_empty(), "{src}: {found:#?}");
     }
 }
+
+/// Each kind of I/O the domain_io patterns cover is a matching line, as
+/// Domain production code writes it today: environment, filesystem,
+/// processes, clocks, sleeps, tasks, sockets and connections. ID
+/// constructors, tracing, injected sources, sqlx's `.bind(..)` and the
+/// dropped look-alikes are not; nor are what `ARCHITECTURE.toml` says the
+/// patterns miss, such as syscalls. Only l20_domain crates are checked.
+#[test]
+fn domain_io_matches_io_only() {
+    const SRC: &str = "crates/l20_domain/x/src";
+    let crossings = [
+        "let value = std::env::var(\"NAME\").ok();",
+        "if let Some(dir) = env::var_os(\"HOME\") {",
+        "let dir = std::env::temp_dir();",
+        "dotenvy::dotenv().ok();",
+        "let flag = env_flag_var(NAME);",
+        "let environment = ProcessEnvironment;",
+        "let text = std::fs::read_to_string(\"/proc/cpuinfo\")?;",
+        "use std::fs;",
+        "let entries = fs::read_dir(&dir)?;",
+        "let file = File::open(&path)?;",
+        "let file = OpenOptions::new().read(true).open(&path)?;",
+        "if path.exists() {",
+        "let output = Command::new(\"tool\").output()?;",
+        "let pid = std::process::id();",
+        "let started = Instant::now();",
+        "let now = SystemTime::now();",
+        "let now = OffsetDateTime::now_utc();",
+        "if started.elapsed() > limit {",
+        "tokio::time::sleep(delay).await;",
+        "use tokio::time::sleep;",
+        "std::thread::sleep(delay);",
+        "tokio::spawn(async move { run().await });",
+        "let handle = spawn_blocking(move || work());",
+        "let mut tasks = JoinSet::new();",
+        "let stream = tokio::net::UnixStream::connect(&socket_path).await?;",
+        "stream: &tokio::net::UnixStream,",
+        "tokio::net::UnixListener::bind(socket_path).map_err(Error::Bind)?;",
+        "let listener = TcpListener::bind(address).await?;",
+        "let stream = std::net::TcpStream::connect(address)?;",
+        "let std_socket: std::net::UdpSocket = socket.into();",
+        "use std::os::unix::net::UnixDatagram;",
+        "let socket = socket2::Socket::new(",
+        "tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(cid, port)).await?;",
+        "pub fn bind_vsock(port: u32) -> std::io::Result<tokio_vsock::VsockListener> {",
+        ".connect_with_connector(tower::service_fn(move |_| {",
+        "let channel = endpoint.connect().await?;",
+        "let channel = Endpoint::from_static(\"http://[::]:50051\").connect_lazy();",
+        "let client = ServiceClient::connect(address).await?;",
+    ];
+    for line in crossings {
+        let found = ratchet_findings("domain_io", SRC, &[], &[("lib.rs", &format!("{line}\n"))]);
+        assert_eq!(found.len(), 1, "{line}: {found:#?}");
+        assert_eq!(found[0].0, "no_crossing", "{line}");
+    }
+
+    let ordinary = [
+        "Self(Uuid::now_v7())",
+        "let id = Uuid::new_v5(&NAMESPACE, name.as_bytes());",
+        "tracing::info!(sandbox_id = %id, \"created\");",
+        "let value = env.var(name)?;",
+        "self.sleep(delay).await;",
+        "async fn sleep(&self, delay: Duration) {",
+        "let metadata = request.metadata();",
+        "if metadata.is_file() {",
+        "const NAME: &str = env!(\"CARGO_PKG_NAME\");",
+        "let deadline = started + timeout;",
+        "pub fn new() -> Self {",
+        "use std::net::{IpAddr, Ipv4Addr, SocketAddr};",
+        "let stream = UnixListenerStream::new(listener);",
+        "let query = sqlx::query(SQL).bind(id);",
+        "match connect().await {",
+        "setsockopt(socket, sockopt::Mark, &mark).map_err(errno_to_io)",
+    ];
+    let text: String = ordinary.iter().map(|line| format!("{line}\n")).collect();
+    let found = ratchet_findings("domain_io", SRC, &[], &[("lib.rs", &text)]);
+    assert!(found.is_empty(), "{found:#?}");
+
+    for src in [
+        "crates/l10_foundation/x/src",
+        "crates/l40_api/x/src",
+        "crates/libs/x/src",
+    ] {
+        let found = ratchet_findings(
+            "domain_io",
+            src,
+            &[],
+            &[("lib.rs", "let value = std::env::var(\"NAME\").ok();\n")],
+        );
+        assert!(found.is_empty(), "{src}: {found:#?}");
+    }
+}
+
+/// A `SPACE_*` name in an l10_foundation crate is a matching line, in a
+/// string or as an identifier; a lowercase product name, a `Space*` type
+/// and a longer identifier that contains `SPACE_` are not, and other layers
+/// are not checked.
+#[test]
+fn foundation_space_names_match_space_names_only() {
+    const SRC: &str = "crates/l10_foundation/x/src";
+    let crossings = [
+        "let endpoint = std::env::var(\"SPACE_OBJECT_STORE_ENDPOINT\").ok();",
+        "pub const SPACE_FLAGD_ENABLED_ENV: &str = \"flagd\";",
+        "const NS: Uuid = SPACE_TEMPLATE_RECEIVED_UUID_NS;",
+        "use crate::paths::{SPACE_SYSTEMD_RUNTIME_DIR, other};",
+    ];
+    for line in crossings {
+        let found = ratchet_findings(
+            "foundation_space_names",
+            SRC,
+            &[],
+            &[("lib.rs", &format!("{line}\n"))],
+        );
+        assert_eq!(found.len(), 1, "{line}: {found:#?}");
+        assert_eq!(found[0].0, "no_crossing", "{line}");
+    }
+
+    let ordinary = [
+        "let key = \"space-request-id\";",
+        "let metric = \"space.sandbox.count\";",
+        "pub struct SpaceIdentity;",
+        "const KUBE_NAMESPACE_LABEL: &str = \"ns\";",
+        "const FREE_SPACE_BYTES: u64 = 1;",
+        "let namespace = NAMESPACE_DEFAULT;",
+    ];
+    let text: String = ordinary.iter().map(|line| format!("{line}\n")).collect();
+    let found = ratchet_findings("foundation_space_names", SRC, &[], &[("lib.rs", &text)]);
+    assert!(found.is_empty(), "{found:#?}");
+
+    for src in ["crates/l20_domain/x/src", "crates/l40_api/x/src"] {
+        let found = ratchet_findings(
+            "foundation_space_names",
+            src,
+            &[],
+            &[("lib.rs", "let name = \"SPACE_NODE_ID\";\n")],
+        );
+        assert!(found.is_empty(), "{src}: {found:#?}");
+    }
+}

@@ -124,6 +124,27 @@
 "crates/libs/internal/api/server/src/published_state.rs" = 4
 "crates/libs/sandbox/store/src/lib.rs" = 2
 
+[pattern_ratchet.domain_io]
+"crates/libs/api-route/src/ed25519.rs" = 10
+"crates/libs/api-route/src/lib.rs" = 1
+"crates/libs/cluster-id/src/lib.rs" = 1
+"crates/libs/common/core/src/env.rs" = 4
+"crates/libs/common/core/src/guest/linux.rs" = 1
+"crates/libs/common/core/src/host/disk_admission.rs" = 4
+"crates/libs/common/core/src/host/linux.rs" = 5
+"crates/libs/common/core/src/k8s.rs" = 4
+"crates/libs/common/core/src/types/kek.rs" = 1
+"crates/libs/ecw-credential/src/lib.rs" = 3
+"crates/libs/execution-spec/src/host_cpu.rs" = 1
+"crates/libs/federated-identity/src/lib.rs" = 1
+"crates/libs/net/common/src/orig_dst/linux.rs" = 4
+"crates/libs/net/common/src/orig_dst/other.rs" = 1
+"crates/libs/spaced/common/src/retry_policy.rs" = 6
+"crates/libs/spaced/common/src/server.rs" = 4
+"crates/libs/spaced/common/src/uds.rs" = 3
+"crates/libs/spaced/common/src/vsock.rs" = 6
+"crates/libs/spaced/guest/protocol/src/validate.rs" = 1
+
 # Filesystem writes in Domain, API and App code, seeded when the instance was
 # added; lower each cap as they move into stores or Foundation mechanisms.
 [pattern_ratchet.durable_file_writes]
@@ -221,6 +242,34 @@
 "crates/libs/vol/mgr/server/src/service.rs" = 3
 "crates/libs/vol/mgr/server/src/staging.rs" = 4
 
+[pattern_ratchet.foundation_space_names]
+"crates/libs/bearer-token/src/lib.rs" = 14
+"crates/libs/btrfs/src/lib.rs" = 2
+"crates/libs/common/grpc/src/internal_transport.rs" = 8
+"crates/libs/common/grpc/src/rotate.rs" = 1
+"crates/libs/common/svc/src/auth/build.rs" = 4
+"crates/libs/common/svc/src/auth/build/direct.rs" = 1
+"crates/libs/common/svc/src/auth/build/k8s.rs" = 8
+"crates/libs/common/svc/src/auth/k8s.rs" = 32
+"crates/libs/common/svc/src/auth/mod.rs" = 8
+"crates/libs/common/svc/src/auth/template_transfer.rs" = 1
+"crates/libs/common/svc/src/sql/mod.rs" = 6
+"crates/libs/common/svc/src/sql/sandbox_residency.rs" = 1
+"crates/libs/feature-flags/src/client.rs" = 1
+"crates/libs/feature-flags/src/lib.rs" = 9
+"crates/libs/feature-flags/src/openfeature/flagd.rs" = 2
+"crates/libs/metrics/src/gateway/readiness.rs" = 1
+"crates/libs/object-store/src/lib.rs" = 6
+"crates/libs/object-store/src/timeouts.rs" = 6
+"crates/libs/observability/src/identity.rs" = 7
+"crates/libs/observability/src/lib.rs" = 10
+"crates/libs/observability/src/logging.rs" = 3
+"crates/libs/observability/src/sink/mod.rs" = 1
+"crates/libs/observability/src/trace_parity_fixture.rs" = 3
+"crates/libs/observability/src/traces.rs" = 1
+"crates/libs/uds-peer-auth/src/lib.rs" = 4
+"crates/libs/valkey/src/shared_valkey.rs" = 1
+
 [pattern_ratchet.kubernetes_access]
 # Spawns the Kubernetes-only reconcilers from the bound `KubernetesSubstrate`.
 "crates/libs/cluster/controller/server/src/reconcilers.rs" = 1
@@ -283,9 +332,10 @@
 [pattern_ratchet.sbxmgr_sqlite_schema]
 
 # [layers.<check>] maps each workspace package to what it depends on against
-# the layers rule's <check>: workspace packages, drivers and storage helpers,
-# or, for codec_features, the <package>/<feature> it enables. Only remove
-# entries: a pull request that adds one is reported.
+# the layers rule's <check>: workspace packages, drivers, storage helpers and
+# packages Domain may not depend on, or, for codec_features, the
+# <package>/<feature> it enables. Only remove entries: a pull request that
+# adds one is reported.
 [layers.codec_features]
 pplx-space-api = [
   "pplx-space-common-core/sqlx",
@@ -359,6 +409,32 @@ pplx-space-observability = [
 ]
 pplx-space-uds-peer-auth = [
   "pplx-space-common-core",
+]
+
+[layers.domain_dependencies]
+pplx-space-common-core = [
+  "k8s-openapi",
+]
+pplx-space-net-common = [
+  "tokio",
+]
+pplx-space-spaced-common = [
+  "hyper-util",
+  "tokio",
+  "tokio-stream",
+  "tokio-util",
+  "tokio-vsock",
+]
+pplx-space-spaced-guest-protocol = [
+  "tokio",
+]
+
+[layers.model_protocol]
+pplx-space-common-core = [
+  "pplx-space-rpc-contracts",
+]
+pplx-space-spaced-common = [
+  "pplx-space-spaced-guest-protocol",
 ]
 
 [layers.storage_access]
