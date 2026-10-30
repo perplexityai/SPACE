@@ -353,33 +353,32 @@ where
     }
     pplx_space_metrics::operations::claimed_by(api_product_label, kind.as_str(), executor);
     let started_at = Instant::now();
-    let report =
-        execute_and_record(store, claim_token, config, operation, executor, execution).await;
+    let (report, outcome) = match execute_and_record(
+        store,
+        claim_token,
+        config,
+        operation,
+        executor,
+        execution,
+    )
+    .await
+    {
+        Ok((report, outcome)) => (Ok(report), outcome),
+        Err(error) => (Err(error), ExecutionOutcome::Error),
+    };
     pplx_space_metrics::operations::execution(
         api_product_label,
         kind.as_str(),
         executor,
-        execution_outcome(&report),
+        outcome,
         started_at,
     );
     report
 }
 
-/// How one execution [`execute_and_record`] ran ended, read from its report.
-fn execution_outcome<E>(report: &Result<TickReport, E>) -> ExecutionOutcome {
-    match report {
-        Err(_) => ExecutionOutcome::Error,
-        Ok(report) if report.succeeded > 0 => ExecutionOutcome::Succeeded,
-        Ok(report) if report.failed > 0 => ExecutionOutcome::Failed,
-        Ok(report) if report.retried > 0 => ExecutionOutcome::Requeued,
-        Ok(report) if report.canceled > 0 => ExecutionOutcome::Canceled,
-        // A lost record counts a stale claim; a lost renewal counts nothing.
-        Ok(_) => ExecutionOutcome::Lost,
-    }
-}
-
 /// The execution half of [`drive_claimed_operation`]: run `execution` under
-/// the renewed claim, then record its result.
+/// the renewed claim, then record its result. Every exit returns how the
+/// execution ended beside the report of what it recorded.
 async fn execute_and_record<F>(
     store: PublicOperationStore,
     claim_token: String,
@@ -387,7 +386,7 @@ async fn execute_and_record<F>(
     operation: ClaimedPublicOperation,
     executor: OperationExecutor,
     execution: F,
-) -> Result<TickReport, PublicOperationStoreError>
+) -> Result<(TickReport, ExecutionOutcome), PublicOperationStoreError>
 where
     F: Future<Output = OperationExecutionResult>,
 {
@@ -417,14 +416,16 @@ where
                     elapsed_ms = started.elapsed().as_millis(),
                     "public operation lease renewal completed"
                 );
+                // Another claimant owns the operation: nothing to record.
                 if !renewed {
-                    return Ok(TickReport::default());
+                    return Ok((TickReport::default(), ExecutionOutcome::Lost));
                 }
             }
         }
     };
     let mut report = TickReport::default();
-    let updated = match result.state {
+    // The outcome this claim recorded, or `None` if the claim was lost first.
+    let recorded = match result.state {
         OperationState::Succeeded => {
             let updated = store
                 .complete_claimed_operation(CompleteClaimedPublicOperation {
@@ -443,7 +444,7 @@ where
                     executor,
                 );
             }
-            updated
+            updated.then_some(ExecutionOutcome::Succeeded)
         }
         OperationState::Failed => {
             let terminal_error_code = result
@@ -479,7 +480,7 @@ where
                     executor,
                 );
             }
-            updated
+            updated.then_some(ExecutionOutcome::Failed)
         }
         // Executors only produce the known states; an `Other` here would be a
         // programming error, and releasing the claim is the safe reading.
@@ -596,7 +597,7 @@ where
                         "public operation exceeded the M1 terminalization deadline"
                     );
                 }
-                updated
+                updated.then_some(ExecutionOutcome::Failed)
             } else if deferral_exhausted_after.is_some()
                 || (!preserve_retry_budget
                     && retry_budget_exhausted(attempts, config.max_retry_attempts))
@@ -677,7 +678,7 @@ where
                         executor,
                     );
                 }
-                updated
+                updated.then_some(ExecutionOutcome::Failed)
             } else {
                 let retry_hint = result
                     .retry_after
@@ -718,6 +719,7 @@ where
                             retry_reason,
                             executor,
                         );
+                        Some(ExecutionOutcome::Requeued)
                     }
                     ReleasedClaim::Superseded { delete_id } => {
                         report.canceled += 1;
@@ -732,19 +734,19 @@ where
                             delete_operation_id = %delete_id,
                             "public create canceled instead of retried: a later delete supersedes it"
                         );
+                        Some(ExecutionOutcome::Canceled)
                     }
-                    ReleasedClaim::Lost => {}
+                    ReleasedClaim::Lost => None,
                 }
-                released != ReleasedClaim::Lost
             }
         }
     };
 
-    if !updated {
+    let Some(outcome) = recorded else {
         record_lost_claim(&mut report, api_product_label, kind, executor, operation_id);
-    }
-
-    Ok(report)
+        return Ok((report, ExecutionOutcome::Lost));
+    };
+    Ok((report, outcome))
 }
 
 /// The error envelope of a requeue the driver fails: its own `evidence`, with
