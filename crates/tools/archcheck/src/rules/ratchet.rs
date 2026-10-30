@@ -64,7 +64,9 @@ pub trait CountRatchet {
 
     /// `file`'s count, if it violates the rule, such as by being over a
     /// limit; `None` for a file the rule allows, which is never counted.
-    fn measure(&self, file: &ProductionFile) -> Option<Count>;
+    /// `ctx` gives what a file's path alone does not, such as its crate's
+    /// layer.
+    fn measure(&self, ctx: &Context, file: &ProductionFile) -> Option<Count>;
 
     fn wording(&self) -> Wording;
 
@@ -75,7 +77,7 @@ pub trait CountRatchet {
 
     /// Why a listed file that no longer violates is fine, such as `" is down
     /// to 900 code lines, within the 1,000-line limit"`.
-    fn cleared(&self, file: &ProductionFile) -> String;
+    fn cleared(&self, ctx: &Context, file: &ProductionFile) -> String;
 
     /// A count in a `not added` line, such as `1200 code lines`.
     fn counted(&self, count: usize) -> String;
@@ -236,7 +238,7 @@ fn check(ctx: &Context, rule: &'static str, ratchet: &dyn CountRatchet) -> Vec<F
     };
     let mut measured = BTreeMap::new();
     for file in &ctx.files {
-        let Some(count) = ratchet.measure(file) else {
+        let Some(count) = ratchet.measure(ctx, file) else {
             continue;
         };
         if !caps.contains_key(&file.path) {
@@ -338,7 +340,7 @@ fn check(ctx: &Context, rule: &'static str, ratchet: &dyn CountRatchet) -> Vec<F
                 STALE_ENTRIES,
                 stale_mode,
                 path,
-                format!("{}. Remove it from {place}.", ratchet.cleared(file)),
+                format!("{}. Remove it from {place}.", ratchet.cleared(ctx, file)),
                 1,
             )),
             Some(Count { count, first_line }) if count > cap => {
@@ -397,7 +399,7 @@ fn update_baseline(
     let mut caps = BTreeMap::new();
     let mut not_added = Vec::new();
     for file in &ctx.files {
-        let Some(Count { count, .. }) = ratchet.measure(file) else {
+        let Some(Count { count, .. }) = ratchet.measure(ctx, file) else {
             continue;
         };
         if listed.is_some_and(|listed| listed.contains_key(&file.path)) {

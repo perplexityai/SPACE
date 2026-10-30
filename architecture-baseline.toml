@@ -124,6 +124,103 @@
 "crates/libs/internal/api/server/src/published_state.rs" = 4
 "crates/libs/sandbox/store/src/lib.rs" = 2
 
+# Filesystem writes in Domain, API and App code, seeded when the instance was
+# added; lower each cap as they move into stores or Foundation mechanisms.
+[pattern_ratchet.durable_file_writes]
+"crates/libs/api-route/src/ed25519.rs" = 1
+"crates/libs/api/src/test_support.rs" = 2
+"crates/libs/build/mgr/server/src/run.rs" = 1
+"crates/libs/build/mgr/src/blob.rs" = 12
+"crates/libs/build/mgr/src/lib.rs" = 9
+"crates/libs/build/mgr/src/oci/assembly.rs" = 4
+"crates/libs/build/mgr/src/oci/containerd.rs" = 2
+"crates/libs/build/mgr/src/oci/registry/ecr_auth.rs" = 2
+"crates/libs/cluster/controller/server/src/leader_election/mod.rs" = 2
+"crates/libs/cluster/controller/server/src/node_drain/store/lifecycle_writer_tests/restore_finalize.rs" = 2
+"crates/libs/common/core/src/host/linux.rs" = 1
+"crates/libs/credential/mgr/server/src/run/volume_socket.rs" = 1
+"crates/libs/internal/api/server/src/run.rs" = 4
+"crates/libs/node/api/server/src/run.rs" = 4
+"crates/libs/node/mgr/server/src/btrfs.rs" = 1
+"crates/libs/node/mgr/server/src/clone_cleanup.rs" = 6
+"crates/libs/node/mgr/server/src/clone_tree.rs" = 5
+"crates/libs/node/mgr/server/src/contained_copy.rs" = 5
+"crates/libs/node/mgr/server/src/device_backing.rs" = 9
+"crates/libs/node/mgr/server/src/disk_io_reservation.rs" = 1
+"crates/libs/node/mgr/server/src/loop_devices.rs" = 4
+"crates/libs/node/mgr/server/src/net/linux.rs" = 6
+"crates/libs/node/mgr/server/src/rootfs_dmcrypt/fork.rs" = 1
+"crates/libs/node/mgr/server/src/service/artifact_fs.rs" = 7
+"crates/libs/node/mgr/server/src/service/artifact_fs/receive.rs" = 1
+"crates/libs/node/mgr/server/src/service/btrfs_delegation.rs" = 2
+"crates/libs/node/mgr/server/src/service/btrfs_send_source.rs" = 3
+"crates/libs/node/mgr/server/src/service/btrfs_send_transport.rs" = 1
+"crates/libs/node/mgr/server/src/service/cleanup_helpers.rs" = 3
+"crates/libs/node/mgr/server/src/service/gateway_isolation.rs" = 5
+"crates/libs/node/mgr/server/src/service/launch_prepare.rs" = 6
+"crates/libs/node/mgr/server/src/service/permission_tree.rs" = 4
+"crates/libs/node/mgr/server/src/service/prepared_rootfs/files.rs" = 5
+"crates/libs/node/mgr/server/src/service/runtime.rs" = 1
+"crates/libs/node/mgr/server/src/service/snapshots.rs" = 4
+"crates/libs/node/mgr/server/src/service/trusted_paths.rs" = 6
+"crates/libs/node/mgr/server/src/slot_pool.rs" = 1
+"crates/libs/node/runtime/core/src/artifact_store.rs" = 15
+"crates/libs/node/runtime/core/src/artifact_store/execution_cache.rs" = 2
+"crates/libs/node/runtime/core/src/artifact_store/test_support.rs" = 8
+"crates/libs/node/runtime/core/src/cgroup.rs" = 8
+"crates/libs/node/runtime/core/src/file_delta.rs" = 2
+"crates/libs/node/runtime/core/src/gateway_launch.rs" = 5
+"crates/libs/node/runtime/core/src/launch/os/linux.rs" = 1
+"crates/libs/node/runtime/core/src/lib.rs" = 1
+"crates/libs/node/runtime/core/src/verity.rs" = 1
+"crates/libs/node/runtime/manager/server/src/installs/release.rs" = 7
+"crates/libs/node/runtime/manager/server/src/installs/staging.rs" = 11
+"crates/libs/node/runtime/supervisor/src/cgroups.rs" = 2
+"crates/libs/node/runtime/supervisor/src/contained_launcher/linux.rs" = 7
+"crates/libs/node/runtime/supervisor/src/execution_store.rs" = 9
+"crates/libs/node/runtime/supervisor/src/inventory.rs" = 5
+"crates/libs/sbx/mgr/server/src/local_artifacts.rs" = 1
+"crates/libs/sbx/mgr/server/src/service/cache_cleanup.rs" = 3
+"crates/libs/sbx/mgr/server/src/service/cache_cleanup/periodic.rs" = 2
+"crates/libs/sbx/mgr/server/src/service/cleanup.rs" = 1
+"crates/libs/sbx/mgr/server/src/service/create.rs" = 1
+"crates/libs/sbx/mgr/server/src/service/fork_artifact.rs" = 3
+"crates/libs/sbx/mgr/server/src/service/grpc_lifecycle/suspend_snapshot.rs" = 2
+"crates/libs/sbx/mgr/server/src/service/grpc_pool_wait_clone.rs" = 1
+"crates/libs/sbx/mgr/server/src/service/grpc_sandbox_transfer.rs" = 8
+"crates/libs/sbx/mgr/server/src/service/grpc_sandbox_transfer/receive.rs" = 3
+"crates/libs/sbx/mgr/server/src/service/grpc_snapshot_transfer.rs" = 5
+"crates/libs/sbx/mgr/server/src/service/grpc_spaced_process_snapshots.rs" = 3
+"crates/libs/sbx/mgr/server/src/service/grpc_state_snapshot.rs" = 9
+"crates/libs/sbx/mgr/server/src/service/recovery/staging_cleanup.rs" = 3
+"crates/libs/sbx/mgr/server/src/service/runtime_upgrade/node_effects.rs" = 3
+"crates/libs/sbx/mgr/server/src/service/spaced_bridge.rs" = 1
+"crates/libs/sbx/mgr/server/src/service/start.rs" = 1
+"crates/libs/sbx/mgr/server/src/service/suspend_snapshot_publication.rs" = 20
+"crates/libs/sbx/mgr/server/src/service/template_snapshot_support.rs" = 5
+"crates/libs/sbx/mgr/server/src/snapshot_restore.rs" = 13
+"crates/libs/sbx/mgr/server/src/snapshot_scheduler.rs" = 1
+"crates/libs/sbx/mgr/server/src/snapshot_upload.rs" = 7
+"crates/libs/sbx/mgr/server/src/snapshot_upload_jobs.rs" = 1
+"crates/libs/sbx/mgr/server/src/transfer_directory.rs" = 3
+"crates/libs/spaced/common/src/server.rs" = 3
+"crates/libs/template/mgr/src/rootfs_backing.rs" = 1
+"crates/libs/template/mgr/src/rootfs_zstd.rs" = 5
+"crates/libs/template/mgr/src/run.rs" = 1
+"crates/libs/template/mgr/src/service.rs" = 15
+"crates/libs/template/mgr/src/service/import_helpers.rs" = 11
+"crates/libs/template/mgr/src/service/snapshots.rs" = 2
+"crates/libs/template/mgr/src/service/startup_recovery.rs" = 8
+"crates/libs/template/mgr/src/service/templates.rs" = 4
+"crates/libs/template/mgr/src/volume.rs" = 5
+"crates/libs/vol/mgr/server/src/executor.rs" = 10
+"crates/libs/vol/mgr/server/src/executor/pull.rs" = 4
+"crates/libs/vol/mgr/server/src/executor/replica_provenance.rs" = 3
+"crates/libs/vol/mgr/server/src/executor/sparse_shadow.rs" = 3
+"crates/libs/vol/mgr/server/src/run.rs" = 3
+"crates/libs/vol/mgr/server/src/service.rs" = 3
+"crates/libs/vol/mgr/server/src/staging.rs" = 4
+
 [pattern_ratchet.kubernetes_access]
 # Spawns the Kubernetes-only reconcilers from the bound `KubernetesSubstrate`.
 "crates/libs/cluster/controller/server/src/reconcilers.rs" = 1
@@ -185,9 +282,45 @@
 # database migrator takes them from the store.
 [pattern_ratchet.sbxmgr_sqlite_schema]
 
-# [layers.<check>] maps each workspace package to the workspace packages it
-# depends on against the layers rule's <check>. Only remove entries: a pull
-# request that adds one is reported.
+# [layers.<check>] maps each workspace package to what it depends on against
+# the layers rule's <check>: workspace packages, drivers and storage helpers,
+# or, for codec_features, the <package>/<feature> it enables. Only remove
+# entries: a pull request that adds one is reported.
+[layers.codec_features]
+pplx-space-api = [
+  "pplx-space-common-core/sqlx",
+]
+pplx-space-cluster-controller-server = [
+  "pplx-space-common-core/sqlx",
+]
+pplx-space-common-core = [
+  "pplx-space-accounts/rusqlite",
+  "pplx-space-accounts/sqlx",
+  "pplx-space-k8s-ids/sqlx",
+  "pplx-space-semver/sqlx",
+]
+pplx-space-common-svc = [
+  "pplx-space-common-core/sqlx",
+]
+pplx-space-credmgr = [
+  "pplx-space-common-core/sqlx",
+]
+pplx-space-internal-api-server = [
+  "pplx-space-common-core/sqlx",
+]
+pplx-space-node-runtime-manager = [
+  "pplx-space-common-core/rusqlite",
+]
+pplx-space-runtime-manager-svc = [
+  "pplx-space-node-runtime-manager/s3",
+]
+pplx-space-snapshot-retention = [
+  "pplx-space-common-core/sqlx",
+]
+pplx-space-volmgr = [
+  "pplx-space-common-core/rusqlite",
+]
+
 [layers.dev_direction]
 pplx-space-sbx-mgr-store = [
   "pplx-space-node-runtime-core",
@@ -226,6 +359,88 @@ pplx-space-observability = [
 ]
 pplx-space-uds-peer-auth = [
   "pplx-space-common-core",
+]
+
+[layers.storage_access]
+pplx-space-accounts = [
+  "rusqlite",
+  "sqlx",
+]
+pplx-space-api = [
+  "deadpool-redis",
+  "redis",
+  "sqlx",
+]
+pplx-space-build-mgr = [
+  "pplx-space-object-store",
+]
+pplx-space-build-mgr-server = [
+  "pplx-space-common-jobs",
+  "rusqlite",
+]
+pplx-space-cluster-controller-server = [
+  "sqlx",
+]
+pplx-space-cluster-reconciler = [
+  "sqlx",
+]
+pplx-space-common-core = [
+  "rusqlite",
+  "sqlx",
+]
+pplx-space-common-svc = [
+  "pplx-space-postgres-contention",
+  "pplx-space-valkey",
+  "sqlx",
+]
+pplx-space-credmgr = [
+  "sqlx",
+]
+pplx-space-internal-api-server = [
+  "sqlx",
+]
+pplx-space-node-ctl-server = [
+  "pplx-space-sqlite",
+  "rusqlite",
+  "sqlx",
+]
+pplx-space-node-mgr = [
+  "pplx-space-sqlite",
+  "rusqlite",
+  "sqlx",
+]
+pplx-space-node-runtime-manager = [
+  "aws-sdk-s3",
+  "pplx-space-common-jobs",
+  "pplx-space-s3-http-client",
+  "pplx-space-sqlite",
+  "rusqlite",
+  "sqlx",
+]
+pplx-space-sbx-mgr = [
+  "pplx-space-common-jobs",
+]
+pplx-space-snapshot-retention = [
+  "sqlx",
+]
+pplx-space-state-reconciliation = [
+  "sqlx",
+]
+pplx-space-template-mgr = [
+  "pplx-space-common-jobs",
+  "pplx-space-sqlite",
+  "rusqlite",
+  "sqlx",
+]
+pplx-space-template-publisher = [
+  "pplx-space-object-store",
+]
+pplx-space-volmgr = [
+  "pplx-space-common-jobs",
+  "pplx-space-object-store",
+  "pplx-space-sqlite",
+  "rusqlite",
+  "sqlx",
 ]
 
 # [crate_names] maps each workspace package with a catch-all name (a part such

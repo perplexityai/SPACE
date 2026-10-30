@@ -25,8 +25,9 @@ use crate::{
 mod layers;
 
 pub use layers::{
-    DuplicatePackageError, EdgeBehaviours, Entries, Layer, LayersConfig, LayersPolicy, PackageSet,
-    UnknownLayerError, Unmoved, UnmovedError,
+    Drivers, DriversError, DuplicatePackageError, EdgeBehaviours, Entries, IncludeLayers,
+    IncludeLayersError, Layer, LayerSet, LayerSetError, LayersConfig, LayersPolicy, PackageSet,
+    StorageConfig, StoragePolicy, UnknownLayerError, Unmoved, UnmovedError,
 };
 
 pub const CONFIG_FILE: &str = "ARCHITECTURE.toml";
@@ -74,10 +75,18 @@ pub struct PatternRatchetConfig {
     /// every production file when absent.
     #[serde(default)]
     pub include: Option<IncludeGlobs>,
+    /// Layers whose crates' files the instance checks, as the layers rule
+    /// gives each crate's layer; every layer when absent. With `include`, a
+    /// file must match both.
+    #[serde(default)]
+    pub include_layers: Option<IncludeLayers>,
     /// A code line matching any of these regexes is restricted.
     pub patterns: Patterns,
     /// Repository-relative path globs whose files may match freely.
     pub allow: PathGlobs,
+    /// Layers whose crates' files may match freely.
+    #[serde(default)]
+    pub allow_layers: LayerSet,
     pub no_crossing: BehaviourConfig,
     pub no_new_entries: BehaviourConfig,
     pub no_raised_caps: BehaviourConfig,

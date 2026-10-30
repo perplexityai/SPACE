@@ -292,3 +292,74 @@ fn sbxmgr_sqlite_schema_matches_the_migrators_sandbox_manager_database() {
     );
     assert!(found.is_empty(), "{found:#?}");
 }
+
+/// Every way the research found production code writing a path is a
+/// matching line, and reads, look-alike names and local wrapper definitions
+/// are not. Foundation and Storage crates, by their layer directory, and
+/// the guest file API crates write freely.
+#[test]
+fn durable_file_writes_match_writes_only() {
+    const SRC: &str = "crates/libs/node/mgr/server/src";
+    let crossings = [
+        "std::fs::write(&path, bytes)?;",
+        "tokio::fs::rename(&staged, &path).await?;",
+        "fs::create_dir_all(&dir)?;",
+        "unix_fs::symlink(&target, &link)?;",
+        "std::os::unix::fs::chown(&path, Some(uid), Some(gid))?;",
+        "let file = File::create(&path)?;",
+        "let file = File::create_new(&path)?;",
+        "let file = OpenOptions::new().create(true).write(true).open(&path)?;",
+        "    .append(true)",
+        "let dir = DirBuilder::new().mode(0o700).create(&path)?;",
+        "file.set_permissions(Permissions::from_mode(0o600))?;",
+        "nix::unistd::unlinkat(Some(dir), name, flags)?;",
+        "renameat(Some(old_dir), old, Some(new_dir), new)?;",
+        "Err(error) => mkdirat(dir, name, mode),",
+        "rustix::fs::mkdir(&path, Mode::RWXU)?;",
+        "libc::unlink(path.as_ptr())",
+        "let flags = OFlag::O_CREAT | OFlag::O_RDWR;",
+        "OFlags::RDWR | OFlags::CREATE,",
+        "use std::fs::{read_to_string, write};",
+    ];
+    for line in crossings {
+        let found = ratchet_findings(
+            "durable_file_writes",
+            SRC,
+            &[],
+            &[("lib.rs", &format!("{line}\n"))],
+        );
+        assert_eq!(found.len(), 1, "{line}: {found:#?}");
+        assert_eq!(found[0].0, "no_crossing", "{line}");
+    }
+
+    let ordinary = [
+        "let text = std::fs::read_to_string(&path)?;",
+        "let file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(&path)?;",
+        "let file = File::open(&path)?;",
+        "fn renameat(old: &Path, new: &Path) -> io::Result<()> {",
+        "self.renameat(old, new)?;",
+        "if !flags.contains(OFlag::O_CREAT) {",
+        "#[serde(rename_all = \"snake_case\")]",
+        "state.remove_sandbox(id);",
+        "let path = dir.join(name).with_extension(\"tmp\");",
+        "use std::fs::{self, File};",
+    ];
+    let text: String = ordinary.iter().map(|line| format!("{line}\n")).collect();
+    let found = ratchet_findings("durable_file_writes", SRC, &[], &[("lib.rs", &text)]);
+    assert!(found.is_empty(), "{found:#?}");
+
+    for src in [
+        "crates/l10_foundation/disk/src",
+        "crates/l30_storage/sbx/mgr/store/src",
+        "crates/libs/spaced/guest/execution/src",
+        "crates/l40_api/spaced/guest/server/src",
+    ] {
+        let found = ratchet_findings(
+            "durable_file_writes",
+            src,
+            &[],
+            &[("lib.rs", "std::fs::write(&path, bytes)?;\n")],
+        );
+        assert!(found.is_empty(), "{src}: {found:#?}");
+    }
+}

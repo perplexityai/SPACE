@@ -7,7 +7,7 @@
 use crate::{
     baseline::BASELINE_FILE,
     config::{FileSizeConfig, RulesConfig},
-    context::ProductionFile,
+    context::{Context, ProductionFile},
     rules::ratchet::{Count, CountRatchet, CountRule, Modes, Wording},
 };
 
@@ -36,7 +36,7 @@ impl CountRatchet for Limit<'_> {
     }
 
     /// Whole-file findings are shown on line 1.
-    fn measure(&self, file: &ProductionFile) -> Option<Count> {
+    fn measure(&self, _ctx: &Context, file: &ProductionFile) -> Option<Count> {
         (file.code_lines > self.0.limit).then_some(Count {
             count: file.code_lines,
             first_line: 1,
@@ -63,7 +63,7 @@ impl CountRatchet for Limit<'_> {
         )
     }
 
-    fn cleared(&self, file: &ProductionFile) -> String {
+    fn cleared(&self, _ctx: &Context, file: &ProductionFile) -> String {
         format!(
             " is down to {} code lines, within the {}-line limit",
             file.code_lines,

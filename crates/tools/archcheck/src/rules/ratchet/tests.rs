@@ -33,7 +33,7 @@ impl CountRatchet for Hits {
         }
     }
 
-    fn measure(&self, file: &ProductionFile) -> Option<Count> {
+    fn measure(&self, _ctx: &Context, file: &ProductionFile) -> Option<Count> {
         let mut lines = code_lines(&file.text)
             .filter(|(_, line)| *line == "hit")
             .map(|(number, _)| number);
@@ -59,7 +59,7 @@ impl CountRatchet for Hits {
         format!(": {} hits.", count.count)
     }
 
-    fn cleared(&self, _file: &ProductionFile) -> String {
+    fn cleared(&self, _ctx: &Context, _file: &ProductionFile) -> String {
         " has no hits left".to_owned()
     }
 

@@ -419,6 +419,64 @@ mode = "required"
 [rules.pattern_ratchet.sbxmgr_sqlite_schema.stale_entries]
 mode = "required"
 
+# Filesystem writes belong in stores and in Foundation's mechanisms, not in
+# Domain, API or App code. Each pattern is a std, tokio or nix/rustix/libc
+# call that creates, writes, renames, links, removes or changes the mode or
+# owner of a path: fs::write, rename, copy, create_dir*, remove_*, symlink,
+# set_permissions and chown, File::create, an open with .write(true) or
+# .append(true), DirBuilder, the *at calls, and O_CREAT or O_TMPFILE in a
+# flag expression. A line can't tell durable state from a cgroup, sysctl,
+# /dev, socket or /run write, so every write counts, and lines in #[cfg(test)]
+# code inside production files are baselined like the rest. Not caught: calls
+# to Foundation write helpers (btrfs subvolumes, common-io's encrypt, decrypt
+# and reflink), shell-outs that write (cp, truncate, btrfs receive), writes
+# through an open handle, tempfile's persist and keep, callers of a crate's
+# own write wrapper unless it is named like a call above (a bare `renameat(`
+# or an `fs::write(` counts whatever it resolves to), and a name imported in
+# a `use` split across lines. The guest file API crates write user data inside the
+# sandbox, which is their purpose. Advisory until calibrated.
+[rules.pattern_ratchet.durable_file_writes]
+patterns = [
+  # std::fs, tokio::fs and std::os::unix::fs mutators; `unix_fs` is the one
+  # alias in use
+  '\b(?:unix_)?fs::(?:write|rename|copy|hard_link|soft_link|symlink|set_permissions|create_dir|create_dir_all|remove_file|remove_dir|remove_dir_all|chown|lchown|fchown)\s*\(',
+  '\bFile::(?:create|create_new)\s*\(',
+  # OpenOptions or File::options() opened for writing, counted at the
+  # write-mode call, so a read-only open is not
+  '\.(?:write|append)\(\s*true\s*\)',
+  '\bDirBuilder::new\s*\(',
+  '\.set_permissions\s*\(',
+  # nix, rustix and libc *at and POSIX mutators, bare or qualified; not a
+  # method call or a local `fn` of the same name
+  '(?:^\s*|::|[^\w\s.]\s*|\b(?:match|return|else|in|move)\s+)(?:mkdirat|unlinkat|renameat|renameat2|renameat_with|symlinkat|linkat|chmodat|chownat|fchmodat|fchownat|mknodat|mknod|mkfifo|mkfifoat|fchmod|fchown)\s*\(',
+  '\b(?:nix|rustix|libc)::(?:\w+::)*(?:unlink|rmdir|mkdir|rename|chmod|chown|lchown|symlink|link|truncate|creat)\s*\(',
+  # creating opens: O_CREAT or O_TMPFILE next to a `|` in a flag expression,
+  # so a test like `flags.contains(O_CREAT)` is not
+  '\|\s*(?:\w+::)*(?:O_CREAT|O_TMPFILE|OFlags::CREATE|OFlags::TMPFILE)\b|\b(?:O_CREAT|O_TMPFILE|OFlags::CREATE|OFlags::TMPFILE)\s*\|',
+  # importing one of the first pattern's functions by name, for bare calls
+  '\buse\s+(?:std|tokio)::(?:fs|os::unix::fs)::(?:\{[^}]*\b)?(?:write|rename|copy|hard_link|soft_link|symlink|set_permissions|create_dir|create_dir_all|remove_file|remove_dir|remove_dir_all|chown|lchown|fchown)\b',
+]
+allow = [
+  "crates/**/spaced/guest/execution/src/**",
+  "crates/**/spaced/guest/server/src/**",
+]
+allow_layers = ["l10_foundation", "l30_storage", "test_support", "tools"]
+
+[rules.pattern_ratchet.durable_file_writes.no_crossing]       # only allowed and listed files may write
+mode = "advisory"
+
+[rules.pattern_ratchet.durable_file_writes.no_new_entries]    # a pull request may not add entries to the baseline
+mode = "advisory"
+
+[rules.pattern_ratchet.durable_file_writes.no_raised_caps]    # a pull request may not raise a cap in the baseline
+mode = "advisory"
+
+[rules.pattern_ratchet.durable_file_writes.listed_no_growth]  # listed files may not gain writing lines
+mode = "advisory"
+
+[rules.pattern_ratchet.durable_file_writes.stale_entries]     # entries with fewer writes, none, or gone
+mode = "advisory"
+
 # Only the store may depend on the SQLite drivers that can open sbx-mgr's
 # database, or on the shared helpers that open, migrate and delete one by
 # path, so no other sbx-mgr crate can name them: no normal, dev or build
@@ -716,6 +774,41 @@ pplx-space-snapshot-store = [
 # The database migrator applies every store's migrations.
 pplx-space-db-migrator = ["pplx-space-db-migrate"]
 
+# Nothing above l30_storage reaches a database or object storage directly,
+# l20_domain never does, and l10_foundation does only in a storage helper,
+# which names nothing SPACE-specific. A helper is an l10_foundation crate with
+# a required dependency on a driver; `helpers` lists the others. The sqlx and
+# SQLite sub-crates are listed so that depending on one instead of the
+# umbrella crate is no way around the checks. A legacy l10_foundation crate
+# (see `legacy` below) is no helper even with a driver dependency: it is
+# checked like every other crate, with today's edges baselined.
+[rules.layers.storage]
+drivers = [
+  "aws-sdk-s3",
+  "deadpool-redis",
+  "libsqlite3-sys",
+  "redis",
+  "rusqlite",
+  "sqlx",
+  "sqlx-core",
+  "sqlx-macros",
+  "sqlx-macros-core",
+  "sqlx-mysql",
+  "sqlx-postgres",
+  "sqlx-sqlite",
+]
+helpers = [
+  # The HTTP connector and per-operation tracing that plug into an
+  # aws-sdk-s3 client's configuration, without depending on aws-sdk-s3.
+  "pplx-space-s3-http-client",
+]
+
+# The crates being dissolved: they predate the layers and mix SPACE-specific
+# code in until they are split up. Every check covers them, with today's edges
+# baselined.
+[rules.layers]
+legacy = ["pplx-space-common-core", "pplx-space-common-svc", "pplx-space-metrics"]
+
 [rules.layers.placement]          # every crate has a layer; no new unmoved entries
 mode = "required"
 
@@ -744,6 +837,30 @@ mode = "required"
 [rules.layers.dev_direction.stale_entries]
 mode = "required"
 
+# Only stores and storage helpers depend on a driver or a helper; an optional
+# dependency counts too, except a codec behind a feature in l10_foundation.
+# Today's exceptions are baselined in [layers.storage_access].
+[rules.layers.storage_access.no_crossing]
+mode = "required"
+
+[rules.layers.storage_access.no_new_entries]
+mode = "required"
+
+[rules.layers.storage_access.stale_entries]
+mode = "required"
+
+# Only stores and storage helpers turn on another crate's driver feature, one
+# that enables its optional dependency on a driver or helper, such as a codec
+# for its types. Today's exceptions are baselined in [layers.codec_features].
+[rules.layers.codec_features.no_crossing]
+mode = "required"
+
+[rules.layers.codec_features.no_new_entries]
+mode = "required"
+
+[rules.layers.codec_features.stale_entries]
+mode = "required"
+
 [rules.layers.test_only]          # test_support only through dev-dependencies; nothing depends on tools
 mode = "required"
 
@@ -753,7 +870,7 @@ mode = "required"
 [rules.layers.store_edges]        # API and Storage crates use only the stores that list them
 mode = "required"
 
-[rules.layers.stale_entries]      # unmoved, store_users and allowed_edges entries that no longer apply
+[rules.layers.stale_entries]      # unmoved, legacy, store_users, allowed_edges and storage entries that no longer apply
 mode = "required"
 
 [rules.layers.policy_changed]     # changes to [rules.layers], compared with the base branch

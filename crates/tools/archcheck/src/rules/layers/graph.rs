@@ -46,6 +46,35 @@ pub(super) fn layer_dir(member: &str) -> Option<(Layer, &str)> {
     Some((Layer::from_dir(dir)?, path))
 }
 
+/// `krate`'s layer, from its directory or else from its `unmoved` entry, and
+/// its path below its layer directory when it is in one.
+pub(super) fn member_layer<'a>(
+    config: &LayersConfig,
+    krate: &'a Crate,
+) -> (Option<Layer>, Option<&'a str>) {
+    match layer_dir(&krate.member) {
+        Some((layer, path)) => (Some(layer), Some(path)),
+        None => (config.unmoved.get(&krate.name), None),
+    }
+}
+
+/// The crate whose production file is at `path`: the one with the longest
+/// member path whose `src/` holds it, so that a member nested in another's
+/// `src/` owns the files below it.
+pub(super) fn file_owner<'a>(crates: &'a [Crate], path: &str) -> Option<&'a Crate> {
+    crates
+        .iter()
+        .filter(|krate| {
+            let src = if krate.member.is_empty() {
+                "src/".to_owned()
+            } else {
+                format!("{}/src/", krate.member)
+            };
+            path.starts_with(&src)
+        })
+        .max_by_key(|krate| krate.member.len())
+}
+
 /// The directories a package's path below its layer directory is made of:
 /// its name without [`PACKAGE_PREFIX`], split on `-`.
 pub(super) fn name_segments(package: &str) -> Vec<&str> {
@@ -99,10 +128,7 @@ impl<'a> Graph<'a> {
             .crates
             .iter()
             .map(|krate| {
-                let (layer, layer_path) = match layer_dir(&krate.member) {
-                    Some((layer, path)) => (Some(layer), Some(path)),
-                    None => (config.unmoved.get(&krate.name), None),
-                };
+                let (layer, layer_path) = member_layer(config, krate);
                 let member = Member {
                     krate,
                     layer,

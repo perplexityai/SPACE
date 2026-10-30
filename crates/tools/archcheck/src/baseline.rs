@@ -52,9 +52,10 @@ const HEADER: &str = "\
 /// Written above the `[layers.<check>]` tables, which follow the tables of
 /// caps.
 const LAYERS_COMMENT: &str = "\
-# [layers.<check>] maps each workspace package to the workspace packages it
-# depends on against the layers rule's <check>. Only remove entries: a pull
-# request that adds one is reported.
+# [layers.<check>] maps each workspace package to what it depends on against
+# the layers rule's <check>: workspace packages, drivers and storage helpers,
+# or, for codec_features, the <package>/<feature> it enables. Only remove
+# entries: a pull request that adds one is reported.
 ";
 
 /// Written above `[crate_names]`, which follows the other tables.
@@ -210,8 +211,15 @@ pub struct BaseTables {
 /// be compared.
 type BaseEdgeTable = Result<BTreeMap<String, BTreeSet<String>>, Box<UnusableBase>>;
 
-/// The `[layers.<check>]` table a base branch's copy without it compares as.
-static NO_EDGES: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+/// A `[layers.<check>]` table of the base branch's copy.
+#[derive(Debug, Clone, Copy)]
+pub enum BaseLayersTable<'a> {
+    Table(&'a BTreeMap<String, BTreeSet<String>>),
+    /// The copy has a `[layers]` key without this table.
+    Missing,
+    /// The copy has no `[layers]` key, as before the layers rule existed.
+    NoLayers,
+}
 
 /// One table of the base branch's copy, or why it can't be compared.
 type BaseTable = Result<BTreeMap<String, usize>, Box<UnusableBase>>;
@@ -298,13 +306,10 @@ impl BaseBaseline {
             .flat_map(|tables| tables.tables.keys().map(String::as_str))
     }
 
-    /// The base branch's `[layers.<check>]` table: empty if the copy has a
-    /// `[layers]` key without it, `None` if the copy has no `[layers]` key,
-    /// as before the layers rule existed.
-    pub fn layers_table(
-        &self,
-        check: &str,
-    ) -> Result<Option<&BTreeMap<String, BTreeSet<String>>>, BaseSkip<'_>> {
+    /// The base branch's `[layers.<check>]` table, or whether the copy lacks
+    /// only that table or its whole `[layers]` key, as before the layers
+    /// rule existed.
+    pub fn layers_table(&self, check: &str) -> Result<BaseLayersTable<'_>, BaseSkip<'_>> {
         let tables = self.tables()?;
         match tables.rules.get(Layers::NAME) {
             None => return Err(BaseSkip::NotRead),
@@ -312,14 +317,14 @@ impl BaseBaseline {
             Some(Ok(())) => {}
         }
         let Some(layers) = &tables.layers else {
-            return Ok(None);
+            return Ok(BaseLayersTable::NoLayers);
         };
         match layers.get(check) {
             Some(table) => table
                 .as_ref()
-                .map(Some)
+                .map(BaseLayersTable::Table)
                 .map_err(|unusable| BaseSkip::Unusable(unusable)),
-            None => Ok(Some(&NO_EDGES)),
+            None => Ok(BaseLayersTable::Missing),
         }
     }
 
