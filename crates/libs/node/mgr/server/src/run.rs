@@ -54,6 +54,7 @@ const ENV_MAX_SLOTS: &[&str] = &["SPACE_NODEMGR_NETWORK_POOL_MAX_SLOTS"];
 const ENV_TARGET_READY: &[&str] = &["SPACE_NODEMGR_NETWORK_POOL_TARGET"];
 const ENV_RETAINED_READY: &[&str] = &["SPACE_NODEMGR_NETWORK_POOL_RETAIN_READY"];
 const ENV_MIN_READY: &[&str] = &["SPACE_NODEMGR_NETWORK_POOL_MIN_READY"];
+const ENV_SANDBOX_CGROUP_MEMORY_MIB: &[&str] = &["SPACE_NODEMGR_SANDBOX_CGROUP_MEMORY_MIB"];
 const ENV_SERVICE_PORT_INGRESS_ISOLATION: &[&str] =
     &["SPACE_NODEMGR_SERVICE_PORT_INGRESS_ISOLATION"];
 const ENV_DISK_IO_RESERVATION_ENABLED: &[&str] = &["SPACE_NODEMGR_DISK_IO_RESERVATION_ENABLED"];
@@ -135,6 +136,12 @@ pub enum RunNodeMgrError {
     },
     #[error("{name} must be a u32")]
     EnvNotU32 {
+        name: &'static str,
+        #[source]
+        source: std::num::ParseIntError,
+    },
+    #[error("{name} must be a u64")]
+    EnvNotU64 {
         name: &'static str,
         #[source]
         source: std::num::ParseIntError,
@@ -284,6 +291,19 @@ fn env_string(names: &[&str]) -> Option<String> {
     None
 }
 
+fn env_u64(names: &[&'static str]) -> Result<Option<u64>, RunNodeMgrError> {
+    for name in names {
+        let Some(value) = env_string(&[name]) else {
+            continue;
+        };
+        return value
+            .parse::<u64>()
+            .map_err(|source| RunNodeMgrError::EnvNotU64 { name, source })
+            .map(Some);
+    }
+    Ok(None)
+}
+
 fn env_bool(names: &[&'static str]) -> Result<Option<bool>, RunNodeMgrError> {
     for name in names {
         let Ok(value) = std::env::var(name) else {
@@ -425,7 +445,7 @@ fn resolve_sandbox_cgroup_config(
     config.memory_mib = setting(
         "sandbox_cgroup.memory_mib",
         cli.sandbox_cgroup_memory_mib.map(Some),
-        None,
+        env_u64(ENV_SANDBOX_CGROUP_MEMORY_MIB)?.map(Some),
         file.memory_mib.map(Some),
         config.memory_mib,
     );
