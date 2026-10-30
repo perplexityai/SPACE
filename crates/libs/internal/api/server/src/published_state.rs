@@ -2473,36 +2473,7 @@ pub async fn publish_sandbox_states(
         "started",
     );
 
-    crate::sandbox_quarantine_store::consume_activation_completion_receipts(
-        conn,
-        node_id,
-        rows_json.clone(),
-    )
-    .await?;
-
-    let rollback_candidates =
-        crate::sandbox_quarantine_store::select_activation_rollback_candidates(
-            conn,
-            node_id,
-            rows_json.clone(),
-        )
-        .await?;
-    let applied_rollbacks = crate::sandbox_quarantine_store::apply_activation_rollback_candidates(
-        conn,
-        node_id,
-        rollback_candidates,
-    )
-    .await?;
-    post_commit_events.extend(applied_rollbacks.into_iter().map(|rollback| {
-        PostCommitSandboxEvent {
-            sandbox_id: rollback.sandbox_id,
-            event_type: SandboxEventType::ActivationRollbackCompleted,
-            prior_lifecycle: rollback.prior_lifecycle,
-            target_lifecycle: rollback.target_state,
-            reason_code: rollback.reason_code,
-            error: rollback.failure_message,
-        }
-    }));
+    post_commit_events.extend(apply_activation_receipts(conn, node_id, &rows).await?);
 
     let suspended_projection =
         project_node_published_suspended_sandboxes(conn, node_id, rows_json.clone()).await?;
@@ -3940,6 +3911,75 @@ async fn write_observed_states(
         "published sandbox observed state diff applied"
     );
     Ok(accepted_rows)
+}
+
+/// Consume matching activation receipts within the publication transaction.
+/// Return only the events that become publishable after its caller commits.
+async fn apply_activation_receipts(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    rows: &[PublishedSandboxRow],
+) -> Result<Vec<PostCommitSandboxEvent>, Status> {
+    // These statements require an exact receipt kind. Empty receipt batches
+    // cannot release or lock an execution, so ordinary reports need neither query.
+    let activation_completions = rows
+        .iter()
+        .filter(|row| {
+            row.transition_receipt_kind
+                == Some(SandboxTransitionReceiptKind::ActivationCompleted.as_str())
+        })
+        .collect::<Vec<_>>();
+    if !activation_completions.is_empty() {
+        let receipt_rows = Json(
+            serde_json::to_value(activation_completions).map_err(|error| {
+                Status::internal(format!("serialize activation completion receipts: {error}"))
+            })?,
+        );
+        crate::sandbox_quarantine_store::consume_activation_completion_receipts(
+            conn,
+            node_id,
+            receipt_rows,
+        )
+        .await?;
+    }
+
+    let activation_rollbacks = rows
+        .iter()
+        .filter(|row| {
+            row.transition_receipt_kind
+                == Some(SandboxTransitionReceiptKind::ActivationRollback.as_str())
+        })
+        .collect::<Vec<_>>();
+    let rollback_candidates = if activation_rollbacks.is_empty() {
+        Vec::new()
+    } else {
+        let receipt_rows = Json(serde_json::to_value(activation_rollbacks).map_err(|error| {
+            Status::internal(format!("serialize activation rollback receipts: {error}"))
+        })?);
+        crate::sandbox_quarantine_store::select_activation_rollback_candidates(
+            conn,
+            node_id,
+            receipt_rows,
+        )
+        .await?
+    };
+    let applied_rollbacks = crate::sandbox_quarantine_store::apply_activation_rollback_candidates(
+        conn,
+        node_id,
+        rollback_candidates,
+    )
+    .await?;
+    Ok(applied_rollbacks
+        .into_iter()
+        .map(|rollback| PostCommitSandboxEvent {
+            sandbox_id: rollback.sandbox_id,
+            event_type: SandboxEventType::ActivationRollbackCompleted,
+            prior_lifecycle: rollback.prior_lifecycle,
+            target_lifecycle: rollback.target_state,
+            reason_code: rollback.reason_code,
+            error: rollback.failure_message,
+        })
+        .collect())
 }
 
 #[cfg(test)]
