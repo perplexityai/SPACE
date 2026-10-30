@@ -50,6 +50,24 @@ fn falls_back_to_env_when_default_file_is_missing() {
 }
 
 #[test]
+fn empty_path_env_falls_back_like_unset() {
+    // A blank path variable is ignored when choosing the path, so it must not
+    // count as an explicit path either: the env token still applies when the
+    // default file is absent.
+    for value in ["", "  "] {
+        let mut env = pplx_space_test_env::TestEnv::default();
+        env.set(SPACE_NODE_API_TOKEN_PATH_ENV, value);
+        env.set(SPACE_INTERNAL_TOKEN_ENV, "env-token");
+
+        assert_eq!(
+            space_bearer_token_from_environment(SpaceBearerToken::NodeApi, &env).unwrap(),
+            "env-token",
+            "path env set to {value:?}"
+        );
+    }
+}
+
+#[test]
 fn explicit_file_path_wins_over_env() {
     let mut env = pplx_space_test_env::TestEnv::default();
     let dir = tempfile::tempdir().unwrap();
