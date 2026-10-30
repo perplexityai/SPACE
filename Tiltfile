@@ -254,25 +254,30 @@ def image_build(image, revision_label = False):
 MAX_PARALLEL_UPDATES = int(os.getenv("SPACE_TILT_MAX_PARALLEL_UPDATES", "8"))
 update_settings(max_parallel_updates = MAX_PARALLEL_UPDATES)
 
-# No `kind load` in the custom_build commands: Tilt loads every custom_build
-# image into every node of a kind cluster itself (its "Pushing … Loading image
-# to KIND" step). A pool-scoped load before it only repeated the image export
-# for the first nodes, 5-19 s per image, and could not keep the image off the
-# other pools.
+# Each image is declared here with space_image and built by a custom_build
+# issued under "Image delivery" below, once every manifest is rendered: its
+# command ends by loading the build into the nodes itself, onto the nodes its
+# pods can schedule onto, and Tilt's own load step is off. See there. Tilt
+# sets no $EXPECTED_REF for a build that names its own reference, so each
+# build tags $SPACE_BUILD_REF, `<name>:tilt-build-<time>-<nonce>`.
+IMAGE_BUILDS = []
+
+def space_image(ref, command, deps):
+    IMAGE_BUILDS.append({"ref": ref, "command": command, "deps": deps})
 
 def rust_runtime_image(name, dockerfile, runtime_deps):
     cmd = " && ".join([
         BUILD_INPUTS_SNAPSHOT,
         pull_base_images(dockerfile),
         RUST_ARTIFACT_BUILD,
-        ("{build} -t $EXPECTED_REF " +
+        ("{build} -t $SPACE_BUILD_REF " +
          "--build-arg SPACE_RUST_BUILD_IMAGE={rust_image} " +
          "--build-arg SPACE_GIT_SHA .").format(
             build = image_build(name),
             rust_image = RUST_ARTIFACT_IMAGE,
         ),
     ])
-    custom_build(
+    space_image(
         ref = "{}:local".format(name),
         command = cmd,
         # The Rust workspace is the common base for all rust images; any
@@ -281,7 +286,6 @@ def rust_runtime_image(name, dockerfile, runtime_deps):
         # cargo-chef-cached Docker build) and
         # every runtime image then re-copies its binaries from it.
         deps = RUST_ARTIFACT_DEPS + runtime_deps,
-        skips_local_docker = False,
     )
 
 rust_runtime_image(
@@ -313,7 +317,7 @@ rust_runtime_image(
 # the operator shell and space-internal-api run it unchanged. LTO is off for
 # faster local iteration, except in the release lane (RUST_BUILD), which links
 # with thin LTO.
-custom_build(
+space_image(
     ref = "space-worker:local",
     command = " && ".join([
         BUILD_INPUTS_SNAPSHOT,
@@ -322,7 +326,7 @@ custom_build(
         # --provenance=false (image_build) also keeps buildx from emitting a
         # multi-platform manifest list, which `kind load docker-image` cannot
         # ingest ("content digest ... not found").
-        (image_build("space-worker") + " -t $EXPECTED_REF " +
+        (image_build("space-worker") + " -t $SPACE_BUILD_REF " +
          "--build-arg SPACE_RUST_BUILD_IMAGE={} --build-arg SPACE_GIT_SHA .").format(
             RUST_ARTIFACT_IMAGE),
     ]),
@@ -335,7 +339,6 @@ custom_build(
             "scripts/k8s/sandbox-manager-start.sh",
             "scripts/space-sbx-db-migrate.sh",
             "templates/firecracker/recipes"],
-    skips_local_docker = False,
 )
 
 # space-seed-publish: carries the locally built production seed template
@@ -347,7 +350,7 @@ custom_build(
 # directory for both steps, resolved once: build-seed.sh writes
 # SPACE_SEED_OUTPUT_DIR (default below), and the image is built from what it
 # wrote.
-custom_build(
+space_image(
     ref = "space-seed-publish:local",
     command = " && ".join([
         BUILD_INPUTS_SNAPSHOT,
@@ -356,7 +359,7 @@ custom_build(
         'seed_dir="${SPACE_SEED_OUTPUT_DIR:-$HOME/.space-devbox/kind/seed/build}"',
         'SPACE_SEED_OUTPUT_DIR="$seed_dir" SPACE_RUST_BUILD_IMAGE={} bash infra/space/kind/scripts/build-seed.sh'.format(
             RUST_ARTIFACT_IMAGE),
-        (image_build("space-seed-publish", revision_label = True) + " -t $EXPECTED_REF " +
+        (image_build("space-seed-publish", revision_label = True) + " -t $SPACE_BUILD_REF " +
          '--build-context seed="$seed_dir" .'),
     ]),
     deps = RUST_ARTIFACT_DEPS + [
@@ -365,34 +368,31 @@ custom_build(
             "docker/Dockerfile.seed-publish",
             "infra/space/kind/scripts/build-seed.sh",
             "infra/space/kind/scripts/seed-publish-entry.sh"],
-    skips_local_docker = False,
 )
 
 # Kind-only: the STS bridge fixture the credential-manager authority's storage
 # exchange calls in place of AWS STS. Go, standard library only; the build runs
 # its unit tests.
-custom_build(
+space_image(
     ref = "space-kind-sts-bridge:local",
     command = " && ".join([
         BUILD_INPUTS_SNAPSHOT,
         pull_base_images("docker/Dockerfile.kind-sts-bridge"),
-        image_build("space-kind-sts-bridge") + " -t $EXPECTED_REF --build-arg SPACE_GIT_SHA .",
+        image_build("space-kind-sts-bridge") + " -t $SPACE_BUILD_REF --build-arg SPACE_GIT_SHA .",
     ]),
     deps = ["docker/Dockerfile.kind-sts-bridge", "infra/space/kind/sts-bridge"],
-    skips_local_docker = False,
 )
 
 # Kind-only: the fake EC2 endpoint the cluster-controller's reconcile-queue GC
 # calls in place of EC2. Go, standard library only.
-custom_build(
+space_image(
     ref = "space-kind-fake-ec2:local",
     command = " && ".join([
         BUILD_INPUTS_SNAPSHOT,
         pull_base_images("docker/Dockerfile.kind-fake-ec2"),
-        image_build("space-kind-fake-ec2") + " -t $EXPECTED_REF --build-arg SPACE_GIT_SHA .",
+        image_build("space-kind-fake-ec2") + " -t $SPACE_BUILD_REF --build-arg SPACE_GIT_SHA .",
     ]),
     deps = ["docker/Dockerfile.kind-fake-ec2", "infra/space/kind/fake-ec2"],
-    skips_local_docker = False,
 )
 
 # UI: no rust, single Dockerfile. NEXT_PUBLIC_API_URL and
@@ -401,18 +401,61 @@ custom_build(
 # .next/required-server-files.json. Runtime env overrides are ignored. Both
 # name the in-cluster Services: the Dockerfile's localhost defaults would point
 # the UI pod's session proxy at itself.
-custom_build(
+space_image(
     ref = "space-ui:local",
     command = " && ".join([
         BUILD_INPUTS_SNAPSHOT,
         pull_base_images("docker/Dockerfile.ui"),
-        (image_build("space-ui", revision_label = True) + " -t $EXPECTED_REF " +
+        (image_build("space-ui", revision_label = True) + " -t $SPACE_BUILD_REF " +
          "--build-arg NEXT_PUBLIC_API_URL=http://space-api:8080 " +
          "--build-arg NEXT_PUBLIC_DATA_PLANE_URL=http://space-data-plane:8090 ."),
     ]),
     deps = ["docker/Dockerfile.ui", "ui"],
-    skips_local_docker = False,
 )
+
+# Every manifest goes to Tilt through deploy_yaml, which also records where
+# each image's pods can schedule: the nodeSelector, required node affinity and
+# nodeName of every pod template, by the repository of each image it runs
+# (any tag: a superset of the references Tilt injects into). The image's load
+# reads them (kind-load-image.py), so call k8s_yaml nowhere else: a pod
+# template that bypassed deploy_yaml could land on a node its image was never
+# loaded onto, and wait there in ImagePullBackOff.
+POD_PLACEMENT = {}
+
+def image_repository(image):
+    return image.split("@")[0].split("/")[-1].split(":")[0]
+
+def pod_specs(obj):
+    spec = obj.get("spec")
+    if type(spec) != "dict":
+        return []
+    if obj.get("kind") == "Pod":
+        return [spec]
+    if obj.get("kind") == "CronJob":
+        spec = (spec.get("jobTemplate") or {}).get("spec") or {}
+    template = spec.get("template")
+    if type(template) != "dict" or type(template.get("spec")) != "dict":
+        return []
+    return [template["spec"]]
+
+def deploy_yaml(yaml):
+    k8s_yaml(yaml)
+    for obj in decode_yaml_stream(read_file(yaml) if type(yaml) == "string" else yaml):
+        if type(obj) != "dict":
+            continue
+        for spec in pod_specs(obj):
+            required = ((spec.get("affinity") or {}).get("nodeAffinity") or {}).get(
+                "requiredDuringSchedulingIgnoredDuringExecution") or {}
+            constraint = {
+                "nodeSelector": spec.get("nodeSelector") or {},
+                "nodeSelectorTerms": required.get("nodeSelectorTerms") or [],
+                "nodeName": spec.get("nodeName") or "",
+            }
+            for container in ((spec.get("initContainers") or []) + (spec.get("containers") or []) +
+                              (spec.get("ephemeralContainers") or [])):
+                known = POD_PLACEMENT.setdefault(image_repository(container.get("image") or ""), [])
+                if constraint not in known:
+                    known.append(constraint)
 
 # ── Cluster bootstrap (RuntimeClass + node labels + Namespace) ───────────
 #
@@ -430,14 +473,14 @@ custom_build(
 # default to it. The same file creates
 # `sandboxes`, the charts' k8s.sandboxNamespace, where the API creates the
 # per-sandbox pods.
-k8s_yaml("infra/space/kind/manifests/namespace.yaml")
-k8s_yaml("infra/space/kind/manifests/runtimeclass.yaml")
+deploy_yaml("infra/space/kind/manifests/namespace.yaml")
+deploy_yaml("infra/space/kind/manifests/runtimeclass.yaml")
 
 # The sandbox namespace's NetworkPolicies: a default-deny plus the traffic a
 # sandbox pod carries (the chart cites the code behind each rule). The API
 # waits for them, so no sandbox pod runs before its namespace is confined.
 # internal-rpc-tls applies the Namespace manifest first.
-k8s_yaml(helm("infra/space/kind/charts/space-sandbox-network-policy", name = "space", namespace = NAMESPACE))
+deploy_yaml(helm("infra/space/kind/charts/space-sandbox-network-policy", name = "space", namespace = NAMESPACE))
 k8s_resource(
     new_name = "space-sandbox-network-policy",
     objects = [
@@ -463,7 +506,7 @@ local_resource(
 # a SPACE PriorityClass waits on this resource, and admission rejects a pod
 # whose class does not exist yet, so the classes are applied here too (the
 # k8s_yaml keeps them Tilt-managed, as the Namespace manifest is).
-k8s_yaml("infra/space/kind/manifests/priorityclasses.yaml")
+deploy_yaml("infra/space/kind/manifests/priorityclasses.yaml")
 local_resource(
     "label-kind-infra",
     cmd = """
@@ -583,7 +626,7 @@ if DATADOG_MODE != "off":
     # those generated files would retrigger the Tiltfile indefinitely.
     for source in ["Chart.yaml", "Chart.lock", "values.yaml", "values.schema.json", "values-fakeintake.yaml", "templates"]:
         watch_file(DATADOG_CHART + "/" + source)
-    k8s_yaml(local(["python3", DATADOG_SCRIPT, "render"], quiet = True))
+    deploy_yaml(local(["python3", DATADOG_SCRIPT, "render"], quiet = True))
 if DATADOG_MODE == "fakeintake":
     k8s_resource(
         "datadog-fakeintake",
@@ -592,7 +635,7 @@ if DATADOG_MODE == "fakeintake":
     )
 
 # Postgres first; the space-db-migrate Job blocks on it.
-k8s_yaml(helm_release("space", "infra/space/kind/charts/space-postgres"))
+deploy_yaml(helm_release("space", "infra/space/kind/charts/space-postgres"))
 k8s_resource(
     "space-postgres",
     labels = ["data"],
@@ -611,8 +654,8 @@ SPACE_API_DEPS = ["space-postgres", "label-kind-workers", "label-kind-infra",
 # across the autoscaled replicas as a deployment's load balancer does.
 # values-kind.yaml carries the bench's non-test-hook overrides, which the
 # caller-provided-cluster chart must not inherit.
-k8s_yaml(helm_release("space", "infra/space/kind/charts/space-api-local",
-                      values = ["infra/space/kind/charts/space-api-local/values-kind.yaml"]))
+deploy_yaml(helm_release("space", "infra/space/kind/charts/space-api-local",
+                         values = ["infra/space/kind/charts/space-api-local/values-kind.yaml"]))
 k8s_resource(
     "space-api",
     labels = ["control-plane"],
@@ -635,7 +678,7 @@ k8s_resource(
 
 # The resource metrics API the API and data-plane HorizontalPodAutoscalers
 # read, in kube-system as a managed cluster's add-on is.
-k8s_yaml(helm("infra/space/kind/charts/space-metrics-server", name = "space", namespace = "kube-system"))
+deploy_yaml(helm("infra/space/kind/charts/space-metrics-server", name = "space", namespace = "kube-system"))
 k8s_resource(
     "metrics-server",
     labels = ["control-plane"],
@@ -655,7 +698,7 @@ local_resource(
 # Internal (cluster) API — node-ctl publishes node state here (this is node
 # registration), template-manager resolves releases, and the seed publish
 # registers the seed release against it.
-k8s_yaml(helm(
+deploy_yaml(helm(
     "infra/space/kind/charts/space-internal-api-local",
     name = "space",
     namespace = NAMESPACE,
@@ -671,7 +714,7 @@ k8s_resource(
 # the platform KEK; each node's credential-manager runs as its agent, and
 # node-manager calls it for sandbox volume DEKs. It needs the API's migrations
 # and the space_creds role the API's bootstrap provisions.
-k8s_yaml(helm_release("space", "infra/space/kind/charts/space-credmgr-authority-local"))
+deploy_yaml(helm_release("space", "infra/space/kind/charts/space-credmgr-authority-local"))
 k8s_resource(
     "space-credmgr-authority",
     labels = ["control-plane"],
@@ -709,8 +752,8 @@ printf 'AWS_ACCESS_KEY_ID=%s\\nAWS_SECRET_ACCESS_KEY=%s\\nAWS_SESSION_TOKEN=%s\\
     )
 # The authority's external key provider: the Kind-only intermediate-key broker
 # fixture, whose derived keys survive restarts of either side.
-k8s_yaml(helm("infra/space/kind/charts/space-kind-key-broker", name = "space", namespace = NAMESPACE,
-              set = ["rustBuild=" + RUST_BUILD]))
+deploy_yaml(helm("infra/space/kind/charts/space-kind-key-broker", name = "space", namespace = NAMESPACE,
+                 set = ["rustBuild=" + RUST_BUILD]))
 k8s_resource(
     "space-kind-key-broker",
     labels = ["control-plane"],
@@ -718,7 +761,7 @@ k8s_resource(
 )
 
 # Public data-plane service for native sessions and ECW wildcard hosts.
-k8s_yaml(helm_release("space", "infra/space/kind/charts/space-data-plane-local"))
+deploy_yaml(helm_release("space", "infra/space/kind/charts/space-data-plane-local"))
 # localhost:8090 is the host port mapping onto space-data-plane-entry, as for
 # the API above.
 k8s_resource(
@@ -729,7 +772,7 @@ k8s_resource(
 
 # The cluster-controller materializes per-sandbox pods under the
 # KubernetesSubstrate and hosts the cluster-singleton reconcilers.
-k8s_yaml(helm_release("space", "infra/space/kind/charts/space-cluster-controller-local"))
+deploy_yaml(helm_release("space", "infra/space/kind/charts/space-cluster-controller-local"))
 k8s_resource(
     "space-cluster-controller",
     labels = ["control-plane"],
@@ -738,14 +781,14 @@ k8s_resource(
 # Kind-only fake EC2 endpoint: the cluster-controller reconcile-queue GC's
 # DescribeInstances, answered from the cluster's Nodes. Its leaf comes from
 # internal-rpc-tls.
-k8s_yaml(helm_release("space", "infra/space/kind/charts/space-kind-fake-ec2"))
+deploy_yaml(helm_release("space", "infra/space/kind/charts/space-kind-fake-ec2"))
 k8s_resource(
     "space-kind-fake-ec2",
     labels = ["control-plane"],
     resource_deps = ["label-kind-infra", "internal-rpc-tls"],
 )
 
-k8s_yaml(helm_release("space", "infra/space/kind/charts/space-ui-local"))
+deploy_yaml(helm_release("space", "infra/space/kind/charts/space-ui-local"))
 k8s_resource(
     "space-ui",
     port_forwards = ["3000:3000"],
@@ -764,7 +807,7 @@ k8s_resource(
 # exchange's OIDC provider and vend role through the IAM API. Both are public
 # registry images the kind nodes pull directly, so no `kind load` step is
 # needed.
-k8s_yaml(helm_release("space", "infra/space/kind/charts/space-object-store"))
+deploy_yaml(helm_release("space", "infra/space/kind/charts/space-object-store"))
 k8s_resource(
     "space-object-store",
     port_forwards = ["8333:8333"],  # S3 API
@@ -785,7 +828,7 @@ k8s_resource(
 # Kind-only STS bridge: the authority's AssumeRole in front of the store's IAM
 # service, and the token issuer that service trusts. Its STS listener's leaf
 # comes from internal-rpc-tls.
-k8s_yaml(helm_release("space", "infra/space/kind/charts/space-kind-sts-bridge"))
+deploy_yaml(helm_release("space", "infra/space/kind/charts/space-kind-sts-bridge"))
 k8s_resource(
     "space-kind-sts-bridge",
     labels = ["data"],
@@ -796,7 +839,7 @@ k8s_resource(
 # admission + per-client concurrency), which space-api, space-admin-api and
 # space-cluster-controller reach through SPACE_REDIS_URL. Public docker.io image
 # pulled directly by the kind nodes (no `kind load`). space-api waits for it.
-k8s_yaml(helm_release("space", "infra/space/kind/charts/space-redis-local"))
+deploy_yaml(helm_release("space", "infra/space/kind/charts/space-redis-local"))
 k8s_resource(
     "space-redis",
     labels = ["data"],
@@ -808,8 +851,10 @@ k8s_resource(
 # build-manager — mirroring production's per-service DaemonSets. Each service
 # tolerates peers that are not ready yet and restarts on its own, so nothing
 # here orders them; they wait only for the node layer and the bootstrap
-# resources their pods mount. A chart's values-builder.yaml carries its builder
-# overrides.
+# resources their pods mount, and for label-kind-infra, so that the worker
+# image, which space-internal-api also runs on the infra node, is loaded
+# knowing which node that is. A chart's values-builder.yaml carries its
+# builder overrides.
 # SPACE_LOOP_DEVICE_TARGET sets the loop-device pool node-manager raises each
 # node to once it is up; the node image stages the library's floor of 64 before
 # that. Inherited from the environment so `SPACE_LOOP_DEVICE_TARGET=128 tilt up`
@@ -828,38 +873,75 @@ for line in NODE_RELEASES:
     node_set = CHART_SET + ["node.role={}".format(role)]
     if service == "node-manager" and LOOP_DEVICE_TARGET:
         node_set.append("loopDeviceTarget={}".format(LOOP_DEVICE_TARGET))
-    k8s_yaml(helm(chart, name = release, namespace = NAMESPACE, values = values, set = node_set))
+    deploy_yaml(helm(chart, name = release, namespace = NAMESPACE, values = values, set = node_set))
     k8s_resource(
         "{}-{}".format(release, service),
         labels = ["node-" + role],
-        resource_deps = ["check-kind-node-image", "label-kind-workers", "sandbox-ssh-secret",
-                         "internal-rpc-tls"],
+        resource_deps = ["check-kind-node-image", "label-kind-workers", "label-kind-infra",
+                         "sandbox-ssh-secret", "internal-rpc-tls"],
     )
 
 # Kind-only operator shell on every sandbox worker and builder; the smoke
 # harness's on-node checks run here.
-k8s_yaml(helm("infra/space/kind/charts/space-node-debug", name = "space", namespace = NAMESPACE,
-              set = ["rustBuild=" + RUST_BUILD]))
+deploy_yaml(helm("infra/space/kind/charts/space-node-debug", name = "space", namespace = NAMESPACE,
+                 set = ["rustBuild=" + RUST_BUILD]))
 k8s_resource(
     "space-node-debug",
     labels = ["node-debug"],
-    resource_deps = ["check-kind-node-image", "label-kind-workers"],
+    resource_deps = ["check-kind-node-image", "label-kind-workers", "label-kind-infra"],
 )
 
 # seed publish: uploads the locally built production seed to the object store and
 # registers the release through the real ClusterApi RPCs. Workers then pull
 # it via template-manager prefetch → volume-manager — the production path.
-k8s_yaml(helm_release("space", "infra/space/kind/charts/space-seed-publish"))
+deploy_yaml(helm_release("space", "infra/space/kind/charts/space-seed-publish"))
 k8s_resource(
     "space-seed-publish",
     labels = ["bootstrap"],
     resource_deps = ["space-internal-api", "space-object-store-bucket-init"],
 )
 
+# ── Image delivery ───────────────────────────────────────────────────────────
+#
+# The images declared under "Image builds", each a custom_build whose command
+# ends by putting the build onto the nodes itself (kind-load-image.py), with
+# Tilt's own load step off (disable_push). That step loaded every image into
+# all six nodes, and on Docker's containerd image store kind cannot tell that a
+# node already holds an image (Docker names it by its manifest digest, the
+# node's CRI by its config digest), so every Tilt start copied every image to
+# every node again. The script tags the build `<name>:tilt-<config digest>`,
+# loads it only onto the nodes its pods can schedule onto (POD_PLACEMENT, from
+# the manifests above) that do not already hold that digest, and writes the tag
+# to the file Tilt then deploys it under (outputs_image_ref_to). An unchanged
+# image keeps its tag, so its workloads do not roll. Every checkout on the host
+# builds into the same Docker store, so the build tag carries the shell's pid
+# and a random nonce besides the time: two builds of one image in the same
+# second, from two checkouts, must not share a tag (Tilt runs the command
+# with `sh`, which may have no $RANDOM).
+IMAGE_REF_DIR = "{}/image-refs/{}".format(
+    os.getenv("SPACE_TILT_STATE_DIR", "") or os.getenv("HOME", "") + "/.space-devbox/kind", KIND_CLUSTER)
+for image in IMAGE_BUILDS:
+    name = image["ref"].split(":")[0]
+    ref_file = "{}/{}".format(IMAGE_REF_DIR, name)
+    custom_build(
+        ref = image["ref"],
+        command = " && ".join([
+            "SPACE_BUILD_REF={}:tilt-build-$(date +%s)-$$-$(od -An -N4 -tx4 /dev/urandom | tr -d ' ')".format(name),
+            image["command"],
+            ("python3 infra/space/kind/scripts/kind-load-image.py --cluster {} --image {} " +
+             "--build-ref \"$SPACE_BUILD_REF\" --ref-file '{}'").format(KIND_CLUSTER, name, ref_file),
+        ]),
+        deps = image["deps"],
+        disable_push = True,
+        outputs_image_ref_to = ref_file,
+        env = {"SPACE_KIND_IMAGE_PLACEMENT": str(encode_json(POD_PLACEMENT.get(name, [])))},
+    )
+
 # ── Superseded image prune ───────────────────────────────────────────────────
 #
-# Every build Tilt loads adds a `:tilt-<hash>` tag to each node's containerd
-# store under $SPACE_KIND_DATA_ROOT, which outlives the cluster. Whenever Tilt
+# Every changed build adds a `:tilt-<hash>` tag to the containerd store of each
+# node it is loaded onto, under $SPACE_KIND_DATA_ROOT, which outlives the
+# cluster. Whenever Tilt
 # has nothing pending or in progress and what the cluster deploys has changed,
 # this removes the builds of SPACE's own images that nothing deployed, built or
 # running still names; third-party images are never touched. The rule and its
@@ -877,13 +959,14 @@ if os.getenv("SPACE_KIND_PRUNE_SUPERSEDED_IMAGES", "1") != "0":
     )
 
 # The host's Docker store, where those builds are made, keeps every one of them
-# too: each Tilt build adds a `:tilt-build-<time>` tag (the $EXPECTED_REF the
-# custom_build commands above tag) and Tilt's own `:tilt-<hash>`. Tilt's built-in
-# pruner (docker_prune_settings) cannot remove them, labelled or not: it passes
-# over every image with more than one tag (internal/engine/dockerprune/
-# docker_pruner.go in tilt-dev/tilt). So whenever an update has settled, the
-# same script removes from the host the builds of SPACE's images it would remove
-# from the nodes, except that the build before the current one stays too.
+# too: each Tilt build adds a `:tilt-build-<time>-<nonce>` tag (the
+# $SPACE_BUILD_REF the build commands above tag) and the `:tilt-<hash>` Tilt
+# deploys. Tilt's built-in pruner (docker_prune_settings) cannot remove them,
+# labelled or not: it passes over every image with more than one tag
+# (internal/engine/dockerprune/docker_pruner.go in tilt-dev/tilt). So whenever
+# an update has settled, the same script removes from the host the builds of
+# SPACE's images it would remove from the nodes, except that the build before
+# the current one stays too.
 # SPACE_TILT_PRUNE_HOST_IMAGES=0 leaves the resource out.
 if os.getenv("SPACE_TILT_PRUNE_HOST_IMAGES", "1") != "0":
     local_resource(

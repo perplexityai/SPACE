@@ -3,12 +3,13 @@
 or with --host from the host's Docker store.
 
 Every bring-up loads fresh builds of the images in lib/space-images.sh into
-every node's containerd store, which lives under $SPACE_KIND_DATA_ROOT and
-survives cluster deletion. Nothing removed the old builds: a moved `:local` tag
-leaves the previous image behind untagged, and each Tilt build adds another
-`:tilt-<hash>` tag. `crictl rmi --prune` is no remedy, because it also removes
-every image no container is using at that moment, including the seed-publish
-image between publishes, which Kind cannot pull back.
+the containerd store of each node that runs them, which lives under
+$SPACE_KIND_DATA_ROOT and survives cluster deletion. Nothing removed the old
+builds: a moved `:local` tag leaves the previous image behind untagged, and
+each changed Tilt build adds another `:tilt-<hash>` tag. `crictl rmi --prune`
+is no remedy, because it also removes every image no container is using at
+that moment, including the seed-publish image between publishes, which Kind
+cannot pull back.
 
 An image is removed only when all of these hold:
 
@@ -24,11 +25,11 @@ An image is removed only when all of these hold:
 With --host the same rules select from the host's Docker store, where the
 builds are made, except that each image also keeps its newest build nothing
 current names: the build before the current one. There every Tilt build adds a
-`:tilt-build-<time>` tag and Tilt's own `:tilt-<hash>` (custom_build), and on
-Docker's graph-driver store a rebuilt `:local` leaves the previous build
-untagged. Tilt's docker_prune_settings pruner removes none of them: it passes
-over every image with more than one tag (internal/engine/dockerprune/
-docker_pruner.go in tilt-dev/tilt).
+`:tilt-build-<time>-<nonce>` tag and the `:tilt-<hash>` Tilt deploys
+(custom_build), and on Docker's graph-driver store a rebuilt `:local` leaves
+the previous build untagged. Tilt's docker_prune_settings pruner removes none
+of them: it passes over every image with more than one tag
+(internal/engine/dockerprune/docker_pruner.go in tilt-dev/tilt).
 
 Anything else, third-party images included, is left alone. Pruning is skipped
 while the Tilt serving this cluster has a build pending or in progress, because

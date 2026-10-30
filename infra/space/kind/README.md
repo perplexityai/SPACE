@@ -195,7 +195,45 @@ python3 infra/space/kind/scripts/image-provenance.py check \
 ```
 
 Nothing prunes `provenance/` or `runs/`; their files are a few kilobytes each
-and can be deleted at any time.
+and can be deleted at any time. Neither the prunes nor `teardown.sh` remove
+`image-refs/<cluster>/` either, the references the last build of each image
+handed Tilt ([Image delivery](#image-delivery)), a few bytes per image.
+
+### Image delivery
+
+Each image build ends by putting the image onto the nodes itself, with Tilt's
+own "Loading image to KIND" step turned off: the "Image delivery" section of
+the `Tiltfile` and `scripts/kind-load-image.py`. Tilt's step loaded every image
+into all six nodes, and on Docker's containerd image store `kind load` cannot
+tell that a node already holds an image (Docker names an image by its manifest
+digest, the node's CRI by its config digest), so every Tilt start copied every
+image to every node again, changed or not. Instead each build:
+
+- is tagged `<name>:tilt-<the first 16 hex digits of its config digest>`, the
+  reference Tilt deploys, so an unchanged image keeps its reference and its
+  workloads do not roll;
+- is loaded onto each node a pod running it can schedule onto, except a node
+  whose CRI already holds that reference at that config digest. A digest that
+  cannot be read counts as absent, so a changed image is never skipped.
+
+Where an image's pods can schedule comes from the manifests Tilt deploys:
+every manifest goes through the Tiltfile's `deploy_yaml`, which records the
+`nodeSelector`, required node affinity and `nodeName` of each pod template by
+the images it runs, and a node is a target when it satisfies any of them. In
+the default layout the worker image goes to the sandbox, builder and infra
+nodes, every other SPACE image to the infra node only, and nothing to the
+control plane. The set only errs toward more nodes: taints and tolerations
+are ignored, a label key that no node carries yet (before `label-kind-infra`
+has run) matches every node, and an image with no recorded pod template, or
+a cluster whose node labels cannot be read, gets every node. Nodes keep their
+images when a pod is evicted or a Node object is deleted and registers again,
+so a drained pod rescheduled within its pool finds its image. A node that
+gains a matching label later gets the image at the image's next build. Pods
+SPACE creates at runtime are not in these manifests and get no image from this
+step; today they all run `registry.k8s.io/pause`.
+
+The load is the last step of each build in Tilt's log, its lines prefixed
+`[kind-load]`, ending with how many nodes it loaded and how long it took.
 
 ## Template publication authentication
 
@@ -483,8 +521,9 @@ and starts Tilt, which labels nodes, installs the local observability backends
 when the `otel` profile is selected, installs the containerd shim on the
 sandbox workers, applies the `space` and `sandboxes` Namespaces +
 `RuntimeClass` and the sandbox namespace's NetworkPolicies, builds every image
-and loads it into the nodes (first run is the long step; the incremental build
-reuses its target dir and the Docker build is cargo-chef-cached after that),
+and loads it into the nodes that run it (first run is the long step; the
+incremental build reuses its target dir and the Docker build is
+cargo-chef-cached after that),
 and applies every chart rendered with `helm template`. `up.sh` waits for all
 of that, then verifies the Datadog Agent when a Datadog backend is selected.
 
@@ -659,6 +698,8 @@ default; `SPACE_BOOTSTRAP_TIMEOUT` for `up.sh`) for that initialization, while s
 An exited Tilt process or failed evaluation ends the wait early with a log
 tail. Detached bring-up also waits for this initialization, but not application
 builds or rollouts; the timeout is per stage, not a whole-bring-up deadline.
+Kind CI runs `install-observability.sh` in a step of its own while the Rust
+producer builds, so Tilt's evaluation finds each release unchanged.
 
 Before installing, `install-observability.sh` loads each backend image onto
 every node at the linux/amd64 digest `ci/mirrored-images.txt` lists for the
@@ -1173,11 +1214,12 @@ effect.
 
 ### Diagnosing iteration disk pressure
 
-Every build loads its images into each Kind node's containerd store, which
-lives under `$SPACE_KIND_DATA_ROOT` and survives `kind delete cluster`. A
-rebuilt `:local` image leaves its previous build behind untagged, and every
-Tilt build adds another `:tilt-<hash>` tag, so unpruned stores keep every
-image of every build on all six nodes. A full store reports image extraction
+Every build loads its images into the containerd store of each Kind node
+that can run them ([Image delivery](#image-delivery)), which lives under
+`$SPACE_KIND_DATA_ROOT` and survives `kind delete cluster`. A rebuilt
+`:local` image leaves its previous build behind untagged, and every changed
+build adds another `:tilt-<hash>` tag, so unpruned stores keep every image of
+every build on each node that runs it. A full store reports image extraction
 or build failures while the host root filesystem may still have space.
 
 The bring-up therefore removes superseded builds itself: the Tilt resource
@@ -1206,17 +1248,18 @@ are never touched. `--dry-run` lists what it would remove;
 `SPACE_KIND_PRUNE_SUPERSEDED_IMAGES=0` turns it off.
 
 The host's Docker store, where the images are built, keeps old builds too.
-Every Tilt build of an image adds two tags to it: `:tilt-build-<time>`, the
-`$EXPECTED_REF` the Tiltfile's `custom_build` commands tag, and Tilt's own
-`:tilt-<hash>`. Tilt's built-in pruner (`docker_prune_settings`) never removes
-these builds, whatever their labels, because it passes over every image with
-more than one tag. On Docker's graph-driver store, a rebuilt `:local` image
-also leaves its previous build behind untagged; the containerd image store
-drops it. So the same script runs with `--host`: as the Tilt resource
-`prune-host-images` whenever an update has settled. It applies the rules above to the host's images, with any
-container on the host holding an image, and also keeps each image's newest
-build that nothing current names, so the build before the current one stays.
-`SPACE_TILT_PRUNE_HOST_IMAGES=0` turns it off.
+Every Tilt build of an image adds two tags to it: `:tilt-build-<time>-<nonce>`,
+the `$SPACE_BUILD_REF` the Tiltfile's build commands tag, and the
+`:tilt-<hash>` Tilt deploys. Tilt's built-in pruner (`docker_prune_settings`)
+never removes these builds, whatever their labels, because it passes over every
+image with more than one tag. On Docker's graph-driver store, a rebuilt
+`:local` image also leaves its previous build behind untagged; the containerd
+image store drops it. So the same script runs with `--host`: as the Tilt
+resource `prune-host-images` whenever an update has settled. It applies the
+rules above to the host's images, with any container on the host holding an
+image, and also keeps each image's newest build that nothing current names, so
+the build before the current one stays. `SPACE_TILT_PRUNE_HOST_IMAGES=0` turns
+it off.
 
 Do not run `crictl rmi --prune` in a node instead. It removes every image no
 container is using at that moment, which includes SPACE images Kind cannot pull

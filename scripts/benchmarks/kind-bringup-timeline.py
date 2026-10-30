@@ -338,9 +338,20 @@ MARKERS = [
     ("rust.durations", r"\[rust-artifacts\] (builder image|cargo build|runtime-supervisor build|assembly|lock acquired)"),
     ("seed", r"\[build-seed\]"),
     ("docker-build", r"^#\d+ (\[|DONE|CACHED)"),
-    ("kind-load", r"not yet present on node|kind load docker-image|Loading image"),
+    ("kind-load", r"not yet present on node|kind load docker-image|Loading image|\[kind-load\]"),
     ("tilt.step", r"STEP \d+/\d+"),
 ]
+# Image loads: Tilt's own push step ("Loading image to KIND"), timed by its
+# build summary, and the load a custom_build runs itself
+# (infra/space/kind/scripts/kind-load-image.py), timed by its last line. A
+# build that loads itself still opens Tilt's push step, which skips at once.
+# Tilt reprints a build's log, so a line seen twice is counted once: a load by
+# the build reference its last line names (each build's is its own), Tilt's
+# push step, which names none, by its text.
+PUSH_START = re.compile(r"STEP (\d+)/\d+ — Pushing (\S+)")
+PUSH_DONE = re.compile(r"Step (\d+) - ([\d.]+)s \(Pushing (\S+)\)")
+OWN_LOAD = re.compile(
+    r"\[kind-load\] (\S+): on (\d+) of (\d+) nodes, (\d+) loaded, in ([\d.]+) s(?: \(build (\S+)\))?")
 # Tilt pads the resource column and truncates long names with an ellipsis.
 LINE = re.compile(r"^(\S+) (?:\s*([A-Za-z0-9][\w.…-]*)\s+│ )?(.*)$")
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
@@ -479,6 +490,10 @@ def cmd_report(args) -> int:
         marks: dict[tuple[str, str], list[float]] = {}
         durations = []
         seen: set[tuple[str, str]] = set()
+        load_lines: set = set()
+        push_started: dict[tuple[str, str], float] = {}
+        last_push: dict[str, tuple[str, str]] = {}
+        loads: list[tuple[float, float, str, str, str]] = []
         for raw in stamped.read_text(errors="replace").splitlines():
             m = LINE.match(ANSI.sub("", raw))
             if not m:
@@ -495,6 +510,26 @@ def cmd_report(args) -> int:
             if "[rust-artifacts]" in text and re.search(r"\d+s\)?$", text) and key not in seen:
                 seen.add(key)
                 durations.append(f"{fmt(ts, t0)} {res[:24]:24} {text.strip()[:110]}")
+            if lm := OWN_LOAD.search(text):
+                build = lm.group(6) or key
+                if build not in load_lines:
+                    load_lines.add(build)
+                    seconds = float(lm.group(5))
+                    loads.append((ts - seconds, seconds, lm.group(1), "own load",
+                                  f"{lm.group(4)} loaded, on {lm.group(2)} of {lm.group(3)} nodes"))
+                continue
+            if key in load_lines:
+                continue
+            load_lines.add(key)
+            if pm := PUSH_START.search(text):
+                push_started[(pm.group(2), pm.group(1))] = ts
+                last_push[res] = (pm.group(2), pm.group(1))
+            elif "Skipping push" in text and res in last_push:
+                push_started.pop(last_push.pop(res), None)
+            elif pm := PUSH_DONE.search(text):
+                start = push_started.pop((pm.group(3), pm.group(1)), None)
+                if start is not None:
+                    loads.append((start, float(pm.group(2)), pm.group(3), "tilt push", ""))
         for (res, phase), stamps in sorted(marks.items(), key=lambda kv: kv[1][0]):
             last = stamps[-1] if phase.endswith("finished") or phase == "kind-load" else stamps[0]
             extra = f" … {fmt(stamps[-1], t0).strip()} (x{len(stamps)})" if len(stamps) > 1 else ""
@@ -503,6 +538,13 @@ def cmd_report(args) -> int:
         if durations:
             p("\n== Rust artifact phase durations (as the build reported them)")
             lines.extend(durations)
+        if loads:
+            p("\n== Image loads (Tilt's push step, or the build's own load)")
+            p(f"{'image':58} {'start':>7} {'end':>7} {'secs':>7}  how")
+            for start, seconds, ref, how, detail in sorted(loads):
+                p(f"{ref[:58]:58} {fmt(start, t0)} {fmt(start + seconds, t0)} {seconds:7.1f}  "
+                  f"{how}{', ' + detail if detail else ''}")
+            p(f"total load seconds: {sum(load[1] for load in loads):.1f} over {len(loads)} loads")
 
     # Stamped command output (`cmd | kind-bringup-timeline.py stamp > OUT/<name>.log`):
     # the bring-up's own progress lines, relative to t0.
