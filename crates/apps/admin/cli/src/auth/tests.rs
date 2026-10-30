@@ -94,6 +94,9 @@ fn credentials_require_a_secure_origin() {
         "https://api.example.com/path",
         "https://user:password@api.example.com",
         "http://api.example.com",
+        "http://126.255.255.255:8081",
+        "http://128.0.0.1:8081",
+        "http://[::ffff:192.0.2.1]:8081",
         "https://api.example.com?token=secret",
         "https://api.example.com#fragment",
     ] {
@@ -102,7 +105,10 @@ fn credentials_require_a_secure_origin() {
     for value in [
         "https://api.example.com",
         "http://127.0.0.1:8081",
+        "http://127.0.0.2:8081",
+        "http://127.23.45.67:8081",
         "http://[::1]:8081",
+        "http://[::ffff:127.0.0.1]:8081",
     ] {
         assert!(origin(value).is_ok(), "{value}");
     }
