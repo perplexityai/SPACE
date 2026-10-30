@@ -109,6 +109,60 @@ Requesting a delete cancels the sandbox's create if that create is still queued 
 
 A Native create can answer `202` before its execution records the sandbox. A `DELETE /v1/sandboxes/{sandbox_id}` in that window is accepted while the create is queued or running, for a caller who could see that create's operation: it answers with a delete operation, as for a sandbox already `creating`, and cancels or waits for the create as described above. A create that succeeds records the sandbox before it is marked succeeded, so a delete that races it still finds the sandbox. A create that fails, expires, or is canceled by an earlier delete can end without recording the sandbox, and a delete with a new `Idempotency-Key` then answers `404`. Every other Native request naming the sandbox, such as `GET /v1/sandboxes/{sandbox_id}`, answers `404` until the sandbox is recorded; poll the create operation instead.
 
+### Inline-durable execution
+
+Native lifecycle operations are durable records in PostgreSQL. By default the
+cluster controller's dispatcher claims and runs each one: it runs on the
+elected leader only, with a bounded number of execution slots and a
+per-organization slot limit. With inline execution on, the API process that
+admits a cold create, a `:wake`, `:resume` or `:start`, or the wake a command,
+process session or attach queues, can claim and run that operation itself, in
+the same transaction that records it. It does so only when:
+
+- the env master `SPACE_NATIVE_INLINE_OPERATIONS_ENABLED` is on, the kind is in
+  `SPACE_NATIVE_INLINE_KINDS`, and the `space-native-inline-operations` flag
+  allows the organization;
+- the process has one of its `SPACE_NATIVE_INLINE_MAX_CONCURRENT` permits free
+  and is not draining;
+- nothing else for the sandbox is queued or running;
+- the organization is under `SPACE_NATIVE_INLINE_ORG_LIMIT`.
+
+Anything else records the operation queued exactly as before, for the
+dispatcher. [`configuration.md`](configuration.md) describes each setting.
+A create that wins an admission-time warm-pool claim runs inline under its
+own switch, `SPACE_NATIVE_CREATE_INLINE_ENABLED`, not these.
+
+The master goes on only once every API process, on every surface, takes the
+per-sandbox queue lock below, and off before the dispatcher's keyed claim:
+the admission claim is sound only while both hold.
+
+The record, the claim and the execution are the dispatcher's. The API runs the
+same executors through the same driver, so claim renewal, retry deferral and
+the operation deadline behave the same, and every retry is requeued for the
+dispatcher. If the API process dies mid-execution, its claim stops being
+renewed. After the claim staleness window (60 s) the dispatcher claims the
+same operation again, so nothing is lost, though that operation finishes later
+than a queued one would have. A graceful API shutdown waits for running inline
+work within its drain budget and queues new work meanwhile.
+
+Inline claims keep one execution per sandbox, in request order:
+
+- Every insert for a sandbox takes a per-sandbox queue lock until it commits.
+  So the admission's check that nothing else is pending sees everything
+  inserted before it. A later insert commits only after the claim, and the
+  dispatcher's claim then sees that claim live and holds the later operation
+  back.
+- A caller's `:wake` joins a system wake only while that wake is still queued.
+  Behind one the API is already running, the `:wake` is queued and completes as
+  already done.
+
+Two limits are counted separately. The organization limit counts the
+organization's live inline claims and is soft: admissions that commit at the
+same moment can pass it by up to their number less one. The dispatcher's
+per-organization slot limit does not count inline claims, and the inline limit
+does not count dispatcher claims. Suspend, pause, stop, delete and kill always
+run on the dispatcher.
+
 In Kind, sandbox pods run in their own namespace, `sandboxes`, apart from the control plane in `space`. NetworkPolicies there admit only the API and cluster controller, on the port they dial, and limit sandbox egress to the public IPv4 internet and cluster DNS; the [Kind harness README](../infra/space/kind/README.md#sandbox-namespace-and-network-policy) lists each rule's source.
 
 ## Lifecycle and persistence

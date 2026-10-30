@@ -147,6 +147,13 @@ spec:
             # plaintext sandboxes exactly as before.
             - name: SPACE_BYOK_VOLUME_ENCRYPTION
               value: {{ .Values.byokVolumeEncryption | quote }}
+            # Inline execution of creates and wakes; see `inlineOperations`
+            # in values.yaml. It runs the controller's executors, under the
+            # BYOK switch above and the route-signing key below.
+            - name: SPACE_NATIVE_INLINE_OPERATIONS_ENABLED
+              value: {{ .Values.inlineOperations.enabled | quote }}
+            - name: SPACE_NATIVE_INLINE_KINDS
+              value: {{ .Values.inlineOperations.kinds | quote }}
             # The admin BYOK-enable gate must agree with the credential-manager
             # authority's platform KEK provider, which provisions a keyless
             # org's key lazily (space-credmgr-authority-local).
