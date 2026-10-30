@@ -4,7 +4,7 @@ use super::*;
 use crate::{config::ArchitectureConfig, rules};
 
 /// `file_size`, two `pattern_ratchet` instances, `crate_names` and
-/// `layers`, every behaviour advisory: a table of every registered rule with
+/// `layers` with its state checks, every behaviour advisory: a table of every registered rule with
 /// a baseline.
 fn config() -> ArchitectureConfig {
     let behaviours = |table: &str| -> String {
@@ -55,6 +55,13 @@ fn config() -> ArchitectureConfig {
         "store_edges",
         "stale_entries",
         "policy_changed",
+        "state.owners",
+        "state.declarations",
+        "state.writes",
+        "state.pending",
+        "unowned.no_crossing",
+        "unowned.no_new_entries",
+        "unowned.stale_entries",
     ]
     .iter()
     .map(|behaviour| format!("[rules.layers.{behaviour}]\nmode = \"advisory\"\n"))

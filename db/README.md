@@ -42,6 +42,13 @@ Generate the version prefix with:
 date -u +%Y%m%d%H%M%S
 ```
 
+A new table needs an owner: the store that writes it declares it in its
+`Cargo.toml` (`[package.metadata.space.state]`) before the migration that
+creates it lands, and `cargo arch` checks it. The shared catalogs, such as
+`db/common`, and the databases they are applied to are listed in
+`[rules.layers.state.shared_catalogs]` in `ARCHITECTURE.toml`. See
+[State ownership](../crates/tools/archcheck/README.md#state-ownership).
+
 ## Migration runners
 
 Each database's `up` command runs its embedded SQLx migrations. Applied files

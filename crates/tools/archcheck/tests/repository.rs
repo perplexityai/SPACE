@@ -127,6 +127,15 @@ fn ratchet_findings(
         .and_then(toml::Value::as_table_mut)
         .expect("ARCHITECTURE.toml has [rules]")
         .remove("dependency_fence");
+    // The state checks' shared catalogs are directories it does not have.
+    if let Some(layers) = config
+        .get_mut("rules")
+        .and_then(|rules| rules.get_mut("layers"))
+        .and_then(toml::Value::as_table_mut)
+    {
+        layers.remove("state");
+        layers.remove("unowned");
+    }
 
     let dir = tempfile::tempdir().expect("create a temporary workspace");
     let member = src.trim_end_matches("/src");
