@@ -19,6 +19,7 @@ from typing import Any, cast
 
 from space_smoke.adapters import (
     CLEANUP_REQUEST_SECONDS,
+    LEASE_TTL_ENV,
     LIVENESS_BUDGET_ENV,
     KindConfig,
     KindHarness,
@@ -187,7 +188,9 @@ class CleanupRestoreTests(unittest.TestCase):
             [command[5:7] for command in commands],
             [("get", "lease"), ("get", "lease"), ("set", "env")],
         )
+        # One write puts the budget back and removes the TTL hook with it.
         self.assertIn(f"{LIVENESS_BUDGET_ENV}-", commands[-1])
+        self.assertIn(f"{LEASE_TTL_ENV}-", commands[-1])
         self.assertTrue(
             all(bound is not None and bound <= CLEANUP_REQUEST_SECONDS for _, bound in executor.calls)
         )
