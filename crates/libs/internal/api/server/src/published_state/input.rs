@@ -104,3 +104,20 @@ impl PublishedSandboxRow {
         }
     }
 }
+
+#[derive(serde::Serialize)]
+pub(super) struct PublishedRestoreRow<'a> {
+    sandbox_id: SandboxId,
+    status: Option<&'a str>,
+    transition_receipt_kind: Option<&'static str>,
+}
+
+impl PublishedSandboxRow {
+    pub(super) fn restore_projection(&self) -> PublishedRestoreRow<'_> {
+        PublishedRestoreRow {
+            sandbox_id: self.sandbox_id,
+            status: self.status.as_deref(),
+            transition_receipt_kind: self.transition_receipt_kind,
+        }
+    }
+}

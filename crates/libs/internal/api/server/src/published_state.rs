@@ -2334,47 +2334,7 @@ pub async fn publish_sandbox_states(
         .filter(|row| row.assigned_to_node && row.first_seen)
         .map(|row| row.sandbox_id)
         .collect::<Vec<_>>();
-    // Publishing `started` proves the node-local runtime finished, but for
-    // Kubernetes sandboxes the control plane also needs a routable active
-    // execution row. The blocking wake/restore path is what hydrates that row
-    // with `running` + pod IP; if it timed out first, keep the row in
-    // `restoring` so the next connect can wait on and hydrate the in-flight
-    // pod instead of treating it as a started sandbox with a broken execution.
-    // Evacuation-marked rows are owned by the node-drain redrive (the same
-    // exemption the sweeper makes) and are left alone.
-    let routable_execution =
-        pplx_space_common_svc::sql::sandbox_routability::routable_execution_or_non_k8s("s", "$4");
-    let restored_convergence_query = format!(
-        "WITH input AS (
-             SELECT *
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 sandbox_id UUID,
-                 status TEXT,
-                 transition_receipt_kind TEXT
-             )
-         )
-         UPDATE sandboxes s
-         SET lifecycle = 'started'
-         FROM input
-         WHERE s.id = input.sandbox_id
-           AND s.active_node_id = $1
-           AND s.evacuation_restore_target IS NULL
-           AND LOWER(TRIM(input.status)) = 'started'
-           AND input.transition_receipt_kind IS DISTINCT FROM $3
-           AND LOWER(TRIM(s.lifecycle)) = 'restoring'
-           AND {routable_execution}
-         RETURNING s.id"
-    );
-    let restored_ids = sqlx::query_scalar::<_, SandboxId>(sqlx::AssertSqlSafe(sql!(
-        restored_convergence_query.as_str()
-    )))
-    .bind(node_id)
-    .bind(rows_json.clone())
-    .bind(SandboxTransitionReceiptKind::ActivationCompleted.as_str())
-    .bind(SubstrateKind::Kubernetes)
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(|err| Status::internal(format!("converge restored sandbox lifecycle: {err}")))?;
+    let restored_ids = converge_restored_sandboxes(conn, node_id, &rows).await?;
     emit_lifecycle_convergence_events(
         node_id,
         &restored_ids,
@@ -2416,34 +2376,7 @@ pub async fn publish_sandbox_states(
         },
     ));
 
-    let stopped_ids = sqlx::query_scalar::<_, SandboxId>(sql!(
-        "WITH input AS (
-             SELECT *
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 sandbox_id UUID,
-                 status TEXT
-             )
-         )
-         UPDATE sandboxes s
-         SET lifecycle = 'stopped'
-         FROM input
-         WHERE s.id = input.sandbox_id
-           AND s.active_node_id = $1
-           AND LOWER(TRIM(input.status)) = 'stopped'
-           AND LOWER(TRIM(s.lifecycle)) IN (
-               'started',
-               'paused',
-               'suspended',
-               'stopping',
-               'restoring'
-           )
-         RETURNING s.id"
-    ))
-    .bind(node_id)
-    .bind(rows_json.clone())
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(|err| Status::internal(format!("promote stopped sandbox lifecycle: {err}")))?;
+    let stopped_ids = converge_stopped_sandboxes(conn, node_id, &rows).await?;
     emit_lifecycle_convergence_events(
         node_id,
         &stopped_ids,
@@ -2452,8 +2385,7 @@ pub async fn publish_sandbox_states(
         "stopped",
     );
 
-    let failed_sandboxes =
-        project_node_published_failed_sandboxes(conn, node_id, rows_json.clone()).await?;
+    let failed_sandboxes = converge_failed_sandboxes(conn, node_id, &rows).await?;
     emit_node_published_state_events(
         node_id,
         &failed_sandboxes,
@@ -4021,6 +3953,138 @@ async fn update_activity_timestamps(
     .await
     .map_err(|err| Status::internal(format!("update sandbox last_used_at from publish: {err}")))?;
     Ok(())
+}
+
+async fn converge_restored_sandboxes(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    rows: &[PublishedSandboxRow],
+) -> Result<Vec<SandboxId>, Status> {
+    // Publishing `started` proves the node-local runtime finished, but for
+    // Kubernetes sandboxes the control plane also needs a routable active
+    // execution row. The blocking wake/restore path is what hydrates that row
+    // with `running` + pod IP; if it timed out first, keep the row in
+    // `restoring` so the next connect can wait on and hydrate the in-flight
+    // pod instead of treating it as a started sandbox with a broken execution.
+    // Evacuation-marked rows are owned by the node-drain redrive (the same
+    // exemption the sweeper makes) and are left alone.
+    let routable_execution =
+        pplx_space_common_svc::sql::sandbox_routability::routable_execution_or_non_k8s("s", "$4");
+    let restored_convergence_query = format!(
+        "WITH input AS (
+             SELECT *
+             FROM jsonb_to_recordset($2::jsonb) AS input(
+                 sandbox_id UUID,
+                 status TEXT,
+                 transition_receipt_kind TEXT
+             )
+         )
+         UPDATE sandboxes s
+         SET lifecycle = 'started'
+         FROM input
+         WHERE s.id = input.sandbox_id
+           AND s.active_node_id = $1
+           AND s.evacuation_restore_target IS NULL
+           AND LOWER(TRIM(input.status)) = 'started'
+           AND input.transition_receipt_kind IS DISTINCT FROM $3
+           AND LOWER(TRIM(s.lifecycle)) = 'restoring'
+           AND {routable_execution}
+         RETURNING s.id"
+    );
+    let restored_rows = rows
+        .iter()
+        .filter(|row| {
+            row.may_report_lifecycle(SandboxLifecycle::Started)
+                && row.transition_receipt_kind
+                    != Some(SandboxTransitionReceiptKind::ActivationCompleted.as_str())
+        })
+        .map(PublishedSandboxRow::restore_projection)
+        .collect::<Vec<_>>();
+    let restored_ids = if restored_rows.is_empty() {
+        Vec::new()
+    } else {
+        let restored_rows = Json(serde_json::to_value(restored_rows).map_err(|error| {
+            Status::internal(format!("serialize restored publication rows: {error}"))
+        })?);
+        sqlx::query_scalar::<_, SandboxId>(sqlx::AssertSqlSafe(sql!(
+            restored_convergence_query.as_str()
+        )))
+        .bind(node_id)
+        .bind(restored_rows)
+        .bind(SandboxTransitionReceiptKind::ActivationCompleted.as_str())
+        .bind(SubstrateKind::Kubernetes)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|err| Status::internal(format!("converge restored sandbox lifecycle: {err}")))?
+    };
+    Ok(restored_ids)
+}
+
+async fn converge_stopped_sandboxes(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    rows: &[PublishedSandboxRow],
+) -> Result<Vec<SandboxId>, Status> {
+    let stopped_rows = rows
+        .iter()
+        .filter(|row| row.may_report_lifecycle(SandboxLifecycle::Stopped))
+        .map(PublishedSandboxRow::lifecycle_projection)
+        .collect::<Vec<_>>();
+    let stopped_ids = if stopped_rows.is_empty() {
+        Vec::new()
+    } else {
+        let stopped_rows = Json(serde_json::to_value(stopped_rows).map_err(|error| {
+            Status::internal(format!("serialize stopped publication rows: {error}"))
+        })?);
+        sqlx::query_scalar::<_, SandboxId>(sql!(
+            "WITH input AS (
+             SELECT *
+             FROM jsonb_to_recordset($2::jsonb) AS input(
+                 sandbox_id UUID,
+                 status TEXT
+             )
+         )
+         UPDATE sandboxes s
+         SET lifecycle = 'stopped'
+         FROM input
+         WHERE s.id = input.sandbox_id
+           AND s.active_node_id = $1
+           AND LOWER(TRIM(input.status)) = 'stopped'
+           AND LOWER(TRIM(s.lifecycle)) IN (
+               'started',
+               'paused',
+               'suspended',
+               'stopping',
+               'restoring'
+           )
+         RETURNING s.id"
+        ))
+        .bind(node_id)
+        .bind(stopped_rows)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|err| Status::internal(format!("promote stopped sandbox lifecycle: {err}")))?
+    };
+    Ok(stopped_ids)
+}
+
+async fn converge_failed_sandboxes(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    rows: &[PublishedSandboxRow],
+) -> Result<Vec<(SandboxId, String)>, Status> {
+    let failed_rows = rows
+        .iter()
+        .filter(|row| row.may_report_lifecycle(SandboxLifecycle::Failed))
+        .map(PublishedSandboxRow::lifecycle_projection)
+        .collect::<Vec<_>>();
+    if failed_rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows_json = Json(serde_json::to_value(failed_rows).map_err(|error| {
+        Status::internal(format!("serialize failed publication rows: {error}"))
+    })?);
+    project_node_published_failed_sandboxes(conn, node_id, rows_json).await
 }
 
 #[cfg(test)]
