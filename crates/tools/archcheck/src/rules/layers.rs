@@ -19,6 +19,9 @@
 //!   clients.
 //! - `store_edges`: an API or Storage crate depends on a store only if the
 //!   store lists it as a user.
+//! - `storage_access` and `codec_features`: only stores and storage helpers
+//!   depend on a database or object storage driver, or turn on another
+//!   crate's driver feature; each with a baseline table ([`storage`]).
 //! - `stale_entries` and `policy_changed`: entries of `[rules.layers]` that
 //!   no longer apply, and every change to it from the base branch's copy,
 //!   including its removal.
@@ -28,6 +31,7 @@
 
 mod graph;
 mod policy;
+mod storage;
 #[cfg(test)]
 mod tests;
 
@@ -38,8 +42,10 @@ use graph::{
     production_problem, used_items,
 };
 
+use storage::{CODEC_FEATURES, STORAGE_ACCESS, Storage};
+
 use crate::{
-    baseline::{BASELINE_FILE, BaseBaseline, BaseSkip, Baseline, EdgeTable},
+    baseline::{BASELINE_FILE, BaseBaseline, BaseLayersTable, BaseSkip, Baseline, EdgeTable},
     config::{
         BaseArchitecture, BehaviourConfig, CONFIG_FILE, EdgeBehaviours, Layer, LayersConfig, Mode,
         RulesConfig,
@@ -63,19 +69,35 @@ impl Layers {
             .map(|check| format!("{RULE}.{check}"))
             .collect()
     }
+
+    /// [`Self::table_names`] for a sentence: `a, b and c`.
+    pub fn table_list() -> String {
+        and_list(&Self::table_names())
+    }
 }
 
 const RULE: &str = Layers::NAME;
 const DIRECTION: &str = "direction";
 const DEV_DIRECTION: &str = "dev_direction";
 /// The checks with a baseline table, `[layers.<check>]`.
-const CHECKS: [&str; 2] = [DIRECTION, DEV_DIRECTION];
+const CHECKS: [&str; 4] = [DIRECTION, DEV_DIRECTION, STORAGE_ACCESS, CODEC_FEATURES];
 /// Where a finding sends the reader for what belongs in each layer.
 const GUIDE: &str = "crates/tools/archcheck/README.md#layers";
 /// What the comparisons with the base branch's `ARCHITECTURE.toml` are, for
 /// skip lines.
 const POLICY_COMPARISONS: &str =
     "layers.policy_changed and layers.placement's check for new unmoved entries";
+
+/// A violation a baselined check's table lists as `(from, to)`.
+#[derive(Clone)]
+struct Crossing {
+    /// The manifest line that declares it, where its finding is shown.
+    location: Location,
+    /// The finding's text after the path.
+    detail: String,
+    /// The edge for a `not added` line, such as `a (l40_api) -> sqlx`.
+    summary: String,
+}
 
 /// An edge with a problem, and the finding's text after the path.
 struct Violation<'a> {
@@ -139,23 +161,55 @@ impl<'a> Verdicts<'a> {
             .any(|violation| violation.problem == problem && violation.edge.key() == *key)
     }
 
-    /// The violations a baselined check's table lists, by `(from, to)`.
-    fn of(&self, check: &str) -> BTreeMap<(String, String), &Violation<'a>> {
-        let problem = problem_of(check);
+    /// The violations `problem`'s baselined check lists, by `(from, to)`.
+    fn of(&self, problem: Problem) -> BTreeMap<(String, String), Crossing> {
         self.violations
             .iter()
             .filter(|violation| violation.problem == problem)
-            .map(|violation| (violation.edge.key(), violation))
+            .map(|violation| {
+                let (from_layer, to_layer) = layers_of(&violation.edge);
+                let crossing = Crossing {
+                    location: Location {
+                        path: violation.edge.from.krate.manifest(),
+                        line: violation.edge.dependency.line,
+                    },
+                    detail: violation.detail.clone(),
+                    summary: format!(
+                        "{} ({from_layer}) -> {} ({to_layer})",
+                        violation.edge.from.name(),
+                        violation.edge.to.name()
+                    ),
+                };
+                (violation.edge.key(), crossing)
+            })
             .collect()
     }
 }
 
-/// The problem a baselined check reports.
-fn problem_of(check: &str) -> Problem {
-    if check == DEV_DIRECTION {
-        Problem::DevDirection
-    } else {
-        Problem::Direction
+/// Every check's verdicts.
+struct Checked<'a> {
+    graph: &'a Graph<'a>,
+    verdicts: Verdicts<'a>,
+    storage: Storage<'a>,
+}
+
+impl<'a> Checked<'a> {
+    fn new(ctx: &Context, config: &LayersConfig, graph: &'a Graph<'a>) -> Self {
+        Self {
+            graph,
+            verdicts: Verdicts::new(ctx, config, graph),
+            storage: Storage::new(ctx, config, graph),
+        }
+    }
+
+    /// The violations a baselined check's table lists, by `(from, to)`.
+    fn crossings(&self, check: &str) -> BTreeMap<(String, String), Crossing> {
+        match check {
+            DIRECTION => self.verdicts.of(Problem::Direction),
+            DEV_DIRECTION => self.verdicts.of(Problem::DevDirection),
+            STORAGE_ACCESS => self.storage.access.clone(),
+            _ => self.storage.codecs.clone(),
+        }
     }
 }
 
@@ -167,10 +221,11 @@ impl Rule for Layers {
         let graph = Graph::new(ctx, config);
         let mut findings = placement(ctx, config, &graph);
         findings.extend(layout(config, &graph));
-        let verdicts = Verdicts::new(ctx, config, &graph);
+        let checked = Checked::new(ctx, config, &graph);
         for check in CHECKS {
-            findings.extend(baselined(ctx, config, &graph, &verdicts, check));
+            findings.extend(baselined(ctx, config, &checked, check));
         }
+        let verdicts = &checked.verdicts;
         for (problem, behaviour, mode) in [
             (Problem::TestOnly, "test_only", config.test_only.mode),
             (Problem::Clients, "clients", config.clients.mode),
@@ -184,7 +239,13 @@ impl Rule for Layers {
                     .map(|violation| edge_finding(None, behaviour, mode, violation)),
             );
         }
-        findings.extend(policy::stale_entries(ctx, config, &graph, &verdicts));
+        findings.extend(policy::stale_entries(ctx, config, &graph, verdicts));
+        findings.extend(storage::stale_entries(
+            ctx,
+            config,
+            &graph,
+            &checked.storage,
+        ));
         findings.extend(policy::policy_changed(ctx, config, &graph));
         findings
     }
@@ -260,32 +321,37 @@ impl Rule for Layers {
             return Vec::new();
         };
         let graph = Graph::new(ctx, config);
-        let verdicts = Verdicts::new(ctx, config, &graph);
+        let checked = Checked::new(ctx, config, &graph);
         let mut not_added = Vec::new();
         for check in CHECKS {
             let existing = ctx.baseline.layers.get(check);
             let mut table = EdgeTable::default();
-            for ((from, to), violation) in verdicts.of(check) {
+            for ((from, to), crossing) in checked.crossings(check) {
                 if existing.is_some_and(|existing| existing.contains(&from, &to)) {
                     table.insert(&from, &to);
                     continue;
                 }
-                let (from_layer, to_layer) = layers_of(&violation.edge);
-                let exception = if check == DEV_DIRECTION {
-                    format!("{RULE}.{DEV_DIRECTION} has no exceptions")
-                } else {
-                    format!(
+                let exception = match check {
+                    DIRECTION => format!(
                         "a reviewed, permanent exception goes in [rules.{RULE}] allowed_edges in \
                          {CONFIG_FILE}, which {RULE}.policy_changed reports"
-                    )
+                    ),
+                    DEV_DIRECTION => format!("{RULE}.{DEV_DIRECTION} has no exceptions"),
+                    _ => format!(
+                        "a crate that has to reach storage for good becomes a store or a storage \
+                         helper; listing one in [rules.{RULE}.storage] helpers is a policy change, \
+                         which {RULE}.policy_changed reports, and a helper derived from a required \
+                         driver dependency is reviewed in the manifest diff"
+                    ),
                 };
                 not_added.push(NotAdded {
                     table: format!("{RULE}.{check}"),
                     entry: None,
                     line: format!(
-                        "not added: {from} ({from_layer}) -> {to} ({to_layer}) in \
-                         [{RULE}.{check}]; fix the dependency (cargo arch says how): an entry \
-                         added by hand fails {RULE}.{check}.no_new_entries, and {exception}"
+                        "not added: {} in [{RULE}.{check}]; fix the dependency (cargo arch says \
+                         how): an entry added by hand fails {RULE}.{check}.no_new_entries, and \
+                         {exception}",
+                        crossing.summary
                     ),
                 });
             }
@@ -295,13 +361,21 @@ impl Rule for Layers {
     }
 }
 
-/// `layers.direction.no_new_entries and layers.dev_direction.no_new_entries`.
+/// `layers.direction.no_new_entries, …, and layers.codec_features.no_new_entries`.
 fn comparisons() -> String {
-    CHECKS
+    let all: Vec<String> = CHECKS
         .iter()
         .map(|check| format!("{RULE}.{check}.no_new_entries"))
-        .collect::<Vec<_>>()
-        .join(" and ")
+        .collect();
+    and_list(&all)
+}
+
+/// `items` for a sentence: `a`, `a and b`, or `a, b and c`.
+fn and_list(items: &[String]) -> String {
+    match items.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        _ => items.join(""),
+    }
 }
 
 /// Whether the base branch's `ARCHITECTURE.toml` has `[rules.layers]`;
@@ -506,7 +580,8 @@ fn edge_finding(
 #[derive(Clone, Copy)]
 enum BaseEdges<'a> {
     Compare(&'a BTreeMap<String, BTreeSet<String>>),
-    /// The base branch has no layers rule yet: every entry seeds the table.
+    /// The base branch has no layers rule, or no such check, yet: every
+    /// entry seeds the table.
     Seeding,
     /// The comparison is skipped, with a skip line.
     Skipped,
@@ -514,41 +589,67 @@ enum BaseEdges<'a> {
 
 fn base_edges<'a>(ctx: &'a Context, check: &str) -> BaseEdges<'a> {
     static NONE: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    match ctx.base_baseline.layers_table(check) {
-        Err(_) => BaseEdges::Skipped,
-        Ok(Some(table)) => BaseEdges::Compare(table),
-        // A base with the rule but without its tables tolerates nothing.
-        Ok(None) if rule_on_base(ctx) == Some(true) => BaseEdges::Compare(&NONE),
-        Ok(None) => BaseEdges::Seeding,
+    let table = match ctx.base_baseline.layers_table(check) {
+        Err(_) => return BaseEdges::Skipped,
+        Ok(BaseLayersTable::Table(table)) => return BaseEdges::Compare(table),
+        Ok(table) => table,
+    };
+    // A base with the check but without its table tolerates nothing; one
+    // without the check, or the rule, is seeded. Without the base's
+    // ARCHITECTURE.toml, a `[layers]` key in its baseline stands for the
+    // rule.
+    match (check_on_base(ctx, check), table) {
+        (Some(true), _) | (None, BaseLayersTable::Missing) => BaseEdges::Compare(&NONE),
+        _ => BaseEdges::Seeding,
     }
+}
+
+/// Whether the base branch's `[rules.layers]` configures `check`; `None`
+/// when that copy was not given. A copy whose table can't be read has the
+/// rule, as for [`rule_on_base`], and is taken to have the check.
+fn check_on_base(ctx: &Context, check: &str) -> Option<bool> {
+    let BaseArchitecture::Loaded(base) = &ctx.base_architecture else {
+        return None;
+    };
+    let Ok(base) = &base.layers else {
+        return Some(true);
+    };
+    let prefix = format!("{check}.");
+    Some(base.as_ref().is_some_and(|policy| {
+        policy
+            .modes
+            .keys()
+            .any(|behaviour| behaviour.starts_with(&prefix))
+    }))
 }
 
 /// `no_crossing`, `no_new_entries` and `stale_entries` of `check`.
 fn baselined(
     ctx: &Context,
     config: &LayersConfig,
-    graph: &Graph<'_>,
-    verdicts: &Verdicts<'_>,
+    checked: &Checked<'_>,
     check: &'static str,
 ) -> Vec<Finding> {
-    let behaviours: &EdgeBehaviours = if check == DEV_DIRECTION {
-        &config.dev_direction
-    } else {
-        &config.direction
+    let behaviours: &EdgeBehaviours = match check {
+        DIRECTION => &config.direction,
+        DEV_DIRECTION => &config.dev_direction,
+        STORAGE_ACCESS => &config.storage_access,
+        _ => &config.codec_features,
     };
     static EMPTY: EdgeTable = EdgeTable::new();
     let table = ctx.baseline.layers.get(check).unwrap_or(&EMPTY);
-    let violations = verdicts.of(check);
-    let mut findings: Vec<Finding> = violations
+    let crossings = checked.crossings(check);
+    let mut findings: Vec<Finding> = crossings
         .iter()
         .filter(|((from, to), _)| !table.contains(from, to))
-        .map(|(_, violation)| {
-            edge_finding(
-                Some(check),
-                "no_crossing",
-                behaviours.no_crossing.mode,
-                violation,
-            )
+        .map(|(_, crossing)| Finding {
+            rule: RULE,
+            instance: Some(check.to_owned()),
+            behaviour: "no_crossing",
+            path: crossing.location.path.clone(),
+            detail: crossing.detail.clone(),
+            mode: behaviours.no_crossing.mode,
+            location: crossing.location.clone(),
         })
         .collect();
     let entry =
@@ -565,6 +666,11 @@ fn baselined(
             },
         };
     let base = base_edges(ctx, check);
+    let seeded = if rule_on_base(ctx) == Some(true) {
+        format!("the base branch's layers rule has no {check} check yet")
+    } else {
+        "the base branch has no layers rule yet".to_owned()
+    };
     for (from, to) in table.iter() {
         let listed = format!("[{RULE}.{check}] in {BASELINE_FILE}");
         match base {
@@ -588,45 +694,23 @@ fn baselined(
                 from,
                 to,
                 format!(
-                    ": is in {listed}, and the base branch has no layers rule yet, so this pull \
-                     request seeds the table. Review each entry."
+                    ": is in {listed}, and {seeded}, so this pull request seeds the table. \
+                     Review each entry."
                 ),
             )),
             BaseEdges::Compare(_) | BaseEdges::Skipped => {}
         }
     }
-    let edges = if check == DEV_DIRECTION {
-        &verdicts.dev
-    } else {
-        &verdicts.production
-    };
     for (from, to) in table.iter() {
         let key = (from.to_owned(), to.to_owned());
-        if violations.contains_key(&key) {
+        if crossings.contains_key(&key) {
             continue;
         }
-        let reason = match (graph.member(from), graph.member(to)) {
-            (None, _) => format!("no workspace member is named {from}"),
-            (_, None) => format!("no workspace member is named {to}"),
-            (Some(member), _) | (_, Some(member)) if member.layer.is_none() => format!(
-                "{} has no layer, so no layers check sees the edge (see its {RULE}.placement \
-                 finding)",
-                member.name()
-            ),
-            _ if check == DEV_DIRECTION && verdicts.production.contains(&key) => format!(
-                "{from}'s dev-dependency on {to} duplicates a normal or build one, which \
-                 [{RULE}.{DIRECTION}] covers"
-            ),
-            _ if !edges.contains(&key) => format!(
-                "{from} has no {} on {to}",
-                if check == DEV_DIRECTION {
-                    "dev-dependency"
-                } else {
-                    "normal or build dependency"
-                }
-            ),
-            _ => "the layer order allows that edge now, or another layers check reports it"
-                .to_owned(),
+        let reason = match check {
+            DIRECTION | DEV_DIRECTION => edge_stale_reason(checked, check, &key),
+            _ => checked
+                .storage
+                .stale_reason(config, checked.graph, check, from, to),
         };
         findings.push(entry(
             "stale_entries",
@@ -640,6 +724,40 @@ fn baselined(
         ));
     }
     findings
+}
+
+/// Why `(from, to)` in the table of `direction` or `dev_direction` is no
+/// violation.
+fn edge_stale_reason(checked: &Checked<'_>, check: &str, key: &(String, String)) -> String {
+    let (graph, verdicts) = (checked.graph, &checked.verdicts);
+    let (from, to) = (key.0.as_str(), key.1.as_str());
+    let edges = if check == DEV_DIRECTION {
+        &verdicts.dev
+    } else {
+        &verdicts.production
+    };
+    match (graph.member(from), graph.member(to)) {
+        (None, _) => format!("no workspace member is named {from}"),
+        (_, None) => format!("no workspace member is named {to}"),
+        (Some(member), _) | (_, Some(member)) if member.layer.is_none() => format!(
+            "{} has no layer, so no layers check sees the edge (see its {RULE}.placement \
+             finding)",
+            member.name()
+        ),
+        _ if check == DEV_DIRECTION && verdicts.production.contains(key) => format!(
+            "{from}'s dev-dependency on {to} duplicates a normal or build one, which \
+             [{RULE}.{DIRECTION}] covers"
+        ),
+        _ if !edges.contains(key) => format!(
+            "{from} has no {} on {to}",
+            if check == DEV_DIRECTION {
+                "dev-dependency"
+            } else {
+                "normal or build dependency"
+            }
+        ),
+        _ => "the layer order allows that edge now, or another layers check reports it".to_owned(),
+    }
 }
 
 /// The finding text for an edge with `problem`, after the path: the edge,
