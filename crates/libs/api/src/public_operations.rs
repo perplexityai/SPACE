@@ -678,6 +678,40 @@ impl PublicOperationStore {
         .await
     }
 
+    /// [`Self::create_or_join_active_sandbox_wake`], except that a wake it
+    /// creates is also claimed in the same transaction, for the caller to
+    /// execute, when nothing else for the sandbox is queued or running (see
+    /// [`PublicOperationAdmission::create_claimed_if_sole_active`]). A joined
+    /// wake is never claimed: whoever created it, or the dispatcher, runs it.
+    pub async fn create_or_join_active_sandbox_wake_claimed_if_sole_active(
+        &self,
+        org_id: OrgId,
+        target_id: &str,
+        payload_json: serde_json::Value,
+        traceparent: Option<String>,
+    ) -> Result<CreateInlinePublicOperationResult, PublicOperationStoreError> {
+        let (result, claimed) = self
+            .create_or_join_active_sandbox_operation_tx(
+                org_id,
+                OperationKind::WakeSandbox,
+                target_id,
+                payload_json,
+                traceparent,
+                true,
+            )
+            .await?;
+        Ok(match (result, claimed) {
+            (_, Some((claim_token, operation))) => CreateInlinePublicOperationResult::Claimed {
+                claim_token,
+                operation,
+            },
+            (CreatePublicOperationResult::Created(operation_id), None) => {
+                CreateInlinePublicOperationResult::Queued(operation_id)
+            }
+            (result, None) => CreateInlinePublicOperationResult::NotCreated(result),
+        })
+    }
+
     /// The system's (actorless) operation of `kind` on a sandbox, joining one
     /// already queued or running. The lock key includes the kind, so a delete
     /// and a wake for one sandbox never serialize on each other here; the
@@ -690,6 +724,37 @@ impl PublicOperationStore {
         payload_json: serde_json::Value,
         traceparent: Option<String>,
     ) -> Result<CreatePublicOperationResult, PublicOperationStoreError> {
+        let (result, _) = self
+            .create_or_join_active_sandbox_operation_tx(
+                org_id,
+                kind,
+                target_id,
+                payload_json,
+                traceparent,
+                false,
+            )
+            .await?;
+        Ok(result)
+    }
+
+    /// [`Self::create_or_join_active_sandbox_operation`]; with
+    /// `claim_if_sole_active`, an operation it creates is also claimed when
+    /// nothing else for the sandbox is active.
+    async fn create_or_join_active_sandbox_operation_tx(
+        &self,
+        org_id: OrgId,
+        kind: OperationKind,
+        target_id: &str,
+        payload_json: serde_json::Value,
+        traceparent: Option<String>,
+        claim_if_sole_active: bool,
+    ) -> Result<
+        (
+            CreatePublicOperationResult,
+            Option<(String, ClaimedPublicOperation)>,
+        ),
+        PublicOperationStoreError,
+    > {
         let mut tx = self.pool.begin().await?;
         lock_active_sandbox_operation(&mut tx, org_id, kind, target_id).await?;
         let existing = if kind == OperationKind::DeleteSandbox {
@@ -716,8 +781,9 @@ impl PublicOperationStore {
         };
         if let Some(operation_id) = existing {
             tx.commit().await?;
-            return Ok(CreatePublicOperationResult::Existing(
-                OperationId::from_uuid(operation_id),
+            return Ok((
+                CreatePublicOperationResult::Existing(OperationId::from_uuid(operation_id)),
+                None,
             ));
         }
         let (result, superseded) = create_operation_tx(
@@ -737,6 +803,12 @@ impl PublicOperationStore {
             },
         )
         .await?;
+        let claimed = match result {
+            CreatePublicOperationResult::Created(operation_id) if claim_if_sole_active => {
+                claim_created_if_sole_active_tx(&mut tx, org_id, target_id, operation_id).await?
+            }
+            _ => None,
+        };
         tx.commit().await?;
         superseded.record();
         if matches!(result, CreatePublicOperationResult::Created(_)) {
@@ -746,7 +818,7 @@ impl PublicOperationStore {
                 OperationTargetType::Sandbox.as_str(),
             );
         }
-        Ok(result)
+        Ok((result, claimed))
     }
 
     pub async fn begin_operation_admission(
@@ -1121,6 +1193,69 @@ async fn claim_created_operation_tx(
     Ok((claim_token, operation))
 }
 
+/// [`claim_created_operation_tx`] for `operation_id`, an operation of the
+/// sandbox `target_id` this transaction just created, only if nothing else
+/// for the sandbox is queued (due or not) or running (under a live claim or
+/// a stale one). Otherwise it stays queued for the dispatcher, behind them.
+///
+/// Its insert holds the sandbox's queue lock until this transaction commits,
+/// so what this statement reads is all there is for the sandbox: an insert
+/// committed earlier is visible, and a later one waits for the lock. Rows
+/// leave queued or running only for a terminal state, which never reverts.
+/// So when nothing else is active here, the dispatcher has nothing on the
+/// sandbox it could claim beside this one, and any of its claims that sees a
+/// later operation for the sandbox also sees this claim live and holds that
+/// operation back. Forks are not in the sandbox's queue.
+async fn claim_created_if_sole_active_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    org_id: OrgId,
+    target_id: &str,
+    operation_id: OperationId,
+) -> Result<Option<(String, ClaimedPublicOperation)>, PublicOperationStoreError> {
+    let others_active = sqlx::query_scalar::<_, bool>(sql!(
+        "SELECT EXISTS (
+             SELECT 1
+               FROM public_operations
+              WHERE org_id = $1
+                AND target_type = $2
+                AND target_id = $3
+                AND kind <> $4
+                AND state IN ($5, $6)
+                AND operation_id <> $7
+         )"
+    ))
+    .bind(org_id)
+    .bind(OperationTargetType::Sandbox.as_str())
+    .bind(target_id)
+    .bind(OperationKind::ForkSandbox.as_str())
+    .bind(OperationState::Queued.as_str())
+    .bind(OperationState::Running.as_str())
+    .bind(operation_id.as_uuid())
+    .fetch_one(&mut **tx)
+    .await?;
+    if others_active {
+        return Ok(None);
+    }
+    Ok(Some(claim_created_operation_tx(tx, operation_id).await?))
+}
+
+/// What [`PublicOperationAdmission::create_claimed_if_sole_active`] recorded.
+#[derive(Debug, Clone)]
+pub enum CreateInlinePublicOperationResult {
+    /// Created and claimed, with an admission claim token: the caller owns
+    /// this attempt and must record its outcome under `claim_token`. If the
+    /// caller dies, the claim goes stale and the dispatcher re-drives it.
+    Claimed {
+        claim_token: String,
+        operation: ClaimedPublicOperation,
+    },
+    /// Created and left queued for the dispatcher, because other work for
+    /// its sandbox is queued or running.
+    Queued(OperationId),
+    /// Nothing was created: a replay, a key conflict or an admission denial.
+    NotCreated(CreatePublicOperationResult),
+}
+
 pub struct PublicOperationAdmission {
     tx: Transaction<'static, Postgres>,
     observation: ObservePublicOperationIdempotency,
@@ -1200,6 +1335,57 @@ impl PublicOperationAdmission {
             );
         }
         Ok(result)
+    }
+
+    /// [`Self::create`], except that a newly created sandbox operation is
+    /// also claimed in the same transaction, for the caller to execute
+    /// inline, when nothing else for its sandbox is queued or running.
+    /// Anything else is recorded as [`Self::create`] records it: queued for
+    /// the dispatcher, or not at all for a replay or a conflict.
+    ///
+    /// The claim takes an admission claim token, which the dispatcher's
+    /// per-organization slot limit does not count.
+    pub async fn create_claimed_if_sole_active(
+        mut self,
+        input: CreatePublicOperation<'_>,
+    ) -> Result<CreateInlinePublicOperationResult, PublicOperationStoreError> {
+        let api_product = input.api_product;
+        let kind = input.kind;
+        let target_type = input.target_type.clone();
+        let org_id = input.org_id;
+        let queue = sandbox_queue_target(&input);
+        let (created, superseded) = create_operation_tx(&mut self.tx, input).await?;
+        let operation_id = match created {
+            CreatePublicOperationResult::Created(operation_id) => operation_id,
+            other => {
+                self.tx.commit().await?;
+                return Ok(CreateInlinePublicOperationResult::NotCreated(other));
+            }
+        };
+        let claimed = match queue {
+            Some(target_id) => {
+                claim_created_if_sole_active_tx(&mut self.tx, org_id, target_id, operation_id)
+                    .await?
+            }
+            None => None,
+        };
+        self.tx.commit().await?;
+        superseded.record();
+        pplx_space_metrics::operations::created(
+            api_product.as_str(),
+            kind.as_str(),
+            target_type
+                .as_ref()
+                .map(OperationTargetType::as_str)
+                .unwrap_or("none"),
+        );
+        Ok(match claimed {
+            Some((claim_token, operation)) => CreateInlinePublicOperationResult::Claimed {
+                claim_token,
+                operation,
+            },
+            None => CreateInlinePublicOperationResult::Queued(operation_id),
+        })
     }
 
     /// [`Self::create`] for a caller's `:wake`, except that it joins a wake
