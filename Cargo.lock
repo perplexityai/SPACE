@@ -7336,6 +7336,7 @@ dependencies = [
 name = "pplx-space-spaced-guest-execution"
 version = "0.8.0"
 dependencies = [
+ "aws-lc-rs",
  "dashmap",
  "futures-util",
  "globset",

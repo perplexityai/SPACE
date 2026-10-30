@@ -35,6 +35,7 @@ fn readiness_discovery_preserves_instance_and_filters_unsupported_guarantees() {
                 "process_output_gap_resume".into(),
                 "future_capability".into(),
             ],
+            ..Default::default()
         }),
     ] {
         let expected = info.clone().map(|mut info| {

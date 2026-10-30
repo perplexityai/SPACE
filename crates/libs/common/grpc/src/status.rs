@@ -106,6 +106,7 @@ pub fn is_terminal_guest_process_error(status: &Status) -> bool {
 pub enum GuestCapability {
     InteractiveProcessControl,
     ProcessOutputGapResume,
+    ProcessRecoveryStart,
 }
 
 impl GuestCapability {
@@ -113,6 +114,7 @@ impl GuestCapability {
         match self {
             Self::InteractiveProcessControl => "interactive_process_control",
             Self::ProcessOutputGapResume => "process_output_gap_resume",
+            Self::ProcessRecoveryStart => "process_recovery_start",
         }
     }
 }
@@ -130,6 +132,7 @@ impl std::str::FromStr for GuestCapability {
         Ok(match value {
             "interactive_process_control" => Self::InteractiveProcessControl,
             "process_output_gap_resume" => Self::ProcessOutputGapResume,
+            "process_recovery_start" => Self::ProcessRecoveryStart,
             _ => {
                 return Err(GuestCapabilityParseError {
                     value: value.to_owned(),

@@ -22,6 +22,7 @@ async fn run_exec_stream(
         .spaced_start_process(SpacedStartProcessRequest {
             sandbox_id: sandbox_id.to_string(),
             operation: Some(pplx_space_sbx_mgr_client::operations::StartRequest {
+                recovery: None,
                 command,
                 cwd: None,
                 env: HashMap::default(),

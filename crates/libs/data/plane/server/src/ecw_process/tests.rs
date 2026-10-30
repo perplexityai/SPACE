@@ -39,7 +39,10 @@ fn started_process_event(process_id: &ProcessId) -> SpacedProcessEvent {
         process_id: process_id.to_string(),
         pid: Some(123),
         event: Some(spaced_ops::process_event::Event::Started(
-            spaced_ops::ProcessStarted { start_time: None },
+            spaced_ops::ProcessStarted {
+                start_time: None,
+                ..Default::default()
+            },
         )),
     }
 }

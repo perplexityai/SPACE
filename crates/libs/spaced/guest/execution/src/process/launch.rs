@@ -130,6 +130,7 @@ impl ProcessSupervision {
 /// tracked owner task runs it, so it completes even if the request goes away.
 pub(super) struct ProcessLaunch {
     pub(super) command: Command,
+    pub(super) recovery_launch: Option<RecoveryLaunch>,
     pub(super) prepared_pty: Option<PreparedPty>,
     pub(super) stdin_enabled: bool,
     /// What `list` reports; the pid is filled in once the child exists.
@@ -213,6 +214,7 @@ impl SpawnThread {
 
 /// A published process: what its start answers with, and its supervision.
 pub(super) struct LaunchedProcess {
+    pub(super) recovery_incarnation: Option<ProcessRecoveryToken>,
     pub(super) pid: u32,
     pub(super) started: ProcessEvent,
     pub(super) cursor: ProcessJournalCursor,
@@ -223,21 +225,30 @@ impl ProcessLaunch {
     /// Publish the process and settle the start's idempotent operation with
     /// the outcome, so a same-key retry replays it.
     pub(super) async fn run(
-        self,
+        mut self,
         operation: IdempotencyOperation,
     ) -> Result<LaunchedProcess, Status> {
         let process_id = self.process_id.clone();
-        let launched = self.publish().await;
+        let recovery_launch = self.recovery_launch.take();
+        let launched = self.publish(recovery_launch.is_some()).await;
         operation.complete(match &launched {
-            Ok(_) => Ok(IdempotencyRecord::ProcessStarted { process_id }),
+            Ok(launched) => Ok(match launched.recovery_incarnation {
+                Some(incarnation) => IdempotencyRecord::RecoveryProcessStarted {
+                    process_id,
+                    incarnation,
+                },
+                None => IdempotencyRecord::ProcessStarted { process_id },
+            }),
             Err(status) => Err(status.clone()),
         });
+        drop(recovery_launch);
         launched
     }
 
-    pub(super) async fn publish(self) -> Result<LaunchedProcess, Status> {
+    pub(super) async fn publish(self, recovery_start: bool) -> Result<LaunchedProcess, Status> {
         let ProcessLaunch {
             command,
+            recovery_launch: _,
             prepared_pty,
             stdin_enabled,
             mut info,
@@ -326,13 +337,24 @@ impl ProcessLaunch {
                 return Err(map_io_error(error));
             }
         };
-        let started = match process_started_event(&process_id, Some(pid)) {
+        let mut started = match process_started_event(&process_id, Some(pid)) {
             Ok(started) => started,
             Err(status) => {
                 terminate_and_reap_failed_start(child, process_reservation, &inner.process_tasks);
                 return Err(status);
             }
         };
+        let recovery_incarnation = recovery_start.then(ProcessRecoveryToken::new);
+        if let Some(incarnation) = recovery_incarnation
+            && let Some(
+                pplx_space_spaced_guest_protocol::proto::operations::process_event::Event::Started(
+                    event,
+                ),
+            ) = started.event.as_mut()
+        {
+            event.instance_id = Some(inner.recovery.instance.to_string());
+            event.process_incarnation = Some(incarnation.to_string());
+        }
         info.pid = pid;
         let record = Arc::new(ProcessRecord::new(
             started.clone(),
@@ -395,6 +417,7 @@ impl ProcessLaunch {
             registry: inner.processes.clone(),
         };
         Ok(LaunchedProcess {
+            recovery_incarnation,
             pid,
             started,
             cursor,

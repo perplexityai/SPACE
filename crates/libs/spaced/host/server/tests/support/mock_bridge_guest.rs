@@ -399,6 +399,7 @@ impl Process for MockBridgeGuest {
                     pplx_space_spaced_common::proto::bridge_guest::process_event::Event::Started(
                         pplx_space_spaced_common::proto::bridge_guest::ProcessStarted {
                             start_time: Some(timestamp_from_millis(1_000)),
+                            ..Default::default()
                         },
                     ),
                 ),
