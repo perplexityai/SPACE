@@ -27,7 +27,10 @@ fn single_claim_config() -> ReconcilerConfig {
         enabled: true,
         claim_limit: 1,
         execution_concurrency: 1,
-        max_retry_attempts: 1,
+        execution: OperationExecutionConfig {
+            max_retry_attempts: 1,
+            ..OperationExecutionConfig::default()
+        },
         ..ReconcilerConfig::default()
     }
 }
@@ -73,10 +76,16 @@ fn config_defaults_enabled() {
     assert_eq!(config.tick, DEFAULT_TICK);
     assert_eq!(config.claim_limit, DEFAULT_CLAIM_LIMIT);
     assert_eq!(config.execution_concurrency, DEFAULT_EXECUTION_CONCURRENCY);
-    assert_eq!(config.claim_stale_after, DEFAULT_CLAIM_STALE_AFTER);
-    assert_eq!(config.retry_after, DEFAULT_RETRY_AFTER);
-    assert_eq!(config.max_retry_attempts, DEFAULT_MAX_RETRY_ATTEMPTS);
-    assert_eq!(config.m1_max_age, Some(DEFAULT_M1_MAX_AGE));
+    assert_eq!(
+        config.execution.claim_stale_after,
+        DEFAULT_CLAIM_STALE_AFTER
+    );
+    assert_eq!(config.execution.retry_after, DEFAULT_RETRY_AFTER);
+    assert_eq!(
+        config.execution.max_retry_attempts,
+        DEFAULT_MAX_RETRY_ATTEMPTS
+    );
+    assert_eq!(config.execution.m1_max_age, Some(DEFAULT_M1_MAX_AGE));
 }
 
 #[test]
@@ -97,11 +106,18 @@ fn tick_defaults_to_25ms_and_the_test_override_takes_whole_seconds() {
 fn m1_max_age_env_defaults_and_zero_disables() {
     let mut env = pplx_space_test_env::TestEnv::default();
     assert_eq!(
-        ReconcilerConfig::from_environment(&env).m1_max_age,
+        ReconcilerConfig::from_environment(&env)
+            .execution
+            .m1_max_age,
         Some(Duration::from_secs(1_800))
     );
     env.set(M1_MAX_AGE_ENV, "0");
-    assert_eq!(ReconcilerConfig::from_environment(&env).m1_max_age, None);
+    assert_eq!(
+        ReconcilerConfig::from_environment(&env)
+            .execution
+            .m1_max_age,
+        None
+    );
 }
 
 // This crate's tests build with `test-hooks` on (a dev-dependency feature), so
@@ -298,7 +314,10 @@ async fn delete_execution_renews_claim_while_a_phase_is_blocked() -> TestResult 
     let started = Arc::clone(&executor.started);
     let release = Arc::clone(&executor.release);
     let config = ReconcilerConfig {
-        claim_stale_after: Duration::from_secs(1),
+        execution: OperationExecutionConfig {
+            claim_stale_after: Duration::from_secs(1),
+            ..single_claim_config().execution
+        },
         ..single_claim_config()
     };
     let tick_task = tokio::spawn({
@@ -701,7 +720,10 @@ async fn backdated_fork_and_admin_operations_remain_outside_m1_deadline() -> Tes
     let config = ReconcilerConfig {
         claim_limit: 2,
         execution_concurrency: 2,
-        max_retry_attempts: 10,
+        execution: OperationExecutionConfig {
+            max_retry_attempts: 10,
+            ..single_claim_config().execution
+        },
         ..single_claim_config()
     };
     let executor = FixedExecutor::requeue(
@@ -992,8 +1014,11 @@ async fn assert_deadline_failure(
     )
     .await?;
     let config = ReconcilerConfig {
-        max_retry_attempts: 10,
-        m1_max_age: Some(m1_max_age),
+        execution: OperationExecutionConfig {
+            max_retry_attempts: 10,
+            m1_max_age: Some(m1_max_age),
+            ..single_claim_config().execution
+        },
         ..single_claim_config()
     };
 

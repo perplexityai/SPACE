@@ -594,7 +594,10 @@ async fn kill_switch_restores_the_unkeyed_claim() -> TestResult {
     let config = ReconcilerConfig {
         keyed_claim_enabled: false,
         claim_limit: 8,
-        max_retry_attempts: 4,
+        execution: OperationExecutionConfig {
+            max_retry_attempts: 4,
+            ..single_claim_config().execution
+        },
         ..single_claim_config()
     };
 
@@ -737,7 +740,7 @@ async fn a_reclaim_of_a_locally_running_operation_waits_for_its_next_renewal() -
     };
     // Handed back until the running execution's next renewal notices it
     // lost the claim, not re-claimed every second until then.
-    let renewal = config.claim_stale_after / 3;
+    let renewal = config.execution.claim_stale_after / 3;
     assert!(
         (delay_secs - renewal.as_secs_f64()).abs() < 0.5,
         "handed back for {delay_secs}s, renewal is {renewal:?}"
@@ -997,7 +1000,10 @@ async fn a_create_mid_attempt_when_a_delete_arrives_ends_canceled_instead_of_ret
     let config = ReconcilerConfig {
         claim_limit: 8,
         execution_concurrency: 8,
-        max_retry_attempts: 10,
+        execution: OperationExecutionConfig {
+            max_retry_attempts: 10,
+            ..single_claim_config().execution
+        },
         ..single_claim_config()
     };
 

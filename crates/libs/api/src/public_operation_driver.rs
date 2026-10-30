@@ -129,6 +129,9 @@ pub fn execution_span(operation: &ClaimedPublicOperation) -> tracing::Span {
 }
 
 /// Test-hook override of [`DEFAULT_CLAIM_STALE_AFTER`], in whole seconds.
+/// A claimer judges staleness by its own value, so set it on `space-api` and
+/// `space-cluster-controller` alike, or the dispatcher can steal an inline
+/// execution that is still renewing.
 pub const CLAIM_STALE_SECS_ENV: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_CLAIM_STALE_SECS";
 /// Test-hook override of [`DEFAULT_M1_MAX_AGE`], in whole seconds; `0` turns
 /// the deadline off.

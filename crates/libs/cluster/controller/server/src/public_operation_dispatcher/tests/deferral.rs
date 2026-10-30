@@ -70,7 +70,10 @@ impl PublicOperationExecutor for FencedRestoreExecutor {
 fn deferral_config() -> ReconcilerConfig {
     ReconcilerConfig {
         // One counted attempt: any requeue that spent one would fail.
-        max_retry_attempts: 1,
+        execution: OperationExecutionConfig {
+            max_retry_attempts: 1,
+            ..single_claim_config().execution
+        },
         ..single_claim_config()
     }
 }
@@ -168,6 +171,7 @@ async fn a_deferred_operation_past_its_window_fails_with_its_existing_error() ->
     let executor = FencedRestoreExecutor::default();
     let config = deferral_config();
     let max_age = config
+        .execution
         .m1_max_age
         .expect("default config has an age deadline");
     let window = pplx_space_api::public_operation_driver::DEFERRED_RETRY_WINDOW;
@@ -245,6 +249,7 @@ async fn a_carried_error_joins_the_evidence_of_either_failure() -> TestResult {
     executor.carry_error.store(true, Ordering::SeqCst);
     let config = deferral_config();
     let max_age = config
+        .execution
         .m1_max_age
         .expect("default config has an age deadline");
     let window = pplx_space_api::public_operation_driver::DEFERRED_RETRY_WINDOW;
@@ -378,9 +383,12 @@ async fn each_switch_turns_off_only_its_own_mechanism() -> TestResult {
         let executor = FencedRestoreExecutor::default();
         let config = ReconcilerConfig {
             keyed_claim_enabled,
-            retry_deferral_enabled,
             claim_limit: 8,
-            max_retry_attempts: 4,
+            execution: OperationExecutionConfig {
+                defer_retry_waits: retry_deferral_enabled,
+                max_retry_attempts: 4,
+                ..single_claim_config().execution
+            },
             ..single_claim_config()
         };
 
@@ -436,7 +444,10 @@ async fn the_run_loop_reads_the_deferral_switch() -> TestResult {
         let shutdown = CancellationToken::new();
         let dispatcher = tokio::spawn(run(
             ReconcilerConfig {
-                retry_deferral_enabled,
+                execution: OperationExecutionConfig {
+                    defer_retry_waits: retry_deferral_enabled,
+                    ..fast_loop_config(1).execution
+                },
                 ..fast_loop_config(1)
             },
             store.clone(),
@@ -469,10 +480,10 @@ async fn the_run_loop_reads_the_deferral_switch() -> TestResult {
 fn retry_deferral_switch_reads_from_env() {
     let mut env = pplx_space_test_env::TestEnv::default();
     let config = ReconcilerConfig::from_environment(&env);
-    assert!(config.retry_deferral_enabled);
+    assert!(config.execution.defer_retry_waits);
     env.set(RETRY_DEFERRAL_ENABLED_ENV, "false");
     let config = ReconcilerConfig::from_environment(&env);
-    assert!(!config.retry_deferral_enabled);
+    assert!(!config.execution.defer_retry_waits);
     assert!(config.keyed_claim_enabled, "the switches are independent");
 }
 
@@ -535,7 +546,10 @@ async fn a_native_delete_waits_out_an_upload_without_spending_attempts() -> Test
         let (operation_id, sandbox_id, snapshot_id) =
             native_delete_behind_an_upload(&db.pool, &store).await?;
         let config = ReconcilerConfig {
-            retry_deferral_enabled,
+            execution: OperationExecutionConfig {
+                defer_retry_waits: retry_deferral_enabled,
+                ..deferral_config().execution
+            },
             ..deferral_config()
         };
         for age_secs in (0..=300).step_by(60) {
@@ -590,6 +604,7 @@ async fn a_native_delete_at_its_deadline_names_the_upload() -> TestResult {
     let executor = direct_native_executor(&db.pool, false, None, EgressProfiles::default());
     let config = deferral_config();
     let max_age = config
+        .execution
         .m1_max_age
         .expect("default config has an age deadline");
 
