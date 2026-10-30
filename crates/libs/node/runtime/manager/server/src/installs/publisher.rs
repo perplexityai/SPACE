@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pplx_space_common_core::types::{Digest, RuntimeIdentity};
+use pplx_space_common_core::types::{ComponentIdentity, Digest, RuntimeIdentity};
 use pplx_space_node_mgr_client::proto as node;
 use pplx_space_node_runtime_core::artifact_store::StagedName;
 use pplx_space_node_runtime_core::catalog::{CatalogError, RuntimeCatalog};
@@ -29,6 +29,7 @@ const PUBLISHER_TIMEOUT: Duration = Duration::from_secs(120);
 pub(crate) enum NodeArtifactRef {
     Release(RuntimeIdentity, Digest),
     Kernel(KernelVersion, Digest),
+    Boot(ComponentIdentity),
 }
 
 /// A kernel or release in the node's store.
@@ -105,6 +106,14 @@ impl NodeManagerPublisher {
 
 fn node_artifact(artifact: &NodeArtifactRef) -> node::NodeArtifact {
     let artifact = match artifact {
+        NodeArtifactRef::Boot(identity) => {
+            node::node_artifact::Artifact::Component(node::ComponentArtifact {
+                kind: pplx_space_execution_common::proto::ArtifactComponentKind::from(identity.kind)
+                    as i32,
+                version: identity.version.to_string(),
+                digest: identity.digest.to_string(),
+            })
+        }
         NodeArtifactRef::Release(release, digest) => {
             node::node_artifact::Artifact::RuntimeRelease(node::RuntimeReleaseArtifact {
                 runtime_kind: pplx_space_execution_common::proto::RuntimeKind::from(release.kind)

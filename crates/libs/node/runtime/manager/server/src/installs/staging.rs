@@ -114,6 +114,7 @@ pub(super) struct FinishedImage {
 /// release banner as it grows.
 pub(super) struct StagedImage {
     file: std::fs::File,
+    image: PathBuf,
     md5: Md5,
     sha256: Sha256,
     release: KernelReleaseScanner,
@@ -124,6 +125,21 @@ impl StagedImage {
     /// Create the staged kernel directory `staged` inside `staged_root`, both
     /// private, and the empty image inside it.
     pub(super) fn create(staged_root: &Path, staged: &Path) -> Result<Self, StagingError> {
+        Self::create_named(staged_root, staged, KERNEL_IMAGE)
+    }
+
+    pub(super) fn create_boot_artifact(
+        staged_root: &Path,
+        staged: &Path,
+    ) -> Result<Self, StagingError> {
+        Self::create_named(
+            staged_root,
+            staged,
+            pplx_space_node_runtime_core::artifact_store::BOOT_ARTIFACT_IMAGE,
+        )
+    }
+
+    fn create_named(staged_root: &Path, staged: &Path, name: &str) -> Result<Self, StagingError> {
         let mut builder = std::fs::DirBuilder::new();
         builder.mode(0o700);
         builder
@@ -132,7 +148,7 @@ impl StagedImage {
         builder
             .create(staged)
             .map_err(|error| StagingError::new("create", staged, error))?;
-        let image = staged.join(KERNEL_IMAGE);
+        let image = staged.join(name);
         let file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -141,6 +157,7 @@ impl StagedImage {
             .map_err(|error| StagingError::new("create", &image, error))?;
         Ok(Self {
             file,
+            image,
             md5: Md5::new(),
             sha256: Sha256::new(),
             release: KernelReleaseScanner::new(),
@@ -166,7 +183,7 @@ impl StagedImage {
     /// Flush the image to disk, make it and its directory readable, and
     /// return what was learned while writing it.
     pub(super) fn finish(self, staged: &Path) -> Result<FinishedImage, StagingError> {
-        let image = staged.join(KERNEL_IMAGE);
+        let image = self.image;
         self.file
             .sync_all()
             .map_err(|error| StagingError::new("sync", &image, error))?;

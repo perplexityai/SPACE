@@ -10,6 +10,11 @@ impl TemplateManagerService {
         let req = request.get_ref();
         validate_template_name(&req.template)?;
 
+        if self.template_guest_image(&req.template).await?.is_some() {
+            return Err(Status::failed_precondition(
+                "firmware guests do not support warm pools",
+            ));
+        }
         let requested_shape = optional_pool_shape(req.vcpu, req.memory_mib)?;
         let (existing_pool, settings, runtime_defaults) = {
             let db = Arc::clone(&self.db);

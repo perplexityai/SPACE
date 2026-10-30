@@ -5851,6 +5851,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-execution-catalog"
+version = "0.8.0"
+dependencies = [
+ "pplx-space-common-core",
+ "pplx-space-execution-common",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
 name = "pplx-space-execution-common"
 version = "0.8.0"
 dependencies = [
@@ -6583,6 +6598,7 @@ dependencies = [
  "pplx-space-node-mgr-client",
  "serde_json",
  "tokio",
+ "tokio-stream",
  "tonic",
 ]
 
@@ -6649,6 +6665,7 @@ dependencies = [
  "pplx-space-common-grpc",
  "pplx-space-common-io",
  "pplx-space-common-proto-build",
+ "pplx-space-execution-catalog",
  "pplx-space-execution-common",
  "pplx-space-net-common",
  "pplx-space-test-env",
@@ -7603,6 +7620,7 @@ dependencies = [
  "pplx-space-common-lru-reaper",
  "pplx-space-common-svc",
  "pplx-space-db-test-fixtures",
+ "pplx-space-execution-catalog",
  "pplx-space-execution-common",
  "pplx-space-feature-flags",
  "pplx-space-internal-api-server",
