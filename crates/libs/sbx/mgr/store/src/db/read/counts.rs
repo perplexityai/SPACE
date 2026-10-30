@@ -4,6 +4,7 @@
 use crate::auto_lifecycle_delete_receipts::{
     AutoLifecycleDeleteBlockedStats, AutoLifecycleDeleteOutboxStats,
 };
+use crate::db::local_artifact_leases::PendingBackupBacklog;
 use crate::db::{Connection, Result, SandboxLifecycleCount};
 
 /// Only the store defines these; callers pick one, they do not add their own.
@@ -14,6 +15,7 @@ mod sealed {
     impl Sealed for super::MalformedSuspendedUpdatedAt {}
     impl Sealed for super::DeleteOutbox {}
     impl Sealed for super::DeleteBlocked {}
+    impl Sealed for super::PendingBackups {}
 }
 
 /// A count [`counts`] can compute, and what it returns.
@@ -87,5 +89,18 @@ impl Count for DeleteBlocked {
 
     fn count(self, conn: &Connection) -> Result<Self::Output> {
         crate::db::auto_lifecycle_delete_receipts::blocked_stats(conn)
+    }
+}
+
+/// Sandboxes whose pinned artifact has no durable remote copy yet, the same
+/// set `scan::pending_backups` lists.
+#[derive(Clone, Copy, Debug)]
+pub struct PendingBackups;
+
+impl Count for PendingBackups {
+    type Output = PendingBackupBacklog;
+
+    fn count(self, conn: &Connection) -> Result<Self::Output> {
+        crate::db::local_artifact_leases::pending_backup_backlog(conn)
     }
 }
