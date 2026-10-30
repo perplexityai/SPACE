@@ -91,7 +91,8 @@ pub fn database_connect_options(
 /// spans under the active request, and the log formatter drops them, so they
 /// are trace data rather than log output. Fixed rather than configurable:
 /// query spans are always on. `INFO` keeps them inside the default `RUST_LOG`
-/// filter.
+/// filter; a `sqlx::query=off` directive in `RUST_LOG` or
+/// `SPACE_TRACE_FILTER` turns them off.
 const QUERY_EVENT_LEVEL: LevelFilter = LevelFilter::Info;
 
 /// [`database_connect_options`] plus the options every service pool shares.

@@ -525,6 +525,10 @@ forwarding never relabels it.
 | `SPACE_DB_APP_LOCK_TIMEOUT` | `bootstrap-roles` application-role `lock_timeout`; same as `--app-lock-timeout`. `0` resets it, unset leaves it unchanged. |
 | `SPACE_API_URL`, `SPACE_API_TOKEN` | Admin CLI. |
 
+Service database pools always emit SQLx `sqlx::query` events at `INFO`, which
+become DB spans under traced requests. To turn them off, add a
+`sqlx::query=off` directive to `RUST_LOG` or `SPACE_TRACE_FILTER`.
+
 ## Execution eligibility
 
 | Variable | Default | Notes |
