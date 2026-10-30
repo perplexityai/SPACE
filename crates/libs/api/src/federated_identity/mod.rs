@@ -5,8 +5,8 @@ pub mod ingress;
 mod store;
 
 pub(crate) use identity::{
-    FederatedOwnerRecord, MaterializeOwnerError, ResolvePrincipalError, materialize_owner,
-    resolve_principal,
+    FederatedOwnerRecord, MaterializeOwnerError, ResolvePrincipalError, find_owner_record,
+    materialize_owner, resolve_principal,
 };
 
 pub use config::*;

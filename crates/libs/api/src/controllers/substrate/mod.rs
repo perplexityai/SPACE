@@ -1660,6 +1660,19 @@ pub trait SubstrateAdapter: Send + Sync {
         Ok(())
     }
 
+    /// Give up an admitted claim this create has decided not to adopt
+    /// (or failed to bind), before any sandbox row exists for its ID. The
+    /// slot must never return to the ready inventory. Default: the same as
+    /// [`Self::rollback_pooled_execution_claim`]. Kubernetes additionally
+    /// makes the slot due for the pool's next stale-claimed sweep, so the
+    /// create's retry builds cold without waiting out the claim timeout.
+    async fn abandon_admitted_pool_claim(
+        &self,
+        claim: &PooledExecutionClaim,
+    ) -> Result<(), ControllerError> {
+        self.rollback_pooled_execution_claim(claim).await
+    }
+
     async fn cleanup_failed_pooled_prepare(
         &self,
         claim: &PooledExecutionClaim,
@@ -3010,6 +3023,17 @@ impl SubstrateAdapter for Substrate {
             Inner::Direct(substrate) => substrate.rollback_pooled_execution_claim(claim).await,
             #[cfg(feature = "kubernetes")]
             Inner::Kubernetes(substrate) => substrate.rollback_pooled_execution_claim(claim).await,
+        }
+    }
+
+    async fn abandon_admitted_pool_claim(
+        &self,
+        claim: &PooledExecutionClaim,
+    ) -> Result<(), ControllerError> {
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.abandon_admitted_pool_claim(claim).await,
+            #[cfg(feature = "kubernetes")]
+            Inner::Kubernetes(substrate) => substrate.abandon_admitted_pool_claim(claim).await,
         }
     }
 
