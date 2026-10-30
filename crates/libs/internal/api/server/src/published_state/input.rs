@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::SandboxId;
+use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
 use pplx_space_net_common::NetworkPolicyV1;
 use uuid::Uuid;
 
@@ -57,4 +57,29 @@ pub(super) struct PublishedSandboxRow {
     pub(super) state_changed_at: Option<String>,
     pub(super) execution_generation: Option<i64>,
     pub(super) pod_uid: Option<String>,
+}
+
+/// A narrow SQL projection. Status remains an open label with its exact spelling;
+/// the database decides lifecycle eligibility under its own collation.
+#[derive(serde::Serialize)]
+pub(super) struct PublishedLifecycleRow<'a> {
+    sandbox_id: SandboxId,
+    status: Option<&'a str>,
+}
+
+impl PublishedSandboxRow {
+    pub(super) fn may_report_lifecycle(&self, expected: SandboxLifecycle) -> bool {
+        self.status.as_deref().is_some_and(|status| {
+            // Non-ASCII labels stay in the SQL input rather than assuming Rust
+            // and the database have identical case conversion rules.
+            !status.is_ascii() || status.eq_ignore_ascii_case(expected.as_str())
+        })
+    }
+
+    pub(super) fn lifecycle_projection(&self) -> PublishedLifecycleRow<'_> {
+        PublishedLifecycleRow {
+            sandbox_id: self.sandbox_id,
+            status: self.status.as_deref(),
+        }
+    }
 }

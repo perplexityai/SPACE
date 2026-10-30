@@ -2476,7 +2476,7 @@ pub async fn publish_sandbox_states(
     post_commit_events.extend(apply_activation_receipts(conn, node_id, &rows).await?);
 
     let suspended_projection =
-        project_node_published_suspended_sandboxes(conn, node_id, rows_json.clone()).await?;
+        project_node_published_suspended_sandboxes(conn, node_id, &rows).await?;
     let recovered_ids = suspended_projection
         .recoveries
         .iter()
@@ -2760,23 +2760,7 @@ pub async fn publish_sandbox_states(
         );
     }
 
-    let pause_failed_recoveries =
-        crate::sandbox_quarantine_store::recover_pause_failed_from_inventory(
-            conn,
-            node_id,
-            rows_json.clone(),
-        )
-        .await?;
-    post_commit_events.extend(pause_failed_recoveries.into_iter().map(|recovery| {
-        PostCommitSandboxEvent {
-            sandbox_id: recovery.sandbox_id,
-            event_type: SandboxEventType::QuarantineRecovered,
-            prior_lifecycle: SandboxLifecycle::Quarantined,
-            target_lifecycle: recovery.target_state,
-            reason_code: SandboxQuarantineReasonCode::PauseFailed,
-            error: None,
-        }
-    }));
+    post_commit_events.extend(recover_pause_failed_sandboxes(conn, node_id, &rows).await?);
 
     queue_policy_reconcile_refs_for_new_inventory(
         conn,
@@ -2976,6 +2960,7 @@ async fn project_node_published_failed_sandboxes(
         .collect())
 }
 
+#[derive(Default)]
 struct SuspendedProjectionOutcome {
     rows: Vec<(SandboxId, bool)>,
     recoveries: Vec<(SandboxId, SandboxLifecycle, SandboxQuarantineReasonCode)>,
@@ -2987,8 +2972,18 @@ struct SuspendedProjectionOutcome {
 async fn project_node_published_suspended_sandboxes(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
-    rows_json: Json<serde_json::Value>,
+    rows: &[PublishedSandboxRow],
 ) -> Result<SuspendedProjectionOutcome, Status> {
+    let suspended_rows = rows
+        .iter()
+        .filter(|row| row.may_report_lifecycle(SandboxLifecycle::Suspended))
+        .collect::<Vec<_>>();
+    if suspended_rows.is_empty() {
+        return Ok(SuspendedProjectionOutcome::default());
+    }
+    let rows_json = Json(serde_json::to_value(suspended_rows).map_err(|error| {
+        Status::internal(format!("serialize suspended publication rows: {error}"))
+    })?);
     let candidates = crate::sandbox_quarantine_store::select_suspended_projection_candidates(
         conn, node_id, rows_json,
     )
@@ -3978,6 +3973,46 @@ async fn apply_activation_receipts(
             target_lifecycle: rollback.target_state,
             reason_code: rollback.reason_code,
             error: rollback.failure_message,
+        })
+        .collect())
+}
+
+/// Recover node-owned pause failures from definitive healthy observations.
+async fn recover_pause_failed_sandboxes(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    rows: &[PublishedSandboxRow],
+) -> Result<Vec<PostCommitSandboxEvent>, Status> {
+    let healthy_rows = rows
+        .iter()
+        .filter(|row| {
+            row.may_report_lifecycle(SandboxLifecycle::Started)
+                || row.may_report_lifecycle(SandboxLifecycle::Paused)
+        })
+        .map(PublishedSandboxRow::lifecycle_projection)
+        .collect::<Vec<_>>();
+    let pause_failed_recoveries = if healthy_rows.is_empty() {
+        Vec::new()
+    } else {
+        let healthy_rows = Json(serde_json::to_value(healthy_rows).map_err(|error| {
+            Status::internal(format!("serialize healthy publication rows: {error}"))
+        })?);
+        crate::sandbox_quarantine_store::recover_pause_failed_from_inventory(
+            conn,
+            node_id,
+            healthy_rows,
+        )
+        .await?
+    };
+    Ok(pause_failed_recoveries
+        .into_iter()
+        .map(|recovery| PostCommitSandboxEvent {
+            sandbox_id: recovery.sandbox_id,
+            event_type: SandboxEventType::QuarantineRecovered,
+            prior_lifecycle: SandboxLifecycle::Quarantined,
+            target_lifecycle: recovery.target_state,
+            reason_code: SandboxQuarantineReasonCode::PauseFailed,
+            error: None,
         })
         .collect())
 }
