@@ -223,6 +223,8 @@ impl LocalBackupInventoryReport {
 /// the pending-backup mirror — see [`LocalBackupInventoryReport`].
 /// Execution collection has its own receipt time: only a supplied outcome
 /// advances it. Heartbeats and other facets preserve the previous evidence.
+/// The environment arrays have a third, written only as
+/// [`EnvironmentRefs`](crate::environment_observation::EnvironmentRefs) says.
 ///
 /// `reported_window` is how long past now the node counts as fresh, from
 /// [`reported_freshness`](pplx_space_node_api_client::node_status_freshness::reported_freshness).
@@ -242,6 +244,10 @@ pub(super) async fn upsert_node_status_from_publish(
     local_backup_report: LocalBackupInventoryReport,
     execution_observation: Option<crate::execution_observation::PublishedExecutionObservation>,
 ) -> Result<(), Status> {
+    let environments = execution_observation.as_ref().map_or(
+        &crate::environment_observation::EnvironmentRefs::Preserve,
+        |observation| &observation.environments,
+    );
     let (
         scheduling_status,
         scheduling_reason,
@@ -295,6 +301,9 @@ pub(super) async fn upsert_node_status_from_publish(
              execution_policy_received_at,
              execution_inventory_status,
              execution_inventory_received_at,
+             usable_environment_refs,
+             known_environment_refs,
+             environment_refs_received_at,
              updated_at
          )
          SELECT n.id,
@@ -324,6 +333,9 @@ pub(super) async fn upsert_node_status_from_publish(
                 CASE WHEN $17::JSONB IS NOT NULL THEN clock_timestamp() ELSE NULL END,
                 $16::TEXT,
                 CASE WHEN $16::TEXT IS NOT NULL THEN clock_timestamp() ELSE NULL END,
+                $19::TEXT[],
+                $20::TEXT[],
+                CASE WHEN $19::TEXT[] IS NOT NULL THEN clock_timestamp() ELSE NULL END,
                 NOW()
          FROM nodes n
          WHERE n.id = $1
@@ -423,6 +435,29 @@ pub(super) async fn upsert_node_status_from_publish(
                  WHEN $16::TEXT IS NOT NULL THEN clock_timestamp()
                  ELSE node_status_snapshots.execution_inventory_received_at
              END,
+             -- Written together or not at all, as the row's CHECK requires:
+             -- a complete inventory records or clears all three, and any
+             -- other publication leaves them to age out by their receipt. An
+             -- unchanged array keeps its stored copy, so a steady report
+             -- leaves the GIN-indexed column alone and the update can be HOT.
+             usable_environment_refs = CASE
+                 WHEN $21::BOOLEAN
+                      AND EXCLUDED.usable_environment_refs
+                          IS DISTINCT FROM node_status_snapshots.usable_environment_refs
+                 THEN EXCLUDED.usable_environment_refs
+                 ELSE node_status_snapshots.usable_environment_refs
+             END,
+             known_environment_refs = CASE
+                 WHEN $21::BOOLEAN
+                      AND EXCLUDED.known_environment_refs
+                          IS DISTINCT FROM node_status_snapshots.known_environment_refs
+                 THEN EXCLUDED.known_environment_refs
+                 ELSE node_status_snapshots.known_environment_refs
+             END,
+             environment_refs_received_at = CASE
+                 WHEN $21::BOOLEAN THEN EXCLUDED.environment_refs_received_at
+                 ELSE node_status_snapshots.environment_refs_received_at
+             END,
              updated_at = NOW()"
     ))
     .bind(node_id)
@@ -447,13 +482,17 @@ pub(super) async fn upsert_node_status_from_publish(
     )
     .bind(
         execution_observation
-            .and_then(|observation| observation.policy)
+            .as_ref()
+            .and_then(|observation| observation.policy.as_ref())
             .map(Json),
     )
     .bind(
         pplx_space_node_api_client::node_status_freshness::DEFAULT_NODE_STATUS_FRESHNESS
             .as_secs_f64(),
     )
+    .bind(environments.usable())
+    .bind(environments.known())
+    .bind(environments.writes())
     .execute(&mut *conn)
     .await
     .map_err(|err| Status::internal(format!("upsert node status from publish: {err}")))?;

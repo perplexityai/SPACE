@@ -1604,6 +1604,7 @@ fn normalize_ip(value: IpAddr) -> IpAddr {
 mod adapter;
 mod auto_lifecycle_delete_completions;
 mod backup_generation_fence;
+mod environment_observation;
 mod execution_currency;
 mod execution_observation;
 mod metadata;

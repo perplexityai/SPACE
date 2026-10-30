@@ -917,6 +917,61 @@ descriptor, a repeated known or usable entry, a repeated or self edge, a usable
 or edge reference outside `known`, a memory edge without an upgrade edge, or an
 out-of-range sort key.
 
+### Recording environment observations
+
+The cluster API records the observation from each complete inventory in the
+publication's transaction (`crates/libs/internal/api/server/src/environment_observation.rs`):
+
+- `node_status_snapshots.known_environment_refs` gets every known
+  environment, and `usable_environment_refs` the usable ones that aren't
+  retired, even where a copy still verifies on the node. Both arrays share
+  `environment_refs_received_at`.
+- A complete inventory without an observation, from an old node build, or with
+  one that fails to decode sets the arrays and their receipt to NULL and
+  withdraws the node's certifications, so the node has no environment
+  evidence. The decoder rejects the whole observation when any entry fails,
+  including an entry of a kind the reader doesn't know, so roll cluster-api
+  readers out before nodes that publish a new entry kind.
+- An unavailable or legacy report, or a publication with no execution
+  observation, leaves the arrays alone. Older cluster-api writers don't write
+  them either, so the arrays age out by their own receipt.
+
+A node's published environments are evidence only while
+`node_environment_evidence(nss)` holds for its `node_status_snapshots` row:
+the latest inventory report is complete, the node is fresh by `stale_after`,
+and `environment_refs_received_at` is within the node's freshness window
+(`stale_after - observed_at`, two node-status intervals plus 30 seconds). It's
+a Postgres function, so placement and the upgrade reconciler use one
+definition from any crate's SQL.
+
+Each node's certification of each known environment, its sort key and edges,
+is kept in `node_environment_certifications`, and the catalog row is
+aggregated from those rows. An edge counts while every node whose build knows
+both of its ends certifies it; a build that doesn't know the target abstains.
+So a fleet with several architectures or builds keeps every edge that the
+builds able to judge agree on, and an edge comes back once a node that vetoed
+it upgrades. The catalog row's identity comes from the definition (runtime
+alias, runtime version, kernel version, state format), so the upgrade decision
+can match unbound records against it. Its sort key is the one from the last
+node build whose certifications changed. A definition without a kernel or a
+state format gets no row, and so is in no recipe.
+
+The aggregate is recomputed only when a node's certifications change, under a
+transaction-scoped advisory lock, so a steady fleet writes nothing to the
+catalog. A node's rows stay until it publishes a complete inventory without an
+observation or is deleted. A node that stops publishing keeps voting until
+then, and deleting a node removes its rows without recomputing the edges it
+voted on; the next change to any node that knows those environments
+recomputes them. An environment no node certifies any more keeps its last
+edges, so its sandboxes keep their upgrade paths.
+
+Every complete inventory also samples
+`internal_api.runtime_provisioning.recipe_environments`, the size of the
+recipe that node would be assigned, whether or not recipes are served, tagged
+`catalog:known` or `catalog:full` for a node with no known set. node-ctl
+refuses a recipe over 32 environments whole, so alert on the fleet maximum
+approaching 32, and retire environments before it's reached.
+
 ### Cluster desired policy
 
 Cluster policy lives in the control-plane tables `runtime_environment_policy`
@@ -1274,8 +1329,10 @@ Kubernetes substrate runs it from its stopped-start path and from every
 restore into the started lifecycle: user resumes, connect-time wakes and
 started recovery. A drain's evacuation restore keeps the sandbox's
 environment. Direct doesn't decide upgrades. Edges come only from
-`runtime_environments`, which nothing writes yet, so until node publications
-populate it, every move off an environment that may not execute is stranded.
+`runtime_environments`, which node publications populate (see "Recording
+environment observations"), so until nodes on a build that publishes
+observations have reported, every move off an environment that may not execute
+is stranded.
 
 1. **Evidence.** A resume reads the producer of the checkpoint it would load,
    which the restore plan already chose: the full `snapshots` row at the
@@ -1371,14 +1428,17 @@ to node-manager, and installation never reads it. The cluster authenticates the 
 existing origin check before answering.
 
 While `SPACE_INTERNAL_API_RUNTIME_PROVISIONING_RECIPE_ENABLED` is on, the cluster
-API assigns workers and builders in the provisioning cohort a recipe of every
-environment in the `runtime_environments` catalog that isn't retired, read
+API assigns workers and builders in the provisioning cohort a recipe of the
+environments in the `runtime_environments` catalog that aren't retired and that
+the node's last complete inventory lists in `known_environment_refs`, read
 through the catalog store in
-`crates/libs/execution/runtime-environment-catalog-store`. Each row is an
-environment a node build has published as certified, and an operator retires
-one by setting `retired_at`. Nothing records node publishes in the catalog yet,
-so until that writer lands an enabled cohort receives an empty recipe and
-installs nothing. The recipe ignores execution policy: an environment
+`crates/libs/execution/runtime-environment-catalog-store`. A node that hasn't
+reported a known set (NULL, as from a build that predates observations) gets
+every unretired environment. Each row is an environment a node build has
+published as certified, and an operator retires one by setting `retired_at`.
+Until a node on a current build publishes, the catalog is empty, so an enabled
+cohort receives an empty recipe and installs nothing. The recipe ignores
+execution policy: an environment
 with no state, or a blocked one, stays installed, so a later policy change finds
 it already in place. That's what lets a 0-day on an already-certified
 environment be answered with a policy change rather than a download. An empty
