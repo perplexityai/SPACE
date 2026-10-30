@@ -911,6 +911,29 @@ fn a_completed_retry_keeps_its_attempt_count_after_the_error_is_cleared() {
 }
 
 #[test]
+fn a_failed_transfer_reports_whether_it_ran_out_of_retries() {
+    let mut job = persisted_job("failed", &sample_artifact());
+    job.error = Some("object store unreachable".to_string());
+
+    job.failure = Some(JobFailure::Retriable);
+    let reported = job_to_proto(job.clone()).unwrap();
+    assert_eq!(reported.status, TransferJobStatus::Failed as i32);
+    assert_eq!(reported.failure_kind(), TransferJobFailureKind::Retriable);
+
+    job.failure = Some(JobFailure::Permanent { reason: None });
+    assert_eq!(
+        job_to_proto(job).unwrap().failure_kind(),
+        TransferJobFailureKind::Permanent
+    );
+
+    let running = persisted_job("running", &sample_artifact());
+    assert_eq!(
+        job_to_proto(running).unwrap().failure_kind(),
+        TransferJobFailureKind::Unspecified
+    );
+}
+
+#[test]
 fn pull_job_failure_status_preserves_typed_reason_and_retry_semantics() {
     let mut job = persisted_job("failed", &sample_artifact());
     job.error = Some("object not found".to_string());

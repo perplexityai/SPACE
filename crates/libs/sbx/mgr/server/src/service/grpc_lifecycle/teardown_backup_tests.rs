@@ -464,9 +464,11 @@ where
 enum Transfers {
     Running,
     Completed,
+    /// As vol-mgr reports a transfer it failed permanently.
+    Failed,
     /// As vol-mgr reports a transfer whose retries ran out during an
     /// object-store outage.
-    Failed,
+    GaveUp,
 }
 
 /// A vol-mgr on a test-owned socket that accepts every push and reports every
@@ -507,12 +509,23 @@ impl FakeVolumeManager {
                     }
                     "GetTransferJob" => {
                         answer(request, move |request: vol::GetTransferJobRequest| {
-                            let (status, error) = match transfers {
-                                Transfers::Running => (vol::TransferJobStatus::Running, None),
-                                Transfers::Completed => (vol::TransferJobStatus::Completed, None),
+                            use vol::TransferJobFailureKind as Kind;
+                            let (status, error, failure_kind) = match transfers {
+                                Transfers::Running => {
+                                    (vol::TransferJobStatus::Running, None, Kind::Unspecified)
+                                }
+                                Transfers::Completed => {
+                                    (vol::TransferJobStatus::Completed, None, Kind::Unspecified)
+                                }
                                 Transfers::Failed => (
                                     vol::TransferJobStatus::Failed,
+                                    Some("object rejected".to_string()),
+                                    Kind::Permanent,
+                                ),
+                                Transfers::GaveUp => (
+                                    vol::TransferJobStatus::Failed,
                                     Some("object store unreachable".to_string()),
+                                    Kind::Retriable,
                                 ),
                             };
                             Ok(vol::GetTransferJobResponse {
@@ -521,6 +534,7 @@ impl FakeVolumeManager {
                                     status: status as i32,
                                     bytes_transferred: 18,
                                     error,
+                                    failure_kind: failure_kind as i32,
                                     ..Default::default()
                                 }),
                             })
@@ -563,11 +577,11 @@ impl Drop for FakeVolumeManager {
 #[derive(Clone, Copy, Debug)]
 enum NodeLocalUpload {
     Running,
-    /// vol-mgr gave up on its transfer; the teardown's new attempt completes.
+    /// vol-mgr failed its transfer; the teardown's new attempt completes.
     TransferFailed,
-    /// vol-mgr gave up on its transfer, and on the teardown's new attempt too.
+    /// vol-mgr failed its transfer, and the teardown's new attempt too.
     TransferFailedTwice,
-    /// vol-mgr gave up on its transfer, and on an attempt a backup requested
+    /// vol-mgr failed its transfer, and an attempt a backup requested
     /// by artifact id started before the teardown.
     TwoFailedAttempts,
     /// The control plane didn't know the node yet when the node-local suspend
@@ -704,7 +718,7 @@ async fn ended(
 /// published artifact. The teardown and a backup requested by artifact id
 /// share the node-local suspend's upload while it runs, and a joined driver
 /// accepts the poll that completed the generation first. Once that upload has
-/// failed, an attempt's failure, such as a transfer vol-mgr gave up on or a
+/// failed, an attempt's failure, such as a transfer vol-mgr failed or a
 /// registration refused for a node the control plane didn't know yet, gets
 /// one new attempt unless two uploads of the artifact have already failed. A
 /// registration refused for the artifact itself fails the teardown at once.
@@ -724,18 +738,17 @@ async fn teardown_after_node_local_suspend_shares_its_upload_or_settles_its_fail
         ]
         // Each case's future is large; keep them off the test's stack.
         .map(|upload| Box::pin(teardown_after_node_local_upload(upload)) as Case);
-        futures_util::future::join_all(
-            cases
-                .into_iter()
-                .chain([Box::pin(captured_upload_failing_twice()) as Case]),
-        )
+        futures_util::future::join_all(cases.into_iter().chain([
+            Box::pin(captured_upload_failing_twice()) as Case,
+            Box::pin(captured_upload_outlasting_an_outage()) as Case,
+        ]))
         .await;
     })
     .await;
 }
 
-/// A teardown that captured its own artifact, whose upload vol-mgr gives up
-/// on twice. The first failure gets a recovery attempt, so the `suspending`
+/// A teardown that captured its own artifact, whose upload vol-mgr fails
+/// permanently twice. The first failure gets a recovery attempt, so the `suspending`
 /// row isn't marked as finished failing until that attempt fails too.
 async fn captured_upload_failing_twice() {
     use crate::service::tests::service_tests::insert_stranded_teardown_suspend_sandbox;
@@ -789,7 +802,7 @@ async fn captured_upload_failing_twice() {
     tokio::time::timeout(ends, drive())
         .await
         .unwrap()
-        .expect_err("vol-mgr gives up on the transfer");
+        .expect_err("vol-mgr fails the transfer");
     let first = only_upload(&service, &id);
     assert_eq!(first.status, JobStatus::Failed.as_str());
     assert_eq!(marker(), None, "the recovery attempt is still to come");
@@ -797,7 +810,7 @@ async fn captured_upload_failing_twice() {
     tokio::time::timeout(ends, drive())
         .await
         .unwrap()
-        .expect_err("vol-mgr gives up on the recovery attempt too");
+        .expect_err("vol-mgr fails the recovery attempt too");
     let attempts = uploads(&service, &id);
     assert_eq!(attempts.len(), 2, "one recovery attempt");
     assert!(
@@ -813,6 +826,108 @@ async fn captured_upload_failing_twice() {
         service.lookup_sandbox(&id).unwrap().state,
         SandboxState::Suspending
     );
+    super::retired_teardown_tests::drain(&service).await;
+}
+
+/// A teardown that captured its own artifact, whose transfer vol-mgr ran out
+/// of retries on during an outage. The upload submits the transfer again on
+/// its next attempt instead of failing the backup, and the suspend becomes
+/// durable once the outage ends.
+async fn captured_upload_outlasting_an_outage() {
+    use crate::service::tests::service_tests::insert_stranded_teardown_suspend_sandbox;
+    use pplx_space_common_core::types::ExecutionGeneration;
+    use pplx_space_common_jobs::JobStatus;
+
+    let generation = ExecutionGeneration::new(GENERATION).unwrap();
+    let volume_manager = FakeVolumeManager::serve(Transfers::GaveUp);
+    let scratch = tempfile::tempdir().unwrap();
+    let conn = crate::db::test_conn();
+    let sandbox_id = SandboxId::new();
+    let id = sandbox_id.to_string();
+    let staged = insert_stranded_teardown_suspend_sandbox(&conn, sandbox_id, generation);
+    let snapshot_dir = scratch.path().join("suspend");
+    crate::service::suspend_snapshot_publication::write_full_suspend_artifact(
+        &snapshot_dir,
+        &id,
+        staged,
+        b"teardown-capture",
+    );
+    conn.execute(
+        "UPDATE local_artifacts SET local_path = ?1 WHERE local_artifact_id = ?2",
+        crate::db::fixture::params![snapshot_dir.to_str().unwrap(), staged.to_string()],
+    )
+    .unwrap();
+    let service = SandboxManagerService::new_with_options(
+        conn,
+        SandboxManagerServiceOptions {
+            volume_manager_socket_path: volume_manager.socket.clone(),
+            ..SandboxManagerServiceOptions::for_test_in(scratch.path())
+        },
+    );
+    let cache = tempfile::tempdir().unwrap();
+    let marker = || {
+        let db = service.db.lock().unwrap();
+        crate::db::get_sandbox(&db, &id)
+            .unwrap()
+            .unwrap()
+            .failure_reason
+    };
+    let mut driver = std::pin::pin!(service.drive_teardown_suspend_in(
+        sandbox_id,
+        generation,
+        SandboxEventTrigger::System,
+        cache.path(),
+    ));
+    let rescheduled = async {
+        loop {
+            if let Some(upload) = uploads(&service, &id)
+                .into_iter()
+                .find(|upload| upload.attempts == 1 && upload.status == JobStatus::Pending.as_str())
+            {
+                break upload;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    };
+    let upload = tokio::select! {
+        result = &mut driver => panic!("the suspend ended before its upload retried: {result:?}"),
+        upload = tokio::time::timeout(std::time::Duration::from_secs(10), rescheduled) => {
+            upload.expect("the upload schedules a retry rather than failing")
+        }
+    };
+    // The next attempt submits fresh transfers rather than polling the
+    // ones vol-mgr gave up on (the teardown handoff may already have).
+    let error = upload.error.as_deref().unwrap_or_default();
+    let gave_up = error
+        .strip_prefix("vol-mgr job ")
+        .and_then(|rest| rest.split_once(" ran out of retries"))
+        .map(|(job_id, _)| job_id.to_owned())
+        .unwrap_or_else(|| panic!("the attempt records the transfer it gave up on: {error}"));
+    assert!(
+        !upload
+            .payload_as::<crate::snapshot_upload::SnapshotUploadJobs>()
+            .unwrap()
+            .job_ids
+            .iter()
+            .any(|job_id| job_id.to_string() == gave_up),
+        "the retry submits its transfers again"
+    );
+    assert_eq!(marker(), None, "a transient outage fails no backup");
+
+    volume_manager.report(Transfers::Completed);
+    // This fixture has no node-manager, so the teardown stops at the
+    // cleanup that follows a durable backup.
+    let error = tokio::time::timeout(std::time::Duration::from_secs(20), driver)
+        .await
+        .unwrap()
+        .expect_err("the fixture has no node-manager to clean up with");
+    assert!(
+        error.message().starts_with("durable sandbox cleanup"),
+        "the retried suspend is durable: {error}"
+    );
+    let upload = ended(&service, &upload.job_id, JobStatus::Completed).await;
+    assert_eq!(upload.attempts, 2);
+    assert_eq!(marker(), None);
     super::retired_teardown_tests::drain(&service).await;
 }
 

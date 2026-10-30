@@ -102,7 +102,10 @@ async fn cancelled_transfer_poll_yields_before_connecting() {
     .await
     .unwrap_err();
 
-    assert!(matches!(error, JobError::YieldedForRestart));
+    assert!(matches!(
+        error,
+        ArtifactWaitError::Job(JobError::YieldedForRestart)
+    ));
 }
 
 #[tokio::test(start_paused = true)]
@@ -127,7 +130,10 @@ async fn stalled_transfer_probe_is_bounded_without_cancelling_remote_work() {
     // Accept the connection but never answer its HTTP/2 handshake or request.
     let (_connection, _) = listener.accept().await.unwrap();
     tokio::time::advance(TRANSFER_PROBE_TIMEOUT).await;
-    assert!(matches!(probe.await.unwrap(), Err(JobError::Retriable(_))));
+    assert!(matches!(
+        probe.await.unwrap(),
+        Err(ArtifactWaitError::Job(JobError::Retriable(_)))
+    ));
     assert!(
         !cancellation.is_cancelled(),
         "a failed observation must not cancel durable transfer work"

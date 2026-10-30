@@ -439,6 +439,18 @@ message TransferJob {
     // with more than one had a failed attempt; `error` is cleared on
     // completion, `attempts` never is.
     uint32            attempts          = 13;
+    // How a FAILED job failed; UNSPECIFIED for every other status.
+    TransferJobFailureKind failure_kind = 14;
+}
+
+enum TransferJobFailureKind {
+    // Not failed, or reported by a vol-mgr that predates this field.
+    TRANSFER_JOB_FAILURE_KIND_UNSPECIFIED = 0;
+    // Submitting the same transfer again would fail the same way.
+    TRANSFER_JOB_FAILURE_KIND_PERMANENT   = 1;
+    // Retries ran out on transient errors, such as an unreachable credential
+    // authority or object store. The same transfer submitted again may succeed.
+    TRANSFER_JOB_FAILURE_KIND_RETRIABLE   = 2;
 }
 
 message GetTransferJobRequest {

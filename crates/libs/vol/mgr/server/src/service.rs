@@ -40,9 +40,9 @@ use pplx_space_volmgr_client::proto::{
     PullFileRequest, PullFileResponse, PullFilesAsyncRequest, PullFilesAsyncResponse,
     PushFileBatchEntry, PushFileRequest, PushFileResponse, PushFilesAsyncRequest,
     PushFilesAsyncResponse, SnapshotArtifact as ProtoSnapshotArtifact, SubmitTransferResponse,
-    TransferJob, TransferJobStatus, VolumeReadDirRequest, VolumeReadDirResponse, VolumeReadRequest,
-    VolumeReadResponse, VolumeSpec, VolumeStatRequest, VolumeStatResponse,
-    volume_manager_server::VolumeManager,
+    TransferJob, TransferJobFailureKind, TransferJobStatus, VolumeReadDirRequest,
+    VolumeReadDirResponse, VolumeReadRequest, VolumeReadResponse, VolumeSpec, VolumeStatRequest,
+    VolumeStatResponse, volume_manager_server::VolumeManager,
 };
 use pplx_space_volmgr_client::snapshot_artifact_from_proto;
 
@@ -643,6 +643,15 @@ fn job_to_proto(job: pplx_space_common_jobs::Job) -> Result<TransferJob, Status>
         "cancelled" => TransferJobStatus::Cancelled,
         _ => TransferJobStatus::Unspecified,
     };
+    let failure_kind = match (status, job.failure) {
+        (TransferJobStatus::Failed, Some(JobFailure::Permanent { .. })) => {
+            TransferJobFailureKind::Permanent
+        }
+        (TransferJobStatus::Failed, Some(JobFailure::Retriable)) => {
+            TransferJobFailureKind::Retriable
+        }
+        _ => TransferJobFailureKind::Unspecified,
+    };
     Ok(TransferJob {
         job_id: job.job_id.to_string(),
         status: transfer_job_status_code(status),
@@ -657,6 +666,7 @@ fn job_to_proto(job: pplx_space_common_jobs::Job) -> Result<TransferJob, Status>
         completed_at: job.completed_at,
         transfer_scope_id,
         attempts: u32::try_from(job.attempts).unwrap_or_default(),
+        failure_kind: failure_kind.into(),
     })
 }
 
