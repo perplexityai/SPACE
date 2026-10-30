@@ -1,5 +1,7 @@
 [workspace]
 resolver = "3"
+# Fuzzing uses its own pinned nightly, dependencies and instrumented builds.
+exclude = ["fuzz"]
 members = [
     "crates/apps/api/svc",
     "crates/apps/builder/cli",

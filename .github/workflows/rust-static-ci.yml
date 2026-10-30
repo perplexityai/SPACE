@@ -360,3 +360,54 @@ jobs:
         with:
           path: ${{ runner.temp }}/space-sccache
           key: ${{ steps.rust-cache-key.outputs.key }}
+
+  fuzz:
+    if: github.repository == 'perplexityai/SPACE'
+    name: Rust fuzz targets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: fuzz
+    steps:
+      - name: Check out SPACE
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install fuzz build prerequisites
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang protobuf-compiler
+
+      - name: Install the pinned fuzz toolchain and runner
+        run: |
+          rustup show active-toolchain
+          cargo install cargo-fuzz --locked --version "$(cat cargo-fuzz.version)" --root "${RUNNER_TEMP}/fuzz-tools"
+          echo "${RUNNER_TEMP}/fuzz-tools/bin" >>"${GITHUB_PATH}"
+
+      - name: Check fuzz formatting
+        run: cargo fmt -- --check
+
+      - name: Exercise every fuzz target
+        run: |
+          cargo fetch --locked
+          cp Cargo.lock "${RUNNER_TEMP}/fuzz-Cargo.lock"
+          cargo fuzz list >"${RUNNER_TEMP}/fuzz-targets"
+          test -s "${RUNNER_TEMP}/fuzz-targets"
+          while IFS= read -r target; do
+            mkdir -p "corpus/${target}"
+            cargo fuzz run "${target}" "corpus/${target}" "seeds/${target}" -- -max_total_time=30 -timeout=5 -rss_limit_mb=2048
+          done <"${RUNNER_TEMP}/fuzz-targets"
+          cmp Cargo.lock "${RUNNER_TEMP}/fuzz-Cargo.lock"
+
+      - name: Upload failing inputs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fuzz-failing-inputs
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+          retention-days: 7
