@@ -14,9 +14,8 @@
 //!   `StartRequest` carries those fields. A readiness wait still blocks on
 //!   start. Default shapes and disk-only overrides can use one-shot create,
 //!   whose `CreateRequest` forwards disk size as `rootfs_size_mb`.
-//! - No-ops returning `None` or nothing: `sandbox_ip`, `access_sandbox_ip`,
-//!   `list_inventory_nodes` (Postgres is the inventory),
-//!   `retire_fence_mismatch` and `observe_pod_identities`.
+//! - No-ops returning `None` or nothing: `list_inventory_nodes` (Postgres is
+//!   the inventory), `retire_fence_mismatch` and `observe_pod_identities`.
 //! - Direct-only: the node registry and the template pull and delete routes in
 //!   `routes/admin/node_maintenance.rs` (501 on Kubernetes).
 //!
@@ -4285,20 +4284,6 @@ impl SubstrateAdapter for DirectSubstrate {
             }
         }
         self.node_client(sandbox.id).await
-    }
-
-    async fn sandbox_ip(&self, _sandbox_id: SandboxId) -> Result<Option<String>, ControllerError> {
-        Ok(None)
-    }
-
-    async fn access_sandbox_ip(
-        &self,
-        _metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,
-        _sandbox: &Sandbox,
-        _timeout: Duration,
-        _charge: crate::controllers::substrate::RecoveryCharge,
-    ) -> Result<Option<String>, ControllerError> {
-        Ok(None)
     }
 
     async fn builder_client(&self) -> Result<BuilderClient, ControllerError> {

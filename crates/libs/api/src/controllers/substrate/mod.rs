@@ -1516,28 +1516,6 @@ pub trait SubstrateAdapter: Send + Sync {
         charge: RecoveryCharge,
     ) -> Result<RuntimeClient, ControllerError>;
 
-    /// Return a dialable sandbox IP for arbitrary service-port traffic.
-    ///
-    /// Service proxying owns the destination port, so substrates only expose
-    /// the execution IP here. Substrates without a routable sandbox IP can
-    /// return `None`.
-    async fn sandbox_ip(&self, sandbox_id: SandboxId) -> Result<Option<String>, ControllerError>;
-
-    /// Return a dialable sandbox IP for guest service traffic.
-    ///
-    /// Like `access_runtime_client`, this may recreate missing execution
-    /// objects, but must honor implicit-wake policy when the sandbox is
-    /// dormant. `admission` charges the cluster limiter when a live sandbox's
-    /// pod has to be recreated (a real activation the stored-lifecycle
-    /// entrypoint charge misses).
-    async fn access_sandbox_ip(
-        &self,
-        metric_identity: SandboxApiMetricIdentity,
-        sandbox: &Sandbox,
-        timeout: Duration,
-        charge: RecoveryCharge,
-    ) -> Result<Option<String>, ControllerError>;
-
     /// Connect to the node-api builder surface for substrate-level template work.
     ///
     /// The substrate owns where this client points; callers own the common
@@ -2811,36 +2789,6 @@ impl SubstrateAdapter for Substrate {
             Inner::Kubernetes(substrate) => {
                 substrate
                     .access_runtime_client(metric_identity, sandbox, activity, timeout, charge)
-                    .await
-            }
-        }
-    }
-
-    async fn sandbox_ip(&self, sandbox_id: SandboxId) -> Result<Option<String>, ControllerError> {
-        match &self.inner {
-            Inner::Direct(substrate) => substrate.sandbox_ip(sandbox_id).await,
-            #[cfg(feature = "kubernetes")]
-            Inner::Kubernetes(substrate) => substrate.sandbox_ip(sandbox_id).await,
-        }
-    }
-
-    async fn access_sandbox_ip(
-        &self,
-        metric_identity: SandboxApiMetricIdentity,
-        sandbox: &Sandbox,
-        timeout: Duration,
-        charge: RecoveryCharge,
-    ) -> Result<Option<String>, ControllerError> {
-        match &self.inner {
-            Inner::Direct(substrate) => {
-                substrate
-                    .access_sandbox_ip(metric_identity, sandbox, timeout, charge)
-                    .await
-            }
-            #[cfg(feature = "kubernetes")]
-            Inner::Kubernetes(substrate) => {
-                substrate
-                    .access_sandbox_ip(metric_identity, sandbox, timeout, charge)
                     .await
             }
         }

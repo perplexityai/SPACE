@@ -166,7 +166,7 @@ async fn drain_gate_blocks_dormant_sandbox_on_draining_target_node() -> TestResu
         .expect("inserted sandbox must be visible");
     assert_eq!(sandbox.lifecycle, "suspended");
 
-    let err = ensure_access_path_not_blocked_by_drain(&db.pool, &sandbox, SandboxAction::Access)
+    let err = ensure_access_path_not_blocked_by_drain(&db.pool, &sandbox, SandboxAction::Spaced)
         .await
         .expect_err("dormant + draining-target should 409");
     assert_eq!(err.clone().into_response().status(), StatusCode::CONFLICT);

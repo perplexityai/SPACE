@@ -447,34 +447,6 @@ fn initial_lifecycle_terminal_phase(lifecycle: &str) -> ReconnectTerminalPhase {
     }
 }
 
-fn initial_lifecycle_may_need_wake(lifecycle: &str) -> bool {
-    matches!(
-        parse_reconnect_lifecycle(lifecycle),
-        Some(
-            SandboxLifecycle::Paused
-                | SandboxLifecycle::Pausing
-                | SandboxLifecycle::Resuming
-                | SandboxLifecycle::Suspended
-                | SandboxLifecycle::Suspending
-                | SandboxLifecycle::Restoring
-        )
-    )
-}
-
-fn successful_access_reconnect_outcome(
-    initial_lifecycle: &str,
-) -> Option<(ReconnectOutcome, ReconnectTerminalPhase, ReconnectReason)> {
-    if initial_lifecycle_may_need_wake(initial_lifecycle) {
-        Some((
-            ReconnectOutcome::WakeSubmitted,
-            ReconnectTerminalPhase::Ready,
-            ReconnectReason::Ok,
-        ))
-    } else {
-        None
-    }
-}
-
 fn wait_ready_terminal_phase(phase: WaitReadyTimeoutPhase) -> ReconnectTerminalPhase {
     match phase {
         WaitReadyTimeoutPhase::PodNeverReady => ReconnectTerminalPhase::PodNeverReady,
@@ -642,14 +614,13 @@ fn reconnect_controller_error_outcome(
     // race must never enter, and with no `lock_contention` reason for the
     // `lock_timeout` rollout to watch.
     //
-    // This is load-bearing today, not pre-emptive. The call site below at
-    // `access_sandbox_ip`'s error arm carries a `ControllerError` straight from
-    // the substrate: the Kubernetes impl converts `suspend_restore_plan` and
-    // `resolve_pod_ip` with `ControllerError::from`, both are `db_context`
-    // classified, and `From<SubstrateError>` turns `LockContention` into
-    // `ControllerError::lock_contention`. So every ECW data-plane access that
-    // loses a row lock on `sandboxes` or `sandbox_k8s_executions` reaches here
-    // as a contention error.
+    // Pre-emptive today. The only production caller, the `Wake` /
+    // `ImplicitWake` admission check in `SandboxController::action`, passes a
+    // cluster-admission rejection (a 429), which never carries the
+    // lock-contention marker. The arm is for a caller that forwards a
+    // substrate error: `From<SubstrateError>` turns `LockContention` into
+    // `ControllerError::lock_contention`, which would otherwise be labelled
+    // `wake_failed` / `unavailable` here. `reconnect_metrics_tests` pins it.
     if err.is_lock_contention() {
         return (
             ReconnectOutcome::Exhausted,
@@ -1178,105 +1149,6 @@ impl SandboxController {
         role_filter: Option<&str>,
     ) -> Result<Option<Vec<NodeInventoryEntry>>, SubstrateError> {
         self.substrate.list_inventory_nodes(role_filter).await
-    }
-
-    pub async fn sandbox_ip(
-        &self,
-        sandbox_id: SandboxId,
-    ) -> Result<Option<String>, ControllerError> {
-        self.substrate.sandbox_ip(sandbox_id).await
-    }
-
-    pub async fn access_sandbox_ip(
-        &self,
-        pool: &PgPool,
-        sandbox: &Sandbox,
-    ) -> Result<Option<String>, ControllerError> {
-        let reconnect_started_at = std::time::Instant::now();
-        let initial_lifecycle = sandbox.lifecycle.as_str();
-        let metric_identity = SandboxApiMetricIdentity::native("access");
-        lifecycle::ensure_access_path_not_blocked_by_drain(
-            pool,
-            sandbox,
-            lifecycle::SandboxAction::Access,
-        )
-        .await
-        .inspect_err(|_| {
-            record_reconnect_attempt(
-                metric_identity,
-                initial_lifecycle,
-                ReconnectOutcome::Rejected,
-                ReconnectTerminalPhase::Api,
-                ReconnectReason::DrainBlocked,
-                reconnect_started_at,
-            );
-        })?;
-        // Charge the cluster activation limiter when this access will restore a
-        // suspended sandbox or boot a created one (the implicit data-plane wake
-        // vector). Live/paused reconnects classify as no-op and don't spend a
-        // token. Fails open on limiter errors, so an Err here is a genuine
-        // activation rejection (429/backpressure) — record it on the reconnect
-        // series so a control-plane-throttled data-plane retry storm isn't
-        // invisible to the retry-storm monitor.
-        lifecycle::charge_implicit_access_activation(
-            self.cluster_admission.as_ref(),
-            sandbox,
-            ExecutionActivityKind::Access,
-        )
-        .await
-        .inspect_err(|err| {
-            let (outcome, terminal_phase, reason) =
-                reconnect_controller_error_outcome(initial_lifecycle, err);
-            record_reconnect_attempt(
-                metric_identity,
-                initial_lifecycle,
-                outcome,
-                terminal_phase,
-                reason,
-                reconnect_started_at,
-            );
-        })?;
-        match self
-            .substrate
-            .access_sandbox_ip(
-                metric_identity,
-                sandbox,
-                DEFAULT_BLOCKING_WAIT_TIMEOUT,
-                crate::controllers::substrate::RecoveryCharge::enforce(
-                    self.cluster_admission.as_ref(),
-                ),
-            )
-            .await
-        {
-            Ok(result) => {
-                if let Some((outcome, terminal_phase, reason)) =
-                    successful_access_reconnect_outcome(initial_lifecycle)
-                {
-                    record_reconnect_attempt(
-                        metric_identity,
-                        initial_lifecycle,
-                        outcome,
-                        terminal_phase,
-                        reason,
-                        reconnect_started_at,
-                    );
-                }
-                Ok(result)
-            }
-            Err(err) => {
-                let (outcome, terminal_phase, reason) =
-                    reconnect_controller_error_outcome(initial_lifecycle, &err);
-                record_reconnect_attempt(
-                    metric_identity,
-                    initial_lifecycle,
-                    outcome,
-                    terminal_phase,
-                    reason,
-                    reconnect_started_at,
-                );
-                Err(err)
-            }
-        }
     }
 
     /// Read the sandbox's wake-convergence signal fresh from Postgres.

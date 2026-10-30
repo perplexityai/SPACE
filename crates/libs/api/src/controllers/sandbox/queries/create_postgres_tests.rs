@@ -908,20 +908,6 @@ impl SubstrateAdapter for RetryingPoolSubstrate {
         panic!("unused")
     }
 
-    async fn sandbox_ip(&self, _sandbox_id: SandboxId) -> Result<Option<String>, ControllerError> {
-        panic!("unused")
-    }
-
-    async fn access_sandbox_ip(
-        &self,
-        _metric_identity: SandboxApiMetricIdentity,
-        _sandbox: &Sandbox,
-        _timeout: Duration,
-        _charge: crate::controllers::substrate::RecoveryCharge,
-    ) -> Result<Option<String>, ControllerError> {
-        panic!("unused")
-    }
-
     async fn builder_client(
         &self,
     ) -> Result<crate::controllers::substrate::BuilderClient, ControllerError> {
@@ -1241,20 +1227,6 @@ impl SubstrateAdapter for NodeRpcStubbedKubernetes {
         _timeout: Duration,
         _charge: crate::controllers::substrate::RecoveryCharge,
     ) -> Result<RuntimeClient, ControllerError> {
-        panic!("unused")
-    }
-
-    async fn sandbox_ip(&self, _sandbox_id: SandboxId) -> Result<Option<String>, ControllerError> {
-        panic!("unused")
-    }
-
-    async fn access_sandbox_ip(
-        &self,
-        _metric_identity: SandboxApiMetricIdentity,
-        _sandbox: &Sandbox,
-        _timeout: Duration,
-        _charge: crate::controllers::substrate::RecoveryCharge,
-    ) -> Result<Option<String>, ControllerError> {
         panic!("unused")
     }
 

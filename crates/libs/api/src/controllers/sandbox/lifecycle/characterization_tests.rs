@@ -319,7 +319,6 @@ async fn non_lifecycle_actions_are_bad_requests_and_write_nothing() -> TestResul
     // Direct is only a placeholder here: this test never reaches the substrate.
     let controller = direct_controller(pool);
     let internal_labels = [
-        SandboxAction::Access,
         SandboxAction::Stats,
         SandboxAction::OpenPort,
         SandboxAction::Rollback,

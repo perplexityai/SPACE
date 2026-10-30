@@ -9,17 +9,17 @@
 # that adds an entry or raises a cap is reported.
 
 [file_size]
-"crates/libs/api/src/controllers/sandbox/lifecycle.rs" = 1825
-"crates/libs/api/src/controllers/sandbox/mod.rs" = 1193
+"crates/libs/api/src/controllers/sandbox/lifecycle.rs" = 1815
+"crates/libs/api/src/controllers/sandbox/mod.rs" = 1086
 "crates/libs/api/src/controllers/sandbox/queries.rs" = 2571
 "crates/libs/api/src/controllers/sandbox/spaced.rs" = 1113
 "crates/libs/api/src/controllers/sandbox/updates.rs" = 1008
 "crates/libs/api/src/controllers/substrate/direct.rs" = 3907
-"crates/libs/api/src/controllers/substrate/kubernetes/adapter/substrate_adapter.rs" = 2467
+"crates/libs/api/src/controllers/substrate/kubernetes/adapter/substrate_adapter.rs" = 2344
 "crates/libs/api/src/controllers/substrate/kubernetes/execution.rs" = 1670
 "crates/libs/api/src/controllers/substrate/kubernetes/pod_ops/ensure_pod.rs" = 1111
 "crates/libs/api/src/controllers/substrate/kubernetes/support.rs" = 1018
-"crates/libs/api/src/controllers/substrate/mod.rs" = 2771
+"crates/libs/api/src/controllers/substrate/mod.rs" = 2089
 "crates/libs/api/src/fork_operation_executor.rs" = 1755
 "crates/libs/api/src/public_operations.rs" = 1787
 "crates/libs/api/src/public_sandbox_operations.rs" = 1023
