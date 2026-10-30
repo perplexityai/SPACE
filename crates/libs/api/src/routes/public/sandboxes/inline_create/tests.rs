@@ -1036,4 +1036,225 @@ mod postgres {
         assert_eq!(script.calls(), 2);
         Ok(())
     }
+
+    /// Returns once `script`'s execution has started, failing the test if
+    /// it does not within a few seconds.
+    async fn started(script: &ScriptedCreate) {
+        tokio::time::timeout(Duration::from_secs(10), script.0.started.notified())
+            .await
+            .expect("the inline execution starts");
+    }
+
+    /// Cold creates, and every other inline-capable kind listed in `kinds`,
+    /// offered to `script` by a process with `max_concurrent` permits and
+    /// `org_limit`.
+    fn cold_inline(
+        script: &ScriptedCreate,
+        kinds: &[OperationKind],
+        max_concurrent: usize,
+        org_limit: Option<u32>,
+    ) -> crate::inline_operations::InlineLifecycle {
+        crate::inline_operations::InlineLifecycle::new(
+            InlineOperations::new(
+                InlineOperationsConfig {
+                    enabled: true,
+                    kinds: kinds.to_vec(),
+                    max_concurrent,
+                    org_limit: org_limit.and_then(std::num::NonZeroU32::new),
+                },
+                TaskTracker::new(),
+                DrainSignal::new(),
+                OperationExecutionConfig::default(),
+                true,
+            ),
+            Arc::new(script.clone()),
+            pplx_space_feature_flags::FeatureFlagClient::disabled(),
+        )
+    }
+
+    /// `POST /v1/sandboxes` with admission-time claiming off, so every
+    /// create is cold, offered to `inline`, under `quota`.
+    async fn create_cold(
+        fixture: &AdmissionPoolFixture,
+        inline: &crate::inline_operations::InlineLifecycle,
+        idempotency_key: &str,
+        quota: Option<crate::public_operations::SandboxQuota>,
+    ) -> Result<
+        pplx_space_public_api::SandboxOperationResponse,
+        crate::routes::public::error::PublicApiError,
+    > {
+        crate::routes::public::sandboxes::create_native_sandbox_operation(
+            &fixture.db.pool,
+            fixture.org_id,
+            fixture.user_id,
+            &pplx_space_common_core::types::IdempotencyKey::parse(idempotency_key)
+                .expect("test key parses"),
+            fixture.request(),
+            None,
+            None,
+            quota,
+            Some(inline),
+        )
+        .await
+    }
+
+    /// Why a cold create offered for inline execution is left queued.
+    #[derive(Debug, Clone, Copy)]
+    enum ColdFallback {
+        /// It isn't: it runs inline.
+        None,
+        /// `SPACE_NATIVE_INLINE_KINDS` doesn't list creates.
+        KindNotListed,
+        /// Another create holds the process's one permit.
+        Saturated,
+        /// Another create, in another process, holds the organization's one
+        /// inline slot.
+        OrgLimit,
+    }
+
+    /// A cold create offered for inline execution is claimed as it is
+    /// recorded and runs here, answering as a queued create does; refused,
+    /// it is recorded queued for the dispatcher at attempt 0, as with
+    /// inline execution off.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cold_create_runs_inline_or_is_queued_for_the_dispatcher() -> TestDbResult<()> {
+        let creates = &[OperationKind::CreateSandbox][..];
+        for case in [
+            ColdFallback::None,
+            ColdFallback::KindNotListed,
+            ColdFallback::Saturated,
+            ColdFallback::OrgLimit,
+        ] {
+            let fixture = AdmissionPoolFixture::new(1).await?;
+            let script = ScriptedCreate::gated(Script::Succeed);
+            let inline = match case {
+                ColdFallback::None | ColdFallback::Saturated => {
+                    cold_inline(&script, creates, 1, None)
+                }
+                ColdFallback::KindNotListed => {
+                    cold_inline(&script, &[OperationKind::WakeSandbox], 4, None)
+                }
+                ColdFallback::OrgLimit => cold_inline(&script, creates, 4, Some(1)),
+            };
+            let holder = match case {
+                ColdFallback::Saturated => Some(
+                    create_cold(&fixture, &inline, "cold-holder", None)
+                        .await
+                        .expect("create is recorded"),
+                ),
+                ColdFallback::OrgLimit => {
+                    let other_process = cold_inline(&script, creates, 4, Some(1));
+                    Some(
+                        create_cold(&fixture, &other_process, "cold-holder", None)
+                            .await
+                            .expect("create is recorded"),
+                    )
+                }
+                ColdFallback::None | ColdFallback::KindNotListed => None,
+            };
+            if holder.is_some() {
+                started(&script).await;
+            }
+
+            let response = create_cold(&fixture, &inline, "cold-create", None)
+                .await
+                .expect("create is recorded");
+            assert_eq!(
+                response.operation, None,
+                "{case:?}: answers without waiting"
+            );
+            let row = operation_row(&fixture, response.operation_id).await?;
+            let payload = fixture.payload(response.operation_id).await?;
+            assert!(payload.pool_claim.is_none(), "{case:?}: a cold create");
+            match case {
+                ColdFallback::None => {
+                    assert_eq!((row.state.as_str(), row.attempts), ("running", 1));
+                    started(&script).await;
+                    script.open_gate();
+                    let row = wait_for_state(&fixture, response.operation_id, "succeeded").await?;
+                    assert_eq!((row.attempts, row.claim_generation), (1, 1));
+                    assert_eq!(
+                        event_types(&fixture, response.operation_id).await?,
+                        vec![
+                            "operation.created",
+                            "operation.claimed",
+                            "operation.completed"
+                        ]
+                    );
+                    assert_eq!(script.calls(), 1);
+                }
+                ColdFallback::KindNotListed | ColdFallback::Saturated | ColdFallback::OrgLimit => {
+                    assert_eq!(
+                        (row.state.as_str(), row.attempts),
+                        ("queued", 0),
+                        "{case:?}"
+                    );
+                    let claim = dispatcher_claim(&fixture).await?;
+                    assert_eq!(
+                        claim
+                            .operations
+                            .iter()
+                            .map(|operation| operation.id)
+                            .collect::<Vec<_>>(),
+                        vec![response.operation_id],
+                        "{case:?}: the dispatcher takes it"
+                    );
+                    assert_eq!(
+                        script.calls(),
+                        usize::from(holder.is_some()),
+                        "{case:?}: it never ran inline"
+                    );
+                }
+            }
+            if holder.is_some() {
+                script.open_gate();
+            }
+        }
+        Ok(())
+    }
+
+    /// A cold create at its organization's quota is refused before anything
+    /// is recorded or run, inline execution or not; a replay of the admitted
+    /// one answers with it and runs nothing again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cold_create_keeps_its_quota_and_replays_without_running_again() -> TestDbResult<()> {
+        let fixture = AdmissionPoolFixture::new(1).await?;
+        let script = ScriptedCreate::gated(Script::Succeed);
+        let inline = cold_inline(&script, &[OperationKind::CreateSandbox], 4, None);
+        let quota = Some(crate::public_operations::SandboxQuota {
+            org_id: fixture.org_id,
+            org_limit: Some(1),
+            subject: None,
+        });
+        let admitted = create_cold(&fixture, &inline, "cold-admitted", quota)
+            .await
+            .expect("create is recorded");
+        started(&script).await;
+
+        let refused = create_cold(&fixture, &inline, "cold-over-quota", quota)
+            .await
+            .expect_err("the in-flight create holds the quota");
+        let refused = axum::response::IntoResponse::into_response(refused);
+        assert_eq!(refused.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        let recorded: i64 = sqlx::query_scalar(sql!(
+            "SELECT COUNT(*) FROM public_operations WHERE org_id = $1"
+        ))
+        .bind(fixture.org_id)
+        .fetch_one(&fixture.db.pool)
+        .await?;
+        assert_eq!(recorded, 1);
+
+        let replay = create_cold(&fixture, &inline, "cold-admitted", quota)
+            .await
+            .expect("create is recorded");
+        assert_eq!(replay.operation_id, admitted.operation_id);
+        script.open_gate();
+        wait_for_state(&fixture, admitted.operation_id, "succeeded").await?;
+        let replay = create_cold(&fixture, &inline, "cold-admitted", None)
+            .await
+            .expect("create is recorded");
+        assert_eq!(replay.operation_id, admitted.operation_id);
+        assert_eq!(script.calls(), 1, "a single execution");
+        Ok(())
+    }
 }
