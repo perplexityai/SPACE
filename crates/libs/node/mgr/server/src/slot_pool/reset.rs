@@ -174,44 +174,70 @@ impl Drop for ResetClaim {
     }
 }
 
-pub(super) async fn reset_slot(pool: std::sync::Arc<NetworkPool>, slot_id: u32) {
+/// How a reset attempt ended, for the scheduler's retry pacing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ResetAttempt {
+    /// The reset ran, failed, found nothing to do or retains its own retry.
+    Done,
+    /// The reset did not start because this sandbox's mutation claim is held.
+    ClaimHeld { sandbox_id: String },
+}
+
+#[cfg(test)]
+pub(super) async fn reset_slot(pool: std::sync::Arc<NetworkPool>, slot_id: u32) -> ResetAttempt {
+    reset_slot_with(pool, slot_id, net::teardown_network).await
+}
+
+pub(super) async fn reset_slot_with(
+    pool: std::sync::Arc<NetworkPool>,
+    slot_id: u32,
+    teardown: fn(&str, &NetId, Option<&str>) -> Result<(), net::NetworkTeardownError>,
+) -> ResetAttempt {
     if pool.shutdown_token.is_cancelled() {
-        return;
+        return ResetAttempt::Done;
     }
     let Some(claim) = ResetClaim::acquire(&pool, slot_id) else {
         schedule_reset_retry(pool, slot_id);
-        return;
+        return ResetAttempt::Done;
     };
     let reset_started = Instant::now();
     let config = pool.config();
     let (record, reset_key, mutation_claim) = {
         let Ok(mut conn) = pool.db.lock() else {
-            return;
+            return ResetAttempt::Done;
         };
         let Ok(tx) = conn.transaction() else {
-            return;
+            return ResetAttempt::Done;
         };
         let record = match query_record_by_slot(&tx, slot_id) {
             Ok(Some(record)) => record,
             Ok(None) => {
                 claim.disarm();
-                return;
+                return ResetAttempt::Done;
             }
             Err(error) => {
                 tracing::warn!(slot_id, %error, "reset inventory unavailable; retry scheduled");
-                return;
+                return ResetAttempt::Done;
             }
         };
         if record.state != SlotState::Dirty && record.state != SlotState::Resetting {
             claim.disarm();
-            return;
+            return ResetAttempt::Done;
         }
         let mutation_claim = if record.info.sandbox_id.is_empty() {
             None
         } else {
             let Some(mutation_claim) = pool.try_claim_sandbox_mutation(&record.info.sandbox_id)
             else {
-                return; // ResetClaim schedules a bounded, deduplicated retry.
+                tracing::debug!(
+                    slot_id,
+                    sandbox_id = %record.info.sandbox_id,
+                    "network slot reset deferred while the sandbox mutation claim is held"
+                );
+                // The scheduler retries once the claim is released.
+                return ResetAttempt::ClaimHeld {
+                    sandbox_id: record.info.sandbox_id.clone(),
+                };
             };
             Some(mutation_claim)
         };
@@ -230,15 +256,15 @@ pub(super) async fn reset_slot(pool: std::sync::Arc<NetworkPool>, slot_id: u32) 
             Ok(changed) => changed,
             Err(error) => {
                 tracing::error!(slot_id, error = %error, "failed to persist network slot reset claim");
-                return;
+                return ResetAttempt::Done;
             }
         };
         if changed == 0 {
-            return;
+            return ResetAttempt::Done;
         }
         if let Err(error) = tx.commit() {
             tracing::error!(slot_id, error = %error, "failed to commit network slot reset claim");
-            return;
+            return ResetAttempt::Done;
         }
         (record, reset_key, mutation_claim)
     };
@@ -270,7 +296,7 @@ pub(super) async fn reset_slot(pool: std::sync::Arc<NetworkPool>, slot_id: u32) 
             "network slot reset deferred until host networking is ready"
         );
         schedule_reset_retry(pool, slot_id);
-        return;
+        return ResetAttempt::Done;
     }
 
     let previous_pod_netns = record.info.pod_netns.clone();
@@ -295,19 +321,19 @@ pub(super) async fn reset_slot(pool: std::sync::Arc<NetworkPool>, slot_id: u32) 
         let net = NetId::from_slot(slot_id);
         let ns = net.ns();
         if reset_kind == LeaseKind::Ephemeral {
-            net::teardown_network(&ns, &net, previous_pod_netns.as_deref())?;
+            teardown(&ns, &net, previous_pod_netns.as_deref())?;
             return Ok(());
         }
 
         if previous_pod_netns == target_pod_netns {
             if let Err(error) = net::reset_network_slot(&ns, &net, target_pod_netns.as_deref()) {
                 tracing::warn!(slot_id, error = %error, "in-place network slot reset failed; rebuilding slot");
-                setup_pool.handoff_network_namespace(slot_id, lease_info.generation, SlotState::Resetting, target_pod_netns.as_deref())?;
+                setup_pool.handoff_network_namespace_with(slot_id, lease_info.generation, SlotState::Resetting, target_pod_netns.as_deref(), teardown)?;
                 net::setup_network(&ns, &net, target_pod_netns.as_deref())
                     .map_err(classify_network_setup_error)?;
             }
         } else {
-            setup_pool.handoff_network_namespace(slot_id, lease_info.generation, SlotState::Resetting, target_pod_netns.as_deref())?;
+            setup_pool.handoff_network_namespace_with(slot_id, lease_info.generation, SlotState::Resetting, target_pod_netns.as_deref(), teardown)?;
             net::setup_network(&ns, &net, target_pod_netns.as_deref())
                 .map_err(classify_network_setup_error)?;
         }
@@ -329,7 +355,7 @@ pub(super) async fn reset_slot(pool: std::sync::Arc<NetworkPool>, slot_id: u32) 
             );
             let changed = {
                 let Ok(conn) = pool.db.lock() else {
-                    return;
+                    return ResetAttempt::Done;
                 };
                 let now = now_secs();
                 let result = if reset_kind == LeaseKind::Pooled {
@@ -389,7 +415,7 @@ pub(super) async fn reset_slot(pool: std::sync::Arc<NetworkPool>, slot_id: u32) 
                             "failed to persist reset network slot"
                         );
                         schedule_reset_retry(pool.clone(), slot_id);
-                        return;
+                        return ResetAttempt::Done;
                     }
                 }
             };
@@ -403,7 +429,7 @@ pub(super) async fn reset_slot(pool: std::sync::Arc<NetworkPool>, slot_id: u32) 
                     elapsed_ms = reset_started.elapsed().as_millis() as u64,
                     "network slot reset completed but lease changed before ready transition"
                 );
-                return;
+                return ResetAttempt::Done;
             }
             tracing::info!(
                 slot_id,
@@ -426,7 +452,7 @@ pub(super) async fn reset_slot(pool: std::sync::Arc<NetworkPool>, slot_id: u32) 
                 "network slot reset failed"
             );
             let Ok(conn) = pool.db.lock() else {
-                return;
+                return ResetAttempt::Done;
             };
             match error.disposition() {
                 SlotResetDisposition::WaitForLeaseProcess => {
@@ -484,7 +510,7 @@ pub(super) async fn reset_slot(pool: std::sync::Arc<NetworkPool>, slot_id: u32) 
                                 sandbox_id = ?reset_key.sandbox_id,
                                 "network slot reset retry skipped because lease changed before retry accounting"
                             );
-                            return;
+                            return ResetAttempt::Done;
                         }
                         Err(db_error) => {
                             tracing::error!(
@@ -538,7 +564,7 @@ pub(super) async fn reset_slot(pool: std::sync::Arc<NetworkPool>, slot_id: u32) 
                             } else {
                                 schedule_reset_retry(pool.clone(), slot_id);
                             }
-                            return;
+                            return ResetAttempt::Done;
                         }
                     };
                     if attempts >= MAX_SLOT_CLEANUP_RESET_RETRIES {
@@ -576,7 +602,7 @@ pub(super) async fn reset_slot(pool: std::sync::Arc<NetworkPool>, slot_id: u32) 
                                 schedule_reset_retry(pool.clone(), slot_id);
                             }
                         }
-                        return;
+                        return ResetAttempt::Done;
                     }
                     tracing::warn!(
                         slot_id,
@@ -654,7 +680,7 @@ pub(super) async fn reset_slot(pool: std::sync::Arc<NetworkPool>, slot_id: u32) 
                                 schedule_reset_retry(pool.clone(), slot_id);
                             }
                         }
-                        return;
+                        return ResetAttempt::Done;
                     }
                     tracing::warn!(
                         slot_id,
@@ -721,6 +747,7 @@ pub(super) async fn reset_slot(pool: std::sync::Arc<NetworkPool>, slot_id: u32) 
             }
         }
     }
+    ResetAttempt::Done
 }
 
 pub(super) fn schedule_reset_retry(pool: std::sync::Arc<NetworkPool>, slot_id: u32) {

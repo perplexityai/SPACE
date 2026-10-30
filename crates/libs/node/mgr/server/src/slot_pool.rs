@@ -630,6 +630,24 @@ impl NetworkPool {
         }
     }
 
+    /// Resolves once no claim of either kind is held on the sandbox.
+    pub(super) async fn sandbox_mutation_released(&self, sandbox_id: &str) {
+        loop {
+            let released = self.sandbox_mutations_released.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
+            if !self
+                .sandbox_mutations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(sandbox_id)
+            {
+                return;
+            }
+            released.await;
+        }
+    }
+
     /// Non-destructive host work shares protection against cleanup and reset.
     /// Resource-family gates separately serialize conflicting VM/device work;
     /// sidecars may start while preparation or snapshot load is still running.
