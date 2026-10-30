@@ -13,8 +13,10 @@ or drop:
   decisions and reconnect metrics with a bounded client id.
 - [PR #1061](https://github.com/perplexityai/SPACE/pull/1061) refuses an
   activation with a `503` when no eligible node has a free network slot.
-- [PR #1066](https://github.com/perplexityai/SPACE/pull/1066) adds a nullable
-  `activating_client_key` column to `sandbox_k8s_executions`.
+- [PR #1066](https://github.com/perplexityai/SPACE/pull/1066) adds the
+  nullable `sandboxes.activating_client_id` column (migration
+  `20261030070237_sandbox_activating_client_id`). It first added the column
+  to `sandbox_k8s_executions`, and was reworked to this RFC.
 - [PR #1068](https://github.com/perplexityai/SPACE/pull/1068) carries the
   activating client into admission, records it per execution generation and
   labels pods with it.
@@ -209,8 +211,8 @@ pull request.
 
 ## Why the in-flight attribution design changes
 
-PR #1066 and PR #1068 record the client on each `sandbox_k8s_executions`
-generation when it's inserted, and render the pod label from that row.
+PR #1066 and PR #1068, as first written, recorded the client on each
+`sandbox_k8s_executions` generation when it was inserted, and rendered the pod label from that row.
 Three problems follow:
 
 - **It's Kubernetes-only.** Direct has no generation rows.
@@ -513,8 +515,13 @@ constructor takes an `ActivationClient`, and PR #1068's client-less
 call site. Direct writes the record for a start only when the state is
 `Enforce` or `Paid`.
 
-**Shape.** No default, no backfill and no `CHECK`. Adding a nullable column
-without a default is catalog-only. There's no index, because nothing filters
+**Shape.** No default and no backfill. Adding a nullable column without a
+default is catalog-only. A format `CHECK` allows `NULL`, the reserved ids and
+the Kubernetes label-value grammar (at most 63 characters), as the
+data-store rules keep for fixed formats, so a write that bypasses the Rust
+parsing fails instead of storing a value no label could carry. It's added
+`NOT VALID`, so the migration doesn't scan `sandboxes`; it constrains every
+new write, and the existing rows are all `NULL`. There's no index, because nothing filters
 on the column. A change bumps `updated_at` through the existing trigger,
 about once per new pod.
 
@@ -851,7 +858,7 @@ operations, against the same Redis. Everything here applies there too:
 
 ## Alternatives considered
 
-- **Per-generation column (PR #1066 as written).** Kubernetes-only, needs
+- **Per-generation column (PR #1066's first version).** Kubernetes-only, needs
   inheritance in every generation insert, and records claims, not
   activations.
 - **Writing the record when a claim is won, or on success.** Every exit that
@@ -876,7 +883,7 @@ operations, against the same Redis. Everything here applies there too:
 | --- | --- | --- |
 | PR #1058, client id on limiter and reconnect metrics | keep; merge first | It becomes the resolver's home: reserve `native`, ignore non-label entries with a warning, and derive the metric tag from `ClientKey`. Interning and `overflow` stay a metrics rule. |
 | PR #1061, slot check with a `503` | keep, with two changes | Run the slot check whenever it's enabled, not only when the cluster limiter is. Pass its refusal through `control_runtime_client`'s fallback, using the `ControllerError` marker. |
-| PR #1066, execution-row column | rework | Move the column to `sandboxes` as `activating_client_id`, since it holds an id. Keep the migration's shape and its rollback note. |
+| PR #1066, the attribution column | rework | Now `sandboxes.activating_client_id` (migration `20261030070237_sandbox_activating_client_id`), moved from `sandbox_k8s_executions` because the record follows the sandbox's runtime on both substrates, not a Kubernetes generation, and renamed because it holds an id, not a key. It keeps the nullable, no-default, no-backfill shape and the rollback note, and adds the `NOT VALID` format `CHECK`. |
 | PR #1068, attribution and labels | rework | Keep the client in `RecoveryCharge`, the fork payload field, the pod label and the adoption patch, made synchronous and moved before the commit. Drop the generation-row writes, their inheritance logic, the change to `admit`'s signature and the fallback to `ClientKey::unknown`. Add `ActivationClient`, the `ChargeState` and `CapPolicy` split, the insert writes, the `attribute_runtime` store module with conditional pod-tracking writes, and the label in `SandboxPodView`. |
 | Concurrency limiter enforcement | turn on | Set `SPACE_API_CLIENT_CONCURRENCY_MODE=enforce` with caps. Gate ECW resume with `acquire_client_slot`, which needs the header threaded into `SandboxController::action`. |
 | Direct attribution | separate pull request | Write the record from the owned restore receipt, and from `persist_route_identity_receipt` for a charged start or a wake that started or restored the VM. Thread the client into `restore_execution_with_candidates`, and update the `direct.rs` module doc. |
@@ -889,12 +896,14 @@ operations, against the same Redis. Everything here applies there too:
    name the column. The migration's brief `ACCESS EXCLUSIVE` lock on a busy
    table can lose to a long transaction under the one-second
    `lock_timeout`, so rely on the migrator's retry and run it outside peak
-   load.
+   load. Its `NOT VALID` `CHECK` is added under the same lock and scans
+   nothing.
 2. Attribution ships to the API and the cluster controller, and changes no
    admission decision. During a mixed rollout, old images write no record
    and create unlabeled pods. When a new-image observer starts tracking such
    a pod, it sets the record to `NULL`, so that sandbox counts against no
-   one until its next activation under a new image. The live cap is still
+   one until a new-image activation with a client of its own (`Client` or
+   `Native`) sets it. An inheriting activation keeps `NULL` (Decision 1). The live cap is still
    off, so nothing enforced depends on it. Forks queued before the payload
    field fall back to `Inherit`.
 3. Enforce the concurrency limiter.
