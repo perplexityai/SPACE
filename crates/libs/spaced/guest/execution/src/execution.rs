@@ -42,6 +42,49 @@ pub struct ExecutionServiceConfig {
     pub native_upload_idle_timeout: Duration,
     /// Guest memory used to size retained process output; None uses the fallback budget.
     pub guest_memory_bytes: Option<u64>,
+    /// How long completed processes and keyed starts are kept for callers.
+    pub process_retention: ProcessRetention,
+}
+
+/// How long this service lifetime keeps what a retrying or reconnecting caller
+/// needs. A restart loses the retained records.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessRetention {
+    /// How long a completed process's exit stays replayable. When every record
+    /// slot is held, the record that completed first is evicted to admit a new start.
+    pub completed: Duration,
+    /// How long completed output and environment remain retained. Must not exceed
+    /// `completed`. Retained bytes still consume the shared output budget.
+    pub output: Duration,
+    /// How long a completed keyed start is remembered. The key store's fixed
+    /// capacity divided by this window bounds the sustained rate of keyed starts.
+    /// In-progress starts keep their fixed 60-second bound.
+    pub idempotency: Duration,
+}
+
+impl Default for ProcessRetention {
+    fn default() -> Self {
+        Self {
+            completed: process::COMPLETED_PROCESS_RETENTION,
+            output: process::COMPLETED_PROCESS_OUTPUT_RETENTION,
+            idempotency: IDEMPOTENCY_RECORD_TTL,
+        }
+    }
+}
+
+impl ProcessRetention {
+    fn validate(self) -> Result<(), CreateExecutionServiceError> {
+        let valid = |window: Duration| !window.is_zero() && window <= MAX_RETENTION;
+        if valid(self.completed)
+            && valid(self.output)
+            && valid(self.idempotency)
+            && self.output <= self.completed
+        {
+            Ok(())
+        } else {
+            Err(CreateExecutionServiceError::InvalidProcessRetention)
+        }
+    }
 }
 
 impl Default for ExecutionServiceConfig {
@@ -58,6 +101,7 @@ impl Default for ExecutionServiceConfig {
             cancellation_grace: filesystem::router::DEFAULT_CANCELLATION_GRACE,
             native_upload_idle_timeout: DEFAULT_NATIVE_UPLOAD_IDLE_TIMEOUT,
             guest_memory_bytes: None,
+            process_retention: ProcessRetention::default(),
             worker_executable: None,
             identity_policy: if cfg!(target_os = "linux") {
                 IdentityPolicy::Restricted
@@ -80,6 +124,10 @@ pub enum CreateExecutionServiceError {
     RestrictedRequiresPrivilege,
     #[error("cannot inspect launcher capabilities: {0}")]
     InspectPrivileges(#[source] std::io::Error),
+    #[error(
+        "process retention windows must be nonzero and at most seven days, with output no longer than completed retention"
+    )]
+    InvalidProcessRetention,
 }
 
 #[derive(Clone)]
@@ -141,6 +189,7 @@ impl ExecutionService {
         config: ExecutionServiceConfig,
         guest_cgroups: Option<Arc<ExecutionCgroups>>,
     ) -> Result<Self, CreateExecutionServiceError> {
+        config.process_retention.validate()?;
         let shutdown = shutdown.child_token();
         let filesystem = filesystem::FilesystemHandle::new(
             config.filesystem_execution,
@@ -169,10 +218,14 @@ impl ExecutionService {
                 default_working_dir: config.default_working_dir,
                 identity_policy: config.identity_policy,
                 process_env: RwLock::new(EnvMap::empty()),
-                processes: ProcessRegistry::new(process::ProcessOutputBudget::for_guest_memory(
-                    config.guest_memory_bytes,
-                )),
-                idempotency: IdempotencyStore::new("process"),
+                processes: ProcessRegistry::new(
+                    process::ProcessOutputBudget::for_guest_memory(config.guest_memory_bytes),
+                    config.process_retention,
+                ),
+                idempotency: IdempotencyStore::with_window(
+                    "process",
+                    config.process_retention.idempotency,
+                ),
                 filesystem,
                 guest_cgroups,
             }),

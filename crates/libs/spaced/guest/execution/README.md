@@ -47,6 +47,20 @@ and error evolution, requires a separate crate-level policy before stabilization
   executable during construction: an unreadable or invalid `/proc/self/exe`
   intentionally fails startup before readiness, rather than deferring that
   failure to the first filesystem request.
+- `ExecutionServiceConfig::process_retention` independently sets completed-exit,
+  completed-output and completed-start idempotency windows. Defaults preserve
+  guest behavior: 15 minutes for exits, 60 seconds for output and idempotency.
+  Records are lost on restart and the record that completed first is evicted at
+  capacity. Output/environment retention ends no later than record retention;
+  retaining output longer keeps its share of the shared output budget. A long
+  idempotency window lowers the sustained keyed-start rate the fixed key store
+  admits. In-progress starts keep their fixed 60-second bound regardless of these
+  windows. Each configured window must be nonzero and at most seven days, and
+  output retention must not exceed completed-record retention.
+  A key may outlive output or the record: a keyed Start retry after output expiry
+  returns Started followed by a lagged `ResourceExhausted`; after record expiry
+  it returns `FailedPrecondition` (process replay state expired). Neither outcome
+  starts a replacement process.
 - Linux identity workers require the daemon's privilege to install the requested
   OS account's groups and IDs; an unprivileged worker host is unsupported. Direct mode
   runs filesystem syscalls with the daemon's credentials; its `user` selects path
@@ -179,14 +193,14 @@ and error evolution, requires a separate crate-level policy before stabilization
   process groups while supervision is active. Background descendants that close
   or redirect inherited output can outlive a completed leader; draining this
   service does not establish that every descendant has exited.
-- A completed process stays connectable for 15 minutes after it exits, so a
+- By default, a completed process stays connectable for 15 minutes after it exits, so a
   client that reattaches still reads its exit, and the process list includes it
   with its exit when asked to (`include_exited`); by default it lists running
   processes only. A list request can name one `process_id`. The window is
   measured on the guest's monotonic clock, so time the sandbox spends suspended
   does not count. Starts beyond the 128-record limit evict the oldest completed
   records first, which can end it early. The record keeps its output only for
-  the start idempotency window (60 seconds), then just its command and exit,
+  the default output window (60 seconds), then just its command and exit,
   dropping its environment with the output. It closes its stdin and terminal
   descriptors when the process exits; a write still in flight then closes them
   when it returns. A caller-assigned process id stays in use for the whole
@@ -255,6 +269,10 @@ in the forked child before exec can fail. The real cgroup probe additionally
 verifies membership by start publication and inherited descendant membership.
 These checks cover placement and caller teardown, not resource limits or
 a complete sandbox isolation policy.
+
+Process-retention configuration is a separate extension described in the
+[process recovery RFC](../../../../../docs/space/rfcs/2026-10-25-process-recovery.md).
+It is not required to host the execution service under the embedding contract.
 
 The proposed support profile, ownership contract, and implementation acceptance
 criteria are in the [embedding RFC](../../../../../docs/space/rfcs/2026-10-06-guest-execution-embedding.md).
