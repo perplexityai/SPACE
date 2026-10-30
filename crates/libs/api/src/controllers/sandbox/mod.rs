@@ -493,7 +493,8 @@ fn wait_ready_reason(phase: WaitReadyTimeoutPhase) -> ReconnectReason {
 
 fn retry_after_cause_terminal_phase(cause: ControllerRetryAfterCause) -> ReconnectTerminalPhase {
     match cause {
-        ControllerRetryAfterCause::RestoreInFlight => ReconnectTerminalPhase::Restore,
+        ControllerRetryAfterCause::RestoreInFlight
+        | ControllerRetryAfterCause::RestoreSourcePending => ReconnectTerminalPhase::Restore,
         ControllerRetryAfterCause::PodNeverReady => ReconnectTerminalPhase::PodNeverReady,
         ControllerRetryAfterCause::ProxyUnreachable => ReconnectTerminalPhase::ProxyUnreachable,
         ControllerRetryAfterCause::GuestNotReady => ReconnectTerminalPhase::GuestNotReady,
@@ -508,6 +509,7 @@ fn retry_after_cause_terminal_phase(cause: ControllerRetryAfterCause) -> Reconne
 fn retry_after_cause_reason(cause: ControllerRetryAfterCause) -> ReconnectReason {
     match cause {
         ControllerRetryAfterCause::RestoreInFlight => ReconnectReason::RestoreInFlight,
+        ControllerRetryAfterCause::RestoreSourcePending => ReconnectReason::RestoreSourcePending,
         ControllerRetryAfterCause::PodNeverReady => ReconnectReason::PodNeverReady,
         ControllerRetryAfterCause::ProxyUnreachable => ReconnectReason::ProxyUnreachable,
         ControllerRetryAfterCause::GuestNotReady => ReconnectReason::GuestNotReady,
@@ -519,7 +521,8 @@ fn retry_after_cause_reason(cause: ControllerRetryAfterCause) -> ReconnectReason
 
 fn retry_after_cause_outcome(cause: ControllerRetryAfterCause) -> ReconnectOutcome {
     match cause {
-        ControllerRetryAfterCause::RestoreInFlight => ReconnectOutcome::WakeInProgress,
+        ControllerRetryAfterCause::RestoreInFlight
+        | ControllerRetryAfterCause::RestoreSourcePending => ReconnectOutcome::WakeInProgress,
         ControllerRetryAfterCause::PodNeverReady
         | ControllerRetryAfterCause::ProxyUnreachable
         | ControllerRetryAfterCause::GuestNotReady
@@ -548,12 +551,16 @@ fn reconnect_error_outcome(
 ) -> (ReconnectOutcome, ReconnectTerminalPhase, ReconnectReason) {
     match err {
         SubstrateError::RestoreInFlight { .. }
-        | SubstrateError::RestoreSourcePending { .. }
         | SubstrateError::SuspendInFlight { .. }
         | SubstrateError::ActivationInFlight { .. } => (
             ReconnectOutcome::WakeInProgress,
             ReconnectTerminalPhase::Restore,
             ReconnectReason::RestoreInFlight,
+        ),
+        SubstrateError::RestoreSourcePending { .. } => (
+            ReconnectOutcome::WakeInProgress,
+            ReconnectTerminalPhase::Restore,
+            ReconnectReason::RestoreSourcePending,
         ),
         SubstrateError::RestoreContextUnavailable { .. } => (
             ReconnectOutcome::WakeFailed,

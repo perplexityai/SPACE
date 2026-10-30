@@ -1499,6 +1499,10 @@ impl SubstrateAdapter for KubernetesSubstrate {
         sandbox_id: SandboxId,
         charge: crate::controllers::substrate::RecoveryCharge,
     ) -> Result<RuntimeClient, ControllerError> {
+        self.store
+            .ensure_local_suspend_restore_source(sandbox_id)
+            .await
+            .map_err(ControllerError::from)?;
         let sandbox_before_resolution = self
             .store
             .require_sandbox(sandbox_id)
@@ -1629,6 +1633,10 @@ impl SubstrateAdapter for KubernetesSubstrate {
         timeout: Duration,
         charge: crate::controllers::substrate::RecoveryCharge,
     ) -> Result<RuntimeClient, ControllerError> {
+        self.store
+            .ensure_local_suspend_restore_source(sandbox.id)
+            .await
+            .map_err(ControllerError::from)?;
         if is_suspended_lifecycle(&sandbox.lifecycle) {
             Self::should_allow_access_recovery(sandbox, activity)?;
             return self
@@ -1737,6 +1745,13 @@ impl SubstrateAdapter for KubernetesSubstrate {
         charge: crate::controllers::substrate::RecoveryCharge,
     ) -> Result<Option<String>, ControllerError> {
         let sandbox_id = sandbox.id;
+        // Inspect durability before the repairing resolver can retire the
+        // missing execution or clear its source-node association. Teardown
+        // uses that resolver too and deliberately does not take this gate.
+        self.store
+            .ensure_local_suspend_restore_source(sandbox_id)
+            .await
+            .map_err(ControllerError::from)?;
         let restore_plan = if is_suspended_lifecycle(&sandbox.lifecycle) {
             Some(
                 self.suspend_restore_plan(sandbox, false)
