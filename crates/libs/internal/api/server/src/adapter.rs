@@ -769,9 +769,9 @@ impl ClusterApi for ClusterApiService {
                 let row = match template_by_name.get(&template) {
                     Some(row) => row,
                     None => {
-                        tracing::warn!(
+                        tracing::debug!(
                             template,
-                            "node requested network policy for unknown template"
+                            "network policy not answered for a requested template"
                         );
                         return None;
                     }
@@ -904,9 +904,9 @@ impl ClusterApi for ClusterApiService {
                 let row = match by_name.get(&template) {
                     Some(row) => row,
                     None => {
-                        tracing::warn!(
+                        tracing::debug!(
                             template,
-                            "node requested base-snapshot policy for unknown template"
+                            "base-snapshot policy not answered for a requested template"
                         );
                         return None;
                     }
@@ -1095,7 +1095,7 @@ impl ClusterApi for ClusterApiService {
                 if releasable {
                     released.push(template);
                 } else {
-                    tracing::warn!(
+                    tracing::debug!(
                         template,
                         "node requested desired state for unknown template"
                     );
