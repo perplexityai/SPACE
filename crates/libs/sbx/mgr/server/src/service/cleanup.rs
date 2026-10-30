@@ -2361,8 +2361,57 @@ impl SandboxManagerService {
             |mut node_client| async move {
                 // Before every termination attempt: writes can land between
                 // a flush and a retried termination.
-                self.flush_guest_before_termination(sandbox_id, guest_flush)
-                    .await;
+                let row = match self.lookup_sandbox(sandbox_id) {
+                    Ok(row) => Some(row),
+                    Err(error) if error.code() == tonic::Code::NotFound => None,
+                    Err(error) => return Err(error),
+                };
+                use pplx_space_node_runtime_core::boot::{GuestProfile, GuestShutdown};
+                let shutdown_policy = match row.as_ref() {
+                    Some(row) => match row.execution_metadata.as_ref() {
+                        Some(execution) => match GuestProfile::resolve(execution, row.guest_image) {
+                            Ok(profile) => Some(profile.shutdown()),
+                            Err(error) => {
+                                tracing::warn!(sandbox_id, %error, "cannot resolve graceful shutdown; proceeding with fenced termination");
+                                None
+                            }
+                        },
+                        None if row.guest_image.legacy_transport() => Some(GuestShutdown::AgentFlush),
+                        None => None,
+                    },
+                    None => Some(GuestShutdown::AgentFlush),
+                };
+                let shutdown = match shutdown_policy {
+                    Some(GuestShutdown::Acpi) => Some(
+                        self.stop_firmware_guest(
+                            sandbox_id,
+                            job_id.as_ref(),
+                            immediate_kill
+                                || guest_flush
+                                    != crate::db::cleanup_jobs::GuestFlush::BeforeTermination,
+                        )
+                        .await?,
+                    ),
+                    Some(GuestShutdown::AgentFlush) => {
+                        self.flush_guest_before_termination(sandbox_id, guest_flush)
+                            .await;
+                        None
+                    }
+                    None => Some(super::guest_image::ShutdownOutcome::Unclassified),
+                };
+                if shutdown.is_some_and(|outcome| {
+                    !matches!(
+                        outcome,
+                        super::guest_image::ShutdownOutcome::GuestExitObserved
+                    )
+                }) {
+                    tracing::warn!(
+                        sandbox_id,
+                        ?job_id,
+                        ?shutdown,
+                        "terminating guest without observed exit"
+                    );
+                }
                 service_cleanup_via_node_with_options(
                     &self.db,
                     &mut node_client,
@@ -2375,7 +2424,22 @@ impl SandboxManagerService {
                     },
                     context,
                 )
-                .await
+                .await?;
+                if let Some(outcome) = shutdown {
+                    let mut details = SandboxEventDetails::default().operation("runtime_termination").reason(outcome.as_str());
+                    if let Some(row) = row
+                        && let Some(generation) = row.space_api_route_identity.execution_generation
+                    {
+                        details = details.execution_generation(generation.to_string());
+                    }
+                    emit_sandbox_event(
+                        sandbox_id,
+                        SandboxEventType::CleanupCompleted,
+                        SandboxEventSource::SbxManager,
+                        details,
+                    );
+                }
+                Ok(())
             },
         )
         .await
@@ -2924,6 +2988,12 @@ impl SandboxManagerService {
         guest_flush: crate::db::cleanup_jobs::GuestFlush,
     ) {
         if guest_flush != crate::db::cleanup_jobs::GuestFlush::BeforeTermination {
+            return;
+        }
+        if self
+            .lookup_sandbox(sandbox_id)
+            .is_ok_and(|sandbox| !sandbox.guest_image.expects_agent())
+        {
             return;
         }
         let flushed = within_stop_flush_budget(

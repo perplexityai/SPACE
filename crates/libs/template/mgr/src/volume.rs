@@ -1613,6 +1613,13 @@ async fn try_pull_from(
             PullError::Failure(PullFailure::ExecutionMetadataInvalid)
         })?;
 
+    if metadata.guest_image.is_some() {
+        warn!(
+            template = name,
+            "refusing unsupported or local-only guest image in template pull"
+        );
+        return Err(PullError::Failure(PullFailure::ExecutionMetadataInvalid));
+    }
     // 3. Build the download plan from `manifest.files` with the dedup
     //    rule: when both `X` and `X.zst` are listed (with a well-formed
     //    zstd descriptor), drop `X` and pull only `X.zst`. Decompression

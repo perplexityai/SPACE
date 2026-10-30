@@ -1,5 +1,5 @@
-//! Measurements authored from the existing SHA-256-pinned bytes using
-//! fsverity-utils: SHA-256, 4096-byte blocks, no salt. They are local integrity
+//! Measurements of the SHA-256-pinned bytes with the fs-verity SHA-256
+//! algorithm, 4096-byte blocks and no salt. They are local integrity
 //! metadata and do not change release, kernel or environment identities.
 
 use crate::verity::VerityDigest;
@@ -15,6 +15,10 @@ pub fn compiled_verity_digest(
 fn compiled_pins() -> Result<&'static BTreeMap<Digest, VerityDigest>, &'static super::CatalogError>
 {
     const PINS: &[(&str, &str)] = &[
+        (
+            "sha256:dc2fc8f0e43b96712d9fccc52a3a590769606412b3e1bc911d217addd3bef624",
+            "sha256:aaea9d4d97292b3313c6bb2ad5c9bc48cc2aa4e3e9bad535fb9aaae2bfa2d667",
+        ),
         (
             "sha256:4f4f98a3d661a40f3e5272627cc895a1b2e525f2f6bedf5f895f9cd21ba5c65b",
             "sha256:cd4561645a5536a9ec4e45039c25f46b364a3715590d64ebeabf0f0f03c35fe0",

@@ -14,6 +14,13 @@ fn recorded_execution_in(
     cache: &Path,
     sandbox_id: &str,
 ) -> Result<Option<ExecutionMetadata>, Status> {
+    Ok(recorded_artifact_in(cache, sandbox_id)?.map(|metadata| metadata.execution))
+}
+
+fn recorded_artifact_in(
+    cache: &Path,
+    sandbox_id: &str,
+) -> Result<Option<SandboxArtifactMetadata>, Status> {
     validate_sandbox_id(sandbox_id)?;
     let directory_path = cache.join(sandbox_id);
     match std::fs::symlink_metadata(directory_path.join("metadata.json")) {
@@ -44,10 +51,47 @@ fn recorded_execution_in(
             "sandbox execution metadata identity mismatch",
         ));
     }
-    Ok(Some(metadata.execution))
+    Ok(Some(metadata))
+}
+
+fn recorded_guest_network_in(
+    cache: &Path,
+    sandbox_id: &str,
+) -> Result<pplx_space_common_core::types::guest_image::GuestNetwork, Status> {
+    // Existing network intent survives catalog retirement. Parsing, file and
+    // sandbox identity checks remain mandatory; only absence means legacy.
+    Ok(recorded_artifact_in(cache, sandbox_id)?
+        .map(|metadata| metadata.guest_image().network())
+        .unwrap_or_default())
 }
 
 impl NodeManagerService {
+    pub(super) async fn recorded_guest_network(
+        &self,
+        sandbox_id: String,
+    ) -> Result<pplx_space_common_core::types::guest_image::GuestNetwork, Status> {
+        self.off_runtime("read recorded guest network", move || {
+            recorded_guest_network_in(Path::new(CACHE_DIR), &sandbox_id)
+        })
+        .await
+    }
+    pub(super) async fn recorded_guest_profile(
+        &self,
+        sandbox_id: String,
+    ) -> Result<Option<pplx_space_node_runtime_core::boot::GuestProfile>, Status> {
+        self.off_runtime("read guest profile", move || {
+            recorded_artifact_in(Path::new(CACHE_DIR), &sandbox_id)?
+                .map(|metadata| {
+                    pplx_space_node_runtime_core::boot::GuestProfile::resolve(
+                        &metadata.execution,
+                        metadata.guest_image(),
+                    )
+                    .map_err(|error| Status::failed_precondition(error.to_string()))
+                })
+                .transpose()
+        })
+        .await
+    }
     pub(super) async fn recorded_execution(
         &self,
         sandbox_id: String,
@@ -61,6 +105,39 @@ impl NodeManagerService {
 }
 
 impl NodeManagerService {
+    pub(super) async fn pin_runtime_owner(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<pplx_space_node_runtime_core::launch::ProcessObserver, Status> {
+        let slot = self
+            .pool
+            .get(sandbox_id)
+            .map_err(slot_store_status)?
+            .ok_or_else(|| Status::failed_precondition("runtime has no node lease"))?;
+        let id = sandbox_id.to_owned();
+        self.off_runtime("pin runtime control owner", move || {
+            let pid = super::runtime::registered_firecracker_pid(Path::new(RUN_DIR), &id)?;
+            let handle = crate::launch::ProcessHandle::open(pid.get().get())
+                .map_err(|e| Status::unavailable(e.to_string()))?;
+            // Re-observe cgroup registration after pinning the numeric PID.
+            let registered = super::runtime::registered_firecracker_pid(Path::new(RUN_DIR), &id)?;
+            if registered != pid
+                || handle
+                    .credentials_match(slot.sandbox_uid, slot.sandbox_uid)
+                    .map_err(|e| Status::unavailable(e.to_string()))?
+                    != Some(true)
+                || handle
+                    .program_matches("cloud-hypervisor")
+                    .map_err(|e| Status::unavailable(e.to_string()))?
+                    != Some(true)
+            {
+                return Err(Status::failed_precondition("runtime control owner changed"));
+            }
+            Ok(handle.into())
+        })
+        .await
+    }
+
     pub(super) async fn runtime_control(
         &self,
         runtime: pplx_space_common_core::types::RuntimeKind,
@@ -74,36 +151,7 @@ impl NodeManagerService {
         )
         .map_err(|e| Status::failed_precondition(e.to_string()))?;
         let peer = if runtime == pplx_space_common_core::types::RuntimeKind::CloudHypervisor {
-            let slot = self
-                .pool
-                .get(sandbox_id)
-                .map_err(slot_store_status)?
-                .ok_or_else(|| Status::failed_precondition("runtime has no node lease"))?;
-            let id = sandbox_id.to_owned();
-            Some(
-                self.off_runtime("pin runtime control owner", move || {
-                    let pid = super::runtime::registered_firecracker_pid(Path::new(RUN_DIR), &id)?;
-                    let handle = crate::launch::ProcessHandle::open(pid.get().get())
-                        .map_err(|e| Status::unavailable(e.to_string()))?;
-                    // Re-observe cgroup registration after pinning the numeric PID.
-                    let registered =
-                        super::runtime::registered_firecracker_pid(Path::new(RUN_DIR), &id)?;
-                    if registered != pid
-                        || handle
-                            .credentials_match(slot.sandbox_uid, slot.sandbox_uid)
-                            .map_err(|e| Status::unavailable(e.to_string()))?
-                            != Some(true)
-                        || handle
-                            .program_matches("cloud-hypervisor")
-                            .map_err(|e| Status::unavailable(e.to_string()))?
-                            != Some(true)
-                    {
-                        return Err(Status::failed_precondition("runtime control owner changed"));
-                    }
-                    Ok(handle.into())
-                })
-                .await?,
-            )
+            Some(self.pin_runtime_owner(sandbox_id).await?)
         } else {
             None
         };
@@ -115,6 +163,7 @@ impl NodeManagerService {
         &self,
         runtime: pplx_space_common_core::types::RuntimeKind,
         path: PathBuf,
+        source: pplx_space_node_runtime_core::boot::BootSource,
     ) -> Result<pplx_space_node_runtime_core::boot::StandaloneBoot, Status> {
         self.off_runtime("read runtime boot configuration", move || {
             let (parent, name) = super::artifact_fs::parent(&path)?;
@@ -130,7 +179,7 @@ impl NodeManagerService {
             }
             let text =
                 String::from_utf8(bytes).map_err(|e| Status::invalid_argument(e.to_string()))?;
-            pplx_space_node_runtime_core::boot::validate_standalone(runtime, &text)
+            pplx_space_node_runtime_core::boot::validate_standalone(runtime, &text, source)
                 .map_err(|e| Status::invalid_argument(e.to_string()))
         })
         .await

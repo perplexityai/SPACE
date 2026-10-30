@@ -12,6 +12,7 @@ use pplx_space_durations::parse_simple_duration_secs;
 fn disabled_policy_is_empty() {
     let policy = AutoLifecyclePolicy::disabled();
     assert!(policy.is_disabled());
+    assert!(!policy.requires_memory_lifecycle());
 }
 
 #[test]
@@ -35,6 +36,7 @@ fn normalization_preserves_explicitly_disabled_wake_sources() {
     .normalized();
 
     assert!(policy.wake.on.is_empty());
+    assert!(policy.requires_memory_lifecycle());
 }
 
 #[cfg(feature = "serde")]
