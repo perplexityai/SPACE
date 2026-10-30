@@ -678,6 +678,7 @@ pub(crate) mod service_tests {
         crate::db::insert_sandbox(
             conn,
             crate::db::InsertSandboxParams {
+                guest_image: Default::default(),
                 id: &sandbox_id_string,
                 uuid8: &uuid8,
                 state: SandboxState::Paused,
@@ -1635,7 +1636,7 @@ pub(crate) mod service_tests {
                 slot: 7,
                 guest_cid: 37,
                 pid: std::process::id(),
-                spaced_host_pid: 10001,
+                spaced_host_pid: Some(10001),
                 netgtw_pid: 10002,
                 vsock_uds_path: "/space/run/microvm/sandboxes/test/root/v.sock",
                 api_socket_path: "/space/run/microvm/sandboxes/test/api.sock",
@@ -2192,6 +2193,7 @@ pub(crate) mod service_tests {
             crate::db::insert_sandbox_with_cleanup_episode_and_route_evidence(
                 &db,
                 crate::db::InsertSandboxParams {
+                    guest_image: Default::default(),
                     id: &sandbox_id_string,
                     uuid8: &SandboxRuntimeLabel::from_sandbox_id(sandbox_id),
                     state: SandboxState::Creating,
@@ -4030,6 +4032,7 @@ pub(crate) mod service_tests {
             crate::db::insert_sandbox(
                 conn,
                 crate::db::InsertSandboxParams {
+                    guest_image: Default::default(),
                     id,
                     uuid8: &uuid8,
                     state,
@@ -4750,7 +4753,7 @@ pub(crate) mod service_tests {
     fn start_gate_marks_started_when_guest_ready_and_no_policy_expected() {
         let response = pplx_space_spaced_host_client::proto::WaitReadyResponse::default();
         assert!(matches!(
-            evaluate_start_gate(Ok(response), None),
+            evaluate_start_gate(Ok(response.into()), None),
             StartGate::Ready(_)
         ));
     }
@@ -4759,7 +4762,7 @@ pub(crate) mod service_tests {
     fn start_gate_marks_started_when_guest_ready_and_policy_installed() {
         let response = pplx_space_spaced_host_client::proto::WaitReadyResponse::default();
         assert!(matches!(
-            evaluate_start_gate(Ok(response), Some(Ok(()))),
+            evaluate_start_gate(Ok(response.into()), Some(Ok(()))),
             StartGate::Ready(_)
         ));
     }
@@ -4767,7 +4770,10 @@ pub(crate) mod service_tests {
     #[test]
     fn start_gate_fails_closed_when_policy_push_fails_even_if_guest_ready() {
         let response = pplx_space_spaced_host_client::proto::WaitReadyResponse::default();
-        match evaluate_start_gate(Ok(response), Some(Err(Status::internal("netgtw down")))) {
+        match evaluate_start_gate(
+            Ok(response.into()),
+            Some(Err(Status::internal("netgtw down"))),
+        ) {
             StartGate::NetworkPolicyFailed(status) => {
                 assert_eq!(status.code(), tonic::Code::Internal);
                 assert!(status.message().contains("netgtw down"));
@@ -4826,6 +4832,7 @@ pub(crate) mod service_tests {
         crate::db::insert_sandbox(
             &conn,
             crate::db::InsertSandboxParams {
+                guest_image: Default::default(),
                 id: &sandbox_id,
                 uuid8: &uuid8,
                 state: SandboxState::Paused,
@@ -4967,6 +4974,7 @@ pub(crate) mod service_tests {
         crate::db::insert_sandbox(
             &conn,
             crate::db::InsertSandboxParams {
+                guest_image: Default::default(),
                 id: &sandbox_id,
                 uuid8: &uuid8,
                 state: SandboxState::Paused,
@@ -5385,6 +5393,7 @@ pub(crate) mod service_tests {
         crate::db::insert_sandbox(
             &conn,
             crate::db::InsertSandboxParams {
+                guest_image: Default::default(),
                 id: &sandbox_id,
                 uuid8: &uuid8,
                 state: SandboxState::Paused,
@@ -6271,7 +6280,7 @@ pub(crate) mod service_tests {
             sandbox_id: &sandbox_id,
             boot_type: "snapshot",
             pid: 1,
-            spaced_host_pid: 2,
+            spaced_host_pid: Some(2),
             net_gateway_pid: 3,
             sandbox_uid: 10_000,
             network_slot: 1,
@@ -7060,7 +7069,7 @@ pub(crate) mod service_tests {
                 slot: 7,
                 guest_cid: 37,
                 pid: std::process::id(),
-                spaced_host_pid: 10001,
+                spaced_host_pid: Some(10001),
                 netgtw_pid: 10002,
                 vsock_uds_path: "/space/run/firecracker/sandboxes/test/root/v.sock",
                 api_socket_path: "/space/run/firecracker/sandboxes/test/api.sock",
@@ -7164,6 +7173,7 @@ pub(crate) mod service_tests {
         crate::db::insert_sandbox(
             conn,
             crate::db::InsertSandboxParams {
+                guest_image: Default::default(),
                 id,
                 uuid8: &uuid8,
                 state,
@@ -8601,7 +8611,7 @@ pub(crate) mod service_tests {
             slot,
             guest_cid: 37,
             pid: std::process::id(),
-            spaced_host_pid: 10001,
+            spaced_host_pid: Some(10001),
             netgtw_pid: 10002,
             vsock_uds_path: "/space/run/firecracker/sandboxes/test/root/v.sock",
             api_socket_path: "/space/run/firecracker/sandboxes/test/api.sock",
@@ -10626,6 +10636,7 @@ pub(crate) mod service_tests {
         service
             .watchdog
             .add_sandbox(crate::watchdog::SidecarInfo {
+                guest_image: Default::default(),
                 node_execution_id: None,
                 sandbox_id: sandbox_id.to_string(),
                 uid: None,
@@ -12471,7 +12482,7 @@ pub(crate) mod service_tests {
                     slot: 8,
                     guest_cid: 38,
                     pid: std::process::id(),
-                    spaced_host_pid: 10003,
+                    spaced_host_pid: Some(10003),
                     netgtw_pid: 10004,
                     vsock_uds_path: "/space/run/firecracker/sandboxes/replacement/root/v.sock",
                     api_socket_path: "/space/run/firecracker/sandboxes/replacement/api.sock",
@@ -13721,6 +13732,7 @@ pub(crate) mod service_tests {
         crate::db::insert_sandbox(
             conn,
             crate::db::InsertSandboxParams {
+                guest_image: Default::default(),
                 id,
                 uuid8: &uuid8,
                 state,
@@ -15874,7 +15886,7 @@ pub(crate) mod service_tests {
                 slot: 7,
                 guest_cid: 37,
                 pid: std::process::id(),
-                spaced_host_pid: 10001,
+                spaced_host_pid: Some(10001),
                 netgtw_pid: 10002,
                 vsock_uds_path: "/space/run/firecracker/sandboxes/test/root/v.sock",
                 api_socket_path: "/space/run/firecracker/sandboxes/test/api.sock",

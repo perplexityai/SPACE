@@ -509,7 +509,7 @@ fn inbound_reply_disable_fails_closed_without_rule_handle() {
 #[test]
 fn proxy_keeps_only_local_service_reply_exception() {
     let generated: serde_json::Value =
-        serde_json::from_str(&netgtw_tproxy_rules_json(12345)).unwrap();
+        serde_json::from_str(&netgtw_tproxy_rules_json(12345, false)).unwrap();
     let rules: Vec<_> = generated["nftables"]
         .as_array()
         .unwrap()
@@ -914,5 +914,34 @@ fn udp443_guardrail_requires_source_validation_and_packaged_policy() {
             defect == "before return",
             "{defect}: {result:?}"
         );
+    }
+}
+
+#[test]
+fn dhcp_bypass_is_owned_by_each_atomic_gateway_ruleset() {
+    for dhcp in [false, true] {
+        let generated: serde_json::Value =
+            serde_json::from_str(&netgtw_tproxy_rules_json(12345, dhcp)).unwrap();
+        let commands = generated["nftables"].as_array().unwrap();
+        let bypass = commands
+            .iter()
+            .position(|entry| entry["add"]["rule"]["comment"] == "execution-local-dhcp");
+        assert_eq!(bypass.is_some(), dhcp);
+        if let Some(bypass) = bypass {
+            let last_flush = commands
+                .iter()
+                .rposition(|entry| entry.get("flush").is_some())
+                .unwrap();
+            let first_tproxy = commands
+                .iter()
+                .position(|entry| {
+                    entry["add"]["rule"]["expr"]
+                        .as_array()
+                        .is_some_and(|expr| expr.iter().any(|e| e.get("tproxy").is_some()))
+                })
+                .unwrap();
+            assert!(last_flush < bypass && bypass < first_tproxy);
+            assert_eq!(commands[bypass]["add"]["rule"], guest_dhcp_proxy_rule());
+        }
     }
 }

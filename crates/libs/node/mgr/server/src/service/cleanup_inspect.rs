@@ -613,6 +613,8 @@ impl NodeManagerService {
             )));
         }
 
+        self.stop_guest_dhcp(sandbox_id).await?;
+
         // 6. Release network slot
         if info.is_some() {
             self.pool.release(sandbox_id).map_err(|error| {

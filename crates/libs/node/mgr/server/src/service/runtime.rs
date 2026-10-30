@@ -627,7 +627,11 @@ impl NodeManagerService {
                 SandboxEventSource::NodeManager,
             )
             .emit_with(details());
-            net::setup_tproxy(&ns_name, process_uid, &vpeer).map_err(|e| {
+            let dhcp = self
+                .recorded_guest_profile(req.sandbox_id.clone())
+                .await?
+                .is_some_and(|profile| profile.uses_dhcp());
+            net::setup_tproxy(&ns_name, process_uid, &vpeer, dhcp).map_err(|e| {
                 let status = Status::internal(format!("setup tproxy failed: {e}"));
                 SandboxEvent::new(
                     typed_sandbox_id,
@@ -834,6 +838,8 @@ impl NodeManagerService {
             // Any RPC error can leave either a live runtime or owned stop work.
             stop_sandbox_runtime_with_supervisor(self, sandbox_id, false, None).await?;
         }
+
+        self.stop_guest_dhcp(sandbox_id).await?;
 
         let info = self.pool.release(sandbox_id).map_err(|error| {
             SandboxEvent::new(

@@ -337,6 +337,17 @@ impl TemplateManagerService {
             .as_ref()
             .map(proto_policy_to_common)
             .transpose()?;
+        if let Some(policy) = auto_lifecycle.as_ref()
+            && policy.requires_memory_lifecycle()
+            && self
+                .template_guest_image(&req.template)
+                .await?
+                .is_some_and(|image| !image.supports_auto_memory_lifecycle())
+        {
+            return Err(Status::failed_precondition(
+                "agentless firmware guests do not support automatic pause or suspend",
+            ));
+        }
         let network_policy = req
             .network_policy
             .as_ref()
@@ -440,6 +451,11 @@ impl TemplateManagerService {
         let template = req.template.trim().to_string();
         validate_template_name(&template)?;
         let ensure_base_snapshot = req.ensure_base_snapshot;
+        if ensure_base_snapshot && self.template_guest_image(&template).await?.is_some() {
+            return Err(Status::failed_precondition(
+                "firmware guests do not support snapshots",
+            ));
+        }
         let snapshot_vcpu = optional_positive_or_default("snapshot_vcpu", req.snapshot_vcpu, 2)?;
         let snapshot_memory_mib =
             optional_positive_or_default("snapshot_memory_mib", req.snapshot_memory_mib, 1024)?;

@@ -524,6 +524,16 @@ impl ArtifactPublisher for LocalPublisher {
             .map_err(|error| refused(&error, false))?;
         let architecture = host();
         let publication = match artifact {
+            NodeArtifactRef::Boot(identity) => {
+                let pin = catalog
+                    .boot_artifact(identity, architecture)
+                    .ok_or_else(|| {
+                        PublisherError::Refused(Box::new(tonic::Status::failed_precondition(
+                            "no boot pins",
+                        )))
+                    })?;
+                self.store.publish_boot_artifact(pin, staged)
+            }
             NodeArtifactRef::Release(release, digest) => {
                 let pin = catalog
                     .release(release, architecture)
@@ -557,6 +567,7 @@ impl ArtifactPublisher for LocalPublisher {
 
     async fn remove(&self, artifact: &NodeArtifactRef) -> Result<bool, PublisherError> {
         let removed = match artifact {
+            NodeArtifactRef::Boot(identity) => self.store.remove_boot_artifact(identity),
             NodeArtifactRef::Release(release, digest) => {
                 self.store.remove_release(release, *digest)
             }

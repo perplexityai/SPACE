@@ -309,6 +309,56 @@ fn namespace_rules_json(
     )
 }
 
+/// Install only for an execution with a DHCP responder. Bootstrap packets have
+/// no source address yet; every other unassigned source still hits the normal
+/// anti-spoofing rule. The namespace and its rules are reclaimed with the slot.
+pub(crate) fn ensure_guest_dhcp_bootstrap(ns: &str) -> FirewallResult<()> {
+    let rule = guest_dhcp_bootstrap_rule();
+    let chain = nft_chain_json(Some(ns), "ip", SANDBOX_TABLE, PRE_TPROXY_GUARDRAILS_CHAIN)?;
+    if chain.as_ref().is_some_and(|chain| {
+        rule.get("expr")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|expressions| nft_chain_rule_position(chain, expressions).is_some())
+    }) {
+        return Ok(());
+    }
+    apply_nft_json(
+        &serde_json::json!({"nftables": [{"insert": {"rule": rule}}]}).to_string(),
+        Some(ns),
+    )
+}
+
+fn guest_dhcp_proxy_rule() -> serde_json::Value {
+    serde_json::json!({
+        "family": "ip", "table": PROXY_TABLE, "chain": "prerouting",
+        "comment": "execution-local-dhcp",
+        "expr": [
+            {"match": {"left": {"meta": {"key": "iifname"}}, "right": "tap0", "op": "=="}},
+            {"match": {"left": {"meta": {"key": "l4proto"}}, "right": "udp", "op": "=="}},
+            {"match": {"left": {"payload": {"protocol": "udp", "field": "sport"}}, "right": 68, "op": "=="}},
+            {"match": {"left": {"payload": {"protocol": "udp", "field": "dport"}}, "right": 67, "op": "=="}},
+            {"match": {"left": {"payload": {"protocol": "ip", "field": "daddr"}}, "right": {"set": ["255.255.255.255", crate::net::GUEST_GATEWAY]}, "op": "=="}},
+            {"return": null}
+        ]
+    })
+}
+
+fn guest_dhcp_bootstrap_rule() -> serde_json::Value {
+    serde_json::json!({
+        "family": "ip", "table": SANDBOX_TABLE, "chain": PRE_TPROXY_GUARDRAILS_CHAIN,
+        "comment": "execution-dhcp-bootstrap",
+        "expr": [
+            {"match": {"left": {"meta": {"key": "iifname"}}, "right": "tap0", "op": "=="}},
+            {"match": {"left": {"payload": {"protocol": "ip", "field": "saddr"}}, "right": "0.0.0.0", "op": "=="}},
+            {"match": {"left": {"payload": {"protocol": "ip", "field": "daddr"}}, "right": "255.255.255.255", "op": "=="}},
+            {"match": {"left": {"meta": {"key": "l4proto"}}, "right": "udp", "op": "=="}},
+            {"match": {"left": {"payload": {"protocol": "udp", "field": "sport"}}, "right": 68, "op": "=="}},
+            {"match": {"left": {"payload": {"protocol": "udp", "field": "dport"}}, "right": 67, "op": "=="}},
+            {"return": null}
+        ]
+    })
+}
+
 fn load_pre_tproxy_guardrail_rules() -> FirewallResult<String> {
     let policy = fs::read_to_string(PRE_TPROXY_GUARDRAILS_POLICY_PATH).map_err(|source| {
         FirewallError::ReadPreTproxyPolicy {
@@ -439,16 +489,29 @@ const PROXY_TABLE: &str = "proxy";
 /// 6. Create "inbound" chain at priority -1 for guest port allowlist (empty = all closed).
 ///
 /// Requires policy routing to be set up separately via `setup_tproxy_policy_routing`.
-pub fn setup_netgtw_tproxy_rules(ns: &str, uid: u32, vpeer: &str) -> FirewallResult<()> {
+pub fn setup_netgtw_tproxy_rules(
+    ns: &str,
+    uid: u32,
+    vpeer: &str,
+    dhcp: bool,
+) -> FirewallResult<()> {
     ensure_namespace_forward_drop_rules(ns, vpeer)?;
-    apply_nft_json(&netgtw_tproxy_rules_json(uid), Some(ns))
+    apply_nft_json(&netgtw_tproxy_rules_json(uid, dhcp), Some(ns))
 }
 
-fn netgtw_tproxy_rules_json(uid: u32) -> String {
+fn netgtw_tproxy_rules_json(uid: u32, dhcp: bool) -> String {
     // This function exclusively owns proxy/prerouting and proxy/divert; other
     // callers must not add rules there. Rebuild both in one nft transaction so
     // legacy broad reply exceptions cannot survive ahead of the corrected rules.
     let guest_gateway = crate::net::GUEST_GATEWAY;
+    let dhcp_rule = if dhcp {
+        format!(
+            "{},",
+            serde_json::json!({"add": {"rule": guest_dhcp_proxy_rule()}})
+        )
+    } else {
+        String::new()
+    };
     format!(
         r#"{{ "nftables": [
   {{ "add": {{ "table": {{ "family": "ip", "name": "{PROXY_TABLE}" }} }} }},
@@ -458,6 +521,7 @@ fn netgtw_tproxy_rules_json(uid: u32) -> String {
     "type": "filter", "hook": "prerouting", "prio": -149 }} }} }},
   {{ "flush": {{ "chain": {{ "family": "ip", "table": "{PROXY_TABLE}", "name": "prerouting" }} }} }},
   {{ "flush": {{ "chain": {{ "family": "ip", "table": "{PROXY_TABLE}", "name": "divert" }} }} }},
+  {dhcp_rule}
   {{ "add": {{ "rule": {{ "family": "ip", "table": "{PROXY_TABLE}", "chain": "prerouting",
     "expr": [
       {{ "match": {{ "left": {{ "meta": {{ "key": "mark" }} }},

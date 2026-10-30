@@ -3,6 +3,7 @@ use super::*;
 #[test]
 fn round_trip_preserves_shape() {
     let mut m = TemplateManifest {
+        guest_image: None,
         schema_version: None,
         execution: None,
         name: "seed".to_string(),
