@@ -1083,6 +1083,21 @@ mode = "required"
 [rules.layers.model_protocol.stale_entries]
 mode = "required"
 
+# An API crate uses another one only through its crate root (the items it
+# re-exports there) or through a client; an app may compose its children at
+# any path. The items each pair reaches inside the other's modules today are
+# listed in [layers.facades], as "<from>.<to>" = [<item>, ...]. The planned
+# fix for cluster-controller-server -> api is a shared operations crate, and
+# for the `proto` items, a client crate.
+[rules.layers.facades.no_crossing]     # an item reached inside an API crate's modules, unlisted
+mode = "advisory"
+
+[rules.layers.facades.no_new_entries]  # items the base branch's copy lacks
+mode = "advisory"
+
+[rules.layers.facades.stale_entries]   # listed items no longer reached
+mode = "advisory"
+
 [rules.layers.test_only]          # test_support only through dev-dependencies; nothing depends on tools
 mode = "required"
 

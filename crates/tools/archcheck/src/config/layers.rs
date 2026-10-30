@@ -134,6 +134,8 @@ pub struct LayersConfig {
     pub codec_features: EdgeBehaviours,
     pub domain_dependencies: EdgeBehaviours,
     pub model_protocol: EdgeBehaviours,
+    /// API crates used through their crate root or a client.
+    pub facades: EdgeBehaviours,
     pub test_only: BehaviourConfig,
     pub clients: BehaviourConfig,
     pub store_edges: BehaviourConfig,
@@ -484,6 +486,7 @@ struct PolicyTable {
     codec_features: Option<PolicyEdgeBehaviours>,
     domain_dependencies: Option<PolicyEdgeBehaviours>,
     model_protocol: Option<PolicyEdgeBehaviours>,
+    facades: Option<PolicyEdgeBehaviours>,
     test_only: Option<PolicyBehaviour>,
     clients: Option<PolicyBehaviour>,
     store_edges: Option<PolicyBehaviour>,
@@ -609,6 +612,7 @@ impl LayersPolicy {
             ("codec_features", table.codec_features),
             ("domain_dependencies", table.domain_dependencies),
             ("model_protocol", table.model_protocol),
+            ("facades", table.facades),
         ] {
             let Some(entry) = entry else { continue };
             for (behaviour, entry) in [

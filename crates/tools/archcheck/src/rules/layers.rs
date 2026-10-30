@@ -26,6 +26,9 @@
 //!   a package that does I/O, and no model on a protocol; each with a
 //!   baseline table. `single_user`: a hint for a Domain crate with one user
 //!   ([`domain`]).
+//! - `facades`: an API crate is used through its crate root or a client, not
+//!   through paths into its modules; with a baseline table of the items each
+//!   pair of packages reaches today.
 //! - `stale_entries` and `policy_changed`: entries of `[rules.layers]` that
 //!   no longer apply, and every change to it from the base branch's copy,
 //!   including its removal.
@@ -34,14 +37,17 @@
 //! layer directory leaves them alone.
 
 mod domain;
+mod facades;
 mod graph;
 mod policy;
+mod scan;
 mod storage;
 #[cfg(test)]
 mod tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use facades::FACADES;
 use graph::{
     Edge, Graph, Member, Problem, allowed_targets, dev_problem, file_owner, list, may_depend,
     member_layer, name_segments, production_problem, used_items,
@@ -70,10 +76,7 @@ impl Layers {
     /// Its baseline tables, `[layers.<check>]`, as `--write-baseline=<table>`
     /// takes them.
     pub fn table_names() -> Vec<String> {
-        CHECKS
-            .iter()
-            .map(|check| format!("{RULE}.{check}"))
-            .collect()
+        tables().map(|check| format!("{RULE}.{check}")).collect()
     }
 
     /// [`Self::table_names`] for a sentence: `a, b and c`.
@@ -85,7 +88,7 @@ impl Layers {
 const RULE: &str = Layers::NAME;
 const DIRECTION: &str = "direction";
 const DEV_DIRECTION: &str = "dev_direction";
-/// The checks with a baseline table, `[layers.<check>]`.
+/// The checks with a baseline table of edges, `[layers.<check>]`.
 const CHECKS: [&str; 6] = [
     DIRECTION,
     DEV_DIRECTION,
@@ -94,6 +97,12 @@ const CHECKS: [&str; 6] = [
     DOMAIN_DEPENDENCIES,
     MODEL_PROTOCOL,
 ];
+/// The checks with a baseline table, `[layers.<check>]`: those of
+/// [`CHECKS`], and `facades`, whose table lists items per pair of packages.
+fn tables() -> impl Iterator<Item = &'static str> {
+    CHECKS.into_iter().chain([FACADES])
+}
+
 /// Where a finding sends the reader for what belongs in each layer.
 const GUIDE: &str = "crates/tools/archcheck/README.md#layers";
 /// What the comparisons with the base branch's `ARCHITECTURE.toml` are, for
@@ -257,6 +266,7 @@ impl Rule for Layers {
                     .map(|violation| edge_finding(None, behaviour, mode, violation)),
             );
         }
+        findings.extend(facades::check(ctx, config, &graph));
         findings.extend(policy::stale_entries(ctx, config, &graph, verdicts));
         findings.extend(domain::single_user(ctx, config, &graph));
         findings.extend(storage::stale_entries(
@@ -284,8 +294,7 @@ impl Rule for Layers {
         if let BaseBaseline::NotGiven = ctx.base_baseline {
             return vec![BaseSkip::NotGiven.message(&format!("{} skipped", comparisons()))];
         }
-        CHECKS
-            .iter()
+        tables()
             .filter_map(|check| {
                 let skip = ctx.base_baseline.layers_table(check).err()?;
                 Some(skip.message(&format!("{RULE}.{check}.no_new_entries skipped")))
@@ -341,7 +350,8 @@ impl Rule for Layers {
     /// the rest, and adds none: an edge without an entry is listed, to fix.
     /// A hand-added entry fails `no_new_entries`; a reviewed, permanent
     /// exception to `direction` goes in `allowed_edges` instead. Every table
-    /// is always written.
+    /// is always written; for `[layers.facades]`, see
+    /// [`facades::update_baseline`].
     fn update_baseline(&self, ctx: &Context, baseline: &mut Baseline) -> Vec<NotAdded> {
         let Some(config) = &ctx.config.rules.layers else {
             return Vec::new();
@@ -386,6 +396,7 @@ impl Rule for Layers {
             }
             baseline.layers.insert(check.to_owned(), table);
         }
+        not_added.extend(facades::update_baseline(ctx, &graph, baseline));
         not_added
     }
 }
@@ -398,13 +409,12 @@ pub(crate) fn file_layer(ctx: &Context, path: &str) -> Option<Layer> {
     member_layer(config, file_owner(&ctx.crates, path)?).0
 }
 
-/// `layers.direction.no_new_entries, …, and layers.codec_features.no_new_entries`.
+/// `layers.direction.no_new_entries, … and layers.facades.no_new_entries`.
 fn comparisons() -> String {
-    let all: Vec<String> = CHECKS
-        .iter()
+    let comparisons: Vec<String> = tables()
         .map(|check| format!("{RULE}.{check}.no_new_entries"))
         .collect();
-    and_list(&all)
+    and_list(&comparisons)
 }
 
 /// `items` for a sentence: `a`, `a and b`, or `a, b and c`.
@@ -615,7 +625,7 @@ fn edge_finding(
 /// What the base branch's copy of a baselined check's table is, for
 /// `no_new_entries`.
 #[derive(Clone, Copy)]
-enum BaseEdges<'a> {
+pub(super) enum BaseEdges<'a> {
     Compare(&'a BTreeMap<String, BTreeSet<String>>),
     /// The base branch has no layers rule, or no such check, yet: every
     /// entry seeds the table.
@@ -624,7 +634,7 @@ enum BaseEdges<'a> {
     Skipped,
 }
 
-fn base_edges<'a>(ctx: &'a Context, check: &str) -> BaseEdges<'a> {
+pub(super) fn base_edges<'a>(ctx: &'a Context, check: &str) -> BaseEdges<'a> {
     static NONE: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let table = match ctx.base_baseline.layers_table(check) {
         Err(_) => return BaseEdges::Skipped,
@@ -638,6 +648,16 @@ fn base_edges<'a>(ctx: &'a Context, check: &str) -> BaseEdges<'a> {
     match (check_on_base(ctx, check), table) {
         (Some(true), _) | (None, BaseLayersTable::Missing) => BaseEdges::Compare(&NONE),
         _ => BaseEdges::Seeding,
+    }
+}
+
+/// Why the base branch's copy has no `check` table to compare with, for a
+/// seeding finding: `the base branch has no layers rule yet`.
+pub(super) fn seeded(ctx: &Context, check: &str) -> String {
+    if rule_on_base(ctx) == Some(true) {
+        format!("the base branch's layers rule has no {check} check yet")
+    } else {
+        "the base branch has no layers rule yet".to_owned()
     }
 }
 
@@ -705,11 +725,7 @@ fn baselined(
             },
         };
     let base = base_edges(ctx, check);
-    let seeded = if rule_on_base(ctx) == Some(true) {
-        format!("the base branch's layers rule has no {check} check yet")
-    } else {
-        "the base branch has no layers rule yet".to_owned()
-    };
+    let seeded = seeded(ctx, check);
     for (from, to) in table.iter() {
         let listed = format!("[{RULE}.{check}] in {BASELINE_FILE}");
         match base {

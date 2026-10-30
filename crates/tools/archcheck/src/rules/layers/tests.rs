@@ -8,10 +8,7 @@ use std::collections::BTreeMap;
 use super::{
     and_list,
     domain::{protocol_suffix, top_level},
-    graph::{
-        Member, Problem, file_owner, layer_dir, list, may_depend, name_segments, use_tree,
-        used_items,
-    },
+    graph::{Member, Problem, file_owner, layer_dir, list, may_depend, name_segments, used_items},
     storage::features_of,
 };
 use crate::{
@@ -22,7 +19,7 @@ use crate::{
 /// Every behaviour of `[rules.layers]`, as its key in `LayersPolicy.modes`.
 /// `LayersConfig` requires each and denies others, so this list is its
 /// list.
-const BEHAVIOURS: [&str; 26] = [
+const BEHAVIOURS: [&str; 29] = [
     "placement",
     "layout",
     "direction.no_crossing",
@@ -43,6 +40,9 @@ const BEHAVIOURS: [&str; 26] = [
     "model_protocol.no_crossing",
     "model_protocol.no_new_entries",
     "model_protocol.stale_entries",
+    "facades.no_crossing",
+    "facades.no_new_entries",
+    "facades.stale_entries",
     "test_only",
     "clients",
     "store_edges",
@@ -223,47 +223,16 @@ fn and_lists() {
     assert_eq!(and_list(&items(&["a", "b", "c"])), "a, b and c");
 }
 
-/// The paths a use tree or a path in code names, as a finding lists them.
-#[test]
-fn use_trees() {
-    let cases: &[(&str, &str, &[&str])] = &[
-        ("Item;", "", &["Item"]),
-        ("module::Item;", "", &["module::Item"]),
-        ("module :: Item ;", "", &["module::Item"]),
-        ("{A, b::C};", "", &["A", "b::C"]),
-        (
-            "{\n    a::{B, c::{D, self}},\n    E as F,\n    G,\n};",
-            "",
-            &["a::B", "a::c::D", "a::c", "E", "G"],
-        ),
-        ("{self, A};", "", &["A"]),
-        ("a::{self};", "", &["a"]),
-        ("a::*;", "", &["a"]),
-        ("*;", "", &[]),
-        ("{A,};", "", &["A"]),
-        ("Type::<u8>::new()", "", &["Type"]),
-        ("f(x)", "", &["f"]),
-        ("", "", &[]),
-        ("B, C", "a", &["a::B"]),
-    ];
-    for (text, prefix, expected) in cases {
-        let mut rest = *text;
-        let mut paths = Vec::new();
-        use_tree(&mut rest, prefix, &mut paths);
-        assert_eq!(paths, *expected, "{text:?}");
-    }
-    // The tree is consumed, up to what ends it.
-    let mut rest = "{A as B, C}; rest";
-    use_tree(&mut rest, "", &mut Vec::new());
-    assert_eq!(rest, "; rest");
-}
-
-/// The items a crate's files name through a dependency; none when the
-/// dependency has no name to find, as for a target without a library that
-/// the manifest doesn't rename.
+/// The items a crate's files name through a dependency, from use trees of
+/// any shape and from paths in code, but not from comments, literals or
+/// test code; none when the dependency has no name to find, as for a target
+/// without a library that the manifest doesn't rename.
 #[test]
 fn items_used_through_a_dependency() {
-    let text = "use dep::{A, b::C};\nfn f() { other::dep::x(); d::e(); }\n";
+    let text = "use dep::{A, b::{C, self}, e::*, F as G};\nuse dep::{self, *};\n\
+                fn f() { other::dep::x(); d::e(); dep::T::<u8>::new(); }\n\
+                // dep::Commented\nconst S: &str = \"dep::Quoted\";\n\
+                #[cfg(test)]\nfn t() { dep::InTests; }\n";
     let files = [ProductionFile {
         path: "member/src/lib.rs".to_owned(),
         text: text.to_owned(),
@@ -290,7 +259,17 @@ fn items_used_through_a_dependency() {
     };
     let used =
         |rename: Option<&str>, lib: &str| used_items(&files, &krate, &dependency(rename), lib);
-    assert_eq!(used(None, "dep"), ["dep::A", "dep::b::C"]);
+    assert_eq!(
+        used(None, "dep"),
+        [
+            "dep::A",
+            "dep::F",
+            "dep::T",
+            "dep::b",
+            "dep::b::C",
+            "dep::e"
+        ]
+    );
     assert_eq!(used(Some("d"), "dep"), ["d::e"]);
     assert_eq!(used(None, ""), Vec::<String>::new());
 }

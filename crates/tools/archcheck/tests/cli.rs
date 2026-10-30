@@ -4920,7 +4920,7 @@ fn pattern_ratchet_errors_point_at_the_line() {
 }
 
 /// Every behaviour of the layers rule, as `[rules.layers.<behaviour>]`.
-const LAYERS_BEHAVIOURS: [&str; 26] = [
+const LAYERS_BEHAVIOURS: [&str; 29] = [
     "placement",
     "layout",
     "direction.no_crossing",
@@ -4941,6 +4941,9 @@ const LAYERS_BEHAVIOURS: [&str; 26] = [
     "model_protocol.no_crossing",
     "model_protocol.no_new_entries",
     "model_protocol.stale_entries",
+    "facades.no_crossing",
+    "facades.no_new_entries",
+    "facades.stale_entries",
     "test_only",
     "clients",
     "store_edges",
@@ -6189,6 +6192,14 @@ fn layers_policy_changed() {
         "[rules.layers.direction.no_crossing]\nmode = \"required\"",
         "[rules.layers.direction.no_crossing]\nmode = \"advisory\"",
     );
+    let advisory_facades = required.replace(
+        "[rules.layers.facades.no_crossing]\nmode = \"required\"",
+        "[rules.layers.facades.no_crossing]\nmode = \"advisory\"",
+    );
+    let without_facades: String = required
+        .split_inclusive("[rules.")
+        .filter(|table| !table.starts_with("layers.facades."))
+        .collect();
     /// Name, the base's `ARCHITECTURE.toml`, this branch's, and each finding
     /// as the text of its line and its message.
     type Case<'a> = (&'a str, String, String, &'a [(&'a str, &'a str)]);
@@ -6396,6 +6407,38 @@ fn layers_policy_changed() {
                  advisory.",
             )],
         ),
+        (
+            "a facades mode changed",
+            required.clone(),
+            advisory_facades,
+            &[(
+                "[rules.layers.facades.no_crossing]",
+                "ARCHITECTURE.toml: layers.facades.no_crossing mode changed from required to \
+                 advisory.",
+            )],
+        ),
+        (
+            "the facades check new",
+            without_facades,
+            required.clone(),
+            &[
+                (
+                    "[rules.layers.facades.no_crossing]",
+                    "ARCHITECTURE.toml: layers.facades.no_crossing mode changed from unset to \
+                     required.",
+                ),
+                (
+                    "[rules.layers.facades.no_new_entries]",
+                    "ARCHITECTURE.toml: layers.facades.no_new_entries mode changed from unset to \
+                     required.",
+                ),
+                (
+                    "[rules.layers.facades.stale_entries]",
+                    "ARCHITECTURE.toml: layers.facades.stale_entries mode changed from unset to \
+                     required.",
+                ),
+            ],
+        ),
     ];
     for (name, base, policy, expected) in &cases {
         let ws = Layered {
@@ -6415,6 +6458,7 @@ fn layers_policy_changed() {
             if line.starts_with("[rules.layers.direction")
                 || line.starts_with("[rules.layers.codec_features")
                 || line.starts_with("[rules.layers.model_protocol")
+                || line.starts_with("[rules.layers.facades")
             {
                 want += 1;
             }
@@ -6572,8 +6616,8 @@ fn layers_configuration_errors() {
     let unknown_table = "is not a table of the layers rule: with [rules.layers] in \
                          ARCHITECTURE.toml, its tables are layers.direction, \
                          layers.dev_direction, layers.storage_access, layers.codec_features, \
-                         layers.domain_dependencies and layers.model_protocol, and without it \
-                         there are none";
+                         layers.domain_dependencies, layers.model_protocol and layers.facades, and \
+                         without it there are none";
     let cases: &[(&str, &str, String, &str)] = &[
         (
             "an unknown layer",
@@ -6645,6 +6689,22 @@ fn layers_configuration_errors() {
             "ARCHITECTURE.toml",
             config(ADVISORY),
             unknown_table,
+        ),
+        (
+            "a facades table of counts",
+            "architecture-baseline.toml",
+            "[file_size]\n[layers.facades]\npplx-space-c.pplx-space-a = 3\n[crate_names]\n"
+                .to_owned(),
+            "could not parse",
+        ),
+        (
+            "a facades behaviour missing",
+            "ARCHITECTURE.toml",
+            tables("").replace(
+                "[rules.layers.facades.stale_entries]\nmode = \"required\"\n",
+                "",
+            ),
+            "missing field `stale_entries`",
         ),
         (
             "a baseline table of edges that is not a list",
@@ -6852,8 +6912,8 @@ fn layers_rdjson_and_exit_codes() {
     let skips = [
         "archcheck: layers.direction.no_new_entries, layers.dev_direction.no_new_entries, \
          layers.storage_access.no_new_entries, layers.codec_features.no_new_entries, \
-         layers.domain_dependencies.no_new_entries and layers.model_protocol.no_new_entries \
-         skipped (no --base-baseline given)",
+         layers.domain_dependencies.no_new_entries, layers.model_protocol.no_new_entries and \
+         layers.facades.no_new_entries skipped (no --base-baseline given)",
         "archcheck: layers.policy_changed and layers.placement's check for new unmoved entries \
          skipped (no --base-architecture given)",
     ];
@@ -6966,8 +7026,8 @@ fn layers_rdjson_and_exit_codes() {
             "file_size.no_new_entries and file_size.no_raised_caps, \
              layers.direction.no_new_entries, layers.dev_direction.no_new_entries, \
              layers.storage_access.no_new_entries, layers.codec_features.no_new_entries, \
-             layers.domain_dependencies.no_new_entries and \
-             layers.model_protocol.no_new_entries skipped"
+             layers.domain_dependencies.no_new_entries, layers.model_protocol.no_new_entries \
+             and layers.facades.no_new_entries skipped"
         ),
         "{}",
         warnings[0]
@@ -6985,17 +7045,18 @@ fn layers_rdjson_and_exit_codes() {
         ],
     );
     assert_eq!(not_a_table.code, 0, "{}", not_a_table.stdout);
-    for check in [
-        "direction",
-        "dev_direction",
-        "storage_access",
-        "codec_features",
+    for skipped in [
+        "layers.direction.no_new_entries",
+        "layers.dev_direction.no_new_entries",
+        "layers.storage_access.no_new_entries",
+        "layers.codec_features.no_new_entries",
+        "layers.facades.no_new_entries",
     ] {
         assert!(
             not_a_table.stdout.lines().any(|line| line
                 .starts_with("archcheck: warning: could not parse ")
-                && line.ends_with(&format!("; layers.{check}.no_new_entries skipped"))),
-            "{check}: {}",
+                && line.ends_with(&format!("; {skipped} skipped"))),
+            "{skipped}: {}",
             not_a_table.stdout
         );
     }
@@ -7359,6 +7420,140 @@ fn storage_workspace(tables: &str, files: Vec<(&str, String)>) -> TempDir {
         extra: &STORAGE_EXTRA,
         tables,
         files: all,
+        ..Layered::default()
+    }
+    .build()
+}
+
+/// Members of a layered workspace whose API crates reach into each other,
+/// beside [`LAYERED`]'s: `pplx-space-c` and `pplx-space-e`, which depends on
+/// `pplx-space-a` renamed `api`, and on `pplx-space-c`.
+const FACADE_MEMBERS: [(&str, &str); 2] = [
+    ("crates/l40_api/c", "pplx-space-c"),
+    ("crates/l40_api/e", "pplx-space-e"),
+];
+
+/// The dependencies of [`FACADE_MEMBERS`] and of the app `pplx-space-p`.
+const FACADE_DEPENDENCIES: [(&str, &str, &str); 6] = [
+    ("pplx-space-c", "dependencies", "pplx-space-a"),
+    ("pplx-space-c", "dependencies", "pplx-space-a-client"),
+    ("pplx-space-c", "dependencies", "pplx-space-d"),
+    ("pplx-space-e", "dependencies", "api=pplx-space-a"),
+    ("pplx-space-e", "dependencies", "pplx-space-c"),
+    ("pplx-space-p", "dependencies", "pplx-space-a"),
+];
+
+/// Where `pplx-space-c` reaches into `pplx-space-a`.
+const C_SOURCE: &str = "crates/l40_api/c/src/lib.rs";
+
+/// Where `pplx-space-e` reaches through its crate root's alias.
+const E_INNER: &str = "crates/l40_api/e/src/inner.rs";
+
+/// The sources of a workspace where `pplx-space-c` reaches 3 items inside
+/// `pplx-space-a`'s modules, one under `proto`; `pplx-space-e` 2, by its
+/// renamed dependency and, from another file, through an alias of it at
+/// its crate root and a module imported through that; and `pplx-space-e`
+/// 1 inside `pplx-space-c`'s, which only it uses. Paths into the client,
+/// from the app, and from tests are not counted.
+fn facade_sources() -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "crates/l40_api/a/server/src/lib.rs",
+            "pub mod m;\npub mod proto {}\npub struct Root;\n".to_owned(),
+        ),
+        (
+            C_SOURCE,
+            "use pplx_space_a::{Root, m::{X, Y}};\nuse pplx_space_a_client::m::Z;\n\
+             fn f() -> pplx_space_a::proto::Request { pplx_space_a::m::X::new() }\n\
+             #[cfg(test)]\nmod tests;\npub mod jobs {}\n"
+                .to_owned(),
+        ),
+        (
+            "crates/l40_api/c/src/tests.rs",
+            "use pplx_space_a::m::InTests;\n".to_owned(),
+        ),
+        (
+            "crates/l40_api/e/src/lib.rs",
+            "use api::m::X;\n// pplx_space_a::m::Mentioned\npub use api as alias;\nmod inner;\n"
+                .to_owned(),
+        ),
+        (
+            E_INNER,
+            "use crate::alias::m;\nfn f() { m::Y::new(); pplx_space_c::jobs::Run::new(); }\n"
+                .to_owned(),
+        ),
+        (
+            "crates/l50_app/p/src/lib.rs",
+            "use pplx_space_a::m::Composed;\n".to_owned(),
+        ),
+    ]
+}
+
+/// The `[layers.facades]` entries of every item [`facade_sources`] reach.
+const FACADE_ITEMS: [(&str, &str, &[&str]); 3] = [
+    (
+        "pplx-space-c",
+        "pplx-space-a",
+        &["m::X", "m::Y", "proto::Request"],
+    ),
+    ("pplx-space-e", "pplx-space-a", &["m::X", "m::Y"]),
+    ("pplx-space-e", "pplx-space-c", &["jobs::Run"]),
+];
+
+/// A baseline with every layers table, `[layers.facades]` with these
+/// entries as `(from, to, items)` in generated form from line 5: each key
+/// on its line, then each item on its own.
+fn facades_baseline(entries: &[(&str, &str, &[&str])]) -> String {
+    let mut text =
+        "[file_size]\n[layers.dev_direction]\n[layers.direction]\n[layers.facades]\n".to_owned();
+    for (from, to, items) in entries {
+        text.push_str(&format!("\"{from}.{to}\" = [\n"));
+        for item in *items {
+            text.push_str(&format!("  {item:?},\n"));
+        }
+        text.push_str("]\n");
+    }
+    text.push_str("[crate_names]\n");
+    text
+}
+
+/// [`FACADE_ITEMS`] with `item` of `(from, to)` dropped.
+fn facade_items_without(
+    from: &str,
+    to: &str,
+    item: &str,
+) -> Vec<(&'static str, &'static str, Vec<&'static str>)> {
+    FACADE_ITEMS
+        .iter()
+        .map(|(f, t, items)| {
+            let items = items
+                .iter()
+                .copied()
+                .filter(|listed| (*f, *t, *listed) != (from, to, item))
+                .collect();
+            (*f, *t, items)
+        })
+        .collect()
+}
+
+/// [`facades_baseline`] of owned item lists.
+fn facades_baseline_of(entries: &[(&str, &str, Vec<&str>)]) -> String {
+    let entries: Vec<(&str, &str, &[&str])> = entries
+        .iter()
+        .map(|(from, to, items)| (*from, *to, items.as_slice()))
+        .collect();
+    facades_baseline(&entries)
+}
+
+/// A workspace of [`facade_sources`], with `baseline`.
+fn facade_workspace(baseline: String, mode: &str) -> TempDir {
+    let mut files = facade_sources();
+    files.push(("architecture-baseline.toml", baseline));
+    files.push(("ARCHITECTURE.toml", layers_config("", mode)));
+    Layered {
+        extra: &FACADE_MEMBERS,
+        dependencies: &FACADE_DEPENDENCIES,
+        files,
         ..Layered::default()
     }
     .build()
@@ -8912,4 +9107,627 @@ fn layers_single_user() {
         ),
     ];
     assert_eq!(hints, expected);
+}
+
+/// `(code, message, location, required)` of each `layers.facades` finding.
+fn facade_findings(ctx: &Context) -> Vec<(String, String, String, bool)> {
+    check(ctx)
+        .into_iter()
+        .filter(|finding| finding.instance.as_deref() == Some("facades"))
+        .map(|finding| {
+            let at = format!("{}:{}", finding.location.path, finding.location.line);
+            (
+                finding.code(),
+                finding.message(),
+                at,
+                finding.mode.is_required(),
+            )
+        })
+        .collect()
+}
+
+/// Each item a pair reaches inside an API crate's modules is listed under
+/// the pair in `[layers.facades]`: an item it doesn't list is shown where
+/// it is first named, with the pair's total and modules; a listed item no
+/// longer reached, or under a pair that reaches nothing the check counts,
+/// is stale. Paths into a client, from an app, in test files or comments,
+/// and of a name the crate does not import are not counted.
+#[test]
+fn layers_facades() {
+    const C_TO_A: &str = "pplx-space-c -> pplx-space-a: ";
+    let crossing = |item: &str| {
+        format!(
+            "{C_TO_A}pplx-space-c reaches pplx_space_a::{item}, which [layers.facades] in \
+             architecture-baseline.toml does not list, rather than through pplx-space-a's crate \
+             root; in all it reaches 3 items inside pplx-space-a's modules (m 2, proto 1), 1 of \
+             them under proto. An API crate uses another only through its root, the items it \
+             re-exports there, or a client. Fix one of: re-export the items pplx-space-c uses at \
+             pplx-space-a's crate root (`pub use`) and import them from there; or, since \
+             pplx-space-a is already a library 2 crates share, move the code to where it \
+             belongs: a crate of its own, or pplx-space-c if only it uses it; for the proto \
+             items, a client or protocol crate that both use, which this check does not count. \
+             See crates/tools/archcheck/README.md#layers."
+        )
+    };
+    let e_crossing = |item: &str| {
+        format!(
+            "pplx-space-e -> pplx-space-a: pplx-space-e reaches pplx_space_a::{item}, which \
+             [layers.facades] in architecture-baseline.toml does not list, rather than through \
+             pplx-space-a's crate root; in all it reaches 2 items inside pplx-space-a's modules \
+             (m 2)."
+        )
+    };
+    let stale = |pair: &str, item: &str, reason: &str| {
+        format!(
+            "{pair}: lists {item} in [layers.facades] in architecture-baseline.toml, but \
+             {reason}. Remove the entry (cargo arch --write-baseline=layers.facades)."
+        )
+    };
+    let all = facade_items_without("", "", "");
+    /// Name, entries, and `(code, start of message, location)` of each
+    /// finding.
+    type Case<'a> = (
+        &'a str,
+        Vec<(&'a str, &'a str, Vec<&'a str>)>,
+        Vec<(&'a str, String, String)>,
+    );
+    let cases: Vec<Case> = vec![
+        ("every item listed", all.clone(), vec![]),
+        (
+            "no entries",
+            vec![],
+            vec![
+                (
+                    "layers.facades.no_crossing",
+                    crossing("m::X"),
+                    format!("{C_SOURCE}:1"),
+                ),
+                (
+                    "layers.facades.no_crossing",
+                    crossing("m::Y"),
+                    format!("{C_SOURCE}:1"),
+                ),
+                (
+                    "layers.facades.no_crossing",
+                    crossing("proto::Request"),
+                    format!("{C_SOURCE}:3"),
+                ),
+                (
+                    "layers.facades.no_crossing",
+                    e_crossing("m::X"),
+                    "crates/l40_api/e/src/lib.rs:1".to_owned(),
+                ),
+                (
+                    "layers.facades.no_crossing",
+                    e_crossing("m::Y"),
+                    format!("{E_INNER}:2"),
+                ),
+                (
+                    "layers.facades.no_crossing",
+                    "pplx-space-e -> pplx-space-c: pplx-space-e reaches pplx_space_c::jobs::Run, \
+                     which [layers.facades] in architecture-baseline.toml does not list, rather \
+                     than through pplx-space-c's crate root; in all it reaches 1 item inside \
+                     pplx-space-c's modules (jobs 1). An API crate uses another only through its \
+                     root, the items it re-exports there, or a client. Fix one of: re-export the \
+                     items pplx-space-e uses at pplx-space-c's crate root (`pub use`) and import \
+                     them from there; or move the code they belong to out of pplx-space-c, into \
+                     a crate both can depend on, such as a shared l40_api crate for operations \
+                     both services run. See crates/tools/archcheck/README.md#layers."
+                        .to_owned(),
+                    format!("{E_INNER}:2"),
+                ),
+            ],
+        ),
+        (
+            "an item unlisted",
+            facade_items_without("pplx-space-c", "pplx-space-a", "m::Y"),
+            vec![(
+                "layers.facades.no_crossing",
+                crossing("m::Y"),
+                format!("{C_SOURCE}:1"),
+            )],
+        ),
+        (
+            "items that are not reached",
+            vec![
+                ("pplx-space-c", "", vec!["m::X"]),
+                (
+                    "pplx-space-c",
+                    "pplx-space-a",
+                    vec!["m::Gone", "m::X", "m::Y", "proto::Request"],
+                ),
+                ("pplx-space-c", "pplx-space-a-client", vec!["m::Z"]),
+                ("pplx-space-c", "pplx-space-d", vec!["m::W"]),
+                ("pplx-space-e", "pplx-space-a", vec!["m::X", "m::Y"]),
+                ("pplx-space-e", "pplx-space-c", vec!["jobs::Run"]),
+                ("pplx-space-e", "pplx-space-gone", vec!["m::V"]),
+                ("pplx-space-f", "pplx-space-a", vec!["m::U"]),
+                ("pplx-space-p", "pplx-space-a", vec!["m::Composed"]),
+            ],
+            vec![
+                (
+                    "layers.facades.stale_entries",
+                    stale(
+                        "pplx-space-c.",
+                        "m::X",
+                        "its key, pplx-space-c., is not <from>.<to>",
+                    ),
+                    "architecture-baseline.toml:6".to_owned(),
+                ),
+                (
+                    "layers.facades.stale_entries",
+                    stale(
+                        "pplx-space-c -> pplx-space-a",
+                        "m::Gone",
+                        "pplx-space-c's production code no longer reaches pplx_space_a::m::Gone",
+                    ),
+                    "architecture-baseline.toml:9".to_owned(),
+                ),
+                (
+                    "layers.facades.stale_entries",
+                    stale(
+                        "pplx-space-c -> pplx-space-a-client",
+                        "m::Z",
+                        "pplx-space-a-client is a client, the way into its service, so paths \
+                         into it are not counted",
+                    ),
+                    "architecture-baseline.toml:15".to_owned(),
+                ),
+                (
+                    "layers.facades.stale_entries",
+                    stale(
+                        "pplx-space-c -> pplx-space-d",
+                        "m::W",
+                        "pplx-space-d is in l20_domain, not an l40_api crate with a library, so \
+                         paths into it are not counted",
+                    ),
+                    "architecture-baseline.toml:18".to_owned(),
+                ),
+                (
+                    "layers.facades.stale_entries",
+                    stale(
+                        "pplx-space-e -> pplx-space-gone",
+                        "m::V",
+                        "no workspace member is named pplx-space-gone",
+                    ),
+                    "architecture-baseline.toml:28".to_owned(),
+                ),
+                (
+                    "layers.facades.stale_entries",
+                    stale(
+                        "pplx-space-f -> pplx-space-a",
+                        "m::U",
+                        "pplx-space-f's production code no longer reaches inside \
+                         pplx-space-a's modules",
+                    ),
+                    "architecture-baseline.toml:31".to_owned(),
+                ),
+                (
+                    "layers.facades.stale_entries",
+                    stale(
+                        "pplx-space-p -> pplx-space-a",
+                        "m::Composed",
+                        "pplx-space-p is in l50_app, whose sources this check does not read: an \
+                         app composes its children at any path, and tools are never shipped",
+                    ),
+                    "architecture-baseline.toml:34".to_owned(),
+                ),
+            ],
+        ),
+    ];
+    for (name, entries, expected) in cases {
+        let ws = facade_workspace(facades_baseline_of(&entries), "required");
+        let found = facade_findings(&load(ws.path(), None));
+        assert_eq!(found.len(), expected.len(), "{name}: {found:#?}");
+        for ((code, message, at, required), (want_code, want_message, want_at)) in
+            found.iter().zip(&expected)
+        {
+            assert_eq!(code, want_code, "{name}: {message}");
+            assert!(
+                message.starts_with(want_message.as_str()),
+                "{name}: {message}\nwanted: {want_message}"
+            );
+            assert_eq!(at, want_at, "{name}: {message}");
+            assert!(required, "{name}: {message}");
+        }
+    }
+}
+
+/// A child file module's `super::` paths and `use super::*;` see what its
+/// parent binds at its top level, in either file layout and from a
+/// grandchild, and cancel the parent's import of a module they go through;
+/// a module declared with `#[path]` is not given its parent's names.
+#[test]
+fn layers_facades_file_modules() {
+    let mut files = facade_sources();
+    for (path, text) in &mut files {
+        if *path == E_INNER {
+            *text =
+                "use crate::alias::m::{self};\nmod child;\n#[path = \"moved.rs\"]\nmod moved;\n"
+                    .to_owned();
+        }
+    }
+    files.extend([
+        (
+            "crates/l40_api/e/src/inner/child/mod.rs",
+            "use super::*;\nmod grand;\nfn g() { m::Child::new(); }\n".to_owned(),
+        ),
+        (
+            "crates/l40_api/e/src/inner/child/grand.rs",
+            "fn h() { super::m::Grand; super::super::m::Super; }\n".to_owned(),
+        ),
+        (
+            "crates/l40_api/e/src/inner/moved.rs",
+            "use super::*;\nfn k() { m::Moved; super::m::Moved; }\n".to_owned(),
+        ),
+        ("architecture-baseline.toml", facades_baseline(&[])),
+        ("ARCHITECTURE.toml", layers_config("", "required")),
+    ]);
+    let ws = Layered {
+        extra: &FACADE_MEMBERS,
+        dependencies: &FACADE_DEPENDENCIES,
+        files,
+        ..Layered::default()
+    }
+    .build();
+    let reached: Vec<(String, String)> = facade_findings(&load(ws.path(), None))
+        .into_iter()
+        .filter(|(code, message, ..)| {
+            code == "layers.facades.no_crossing"
+                && message.starts_with("pplx-space-e -> pplx-space-a")
+        })
+        .map(|(_, message, at, _)| {
+            let item = message
+                .split("reaches pplx_space_a::")
+                .nth(1)
+                .and_then(|rest| rest.split(',').next())
+                .unwrap_or_default()
+                .to_owned();
+            (item, at)
+        })
+        .collect();
+    let expected = [
+        ("m::Child", "crates/l40_api/e/src/inner/child/mod.rs:3"),
+        ("m::Grand", "crates/l40_api/e/src/inner/child/grand.rs:1"),
+        ("m::Super", "crates/l40_api/e/src/inner/child/grand.rs:1"),
+        ("m::X", "crates/l40_api/e/src/lib.rs:1"),
+    ];
+    let expected: Vec<(String, String)> = expected
+        .iter()
+        .map(|(item, at)| ((*item).to_owned(), (*at).to_owned()))
+        .collect();
+    assert_eq!(reached, expected);
+}
+
+/// `no_new_entries` compares `[layers.facades]` with the base branch's
+/// copy: an item it lacks is new. A base whose layers rule has no facades
+/// check yet, or no layers rule, is seeded instead, with one advisory
+/// finding per pair; one whose rule configures the check but whose baseline
+/// lacks the table is compared with an empty one. A copy whose table is of
+/// another shape skips the comparison, with a warning.
+#[test]
+fn layers_facades_base_baseline() {
+    let ws = facade_workspace(
+        facades_baseline_of(&facade_items_without("", "", "")),
+        "required",
+    );
+    let configured = layers_config("", "required");
+    let without_facades: String = configured
+        .split_inclusive("[rules.")
+        .filter(|table| !table.starts_with("layers.facades."))
+        .collect();
+    let seeds = |pair: &str, items: &str, why: &str| {
+        format!(
+            "{pair}: lists {items} in [layers.facades] in architecture-baseline.toml, and {why}, \
+             so this pull request seeds the table. Review each entry."
+        )
+    };
+    let seeded = |why: &str| {
+        vec![
+            (
+                "layers.facades.no_new_entries",
+                seeds("pplx-space-c -> pplx-space-a", "3 items", why),
+                6,
+                false,
+            ),
+            (
+                "layers.facades.no_new_entries",
+                seeds("pplx-space-e -> pplx-space-a", "2 items", why),
+                11,
+                false,
+            ),
+            (
+                "layers.facades.no_new_entries",
+                seeds("pplx-space-e -> pplx-space-c", "1 item", why),
+                15,
+                false,
+            ),
+        ]
+    };
+    let new = |pair: &str, item: &str, to: &str, line: usize| {
+        (
+            "layers.facades.no_new_entries",
+            format!(
+                "{pair}: lists {item} in [layers.facades] in architecture-baseline.toml, and the \
+                 base branch's copy does not. A new path into another API crate's modules is \
+                 fixed, not baselined: re-export the item at {to}'s root or move the code, and \
+                 remove the entry; without it, layers.facades.no_crossing says how. Keep it only \
+                 as a reviewed exception, saying why in the pull request."
+            ),
+            line,
+            true,
+        )
+    };
+    let every_item_new = vec![
+        new("pplx-space-c -> pplx-space-a", "m::X", "pplx-space-a", 6),
+        new("pplx-space-c -> pplx-space-a", "m::Y", "pplx-space-a", 7),
+        new(
+            "pplx-space-c -> pplx-space-a",
+            "proto::Request",
+            "pplx-space-a",
+            8,
+        ),
+        new("pplx-space-e -> pplx-space-a", "m::X", "pplx-space-a", 11),
+        new("pplx-space-e -> pplx-space-a", "m::Y", "pplx-space-a", 12),
+        new(
+            "pplx-space-e -> pplx-space-c",
+            "jobs::Run",
+            "pplx-space-c",
+            15,
+        ),
+    ];
+    let mut base_with_more = facade_items_without("", "", "");
+    base_with_more[0].2.push("m::Gone");
+    /// Name, the base copy, the base's `ARCHITECTURE.toml`, and `(code,
+    /// message, line in the baseline, required)` of each finding.
+    type Case<'a> = (
+        &'a str,
+        String,
+        Option<&'a str>,
+        Vec<(&'a str, String, usize, bool)>,
+    );
+    let cases: Vec<Case> = vec![
+        (
+            "the same entries",
+            facades_baseline_of(&facade_items_without("", "", "")),
+            None,
+            vec![],
+        ),
+        (
+            "items dropped are silent",
+            facades_baseline_of(&base_with_more),
+            None,
+            vec![],
+        ),
+        (
+            "an item added",
+            facades_baseline_of(&facade_items_without(
+                "pplx-space-c",
+                "pplx-space-a",
+                "m::Y",
+            )),
+            None,
+            vec![new(
+                "pplx-space-c -> pplx-space-a",
+                "m::Y",
+                "pplx-space-a",
+                7,
+            )],
+        ),
+        (
+            "a base whose rule has no facades check",
+            layers_baseline(&[], &[]),
+            Some(&without_facades),
+            seeded("the base branch's layers rule has no facades check yet"),
+        ),
+        (
+            "no layers rule on the base",
+            baseline(&[]),
+            None,
+            seeded("the base branch has no layers rule yet"),
+        ),
+        (
+            "a base that configures the check but lacks the table",
+            layers_baseline(&[], &[]),
+            Some(&configured),
+            every_item_new.clone(),
+        ),
+        (
+            "a base baseline alone that lacks the table",
+            layers_baseline(&[], &[]),
+            None,
+            every_item_new,
+        ),
+        (
+            "a facades table of counts",
+            "[file_size]\n[layers.facades]\npplx-space-c.pplx-space-a = 3\n".to_owned(),
+            None,
+            vec![],
+        ),
+    ];
+    for (name, base, architecture, expected) in cases {
+        let ctx = load_with(ws.path(), Some(&base), architecture);
+        let found = facade_findings(&ctx);
+        let found: Vec<(&str, &str, &str, bool)> = found
+            .iter()
+            .filter(|(code, ..)| code.ends_with(".no_new_entries"))
+            .map(|(code, message, at, required)| {
+                (code.as_str(), message.as_str(), at.as_str(), *required)
+            })
+            .collect();
+        let expected: Vec<(&str, &str, String, bool)> = expected
+            .iter()
+            .map(|(code, message, line, required)| {
+                (
+                    *code,
+                    message.as_str(),
+                    format!("architecture-baseline.toml:{line}"),
+                    *required,
+                )
+            })
+            .collect();
+        let expected: Vec<(&str, &str, &str, bool)> = expected
+            .iter()
+            .map(|(code, message, at, required)| (*code, *message, at.as_str(), *required))
+            .collect();
+        assert_eq!(found, expected, "{name}");
+        let warned = skipped(&ctx).into_iter().any(|line| {
+            line.starts_with("warning: could not parse ")
+                && line.ends_with("; layers.facades.no_new_entries skipped")
+        });
+        assert_eq!(warned, name == "a facades table of counts", "{name}");
+    }
+}
+
+/// `--write-baseline` keeps each listed item still reached, removes the
+/// others, adds none, listing each pair's unlisted items as `not added`,
+/// and always writes the table, in generated form, one item per line,
+/// which is written back byte-identical; with `=layers.facades`, it updates
+/// that table alone.
+#[test]
+fn layers_facades_write_baseline() {
+    const BASELINE: &str = "architecture-baseline.toml";
+    let hand_written = "[file_size]\n\"crates/gone.rs\" = 9\n[layers.facades]\n\
+                        \"pplx-space-c.pplx-space-a\" = [\"proto::Request\", 'm::X', \"m::Gone\"]\n\
+                        \"pplx-space-c.pplx-space-d\" = [\"m::W\"]\n\
+                        \"pplx-space-e.pplx-space-c\" = [\"jobs::Run\"]\n\
+                        [crate_names]\n";
+    let ws = facade_workspace(hand_written.to_owned(), "required");
+
+    let scoped = run(ws.path(), &["--write-baseline=layers.facades"]);
+    assert_eq!(scoped.code, 0, "{}", scoped.stderr);
+    let not_added: Vec<&str> = scoped
+        .stdout
+        .lines()
+        .filter(|line| line.starts_with("not added: "))
+        .collect();
+    assert_eq!(
+        not_added,
+        [
+            "not added: pplx-space-c -> pplx-space-a, 1 item inside its modules (m::Y), in \
+             [layers.facades]; re-export them at its root or move the code (cargo arch says \
+             how), or, for a reviewed exception, add each to \"pplx-space-c.pplx-space-a\" \
+             inside [layers.facades] by hand, which layers.facades.no_new_entries reports",
+            "not added: pplx-space-e -> pplx-space-a, 2 items inside its modules (m::X, m::Y), \
+             in [layers.facades]; re-export them at its root or move the code (cargo arch says \
+             how), or, for a reviewed exception, add each to \"pplx-space-e.pplx-space-a\" \
+             inside [layers.facades] by hand, which layers.facades.no_new_entries reports",
+        ],
+        "{}",
+        scoped.stdout
+    );
+    assert!(
+        scoped
+            .stdout
+            .contains("archcheck: wrote 3 layers.facades entries to "),
+        "{}",
+        scoped.stdout
+    );
+    let text = fs::read_to_string(ws.path().join(BASELINE)).unwrap();
+    assert!(text.contains("\"crates/gone.rs\" = 9"), "{text}");
+    assert_eq!(
+        generated_table(&text, "layers.facades"),
+        "[layers.facades]\n\"pplx-space-c.pplx-space-a\" = [\n  \"m::X\",\n  \
+         \"proto::Request\",\n]\n\"pplx-space-e.pplx-space-c\" = [\n  \"jobs::Run\",\n]\n",
+        "{text}"
+    );
+    assert!(!text.contains("[layers.direction]"), "{text}");
+
+    // Unscoped: every table, the facades one sorted among the others.
+    let all = run(ws.path(), &["--write-baseline"]);
+    assert_eq!(all.code, 0, "{}", all.stderr);
+    assert!(
+        all.stdout.contains(
+            "0 layers.direction, 0 layers.domain_dependencies, 3 layers.facades, 0 \
+             layers.model_protocol"
+        ),
+        "{}",
+        all.stdout
+    );
+    let generated = fs::read_to_string(ws.path().join(BASELINE)).unwrap();
+    assert!(!generated.contains("crates/gone.rs"), "{generated}");
+    let facades_at = generated.find("\n[layers.facades]\n").unwrap();
+    assert!(
+        generated.find("\n[layers.direction]\n").unwrap() < facades_at
+            && facades_at < generated.find("\n[crate_names]\n").unwrap(),
+        "{generated}"
+    );
+    for args in [
+        &["--write-baseline"][..],
+        &["--write-baseline=layers.facades"],
+    ] {
+        assert_eq!(run(ws.path(), args).code, 0);
+        assert_eq!(
+            fs::read_to_string(ws.path().join(BASELINE)).unwrap(),
+            generated,
+            "{args:?}"
+        );
+    }
+    // The items kept are clean; those not added still cross.
+    let codes: Vec<String> = facade_findings(&load(ws.path(), None))
+        .into_iter()
+        .map(|(code, message, _, _)| format!("{code}: {message}"))
+        .collect();
+    assert_eq!(codes.len(), 3, "{codes:#?}");
+    for (code, start) in codes.iter().zip([
+        "layers.facades.no_crossing: pplx-space-c -> pplx-space-a: pplx-space-c reaches \
+         pplx_space_a::m::Y,",
+        "layers.facades.no_crossing: pplx-space-e -> pplx-space-a: pplx-space-e reaches \
+         pplx_space_a::m::X,",
+        "layers.facades.no_crossing: pplx-space-e -> pplx-space-a: pplx-space-e reaches \
+         pplx_space_a::m::Y,",
+    ]) {
+        assert!(code.starts_with(start), "{codes:#?}");
+    }
+
+    // A baseline without the table gets one from either form of the write.
+    for args in [
+        &["--write-baseline"][..],
+        &["--write-baseline=layers.facades"],
+    ] {
+        fs::write(ws.path().join(BASELINE), layers_baseline(&[], &[])).unwrap();
+        assert_eq!(run(ws.path(), args).code, 0, "{args:?}");
+        let text = fs::read_to_string(ws.path().join(BASELINE)).unwrap();
+        assert_eq!(
+            generated_table(&text, "layers.facades"),
+            "[layers.facades]\n",
+            "{args:?}: {text}"
+        );
+    }
+}
+
+/// A required crossing is an `ERROR` where the item is first named, and
+/// exits 1; an advisory one is a `WARNING` and exits 0.
+#[test]
+fn layers_facades_rdjson_and_exit_codes() {
+    for (mode, code, severity) in [("required", 1, "ERROR"), ("advisory", 0, "WARNING")] {
+        let entries = facade_items_without("pplx-space-c", "pplx-space-a", "proto::Request");
+        let ws = facade_workspace(facades_baseline_of(&entries), mode);
+        let found = run(ws.path(), &["--format", "rdjson"]);
+        assert_eq!(found.code, code, "{mode}: {}", found.stderr);
+        let document: Value = serde_json::from_str(&found.stdout).unwrap();
+        let diagnostics: Vec<Value> = document["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|d| {
+                d["code"]["value"]
+                    .as_str()
+                    .is_some_and(|code| code.starts_with("layers.facades."))
+            })
+            .map(|d| {
+                json!([
+                    d["code"]["value"],
+                    d["severity"],
+                    d["location"]["path"],
+                    d["location"]["range"]["start"]["line"],
+                ])
+            })
+            .collect();
+        assert_eq!(
+            diagnostics,
+            [json!(["layers.facades.no_crossing", severity, C_SOURCE, 3])],
+            "{mode}"
+        );
+    }
 }

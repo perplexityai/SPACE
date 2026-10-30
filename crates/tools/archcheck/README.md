@@ -369,9 +369,9 @@ http = ["hyper", "reqwest"]
 [rules.layers.placement]
 mode = "required"
 # ...and layout, test_only, clients, store_edges, single_user, stale_entries
-# and policy_changed, each with a mode, and direction, dev_direction,
-# storage_access, codec_features, domain_dependencies and model_protocol, each
-# with no_crossing, no_new_entries and stale_entries.
+# and policy_changed, each with a mode; and direction, dev_direction,
+# storage_access, codec_features, domain_dependencies, model_protocol and
+# facades, each with no_crossing, no_new_entries and stale_entries.
 ```
 
 The checks, each with its own mode:
@@ -418,6 +418,8 @@ The checks, each with its own mode:
   the crate owns the state, listing it.
 - `single_user`: a hint, advisory, for a Domain crate that may belong in its
   one user (see [Domain](#domain)).
+- `facades`: a crate reaching inside another API crate's modules instead of
+  using its crate root or its client; see [API facades](#api-facades).
 - `stale_entries`: an `unmoved` entry for a crate that is gone or now in a
   layer directory; a `store_users` entry for something that isn't a store, or
   listing a crate that is gone, a client, or one outside API and Storage,
@@ -484,8 +486,8 @@ saying to fix the dependency, since an entry added by hand fails
 has to reach storage for good becomes a store or a storage helper (see
 [Storage access](#storage-access)), and a Domain crate that needs a fenced
 package is not Domain code and moves to its layer (see [Domain](#domain)).
-As for `crate_names`, it lists no TOML to paste. It always writes all six
-tables, after the tables of caps and before `[crate_names]`;
+As for `crate_names`, it lists no TOML to paste. It always writes every
+layers table, after the tables of caps and before `[crate_names]`;
 `--write-baseline=layers.<check>` updates one, creating it if the file lacks
 it.
 
@@ -651,6 +653,141 @@ Foundation's, which should name nothing SPACE-specific. Both count the
 legacy crates in their layer, with baseline entries, so that new matches do
 not land there.
 
+### API facades
+
+`facades` keeps an API crate's modules its own: another crate uses it
+through its crate root, the items it re-exports there, or through its
+`*-client`. Apps are exempt, since an app composes its children at any path,
+and so are tools and paths into a client.
+
+It reads the production files of every member with a layer other than
+`l50_app` and `tools`, as tokens, so text in comments and in string, raw
+string, byte and character literals never counts. Items under
+`#[cfg(test)]`, or a `cfg(all(…))` that requires `test`, are left out: an
+outer attribute's item, up to its `;` or body, or its field or arm, up to
+its `,` (a comma inside a field type's `<…>` does not end it); an inner
+`#![cfg(test)]`'s whole file or module. Code under `cfg(any(test, …))` or
+`cfg(not(test))` counts.
+
+A path reaches into a module when, read from the name it starts with, the
+path inside a non-client API crate starts with a snake-case segment and
+has another after it: `pplx_space_api::controllers::Substrate`, in a `use`
+tree of any shape (groups, nested or across lines, `self`, globs, a leading
+`::`) or in an expression, type, attribute or macro argument, including
+after `..`, `->` or `=>`. The name a path starts with is the library's, or
+the manifest's `package =` rename, or one a `use` or `extern crate` binds:
+an alias of the crate (`use x as y;`, `use x::{self as y};`, `extern crate
+x as y;`), or a module of it (`use x::m;`, `use x::m as n;`, or, after a
+glob of the root, `use x::*;`, each of its `pub mod`s), so that `m::Item`
+after `use x::m;` reaches `m::Item` as the path in full would. A name is
+bound for the block or inline module it is declared in and the blocks
+inside it, before or after the declaration, as in Rust; a module inside it
+does not see it, and `self::name` is the module's name, not a block's. A
+`mod name` the file declares hides a target or a glob's module of that
+name, unless it is declared only for tests (`#[cfg(test)] mod name;`),
+which production code does not see.
+
+Names are followed across the consumer's files two ways. What the crate
+root (`src/lib.rs`, or `src/main.rs` without a library) binds at its top
+level is reached from any file as `crate::<name>…`, through chains of
+aliases there too (`use crate::x as y;`), so `pub use pplx_space_api as
+api;` there makes `crate::api::m::Item` a path into `pplx_space_api`; an
+`extern crate x as y;` there makes `y` a name of the crate in every file.
+And a file module's `super::<name>…` paths and `use super::*;` see what its
+parent file module binds at its top level (the parent of `src/a/b.rs` or
+`src/a/b/mod.rs` is `src/a.rs` or `src/a/mod.rs`, which declares `mod b;`),
+and its grandparent's through `super::super::`; inside a file, `super::`
+from an inline module is the module around it. Only these `super::` paths
+reach a parent's names: `crate::<parent>::m::…` is not followed, from the
+parent's children either. Root items are fine:
+`lib::Item`, `lib::Enum::Variant`, `lib::function()`, `lib::f::<T>()`, also
+when imported by name. "Root" means items directly at the root: a `pub
+mod`, or a module re-exported at the root, is still a module, so
+`lib::module::Item` counts either way.
+
+An item is the path inside the crate, cut after its first segment that is
+not snake case (`controllers::substrate::Substrate`), or `m::*` for a glob
+of a module. Importing a module that no path goes on through counts as the
+module itself: `use lib::m::{self}`, `use lib::m::n;`, or `use lib::m;`
+where `m` is a root `pub mod`. An import at a file's top level counts only
+if no path goes on through it in that file, nor in another as
+`crate::<name>…` (for the crate root's) or `super::<name>…` (for a
+parent's). A `use` that only binds another name again, as `use crate::m;`
+does, is not counted itself. A glob of the root, `use lib::*`, counts once,
+as `*`, if the crate has a `pub mod` and no path goes on through a module
+it binds; a module another import or a `mod` binds by that name is not one
+of the glob's.
+
+A pair of packages reaches the set of distinct items one names inside the
+other's modules. Formatting and repeated mentions leave the set alone, and
+so does the import style: the same item, named in full, through an
+imported module or alias, or imported by name, is one entry. So do file
+splits, into the crate root, whose names are reached through `crate::`,
+and its file modules, whose names their children reach through `super::`
+paths or `use super::*;`. The exceptions:
+
+- A glob of a module is one `m::*` entry for whatever it brings in.
+- A glob of the root used only for root items adds `*`; replace the glob
+  with the items it is used for.
+- A module declared with `#[path]`, or inside an inline module, is not given
+  its parent's names, so its `super::` paths are not seen, and an import
+  of its parent's that only they go on through counts as the module.
+
+Each entry is an item, module or glob that the fix re-exports or moves.
+`proto` modules count like any other; the finding gives their share, and
+for them adds a client or protocol crate to the other fixes.
+
+Not seen: a path a macro builds, such as through `$crate`; a path through
+a re-export in a module of the consumer other than its root, unless it is
+a `super::` path from one of that module's children (`crate::x::m::…` is
+not followed, from `src/x/` children either, so `pub use lib::m;` in
+`src/x.rs` counts once, as the module `m`); the `super::` paths of a
+`#[path]` module; and a path into a crate that another crate re-exports
+whole.
+
+`[layers.facades]` lists each pair's items, keyed `"<from>.<to>"` by package
+names, one item per line:
+
+```toml
+[layers.facades]
+"pplx-space-cluster-controller-server.pplx-space-api" = [
+  "controllers::substrate::Substrate",
+  "public_operations::PublicOperationStore",
+]
+```
+
+Its behaviours, each with its own mode under
+`[rules.layers.facades.<behaviour>]`:
+
+- `no_crossing`: an item the table doesn't list under its pair, shown where
+  it is first named (by file, then line). The finding names the item, the
+  pair's total, the modules reached with their counts, the `proto` share,
+  and the fixes.
+- `no_new_entries`: an item the base branch's copy doesn't list. As for the
+  edge tables, a base whose layers rule has no `facades` check, or no layers
+  rule, is seeded instead: one advisory finding per pair, at its first item.
+  A base that configures the check but whose baseline lacks the table is
+  compared with an empty one.
+- `stale_entries`: a listed item the pair no longer reaches, to remove; also
+  every item of a pair that reaches nothing the check counts, because a
+  package is gone, the first is an app or a tool, the second is not a
+  non-client API crate with a library, or the key is not `<from>.<to>`.
+
+`no_new_entries` and `stale_entries` point at the item's line in the
+baseline.
+
+The fixes: re-export the items at the target's root (`pub use`) and import
+them from there; or move the code to where it belongs. For a target that
+more than one crate already shares, such as `node-runtime-core`, that is a
+crate of its own, or the consumer if only it uses the code; for another
+service's API crate, a crate both can depend on, such as a shared
+operations crate (the plan for cluster-controller-server and api). For
+`proto` items, a client or protocol crate as well.
+
+`--write-baseline` keeps each listed item still reached, removes the
+others, and adds none: it prints `not added: …` for each pair with items it
+doesn't list.
+
 ### Limits
 
 - The checks see direct dependencies only. An edge through a re-export, such
@@ -673,6 +810,21 @@ not land there.
   driver is not seen unless it is listed. A workspace crate that does is
   seen as a storage helper only once it is in `l10_foundation` with a
   required driver dependency.
+- `facades` follows names into other files of the consumer only through
+  `crate::` (what the crate root binds) and a child's `super::` or `use
+  super::*;` (what its parent file module binds): only `super::` paths
+  reach a parent's re-exports. A `super::` path of a module declared with
+  `#[path]`, or inside an inline module, is not seen. Nor is a path through
+  a re-export in a module other than the root any other way: where
+  `src/x.rs` has `pub use lib::m;`, `crate::x::m::…` (from any file,
+  `src/x/` children included), a sibling's `super::x::m::…` and the names
+  `use crate::x::*;` brings in are not followed, and that import counts
+  once, as the module `m`, instead of the items reached through it. A glob
+  there counts once as itself: `m::*` for `pub use lib::m::*;`, and `*` for
+  `pub use lib::*;`.
+- A file declared by `#[cfg(test)] mod x;` whose name is not a test file's,
+  such as `test_support.rs`, is a production file, as for every rule, so
+  `facades` and the other checks that read sources count its paths.
 - The package-keyed tables have no rename map. Renaming a package that a
   `[layers.*]` baseline entry names fails `no_new_entries` until its edges
   are fixed. Renaming one that an `unmoved` entry names fails `placement`,
@@ -705,6 +857,12 @@ not land there.
   per-edge exception, and a hand-added baseline entry fails `no_new_entries`.
   For a line that `domain_io` matches but that is not I/O, narrow the
   instance's patterns in a reviewed change.
+- **A facade exception:** `facades` has no allow list. While its behaviours
+  are advisory, a reviewed exception is an item added by hand under its
+  `"<from>.<to>"` key in `[layers.facades]`, with the pull request saying
+  why; `no_new_entries` reports it, and `--write-baseline` keeps it while
+  the pair still reaches it. Once `no_new_entries` is required, there is
+  none: fix the path instead.
 - **Moving a crate:** `git mv` it into its layer directory and remove its
   `unmoved` entry, which `stale_entries` asks for. Its layers baseline
   entries keep matching, but path-keyed configuration has to follow the
@@ -738,6 +896,8 @@ outside the instance's allowed paths with a matching line, with its count of
 matching lines. `[layers.<check>]` maps a package name to the packages it
 depends on against the check instead, or for `codec_features` the
 `<package>/<feature>` entries it enables (see [Layers](#layers)), and
+`[layers.facades]` each `"<from>.<to>"` pair of packages to the items it
+reaches (see [API facades](#api-facades)), and
 `[crate_names]`, written last, a package name to its member path (see
 [Crate names](#crate-names)). Entries should only be
 removed or lowered.

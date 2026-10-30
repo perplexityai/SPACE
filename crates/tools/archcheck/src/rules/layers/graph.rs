@@ -3,8 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use regex::Regex;
-
+use super::scan::paths;
 use crate::{
     config::{Layer, LayersConfig},
     context::{Context, Crate, Dependency, ProductionFile},
@@ -286,14 +285,13 @@ pub(super) fn dev_problem(edge: &Edge<'_>) -> Option<Problem> {
     (to.rank() > from.rank()).then_some(Problem::DevDirection)
 }
 
-/// The items `krate`'s production files name through `dependency`, such as
+/// The items `krate`'s production files use through `dependency`, such as
 /// `pplx_space_api_route::token::RouteToken`, for a finding to say what
 /// crosses an edge: every path that starts with the name the crate imports
-/// the dependency by, with `use` groups expanded. A path after another
-/// path's `::`, such as `other::b::x` for `b`, is another crate's module. A
-/// name imported under another name, or used through a macro, is not seen;
-/// nor is anything when the target has no library and the dependency no
-/// other name.
+/// the dependency by, read by [`paths`], so that comments, literals and
+/// `#[cfg(test)]` code never count. A name imported under another name, or
+/// used through a macro, is not seen; nor is anything when the target has
+/// no library and the dependency no other name.
 pub(super) fn used_items(
     files: &[ProductionFile],
     krate: &Crate,
@@ -308,90 +306,17 @@ pub(super) fn used_items(
     if name.is_empty() {
         return Vec::new();
     }
-    let Ok(pattern) = Regex::new(&format!(r"\b{}\s*::", regex::escape(&name))) else {
-        return Vec::new();
-    };
     let prefix = if krate.member.is_empty() {
         "src/".to_owned()
     } else {
         format!("{}/src/", krate.member)
     };
-    let mut items = BTreeSet::new();
-    for file in files.iter().filter(|file| file.path.starts_with(&prefix)) {
-        for found in pattern.find_iter(&file.text) {
-            let before = file.text.get(..found.start()).unwrap_or_default();
-            if before.trim_end().ends_with("::") {
-                continue;
-            }
-            let mut rest = file.text.get(found.end()..).unwrap_or_default();
-            let mut paths = Vec::new();
-            use_tree(&mut rest, "", &mut paths);
-            items.extend(paths.into_iter().map(|path| format!("{name}::{path}")));
-        }
-    }
+    let items: BTreeSet<String> = files
+        .iter()
+        .filter(|file| file.path.starts_with(&prefix))
+        .flat_map(|file| paths(&file.text, &name))
+        .collect();
     items.into_iter().collect()
-}
-
-/// Adds to `paths` each path that the use tree at the start of `text` names
-/// below `prefix`, and moves `text` past the tree: `a::B` and `a::c::D` for
-/// `a::{B, c::D}`. `self` and a glob name `prefix` itself, and `as` and its
-/// alias are skipped; anything else that is not a path segment, such as the
-/// `<` of `a::B::<T>` or a trailing comma's `}`, ends the tree.
-pub(super) fn use_tree(text: &mut &str, prefix: &str, paths: &mut Vec<String>) {
-    let mut path = prefix.to_owned();
-    loop {
-        let rest = text.trim_start();
-        if let Some(group) = rest.strip_prefix('{') {
-            *text = group;
-            loop {
-                use_tree(text, &path, paths);
-                match text.trim_start().strip_prefix(',') {
-                    Some(next) => *text = next,
-                    None => break,
-                }
-            }
-            let rest = text.trim_start();
-            *text = rest.strip_prefix('}').unwrap_or(rest);
-            return;
-        }
-        let (segment, after) = rest.split_at(ident_len(rest));
-        if segment.is_empty() || segment == "self" {
-            let glob = after.strip_prefix('*');
-            *text = glob.unwrap_or(after);
-            let names_path = segment == "self" || glob.is_some() || path != prefix;
-            if names_path && !path.is_empty() {
-                paths.push(path);
-            }
-            return;
-        }
-        path = if path.is_empty() {
-            segment.to_owned()
-        } else {
-            format!("{path}::{segment}")
-        };
-        match after.trim_start().strip_prefix("::") {
-            Some(next) => *text = next,
-            None => {
-                paths.push(path);
-                *text = after;
-                let alias = after
-                    .trim_start()
-                    .strip_prefix("as")
-                    .filter(|alias| alias.starts_with(char::is_whitespace));
-                if let Some(alias) = alias {
-                    let alias = alias.trim_start();
-                    *text = alias.split_at(ident_len(alias)).1;
-                }
-                return;
-            }
-        }
-    }
-}
-
-/// The length of the identifier at the start of `text`, 0 if none is.
-fn ident_len(text: &str) -> usize {
-    text.find(|c: char| !(c.is_alphanumeric() || c == '_'))
-        .unwrap_or(text.len())
 }
 
 /// `names` as a list for a sentence, at most `limit` of them.
