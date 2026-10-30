@@ -88,6 +88,9 @@ expression: paths_by_method
   "/sandboxes/{sandbox_id}/process-sessions": [
     "post"
   ],
+  "/sandboxes/{sandbox_id}/process-sessions:attach": [
+    "get"
+  ],
   "/sandboxes/{sandbox_id}/processes": [
     "get"
   ],
