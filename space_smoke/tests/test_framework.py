@@ -221,6 +221,7 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "node.runtime_crash_preserves_disk",
                 "node.runtime_memory_lifecycle",
                 "node.runtime_survives_manager_restarts",
+                "node.windows_sandbox_lifecycle",
             ],
         )
         self.assertIs(registered.fixture_type, CommandSandboxFixture)
