@@ -19,11 +19,13 @@
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use pplx_space_common_svc::DrainSignal;
 use pplx_space_metrics::operations::{InlineAdmissionPath, InlineAdmissionReason};
 use pplx_space_public_api::OperationKind;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::Instrument as _;
 
@@ -42,6 +44,10 @@ pub const INLINE_KINDS_ENV: &str = "SPACE_NATIVE_INLINE_KINDS";
 pub const INLINE_MAX_CONCURRENT_ENV: &str = "SPACE_NATIVE_INLINE_MAX_CONCURRENT";
 const DEFAULT_INLINE_MAX_CONCURRENT: usize = 128;
 const MAX_INLINE_MAX_CONCURRENT: usize = 1024;
+/// How often [`InlineOperations::report_slots`] samples the in-flight count.
+/// The metrics agent keeps a gauge's last value per flush, so a sample is at
+/// most this old when it is sent.
+const SLOT_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The kinds `SPACE_NATIVE_INLINE_KINDS` may name: wakes, which callers wait
 /// on, and creates. Everything else stays on the dispatcher.
@@ -239,6 +245,31 @@ impl InlineOperations {
         }
     }
 
+    /// Report `operations.inline.in_flight` against this process's capacity
+    /// now and every [`SLOT_REPORT_INTERVAL`] until `shutdown_token` fires,
+    /// so a process that runs nothing inline, or has gone quiet, still
+    /// reports both. Capacity is `0` where nothing can run inline (no
+    /// route-signing authority, or no permits). Sampling the count, rather
+    /// than reporting each change as it happens, keeps two executions that
+    /// end together from reporting their counts out of order.
+    pub fn report_slots(
+        &self,
+        shutdown_token: CancellationToken,
+    ) -> impl Future<Output = ()> + Send + 'static {
+        let inner = Arc::clone(&self.inner);
+        let capacity = if inner.route_signing {
+            inner.config.max_concurrent
+        } else {
+            0
+        };
+        crate::limiter_liveness::run_heartbeat(SLOT_REPORT_INTERVAL, shutdown_token, move || {
+            pplx_space_metrics::operations::inline_slots(
+                inner.in_flight.load(Ordering::Acquire),
+                capacity,
+            );
+        })
+    }
+
     /// Count an operation offered on `path` that the route left queued for a
     /// reason only it knows.
     pub fn refuse(&self, path: InlineAdmissionPath, refusal: InlineRefusal) {
@@ -308,20 +339,19 @@ impl InlineOperations {
 }
 
 /// Counts one inline execution while it runs, including one that panics.
+/// [`InlineOperations::report_slots`] reports the count.
 struct InFlight(Arc<Inner>);
 
 impl InFlight {
     fn enter(inner: Arc<Inner>) -> Self {
-        let in_flight = inner.in_flight.fetch_add(1, Ordering::AcqRel) + 1;
-        pplx_space_metrics::operations::inline_slots(in_flight, inner.config.max_concurrent);
+        inner.in_flight.fetch_add(1, Ordering::AcqRel);
         Self(inner)
     }
 }
 
 impl Drop for InFlight {
     fn drop(&mut self) {
-        let in_flight = self.0.in_flight.fetch_sub(1, Ordering::AcqRel) - 1;
-        pplx_space_metrics::operations::inline_slots(in_flight, self.0.config.max_concurrent);
+        self.0.in_flight.fetch_sub(1, Ordering::AcqRel);
     }
 }
 

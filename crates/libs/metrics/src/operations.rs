@@ -260,7 +260,9 @@ pub fn inline_admission(path: InlineAdmissionPath, reason: InlineAdmissionReason
     );
 }
 
-/// Operations the API process is executing inline, against its permits.
+/// Operations the API process is executing inline, against its permits:
+/// sampled from startup on a timer, with capacity `0` where the process can
+/// run nothing inline.
 pub fn inline_slots(in_flight: usize, capacity: usize) {
     gauge("operations.inline.in_flight", in_flight as f64, &[]);
     gauge("operations.inline.capacity", capacity as f64, &[]);

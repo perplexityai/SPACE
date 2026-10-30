@@ -189,6 +189,7 @@ impl AppState {
             crate::public_operation_driver::OperationExecutionConfig::from_env(),
             route_signing,
         );
+        task_tracker.spawn(inline_operations.report_slots(shutdown_token.child_token()));
         let ecw_credential_keyring = std::sync::Arc::new(
             pplx_space_common_svc::ecw_credential::EcwCredentialKeyring::load_from_env()?,
         );
