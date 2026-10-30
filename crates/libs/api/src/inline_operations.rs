@@ -16,15 +16,23 @@
 //! records its operation queued for the dispatcher, exactly as it would with
 //! inline execution off. Across processes, [`InlineOrgLimit`] bounds what one
 //! organization runs inline; admission checks it as it claims.
+//!
+//! [`InlineLifecycle`] offers the lifecycle operations callers wait on
+//! (wakes, resumes and starts) to the runner, under the env switches and the
+//! per-organization `space-native-inline-operations` flag.
 
 use std::future::Future;
 use std::num::NonZeroU32;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use pplx_space_common_core::types::OrgId;
 use pplx_space_common_svc::DrainSignal;
+use pplx_space_feature_flags::{FeatureFlagClient, SPACE_NATIVE_INLINE_OPERATIONS_FLAG};
 use pplx_space_metrics::operations::{InlineAdmissionPath, InlineAdmissionReason};
+use pplx_space_public_api::OperationKind;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -35,9 +43,17 @@ use crate::public_operation_driver::{
     drive_deferrable_operation, execution_span,
 };
 use crate::public_operations::{
-    ClaimedPublicOperation, InlineOrgLimit, InlineQueueReason, PublicOperationStore,
+    ClaimedPublicOperation, CreateInlinePublicOperationResult, CreatePublicOperationResult,
+    InlineOrgLimit, InlineQueueReason, PublicOperationStore,
+};
+use crate::public_sandbox_operations::{
+    CreateSandboxOperationExecutor, SandboxLifecycleOperationExecutor,
 };
 
+/// Env master for executing lifecycle operations inline.
+pub const INLINE_OPERATIONS_ENABLED_ENV: &str = "SPACE_NATIVE_INLINE_OPERATIONS_ENABLED";
+/// Comma-separated operation kinds the master enables inline.
+pub const INLINE_KINDS_ENV: &str = "SPACE_NATIVE_INLINE_KINDS";
 /// Inline executions one API process runs at once; `0` turns inline
 /// execution off entirely, including warm-pool creates.
 pub const INLINE_MAX_CONCURRENT_ENV: &str = "SPACE_NATIVE_INLINE_MAX_CONCURRENT";
@@ -51,9 +67,22 @@ const SLOT_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 /// process; unset or `0` sets no limit.
 pub const INLINE_ORG_LIMIT_ENV: &str = "SPACE_NATIVE_INLINE_ORG_LIMIT";
 
-/// The environment's inline settings.
+/// The kinds `SPACE_NATIVE_INLINE_KINDS` may name: wakes, which callers wait
+/// on, and creates. Everything else stays on the dispatcher.
+pub const INLINE_CAPABLE_KINDS: &[OperationKind] = &[
+    OperationKind::CreateSandbox,
+    OperationKind::WakeSandbox,
+    OperationKind::ResumeSandbox,
+    OperationKind::StartSandbox,
+];
+
+/// The environment's inline switches.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InlineOperationsConfig {
+    /// `SPACE_NATIVE_INLINE_OPERATIONS_ENABLED`, off by default.
+    pub enabled: bool,
+    /// `SPACE_NATIVE_INLINE_KINDS`, empty by default.
+    pub kinds: Vec<OperationKind>,
     /// `SPACE_NATIVE_INLINE_MAX_CONCURRENT`.
     pub max_concurrent: usize,
     /// `SPACE_NATIVE_INLINE_ORG_LIMIT`, `None` (no limit) by default.
@@ -63,6 +92,8 @@ pub struct InlineOperationsConfig {
 impl Default for InlineOperationsConfig {
     fn default() -> Self {
         Self {
+            enabled: false,
+            kinds: Vec::new(),
             max_concurrent: DEFAULT_INLINE_MAX_CONCURRENT,
             org_limit: None,
         }
@@ -74,11 +105,38 @@ impl InlineOperationsConfig {
         Self::from_environment(&pplx_space_common_core::env::ProcessEnvironment)
     }
 
-    /// A malformed limit keeps the default, and one above 1024 is capped. A
-    /// malformed organization limit sets none, with a warning.
+    /// A kind outside [`INLINE_CAPABLE_KINDS`], or not a kind at all, is
+    /// left out with a warning. A malformed limit keeps the default, and one
+    /// above 1024 is capped. A malformed organization limit sets none, with
+    /// a warning.
     pub fn from_environment(env: &dyn pplx_space_common_core::env::Environment) -> Self {
         let default = Self::default();
+        let mut kinds = Vec::new();
+        for name in env
+            .var(INLINE_KINDS_ENV)
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            match name.parse::<OperationKind>() {
+                Ok(kind) if INLINE_CAPABLE_KINDS.contains(&kind) => {
+                    if !kinds.contains(&kind) {
+                        kinds.push(kind);
+                    }
+                }
+                _ => tracing::warn!(
+                    kind = name,
+                    "{INLINE_KINDS_ENV} names a kind that cannot run inline; it stays on the dispatcher"
+                ),
+            }
+        }
         Self {
+            enabled: pplx_space_common_core::env::env_flag(
+                env.var(INLINE_OPERATIONS_ENABLED_ENV).ok().as_deref(),
+                default.enabled,
+            ),
+            kinds,
             max_concurrent: env
                 .var(INLINE_MAX_CONCURRENT_ENV)
                 .ok()
@@ -124,6 +182,9 @@ pub enum InlineRefusal {
     OrgLimit,
     /// An idempotent replay, which records nothing new.
     Replay,
+    /// The request joined an operation already queued or running, which
+    /// records nothing new.
+    Joined,
 }
 
 impl From<InlineQueueReason> for InlineRefusal {
@@ -145,6 +206,7 @@ impl InlineRefusal {
             Self::Busy => InlineAdmissionReason::Busy,
             Self::OrgLimit => InlineAdmissionReason::OrgLimit,
             Self::Replay => InlineAdmissionReason::Replay,
+            Self::Joined => InlineAdmissionReason::Joined,
         }
     }
 }
@@ -204,6 +266,17 @@ impl InlineOperations {
                 execution,
             }),
         }
+    }
+
+    /// Whether the env switches let operations of `kind` run inline: the
+    /// master on, and `kind` in the allowlist. A route still needs a permit.
+    ///
+    /// The master goes on only once every API process, on every surface,
+    /// takes the per-sandbox queue lock when it inserts an operation, and
+    /// off before the dispatcher's keyed claim: the sole-active claim that
+    /// every route reading this uses is sound only under both.
+    pub fn kind_enabled(&self, kind: OperationKind) -> bool {
+        self.inner.config.enabled && self.inner.config.kinds.contains(&kind)
     }
 
     /// The organization limit admission holds an inline claim to, with this
@@ -333,6 +406,149 @@ impl InlineOperations {
             }
             .instrument(span),
         )
+    }
+}
+
+/// One claimed operation's execution, as the runner drives it.
+pub(crate) type InlineExecution = Pin<Box<dyn Future<Output = OperationExecutionResult> + Send>>;
+
+/// Runs one claimed operation. Production runs the dispatcher's executor for
+/// its kind; tests substitute the execution.
+pub(crate) trait InlineExecutor: Send + Sync + 'static {
+    fn execute(&self, operation: ClaimedPublicOperation) -> InlineExecution;
+}
+
+impl InlineExecutor for CreateSandboxOperationExecutor {
+    fn execute(&self, operation: ClaimedPublicOperation) -> InlineExecution {
+        let executor = self.clone();
+        Box::pin(async move { executor.execute(&operation).await.into() })
+    }
+}
+
+impl InlineExecutor for SandboxLifecycleOperationExecutor {
+    fn execute(&self, operation: ClaimedPublicOperation) -> InlineExecution {
+        let executor = self.clone();
+        Box::pin(async move { executor.execute(&operation).await.into() })
+    }
+}
+
+/// Inline execution of the lifecycle operations callers wait on: a caller's
+/// `:wake`, `:resume` or `:start`, and the wake the system queues for a
+/// command, process session or attach. Each runs inline only when the env
+/// master is on, its kind is in `SPACE_NATIVE_INLINE_KINDS`, the
+/// `space-native-inline-operations` flag allows its organization, and the
+/// process has a permit free; admission then claims it only on an otherwise
+/// idle sandbox with the organization under its limit. Anything else is
+/// recorded queued for the dispatcher, exactly as with inline execution off.
+#[derive(Clone)]
+pub struct InlineLifecycle {
+    runner: InlineOperations,
+    executor: Arc<dyn InlineExecutor>,
+    feature_flags: FeatureFlagClient,
+}
+
+impl InlineLifecycle {
+    pub(crate) fn new(
+        runner: InlineOperations,
+        executor: Arc<dyn InlineExecutor>,
+        feature_flags: FeatureFlagClient,
+    ) -> Self {
+        Self {
+            runner,
+            executor,
+            feature_flags,
+        }
+    }
+
+    /// The dispatcher's lifecycle executor, run by `runner`.
+    pub(crate) fn with_lifecycle_executor(
+        runner: InlineOperations,
+        executor: SandboxLifecycleOperationExecutor,
+        feature_flags: FeatureFlagClient,
+    ) -> Self {
+        Self::new(runner, Arc::new(executor), feature_flags)
+    }
+
+    /// Whether operations of `kind` for `org_id` are offered for inline
+    /// execution: the env switches allow the kind, and the flag, evaluated
+    /// on the organization under the env master, allows the organization.
+    pub fn enabled_for(&self, org_id: OrgId, kind: OperationKind) -> bool {
+        let org_enabled = self.feature_flags.gate_enabled(
+            self.runner.inner.config.enabled,
+            SPACE_NATIVE_INLINE_OPERATIONS_FLAG,
+            &org_id.to_string(),
+        );
+        org_enabled && self.runner.kind_enabled(kind)
+    }
+
+    /// A permit to offer an operation of `kind` for `org_id` on `path` for
+    /// inline execution, or `None` to record it queued. A refused permit is
+    /// counted; an operation not offered at all is not.
+    pub(crate) fn offer(
+        &self,
+        org_id: OrgId,
+        kind: OperationKind,
+        path: InlineAdmissionPath,
+    ) -> Option<InlinePermit> {
+        if !self.enabled_for(org_id, kind) {
+            return None;
+        }
+        self.runner.try_acquire(path).ok()
+    }
+
+    /// The organization limit admission holds the claim to.
+    pub(crate) fn org_limit(&self) -> Option<InlineOrgLimit> {
+        self.runner.org_limit()
+    }
+
+    /// Count a replay of an operation of `kind` that would have been offered.
+    pub(crate) fn refuse_replay(
+        &self,
+        org_id: OrgId,
+        kind: OperationKind,
+        path: InlineAdmissionPath,
+    ) {
+        if self.enabled_for(org_id, kind) {
+            self.runner.refuse(path, InlineRefusal::Replay);
+        }
+    }
+
+    /// Act on what admission recorded under `permit`: run a claimed
+    /// operation inline, holding the permit, or count why it was left
+    /// queued or not created. Answers what was recorded, as a plain create
+    /// answers it, so the route responds exactly as without inline
+    /// execution. The execution runs detached; the route does not wait.
+    pub(crate) fn settle(
+        &self,
+        permit: InlinePermit,
+        store: &PublicOperationStore,
+        recorded: CreateInlinePublicOperationResult,
+    ) -> CreatePublicOperationResult {
+        let path = permit.path;
+        match recorded {
+            CreateInlinePublicOperationResult::Claimed {
+                claim_token,
+                operation,
+            } => {
+                let operation_id = operation.id;
+                let execution = self.executor.execute(operation.clone());
+                drop(
+                    self.runner
+                        .spawn(permit, store.clone(), claim_token, operation, execution),
+                );
+                CreatePublicOperationResult::Created(operation_id)
+            }
+            CreateInlinePublicOperationResult::Queued(operation_id, reason) => {
+                self.runner.refuse(path, reason.into());
+                CreatePublicOperationResult::Created(operation_id)
+            }
+            CreateInlinePublicOperationResult::NotCreated(result) => {
+                if matches!(result, CreatePublicOperationResult::Existing(_)) {
+                    self.runner.refuse(path, InlineRefusal::Joined);
+                }
+                result
+            }
+        }
     }
 }
 

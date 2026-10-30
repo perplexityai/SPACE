@@ -228,6 +228,11 @@ metric_vocabulary!(
     InlineAdmissionPath {
         /// A native create that won an admission-time warm-pool claim.
         WarmPoolCreate => "warm_pool_create",
+        /// A caller's `:wake`, `:resume` or `:start`.
+        LifecycleAction => "lifecycle_action",
+        /// The wake the system queues for a command, process session or
+        /// attach on a sandbox at rest.
+        ImplicitWake => "implicit_wake",
     }
 );
 
@@ -251,6 +256,9 @@ metric_vocabulary!(
         OrgLimit => "org_limit",
         /// An idempotent replay, which records nothing new.
         Replay => "replay",
+        /// Joined an operation already queued or running, which records
+        /// nothing new.
+        Joined => "joined",
     }
 );
 

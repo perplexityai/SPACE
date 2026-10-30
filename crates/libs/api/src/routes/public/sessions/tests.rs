@@ -138,9 +138,15 @@ fn command_admission_follows_lifecycle_and_wake_policy() {
 /// branches on.
 mod not_running {
     use super::*;
+    use crate::inline_operations::{
+        INLINE_CAPABLE_KINDS, InlineExecution, InlineExecutor, InlineLifecycle, InlineOperations,
+        InlineOperationsConfig,
+    };
+    use crate::public_operation_driver::{OperationExecutionConfig, OperationExecutionResult};
     use crate::public_operations::{
-        ApiProduct, CreatePublicOperation, CreatePublicOperationIdempotency,
-        CreatePublicOperationResult,
+        ApiProduct, ClaimLimits, ClaimPublicOperations, ClaimedPublicOperation,
+        CreatePublicOperation, CreatePublicOperationIdempotency, CreatePublicOperationResult,
+        PublicOperationRequeueReason,
     };
     use axum::{
         Router,
@@ -151,8 +157,11 @@ mod not_running {
     use pplx_space_db_test_fixtures::{
         SEED_ORG_ID, SEED_USER_ID, TestDb, TestDbResult, pg_test_db,
     };
+    use pplx_space_public_api::OperationState;
     use pplx_space_public_api::{OperationKind, OperationTargetType, RequestFingerprint};
     use serde_json::{Value, json};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::Notify;
     use tower::ServiceExt;
     use uuid::Uuid;
 
@@ -161,9 +170,15 @@ mod not_running {
     struct Fixture {
         db: TestDb,
         app: Router,
+        state: AppState,
     }
 
     async fn fixture() -> TestDbResult<Fixture> {
+        fixture_with(None).await
+    }
+
+    /// [`fixture`] whose routes offer lifecycle work to `inline`.
+    async fn fixture_with(inline: Option<InlineLifecycle>) -> TestDbResult<Fixture> {
         let db = pg_test_db().await?;
         sqlx::query(sql!(
             "INSERT INTO api_keys (id, org_id, name, key_hash, allowed_surfaces)
@@ -174,11 +189,14 @@ mod not_running {
         .bind(crate::auth::hash_token(KEY))
         .execute(&db.pool)
         .await?;
-        let state = AppState::from_pool(db.pool.clone()).await?;
+        let mut state = AppState::from_pool(db.pool.clone()).await?;
+        if let Some(inline) = inline {
+            state.inline_lifecycle = inline;
+        }
         let app = Router::new()
             .nest("/v1", crate::routes::public::v1_router(state.clone()))
-            .with_state(state);
-        Ok(Fixture { db, app })
+            .with_state(state.clone());
+        Ok(Fixture { db, app, state })
     }
 
     /// A sandbox with no node, as a suspended Kubernetes sandbox is.
@@ -600,30 +618,90 @@ mod not_running {
         Ok(())
     }
 
+    /// Who claimed the command wake a `:wake` arrives behind.
+    #[derive(Debug, Clone, Copy)]
+    enum CommandWakeClaimant {
+        Dispatcher,
+        /// Admission, as the API claims a wake it runs inline.
+        Inline,
+    }
+
     #[tokio::test]
     async fn a_wake_does_not_join_a_command_wake_already_claimed() -> TestDbResult<()> {
-        let fixture = fixture().await?;
-        let sandbox_id = sandbox(&fixture, "suspended", &["command"]).await?;
-        command(&fixture, sandbox_id, "commands").await?;
-        let [(system, None)] = wake_ids(&fixture, sandbox_id).await?[..] else {
-            panic!("one system wake");
-        };
-        let mut tx = fixture.db.pool.begin().await?;
-        claim(&mut tx, system).await?;
-        tx.commit().await?;
+        for claimant in [CommandWakeClaimant::Dispatcher, CommandWakeClaimant::Inline] {
+            let script = ScriptedWake::gated(WakeScript::Succeed);
+            let fixture = match claimant {
+                CommandWakeClaimant::Dispatcher => fixture().await?,
+                CommandWakeClaimant::Inline => fixture_with(Some(script.inline())).await?,
+            };
+            let sandbox_id = sandbox(&fixture, "suspended", &["command"]).await?;
+            command(&fixture, sandbox_id, "commands").await?;
+            let [(system, None)] = wake_ids(&fixture, sandbox_id).await?[..] else {
+                panic!("{claimant:?}: one system wake");
+            };
+            match claimant {
+                CommandWakeClaimant::Dispatcher => {
+                    let mut tx = fixture.db.pool.begin().await?;
+                    claim(&mut tx, system).await?;
+                    tx.commit().await?;
+                }
+                CommandWakeClaimant::Inline => {
+                    script.0.started.notified().await;
+                    assert_eq!(state_and_attempts(&fixture, system).await?, ("running", 1));
+                }
+            }
 
-        // Its attempt runs by the actor its claim read: a command wake, which
-        // the policy could still refuse, so this `:wake` must not be answered
-        // with it.
-        let wake = lifecycle(&fixture, sandbox_id, "wake", &Uuid::now_v7().to_string()).await?;
-        let queued = vec![(system, None), (wake, Some(SEED_USER_ID))];
-        assert_eq!(wake_ids(&fixture, sandbox_id).await?, queued);
+            // Its attempt runs by the actor its claim read: a command wake,
+            // which the policy could still refuse, so this `:wake` must not
+            // be answered with it. Nor does it run inline beside it.
+            let wake = lifecycle(&fixture, sandbox_id, "wake", &Uuid::now_v7().to_string()).await?;
+            let queued = vec![(system, None), (wake, Some(SEED_USER_ID))];
+            assert_eq!(
+                wake_ids(&fixture, sandbox_id).await?,
+                queued,
+                "{claimant:?}"
+            );
+            assert_eq!(state_and_attempts(&fixture, wake).await?, ("queued", 0));
 
-        // A reconnect during that attempt joins the caller's own wake.
-        command(&fixture, sandbox_id, "commands").await?;
-        let again = lifecycle(&fixture, sandbox_id, "wake", &Uuid::now_v7().to_string()).await?;
-        assert_eq!(again, wake);
-        assert_eq!(wake_ids(&fixture, sandbox_id).await?, queued);
+            // A reconnect during that attempt joins the caller's own wake.
+            command(&fixture, sandbox_id, "commands").await?;
+            let again =
+                lifecycle(&fixture, sandbox_id, "wake", &Uuid::now_v7().to_string()).await?;
+            assert_eq!(again, wake, "{claimant:?}");
+            assert_eq!(
+                wake_ids(&fixture, sandbox_id).await?,
+                queued,
+                "{claimant:?}"
+            );
+
+            // Once the command wake places the sandbox, the dispatcher takes
+            // the caller's wake, which finds it running.
+            match claimant {
+                CommandWakeClaimant::Dispatcher => succeed(&fixture, system).await?,
+                CommandWakeClaimant::Inline => {
+                    script.open_gate();
+                    wait_for_state(&fixture, system, "succeeded").await?;
+                }
+            }
+            set_lifecycle(&fixture, sandbox_id, "started").await?;
+            let result = dispatcher_runs(&fixture, wake).await?;
+            assert_eq!(result.state, OperationState::Succeeded, "{claimant:?}");
+            assert_eq!(
+                result
+                    .result_json
+                    .as_ref()
+                    .and_then(|result| result["controller_response"].get("already_completed")),
+                Some(&json!(true)),
+                "{claimant:?}: {result:?}"
+            );
+            assert_eq!(
+                script.executed(),
+                match claimant {
+                    CommandWakeClaimant::Dispatcher => vec![],
+                    CommandWakeClaimant::Inline => vec![system],
+                }
+            );
+        }
         Ok(())
     }
 
@@ -895,7 +973,7 @@ mod not_running {
             let case = format!("{lifecycle} {wake_on:?} {activity:?}");
             for _ in 0..2 {
                 assert_eq!(
-                    queue_implicit_wake(&fixture.db.pool, &stored, activity, true)
+                    queue_implicit_wake(&fixture.db.pool, None, &stored, activity, true)
                         .await
                         .map_err(|e| format!("{e:?}"))?,
                     queued,
@@ -934,7 +1012,7 @@ mod not_running {
                 .await?
                 .expect("seeded sandbox");
         assert!(
-            queue_implicit_wake(&fixture.db.pool, &stored, Command, true)
+            queue_implicit_wake(&fixture.db.pool, None, &stored, Command, true)
                 .await
                 .map_err(|e| format!("{e:?}"))?
         );
@@ -954,7 +1032,7 @@ mod not_running {
         .execute(&fixture.db.pool)
         .await?;
         assert!(
-            queue_implicit_wake(&fixture.db.pool, &stored, Command, true)
+            queue_implicit_wake(&fixture.db.pool, None, &stored, Command, true)
                 .await
                 .map_err(|e| format!("{e:?}"))?
         );
@@ -968,7 +1046,7 @@ mod not_running {
                 .await?
                 .expect("seeded sandbox");
         assert!(
-            queue_implicit_wake(&fixture.db.pool, &stored, Access, false)
+            queue_implicit_wake(&fixture.db.pool, None, &stored, Access, false)
                 .await
                 .map_err(|e| format!("{e:?}"))?
         );
@@ -1029,7 +1107,7 @@ mod not_running {
         .await?;
 
         assert!(
-            queue_implicit_wake(&fixture.db.pool, &stored, Access, true)
+            queue_implicit_wake(&fixture.db.pool, None, &stored, Access, true)
                 .await
                 .map_err(|e| format!("{e:?}"))?
         );
@@ -1037,6 +1115,403 @@ mod not_running {
             wake_activities(&fixture, sandbox_id).await?,
             vec![Some("access".to_owned())]
         );
+        Ok(())
+    }
+
+    /// What a scripted inline wake does once it starts.
+    #[derive(Clone, Copy)]
+    enum WakeScript {
+        Succeed,
+        /// The process running it dies.
+        Panic,
+    }
+
+    struct WakeScriptState {
+        script: WakeScript,
+        executed: Mutex<Vec<Uuid>>,
+        started: Notify,
+        /// When set, the execution waits here after starting.
+        gate: Option<Notify>,
+    }
+
+    /// An inline executor for lifecycle work, standing in for the
+    /// dispatcher's lifecycle executor.
+    #[derive(Clone)]
+    struct ScriptedWake(Arc<WakeScriptState>);
+
+    impl ScriptedWake {
+        fn new(script: WakeScript) -> Self {
+            Self::build(script, false)
+        }
+
+        fn gated(script: WakeScript) -> Self {
+            Self::build(script, true)
+        }
+
+        fn build(script: WakeScript, gated: bool) -> Self {
+            Self(Arc::new(WakeScriptState {
+                script,
+                executed: Mutex::new(Vec::new()),
+                started: Notify::new(),
+                gate: gated.then(Notify::new),
+            }))
+        }
+
+        fn open_gate(&self) {
+            self.0.gate.as_ref().expect("gated script").notify_one();
+        }
+
+        /// The operations it executed, in order.
+        fn executed(&self) -> Vec<Uuid> {
+            self.0.executed.lock().expect("executed").clone()
+        }
+
+        /// Inline execution of every inline-capable kind for every
+        /// organization, through this script.
+        fn inline(&self) -> InlineLifecycle {
+            InlineLifecycle::new(
+                InlineOperations::new(
+                    InlineOperationsConfig {
+                        enabled: true,
+                        kinds: INLINE_CAPABLE_KINDS.to_vec(),
+                        ..Default::default()
+                    },
+                    tokio_util::task::TaskTracker::new(),
+                    pplx_space_common_svc::DrainSignal::new(),
+                    OperationExecutionConfig::default(),
+                    true,
+                ),
+                Arc::new(self.clone()),
+                pplx_space_feature_flags::FeatureFlagClient::disabled(),
+            )
+        }
+    }
+
+    impl InlineExecutor for ScriptedWake {
+        fn execute(&self, operation: ClaimedPublicOperation) -> InlineExecution {
+            let state = Arc::clone(&self.0);
+            Box::pin(async move {
+                state
+                    .executed
+                    .lock()
+                    .expect("executed")
+                    .push(operation.id.as_uuid());
+                state.started.notify_one();
+                if let Some(gate) = &state.gate {
+                    gate.notified().await;
+                }
+                match state.script {
+                    WakeScript::Succeed => OperationExecutionResult {
+                        state: OperationState::Succeeded,
+                        progress_message: "sandbox lifecycle action dispatched".to_string(),
+                        result_json: Some(woken_result(&operation)),
+                        terminal_error_code: None,
+                        terminal_error_json: None,
+                        retry_after: None,
+                        requeue_reason: PublicOperationRequeueReason::TransientFailure,
+                    },
+                    WakeScript::Panic => panic!("the API process running the wake dies"),
+                }
+            })
+        }
+    }
+
+    /// The result the lifecycle executor records for an action that placed
+    /// the sandbox.
+    fn woken_result(operation: &ClaimedPublicOperation) -> Value {
+        let payload: crate::public_sandbox_operations::SandboxLifecycleOperationPayload =
+            serde_json::from_value(operation.payload.clone()).expect("a lifecycle payload");
+        serde_json::to_value(pplx_space_public_api::PublicOperationResult::Sandbox(
+            pplx_space_public_api::PublicSandboxOperationResult {
+                sandbox_id: payload.sandbox_id,
+                state: pplx_space_public_api::SandboxLifecycleState::Running,
+                action: Some(payload.action),
+                controller_response: Some(json!({"ok": true})),
+            },
+        ))
+        .expect("a result serializes")
+    }
+
+    async fn state_and_attempts(
+        fixture: &Fixture,
+        operation_id: Uuid,
+    ) -> TestDbResult<(&'static str, i32)> {
+        let (state, attempts): (String, i32) = sqlx::query_as(sql!(
+            "SELECT state, attempts FROM public_operations WHERE operation_id = $1"
+        ))
+        .bind(operation_id)
+        .fetch_one(&fixture.db.pool)
+        .await?;
+        let state = match state.as_str() {
+            "queued" => "queued",
+            "running" => "running",
+            "succeeded" => "succeeded",
+            other => panic!("unexpected state {other}"),
+        };
+        Ok((state, attempts))
+    }
+
+    async fn wait_for_state(
+        fixture: &Fixture,
+        operation_id: Uuid,
+        state: &str,
+    ) -> TestDbResult<()> {
+        for _ in 0..500 {
+            if state_and_attempts(fixture, operation_id).await?.0 == state {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("operation {operation_id} never reached {state}");
+    }
+
+    /// A dispatcher claim of every due lifecycle operation for the fixture's
+    /// sandboxes, at its default staleness.
+    async fn dispatcher_claim(
+        fixture: &Fixture,
+    ) -> TestDbResult<crate::public_operations::PublicOperationClaim> {
+        Ok(PublicOperationStore::new(fixture.db.pool.clone())
+            .claim_operations(ClaimPublicOperations {
+                limits: ClaimLimits::any(16),
+                claim_stale_after: OperationExecutionConfig::default().claim_stale_after,
+                claimable_kinds: INLINE_CAPABLE_KINDS,
+            })
+            .await?)
+    }
+
+    /// The dispatcher claims `operation_id` and runs it through the real
+    /// lifecycle executor, recording its outcome.
+    async fn dispatcher_runs(
+        fixture: &Fixture,
+        operation_id: Uuid,
+    ) -> TestDbResult<OperationExecutionResult> {
+        let claim = dispatcher_claim(fixture).await?;
+        let [operation] = &claim.operations[..] else {
+            panic!(
+                "the dispatcher claims one operation: {:?}",
+                claim.operations
+            );
+        };
+        assert_eq!(operation.id.as_uuid(), operation_id);
+        let result: OperationExecutionResult =
+            crate::public_sandbox_operations::SandboxLifecycleOperationExecutor::new(
+                fixture.db.pool.clone(),
+                fixture.state.sandbox_controller.clone(),
+            )
+            .execute(operation)
+            .await
+            .into();
+        crate::public_operation_driver::drive_claimed_operation(
+            PublicOperationStore::new(fixture.db.pool.clone()),
+            claim.claim_token,
+            OperationExecutionConfig::default(),
+            operation.clone(),
+            crate::public_operation_driver::OperationExecutor::Dispatcher,
+            std::future::ready(result.clone()),
+        )
+        .await?;
+        assert_eq!(
+            state_and_attempts(fixture, operation_id).await?.0,
+            "succeeded"
+        );
+        Ok(result)
+    }
+
+    /// How a test asks for a sandbox to run.
+    #[derive(Debug, Clone, Copy)]
+    enum Waker {
+        /// `POST /v1/sandboxes/{sandbox_id}:{action}`.
+        Action(&'static str),
+        /// A command or process session, on this route.
+        Command(&'static str),
+        /// The session route resolver's attach, through the activation RPC.
+        Attach,
+    }
+
+    /// Ask for `sandbox_id` to run by `waker`: the operation it recorded.
+    async fn wake_by(
+        fixture: &Fixture,
+        sandbox_id: PublicSandboxId,
+        waker: Waker,
+    ) -> TestDbResult<Uuid> {
+        match waker {
+            Waker::Action(action) => {
+                lifecycle(fixture, sandbox_id, action, &Uuid::now_v7().to_string()).await
+            }
+            Waker::Command(route) => {
+                let (status, _, body) = command(fixture, sandbox_id, route).await?;
+                assert_eq!(status, StatusCode::CREATED, "{body}");
+                last_operation(fixture, sandbox_id).await
+            }
+            Waker::Attach => {
+                let stored =
+                    crate::controllers::sandbox::fetch_sandbox(&fixture.db.pool, sandbox_id.into())
+                        .await?
+                        .expect("seeded sandbox");
+                assert!(
+                    queue_implicit_wake(
+                        &fixture.db.pool,
+                        Some(&fixture.state.inline_lifecycle),
+                        &stored,
+                        crate::controllers::substrate::ExecutionActivityKind::Access,
+                        true,
+                    )
+                    .await
+                    .map_err(|e| format!("{e:?}"))?
+                );
+                last_operation(fixture, sandbox_id).await
+            }
+        }
+    }
+
+    /// The sandbox's most recently requested operation.
+    async fn last_operation(fixture: &Fixture, sandbox_id: PublicSandboxId) -> TestDbResult<Uuid> {
+        Ok(sqlx::query_scalar(sql!(
+            "SELECT operation_id
+               FROM public_operations
+              WHERE target_type = 'sandbox' AND target_id = $1
+              ORDER BY requested_at DESC, operation_id DESC
+              LIMIT 1"
+        ))
+        .bind(sandbox_id.to_string())
+        .fetch_one(&fixture.db.pool)
+        .await?)
+    }
+
+    /// Every waker, with the sandbox state it acts on.
+    const WAKERS: [(Waker, &str); 6] = [
+        (Waker::Action("wake"), "suspended"),
+        (Waker::Action("resume"), "paused"),
+        (Waker::Action("start"), "stopped"),
+        (Waker::Command("commands"), "suspended"),
+        (Waker::Command("process-sessions"), "suspended"),
+        (Waker::Attach, "suspended"),
+    ];
+
+    /// On an idle sandbox, each waker's operation is claimed as it is
+    /// recorded and runs in the API, to the same durable record a
+    /// dispatcher execution leaves; the dispatcher never sees it.
+    #[tokio::test]
+    async fn a_wake_on_an_idle_sandbox_runs_inline_and_completes() -> TestDbResult<()> {
+        for (waker, lifecycle_state) in WAKERS {
+            let script = ScriptedWake::new(WakeScript::Succeed);
+            let fixture = fixture_with(Some(script.inline())).await?;
+            let sandbox_id = sandbox(&fixture, lifecycle_state, &["access"]).await?;
+            let operation_id = wake_by(&fixture, sandbox_id, waker).await?;
+            wait_for_state(&fixture, operation_id, "succeeded").await?;
+            assert_eq!(script.executed(), vec![operation_id], "{waker:?}");
+            // One claim, at admission: no dispatcher runs here.
+            let events: Vec<String> = sqlx::query_scalar(sql!(
+                "SELECT event_type FROM public_operation_events
+                  WHERE operation_id = $1 ORDER BY sequence"
+            ))
+            .bind(operation_id)
+            .fetch_all(&fixture.db.pool)
+            .await?;
+            assert_eq!(state_and_attempts(&fixture, operation_id).await?.1, 1);
+            assert_eq!(
+                events,
+                vec![
+                    "operation.created",
+                    "operation.claimed",
+                    "operation.completed"
+                ],
+                "{waker:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Behind other work on its sandbox, here a queued `:suspend`, each
+    /// waker's operation is recorded queued for the dispatcher, after it.
+    #[tokio::test]
+    async fn a_wake_behind_queued_work_is_queued_for_the_dispatcher() -> TestDbResult<()> {
+        for (waker, lifecycle_state) in WAKERS {
+            let script = ScriptedWake::new(WakeScript::Succeed);
+            let fixture = fixture_with(Some(script.inline())).await?;
+            let sandbox_id = sandbox(&fixture, lifecycle_state, &["access"]).await?;
+            let suspend =
+                lifecycle(&fixture, sandbox_id, "suspend", &Uuid::now_v7().to_string()).await?;
+            let operation_id = wake_by(&fixture, sandbox_id, waker).await?;
+            assert_ne!(operation_id, suspend, "{waker:?}");
+            assert_eq!(
+                state_and_attempts(&fixture, operation_id).await?,
+                ("queued", 0),
+                "{waker:?}"
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, Vec<Uuid>>(sql!(
+                    "SELECT ARRAY(SELECT operation_id FROM public_operations
+                                   WHERE target_type = 'sandbox' AND target_id = $1
+                                     AND state IN ('queued', 'running')
+                                   ORDER BY requested_at, operation_id)"
+                ))
+                .bind(sandbox_id.to_string())
+                .fetch_one(&fixture.db.pool)
+                .await?,
+                vec![suspend, operation_id],
+                "{waker:?}: the wake sorts after the suspend"
+            );
+            assert!(script.executed().is_empty(), "{waker:?}");
+        }
+        Ok(())
+    }
+
+    /// The API process running an inline wake dies before recording its
+    /// outcome: the wake stays the claimant's until its claim goes stale,
+    /// then the dispatcher takes the same operation over.
+    #[tokio::test]
+    async fn an_inline_wake_whose_process_dies_is_redriven_by_the_dispatcher() -> TestDbResult<()> {
+        let script = ScriptedWake::new(WakeScript::Panic);
+        let fixture = fixture_with(Some(script.inline())).await?;
+        let sandbox_id = sandbox(&fixture, "suspended", &["access"]).await?;
+        let wake = lifecycle(&fixture, sandbox_id, "wake", &Uuid::now_v7().to_string()).await?;
+        script.0.started.notified().await;
+        // The task is gone; its claim is still live.
+        assert_eq!(state_and_attempts(&fixture, wake).await?, ("running", 1));
+        assert!(dispatcher_claim(&fixture).await?.operations.is_empty());
+
+        sqlx::query(sql!(
+            "UPDATE public_operations
+             SET claimed_at = NOW() - INTERVAL '10 minutes'
+             WHERE operation_id = $1"
+        ))
+        .bind(wake)
+        .execute(&fixture.db.pool)
+        .await?;
+        let claim = dispatcher_claim(&fixture).await?;
+        let [reclaimed] = &claim.operations[..] else {
+            panic!("the dispatcher reclaims the wake: {:?}", claim.operations);
+        };
+        assert_eq!(reclaimed.id.as_uuid(), wake);
+        assert_eq!(reclaimed.claim_generation, 2);
+        assert_eq!(state_and_attempts(&fixture, wake).await?, ("running", 2));
+        assert_eq!(script.executed(), vec![wake]);
+        Ok(())
+    }
+
+    /// A replay of an inline `:wake` or `:start` answers with the operation
+    /// it recorded, and neither records nor runs anything again.
+    #[tokio::test]
+    async fn a_replayed_inline_wake_answers_with_the_same_operation() -> TestDbResult<()> {
+        for (action, lifecycle_state) in [("wake", "suspended"), ("start", "stopped")] {
+            let script = ScriptedWake::new(WakeScript::Succeed);
+            let fixture = fixture_with(Some(script.inline())).await?;
+            let sandbox_id = sandbox(&fixture, lifecycle_state, &["access"]).await?;
+            let key = Uuid::now_v7().to_string();
+            let first = lifecycle(&fixture, sandbox_id, action, &key).await?;
+            wait_for_state(&fixture, first, "succeeded").await?;
+            assert_eq!(lifecycle(&fixture, sandbox_id, action, &key).await?, first);
+            assert_eq!(queue(&fixture, sandbox_id).await?, vec![], "{action}");
+            let recorded: i64 = sqlx::query_scalar(sql!(
+                "SELECT COUNT(*) FROM public_operations WHERE target_id = $1"
+            ))
+            .bind(sandbox_id.to_string())
+            .fetch_one(&fixture.db.pool)
+            .await?;
+            assert_eq!(recorded, 1, "{action}");
+            assert_eq!(script.executed(), vec![first], "{action}");
+        }
         Ok(())
     }
 }

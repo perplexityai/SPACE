@@ -12,7 +12,8 @@ use pplx_space_feature_flags::{
     SPACE_API_CLIENT_CONCURRENCY_LIMITER_FLAG, SPACE_API_CLIENT_CONCURRENCY_QUOTAS_FLAG,
     SPACE_API_TIMEOUT_LOCK_BYPASS_FLAG, SPACE_CLUSTER_API_CLIENT_SIDE_BALANCING_FLAG,
     SPACE_CLUSTER_RATE_LIMITER_FLAG, SPACE_NATIVE_CREATE_POOL_CLAIM_FLAG,
-    SPACE_NATIVE_HIDDEN_OPERATIONS_FLAG, SPACE_NET_GATEWAY_KNOWN_EGRESS_DOMAINS_FLAG,
+    SPACE_NATIVE_HIDDEN_OPERATIONS_FLAG, SPACE_NATIVE_INLINE_OPERATIONS_FLAG,
+    SPACE_NET_GATEWAY_KNOWN_EGRESS_DOMAINS_FLAG,
 };
 
 const REFERENCE: &str = include_str!("../reference/flagd-space-flags.json");
@@ -52,8 +53,8 @@ fn reference() -> Reference {
 /// against the reference file, so a flag in one and not the other fails in
 /// either direction. A flag in **neither** — declared in the crate root and
 /// added to no table — passes, because Rust gives a test no way to enumerate
-/// the crate's `Flag` constants and nothing here scans for them. Adding a
-/// tenth production flag is therefore a manual step in two places, and
+/// the crate's `Flag` constants and nothing here scans for them. Adding an
+/// eleventh production flag is therefore a manual step in two places, and
 /// forgetting both leaves it silently unconfigurable for anyone deploying the
 /// reference.
 #[derive(Clone, Copy, Debug)]
@@ -63,12 +64,13 @@ enum Shape {
 }
 
 /// Every flag SPACE reads, with the shape its reader expects.
-const FLAGS_READ_BY_SPACE: [(&str, Shape); 9] = [
+const FLAGS_READ_BY_SPACE: [(&str, Shape); 10] = [
     (SPACE_CLUSTER_RATE_LIMITER_FLAG.key(), Shape::Bool),
     (SPACE_API_CLIENT_CONCURRENCY_LIMITER_FLAG.key(), Shape::Bool),
     (SPACE_API_TIMEOUT_LOCK_BYPASS_FLAG.key(), Shape::Bool),
     (SPACE_NATIVE_CREATE_POOL_CLAIM_FLAG.key(), Shape::Bool),
     (SPACE_NATIVE_HIDDEN_OPERATIONS_FLAG.key(), Shape::Bool),
+    (SPACE_NATIVE_INLINE_OPERATIONS_FLAG.key(), Shape::Bool),
     (
         SPACE_CLUSTER_API_CLIENT_SIDE_BALANCING_FLAG.key(),
         Shape::Bool,

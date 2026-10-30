@@ -2,7 +2,7 @@ use super::*;
 use crate::{
     SPACE_API_CLIENT_CONCURRENCY_LIMITER_FLAG, SPACE_CLUSTER_API_CLIENT_SIDE_BALANCING_FLAG,
     SPACE_CLUSTER_RATE_LIMITER_FLAG, SPACE_NATIVE_CREATE_POOL_CLAIM_FLAG,
-    SPACE_NATIVE_HIDDEN_OPERATIONS_FLAG,
+    SPACE_NATIVE_HIDDEN_OPERATIONS_FLAG, SPACE_NATIVE_INLINE_OPERATIONS_FLAG,
 };
 
 const FALLS_BACK_ON: BoolFlag = BoolFlag::new("space-test-guardrail", true);
@@ -128,6 +128,7 @@ fn a_shipped_flag_gets_its_declared_answer_with_no_backend_installed() {
         (SPACE_CLUSTER_API_CLIENT_SIDE_BALANCING_FLAG, false),
         (SPACE_NATIVE_CREATE_POOL_CLAIM_FLAG, false),
         (SPACE_NATIVE_HIDDEN_OPERATIONS_FLAG, false),
+        (SPACE_NATIVE_INLINE_OPERATIONS_FLAG, true),
     ] {
         assert_eq!(
             gate_enabled(true, flag, Err(Unresolved::NoProvider)),

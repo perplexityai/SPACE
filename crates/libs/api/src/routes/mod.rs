@@ -53,6 +53,8 @@ pub struct AppState {
     /// Claimed operations this process executes itself instead of leaving
     /// them to the dispatcher. See [`crate::inline_operations`].
     pub inline_operations: crate::inline_operations::InlineOperations,
+    /// Wakes, resumes and starts offered to [`Self::inline_operations`].
+    pub inline_lifecycle: crate::inline_operations::InlineLifecycle,
     /// Bookkeeping for the e2b-compat template build endpoints.
     /// See `routes::e2b::template_build` for the persisted keys.
     pub template_build_state: std::sync::Arc<crate::routes::e2b::TemplateBuildState>,
@@ -190,6 +192,14 @@ impl AppState {
             route_signing,
         );
         task_tracker.spawn(inline_operations.report_slots(shutdown_token.child_token()));
+        let inline_lifecycle = crate::inline_operations::InlineLifecycle::with_lifecycle_executor(
+            inline_operations.clone(),
+            crate::public_sandbox_operations::SandboxLifecycleOperationExecutor::new(
+                pool.clone(),
+                sandbox_controller.clone(),
+            ),
+            feature_flags.clone(),
+        );
         let ecw_credential_keyring = std::sync::Arc::new(
             pplx_space_common_svc::ecw_credential::EcwCredentialKeyring::load_from_env()?,
         );
@@ -205,6 +215,7 @@ impl AppState {
             readiness,
             drain_signal,
             inline_operations,
+            inline_lifecycle,
             template_build_state,
             federated_identity,
             external_console: None,

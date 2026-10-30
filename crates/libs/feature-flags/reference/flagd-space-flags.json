@@ -85,6 +85,24 @@
         ]
       }
     },
+    "space-native-inline-operations": {
+      "state": "ENABLED",
+      "defaultVariant": "on",
+      "variants": {
+        "on": true,
+        "off": false
+      },
+      "_comment": "The subject is SPACE's org id. Defaults on, as the flag falls back on, so SPACE_NATIVE_INLINE_OPERATIONS_ENABLED and SPACE_NATIVE_INLINE_KINDS decide and serving this file changes nothing; a rule can hold one org back. With the master off nothing runs inline, whatever this flag says.",
+      "targeting": {
+        "if": [
+          {
+            "==": [{ "var": "targetingKey" }, "replace-me-or-delete-this-rule"]
+          },
+          "off",
+          null
+        ]
+      }
+    },
     "space-cluster-api-client-side-balancing": {
       "state": "ENABLED",
       "defaultVariant": "off",

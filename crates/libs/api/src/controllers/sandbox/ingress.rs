@@ -18,6 +18,9 @@ struct Activator {
 struct StoredAccess {
     pool: PgPool,
     controller: SandboxController,
+    /// Runs a wake it queues in this process when offered; `None` leaves
+    /// every wake queued for the dispatcher.
+    inline: Option<crate::inline_operations::InlineLifecycle>,
 }
 
 #[derive(Clone, Copy)]
@@ -91,11 +94,16 @@ impl ActivationOwners {
 pub(crate) fn ingress_activation(
     pool: PgPool,
     controller: SandboxController,
+    inline: crate::inline_operations::InlineLifecycle,
     tasks: TaskTracker,
     shutdown: CancellationToken,
 ) -> Arc<dyn IngressActivation> {
     Arc::new(Activator {
-        backend: Arc::new(StoredAccess { pool, controller }),
+        backend: Arc::new(StoredAccess {
+            pool,
+            controller,
+            inline: Some(inline),
+        }),
         owners: ActivationOwners {
             tasks,
             slots: Arc::new(Semaphore::new(128)),
@@ -119,6 +127,7 @@ impl AccessBackend for StoredAccess {
         };
         crate::routes::public::sessions::queue_implicit_wake(
             &self.pool,
+            self.inline.as_ref(),
             &sandbox,
             activity,
             crate::public_sandbox_operations::implicit_wake_activity_enabled(),
