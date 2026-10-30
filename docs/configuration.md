@@ -521,7 +521,6 @@ forwarding never relabels it.
 | `SPACE_DB_USER_PASSWORD`, `SPACE_DB_CREDS_PASSWORD` | **required** by services. |
 | `SPACE_DB_BOOTSTRAP_USER_PASSWORD`, `SPACE_DB_BOOTSTRAP_CREDS_PASSWORD`, `SPACE_DB_BOOTSTRAP_MIGRATOR_PASSWORD`, `SPACE_DB_BOOTSTRAP_RO_PASSWORD`, `SPACE_DB_BOOTSTRAP_SUPERADMIN_PASSWORD` | Required by `bootstrap-roles` unless `--allow-missing-passwords`. |
 | `SPACE_USER_PASSWORD` | Migrator command. |
-| `SPACE_SQLX_QUERY_LOG_LEVEL` | Off by default. |
 | `SPACE_DB_MIGRATE_JOB_DEADLINE_SECONDS` | The migrate Job's `activeDeadlineSeconds`, passed in so retries stop before Kubernetes kills the Job. |
 | `SPACE_DB_APP_LOCK_TIMEOUT` | `bootstrap-roles` application-role `lock_timeout`; same as `--app-lock-timeout`. `0` resets it, unset leaves it unchanged. |
 | `SPACE_API_URL`, `SPACE_API_TOKEN` | Admin CLI. |

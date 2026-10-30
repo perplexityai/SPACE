@@ -85,6 +85,28 @@ pub fn database_connect_options(
     Ok(options)
 }
 
+/// Level of SQLx's per-statement query-completion events on service pools.
+///
+/// The observability bridge turns these `sqlx::query` events into Datadog DB
+/// spans under the active request, and the log formatter drops them, so they
+/// are trace data rather than log output. Fixed rather than configurable:
+/// query spans are always on. `INFO` keeps them inside the default `RUST_LOG`
+/// filter.
+const QUERY_EVENT_LEVEL: LevelFilter = LevelFilter::Info;
+
+/// [`database_connect_options`] plus the options every service pool shares.
+fn service_connect_options(
+    database_url: &str,
+    application_name: &str,
+    identity: DatabaseIdentity,
+    password: &str,
+) -> Result<PgConnectOptions, DatabaseConnectOptionsError> {
+    Ok(
+        database_connect_options(database_url, application_name, identity, password)?
+            .log_statements(QUERY_EVENT_LEVEL),
+    )
+}
+
 /// Connect a managed Postgres identity with the shared pool configuration.
 ///
 /// One generic pool knob per setting, set per-Deployment in Helm (env is
@@ -93,17 +115,18 @@ pub fn database_connect_options(
 /// `POSTGRES_POOL_MIN_CONNECTIONS` (default 1),
 /// `POSTGRES_POOL_ACQUIRE_TIMEOUT_SECS` (default 5),
 /// `POSTGRES_POOL_IDLE_TIMEOUT_SECS` (default 300),
-/// `POSTGRES_POOL_MAX_LIFETIME_SECS` (default 1800),
-/// `POSTGRES_POOL_MAX_LIFETIME_JITTER_FRACTION` (default 1/6), and
-/// `SPACE_SQLX_QUERY_LOG_LEVEL` (default off).
+/// `POSTGRES_POOL_MAX_LIFETIME_SECS` (default 1800), and
+/// `POSTGRES_POOL_MAX_LIFETIME_JITTER_FRACTION` (default 1/6).
+///
+/// Every statement emits a query-completion event; see
+/// [`QUERY_EVENT_LEVEL`].
 pub async fn connect_postgres_as(
     database_url: &str,
     application_name: &str,
     identity: DatabaseIdentity,
     password: &str,
 ) -> Result<PgPool, ConnectPostgresAsError> {
-    let options = database_connect_options(database_url, application_name, identity, password)?
-        .log_statements(sqlx_query_log_level_from_env());
+    let options = service_connect_options(database_url, application_name, identity, password)?;
     postgres_pool_options()
         .connect_with(options)
         .await
@@ -158,8 +181,7 @@ pub fn connect_postgres_lazy_as_capped(
     statement_timeout: Option<Duration>,
 ) -> Result<PgPool, DatabaseConnectOptionsError> {
     let max_connections = max_connections.get();
-    let options = database_connect_options(database_url, application_name, identity, password)?
-        .log_statements(sqlx_query_log_level_from_env());
+    let options = service_connect_options(database_url, application_name, identity, password)?;
     let pool_options = postgres_pool_options()
         .max_connections(max_connections)
         .min_connections(min_connections_from_env().min(max_connections));
@@ -206,8 +228,7 @@ pub fn connect_postgres_lazy_as(
     identity: DatabaseIdentity,
     password: &str,
 ) -> Result<PgPool, DatabaseConnectOptionsError> {
-    let options = database_connect_options(database_url, application_name, identity, password)?
-        .log_statements(sqlx_query_log_level_from_env());
+    let options = service_connect_options(database_url, application_name, identity, password)?;
     Ok(postgres_pool_options().connect_lazy_with(options))
 }
 
@@ -264,32 +285,6 @@ async fn warm_type_cache(conn: &mut sqlx::PgConnection) -> Result<(), sqlx::Erro
     .fetch_one(conn)
     .await?;
     Ok(())
-}
-
-fn sqlx_query_log_level_from_env() -> LevelFilter {
-    match std::env::var("SPACE_SQLX_QUERY_LOG_LEVEL") {
-        Ok(raw) => parse_level_filter(&raw).unwrap_or_else(|| {
-            tracing::warn!(
-                raw = %raw,
-                default = "off",
-                "invalid SPACE_SQLX_QUERY_LOG_LEVEL; using default"
-            );
-            LevelFilter::Off
-        }),
-        Err(_) => LevelFilter::Off,
-    }
-}
-
-fn parse_level_filter(raw: &str) -> Option<LevelFilter> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "off" => Some(LevelFilter::Off),
-        "error" => Some(LevelFilter::Error),
-        "warn" | "warning" => Some(LevelFilter::Warn),
-        "info" => Some(LevelFilter::Info),
-        "debug" => Some(LevelFilter::Debug),
-        "trace" => Some(LevelFilter::Trace),
-        _ => None,
-    }
 }
 
 fn max_connections_from_env() -> u32 {
