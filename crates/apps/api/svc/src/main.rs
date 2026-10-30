@@ -1,3 +1,4 @@
+// CI measurement only: this line forces a Rust rebuild. Never merged.
 use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
