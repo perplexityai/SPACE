@@ -2047,6 +2047,7 @@ async fn prune_local_artifact_metadata_once(
 
 mod activation;
 mod activation_support;
+pub(crate) use activation_support::NodeIdentitySource;
 mod adapter;
 mod auth_lookup;
 #[cfg(test)]

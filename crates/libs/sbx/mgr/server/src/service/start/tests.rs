@@ -647,6 +647,32 @@ fn restore_placement_accepts_local_bytes_only_on_named_source_node() {
     );
 }
 
+// A Direct node has no SPACE_NODE_ID; its node-id file names it.
+#[test]
+fn restore_placement_recognises_the_source_node_from_the_node_id_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let node_id_path = dir.path().join("node-id");
+    let node_id = NodeId::new().to_string();
+    std::fs::write(&node_id_path, format!("{node_id}\n")).unwrap();
+    let request = StartRequest {
+        sandbox_id: SandboxId::new().to_string(),
+        checkpoint: Some(SUSPEND_CHECKPOINT.to_string()),
+        suspend_restore_source_node: Some(node_id),
+        ..Default::default()
+    };
+
+    let context = StartSandboxContext::from_request_on_node(
+        &request,
+        &NodeIdentitySource::node_id_file(node_id_path),
+    )
+    .unwrap();
+
+    assert_eq!(
+        context.restore_placement,
+        SuspendRestorePlacement::SourceNode
+    );
+}
+
 #[tokio::test]
 async fn restore_releases_artifact_lock_while_waiting_for_cleanup_completion() {
     use crate::service::tests::service_tests::{insert_test_sandbox, service_for_teardown_test};

@@ -26,6 +26,28 @@ fn btrfs_disk_restore_stages_only_the_rootfs_diff() {
     assert_eq!(btrfs_restore_artifacts(ArtifactKind::Full).len(), 3);
 }
 
+// A Direct node has no SPACE_NODE_ID; its node-id file names it.
+#[test]
+fn quarantine_recovery_plan_request_names_the_node_from_the_node_id_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let node_id_path = dir.path().join("node-id");
+    let node_id = pplx_space_common_core::types::NodeId::new().to_string();
+    std::fs::write(&node_id_path, format!("{node_id}\n")).unwrap();
+
+    let request = quarantine_recovery_plan_request(
+        "sandbox-under-test",
+        &crate::service::NodeIdentitySource::node_id_file(node_id_path),
+        None,
+    )
+    .expect("the node-id file identifies this node");
+
+    assert_eq!(request.node_id, node_id);
+    assert_eq!(
+        request.role,
+        Some(pplx_space_node_api_client::proto::NodeRole::Worker as i32)
+    );
+}
+
 #[test]
 fn recovery_plan_parses_legacy_empty_artifact_identity() {
     assert_eq!(parse_recovery_local_artifact_id("").unwrap(), None);

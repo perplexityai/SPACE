@@ -6,10 +6,11 @@
 use pplx_space_common_core::types::{LocalArtifactId, RateLimiter, TokenBucket};
 
 use super::activation_support::{
-    ActivationFailureStage, IdentityFreeDirectActivationAuthority, StartStateTransition,
-    operation_activation_attempt_id_from_wire, space_api_route_identity_for_runtime_activation,
-    space_api_route_identity_from_start_request, space_api_route_identity_to_wire,
-    spawn_wait_ready_state_transition, wait_ready_and_mark_started, wake_target_state_from_proto,
+    ActivationFailureStage, IdentityFreeDirectActivationAuthority, NodeIdentitySource,
+    StartStateTransition, operation_activation_attempt_id_from_wire,
+    space_api_route_identity_for_runtime_activation, space_api_route_identity_from_start_request,
+    space_api_route_identity_to_wire, spawn_wait_ready_state_transition,
+    wait_ready_and_mark_started, wake_target_state_from_proto,
 };
 use super::cleanup_support::{ActivationCleanupSpec, read_node_execution_fence};
 use super::create::StartFromCheckpointLaunch;
@@ -254,6 +255,13 @@ fn interrupted_restore_action(
 
 impl StartSandboxContext {
     fn from_request(req: &StartRequest) -> Result<Self, Status> {
+        Self::from_request_on_node(req, &NodeIdentitySource::from_process())
+    }
+
+    fn from_request_on_node(
+        req: &StartRequest,
+        node_identity: &NodeIdentitySource,
+    ) -> Result<Self, Status> {
         let checkpoint = req.checkpoint.clone().unwrap_or_default();
         let suspend_restore_storage_uri = req.suspend_restore_storage_uri.clone();
         let parsed_suspend_restore_storage_uri = suspend_restore_storage_uri
@@ -275,7 +283,7 @@ impl StartSandboxContext {
             ));
         }
 
-        let local_node_id = std::env::var("SPACE_NODE_ID").ok();
+        let local_node_id = node_identity.configured_node_id();
         let restore_placement = suspend_restore_placement(
             suspend_restore_source_node.as_deref(),
             local_node_id.as_deref(),

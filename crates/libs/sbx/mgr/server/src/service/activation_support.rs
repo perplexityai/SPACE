@@ -685,21 +685,53 @@ fn parse_optional_pod_uid(
         .map_err(|error| Status::invalid_argument(format!("{name} is invalid: {error}")))
 }
 
-pub(super) fn local_space_node_id() -> Option<NodeId> {
-    let value = std::env::var("SPACE_NODE_ID")
-        .ok()
-        .or_else(|| std::fs::read_to_string(NODE_ID_PATH).ok());
-    let value = value?;
-    let value = value.trim();
-    if value.is_empty() {
-        return None;
+/// Where this node's identity is configured: `SPACE_NODE_ID` when the
+/// variable is set, else the node-id file that node-api reads or generates.
+/// Direct nodes rely on the file; Kubernetes node services set the variable
+/// to the kube node name. A set but blank variable names no node: unlike
+/// node-api, this does not fall back to the file.
+#[derive(Clone, Debug)]
+pub(crate) struct NodeIdentitySource {
+    env_value: Option<String>,
+    node_id_path: std::path::PathBuf,
+}
+
+impl NodeIdentitySource {
+    pub(crate) fn from_process() -> Self {
+        Self {
+            env_value: std::env::var("SPACE_NODE_ID").ok(),
+            node_id_path: NODE_ID_PATH.into(),
+        }
     }
+
+    #[cfg(test)]
+    pub(crate) fn node_id_file(node_id_path: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            env_value: None,
+            node_id_path: node_id_path.into(),
+        }
+    }
+
+    /// The configured value as written, trimmed: a node UUID, or a kube node
+    /// name that [`local_space_node_id`] maps to one.
+    pub(crate) fn configured_node_id(&self) -> Option<String> {
+        let value = self
+            .env_value
+            .clone()
+            .or_else(|| std::fs::read_to_string(&self.node_id_path).ok())?;
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.to_owned())
+    }
+}
+
+pub(super) fn local_space_node_id() -> Option<NodeId> {
+    let value = NodeIdentitySource::from_process().configured_node_id()?;
     let role = std::env::var("SPACE_NODE_ROLE")
         .ok()
         .and_then(|role| role.parse::<SpaceNodeRole>().ok())
         .filter(|role| matches!(role, SpaceNodeRole::Worker | SpaceNodeRole::Builder))
         .unwrap_or(SpaceNodeRole::Worker);
-    space_node_id(value, role).ok()
+    space_node_id(&value, role).ok()
 }
 
 #[derive(Clone, Debug)]
