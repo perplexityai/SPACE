@@ -1060,6 +1060,11 @@ func (x *NodeExecutionInventory) GetEnvironments() *EnvironmentObservation {
 
 // Which environments this node's build certifies and which it can run. Usable
 // is not executable: the policy observation says what this node admits.
+//
+// Readers reject the whole observation when any entry fails to decode,
+// including a definition of a kind the reader doesn't know, and treat the node
+// as having no environment evidence. So readers that understand a new entry
+// kind must be deployed before nodes publish one.
 type EnvironmentObservation struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	SchemaVersion uint32                 `protobuf:"varint,1,opt,name=schema_version,json=schemaVersion,proto3" json:"schema_version,omitempty"`

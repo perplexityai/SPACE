@@ -199,3 +199,31 @@ pub fn ingress_preparation_path(observing: bool) {
         )],
     );
 }
+
+metric_vocabulary!(
+    /// Which catalog a node's provisioning recipe is drawn from.
+    RecipeCatalogScope {
+        /// The unretired environments the node's build reports it knows.
+        Known => "known",
+        /// Every unretired environment: the node reports no known set, so its
+        /// recipe is the whole catalog, every architecture included.
+        Full => "full",
+    }
+);
+
+/// How many environments one node's provisioning recipe holds, sampled from
+/// each complete inventory the node publishes, whether or not recipes are
+/// served. node-ctl refuses a recipe over `MAX_RECIPE_ENVIRONMENTS` (32)
+/// whole, and the cluster API then omits it, so past the limit that node
+/// installs nothing new until environments are retired. Alert on the fleet
+/// maximum approaching the limit, before it's reached.
+///
+/// A distribution for the reason [`local_backup_queue_depth`] is one: several
+/// replicas serve every node, so a gauge would be last-writer-wins.
+pub fn runtime_provisioning_recipe_environments(environments: usize, catalog: RecipeCatalogScope) {
+    distribution(
+        "internal_api.runtime_provisioning.recipe_environments",
+        environments as f64,
+        &[tag("catalog", catalog)],
+    );
+}

@@ -1,6 +1,7 @@
 //! `GetNodeRuntimeDesiredState` serves the stored execution policy while its
-//! setting is on, and the unretired catalog as a recipe to nodes in the
-//! provisioning cohort, each independently, to registered nodes only. A
+//! setting is on, and the unretired catalog, narrowed to what the node reports
+//! it knows, as a recipe to nodes in the provisioning cohort, each
+//! independently, to registered nodes only. A
 //! policy it can't read fails the call; a catalog it can't read only omits
 //! the recipe.
 
@@ -598,5 +599,88 @@ async fn the_catalog_read_uses_the_runtime_catalog_pool() -> TestResult {
         .await?
         .into_inner();
     assert_eq!(response.recipe, catalog_recipe());
+    Ok(())
+}
+
+/// The node's last complete inventory, reporting `known` as its build's known
+/// environments.
+async fn report_known(
+    pool: &sqlx::PgPool,
+    node_id: NodeId,
+    known: &[EnvironmentReference],
+) -> TestResult {
+    let known: Vec<String> = known.iter().map(ToString::to_string).collect();
+    sqlx::query(sql!(
+        "INSERT INTO node_status_snapshots (
+             node_id, observed_at, updated_at, stale_after, reachable, services,
+             execution_inventory_status, execution_inventory_received_at,
+             usable_environment_refs, known_environment_refs, environment_refs_received_at
+         )
+         VALUES ($1, now(), now(), now() + interval '150 seconds', TRUE, '[]',
+                 'complete', now(), '{}', $2, now())"
+    ))
+    .bind(node_id)
+    .bind(known)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_node_that_reports_its_known_environments_installs_only_those() -> TestResult {
+    let Some(mut fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    fixture.service.runtime_provisioning_cohort = admit_every_node();
+    let node_id = insert_worker(&fixture.service.pool).await?;
+    write_catalog(&fixture.service.pool).await?;
+    // e6 is retired and e9 isn't in the catalog: neither is installed.
+    report_known(
+        &fixture.service.pool,
+        node_id,
+        &[environment(5), environment(6), environment(9)],
+    )
+    .await?;
+
+    let response = fixture
+        .service
+        .get_node_runtime_desired_state(request(node_id))
+        .await?
+        .into_inner();
+    assert_eq!(
+        response.recipe,
+        Some(RuntimeProvisioningRecipe {
+            required_environments: vec![environment(5).to_string()],
+        })
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_cluster_catalog_over_the_limit_still_serves_nodes_that_know_fewer() -> TestResult {
+    let Some(mut fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    fixture.service.runtime_provisioning_cohort = admit_every_node();
+    // Two node builds, say two architectures, each certifying its own half.
+    let count = u8::try_from(MAX_RECIPE_ENVIRONMENTS + 8)?;
+    for byte in 0..count {
+        insert_catalog(&fixture.service.pool, &environment(byte).to_string(), false).await?;
+    }
+    let half: Vec<_> = (0..count)
+        .filter(|byte| byte % 2 == 0)
+        .map(environment)
+        .collect();
+    let reporting = insert_worker(&fixture.service.pool).await?;
+    report_known(&fixture.service.pool, reporting, &half).await?;
+
+    let recipe = fixture
+        .service
+        .get_node_runtime_desired_state(request(reporting))
+        .await?
+        .into_inner()
+        .recipe
+        .expect("a node knowing fewer than the limit gets its recipe");
+    assert_eq!(recipe.required_environments.len(), half.len());
     Ok(())
 }
