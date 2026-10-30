@@ -231,6 +231,7 @@ pub(super) fn bridge_process_kill_request(
     let signal = ProcessSignal::sigkill();
     Ok(
         pplx_space_spaced_common::proto::bridge_guest::SendSignalRequest {
+            recovery: None,
             process_id: process_id.as_str().to_string(),
             signal: signal.as_i32(),
         },

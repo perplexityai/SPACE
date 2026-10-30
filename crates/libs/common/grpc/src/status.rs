@@ -107,6 +107,7 @@ pub enum GuestCapability {
     InteractiveProcessControl,
     ProcessOutputGapResume,
     ProcessRecoveryStart,
+    ProcessRecoveryHandles,
 }
 
 impl GuestCapability {
@@ -115,6 +116,7 @@ impl GuestCapability {
             Self::InteractiveProcessControl => "interactive_process_control",
             Self::ProcessOutputGapResume => "process_output_gap_resume",
             Self::ProcessRecoveryStart => "process_recovery_start",
+            Self::ProcessRecoveryHandles => "process_recovery_handles",
         }
     }
 }
@@ -133,6 +135,7 @@ impl std::str::FromStr for GuestCapability {
             "interactive_process_control" => Self::InteractiveProcessControl,
             "process_output_gap_resume" => Self::ProcessOutputGapResume,
             "process_recovery_start" => Self::ProcessRecoveryStart,
+            "process_recovery_handles" => Self::ProcessRecoveryHandles,
             _ => {
                 return Err(GuestCapabilityParseError {
                     value: value.to_owned(),

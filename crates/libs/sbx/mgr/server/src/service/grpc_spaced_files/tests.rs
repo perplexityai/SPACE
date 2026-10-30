@@ -34,6 +34,8 @@ fn readiness_discovery_preserves_instance_and_filters_unsupported_guarantees() {
             capabilities: vec![
                 "process_output_gap_resume".into(),
                 "future_capability".into(),
+                "process_recovery_start".into(),
+                "process_recovery_handles".into(),
             ],
             ..Default::default()
         }),

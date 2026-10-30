@@ -167,6 +167,7 @@ async fn apply_process_signal(
             SpacedSendSignalRequest {
                 sandbox_id: sandbox.id.to_string(),
                 operation: Some(spaced_ops::SendSignalRequest {
+                    recovery: None,
                     process_id: process_id.to_string(),
                     signal: signal.as_i32(),
                 }),

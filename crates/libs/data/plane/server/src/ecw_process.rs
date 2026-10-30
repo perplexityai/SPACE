@@ -404,6 +404,7 @@ pub(super) async fn process_connect(
     let message = SpacedConnectProcessRequest {
         sandbox_id: route.sandbox_id.to_string(),
         operation: Some(spaced_ops::ConnectProcessRequest {
+            recovery: None,
             process_id,
             timeout,
             output_cursor: None,
@@ -478,6 +479,7 @@ pub(super) async fn process_update(
         let message = SpacedResizePtyRequest {
             sandbox_id: route.sandbox_id.to_string(),
             operation: Some(spaced_ops::ResizePtyRequest {
+                recovery: None,
                 process_id,
                 size: Some(size),
             }),
@@ -512,7 +514,11 @@ pub(super) async fn process_send_signal(
     let signal = process_signal_to_native(request.signal)?;
     let message = SpacedSendSignalRequest {
         sandbox_id: route.sandbox_id.to_string(),
-        operation: Some(spaced_ops::SendSignalRequest { process_id, signal }),
+        operation: Some(spaced_ops::SendSignalRequest {
+            recovery: None,
+            process_id,
+            signal,
+        }),
     };
     bounded_node_api_unary(
         &state,
@@ -665,7 +671,11 @@ async fn send_process_input(
 ) -> Result<EcwResolvedRoute, EcwProxyError> {
     let message = SpacedSendInputRequest {
         sandbox_id: route.sandbox_id.to_string(),
-        operation: Some(spaced_ops::SendInputRequest { process_id, data }),
+        operation: Some(spaced_ops::SendInputRequest {
+            recovery: None,
+            process_id,
+            data,
+        }),
     };
     bounded_node_api_unary(
         state,
@@ -708,7 +718,10 @@ pub(super) async fn process_close_stdin(
         .await;
     let message = SpacedCloseStdinRequest {
         sandbox_id: route.sandbox_id.to_string(),
-        operation: Some(spaced_ops::CloseStdinRequest { process_id }),
+        operation: Some(spaced_ops::CloseStdinRequest {
+            recovery: None,
+            process_id,
+        }),
     };
     retryable_bounded_node_api_unary(
         &state,

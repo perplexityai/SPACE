@@ -235,6 +235,7 @@ impl Boundary {
         assert!(!self.members("filesystem").contains(&unrelated_pid));
         service
             .send_input(tonic::Request::new(SendInputRequest {
+                recovery: None,
                 process_id: started.process_id,
                 data: b"continue\n".to_vec(),
             }))

@@ -230,7 +230,9 @@ impl ProcessLaunch {
     ) -> Result<LaunchedProcess, Status> {
         let process_id = self.process_id.clone();
         let recovery_launch = self.recovery_launch.take();
-        let launched = self.publish(recovery_launch.is_some()).await;
+        let launched = self
+            .publish(recovery_launch.as_ref().map(|launch| launch.fence))
+            .await;
         operation.complete(match &launched {
             Ok(launched) => Ok(match launched.recovery_incarnation {
                 Some(incarnation) => IdempotencyRecord::RecoveryProcessStarted {
@@ -245,7 +247,10 @@ impl ProcessLaunch {
         launched
     }
 
-    pub(super) async fn publish(self, recovery_start: bool) -> Result<LaunchedProcess, Status> {
+    pub(super) async fn publish(
+        self,
+        recovery_fence: Option<pplx_space_spaced_guest_protocol::recovery::RecoveryFence>,
+    ) -> Result<LaunchedProcess, Status> {
         let ProcessLaunch {
             command,
             recovery_launch: _,
@@ -344,7 +349,11 @@ impl ProcessLaunch {
                 return Err(status);
             }
         };
-        let recovery_incarnation = recovery_start.then(ProcessRecoveryToken::new);
+        let recovery_identity = recovery_fence.map(|fence| recovery::RecoveryIdentity {
+            activation: fence.activation,
+            incarnation: ProcessRecoveryToken::new(),
+        });
+        let recovery_incarnation = recovery_identity.map(|identity| identity.incarnation);
         if let Some(incarnation) = recovery_incarnation
             && let Some(
                 pplx_space_spaced_guest_protocol::proto::operations::process_event::Event::Started(
@@ -358,6 +367,7 @@ impl ProcessLaunch {
         info.pid = pid;
         let record = Arc::new(ProcessRecord::new(
             started.clone(),
+            recovery_identity,
             info,
             input,
             signal_handle,

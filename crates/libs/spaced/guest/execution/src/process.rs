@@ -17,7 +17,9 @@ use tokio::io::AsyncRead;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 mod pty;
+mod recovery;
 use pty::PtyIo;
+use recovery::{ProcessAddress, TargetState};
 
 mod child_io;
 mod journal;
@@ -320,7 +322,7 @@ impl Process for ExecutionService {
                 .launches
                 .clone()
                 .try_read_owned()
-                .map_err(|_| Status::unavailable("process recovery is temporarily unavailable"))?;
+                .map_err(|_| pplx_space_spaced_guest_protocol::recovery::RecoveryReason::TemporarilyUnavailable.into_status())?;
             let permit = crate::payload::acquire(
                 &self.inner.process_payload_slots,
                 pplx_space_spaced_guest_protocol::process_limits::START_PAYLOAD_SLOTS,
@@ -654,23 +656,20 @@ impl Process for ExecutionService {
             pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,
         )?;
         let request = request.into_inner();
-        let process_id = ProcessId::parse(request.process_id).map_err(invalid_argument_status)?;
+        let address = ProcessAddress::parse(request.process_id, request.recovery)?;
         let resume_after_output_gap = request.resume_after_output_gap.unwrap_or(false);
         // Validate the field for wire compatibility, but do not turn it into a
         // total stream-lifetime deadline here. ECW and native callers own
         // their outer stream budgets; enforcing the same value again in the
         // guest can truncate a healthy, continuously producing process.
         validate_optional_timeout(request.timeout)?;
-        let replay = self
-            .inner
-            .processes
-            .replay(
-                &process_id,
-                request.output_cursor,
-                request.resume_from_oldest_retained,
-                request.resume_after_output_gap.unwrap_or(false),
-            )
-            .ok_or_else(|| Status::not_found("process not found"))?;
+        let target = self.select_process(address, TargetState::Retained).await?;
+        let process_id = &target.id;
+        let replay = target.record.replay(
+            request.output_cursor,
+            request.resume_from_oldest_retained,
+            request.resume_after_output_gap.unwrap_or(false),
+        );
         let pid = match &replay {
             ProcessReplay::Running { started, .. } | ProcessReplay::Completed { started, .. } => {
                 started.pid
@@ -681,7 +680,7 @@ impl Process for ExecutionService {
                 let output_cursor = request.output_cursor.map(|_| cursor.next_sequence);
                 process_event_stream_with_prefix(
                     vec![process_connected_event(
-                        &process_id,
+                        process_id,
                         pid,
                         output_cursor,
                         resume_after_output_gap,
@@ -735,14 +734,12 @@ impl Process for ExecutionService {
             pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,
         )?;
         let request = request.into_inner();
-        let process_id = ProcessId::parse(request.process_id).map_err(invalid_argument_status)?;
+        let address = ProcessAddress::parse(request.process_id, request.recovery)?;
         let signal =
             ProcessSignal::try_from_i32(request.signal).map_err(invalid_argument_status)?;
-        let handle = self
-            .inner
-            .processes
-            .get_running(&process_id)
-            .ok_or_else(|| Status::not_found("process not found"))?;
+        let target = self.select_process(address, TargetState::Running).await?;
+        let process_id = &target.id;
+        let handle = &target.record;
         let kill = signal.as_i32() == libc::SIGKILL;
         match handle.signal_handle.signal(signal) {
             Ok(()) => {}
@@ -775,13 +772,13 @@ impl Process for ExecutionService {
             pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,
         )?;
         let mut request = request.into_inner();
-        let process_id = ProcessId::parse(std::mem::take(&mut request.process_id))
-            .map_err(invalid_argument_status)?;
-        let record = self
-            .inner
-            .processes
-            .get_running(&process_id)
-            .ok_or_else(|| Status::not_found("process not found"))?;
+        let address = ProcessAddress::parse(
+            std::mem::take(&mut request.process_id),
+            request.recovery.take(),
+        )?;
+        let target = self.select_process(address, TargetState::Running).await?;
+        let process_id = &target.id;
+        let record = &target.record;
         record.write_stdin(&request.data).await?;
         tracing::debug!(
             command = "bridge_guest_process_send_input",
@@ -802,12 +799,10 @@ impl Process for ExecutionService {
             pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,
         )?;
         let request = request.into_inner();
-        let process_id = ProcessId::parse(request.process_id).map_err(invalid_argument_status)?;
-        let record = self
-            .inner
-            .processes
-            .get_running(&process_id)
-            .ok_or_else(|| Status::not_found("process not found"))?;
+        let address = ProcessAddress::parse(request.process_id, request.recovery)?;
+        let target = self.select_process(address, TargetState::Running).await?;
+        let process_id = &target.id;
+        let record = &target.record;
         record.close_stdin().await?;
         tracing::debug!(
             command = "bridge_guest_process_close_stdin",
@@ -827,15 +822,13 @@ impl Process for ExecutionService {
             pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,
         )?;
         let request = request.into_inner();
-        let process_id = ProcessId::parse(request.process_id).map_err(invalid_argument_status)?;
+        let address = ProcessAddress::parse(request.process_id, request.recovery)?;
         let size = request
             .size
             .ok_or_else(|| Status::invalid_argument("pty size is required"))?;
-        let record = self
-            .inner
-            .processes
-            .get_running(&process_id)
-            .ok_or_else(|| Status::not_found("process not found"))?;
+        let target = self.select_process(address, TargetState::Running).await?;
+        let process_id = &target.id;
+        let record = &target.record;
         record.resize_pty(size)?;
         tracing::debug!(
             command = "bridge_guest_process_resize_pty",

@@ -1,7 +1,10 @@
 //! Recovery lifetime and fixed-size request binding; no request payload is retained.
 use aws_lc_rs::digest::{Context, SHA256};
 use pplx_space_common_core::types::ProcessRecoveryToken;
-use pplx_space_spaced_guest_protocol::{proto::operations::StartRequest, recovery::RecoveryFence};
+use pplx_space_spaced_guest_protocol::{
+    proto::operations::StartRequest,
+    recovery::{RecoveryFence, RecoveryReason},
+};
 use prost::Message;
 use tonic::Status;
 
@@ -12,6 +15,13 @@ pub(super) enum RequestBinding {
 }
 
 impl RequestBinding {
+    pub(super) fn expired_status(self) -> Status {
+        match self {
+            Self::Legacy => Status::failed_precondition("idempotency_key expired"),
+            Self::Recovery(_) => RecoveryReason::StartKeyExpired.into_status(),
+        }
+    }
+
     pub(super) fn require_match(self, supplied: Self) -> Result<(), Status> {
         match (self, supplied) {
             (Self::Legacy, Self::Legacy) => Ok(()),
@@ -19,9 +29,7 @@ impl RequestBinding {
             (Self::Recovery(_), Self::Recovery(_)) => Err(Status::invalid_argument(
                 "idempotency_key is bound to a different start request",
             )),
-            _ => Err(Status::failed_precondition(
-                "idempotency_key belongs to a different start mode",
-            )),
+            _ => Err(RecoveryReason::StartModeMismatch.into_status()),
         }
     }
 }
@@ -71,18 +79,16 @@ pub(super) struct RecoveryState {
 impl RecoveryState {
     pub(super) fn check(&self, fence: RecoveryFence) -> Result<(), Status> {
         if self.instance != fence.instance {
-            return Err(Status::failed_precondition("execution engine restarted"));
+            return Err(RecoveryReason::EngineRestarted.into_status());
         }
         match *self
             .activation
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
         {
-            None => Err(Status::unavailable(
-                "process recovery is temporarily unavailable",
-            )),
+            None => Err(RecoveryReason::TemporarilyUnavailable.into_status()),
             Some(current) if current != fence.activation => {
-                Err(Status::failed_precondition("execution activation changed"))
+                Err(RecoveryReason::ActivationChanged.into_status())
             }
             Some(_) => Ok(()),
         }

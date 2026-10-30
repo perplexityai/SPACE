@@ -125,6 +125,7 @@ struct IdempotencyClaim {
     store: IdempotencyStore,
     key: IdempotencyKey,
     generation: Arc<Notify>,
+    binding: RequestBinding,
 }
 
 /// No effect may be started until `begin` transfers ownership to an operation.
@@ -183,7 +184,7 @@ impl IdempotencyStore {
                                     in_progress_generation: None,
                                 },
                             );
-                            return Err(Status::failed_precondition("idempotency_key expired"));
+                            return Err(binding.expired_status());
                         }
                         return Ok(IdempotencyLookup::Completed(result.clone()));
                     }
@@ -203,7 +204,7 @@ impl IdempotencyStore {
                                     in_progress_generation: Some(notify),
                                 },
                             );
-                            return Err(Status::failed_precondition("idempotency_key expired"));
+                            return Err(binding.expired_status());
                         }
                         // Register under the state lock. `notify_waiters` does
                         // not retain a permit for a future waiter, so creating
@@ -212,7 +213,7 @@ impl IdempotencyStore {
                         enabled_notification(notify.clone())
                     }
                     Some(StoredIdempotencyRecord::Expired { .. }) => {
-                        return Err(Status::failed_precondition("idempotency_key expired"));
+                        return Err(binding.expired_status());
                     }
                     None => {
                         if !state.can_insert(&key) {
@@ -241,6 +242,7 @@ impl IdempotencyStore {
                                 store: self.clone(),
                                 key,
                                 generation,
+                                binding,
                             }),
                         }));
                     }
@@ -506,7 +508,7 @@ impl IdempotencyReservation {
                     && created_at.elapsed() <= IN_PROGRESS_LIMIT
         );
         if !current {
-            return Err(Status::failed_precondition("idempotency_key expired"));
+            return Err(claim.binding.expired_status());
         }
         Ok(IdempotencyOperation {
             claim: self.claim.take(),

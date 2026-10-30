@@ -287,6 +287,7 @@ pub(super) async fn run() {
             .expect("replace environment");
         service
             .send_input(tonic::Request::new(SendInputRequest {
+                recovery: None,
                 process_id: started.process_id,
                 data: b"continue\n".to_vec(),
             }))

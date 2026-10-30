@@ -99,6 +99,7 @@ async fn bridge_guest_process_send_input_writes_and_close_stdin_signals_eof() {
 
     client
         .send_input(bridge_guest::SendInputRequest {
+            recovery: None,
             process_id: process_id.clone(),
             data: b"hello stdin\n".to_vec(),
         })
@@ -106,6 +107,7 @@ async fn bridge_guest_process_send_input_writes_and_close_stdin_signals_eof() {
         .expect("send input");
     client
         .close_stdin(bridge_guest::CloseStdinRequest {
+            recovery: None,
             process_id: process_id.clone(),
         })
         .await
@@ -188,6 +190,7 @@ async fn bridge_guest_process_stalled_stream_does_not_block_reconnect_exit() {
 
     let mut connected = service
         .connect_process(tonic::Request::new(bridge_guest::ConnectProcessRequest {
+            recovery: None,
             process_id: started.process_id,
             timeout: None,
             output_cursor: None,
@@ -243,6 +246,7 @@ async fn bridge_guest_process_connect_replays_from_output_cursor() {
 
     let mut connected = service
         .connect_process(tonic::Request::new(bridge_guest::ConnectProcessRequest {
+            recovery: None,
             process_id: started.process_id,
             timeout: None,
             output_cursor: Some(0),
@@ -559,6 +563,7 @@ async fn bridge_guest_process_start_replays_output_while_cursorless_connect_retu
         let stream = if reconnect {
             client
                 .connect_process(bridge_guest::ConnectProcessRequest {
+                    recovery: None,
                     process_id: started.process_id.clone(),
                     timeout: None,
                     output_cursor: None,
@@ -664,6 +669,7 @@ async fn bridge_guest_process_pty_start_input_and_resize_work() {
 
     client
         .resize_pty(bridge_guest::ResizePtyRequest {
+            recovery: None,
             process_id: process_id.clone(),
             size: Some(bridge_guest::PtySize {
                 rows: 34,
@@ -674,6 +680,7 @@ async fn bridge_guest_process_pty_start_input_and_resize_work() {
         .expect("resize pty");
     client
         .send_input(bridge_guest::SendInputRequest {
+            recovery: None,
             process_id,
             data: b"hello pty\n".to_vec(),
         })
@@ -715,6 +722,7 @@ async fn bridge_guest_process_connect_and_signal_validation_work() {
     let connected = first_process_event(
         client
             .connect_process(bridge_guest::ConnectProcessRequest {
+                recovery: None,
                 process_id: process_id.clone(),
                 timeout: None,
                 output_cursor: None,
@@ -731,6 +739,7 @@ async fn bridge_guest_process_connect_and_signal_validation_work() {
 
     let error = client
         .send_signal(bridge_guest::SendSignalRequest {
+            recovery: None,
             process_id: process_id.clone(),
             signal: 0,
         })
@@ -740,6 +749,7 @@ async fn bridge_guest_process_connect_and_signal_validation_work() {
 
     client
         .send_signal(bridge_guest::SendSignalRequest {
+            recovery: None,
             process_id: process_id.clone(),
             signal: 9,
         })
@@ -799,6 +809,7 @@ async fn bridge_guest_process_list_returns_running_processes() {
 
     client
         .send_signal(bridge_guest::SendSignalRequest {
+            recovery: None,
             process_id: started.process_id,
             signal: 9,
         })
@@ -816,6 +827,7 @@ async fn bridge_guest_process_connect_unknown_returns_not_found() {
 
     let error = client
         .connect_process(bridge_guest::ConnectProcessRequest {
+            recovery: None,
             process_id: "missing".into(),
             timeout: None,
             output_cursor: None,
