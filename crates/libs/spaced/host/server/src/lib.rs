@@ -90,6 +90,7 @@ mod meta;
 mod networking;
 mod process;
 mod protocol;
+mod recovery;
 mod run;
 
 pub use run::{RunSpacedHostError, SERVICE_NAME, SpacedHostBootType, SpacedHostRunConfig, run};
@@ -147,6 +148,11 @@ pub enum ConnectBridgeGuestError {
 
 #[derive(Clone, Debug)]
 pub struct SpacedHostServiceConfig {
+    /// External identity for this resident VM. Use a fresh identity after any
+    /// memory restore; retain it across resident pause/resume and host restarts.
+    /// None leaves process recovery disabled. Activation requires a lifecycle
+    /// owner to complete ResumeProcessRecovery after the VM is running.
+    pub process_recovery_activation: Option<pplx_space_common_core::types::ProcessRecoveryToken>,
     pub socket_path: PathBuf,
     pub bridge_host_socket_path: PathBuf,
     pub bridge_guest_connector: BridgeGuestConnector,
@@ -157,6 +163,7 @@ pub struct SpacedHostServiceConfig {
 impl Default for SpacedHostServiceConfig {
     fn default() -> Self {
         Self {
+            process_recovery_activation: None,
             socket_path: pplx_space_common_core::host::linux::paths::default_host_uds_path(
                 pplx_space_common_core::host::linux::paths::SPACED_HOST_SOCKET_FILE,
             ),
@@ -185,6 +192,7 @@ impl std::fmt::Debug for SpacedHostService {
 
 #[derive(Clone, Debug)]
 struct GuestReadySnapshot {
+    process_recovery_barrier_id: Option<pplx_space_common_core::types::ProcessRecoveryToken>,
     process_execution: Option<proto::ProcessExecutionInfo>,
     guest_uptime: Option<prost_types::Duration>,
     version: String,
@@ -218,6 +226,7 @@ impl GuestReadinessCoordinator {
 }
 
 struct SpacedHostServiceInner {
+    process_recovery: Option<recovery::RecoveryLifecycle>,
     shutdown: CancellationToken,
     socket_path: PathBuf,
     bridge_host_socket_path: PathBuf,

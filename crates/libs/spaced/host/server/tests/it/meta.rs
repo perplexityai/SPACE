@@ -51,6 +51,16 @@ impl Drop for ActiveWaitReadyCall {
 
 #[tonic::async_trait]
 impl BridgeGuestMeta for ReadyWaitGuest {
+    async fn activate_process_recovery(
+        &self,
+        _: Request<pplx_space_spaced_common::proto::bridge_guest::ActivateProcessRecoveryRequest>,
+    ) -> Result<
+        Response<pplx_space_spaced_common::proto::bridge_guest::ActivateProcessRecoveryResponse>,
+        Status,
+    > {
+        Err(Status::unimplemented("older guest"))
+    }
+
     async fn ping(
         &self,
         _request: Request<BridgeGuestPingRequest>,
@@ -84,6 +94,7 @@ impl BridgeGuestMeta for ReadyWaitGuest {
         }
         let ready = self.ready.load(Ordering::SeqCst);
         Ok(Response::new(BridgeGuestWaitReadyResponse {
+            process_recovery_barrier_id: None,
             process_execution: ready.then(|| self.process_execution.clone()).flatten(),
             ready,
             guest_uptime: ready.then(|| duration_from_millis(42)),

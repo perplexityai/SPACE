@@ -9,7 +9,7 @@ fn flush_filesystem_at_path_with_syncfs(
     syncfs(&root)
 }
 
-async fn run_filesystem_flush(
+pub(super) async fn run_filesystem_flush(
     slots: Arc<Semaphore>,
     flush: impl FnOnce() -> Result<(), Status> + Send + 'static,
 ) -> Result<(), Status> {
@@ -111,6 +111,8 @@ impl SpacedGuestService {
             mem_total_bytes: ready.then(guest_mem_total_bytes).flatten(),
             vcpu_count: ready.then(guest_vcpu_count).flatten(),
             process_execution: ready.then(|| self.inner.execution.process_execution_info()),
+            process_recovery_barrier_id: ready
+                .then(|| self.inner.process_recovery.barrier().to_string()),
         }
     }
 
@@ -255,6 +257,20 @@ impl BridgeGuestMeta for SpacedGuestService {
         Ok(Response::new(response))
     }
 
+    async fn activate_process_recovery(
+        &self,
+        request: Request<
+            pplx_space_spaced_common::proto::bridge_guest::ActivateProcessRecoveryRequest,
+        >,
+    ) -> Result<
+        Response<pplx_space_spaced_common::proto::bridge_guest::ActivateProcessRecoveryResponse>,
+        Status,
+    > {
+        self.activate_recovery(request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
     async fn configure_process_env(
         &self,
         request: Request<ConfigureProcessEnvRequest>,
@@ -301,11 +317,8 @@ impl BridgeGuestMeta for SpacedGuestService {
         &self,
         _request: Request<FlushFilesystemsRequest>,
     ) -> Result<Response<FlushFilesystemsResponse>, Status> {
-        run_filesystem_flush(
-            self.inner.filesystem_flush_slots.clone(),
-            flush_guest_filesystems,
-        )
-        .await?;
+        self.flush_with_recovery_barrier(flush_guest_filesystems)
+            .await?;
         tracing::info!(
             command = "bridge_guest_flush_filesystems",
             "guest filesystems flushed"

@@ -13,6 +13,9 @@ pub(super) async fn connect_process_stream(
     client: &pplx_space_spaced_host_client::SpacedHostClient,
     operation: &pplx_space_sbx_mgr_client::operations::ConnectProcessRequest,
 ) -> Result<tonic::Streaming<host_proto::ProcessEvent>, Status> {
+    if operation.recovery.is_some() {
+        return client.recovery_connect_process(operation.clone()).await;
+    }
     client
         .connect_process_stream_with_cursor(
             operation.process_id.clone(),

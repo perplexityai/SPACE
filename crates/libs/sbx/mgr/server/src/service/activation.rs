@@ -601,6 +601,9 @@ impl SandboxManagerService {
         let _guard = wait_for_activation_admission(&sandbox.id, wake_lock.lock()).await?;
         loop {
             let sandbox = self.lookup_sandbox(&sandbox.id)?;
+            if let Some(fence) = start.recovery_fence {
+                super::process_recovery::authorize_resident_recovery(&sandbox, route_auth, fence)?;
+            }
             let wake_policy =
                 if sandbox.auto_lifecycle_authority == crate::db::PolicyAuthority::Local {
                     &sandbox.auto_lifecycle

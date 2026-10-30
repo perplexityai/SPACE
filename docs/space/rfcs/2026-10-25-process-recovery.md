@@ -254,16 +254,59 @@ receipts before flushing. Once quiescing begins, cancelling configuration leaves
 recovery disabled until a subsequent change completes the barrier.
 
 Recovery rearming is optional on ordinary readiness: first observe the guest,
-then attempt rearming within a small part of the remaining request budget. A busy
-snapshot lock or failed rearm removes recovery capabilities without failing
-readiness. Preparation waits briefly for an admitted rearm instead of immediately
-refusing because its lifecycle permit is busy.
+then attempt rearming within half the remaining request budget, capped at three
+seconds. A busy snapshot lock or failed rearm removes recovery capabilities
+without failing readiness. Preparation waits briefly for an admitted rearm
+instead of immediately refusing because its lifecycle permit is busy.
 
 Before implicitly resuming a resident paused sandbox, the manager validates its
 external activation. Recovery requests never restore a suspended sandbox using
 old fences. New public recovery command sessions require a running sandbox and
 do not enqueue a wake; callers explicitly resume or restore, then discover the
-execution for new work. Legacy command wake policy is unchanged.
+execution for new work. An admitted resident resume completes or rolls back even
+if its caller times out or disconnects. During manager drain, matching recovery
+handles may still access an already running resident; they cannot start a resume.
+Node publication confirms a resident wake with a fresh worker observation before
+advancing the public lifecycle. A concurrent lifecycle write or replacement
+execution invalidates that confirmation. Explicit resume of the same already
+running resident succeeds without resetting its policy or activity clocks.
+Legacy command wake policy is unchanged.
+
+### Snapshot activation handshake
+
+The guest starts with recovery disabled. `WaitReady` supplies an opaque barrier;
+`ActivateProcessRecovery` accepts an external activation only against that exact
+barrier. Repeating the activation is idempotent. Changing it requires quiescence.
+The existing `FlushFilesystems` RPC invalidates the barrier and disables recovery
+before waiting for admitted effects. Disabling interrupts blocked recovery writes
+and waits for their owners to publish terminal receipts before flushing. This also protects snapshot
+preparation by older hosts. A delayed activation against an earlier barrier is
+refused. Cancelling a flush does not release activation exclusion while its
+blocking filesystem work still runs.
+
+A host configured with an external activation starts quiesced. Its `WaitReady`
+returns a separate host barrier; `ResumeProcessRecovery` accepts that barrier and
+installs only the launch-configured activation. Preparation and ordinary guest
+flushes invalidate the host barrier. A restarted host creates a new barrier while
+retaining the resident VM's activation. Lost replies leave the host quiesced until
+a confirmed retry. Neither readiness polling nor clock synchronization activates
+recovery automatically.
+
+The lifecycle owner must exclude snapshot preparation and capture while resuming
+recovery, and must choose a fresh external activation after every actual memory
+restore. Resident pause/resume, checkpoint completion and failed-capture rollback
+can rearm the existing activation once the VM is running. Disk-only flushing also
+quiesces recovery and requires rearming. Barriers are ordering tokens, not access
+credentials; host metadata calls retain their existing peer authorization.
+
+Node-manager derives the host's activation from the accepted execution fence,
+including sidecar restarts; callers cannot override it through launch arguments.
+The sandbox manager rearms lazily on readiness or a recovery call. It acquires
+the existing snapshot artifact lock, reloads and authorizes a Started sandbox,
+attests its current host, and holds the lock through activation confirmation.
+A paused or transitioning VM cannot rearm. Host capabilities remain filtered
+until the guest confirms the launch-bound activation. Hosts without activation
+configuration and older guests retain the existing path.
 
 ### Deduplicate process mutations
 
@@ -316,9 +359,10 @@ receiving that result, but cannot infer rollback or claim exactly-once execution
 Ship contracts in dependency order: discovery, recovery Start with key binding,
 fenced reconnect/control handles, then mutation receipts. A path advertises its
 capability only after its affected adapters and lifecycle boundary implement
-the contract. The native Start foundation may ship first;
-the daemon routing path filters its capability until the external activation
-handshake and forwarding are implemented.
+the contract. Native support can ship before routed support; the routed path
+advertises recovery only after its external activation handshake completes.
+Adapters preserve envelopes and do not implicitly retry dispatched recovery
+starts or mutations; the caller owns the retry deadline and ordering.
 A client must discover support before selecting the recovery encoding; absent
 or filtered capabilities select the existing path only for new work. Never
 translate an uncertain recovery retry into a legacy request.

@@ -43,6 +43,7 @@ impl HostFixture {
         let service = SpacedHostService::new_with_config(
             shutdown.clone(),
             SpacedHostServiceConfig {
+                process_recovery_activation: None,
                 socket_path: socket_path.clone(),
                 bridge_host_socket_path: bridge_host_socket_path.clone(),
                 bridge_guest_connector,

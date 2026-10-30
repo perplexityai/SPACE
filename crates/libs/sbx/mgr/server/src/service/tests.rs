@@ -7152,7 +7152,7 @@ pub(crate) mod service_tests {
         request
     }
 
-    fn insert_platform_owned_sandbox(
+    pub(crate) fn insert_platform_owned_sandbox(
         conn: &crate::db::Connection,
         id: &str,
         state: SandboxState,
@@ -16255,7 +16255,7 @@ pub(crate) mod service_tests {
         request
     }
 
-    fn route_authorized_service(
+    pub(crate) fn route_authorized_service(
         conn: crate::db::Connection,
         sandbox_id: SandboxId,
     ) -> (SandboxManagerService, SpaceApiRouteEd25519Token) {

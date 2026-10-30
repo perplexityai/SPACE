@@ -292,8 +292,19 @@ async fn sandbox_kill_is_admitted_while_every_sandbox_permit_is_held() {
 fn discovery_only_advertises_forwarded_process_capabilities() {
     let mut capabilities = vec![
         "process_output_gap_resume".to_owned(),
+        "process_recovery_start".to_owned(),
+        "process_recovery_handles".to_owned(),
+        "process_mutation_receipts".to_owned(),
         "future_process_contract".to_owned(),
     ];
     retain_process_capabilities(&mut capabilities);
-    assert_eq!(capabilities, ["process_output_gap_resume"]);
+    assert_eq!(
+        capabilities,
+        [
+            "process_output_gap_resume",
+            "process_recovery_start",
+            "process_recovery_handles",
+            "process_mutation_receipts"
+        ]
+    );
 }

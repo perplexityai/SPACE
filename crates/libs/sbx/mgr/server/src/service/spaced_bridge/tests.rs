@@ -572,41 +572,83 @@ async fn process_reconnect_options_reach_the_host() {
     )
     .await
     .unwrap();
-    for resume_after_output_gap in [None, Some(false), Some(true)] {
-        let operation = pplx_space_sbx_mgr_client::operations::ConnectProcessRequest {
-            recovery: None,
-            process_id: "process".into(),
-            timeout: Some(prost_types::Duration {
-                seconds: 2,
-                nanos: 0,
-            }),
-            output_cursor: Some(7),
-            resume_from_oldest_retained: true,
-            resume_after_output_gap,
-        };
-        let mut stream = tokio::time::timeout(
-            Duration::from_secs(3),
-            connect_process_stream(&client, &operation),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert!(stream.message().await.unwrap().is_none());
-        let actual = recorded
-            .lock()
+    for recovery_enabled in [false, true] {
+        for resume_after_output_gap in [None, Some(false), Some(true)] {
+            let operation = pplx_space_sbx_mgr_client::operations::ConnectProcessRequest {
+                recovery: recovery_enabled.then(|| host_proto::RecoveryHandle {
+                    contract_version: 1,
+                    expected_instance_id: pplx_space_common_core::types::ProcessRecoveryToken::new(
+                    )
+                    .to_string(),
+                    expected_activation_id:
+                        pplx_space_common_core::types::ProcessRecoveryToken::new().to_string(),
+                    process_id: "process".into(),
+                    process_incarnation: pplx_space_common_core::types::ProcessRecoveryToken::new()
+                        .to_string(),
+                    sequence: None,
+                }),
+                process_id: if recovery_enabled {
+                    String::new()
+                } else {
+                    "process".into()
+                },
+                timeout: Some(prost_types::Duration {
+                    seconds: 2,
+                    nanos: 0,
+                }),
+                output_cursor: Some(7),
+                resume_from_oldest_retained: true,
+                resume_after_output_gap,
+            };
+            let mut stream = tokio::time::timeout(
+                Duration::from_secs(3),
+                connect_process_stream(&client, &operation),
+            )
+            .await
             .unwrap()
-            .pop()
-            .expect("host received a request");
-        assert_eq!(actual.process_id, operation.process_id);
-        assert_eq!(actual.timeout, operation.timeout);
-        assert_eq!(actual.output_cursor, operation.output_cursor);
-        assert!(actual.resume_from_oldest_retained);
-        // The convenience client omits false; only true opts into recovery.
-        assert_eq!(
-            actual.resume_after_output_gap,
-            resume_after_output_gap.filter(|enabled| *enabled)
-        );
+            .unwrap();
+            assert!(stream.message().await.unwrap().is_none());
+            let actual = recorded
+                .lock()
+                .unwrap()
+                .pop()
+                .expect("host received a request");
+            assert_eq!(actual.process_id, operation.process_id);
+            assert_eq!(actual.timeout, operation.timeout);
+            assert_eq!(actual.output_cursor, operation.output_cursor);
+            assert!(actual.resume_from_oldest_retained);
+            assert_eq!(actual.recovery, operation.recovery);
+            // Legacy convenience calls omit false; recovery envelopes pass intact.
+            assert_eq!(
+                actual.resume_after_output_gap,
+                if recovery_enabled {
+                    resume_after_output_gap
+                } else {
+                    resume_after_output_gap.filter(|enabled| *enabled)
+                }
+            );
+        }
     }
     server.abort();
     assert!(server.await.unwrap_err().is_cancelled());
+}
+
+#[test]
+fn started_event_keeps_recovery_identity() {
+    let event = host_proto::ProcessEvent {
+        process_id: "process".into(),
+        pid: Some(123),
+        event: Some(host_proto::process_event::Event::Started(
+            host_proto::ProcessStarted {
+                instance_id: Some(
+                    pplx_space_common_core::types::ProcessRecoveryToken::new().to_string(),
+                ),
+                process_incarnation: Some(
+                    pplx_space_common_core::types::ProcessRecoveryToken::new().to_string(),
+                ),
+                ..Default::default()
+            },
+        )),
+    };
+    assert_eq!(process_event_to_spaced(event.clone()).unwrap(), event);
 }

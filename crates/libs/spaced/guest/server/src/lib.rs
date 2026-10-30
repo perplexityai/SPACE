@@ -172,6 +172,7 @@ mod memlock;
 mod meta;
 mod networking;
 mod port_forward;
+mod recovery;
 #[cfg(test)]
 mod transport;
 
@@ -291,6 +292,7 @@ impl std::fmt::Debug for SpacedGuestService {
 struct SpacedGuestServiceInner {
     shutdown: CancellationToken,
     filesystem_flush_slots: Arc<Semaphore>,
+    process_recovery: recovery::RecoveryLifecycle,
     host_connector_type: HostConnectorType,
     bridge_host_client: LazyClient<BridgeHostClient<tonic::transport::Channel>>,
     bridge_host_calls: Arc<Semaphore>,
@@ -379,6 +381,7 @@ impl SpacedGuestService {
             inner: Arc::new(SpacedGuestServiceInner {
                 shutdown,
                 filesystem_flush_slots: Arc::new(Semaphore::new(1)),
+                process_recovery: recovery::RecoveryLifecycle::new(),
                 host_connector_type: config.host_connector_type,
                 bridge_host_client: LazyClient::new(),
                 bridge_host_calls: Arc::new(Semaphore::new(MAX_CONCURRENT_BRIDGE_HOST_CALLS)),
