@@ -11,8 +11,9 @@ table (`node_direct`, `sandbox_direct_route_*`), read the
 - New ClusterApi and NodeInfo RPCs rely on the auth layers in `src/run.rs`:
   `NodeApiAuthLayer` (`SPACE_INTERNAL_TOKEN` or TokenReview) and, for
   template publication, `BuildAuthLayer`. Health and reflection are exempt.
-  BuildAuthLayer supplies freshly reviewed pod-bound node name/UID for
-  grant-bound template publication; match both against live builder inventory.
+  BuildAuthLayer supplies the pod-bound node name/UID from a TokenReview of the
+  caller's token (an accepted review is reused for at most 30 s) for grant-bound
+  template publication; match both against live builder inventory.
 - A new RPC that acts for a node identifies it as the registered node whose
   address equals the caller's remote IP (except publication above and template
   catalog reads, which use reviewed node name/UID when supplied and retain
