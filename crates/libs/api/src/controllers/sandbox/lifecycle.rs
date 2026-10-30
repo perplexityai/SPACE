@@ -2208,14 +2208,15 @@ impl SandboxController {
                 SandboxLifecycleStatus::Started
             }
             SandboxAction::Wake | SandboxAction::ImplicitWake(_) => {
-                let mut client = self
-                    .substrate
+                // The worker serves Wake only on its internal surface. With no
+                // row there is no start context to send.
+                self.substrate
                     .runtime_client(
                         typed_id,
                         crate::controllers::substrate::RecoveryCharge::Exempt,
                     )
-                    .await?;
-                client
+                    .await?
+                    .internal_client()
                     .wake_sandbox(WakeRequest {
                         implicit_wake_source: action
                             .wake_activity()

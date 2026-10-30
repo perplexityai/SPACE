@@ -150,7 +150,7 @@ impl RuntimeClient {
         .await
     }
 
-    pub(super) fn internal_client(&self) -> RuntimeInternalClient {
+    pub(in crate::controllers) fn internal_client(&self) -> RuntimeInternalClient {
         WorkerApiInternalClient::new(node_api_channel(
             self.channel.clone(),
             SpaceBearerToken::NodeApiInternal,
