@@ -9,8 +9,9 @@ use tonic::Status;
 /// Refuse a new execution-bound backup whose generation the control plane has
 /// superseded: a newer execution is active or has materialized a pod, or this
 /// generation's own execution was retired as `replaced` (an abandoned restore
-/// claim, a started-recovery replacement). Either way no restore can adopt the runtime
-/// that captured the artifact.
+/// claim, a started-recovery replacement, an activation its node rolled back
+/// with nothing the capture could be the only copy of).
+/// Either way no restore can adopt the runtime that captured the artifact.
 ///
 /// A teardown or idle suspend runs on the node for whatever runtime the pod
 /// carried, including such a runtime: a reaped orphaned restore pod's VM, say,

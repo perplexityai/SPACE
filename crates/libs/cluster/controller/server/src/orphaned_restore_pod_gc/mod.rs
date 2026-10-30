@@ -44,13 +44,18 @@
 //! (`retire_execution` instead stops or deletes the sandbox on the node before
 //! its pod DELETE whenever it can reach the runtime, so it doesn't normally
 //! start a teardown suspend). That teardown suspends a resident VM and
-//! registers the capture with `BeginArtifactBackup`, which refuses it either
-//! way, so a reap can't register a snapshot the sandbox's next restore would
-//! select. A restore whose unmaterialized claim the request abandoned (the
+//! registers the capture with `BeginArtifactBackup`, which refuses it in each
+//! case below, so there a reap can't register a snapshot the sandbox's next
+//! restore would select. A restore whose unmaterialized claim the request abandoned (the
 //! re-drive cancellation guard), or that the API's rollback or the
 //! transient-lifecycle sweeper reverted with abandoned-restore retirement
-//! enabled, retired its execution as `replaced`,
-//! and a pod below the active generation has a newer one. Either way the
+//! enabled, retired its execution as `replaced`. So, with retirement enabled,
+//! did a restore its node rolled back, when the control plane applied the
+//! rollback receipt to a row still `restoring` whose restore selection is
+//! proven to choose a durable pre-restore snapshot; with it off, that
+//! execution reads `suspended`, and the fence admits a capture of its pod's
+//! teardown. A pod below the
+//! active generation has a newer execution. Either way the
 //! refusal says the execution was superseded, and the node releases the VM and
 //! discards the capture. A successful DELETE therefore means that
 //! teardown has begun (the pod is terminating), not that the VM is gone: it's

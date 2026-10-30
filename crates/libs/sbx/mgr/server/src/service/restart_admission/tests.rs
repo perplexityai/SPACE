@@ -669,3 +669,36 @@ async fn guest_start_failures_are_reported_as_failures_not_caller_disconnects() 
     let internal = abandon_start_if_caller_cancelled(async { Ok::<_, tonic::Status>(8) }).await;
     assert!(matches!(internal, GuestStartOutcome::Opened(8)));
 }
+
+/// A passive observation, such as a retried activation's question to the
+/// control plane, ends as soon as its caller disconnects, even mid-flight,
+/// instead of running until it gives up; a live caller gets the answer.
+#[tokio::test(start_paused = true)]
+async fn observation_ends_with_a_disconnected_caller() {
+    let cancelled = CancellationToken::new();
+    let (started, observing) = tokio::sync::oneshot::channel();
+    let observation = tokio::spawn(CALLER_CANCELLED.scope(cancelled.clone(), async move {
+        observe_unless_caller_cancelled("disconnected", async move {
+            let _ = started.send(());
+            std::future::pending::<()>().await
+        })
+        .await
+    }));
+    observing.await.expect("the observation starts");
+    cancelled.cancel();
+    let error = tokio::time::timeout(std::time::Duration::from_secs(5), observation)
+        .await
+        .expect("the observation ends when its caller disconnects")
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Cancelled);
+
+    let answer = CALLER_CANCELLED
+        .scope(
+            CancellationToken::new(),
+            observe_unless_caller_cancelled("live", std::future::ready(7)),
+        )
+        .await
+        .expect("a live caller gets the observation");
+    assert_eq!(answer, 7);
+}

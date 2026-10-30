@@ -13,18 +13,19 @@ pub(crate) enum OpenRouteActivationAdmissionError {
 }
 
 /// How long a retried activation waits for the control plane's answer about
-/// its execution before it starts without one.
+/// its execution before treating it as unanswered.
 const EXECUTION_CURRENCY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Whether the control plane says it retired `generation` of `sandbox_id`.
-/// Only that answer counts: a control plane that can't be reached, predates
-/// the question or doesn't know the execution leaves the activation to start
-/// as it would without asking, and the backup fence still refuses the
-/// capture of a runtime it superseded.
-pub(crate) async fn retired_on_cluster(
+/// Ask the control plane whether `generation` of `sandbox_id` is still its
+/// active execution. A control plane that can't be reached, times out or
+/// predates the question answers
+/// [`ExecutionCurrency::Unspecified`](pplx_space_node_api_client::proto::ExecutionCurrency),
+/// as one that doesn't know the execution does; the caller decides what an
+/// unanswered question permits.
+pub(crate) async fn execution_currency_on_cluster(
     sandbox_id: &str,
     generation: pplx_space_common_core::types::ExecutionGeneration,
-) -> bool {
+) -> pplx_space_node_api_client::proto::ExecutionCurrency {
     use pplx_space_node_api_client::proto::{ExecutionCurrency, GetExecutionCurrencyRequest};
     let ask = async {
         let mut cluster = pplx_space_node_api_client::cluster::connect_from_env()
@@ -40,17 +41,16 @@ pub(crate) async fn retired_on_cluster(
             .map_err(|status| format!("{:?}: {}", status.code(), status.message()))
     };
     match tokio::time::timeout(EXECUTION_CURRENCY_TIMEOUT, ask).await {
-        Ok(Ok(currency)) => currency == ExecutionCurrency::Retired,
+        Ok(Ok(currency)) => currency,
         Ok(Err(error)) => {
             tracing::warn!(sandbox_id, %generation, %error,
-                "could not ask whether a retried activation's execution is current; starting it");
-            false
+                "could not ask whether a retried activation's execution is current");
+            ExecutionCurrency::Unspecified
         }
         Err(_) => {
             tracing::warn!(sandbox_id, %generation,
-                "asking whether a retried activation's execution is current timed out; \
-                 starting it");
-            false
+                "asking whether a retried activation's execution is current timed out");
+            ExecutionCurrency::Unspecified
         }
     }
 }

@@ -775,12 +775,6 @@ impl SandboxManagerService {
             route_identity_provenance,
             open_activation_claim_eligible,
         );
-        // An in-place restore already asked before staging, so this ask
-        // catches a retirement that landed during staging. A warm start asks
-        // only here.
-        self.refuse_retired_activation_retry(id, open_route_activation.as_ref())
-            .await?;
-
         // Serialize the whole activation boundary with cleanup. A cleanup
         // admitted for the previous execution must either finish before this
         // restore claims the row, or observe the attached replacement
@@ -796,6 +790,13 @@ impl SandboxManagerService {
             activation_lock_owner.lock(),
         )
         .await?;
+        // An in-place restore already asked before staging, so this ask
+        // catches a retirement that landed during staging. A warm start asks
+        // only here. It asks under the activation lock, so a rollback cleanup
+        // of this claim has either finished, leaving its receipt for the check
+        // to see, or can't finish before this restore claims the row.
+        self.refuse_retired_activation_retry(id, open_route_activation.as_ref())
+            .await?;
 
         let cleanup_episode = {
             let db = self.db_conn()?;

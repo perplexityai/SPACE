@@ -434,6 +434,13 @@ impl RouteClaimFacet<'_> {
     pub fn matches(self, claim: &OpenRouteActivationClaim) -> Result<bool> {
         crate::db::route_activation_claims::claim_matches(self.0.conn, self.0.id, claim)
     }
+
+    /// Whether this node rolled back the activation of `claim`, already
+    /// matched as the open claim (see
+    /// [`crate::db::route_activation_claims::claim_rolled_back`]).
+    pub fn rolled_back(self, claim: &OpenRouteActivationClaim) -> Result<bool> {
+        crate::db::route_activation_claims::claim_rolled_back(self.0.conn, self.0.id, claim)
+    }
 }
 
 #[derive(Clone, Copy)]

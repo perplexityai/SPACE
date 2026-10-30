@@ -209,51 +209,7 @@ impl ActivationCompletion {
     }
 }
 
-/// Whether a restore rollback retires the abandoned restore's execution, and
-/// so makes its pod disposable: the API's rollback of a failed restore claim
-/// and the transient-lifecycle sweeper's revert of an aged `restoring` row.
-///
-/// Retiring is safe only once no user request can have reached a `restoring`
-/// sandbox's pod, which every routing replica (API and internal API) running
-/// the restoring gate guarantees. A replica from before that gate still
-/// routes to a reachable restore pod, and a retirement would then delete
-/// what it served. So retirement ships disabled, behind
-/// [`Self::ENV`], and is enabled per deployment once every routing replica
-/// runs the gate; rolling back to older routing binaries disables it first.
-/// Disabled, both writers revert only the lifecycle, as they did before.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum AbandonedRestoreRetirement {
-    /// Revert only the lifecycle; the restore's execution stays active.
-    #[default]
-    Disabled,
-    /// Retire the abandoned restore's execution in the revert.
-    Enabled,
-}
-
-impl AbandonedRestoreRetirement {
-    /// The switch both the API and the cluster controller read
-    /// ([`Self::from_env`]): `1`, `true`, `yes`, `on` or `enabled`, in any
-    /// case, turns retirement on; unset or anything else keeps it disabled.
-    pub const ENV: &'static str = "SPACE_ABANDONED_RESTORE_RETIREMENT_ENABLED";
-
-    pub fn from_enabled(enabled: bool) -> Self {
-        if enabled {
-            Self::Enabled
-        } else {
-            Self::Disabled
-        }
-    }
-
-    /// The switch as both components read it, so they agree on what turns
-    /// it on.
-    pub fn from_env() -> Self {
-        Self::from_enabled(pplx_space_common_core::env::env_flag_var(Self::ENV, false))
-    }
-
-    pub fn is_enabled(self) -> bool {
-        self == Self::Enabled
-    }
-}
+pub use pplx_space_common_core::types::AbandonedRestoreRetirement;
 
 /// Exact operation lease to release after the controller publishes its lifecycle.
 /// A later owner or execution must never be released by this completion.

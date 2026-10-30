@@ -344,41 +344,95 @@ impl SandboxManagerService {
     /// retries a pod whose first launch failed with the same route identity,
     /// which still matches the claim the failure kept open, so only the
     /// control plane can tell that a newer execution replaced it; started
-    /// anyway, the runtime is an orphan whose capture the backup fence refuses.
+    /// anyway, the runtime is an orphan.
     /// A first activation isn't asked: its execution was current when the
     /// control plane made its pod.
+    ///
+    /// A retry of an activation this node rolled back (the row still carries
+    /// the rollback receipt for the claim's generation) starts only when the
+    /// control plane answers that the execution is current. The receipt is
+    /// published with the row, and the control plane retires the execution
+    /// when it applies it, so the retry is a legitimate continuation only
+    /// while that hasn't happened. Without an answer the node can't tell, and
+    /// starting would bring up a runtime for an execution that may already be
+    /// retired, in a pod nothing routes to. No answer includes a control plane
+    /// that predates the question (during a rollout that upgrades nodes
+    /// first), an unreachable or misconfigured one, and one that can't place
+    /// the execution on this node; such a retry keeps failing until the
+    /// answer changes or a new activation replaces it. The answer is a
+    /// point-in-time one: a publication already carrying the receipt can still
+    /// retire the execution after it. Whether the backup fence then refuses
+    /// the orphan's capture depends on how the control plane retired the
+    /// execution.
+    ///
+    /// The last ask before an activation claims the row runs under the
+    /// activation lock, so a rollback cleanup can't write the receipt between
+    /// it and the activation; an in-place restore also asks earlier, before
+    /// staging, so a retry already refused stages nothing. The last ask holds
+    /// the lock for the question, up to its five-second timeout when the
+    /// control plane doesn't answer, or until the caller disconnects, which
+    /// abandons the question. A cleanup of this sandbox that waits for
+    /// the lock waits that long, and one that only tries it gives up; another
+    /// activation of it, which waits five seconds for admission, may be
+    /// refused as busy.
     pub(in crate::service) async fn refuse_retired_activation_retry(
         &self,
         sandbox_id: &str,
         claim: Option<&crate::db::route_activation_claims::OpenRouteActivationClaim>,
     ) -> Result<(), Status> {
+        use pplx_space_node_api_client::proto::ExecutionCurrency;
         let Some(claim) = claim else {
             return Ok(());
         };
-        let retry = {
+        let rolled_back = {
             let db = self.db_conn()?;
-            crate::db::read::sandbox_view(&db, sandbox_id)
-                .route_claim()
-                .matches(claim)
-                .map_err(|error| Status::internal(format!("db error: {error}")))?
+            let view = crate::db::read::sandbox_view(&db, sandbox_id);
+            let route_claim = view.route_claim();
+            let db_error = |error| Status::internal(format!("db error: {error}"));
+            if !route_claim.matches(claim).map_err(db_error)? {
+                return Ok(());
+            }
+            route_claim.rolled_back(claim).map_err(db_error)?
         };
         let generation = claim.execution_generation();
-        if retry && crate::route_activation_claims::retired_on_cluster(sandbox_id, generation).await
-        {
-            // The gRPC layer logs a `FailedPrecondition` reply at debug, so
-            // without this line a pod kubelet keeps retrying leaves no trace
-            // in the logs. The pod only stops once something deletes it.
-            tracing::warn!(
-                sandbox_id,
-                %generation,
-                "refused a retried activation of a retired execution; its pod must be deleted"
-            );
-            return Err(Status::failed_precondition(format!(
-                "execution generation {generation} of sandbox {sandbox_id} was retired; \
-                 its runtime must not start"
-            )));
+        // Boxed: the question's gRPC connect and call make a large future, and
+        // inline it would sit in every activation path's future, which an
+        // unoptimized build already runs close to a test thread's stack.
+        let currency = Box::pin(super::restart_admission::observe_unless_caller_cancelled(
+            sandbox_id,
+            crate::route_activation_claims::execution_currency_on_cluster(sandbox_id, generation),
+        ))
+        .await?;
+        match currency {
+            ExecutionCurrency::Retired => {
+                // The gRPC layer logs a `FailedPrecondition` reply at debug, so
+                // without this line a pod kubelet keeps retrying leaves no trace
+                // in the logs. The pod only stops once something deletes it.
+                tracing::warn!(
+                    sandbox_id,
+                    %generation,
+                    "refused a retried activation of a retired execution; its pod must be deleted"
+                );
+                Err(Status::failed_precondition(format!(
+                    "execution generation {generation} of sandbox {sandbox_id} was retired; \
+                     its runtime must not start"
+                )))
+            }
+            ExecutionCurrency::Unspecified if rolled_back => {
+                tracing::warn!(
+                    sandbox_id,
+                    %generation,
+                    "refused a retried activation this node rolled back, which the control \
+                     plane didn't confirm is current"
+                );
+                Err(Status::failed_precondition(format!(
+                    "execution generation {generation} of sandbox {sandbox_id} was rolled back on \
+                     this node and the control plane didn't confirm it is current; its runtime \
+                     must not start"
+                )))
+            }
+            ExecutionCurrency::Current | ExecutionCurrency::Unspecified => Ok(()),
         }
-        Ok(())
     }
 
     pub(super) fn resolve_runtime_activation_identity(

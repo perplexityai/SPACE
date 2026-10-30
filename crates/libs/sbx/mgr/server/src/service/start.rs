@@ -2094,14 +2094,6 @@ impl SandboxManagerService {
             start_ctx.route_identity_provenance,
             start_ctx.open_activation_claim_eligible,
         );
-        if let Err(error) = self
-            .refuse_retired_activation_retry(id, open_route_activation.as_ref())
-            .await
-        {
-            activation_admission_permit.finish(AdmissionPermitOutcome::Failed);
-            return Err(error);
-        }
-
         // Serialize the whole activation boundary with cleanup. A cleanup
         // admitted for the previous execution must either finish before this
         // start claims the row, or observe the attached replacement generation
@@ -2114,6 +2106,20 @@ impl SandboxManagerService {
         );
         let activation_fence =
             wait_for_activation_admission(id, activation_lock_owner.lock()).await?;
+        // Under the activation lock, so a rollback cleanup of this claim has
+        // either finished, leaving its receipt for the check to see, or can't
+        // finish before this start claims the row.
+        if let Err(error) = self
+            .refuse_retired_activation_retry(id, open_route_activation.as_ref())
+            .await
+        {
+            activation_admission_permit.finish(if error.code() == tonic::Code::Cancelled {
+                AdmissionPermitOutcome::Cancelled
+            } else {
+                AdmissionPermitOutcome::Failed
+            });
+            return Err(error);
+        }
 
         let cleanup_episode = {
             let db = self.db_conn()?;

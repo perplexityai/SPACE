@@ -146,7 +146,7 @@ impl FinalizedSnapshotRow {
 #[path = "published_state.rs"]
 mod published_state;
 /// Re-exported so Space's Datadog DBM query tests (private to Space) can drive the publish path.
-pub use published_state::publish_sandbox_states;
+pub use published_state::{publish_sandbox_states, publish_sandbox_states_with_retirement};
 mod sandbox_quarantine_store;
 use published_state::{
     capture_host_cpu, project_ready_suspend_snapshot, prune_absent_node_templates,
@@ -336,6 +336,10 @@ pub struct ClusterApiService {
     /// Which nodes `GetNodeRuntimeDesiredState` assigns a provisioning recipe.
     /// None unless `from_env_with_security_state` reads it on.
     runtime_provisioning_cohort: runtime_provisioning_cohort::RuntimeProvisioningCohort,
+    /// Whether applying a node's rollback receipt for a restore may retire
+    /// its execution as `replaced`. Off unless `from_env_with_security_state`
+    /// reads it on, for the same reason.
+    abandoned_restore_retirement: pplx_space_common_core::types::AbandonedRestoreRetirement,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -604,6 +608,8 @@ impl ClusterApiService {
             runtime_desired_state: runtime_desired_state::RuntimeDesiredState::Disabled,
             runtime_provisioning_cohort:
                 runtime_provisioning_cohort::RuntimeProvisioningCohort::Disabled,
+            abandoned_restore_retirement:
+                pplx_space_common_core::types::AbandonedRestoreRetirement::Disabled,
         }
     }
 
@@ -677,6 +683,8 @@ impl ClusterApiService {
         service.runtime_provisioning_cohort =
             runtime_provisioning_cohort::RuntimeProvisioningCohort::from_env()
                 .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        service.abandoned_restore_retirement =
+            pplx_space_common_core::types::AbandonedRestoreRetirement::from_env();
         Ok(service)
     }
 

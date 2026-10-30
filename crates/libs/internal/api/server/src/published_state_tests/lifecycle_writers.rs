@@ -454,7 +454,8 @@ async fn port_exposures(pool: &PgPool, sandbox_id: SandboxId) -> TestResult<Vec<
 /// `stopped` or `suspended` target out of every lifecycle but `quarantined`,
 /// `deleting` and the stored non-variants. The move unplaces the row, clears
 /// `active_node_id`, backfills an empty `target_node_id` from it, retires the
-/// execution (`suspended` for a suspended target, `replaced` otherwise), and
+/// execution (`replaced`, or `suspended` for a suspended target, since this
+/// publishes with abandoned-restore retirement disabled), and
 /// resets the observation of open port exposures only. The candidate query
 /// compares the lifecycle trimmed and lower-cased, so a padded `quarantined`
 /// is refused like the canonical one. It also reads the normalized lifecycle

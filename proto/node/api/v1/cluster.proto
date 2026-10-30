@@ -1280,7 +1280,9 @@ message GetSandboxSnapshotStorageUriResponse {
 
 enum ExecutionCurrency {
   // Unknown: no execution with that generation is recorded on the caller's
-  // node. A caller proceeds as it would without asking.
+  // node. A caller proceeds as it would without asking, unless its own
+  // records show it rolled that activation back: then only `CURRENT` lets it
+  // run.
   EXECUTION_CURRENCY_UNSPECIFIED = 0;
   // The execution is the sandbox's active execution.
   EXECUTION_CURRENCY_CURRENT = 1;

@@ -15,8 +15,8 @@ use pplx_space_common_core::types::{
 use pplx_space_sandbox_portability::{
     current_suspend_origin_marker_snapshot_ready, exact_marker_snapshot_backup_current,
     node_published_suspend_evidence, pre_quarantine_suspend_snapshot_current,
-    quarantine_recovery_suspend_snapshot_current, started_suspend_revert_eligibility,
-    suspended_projection_lifecycle_eligible_with_node_evidence,
+    quarantine_recovery_suspend_snapshot_current, restore_retry_suspended_revert_snapshot_exists,
+    started_suspend_revert_eligibility, suspended_projection_lifecycle_eligible_with_node_evidence,
 };
 use sqlx::types::Json;
 use sqlx::{FromRow, PgPool};
@@ -503,14 +503,47 @@ pub(super) async fn select_activation_rollback_candidates(
 /// Each statement is intentionally explicit: execution retirement, port
 /// invalidation, and lifecycle convergence share the caller's transaction and
 /// any invariant failure rolls all of them back.
+///
+/// The rolled-back execution is retired as `replaced`, which makes
+/// `BeginArtifactBackup` refuse any capture of its generation (see
+/// `backup_generation_fence`): the node gave up that activation, so a runtime
+/// of it that still runs, such as one a kubelet retry of its pod brought up,
+/// holds nothing the sandbox needs. A rollback to `suspended` is the one
+/// exception, as it is for the API's own restore revert. It retires as
+/// `replaced` only with abandoned-restore `retirement` enabled, for a row
+/// still `restoring`, not an evacuation restore, whose execution the restore
+/// created, and whose restore selection is proven to choose a ready, durably
+/// stored pre-restore source. That retirement also clears `placement_changed_at`, as the API's revert does:
+/// the restore's pod placement moved the clock past the pre-restore source,
+/// and the suspended selector takes a markerless snapshot only when it's
+/// newer than the last placement. Otherwise the execution reads `suspended`,
+/// and the fence admits a capture that may be the only copy of the sandbox's
+/// state: while retirement is off, a routing replica from before the
+/// restoring gate may have served the relaunched runtime, and an execution
+/// the restore reused may hold state of its own. Such a capture comes from
+/// the pod's teardown suspend when the next restore's pre-claim lingering-pod
+/// sweep deletes the pod, or from an idle auto-suspend of the relaunched
+/// runtime. That restore has already chosen its source, so it doesn't load
+/// the capture; a later one may.
 pub(super) async fn apply_activation_rollback_candidates(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
     candidates: Vec<ActivationRollbackCandidate>,
+    retirement: pplx_space_common_core::types::AbandonedRestoreRetirement,
 ) -> Result<Vec<ActivationRollbackCandidate>, Status> {
     let mut applied = Vec::with_capacity(candidates.len());
     for candidate in candidates {
-        let execution_state = if candidate.target_state == SandboxTransitionTargetState::Suspended {
+        let restore = candidate.target_state == SandboxTransitionTargetState::Suspended;
+        let retires_restore = restore
+            && retirement.is_enabled()
+            && candidate.prior_lifecycle == SandboxLifecycle::Restoring
+            && rollback_restore_retirable(
+                conn,
+                candidate.sandbox_id,
+                candidate.execution_generation,
+            )
+            .await?;
+        let execution_state = if restore && !retires_restore {
             "suspended"
         } else {
             "replaced"
@@ -561,7 +594,8 @@ pub(super) async fn apply_activation_rollback_candidates(
                     target_node_id = COALESCE(target_node_id, active_node_id),
                     active_node_id = NULL,
                     command_ready_pending = FALSE,
-                    lifecycle_changed_at = NOW()
+                    lifecycle_changed_at = NOW(),
+                    placement_changed_at = CASE WHEN $4 THEN NULL ELSE placement_changed_at END
               WHERE id = $1
                 AND active_node_id = $2
                 AND lifecycle NOT IN ('quarantined', 'deleted', 'deleting', 'cleanup_required')"
@@ -569,6 +603,7 @@ pub(super) async fn apply_activation_rollback_candidates(
         .bind(candidate.sandbox_id)
         .bind(node_id)
         .bind(candidate.target_state.as_str())
+        .bind(retires_restore)
         .execute(&mut *conn)
         .await
         .map_err(|error| Status::internal(format!("converge activation rollback: {error}")))?;
@@ -581,6 +616,48 @@ pub(super) async fn apply_activation_rollback_candidates(
         applied.push(candidate);
     }
     Ok(applied)
+}
+
+/// Whether a rollback of a `restoring` row to `suspended` may retire
+/// `generation`'s execution as `replaced`: not an evacuation restore, the
+/// restore created the execution, and the suspended-revert proof holds. Read
+/// before the rollback converges the lifecycle, so `lifecycle_changed_at`
+/// still names the transition into the restore the node rolled back. The
+/// candidate select already holds the sandbox row `FOR UPDATE`, and this
+/// separate statement reads the snapshots and executions as of after that
+/// lock.
+async fn rollback_restore_retirable(
+    conn: &mut sqlx::PgConnection,
+    sandbox_id: SandboxId,
+    generation: i64,
+) -> Result<bool, Status> {
+    static QUERY: LazyLock<String> = LazyLock::new(|| {
+        let proof = restore_retry_suspended_revert_snapshot_exists("s");
+        sql!(
+            format!(
+                "SELECT s.evacuation_restore_target IS NULL
+                    AND EXISTS (
+                        SELECT 1
+                          FROM sandbox_k8s_executions e
+                         WHERE e.sandbox_id = s.id
+                           AND e.generation = $2
+                           AND e.created_at >= s.lifecycle_changed_at
+                    )
+                    AND {proof}
+               FROM sandboxes s
+              WHERE s.id = $1"
+            )
+            .as_str()
+        )
+    });
+    sqlx::query_scalar(sqlx::AssertSqlSafe(QUERY.as_str()))
+        .bind(sandbox_id)
+        .bind(generation)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|error| {
+            Status::internal(format!("read activation rollback restore source: {error}"))
+        })
 }
 
 /// Clear an sbx-manager-authored pause failure after the same node publishes a

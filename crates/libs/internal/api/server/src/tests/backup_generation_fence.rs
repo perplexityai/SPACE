@@ -3,7 +3,9 @@
 
 use super::*;
 
-use pplx_space_common_core::types::ExecutionGeneration;
+use pplx_space_common_core::types::{
+    AbandonedRestoreRetirement, ExecutionGeneration, SandboxQuarantineReasonCode,
+};
 use pplx_space_node_api_client::cluster::backup_execution_superseded_generation;
 
 fn teardown_backup_request(
@@ -737,6 +739,190 @@ async fn the_reply_says_whether_the_fence_admitted_the_registration() -> TestRes
     assert!(
         !begin(unbound).await?.into_inner().generation_fence_admitted,
         "an unbound registration isn't"
+    );
+    Ok(())
+}
+
+/// The node rolled back a restore of generation 3 (its prepare failed) and
+/// published the rollback receipt, which the control plane applies under
+/// `retirement`. The sandbox has a durable pre-restore snapshot. Returns the
+/// sandbox, its source node's address, and the state the rollback retired
+/// generation 3's execution as.
+async fn apply_rollback_of_a_restore_with_a_durable_source(
+    fixture: &ClusterFixture,
+    retirement: AbandonedRestoreRetirement,
+) -> TestResult<(SandboxId, std::net::IpAddr, String)> {
+    let pool = &fixture.service.pool;
+    let (sandbox_id, source_ip, _) = seed_sandbox_on_source_node(pool).await?;
+    let node_id: NodeId = sqlx::query_scalar(sql!("SELECT id FROM nodes WHERE host(address) = $1"))
+        .bind(source_ip.to_string())
+        .fetch_one(pool)
+        .await?;
+    insert_execution(pool, sandbox_id, 2, "suspended", false).await?;
+    // The pre-restore snapshot generation 2's suspend made durable, taken
+    // before the wake moved the row to `restoring`.
+    let pre_restore = SnapshotId::new();
+    sqlx::query(sql!(
+        "INSERT INTO snapshots (
+             id, sandbox_id, type, state, source_node_id, org_id,
+             local_artifact_id, artifact_kind, artifact_origin, timestamp
+         )
+         VALUES (
+             $1, $2, 'full', 'ready', $3, $4::uuid, $5, 'full', 'suspend',
+             NOW() - INTERVAL '1 minute'
+         )"
+    ))
+    .bind(pre_restore)
+    .bind(sandbox_id)
+    .bind(node_id)
+    .bind(SEEDED_ORG_ID)
+    .bind(LocalArtifactId::new())
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO snapshot_storage_locations
+             (snapshot_id, storage_connection_string, org_id)
+         VALUES ($1, 's3://space-test/pre-restore', $2::uuid)"
+    ))
+    .bind(pre_restore)
+    .bind(SEEDED_ORG_ID)
+    .execute(pool)
+    .await?;
+    // The wake claims the row, creates generation 3's execution, and its pod
+    // is placed, which moves the placement clock past the pre-restore
+    // snapshot.
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET lifecycle = 'restoring', lifecycle_changed_at = NOW()
+          WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(pool)
+    .await?;
+    insert_execution(pool, sandbox_id, 3, "creating", true).await?;
+    let activation_attempt_id = Uuid::now_v7();
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions
+            SET activation_attempt_id = $2
+          WHERE sandbox_id = $1 AND generation = 3"
+    ))
+    .bind(sandbox_id)
+    .bind(activation_attempt_id)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET placement_changed_at = NOW() WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(pool)
+    .await?;
+
+    let rollback = PublishedSandboxState {
+        transition_receipt: Some(pplx_space_sbx_mgr_client::proto::TransitionReceipt {
+            id: Uuid::now_v7().to_string(),
+            kind: "activation_rollback".to_string(),
+            target_state: "suspended".to_string(),
+            execution_generation: 3,
+            reason_code: SandboxQuarantineReasonCode::RestorePrepareFailed.to_string(),
+            activation_attempt_id: Some(activation_attempt_id.to_string()),
+        }),
+        ..published_sandbox_state(sandbox_id, "suspended")
+    };
+    let mut conn = pool.acquire().await?;
+    let outcome =
+        publish_sandbox_states_with_retirement(&mut conn, node_id, &[rollback], retirement).await?;
+    drop(conn);
+    assert_eq!(outcome.post_commit_events.len(), 1, "the rollback applies");
+    let (lifecycle, state): (String, String) = sqlx::query_as(sql!(
+        "SELECT s.lifecycle, e.state
+           FROM sandboxes s
+           JOIN sandbox_k8s_executions e ON e.sandbox_id = s.id AND e.generation = 3
+          WHERE s.id = $1"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(lifecycle, "suspended");
+    Ok((sandbox_id, source_ip, state))
+}
+
+/// Kubelet's retry of [`apply_rollback_of_a_restore_with_a_durable_source`]'s
+/// pod brought a gen-3 runtime up anyway, and when the pod is reaped its
+/// teardown suspend registers that runtime's capture. With retirement
+/// enabled the rollback retired the execution as `replaced`, so the capture
+/// is refused rather than becoming the snapshot the next restore selects, and
+/// the next restore still selects the pre-restore snapshot.
+#[tokio::test(flavor = "current_thread")]
+async fn a_rolled_back_restore_cannot_register_a_teardown_snapshot() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let pool = &fixture.service.pool;
+    let (sandbox_id, source_ip, state) = apply_rollback_of_a_restore_with_a_durable_source(
+        &fixture,
+        AbandonedRestoreRetirement::Enabled,
+    )
+    .await?;
+    assert_eq!(state, "replaced");
+    // The retirement cleared the placement clock the restore's pod moved, so
+    // the suspended selector still takes the pre-restore snapshot.
+    let restorable: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(
+        format!(
+            "SELECT {} FROM sandboxes s WHERE s.id = $1",
+            pplx_space_sandbox_portability::fresh_ready_snapshot_exists("s")
+        )
+        .as_str()
+    )))
+    .bind(sandbox_id)
+    .fetch_one(pool)
+    .await?;
+    assert!(
+        restorable,
+        "the next wake must restore from the pre-restore snapshot"
+    );
+
+    let relaunched_capture = SnapshotId::new();
+    let error = begin_teardown_backup(
+        &fixture.service,
+        source_ip,
+        sandbox_id,
+        relaunched_capture,
+        3,
+    )
+    .await
+    .expect_err("a rolled-back restore's runtime must not register a snapshot");
+    assert_superseded_refusal(&error, 3);
+    assert_eq!(snapshot_row_count(pool, relaunched_capture).await?, 0);
+    Ok(())
+}
+
+/// With retirement disabled, a routing replica from before the restoring gate
+/// may have served the relaunched runtime, so the rollback retires the
+/// execution as `suspended` and the same capture registers.
+#[tokio::test(flavor = "current_thread")]
+async fn a_rolled_back_restore_keeps_its_capture_with_retirement_disabled() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let (sandbox_id, source_ip, state) = apply_rollback_of_a_restore_with_a_durable_source(
+        &fixture,
+        AbandonedRestoreRetirement::Disabled,
+    )
+    .await?;
+    assert_eq!(state, "suspended");
+
+    let relaunched_capture = SnapshotId::new();
+    begin_teardown_backup(
+        &fixture.service,
+        source_ip,
+        sandbox_id,
+        relaunched_capture,
+        3,
+    )
+    .await?;
+    assert_eq!(
+        snapshot_state(&fixture.service.pool, relaunched_capture).await?,
+        "creating"
     );
     Ok(())
 }

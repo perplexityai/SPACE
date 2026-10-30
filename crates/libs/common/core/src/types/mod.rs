@@ -51,6 +51,7 @@ pub mod path;
 mod postgres;
 pub mod privacy;
 pub mod process;
+pub mod restore_retirement;
 pub mod runtime;
 pub mod sandbox;
 #[cfg(feature = "serde")]
@@ -94,6 +95,7 @@ pub use object_store::*;
 pub use path::*;
 pub use privacy::*;
 pub use process::*;
+pub use restore_retirement::*;
 pub use runtime::{
     EffectiveStartup, RUNTIME_CLOUD_HYPERVISOR, RUNTIME_CLOUD_HYPERVISOR_ALIAS,
     RUNTIME_FIRECRACKER, RUNTIME_FIRECRACKER_ALIAS, RUNTIME_GVISOR, RUNTIME_GVISOR_ALIAS,

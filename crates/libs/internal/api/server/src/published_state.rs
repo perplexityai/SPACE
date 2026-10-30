@@ -1503,15 +1503,35 @@ static DELETE_ABSENT_STOPPED_SANDBOXES: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
+/// [`publish_sandbox_states_with_retirement`] with abandoned-restore
+/// retirement disabled, the setting every replica runs until it's turned on.
+pub async fn publish_sandbox_states(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    states: &[PublishedSandboxState],
+) -> Result<SandboxPublicationOutcome, Status> {
+    publish_sandbox_states_with_retirement(
+        conn,
+        node_id,
+        states,
+        pplx_space_common_core::types::AbandonedRestoreRetirement::Disabled,
+    )
+    .await
+}
+
 /// Publishes a node's sandbox observations.
 ///
 /// Callers that need atomic lifecycle convergence should run this inside a
 /// transaction. Node-published suspended projection uses multiple statements
 /// over one locked candidate set and relies on transaction rollback on error.
-pub async fn publish_sandbox_states(
+/// `retirement` decides whether a rollback receipt for a restore may retire
+/// its execution as `replaced` (see
+/// `sandbox_quarantine_store::apply_activation_rollback_candidates`).
+pub async fn publish_sandbox_states_with_retirement(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
     states: &[PublishedSandboxState],
+    retirement: pplx_space_common_core::types::AbandonedRestoreRetirement,
 ) -> Result<SandboxPublicationOutcome, Status> {
     let mut states_by_id = BTreeMap::new();
     for state in states {
@@ -2257,7 +2277,7 @@ pub async fn publish_sandbox_states(
         "started",
     );
 
-    post_commit_events.extend(apply_activation_receipts(conn, node_id, &rows).await?);
+    post_commit_events.extend(apply_activation_receipts(conn, node_id, &rows, retirement).await?);
 
     let suspended_projection =
         project_node_published_suspended_sandboxes(conn, node_id, &rows).await?;
@@ -3670,6 +3690,7 @@ async fn apply_activation_receipts(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
     rows: &[PublishedSandboxRow],
+    retirement: pplx_space_common_core::types::AbandonedRestoreRetirement,
 ) -> Result<Vec<PostCommitSandboxEvent>, Status> {
     // These statements require an exact receipt kind. Empty receipt batches
     // cannot release or lock an execution, so ordinary reports need neither query.
@@ -3718,6 +3739,7 @@ async fn apply_activation_receipts(
         conn,
         node_id,
         rollback_candidates,
+        retirement,
     )
     .await?;
     Ok(applied_rollbacks
