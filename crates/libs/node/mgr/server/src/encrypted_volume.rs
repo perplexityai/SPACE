@@ -53,6 +53,7 @@ use crate::rootfs_dmcrypt::{
 use crate::device_backing::{self, Backing, LoopDevice};
 
 mod busy_holders;
+pub mod compact;
 #[cfg(any(target_os = "linux", test))]
 mod mount_identity;
 
