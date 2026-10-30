@@ -83,3 +83,24 @@ impl PublishedSandboxRow {
         }
     }
 }
+
+/// Checked activity timestamps retain their serialized RFC3339 spelling so the
+/// existing PostgreSQL timestamp casts and update thresholds remain authoritative.
+#[derive(serde::Serialize)]
+pub(super) struct PublishedActivityRow<'a> {
+    sandbox_id: SandboxId,
+    last_used_at: Option<&'a str>,
+    last_access_at: Option<&'a str>,
+    last_command_at: Option<&'a str>,
+}
+
+impl PublishedSandboxRow {
+    pub(super) fn activity_projection(&self) -> PublishedActivityRow<'_> {
+        PublishedActivityRow {
+            sandbox_id: self.sandbox_id,
+            last_used_at: self.last_used_at.as_deref(),
+            last_access_at: self.last_access_at.as_deref(),
+            last_command_at: self.last_command_at.as_deref(),
+        }
+    }
+}
