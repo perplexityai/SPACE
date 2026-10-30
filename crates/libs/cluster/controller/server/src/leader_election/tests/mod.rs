@@ -1405,6 +1405,51 @@ fn the_liveness_budget_override_is_bounded_like_the_default() {
     }
 }
 
+/// The test-hook TTL is a request to `Timings::derive` like the default:
+/// clamped into the TTL's range, and the retry interval and the budget's floor
+/// follow the resolved TTL. At the TTL floor the brownout scenario's budget
+/// floor is 72 s; an absent or unusable value leaves the default TTL.
+#[test]
+fn the_lease_ttl_override_is_bounded_like_the_default() {
+    use super::{
+        DEFAULT_LEASE_TTL, LEASE_FAILURE_GRACE_TEST_ENV, LEASE_TTL_TEST_ENV, LeaderElectionConfig,
+        MAX_LEASE_TTL, MIN_LEASE_TTL,
+    };
+
+    let config = |ttl: Option<&str>, budget: Option<&str>| {
+        let mut env = pplx_space_test_env::TestEnv::default();
+        env.set("HOSTNAME", "space-cluster-controller-abc123");
+        if let Some(ttl) = ttl {
+            env.set(LEASE_TTL_TEST_ENV, ttl);
+        }
+        if let Some(budget) = budget {
+            env.set(LEASE_FAILURE_GRACE_TEST_ENV, budget);
+        }
+        LeaderElectionConfig::from_environment(&env)
+    };
+
+    let floor = config(Some("18"), Some("1"));
+    assert_eq!(floor.lease_ttl, MIN_LEASE_TTL);
+    assert_eq!(floor.renew_deadline, Duration::from_secs(6));
+    assert_eq!(floor.retry_interval, Duration::from_secs(2));
+    assert_budget_near(
+        floor.lease_failure_grace,
+        Duration::from_secs(72),
+        "the budget's floor follows the TTL floor",
+    );
+
+    assert_eq!(config(Some("30"), None).lease_ttl, Duration::from_secs(30));
+    assert_eq!(config(Some("5"), None).lease_ttl, MIN_LEASE_TTL);
+    assert_eq!(config(Some("999999"), None).lease_ttl, MAX_LEASE_TTL);
+    for unusable in [None, Some(""), Some("0"), Some("ten"), Some("-5")] {
+        assert_eq!(
+            config(unusable, None).lease_ttl,
+            DEFAULT_LEASE_TTL,
+            "{unusable:?} leaves the default"
+        );
+    }
+}
+
 /// The cadence floor must never grow so large that it disables the budget it
 /// exists to protect. A typo'd retry interval of ~1e9 seconds would otherwise
 /// saturate the floor to `Duration::MAX`, leaving the replica permanently

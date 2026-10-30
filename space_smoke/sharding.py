@@ -61,10 +61,10 @@ _DURATION_SECONDS = {
         # and cleanup: 23.5 s.
         "local.fork_suspended_cross_node": 25,
         "local.gentle_drain_leaves_sandbox_resident": 39,
-        # Two Kind runs in otel mode with the budget at its 240 s floor: 765 and
-        # 760 s of phases, a one-tick runner window, the outage's budget wait,
-        # then the contender's watch of about 350 s.
-        "local.leader_election_brownout_keeps_one_leader": 765,
+        # At the 18 s lease TTL floor, with the budget at its 72 s floor: three
+        # Kind runs took 448-469 s, most of it the outage's budget wait, the
+        # contender's watch of about 120 s and two 60 s tick windows.
+        "local.leader_election_brownout_keeps_one_leader": 457,
         # Two otel-mode Kind runs with the reconcile requested from node-ctl:
         # 17-18 s.
         "local.node_ctl_fence_refuses_and_reconciles": 17,
