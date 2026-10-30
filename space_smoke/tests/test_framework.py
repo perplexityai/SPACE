@@ -126,6 +126,7 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "ecw.process_reattach",
                 "ecw.public_port_to_all_interfaces",
                 "ecw.public_port_to_loopback",
+                "ecw.quiet_process_stream_keepalive",
                 "ecw.refresh_keepalive",
                 "ecw.sandbox_delete",
                 "ecw.sandbox_info",

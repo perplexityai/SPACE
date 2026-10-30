@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import hashlib
+import http.client
 import importlib
 import ipaddress
 import json
@@ -17,6 +18,7 @@ import sys
 import tempfile
 import threading
 import socket
+import ssl
 import sys
 import time
 import uuid
@@ -75,6 +77,7 @@ from space_smoke.capabilities import (
     EcwLifecycle,
     EcwPermissionDenied,
     EcwProcess,
+    EcwProcessStream,
     EcwPublicPort,
     EcwSandbox,
     EcwSandboxBusy,
@@ -8061,6 +8064,38 @@ class _SdkProtocolCompatibility:
             request_timeout=request_timeout,
         )
 
+    @property
+    def envd_address(self) -> tuple[str, int]:
+        url = urlsplit(self._sandbox._data_plane_sdk().envd_api_url)
+        return str(url.hostname), url.port or (443 if url.scheme == "https" else 80)
+
+    def stream_command(
+        self,
+        command: str,
+        *,
+        keepalive_interval: int,
+        dial: tuple[str, int] | None = None,
+        request_timeout: float = 120,
+    ) -> EcwProcessStream:
+        sdk = self._sandbox._data_plane_sdk()
+        headers = {
+            **sdk.connection_config.sandbox_headers,
+            "Content-Type": "application/connect+json",
+            "Connect-Protocol-Version": "1",
+            "Connect-Timeout-Ms": str(int(request_timeout * 1000)),
+            "Keepalive-Ping-Interval": str(keepalive_interval),
+        }
+        request = json.dumps(
+            {"process": {"cmd": "/bin/bash", "args": ["-l", "-c", command]}}
+        ).encode()
+        return _stream_connect_process(
+            f"{sdk.envd_api_url.rstrip('/')}/process.Process/Start",
+            headers,
+            b"\x00" + len(request).to_bytes(4, "big") + request,
+            dial=dial or self.envd_address,
+            timeout=request_timeout,
+        )
+
     def _compatibility_request(
         self,
         path: str,
@@ -8098,6 +8133,88 @@ class _SdkProtocolCompatibility:
             ) from error
         except URLError as error:
             raise RuntimeError(f"ECW {method} {path} failed: {error.reason}") from error
+
+
+def _stream_connect_process(
+    url: str,
+    headers: Mapping[str, str],
+    body: bytes,
+    *,
+    dial: tuple[str, int],
+    timeout: float,
+) -> EcwProcessStream:
+    """POST one Connect-JSON process stream and record its events as they arrive."""
+
+    target = urlsplit(url)
+    connection: http.client.HTTPConnection
+    if target.scheme == "https":
+        connection = _DialedHTTPSConnection(target.netloc, dial=dial, timeout=timeout)
+    else:
+        connection = _DialedHTTPConnection(target.netloc, dial=dial, timeout=timeout)
+    events: list[str] = []
+    stdout = bytearray()
+    exit_code: int | None = None
+    error: str | None = "response stream closed before its end-of-stream message"
+    longest_silence = 0.0
+    try:
+        connection.request("POST", target.path, body=body, headers=dict(headers))
+        response = connection.getresponse()
+        if response.status != 200:
+            detail = response.read(4_000).decode(errors="replace")
+            raise RuntimeError(
+                f"ECW Process.Start returned HTTP {response.status}: {detail}"
+            )
+        last_arrival = time.monotonic()
+        while header := response.read(5):
+            payload = response.read(int.from_bytes(header[1:5], "big"))
+            now = time.monotonic()
+            longest_silence = max(longest_silence, now - last_arrival)
+            last_arrival = now
+            message = json.loads(payload)
+            if header[0] & 0x02:
+                error = json.dumps(message["error"]) if "error" in message else None
+                break
+            ((kind, event),) = message["event"].items()
+            events.append(kind)
+            if kind == "data" and "stdout" in event:
+                stdout += base64.b64decode(event["stdout"])
+            elif kind == "end":
+                exit_code = int(event.get("exitCode", 0))
+    except (OSError, HTTPException) as cut:
+        error = f"{error}: {cut!r}"
+    finally:
+        connection.close()
+    return EcwProcessStream(
+        events=tuple(events),
+        stdout=stdout.decode(errors="replace"),
+        exit_code=exit_code,
+        error=error,
+        longest_silence_seconds=longest_silence,
+    )
+
+
+class _DialedHTTPConnection(http.client.HTTPConnection):
+    """HTTP connection to `host` whose socket is opened to `dial` instead."""
+
+    def __init__(self, host: str, *, dial: tuple[str, int], timeout: float) -> None:
+        super().__init__(host, timeout=timeout)
+        self._dial = dial
+
+    def connect(self) -> None:
+        self.sock = socket.create_connection(self._dial, self.timeout)
+
+
+class _DialedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS connection to `host` whose socket is opened to `dial` instead."""
+
+    def __init__(self, host: str, *, dial: tuple[str, int], timeout: float) -> None:
+        super().__init__(host, timeout=timeout)
+        self._dial = dial
+        self._tls = ssl.create_default_context()
+
+    def connect(self) -> None:
+        sock = socket.create_connection(self._dial, self.timeout)
+        self.sock = self._tls.wrap_socket(sock, server_hostname=self.host)
 
 
 class _SdkWatchHandle:
