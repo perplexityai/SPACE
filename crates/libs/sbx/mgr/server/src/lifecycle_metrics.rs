@@ -58,7 +58,7 @@ pub(crate) async fn run(db: crate::db::SharedConnection, shutdown_token: Cancell
             _ = interval.tick() => {}
         }
 
-        let counts = {
+        let (counts, backups) = {
             let db = match db.lock() {
                 Ok(db) => db,
                 Err(error) => {
@@ -66,8 +66,18 @@ pub(crate) async fn run(db: crate::db::SharedConnection, shutdown_token: Cancell
                     continue;
                 }
             };
-            crate::db::read::counts(&db, crate::db::read::ByLifecycle)
+            (
+                crate::db::read::counts(&db, crate::db::read::ByLifecycle),
+                crate::db::read::counts(&db, crate::db::read::PendingBackups),
+            )
         };
+        match backups {
+            Ok(backups) => pplx_space_metrics::sandbox::worker::pending_backups(
+                backups.count,
+                backups.oldest_age_secs,
+            ),
+            Err(error) => tracing::warn!(%error, "failed to sample pending sandbox backups"),
+        }
         let counts = match counts {
             Ok(counts) => counts,
             Err(error) => {
