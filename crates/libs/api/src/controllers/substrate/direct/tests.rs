@@ -11,6 +11,7 @@ use pplx_space_node_api_sim::{SandboxRecord, SimState, SimWorkerHarness};
 use pplx_space_placement::test_support::stored_lifecycle_matrix;
 use sqlx::PgPool;
 
+mod idle_suspended;
 mod restore_lease_completion;
 mod substrate_scope;
 

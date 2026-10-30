@@ -9,6 +9,21 @@
 //!   [`SubstrateAdapter`]. Stop, kill, pause/resume and checkpoint go through
 //!   the shared controller over Direct's runtime clients, which never recreate
 //!   an execution.
+//! - A node's idle suspend clears `active_node_id` and keeps `target_node_id`
+//!   on the node holding the local artifact. Waking such a `suspended` or
+//!   `restoring` row, implicit or explicit, first reads that node's record.
+//!   An implicit wake refuses when the record is dormant under a Local
+//!   auto-lifecycle override that denies it. A record still running the
+//!   row's current execution generation (a wake raced the suspend) is
+//!   adopted: the row is placed back on that node and woken there. Otherwise
+//!   the wake restores through the restore lease, whose candidates try that
+//!   node first; a read that fails or does not answer in time restores under
+//!   the cluster policy. A `started` row left with no active node by that
+//!   race is adopted the same way when its worker is looked up. A cross-node
+//!   restore never deletes a source copy that reports a live record. Delete
+//!   reaches the active node, else that target node; with neither it returns
+//!   `Unavailable` and the caller removes the row without node-local
+//!   teardown.
 //! - Warm-pool claims adopt node-side.
 //! - Custom vCPU or memory uses separate create and start calls: only
 //!   `StartRequest` carries those fields. A readiness wait still blocks on
@@ -181,11 +196,22 @@ const DIRECT_NODE_RPC_TIMEOUT: Duration = crate::controllers::substrate::NODE_RP
 const DIRECT_NODE_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const DIRECT_PULL_ON_CREATE_RPC_TIMEOUT: Duration = Duration::from_secs(600);
 const DIRECT_REMOTE_RESTORE_CANDIDATE_LIMIT: i64 = 7;
+/// Reading the record on the node that holds an unplaced sandbox's local
+/// state is advisory, so a slow or dead node costs a wake or a source cleanup
+/// this much. It bounds the whole read: finding that node, connecting to it
+/// and its `StateRequest`.
+const DIRECT_SOURCE_RECORD_READ_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DirectRestoreLease {
     token: Uuid,
     restore_retry: bool,
+}
+
+fn unassigned_worker_error(sandbox_id: SandboxId) -> SubstrateError {
+    SubstrateError::Unavailable {
+        message: format!("sandbox {sandbox_id} is not assigned to an active worker node"),
+    }
 }
 
 fn direct_delete_error(sandbox_id: SandboxId, error: tonic::Status) -> SubstrateError {
@@ -506,6 +532,110 @@ fn resident_is_dormant(resident: &pplx_space_sbx_mgr_client::proto::SandboxInfo)
                 | SandboxLifecycleState::Created
         )
     )
+}
+
+/// Whether `record` holds a VM, or is moving into or out of one. A restore's
+/// `Start`, which always carries a newly reserved execution generation, is
+/// refused there, and a restore on another worker would run a second copy,
+/// so such a record is adopted (`DirectSubstrate::adopt_live_source_record`)
+/// or, on a cross-node restore, never deleted.
+fn record_holds_live_runtime(record: &pplx_space_sbx_mgr_client::proto::SandboxInfo) -> bool {
+    use pplx_space_sbx_mgr_client::proto::SandboxLifecycleState;
+    matches!(
+        record.observed_lifecycle(),
+        Ok(SandboxLifecycleState::Creating
+            | SandboxLifecycleState::Starting
+            | SandboxLifecycleState::Started
+            | SandboxLifecycleState::Stopping
+            | SandboxLifecycleState::Pausing
+            | SandboxLifecycleState::Paused
+            | SandboxLifecycleState::Resuming
+            | SandboxLifecycleState::Checkpointing
+            | SandboxLifecycleState::Suspending
+            | SandboxLifecycleState::Restoring)
+    )
+}
+
+/// The restore's `Start` checks no wake policy, so an implicit wake of an
+/// unplaced row checks the record on the node holding its local state. A
+/// dormant record under a Local override that denies `activity` refuses the
+/// wake, as that worker's Wake would for a placed row. Under Cluster
+/// authority, the caller has already checked the policy.
+fn refuse_wake_denied_by_local_override(
+    sandbox_id: SandboxId,
+    node_id: NodeId,
+    record: &pplx_space_sbx_mgr_client::proto::SandboxInfo,
+    activity: ExecutionActivityKind,
+) -> Result<(), SubstrateError> {
+    use pplx_space_sbx_mgr_client::proto::SandboxLifecycleState;
+
+    // The worker refuses only a dormant record. A live one is adopted and
+    // woken through its worker, which applies its effective policy itself.
+    if !matches!(
+        record
+            .lifecycle
+            .and_then(|state| SandboxLifecycleState::try_from(state).ok()),
+        Some(
+            SandboxLifecycleState::Created
+                | SandboxLifecycleState::Stopped
+                | SandboxLifecycleState::Paused
+                | SandboxLifecycleState::Suspended
+        )
+    ) {
+        return Ok(());
+    }
+    if !matches!(
+        PolicyAuthority::from_optional_proto(record.auto_lifecycle_authority),
+        Ok(Some(PolicyAuthority::Local))
+    ) {
+        return Ok(());
+    }
+    let Some(policy) = record.auto_lifecycle.as_ref() else {
+        return Ok(());
+    };
+    let policy = match crate::controllers::auto_lifecycle::policy_from_proto(policy) {
+        Ok(policy) => policy,
+        Err(error) => {
+            tracing::warn!(
+                sandbox_id = %sandbox_id,
+                node_id = %node_id,
+                %error,
+                "suspended record reported an invalid local wake policy; waking under the cluster policy"
+            );
+            return Ok(());
+        }
+    };
+    if activity.allows_implicit_wake(&policy) {
+        return Ok(());
+    }
+    Err(SubstrateError::Conflict {
+        message: format!(
+            "automatic wake of sandbox {sandbox_id} is disabled by its node's local auto-lifecycle policy"
+        ),
+    })
+}
+
+/// The record `client`'s node holds for `sandbox_id`, if it holds one.
+async fn node_sandbox_record(
+    client: &mut RuntimeClient,
+    sandbox_id: SandboxId,
+) -> Result<Option<pplx_space_sbx_mgr_client::proto::SandboxInfo>, SubstrateError> {
+    match client
+        .sandbox_state(pplx_space_sbx_mgr_client::proto::StateRequest {
+            sandbox_ids: vec![sandbox_id.to_string()],
+        })
+        .await
+    {
+        Ok(response) => Ok(response
+            .into_inner()
+            .sandboxes
+            .into_iter()
+            .find(|row| row.sandbox_id == sandbox_id.to_string())),
+        Err(status) if status.code() == Code::NotFound => Ok(None),
+        Err(status) => Err(SubstrateError::Unavailable {
+            message: format!("node-api state error: {status}"),
+        }),
+    }
 }
 
 fn wake_requires_restore(status: &tonic::Status) -> bool {
@@ -2030,6 +2160,44 @@ impl DirectSubstrate {
     }
 
     async fn sandbox_node(&self, sandbox_id: SandboxId) -> Result<DirectNode, SubstrateError> {
+        if let Some(node) = self.active_sandbox_node(sandbox_id).await? {
+            return Ok(node);
+        }
+        // A wake through a placed row's worker can finish after that node's
+        // suspend projection cleared `active_node_id`; its completion then
+        // writes `started` over the projected `suspended`, with no active
+        // node while the record runs. Adopt that record as a wake would.
+        let started = pplx_space_sandbox_store::get(&self.pool, sandbox_id)
+            .await
+            .map_err(sqlx::Error::from)
+            .db_context_with(|| format!("failed to load lifecycle for sandbox {sandbox_id}"))?
+            .is_some_and(|row| {
+                matches!(
+                    row.lifecycle.parse::<SandboxLifecycle>(),
+                    Ok(SandboxLifecycle::Started)
+                )
+            });
+        if started
+            && let Some((node, record)) = self
+                .unplaced_source_record(sandbox_id, DIRECT_SOURCE_RECORD_READ_TIMEOUT)
+                .await?
+            && let Some(node) = self
+                .adopt_live_source_record(sandbox_id, SandboxLifecycle::Started, &node, &record)
+                .await?
+        {
+            return Ok(node);
+        }
+        Err(unassigned_worker_error(sandbox_id))
+    }
+
+    /// The registered worker named by the row's `active_node_id`. This is
+    /// not `Sandbox::active_node_id`, which prefers the Direct route
+    /// identity's node over this column; a node's own suspend publication
+    /// clears the column but leaves that identity.
+    async fn active_sandbox_node(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<Option<DirectNode>, SubstrateError> {
         sqlx::query_as::<_, DirectNode>(sql!(
             "SELECT n.id, nd.node_api_endpoint
              FROM sandboxes s
@@ -2045,9 +2213,37 @@ impl DirectSubstrate {
         .bind(SubstrateKind::Space)
         .fetch_optional(&self.pool)
         .await
-        .db_context_with(|| format!("failed to load worker placement for sandbox {sandbox_id}"))?
+        .db_context_with(|| format!("failed to load worker placement for sandbox {sandbox_id}"))
+    }
+
+    /// The worker holding a sandbox's node-local state: its active node, or,
+    /// once a suspend has released it (`active_node_id` cleared), the
+    /// `target_node_id` the suspend kept on the node holding its artifact.
+    /// The columns name the same node on a placed Direct row; should they
+    /// differ, delete prefers the node running the execution, while
+    /// [`Self::direct_provenance_source_node`] prefers the artifact's node.
+    async fn sandbox_local_state_node(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<DirectNode, SubstrateError> {
+        sqlx::query_as::<_, DirectNode>(sql!(
+            "SELECT n.id, nd.node_api_endpoint
+             FROM sandboxes s
+             JOIN nodes n ON n.id = COALESCE(s.active_node_id, s.target_node_id)
+             JOIN node_direct nd ON nd.node_id = n.id
+             WHERE s.id = $1
+               AND n.managed_by = $2
+               AND n.role = 'worker'
+               AND nd.deleted_at IS NULL
+             LIMIT 1"
+        ))
+        .bind(sandbox_id.as_uuid())
+        .bind(SubstrateKind::Space)
+        .fetch_optional(&self.pool)
+        .await
+        .db_context_with(|| format!("failed to load local-state node for sandbox {sandbox_id}"))?
         .ok_or_else(|| SubstrateError::Unavailable {
-            message: format!("sandbox {sandbox_id} is not assigned to an active worker node"),
+            message: format!("sandbox {sandbox_id} has no worker node holding its local state"),
         })
     }
 
@@ -2892,6 +3088,151 @@ impl DirectSubstrate {
         Err(error)
     }
 
+    async fn restore_for_wake(
+        &self,
+        sandbox: &Sandbox,
+        timeout: Duration,
+    ) -> Result<ExecutionActivation, SubstrateError> {
+        let restored = self
+            .restore_execution_with_candidates(
+                sandbox.id,
+                ActivationOptions {
+                    blocking: true,
+                    ready_timeout: timeout,
+                },
+            )
+            .await?;
+        Ok(ExecutionActivation::owned(ExecutionBinding {
+            execution_object_id: sandbox.id.to_string(),
+            runtime_endpoint: restored.endpoint,
+            execution_generation: restored.execution_generation,
+        }))
+    }
+
+    /// The record the node holding an unplaced sandbox's local state
+    /// (`target_node_id`) reports, read within `budget`, which covers finding
+    /// that node too. `None` when no registered node holds that state, the
+    /// node holds no record, or the read fails or does not answer in time.
+    async fn unplaced_source_record(
+        &self,
+        sandbox_id: SandboxId,
+        budget: Duration,
+    ) -> Result<Option<(DirectNode, pplx_space_sbx_mgr_client::proto::SandboxInfo)>, SubstrateError>
+    {
+        let read = tokio::time::timeout(budget, async {
+            let Some(node) = self.direct_provenance_source_node(sandbox_id).await? else {
+                return Ok(None);
+            };
+            let record = match self.worker_client_for_node(&node).await {
+                Ok((_, mut client)) => node_sandbox_record(&mut client, sandbox_id).await,
+                Err(error) => Err(error),
+            };
+            Ok::<_, SubstrateError>(Some((node, record)))
+        })
+        .await;
+        let (node, record) = match read {
+            Ok(found) => match found? {
+                Some(found) => found,
+                None => return Ok(None),
+            },
+            Err(_) => {
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    budget_ms = budget.as_millis(),
+                    "the unplaced sandbox's source record did not answer in time"
+                );
+                return Ok(None);
+            }
+        };
+        match record {
+            Ok(record) => Ok(record.map(|record| (node, record))),
+            Err(error) => {
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    node_id = %node.id,
+                    %error,
+                    "cannot read the unplaced sandbox's source record"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// Places a row with no active node back on `node` when the record there
+    /// still holds or is moving a VM at the row's current execution
+    /// generation. A wake that raced that node's suspend leaves such a
+    /// record: the projection clears `active_node_id` while the wake runs.
+    /// Restoring around it would start a second copy from an older snapshot,
+    /// so the row adopts the running one instead, with no new generation.
+    ///
+    /// One guarded write fences on the lifecycle the caller read, no active
+    /// node, no live restore lease (whose owner's restore answers for
+    /// itself), and a route identity on `node` whose execution generation is
+    /// both the record's and the last one reserved. A running record leaves
+    /// the row `started`; one still moving keeps the read lifecycle for the
+    /// wake through its worker to finish. Returns the node the row is placed
+    /// on, which is another writer's when that writer placed it first.
+    async fn adopt_live_source_record(
+        &self,
+        sandbox_id: SandboxId,
+        read_lifecycle: SandboxLifecycle,
+        node: &DirectNode,
+        record: &pplx_space_sbx_mgr_client::proto::SandboxInfo,
+    ) -> Result<Option<DirectNode>, SubstrateError> {
+        use pplx_space_sbx_mgr_client::proto::SandboxLifecycleState;
+
+        if !record_holds_live_runtime(record) {
+            return Ok(None);
+        }
+        let Some(execution_generation) = record.execution_generation else {
+            return Ok(None);
+        };
+        let started = matches!(
+            record.observed_lifecycle(),
+            Ok(SandboxLifecycleState::Started)
+        );
+        let adopted = sqlx::query(sql!(
+            "UPDATE sandboxes s
+                SET active_node_id = $2,
+                    target_node_id = $2,
+                    placement = 'on_node',
+                    placement_changed_at = NOW(),
+                    lifecycle = CASE WHEN $5 THEN 'started' ELSE s.lifecycle END
+               FROM sandbox_direct_route_identities route,
+                    sandbox_direct_route_provenance provenance
+              WHERE s.id = $1
+                AND s.managed_by = $6
+                AND s.active_node_id IS NULL
+                AND LOWER(TRIM(s.lifecycle)) = $3
+                AND (s.restore_lease_expires_at IS NULL OR s.restore_lease_expires_at <= NOW())
+                AND route.sandbox_id = s.id
+                AND route.current_node_id = $2
+                AND route.execution_generation = $4
+                AND provenance.sandbox_id = s.id
+                AND provenance.last_execution_generation = $4"
+        ))
+        .bind(sandbox_id.as_uuid())
+        .bind(node.id.as_uuid())
+        .bind(read_lifecycle.as_str())
+        .bind(execution_generation)
+        .bind(started)
+        .bind(SubstrateKind::Space)
+        .execute(&self.pool)
+        .await
+        .db_context("failed to adopt the live record's placement")?;
+        if adopted.rows_affected() == 1 {
+            tracing::info!(
+                sandbox_id = %sandbox_id,
+                node_id = %node.id,
+                execution_generation,
+                from_lifecycle = read_lifecycle.as_str(),
+                "placed a sandbox with no active node back on the node still running it"
+            );
+            return Ok(Some(node.clone()));
+        }
+        self.active_sandbox_node(sandbox_id).await
+    }
+
     async fn delete_source_suspended_sandbox_best_effort(
         &self,
         sandbox_id: SandboxId,
@@ -2934,6 +3275,48 @@ impl DirectSubstrate {
                 return Ok(());
             }
         };
+
+        // A wake that raced the source's suspend can leave a live record
+        // there, newer than the snapshot just restored, so the cleanup deletes
+        // only a record it reads as not live.
+        match tokio::time::timeout(
+            DIRECT_SOURCE_RECORD_READ_TIMEOUT,
+            node_sandbox_record(&mut client, sandbox_id),
+        )
+        .await
+        {
+            Ok(Ok(Some(record))) if !record_holds_live_runtime(&record) => {}
+            Ok(Ok(None)) => return Ok(()),
+            Ok(Ok(Some(record))) => {
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    source_node_id = %source_node_id,
+                    restored_node_id = %restored_node_id,
+                    lifecycle = record.observed_lifecycle().map_or("unknown", |state| state.label()),
+                    "leaving the source-node copy after direct cross-node restore because it reports a live record"
+                );
+                return Ok(());
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    source_node_id = %source_node_id,
+                    restored_node_id = %restored_node_id,
+                    %error,
+                    "leaving the source-node copy after direct cross-node restore because its record cannot be read"
+                );
+                return Ok(());
+            }
+            Err(_) => {
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    source_node_id = %source_node_id,
+                    restored_node_id = %restored_node_id,
+                    "leaving the source-node copy after direct cross-node restore because its record read timed out"
+                );
+                return Ok(());
+            }
+        }
 
         if let Err(error) = self.renew_direct_restore_lease(sandbox_id, lease).await {
             tracing::warn!(
@@ -3893,7 +4276,8 @@ impl SubstrateAdapter for DirectSubstrate {
     }
 
     async fn delete_execution(&self, sandbox_id: SandboxId) -> Result<(), SubstrateError> {
-        let (_, _, mut client) = self.worker_client_for_sandbox(sandbox_id).await?;
+        let node = self.sandbox_local_state_node(sandbox_id).await?;
+        let (_, mut client) = self.worker_client_for_node(&node).await?;
 
         // Delete must reach sbx-mgr's suspend-publication fence directly. A
         // pre-delete Stop would change an in-flight `Suspending` row to
@@ -4064,7 +4448,46 @@ impl SubstrateAdapter for DirectSubstrate {
     ) -> Result<ExecutionActivation, SubstrateError> {
         charge.charge_restore_claim().await?;
         let sandbox_id = sandbox.id;
-        let node = self.sandbox_node(sandbox_id).await?;
+        // A node's idle suspend leaves no active node to answer Wake, only
+        // `target_node_id` on the node holding the artifact. The record that
+        // node reports decides the path: a live one is adopted and woken
+        // there; otherwise the wake restores as an explicit restore does,
+        // and the candidates try that node first.
+        let (node, timeout) = match self.active_sandbox_node(sandbox_id).await? {
+            Some(node) => (node, timeout),
+            None => {
+                let lifecycle = match sandbox.lifecycle.parse::<SandboxLifecycle>() {
+                    Ok(lifecycle @ (SandboxLifecycle::Suspended | SandboxLifecycle::Restoring)) => {
+                        lifecycle
+                    }
+                    _ => return Err(unassigned_worker_error(sandbox_id)),
+                };
+                let deadline = tokio::time::Instant::now() + timeout;
+                let adopted = match self
+                    .unplaced_source_record(
+                        sandbox_id,
+                        timeout.min(DIRECT_SOURCE_RECORD_READ_TIMEOUT),
+                    )
+                    .await?
+                {
+                    Some((node, record)) => {
+                        if let Some(activity) = wake_activity {
+                            refuse_wake_denied_by_local_override(
+                                sandbox_id, node.id, &record, activity,
+                            )?;
+                        }
+                        self.adopt_live_source_record(sandbox_id, lifecycle, &node, &record)
+                            .await?
+                    }
+                    None => None,
+                };
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                match adopted {
+                    Some(node) => (node, remaining),
+                    None => return self.restore_for_wake(sandbox, remaining).await,
+                }
+            }
+        };
         let endpoint = Self::endpoint(&node.node_api_endpoint)?;
         let mut observer = connect_worker(endpoint.clone()).await.map_err(|error| {
             SubstrateError::Unavailable {
@@ -4174,20 +4597,7 @@ impl SubstrateAdapter for DirectSubstrate {
                 if wake_requires_restore(&status)
                     && wake_lifecycle_allows_restore_fallback(&sandbox.lifecycle) =>
             {
-                let restored = self
-                    .restore_execution_with_candidates(
-                        sandbox_id,
-                        ActivationOptions {
-                            blocking: true,
-                            ready_timeout: timeout,
-                        },
-                    )
-                    .await?;
-                return Ok(ExecutionActivation::owned(ExecutionBinding {
-                    execution_object_id: sandbox.id.to_string(),
-                    runtime_endpoint: restored.endpoint,
-                    execution_generation: restored.execution_generation,
-                }));
+                return self.restore_for_wake(sandbox, timeout).await;
             }
             // The worker's effective policy refused an implicit wake. That is
             // a terminal policy answer, not a transient runtime failure.
@@ -4256,33 +4666,23 @@ impl SubstrateAdapter for DirectSubstrate {
                     "automatic access wake is disabled",
                 ));
             }
-            // The access entrypoint already charged admission. A placed
-            // sandbox goes through the worker's implicit wake so its
-            // effective policy, including a local override, is enforced under
-            // the wake lock; the worker asks for a restore only when its local
-            // row is missing. An unplaced sandbox has no worker to consult and
-            // uses the direct restore lease and completion owner.
-            if sandbox.active_node_id.is_some() {
-                self.wake_execution(
-                    metric_identity,
-                    sandbox,
-                    timeout,
-                    Some(activity),
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
-                )
-                .await
-                .map_err(ControllerError::from)?;
-            } else {
-                self.restore_execution_with_candidates(
-                    sandbox.id,
-                    ActivationOptions {
-                        blocking: true,
-                        ready_timeout: timeout,
-                    },
-                )
-                .await
-                .map_err(ControllerError::from)?;
-            }
+            // The access entrypoint already charged admission. Every
+            // suspended or restoring row wakes through `wake_execution`, which
+            // applies the worker's effective policy, including a local
+            // override. A placed row's worker enforces it under the wake lock.
+            // For an unplaced row it reads the record on the node holding its
+            // local state (`target_node_id`, with or without a route receipt)
+            // before the restore. A row with no such node has no worker to
+            // consult and restores on the cluster policy alone.
+            self.wake_execution(
+                metric_identity,
+                sandbox,
+                timeout,
+                Some(activity),
+                crate::controllers::substrate::RecoveryCharge::Exempt,
+            )
+            .await
+            .map_err(ControllerError::from)?;
         }
         self.node_client(sandbox.id).await
     }

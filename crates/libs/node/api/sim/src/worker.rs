@@ -265,6 +265,15 @@ fn sim_lifecycle(label: &str) -> sbx::SandboxLifecycleState {
     }
 }
 
+/// The policy a record holds, reported as sandbox-manager reports its row's.
+fn decoded_policy(encoded: &[u8]) -> Option<sbx::AutoLifecyclePolicy> {
+    use prost::Message;
+    if encoded.is_empty() {
+        return None;
+    }
+    sbx::AutoLifecyclePolicy::decode(encoded).ok()
+}
+
 fn sandbox_info_from_record(rec: &crate::state::SandboxRecord) -> sbx::SandboxInfo {
     sbx::SandboxInfo {
         lifecycle: Some(sim_lifecycle(&rec.status) as i32),
@@ -285,7 +294,7 @@ fn sandbox_info_from_record(rec: &crate::state::SandboxRecord) -> sbx::SandboxIn
         netgtw_alive: true,
         snapshots_enabled: rec.snapshots_enabled,
         pool_template: rec.pool_template.clone(),
-        auto_lifecycle: None,
+        auto_lifecycle: decoded_policy(&rec.access_idle_policy),
         auto_lifecycle_status: None,
         failure_reason: None,
         quarantine_reason_code: None,
@@ -301,7 +310,7 @@ fn sandbox_info_from_record(rec: &crate::state::SandboxRecord) -> sbx::SandboxIn
         applied_network_policy_generation: 0,
         applied_network_policy_source: 0,
         network_policy_authority: PolicyAuthority::Cluster.as_proto_i32(),
-        auto_lifecycle_authority: PolicyAuthority::Cluster.as_proto_i32(),
+        auto_lifecycle_authority: rec.auto_lifecycle_authority.as_proto_i32(),
         current_local_artifact_id: None,
         current_local_artifact_kind: None,
         current_local_artifact_origin: None,
@@ -544,15 +553,30 @@ impl WorkerApi for SimWorkerApiService {
                 "StartSandbox.netns_path is internal-only; use WorkerApiInternal",
             ));
         }
-        let rec = self
-            .state
-            .transition(
-                &req.sandbox_id,
-                &[status::CREATING, status::STOPPED],
-                status::RUNNING,
-            )
-            .await
-            .map_err(map_state_error)?;
+        // A Start carrying the suspend checkpoint restores a locally
+        // suspended sandbox, as sandbox-manager does.
+        let suspend_checkpoint = req.checkpoint.as_deref() == Some("suspend");
+        let from: &[&str] = if suspend_checkpoint {
+            &[status::CREATING, status::STOPPED, status::SUSPENDED]
+        } else {
+            &[status::CREATING, status::STOPPED]
+        };
+        // With a durable storage URI it restores, from that snapshot, a
+        // sandbox this node holds no record of: a cross-node restore.
+        let cross_node_restore = suspend_checkpoint
+            && req.suspend_restore_storage_uri.is_some()
+            && matches!(
+                self.state.get(&req.sandbox_id).await,
+                Err(SimStateError::NotFound(_))
+            );
+        let rec = if cross_node_restore {
+            self.state.ensure_default_running(&req.sandbox_id).await
+        } else {
+            self.state
+                .transition(&req.sandbox_id, from, status::RUNNING)
+                .await
+        }
+        .map_err(map_state_error)?;
 
         sim_install_activation_policy(
             &self.state,
