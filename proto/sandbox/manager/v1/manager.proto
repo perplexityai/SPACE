@@ -219,6 +219,7 @@ service SandboxManager {
   rpc SpacedEnableFileChanges(SpacedEnableFileChangesRequest) returns (space.spaced.operations.v1.EnableFileChangesResponse);
   rpc SpacedDisableFileChanges(SpacedDisableFileChangesRequest) returns (space.spaced.operations.v1.DisableFileChangesResponse);
   rpc SpacedGetModifiedFiles(SpacedGetModifiedFilesRequest) returns (space.spaced.operations.v1.GetModifiedFilesResponse);
+  rpc SpacedGlob(SpacedGlobRequest) returns (space.spaced.operations.v1.GlobResponse);
 
   rpc SpacedStartProcess(SpacedStartProcessRequest) returns (stream space.spaced.operations.v1.ProcessEvent);
   rpc SpacedConnectProcess(SpacedConnectProcessRequest) returns (stream space.spaced.operations.v1.ProcessEvent);
@@ -1327,6 +1328,11 @@ message SpacedDisableFileChangesRequest {
 message SpacedGetModifiedFilesRequest {
   string sandbox_id = 1;
   space.spaced.operations.v1.GetModifiedFilesRequest operation = 2;
+}
+
+message SpacedGlobRequest {
+  string sandbox_id = 1;
+  space.spaced.operations.v1.GlobRequest operation = 2;
 }
 
 message SpacedStartProcessRequest {

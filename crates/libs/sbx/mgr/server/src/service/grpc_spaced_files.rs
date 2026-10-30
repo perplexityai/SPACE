@@ -989,6 +989,32 @@ impl SandboxManagerService {
         Ok(Response::new(SpacedDisableFileChangesResponse {}))
     }
 
+    pub(super) async fn spaced_glob(
+        &self,
+        request: Request<SpacedGlobRequest>,
+    ) -> Result<Response<SpacedGlobResponse>, Status> {
+        self.authorize_peer(&request, SpacedRpc::Glob.as_str(), ALLOW_SANDBOX_OPERATOR)?;
+        let wake_budget = grpc_timeout_budget(&request);
+        let req = request.get_ref();
+        let route_auth =
+            self.prepare_space_api_bridge(&request, &req.sandbox_id, SpacedRpc::Glob)?;
+        let operation = required_operation(&req.operation)?.clone();
+        let sandbox = self
+            .ensure_active_for_read_only_guest_activity(
+                Some(route_auth.clone()),
+                &req.sandbox_id,
+                true,
+                wake_budget,
+                GuestActivityKind::Access,
+                "SpacedGlob",
+            )
+            .await?;
+        route_auth.authorize_sandbox(&sandbox)?;
+        let user = parse_operation_user(operation.user.clone())?;
+        let client = self.connect_spaced_host(&sandbox).await?;
+        Ok(Response::new(client.glob_as_user(operation, user).await?))
+    }
+
     pub(super) async fn spaced_get_modified_files(
         &self,
         request: Request<SpacedGetModifiedFilesRequest>,

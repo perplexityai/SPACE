@@ -548,6 +548,24 @@ impl SandboxController {
         client.spaced_get_modified_files(request).await
     }
 
+    pub async fn spaced_glob(
+        &self,
+        pool: &PgPool,
+        sandbox: &Sandbox,
+        metric_identity: SandboxApiMetricIdentity,
+        request: SpacedGlobRequest,
+    ) -> Result<SpacedGlobResponse, ControllerError> {
+        let mut client = self
+            .spaced_client(
+                pool,
+                sandbox,
+                metric_identity,
+                Some(ExecutionActivityKind::Access),
+            )
+            .await?;
+        client.spaced_glob(request).await
+    }
+
     pub async fn spaced_start_process(
         &self,
         pool: &PgPool,
@@ -1203,6 +1221,12 @@ impl SpacedSandboxClient {
         spaced_get_modified_files,
         SpacedGetModifiedFilesRequest,
         SpacedGetModifiedFilesResponse,
+        NodeApiOperationBudget::FilesystemMetadata
+    );
+    spaced_client_call!(
+        spaced_glob,
+        SpacedGlobRequest,
+        SpacedGlobResponse,
         NodeApiOperationBudget::FilesystemMetadata
     );
     spaced_client_call!(

@@ -13,10 +13,11 @@ use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
     CreateWatcherRequest, CreateWatcherResponse, DisableFileChangesRequest,
     DisableFileChangesResponse, EnableFileChangesRequest, EnableFileChangesResponse,
     GetModifiedFilesRequest, GetModifiedFilesResponse, GetWatcherEventsRequest,
-    GetWatcherEventsResponse, ListRequest, MkdirRequest, MkdirResponse, NormalizeWatchRootRequest,
-    NormalizeWatchRootResponse, ReadRequest, RemoveRequest, RemoveResponse, RemoveWatcherRequest,
-    RemoveWatcherResponse, RenameRequest, RenameResponse, StatRequest, StatResponse, WatchRequest,
-    WriteBatchRequest, WriteBatchResponse, WriteRequest, WriteResponse,
+    GetWatcherEventsResponse, GlobRequest, GlobResponse, ListRequest, MkdirRequest, MkdirResponse,
+    NormalizeWatchRootRequest, NormalizeWatchRootResponse, ReadRequest, RemoveRequest,
+    RemoveResponse, RemoveWatcherRequest, RemoveWatcherResponse, RenameRequest, RenameResponse,
+    StatRequest, StatResponse, WatchRequest, WriteBatchRequest, WriteBatchResponse, WriteRequest,
+    WriteResponse,
 };
 #[cfg(target_os = "linux")]
 use tokio::sync::Mutex;
@@ -1562,6 +1563,20 @@ impl Filesystem for FilesystemHandle {
                     self.observe_ledger_state(&worker, response.get_ref()).await;
                 }
                 result
+            }
+        }
+    }
+
+    async fn glob(&self, request: Request<GlobRequest>) -> Result<Response<GlobResponse>, Status> {
+        match &self.backend {
+            Backend::Direct(service) => service.glob(request).await,
+            #[cfg(target_os = "linux")]
+            Backend::Workers(_) => {
+                let mut request = request.into_inner();
+                let worker = self.worker(request.user.take()).await?;
+                let mut client = worker.client.clone();
+                self.observe_worker_result(&worker, client.glob(request).await)
+                    .await
             }
         }
     }

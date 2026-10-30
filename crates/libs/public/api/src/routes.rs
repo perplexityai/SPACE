@@ -199,6 +199,7 @@ native_operations! {
     CREATE_FILE_WATCH_SESSION = NativeOperation::new("/v1/sandboxes/{sandbox_id}/file-watch-sessions", Post, "createFileWatchSession", IncubatingHidden);
     DISABLE_FILE_CHANGES = NativeOperation::new("/v1/sandboxes/{sandbox_id}/files:changes_disable", Post, "disableFileChanges", Incubating);
     ENABLE_FILE_CHANGES = NativeOperation::new("/v1/sandboxes/{sandbox_id}/files:changes_enable", Post, "enableFileChanges", Incubating);
+    GLOB_FILES = NativeOperation::new("/v1/sandboxes/{sandbox_id}/files:glob", Post, "globFiles", Incubating);
     LIST_FILES = NativeOperation::new("/v1/sandboxes/{sandbox_id}/files:list", Post, "listFiles", Incubating);
     CREATE_DIRECTORY = NativeOperation::new("/v1/sandboxes/{sandbox_id}/files:mkdir", Post, "createDirectory", Incubating);
     LIST_MODIFIED_FILES = NativeOperation::new("/v1/sandboxes/{sandbox_id}/files:modified", Post, "listModifiedFiles", Incubating);

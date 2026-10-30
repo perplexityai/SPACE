@@ -82,6 +82,7 @@ const (
 	SandboxManager_SpacedEnableFileChanges_FullMethodName                = "/space.sandbox.manager.v1.SandboxManager/SpacedEnableFileChanges"
 	SandboxManager_SpacedDisableFileChanges_FullMethodName               = "/space.sandbox.manager.v1.SandboxManager/SpacedDisableFileChanges"
 	SandboxManager_SpacedGetModifiedFiles_FullMethodName                 = "/space.sandbox.manager.v1.SandboxManager/SpacedGetModifiedFiles"
+	SandboxManager_SpacedGlob_FullMethodName                             = "/space.sandbox.manager.v1.SandboxManager/SpacedGlob"
 	SandboxManager_SpacedStartProcess_FullMethodName                     = "/space.sandbox.manager.v1.SandboxManager/SpacedStartProcess"
 	SandboxManager_SpacedConnectProcess_FullMethodName                   = "/space.sandbox.manager.v1.SandboxManager/SpacedConnectProcess"
 	SandboxManager_SpacedListProcesses_FullMethodName                    = "/space.sandbox.manager.v1.SandboxManager/SpacedListProcesses"
@@ -272,6 +273,7 @@ type SandboxManagerClient interface {
 	SpacedEnableFileChanges(ctx context.Context, in *SpacedEnableFileChangesRequest, opts ...grpc.CallOption) (*v1.EnableFileChangesResponse, error)
 	SpacedDisableFileChanges(ctx context.Context, in *SpacedDisableFileChangesRequest, opts ...grpc.CallOption) (*v1.DisableFileChangesResponse, error)
 	SpacedGetModifiedFiles(ctx context.Context, in *SpacedGetModifiedFilesRequest, opts ...grpc.CallOption) (*v1.GetModifiedFilesResponse, error)
+	SpacedGlob(ctx context.Context, in *SpacedGlobRequest, opts ...grpc.CallOption) (*v1.GlobResponse, error)
 	SpacedStartProcess(ctx context.Context, in *SpacedStartProcessRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[v1.ProcessEvent], error)
 	SpacedConnectProcess(ctx context.Context, in *SpacedConnectProcessRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[v1.ProcessEvent], error)
 	SpacedListProcesses(ctx context.Context, in *SpacedListProcessesRequest, opts ...grpc.CallOption) (*SpacedListProcessesResponse, error)
@@ -963,6 +965,16 @@ func (c *sandboxManagerClient) SpacedGetModifiedFiles(ctx context.Context, in *S
 	return out, nil
 }
 
+func (c *sandboxManagerClient) SpacedGlob(ctx context.Context, in *SpacedGlobRequest, opts ...grpc.CallOption) (*v1.GlobResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(v1.GlobResponse)
+	err := c.cc.Invoke(ctx, SandboxManager_SpacedGlob_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *sandboxManagerClient) SpacedStartProcess(ctx context.Context, in *SpacedStartProcessRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[v1.ProcessEvent], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	stream, err := c.cc.NewStream(ctx, &SandboxManager_ServiceDesc.Streams[5], SandboxManager_SpacedStartProcess_FullMethodName, cOpts...)
@@ -1367,6 +1379,7 @@ type SandboxManagerServer interface {
 	SpacedEnableFileChanges(context.Context, *SpacedEnableFileChangesRequest) (*v1.EnableFileChangesResponse, error)
 	SpacedDisableFileChanges(context.Context, *SpacedDisableFileChangesRequest) (*v1.DisableFileChangesResponse, error)
 	SpacedGetModifiedFiles(context.Context, *SpacedGetModifiedFilesRequest) (*v1.GetModifiedFilesResponse, error)
+	SpacedGlob(context.Context, *SpacedGlobRequest) (*v1.GlobResponse, error)
 	SpacedStartProcess(*SpacedStartProcessRequest, grpc.ServerStreamingServer[v1.ProcessEvent]) error
 	SpacedConnectProcess(*SpacedConnectProcessRequest, grpc.ServerStreamingServer[v1.ProcessEvent]) error
 	SpacedListProcesses(context.Context, *SpacedListProcessesRequest) (*SpacedListProcessesResponse, error)
@@ -1591,6 +1604,9 @@ func (UnimplementedSandboxManagerServer) SpacedDisableFileChanges(context.Contex
 }
 func (UnimplementedSandboxManagerServer) SpacedGetModifiedFiles(context.Context, *SpacedGetModifiedFilesRequest) (*v1.GetModifiedFilesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SpacedGetModifiedFiles not implemented")
+}
+func (UnimplementedSandboxManagerServer) SpacedGlob(context.Context, *SpacedGlobRequest) (*v1.GlobResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SpacedGlob not implemented")
 }
 func (UnimplementedSandboxManagerServer) SpacedStartProcess(*SpacedStartProcessRequest, grpc.ServerStreamingServer[v1.ProcessEvent]) error {
 	return status.Error(codes.Unimplemented, "method SpacedStartProcess not implemented")
@@ -2729,6 +2745,24 @@ func _SandboxManager_SpacedGetModifiedFiles_Handler(srv interface{}, ctx context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _SandboxManager_SpacedGlob_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SpacedGlobRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxManagerServer).SpacedGlob(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxManager_SpacedGlob_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxManagerServer).SpacedGlob(ctx, req.(*SpacedGlobRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _SandboxManager_SpacedStartProcess_Handler(srv interface{}, stream grpc.ServerStream) error {
 	m := new(SpacedStartProcessRequest)
 	if err := stream.RecvMsg(m); err != nil {
@@ -3240,6 +3274,10 @@ var SandboxManager_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SpacedGetModifiedFiles",
 			Handler:    _SandboxManager_SpacedGetModifiedFiles_Handler,
+		},
+		{
+			MethodName: "SpacedGlob",
+			Handler:    _SandboxManager_SpacedGlob_Handler,
 		},
 		{
 			MethodName: "SpacedListProcesses",

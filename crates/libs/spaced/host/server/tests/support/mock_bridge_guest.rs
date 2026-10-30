@@ -11,14 +11,15 @@ use pplx_space_spaced_common::proto::bridge_guest::{
     DisableFileChangesResponse, EnableFileChangesRequest, EnableFileChangesResponse, FileChunk,
     FileEvent, FileType, FlushFilesystemsRequest, FlushFilesystemsResponse,
     GetModifiedFilesRequest, GetModifiedFilesResponse, GetWatcherEventsRequest,
-    GetWatcherEventsResponse, LegacyDirEntry, LegacyStatResponse, ListProcessesRequest,
-    ListRequest, MkdirRequest, MkdirResponse, NormalizeWatchRootRequest,
-    NormalizeWatchRootResponse, NotifyResumeRequest, NotifyResumeResponse, PingRequest,
-    PingResponse, ProcessEvent, ProcessInfo, ReadRequest, RemoveRequest, RemoveResponse,
-    RemoveWatcherRequest, RemoveWatcherResponse, RenameRequest, RenameResponse, ResizePtyRequest,
-    ResizePtyResponse, SendInputRequest, SendInputResponse, SendSignalRequest, SendSignalResponse,
-    StartRequest, StatRequest, WaitReadyRequest, WaitReadyResponse, WatchRequest,
-    WriteBatchRequest, WriteBatchResponse, WriteRequest, WriteResponse,
+    GetWatcherEventsResponse, GlobMatch, GlobRequest, GlobResponse, LegacyDirEntry,
+    LegacyStatResponse, ListProcessesRequest, ListRequest, MkdirRequest, MkdirResponse,
+    NormalizeWatchRootRequest, NormalizeWatchRootResponse, NotifyResumeRequest,
+    NotifyResumeResponse, PingRequest, PingResponse, ProcessEvent, ProcessInfo, ReadRequest,
+    RemoveRequest, RemoveResponse, RemoveWatcherRequest, RemoveWatcherResponse, RenameRequest,
+    RenameResponse, ResizePtyRequest, ResizePtyResponse, SendInputRequest, SendInputResponse,
+    SendSignalRequest, SendSignalResponse, StartRequest, StatRequest, WaitReadyRequest,
+    WaitReadyResponse, WatchRequest, WriteBatchRequest, WriteBatchResponse, WriteRequest,
+    WriteResponse,
 };
 use std::sync::{
     Arc,
@@ -361,6 +362,21 @@ impl Filesystem for MockBridgeGuest {
             cursor: Some("1".into()),
             monitoring_enabled: true,
             overflowed: false,
+        }))
+    }
+
+    async fn glob(&self, request: Request<GlobRequest>) -> Result<Response<GlobResponse>, Status> {
+        if let Some(code) = self.metadata_open_error {
+            return Err(Status::new(code, "Glob rejected"));
+        }
+        let request = request.into_inner();
+        Ok(Response::new(GlobResponse {
+            matches: vec![GlobMatch {
+                path: format!("{}:{}", request.search_dir, request.pattern),
+                size_bytes: u64::from(request.max_results),
+                modified_at: Some(timestamp_from_millis(1_000)),
+            }],
+            truncated: true,
         }))
     }
 }

@@ -260,6 +260,7 @@ fn grpc_client_application_statuses_are_expected(path: &str) -> bool {
             | "EnableFileChanges"
             | "DisableFileChanges"
             | "GetModifiedFiles"
+            | "Glob"
             | "StartProcess"
             | "ConnectProcess"
             | "ListProcesses"
