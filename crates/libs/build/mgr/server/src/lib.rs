@@ -294,7 +294,6 @@ trait BuildBackend: Send + Sync {
         &self,
         template_id: &str,
         content_hash: &str,
-        environment: Option<pplx_space_common_core::types::EnvironmentReference>,
         publish_tags: &[String],
         publication: TemplatePublication,
     ) -> Result<(), PublishError>;
@@ -340,18 +339,10 @@ impl BuildBackend for RuntimeBuildBackend {
         &self,
         template_id: &str,
         content_hash: &str,
-        environment: Option<pplx_space_common_core::types::EnvironmentReference>,
         publish_tags: &[String],
         publication: TemplatePublication,
     ) -> Result<(), PublishError> {
-        publish_build(
-            template_id,
-            content_hash,
-            environment,
-            publish_tags,
-            publication,
-        )
-        .await
+        publish_build(template_id, content_hash, publish_tags, publication).await
     }
 
     async fn prune_replaced_builds(&self, template_id: &str, keep_hash: &str) {
@@ -498,13 +489,7 @@ impl JobExecutor for BuildExecutor {
                                 "build phase started"
                             );
                             let result = backend
-                                .publish(
-                                    &template_id,
-                                    &hash,
-                                    outcome.environment,
-                                    &publish_tags,
-                                    publication,
-                                )
+                                .publish(&template_id, &hash, &publish_tags, publication)
                                 .await;
                             let step_result = pplx_space_metrics::template::TemplateBuildStepResult::from_ok(result.is_ok());
                             let result_tag = step_result.as_str();

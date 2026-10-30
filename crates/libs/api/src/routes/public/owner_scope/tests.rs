@@ -1564,6 +1564,7 @@ async fn a_same_key_retry_racing_an_early_delete_replays_it() -> TestDbResult<()
                 sandbox_id,
                 action,
                 rollback: None,
+                wake_activity: None,
             }
             .into_json(),
             idempotency: Some(idempotency),

@@ -846,6 +846,7 @@ async fn native_start_overwrites_a_stopped_written_mid_flight_without_a_retry() 
             sandbox_id: PublicSandboxId::from(sandbox_id),
             action: SandboxLifecycleAction::Start,
             rollback: None,
+            wake_activity: None,
         }
         .into_json(),
         attempts: 1,
@@ -1131,15 +1132,20 @@ async fn untracked_runtime_actions_without_placement_are_unavailable() -> TestRe
     Ok(())
 }
 
-/// The wake a command queues (a native wake with no actor) runs through the
+/// The wake a session queues (a native wake with no actor) runs through the
 /// lifecycle executor like a `:wake`, but only while the sandbox's wake
-/// policy, read when it executes, still lets a command wake it: allowed, it
-/// wakes the paused resident; cleared since, it fails as a conflict and
-/// leaves the sandbox paused. A caller's `:wake` is not policy-gated.
+/// policy, read when it executes, still lets the session's activity wake it:
+/// allowed, it wakes the paused resident; not allowed, it fails as a conflict
+/// and leaves the sandbox paused. A wake recording access, as for a
+/// reattach to a running process, needs `access`. One recording no activity,
+/// as an older API or one with the record switched off queues every wake, is
+/// judged as a command, as an older executor judges it. A caller's `:wake`
+/// is not policy-gated.
 #[tokio::test(flavor = "current_thread")]
-async fn a_command_wake_operation_runs_only_while_the_policy_allows_it() -> TestResult {
+async fn a_system_wake_operation_runs_only_while_the_policy_allows_its_activity() -> TestResult {
     use crate::public_operations::{ApiProduct, ClaimedPublicOperation};
     use crate::public_sandbox_operations::{
+        ImplicitWakeActivity::{Access, Command},
         SandboxLifecycleOperationExecutor, SandboxLifecycleOperationPayload,
     };
     use pplx_space_public_api::{
@@ -1156,38 +1162,53 @@ async fn a_command_wake_operation_runs_only_while_the_policy_allows_it() -> Test
     let executor = SandboxLifecycleOperationExecutor::new(pool.clone(), direct_controller(pool));
 
     let caller: UserId = "00000000-0000-0000-0000-000000000010".parse()?;
-    for (actor, allowed, wakes) in [
-        (None, true, true),
-        (None, false, false),
-        (Some(caller), false, true),
+    let org_id = "00000000-0000-0000-0000-000000000001".parse()?;
+    let access = Some(Access);
+    let command = Some(Command);
+    // (actor, wake.on, if not the access policy placing it sets, recorded
+    // activity, wakes)
+    for (actor, wake_on, recorded, wakes) in [
+        (None, None, None, true),
+        (None, Some(&[][..]), None, false),
+        (Some(caller), Some(&[]), None, true),
+        (Some(caller), Some(&["command"]), access, true),
+        (None, None, access, true),
+        (None, Some(&["command"]), command, true),
+        (None, Some(&["command"]), access, false),
+        // Recording none: queued by an older API, or with the record off.
+        (None, Some(&["command"]), None, true),
     ] {
         let sandbox_id = SandboxId::new();
         insert_sandbox(pool, sandbox_id, "paused", "space").await?;
         // Places it with an access-wake policy.
         place_on_node(pool, sandbox_id, node_id).await?;
         insert_resident(worker.state(), sandbox_id, "paused").await?;
-        if !allowed {
+        if let Some(wake_on) = wake_on {
             sqlx::query(sql!(
-                "UPDATE sandboxes SET auto_lifecycle_json = '{}'::JSONB WHERE id = $1"
+                "UPDATE sandboxes SET auto_lifecycle_json = $2 WHERE id = $1"
             ))
             .bind(sandbox_id)
+            .bind(serde_json::json!({ "wake": { "on": wake_on } }))
             .execute(pool)
             .await?;
         }
+        let payload = SandboxLifecycleOperationPayload {
+            sandbox_id: PublicSandboxId::from(sandbox_id),
+            action: SandboxLifecycleAction::Wake,
+            rollback: None,
+            wake_activity: recorded,
+        }
+        .into_json();
+        let case = format!("{actor:?} {wake_on:?} {recorded:?}");
         let operation = ClaimedPublicOperation {
             id: OperationId::new(),
-            org_id: "00000000-0000-0000-0000-000000000001".parse()?,
+            org_id,
             actor_user_id: actor,
             api_product: ApiProduct::Native,
             kind: OperationKind::WakeSandbox,
             target_type: None,
             target_id: Some(PublicSandboxId::from(sandbox_id).to_string()),
-            payload: SandboxLifecycleOperationPayload {
-                sandbox_id: PublicSandboxId::from(sandbox_id),
-                action: SandboxLifecycleAction::Wake,
-                rollback: None,
-            }
-            .into_json(),
+            payload,
             attempts: 1,
             claim_generation: 1,
             traceparent: None,
@@ -1198,14 +1219,18 @@ async fn a_command_wake_operation_runs_only_while_the_policy_allows_it() -> Test
 
         let resident = worker.state().get(&sandbox_id.to_string()).await?.status;
         if wakes {
-            assert_eq!(result.state, OperationState::Succeeded, "{result:?}");
+            assert_eq!(
+                result.state,
+                OperationState::Succeeded,
+                "{case}: {result:?}"
+            );
             assert_eq!(resident, "running");
             assert_eq!(
                 row(pool, sandbox_id).await?,
                 Some(Row::new("started", "on_node"))
             );
         } else {
-            assert_eq!(result.state, OperationState::Failed, "{result:?}");
+            assert_eq!(result.state, OperationState::Failed, "{case}: {result:?}");
             assert_eq!(result.terminal_error_code, Some(PublicErrorCode::Conflict));
             // Refused by the executor before any node call: a sandbox with no
             // node to ask (a suspended Kubernetes one) has no other check.

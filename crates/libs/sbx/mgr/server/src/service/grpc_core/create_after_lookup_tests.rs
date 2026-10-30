@@ -109,7 +109,6 @@ impl TemplateBuild {
                 name: TEMPLATE.into(),
                 content_hash: Some(build.into()),
                 tag: None,
-                environment: None,
             }),
             arch: std::env::consts::ARCH.into(),
             template_dir: self.dir.path().to_str().unwrap().into(),
@@ -217,7 +216,6 @@ impl Fixture {
                     name: TEMPLATE.into(),
                     content_hash: None,
                     tag: None,
-                    environment: None,
                 }),
                 vcpu: None,
                 memory_mib: None,
@@ -806,17 +804,6 @@ async fn explicit_selection_checks_legacy_base_evidence_before_create() {
             assert_eq!(error.code(), tonic::Code::FailedPrecondition);
         }
         assert_eq!(fixture.row_count(), 0);
-        // The selected environment picks that environment's build of the
-        // rootfs from template-manager's cache.
-        let lookups = fixture.templates.requests();
-        assert_eq!(lookups.len(), 1);
-        assert_eq!(
-            lookups[0]
-                .template
-                .as_ref()
-                .and_then(|template| template.environment.clone()),
-            Some(definition.reference().to_string())
-        );
     }
 }
 

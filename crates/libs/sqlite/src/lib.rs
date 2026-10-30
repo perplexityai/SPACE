@@ -9,6 +9,7 @@
 
 pub mod baselines;
 pub mod runtime_manager;
+mod template_manager;
 
 use pplx_space_migration_checksums::AcceptedChecksums;
 use pplx_space_sql_locator::sql;
@@ -385,6 +386,9 @@ async fn migrate_once(
             })?;
 
         let result = async {
+            if db_name == template_manager::STORE {
+                template_manager::reverse_retired_partitions(db_path, migrators.service)?;
+            }
             validate_schema(db_name, db_path, migrators, checksums).await?;
             let mut conn = pool
                 .acquire()

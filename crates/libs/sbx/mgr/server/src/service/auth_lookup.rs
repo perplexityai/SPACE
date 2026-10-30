@@ -998,7 +998,6 @@ impl SandboxManagerService {
                     name: sandbox.template.clone(),
                     content_hash: sandbox.template_hash.clone(),
                     tag: None,
-                    environment: None,
                 },
                 template_lookup_scope(&sandbox.user, Some(&sandbox.id))?,
             )

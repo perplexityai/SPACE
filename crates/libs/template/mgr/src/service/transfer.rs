@@ -70,8 +70,6 @@ impl TemplateManagerService {
             .hash
         };
         validate_content_hash(&content_hash)?;
-        let requested_partition =
-            super::lookup::requested_cache_partition(tmpl_ref.environment.as_deref())?;
 
         // Verify build exists and is ready
         let db = Arc::clone(&self.db);
@@ -81,13 +79,7 @@ impl TemplateManagerService {
             let conn = db
                 .lock()
                 .map_err(|_| crate::db::mutex_poison_error("load export build"))?;
-            // A ready build in preference order; otherwise any row, so a
-            // build mid-eviction is reported by its state.
-            match crate::db::find_ready_build(&conn, &name, &hash, requested_partition)? {
-                Some(build) => Ok(Some(build)),
-                None => crate::db::list_builds_for_hash(&conn, &name, &hash)
-                    .map(|builds| builds.into_iter().next()),
-            }
+            crate::db::get_build(&conn, &name, &hash)
         })
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking: {e}")))?
@@ -103,14 +95,7 @@ impl TemplateManagerService {
             )));
         }
 
-        let partition = build.cache_partition;
-        let environment = build.environment();
-        let build_path = build_artifacts_dir(
-            &self.artifact_store.root,
-            template_id,
-            &content_hash,
-            partition,
-        );
+        let build_path = build_artifacts_dir(&self.artifact_store.root, template_id, &content_hash);
         let bdir = build_path.to_string_lossy().into_owned();
         let include_snapshot = req.include_snapshot;
         let snapshot_dimensions =
@@ -143,13 +128,7 @@ impl TemplateManagerService {
                     "snapshot_vcpu and snapshot_memory_mib are required when include_snapshot is true",
                 )
             })?;
-            let sd = snapshot_dir(
-                template_id,
-                &content_hash,
-                partition,
-                snap_vcpu,
-                snap_memory_mib,
-            );
+            let sd = snapshot_dir(template_id, &content_hash, snap_vcpu, snap_memory_mib);
             if std::path::Path::new(&format!("{sd}/snapshot.base")).exists()
                 && std::path::Path::new(&format!("{sd}/vmstate.base")).exists()
             {
@@ -179,7 +158,6 @@ impl TemplateManagerService {
                             name: tmpl_name,
                             content_hash: Some(tmpl_hash),
                             tag: None,
-                            environment: environment.map(|environment| environment.to_string()),
                         }),
                         metadata_json,
                         includes_snapshot: has_snapshot,
@@ -353,9 +331,8 @@ impl TemplateManagerService {
             validate_content_hash(rootfs_hash)?;
         }
 
-        let target = ImportTarget::from_header(template_id, content_hash, &header)?;
-        // Acquire per-build import lock (keyed on name + build dir)
-        let lock_key = target.lock_key();
+        // Acquire per-template import lock (keyed on name+hash)
+        let lock_key = format!("{template_id}@{content_hash}");
         let _import_guard = {
             let mut importing = self.importing_templates.lock().map_err(|_| {
                 Status::internal("import lock set mutex poisoned while starting import")
@@ -371,7 +348,9 @@ impl TemplateManagerService {
             }
         };
 
-        let response = self.do_import(target, &header, &mut stream).await?;
+        let response = self
+            .do_import(template_id, content_hash, &header, &mut stream)
+            .await?;
         if header.block_on_snapshot_policy_achieved.unwrap_or(false) {
             let outcome = self.reconcile_desired_base_snapshot(template_id).await;
             if let Some(error) = outcome.error {

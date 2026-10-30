@@ -1780,6 +1780,56 @@ async fn optional_e2b_body_distinguishes_empty_from_untyped_nonempty() {
 }
 
 #[test]
+fn create_translation_applies_resource_overrides() {
+    for (raw, cpu, memory) in [
+        (r#"{"vcpu":4,"memory_mib":8192}"#, Some(4), Some(8192)),
+        (r#"{"vcpu":4}"#, Some(4), None),
+        (r#"{"memory_mib":8192}"#, None, Some(8192)),
+        ("{}", None, None),
+    ] {
+        let mut request = base_create_request();
+        request
+            .metadata
+            .insert("space.resources".into(), raw.into());
+        request.metadata.insert("purpose".into(), "example".into());
+        let translated = translate_create_request(request).unwrap();
+        assert_eq!(translated.native.vcpu, cpu);
+        assert_eq!(translated.native.memory_mib, memory);
+        assert!(!translated.native.metadata.contains_key("space.resources"));
+        assert!(translated.native.metadata.contains_key("purpose"));
+    }
+    let translated = translate_create_request(base_create_request()).unwrap();
+    assert_eq!(translated.native.vcpu, None);
+    assert_eq!(translated.native.memory_mib, None);
+}
+
+#[test]
+fn create_translation_rejects_invalid_resource_overrides() {
+    for raw in [
+        "not json",
+        "null",
+        r#"{"vcpu":0}"#,
+        r#"{"memory_mib":-1}"#,
+        r#"{"memory_mib":0}"#,
+        r#"{"vcpu":1.5}"#,
+        r#"{"vcpu":"4"}"#,
+        r#"{"vcpu":2147483648}"#,
+        r#"{"memory_mib":2147483648}"#,
+        r#"{"memory_mb":8192}"#,
+    ] {
+        let mut request = base_create_request();
+        request
+            .metadata
+            .insert("space.resources".into(), raw.into());
+        assert_eq!(
+            translate_create_request(request).unwrap_err().status,
+            StatusCode::BAD_REQUEST,
+            "{raw}"
+        );
+    }
+}
+
+#[test]
 fn create_translation_maps_supported_fields() {
     let mut request = base_create_request();
     request.template_id = Some("tmpl-123".to_string());

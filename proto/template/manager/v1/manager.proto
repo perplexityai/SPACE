@@ -18,6 +18,15 @@ service TemplateManager {
   // Delete a template (all builds, snapshots, and tags).
   rpc DeleteTemplate(DeleteTemplateRequest) returns (DeleteTemplateResponse);
 
+  // Delete a template's cached builds the way the cache GC evicts one, only
+  // while none was created or used in the last idle_secs. Deletes the
+  // template's local pool and its members first, even when it then keeps the
+  // template, since pool refills keep its builds in use. Fails with FAILED_PRECONDITION while
+  // a build is that recent, pinned, used by a local sandbox or targeted by a
+  // warm pool, ABORTED while the cache GC or another eviction is running, and
+  // NOT_FOUND when no build is cached.
+  rpc DeleteIdleTemplate(DeleteIdleTemplateRequest) returns (DeleteIdleTemplateResponse);
+
   // List all templates with snapshot/pool status.
   rpc ListTemplates(ListTemplatesRequest) returns (ListTemplatesResponse);
 
@@ -85,6 +94,14 @@ message DeleteTemplateRequest {
 
 message DeleteTemplateResponse {}
 
+message DeleteIdleTemplateRequest {
+  string template = 1;
+  // Must be positive.
+  uint64 idle_secs = 2;
+}
+
+message DeleteIdleTemplateResponse {}
+
 message ListTemplatesRequest {}
 
 message ListTemplatesResponse {
@@ -129,18 +146,6 @@ message TemplateRef {
   string name = 1;
   optional string content_hash = 2;     // exact build hash
   optional string tag = 3;              // build alias
-  // One rootfs can be cached once per environment it's bound to. In requests,
-  // an environment reference prefers the build bound to that environment,
-  // then the build unbound and initial-environment builds share, then any
-  // other; absent prefers the shared one. A latest-build lookup returns the
-  // newest build, same-date builds going to the larger content hash and
-  // builds of one digest to that order. A cache miss pulls the release, whose
-  // manifest, or failing that its metadata, decides where it's cached. Callers
-  // check that the build they get is a compatible cold-boot source for the
-  // environment they run it under. In responses: the resolved build's
-  // environment binding, absent for unbound builds. DeleteTemplateBuild
-  // rejects it and removes every cached build of the hash.
-  optional string environment = 4;
 }
 
 message SnapshotInfo {

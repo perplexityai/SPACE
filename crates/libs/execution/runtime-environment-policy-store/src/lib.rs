@@ -3,7 +3,8 @@
 //!
 //! The policy is one seeded row naming the cluster default, the legacy
 //! permission and a generation, plus a state per environment. [`get`] reads
-//! all of it in one statement, so a reader never sees a default from one
+//! all of it in one statement ([`get_record`] adds who changed each row and
+//! why), so a reader never sees a default from one
 //! policy and states from another. The write verbs ([`set_default`],
 //! [`set_environment_state`], [`set_legacy_unbound_allowed`]) take the
 //! caller's open transaction, lock the policy row first, and increment the
@@ -41,7 +42,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{DigestParseError, EnvironmentReference};
+use pplx_space_common_core::types::{DigestParseError, EnvironmentReference, UserId};
 
 mod write;
 
@@ -67,6 +68,9 @@ pub enum RuntimeEnvironmentState {
 }
 
 impl RuntimeEnvironmentState {
+    /// Every state, for error messages and exhaustive iteration.
+    pub const ALL: [Self; 3] = [Self::Allowed, Self::Deprecated, Self::Blocked];
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Allowed => "allowed",
@@ -157,13 +161,41 @@ pub enum GetPolicyError {
     Database(#[from] sqlx::Error),
 }
 
+/// Who last changed a row, when and why, as the row records it. Not policy
+/// history: see the crate docs for what `updated_at` can't be used for.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordedChange {
+    pub updated_at: time::OffsetDateTime,
+    /// `None` for a change no user made, or once that user was deleted.
+    pub updated_by: Option<UserId>,
+    pub reason: String,
+}
+
+/// The policy as [`get`] reads it, plus each row's [`RecordedChange`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeEnvironmentPolicyRecord {
+    pub policy: RuntimeEnvironmentPolicy,
+    /// The policy row's last change. `None` at the bootstrap generation, which
+    /// no writer made and which carries no reason.
+    pub last_change: Option<RecordedChange>,
+    /// The last change of each environment's state, keyed like
+    /// [`RuntimeEnvironmentPolicy::environments`].
+    pub environment_changes: BTreeMap<EnvironmentReference, RecordedChange>,
+}
+
 #[derive(sqlx::FromRow)]
 struct PolicyStateRow {
     generation: i64,
     default_environment_ref: Option<String>,
     legacy_unbound_allowed: Option<bool>,
+    policy_updated_at: time::OffsetDateTime,
+    policy_updated_by_user_id: Option<UserId>,
+    policy_reason: Option<String>,
     environment_ref: Option<String>,
     state: Option<String>,
+    state_updated_at: Option<time::OffsetDateTime>,
+    state_updated_by_user_id: Option<UserId>,
+    state_reason: Option<String>,
 }
 
 /// Read the whole policy. Accepts a pool or a transaction connection; takes
@@ -171,12 +203,26 @@ struct PolicyStateRow {
 pub async fn get(
     executor: impl sqlx::PgExecutor<'_>,
 ) -> Result<RuntimeEnvironmentPolicy, GetPolicyError> {
+    Ok(get_record(executor).await?.policy)
+}
+
+/// Read the whole policy with who changed each row, when and why. Same
+/// snapshot and failure rules as [`get`], which reads through it.
+pub async fn get_record(
+    executor: impl sqlx::PgExecutor<'_>,
+) -> Result<RuntimeEnvironmentPolicyRecord, GetPolicyError> {
     // One statement, so the policy row and the states come from one snapshot
     // even under READ COMMITTED. The LEFT JOIN keeps the policy row when no
     // environment has a state, and yields no rows when the policy row is gone.
     let rows = sqlx::query_as::<_, PolicyStateRow>(sql!(
         "SELECT p.generation, p.default_environment_ref, p.legacy_unbound_allowed,
-                s.environment_ref, s.state
+                p.updated_at AS policy_updated_at,
+                p.updated_by_user_id AS policy_updated_by_user_id,
+                p.reason AS policy_reason,
+                s.environment_ref, s.state,
+                s.updated_at AS state_updated_at,
+                s.updated_by_user_id AS state_updated_by_user_id,
+                s.reason AS state_reason
          FROM runtime_environment_policy p
          LEFT JOIN runtime_environment_states s ON TRUE"
     ))
@@ -194,10 +240,25 @@ pub async fn get(
         .map(parse_environment)
         .transpose()?;
     let legacy_unbound_allowed = first.legacy_unbound_allowed;
+    // Every writer stamps a reason with its generation bump, so a policy row
+    // without one is the migration's seed.
+    let last_change = first.policy_reason.clone().map(|reason| RecordedChange {
+        updated_at: first.policy_updated_at,
+        updated_by: first.policy_updated_by_user_id,
+        reason,
+    });
 
     let mut environments = BTreeMap::new();
+    let mut environment_changes = BTreeMap::new();
     for row in rows {
-        let (Some(environment), Some(state)) = (row.environment_ref, row.state) else {
+        // The state table's columns are NOT NULL; they're optional here only
+        // because of the LEFT JOIN, which fills all of them or none.
+        let (Some(environment), Some(state), Some(updated_at), Some(reason)) = (
+            row.environment_ref,
+            row.state,
+            row.state_updated_at,
+            row.state_reason,
+        ) else {
             continue;
         };
         let environment = parse_environment(&environment)?;
@@ -208,14 +269,59 @@ pub async fn get(
                 source,
             })?;
         environments.insert(environment, state);
+        environment_changes.insert(
+            environment,
+            RecordedChange {
+                updated_at,
+                updated_by: row.state_updated_by_user_id,
+                reason,
+            },
+        );
     }
 
-    Ok(RuntimeEnvironmentPolicy {
-        generation,
-        default_environment,
-        legacy_unbound_allowed,
-        environments,
+    Ok(RuntimeEnvironmentPolicyRecord {
+        policy: RuntimeEnvironmentPolicy {
+            generation,
+            default_environment,
+            legacy_unbound_allowed,
+            environments,
+        },
+        last_change,
+        environment_changes,
     })
+}
+
+/// Read only the cluster default, without the state rows. Unlike [`get`], an
+/// environment whose stored state this build can't read doesn't fail it, so a
+/// caller that needs only the default can still act while that row awaits
+/// repair. Takes no lock.
+pub async fn get_default(
+    executor: impl sqlx::PgExecutor<'_>,
+) -> Result<Option<EnvironmentReference>, GetPolicyError> {
+    let row = sqlx::query_as::<_, (Option<String>,)>(sql!(
+        "SELECT default_environment_ref FROM runtime_environment_policy WHERE singleton"
+    ))
+    .fetch_optional(executor)
+    .await?;
+    let Some((default,)) = row else {
+        return Err(GetPolicyError::PolicyRowMissing);
+    };
+    default.as_deref().map(parse_environment).transpose()
+}
+
+/// Read only the policy generation, for a caller deciding whether a write
+/// conditional on one could still apply. Like [`get_default`], an unreadable
+/// state row doesn't fail it. Takes no lock.
+pub async fn get_generation(executor: impl sqlx::PgExecutor<'_>) -> Result<u64, GetPolicyError> {
+    let row = sqlx::query_as::<_, (i64,)>(sql!(
+        "SELECT generation FROM runtime_environment_policy WHERE singleton"
+    ))
+    .fetch_optional(executor)
+    .await?;
+    let Some((generation,)) = row else {
+        return Err(GetPolicyError::PolicyRowMissing);
+    };
+    u64::try_from(generation).map_err(|_| GetPolicyError::InvalidGeneration(generation))
 }
 
 fn parse_environment(value: &str) -> Result<EnvironmentReference, GetPolicyError> {

@@ -2,7 +2,7 @@ use std::{convert::Infallible, fmt::Display, io::Write, time::Duration};
 
 use axum::{
     body::{Body, Bytes, to_bytes},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
@@ -23,6 +23,17 @@ use super::{
 
 pub(super) const E2B_CONNECT_JSON_BODY_LIMIT_BYTES: usize = 1024 * 1024;
 const ECW_BACKEND_BUSY_RETRY_AFTER: Duration = Duration::from_secs(1);
+
+/// Match envd's header units, positive Go-duration bound, and fallback.
+pub(super) fn keepalive_interval(headers: &HeaderMap) -> Duration {
+    let seconds = headers
+        .get("Keepalive-Ping-Interval")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0 && *seconds <= (i64::MAX / 1_000_000_000) as u64)
+        .unwrap_or(90);
+    Duration::from_secs(seconds)
+}
 
 pub(super) async fn decode_connect_json_request<T: DeserializeOwned>(
     body: Body,

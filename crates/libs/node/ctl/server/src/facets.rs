@@ -33,8 +33,9 @@ use pplx_space_sbx_mgr_client::proto::{
     StateRequest as SbxStateRequest, StateResponse as SbxStateResponse,
 };
 use pplx_space_template_mgr_client::proto::{
-    CreatePoolRequest, DeletePoolRequest, DeleteTemplateRequest, ListTemplatesRequest,
-    PoolStatusRequest, UpdateTemplateSettingsRequest, UpdateTemplateSnapshotPolicyRequest,
+    CreatePoolRequest, DeleteIdleTemplateRequest, DeletePoolRequest, DeleteTemplateRequest,
+    ListTemplatesRequest, PoolStatusRequest, UpdateTemplateSettingsRequest,
+    UpdateTemplateSnapshotPolicyRequest,
 };
 use tonic::{Code, Request};
 
@@ -55,6 +56,7 @@ mod runtime_provisioning;
 pub(crate) use runtime_provisioning::Provisioning;
 mod sandbox_desired_state;
 mod template_desired_state;
+mod unanswered_templates;
 
 use cluster_deleted_eviction::*;
 use inventory_publish::*;
@@ -63,6 +65,7 @@ pub use network_policy::*;
 use port_exposure::*;
 use sandbox_desired_state::*;
 use template_desired_state::*;
+use unanswered_templates::*;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum FacetKind {
@@ -338,9 +341,11 @@ impl FacetKind {
                     .await
                     .map(InboundFacetResult::from_stats)
             }
-            Self::TemplateDesiredState => refresh_template_desired_state(node_id, node_role, scope)
-                .await
-                .map(InboundFacetResult::from_stats),
+            Self::TemplateDesiredState => {
+                refresh_template_desired_state(node_id, node_role, scope, sync_interval)
+                    .await
+                    .map(InboundFacetResult::from_stats)
+            }
             Self::SandboxInventory | Self::TemplateInventory | Self::NodeStatus => {
                 Ok(InboundFacetResult::default())
             }

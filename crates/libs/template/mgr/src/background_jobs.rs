@@ -34,9 +34,7 @@
 //!
 //! ## Idempotency
 //!
-//! Submissions use `dedup_key = "{name}@{build_dir}"` (the content hash,
-//! plus `@{environment}` for a build in an environment's cache
-//! partition), so a
+//! Submissions use `dedup_key = "{name}@{content_hash}"`, so a
 //! flapping nodemgr that produces multiple finalize failures for the
 //! same build coalesces to a single in-flight job. The executor
 //! itself is idempotent — re-stamping an already-stamped subvolume
@@ -61,42 +59,13 @@ const MAX_ATTEMPTS: i32 = 10;
 pub struct StampPayload {
     pub name: String,
     pub content_hash: String,
-    /// Environment of the build's cache partition. Absent for the legacy
-    /// partition, including every job enqueued before partitions existed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub partition_environment: Option<pplx_space_common_core::types::EnvironmentReference>,
 }
 
 impl StampPayload {
-    pub fn new(
-        name: &str,
-        content_hash: &str,
-        partition: pplx_space_common_core::types::TemplateCachePartition,
-    ) -> Self {
-        Self {
-            name: name.to_string(),
-            content_hash: content_hash.to_string(),
-            partition_environment: partition.environment(),
-        }
-    }
-
-    pub fn partition(&self) -> pplx_space_common_core::types::TemplateCachePartition {
-        use pplx_space_common_core::types::TemplateCachePartition;
-        self.partition_environment.map_or(
-            TemplateCachePartition::Legacy,
-            TemplateCachePartition::Environment,
-        )
-    }
-
-    /// Stable dedup key so concurrent re-enqueues of the same build
-    /// coalesce to one in-flight job. Legacy builds keep the
-    /// `{name}@{content_hash}` key.
+    /// Stable dedup key so concurrent re-enqueues of the same
+    /// `(name, content_hash)` coalesce to one in-flight job.
     pub fn dedup_key(&self) -> String {
-        format!(
-            "{}@{}",
-            self.name,
-            self.partition().build_dir_name(&self.content_hash)
-        )
+        format!("{}@{}", self.name, self.content_hash)
     }
 }
 
@@ -146,7 +115,6 @@ mod stamp {
         let result = crate::btrfs_via_nodemgr::finalize_template_subvolume(
             &payload.name,
             &payload.content_hash,
-            payload.partition(),
         )
         .await;
         classify_finalize_result(result, &payload)
@@ -169,7 +137,6 @@ mod stamp {
                 tracing::info!(
                     template = %payload.name,
                     content_hash = %payload.content_hash,
-                    cache_partition = %payload.partition(),
                     %received_uuid,
                     "template_stamp job: finalize succeeded (via nodemgr)"
                 );
@@ -185,14 +152,14 @@ mod stamp {
                 // nothing. Surface as permanent so the metric makes
                 // it operationally visible.
                 Err(JobError::permanent(format!(
-                    "template {} digest dir is not a btrfs subvolume; \
+                    "template {}@{} digest dir is not a btrfs subvolume; \
                      btrfs-send codec permanently unavailable for this build",
-                    payload.dedup_key()
+                    payload.name, payload.content_hash
                 )))
             }
             Err(err) => Err(JobError::retriable(format!(
-                "template_stamp {}: {err}",
-                payload.dedup_key()
+                "template_stamp {}@{}: {err}",
+                payload.name, payload.content_hash
             ))),
         }
     }

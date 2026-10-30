@@ -483,55 +483,6 @@ fn restore_provenance_classifies_legacy_remote_metadata() {
     assert_eq!(provenance, SandboxRestoreProvenance::RemoteMetadataUnknown);
 }
 
-/// A start looks up the template preferring the sandbox's own environment,
-/// so a twin cached for it supplies the disk and defaults its binding needs.
-#[tokio::test]
-async fn sandbox_starts_prefer_the_build_of_their_saved_environment() {
-    use pplx_space_common_core::types::{Arch, Digest, EnvironmentReference, ExecutionMetadata};
-    let cache = tempfile::tempdir().unwrap();
-    let conn = crate::db::test_conn();
-    let id = SandboxId::new().to_string();
-    crate::service::tests::service_tests::insert_test_sandbox(
-        &conn,
-        &id,
-        crate::state::SandboxState::Stopped,
-    );
-    let twin = EnvironmentReference::new(Digest::sha256([2; 32]));
-    let execution =
-        ExecutionMetadata::initial_firecracker(Arch::X86_64, vec![]).with_environment(twin);
-    conn.execute(
-        "UPDATE sandboxes SET execution_metadata_json = ?1, template_hash = ?2 WHERE id = ?3",
-        (
-            serde_json::to_string(&execution).unwrap(),
-            format!("sha256:{}", "a".repeat(64)),
-            &id,
-        ),
-    )
-    .unwrap();
-    let sandbox = crate::db::get_sandbox(&conn, &id).unwrap().unwrap();
-    assert_eq!(
-        sandbox_template_preference(&sandbox),
-        Some(twin.to_string())
-    );
-    let templates = crate::template_resolver::fake::FakeTemplateResolver::refusing(
-        tonic::Status::not_found("no build cached"),
-    );
-
-    let _ = template_runtime_defaults_for_sandbox_start(&templates, &sandbox, None).await;
-    let node =
-        crate::node_manager_transport::fake::unbound(cache.path().join("unused.sock").as_path());
-    let _ = template_source_for_sandbox_prepare_in(&node, &templates, &sandbox, cache.path()).await;
-
-    let requests = templates.requests();
-    assert_eq!(requests.len(), 2, "{requests:?}");
-    for request in requests {
-        assert_eq!(
-            request.template.unwrap().environment,
-            Some(twin.to_string())
-        );
-    }
-}
-
 #[tokio::test]
 async fn existing_sandbox_cannot_resolve_a_missing_artifact_by_latest_alias() {
     let conn = crate::db::test_conn();
@@ -553,7 +504,6 @@ async fn existing_sandbox_cannot_resolve_a_missing_artifact_by_latest_alias() {
             name: "app-runtime".into(),
             content_hash: None,
             tag: None,
-            environment: None,
         },
         &sandbox,
     )

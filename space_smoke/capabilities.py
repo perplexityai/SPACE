@@ -792,6 +792,104 @@ class OrphanedRestorePodGcControl(Protocol):
 
 
 @dataclass(frozen=True)
+class NodeTemplatePresence:
+    """The `space.pplx.net/template-build-*` metadata on one Node.
+
+    node-ctl keeps one label per ready local template build and a same-key
+    annotation carrying the build's full content hash.
+    """
+
+    labels: frozenset[str]
+    annotations: Mapping[str, str]
+
+
+@dataclass(frozen=True)
+class NodeCtlFacetRun:
+    """One node-ctl inbound facet's latest run, from `space-nodectl facet status --json`.
+
+    Times are unix seconds, 0 before the first run. node-ctl runs one work
+    item at a time, so `running` false with `last_completed_at` no earlier
+    than `last_started_at` means the latest started run has finished, and
+    `last_success_at` equal to `last_completed_at` that it succeeded.
+    """
+
+    last_started_at: int
+    last_completed_at: int
+    last_success_at: int
+    running: bool
+    last_error: str
+
+
+class UnansweredTemplateEvictionControl(Protocol):
+    """Kind-only operations for node-ctl's unanswered-template cleanup scenario.
+
+    A worker's node-ctl waits an hour before deleting a local template the
+    cluster released, and reads that wait once at start, so the scenario
+    overrides one env key on the worker node-ctl DaemonSet
+    (`SPACE_NODECTL_UNANSWERED_TEMPLATE_EVICT_AFTER_SECS`, to a bounded number
+    of seconds) under its own mutation Lease and puts the captured literal
+    back. The observables are what an operator reads on the
+    worker: `space-tmplmgr list`, the template's digest directories, and the
+    Node's template-build labels and annotations. node-ctl's log is failure
+    evidence only. Instead of waiting for node-ctl's poll, the scenario runs
+    the template desired-state facet on demand and reads the facet's status
+    to know the run finished.
+    """
+
+    def acquire_node_ctl_mutation(self) -> Callable[[], None]:
+        """Take the cluster-visible worker node-ctl DaemonSet Lease; returns its release."""
+        ...
+
+    def unanswered_template_evict_env(self) -> str | None:
+        """The key's literal on the worker node-ctl DaemonSet, None if unset."""
+        ...
+
+    def set_unanswered_template_evict_after(self, seconds: int) -> None:
+        """Set the wait and await the rollout; refuses a value outside 10..600 s."""
+        ...
+
+    def restore_unanswered_template_evict_env(self, standing: str | None) -> None:
+        """Put the captured literal back (None unsets) and await the rollout."""
+        ...
+
+    def running_unanswered_template_evict_env(self, node_name: str) -> str | None:
+        """The key's literal on the node-ctl pod running on that worker, None if unset."""
+        ...
+
+    def other_sandbox_worker_node(self, excluding_node: str) -> str:
+        """A sandbox-pool kube node other than `excluding_node`, or a configuration error."""
+        ...
+
+    def local_template_names(self, node_name: str) -> frozenset[str]:
+        """The template names `space-tmplmgr list` reports on that worker."""
+        ...
+
+    def template_digest_dirs(self, node_name: str, template: str) -> tuple[str, ...]:
+        """Names of the `sha256:*` digest directories under the template, from disk."""
+        ...
+
+    def node_template_presence(self, node_name: str) -> NodeTemplatePresence: ...
+
+    def reconcile_node_ctl_facet(self, node_name: str, facet: str) -> None:
+        """Have that node's node-ctl run inbound `facet` at full scope now (`space-nodectl reconcile`).
+
+        node-ctl's `RefreshFacetState` with no element: the run a poll makes
+        for that facet, followed by an outbound sync. It only enqueues the
+        run; read `node_ctl_facet_run` to see it finish. Raises if node-ctl
+        did not take the request.
+        """
+        ...
+
+    def node_ctl_facet_run(self, node_name: str, facet: str) -> NodeCtlFacetRun:
+        """That node's node-ctl status for inbound `facet`'s latest run."""
+        ...
+
+    def node_ctl_log(self, node_name: str, *, since_time: str) -> str:
+        """That worker's node-ctl log since `since_time`. Failure evidence only."""
+        ...
+
+
+@dataclass(frozen=True)
 class TemplateRecipe:
     """A Dockerfile-plus-SDK template definition, rendered by the SDK adapter."""
 

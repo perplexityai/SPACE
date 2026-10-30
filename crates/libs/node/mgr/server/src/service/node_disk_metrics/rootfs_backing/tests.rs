@@ -10,12 +10,6 @@ fn inventory_includes_each_generation_and_retained_rootfs_without_following_link
     for directory in [
         templates.join("example/sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
         templates.join("example/blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-        // A build cached for another environment.
-        templates.join(format!(
-            "example/sha256:{}@sha256:{}",
-            "e".repeat(64),
-            "f".repeat(64)
-        )),
         templates.join(".staging/sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
         templates.join("example/sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.importing.fixture"),
         templates.join("example/blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.replaced.fixture"),
@@ -38,7 +32,7 @@ fn inventory_includes_each_generation_and_retained_rootfs_without_following_link
 
     let inventory = collect(&sandboxes, &templates).unwrap();
     for (kind, expected) in [
-        (Kind::Template, 4),
+        (Kind::Template, 3),
         (Kind::Instance, 1),
         (Kind::SuspendCheckpoint, 1),
         (Kind::DiskSnapshot, 1),

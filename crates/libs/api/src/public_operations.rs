@@ -77,6 +77,8 @@ const DEFAULT_IDEMPOTENCY_TTL_HOURS: i64 = 24;
 /// controller replicas so the keyed-claim rule sees every committed claim.
 pub const PUBLIC_OPERATION_CLAIM_LOCK_KEY: i64 = 0x7370_6163_655f_6f70;
 
+mod key_bindings;
+pub(crate) use key_bindings::{KEY_BINDING_TTL_MINUTES, bind_idempotency_key};
 mod responses;
 pub(crate) use responses::ResponseAdmissionError;
 mod sandbox_quota;
@@ -2992,15 +2994,21 @@ async fn gc_expired(
     .fetch_all(&mut *tx)
     .await?;
 
+    // The batch's ids are collected first, as an array, so the delete finds
+    // them through the primary key rather than joining the whole table. The
+    // outer `expires_at` check is what a selected row is held to once its
+    // lock is free: a record renewed while this waits on it is rechecked as
+    // renewed and kept.
     let idempotency_rows = sqlx::query_scalar::<_, Uuid>(sql!(
         "DELETE FROM public_idempotency_records
-         WHERE id IN (
+         WHERE id = ANY(ARRAY(
              SELECT id
              FROM public_idempotency_records
              WHERE expires_at <= NOW()
              ORDER BY expires_at ASC, id ASC
              LIMIT $1
-         )
+         ))
+           AND expires_at <= NOW()
          RETURNING id"
     ))
     .bind(max_records)

@@ -24,9 +24,6 @@ use sqlx::{Postgres, Transaction};
 
 use crate::{RuntimeEnvironmentState, UnknownRuntimeEnvironmentState};
 
-/// Upper bound on a reason, in characters, matching the schema's `CHECK`.
-const MAX_REASON_CHARS: usize = 1024;
-
 /// Why a policy changed: 1 to 1024 characters, as the schema requires, and no
 /// NUL, which Postgres text can't hold.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -36,13 +33,19 @@ pub struct PolicyChangeReason(String);
 pub enum PolicyChangeReasonError {
     #[error("a policy change reason must not be empty")]
     Empty,
-    #[error("a policy change reason must be at most {MAX_REASON_CHARS} characters, got {0}")]
+    #[error(
+        "a policy change reason must be at most {max} characters, got {0}",
+        max = PolicyChangeReason::MAX_CHARS
+    )]
     TooLong(usize),
     #[error("a policy change reason must not contain a NUL character")]
     ContainsNul,
 }
 
 impl PolicyChangeReason {
+    /// Upper bound on a reason, in characters, matching the schema's `CHECK`.
+    pub const MAX_CHARS: usize = 1024;
+
     pub fn new(reason: impl Into<String>) -> Result<Self, PolicyChangeReasonError> {
         let reason = reason.into();
         if reason.contains('\0') {
@@ -51,7 +54,7 @@ impl PolicyChangeReason {
         // Postgres `char_length` counts characters, as `chars()` does.
         match reason.chars().count() {
             0 => Err(PolicyChangeReasonError::Empty),
-            count if count > MAX_REASON_CHARS => Err(PolicyChangeReasonError::TooLong(count)),
+            count if count > Self::MAX_CHARS => Err(PolicyChangeReasonError::TooLong(count)),
             _ => Ok(Self(reason)),
         }
     }

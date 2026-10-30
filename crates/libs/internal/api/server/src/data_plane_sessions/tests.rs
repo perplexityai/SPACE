@@ -368,3 +368,73 @@ async fn a_wake_finishing_after_the_route_row_was_read_leaves_the_route_retryabl
     assert_eq!(route_at_rest(pool, row.org_id, row.sandbox_id).await, None);
     Ok(())
 }
+
+#[tokio::test]
+async fn only_a_definite_no_from_the_lifecycle_owner_leaves_a_route_at_rest() {
+    struct Owner(
+        Result<bool, tonic::Code>,
+        std::sync::Mutex<Vec<ImplicitWakeActivity>>,
+    );
+    #[tonic::async_trait]
+    impl crate::ingress_activation::IngressActivation for Owner {
+        async fn prepare(&self, _: SandboxId, _: std::time::Duration) -> Result<(), Status> {
+            Ok(())
+        }
+        async fn queue_implicit_wake(
+            &self,
+            _: SandboxId,
+            activity: ImplicitWakeActivity,
+            _: std::time::Duration,
+        ) -> Result<bool, Status> {
+            self.1.lock().unwrap().push(activity);
+            self.0
+                .map_err(|code| Status::new(code, "synthetic owner failure"))
+        }
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let sandbox_id = SandboxId::new();
+    let access = ImplicitWakeActivity::Access;
+    // Unknown is not "nothing can wake it": the attach stays retryable.
+    assert!(implicit_wake_queued(None, sandbox_id, access, deadline).await);
+    for (answer, queued) in [
+        (Ok(true), true),
+        (Ok(false), false),
+        (Err(tonic::Code::Unavailable), true),
+        // An API from before the request.
+        (Err(tonic::Code::Unimplemented), true),
+    ] {
+        let owner = Owner(answer, Default::default());
+        assert_eq!(
+            implicit_wake_queued(Some(&owner), sandbox_id, access, deadline).await,
+            queued,
+            "{answer:?}"
+        );
+        assert_eq!(
+            *owner.1.lock().unwrap(),
+            vec![access],
+            "the activity is asked about"
+        );
+    }
+}
+
+/// The node judges a first terminal or process attach, which starts the
+/// process, as a command, and a reconnect to a process that already started,
+/// or any file-watch call, as access; the wake the resolver asks for follows.
+#[test]
+fn a_reattach_asks_for_the_wake_the_node_would_allow() {
+    use ImplicitWakeActivity::{Access, Command};
+    for (kind, process_id, activity) in [
+        ("process", None, Command),
+        ("terminal", None, Command),
+        ("process", Some("proc-1"), Access),
+        ("terminal", Some("proc-1"), Access),
+        ("file_watch", None, Access),
+        ("not-a-kind", None, Access),
+    ] {
+        assert_eq!(
+            waiting_activity(kind, process_id),
+            activity,
+            "{kind} {process_id:?}"
+        );
+    }
+}

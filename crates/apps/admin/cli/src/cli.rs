@@ -1,5 +1,6 @@
 use clap::builder::TypedValueParser;
 use clap::{Parser, Subcommand, ValueEnum};
+use pplx_space_common_core::types::EnvironmentReference;
 use pplx_space_common_core::types::admin::AdminNodeSort;
 use std::str::FromStr;
 
@@ -125,6 +126,118 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         command: TemplateCommands,
     },
+    /// Manage the cluster's execution environments.
+    Runtime {
+        #[command(subcommand)]
+        command: RuntimeCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum RuntimeCommands {
+    /// Read and set the execution environment policy
+    /// (/admin/api/v1/runtime-environments).
+    Env {
+        #[command(subcommand)]
+        command: RuntimeEnvCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum RuntimeEnvCommands {
+    /// Show the policy: generation, default, and each environment's state.
+    List {
+        /// Emit the raw JSON response instead of a formatted view.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Make an environment the cluster default. It becomes allowed if it
+    /// isn't, and the previous default stays allowed. The first default also
+    /// stops every environment with no state, so mark the ones to keep first.
+    Default {
+        environment: EnvironmentReference,
+        /// Why, recorded with you on the policy.
+        #[arg(long)]
+        reason: String,
+        /// Set the cluster's first default even though work may depend on
+        /// an environment it stops (one with no state, or one whose state
+        /// doesn't execute), or on a sandbox or in-use template release
+        /// whose environment can't be told.
+        /// Without it, such a write is refused and the counts are shown.
+        /// Later defaults stop nothing.
+        #[arg(long)]
+        strand: bool,
+        /// Apply only if the policy is still at this generation (the one
+        /// `runtime env list` showed), so a write from a stale read is
+        /// refused instead of undoing someone else's change.
+        #[arg(long, value_name = "GENERATION")]
+        if_generation: Option<u64>,
+        /// Emit the raw JSON response.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Set an environment's state. The default must stay allowed.
+    State {
+        environment: EnvironmentReference,
+        state: RuntimeEnvironmentStateArg,
+        /// Why, recorded with you on the policy.
+        #[arg(long)]
+        reason: String,
+        /// Block even though work may still depend on the environment:
+        /// sandboxes or in-use template releases bound to it, or ones whose
+        /// environment can't be told (no binding, an unreadable one, or no
+        /// record). Without it, such a block is refused and the counts are
+        /// shown. A block of an environment that already doesn't execute
+        /// needs none.
+        #[arg(long)]
+        strand: bool,
+        /// Apply only if the policy is still at this generation (the one
+        /// `runtime env list` showed), so a write from a stale read is
+        /// refused instead of undoing someone else's change.
+        #[arg(long, value_name = "GENERATION")]
+        if_generation: Option<u64>,
+        /// Emit the raw JSON response.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show each node's enforced policy and whether it matches the cluster's.
+    Nodes {
+        /// Start after this node id (the previous page's next_after).
+        #[arg(long, conflicts_with = "all")]
+        after: Option<uuid::Uuid>,
+        /// Follow next_after through every page.
+        #[arg(long)]
+        all: bool,
+        /// Emit the raw JSON response; with --all, a JSON array of pages.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Count sandboxes and template releases per environment.
+    Population {
+        /// Emit the raw JSON response instead of a formatted table.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// The states `PUT .../{environment}/state` accepts. The server owns the
+/// vocabulary and rejects anything else; this copy lists them in `--help` and
+/// refuses a misspelled one before anything is sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum RuntimeEnvironmentStateArg {
+    Allowed,
+    Deprecated,
+    Blocked,
+}
+
+impl RuntimeEnvironmentStateArg {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Allowed => "allowed",
+            Self::Deprecated => "deprecated",
+            Self::Blocked => "blocked",
+        }
+    }
 }
 
 #[derive(clap::Args)]

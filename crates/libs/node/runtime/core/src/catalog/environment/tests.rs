@@ -334,28 +334,3 @@ fn an_execution_is_attributed_to_the_environment_it_ran_under() {
     .unwrap();
     assert_eq!(attributed(&custom), None);
 }
-
-#[test]
-fn template_cache_partition_keeps_e0_in_the_legacy_layout() {
-    // Template caches file E0 builds in the legacy layout by this reference.
-    // If it changes, startup recovery on every node finds each E0 build in
-    // the wrong partition and drops it with its base snapshots.
-    let e0 = initial_environment_reference().unwrap();
-    assert_eq!(
-        e0.to_string(),
-        "sha256:3168c96b5719ce62543ae53e6641a4eb80416a9f01e5585f6f76c3c70111fa0b"
-    );
-    assert_eq!(
-        template_cache_partition(Some(e0)),
-        TemplateCachePartition::Legacy
-    );
-    assert_eq!(
-        template_cache_partition(None),
-        TemplateCachePartition::Legacy
-    );
-    let other = EnvironmentReference::new(Digest::sha256([9; 32]));
-    assert_eq!(
-        template_cache_partition(Some(other)),
-        TemplateCachePartition::Environment(other)
-    );
-}

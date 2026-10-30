@@ -384,7 +384,6 @@ pub async fn delete_node_template(
                 name,
                 content_hash: Some(content_hash),
                 tag: None,
-                environment: None,
             }),
         };
         let response = match target_role {

@@ -516,6 +516,14 @@ message TemplateDesiredState {
 
 message GetNodeTemplateDesiredStateResponse {
   repeated TemplateDesiredState templates = 1;
+  // Requested templates the cluster keeps present and this worker reports
+  // holding (its published template inventory), but which the worker has no
+  // reason to hold: not generic, no sandbox placed there and no enabled warm
+  // pool. They are left out of `templates`. A worker may delete its copy of
+  // one that stays released for long enough. Only membership is a signal:
+  // a template missing from both lists may be unknown to the cluster, and
+  // builders always get an empty list.
+  repeated string released_templates = 2;
 }
 
 // Cluster execution environment policy. An unset optional field means the

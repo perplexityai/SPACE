@@ -1640,16 +1640,12 @@ impl SandboxManagerService {
         let vmstate_path = snapshot_dir.join("vmstate");
 
         if !vmstate_path.exists() {
-            // The base snapshot of the sandbox's own environment's build, when
-            // cached, so a warm start doesn't restore another environment's
-            // memory state.
             let resolved_template = resolve_template_paths_for_start(
                 self.template_resolver.as_ref(),
                 pplx_space_template_mgr_client::proto::TemplateRef {
                     name: sandbox.template.clone(),
                     content_hash: sandbox.template_hash.clone(),
                     tag: None,
-                    environment: super::create_support::sandbox_template_preference(sandbox),
                 },
                 sandbox,
             )

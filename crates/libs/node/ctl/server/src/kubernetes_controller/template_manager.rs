@@ -129,7 +129,6 @@ async fn ensure_template(
             name: template.to_string(),
             content_hash: content_hash.map(ToOwned::to_owned),
             tag: tag.map(ToOwned::to_owned),
-            environment: None,
         }),
         vcpu: None,
         memory_mib: None,

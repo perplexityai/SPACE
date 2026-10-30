@@ -26,10 +26,40 @@ pub(super) struct CreateSandboxTranslation {
 
 const NETWORK_POLICY_METADATA_KEY: &str = "network.policy";
 const TLS_INTERCEPTION_METADATA_KEY: &str = "network.tls_interception";
+const RESOURCES_METADATA_KEY: &str = "space.resources";
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateResources {
+    vcpu: Option<u32>,
+    memory_mib: Option<u32>,
+}
 
 pub(super) fn translate_create_request(
     mut req: CreateSandboxRequestE2b,
 ) -> Result<CreateSandboxTranslation, E2bApiError> {
+    // Reserved metadata carries SPACE create options through an unmodified SDK.
+    let resources = req
+        .metadata
+        .remove(RESOURCES_METADATA_KEY)
+        .map(|raw| serde_json::from_str::<CreateResources>(&raw))
+        .transpose()
+        .map_err(|error| E2bApiError::bad_request(format!("invalid space.resources: {error}")))?
+        .unwrap_or_default();
+    for (field, value) in [
+        ("vcpu", resources.vcpu),
+        ("memory_mib", resources.memory_mib),
+    ] {
+        // Resource columns are signed 32-bit integers; reject before admission.
+        if let Some(value) = value
+            && (value == 0 || value > i32::MAX as u32)
+        {
+            return Err(E2bApiError::bad_request(format!(
+                "space.resources.{field} must be between 1 and {}",
+                i32::MAX
+            )));
+        }
+    }
     let mut unsupported = Vec::new();
     let network_policy = if let Some(raw) = req.metadata.remove(NETWORK_POLICY_METADATA_KEY) {
         if req.network.is_some()
@@ -117,8 +147,8 @@ pub(super) fn translate_create_request(
             boot_mode: None,
             env: req.env_vars,
             metadata,
-            vcpu: None,
-            memory_mib: None,
+            vcpu: resources.vcpu,
+            memory_mib: resources.memory_mib,
             disk_mib: None,
             file_changes: None,
             auto_lifecycle: Some(auto_lifecycle),

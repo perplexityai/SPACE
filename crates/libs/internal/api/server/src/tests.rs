@@ -7581,6 +7581,7 @@ async fn node_template_and_policy_reads_follow_placement() -> TestResult {
         policy: Vec<String>,
         sandboxes: Vec<String>,
         desired: Vec<(String, Option<bool>)>,
+        released: Vec<String>,
         base: Vec<String>,
     }
     async fn seen_by(
@@ -7591,7 +7592,11 @@ async fn node_template_and_policy_reads_follow_placement() -> TestResult {
         sandbox_id: Uuid,
     ) -> TestResult<Seen> {
         let node_ip = std::net::IpAddr::V4(node_ip);
-        let templates = vec!["private-base".to_string(), "code-runtime".to_string()];
+        let templates = vec![
+            "private-base".to_string(),
+            "code-runtime".to_string(),
+            "hand-registered".to_string(),
+        ];
         let role = Some(role as i32);
         let policy = fixture
             .service
@@ -7638,20 +7643,29 @@ async fn node_template_and_policy_reads_follow_placement() -> TestResult {
                 .into_iter()
                 .map(|t| (t.template, t.present))
                 .collect(),
+            released: desired.released_templates,
             base: base.templates.into_iter().map(|t| t.template).collect(),
         };
         seen.policy.sort();
         seen.desired.sort();
+        seen.released.sort();
         seen.base.sort();
         Ok(seen)
     }
-    fn assert_seen(seen: &Seen, templates: &[&str], sandbox: Option<Uuid>, label: &str) {
+    fn assert_seen(
+        seen: &Seen,
+        templates: &[&str],
+        released: &[&str],
+        sandbox: Option<Uuid>,
+        label: &str,
+    ) {
         let templates: Vec<String> = templates.iter().map(|t| t.to_string()).collect();
         let present: Vec<(String, Option<bool>)> =
             templates.iter().map(|t| (t.clone(), Some(true))).collect();
         assert_eq!(seen.policy, templates, "{label}: policy templates");
         assert_eq!(seen.base, templates, "{label}: base-snapshot templates");
         assert_eq!(seen.desired, present, "{label}: desired templates");
+        assert_eq!(seen.released, released, "{label}: released templates");
         let sandbox: Vec<String> = sandbox.into_iter().map(|id| id.to_string()).collect();
         assert_eq!(seen.sandboxes, sandbox, "{label}: sandboxes");
     }
@@ -7660,9 +7674,9 @@ async fn node_template_and_policy_reads_follow_placement() -> TestResult {
     let worker = ProtoNodeRole::Worker;
 
     let seen = seen_by(&fixture, host, host_ip, worker, sandbox_id).await?;
-    assert_seen(&seen, BOTH, Some(sandbox_id), "active host");
+    assert_seen(&seen, BOTH, &[], Some(sandbox_id), "active host");
     let seen = seen_by(&fixture, other, other_ip, worker, sandbox_id).await?;
-    assert_seen(&seen, GENERIC, None, "unplaced worker");
+    assert_seen(&seen, GENERIC, &[], None, "unplaced worker");
     let seen = seen_by(
         &fixture,
         builder,
@@ -7671,7 +7685,7 @@ async fn node_template_and_policy_reads_follow_placement() -> TestResult {
         sandbox_id,
     )
     .await?;
-    assert_seen(&seen, GENERIC, None, "unplaced builder");
+    assert_seen(&seen, GENERIC, &[], None, "unplaced builder");
 
     // A pending migration is a target placement: the destination may read
     // before the sandbox is active there, and the source keeps reading while
@@ -7684,9 +7698,9 @@ async fn node_template_and_policy_reads_follow_placement() -> TestResult {
     .execute(pool)
     .await?;
     let seen = seen_by(&fixture, host, host_ip, worker, sandbox_id).await?;
-    assert_seen(&seen, BOTH, Some(sandbox_id), "migration source");
+    assert_seen(&seen, BOTH, &[], Some(sandbox_id), "migration source");
     let seen = seen_by(&fixture, other, other_ip, worker, sandbox_id).await?;
-    assert_seen(&seen, BOTH, Some(sandbox_id), "migration target");
+    assert_seen(&seen, BOTH, &[], Some(sandbox_id), "migration target");
 
     // Once the sandbox is active only on the destination, the source loses it.
     sqlx::query(sql!(
@@ -7697,12 +7711,14 @@ async fn node_template_and_policy_reads_follow_placement() -> TestResult {
     .execute(pool)
     .await?;
     let seen = seen_by(&fixture, other, other_ip, worker, sandbox_id).await?;
-    assert_seen(&seen, BOTH, Some(sandbox_id), "active destination");
+    assert_seen(&seen, BOTH, &[], Some(sandbox_id), "active destination");
     let seen = seen_by(&fixture, host, host_ip, worker, sandbox_id).await?;
-    assert_seen(&seen, GENERIC, None, "former host");
+    assert_seen(&seen, GENERIC, &[], None, "former host");
 
     // Inventory is what the node reports about itself, so holding a template
-    // is not a placement.
+    // is not a placement. A held template the cluster keeps present but the
+    // node has no reason to hold is released. A template the cluster does not
+    // know, also requested, never is: inventory only lists known templates.
     sqlx::query(sql!(
         "INSERT INTO node_template_inventory (node_id, template_name)
          VALUES ($1, 'private-base')"
@@ -7711,7 +7727,13 @@ async fn node_template_and_policy_reads_follow_placement() -> TestResult {
     .execute(pool)
     .await?;
     let seen = seen_by(&fixture, host, host_ip, worker, sandbox_id).await?;
-    assert_seen(&seen, GENERIC, None, "self-reported inventory");
+    assert_seen(
+        &seen,
+        GENERIC,
+        &["private-base"],
+        None,
+        "self-reported inventory",
+    );
 
     // An enabled warm pool covers registered workers, not builders.
     let config_id: Uuid = sqlx::query_scalar(sql!(
@@ -7726,7 +7748,7 @@ async fn node_template_and_policy_reads_follow_placement() -> TestResult {
     .fetch_one(pool)
     .await?;
     let seen = seen_by(&fixture, host, host_ip, worker, sandbox_id).await?;
-    assert_seen(&seen, GENERIC, None, "disabled pool");
+    assert_seen(&seen, GENERIC, &["private-base"], None, "disabled pool");
     sqlx::query(sql!(
         "UPDATE kubernetes_pool_configs SET enabled = TRUE WHERE id = $1"
     ))
@@ -7734,7 +7756,7 @@ async fn node_template_and_policy_reads_follow_placement() -> TestResult {
     .execute(pool)
     .await?;
     let seen = seen_by(&fixture, host, host_ip, worker, sandbox_id).await?;
-    assert_seen(&seen, BOTH, None, "enabled pool, worker");
+    assert_seen(&seen, BOTH, &[], None, "enabled pool, worker");
     let seen = seen_by(
         &fixture,
         builder,
@@ -7743,7 +7765,7 @@ async fn node_template_and_policy_reads_follow_placement() -> TestResult {
         sandbox_id,
     )
     .await?;
-    assert_seen(&seen, GENERIC, None, "enabled pool, builder");
+    assert_seen(&seen, GENERIC, &[], None, "enabled pool, builder");
     sqlx::query(sql!(
         "UPDATE kubernetes_pool_configs SET enabled = FALSE WHERE id = $1"
     ))
@@ -7768,9 +7790,15 @@ async fn node_template_and_policy_reads_follow_placement() -> TestResult {
         sandbox_id,
     )
     .await?;
-    assert_seen(&seen, BOTH, None, "fresh grant, builder");
+    assert_seen(&seen, BOTH, &[], None, "fresh grant, builder");
     let seen = seen_by(&fixture, host, host_ip, worker, sandbox_id).await?;
-    assert_seen(&seen, GENERIC, None, "fresh grant, worker");
+    assert_seen(
+        &seen,
+        GENERIC,
+        &["private-base"],
+        None,
+        "fresh grant, worker",
+    );
     sqlx::query(sql!("DELETE FROM template_build_base_grants"))
         .execute(pool)
         .await?;
@@ -7797,6 +7825,10 @@ async fn node_template_and_policy_reads_follow_placement() -> TestResult {
         "retiring holder: desired templates"
     );
     assert!(holder.sandboxes.is_empty(), "retiring holder: sandboxes");
+    assert!(
+        holder.released.is_empty(),
+        "retiring holder: released templates"
+    );
     let active = seen_by(&fixture, other, other_ip, worker, sandbox_id).await?;
     assert_eq!(
         active.policy, BOTH,

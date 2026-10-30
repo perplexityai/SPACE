@@ -880,6 +880,54 @@ fn create_operation_payload_is_wire_compatible_with_old_shape() {
     );
 }
 
+/// The wake payload as executors from before `wake_activity` parse it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct PreActivityLifecycleOperationPayload {
+    sandbox_id: PublicSandboxId,
+    action: SandboxLifecycleAction,
+    #[serde(default)]
+    rollback: Option<RollbackSandboxRequest>,
+}
+
+#[test]
+fn wake_payload_without_an_activity_is_wire_compatible_with_old_shape() {
+    let payload = |wake_activity| {
+        SandboxLifecycleOperationPayload {
+            sandbox_id: PublicSandboxId::new(),
+            action: SandboxLifecycleAction::Wake,
+            rollback: None,
+            wake_activity,
+        }
+        .into_json()
+    };
+
+    // With the record off, an older executor parses the system's wake.
+    let unrecorded = payload(None);
+    assert_eq!(
+        unrecorded.as_object().map(|object| object.len()),
+        Some(2),
+        "{unrecorded}"
+    );
+    serde_json::from_value::<PreActivityLifecycleOperationPayload>(unrecorded).unwrap();
+
+    // An older API's wake parses here, recording no activity.
+    let old = serde_json::json!({ "sandbox_id": PublicSandboxId::new(), "action": "wake" });
+    let parsed: SandboxLifecycleOperationPayload = serde_json::from_value(old).unwrap();
+    assert_eq!(parsed.wake_activity, None);
+
+    // A recorded activity is a key an older executor rejects, so it waits
+    // for every executor to read it (`IMPLICIT_WAKE_ACTIVITY_ENV`).
+    for activity in [ImplicitWakeActivity::Command, ImplicitWakeActivity::Access] {
+        let recorded = payload(Some(activity));
+        let parsed: SandboxLifecycleOperationPayload =
+            serde_json::from_value(recorded.clone()).unwrap();
+        assert_eq!(parsed.wake_activity, Some(activity));
+        assert!(serde_json::from_value::<PreActivityLifecycleOperationPayload>(recorded).is_err());
+    }
+}
+
 #[test]
 fn controller_update_request_uses_public_contract_fields() {
     let controller = controller_update_request(public_update_request());
@@ -1245,6 +1293,7 @@ fn claimed_delete_operation(
             sandbox_id: public_sandbox_id,
             action: SandboxLifecycleAction::Delete,
             rollback: None,
+            wake_activity: None,
         })
         .expect("delete payload serializes"),
         attempts: 1,

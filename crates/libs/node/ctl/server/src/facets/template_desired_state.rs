@@ -70,13 +70,22 @@ pub(super) async fn refresh_template_desired_state(
     node_id: &str,
     node_role: Option<NodeRole>,
     scope: FacetScope,
+    sync_interval: Duration,
 ) -> Result<ReconcileStats, String> {
+    let full_scope = matches!(scope, FacetScope::Full);
     let templates = resolve_template_scope(scope).await?;
     let mut stats = ReconcileStats {
         templates_seen: templates.len() as u64,
         ..ReconcileStats::default()
     };
     if templates.is_empty() {
+        if full_scope {
+            // No local templates left: drop every record, as a full answer would.
+            UNANSWERED_TEMPLATES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        }
         return Ok(stats);
     }
 
@@ -86,12 +95,40 @@ pub(super) async fn refresh_template_desired_state(
     let response = cluster
         .get_node_template_desired_state(GetNodeTemplateDesiredStateRequest {
             node_id: node_id.to_string(),
-            templates,
+            templates: templates.clone(),
             role: proto_node_role(node_role),
         })
         .await
         .map_err(|error| format!("cluster template desired-state refresh failed: {error}"))?
         .into_inner();
+    // Only workers delete released templates, and only while that is on.
+    let evict_after = match node_role {
+        Some(NodeRole::Worker) => unanswered_template_evict_after(),
+        _ => None,
+    };
+    let evict_unanswered = evict_after.map_or_else(Vec::new, |after| {
+        let released = response
+            .released_templates
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        UNANSWERED_TEMPLATES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .plan(
+                &templates,
+                &released,
+                full_scope,
+                std::time::Instant::now(),
+                PlanLimits {
+                    after,
+                    // A few missed syncs, so one failed read does not restart
+                    // every wait but an outage does.
+                    max_gap: sync_interval.saturating_mul(3),
+                    limit: UNANSWERED_TEMPLATE_EVICTS_PER_SYNC,
+                },
+            )
+    });
 
     let mut tmpl = pplx_space_template_mgr_client::connect()
         .await
@@ -292,6 +329,25 @@ pub(super) async fn refresh_template_desired_state(
         if applied {
             stats.templates_applied = stats.templates_applied.saturating_add(1);
         }
+    }
+
+    if let Some(after) = evict_after
+        && !evict_unanswered.is_empty()
+    {
+        let deleted = delete_unanswered_templates(
+            &UNANSWERED_TEMPLATES,
+            evict_unanswered,
+            |template| local_templates.contains_key(template),
+            &mut FacetUnansweredTemplateCalls {
+                cluster: &mut cluster,
+                template_manager: &mut tmpl,
+                node_id,
+                node_role,
+            },
+            after,
+        )
+        .await;
+        stats.templates_applied = stats.templates_applied.saturating_add(deleted);
     }
 
     if failures > 0 {

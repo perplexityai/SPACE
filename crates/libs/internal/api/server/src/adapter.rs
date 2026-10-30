@@ -950,6 +950,7 @@ impl ClusterApi for ClusterApiService {
         if templates.is_empty() {
             return Ok(Response::new(GetNodeTemplateDesiredStateResponse {
                 templates: Vec::new(),
+                released_templates: Vec::new(),
             }));
         }
 
@@ -960,6 +961,12 @@ impl ClusterApi for ClusterApiService {
         // `placed` reads the node's sandboxes once per request through the
         // node indexes, and only when a requested template is not generic, so
         // cost tracks the node's sandboxes rather than templates × table size.
+        // Every requested template the cluster knows comes back, with
+        // `admitted` saying whether the node has a reason to hold it; a
+        // present one a worker holds without a reason is released, from the
+        // same snapshot as the admission it failed. Released templates are
+        // limited to what the node reports holding, so the list says nothing
+        // about templates the node does not already have.
         let rows = sqlx::query_as::<_, TemplateDesiredStateRow>(
             sql!("WITH requested AS (
                  SELECT DISTINCT UNNEST($1::TEXT[]) AS template
@@ -1016,7 +1023,41 @@ impl ClusterApi for ClusterApiService {
                         WHEN $2 = 'worker' AND t.desired_state = 'present' AND pp.boot_mode = 'snapshot'
                         THEN COALESCE(li.memory_mib, bsp.snapshot_memory_mib)
                         ELSE NULL
-                    END AS pool_memory_mib
+                    END AS pool_memory_mib,
+                    COALESCE(
+                        (t.visibility = 'generic' AND t.desired_state = 'present')
+                        OR t.name IN (SELECT template_id FROM placed)
+                        OR ($2 = 'worker' AND EXISTS (
+                            SELECT 1
+                            FROM kubernetes_pool_configs pc
+                            JOIN template_releases pr ON pr.id = pc.template_release_id
+                            WHERE pc.enabled
+                              AND pr.template_name = t.name
+                        ))
+                        OR ($2 = 'builder' AND EXISTS (
+                            SELECT 1
+                            FROM template_build_base_grants g
+                            WHERE g.base_template_name = t.name
+                              AND g.org_id = t.org_id
+                              AND ((g.builder_node_id IS NULL
+                                    AND g.granted_at > NOW() - INTERVAL '1 hour')
+                                   OR (g.builder_node_id = $3
+                                       AND g.granted_at > NOW() - INTERVAL '7 days'))
+                        ))
+                        OR (t.desired_state <> 'present' AND EXISTS (
+                            SELECT 1
+                            FROM node_template_inventory nti
+                            WHERE nti.template_name = r.template
+                              AND nti.node_id = $3
+                        )),
+                        FALSE
+                    ) AS admitted,
+                    EXISTS (
+                        SELECT 1
+                        FROM node_template_inventory nti
+                        WHERE nti.template_name = r.template
+                          AND nti.node_id = $3
+                    ) AS held_here
              FROM requested r
              JOIN templates t ON t.name = r.template
              LEFT JOIN template_default_auto_lifecycle_policies al
@@ -1026,32 +1067,7 @@ impl ClusterApi for ClusterApiService {
              LEFT JOIN template_base_snapshot_policies bsp
                     ON bsp.template = r.template
              LEFT JOIN local_inventory li
-                    ON li.template_name = r.template
-             WHERE (t.visibility = 'generic' AND t.desired_state = 'present')
-                OR t.name IN (SELECT template_id FROM placed)
-                OR ($2 = 'worker' AND EXISTS (
-                    SELECT 1
-                    FROM kubernetes_pool_configs pc
-                    JOIN template_releases pr ON pr.id = pc.template_release_id
-                    WHERE pc.enabled
-                      AND pr.template_name = t.name
-                ))
-                OR ($2 = 'builder' AND EXISTS (
-                    SELECT 1
-                    FROM template_build_base_grants g
-                    WHERE g.base_template_name = t.name
-                      AND g.org_id = t.org_id
-                      AND ((g.builder_node_id IS NULL
-                            AND g.granted_at > NOW() - INTERVAL '1 hour')
-                           OR (g.builder_node_id = $3
-                               AND g.granted_at > NOW() - INTERVAL '7 days'))
-                ))
-                OR (t.desired_state <> 'present' AND EXISTS (
-                    SELECT 1
-                    FROM node_template_inventory nti
-                    WHERE nti.template_name = r.template
-                      AND nti.node_id = $3
-                ))"),
+                    ON li.template_name = r.template"),
         )
         .bind(&templates)
         .bind(origin.role.as_str())
@@ -1065,12 +1081,25 @@ impl ClusterApi for ClusterApiService {
             by_name.insert(row.template.clone(), row);
         }
         let mut states = Vec::new();
+        let mut released = Vec::new();
         for template in templates {
-            let Some(row) = by_name.get(&template) else {
-                tracing::warn!(
-                    template,
-                    "node requested desired state for unknown template"
-                );
+            let Some(row) = by_name.get(&template).filter(|row| row.admitted) else {
+                let releasable = by_name.get(&template).is_some_and(|row| {
+                    origin.role == SpaceNodeRole::Worker
+                        && row.held_here
+                        && row
+                            .desired_state
+                            .parse::<DomainTemplateDesiredState>()
+                            .is_ok_and(DomainTemplateDesiredState::is_present)
+                });
+                if releasable {
+                    released.push(template);
+                } else {
+                    tracing::warn!(
+                        template,
+                        "node requested desired state for unknown template"
+                    );
+                }
                 continue;
             };
             let desired_state = row
@@ -1124,6 +1153,7 @@ impl ClusterApi for ClusterApiService {
 
         Ok(Response::new(GetNodeTemplateDesiredStateResponse {
             templates: states,
+            released_templates: released,
         }))
     }
 

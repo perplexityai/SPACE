@@ -10,6 +10,33 @@ use serde_json::Value;
 
 use super::*;
 
+#[test]
+fn keepalive_header_matches_envd_interval_policy() {
+    for (value, seconds) in [
+        (None, 90),
+        (Some("50"), 50),
+        (Some("+1"), 1),
+        (Some("9223372036"), 9223372036),
+        (Some("0"), 90),
+        (Some("-1"), 90),
+        (Some("invalid"), 90),
+        (Some("1.5"), 90),
+        (Some(" 50"), 90),
+        (Some("9223372037"), 90),
+        (Some("18446744073709551616"), 90),
+    ] {
+        let mut headers = HeaderMap::new();
+        if let Some(value) = value {
+            headers.insert("Keepalive-Ping-Interval", value.parse().unwrap());
+        }
+        assert_eq!(
+            keepalive_interval(&headers),
+            Duration::from_secs(seconds),
+            "{value:?}"
+        );
+    }
+}
+
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 struct TestMessage {
     value: String,

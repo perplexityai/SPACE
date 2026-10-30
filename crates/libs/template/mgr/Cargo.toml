@@ -56,7 +56,6 @@ pplx-space-metrics = { workspace = true }
 pplx-space-feature-flags = { workspace = true }
 pplx-space-node-api-client = { workspace = true }
 pplx-space-node-mgr-client = { workspace = true }
-pplx-space-node-runtime-core = { workspace = true }
 pplx-space-net-common = { workspace = true, features = ["serde"] }
 pplx-space-observability = { workspace = true, default-features = false }
 pplx-space-sbx-mgr-client = { workspace = true }

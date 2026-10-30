@@ -235,6 +235,22 @@ impl AdminClient {
         Ok(render_warm_pool_config(config))
     }
 
+    /// Send `request` with a 30-second budget and return its pretty-printed
+    /// body, or the server's status and error body as [`CliError::Api`].
+    pub(crate) async fn send(&self, request: reqwest::RequestBuilder) -> Result<String, CliError> {
+        let response = request
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|err| CliError::Transport(err.to_string()))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|err| CliError::Transport(err.to_string()))?;
+        interpret_response(status, &body)
+    }
+
     async fn get(&self, url: &str) -> Result<String, CliError> {
         let response = self
             .http

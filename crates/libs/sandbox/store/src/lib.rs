@@ -508,7 +508,8 @@ pub async fn restore_owner_active(
     .unwrap_or(false))
 }
 
-/// A sandbox's stored lifecycle and whether something is about to activate it.
+/// A sandbox's stored lifecycle and policy, and whether something is about to
+/// activate it.
 #[derive(Clone, Debug, sqlx::FromRow)]
 pub struct SandboxActivationObservation {
     /// The stored value, a `String` as on [`SandboxRecord::lifecycle`].
@@ -516,13 +517,15 @@ pub struct SandboxActivationObservation {
     /// An operation that brings the sandbox back to running (start, resume,
     /// restore or wake) is queued or running for it.
     pub activation_pending: bool,
+    /// The sandbox's stored lifecycle policy, read with the lifecycle.
+    pub auto_lifecycle: sqlx::types::Json<pplx_space_common_core::types::AutoLifecyclePolicy>,
 }
 
-/// Observe the org's sandbox's lifecycle and pending activation, the sandbox
-/// also named by its operation `target_id`. One statement, so an activation
-/// that finishes meanwhile is seen with the lifecycle it left behind, never
-/// as an old lifecycle with no activation coming. `None` when the org has no
-/// such sandbox. Observation only: it never claims the work.
+/// Observe the org's sandbox's lifecycle, policy and pending activation, the
+/// sandbox also named by its operation `target_id`. One statement, so an
+/// activation that finishes meanwhile is seen with the lifecycle it left
+/// behind, never as an old lifecycle with no activation coming. `None` when
+/// the org has no such sandbox. Observation only: it never claims the work.
 pub async fn activation_observation(
     executor: impl sqlx::PgExecutor<'_>,
     org_id: OrgId,
@@ -531,6 +534,7 @@ pub async fn activation_observation(
 ) -> Result<Option<SandboxActivationObservation>, SandboxStoreError> {
     Ok(sqlx::query_as::<_, SandboxActivationObservation>(sql!(
         "SELECT s.lifecycle,
+                s.auto_lifecycle_json AS auto_lifecycle,
                 EXISTS (
                     SELECT 1
                       FROM public_operations

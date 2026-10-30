@@ -380,3 +380,35 @@ pub fn record_template(entry: AdminTemplateAuditEntry<'_>) {
         error = entry.error.unwrap_or(""),
     );
 }
+
+/// Parameters for a runtime environment policy write's audit entry.
+pub(super) struct AdminRuntimeEnvironmentAuditEntry<'a> {
+    pub actor: &'a User,
+    pub action: &'a str,
+    pub environment_ref: &'a str,
+    pub requested_state: &'a str,
+    pub reason: &'a str,
+    /// The caller waived the check for work a write would strand.
+    pub strand: bool,
+    /// The generation the write produced; `None` when it was refused.
+    pub generation: Option<u64>,
+    pub success: bool,
+    pub error: Option<&'a str>,
+}
+
+pub(super) fn record_runtime_environment(entry: AdminRuntimeEnvironmentAuditEntry<'_>) {
+    tracing::info!(
+        target: "space.admin.audit",
+        event = "admin_audit",
+        actor_user_id = %entry.actor.id,
+        actor_email = %entry.actor.email,
+        action = entry.action,
+        environment_ref = entry.environment_ref,
+        requested_state = entry.requested_state,
+        reason = entry.reason,
+        strand = entry.strand,
+        generation = entry.generation,
+        success = entry.success,
+        error = entry.error.unwrap_or(""),
+    );
+}

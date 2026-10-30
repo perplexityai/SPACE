@@ -1,15 +1,10 @@
--- With template-manager stopped, apply with a migrator that bundles this
--- migration (`space-db-migrator template-manager down`), which also removes
--- its history row; an older template-manager refuses a database that still
--- records it. docs/execution-environments.md has the full rollback procedure.
---
--- Restores the pre-partition keys. Only legacy-partition rows fit them, so
--- rows of environment partitions are dropped; their on-disk directories are
--- left for an operator to remove. Before starting an older template-manager,
--- remove each `{name}/snapshots/{hash}@{environment}` directory, which its
--- startup recovery would register as snapshot rows of an invalid hash, and
--- delete each `{name}/{hash}@{environment}` build directory, a read-only
--- subvolume on btrfs hosts, with `btrfs subvolume delete`.
+-- Down migration of the retired 20261026220935_template_cache_partitions,
+-- kept verbatim except for this header. The migration isn't bundled, so
+-- `pplx-space-sqlite` runs this file itself when a database still records it
+-- and holds no environment-partition build, tag pin or unfinished stamp job,
+-- then removes its history row. The DELETE and the `WHERE cache_partition = ''`
+-- filters then drop only finished environment stamp jobs and, as the up
+-- migration did, child rows whose build is gone.
 
 -- An older template-manager reads every stamp job as the legacy build's, so
 -- the other partitions' jobs go with their rows.

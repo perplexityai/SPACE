@@ -76,6 +76,38 @@ This is not a mechanism for changing schema or data behavior: those
 changes still require a new migration. Rollbacks to versions predating a registry
 entry can reject a database created with the revised SQL.
 
+## Retired template-manager migration
+
+Template-manager's `20261026220935_template_cache_partitions` was withdrawn
+after some nodes had applied it, so a release that doesn't bundle it can find
+it recorded. Its SQL is kept in `db/template-manager/history/`. When such a
+release migrates a database that records the migration with its original
+checksum and holds no environment-partition build, tag pin or unfinished
+environment `template_stamp` job, the runner applies the down SQL and removes
+the history row in one transaction. The down SQL also drops child rows whose
+build is gone and finished environment stamp jobs, which carry nothing to
+keep, so no rollback step beyond the image is needed for the database. Only
+`up` and template-manager's own startup reverse it; `space-db-migrator
+template-manager down` and `status` don't.
+
+Where a rollout runs `space-db-migrator` in an init container beside the
+serving pod, that pod still names `cache_partition` after the reversal, so its
+reads and writes fail until it exits.
+
+The check counts rows only. A `{hash}@{environment}` build or snapshot
+directory left without a row stays on disk, and the release's startup recovery
+can register a snapshot directory as a row; remove such directories first.
+
+A database holding an environment-partition build, tag pin or unfinished
+environment stamp job is refused before any write: reversing it would drop
+that row. Keep running a release that bundles the migration on that node.
+
+This release's template-manager writes succeed on either schema, so it can
+keep serving while a migrator re-applies the migration. That holds only for the
+original SQL: the same version and checksum, `cache_partition` defaulting to
+`''`, and no other unique constraint on the four tables. A catalog that bundles
+the version again applies it normally.
+
 ## Console password provisioning
 
 The password hash marker `!` locks console password login and rejects existing

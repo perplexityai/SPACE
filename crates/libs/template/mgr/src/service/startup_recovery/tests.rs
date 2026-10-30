@@ -124,13 +124,7 @@ fn parse_manifest_rejects_files_map_key_with_dot_prefix() {
 fn manifest_self_consistency_accepts_canonical_manifest() {
     let fixture = write_digest_fixture(b"rootfs-bytes", b"zst-bytes");
     let manifest = canonical_manifest(&fixture);
-    validate_manifest_self_consistency(
-        &fixture.rootfs_hash,
-        crate::db::TemplateCachePartition::Legacy,
-        &manifest,
-        &TemplateMetadata::default(),
-    )
-    .unwrap();
+    validate_manifest_self_consistency(&fixture.rootfs_hash, &manifest).unwrap();
 }
 
 #[test]
@@ -138,13 +132,7 @@ fn manifest_self_consistency_rejects_content_hash_mismatch() {
     let fixture = write_digest_fixture(b"rootfs-bytes", b"zst-bytes");
     let mut manifest = canonical_manifest(&fixture);
     manifest.content_hash = sha256_content_hash(b"different");
-    let err = validate_manifest_self_consistency(
-        &fixture.rootfs_hash,
-        crate::db::TemplateCachePartition::Legacy,
-        &manifest,
-        &TemplateMetadata::default(),
-    )
-    .unwrap_err();
+    let err = validate_manifest_self_consistency(&fixture.rootfs_hash, &manifest).unwrap_err();
     assert!(matches!(
         err,
         DigestDirRejection::ContentHashDisagreesWithDirName { .. }
@@ -156,13 +144,7 @@ fn manifest_self_consistency_rejects_empty_bootable_artifact() {
     let fixture = write_digest_fixture(b"rootfs-bytes", b"zst-bytes");
     let mut manifest = canonical_manifest(&fixture);
     manifest.bootable_artifact.clear();
-    let err = validate_manifest_self_consistency(
-        &fixture.rootfs_hash,
-        crate::db::TemplateCachePartition::Legacy,
-        &manifest,
-        &TemplateMetadata::default(),
-    )
-    .unwrap_err();
+    let err = validate_manifest_self_consistency(&fixture.rootfs_hash, &manifest).unwrap_err();
     assert!(matches!(
         err,
         DigestDirRejection::BootableArtifactNotDeclared
@@ -174,13 +156,7 @@ fn manifest_self_consistency_rejects_missing_bootable_entry() {
     let fixture = write_digest_fixture(b"rootfs-bytes", b"zst-bytes");
     let mut manifest = canonical_manifest(&fixture);
     manifest.files.remove(TEMPLATE_ROOTFS_FILE);
-    let err = validate_manifest_self_consistency(
-        &fixture.rootfs_hash,
-        crate::db::TemplateCachePartition::Legacy,
-        &manifest,
-        &TemplateMetadata::default(),
-    )
-    .unwrap_err();
+    let err = validate_manifest_self_consistency(&fixture.rootfs_hash, &manifest).unwrap_err();
     assert!(matches!(
         err,
         DigestDirRejection::BootableEntryAbsentFromFilesMap(_)
@@ -193,13 +169,7 @@ fn manifest_self_consistency_rejects_bootable_digest_mismatch() {
     let mut manifest = canonical_manifest(&fixture);
     manifest.files.get_mut(TEMPLATE_ROOTFS_FILE).unwrap().digest =
         sha256_content_hash(b"different");
-    let err = validate_manifest_self_consistency(
-        &fixture.rootfs_hash,
-        crate::db::TemplateCachePartition::Legacy,
-        &manifest,
-        &TemplateMetadata::default(),
-    )
-    .unwrap_err();
+    let err = validate_manifest_self_consistency(&fixture.rootfs_hash, &manifest).unwrap_err();
     assert!(matches!(
         err,
         DigestDirRejection::BootableEntryDigestDisagreesWithDirName { .. }
@@ -337,7 +307,6 @@ async fn prune_drops_deleting_row_when_artifacts_missing() {
         &crate::db::BuildUpsert {
             name: "seed",
             content_hash: hash,
-            cache_partition: crate::db::TemplateCachePartition::Legacy,
             build_date: "2026-01-01T00:00:00Z",
             manifest_json: "{}",
             runtime: "fc",
@@ -386,7 +355,6 @@ async fn prune_restores_deleting_row_when_artifacts_intact() {
         &crate::db::BuildUpsert {
             name: "seed",
             content_hash: hash,
-            cache_partition: crate::db::TemplateCachePartition::Legacy,
             build_date: "2026-01-01T00:00:00Z",
             manifest_json: "{}",
             runtime: "fc",
@@ -439,300 +407,19 @@ async fn recovery_adopts_blake3_bytes_and_rejects_corruption_without_a_catalog_r
     let service =
         TemplateManagerService::new_with_template_root(crate::db::test_conn(), fixture.dir.path())
             .unwrap();
-    reconcile_digest_dir_against_db(
-        &service,
-        DigestDirBuild {
-            name: "seed",
-            hash_name: hash,
-            partition: crate::db::TemplateCachePartition::Legacy,
-            digest_dir: fixture.dir.path(),
-        },
-    )
-    .await;
+    reconcile_digest_dir_against_db(&service, "seed", hash, fixture.dir.path()).await;
     assert!(
-        crate::db::get_build(
-            &service.db.lock().unwrap(),
-            "seed",
-            hash,
-            crate::db::TemplateCachePartition::Legacy
-        )
-        .unwrap()
-        .is_some()
-    );
-    crate::db::delete_build(
-        &service.db.lock().unwrap(),
-        "seed",
-        hash,
-        crate::db::TemplateCachePartition::Legacy,
-    )
-    .unwrap();
-    std::fs::write(fixture.dir.path().join(TEMPLATE_ROOTFS_FILE), b"bad").unwrap();
-    reconcile_digest_dir_against_db(
-        &service,
-        DigestDirBuild {
-            name: "seed",
-            hash_name: hash,
-            partition: crate::db::TemplateCachePartition::Legacy,
-            digest_dir: fixture.dir.path(),
-        },
-    )
-    .await;
-    assert!(
-        crate::db::get_build(
-            &service.db.lock().unwrap(),
-            "seed",
-            hash,
-            crate::db::TemplateCachePartition::Legacy
-        )
-        .unwrap()
-        .is_none()
-    );
-    assert!(!fixture.dir.path().exists());
-}
-
-fn twin_partition() -> crate::db::TemplateCachePartition {
-    crate::db::TemplateCachePartition::Environment(
-        pplx_space_common_core::types::EnvironmentReference::new(
-            pplx_space_common_core::types::Digest::sha256([2; 32]),
-        ),
-    )
-}
-
-fn bind_manifest(manifest: &mut TemplateManifest, partition: crate::db::TemplateCachePartition) {
-    let execution = pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
-        pplx_space_common_core::types::Arch::X86_64,
-        vec![],
-    );
-    manifest.set_execution_metadata(match partition.environment() {
-        Some(environment) => execution.with_environment(environment),
-        None => execution,
-    });
-}
-
-#[test]
-fn self_consistency_rejects_a_dir_bound_elsewhere() {
-    let fixture = write_digest_fixture(b"rootfs", b"zst-bytes");
-    let mut manifest = canonical_manifest(&fixture);
-    bind_manifest(&mut manifest, crate::db::TemplateCachePartition::Legacy);
-    let err = validate_manifest_self_consistency(
-        &fixture.rootfs_hash,
-        twin_partition(),
-        &manifest,
-        &TemplateMetadata::default(),
-    )
-    .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            DigestDirRejection::PartitionDisagreesWithDirName { .. }
-        ),
-        "{err}"
-    );
-    let mut manifest = canonical_manifest(&fixture);
-    bind_manifest(&mut manifest, twin_partition());
-    validate_manifest_self_consistency(
-        &fixture.rootfs_hash,
-        twin_partition(),
-        &manifest,
-        &TemplateMetadata::default(),
-    )
-    .unwrap();
-    // A legacy-layout dir bound to another environment is no exception.
-    let err = validate_manifest_self_consistency(
-        &fixture.rootfs_hash,
-        crate::db::TemplateCachePartition::Legacy,
-        &manifest,
-        &TemplateMetadata::default(),
-    )
-    .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            DigestDirRejection::PartitionDisagreesWithDirName { .. }
-        ),
-        "{err}"
-    );
-
-    // A manifest without execution metadata takes metadata.json's binding,
-    // as registration does.
-    let unbound = canonical_manifest(&fixture);
-    assert!(unbound.execution.is_none());
-    let mut metadata = TemplateMetadata::default();
-    metadata.set_execution_metadata(
-        pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
-            pplx_space_common_core::types::Arch::X86_64,
-            vec![],
-        )
-        .with_environment(twin_partition().environment().unwrap()),
-    );
-    validate_manifest_self_consistency(&fixture.rootfs_hash, twin_partition(), &unbound, &metadata)
-        .unwrap();
-    let err = validate_manifest_self_consistency(
-        &fixture.rootfs_hash,
-        crate::db::TemplateCachePartition::Legacy,
-        &unbound,
-        &metadata,
-    )
-    .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            DigestDirRejection::PartitionDisagreesWithDirName { .. }
-        ),
-        "{err}"
-    );
-
-    // Unreadable execution metadata keeps a legacy dir's pre-partition
-    // handling, but a partitioned dir can't prove its binding.
-    manifest.schema_version = Some(u32::MAX);
-    validate_manifest_self_consistency(
-        &fixture.rootfs_hash,
-        crate::db::TemplateCachePartition::Legacy,
-        &manifest,
-        &TemplateMetadata::default(),
-    )
-    .unwrap();
-    let err = validate_manifest_self_consistency(
-        &fixture.rootfs_hash,
-        twin_partition(),
-        &manifest,
-        &TemplateMetadata::default(),
-    )
-    .unwrap_err();
-    assert!(
-        matches!(err, DigestDirRejection::ExecutionMetadataInvalid(_)),
-        "{err}"
-    );
-}
-
-/// The binding may sit only in metadata.json, as a pull interrupted before
-/// normalizing its manifest leaves it.
-#[rstest::rstest]
-#[case::in_manifest(false)]
-#[case::in_metadata(true)]
-#[tokio::test]
-async fn recovery_registers_a_twin_dir_in_its_own_partition(#[case] in_metadata: bool) {
-    let fixture = write_digest_fixture(b"twin-rootfs", b"zst-bytes");
-    let mut manifest = canonical_manifest(&fixture);
-    if in_metadata {
-        let mut bound = manifest.clone();
-        bind_manifest(&mut bound, twin_partition());
-        let mut metadata = TemplateMetadata::default();
-        metadata.set_execution_metadata(bound.execution.unwrap());
-        std::fs::write(
-            fixture.dir.path().join("metadata.json"),
-            serde_json::to_vec(&metadata).unwrap(),
-        )
-        .unwrap();
-    } else {
-        bind_manifest(&mut manifest, twin_partition());
-    }
-    write_manifest_json(fixture.dir.path(), &manifest);
-    let service =
-        TemplateManagerService::new_with_template_root(crate::db::test_conn(), fixture.dir.path())
-            .unwrap();
-    reconcile_digest_dir_against_db(
-        &service,
-        DigestDirBuild {
-            name: "seed",
-            hash_name: &fixture.rootfs_hash,
-            partition: twin_partition(),
-            digest_dir: fixture.dir.path(),
-        },
-    )
-    .await;
-    let conn = service.db.lock().unwrap();
-    assert!(
-        crate::db::get_build(&conn, "seed", &fixture.rootfs_hash, twin_partition())
+        crate::db::get_build(&service.db.lock().unwrap(), "seed", hash)
             .unwrap()
             .is_some()
     );
+    crate::db::delete_build(&service.db.lock().unwrap(), "seed", hash).unwrap();
+    std::fs::write(fixture.dir.path().join(TEMPLATE_ROOTFS_FILE), b"bad").unwrap();
+    reconcile_digest_dir_against_db(&service, "seed", hash, fixture.dir.path()).await;
     assert!(
-        crate::db::get_build(
-            &conn,
-            "seed",
-            &fixture.rootfs_hash,
-            crate::db::TemplateCachePartition::Legacy
-        )
-        .unwrap()
-        .is_none()
+        crate::db::get_build(&service.db.lock().unwrap(), "seed", hash)
+            .unwrap()
+            .is_none()
     );
-}
-
-/// A node that predates partitions can hold a build bound to another
-/// environment in the legacy layout, under a legacy row. Recovery drops it
-/// with its base snapshots, so a pull fetches it into its own partition.
-#[tokio::test]
-async fn recovery_drops_a_legacy_dir_bound_to_another_environment() {
-    let root = tempfile::tempdir().unwrap();
-    let fixture = write_digest_fixture(b"legacy-dir-rootfs", b"zst-bytes");
-    let mut manifest = canonical_manifest(&fixture);
-    bind_manifest(&mut manifest, twin_partition());
-    write_manifest_json(fixture.dir.path(), &manifest);
-    let conn = crate::db::test_conn();
-    conn.execute(
-        "INSERT INTO template_builds (name, content_hash, build_date, manifest_json, runtime, arch, created_at)
-         VALUES ('seed', ?1, 'd', ?2, 'fc', 'x86_64', '0')",
-        rusqlite::params![fixture.rootfs_hash, serde_json::to_string(&manifest).unwrap()],
-    )
-    .unwrap();
-    let service = TemplateManagerService::new_with_template_root(conn, root.path()).unwrap();
-    let snapshot = root
-        .path()
-        .join("seed/snapshots")
-        .join(&fixture.rootfs_hash)
-        .join("vcpu1_mem256");
-    std::fs::create_dir_all(&snapshot).unwrap();
-    std::fs::write(snapshot.join("snapshot.base"), b"memory").unwrap();
-
-    reconcile_digest_dir_against_db(
-        &service,
-        DigestDirBuild {
-            name: "seed",
-            hash_name: &fixture.rootfs_hash,
-            partition: crate::db::TemplateCachePartition::Legacy,
-            digest_dir: fixture.dir.path(),
-        },
-    )
-    .await;
-
-    assert!(!fixture.dir.path().exists());
-    assert!(!snapshot.exists());
-    assert!(
-        crate::db::get_build(
-            &service.db.lock().unwrap(),
-            "seed",
-            &fixture.rootfs_hash,
-            crate::db::TemplateCachePartition::Legacy,
-        )
-        .unwrap()
-        .is_none()
-    );
-}
-
-/// A partitioned dir only this code writes must hold its own environment's
-/// build; one that doesn't is dropped.
-#[tokio::test]
-async fn recovery_drops_a_partitioned_dir_bound_elsewhere() {
-    let root = tempfile::tempdir().unwrap();
-    let fixture = write_digest_fixture(b"twin-dir-rootfs", b"zst-bytes");
-    let mut manifest = canonical_manifest(&fixture);
-    bind_manifest(&mut manifest, crate::db::TemplateCachePartition::Legacy);
-    write_manifest_json(fixture.dir.path(), &manifest);
-    let service =
-        TemplateManagerService::new_with_template_root(crate::db::test_conn(), root.path())
-            .unwrap();
-
-    reconcile_digest_dir_against_db(
-        &service,
-        DigestDirBuild {
-            name: "seed",
-            hash_name: &fixture.rootfs_hash,
-            partition: twin_partition(),
-            digest_dir: fixture.dir.path(),
-        },
-    )
-    .await;
-
     assert!(!fixture.dir.path().exists());
 }

@@ -3,6 +3,7 @@ use axum::{
     http::{HeaderValue, header},
     response::IntoResponse,
 };
+use pplx_space_runtime_environment_policy_store::PolicyChangeReason;
 use serde_json::{Map, Value, json};
 
 const ADMIN_LLMS_TXT: &str = "SPACE Admin API\n\n\
@@ -364,6 +365,7 @@ fn admin_openapi_value() -> Value {
     insert_admin_sandbox_create_paths(paths);
     insert_identity_profile_paths(paths);
     insert_audit_event_paths(paths);
+    insert_runtime_environment_paths(paths);
     spec
 }
 
@@ -864,6 +866,150 @@ fn insert_audit_event_paths(paths: &mut Map<String, Value>) {
                     "200": { "description": "Audit event list" },
                     "400": { "description": "Invalid pagination limit" },
                     "403": { "description": "Caller is not a managing organization admin" }
+                }
+            }
+        }),
+    );
+}
+
+fn insert_runtime_environment_paths(paths: &mut Map<String, Value>) {
+    let environment_ref = json!({
+        "type": "string",
+        "pattern": "^(sha256|blake3):[0-9a-f]{64}$",
+        "description": "Execution environment reference"
+    });
+    let reason = json!({
+        "type": "string",
+        "minLength": 1,
+        "maxLength": PolicyChangeReason::MAX_CHARS,
+        "description": "Why the policy changed. Recorded with the caller on the policy row, and on the environment's state row when the write changes it."
+    });
+    let if_match = json!({
+        "name": "If-Match",
+        "in": "header",
+        "required": false,
+        "schema": { "type": "string", "pattern": "^\"?[0-9]+\"?$" },
+        "description": "The policy generation the caller last read, optionally quoted. The write applies only at that generation, compared under the policy row lock; absent, it's unconditional."
+    });
+    paths.insert(
+        "/runtime-environments".to_string(),
+        json!({
+            "get": {
+                "summary": "Get the cluster execution environment policy",
+                "description": "The generation, the default environment, the legacy unbound permission, and every environment with a state, each with who last changed it and why. A null default or legacy permission means nodes keep their configured one. updated_at is trigger-maintained and isn't policy history.",
+                "responses": {
+                    "200": { "description": "Object with generation, default_environment_ref, legacy_unbound_allowed, last_change and environments (environment_ref, state, executes, is_default, last_change)" },
+                    "403": { "description": "Managing organization administrator required" },
+                    "500": { "description": "A stored policy value this server can't read; the error names it" }
+                }
+            }
+        }),
+    );
+    paths.insert(
+        "/runtime-environments/default".to_string(),
+        json!({
+            "put": {
+                "summary": "Set the cluster default execution environment",
+                "parameters": [if_match.clone()],
+                "description": "Records the environment as allowed if it isn't already and increments the generation in the same transaction. The previous default stays allowed. The default can be replaced but never cleared. The first default starts narrowing nodes to the environments that execute, so it needs strand: true while sandboxes, or template releases in use (tagged or pinned by an enabled pool config), are bound to an environment with no state or one that doesn't execute, or while any sandbox's environment can't be told; mark the environments to keep allowed first. Later defaults stop nothing. No check yet that every node can run the new default: a node that applies the policy is to refuse a default it hasn't installed and verified.",
+                "requestBody": {
+                    "required": true,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["environment_ref", "reason"],
+                                "properties": {
+                                    "environment_ref": environment_ref,
+                                    "reason": reason,
+                                    "strand": {
+                                        "type": "boolean",
+                                        "default": false,
+                                        "description": "Set the first default even though work may depend on an environment it stops."
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                "responses": {
+                    "200": { "description": "Object with the new generation and default_environment_ref" },
+                    "400": { "description": "Invalid body, environment reference or reason" },
+                    "403": { "description": "Managing organization administrator required" },
+                    "409": { "description": "The environment is blocked or has a stored state this server doesn't recognize, or the first default would stop work (at_risk carries the environments and counts)" },
+                    "412": { "description": "If-Match named a generation other than the policy's current one; nothing changed" }
+                }
+            }
+        }),
+    );
+    paths.insert(
+        "/runtime-environments/{environment_ref}/state".to_string(),
+        json!({
+            "put": {
+                "summary": "Set an execution environment's state",
+                "description": "allowed and deprecated execute; blocked never executes. Increments the generation in the same transaction. The default must stay allowed, and blocking requires a cluster default. Blocking an environment that still has sandboxes, or template releases in use (a tag points to it or an enabled pool config pins it), bound to it, or while any sandbox has no environment binding, an unreadable one, or no binding record, needs strand: true: unbound legacy work executes as the environment it matches, which the server can't resolve, and a sandbox with no observation from its node may be bound to this one. In-use releases with no or an unreadable binding gate too, since new creates from them may run on the environment that stops. Other template releases, and sandboxes that can't run again (cleanup_required or deleting, or failed with no live evidence and nothing the repair loop could revert to), are reported in at_risk but don't require strand. Blocking an environment that already doesn't execute (blocked, or with no state under a default) normally needs no strand; if another policy write lands while the block waits, the check runs in full. The counts are read just before the write and sandboxes keep changing, so strand is an acknowledgement, not a guarantee.",
+                "parameters": [
+                    { "name": "environment_ref", "in": "path", "required": true, "schema": environment_ref },
+                    if_match
+                ],
+                "requestBody": {
+                    "required": true,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["state", "reason"],
+                                "properties": {
+                                    "state": { "type": "string", "enum": ["allowed", "deprecated", "blocked"] },
+                                    "reason": reason,
+                                    "strand": {
+                                        "type": "boolean",
+                                        "default": false,
+                                        "description": "Block even though work may still depend on the environment: work bound to it, or a sandbox whose environment can't be told. Only accepted with state blocked."
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                "responses": {
+                    "200": { "description": "Object with the new generation, environment_ref and state" },
+                    "400": { "description": "Invalid body, environment reference, state or reason, or strand without blocked" },
+                    "403": { "description": "Managing organization administrator required" },
+                    "409": { "description": "The environment is the default, blocking needs a default first, or work may still be bound to it (at_risk carries the environments and counts)" },
+                    "412": { "description": "If-Match named a generation other than the policy's current one; nothing changed" }
+                }
+            }
+        }),
+    );
+    paths.insert(
+        "/runtime-environments/nodes".to_string(),
+        json!({
+            "get": {
+                "summary": "List each node's published execution policy against the cluster policy",
+                "description": "At most 100 nodes, ordered by node UUID, soft-deleted direct nodes excluded. conformance is unknown when a node hasn't published a readable policy or reports it can't read the cluster policy it persisted, conforms when it doesn't allow legacy unbound work the cluster revoked and, once the cluster has a default, its default matches and it executes nothing the cluster doesn't; it diverges otherwise, with the differences. applied_generation is the cluster generation the node reports applying, null for a node on its startup policy or one that can't read the cluster policy it persisted, and applied_current says whether it's the generation compared with. Conformance compares content, so a node behind on generation still conforms when nothing it would change has changed. status_fresh is false when the node's status snapshot is past stale_after. Use next_after as the after cursor; null means the last page.",
+                "parameters": [
+                    { "name": "after", "in": "query", "schema": { "type": "string", "format": "uuid" } }
+                ],
+                "responses": {
+                    "200": { "description": "Object with generation, default_environment_ref, nodes and a nullable next_after cursor" },
+                    "400": { "description": "Invalid cursor (plain-text body)" },
+                    "403": { "description": "Managing organization administrator required" }
+                }
+            }
+        }),
+    );
+    paths.insert(
+        "/runtime-environments/population".to_string(),
+        json!({
+            "get": {
+                "summary": "Count sandboxes and template releases per execution environment",
+                "description": "Aggregate counts, never a row list. A suspended or restoring sandbox counts under the environment of the snapshot its substrate's restore would pick. On Direct that's the newest full snapshot in any upload state, since restore runs the source node's artifact, or, for a restoring sandbox, the newest from before the restore began. On Kubernetes it's the newest ready full snapshot with a live storage location: while a node drain evacuates the sandbox, the one holding its current local artifact or, with no artifact marker, the newest full snapshot; otherwise, for a suspended sandbox, the one holding its current local artifact or, with no marker, one taken since the last placement, and for a restoring sandbox, the newest from before the restore began. A failed sandbox whose observation the repair loop would read as live (a status other than failed, a pid, or a node assignment) counts under that observation, and one with a live Kubernetes execution but no such observation counts as unrecorded. Otherwise a failed Kubernetes sandbox the repair loop can revert counts under the snapshot it would restore from: its newest ready full snapshot with a live location, the marked one if a current backup holds its marker. Any other failed sandbox can't run again and has no record. Every other sandbox counts under the execution metadata its node last published. unbound counts records with no environment binding, unrecorded counts sandboxes with no record, including suspended ones with no snapshot a restore could pick, and invalid counts bindings this server can't parse. Deletion tombstones aren't counted. Unbound legacy work isn't attributed to the environment it matches.",
+                "responses": {
+                    "200": { "description": "Object with generation, environments (environment_ref, state, is_default, sandboxes, sandboxes_by_lifecycle, sandboxes_not_runnable, template_releases, template_releases_in_use), unbound, unrecorded and invalid" },
+                    "403": { "description": "Managing organization administrator required" }
                 }
             }
         }),

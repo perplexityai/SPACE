@@ -105,6 +105,10 @@ pub(super) struct TemplateDesiredStateRow {
     pub(super) pool_boot_mode: Option<String>,
     pub(super) pool_vcpu: Option<i32>,
     pub(super) pool_memory_mib: Option<i32>,
+    /// The node has a reason to hold the template, so it is answered.
+    pub(super) admitted: bool,
+    /// The node's published inventory lists the template.
+    pub(super) held_here: bool,
 }
 
 /// One row per requested id that exists. The desired-state payload

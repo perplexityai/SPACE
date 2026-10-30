@@ -21,13 +21,7 @@ impl TemplateManagerService {
                 let existing_pool = crate::db::get_pool(&conn, &template)?;
                 let settings = crate::db::get_template_settings(&conn, &template)?;
                 let runtime_defaults = crate::pool_manager::pool_base_build(&conn, &template)?
-                    .map(|build| {
-                        template_runtime_defaults(
-                            &template,
-                            &build.content_hash,
-                            build.cache_partition,
-                        )
-                    })
+                    .map(|build| template_runtime_defaults(&template, &build.content_hash))
                     .unwrap_or_default();
                 Ok::<_, rusqlite::Error>((existing_pool, settings, runtime_defaults))
             })
@@ -90,17 +84,8 @@ impl TemplateManagerService {
                 else {
                     return Ok::<_, Status>(None);
                 };
-                crate::db::get_snapshot(
-                    &conn,
-                    crate::db::SnapshotKey {
-                        name: &t,
-                        content_hash: &build.content_hash,
-                        cache_partition: build.cache_partition,
-                        vcpu,
-                        memory_mib,
-                    },
-                )
-                .map_err(|e| Status::internal(format!("db get_snapshot: {e}")))
+                crate::db::get_snapshot(&conn, &t, &build.content_hash, vcpu, memory_mib)
+                    .map_err(|e| Status::internal(format!("db get_snapshot: {e}")))
             })
             .await
             .map_err(|e| Status::internal(format!("spawn_blocking: {e}")))??;

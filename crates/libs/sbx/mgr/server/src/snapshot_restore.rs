@@ -2784,7 +2784,6 @@ async fn ensure_local_template(
                     name: template_name.to_string(),
                     content_hash: Some(content_hash.to_string()),
                     tag: None,
-                    environment: None,
                 }),
                 vcpu: None,
                 memory_mib: None,

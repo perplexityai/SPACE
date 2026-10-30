@@ -711,16 +711,7 @@ async fn tick(
                     let name = name.to_string();
                     let tag = tag.to_string();
                     let hash = hash.clone();
-                    // Tag resolution names no environment yet; see
-                    // `PinnedDigestsStore`.
-                    move |s| {
-                        s.upsert_tag(
-                            &name,
-                            &tag,
-                            crate::db::TemplateCachePartition::Legacy,
-                            &hash,
-                        )
-                    }
+                    move |s| s.upsert_tag(&name, &tag, &hash)
                 })
                 .await
                 {
@@ -1347,7 +1338,6 @@ fn dispatch_pull(
             Ok(p) => p,
             Err(_) => return, // semaphore closed; daemon shutting down
         };
-        // The release's manifest picks the cache partition.
         let outcome = puller.pull(db, &name, &content_hash, "", trigger).await;
         match outcome {
             crate::volume::PullOutcome::Materialized => {

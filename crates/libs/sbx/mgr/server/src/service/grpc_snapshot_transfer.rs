@@ -195,7 +195,7 @@ impl SandboxManagerService {
 
                                 if use_delta && std::path::Path::new(&rootfs_path).exists() {
                                     let template_rootfs =
-                        pplx_space_common_core::host::linux::paths::cached_template_rootfs_path(
+                        pplx_space_common_core::host::linux::paths::template_rootfs_path(
                             &template,
                             &template_hash,
                         );
@@ -458,11 +458,10 @@ impl SandboxManagerService {
                 }
             }
             if receiver.contains("rootfs.ext4.diff") {
-                let template =
-                    pplx_space_common_core::host::linux::paths::cached_template_rootfs_path(
-                        &header.template_id,
-                        &header.content_hash,
-                    );
+                let template = pplx_space_common_core::host::linux::paths::template_rootfs_path(
+                    &header.template_id,
+                    &header.content_hash,
+                );
                 let diff = format!("{staging}/rootfs.ext4.diff");
                 let dest = format!("{staging}/rootfs.ext4");
                 self.blocking_artifact_io(move |_| {

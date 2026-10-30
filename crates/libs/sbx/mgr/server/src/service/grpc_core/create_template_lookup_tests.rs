@@ -184,7 +184,6 @@ async fn create_checks_auto_lifecycle_authority_before_template_lookup(
                     name: "seed".into(),
                     content_hash: None,
                     tag: None,
-                    environment: None,
                 }),
                 vcpu: None,
                 memory_mib: None,

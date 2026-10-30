@@ -224,7 +224,6 @@ fn upsert_test_build_with_execution(conn: &Connection, name: &str, content_hash:
         &BuildUpsert {
             name,
             content_hash,
-            cache_partition: crate::db::TemplateCachePartition::Legacy,
             build_date: "2026-06-12T00:00:00Z",
             manifest_json: &manifest_json,
             runtime: "fc",
@@ -274,9 +273,6 @@ fn upsert_build_projects_execution_metadata_and_unspecified_role() {
             &BuildUpsert {
                 name: "seed",
                 content_hash: "sha256:build",
-                cache_partition: pplx_space_node_runtime_core::catalog::template_cache_partition(
-                    execution.environment(),
-                ),
                 build_date: "2026-06-12T00:00:00Z",
                 manifest_json: &manifest_json,
                 runtime: "fc",
@@ -361,13 +357,7 @@ fn delete_build_removes_execution_component_rows() {
     conn.pragma_update(None, "foreign_keys", false).unwrap();
     upsert_test_build_with_execution(&conn, "base", "sha256:build");
 
-    delete_build(
-        &conn,
-        "base",
-        "sha256:build",
-        crate::db::TemplateCachePartition::Legacy,
-    )
-    .unwrap();
+    delete_build(&conn, "base", "sha256:build").unwrap();
 
     let component_count: u32 = conn
         .query_row(
@@ -736,7 +726,6 @@ fn ready_build(name: &str, content_hash: &str, size: u64) -> BuildUpsert<'static
     BuildUpsert {
         name: n,
         content_hash: h,
-        cache_partition: crate::db::TemplateCachePartition::Legacy,
         build_date: "2026-01-01T00:00:00Z",
         manifest_json: "{}",
         runtime: "fc",
@@ -749,14 +738,14 @@ fn ready_build(name: &str, content_hash: &str, size: u64) -> BuildUpsert<'static
 /// Regression test: `upsert_build`'s ON CONFLICT path must NOT clobber
 /// a `state='deleting'` row back to `'ready'`. That window
 /// opens when eviction Phase 1 marks deleting, a concurrent
-/// on-demand pull races in (since `resolve_template_build` now
+/// on-demand pull races in (since `resolve_template` now
 /// returns NotFound and the `GetTemplate` handler falls
 /// through to a fresh pull), and the pull's final upsert
 /// would resurrect the doomed row. Eviction's Phase 3 then
 /// DELETEs it, and the on-disk state is indeterminate.
 ///
 /// With the WHERE guard, the upsert is a no-op when state is
-/// 'deleting'. The caller's `resolve_template_build` then still
+/// 'deleting'. The caller's `resolve_template` then still
 /// sees `state='deleting'` → NotFound, no resurrection.
 #[test]
 fn upsert_build_refuses_to_clobber_deleting_state() {
@@ -804,17 +793,17 @@ fn is_build_marked_deleting_matches_state() {
     let conn = test_conn();
     upsert_build(&conn, &ready_build("seed", "sha256:aa", 100)).unwrap();
 
-    assert!(!is_build_marked_deleting(&conn, "seed", "sha256:aa",).unwrap());
+    assert!(!is_build_marked_deleting(&conn, "seed", "sha256:aa").unwrap());
 
     conn.execute(
         "UPDATE template_builds SET state = 'deleting' WHERE name = ?1 AND content_hash = ?2",
         params!["seed", "sha256:aa"],
     )
     .unwrap();
-    assert!(is_build_marked_deleting(&conn, "seed", "sha256:aa",).unwrap());
+    assert!(is_build_marked_deleting(&conn, "seed", "sha256:aa").unwrap());
 
     // Missing row → false (not an error).
-    assert!(!is_build_marked_deleting(&conn, "seed", "sha256:does-not-exist",).unwrap());
+    assert!(!is_build_marked_deleting(&conn, "seed", "sha256:does-not-exist").unwrap());
 }
 
 /// `upsert_build` must seed `last_used_at = created_at` so a
@@ -859,13 +848,7 @@ fn touch_build_updates_last_used_at() {
         .unwrap();
     assert_eq!(before, "1000");
 
-    touch_build(
-        &conn,
-        "seed",
-        "sha256:aa",
-        crate::db::TemplateCachePartition::Legacy,
-    )
-    .unwrap();
+    touch_build(&conn, "seed", "sha256:aa").unwrap();
 
     let after: String = conn
         .query_row(
@@ -889,13 +872,7 @@ fn touch_build_updates_last_used_at() {
 fn touch_build_is_no_op_for_missing_row() {
     let conn = test_conn();
 
-    touch_build(
-        &conn,
-        "seed",
-        "sha256:does-not-exist",
-        crate::db::TemplateCachePartition::Legacy,
-    )
-    .unwrap();
+    touch_build(&conn, "seed", "sha256:does-not-exist").unwrap();
 }
 
 /// `list_eviction_candidates` returns timestamps as parsed u64
@@ -1010,4 +987,168 @@ fn list_template_snapshot_policies_only_returns_explicit_policy() {
     assert_eq!(rows[0].template, "base");
     assert!(!rows[0].ensure_base_snapshot);
     assert!(rows[0].base_snapshot_policy_set_at.is_some());
+}
+
+/// The cache-partition schema of the retired migration 20261026220935.
+const PARTITIONED_SCHEMA_SQL: &str = include_str!(
+    "../../../../../../db/template-manager/history/20261026220935_template_cache_partitions.up.sql"
+);
+
+/// A migrator that bundles the partition migration can apply it under this
+/// release's serving pod, so each upsert inserts and updates on either schema.
+#[test]
+fn upserts_insert_and_update_on_the_bundled_and_partitioned_schemas() {
+    for partitioned in [false, true] {
+        let conn = test_conn();
+        if partitioned {
+            conn.execute_batch(PARTITIONED_SCHEMA_SQL).unwrap();
+        }
+        let build = |conn: &Connection| -> (u64, i64) {
+            let size = get_build(conn, "seed", "sha256:build")
+                .unwrap()
+                .unwrap()
+                .artifact_size_bytes;
+            let components = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM template_build_components WHERE name = 'seed'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            (size, components)
+        };
+
+        upsert_test_build_with_execution(&conn, "seed", "sha256:build");
+        assert_eq!(build(&conn), (1, 1), "partitioned={partitioned}");
+        upsert_build(&conn, &ready_build("seed", "sha256:build", 200)).unwrap();
+        assert_eq!(build(&conn), (200, 0), "partitioned={partitioned}");
+        upsert_test_build_with_execution(&conn, "seed", "sha256:build");
+        assert_eq!(build(&conn), (1, 1), "partitioned={partitioned}");
+        // The eviction guard still applies to the conflicting row.
+        conn.execute(
+            "UPDATE template_builds SET state = 'deleting' WHERE name = 'seed'",
+            [],
+        )
+        .unwrap();
+        upsert_build(&conn, &ready_build("seed", "sha256:build", 300)).unwrap();
+        assert_eq!(build(&conn), (1, 1), "partitioned={partitioned}");
+        conn.execute(
+            "UPDATE template_builds SET state = 'ready' WHERE name = 'seed'",
+            [],
+        )
+        .unwrap();
+
+        upsert_snapshot(&conn, "seed", "sha256:build", 2, 2048, "sha256:first").unwrap();
+        upsert_snapshot(&conn, "seed", "sha256:build", 2, 2048, "sha256:second").unwrap();
+        assert_eq!(
+            list_snapshots(&conn, "seed", "sha256:build")
+                .unwrap()
+                .into_iter()
+                .map(|snapshot| snapshot.snapshot_hash)
+                .collect::<Vec<_>>(),
+            ["sha256:second"],
+            "partitioned={partitioned}"
+        );
+
+        let store = crate::pinned_digests::PinnedDigestsStore::new(std::sync::Arc::new(
+            std::sync::Mutex::new(conn),
+        ));
+        store.upsert_tag("seed", "latest", "sha256:first").unwrap();
+        store.upsert_tag("seed", "latest", "sha256:build").unwrap();
+        assert_eq!(
+            store.list_pinned_hashes_for_template("seed").unwrap(),
+            ["sha256:build"],
+            "partitioned={partitioned}"
+        );
+
+        if partitioned {
+            let conn = store.conn();
+            let conn = conn.lock().unwrap();
+            let partitions: i64 = conn
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM template_builds WHERE cache_partition != '')
+                          + (SELECT COUNT(*) FROM template_build_components WHERE cache_partition != '')
+                          + (SELECT COUNT(*) FROM template_snapshots WHERE cache_partition != '')
+                          + (SELECT COUNT(*) FROM template_pinned_tags WHERE cache_partition != '')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(partitions, 0, "every write lands in the legacy partition");
+        }
+    }
+}
+
+/// A pool refill names the template's latest ready Firecracker build, so its
+/// runtime and the rootfs sandbox-manager resolves come from one row, and
+/// records the use. A template with only other runtimes' builds gets none.
+#[test]
+fn pool_refills_name_the_latest_firecracker_build_and_touch_it() {
+    let conn = test_conn();
+    let cloud_hypervisor = pplx_space_common_core::types::RuntimeKind::CloudHypervisor.alias();
+    let upsert = |content_hash: &'static str, build_date, runtime| {
+        upsert_build(
+            &conn,
+            &BuildUpsert {
+                build_date,
+                runtime,
+                ..ready_build("seed", content_hash, 1)
+            },
+        )
+        .unwrap();
+        set_last_used_at_for_test(&conn, "seed", content_hash, 0).unwrap();
+    };
+    assert!(
+        crate::pool_manager::pool_refill_build(&conn, "seed")
+            .unwrap()
+            .is_none()
+    );
+    upsert("sha256:ch", "2026-03-01T00:00:00Z", cloud_hypervisor);
+    assert!(matches!(
+        crate::pool_manager::pool_refill_build(&conn, "seed"),
+        Err(crate::pool_manager::PoolError::NoPoolBuild)
+    ));
+    upsert("sha256:old", "2026-01-01T00:00:00Z", "fc");
+    upsert("sha256:new", "2026-02-01T00:00:00Z", "fc");
+
+    let build = crate::pool_manager::pool_refill_build(&conn, "seed")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(build.content_hash, "sha256:new");
+    let last_used = |content_hash: &str| -> String {
+        conn.query_row(
+            "SELECT last_used_at FROM template_builds WHERE content_hash = ?1",
+            [content_hash],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    assert_ne!(last_used("sha256:new"), "0");
+    assert_eq!(last_used("sha256:old"), "0");
+    assert_eq!(last_used("sha256:ch"), "0");
+}
+
+/// Builds with the same date resolve to the larger digest, and a row that
+/// can't be decoded is an error, not a missing build.
+#[test]
+fn latest_build_breaks_date_ties_by_digest_and_reports_bad_rows() {
+    let conn = test_conn();
+    for content_hash in ["sha256:aa", "sha256:bb"] {
+        upsert_build(&conn, &ready_build("seed", content_hash, 1)).unwrap();
+    }
+    assert_eq!(
+        get_latest_build(&conn, "seed")
+            .unwrap()
+            .unwrap()
+            .content_hash,
+        "sha256:bb"
+    );
+
+    conn.execute(
+        "UPDATE template_builds SET artifact_size_bytes = -1 WHERE content_hash = 'sha256:bb'",
+        [],
+    )
+    .unwrap();
+    assert!(get_latest_build(&conn, "seed").is_err());
 }

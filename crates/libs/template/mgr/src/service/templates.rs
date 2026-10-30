@@ -59,6 +59,109 @@ impl TemplateManagerService {
         Ok(Response::new(DeleteTemplateResponse {}))
     }
 
+    /// Delete a template the cluster no longer wants on this node, without
+    /// racing a sandbox create that is about to use it: builds go through the
+    /// GC's eviction with an idle bound instead of `DeleteTemplate`'s
+    /// whole-tree removal (see [`crate::eviction::evict_idle_template`]).
+    pub(super) async fn delete_idle_template(
+        &self,
+        request: Request<crate::proto::DeleteIdleTemplateRequest>,
+    ) -> Result<Response<crate::proto::DeleteIdleTemplateResponse>, Status> {
+        self.authorize_peer(
+            &request,
+            "DeleteIdleTemplate",
+            ALLOW_TEMPLATE_DESIRED_STATE_OPERATOR,
+        )?;
+        let publish_node_state = !crate::node_state_sync::should_skip_node_publish(&request);
+        let crate::proto::DeleteIdleTemplateRequest {
+            template,
+            idle_secs,
+        } = request.into_inner();
+        validate_template_name(&template)?;
+        if idle_secs == 0 {
+            return Err(Status::invalid_argument("idle_secs must be positive"));
+        }
+        let touched_before_secs = jiff::Timestamp::now()
+            .as_second()
+            .max(0)
+            .cast_unsigned()
+            .saturating_sub(idle_secs);
+
+        // Pool members keep the builds referenced, and each refill touches
+        // its build, so the pool goes first, every time: `DeletePool` also
+        // stops members a failed earlier teardown left behind. The eviction
+        // below then refuses until the pool's last touch is older than the
+        // idle period.
+        self.delete_pool(internal_request(DeletePoolRequest {
+            template: template.clone(),
+        }))
+        .await?;
+
+        let dependency_error = |error: String| {
+            Status::unavailable(format!(
+                "cannot check what protects template {template} before deleting it: {error}"
+            ))
+        };
+        let active = fetch_build_referencing_sandbox_keys()
+            .await
+            .map_err(dependency_error)?;
+        let warm_pool = fetch_warm_pool_protected_keys()
+            .await
+            .map_err(dependency_error)?;
+        // Spawned, so a caller that stops waiting cannot interrupt the
+        // eviction between a build's `deleting` swap and its final row delete.
+        let eviction = tokio::spawn({
+            let db = Arc::clone(&self.db);
+            let gate = self.eviction_gate.clone();
+            let name = template.clone();
+            let disk = crate::eviction::EvictionDisk {
+                delete: gc_delete_disk_fn(self.artifact_store.clone()),
+                probe: gc_reaper_probe_fn(self.artifact_store.clone()),
+            };
+            async move {
+                crate::eviction::evict_idle_template(
+                    db,
+                    &gate,
+                    &name,
+                    touched_before_secs,
+                    active,
+                    warm_pool,
+                    disk,
+                )
+                .await
+            }
+        });
+        let outcome = eviction
+            .await
+            .map_err(|e| blocking_join_status("evict idle template", &template, e))?
+            .map_err(|e| Status::internal(format!("evict idle template {template}: {e}")))?;
+
+        // `DeletePool` publishes its own change; this publishes evicted builds.
+        let (changed, result) = match outcome {
+            crate::eviction::IdleTemplateEviction::Evicted => (true, Ok(())),
+            crate::eviction::IdleTemplateEviction::NotFound => (
+                false,
+                Err(Status::not_found(format!("template not found: {template}"))),
+            ),
+            crate::eviction::IdleTemplateEviction::Busy => (
+                false,
+                Err(Status::aborted(format!(
+                    "template cache eviction is running; retry deleting {template} later"
+                ))),
+            ),
+            crate::eviction::IdleTemplateEviction::Kept { evicted, reason } => (
+                evicted > 0,
+                Err(Status::failed_precondition(format!(
+                    "kept template {template}: {reason}"
+                ))),
+            ),
+        };
+        if changed && publish_node_state {
+            crate::node_state_sync::mark_template_dirty(&self.db, &template);
+        }
+        result.map(|()| Response::new(crate::proto::DeleteIdleTemplateResponse {}))
+    }
+
     async fn template_local_state_exists(&self, template: &str) -> Result<bool, Status> {
         let db = Arc::clone(&self.db);
         let name = template.to_string();
@@ -131,16 +234,15 @@ impl TemplateManagerService {
         let nodemgr_deadline =
             tokio::time::Instant::now() + lookup::NODEMGR_SUBVOLUME_DELETE_TIMEOUT;
         for path in &subvolumes {
-            // The digest dir name is the build dir (content hash, plus
-            // `@{environment}` outside the legacy partition) or a
+            // The digest dir name is the build's content hash (or a
             // transient sibling such as `….importing` /
             // `….replaced.<uuid>`, which the build-level delete
-            // detects and cleans locally without the node-mgr RPC.
+            // detects and cleans locally without the node-mgr RPC).
             match path.file_name().and_then(|n| n.to_str()) {
-                Some(build_dir_name) => {
+                Some(content_hash) => {
                     self.remove_build_artifacts_subvolume_aware(
                         template,
-                        build_dir_name,
+                        content_hash,
                         nodemgr_deadline,
                     )
                     .await?;
@@ -228,12 +330,9 @@ impl TemplateManagerService {
                 // Collect all snapshots for each build
                 let mut all_snaps = Vec::new();
                 for build in &builds {
-                    if let Ok(snaps) = crate::db::list_snapshots(
-                        &conn,
-                        &build.name,
-                        &build.content_hash,
-                        build.cache_partition,
-                    ) {
+                    if let Ok(snaps) =
+                        crate::db::list_snapshots(&conn, &build.name, &build.content_hash)
+                    {
                         all_snaps.extend(snaps);
                     }
                 }
@@ -257,8 +356,7 @@ impl TemplateManagerService {
         let mut effective_snapshot_memory_by_requested = HashMap::new();
         for build in &builds {
             let settings = template_settings.get(&build.name);
-            let runtime_defaults =
-                template_runtime_defaults(&build.name, &build.content_hash, build.cache_partition);
+            let runtime_defaults = template_runtime_defaults(&build.name, &build.content_hash);
             let requested_memory_mib = settings
                 .map(|settings| settings.snapshot_memory_mib)
                 .or(runtime_defaults.memory_mib)
@@ -317,11 +415,7 @@ impl TemplateManagerService {
                 // Snapshots for this build
                 let snapshots: Vec<crate::proto::SnapshotInfo> = all_snapshots
                     .iter()
-                    .filter(|s| {
-                        s.name == build.name
-                            && s.content_hash == build.content_hash
-                            && s.cache_partition == build.cache_partition
-                    })
+                    .filter(|s| s.name == build.name && s.content_hash == build.content_hash)
                     .map(|s| crate::proto::SnapshotInfo {
                         vcpu: s.vcpu,
                         memory_mib: s.memory_mib,
@@ -332,11 +426,7 @@ impl TemplateManagerService {
                 let has_base_snapshot = !snapshots.is_empty();
                 let template_name = build.name.clone();
                 let settings = template_settings.get(&template_name);
-                let runtime_defaults = template_runtime_defaults(
-                    &build.name,
-                    &build.content_hash,
-                    build.cache_partition,
-                );
+                let runtime_defaults = template_runtime_defaults(&build.name, &build.content_hash);
                 let snapshot_vcpu = settings
                     .map(|settings| settings.snapshot_vcpu)
                     .or(runtime_defaults.vcpu)
@@ -378,17 +468,12 @@ impl TemplateManagerService {
                     snapshot_cache_size_bytes(
                         &build.name,
                         &build.content_hash,
-                        build.cache_partition,
                         snap.vcpu,
                         snap.memory_mib,
                     )
                 });
 
-                let cache_size_bytes = template_cache_size_bytes(
-                    &build.name,
-                    &build.content_hash,
-                    build.cache_partition,
-                );
+                let cache_size_bytes = template_cache_size_bytes(&build.name, &build.content_hash);
                 let execution = template_execution_proto(&build);
 
                 Ok::<_, Status>(crate::proto::TemplateFullInfo {
@@ -482,10 +567,7 @@ impl TemplateManagerService {
                         .ok()
                         .map(|entries| {
                             entries.flatten().any(|e| {
-                                crate::db::TemplateCachePartition::parse_build_dir_name(
-                                    &e.file_name().to_string_lossy(),
-                                )
-                                .is_some()
+                                e.file_name().to_string_lossy().parse::<Digest>().is_ok()
                                     && e.path().join("rootfs.ext4").exists()
                             })
                         })
@@ -571,17 +653,9 @@ impl TemplateManagerService {
             .map(|m| m.len())
             .map_err(|e| Status::internal(format!("stat rootfs {}: {e}", rootfs_path.display())))?;
 
-        // The build lands in the cache partition of the environment its
-        // metadata binds, so registering a twin never touches its sibling.
-        let partition = metadata_cache_partition(&metadata)?;
-        let digest_dir = build_artifacts_dir(
-            &self.artifact_store.root,
-            template_id,
-            &content_hash,
-            partition,
-        )
-        .display()
-        .to_string();
+        let digest_dir = build_artifacts_dir(&self.artifact_store.root, template_id, &content_hash)
+            .display()
+            .to_string();
 
         // If a build with this same expanded hash already exists,
         // drop the staging copy and short-circuit to a metadata refresh.
@@ -592,7 +666,6 @@ impl TemplateManagerService {
                 .finish_register_with_existing_digest(ExistingDigestRegistration {
                     template_id,
                     content_hash: &content_hash,
-                    partition,
                     digest_dir: &digest_dir,
                     metadata_bytes: metadata_bytes.as_deref(),
                     requested_network_policy: requested_network_policy.as_ref(),
@@ -638,7 +711,6 @@ impl TemplateManagerService {
                     .finish_register_with_existing_digest(ExistingDigestRegistration {
                         template_id,
                         content_hash: &content_hash,
-                        partition,
                         digest_dir: &digest_dir,
                         metadata_bytes: metadata_bytes.as_deref(),
                         requested_network_policy: requested_network_policy.as_ref(),
@@ -672,7 +744,6 @@ impl TemplateManagerService {
                 &crate::db::BuildUpsert {
                     name: &name,
                     content_hash: &hash,
-                    cache_partition: partition,
                     build_date: &date,
                     manifest_json: &manifest_str,
                     runtime: &runtime,
@@ -716,11 +787,6 @@ impl TemplateManagerService {
                 name: template_id.clone(),
                 content_hash: Some(content_hash),
                 tag: None,
-                environment: metadata
-                    .environment()
-                    .ok()
-                    .flatten()
-                    .map(|environment| environment.to_string()),
             }),
             build_date,
         }))
@@ -738,7 +804,6 @@ impl TemplateManagerService {
         let ExistingDigestRegistration {
             template_id,
             content_hash,
-            partition,
             digest_dir,
             metadata_bytes,
             requested_network_policy,
@@ -753,7 +818,7 @@ impl TemplateManagerService {
         )
         .await?;
         register_source.cleanup();
-        let (build_date, environment) = {
+        let build_date = {
             let db = Arc::clone(&self.db);
             let name = template_id.to_string();
             let hash = content_hash.to_string();
@@ -767,15 +832,12 @@ impl TemplateManagerService {
                     &name,
                     requested_network_policy.as_ref(),
                 )?;
-                crate::db::get_build(&conn, &name, &hash, partition)
+                crate::db::get_build(&conn, &name, &hash)
             })
             .await
             .map_err(|e| Status::internal(format!("spawn_blocking: {e}")))?
             .map_err(|e| Status::internal(format!("db get_build: {e}")))?
-            .map(|build| {
-                let environment = build.environment();
-                (build.build_date, environment)
-            })
+            .map(|build| build.build_date)
             .ok_or_else(|| {
                 Status::already_exists(format!(
                     "template '{template_id}' already exists on disk but is not registered"
@@ -798,7 +860,6 @@ impl TemplateManagerService {
                 name: template_id.to_string(),
                 content_hash: Some(content_hash.to_string()),
                 tag: None,
-                environment: environment.map(|environment| environment.to_string()),
             }),
             build_date,
         }))
@@ -808,9 +869,19 @@ impl TemplateManagerService {
 fn template_execution_proto(
     build: &crate::db::BuildRow,
 ) -> Option<pplx_space_execution_common::proto::ExecutionMetadata> {
-    build
-        .execution_metadata()
-        .map(|execution| (&execution).into())
+    let raw = build.execution_metadata_json.as_deref()?;
+    match serde_json::from_str::<pplx_space_common_core::types::ExecutionMetadata>(raw) {
+        Ok(execution) => Some((&execution).into()),
+        Err(error) => {
+            tracing::warn!(
+                template = %build.name,
+                content_hash = %build.content_hash,
+                %error,
+                "stored template execution metadata is invalid"
+            );
+            None
+        }
+    }
 }
 
 /// Inputs for completing a registration against an already-existing digest
@@ -818,7 +889,6 @@ fn template_execution_proto(
 pub(super) struct ExistingDigestRegistration<'a> {
     pub(super) template_id: &'a str,
     pub(super) content_hash: &'a str,
-    pub(super) partition: crate::db::TemplateCachePartition,
     pub(super) digest_dir: &'a str,
     pub(super) metadata_bytes: Option<&'a [u8]>,
     pub(super) requested_network_policy: Option<&'a NetworkPolicyV1>,

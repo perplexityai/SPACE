@@ -740,12 +740,10 @@ fn classify_disk_metric_targets(
             continue;
         }
         for digest in budget.directories(&path)? {
-            // Every cache partition's build dir counts, not only legacy ones.
             if digest.file_name().is_some_and(|n| {
-                pplx_space_common_core::types::TemplateCachePartition::parse_build_dir_name(
-                    &n.to_string_lossy(),
-                )
-                .is_some()
+                n.to_string_lossy()
+                    .parse::<pplx_space_common_core::types::Digest>()
+                    .is_ok()
             }) && regular_file_exists(&digest.join("rootfs.ext4"))?
             {
                 targets.templates.push(path_string(path));

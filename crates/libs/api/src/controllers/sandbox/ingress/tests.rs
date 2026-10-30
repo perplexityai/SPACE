@@ -18,9 +18,18 @@ struct Backend {
     entered: Notify,
     release: Notify,
     outcome: AccessOutcome,
+    wakes_asked: Mutex<Vec<ExecutionActivityKind>>,
 }
 #[tonic::async_trait]
 impl AccessBackend for Backend {
+    async fn queue_implicit_wake(
+        &self,
+        _: SandboxId,
+        activity: ExecutionActivityKind,
+    ) -> Result<bool, Status> {
+        self.wakes_asked.lock().unwrap().push(activity);
+        Ok(false)
+    }
     async fn observe(&self, _: SandboxId) -> Result<Observation, Status> {
         Ok(*self.state.lock().unwrap())
     }
@@ -52,6 +61,7 @@ fn fixture(state: Observation, outcome: AccessOutcome) -> (Arc<Backend>, Activat
         entered: Notify::new(),
         release: Notify::new(),
         outcome,
+        wakes_asked: Mutex::new(Vec::new()),
     });
     let activator = Activator {
         backend: backend.clone(),
@@ -378,4 +388,29 @@ async fn stored_ingress_access_resumes_paused_execution_before_reporting_ready()
         }
     }
     Ok(())
+}
+
+/// The resolver names what the waiting session will do; an activity it does
+/// not name is access, the stricter rule.
+#[tokio::test]
+async fn a_queued_implicit_wake_is_judged_for_the_activity_the_resolver_names() {
+    let (backend, activator) = fixture(suspended(false), AccessOutcome::Ready);
+    for activity in [
+        ImplicitWakeActivity::Command,
+        ImplicitWakeActivity::Access,
+        ImplicitWakeActivity::Unspecified,
+    ] {
+        activator
+            .queue_implicit_wake(SandboxId::new(), activity, Duration::from_secs(1))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        *backend.wakes_asked.lock().unwrap(),
+        vec![
+            ExecutionActivityKind::Command,
+            ExecutionActivityKind::Access,
+            ExecutionActivityKind::Access,
+        ]
+    );
 }

@@ -2,7 +2,11 @@
 //! operator-authorization gate, and timestamp formatting. Route modules stay
 //! focused on their own HTTP surface and state machines.
 
-use axum::{Json, http::StatusCode, response::IntoResponse};
+use axum::{
+    Json,
+    http::{HeaderMap, StatusCode, header},
+    response::IntoResponse,
+};
 use pplx_space_common_svc::sql::contention;
 use time::OffsetDateTime;
 
@@ -220,6 +224,17 @@ pub(super) fn db_error(err: sqlx::Error) -> (StatusCode, Json<serde_json::Value>
     api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
 }
 
+/// The response for a database failure on a statement that wrote nothing,
+/// with a lost lock race classified as [`ContentionScope::ReadOnly`]: unlike
+/// [`db_error`], it never blames a read for a write the caller didn't make.
+pub(super) fn read_db_error(err: sqlx::Error) -> axum::response::Response {
+    if let Some((status, message)) = contention_disposition(ContentionScope::ReadOnly, &err) {
+        return api_error(status, message).into_response();
+    }
+    tracing::warn!(error = %err, "admin read failed");
+    api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+}
+
 /// Required-JSON-body parser for admin writes. Bodies are never optional
 /// here — an accidental empty POST must not be interpreted as (for example)
 /// an org release — and every request type uses `deny_unknown_fields`, so a
@@ -240,6 +255,23 @@ pub(super) fn parse_json_body<T: serde::de::DeserializeOwned>(
             format!("invalid {what} body: {err}"),
         )
     })
+}
+
+/// The generation an `If-Match` header asks a write to apply at: `None` when
+/// the header is absent, which makes the write unconditional. The error is a
+/// 400 message, so each caller answers it in its own error shape.
+pub(super) fn parse_if_match_generation(headers: &HeaderMap) -> Result<Option<u64>, &'static str> {
+    let Some(value) = headers.get(header::IF_MATCH) else {
+        return Ok(None);
+    };
+    let raw = value
+        .to_str()
+        .map_err(|_| "Invalid If-Match header")?
+        .trim()
+        .trim_matches('"');
+    raw.parse::<u64>()
+        .map(Some)
+        .map_err(|_| "If-Match must be a generation number")
 }
 
 pub(super) fn format_time(value: OffsetDateTime) -> String {

@@ -2,7 +2,6 @@ use std::{
     convert::Infallible,
     pin::Pin,
     task::{Context, Poll},
-    time::Duration as StdDuration,
 };
 
 use axum::{
@@ -1401,13 +1400,7 @@ pub(super) async fn e2b_watch_dir(
             return EcwProxyError::draining().into_response();
         }
     };
-    let keepalive_secs = headers
-        .get("Keepalive-Ping-Interval")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|seconds| *seconds > 0)
-        .unwrap_or(90);
-    let keepalive_interval = StdDuration::from_secs(keepalive_secs);
+    let keepalive_interval = ecw_connect::keepalive_interval(&headers);
     let mut interval = tokio::time::interval_at(
         tokio::time::Instant::now() + keepalive_interval,
         keepalive_interval,

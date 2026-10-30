@@ -855,6 +855,7 @@ async fn native_start_overwrites_a_stopped_written_mid_flight_without_a_retry() 
             sandbox_id: PublicSandboxId::from(sandbox_id),
             action: SandboxLifecycleAction::Start,
             rollback: None,
+            wake_activity: None,
         }
         .into_json(),
         attempts: 1,

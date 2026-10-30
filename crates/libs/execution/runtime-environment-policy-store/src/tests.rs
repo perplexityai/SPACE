@@ -365,6 +365,58 @@ async fn writes_record_the_actor_and_reason() -> TestResult {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn the_bootstrap_record_has_no_change() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let record = get_record(&db.pool).await?;
+    assert_eq!(record.policy, get(&db.pool).await?);
+    assert_eq!(record.last_change, None);
+    assert!(record.environment_changes.is_empty());
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn the_record_reads_back_each_rows_actor_and_reason() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let (e0, e1) = (environment(0), environment(1));
+    set_default_committed(&db.pool, e0).await?;
+    let mut tx = db.pool.begin().await?;
+    let unattributed = PolicyChange {
+        actor: None,
+        reason: PolicyChangeReason::new("deprecate e1")?,
+    };
+    set_environment_state(
+        &mut tx,
+        e1,
+        RuntimeEnvironmentState::Deprecated,
+        &unattributed,
+    )
+    .await?;
+    tx.commit().await?;
+
+    let record = get_record(&db.pool).await?;
+    assert_eq!(record.policy, get(&db.pool).await?);
+    let last_change = record.last_change.expect("a written policy has a change");
+    assert_eq!(last_change.updated_by, None);
+    assert_eq!(last_change.reason, "deprecate e1");
+
+    let e0_change = &record.environment_changes[&e0];
+    assert_eq!(e0_change.updated_by, Some(UserId::from_uuid(SEED_USER)));
+    assert_eq!(e0_change.reason, "set default");
+    let e1_change = &record.environment_changes[&e1];
+    assert_eq!(e1_change.updated_by, None);
+    assert_eq!(e1_change.reason, "deprecate e1");
+    assert_eq!(
+        record.environment_changes.keys().collect::<Vec<_>>(),
+        record.policy.environments.keys().collect::<Vec<_>>(),
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn a_missing_policy_row_is_an_error_not_the_bootstrap_policy() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
@@ -397,6 +449,42 @@ async fn a_missing_policy_row_is_an_error_not_the_bootstrap_policy() -> TestResu
         Err(SetLegacyUnboundAllowedError::PolicyRowMissing)
     ));
     tx.rollback().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn the_default_and_generation_read_past_an_unknown_state() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    assert_eq!(get_default(&db.pool).await?, None);
+    let e0 = environment(0);
+    set_default_committed(&db.pool, e0).await?;
+    sqlx::query(sql!(
+        "INSERT INTO runtime_environment_states (environment_ref, state, reason)
+         VALUES ($1, 'retired', 'from a newer build')"
+    ))
+    .bind(environment(1).to_string())
+    .execute(&db.pool)
+    .await?;
+    assert!(matches!(
+        get(&db.pool).await,
+        Err(GetPolicyError::UnknownState { .. })
+    ));
+    assert_eq!(get_default(&db.pool).await?, Some(e0));
+    assert_eq!(get_generation(&db.pool).await?, 1);
+
+    sqlx::query(sql!("DELETE FROM runtime_environment_policy"))
+        .execute(&db.pool)
+        .await?;
+    assert!(matches!(
+        get_default(&db.pool).await,
+        Err(GetPolicyError::PolicyRowMissing)
+    ));
+    assert!(matches!(
+        get_generation(&db.pool).await,
+        Err(GetPolicyError::PolicyRowMissing)
+    ));
     Ok(())
 }
 
@@ -459,11 +547,8 @@ fn reasons_follow_the_schema_bounds() {
 
 #[test]
 fn states_round_trip_through_their_wire_values() {
-    for state in [
-        RuntimeEnvironmentState::Allowed,
-        RuntimeEnvironmentState::Deprecated,
-        RuntimeEnvironmentState::Blocked,
-    ] {
+    for state in RuntimeEnvironmentState::ALL {
+        assert_eq!(state.to_string(), state.as_str());
         assert_eq!(state.as_str().parse(), Ok(state));
     }
     assert_eq!(

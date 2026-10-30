@@ -108,6 +108,44 @@ The selected template must already be published. `seed` is the compatibility
 default when a create request omits `templateID`; a production deployment will
 usually publish and select a purpose-built runtime template instead.
 
+## Sizing at create
+
+SPACE extends ECW create with the reserved metadata key `space.resources`. Its
+value is a JSON object with optional `vcpu` (CPU count) and `memory_mib` (MiB)
+fields. This lets an unmodified E2B SDK request resources for each new sandbox,
+independently of the template's build defaults:
+
+```python
+import json
+from e2b import Sandbox
+
+sandbox = Sandbox.create(
+    template="seed",
+    metadata={"space.resources": json.dumps({"vcpu": 4, "memory_mib": 8192})},
+)
+```
+
+Use the SPACE domain and API key configured above. This is a SPACE extension,
+not an upstream E2B create option. ECW already uses reserved metadata for
+[full network policies](ecw-network-policy.md). The current upstream E2B create
+schema and Python SDK 2.62.0 do not expose CPU or memory overrides.
+
+Provided values must be positive integers no larger than 2,147,483,647; actual
+allocation remains subject to runtime and available capacity. Malformed JSON,
+unknown fields, and invalid values return HTTP 400. Omitted fields retain the
+normal create defaults. ECW consumes `space.resources`, so it does not appear in
+the sandbox's stored metadata; other metadata is preserved.
+
+An explicit CPU or memory override selects a cold boot, bypassing warm-pool
+and base-snapshot creation. The extension does not resize an existing sandbox,
+change a template, or alter fork, connect, or resume behavior. Requests without
+the extension retain their existing behavior.
+
+Deploy an API version supporting this extension before enabling callers. Older
+versions accept the key as ordinary metadata and do not apply its sizing.
+Callers should verify the allocation returned by `get_info()` and reject an
+undersized sandbox.
+
 ## Compatibility contract
 
 ECW supports the E2B-shaped sandbox create, list, inspect, delete, connect,

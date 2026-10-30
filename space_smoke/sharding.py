@@ -108,6 +108,9 @@ _DURATION_SECONDS = {
         # budget and 60 s grace.
         "local.template_cache_lru_eviction_reclaims": 92,
         "local.template_startup_recovery_decision_table": 45,
+        # A Kind bench run with the 20 s wait took 116 s, 29 s of it the two
+        # node-ctl rollouts (95-96 s with a 10 s wait).
+        "local.unanswered_template_deleted_after_wait": 116,
         "network_policy.v1_cidr_allow": 11,
         "network_policy.v1_cidr_deny": 13,
         "network_policy.v1_deny_precedes_allow": 11,
@@ -140,8 +143,12 @@ _DURATION_SECONDS = {
         # Local Kind runs, with the generator image present or pulled from
         # Docker Hub: 15-18 s, of which SDK generation is 2-5 s.
         "native.m1_generated_sdk_conformance": 20,
+        # Estimate until a bench run refreshes it: three live policy updates,
+        # each waiting for gateway reconcile and an HTTPS probe.
+        "native.network_policy_live_update": 30,
         "native.resident_pause": 5,
         "native_contract.command_validation": 6,
+        "native_contract.file_idempotency_conflict": 5,
         "native_contract.idempotency_conflict": 5,
         "native_contract.tenant_isolation": 5,
         "native_contract.token_scope": 5,

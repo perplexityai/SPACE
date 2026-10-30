@@ -739,6 +739,7 @@ mod not_running {
                     sandbox_id,
                     action: SandboxLifecycleAction::Wake,
                     rollback: None,
+                    wake_activity: None,
                 }
                 .into_json(),
                 idempotency: None,
@@ -844,6 +845,198 @@ mod not_running {
                 send(&fixture, sandbox_id, route, &key, json!({"command": []})).await?;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{route}: {body}");
         }
+        Ok(())
+    }
+
+    /// The activity recorded on each wake operation for `sandbox_id`.
+    async fn wake_activities(
+        fixture: &Fixture,
+        sandbox_id: PublicSandboxId,
+    ) -> TestDbResult<Vec<Option<String>>> {
+        Ok(sqlx::query_scalar(sql!(
+            "SELECT payload_json->>'wake_activity'
+               FROM public_operations
+              WHERE kind = 'wake_sandbox' AND target_id = $1
+              ORDER BY requested_at, operation_id"
+        ))
+        .bind(sandbox_id.to_string())
+        .fetch_all(&fixture.db.pool)
+        .await?)
+    }
+
+    #[tokio::test]
+    async fn an_attach_on_a_sandbox_at_rest_queues_the_wake_its_policy_allows() -> TestDbResult<()>
+    {
+        use crate::controllers::substrate::ExecutionActivityKind::{Access, Command};
+        let fixture = fixture().await?;
+        let for_command = Some("command");
+        let for_access = Some("access");
+        for (lifecycle, wake_on, activity, queued, recorded) in [
+            ("suspended", &["access"][..], Access, true, for_access),
+            ("suspended", &["access"], Command, true, for_command),
+            ("suspended", &["command"], Command, true, for_command),
+            // A reattach to a process that already started, or a file watch,
+            // is access, which a `command` policy does not wake for.
+            ("suspended", &["command"], Access, false, None),
+            ("paused", &["command"], Access, false, None),
+            ("paused", &["command"], Command, true, for_command),
+            ("suspended", &[], Command, false, None),
+            ("stopped", &["command"], Command, false, None),
+            // Running or heading there since the resolver looked: no wake,
+            // but the attach keeps waiting.
+            ("started", &["access"], Access, true, None),
+            ("restoring", &[], Access, true, None),
+        ] {
+            let sandbox_id = sandbox(&fixture, lifecycle, wake_on).await?;
+            let stored =
+                crate::controllers::sandbox::fetch_sandbox(&fixture.db.pool, sandbox_id.into())
+                    .await?
+                    .expect("seeded sandbox");
+            let case = format!("{lifecycle} {wake_on:?} {activity:?}");
+            for _ in 0..2 {
+                assert_eq!(
+                    queue_implicit_wake(&fixture.db.pool, &stored, activity, true)
+                        .await
+                        .map_err(|e| format!("{e:?}"))?,
+                    queued,
+                    "{case}"
+                );
+            }
+            let expected: Vec<_> = recorded.map(str::to_owned).into_iter().map(Some).collect();
+            assert_eq!(
+                wake_activities(&fixture, sandbox_id).await?,
+                expected,
+                "{case}"
+            );
+            if recorded.is_some() {
+                assert_eq!(
+                    wakes(&fixture, sandbox_id).await?,
+                    vec![(None, "native".to_string())]
+                );
+            }
+        }
+
+        // A start queued since the resolver looked is about to place a
+        // stopped sandbox: keep waiting, with no wake of its own.
+        let sandbox_id = sandbox(&fixture, "stopped", &["command"]).await?;
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/v1/sandboxes/{sandbox_id}:start"))
+            .header("authorization", format!("Bearer {KEY}"))
+            .header("idempotency-key", Uuid::now_v7().to_string())
+            .body(Body::empty())?;
+        assert_eq!(
+            fixture.app.clone().oneshot(request).await?.status(),
+            StatusCode::ACCEPTED
+        );
+        let stored =
+            crate::controllers::sandbox::fetch_sandbox(&fixture.db.pool, sandbox_id.into())
+                .await?
+                .expect("seeded sandbox");
+        assert!(
+            queue_implicit_wake(&fixture.db.pool, &stored, Command, true)
+                .await
+                .map_err(|e| format!("{e:?}"))?
+        );
+        assert!(wake_activities(&fixture, sandbox_id).await?.is_empty());
+
+        // A start that completed since the resolver looked, so nothing is
+        // queued any more: keep waiting, with no wake.
+        let sandbox_id = sandbox(&fixture, "stopped", &["command"]).await?;
+        let stored =
+            crate::controllers::sandbox::fetch_sandbox(&fixture.db.pool, sandbox_id.into())
+                .await?
+                .expect("seeded sandbox");
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET lifecycle = 'started' WHERE id = $1"
+        ))
+        .bind(stored.id)
+        .execute(&fixture.db.pool)
+        .await?;
+        assert!(
+            queue_implicit_wake(&fixture.db.pool, &stored, Command, true)
+                .await
+                .map_err(|e| format!("{e:?}"))?
+        );
+        assert!(wake_activities(&fixture, sandbox_id).await?.is_empty());
+
+        // With the record off, the wake is queued in the payload every
+        // executor parses, which runs it as a command's.
+        let sandbox_id = sandbox(&fixture, "suspended", &["access"]).await?;
+        let stored =
+            crate::controllers::sandbox::fetch_sandbox(&fixture.db.pool, sandbox_id.into())
+                .await?
+                .expect("seeded sandbox");
+        assert!(
+            queue_implicit_wake(&fixture.db.pool, &stored, Access, false)
+                .await
+                .map_err(|e| format!("{e:?}"))?
+        );
+        assert_eq!(
+            wake_payloads(&fixture, sandbox_id).await?,
+            vec![json!({ "sandbox_id": sandbox_id, "action": "wake" })]
+        );
+
+        // So is a new command's, with the record off by default.
+        let sandbox_id = sandbox(&fixture, "suspended", &["command"]).await?;
+        let (status, _, body) = command(&fixture, sandbox_id, "commands").await?;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(
+            wake_payloads(&fixture, sandbox_id).await?,
+            vec![json!({ "sandbox_id": sandbox_id, "action": "wake" })]
+        );
+        Ok(())
+    }
+
+    /// The payload of each wake operation for `sandbox_id`.
+    async fn wake_payloads(
+        fixture: &Fixture,
+        sandbox_id: PublicSandboxId,
+    ) -> TestDbResult<Vec<Value>> {
+        Ok(sqlx::query_scalar::<_, sqlx::types::Json<Value>>(sql!(
+            "SELECT payload_json
+               FROM public_operations
+              WHERE kind = 'wake_sandbox' AND target_id = $1
+              ORDER BY requested_at, operation_id"
+        ))
+        .bind(sandbox_id.to_string())
+        .fetch_all(&fixture.db.pool)
+        .await?
+        .into_iter()
+        .map(|payload| payload.0)
+        .collect())
+    }
+
+    /// A policy updated to allow the attach's activity after the resolver's
+    /// sandbox read, while the sandbox stays at rest, is judged as it is now:
+    /// the wake is queued and the attach keeps waiting, rather than getting
+    /// the final at-rest answer the earlier policy gave.
+    #[tokio::test]
+    async fn an_attach_is_judged_by_the_policy_read_with_the_lifecycle() -> TestDbResult<()> {
+        use crate::controllers::substrate::ExecutionActivityKind::Access;
+        let fixture = fixture().await?;
+        let sandbox_id = sandbox(&fixture, "suspended", &["command"]).await?;
+        let stored =
+            crate::controllers::sandbox::fetch_sandbox(&fixture.db.pool, sandbox_id.into())
+                .await?
+                .expect("seeded sandbox");
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET auto_lifecycle_json = $2 WHERE id = $1"
+        ))
+        .bind(stored.id)
+        .bind(sqlx::types::Json(wake_policy(&["access"])))
+        .execute(&fixture.db.pool)
+        .await?;
+
+        assert!(
+            queue_implicit_wake(&fixture.db.pool, &stored, Access, true)
+                .await
+                .map_err(|e| format!("{e:?}"))?
+        );
+        assert_eq!(
+            wake_activities(&fixture, sandbox_id).await?,
+            vec![Some("access".to_owned())]
+        );
         Ok(())
     }
 }

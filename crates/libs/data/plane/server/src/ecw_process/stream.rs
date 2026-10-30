@@ -8,6 +8,7 @@ pub(super) fn process_connect_json_stream_response<S>(
     route: &EcwResolvedRoute,
     stdout_stream: ecw_connect::EcwProcessStdoutStream,
     stall_after: Option<Duration>,
+    keepalive_interval: Duration,
     lease: EcwProcessStreamLease,
 ) -> Response
 where
@@ -15,11 +16,11 @@ where
 {
     ecw_connect::connect_json_stream_response(process_connect_json_stream(
         stream,
-        "Process.Connect",
         route,
         true,
         stdout_stream,
         stall_after,
+        keepalive_interval,
         lease,
     ))
 }
@@ -29,6 +30,7 @@ pub(super) fn process_start_json_stream_response<S>(
     route: &EcwResolvedRoute,
     stdout_stream: ecw_connect::EcwProcessStdoutStream,
     stall_after: Option<Duration>,
+    keepalive_interval: Duration,
     lease: EcwProcessStreamLease,
 ) -> Response
 where
@@ -36,11 +38,11 @@ where
 {
     ecw_connect::connect_json_stream_response(process_connect_json_stream(
         stream,
-        "Process.Start",
         route,
         false,
         stdout_stream,
         stall_after,
+        keepalive_interval,
         lease,
     ))
 }
@@ -662,11 +664,11 @@ pub(super) fn process_timeout_duration(timeout: &prost_types::Duration) -> Optio
 
 pub(super) fn process_connect_json_stream<S>(
     stream: S,
-    operation: &'static str,
     route: &EcwResolvedRoute,
     connected_as_start: bool,
     stdout_stream: ecw_connect::EcwProcessStdoutStream,
     stall_after: Option<Duration>,
+    keepalive_interval: Duration,
     lease: EcwProcessStreamLease,
 ) -> ProcessConnectJsonStream<S>
 where
@@ -674,7 +676,11 @@ where
 {
     ProcessConnectJsonStream {
         inner: Box::pin(stream),
-        operation,
+        operation: if connected_as_start {
+            "Process.Connect"
+        } else {
+            "Process.Start"
+        },
         sandbox_id: route.sandbox_id,
         route_generation: route.route_generation,
         current_node_id: route.current_node_id,
@@ -688,6 +694,8 @@ where
         shutdown: Box::pin(lease.shutdown_token.cancelled_owned()),
         flushed_after_shutdown: None,
         delivered_any: false,
+        keepalive_interval,
+        keepalive_deadline: None,
         start_wait: None,
         _stream_permit: lease.permit,
     }
@@ -720,6 +728,10 @@ pub(super) struct ProcessConnectJsonStream<S> {
     /// Whether any message reached the client, so a start knows whether it
     /// has reported itself yet.
     delivered_any: bool,
+    // Response bytes reach HTTP intermediaries; backend keepalives do not.
+    // This timer never renews the process lease or sandbox lifetime.
+    keepalive_interval: Duration,
+    keepalive_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
     /// How long a start that has not reported itself waits after the deadline.
     start_wait: Option<Pin<Box<tokio::time::Sleep>>>,
     _stream_permit: AttachedStreamPermit,
@@ -810,6 +822,20 @@ where
         loop {
             match this.inner.as_mut().poll_next(cx) {
                 Poll::Ready(Some(Ok(event))) => {
+                    match &event.event {
+                        Some(spaced_ops::process_event::Event::Started(_))
+                        | Some(spaced_ops::process_event::Event::Connected(_)) => {
+                            // Start must reach the SDK before any keepalive.
+                            if !this.delivered_any {
+                                this.keepalive_deadline =
+                                    Some(Box::pin(tokio::time::sleep(this.keepalive_interval)));
+                            }
+                        }
+                        Some(spaced_ops::process_event::Event::Exit(_)) => {
+                            this.keepalive_deadline = None;
+                        }
+                        _ => {}
+                    }
                     if let Some(bytes) = ecw_connect::process_event_to_connect_message(
                         event,
                         this.connected_as_start,
@@ -820,6 +846,11 @@ where
                             flushed.bytes += bytes.len();
                         }
                         this.delivered_any = true;
+                        if let Some(deadline) = this.keepalive_deadline.as_mut() {
+                            deadline
+                                .as_mut()
+                                .reset(tokio::time::Instant::now() + this.keepalive_interval);
+                        }
                         record_ecw_process_stream_bytes(&bytes);
                         return Poll::Ready(Some(Ok(bytes)));
                     }
@@ -874,6 +905,20 @@ where
                         let bytes = ecw_connect::connect_error_end_stream(
                             tonic::Code::Unavailable,
                             PROCESS_STREAM_STALL_MESSAGE,
+                        );
+                        record_ecw_process_stream_bytes(&bytes);
+                        return Poll::Ready(Some(Ok(bytes)));
+                    }
+                    if this.delivered_any
+                        && let Some(deadline) = this.keepalive_deadline.as_mut()
+                        && deadline.as_mut().poll(cx).is_ready()
+                    {
+                        deadline
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + this.keepalive_interval);
+                        let bytes = ecw_connect::connect_json_message(
+                            serde_json::json!({"event": {"keepalive": {}}}),
+                            false,
                         );
                         record_ecw_process_stream_bytes(&bytes);
                         return Poll::Ready(Some(Ok(bytes)));

@@ -1891,6 +1891,206 @@ async fn seed_sandbox(
     Ok(())
 }
 
+async fn bind_file_key(
+    pool: &PgPool,
+    org_id: OrgId,
+    path_template: &'static str,
+    key: &str,
+    fingerprint: char,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let key = IdempotencyKey::parse(key)?;
+    let fingerprint = RequestFingerprint::parse(fingerprint.to_string().repeat(64))?;
+    Ok(bind_idempotency_key(
+        pool,
+        org_id,
+        &CreatePublicOperationIdempotency {
+            method: HttpOperationMethod::Post,
+            path_template: OperationPathTemplate::new(path_template),
+            key: &key,
+            request_fingerprint: &fingerprint,
+        },
+    )
+    .await?)
+}
+
+async fn expire_keys(pool: &PgPool, org_id: OrgId, keys: &[&str]) -> Result<(), sqlx::Error> {
+    sqlx::query(sql!(
+        "UPDATE public_idempotency_records
+         SET expires_at = NOW() - INTERVAL '1 second'
+         WHERE org_id = $1 AND idempotency_key = ANY($2)"
+    ))
+    .bind(org_id)
+    .bind(keys)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// An expired binding takes the next request's fingerprint, and from then on
+/// refuses the first one.
+#[tokio::test]
+async fn an_expired_key_binding_takes_the_next_request() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+
+    assert!(bind_file_key(&db.pool, org_id, FILE_WRITE, "key", 'a').await?);
+    assert!(bind_file_key(&db.pool, org_id, FILE_WRITE, "key", 'a').await?);
+    assert!(!bind_file_key(&db.pool, org_id, FILE_WRITE, "key", 'b').await?);
+    expire_keys(&db.pool, org_id, &["key"]).await?;
+    assert!(bind_file_key(&db.pool, org_id, FILE_WRITE, "key", 'b').await?);
+    assert!(!bind_file_key(&db.pool, org_id, FILE_WRITE, "key", 'a').await?);
+    Ok(())
+}
+
+const FILE_WRITE: &str = "/v1/sandboxes/{sandbox_id}/files:write";
+
+/// Hold `renew` uncommitted on an expired binding, start `sweep` so it
+/// selects that binding as expired and waits on it, then commit the renewal
+/// and let the sweep finish. Returns whether the renewed binding, with
+/// fingerprint `b`, survived: it still refuses fingerprint `c`.
+async fn renewal_survives_a_waiting_sweep<R, S>(
+    db: &pplx_space_db_test_fixtures::TestDb,
+    renew: R,
+    sweep: S,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>
+where
+    R: for<'c> FnOnce(
+        &'c mut sqlx::PgConnection,
+        OrgId,
+    ) -> futures_util::future::BoxFuture<'c, Result<(), sqlx::Error>>,
+    S: std::future::Future<Output = Result<(), sqlx::Error>> + Send + 'static,
+{
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    assert!(bind_file_key(&db.pool, org_id, FILE_WRITE, "key", 'a').await?);
+    expire_keys(&db.pool, org_id, &["key"]).await?;
+
+    let mut renewal = db.pool.begin().await?;
+    renew(&mut renewal, org_id).await?;
+    let sweep = tokio::spawn(sweep);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let waiting: bool = sqlx::query_scalar(sql!(
+            "SELECT EXISTS (
+                 SELECT 1 FROM pg_stat_activity
+                 WHERE datname = current_database()
+                   AND wait_event_type = 'Lock'
+                   AND query LIKE '%DELETE FROM public_idempotency_records%'
+             )"
+        ))
+        .fetch_one(&db.pool)
+        .await?;
+        if waiting {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the sweep never waited on the renewed binding"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    renewal.commit().await?;
+    sweep.await??;
+
+    Ok(!bind_file_key(&db.pool, org_id, FILE_WRITE, "key", 'c').await?)
+}
+
+/// A controller released before the sweep rechecked `expires_at` deletes
+/// whatever row still has the `id` it selected. A binding renewed while that
+/// sweep waits on it survives anyway, because the renewal gives it a new id.
+#[tokio::test]
+async fn a_renewed_key_binding_survives_a_sweep_that_deletes_by_id() -> TestResult {
+    let Some(db) = try_pg_test_db_with_max_connections(3).await? else {
+        return Ok(());
+    };
+    let pool = db.pool.clone();
+    let sweep = async move {
+        // The retention DELETE as such a controller runs it.
+        sqlx::query(sql!(
+            "DELETE FROM public_idempotency_records
+             WHERE id IN (
+                 SELECT id
+                 FROM public_idempotency_records
+                 WHERE expires_at <= NOW()
+                 ORDER BY expires_at ASC, id ASC
+                 LIMIT 100
+             )"
+        ))
+        .execute(&pool)
+        .await
+        .map(drop)
+    };
+    let survived = renewal_survives_a_waiting_sweep(
+        &db,
+        |conn, org_id| {
+            Box::pin(async move {
+                let key = IdempotencyKey::parse("key").expect("valid key");
+                let fingerprint = RequestFingerprint::parse("b".repeat(64)).expect("valid");
+                let bound = bind_idempotency_key(
+                    conn,
+                    org_id,
+                    &CreatePublicOperationIdempotency {
+                        method: HttpOperationMethod::Post,
+                        path_template: OperationPathTemplate::new(FILE_WRITE),
+                        key: &key,
+                        request_fingerprint: &fingerprint,
+                    },
+                )
+                .await?;
+                assert!(bound);
+                Ok(())
+            })
+        },
+        sweep,
+    )
+    .await?;
+    assert!(survived, "the sweep deleted the renewed binding");
+    Ok(())
+}
+
+/// The sweep rechecks expiry on the row it deletes, so a record that a
+/// writer extends in place while the sweep waits on it is kept.
+#[tokio::test]
+async fn the_retention_sweep_keeps_a_record_renewed_while_it_waits() -> TestResult {
+    let Some(db) = try_pg_test_db_with_max_connections(3).await? else {
+        return Ok(());
+    };
+    let store = PublicOperationStore::new(db.pool.clone());
+    let sweep = async move {
+        store
+            .gc_expired(PublicOperationGcRequest {
+                max_records: 100,
+                payload_scrub_rules: &[],
+            })
+            .await
+            .map(drop)
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))
+    };
+    let survived = renewal_survives_a_waiting_sweep(
+        &db,
+        |conn, org_id| {
+            Box::pin(async move {
+                sqlx::query(sql!(
+                    "UPDATE public_idempotency_records
+                     SET request_fingerprint = $2,
+                         expires_at = NOW() + INTERVAL '10 minutes'
+                     WHERE org_id = $1 AND idempotency_key = 'key'"
+                ))
+                .bind(org_id)
+                .bind("b".repeat(64))
+                .execute(conn)
+                .await?;
+                Ok(())
+            })
+        },
+        sweep,
+    )
+    .await?;
+    assert!(survived, "the sweep deleted the renewed record");
+    Ok(())
+}
+
 async fn seed_org(pool: &PgPool) -> Result<Uuid, sqlx::Error> {
     let id = Uuid::now_v7();
     sqlx::query(sql!(

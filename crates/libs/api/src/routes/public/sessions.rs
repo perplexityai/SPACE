@@ -26,7 +26,7 @@ use crate::{
     middleware::auth::{AuthOrg, AuthUser},
     models::Sandbox,
     public_operations::{HttpOperationMethod, OperationPathTemplate, PublicOperationStore},
-    public_sandbox_operations::SandboxLifecycleOperationPayload,
+    public_sandbox_operations::{SandboxLifecycleOperationPayload, implicit_wake_activity_enabled},
     public_sandbox_projection::public_lifecycle_state,
     public_sessions::{
         CreatePublicSession, CreatePublicSessionIdempotency, ListPublicSessions,
@@ -145,7 +145,14 @@ pub async fn create_process_session(
     )
     .await?;
     if admission == CommandAdmission::AdmitAndWake {
-        enqueue_command_wake(&state, org.id, sandbox_id).await?;
+        enqueue_implicit_wake(
+            &state.pool,
+            org.id,
+            sandbox_id,
+            ExecutionActivityKind::Command,
+            implicit_wake_activity_enabled(),
+        )
+        .await?;
     }
 
     Ok((StatusCode::CREATED, Json(session)))
@@ -180,7 +187,14 @@ pub async fn create_command(
     )
     .await?;
     if admission == CommandAdmission::AdmitAndWake {
-        enqueue_command_wake(&state, org.id, sandbox_id).await?;
+        enqueue_implicit_wake(
+            &state.pool,
+            org.id,
+            sandbox_id,
+            ExecutionActivityKind::Command,
+            implicit_wake_activity_enabled(),
+        )
+        .await?;
     }
 
     // Streaming is negotiated after the create, so validation, owner scope,
@@ -218,7 +232,18 @@ fn command_admission(
     lifecycle: SandboxLifecycle,
     policy: &AutoLifecyclePolicy,
 ) -> CommandAdmission {
-    let wakes = ExecutionActivityKind::Command.allows_implicit_wake(policy);
+    activity_admission(ExecutionActivityKind::Command, lifecycle, policy)
+}
+
+/// [`command_admission`] for a session that will do `activity` once the
+/// sandbox runs: a reattach to a process that already started, or a file
+/// watch, is access, which wakes only on `access`.
+fn activity_admission(
+    activity: ExecutionActivityKind,
+    lifecycle: SandboxLifecycle,
+    policy: &AutoLifecyclePolicy,
+) -> CommandAdmission {
+    let wakes = activity.allows_implicit_wake(policy);
     match lifecycle {
         // A checkpoint returns the sandbox to the state it left, and the
         // node's command wake waits it out; a paused result is refused there.
@@ -276,23 +301,37 @@ fn sandbox_lifecycle(sandbox: &Sandbox) -> Result<SandboxLifecycle, PublicApiErr
 /// when no attach can reach it. The operation runs through the dispatcher
 /// like a `:wake`, after any lifecycle operation queued before it, as the
 /// system (no actor) rather than the caller, and only if the sandbox's wake
-/// policy still allows a command wake when it runs. A sandbox still pausing or suspending
-/// refuses the activation for now; the operation retries until it settles.
+/// policy still allows `activity` to wake it when it runs. A sandbox still
+/// pausing or suspending refuses the activation for now; the operation
+/// retries until it settles.
+///
+/// With `record_activity` ([`implicit_wake_activity_enabled`]), a new wake
+/// records `activity`, and the executor judges the policy by it; without,
+/// the wake goes in as it did before the record, and runs by the command
+/// rule. A join keeps the activity of the wake it joins, whatever this
+/// caller's: each caller's activity was allowed when it asked, so the wake's
+/// rule can refuse the joiner's only if the policy narrowed in between, as
+/// from `access` to `command` under a wake for access that a new command
+/// joins. That wake is refused when it runs; the joiner's next attach finds
+/// nothing coming and queues a fresh wake for its own activity.
 ///
 /// Called for a replayed session too, so a retry heals a wake that failed to
 /// queue after its session was created.
-async fn enqueue_command_wake(
-    state: &AppState,
+async fn enqueue_implicit_wake(
+    pool: &sqlx::PgPool,
     org_id: OrgId,
     sandbox_id: PublicSandboxId,
+    activity: ExecutionActivityKind,
+    record_activity: bool,
 ) -> Result<(), PublicApiError> {
     let payload = SandboxLifecycleOperationPayload {
         sandbox_id,
         action: SandboxLifecycleAction::Wake,
         rollback: None,
+        wake_activity: record_activity.then_some(activity.into()),
     }
     .into_json();
-    PublicOperationStore::new(state.pool.clone())
+    PublicOperationStore::new(pool.clone())
         .create_or_join_active_sandbox_wake(
             org_id,
             &sandbox_id.to_string(),
@@ -301,6 +340,69 @@ async fn enqueue_command_wake(
         )
         .await?;
     Ok(())
+}
+
+/// Queue, or join, the wake an existing session on `sandbox` waits for, when
+/// the sandbox is at rest and its wake policy lets the session's `activity`
+/// wake it, as the node will judge that activity. For the session route
+/// resolver, whose attach found the sandbox with no node: answers whether
+/// the attach should keep waiting. A sandbox that is running or heading there
+/// again since the resolver looked needs no wake and keeps waiting too, as
+/// does one a start, resume, restore or wake queued since then is about to
+/// place; only one nothing can wake for `activity` answers no. A new wake
+/// records `activity` as [`enqueue_implicit_wake`] says for
+/// `record_activity`.
+pub(crate) async fn queue_implicit_wake(
+    pool: &sqlx::PgPool,
+    sandbox: &Sandbox,
+    activity: ExecutionActivityKind,
+    record_activity: bool,
+) -> Result<bool, PublicApiError> {
+    let sandbox_id = PublicSandboxId::from(sandbox.id);
+    let mut admission = activity_admission(
+        activity,
+        sandbox_lifecycle(sandbox)?,
+        &sandbox.auto_lifecycle.0,
+    );
+    if admission == CommandAdmission::Refuse {
+        // Read the sandbox again before answering no, with its pending
+        // activations in the same statement. A start, resume, restore or
+        // wake queued since the first read is about to place it. One that
+        // completed, or got under way, since then already has: the lifecycle
+        // read now is one the attach is admitted in. A policy updated since
+        // then is judged as it is now, so one that has come to allow
+        // `activity` wakes the sandbox.
+        let observed = pplx_space_sandbox_store::activation_observation(
+            pool,
+            sandbox.org_id,
+            sandbox.id,
+            &sandbox_id.to_string(),
+        )
+        .await
+        .map_err(|error| {
+            tracing::warn!(sandbox_id = %sandbox.id, %error, "could not read pending activations");
+            PublicApiError::internal()
+        })?;
+        let Some(observed) = observed else {
+            return Ok(false);
+        };
+        if observed.activation_pending {
+            return Ok(true);
+        }
+        let Ok(lifecycle) = observed.lifecycle.parse::<SandboxLifecycle>() else {
+            return Ok(false);
+        };
+        admission = activity_admission(activity, lifecycle, &observed.auto_lifecycle.0);
+    }
+    match admission {
+        CommandAdmission::Admit => Ok(true),
+        CommandAdmission::Refuse => Ok(false),
+        CommandAdmission::AdmitAndWake => {
+            enqueue_implicit_wake(pool, sandbox.org_id, sandbox_id, activity, record_activity)
+                .await?;
+            Ok(true)
+        }
+    }
 }
 
 /// Create a command (one-shot process) data-plane session for `sandbox_id`,

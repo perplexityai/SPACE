@@ -4,6 +4,7 @@ use pplx_space_common_cli::exit_error;
 mod admin_client;
 mod auth;
 mod cli;
+mod runtime;
 mod templates;
 
 use admin_client::{AdminClient, CliError, WarmPoolConfigRequest};
@@ -75,6 +76,7 @@ async fn main() {
             diagnostics,
         } => client.get_node(&node, json, diagnostics).await,
         Commands::Template { command } => client.template_command(command).await,
+        Commands::Runtime { command } => client.runtime_command(command).await,
         Commands::WarmPool { command } => match command {
             WarmPoolCommands::Create(args) => {
                 let json = args.json;

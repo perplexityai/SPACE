@@ -659,6 +659,8 @@ default; `SPACE_BOOTSTRAP_TIMEOUT` for `up.sh`) for that initialization, while s
 An exited Tilt process or failed evaluation ends the wait early with a log
 tail. Detached bring-up also waits for this initialization, but not application
 builds or rollouts; the timeout is per stage, not a whole-bring-up deadline.
+Kind CI runs `install-observability.sh` in a step of its own while the Rust
+producer builds, so Tilt's evaluation finds each release unchanged.
 
 Before installing, `install-observability.sh` loads each backend image onto
 every node at the linux/amd64 digest `ci/mirrored-images.txt` lists for the

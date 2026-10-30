@@ -138,6 +138,62 @@ pub struct SandboxLifecycleOperationPayload {
     pub action: SandboxLifecycleAction,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollback: Option<RollbackSandboxRequest>,
+    /// The activity the system's wake for a session was queued for, which
+    /// the executor judges the sandbox's wake policy by when the wake runs.
+    /// Only that wake carries it (see [`is_implicit_wake`]), and only while
+    /// [`IMPLICIT_WAKE_ACTIVITY_ENV`] is on.
+    ///
+    /// Same mixed-version rule as `CreateSandboxOperationPayload::node_pool`:
+    /// an absent key serializes byte-identically to the payload older
+    /// producers emit, and a wake without it, such as one an older API
+    /// queued, is judged as a command, as an older executor judges every
+    /// system wake. A present key is rejected by an older executor's
+    /// `deny_unknown_fields`, so every `space-cluster-controller` replica
+    /// must run this release before any producer sets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_activity: Option<ImplicitWakeActivity>,
+}
+
+/// A session's activity, as the wake policy names it, recorded on the
+/// system's wake for that session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImplicitWakeActivity {
+    Command,
+    Access,
+}
+
+impl From<ExecutionActivityKind> for ImplicitWakeActivity {
+    fn from(activity: ExecutionActivityKind) -> Self {
+        match activity {
+            ExecutionActivityKind::Command => Self::Command,
+            ExecutionActivityKind::Access => Self::Access,
+        }
+    }
+}
+
+impl From<ImplicitWakeActivity> for ExecutionActivityKind {
+    fn from(activity: ImplicitWakeActivity) -> Self {
+        match activity {
+            ImplicitWakeActivity::Command => Self::Command,
+            ImplicitWakeActivity::Access => Self::Access,
+        }
+    }
+}
+
+/// The switch for recording [`SandboxLifecycleOperationPayload::wake_activity`]
+/// on the system's wakes the API queues: `1`, `true`, `yes`, `on` or
+/// `enabled`, in any case, turns it on; unset or anything else keeps it off.
+/// Off, every system wake goes in without it and runs as a command wake, as
+/// before the field. Turn it on only once every `space-cluster-controller`
+/// replica runs a release that reads the field, and off again, letting the
+/// wakes queued with it drain, before rolling one back.
+pub(crate) const IMPLICIT_WAKE_ACTIVITY_ENV: &str = "SPACE_IMPLICIT_WAKE_ACTIVITY_ENABLED";
+
+/// Whether the API records the activity on the system's wakes it queues; see
+/// [`IMPLICIT_WAKE_ACTIVITY_ENV`].
+pub(crate) fn implicit_wake_activity_enabled() -> bool {
+    pplx_space_common_core::env::env_flag_var(IMPLICIT_WAKE_ACTIVITY_ENV, false)
 }
 
 impl SandboxLifecycleOperationPayload {
@@ -741,11 +797,12 @@ impl SandboxLifecycleOperationExecutor {
                 "sandbox rollback completed",
             ));
         }
-        let controller_action = if is_implicit_command_wake(operation, payload.action) {
-            if !ExecutionActivityKind::Command.allows_implicit_wake(&sandbox.auto_lifecycle.0) {
+        let controller_action = if is_implicit_wake(operation, payload.action) {
+            let activity = implicit_wake_activity(payload.wake_activity);
+            if !activity.allows_implicit_wake(&sandbox.auto_lifecycle.0) {
                 return Err(SandboxLifecycleExecutionError::ImplicitWakeNotAllowed);
             }
-            SandboxAction::ImplicitWake(ExecutionActivityKind::Command)
+            SandboxAction::ImplicitWake(activity)
         } else {
             sandbox_action(payload.action)?
         };
@@ -968,25 +1025,31 @@ fn completed_lifecycle_target_state(
     }
 }
 
-/// A native wake operation with no actor is the system's wake for a command
-/// or process session (`create_or_join_active_sandbox_wake`): no caller asked
-/// for it, so it runs only while the sandbox's wake policy, read now, still
-/// lets a command wake it. Nothing else creates one, with one exception:
-/// `public_operations.actor_user_id` is `ON DELETE SET NULL`, so a caller's
-/// queued `:wake` whose user is deleted before it runs is recognized here too,
-/// and refused if the policy forbids a command wake; no caller remains to want
-/// it. A controller without this check runs it as the plain `:wake` the
-/// policy allowed at enqueue. A caller's `:wake` joins the system's wake only
-/// while it is queued, giving it that caller as its actor, so the claim that
-/// takes it reads that actor and it runs as their `:wake`.
-fn is_implicit_command_wake(
-    operation: &ClaimedPublicOperation,
-    action: SandboxLifecycleAction,
-) -> bool {
+/// A native wake operation with no actor is the system's wake for a session
+/// (`create_or_join_active_sandbox_wake`): no caller asked for it, so it runs
+/// only while the sandbox's wake policy, read now, still lets the session's
+/// activity wake it (see [`implicit_wake_activity`]). Nothing else creates one,
+/// with one exception: `public_operations.actor_user_id` is `ON DELETE SET
+/// NULL`, so a caller's queued `:wake` whose user is deleted before it runs is
+/// recognized here too, and refused if the policy forbids a command wake; no
+/// caller remains to want it. A controller without this check runs it as the
+/// plain `:wake` the policy allowed at enqueue. A caller's `:wake` joins the
+/// system's wake only while it is queued, giving it that caller as its actor,
+/// so the claim that takes it reads that actor and it runs as their `:wake`.
+fn is_implicit_wake(operation: &ClaimedPublicOperation, action: SandboxLifecycleAction) -> bool {
     action == SandboxLifecycleAction::Wake
         && operation.kind == OperationKind::WakeSandbox
         && operation.api_product == ApiProduct::Native
         && operation.actor_user_id.is_none()
+}
+
+/// The activity the system's wake is judged for when it runs: the one it
+/// records, or, for a wake without one, a command. Such a wake was queued by
+/// an API from before the field or with [`IMPLICIT_WAKE_ACTIVITY_ENV`] off,
+/// and an executor from before the field runs it by the command rule too, so
+/// no wake an older executor would run is refused here.
+fn implicit_wake_activity(recorded: Option<ImplicitWakeActivity>) -> ExecutionActivityKind {
+    recorded.map_or(ExecutionActivityKind::Command, ExecutionActivityKind::from)
 }
 
 fn sandbox_action(
@@ -1094,7 +1157,7 @@ enum SandboxLifecycleExecutionError {
     MissingRollbackSnapshotName,
     #[error("unsupported sandbox lifecycle action '{0}'")]
     UnsupportedAction(SandboxLifecycleAction),
-    #[error("the sandbox's wake policy no longer lets a command wake it")]
+    #[error("the sandbox's wake policy no longer lets the waiting session's activity wake it")]
     ImplicitWakeNotAllowed,
     #[error("unknown sandbox lifecycle: {0}")]
     UnknownLifecycle(#[from] SandboxLifecycleParseError),

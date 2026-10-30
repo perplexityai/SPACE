@@ -134,7 +134,12 @@ source layout; update the declaration together with changes to that behavior.
 ## Ingress activation delegation
 
 `IngressActivationApi/PrepareIngress` is an internal gRPC service hosted by
-`space-api-svc`, using its existing lifecycle controller. Configure
+`space-api-svc`, using its existing lifecycle controller. The same service
+serves `IngressActivationApi/QueueImplicitWake`, which the session route
+resolver calls to queue, or join, the wake a data-plane session on a sandbox at
+rest waits for, when the sandbox's wake policy allows what the session will
+do: start a command or terminal (`command` or `access`), or reconnect to a
+process or watch files (`access`). It never waits for the wake. Configure
 `SPACE_INGRESS_ACTIVATION_LISTEN` on the API deployments that serve it. When
 unset, the API continues serving its existing HTTP surface without an activation
 listener. The local Kind chart exposes this listener on port 9801.
@@ -142,7 +147,8 @@ listener. The local Kind chart exposes this listener on port 9801.
 Configure `SPACE_INGRESS_ACTIVATION_ENDPOINT` (an HTTPS URL) and the shared CA
 bundle on cluster API. Without an endpoint, cluster API still starts and serves
 healthy routes; delegated wakes return `Unavailable` with an unconfigured
-endpoint diagnostic. `SPACE_INGRESS_ACTIVATION_TLS_SERVER_NAME` optionally overrides
+endpoint diagnostic, and an attach to a sandbox at rest stays retryable rather
+than being answered as one nothing can wake. `SPACE_INGRESS_ACTIVATION_TLS_SERVER_NAME` optionally overrides
 the endpoint's certificate name. Provision a separate listener certificate/key
 with `SPACE_INTERNAL_RPC_TLS_CERT` and `SPACE_INTERNAL_RPC_TLS_KEY`; API HTTP
 routing does not expose this RPC.
