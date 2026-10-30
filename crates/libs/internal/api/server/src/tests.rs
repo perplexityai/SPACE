@@ -4091,6 +4091,7 @@ async fn finalize_ready_from_node(
                 bytes_uploaded: 4096,
                 failure_reason: None,
                 artifact_digests: Vec::new(),
+                suspend_uncommitted: false,
             },
             std::net::IpAddr::V4(node_ip),
         ))
@@ -4642,6 +4643,7 @@ async fn finalize(
                 bytes_uploaded: bytes,
                 failure_reason: None,
                 artifact_digests: Vec::new(),
+                suspend_uncommitted: false,
             },
             TEST_WORKER_IP,
         ))
@@ -4763,6 +4765,17 @@ async fn finalize_artifact_backup_from_node(
     node_ip: std::net::IpAddr,
     backup_attempt_id: SnapshotId,
 ) -> Result<(), tonic::Status> {
+    finalize_artifact_backup_reporting_suspend(service, node_ip, backup_attempt_id, false).await
+}
+
+/// Finalize `backup_attempt_id` as `ready` from the node at `node_ip`, which
+/// reports whether it committed the suspend that captured it.
+async fn finalize_artifact_backup_reporting_suspend(
+    service: &ClusterApiService,
+    node_ip: std::net::IpAddr,
+    backup_attempt_id: SnapshotId,
+    suspend_uncommitted: bool,
+) -> Result<(), tonic::Status> {
     service
         .finalize_artifact_backup(request_from_node(
             FinalizeArtifactBackupRequest {
@@ -4771,6 +4784,7 @@ async fn finalize_artifact_backup_from_node(
                 bytes_uploaded: 42,
                 failure_reason: None,
                 artifact_digests: Vec::new(),
+                suspend_uncommitted,
             },
             node_ip,
         ))
@@ -5269,6 +5283,79 @@ async fn finalize_suspend_artifact_does_not_retire_api_owned_suspend() -> TestRe
     assert_eq!(lifecycle, "suspending");
     assert!(active);
     assert_eq!(execution_state, "running");
+    Ok(())
+}
+
+/// A node that rolled a suspend back to `paused` keeps the runtime while its
+/// upload of the capture goes on. When that upload finalizes reporting the
+/// suspend uncommitted, the backup is ready, and the control-plane row stays
+/// `paused` and active on that node with its execution running, as the
+/// runtime is. The same finalize without the report projects the row
+/// `suspended`.
+#[tokio::test(flavor = "current_thread")]
+async fn finalize_suspend_artifact_keeps_a_paused_row_whose_node_reports_it_uncommitted()
+-> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let pool = &fixture.service.pool;
+    let node_id = NodeId::new();
+    insert_ready_worker_node(pool, node_id).await?;
+
+    for (suspend_uncommitted, expected) in [
+        (true, ("paused", Some(node_id), true, "running")),
+        (false, ("suspended", None, false, "suspended")),
+    ] {
+        let sandbox_id = SandboxId::new();
+        seed_active_k8s_sandbox(pool, sandbox_id, node_id).await?;
+        seed_active_k8s_execution(pool, sandbox_id, 4, "100.64.0.4").await?;
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET lifecycle = 'paused' WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .execute(pool)
+        .await?;
+        let backup_attempt_id = SnapshotId::new();
+        begin_artifact_backup(
+            &fixture.service,
+            sandbox_id,
+            LocalArtifactId::new(),
+            backup_attempt_id,
+            pplx_space_sbx_mgr_client::proto::ArtifactKind::Full,
+            pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend,
+        )
+        .await?;
+
+        finalize_artifact_backup_reporting_suspend(
+            &fixture.service,
+            TEST_WORKER_IP,
+            backup_attempt_id,
+            suspend_uncommitted,
+        )
+        .await?;
+
+        assert_eq!(snapshot_state(pool, backup_attempt_id).await?, "ready");
+        let row: (String, Option<NodeId>, bool, String) = sqlx::query_as(sql!(
+            "SELECT s.lifecycle, s.active_node_id, e.active, e.state
+               FROM sandboxes s
+               JOIN sandbox_k8s_executions e ON e.sandbox_id = s.id
+              WHERE s.id = $1"
+        ))
+        .bind(sandbox_id)
+        .fetch_one(pool)
+        .await?;
+        let (lifecycle, active_node_id, active, execution_state) = expected;
+        assert_eq!(
+            row,
+            (
+                lifecycle.to_owned(),
+                active_node_id,
+                active,
+                execution_state.to_owned()
+            ),
+            "suspend_uncommitted={suspend_uncommitted}"
+        );
+    }
     Ok(())
 }
 
@@ -6121,6 +6208,7 @@ async fn finalize_failed_persists_failure_reason() -> TestResult {
                 bytes_uploaded: 0,
                 failure_reason: Some(reason.to_string()),
                 artifact_digests: Vec::new(),
+                suspend_uncommitted: false,
             },
             TEST_WORKER_IP,
         ))
@@ -6190,6 +6278,7 @@ async fn finalize_failed_blank_reason_is_treated_as_absent() -> TestResult {
                 bytes_uploaded: 0,
                 failure_reason: Some("   \t  ".to_string()),
                 artifact_digests: Vec::new(),
+                suspend_uncommitted: false,
             },
             TEST_WORKER_IP,
         ))
@@ -7365,6 +7454,7 @@ async fn finalize_ready_with_digests(
                 bytes_uploaded: 4096 + (1 << 30),
                 failure_reason: None,
                 artifact_digests,
+                suspend_uncommitted: false,
             },
             TEST_WORKER_IP,
         ))

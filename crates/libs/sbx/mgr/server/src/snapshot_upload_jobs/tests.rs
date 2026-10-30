@@ -1260,3 +1260,75 @@ fn absent_volume_manager_socket() -> std::path::PathBuf {
         .join(format!("space-sbx-mgr-test-{}", uuid::Uuid::now_v7()))
         .join("absent-volume-manager.sock")
 }
+
+/// A suspend capture's ready backup reports the suspend uncommitted exactly
+/// when the node may still hold the runtime that capture was meant to release:
+/// in a state that holds one outside a suspend, or suspending or suspended
+/// without this capture pinned. A quarantined row counts as one that may hold
+/// a runtime. A capture of any other origin, a missing row, and the cleanup
+/// states keep the projection.
+#[test]
+fn suspend_uncommitted_follows_the_row_state_and_its_pin() {
+    use crate::state::SandboxState;
+    use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin};
+
+    let capture = LocalArtifactId::new();
+    let pinned = capture.to_string();
+    let other = LocalArtifactId::new().to_string();
+    let cases = [
+        // Rolled back to `paused`, which restores the previous pin.
+        (SandboxState::Paused, Some(other.as_str()), true),
+        (SandboxState::Started, Some(pinned.as_str()), true),
+        (SandboxState::Restoring, None, true),
+        // A node-local suspend before its cleanup completes, or one begun
+        // after a rollback: neither has pinned this capture.
+        (SandboxState::Suspending, None, true),
+        (SandboxState::Suspending, Some(other.as_str()), true),
+        // A teardown suspend that staged this capture.
+        (SandboxState::Suspending, Some(pinned.as_str()), false),
+        (SandboxState::Suspended, Some(pinned.as_str()), false),
+        // A later suspend committed another capture.
+        (SandboxState::Suspended, Some(other.as_str()), true),
+        (SandboxState::CleanupRequired, Some(other.as_str()), false),
+        (SandboxState::CleanupFailed, None, false),
+        (SandboxState::Quarantined, None, true),
+        (SandboxState::Stopped, None, false),
+    ];
+    let conn = crate::db::test_conn();
+    for (index, (state, pin, _)) in cases.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO sandboxes (
+                 id, uuid8, state, template, user, runtime, created_at, updated_at,
+                 process_env_json, auto_lifecycle_json, auto_lifecycle_state_json,
+                 current_local_artifact_id, current_local_artifact_kind,
+                 current_local_artifact_origin
+             ) VALUES (?1, 'uuid8', ?2, 'seed', 'u', 'fc', '0', '0',
+                       '{}', '{}', '{}', ?3, ?4, ?5)",
+            crate::db::fixture::params![
+                format!("sbx-{index}"),
+                state.as_str(),
+                pin,
+                pin.map(|_| "full"),
+                pin.map(|_| "suspend"),
+            ],
+        )
+        .unwrap();
+    }
+    let db = crate::db::SharedConnection::new(conn);
+    let meta = |sandbox_id: &str, origin: ArtifactOrigin| SnapshotMeta {
+        sandbox_id: sandbox_id.to_owned(),
+        ..reclaim_fixture_meta(None, Some(ArtifactKind::Full), Some(origin), Some(capture))
+    };
+
+    let answers: Vec<_> = (0..cases.len())
+        .map(|index| {
+            suspend_uncommitted(&db, &meta(&format!("sbx-{index}"), ArtifactOrigin::Suspend))
+                .unwrap()
+        })
+        .collect();
+    let expected: Vec<_> = cases.iter().map(|(_, _, expected)| *expected).collect();
+    assert_eq!(answers, expected, "{cases:?}");
+
+    assert!(!suspend_uncommitted(&db, &meta("sbx-absent", ArtifactOrigin::Suspend)).unwrap());
+    assert!(!suspend_uncommitted(&db, &meta("sbx-0", ArtifactOrigin::Stop)).unwrap());
+}

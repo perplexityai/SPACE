@@ -2,37 +2,103 @@
 
 use super::*;
 
-/// The environment variable naming the file the stub, serving in the parent
-/// process, appends each admitted registration's local artifact id to. The
-/// child that runs the test reads it with [`admitted_registrations`].
-const ADMITTED_REGISTRATIONS_ENV: &str = "SPACE_TEST_ADMITTED_ARTIFACT_BACKUPS";
+/// Lines a stub serving in the parent process appends to a file, which the
+/// child that runs the test reads back through the environment variable
+/// `env` names.
+struct CrossProcessLog {
+    env: &'static str,
+    path: std::sync::Mutex<Option<std::path::PathBuf>>,
+}
 
-/// The file the parent's stub records admitted registrations in.
-static ADMITTED_REGISTRATIONS: std::sync::Mutex<Option<std::path::PathBuf>> =
-    std::sync::Mutex::new(None);
+impl CrossProcessLog {
+    const fn new(env: &'static str) -> Self {
+        Self {
+            env,
+            path: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Point the parent's appends at `file`, and return the variable that
+    /// hands it to the child.
+    fn serve_into<'a>(
+        &self,
+        file: &'a tempfile::NamedTempFile,
+    ) -> (&'static str, Option<&'a std::ffi::OsStr>) {
+        *self.path.lock().unwrap() = Some(file.path().to_path_buf());
+        (self.env, Some(file.path().as_os_str()))
+    }
+
+    fn append(&self, line: &str) {
+        use std::io::Write as _;
+        let path = self.path.lock().unwrap().clone();
+        if let Some(path) = path {
+            // One write per line: concurrent requests append to the same
+            // file, and an append this small lands whole.
+            let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+            file.write_all(format!("{line}\n").as_bytes()).unwrap();
+        }
+    }
+
+    fn lines(&self) -> Vec<String> {
+        let path = std::env::var_os(self.env)
+            .unwrap_or_else(|| panic!("{} is set only under with_cluster_api", self.env));
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+/// The local artifact id of each registration the stub admitted.
+static ADMITTED_REGISTRATIONS: CrossProcessLog =
+    CrossProcessLog::new("SPACE_TEST_ADMITTED_ARTIFACT_BACKUPS");
+
+/// Each `FinalizeArtifactBackup` a stub answered.
+static FINALIZED_BACKUPS: CrossProcessLog =
+    CrossProcessLog::new("SPACE_TEST_FINALIZED_ARTIFACT_BACKUPS");
 
 /// The local artifact ids of every registration the stub admitted, a probe
 /// that registers nothing aside. Admitting one is what lets a backup proceed.
 pub(super) fn admitted_registrations() -> Vec<String> {
-    let path = std::env::var_os(ADMITTED_REGISTRATIONS_ENV)
-        .expect("admitted registrations are recorded only under with_cluster_api");
-    std::fs::read_to_string(path)
-        .unwrap()
-        .lines()
-        .map(str::to_owned)
-        .collect()
+    ADMITTED_REGISTRATIONS.lines()
 }
 
 fn record_admitted_registration(local_artifact_id: &str) {
-    use std::io::Write as _;
-    let path = ADMITTED_REGISTRATIONS.lock().unwrap().clone();
-    if let Some(path) = path {
-        // One write per line: concurrent registrations append to the same
-        // file, and an append this small lands whole.
-        let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
-        file.write_all(format!("{local_artifact_id}\n").as_bytes())
-            .unwrap();
-    }
+    ADMITTED_REGISTRATIONS.append(local_artifact_id);
+}
+
+/// A `FinalizeArtifactBackup` a stub answered, as the node sent it.
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::service::grpc_lifecycle) struct FinalizedBackup {
+    pub(in crate::service::grpc_lifecycle) backup_attempt_id: String,
+    pub(in crate::service::grpc_lifecycle) suspend_uncommitted: bool,
+}
+
+/// Every `FinalizeArtifactBackup` a stub recorded with
+/// [`record_finalized_backup`], in arrival order.
+pub(in crate::service::grpc_lifecycle) fn finalized_backups() -> Vec<FinalizedBackup> {
+    FINALIZED_BACKUPS
+        .lines()
+        .iter()
+        .map(|line| {
+            let (backup_attempt_id, suspend_uncommitted) = line.split_once(' ').unwrap();
+            FinalizedBackup {
+                backup_attempt_id: backup_attempt_id.to_owned(),
+                suspend_uncommitted: suspend_uncommitted.parse().unwrap(),
+            }
+        })
+        .collect()
+}
+
+/// Record `request` for the child's [`finalized_backups`].
+pub(in crate::service::grpc_lifecycle) fn record_finalized_backup(
+    request: &pplx_space_node_api_client::proto::FinalizeArtifactBackupRequest,
+) {
+    FINALIZED_BACKUPS.append(&format!(
+        "{} {}",
+        request.backup_attempt_id, request.suspend_uncommitted
+    ));
 }
 
 /// A cluster-api stub. Its `BeginArtifactBackup` refuses every
@@ -272,12 +338,10 @@ pub(in crate::service::grpc_lifecycle) async fn with_cluster_api<S>(
     let token = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(token.path(), "synthetic-backup-test-token").unwrap();
     let admitted = tempfile::NamedTempFile::new().unwrap();
-    *ADMITTED_REGISTRATIONS.lock().unwrap() = Some(admitted.path().to_path_buf());
+    let finalized = tempfile::NamedTempFile::new().unwrap();
     let child = pplx_space_test_env::enter_test_process(&[
-        (
-            ADMITTED_REGISTRATIONS_ENV,
-            Some(admitted.path().as_os_str()),
-        ),
+        ADMITTED_REGISTRATIONS.serve_into(&admitted),
+        FINALIZED_BACKUPS.serve_into(&finalized),
         ("SPACE_INTERNAL_RPC_INSECURE_DEV", Some(OsStr::new("1"))),
         (
             pplx_space_node_api_client::cluster::CLUSTER_API_ENDPOINT_ENV,

@@ -138,6 +138,26 @@ impl SandboxState {
         }
     }
 
+    /// Whether the VM runtime may be resident outside any suspend, so a
+    /// suspend backup that becomes durable now doesn't make the sandbox
+    /// suspended. A suspend rolled back to `Paused` lands here, as does a
+    /// sandbox started or restored since the capture. So does `Quarantined`:
+    /// quarantine preserves resources it can't account for, a running VM
+    /// included, and nothing settles them until an operator or a recovery
+    /// does. `Suspending` and `Suspended` answer `false`, because whether a
+    /// durable capture is theirs depends on the artifact they pin, not on the
+    /// state. The remaining states never ran a VM, released it, or hand it to
+    /// a cleanup of their own.
+    pub fn holds_runtime_outside_suspend(self) -> bool {
+        use SandboxState::*;
+        match self {
+            Starting | Started | Stopping | Pausing | Paused | Resuming | Checkpointing
+            | Restoring | Quarantined => true,
+            Creating | Created | Stopped | Deleting | Suspending | Suspended | CleanupRequired
+            | CleanupFailed | Failed => false,
+        }
+    }
+
     /// Both `Started` and `Paused` sandboxes may have associated network gateways.
     pub const fn can_cycle_net_gateway(self) -> bool {
         matches!(self, Self::Started | Self::Paused)

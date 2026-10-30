@@ -1160,6 +1160,16 @@ message FinalizeArtifactBackupRequest {
   // Digests of the artifacts this attempt uploaded. Recorded only for READY
   // and write-once: a replay must repeat the same digests.
   repeated SnapshotArtifactDigest artifact_digests = 5;
+  // Set when the node may still hold the runtime this attempt's suspend
+  // capture was meant to release: the suspend rolled back to `paused` or was
+  // quarantined, the sandbox woke since, or the node's suspend in flight or
+  // committed suspend doesn't pin this capture.
+  // The server then records the READY backup without projecting a completed
+  // suspend onto the sandbox, which could retire its execution over a
+  // resident runtime. The node's own `suspended` report still projects the
+  // row once a suspend commits. A node that predates the field leaves it
+  // unset, which keeps the projection.
+  bool suspend_uncommitted = 6;
 }
 
 // Content digest of one artifact file in a backup attempt, reported by the

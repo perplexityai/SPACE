@@ -108,6 +108,20 @@ use crate::proto::{
     UnstableResolveSandboxServiceRouteRequest, UnstableResolveSandboxServiceRouteResponse,
     WarmPoolTemplateRelease, facet_ref, network_policy_target_ref,
 };
+
+/// What a node reports when it closes a backup attempt, as
+/// [`ClusterApiService::finalize_backup_attempt`] applies it.
+struct BackupAttemptFinalization<'a> {
+    target_state: SnapshotState,
+    bytes_uploaded: i64,
+    failure_reason: Option<&'a str>,
+    artifact_digests: &'a [snapshot_store::SnapshotArtifactDigest],
+    /// The node may still hold the runtime this attempt's suspend capture was
+    /// meant to release, so a READY backup must not project the sandbox
+    /// `suspended`.
+    suspend_uncommitted: bool,
+}
+
 /// The `snapshots` row [`ClusterApiService::finalize_backup_attempt`] flips,
 /// exactly as that statement's `RETURNING` produces it.
 #[derive(Debug, FromRow)]
@@ -697,15 +711,23 @@ impl ClusterApiService {
     ///
     /// Only the attempt's source node may close it; the check precedes the
     /// transaction so a refused caller writes nothing.
+    ///
+    /// A READY suspend backup projects the sandbox `suspended` unless
+    /// `suspend_uncommitted` says the source node may still hold the runtime,
+    /// as after it rolled the capturing suspend back to `paused`.
     async fn finalize_backup_attempt(
         &self,
         snapshot_id: SnapshotId,
-        target_state: SnapshotState,
-        bytes_uploaded: i64,
-        failure_reason: Option<&str>,
-        artifact_digests: &[snapshot_store::SnapshotArtifactDigest],
+        finalization: BackupAttemptFinalization<'_>,
         remote_addr: Option<std::net::SocketAddr>,
     ) -> Result<(), Status> {
+        let BackupAttemptFinalization {
+            target_state,
+            bytes_uploaded,
+            failure_reason,
+            artifact_digests,
+            suspend_uncommitted,
+        } = finalization;
         let attempt = self
             .registered_backup_attempt(snapshot_id)
             .await?
@@ -808,7 +830,7 @@ impl ClusterApiService {
                 })?;
         }
 
-        let suspend_projection = if target_state.is_ready() {
+        let suspend_projection = if target_state.is_ready() && !suspend_uncommitted {
             project_ready_suspend_snapshot(&mut tx, snapshot_id).await?
         } else {
             None
@@ -1070,10 +1092,13 @@ impl ClusterApiService {
         let artifact_digests = parse_artifact_digests(&req.artifact_digests)?;
         self.finalize_backup_attempt(
             SnapshotId::from_uuid(backup_attempt_id.as_uuid()),
-            target_state,
-            req.bytes_uploaded,
-            req.failure_reason.as_deref(),
-            &artifact_digests,
+            BackupAttemptFinalization {
+                target_state,
+                bytes_uploaded: req.bytes_uploaded,
+                failure_reason: req.failure_reason.as_deref(),
+                artifact_digests: &artifact_digests,
+                suspend_uncommitted: req.suspend_uncommitted,
+            },
             remote_addr,
         )
         .await?;

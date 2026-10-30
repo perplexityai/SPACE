@@ -1685,6 +1685,7 @@ async fn finalize(
         bytes_uploaded: 1,
         failure_reason: None,
         artifact_digests: Vec::new(),
+        suspend_uncommitted: false,
     });
     request
         .extensions_mut()
