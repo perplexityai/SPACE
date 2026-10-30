@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewSpec};
 use kube::api::PostParams;
@@ -12,14 +12,36 @@ use super::{
     AuthenticatedBuildNode, BuildAuthError, BuildAuthenticatedCaller, BuildSurface,
     SystemTemplateAuthority, TenantTemplateAuthority,
 };
-use crate::auth::{is_jwt_shaped, k8s::K8sTokenAuthConfig};
+use crate::auth::is_jwt_shaped;
+use crate::auth::k8s::{
+    InFlightState, K8sTokenAuthConfig, Lookup, TokenCacheKey, TokenReviewCache,
+    accepted_token_cache_expiry,
+};
+
+/// The least time left on a call's deadline for it to start a review.
+const MIN_REVIEW_TIME: Duration = Duration::from_millis(100);
 
 pub(super) struct BuildTokenReviewer {
     reviews: kube::Api<TokenReview>,
     policy: BuildPolicy,
+    surface: BuildSurface,
     permits: tokio::sync::Semaphore,
     budget: Mutex<ReviewBudget>,
     timeout: Duration,
+    /// Accepted reviews, each kept for `reviewed_ttl` after it returns or
+    /// until 5 s before the token's `exp`, whichever is sooner. `policy` is
+    /// applied to a cached identity on every call. A rejected or failed review
+    /// is not cached.
+    reviewed: TokenReviewCache<ReviewedBuildToken>,
+    /// `K8sTokenAuthConfig::cache_ttl`, the TTL node-api's verifier uses.
+    reviewed_ttl: Duration,
+}
+
+/// What a TokenReview established about a token, before any build policy.
+#[derive(Clone, Debug)]
+struct ReviewedBuildToken {
+    username: String,
+    node: Option<AuthenticatedBuildNode>,
 }
 
 pub(super) struct BuildPolicy {
@@ -125,6 +147,7 @@ impl BuildTokenReviewer {
         Ok(Self {
             reviews: kube::Api::all(crate::kube_client::traced_kube_client_from_env().await?),
             policy,
+            surface,
             permits: tokio::sync::Semaphore::new(config.max_inflight_reviews),
             budget: Mutex::new(ReviewBudget {
                 window: Instant::now(),
@@ -132,6 +155,8 @@ impl BuildTokenReviewer {
                 per_second,
             }),
             timeout: config.review_timeout,
+            reviewed: TokenReviewCache::new(config.cache_max_entries),
+            reviewed_ttl: config.cache_ttl,
         })
     }
 
@@ -139,14 +164,89 @@ impl BuildTokenReviewer {
         &self,
         token: &str,
     ) -> Result<BuildAuthenticatedCaller, Status> {
-        let policy = &self.policy;
         if !is_jwt_shaped(token) {
             return Err(Status::unauthenticated("invalid token"));
         }
-        let _permit = self
-            .permits
-            .try_acquire()
-            .map_err(|_| Status::unavailable("build token reviewer is busy"))?;
+        // One review timeout bounds the whole call, waits included. Without
+        // it, callers bearing one token would review in turn behind a hung
+        // apiserver, the k-th failing only after k timeouts.
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        let key = TokenCacheKey::new(token, &self.policy.audience);
+        let _claim = loop {
+            if let Some(reviewed) = self.cached(&key) {
+                return self.policy.authorize(&reviewed);
+            }
+            match self.reviewed.join_in_flight_or_claim(&key) {
+                InFlightState::Claimed(claim) => {
+                    if let Some(reviewed) = self.cached(&key) {
+                        return self.policy.authorize(&reviewed);
+                    }
+                    break claim;
+                }
+                InFlightState::Waiting(waiter) => {
+                    self.cache_metric("in_flight_wait");
+                    if tokio::time::timeout_at(deadline, waiter).await.is_err() {
+                        self.cache_metric("in_flight_timeout");
+                        return Err(Status::unavailable("build token review timed out"));
+                    }
+                }
+            }
+        };
+        self.cache_metric("miss");
+        let reviewed = self.review(token, deadline).await?;
+        let now = Instant::now();
+        let expires_at =
+            accepted_token_cache_expiry(token, now, SystemTime::now(), self.reviewed_ttl);
+        if expires_at > now {
+            if self.reviewed.insert(key, reviewed.clone(), expires_at, now) {
+                self.cache_metric("evict_capacity");
+            }
+            self.cache_metric("insert_authenticated");
+        }
+        self.policy.authorize(&reviewed)
+    }
+
+    fn cached(&self, key: &TokenCacheKey) -> Option<ReviewedBuildToken> {
+        match self.reviewed.lookup(key, Instant::now()) {
+            Lookup::Live(reviewed) => {
+                self.cache_metric("hit_authenticated");
+                Some(reviewed)
+            }
+            Lookup::Expired => {
+                self.cache_metric("evict_expired");
+                None
+            }
+            Lookup::Absent => None,
+        }
+    }
+
+    fn cache_metric(&self, result: &str) {
+        pplx_space_metrics::auth::build_token_review_cache(self.surface.as_str(), result);
+    }
+
+    /// Reviews `token` with the apiserver by `deadline`, within the
+    /// concurrency permits and the per-second budget. Bounds apiserver load
+    /// and fails closed when the review cannot complete.
+    async fn review(
+        &self,
+        token: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<ReviewedBuildToken, Status> {
+        let policy = &self.policy;
+        // A call that claims after another call's review failed has only what
+        // is left of its deadline. Too little to finish a review is refused
+        // before it spends a permit and a budget unit.
+        let review_time = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if review_time < MIN_REVIEW_TIME {
+            self.cache_metric("in_flight_timeout");
+            return Err(Status::unavailable("build token review timed out"));
+        }
+        // A refusal here is counted, not logged: under load it repeats per
+        // call, and the caller already sees the status.
+        let Ok(_permit) = self.permits.try_acquire() else {
+            self.cache_metric("busy");
+            return Err(Status::unavailable("build token reviewer is busy"));
+        };
         {
             let mut budget = self
                 .budget
@@ -157,12 +257,11 @@ impl BuildTokenReviewer {
                 budget.remaining = budget.per_second;
             }
             if budget.remaining == 0 {
+                self.cache_metric("rate_limited");
                 return Err(Status::unavailable("build token review rate exceeded"));
             }
             budget.remaining -= 1;
         }
-        // Review each build RPC instead of maintaining a second authentication
-        // cache. Bound apiserver load and fail closed when review cannot complete.
         let review = TokenReview {
             spec: TokenReviewSpec {
                 token: Some(token.to_string()),
@@ -170,15 +269,15 @@ impl BuildTokenReviewer {
             },
             ..Default::default()
         };
-        let response = tokio::time::timeout(
-            self.timeout,
+        let response = tokio::time::timeout_at(
+            deadline,
             self.reviews.create(&PostParams::default(), &review),
         )
         .await
         .map_err(|_| {
             tracing::warn!(
                 audience = %policy.audience,
-                timeout_secs = self.timeout.as_secs_f64(),
+                timeout_secs = review_time.as_secs_f64(),
                 "build TokenReview request timed out"
             );
             Status::unavailable("build token review timed out")
@@ -227,25 +326,39 @@ impl BuildTokenReviewer {
             .username
             .as_deref()
             .ok_or_else(|| Status::unauthenticated("build token has no identity"))?;
-        if !policy.allowed.contains(username) {
+        Ok(ReviewedBuildToken {
+            username: username.to_owned(),
+            node: AuthenticatedBuildNode::from_reviewed_user_info(&user),
+        })
+    }
+}
+
+impl BuildPolicy {
+    /// Applies this surface's build policy to a reviewed identity. Runs on
+    /// every call, cached or not.
+    fn authorize(&self, reviewed: &ReviewedBuildToken) -> Result<BuildAuthenticatedCaller, Status> {
+        let username = reviewed.username.as_str();
+        if !self.allowed.contains(username) {
             return Err(Status::permission_denied("caller may not submit builds"));
         }
-        let system = if policy.system.contains(username) {
+        let system = if self.system.contains(username) {
             SystemTemplateAuthority::Unconditional
-        } else if policy.granted_system.contains(username) {
+        } else if self.granted_system.contains(username) {
             SystemTemplateAuthority::Granted
         } else {
             SystemTemplateAuthority::Denied
         };
-        let tenant = if !policy.tenant.contains(username) {
+        let tenant = if !self.tenant.contains(username) {
             TenantTemplateAuthority::Denied
-        } else if policy.tenant_requires_grant {
+        } else if self.tenant_requires_grant {
             TenantTemplateAuthority::Granted
         } else {
             TenantTemplateAuthority::Unconditional
         };
         let node = if tenant == TenantTemplateAuthority::Granted {
-            Some(publication_node(&user)?)
+            Some(reviewed.node.clone().ok_or_else(|| {
+                Status::permission_denied("publication requires a pod-bound node identity")
+            })?)
         } else {
             None
         };
@@ -255,13 +368,6 @@ impl BuildTokenReviewer {
             node,
         })
     }
-}
-
-fn publication_node(
-    user: &k8s_openapi::api::authentication::v1::UserInfo,
-) -> Result<AuthenticatedBuildNode, Status> {
-    AuthenticatedBuildNode::from_reviewed_user_info(user)
-        .ok_or_else(|| Status::permission_denied("publication requires a pod-bound node identity"))
 }
 
 #[cfg(test)]

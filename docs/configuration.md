@@ -342,8 +342,9 @@ dispatch fails and pins it to the accepting builder node from the response.
 Build-manager forwards the grant to template and release registration.
 ClusterApi accepts a tenant-list account's publication only with a grant that
 names the requested template and organization and that covers the builder node
-identified by freshly reviewed pod-bound node name and UID, matched against
-live Kubernetes builder inventory. A builder whose registration has no
+identified by the pod-bound node name and UID from a TokenReview of the caller's
+token, matched against live Kubernetes builder inventory. An accepted review is
+reused for at most 30 seconds. A builder whose registration has no
 inventory UID yet cannot publish; build-manager retries until inventory
 synchronization completes, within its bounded registration backoff. Updated build-managers also
 retry publication failures explicitly marked as uncommitted database

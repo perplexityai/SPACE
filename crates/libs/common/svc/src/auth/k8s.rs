@@ -1,9 +1,10 @@
-//! Kubernetes `TokenReview` authentication path for node-api.
+//! Kubernetes `TokenReview` authentication path for node-api, and the
+//! reviewed-token cache ([`review_cache`]) that the build reviewers share.
 //!
 //! This whole module is gated behind the `k8s` cargo feature via `mod k8s;` in
 //! the parent, so individual items here do not carry `#[cfg(feature = "k8s")]`.
 
-use std::collections::{BTreeSet, HashMap, hash_map::Entry};
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -11,8 +12,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use base64::{Engine, engine::general_purpose};
 use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewSpec, TokenReviewStatus};
 use kube::api::PostParams;
-use sha2::{Digest, Sha256};
 use tonic::Status;
+
+mod review_cache;
+
+pub(super) use review_cache::{InFlightState, Lookup, TokenCacheKey, TokenReviewCache};
 
 use super::{
     AuthConfigError, AuthSurface, AuthenticatedNodeIdentity, DataPlaneSessionRefreshAuthority,
@@ -124,8 +128,7 @@ impl ReviewRateLimiter {
 pub(super) struct K8sTokenReviewer {
     reviews: kube::Api<TokenReview>,
     config: Arc<K8sTokenAuthConfig>,
-    cache: Arc<Mutex<HashMap<TokenCacheKey, CachedTokenReview>>>,
-    in_flight: Arc<Mutex<HashMap<TokenCacheKey, Vec<tokio::sync::oneshot::Sender<()>>>>>,
+    cache: Arc<TokenReviewCache<CachedTokenReviewResult>>,
     // Caps concurrent TokenReview calls to the apiserver across distinct tokens.
     review_limiter: Arc<tokio::sync::Semaphore>,
     // Caps the per-second rate of TokenReview calls across distinct tokens.
@@ -143,9 +146,8 @@ impl K8sTokenReviewer {
         let rate_limiter = Arc::new(ReviewRateLimiter::new(config.review_rate_per_sec));
         Self {
             reviews: kube::Api::all(client),
+            cache: Arc::new(TokenReviewCache::new(config.cache_max_entries)),
             config: Arc::new(config),
-            cache: Arc::new(Mutex::new(HashMap::new())),
-            in_flight: Arc::new(Mutex::new(HashMap::new())),
             review_limiter,
             rate_limiter,
         }
@@ -170,16 +172,13 @@ impl K8sTokenReviewer {
                 return Err(rejection.into_status());
             }
         };
-        let key = TokenCacheKey {
-            token_digest: token_digest(token),
-            audience: policy.audience.to_owned(),
-        };
+        let key = TokenCacheKey::new(token, policy.audience);
 
         let _in_flight_claim = loop {
             if let Some(cached) = self.cached_result(&key) {
                 return self.authorize_cached_result(&policy, surface, method, cached);
             }
-            match self.join_in_flight_or_claim(&key) {
+            match self.cache.join_in_flight_or_claim(&key) {
                 InFlightState::Claimed(claim) => {
                     if let Some(cached) = self.cached_result(&key) {
                         return self.authorize_cached_result(&policy, surface, method, cached);
@@ -310,16 +309,13 @@ impl K8sTokenReviewer {
     }
 
     fn cached_result(&self, key: &TokenCacheKey) -> Option<CachedTokenReviewResult> {
-        let now = Instant::now();
-        let mut cache = lock_or_recover(&self.cache);
-        match cache.get(key) {
-            Some(cached) if cached.expires_at > now => Some(cached.result.clone()),
-            Some(_) => {
-                cache.remove(key);
+        match self.cache.lookup(key, Instant::now()) {
+            Lookup::Live(result) => Some(result),
+            Lookup::Expired => {
                 pplx_space_metrics::auth::token_review_cache("evict_expired");
                 None
             }
-            None => None,
+            Lookup::Absent => None,
         }
     }
 
@@ -348,24 +344,6 @@ impl K8sTokenReviewer {
                     reason.as_str(),
                 );
                 Err(reason.to_status())
-            }
-        }
-    }
-
-    fn join_in_flight_or_claim(&self, key: &TokenCacheKey) -> InFlightState {
-        let mut in_flight = lock_or_recover(&self.in_flight);
-        match in_flight.entry(key.clone()) {
-            Entry::Occupied(mut entry) => {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                entry.get_mut().push(tx);
-                InFlightState::Waiting(rx)
-            }
-            Entry::Vacant(entry) => {
-                entry.insert(Vec::new());
-                InFlightState::Claimed(InFlightClaim {
-                    key: key.clone(),
-                    in_flight: Arc::clone(&self.in_flight),
-                })
             }
         }
     }
@@ -430,16 +408,8 @@ impl K8sTokenReviewer {
         result: CachedTokenReviewResult,
         expires_at: Instant,
     ) {
-        let mut cache = lock_or_recover(&self.cache);
-        let (result_tag, evicted_capacity) = cache_token_review_result(
-            &mut cache,
-            key,
-            result,
-            expires_at,
-            Instant::now(),
-            self.config.cache_max_entries,
-        );
-        if evicted_capacity {
+        let result_tag = result.insert_metric();
+        if self.cache.insert(key, result, expires_at, Instant::now()) {
             pplx_space_metrics::auth::token_review_cache("evict_capacity");
         }
         pplx_space_metrics::auth::token_review_cache(result_tag);
@@ -484,27 +454,6 @@ impl K8sTokenReviewer {
     }
 }
 
-enum InFlightState {
-    Claimed(InFlightClaim),
-    Waiting(tokio::sync::oneshot::Receiver<()>),
-}
-
-struct InFlightClaim {
-    key: TokenCacheKey,
-    in_flight: Arc<Mutex<HashMap<TokenCacheKey, Vec<tokio::sync::oneshot::Sender<()>>>>>,
-}
-
-impl Drop for InFlightClaim {
-    fn drop(&mut self) {
-        let waiters = lock_or_recover(&self.in_flight)
-            .remove(&self.key)
-            .unwrap_or_default();
-        for waiter in waiters {
-            let _ = waiter.send(());
-        }
-    }
-}
-
 #[derive(Clone)]
 pub(super) struct K8sTokenAuthConfig {
     pub(super) namespace: String,
@@ -519,9 +468,9 @@ pub(super) struct K8sTokenAuthConfig {
     template_transfer_usernames: BTreeSet<String>,
     node_api_internal_allowed_usernames: BTreeSet<String>,
     cluster_api_allowed_usernames: BTreeSet<String>,
-    cache_ttl: Duration,
+    pub(super) cache_ttl: Duration,
     negative_cache_ttl: Duration,
-    cache_max_entries: usize,
+    pub(super) cache_max_entries: usize,
     pub(super) max_inflight_reviews: usize,
     review_rate_per_sec: u64,
     pub(super) review_timeout: Duration,
@@ -855,18 +804,6 @@ impl AuthPolicy<'_> {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct TokenCacheKey {
-    token_digest: [u8; 32],
-    audience: String,
-}
-
-#[derive(Clone, Debug)]
-struct CachedTokenReview {
-    result: CachedTokenReviewResult,
-    expires_at: Instant,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum CachedTokenReviewResult {
     Accepted {
@@ -876,6 +813,15 @@ enum CachedTokenReviewResult {
     Rejected {
         reason: TokenReviewRejectReason,
     },
+}
+
+impl CachedTokenReviewResult {
+    const fn insert_metric(&self) -> &'static str {
+        match self {
+            Self::Accepted { .. } => "insert_authenticated",
+            Self::Rejected { .. } => "insert_deny",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -921,64 +867,13 @@ impl TokenReviewRejectReason {
     }
 }
 
-fn prune_token_review_cache(
-    cache: &mut HashMap<TokenCacheKey, CachedTokenReview>,
-    now: Instant,
-    max_entries: usize,
-) {
-    if max_entries == 0 {
-        cache.clear();
-        return;
-    }
-    cache.retain(|_, cached| cached.expires_at > now);
-}
-
 fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn cache_token_review_result(
-    cache: &mut HashMap<TokenCacheKey, CachedTokenReview>,
-    key: TokenCacheKey,
-    result: CachedTokenReviewResult,
-    expires_at: Instant,
-    now: Instant,
-    max_entries: usize,
-) -> (&'static str, bool) {
-    let result_tag = match &result {
-        CachedTokenReviewResult::Accepted { .. } => "insert_authenticated",
-        CachedTokenReviewResult::Rejected { .. } => "insert_deny",
-    };
-    if max_entries == 0 {
-        cache.clear();
-        return (result_tag, false);
-    }
-
-    prune_token_review_cache(cache, now, max_entries);
-    // Capacity eviction is O(N), bounded by cache_max_entries. Keep the cap
-    // modest; if this cache ever needs to grow materially, replace the HashMap
-    // with a real LRU/LFU structure instead of stretching this scan.
-    let evicted_capacity = if cache.len() >= max_entries {
-        if let Some(evict_key) = cache
-            .iter()
-            .min_by_key(|(_, cached)| cached.expires_at)
-            .map(|(key, _)| key.clone())
-        {
-            cache.remove(&evict_key);
-            true
-        } else {
-            false
-        }
-    } else {
-        false
-    };
-    cache.insert(key, CachedTokenReview { result, expires_at });
-    (result_tag, evicted_capacity)
-}
-
-fn accepted_token_cache_expiry(
+pub(super) fn accepted_token_cache_expiry(
     token: &str,
     now: Instant,
     now_system: SystemTime,
@@ -1058,12 +953,6 @@ fn validate_token_review_status(
         username,
         node_identity,
     })
-}
-
-fn token_digest(token: &str) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(token.as_bytes());
-    hasher.finalize().into()
 }
 
 fn service_account_username(namespace: &str, name: &str) -> String {

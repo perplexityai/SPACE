@@ -4,7 +4,7 @@ use super::super::{
 };
 use super::*;
 use crate::auth::test_support::{
-    TokenReviewStatus, pod_bound_service_account_status, service_account_status,
+    TokenReviewStatus, jwt_with_exp, pod_bound_service_account_status, service_account_status,
     token_review_service,
 };
 use kube::client::{Body, ClientBuilder};
@@ -12,11 +12,13 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
+use std::time::UNIX_EPOCH;
 use tonic::Code;
 
 const NODE_BUILD: &str = "/space.node.api.v1.BuilderApi/BuildTemplate";
 const MANAGER_BUILD: &str = "/build.manager.v1.BuildManager/StartBuild";
 const TOKEN: &str = "header.untrusted-claims.signature";
+const BUILDER: &str = "system:serviceaccount:space:space-builder";
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -41,21 +43,31 @@ fn reviewer(
     status: TokenReviewStatus,
     expected_audience: &str,
 ) -> (BuildTokenReviewer, Arc<AtomicUsize>) {
+    reviewer_for_token(status, expected_audience, TOKEN)
+}
+
+fn reviewer_for_token(
+    status: TokenReviewStatus,
+    expected_audience: &str,
+    expected_token: &str,
+) -> (BuildTokenReviewer, Arc<AtomicUsize>) {
     let calls = Arc::new(AtomicUsize::new(0));
     let expected_policy = policy(expected_audience);
     let expected_audience = expected_audience.to_string();
+    let expected_token = expected_token.to_string();
     let service = token_review_service({
         let calls = calls.clone();
         move |request| {
             calls.fetch_add(1, Ordering::SeqCst);
             assert_eq!(request.audiences, Some(vec![expected_audience.clone()]));
-            assert_eq!(request.token.as_deref(), Some(TOKEN));
+            assert_eq!(request.token.as_deref(), Some(expected_token.as_str()));
             status.clone()
         }
     });
     let reviewer = BuildTokenReviewer {
         reviews: kube::Api::all(ClientBuilder::new(service, "space").build()),
         policy: expected_policy,
+        surface: BuildSurface::Manager,
         permits: tokio::sync::Semaphore::new(8),
         budget: Mutex::new(ReviewBudget {
             window: Instant::now(),
@@ -63,8 +75,55 @@ fn reviewer(
             per_second: 50,
         }),
         timeout: Duration::from_secs(5),
+        reviewed: TokenReviewCache::new(16),
+        reviewed_ttl: Duration::from_secs(30),
     };
     (reviewer, calls)
+}
+
+/// A build-manager reviewer whose apiserver answers each review with `status`
+/// after `delay`, or never when `delay` is `None`.
+fn reviewer_answering_after(
+    status: TokenReviewStatus,
+    delay: Option<Duration>,
+) -> (BuildTokenReviewer, Arc<AtomicUsize>) {
+    let (mut reviewer, _) = reviewer(status.clone(), "space-build-manager");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let body = serde_json::to_vec(&TokenReview {
+        status: Some(status),
+        ..Default::default()
+    })
+    .unwrap();
+    let service = tower::service_fn({
+        let calls = calls.clone();
+        move |_request: http::Request<Body>| {
+            let calls = calls.clone();
+            let body = body.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                match delay {
+                    Some(delay) => tokio::time::sleep(delay).await,
+                    None => std::future::pending::<()>().await,
+                }
+                Ok::<_, BoxError>(
+                    http::Response::builder()
+                        .status(201)
+                        .header(http::header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+            }
+        }
+    });
+    reviewer.reviews = kube::Api::all(ClientBuilder::new(service, "space").build());
+    (reviewer, calls)
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 fn authenticator(reviewer: BuildTokenReviewer, fallback: bool) -> BuildAuthenticator {
@@ -235,11 +294,15 @@ async fn invalid_review_and_exhausted_budget_fail_closed() {
             (Some(false), expected_rejected),
         ] {
             status.authenticated = authenticated;
-            let (reviewer, _) = reviewer(status.clone(), "space-build-manager");
+            let (reviewer, calls) = reviewer(status.clone(), "space-build-manager");
 
-            let result = reviewer.authenticate(TOKEN).await;
+            // A failed review is not cached: the second call reviews again.
+            for _ in 0..2 {
+                let result = reviewer.authenticate(TOKEN).await;
 
-            assert_eq!(result.unwrap_err().code(), expected);
+                assert_eq!(result.unwrap_err().code(), expected);
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
         }
     }
     let (reviewer, calls) = reviewer(
@@ -428,7 +491,7 @@ async fn publication_requires_unambiguous_reviewed_pod_and_node() {
                     extra.remove(&key);
                 }
             }
-            let (mut reviewer, _) = reviewer(status, "space-cluster-api");
+            let (mut reviewer, calls) = reviewer(status, "space-cluster-api");
             reviewer.policy = BuildPolicy::new(
                 BuildSurface::Publication,
                 "space-cluster-api".into(),
@@ -437,9 +500,118 @@ async fn publication_requires_unambiguous_reviewed_pod_and_node() {
                 accounts(&["space-build-manager"]),
             );
 
-            let result = reviewer.authenticate(TOKEN).await;
+            // The second call is denied from the cached identity.
+            for _ in 0..2 {
+                let result = reviewer.authenticate(TOKEN).await;
 
-            assert_eq!(result.unwrap_err().code(), Code::PermissionDenied);
+                assert_eq!(result.unwrap_err().code(), Code::PermissionDenied);
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
         }
     }
+}
+
+/// Calls bearing an accepted token are answered from the cache until its
+/// entry expires, without spending the per-second review budget.
+#[tokio::test]
+async fn a_reviewed_token_is_answered_from_the_cache_without_spending_budget() {
+    let (reviewer, calls) = reviewer(
+        service_account_status("space-build-manager", BUILDER),
+        "space-build-manager",
+    );
+    reviewer.budget.lock().unwrap().remaining = 1;
+
+    for _ in 0..10 {
+        reviewer.authenticate(TOKEN).await.unwrap();
+    }
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// The cache holds who the caller is, not what it may do: the surface's build
+/// policy is applied to the cached identity on every call.
+#[tokio::test]
+async fn a_cached_identity_is_authorized_on_every_call() {
+    let (mut reviewer, calls) = reviewer(
+        service_account_status("space-build-manager", BUILDER),
+        "space-build-manager",
+    );
+    reviewer.authenticate(TOKEN).await.unwrap();
+
+    reviewer.policy = BuildPolicy::new(
+        BuildSurface::Manager,
+        "space-build-manager".to_string(),
+        accounts(&["space-api"]),
+        BTreeSet::new(),
+        accounts(&["space-api"]),
+    );
+
+    assert_eq!(
+        reviewer.authenticate(TOKEN).await.unwrap_err().code(),
+        Code::PermissionDenied
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// A token whose `exp` falls within the 5 s expiry skew is never cached and
+/// is reviewed on every call; one that expires later is cached.
+#[tokio::test]
+async fn a_token_near_its_expiry_is_reviewed_on_every_call() {
+    for (expires_in, expected_calls) in [(1, 2), (3_600, 1)] {
+        let token = jwt_with_exp(unix_now() + expires_in);
+        let (reviewer, calls) = reviewer_for_token(
+            service_account_status("space-build-manager", BUILDER),
+            "space-build-manager",
+            &token,
+        );
+
+        for _ in 0..2 {
+            reviewer.authenticate(&token).await.unwrap();
+        }
+
+        assert_eq!(calls.load(Ordering::SeqCst), expected_calls, "{expires_in}");
+    }
+}
+
+/// Calls bearing one token while its review is in flight wait for that review
+/// instead of each starting one.
+#[tokio::test]
+async fn concurrent_calls_with_one_token_share_one_review() {
+    let (reviewer, calls) = reviewer_answering_after(
+        service_account_status("space-build-manager", BUILDER),
+        Some(Duration::from_millis(100)),
+    );
+
+    let (first, second, third, fourth) = tokio::join!(
+        reviewer.authenticate(TOKEN),
+        reviewer.authenticate(TOKEN),
+        reviewer.authenticate(TOKEN),
+        reviewer.authenticate(TOKEN),
+    );
+
+    for result in [first, second, third, fourth] {
+        result.unwrap();
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// One review timeout bounds each call, waits included: calls that share a
+/// review the apiserver never answers all fail within it.
+#[tokio::test(start_paused = true)]
+async fn calls_waiting_on_a_hung_review_fail_within_one_timeout() {
+    let (mut reviewer, calls) =
+        reviewer_answering_after(service_account_status("space-build-manager", BUILDER), None);
+    reviewer.timeout = Duration::from_millis(500);
+    let started = tokio::time::Instant::now();
+
+    let (first, second) = tokio::join!(reviewer.authenticate(TOKEN), reviewer.authenticate(TOKEN));
+
+    assert_eq!(first.unwrap_err().code(), Code::Unavailable);
+    assert_eq!(second.unwrap_err().code(), Code::Unavailable);
+    assert!(
+        started.elapsed() <= reviewer.timeout + Duration::from_millis(1),
+        "both calls should fail within one review timeout, took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
