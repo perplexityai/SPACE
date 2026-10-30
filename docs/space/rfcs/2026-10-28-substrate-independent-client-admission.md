@@ -260,7 +260,10 @@ something other than that client's own call: an ingress request, a native
 file read, a reconciler's rebuild. Those wakes still give the client one
 more live sandbox, so they count against its cap. Classifying them `Native`
 would relabel the sandbox `native` and drop it from its client's cap for
-good.
+good. None of those wakes carries the client's `X-Client-ID`: a data-plane
+request isn't that client's call, and a node drain's evacuation has no
+request at all. That's why the client id is persisted (see "Not persisting
+the client id" under "Alternatives considered").
 
 **Why native has no cap.** Native creates already have a per-organization
 limit (`native_sandbox_limits.rs`), and a native live cap is a separate
@@ -863,6 +866,21 @@ operations, against the same Redis. Everything here applies there too:
 
 ## Alternatives considered
 
+- **Not persisting the client id.** Not every runtime creation runs in the
+  activating client's own request. A data-plane request (ingress, a native
+  file or process route) wakes a suspended or stopped sandbox from a request
+  that isn't that client's call, and a node drain's evacuation rebuilds pods
+  with no request at all. Neither has the client's header to read. Two
+  cheaper options fall short:
+  - *Copying the label from the old pod* fails because a sandbox at rest,
+    suspended or stopped, has no pod, and that's exactly the state the
+    data-plane path wakes from.
+  - *Labeling such pods `unknown`* moves the sandbox out of its client's
+    cap until that client activates it again itself, which some never do.
+
+  Warm pools don't need the record. Their pods exist before any client
+  does, and the create that claims one has the header, so it's labeled at
+  adoption (Decision 4).
 - **Per-generation column (PR #1066's first version).** Kubernetes-only, needs
   inheritance in every generation insert, and records claims, not
   activations.
