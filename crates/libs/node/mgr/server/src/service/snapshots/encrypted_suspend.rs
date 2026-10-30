@@ -249,6 +249,7 @@ impl NodeManagerService {
         self.stage_retained_encrypted_suspend_under_ownership(
             sandbox_id,
             local_artifact_id,
+            fresh,
             execution_fence,
         )
         .await?;
