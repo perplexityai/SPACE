@@ -5,7 +5,7 @@ use pplx_space_common_core::types::{
     SpaceApiRouteIdentity, VsockCid,
 };
 
-fn endpoint_proof(start_time_ticks: u64) -> crate::endpoint_proof::SpacedEndpointProof {
+pub(super) fn endpoint_proof(start_time_ticks: u64) -> crate::endpoint_proof::SpacedEndpointProof {
     crate::endpoint_proof::SpacedEndpointProof {
         sandbox_id: SandboxId::new(),
         execution_generation: ExecutionGeneration::new(1).unwrap(),
@@ -101,19 +101,157 @@ fn malformed_endpoint_proof_is_an_internal_failure() {
             "node returned a malformed proof".to_string(),
         ));
     assert_eq!(status.code(), tonic::Code::Internal);
+}
 
-    let status = node_endpoint_proof_status(tonic::Status::invalid_argument(
-        "node returned malformed endpoint state",
-    ));
-    assert_eq!(status.code(), tonic::Code::Internal);
+/// Node-manager statuses as tonic surfaces them, with the code the caller
+/// is answered and whether the endpoint proof retry window replays them.
+/// The window replays the client's connection failures, the codes the shared
+/// retry rule retries (including a rate limit whose hint it waits out), and
+/// `DeadlineExceeded`, `Unimplemented` and any `Cancelled`; other answers are
+/// not replayed. Load shed and an over-long rate limit still answer
+/// `Unavailable`, so the caller can retry later.
+fn node_endpoint_proof_statuses()
+-> Vec<(&'static str, tonic::Status, tonic::Code, tonic::Code, bool)> {
+    use tonic::Code;
+    let h2 = |reason| tonic::Status::from_error(Box::new(h2::Error::from(reason)));
+    let rate_limited = |try_again| {
+        pplx_space_common_grpc::rate_limited_status(
+            "busy",
+            Some(std::time::Duration::from_secs(try_again)),
+        )
+    };
+    vec![
+        (
+            "client timed the request out",
+            tonic::Status::from_error(Box::new(tonic::TimeoutExpired(()))),
+            Code::Cancelled,
+            Code::Unavailable,
+            true,
+        ),
+        (
+            "server's rapid-reset guard closed the connection",
+            h2(h2::Reason::ENHANCE_YOUR_CALM),
+            Code::ResourceExhausted,
+            Code::Unavailable,
+            true,
+        ),
+        (
+            "connection closed with a protocol error",
+            h2(h2::Reason::PROTOCOL_ERROR),
+            Code::Internal,
+            Code::Unavailable,
+            true,
+        ),
+        (
+            "connection closed gracefully mid-request",
+            h2(h2::Reason::NO_ERROR),
+            Code::Internal,
+            Code::Unavailable,
+            true,
+        ),
+        (
+            "stream cancelled by the peer",
+            h2(h2::Reason::CANCEL),
+            Code::Cancelled,
+            Code::Unavailable,
+            true,
+        ),
+        (
+            "stream refused by the peer",
+            h2(h2::Reason::REFUSED_STREAM),
+            Code::Unavailable,
+            Code::Unavailable,
+            true,
+        ),
+        (
+            "endpoint proof RPC not deployed yet",
+            tonic::Status::unimplemented("unknown method"),
+            Code::Unimplemented,
+            Code::Unavailable,
+            true,
+        ),
+        (
+            "rate limited with a retry hint inside the wait bound",
+            rate_limited(1),
+            Code::ResourceExhausted,
+            Code::Unavailable,
+            true,
+        ),
+        (
+            "rate limited with a retry hint past the wait bound",
+            rate_limited(30),
+            Code::ResourceExhausted,
+            Code::Unavailable,
+            false,
+        ),
+        (
+            "load shed by node-manager's in-flight limit",
+            tonic::Status::resource_exhausted("UDS gRPC rate limit exceeded"),
+            Code::ResourceExhausted,
+            Code::Unavailable,
+            false,
+        ),
+        (
+            "node-manager failed to evaluate the proof",
+            tonic::Status::internal("proof evaluation failed"),
+            Code::Internal,
+            Code::Internal,
+            false,
+        ),
+        (
+            "node-manager returned malformed endpoint state",
+            tonic::Status::invalid_argument("malformed endpoint state"),
+            Code::InvalidArgument,
+            Code::Internal,
+            false,
+        ),
+        (
+            "endpoint no longer matches the proof",
+            tonic::Status::failed_precondition("endpoint changed"),
+            Code::FailedPrecondition,
+            Code::PermissionDenied,
+            false,
+        ),
+        (
+            "endpoint identity mismatch",
+            tonic::Status::permission_denied("endpoint identity mismatch"),
+            Code::PermissionDenied,
+            Code::PermissionDenied,
+            false,
+        ),
+    ]
 }
 
 #[test]
-fn missing_endpoint_proof_rpc_is_retryable_during_rollout() {
-    let status = node_endpoint_proof_status(tonic::Status::unimplemented(
-        "endpoint proof RPC is not deployed yet",
-    ));
-    assert_eq!(status.code(), tonic::Code::Unavailable);
+fn node_endpoint_proof_failures_map_to_the_callers_code() {
+    for (case, status, tonic_code, mapped, _) in node_endpoint_proof_statuses() {
+        assert_eq!(status.code(), tonic_code, "{case}: tonic's code");
+        let status =
+            node_endpoint_proof_status(SandboxId::new(), "validate_sandbox_endpoint_proof", status);
+        assert_eq!(status.code(), mapped, "{case}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn endpoint_proof_rpc_replays_connection_failures_but_not_answers() {
+    for (case, status, _, _, replayed) in node_endpoint_proof_statuses() {
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let result = call_endpoint_proof_rpc("validate_sandbox_endpoint_proof", || {
+            let first = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+            let status = status.clone();
+            async move { if first { Err(status) } else { Ok(()) } }
+        })
+        .await;
+
+        let attempts = attempts.load(std::sync::atomic::Ordering::SeqCst);
+        if replayed {
+            assert!(result.is_ok(), "{case}: {result:?}");
+            assert_eq!(attempts, 2, "{case}");
+        } else {
+            assert!(result.is_err(), "{case}");
+            assert_eq!(attempts, 1, "{case}: an answer is not replayed");
+        }
+    }
 }
 
 #[test]
