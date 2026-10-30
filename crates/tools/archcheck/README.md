@@ -288,16 +288,200 @@ dependencies depend on. For sbx-mgr, `run_sbxmgr_production_checks` in
 tree -i`, it asserts which crates may bring rusqlite and `pplx-space-sqlite`
 into the server's production graph.
 
+## Layers
+
+`layers` keeps every workspace crate in a layer and its dependencies pointing
+down the stack. The layers are directories under `crates/`, bottom-up:
+
+| Layer | Holds |
+|---|---|
+| `l10_foundation` | generic building blocks that name nothing SPACE-specific |
+| `l20_domain` | models (types and the rules that keep them valid) and protocols (wire schemas and conversions), without I/O |
+| `l30_storage` | stores: the only crates that reach a database, private to the crates that own their state |
+| `l40_api` | use cases and their entry points (handlers, loops, sweepers, jobs), and each service's `*-client` |
+| `l50_app` | thin mains that compose API crates |
+| `test_support` | test doubles and fixtures, reachable only through `[dev-dependencies]` |
+| `tools` | repository tools, never shipped; nothing depends on them |
+
+A crate in `crates/<layer>/` takes its layer from the directory. Below it, the
+crate's path is its package name without `pplx-space-`, split on `-`:
+`pplx-space-sbx-mgr-client` in `l40_api` is at `crates/l40_api/sbx/mgr/client`.
+A crate may sit one directory below its name's path (a leaf without `-`); use
+one where another crate's name in the layer would nest, such as `server` for a
+service: `sbx-mgr` beside `sbx-mgr-client` is at
+`crates/l40_api/sbx/mgr/server`. The crates that predate the layer
+directories are listed by layer in `[rules.layers.unmoved]` until they move;
+a new crate goes in a layer directory.
+
+Normal and build dependencies follow this matrix; the checks below say what
+each finding means and how to fix it.
+
+| From | May depend on |
+|---|---|
+| Foundation | Foundation |
+| Domain | Domain, Foundation |
+| Storage | Domain, Foundation, and another store that lists it as a user |
+| API | API, Domain, Foundation, and the stores that list it as a user; a `*-client` only Domain, Foundation and other clients |
+| App | API, Domain, Foundation; never another app or a store |
+| test_support, tools | anything but tools |
+
+```toml
+[rules.layers.unmoved]                 # crates outside the layer directories
+l10_foundation = ["pplx-space-byte-size"]
+
+[rules.layers.store_users]             # store → the crates that own its state
+pplx-space-sandbox-store = ["pplx-space-api"]
+
+[rules.layers.allowed_edges]           # edges the matrix forbids, allowed by name
+pplx-space-db-migrator = ["pplx-space-db-migrate"]
+
+[rules.layers.placement]
+mode = "required"
+# ...and layout, test_only, clients, store_edges, stale_entries and
+# policy_changed, each with a mode, and direction and dev_direction, each with
+# no_crossing, no_new_entries and stale_entries.
+```
+
+The checks, each with its own mode:
+
+- `placement`: a crate outside the layer directories without an `unmoved`
+  entry, shown on the `name =` line of its `Cargo.toml`; and, with
+  `--base-architecture`, an `unmoved` entry the base branch's copy lacks,
+  shown on the entry's line, since the list only shrinks. If the base
+  branch has no `[rules.layers]`, the whole list is new and only
+  `policy_changed` reports it.
+- `layout`: a crate in a layer directory at another path than its name's,
+  with or without a leaf, or with another crate inside its directory (shown
+  on the outer crate, which takes a leaf; if it already has one, one of the
+  two moves). Crates outside the layer directories aren't checked.
+- `direction`: a normal or build dependency the matrix forbids, shown on the
+  manifest line that declares it. The finding names the items the crate's
+  production files use from the other one, and the fixes: move those items
+  down; move the crate up, with its dependents whose layer would then point
+  the wrong way, by a normal, build or dev edge (not checked against the
+  client and store rules), unless the other crate is an app (the advice to
+  move up to `l30_storage` adds that the stores the crate uses must then list
+  it, and to move a `*-client` up to `l40_api`, that it may then depend only
+  on Domain, Foundation and clients); or invert the edge through a trait. An
+  app depending on an app moves the shared code into an API crate; one
+  depending on a store goes through the API crate that owns it.
+- `dev_direction`: a dev-dependency on a higher layer. Tests may use their
+  own and lower layers and test_support, including another service's real
+  server or store; the client and store rules don't apply to them, and
+  test_support and tools crates may dev-depend on any layer but tools. A
+  dev-dependency that duplicates a normal or build one is checked only as
+  that. Fix by moving the fixtures into test_support or down, or the tests
+  up.
+- `test_only`: a normal or build dependency on a test_support crate from a
+  layer crate, or any dependency on a tools crate. Tools may use test_support
+  as a normal dependency. An `allowed_edges` entry, which exempts an edge
+  from `direction`, `clients` and `store_edges`, never exempts one from
+  `test_only`.
+- `clients`: a `*-client` crate in `l40_api` depending on anything but
+  Domain, Foundation and other clients, such as its own service or a store.
+  The fix is a protocol crate in Domain that both depend on.
+- `store_edges`: an API or Storage crate depending on a store whose
+  `store_users` doesn't list it. The fix is the owner's API, or for a store,
+  which can't depend on one, moving the read into the owning store; or, if
+  the crate owns the state, listing it.
+- `stale_entries`: an `unmoved` entry for a crate that is gone or now in a
+  layer directory; a `store_users` entry for something that isn't a store, or
+  listing a crate that is gone, a client, or one outside API and Storage,
+  which allows nothing; an `allowed_edges` entry whose normal or build
+  dependency is gone, that needs no exception, or that is for a `test_only`
+  edge, which it can't exempt. An entry naming a crate without a layer isn't
+  stale: the crate's `placement` finding covers it. Each is shown on its line
+  in `ARCHITECTURE.toml`.
+- `policy_changed`: every difference in `[rules.layers]` from the base
+  branch's `ARCHITECTURE.toml`, given with `--base-architecture`: an
+  `unmoved` entry added or moved to another layer, a store user or allowed
+  edge added or removed, a mode changed, or the whole table new. A removed
+  `unmoved` entry is one only if its crate moved into another layer's
+  directory than the entry's (shown on the `unmoved` header, or the first
+  `[rules.layers…]` one); otherwise its crate moved where the entry said, was
+  deleted, or is a `placement` finding. A base with `[rules.layers]` and a
+  branch without it gets one advisory finding on line 1 of
+  `ARCHITECTURE.toml`: the whole rule was removed and no longer runs. The
+  copy is read as for `crate_names`; a
+  `[rules.layers]` of another shape skips this behaviour and `placement`'s
+  comparison with a warning (on a branch without the rule, the check for its
+  removal), and `crate_names.policy_changed` still runs.
+
+`direction` and `dev_direction` have baseline tables, `[layers.direction]`
+and `[layers.dev_direction]`, which map each package to the packages it
+depends on against the check today, one per line. Package names, not paths,
+so moving a crate into its layer directory leaves its entries alone. Each
+check has three behaviours:
+
+- `no_crossing`: an edge with the check's problem that its table doesn't
+  list;
+- `no_new_entries`: an entry the base branch's copy of the table lacks,
+  given with `--base-baseline`. A copy with a `[layers]` key but without the
+  table, or whose `ARCHITECTURE.toml` has a `[rules.layers]`, even one this
+  branch can't read, tolerates nothing. If the base branch has no layers rule
+  yet (neither a `[layers]` key in its baseline nor, with
+  `--base-architecture`, a `[rules.layers]`), every entry is reported as
+  advisory instead, as the pull request seeding the table. Without the flag,
+  or with a `[layers]` key or table that doesn't parse, it is skipped with a
+  line after the summary;
+- `stale_entries`: an entry whose edge is gone, whose package is gone or has
+  no layer, or that the check no longer reports, such as a dev entry whose
+  dependency is also a normal one.
+
+`--write-baseline` keeps the entries that are still violations, removes the
+rest, and adds none: it prints `not added: …` for each edge without one,
+saying to fix the dependency, since an entry added by hand fails
+`no_new_entries`; a reviewed, permanent exception to `direction` goes in
+`[rules.layers.allowed_edges]`, which `policy_changed` reports, and
+`dev_direction` has no exception path. As for `crate_names`, it lists no TOML
+to paste. It always writes both tables, after
+the tables of caps and before `[crate_names]`;
+`--write-baseline=layers.<check>` updates one, creating it if the file lacks
+it.
+
+### Limits
+
+- The checks see direct dependencies only. An edge through a re-export, such
+  as `common-svc` re-exporting a store, is not seen until the legacy crates
+  that re-export go.
+- The package-keyed tables have no rename map. Renaming a package that a
+  `[layers.*]` baseline entry names fails `no_new_entries` until its edges
+  are fixed. Renaming one that an `unmoved` entry names fails `placement`,
+  since its entry under the new name is new, until the crate moves into its
+  layer directory; fixing its edges doesn't help.
+
+### Adding a crate, a store user or an exception
+
+- **A crate:** create it in its layer's directory, at the path its package
+  name gives. If no layer fits, the crate probably holds two things; split it.
+- **A store user:** if an API or Storage crate owns state a store keeps, add it
+  to the store's list in `[rules.layers.store_users]`. `policy_changed`
+  reports the change for review. A crate that only needs the data uses the
+  owner's API instead.
+- **An exception:** an edge the matrix forbids for good reason, such as the
+  database migrator applying every store's migrations, goes in
+  `[rules.layers.allowed_edges]` with a comment saying why; `policy_changed`
+  reports it. A violation to fix later doesn't: it fails `no_crossing`, and
+  a hand-added baseline entry fails `no_new_entries`.
+- **Moving a crate:** `git mv` it into its layer directory and remove its
+  `unmoved` entry, which `stale_entries` asks for. Its layers baseline
+  entries keep matching, but path-keyed configuration has to follow the
+  crate: ratchet `include` and `allow`, fence `members` and `allow`, the
+  `[file_size]` and ratchet baseline keys, and the member paths of
+  `[crate_names]` baseline entries.
+
 ## Configuration and modes
 
 Each behaviour has a `mode`: `advisory` findings are reported, `required` ones
 also fail the check, so behaviours can graduate one at a time. Unknown keys,
 sections or modes, a missing file, bad TOML, an invalid regex, glob or instance
-name, an empty `patterns`, `include`, `packages` or `members` list, a baseline
-table for an instance that is not configured, and a failing `cargo metadata`
-exit 2. So does a `--base-baseline`, `--renames` or `--base-architecture` that
-can't be read, or one combined with `--write-baseline`, and `--renames` input
-that is not git's (see [Renamed files](#renamed-files)).
+name, an empty `patterns`, `include`, `packages` or `members` list, a layer
+name that is not one of the seven, a package listed twice in `unmoved` or in
+one `store_users` or `allowed_edges` list, a baseline table for an instance or
+layers check that is not configured, and a failing `cargo metadata` exit 2. So
+does a `--base-baseline`, `--renames` or `--base-architecture` that can't be
+read, or one combined with `--write-baseline`, and `--renames` input that is
+not git's (see [Renamed files](#renamed-files)).
 
 ## Baseline
 
@@ -305,8 +489,10 @@ Each table maps a repository-relative path to its cap, the count it had when
 listed: under `[file_size]`, each production file over the limit, with its
 code-line count; under `[pattern_ratchet.<instance>]`, each production file
 outside the instance's allowed paths with a matching line, with its count of
-matching lines. `[crate_names]`, written last, maps a package name to its
-member path instead (see [Crate names](#crate-names)). Entries should only be
+matching lines. `[layers.<check>]` maps a package name to the packages it
+depends on against the check instead (see [Layers](#layers)), and
+`[crate_names]`, written last, a package name to its member path (see
+[Crate names](#crate-names)). Entries should only be
 removed or lowered.
 
 `cargo arch --write-baseline` rewrites `architecture-baseline.toml` from its
@@ -314,9 +500,11 @@ entries and the tree. An entry still in violation gets its current count as
 its cap: under `[file_size]`, a file still over the limit; under
 `[pattern_ratchet.<instance>]`, a file outside the allowed paths that still has
 a matching line. The other entries are removed. It never adds an entry, or a
-`[pattern_ratchet.<instance>]` table the file lacks (`[file_size]` and
-`[crate_names]` are always written, empty if the file had none; for
-`[crate_names]`, see [Crate names](#crate-names)). It prints `not added: <path> (N code lines); …` for each
+`[pattern_ratchet.<instance>]` table the file lacks (`[file_size]`,
+`[crate_names]` and, with the layers rule configured, both `[layers.<check>]`
+tables are always written, empty if the file had none; for `[crate_names]`
+and the layers tables, which list no entries to paste, see [Crate
+names](#crate-names) and [Layers](#layers)). It prints `not added: <path> (N code lines); …` for each
 file over the limit without an entry instead, and `not added: <path> (N code
 lines matching the <instance> patterns); …` for each matching file without
 one, then, after its summary line, the entries they would need, as TOML, one
@@ -332,7 +520,8 @@ existing file with the strict parser, so a missing or invalid baseline exits 2:
 it can't create one from scratch.
 
 `cargo arch --write-baseline=<table>`, with `<table>` `file_size`,
-`crate_names` or `pattern_ratchet.<instance>` for a configured instance, does
+`crate_names`, `pattern_ratchet.<instance>` for a configured instance or
+`layers.<check>` with the layers rule configured, does
 the same for that
 table alone and keeps every other table as the existing baseline has it,
 printing only that table's `not added` lines and entries. Use it when adding
@@ -368,13 +557,19 @@ detect. If git skips rename detection because more files were added and
 deleted than `-l` allows, the step turns git's warning into a workflow
 warning, and moved entries count as new too. If the base can't be resolved,
 the step warns and runs without any of the flags: the `no_new_entries` and
-`no_raised_caps` behaviours and `crate_names.policy_changed` are skipped, and
-`crate_names.no_new` allows only the bootstrap entries. Each finding is a
+`no_raised_caps` behaviours, `crate_names.policy_changed`,
+`layers.policy_changed` and `layers.placement`'s check for new `unmoved`
+entries are skipped, and `crate_names.no_new` allows only the bootstrap
+entries. Each finding is a
 diagnostic with code `<rule>.<behaviour>`, or `<rule>.<instance>.<behaviour>`
 for a rule with instances, on line 1 of its file, with the path exactly as it
 is. A new catch-all crate points at the `name =` line of its `Cargo.toml`
 instead, and a new entry, a raised cap, a stale entry for a deleted file and a
-stale `[crate_names]` entry at the entry's line in the baseline.
+stale `[crate_names]` entry at the entry's line in the baseline. `layers`
+findings point at a crate's `name =` line (`placement`, `layout`), the
+manifest line declaring a dependency (an edge), the entry's line in
+`ARCHITECTURE.toml` (a new `unmoved` entry, `stale_entries`,
+`policy_changed`) or the edge's line in the baseline.
 `pattern_ratchet`'s `no_crossing`, `listed_no_growth` and shrank
 `stale_entries` findings point at the file's first matching line; one for a
 file with no matches left, at its line 1. Required findings are `ERROR`,
@@ -402,8 +597,9 @@ advisory ones `WARNING`.
   First come all `no_new_entries` and `no_raised_caps` findings: they compare
   with the base's copy by table and key, so they include the entries of a
   renamed or split pattern table even though those lines are unchanged.
-  `crate_names.policy_changed` findings, which compare with the base's
-  `ARCHITECTURE.toml`, come with them, although the report lists them last.
+  `crate_names.policy_changed` and `layers.policy_changed` findings, which
+  compare with the base's `ARCHITECTURE.toml`, come with them, although the
+  report lists them last.
   Then come findings in the files the pull request changes (old or new name),
   and stale entries in the baseline for files it changes, such as files it
   deletes, or, in `[crate_names]`, for a crate whose `Cargo.toml` it changes,
