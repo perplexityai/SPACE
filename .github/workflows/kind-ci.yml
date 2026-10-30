@@ -312,6 +312,23 @@ jobs:
       - name: Prepare Kind while the Rust producer builds
         run: bash infra/space/kind/scripts/prepare-cluster.sh
 
+      # Tiltfile evaluation installs the selected observability profile before
+      # Tilt registers its context, and none of it needs a SPACE image. In otel
+      # mode that is minutes of image loads and Helm waits, which ran after the
+      # producer finished. Installed here, they overlap the producer instead,
+      # and Tilt's own pass finds each release unchanged. The Datadog preflight
+      # runs first, as it does in the Tiltfile. Inside Tilt the install was
+      # bounded by the bring-up's 1800 s initialization timeout; the step keeps
+      # that bound, since `ctr images ls` and `kind load` have none of their own.
+      - name: Install the observability profile while the Rust producer builds
+        timeout-minutes: 30
+        env:
+          SPACE_KIND_CLUSTER: space-local
+        run: |
+          set -euo pipefail
+          python3 infra/space/kind/scripts/datadog_backend.py preflight --for-deployment >/dev/null
+          bash infra/space/kind/scripts/install-observability.sh
+
       - name: Wait for this attempt's Rust producer
         timeout-minutes: 70
         env:
