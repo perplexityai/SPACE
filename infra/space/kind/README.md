@@ -392,12 +392,10 @@ and names the teardown that switches it.
 - **Charts.** The Tiltfile renders `substrate=direct` into `space-api-local`
   and `space-cluster-controller-local`, which set `SPACE_K8S_CONTROL_PLANE`
   to `false`. The default `substrate: kubernetes` renders every chart
-  byte-identically to a chart without the value. The controller also takes
-  `values-direct.yaml`, which sets one replica. On Direct, leader election
-  doesn't contend for the Lease (the substrate's `contends_for_leader_lease`
-  capability), so a second replica would run every reconciler again; the
-  chart refuses any other `replicaCount` there. The node services take
-  `node.substrate=direct` (see below).
+  byte-identically to a chart without the value. The controller keeps its
+  two replicas: in a pod it contends for the Lease on either substrate, so
+  only the holder runs the reconcilers, as on the default lane. The node
+  services take `node.substrate=direct` (see below).
 - **Node identity.** A Direct node is known by a node UUID: the admin
   registry records the id its node-api reports, and ClusterApi resolves a
   kube node name only to a Kubernetes registration. On this lane the
@@ -1448,7 +1446,7 @@ kind cluster: space-local (kind-cluster.yaml.tmpl — 6 nodes)
 │   ├── space-credmgr-authority (Deployment, 2 replicas; credential-manager authority — credential tables + platform KEK)
 │   ├── space-kind-key-broker (Deployment; Kind-only intermediate-key broker fixture behind the platform KEK)
 │   ├── space-data-plane      (Deployment, 2–3 replicas by HPA)
-│   ├── space-cluster-controller (Deployment, 2 replicas, one leader; materializes per-sandbox pods on the default (Kubernetes) lane; one replica on the Direct substrate lane)
+│   ├── space-cluster-controller (Deployment, 2 replicas, one leader; materializes per-sandbox pods on the default (Kubernetes) lane)
 │   ├── space-kind-fake-ec2   (Deployment; Kind-only fake EC2 endpoint the reconcile-queue GC asks about non-ready nodes)
 │   ├── metrics-server        (Deployment in kube-system; resource metrics for the HPAs)
 │   ├── space-seed-publish    (Job; publishes the locally built seed)
@@ -1538,8 +1536,9 @@ load-balanced entry, scaled on load.
   competing runner can turn a retried lock race into a failed run
   (`crates/libs/db/migrator/src/migration_retry.rs`). Tilt makes `space-api`
   wait for the Job.
-- **cluster-controller** runs two replicas with leader election on: the Lease
-  holder runs every reconciler and the other stands by, Ready, to take over.
+- **cluster-controller** runs two replicas with leader election on, on either
+  substrate: the Lease holder runs every reconciler and the other stands by,
+  Ready, to take over.
   The typed scenario `local.leader_election_brownout_keeps_one_leader`
   exercises the handoff. It needs `otel` mode. It lowers the controller's
   liveness budget to its floor for its own run, through a test hook that is

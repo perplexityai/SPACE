@@ -58,8 +58,7 @@ serviceAccount:
 nodeApiTokenExpirationSeconds: 600
 
 # The substrate, as space-api-local's `substrate`: `kubernetes` or `direct`.
-# Both must name the same one. `direct` needs `replicaCount: 1`
-# (values-direct.yaml; see the guard in templates/deployment.yaml).
+# Both must name the same one.
 substrate: kubernetes
 
 # Same KubernetesSubstrate env block as the api-server. The cluster-controller

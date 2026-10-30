@@ -266,10 +266,10 @@ pub async fn run_reconcilers(
         // dispatcher does, so its heartbeat takes a sibling of the same token
         // the dispatcher runs on. Under leader election that token is the
         // lease's, so a replica that loses the lease stops vouching for a
-        // limiter it no longer runs; with election disabled (direct substrate
-        // or kill-switch, which assume a single replica) it is the process
-        // token. Either way the signal is scoped to a replica that actually
-        // runs the limiter.
+        // limiter it no longer runs; with election disabled (a Direct process
+        // outside a pod, or the kill-switch, which assume a single replica) it
+        // is the process token. Either way the signal is scoped to a replica that
+        // actually runs the limiter.
         //
         // This is the owning statement of what a *silent* cluster-controller
         // heartbeat means. Four independent causes, so absence alone never

@@ -1142,13 +1142,13 @@ pub struct SubstrateCapabilities {
     /// A node row's counterpart is
     /// [`SubstrateKind::has_node_drain_reconciler`](pplx_space_common_core::types::SubstrateKind::has_node_drain_reconciler).
     pub supports_node_drain: bool,
-    /// The cluster controller may run as several replicas, so each one
-    /// contends for a leader `Lease` on the apiserver and only the holder runs
-    /// the reconcilers (unless the leader-election kill-switch is off). When
-    /// false, the controller is a single local process and runs the
-    /// reconcilers unconditionally. The lease client comes from the process
-    /// environment, not from the substrate.
-    pub contends_for_leader_lease: bool,
+    /// The adapter drives sandboxes through a Kubernetes apiserver, with a
+    /// client the process builds from its environment (an in-cluster config
+    /// or a kubeconfig). The cluster controller can therefore reach a leader
+    /// `Lease` on that apiserver wherever it runs, and may share the cluster
+    /// with in-cluster replicas, so it contends for the `Lease` even outside
+    /// a pod.
+    pub uses_kubernetes_api: bool,
     /// A successful [`SubstrateAdapter::suspend_execution`] has already
     /// committed `lifecycle = 'suspended'`, under the fence of the execution
     /// it suspended. The caller then writes no lifecycle of its own: an
@@ -1168,7 +1168,7 @@ impl SubstrateCapabilities {
         resolves_cold_create_shape: false,
         supports_node_pool_placement: false,
         supports_node_drain: false,
-        contends_for_leader_lease: false,
+        uses_kubernetes_api: false,
         suspend_commits_lifecycle: false,
     };
 
@@ -1179,7 +1179,7 @@ impl SubstrateCapabilities {
         resolves_cold_create_shape: true,
         supports_node_pool_placement: true,
         supports_node_drain: true,
-        contends_for_leader_lease: true,
+        uses_kubernetes_api: true,
         suspend_commits_lifecycle: true,
     };
 }

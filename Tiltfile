@@ -788,9 +788,7 @@ k8s_resource(
 
 # The cluster-controller materializes per-sandbox pods under the
 # KubernetesSubstrate and hosts the cluster-singleton reconcilers.
-CONTROLLER_CHART = "infra/space/kind/charts/space-cluster-controller-local"
-deploy_yaml(helm_release("space", CONTROLLER_CHART,
-                         values = [CONTROLLER_CHART + "/values-direct.yaml"] if DIRECT else [],
+deploy_yaml(helm_release("space", "infra/space/kind/charts/space-cluster-controller-local",
                          set = ["substrate=" + SUBSTRATE]))
 k8s_resource(
     "space-cluster-controller",

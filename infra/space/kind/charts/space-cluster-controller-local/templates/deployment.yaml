@@ -1,13 +1,3 @@
-{{- /*
-On `direct` the controller runs its reconcilers without contending for the
-Lease: leader election follows the substrate's contends_for_leader_lease
-capability (crates/libs/cluster/controller/server/src/lib.rs), false on
-Direct, so a second replica would run every reconciler a second time. Hold it
-to one replica until leader election no longer depends on the substrate.
-*/ -}}
-{{- if and (eq (include "space-cluster-controller-local.substrate" .) "direct") (ne (int .Values.replicaCount) 1) -}}
-{{- fail (printf "substrate direct runs one cluster-controller replica, got replicaCount %d; the Direct substrate lane is Kind-only and its bring-up sets it (values-direct.yaml; see infra/space/kind/README.md)" (int .Values.replicaCount)) -}}
-{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -193,11 +183,11 @@ spec:
             {{- /* `substrate: direct` renders "false" (values.yaml). */}}
             - name: SPACE_K8S_CONTROL_PLANE
               value: {{ include "space-cluster-controller-local.k8sControlPlane" . }}
-            # On `kubernetes`, leader election stays on whatever the replica
-            # count: with it off every replica would run the reconcilers (lib.rs
-            # in crates/libs/cluster/controller/server). On `direct` the
-            # controller does not contend for the Lease whatever this says,
-            # hence one replica there (the guard above).
+            # Leader election stays on whatever the replica count and
+            # substrate: with it off every replica would run the reconcilers.
+            # In a pod the controller contends for the Lease on either
+            # substrate (LeaderElectionConfig::election in
+            # crates/libs/cluster/controller/server/src/leader_election).
             - name: SPACE_CLUSTER_CONTROLLER_LEADER_ELECTION_ENABLED
               value: "true"
             # Namespace of the coordination.k8s.io Lease used for leader

@@ -131,7 +131,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_FIRECRACKER_VENDOR_DIR`, `SPACE_FIRECRACKER_ASSET_DIR`, `SPACE_FIRECRACKER_KERNEL_ASSET_DIR` | built-in paths | Node-manager runtime asset locations. |
 | `SPACE_SUSPEND_WAKE_ARBITRATION` | on | Kill switch: off lets a suspend that queued behind a concurrent wake through instead of rejecting it as superseded. |
 | `SPACE_SUSPEND_DEFAULT_FORMAT` | `btrfs-send` | Set `full` to roll the suspend codec default back. |
-| `SPACE_CLUSTER_CONTROLLER_LEADER_ELECTION_ENABLED` | on | Kill switch; off runs the reconcilers without a lease, which is only safe with one replica. |
+| `SPACE_CLUSTER_CONTROLLER_LEADER_ELECTION_ENABLED` | on | Kill switch. On, the cluster controller contends for its leader Lease when it runs in a Kubernetes pod (`KUBERNETES_SERVICE_HOST` and `KUBERNETES_SERVICE_PORT` both set) or uses the Kubernetes substrate, and otherwise runs the reconcilers without a lease. Off runs them without a lease everywhere. Running without a lease is only safe with one replica. |
 
 ## API, admission and limits
 

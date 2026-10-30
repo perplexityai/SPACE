@@ -19,23 +19,62 @@ use fixtures::{
 
 use super::{Campaign, LeaderElectionConfig};
 
-/// A replica contends for the lease only on a substrate that runs the
-/// controller as several replicas, and the kill-switch turns contention off
-/// everywhere. Direct is a single local process and runs the reconcilers
-/// unconditionally.
+/// A replica contends for the lease only while the kill-switch leaves election
+/// on, and then when the process runs in a Kubernetes pod (where an apiserver
+/// can host the `Lease` and a Deployment may run several replicas) or its
+/// substrate drives the Kubernetes API (whose client reaches the `Lease` from
+/// anywhere, beside any in-cluster replicas). So a Direct controller in a pod
+/// contends like a Kubernetes one, a Kubernetes-substrate controller contends
+/// wherever it runs, and only an off-cluster Direct controller (a systemd host)
+/// runs the reconcilers without election.
 #[test]
-fn contention_follows_the_substrate_and_the_kill_switch() {
+fn contention_follows_the_process_host_the_substrate_and_the_kill_switch() {
     use pplx_space_api::controllers::substrate::SubstrateCapabilities;
 
-    for (substrate, capabilities, enabled, expected) in [
-        ("direct", SubstrateCapabilities::DIRECT, true, false),
-        ("direct", SubstrateCapabilities::DIRECT, false, false),
-        ("kubernetes", SubstrateCapabilities::KUBERNETES, true, true),
+    use super::{Election, ElectionSkip, ProcessHost};
+
+    const DIRECT: (&str, SubstrateCapabilities) = ("direct", SubstrateCapabilities::DIRECT);
+    const KUBERNETES: (&str, SubstrateCapabilities) =
+        ("kubernetes", SubstrateCapabilities::KUBERNETES);
+
+    for (enabled, host, (substrate, capabilities), expected) in [
+        (true, ProcessHost::Kubernetes, DIRECT, Election::Contend),
+        (true, ProcessHost::Kubernetes, KUBERNETES, Election::Contend),
         (
-            "kubernetes",
-            SubstrateCapabilities::KUBERNETES,
+            true,
+            ProcessHost::OutsideKubernetes,
+            DIRECT,
+            Election::Skip(ElectionSkip::OutsideKubernetes),
+        ),
+        (
+            true,
+            ProcessHost::OutsideKubernetes,
+            KUBERNETES,
+            Election::Contend,
+        ),
+        (
             false,
+            ProcessHost::Kubernetes,
+            DIRECT,
+            Election::Skip(ElectionSkip::Disabled),
+        ),
+        (
             false,
+            ProcessHost::Kubernetes,
+            KUBERNETES,
+            Election::Skip(ElectionSkip::Disabled),
+        ),
+        (
+            false,
+            ProcessHost::OutsideKubernetes,
+            DIRECT,
+            Election::Skip(ElectionSkip::Disabled),
+        ),
+        (
+            false,
+            ProcessHost::OutsideKubernetes,
+            KUBERNETES,
+            Election::Skip(ElectionSkip::Disabled),
         ),
     ] {
         let config = LeaderElectionConfig {
@@ -43,9 +82,37 @@ fn contention_follows_the_substrate_and_the_kill_switch() {
             ..test_config("replica-a")
         };
         assert_eq!(
-            config.contends(capabilities),
+            config.election(host, capabilities),
             expected,
-            "{substrate} substrate, election enabled: {enabled}"
+            "election enabled: {enabled}, host: {host:?}, {substrate} substrate"
+        );
+    }
+}
+
+/// The process runs inside Kubernetes when both service variables the kubelet
+/// injects into every pod are set, which is the rule the kube client applies
+/// before it builds an in-cluster config. Either one alone is not a pod.
+#[test]
+fn process_host_is_kubernetes_only_with_both_service_variables() {
+    use super::ProcessHost;
+
+    for (service_host, service_port, expected) in [
+        (None, None, ProcessHost::OutsideKubernetes),
+        (Some("10.96.0.1"), None, ProcessHost::OutsideKubernetes),
+        (None, Some("443"), ProcessHost::OutsideKubernetes),
+        (Some("10.96.0.1"), Some("443"), ProcessHost::Kubernetes),
+    ] {
+        let mut env = pplx_space_test_env::TestEnv::default();
+        if let Some(value) = service_host {
+            env.set("KUBERNETES_SERVICE_HOST", value);
+        }
+        if let Some(value) = service_port {
+            env.set("KUBERNETES_SERVICE_PORT", value);
+        }
+        assert_eq!(
+            ProcessHost::from_environment(&env),
+            expected,
+            "KUBERNETES_SERVICE_HOST: {service_host:?}, KUBERNETES_SERVICE_PORT: {service_port:?}"
         );
     }
 }
@@ -622,8 +689,8 @@ async fn readiness_marker_follows_the_leaders_renewals() {
 }
 
 /// Winning the lease reports Ready, and `signal_ready` does so for the
-/// non-election paths (Direct substrate, kill-switch) where the process runs the
-/// reconcilers unconditionally.
+/// non-election paths (kill-switch, or a Direct process outside a pod) where
+/// the process runs the reconcilers unconditionally.
 #[tokio::test(start_paused = true)]
 async fn readiness_marker_written_for_leader_and_for_the_non_election_path() {
     let path = marker_path("leader");
