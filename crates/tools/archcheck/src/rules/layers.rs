@@ -28,6 +28,9 @@
 //! - `stale_entries` and `policy_changed`: entries of `[rules.layers]` that
 //!   no longer apply, and every change to it from the base branch's copy,
 //!   including its removal.
+//! - with `[rules.layers.state]`, the state checks (`state.*` and
+//!   `unowned`): which store owns each table, from the stores' manifests
+//!   and the migration catalogs; see the `state` module.
 //!
 //! Baseline tables are keyed by package name, so moving a crate into its
 //! layer directory leaves them alone.
@@ -35,6 +38,8 @@
 mod domain;
 mod graph;
 mod policy;
+mod sql;
+mod state;
 mod storage;
 #[cfg(test)]
 mod tests;
@@ -67,7 +72,7 @@ impl Layers {
     pub const NAME: &'static str = "layers";
 
     /// Its baseline tables, `[layers.<check>]`, as `--write-baseline=<table>`
-    /// takes them.
+    /// takes them; `[layers.unowned]` comes with `[rules.layers.state]`.
     pub fn table_names() -> Vec<String> {
         CHECKS
             .iter()
@@ -93,6 +98,9 @@ const CHECKS: [&str; 6] = [
     DOMAIN_DEPENDENCIES,
     MODEL_PROTOCOL,
 ];
+/// The state check whose baseline table, `[layers.unowned]`, lists the
+/// live tables no store declares.
+const UNOWNED: &str = "unowned";
 /// Where a finding sends the reader for what belongs in each layer.
 const GUIDE: &str = "crates/tools/archcheck/README.md#layers";
 /// What the comparisons with the base branch's `ARCHITECTURE.toml` are, for
@@ -256,6 +264,9 @@ impl Rule for Layers {
                     .map(|violation| edge_finding(None, behaviour, mode, violation)),
             );
         }
+        if let (Some(state), Some(unowned)) = (&config.state, &config.unowned) {
+            findings.extend(state::check(ctx, config, state, unowned, &graph));
+        }
         findings.extend(policy::stale_entries(ctx, config, &graph, verdicts));
         findings.extend(storage::stale_entries(
             ctx,
@@ -280,9 +291,9 @@ impl Rule for Layers {
             return Vec::new();
         }
         if let BaseBaseline::NotGiven = ctx.base_baseline {
-            return vec![BaseSkip::NotGiven.message(&format!("{} skipped", comparisons()))];
+            return vec![BaseSkip::NotGiven.message(&format!("{} skipped", comparisons(ctx)))];
         }
-        CHECKS
+        baselined_checks(ctx)
             .iter()
             .filter_map(|check| {
                 let skip = ctx.base_baseline.layers_table(check).err()?;
@@ -295,14 +306,18 @@ impl Rule for Layers {
         if ctx.config.rules.layers.is_none() {
             return Vec::new();
         }
-        vec![comparisons()]
+        vec![comparisons(ctx)]
     }
 
     fn tables(&self, config: &RulesConfig) -> Vec<String> {
-        if config.layers.is_none() {
+        let Some(layers) = &config.layers else {
             return Vec::new();
+        };
+        let mut tables = Self::table_names();
+        if layers.state.is_some() {
+            tables.push(format!("{RULE}.{UNOWNED}"));
         }
-        Self::table_names()
+        tables
     }
 
     fn baseline_rule(&self) -> Option<&'static str> {
@@ -384,17 +399,39 @@ impl Rule for Layers {
             }
             baseline.layers.insert(check.to_owned(), table);
         }
+        if let Some(state) = &config.state {
+            let (table, unlisted) = state::update_unowned(ctx, state, &graph);
+            baseline.layers.insert(UNOWNED.to_owned(), table);
+            not_added.extend(unlisted);
+        }
         not_added
     }
 }
 
-/// `layers.direction.no_new_entries, …, and layers.codec_features.no_new_entries`.
-fn comparisons() -> String {
-    let all: Vec<String> = CHECKS
+/// The checks with a baseline table: those of [`CHECKS`], and `unowned`
+/// with `[rules.layers.state]`.
+fn baselined_checks(ctx: &Context) -> Vec<&'static str> {
+    let mut checks = CHECKS.to_vec();
+    if ctx
+        .config
+        .rules
+        .layers
+        .as_ref()
+        .is_some_and(|layers| layers.state.is_some())
+    {
+        checks.push(UNOWNED);
+    }
+    checks
+}
+
+/// `layers.direction.no_new_entries, …, and layers.model_protocol.no_new_entries`,
+/// and `layers.unowned.no_new_entries` with the state checks.
+fn comparisons(ctx: &Context) -> String {
+    let comparisons: Vec<String> = baselined_checks(ctx)
         .iter()
         .map(|check| format!("{RULE}.{check}.no_new_entries"))
         .collect();
-    and_list(&all)
+    and_list(&comparisons)
 }
 
 /// `items` for a sentence: `a`, `a and b`, or `a, b and c`.
@@ -624,9 +661,11 @@ fn base_edges<'a>(ctx: &'a Context, check: &str) -> BaseEdges<'a> {
     // A base with the check but without its table tolerates nothing; one
     // without the check, or the rule, is seeded. Without the base's
     // ARCHITECTURE.toml, a `[layers]` key in its baseline stands for the
-    // rule.
+    // rule, but not for the state checks, which `[layers.unowned]` came
+    // after: a copy without it predates them.
     match (check_on_base(ctx, check), table) {
-        (Some(true), _) | (None, BaseLayersTable::Missing) => BaseEdges::Compare(&NONE),
+        (Some(true), _) => BaseEdges::Compare(&NONE),
+        (None, BaseLayersTable::Missing) if check != UNOWNED => BaseEdges::Compare(&NONE),
         _ => BaseEdges::Seeding,
     }
 }
@@ -641,13 +680,7 @@ fn check_on_base(ctx: &Context, check: &str) -> Option<bool> {
     let Ok(base) = &base.layers else {
         return Some(true);
     };
-    let prefix = format!("{check}.");
-    Some(base.as_ref().is_some_and(|policy| {
-        policy
-            .modes
-            .keys()
-            .any(|behaviour| behaviour.starts_with(&prefix))
-    }))
+    Some(base.as_ref().is_some_and(|policy| policy.has_check(check)))
 }
 
 /// `no_crossing`, `no_new_entries` and `stale_entries` of `check`.
