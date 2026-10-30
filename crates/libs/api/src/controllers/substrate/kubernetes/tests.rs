@@ -12098,6 +12098,7 @@ mod kubernetes_tests {
                     op: "create",
                     surface: pplx_space_metrics::sandbox::api::SandboxApiSurface::Native,
                     client_class: pplx_space_metrics::sandbox::api::ClientClass::Other,
+                    client_id: pplx_space_metrics::sandbox::api::ClientIdTag::UNKNOWN,
                 },
                 actor: &self.actor,
                 template: "seed",

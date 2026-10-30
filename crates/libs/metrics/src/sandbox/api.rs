@@ -69,6 +69,51 @@ impl std::fmt::Display for ClientClass {
     }
 }
 
+/// The `client_id` tag value: an allowlisted `X-Client-ID`, or `unknown`.
+///
+/// Only operator-configured IDs may be allowlisted, so the tag's cardinality is
+/// bounded by configuration, never by what a caller sent. A missing, blank, or
+/// unlisted header is [`Self::UNKNOWN`], so a caller rotating IDs can't mint
+/// new series. The variants are private: an allowlisted value exists only
+/// through [`Self::allowlisted`], whose caller owns the bound.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct ClientIdTag(ClientIdTagValue);
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ClientIdTagValue {
+    Allowlisted(&'static str),
+    Overflow,
+    Unknown,
+}
+
+impl ClientIdTag {
+    /// Every caller the allowlist doesn't name.
+    pub const UNKNOWN: Self = Self(ClientIdTagValue::Unknown);
+    /// An allowlisted client the resolver couldn't name without unbounded
+    /// memory. It still has its own limiter bucket.
+    pub const OVERFLOW: Self = Self(ClientIdTagValue::Overflow);
+
+    /// The tag for an allowlisted client. `id` must come from operator
+    /// configuration, interned by the resolver: a caller-supplied value here
+    /// would put unbounded caller text on every series that carries the tag.
+    pub const fn allowlisted(id: &'static str) -> Self {
+        Self(ClientIdTagValue::Allowlisted(id))
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self.0 {
+            ClientIdTagValue::Allowlisted(id) => id,
+            ClientIdTagValue::Overflow => "overflow",
+            ClientIdTagValue::Unknown => "unknown",
+        }
+    }
+
+    /// Whether the tag names a client with its own limiter bucket.
+    const fn has_own_bucket(self) -> bool {
+        !matches!(self.0, ClientIdTagValue::Unknown)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct SandboxApiMetricIdentity {
     pub op: &'static str,
@@ -79,6 +124,11 @@ pub struct SandboxApiMetricIdentity {
     /// Defaults to [`ClientClass::Other`]; the connect entrypoints stamp the
     /// real class from `X-Client-ID` via [`Self::with_client_class`].
     pub client_class: ClientClass,
+    /// Bounded connecting-client ID. Read by the same reconnect metrics as
+    /// `client_class` and ignored by [`api_identity_tags`]. Defaults to
+    /// [`ClientIdTag::UNKNOWN`]; the connect entrypoint stamps it via
+    /// [`Self::with_client_id`].
+    pub client_id: ClientIdTag,
 }
 
 impl SandboxApiMetricIdentity {
@@ -87,6 +137,7 @@ impl SandboxApiMetricIdentity {
             op,
             surface,
             client_class: ClientClass::Other,
+            client_id: ClientIdTag::UNKNOWN,
         }
     }
 
@@ -103,6 +154,14 @@ impl SandboxApiMetricIdentity {
     /// retry-storm metric can split interactive vs cron traffic.
     pub const fn with_client_class(mut self, client_class: ClientClass) -> Self {
         self.client_class = client_class;
+        self
+    }
+
+    /// Stamp the bounded connecting-client ID onto the identity, leaving every
+    /// other field untouched. Used at the reconnect entrypoint so the
+    /// reconnect metrics can name the caller, not only its class.
+    pub const fn with_client_id(mut self, client_id: ClientIdTag) -> Self {
+        self.client_id = client_id;
         self
     }
 }
@@ -378,6 +437,7 @@ pub struct ReconnectAttempt<'a> {
     pub terminal_phase: ReconnectTerminalPhase,
     pub reason: ReconnectReason,
     pub client_class: ClientClass,
+    pub client_id: ClientIdTag,
     pub started_at: Instant,
 }
 
@@ -389,12 +449,14 @@ pub fn reconnect_attempt(sample: ReconnectAttempt<'_>) {
         tag("terminal_phase", sample.terminal_phase),
         tag("reason", sample.reason),
         tag("client_class", sample.client_class),
+        tag("client_id", sample.client_id.as_str()),
     ];
     counter("sandbox.reconnect.attempts", 1, &counter_tags);
     let duration_tags = [
         tag("entrypoint", sample.entrypoint),
         tag("outcome", sample.outcome),
         tag("terminal_phase", sample.terminal_phase),
+        tag("client_id", sample.client_id.as_str()),
     ];
     timing_ms(
         "sandbox.reconnect.duration_ms",
@@ -1047,6 +1109,7 @@ fn dormant_activation_tags(
 /// many sandbox create/reconnect operations a single client (identified by the
 /// `X-Client-ID` header) may have in flight at once.
 pub mod client_limit {
+    use super::ClientIdTag;
     use crate::emit::{counter, gauge, tag};
 
     /// Which control-plane-touching operation the limiter is gating.
@@ -1138,9 +1201,10 @@ pub mod client_limit {
         }
     }
 
-    /// Whether the request carried an `X-Client-ID`. Requests without one share
-    /// a single `unspecified` bucket. Kept coarse (never the raw client id) so
-    /// the metric stays bounded-cardinality — the raw id goes to logs only.
+    /// Whether the request was tracked in its own client bucket. Requests
+    /// without an `X-Client-ID`, or with one the allowlist doesn't list, share
+    /// a single `unspecified` bucket. [`decision`] derives it from the bounded
+    /// [`ClientIdTag`]; the raw header value never becomes a tag.
     #[derive(Debug, Clone, Copy, Eq, PartialEq)]
     pub enum ClientScope {
         Client,
@@ -1162,7 +1226,25 @@ pub mod client_limit {
         }
     }
 
-    pub fn decision(operation: Operation, decision: Decision, reason: Reason, scope: ClientScope) {
+    impl From<ClientIdTag> for ClientScope {
+        fn from(client_id: ClientIdTag) -> Self {
+            if client_id.has_own_bucket() {
+                Self::Client
+            } else {
+                Self::Unspecified
+            }
+        }
+    }
+
+    /// One limiter verdict, tagged with the bounded `client_id` so an observe
+    /// or enforce rollout can be read per caller. `client_scope` is derived
+    /// from it, so the two can't disagree.
+    pub fn decision(
+        operation: Operation,
+        decision: Decision,
+        reason: Reason,
+        client_id: ClientIdTag,
+    ) {
         counter(
             "sandbox.api.client_concurrency.decision",
             1,
@@ -1170,7 +1252,8 @@ pub mod client_limit {
                 tag("operation", operation.as_str()),
                 tag("decision", decision.as_str()),
                 tag("reason", reason.as_str()),
-                tag("client_scope", scope.as_str()),
+                tag("client_scope", ClientScope::from(client_id).as_str()),
+                tag("client_id", client_id.as_str()),
             ],
         );
     }

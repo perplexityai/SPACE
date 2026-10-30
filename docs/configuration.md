@@ -134,7 +134,7 @@ because disabling it by mistake would leave every create queued forever.
 | --- | --- | --- |
 | `SPACE_API_CLIENT_CONCURRENCY_MODE` | `observe` | `off`, `observe` or `enforce`. |
 | `SPACE_API_CLIENT_CONCURRENCY_MAX_PER_CLIENT` | 32 | |
-| `SPACE_API_CLIENT_CONCURRENCY_KNOWN_CLIENTS` | empty | |
+| `SPACE_API_CLIENT_CONCURRENCY_KNOWN_CLIENTS` | empty | Comma-separated `X-Client-ID` values that get their own limiter bucket. These IDs, plus the keys of the runtime quota overrides, are also the only values the limiter and reconnect metrics report as `client_id`; any other caller is `unknown`, and an override-only caller past the per-process cap of 64 is `overflow`. The IDs `unknown`, `overflow` and `native`, in any case, are reserved, and an ID must be a valid Kubernetes label value. Listed here or as an override key, any other entry is ignored, and its caller shares the unspecified bucket. IDs that differ only in case keep separate buckets but share one `client_id` series, because Datadog lowercases tag values; startup warns about these and the ignored entries in this list, and the first request that matches an ignored override key warns about that key. |
 | `SPACE_API_CLIENT_CLASSES` | empty | JSON map; invalid JSON fails startup. |
 | `SPACE_CLUSTER_ACTIVATION_ADMISSION_ENABLED` | on | Fails open (with a warning) when `SPACE_REDIS_URL` is unset. |
 | `SPACE_CLUSTER_ACTIVATION_ADMISSION_REFILL_RPS` | 60 | |
