@@ -11,6 +11,7 @@ use pplx_space_node_api_sim::{SandboxRecord, SimState, SimWorkerHarness};
 use pplx_space_placement::test_support::stored_lifecycle_matrix;
 use sqlx::PgPool;
 
+mod activating_client;
 mod restore_lease_completion;
 mod substrate_scope;
 
@@ -930,13 +931,21 @@ async fn restore_attempt_renewal_extends_the_owned_lease() -> TestResult {
 }
 
 async fn postgres_fixture() -> TestResult<Option<PostgresFixture>> {
+    postgres_fixture_with(crate::controllers::substrate::ActivationClientAttribution::Disabled)
+        .await
+}
+
+async fn postgres_fixture_with(
+    attribution: crate::controllers::substrate::ActivationClientAttribution,
+) -> TestResult<Option<PostgresFixture>> {
     let Some(db) = try_pg_test_db_with_max_connections(4).await? else {
         return Ok(None);
     };
     let pool = db.pool.clone();
 
     Ok(Some(PostgresFixture {
-        substrate: DirectSubstrate::new(pool.clone()),
+        substrate: DirectSubstrate::new(pool.clone())
+            .with_activation_client_attribution(attribution),
         pool,
         _db: db,
     }))
@@ -2480,6 +2489,7 @@ async fn restore_preflight_reports_unexpired_owner_before_candidate_availability
                 blocking: true,
                 ready_timeout: Duration::from_secs(5),
             },
+            &RecoveryCharge::exempt_for_tests(),
         )
         .await
     {
@@ -2524,6 +2534,7 @@ async fn restore_without_source_or_ready_storage_uri_does_not_claim_a_lease() ->
                 blocking: true,
                 ready_timeout: Duration::from_secs(5),
             },
+            &RecoveryCharge::exempt_for_tests(),
         )
         .await
     {
@@ -2612,6 +2623,7 @@ async fn failed_restore_retry_preserves_the_restore_boundary() -> TestResult {
                 blocking: true,
                 ready_timeout: Duration::from_secs(5),
             },
+            &RecoveryCharge::exempt_for_tests(),
         )
         .await
     {
@@ -3346,6 +3358,7 @@ async fn stale_direct_route_receipt_cannot_replace_newer_execution_identity() ->
                 ..Default::default()
             }),
             DirectRouteIdentityOperation::Start,
+            ReceiptRecord::Unchanged,
         )
         .await
         .expect_err("a stale route receipt must not replace a newer execution identity");
@@ -3415,6 +3428,7 @@ async fn newer_direct_activation_attempt_replaces_equal_generation_identity() ->
                 ..Default::default()
             }),
             DirectRouteIdentityOperation::Start,
+            ReceiptRecord::Unchanged,
         )
         .await?;
 
@@ -3444,6 +3458,7 @@ async fn newer_direct_activation_attempt_replaces_equal_generation_identity() ->
                 ..Default::default()
             }),
             DirectRouteIdentityOperation::Start,
+            ReceiptRecord::Unchanged,
         )
         .await
         .expect_err("an older equal-generation attempt must remain stale");
@@ -3484,6 +3499,7 @@ async fn direct_route_provenance_survives_active_receipt_clear() -> TestResult {
                 ..Default::default()
             }),
             DirectRouteIdentityOperation::Start,
+            ReceiptRecord::Unchanged,
         )
         .await?;
     fixture
@@ -3603,6 +3619,8 @@ async fn wake_noop_without_receipt_preserves_current_direct_identity() -> TestRe
                 transition: pplx_space_sbx_mgr_client::proto::WakeTransition::Noop as i32,
                 route_identity: None,
             },
+            ReceiptRecord::Unchanged,
+            false,
         )
         .await?
         .expect("a no-op wake must retain the current identity");
@@ -4012,7 +4030,10 @@ async fn cross_node_restore_handles_candidate_failures(
         return Ok(());
     }
 
-    let Some(fixture) = postgres_fixture().await? else {
+    let Some(fixture) =
+        postgres_fixture_with(crate::controllers::substrate::ActivationClientAttribution::Enabled)
+            .await?
+    else {
         return Ok(());
     };
     let sandbox_id = SandboxId::new();
@@ -4050,6 +4071,14 @@ async fn cross_node_restore_handles_candidate_failures(
         source_node_id,
         source_server.endpoint(),
         "9.0.0",
+    )
+    .await?;
+    pplx_space_sandbox_store::attribute_runtime::set_activating_client(
+        &fixture.pool,
+        sandbox_id,
+        Some(&pplx_space_common_core::types::ClientId::parse(
+            "previous-client",
+        )?),
     )
     .await?;
     insert_ready_worker(
@@ -4108,10 +4137,24 @@ async fn cross_node_restore_handles_candidate_failures(
                 blocking: true,
                 ready_timeout: Duration::from_secs(5),
             },
-            crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
+            crate::controllers::substrate::RecoveryCharge::exempt(
+                crate::controllers::substrate::CapPolicy::Skip,
+                crate::controllers::substrate::ActivationAttribution::client(
+                    pplx_space_common_core::types::ClientId::parse("restore-client")?,
+                ),
+            ),
         )
         .await;
+    let recorded =
+        pplx_space_sandbox_store::attribute_runtime::activating_client(&fixture.pool, sandbox_id)
+            .await?
+            .expect("sandbox row");
     if !alternate_support {
+        assert_eq!(
+            recorded.as_ref().map(|id| id.as_str()),
+            Some("previous-client"),
+            "a failed restore leaves the previous record"
+        );
         let error = result.expect_err("no candidate supports activation policy");
         assert!(
             error
@@ -4154,6 +4197,11 @@ async fn cross_node_restore_handles_candidate_failures(
     assert_eq!(target_node_id, Some(alternate_node_id));
     assert_eq!(placement, "on_node");
     assert_eq!(lifecycle, "started");
+    // A restore records its client even when nobody charges it.
+    assert_eq!(
+        recorded.as_ref().map(|id| id.as_str()),
+        Some("restore-client")
+    );
     let persisted_identity: Option<(i64, NodeId, String, i64, Uuid, Option<String>)> =
         sqlx::query_as(sql!(
             "SELECT route_generation,
@@ -4357,6 +4405,7 @@ async fn stale_cross_node_restore_receipt_cannot_overwrite_newer_placement() -> 
             &stale_response,
             stale_identity,
             stale_lease,
+            ReceiptRecord::Unchanged,
         )
         .await
         .expect_err("an expired restore owner must not publish placement or provenance");
@@ -4414,6 +4463,7 @@ async fn owned_restore_persists_the_supplied_identity_when_legacy_manager_omits_
             },
             supplied_identity,
             lease,
+            ReceiptRecord::Unchanged,
         )
         .await?
         .expect("the supplied identity must be retained during rolling skew");
