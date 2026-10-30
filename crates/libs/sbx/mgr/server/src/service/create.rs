@@ -689,27 +689,26 @@ impl SandboxManagerService {
         .await?;
         let prepare_template = prepare_source.template;
         let prepare_template_dir = prepare_source.template_dir;
-        // Resolve the effective policy ref up front; it is pushed to the
-        // net-gateway in the background after launch (below). The gateway
+        // Resolve the effective policy up front so a policy that cannot be
+        // resolved fails the restore before launch. The gateway is nudged to
+        // hydrate in the background after launch (below). The gateway
         // namespace denies egress until policy and CA readiness (fail-closed).
         // Hydration overlaps snapshot load; the finalizer confirms traffic
         // readiness before publishing Started. Hydration requires that the
-        // gateway can actually pull policy as soon as its
-        // process starts: host-control authorizes those pulls by the gateway's
-        // registered (pid, uid), so the launch below persists the registration
+        // gateway can actually pull policy as soon as its process starts:
+        // host-control authorizes those pulls by the gateway's registered
+        // (pid, uid), so the launch below persists the registration
         // inside the gateway launch arm rather than after the jailer join.
-        let effective_policy_ref = if Self::sandbox_is_pool_member(sandbox) {
-            None
-        } else {
+        let has_network_identity = !Self::sandbox_is_pool_member(sandbox);
+        if has_network_identity {
             // Cache resolution owns and measures the foreground deadline.
-            let effective_policy = start_stage(
+            start_stage(
                 "restore.effective_network_policy",
                 id,
                 self.effective_network_policy(sandbox),
             )
             .await?;
-            Some(effective_network_policy_ref(sandbox, &effective_policy)?)
-        };
+        }
         let mut node_client = start_stage_timeout(
             "restore.connect_node_mgr",
             START_NODE_METADATA_TIMEOUT,
@@ -1220,13 +1219,8 @@ impl SandboxManagerService {
                 return Err(e);
             }
         };
-        if let Some(effective_policy_ref) = effective_policy_ref {
-            spawn_network_policy_refresh(
-                self.db.clone(),
-                id.to_string(),
-                effective_policy_ref,
-                "snapshot-restore",
-            );
+        if has_network_identity {
+            spawn_network_policy_refresh(self.db.clone(), id.to_string(), "snapshot-restore");
         }
 
         // Load the snapshot and start spaced-host concurrently. spaced-host only

@@ -742,18 +742,25 @@ fn refresh_abandon_reason(
     })
 }
 
+/// Nudge a freshly launched net-gateway to hydrate while the rest of the
+/// activation proceeds.
+///
+/// This asserts no policy ref. The gateway pulls the current effective policy
+/// from host-control, so a ref resolved by the caller can only match it or be
+/// older. With a policy change committed after that resolution (a per-sandbox
+/// override or a template policy update), an asserted ref would make a poll
+/// force a re-pull that the gateway rejects as a mismatch, clearing its
+/// installed policy until something re-pulls. Later policy changes are pushed
+/// by their own write path and the reconciler, not by this refresh.
 pub(super) fn spawn_network_policy_refresh(
     db: crate::db::SharedConnection,
     sandbox_id: String,
-    expected_policy_ref: EffectiveNetworkPolicyRef,
     reason: &'static str,
 ) {
     let span_sandbox_id = sandbox_id.clone();
     tokio::spawn(
         async move {
-            if let Err(error) =
-                refresh_network_policy(&db, &sandbox_id, Some(&expected_policy_ref), reason).await
-            {
+            if let Err(error) = refresh_network_policy(&db, &sandbox_id, None, reason).await {
                 tracing::warn!(
                     sandbox_id,
                     reason,
