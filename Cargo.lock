@@ -6584,6 +6584,7 @@ dependencies = [
  "pplx-space-node-mgr-client",
  "serde_json",
  "tokio",
+ "tokio-stream",
  "tonic",
 ]
 
@@ -7563,6 +7564,7 @@ dependencies = [
  "clap",
  "pplx-space-common-cli",
  "pplx-space-common-core",
+ "pplx-space-net-common",
  "pplx-space-sbx-mgr-client",
  "tokio",
 ]
@@ -7612,6 +7614,7 @@ dependencies = [
  "pplx-space-net-common",
  "pplx-space-node-api-client",
  "pplx-space-node-mgr-client",
+ "pplx-space-node-runtime-core",
  "pplx-space-observability",
  "pplx-space-sbx-mgr-client",
  "pplx-space-sqlite",

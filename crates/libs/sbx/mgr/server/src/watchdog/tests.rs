@@ -36,6 +36,7 @@ fn insert_test_sandbox(conn: &crate::db::Connection, id: &str, state: crate::sta
     crate::db::insert_sandbox(
         conn,
         crate::db::InsertSandboxParams {
+            guest_image: Default::default(),
             id,
             uuid8: &uuid8,
             state,
@@ -114,7 +115,7 @@ fn set_runtime_fields(
             slot: 1,
             guest_cid: 42,
             pid: 30_001,
-            spaced_host_pid: 30_002,
+            spaced_host_pid: Some(30_002),
             netgtw_pid: 30_003,
             vsock_uds_path: "/tmp/vsock.sock",
             api_socket_path: "/tmp/api.sock",
@@ -140,6 +141,7 @@ fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
 
 fn restart_test_info(sandbox_id: &str) -> SidecarInfo {
     SidecarInfo {
+        guest_image: Default::default(),
         node_execution_id: None,
         sandbox_id: sandbox_id.to_string(),
         uid: Some(20_001),
@@ -288,6 +290,7 @@ async fn clear_netgtw_probe_state_drops_cached_process_observations() {
     );
     watchdog
         .add_sandbox(SidecarInfo {
+            guest_image: Default::default(),
             node_execution_id: None,
             sandbox_id: "0199c1e0-0000-7000-8000-000000000001".to_string(),
             uid: Some(20001),
@@ -1350,28 +1353,38 @@ async fn missing_guest_uptime_preserves_last_observation() {
 }
 
 #[test]
-fn paused_guest_signal_is_not_applicable_to_composed_health() {
-    let mut health = test_health();
-    health.health_observed_at = Some(SystemTime::now());
-    for component in HealthComponent::ALL {
-        let outcome = if component == HealthComponent::SpacedGuest {
-            HealthProbeOutcome::NotApplicable
-        } else {
-            HealthProbeOutcome::Success
-        };
-        health.health_components.push(component, sample(outcome));
-        health.health_components.push(component, sample(outcome));
-        update_component_classification(
-            &mut health,
-            component,
-            Some(crate::state::SandboxState::Paused),
+fn inapplicable_guest_components_do_not_block_composed_health() {
+    for (lifecycle, without_agent) in [
+        (crate::state::SandboxState::Paused, false),
+        (crate::state::SandboxState::Started, true),
+    ] {
+        let mut health = test_health();
+        health.health_status = ComposedHealthStatus::Initializing;
+        health.health_observed_at = Some(SystemTime::now());
+        for component in HealthComponent::ALL {
+            let inapplicable = component == HealthComponent::SpacedGuest
+                || (without_agent && component == HealthComponent::SpacedHost);
+            let outcome = if inapplicable {
+                HealthProbeOutcome::NotApplicable
+            } else {
+                HealthProbeOutcome::Success
+            };
+            health.health_components.push(component, sample(outcome));
+            health.health_components.push(component, sample(outcome));
+            update_component_classification(&mut health, component, Some(lifecycle));
+        }
+        assert_eq!(
+            classify_composed_health(&health, Some(lifecycle)),
+            ComposedHealthStatus::Healthy,
+            "{lifecycle:?} without_agent={without_agent}"
+        );
+        // A previous execution's exemption is not evidence for the new one.
+        health.lifecycle_epoch += 1;
+        assert_eq!(
+            classify_composed_health(&health, Some(lifecycle)),
+            ComposedHealthStatus::Initializing
         );
     }
-
-    assert_eq!(
-        classify_composed_health(&health, Some(crate::state::SandboxState::Paused)),
-        ComposedHealthStatus::Healthy
-    );
 }
 
 #[test]

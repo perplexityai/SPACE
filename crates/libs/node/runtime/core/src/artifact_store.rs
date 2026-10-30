@@ -41,6 +41,8 @@ use sha2::{Digest as _, Sha256};
 
 use crate::catalog::{ManagedDirectoryName, PinnedKernel, PinnedRelease};
 
+mod boot_artifact;
+pub use boot_artifact::{BOOT_ARTIFACT_IMAGE, boot_artifact_directory, boot_artifact_staging};
 mod protection;
 pub use protection::verify_execution_directory;
 use protection::{RootProtection, check_root};
@@ -138,7 +140,13 @@ pub fn kernel_directory_names(version: &ArtifactVersion, digest: Digest) -> [Str
 
 /// Prefer the compact copy, but never hide an unreadable or invalid preferred
 /// entry by selecting an older copy. Authentication is the caller's next step.
-pub fn existing_artifact_path(root: &Path, names: &[String; 2]) -> std::io::Result<PathBuf> {
+pub fn existing_artifact_path(root: &Path, names: &[String]) -> std::io::Result<PathBuf> {
+    let preferred = names.first().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "artifact locator is required",
+        )
+    })?;
     for name in names {
         let path = root.join(name);
         match std::fs::symlink_metadata(&path) {
@@ -147,7 +155,7 @@ pub fn existing_artifact_path(root: &Path, names: &[String; 2]) -> std::io::Resu
             Err(error) => return Err(error),
         }
     }
-    Ok(root.join(&names[0]))
+    Ok(root.join(preferred))
 }
 
 pub fn managed_kernel_directory(version: &ArtifactVersion, digest: Digest) -> String {
@@ -569,7 +577,11 @@ impl ArtifactStore {
     /// Existing paths are verified, never re-owned or linked to execution roots.
     /// Failure disables management, not execution. Blocking.
     pub fn prepare_roots(&self) -> Result<(), std::io::Error> {
-        for root in [&self.releases_root, &self.kernels_root] {
+        for root in [
+            &self.releases_root,
+            &self.kernels_root,
+            &self.boot_artifacts_root(),
+        ] {
             let parent = root.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
             let vendor = parent.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
             for directory in [vendor, parent, root.as_path()] {
@@ -827,7 +839,11 @@ impl ArtifactStore {
     /// Returns how many entries were removed. Blocking.
     pub fn clear_leftovers(&self) -> Result<usize, std::io::Error> {
         let mut removed = 0;
-        for root in [&self.releases_root, &self.kernels_root] {
+        for root in [
+            &self.releases_root,
+            &self.kernels_root,
+            &self.boot_artifacts_root(),
+        ] {
             // Listing-only nodes may never provision managed roots.
             match std::fs::symlink_metadata(root) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,

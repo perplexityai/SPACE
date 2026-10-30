@@ -111,6 +111,7 @@ fn insert_sandbox(
     crate::db::insert_sandbox(
         conn,
         crate::db::InsertSandboxParams {
+            guest_image: Default::default(),
             id: &sandbox_id.to_string(),
             uuid8: &SandboxRuntimeLabel::from_sandbox_id(sandbox_id),
             state,

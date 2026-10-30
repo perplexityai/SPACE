@@ -738,6 +738,7 @@ pub mod fixture {
         crate::db::insert_sandbox(
             conn,
             crate::db::InsertSandboxParams {
+                guest_image: Default::default(),
                 id,
                 uuid8: &uuid8,
                 state,

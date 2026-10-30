@@ -1,16 +1,17 @@
 //! Guest boot configuration belongs to runtime adapters. Lifecycle callers
 //! provide resources and policy, not a provider's JSON keys or device model.
 use pplx_space_common_core::types::{
-    Arch, BalloonConfig, GuestOperatingSystem, GuestPlatform, RateLimiter, RuntimeKind, VcpuCount,
+    Arch, BalloonConfig, ExecutionMetadata, GuestOperatingSystem, GuestPlatform, RateLimiter,
+    RuntimeKind, VcpuCount,
 };
 use std::num::{NonZeroU32, NonZeroU64};
 
 mod cloud_hypervisor;
 mod firecracker;
 
-/// Inputs for the Linux direct-boot adapters. Firmware and library-backed
-/// runtimes can introduce their own boot input without changing lifecycle intent.
-pub struct LinuxBoot<'a> {
+/// Resources for a catalog-qualified guest boot. The source selects direct
+/// kernel boot or firmware without making the lifecycle invent a kernel.
+pub struct GuestBoot<'a> {
     pub guest: GuestPlatform,
     pub cpus: VcpuCount,
     pub memory_mib: NonZeroU64,
@@ -23,13 +24,108 @@ pub struct LinuxBoot<'a> {
     pub huge_pages: bool,
     pub console: bool,
     pub builder: bool,
+    pub source: BootSource,
+}
+
+/// The launch boundary derives this from verified execution metadata, not from
+/// caller-provided runtime JSON.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BootSource {
+    LinuxDirect,
+    Uefi,
+}
+
+impl BootSource {
+    pub fn from_execution(execution: &ExecutionMetadata) -> Result<Self, BootConfigError> {
+        Self::resolve_execution(execution).map(|(source, _)| source)
+    }
+
+    fn resolve_execution(
+        execution: &ExecutionMetadata,
+    ) -> Result<(Self, Option<&'static crate::catalog::CompiledEnvironment>), BootConfigError> {
+        // Historical Firecracker disks predate bound environment descriptors;
+        // their wire contract already specifies Linux direct boot.
+        if execution.environment().is_none()
+            && execution.runtime().kind == RuntimeKind::Firecracker
+            && execution.guest().os == GuestOperatingSystem::Linux
+            && execution.components().iter().all(|component| {
+                component.kind == pplx_space_common_core::types::ArtifactComponentKind::Kernel
+            })
+        {
+            return Ok((Self::LinuxDirect, None));
+        }
+        use pplx_space_common_core::types::BootProfile;
+        use pplx_space_execution_common::environment::{
+            CLOUD_HYPERVISOR_BOOT_CONTRACT, CLOUD_HYPERVISOR_UEFI_BOOT_CONTRACT,
+            FIRECRACKER_BOOT_CONTRACT,
+        };
+        let catalog = crate::catalog::CompiledEnvironment::cached_for_architecture(
+            execution.guest().architecture,
+        )
+        .map_err(|_| BootConfigError::Invalid("compiled environment catalog unavailable"))?;
+        let environment = crate::catalog::CompiledEnvironment::of_execution(catalog, execution)
+            .ok_or(BootConfigError::Invalid("unknown execution boot contract"))?;
+        if execution.environment().is_some() {
+            environment
+                .definition()
+                .check_execution(execution)
+                .map_err(|_| {
+                    BootConfigError::Invalid("execution differs from its bound environment")
+                })?;
+        }
+        let source = match &environment.definition().descriptor().spec().boot {
+            BootProfile::LinuxDirectV1 { .. } => Ok(Self::LinuxDirect),
+            BootProfile::ArtifactsV1 { contract, .. } => match contract.as_str() {
+                FIRECRACKER_BOOT_CONTRACT | CLOUD_HYPERVISOR_BOOT_CONTRACT => Ok(Self::LinuxDirect),
+                CLOUD_HYPERVISOR_UEFI_BOOT_CONTRACT => Ok(Self::Uefi),
+                _ => Err(BootConfigError::Invalid(
+                    "unsupported execution boot contract",
+                )),
+            },
+        }?;
+        Ok((source, Some(environment)))
+    }
+}
+
+/// One policy resolver, repeated at each process boundary before side effects.
+/// Disk and network behavior come from the image; the catalog qualifies their
+/// combination with the boot protocol, independently of the guest OS name.
+#[derive(Clone, Copy, Debug)]
+pub struct GuestProfile {
+    image: pplx_space_common_core::types::guest_image::GuestImageContract,
+}
+impl GuestProfile {
+    pub fn resolve(
+        execution: &ExecutionMetadata,
+        image: pplx_space_common_core::types::guest_image::GuestImageContract,
+    ) -> Result<Self, BootConfigError> {
+        image
+            .validate()
+            .map_err(|_| BootConfigError::Invalid("inconsistent guest agent/readiness contract"))?;
+        let (_, environment) = BootSource::resolve_execution(execution)?;
+        let qualified = match environment {
+            Some(environment) => environment.supports_guest_image(image),
+            // Only the historical unbound Firecracker path can reach here after
+            // BootSource admission; retain its legacy image semantics on ARM too.
+            None => execution.environment().is_none() && image.legacy_transport(),
+        };
+        if !qualified {
+            return Err(BootConfigError::Invalid(
+                "image is incompatible with the qualified boot protocol",
+            ));
+        }
+        Ok(Self { image })
+    }
+    pub fn uses_dhcp(self) -> bool {
+        self.image.network() == pplx_space_common_core::types::guest_image::GuestNetwork::SlotDhcpV1
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum BootConfigError {
-    #[error("runtime {0} has no Linux direct-boot adapter")]
+    #[error("runtime {0} has no boot adapter")]
     UnsupportedRuntime(RuntimeKind),
-    #[error("Linux direct boot cannot boot guest {0:?}")]
+    #[error("unqualified boot source for guest {0:?}")]
     Guest(GuestPlatform),
     #[error("{feature} is not qualified for runtime {runtime}")]
     UnsupportedFeature {
@@ -63,10 +159,13 @@ pub fn validate_resources(
 
 pub fn configuration(
     runtime: RuntimeKind,
-    input: &LinuxBoot<'_>,
+    input: &GuestBoot<'_>,
 ) -> Result<String, BootConfigError> {
-    if input.guest.os != GuestOperatingSystem::Linux {
-        return Err(BootConfigError::Guest(input.guest));
+    match (input.source, input.guest.os, input.guest.architecture) {
+        (BootSource::LinuxDirect, GuestOperatingSystem::Linux, _) => {}
+        (BootSource::Uefi, _, Arch::X86_64)
+            if runtime == RuntimeKind::CloudHypervisor && !input.builder => {}
+        _ => return Err(BootConfigError::Guest(input.guest)),
     }
     let value = match runtime {
         RuntimeKind::Firecracker => firecracker::configuration(input),
@@ -78,9 +177,10 @@ pub fn configuration(
 
 // Changes apply only on cold boot. Rebuild templates and base snapshots to
 // roll out new boot arguments to workloads restored from memory state.
-fn command_line(input: &LinuxBoot<'_>, devices: &str, uart: &str, console: &str) -> String {
-    use pplx_space_common_core::guest::linux::network::{
-        GATEWAY_IPV4_ADDR, IPV4_ADDR, IPV4_NETMASK, PRIMARY_INTERFACE,
+fn command_line(input: &GuestBoot<'_>, devices: &str, uart: &str, console: &str) -> String {
+    use pplx_space_common_core::guest::linux::network::PRIMARY_INTERFACE;
+    use pplx_space_common_core::guest::network::{
+        GATEWAY as GATEWAY_IPV4_ADDR, GUEST as IPV4_ADDR, NETMASK as IPV4_NETMASK,
     };
     let build = if input.builder {
         format!(
@@ -139,9 +239,12 @@ impl StandaloneBoot {
 pub fn validate_standalone(
     runtime: RuntimeKind,
     configuration: &str,
+    source: BootSource,
 ) -> Result<StandaloneBoot, BootConfigError> {
     match runtime {
-        RuntimeKind::CloudHypervisor => cloud_hypervisor::parse(configuration).map(StandaloneBoot),
+        RuntimeKind::CloudHypervisor => {
+            cloud_hypervisor::parse(configuration, source).map(StandaloneBoot)
+        }
         _ => Err(BootConfigError::UnsupportedRuntime(runtime)),
     }
 }

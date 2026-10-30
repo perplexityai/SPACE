@@ -396,11 +396,13 @@ impl NetId {
     fn ip_slot_offset(&self) -> u32 {
         self.slot + 1
     }
+    pub fn guest_mac_bytes(&self) -> [u8; 6] {
+        let [_, b2, b1, b0] = self.slot.to_be_bytes();
+        [0xaa, 0xfc, 0, b2, b1, b0]
+    }
     pub fn guest_mac(&self) -> String {
-        let b2 = (self.slot >> 16) & 0xff;
-        let b1 = (self.slot >> 8) & 0xff;
-        let b0 = self.slot & 0xff;
-        format!("AA:FC:00:{:02X}:{:02X}:{:02X}", b2, b1, b0)
+        let [a, b, c, d, e, f] = self.guest_mac_bytes();
+        format!("{a:02X}:{b:02X}:{c:02X}:{d:02X}:{e:02X}:{f:02X}")
     }
 }
 
@@ -699,8 +701,8 @@ pub fn reset_network_slot(ns: &str, net: &NetId, pod_netns: Option<&str>) -> Res
 /// Set up TPROXY rules and policy routing in a namespace for net-gateway.
 /// `ns` — the network namespace name.
 /// `vpeer` — the vpeer interface name (for inbound DROP rule).
-pub fn setup_tproxy(ns: &str, uid: u32, vpeer: &str) -> Result<(), String> {
-    crate::firewall::setup_netgtw_tproxy_rules(ns, uid, vpeer).map_err(|e| e.to_string())?;
+pub fn setup_tproxy(ns: &str, uid: u32, vpeer: &str, dhcp: bool) -> Result<(), String> {
+    crate::firewall::setup_netgtw_tproxy_rules(ns, uid, vpeer, dhcp).map_err(|e| e.to_string())?;
 
     // Use "replace" to be idempotent — the rule/route may already exist if
     // the namespace was reused (e.g., suspend → restore reuses the same ns).
@@ -896,3 +898,16 @@ mod native;
 
 #[cfg(test)]
 mod tests;
+
+/// Create a connected descriptor in the lease's namespace, with a bounded
+/// connect. Call on the blocking host-work executor, never a Tokio worker.
+pub(crate) fn guest_tcp_stream(
+    ns: &str,
+    port: std::num::NonZeroU16,
+) -> io::Result<std::net::TcpStream> {
+    native::guest_tcp_stream(ns, port)
+}
+
+pub(crate) fn guest_dhcp_socket(ns: &str) -> io::Result<std::net::UdpSocket> {
+    native::guest_dhcp_socket(ns)
+}

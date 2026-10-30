@@ -32,6 +32,8 @@ use pplx_space_common_core::types::{
 };
 use sha2::{Digest as _, Sha256};
 
+mod boot_artifact;
+
 use crate::catalog::ManagedDirectoryName;
 
 use super::kernel_release::KernelReleaseScanner;
@@ -113,13 +115,23 @@ pub struct ScanLimits {
 pub struct ArtifactKinds {
     pub runtimes: bool,
     pub kernels: bool,
+    pub firmware: bool,
 }
 
 impl ArtifactKinds {
     pub const ALL: Self = Self {
         runtimes: true,
         kernels: true,
+        firmware: true,
     };
+
+    pub const fn includes_component(self, kind: ArtifactComponentKind) -> bool {
+        match kind {
+            ArtifactComponentKind::Kernel => self.kernels,
+            ArtifactComponentKind::Firmware => self.firmware,
+            _ => false,
+        }
+    }
 }
 
 /// What an artifact is, in the shared execution vocabulary. A kernel's
@@ -651,11 +663,18 @@ pub fn scan(
         scanner.scan_legacy_assets(&roots.cache_legacy_assets);
     }
 
+    if let Some(kernels) = &roots.managed_kernels {
+        let root = kernels.with_file_name("boot-artifacts");
+        if kinds.includes_component(ArtifactComponentKind::Firmware) {
+            scanner.scan_boot_artifacts(&root, ArtifactComponentKind::Firmware);
+        }
+    }
+
     // A filtered scan evicts only its own kind; the untouched partition is
     // still bounded by the last scan that visited it.
     scanner.previous.retain(|(kind, _), _| match kind {
         ArtifactKind::Runtime(_) => !kinds.runtimes,
-        ArtifactKind::Component(_) => !kinds.kernels,
+        ArtifactKind::Component(kind) => !kinds.includes_component(*kind),
     });
     scanner.previous.extend(scanner.seen);
     cache.entries = scanner.previous;
@@ -1268,8 +1287,8 @@ fn empty_artifact(origin: ArtifactOrigin, name: String, path: PathBuf) -> Scanne
             ArtifactKind::Component(ArtifactComponentKind::Kernel) => Some(boot_component_role()),
             ArtifactKind::Component(_) | ArtifactKind::Runtime(_) => None,
         },
-        // The runtime manager installs nothing yet, so nothing it finds is
-        // its own.
+        // Management attribution is applied from the configured store roots,
+        // never inferred from a directory label alone.
         management: ArtifactManagement::External(ArtifactProvider::Unknown),
         name,
         path,
