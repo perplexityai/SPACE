@@ -719,6 +719,41 @@ pplx-space-snapshot-store = [
 # The database migrator applies every store's migrations.
 pplx-space-db-migrator = ["pplx-space-db-migrate"]
 
+# Nothing above l30_storage reaches a database or object storage directly,
+# l20_domain never does, and l10_foundation does only in a storage helper,
+# which names nothing SPACE-specific. A helper is an l10_foundation crate with
+# a required dependency on a driver; `helpers` lists the others. The sqlx and
+# SQLite sub-crates are listed so that depending on one instead of the
+# umbrella crate is no way around the checks. A legacy l10_foundation crate
+# (see `legacy` below) is no helper even with a driver dependency: it is
+# checked like every other crate, with today's edges baselined.
+[rules.layers.storage]
+drivers = [
+  "aws-sdk-s3",
+  "deadpool-redis",
+  "libsqlite3-sys",
+  "redis",
+  "rusqlite",
+  "sqlx",
+  "sqlx-core",
+  "sqlx-macros",
+  "sqlx-macros-core",
+  "sqlx-mysql",
+  "sqlx-postgres",
+  "sqlx-sqlite",
+]
+helpers = [
+  # The HTTP connector and per-operation tracing that plug into an
+  # aws-sdk-s3 client's configuration, without depending on aws-sdk-s3.
+  "pplx-space-s3-http-client",
+]
+
+# The crates being dissolved: they predate the layers and mix SPACE-specific
+# code in until they are split up. Every check covers them, with today's edges
+# baselined.
+[rules.layers]
+legacy = ["pplx-space-common-core", "pplx-space-common-svc", "pplx-space-metrics"]
+
 [rules.layers.placement]          # every crate has a layer; no new unmoved entries
 mode = "required"
 
@@ -747,6 +782,30 @@ mode = "required"
 [rules.layers.dev_direction.stale_entries]
 mode = "required"
 
+# Only stores and storage helpers depend on a driver or a helper; an optional
+# dependency counts too, except a codec behind a feature in l10_foundation.
+# Today's exceptions are baselined in [layers.storage_access].
+[rules.layers.storage_access.no_crossing]
+mode = "required"
+
+[rules.layers.storage_access.no_new_entries]
+mode = "required"
+
+[rules.layers.storage_access.stale_entries]
+mode = "required"
+
+# Only stores and storage helpers turn on another crate's driver feature, one
+# that enables its optional dependency on a driver or helper, such as a codec
+# for its types. Today's exceptions are baselined in [layers.codec_features].
+[rules.layers.codec_features.no_crossing]
+mode = "required"
+
+[rules.layers.codec_features.no_new_entries]
+mode = "required"
+
+[rules.layers.codec_features.stale_entries]
+mode = "required"
+
 [rules.layers.test_only]          # test_support only through dev-dependencies; nothing depends on tools
 mode = "required"
 
@@ -756,7 +815,7 @@ mode = "required"
 [rules.layers.store_edges]        # API and Storage crates use only the stores that list them
 mode = "required"
 
-[rules.layers.stale_entries]      # unmoved, store_users and allowed_edges entries that no longer apply
+[rules.layers.stale_entries]      # unmoved, legacy, store_users, allowed_edges and storage entries that no longer apply
 mode = "required"
 
 [rules.layers.policy_changed]     # changes to [rules.layers], compared with the base branch

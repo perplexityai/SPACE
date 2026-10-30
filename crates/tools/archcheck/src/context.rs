@@ -1,6 +1,7 @@
 //! Everything a rule may inspect, loaded once before any rule runs.
 
 use std::{
+    collections::BTreeMap,
     env,
     ffi::OsStr,
     io,
@@ -140,6 +141,11 @@ pub struct Crate {
     pub lib_name_line: Option<usize>,
     /// Every dependency its manifest declares, of any kind and target.
     pub dependencies: Vec<Dependency>,
+    /// Its manifest's `[features]`: each feature to what it enables, such
+    /// as `dep:sqlx` or `other/sqlx`, each with the 1-based line it is
+    /// written on. Cargo's implicit features for optional dependencies are
+    /// not among them.
+    pub features: BTreeMap<String, Vec<(String, usize)>>,
 }
 
 /// A dependency a member's manifest declares, as `cargo metadata` reports
@@ -156,6 +162,14 @@ pub struct Dependency {
     pub target: Option<String>,
     /// The 1-based line that names it in the manifest, or 1 if none does.
     pub line: usize,
+    /// Whether it is `optional = true`, built only when a feature enables
+    /// it.
+    pub optional: bool,
+    /// The features it enables on the depended-on package, `features =
+    /// […]`, including those the workspace's entry adds.
+    pub features: Vec<String>,
+    /// Whether it enables the depended-on package's `default` feature.
+    pub uses_default_features: bool,
 }
 
 impl Dependency {
@@ -180,6 +194,12 @@ impl Dependency {
     /// examples and benchmarks build with.
     pub fn is_dev(&self) -> bool {
         self.kind.as_deref() == Some("dev")
+    }
+
+    /// The name the manifest and its `[features]` call it by: its
+    /// `package = "…"` rename, or the package name.
+    pub fn key(&self) -> &str {
+        self.rename.as_deref().unwrap_or(&self.package)
     }
 }
 
@@ -244,7 +264,7 @@ impl Context {
                 return Err(LoadError::UnknownLayersTable {
                     path,
                     table,
-                    known: Layers::table_names().join(" and "),
+                    known: Layers::table_list(),
                 });
             }
             return Err(LoadError::UnknownBaselineTable { path, table });
@@ -398,6 +418,17 @@ struct MetadataDependency {
     rename: Option<String>,
     kind: Option<String>,
     target: Option<String>,
+    #[serde(default)]
+    optional: bool,
+    #[serde(default)]
+    features: Vec<String>,
+    #[serde(default = "enabled")]
+    uses_default_features: bool,
+}
+
+/// Cargo's default for `default-features`.
+fn enabled() -> bool {
+    true
 }
 
 #[derive(Deserialize)]
@@ -450,12 +481,15 @@ fn workspace_crates(root: &Path) -> Result<Vec<Crate>, LoadError> {
     Ok(crates)
 }
 
-/// Only the names of a member's manifest, for their lines; Cargo has read
+/// Only the names of a member's manifest, for their lines, and its
+/// `[features]`, whose lines `cargo metadata` does not give; Cargo has read
 /// the rest.
 #[derive(Deserialize)]
 struct MemberManifest {
     package: Option<NameTable>,
     lib: Option<NameTable>,
+    #[serde(default)]
+    features: BTreeMap<String, Vec<Spanned<String>>>,
 }
 
 #[derive(Deserialize)]
@@ -474,6 +508,20 @@ fn load_crate(workspace_root: &Path, package: MetadataPackage) -> Result<Crate, 
     };
     let member = relative_path(Path::new(""), member)?;
     let (parsed, text): (MemberManifest, String) = parse_toml_with_text(&manifest)?;
+    let features = parsed
+        .features
+        .into_iter()
+        .map(|(feature, enables)| {
+            let enables = enables
+                .into_iter()
+                .map(|item| {
+                    let at = line_of(&text, item.span().start);
+                    (item.into_inner(), at)
+                })
+                .collect();
+            (feature, enables)
+        })
+        .collect();
     let line = |table: Option<NameTable>| {
         table
             .and_then(|table| table.name)
@@ -501,6 +549,9 @@ fn load_crate(workspace_root: &Path, package: MetadataPackage) -> Result<Crate, 
             rename: dependency.rename,
             kind: dependency.kind,
             target: dependency.target,
+            optional: dependency.optional,
+            features: dependency.features,
+            uses_default_features: dependency.uses_default_features,
         })
         .collect();
     Ok(Crate {
@@ -510,13 +561,16 @@ fn load_crate(workspace_root: &Path, package: MetadataPackage) -> Result<Crate, 
         name_line: line(parsed.package).unwrap_or(1),
         lib_name_line: line(parsed.lib),
         dependencies,
+        features,
     })
 }
 
 /// The first line of `manifest` that declares a dependency called `key`:
-/// `key = …`, `key.workspace = …` or a `[….dependencies.key]` header, with
-/// the key bare or quoted. 1 if none does, since the line only places the
-/// finding.
+/// `key = …` or `key.workspace = …` in a dependency table, or a
+/// `[….dependencies.key]` header, with the key bare or quoted. Other tables,
+/// such as `[features]`, whose keys may share the name, and the root
+/// manifest's `[workspace.dependencies]` are skipped. 1 if none does, since
+/// the line only places the finding.
 fn dependency_line(manifest: &str, key: &str) -> usize {
     let quoted = format!("\"{key}\"");
     let names_key = |rest: &str| {
@@ -525,17 +579,27 @@ fn dependency_line(manifest: &str, key: &str) -> usize {
                 .is_some_and(|after| after.trim_start().starts_with(['=', '.', ']']))
         })
     };
-    manifest
-        .lines()
-        .position(|line| {
-            let line = line.trim_start();
-            names_key(line)
-                || line.starts_with('[')
-                    && line
-                        .split_once("dependencies.")
-                        .is_some_and(|(_, rest)| names_key(rest))
-        })
-        .map_or(1, |index| index + 1)
+    let mut in_dependencies = false;
+    for (index, line) in manifest.lines().enumerate() {
+        let line = line.trim_start();
+        if let Some(header) = line.strip_prefix('[') {
+            let header = header.split(']').next().unwrap_or_default().trim();
+            if header.starts_with("workspace") {
+                in_dependencies = false;
+                continue;
+            }
+            in_dependencies = header.ends_with("dependencies");
+            if header
+                .split_once("dependencies.")
+                .is_some_and(|(_, rest)| names_key(&format!("{rest}]")))
+            {
+                return index + 1;
+            }
+        } else if in_dependencies && names_key(line) {
+            return index + 1;
+        }
+    }
+    1
 }
 
 fn production_files(root: &Path, crates: &[Crate]) -> Result<Vec<ProductionFile>, LoadError> {
