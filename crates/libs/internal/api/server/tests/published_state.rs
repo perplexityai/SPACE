@@ -2479,6 +2479,20 @@ async fn publish_sandbox_state_updates_activity_clocks_without_touching_updated_
     insert_active_sandbox(&db.pool, sandbox_id, node_id, "started").await?;
     set_sandbox_updated_at_for_test(&db.pool, sandbox_id, original_updated_at).await?;
 
+    let mut conn = db.pool.acquire().await?;
+    publish_sandbox_states(
+        &mut conn,
+        node_id,
+        &[published_sandbox_state(sandbox_id, "started")],
+    )
+    .await?;
+    drop(conn);
+    assert_eq!(
+        sandbox_activity_at(&db.pool, sandbox_id).await?,
+        (None, None, None),
+        "a report with no activity must leave all three clocks unset"
+    );
+
     let mut state = published_sandbox_state(sandbox_id, "started");
     state.last_access_at = Some(timestamp(1_800_000_000));
     state.last_command_at = Some(timestamp(1_800_000_120));
@@ -2507,6 +2521,21 @@ async fn publish_sandbox_state_updates_activity_clocks_without_touching_updated_
             .unix_timestamp(),
         1_800_000_120
     );
+    let foreign_node = NodeId::new();
+    insert_ready_worker_node(&db.pool, foreign_node).await?;
+    let mut foreign_state = published_sandbox_state(sandbox_id, "started");
+    foreign_state.last_used_at = Some(timestamp(1_900_000_000));
+    foreign_state.last_access_at = Some(timestamp(1_900_000_000));
+    foreign_state.last_command_at = Some(timestamp(1_900_000_000));
+    let mut conn = db.pool.acquire().await?;
+    publish_sandbox_states(&mut conn, foreign_node, &[foreign_state]).await?;
+    drop(conn);
+    assert_eq!(
+        sandbox_activity_at(&db.pool, sandbox_id).await?,
+        (last_used_at, last_access_at, last_command_at),
+        "a foreign publisher cannot advance any of the sandbox's activity clocks"
+    );
+
     let updated_at = sandbox_updated_at(&db.pool, sandbox_id).await?;
     assert_eq!(
         updated_at.unix_timestamp(),

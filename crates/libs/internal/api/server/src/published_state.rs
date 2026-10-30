@@ -3940,6 +3940,8 @@ async fn update_activity_timestamps(
     let activity_rows = Json(serde_json::to_value(activity_rows).map_err(|error| {
         Status::internal(format!("serialize published activity timestamps: {error}"))
     })?);
+    // PostgreSQL GREATEST ignores absent clocks and yields NULL if all are absent.
+    // Keep publisher ownership on the updated row, avoiding a redundant self-join.
     sqlx::query(sql!(
         "WITH input AS (
          SELECT *
@@ -3954,74 +3956,61 @@ async fn update_activity_timestamps(
          SELECT input.sandbox_id,
                 input.last_access_at,
                 input.last_command_at,
-                (
-                    SELECT MAX(value)
-                    FROM (
-                        VALUES
-                            (input.last_used_at),
-                            (input.last_access_at),
-                            (input.last_command_at)
-                    ) AS timestamps(value)
-                ) AS last_used_at
+                GREATEST(input.last_used_at, input.last_access_at, input.last_command_at) AS last_used_at
          FROM input
-     ),
-     publishable AS (
-         SELECT activity.*
-         FROM activity
-         JOIN sandboxes s ON s.id = activity.sandbox_id
-         WHERE s.active_node_id = $1
-           AND activity.last_used_at IS NOT NULL
      )
      UPDATE sandboxes s
      SET last_access_at = CASE
-             WHEN publishable.last_access_at IS NOT NULL
+             WHEN activity.last_access_at IS NOT NULL
               AND (
                   s.last_access_at IS NULL
-                  OR s.last_access_at < publishable.last_access_at - INTERVAL '1 minute'
+                  OR s.last_access_at < activity.last_access_at - INTERVAL '1 minute'
               )
-             THEN publishable.last_access_at
+             THEN activity.last_access_at
              ELSE s.last_access_at
          END,
          last_command_at = CASE
-             WHEN publishable.last_command_at IS NOT NULL
+             WHEN activity.last_command_at IS NOT NULL
               AND (
                   s.last_command_at IS NULL
-                  OR s.last_command_at < publishable.last_command_at - INTERVAL '1 minute'
+                  OR s.last_command_at < activity.last_command_at - INTERVAL '1 minute'
               )
-             THEN publishable.last_command_at
+             THEN activity.last_command_at
              ELSE s.last_command_at
          END,
          last_used_at = CASE
-             WHEN publishable.last_used_at IS NOT NULL
+             WHEN activity.last_used_at IS NOT NULL
               AND (
                   s.last_used_at IS NULL
-                  OR s.last_used_at < publishable.last_used_at - INTERVAL '1 minute'
+                  OR s.last_used_at < activity.last_used_at - INTERVAL '1 minute'
               )
-             THEN publishable.last_used_at
+             THEN activity.last_used_at
              ELSE s.last_used_at
          END
-     FROM publishable
-     WHERE s.id = publishable.sandbox_id
+     FROM activity
+     WHERE s.id = activity.sandbox_id
+       AND s.active_node_id = $1
+       AND activity.last_used_at IS NOT NULL
        AND (
            (
-               publishable.last_access_at IS NOT NULL
+               activity.last_access_at IS NOT NULL
                AND (
                    s.last_access_at IS NULL
-                   OR s.last_access_at < publishable.last_access_at - INTERVAL '1 minute'
+                   OR s.last_access_at < activity.last_access_at - INTERVAL '1 minute'
                )
            )
            OR (
-               publishable.last_command_at IS NOT NULL
+               activity.last_command_at IS NOT NULL
                AND (
                    s.last_command_at IS NULL
-                   OR s.last_command_at < publishable.last_command_at - INTERVAL '1 minute'
+                   OR s.last_command_at < activity.last_command_at - INTERVAL '1 minute'
                )
            )
            OR (
-               publishable.last_used_at IS NOT NULL
+               activity.last_used_at IS NOT NULL
                AND (
                    s.last_used_at IS NULL
-                   OR s.last_used_at < publishable.last_used_at - INTERVAL '1 minute'
+                   OR s.last_used_at < activity.last_used_at - INTERVAL '1 minute'
                )
            )
        )"
