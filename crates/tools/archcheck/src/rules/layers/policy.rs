@@ -1,4 +1,5 @@
-//! `layers.stale_entries` for `[rules.layers]` entries that no longer apply,
+//! `layers.stale_entries` for `[rules.layers]` entries that no longer apply
+//! (those of `[rules.layers.storage]` are [`super::storage`]'s),
 //! and `layers.policy_changed` for every change to `[rules.layers]` from the
 //! base branch's `ARCHITECTURE.toml`, including its removal.
 
@@ -331,6 +332,26 @@ fn changes(base: Option<&LayersPolicy>, policy: &LayersPolicy) -> Vec<(usize, St
                     ));
                 }
             }
+        }
+    }
+    let storage = format!("[rules.{RULE}.storage]");
+    for (key, old, new) in [
+        ("drivers", &base.storage.drivers, &policy.storage.drivers),
+        ("helpers", &base.storage.helpers, &policy.storage.helpers),
+    ] {
+        for (package, line) in new {
+            if !old.contains_key(package) {
+                changes.push((
+                    *line,
+                    format!(": `{package}` was added to {storage} {key}."),
+                ));
+            }
+        }
+        for package in old.keys().filter(|package| !new.contains_key(*package)) {
+            changes.push((
+                policy.storage.line.unwrap_or(policy.line),
+                format!(": `{package}` was removed from {storage} {key}."),
+            ));
         }
     }
     for (package, line) in &policy.legacy {

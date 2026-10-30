@@ -25,8 +25,9 @@ use crate::{
 mod layers;
 
 pub use layers::{
-    DuplicatePackageError, EdgeBehaviours, Entries, Layer, LayersConfig, LayersPolicy, PackageSet,
-    UnknownLayerError, Unmoved, UnmovedError,
+    Drivers, DriversError, DuplicatePackageError, EdgeBehaviours, Entries, Layer, LayersConfig,
+    LayersPolicy, PackageSet, StorageConfig, StoragePolicy, UnknownLayerError, Unmoved,
+    UnmovedError,
 };
 
 pub const CONFIG_FILE: &str = "ARCHITECTURE.toml";

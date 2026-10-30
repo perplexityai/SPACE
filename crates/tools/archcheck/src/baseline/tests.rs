@@ -38,6 +38,12 @@ fn config() -> ArchitectureConfig {
         "dev_direction.no_crossing",
         "dev_direction.no_new_entries",
         "dev_direction.stale_entries",
+        "storage_access.no_crossing",
+        "storage_access.no_new_entries",
+        "storage_access.stale_entries",
+        "codec_features.no_crossing",
+        "codec_features.no_new_entries",
+        "codec_features.stale_entries",
         "test_only",
         "clients",
         "store_edges",
@@ -46,6 +52,7 @@ fn config() -> ArchitectureConfig {
     ]
     .iter()
     .map(|behaviour| format!("[rules.layers.{behaviour}]\nmode = \"advisory\"\n"))
+    .chain(["[rules.layers.storage]\ndrivers = [\"sqlx\"]\n".to_owned()])
     .collect();
     let text = format!(
         "[rules.file_size]\nlimit = 5\n{}{}{}\
@@ -95,7 +102,11 @@ fn every_configured_table_is_read_from_a_base_copy() {
         }
         if let Some(check) = layers_check(table) {
             let edges = BTreeMap::from([("from".to_owned(), BTreeSet::from([table.clone()]))]);
-            assert_eq!(base.layers_table(check).ok(), Some(Some(&edges)), "{table}");
+            let found = match base.layers_table(check) {
+                Ok(BaseLayersTable::Table(found)) => Some(found),
+                _ => None,
+            };
+            assert_eq!(found, Some(&edges), "{table}");
             continue;
         }
         let entries = base.table(table).ok();
