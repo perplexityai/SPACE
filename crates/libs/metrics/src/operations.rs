@@ -228,6 +228,8 @@ metric_vocabulary!(
     InlineAdmissionPath {
         /// A native create that won an admission-time warm-pool claim.
         WarmPoolCreate => "warm_pool_create",
+        /// A native create that takes no warm-pool slot.
+        ColdCreate => "cold_create",
         /// A caller's `:wake`, `:resume` or `:start`.
         LifecycleAction => "lifecycle_action",
         /// The wake the system queues for a command, process session or

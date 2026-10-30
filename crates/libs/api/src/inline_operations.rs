@@ -432,9 +432,27 @@ impl InlineExecutor for SandboxLifecycleOperationExecutor {
     }
 }
 
-/// Inline execution of the lifecycle operations callers wait on: a caller's
-/// `:wake`, `:resume` or `:start`, and the wake the system queues for a
-/// command, process session or attach. Each runs inline only when the env
+/// The dispatcher's executors for the kinds [`InlineLifecycle`] offers,
+/// chosen by kind as the dispatcher chooses them.
+struct NativeInlineExecutor {
+    create: CreateSandboxOperationExecutor,
+    lifecycle: SandboxLifecycleOperationExecutor,
+}
+
+impl InlineExecutor for NativeInlineExecutor {
+    fn execute(&self, operation: ClaimedPublicOperation) -> InlineExecution {
+        if operation.kind == OperationKind::CreateSandbox {
+            InlineExecutor::execute(&self.create, operation)
+        } else {
+            InlineExecutor::execute(&self.lifecycle, operation)
+        }
+    }
+}
+
+/// Inline execution of the lifecycle operations callers wait on: a native
+/// create that takes no warm-pool slot, a caller's `:wake`, `:resume` or
+/// `:start`, and the wake the system queues for a command, process session
+/// or attach. Each runs inline only when the env
 /// master is on, its kind is in `SPACE_NATIVE_INLINE_KINDS`, the
 /// `space-native-inline-operations` flag allows its organization, and the
 /// process has a permit free; admission then claims it only on an otherwise
@@ -460,13 +478,18 @@ impl InlineLifecycle {
         }
     }
 
-    /// The dispatcher's lifecycle executor, run by `runner`.
-    pub(crate) fn with_lifecycle_executor(
+    /// The dispatcher's create and lifecycle executors, run by `runner`.
+    pub(crate) fn with_native_executors(
         runner: InlineOperations,
-        executor: SandboxLifecycleOperationExecutor,
+        create: CreateSandboxOperationExecutor,
+        lifecycle: SandboxLifecycleOperationExecutor,
         feature_flags: FeatureFlagClient,
     ) -> Self {
-        Self::new(runner, Arc::new(executor), feature_flags)
+        Self::new(
+            runner,
+            Arc::new(NativeInlineExecutor { create, lifecycle }),
+            feature_flags,
+        )
     }
 
     /// Whether operations of `kind` for `org_id` are offered for inline
