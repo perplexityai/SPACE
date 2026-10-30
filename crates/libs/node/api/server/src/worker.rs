@@ -86,6 +86,12 @@ fn classify_wait_ready_policy(
     }
 }
 
+fn retain_process_capabilities(capabilities: &mut Vec<String>) {
+    capabilities.retain(|capability| {
+        capability == pplx_space_common_grpc::GuestCapability::ProcessOutputGapResume.as_str()
+    });
+}
+
 fn prepare_wait_ready_forward<T>(request: &mut Request<T>) {
     let policy = classify_wait_ready_caller(request);
     let route_token = space_api_route_capability_presence(request.metadata());
@@ -817,16 +823,21 @@ impl WorkerApi for WorkerApiService {
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::SpacedGetStatusResponse>, Status> {
         let sandbox_id = r.get_ref().sandbox_id.clone();
         let client = self.clients.sbx();
-        self.limited_sbx_operation("SpacedGetStatus", &sandbox_id, move || {
-            crate::restart_handoff::call_with_restart_handoff(
-                "SpacedGetStatus",
-                RpcReplaySafety::ReadOnly,
-                r,
-                client,
-                |mut client, request| async move { client.spaced_get_status(request).await },
-            )
-        })
-        .await
+        let mut response = self
+            .limited_sbx_operation("SpacedGetStatus", &sandbox_id, move || {
+                crate::restart_handoff::call_with_restart_handoff(
+                    "SpacedGetStatus",
+                    RpcReplaySafety::ReadOnly,
+                    r,
+                    client,
+                    |mut client, request| async move { client.spaced_get_status(request).await },
+                )
+            })
+            .await?;
+        if let Some(info) = response.get_mut().process_execution.as_mut() {
+            retain_process_capabilities(&mut info.capabilities);
+        }
+        Ok(response)
     }
 
     async fn spaced_wait_ready(
@@ -836,16 +847,21 @@ impl WorkerApi for WorkerApiService {
         prepare_wait_ready_forward(&mut r);
         let sandbox_id = r.get_ref().sandbox_id.clone();
         let client = self.clients.sbx();
-        self.limited_sbx_operation("SpacedWaitReady", &sandbox_id, move || {
-            crate::restart_handoff::call_with_restart_handoff(
-                "SpacedWaitReady",
-                RpcReplaySafety::ReadOnly,
-                r,
-                client,
-                |mut client, request| async move { client.spaced_wait_ready(request).await },
-            )
-        })
-        .await
+        let mut response = self
+            .limited_sbx_operation("SpacedWaitReady", &sandbox_id, move || {
+                crate::restart_handoff::call_with_restart_handoff(
+                    "SpacedWaitReady",
+                    RpcReplaySafety::ReadOnly,
+                    r,
+                    client,
+                    |mut client, request| async move { client.spaced_wait_ready(request).await },
+                )
+            })
+            .await?;
+        if let Some(info) = response.get_mut().process_execution.as_mut() {
+            retain_process_capabilities(&mut info.capabilities);
+        }
+        Ok(response)
     }
 
     async fn spaced_stat(

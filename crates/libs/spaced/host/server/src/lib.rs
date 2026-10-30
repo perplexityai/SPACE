@@ -185,6 +185,7 @@ impl std::fmt::Debug for SpacedHostService {
 
 #[derive(Clone, Debug)]
 struct GuestReadySnapshot {
+    process_execution: Option<proto::ProcessExecutionInfo>,
     guest_uptime: Option<prost_types::Duration>,
     version: String,
     compatibility_family: String,

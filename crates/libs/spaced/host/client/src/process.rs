@@ -13,12 +13,16 @@ pub(super) fn connect_process_request(
     timeout: Option<ReadyTimeout>,
     output_cursor: Option<u64>,
     resume_from_oldest_retained: bool,
+    resume_after_output_gap: bool,
 ) -> ConnectProcessRequest {
     ConnectProcessRequest {
         process_id: process_id.as_str().to_string(),
         timeout: timeout.map(proto_duration),
         output_cursor,
         resume_from_oldest_retained,
+        // Unset rather than false, so a reader that does not opt in sends
+        // the same request as before the field existed.
+        resume_after_output_gap: resume_after_output_gap.then_some(true),
     }
 }
 
@@ -92,6 +96,7 @@ impl SpacedHostClient {
         timeout: Option<std::time::Duration>,
         output_cursor: Option<u64>,
         resume_from_oldest_retained: bool,
+        resume_after_output_gap: bool,
     ) -> Result<tonic::Streaming<proto::ProcessEvent>, tonic::Status> {
         let process_id = ProcessId::parse(process_id).map_err(invalid_argument_status)?;
         let timeout = timeout
@@ -112,6 +117,7 @@ impl SpacedHostClient {
                             timeout,
                             output_cursor,
                             resume_from_oldest_retained,
+                            resume_after_output_gap,
                         ))
                         .await
                         .map(Response::into_inner)

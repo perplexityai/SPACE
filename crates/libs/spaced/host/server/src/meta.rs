@@ -45,6 +45,9 @@ impl Meta for SpacedHostService {
         };
         Ok(Response::new(GetStatusResponse {
             ready: status.is_some(),
+            process_execution: status
+                .as_ref()
+                .and_then(|status| status.process_execution.clone()),
             guest_uptime: status.as_ref().and_then(|status| status.guest_uptime),
             host_version: Some(proto::VersionInfo {
                 version: pplx_space_spaced_common::spaced_version().to_string(),
@@ -65,6 +68,7 @@ impl Meta for SpacedHostService {
         let timeout = validate_timeout(request.into_inner().timeout)?;
         let response = self.wait_guest_ready(timeout, context).await?;
         Ok(Response::new(WaitReadyResponse {
+            process_execution: response.process_execution,
             guest_uptime: response.guest_uptime,
             mem_total_bytes: response.mem_total_bytes,
             vcpu_count: response.vcpu_count,

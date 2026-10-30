@@ -47,6 +47,12 @@ and error evolution, requires a separate crate-level policy before stabilization
   executable during construction: an unreadable or invalid `/proc/self/exe`
   intentionally fails startup before readiness, rather than deferring that
   failure to the first filesystem request.
+- `ExecutionService::process_execution_info()` reports the service instance and
+  implemented process capabilities before starting work. Clones share an instance;
+  a newly constructed service has a new one. Guest readiness forwards the identity
+  and supported capabilities through host and manager metadata; older peers omit it. Memory
+  snapshots preserve it, so handles must also identify their sandbox. Discovery is
+  only an observation: it does not yet fence requests or make mutations retry-safe.
 - `ExecutionServiceConfig::process_retention` independently sets completed-exit,
   completed-output and completed-start idempotency windows. Defaults preserve
   guest behavior: 15 minutes for exits, 60 seconds for output and idempotency.
@@ -193,6 +199,18 @@ and error evolution, requires a separate crate-level policy before stabilization
   process groups while supervision is active. Background descendants that close
   or redirect inherited output can outlive a completed leader; draining this
   service does not establish that every descendant has exited.
+- `ConnectProcessRequest::resume_after_output_gap` opts into explicit loss
+  reports followed by retained output and the exit. `ProcessOutputGap` names the
+  next cursor, skipped events and cumulative bytes before that cursor. It also
+  applies to gaps that arise after connecting and takes precedence over
+  `resume_from_oldest_retained` for reporting loss. When backpressure is enabled
+  and the primary reader position is free, a stale gap reader holds the oldest
+  retained output before reporting the gap. Observers do not displace a primary
+  reader and can encounter further gaps. Callers that omit the option keep
+  existing reconnect behavior. Cursor-based opt-ins require an affirmative first
+  `Connected` acknowledgement; upstream errors are propagated. Cursorless
+  completed replay retains its Started/Exit shape without claiming capability
+  support. Ordinary connections remain available to older guests.
 - By default, a completed process stays connectable for 15 minutes after it exits, so a
   client that reattaches still reads its exit, and the process list includes it
   with its exit when asked to (`include_exited`); by default it lists running

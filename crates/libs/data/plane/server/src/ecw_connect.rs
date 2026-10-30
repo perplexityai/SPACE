@@ -287,7 +287,8 @@ pub(super) fn process_event_to_connect_message(
             Some(connect_process_output("stderr", &stderr.data))
         }
         Some(spaced_process_event::Event::Exit(exit)) => Some(connect_process_exit(exit.outcome)),
-        None => None,
+        // `ecw_process` fails the stream on a gap before translating it.
+        Some(spaced_process_event::Event::OutputGap(_)) | None => None,
     }
 }
 

@@ -7508,6 +7508,7 @@ dependencies = [
  "tonic",
  "tower",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

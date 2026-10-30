@@ -441,14 +441,22 @@ impl Process for MockBridgeGuest {
         &self,
         request: Request<ConnectProcessRequest>,
     ) -> Result<Response<Self::ConnectProcessStream>, Status> {
-        assert_eq!(request.into_inner().process_id, "proc-1");
+        let request = request.into_inner();
+        // `proc-1` answers like a guest that predates resume_after_output_gap;
+        // `proc-2` like one that honors it.
+        let resume_after_output_gap = match request.process_id.as_str() {
+            "proc-1" => false,
+            "proc-2" => request.resume_after_output_gap == Some(true),
+            other => panic!("unexpected process {other}"),
+        };
         let events = vec![Ok(ProcessEvent {
-            process_id: "proc-1".into(),
+            process_id: request.process_id,
             pid: Some(123),
             event: Some(
                 pplx_space_spaced_common::proto::bridge_guest::process_event::Event::Connected(
                     pplx_space_spaced_common::proto::bridge_guest::ProcessConnected {
                         output_cursor: None,
+                        resume_after_output_gap,
                     },
                 ),
             ),
@@ -543,6 +551,7 @@ impl Meta for MockBridgeGuest {
         _request: Request<WaitReadyRequest>,
     ) -> Result<Response<WaitReadyResponse>, Status> {
         Ok(Response::new(WaitReadyResponse {
+            process_execution: None,
             ready: self.ready,
             guest_uptime: self.ready.then_some(prost_types::Duration {
                 seconds: 1,

@@ -194,6 +194,16 @@ message GetModifiedFilesResponse {
   bool overflowed = 6;
 }
 
+// Observation of one in-memory execution service. It is not an authorization
+// token or a request fence. Adapters retain only capabilities they preserve.
+// A memory snapshot preserves this identity; bind handles to their sandbox too.
+message ProcessExecutionInfo {
+  // Changes when the execution service is constructed again, not on reconnect.
+  string instance_id = 1;
+  // Unknown names may be ignored. Absence means unsupported.
+  repeated string capabilities = 2;
+}
+
 message StartRequest {
   repeated string command = 1;
   optional string cwd = 2;
@@ -248,6 +258,11 @@ message ConnectProcessRequest {
   // its reader position, so output written meanwhile cannot evict it, and
   // reports it in `ProcessConnected.output_cursor`. Older guests ignore it.
   bool resume_from_oldest_retained = 4;
+  // Emit ProcessOutputGap and continue when unread output is evicted, including
+  // after the connection starts. Unlike resume_from_oldest_retained, this also
+  // reports the initial gap instead of silently moving the starting cursor.
+  // Takes precedence when both options are set.
+  optional bool resume_after_output_gap = 5;
 }
 message ListProcessesRequest {
   // Also list processes that have exited but are still retained, with their
@@ -302,17 +317,35 @@ message ProcessEvent {
     ProcessOutput stdout = 5;
     ProcessOutput stderr = 6;
     ProcessExit exit = 7;
+    // Sent only to a ConnectProcess caller that set resume_after_output_gap.
+    ProcessOutputGap output_gap = 8;
   }
 }
 message ProcessStarted { optional google.protobuf.Timestamp start_time = 1; }
 message ProcessConnected {
-  // The journal cursor of the first output this stream sends, when the
-  // request set `output_cursor`: that cursor, or a later one when
+  // The initial journal cursor when the request set `output_cursor`: that
+  // cursor, or a later one when
   // `resume_from_oldest_retained` moved the start past evicted output.
+  // An opted-in ProcessOutputGap may subsequently advance this cursor.
   // Unset by older guests.
   optional uint64 output_cursor = 1;
+  // Set when the request asked for resume_after_output_gap and this guest
+  // honors it. A guest that predates the field ignores the request and keeps
+  // failing a lagged reader; spaced-host then refuses the opted-in stream with
+  // a guest-capability-unsupported status.
+  bool resume_after_output_gap = 2;
 }
 message ProcessOutput { bytes data = 1; }
+message ProcessOutputGap {
+  // Output events evicted before this stream delivered them.
+  uint64 skipped_events = 1;
+  // The output_cursor of the next output event this stream delivers.
+  uint64 output_cursor = 2;
+  // Total stdout and stderr data bytes the process emitted before
+  // output_cursor. A caller that counted the bytes it received from cursor 0
+  // subtracts that count to learn how many bytes it missed.
+  uint64 output_bytes_before = 3;
+}
 message ProcessExit {
   oneof outcome {
     ProcessExited exited = 1;

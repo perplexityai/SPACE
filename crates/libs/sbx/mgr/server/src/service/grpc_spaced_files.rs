@@ -10,6 +10,39 @@ use super::spaced_bridge::*;
 use super::tail_support::*;
 use super::*;
 
+fn supported_process_execution_info(
+    info: Option<pplx_space_spaced_host_client::proto::ProcessExecutionInfo>,
+) -> Option<pplx_space_spaced_host_client::proto::ProcessExecutionInfo> {
+    info.map(|mut info| {
+        // Advertise only guarantees preserved by this manager's request adapters.
+        info.capabilities.retain(|capability| {
+            capability == pplx_space_common_grpc::GuestCapability::ProcessOutputGapResume.as_str()
+        });
+        info
+    })
+}
+
+fn spaced_status_response(
+    status: pplx_space_spaced_host_client::proto::GetStatusResponse,
+) -> SpacedGetStatusResponse {
+    SpacedGetStatusResponse {
+        process_execution: supported_process_execution_info(status.process_execution),
+        ready: status.ready,
+        guest_uptime: status.guest_uptime,
+        host_version: spaced_version_info(status.host_version),
+        guest_version: spaced_version_info(status.guest_version),
+    }
+}
+
+fn spaced_ready_response(
+    response: pplx_space_spaced_host_client::proto::WaitReadyResponse,
+) -> SpacedWaitReadyResponse {
+    SpacedWaitReadyResponse {
+        process_execution: supported_process_execution_info(response.process_execution),
+        guest_uptime: response.guest_uptime,
+    }
+}
+
 /// How long a sandbox whose `Stats` inspect failed stays quiet before another
 /// failure is logged. Kubelet polls every sandbox's stats, so a node-manager
 /// restart would otherwise log once per poll per sandbox.
@@ -340,12 +373,7 @@ impl SandboxManagerService {
         route_auth.authorize_sandbox(&sandbox)?;
         let client = self.connect_spaced_host(&sandbox).await?;
         let status = client.get_status().await?;
-        Ok(Response::new(SpacedGetStatusResponse {
-            ready: status.ready,
-            guest_uptime: status.guest_uptime,
-            host_version: spaced_version_info(status.host_version),
-            guest_version: spaced_version_info(status.guest_version),
-        }))
+        Ok(Response::new(spaced_status_response(status)))
     }
 
     pub(super) async fn spaced_wait_ready(
@@ -379,9 +407,7 @@ impl SandboxManagerService {
             .connect_spaced_host_with_policy(&sandbox, endpoint_proof_policy)
             .await?;
         let response = client.wait_ready(timeout).await?;
-        Ok(Response::new(SpacedWaitReadyResponse {
-            guest_uptime: response.guest_uptime,
-        }))
+        Ok(Response::new(spaced_ready_response(response)))
     }
 
     pub(super) async fn spaced_stat(

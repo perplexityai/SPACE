@@ -38,6 +38,7 @@ struct ReadyWaitGuest {
     response_errors: Arc<std::sync::Mutex<std::collections::VecDeque<tonic::Code>>>,
     flush_deadlines: Option<Arc<std::sync::Mutex<Vec<Duration>>>>,
     ping_callsites: usize,
+    process_execution: Option<pplx_space_spaced_common::proto::operations::ProcessExecutionInfo>,
 }
 
 struct ActiveWaitReadyCall(Arc<AtomicUsize>);
@@ -83,6 +84,7 @@ impl BridgeGuestMeta for ReadyWaitGuest {
         }
         let ready = self.ready.load(Ordering::SeqCst);
         Ok(Response::new(BridgeGuestWaitReadyResponse {
+            process_execution: ready.then(|| self.process_execution.clone()).flatten(),
             ready,
             guest_uptime: ready.then(|| duration_from_millis(42)),
             version: self.version.to_string(),
@@ -134,6 +136,7 @@ impl ReadyWaitGuest {
             response_errors: Arc::default(),
             flush_deadlines: None,
             ping_callsites: 0,
+            process_execution: None,
         }
     }
 
@@ -476,18 +479,36 @@ async fn is_connected_recovers_after_guest_bridge_starts_late() {
 async fn readiness_requires_a_supported_guest_and_preserves_legacy_support() {
     // The common crate owns the full identity matrix; this exercises transport,
     // terminal status propagation, and readiness publication.
-    for (version, family, supported) in [
-        ("0.1.0", "0.1", true),
-        ("0.8.0", "0.8", true),
-        ("0.9.0", "0.9", false),
-        ("invalid", "0.1", false),
+    for (version, family, supported, discovery, valid_instance) in [
+        ("0.1.0", "0.1", true, false, true),
+        ("0.8.0", "0.8", true, false, true),
+        ("0.8.0", "0.8", true, true, true),
+        ("0.8.0", "0.8", true, true, false),
+        ("0.9.0", "0.9", false, true, true),
+        ("invalid", "0.1", false, false, true),
     ] {
         let temp_dir = tempfile::tempdir().expect("temp dir created");
         let bridge_guest_socket_path = temp_dir.path().join("spaced-bridge-guest.sock");
         let wait_ready_calls = Arc::new(AtomicUsize::new(0));
+        let process_execution =
+            discovery.then(
+                || pplx_space_spaced_common::proto::operations::ProcessExecutionInfo {
+                    instance_id: if valid_instance {
+                        "01900000-0000-7000-8000-000000000001"
+                    } else {
+                        "invalid"
+                    }
+                    .into(),
+                    capabilities: vec![
+                        "process_output_gap_resume".into(),
+                        "future_capability".into(),
+                    ],
+                },
+            );
         let bridge_task = ReadyWaitGuest {
             version,
             family,
+            process_execution: process_execution.clone(),
             ..ReadyWaitGuest::new(wait_ready_calls.clone())
         }
         .start(bridge_guest_socket_path.clone())
@@ -506,6 +527,14 @@ async fn readiness_requires_a_supported_guest_and_preserves_legacy_support() {
             assert_eq!(ready.guest_uptime, Some(duration_from_millis(42)));
             assert_eq!(ready.mem_total_bytes, Some(8_589_934_592));
             assert_eq!(ready.vcpu_count, Some(4));
+            let expected = process_execution
+                .clone()
+                .filter(|_| valid_instance)
+                .map(|mut info| {
+                    info.capabilities = vec!["process_output_gap_resume".into()];
+                    info
+                });
+            assert_eq!(ready.process_execution, expected);
             let identity = ready.guest_version.expect("ready guest identity");
             assert_eq!(identity.version, version);
             assert_eq!(identity.compatibility_family, family);
@@ -516,6 +545,13 @@ async fn readiness_requires_a_supported_guest_and_preserves_legacy_support() {
         let status = client.get_status().await.unwrap();
         assert_eq!(status.ready, supported);
         assert_eq!(status.guest_version.is_some(), supported);
+        let expected = process_execution
+            .filter(|_| supported && valid_instance)
+            .map(|mut info| {
+                info.capabilities = vec!["process_output_gap_resume".into()];
+                info
+            });
+        assert_eq!(status.process_execution, expected);
 
         fixture.stop().await;
         bridge_task.abort();

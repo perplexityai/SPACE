@@ -127,6 +127,47 @@ impl SpacedHostService {
     }
 }
 
+/// A guest that predates `resume_after_output_gap` ignores it and keeps failing
+/// a lagged reader. Only a guest that honors the request acknowledges it on its
+/// first connected event. Cursor-based replay requires that acknowledgement;
+/// cursorless completed replay retains its existing Started/Exit shape.
+/// An upstream error before acknowledgement becomes the RPC status, before any
+/// events are relayed. Callers that do not opt in never wait here.
+pub(super) async fn require_output_gap_resume_ack<S>(
+    mut stream: S,
+    output_cursor: Option<u64>,
+) -> Result<
+    impl futures_util::Stream<
+        Item = Result<pplx_space_spaced_common::proto::bridge_guest::ProcessEvent, Status>,
+    > + Send
+    + 'static,
+    Status,
+>
+where
+    S: futures_util::Stream<
+            Item = Result<pplx_space_spaced_common::proto::bridge_guest::ProcessEvent, Status>,
+        > + Send
+        + Unpin
+        + 'static,
+{
+    use futures_util::StreamExt;
+    use pplx_space_spaced_common::proto::bridge_guest::process_event::Event;
+
+    let first = stream.next().await.transpose()?;
+    let acknowledged = match first.as_ref().and_then(|event| event.event.as_ref()) {
+        Some(Event::Connected(connected)) => connected.resume_after_output_gap,
+        Some(Event::Started(_)) => output_cursor.is_none(),
+        _ => false,
+    };
+    if !acknowledged {
+        return Err(guest_capability_unsupported_status(
+            GuestCapability::ProcessOutputGapResume,
+            "guest spaced-svc does not support ConnectProcess resume_after_output_gap; rebuild or restore the sandbox with a newer spaced guest",
+        ));
+    }
+    Ok(futures_util::stream::iter(first.map(Ok)).chain(stream))
+}
+
 pub(super) fn legacy_bridge_stat_to_host(
     path: String,
     response: pplx_space_spaced_common::proto::bridge_guest::LegacyStatResponse,
@@ -165,3 +206,6 @@ pub(super) fn legacy_bridge_dir_entry_to_host(
         link_count: None,
     })
 }
+
+#[cfg(test)]
+mod tests;

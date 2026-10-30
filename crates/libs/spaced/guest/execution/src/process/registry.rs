@@ -277,6 +277,7 @@ impl ProcessRegistry {
         process_id: &ProcessId,
         output_cursor: Option<u64>,
         from_oldest_retained: bool,
+        resume_after_output_gap: bool,
     ) -> Option<ProcessReplay> {
         let record = self.get_record(process_id)?;
         if output_cursor.is_none()
@@ -289,7 +290,14 @@ impl ProcessRegistry {
         }
         Some(ProcessReplay::Running {
             started: record.started.clone(),
-            cursor: record.journal.cursor(output_cursor, from_oldest_retained),
+            cursor: record.journal.cursor(
+                output_cursor,
+                from_oldest_retained,
+                resume_after_output_gap.then(|| OutputGapResume {
+                    process_id: record.started.process_id.clone(),
+                    pid: record.started.pid,
+                }),
+            ),
         })
     }
 

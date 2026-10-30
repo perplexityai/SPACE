@@ -83,6 +83,8 @@ impl Process for SpacedHostService {
     ) -> Result<Response<Self::ConnectProcessStream>, Status> {
         let request = bridge_process_connect_request(request.into_inner())
             .map_err(pplx_space_common_grpc::mark_guest_process_error)?;
+        let resume_after_output_gap = request.resume_after_output_gap == Some(true);
+        let output_cursor = request.output_cursor;
         let guest_stream = self
             .call_bridge_guest_process(
                 "bridge_guest_process_connect",
@@ -98,6 +100,13 @@ impl Process for SpacedHostService {
                 },
             )
             .await?;
+        let guest_stream = if resume_after_output_gap {
+            futures_util::future::Either::Left(
+                crate::compat::require_output_gap_resume_ack(guest_stream, output_cursor).await?,
+            )
+        } else {
+            futures_util::future::Either::Right(guest_stream)
+        };
         Ok(Response::new(relay_stream(guest_stream, map_process_event)))
     }
 

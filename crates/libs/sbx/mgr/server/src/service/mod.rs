@@ -81,6 +81,10 @@ mod runtime_upgrade;
 mod suspend_snapshot_publication;
 mod template_apps;
 
+mod rpc_authorization;
+
+use rpc_authorization::*;
+
 /// Enables the network-credential authority path (off by default).
 const NETWORK_CREDENTIALS_ENABLED_ENV: &str = "SPACE_SBXMGR_NETWORK_CREDENTIALS_ENABLED";
 
@@ -137,9 +141,9 @@ use crate::proto::{
     SpacedNormalizeWatchRootRequest, SpacedNormalizeWatchRootResponse,
     SpacedOpenLoopbackBridgeRequest, SpacedOpenLoopbackBridgeResponse, SpacedPingGuestRequest,
     SpacedPingGuestResponse, SpacedProcessConnected, SpacedProcessEvent, SpacedProcessExit,
-    SpacedProcessExited, SpacedProcessInfo, SpacedProcessOutput, SpacedProcessSignaled,
-    SpacedProcessStarted, SpacedProcessTimedOut, SpacedProcessUnknown, SpacedReadRequest,
-    SpacedRemoveRequest, SpacedRemoveResponse, SpacedRemoveWatcherRequest,
+    SpacedProcessExited, SpacedProcessInfo, SpacedProcessOutput, SpacedProcessOutputGap,
+    SpacedProcessSignaled, SpacedProcessStarted, SpacedProcessTimedOut, SpacedProcessUnknown,
+    SpacedReadRequest, SpacedRemoveRequest, SpacedRemoveResponse, SpacedRemoveWatcherRequest,
     SpacedRemoveWatcherResponse, SpacedRenameRequest, SpacedRenameResponse, SpacedResizePtyRequest,
     SpacedResizePtyResponse, SpacedSendInputRequest, SpacedSendInputResponse,
     SpacedSendSignalRequest, SpacedSendSignalResponse, SpacedStartProcessRequest,
@@ -200,17 +204,6 @@ const NETWORK_POLICY_PUSH_RETRY_DELAYS: [Duration; 11] = [
     Duration::from_secs(10),
 ];
 
-fn request_sandbox_ids(sandbox_ids: &[String]) -> Vec<String> {
-    let mut ids = Vec::with_capacity(sandbox_ids.len());
-    let mut seen = BTreeSet::new();
-    for sandbox_id in sandbox_ids.iter().map(|id| id.trim()) {
-        if !sandbox_id.is_empty() && seen.insert(sandbox_id.to_owned()) {
-            ids.push(sandbox_id.to_owned());
-        }
-    }
-    ids
-}
-
 const RUN_DIR: &str = pplx_space_common_core::host::linux::paths::SANDBOX_RUN_DIR;
 const CACHE_DIR: &str = pplx_space_common_core::host::linux::paths::SANDBOX_CACHE_DIR;
 
@@ -224,104 +217,6 @@ const MAX_WRITE_BATCH_ENTRIES: usize = pplx_space_common_core::spaced::MAX_WRITE
 const DEFAULT_BLOCKING_READY_TIMEOUT_SECS: u32 = 30;
 const DEFAULT_RESUME_READY_TIMEOUT_SECS: u32 = 5;
 const GRPC_TIMEOUT_METADATA_KEY: &str = "grpc-timeout";
-const SPACE_TMPLMGR_ACCOUNT: &str = user_names::SPACE_TMPLMGR;
-
-const ALLOW_SANDBOX_OBSERVER: &[UdsPeerPrincipal] = &[
-    UdsPeerPrincipal::Root,
-    UdsPeerPrincipal::Role(LocalRole::Observer),
-    UdsPeerPrincipal::Service(user_names::SPACE_NODEAPI),
-    UdsPeerPrincipal::Service(user_names::SPACE_NODECTL),
-    UdsPeerPrincipal::Service(user_names::SPACE_SBXMGR),
-];
-const ALLOW_SANDBOX_OBSERVER_OR_TMPLMGR: &[UdsPeerPrincipal] = &[
-    UdsPeerPrincipal::Root,
-    UdsPeerPrincipal::Role(LocalRole::Observer),
-    UdsPeerPrincipal::Service(user_names::SPACE_NODEAPI),
-    UdsPeerPrincipal::Service(user_names::SPACE_TMPLMGR),
-    UdsPeerPrincipal::Service(user_names::SPACE_NODECTL),
-    UdsPeerPrincipal::Service(user_names::SPACE_SBXMGR),
-];
-// Direct sandbox/snapshot import and export streams require root or a local
-// operator; node-api retains separate authority for lifecycle and backup RPCs.
-const ALLOW_LOCAL_ARTIFACT_OPERATOR: &[UdsPeerPrincipal] = &[
-    UdsPeerPrincipal::Root,
-    UdsPeerPrincipal::Role(LocalRole::Operator),
-];
-const ALLOW_SANDBOX_OPERATOR: &[UdsPeerPrincipal] = &[
-    UdsPeerPrincipal::Root,
-    UdsPeerPrincipal::Role(LocalRole::Operator),
-    UdsPeerPrincipal::Service(user_names::SPACE_NODEAPI),
-];
-const ALLOW_SANDBOX_AUTO_LIFECYCLE_OPERATOR: &[UdsPeerPrincipal] = &[
-    UdsPeerPrincipal::Root,
-    UdsPeerPrincipal::Role(LocalRole::Operator),
-    UdsPeerPrincipal::Service(user_names::SPACE_NODEAPI),
-    UdsPeerPrincipal::Service(user_names::SPACE_NODECTL),
-];
-const ALLOW_SANDBOX_NETWORK_POLICY_OPERATOR: &[UdsPeerPrincipal] = &[
-    UdsPeerPrincipal::Root,
-    UdsPeerPrincipal::Role(LocalRole::Operator),
-    UdsPeerPrincipal::Service(user_names::SPACE_NODEAPI),
-    UdsPeerPrincipal::Service(user_names::SPACE_NODECTL),
-];
-const ALLOW_SANDBOX_SNAPSHOT_OPERATOR: &[UdsPeerPrincipal] = &[
-    UdsPeerPrincipal::Root,
-    UdsPeerPrincipal::Role(LocalRole::Operator),
-    UdsPeerPrincipal::Service(user_names::SPACE_NODEAPI),
-    UdsPeerPrincipal::Service(user_names::SPACE_NODECTL),
-];
-const ALLOW_SANDBOX_OPERATOR_OR_TMPLMGR: &[UdsPeerPrincipal] = &[
-    UdsPeerPrincipal::Root,
-    UdsPeerPrincipal::Role(LocalRole::Operator),
-    UdsPeerPrincipal::Service(user_names::SPACE_NODEAPI),
-    UdsPeerPrincipal::Service(user_names::SPACE_TMPLMGR),
-    UdsPeerPrincipal::Service(user_names::SPACE_SBXMGR),
-];
-const ALLOW_AUTO_LIFECYCLE_DELETE_RECEIPTS: &[UdsPeerPrincipal] = &[
-    UdsPeerPrincipal::Root,
-    UdsPeerPrincipal::Service(user_names::SPACE_NODECTL),
-];
-// The pending-backup inventory is the node's own answer to "what on this
-// disk has no durable copy". Its only caller is node-ctl, which publishes it
-// in the Full census; root covers break-glass inspection. Deliberately not
-// the general observer set, which would put a node's data-loss exposure in
-// front of every local reader.
-const ALLOW_LOCAL_BACKUP_INVENTORY: &[UdsPeerPrincipal] = &[
-    UdsPeerPrincipal::Root,
-    UdsPeerPrincipal::Service(user_names::SPACE_NODECTL),
-];
-const ALLOW_SANDBOX_ADMIN_OR_TMPLMGR: &[UdsPeerPrincipal] = &[
-    UdsPeerPrincipal::Root,
-    UdsPeerPrincipal::Role(LocalRole::Admin),
-    UdsPeerPrincipal::Service(user_names::SPACE_TMPLMGR),
-];
-const ALLOW_SANDBOX_POOL_ADOPT: &[UdsPeerPrincipal] = &[
-    UdsPeerPrincipal::Root,
-    UdsPeerPrincipal::Role(LocalRole::Admin),
-    UdsPeerPrincipal::Service(user_names::SPACE_NODEAPI),
-    UdsPeerPrincipal::Service(user_names::SPACE_TMPLMGR),
-];
-const ALLOW_SANDBOX_START_CONTEXT: &[UdsPeerPrincipal] = &[
-    UdsPeerPrincipal::Root,
-    UdsPeerPrincipal::Role(LocalRole::Admin),
-    UdsPeerPrincipal::Service(user_names::SPACE_NODEAPI),
-];
-/// The callers that run lifecycle work for the control plane. Every one is
-/// also allowed Start and Stop, which an upgrade runs as its caller.
-const ALLOW_SANDBOX_RUNTIME_UPGRADE: &[UdsPeerPrincipal] = &[
-    UdsPeerPrincipal::Root,
-    UdsPeerPrincipal::Role(LocalRole::Operator),
-    UdsPeerPrincipal::Service(user_names::SPACE_NODEAPI),
-];
-// Cluster-deleted evictions are driven by node-ctl's desired-state facet
-// sync, which carries the authoritative "no cluster row" signal. Root and
-// the local operator role cover break-glass tooling; deliberately not the
-// general sandbox-operator set.
-const ALLOW_SANDBOX_CLUSTER_DELETED_EVICT: &[UdsPeerPrincipal] = &[
-    UdsPeerPrincipal::Root,
-    UdsPeerPrincipal::Role(LocalRole::Operator),
-    UdsPeerPrincipal::Service(user_names::SPACE_NODECTL),
-];
 
 type SbxExportSnapshotStream =
     Pin<Box<dyn tokio_stream::Stream<Item = Result<ExportSnapshotChunk, Status>> + Send>>;
