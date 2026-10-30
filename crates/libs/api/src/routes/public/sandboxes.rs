@@ -345,14 +345,27 @@ pub(crate) async fn create_native_sandbox_operation(
                             let sandbox_id = PublicSandboxId::from(claim.sandbox_id);
                             let sandbox_id_string = sandbox_id.to_string();
                             let input = create(sandbox_id, &sandbox_id_string, Some(claim));
-                            // Without a permit the create is recorded
-                            // queued, as with the kill switch off.
-                            let permit = inline.as_ref().and_then(|inline| {
+                            // Without a permit, or with the org at its
+                            // inline limit, the create is recorded queued,
+                            // as with the kill switch off.
+                            let mut permit = inline.as_ref().and_then(|inline| {
                                 inline
                                     .runner
                                     .try_acquire(InlineAdmissionPath::WarmPoolCreate)
                                     .ok()
                             });
+                            if let Some(inline) = &inline
+                                && permit.is_some()
+                                && admission
+                                    .inline_org_at_limit(org_id, inline.runner.org_limit())
+                                    .await?
+                            {
+                                permit = None;
+                                inline.runner.refuse(
+                                    InlineAdmissionPath::WarmPoolCreate,
+                                    InlineRefusal::OrgLimit,
+                                );
+                            }
                             let result = if let Some(permit) = permit {
                                 match admission.create_claimed_or_roll_back(input).await? {
                                     CreateClaimedPublicOperationResult::Claimed {
