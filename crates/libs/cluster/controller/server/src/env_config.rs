@@ -27,18 +27,6 @@ impl EnvConfig<'_> {
         }
     }
 
-    pub(crate) fn test_optional_positive_duration_secs(
-        &self,
-        var: &str,
-        default: Option<PositiveDuration>,
-    ) -> Option<PositiveDuration> {
-        match self.test_raw(var).and_then(|raw| raw.parse::<u64>().ok()) {
-            Some(0) => None,
-            Some(value) => PositiveDuration::new(Duration::from_secs(value)),
-            None => default,
-        }
-    }
-
     pub(crate) fn truthy_default(&self, var: &str, default: bool) -> bool {
         match self.0.var(var).as_deref() {
             Ok("1" | "true" | "True" | "TRUE") => true,

@@ -1,7 +1,8 @@
 //! Running one claimed public operation to its recorded outcome.
 //!
 //! The cluster-controller dispatcher and the native create's inline path
-//! both drive a claimed operation through [`drive_claimed_operation`]: it
+//! both drive a claimed operation through [`drive_deferrable_operation`],
+//! under the [`OperationExecutionConfig`] both read from the environment: it
 //! renews the claim while the execution runs, then records the result under
 //! that claim (complete, fail, or release for a retry) with the same events
 //! and metrics either way. Only the `executor` metric tag tells them apart.
@@ -19,6 +20,7 @@ use crate::public_operations::{
     PublicOperationStore, PublicOperationStoreError, ReleaseClaimedPublicOperation, ReleasedClaim,
 };
 use crate::public_sandbox_operations::PublicOperationExecutionResult;
+use crate::retry_deferral::RetryDeferral;
 
 pub use pplx_space_metrics::operations::OperationExecutor;
 
@@ -126,12 +128,24 @@ pub fn execution_span(operation: &ClaimedPublicOperation) -> tracing::Span {
     span
 }
 
+/// Test-hook override of [`DEFAULT_CLAIM_STALE_AFTER`], in whole seconds.
+pub const CLAIM_STALE_SECS_ENV: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_CLAIM_STALE_SECS";
+/// Test-hook override of [`DEFAULT_M1_MAX_AGE`], in whole seconds; `0` turns
+/// the deadline off.
+pub const M1_MAX_AGE_ENV: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_M1_MAX_AGE_SECS";
+/// Kill switch for retry deferral.
+pub const RETRY_DEFERRAL_ENABLED_ENV: &str =
+    "SPACE_PUBLIC_OPERATION_DISPATCHER_RETRY_DEFERRAL_ENABLED";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OperationExecutionConfig {
     pub claim_stale_after: Duration,
     pub retry_after: Duration,
     pub max_retry_attempts: i32,
     pub m1_max_age: Option<Duration>,
+    /// Whether an execution may hand a retry wait back instead of waiting it
+    /// out (see [`drive_deferrable_operation`]).
+    pub defer_retry_waits: bool,
 }
 
 impl Default for OperationExecutionConfig {
@@ -141,6 +155,44 @@ impl Default for OperationExecutionConfig {
             retry_after: DEFAULT_RETRY_AFTER,
             max_retry_attempts: DEFAULT_MAX_RETRY_ATTEMPTS,
             m1_max_age: Some(DEFAULT_M1_MAX_AGE),
+            defer_retry_waits: true,
+        }
+    }
+}
+
+impl OperationExecutionConfig {
+    pub fn from_env() -> Self {
+        Self::from_environment(&pplx_space_common_core::env::ProcessEnvironment)
+    }
+
+    /// The settings every executor of claimed operations runs under: the
+    /// cluster-controller dispatcher and an API process executing inline read
+    /// the same variables, so an operation is renewed, retried and bounded by
+    /// its deadline the same way whichever of them runs it. The staleness
+    /// and deadline overrides are test hooks; the retry-deferral switch is a
+    /// deployment setting. A malformed override keeps the default.
+    pub fn from_environment(env: &dyn pplx_space_common_core::env::Environment) -> Self {
+        let default = Self::default();
+        let test_secs = |name| {
+            pplx_space_common_core::env::test_hook(env, name)
+                .and_then(|raw| raw.parse::<u64>().ok())
+        };
+        Self {
+            claim_stale_after: test_secs(CLAIM_STALE_SECS_ENV)
+                .filter(|secs| *secs > 0)
+                .map_or(default.claim_stale_after, Duration::from_secs),
+            retry_after: default.retry_after,
+            max_retry_attempts: default.max_retry_attempts,
+            m1_max_age: match test_secs(M1_MAX_AGE_ENV) {
+                Some(0) => None,
+                Some(secs) => Some(Duration::from_secs(secs)),
+                None => default.m1_max_age,
+            },
+            defer_retry_waits: match env.var(RETRY_DEFERRAL_ENABLED_ENV).as_deref() {
+                Ok("1" | "true" | "True" | "TRUE") => true,
+                Ok("0" | "false" | "False" | "FALSE") => false,
+                _ => default.defer_retry_waits,
+            },
         }
     }
 }
@@ -191,6 +243,47 @@ impl TickReport {
         self.expired += other.expired;
         self.canceled += other.canceled;
     }
+}
+
+/// [`drive_claimed_operation`] for an executor's work, which may hand its
+/// retry waits back. With `config.defer_retry_waits`, `execution` runs under a
+/// [`RetryDeferral`] scope, and a transient retry after one of its steps
+/// deferred a wait is released as [`PublicOperationRequeueReason::RetryDeferred`],
+/// which spends no attempt, so the wait does not hold the executor's slot.
+pub async fn drive_deferrable_operation<F>(
+    store: PublicOperationStore,
+    claim_token: String,
+    config: OperationExecutionConfig,
+    operation: ClaimedPublicOperation,
+    executor: OperationExecutor,
+    execution: F,
+) -> Result<TickReport, PublicOperationStoreError>
+where
+    F: Future<Output = OperationExecutionResult>,
+{
+    let deferral = config.defer_retry_waits.then(RetryDeferral::new);
+    let recorded = deferral.clone();
+    let execution = crate::retry_deferral::scope(deferral, execution);
+    drive_claimed_operation(
+        store,
+        claim_token,
+        config,
+        operation,
+        executor,
+        async move {
+            let mut result = execution.await;
+            // A transient retry after a step handed its wait back is the
+            // deferral; other requeue reasons keep their own accounting.
+            if result.state == OperationState::Queued
+                && result.requeue_reason == PublicOperationRequeueReason::TransientFailure
+                && recorded.as_ref().is_some_and(RetryDeferral::deferred)
+            {
+                result.requeue_reason = PublicOperationRequeueReason::RetryDeferred;
+            }
+            result
+        },
+    )
+    .await
 }
 
 /// Run `execution` under the claim `claim_token` holds on `operation`, then
@@ -720,3 +813,6 @@ fn is_native_m1_terminalized_kind(api_product: ApiProduct, kind: OperationKind) 
     expires_unrun(api_product, kind)
         || (api_product == ApiProduct::Native && kind == OperationKind::DeleteSandbox)
 }
+
+#[cfg(test)]
+mod tests;

@@ -109,7 +109,7 @@ pub async fn create_sandbox(
     let pool_claims =
         native_create_pool_claim_enabled(&state.feature_flags).then(|| NativeCreatePoolClaims {
             controller: &state.sandbox_controller,
-            inline: inline_create::InlineCreate::from_env(&state.pool, &state.sandbox_controller),
+            inline: inline_create::InlineCreate::from_env(&state),
         });
     let response = create_native_sandbox_operation(
         &state.pool,
@@ -181,8 +181,9 @@ pub(crate) struct NativeCreatePoolClaims<'a> {
 ///
 /// With inline execution on, a create that won a claim is also claimed for
 /// execution in that transaction, and runs here (see [`inline_create`])
-/// before the response, up to a short deadline. Every other create is
-/// recorded queued for the dispatcher, as before.
+/// before the response, up to a short deadline, unless this process is
+/// draining. Every other create is recorded queued for the dispatcher, as
+/// before.
 ///
 /// `sandbox_quota` is the caller's live-sandbox limits, `None` when it has
 /// none. A new create that would exceed one is refused with a non-retryable
@@ -215,7 +216,8 @@ pub(crate) async fn create_native_sandbox_operation(
     }
     let inline = pool_claims
         .as_ref()
-        .and_then(|claims| claims.inline.clone());
+        .and_then(|claims| claims.inline.clone())
+        .filter(inline_create::InlineCreate::admits_new_work);
     let plan = match pool_claims.as_ref().map(|claims| claims.controller) {
         None => NativeCreatePoolPlan::Unclaimed(AdmissionClaimOutcome::Disabled),
         Some(controller) => {

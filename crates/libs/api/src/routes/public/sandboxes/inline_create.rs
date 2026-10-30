@@ -4,27 +4,34 @@
 //! The request records the create already claimed (see
 //! `PublicOperationAdmission::create_claimed_or_roll_back`), so the
 //! dispatcher never picks it up while this process runs it. The execution
-//! runs in its own task through the same driver the dispatcher uses, so it
-//! renews the claim and records the result identically. The request waits
-//! for it only up to a short deadline. Past that deadline, or after a
-//! client disconnect, the task keeps running. If the task dies, the claim
-//! goes stale and the dispatcher re-drives the same operation through the
-//! admitted-claim path.
+//! runs in its own task through the same driver the dispatcher uses, under
+//! the same execution settings and retry deferral, so it renews the claim and
+//! records the result identically. The request waits for it only up to a
+//! short deadline. Past that deadline, or after a client disconnect, the task
+//! keeps running. If the task dies, the claim goes stale and the dispatcher
+//! re-drives the same operation through the admitted-claim path.
+//!
+//! The task is on the API's task tracker, so shutdown waits for it within its
+//! grace period; one still running when the process exits is left to go
+//! stale. Once the process is draining, a create that wins a claim is
+//! recorded queued for the dispatcher instead.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use pplx_space_common_svc::DrainSignal;
+use tokio_util::task::TaskTracker;
 use tracing::Instrument as _;
 
-use crate::controllers::sandbox::SandboxController;
 use crate::public_operation_driver::{
-    OperationExecutionConfig, OperationExecutionResult, OperationExecutor, drive_claimed_operation,
-    execution_span,
+    OperationExecutionConfig, OperationExecutionResult, OperationExecutor,
+    drive_deferrable_operation, execution_span,
 };
 use crate::public_operations::{ClaimedPublicOperation, PublicOperationStore};
 use crate::public_sandbox_operations::CreateSandboxOperationExecutor;
+use crate::routes::AppState;
 
 /// Kill switch for inline execution, read only while admission-time claims
 /// are on. Off records claimed creates queued for the dispatcher, as before.
@@ -55,12 +62,16 @@ impl InlineCreateExecutor for CreateSandboxOperationExecutor {
 pub(crate) struct InlineCreate {
     pub(crate) wait: Duration,
     pub(crate) executor: Arc<dyn InlineCreateExecutor>,
+    /// The API's tracker, which shutdown waits on.
+    pub(crate) tasks: TaskTracker,
+    pub(crate) drain_signal: DrainSignal,
+    pub(crate) config: OperationExecutionConfig,
 }
 
 impl InlineCreate {
-    /// Inline execution through `controller`, or `None` when the kill switch
-    /// is off.
-    pub(crate) fn from_env(pool: &sqlx::PgPool, controller: &SandboxController) -> Option<Self> {
+    /// Inline execution through the state's controller, or `None` when the
+    /// kill switch is off.
+    pub(crate) fn from_env(state: &AppState) -> Option<Self> {
         if !pplx_space_common_core::env::env_flag_var(
             NATIVE_CREATE_INLINE_ENV,
             DEFAULT_NATIVE_CREATE_INLINE_ENABLED,
@@ -70,10 +81,19 @@ impl InlineCreate {
         Some(Self {
             wait: inline_wait(std::env::var(NATIVE_CREATE_INLINE_WAIT_ENV).ok().as_deref()),
             executor: Arc::new(CreateSandboxOperationExecutor::new(
-                pool.clone(),
-                controller.clone(),
+                state.pool.clone(),
+                state.sandbox_controller.clone(),
             )),
+            tasks: state.task_tracker.clone(),
+            drain_signal: state.drain_signal.clone(),
+            config: state.operation_execution,
         })
+    }
+
+    /// Whether a new create may still be claimed to run here: not once the
+    /// process is draining, when it is left queued for the dispatcher.
+    pub(crate) fn admits_new_work(&self) -> bool {
+        !self.drain_signal.is_draining()
     }
 
     /// Start executing `operation` under `claim_token` in its own task, and
@@ -119,12 +139,13 @@ impl InlineCreate {
         let operation_id = operation.id;
         let span = execution_span(&operation);
         let execution = self.executor.execute(operation.clone());
-        tokio::spawn(
+        let config = self.config;
+        self.tasks.spawn(
             async move {
-                match drive_claimed_operation(
+                match drive_deferrable_operation(
                     store,
                     claim_token,
-                    OperationExecutionConfig::default(),
+                    config,
                     operation,
                     OperationExecutor::Inline,
                     execution,

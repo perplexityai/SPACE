@@ -10,9 +10,11 @@ use pplx_space_api::egress_profiles::EgressProfiles;
 use pplx_space_api::fork_operation_executor::ForkSandboxOperationExecutor;
 use pplx_space_api::public_operation_driver::{
     DEFAULT_CLAIM_STALE_AFTER, DEFAULT_M1_MAX_AGE, DEFAULT_MAX_RETRY_ATTEMPTS, DEFAULT_RETRY_AFTER,
-    OperationExecutionConfig, OperationExecutor, claim_renewal_interval, drive_claimed_operation,
-    execution_span, expire_overdue_queued_operations,
+    OperationExecutionConfig, OperationExecutor, claim_renewal_interval,
+    drive_deferrable_operation, execution_span, expire_overdue_queued_operations,
 };
+#[cfg(test)]
+use pplx_space_api::public_operation_driver::{M1_MAX_AGE_ENV, RETRY_DEFERRAL_ENABLED_ENV};
 pub use pplx_space_api::public_operation_driver::{OperationExecutionResult, TickReport};
 use pplx_space_api::public_operations::{
     ClaimLimits, ClaimPublicOperations, ClaimedPublicOperation, OrgSlotLimit, PublicOperationClaim,
@@ -24,7 +26,6 @@ use pplx_space_api::public_sandbox_operations::{
     UpdateSandboxOperationExecutor,
 };
 use pplx_space_api::public_template_operations::DeleteTemplateOperationExecutor;
-use pplx_space_api::retry_deferral::RetryDeferral;
 use pplx_space_api::tls_interception_exemptions::TlsInterceptionExemptions;
 use pplx_space_feature_flags::FeatureFlagClient;
 use pplx_space_public_api::{OperationId, OperationKind, OperationState, PublicErrorCode};
@@ -80,12 +81,10 @@ const ORG_SLOT_HEADROOM_ENV: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_ORG_SLOT_
 /// unless an execution finishes first. Until then such a claim reads the
 /// whole backlog for nothing.
 const HELD_BACK_CLAIM_BACKOFF: Duration = Duration::from_millis(250);
-const M1_MAX_AGE_ENV: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_M1_MAX_AGE_SECS";
 /// How soon an operation handed back because its key is already executing
 /// in this process becomes claimable again.
 const BUSY_KEY_RETRY_AFTER: Duration = Duration::from_secs(1);
 const KEYED_CLAIM_ENABLED_ENV: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_KEYED_CLAIM_ENABLED";
-const RETRY_DEFERRAL_ENABLED_ENV: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_RETRY_DEFERRAL_ENABLED";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconcilerConfig {
@@ -147,6 +146,9 @@ impl ReconcilerConfig {
     pub(crate) fn from_environment(env: &dyn pplx_space_common_core::env::Environment) -> Self {
         let config = env_config::EnvConfig(env);
         let default = Self::default();
+        // Shared with inline execution in the API, which must renew, retry
+        // and bound an operation as this loop does.
+        let execution = OperationExecutionConfig::from_environment(env);
         Self {
             // Deliberately not a fail-closed gate: this loop is what completes
             // queued create operations, so a malformed value keeps the default
@@ -187,24 +189,13 @@ impl ReconcilerConfig {
                 DEFAULT_ORG_SLOT_HEADROOM,
                 MAX_EXECUTION_CONCURRENCY as u32,
             ) as usize,
-            claim_stale_after: config.test_duration_secs(
-                "SPACE_PUBLIC_OPERATION_DISPATCHER_CLAIM_STALE_SECS",
-                DEFAULT_CLAIM_STALE_AFTER,
-            ),
-            retry_after: DEFAULT_RETRY_AFTER,
-            max_retry_attempts: DEFAULT_MAX_RETRY_ATTEMPTS,
+            claim_stale_after: execution.claim_stale_after,
+            retry_after: execution.retry_after,
+            max_retry_attempts: execution.max_retry_attempts,
             keyed_claim_enabled: config
                 .truthy_default(KEYED_CLAIM_ENABLED_ENV, default.keyed_claim_enabled),
-            retry_deferral_enabled: config
-                .truthy_default(RETRY_DEFERRAL_ENABLED_ENV, default.retry_deferral_enabled),
-            m1_max_age: config
-                .test_optional_positive_duration_secs(
-                    M1_MAX_AGE_ENV,
-                    Some(pplx_space_common_core::types::PositiveDuration::new_panic(
-                        DEFAULT_M1_MAX_AGE,
-                    )),
-                )
-                .map(pplx_space_common_core::types::PositiveDuration::get),
+            retry_deferral_enabled: execution.defer_retry_waits,
+            m1_max_age: execution.m1_max_age,
         }
     }
 }
@@ -215,6 +206,7 @@ fn execution_config(config: &ReconcilerConfig) -> OperationExecutionConfig {
         retry_after: config.retry_after,
         max_retry_attempts: config.max_retry_attempts,
         m1_max_age: config.m1_max_age,
+        defer_retry_waits: config.retry_deferral_enabled,
     }
 }
 
@@ -532,7 +524,6 @@ pub async fn run<E>(
                                 executor.clone(),
                                 claim.claim_token.clone(),
                                 execution_config,
-                                config.retry_deferral_enabled,
                                 operation,
                             )
                             .instrument(span);
@@ -836,7 +827,6 @@ where
             executor.clone(),
             claim.claim_token.clone(),
             execution_config,
-            config.retry_deferral_enabled,
             operation,
         )
         .instrument(span)
@@ -855,7 +845,6 @@ async fn execute_claimed_operation<E>(
     executor: E,
     claim_token: String,
     config: OperationExecutionConfig,
-    defer_retry_waits: bool,
     operation: ClaimedPublicOperation,
 ) -> Result<TickReport, pplx_space_api::public_operations::PublicOperationStoreError>
 where
@@ -863,30 +852,16 @@ where
 {
     let execution_claim_token = claim_token.clone();
     let execution_operation = operation.clone();
-    let deferral = defer_retry_waits.then(RetryDeferral::new);
-    let recorded = deferral.clone();
-    let execution = pplx_space_api::retry_deferral::scope(deferral, async move {
-        executor
-            .execute(&execution_claim_token, execution_operation)
-            .await
-    });
-    drive_claimed_operation(
+    drive_deferrable_operation(
         store,
         claim_token,
         config,
         operation,
         OperationExecutor::Dispatcher,
         async move {
-            let mut result = execution.await;
-            // A transient retry after a step handed its wait back is the
-            // deferral; other requeue reasons keep their own accounting.
-            if result.state == OperationState::Queued
-                && result.requeue_reason == PublicOperationRequeueReason::TransientFailure
-                && recorded.as_ref().is_some_and(RetryDeferral::deferred)
-            {
-                result.requeue_reason = PublicOperationRequeueReason::RetryDeferred;
-            }
-            result
+            executor
+                .execute(&execution_claim_token, execution_operation)
+                .await
         },
     )
     .await
