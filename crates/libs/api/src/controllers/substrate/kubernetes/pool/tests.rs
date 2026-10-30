@@ -3,7 +3,10 @@ use pplx_space_common_core::types::{DiskIoLimits, NodeId, SandboxId};
 use super::*;
 use std::collections::BTreeMap;
 
-use crate::controllers::substrate::ActorRef;
+use crate::controllers::substrate::{
+    ActorRef, AdoptionLabelOutcome, AdoptionLabelThrottle, SubstrateAdapter,
+};
+use axum::http::StatusCode;
 use pplx_space_cluster_pool::PoolConfigOwner;
 use pplx_space_common_core::types::{AutoLifecyclePolicy, Email, OrgId, UserId};
 use pplx_space_db_test_fixtures::pg_test_db;
@@ -261,6 +264,7 @@ fn pooled_claim_request<'a>(
         template_network_policy,
         template_network_policy_generation: 1,
         volume_encryption: false,
+        client_id: None,
     }
 }
 
@@ -760,7 +764,11 @@ async fn postgres_invalidate_claimed_pool_slot_keeps_slot_unclaimable() -> TestR
 async fn upsert_pool_config_uses_store_namespace() -> TestResult {
     let db = pg_test_db().await?;
     let slot = insert_ready_pool_slot(&db.pool).await?;
-    let store = K8sStore::new(db.pool.clone(), "sandboxes".to_string());
+    let store = K8sStore::new(
+        db.pool.clone(),
+        "sandboxes".to_string(),
+        crate::controllers::substrate::ActivationClientAttribution::Enabled,
+    );
 
     let config = upsert_pool_config(
         &store,
@@ -801,7 +809,11 @@ async fn upsert_pool_config_uses_store_namespace() -> TestResult {
 async fn upsert_pool_config_rejects_encryptable_configs() -> TestResult {
     let db = pg_test_db().await?;
     let slot = insert_ready_pool_slot(&db.pool).await?;
-    let store = K8sStore::new(db.pool.clone(), "sandboxes".to_string());
+    let store = K8sStore::new(
+        db.pool.clone(),
+        "sandboxes".to_string(),
+        crate::controllers::substrate::ActivationClientAttribution::Enabled,
+    );
     let request = |enabled| ClusterPoolConfigRequest {
         template_name: "seed".to_string(),
         content_hash: Some(slot.content_hash.clone()),
@@ -844,7 +856,11 @@ async fn upsert_pool_config_rejects_encryptable_configs() -> TestResult {
 async fn upsert_pool_config_preserves_and_explicitly_resets_disk_capacity() -> TestResult {
     let db = pg_test_db().await?;
     let slot = insert_ready_pool_slot(&db.pool).await?;
-    let store = K8sStore::new(db.pool.clone(), "sandboxes".to_string());
+    let store = K8sStore::new(
+        db.pool.clone(),
+        "sandboxes".to_string(),
+        crate::controllers::substrate::ActivationClientAttribution::Enabled,
+    );
     let request = |disk_mib, reset_disk_to_template_default| ClusterPoolConfigRequest {
         template_name: "seed".to_string(),
         content_hash: Some(slot.content_hash.clone()),
@@ -892,7 +908,11 @@ async fn disable_pool_config_preserves_autoscaler_ownership() -> TestResult {
     // arrange
     let db = pg_test_db().await?;
     let slot = insert_ready_pool_slot(&db.pool).await?;
-    let store = K8sStore::new(db.pool.clone(), "sandboxes".to_string());
+    let store = K8sStore::new(
+        db.pool.clone(),
+        "sandboxes".to_string(),
+        crate::controllers::substrate::ActivationClientAttribution::Enabled,
+    );
     let config_id: Uuid = sqlx::query_scalar(sql!(
         "UPDATE kubernetes_pool_configs
          SET managed_by = 'autoscaler'
@@ -924,7 +944,11 @@ async fn upsert_pool_config_takes_manual_ownership_from_autoscaler() -> TestResu
     // arrange
     let db = pg_test_db().await?;
     let slot = insert_ready_pool_slot(&db.pool).await?;
-    let store = K8sStore::new(db.pool.clone(), "sandboxes".to_string());
+    let store = K8sStore::new(
+        db.pool.clone(),
+        "sandboxes".to_string(),
+        crate::controllers::substrate::ActivationClientAttribution::Enabled,
+    );
     sqlx::query(sql!(
         "UPDATE kubernetes_pool_configs
          SET managed_by = 'autoscaler'
@@ -1189,5 +1213,236 @@ async fn postgres_admitted_pool_cleanup_pending_reports_failed_adoptions() -> Te
     .execute(&db.pool)
     .await?;
     assert!(admitted_pool_cleanup_pending(&db.pool, slot.sandbox_id).await?);
+    Ok(())
+}
+
+/// Claim `slot` for a create with no request env, network policy or
+/// lifecycle policy.
+async fn claim_ready_pool_slot(
+    pool: &PgPool,
+    slot: &ReadyPoolSlotFixture,
+) -> TestResult<PooledExecutionClaim> {
+    let actor = ActorRef::new(slot.user_id, slot.org_id, Email::parse("pool@example.com")?);
+    let env = BTreeMap::new();
+    let auto_lifecycle = AutoLifecyclePolicy::disabled();
+    let template_network_policy = NetworkPolicyV1::deny_all();
+    let request = pooled_claim_request(&actor, &env, &auto_lifecycle, &template_network_policy);
+    Ok(claim_pooled_execution(pool, &request, "space")
+        .await?
+        .claim
+        .expect("ready pool slot should be claimed"))
+}
+
+/// The adopter's label is patched onto the claimed pool pod before the
+/// adoption commits, fenced by the claimed pod UID. A permanent failure
+/// invalidates the slot, never returning it to the pool, where a refusal that
+/// repeats would hand the same slot to every later create. Throttling is
+/// retried first; throttling that outlasts the retries is transient, so the
+/// slot is released or the claim kept, as the caller asks, and never
+/// invalidated.
+#[rstest::rstest]
+#[case::labeled(
+    StatusCode::OK,
+    AdoptionLabelThrottle::ReleaseSlot,
+    AdoptionLabelOutcome::Labeled,
+    1
+)]
+#[case::pod_replaced_under_the_same_name(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    AdoptionLabelThrottle::ReleaseSlot,
+    AdoptionLabelOutcome::Invalidated,
+    1
+)]
+#[case::forbidden(
+    StatusCode::FORBIDDEN,
+    AdoptionLabelThrottle::KeepClaim,
+    AdoptionLabelOutcome::Invalidated,
+    1
+)]
+#[case::unknown_outcome(
+    StatusCode::INTERNAL_SERVER_ERROR,
+    AdoptionLabelThrottle::ReleaseSlot,
+    AdoptionLabelOutcome::Invalidated,
+    1
+)]
+#[case::pod_gone(
+    StatusCode::NOT_FOUND,
+    AdoptionLabelThrottle::ReleaseSlot,
+    AdoptionLabelOutcome::Invalidated,
+    1
+)]
+#[case::throttled_throughout_releases_the_slot(
+    StatusCode::TOO_MANY_REQUESTS,
+    AdoptionLabelThrottle::ReleaseSlot,
+    AdoptionLabelOutcome::Throttled,
+    // `K8S_THROTTLE_RETRY_ATTEMPTS`: every attempt is spent before giving up.
+    3
+)]
+#[case::throttled_throughout_keeps_the_claim(
+    StatusCode::TOO_MANY_REQUESTS,
+    AdoptionLabelThrottle::KeepClaim,
+    AdoptionLabelOutcome::Throttled,
+    3
+)]
+#[tokio::test(flavor = "current_thread")]
+async fn postgres_label_adopted_execution_patches_the_label_or_gives_up_the_slot(
+    #[case] status: StatusCode,
+    #[case] on_throttle: AdoptionLabelThrottle,
+    #[case] expected: AdoptionLabelOutcome,
+    #[case] expected_patches: usize,
+) -> TestResult {
+    use super::super::scripted_test_doubles::{
+        KubeReply, kube_status, pod_path, requests_matching, scripted_kube_client,
+    };
+    use pplx_space_common_core::kubernetes::SANDBOX_CLIENT_ID_LABEL;
+    use pplx_space_common_core::types::ClientId;
+
+    let db = pg_test_db().await?;
+    let slot = insert_ready_pool_slot(&db.pool).await?;
+    let claim = claim_ready_pool_slot(&db.pool, &slot).await?;
+    let (client, log) = scripted_kube_client(move |_| {
+        if status.is_success() {
+            KubeReply::Json(
+                status,
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": { "name": "pooled", "namespace": "space" }
+                }),
+            )
+        } else {
+            kube_status(status, "scripted")
+        }
+    });
+    let substrate = super::super::tests::substrate_with_store_and_client(db.pool.clone(), client);
+    let adopter = ClientId::parse("adopter").expect("test client id");
+
+    let outcome = substrate
+        .label_adopted_execution(&claim, Some(&adopter), on_throttle)
+        .await?;
+
+    assert_eq!(outcome, expected);
+    let patches = requests_matching(&log, &axum::http::Method::PATCH);
+    assert_eq!(patches.len(), expected_patches, "{patches:?}");
+    let patch = &patches[0];
+    assert_eq!(patch.path, pod_path(&claim.pod_name));
+    let body = patch.body.as_ref().expect("the patch has a body");
+    assert_eq!(
+        body.pointer("/metadata/labels")
+            .and_then(|labels| labels.get(SANDBOX_CLIENT_ID_LABEL))
+            .and_then(serde_json::Value::as_str),
+        Some("adopter")
+    );
+    assert_eq!(
+        body.pointer("/metadata/uid")
+            .and_then(serde_json::Value::as_str),
+        Some(
+            claim
+                .pod_uid
+                .as_ref()
+                .expect("the fixture slot records its pod UID")
+                .as_str()
+        ),
+        "the patch is fenced by the claimed pod UID"
+    );
+    let slot_after = match (expected, on_throttle) {
+        (AdoptionLabelOutcome::Labeled, _)
+        | (AdoptionLabelOutcome::Throttled, AdoptionLabelThrottle::KeepClaim) => {
+            ("claimed", Some(claim.claim_id))
+        }
+        (AdoptionLabelOutcome::Throttled, AdoptionLabelThrottle::ReleaseSlot) => ("ready", None),
+        (AdoptionLabelOutcome::Invalidated, _) => ("claimed", None),
+    };
+    assert_eq!(
+        fixture_slot_state(&db.pool, &slot).await?,
+        Some((slot_after.0.to_string(), slot_after.1))
+    );
+    Ok(())
+}
+
+/// A claim with no recorded pod UID can't fence the patch to the claimed pod,
+/// so it's invalidated without asking the apiserver.
+#[tokio::test(flavor = "current_thread")]
+async fn postgres_label_adopted_execution_invalidates_a_claim_without_a_pod_uid() -> TestResult {
+    use super::super::scripted_test_doubles::{kube_status, scripted_kube_client};
+    use pplx_space_common_core::types::ClientId;
+
+    let db = pg_test_db().await?;
+    let slot = insert_ready_pool_slot(&db.pool).await?;
+    sqlx::query(sql!(
+        "UPDATE kubernetes_pool_slots SET pod_uid = NULL WHERE reserved_sandbox_id = $1"
+    ))
+    .bind(slot.sandbox_id)
+    .execute(&db.pool)
+    .await?;
+    let claim = claim_ready_pool_slot(&db.pool, &slot).await?;
+    assert_eq!(claim.pod_uid, None);
+    let (client, log) = scripted_kube_client(|_| kube_status(StatusCode::OK, "unexpected"));
+    let substrate = super::super::tests::substrate_with_store_and_client(db.pool.clone(), client);
+    let adopter = ClientId::parse("adopter").expect("test client id");
+
+    let outcome = substrate
+        .label_adopted_execution(&claim, Some(&adopter), AdoptionLabelThrottle::ReleaseSlot)
+        .await?;
+
+    assert_eq!(outcome, AdoptionLabelOutcome::Invalidated);
+    assert!(log.lock().expect("kube log mutex poisoned").is_empty());
+    assert_eq!(
+        fixture_slot_state(&db.pool, &slot).await?,
+        Some(("claimed".to_string(), None))
+    );
+    Ok(())
+}
+
+/// An adopter with no id to stamp leaves the pod unlabeled without asking the
+/// apiserver.
+#[tokio::test(flavor = "current_thread")]
+async fn label_adopted_execution_without_a_client_sends_nothing() -> TestResult {
+    use super::super::scripted_test_doubles::{kube_status, scripted_kube_client};
+
+    let db = pg_test_db().await?;
+    let slot = insert_ready_pool_slot(&db.pool).await?;
+    let claim = claim_ready_pool_slot(&db.pool, &slot).await?;
+    let (client, log) =
+        scripted_kube_client(|_| kube_status(StatusCode::INTERNAL_SERVER_ERROR, "unexpected"));
+    let substrate = super::super::tests::substrate_with_store_and_client(db.pool.clone(), client);
+
+    let outcome = substrate
+        .label_adopted_execution(&claim, None, AdoptionLabelThrottle::ReleaseSlot)
+        .await?;
+
+    assert_eq!(outcome, AdoptionLabelOutcome::Labeled);
+    assert!(log.lock().expect("kube log mutex poisoned").is_empty());
+    Ok(())
+}
+
+/// With attribution off, adoption patches nothing, even for a client with an
+/// id, and the claim stays as it was.
+#[tokio::test(flavor = "current_thread")]
+async fn postgres_label_adopted_execution_with_attribution_off_sends_nothing() -> TestResult {
+    use super::super::scripted_test_doubles::{kube_status, scripted_kube_client};
+    use crate::controllers::substrate::ActivationClientAttribution;
+    use pplx_space_common_core::types::ClientId;
+
+    let db = pg_test_db().await?;
+    let slot = insert_ready_pool_slot(&db.pool).await?;
+    let claim = claim_ready_pool_slot(&db.pool, &slot).await?;
+    let (client, log) =
+        scripted_kube_client(|_| kube_status(StatusCode::INTERNAL_SERVER_ERROR, "unexpected"));
+    let mut substrate =
+        super::super::tests::substrate_with_store_and_client(db.pool.clone(), client);
+    substrate.k8s.activation_client_attribution = ActivationClientAttribution::Disabled;
+    let adopter = ClientId::parse("adopter").expect("test client id");
+
+    let outcome = substrate
+        .label_adopted_execution(&claim, Some(&adopter), AdoptionLabelThrottle::ReleaseSlot)
+        .await?;
+
+    assert_eq!(outcome, AdoptionLabelOutcome::Labeled);
+    assert!(log.lock().expect("kube log mutex poisoned").is_empty());
+    assert_eq!(
+        fixture_slot_state(&db.pool, &slot).await?,
+        Some(("claimed".to_string(), Some(claim.claim_id)))
+    );
     Ok(())
 }

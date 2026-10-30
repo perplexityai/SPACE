@@ -1105,6 +1105,10 @@ impl SandboxController {
                 id,
                 crate::controllers::substrate::RecoveryCharge::enforce(
                     self.cluster_admission.as_ref(),
+                    crate::controllers::substrate::CapPolicy::Check,
+                    crate::controllers::substrate::ActivationAttribution::inherit(
+                        sandbox.activating_client_id.as_ref(),
+                    ),
                 ),
             )
             .await?;

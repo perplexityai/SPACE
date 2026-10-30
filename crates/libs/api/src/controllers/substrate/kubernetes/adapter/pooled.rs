@@ -201,6 +201,9 @@ impl KubernetesSubstrate {
             // apply to the already-booted pod.
             volume_encryption: _,
             disk_io_limits: _,
+            // Labeled by `label_adopted_execution` before the adoption
+            // committed.
+            client_id: _,
         } = setup;
         // The pool pod's user_id/org_id annotations carry the pool's identity;
         // adoption conveys the adopter's identity through the owner update below

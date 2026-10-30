@@ -169,6 +169,8 @@ impl DirectRestoreCandidate {
 pub struct DirectSubstrate {
     pool: PgPool,
     worker_channels: std::sync::Arc<super::worker_channels::WorkerChannels>,
+    /// Whether creates record their activating client; off unless set.
+    activation_client_attribution: super::ActivationClientAttribution,
 }
 
 const DIRECT_NODE_CREATE_FAILURE_TTL_SECS: i64 = 10;
@@ -756,7 +758,20 @@ impl DirectSubstrate {
                 DIRECT_NODE_CONNECT_TIMEOUT,
                 DIRECT_NODE_RPC_TIMEOUT,
             )),
+            activation_client_attribution: super::ActivationClientAttribution::Disabled,
         }
+    }
+
+    pub fn with_activation_client_attribution(
+        mut self,
+        attribution: super::ActivationClientAttribution,
+    ) -> Self {
+        self.activation_client_attribution = attribution;
+        self
+    }
+
+    pub(super) fn activation_client_attribution(&self) -> super::ActivationClientAttribution {
+        self.activation_client_attribution
     }
 
     async fn persist_route_identity_receipt(
@@ -3549,6 +3564,16 @@ impl SubstrateAdapter for DirectSubstrate {
         Ok(())
     }
 
+    /// Direct adopts node-side and has no pod to label.
+    async fn label_adopted_execution(
+        &self,
+        _claim: &PooledExecutionClaim,
+        _client_id: Option<&pplx_space_common_core::types::ClientId>,
+        _on_throttle: crate::controllers::substrate::AdoptionLabelThrottle,
+    ) -> Result<crate::controllers::substrate::AdoptionLabelOutcome, ControllerError> {
+        Ok(crate::controllers::substrate::AdoptionLabelOutcome::Labeled)
+    }
+
     async fn rollback_pooled_execution_claim(
         &self,
         claim: &PooledExecutionClaim,
@@ -4240,7 +4265,7 @@ impl SubstrateAdapter for DirectSubstrate {
         sandbox: &Sandbox,
         activity: ExecutionActivityKind,
         timeout: Duration,
-        _charge: crate::controllers::substrate::RecoveryCharge,
+        charge: crate::controllers::substrate::RecoveryCharge,
     ) -> Result<RuntimeClient, ControllerError> {
         if matches!(
             sandbox.lifecycle.parse::<SandboxLifecycle>(),
@@ -4263,7 +4288,7 @@ impl SubstrateAdapter for DirectSubstrate {
                     sandbox,
                     timeout,
                     Some(activity),
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    charge.after_charge(),
                 )
                 .await
                 .map_err(ControllerError::from)?;

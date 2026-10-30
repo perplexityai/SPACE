@@ -125,6 +125,43 @@ The selected template must already be published. `seed` is the compatibility
 default when a create request omits `templateID`; a production deployment will
 usually publish and select a purpose-built runtime template instead.
 
+### Client attribution
+
+A client can identify itself with an `X-Client-ID` header. Create, fork and
+connect each take a slot under the per-client concurrency limit
+(`SPACE_API_CLIENT_CONCURRENCY_*` in [Configuration](configuration.md)), which
+gives each allowlisted id its own bucket and has every other request share
+one. Resume takes one too when `SPACE_ACTIVATION_CLIENT_ATTRIBUTION_ENABLED` is
+on.
+
+With `SPACE_ACTIVATION_CLIENT_ATTRIBUTION_ENABLED` on (it's off by default; see
+[Configuration](configuration.md)), the id is also recorded as the client whose
+activation created the sandbox's runtime. A value that is a Kubernetes label value is used as sent, after
+trimming. A missing or invalid value, or one of the reserved ids `unknown`,
+`native` and `overflow` in any case, becomes `unknown`. A native `/v1` create
+records `native`. On Direct, the record is written only when the sandbox is
+created.
+
+On Kubernetes, the pod an activation creates carries the id as its
+`space.pplx.net/client-id` label, and tracking that pod records it on the
+sandbox:
+
+- A create, fork, connect or resume labels its pod with the calling client,
+  and a native lifecycle operation that starts a runtime labels its pod
+  `native`.
+- An activation with no client of its own (an implicit wake from a command or
+  ingress, a reconciler, an evacuation) labels its pod with the recorded id,
+  and leaves it unlabeled when nothing is recorded.
+- A wake that reuses the resident runtime keeps its pod and label.
+- A warm-pool pod is labeled when it's adopted, before the create commits. If
+  the label can't be applied, the pod isn't adopted, and the create builds a
+  cold pod instead. A create whose slot was reserved for it at admission is
+  answered with a retryable 503 and builds cold on a retry, once the pool has
+  collected the slot.
+
+Ids are unbounded, since a client can send any value. Anything that needs a
+bounded set, such as a metric tag, has to map the id to one first.
+
 ## Sizing at create
 
 SPACE extends ECW create with the reserved metadata key `space.resources`. Its

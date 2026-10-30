@@ -255,6 +255,50 @@ impl AbandonedRestoreRetirement {
     }
 }
 
+/// Whether SPACE records which client's activation created a sandbox's
+/// runtime: the `sandboxes.activating_client_id` record, the
+/// `space.pplx.net/client-id` pod label and the label patch at warm-pool
+/// adoption.
+///
+/// Off, none of the three happens: new pods are unlabeled, adoption sends no
+/// patch, and nothing writes the record. The client is still carried in
+/// process (charges, fork payloads), which changes nothing outside it. The
+/// switch ships off and is turned on per deployment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ActivationClientAttribution {
+    #[default]
+    Disabled,
+    Enabled,
+}
+
+impl ActivationClientAttribution {
+    /// The switch both the API and the cluster controller read
+    /// ([`Self::from_env`]): `1`, `true`, `yes`, `on` or `enabled`, in any
+    /// case, turns attribution on; unset or anything else keeps it off.
+    pub const ENV: &'static str = "SPACE_ACTIVATION_CLIENT_ATTRIBUTION_ENABLED";
+
+    pub fn from_enabled(enabled: bool) -> Self {
+        if enabled {
+            Self::Enabled
+        } else {
+            Self::Disabled
+        }
+    }
+
+    pub fn from_env() -> Self {
+        Self::from_enabled(pplx_space_common_core::env::env_flag_var(Self::ENV, false))
+    }
+
+    pub fn is_enabled(self) -> bool {
+        self == Self::Enabled
+    }
+
+    /// `client_id` when attribution is on, else `None`.
+    pub fn gate<T>(self, client_id: Option<T>) -> Option<T> {
+        client_id.filter(|_| self.is_enabled())
+    }
+}
+
 /// Exact operation lease to release after the controller publishes its lifecycle.
 /// A later owner or execution must never be released by this completion.
 #[derive(Debug, Clone, Copy)]
@@ -495,6 +539,10 @@ pub struct CreateExecutionRequest<'a> {
     /// PodSpec-only and not persisted, so it applies at create and does not
     /// survive to a later reconcile/restore.
     pub node_pool: Option<&'a NodePoolName>,
+    /// The create's client id: the ECW caller's, or `native`. The sandbox
+    /// pod is labeled with it as `space.pplx.net/client-id`; `None` creates
+    /// it unlabeled.
+    pub client_id: Option<&'a pplx_space_common_core::types::ClientId>,
 }
 
 pub struct CreateExecutionOutcome {
@@ -1660,6 +1708,18 @@ pub trait SubstrateAdapter: Send + Sync {
         Ok(())
     }
 
+    /// Label an adopted pool sandbox's runtime with its adopter's client id,
+    /// before the adoption commits. A pool runtime is built before it has an
+    /// adopter, and adoption is its activation. On failure the adoption must
+    /// not proceed: persistent throttling releases the slot or keeps the
+    /// claim as `on_throttle` says, and any other failure invalidates it.
+    async fn label_adopted_execution(
+        &self,
+        claim: &PooledExecutionClaim,
+        client_id: Option<&pplx_space_common_core::types::ClientId>,
+        on_throttle: AdoptionLabelThrottle,
+    ) -> Result<AdoptionLabelOutcome, ControllerError>;
+
     async fn cleanup_failed_pooled_prepare(
         &self,
         claim: &PooledExecutionClaim,
@@ -1811,6 +1871,16 @@ impl Substrate {
         }
     }
 
+    /// Whether this substrate records activating clients (see
+    /// [`ActivationClientAttribution`]).
+    pub fn activation_client_attribution(&self) -> ActivationClientAttribution {
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.activation_client_attribution(),
+            #[cfg(feature = "kubernetes")]
+            Inner::Kubernetes(substrate) => substrate.k8s.activation_client_attribution,
+        }
+    }
+
     /// The Kubernetes substrate, for code that needs Kubernetes-only state
     /// (its client, caches, or reconcilers typed on it). Behavior shared code
     /// asks a substrate to perform belongs on [`SubstrateAdapter`], and static
@@ -1864,9 +1934,10 @@ impl Substrate {
         #[cfg(not(feature = "kubernetes"))]
         drop((shutdown_token, task_tracker));
 
-        Ok(Self::from_direct(direct::DirectSubstrate::new(
-            pool.clone(),
-        )))
+        Ok(Self::from_direct(
+            direct::DirectSubstrate::new(pool.clone())
+                .with_activation_client_attribution(ActivationClientAttribution::from_env()),
+        ))
     }
 
     pub(crate) async fn reserve_rollback_route_identity(
@@ -3010,6 +3081,27 @@ impl SubstrateAdapter for Substrate {
             Inner::Direct(substrate) => substrate.rollback_pooled_execution_claim(claim).await,
             #[cfg(feature = "kubernetes")]
             Inner::Kubernetes(substrate) => substrate.rollback_pooled_execution_claim(claim).await,
+        }
+    }
+
+    async fn label_adopted_execution(
+        &self,
+        claim: &PooledExecutionClaim,
+        client_id: Option<&pplx_space_common_core::types::ClientId>,
+        on_throttle: AdoptionLabelThrottle,
+    ) -> Result<AdoptionLabelOutcome, ControllerError> {
+        match &self.inner {
+            Inner::Direct(substrate) => {
+                substrate
+                    .label_adopted_execution(claim, client_id, on_throttle)
+                    .await
+            }
+            #[cfg(feature = "kubernetes")]
+            Inner::Kubernetes(substrate) => {
+                substrate
+                    .label_adopted_execution(claim, client_id, on_throttle)
+                    .await
+            }
         }
     }
 

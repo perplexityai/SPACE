@@ -197,6 +197,8 @@ impl AccessBackend for StoredAccess {
                     SandboxApiMetricIdentity::native("ingress"),
                     super::lifecycle::SandboxAction::ImplicitWake(ExecutionActivityKind::Access),
                     None,
+                    // Ingress acts for the sandbox's recorded client.
+                    crate::controllers::substrate::ActivationClient::Inherit,
                 )
                 .await
                 .map_err(|error| Status::unavailable(error.to_string()))?;

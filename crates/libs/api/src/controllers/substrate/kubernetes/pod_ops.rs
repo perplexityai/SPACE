@@ -1,4 +1,5 @@
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use crate::controllers::substrate::KeyResolution;
+use pplx_space_common_core::types::{ClientId, NodeId, SandboxId};
 
 use super::support::*;
 use super::*;
@@ -32,10 +33,9 @@ mod started_recovery;
 mod wake;
 mod worker_clients;
 use delete::delete_sandbox_pod_with_throttle_retry;
+pub(super) use delete::retry_kube_throttling;
 #[cfg(test)]
-use delete::{
-    K8S_THROTTLE_DELETE_RETRY_ATTEMPTS, lingering_sandbox_pod_names, retry_kube_delete_throttling,
-};
+use delete::{K8S_THROTTLE_RETRY_ATTEMPTS, lingering_sandbox_pod_names};
 #[cfg(test)]
 use ensure_pod::restore_placement_sample;
 #[cfg(test)]
@@ -132,6 +132,20 @@ pub(super) struct SandboxPodRequestInputs<'a> {
     /// `None` renders no node-group constraints: the gate is off, or the
     /// cluster has no generic node group.
     pub(super) node_group_placement: Option<&'a NodeGroupPlacement>,
+    /// Rendered as the `space.pplx.net/client-id` label when `Some`.
+    pub(super) client_id: Option<&'a ClientId>,
+}
+
+/// The client id a pod built for `sandbox` is labeled with: the activation's
+/// resolved id, or the sandbox's record when no activation resolved one (a
+/// reconciler's rebuild). See [`KeyResolution::pod_label`].
+pub(super) fn pod_client_id(
+    activation_attempt: Option<&ActivationAttemptAssignment>,
+    sandbox: &Sandbox,
+) -> Option<ClientId> {
+    activation_attempt
+        .map_or(&KeyResolution::Unresolved, |assignment| &assignment.key)
+        .pod_label(sandbox.activating_client_id.as_ref())
 }
 
 impl PodCreateContext<'_> {
@@ -191,6 +205,8 @@ impl StartedRecoveryOwnership {
 pub(super) struct ActivationAttemptAssignment {
     requested_id: SandboxActivationAttemptId,
     target_state: SandboxTransitionTargetState,
+    /// The client id this activation's new pods are labeled with.
+    key: KeyResolution,
     assigned: std::sync::Arc<std::sync::Mutex<Option<(SandboxActivationAttemptId, i64)>>>,
 }
 
@@ -198,10 +214,12 @@ impl ActivationAttemptAssignment {
     pub(super) fn new(
         requested_id: SandboxActivationAttemptId,
         target_state: SandboxTransitionTargetState,
+        key: KeyResolution,
     ) -> Self {
         Self {
             requested_id,
             target_state,
+            key,
             assigned: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }

@@ -243,6 +243,7 @@ async fn rejected_activation_emits_no_orphaned_requested_event() -> TestResult {
             pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::ecw("start"),
             SandboxAction::Start,
             None,
+            crate::controllers::substrate::ActivationClient::Native,
         )
         .await;
     drop(guard);
@@ -315,6 +316,7 @@ async fn direct_start_restore_spends_deferred_admission_at_entry() -> TestResult
             pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::ecw("start"),
             SandboxAction::Start,
             None,
+            crate::controllers::substrate::ActivationClient::Native,
         )
         .await
         .expect_err("direct restore-shaped Start must pay admission");
@@ -497,6 +499,7 @@ async fn persisted_delete_intent_denies_later_fork_admission() -> TestResult {
             federated_owner: None,
             federated_service_grant: None,
             idempotency_key: &key,
+            client_id: &pplx_space_common_core::types::ClientId::unknown(),
         },
     )
     .await?;
@@ -573,6 +576,7 @@ async fn invalid_activation_options_reject_before_admission_and_requested_event(
                 blocking: None,
                 ready_timeout_secs: Some(0),
             }),
+            crate::controllers::substrate::ActivationClient::Native,
         )
         .await;
     drop(guard);
@@ -928,7 +932,10 @@ async fn resume_uses_resolved_runtime_without_async_observation() -> TestResult 
             ));
         let mut client = controller
             .substrate
-            .runtime_client(id, crate::controllers::substrate::RecoveryCharge::Exempt)
+            .runtime_client(
+                id,
+                crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
+            )
             .await?;
         let request = controller
             .resume_request_with_current_policy(

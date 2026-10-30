@@ -586,6 +586,7 @@ async fn joined_create_waits_on_the_owners_pod(#[case] owner_pod: OwnerPod) -> T
                 owner.generation,
                 Some(&format!("{}-uid", owner.pod_name)),
                 Some("127.0.0.1"),
+                None,
             )
             .await?;
     }

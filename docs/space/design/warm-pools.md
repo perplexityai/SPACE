@@ -129,6 +129,7 @@ sequenceDiagram
         alt no ready slot
             API->>K8S: cold create
         else hit
+            API->>K8S: with attribution on, patch the adopter's<br/>client-id label, fenced by the pod UID
             API->>PG: bind: sandbox rows on the reserved ID,<br/>slot bound
             API->>K8S: patch pod annotations
             API->>Node: adopt: apply env, owner and lifecycle,<br/>wake the paused VM
@@ -166,6 +167,27 @@ Bind is a separate transaction. It inserts the sandbox rows and the
 generation-1 `sandbox_k8s_executions` row on the slot's reserved sandbox ID,
 and marks the slot `bound` in the same transaction. A `claimed` row older than
 the claim timeout is therefore a handoff that died before bind.
+
+With `SPACE_ACTIVATION_CLIENT_ATTRIBUTION_ENABLED` on, before bind, the API
+patches the adopter's `space.pplx.net/client-id` label onto the claimed pod,
+retrying while the apiserver throttles. The patch carries the claimed pod UID,
+so a pod recreated under the same name is rejected rather than labeled.
+
+Throttling that outlasts those retries is transient, and the patch is
+idempotent, so the slot stays good: the create gives the slot back to `ready`
+and fails with a retryable 503 rather than building cold, which would add
+apiserver writes while it throttles. A create whose slot was claimed at
+admission keeps its claim and gets a retryable 503, and its retry adopts the
+same slot.
+
+Any other failure means the pod can't be labeled, so it isn't adopted: its slot
+is invalidated for cleanup, never returned to `ready`, and the create falls
+back as after a pool miss: a cold build, or a 503 for a pool-only create. A
+create whose slot was claimed at admission gets a retryable 503 and builds cold
+under the same ID once the pool collects the slot. Returning a permanently
+failed slot would put it first in claim order for every later create, so one
+refusal that repeats would take every claim. The API needs `patch` on pods in
+the sandbox namespace for this.
 
 After bind, the API patches the pod's annotations and calls node-local
 adoption. Adoption applies the owner, environment and final auto-lifecycle

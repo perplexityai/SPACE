@@ -430,6 +430,9 @@ pub struct KubernetesState {
     /// Whether resume and start decide a runtime upgrade
     /// (`SPACE_RUNTIME_UPGRADE_AT_ACTIVATION_ENABLED`, default off).
     pub runtime_upgrade_at_activation: super::runtime_upgrade::RuntimeUpgradeAtActivation,
+    /// Whether pods are labeled and the record written
+    /// (`SPACE_ACTIVATION_CLIENT_ATTRIBUTION_ENABLED`, default off).
+    pub activation_client_attribution: super::ActivationClientAttribution,
     pub caches: Arc<K8sCaches>,
 }
 
@@ -485,6 +488,7 @@ impl KubernetesState {
             abandoned_restore_retirement: super::AbandonedRestoreRetirement::from_env(),
             runtime_upgrade_at_activation:
                 super::runtime_upgrade::RuntimeUpgradeAtActivation::from_env(),
+            activation_client_attribution: super::ActivationClientAttribution::from_env(),
             sandbox_proxy_port: DEFAULT_SANDBOX_PROXY_PORT,
             node_api_port: DEFAULT_SANDBOX_PROXY_PORT,
             sandbox_pod_config: SandboxPodConfigValues::from_env()?,
@@ -899,7 +903,11 @@ impl KubernetesSubstrate {
             Ok(Some(k8s)) => {
                 let (pod_store, pod_network_slots, pod_events, pod_reflector_ready) =
                     pod_reflector::start(k8s.client.clone(), k8s.sandbox_namespace.clone());
-                let store = K8sStore::new(pool.clone(), k8s.sandbox_namespace.clone());
+                let store = K8sStore::new(
+                    pool.clone(),
+                    k8s.sandbox_namespace.clone(),
+                    k8s.activation_client_attribution,
+                );
                 // Read before `k8s` is moved into the struct below.
                 let node_group_placement = NodeGroupPlacementResolver::new(
                     pool.clone(),

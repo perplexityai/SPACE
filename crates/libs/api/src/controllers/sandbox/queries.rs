@@ -1,4 +1,8 @@
-use pplx_space_common_core::types::{OrgId, SandboxId, UserId};
+use crate::controllers::substrate::{
+    ActivationAttribution, ActivationClient, AdoptionLabelOutcome, AdoptionLabelThrottle,
+    CapPolicy, RecoveryCharge,
+};
+use pplx_space_common_core::types::{ClientId, OrgId, SandboxId, UserId};
 
 use super::*;
 use crate::controllers::substrate::{
@@ -155,6 +159,8 @@ struct PooledCreateInput<'a> {
     boot_mode: CreateBootMode,
     federated_owner: Option<&'a crate::federated_identity::FederatedOwner>,
     federated_service_grant: Option<&'a crate::federated_identity::FederatedServiceGrant>,
+    /// The create's client id, recorded and labeled on the adopted sandbox.
+    client_id: Option<&'a ClientId>,
     /// This create will produce an encrypted sandbox (org enrollment ∧ the
     /// global volume-encryption switch). See the pool bypass in
     /// `try_create_from_pool_with_substrate` for why these cold-create today.
@@ -416,6 +422,8 @@ pub struct RestoreForkDiskAsNewContext<'a> {
     pub operation_id: OperationId,
     pub restore_lease_seconds: u32,
     pub volume_encryption: bool,
+    /// Whose fork this is, from the persisted operation.
+    pub activating_client: ActivationClient,
 }
 
 /// Whether the owner org has BYOK (per-sandbox volume encryption) enabled.
@@ -917,6 +925,10 @@ struct SandboxCreateExecutionMode<'a> {
     restore_from: Option<ForkDiskRestore<'a>>,
     restore_operation_id: Option<OperationId>,
     restore_lease_seconds: u32,
+    /// Whose activation this create is. A new sandbox has no record, so an
+    /// inheriting create (a fork queued before forks carried their client)
+    /// has no client id to label or record.
+    attribution: ActivationAttribution,
 }
 
 fn pool_attempt_resources(pool_shape: Option<PooledExecutionPoolShape>) -> SandboxResources {
@@ -991,6 +1003,7 @@ impl SandboxController {
         req: &CreateSandboxRequest,
         metric_identity: SandboxApiMetricIdentity,
         federated: FederatedSandboxCreateContext<'_>,
+        activating_client: ActivationClient,
     ) -> Result<SandboxResponse, ControllerError> {
         self.create_with_sandbox_id_inner(
             pool,
@@ -998,6 +1011,7 @@ impl SandboxController {
             req,
             metric_identity,
             SandboxCreateExecutionMode {
+                attribution: ActivationAttribution::resolve(activating_client, None),
                 sandbox_id: SandboxId::new(),
                 sandbox_id_pinned: false,
                 admitted_pool_claim: None,
@@ -1032,6 +1046,8 @@ impl SandboxController {
                 restore_from: None,
                 restore_operation_id: None,
                 restore_lease_seconds: 0,
+                // Native `/v1` creates.
+                attribution: ActivationAttribution::native(),
             },
         )
         .await
@@ -1068,6 +1084,8 @@ impl SandboxController {
                 restore_from: None,
                 restore_operation_id: None,
                 restore_lease_seconds: 0,
+                // Native `/v1` creates.
+                attribution: ActivationAttribution::native(),
             },
         )
         .await
@@ -1181,6 +1199,7 @@ impl SandboxController {
                 }),
                 restore_operation_id: Some(restore.operation_id),
                 restore_lease_seconds: restore.restore_lease_seconds,
+                attribution: ActivationAttribution::resolve(restore.activating_client, None),
             },
         )
         .await
@@ -1206,7 +1225,14 @@ impl SandboxController {
             restore_from,
             restore_operation_id,
             restore_lease_seconds,
+            attribution,
         } = mode;
+        // Off, the create records no client and its pod is unlabeled, cold or
+        // adopted.
+        let client_id = self
+            .substrate
+            .activation_client_attribution()
+            .gate(attribution.key().pod_label(None));
         let fork_volume_encryption = restore_from
             .as_ref()
             .map(|restore| restore.volume_encryption);
@@ -1349,6 +1375,7 @@ impl SandboxController {
             federated_owner,
             federated_service_grant,
             volume_encryption,
+            client_id: client_id.as_ref(),
         };
         // Set when this create was admitted against a warm-pool slot and is
         // building cold instead: the slot's pod used this ID's generation 1.
@@ -1435,6 +1462,7 @@ impl SandboxController {
             auto_lifecycle: &auto_lifecycle,
             network_policy_override_json: network_policy_override_json.as_ref(),
             egress_profiles: &egress_profile_names,
+            activating_client_id: client_id.as_ref(),
         };
         match (federated_owner, federated_service_grant) {
             (None, None) => {
@@ -1557,6 +1585,7 @@ impl SandboxController {
                 wait_until_ready: req.wait_until_ready,
                 volume_encryption,
                 node_pool: req.node_pool.as_ref(),
+                client_id: client_id.as_ref(),
             })
             .await
         {
@@ -1681,7 +1710,8 @@ impl SandboxController {
                             blocking: true,
                             ready_timeout: DEFAULT_BLOCKING_WAIT_TIMEOUT,
                         },
-                        crate::controllers::substrate::RecoveryCharge::Exempt,
+                        // Charged as this create's cold activation.
+                        RecoveryCharge::paid(CapPolicy::Skip, attribution.clone()),
                     )
                     .await
                 {
@@ -1709,7 +1739,7 @@ impl SandboxController {
                 .substrate
                 .runtime_client(
                     outcome.sandbox_id,
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    RecoveryCharge::paid(CapPolicy::Skip, attribution.clone()),
                 )
                 .await
             {
@@ -2085,6 +2115,33 @@ impl SandboxController {
                     return Ok(PoolCreateResult::cold(observation));
                 }
             };
+
+            // Adoption is the pool pod's activation, so it takes the
+            // adopter's label before the adoption commits. A pod that can't be
+            // labeled isn't adopted: the create builds cold, which labels its
+            // pod when it creates it, and a strict pool create gets the miss's
+            // existing 503. A throttled apiserver gives the slot back and
+            // fails the create retryably instead, since a cold build would add
+            // writes while it's throttling.
+            match substrate
+                .label_adopted_execution(
+                    &claim,
+                    input.client_id,
+                    AdoptionLabelThrottle::ReleaseSlot,
+                )
+                .await
+                // Like a failed commit below, this runs after the claim, so it
+                // may not tell the caller to retry and claim a second slot.
+                .map_err(ControllerError::demoted_after_side_effect)?
+            {
+                AdoptionLabelOutcome::Labeled => {}
+                AdoptionLabelOutcome::Throttled => return Err(adoption_label_throttled()),
+                AdoptionLabelOutcome::Invalidated => {
+                    return Ok(PoolCreateResult::cold(
+                        PoolCreateObservation::after_pool_recovery_failure(),
+                    ));
+                }
+            }
 
             let sandbox_uuid = match commit_pooled_sandbox_claim(
                 input.pool,
@@ -2470,6 +2527,35 @@ impl SandboxController {
             );
             substrate.rollback_pooled_execution_claim(&claim).await?;
             return Err(admitted_pool_slot_release_pending());
+        }
+
+        // A slot that can't be labeled is invalidated. The admitted slot
+        // reserves this operation's planned id, so the create waits for the
+        // pool to collect it, then builds cold under that id.
+        match substrate
+            .label_adopted_execution(&claim, input.client_id, AdoptionLabelThrottle::KeepClaim)
+            .await
+        {
+            Ok(AdoptionLabelOutcome::Labeled) => {}
+            // The claim is kept, so the retry adopts the same slot.
+            Ok(AdoptionLabelOutcome::Throttled) => {
+                return Err(admitted_adoption_label_throttled());
+            }
+            // The retry waits for the pool to collect the invalidated slot.
+            Ok(AdoptionLabelOutcome::Invalidated) => {
+                return Err(admitted_pool_slot_release_pending());
+            }
+            Err(error) => {
+                // The slot may still be claimed; the retry looks it up again
+                // under this ID.
+                tracing::warn!(
+                    sandbox_id = %claim.sandbox_id,
+                    claim_id = %claim.claim_id,
+                    %error,
+                    "admitted warm-pool slot could not be labeled"
+                );
+                return Err(admitted_pool_slot_release_pending());
+            }
         }
 
         let sandbox_uuid = match commit_pooled_sandbox_claim(
@@ -2890,6 +2976,7 @@ async fn insert_pooled_sandbox(
             auto_lifecycle: input.auto_lifecycle,
             network_policy_override_json: network_policy_override_json.as_ref(),
             egress_profiles: &input.egress_profiles.as_names(),
+            activating_client_id: input.client_id,
         },
         claim.active_node_id,
     )
@@ -2922,12 +3009,34 @@ fn pooled_execution_claim_request<'a>(
         template_network_policy: input.template_network_policy,
         template_network_policy_generation: input.template_network_policy_generation,
         volume_encryption: input.volume_encryption,
+        client_id: input.client_id,
     }
 }
 
 /// How long an admitted create waits before re-checking a pool slot that
 /// still owns a pod under its ID.
 const ADMITTED_POOL_SLOT_RELEASE_RETRY: Duration = Duration::from_secs(15);
+
+/// How long a create whose adoption label was throttled waits before retrying.
+const ADOPTION_LABEL_THROTTLED_RETRY: Duration = Duration::from_secs(2);
+
+/// A pool create whose adoption label the apiserver kept throttling. The slot
+/// went back to the pool, so a retry is safe.
+fn adoption_label_throttled() -> ControllerError {
+    ControllerError::service_unavailable("the Kubernetes apiserver is throttling; retry the create")
+        .with_retry_after_header(ADOPTION_LABEL_THROTTLED_RETRY)
+}
+
+/// An admitted create whose adoption label the apiserver kept throttling. Its
+/// claim is kept, so the retry adopts the same slot; like a pending release,
+/// that's workflow progress rather than a failed attempt.
+fn admitted_adoption_label_throttled() -> ControllerError {
+    ControllerError::service_unavailable(
+        "the Kubernetes apiserver is throttling; the retry adopts the same warm-pool slot",
+    )
+    .with_retry_after_header(ADOPTION_LABEL_THROTTLED_RETRY)
+    .with_retry_after_cause(ControllerRetryAfterCause::PoolSlotRelease)
+}
 
 fn admitted_pool_slot_release_pending() -> ControllerError {
     ControllerError::service_unavailable(

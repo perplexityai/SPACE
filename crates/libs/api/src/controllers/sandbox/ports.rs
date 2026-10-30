@@ -620,8 +620,9 @@ impl SandboxController {
                 sandbox,
                 ExecutionActivityKind::Access,
                 DEFAULT_BLOCKING_WAIT_TIMEOUT,
-                crate::controllers::substrate::RecoveryCharge::enforce(
+                super::lifecycle::implicit_activation_charge(
                     self.cluster_admission.as_ref(),
+                    sandbox,
                 ),
             )
             .await?;

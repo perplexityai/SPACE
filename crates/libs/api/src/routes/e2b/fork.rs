@@ -230,6 +230,9 @@ pub(super) async fn fork_sandbox(
                                 federated_owner,
                                 federated_service_grant: federated_service_grant.as_ref(),
                                 idempotency_key: &idempotency_key,
+                                client_id: &pplx_space_common_core::types::ClientId::from_header(
+                                    client_id.as_deref(),
+                                ),
                             },
                         )
                         .await

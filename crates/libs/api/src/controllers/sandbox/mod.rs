@@ -1136,6 +1136,12 @@ impl SandboxController {
         self.substrate.capabilities()
     }
 
+    /// Whether this deployment records activating clients (see
+    /// [`super::substrate::ActivationClientAttribution`]).
+    pub fn activation_client_attribution(&self) -> super::substrate::ActivationClientAttribution {
+        self.substrate.activation_client_attribution()
+    }
+
     pub async fn set_node_schedulability(
         &self,
         request: super::substrate::NodeSchedulabilityRequest<'_>,
@@ -1242,9 +1248,7 @@ impl SandboxController {
                 metric_identity,
                 sandbox,
                 DEFAULT_BLOCKING_WAIT_TIMEOUT,
-                crate::controllers::substrate::RecoveryCharge::enforce(
-                    self.cluster_admission.as_ref(),
-                ),
+                lifecycle::implicit_activation_charge(self.cluster_admission.as_ref(), sandbox),
             )
             .await
         {

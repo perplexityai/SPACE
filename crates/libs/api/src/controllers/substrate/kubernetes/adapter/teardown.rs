@@ -211,6 +211,10 @@ impl KubernetesSubstrate {
                     sandbox_id,
                     &current_execution_identity(&active, live_pod.as_deref()),
                     observed_uid,
+                    live_pod
+                        .as_deref()
+                        .and_then(SandboxPodView::client_id)
+                        .as_ref(),
                 )
                 .await;
             }
@@ -287,10 +291,11 @@ impl KubernetesSubstrate {
         sandbox_id: SandboxId,
         identity: &ExecutionIdentity,
         observed_uid: &str,
+        observed_client: Option<&pplx_space_common_core::types::ClientId>,
     ) {
         match self
             .store
-            .backfill_missing_pod_uid(sandbox_id, identity, observed_uid)
+            .backfill_missing_pod_uid(sandbox_id, identity, observed_uid, observed_client)
             .await
         {
             Ok(_) => tracing::info!(
@@ -514,8 +519,13 @@ impl KubernetesSubstrate {
                         })?
             {
                 if let Some(observed_uid) = materialized.uid() {
-                    self.hydrate_materialized_pod_uid(sandbox_id, &fenced.identity, observed_uid)
-                        .await;
+                    self.hydrate_materialized_pod_uid(
+                        sandbox_id,
+                        &fenced.identity,
+                        observed_uid,
+                        materialized.client_id().as_ref(),
+                    )
+                    .await;
                 }
                 return Ok(self.refuse_fenced_teardown(
                     sandbox_id,

@@ -28,8 +28,11 @@ fn activation_assignment_retains_the_database_canonical_id_across_clones() {
     let assigned_id = SandboxActivationAttemptId::from_uuid(
         Uuid::parse_str("019c0000-0000-7000-8000-000000000002").unwrap(),
     );
-    let assignment =
-        ActivationAttemptAssignment::new(requested_id, SandboxTransitionTargetState::Started);
+    let assignment = ActivationAttemptAssignment::new(
+        requested_id,
+        SandboxTransitionTargetState::Started,
+        crate::controllers::substrate::KeyResolution::Unresolved,
+    );
 
     assignment.clone().record_assigned(assigned_id, 1);
 
@@ -633,11 +636,11 @@ fn kube_api_server_error_maps_to_retryable_substrate_timeout() {
 async fn delete_throttling_retry_retries_429_until_success() {
     let calls = Arc::new(AtomicUsize::new(0));
 
-    let result = retry_kube_delete_throttling("test_delete", || {
+    let result = retry_kube_throttling("test_delete", || {
         let calls = Arc::clone(&calls);
         async move {
             let prior = calls.fetch_add(1, Ordering::SeqCst);
-            if prior + 1 < K8S_THROTTLE_DELETE_RETRY_ATTEMPTS {
+            if prior + 1 < K8S_THROTTLE_RETRY_ATTEMPTS {
                 Err(kube_api_error(429))
             } else {
                 Ok(())
@@ -647,17 +650,14 @@ async fn delete_throttling_retry_retries_429_until_success() {
     .await;
 
     result.unwrap();
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        K8S_THROTTLE_DELETE_RETRY_ATTEMPTS
-    );
+    assert_eq!(calls.load(Ordering::SeqCst), K8S_THROTTLE_RETRY_ATTEMPTS);
 }
 
 #[tokio::test]
 async fn delete_throttling_retry_stops_after_bounded_429_budget() {
     let calls = Arc::new(AtomicUsize::new(0));
 
-    let result = retry_kube_delete_throttling("test_delete", || {
+    let result = retry_kube_throttling("test_delete", || {
         let calls = Arc::clone(&calls);
         async move {
             calls.fetch_add(1, Ordering::SeqCst);
@@ -667,17 +667,14 @@ async fn delete_throttling_retry_stops_after_bounded_429_budget() {
     .await;
 
     assert!(matches!(result, Err(ref err) if is_kube_api_throttling_error(err)));
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        K8S_THROTTLE_DELETE_RETRY_ATTEMPTS
-    );
+    assert_eq!(calls.load(Ordering::SeqCst), K8S_THROTTLE_RETRY_ATTEMPTS);
 }
 
 #[tokio::test]
 async fn delete_throttling_retry_does_not_retry_non_429_errors() {
     let calls = Arc::new(AtomicUsize::new(0));
 
-    let result = retry_kube_delete_throttling("test_delete", || {
+    let result = retry_kube_throttling("test_delete", || {
         let calls = Arc::clone(&calls);
         async move {
             calls.fetch_add(1, Ordering::SeqCst);
