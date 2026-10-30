@@ -287,17 +287,20 @@ async fn admit_inline_round(
         let result = store
             .begin_operation_admission(org_id, ApiProduct::Native, &idempotency)
             .await?
-            .create_claimed_if_sole_active(CreatePublicOperation {
-                org_id,
-                actor_user_id: None,
-                api_product: ApiProduct::Native,
-                kind,
-                target_type: Some(pplx_space_public_api::OperationTargetType::Sandbox),
-                target_id: Some(sandbox),
-                payload_json: serde_json::json!({}),
-                idempotency: Some(idempotency.clone()),
-                traceparent: None,
-            })
+            .create_claimed_if_sole_active(
+                CreatePublicOperation {
+                    org_id,
+                    actor_user_id: None,
+                    api_product: ApiProduct::Native,
+                    kind,
+                    target_type: Some(pplx_space_public_api::OperationTargetType::Sandbox),
+                    target_id: Some(sandbox),
+                    payload_json: serde_json::json!({}),
+                    idempotency: Some(idempotency.clone()),
+                    traceparent: None,
+                },
+                None,
+            )
             .await?;
         match result {
             CreateInlinePublicOperationResult::Claimed {
@@ -325,7 +328,9 @@ async fn admit_inline_round(
                     .await
                 });
             }
-            CreateInlinePublicOperationResult::Queued(operation_id) => recorded.push(operation_id),
+            CreateInlinePublicOperationResult::Queued(operation_id, _) => {
+                recorded.push(operation_id)
+            }
             CreateInlinePublicOperationResult::NotCreated(other) => {
                 panic!("a new key records an operation: {other:?}")
             }

@@ -14,9 +14,11 @@
 //! grace period), and no new work once the process drains or when it has no
 //! route-signing authority to execute with. A route that cannot get a permit
 //! records its operation queued for the dispatcher, exactly as it would with
-//! inline execution off.
+//! inline execution off. Across processes, [`InlineOrgLimit`] bounds what one
+//! organization runs inline; admission checks it as it claims.
 
 use std::future::Future;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -32,7 +34,9 @@ use crate::public_operation_driver::{
     OperationExecutionConfig, OperationExecutionResult, OperationExecutor,
     drive_deferrable_operation, execution_span,
 };
-use crate::public_operations::{ClaimedPublicOperation, PublicOperationStore};
+use crate::public_operations::{
+    ClaimedPublicOperation, InlineOrgLimit, InlineQueueReason, PublicOperationStore,
+};
 
 /// Inline executions one API process runs at once; `0` turns inline
 /// execution off entirely, including warm-pool creates.
@@ -43,18 +47,24 @@ const MAX_INLINE_MAX_CONCURRENT: usize = 1024;
 /// The metrics agent keeps a gauge's last value per flush, so a sample is at
 /// most this old when it is sent.
 const SLOT_REPORT_INTERVAL: Duration = Duration::from_secs(1);
+/// Inline executions one organization may hold at once across every API
+/// process; unset or `0` sets no limit.
+pub const INLINE_ORG_LIMIT_ENV: &str = "SPACE_NATIVE_INLINE_ORG_LIMIT";
 
 /// The environment's inline settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InlineOperationsConfig {
     /// `SPACE_NATIVE_INLINE_MAX_CONCURRENT`.
     pub max_concurrent: usize,
+    /// `SPACE_NATIVE_INLINE_ORG_LIMIT`, `None` (no limit) by default.
+    pub org_limit: Option<NonZeroU32>,
 }
 
 impl Default for InlineOperationsConfig {
     fn default() -> Self {
         Self {
             max_concurrent: DEFAULT_INLINE_MAX_CONCURRENT,
+            org_limit: None,
         }
     }
 }
@@ -64,7 +74,8 @@ impl InlineOperationsConfig {
         Self::from_environment(&pplx_space_common_core::env::ProcessEnvironment)
     }
 
-    /// A malformed limit keeps the default, and one above 1024 is capped.
+    /// A malformed limit keeps the default, and one above 1024 is capped. A
+    /// malformed organization limit sets none, with a warning.
     pub fn from_environment(env: &dyn pplx_space_common_core::env::Environment) -> Self {
         let default = Self::default();
         Self {
@@ -75,6 +86,22 @@ impl InlineOperationsConfig {
                 .map_or(default.max_concurrent, |limit| {
                     limit.min(MAX_INLINE_MAX_CONCURRENT)
                 }),
+            org_limit: env.var(INLINE_ORG_LIMIT_ENV).ok().and_then(|raw| {
+                let raw = raw.trim();
+                if raw.is_empty() {
+                    return None;
+                }
+                match raw.parse::<u32>() {
+                    Ok(limit) => NonZeroU32::new(limit),
+                    Err(_) => {
+                        tracing::warn!(
+                            value = raw,
+                            "{INLINE_ORG_LIMIT_ENV} is not a number; no organization limit is set"
+                        );
+                        None
+                    }
+                }
+            }),
         }
     }
 }
@@ -91,8 +118,21 @@ pub enum InlineRefusal {
     Draining,
     /// Every permit is held.
     Saturated,
+    /// Other work for the operation's sandbox is queued or running.
+    Busy,
+    /// The organization is at its [`InlineOrgLimit`].
+    OrgLimit,
     /// An idempotent replay, which records nothing new.
     Replay,
+}
+
+impl From<InlineQueueReason> for InlineRefusal {
+    fn from(reason: InlineQueueReason) -> Self {
+        match reason {
+            InlineQueueReason::Busy => Self::Busy,
+            InlineQueueReason::OrgLimit => Self::OrgLimit,
+        }
+    }
 }
 
 impl InlineRefusal {
@@ -102,6 +142,8 @@ impl InlineRefusal {
             Self::RouteSigningMissing => InlineAdmissionReason::RouteSigningMissing,
             Self::Draining => InlineAdmissionReason::Draining,
             Self::Saturated => InlineAdmissionReason::Saturated,
+            Self::Busy => InlineAdmissionReason::Busy,
+            Self::OrgLimit => InlineAdmissionReason::OrgLimit,
             Self::Replay => InlineAdmissionReason::Replay,
         }
     }
@@ -162,6 +204,15 @@ impl InlineOperations {
                 execution,
             }),
         }
+    }
+
+    /// The organization limit admission holds an inline claim to, with this
+    /// process's claim staleness; `None` sets none.
+    pub fn org_limit(&self) -> Option<InlineOrgLimit> {
+        self.inner.config.org_limit.map(|limit| InlineOrgLimit {
+            limit,
+            claim_stale_after: self.inner.execution.claim_stale_after,
+        })
     }
 
     /// A permit to run one operation offered on `path` inline, taken before

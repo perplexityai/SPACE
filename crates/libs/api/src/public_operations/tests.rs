@@ -795,7 +795,7 @@ async fn admission_claims_a_new_operation_only_on_an_otherwise_idle_sandbox() ->
         let recorded = store
             .begin_operation_admission(org_id, ApiProduct::Native, &idempotency)
             .await?
-            .create_claimed_if_sole_active(input())
+            .create_claimed_if_sole_active(input(), None)
             .await?;
         let operation_id = match (claimed, recorded) {
             (
@@ -826,7 +826,10 @@ async fn admission_claims_a_new_operation_only_on_an_otherwise_idle_sandbox() ->
                 );
                 operation.id
             }
-            (false, CreateInlinePublicOperationResult::Queued(operation_id)) => {
+            (
+                false,
+                CreateInlinePublicOperationResult::Queued(operation_id, InlineQueueReason::Busy),
+            ) => {
                 assert_eq!(
                     operation_state_and_attempts(&db.pool, operation_id).await?,
                     ("queued".to_string(), 0),
@@ -841,7 +844,7 @@ async fn admission_claims_a_new_operation_only_on_an_otherwise_idle_sandbox() ->
         let replay = store
             .begin_operation_admission(org_id, ApiProduct::Native, &idempotency)
             .await?
-            .create_claimed_if_sole_active(input())
+            .create_claimed_if_sole_active(input(), None)
             .await?;
         assert!(
             matches!(
@@ -888,17 +891,20 @@ async fn an_admission_claim_is_stamped_when_taken_not_when_its_transaction_began
             let recorded = store
                 .begin_operation_admission(org_id, ApiProduct::Native, &idempotency)
                 .await?
-                .create_claimed_if_sole_active(CreatePublicOperation {
-                    org_id,
-                    actor_user_id: None,
-                    api_product: ApiProduct::Native,
-                    kind: OperationKind::StopSandbox,
-                    target_type: Some(OperationTargetType::Sandbox),
-                    target_id: Some(&target_id),
-                    payload_json: serde_json::json!({}),
-                    idempotency: Some(idempotency.clone()),
-                    traceparent: None,
-                })
+                .create_claimed_if_sole_active(
+                    CreatePublicOperation {
+                        org_id,
+                        actor_user_id: None,
+                        api_product: ApiProduct::Native,
+                        kind: OperationKind::StopSandbox,
+                        target_type: Some(OperationTargetType::Sandbox),
+                        target_id: Some(&target_id),
+                        payload_json: serde_json::json!({}),
+                        idempotency: Some(idempotency.clone()),
+                        traceparent: None,
+                    },
+                    None,
+                )
                 .await?;
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(recorded)
         }
@@ -943,6 +949,7 @@ async fn an_implicit_wake_is_claimed_only_when_created_on_an_idle_sandbox() -> T
             &target_id,
             serde_json::json!({"action": "wake"}),
             None,
+            None,
         )
     };
 
@@ -974,7 +981,8 @@ async fn an_implicit_wake_is_claimed_only_when_created_on_an_idle_sandbox() -> T
         create_test_operation_for_target(&store, org_id, OperationKind::SuspendSandbox, &target_id)
             .await?
             .expect_created();
-    let CreateInlinePublicOperationResult::Queued(behind) = wake().await? else {
+    let CreateInlinePublicOperationResult::Queued(behind, InlineQueueReason::Busy) = wake().await?
+    else {
         panic!("a wake behind a queued suspend stays queued");
     };
     assert_eq!(
@@ -985,6 +993,139 @@ async fn an_implicit_wake_is_claimed_only_when_created_on_an_idle_sandbox() -> T
         operation_state_and_attempts(&db.pool, behind).await?,
         ("queued".to_string(), 0)
     );
+    Ok(())
+}
+
+/// Admission claims a new operation for inline execution only while its
+/// organization has fewer than its limit of live inline claims other than
+/// teardowns. Dispatcher claims, stale claims, finished ones and another
+/// organization's don't count.
+#[tokio::test]
+async fn admission_holds_an_organization_to_its_inline_limit() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let other_org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let org_limit = InlineOrgLimit {
+        limit: NonZeroU32::new(2).expect("nonzero"),
+        claim_stale_after: Duration::from_secs(60),
+    };
+    let admit = |org_id: OrgId, kind: OperationKind| {
+        let store = store.clone();
+        async move {
+            let key = IdempotencyKey::parse(Uuid::now_v7().to_string())?;
+            let fingerprint = RequestFingerprint::parse("e".repeat(64))?;
+            let idempotency = CreatePublicOperationIdempotency {
+                method: HttpOperationMethod::Post,
+                path_template: OperationPathTemplate::new("/v1/sandboxes/{sandbox_id}:wake"),
+                key: &key,
+                request_fingerprint: &fingerprint,
+            };
+            let target_id = PublicSandboxId::new().to_string();
+            let recorded = store
+                .begin_operation_admission(org_id, ApiProduct::Native, &idempotency)
+                .await?
+                .create_claimed_if_sole_active(
+                    CreatePublicOperation {
+                        org_id,
+                        actor_user_id: None,
+                        api_product: ApiProduct::Native,
+                        kind,
+                        target_type: Some(OperationTargetType::Sandbox),
+                        target_id: Some(&target_id),
+                        payload_json: serde_json::json!({}),
+                        idempotency: Some(idempotency.clone()),
+                        traceparent: None,
+                    },
+                    Some(org_limit),
+                )
+                .await?;
+            TestResult::<CreateInlinePublicOperationResult>::Ok(recorded)
+        }
+    };
+    let claimed = |recorded: CreateInlinePublicOperationResult| match recorded {
+        CreateInlinePublicOperationResult::Claimed {
+            claim_token,
+            operation,
+        } => (claim_token, operation.id),
+        other => panic!("expected an inline claim, got {other:?}"),
+    };
+    let wake = OperationKind::WakeSandbox;
+
+    // None of these count: a dispatcher claim, a teardown claimed inline,
+    // an inline claim gone stale, and one that finished.
+    create_test_operation_for_target(&store, org_id, wake, &PublicSandboxId::new().to_string())
+        .await?
+        .expect_created();
+    assert_eq!(claim_wakes(&store).await?.operations.len(), 1);
+    claimed(admit(org_id, OperationKind::DeleteSandbox).await?);
+    let (_, stale) = claimed(admit(org_id, wake).await?);
+    sqlx::query(sql!(
+        "UPDATE public_operations
+         SET claimed_at = NOW() - INTERVAL '10 minutes'
+         WHERE operation_id = $1"
+    ))
+    .bind(stale.as_uuid())
+    .execute(&db.pool)
+    .await?;
+    let (finished_token, finished) = claimed(admit(org_id, wake).await?);
+    assert!(
+        store
+            .complete_claimed_operation(CompleteClaimedPublicOperation {
+                claim_token: finished_token,
+                operation_id: finished,
+                progress_message: "woken".to_string(),
+                result_json: serde_json::json!({}),
+            })
+            .await?
+    );
+
+    // Two live inline claims reach the limit.
+    let (first_token, first) = claimed(admit(org_id, wake).await?);
+    claimed(admit(org_id, wake).await?);
+    let CreateInlinePublicOperationResult::Queued(held, InlineQueueReason::OrgLimit) =
+        admit(org_id, wake).await?
+    else {
+        panic!("an organization at its limit has its operation queued");
+    };
+    assert_eq!(
+        operation_state_and_attempts(&db.pool, held).await?,
+        ("queued".to_string(), 0)
+    );
+    let system_wake = store
+        .create_or_join_active_sandbox_wake_claimed_if_sole_active(
+            org_id,
+            &PublicSandboxId::new().to_string(),
+            serde_json::json!({"action": "wake"}),
+            None,
+            Some(org_limit),
+        )
+        .await?;
+    assert!(
+        matches!(
+            system_wake,
+            CreateInlinePublicOperationResult::Queued(_, InlineQueueReason::OrgLimit)
+        ),
+        "{system_wake:?}"
+    );
+
+    // Another organization is not held to it.
+    claimed(admit(other_org_id, wake).await?);
+
+    // Once one of its claims finishes, the organization has room again.
+    assert!(
+        store
+            .complete_claimed_operation(CompleteClaimedPublicOperation {
+                claim_token: first_token,
+                operation_id: first,
+                progress_message: "woken".to_string(),
+                result_json: serde_json::json!({}),
+            })
+            .await?
+    );
+    claimed(admit(org_id, wake).await?);
     Ok(())
 }
 
