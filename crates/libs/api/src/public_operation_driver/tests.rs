@@ -39,3 +39,49 @@ fn execution_config_reads_the_dispatchers_settings() {
         );
     }
 }
+
+/// Each outcome is read from the report of the recording that produces it;
+/// the match fails the build until a new outcome has its report here.
+#[test]
+fn an_execution_outcome_is_read_from_the_report_that_records_it() {
+    let outcomes = [
+        ExecutionOutcome::Succeeded,
+        ExecutionOutcome::Failed,
+        ExecutionOutcome::Requeued,
+        ExecutionOutcome::Canceled,
+        ExecutionOutcome::Lost,
+        ExecutionOutcome::Error,
+    ];
+    for outcome in outcomes {
+        let report: Result<TickReport, ()> = match outcome {
+            ExecutionOutcome::Succeeded => Ok(TickReport {
+                succeeded: 1,
+                ..TickReport::default()
+            }),
+            ExecutionOutcome::Failed => Ok(TickReport {
+                failed: 1,
+                ..TickReport::default()
+            }),
+            ExecutionOutcome::Requeued => Ok(TickReport {
+                retried: 1,
+                ..TickReport::default()
+            }),
+            ExecutionOutcome::Canceled => Ok(TickReport {
+                canceled: 1,
+                ..TickReport::default()
+            }),
+            // The result was not recorded: the claim was taken meanwhile.
+            ExecutionOutcome::Lost => Ok(TickReport {
+                stale_claims: 1,
+                ..TickReport::default()
+            }),
+            ExecutionOutcome::Error => Err(()),
+        };
+        assert_eq!(execution_outcome(&report), outcome, "{report:?}");
+    }
+    // A renewal that finds the claim taken returns before recording anything.
+    assert_eq!(
+        execution_outcome::<()>(&Ok(TickReport::default())),
+        ExecutionOutcome::Lost
+    );
+}

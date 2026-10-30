@@ -22,6 +22,7 @@ use crate::public_operations::{
 use crate::public_sandbox_operations::PublicOperationExecutionResult;
 use crate::retry_deferral::RetryDeferral;
 
+use pplx_space_metrics::operations::ExecutionOutcome;
 pub use pplx_space_metrics::operations::OperationExecutor;
 
 /// How long a claim may go unrenewed before the dispatcher reclaims it.
@@ -296,6 +297,8 @@ where
 ///
 /// A Native M1 operation of [`NATIVE_M1_EXPIRING_KINDS`] first claimed when
 /// already older than the deadline is recorded `expired` without running.
+/// Every other claim records `operations.execution_ms`, from here to the
+/// recorded outcome, unless the caller stops polling first.
 pub async fn drive_claimed_operation<F>(
     store: PublicOperationStore,
     claim_token: String,
@@ -312,7 +315,6 @@ where
     let api_product_label = api_product.as_str();
     let kind = operation.kind;
     let attempts = operation.attempts;
-    let executor_label = executor.as_str();
     if let Some(max_age) = config.m1_max_age
         && expires_unrun(api_product, kind)
         && let Some(age_secs) = operation.age_at_first_claim_secs
@@ -345,11 +347,56 @@ where
                 "public operation expired at claim: older than the M1 terminalization deadline"
             );
         } else {
-            record_lost_claim(&mut report, api_product_label, kind, operation_id);
+            record_lost_claim(&mut report, api_product_label, kind, executor, operation_id);
         }
         return Ok(report);
     }
-    pplx_space_metrics::operations::claimed_by(api_product_label, kind.as_str(), executor_label);
+    pplx_space_metrics::operations::claimed_by(api_product_label, kind.as_str(), executor.as_str());
+    let started_at = Instant::now();
+    let report =
+        execute_and_record(store, claim_token, config, operation, executor, execution).await;
+    pplx_space_metrics::operations::execution(
+        api_product_label,
+        kind.as_str(),
+        executor,
+        execution_outcome(&report),
+        started_at,
+    );
+    report
+}
+
+/// How one execution [`execute_and_record`] ran ended, read from its report.
+fn execution_outcome<E>(report: &Result<TickReport, E>) -> ExecutionOutcome {
+    match report {
+        Err(_) => ExecutionOutcome::Error,
+        Ok(report) if report.succeeded > 0 => ExecutionOutcome::Succeeded,
+        Ok(report) if report.failed > 0 => ExecutionOutcome::Failed,
+        Ok(report) if report.retried > 0 => ExecutionOutcome::Requeued,
+        Ok(report) if report.canceled > 0 => ExecutionOutcome::Canceled,
+        // A lost record counts a stale claim; a lost renewal counts nothing.
+        Ok(_) => ExecutionOutcome::Lost,
+    }
+}
+
+/// The execution half of [`drive_claimed_operation`]: run `execution` under
+/// the renewed claim, then record its result.
+async fn execute_and_record<F>(
+    store: PublicOperationStore,
+    claim_token: String,
+    config: OperationExecutionConfig,
+    operation: ClaimedPublicOperation,
+    executor: OperationExecutor,
+    execution: F,
+) -> Result<TickReport, PublicOperationStoreError>
+where
+    F: Future<Output = OperationExecutionResult>,
+{
+    let operation_id = operation.id;
+    let api_product = operation.api_product;
+    let api_product_label = api_product.as_str();
+    let kind = operation.kind;
+    let attempts = operation.attempts;
+    let executor_label = executor.as_str();
     let renew_every = claim_renewal_interval(config.claim_stale_after);
     let mut renewal = tokio::time::interval(renew_every);
     renewal.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -424,6 +471,7 @@ where
                     api_product_label,
                     kind.as_str(),
                     &terminal_error_label,
+                    executor,
                 );
                 pplx_space_metrics::operations::completed_by(
                     api_product_label,
@@ -526,6 +574,7 @@ where
                         api_product_label,
                         kind.as_str(),
                         terminal_error_code.as_str(),
+                        executor,
                     );
                     pplx_space_metrics::operations::completed_by(
                         api_product_label,
@@ -620,6 +669,7 @@ where
                         api_product_label,
                         kind.as_str(),
                         terminal_error_code.as_str(),
+                        executor,
                     );
                     pplx_space_metrics::operations::completed_by(
                         api_product_label,
@@ -667,6 +717,7 @@ where
                             api_product_label,
                             kind.as_str(),
                             retry_reason,
+                            executor,
                         );
                     }
                     ReleasedClaim::Superseded { delete_id } => {
@@ -691,7 +742,7 @@ where
     };
 
     if !updated {
-        record_lost_claim(&mut report, api_product_label, kind, operation_id);
+        record_lost_claim(&mut report, api_product_label, kind, executor, operation_id);
     }
 
     Ok(report)
@@ -719,10 +770,11 @@ fn record_lost_claim(
     report: &mut TickReport,
     api_product_label: &str,
     kind: OperationKind,
+    executor: OperationExecutor,
     operation_id: OperationId,
 ) {
     report.stale_claims += 1;
-    pplx_space_metrics::operations::stale_claim(api_product_label, kind.as_str());
+    pplx_space_metrics::operations::stale_claim(api_product_label, kind.as_str(), executor);
     tracing::warn!(
         operation_id = %operation_id,
         "public operation claim was lost before completion update"
