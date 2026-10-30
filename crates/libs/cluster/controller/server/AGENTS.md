@@ -26,8 +26,10 @@ Every table named here is in the control-plane Postgres store.
   `'k8s'`/`'space'` literal, bound from `substrate.managed_by()` when it scopes
   to the running substrate's rows, or a fixed `SubstrateKind` when it targets
   one substrate (the Kubernetes arm of `run_reconcilers`;
-  `tombstone_retention`'s Direct tombstones). For what Direct lacks, see the
-  [Direct substrate contract](../../../api/src/controllers/substrate/AGENTS.md#direct-substrate-contract).
+  `tombstone_retention`'s Direct tombstones).
+- A new loop over sandbox or node state runs for both substrates; see the
+  [substrate contract](../../../api/src/controllers/substrate/AGENTS.md#substrate-contract).
+  Direct's gaps are in the `direct.rs` module doc.
 - `stuck_container_creating_gc` reads the `orphaned_sandboxes` and
   transient-lifecycle sweeper configs and runs only when both would retire
   the rows of the pods it deletes; changing those readers changes its gate.

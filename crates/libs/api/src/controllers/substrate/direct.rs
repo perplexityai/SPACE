@@ -9,26 +9,31 @@
 //!   [`SubstrateAdapter`]. Stop, kill, pause/resume and checkpoint go through
 //!   the shared controller over Direct's runtime clients, which never recreate
 //!   an execution.
-//! - Warm-pool claims adopt node-side; custom vcpu/memory or encrypted claims
-//!   go cold. Admission-time pool slot claims always miss.
-//! - [`SubstrateError::Unsupported`]: node-pool placement, forks, and cluster
-//!   pool configs. Custom vCPU or memory uses separate create and start calls:
-//!   only `StartRequest` carries those fields. A readiness wait still blocks
-//!   on start. Default shapes and disk-only overrides can use one-shot create,
+//! - Warm-pool claims adopt node-side.
+//! - Custom vCPU or memory uses separate create and start calls: only
+//!   `StartRequest` carries those fields. A readiness wait still blocks on
+//!   start. Default shapes and disk-only overrides can use one-shot create,
 //!   whose `CreateRequest` forwards disk size as `rootfs_size_mb`.
 //! - No-ops returning `None` or nothing: `sandbox_ip`, `access_sandbox_ip`,
 //!   `list_inventory_nodes` (Postgres is the inventory),
 //!   `retire_fence_mismatch` and `observe_pod_identities`.
-//!   `retire_execution` ignores its fence, but still stops the sandbox and
-//!   clears its routing. It enqueues no stopped-disk backup (see below); the
-//!   stopped disk stays on the node.
 //! - Direct-only: the node registry and the template pull and delete routes in
 //!   `routes/admin/node_maintenance.rs` (501 on Kubernetes).
-//! - No drain or evacuation ([`SubstrateCapabilities::supports_node_drain`]
-//!   is false). Admin `:drain`, `:terminate`, `:cordon`, `:uncordon` and
-//!   `:force-upload-local-snapshots` return 501 before reading or writing the
-//!   node. `:undrain` is the way out of a `draining` or `drained` phase an
-//!   earlier drain left: it clears it without a substrate call.
+//!
+//! # Gaps
+//!
+//! | Refused or missing | Effect today | Removed by |
+//! |---|---|---|
+//! | Node-pool placement | [`SubstrateError::Unsupported`]: a create naming a node pool is refused | Node-pool membership for registered nodes, read by core placement |
+//! | Forks (restoring a durable fork disk as a new sandbox) | `Unsupported`: the create is refused | A Direct launch that stages the fork disk on the chosen node |
+//! | Cluster pool configs (`list_pool_configs`, `upsert_pool_config`, `disable_pool_config`) | `Unsupported` from the trait defaults | Pool-config handling in the core for both substrates |
+//! | Warm-pool claims with custom vCPU or memory, or with volume encryption | The claim misses and the create boots cold | Pool members of that shape, or an adoption that applies it |
+//! | Admission-time pool slot claims (`claim_admission_pool_slot`) | Always miss | A Direct warm-pool slot store the core claims from at admission |
+//! | Retire fence | `retire_execution` ignores its fence, but still stops the sandbox and clears its routing | A fence check against the Direct execution it names |
+//! | Stopped-disk backup on retire | `retire_execution` enqueues none; the stopped disk stays on the node (see below) | A retried Direct retire (next row), then the enqueue |
+//! | Retire retry | Nothing retries a failed Direct retire (see below) | The sweeper's failed-cleanup retry running for both substrates |
+//! | Drain and evacuation | [`SubstrateCapabilities::supports_node_drain`] is false. Admin `:drain`, `:terminate`, `:cordon`, `:uncordon` and `:force-upload-local-snapshots` return 501 before reading or writing the node. `:undrain` clears a `draining` or `drained` phase an earlier drain left, without a substrate call | Core drain and evacuation for both substrates over a Direct `set_node_schedulability` |
+//! | Drain, orphan, failed-row repair and node-sync loops | Not started on Direct (below) | Those loops running for both substrates through the adapter |
 //!
 //! # Kubernetes-only reconcilers
 //!

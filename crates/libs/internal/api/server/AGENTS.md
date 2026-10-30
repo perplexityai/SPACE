@@ -4,7 +4,7 @@ Every table named here is in the control-plane Postgres store.
 
 Before changing code that branches on the substrate or names a Direct-only
 table (`node_direct`, `sandbox_direct_route_*`), read the
-[Direct substrate contract](../../../api/src/controllers/substrate/AGENTS.md#direct-substrate-contract).
+[substrate contract](../../../api/src/controllers/substrate/AGENTS.md#substrate-contract).
 
 ## Changes
 
