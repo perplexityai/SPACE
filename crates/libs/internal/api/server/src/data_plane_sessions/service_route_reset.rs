@@ -36,16 +36,21 @@ pub(crate) async fn reset_sandbox_service_route(
         .await
         .map_err(|error| Status::internal(format!("begin reset sandbox service route: {error}")))?;
 
+    // The caller's generation is the one the service-route resolver handed
+    // out, so it is resolved as the shared route readers resolve it: a Direct
+    // sandbox has no execution row, and its generation is its route identity's.
     let reset = sqlx::query_as::<_, UnstableResetSandboxServiceRouteRow>(sql!(
         "WITH current_route AS (
              SELECT s.id AS sandbox_id, s.active_node_id
              FROM sandboxes s
-             JOIN sandbox_k8s_executions e
+             LEFT JOIN sandbox_k8s_executions e
                ON e.sandbox_id = s.id
               AND e.active
-              AND e.generation = $3
+             LEFT JOIN sandbox_direct_route_identities direct_route
+               ON direct_route.sandbox_id = s.id
              WHERE s.id = $1
                AND s.active_node_id IS NOT NULL
+               AND COALESCE(e.generation, direct_route.execution_generation) = $3
          ),
          updated AS (
              UPDATE sandbox_port_exposures spe

@@ -120,6 +120,7 @@
 "crates/libs/cluster/controller/server/src/tombstone_retention.rs" = 2
 "crates/libs/cluster/trigger-queue/src/lib.rs" = 1
 "crates/libs/internal/api/server/src/data_plane_sessions/route_rows.rs" = 7
+"crates/libs/internal/api/server/src/data_plane_sessions/service_route_reset.rs" = 1
 "crates/libs/internal/api/server/src/lib.rs" = 1
 "crates/libs/internal/api/server/src/published_state.rs" = 4
 "crates/libs/sandbox/store/src/lib.rs" = 2
