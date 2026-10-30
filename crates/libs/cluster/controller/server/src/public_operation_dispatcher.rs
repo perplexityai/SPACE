@@ -262,10 +262,14 @@ impl NativePublicOperationExecutor {
             pool,
             substrate.clone(),
             ClusterSandboxAdmission::with_config(
-                substrate,
+                substrate.clone(),
                 ClusterSandboxAdmissionConfig::from_env(),
+                feature_flags.clone(),
+            )
+            .with_live_cap(pplx_space_api::client_live_cap::ClientLiveCap::new(
+                substrate,
                 feature_flags,
-            ),
+            )),
             route_ed25519_authority,
             grant_audience,
             tls_interception_exemptions,

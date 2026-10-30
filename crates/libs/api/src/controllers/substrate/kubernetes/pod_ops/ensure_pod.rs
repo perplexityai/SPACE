@@ -2,6 +2,15 @@
 //! helpers.
 
 use super::*;
+use crate::controllers::substrate::CapPolicy;
+
+/// Let a live-cap reservation lapse after one TTL instead of releasing it: a
+/// pod may exist that the reflectors haven't shown yet.
+fn keep_live(live: Option<crate::client_live_cap::LiveReservation>) {
+    if let Some(live) = live {
+        live.keep();
+    }
+}
 
 /// Derive the per-restore placement decision a [`PodCreateContext`] renders,
 /// for the `sandbox.restore.placement` metric. `None` for non-restore creates
@@ -158,6 +167,25 @@ impl KubernetesSubstrate {
         plan.is_ok()
     }
 
+    /// The live cap's `Check` point, for a charge whose cap this pod creation
+    /// decides: `Check`, or `ReserveAtClaim` on a call that claimed no lease.
+    /// Hold the reservation until the pod create returns.
+    async fn check_live_cap_for_pod_create(
+        &self,
+        charge: Option<&RecoveryCharge>,
+        sandbox: &Sandbox,
+    ) -> Result<Option<crate::client_live_cap::LiveReservation>, SubstrateError> {
+        let Some(charge) = charge else {
+            return Ok(None);
+        };
+        if !matches!(charge.cap(), CapPolicy::Check | CapPolicy::ReserveAtClaim) {
+            return Ok(None);
+        }
+        charge
+            .reserve_live_cap(sandbox.id, sandbox.activating_client_id.as_ref())
+            .await
+    }
+
     pub(in crate::controllers::substrate::kubernetes) async fn ensure_pod_exists(
         &self,
         sandbox: &Sandbox,
@@ -170,6 +198,7 @@ impl KubernetesSubstrate {
             started_recovery,
             restore_lease_token,
             activation_attempt,
+            charge,
         } = ownership;
         let started_recovery_owner_generation =
             started_recovery.map(StartedRecoveryOwnership::generation);
@@ -492,23 +521,43 @@ impl KubernetesSubstrate {
                     }
                 };
                 if outcome == Some(SchedulingOutcome::Unschedulable) {
+                    // The re-drive replaces a pod an earlier activation
+                    // created, so it's this activation's pod creation: the
+                    // live cap checks it first.
+                    let live = self
+                        .check_live_cap_for_pod_create(charge.as_ref(), &sandbox)
+                        .await?;
                     // Boxed so this already-huge async fn's stack frame embeds
                     // only a pointer, not the re-drive sub-future. The re-drive
                     // itself re-verifies the pod with an authoritative GET
                     // before any teardown.
-                    match Box::pin(self.redrive_unschedulable_restore_cross_node_recorded(
-                        pplx_space_metrics::sandbox::restore::RedrivePath::Retry,
-                        &sandbox,
-                        &claim,
-                        claim_lifecycle,
-                        suspend_restore_source_node,
-                        suspend_restore_storage_uri,
-                        restore_lease_token,
-                        pod_client.as_ref(),
-                    ))
-                    .await?
-                    {
+                    let redriven =
+                        Box::pin(self.redrive_unschedulable_restore_cross_node_recorded(
+                            pplx_space_metrics::sandbox::restore::RedrivePath::Retry,
+                            &sandbox,
+                            &claim,
+                            claim_lifecycle,
+                            suspend_restore_source_node,
+                            suspend_restore_storage_uri,
+                            restore_lease_token,
+                            pod_client.as_ref(),
+                        ))
+                        .await;
+                    // A failed re-drive may have left its successor pod
+                    // behind (an unconfirmed create, or a failed cleanup),
+                    // so any re-drive error keeps the count rather than
+                    // releasing it, even one that failed before touching a
+                    // pod.
+                    let redriven = match redriven {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            keep_live(live);
+                            return Err(error);
+                        }
+                    };
+                    match redriven {
                         RedriveOutcome::Redriven(cross_node_pod) => {
+                            keep_live(live);
                             self.remember_pod_node_placement(
                                 sandbox.id,
                                 &cross_node_pod,
@@ -902,6 +951,25 @@ impl KubernetesSubstrate {
             return Ok(());
         }
 
+        // The live cap's `Check` point: this branch is about to create a pod.
+        // A refusal is a refused charge, not a failed activation, so it gives
+        // back the claim it created, as the other pre-create failures do.
+        let live = match self
+            .check_live_cap_for_pod_create(charge.as_ref(), &sandbox)
+            .await
+        {
+            Ok(live) => live,
+            Err(error) => {
+                if claim.created && execution_pod_create_in_flight(claim.row.state) {
+                    let _ = self
+                        .store
+                        .abandon_created_unmaterialized_create_claim(sandbox.id, &claim)
+                        .await?;
+                }
+                return Err(error);
+            }
+        };
+
         let pod_create_context = self
             .pod_create_context_for_claim(
                 &sandbox,
@@ -1047,22 +1115,30 @@ impl KubernetesSubstrate {
                         });
                     }
                     Err(query_error) => {
+                        // The conflicting pod may be live: keep its count.
+                        keep_live(live);
                         return Err(SubstrateError::restore_in_flight(format!(
                             "sandbox pod create conflicted, but Kubernetes could not confirm pod \
                              {pod_name}: {query_error}"
                         )));
                     }
                 };
-                if self
+                // A pod exists: a cleanup that fails may leave it live.
+                match self
                     .cleanup_stale_existing_pod_after_create_error(
                         &sandbox,
                         &claim,
                         &existing,
                         suspend_restore_storage_uri,
                     )
-                    .await?
+                    .await
                 {
-                    return Ok(());
+                    Ok(true) => return Ok(()),
+                    Ok(false) => {}
+                    Err(error) => {
+                        keep_live(live);
+                        return Err(error);
+                    }
                 }
                 (existing, false)
             }
@@ -1070,16 +1146,22 @@ impl KubernetesSubstrate {
                 let create_error = format!("failed to create sandbox pod: {err}");
                 match fetch_sandbox_pod_uncached(&self.k8s, &claim.row.pod_name).await {
                     Ok(Some(existing)) => {
-                        if self
+                        // A pod exists: a cleanup that fails may leave it live.
+                        match self
                             .cleanup_stale_existing_pod_after_create_error(
                                 &sandbox,
                                 &claim,
                                 &existing,
                                 suspend_restore_storage_uri,
                             )
-                            .await?
+                            .await
                         {
-                            return Ok(());
+                            Ok(true) => return Ok(()),
+                            Ok(false) => {}
+                            Err(error) => {
+                                keep_live(live);
+                                return Err(error);
+                            }
                         }
                         (existing, false)
                     }
@@ -1102,13 +1184,21 @@ impl KubernetesSubstrate {
                         // have committed the Pod before returning the error.
                         // Preserve started-recovery ownership so its failure
                         // publisher cannot roll the sandbox back while that
-                        // Pod may be live.
+                        // Pod may be live, and keep its live-cap count.
+                        keep_live(live);
                         return Err(SubstrateError::restore_in_flight(message));
                     }
                 }
             }
         };
 
+        // A pod exists now, created here or found after a create error the
+        // apiserver may still have committed: the member only has to cover
+        // the watch delay before the reflectors show it. A path that returned
+        // above before any create was sent, or after the apiserver confirmed
+        // there's no pod, dropped the reservation and released it; one that
+        // may have left a pod kept it.
+        keep_live(live);
         let pod_ip = assigned_pod_ip(&pod)?.map(|ip| ip.to_string());
         match self
             .store

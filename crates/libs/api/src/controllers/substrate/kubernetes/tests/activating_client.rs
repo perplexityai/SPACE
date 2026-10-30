@@ -13,10 +13,10 @@ use pplx_space_test_env::TestResult;
 use uuid::Uuid;
 
 use super::*;
-use crate::controllers::substrate::KeyResolution;
 use crate::controllers::substrate::kubernetes::pod_ops::{
     ActivationAttemptAssignment, PodMaterializationOwnership, StartedRecoveryOwnership,
 };
+use crate::controllers::substrate::{KeyResolution, SubstrateError};
 
 /// A started sandbox recorded as activated by `background-client`, whose
 /// generation-2 execution lost its pod; a ready portable snapshot lets
@@ -127,6 +127,131 @@ async fn a_rebuilt_pod_is_labeled_with_its_activating_client(
         expected,
         "the record follows the new pod"
     );
+    Ok(())
+}
+
+/// Refuses every live-cap check and counts them.
+#[derive(Default)]
+struct AtLiveCap(Mutex<usize>);
+
+impl crate::controllers::substrate::ActivationAdmission for AtLiveCap {
+    fn admit(
+        &self,
+        _class: crate::controllers::substrate::ActivationAdmissionClass,
+    ) -> crate::controllers::substrate::ActivationAdmissionFuture<'_> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn reserve_live(
+        &self,
+        _client: ClientId,
+        _sandbox: SandboxId,
+    ) -> crate::controllers::substrate::LiveCapFuture<'_> {
+        *self.0.lock().expect("count mutex poisoned") += 1;
+        Box::pin(async { Err(at_cap()) })
+    }
+
+    fn precheck_live(
+        &self,
+        _client: ClientId,
+        _sandbox: SandboxId,
+    ) -> crate::controllers::substrate::ActivationAdmissionFuture<'_> {
+        *self.0.lock().expect("count mutex poisoned") += 1;
+        Box::pin(async { Err(at_cap()) })
+    }
+}
+
+fn at_cap() -> crate::controllers::substrate::ActivationAdmissionRejection {
+    crate::controllers::substrate::ActivationAdmissionRejection::new(
+        "client live sandbox cap reached".to_string(),
+        Some(std::time::Duration::from_secs(5)),
+        false,
+    )
+}
+
+/// `ensure_pod_exists` is the live cap's `Check` point (RFC Decision 6): a
+/// charge whose cap is decided where a pod gets created is checked on the
+/// branch about to create one, and a refusal creates no pod; a charge
+/// reserved upstream, or one that isn't capped, isn't checked again.
+#[rstest::rstest]
+#[case::checked_where_the_pod_is_created(crate::controllers::substrate::CapPolicy::Check, true)]
+#[case::a_call_that_claimed_no_lease(
+    crate::controllers::substrate::CapPolicy::ReserveAtClaim,
+    true
+)]
+#[case::reserved_upstream(crate::controllers::substrate::CapPolicy::Reserved, false)]
+#[case::not_capped(crate::controllers::substrate::CapPolicy::Skip, false)]
+#[tokio::test(flavor = "current_thread")]
+async fn a_pod_create_is_checked_against_the_live_cap_by_its_cap_policy(
+    #[case] cap: crate::controllers::substrate::CapPolicy,
+    #[case] checked: bool,
+) -> TestResult {
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let pool = db.pool.clone();
+    let sandbox_id = sandbox_with_a_lost_background_execution(&pool).await?;
+    let sandbox = crate::controllers::sandbox::fetch_sandbox(&pool, sandbox_id)
+        .await?
+        .expect("inserted sandbox must be visible");
+    let captured_pod_creates = Arc::new(Mutex::new(Vec::new()));
+    let substrate = substrate_with_store_and_client(
+        pool.clone(),
+        mock_kubernetes_client(Arc::clone(&captured_pod_creates)),
+    );
+    let admission = Arc::new(AtLiveCap::default());
+    let charge = crate::controllers::substrate::RecoveryCharge::exempt(
+        Some(&admission),
+        cap,
+        crate::controllers::substrate::ActivationAttribution::inherit_unresolved(),
+    );
+
+    let result = substrate
+        .ensure_pod_exists(
+            &sandbox,
+            None,
+            None,
+            None,
+            PodMaterializationOwnership::new(
+                Some(StartedRecoveryOwnership::ExistingExecution { generation: 2 }),
+                None,
+                Some(ActivationAttemptAssignment::new(
+                    SandboxActivationAttemptId::new(),
+                    SandboxTransitionTargetState::Started,
+                    KeyResolution::Unresolved,
+                )),
+            )
+            .with_charge(&charge),
+        )
+        .await;
+
+    let creates = captured_pod_creates
+        .lock()
+        .expect("capture mutex poisoned")
+        .len();
+    let checks = *admission.0.lock().expect("count mutex poisoned");
+    if checked {
+        assert!(
+            matches!(
+                result,
+                Err(SubstrateError::AdmissionRejected {
+                    rate_limited: false,
+                    ..
+                })
+            ),
+            "a refusal is a refused charge: {result:?}"
+        );
+        assert_eq!(
+            (checks, creates),
+            (1, 0),
+            "checked once, and no pod created"
+        );
+    } else {
+        result?;
+        assert_eq!(
+            (checks, creates),
+            (0, 1),
+            "not checked, and the pod created"
+        );
+    }
     Ok(())
 }
 

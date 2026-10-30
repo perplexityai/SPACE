@@ -1224,7 +1224,7 @@ impl SandboxController {
         // activation rejection (429/backpressure) — record it on the reconnect
         // series so a control-plane-throttled data-plane retry storm isn't
         // invisible to the retry-storm monitor.
-        lifecycle::charge_implicit_access_activation(
+        let live = lifecycle::charge_implicit_access_activation(
             self.cluster_admission.as_ref(),
             sandbox,
             ExecutionActivityKind::Access,
@@ -1248,11 +1248,16 @@ impl SandboxController {
                 metric_identity,
                 sandbox,
                 DEFAULT_BLOCKING_WAIT_TIMEOUT,
-                lifecycle::implicit_activation_charge(self.cluster_admission.as_ref(), sandbox),
+                lifecycle::implicit_activation_charge(
+                    self.cluster_admission.as_ref(),
+                    sandbox,
+                    live.is_some(),
+                ),
             )
             .await
         {
             Ok(result) => {
+                lifecycle::keep_live(live);
                 if let Some((outcome, terminal_phase, reason)) =
                     successful_access_reconnect_outcome(initial_lifecycle)
                 {

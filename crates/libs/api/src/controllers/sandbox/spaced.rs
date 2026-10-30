@@ -85,7 +85,7 @@ impl SandboxController {
                 // `runtime_client` path errored). `wake_execution` spends a real
                 // node slot for a suspended (Restore) or created (Cold) sandbox.
                 // Fails open on limiter errors.
-                super::lifecycle::charge_control_wake_activation(
+                let live = super::lifecycle::charge_control_wake_activation(
                     self.cluster_admission.as_ref(),
                     sandbox,
                 )
@@ -101,6 +101,7 @@ impl SandboxController {
                     )
                     .await
                     .map_err(ControllerError::from)?;
+                super::lifecycle::keep_live(live);
                 self.substrate.runtime_client(sandbox.id, paid).await
             }
             Err(err) => Err(err),
@@ -698,16 +699,19 @@ pub(crate) async fn connect_spaced_runtime_client(
     )
     .await?;
 
-    let charge = super::lifecycle::implicit_activation_charge(admission, sandbox);
-
     // The dormant entrypoint charge covers created/stopped/suspended implicit
     // wakes on the initial connect; the non-dormant lost-pod recreate is charged
     // inside the substrate recovery branch via `charge`.
-    if charge_entrypoint && let Some(activity) = activity {
-        super::lifecycle::charge_implicit_access_activation(admission, sandbox, activity).await?;
-    }
+    let live = match activity {
+        Some(activity) if charge_entrypoint => {
+            super::lifecycle::charge_implicit_access_activation(admission, sandbox, activity)
+                .await?
+        }
+        _ => None,
+    };
+    let charge = super::lifecycle::implicit_activation_charge(admission, sandbox, live.is_some());
 
-    match activity {
+    let client = match activity {
         Some(activity) => {
             substrate
                 .access_runtime_client(
@@ -720,7 +724,11 @@ pub(crate) async fn connect_spaced_runtime_client(
                 .await
         }
         None => substrate.runtime_client(sandbox.id, charge).await,
+    };
+    if client.is_ok() {
+        super::lifecycle::keep_live(live);
     }
+    client
 }
 
 pub(super) fn space_api_bridge_route_token(

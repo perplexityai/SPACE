@@ -15,7 +15,7 @@ use tokio::{
     time::{Instant, sleep_until, timeout},
 };
 
-use super::sandbox_pod_view::{self, NodeNetworkSlots, SandboxPodView, SandboxPodWriter};
+use super::sandbox_pod_view::{self, SandboxPodIndexes, SandboxPodView, SandboxPodWriter};
 
 const SANDBOX_POD_LABEL_SELECTOR: &str = "space.pplx.net/managed-by=space-api";
 /// Buffer depth for the per-name event broadcast. Sized well above the steady-
@@ -298,8 +298,9 @@ pub(super) async fn wait_for_pod_absence(
 /// lifetime of the process. The returned store is cheap to clone (internally
 /// an `Arc`) and is safe to call from any sync context.
 ///
-/// The returned [`NodeNetworkSlots`] is the per-node network-slot index,
-/// written from the same events just before the store.
+/// The returned [`SandboxPodIndexes`] are the per-node network-slot index and
+/// the per-client live-pod index, written from the same events just before
+/// the store.
 ///
 /// The returned `PodEvents` is fed by the same watch stream and lets callers
 /// wait for the next add/modify/delete event for a specific pod name.
@@ -316,13 +317,13 @@ pub fn start(
     namespace: String,
 ) -> (
     Store<SandboxPodView>,
-    NodeNetworkSlots,
+    SandboxPodIndexes,
     PodEvents,
     ReflectorReady,
 ) {
     let pods: Api<Pod> = Api::namespaced(client, &namespace);
     let cfg = WatcherConfig::default().labels(SANDBOX_POD_LABEL_SELECTOR);
-    let (store, network_slots, writer) = sandbox_pod_view::sandbox_pod_cache();
+    let (store, indexes, writer) = sandbox_pod_view::sandbox_pod_cache();
     let stream = watcher::watcher(pods, cfg)
         .map_ok(sandbox_pod_view::sandbox_pod_view_event)
         .default_backoff();
@@ -358,7 +359,7 @@ pub fn start(
         }
     });
 
-    (store, network_slots, events, ready)
+    (store, indexes, events, ready)
 }
 
 /// Drains the sandbox-pod watcher stream: applies each event to the slot index
@@ -389,6 +390,7 @@ async fn reflect_sandbox_pods<S>(
                 }
             }
             Err(err) => {
+                writer.mark_watch_error();
                 tracing::warn!(
                     namespace = %namespace,
                     error = %err,
@@ -397,6 +399,7 @@ async fn reflect_sandbox_pods<S>(
             }
         }
     }
+    writer.mark_watch_error();
     tracing::warn!(
         namespace = %namespace,
         "sandbox pod reflector stream ended"
