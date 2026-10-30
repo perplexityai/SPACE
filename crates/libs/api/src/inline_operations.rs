@@ -23,7 +23,6 @@ use std::time::Duration;
 
 use pplx_space_common_svc::DrainSignal;
 use pplx_space_metrics::operations::{InlineAdmissionPath, InlineAdmissionReason};
-use pplx_space_public_api::OperationKind;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -35,10 +34,6 @@ use crate::public_operation_driver::{
 };
 use crate::public_operations::{ClaimedPublicOperation, PublicOperationStore};
 
-/// Env master for executing lifecycle operations inline.
-pub const INLINE_OPERATIONS_ENABLED_ENV: &str = "SPACE_NATIVE_INLINE_OPERATIONS_ENABLED";
-/// Comma-separated operation kinds the master enables inline.
-pub const INLINE_KINDS_ENV: &str = "SPACE_NATIVE_INLINE_KINDS";
 /// Inline executions one API process runs at once; `0` turns inline
 /// execution off entirely, including warm-pool creates.
 pub const INLINE_MAX_CONCURRENT_ENV: &str = "SPACE_NATIVE_INLINE_MAX_CONCURRENT";
@@ -49,22 +44,9 @@ const MAX_INLINE_MAX_CONCURRENT: usize = 1024;
 /// most this old when it is sent.
 const SLOT_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 
-/// The kinds `SPACE_NATIVE_INLINE_KINDS` may name: wakes, which callers wait
-/// on, and creates. Everything else stays on the dispatcher.
-pub const INLINE_CAPABLE_KINDS: &[OperationKind] = &[
-    OperationKind::CreateSandbox,
-    OperationKind::WakeSandbox,
-    OperationKind::ResumeSandbox,
-    OperationKind::StartSandbox,
-];
-
-/// The environment's inline switches.
+/// The environment's inline settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InlineOperationsConfig {
-    /// `SPACE_NATIVE_INLINE_OPERATIONS_ENABLED`, off by default.
-    pub enabled: bool,
-    /// `SPACE_NATIVE_INLINE_KINDS`, empty by default.
-    pub kinds: Vec<OperationKind>,
     /// `SPACE_NATIVE_INLINE_MAX_CONCURRENT`.
     pub max_concurrent: usize,
 }
@@ -72,8 +54,6 @@ pub struct InlineOperationsConfig {
 impl Default for InlineOperationsConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            kinds: Vec::new(),
             max_concurrent: DEFAULT_INLINE_MAX_CONCURRENT,
         }
     }
@@ -84,37 +64,10 @@ impl InlineOperationsConfig {
         Self::from_environment(&pplx_space_common_core::env::ProcessEnvironment)
     }
 
-    /// A kind outside [`INLINE_CAPABLE_KINDS`], or not a kind at all, is
-    /// left out with a warning. A malformed limit keeps the default, and one
-    /// above 1024 is capped.
+    /// A malformed limit keeps the default, and one above 1024 is capped.
     pub fn from_environment(env: &dyn pplx_space_common_core::env::Environment) -> Self {
         let default = Self::default();
-        let mut kinds = Vec::new();
-        for name in env
-            .var(INLINE_KINDS_ENV)
-            .unwrap_or_default()
-            .split(',')
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-        {
-            match name.parse::<OperationKind>() {
-                Ok(kind) if INLINE_CAPABLE_KINDS.contains(&kind) => {
-                    if !kinds.contains(&kind) {
-                        kinds.push(kind);
-                    }
-                }
-                _ => tracing::warn!(
-                    kind = name,
-                    "{INLINE_KINDS_ENV} names a kind that cannot run inline; it stays on the dispatcher"
-                ),
-            }
-        }
         Self {
-            enabled: pplx_space_common_core::env::env_flag(
-                env.var(INLINE_OPERATIONS_ENABLED_ENV).ok().as_deref(),
-                default.enabled,
-            ),
-            kinds,
             max_concurrent: env
                 .var(INLINE_MAX_CONCURRENT_ENV)
                 .ok()
@@ -209,12 +162,6 @@ impl InlineOperations {
                 execution,
             }),
         }
-    }
-
-    /// Whether the env switches let operations of `kind` run inline: the
-    /// master on, and `kind` in the allowlist. A route still needs a permit.
-    pub fn kind_enabled(&self, kind: OperationKind) -> bool {
-        self.inner.config.enabled && self.inner.config.kinds.contains(&kind)
     }
 
     /// A permit to run one operation offered on `path` inline, taken before

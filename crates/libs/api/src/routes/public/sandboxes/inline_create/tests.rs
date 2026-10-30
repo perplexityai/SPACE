@@ -116,10 +116,7 @@ mod postgres {
         max_concurrent: usize,
     ) -> InlineOperations {
         InlineOperations::new(
-            InlineOperationsConfig {
-                max_concurrent,
-                ..InlineOperationsConfig::default()
-            },
+            InlineOperationsConfig { max_concurrent },
             tasks,
             drain_signal,
             execution,
