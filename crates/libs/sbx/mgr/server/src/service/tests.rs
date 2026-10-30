@@ -12896,12 +12896,6 @@ pub(crate) mod service_tests {
         );
     }
 
-    #[test]
-    fn failed_encrypted_capture_keeps_live_memory_base_mounted() {
-        assert!(!super::grpc_lifecycle::failed_encrypted_capture_may_release_volume(true));
-        assert!(super::grpc_lifecycle::failed_encrypted_capture_may_release_volume(false));
-    }
-
     #[tokio::test]
     async fn node_local_backup_fence_failure_preserves_runtime_and_rolls_back_to_paused() {
         let conn = crate::db::test_conn();

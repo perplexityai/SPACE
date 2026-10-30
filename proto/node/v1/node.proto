@@ -123,6 +123,11 @@ service NodeManager {
   rpc GetVmState(GetVmStateRequest) returns (GetVmStateResponse);
   rpc CaptureVmState(CaptureVmStateRequest) returns (CaptureVmStateResponse);
   rpc RestoreVmState(RestoreVmStateRequest) returns (RestoreVmStateResponse);
+  // Capture and stage a BYOK suspend snapshot without stopping the runtime.
+  // Idempotent by local_artifact_id: a retry resumes staging after a confirmed
+  // capture and never overwrites a capture with an unknown outcome.
+  rpc CreateEncryptedSuspendSnapshot(CreateEncryptedSuspendSnapshotRequest)
+      returns (CreateEncryptedSuspendSnapshotResponse);
 
   // Create a read-only btrfs snapshot of a sandbox's instance subvolume.
   rpc CreateBtrfsSnapshot(CreateBtrfsSnapshotRequest) returns (CreateBtrfsSnapshotResponse);
@@ -925,6 +930,25 @@ message ResumeSandboxRequest {
   ExecutionFence execution_fence = 2;
 }
 message ResumeSandboxResponse {}
+
+message CreateEncryptedSuspendSnapshotRequest {
+  string sandbox_id = 1;
+  // The suspend publication this operation owns. node-manager derives its
+  // canonical staging directory and persists capture progress there.
+  string local_artifact_id = 2;
+  EncryptedSuspendSnapshotBase base = 3;
+  ExecutionFence execution_fence = 4;
+}
+
+message CreateEncryptedSuspendSnapshotResponse {}
+
+enum EncryptedSuspendSnapshotBase {
+  ENCRYPTED_SUSPEND_SNAPSHOT_BASE_UNSPECIFIED = 0;
+  // No prior memory snapshot exists; prepare an empty volume.
+  ENCRYPTED_SUSPEND_SNAPSHOT_BASE_FRESH = 1;
+  // The runtime restored from this volume; preserve it as the Diff base.
+  ENCRYPTED_SUSPEND_SNAPSHOT_BASE_EXISTING = 2;
+}
 
 // Runtime-neutral disk I/O token buckets; adapters reject unsupported limits.
 message DriveRateLimit {

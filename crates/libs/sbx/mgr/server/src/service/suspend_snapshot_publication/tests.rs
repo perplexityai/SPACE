@@ -169,7 +169,7 @@ fn classifier_refuses_mismatched_canonical_when_expected_artifact_is_known() {
 }
 
 #[test]
-fn classifier_treats_runtime_live_as_source_of_truth() {
+fn classifier_does_not_hide_a_complete_capture_behind_runtime_liveness() {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let sandbox_dir = tmp.path();
     let local_artifact_id = LocalArtifactId::new();
@@ -187,8 +187,82 @@ fn classifier_treats_runtime_live_as_source_of_truth() {
 
     assert_eq!(
         decision,
-        SuspendSnapshotPublicationDecision::RuntimeLiveWithoutUsableArtifact
+        SuspendSnapshotPublicationDecision::StagedComplete(StagedSuspendSnapshotArtifact {
+            local_artifact_id,
+            staging_dir,
+        })
     );
+}
+
+#[test]
+fn classifier_prefers_the_newest_complete_capture() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let sandbox_dir = tmp.path();
+    let older = LocalArtifactId::from_uuid(
+        uuid::Uuid::parse_str("019d84bd-280d-7331-99c6-b63377f3a3a2").unwrap(),
+    );
+    let newer = LocalArtifactId::from_uuid(
+        uuid::Uuid::parse_str("019d84bd-280e-7331-99c6-b63377f3a3a2").unwrap(),
+    );
+    write_full_suspend_artifact(
+        &suspend_snapshot_staging_dir(sandbox_dir, older),
+        TEST_SANDBOX_ID,
+        older,
+        b"older",
+    );
+    write_full_suspend_artifact(
+        &suspend_snapshot_staging_dir(sandbox_dir, newer),
+        TEST_SANDBOX_ID,
+        newer,
+        b"newer",
+    );
+
+    let decision =
+        classify_suspend_snapshot_publication(sandbox_dir, None, false, &Default::default())
+            .unwrap();
+
+    assert_eq!(
+        decision,
+        SuspendSnapshotPublicationDecision::StagedComplete(StagedSuspendSnapshotArtifact {
+            local_artifact_id: newer,
+            staging_dir: suspend_snapshot_staging_dir(sandbox_dir, newer),
+        })
+    );
+}
+
+#[test]
+fn newer_pending_capture_blocks_an_older_complete_capture() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let sandbox_dir = tmp.path();
+    let older = LocalArtifactId::from_uuid(
+        uuid::Uuid::parse_str("019d84bd-280d-7331-99c6-b63377f3a3a2").unwrap(),
+    );
+    let newer = LocalArtifactId::from_uuid(
+        uuid::Uuid::parse_str("019d84bd-280e-7331-99c6-b63377f3a3a2").unwrap(),
+    );
+    write_full_suspend_artifact(
+        &suspend_snapshot_staging_dir(sandbox_dir, older),
+        TEST_SANDBOX_ID,
+        older,
+        b"older",
+    );
+    let staging = suspend_snapshot_staging_dir(sandbox_dir, newer);
+    write_full_suspend_artifact(&staging, TEST_SANDBOX_ID, newer, b"metadata-source");
+    let metadata: crate::snapshot_upload::SnapshotMeta = serde_json::from_slice(
+        &std::fs::read(staging.join(crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME)).unwrap(),
+    )
+    .unwrap();
+    std::fs::remove_dir_all(&staging).unwrap();
+    std::fs::create_dir_all(&staging).unwrap();
+    prepare_encrypted_capture_record(&staging, &metadata, false).unwrap();
+
+    let error = classify_suspend_snapshot_publication(sandbox_dir, None, true, &Default::default())
+        .expect_err("a newer recoverable capture must settle first");
+
+    assert!(matches!(
+        error,
+        SuspendSnapshotPublicationError::EncryptedCapturePending { .. }
+    ));
 }
 
 fn retained(snapshot_dir: &Path, source_id: uuid::Uuid) -> RetainedSource {

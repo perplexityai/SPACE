@@ -2559,13 +2559,13 @@ async fn suspend_publication_failure_after_staging_preserves_only_owned_evidence
     }
     for (case, runtime_live, row, disk, unreadable_journal, expected, final_state) in [
         (
-            "a live runtime rolls back to paused",
+            "a complete capture wins over a live runtime",
             true,
             Row::At(SandboxState::Suspending),
             Disk::CompleteCurrentStaging,
             false,
             Disposition::Cleanup,
-            Some(SandboxState::Paused),
+            Some(SandboxState::CleanupRequired),
         ),
         (
             "another transition already moved the row",
@@ -2701,8 +2701,18 @@ async fn suspend_publication_failure_after_staging_preserves_only_owned_evidence
             );
         }
         if matches!(disk, Disk::CompleteCurrentStaging) {
-            // Removal is the caller's job, on a Cleanup disposition.
-            assert!(staging_dir.exists(), "{case}");
+            if final_state == Some(SandboxState::CleanupRequired) {
+                assert!(
+                    crate::service::suspend_snapshot_publication::canonical_suspend_snapshot_dir(
+                        &sandbox_dir,
+                    )
+                    .exists(),
+                    "{case}"
+                );
+            } else {
+                // Removal is the caller's job, on a Cleanup disposition.
+                assert!(staging_dir.exists(), "{case}");
+            }
         }
         drain_service_tasks(&service).await;
     }

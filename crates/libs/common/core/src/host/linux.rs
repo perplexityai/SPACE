@@ -337,6 +337,35 @@ pub mod paths {
     /// [`sandbox_snapshots_dir`]. Users can't list, delete or roll back to them.
     pub const INTERNAL_OPERATION_SNAPSHOT_PREFIX: &str = "d-operation-";
 
+    /// Name prefix of a suspend's publication staging directory under the
+    /// sandbox's snapshots directory; the suffix is the capture's local
+    /// artifact id.
+    pub const SUSPEND_STAGING_PREFIX: &str = ".suspend-publish-";
+
+    /// Prepared encrypted-suspend metadata. node-manager moves this record
+    /// through the capture phases without parsing it.
+    pub const ENCRYPTED_SUSPEND_CAPTURE_INTENT: &str = ".encrypted-capture.json.intent";
+    /// A Firecracker capture was requested, but its outcome was not durably
+    /// observed. This marker prevents a retry from overwriting it.
+    pub const ENCRYPTED_SUSPEND_CAPTURE_STARTED: &str = ".encrypted-capture.json.started";
+    /// Firecracker confirmed the capture. Staging may safely be retried.
+    pub const ENCRYPTED_SUSPEND_CAPTURE_RECORD: &str = "encrypted-capture.json";
+    /// Canonical encrypted memory volume owned by suspend/restore.
+    pub const ENCRYPTED_SUSPEND_VOLUME_NAME: &str = "snapshot";
+    /// Sparse logical ceiling for the encrypted memory volume.
+    pub const ENCRYPTED_SUSPEND_VOLUME_SIZE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
+    /// Returns the publication staging directory of one suspend capture.
+    pub fn sandbox_suspend_staging_dir(
+        sandbox_id: &str,
+        local_artifact_id: crate::types::LocalArtifactId,
+    ) -> String {
+        format!(
+            "{}/{SUSPEND_STAGING_PREFIX}{local_artifact_id}",
+            sandbox_snapshots_dir(sandbox_id)
+        )
+    }
+
     /// Returns the directory path for one sandbox snapshot.
     pub fn sandbox_snapshot_dir(sandbox_id: &str, snapshot_name: &str) -> String {
         format!("{}/{snapshot_name}", sandbox_snapshots_dir(sandbox_id))
