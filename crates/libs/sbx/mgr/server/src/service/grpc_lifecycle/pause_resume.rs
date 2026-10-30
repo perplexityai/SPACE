@@ -516,6 +516,7 @@ impl SandboxManagerService {
                 route_identity_provenance,
                 authoritative_route_identity: start_context.route_identity.is_some(),
                 provisional_activation_attempt: false,
+                runtime_upgrade: None,
             }
         } else {
             self.authorize_peer(&request, "Wake", ALLOW_SANDBOX_OPERATOR)?;
@@ -524,6 +525,28 @@ impl SandboxManagerService {
                 ..WakeStartConfig::default()
             }
         };
+        if let Some(upgrade) = &req.runtime_upgrade {
+            // The upgrade's cold start runs as this caller, so the caller must
+            // hold the upgrade's authority as well as Start's.
+            self.authorize_peer(
+                &request,
+                "Wake.runtime_upgrade",
+                ALLOW_SANDBOX_RUNTIME_UPGRADE,
+            )?;
+            // An implicit wake is admitted by the sandbox's wake policy before
+            // the upgrade runs, as before a start or restore.
+            if req.start_context.is_none() || !req.blocking || target_state != SandboxState::Started
+            {
+                return Err(Status::invalid_argument(
+                    "a runtime upgrade wake requires start_context and blocking STARTED",
+                ));
+            }
+            start.runtime_upgrade = Some(super::super::runtime_upgrade::WakeRuntimeUpgrade::parse(
+                upgrade,
+                request.metadata().clone(),
+                request.extensions().clone(),
+            )?);
+        }
         let normalized_route_identity =
             space_api_route_identity_for_runtime_activation(start.space_api_route_identity);
         start.space_api_route_identity = normalized_route_identity.identity;
@@ -593,36 +616,40 @@ impl SandboxManagerService {
                     return Err(error);
                 }
             };
-            if let Err(error) = self
-                .start_sandbox_with_authority(
-                    StartRequest {
-                        activation_auto_lifecycle: start
-                            .activation_auto_lifecycle
-                            .clone()
-                            .map(Into::into),
-                        sandbox_id: sandbox_id.clone(),
-                        vcpu: start.vcpu,
-                        memory_mib: start.memory_mib,
-                        checkpoint: Some(SUSPEND_CHECKPOINT.to_string()),
-                        blocking: false,
-                        netns_path,
-                        target_state: req.target_state,
-                        suspend_restore_storage_uri: start.suspend_restore_storage_uri.clone(),
-                        suspend_restore_source_node: start.suspend_restore_source_node.clone(),
-                        expected_local_artifact_id: start.expected_local_artifact_id.clone(),
-                        route_identity: space_api_route_identity_to_wire(
-                            &start.space_api_route_identity,
-                        ),
-                        operation_activation_attempt_id: start
-                            .operation_activation_attempt_id
-                            .map(|id| id.to_string()),
-                        ..Default::default()
-                    },
+            let staging_start = StartRequest {
+                activation_auto_lifecycle: start.activation_auto_lifecycle.clone().map(Into::into),
+                sandbox_id: sandbox_id.clone(),
+                vcpu: start.vcpu,
+                memory_mib: start.memory_mib,
+                checkpoint: Some(SUSPEND_CHECKPOINT.to_string()),
+                blocking: false,
+                netns_path,
+                target_state: req.target_state,
+                suspend_restore_storage_uri: start.suspend_restore_storage_uri.clone(),
+                suspend_restore_source_node: start.suspend_restore_source_node.clone(),
+                expected_local_artifact_id: start.expected_local_artifact_id.clone(),
+                route_identity: space_api_route_identity_to_wire(&start.space_api_route_identity),
+                operation_activation_attempt_id: start
+                    .operation_activation_attempt_id
+                    .map(|id| id.to_string()),
+                ..Default::default()
+            };
+            // An upgrade boots the staged disk, so the checkpoint is staged
+            // and left suspended rather than launched.
+            let staged = if start.runtime_upgrade.is_some() {
+                // Boxed, like the upgrade it precedes: inlined, the staging
+                // future would grow every Wake's state machine.
+                Box::pin(self.stage_missing_checkpoint(staging_start)).await
+            } else {
+                self.start_sandbox_with_authority(
+                    staging_start,
                     false,
                     IdentityFreeDirectActivationAuthority::Denied,
                 )
                 .await
-            {
+                .map(drop)
+            };
+            if let Err(error) = staged {
                 emit_sandbox_event(
                     &sandbox_id,
                     SandboxEventType::WakeFailed,

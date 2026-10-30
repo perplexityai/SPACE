@@ -81,6 +81,23 @@ local installation.
 
 ## Configure a client
 
+### Read authoritative sandbox ownership
+
+`GET /sandboxes/{sandboxID}` includes an `ownership` object derived from the
+stored sandbox row, not from its editable `metadata`:
+
+```json
+{"source":"federated_identity","issuer":"example-issuer","orgID":"tenant-org"}
+```
+
+Local-owned sandboxes return `{"source":"local"}`. Clients using trusted
+federated owner assertions can check the upstream organization before selecting
+a prepared source or accepting a fork. A missing field on an older deployment
+does not establish tenant ownership. Forks preserve source organization;
+presenting another owner does not transfer a local-owned source to that tenant.
+
+### Connect with the SDK
+
 Set the base domain and the raw key, then pass the same values to the SDK:
 
 ```bash

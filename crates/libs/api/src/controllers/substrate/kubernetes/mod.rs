@@ -427,6 +427,9 @@ pub struct KubernetesState {
     /// Whether a failed restore claim's rollback retires its execution
     /// (`SPACE_ABANDONED_RESTORE_RETIREMENT_ENABLED`, default off).
     pub abandoned_restore_retirement: super::AbandonedRestoreRetirement,
+    /// Whether resume and start decide a runtime upgrade
+    /// (`SPACE_RUNTIME_UPGRADE_AT_ACTIVATION_ENABLED`, default off).
+    pub runtime_upgrade_at_activation: super::runtime_upgrade::RuntimeUpgradeAtActivation,
     pub caches: Arc<K8sCaches>,
 }
 
@@ -480,6 +483,8 @@ impl KubernetesState {
             create_data_plane_ready_timeout,
             k8s_blocking_delete_timeout: DEFAULT_K8S_BLOCKING_DELETE_TIMEOUT,
             abandoned_restore_retirement: super::AbandonedRestoreRetirement::from_env(),
+            runtime_upgrade_at_activation:
+                super::runtime_upgrade::RuntimeUpgradeAtActivation::from_env(),
             sandbox_proxy_port: DEFAULT_SANDBOX_PROXY_PORT,
             node_api_port: DEFAULT_SANDBOX_PROXY_PORT,
             sandbox_pod_config: SandboxPodConfigValues::from_env()?,
@@ -865,6 +870,9 @@ pub struct KubernetesSubstrate {
     /// directly so a join's re-check interval is settable in tests;
     /// production takes the default, which is those constants.
     recovery_join_backoff: execution::RecoveryJoinBackoffPolicy,
+    /// The runtime environment policy the resume- and start-time upgrade
+    /// decision reads, shared by clones.
+    runtime_policy: super::runtime_upgrade::RuntimePolicyCache,
     /// Readiness, preserve-decision, suspend and connect budgets. Production
     /// takes the default, which is the constants each one names.
     budgets: SubstrateBudgets,
@@ -918,6 +926,7 @@ impl KubernetesSubstrate {
                     node_group_placement,
                     cancel_tracker: CancelRateTracker::with_default_budget(),
                     recovery_join_backoff: execution::RecoveryJoinBackoffPolicy::default(),
+                    runtime_policy: super::runtime_upgrade::RuntimePolicyCache::default(),
                     budgets: SubstrateBudgets::default(),
                     shutdown_token,
                     task_tracker,
@@ -1240,6 +1249,7 @@ mod node_sync;
 mod per_sandbox_setup;
 mod pod_ops;
 mod pool;
+mod runtime_upgrade;
 #[cfg(test)]
 pub(crate) mod scripted_test_doubles;
 mod support;

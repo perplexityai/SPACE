@@ -383,6 +383,7 @@ pub(super) async fn start_scripted_worker(
             wake_attempts: Arc::new(AtomicUsize::new(0)),
             succeed_after_attempt: Some(config.wake_succeeds_from_attempt),
             echo_route_identity: true,
+            received: Arc::default(),
         }),
         replies: Arc::clone(&replies),
         observers: Arc::clone(&observers),

@@ -1,3 +1,4 @@
+use pplx_space_common_core::types::guest_image::GuestDiskLayout;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, thiserror::Error)]
@@ -37,6 +38,14 @@ pub(crate) enum ExpandedRootfsError {
         expected_bytes: u64,
         actual_bytes: u64,
     },
+    #[error("invalid template metadata schema: {0}")]
+    Schema(#[from] pplx_space_common_core::types::TemplateMetadataSchemaError),
+    #[error("invalid template manifest schema: {0}")]
+    ManifestSchema(#[from] pplx_space_common_core::types::TemplateManifestSchemaError),
+    #[error("template metadata and manifest guest image contracts disagree")]
+    GuestImageMismatch,
+    #[error("invalid guest profile: {0}")]
+    GuestProfile(#[from] pplx_space_execution_catalog::guest::GuestProfileError),
 }
 
 impl ExpandedRootfsError {
@@ -46,7 +55,11 @@ impl ExpandedRootfsError {
             Self::Command { .. } => "command",
             Self::TooSmall { .. } => "too_small",
             Self::Missing { .. } => "missing",
-            Self::InvalidMetadata { .. } => "invalid_metadata",
+            Self::InvalidMetadata { .. }
+            | Self::Schema(_)
+            | Self::ManifestSchema(_)
+            | Self::GuestImageMismatch
+            | Self::GuestProfile(_) => "invalid_metadata",
             Self::WrongSize { .. } => "wrong_size",
         }
     }
@@ -62,11 +75,13 @@ pub(crate) fn expand_rootfs_from_metadata(
     build_dir: impl AsRef<Path>,
 ) -> Result<Option<(PathBuf, u64)>, ExpandedRootfsError> {
     let build_dir = build_dir.as_ref();
-    let Some(rootfs_size_mb) = rootfs_size_mb_from_metadata(build_dir)? else {
+    let metadata = read_metadata(build_dir)?;
+    let Some(rootfs_size_mb) = metadata.disk_size_mb.filter(|value| *value > 0) else {
         return Ok(None);
     };
+    let layout = metadata.guest_image.unwrap_or_default().disk();
     let size_bytes = u64::from(rootfs_size_mb) * 1024 * 1024;
-    expand_rootfs(&build_dir.join("rootfs.ext4"), rootfs_size_mb)
+    expand_rootfs(&build_dir.join("rootfs.ext4"), rootfs_size_mb, layout)
         .map(|path| Some((path, size_bytes)))
 }
 
@@ -149,10 +164,16 @@ fn manifest_rootfs_size_bytes(build_dir: &Path) -> Result<Option<u64>, ExpandedR
 pub(crate) fn rootfs_size_mb_from_metadata(
     build_dir: &Path,
 ) -> Result<Option<u32>, ExpandedRootfsError> {
+    Ok(read_metadata(build_dir)?
+        .disk_size_mb
+        .filter(|value| *value > 0))
+}
+
+fn read_metadata(build_dir: &Path) -> Result<TemplateMetadata, ExpandedRootfsError> {
     let metadata_path = build_dir.join("metadata.json");
     let metadata_json = match std::fs::read_to_string(&metadata_path) {
         Ok(metadata_json) => metadata_json,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "{}".to_owned(),
         Err(source) => {
             return Err(ExpandedRootfsError::Io {
                 operation: "read metadata",
@@ -167,10 +188,44 @@ pub(crate) fn rootfs_size_mb_from_metadata(
             source,
         }
     })?;
-    Ok(metadata.disk_size_mb.filter(|value| *value > 0))
+    if let Some(execution) = metadata.execution_metadata()? {
+        pplx_space_execution_catalog::guest::GuestProfile::resolve(
+            execution,
+            metadata.guest_image.unwrap_or_default(),
+        )?;
+    }
+    let manifest_path = build_dir.join("manifest.json");
+    match std::fs::read_to_string(&manifest_path) {
+        Ok(bytes) => {
+            let manifest: TemplateManifest = serde_json::from_str(&bytes).map_err(|source| {
+                ExpandedRootfsError::InvalidMetadata {
+                    path: manifest_path.display().to_string(),
+                    source,
+                }
+            })?;
+            manifest.execution_metadata()?;
+            if manifest.guest_image != metadata.guest_image {
+                return Err(ExpandedRootfsError::GuestImageMismatch);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(ExpandedRootfsError::Io {
+                operation: "read manifest",
+                path: manifest_path.display().to_string(),
+                source,
+            });
+        }
+    }
+
+    Ok(metadata)
 }
 
-fn expand_rootfs(rootfs_path: &Path, rootfs_size_mb: u32) -> Result<PathBuf, ExpandedRootfsError> {
+fn expand_rootfs(
+    rootfs_path: &Path,
+    rootfs_size_mb: u32,
+    layout: GuestDiskLayout,
+) -> Result<PathBuf, ExpandedRootfsError> {
     let requested_bytes = u64::from(rootfs_size_mb) * 1024 * 1024;
     let current_bytes = std::fs::metadata(rootfs_path)
         .map(|metadata| metadata.len())
@@ -189,19 +244,30 @@ fn expand_rootfs(rootfs_path: &Path, rootfs_size_mb: u32) -> Result<PathBuf, Exp
         return Ok(rootfs_path.to_path_buf());
     }
 
-    let mut truncate = std::process::Command::new("truncate");
-    truncate
-        .args(["-s", &format!("{rootfs_size_mb}M")])
-        .arg(rootfs_path);
-    run_status_command("truncate", &mut truncate, rootfs_path, |_| false)?;
-
-    let mut fsck = std::process::Command::new("e2fsck");
-    fsck.arg("-fy").arg(rootfs_path);
-    run_status_command("e2fsck", &mut fsck, rootfs_path, |code| code == Some(1))?;
-
-    let mut resize = std::process::Command::new("resize2fs");
-    resize.arg(rootfs_path);
-    run_status_command("resize2fs", &mut resize, rootfs_path, |_| false)?;
+    // Extending an opaque disk preserves its partition table and filesystem;
+    // only the guest may resize those structures.
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(rootfs_path)
+        .map_err(|source| ExpandedRootfsError::Io {
+            operation: "open disk",
+            path: rootfs_path.display().to_string(),
+            source,
+        })?;
+    file.set_len(requested_bytes)
+        .map_err(|source| ExpandedRootfsError::Io {
+            operation: "extend disk",
+            path: rootfs_path.display().to_string(),
+            source,
+        })?;
+    if layout == GuestDiskLayout::Ext4Filesystem {
+        let mut fsck = std::process::Command::new("e2fsck");
+        fsck.arg("-fy").arg(rootfs_path);
+        run_status_command("e2fsck", &mut fsck, rootfs_path, |code| code == Some(1))?;
+        let mut resize = std::process::Command::new("resize2fs");
+        resize.arg(rootfs_path);
+        run_status_command("resize2fs", &mut resize, rootfs_path, |_| false)?;
+    }
 
     let rootfs_path = checked_rootfs_size(rootfs_path.to_path_buf(), requested_bytes)?;
     page_cache::advise_path_dontneed(&rootfs_path, "expand template rootfs");

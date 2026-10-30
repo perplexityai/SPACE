@@ -1607,6 +1607,19 @@ async fn try_pull_from(
         return Err(PullError::Failure(PullFailure::ManifestUnsafeFilename));
     }
 
+    let metadata = crate::service::validate_guest_documents(&metadata_bytes, &manifest_bytes)
+        .map_err(|error| {
+            warn!(template = name, %error, "invalid pulled template documents");
+            PullError::Failure(PullFailure::ExecutionMetadataInvalid)
+        })?;
+
+    if metadata.guest_image.is_some() {
+        warn!(
+            template = name,
+            "refusing unsupported or local-only guest image in template pull"
+        );
+        return Err(PullError::Failure(PullFailure::ExecutionMetadataInvalid));
+    }
     // 3. Build the download plan from `manifest.files` with the dedup
     //    rule: when both `X` and `X.zst` are listed (with a well-formed
     //    zstd descriptor), drop `X` and pull only `X.zst`. Decompression
@@ -1708,8 +1721,6 @@ async fn try_pull_from(
         });
     }
 
-    let metadata: pplx_space_common_core::types::TemplateMetadata =
-        serde_json::from_slice(&metadata_bytes).unwrap_or_default();
     let rootfs_size = rootfs_outcome.rootfs_size;
     let artifact_size = rootfs_size;
     let manifest = crate::service::normalize_template_manifest(

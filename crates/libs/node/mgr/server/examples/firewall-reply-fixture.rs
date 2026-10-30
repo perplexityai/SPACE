@@ -16,7 +16,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("recover") => recover_pool().await?,
         Some("setup") => {
             firewall::setup_namespace_rules(namespace, "vpeer", "198.18.0.1", "169.254.0.21")?;
-            net::setup_tproxy(namespace, 12345, "vpeer")?;
+            net::setup_tproxy(namespace, 12345, "vpeer", false)?;
             for protocol in ["tcp", "udp"] {
                 firewall::allow_guest_port(namespace, "vpeer", 9000, protocol)?;
             }
@@ -25,7 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             firewall::validate_namespace_firewall_config(namespace, "vpeer", "169.254.0.21")?;
         }
         Some("reapply") => {
-            net::setup_tproxy(namespace, 12345, "vpeer")?;
+            net::setup_tproxy(namespace, 12345, "vpeer", false)?;
         }
         _ => {
             return Err(

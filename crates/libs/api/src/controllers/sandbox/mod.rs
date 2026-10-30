@@ -757,9 +757,11 @@ pub(crate) fn record_reconnect_attempt(
         terminal_phase: tags.terminal_phase,
         reason: tags.reason,
         // The identity flows unchanged from the connect entrypoint, so the
-        // coarse client class stamped there rides through every downstream
-        // reconnect emission (route rejections and the controller wake path).
+        // client class and bounded client id stamped there ride through every
+        // downstream reconnect emission (route rejections and the controller
+        // wake path).
         client_class: identity.client_class,
+        client_id: identity.client_id,
         started_at,
     });
 }

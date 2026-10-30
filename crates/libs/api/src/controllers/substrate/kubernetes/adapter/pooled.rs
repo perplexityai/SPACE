@@ -52,6 +52,7 @@ pub(super) fn pooled_wake_request(
         // resuming it. If the invariant is violated and the VM is already
         // Started, Wake preserves Started rather than pausing a live VM.
         target_state: target_state as i32,
+        runtime_upgrade: None,
     })
 }
 

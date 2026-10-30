@@ -26,18 +26,18 @@ use std::time::{Duration, Instant, SystemTime};
 
 use pplx_space_common_core::host::linux::paths;
 use pplx_space_common_core::types::{
-    Arch, ArtifactComponentKind, ArtifactComponentRole, ArtifactVersion, Digest,
-    FIRECRACKER_STATE_FORMAT, RuntimeIdentity, RuntimeKind, RuntimeVersion, StateFormatIdentity,
-    StateFormatName,
+    Arch, ArtifactComponentKind, ArtifactComponentRole, ArtifactVersion, Digest, RuntimeIdentity,
+    RuntimeKind, RuntimeVersion, StateFormatIdentity,
 };
 use sha2::{Digest as _, Sha256};
+
+mod boot_artifact;
 
 use crate::catalog::ManagedDirectoryName;
 
 use super::kernel_release::KernelReleaseScanner;
 use super::{
-    FirecrackerDriver, RuntimeInstallationRoot, boot_component_role, kernel_candidate_version,
-    version_from_dir,
+    RuntimeInstallationRoot, boot_component_role, kernel_candidate_version, version_from_dir,
 };
 
 const KERNEL_IMAGE: &str = "vmlinux.bin";
@@ -113,13 +113,23 @@ pub struct ScanLimits {
 pub struct ArtifactKinds {
     pub runtimes: bool,
     pub kernels: bool,
+    pub firmware: bool,
 }
 
 impl ArtifactKinds {
     pub const ALL: Self = Self {
         runtimes: true,
         kernels: true,
+        firmware: true,
     };
+
+    pub const fn includes_component(self, kind: ArtifactComponentKind) -> bool {
+        match kind {
+            ArtifactComponentKind::Kernel => self.kernels,
+            ArtifactComponentKind::Firmware => self.firmware,
+            _ => false,
+        }
+    }
 }
 
 /// What an artifact is, in the shared execution vocabulary. A kernel's
@@ -651,11 +661,18 @@ pub fn scan(
         scanner.scan_legacy_assets(&roots.cache_legacy_assets);
     }
 
+    if let Some(kernels) = &roots.managed_kernels {
+        let root = crate::artifact_layout::boot_artifacts_root(kernels);
+        if kinds.includes_component(ArtifactComponentKind::Firmware) {
+            scanner.scan_boot_artifacts(&root, ArtifactComponentKind::Firmware);
+        }
+    }
+
     // A filtered scan evicts only its own kind; the untouched partition is
     // still bounded by the last scan that visited it.
     scanner.previous.retain(|(kind, _), _| match kind {
         ArtifactKind::Runtime(_) => !kinds.runtimes,
-        ArtifactKind::Component(_) => !kinds.kernels,
+        ArtifactKind::Component(kind) => !kinds.includes_component(*kind),
     });
     scanner.previous.extend(scanner.seen);
     cache.entries = scanner.previous;
@@ -1268,8 +1285,8 @@ fn empty_artifact(origin: ArtifactOrigin, name: String, path: PathBuf) -> Scanne
             ArtifactKind::Component(ArtifactComponentKind::Kernel) => Some(boot_component_role()),
             ArtifactKind::Component(_) | ArtifactKind::Runtime(_) => None,
         },
-        // The runtime manager installs nothing yet, so nothing it finds is
-        // its own.
+        // Management attribution is applied from the configured store roots,
+        // never inferred from a directory label alone.
         management: ArtifactManagement::External(ArtifactProvider::Unknown),
         name,
         path,
@@ -1290,68 +1307,9 @@ pub fn probe_elf_file(path: &Path) -> std::io::Result<ElfProbe> {
     probe_elf(&mut open_nonblocking(path)?)
 }
 
-/// Resolve a runtime release's qualified memory-state format.
-pub type StateFormatResolver = fn(&RuntimeVersion) -> Result<StateFormatIdentity, String>;
-
-/// What one runtime's release directory holds.
-pub struct ReleaseLayout {
-    /// Binaries under the release directory, all required. The first is the
-    /// runtime's own and names the release's architecture.
-    pub binaries: &'static [&'static str],
-    /// A qualified persisted-state format, when SPACE supports memory state
-    /// for this runtime. A valid installation need not support snapshots.
-    pub state_format: Option<StateFormatResolver>,
-    /// Releases that may be pinned by the catalog. Recognizing a directory's
-    /// layout alone does not qualify that release for installation or execution.
-    pub known_releases: fn() -> Vec<&'static str>,
-}
-
-impl ReleaseLayout {
-    /// The layout of `runtime`'s releases, for the runtimes the scan knows.
-    pub fn of(runtime: RuntimeKind) -> Option<&'static Self> {
-        match runtime {
-            RuntimeKind::Firecracker => Some(&FIRECRACKER_RELEASE_LAYOUT),
-            RuntimeKind::CloudHypervisor => Some(&CLOUD_HYPERVISOR_RELEASE_LAYOUT),
-            RuntimeKind::Gvisor => None,
-        }
-    }
-}
-
-/// `bin/firecracker` and `bin/jailer`, writing the snapshot version the
-/// known-release map gives.
-pub const FIRECRACKER_RELEASE_LAYOUT: ReleaseLayout = ReleaseLayout {
-    binaries: &["bin/firecracker", "bin/jailer"],
-    state_format: Some(firecracker_state_format),
-    known_releases: firecracker_known_releases,
+pub use pplx_space_execution_catalog::layout::{
+    FIRECRACKER_RELEASE_LAYOUT, ReleaseLayout, StateFormatResolver,
 };
-
-const CLOUD_HYPERVISOR_RELEASE_LAYOUT: ReleaseLayout = ReleaseLayout {
-    binaries: &["bin/cloud-hypervisor"],
-    state_format: None,
-    // Install pins do not qualify this runtime for sandbox execution.
-    known_releases: || vec![crate::catalog::CLOUD_HYPERVISOR_INSTALL_VERSION],
-};
-
-fn firecracker_known_releases() -> Vec<&'static str> {
-    super::FIRECRACKER_STATE_FORMAT_RELEASES
-        .iter()
-        .map(|release| release.runtime_version)
-        .collect()
-}
-
-fn firecracker_state_format(version: &RuntimeVersion) -> Result<StateFormatIdentity, String> {
-    let driver = FirecrackerDriver;
-    driver
-        .parse_version(version)
-        .map_err(|error| error.to_string())?;
-    Ok(StateFormatIdentity {
-        format: StateFormatName::parse(FIRECRACKER_STATE_FORMAT)
-            .map_err(|error| error.to_string())?,
-        version: driver
-            .state_format_version(version)
-            .map_err(|error| error.to_string())?,
-    })
-}
 
 fn inspect_runtime_release(
     runtime: RuntimeKind,

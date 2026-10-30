@@ -9,7 +9,7 @@ use pplx_space_common_core::types::{
     Arch, ArtifactComponentKind, ArtifactComponentMetadata, ArtifactComponentRole, ArtifactFormat,
     ArtifactVersion, Digest, EnvironmentReference, ExecutionMetadata, ExecutionMetadataError,
     FIRECRACKER_STATE_FORMAT, GuestOperatingSystem, GuestPlatform, RuntimeIdentity, RuntimeKind,
-    RuntimeVersion, StateFormatIdentity, StateFormatName, StateFormatVersion,
+    RuntimeVersion, StateFormatIdentity, StateFormatName, StateFormatVersion, VersionSortKey,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -18,6 +18,7 @@ pub mod diagnostic;
 pub mod kernel_release;
 #[cfg(feature = "artifact-store")]
 mod managed;
+mod observation;
 
 const BOOT_COMPONENT_ROLE: &str = "boot";
 const VMLINUX_COMPONENT_FORMAT: &str = "vmlinux";
@@ -26,33 +27,7 @@ pub fn boot_component_role() -> ArtifactComponentRole {
     ArtifactComponentRole::parse(BOOT_COMPONENT_ROLE).expect("boot component role is valid")
 }
 
-struct FirecrackerStateFormatRelease {
-    runtime_version: &'static str,
-    state_format_version: &'static str,
-}
-
-const FIRECRACKER_STATE_FORMAT_RELEASES: &[FirecrackerStateFormatRelease] = &[
-    FirecrackerStateFormatRelease {
-        runtime_version: "1.15.1",
-        state_format_version: "9.0.0",
-    },
-    FirecrackerStateFormatRelease {
-        runtime_version: "1.16.0",
-        state_format_version: "10.0.0",
-    },
-    FirecrackerStateFormatRelease {
-        runtime_version: "1.16.1",
-        state_format_version: "10.0.0",
-    },
-    FirecrackerStateFormatRelease {
-        runtime_version: "1.16.2",
-        state_format_version: "11.0.0",
-    },
-    FirecrackerStateFormatRelease {
-        runtime_version: "1.17.0",
-        state_format_version: "12.0.0",
-    },
-];
+use pplx_space_execution_catalog::layout::FIRECRACKER_STATE_FORMAT_RELEASES;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeInstallation {
@@ -358,6 +333,8 @@ pub enum RuntimeInventoryError {
     },
     #[error("kernel read returned {read} bytes for a {len}-byte buffer")]
     InvalidKernelReadBuffer { read: usize, len: usize },
+    #[error("compiled environment has no auxiliary boot-file pin for {0:?}")]
+    MissingBootArtifactPin(pplx_space_common_core::types::ComponentIdentity),
     #[error("no installed artifact component matches {0:?}")]
     NoCompatibleComponent(ArtifactComponentMetadata),
     #[error("no {selection} {kind} component is installed")]
@@ -429,6 +406,7 @@ impl RuntimeInventoryError {
             | Self::InvalidExecutionMetadata(_)
             | Self::UnknownFirecrackerSnapshotFormat(_)
             | Self::IncompleteInstallation { .. }
+            | Self::MissingBootArtifactPin(_)
             | Self::NoCompatibleComponent(_)
             | Self::NoDefaultComponent { .. }
             | Self::NoCompatibleRuntime { .. }
@@ -591,6 +569,9 @@ trait RuntimeDriver: Send + Sync {
         left: &RuntimeVersion,
         right: &RuntimeVersion,
     ) -> Result<Ordering, RuntimeInventoryError>;
+    /// A portable key that orders as `compare_versions` does, for versions
+    /// whose order fits integer components. `None` publishes no order.
+    fn version_sort_key(&self, version: &RuntimeVersion) -> Option<VersionSortKey>;
     fn can_execute(
         &self,
         installed: &RuntimeInstallation,
@@ -813,6 +794,10 @@ impl RuntimeDriver for FirecrackerDriver {
         Ok(self.parse_version(left)?.cmp(&self.parse_version(right)?))
     }
 
+    fn version_sort_key(&self, version: &RuntimeVersion) -> Option<VersionSortKey> {
+        semver_sort_key(&self.parse_version(version).ok()?)
+    }
+
     fn can_execute(
         &self,
         installed: &RuntimeInstallation,
@@ -870,6 +855,29 @@ impl RuntimeDriverRegistry {
 }
 
 static DRIVERS: RuntimeDriverRegistry = RuntimeDriverRegistry::new();
+
+/// The runtime driver's ordering key for a release, when it defines one.
+fn semver_sort_key(version: &semver::Version) -> Option<VersionSortKey> {
+    // A pre-release sorts before its release, which [major, minor, patch]
+    // can't express; build metadata has no defined order.
+    if !version.pre.is_empty() || !version.build.is_empty() {
+        return None;
+    }
+    let component = |value: u64| u32::try_from(value).ok();
+    VersionSortKey::new(vec![
+        component(version.major)?,
+        component(version.minor)?,
+        component(version.patch)?,
+    ])
+    .ok()
+}
+
+pub(crate) fn version_sort_key(runtime: &RuntimeIdentity) -> Option<VersionSortKey> {
+    DRIVERS
+        .get(runtime.kind)
+        .ok()?
+        .version_sort_key(&runtime.version)
+}
 
 impl RuntimeInventory {
     /// Root-owned artifacts are immutable; missing/replaced files invalidate a
@@ -1238,9 +1246,14 @@ impl RuntimeInventory {
                         RuntimeInventoryError::NoCompatibleComponent(component.clone())
                     })?;
                 resolved_components.push(installed.metadata.clone());
+                selected_components.push(ResolvedArtifactComponent {
+                    metadata: installed.metadata.clone(),
+                    path: installed.path.clone(),
+                    integrity: installed.integrity,
+                });
             }
         }
-        if !omit_boot_components {
+        if !omit_boot_components && binding.is_none() {
             let boot_role = boot_component_role();
             let requested_kernel = requested.and_then(|metadata| {
                 metadata.component(ArtifactComponentKind::Kernel, Some(&boot_role))
@@ -1273,11 +1286,13 @@ impl RuntimeInventory {
             if requested_kernel.is_none() {
                 resolved_components.push(kernel.metadata.clone());
             }
-            selected_components.push(ResolvedArtifactComponent {
-                metadata: kernel.metadata.clone(),
-                path: kernel.path.clone(),
-                integrity: kernel.integrity,
-            });
+            if requested_kernel.is_none() {
+                selected_components.push(ResolvedArtifactComponent {
+                    metadata: kernel.metadata.clone(),
+                    path: kernel.path.clone(),
+                    integrity: kernel.integrity,
+                });
+            }
         }
         let execution = ExecutionMetadata::new(
             selected_runtime.runtime.clone(),
@@ -1330,6 +1345,9 @@ impl RuntimeInventory {
                     })
                     .into_iter()
                     .collect(),
+                version_sort_key: VersionSortKey::to_wire(
+                    version_sort_key(&installation.runtime).as_ref(),
+                ),
             })
             .collect();
         let components = self
@@ -1343,6 +1361,7 @@ impl RuntimeInventory {
             .collect();
         proto::NodeExecutionInventory {
             policy: None,
+            environments: None,
             runtimes,
             components,
         }

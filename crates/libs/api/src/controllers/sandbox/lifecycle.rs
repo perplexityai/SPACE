@@ -2224,6 +2224,7 @@ impl SandboxController {
                         blocking: true,
                         start_context: None,
                         target_state: 0,
+                        runtime_upgrade: None,
                     })
                     .await?;
                 SandboxLifecycleStatus::Started

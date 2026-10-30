@@ -5106,6 +5106,59 @@ fn detail_sandbox_uses_cached_runtime_spec() {
 }
 
 #[test]
+fn detail_reports_authoritative_federated_ownership_not_metadata() {
+    let mut sandbox = test_sandbox();
+    sandbox.metadata.0.insert(
+        "space.owner".into(),
+        SandboxMetadataValue::String(
+            r#"{"source":"federated_identity","orgID":"forged-org"}"#.into(),
+        ),
+    );
+    let response = native_sandbox_response(sandbox.id);
+    let mut ownerships = Vec::new();
+    for (source, issuer, org, expected) in [
+        (
+            SandboxOwnerSource::Local,
+            None,
+            None,
+            serde_json::json!({"source": "local"}),
+        ),
+        (
+            SandboxOwnerSource::FederatedIdentity,
+            Some("example-issuer"),
+            Some("tenant-org"),
+            serde_json::json!({"source": "federated_identity", "issuer": "example-issuer", "orgID": "tenant-org"}),
+        ),
+    ] {
+        sandbox.owner_source = source;
+        sandbox.upstream_issuer = issuer.map(str::to_owned);
+        sandbox.upstream_org_id = org.map(str::to_owned);
+        let detail =
+            build_detail_sandbox(&test_ecw_credential_keyring(), &sandbox, &response, None)
+                .unwrap();
+        let detail = serde_json::to_value(detail).unwrap();
+        assert_eq!(detail["ownership"], expected);
+        ownerships.push(detail["ownership"].clone());
+    }
+    insta::assert_json_snapshot!(ownerships, @r#"
+    [
+      {
+        "source": "local"
+      },
+      {
+        "source": "federated_identity",
+        "issuer": "example-issuer",
+        "orgID": "tenant-org"
+      }
+    ]
+    "#);
+
+    sandbox.upstream_org_id = None;
+    build_detail_sandbox(&test_ecw_credential_keyring(), &sandbox, &response, None)
+        .expect_err("incomplete federated ownership must be rejected");
+}
+
+#[test]
 fn sandbox_template_id_does_not_append_content_hash() {
     let mut sandbox = test_sandbox();
     sandbox.template_id = Some("app-runtime".to_string());

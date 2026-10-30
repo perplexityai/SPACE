@@ -591,6 +591,39 @@ impl TemplateManagerService {
             }
         };
 
+        let metadata_bytes = match std::fs::read(register_source.metadata_path()) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => {
+                return Err(Status::failed_precondition(format!(
+                    "read template metadata: {error}"
+                )));
+            }
+        };
+        let source_manifest = register_source
+            .metadata_path()
+            .with_file_name("manifest.json");
+        let manifest_bytes = match std::fs::read(&source_manifest) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => {
+                return Err(Status::failed_precondition(format!(
+                    "read template manifest: {error}"
+                )));
+            }
+        };
+        let metadata = validate_guest_documents(&metadata_bytes, &manifest_bytes)?;
+        if metadata.guest_image.is_some() {
+            self.authorize_peer(
+                &request,
+                "RegisterFirmwareTemplate",
+                &[
+                    UdsPeerPrincipal::Root,
+                    UdsPeerPrincipal::Role(LocalRole::Operator),
+                ],
+            )?;
+        }
+
         // Network policy validation is independent of the content hash, so run
         // it before any disk work.
         if let Some(requested_policy) = requested_network_policy.as_ref() {
@@ -633,8 +666,7 @@ impl TemplateManagerService {
         // Read metadata for build_date / arch.
         let meta_path = format!("{staging_dir}/metadata.json");
         let metadata_json = std::fs::read_to_string(&meta_path).unwrap_or_default();
-        let metadata: pplx_space_common_core::types::TemplateMetadata =
-            serde_json::from_str(&metadata_json).unwrap_or_default();
+        let metadata = validate_guest_documents(metadata_json.as_bytes(), &[])?;
         let build_date = metadata.built_at.clone();
         // No manifest on disk yet during register — the empty default is
         // the equivalent of the previous `serde_json::Value::Null`.

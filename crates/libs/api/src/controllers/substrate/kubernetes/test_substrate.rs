@@ -12,6 +12,9 @@ use kube::runtime::{reflector, watcher::Event};
 use super::execution::RecoveryJoinBackoffPolicy;
 use super::*;
 use crate::controllers::substrate::AbandonedRestoreRetirement;
+use crate::controllers::substrate::runtime_upgrade::{
+    RuntimePolicyCache, RuntimeUpgradeAtActivation,
+};
 
 /// The namespace a substrate built here keeps its sandbox pods and their
 /// `sandbox_k8s_executions` rows in.
@@ -108,6 +111,7 @@ pub(super) fn assemble_substrate(
             create_data_plane_ready_timeout: Duration::from_secs(1),
             k8s_blocking_delete_timeout: Duration::from_secs(1),
             abandoned_restore_retirement: AbandonedRestoreRetirement::Enabled,
+            runtime_upgrade_at_activation: RuntimeUpgradeAtActivation::Disabled,
             caches,
         },
         restore_waiters: RestoreWaiters::new(
@@ -131,6 +135,7 @@ pub(super) fn assemble_substrate(
         // tests.
         node_group_placement: NodeGroupPlacementResolver::new(pool, false),
         recovery_join_backoff: RecoveryJoinBackoffPolicy::default(),
+        runtime_policy: RuntimePolicyCache::default(),
         budgets: SubstrateBudgets::default(),
         shutdown_token,
         task_tracker,

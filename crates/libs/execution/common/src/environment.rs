@@ -7,11 +7,20 @@ use pplx_space_common_core::types::*;
 use crate::{ExecutionProtoError, proto};
 
 mod binding;
+mod observation;
 mod profiles;
 mod transport;
 pub use binding::{EnvironmentBindingError, EnvironmentRequirementsError};
+pub use observation::{
+    ENVIRONMENT_OBSERVATION_SCHEMA_VERSION, EnvironmentObservation, EnvironmentObservationError,
+    KnownEnvironment,
+};
 pub use transport::{FIRECRACKER_BOOT_CONTRACT, FIRECRACKER_MACHINE_CONTRACT};
 pub const CLOUD_HYPERVISOR_BOOT_CONTRACT: &str = "cloud-hypervisor-linux-direct-v1";
+/// UEFI raw-disk boot; no Linux kernel, command line, or initramfs.
+pub const CLOUD_HYPERVISOR_UEFI_BOOT_CONTRACT: &str = "cloud-hypervisor-uefi-v1";
+/// x86 PCI/ACPI, KVM Hyper-V enlightenments, UTC RTC; cold boot only.
+pub const CLOUD_HYPERVISOR_WINDOWS_MACHINE_CONTRACT: &str = "cloud-hypervisor-windows-pci-v1";
 pub const CLOUD_HYPERVISOR_MACHINE_CONTRACT: &str = "cloud-hypervisor-pci-v1";
 
 /// The direct-boot image format is part of the compiled CH boot contract.

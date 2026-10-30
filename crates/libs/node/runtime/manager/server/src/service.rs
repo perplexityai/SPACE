@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::installs::{
-    CancelOperationError, Installer, KernelSource, LookupOperationError, ReleaseLine,
-    ReleaseLineParseError, RuntimeLine, SubmitOperationError, describe,
+    CancelOperationError, Installer, LookupOperationError, ReleaseLine, ReleaseLineParseError,
+    RuntimeLine, SubmitOperationError, describe,
 };
 use crate::protection::{self, AuditIdentity, PathRole};
 use crate::run::SERVICE_NAME;
@@ -127,17 +127,6 @@ impl RuntimeManagerService {
             )
         })
     }
-
-    fn kernel_source(
-        &self,
-        runtime: pplx_space_common_core::types::RuntimeKind,
-    ) -> Result<&Arc<dyn KernelSource>, Status> {
-        self.kernel_source.get(runtime).ok_or_else(|| {
-            Status::failed_precondition(format!(
-                "the runtime manager has no kernel source configured for {runtime}"
-            ))
-        })
-    }
 }
 
 fn parse_operation_id(value: &str) -> Result<JobId, Status> {
@@ -171,26 +160,29 @@ fn parse_release(runtime_kind: i32, version: &str) -> Result<RuntimeIdentity, St
     Ok(RuntimeIdentity { kind, version })
 }
 
-fn require_kernel(kind: i32) -> Result<(), Status> {
-    match ArtifactComponentKind::try_from(kind) {
-        Ok(ArtifactComponentKind::Kernel) => Ok(()),
-        Ok(ArtifactComponentKind::Unspecified) | Err(_) => {
-            Err(Status::invalid_argument("a component kind is required"))
-        }
-        Ok(_) => Err(Status::failed_precondition(
-            "this build only installs kernel components",
-        )),
-    }
-}
-
 fn parse_component(
     value: Option<&pplx_space_node_runtime_manager_client::proto::ComponentIdentity>,
 ) -> Result<ComponentIdentity, Status> {
     let value =
         value.ok_or_else(|| Status::invalid_argument("a component identity is required"))?;
-    require_kernel(value.kind)?;
+    let kind = match ArtifactComponentKind::try_from(value.kind) {
+        Ok(ArtifactComponentKind::Kernel) => {
+            pplx_space_common_core::types::ArtifactComponentKind::Kernel
+        }
+        Ok(ArtifactComponentKind::Firmware) => {
+            pplx_space_common_core::types::ArtifactComponentKind::Firmware
+        }
+        Ok(ArtifactComponentKind::Unspecified) | Err(_) => {
+            return Err(Status::invalid_argument("a component kind is required"));
+        }
+        Ok(_) => {
+            return Err(Status::failed_precondition(
+                "no installer for this component kind",
+            ));
+        }
+    };
     Ok(ComponentIdentity {
-        kind: pplx_space_common_core::types::ArtifactComponentKind::Kernel,
+        kind,
         version: value
             .version
             .parse()
@@ -223,7 +215,7 @@ fn parse_identity(value: Option<&ArtifactIdentity>) -> Result<RequestedArtifact,
         None => Err(Status::invalid_argument("artifact identity is required")),
     }
 }
-fn presence(root: &std::path::Path, names: &[String; 2]) -> ArtifactPresence {
+fn presence(root: &std::path::Path, names: &[String]) -> ArtifactPresence {
     let path =
         match pplx_space_node_runtime_core::artifact_store::existing_artifact_path(root, names) {
             Ok(path) => path,
@@ -272,9 +264,7 @@ fn cancel_status(error: CancelOperationError) -> Status {
 }
 
 /// The scan covers what the request names: every kind when `kinds` is empty,
-/// and every component kind when `component_kinds` is empty. Kernels are the
-/// only components the scan finds, so a filter naming other component kinds
-/// lists no components.
+/// and every supported component kind when `component_kinds` is empty.
 fn parse_kinds(request: &ListExecutionArtifactsRequest) -> Result<ArtifactKinds, Status> {
     let mut runtimes = request.kinds.is_empty();
     let mut components = request.kinds.is_empty();
@@ -290,9 +280,11 @@ fn parse_kinds(request: &ListExecutionArtifactsRequest) -> Result<ArtifactKinds,
         }
     }
     let mut kernels = request.component_kinds.is_empty();
+    let mut firmware = request.component_kinds.is_empty();
     for kind in &request.component_kinds {
         match ArtifactComponentKind::try_from(*kind) {
             Ok(ArtifactComponentKind::Kernel) => kernels = true,
+            Ok(ArtifactComponentKind::Firmware) => firmware = true,
             Ok(ArtifactComponentKind::Unspecified) | Err(_) => {
                 return Err(Status::invalid_argument(format!(
                     "unsupported artifact component kind {kind}"
@@ -304,6 +296,7 @@ fn parse_kinds(request: &ListExecutionArtifactsRequest) -> Result<ArtifactKinds,
     Ok(ArtifactKinds {
         runtimes,
         kernels: components && kernels,
+        firmware: components && firmware,
     })
 }
 
@@ -417,6 +410,24 @@ impl RuntimeManager for RuntimeManagerService {
         self.peer_authorizer
             .authorize_request(&request, "ListAvailableArtifacts", ALLOW_READ)?;
         let filter = request.into_inner();
+        let boot_kinds: Vec<_> = [ArtifactComponentKind::Firmware]
+            .into_iter()
+            .filter(|kind| {
+                filter.runtime_kind == execution::RuntimeKind::Unspecified as i32
+                    && filter.runtime_version.is_none()
+                    && (filter.kinds.is_empty()
+                        || filter
+                            .kinds
+                            .contains(&(ExecutionArtifactKind::Component as i32)))
+                    && (filter.component_kinds.is_empty()
+                        || filter.component_kinds.contains(&(*kind as i32)))
+            })
+            .collect();
+        let boot_source = self
+            .installer
+            .as_ref()
+            .and_then(|installer| installer.boot_source())
+            .map(std::path::Path::to_path_buf);
         let kinds = parse_kinds(&ListExecutionArtifactsRequest {
             kinds: filter.kinds,
             component_kinds: filter.component_kinds,
@@ -447,8 +458,9 @@ impl RuntimeManager for RuntimeManagerService {
             .map_err(|error| Status::internal(describe(&error)))?
             .map_err(|error| Status::failed_precondition(describe(&error)))?;
         let mut offered = Vec::new();
-        if kinds.kernels {
-            let source = self.kernel_source(runtime)?;
+        if kinds.kernels
+            && let Some(source) = self.kernel_source.get(runtime)
+        {
             let mut lines = match line {
                 Some(line) => vec![line],
                 None => catalog
@@ -492,6 +504,19 @@ impl RuntimeManager for RuntimeManagerService {
                             &releases.root,
                             &pplx_space_node_runtime_core::artifact_store::release_directory_names(&pin.release, pin.digest()),
                         ) as i32,
+                        compatible_runtimes: Vec::new(),
+                    });
+                }
+            }
+            if let Some(source) = boot_source {
+                for pin in catalog.boot_artifacts(architecture).filter(|pin| boot_kinds.contains(&execution::ArtifactComponentKind::from(pin.identity().kind))) {
+                    let directory = pplx_space_node_runtime_core::artifact_store::boot_artifact_directory(pin.identity());
+                    artifacts.push(AvailableArtifact {
+                        identity: Some(crate::convert::component_identity(pin.identity().clone())),
+                        architecture: architecture.as_str().to_string(),
+                        size: Some(pin.size()),
+                        source: source.join(&directory).join(pplx_space_node_runtime_core::artifact_store::BOOT_ARTIFACT_IMAGE).display().to_string(),
+                        presence: kernels_root.as_ref().map_or(ArtifactPresence::Unspecified, |root| presence(&pplx_space_node_runtime_core::artifact_layout::boot_artifacts_root(root), std::slice::from_ref(&directory))) as i32,
                         compatible_runtimes: Vec::new(),
                     });
                 }
@@ -561,6 +586,15 @@ impl RuntimeManager for RuntimeManagerService {
                 .install_release(release, digest)
                 .await
                 .map_err(submit_status)?,
+            RequestedArtifact::Component(component)
+                if component.kind
+                    != pplx_space_common_core::types::ArtifactComponentKind::Kernel =>
+            {
+                installer
+                    .install_boot_artifact(component)
+                    .await
+                    .map_err(submit_status)?
+            }
             RequestedArtifact::Component(component) => {
                 let checking = installer.clone();
                 let requested = component.clone();
@@ -608,6 +642,12 @@ impl RuntimeManager for RuntimeManagerService {
         let operation = match identity {
             RequestedArtifact::Runtime(release, digest) => {
                 installer.uninstall_release(release, digest).await
+            }
+            RequestedArtifact::Component(component)
+                if component.kind
+                    != pplx_space_common_core::types::ArtifactComponentKind::Kernel =>
+            {
+                installer.uninstall_boot_artifact(component).await
             }
             RequestedArtifact::Component(component) => {
                 let version = component

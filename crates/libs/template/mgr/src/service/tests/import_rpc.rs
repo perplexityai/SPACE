@@ -31,7 +31,7 @@ enum Change {
 #[case::digest(Change::Digest, Code::AlreadyExists)]
 #[case::size(Change::Size, Code::AlreadyExists)]
 #[case::corrupted_rootfs(Change::Corruption, Code::FailedPrecondition)]
-#[case::unsupported_schema(Change::Schema, Code::AlreadyExists)]
+#[case::unsupported_schema(Change::Schema, Code::FailedPrecondition)]
 #[case::registration_failure(Change::Registration, Code::Internal)]
 #[case::description(Change::Description, Code::Ok)]
 #[case::unchanged(Change::Unchanged, Code::Ok)]
@@ -430,4 +430,41 @@ async fn rejected_snapshot_stream_discards_prepared_refresh(#[case] valid_dimens
                 .to_string_lossy()
                 .contains(".republishing."))
     );
+}
+
+#[tokio::test]
+async fn new_import_refuses_unknown_schema_without_waiting_for_disk_bytes() {
+    use futures_util::StreamExt;
+    for metadata in [false, true] {
+        let mut fixture = ImportFixture::new().await;
+        let mut header = fixture.changed_header(Change::Unchanged);
+        header.template.as_mut().unwrap().name = "unsupported-import".into();
+        let bytes = if metadata {
+            &mut header.metadata_json
+        } else {
+            &mut header.manifest_json
+        };
+        let mut document: Value = serde_json::from_slice(bytes).unwrap();
+        document["schema_version"] = json!(99);
+        *bytes = serde_json::to_vec(&document).unwrap();
+        let stream = tokio_stream::iter([ImportTemplateRequest {
+            payload: Some(Payload::Header(header)),
+        }])
+        .chain(futures_util::stream::pending());
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            fixture.client.import_template(stream),
+        )
+        .await
+        .expect("unsupported header must be refused before consuming disk data");
+        assert_eq!(result.unwrap_err().code(), Code::FailedPrecondition);
+        assert!(
+            !fixture
+                .service
+                .artifact_store
+                .root
+                .join("unsupported-import")
+                .exists()
+        );
+    }
 }

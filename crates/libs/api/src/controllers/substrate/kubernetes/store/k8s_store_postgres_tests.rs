@@ -15,6 +15,7 @@ mod lifecycle_writer_tests;
 mod materialization_record_tests;
 mod owned_restore_completion_tests;
 mod restore_revert_tests;
+mod runtime_upgrade_evidence_tests;
 mod started_recovery_observation_tests;
 mod stopped_evacuation_claim_tests;
 mod stopped_restore_selector_tests;

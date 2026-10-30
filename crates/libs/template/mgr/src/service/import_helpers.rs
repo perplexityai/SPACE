@@ -351,6 +351,7 @@ impl TemplateManagerService {
         header: &crate::proto::ImportTemplateHeader,
         stream: &mut tonic::Streaming<crate::proto::ImportTemplateRequest>,
     ) -> Result<Response<crate::proto::ImportTemplateResponse>, Status> {
+        validate_guest_documents(&header.metadata_json, &header.manifest_json)?;
         let digest_dir = build_artifacts_dir(&self.artifact_store.root, template_id, content_hash);
         let digest_dir = digest_dir.to_string_lossy().into_owned();
         let staging_dir = format!("{digest_dir}.importing.{}", Uuid::now_v7());
@@ -542,8 +543,7 @@ impl TemplateManagerService {
             .await?;
         let metadata_json = String::from_utf8_lossy(&header.metadata_json).to_string();
         let manifest = parse_template_manifest("incoming manifest_json", &header.manifest_json)?;
-        let metadata: pplx_space_common_core::types::TemplateMetadata =
-            serde_json::from_str(&metadata_json).unwrap_or_default();
+        let metadata = validate_guest_documents(metadata_json.as_bytes(), &header.manifest_json)?;
         let manifest = normalize_template_manifest(
             manifest,
             template_id,
