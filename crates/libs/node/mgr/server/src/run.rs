@@ -54,7 +54,7 @@ const ENV_MAX_SLOTS: &[&str] = &["SPACE_NODEMGR_NETWORK_POOL_MAX_SLOTS"];
 const ENV_TARGET_READY: &[&str] = &["SPACE_NODEMGR_NETWORK_POOL_TARGET"];
 const ENV_RETAINED_READY: &[&str] = &["SPACE_NODEMGR_NETWORK_POOL_RETAIN_READY"];
 const ENV_MIN_READY: &[&str] = &["SPACE_NODEMGR_NETWORK_POOL_MIN_READY"];
-const ENV_SANDBOX_CGROUP_MEMORY_MIB: &[&str] = &["SPACE_NODEMGR_SANDBOX_CGROUP_MEMORY_MIB"];
+const ENV_SANDBOX_CGROUP_MEMORY_MIB: &str = "SPACE_NODEMGR_SANDBOX_CGROUP_MEMORY_MIB";
 const ENV_SERVICE_PORT_INGRESS_ISOLATION: &[&str] =
     &["SPACE_NODEMGR_SERVICE_PORT_INGRESS_ISOLATION"];
 const ENV_DISK_IO_RESERVATION_ENABLED: &[&str] = &["SPACE_NODEMGR_DISK_IO_RESERVATION_ENABLED"];
@@ -291,17 +291,14 @@ fn env_string(names: &[&str]) -> Option<String> {
     None
 }
 
-fn env_u64(names: &[&'static str]) -> Result<Option<u64>, RunNodeMgrError> {
-    for name in names {
-        let Some(value) = env_string(&[name]) else {
-            continue;
-        };
-        return value
-            .parse::<u64>()
-            .map_err(|source| RunNodeMgrError::EnvNotU64 { name, source })
-            .map(Some);
-    }
-    Ok(None)
+fn env_u64(name: &'static str) -> Result<Option<u64>, RunNodeMgrError> {
+    env_string(&[name])
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|source| RunNodeMgrError::EnvNotU64 { name, source })
+        })
+        .transpose()
 }
 
 fn env_bool(names: &[&'static str]) -> Result<Option<bool>, RunNodeMgrError> {
