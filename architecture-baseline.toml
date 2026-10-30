@@ -116,7 +116,6 @@
 "crates/libs/api/src/routes/admin/node_store.rs" = 1
 "crates/libs/api/src/routes/admin/templates.rs" = 1
 "crates/libs/api/src/routes/public/sandboxes.rs" = 1
-"crates/libs/cluster/controller/server/src/node_drain/store.rs" = 1
 "crates/libs/cluster/controller/server/src/tombstone_retention.rs" = 2
 "crates/libs/cluster/trigger-queue/src/lib.rs" = 1
 "crates/libs/internal/api/server/src/data_plane_sessions/route_rows.rs" = 7
