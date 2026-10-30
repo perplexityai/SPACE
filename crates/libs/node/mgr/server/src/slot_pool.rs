@@ -614,7 +614,7 @@ impl NetworkPool {
         }))
     }
 
-    /// Startup authority checks must wait for recovery without holding host locks.
+    /// Callers must not hold a lock that a current holder may wait for.
     pub(crate) async fn claim_sandbox_mutation(
         &self,
         sandbox_id: &str,

@@ -7523,11 +7523,11 @@ pub(crate) mod service_tests {
         }
     }
 
-    /// node-manager refuses cleanup while another host mutation, such as a
-    /// network-slot reset, holds the sandbox's exclusive claim. A refused
-    /// first attempt fails the eviction RPC after the row was claimed, so the
-    /// claim must leave durable cleanup work that recovery completes without
-    /// another eviction call.
+    /// node-manager refuses cleanup when another host mutation, such as a
+    /// network-slot reset, holds the sandbox's exclusive claim past cleanup's
+    /// bounded wait. A refused first attempt fails the eviction RPC after the
+    /// row was claimed, so the claim must leave durable cleanup work that
+    /// recovery completes without another eviction call.
     #[tokio::test]
     async fn evict_cluster_deleted_stopped_sandbox_converges_after_a_refused_cleanup() {
         const REFUSED: &str = "sandbox host mutation or reset is in progress; retry";

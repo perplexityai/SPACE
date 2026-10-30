@@ -329,6 +329,26 @@ impl NodeManagerService {
         caller: Option<launch::ProcessHandle>,
     ) -> CleanupOperationResult {
         let sandbox_id = &req.sandbox_id;
+        // Also excludes recovery/reset when the active lease is already gone.
+        // Wait for any current holder like the other phases: a slot reset or
+        // recovery, Release, or shared work such as Launch, Prepare and the
+        // snapshot RPCs, which hold the claim for all of their host work.
+        // Shared work arriving meanwhile can keep the claim busy until the
+        // phase timeout; an expired wait keeps the refusal message callers
+        // retry on. The claim comes first so that a cleanup parked here holds
+        // no CleanupSandbox permit, which is node-wide, and no artifact lock,
+        // which a cache deletion waits for while holding a global delete slot.
+        // This order cannot close a cycle: nothing that waits for the claim
+        // holds the permit or the artifact lock, and RPCs that take the
+        // artifact lock and then the claim only try the claim. While this
+        // cleanup holds the claim and waits for its permit or the artifact
+        // lock, those RPCs therefore fail fast with Unavailable.
+        let _mutation_claim = wait_for_cleanup_phase(
+            &self.cleanup_operations.shutdown_token,
+            self.pool.claim_sandbox_mutation(sandbox_id),
+            "sandbox host mutation or reset is in progress; retry",
+        )
+        .await?;
         let _lifecycle_permit = wait_for_cleanup_phase(
             &self.cleanup_operations.shutdown_token,
             self.lifecycle_limiter
@@ -342,8 +362,6 @@ impl NodeManagerService {
             "timed out waiting for artifact transfer ownership",
         )
         .await??;
-        // Also excludes recovery/reset when the active lease is already gone.
-        let _mutation_claim = self.claim_sandbox_mutation(sandbox_id)?;
         let info = self.pool.get(sandbox_id).map_err(slot_store_status)?;
         let _cgroup_guard = wait_for_cleanup_phase(
             &self.cleanup_operations.shutdown_token,
