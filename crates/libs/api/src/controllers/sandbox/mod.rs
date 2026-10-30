@@ -1028,7 +1028,6 @@ pub struct SandboxController {
         Option<crate::tls_interception_exemptions::TlsInterceptionExemptions>,
     federated_grant_audience: pplx_space_common_core::types::FederatedGrantAudience,
     substrate: Substrate,
-    feature_flags: pplx_space_feature_flags::FeatureFlagClient,
     cluster_admission: Option<std::sync::Arc<crate::cluster_admission::ClusterSandboxAdmission>>,
     route_ed25519_authority: Option<
         std::sync::Arc<
@@ -1084,7 +1083,6 @@ impl SandboxController {
             federated_grant_audience: crate::federated_identity::FederatedIdentityPolicy::default()
                 .grant_audience,
             substrate,
-            feature_flags: pplx_space_feature_flags::FeatureFlagClient::disabled(),
             cluster_admission: None,
             route_ed25519_authority: None,
         }
@@ -1100,18 +1098,9 @@ impl SandboxController {
             federated_grant_audience: crate::federated_identity::FederatedIdentityPolicy::default()
                 .grant_audience,
             substrate,
-            feature_flags: pplx_space_feature_flags::FeatureFlagClient::disabled(),
             cluster_admission: Some(std::sync::Arc::new(cluster_admission)),
             route_ed25519_authority: None,
         }
-    }
-
-    pub fn with_feature_flags(
-        mut self,
-        flags: pplx_space_feature_flags::FeatureFlagClient,
-    ) -> Self {
-        self.feature_flags = flags;
-        self
     }
 
     pub fn with_route_ed25519_authority(
