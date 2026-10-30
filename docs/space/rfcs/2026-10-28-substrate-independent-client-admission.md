@@ -547,20 +547,21 @@ label in:
   (`try_create_from_pool_with_substrate`) and a native admitted claim
   (`try_create_from_admitted_pool_claim_with_substrate`).
 - It's a new required `SubstrateAdapter` method, `label_adopted_execution`,
-  because slot release is private to the Kubernetes pool module. Direct's
+  because slot invalidation is private to the Kubernetes pool module. Direct's
   arm returns success: it adopts node-side and has no pod to label.
 
 **When the patch fails,** the adoption fails, not the create:
 
-- On a pool attempt whose patch the apiserver definitively rejected, the
-  slot goes back to the pool, and the create continues cold. A cold pod is
-  labeled when it's created.
-- A patch whose outcome is unknown, after a timeout or a transport error,
-  may still land later. So its slot is invalidated, never returned, and the
-  pool's cleanup deletes the pod.
-- A native admitted claim always invalidates its slot. Its reserved sandbox
-  id is the operation's planned id, so a returned slot could be adopted by
-  another create under that id. It then returns the release-pending error it
+- The slot is invalidated, never returned, whatever the apiserver
+  answered, and the pool's cleanup deletes the pod. A returned slot goes
+  back to the front of the claim queue, so a refusal that repeats would
+  send every later pool hit to the same failing slot, an error on every
+  request that the Precision rule rejects. Invalidating costs one rebuilt
+  warm pod, and a patch whose outcome is unknown can't land on a reused
+  pod.
+- A pool attempt then continues cold. A cold pod is labeled when it's
+  created.
+- A native admitted claim instead returns the release-pending error it
   already returns for a claim it declines, and the retry builds cold under
   its own id.
 - A `boot_mode=pool` create has no cold path, so it fails with the existing
