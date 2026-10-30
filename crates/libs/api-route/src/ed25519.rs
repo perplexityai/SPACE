@@ -348,6 +348,30 @@ pub struct SpaceApiRouteEd25519Authority {
 }
 
 impl SpaceApiRouteEd25519Authority {
+    pub fn new(
+        issuer: SpaceApiRouteEd25519Issuer,
+        cluster_id: ClusterId,
+        signer: SpaceApiRouteEd25519Signer,
+    ) -> Self {
+        Self {
+            issuer,
+            cluster_id,
+            signer,
+        }
+    }
+
+    pub fn issuer(&self) -> &SpaceApiRouteEd25519Issuer {
+        &self.issuer
+    }
+
+    pub fn cluster_id(&self) -> &ClusterId {
+        &self.cluster_id
+    }
+
+    pub fn verification_key(&self) -> SpaceApiRouteEd25519VerificationKey {
+        self.signer.public_key()
+    }
+
     pub fn load_from_env() -> Result<Option<Self>, SpaceApiRouteEd25519Error> {
         Self::load_from_environment_impl(&pplx_space_common_core::env::ProcessEnvironment)
     }
@@ -922,6 +946,9 @@ fn decode_pem_block(text: &str, label: &str) -> Result<Vec<u8>, ()> {
 fn unix_now_secs() -> u64 {
     u64::try_from(jiff::Timestamp::now().as_second()).unwrap_or_default()
 }
+
+mod data_plane_handover;
+pub use data_plane_handover::*;
 
 #[cfg(test)]
 mod tests;

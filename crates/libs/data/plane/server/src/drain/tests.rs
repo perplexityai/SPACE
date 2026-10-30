@@ -30,6 +30,7 @@ async fn start_drain(
     let server = tokio::spawn(serve_and_drain(
         data_plane_listener(listener),
         app(stream_shutdown_token.clone()),
+        None,
         DrainLifecycle {
             shutdown_token: shutdown_token.clone(),
             stream_shutdown_token: stream_shutdown_token.clone(),
@@ -389,6 +390,7 @@ async fn unattached_websocket_is_told_to_reconnect_when_the_drain_starts() {
     let server = tokio::spawn(serve_and_drain(
         data_plane_listener(listener),
         router(state),
+        None,
         DrainLifecycle {
             shutdown_token: shutdown_token.clone(),
             stream_shutdown_token,

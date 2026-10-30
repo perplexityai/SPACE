@@ -51,9 +51,13 @@ enum DrainEnding {
 /// `shutdown_grace` it waits for the streams until the process is killed or a
 /// second stop signal cancels `force_token`, which ends the drain the same way
 /// the deadline does.
+///
+/// `internal`, when set, is a second listener for in-cluster callers. It
+/// stops accepting and drains together with the public one.
 pub(super) async fn serve_and_drain(
     listener: DataPlaneListener,
     app: Router,
+    internal: Option<(DataPlaneListener, Router)>,
     lifecycle: DrainLifecycle,
 ) -> std::io::Result<()> {
     let DrainLifecycle {
@@ -76,15 +80,32 @@ pub(super) async fn serve_and_drain(
             );
         }
     };
+    let internal_stop_accepting = {
+        let shutdown_token = shutdown_token.clone();
+        async move { shutdown_token.cancelled().await }
+    };
     let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(stop_accepting);
+    let internal_server = async move {
+        match internal {
+            Some((listener, app)) => {
+                axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .with_graceful_shutdown(internal_stop_accepting)
+                .await
+            }
+            None => Ok(()),
+        }
+    };
     let drained = {
         let tasks = tasks.clone();
         async move {
-            server.await?;
+            tokio::try_join!(async move { server.await }, internal_server)?;
             // The server has stopped, so nothing new can be tracked; closing
             // lets `wait` finish once the upgraded connections end.
             tasks.close();

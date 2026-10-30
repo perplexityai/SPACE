@@ -362,6 +362,16 @@ pub fn attach(kind: &str, result: &str) {
     );
 }
 
+/// Whether an attach used the route the API handed over (`accepted`) or fell
+/// back to resolving it (every other `result`).
+pub fn route_handover(kind: &str, result: &str) {
+    counter(
+        "data_plane.route_handover",
+        1,
+        &[tag("kind", kind), tag("result", result)],
+    );
+}
+
 pub fn stream_closed(kind: &str, result: &str) {
     counter(
         "data_plane.stream.closed",

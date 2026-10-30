@@ -97,6 +97,11 @@ pub enum AppStateError {
     NativeHiddenOperations(#[from] public::hidden_operations::HiddenOperationsConfigError),
 }
 
+fn route_handover_enabled() -> bool {
+    std::env::var(crate::command_stream::DATA_PLANE_ROUTE_HANDOVER_ENV)
+        .is_ok_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+}
+
 impl AppState {
     #[cfg(test)]
     pub async fn from_pool(pool: PgPool) -> Result<Self, AppStateError> {
@@ -148,6 +153,7 @@ impl AppState {
             feature_flags.clone(),
         );
         task_tracker.spawn(cluster_admission.liveness_heartbeat(shutdown_token.child_token()));
+        let route_handover_authority = route_ed25519_authority.clone();
         let sandbox_controller =
             crate::controllers::sandbox::SandboxController::with_cluster_admission(
                 substrate.clone(),
@@ -174,8 +180,15 @@ impl AppState {
 
         let template_build_state = crate::routes::e2b::TemplateBuildState::new(pool.clone());
         let data_plane_base_url = crate::public_sessions::data_plane_base_url_from_env();
-        let command_stream =
-            crate::command_stream::CommandStreamProxy::from_env(shutdown_token.child_token())?;
+        let command_stream = crate::command_stream::CommandStreamProxy::from_env(
+            shutdown_token.child_token(),
+        )?
+        .map(|proxy| match route_handover_authority {
+            Some(authority) if route_handover_enabled() => proxy.with_route_handover(
+                crate::command_stream::RouteHandoverIssuer::new(pool.clone(), authority),
+            ),
+            _ => proxy,
+        });
         let ecw_credential_keyring = std::sync::Arc::new(
             pplx_space_common_svc::ecw_credential::EcwCredentialKeyring::load_from_env()?,
         );
