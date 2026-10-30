@@ -745,10 +745,14 @@ Direct pull request.
    claim, a pool bypass and a pool attempt. So forks and pinned creates are
    capped too, and a warm pod isn't claimed only to be refused. A miss then
    runs the existing gates.
-3. **Every other activation**, at its charge point, runs the existing gates:
-   the empty-cluster guard (`429`), the slot check (`503`, PR #1061) and the
-   cluster bucket (`429`). The live cap runs before them, or at pod
-   creation, according to its `CapPolicy`.
+3. **Every activation**, at its charge point, runs the existing gates: the
+   empty-cluster guard (`429`) and the cluster bucket (`429`). PR #1061's
+   slot check (`503`) runs only for a cold create, one whose warm-pool
+   attempt missed or that skips the pool, between those two. Every other
+   activation can reuse an existing pod or a node its disk is pinned to, so
+   a cluster-wide count of free slots would misjudge it. Those stay bounded
+   by the cluster bucket and the live cap. The live cap runs before the
+   gates, or at pod creation, according to its `CapPolicy`.
 
 ### Where the live cap runs
 
