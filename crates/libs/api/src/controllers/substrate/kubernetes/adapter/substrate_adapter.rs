@@ -939,7 +939,11 @@ impl SubstrateAdapter for KubernetesSubstrate {
         };
         // The controller may have deferred admission from a stale restore-
         // shaped snapshot. If the refreshed row now takes the cold-start path,
-        // spend that deferred charge before creating an execution.
+        // spend that deferred charge before creating an execution, after the
+        // live cap's pre-check: `ensure_pod_exists` checks the cap again
+        // where it creates the pod.
+        self.precheck_live_cap_before_cold_charge(&charge, &sandbox)
+            .await?;
         charge.charge_cold_activation().await?;
         // Only non-restore lifecycles (`stopped`, etc.) reach here — the
         // `suspended`/`restoring` cases delegated to the restore machinery
@@ -989,7 +993,8 @@ impl SubstrateAdapter for KubernetesSubstrate {
                         // Non-restore start path holds no restore lease.
                         None,
                         Some(activation_assignment.clone()),
-                    ),
+                    )
+                    .with_charge(&charge),
                 ),
             )
             .await

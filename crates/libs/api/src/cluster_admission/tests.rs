@@ -39,11 +39,17 @@ fn admission_with_flags(
     bucket: Option<RedisTokenBucket>,
     feature_flags: FeatureFlagClient,
 ) -> ClusterSandboxAdmission {
+    let live_cap = crate::client_live_cap::ClientLiveCap::with_config(
+        substrate.clone(),
+        crate::client_live_cap::ClientLiveCapConfig::default(),
+        feature_flags.clone(),
+    );
     ClusterSandboxAdmission {
         substrate,
         bucket,
         config: sanitize_config(config),
         feature_flags,
+        live_cap,
     }
 }
 

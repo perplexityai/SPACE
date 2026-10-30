@@ -1,4 +1,4 @@
-use crate::controllers::substrate::KeyResolution;
+use crate::controllers::substrate::{KeyResolution, RecoveryCharge};
 use pplx_space_common_core::types::{ClientId, NodeId, SandboxId};
 
 use super::support::*;
@@ -266,6 +266,10 @@ pub(super) struct PodMaterializationOwnership {
     /// Per-attempt fence because an activation retry may reuse an execution
     /// generation.
     activation_attempt: Option<ActivationAttemptAssignment>,
+    /// The activation's charge, for the live cap's `Check` point: a pod about
+    /// to be created is checked when its cap policy says so. `None` checks
+    /// nothing.
+    charge: Option<RecoveryCharge>,
 }
 
 impl PodMaterializationOwnership {
@@ -278,7 +282,14 @@ impl PodMaterializationOwnership {
             started_recovery,
             restore_lease_token,
             activation_attempt,
+            charge: None,
         }
+    }
+
+    /// Check the live cap with `charge` where a pod is about to be created.
+    pub(super) fn with_charge(mut self, charge: &RecoveryCharge) -> Self {
+        self.charge = Some(charge.clone());
+        self
     }
 }
 

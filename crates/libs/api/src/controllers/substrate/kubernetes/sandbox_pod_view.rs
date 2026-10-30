@@ -22,6 +22,7 @@ use std::{
     sync::{Arc, PoisonError, RwLock},
 };
 
+use super::client_live_pods::ClientLivePods;
 use k8s_openapi::api::core::v1::{ContainerStatus, Pod, PodCondition};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::runtime::{reflector, watcher};
@@ -557,32 +558,47 @@ impl NodeNetworkSlots {
 pub(super) struct SandboxPodWriter {
     store: reflector::store::Writer<SandboxPodView>,
     network_slots: NodeNetworkSlots,
+    client_pods: ClientLivePods,
 }
 
 impl SandboxPodWriter {
     pub(super) fn apply_watcher_event(&mut self, event: &watcher::Event<SandboxPodView>) {
-        // Index first. It matters at `InitDone`: the store's swap releases the
-        // readiness waiters, and nothing ready should read an index that
-        // hasn't caught up. No reader joins the two, so the brief lead on
-        // other events is harmless.
+        // Indexes first. It matters at `InitDone`: the store's swap releases
+        // the readiness waiters, and nothing ready should read an index that
+        // hasn't caught up. No reader joins them, so the brief lead on other
+        // events is harmless.
         self.network_slots.apply(event);
+        self.client_pods.apply(event);
         self.store.apply_watcher_event(event);
+    }
+
+    /// The watch returned an error; see [`ClientLivePods::mark_watch_error`].
+    pub(super) fn mark_watch_error(&self) {
+        self.client_pods.mark_watch_error();
     }
 }
 
-/// Create an empty sandbox-pod store, its slot index, and their shared writer.
+/// The indexes kept beside the sandbox-pod store, written by the same writer.
+#[derive(Clone, Default)]
+pub(super) struct SandboxPodIndexes {
+    pub(super) network_slots: NodeNetworkSlots,
+    pub(super) client_pods: ClientLivePods,
+}
+
+/// Create an empty sandbox-pod store, its indexes, and their shared writer.
 pub(super) fn sandbox_pod_cache() -> (
     reflector::Store<SandboxPodView>,
-    NodeNetworkSlots,
+    SandboxPodIndexes,
     SandboxPodWriter,
 ) {
     let (store, writer) = reflector::store::<SandboxPodView>();
-    let network_slots = NodeNetworkSlots::default();
+    let indexes = SandboxPodIndexes::default();
     let writer = SandboxPodWriter {
         store: writer,
-        network_slots: network_slots.clone(),
+        network_slots: indexes.network_slots.clone(),
+        client_pods: indexes.client_pods.clone(),
     };
-    (store, network_slots, writer)
+    (store, indexes, writer)
 }
 
 /// A sandbox-pod store and slot index seeded with `pods` through one complete
@@ -593,16 +609,16 @@ pub(super) fn seeded_sandbox_pod_cache(
     pods: impl IntoIterator<Item = Pod>,
 ) -> (
     reflector::Store<SandboxPodView>,
-    NodeNetworkSlots,
+    SandboxPodIndexes,
     SandboxPodWriter,
 ) {
-    let (store, network_slots, mut writer) = sandbox_pod_cache();
+    let (store, indexes, mut writer) = sandbox_pod_cache();
     writer.apply_watcher_event(&watcher::Event::Init);
     for pod in pods {
         writer.apply_watcher_event(&watcher::Event::InitApply(pod.into()));
     }
     writer.apply_watcher_event(&watcher::Event::InitDone);
-    (store, network_slots, writer)
+    (store, indexes, writer)
 }
 
 #[cfg(test)]

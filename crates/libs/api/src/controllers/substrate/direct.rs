@@ -16,6 +16,8 @@
 //!   only `StartRequest` carries those fields. A readiness wait still blocks
 //!   on start. Default shapes and disk-only overrides can use one-shot create,
 //!   whose `CreateRequest` forwards disk size as `rootfs_size_mb`.
+//! - `Substrate::live_sandboxes_for_client` answers unknown (`Unsupported`):
+//!   Direct keeps no per-client inventory, so the per-client live cap admits.
 //! - No-ops returning `None` or nothing: `sandbox_ip`, `access_sandbox_ip`,
 //!   `list_inventory_nodes` (Postgres is the inventory),
 //!   `retire_fence_mismatch` and `observe_pod_identities`.

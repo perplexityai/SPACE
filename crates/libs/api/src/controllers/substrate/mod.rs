@@ -80,6 +80,7 @@ use crate::models::{ClusterPoolConfigRequest, ClusterPoolConfigResponse, Sandbox
 use sqlx::{PgPool, Postgres, Transaction};
 
 mod execution_fence;
+mod live_count;
 mod local_artifact;
 pub(crate) mod native_access;
 mod node_api_client;
@@ -89,6 +90,7 @@ pub mod runtime_upgrade;
 mod sandbox_state_probe;
 
 pub use execution_fence::*;
+pub use live_count::*;
 pub use local_artifact::*;
 pub use node_api_client::*;
 pub use pool_claims::*;
@@ -1206,6 +1208,10 @@ pub struct SubstrateCapabilities {
     ///
     /// Direct's suspend leaves the lifecycle to that caller write.
     pub suspend_commits_lifecycle: bool,
+    /// [`Substrate::live_sandboxes_for_client`] can answer with a count. When
+    /// false it always answers `Unknown(Unsupported)`, so the per-client live
+    /// cap admits without reading its Redis pending set.
+    pub counts_live_sandboxes_per_client: bool,
 }
 
 impl SubstrateCapabilities {
@@ -1218,6 +1224,7 @@ impl SubstrateCapabilities {
         supports_node_drain: false,
         contends_for_leader_lease: false,
         suspend_commits_lifecycle: false,
+        counts_live_sandboxes_per_client: false,
     };
 
     pub const KUBERNETES: Self = Self {
@@ -1229,6 +1236,7 @@ impl SubstrateCapabilities {
         supports_node_drain: true,
         contends_for_leader_lease: true,
         suspend_commits_lifecycle: true,
+        counts_live_sandboxes_per_client: true,
     };
 }
 
@@ -2047,6 +2055,27 @@ impl Substrate {
             Inner::Direct(_) => ReflectorReady::always_ready(),
             #[cfg(feature = "kubernetes")]
             Inner::Kubernetes(substrate) => substrate.readiness(),
+        }
+    }
+
+    /// How many sandboxes with a live runtime the client ids `ids` select
+    /// hold, other than `activating` and the sandboxes in `already_pending`.
+    /// A synchronous cache read: Kubernetes counts from the sandbox-pod
+    /// reflector, and Direct, with no in-memory inventory, answers
+    /// [`LiveSandboxCountUnknown::Unsupported`], so the live cap admits.
+    #[cfg_attr(not(feature = "kubernetes"), allow(unused_variables))]
+    pub fn live_sandboxes_for_client(
+        &self,
+        ids: &CountedIds,
+        activating: Option<SandboxId>,
+        already_pending: &std::collections::HashSet<SandboxId>,
+    ) -> LiveSandboxCount {
+        match &self.inner {
+            Inner::Direct(_) => LiveSandboxCount::Unknown(LiveSandboxCountUnknown::Unsupported),
+            #[cfg(feature = "kubernetes")]
+            Inner::Kubernetes(substrate) => {
+                substrate.live_sandboxes_for_client(ids, activating, already_pending)
+            }
         }
     }
 

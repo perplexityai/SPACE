@@ -66,7 +66,7 @@ pub(super) fn seeded_substrate(
         node_api_pod_writer.apply_watcher_event(&Event::InitApply(pod.clone()));
     }
     node_api_pod_writer.apply_watcher_event(&Event::InitDone);
-    let (pod_store, pod_network_slots, _) = sandbox_pod_view::seeded_sandbox_pod_cache(pods);
+    let (pod_store, pod_indexes, _) = sandbox_pod_view::seeded_sandbox_pod_cache(pods);
 
     let (node_store, mut node_writer) = reflector::store::<Node>();
     node_writer.apply_watcher_event(&Event::Init);
@@ -82,7 +82,7 @@ pub(super) fn seeded_substrate(
         sandbox_proxy_port,
         SandboxPodConfigValues::default(),
         caches,
-        (pod_store, pod_network_slots),
+        (pod_store, pod_indexes),
     )
 }
 
@@ -96,7 +96,7 @@ pub(super) fn assemble_substrate(
     sandbox_proxy_port: u16,
     sandbox_pod_config: SandboxPodConfigValues,
     caches: Arc<K8sCaches>,
-    (pod_store, pod_network_slots): (Store<SandboxPodView>, NodeNetworkSlots),
+    (pod_store, pod_indexes): (Store<SandboxPodView>, SandboxPodIndexes),
 ) -> KubernetesSubstrate {
     let shutdown_token = CancellationToken::new();
     let task_tracker = TaskTracker::new();
@@ -134,7 +134,8 @@ pub(super) fn assemble_substrate(
             ActivationClientAttribution::Enabled,
         ),
         pod_store,
-        pod_network_slots,
+        pod_network_slots: pod_indexes.network_slots,
+        pod_client_index: pod_indexes.client_pods,
         pod_events: pod_reflector::PodEvents::for_test(),
         pod_reflector_ready: ReflectorReady::always_ready(),
         cancel_tracker: Arc::new(CancelRateTracker::with_budget(64)),

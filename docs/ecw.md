@@ -162,6 +162,15 @@ sandbox:
 Ids are unbounded, since a client can send any value. Anything that needs a
 bounded set, such as a metric tag, has to map the id to one first.
 
+An operator can cap how many sandboxes with a live runtime each client holds
+(a stopped one still holds its runtime and counts)
+(`SPACE_API_CLIENT_LIVE_CAP_*` in [Configuration](configuration.md)). A
+create, fork, connect or resume that would go over the cap gets a `429` with
+a `Retry-After`, and succeeds once the client pauses or kills one of
+its sandboxes. A connect to a sandbox that's already running is never refused.
+On the Direct substrate the cap always admits, since Direct keeps no
+per-client inventory.
+
 ## Sizing at create
 
 SPACE extends ECW create with the reserved metadata key `space.resources`. Its
