@@ -63,10 +63,11 @@ For new work:
 - Record every gap. If one substrate cannot support an operation yet, return
   `SubstrateError::Unsupported` from it and add a row to the gap table in its
   module doc (`direct.rs`, or `kubernetes/mod.rs`, whose first gap starts
-  one): what is refused, its effect, and the change that removes it. An
-  `Unsupported` without a row fails review; an existing row is not precedent
-  for a new one. A PR that changes Direct's behavior updates the `direct.rs`
-  module doc, and the PR that closes a gap deletes its row.
+  one): what is refused, its effect, who owns closing it, and the change that
+  removes it. An `Unsupported` without a row, or a row without an owner and a
+  removal plan, fails review; an existing row is not precedent for a new one.
+  A PR that changes Direct's behavior updates the `direct.rs` module doc,
+  and the PR that closes a gap deletes its row.
 - No single-substrate reconcilers for sandbox or node state. A loop that
   repairs, retries, drains, evacuates or collects that state runs for both
   substrates and reaches it through the adapter. A loop that manages

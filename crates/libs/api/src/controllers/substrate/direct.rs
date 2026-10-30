@@ -22,18 +22,18 @@
 //!
 //! # Gaps
 //!
-//! | Refused or missing | Effect today | Removed by |
-//! |---|---|---|
-//! | Node-pool placement | [`SubstrateError::Unsupported`]: a create naming a node pool is refused | Node-pool membership for registered nodes, read by core placement |
-//! | Forks (restoring a durable fork disk as a new sandbox) | `Unsupported`: the create is refused | A Direct launch that stages the fork disk on the chosen node |
-//! | Cluster pool configs (`list_pool_configs`, `upsert_pool_config`, `disable_pool_config`) | `Unsupported` from the trait defaults | Pool-config handling in the core for both substrates |
-//! | Warm-pool claims with custom vCPU or memory, or with volume encryption | The claim misses and the create boots cold | Pool members of that shape, or an adoption that applies it |
-//! | Admission-time pool slot claims (`claim_admission_pool_slot`) | Always miss | A Direct warm-pool slot store the core claims from at admission |
-//! | Retire fence | `retire_execution` ignores its fence, but still stops the sandbox and clears its routing | A fence check against the Direct execution it names |
-//! | Stopped-disk backup on retire | `retire_execution` enqueues none; the stopped disk stays on the node (see below) | A retried Direct retire (next row), then the enqueue |
-//! | Retire retry | Nothing retries a failed Direct retire (see below) | The sweeper's failed-cleanup retry running for both substrates |
-//! | Drain and evacuation | [`SubstrateCapabilities::supports_node_drain`] is false. Admin `:drain`, `:terminate`, `:cordon`, `:uncordon` and `:force-upload-local-snapshots` return 501 before reading or writing the node. `:undrain` clears a `draining` or `drained` phase an earlier drain left, without a substrate call | Core drain and evacuation for both substrates over a Direct `set_node_schedulability` |
-//! | Drain, orphan, failed-row repair and node-sync loops | Not started on Direct (below) | Those loops running for both substrates through the adapter |
+//! | Refused or missing | Effect today | Owner | Removed by |
+//! |---|---|---|---|
+//! | Node-pool placement | [`SubstrateError::Unsupported`]: a create naming a node pool is refused | ac-pplx | Node-pool membership for registered nodes, read by core placement |
+//! | Forks (restoring a durable fork disk as a new sandbox) | `Unsupported`: the create is refused | ac-pplx | A Direct launch that stages the fork disk on the chosen node |
+//! | Cluster pool configs (`list_pool_configs`, `upsert_pool_config`, `disable_pool_config`) | `Unsupported` from the trait defaults | ac-pplx | Pool-config handling in the core for both substrates |
+//! | Warm-pool claims with custom vCPU or memory, or with volume encryption | The claim misses and the create boots cold | ac-pplx | Pool members of that shape, or an adoption that applies it |
+//! | Admission-time pool slot claims (`claim_admission_pool_slot`) | Always miss | ac-pplx | A Direct warm-pool slot store the core claims from at admission |
+//! | Retire fence | `retire_execution` ignores its fence, but still stops the sandbox and clears its routing | ac-pplx | A fence check against the Direct execution it names |
+//! | Stopped-disk backup on retire | `retire_execution` enqueues none; the stopped disk stays on the node (see below) | ac-pplx | A retried Direct retire (next row), then the enqueue |
+//! | Retire retry | Nothing retries a failed Direct retire (see below) | ac-pplx | The sweeper's failed-cleanup retry running for both substrates |
+//! | Drain and evacuation | [`SubstrateCapabilities::supports_node_drain`] is false. Admin `:drain`, `:terminate`, `:cordon`, `:uncordon` and `:force-upload-local-snapshots` return 501 before reading or writing the node. `:undrain` clears a `draining` or `drained` phase an earlier drain left, without a substrate call | ac-pplx | Core drain and evacuation for both substrates over a Direct `set_node_schedulability` |
+//! | Drain, orphan, failed-row repair and node-sync loops | Not started on Direct (below) | ac-pplx | Those loops running for both substrates through the adapter |
 //!
 //! # Kubernetes-only reconcilers
 //!
