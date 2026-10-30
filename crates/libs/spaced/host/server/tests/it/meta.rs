@@ -504,6 +504,7 @@ async fn readiness_requires_a_supported_guest_and_preserves_legacy_support() {
                         "future_capability".into(),
                         "process_recovery_start".into(),
                         "process_recovery_handles".into(),
+                        "process_mutation_receipts".into(),
                     ],
                     ..Default::default()
                 },

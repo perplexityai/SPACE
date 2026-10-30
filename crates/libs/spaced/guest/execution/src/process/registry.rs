@@ -93,7 +93,7 @@ pub(super) struct ProcessRecord {
     // RPCs can retain a completed record beyond registry eviction.
     pub(super) _record_slot: OwnedSemaphorePermit,
     pub(super) started: ProcessEvent,
-    pub(super) recovery_identity: Option<recovery::RecoveryIdentity>,
+    pub(super) recovery: Option<recovery::RecoveryRecord>,
     /// What `list` reports, without `env`.
     pub(super) info: ProcessInfo,
     /// Up to 64 KiB, kept apart from `info` so a finished record can drop it
@@ -144,7 +144,7 @@ impl ProcessRecord {
         Self {
             _record_slot: reservation.record_slot,
             started,
-            recovery_identity,
+            recovery: recovery_identity.map(recovery::RecoveryRecord::new),
             info,
             env: std::sync::Mutex::new(env),
             input,

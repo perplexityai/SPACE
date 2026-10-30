@@ -36,6 +36,7 @@ fn readiness_discovery_preserves_instance_and_filters_unsupported_guarantees() {
                 "future_capability".into(),
                 "process_recovery_start".into(),
                 "process_recovery_handles".into(),
+                "process_mutation_receipts".into(),
             ],
             ..Default::default()
         }),

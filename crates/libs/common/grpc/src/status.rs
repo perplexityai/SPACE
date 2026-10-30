@@ -108,6 +108,7 @@ pub enum GuestCapability {
     ProcessOutputGapResume,
     ProcessRecoveryStart,
     ProcessRecoveryHandles,
+    ProcessMutationReceipts,
 }
 
 impl GuestCapability {
@@ -117,6 +118,7 @@ impl GuestCapability {
             Self::ProcessOutputGapResume => "process_output_gap_resume",
             Self::ProcessRecoveryStart => "process_recovery_start",
             Self::ProcessRecoveryHandles => "process_recovery_handles",
+            Self::ProcessMutationReceipts => "process_mutation_receipts",
         }
     }
 }
@@ -136,6 +138,7 @@ impl std::str::FromStr for GuestCapability {
             "process_output_gap_resume" => Self::ProcessOutputGapResume,
             "process_recovery_start" => Self::ProcessRecoveryStart,
             "process_recovery_handles" => Self::ProcessRecoveryHandles,
+            "process_mutation_receipts" => Self::ProcessMutationReceipts,
             _ => {
                 return Err(GuestCapabilityParseError {
                     value: value.to_owned(),
