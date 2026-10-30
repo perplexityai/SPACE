@@ -36,10 +36,11 @@ use tonic::{Request, Response, Status};
 use zeroize::Zeroizing;
 
 use crate::proto::{
-    PrepareEncryptedRootfsRequest, PrepareEncryptedRootfsResponse, PrepareEncryptedVolumeRequest,
-    PrepareEncryptedVolumeResponse, PrepareSnapshotRootfsRequest, PrepareSnapshotRootfsResponse,
-    ReleaseEncryptedVolumeRequest, ReleaseEncryptedVolumeResponse,
+    EncryptedVolumeStagedArtifact, PrepareEncryptedRootfsRequest, PrepareEncryptedRootfsResponse,
+    PrepareEncryptedVolumeRequest, PrepareEncryptedVolumeResponse, PrepareSnapshotRootfsRequest,
+    PrepareSnapshotRootfsResponse, ReleaseEncryptedVolumeRequest, ReleaseEncryptedVolumeResponse,
 };
+
 use crate::{encrypted_volume, rootfs_dmcrypt};
 
 use super::{ALLOW_NODE_ADMIN_OR_SBXMGR, NodeManagerService};
@@ -292,7 +293,7 @@ impl NodeManagerService {
         .await
     }
 
-    async fn prepare_encrypted_volume_inner(
+    pub(super) async fn prepare_encrypted_volume_inner(
         &self,
         sandbox_id: SandboxId,
         req: PrepareEncryptedVolumeRequest,
@@ -415,44 +416,124 @@ impl NodeManagerService {
             }
 
             // Optionally stage sealed (ciphertext) artifacts into the caller's
-            // publication staging dir. node-manager is privileged and can read
-            // the sandbox-private `instance/` dir; the artifacts are LUKS2
-            // containers, so the reflink copies carry only ciphertext.
-            if !req.stage_dir.trim().is_empty() && !req.stage_artifacts.is_empty() {
-                let stage_dir = validate_sandbox_scoped_path(
-                    &operation_sandbox_id,
-                    req.stage_dir.trim(),
-                    "stage_dir",
-                )
-                .inspect_err(|_| metric.failed(pplx_space_metrics::byok::PHASE_STAGE))?;
-                // `sync` first so any in-flight writes are durable before the
-                // copy. Best-effort: a failed sync degrades durability of the
-                // staged copy, not correctness of the sealed volume.
-                match rootfs_dmcrypt::run("sync", &[]).await {
-                    Ok(_) => {}
-                    Err(error) => {
-                        tracing::warn!(sandbox_id = %operation_sandbox_id, %error, "failed to run sync before artifact staging");
-                    }
-                }
-                for artifact in &req.stage_artifacts {
-                    let src = validate_sandbox_scoped_path(
-                        &operation_sandbox_id,
-                        &artifact.src_path,
-                        "stage_artifacts.src_path",
-                    )
-                    .inspect_err(|_| metric.failed(pplx_space_metrics::byok::PHASE_STAGE))?;
-                    let dst_name = validate_stage_dst_name(&artifact.dst_name)
-                        .inspect_err(|_| metric.failed(pplx_space_metrics::byok::PHASE_STAGE))?;
-                    stage_contained(&operation_sandbox_id, src, stage_dir.join(dst_name))
+            // publication staging dir.
+            if !req.stage_dir.trim().is_empty()
+                && !req.stage_artifacts.is_empty()
+                && let Err(error) =
+                    stage_artifacts(&operation_sandbox_id, &req.stage_dir, &req.stage_artifacts)
                         .await
-                        .inspect_err(|_| metric.failed(pplx_space_metrics::byok::PHASE_STAGE))?;
-                }
+            {
+                metric.failed(pplx_space_metrics::byok::PHASE_STAGE);
+                return Err(error);
             }
             metric.succeeded();
             Ok(Response::new(ReleaseEncryptedVolumeResponse {}))
         };
         operation.await
     }
+}
+
+impl NodeManagerService {
+    pub(super) async fn stage_retained_encrypted_suspend_under_ownership(
+        &self,
+        sandbox_id: SandboxId,
+        local_artifact_id: pplx_space_common_core::types::LocalArtifactId,
+        execution_fence: Option<crate::proto::ExecutionFence>,
+    ) -> Result<(), Status> {
+        let metric = DeviceOpMetric::stage(pplx_space_metrics::byok::OP_SNAPSHOT_VOLUME);
+        self.check_execution(&sandbox_id.to_string(), execution_fence.as_ref(), false)?;
+        let volume_name = paths::ENCRYPTED_SUSPEND_VOLUME_NAME;
+        let stage_dir = PathBuf::from(paths::sandbox_suspend_staging_dir(
+            &sandbox_id.to_string(),
+            local_artifact_id,
+        ));
+        let artifacts = vec![
+            (
+                volume_backing_path(&sandbox_id, volume_name),
+                "snapshot.luks".to_string(),
+            ),
+            (
+                PathBuf::from(paths::sandbox_instance_dir(&sandbox_id.to_string()))
+                    .join(ROOTFS_COW_FILE),
+                ROOTFS_COW_FILE.to_string(),
+            ),
+        ];
+        // The volume stays open: a live Firecracker may still map its memory
+        // file, privately, which never writes the file. Read-only is what keeps
+        // the flushed bytes fixed while they are copied.
+        let mount_dir = volume_mount_dir(&sandbox_id, volume_name);
+        if let Err(error) =
+            encrypted_volume::make_read_only(&sandbox_id, volume_name, &mount_dir).await
+        {
+            metric.failed(dmcrypt_error_phase(&error));
+            return Err(dmcrypt_error_to_status(error));
+        }
+        // The rootfs COW is staged from a live runtime too: flush what
+        // Firecracker has written through the buffered composite first.
+        let staged = match rootfs_dmcrypt::flush_composite(&sandbox_id).await {
+            Ok(()) => stage_files(&sandbox_id, &stage_dir, artifacts)
+                .await
+                .map_err(|error| (pplx_space_metrics::byok::PHASE_STAGE, error)),
+            Err(error) => Err((dmcrypt_error_phase(&error), dmcrypt_error_to_status(error))),
+        };
+        // The copies are immutable reflinks now. Leave the volume as a capture
+        // finds it, so nothing that predates read-only staging meets it.
+        if let Err(error) = encrypted_volume::remount_read_write(&mount_dir).await {
+            tracing::warn!(
+                %sandbox_id,
+                %error,
+                "encrypted volume stayed read-only after staging; the next prepare remounts it"
+            );
+        }
+        if let Err((phase, error)) = staged {
+            metric.failed(phase);
+            return Err(error);
+        }
+        metric.succeeded();
+        Ok(())
+    }
+}
+
+/// Reflink-copy the caller-named ciphertext artifacts of a release into its
+/// publication staging dir, after validating both ends.
+async fn stage_artifacts(
+    sandbox_id: &SandboxId,
+    stage_dir: &str,
+    artifacts: &[EncryptedVolumeStagedArtifact],
+) -> Result<(), Status> {
+    let stage_dir = validate_sandbox_scoped_path(sandbox_id, stage_dir.trim(), "stage_dir")?;
+    let mut files = Vec::with_capacity(artifacts.len());
+    for artifact in artifacts {
+        let src = validate_sandbox_scoped_path(
+            sandbox_id,
+            &artifact.src_path,
+            "stage_artifacts.src_path",
+        )?;
+        let dst_name = validate_stage_dst_name(&artifact.dst_name)?;
+        files.push((src, dst_name.to_string()));
+    }
+    stage_files(sandbox_id, &stage_dir, files).await
+}
+
+/// Reflink-copy ciphertext artifacts into a publication staging dir.
+/// node-manager is privileged and can read the sandbox-private `instance/`
+/// dir; the artifacts are LUKS2 containers, so the copies carry only
+/// ciphertext.
+async fn stage_files(
+    sandbox_id: &SandboxId,
+    stage_dir: &Path,
+    files: Vec<(PathBuf, String)>,
+) -> Result<(), Status> {
+    // `sync` first so any in-flight writes are durable before the copy.
+    // Best-effort: a failed sync degrades durability of the staged copy, not
+    // correctness of the volume.
+    if let Err(error) = rootfs_dmcrypt::run("sync", &[]).await {
+        tracing::warn!(%sandbox_id, %error, "failed to run sync before artifact staging");
+    }
+    for (src, dst_name) in files {
+        stage_contained(sandbox_id, src, stage_dir.join(dst_name)).await?;
+    }
+    Ok(())
 }
 
 /// Parse the wire sandbox id into the typed [`SandboxId`] every derived path
@@ -470,7 +551,7 @@ fn volume_backing_path(sandbox_id: &SandboxId, volume_name: &str) -> PathBuf {
 }
 
 /// Canonical mount point of a named per-sandbox encrypted volume.
-fn volume_mount_dir(sandbox_id: &SandboxId, volume_name: &str) -> PathBuf {
+pub(super) fn volume_mount_dir(sandbox_id: &SandboxId, volume_name: &str) -> PathBuf {
     PathBuf::from(paths::sandbox_cache_dir(&sandbox_id.to_string()))
         .join(format!("{volume_name}-vol"))
 }
@@ -727,6 +808,7 @@ fn dmcrypt_error_phase(e: &rootfs_dmcrypt::DmCryptError) -> &'static str {
 enum DeviceOpKind {
     Prepare,
     Release,
+    Stage,
 }
 
 /// Records `attempted` when constructed and a terminal outcome exactly once:
@@ -759,6 +841,11 @@ impl DeviceOpMetric {
         Self::new(op, DeviceOpKind::Release)
     }
 
+    fn stage(op: &'static str) -> Self {
+        pplx_space_metrics::byok::device_stage_attempted(op);
+        Self::new(op, DeviceOpKind::Stage)
+    }
+
     fn new(op: &'static str, kind: DeviceOpKind) -> Self {
         Self {
             op,
@@ -779,6 +866,7 @@ impl DeviceOpMetric {
             DeviceOpKind::Release => {
                 pplx_space_metrics::byok::device_release_failed(self.op, phase)
             }
+            DeviceOpKind::Stage => pplx_space_metrics::byok::device_stage_failed(self.op, phase),
         }
     }
 

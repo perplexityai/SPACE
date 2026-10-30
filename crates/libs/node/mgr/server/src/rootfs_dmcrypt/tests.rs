@@ -163,3 +163,118 @@ fn only_cryptsetup_close_exit_five_is_busy() {
         Err(DmCryptError::Command { .. })
     ));
 }
+
+/// A live Firecracker writes the guest rootfs through the composite with a
+/// buffered descriptor it keeps open, so its last close never flushes the
+/// device before the COW backing is staged. After [`flush_composite`], a copy
+/// of `cow.luks` taken while that writer is still open carries the write: the
+/// copy opens as another composite over the same origin and reads it back.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires root, loop/dm-crypt and an explicitly supplied disposable btrfs fixture directory"]
+async fn a_cow_copy_after_flush_holds_a_live_writers_buffered_writes() {
+    use std::os::unix::fs::FileExt;
+
+    // CI includes ignored tests; host mutation still requires explicit opt-in.
+    let Some(root) = std::env::var_os("SPACE_NODEMGR_TEST_BTRFS_DIR") else {
+        eprintln!("not opted in: set SPACE_NODEMGR_TEST_BTRFS_DIR to a disposable btrfs directory");
+        return;
+    };
+    assert!(nix::unistd::geteuid().is_root());
+    let temp = tempfile::tempdir_in(root).unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let dek = zeroize::Zeroizing::new(vec![42; 32]);
+    let (live, copy) = (SandboxId::new(), SandboxId::new());
+    let dir = |name: &str| {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    };
+    let (live_dir, copy_dir) = (dir("live"), dir("copy"));
+    let origin = vec![0_u8; 16 * 1024 * 1024];
+    std::fs::write(live_dir.join("rootfs.ext4"), &origin).unwrap();
+    std::fs::write(copy_dir.join("rootfs.ext4"), &origin).unwrap();
+    const OFFSET: u64 = 3 * 4096;
+    const MARKER: &[u8] = b"guest write still in the page cache";
+
+    let prepared = prepare(PrepareParams {
+        sandbox_id: live,
+        origin_path: live_dir.join("rootfs.ext4"),
+        cow_path: live_dir.join("cow.luks"),
+        restore_cow_source: None,
+        rootfs_size_bytes: 0,
+        dek: &dek,
+    })
+    .await
+    .unwrap();
+    let writer = std::fs::File::options()
+        .write(true)
+        .open(&prepared.mapper_path)
+        .unwrap();
+    writer.write_at(MARKER, OFFSET).unwrap();
+
+    flush_composite(&live).await.unwrap();
+    // Opened in place below, as a same-node restore opens the kept COW.
+    std::fs::copy(live_dir.join("cow.luks"), copy_dir.join("cow.luks")).unwrap();
+    drop(writer);
+
+    let reopened = prepare(PrepareParams {
+        sandbox_id: copy,
+        origin_path: copy_dir.join("rootfs.ext4"),
+        cow_path: copy_dir.join("cow.luks"),
+        restore_cow_source: None,
+        rootfs_size_bytes: 0,
+        dek: &dek,
+    })
+    .await
+    .unwrap();
+    let mut read = vec![0_u8; MARKER.len()];
+    std::fs::File::open(&reopened.mapper_path)
+        .unwrap()
+        .read_exact_at(&mut read, OFFSET)
+        .unwrap();
+    // The origin loops are attached read-only, and a detached loop device
+    // keeps that flag until it is attached read-write again. Reattach each to
+    // a scratch file and detach it, so other tests on this host see none.
+    let origin_loops = [&live_dir, &copy_dir].map(|dir| {
+        let found = std::process::Command::new("losetup")
+            .arg("-j")
+            .arg(dir.join("rootfs.ext4"))
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&found.stdout)
+            .lines()
+            .filter_map(|line| line.split(':').next().map(str::to_owned))
+            .collect::<Vec<_>>()
+    });
+    release(&copy, &copy_dir.join("rootfs.ext4")).await.unwrap();
+    release(&live, &live_dir.join("rootfs.ext4")).await.unwrap();
+    let scratch = root.join("scratch.img");
+    std::fs::File::create(&scratch)
+        .unwrap()
+        .set_len(1024 * 1024)
+        .unwrap();
+    for device in origin_loops.iter().flatten() {
+        // Autoclear detaches the origin asynchronously after release. Detach
+        // only a device this test then attached; another process may own it.
+        let mut attached = false;
+        for _ in 0..50 {
+            attached = std::process::Command::new("losetup")
+                .arg(device)
+                .arg(&scratch)
+                .status()
+                .unwrap()
+                .success();
+            if attached {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if attached {
+            let _ = std::process::Command::new("losetup")
+                .args(["-d", device])
+                .status();
+        }
+    }
+    assert_eq!(read, MARKER, "the staged COW must carry the buffered write");
+}
