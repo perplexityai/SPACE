@@ -571,6 +571,20 @@ fn reject_public_wake_start_context(
     Ok(())
 }
 
+// Sandbox-manager authorizes an upgrade by its caller, which is node-api on
+// both services, so the public service must refuse it itself.
+fn reject_public_wake_runtime_upgrade(
+    rpc: &'static str,
+    runtime_upgrade: &Option<pplx_space_sbx_mgr_client::proto::WakeRuntimeUpgrade>,
+) -> Result<(), Status> {
+    if runtime_upgrade.is_some() {
+        return Err(Status::invalid_argument(format!(
+            "{rpc}.runtime_upgrade is internal-only; use WorkerApiInternal"
+        )));
+    }
+    Ok(())
+}
+
 fn reject_public_operation_activation_attempt(operation: &Option<String>) -> Result<(), Status> {
     if operation.is_some() {
         return Err(Status::invalid_argument(
@@ -719,6 +733,7 @@ impl WorkerApi for WorkerApiService {
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::WakeResponse>, Status> {
         record_sandbox_id(&tracing::Span::current(), &r.get_ref().sandbox_id);
         reject_public_wake_start_context("WakeSandbox", &r.get_ref().start_context)?;
+        reject_public_wake_runtime_upgrade("WakeSandbox", &r.get_ref().runtime_upgrade)?;
         fwd_sbx!(self, "WakeSandbox", wake, r)
     }
 
@@ -1445,10 +1460,14 @@ impl WorkerApiInternal for WorkerApiService {
         r: Request<pplx_space_sbx_mgr_client::proto::WakeRequest>,
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::WakeResponse>, Status> {
         record_sandbox_id(&tracing::Span::current(), &r.get_ref().sandbox_id);
-        if r.get_ref()
-            .start_context
-            .as_ref()
-            .is_some_and(|context| context.activation_auto_lifecycle.is_some())
+        // A runtime upgrade discards a suspended sandbox's memory under an
+        // authorization the caller names, so it takes the same control-plane
+        // authority as a policy write.
+        if r.get_ref().runtime_upgrade.is_some()
+            || r.get_ref()
+                .start_context
+                .as_ref()
+                .is_some_and(|context| context.activation_auto_lifecycle.is_some())
         {
             require_policy_mutation_authority(&r)?;
         }

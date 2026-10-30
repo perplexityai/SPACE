@@ -253,6 +253,7 @@ async fn suspend_on_node_a_then_wake_on_node_b_restores() {
             blocking: true,
             start_context: None,
             target_state: 0,
+            runtime_upgrade: None,
         }))
         .await
         .unwrap()
@@ -502,6 +503,7 @@ async fn public_wake_rejects_start_context() {
             blocking: true,
             start_context: Some(sbx::WakeStartContext::default()),
             target_state: 0,
+            runtime_upgrade: None,
         }))
         .await
         .unwrap_err();
@@ -839,6 +841,7 @@ async fn internal_wake_prefers_and_records_the_start_context_identity() {
                 ..Default::default()
             }),
             target_state: 0,
+            runtime_upgrade: None,
         }))
         .await
         .unwrap()
@@ -875,6 +878,7 @@ async fn internal_wake_prefers_and_records_the_start_context_identity() {
                 ..Default::default()
             }),
             target_state: 0,
+            runtime_upgrade: None,
         }))
         .await
         .unwrap()
@@ -919,6 +923,7 @@ async fn resident_kubernetes_wake_acknowledges_and_records_requested_identity() 
                     ..Default::default()
                 }),
                 target_state: 0,
+                runtime_upgrade: None,
             }))
             .await
             .unwrap()
@@ -1002,6 +1007,7 @@ async fn wake_replays_the_recorded_activation_attempt() {
             blocking: true,
             start_context: None,
             target_state: 0,
+            runtime_upgrade: None,
         }))
         .await
         .unwrap()

@@ -4,6 +4,7 @@ use super::support::{
 };
 use super::wait_ready::CommandReadyPod;
 use super::*;
+use crate::controllers::substrate::runtime_upgrade::UpgradeActivation;
 use crate::controllers::substrate::{ActivationOptions, RecoveryCharge};
 use pplx_space_common_core::kubernetes::EvacuationPlacement;
 use pplx_space_common_core::types::{
@@ -1134,6 +1135,7 @@ impl KubernetesSubstrate {
                             ),
                             target_state: pplx_space_sbx_mgr_client::proto::WakeTargetState::Started
                                 as i32,
+                            runtime_upgrade: None,
                         }
                     },
                     || {},
@@ -1871,6 +1873,21 @@ impl KubernetesSubstrate {
             } else {
                 None
             };
+            // Decided before the pod exists, so a stranded sandbox is refused
+            // before anything is placed. Every restore here lands in the
+            // started lifecycle except a drain's evacuation, which keeps the
+            // sandbox's lifecycle and its environment.
+            let runtime_upgrade = match &restore_plan {
+                Some(plan) if evacuation_placement.is_none() => {
+                    self.activation_runtime_upgrade(
+                        sandbox_id,
+                        UpgradeActivation::Restore,
+                        plan.storage_uri.as_deref(),
+                    )
+                    .await?
+                }
+                _ => None,
+            };
             // Boxed: `ensure_pod_exists` is a large future; inlining it here
             // overflows the test thread's stack.
             let (activation_attempt_id, joined_attempt_id) = match Box::pin(
@@ -1997,6 +2014,7 @@ impl KubernetesSubstrate {
                                 },
                             ),
                             target_state: wake_target_state,
+                            runtime_upgrade: runtime_upgrade.clone(),
                         }
                     },
                     emit_wake_requested,

@@ -58,6 +58,9 @@ pub(super) struct WakeStartConfig {
         crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance,
     pub(super) authoritative_route_identity: bool,
     pub(super) provisional_activation_attempt: bool,
+    /// The runtime upgrade to wake a stopped or suspended sandbox by, in place
+    /// of its start or restore (`WakeRequest.runtime_upgrade`).
+    pub(super) runtime_upgrade: Option<super::runtime_upgrade::WakeRuntimeUpgrade>,
 }
 
 impl Default for WakeStartConfig {
@@ -79,6 +82,7 @@ impl Default for WakeStartConfig {
                 crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::Unfenced,
             authoritative_route_identity: false,
             provisional_activation_attempt: false,
+            runtime_upgrade: None,
         }
     }
 }

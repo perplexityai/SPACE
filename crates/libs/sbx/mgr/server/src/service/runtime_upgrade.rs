@@ -808,29 +808,29 @@ fn required_text(value: &str, field: &str, max_bytes: usize) -> Result<String, S
     Ok(value.to_string())
 }
 
-/// Parse an `UpgradeRuntime` request. The embedded Start must be the plain
-/// blocking cold start the upgrade runs: readiness is its verification.
-fn parse_request(
-    request: crate::proto::UpgradeRuntimeRequest,
-) -> Result<RuntimeUpgradeRequest, Status> {
-    use crate::proto::WakeTargetState;
-    let sandbox_id = request
-        .sandbox_id
-        .parse::<pplx_space_common_core::types::SandboxId>()
-        .map_err(|error| Status::invalid_argument(format!("invalid sandbox_id: {error}")))?
-        .to_string();
-    let operation_id = request
-        .operation_id
+/// The operation, target and authorization an upgrade names, parsed the same
+/// way whether `UpgradeRuntime` or a Wake carries them.
+fn parse_upgrade_identity(
+    operation_id: &str,
+    target_environment: &str,
+    authorization: Option<&crate::proto::RuntimeUpgradeAuthorization>,
+) -> Result<
+    (
+        RuntimeUpgradeOperationId,
+        EnvironmentReference,
+        RuntimeUpgradeAuthorization,
+    ),
+    Status,
+> {
+    let operation_id = operation_id
         .parse::<RuntimeUpgradeOperationId>()
         .map_err(|error| Status::invalid_argument(format!("invalid operation_id: {error}")))?;
-    let target = request
-        .target_environment
+    let target = target_environment
         .parse::<EnvironmentReference>()
         .map_err(|error| {
             Status::invalid_argument(format!("invalid target_environment: {error}"))
         })?;
-    let authorization = request
-        .authorization
+    let authorization = authorization
         .ok_or_else(|| Status::invalid_argument("a runtime upgrade requires an authorization"))?;
     let authorization = RuntimeUpgradeAuthorization {
         id: required_text(
@@ -845,20 +845,13 @@ fn parse_request(
         )?,
         memory_loss: authorization.memory_loss,
     };
-    let target_state = match WakeTargetState::try_from(request.target_state) {
-        Ok(WakeTargetState::Unspecified | WakeTargetState::Started) => {
-            RuntimeUpgradeTargetState::Started
-        }
-        Ok(WakeTargetState::Stopped) => RuntimeUpgradeTargetState::Stopped,
-        _ => {
-            return Err(Status::invalid_argument(
-                "a runtime upgrade ends started or stopped",
-            ));
-        }
-    };
-    let start = request
-        .start
-        .ok_or_else(|| Status::invalid_argument("a runtime upgrade requires its Start"))?;
+    Ok((operation_id, target, authorization))
+}
+
+/// Refuse an upgrade Start other than the plain blocking cold start the
+/// upgrade runs: readiness is its verification.
+fn require_cold_upgrade_start(start: &StartRequest, sandbox_id: &str) -> Result<(), Status> {
+    use crate::proto::WakeTargetState;
     if start.sandbox_id != sandbox_id {
         return Err(Status::invalid_argument(
             "the upgrade's Start must name the upgraded sandbox",
@@ -884,6 +877,39 @@ fn parse_request(
             "the upgrade's Start must be a plain cold start into the started lifecycle",
         ));
     }
+    Ok(())
+}
+
+/// Parse an `UpgradeRuntime` request.
+fn parse_request(
+    request: crate::proto::UpgradeRuntimeRequest,
+) -> Result<RuntimeUpgradeRequest, Status> {
+    use crate::proto::WakeTargetState;
+    let sandbox_id = request
+        .sandbox_id
+        .parse::<pplx_space_common_core::types::SandboxId>()
+        .map_err(|error| Status::invalid_argument(format!("invalid sandbox_id: {error}")))?
+        .to_string();
+    let (operation_id, target, authorization) = parse_upgrade_identity(
+        &request.operation_id,
+        &request.target_environment,
+        request.authorization.as_ref(),
+    )?;
+    let target_state = match WakeTargetState::try_from(request.target_state) {
+        Ok(WakeTargetState::Unspecified | WakeTargetState::Started) => {
+            RuntimeUpgradeTargetState::Started
+        }
+        Ok(WakeTargetState::Stopped) => RuntimeUpgradeTargetState::Stopped,
+        _ => {
+            return Err(Status::invalid_argument(
+                "a runtime upgrade ends started or stopped",
+            ));
+        }
+    };
+    let start = request
+        .start
+        .ok_or_else(|| Status::invalid_argument("a runtime upgrade requires its Start"))?;
+    require_cold_upgrade_start(&start, &sandbox_id)?;
     Ok(RuntimeUpgradeRequest {
         operation_id,
         sandbox_id,
@@ -892,6 +918,57 @@ fn parse_request(
         authorization,
         start,
     })
+}
+
+/// The upgrade a Wake carries (`WakeRequest.runtime_upgrade`), parsed before
+/// the Wake acts, with the caller its cold start runs as.
+#[derive(Clone, Debug)]
+pub(super) struct WakeRuntimeUpgrade {
+    operation_id: RuntimeUpgradeOperationId,
+    target: EnvironmentReference,
+    authorization: RuntimeUpgradeAuthorization,
+    /// The checkpoint the control plane decided the upgrade from, by its
+    /// local artifact (`WakeRuntimeUpgrade.checkpoint_local_artifact_id`).
+    checkpoint_local_artifact_id: Option<pplx_space_common_core::types::LocalArtifactId>,
+    /// The Wake's caller, whom the upgrade's cold start runs as.
+    metadata: tonic::metadata::MetadataMap,
+    extensions: tonic::Extensions,
+}
+
+impl WakeRuntimeUpgrade {
+    pub(super) const fn checkpoint_local_artifact_id(
+        &self,
+    ) -> Option<pplx_space_common_core::types::LocalArtifactId> {
+        self.checkpoint_local_artifact_id
+    }
+
+    pub(super) fn parse(
+        upgrade: &crate::proto::WakeRuntimeUpgrade,
+        metadata: tonic::metadata::MetadataMap,
+        extensions: tonic::Extensions,
+    ) -> Result<Self, Status> {
+        let (operation_id, target, authorization) = parse_upgrade_identity(
+            &upgrade.operation_id,
+            &upgrade.target_environment,
+            upgrade.authorization.as_ref(),
+        )?;
+        let checkpoint_local_artifact_id = upgrade
+            .checkpoint_local_artifact_id
+            .as_deref()
+            .map(str::parse)
+            .transpose()
+            .map_err(|error| {
+                Status::invalid_argument(format!("invalid checkpoint_local_artifact_id: {error}"))
+            })?;
+        Ok(Self {
+            operation_id,
+            target,
+            authorization,
+            checkpoint_local_artifact_id,
+            metadata,
+            extensions,
+        })
+    }
 }
 
 impl super::SandboxManagerService {
@@ -906,6 +983,55 @@ impl super::SandboxManagerService {
         )?;
         let (metadata, extensions, message) = request.into_parts();
         let parsed = parse_request(message)?;
+        let (outcome, start) = match self
+            .run_runtime_upgrade(metadata, extensions, parsed)
+            .await?
+        {
+            RuntimeUpgradeOutcome::Upgraded { start } => (
+                crate::proto::RuntimeUpgradeOutcome::Upgraded,
+                start.map(|start| *start),
+            ),
+            RuntimeUpgradeOutcome::AlreadyOnTarget => {
+                (crate::proto::RuntimeUpgradeOutcome::AlreadyOnTarget, None)
+            }
+        };
+        Ok(tonic::Response::new(crate::proto::UpgradeRuntimeResponse {
+            outcome: outcome as i32,
+            start,
+        }))
+    }
+
+    /// Run the upgrade a Wake carries, booting `start`: the cold start the
+    /// Wake built for this sandbox. The caller holds the Wake's lock.
+    pub(super) async fn wake_runtime_upgrade(
+        &self,
+        upgrade: &WakeRuntimeUpgrade,
+        start: StartRequest,
+    ) -> Result<RuntimeUpgradeOutcome, Status> {
+        // The Wake built `start` as its cold start, and the upgrade's boot
+        // refuses anything else.
+        let sandbox_id = start.sandbox_id.clone();
+        self.run_runtime_upgrade(
+            upgrade.metadata.clone(),
+            upgrade.extensions.clone(),
+            RuntimeUpgradeRequest {
+                operation_id: upgrade.operation_id,
+                sandbox_id,
+                target: upgrade.target,
+                target_state: RuntimeUpgradeTargetState::Started,
+                authorization: upgrade.authorization.clone(),
+                start,
+            },
+        )
+        .await
+    }
+
+    async fn run_runtime_upgrade(
+        &self,
+        metadata: tonic::metadata::MetadataMap,
+        extensions: tonic::Extensions,
+        parsed: RuntimeUpgradeRequest,
+    ) -> Result<RuntimeUpgradeOutcome, Status> {
         let sandbox_id = parsed.sandbox_id.clone();
         let lock = self.auto_lifecycle.runtime_upgrade_lock(&sandbox_id);
         let _guard = super::restart_admission::wait_for_activation_admission(
@@ -920,19 +1046,7 @@ impl super::SandboxManagerService {
         );
         let outcome = upgrader.upgrade(parsed).await;
         crate::node_state_sync::mark_sandbox_dirty(&self.db, &sandbox_id);
-        let (outcome, start) = match outcome? {
-            RuntimeUpgradeOutcome::Upgraded { start } => (
-                crate::proto::RuntimeUpgradeOutcome::Upgraded,
-                start.map(|start| *start),
-            ),
-            RuntimeUpgradeOutcome::AlreadyOnTarget => {
-                (crate::proto::RuntimeUpgradeOutcome::AlreadyOnTarget, None)
-            }
-        };
-        Ok(tonic::Response::new(crate::proto::UpgradeRuntimeResponse {
-            outcome: outcome as i32,
-            start,
-        }))
+        outcome
     }
 
     /// Refuse to stage or load a checkpoint while an upgrade still owes the

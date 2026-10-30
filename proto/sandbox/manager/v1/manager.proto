@@ -867,6 +867,32 @@ message WakeRequest {
   // Unspecified is explicit operator wake. Access/command wakes must honor the
   // worker's effective policy under wake exclusion. Requires blocking STARTED.
   AutoLifecycleWakeSource implicit_wake_source = 5;
+  // Internal-only. Wake a stopped or suspended sandbox by the runtime upgrade
+  // `UpgradeRuntime` performs, booting the cold start this Wake would run
+  // under `target_environment`, instead of starting or restoring it on the
+  // environment it last ran under. Requires `start_context` and blocking
+  // STARTED; an implicit wake is admitted by the sandbox's wake policy first,
+  // as for a start or restore. A sandbox absent from this node is first
+  // staged from its suspend checkpoint, never launched from it. When the
+  // upgrade finds the sandbox already on the target, the Wake proceeds as
+  // without this field. A sandbox-manager that predates the field ignores it
+  // and wakes normally, where execution policy then refuses a blocked runtime.
+  optional WakeRuntimeUpgrade runtime_upgrade = 6;
+}
+
+// The runtime upgrade a Wake runs; see `WakeRequest.runtime_upgrade` and
+// `UpgradeRuntimeRequest`, whose fields these are.
+message WakeRuntimeUpgrade {
+  // Caller-chosen UUID naming this upgrade. Retries reuse it.
+  string operation_id = 1;
+  string target_environment = 2;
+  RuntimeUpgradeAuthorization authorization = 3;
+  // For a suspended sandbox, the local artifact of the checkpoint the
+  // control plane decided the upgrade from. The node upgrades only a row
+  // whose current local artifact is that checkpoint, and refuses a stale copy
+  // the restore would have replaced. Required for a suspended sandbox; a
+  // stopped one has no checkpoint to name.
+  optional string checkpoint_local_artifact_id = 4;
 }
 // Target lifecycle state for a Wake / WakeSandbox call. UNSPECIFIED is
 // treated as STARTED to preserve the historical behavior of the API.

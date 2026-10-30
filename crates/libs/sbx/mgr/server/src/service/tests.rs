@@ -15974,6 +15974,7 @@ pub(crate) mod service_tests {
                     blocking: true,
                     start_context: None,
                     target_state: 0,
+                    runtime_upgrade: None,
                 }))
                 .await
         });
@@ -16029,6 +16030,7 @@ pub(crate) mod service_tests {
                     ..Default::default()
                 }),
                 target_state: 0,
+                runtime_upgrade: None,
             }))
             .await
             .expect("a no-op wake does not consume launch context");
@@ -16735,6 +16737,7 @@ pub(crate) mod service_tests {
                 blocking: true,
                 start_context: None,
                 target_state: 0,
+                runtime_upgrade: None,
             }))
             .await
             .expect("explicit wake of a started sandbox should be a no-op");
@@ -16778,6 +16781,7 @@ pub(crate) mod service_tests {
                     ..Default::default()
                 }),
                 target_state: 0,
+                runtime_upgrade: None,
             }))
             .await
             .expect_err("an identity-free dormant wake must not start the sandbox");
@@ -16856,6 +16860,7 @@ pub(crate) mod service_tests {
                     ..Default::default()
                 }),
                 target_state: 0,
+                runtime_upgrade: None,
             }))
             .await
             .expect_err("checkpoint staging without a network namespace must fail");
@@ -17445,6 +17450,7 @@ pub(crate) mod service_tests {
                         blocking: true,
                         start_context: None,
                         target_state: 0,
+                        runtime_upgrade: None,
                     }))
                     .await
             });
@@ -18020,6 +18026,7 @@ pub(crate) mod service_tests {
                 }),
                 target_state: crate::proto::WakeTargetState::Stopped as i32,
                 implicit_wake_source: 0,
+                runtime_upgrade: None,
             })),
         )
         .await
@@ -18088,6 +18095,7 @@ pub(crate) mod service_tests {
                     }),
                     target_state: crate::proto::WakeTargetState::Stopped as i32,
                     implicit_wake_source: 0,
+                    runtime_upgrade: None,
                 })),
             )
             .await
@@ -18134,6 +18142,7 @@ pub(crate) mod service_tests {
                 start_context: None,
                 target_state: crate::proto::WakeTargetState::Stopped as i32,
                 implicit_wake_source: 0,
+                runtime_upgrade: None,
             })),
         )
         .await
@@ -18238,6 +18247,7 @@ pub(crate) mod service_tests {
                 }),
                 target_state: crate::proto::WakeTargetState::Stopped as i32,
                 implicit_wake_source: 0,
+                runtime_upgrade: None,
             })),
         )
         .await

@@ -85,6 +85,7 @@ pub(crate) mod native_access;
 mod node_api_client;
 mod pool_claims;
 mod recovery_charge;
+pub mod runtime_upgrade;
 mod sandbox_state_probe;
 
 pub use execution_fence::*;

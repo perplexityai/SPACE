@@ -1239,6 +1239,28 @@ impl SandboxManagerService {
         }
     }
 
+    /// Stage a sandbox absent from this node from its suspend checkpoint, and
+    /// leave its row suspended without launching anything. A Wake that runs a
+    /// runtime upgrade boots the staged disk by cold start instead of loading
+    /// the checkpoint, which may belong to a runtime that must not execute.
+    /// A sandbox already on this node, in any state, is left to the upgrade,
+    /// which checks its checkpoint against the one it was decided from.
+    pub(super) async fn stage_missing_checkpoint(&self, req: StartRequest) -> Result<(), Status> {
+        let mut start_ctx = StartSandboxContext::from_request(&req)?;
+        match self.resolve_start_sandbox_target(&req.sandbox_id, &start_ctx, false)? {
+            // Another activation created the row since the caller looked.
+            StartSandboxTarget::Local(_) => Ok(()),
+            StartSandboxTarget::MissingCheckpointRestore { sandbox_id } => self
+                .materialize_missing_checkpoint_restore(&sandbox_id, &mut start_ctx)
+                .instrument(tracing::info_span!(
+                    "sbxmgr.start.runtime_upgrade_stage",
+                    sandbox_id = %sandbox_id
+                ))
+                .await
+                .map(drop),
+        }
+    }
+
     async fn restore_suspended_checkpoint_start(
         &self,
         req: &StartRequest,

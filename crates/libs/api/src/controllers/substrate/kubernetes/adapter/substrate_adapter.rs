@@ -1,6 +1,7 @@
 //! `SubstrateAdapter` implementation for `KubernetesSubstrate`.
 
 use super::*;
+use crate::controllers::substrate::runtime_upgrade::UpgradeActivation;
 use pplx_space_common_core::types::SubstrateKind;
 
 impl SubstrateAdapter for KubernetesSubstrate {
@@ -926,6 +927,15 @@ impl SubstrateAdapter for KubernetesSubstrate {
                 )
                 .await;
         }
+        // A stopped sandbox boots under the environment it last ran under
+        // unless the policy moves it. Decided before admission is charged or
+        // a pod exists, so a stranded sandbox costs nothing and places nothing.
+        let runtime_upgrade = if normalize_lifecycle(&sandbox.lifecycle) == "stopped" {
+            self.activation_runtime_upgrade(sandbox_id, UpgradeActivation::Start, None)
+                .await?
+        } else {
+            None
+        };
         // The controller may have deferred admission from a stale restore-
         // shaped snapshot. If the refreshed row now takes the cold-start path,
         // spend that deferred charge before creating an execution.
@@ -1092,6 +1102,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                                 },
                             ),
                             target_state: 0,
+                            runtime_upgrade: runtime_upgrade.clone(),
                         }
                     },
                     emit_wake_requested,
@@ -1825,6 +1836,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                                     },
                                 ),
                                 target_state: 0,
+                                runtime_upgrade: None,
                             }
                         },
                         || {},

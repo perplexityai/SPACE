@@ -483,6 +483,7 @@ fn direct_wake_request(
             }
         }),
         target_state: 0,
+        runtime_upgrade: None,
     }
 }
 

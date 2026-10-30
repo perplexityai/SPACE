@@ -599,6 +599,10 @@ impl SandboxManagerService {
                 )),
         );
         let _guard = wait_for_activation_admission(&sandbox.id, wake_lock.lock()).await?;
+        // At most once per Wake: a replay of a retired upgrade answers
+        // `Upgraded` without booting, and the row it leaves must not send the
+        // loop back into the upgrade.
+        let mut runtime_upgrade = start.runtime_upgrade.as_ref();
         loop {
             let sandbox = self.lookup_sandbox(&sandbox.id)?;
             let wake_policy =
@@ -704,6 +708,54 @@ impl SandboxManagerService {
                             ),
                         )
                         .await;
+                }
+                SandboxState::Suspended | SandboxState::Stopped
+                    if let Some(upgrade) = runtime_upgrade.take() =>
+                {
+                    // The upgrade boots the disk under this node's checkpoint, so
+                    // that checkpoint must be the one the upgrade was decided
+                    // from: the row's pinned local artifact must be the one the
+                    // Wake names. Staging pins the staged checkpoint, so the
+                    // check holds across retries; a stale copy here is refused,
+                    // never booted.
+                    if sandbox.state == SandboxState::Suspended
+                        && (upgrade.checkpoint_local_artifact_id().is_none()
+                            || sandbox.current_local_artifact_id
+                                != upgrade.checkpoint_local_artifact_id())
+                    {
+                        return Err(Status::failed_precondition(format!(
+                            "sandbox {}'s checkpoint on this node isn't the one its runtime \
+                             upgrade was decided from; refusing to boot it",
+                            sandbox.id
+                        )));
+                    }
+                    let ready_timeout_secs = wake_ready_timeout_secs(
+                        wait_deadline,
+                        DEFAULT_BLOCKING_READY_TIMEOUT_SECS,
+                        sandbox.state,
+                    )?;
+                    // The upgrade boots the cold start this Wake would run for
+                    // a stopped sandbox, never the checkpoint. Boxed: the
+                    // upgrade is a large future, and inlined it would grow every
+                    // Wake's state machine, upgrade or not, past the stack of an
+                    // unoptimized build.
+                    let outcome = Box::pin(self.wake_runtime_upgrade(
+                        upgrade,
+                        start.start_request(&sandbox.id, false, Some(ready_timeout_secs))?,
+                    ))
+                    .await?;
+                    if matches!(
+                        outcome,
+                        super::runtime_upgrade::RuntimeUpgradeOutcome::AlreadyOnTarget
+                    ) {
+                        // Nothing was fenced or booted; the next pass starts or
+                        // restores the sandbox as a Wake without the upgrade.
+                        tracing::info!(
+                            sandbox_id = %sandbox.id,
+                            state = %sandbox.state,
+                            "wake runtime upgrade found the sandbox already on its target"
+                        );
+                    }
                 }
                 SandboxState::Suspended => {
                     self.start_sandbox_with_authority(

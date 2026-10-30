@@ -287,3 +287,48 @@ async fn sandbox_kill_is_admitted_while_every_sandbox_permit_is_held() {
         .await;
     assert_eq!(sandbox_kill.unwrap_err().code(), tonic::Code::Unimplemented);
 }
+
+/// Sandbox-manager authorizes an upgrade by its caller, which is node-api on
+/// either service, so the public service refuses one before forwarding and
+/// only the internal one forwards it, for the control plane.
+#[tokio::test]
+async fn only_the_internal_wake_forwards_a_runtime_upgrade() {
+    use pplx_space_node_api_client::proto::worker_api_internal_server::WorkerApiInternal;
+    use pplx_space_node_api_client::proto::worker_api_server::WorkerApi;
+    let service =
+        service_with_limiter(UdsPerSandboxLimiter::for_tests_with_reserved(1, 1, 8)).await;
+    let wake = |runtime_upgrade| {
+        Request::new(proto::WakeRequest {
+            sandbox_id: SandboxId::new().to_string(),
+            blocking: true,
+            runtime_upgrade,
+            ..Default::default()
+        })
+    };
+    let upgrade = || Some(proto::WakeRuntimeUpgrade::default());
+
+    let refused = WorkerApi::wake_sandbox(&service, wake(upgrade()))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument, "{refused}");
+    assert!(refused.message().contains("internal-only"), "{refused}");
+
+    // A data-plane caller may not run one even on the internal service.
+    let mut unprivileged = wake(upgrade());
+    unprivileged.extensions_mut().insert(
+        pplx_space_common_svc::auth::NodeApiAuthenticatedCaller::unprivileged_workload_for_test(),
+    );
+    let denied = WorkerApiInternal::wake_sandbox(&service, unprivileged)
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::PermissionDenied, "{denied}");
+
+    // The fake sandbox-manager answers whatever reaches it with Unimplemented.
+    for forwarded in [
+        WorkerApi::wake_sandbox(&service, wake(None)).await,
+        WorkerApiInternal::wake_sandbox(&service, wake(upgrade())).await,
+    ] {
+        let forwarded = forwarded.unwrap_err();
+        assert_eq!(forwarded.code(), tonic::Code::Unimplemented, "{forwarded}");
+    }
+}

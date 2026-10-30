@@ -1263,6 +1263,101 @@ or the sandbox stops some other way. Deleting the sandbox deletes its
 upgrade rows; evicting it removes the preserved copy with the rest of its local
 presence, and the upgrade fails at its next claim.
 
+### Upgrading at resume and start
+
+On Kubernetes, the control plane can decide a runtime upgrade when a stopped
+sandbox starts or a suspended one resumes, before it dispatches the activation.
+`SPACE_RUNTIME_UPGRADE_AT_ACTIVATION_ENABLED` turns it on; it's off by default,
+and off, every start and restore proceeds as recorded. The decision lives in
+`crates/libs/api/src/controllers/substrate/runtime_upgrade.rs`, and the
+Kubernetes substrate runs it from its stopped-start path and from every
+restore into the started lifecycle: user resumes, connect-time wakes and
+started recovery. A drain's evacuation restore keeps the sandbox's
+environment. Direct doesn't decide upgrades. Edges come only from
+`runtime_environments`, which nothing writes yet, so until node publications
+populate it, every move off an environment that may not execute is stranded.
+
+1. **Evidence.** A resume reads the producer of the checkpoint it would load,
+   which the restore plan already chose: the full `snapshots` row at the
+   plan's storage URI, or, for a restore from the node's local copy, the
+   snapshot of the sandbox's current local artifact. A start reads the
+   execution the sandbox last published, from `sandbox_observed_states`; a
+   publish that carried no execution is no evidence, and so is a checkpoint
+   without a local artifact identity, since the node couldn't tell its copy
+   is that checkpoint. A record that names its environment is that
+   environment. An unbound one is attributed as narrowly as the control
+   plane can approach node-manager, which applies an environment's
+   eligibility to unbound work only when the work matches that environment's
+   definition exactly, boot-component digests included, and runs other
+   unbound work as a historical contract while the cluster permits legacy
+   unbound work. The catalog has no digests, so an unbound record counts only
+   when its runtime, version, kernel and state format all match exactly one
+   unretired row of `runtime_environments`; one that matches here but not on
+   the node is refused there before the fence, for want of a certified
+   edge. A record from before execution
+   metadata counts as E0 (Firecracker 1.15.1 with format 9.0.0, the
+   `INITIAL_FIRECRACKER_*` identity) only when the cluster disables legacy
+   unbound work, and a kernel it names must match. A bound record on an
+   `allowed` environment needs no catalog. Anything else activates as
+   recorded, and the node's execution policy decides whether it may run.
+2. **Decision.** With no cluster default, or on the default or an `allowed`
+   environment, nothing moves. A suspended sandbox on a `deprecated`
+   environment restores where it is, memory included. Otherwise the target is
+   the default, along the edges `runtime_environments` records for the
+   sandbox's environment:
+   - a resume with a memory edge restores as usual, and the node's
+     restore-consumer selection loads the checkpoint under the default;
+   - an upgrade edge runs the runtime upgrade above instead, for a stopped
+     sandbox, or for a suspended one whose environment an operator blocked;
+     memory is discarded only under that block;
+   - a stopped sandbox on a `deprecated` environment with no edge starts
+     where it is, since that environment still executes;
+   - anything else is stranded: the activation is refused with
+     `FailedPrecondition` (412) naming both environments, and the restore
+     claim is released, so the sandbox resumes once an operator allows its
+     environment or certifies an edge.
+
+   An environment with no state counts as not executing once the cluster has a
+   default, as it does on nodes, but it isn't an operator's consent to lose
+   memory: setting the first default leaves every other environment without a
+   state. A suspended sandbox there with no memory edge is stranded, which
+   allowing the environment undoes. The policy is read through a 5-second
+   cache, and a resume that would discard memory decides again on the
+   uncached policy first.
+3. **Dispatch.** The activation's Wake carries `WakeRequest.runtime_upgrade`:
+   the target, an operation id derived from the sandbox, the move, its cause
+   and the checkpoint or execution being moved (so every retry names the same
+   upgrade under the same authorization), and the authorization. The authorization is the environment's
+   state, `runtime-environment-<blocked|unlisted|deprecated>:<environment>`,
+   and it accepts memory loss only for a suspended sandbox whose environment
+   is `blocked`. Placement doesn't change. Sandbox-manager runs the upgrade
+   under the Wake's lock, booting the cold start the Wake would run for a
+   stopped sandbox, and finishes the Wake as a resident one. When the upgrade
+   finds the sandbox already on the target, the Wake starts or restores it as
+   usual. A sandbox absent from the node, a restore pod scheduled away from
+   the node holding its checkpoint, is first staged from the checkpoint's
+   storage URI and left suspended, never launched from it, and then
+   upgraded: that's the cluster-side materialization for a sandbox with no
+   pod. A sandbox-manager that predates the field ignores it and wakes
+   normally, where its execution policy refuses a runtime that may not run.
+   Node-api forwards `runtime_upgrade` only on `WorkerApiInternal`, and only
+   for a caller with the control-plane authority a policy write needs; its
+   public `WakeSandbox` refuses the field.
+   A suspended sandbox's checkpoint on the node is booted only if it's the
+   one the upgrade was decided from: the Wake names that checkpoint's local
+   artifact, and the row must pin it, as it does on the checkpoint's source
+   node and after staging, so the check holds across retries. An upgrade of a
+   suspended sandbox that names no checkpoint is refused. A stale copy is
+   refused with `FailedPrecondition` and left alone, where a plain restore
+   would have staged the chosen backup over it. Staging an encrypted
+   checkpoint writes no plaintext rootfs, so an encrypted sandbox restored
+   away from its checkpoint is refused before the fence.
+
+While an upgrade holds the sandbox, other activations get the retryable 503
+the restore and activation leases already give, and a Wake that meets the
+node's fence is retried to its deadline and answers a retryable 503. The
+decision is counted by `runtime_upgrade.activation.decision`.
+
 ### Node runtime provisioning
 
 The whole-node `runtime-provisioning` facet reads
