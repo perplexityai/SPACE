@@ -23,7 +23,7 @@ datadog-otel = ["otel", "datadog"]
 
 [dependencies]
 anyhow = { workspace = true }
-clap = { workspace = true, features = ["derive"] }
+clap = { workspace = true, features = ["derive", "env"] }
 
 # internal
 pplx-space-common-core = { workspace = true }

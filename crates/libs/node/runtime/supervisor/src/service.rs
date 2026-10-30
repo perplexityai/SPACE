@@ -149,6 +149,7 @@ pub struct RuntimeSupervisorService {
     reaper_shutdown: CancellationToken,
     peer_authorizer: UdsPeerAuthorizer,
     shutdown: CancellationToken,
+    jailer_start_timeout: Duration,
 }
 
 impl Default for RuntimeSupervisorService {
@@ -175,7 +176,13 @@ impl RuntimeSupervisorService {
                 std::iter::empty::<UdsPeerAccount>(),
             ),
             shutdown,
+            jailer_start_timeout: launch::DEFAULT_JAILER_START_TIMEOUT,
         }
+    }
+
+    pub fn with_jailer_start_timeout(mut self, timeout: Duration) -> Self {
+        self.jailer_start_timeout = timeout;
+        self
     }
 
     pub async fn drain(&self) {
@@ -715,6 +722,7 @@ impl RuntimeSupervisorService {
                 sandbox_id, execution, budget, sealed_launch,
             ).await?;
             let blocking_slot = self.acquire_blocking_slot().await?;
+            let jailer_start_timeout = self.jailer_start_timeout;
             let launch_result = tokio::task::spawn_blocking(move || {
                 let _blocking_slot = blocking_slot;
                 launch::launch_via_jailer(launch::JailerLaunch {
@@ -730,6 +738,7 @@ impl RuntimeSupervisorService {
                     fc_metrics_path: req.fc_metrics_path.as_ref().map_or("", |path| path.as_str()),
                     fc_console_path: req.fc_console_path.as_ref().map_or("", |path| path.as_str()),
                     cgroup_limits: &cgroup_limits,
+                    jailer_start_timeout,
                 })
             })
             .await

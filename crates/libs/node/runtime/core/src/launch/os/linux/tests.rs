@@ -383,3 +383,73 @@ fn jailer_execution_uses_the_opened_inode_after_path_replacement() {
             .success()
     );
 }
+
+#[test]
+fn jailer_timeout_reports_its_output_without_waiting_for_its_descendants() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+
+    /// Kills the background process the fake jailer leaves holding its pipes.
+    struct KillRecordedPid(std::path::PathBuf);
+    impl Drop for KillRecordedPid {
+        fn drop(&mut self) {
+            let Ok(pid) = std::fs::read_to_string(&self.0) else {
+                return;
+            };
+            if let Ok(pid) = pid.trim().parse() {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(pid),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+        }
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let jailer = directory.path().join("jailer");
+    let background_pid = directory.path().join("background.pid");
+    // Dropped at the end of the test, after the elapsed-time check, and
+    // before the temporary directory.
+    let _background = KillRecordedPid(background_pid.clone());
+    // More stdout than the reported tail, then a stage that never finishes,
+    // with a background process still holding both pipes open.
+    std::fs::write(
+        &jailer,
+        format!(
+            "#!/bin/sh\n\
+             printf '%03000d\\n' 0\n\
+             echo first-stage-done\n\
+             echo second-stage-waiting >&2\n\
+             sleep 10 &\n\
+             echo $! > '{}'\n\
+             exec sleep 10\n",
+            background_pid.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&jailer, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let started = Instant::now();
+    let error = super::run_jailer_command(
+        "sandbox-a",
+        crate::launch::JailerExecutable::LegacyPath(jailer.to_str().unwrap()),
+        "",
+        &[],
+        Duration::from_millis(300),
+    )
+    .unwrap_err();
+
+    assert!(started.elapsed() < Duration::from_secs(5), "{error}");
+    assert!(
+        error.starts_with("jailer for sandbox-a timed out after "),
+        "{error}"
+    );
+    assert!(error.contains("(limit 300ms)"), "{error}");
+    assert!(error.contains("first-stage-done"), "{error}");
+    assert!(error.contains("second-stage-waiting"), "{error}");
+    assert!(
+        error.len() < 2 * super::JAILER_OUTPUT_TAIL_BYTES + 200,
+        "output tail is unbounded: {} bytes",
+        error.len()
+    );
+}

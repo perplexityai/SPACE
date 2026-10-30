@@ -1,5 +1,6 @@
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use pplx_space_node_runtime_core::proto::runtime_supervisor_server::RuntimeSupervisorServer;
 use tokio_stream::wrappers::UnixListenerStream;
@@ -24,6 +25,8 @@ pub struct RuntimeSupervisorRunConfig {
     /// service. See [`run`] for why the two modes cannot be separated by the
     /// caller.
     pub sidecar_launcher_fd: Option<RawFd>,
+    /// How long one Firecracker jailer run may take before the launch fails.
+    pub jailer_start_timeout: Duration,
 }
 
 /// Why [`run`] returned without a clean shutdown.
@@ -69,13 +72,16 @@ pub fn run(config: RuntimeSupervisorRunConfig) -> Result<(), RunRuntimeSuperviso
         .enable_all()
         .build()
         .map_err(RunRuntimeSupervisorError::BuildRuntime)?
-        .block_on(run_service(config.socket_path))
+        .block_on(run_service(config.socket_path, config.jailer_start_timeout))
 }
 
 #[cfg(test)]
 mod tests;
 
-async fn run_service(socket: PathBuf) -> Result<(), RunRuntimeSupervisorError> {
+async fn run_service(
+    socket: PathBuf,
+    jailer_start_timeout: Duration,
+) -> Result<(), RunRuntimeSupervisorError> {
     let telemetry = pplx_space_common_svc::init_service(SERVICE_NAME)
         .map_err(RunRuntimeSupervisorError::Telemetry)?;
     let listener = pplx_space_common_svc::bind_unix_socket(
@@ -89,12 +95,17 @@ async fn run_service(socket: PathBuf) -> Result<(), RunRuntimeSupervisorError> {
     })?;
     let (_, health_service) = pplx_space_common_svc::grpc_health_service();
     let shutdown_token = pplx_space_common_svc::shutdown_token();
-    let service = RuntimeSupervisorService::new(shutdown_token.clone());
+    let service = RuntimeSupervisorService::new(shutdown_token.clone())
+        .with_jailer_start_timeout(jailer_start_timeout);
     service
         .spawn_tracked_child_reaper()
         .map_err(RunRuntimeSupervisorError::ChildReaper)?;
 
-    tracing::info!(socket_path = %socket.display(), "space-runtime-supervisor listening");
+    tracing::info!(
+        socket_path = %socket.display(),
+        jailer_start_timeout_ms = jailer_start_timeout.as_millis() as u64,
+        "space-runtime-supervisor listening"
+    );
     let shutdown = async {
         shutdown_token.cancelled().await;
         tracing::warn!("space-runtime-supervisor shutting down");
