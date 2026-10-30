@@ -3,10 +3,9 @@
 /// SPACE guest Linux network contract.
 pub mod network {
     pub const PRIMARY_INTERFACE: &str = "eth0";
-    pub const IPV4_ADDR: &str = "169.254.0.21";
-    pub const GATEWAY_IPV4_ADDR: &str = "169.254.0.22";
-    pub const IPV4_NETMASK: &str = "255.255.255.252";
-    pub const GATEWAY_IPV4_CIDR: &str = "169.254.0.22/30";
+    pub use pplx_space_net_common::guest_link::{
+        GATEWAY_IPV4_ADDR, GATEWAY_IPV4_CIDR, IPV4_ADDR, IPV4_NETMASK,
+    };
 }
 
 /// SPACE guest Linux filesystem paths.

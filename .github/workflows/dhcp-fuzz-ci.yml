@@ -1,0 +1,61 @@
+name: DHCP fuzz CI
+
+on:
+  pull_request:
+    paths:
+      - crates/libs/net/common/src/slot_dhcp.rs
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dhcp-fuzz-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    if: github.repository == 'perplexityai/SPACE'
+    name: DHCP parser fuzz
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: fuzz
+    steps:
+      - name: Check out SPACE
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install fuzz build prerequisites
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang protobuf-compiler
+
+      - name: Install the pinned fuzz toolchain and runner
+        run: |
+          rustup show active-toolchain
+          cargo install cargo-fuzz --locked --version "$(cat cargo-fuzz.version)" --root "${RUNNER_TEMP}/fuzz-tools"
+          echo "${RUNNER_TEMP}/fuzz-tools/bin" >>"${GITHUB_PATH}"
+
+      - name: Check fuzz formatting
+        run: cargo fmt -- --check
+
+      - name: Exercise the DHCP parser
+        run: |
+          cargo fetch --locked
+          cp Cargo.lock "${RUNNER_TEMP}/fuzz-Cargo.lock"
+          mkdir -p corpus/slot_dhcp
+          cargo fuzz run slot_dhcp corpus/slot_dhcp seeds/slot_dhcp -- -max_total_time=30 -timeout=5 -rss_limit_mb=2048
+          cmp Cargo.lock "${RUNNER_TEMP}/fuzz-Cargo.lock"
+
+      - name: Upload failing inputs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fuzz-failing-inputs
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+          retention-days: 7
