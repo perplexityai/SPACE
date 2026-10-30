@@ -128,6 +128,16 @@
 //! unrestorable-`restoring` fail doesn't apply this check; it matches only a
 //! row with no active execution.
 //!
+//! A client that keeps retrying a failed restore renews both on every retry,
+//! so the check alone would spare its row, and the pending pod holding a node
+//! slot, for as long as the client keeps going. The restoring-episode
+//! deadline ([`ReconcilerConfig::restoring_episode_deadline`]) ends that: past
+//! it, a Kubernetes `restoring` row whose active execution has no pod IP, and
+//! whose pre-restore snapshot proves a revert safe, is listed whatever its
+//! leases say. Its probe still decides the action, and only the revert to
+//! `suspended` honors the deadline; the fail and converge CASes still apply
+//! the check. See `restoring_episode::restoring_episode_overdue`.
+//!
 //! Of these lifecycles only `creating` and `restoring` are ever written to
 //! the row today: the start and resume paths keep the row's old lifecycle
 //! while they run, and nothing writes `pausing` or `checkpointing`. The other
@@ -195,6 +205,7 @@ use crate::env_config;
 
 pub mod classify;
 pub mod probe;
+mod restoring_episode;
 pub mod store;
 
 #[cfg(test)]
@@ -696,6 +707,23 @@ pub(crate) const DEFAULT_COMMAND_READY_PENDING_TERMINAL_AGE_SECS: u64 = 3600;
 /// against enqueue latency and unmodeled transients, so it only needs to
 /// comfortably exceed suspend→backup-enqueue time (seconds).
 pub(crate) const DEFAULT_UNRESTORABLE_RESTORING_AGE_SECS: u64 = 300;
+/// Default restoring-episode deadline: how long a `restoring` row may go,
+/// from the claim that started its episode, while its active execution has no
+/// pod IP, before the sweep may revert it even under a live retry.
+///
+/// Priced against both failure modes. A restore pod has no IP until its node
+/// has loaded the snapshot and resumed the VM: the shim makes that start
+/// inside the pod sandbox's creation, and kubelet publishes the IP only once
+/// that returns. So the deadline has to clear the slowest healthy load,
+/// including one that first downloads the snapshot from durable storage, and
+/// reverting one wastes that load and starts a fresh restore from the same
+/// snapshot. Every minute past it holds a node slot for a restore that won't
+/// finish. Half an hour is three default `restoring` ages and six
+/// restore-ownership windows, far past any load a healthy node takes, so a
+/// slow episode gets several full retries first. It's a budget for the whole
+/// episode, not for each attempt: time a failed attempt spent counts against
+/// the attempt after it.
+pub(crate) const DEFAULT_RESTORING_EPISODE_DEADLINE_SECS: u64 = 1800;
 
 #[derive(Debug, Clone)]
 pub struct ReconcilerConfig {
@@ -765,6 +793,15 @@ pub struct ReconcilerConfig {
     /// the lifecycle and the cleanup retires the execution afterwards,
     /// refusing a pod that came up since the candidate was observed.
     pub abandoned_restore_retirement: AbandonedRestoreRetirement,
+    /// How long a Kubernetes `restoring` episode may run while its active
+    /// execution has no pod IP before the sweep may revert it to `suspended`,
+    /// however recently a client retry renewed its restore lease and
+    /// activation attempt (`SPACE_TRANSIENT_LIFECYCLE_SWEEPER_RESTORING_EPISODE_DEADLINE_SECS`,
+    /// default [`DEFAULT_RESTORING_EPISODE_DEADLINE_SECS`], `0` turns it off).
+    /// Measured from `lifecycle_changed_at`, which re-drives don't move, and
+    /// effective only past the `restoring` age too. See
+    /// `restoring_episode::restoring_episode_overdue`.
+    pub restoring_episode_deadline: Option<PositiveDuration>,
 }
 
 /// Per-lifecycle override resolution.
@@ -814,6 +851,9 @@ impl Default for ReconcilerConfig {
                 Duration::from_secs(DEFAULT_UNRESTORABLE_RESTORING_AGE_SECS),
             ),
             abandoned_restore_retirement: AbandonedRestoreRetirement::Disabled,
+            restoring_episode_deadline: Some(PositiveDuration::new_panic(Duration::from_secs(
+                DEFAULT_RESTORING_EPISODE_DEADLINE_SECS,
+            ))),
         }
     }
 }
@@ -875,6 +915,10 @@ impl ReconcilerConfig {
             unrestorable_restoring_min_placement_age: default
                 .unrestorable_restoring_min_placement_age,
             abandoned_restore_retirement: AbandonedRestoreRetirement::from_env(),
+            restoring_episode_deadline: config.optional_positive_duration_secs(
+                "SPACE_TRANSIENT_LIFECYCLE_SWEEPER_RESTORING_EPISODE_DEADLINE_SECS",
+                default.restoring_episode_deadline,
+            ),
         }
     }
 
@@ -1785,12 +1829,13 @@ impl<S: SweepSink> Reconciler<S> {
             .debug();
             return;
         };
+        let reason = restoring_episode::revert_reason(candidate);
         OutcomeEvent::aged_transient(
             AgedTransientOutcome::RevertedToDurableSnapshot,
             candidate.lifecycle.as_str(),
             verdict.as_str(),
         )
-        .reason("recoverable_snapshot")
+        .reason(reason)
         .sandbox_id(candidate.sandbox_id)
         .age_secs(candidate.age.as_secs())
         .warn();
@@ -1802,7 +1847,7 @@ impl<S: SweepSink> Reconciler<S> {
             Some(SandboxLifecycle::Suspended),
             verdict,
             candidate.age,
-            "recoverable_snapshot",
+            reason,
         );
 
         // The revert already retired the restore's execution, so what's left
@@ -2861,6 +2906,7 @@ pub async fn run_with_substrate(
     shutdown_token: CancellationToken,
 ) {
     let sink = SubstrateSweepSink::new(pool, substrate)
-        .with_abandoned_restore_retirement(config.abandoned_restore_retirement);
+        .with_abandoned_restore_retirement(config.abandoned_restore_retirement)
+        .with_restoring_episode_deadline(config.restoring_episode_deadline);
     run(config, sink, shutdown_token).await;
 }

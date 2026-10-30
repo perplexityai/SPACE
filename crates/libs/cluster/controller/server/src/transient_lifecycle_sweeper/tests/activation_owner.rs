@@ -160,7 +160,7 @@ async fn insert_row_with(
     Ok(sandbox_id)
 }
 
-async fn lifecycle_of(pool: &PgPool, sandbox_id: SandboxId) -> TestResult<String> {
+pub(super) async fn lifecycle_of(pool: &PgPool, sandbox_id: SandboxId) -> TestResult<String> {
     Ok(
         sqlx::query_scalar(sql!("SELECT lifecycle FROM sandboxes WHERE id = $1"))
             .bind(sandbox_id)
@@ -282,7 +282,7 @@ async fn a_restoring_row_is_converged_or_reverted_only_once_its_wake_is_gone() -
 /// Both revert variants carry the owner check: the one that only moves the
 /// lifecycle (the default) and the one that also retires the restore's
 /// execution.
-const RETIREMENT_MODES: [AbandonedRestoreRetirement; 2] = [
+pub(super) const RETIREMENT_MODES: [AbandonedRestoreRetirement; 2] = [
     AbandonedRestoreRetirement::Disabled,
     AbandonedRestoreRetirement::Enabled,
 ];
@@ -295,7 +295,10 @@ fn revert_sink(pool: &PgPool, retirement: AbandonedRestoreRetirement) -> Substra
 /// The retire fence the candidate select would record for the row's active
 /// execution, read straight from it, so a revert that retires the execution
 /// matches it and only the owner check can refuse.
-async fn recorded_fence(pool: &PgPool, sandbox_id: SandboxId) -> TestResult<RetireFence> {
+pub(super) async fn recorded_fence(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+) -> TestResult<RetireFence> {
     let row: RecordedExecutionRow = sqlx::query_as(sql!(
         "SELECT pod_name, activation_attempt_id, generation,
                 NULLIF(BTRIM(pod_uid), '') AS pod_uid, route_activation_id

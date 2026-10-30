@@ -28,6 +28,7 @@ fn candidate(
         node_name: Some("node-a".to_string()),
         routable_execution: true,
         activation_abandoned: false,
+        episode_overdue: false,
         activation_attempt_held: true,
         pod_fence: RetireFence::NoExecution,
     }

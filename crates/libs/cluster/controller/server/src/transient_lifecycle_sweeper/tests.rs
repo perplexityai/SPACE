@@ -803,6 +803,7 @@ fn candidate(lifecycle: SandboxLifecycle) -> SweepCandidate {
         node_name: Some("node-a".to_string()),
         routable_execution: true,
         activation_abandoned: false,
+        episode_overdue: false,
         activation_attempt_held: true,
         pod_fence: pod_fence(),
     }
@@ -879,6 +880,7 @@ fn config_with_all_overrides(age: PositiveDuration) -> ReconcilerConfig {
         unrestorable_restoring_enabled: true,
         unrestorable_restoring_min_placement_age: age,
         abandoned_restore_retirement: Default::default(),
+        restoring_episode_deadline: None,
     }
 }
 
@@ -1535,6 +1537,28 @@ async fn v5_missing_restoring_with_ready_snapshot_reverts() {
     assert_eq!(report.aged_out, 0);
     assert_eq!(reconciler.sink.revert_calls(), vec![missing_id]);
     assert_eq!(reconciler.sink.cleanup_calls(), vec![missing_id]);
+}
+
+/// A revert reports the deadline as its reason only for a candidate the
+/// deadline let through; every other revert reports its snapshot.
+#[test]
+fn a_revert_reports_the_deadline_only_when_it_let_the_row_through() {
+    let ordinary = SweepCandidate {
+        ready_snapshot: true,
+        ..candidate(SandboxLifecycle::Restoring)
+    };
+    let overdue = SweepCandidate {
+        episode_overdue: true,
+        ..ordinary.clone()
+    };
+    assert_eq!(
+        restoring_episode::revert_reason(&ordinary),
+        "recoverable_snapshot"
+    );
+    assert_eq!(
+        restoring_episode::revert_reason(&overdue),
+        "restoring_episode_deadline"
+    );
 }
 
 /// V6 — a probe error downgrades every candidate on that node to
@@ -2580,6 +2604,7 @@ fn f5_only_an_observed_pod_yields_a_verifiable_fence() {
 
 mod activation_owner;
 mod crashed_create;
+mod episode_deadline;
 
 mod postgres_backed {
 
@@ -2645,6 +2670,7 @@ mod postgres_backed {
                         .bind(1_i64)
                         .bind(1000_i64)
                         .bind(SubstrateKind::Kubernetes)
+                        .bind(None::<i64>)
                         .fetch_all(&db.pool)
                         .await?;
                 assert!(candidates.iter().all(|row| row.id != id));
@@ -2778,6 +2804,7 @@ mod postgres_backed {
                 .bind(age_secs)
                 .bind(1000_i64)
                 .bind(SubstrateKind::Kubernetes)
+                .bind(None::<i64>)
                 .fetch_all(pool)
                 .await?,
         )
@@ -2986,6 +3013,7 @@ mod postgres_backed {
         .bind(60_i64)
         .bind(1000_i64)
         .bind(SubstrateKind::Kubernetes)
+        .bind(None::<i64>)
         .fetch_all(pool)
         .await?;
         let listed_ids: Vec<SandboxId> = listed.into_iter().map(|row| row.id).collect();
@@ -3352,6 +3380,7 @@ mod postgres_backed {
         .bind(60_i64)
         .bind(1000_i64)
         .bind(SubstrateKind::Kubernetes)
+        .bind(None::<i64>)
         .fetch_all(pool)
         .await?;
         let fact = |id: SandboxId| {
@@ -4130,6 +4159,8 @@ mod postgres_backed {
                 .bind(lifecycle.to_string())
                 .bind(60_i64)
                 .bind(sandbox_id)
+                .bind(None::<i64>)
+                .bind(SubstrateKind::Kubernetes)
                 .fetch_optional(pool)
                 .await?,
         )

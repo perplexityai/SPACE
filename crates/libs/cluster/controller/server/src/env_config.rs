@@ -64,6 +64,20 @@ impl EnvConfig<'_> {
         pplx_space_common_core::env::env_destructive_gate(self.0.var(var).ok().as_deref())
     }
 
+    /// An optional positive duration from seconds: unset or unparseable keeps
+    /// `default`, and `0` turns it off.
+    pub(crate) fn optional_positive_duration_secs(
+        &self,
+        var: &str,
+        default: Option<PositiveDuration>,
+    ) -> Option<PositiveDuration> {
+        match self.0.var(var).ok().and_then(|raw| raw.parse::<u64>().ok()) {
+            Some(0) => None,
+            Some(value) => PositiveDuration::new(Duration::from_secs(value)),
+            None => default,
+        }
+    }
+
     pub(crate) fn duration_secs(&self, var: &str, default: Duration) -> Duration {
         match self.0.var(var).ok().and_then(|raw| raw.parse::<u64>().ok()) {
             Some(secs) if secs > 0 => Duration::from_secs(secs),

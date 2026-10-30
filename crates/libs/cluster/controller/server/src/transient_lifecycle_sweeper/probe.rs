@@ -75,6 +75,13 @@ pub struct SweepCandidate {
     /// left (one that never took one, or whose activation finished). The
     /// fail, converge and revert CASes re-check the owner.
     pub activation_abandoned: bool,
+    /// Whether this is a `restoring` row the restoring-episode deadline
+    /// ([`super::ReconcilerConfig::restoring_episode_deadline`]) let through:
+    /// its episode is overdue with no pod IP on its active execution, and its
+    /// restore lease or activation attempt would otherwise have spared it.
+    /// Only the revert honors that; the converge and fail CASes keep their
+    /// owner guards. It labels the revert's outcome and reads nothing else.
+    pub episode_overdue: bool,
     /// Whether the active execution holds an activation attempt. Only a held
     /// attempt can be completed by the node's activation-completion receipt,
     /// which matches on the attempt id; an owner that gave its activation up
