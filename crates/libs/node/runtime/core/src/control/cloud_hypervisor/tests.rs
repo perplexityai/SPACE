@@ -98,6 +98,7 @@ async fn boot_orders_create_before_boot_and_never_replays_a_failure() {
             RuntimeKind::CloudHypervisor,
             &crate::boot::configuration(RuntimeKind::CloudHypervisor, &crate::boot::tests::input())
                 .unwrap(),
+            crate::boot::BootSource::LinuxDirect,
         )
         .unwrap();
         let expected_body = configuration.encode().unwrap();

@@ -73,9 +73,11 @@ impl InitialEnvironment {
             runtime_ordering_key: semver::Version::parse(self.release.release.version.as_str())?,
             initial_reference: Some(definition.reference()),
             release: self.release.clone(),
-            kernel: self.kernel.clone(),
+            kernel: Some(self.kernel.clone()),
+            boot_artifacts: Vec::new(),
             definition,
             memory_state: true,
+            guest_image: QualifiedGuestImage::LinuxDirect,
             name: "e0",
             upgrade_targets: Vec::new(),
         })
@@ -169,16 +171,44 @@ const CERTIFIED_UPGRADE_EDGES: &[(&str, &str)] = &[
 #[derive(Clone, Debug)]
 pub struct CompiledEnvironment {
     release: PinnedRelease,
-    kernel: PinnedKernel,
+    kernel: Option<PinnedKernel>,
+    boot_artifacts: Vec<super::PinnedBootArtifact>,
     definition: EnvironmentDefinition,
     memory_state: bool,
+    guest_image: QualifiedGuestImage,
     name: &'static str,
     runtime_ordering_key: semver::Version,
     initial_reference: Option<EnvironmentReference>,
     upgrade_targets: Vec<EnvironmentReference>,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum QualifiedGuestImage {
+    LinuxDirect,
+    AgentlessDhcpDisk,
+}
+
 impl CompiledEnvironment {
+    /// Image qualification is attached to the environment, not inferred from
+    /// the guest OS or from firmware versus direct boot at each caller.
+    pub fn supports_guest_image(
+        &self,
+        image: pplx_space_common_core::types::guest_image::GuestImageContract,
+    ) -> bool {
+        use pplx_space_common_core::types::guest_image::{
+            GuestDiskLayout, GuestNetwork, GuestReadiness,
+        };
+        match self.guest_image {
+            QualifiedGuestImage::LinuxDirect => image.legacy_transport(),
+            QualifiedGuestImage::AgentlessDhcpDisk => {
+                image.disk() == GuestDiskLayout::OpaqueRawDisk
+                    && image.network() == GuestNetwork::SlotDhcpV1
+                    && !image.expects_agent()
+                    && matches!(image.readiness(), GuestReadiness::TcpService { .. })
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(
         release: PinnedRelease,
@@ -197,9 +227,11 @@ impl CompiledEnvironment {
                     .reference(),
             ),
             release,
-            kernel,
+            kernel: Some(kernel),
+            boot_artifacts: Vec::new(),
             definition,
             memory_state,
+            guest_image: QualifiedGuestImage::LinuxDirect,
             name: "synthetic",
             upgrade_targets: Vec::new(),
         }
@@ -287,9 +319,11 @@ impl CompiledEnvironment {
                 runtime_ordering_key,
                 initial_reference: Some(initial_reference),
                 release: release.clone(),
-                kernel: kernel_pin.clone(),
+                kernel: Some(kernel_pin.clone()),
+                boot_artifacts: Vec::new(),
                 definition,
                 memory_state,
+                guest_image: QualifiedGuestImage::LinuxDirect,
                 name,
                 upgrade_targets: Vec::new(),
             })
@@ -297,8 +331,88 @@ impl CompiledEnvironment {
         .collect::<Result<_, CatalogError>>()?;
         environments.push(Self::cloud_hypervisor(&catalog, architecture, false)?);
         environments.push(Self::cloud_hypervisor(&catalog, architecture, true)?);
+        environments.push(Self::cloud_hypervisor_windows(&catalog, architecture)?);
         record_upgrade_edges(&mut environments, CERTIFIED_UPGRADE_EDGES);
         Ok(environments)
+    }
+
+    fn cloud_hypervisor_windows(
+        catalog: &RuntimeCatalog,
+        architecture: Arch,
+    ) -> Result<Self, CatalogError> {
+        let release = catalog
+            .releases(RuntimeKind::CloudHypervisor, architecture)
+            .find(|pin| pin.release.version.as_str() == "54.0")
+            .ok_or_else(|| CatalogError::Compiled {
+                entry: "CH Windows UEFI".into(),
+                field: "runtime pin",
+                value: "54.0",
+            })?
+            .clone();
+        let firmware = catalog
+            .boot_artifacts(architecture)
+            .find(|pin| {
+                pin.identity().kind == ArtifactComponentKind::Firmware
+                    && pin.identity().version.as_str() == super::uefi::VERSION
+            })
+            .ok_or_else(|| CatalogError::Compiled {
+                entry: "CH Windows UEFI".into(),
+                field: "firmware pin",
+                value: super::uefi::VERSION,
+            })?
+            .clone();
+        let definition = (|| -> Result<_, CompiledEnvironmentDefinitionError> {
+            let host = HostPlatform {
+                os: HostOperatingSystem::Linux,
+                architecture,
+            };
+            let boot_contract =
+                pplx_space_execution_common::environment::CLOUD_HYPERVISOR_UEFI_BOOT_CONTRACT
+                    .parse()?;
+            let machine_contract =
+                pplx_space_execution_common::environment::CLOUD_HYPERVISOR_WINDOWS_MACHINE_CONTRACT
+                    .parse()?;
+            let spec = EnvironmentSpec {
+                host,
+                guest: GuestPlatform {
+                    os: GuestOperatingSystem::Windows,
+                    architecture,
+                },
+                runtime: RuntimeBinding::ManagedRelease(ManagedRuntimeRelease {
+                    runtime: release.release.clone(),
+                    digest: release.digest(),
+                    target: host,
+                    layout: RuntimePayloadLayout::CatalogReleaseV1,
+                }),
+                backend: HypervisorBackend::Kvm,
+                boot: BootProfile::ArtifactsV1 {
+                    contract: boot_contract,
+                    artifacts: vec![BootArtifact::new(
+                        "firmware".parse()?,
+                        firmware.identity().clone(),
+                        "edk2-fd".parse()?,
+                    )],
+                },
+                isolation: IsolationClass::HardwareVm,
+                compatibility: ExecutionCompatibilityProfile::RuntimeV1 {
+                    contract: machine_contract,
+                    state_format: None,
+                },
+            };
+            Ok(EnvironmentDefinition::new(spec.try_into()?))
+        })()?;
+        Ok(Self {
+            runtime_ordering_key: semver::Version::new(54, 0, 0),
+            initial_reference: None,
+            release,
+            kernel: None,
+            boot_artifacts: vec![firmware],
+            definition,
+            memory_state: false,
+            guest_image: QualifiedGuestImage::AgentlessDhcpDisk,
+            name: "ch-54.0-windows-uefi",
+            upgrade_targets: Vec::new(),
+        })
     }
 
     fn cloud_hypervisor(
@@ -328,9 +442,11 @@ impl CompiledEnvironment {
             runtime_ordering_key: semver::Version::new(54, 0, 0),
             initial_reference: None,
             release,
-            kernel,
+            kernel: Some(kernel),
+            boot_artifacts: Vec::new(),
             definition,
             memory_state,
+            guest_image: QualifiedGuestImage::LinuxDirect,
             name: if memory_state {
                 "ch-54.0-linux-7.2.8-state-v1"
             } else {
@@ -355,9 +471,20 @@ impl CompiledEnvironment {
     pub fn release(&self) -> &PinnedRelease {
         &self.release
     }
-    pub fn kernel(&self) -> &PinnedKernel {
-        &self.kernel
+    pub fn kernel(&self) -> Option<&PinnedKernel> {
+        self.kernel.as_ref()
     }
+    /// File pins supplement the descriptor's identities with publication sizes.
+    /// Roles and formats come from the descriptor, never from installation paths.
+    pub fn boot_artifact(
+        &self,
+        identity: &ComponentIdentity,
+    ) -> Option<&super::PinnedBootArtifact> {
+        self.boot_artifacts.iter().find(|pin| {
+            pin.identity() == identity && pin.architecture() == self.release.architecture
+        })
+    }
+
     pub fn supports_memory_state(&self) -> bool {
         self.memory_state
             && self

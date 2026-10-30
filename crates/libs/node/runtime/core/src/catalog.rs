@@ -27,7 +27,10 @@ use sha2::{Digest as _, Sha256};
 
 use crate::runtime_inventory::diagnostic::ReleaseLayout;
 
+mod boot_artifact;
+pub use boot_artifact::{BOOT_ARTIFACT_IMAGE, BootArtifactPinError, PinnedBootArtifact};
 mod environment;
+mod uefi;
 mod verity;
 pub use environment::{
     CompiledEnvironment, CompiledEnvironmentDefinitionError, ResolveEnvironmentError,
@@ -608,13 +611,18 @@ pub enum CatalogError {
 pub struct RuntimeCatalog {
     releases: Vec<PinnedRelease>,
     kernels: Vec<PinnedKernel>,
+    boot_artifacts: Vec<PinnedBootArtifact>,
 }
 
 impl RuntimeCatalog {
     /// A catalog of exactly these pins, as a test or a tool assembles one.
     /// What node-manager trusts is the catalog it loads itself.
     pub fn from_pins(releases: Vec<PinnedRelease>, kernels: Vec<PinnedKernel>) -> Self {
-        Self { releases, kernels }
+        Self {
+            releases,
+            kernels,
+            boot_artifacts: Vec::new(),
+        }
     }
 
     /// The compiled table alone.
@@ -690,6 +698,7 @@ impl RuntimeCatalog {
                     .ok_or_else(|| field("sha256", compiled.sha256))?,
             });
         }
+        catalog.boot_artifacts.push(uefi::firmware()?);
         Ok(catalog)
     }
 
@@ -853,7 +862,45 @@ impl RuntimeCatalog {
                 None => self.kernels.push(pinned),
             }
         }
+        for pin in file.boot_artifacts {
+            let existing = self.boot_artifacts.iter().find(|existing| {
+                existing.architecture() == pin.architecture()
+                    && existing.identity().kind == pin.identity().kind
+                    && existing.identity().version == pin.identity().version
+            });
+            match existing {
+                Some(existing) if existing == &pin => {}
+                Some(_) => {
+                    return Err(CatalogError::Conflict {
+                        path: path.to_path_buf(),
+                        entry: format!(
+                            "{} {} {}",
+                            pin.identity().kind,
+                            pin.identity().version,
+                            pin.architecture()
+                        ),
+                    });
+                }
+                None => self.boot_artifacts.push(pin),
+            }
+        }
         Ok(())
+    }
+
+    pub fn boot_artifact(
+        &self,
+        identity: &pplx_space_common_core::types::ComponentIdentity,
+        architecture: Arch,
+    ) -> Option<&PinnedBootArtifact> {
+        self.boot_artifacts
+            .iter()
+            .find(|pin| pin.identity() == identity && pin.architecture() == architecture)
+    }
+
+    pub fn boot_artifacts(&self, architecture: Arch) -> impl Iterator<Item = &PinnedBootArtifact> {
+        self.boot_artifacts
+            .iter()
+            .filter(move |pin| pin.architecture() == architecture)
     }
 
     /// The pins of `release` for `architecture`.
@@ -913,6 +960,8 @@ struct CatalogFile {
     releases: Vec<CatalogFileRelease>,
     #[serde(default)]
     kernels: Vec<CatalogFileKernel>,
+    #[serde(default)]
+    boot_artifacts: Vec<PinnedBootArtifact>,
 }
 
 #[derive(serde::Deserialize)]

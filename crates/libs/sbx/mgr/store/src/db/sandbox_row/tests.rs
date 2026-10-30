@@ -8,10 +8,20 @@ fn projection_order_does_not_change_values_or_corrupt_column_diagnostics() {
     let id = SandboxId::new().to_string();
     let runtime_label = SandboxRuntimeLabel::parse("abcdef12").unwrap();
     let owner = SandboxOwner::parse("row-owner").unwrap();
+    let image = pplx_space_common_core::types::guest_image::GuestImageContract::new(
+        pplx_space_common_core::types::guest_image::GuestDiskLayout::OpaqueRawDisk,
+        pplx_space_common_core::types::guest_image::GuestReadiness::TcpService {
+            port: std::num::NonZeroU16::new(3389).unwrap(),
+        },
+        pplx_space_common_core::types::guest_image::GuestNetwork::SlotDhcpV1,
+        pplx_space_common_core::types::guest_image::GuestAgent::Absent,
+    )
+    .unwrap();
     let env = BTreeMap::from([("KEY".to_owned(), "value".to_owned())]);
     insert_sandbox(
         &conn,
         InsertSandboxParams {
+            guest_image: image,
             id: &id,
             uuid8: &runtime_label,
             state: SandboxState::Stopped,
@@ -55,11 +65,12 @@ fn projection_order_does_not_change_values_or_corrupt_column_diagnostics() {
                     restore_origin, restore_phase, restore_storage_uri,
                     space_api_route_substrate_kind, space_api_route_activation_attempt_id,
                     spaced_endpoint_proof_json, disk_io_max_operations_per_sec,
-                    disk_io_max_bandwidth_mib_per_sec, node_execution_id, id
+                    disk_io_max_bandwidth_mib_per_sec, node_execution_id, guest_image_contract_json, id
                FROM sandboxes WHERE id = ?1",
         )
         .unwrap();
     let row = statement.query_row([&id], row_to_sandbox).unwrap();
+    assert_eq!(row.guest_image, image);
     assert_eq!(row.id, id);
     assert_eq!(row.uuid8, runtime_label);
     assert_eq!(row.state, SandboxState::Stopped);
@@ -97,6 +108,7 @@ fn absent_or_malformed_counters_fail_closed_instead_of_decoding_zero() {
     insert_sandbox(
         &conn,
         InsertSandboxParams {
+            guest_image: Default::default(),
             id: &id,
             uuid8: &SandboxRuntimeLabel::parse("abcdef12").unwrap(),
             state: SandboxState::Stopped,
