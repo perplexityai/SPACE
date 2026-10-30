@@ -26,33 +26,7 @@ pub fn boot_component_role() -> ArtifactComponentRole {
     ArtifactComponentRole::parse(BOOT_COMPONENT_ROLE).expect("boot component role is valid")
 }
 
-struct FirecrackerStateFormatRelease {
-    runtime_version: &'static str,
-    state_format_version: &'static str,
-}
-
-const FIRECRACKER_STATE_FORMAT_RELEASES: &[FirecrackerStateFormatRelease] = &[
-    FirecrackerStateFormatRelease {
-        runtime_version: "1.15.1",
-        state_format_version: "9.0.0",
-    },
-    FirecrackerStateFormatRelease {
-        runtime_version: "1.16.0",
-        state_format_version: "10.0.0",
-    },
-    FirecrackerStateFormatRelease {
-        runtime_version: "1.16.1",
-        state_format_version: "10.0.0",
-    },
-    FirecrackerStateFormatRelease {
-        runtime_version: "1.16.2",
-        state_format_version: "11.0.0",
-    },
-    FirecrackerStateFormatRelease {
-        runtime_version: "1.17.0",
-        state_format_version: "12.0.0",
-    },
-];
+use pplx_space_execution_catalog::layout::FIRECRACKER_STATE_FORMAT_RELEASES;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeInstallation {
@@ -358,6 +332,8 @@ pub enum RuntimeInventoryError {
     },
     #[error("kernel read returned {read} bytes for a {len}-byte buffer")]
     InvalidKernelReadBuffer { read: usize, len: usize },
+    #[error("compiled environment has no auxiliary boot-file pin for {0:?}")]
+    MissingBootArtifactPin(pplx_space_common_core::types::ComponentIdentity),
     #[error("no installed artifact component matches {0:?}")]
     NoCompatibleComponent(ArtifactComponentMetadata),
     #[error("no {selection} {kind} component is installed")]
@@ -429,6 +405,7 @@ impl RuntimeInventoryError {
             | Self::InvalidExecutionMetadata(_)
             | Self::UnknownFirecrackerSnapshotFormat(_)
             | Self::IncompleteInstallation { .. }
+            | Self::MissingBootArtifactPin(_)
             | Self::NoCompatibleComponent(_)
             | Self::NoDefaultComponent { .. }
             | Self::NoCompatibleRuntime { .. }
@@ -1238,9 +1215,14 @@ impl RuntimeInventory {
                         RuntimeInventoryError::NoCompatibleComponent(component.clone())
                     })?;
                 resolved_components.push(installed.metadata.clone());
+                selected_components.push(ResolvedArtifactComponent {
+                    metadata: installed.metadata.clone(),
+                    path: installed.path.clone(),
+                    integrity: installed.integrity,
+                });
             }
         }
-        if !omit_boot_components {
+        if !omit_boot_components && binding.is_none() {
             let boot_role = boot_component_role();
             let requested_kernel = requested.and_then(|metadata| {
                 metadata.component(ArtifactComponentKind::Kernel, Some(&boot_role))
@@ -1273,11 +1255,13 @@ impl RuntimeInventory {
             if requested_kernel.is_none() {
                 resolved_components.push(kernel.metadata.clone());
             }
-            selected_components.push(ResolvedArtifactComponent {
-                metadata: kernel.metadata.clone(),
-                path: kernel.path.clone(),
-                integrity: kernel.integrity,
-            });
+            if requested_kernel.is_none() {
+                selected_components.push(ResolvedArtifactComponent {
+                    metadata: kernel.metadata.clone(),
+                    path: kernel.path.clone(),
+                    integrity: kernel.integrity,
+                });
+            }
         }
         let execution = ExecutionMetadata::new(
             selected_runtime.runtime.clone(),

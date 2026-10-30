@@ -189,6 +189,8 @@ const MAX_CACHE_ARTIFACT_DELETES: usize = 4;
 
 #[derive(Clone)]
 pub struct NodeManagerService {
+    guest_networks: std::sync::Arc<guest_network::GuestNetworks>,
+    guest_access: std::sync::Arc<guest_control::GuestAccessBudgets>,
     pool: std::sync::Arc<NetworkPool>,
     peer_authorizer: UdsPeerAuthorizer,
     sandbox_cgroup_config: SandboxCgroupConfig,
@@ -374,6 +376,8 @@ impl NodeManagerService {
         )
         .with_task_tracker(task_tracker.clone());
         Ok(Self {
+            guest_networks: Default::default(),
+            guest_access: Default::default(),
             pool,
             peer_authorizer: node_peer_authorizer(),
             sandbox_cgroup_config,
@@ -745,3 +749,7 @@ use network_helpers::*;
 use crate::snapshot_request::{StateCapture, StateRestore};
 
 mod runtime_control;
+
+mod guest_control;
+
+mod guest_network;
