@@ -15,6 +15,7 @@
 //! - [`staging`]: private staging and hashing.
 //! - [`store`]: durable mutation intent and per-job results.
 
+mod boot_artifact;
 mod executor;
 #[cfg(feature = "github")]
 mod github;

@@ -574,6 +574,12 @@ impl AutoLifecyclePolicy {
         self.stages.iter().any(|stage| stage.action == action)
     }
 
+    /// Whether this policy needs a resident or persisted VM memory operation.
+    pub fn requires_memory_lifecycle(&self) -> bool {
+        self.contains_action(AutoLifecycleIdleAction::Pause)
+            || self.contains_action(AutoLifecycleIdleAction::Suspend)
+    }
+
     pub fn normalized(mut self) -> Self {
         self.normalize_in_place();
         self

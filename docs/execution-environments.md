@@ -1104,7 +1104,7 @@ discards its memory, so it needs everything above whether or not the state
 format changes; E0 → Firecracker 1.17.0 / Linux 6.1.155 also changes it, from
 9.0.0 to 12.0.0. The compiled catalog records which of these same-kernel
 cold-boot moves are certified, as upgrade edges. `CERTIFIED_UPGRADE_EDGES` in
-`crates/libs/node/runtime/core/src/catalog/environment.rs` lists them, and
+`crates/libs/execution/catalog/src/catalog/environment.rs` lists them, and
 `CompiledEnvironment::upgrade_targets` exposes each environment's targets.
 Listing a pair is the certification decision. An edge must change the runtime,
 and its target must pass the environment-level cold-boot source check

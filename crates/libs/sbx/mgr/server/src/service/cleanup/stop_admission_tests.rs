@@ -399,7 +399,7 @@ async fn exited_runtime_recovery_requires_death_and_the_current_execution() {
                 slot: 1,
                 guest_cid: 3,
                 pid: child.id(),
-                spaced_host_pid: 0,
+                spaced_host_pid: None,
                 netgtw_pid: 0,
                 vsock_uds_path: "/synthetic/v.sock",
                 api_socket_path: "/synthetic/control.sock",

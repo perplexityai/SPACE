@@ -20,6 +20,7 @@ datadog-otel = ["otel", "datadog"]
 test-hooks = ["pplx-space-common-core/test-hooks"]
 
 [dependencies]
+pplx-space-execution-catalog = { workspace = true }
 rustix = { workspace = true, features = ["fs"] }
 async-trait = { workspace = true }
 futures-util = { workspace = true }

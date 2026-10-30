@@ -672,3 +672,69 @@ fn historical_and_compact_release_copies_remain_verified_and_removable() {
         );
     }
 }
+
+#[test]
+fn auxiliary_boot_publication_authenticates_bytes_and_keeps_separate_inodes() {
+    use crate::catalog::PinnedBootArtifact;
+    use pplx_space_common_core::types::{ArtifactComponentKind, ComponentIdentity};
+    let fixture = Fixture::new();
+    fixture.store.prepare_roots().unwrap();
+    {
+        let kind = ArtifactComponentKind::Firmware;
+        let bytes = binary(13);
+        let pin = PinnedBootArtifact::new(
+            ComponentIdentity {
+                kind,
+                version: "test-1".parse().unwrap(),
+                digest: sha256(&bytes),
+            },
+            Arch::X86_64,
+            bytes.len() as u64,
+        )
+        .unwrap();
+        let source = fixture
+            .staging
+            .join(boot_artifact_staging(kind))
+            .join("job-boot/test-1");
+        std::fs::create_dir_all(&source).unwrap();
+        let source = source.join(BOOT_ARTIFACT_IMAGE);
+        std::fs::write(&source, binary(14)).unwrap();
+        assert!(matches!(
+            fixture
+                .store
+                .publish_boot_artifact(&pin, &staged("job-boot")),
+            Err(PublishError::Mismatch { .. })
+        ));
+        std::fs::write(&source, &bytes).unwrap();
+        let publication = fixture
+            .store
+            .publish_boot_artifact(&pin, &staged("job-boot"))
+            .unwrap();
+        std::fs::write(&source, binary(15)).unwrap();
+        let verified = fixture.store.verify_boot_artifact(&pin).unwrap();
+        assert_eq!(verified.path, publication.path);
+        assert_eq!(
+            std::fs::read(verified.path.join(BOOT_ARTIFACT_IMAGE)).unwrap(),
+            bytes
+        );
+        let replay = fixture
+            .store
+            .publish_boot_artifact(&pin, &staged("job-absent"))
+            .unwrap();
+        assert_eq!(replay.outcome, PublishOutcome::AlreadyPresent);
+        std::fs::write(verified.path.join(BOOT_ARTIFACT_IMAGE), binary(16)).unwrap();
+        assert!(matches!(
+            fixture.store.remove_boot_artifact(pin.identity()),
+            Err(RemoveError::IdentityChanged { .. })
+        ));
+        std::fs::write(verified.path.join(BOOT_ARTIFACT_IMAGE), bytes).unwrap();
+        assert_eq!(
+            fixture.store.remove_boot_artifact(pin.identity()).unwrap(),
+            RemoveOutcome::Removed
+        );
+        assert_eq!(
+            fixture.store.remove_boot_artifact(pin.identity()).unwrap(),
+            RemoveOutcome::Absent
+        );
+    }
+}

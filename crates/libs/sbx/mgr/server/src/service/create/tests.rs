@@ -63,6 +63,7 @@ async fn create_refusals_before_insert_persist_nothing() {
         let id = SandboxId::new().to_string();
         let error = service
             .create_with_id(CreateWithIdArgs {
+                guest_image: Default::default(),
                 req: &case.req,
                 sandbox_owner: &owner,
                 effective_mode: BootMode::Cold,
@@ -166,6 +167,7 @@ async fn restore_selects_its_consumer_from_the_checkpoint(
     crate::db::insert_sandbox(
         &conn,
         crate::db::InsertSandboxParams {
+            guest_image: Default::default(),
             id: &id.to_string(),
             uuid8: &SandboxRuntimeLabel::from_sandbox_id(id),
             state: SandboxState::Suspended,
@@ -349,6 +351,7 @@ async fn a_runtime_upgrade_fence_refuses_a_concurrent_restore_before_allocation(
     crate::db::insert_sandbox(
         &conn,
         crate::db::InsertSandboxParams {
+            guest_image: Default::default(),
             id: &id.to_string(),
             uuid8: &SandboxRuntimeLabel::from_sandbox_id(id),
             state: SandboxState::Suspended,

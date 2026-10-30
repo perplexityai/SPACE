@@ -329,6 +329,7 @@ async fn create_intent_preserves_immutables_independently_of_pool_occupancy() {
             crate::db::insert_sandbox(
                 &conn,
                 crate::db::InsertSandboxParams {
+                    guest_image: Default::default(),
                     id: &donor.to_string(),
                     uuid8: &SandboxRuntimeLabel::from_sandbox_id(donor),
                     state: SandboxState::Paused,
@@ -771,7 +772,9 @@ fn template_provenance_does_not_overwrite_a_selected_cold_boot_consumer() {
         .iter()
         .find(|entry| {
             entry.release().release.version.as_str() == "1.17.0"
-                && entry.kernel().version.as_str() == "6.1.155"
+                && entry
+                    .kernel()
+                    .is_some_and(|kernel| kernel.version.as_str() == "6.1.155")
         })
         .unwrap()
         .definition()
@@ -784,7 +787,11 @@ fn template_provenance_does_not_overwrite_a_selected_cold_boot_consumer() {
     );
     let other_kernel = catalog
         .iter()
-        .find(|entry| entry.kernel().version.as_str() == "6.18.44")
+        .find(|entry| {
+            entry
+                .kernel()
+                .is_some_and(|kernel| kernel.version.as_str() == "6.18.44")
+        })
         .unwrap()
         .definition()
         .execution_requirements()
