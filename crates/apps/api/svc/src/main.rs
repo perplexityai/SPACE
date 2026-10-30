@@ -1,3 +1,4 @@
+// CI measurement only (change type: leaf binary, run 1). Never merged.
 use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
