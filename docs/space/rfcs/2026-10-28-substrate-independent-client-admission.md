@@ -280,7 +280,10 @@ own attribution.
 
 **Classification by intent.** `Client` and `Native` are for activations a
 caller explicitly asked for. ECW create, connect, resume and fork are
-`Client`, and native and admin creates and lifecycle calls are `Native`.
+`Client`, and native and admin creates and lifecycle calls are `Native`. An
+explicit ECW activation from a client other than the recorded one is
+`Client` for that caller, so the runtime it creates, its label and the
+record move to that caller.
 Anything else that happens to create a runtime is `Inherit`: implicit access
 (ingress, `spaced_client` routes, opening a port, rollback, the spaced
 control-wake fallback), a rebuild as a side effect of Stop or Kill,
@@ -866,11 +869,12 @@ operations, against the same Redis. Everything here applies there too:
 
 ## Alternatives considered
 
-- **Not persisting the client id.** Not every runtime creation runs in the
-  activating client's own request. A data-plane request (ingress, a native
-  file or process route) wakes a suspended or stopped sandbox from a request
-  that isn't that client's call, and a node drain's evacuation rebuilds pods
-  with no request at all. Neither has the client's header to read. Two
+- **Not persisting the client id.** Explicit activations carry their
+  caller's header (Decision 1). Only two paths create a runtime without the
+  owning client's header: a data-plane request (ingress, a native file or
+  process route), which wakes a suspended or stopped sandbox from a request
+  that isn't that client's call, and a node drain's evacuation, which
+  rebuilds pods with no request at all. Two
   cheaper options fall short:
   - *Copying the label from the old pod* fails because a sandbox at rest,
     suspended or stopped, has no pod, and that's exactly the state the
