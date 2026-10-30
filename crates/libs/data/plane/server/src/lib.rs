@@ -890,7 +890,11 @@ async fn ecw_service_proxy(
                 match service_port_ingress_io(&state, &target, &route).await {
                     Ok(io) => {
                         // Renew authorization after a potentially long implicit wake,
-                        // before the first application byte is sent.
+                        // before the first application byte is sent, unless the open
+                        // finished while the cache still serves this route.
+                        if runtime_route::ecw_route_still_cached(&state, &route) {
+                            return Ok((route, io));
+                        }
                         let fresh = runtime_route::resolve_ecw_route_uncached(
                             &state,
                             &route.origin,

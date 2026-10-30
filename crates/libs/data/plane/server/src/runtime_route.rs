@@ -189,6 +189,22 @@ pub(super) async fn resolve_ecw_route_uncached(
     Ok(resolved)
 }
 
+/// Whether the route cache would still hand this exact route to a new request
+/// without asking ClusterApi.
+///
+/// An ingress open that finishes while this holds sends its first byte under
+/// authorization at most about one route-cache TTL old, as a cache hit does, so
+/// the proxy skips the post-open resolve, which would also repeat ClusterApi's
+/// node-port setup. The proxy renews before the first byte when the open
+/// outlasted what remained of the cache entry (such as a slow implicit wake),
+/// the entry was replaced or evicted, or a token is inside its refresh window.
+pub(super) fn ecw_route_still_cached(state: &DataPlaneState, route: &EcwResolvedRoute) -> bool {
+    matches!(
+        state.route_cache.lookup_ecw(&route.origin.cache_key()),
+        RouteCacheLookup::Hit(current) if current.cache_epoch == route.cache_epoch
+    ) && !ecw_route_tokens_need_refresh(route)
+}
+
 /// Whether an endpoint rejected this call because the route token names a
 /// superseded incarnation or has expired, which re-resolving can fix.
 ///
