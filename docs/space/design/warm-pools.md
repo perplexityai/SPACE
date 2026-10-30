@@ -284,6 +284,12 @@ For each enabled policy, on each tick:
    drain, and the empty config is deleted later. Claimed slots keep their
    parent config until sandbox cleanup removes the slot row.
 
+A policy or demand row that does not decode is skipped and logged, and the
+stale configs of the release it names stay enabled, since the row may have
+selected that release. A candidate whose config write fails is logged and the
+others are still written. If the step itself fails, for example on a query
+timeout, the pass logs it and still reconciles the stored configs.
+
 Changing a policy's shape selects new keys. Configs at the old shape drain
 while configs at the new shape fill. Reconciliation is convergent rather than
 transactional: if the controller stops partway through, the next tick
@@ -350,6 +356,7 @@ are draining during a rollover.
 | Unclaimed pod missing, mismatched or on a cordoned node | Slot deleted, refilled later. |
 | Warming slot never becomes ready | Deleted after the warming timeout. |
 | Pool pods cannot be scheduled | Refill stays bounded; creates fall back to cold. |
+| Autoscale step fails | The pass still reconciles the stored configs; policy-owned configs are not added, resized or retired that pass. |
 
 ## Limits
 

@@ -26,8 +26,8 @@ use pplx_space_api::node_group_placement::{
     ResolvePath as NodeGroupResolvePath, ResolvedPlacement,
 };
 use pplx_space_cluster_pool::{
-    InvalidPoolConfigRow, NewPoolSlot, PoolConfig, PoolSlot, PoolSlotCounts, PoolSlotState,
-    WarmPoolStore,
+    AutoscaleRun, InvalidPoolConfigRow, NewPoolSlot, PoolConfig, PoolConfigRead, PoolSlot,
+    PoolSlotCounts, PoolSlotState, WarmPoolStore,
 };
 use pplx_space_common_core::kubernetes::NodeGroupPlacement;
 use pplx_space_common_core::{
@@ -54,7 +54,7 @@ use tonic::{Code, transport::Endpoint};
 use tracing::Instrument;
 use uuid::Uuid;
 
-use self::pass::{ConfigStage, PassReport};
+use self::pass::{AutoscaleOutcome, ConfigStage, PassReport};
 
 use crate::pod::{build_pool_pod, pool_pod_name, ready_pod_metadata};
 
@@ -934,13 +934,34 @@ impl Reconciler {
         Ok(timed_io(operation, self.io_timeouts.grpc_substrate(), future).await?)
     }
 
-    async fn reconcile_once(&self) -> Result<ReconcileSummary, WarmPoolError> {
-        let deleted_configs = self
+    /// Runs the autoscale step and reports what it skipped. Autoscaling adds,
+    /// resizes and retires policy-owned configs; the configs already stored
+    /// still need their slots reconciled, so a failed step does not end the
+    /// pass. Returns the configs it retired.
+    async fn autoscale(&self) -> PoolConfigRead {
+        let (outcome, retired) = match self
             .timed_postgres(
                 "autoscale-configs",
                 self.store.autoscale_configs(&self.namespace),
             )
-            .await?;
+            .await
+        {
+            Ok(run) => (report_autoscale_run(&run), run.retired),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "warm pool: autoscaling failed; reconciling the stored pool configs without it"
+                );
+                (AutoscaleOutcome::Failed, PoolConfigRead::default())
+            }
+        };
+        self.pass_report().autoscale = outcome;
+        pplx_space_metrics::warm_pool::autoscale(outcome.as_str());
+        retired
+    }
+
+    async fn reconcile_once(&self) -> Result<ReconcileSummary, WarmPoolError> {
+        let deleted_configs = self.autoscale().await;
         let reconcilable = self
             .timed_postgres("reconcilable-configs", self.store.reconcilable_configs())
             .await?;
@@ -2716,6 +2737,40 @@ fn emit_reconcile_config_states(config: &PoolConfig, succeeded: bool) {
         "succeeded",
         state.succeeded,
     );
+}
+
+/// Log each row and candidate the autoscale step skipped, and classify the
+/// step for the pass report.
+fn report_autoscale_run(run: &AutoscaleRun) -> AutoscaleOutcome {
+    for row in &run.invalid_rows {
+        tracing::error!(
+            read = %row.read,
+            template_release_id = %row.template_release_id,
+            error = %row.error,
+            "warm pool: autoscale row is not valid; skipping it"
+        );
+    }
+    for candidate in &run.failed_candidates {
+        tracing::warn!(
+            template_release_id = %candidate.template_release_id,
+            vcpu = candidate.vcpu.get().get(),
+            memory_mib = candidate.memory.as_mib_floor(),
+            error = %candidate.error,
+            "warm pool: could not write an autoscale config; leaving its stored config as it is"
+        );
+    }
+    let held = run.held_release_ids();
+    if !held.is_empty() {
+        tracing::warn!(
+            held_releases = held.len(),
+            "warm pool: autoscale skipped rows, so stale configs of their releases stay enabled"
+        );
+    }
+    if run.invalid_rows.is_empty() && run.failed_candidates.is_empty() {
+        AutoscaleOutcome::Ok
+    } else {
+        AutoscaleOutcome::Partial
+    }
 }
 
 /// Log and count each invalid config row that a read did not return as a config.

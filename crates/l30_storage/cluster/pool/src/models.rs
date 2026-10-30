@@ -65,6 +65,82 @@ pub struct PoolConfigRead {
     pub invalid_rows: Vec<InvalidPoolConfigRow>,
 }
 
+/// The result of one autoscale step ([`crate::WarmPoolStore::autoscale_configs`]).
+///
+/// A step does not fail because of one invalid row or one failed config write:
+/// it skips the row or the candidate, reports it here, and writes the rest.
+#[derive(Debug, Default)]
+pub struct AutoscaleRun {
+    /// Configs deleted after they finished draining, so callers can publish
+    /// their final inactive state.
+    pub retired: PoolConfigRead,
+    /// Policy and demand rows that did not decode. The caller must report them.
+    pub invalid_rows: Vec<InvalidAutoscaleRow>,
+    /// Candidates whose config write failed. A failed candidate's stored
+    /// config is not disabled; one that was already disabled and empty is
+    /// still deleted.
+    pub failed_candidates: Vec<FailedAutoscaleCandidate>,
+}
+
+impl AutoscaleRun {
+    /// The releases whose stale configs the step left enabled: those named by
+    /// a skipped row. Such a row may have selected its release as a
+    /// candidate, so retiring that release's configs could drain a pool that
+    /// still has a policy or demand.
+    pub fn held_release_ids(&self) -> Vec<Uuid> {
+        let mut held = self
+            .invalid_rows
+            .iter()
+            .map(|row| row.template_release_id)
+            .collect::<Vec<_>>();
+        held.sort_unstable();
+        held.dedup();
+        held
+    }
+}
+
+/// The autoscale read an [`InvalidAutoscaleRow`] came from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AutoscaleRead {
+    RetainedPolicyReleases,
+    DemandedPolicyReleases,
+    ObservedDemand,
+}
+
+impl AutoscaleRead {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RetainedPolicyReleases => "retained-policy-releases",
+            Self::DemandedPolicyReleases => "demanded-policy-releases",
+            Self::ObservedDemand => "observed-demand",
+        }
+    }
+}
+
+impl std::fmt::Display for AutoscaleRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A warm-pool policy or observed-demand row that did not decode, so the
+/// autoscale step skipped it.
+#[derive(Debug)]
+pub struct InvalidAutoscaleRow {
+    pub read: AutoscaleRead,
+    pub template_release_id: Uuid,
+    pub error: PoolError,
+}
+
+/// An autoscale candidate whose pool config write failed.
+#[derive(Debug)]
+pub struct FailedAutoscaleCandidate {
+    pub template_release_id: Uuid,
+    pub vcpu: VcpuCount,
+    pub memory: MemorySize,
+    pub error: PoolError,
+}
+
 /// A pool config joined with its live slot counts, as served by the
 /// cluster-pool admin API. Numeric fields keep their storage types and
 /// `template_name`/`content_hash` stay raw strings: this is a read model for

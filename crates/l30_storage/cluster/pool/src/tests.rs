@@ -10,8 +10,8 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::{
-    ManualPoolConfigSpec, NewPoolSlot, OpenPoolSlotDeleteLock, PoolConfigOwner, PoolError,
-    PoolSlot, PoolSlotState, WarmPoolStore,
+    AutoscaleRead, ManualPoolConfigSpec, NewPoolSlot, OpenPoolSlotDeleteLock, PoolConfigOwner,
+    PoolError, PoolSlot, PoolSlotState, WarmPoolStore,
 };
 
 type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -1189,7 +1189,12 @@ async fn autoscale_deletes_empty_policy_owned_pool_when_policy_is_removed() -> T
     )
     .await?;
 
-    let retired_configs = fixture.store.autoscale_configs("sandboxes").await?.configs;
+    let retired_configs = fixture
+        .store
+        .autoscale_configs("sandboxes")
+        .await?
+        .retired
+        .configs;
 
     let config_count = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*)::BIGINT
@@ -4252,7 +4257,12 @@ async fn config_reads_decode_blake3_release_hashes() -> TestResult {
     assert_eq!(recently_disabled.len(), 1);
     assert_eq!(recently_disabled[0].content_hash, content_hash);
 
-    let retired = fixture.store.autoscale_configs("space").await?.configs;
+    let retired = fixture
+        .store
+        .autoscale_configs("space")
+        .await?
+        .retired
+        .configs;
     assert_eq!(retired.len(), 1);
     assert_eq!(retired[0].id, config_id);
     assert_eq!(retired[0].content_hash, content_hash);
@@ -4322,7 +4332,7 @@ async fn config_reads_keep_valid_rows_when_one_row_is_invalid() -> TestResult {
 
     // The autoscaler deletes the empty, disabled row although it is invalid,
     // and reports it. The valid manual config stays.
-    let retired = fixture.store.autoscale_configs("space").await?;
+    let retired = fixture.store.autoscale_configs("space").await?.retired;
     assert!(retired.configs.is_empty());
     assert_eq!(retired.invalid_rows.len(), 1);
     assert_eq!(retired.invalid_rows[0].id, bad_config_id);
@@ -4330,6 +4340,244 @@ async fn config_reads_keep_valid_rows_when_one_row_is_invalid() -> TestResult {
     assert_eq!(remaining.configs.len(), 1);
     assert_eq!(remaining.configs[0].id, good_config_id);
     assert!(remaining.invalid_rows.is_empty());
+
+    Ok(())
+}
+
+/// `Some(enabled)` for the release's config, or `None` once it is deleted.
+async fn config_enabled(pool: &PgPool, template_release_id: Uuid) -> TestResult<Option<bool>> {
+    Ok(sqlx::query_scalar::<_, bool>(
+        "SELECT enabled FROM kubernetes_pool_configs WHERE template_release_id = $1",
+    )
+    .bind(template_release_id)
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// A recent sandbox whose shape does not decode is one invalid demand row. The
+/// step skips it and writes the other candidates. It holds the stale configs of
+/// the row's release until the row is gone, because the row may have selected
+/// that release, and still retires every other stale config.
+#[tokio::test(flavor = "current_thread")]
+async fn autoscale_skips_an_invalid_demand_row_and_holds_only_its_release() -> TestResult {
+    let fixture = postgres_fixture().await?;
+    let (policy_release_id, _) = seed_release(&fixture.pool, "seed", 0x70).await?;
+    upsert_warm_pool_policy(&fixture.pool, "seed", 2, 10, 1).await?;
+    // Configs the autoscaler owns but no policy wants any longer.
+    let held_release_id = Uuid::now_v7();
+    let held = autoscaler_seed(
+        "held",
+        held_release_id,
+        Uuid::now_v7(),
+        ContentHash::new(Digest::sha256([0x71; 32])),
+        (2, 1, 2),
+    );
+    let held_hash = held.content_hash;
+    insert_pool_config_seed(&fixture.pool, held).await?;
+    let retired_release_id = Uuid::now_v7();
+    insert_pool_config_seed(
+        &fixture.pool,
+        autoscaler_seed(
+            "unpolicied",
+            retired_release_id,
+            Uuid::now_v7(),
+            ContentHash::new(Digest::sha256([0x75; 32])),
+            (2, 1, 2),
+        ),
+    )
+    .await?;
+    insert_sandbox_for_template(
+        &fixture.pool,
+        "held",
+        "k8s",
+        &held_hash.to_string(),
+        Some(0),
+        Some(1024),
+    )
+    .await?;
+
+    let run = fixture.store.autoscale_configs("sandboxes").await?;
+
+    assert_eq!(run.invalid_rows.len(), 1);
+    assert_eq!(run.invalid_rows[0].read, AutoscaleRead::ObservedDemand);
+    assert_eq!(run.invalid_rows[0].template_release_id, held_release_id);
+    assert_eq!(run.held_release_ids(), vec![held_release_id]);
+    assert!(run.failed_candidates.is_empty());
+    assert_eq!(
+        config_enabled(&fixture.pool, policy_release_id).await?,
+        Some(true)
+    );
+    assert_eq!(
+        config_enabled(&fixture.pool, held_release_id).await?,
+        Some(true),
+        "the skipped row's release keeps its stale config"
+    );
+    // With no slots, a stale config is disabled and deleted in the same step.
+    assert_eq!(
+        run.retired
+            .configs
+            .iter()
+            .map(|config| config.template_release_id)
+            .collect::<Vec<_>>(),
+        vec![retired_release_id]
+    );
+
+    sqlx::query("DELETE FROM sandboxes WHERE template_id = 'held'")
+        .execute(&fixture.pool)
+        .await?;
+    let run = fixture.store.autoscale_configs("sandboxes").await?;
+
+    assert!(run.invalid_rows.is_empty());
+    assert_eq!(
+        run.retired
+            .configs
+            .iter()
+            .map(|config| config.template_release_id)
+            .collect::<Vec<_>>(),
+        vec![held_release_id]
+    );
+
+    Ok(())
+}
+
+/// A policy whose row does not decode is skipped, and the stale configs of the
+/// releases its rows name are held. Template GC's protected set still fails as
+/// a whole, so GC skips its tick instead of evicting a release the policy
+/// retains.
+#[tokio::test(flavor = "current_thread")]
+async fn autoscale_skips_an_invalid_policy_row_and_holds_its_releases() -> TestResult {
+    let fixture = postgres_fixture().await?;
+    let policy_release_id = Uuid::now_v7();
+    insert_pool_config_seed(
+        &fixture.pool,
+        autoscaler_seed(
+            "bad-policy",
+            policy_release_id,
+            Uuid::now_v7(),
+            ContentHash::new(Digest::sha256([0x76; 32])),
+            (2, 1, 2),
+        ),
+    )
+    .await?;
+    upsert_warm_pool_policy(&fixture.pool, "bad-policy", 2, 10, 1).await?;
+    // Within the column's CHECK, but above the largest disk I/O bandwidth the
+    // policy decoder accepts.
+    sqlx::query(
+        "UPDATE warm_pool_policies
+         SET disk_io_max_bandwidth_mib_per_sec = 17592186044416
+         WHERE template_name = 'bad-policy'",
+    )
+    .execute(&fixture.pool)
+    .await?;
+    let retired_release_id = Uuid::now_v7();
+    insert_pool_config_seed(
+        &fixture.pool,
+        autoscaler_seed(
+            "unpolicied",
+            retired_release_id,
+            Uuid::now_v7(),
+            ContentHash::new(Digest::sha256([0x77; 32])),
+            (2, 1, 2),
+        ),
+    )
+    .await?;
+
+    let run = fixture.store.autoscale_configs("sandboxes").await?;
+
+    assert_eq!(run.invalid_rows.len(), 1);
+    assert_eq!(
+        run.invalid_rows[0].read,
+        AutoscaleRead::RetainedPolicyReleases
+    );
+    assert_eq!(run.held_release_ids(), vec![policy_release_id]);
+    assert_eq!(
+        config_enabled(&fixture.pool, policy_release_id).await?,
+        Some(true),
+        "the invalid policy's release keeps its config"
+    );
+    assert_eq!(
+        run.retired
+            .configs
+            .iter()
+            .map(|config| config.template_release_id)
+            .collect::<Vec<_>>(),
+        vec![retired_release_id]
+    );
+    fixture
+        .store
+        .protected_template_releases()
+        .await
+        .unwrap_err();
+
+    Ok(())
+}
+
+/// A candidate whose config write fails is reported, its stored config is not
+/// disabled, and the other candidates are still written.
+#[tokio::test(flavor = "current_thread")]
+async fn autoscale_writes_the_other_candidates_when_one_write_fails() -> TestResult {
+    let fixture = postgres_fixture().await?;
+    let refused_release_id = Uuid::now_v7();
+    insert_pool_config_seed(
+        &fixture.pool,
+        autoscaler_seed(
+            "refused",
+            refused_release_id,
+            Uuid::now_v7(),
+            ContentHash::new(Digest::sha256([0x72; 32])),
+            (2, 1, 2),
+        ),
+    )
+    .await?;
+    let (written_release_id, _) = seed_release(&fixture.pool, "seed", 0x73).await?;
+    upsert_warm_pool_policy(&fixture.pool, "refused", 2, 10, 1).await?;
+    upsert_warm_pool_policy(&fixture.pool, "seed", 2, 10, 1).await?;
+    sqlx::query(
+        "CREATE FUNCTION refuse_pool_config_for_test()
+         RETURNS trigger
+         LANGUAGE plpgsql
+         AS $$
+         BEGIN
+             IF EXISTS (
+                 SELECT 1 FROM template_releases r
+                 WHERE r.id = NEW.template_release_id AND r.template_name = 'refused'
+             ) THEN
+                 RAISE EXCEPTION 'pool config refused for test';
+             END IF;
+             RETURN NEW;
+         END;
+         $$",
+    )
+    .execute(&fixture.pool)
+    .await?;
+    sqlx::query(
+        "CREATE TRIGGER refuse_pool_config_for_test
+         BEFORE INSERT ON kubernetes_pool_configs
+         FOR EACH ROW
+         EXECUTE FUNCTION refuse_pool_config_for_test()",
+    )
+    .execute(&fixture.pool)
+    .await?;
+
+    let run = fixture.store.autoscale_configs("sandboxes").await?;
+
+    assert_eq!(
+        run.failed_candidates
+            .iter()
+            .map(|candidate| candidate.template_release_id)
+            .collect::<Vec<_>>(),
+        vec![refused_release_id]
+    );
+    assert!(run.invalid_rows.is_empty());
+    assert_eq!(
+        config_enabled(&fixture.pool, refused_release_id).await?,
+        Some(true),
+        "a failed candidate's stored config stays enabled"
+    );
+    assert_eq!(
+        config_enabled(&fixture.pool, written_release_id).await?,
+        Some(true)
+    );
 
     Ok(())
 }

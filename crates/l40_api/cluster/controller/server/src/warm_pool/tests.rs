@@ -34,7 +34,7 @@ use pplx_space_common_core::{
     },
     types::{ContentHash, Digest, MemorySize, TemplateName, VcpuCount},
 };
-use pplx_space_db_test_fixtures::pg_test_db;
+use pplx_space_db_test_fixtures::{TestDb, pg_test_db};
 
 use time::OffsetDateTime;
 use tokio::{net::TcpListener, sync::oneshot};
@@ -1255,10 +1255,11 @@ async fn reconcile_config_does_not_refill_when_slot_counts_fail() -> TestResult 
     Ok(())
 }
 
-#[tokio::test]
-async fn reconcile_once_starts_preparing_republished_exact_release() -> TestResult {
-    let db = pg_test_db().await?;
-    let store = WarmPoolStore::new(db.pool.clone());
+/// A policy-owned template whose retained release is the older, republished
+/// one: the autoscaler's only candidate. Returns that release and its hash.
+async fn seed_republished_policy_release(
+    db: &TestDb,
+) -> TestResult<(Uuid, ContentHash, TemplateName)> {
     let template_name = TemplateName::parse("ask-project-files")?;
     let republished_release_id = Uuid::now_v7();
     let current_release_id = Uuid::now_v7();
@@ -1329,9 +1330,15 @@ async fn reconcile_once_starts_preparing_republished_exact_release() -> TestResu
     .execute(&db.pool)
     .await?;
 
+    Ok((republished_release_id, republished_hash, template_name))
+}
+
+/// A reconciler over `store` that can create pool pods and never reaches the
+/// substrate.
+fn pool_creating_reconciler(db: &TestDb, store: &WarmPoolStore) -> Reconciler {
     let (pod_store, _) = reflector::store();
     let (node_store, _) = reflector::store();
-    let reconciler = Reconciler {
+    Reconciler {
         kube: mock_kubernetes_client_for_pool_creation(),
         pod_cache: PodCache {
             store: pod_store,
@@ -1339,7 +1346,7 @@ async fn reconcile_once_starts_preparing_republished_exact_release() -> TestResu
         },
         node_store,
         store: store.clone(),
-        // Direct is only a placeholder here: this test never reaches the substrate.
+        // Direct is only a placeholder here: these passes never reach the substrate.
         substrate: Arc::new(Substrate::from_direct(DirectSubstrate::new(
             db.pool.clone(),
         ))),
@@ -1361,7 +1368,16 @@ async fn reconcile_once_starts_preparing_republished_exact_release() -> TestResu
         receipt_backstops: Mutex::new(ReceiptBackstopState::default()),
         node_group_placement: disabled_node_group_placement(),
         pass_report: Mutex::new(super::PassReport::default()),
-    };
+    }
+}
+
+#[tokio::test]
+async fn reconcile_once_starts_preparing_republished_exact_release() -> TestResult {
+    let db = pg_test_db().await?;
+    let store = WarmPoolStore::new(db.pool.clone());
+    let (republished_release_id, republished_hash, template_name) =
+        seed_republished_policy_release(&db).await?;
+    let reconciler = pool_creating_reconciler(&db, &store);
 
     let summary = reconciler.reconcile_once().await?;
 
@@ -1392,6 +1408,57 @@ async fn reconcile_once_starts_preparing_republished_exact_release() -> TestResu
             "warming".to_string(),
         )
     );
+
+    Ok(())
+}
+
+/// Autoscaling runs first in a pass. When it fails, here after it wrote its
+/// candidate's config, the pass still reconciles the stored configs instead of
+/// ending for every template, and its report says autoscaling failed.
+#[tokio::test]
+async fn reconcile_once_reconciles_stored_configs_when_autoscaling_fails() -> TestResult {
+    let db = pg_test_db().await?;
+    let store = WarmPoolStore::new(db.pool.clone());
+    let (republished_release_id, _, _) = seed_republished_policy_release(&db).await?;
+    // Deleting retired configs is the step's last write, and it runs even when
+    // nothing is retired. Nothing else in a pass deletes a pool config. An
+    // UPDATE trigger would refuse the step's upsert too: Postgres fires
+    // statement-level UPDATE triggers for INSERT ... ON CONFLICT DO UPDATE.
+    sqlx::query(sql!(
+        "CREATE FUNCTION refuse_pool_config_delete_for_test()
+         RETURNS trigger
+         LANGUAGE plpgsql
+         AS $$
+         BEGIN
+             RAISE EXCEPTION 'pool config delete refused for test';
+         END;
+         $$"
+    ))
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "CREATE TRIGGER refuse_pool_config_delete_for_test
+         BEFORE DELETE ON kubernetes_pool_configs
+         FOR EACH STATEMENT
+         EXECUTE FUNCTION refuse_pool_config_delete_for_test()"
+    ))
+    .execute(&db.pool)
+    .await?;
+    let reconciler = pool_creating_reconciler(&db, &store);
+
+    let summary = reconciler.reconcile_once().await?;
+
+    assert_eq!(summary.created_slots, 1);
+    assert_eq!(
+        reconciler.take_pass_report().autoscale,
+        AutoscaleOutcome::Failed
+    );
+    let slot_release_id = sqlx::query_scalar::<_, Uuid>(sql!(
+        "SELECT template_release_id FROM kubernetes_pool_slots"
+    ))
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(slot_release_id, republished_release_id);
 
     Ok(())
 }
