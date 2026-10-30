@@ -520,11 +520,12 @@ password sessions that have not expired become valid again.
 
 ### Template mutation authority
 
-On worker and builder node-api, `DeleteTemplate`, `DeleteTemplateBuild`,
-`CreatePool`, and `DeletePool` require the trusted policy service-account
-capability. Template-manager's local roles and deletion dependency guards still
-apply. Pool target counts have no capacity-based upper bound yet; operators
-must budget pool sizes even after caller authorization succeeds.
+On worker and builder node-api, `DeleteTemplate` and `DeleteTemplateBuild`
+require the trusted policy service-account capability, as do builder
+node-api's `CreatePool` and `DeletePool`. Template-manager's local roles and
+deletion dependency guards still apply. Pool target counts have no
+capacity-based upper bound yet; operators must budget pool sizes even after
+caller authorization succeeds.
 
 With Kubernetes authentication disabled, the shared internal token remains the
 operator trust boundary and retains mutation authority. When Kubernetes
@@ -579,8 +580,8 @@ uses the internal surface, so its caller needs an internal-audience token.
 
 Shared static-token fallback cannot mutate policy when Kubernetes
 authentication is enabled; static-only deployments retain that authority.
-Policy-bearing cold creation, internal pool adoption, and worker and builder
-template updates require a trusted caller. Cold creation and pool adoption also
+Policy-bearing cold creation, internal pool adoption, and builder template
+updates require a trusted caller. Cold creation and pool adoption also
 require policy authority for a nonzero sandbox-policy generation, even without
 an override. Requests with no overrides and generation zero remain available to
 otherwise admitted callers and inherit the template's policy. Guest-bridge

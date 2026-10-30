@@ -1340,9 +1340,9 @@ populate it, every move off an environment that may not execute is stranded.
    upgraded: that's the cluster-side materialization for a sandbox with no
    pod. A sandbox-manager that predates the field ignores it and wakes
    normally, where its execution policy refuses a runtime that may not run.
-   Node-api forwards `runtime_upgrade` only on `WorkerApiInternal`, and only
-   for a caller with the control-plane authority a policy write needs; its
-   public `WakeSandbox` refuses the field.
+   Node-api serves Wake only on `WorkerApiInternal`, and forwards
+   `runtime_upgrade` only for a caller with the control-plane authority a
+   policy write needs.
    A suspended sandbox's checkpoint on the node is booted only if it's the
    one the upgrade was decided from: the Wake names that checkpoint's local
    artifact, and the row must pin it, as it does on the checkpoint's source

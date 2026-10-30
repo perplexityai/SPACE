@@ -1913,7 +1913,7 @@ and the target node-api's export request to the source:
 |---|---|
 | worker WorkerApi, NodeInfo | `space-api` (shared and admin api), `space-cluster-controller`, `space-data-plane` (guest bridge, guest calls only), `space-internal-api`, both node-api accounts (template transfers) |
 | worker WorkerApiInternal | `space-api`, `space-cluster-controller` |
-| worker lifecycle-probe `SpacedWaitReady`, caller-supplied policy, template and pool mutation | `space-api`, `space-cluster-controller` |
+| worker lifecycle-probe `SpacedWaitReady`, caller-supplied policy, template deletion | `space-api`, `space-cluster-controller` |
 | builder BuilderApi, NodeInfo | `space-api`, `space-cluster-controller`, both node-api accounts |
 | builder `BuildTemplate` (system and tenant), policy, template deletion | `space-api` |
 | peer template transfers (`PullTemplate`, `NodeExportTemplate`), both roles | `space-api` (starts a pull), both node-api accounts (the target asks the source for the export) |

@@ -55,8 +55,8 @@ auth:
   SPACE_NODE_API_AUTH_TRUSTED_WAIT_READY_SERVICE_ACCOUNTS:
     - space-api
     - space-cluster-controller
-  # Caller-supplied network and auto-lifecycle policy, template and pool
-  # mutation (worker.rs, auth/template.rs): the substrate's creates, starts,
+  # Caller-supplied network and auto-lifecycle policy and template deletion
+  # (worker.rs, auth/template.rs): the substrate's creates, starts,
   # wakes and policy updates. Required on both roles (validate_for_role).
   SPACE_NODE_API_AUTH_TRUSTED_POLICY_SERVICE_ACCOUNTS:
     - space-api

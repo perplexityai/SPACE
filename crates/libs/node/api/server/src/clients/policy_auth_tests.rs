@@ -137,7 +137,6 @@ pub(super) fn bearer<T>(body: T, token: &str) -> Request<T> {
 enum Rpc {
     Create,
     Adopt,
-    WorkerTemplate,
     BuilderTemplate,
     Network,
     Lifecycle,
@@ -157,7 +156,6 @@ async fn policy_rpc_authentication_reaches_handlers() {
         for rpc in [
             Rpc::Create,
             Rpc::Adopt,
-            Rpc::WorkerTemplate,
             Rpc::BuilderTemplate,
             Rpc::Network,
             Rpc::Lifecycle,
@@ -220,8 +218,8 @@ async fn policy_rpc_authentication_reaches_handlers() {
                         ))
                         .await
                         .map(|_| ()),
-                    Rpc::WorkerTemplate | Rpc::BuilderTemplate => {
-                        let request = bearer(
+                    Rpc::BuilderTemplate => BuilderApiClient::new(service.clone())
+                        .update_template_settings(bearer(
                             tmpl::UpdateTemplateSettingsRequest {
                                 network_policy,
                                 default_auto_lifecycle: auto_lifecycle,
@@ -231,18 +229,9 @@ async fn policy_rpc_authentication_reaches_handlers() {
                                 ..Default::default()
                             },
                             token,
-                        );
-                        match rpc {
-                            Rpc::WorkerTemplate => WorkerApiClient::new(service.clone())
-                                .update_template_settings(request)
-                                .await
-                                .map(|_| ()),
-                            _ => BuilderApiClient::new(service.clone())
-                                .update_template_settings(request)
-                                .await
-                                .map(|_| ()),
-                        }
-                    }
+                        ))
+                        .await
+                        .map(|_| ()),
                     Rpc::Network => WorkerApiClient::new(service.clone())
                         .set_sandbox_network_policy(bearer(
                             sbx::SetNetworkPolicyRequest {
@@ -281,7 +270,7 @@ async fn policy_rpc_authentication_reaches_handlers() {
                 let requires_authority = match rpc {
                     Rpc::Network | Rpc::Lifecycle => true,
                     Rpc::Create | Rpc::Adopt => network || lifecycle || generation != 0,
-                    Rpc::WorkerTemplate | Rpc::BuilderTemplate => network || lifecycle,
+                    Rpc::BuilderTemplate => network || lifecycle,
                 };
                 let allowed = trusted || !requires_authority;
                 assert_eq!(

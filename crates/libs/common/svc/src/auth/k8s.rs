@@ -747,8 +747,7 @@ fn guest_bridge_method(role: NodeRole, path: &str) -> bool {
     };
     matches!(
         method,
-        "SpacedPingGuest"
-            | "SpacedGetStatus"
+        "SpacedGetStatus"
             | "SpacedWaitReady"
             | "SpacedStat"
             | "SpacedList"

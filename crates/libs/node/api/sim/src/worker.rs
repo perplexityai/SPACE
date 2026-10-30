@@ -22,8 +22,7 @@ use pplx_space_node_api_client::proto::worker_api_internal_server::WorkerApiInte
 use pplx_space_node_api_client::proto::worker_api_server::WorkerApi;
 use pplx_space_node_api_client::proto::{
     ListNodeTemplatesRequest, ListNodeTemplatesResponse, PullTemplateRequest, PullTemplateResponse,
-    RefreshFacetStateRequest, RefreshFacetStateResponse, TriggerStateReconciliationRequest,
-    TriggerStateReconciliationResponse,
+    TriggerStateReconciliationRequest, TriggerStateReconciliationResponse,
 };
 use pplx_space_sbx_mgr_client::proto as sbx;
 use pplx_space_template_mgr_client::proto as tmpl;
@@ -323,19 +322,6 @@ fn sandbox_info_from_record(rec: &crate::state::SandboxRecord) -> sbx::SandboxIn
             Some(NodeManagedBy::Kubernetes) => sbx::SandboxSubstrateKind::Kubernetes as i32,
             None => sbx::SandboxSubstrateKind::Unspecified as i32,
         },
-    }
-}
-
-fn list_element_from_record(rec: &crate::state::SandboxRecord) -> sbx::SandboxListElement {
-    sbx::SandboxListElement {
-        lifecycle: Some(sim_lifecycle(&rec.status) as i32),
-        sandbox_id: rec.sandbox_id.clone(),
-        template: Some(rec.template.clone()),
-        image_hash: rec.content_hash.clone(),
-        pool_template: rec.pool_template.clone(),
-        runtime: Some(rec.runtime.clone()),
-        created_at: Some(rec.created_at.clone()),
-        owner: Some(rec.user.clone()),
     }
 }
 
@@ -649,34 +635,6 @@ impl WorkerApi for SimWorkerApiService {
         }))
     }
 
-    async fn get_sandbox_health(
-        &self,
-        request: Request<sbx::GetSandboxHealthRequest>,
-    ) -> Result<Response<sbx::GetSandboxHealthResponse>, Status> {
-        let sandbox_id = request.into_inner().sandbox_id;
-        self.state.get(&sandbox_id).await.map_err(map_state_error)?;
-        Ok(Response::new(sbx::GetSandboxHealthResponse {
-            sandbox_id,
-            status: sbx::SandboxHealthStatus::Healthy as i32,
-            evaluated_at: None,
-            degraded_components: Vec::new(),
-            components: Vec::new(),
-        }))
-    }
-
-    async fn list_sandboxes(
-        &self,
-        _request: Request<sbx::ListRequest>,
-    ) -> Result<Response<sbx::ListResponse>, Status> {
-        let recs = self.state.list().await;
-        // The simulated inventory is small: answer every `page_size` with one
-        // final page, which paging clients accept as the end of the scan.
-        Ok(Response::new(sbx::ListResponse {
-            sandboxes: recs.iter().map(list_element_from_record).collect(),
-            next_page_token: String::new(),
-        }))
-    }
-
     // ── Sandbox state management ─────────────────────────────────────────────
 
     async fn pause_sandbox(
@@ -727,27 +685,6 @@ impl WorkerApi for SimWorkerApiService {
                     .unwrap_or_else(|| sim_direct_route_identity(self.state.node_id(), None)),
             ),
         }))
-    }
-
-    async fn wake_sandbox(
-        &self,
-        request: Request<sbx::WakeRequest>,
-    ) -> Result<Response<sbx::WakeResponse>, Status> {
-        let req = request.into_inner();
-        if req.start_context.is_some() {
-            return Err(Status::invalid_argument(
-                "WakeSandbox.start_context is internal-only; use WorkerApiInternal",
-            ));
-        }
-        sim_wake(
-            &self.state,
-            &req.sandbox_id,
-            None,
-            req.implicit_wake_source,
-            None,
-            None,
-        )
-        .await
     }
 
     async fn create_sandbox_snapshot(
@@ -1050,18 +987,6 @@ impl WorkerApi for SimWorkerApiService {
     }
 
     // ── Spaced guest operations: ping/status/wait_ready stub healthy ─────────
-
-    async fn spaced_ping_guest(
-        &self,
-        request: Request<sbx::SpacedPingGuestRequest>,
-    ) -> Result<Response<sbx::SpacedPingGuestResponse>, Status> {
-        let req = request.into_inner();
-        self.state
-            .ensure_default_running(&req.sandbox_id)
-            .await
-            .map_err(map_state_error)?;
-        Ok(Response::new(sbx::SpacedPingGuestResponse {}))
-    }
 
     async fn spaced_get_status(
         &self,
@@ -1583,31 +1508,10 @@ impl WorkerApi for SimWorkerApiService {
 
     // ── Sandbox snapshots (templates have their own pull/export) ─────────────
 
-    async fn enable_snapshots(
-        &self,
-        _request: Request<sbx::EnableSnapshotsRequest>,
-    ) -> Result<Response<sbx::EnableSnapshotsResponse>, Status> {
-        unimplemented()
-    }
-
-    async fn disable_snapshots(
-        &self,
-        _request: Request<sbx::DisableSnapshotsRequest>,
-    ) -> Result<Response<sbx::DisableSnapshotsResponse>, Status> {
-        unimplemented()
-    }
-
     async fn list_snapshots(
         &self,
         _request: Request<sbx::ListSnapshotsRequest>,
     ) -> Result<Response<sbx::ListSnapshotsResponse>, Status> {
-        unimplemented()
-    }
-
-    async fn delete_snapshots(
-        &self,
-        _request: Request<sbx::DeleteSnapshotsRequest>,
-    ) -> Result<Response<sbx::DeleteSnapshotsResponse>, Status> {
         unimplemented()
     }
 
@@ -1634,55 +1538,6 @@ impl WorkerApi for SimWorkerApiService {
         unimplemented()
     }
 
-    async fn list_templates(
-        &self,
-        _request: Request<tmpl::ListTemplatesRequest>,
-    ) -> Result<Response<tmpl::ListTemplatesResponse>, Status> {
-        unimplemented()
-    }
-
-    async fn get_template(
-        &self,
-        _request: Request<tmpl::GetTemplateRequest>,
-    ) -> Result<Response<tmpl::GetTemplateResponse>, Status> {
-        unimplemented()
-    }
-
-    async fn update_template_settings(
-        &self,
-        _request: Request<tmpl::UpdateTemplateSettingsRequest>,
-    ) -> Result<Response<tmpl::UpdateTemplateSettingsResponse>, Status> {
-        unimplemented()
-    }
-
-    async fn update_template_snapshot_policy(
-        &self,
-        _request: Request<tmpl::UpdateTemplateSnapshotPolicyRequest>,
-    ) -> Result<Response<tmpl::UpdateTemplateSnapshotPolicyResponse>, Status> {
-        unimplemented()
-    }
-
-    async fn create_pool(
-        &self,
-        _request: Request<tmpl::CreatePoolRequest>,
-    ) -> Result<Response<tmpl::CreatePoolResponse>, Status> {
-        unimplemented()
-    }
-
-    async fn delete_pool(
-        &self,
-        _request: Request<tmpl::DeletePoolRequest>,
-    ) -> Result<Response<tmpl::DeletePoolResponse>, Status> {
-        unimplemented()
-    }
-
-    async fn pool_status(
-        &self,
-        _request: Request<tmpl::PoolStatusRequest>,
-    ) -> Result<Response<tmpl::PoolStatusResponse>, Status> {
-        unimplemented()
-    }
-
     // ── Network (no-op; preserve transitions reconcilers expect) ─────────────
 
     async fn expose_port(
@@ -1691,15 +1546,6 @@ impl WorkerApi for SimWorkerApiService {
     ) -> Result<Response<pplx_space_node_mgr_client::proto::ExposePortResponse>, Status> {
         Ok(Response::new(
             pplx_space_node_mgr_client::proto::ExposePortResponse {},
-        ))
-    }
-
-    async fn unexpose_port(
-        &self,
-        _request: Request<pplx_space_node_mgr_client::proto::UnexposePortRequest>,
-    ) -> Result<Response<pplx_space_node_mgr_client::proto::UnexposePortResponse>, Status> {
-        Ok(Response::new(
-            pplx_space_node_mgr_client::proto::UnexposePortResponse {},
         ))
     }
 
@@ -1712,23 +1558,7 @@ impl WorkerApi for SimWorkerApiService {
         ))
     }
 
-    async fn deny_port(
-        &self,
-        _request: Request<pplx_space_node_mgr_client::proto::DenyPortRequest>,
-    ) -> Result<Response<pplx_space_node_mgr_client::proto::DenyPortResponse>, Status> {
-        Ok(Response::new(
-            pplx_space_node_mgr_client::proto::DenyPortResponse {},
-        ))
-    }
-
     // ── Custom orchestration ─────────────────────────────────────────────────
-
-    async fn refresh_facet_state(
-        &self,
-        _request: Request<RefreshFacetStateRequest>,
-    ) -> Result<Response<RefreshFacetStateResponse>, Status> {
-        Ok(Response::new(RefreshFacetStateResponse {}))
-    }
 
     async fn trigger_state_reconciliation(
         &self,
