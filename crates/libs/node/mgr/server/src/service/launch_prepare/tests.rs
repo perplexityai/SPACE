@@ -10,7 +10,12 @@ fn oversized_rootfs_resize_is_rejected_before_touching_disk() {
     let rootfs = directory.path().join("rootfs.ext4");
     std::fs::write(&rootfs, b"unchanged").unwrap();
     for mib in [0, 128 * 1024 + 1, u32::MAX] {
-        let error = super::resize_ext4_rootfs(rootfs.to_str().unwrap(), mib).unwrap_err();
+        let error = super::resize_guest_disk(
+            rootfs.to_str().unwrap(),
+            mib,
+            pplx_space_common_core::types::guest_image::GuestDiskLayout::Ext4Filesystem,
+        )
+        .unwrap_err();
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
         assert_eq!(std::fs::read(&rootfs).unwrap(), b"unchanged");
     }

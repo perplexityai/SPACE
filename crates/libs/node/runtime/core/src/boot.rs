@@ -8,9 +8,9 @@ use std::num::{NonZeroU32, NonZeroU64};
 mod cloud_hypervisor;
 mod firecracker;
 
-/// Inputs for the Linux direct-boot adapters. Firmware and library-backed
-/// runtimes can introduce their own boot input without changing lifecycle intent.
-pub struct LinuxBoot<'a> {
+/// Resources for a catalog-qualified guest boot. The source selects direct
+/// kernel boot or firmware without making the lifecycle invent a kernel.
+pub struct GuestBoot<'a> {
     pub guest: GuestPlatform,
     pub cpus: VcpuCount,
     pub memory_mib: NonZeroU64,
@@ -23,13 +23,16 @@ pub struct LinuxBoot<'a> {
     pub huge_pages: bool,
     pub console: bool,
     pub builder: bool,
+    pub source: BootSource,
 }
+
+pub use pplx_space_execution_catalog::guest::{BootSource, GuestProfile, GuestShutdown};
 
 #[derive(Debug, thiserror::Error)]
 pub enum BootConfigError {
-    #[error("runtime {0} has no Linux direct-boot adapter")]
+    #[error("runtime {0} has no boot adapter")]
     UnsupportedRuntime(RuntimeKind),
-    #[error("Linux direct boot cannot boot guest {0:?}")]
+    #[error("unqualified boot source for guest {0:?}")]
     Guest(GuestPlatform),
     #[error("{feature} is not qualified for runtime {runtime}")]
     UnsupportedFeature {
@@ -63,10 +66,13 @@ pub fn validate_resources(
 
 pub fn configuration(
     runtime: RuntimeKind,
-    input: &LinuxBoot<'_>,
+    input: &GuestBoot<'_>,
 ) -> Result<String, BootConfigError> {
-    if input.guest.os != GuestOperatingSystem::Linux {
-        return Err(BootConfigError::Guest(input.guest));
+    match (input.source, input.guest.os, input.guest.architecture) {
+        (BootSource::LinuxDirect, GuestOperatingSystem::Linux, _) => {}
+        (BootSource::Uefi, _, Arch::X86_64)
+            if runtime == RuntimeKind::CloudHypervisor && !input.builder => {}
+        _ => return Err(BootConfigError::Guest(input.guest)),
     }
     let value = match runtime {
         RuntimeKind::Firecracker => firecracker::configuration(input),
@@ -78,9 +84,10 @@ pub fn configuration(
 
 // Changes apply only on cold boot. Rebuild templates and base snapshots to
 // roll out new boot arguments to workloads restored from memory state.
-fn command_line(input: &LinuxBoot<'_>, devices: &str, uart: &str, console: &str) -> String {
-    use pplx_space_common_core::guest::linux::network::{
-        GATEWAY_IPV4_ADDR, IPV4_ADDR, IPV4_NETMASK, PRIMARY_INTERFACE,
+fn command_line(input: &GuestBoot<'_>, devices: &str, uart: &str, console: &str) -> String {
+    use pplx_space_common_core::guest::linux::network::PRIMARY_INTERFACE;
+    use pplx_space_common_core::guest::network::{
+        GATEWAY as GATEWAY_IPV4_ADDR, GUEST as IPV4_ADDR, NETMASK as IPV4_NETMASK,
     };
     let build = if input.builder {
         format!(
@@ -139,9 +146,12 @@ impl StandaloneBoot {
 pub fn validate_standalone(
     runtime: RuntimeKind,
     configuration: &str,
+    source: BootSource,
 ) -> Result<StandaloneBoot, BootConfigError> {
     match runtime {
-        RuntimeKind::CloudHypervisor => cloud_hypervisor::parse(configuration).map(StandaloneBoot),
+        RuntimeKind::CloudHypervisor => {
+            cloud_hypervisor::parse(configuration, source).map(StandaloneBoot)
+        }
         _ => Err(BootConfigError::UnsupportedRuntime(runtime)),
     }
 }

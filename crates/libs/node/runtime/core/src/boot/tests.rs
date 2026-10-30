@@ -1,9 +1,10 @@
 use super::*;
+use pplx_space_common_core::types::ExecutionMetadata;
 use pplx_space_common_core::types::{BalloonDevice, TokenBucket};
 use serde_json::{Value, json};
 
-pub(crate) fn input() -> LinuxBoot<'static> {
-    LinuxBoot {
+pub(crate) fn input() -> GuestBoot<'static> {
+    GuestBoot {
         guest: GuestPlatform {
             os: GuestOperatingSystem::Linux,
             architecture: Arch::Aarch64,
@@ -28,6 +29,7 @@ pub(crate) fn input() -> LinuxBoot<'static> {
         huge_pages: false,
         console: false,
         builder: false,
+        source: BootSource::LinuxDirect,
     }
 }
 
@@ -161,7 +163,7 @@ fn firecracker_retains_balloon_network_and_console_configuration() {
 #[test]
 fn standalone_admission_rejects_extra_devices_and_host_paths() {
     let text = configuration(RuntimeKind::CloudHypervisor, &input()).unwrap();
-    validate_standalone(RuntimeKind::CloudHypervisor, &text).unwrap();
+    validate_standalone(RuntimeKind::CloudHypervisor, &text, BootSource::LinuxDirect).unwrap();
     let original: Value = serde_json::from_str(&text).unwrap();
     for (pointer, replacement) in [
         ("/payload/kernel", json!("/etc/shadow")),
@@ -175,13 +177,23 @@ fn standalone_admission_rejects_extra_devices_and_host_paths() {
         let mut config = original.clone();
         *config.pointer_mut(pointer).unwrap() = replacement;
         assert!(
-            validate_standalone(RuntimeKind::CloudHypervisor, &config.to_string()).is_err(),
+            validate_standalone(
+                RuntimeKind::CloudHypervisor,
+                &config.to_string(),
+                BootSource::LinuxDirect
+            )
+            .is_err(),
             "{pointer}"
         );
     }
     let mut extra = original;
     extra["devices"] = json!([{ "path": "/dev/vfio/3" }]);
-    validate_standalone(RuntimeKind::CloudHypervisor, &extra.to_string()).unwrap_err();
+    validate_standalone(
+        RuntimeKind::CloudHypervisor,
+        &extra.to_string(),
+        BootSource::LinuxDirect,
+    )
+    .unwrap_err();
 }
 
 #[test]
@@ -205,6 +217,7 @@ fn persisted_ch_state_rebinds_host_resources_but_preserves_guest_identity() {
     let source = validate_standalone(
         RuntimeKind::CloudHypervisor,
         &configuration(RuntimeKind::CloudHypervisor, &input()).unwrap(),
+        BootSource::LinuxDirect,
     )
     .unwrap();
     let state = json!({"id":"vm", "snapshots":{}, "snapshot_data":{"sample":[1,2,3]}});
@@ -217,6 +230,7 @@ fn persisted_ch_state_rebinds_host_resources_but_preserves_guest_identity() {
     let mut target = validate_standalone(
         RuntimeKind::CloudHypervisor,
         &configuration(RuntimeKind::CloudHypervisor, &target_input).unwrap(),
+        BootSource::LinuxDirect,
     )
     .unwrap();
     let rate = pplx_space_common_core::types::RateLimiter {
@@ -262,6 +276,7 @@ fn persisted_ch_state_refuses_unknown_formats_devices_and_resource_mismatch() {
     let boot = validate_standalone(
         RuntimeKind::CloudHypervisor,
         &configuration(RuntimeKind::CloudHypervisor, &input()).unwrap(),
+        BootSource::LinuxDirect,
     )
     .unwrap();
     let baseline: Value = serde_json::from_slice(&boot.capture_state(json!({})).unwrap()).unwrap();
@@ -288,4 +303,117 @@ fn persisted_ch_state_refuses_unknown_formats_devices_and_resource_mismatch() {
     unknown_device["configuration"]["devices"] = json!([{"path":"/sys/devices/example"}]);
     boot.restore_state(&serde_json::to_vec(&unknown_device).unwrap())
         .unwrap_err();
+}
+
+#[test]
+fn firmware_boot_keeps_linux_inputs_out_of_the_device_model() {
+    let mut boot = input();
+    boot.guest = GuestPlatform {
+        os: GuestOperatingSystem::Windows,
+        architecture: Arch::X86_64,
+    };
+    boot.source = BootSource::Uefi;
+    let text = configuration(RuntimeKind::CloudHypervisor, &boot).unwrap();
+    validate_standalone(RuntimeKind::CloudHypervisor, &text, BootSource::Uefi).unwrap();
+    let config: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(config["payload"], json!({"firmware": "/firmware.fd"}));
+    assert_eq!(config["cpus"]["kvm_hyperv"], true);
+    for (field, value) in [
+        ("kernel", json!("/vmlinux.bin")),
+        ("cmdline", json!("root=/dev/vda")),
+        ("initramfs", json!("/initrd.img")),
+        ("firmware", json!("/etc/shadow")),
+    ] {
+        let mut changed = config.clone();
+        changed["payload"][field] = value;
+        validate_standalone(
+            RuntimeKind::CloudHypervisor,
+            &changed.to_string(),
+            BootSource::Uefi,
+        )
+        .unwrap_err();
+    }
+    validate_standalone(RuntimeKind::CloudHypervisor, &text, BootSource::LinuxDirect).unwrap_err();
+    configuration(RuntimeKind::Firecracker, &boot).unwrap_err();
+    boot.builder = true;
+    configuration(RuntimeKind::CloudHypervisor, &boot).unwrap_err();
+    boot.builder = false;
+    boot.guest.os = GuestOperatingSystem::Linux;
+    // Rendering follows the qualified boot protocol; OS identity is not a proxy.
+    assert_eq!(
+        configuration(RuntimeKind::CloudHypervisor, &boot).unwrap(),
+        text
+    );
+}
+
+#[test]
+fn image_policy_is_qualified_by_boot_contract() {
+    use pplx_space_common_core::types::guest_image::{
+        GuestAgent, GuestDiskLayout, GuestImageContract, GuestNetwork, GuestReadiness,
+    };
+    let catalog =
+        crate::catalog::CompiledEnvironment::cached_for_architecture(Arch::X86_64).unwrap();
+    for environment in catalog {
+        let execution = environment.definition().execution_requirements().unwrap();
+        let source = BootSource::from_execution(&execution).unwrap();
+        assert_eq!(
+            GuestProfile::resolve(&execution, GuestImageContract::default()).is_ok(),
+            source == BootSource::LinuxDirect
+        );
+        for disk in [
+            GuestDiskLayout::Ext4Filesystem,
+            GuestDiskLayout::OpaqueRawDisk,
+        ] {
+            for network in [GuestNetwork::KernelSlotIpv4V1, GuestNetwork::SlotDhcpV1] {
+                for agent in [GuestAgent::Spaced, GuestAgent::Absent] {
+                    let image = GuestImageContract::new(
+                        disk,
+                        GuestReadiness::TcpService {
+                            port: std::num::NonZeroU16::new(22).unwrap(),
+                        },
+                        network,
+                        agent,
+                    )
+                    .unwrap();
+                    let result = GuestProfile::resolve(&execution, image);
+                    let expected = source == BootSource::Uefi
+                        && disk == GuestDiskLayout::OpaqueRawDisk
+                        && network == GuestNetwork::SlotDhcpV1
+                        && agent == GuestAgent::Absent;
+                    assert_eq!(result.is_ok(), expected, "{} {image:?}", environment.name());
+                    if let Ok(profile) = result {
+                        assert!(profile.uses_dhcp());
+                        assert_eq!(profile.shutdown(), GuestShutdown::Acpi);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn historical_arm_firecracker_resolves_without_qualifying_unknown_bindings() {
+    use pplx_space_common_core::types::{ArtifactComponentKind, ArtifactComponentMetadata};
+    let kernel = ArtifactComponentMetadata {
+        kind: ArtifactComponentKind::Kernel,
+        role: None,
+        format: None,
+        version: Some("6.1.158".parse().unwrap()),
+        digest: None,
+    };
+    for components in [vec![], vec![kernel]] {
+        let execution = ExecutionMetadata::initial_firecracker(Arch::Aarch64, components);
+        assert_eq!(
+            GuestProfile::resolve(&execution, Default::default())
+                .unwrap()
+                .shutdown(),
+            GuestShutdown::AgentFlush
+        );
+        let unknown = execution.with_environment(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .parse()
+                .unwrap(),
+        );
+        GuestProfile::resolve(&unknown, Default::default()).unwrap_err();
+    }
 }

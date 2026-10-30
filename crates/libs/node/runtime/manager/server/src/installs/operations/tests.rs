@@ -40,6 +40,9 @@ impl ArtifactPublisher for FaultPublisher {
         };
         if self.break_cleanup.load(Ordering::SeqCst) {
             let namespace = match artifact {
+                NodeArtifactRef::Boot(_) => {
+                    panic!("fault fixture only injects kernel/release cleanup errors")
+                }
                 NodeArtifactRef::Kernel(..) => "firecracker/kernels",
                 NodeArtifactRef::Release(..) => "firecracker/releases",
             };
@@ -120,6 +123,7 @@ impl Fixture {
         publisher: Arc<FaultPublisher>,
     ) -> ExecutorParts {
         ExecutorParts {
+            boot_source: None,
             kernels_root: base.join("node/kernels"),
             staging: base.join("staging"),
             limits: LIMITS,
@@ -226,6 +230,9 @@ async fn both_kinds_install_retry_and_delete_without_touching_execution() {
             };
             let compact = executor.target(&request.artifact()).unwrap();
             let names = match request.artifact() {
+                NodeArtifactRef::Boot(_) => {
+                    unreachable!("fixture offers only kernels and releases")
+                }
                 NodeArtifactRef::Kernel(version, digest) => {
                     kernel_directory_names(version.artifact_version(), digest)
                 }

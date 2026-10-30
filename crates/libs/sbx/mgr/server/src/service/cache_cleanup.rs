@@ -574,6 +574,7 @@ fn insert_orphaned_sandbox_row_in_transaction(
                 crate::db::insert_quarantined_sandbox_in_transaction(
                     conn,
                     crate::db::InsertSandboxParams {
+                        guest_image: Default::default(),
                         id: &sandbox_id_string,
                         uuid8: &uuid8,
                         state: SandboxState::Quarantined,
@@ -611,6 +612,7 @@ fn insert_orphaned_sandbox_row_in_transaction(
     crate::db::insert_sandbox(
         conn,
         crate::db::InsertSandboxParams {
+            guest_image: Default::default(),
             id: &sandbox_id_string,
             uuid8: &uuid8,
             state: SandboxState::CleanupRequired,

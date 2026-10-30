@@ -13,6 +13,7 @@ fn armed_clone() -> (SandboxManagerService, SandboxId, SandboxCleanupEpisodeId) 
     crate::db::insert_sandbox_with_cleanup_episode_and_route_evidence(
         &conn,
         crate::db::InsertSandboxParams {
+            guest_image: Default::default(),
             id: &id.to_string(),
             uuid8: &SandboxRuntimeLabel::from_sandbox_id(id),
             state: SandboxState::Creating,

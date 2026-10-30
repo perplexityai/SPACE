@@ -28,6 +28,10 @@ fn import_header_execution_metadata(
             "import runtime does not match execution metadata",
         ));
     }
+    // This transport carries no image contract. Qualify its legacy semantics
+    // against the bound boot protocol before allocating or copying files.
+    pplx_space_node_runtime_core::boot::GuestProfile::resolve(&execution, Default::default())
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
     Ok(execution)
 }
 
@@ -371,6 +375,11 @@ impl SandboxManagerService {
         self.refuse_runtime_upgrade_fence(&id)?;
         let sandbox = self.lookup_sandbox(&id)?;
 
+        if !sandbox.guest_image.legacy_transport() {
+            return Err(Status::failed_precondition(
+                "firmware sandboxes cannot be exported or distributed",
+            ));
+        }
         // Reject export of a running sandbox — rootfs is being mutated
         if !matches!(
             sandbox.state,
@@ -669,6 +678,7 @@ impl SandboxManagerService {
             &db,
             crate::db::transfer::ImportReservation {
                 params: crate::db::InsertSandboxParams {
+                    guest_image: Default::default(),
                     id: sandbox_id,
                     uuid8: &uuid8,
                     state: SandboxState::Creating,
