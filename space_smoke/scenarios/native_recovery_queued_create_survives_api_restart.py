@@ -3,6 +3,7 @@
 import time
 import uuid
 
+from space_smoke.native_inline import inline_permits
 from space_smoke.native_recovery import (
     RECOVERY_ENVIRONMENT,
     KindNativeHardeningFixture,
@@ -28,7 +29,9 @@ def queued_create_survives_api_restart(fixture: KindNativeHardeningFixture) -> N
     # The supplied forwards must target the acknowledged Kind cluster. Probe
     # the authenticated public surface before stopping any controller.
     expect_response(fixture, fixture.request("GET", "/v1/sandboxes?limit=1"), 200)
-    with control.owned_faults():
+    # A queued create is the subject, so inline execution is off throughout:
+    # with it on, the API would run the create itself instead of queuing it.
+    with inline_permits(fixture, control, 0), control.owned_faults():
         with fixture.context.phase("queue a create while the controller is stopped"):
             control.stop_controller()
             key = uuid.uuid4().hex
