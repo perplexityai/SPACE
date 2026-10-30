@@ -173,6 +173,8 @@ pub struct RuntimeManagerInstallConfig {
     /// The runtime manager's private staging, which node-manager publishes
     /// from. Provisioning creates it.
     pub staging_dir: PathBuf,
+    /// Operator-configured source of pinned auxiliary boot files.
+    pub boot_artifacts_source: Option<PathBuf>,
     pub limits: InstallLimits,
 }
 
@@ -214,8 +216,8 @@ pub enum RunRuntimeManagerError {
     Serve(#[source] tonic::transport::Error),
     #[error("failed to enable kernel installs: {0}")]
     Installer(#[source] OpenInstallerError),
-    #[error("kernel installs need a kernel source")]
-    NoKernelSource,
+    #[error("artifact installs need a configured source")]
+    NoArtifactSource,
     #[error(
         "the runtime-manager state directory {} is not protected ({protection}); installs need it private",
         path.display()
@@ -268,8 +270,11 @@ pub async fn run(
         .collect();
     let installer = match config.install {
         Some(install) => {
-            if kernel_source.is_empty() {
-                return Err(RunRuntimeManagerError::NoKernelSource);
+            if kernel_source.is_empty()
+                && releases.is_empty()
+                && install.boot_artifacts_source.is_none()
+            {
+                return Err(RunRuntimeManagerError::NoArtifactSource);
             }
             let source = kernel_source.clone();
             let audited = config.state_dir.clone();
@@ -336,6 +341,7 @@ pub async fn run(
                 let installer = Installer::open(
                     ExecutorParts {
                         kernels_root: install.kernels_root,
+                        boot_source: install.boot_artifacts_source,
                         staging: install.staging_dir,
                         limits: install.limits,
                         host_arch,

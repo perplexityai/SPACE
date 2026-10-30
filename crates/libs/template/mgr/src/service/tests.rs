@@ -2196,25 +2196,22 @@ async fn register_template_uses_producer_algorithm(
         std::fs::copy(fixture.path().join(file), source.join(file)).unwrap();
     }
     if cloud_hypervisor {
-        use pplx_space_common_core::types::{
-            Arch, ExecutionMetadata, GuestOperatingSystem, GuestPlatform, RuntimeIdentity,
-            RuntimeKind, TemplateMetadata,
-        };
+        use pplx_space_common_core::types::{Arch, TemplateMetadata};
+        let environments =
+            pplx_space_execution_catalog::catalog::CompiledEnvironment::for_architecture(
+                Arch::X86_64,
+            )
+            .unwrap();
+        let definition = environments
+            .iter()
+            .find(|environment| environment.name() == "ch-54.0-linux-7.2.8")
+            .unwrap()
+            .definition();
         let mut metadata = TemplateMetadata::default();
         metadata.set_execution_metadata(
-            ExecutionMetadata::new(
-                RuntimeIdentity {
-                    kind: RuntimeKind::CloudHypervisor,
-                    version: "54.0".parse().unwrap(),
-                },
-                GuestPlatform {
-                    os: GuestOperatingSystem::Linux,
-                    architecture: Arch::X86_64,
-                },
-                None,
-                vec![],
-            )
-            .unwrap(),
+            definition
+                .bind_execution(definition.execution_requirements().unwrap())
+                .unwrap(),
         );
         metadata.arch = Some("x86_64".into());
         std::fs::write(
@@ -2278,4 +2275,76 @@ async fn register_template_uses_producer_algorithm(
         assert_eq!(manifest.runtime, "ch");
         assert_eq!(build.runtime, "ch");
     }
+}
+
+#[tokio::test]
+async fn firmware_template_refuses_pool_and_snapshot_intent_before_persisting() {
+    let root = tempfile::tempdir().unwrap();
+    let conn = crate::db::test_conn();
+    let execution = serde_json::from_value(serde_json::json!({
+        "environment": format!("sha256:{}", "a".repeat(64)),
+        "runtime": {"kind": "cloud-hypervisor", "version": "54.0"},
+        "guest": {"os": "windows", "architecture": "x86_64"},
+        "components": [{"kind":"firmware", "role":"firmware", "version":"test-1",
+            "digest": format!("sha256:{}", "b".repeat(64)), "format":"edk2-fd"}]
+    }))
+    .unwrap();
+    let image = serde_json::from_value(serde_json::json!({
+        "version":1, "disk":"opaque_raw_disk", "network":"slot_dhcp_v1", "agent":"absent",
+        "readiness":{"kind":"tcp_service", "port":3389}
+    }))
+    .unwrap();
+    let mut manifest = pplx_space_common_core::types::TemplateManifest {
+        guest_image: Some(image),
+        ..Default::default()
+    };
+    manifest.set_execution_metadata(execution);
+    let hash = format!("blake3:{}", "c".repeat(64));
+    crate::db::upsert_build(
+        &conn,
+        &crate::db::BuildUpsert {
+            name: "firmware-test",
+            content_hash: &hash,
+            build_date: "2026-01-01T00:00:00Z",
+            manifest_json: &serde_json::to_string(&manifest).unwrap(),
+            runtime: "ch",
+            arch: "x86_64",
+            artifact_size_bytes: 0,
+            state: "ready",
+        },
+    )
+    .unwrap();
+    let service = TemplateManagerService::new_with_template_root(conn, root.path()).unwrap();
+    let original = crate::db::get_template_settings(&service.db.lock().unwrap(), "firmware-test")
+        .unwrap()
+        .unwrap();
+    let pool = service
+        .create_pool(internal_request(CreatePoolRequest {
+            template: "firmware-test".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    let snapshot = service
+        .update_template_snapshot_policy(internal_request(UpdateTemplateSnapshotPolicyRequest {
+            template: "firmware-test".into(),
+            ensure_base_snapshot: true,
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(pool.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(snapshot.code(), tonic::Code::FailedPrecondition);
+    let db = service.db.lock().unwrap();
+    assert!(crate::db::get_pool(&db, "firmware-test").unwrap().is_none());
+    let retained = crate::db::get_template_settings(&db, "firmware-test")
+        .unwrap()
+        .unwrap();
+    assert_eq!(retained.ensure_base_snapshot, original.ensure_base_snapshot);
+    assert_eq!(
+        retained.base_snapshot_policy_set_at,
+        original.base_snapshot_policy_set_at
+    );
+    assert_eq!(retained.snapshot_vcpu, original.snapshot_vcpu);
+    assert_eq!(retained.snapshot_memory_mib, original.snapshot_memory_mib);
 }

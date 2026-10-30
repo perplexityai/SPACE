@@ -973,3 +973,32 @@ fn netns_path(ns: &str) -> String {
 fn owned_args(args: &[&str]) -> Vec<String> {
     args.iter().map(|arg| (*arg).to_string()).collect()
 }
+
+pub(crate) fn guest_tcp_stream(
+    ns: &str,
+    port: std::num::NonZeroU16,
+) -> std::io::Result<std::net::TcpStream> {
+    run_in_netns(ns, move || {
+        let address =
+            std::net::SocketAddr::from((pplx_space_net_common::guest_link::GUEST, port.get()));
+        let stream =
+            std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_secs(1))?;
+        stream.set_nonblocking(true)?;
+        Ok(stream)
+    })
+}
+
+pub(crate) fn guest_dhcp_socket(ns: &str) -> std::io::Result<std::net::UdpSocket> {
+    run_in_netns(ns, move || {
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )?;
+        socket.bind_device(Some(TAP_DEVICE.as_bytes()))?;
+        socket.set_broadcast(true)?;
+        socket.set_nonblocking(true)?;
+        socket.bind(&std::net::SocketAddr::from(([0, 0, 0, 0], 67)).into())?;
+        Ok(socket.into())
+    })
+}

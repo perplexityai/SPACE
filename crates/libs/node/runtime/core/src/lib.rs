@@ -106,3 +106,8 @@ mod tests;
 pub mod runtime_launch;
 
 pub mod vm_state;
+
+#[cfg(test)]
+mod catalog_policy_tests;
+
+pub mod artifact_layout;

@@ -82,8 +82,16 @@ fn local_create_and_start_delegate_direct_identity_to_sandbox_manager() {
         Default::default(),
         None,
     );
-    let start = local_start_request("sandbox-id".to_string(), None, false, true, Some(60));
+    let start = local_start_request(
+        "sandbox-id".to_string(),
+        None,
+        Some(4096),
+        false,
+        true,
+        Some(60),
+    );
 
     assert_eq!(create.route_identity, None);
     assert_eq!(start.route_identity, None);
+    assert_eq!(start.memory_mib, Some(4096));
 }

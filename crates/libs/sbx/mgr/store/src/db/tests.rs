@@ -1207,7 +1207,7 @@ fn runtime_fields(execution_generation: ExecutionGeneration) -> RuntimeFields<'s
         slot: 7,
         guest_cid: 37,
         pid: std::process::id(),
-        spaced_host_pid: 10001,
+        spaced_host_pid: Some(10001),
         netgtw_pid: 10002,
         vsock_uds_path: "/space/run/firecracker/sandboxes/test/root/v.sock",
         api_socket_path: "/space/run/firecracker/sandboxes/test/api.sock",
@@ -1273,7 +1273,7 @@ fn endpoint_proof_round_trips_and_clears_with_runtime() {
             slot: 7,
             guest_cid: 37,
             pid: std::process::id(),
-            spaced_host_pid: 10001,
+            spaced_host_pid: Some(10001),
             netgtw_pid: 10002,
             vsock_uds_path: "/space/run/firecracker/sandboxes/test/root/v.sock",
             api_socket_path: "/space/run/firecracker/sandboxes/test/api.sock",
@@ -1314,7 +1314,7 @@ fn endpoint_proof_round_trips_and_clears_with_runtime() {
             slot: 7,
             guest_cid: 37,
             pid: std::process::id(),
-            spaced_host_pid: 10001,
+            spaced_host_pid: Some(10001),
             netgtw_pid: 10002,
             vsock_uds_path: "/space/run/firecracker/sandboxes/test/root/v.sock",
             api_socket_path: "/space/run/firecracker/sandboxes/test/api.sock",
@@ -1448,6 +1448,7 @@ fn restore_adopt_insert_binds_volume_encryption() {
         volume_encryption: bool,
     ) -> InsertSandboxParams<'a> {
         InsertSandboxParams {
+            guest_image: Default::default(),
             id,
             uuid8,
             state: SandboxState::Restoring,
@@ -1531,6 +1532,7 @@ fn restore_adoption_clears_obsolete_auto_lifecycle_delete_block() {
     let env = BTreeMap::new();
     let lifecycle = AutoLifecyclePolicy::disabled();
     let restore_params = || InsertSandboxParams {
+        guest_image: Default::default(),
         id: &sandbox_id_string,
         uuid8: &uuid8,
         state: SandboxState::Restoring,
@@ -1553,6 +1555,7 @@ fn restore_adoption_clears_obsolete_auto_lifecycle_delete_block() {
     insert_sandbox(
         &conn,
         InsertSandboxParams {
+            guest_image: Default::default(),
             id: &sandbox_id_string,
             uuid8: &uuid8,
             state: SandboxState::Created,

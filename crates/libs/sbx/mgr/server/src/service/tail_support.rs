@@ -118,6 +118,9 @@ pub(super) fn activation_metadata_json(
             .transpose()
             .map_err(|error| invalid(error.to_string()))?,
     );
+    if !sandbox.guest_image.legacy_transport() {
+        metadata = metadata.with_guest_image(sandbox.guest_image);
+    }
     metadata.cpu_budget = cpu_budget;
     metadata.guest_memory = guest_memory;
     serde_json::to_string(&metadata)
