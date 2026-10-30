@@ -9,6 +9,7 @@ use tracing_subscriber::layer::SubscriberExt as _;
 
 mod export;
 mod lookup_rpc;
+mod schema_guards;
 
 #[tokio::test(flavor = "current_thread")]
 async fn background_loop_observer_contains_inner_panic() {

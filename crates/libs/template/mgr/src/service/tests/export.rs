@@ -154,3 +154,43 @@ async fn assert_export_header(response: Response<TemplateExportStream>, digest: 
         chunk.unwrap();
     }
 }
+
+#[tokio::test]
+async fn export_refuses_unsupported_or_corrupt_documents_before_streaming() {
+    for (file, bytes, expected) in [
+        (
+            "metadata.json",
+            br#"{"schema_version":99}"#.as_slice(),
+            tonic::Code::FailedPrecondition,
+        ),
+        (
+            "manifest.json",
+            br#"{"schema_version":99}"#.as_slice(),
+            tonic::Code::FailedPrecondition,
+        ),
+        (
+            "metadata.json",
+            b"not json".as_slice(),
+            tonic::Code::DataLoss,
+        ),
+    ] {
+        let (root, service, digest) = export_fixture();
+        let dir = build_artifacts_dir(root.path(), TEMPLATE, &digest);
+        std::fs::write(dir.join(file), bytes).unwrap();
+        let result = service
+            .export_template(internal_request(ExportTemplateRequest {
+                template: Some(TemplateRef {
+                    name: TEMPLATE.into(),
+                    content_hash: Some(digest),
+                    tag: None,
+                }),
+                ..Default::default()
+            }))
+            .await;
+        assert_eq!(result.err().unwrap().code(), expected, "{file}");
+        assert_eq!(
+            std::fs::read(dir.join(TEMPLATE_ROOTFS_ZSTD_FILE)).unwrap(),
+            b"synthetic compressed artifact"
+        );
+    }
+}

@@ -103,6 +103,13 @@ impl TemplateManagerService {
 
         let metadata_json = std::fs::read(build_path.join("metadata.json")).unwrap_or_default();
         let manifest_json = std::fs::read(build_path.join("manifest.json")).unwrap_or_default();
+        validate_guest_documents(&metadata_json, &manifest_json).map_err(|error| {
+            if error.code() == tonic::Code::InvalidArgument {
+                Status::data_loss(error.message())
+            } else {
+                error
+            }
+        })?;
         let manifest: pplx_space_common_core::types::TemplateManifest =
             serde_json::from_slice(&manifest_json).unwrap_or_default();
         let (rootfs_hash, mut files) = if let Some(files) =
@@ -310,6 +317,8 @@ impl TemplateManagerService {
             Some(crate::proto::import_template_request::Payload::Header(h)) => h,
             _ => return Err(Status::invalid_argument("first message must be header")),
         };
+
+        validate_guest_documents(&header.metadata_json, &header.manifest_json)?;
 
         let tmpl_ref = header
             .template
