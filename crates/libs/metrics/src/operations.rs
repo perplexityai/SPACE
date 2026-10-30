@@ -33,7 +33,7 @@ metric_vocabulary!(
 );
 
 /// [`claimed`], tagged with the executor that took the claim.
-pub fn claimed_by(api_product: &str, kind: &str, executor: &str) {
+pub fn claimed_by(api_product: &str, kind: &str, executor: OperationExecutor) {
     counter(
         "operations.claimed",
         1,
@@ -46,7 +46,7 @@ pub fn claimed_by(api_product: &str, kind: &str, executor: &str) {
 }
 
 /// [`completed`], tagged with the executor that recorded the result.
-pub fn completed_by(api_product: &str, kind: &str, state: &str, executor: &str) {
+pub fn completed_by(api_product: &str, kind: &str, state: &str, executor: OperationExecutor) {
     counter(
         "operations.completed",
         1,

@@ -351,7 +351,7 @@ where
         }
         return Ok(report);
     }
-    pplx_space_metrics::operations::claimed_by(api_product_label, kind.as_str(), executor.as_str());
+    pplx_space_metrics::operations::claimed_by(api_product_label, kind.as_str(), executor);
     let started_at = Instant::now();
     let report =
         execute_and_record(store, claim_token, config, operation, executor, execution).await;
@@ -396,7 +396,6 @@ where
     let api_product_label = api_product.as_str();
     let kind = operation.kind;
     let attempts = operation.attempts;
-    let executor_label = executor.as_str();
     let renew_every = claim_renewal_interval(config.claim_stale_after);
     let mut renewal = tokio::time::interval(renew_every);
     renewal.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -441,7 +440,7 @@ where
                     api_product_label,
                     kind.as_str(),
                     OperationState::Succeeded.as_str(),
-                    executor_label,
+                    executor,
                 );
             }
             updated
@@ -477,7 +476,7 @@ where
                     api_product_label,
                     kind.as_str(),
                     OperationState::Failed.as_str(),
-                    executor_label,
+                    executor,
                 );
             }
             updated
@@ -580,7 +579,7 @@ where
                         api_product_label,
                         kind.as_str(),
                         OperationState::Failed.as_str(),
-                        executor_label,
+                        executor,
                     );
                     pplx_space_metrics::operations::deadline_exceeded(
                         api_product_label,
@@ -675,7 +674,7 @@ where
                         api_product_label,
                         kind.as_str(),
                         OperationState::Failed.as_str(),
-                        executor_label,
+                        executor,
                     );
                 }
                 updated
@@ -726,7 +725,7 @@ where
                             api_product_label,
                             kind.as_str(),
                             OperationState::Canceled.as_str(),
-                            executor_label,
+                            executor,
                         );
                         tracing::info!(
                             operation_id = %operation_id,
