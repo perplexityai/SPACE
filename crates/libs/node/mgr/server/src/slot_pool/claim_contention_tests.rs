@@ -204,7 +204,13 @@ async fn reset_slot_defers_a_claimed_sandbox_and_requeues_itself() {
         drain(&mut wakeups);
 
         let claim = holder.claim(&pool, &sandbox_id);
-        reset_slot(pool.clone(), 0).await;
+        assert_eq!(
+            reset_slot(pool.clone(), 0).await,
+            ResetAttempt::ClaimHeld {
+                sandbox_id: sandbox_id.clone()
+            },
+            "{holder:?}"
+        );
         let deferred = slot(&pool, 0);
         assert_eq!(
             (
