@@ -468,10 +468,13 @@ so it links to nothing and the configured sampler decides it. That is one
 root trace per pass, 720 an hour, which under native Datadog counts against
 the Agent's sampling budget with the node's other traces. The root parents the
 pass's Postgres, Kubernetes and sandbox-manager calls and every line it logs,
-records `configs` and `failed_configs`, and is an error when the pass fails or
-any config does not reconcile. The pass logs one summary, `warm pool reconcile
-completed` (`warm pool reconcile failed` at WARN when the pass fails), with
-`reconciled_configs`, `failed_configs` and each per-config stage's
+records `configs` and `failed_configs`, and is an error when the pass fails,
+its autoscale step fails, or any config does not reconcile. A failed autoscale
+step does not fail the pass: it logs a WARN, `warm_pool.reconcile.autoscale`
+counts it as `failed`, and the pass still reconciles the stored configs. The
+pass logs one summary, `warm pool reconcile completed` (`warm pool reconcile
+failed` at WARN when the pass fails), with `autoscale_result` (`ok`, `partial`
+or `failed`), `reconciled_configs`, `failed_configs` and each per-config stage's
 `<stage>_result`, longest `<stage>_duration_ms` and `<stage>_failed_configs`. The per-stage `warm pool: stage start` and `warm
 pool: stage done` lines are DEBUG; a failed stage still logs `warm pool: stage
 done` at WARN with its config and error.

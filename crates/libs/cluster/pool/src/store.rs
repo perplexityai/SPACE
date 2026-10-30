@@ -12,17 +12,18 @@ use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::{
-    ClaimedPoolSlot, ClaimedSlotBindSource, ManualPoolConfigSpec, NewPoolSlot,
-    OpenPoolSlotDeleteLock, PoolConfigOwner, PoolConfigRead, PoolConfigWithCounts, PoolError,
-    PoolSlot, PoolSlotCounts, PoolSlotState, ProtectedTemplateRelease, ReleasePoolConfigWithCounts,
-    ReservedPoolSlot, Result,
+    AutoscaleRead, AutoscaleRun, ClaimedPoolSlot, ClaimedSlotBindSource, FailedAutoscaleCandidate,
+    InvalidAutoscaleRow, ManualPoolConfigSpec, NewPoolSlot, OpenPoolSlotDeleteLock,
+    PoolConfigOwner, PoolConfigRead, PoolConfigWithCounts, PoolError, PoolSlot, PoolSlotCounts,
+    PoolSlotState, ProtectedTemplateRelease, ReleasePoolConfigWithCounts, ReservedPoolSlot, Result,
     models::{
         PoolAutoscaleCandidate, PoolObservedDemand, PoolPolicyRelease, memory_to_mib_i32,
         vcpu_to_i32,
     },
     rows::{
         ClaimedPoolSlotRow, PoolConfigRow, PoolObservedDemandRow, PoolPolicyReleaseRow,
-        PoolSlotCountsRow, PoolSlotRow, ReservedPoolSlotRow, decode_config_rows,
+        PoolSlotCountsRow, PoolSlotRow, ReservedPoolSlotRow, decode_autoscale_rows,
+        decode_config_rows,
     },
 };
 
@@ -392,27 +393,47 @@ impl WarmPoolStore {
     /// Reconcile policy-owned release pools from retained-release floors and
     /// bounded sustained demand.
     ///
-    /// Returns configs deleted after they finished draining so callers can
-    /// publish a final inactive state from the returned identity metadata.
+    /// A policy or demand row that does not decode is skipped, and a candidate
+    /// whose config write fails is skipped; both are returned in the
+    /// [`AutoscaleRun`] for the caller to report. Stale configs are retired,
+    /// except those of a release a skipped row names. The returned run also
+    /// carries the configs deleted after they finished draining, so callers
+    /// can publish a final inactive state from their identity metadata. A
+    /// query that fails still fails the step.
     ///
-    /// This sequence intentionally is not transactional: it relies on
-    /// `space-cluster-controller` running as a singleton `Recreate` deployment.
+    /// This sequence intentionally is not transactional: it relies on only
+    /// the cluster-controller replica that holds the leader lease running it.
     /// Add serialization or a transaction before calling it concurrently.
-    pub async fn autoscale_configs(&self, namespace: &str) -> Result<PoolConfigRead> {
-        let candidates = self.autoscale_candidates().await?;
+    pub async fn autoscale_configs(&self, namespace: &str) -> Result<AutoscaleRun> {
+        let mut run = AutoscaleRun::default();
+        let candidates = self.autoscale_candidates(&mut run.invalid_rows).await?;
 
         for candidate in &candidates {
-            self.upsert_autoscale_config(candidate, namespace).await?;
+            if let Err(error) = self.upsert_autoscale_config(candidate, namespace).await {
+                run.failed_candidates.push(FailedAutoscaleCandidate {
+                    template_release_id: candidate.template_release_id,
+                    vcpu: candidate.vcpu,
+                    memory: candidate.memory,
+                    error,
+                });
+            }
         }
 
-        self.disable_stale_autoscale_configs(&candidates).await?;
-        let retired_configs = self.delete_empty_disabled_autoscale_configs().await?;
+        // A failed candidate is still in `candidates`, so its stored config is
+        // not disabled. A skipped row may have selected its release, so that
+        // release's configs are held: not disabled this pass.
+        self.disable_stale_autoscale_configs(&candidates, &run.held_release_ids())
+            .await?;
+        run.retired = self.delete_empty_disabled_autoscale_configs().await?;
 
-        Ok(retired_configs)
+        Ok(run)
     }
 
-    async fn autoscale_candidates(&self) -> Result<Vec<PoolAutoscaleCandidate>> {
-        let demand = self.observed_demand().await?;
+    async fn autoscale_candidates(
+        &self,
+        invalid: &mut Vec<InvalidAutoscaleRow>,
+    ) -> Result<Vec<PoolAutoscaleCandidate>> {
+        let demand = self.observed_demand(invalid).await?;
         let demanded_release_ids = demand
             .iter()
             .filter(|observed| observed.observed_sandboxes >= AUTOSCALE_MIN_DEMAND_SANDBOXES)
@@ -420,7 +441,7 @@ impl WarmPoolStore {
             .collect::<HashSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        let releases = self.policy_releases(&demanded_release_ids).await?;
+        let releases = self.policy_releases(&demanded_release_ids, invalid).await?;
 
         Ok(select_autoscale_candidates(releases, demand))
     }
@@ -428,20 +449,26 @@ impl WarmPoolStore {
     async fn policy_releases(
         &self,
         demanded_release_ids: &[Uuid],
+        invalid: &mut Vec<InvalidAutoscaleRow>,
     ) -> Result<Vec<PoolPolicyRelease>> {
-        let mut releases = self.retained_policy_releases().await?;
+        let mut releases: Vec<PoolPolicyRelease> = decode_autoscale_rows(
+            self.retained_policy_release_rows().await?,
+            AutoscaleRead::RetainedPolicyReleases,
+            invalid,
+        );
         let retained = releases
             .iter()
             .map(|release| (release.template_release_id, release.vcpu, release.memory))
             .collect::<HashSet<_>>();
-        releases.extend(
-            self.demanded_policy_releases(demanded_release_ids)
-                .await?
-                .into_iter()
-                .filter(|release| {
-                    !retained.contains(&(release.template_release_id, release.vcpu, release.memory))
-                }),
+        let demanded: Vec<PoolPolicyRelease> = decode_autoscale_rows(
+            self.demanded_policy_release_rows(demanded_release_ids)
+                .await?,
+            AutoscaleRead::DemandedPolicyReleases,
+            invalid,
         );
+        releases.extend(demanded.into_iter().filter(|release| {
+            !retained.contains(&(release.template_release_id, release.vcpu, release.memory))
+        }));
 
         Ok(releases)
     }
@@ -458,7 +485,14 @@ impl WarmPoolStore {
         ))
         .fetch_all(&self.pool)
         .await?;
-        let retained = self.retained_policy_releases().await?;
+        // All or nothing, unlike the autoscale read: a release left out of
+        // this set may be evicted from nodes.
+        let retained = self
+            .retained_policy_release_rows()
+            .await?
+            .into_iter()
+            .map(PoolPolicyRelease::try_from)
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(enabled
             .into_iter()
@@ -479,8 +513,8 @@ impl WarmPoolStore {
             .collect())
     }
 
-    async fn retained_policy_releases(&self) -> Result<Vec<PoolPolicyRelease>> {
-        let rows = sqlx::query_as::<_, PoolPolicyReleaseRow>(sql!(
+    async fn retained_policy_release_rows(&self) -> Result<Vec<PoolPolicyReleaseRow>> {
+        Ok(sqlx::query_as::<_, PoolPolicyReleaseRow>(sql!(
             "SELECT
                  retained.id AS template_release_id,
                  p.template_name,
@@ -529,16 +563,14 @@ impl WarmPoolStore {
                 .expect("disk I/O default fits in PostgreSQL BIGINT"),
         )
         .fetch_all(&self.pool)
-        .await?;
-
-        rows.into_iter().map(TryInto::try_into).collect()
+        .await?)
     }
 
-    async fn demanded_policy_releases(
+    async fn demanded_policy_release_rows(
         &self,
         demanded_release_ids: &[Uuid],
-    ) -> Result<Vec<PoolPolicyRelease>> {
-        let rows = sqlx::query_as::<_, PoolPolicyReleaseRow>(sql!(
+    ) -> Result<Vec<PoolPolicyReleaseRow>> {
+        Ok(sqlx::query_as::<_, PoolPolicyReleaseRow>(sql!(
             "SELECT
                  demanded.id AS template_release_id,
                  p.template_name,
@@ -587,12 +619,13 @@ impl WarmPoolStore {
                 .expect("disk I/O default fits in PostgreSQL BIGINT"),
         )
         .fetch_all(&self.pool)
-        .await?;
-
-        rows.into_iter().map(TryInto::try_into).collect()
+        .await?)
     }
 
-    async fn observed_demand(&self) -> Result<Vec<PoolObservedDemand>> {
+    async fn observed_demand(
+        &self,
+        invalid: &mut Vec<InvalidAutoscaleRow>,
+    ) -> Result<Vec<PoolObservedDemand>> {
         let lookback_secs =
             i64::try_from(AUTOSCALE_LOOKBACK.as_secs()).expect("autoscale lookback fits i64");
         let rows = sqlx::query_as::<_, PoolObservedDemandRow>(sql!(
@@ -650,7 +683,11 @@ impl WarmPoolStore {
         .fetch_all(&self.pool)
         .await?;
 
-        rows.into_iter().map(TryInto::try_into).collect()
+        Ok(decode_autoscale_rows(
+            rows,
+            AutoscaleRead::ObservedDemand,
+            invalid,
+        ))
     }
 
     async fn upsert_autoscale_config(
@@ -724,6 +761,7 @@ impl WarmPoolStore {
     async fn disable_stale_autoscale_configs(
         &self,
         candidates: &[PoolAutoscaleCandidate],
+        held_release_ids: &[Uuid],
     ) -> Result<()> {
         let release_ids = candidates
             .iter()
@@ -745,6 +783,7 @@ impl WarmPoolStore {
              -- An empty desired set intentionally drains every autoscaler-owned config.
              WHERE c.managed_by = 'autoscaler'
                AND (c.enabled OR c.target_ready_slots != 0)
+               AND c.template_release_id <> ALL($4::UUID[])
                AND NOT EXISTS (
                    SELECT 1
                    FROM unnest($1::UUID[], $2::INT[], $3::INT[])
@@ -757,6 +796,7 @@ impl WarmPoolStore {
         .bind(release_ids)
         .bind(vcpus)
         .bind(memory_mib)
+        .bind(held_release_ids)
         .execute(&self.pool)
         .await?;
 
