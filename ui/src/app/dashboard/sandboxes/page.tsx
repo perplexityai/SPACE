@@ -1067,7 +1067,9 @@ function SandboxesPage() {
     setStatusFilter([]);
     setNodeFilter('any');
     setAgeWindow(DEFAULT_AGE_WINDOW);
-    setOrgFilter(null);
+    // The org filter is applied by the API: clear it the way the selector
+    // does, so the next load (and every poll) asks for all orgs again.
+    if (orgFilterRef.current) changeOrgFilter(null);
   };
 
   const filtersActive =
