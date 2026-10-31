@@ -317,6 +317,11 @@ impl SandboxManagerService {
         activity: GuestActivityKind,
         method: &'static str,
     ) -> Result<crate::db::SandboxRow, Status> {
+        let sandbox = self.lookup_sandbox(sandbox_id)?;
+        super::guest_image::require_agent(&sandbox).map_err(|refusal| match &route_auth {
+            Some(auth) => auth.refuse_sandbox(&sandbox, refusal),
+            None => refusal,
+        })?;
         let state_writer = match self.state_writer_lease(method) {
             Ok(state_writer) => state_writer,
             Err(drain_error) => {
@@ -584,6 +589,13 @@ impl SandboxManagerService {
         route_auth: Option<&super::auth_lookup::SpaceApiBridgeRouteAuthorization>,
     ) -> Result<crate::db::SandboxRow, Status> {
         let sandbox = self.lookup_sandbox(sandbox_id)?;
+        if activity.is_some() {
+            super::guest_image::require_agent(&sandbox).map_err(|refusal| match route_auth {
+                Some(auth) => auth.refuse_sandbox(&sandbox, refusal),
+                None => refusal,
+            })?;
+        }
+
         super::activation_support::validate_route_identity_sandbox(
             &start.space_api_route_identity,
             &sandbox.id,

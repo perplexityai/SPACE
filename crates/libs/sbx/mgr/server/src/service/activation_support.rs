@@ -1245,7 +1245,7 @@ pub(super) fn wake_transition_for_state(state: SandboxState) -> Result<WakeTrans
 /// actionable operator signal.
 #[derive(Debug)]
 pub(super) enum StartGate {
-    Ready(Box<pplx_space_spaced_host_client::proto::WaitReadyResponse>),
+    Ready(Box<GuestReadyEvidence>),
     GuestNotReady(Status),
     NetworkPolicyFailed(Status),
 }
@@ -1292,7 +1292,7 @@ fn activation_failure_status_if_current(
 }
 
 pub(super) fn evaluate_start_gate(
-    ready: Result<pplx_space_spaced_host_client::proto::WaitReadyResponse, Status>,
+    ready: Result<GuestReadyEvidence, Status>,
     network_policy: Option<Result<(), Status>>,
 ) -> StartGate {
     match ready {
@@ -1357,6 +1357,43 @@ pub(super) async fn wait_ready_and_mark_started(
                 .map_err(network_policy_refresh_error_to_status)
         }
     });
+    let image_and_fence = {
+        let connection = crate::node_state_sync::connection_or_signal_failure(&db)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        let row = crate::db::read::sandbox(&connection, sandbox_id)
+            .map_err(|error| Status::internal(error.to_string()))?
+            .ok_or_else(|| Status::not_found("activation sandbox disappeared"))?;
+        (row.guest_image, row.node_execution_id)
+    };
+    let guest = async {
+        match image_and_fence.0.readiness() {
+            pplx_space_common_core::types::guest_image::GuestReadiness::Agent => {
+                wait_ready_via_spaced_host(
+                    sandbox_id,
+                    Duration::from_secs(ready_timeout_secs.into()),
+                    phase,
+                )
+                .await
+                .map(GuestReadyEvidence::Agent)
+            }
+            pplx_space_common_core::types::guest_image::GuestReadiness::TcpService { port } => {
+                let execution = image_and_fence.1.ok_or_else(|| {
+                    Status::failed_precondition(
+                        "guest service readiness requires an execution identity",
+                    )
+                })?;
+                super::guest_image::wait_service(
+                    &crate::node_manager_transport::NodeManagerConnector::host(),
+                    sandbox_id,
+                    execution,
+                    port,
+                    Duration::from_secs(ready_timeout_secs.into()),
+                )
+                .await?;
+                Ok(GuestReadyEvidence::Service)
+            }
+        }
+    };
     complete_start_after_readiness(
         db,
         sandbox_id,
@@ -1364,16 +1401,20 @@ pub(super) async fn wait_ready_and_mark_started(
         ready_timeout_secs,
         phase,
         cleanup_id,
-        StartReadiness {
-            guest: wait_ready_via_spaced_host(
-                sandbox_id,
-                Duration::from_secs(ready_timeout_secs as u64),
-                phase,
-            ),
-            policy,
-        },
+        StartReadiness { guest, policy },
     )
     .await
+}
+
+#[derive(Debug)]
+pub(super) enum GuestReadyEvidence {
+    Agent(pplx_space_spaced_host_client::proto::WaitReadyResponse),
+    Service,
+}
+impl From<pplx_space_spaced_host_client::proto::WaitReadyResponse> for GuestReadyEvidence {
+    fn from(value: pplx_space_spaced_host_client::proto::WaitReadyResponse) -> Self {
+        Self::Agent(value)
+    }
 }
 
 struct StartReadiness<G, P> {
@@ -1391,9 +1432,7 @@ async fn complete_start_after_readiness<G, P>(
     readiness: StartReadiness<G, P>,
 ) -> Result<(), Status>
 where
-    G: std::future::Future<
-            Output = Result<pplx_space_spaced_host_client::proto::WaitReadyResponse, Status>,
-        >,
+    G: std::future::Future<Output = Result<GuestReadyEvidence, Status>>,
     P: std::future::Future<Output = Result<(), Status>> + Send + 'static,
 {
     let t0 = tokio::time::Instant::now();
@@ -1445,13 +1484,18 @@ where
 
     match evaluate_start_gate(ready, policy) {
         StartGate::Ready(response) => {
-            let guest_uptime_ms = wait_ready_guest_uptime_ms(&response);
+            let evidence = *response;
+            let agent = match &evidence {
+                GuestReadyEvidence::Agent(response) => Some(response),
+                GuestReadyEvidence::Service => None,
+            };
+            let guest_uptime_ms = agent.map(wait_ready_guest_uptime_ms);
             tracing::info!(
                 sandbox_id,
                 phase,
-                guest_uptime_ms,
+                ?guest_uptime_ms,
                 elapsed_ms = ready_elapsed.as_millis() as u64,
-                "guest ready via spaced-host"
+                "guest readiness contract satisfied"
             );
             if let Err(status) = configure_process_env_for_activation(
                 &db,
@@ -1483,7 +1527,9 @@ where
                     );
                     return Err(activation_completion_lost_status(SandboxState::Starting));
                 }
-                if let Ok(Some(sandbox)) = crate::db::read::sandbox(&db, sandbox_id) {
+                if let Some(response) = agent
+                    && let Ok(Some(sandbox)) = crate::db::read::sandbox(&db, sandbox_id)
+                {
                     emit_guest_observed_specs(
                         sandbox_id,
                         &sandbox.template,
@@ -1493,14 +1539,17 @@ where
                 }
             }
             mark_sandbox_dirty(&db, sandbox_id);
+            let mut details = SandboxEventDetails::default()
+                .operation(phase)
+                .elapsed_ms(ready_elapsed.as_millis().to_string());
+            if let Some(uptime) = guest_uptime_ms {
+                details = details.guest_uptime_ms(uptime.to_string());
+            }
             emit_sandbox_event(
                 sandbox_id,
                 SandboxEventType::GuestReady,
                 SandboxEventSource::SbxManager,
-                SandboxEventDetails::default()
-                    .operation(phase)
-                    .guest_uptime_ms(guest_uptime_ms.to_string())
-                    .elapsed_ms(ready_elapsed.as_millis().to_string()),
+                details,
             );
             notify_start_succeeded();
             Ok(())
@@ -1511,7 +1560,7 @@ where
                 phase,
                 timeout_secs = ready_timeout_secs,
                 %error,
-                "guest did not become ready via spaced-host"
+                "guest readiness contract was not satisfied"
             );
             emit_sandbox_event(
                 sandbox_id,

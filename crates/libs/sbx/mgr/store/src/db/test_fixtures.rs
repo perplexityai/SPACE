@@ -274,6 +274,7 @@ impl TestSandboxInsert {
         user: &'a SandboxOwner,
     ) -> InsertSandboxParams<'a> {
         InsertSandboxParams {
+            guest_image: Default::default(),
             id: &self.id,
             uuid8,
             state: self.state,

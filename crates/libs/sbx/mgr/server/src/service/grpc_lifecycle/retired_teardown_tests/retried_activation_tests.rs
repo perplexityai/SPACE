@@ -513,6 +513,7 @@ async fn a_retry_waiting_on_a_rollback_cleanup_sees_its_receipt() {
                 template_hash: Some(&template_hash.to_string()),
                 user: &SandboxOwner::parse("user").unwrap(),
                 runtime: RuntimeKind::Firecracker.alias(),
+                guest_image: Default::default(),
                 snapshots_enabled: false,
                 rootfs_size_mb: Some(2048),
                 disk_io_limits: Default::default(),

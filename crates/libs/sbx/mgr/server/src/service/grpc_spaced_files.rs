@@ -192,6 +192,9 @@ impl SandboxManagerService {
         let peer = self.authorize_peer(&request, "Update", ALLOW_SANDBOX_OPERATOR)?;
         let req = request.get_ref();
         let sandbox = self.lookup_sandbox(&req.sandbox_id)?;
+        if req.replace_process_env || !req.process_env.is_empty() {
+            super::guest_image::require_agent(&sandbox)?;
+        }
 
         if sandbox.state != SandboxState::Started && sandbox.state != SandboxState::Paused {
             return Err(Status::failed_precondition(format!(

@@ -51,7 +51,9 @@ fn startup(allowed: &str, default: &str) -> ExecutionPolicy {
 fn unverified_external_copies_are_not_usable_bindings() {
     let e0 = compiled("e0");
     let candidate = compiled("fc-1.17.0-linux-6.18.44");
-    let kernel = candidate.kernel();
+    let kernel = candidate
+        .kernel()
+        .expect("the Firecracker fixture has a kernel");
     let inventory = RuntimeInventory {
         runtimes: vec![external_runtime("1.17.0", "12.0.0")],
         components: vec![kernel_installation(
@@ -261,7 +263,10 @@ mod managed {
         assert_eq!(usable(&discover(&all), &all), ["e0"]);
 
         fixture.place_release("1.17.0", 7);
-        publish_kernel(&fixture, "candidate", candidate.kernel(), 44);
+        let candidate_kernel = candidate
+            .kernel()
+            .expect("the Firecracker fixture has a kernel");
+        publish_kernel(&fixture, "candidate", candidate_kernel, 44);
         // Installed outside the startup ceiling: never usable, and discovery
         // never includes it, so it doesn't resolve as itself under any policy.
         let ceiling = discover(&only_e0);
@@ -283,7 +288,7 @@ mod managed {
 
         // A corrupt execution-cache copy fails cold boot, so it isn't usable,
         // even though the managed store copy still verifies.
-        let image = ArtifactStore::execution_kernel_path(&cache, candidate.kernel()).unwrap();
+        let image = ArtifactStore::execution_kernel_path(&cache, candidate_kernel).unwrap();
         assert!(image.exists(), "selection staged the candidate kernel");
         replace_bytes(&image, &binary(98));
         assert!(!installed.check_files_unchanged());

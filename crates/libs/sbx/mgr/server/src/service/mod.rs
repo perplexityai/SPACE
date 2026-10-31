@@ -2059,6 +2059,7 @@ mod cleanup_support;
 mod cleanup_targets;
 mod create;
 mod create_support;
+mod guest_image;
 pub(crate) use create_support::template_lookup_scope;
 pub(crate) mod drain;
 mod eviction;
