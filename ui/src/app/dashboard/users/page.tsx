@@ -3,7 +3,7 @@
 import { useEffect, useState } from 'react';
 import { adminApi } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
-import { AdminUser, Organization, UserRole } from '@/lib/types';
+import { AdminUser, Organization, Sandbox, UserRole } from '@/lib/types';
 import { Table, Button, Form, Input, Select, Typography, Popconfirm, App, Card, Space, Tag } from 'antd';
 import { assignableRoleOptions, canDeleteUser, canManageUserRole, roleChangeConfirmation, roleColors, roleLabels } from '@/lib/userRoles';
 import { PlusOutlined, DeleteOutlined } from '@ant-design/icons';
@@ -62,7 +62,10 @@ export default function UsersPage() {
 
   const handleRoleChange = (target: AdminUser, role: UserRole) => {
     if (target.role === role) return;
-    modal.confirm({ ...roleChangeConfirmation(target.email, role), onOk: () => applyRole(target, role) });
+    modal.confirm({
+      ...roleChangeConfirmation(target.email, role, { inManagingOrg: !!cluster && target.org_id === cluster.managing_org_id, currentRole: target.role }),
+      onOk: () => applyRole(target, role),
+    });
   };
 
   const applyRole = async (target: AdminUser, role: UserRole) => {
@@ -84,7 +87,17 @@ export default function UsersPage() {
       setUsers(users.filter((u) => u.id !== id));
       message.success('User deleted');
     } catch (err: unknown) {
-      message.error(userDeleteFailureMessage(err));
+      // The list has no sandbox column: on a 500, read the org's sandboxes
+      // to tell whether ownership is the likely cause.
+      let ownsSandboxes = false;
+      const target = users.find((u) => u.id === id);
+      if (target && (err as { status?: unknown })?.status === 500) {
+        ownsSandboxes = await adminApi
+          .get<Sandbox[]>(`/v1/sandboxes?org_id=${target.org_id}&limit=5000`)
+          .then((rows) => rows.some((sandbox) => sandbox.user_id === id))
+          .catch(() => false);
+      }
+      message.error(userDeleteFailureMessage(err, { ownsSandboxes }));
     }
   };
 
