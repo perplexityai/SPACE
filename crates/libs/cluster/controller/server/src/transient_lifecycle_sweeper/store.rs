@@ -8,8 +8,9 @@ use std::time::Duration;
 use pplx_space_api::controllers::substrate::{
     CommandReadyProbe, ExecutionRoutabilityCheck, NodeApiTarget, ObservedPodIdentity,
     PodFenceMismatch, PodIdentityFence, RecordedExecution, RetireExecutionOutcome,
-    RetireExecutionRequest, RetireFence, RuntimeClient, Substrate, SubstrateAdapter,
-    SubstrateError, connect_node_api_client_for_target, sandbox_states_with_client,
+    RetireExecutionRequest, RetireFence, RetireStopRoute, RuntimeClient, Substrate,
+    SubstrateAdapter, SubstrateError, connect_node_api_client_for_target,
+    sandbox_states_with_client,
 };
 use pplx_space_common_core::types::{
     NodeManagedBy, NodeRole, PodName, PodUid, PositiveDuration, SandboxActivationAttemptId,
@@ -1710,7 +1711,11 @@ impl SweepSink for SubstrateSweepSink {
         fence: RetireFence,
     ) -> Result<RetireExecutionOutcome, String> {
         self.substrate
-            .retire_execution(RetireExecutionRequest { sandbox_id, fence })
+            .retire_execution(RetireExecutionRequest {
+                sandbox_id,
+                fence,
+                stop_route: RetireStopRoute::Execution,
+            })
             .await
             .map_err(|err| err.to_string())
     }
@@ -1791,9 +1796,14 @@ impl SweepSink for SubstrateSweepSink {
         &self,
         sandbox_id: SandboxId,
         fence: RetireFence,
+        stop_route: RetireStopRoute,
     ) -> Result<RetireExecutionOutcome, String> {
         self.substrate
-            .retire_execution(RetireExecutionRequest { sandbox_id, fence })
+            .retire_execution(RetireExecutionRequest {
+                sandbox_id,
+                fence,
+                stop_route,
+            })
             .await
             .map_err(|err| err.to_string())
     }

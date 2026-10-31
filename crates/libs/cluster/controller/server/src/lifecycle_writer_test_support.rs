@@ -5,8 +5,9 @@
 //! the Kubernetes apiserver, in process. The stored values a sweep seeds come
 //! from `StoredSandboxLifecycle::all_as_str`.
 
+use std::ffi::OsStr;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::response::IntoResponse;
@@ -16,6 +17,10 @@ use pplx_space_api::controllers::substrate::kubernetes::{
 };
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_common_grpc::internal_transport::INSECURE_DEV_ENV;
+use pplx_space_common_svc::bearer_token::{
+    SPACE_NODE_API_INTERNAL_TOKEN_PATH_ENV, SPACE_NODE_API_TOKEN_PATH_ENV,
+};
 use pplx_space_db_test_fixtures::TestDb;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
@@ -310,7 +315,10 @@ pub(crate) async fn wait_until_blocked(
 pub(crate) const KUBERNETES_NAMESPACE: &str = TEST_SANDBOX_NAMESPACE;
 
 /// A port no host service listens on, for a substrate that must not dial.
-const CLOSED_PORT: u16 = 1;
+pub(crate) const CLOSED_PORT: u16 = 1;
+
+/// Every request the apiserver double answered, as `METHOD path`.
+pub(crate) type ApiserverRequests = Arc<Mutex<Vec<String>>>;
 
 /// A `KubernetesSubstrate` over `pool` whose apiserver is an in-process
 /// double holding no pods and no nodes; see [`kubernetes_substrate_with_pods`].
@@ -336,21 +344,64 @@ pub(crate) fn kubernetes_substrate_with_pods(
     pods: Vec<serde_json::Value>,
     sandbox_proxy_port: u16,
 ) -> TestResult<KubernetesSubstrate> {
+    Ok(kubernetes_substrate_recording_requests(pool, pods, sandbox_proxy_port)?.0)
+}
+
+/// [`kubernetes_substrate_with_pods`], with the requests its apiserver double
+/// answers.
+pub(crate) fn kubernetes_substrate_recording_requests(
+    pool: &PgPool,
+    pods: Vec<serde_json::Value>,
+    sandbox_proxy_port: u16,
+) -> TestResult<(KubernetesSubstrate, ApiserverRequests)> {
     let seeded = pods
         .iter()
         .map(|pod| serde_json::from_value::<Pod>(pod.clone()))
         .collect::<Result<_, _>>()?;
     let held = Arc::new(pods);
+    let requests = ApiserverRequests::default();
+    let recorded = Arc::clone(&requests);
     let apiserver = axum::Router::new().fallback(move |request: axum::extract::Request| {
         let held = Arc::clone(&held);
+        recorded
+            .lock()
+            .expect("apiserver request log poisoned")
+            .push(format!("{} {}", request.method(), request.uri().path()));
         async move { apiserver_double(&held, &request) }
     });
-    Ok(KubernetesSubstrate::with_seeded_caches(
+    let substrate = KubernetesSubstrate::with_seeded_caches(
         pool.clone(),
         kube::Client::new(apiserver, KUBERNETES_NAMESPACE),
         sandbox_proxy_port,
         seeded,
-    ))
+    );
+    Ok((substrate, requests))
+}
+
+/// Re-run the calling test in a child process whose environment lets the
+/// substrate's node-api client reach a double: plaintext internal RPC, and
+/// node-api token paths naming files this parent writes and keeps until the
+/// child exits, so the token reader never falls back to the host's token
+/// files. That client reads both from the process environment, as in
+/// production. Call it first, and return when it returns `false`: the child
+/// has then run the test.
+pub(crate) fn enter_node_api_client_process() -> TestResult<bool> {
+    let tokens = tempfile::tempdir()?;
+    let node_api_token = tokens.path().join("node-api.token");
+    let node_api_internal_token = tokens.path().join("node-api-internal.token");
+    std::fs::write(&node_api_token, "synthetic-internal-token")?;
+    std::fs::write(&node_api_internal_token, "synthetic-internal-control-token")?;
+    Ok(pplx_space_test_env::enter_test_process(&[
+        (INSECURE_DEV_ENV, Some(OsStr::new("true"))),
+        (
+            SPACE_NODE_API_TOKEN_PATH_ENV,
+            Some(node_api_token.as_os_str()),
+        ),
+        (
+            SPACE_NODE_API_INTERNAL_TOKEN_PATH_ENV,
+            Some(node_api_internal_token.as_os_str()),
+        ),
+    ]))
 }
 
 fn apiserver_double(

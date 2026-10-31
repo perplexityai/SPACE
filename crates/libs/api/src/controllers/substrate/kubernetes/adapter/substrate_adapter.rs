@@ -725,6 +725,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
             sandbox_id,
             ExecutionTeardown::Delete,
             &RetireFence::Unobserved,
+            RetireStopRoute::Execution,
         )
         .await
         .map(|_| ())
@@ -766,6 +767,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
             request.sandbox_id,
             ExecutionTeardown::Retire,
             &request.fence,
+            request.stop_route,
         )
         .await
     }

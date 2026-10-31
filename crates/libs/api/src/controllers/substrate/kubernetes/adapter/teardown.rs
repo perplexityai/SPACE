@@ -105,6 +105,9 @@ pub(super) struct FencedTeardown {
     /// there is no runtime to stop and the teardown goes straight to the pod
     /// delete.
     runtime_pod_ip: Option<PodIp>,
+    /// The node the execution row places it on, which
+    /// [`RetireStopRoute::Node`] stops through.
+    node_name: Option<String>,
     /// The pod the check *proved* is there, if any — which is what the delete
     /// carries as its precondition.
     ///
@@ -162,6 +165,7 @@ impl KubernetesSubstrate {
                 sandbox_id,
                 ExecutionTeardown::Delete,
                 &RetireFence::NoExecution,
+                RetireStopRoute::Execution,
             )
             .await?;
         Ok(matches!(outcome, RetireExecutionOutcome::Retired))
@@ -227,6 +231,7 @@ impl KubernetesSubstrate {
                 active.state,
                 live_pod.as_deref(),
             ),
+            node_name: active.k8s_node_name,
         })))
     }
 
@@ -311,14 +316,16 @@ impl KubernetesSubstrate {
 
     /// Shared body of [`SubstrateAdapter::delete_execution`] and
     /// [`SubstrateAdapter::retire_execution`]; `mode` decides whether the
-    /// in-VM cleanup also destroys node-local sandbox state, and `fence` pins
+    /// in-VM cleanup also destroys node-local sandbox state, `fence` pins
     /// the whole teardown to one observed pod identity (see
-    /// [`Self::check_pod_fence`]).
+    /// [`Self::check_pod_fence`]), and `stop_route` picks the worker the
+    /// in-VM requests go to.
     pub(super) async fn teardown_execution(
         &self,
         sandbox_id: SandboxId,
         mode: ExecutionTeardown,
         fence: &RetireFence,
+        stop_route: RetireStopRoute,
     ) -> Result<RetireExecutionOutcome, SubstrateError> {
         let sandbox_uuid = sandbox_id;
         let pod_fence = match fence {
@@ -388,14 +395,11 @@ impl KubernetesSubstrate {
             // pod and execution row visible. Delete goes straight to sbx-mgr's
             // guarded delete: a pre-delete Stop would turn an in-flight
             // `Suspending` row into `Stopping` and erase the publication fence.
-            let endpoint_addr = format!("{pod_ip}:{}", self.k8s.sandbox_proxy_port);
-            let client = Self::pod_worker_client(
-                pod_ip,
-                self.k8s.sandbox_proxy_port,
-                self.budgets.teardown_worker_connect,
-            )
-            .await;
-            if let Some(mut client) = client {
+            let node_name = fenced
+                .as_ref()
+                .and_then(|fenced| fenced.node_name.as_deref());
+            let worker = self.teardown_worker(pod_ip, stop_route, node_name).await;
+            if let Ok((endpoint_addr, mut client)) = worker {
                 if mode.sends_sandbox_stop() {
                     let stop_result = client
                         .stop_sandbox(pplx_space_sbx_mgr_client::proto::StopRequest {
@@ -476,11 +480,14 @@ impl KubernetesSubstrate {
                         }
                     }
                 }
-            } else if mode.requires_stop_success() {
+            } else if let Err(cause) = worker
+                && mode.requires_stop_success()
+            {
                 return Err(SubstrateError::Failed {
-                    message: "pod worker unreachable for in-VM stop during execution retire; \
-                              keeping execution tracked for retry"
-                        .to_string(),
+                    message: format!(
+                        "{cause} for in-VM stop during execution retire; \
+                         keeping execution tracked for retry"
+                    ),
                 });
             }
         }
@@ -593,6 +600,50 @@ impl KubernetesSubstrate {
             .await?;
 
         Ok(RetireExecutionOutcome::Retired)
+    }
+
+    /// The worker a teardown sends its in-VM requests to, with the address it
+    /// dialed, or why there is none to reach.
+    ///
+    /// The node route resolves the node's node-api from the reflector only:
+    /// it is taken right after that node answered a probe, so a node-api
+    /// that is not ready now fails this attempt rather than holding the
+    /// caller's tick, and the caller retries. It needs the node a pod fence
+    /// verified: an unfenced teardown has none, so it fails as for an
+    /// execution that names no node.
+    async fn teardown_worker(
+        &self,
+        pod_ip: PodIp,
+        stop_route: RetireStopRoute,
+        node_name: Option<&str>,
+    ) -> Result<(String, RuntimeClient), String> {
+        let connect_timeout = self.budgets.teardown_worker_connect;
+        match stop_route {
+            RetireStopRoute::Execution => {
+                let port = self.k8s.sandbox_proxy_port;
+                let client = Self::pod_worker_client(pod_ip, port, connect_timeout)
+                    .await
+                    .ok_or_else(|| "pod worker unreachable".to_string())?;
+                Ok((format!("{pod_ip}:{port}"), client))
+            }
+            RetireStopRoute::Node => {
+                let node_name =
+                    node_name.ok_or_else(|| "the execution names no node".to_string())?;
+                let target = NodeApiTarget {
+                    managed_by: SpaceNodeManagedBy::Kubernetes,
+                    role: SpaceNodeRole::Worker,
+                    direct_endpoint: None,
+                    substrate_node_id: Some(node_name),
+                };
+                let endpoint_addr = self
+                    .try_resolve_node_api_endpoint(&target)
+                    .map_err(|error| format!("no node-api on node {node_name} ({error})"))?;
+                let client = Self::worker_client_at(&endpoint_addr, connect_timeout)
+                    .await
+                    .ok_or_else(|| format!("node-api at {endpoint_addr} unreachable"))?;
+                Ok((endpoint_addr, client))
+            }
+        }
     }
 
     /// Idempotent best-effort delete of each tracked pod name. An already-gone
