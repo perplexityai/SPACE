@@ -348,6 +348,21 @@ jobs:
       - name: Load and verify the shared Rust artifact image
         run: python3 infra/space/kind/scripts/rust-artifact-handoff.py load "${RUNNER_TEMP}/kind-rust"
 
+      # Where the bring-up after the artifact handoff spends its time, per Tilt
+      # resource: scripts/benchmarks/kind-bringup-timeline.py records build
+      # windows, pod and Job transitions and the Tilt log stamped on arrival,
+      # which a passing run otherwise keeps none of. It runs in the background
+      # through the baseline smoke; the step after the baseline stops it and
+      # reports.
+      - name: Record the Kind bring-up timeline
+        run: |
+          set -euo pipefail
+          dir="${RUNNER_TEMP}/kind-bringup-timeline"
+          install -d "${dir}"
+          setsid nohup python3 scripts/benchmarks/kind-bringup-timeline.py watch "${dir}" \
+            >"${dir}/watch.out" 2>&1 </dev/null &
+          echo "$!" >"${dir}/watch.pid"
+
       # DATA_PLANE_URL makes the bring-up wait for the public data plane as well as the API.
       # The data plane's ReplicaSet reaches ready a few minutes after the API on a cold
       # stack; without this wait the baseline passes on the API alone and the typed suite's
@@ -359,6 +374,32 @@ jobs:
           BOOTSTRAP_TIMEOUT: 1800
           DATA_PLANE_URL: http://127.0.0.1:8090
         run: bash scripts/tests/smoke-kind-e2e.sh
+
+      # Snapshots Tilt's build history while Tilt still runs, stops the
+      # recorder, prints the timeline and uploads its raw files. Never fails
+      # the shard: the timeline is evidence, not a check.
+      - name: Report the Kind bring-up timeline
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 3
+        run: |
+          dir="${RUNNER_TEMP}/kind-bringup-timeline"
+          [[ -s "${dir}/watch.pid" ]] || exit 0
+          timeout 60 python3 scripts/benchmarks/kind-bringup-timeline.py snapshot "${dir}" >/dev/null || true
+          pid="$(<"${dir}/watch.pid")"
+          kill -TERM "${pid}" 2>/dev/null || true
+          for _ in $(seq 1 20); do kill -0 "${pid}" 2>/dev/null || break; sleep 1; done
+          timeout 60 python3 scripts/benchmarks/kind-bringup-timeline.py report "${dir}" || true
+
+      - name: Upload the Kind bring-up timeline
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kind-bringup-timeline-${{ matrix.shard }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kind-bringup-timeline/
+          retention-days: 7
+          if-no-files-found: ignore
 
       # Together the shards cover every ecw, network_policy, native, and local scenario.
       # Each shard stays serial against the isolated stack its baseline proved. The suite
