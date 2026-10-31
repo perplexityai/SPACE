@@ -7,7 +7,9 @@ import { loadFailureFrom, type LoadFailure } from '@/lib/load-failure';
 import LoadFailureResult from '@/components/load-failure-result';
 import { useAuth } from '@/lib/auth';
 import { useCuriosityTheme } from '@/lib/theme';
-import { Organization, OrgMasterKey, Sandbox, User } from '@/lib/types';
+import { ApiKeyMetadata, Organization, OrgMasterKey, Sandbox, User } from '@/lib/types';
+import { publicSandboxIdFromAny } from '@/lib/sandbox-id';
+import Link from 'next/link';
 import { Card, Table, Typography, Form, Input, Button, App, Descriptions, Space, Switch, Tag } from 'antd';
 import { LockOutlined, SaveOutlined } from '@ant-design/icons';
 import { roleLabels } from '@/lib/userRoles';
@@ -16,7 +18,7 @@ import type { ColumnsType } from 'antd/es/table';
 const { Title } = Typography;
 
 export default function OrgDetailPage() {
-  const { message } = App.useApp();
+  const { message, modal } = App.useApp();
   const { primaryColor: defaultPrimaryColor } = useCuriosityTheme();
   const { id } = useParams<{ id: string }>();
   const { org: authOrg, refreshOrg } = useAuth();
@@ -24,6 +26,7 @@ export default function OrgDetailPage() {
   const [users, setUsers] = useState<User[]>([]);
   const [sandboxes, setSandboxes] = useState<Sandbox[]>([]);
   const [masterKey, setMasterKey] = useState<OrgMasterKey | null>(null);
+  const [apiKeys, setApiKeys] = useState<ApiKeyMetadata[] | null>(null);
   const [byokSaving, setByokSaving] = useState(false);
   const [loadError, setLoadError] = useState<LoadFailure | null>(null);
   const [attempt, setAttempt] = useState(0);
@@ -34,6 +37,8 @@ export default function OrgDetailPage() {
     setLoadError(null);
     adminApi.get<Organization>(`/v1/orgs/${id}`).then((o) => {
       setOrg(o);
+      // Only for an organization that exists; an unknown ID shows not found.
+      adminApi.get<ApiKeyMetadata[]>(`/v1/orgs/${id}/api-keys`).then(setApiKeys).catch(() => setApiKeys([]));
       form.setFieldsValue({
         theme_primary: o.theme_primary || '',
         theme_secondary: o.theme_secondary || '',
@@ -68,6 +73,18 @@ export default function OrgDetailPage() {
     }
   };
 
+  // BYOK decides how every new sandbox in the org is created; confirm first.
+  const confirmByokToggle = (checked: boolean) => {
+    modal.confirm({
+      title: checked ? `Enable BYOK encryption for ${org?.name}?` : `Disable BYOK encryption for ${org?.name}?`,
+      content: checked
+        ? 'New sandboxes in this organization will run on encrypted volumes keyed through the external provider and will not use warm pools. Existing sandboxes keep their current encryption.'
+        : 'New sandboxes in this organization will run on unencrypted volumes. Existing sandboxes keep their current encryption.',
+      okText: checked ? 'Enable BYOK' : 'Disable BYOK',
+      onOk: () => handleByokToggle(checked),
+    });
+  };
+
   const handleByokToggle = async (checked: boolean) => {
     setByokSaving(true);
     try {
@@ -84,7 +101,7 @@ export default function OrgDetailPage() {
   };
 
   const userColumns: ColumnsType<User> = [
-    { title: 'Name', dataIndex: 'display_name' },
+    { title: 'Name', dataIndex: 'display_name', render: (name: string, record) => <Link href={`/dashboard/users/${record.id}`}>{name}</Link> },
     { title: 'Email', dataIndex: 'email' },
     { title: 'Role', dataIndex: 'role', render: (role: User['role']) => roleLabels[role] ?? role },
     {
@@ -131,6 +148,56 @@ export default function OrgDetailPage() {
               </Table.Summary.Cell>
             </Table.Summary.Row>
           )}
+        />
+      </Card>
+
+      <Card
+        title={`Sandboxes (${sandboxes.length})`}
+        size="small"
+        style={{ marginBottom: 24 }}
+        extra={<Link href={`/dashboard/sandboxes?org=${org.id}`}>Open in Sandboxes</Link>}
+      >
+        <Table
+          size="small"
+          rowKey="id"
+          dataSource={sandboxes}
+          pagination={{ pageSize: 10, hideOnSinglePage: true }}
+          locale={{ emptyText: 'No sandboxes' }}
+          columns={[
+            {
+              title: 'Sandbox',
+              dataIndex: 'id',
+              render: (sid: string, row) => (
+                <Link href={`/dashboard/sandboxes/${publicSandboxIdFromAny(sid)}`}>{row.name || publicSandboxIdFromAny(sid)}</Link>
+              ),
+            },
+            { title: 'State', dataIndex: 'status', width: 120, render: (v: string | null) => <Tag>{v || 'unknown'}</Tag> },
+            { title: 'Template', dataIndex: 'template', width: 160, render: (v: string | null) => v || '—' },
+            { title: 'Created', dataIndex: 'created_at', width: 200, render: (v: string | null) => (v ? new Date(v).toLocaleString() : '—') },
+          ]}
+        />
+      </Card>
+
+      <Card
+        title={`API keys (${apiKeys?.length ?? 0})`}
+        size="small"
+        style={{ marginBottom: 24 }}
+        extra={<Link href="/dashboard/api-keys">Manage API keys</Link>}
+      >
+        <Table
+          size="small"
+          rowKey="id"
+          dataSource={apiKeys ?? []}
+          loading={apiKeys === null}
+          pagination={false}
+          locale={{ emptyText: 'No API keys' }}
+          columns={[
+            { title: 'Name', dataIndex: 'name' },
+            { title: 'Key ID', dataIndex: 'id', render: (v: string) => <Typography.Text code copyable>{v}</Typography.Text> },
+            { title: 'Allowed APIs', dataIndex: 'allowed_surfaces', render: (v: string[]) => v.map((surface) => <Tag key={surface}>{surface === 'native' ? 'SPACE' : 'E2B-compatible'}</Tag>) },
+            { title: 'Creator', dataIndex: 'created_by_email', render: (v: string | null) => v || '—' },
+            { title: 'Created', dataIndex: 'created_at', width: 200, render: (v: string) => new Date(v).toLocaleString() },
+          ]}
         />
       </Card>
 
@@ -191,7 +258,7 @@ export default function OrgDetailPage() {
             <Switch
               checked={org.byok_enabled}
               loading={byokSaving}
-              onChange={handleByokToggle}
+              onChange={confirmByokToggle}
             />
             <Typography.Text>
               Encrypt this organization&apos;s sandboxes with its own key
