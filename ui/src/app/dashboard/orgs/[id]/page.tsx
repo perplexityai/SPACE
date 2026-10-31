@@ -2,13 +2,14 @@
 
 import { useEffect, useState } from 'react';
 import { useParams } from 'next/navigation';
-import Link from 'next/link';
 import { adminApi } from '@/lib/api';
+import { loadFailureFrom, type LoadFailure } from '@/lib/load-failure';
+import LoadFailureResult from '@/components/load-failure-result';
 import { useAuth } from '@/lib/auth';
 import { useCuriosityTheme } from '@/lib/theme';
 import { Organization, OrgMasterKey, Sandbox, User } from '@/lib/types';
-import { Card, Table, Typography, Form, Input, Button, App, Descriptions, Space, Switch, Tag, Result } from 'antd';
-import { ArrowLeftOutlined, LockOutlined, SaveOutlined } from '@ant-design/icons';
+import { Card, Table, Typography, Form, Input, Button, App, Descriptions, Space, Switch, Tag } from 'antd';
+import { LockOutlined, SaveOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 
 const { Title } = Typography;
@@ -23,7 +24,8 @@ export default function OrgDetailPage() {
   const [sandboxes, setSandboxes] = useState<Sandbox[]>([]);
   const [masterKey, setMasterKey] = useState<OrgMasterKey | null>(null);
   const [byokSaving, setByokSaving] = useState(false);
-  const [loadError, setLoadError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<LoadFailure | null>(null);
+  const [attempt, setAttempt] = useState(0);
   const [saving, setSaving] = useState(false);
   const [form] = Form.useForm();
 
@@ -36,11 +38,11 @@ export default function OrgDetailPage() {
         theme_secondary: o.theme_secondary || '',
         logo_url: o.logo_url || '',
       });
-    }).catch((err: unknown) => setLoadError(err instanceof Error ? err.message : 'Failed to load organization'));
+    }).catch((err: unknown) => setLoadError(loadFailureFrom(err, 'Failed to load organization')));
     adminApi.get<User[]>(`/v1/orgs/${id}/users`).then(setUsers).catch(() => {});
     adminApi.get<Sandbox[]>(`/v1/sandboxes?org_id=${id}&limit=5000`).then(setSandboxes).catch(() => {});
     adminApi.get<OrgMasterKey | null>(`/v1/orgs/${id}/master-key`).then(setMasterKey).catch(() => {});
-  }, [id]);
+  }, [id, attempt]);
 
   const sandboxCountByUser = (userId: string) =>
     sandboxes.filter((sandbox) => sandbox.user_id === userId).length;
@@ -93,11 +95,13 @@ export default function OrgDetailPage() {
 
   if (loadError) {
     return (
-      <Result
-        status="warning"
-        title="Organization not found"
-        subTitle={<>{loadError} <code>{id}</code></>}
-        extra={<Link href="/dashboard/orgs"><ArrowLeftOutlined /> Organizations</Link>}
+      <LoadFailureResult
+        failure={loadError}
+        noun="organization"
+        id={id}
+        backHref="/dashboard/orgs"
+        backLabel="Organizations"
+        onRetry={() => setAttempt((value) => value + 1)}
       />
     );
   }
