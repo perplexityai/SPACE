@@ -18,6 +18,7 @@
 //! - T6 `t6_failed_cleanup_cleans_listed_active_executions`
 //! - T7 `t7_failed_cleanup_keeps_going_after_cleanup_failure`
 //! - T8 `t8_failed_cleanup_rotates_and_does_not_starve_later_ids`
+//! - T9 `t9_failed_cleanup_backs_off_a_retire_that_keeps_failing`
 //!
 //! ## V — Verify-before-destroy (probe -> classify -> act)
 //! - V1 `v1_alive_restoring_converges_to_wake_target`
@@ -315,6 +316,14 @@ impl FakeSink {
             .unwrap()
             .failed_execution_cleanup_failures
             .insert(sandbox_id);
+    }
+
+    fn clear_failed_execution_cleanup_failure(&self, sandbox_id: SandboxId) {
+        self.0
+            .lock()
+            .unwrap()
+            .failed_execution_cleanup_failures
+            .remove(&sandbox_id);
     }
 
     fn list_calls(&self) -> Vec<(SandboxLifecycle, PositiveDuration)> {
@@ -1147,6 +1156,86 @@ async fn t8_failed_cleanup_rotates_and_does_not_starve_later_ids() {
         reconciler.sink.failed_execution_cleanup_calls(),
         vec![later]
     );
+}
+
+/// T9 — a retire that keeps failing is retried after a wait that doubles up
+/// to a cap, and is neither probed nor retired while it waits, though it
+/// still rotates and its sibling is cleaned on its first tick. Once the retire
+/// succeeds the wait is forgotten.
+#[tokio::test(flavor = "current_thread")]
+async fn t9_failed_cleanup_backs_off_a_retire_that_keeps_failing() {
+    let sink = FakeSink::new();
+    let failing = SandboxId::new();
+    let sibling = SandboxId::new();
+    sink.enqueue_failed_cleanup(vec![failed_candidate(failing), failed_candidate(sibling)]);
+    sink.set_probe_verdict(failing, ProbeVerdict::DeadOnNode);
+    sink.set_probe_verdict(sibling, ProbeVerdict::DeadOnNode);
+    sink.enqueue_failed_execution_cleanup_failure(failing);
+    let reconciler = Reconciler::new(
+        ReconcilerConfig {
+            enabled: false,
+            failed_cleanup_enabled: true,
+            ..ReconcilerConfig::default()
+        },
+        sink,
+    );
+
+    let mut failed_ticks = Vec::new();
+    for tick in 1..=40 {
+        let report = reconciler.tick().await;
+        if report.failed_cleanup_failures > 0 {
+            failed_ticks.push(tick);
+        }
+        assert_eq!(
+            report.failed_cleanup_failures + report.failed_cleanup_backed_off,
+            1,
+            "tick {tick}: the failing sandbox is either retried or waiting: {report:?}"
+        );
+    }
+    assert_eq!(failed_ticks, vec![1, 2, 4, 8, 16, 32]);
+    let probed_failing = reconciler
+        .sink
+        .probe_calls()
+        .iter()
+        .filter(|(_, ids)| ids.contains(&failing))
+        .count();
+    assert_eq!(
+        probed_failing,
+        failed_ticks.len(),
+        "a waiting sandbox is not probed"
+    );
+    let rotations = reconciler.sink.failed_cleanup_attempts();
+    assert_eq!(
+        rotations.iter().filter(|id| **id == failing).count(),
+        40,
+        "a waiting sandbox still rotates"
+    );
+    // The sibling's retire succeeds, and the fake keeps listing it; it is
+    // retried on every tick, never waiting.
+    assert_eq!(
+        reconciler
+            .sink
+            .failed_execution_cleanup_calls()
+            .iter()
+            .filter(|id| **id == sibling)
+            .count(),
+        40
+    );
+
+    // The fault clears. The capped wait after the failure on tick 32 runs to
+    // tick 48, where the retire succeeds, and the fake keeps listing the
+    // sandbox: on tick 49 it is retried at once.
+    reconciler
+        .sink
+        .clear_failed_execution_cleanup_failure(failing);
+    let mut cleaned_ticks = Vec::new();
+    for tick in 41..=49 {
+        let report = reconciler.tick().await;
+        if report.failed_cleanup_attempts == 2 {
+            cleaned_ticks.push(tick);
+        }
+    }
+    assert_eq!(cleaned_ticks, vec![48, 49]);
 }
 
 // -----------------------------------------------------------------
