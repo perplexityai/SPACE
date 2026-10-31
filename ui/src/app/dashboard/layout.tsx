@@ -5,9 +5,8 @@ import { useRouter, usePathname } from 'next/navigation';
 import Link from 'next/link';
 import { useAuth } from '@/lib/auth';
 import { useTheme, useCuriosityTheme } from '@/lib/theme';
-import { UserRole } from '@/lib/types';
 import { isManagingOrgAdmin } from '@/lib/userRoles';
-import { App, Layout, Menu, Typography, Button, ConfigProvider, Avatar, Space, Segmented, Modal } from 'antd';
+import { App, Layout, Menu, Typography, Button, ConfigProvider, Avatar, Space, Segmented, Modal, Result } from 'antd';
 import {
   DashboardOutlined,
   TeamOutlined,
@@ -26,19 +25,19 @@ type DashboardMenuItem = {
   key: string;
   icon: React.ReactNode;
   label: React.ReactNode;
-  roles?: UserRole[];
-  managingOrgAdmin?: boolean;
 };
 
+// Every page reads the admin API, which answers only organization admins of
+// the cluster's managing organization; other users get the notice below.
 const menuItems: DashboardMenuItem[] = [
   { key: '/dashboard', icon: <DashboardOutlined />, label: <Link href="/dashboard">Overview</Link> },
-  { key: '/dashboard/orgs', icon: <TeamOutlined />, label: <Link href="/dashboard/orgs">Organizations</Link>, roles: ['organization_admin'] },
-  { key: '/dashboard/users', icon: <UserOutlined />, label: <Link href="/dashboard/users">Users</Link>, roles: ['organization_admin'] },
-  { key: '/dashboard/api-keys', icon: <KeyOutlined />, label: <Link href="/dashboard/api-keys">API Keys</Link>, managingOrgAdmin: true },
+  { key: '/dashboard/orgs', icon: <TeamOutlined />, label: <Link href="/dashboard/orgs">Organizations</Link> },
+  { key: '/dashboard/users', icon: <UserOutlined />, label: <Link href="/dashboard/users">Users</Link> },
+  { key: '/dashboard/api-keys', icon: <KeyOutlined />, label: <Link href="/dashboard/api-keys">API Keys</Link> },
   { key: '/dashboard/sandboxes', icon: <CloudServerOutlined />, label: <Link href="/dashboard/sandboxes">Sandboxes</Link> },
-  { key: '/dashboard/credential-rules', icon: <KeyOutlined />, label: <Link href="/dashboard/credential-rules">Credential Rules</Link>, managingOrgAdmin: true },
-  { key: '/dashboard/templates', icon: <AppstoreOutlined />, label: <Link href="/dashboard/templates">Templates</Link>, managingOrgAdmin: true },
-  { key: '/dashboard/nodes', icon: <ClusterOutlined />, label: <Link href="/dashboard/nodes">Nodes</Link>, managingOrgAdmin: true },
+  { key: '/dashboard/credential-rules', icon: <KeyOutlined />, label: <Link href="/dashboard/credential-rules">Credential Rules</Link> },
+  { key: '/dashboard/templates', icon: <AppstoreOutlined />, label: <Link href="/dashboard/templates">Templates</Link> },
+  { key: '/dashboard/nodes', icon: <ClusterOutlined />, label: <Link href="/dashboard/nodes">Nodes</Link> },
 ];
 
 export default function DashboardLayout({ children }: { children: React.ReactNode }) {
@@ -73,10 +72,7 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
   if (loading || !user || !org) return null;
 
   const managingOrgAdmin = isManagingOrgAdmin(user, cluster);
-  const visibleItems = menuItems.filter((item) => {
-    if (item.managingOrgAdmin) return managingOrgAdmin;
-    return !item.roles || item.roles.includes(user.role);
-  });
+  const visibleItems = managingOrgAdmin ? menuItems : [];
 
   const selectedKey = visibleItems
     .filter((item) => pathname.startsWith(item.key))
@@ -131,7 +127,20 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
               </Space>
             </div>
           </Sider>
-          <Content style={{ padding: 24, minWidth: 0, overflowX: 'auto', background: surfaces.page }}>{children}</Content>
+          <Content style={{ padding: 24, minWidth: 0, overflowX: 'auto', background: surfaces.page }}>
+            {managingOrgAdmin ? children : (
+              <Result
+                status="403"
+                title="This console is for cluster operators"
+                subTitle={`You are signed in as ${user.email} (${org.name}). The admin console requires an organization admin of the organization that manages this cluster.`}
+                extra={
+                  <Button type="primary" icon={<LogoutOutlined />} onClick={() => setLogoutConfirmationOpen(true)}>
+                    Log out
+                  </Button>
+                }
+              />
+            )}
+          </Content>
         </Layout>
         <Modal
           title="Log out?"
