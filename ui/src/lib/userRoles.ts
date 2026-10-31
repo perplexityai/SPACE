@@ -1,4 +1,4 @@
-import { Cluster, User, UserRole } from './types';
+import type { Cluster, User, UserRole } from './types';
 
 export const roleLabels: Record<UserRole, string> = {
   organization_admin: 'Organization Admin',
@@ -52,13 +52,22 @@ export function canDeleteUser(
 // The confirmation shown before a role change; granting organization admin
 // in the managing organization grants operator access to this console.
 // `inManagingOrg`: the user belongs to the organization that manages the
-// cluster, whose organization admins are the only users of this console.
+// cluster, whose organization admins are the only users of this console;
+// `null` when that is unknown because the cluster record did not load.
 export function roleChangeConfirmation(
   email: string,
   role: UserRole,
-  { inManagingOrg = false, currentRole }: { inManagingOrg?: boolean; currentRole?: UserRole } = {},
+  { inManagingOrg = false, currentRole }: { inManagingOrg?: boolean | null; currentRole?: UserRole } = {},
 ) {
   let content: string;
+  if (inManagingOrg === null) {
+    // The cluster record did not load, so whether this user's organization
+    // manages the cluster is unknown.
+    content = role === 'organization_admin'
+      ? 'Organization admins manage their organization. Whether the role also gives access to this admin console could not be determined: the cluster record did not load.'
+      : 'They lose organization admin rights. Whether they lose access to this admin console could not be determined: the cluster record did not load.';
+    return { title: `Make ${email} ${roleLabels[role]}?`, content, okText: 'Change role' };
+  }
   if (role === 'organization_admin') {
     content = inManagingOrg
       ? 'Organization admins manage their organization. This user is in the organization that manages the cluster, so they can also operate it from this console.'
