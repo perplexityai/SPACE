@@ -412,10 +412,11 @@ async fn set_route_and_provenance(
 /// artifact node while the row is `suspended` with no active node. A wake
 /// adopts that record when it runs on the route identity's node, at or above
 /// that identity's execution generation, and no restore owner can still
-/// record a newer one: the last reserved generation is the record's, or the
-/// row holds no restore-lease token. It places the row back on that node and
-/// wakes it there, with no restore and no new generation, and the Wake's
-/// receipt catches the route identity up. Any other live record is restored
+/// record a newer one: the row holds no restore-lease token, or the route
+/// identity, the record and the last reservation are one generation. It
+/// places the row back on that node and wakes it there, with no restore and
+/// no new generation, and the Wake's receipt catches the route identity up.
+/// Any other live record is restored
 /// around, as is a row under a live restore lease or one that left the
 /// lifecycle the wake read; the cleanup keeps a source copy it does not read
 /// as dormant.
@@ -488,6 +489,16 @@ async fn wake_adopts_a_live_record_on_its_artifact_node() -> TestResult {
             expect: Expect::Adopted,
         },
         Case {
+            label: "restoring row whose expired owner's receipt matches the record",
+            record_status: "running",
+            record_generation: 2,
+            route: (RouteOn::Source, 2),
+            last_generation: 2,
+            row: Row::RestoringExpiredLease,
+            source_is_candidate: true,
+            expect: Expect::Adopted,
+        },
+        Case {
             label: "restoring row whose expired owner reserved the record's generation",
             record_status: "running",
             record_generation: 2,
@@ -495,7 +506,7 @@ async fn wake_adopts_a_live_record_on_its_artifact_node() -> TestResult {
             last_generation: 2,
             row: Row::RestoringExpiredLease,
             source_is_candidate: true,
-            expect: Expect::Adopted,
+            expect: Expect::RestoredElsewhereKeepingSource,
         },
         Case {
             label: "restoring row whose expired owner reserved past the record",

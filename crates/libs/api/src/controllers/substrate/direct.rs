@@ -3179,8 +3179,9 @@ impl DirectSubstrate {
     /// node, no live restore lease (whose owner's restore answers for
     /// itself), and a route identity on `node` whose execution generation is
     /// at most the record's. The record's generation must be at most the last
-    /// one reserved, and that one unless the row holds no restore-lease
-    /// token:
+    /// one reserved. A row that holds a restore-lease token is adopted only
+    /// when the route identity, the record and the last reservation are one
+    /// generation:
     ///
     /// - On a tokenless row no restore owner can still persist a receipt or
     ///   complete: both fence on the token, which a claim writes and leaving
@@ -3189,8 +3190,12 @@ impl DirectSubstrate {
     /// - A newer execution on another worker would have moved the route
     ///   identity there: a receipt moves it only to the row's active node.
     /// - A row that still holds a token (`restoring`, its lease expired) may
-    ///   have an owner about to persist a newer execution, so it is adopted
-    ///   only at the last reserved generation.
+    ///   have an owner whose Start ran and whose receipt has not landed.
+    ///   Adopting clears the token that receipt fences on, and an owner whose
+    ///   receipt is refused after a remote-snapshot restore deletes that
+    ///   destination, which may be the copy just adopted. Such a row is
+    ///   adopted only when its last reservation is the persisted receipt's
+    ///   execution.
     /// - A record older than the route identity is not adopted.
     ///
     /// A `Started` record leaves the row `started`; any other keeps the read
@@ -3240,8 +3245,11 @@ impl DirectSubstrate {
                 AND provenance.sandbox_id = s.id
                 AND provenance.last_execution_generation >= $4
                 AND (
-                    provenance.last_execution_generation = $4
-                    OR s.restore_lease_token IS NULL
+                    s.restore_lease_token IS NULL
+                    OR (
+                        route.execution_generation = $4
+                        AND provenance.last_execution_generation = $4
+                    )
                 )"
         ))
         .bind(sandbox_id.as_uuid())
