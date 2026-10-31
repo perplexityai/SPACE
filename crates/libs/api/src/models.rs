@@ -23,6 +23,9 @@ use pplx_space_cluster_pool::PoolConfigOwner;
 /// api's existing `crate::models::SandboxMetadata` paths keep resolving.
 pub use pplx_space_sandbox_store::{SandboxMetadata, SandboxMetadataValue};
 
+mod sandbox_state;
+pub use sandbox_state::SandboxStateInput;
+
 // --- Database models ---
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
@@ -370,6 +373,7 @@ pub struct SandboxResponse {
     pub name: Option<String>,
     pub user_id: Option<UserId>,
     pub org_id: Option<OrgId>,
+    /// Rendered from `state_input`, as is `status`.
     pub lifecycle: Option<String>,
     pub placement: Option<String>,
     pub active_node_id: Option<NodeId>,
@@ -395,6 +399,9 @@ pub struct SandboxResponse {
     pub network_policy_status: Option<NetworkPolicyStatus>,
     // Live/observed fields from sbx-mgr plus template release identity.
     pub status: Option<String>,
+    /// The facts `lifecycle`, `status` and the ECW state are rendered from.
+    #[serde(skip)]
+    pub state_input: SandboxStateInput,
     pub template: Option<String>,
     pub content_hash: Option<String>,
     pub release_tags: Vec<String>,
@@ -414,6 +421,15 @@ pub struct SandboxResponse {
     /// BYOK: the sandbox runs on dm-crypt encrypted volumes. Stamped at
     /// create time and immutable for the sandbox's lifetime.
     pub volume_encryption: bool,
+}
+
+impl SandboxResponse {
+    /// Stores `state` and renders `lifecycle` and `status` from it.
+    pub(crate) fn set_state(&mut self, state: SandboxStateInput) {
+        self.lifecycle = state.reported_lifecycle();
+        self.status = state.reported_lifecycle();
+        self.state_input = state;
+    }
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
