@@ -40,6 +40,17 @@ pub const DEFAULT_NODE_CONFIG_PATH: &str = "/space/config/nodemgr.toml";
 // Hard-coded so two instances on the same host cannot be configured to use
 // different mutex files and both acquire concurrently.
 const SERVICE_MUTEX_PATH: &str = "/space/run/node-manager/service.mutex";
+/// Streams a client may reset before node-manager accepts them, per
+/// connection, before HTTP/2's rapid-reset guard closes that connection. h2's
+/// default of 20 defends a public listener from peers that open and cancel
+/// streams to load it. Only root and the `space-nodeclients` group can connect
+/// to this socket, and sandbox processes drop supplementary groups before they
+/// run, so here the guard fires only when node-manager falls behind accepting a
+/// trusted client's streams and the client cancels them, for example by timing
+/// them out. Closing the connection then fails every other call on it,
+/// including ones the client cannot replay. The limit stays finite, at hyper's
+/// bound on streams reset locally, so a runaway client is still disconnected.
+const MAX_PENDING_ACCEPT_RESET_STREAMS: usize = 1024;
 const RUNTIME_SUPERVISOR_CONNECT_RETRY_HEALTH_SERVICE: &str = "runtime-supervisor-connect-retry";
 const RUNTIME_SUPERVISOR_ACTIVATOR: &str = "/opt/space/bin/node-manager-runtime-supervisor.sh";
 const RUNTIME_SUPERVISOR_RESTART_REQUIRED: &str = "/space/run/runtime-supervisor/restart-required";
@@ -872,6 +883,7 @@ pub async fn run(
         };
         let server_handle = tokio::spawn(
             pplx_space_common_svc::grpc_server_builder()
+                .http2_max_pending_accept_reset_streams(Some(MAX_PENDING_ACCEPT_RESET_STREAMS))
                 .layer(pplx_space_common_svc::conservative_uds_grpc_rate_limiter_layer(SERVICE_NAME))
                 .layer(pplx_space_common_svc::grpc_trace_layer())
                 .add_service(health_service)
