@@ -195,15 +195,39 @@ impl JobExecutor for SnapshotUploadExecutor {
         // jobs survive it. Persist the durable transfer handles before allowing
         // a teardown-gated caller to release the runtime.
         if payload.job_ids.is_empty() {
-            payload = crate::snapshot_upload::submit_prepared_snapshot(
+            payload = match crate::snapshot_upload::submit_prepared_snapshot(
                 &payload,
                 &self.node_manager,
                 &self.volume_manager_socket,
             )
             .await
-            .map_err(|error| {
-                JobError::retriable(format!("vol-mgr submit prepared snapshot: {error}"))
-            })?;
+            {
+                Ok(submitted) => submitted,
+                Err(crate::snapshot_upload::SubmitPreparedError::Superseded(superseded)) => {
+                    // The synchronous handoff can have staged this artifact's
+                    // transfers while this attempt waited, before the newer
+                    // suspend published. They are still this attempt's.
+                    match persisted_payload(&self.db, &job.job_id)? {
+                        Some(persisted) if !persisted.job_ids.is_empty() => persisted,
+                        _ => {
+                            let error =
+                                JobError::permanent(format!("artifact superseded: {superseded}"));
+                            converge_failed_upload(
+                                &payload,
+                                "artifact_superseded",
+                                error.message(),
+                            )
+                            .await;
+                            return Err(error);
+                        }
+                    }
+                }
+                Err(error) => {
+                    return Err(JobError::retriable(format!(
+                        "vol-mgr submit prepared snapshot: {error}"
+                    )));
+                }
+            };
             persist_submitted_transfer_ids(&self.db, &job.job_id, &payload)?;
         }
 
@@ -591,6 +615,29 @@ pub(crate) fn persist_submitted_transfer_ids(
         )));
     }
     Ok(())
+}
+
+/// The payload `job_id` holds now, while it is pending or running. A handoff
+/// can persist transfer IDs into it after this attempt read it.
+fn persisted_payload(
+    db: &crate::db::SharedConnection,
+    job_id: &JobId,
+) -> Result<Option<SnapshotUploadJobs>, JobError> {
+    let conn = db.lock().map_err(|_| {
+        JobError::permanent(format!(
+            "snapshot-upload database mutex poisoned while reading job {job_id}"
+        ))
+    })?;
+    crate::db::snapshot_upload_jobs::active_job_payload(&conn, job_id, SNAPSHOT_UPLOAD_JOB_KIND)
+        .map_err(|error| {
+            JobError::retriable(format!("read snapshot-upload job {job_id}: {error}"))
+        })?
+        .map(|payload| {
+            serde_json::from_str(&payload).map_err(|error| {
+                JobError::permanent(format!("decode snapshot-upload job {job_id}: {error}"))
+            })
+        })
+        .transpose()
 }
 
 pub(crate) fn prepared_upload_requires_begin(payload: &SnapshotUploadJobs) -> bool {

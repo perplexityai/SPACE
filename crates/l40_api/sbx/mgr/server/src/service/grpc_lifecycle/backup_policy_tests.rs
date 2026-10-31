@@ -398,9 +398,16 @@ fn upload_config(bucket: &str) -> crate::snapshot_upload::SnapshotUploadConfig {
     .unwrap()
 }
 
-/// Write a published artifact directory whose metadata names no artifact
-/// identity, so any identity in the durable intent came from the submission.
-fn write_artifact(dir: &std::path::Path, sandbox_id: &str, files: &[&str]) {
+/// Write a published artifact directory whose metadata names
+/// `local_artifact_id`, as an imported artifact's names the exporter's, or no
+/// artifact identity, so any identity in the durable intent came from the
+/// submission.
+fn write_artifact(
+    dir: &std::path::Path,
+    sandbox_id: &str,
+    files: &[&str],
+    local_artifact_id: Option<LocalArtifactId>,
+) {
     let execution = pplx_space_common_core::types::SnapshotExecutionMetadata::new(
         pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
             std::env::consts::ARCH.parse().unwrap(),
@@ -421,6 +428,7 @@ fn write_artifact(dir: &std::path::Path, sandbox_id: &str, files: &[&str]) {
             "size_bytes": 0,
             "created_at": "2026-10-10T00:00:00Z",
             "source": {"runtime": "fc", "template_id": "seed"},
+            "local_artifact_id": local_artifact_id,
         }))
         .unwrap(),
     )
@@ -448,6 +456,8 @@ async fn durable_artifact_backup_persists_the_submitted_artifact_identity() {
         snapshot_name: Option<&'static str>,
         files: &'static [&'static str],
         metadata: Option<&'static [u8]>,
+        /// The published metadata names another artifact.
+        sidecar_names_another: bool,
         request_bucket: Option<&'static str>,
         default_bucket: Option<&'static str>,
         /// Bucket of the persisted intent; `None` expects no intent at all.
@@ -460,6 +470,7 @@ async fn durable_artifact_backup_persists_the_submitted_artifact_identity() {
         snapshot_name: None,
         files: FULL,
         metadata: None,
+        sidecar_names_another: false,
         request_bucket: Some("request-bucket"),
         default_bucket: Some("default-bucket"),
         persisted_bucket: Some("request-bucket"),
@@ -477,6 +488,11 @@ async fn durable_artifact_backup_persists_the_submitted_artifact_identity() {
             files: &["rootfs.ext4"],
             request_bucket: None,
             persisted_bucket: Some("default-bucket"),
+            ..base
+        },
+        Case {
+            name: "imported artifact whose metadata names the exporter's id",
+            sidecar_names_another: true,
             ..base
         },
         Case {
@@ -508,7 +524,8 @@ async fn durable_artifact_backup_persists_the_submitted_artifact_identity() {
         let sandbox = service.lookup_sandbox(&id).unwrap();
         let root = tempfile::tempdir().unwrap();
         let snapshot_dir = root.path().join("artifact");
-        write_artifact(&snapshot_dir, &id, case.files);
+        let sidecar_artifact_id = case.sidecar_names_another.then(LocalArtifactId::new);
+        write_artifact(&snapshot_dir, &id, case.files, sidecar_artifact_id);
         if let Some(metadata) = case.metadata {
             std::fs::write(
                 snapshot_dir.join(crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME),
@@ -604,6 +621,11 @@ async fn durable_artifact_backup_persists_the_submitted_artifact_identity() {
         assert_eq!(
             payload.meta.local_artifact_id,
             Some(local_artifact_id),
+            "{}",
+            case.name
+        );
+        assert_eq!(
+            payload.sidecar_artifact_id, sidecar_artifact_id,
             "{}",
             case.name
         );
