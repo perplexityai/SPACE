@@ -986,7 +986,7 @@ impl WorkerApi for SimWorkerApiService {
         unimplemented()
     }
 
-    // ── Spaced guest operations: ping/status/wait_ready stub healthy ─────────
+    // ── Spaced guest operations: status/wait_ready stub healthy ──────────────
 
     async fn spaced_get_status(
         &self,
@@ -1616,9 +1616,8 @@ async fn sim_install_activation_policy(
     Ok(())
 }
 
-/// Shared implementation of WakeSandbox used by both `WorkerApi` (public) and
-/// `WorkerApiInternal`. Picks the appropriate WakeTransition based on the
-/// current in-memory state.
+/// Implementation of `WorkerApiInternal.WakeSandbox`. Picks the appropriate
+/// WakeTransition based on the current in-memory state.
 /// `requested_identity` is the reserved identity the control plane passes in
 /// `WakeStartContext.route_identity` when a direct wake hydrates a new
 /// execution. A start or restore prefers it over the record's last identity

@@ -522,8 +522,7 @@ password sessions that have not expired become valid again.
 
 On worker and builder node-api, `DeleteTemplate` and `DeleteTemplateBuild`
 require the trusted policy service-account capability. Template-manager's local
-roles and deletion dependency guards still apply. Pool target counts have no
-capacity-based upper bound yet; operators must budget pool sizes.
+roles and deletion dependency guards still apply.
 
 With Kubernetes authentication disabled, the shared internal token remains the
 operator trust boundary and retains mutation authority. When Kubernetes

@@ -46,7 +46,9 @@ space-admin-cli warm-pool create \
 
 This pins the pool to the template's current `latest` release. Use
 `--content-hash sha256:...` to pick a different release. `--refill-per-tick`
-and `--max-warming-slots` limit how fast the pool fills.
+and `--max-warming-slots` limit how fast the pool fills. SPACE does not check
+`--target-ready-slots` against cluster capacity, so budget pool sizes to fit
+your nodes.
 
 ## Check that it works
 

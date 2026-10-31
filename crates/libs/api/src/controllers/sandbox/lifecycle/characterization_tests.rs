@@ -1357,7 +1357,7 @@ async fn untracked_wake_uses_the_internal_worker_wake() -> TestResult {
     use pplx_space_common_svc::bearer_token::{SpaceBearerToken, space_bearer_metadata};
     use pplx_space_node_api_client::proto::worker_api_internal_server::WorkerApiInternalServer;
 
-    if !crate::test_support::enter_sim_worker_process() {
+    if !crate::test_support::enter_sim_worker_process_with_owned_token_files() {
         return Ok(());
     }
     let db = pg_test_db_with_max_connections(3).await?;

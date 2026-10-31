@@ -8,8 +8,9 @@ import "template/manager/v1/manager.proto";
 import "node/v1/node.proto";
 import "node/api/v1/common.proto";
 
-// WorkerApi is the external API for a SPACE worker node.
-// Exposes full sandbox lifecycle, template management, and network operations.
+// WorkerApi is the external API for a SPACE worker node: sandbox lifecycle
+// (Wake is on WorkerApiInternal), guest operations, sandbox snapshots, template
+// deletion and transfer, and port exposure.
 //
 // Retired in 0.9.0; services cannot reserve names, so do not reuse these:
 // GetSandboxHealth, ListSandboxes, WakeSandbox (WorkerApiInternal keeps its
@@ -113,8 +114,10 @@ service WorkerApi {
   rpc TriggerStateReconciliation(TriggerStateReconciliationRequest) returns (TriggerStateReconciliationResponse);
 }
 
-// WorkerApiInternal is the node-local worker surface for recovery/orchestration
-// RPCs that can carry privileged WakeRequest.start_context.
+// WorkerApiInternal is the worker's control-plane surface, served on the same
+// listener as WorkerApi with its own credential: pool adoption, and the only Wake
+// node-api serves, whose request can carry a privileged start_context or
+// runtime_upgrade.
 service WorkerApiInternal {
   rpc AdoptPoolSandbox(space.sandbox.manager.v1.AdoptPoolSandboxRequest) returns (space.sandbox.manager.v1.AdoptPoolSandboxResponse);
   rpc WakeSandbox(space.sandbox.manager.v1.WakeRequest) returns (space.sandbox.manager.v1.WakeResponse);

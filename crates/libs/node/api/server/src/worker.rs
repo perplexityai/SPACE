@@ -33,15 +33,17 @@ pub struct WorkerApiService {
     shutdown_token: CancellationToken,
 }
 
-/// Reject policy-mutation RPCs from callers node-api did not classify as the
-/// trusted control plane. `SetSandboxNetworkPolicy`, `SetSandboxAutoLifecyclePolicy`,
-/// and a policy-bearing `UpdateTemplateSettings` carry an attacker-controllable
-/// `authority` and `generation`; a data-plane service-account token that reached
-/// the backend with one could pin a node-local or stale-generation policy that
-/// cluster reconciliation can never override (a template policy also propagates to
-/// every running sandbox inheriting it). Absent an authenticated caller (auth
-/// layer disabled, e.g. local dev/tests) the request forwards as before.
-pub(crate) fn require_policy_mutation_authority<T>(request: &Request<T>) -> Result<(), Status> {
+/// Reject policy-bearing requests from callers node-api did not classify as the
+/// trusted control plane: `SetSandboxNetworkPolicy` and
+/// `SetSandboxAutoLifecyclePolicy`, a `CreateSandbox` or `AdoptPoolSandbox` with a
+/// policy override or a nonzero generation, an activation auto-lifecycle policy on
+/// `StartSandbox`, `ResumeSandbox` or the internal Wake, and the internal Wake's
+/// runtime upgrade. Policy requests carry an attacker-controllable `authority` and
+/// `generation`; a data-plane service-account token that reached the backend with
+/// one could pin a node-local or stale-generation policy that cluster
+/// reconciliation can never override. Absent an authenticated caller (auth layer
+/// disabled, e.g. local dev/tests) the request forwards as before.
+fn require_policy_mutation_authority<T>(request: &Request<T>) -> Result<(), Status> {
     check_policy_mutation_authority(
         request
             .extensions()
@@ -1156,8 +1158,6 @@ impl WorkerApi for WorkerApiService {
         pplx_space_common_svc::auth::template::require_template_mutation_authority(&r)?;
         fwd!(self.clients.tmpl(), delete_template_build, r)
     }
-
-    // ── Template pools (template-manager) ────────────────────────────────────
 
     // ── Network (node-manager) ───────────────────────────────────────────────
 

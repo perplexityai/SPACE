@@ -260,7 +260,7 @@ pub enum AuthConfigError {
     )]
     TrustedWaitReadyServiceAccountsMissing,
     #[error(
-        "Kubernetes token auth is enabled for a policy-serving node (worker or builder) but no trusted policy service accounts are configured"
+        "Kubernetes token auth is enabled for a worker or builder node-api but no trusted policy service accounts are configured"
     )]
     TrustedPolicyServiceAccountsMissing,
     #[error("failed to initialize Kubernetes TokenReview client: {0}")]
