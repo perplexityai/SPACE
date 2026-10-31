@@ -1546,6 +1546,42 @@ impl PublicOperationAdmission {
         mut self,
         input: CreatePublicOperation<'_>,
     ) -> Result<CreatePublicOperationResult, PublicOperationStoreError> {
+        if let Some(operation_id) = self.join_active_wake(&input).await? {
+            self.tx.commit().await?;
+            return Ok(CreatePublicOperationResult::Existing(operation_id));
+        }
+        self.create(input).await
+    }
+
+    /// [`Self::create_or_join_active_wake`], except that a wake it creates
+    /// rather than joins goes through [`Self::create_claimed_if_sole_active`].
+    /// A joined wake answers `NotCreated(Existing(..))` and is never claimed,
+    /// so a caller never takes over a system wake an inline claim already
+    /// runs: it is not queued any more, so the caller's wake is created
+    /// behind it, left queued since the sandbox is busy, and completes as
+    /// already done once that wake has placed the sandbox.
+    pub(crate) async fn create_or_join_active_wake_claimed_if_sole_active(
+        mut self,
+        input: CreatePublicOperation<'_>,
+        org_limit: Option<InlineOrgLimit>,
+    ) -> Result<CreateInlinePublicOperationResult, PublicOperationStoreError> {
+        if let Some(operation_id) = self.join_active_wake(&input).await? {
+            self.tx.commit().await?;
+            return Ok(CreateInlinePublicOperationResult::NotCreated(
+                CreatePublicOperationResult::Existing(operation_id),
+            ));
+        }
+        self.create_claimed_if_sole_active(input, org_limit).await
+    }
+
+    /// The wake [`Self::create_or_join_active_wake`] joins for `input`, with
+    /// the caller's key recorded for it in this transaction, which the caller
+    /// commits; `None` when there is none to join and the wake is to be
+    /// created.
+    async fn join_active_wake(
+        &mut self,
+        input: &CreatePublicOperation<'_>,
+    ) -> Result<Option<OperationId>, PublicOperationStoreError> {
         let request = (
             input.kind,
             input.target_id,
@@ -1562,10 +1598,10 @@ impl PublicOperationAdmission {
         let (OperationKind::WakeSandbox, Some(target_id), Some(actor_user_id), Some(idempotency)) =
             request
         else {
-            return self.create(input).await;
+            return Ok(None);
         };
         if !matches!(self.observation, ObservePublicOperationIdempotency::Missing) {
-            return self.create(input).await;
+            return Ok(None);
         }
         lock_active_sandbox_operation(&mut self.tx, input.org_id, input.kind, target_id).await?;
         let Some(joinable) = joinable_active_sandbox_operation(
@@ -1577,7 +1613,7 @@ impl PublicOperationAdmission {
         )
         .await?
         else {
-            return self.create(input).await;
+            return Ok(None);
         };
         if joinable.system {
             let handed_over = sqlx::query_scalar::<_, Uuid>(sql!(
@@ -1593,7 +1629,7 @@ impl PublicOperationAdmission {
             .fetch_optional(&mut *self.tx)
             .await?;
             if handed_over.is_none() {
-                return self.create(input).await;
+                return Ok(None);
             }
         }
         let operation_id = OperationId::from_uuid(joinable.operation_id);
@@ -1614,8 +1650,7 @@ impl PublicOperationAdmission {
             operation_id,
         )
         .await?;
-        self.tx.commit().await?;
-        Ok(CreatePublicOperationResult::Existing(operation_id))
+        Ok(Some(operation_id))
     }
 
     pub async fn finish(self) -> Result<(), PublicOperationStoreError> {

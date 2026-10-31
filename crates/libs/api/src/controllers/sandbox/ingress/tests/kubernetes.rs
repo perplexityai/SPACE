@@ -85,6 +85,7 @@ async fn stored_ingress_access_resumes_paused_execution_before_reporting_ready()
         let backend = StoredAccess {
             pool: db.pool.clone(),
             controller: SandboxController::new(kubernetes(substrate)),
+            inline: None,
         };
         let observed = backend.observe(id).await?;
         if pause_after_observation {
@@ -157,6 +158,7 @@ async fn stored_ingress_access_joins_a_restore_whose_lease_lapsed()
     let backend = StoredAccess {
         pool: db.pool.clone(),
         controller: SandboxController::new(kubernetes(substrate)),
+        inline: None,
     };
     assert!(
         !backend.observe(id).await?.restore_owned,

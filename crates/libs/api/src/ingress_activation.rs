@@ -107,6 +107,7 @@ pub(crate) async fn server(
         activation: crate::controllers::sandbox::ingress_activation(
             state.pool.clone(),
             state.sandbox_controller.clone(),
+            state.inline_lifecycle.clone(),
             tasks,
             shutdown.clone(),
         ),

@@ -49,7 +49,7 @@ use crate::{
         },
         substrate::AdmissionPoolClaim,
     },
-    inline_operations::InlineRefusal,
+    inline_operations::{InlineLifecycle, InlineRefusal},
     middleware::auth::{AuthFederatedOwner, AuthOrg, AuthUser},
     models::{Sandbox, SandboxMetadata as ControllerSandboxMetadata, SandboxMetadataValue},
     public_operations::{
@@ -829,6 +829,7 @@ pub async fn apply_custom_sandbox_action(
     let rollback = rollback_request(action, &body)?;
     enqueue_lifecycle_operation(
         &state.pool,
+        Some(&state.inline_lifecycle),
         org.id,
         actor.id,
         headers,
@@ -849,6 +850,7 @@ pub async fn delete_sandbox(
 ) -> Result<(StatusCode, Json<SandboxOperationResponse>), PublicApiError> {
     enqueue_lifecycle_operation(
         &state.pool,
+        None,
         org.id,
         actor.id,
         headers,
@@ -918,8 +920,17 @@ pub(super) async fn delete_replay_in_owner_scope(
     }
 }
 
+/// Record a lifecycle action. With `inline`, a wake, resume or start that
+/// [`InlineLifecycle`] offers for inline execution, and that admission
+/// claims, runs in this process; anything else is recorded queued for the
+/// dispatcher. The response is the same 202 either way.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the lifecycle action's request-scoped inputs; bundling them only moves the list"
+)]
 async fn enqueue_lifecycle_operation(
     pool: &PgPool,
+    inline: Option<&InlineLifecycle>,
     org_id: OrgId,
     actor_user_id: UserId,
     headers: HeaderMap,
@@ -946,6 +957,13 @@ async fn enqueue_lifecycle_operation(
         ObservePublicOperationIdempotency::Existing(operation_id) => {
             let operation_id = *operation_id;
             admission.finish().await?;
+            if let Some(inline) = inline {
+                inline.refuse_replay(
+                    org_id,
+                    action.operation_kind(),
+                    InlineAdmissionPath::LifecycleAction,
+                );
+            }
             let response = sandbox_operation_response(&store, org_id, operation_id).await?;
             return Ok((StatusCode::ACCEPTED, Json(response)));
         }
@@ -989,10 +1007,27 @@ async fn enqueue_lifecycle_operation(
         idempotency: Some(idempotency),
         traceparent: crate::public_operations::request_traceparent(),
     };
-    let result = if action == SandboxLifecycleAction::Wake {
-        admission.create_or_join_active_wake(input).await?
-    } else {
-        admission.create(input).await?
+    let wake = action == SandboxLifecycleAction::Wake;
+    let offered = inline.and_then(|inline| {
+        inline
+            .offer(org_id, input.kind, InlineAdmissionPath::LifecycleAction)
+            .map(|permit| (inline, permit))
+    });
+    let result = match offered {
+        None if wake => admission.create_or_join_active_wake(input).await?,
+        None => admission.create(input).await?,
+        Some((inline, permit)) => {
+            let recorded = if wake {
+                admission
+                    .create_or_join_active_wake_claimed_if_sole_active(input, inline.org_limit())
+                    .await?
+            } else {
+                admission
+                    .create_claimed_if_sole_active(input, inline.org_limit())
+                    .await?
+            };
+            inline.settle(permit, &store, recorded)
+        }
     };
 
     let response = match result {

@@ -2,7 +2,7 @@ use super::*;
 use crate::{
     SPACE_API_CLIENT_CONCURRENCY_LIMITER_FLAG, SPACE_CLUSTER_API_CLIENT_SIDE_BALANCING_FLAG,
     SPACE_CLUSTER_RATE_LIMITER_FLAG, SPACE_NATIVE_CREATE_POOL_CLAIM_FLAG,
-    SPACE_NATIVE_HIDDEN_OPERATIONS_FLAG,
+    SPACE_NATIVE_HIDDEN_OPERATIONS_FLAG, SPACE_NATIVE_INLINE_OPERATIONS_FLAG,
 };
 
 /// A declaration reports the key it was given and the fallback chosen for it,
@@ -46,8 +46,10 @@ fn a_declaration_carries_its_key_and_its_fallback() {
 /// two that fall back *on* are guardrails whose flag exists only to switch
 /// them off, so an unreachable provider that flipped them to `false` would
 /// silently remove a limiter that the deployment asked for.
-/// The one that falls back *off* is a rollout, where the same unreachable
-/// provider must not enable anything nobody turned on. Flipping any of these
+/// The ones that fall back *off* are rollouts, where the same unreachable
+/// provider must not enable anything nobody turned on. The inline-operations
+/// gate falls back *on* for a different reason: its env master is the
+/// rollout, and the flag only holds organizations back. Flipping any of these
 /// is a deliberate product decision; this test is what makes it impossible to
 /// do by accident while editing a nearby line.
 #[test]
@@ -58,6 +60,7 @@ fn the_shipped_boolean_flags_declare_the_fallbacks_their_features_need() {
         (SPACE_CLUSTER_API_CLIENT_SIDE_BALANCING_FLAG, false),
         (SPACE_NATIVE_CREATE_POOL_CLAIM_FLAG, false),
         (SPACE_NATIVE_HIDDEN_OPERATIONS_FLAG, false),
+        (SPACE_NATIVE_INLINE_OPERATIONS_FLAG, true),
     ] {
         assert_eq!(
             flag.when_unresolved(),
