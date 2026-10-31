@@ -9796,6 +9796,81 @@ fn teardown_suspend_terminal_transitions_close_jobs_atomically() {
 }
 
 #[test]
+fn store_job_failures_are_reported_once_their_transaction_commits() {
+    use super::store_job_failures::StoreJobFailure;
+
+    let conn = test_conn();
+    insert_test_sandbox(
+        &conn,
+        TestSandboxInsert::new("sandbox-1", "sandbox1", SandboxState::Paused),
+    );
+    let old = ExecutionGeneration::new(7).unwrap();
+    let current = ExecutionGeneration::new(8).unwrap();
+    claim_teardown_suspend_operation(&conn, "sandbox-1", old).unwrap();
+    let old_job = active_teardown_suspend_operation(&conn, "sandbox-1")
+        .unwrap()
+        .unwrap()
+        .job_id;
+    let failure = |job_id, error: &str| StoreJobFailure {
+        job_id,
+        kind: TEARDOWN_SUSPEND_JOB_KIND.to_owned(),
+        subject_id: Some("sandbox-1".to_owned()),
+        error: error.to_owned(),
+    };
+
+    let tx = immediate_transaction(&conn).unwrap();
+    teardown_jobs::fail_active(&tx, "sandbox-1", TeardownSuspendFailure::Deleting).unwrap();
+    tx.rollback().unwrap();
+    let tx = immediate_transaction(&conn).unwrap();
+    assert_eq!(tx.commit_taking_failures().unwrap(), []);
+
+    let tx = immediate_transaction(&conn).unwrap();
+    ensure_teardown_suspend_operation(&tx, "sandbox-1", current).unwrap();
+    let current_job = active_teardown_suspend_operation(&tx, "sandbox-1")
+        .unwrap()
+        .unwrap()
+        .job_id;
+    teardown_jobs::fail_active(&tx, "sandbox-1", TeardownSuspendFailure::Deleting).unwrap();
+    assert_eq!(
+        tx.commit_taking_failures().unwrap(),
+        [
+            failure(old_job, TEARDOWN_SUSPEND_SUPERSEDED_REASON),
+            failure(current_job, TeardownSuspendFailure::Deleting.as_str()),
+        ]
+    );
+    let tx = immediate_transaction(&conn).unwrap();
+    assert_eq!(tx.commit_taking_failures().unwrap(), []);
+
+    let cleanup_job = JobId::new();
+    pplx_space_common_jobs::db::insert_job(
+        conn.raw(),
+        pplx_space_common_jobs::db::InsertJob {
+            job_id: &cleanup_job,
+            kind: cleanup_jobs::KIND,
+            payload: "{}",
+            subject_id: Some("sandbox-1"),
+            dedup_key: Some("sandbox-1"),
+            max_attempts: i32::MAX,
+            traceparent: None,
+            priority: Default::default(),
+        },
+    )
+    .unwrap();
+    assert!(pplx_space_common_jobs::db::mark_job_running(conn.raw(), &cleanup_job).unwrap());
+    let tx = immediate_transaction(&conn).unwrap();
+    let outcome = cleanup_jobs::CleanupOutcome::Quarantined("synthetic".to_owned());
+    assert!(cleanup_jobs::finish(&tx, &cleanup_job, &outcome).unwrap());
+    let [cleanup_failure] = tx.commit_taking_failures().unwrap().try_into().unwrap();
+    assert_eq!(
+        (
+            cleanup_failure.kind.as_str(),
+            cleanup_failure.subject_id.as_deref()
+        ),
+        (cleanup_jobs::KIND, Some("sandbox-1"))
+    );
+}
+
+#[test]
 fn teardown_suspend_terminal_failure_is_generation_fenced() {
     let conn = test_conn();
     insert_test_sandbox(

@@ -8,6 +8,8 @@ use std::sync::{Arc, LockResult, Mutex, MutexGuard, PoisonError};
 
 use ref_cast::{RefCastCustom, ref_cast_custom};
 
+use super::store_job_failures::{StoreJobFailure, TransactionFailures, log_committed};
+
 /// A function or method that returns or takes rusqlite values, or that only
 /// `db` calls in production: public with the `test-support` feature, for
 /// sbx-mgr's fixtures and tripwires outside the store, and private to `db`
@@ -238,29 +240,48 @@ impl Connection {
 }
 
 /// A transaction on a [`Connection`], rolled back when dropped uncommitted.
-/// It derefs to the connection, so `db` functions run inside it.
-pub struct Transaction<'c>(rusqlite::Transaction<'c>);
+/// It derefs to the connection, so `db` functions run inside it. Jobs the
+/// store fails permanently inside it are logged once it commits.
+pub struct Transaction<'c> {
+    inner: rusqlite::Transaction<'c>,
+    failures: TransactionFailures,
+}
 
 impl<'c> Transaction<'c> {
     /// `BEGIN IMMEDIATE`: takes the write lock up front.
     pub fn immediate(conn: &'c Connection) -> Result<Self> {
-        Ok(Self(rusqlite::Transaction::new_unchecked(
-            &conn.0,
-            rusqlite::TransactionBehavior::Immediate,
-        )?))
+        Ok(Self {
+            inner: rusqlite::Transaction::new_unchecked(
+                &conn.0,
+                rusqlite::TransactionBehavior::Immediate,
+            )?,
+            failures: TransactionFailures::begin(&conn.0),
+        })
     }
 
     /// `BEGIN DEFERRED`: takes locks as its statements need them.
     pub fn deferred(conn: &'c Connection) -> Result<Self> {
-        Ok(Self(conn.0.unchecked_transaction()?))
+        Ok(Self {
+            inner: conn.0.unchecked_transaction()?,
+            failures: TransactionFailures::begin(&conn.0),
+        })
     }
 
     pub fn commit(self) -> Result<()> {
-        Ok(self.0.commit()?)
+        log_committed(&self.commit_taking_failures()?);
+        Ok(())
+    }
+
+    /// Commits, returning the jobs the store failed permanently inside the
+    /// transaction for the caller to log.
+    pub(super) fn commit_taking_failures(self) -> Result<Vec<StoreJobFailure>> {
+        let Self { inner, failures } = self;
+        inner.commit()?;
+        Ok(failures.take())
     }
 
     pub(super) fn rollback(self) -> Result<()> {
-        Ok(self.0.rollback()?)
+        Ok(self.inner.rollback()?)
     }
 }
 
@@ -268,7 +289,7 @@ impl Deref for Transaction<'_> {
     type Target = Connection;
 
     fn deref(&self) -> &Connection {
-        Connection::view(&self.0)
+        Connection::view(&self.inner)
     }
 }
 

@@ -697,6 +697,9 @@ pub fn fail_cancelling_job(
     Ok(changed == 1)
 }
 
+/// Fail a job permanently, whatever its status. The worker logs the permanent
+/// failures it records; a caller outside the worker must log the failed job
+/// itself, once its write commits.
 pub fn fail_job_permanent(
     conn: &Connection,
     job_id: &JobId,
@@ -728,6 +731,8 @@ pub fn fail_job_retriable_exhausted(
     Ok(())
 }
 
+/// Fail a running job permanently. As for [`fail_job_permanent`], a caller
+/// outside the worker must log the failed job itself, once its write commits.
 pub fn fail_running_job_permanent(
     conn: &Connection,
     job_id: &JobId,
@@ -892,27 +897,27 @@ pub fn cancelling_jobs(conn: &Connection, job_kinds: &[String]) -> rusqlite::Res
         .collect()
 }
 
-/// Return at most `limit` permanently failed jobs (status=failed,
-/// error_kind=permanent), newest first. Callers use [`count_permanent_failures`]
-/// to learn the full total when they need it.
-pub fn list_permanent_failures(conn: &Connection, limit: u32) -> rusqlite::Result<Vec<Job>> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {JOB_SELECT_COLUMNS} FROM jobs
+/// `(kind, failure_reason, count)` for permanently failed rows, ordered by
+/// kind then reason. A `None` reason is a failure recorded without a domain
+/// reason.
+pub fn count_permanent_failures_by_kind_and_reason(
+    conn: &Connection,
+) -> rusqlite::Result<Vec<(String, Option<JobFailureReason>, u64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT kind, failure_reason, COUNT(*) AS n
+         FROM jobs
          WHERE status = 'failed' AND error_kind = 'permanent'
-         ORDER BY completed_at DESC
-         LIMIT ?1"
-    ))?;
-    stmt.query_map(params![limit as i64], map_job)?.collect()
-}
-
-/// Count of permanently failed jobs (status=failed, error_kind=permanent).
-pub fn count_permanent_failures(conn: &Connection) -> rusqlite::Result<u64> {
-    conn.query_row(
-        "SELECT COUNT(*) FROM jobs WHERE status = 'failed' AND error_kind = 'permanent'",
-        [],
-        |row| row.get::<_, i64>(0),
-    )
-    .map(nonnegative_i64_to_u64)
+         GROUP BY kind, failure_reason
+         ORDER BY kind, failure_reason",
+    )?;
+    stmt.query_map([], |row| {
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            nonnegative_i64_to_u64(row.get(2)?),
+        ))
+    })?
+    .collect()
 }
 
 /// Count jobs that have not yet reached a terminal state.
@@ -927,7 +932,7 @@ pub fn count_active_jobs(conn: &Connection) -> rusqlite::Result<u64> {
 
 /// `(kind, status, count)` rows for active jobs, suitable for emitting one
 /// gauge sample per group. Terminal statuses are excluded — `failed` rows are
-/// reported separately via [`count_permanent_failures_by_kind`].
+/// reported separately via [`count_permanent_failures_by_kind_and_reason`].
 pub fn count_active_jobs_by_kind_and_status(
     conn: &Connection,
 ) -> rusqlite::Result<Vec<(String, String, i64)>> {
@@ -951,19 +956,6 @@ pub fn oldest_pending_age_secs_by_kind(conn: &Connection) -> rusqlite::Result<Ve
               - CAST(strftime('%s', MIN(created_at)) AS INTEGER) AS age_secs
          FROM jobs
          WHERE status = 'pending'
-         GROUP BY kind",
-    )?;
-    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect()
-}
-
-/// `(kind, count)` for permanently failed rows per kind. Operators need this
-/// between restarts; the existing summary log line only fires at shutdown.
-pub fn count_permanent_failures_by_kind(conn: &Connection) -> rusqlite::Result<Vec<(String, i64)>> {
-    let mut stmt = conn.prepare(
-        "SELECT kind, COUNT(*) AS n
-         FROM jobs
-         WHERE status = 'failed' AND error_kind = 'permanent'
          GROUP BY kind",
     )?;
     stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
