@@ -194,6 +194,18 @@ fn probe_in_flight_guard_rejects_second_acquire_until_released() {
     assert!(ProbeInFlightGuard::try_acquire(&ACTIVE).is_some());
 }
 
+#[test]
+fn filesystem_usage_reports_a_busy_probe_without_starting_another() {
+    let _in_flight = ProbeInFlightGuard::try_acquire(&FILESYSTEM_USAGE_PROBE_IN_FLIGHT).unwrap();
+
+    let error = read_filesystem_usage(Path::new("/nonexistent")).unwrap_err();
+
+    assert!(
+        matches!(error, BtrfsError::ProbeBusy { .. }),
+        "unexpected error: {error}"
+    );
+}
+
 // The true-on-a-real-subvolume half of `is_subvolume` needs a btrfs
 // mount and is covered by template-manager's
 // `delete_template_build_removes_read_only_btrfs_subvolume_build`
