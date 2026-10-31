@@ -15,13 +15,8 @@
 //! substrate dials the pod's sandbox proxy on that port, where the double
 //! serves the worker APIs.
 
-use std::ffi::OsStr;
 use std::net::Ipv4Addr;
 
-use pplx_space_common_grpc::internal_transport::INSECURE_DEV_ENV;
-use pplx_space_common_svc::bearer_token::{
-    SPACE_NODE_API_INTERNAL_TOKEN_PATH_ENV, SPACE_NODE_API_TOKEN_PATH_ENV,
-};
 use pplx_space_node_api_client::proto::worker_api_internal_server::{
     WorkerApiInternal, WorkerApiInternalServer,
 };
@@ -36,7 +31,9 @@ use tonic::transport::server::TcpIncoming;
 use uuid::Uuid;
 
 use super::*;
-use crate::lifecycle_writer_test_support::{KUBERNETES_NAMESPACE, kubernetes_substrate_with_pods};
+use crate::lifecycle_writer_test_support::{
+    KUBERNETES_NAMESPACE, enter_node_api_client_process, kubernetes_substrate_with_pods,
+};
 
 /// The Kubernetes node the resident's pod runs on.
 const WORKER_NODE: &str = "node-a";
@@ -144,32 +141,6 @@ async fn start_node_api(wake: SucceedingWake) -> TestResult<NodeApi> {
         shutdown,
         _state_dir: state_dir,
     })
-}
-
-/// Re-run the calling test in a child process whose environment lets the
-/// substrate's node-api client reach the double: plaintext internal RPC, and
-/// node-api token paths naming files this parent writes and keeps until the
-/// child exits, so the token reader never falls back to the host's token
-/// files. That client reads both from the process environment, as in
-/// production. Call it first, and return when it returns `false`: the child
-/// has then run the test.
-fn enter_node_api_client_process() -> TestResult<bool> {
-    let tokens = tempfile::tempdir()?;
-    let node_api_token = tokens.path().join("node-api.token");
-    let node_api_internal_token = tokens.path().join("node-api-internal.token");
-    std::fs::write(&node_api_token, "synthetic-internal-token")?;
-    std::fs::write(&node_api_internal_token, "synthetic-internal-control-token")?;
-    Ok(pplx_space_test_env::enter_test_process(&[
-        (INSECURE_DEV_ENV, Some(OsStr::new("true"))),
-        (
-            SPACE_NODE_API_TOKEN_PATH_ENV,
-            Some(node_api_token.as_os_str()),
-        ),
-        (
-            SPACE_NODE_API_INTERNAL_TOKEN_PATH_ENV,
-            Some(node_api_internal_token.as_os_str()),
-        ),
-    ]))
 }
 
 /// A marked `suspended` row resident on the worker node at `pod_ip`, with a
