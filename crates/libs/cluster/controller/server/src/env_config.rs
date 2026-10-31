@@ -35,6 +35,13 @@ impl EnvConfig<'_> {
         }
     }
 
+    /// A switch in the shared `env_flag` vocabulary (`1`, `true`, `yes`, `on`
+    /// or `enabled`, and their negatives, in any case). Unset or any other
+    /// value keeps `default`.
+    pub(crate) fn flag(&self, var: &str, default: bool) -> bool {
+        pplx_space_common_core::env::env_flag(self.0.var(var).ok().as_deref(), default)
+    }
+
     /// A switch whose `true` is the non-destructive mode, such as a dry run.
     /// Unset keeps `default`; a value in the shared `env_flag` vocabulary
     /// wins; any other present value, empty included, turns it on with a
