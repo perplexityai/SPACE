@@ -116,7 +116,10 @@ mod postgres {
         max_concurrent: usize,
     ) -> InlineOperations {
         InlineOperations::new(
-            InlineOperationsConfig { max_concurrent },
+            InlineOperationsConfig {
+                max_concurrent,
+                ..Default::default()
+            },
             tasks,
             drain_signal,
             execution,
@@ -960,6 +963,76 @@ mod postgres {
         script.0.started.notified().await;
         script.open_gate();
         wait_for_state(&fixture, freed.operation_id, "succeeded").await?;
+        assert_eq!(script.calls(), 2);
+        Ok(())
+    }
+
+    /// An organization at its inline limit has a create that wins a slot
+    /// recorded queued, with its slot, even on another process with permits
+    /// free; once its inline create finishes, the next one runs inline.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_create_past_its_organizations_inline_limit_is_queued_for_the_dispatcher()
+    -> TestDbResult<()> {
+        let fixture = AdmissionPoolFixture::new(3).await?;
+        let controller = fixture.controller();
+        let script = ScriptedCreate::gated(Script::Succeed);
+        let process = || {
+            InlineOperations::new(
+                InlineOperationsConfig {
+                    org_limit: std::num::NonZeroU32::new(1),
+                    ..Default::default()
+                },
+                TaskTracker::new(),
+                DrainSignal::new(),
+                OperationExecutionConfig::default(),
+                true,
+            )
+        };
+        let first_process = script.inline_on(Duration::ZERO, process());
+        let second_process = script.inline_on(Duration::ZERO, process());
+        let holding = fixture
+            .create_with(
+                claims(&controller, Some(first_process)),
+                "inline-holds-the-org-limit",
+                fixture.request(),
+            )
+            .await
+            .expect("create is recorded");
+        script.0.started.notified().await;
+
+        let held_back = fixture
+            .create_with(
+                claims(&controller, Some(second_process.clone())),
+                "inline-org-at-limit",
+                fixture.request(),
+            )
+            .await
+            .expect("a create past the org limit is recorded");
+        let row = operation_row(&fixture, held_back.operation_id).await?;
+        assert_eq!((row.state.as_str(), row.attempts), ("queued", 0));
+        assert!(
+            fixture
+                .payload(held_back.operation_id)
+                .await?
+                .pool_claim
+                .is_some(),
+            "it keeps its slot for the dispatcher to adopt"
+        );
+        assert_eq!(script.calls(), 1);
+
+        script.open_gate();
+        wait_for_state(&fixture, holding.operation_id, "succeeded").await?;
+        let room_again = fixture
+            .create_with(
+                claims(&controller, Some(second_process)),
+                "inline-under-the-org-limit",
+                fixture.request(),
+            )
+            .await
+            .expect("create is recorded");
+        script.0.started.notified().await;
+        script.open_gate();
+        wait_for_state(&fixture, room_again.operation_id, "succeeded").await?;
         assert_eq!(script.calls(), 2);
         Ok(())
     }

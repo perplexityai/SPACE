@@ -245,6 +245,10 @@ metric_vocabulary!(
         Draining => "draining",
         /// Every one of the process's inline permits is held.
         Saturated => "saturated",
+        /// Other work for the operation's sandbox is queued or running.
+        Busy => "busy",
+        /// The organization is at `SPACE_NATIVE_INLINE_ORG_LIMIT`.
+        OrgLimit => "org_limit",
         /// An idempotent replay, which records nothing new.
         Replay => "replay",
     }
