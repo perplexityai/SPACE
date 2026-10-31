@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use pplx_space_common_core::host::disk_admission::{
     CacheDiskAdmissionConfig, CacheDiskAdmissionDecision, CacheDiskAdmissionMonitor,
-    CacheDiskAdmissionReason, CacheDiskAdmissionState,
+    CacheDiskAdmissionReason, CacheDiskAdmissionState, CacheDiskRefreshKind,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -28,7 +28,7 @@ impl CacheDiskAdmissionHandle {
     ) -> (Self, Result<(), String>) {
         let handle = Self::new(config);
         let refresh_result = if config.enabled {
-            refresh_cache_disk_admission_once(&handle).await
+            refresh_cache_disk_admission_once(&handle, CacheDiskRefreshKind::Periodic).await
         } else {
             Ok(())
         };
@@ -85,10 +85,11 @@ where
 
 pub async fn refresh_cache_disk_admission_once(
     handle: &CacheDiskAdmissionHandle,
+    kind: CacheDiskRefreshKind,
 ) -> Result<(), String> {
     tokio::task::spawn_blocking({
         let monitor = Arc::clone(&handle.monitor);
-        move || monitor.refresh()
+        move || monitor.refresh(kind)
     })
     .await
     .map_err(|error| format!("disk admission refresh task failed: {error}"))?
@@ -105,7 +106,9 @@ async fn run_cache_disk_admission_refresh_loop<F>(
     F: Fn(&CacheDiskAdmissionHandle) + Send + Sync + 'static,
 {
     loop {
-        if let Err(error) = refresh_cache_disk_admission_once(&handle).await {
+        if let Err(error) =
+            refresh_cache_disk_admission_once(&handle, CacheDiskRefreshKind::Periodic).await
+        {
             tracing::warn!(%error, "cache disk admission refresh failed");
         }
         on_refresh(&handle);
