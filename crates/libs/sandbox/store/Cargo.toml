@@ -21,6 +21,7 @@ uuid = { workspace = true, features = ["v7"] }
 pplx-space-cluster-pool = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["sqlx", "serde"] }
 pplx-space-sandbox-portability = { workspace = true }
+pplx-space-sandbox-routability = { workspace = true }
 pplx-space-sandbox-teardown = { workspace = true }
 
 [dev-dependencies]
