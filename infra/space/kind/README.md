@@ -445,8 +445,10 @@ and names the teardown that switches it.
   inventory is unchanged. On the deployed backend, `SPACE_SMOKE_SUBSTRATE`
   names the deployment's substrate; unset, it filters nothing.
 - **Defects.** A Direct-only defect is tracked by its issue and fails on the
-  Direct lane. Don't quarantine it: a quarantine withholds the scenario on
-  every substrate, the required Kubernetes lane included.
+  Direct lane; its CI job lists it as a known failure
+  ([Direct lane in CI](#direct-lane-in-ci)). Don't quarantine it: a quarantine
+  withholds the scenario on every substrate, the required Kubernetes lane
+  included.
 
 Bring a cluster up in the lane, run the baseline, then the typed suite:
 
@@ -460,8 +462,68 @@ SKIP_BOOTSTRAP=1 bash scripts/tests/smoke-kind-typed.sh all
 The suite needs no `SPACE_SMOKE_SUBSTRATE`: it reads the substrate from the
 bench and checks the exported `SPACE_KIND_SUBSTRATE` against it, as the
 bring-up does under `SKIP_BOOTSTRAP=1`. `first_sandbox.py` needs the
-environment from [the first-sandbox guide](../../../docs/first-sandbox.md). No
-CI job runs the lane.
+environment from [the first-sandbox guide](../../../docs/first-sandbox.md).
+
+### Direct lane in CI
+
+`Kind Direct CI` (`.github/workflows/kind-direct-ci.yml`) runs the lane
+nightly on `main`, on demand (`workflow_dispatch`), and on pull requests that
+change a path in its `paths:` filter: the Direct substrate controller, the
+node-maintenance admin routes, the internal API and cluster-controller servers,
+sandbox-manager, this directory, the root `Tiltfile`,
+`scripts/tests/lib/bootstrap-kind-stack.sh`,
+`scripts/tests/smoke-kind-typed.sh`, `examples/first_sandbox.py`, the suite's
+runner and registry, the known-failures list and the two workflows; the
+nightly run covers everything else. It calls `kind-ci.yml` with
+`substrate: direct`, which runs the usual Rust producer (reusing main's image
+when one has been published for the same Rust inputs) and one `direct_smoke`
+job in place of the six shards: the shards' preparation and handoff, `up.sh`,
+`first_sandbox.py`, then the typed suite on both API surfaces, unsharded, in
+the shards' `otel` telemetry mode. A failure uploads the shards' evidence as
+`kind-node-diagnostics-direct-<attempt>`. No required check depends on it:
+`space-pull-ci` requires only the Kubernetes lane, so a red Direct run does
+not block a merge.
+
+The job sets `SPACE_SMOKE_KNOWN_FAILURES=ci/kind-direct-known-failures.txt`,
+the lane's known failures: one `<scenario id> | <phase> | <reason>` per line.
+Only a runner that sets the variable reads a list. A listed scenario is excused
+only for a fail verdict whose last recorded phase is the listed one. Phases are
+recorded as they end, so a check that runs outside any phase counts as the last
+phase that ended before it. That failure is reported under `KNOWN FAILURES` and
+as a notice, and does not fail the job, even when its cleanup also failed. Any
+other result of a listed scenario (another last phase, an infrastructure error,
+a timeout, a warning) counts as it would unlisted, so it fails the job, as any
+nonzero suite exit does, a warning's 42 included; its `NOT PASSED` entry says it
+was not excused. A listed scenario that passes is reported as an
+`UNEXPECTED PASS` warning, so remove it once its fix lands; any unlisted failure
+fails the job as usual. An entry naming an unregistered scenario, an
+entry without a phase or a reason, or a duplicate fails the run before any
+scenario runs. A unit test checks every entry against the registry on each
+pull request, so a rename, a `substrates=` narrowing or a quarantine updates
+the list in the same change. This is not a quarantine: the scenarios still run
+on every lane, and the Kubernetes lane never reads the list. List a scenario
+here, with the phase it fails in and a plain reason, when it fails only on the
+Direct lane: a Direct defect, or a check that still reads Kubernetes-only
+state. Fix it rather than narrowing the scenario with `substrates=`.
+
+To reproduce the job on a KVM Devbox, start from a cluster with no
+deployment or one already on the Direct substrate:
+
+```bash
+export SPACE_KIND_SUBSTRATE=direct SPACE_KIND_STORAGE_CREDENTIALS=static \
+  SPACE_KIND_TELEMETRY_MODE=otel
+bash infra/space/kind/scripts/up.sh
+SPACE_API_TOKEN="$(curl -fsS -X POST http://localhost:8080/auth/v1/sessions \
+    -H 'content-type: application/json' \
+    -d '{"email":"root@local","password":"password"}' | jq -r .token)" \
+  python3 examples/first_sandbox.py <<<y
+SPACE_SMOKE_SUBSTRATE=direct SKIP_BOOTSTRAP=1 \
+  SPACE_SMOKE_KNOWN_FAILURES=ci/kind-direct-known-failures.txt \
+  bash scripts/tests/smoke-kind-typed.sh all
+```
+
+Leave out `SPACE_SMOKE_KNOWN_FAILURES` to see every listed scenario fail as it
+does on its own. Each scenario that did not pass prints a `rerun:` command.
 
 ## Bring it up
 

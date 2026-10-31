@@ -10,14 +10,22 @@ on:
       rust_build:
         type: string
         default: test-hooks
+      # kubernetes, every caller's default, runs the six smoke shards.
+      # direct, kind-direct-ci.yml's lane, runs one Direct-substrate job in
+      # their place (direct_smoke below) on the same producer.
+      substrate:
+        type: string
+        default: kubernetes
 
 # The caller owns permissions: pull-ci.yml grants contents:read and
 # packages:read and actions:read; main-ci.yml grants packages:write to this call.
 # Actions reads only inspect a producer in this run; never elevate a PR writer.
 
 # Cancel superseded PR validation, but keep every main commit's evidence.
+# The Direct lane runs in a run of its own for the same PR, so its group is
+# its own: sharing one would cancel the required Kubernetes lane.
 concurrency:
-  group: kind-ci-${{ github.event.pull_request.number || github.run_id }}
+  group: kind-ci-${{ inputs.substrate == 'direct' && 'direct-' || '' }}${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 jobs:
@@ -236,7 +244,7 @@ jobs:
           min-versions-to-keep: 20
 
   smoke:
-    if: github.repository == 'perplexityai/SPACE'
+    if: github.repository == 'perplexityai/SPACE' && inputs.substrate != 'direct'
     name: Kind / Firecracker smoke (${{ matrix.shard }}/6)
     permissions:
       actions: read
@@ -271,7 +279,8 @@ jobs:
     runs-on: ubuntu-24.04-16core
     timeout-minutes: 180
     steps:
-      - name: Check out SPACE
+      - &checkout-history
+        name: Check out SPACE
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -283,7 +292,8 @@ jobs:
       # Restart Docker before any Kind/Tilt containers exist.
       - *enable-containerd-store
 
-      - name: Enable KVM access
+      - &enable-kvm
+        name: Enable KVM access
         run: |
           set -euo pipefail
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
@@ -320,7 +330,8 @@ jobs:
 
       - *ghcr-login
 
-      - name: Install Kind smoke prerequisites
+      - &install-smoke-prereqs
+        name: Install Kind smoke prerequisites
         run: |
           set -euo pipefail
           sudo install -d -m 0755 -o "${USER}" -g "$(id -gn)" /home/dev
@@ -338,7 +349,8 @@ jobs:
       # and dmsetup, so they are not general smoke prerequisites: on a Devbox,
       # dmsetup's /usr/sbin is not on the user's PATH and install-prereqs.sh
       # rejected it as absent.
-      - name: Load the host device-mapper targets for BYOK smoke
+      - &load-byok-targets
+        name: Load the host device-mapper targets for BYOK smoke
         run: |
           set -euo pipefail
           source scripts/lib/space-smoke-prereqs.sh
@@ -349,12 +361,14 @@ jobs:
       # publishes each content-addressed tag; until then, or if the pull fails,
       # this builds it from the mirrored base. The bring-up would do the same,
       # but here its cost and source show up as a step of their own.
-      - name: Provide the SPACE Kind node image
+      - &provide-node-image
+        name: Provide the SPACE Kind node image
         run: bash infra/space/kind/scripts/kind-node-image.sh ensure
 
       # Stays on this shard's runner: no cluster or mutable test state crosses
       # jobs. Rust-independent setup now overlaps the shared producer.
-      - name: Prepare Kind while the Rust producer builds
+      - &prepare-kind
+        name: Prepare Kind while the Rust producer builds
         run: bash infra/space/kind/scripts/prepare-cluster.sh
 
       # Tiltfile evaluation installs the selected observability profile before
@@ -365,7 +379,8 @@ jobs:
       # runs first, as it does in the Tiltfile. Inside Tilt the install was
       # bounded by the bring-up's 1800 s initialization timeout; the step keeps
       # that bound, since `ctr images ls` and `kind load` have none of their own.
-      - name: Install the observability profile while the Rust producer builds
+      - &install-observability
+        name: Install the observability profile while the Rust producer builds
         timeout-minutes: 30
         env:
           SPACE_KIND_CLUSTER: space-local
@@ -374,19 +389,22 @@ jobs:
           python3 infra/space/kind/scripts/datadog_backend.py preflight --for-deployment >/dev/null
           bash infra/space/kind/scripts/install-observability.sh
 
-      - name: Wait for this attempt's Rust producer
+      - &wait-producer
+        name: Wait for this attempt's Rust producer
         timeout-minutes: 70
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 infra/space/kind/scripts/rust-artifact-handoff.py wait
 
-      - name: Download this attempt's Rust artifact image
+      - &download-rust-artifacts
+        name: Download this attempt's Rust artifact image
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: kind-rust-${{ github.sha }}-${{ env.SPACE_KIND_RUST_PRODUCER_ATTEMPT }}
           path: ${{ runner.temp }}/kind-rust
 
-      - name: Load and verify the shared Rust artifact image
+      - &load-rust-artifacts
+        name: Load and verify the shared Rust artifact image
         run: python3 infra/space/kind/scripts/rust-artifact-handoff.py load "${RUNNER_TEMP}/kind-rust"
 
       # Where the bring-up after the artifact handoff spends its time, per Tilt
@@ -395,7 +413,8 @@ jobs:
       # which a passing run otherwise keeps none of. It runs in the background
       # through the baseline smoke; the step after the baseline stops it and
       # reports.
-      - name: Record the Kind bring-up timeline
+      - &record-bringup-timeline
+        name: Record the Kind bring-up timeline
         continue-on-error: true
         run: |
           set -euo pipefail
@@ -421,7 +440,8 @@ jobs:
       # recorder and prints the timeline; the next step uploads its raw files.
       # None of the three steps fails the shard: the timeline is evidence, not
       # a check.
-      - name: Report the Kind bring-up timeline
+      - &report-bringup-timeline
+        name: Report the Kind bring-up timeline
         if: always()
         continue-on-error: true
         timeout-minutes: 3
@@ -507,7 +527,8 @@ jobs:
       # apiserver, Tilt, or node must not hold the job until its own deadline and
       # lose the evidence upload. Each command writes its own output, so what
       # finished before a timeout is still uploaded.
-      - name: Collect Kind diagnostics
+      - &collect-kind-diagnostics
+        name: Collect Kind diagnostics
         if: failure()
         timeout-minutes: 5
         run: |
@@ -555,7 +576,8 @@ jobs:
       # (runtime-supervisor, which runs every Firecracker VM, and the node
       # layer) and each node's mount table, with propagation, show what the
       # node itself held.
-      - name: Collect Kind node teardown evidence
+      - &collect-node-evidence
+        name: Collect Kind node teardown evidence
         if: failure()
         timeout-minutes: 8
         run: |
@@ -625,7 +647,8 @@ jobs:
       # and the run's space_* series into the uploaded evidence. The script is
       # bounded in time and size and exits 0; continue-on-error keeps a
       # surprise here from failing the job or skipping the upload.
-      - name: Collect failed-scenario telemetry
+      - &collect-failure-telemetry
+        name: Collect failed-scenario telemetry
         if: failure()
         timeout-minutes: 5
         continue-on-error: true
@@ -640,5 +663,127 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: kind-node-diagnostics-${{ matrix.shard }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kind-node-diagnostics/
+          retention-days: 7
+
+  # The Direct substrate lane ("Direct substrate lane" in
+  # infra/space/kind/README.md): one unsharded job in place of the shards, on
+  # the same producer and the shards' own preparation, handoff and evidence
+  # steps. Only kind-direct-ci.yml selects it, and no required check depends
+  # on that workflow.
+  direct_smoke:
+    if: github.repository == 'perplexityai/SPACE' && inputs.substrate == 'direct'
+    name: Kind / Firecracker smoke (Direct substrate)
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    env:
+      SPACE_CI_IMAGE_MIRROR: ghcr
+      SPACE_KIND_RUST_ARTIFACTS: prebuilt
+      SPACE_KIND_RUST_BUILD: ${{ inputs.rust_build == 'release' && 'release' || '' }}
+      SPACE_KIND_BUILD_CACHE_REPOSITORY: ghcr.io/perplexityai/space-kind-build-cache
+      # The shards' telemetry profile, so both lanes run the same scenarios
+      # and a failure leaves the same telemetry evidence.
+      SPACE_KIND_TELEMETRY_MODE: otel
+      # The lane runs only with static storage credentials: the
+      # credential-manager authority admits a node by its Kubernetes node
+      # registration, which a Direct node does not have.
+      SPACE_KIND_SUBSTRATE: direct
+      SPACE_KIND_STORAGE_CREDENTIALS: static
+    runs-on: ubuntu-24.04-16core
+    timeout-minutes: 180
+    steps:
+      - *checkout-history
+      - *enable-containerd-store
+      - *enable-kvm
+      - *ghcr-login
+      - *install-smoke-prereqs
+      - *load-byok-targets
+      - *provide-node-image
+      - *prepare-kind
+      - *install-observability
+      - *wait-producer
+      - *download-rust-artifacts
+      - *load-rust-artifacts
+      - *record-bringup-timeline
+
+      # Returns once the API and data plane answer and every Direct node is
+      # registered and published.
+      - name: Bring up the Direct substrate lane
+        run: bash infra/space/kind/scripts/up.sh
+
+      # The first-sandbox guide's walkthrough as a user runs it; it asks before
+      # deleting its sandbox, and is answered yes.
+      - name: Create a first sandbox through the public API
+        env:
+          SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE: ${{ runner.temp }}/space-smoke-admin-token
+        run: |
+          set -euo pipefail
+          curl -fsS -X POST http://localhost:8080/auth/v1/sessions \
+            -H 'content-type: application/json' \
+            -d '{"email":"root@local","password":"password"}' \
+            | jq -r '.token // empty' >"${SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE}"
+          chmod 0600 "${SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE}"
+          if [[ ! -s "${SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE}" ]]; then
+            echo "::error::Could not obtain an admin session token from the Kind API"
+            exit 1
+          fi
+          printf 'y\n' | SPACE_API_TOKEN="$(<"${SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE}")" \
+            python3 examples/first_sandbox.py
+
+      - *report-bringup-timeline
+
+      - name: Upload the Kind bring-up timeline
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kind-bringup-timeline-direct-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kind-bringup-timeline/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # The whole inventory the Direct substrate serves, both API surfaces, as
+      # one shard: the suite skips, visibly, what Direct does not serve. A
+      # scenario in ci/kind-direct-known-failures.txt whose fail verdict ends
+      # in its listed phase is reported and does not fail the job; one that
+      # passes is reported as an unexpected pass; any other result counts as
+      # it would unlisted. See "Direct lane in CI" in
+      # infra/space/kind/README.md.
+      - name: Run the typed Kind smoke on the Direct substrate
+        env:
+          SKIP_BOOTSTRAP: "1"
+          SPACE_SMOKE_SUBSTRATE: direct
+          SPACE_SMOKE_KNOWN_FAILURES: ci/kind-direct-known-failures.txt
+          SPACE_M1_GENERATOR_MIRROR: ghcr.io/perplexityai/space-ci-mirror
+          SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE: ${{ runner.temp }}/space-smoke-admin-token
+          SPACE_SMOKE_KIND_COLD_RECEIPTS: ${{ runner.temp }}/space-smoke-cold-receipts
+        run: |
+          set -euo pipefail
+          for tool in aws curl jq; do
+            if ! command -v "${tool}" >/dev/null 2>&1; then
+              echo "::error::The typed Kind smoke needs ${tool} on the runner"
+              exit 1
+            fi
+          done
+          uv_bin="$(bash ci/scripts/ensure-uv.sh)"
+          uv_dir="$(dirname "${uv_bin}")"
+          export PATH="${uv_dir}:${PATH}"
+          install -d -m 0700 "${SPACE_SMOKE_KIND_COLD_RECEIPTS}"
+          # Kept for the failure-telemetry step, which reads the failed
+          # scenarios' sandbox ids from it.
+          bash scripts/tests/smoke-kind-typed.sh all 2>&1 \
+            | tee "${RUNNER_TEMP}/kind-typed-smoke.log"
+
+      - *collect-kind-diagnostics
+      - *collect-node-evidence
+      - *collect-failure-telemetry
+
+      - name: Upload Kind node teardown evidence
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kind-node-diagnostics-direct-${{ github.run_attempt }}
           path: ${{ runner.temp }}/kind-node-diagnostics/
           retention-days: 7

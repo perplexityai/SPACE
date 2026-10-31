@@ -134,8 +134,10 @@ def scenario(
     `substrates` narrows the control-plane substrates the fixture serves
     (`FIXTURE_SUBSTRATES`) for what a substrate does not support by contract,
     such as sandbox pods on Direct. A Direct-only defect is not a narrowing:
-    it is tracked by its issue and fails on the Direct lane. Do not quarantine
-    it either: a quarantine withholds the scenario on every substrate, the
+    it is tracked by its issue and fails on the Direct lane, whose CI job
+    excuses only a fail verdict whose last recorded phase is the one
+    ci/kind-direct-known-failures.txt lists for it. Do not quarantine it
+    either: a quarantine withholds the scenario on every substrate, the
     required Kubernetes lane included. A suite run skips, visibly, the
     scenarios its bench's substrate does not serve: on Kind it reads the
     bench's, and on the deployed backend SPACE_SMOKE_SUBSTRATE names it.
