@@ -75,8 +75,8 @@ import type {
 } from '@/lib/types';
 import { tablePagination } from '@/lib/table-pagination';
 import { useAuth } from '@/lib/auth';
-import { formatAge, sectionData, type DebugSnapshot, type SandboxDebug } from '@/lib/sandbox-debug';
-import { OperationsCard, OrgLink, PlacementCard, ResourcesCard, TimelineCard, UserLink } from './sandbox-insight';
+import { formatAge, sectionData, sectionError, type DebugSnapshot } from '@/lib/sandbox-debug';
+import { OperationsCard, OrgLink, PlacementCard, ResourcesCard, TimelineCard, UserLink, type DebugView } from './sandbox-insight';
 import NetworkPolicyDesigner, {
   compactNetworkPolicyLabel,
   NetworkPolicyDetails,
@@ -396,7 +396,17 @@ function snapshotCodec(type: string): { label: string; color: string } {
 // The public snapshot routes are org-scoped hidden operations; when they are
 // unavailable (another org's sandbox, or not enabled), list the snapshots the
 // admin debug route reports, without rollback.
-function AdminSnapshotsTable({ snapshots, nowMs }: { snapshots: DebugSnapshot[]; nowMs: number }) {
+function AdminSnapshotsTable({
+  snapshots,
+  error,
+  pending,
+  nowMs,
+}: {
+  snapshots: DebugSnapshot[];
+  error: string | null;
+  pending: boolean;
+  nowMs: number;
+}) {
   const { token } = theme.useToken();
   const totalBytes = snapshots.reduce((acc, s) => acc + (s.size_bytes || 0), 0);
   const columns: ColumnsType<DebugSnapshot> = [
@@ -421,7 +431,8 @@ function AdminSnapshotsTable({ snapshots, nowMs }: { snapshots: DebugSnapshot[];
       rowKey="id"
       size="small"
       pagination={tablePagination('snapshots', 10)}
-      locale={{ emptyText: 'No snapshots' }}
+      loading={pending}
+      locale={{ emptyText: error ? 'Could not load snapshots' : 'No snapshots' }}
       footer={() =>
         snapshots.length === 0 ? null : (
           <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, color: token.colorTextSecondary }}>
@@ -437,15 +448,20 @@ function AdminSnapshotsTable({ snapshots, nowMs }: { snapshots: DebugSnapshot[];
 function SnapshotsCard({
   sandboxId,
   foreignOrg,
-  debug,
+  debugView,
+  reloadKey,
   nowMs,
 }: {
   sandboxId: string;
   // The public snapshot routes are scoped to the signed-in user's org.
   foreignOrg: boolean;
-  debug: SandboxDebug | null;
+  debugView: DebugView;
+  // Changes on the page's Refresh and insight interval: a failed listing is
+  // retried then, so one error does not switch the card off for good.
+  reloadKey: number;
   nowMs: number;
 }) {
+  const debug = debugView.debug;
   const { message } = App.useApp();
   const { token } = theme.useToken();
   const [snapshots, setSnapshots] = useState<SnapshotInfo[]>([]);
@@ -454,31 +470,41 @@ function SnapshotsCard({
   const [listingError, setListingError] = useState<string | null>(null);
   const [rollbackOff, setRollbackOff] = useState(false);
 
-  const refresh = () => {
+  const refresh = (background = false) => {
     if (foreignOrg) {
       setSnapshotsOff(true);
       setLoading(false);
       return;
     }
-    setLoading(true);
-    setListingError(null);
+    if (!background) setLoading(true);
     getPublicPage<PublicSnapshot>(`/sandboxes/${sandboxId}/snapshots`)
       .then((items) => {
         setSnapshotsOff(false);
+        setListingError(null);
         setSnapshots(items.map(publicSnapshotToConsoleSnapshot));
       })
       .catch((err: any) => {
         // Either way the admin view below lists the snapshots; only a hidden
         // operation is an expected answer, anything else is reported.
         setSnapshotsOff(true);
-        if (!isHiddenOperationError(err)) {
+        if (isHiddenOperationError(err)) {
+          setListingError(null);
+        } else {
           setListingError(err.message || 'failed to load snapshots');
         }
       })
       .finally(() => setLoading(false));
   };
 
-  useEffect(refresh, [sandboxId, foreignOrg]);
+  useEffect(() => refresh(), [sandboxId, foreignOrg]);
+  const firstReload = useRef(true);
+  useEffect(() => {
+    if (firstReload.current) {
+      firstReload.current = false;
+      return;
+    }
+    refresh(true);
+  }, [reloadKey]);
 
   const handleRollback = async (snapshotName: string) => {
     try {
@@ -529,6 +555,7 @@ function SnapshotsCard({
 
   if (snapshotsOff) {
     const adminSnapshots = sectionData(debug?.snapshots)?.snapshots ?? [];
+    const adminError = debugView.error ?? (debug ? sectionError(debug.snapshots) : null);
     return (
       <Card
         size="small"
@@ -548,10 +575,14 @@ function SnapshotsCard({
             type="warning"
             showIcon
             style={{ marginBottom: 8 }}
-            title={`Could not load snapshots from the snapshot API: ${listingError}. Showing the snapshots the control plane records; rollback is unavailable.`}
+            title={`Could not load snapshots from the snapshot API: ${listingError}. Showing the snapshots the control plane records; rollback is unavailable until it loads.`}
+            action={<Button size="small" onClick={() => refresh()}>Retry</Button>}
           />
         ) : null}
-        <AdminSnapshotsTable snapshots={adminSnapshots} nowMs={nowMs} />
+        {adminError ? (
+          <Alert type="warning" showIcon style={{ marginBottom: 8 }} title={`Could not load the control plane's snapshot records: ${adminError}`} />
+        ) : null}
+        <AdminSnapshotsTable snapshots={adminSnapshots} error={adminError} pending={!debug && !debugView.error} nowMs={nowMs} />
       </Card>
     );
   }
@@ -560,7 +591,7 @@ function SnapshotsCard({
     <Card
       size="small"
       title={<Space><CameraOutlined /> Snapshots</Space>}
-      extra={<Button size="small" icon={<ReloadOutlined />} onClick={refresh}>Refresh</Button>}
+      extra={<Button size="small" icon={<ReloadOutlined />} onClick={() => refresh()}>Refresh</Button>}
     >
       <Table
         columns={[...columns, ...rollbackColumns]}
@@ -1040,9 +1071,17 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
   const [error, setError] = useState<string | null>(null);
   const [editingNetwork, setEditingNetwork] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const [debug, setDebug] = useState<SandboxDebug | null>(null);
+  const [errorStatus, setErrorStatus] = useState<number | null>(null);
+  const [debugView, setDebugView] = useState<DebugView>({ debug: null, error: null });
+  const debug = debugView.debug;
   const [operations, setOperations] = useState<AdminOperationRecord[]>([]);
+  const [operationsMore, setOperationsMore] = useState(false);
+  const [operationsLoaded, setOperationsLoaded] = useState(false);
   const [operationsError, setOperationsError] = useState<string | null>(null);
+  // Bumped on every insight load, so the snapshot card retries with it.
+  const [insightGeneration, setInsightGeneration] = useState(0);
+  // Only the newest insight request may write its answers.
+  const insightRequest = useRef(0);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const sandboxRef = useRef<Sandbox | null>(null);
   sandboxRef.current = sandbox;
@@ -1052,16 +1091,26 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
   // `withDebug` is false when the sandbox row is gone: the debug route has
   // nothing for it, while its operations are still recorded.
   const loadInsight = async (withDebug = true) => {
-    const target = decodeURIComponent(id);
+    const request = ++insightRequest.current;
+    const current = () => request === insightRequest.current;
+    const target = safeDecodeURIComponent(id);
     setNowMs(Date.now());
+    setInsightGeneration((n) => n + 1);
     await Promise.all([
-      withDebug ? getSandboxDebug(target).then(setDebug).catch(() => setDebug(null)) : null,
-      getSandboxOperations(target)
-        .then((ops) => {
+      withDebug
+        ? getSandboxDebug(target)
+            .then((loaded) => { if (current()) setDebugView({ debug: loaded, error: null }); })
+            .catch((err: any) => { if (current()) setDebugView({ debug: null, error: err.message || 'failed to load debug data' }); })
+        : null,
+      getSandboxOperations(target, { orgId: sandboxRef.current?.org_id ?? null })
+        .then(({ operations: ops, more }) => {
+          if (!current()) return;
           setOperations(ops);
+          setOperationsMore(more);
+          setOperationsLoaded(true);
           setOperationsError(null);
         })
-        .catch((err: any) => setOperationsError(err.message || 'failed to load operations')),
+        .catch((err: any) => { if (current()) setOperationsError(err.message || 'failed to load operations'); }),
     ]);
   };
 
@@ -1075,11 +1124,16 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
   const refresh = async (showSpinner = false): Promise<boolean> => {
     if (showSpinner) setLoading(true);
     try {
-      setSandbox(await getConsoleSandbox(safeDecodeURIComponent(id)));
+      const loaded = await getConsoleSandbox(safeDecodeURIComponent(id));
+      // The insight reads that follow use the org before the next render.
+      sandboxRef.current = loaded;
+      setSandbox(loaded);
       setError(null);
+      setErrorStatus(null);
       return true;
     } catch (err: any) {
       setError(err.message || 'Failed to load sandbox');
+      setErrorStatus(typeof err?.status === 'number' ? err.status : null);
       return false;
     } finally {
       if (showSpinner) setLoading(false);
@@ -1105,7 +1159,8 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
       if (typeof document !== 'undefined' && document.hidden) return;
       void refresh(false);
       ticks += 1;
-      if (ticks % 5 === 0 && sandboxRef.current) void loadInsight();
+      // A deleted sandbox has no debug record, but its operations still change.
+      if (ticks % 5 === 0) void loadInsight(!!sandboxRef.current);
     }, 4000);
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
@@ -1196,18 +1251,36 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
   }
 
   if (error && !sandbox) {
+    const gone = errorStatus === 404;
     return (
       <div>
         <Link href="/dashboard/sandboxes"><ArrowLeftOutlined /> Sandboxes</Link>
-        <Title level={3} style={{ marginTop: 8 }}>Sandbox not found</Title>
+        <Title level={3} style={{ marginTop: 8 }}>{gone ? 'Sandbox not found' : 'Could not load the sandbox'}</Title>
         <Paragraph type="danger">{error}</Paragraph>
         <Paragraph><code>{safeDecodeURIComponent(id)}</code></Paragraph>
-        {operations.length ? (
+        {!gone ? (
+          <Button
+            icon={<ReloadOutlined />}
+            onClick={() => { void refresh(true).then((found) => loadInsight(found)); }}
+            style={{ marginBottom: 16 }}
+          >
+            Retry
+          </Button>
+        ) : null}
+        {operations.length || operationsError ? (
           <>
-            <Paragraph type="secondary">
-              The sandbox row is gone, but its lifecycle operations are still recorded:
-            </Paragraph>
-            <OperationsCard operations={operations} error={operationsError} nowMs={nowMs} />
+            {gone && operations.length ? (
+              <Paragraph type="secondary">
+                The sandbox row is gone, but its lifecycle operations are still recorded:
+              </Paragraph>
+            ) : null}
+            <OperationsCard
+              operations={operations}
+              more={operationsMore}
+              error={operationsError}
+              loaded={operationsLoaded}
+              nowMs={nowMs}
+            />
           </>
         ) : null}
       </div>
@@ -1318,22 +1391,29 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
           <ControlButtons sandbox={sandbox} onAction={handleAction} busy={busy} />
         </Card>
 
-        <PlacementCard debug={debug} nowMs={nowMs} />
+        <PlacementCard view={debugView} nowMs={nowMs} />
 
-        <TimelineCard debug={debug} nowMs={nowMs} />
+        <TimelineCard view={debugView} nowMs={nowMs} />
 
-        <OperationsCard operations={operations} error={operationsError} nowMs={nowMs} />
+        <OperationsCard
+          operations={operations}
+          more={operationsMore}
+          error={operationsError}
+          loaded={operationsLoaded}
+          nowMs={nowMs}
+        />
 
         {showSnapshots ? (
           <SnapshotsCard
             sandboxId={sandbox.id}
             foreignOrg={!!authOrg && !!sandbox.org_id && sandbox.org_id !== authOrg.id}
-            debug={debug}
+            debugView={debugView}
+            reloadKey={insightGeneration}
             nowMs={nowMs}
           />
         ) : null}
 
-        <ResourcesCard debug={debug} nowMs={nowMs} />
+        <ResourcesCard view={debugView} nowMs={nowMs} />
 
         <CollapsibleCard
           title="Network policy"

@@ -25,6 +25,7 @@ import {
   sortedTimeline,
   summarizeTimelineDetail,
   type DebugPod,
+  type DebugSection,
   type DebugPort,
   type DebugTimelineEvent,
   type SandboxDebug,
@@ -43,9 +44,24 @@ function When({ value, nowMs }: { value: string | null | undefined; nowMs: numbe
   );
 }
 
-function SectionError({ error }: { error: string | null }) {
-  return error ? <Alert type="warning" showIcon title={`Could not load: ${error}`} style={{ marginBottom: 8 }} /> : null;
+function SectionError({ error, what }: { error: string | null; what?: string }) {
+  return error ? <Alert type="warning" showIcon title={`Could not load${what ? ` ${what}` : ''}: ${error}`} style={{ marginBottom: 8 }} /> : null;
 }
+
+// The debug read as the cards see it. `error` is set when the whole request
+// failed; a single failed section carries its own error. Neither may render
+// as empty data ("none", "No pods recorded").
+export interface DebugView {
+  debug: SandboxDebug | null;
+  error: string | null;
+}
+
+function sectionState(view: DebugView, section: DebugSection<unknown> | undefined) {
+  const error = view.error ?? (view.debug ? sectionError(section) : null);
+  return { error, pending: !view.debug && !view.error };
+}
+
+const unknown = <Text type="secondary">—</Text>;
 
 export function OrgLink({ orgId }: { orgId: string | null }) {
   const [org, setOrg] = useState<Organization | null>(null);
@@ -88,9 +104,14 @@ function nodeLabel(name: string | null, address: string | null, role: string | n
   );
 }
 
-export function PlacementCard({ debug, nowMs }: { debug: SandboxDebug | null; nowMs: number }) {
+export function PlacementCard({ view, nowMs }: { view: DebugView; nowMs: number }) {
+  const { debug } = view;
   const placement = sectionData(debug?.placement);
   const pods = sectionData(debug?.pods) ?? [];
+  const placementState = sectionState(view, debug?.placement);
+  const podsState = sectionState(view, debug?.pods);
+  const node = (name: string | null | undefined, address: string | null | undefined, role: string | null | undefined) =>
+    placement ? nodeLabel(name ?? null, address ?? null, role ?? null) : unknown;
   const podColumns: ColumnsType<DebugPod> = [
     {
       title: 'Pod',
@@ -112,17 +133,18 @@ export function PlacementCard({ debug, nowMs }: { debug: SandboxDebug | null; no
   ];
   return (
     <Card size="small" title={<Space><ClusterOutlined /> Placement and pods</Space>}>
-      <SectionError error={sectionError(debug?.placement) ?? sectionError(debug?.pods)} />
+      <SectionError what="placement" error={placementState.error} />
+      {podsState.error !== placementState.error ? <SectionError what="pods" error={podsState.error} /> : null}
       <Descriptions size="small" column={2} style={{ marginBottom: 12 }}>
         <Descriptions.Item label="Placement">{placement?.state ?? '—'}</Descriptions.Item>
         <Descriptions.Item label="Changed">
           <When value={placement?.changed_at} nowMs={nowMs} />
         </Descriptions.Item>
         <Descriptions.Item label="Active node">
-          {nodeLabel(placement?.active_k8s_node_name ?? null, placement?.active_node_address ?? null, placement?.active_node_role ?? null)}
+          {node(placement?.active_k8s_node_name, placement?.active_node_address, placement?.active_node_role)}
         </Descriptions.Item>
         <Descriptions.Item label="Target node">
-          {nodeLabel(placement?.target_k8s_node_name ?? null, placement?.target_node_address ?? null, placement?.target_node_role ?? null)}
+          {node(placement?.target_k8s_node_name, placement?.target_node_address, placement?.target_node_role)}
         </Descriptions.Item>
       </Descriptions>
       <Table
@@ -132,18 +154,23 @@ export function PlacementCard({ debug, nowMs }: { debug: SandboxDebug | null; no
         size="small"
         pagination={false}
         scroll={{ x: 900 }}
-        locale={{ emptyText: 'No pods recorded' }}
+        loading={podsState.pending}
+        locale={{ emptyText: podsState.error ? 'Could not load pods' : 'No pods recorded' }}
       />
     </Card>
   );
 }
 
-export function ResourcesCard({ debug, nowMs }: { debug: SandboxDebug | null; nowMs: number }) {
+export function ResourcesCard({ view, nowMs }: { view: DebugView; nowMs: number }) {
+  const { debug } = view;
   const resources = sectionData(debug?.resources);
   const ports = sectionData(debug?.ports) ?? [];
+  const resourcesState = sectionState(view, debug?.resources);
+  const portsState = sectionState(view, debug?.ports);
   const observed = resources?.observed ?? null;
+  // "template default" and "none" are answers only when the section loaded.
   const shape = (value: number | null | undefined, unit: string) =>
-    value === null || value === undefined ? <Text type="secondary">template default</Text> : `${value}${unit}`;
+    !resources ? unknown : value === null || value === undefined ? <Text type="secondary">template default</Text> : `${value}${unit}`;
   // Only variable names: values can hold credentials.
   const envKeys = Object.keys(resources?.env ?? {}).sort();
   const metadata = Object.entries(resources?.metadata ?? {});
@@ -160,7 +187,8 @@ export function ResourcesCard({ debug, nowMs }: { debug: SandboxDebug | null; no
   ];
   return (
     <Card size="small" title={<Space><ProfileOutlined /> Resources and runtime</Space>}>
-      <SectionError error={sectionError(debug?.resources)} />
+      <SectionError what="resources" error={resourcesState.error} />
+      {portsState.error !== resourcesState.error ? <SectionError what="ports" error={portsState.error} /> : null}
       <Descriptions size="small" column={3}>
         <Descriptions.Item label="vCPU">{shape(resources?.vcpu, '')}</Descriptions.Item>
         <Descriptions.Item label="Memory">{shape(resources?.memory_mib, ' MiB')}</Descriptions.Item>
@@ -173,12 +201,12 @@ export function ResourcesCard({ debug, nowMs }: { debug: SandboxDebug | null; no
         </Descriptions.Item>
         <Descriptions.Item label="Missed node reports">{observed ? observed.missing_publish_count : '—'}</Descriptions.Item>
         <Descriptions.Item label="Environment" span={3}>
-          {envKeys.length ? (
+          {!resources ? unknown : envKeys.length ? (
             <Space size={4} wrap>{envKeys.map((key) => <Tag key={key}>{key}</Tag>)}</Space>
           ) : <Text type="secondary">none</Text>}
         </Descriptions.Item>
         <Descriptions.Item label="Metadata" span={3}>
-          {metadata.length ? (
+          {!resources ? unknown : metadata.length ? (
             <Space size={4} wrap>
               {metadata.map(([key, value]) => (
                 <Tag key={key}>{`${key}=${formatMetadataValue(value)}`}</Tag>
@@ -193,7 +221,8 @@ export function ResourcesCard({ debug, nowMs }: { debug: SandboxDebug | null; no
         rowKey={(port) => `${port.protocol}:${port.guest_port}`}
         size="small"
         pagination={false}
-        locale={{ emptyText: 'No exposed ports' }}
+        loading={portsState.pending}
+        locale={{ emptyText: portsState.error ? 'Could not load ports' : 'No exposed ports' }}
         style={{ marginTop: 8 }}
       />
     </Card>
@@ -208,8 +237,10 @@ const TIMELINE_COLORS: Record<string, string> = {
   snapshot_failed: 'red',
 };
 
-export function TimelineCard({ debug, nowMs }: { debug: SandboxDebug | null; nowMs: number }) {
+export function TimelineCard({ view, nowMs }: { view: DebugView; nowMs: number }) {
+  const { debug } = view;
   const events = sortedTimeline(sectionData(debug?.timeline) ?? []);
+  const timelineState = sectionState(view, debug?.timeline);
   const columns: ColumnsType<DebugTimelineEvent> = [
     { title: 'When', dataIndex: 'at', width: 120, render: (v: string) => <When value={v} nowMs={nowMs} /> },
     { title: 'Event', dataIndex: 'kind', width: 190, render: (v: string) => <Tag color={TIMELINE_COLORS[v] ?? 'default'}>{v}</Tag> },
@@ -217,14 +248,15 @@ export function TimelineCard({ debug, nowMs }: { debug: SandboxDebug | null; now
   ];
   return (
     <Card size="small" title={<Space><HistoryOutlined /> Timeline</Space>}>
-      <SectionError error={sectionError(debug?.timeline)} />
+      <SectionError what="the timeline" error={timelineState.error} />
       <Table
         columns={columns}
         dataSource={events}
         rowKey={(event, index) => `${event.at}:${event.kind}:${index}`}
         size="small"
         pagination={tablePagination('events', 10)}
-        locale={{ emptyText: 'No events recorded' }}
+        loading={timelineState.pending}
+        locale={{ emptyText: timelineState.error ? 'Could not load the timeline' : 'No events recorded' }}
       />
     </Card>
   );
@@ -246,16 +278,31 @@ function operationError(op: AdminOperationRecord): string | null {
 
 export function OperationsCard({
   operations,
+  more,
   error,
+  loaded,
   nowMs,
 }: {
   operations: AdminOperationRecord[];
+  // More than the newest `operations.length` are recorded.
+  more: boolean;
   error: string | null;
+  loaded: boolean;
   nowMs: number;
 }) {
   const columns: ColumnsType<AdminOperationRecord> = [
     { title: 'Requested', dataIndex: 'created_at', width: 110, render: (v: string) => <When value={v} nowMs={nowMs} /> },
-    { title: 'Operation', dataIndex: 'kind', width: 170, render: (v: string) => <code>{v}</code> },
+    {
+      title: 'Operation',
+      dataIndex: 'kind',
+      width: 170,
+      render: (v: string, op) =>
+        op.target_id && !op.target_id.startsWith('sbx_') ? (
+          <Tooltip title="Recorded under this sandbox's bare UUID: a fork names its source sandbox that way.">
+            <code>{v}</code>
+          </Tooltip>
+        ) : <code>{v}</code>,
+    },
     { title: 'State', dataIndex: 'state', width: 100, render: (v: string) => <Tag color={OPERATION_COLORS[v] ?? 'default'}>{v}</Tag> },
     { title: 'Via', dataIndex: 'api_product', width: 80, render: (v: string | null) => v || '—' },
     {
@@ -276,7 +323,16 @@ export function OperationsCard({
     },
   ];
   return (
-    <Card size="small" title={<Space><DatabaseOutlined /> Operations</Space>}>
+    <Card
+      size="small"
+      title={<Space><DatabaseOutlined /> Operations</Space>}
+      extra={
+        <Text type="secondary" style={{ fontSize: 12 }}>
+          {more ? `Newest ${operations.length} shown; older ones exist. ` : ''}
+          Operations are removed 7 days after they were requested.
+        </Text>
+      }
+    >
       {error ? <Alert type="warning" showIcon title={`Could not load operations: ${error}`} style={{ marginBottom: 8 }} /> : null}
       <Table
         columns={columns}
@@ -285,7 +341,8 @@ export function OperationsCard({
         size="small"
         pagination={tablePagination('operations', 10)}
         scroll={{ x: 1000 }}
-        locale={{ emptyText: 'No operations recorded' }}
+        loading={!loaded && !error}
+        locale={{ emptyText: error ? 'Could not load operations' : 'No operations recorded' }}
       />
     </Card>
   );
