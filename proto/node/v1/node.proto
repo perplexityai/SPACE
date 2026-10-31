@@ -4,6 +4,13 @@ package space.node.v1;
 import "execution/v1/execution.proto";
 
 service NodeManager {
+  // Request ACPI shutdown of the fenced execution; acknowledgement is not proof of exit.
+  rpc RequestGuestShutdown(RequestGuestShutdownRequest) returns (RequestGuestShutdownResponse);
+  // Probe a guest TCP port inside the assigned namespace; no caller-supplied address.
+  rpc ProbeGuestService(ProbeGuestServiceRequest) returns (ProbeGuestServiceResponse);
+  // Operator-only bounded serial or TCP stream, closed when its execution fence is lost.
+  rpc OpenGuestChannel(stream OpenGuestChannelRequest) returns (stream OpenGuestChannelResponse);
+
   // Publish the concrete runtime releases, state formats, and guest components
   // installed on this node. Compatibility remains runtime-driver-owned.
   rpc GetExecutionInventory(GetExecutionInventoryRequest)
@@ -1407,3 +1414,33 @@ message RestoreVmStateRequest {
   DriveRateLimit rootfs_rate_limit = 5;
 }
 message RestoreVmStateResponse {}
+
+
+// All guest channels derive endpoints from the execution-owned lease.
+message RequestGuestShutdownRequest {
+  string sandbox_id = 1;
+  ExecutionFence execution_fence = 2;
+}
+message RequestGuestShutdownResponse {}
+message ProbeGuestServiceRequest {
+  string sandbox_id = 1;
+  ExecutionFence execution_fence = 2;
+  uint32 port = 3;
+}
+message ProbeGuestServiceResponse { bool reachable = 1; }
+message GuestSerialEndpoint {}
+message GuestChannelSelector {
+  string sandbox_id = 1;
+  ExecutionFence execution_fence = 2;
+  oneof endpoint {
+    GuestSerialEndpoint serial = 3;
+    uint32 guest_tcp_port = 4;
+  }
+}
+message OpenGuestChannelRequest {
+  oneof frame {
+    GuestChannelSelector selector = 1;
+    bytes data = 2;
+  }
+}
+message OpenGuestChannelResponse { bytes data = 1; }

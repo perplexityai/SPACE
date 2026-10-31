@@ -51,7 +51,9 @@ fn startup(allowed: &str, default: &str) -> ExecutionPolicy {
 fn unverified_external_copies_are_not_usable_bindings() {
     let e0 = compiled("e0");
     let candidate = compiled("fc-1.17.0-linux-6.18.44");
-    let kernel = candidate.kernel();
+    let kernel = candidate
+        .kernel()
+        .expect("the Firecracker fixture has a kernel");
     let inventory = RuntimeInventory {
         runtimes: vec![external_runtime("1.17.0", "12.0.0")],
         components: vec![kernel_installation(

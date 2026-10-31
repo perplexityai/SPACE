@@ -14,6 +14,7 @@ use pplx_space_node_mgr_client::proto::{
 
 const FACET_SANDBOX_DESIRED_STATE: &str = "sandbox-desired-state";
 
+mod guest_channel;
 #[cfg(test)]
 mod tests;
 
@@ -129,6 +130,8 @@ struct Cli {
 
 #[derive(clap::Subcommand)]
 enum Commands {
+    /// Connect to an execution-fenced guest TCP port or serial console (operator only).
+    GuestChannel(guest_channel::Args),
     /// Resolve and verify an execution environment on this node; JSON output.
     Environment {
         #[arg(long)]
@@ -311,6 +314,9 @@ async fn run(cli: Cli) -> Result<(), String> {
         })?;
 
     match cli.command {
+        Commands::GuestChannel(args) => guest_channel::run(&mut client, args)
+            .await
+            .map_err(|error| error.to_string())?,
         Commands::Environment { reference } => {
             let response = client
                 .resolve_execution_environment(

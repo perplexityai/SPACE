@@ -1768,6 +1768,14 @@ pub(crate) fn validate_restore_metadata_identity(
     target_sandbox_id: &str,
     expected_source_sandbox_id: &str,
 ) -> Result<(), RestoreError> {
+    if let Some(metadata) = meta.execution.as_ref() {
+        // Snapshot transport does not carry non-legacy image semantics.
+        pplx_space_node_runtime_core::boot::GuestProfile::resolve(
+            metadata.execution(),
+            Default::default(),
+        )
+        .map_err(|error| RestoreError::Other(error.to_string()))?;
+    }
     let expected_identity = if meta.artifact_origin == Some(ArtifactOrigin::Fork) {
         target_sandbox_id
     } else {

@@ -95,6 +95,7 @@ fn insert_paused_pool_member(conn: &crate::db::Connection, sandbox_id: SandboxId
     crate::db::insert_sandbox(
         conn,
         crate::db::InsertSandboxParams {
+            guest_image: Default::default(),
             id: &id,
             uuid8: &SandboxRuntimeLabel::from_sandbox_id(sandbox_id),
             state: SandboxState::Paused,
@@ -124,7 +125,7 @@ fn insert_paused_pool_member(conn: &crate::db::Connection, sandbox_id: SandboxId
             slot: 3,
             guest_cid: 33,
             pid: std::process::id(),
-            spaced_host_pid: 10_001,
+            spaced_host_pid: Some(10_001),
             netgtw_pid: 10_002,
             vsock_uds_path: &format!("{scratch}/v.sock"),
             api_socket_path: &format!("{scratch}/api.sock"),
