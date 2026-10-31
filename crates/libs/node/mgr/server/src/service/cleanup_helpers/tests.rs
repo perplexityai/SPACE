@@ -2,7 +2,7 @@ use super::{
     CLEANUP_QUIESCENCE_TIMEOUT, stderr_has_missing_path, stderr_indicates_not_subvolume,
     wait_for_cleanup_quiescence_with,
 };
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::time::Duration;
 
 #[test]
@@ -65,6 +65,177 @@ fn incomplete_device_setup_is_discovered_without_a_cow_marker() {
     let unreadable = root.path().join("unreadable");
     let error = super::host_device_stack_exists(&unreadable, &mapper_dir, &cache, id).unwrap_err();
     assert_names_path(&error, &unreadable);
+}
+
+#[test]
+fn device_scan_rescans_attributes_of_devices_being_removed() {
+    #[derive(Clone, Copy, PartialEq)]
+    enum BetweenPasses {
+        Stays,
+        Disappears,
+        /// Another device takes the same name, as when one is created and
+        /// removed in a loop.
+        Replaced,
+    }
+    struct Case {
+        name: &'static str,
+        device: &'static str,
+        value: String,
+        /// Reads answering `errno` before the attribute reads `value`.
+        failures: usize,
+        errno: i32,
+        between_passes: BetweenPasses,
+        owned_mapper_node: bool,
+        /// Another device starts failing after the first pass and keeps
+        /// failing, as during a mass delete.
+        later_removal: bool,
+        /// `None`: the scan fails, naming the attribute.
+        expected: Option<bool>,
+        expected_pauses: usize,
+    }
+    let id = "018f03b0-1832-7000-8000-000000000001";
+    let unrelated = || Case {
+        name: "unrelated dm device removed mid-scan",
+        device: "dm-3",
+        value: "sbxroot-another".into(),
+        failures: 1,
+        errno: libc::EINVAL,
+        between_passes: BetweenPasses::Disappears,
+        owned_mapper_node: false,
+        later_removal: false,
+        expected: Some(false),
+        expected_pauses: 1,
+    };
+    let cases = [
+        Case {
+            name: "unrelated loop device detached mid-scan",
+            device: "loop4",
+            value: "/unrelated/backing.img".into(),
+            errno: libc::ENODEV,
+            ..unrelated()
+        },
+        Case {
+            name: "no device being removed",
+            failures: 0,
+            expected_pauses: 0,
+            ..unrelated()
+        },
+        Case {
+            name: "another removal starting after the first pass",
+            later_removal: true,
+            ..unrelated()
+        },
+        Case {
+            name: "name reused by successive removals",
+            failures: usize::MAX,
+            between_passes: BetweenPasses::Replaced,
+            ..unrelated()
+        },
+        Case {
+            name: "same device failing on every pass",
+            failures: usize::MAX,
+            between_passes: BetweenPasses::Stays,
+            expected: None,
+            expected_pauses: super::SYS_BLOCK_RESCAN_DELAYS.len(),
+            ..unrelated()
+        },
+        Case {
+            name: "own dm device that answers on a rescan",
+            value: format!("sbxroot-{id}-cow"),
+            errno: libc::ENODEV,
+            between_passes: BetweenPasses::Stays,
+            expected: Some(true),
+            ..unrelated()
+        },
+        Case {
+            name: "own mapper node beside an unrelated removal",
+            owned_mapper_node: true,
+            expected: Some(true),
+            ..unrelated()
+        },
+        unrelated(),
+    ];
+    for case in cases {
+        let root = tempfile::tempdir().unwrap();
+        let sys_block = root.path().join("sys-block");
+        let mapper_dir = root.path().join("mapper");
+        std::fs::create_dir_all(&mapper_dir).unwrap();
+        if case.owned_mapper_node {
+            std::os::unix::fs::symlink("../dm-0", mapper_dir.join(format!("sbxroot-{id}")))
+                .unwrap();
+        }
+        let device = sys_block.join(case.device);
+        let probe = if case.device.starts_with("loop") {
+            "loop/backing_file"
+        } else {
+            "dm/name"
+        };
+        let plant = |device: &std::path::Path| {
+            let attribute = device.join(probe);
+            std::fs::create_dir_all(attribute.parent().unwrap()).unwrap();
+            std::fs::write(attribute, format!("{}\n", case.value)).unwrap();
+        };
+        plant(&device);
+        let attribute = device.join(probe);
+        let later = sys_block.join("dm-9");
+        let reads = Cell::new(0);
+        let pauses = RefCell::new(Vec::new());
+        let result = super::host_device_stack_exists_with(
+            &sys_block,
+            &mapper_dir,
+            &root.path().join("cache"),
+            id,
+            |path| {
+                if path == attribute && reads.replace(reads.get() + 1) < case.failures {
+                    return Err(std::io::Error::from_raw_os_error(case.errno));
+                }
+                if path.starts_with(&later) {
+                    return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+                }
+                std::fs::read_to_string(path)
+            },
+            |delay| {
+                pauses.borrow_mut().push(delay);
+                if case.later_removal {
+                    plant(&later);
+                }
+                match case.between_passes {
+                    BetweenPasses::Stays => {}
+                    BetweenPasses::Disappears => {
+                        if device.exists() {
+                            std::fs::remove_dir_all(&device).unwrap();
+                        }
+                    }
+                    BetweenPasses::Replaced => {
+                        // Build the successor before removing the device so
+                        // that it cannot reuse the device's inode.
+                        let successor = sys_block.join("successor");
+                        plant(&successor);
+                        std::fs::remove_dir_all(&device).unwrap();
+                        std::fs::rename(&successor, &device).unwrap();
+                    }
+                }
+            },
+        );
+        match case.expected {
+            Some(expected) => assert_eq!(result.unwrap(), expected, "{}", case.name),
+            None => {
+                assert_names_path(&result.unwrap_err(), &attribute);
+                assert_eq!(
+                    reads.get(),
+                    super::SYS_BLOCK_RESCAN_DELAYS.len() + 1,
+                    "{}",
+                    case.name
+                );
+            }
+        }
+        assert_eq!(
+            pauses.into_inner(),
+            super::SYS_BLOCK_RESCAN_DELAYS[..case.expected_pauses],
+            "{}",
+            case.name
+        );
+    }
 }
 
 /// Device inventory errors must name the path that failed, which is usually

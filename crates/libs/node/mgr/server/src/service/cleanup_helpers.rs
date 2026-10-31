@@ -1500,8 +1500,11 @@ fn teardown_encrypted_volumes_with(
 }
 
 /// Backing files, kernel devices and stale mapper nodes all retain teardown
-/// obligations. Unreadable inventory is never absence. Errors name the
-/// inventory path that failed, which is usually not the sandbox's own.
+/// obligations. Unreadable inventory is never absence, except an attribute
+/// read that `device_disappearing` classifies as a device being removed: that
+/// entry is skipped on the scans where it fails, and is an error only if the
+/// same entry fails that way on every scan. Errors name the inventory path
+/// that failed, which is usually not the sandbox's own.
 fn device_teardown_needed(instance_dir: &Path) -> std::io::Result<bool> {
     let entries = match std::fs::read_dir(instance_dir) {
         Ok(entries) => Some(entries),
@@ -1542,6 +1545,19 @@ fn device_teardown_needed(instance_dir: &Path) -> std::io::Result<bool> {
     Ok(false)
 }
 
+/// Pauses between rescans of /sys/block while devices are being removed. A
+/// dm device answers EINVAL for its whole removal. The pauses total 1.55 s,
+/// meant to outlast one dm removal; an entry that is still being removed
+/// after that fails the scan, as before.
+#[cfg(any(target_os = "linux", test))]
+const SYS_BLOCK_RESCAN_DELAYS: [Duration; 5] = [
+    Duration::from_millis(50),
+    Duration::from_millis(100),
+    Duration::from_millis(200),
+    Duration::from_millis(400),
+    Duration::from_millis(800),
+];
+
 #[cfg(any(target_os = "linux", test))]
 fn host_device_stack_exists(
     sys_block: &Path,
@@ -1549,35 +1565,108 @@ fn host_device_stack_exists(
     cache_root: &Path,
     sandbox_id: &str,
 ) -> std::io::Result<bool> {
+    host_device_stack_exists_with(
+        sys_block,
+        mapper_dir,
+        cache_root,
+        sandbox_id,
+        |path| std::fs::read_to_string(path),
+        std::thread::sleep,
+    )
+}
+
+/// A device being removed keeps its sysfs entry briefly after its attributes
+/// stop answering: dm returns EINVAL once a mapped device is freeing or
+/// deleting, and sysfs returns ENODEV for an attribute removed while it is
+/// being read. On a shared node this is usually another sandbox's device
+/// mid-teardown.
+#[cfg(any(target_os = "linux", test))]
+fn device_disappearing(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENODEV))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn host_device_stack_exists_with(
+    sys_block: &Path,
+    mapper_dir: &Path,
+    cache_root: &Path,
+    sandbox_id: &str,
+    mut read_attribute: impl FnMut(&Path) -> std::io::Result<String>,
+    mut pause: impl FnMut(Duration),
+) -> std::io::Result<bool> {
     let cache_roots = sandbox_backing_roots(cache_root, sandbox_id).map_err(|error| {
         std::io::Error::new(
             error.kind(),
             format!("resolve {}: {error}", cache_root.display()),
         )
     })?;
-    for entry in std::fs::read_dir(sys_block).map_err(read_error(sys_block))? {
-        let entry = entry.map_err(read_error(sys_block))?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        let probe = if name.starts_with("loop") {
-            "loop/backing_file"
-        } else if name.starts_with("dm-") {
-            "dm/name"
-        } else {
-            continue;
-        };
-        let path = entry.path().join(probe);
-        let value = match std::fs::read_to_string(&path) {
-            Ok(value) => value,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(read_error(&path)(error)),
-        };
-        let value = value.trim();
-        if (name.starts_with("loop") && backing_belongs_to_sandbox(value, &cache_roots))
-            || mapper_belongs_to_sandbox(value, sandbox_id)
-        {
-            return Ok(true);
+    // Skip a disappearing entry and rescan: by then it is gone or readable.
+    // Only an entry that fails on every pass is an error. A new device can
+    // reuse a removed one's name, so an entry is identified by its sysfs inode
+    // too, which each device gets anew. Owned dm devices also leave
+    // /dev/mapper nodes, checked below as a backstop.
+    let mut unresolved: Option<Vec<(PathBuf, u64, std::io::Error)>> = None;
+    for delay in std::iter::once(None).chain(SYS_BLOCK_RESCAN_DELAYS.map(Some)) {
+        if let Some(delay) = delay {
+            pause(delay);
         }
+        let mut disappearing = Vec::new();
+        for entry in std::fs::read_dir(sys_block).map_err(read_error(sys_block))? {
+            let entry = entry.map_err(read_error(sys_block))?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let probe = if name.starts_with("loop") {
+                "loop/backing_file"
+            } else if name.starts_with("dm-") {
+                "dm/name"
+            } else {
+                continue;
+            };
+            let path = entry.path().join(probe);
+            let value = match read_attribute(&path) {
+                Ok(value) => value,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) if device_disappearing(&error) => {
+                    disappearing.push((path, std::os::unix::fs::DirEntryExt::ino(&entry), error));
+                    continue;
+                }
+                Err(error) => return Err(read_error(&path)(error)),
+            };
+            let value = value.trim();
+            if (name.starts_with("loop") && backing_belongs_to_sandbox(value, &cache_roots))
+                || mapper_belongs_to_sandbox(value, sandbox_id)
+            {
+                return Ok(true);
+            }
+        }
+        // Cleanup holds the sandbox's device-stack lock, so none of the
+        // sandbox's own devices can appear mid-scan: an entry that starts
+        // failing after the first pass needs no rescan.
+        let still: Vec<_> = match unresolved.take() {
+            None => disappearing,
+            Some(previous) => disappearing
+                .into_iter()
+                .filter(|(path, ino, _)| {
+                    previous
+                        .iter()
+                        .any(|(seen, seen_ino, _)| (seen, seen_ino) == (path, ino))
+                })
+                .collect(),
+        };
+        if still.is_empty() {
+            break;
+        }
+        unresolved = Some(still);
+    }
+    if let Some((path, _, error)) = unresolved.into_iter().flatten().next() {
+        let error = read_error(&path)(error);
+        return Err(std::io::Error::new(
+            error.kind(),
+            format!(
+                "{error}; still unreadable after {} scans",
+                SYS_BLOCK_RESCAN_DELAYS.len() + 1
+            ),
+        ));
     }
     let nodes = match std::fs::read_dir(mapper_dir) {
         Ok(nodes) => nodes,
