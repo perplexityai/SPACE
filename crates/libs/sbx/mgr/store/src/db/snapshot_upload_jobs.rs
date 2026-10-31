@@ -1,7 +1,7 @@
 //! `jobs` rows of the snapshot-upload pipeline, and the backup markers its
 //! completed jobs prove.
 
-use crate::db::{Connection, Result};
+use crate::db::{Connection, OptionalExtension, Result};
 use pplx_space_common_core::types::{JobId, LocalArtifactId};
 use rusqlite::params;
 
@@ -40,6 +40,17 @@ pub fn replace_active_job_payload(
          WHERE job_id = ?2 AND kind = ?3 AND status IN ('pending', 'running')",
         params![payload, job_id, kind],
     )
+}
+
+/// A pending or running job's payload, or `None` once it is neither.
+pub fn active_job_payload(conn: &Connection, job_id: &JobId, kind: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT payload FROM jobs
+         WHERE job_id = ?1 AND kind = ?2 AND status IN ('pending', 'running')",
+        params![job_id, kind],
+        |row| row.get(0),
+    )
+    .optional()
 }
 
 /// Set a pending or running snapshot-upload job's recorded failure scope,
