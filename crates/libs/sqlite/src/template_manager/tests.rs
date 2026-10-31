@@ -4,9 +4,22 @@ use super::*;
 
 static BUNDLED: Migrator = sqlx::migrate!("../../../db/template-manager");
 static COMMON: Migrator = sqlx::migrate!("../../../db/common");
-/// The catalog of a release that bundles the retired migration.
+/// The catalog of a release that bundles the retired migration together with
+/// this catalog's later migrations.
 static PARTITIONED: LazyLock<Migrator> = LazyLock::new(|| {
     let mut migrations = BUNDLED.migrations.to_vec();
+    migrations.push(retired_migration());
+    Migrator::with_migrations(migrations)
+});
+/// The catalog of the release that recorded the retired migration: the
+/// baseline and that migration only.
+static HISTORICAL: LazyLock<Migrator> = LazyLock::new(|| {
+    let mut migrations = BUNDLED
+        .migrations
+        .iter()
+        .filter(|migration| migration.version == crate::baselines::PUBLIC_SQLITE_BASELINE)
+        .cloned()
+        .collect::<Vec<_>>();
     migrations.push(retired_migration());
     Migrator::with_migrations(migrations)
 });
@@ -103,6 +116,17 @@ fn history(conn: &Connection) -> Vec<i64> {
         .unwrap()
 }
 
+/// The versions that migrating with `service` records.
+fn bundled_versions(service: &Migrator) -> Vec<i64> {
+    let mut versions = service
+        .iter()
+        .filter(|migration| migration.migration_type.is_up_migration())
+        .map(|migration| migration.version)
+        .collect::<Vec<_>>();
+    versions.sort_unstable();
+    versions
+}
+
 async fn fresh_schema(service: &Migrator) -> Vec<(String, String)> {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("template-manager.db");
@@ -130,7 +154,7 @@ async fn a_bundled_schema_is_left_untouched() {
 
     let conn = Connection::open(&path).unwrap();
     assert_eq!(rows(&conn), before);
-    assert_eq!(history(&conn), [crate::baselines::PUBLIC_SQLITE_BASELINE]);
+    assert_eq!(history(&conn), bundled_versions(&BUNDLED));
     assert_eq!(schema(&conn), fresh_schema(&BUNDLED).await);
 }
 
@@ -146,21 +170,9 @@ async fn a_legacy_only_partitioned_database_reverses_and_reapplies() {
 
     // Rolling back, forward again, then back once more is image-only each way.
     for (service, expected, versions) in [
-        (
-            &BUNDLED,
-            &bundled,
-            vec![crate::baselines::PUBLIC_SQLITE_BASELINE],
-        ),
-        (
-            &*PARTITIONED,
-            &partitioned,
-            vec![crate::baselines::PUBLIC_SQLITE_BASELINE, VERSION],
-        ),
-        (
-            &BUNDLED,
-            &bundled,
-            vec![crate::baselines::PUBLIC_SQLITE_BASELINE],
-        ),
+        (&BUNDLED, &bundled, bundled_versions(&BUNDLED)),
+        (&*PARTITIONED, &partitioned, bundled_versions(&PARTITIONED)),
+        (&BUNDLED, &bundled, bundled_versions(&BUNDLED)),
     ] {
         migrate(&path, service).await.unwrap();
 
@@ -169,6 +181,27 @@ async fn a_legacy_only_partitioned_database_reverses_and_reapplies() {
         assert_eq!(history(&conn), versions);
         assert_eq!(&schema(&conn), expected);
     }
+}
+
+#[tokio::test]
+async fn a_database_from_the_partitioned_release_reverses_then_applies_later_migrations() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("template-manager.db");
+    migrate(&path, &HISTORICAL).await.unwrap();
+    let conn = Connection::open(&path).unwrap();
+    seed_legacy(&conn);
+    assert_eq!(
+        history(&conn),
+        [crate::baselines::PUBLIC_SQLITE_BASELINE, VERSION]
+    );
+    let seeded = rows(&conn);
+
+    migrate(&path, &BUNDLED).await.unwrap();
+
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(rows(&conn), seeded);
+    assert_eq!(history(&conn), bundled_versions(&BUNDLED));
+    assert_eq!(schema(&conn), fresh_schema(&BUNDLED).await);
 }
 
 #[tokio::test]
@@ -194,10 +227,7 @@ async fn a_row_outside_the_legacy_partition_refuses_reversal() {
         );
         let conn = Connection::open(&path).unwrap();
         assert_eq!((rows(&conn), schema(&conn)), before);
-        assert_eq!(
-            history(&conn),
-            [crate::baselines::PUBLIC_SQLITE_BASELINE, VERSION]
-        );
+        assert_eq!(history(&conn), bundled_versions(&PARTITIONED));
     }
 }
 
@@ -217,7 +247,7 @@ async fn orphaned_children_and_finished_stamp_jobs_do_not_block_reversal() {
 
         let conn = Connection::open(&path).unwrap();
         assert_eq!(rows(&conn), seeded, "{statement}");
-        assert_eq!(history(&conn), [crate::baselines::PUBLIC_SQLITE_BASELINE]);
+        assert_eq!(history(&conn), bundled_versions(&BUNDLED));
     }
 }
 
