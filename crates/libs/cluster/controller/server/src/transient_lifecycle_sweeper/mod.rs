@@ -136,7 +136,7 @@
 //! whose pre-restore snapshot proves a revert safe, is listed whatever its
 //! leases say. Its probe still decides the action, and only the revert to
 //! `suspended` honors the deadline; the fail and converge CASes still apply
-//! the check. See `restoring_episode::restoring_episode_overdue`.
+//! the check. See `pplx_space_sandbox_store::sweeper::restoring_episode_overdue`.
 //!
 //! Of these lifecycles only `creating` and `restoring` are ever written to
 //! the row today: the start and resume paths keep the row's old lifecycle
@@ -702,7 +702,9 @@ pub(crate) const DEFAULT_COMMAND_READY_PENDING_PROBE_TIMEOUT: Duration = Duratio
 pub(crate) const DEFAULT_COMMAND_READY_PENDING_TERMINAL_AGE_SECS: u64 = 3600;
 /// Minimum time since the last placement change before a provably-
 /// unrestorable `restoring` row (no source node, no eligible snapshot, no
-/// in-flight upload — see `store::unrestorable_restoring_guards`) is failed.
+/// in-flight upload — see
+/// `pplx_space_sandbox_store::sweeper::unrestorable_restoring_guards`) is
+/// failed.
 /// The predicate itself is the primary guard; this window is belt-and-braces
 /// against enqueue latency and unmodeled transients, so it only needs to
 /// comfortably exceed suspend→backup-enqueue time (seconds).
@@ -800,7 +802,7 @@ pub struct ReconcilerConfig {
     /// default [`DEFAULT_RESTORING_EPISODE_DEADLINE_SECS`], `0` turns it off).
     /// Measured from `lifecycle_changed_at`, which re-drives don't move, and
     /// effective only past the `restoring` age too. See
-    /// `restoring_episode::restoring_episode_overdue`.
+    /// `pplx_space_sandbox_store::sweeper::restoring_episode_overdue`.
     pub restoring_episode_deadline: Option<PositiveDuration>,
 }
 
@@ -1216,8 +1218,9 @@ pub trait SweepSink: Send + Sync + 'static {
     /// `placement_changed_at`, **not** `lifecycle_changed_at`: restore claims
     /// preserve the latter as the source-selection boundary, so it is not an
     /// activity clock; legacy rows may also carry prior lifecycle-clock
-    /// refreshes. See `store::unrestorable_restoring_guards` for the full
-    /// predicate and the deliberate absence of a lease guard.
+    /// refreshes. See
+    /// `pplx_space_sandbox_store::sweeper::unrestorable_restoring_guards` for
+    /// the full predicate and the deliberate absence of a lease guard.
     fn list_unrestorable_restoring(
         &self,
         min_placement_age: PositiveDuration,

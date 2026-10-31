@@ -2609,18 +2609,20 @@ mod episode_deadline;
 mod postgres_backed {
 
     use super::super::store::{
-        AgedTransientRow, HEAL_COMMAND_READY_PENDING_SQL, LIST_COMMAND_READY_PENDING_SQL,
-        LIST_FAILED_ACTIVE_EXECUTIONS_SQL, NOTE_FAILED_CLEANUP_ATTEMPT_SQL,
-        REAP_COMMAND_READY_PENDING_SQL, REPAIR_FAILED_ACTIVE_EXECUTION_SQL,
-        converge_restoring_query, fail_candidate_query, fail_unrestorable_restoring_query,
+        AgedTransientRow, LIST_COMMAND_READY_PENDING_SQL, LIST_FAILED_ACTIVE_EXECUTIONS_SQL,
+        NOTE_FAILED_CLEANUP_ATTEMPT_SQL, REPAIR_FAILED_ACTIVE_EXECUTION_SQL, fail_candidate_query,
         failed_active_execution_scope, list_aged_transient_query,
-        list_unrestorable_restoring_query, revert_to_suspended_query,
-        undo_revert_to_suspended_query,
+        list_unrestorable_restoring_query,
     };
     use super::*;
     use pplx_space_common_core::types::SandboxLifecycle;
     use pplx_space_common_core::types::{NodeId, SandboxId, SnapshotId, SubstrateKind};
     use pplx_space_db_test_fixtures::try_pg_test_db;
+    use pplx_space_sandbox_store::sweeper::{
+        HEAL_COMMAND_READY_PENDING_SQL, REAP_COMMAND_READY_PENDING_SQL, converge_restoring_query,
+        fail_unrestorable_restoring_query, revert_to_suspended_query,
+        undo_revert_to_suspended_query,
+    };
     use sqlx::PgPool;
 
     use pplx_space_test_env::TestResult;
