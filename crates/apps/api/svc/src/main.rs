@@ -1,3 +1,4 @@
+// CI measurement only (Rust leaf change). Never merged.
 use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
