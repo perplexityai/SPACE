@@ -33,8 +33,13 @@ export async function getPublicSandbox(id: string): Promise<Sandbox> {
 }
 
 // The newest `limit` sandboxes across every org; the admin list has no cursor.
-export async function getConsoleSandboxes(limit: number = DEFAULT_LIST_LIMIT): Promise<Sandbox[]> {
-  const sandboxes = await adminApi.get<Sandbox[]>(`/v1/sandboxes?limit=${limit}`);
+export async function getConsoleSandboxes(
+  limit: number = DEFAULT_LIST_LIMIT,
+  orgId: string | null = null,
+): Promise<Sandbox[]> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (orgId) params.set('org_id', orgId);
+  const sandboxes = await adminApi.get<Sandbox[]>(`/v1/sandboxes?${params}`);
   return sandboxes.map(adminSandboxToConsoleSandbox);
 }
 

@@ -82,7 +82,9 @@ type NodeFilter = 'any' | 'assigned' | 'unassigned';
 
 const VALID_AGE_WINDOWS: readonly AgeWindow[] = ['1h', '24h', '7d', '30d', '90d', '1y', 'all'];
 const VALID_NODE_FILTERS: readonly NodeFilter[] = ['any', 'assigned', 'unassigned'];
-const DEFAULT_AGE_WINDOW: AgeWindow = '24h';
+// No age limit by default: long-running sandboxes are the ones support
+// cases tend to be about.
+const DEFAULT_AGE_WINDOW: AgeWindow = 'all';
 const DEFAULT_NODE_FILTER: NodeFilter = 'any';
 
 const parseAgeParam = (raw: string | null): AgeWindow =>
@@ -635,6 +637,9 @@ function SandboxesPage() {
   const [ageWindow, setAgeWindow] = useState<AgeWindow>(() => parseAgeParam(searchParams.get('age')));
   const [listLimit, setListLimit] = useState(() => parseListLimit(searchParams.get('limit')));
   const listLimitRef = useRef(listLimit);
+  // Applied by the admin API (`org_id`), so the newest rows are that org's.
+  const [orgFilter, setOrgFilter] = useState<string | null>(() => searchParams.get('org'));
+  const orgFilterRef = useRef(orgFilter);
   // A full identifier that matches no loaded row is looked up directly, so a
   // sandbox outside the newest `listLimit` can still be found.
   const [lookup, setLookup] = useState<
@@ -649,10 +654,11 @@ function SandboxesPage() {
     if (nodeFilter !== DEFAULT_NODE_FILTER) params.set('node', nodeFilter);
     if (ageWindow !== DEFAULT_AGE_WINDOW) params.set('age', ageWindow);
     if (listLimit !== DEFAULT_LIST_LIMIT) params.set('limit', String(listLimit));
+    if (orgFilter) params.set('org', orgFilter);
     const qs = params.toString();
     const next = qs ? `${pathname}?${qs}` : pathname;
     window.history.replaceState(null, '', next);
-  }, [idFilter, templateFilter, statusFilter, nodeFilter, ageWindow, listLimit, pathname]);
+  }, [idFilter, templateFilter, statusFilter, nodeFilter, ageWindow, listLimit, orgFilter, pathname]);
 
   const startRefreshCooldown = () => {
     refreshCooldownRef.current = true;
@@ -680,7 +686,7 @@ function SandboxesPage() {
   const refresh = async ({ showLoading = true, reconcile = false }: { showLoading?: boolean; reconcile?: boolean } = {}) => {
     if (showLoading) setLoading(true);
     try {
-      const data = await getConsoleSandboxes(listLimitRef.current);
+      const data = await getConsoleSandboxes(listLimitRef.current, orgFilterRef.current);
       data.sort((a, b) => parseUptime(b.uptime) - parseUptime(a.uptime) || a.id.localeCompare(b.id));
       setSandboxes(data);
       markViewRefreshed(SANDBOXES_VIEW_REFRESH_KEY);
@@ -1036,6 +1042,14 @@ function SandboxesPage() {
     refreshAndReport();
   };
 
+  const changeOrgFilter = (value: string | null) => {
+    orgFilterRef.current = value;
+    setOrgFilter(value);
+    refreshAndReport();
+  };
+
+  const orgNames = useMemo(() => new Map(orgs.map((org) => [org.id, org.name])), [orgs]);
+
   const templateFilterOptions = useMemo(() => {
     const set = new Set<string>();
     for (const s of sandboxes) {
@@ -1052,7 +1066,10 @@ function SandboxesPage() {
     setTemplateFilter([]);
     setStatusFilter([]);
     setNodeFilter('any');
-    setAgeWindow('24h');
+    setAgeWindow(DEFAULT_AGE_WINDOW);
+    // The org filter is applied by the API: clear it the way the selector
+    // does, so the next load (and every poll) asks for all orgs again.
+    if (orgFilterRef.current) changeOrgFilter(null);
   };
 
   const filtersActive =
@@ -1060,7 +1077,8 @@ function SandboxesPage() {
     templateFilter.length > 0 ||
     statusFilter.length > 0 ||
     nodeFilter !== 'any' ||
-    ageWindow !== '24h';
+    ageWindow !== DEFAULT_AGE_WINDOW ||
+    !!orgFilter;
 
   const columns: ColumnsType<Sandbox> = [
     {
@@ -1167,6 +1185,13 @@ function SandboxesPage() {
       title: 'Activity',
       width: 116,
       render: (_, record) => activityTimeCell(record, nowMs),
+    },
+    {
+      title: 'Org',
+      dataIndex: 'org_id',
+      width: 130,
+      ellipsis: true,
+      render: (orgId: string | null) => (orgId ? <Link href={`/dashboard/orgs/${orgId}`}>{orgNames.get(orgId) ?? orgId}</Link> : '—'),
     },
     { title: 'User', dataIndex: 'user', width: 95, ellipsis: true, render: (v: string) => v || '—' },
     {
@@ -1332,6 +1357,16 @@ function SandboxesPage() {
             onChange={(value) => setAgeWindow(value as AgeWindow)}
             options={AGE_WINDOW_OPTIONS.map((opt) => ({ value: opt.value, label: opt.label }))}
             style={{ width: 150 }}
+          />
+          <Select
+            size="small"
+            allowClear
+            placeholder="Org: any"
+            value={orgFilter ?? undefined}
+            onChange={(value) => changeOrgFilter(value ?? null)}
+            options={orgs.map((org) => ({ value: org.id, label: org.name }))}
+            style={{ width: 170 }}
+            aria-label="Organization"
           />
           <Select
             size="small"
