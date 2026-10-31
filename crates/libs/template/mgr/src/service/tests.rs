@@ -1219,6 +1219,76 @@ fn local_lookup_rejects_stored_traversal_hash_before_path_lookup() {
     assert_eq!(error.code(), tonic::Code::InvalidArgument);
 }
 
+/// Characterization of template-manager's local lookup (`resolve_template`):
+/// the ready build whose stored hash equals the requested string when a hash
+/// is given, otherwise the newest ready build by `build_date`, whatever the
+/// tag. Base-snapshot reconciliation reaches the no-hash rule with tag
+/// `latest` and a name-only GetTemplate with no tag, so there `latest` names
+/// the newest build on this node, not the release the control plane tagged. A
+/// GetTemplate with an explicit tag or a caller org resolves through ClusterApi
+/// first and then looks up that exact hash. The newest ready build is neither
+/// first nor last by insertion or hash; a newer build being evicted is
+/// skipped.
+#[test]
+fn local_template_resolution_characterization() {
+    let conn = crate::db::test_conn();
+    let template = "resolver-fixture";
+    let hex = |c: char| c.to_string().repeat(64);
+    let sha = |c| format!("sha256:{}", hex(c));
+    let blake = |c| format!("blake3:{}", hex(c));
+    for (content_hash, build_date, state) in [
+        (sha('a'), "2026-10-26T00:00:00Z", "ready"),
+        (sha('e'), "2026-10-30T23:00:00Z", "ready"),
+        (blake('c'), "2026-10-28T00:00:00Z", "ready"),
+        (sha('d'), "2026-10-25T00:00:00Z", "ready"),
+        (sha('f'), "2026-10-24T00:00:00Z", "ready"),
+        (sha('7'), "2026-10-31T00:00:00Z", "deleting"),
+    ] {
+        crate::db::upsert_build(
+            &conn,
+            &crate::db::BuildUpsert {
+                name: template,
+                content_hash: &content_hash,
+                build_date,
+                manifest_json: "{}",
+                runtime: RUNTIME_FIRECRACKER_ALIAS,
+                arch: "x86_64",
+                artifact_size_bytes: 0,
+                state,
+            },
+        )
+        .unwrap();
+    }
+
+    let cases = [
+        // The control plane's `latest` holder is `sha256:dd…`.
+        (template, String::new(), "latest", Ok(sha('e'))),
+        (template, String::new(), "", Ok(sha('e'))),
+        (template, sha('a'), "latest", Ok(sha('a'))),
+        // Exact string match only; ClusterApi by-hash finds `sha256:aa…`.
+        (template, hex('a'), "", Err(tonic::Code::NotFound)),
+        (template, blake('c'), "", Ok(blake('c'))),
+        (template, sha('7'), "", Err(tonic::Code::NotFound)),
+        // A missed hash does not fall back to the newest build.
+        (template, sha('8'), "", Err(tonic::Code::NotFound)),
+        (
+            "resolver-fixture-absent",
+            String::new(),
+            "latest",
+            Err(tonic::Code::NotFound),
+        ),
+    ];
+    for (name, content_hash, tag, expected) in cases {
+        let actual = TemplateManagerService::resolve_template(&conn, name, &content_hash, tag)
+            .map(|(resolved_name, hash)| {
+                assert_eq!(resolved_name, name);
+                hash
+            })
+            .map_err(|status| status.code());
+        assert_eq!(actual, expected, "{name}@{content_hash:?} tag={tag:?}");
+    }
+}
+
 struct CachedBaseFixture {
     root: tempfile::TempDir,
     service: TemplateManagerService,

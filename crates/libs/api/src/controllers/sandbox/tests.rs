@@ -967,6 +967,222 @@ mod template_release_resolution_postgres_tests {
         );
         Ok(())
     }
+
+    /// Characterization of sandbox-create release resolution (tag with
+    /// `latest` fallback, digest stored as given or with `sha256:` stripped)
+    /// over the shared resolver world. A bare-hex request cannot reach this
+    /// resolver: `TemplateReference` rejects `name@<hex>` without an algorithm.
+    #[tokio::test(flavor = "current_thread")]
+    async fn sandbox_create_release_resolution_characterization() -> TestResult {
+        use crate::controllers::test_fixtures::{
+            RESOLVER_OTHER_ORG as OTHER, RESOLVER_OWNER_ORG as OWNER, hex, seed_resolver_world,
+        };
+        let db = pg_test_db().await?;
+        let w = seed_resolver_world(&db.pool).await?;
+        let (fc, ch) = (RuntimeKind::Firecracker, RuntimeKind::CloudHypervisor);
+        let sha = |c| format!("sha256:{}", hex(c));
+        let blake = |c| format!("blake3:{}", hex(c));
+        let hit = |id, hash: String| Some((id, hash));
+
+        let cases = [
+            // The digest path answers the requested canonical form, not the stored one.
+            (
+                format!("resolver-fixture@{}", sha('a')),
+                fc,
+                OTHER,
+                hit(w.bare, sha('a')),
+            ),
+            (
+                format!("resolver-fixture@{}", sha('b')),
+                fc,
+                OTHER,
+                hit(w.prefixed, sha('b')),
+            ),
+            (
+                format!("resolver-fixture@{}", blake('c')),
+                fc,
+                OTHER,
+                hit(w.blake3, blake('c')),
+            ),
+            (format!("resolver-fixture@{}", blake('a')), fc, OTHER, None),
+            (format!("resolver-fixture@{}", sha('c')), fc, OTHER, None),
+            // Both forms stored: the row stored in the requested form wins over
+            // the newer bare row with the larger id, and over the older bare
+            // row with the smaller id.
+            (
+                format!("resolver-fixture@{}", sha('9')),
+                fc,
+                OTHER,
+                hit(w.dual_prefixed, sha('9')),
+            ),
+            (
+                format!("resolver-fixture@{}", sha('8')),
+                fc,
+                OTHER,
+                hit(w.late_prefixed, sha('8')),
+            ),
+            // `latest` moved from `newest_created` to `latest_holder`.
+            (
+                "resolver-fixture:latest".into(),
+                fc,
+                OTHER,
+                hit(w.latest_holder, sha('d')),
+            ),
+            (
+                "resolver-fixture".into(),
+                fc,
+                OTHER,
+                hit(w.latest_holder, sha('d')),
+            ),
+            // The tag path answers the stored (here bare) form.
+            (
+                "resolver-fixture:legacy".into(),
+                fc,
+                OTHER,
+                hit(w.bare, hex('a')),
+            ),
+            // Unknown tag falls back to `latest`; build base does not.
+            (
+                "resolver-fixture:missing".into(),
+                fc,
+                OTHER,
+                hit(w.latest_holder, sha('d')),
+            ),
+            ("resolver-fixture:latest".into(), ch, OTHER, None),
+            ("resolver-fixture:missing".into(), ch, OTHER, None),
+            (format!("resolver-fixture@{}", sha('b')), ch, OTHER, None),
+            // No `latest`: not found. The pool config upsert picks the newest by
+            // created_at.
+            ("resolver-fixture-untagged:latest".into(), fc, OTHER, None),
+            ("resolver-fixture-untagged:missing".into(), fc, OTHER, None),
+            // A template being deleted resolves nothing; the pool config upsert,
+            // which never reads `templates`, still answers its `latest`.
+            ("resolver-fixture-deleting:latest".into(), fc, OTHER, None),
+            (
+                format!("resolver-fixture-deleting@{}", sha('7')),
+                fc,
+                OTHER,
+                None,
+            ),
+            (
+                "resolver-fixture-private:latest".into(),
+                fc,
+                OWNER,
+                hit(w.private, sha('f')),
+            ),
+            ("resolver-fixture-private:latest".into(), fc, OTHER, None),
+            (
+                format!("resolver-fixture-private@{}", sha('f')),
+                fc,
+                OTHER,
+                None,
+            ),
+        ];
+        for (reference, runtime, caller, expected) in cases {
+            let resolved = resolve_template_release(
+                &db.pool,
+                &reference.parse()?,
+                runtime,
+                OrgId::from_uuid(caller),
+            )
+            .await;
+            let actual = match resolved {
+                Ok(release) => Some(release),
+                Err(error) if error.status() == axum::http::StatusCode::NOT_FOUND => None,
+                Err(error) => return Err(error.into()),
+            };
+            assert_eq!(
+                actual, expected,
+                "{reference} runtime={runtime:?} caller={caller}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Characterization of build-base resolution (`resolve_base`): tag or full
+    /// digest, Firecracker only, no `latest` fallback, answer parsed into a
+    /// canonical `ContentHash`. Its runtime is fixed, so no runtime cases.
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_base_release_resolution_characterization() -> TestResult {
+        use crate::controllers::test_fixtures::{
+            RESOLVER_OTHER_ORG as OTHER, RESOLVER_OWNER_ORG as OWNER, hex, seed_resolver_world,
+        };
+        use crate::template_releases_store::{ResolveBaseError, resolve_base};
+        let db = pg_test_db().await?;
+        seed_resolver_world(&db.pool).await?;
+        let sha = |c| format!("sha256:{}", hex(c));
+        let blake = |c| format!("blake3:{}", hex(c));
+
+        let cases: [(String, Uuid, Result<String, &str>); 14] = [
+            (
+                format!("resolver-fixture@{}", sha('a')),
+                OTHER,
+                Ok(sha('a')),
+            ),
+            (
+                format!("resolver-fixture@{}", sha('b')),
+                OTHER,
+                Ok(sha('b')),
+            ),
+            (
+                format!("resolver-fixture@{}", blake('c')),
+                OTHER,
+                Ok(blake('c')),
+            ),
+            (
+                format!("resolver-fixture@{}", blake('a')),
+                OTHER,
+                Err("not_found"),
+            ),
+            (
+                format!("resolver-fixture@{}", sha('c')),
+                OTHER,
+                Err("not_found"),
+            ),
+            ("resolver-fixture:latest".into(), OTHER, Ok(sha('d'))),
+            // The stored bare form comes back canonicalized.
+            ("resolver-fixture:legacy".into(), OTHER, Ok(sha('a'))),
+            // No fallback; sandbox create answers `latest` here.
+            ("resolver-fixture:missing".into(), OTHER, Err("not_found")),
+            (
+                "resolver-fixture@sha256:aaaaaaaaaaaa".into(),
+                OTHER,
+                Err("digest_prefix"),
+            ),
+            ("resolver-fixture-untagged".into(), OTHER, Err("not_found")),
+            (
+                "resolver-fixture-private:latest".into(),
+                OWNER,
+                Ok(sha('f')),
+            ),
+            (
+                "resolver-fixture-private:latest".into(),
+                OTHER,
+                Err("not_found"),
+            ),
+            (
+                format!("resolver-fixture-private@{}", sha('f')),
+                OTHER,
+                Err("not_found"),
+            ),
+            (
+                "resolver-fixture-deleting:latest".into(),
+                OTHER,
+                Err("not_found"),
+            ),
+        ];
+        for (reference, caller, expected) in cases {
+            let actual =
+                match resolve_base(&db.pool, &reference.parse()?, OrgId::from_uuid(caller)).await {
+                    Ok(hash) => Ok(hash.to_string()),
+                    Err(ResolveBaseError::NotFound) => Err("not_found"),
+                    Err(ResolveBaseError::DigestPrefix) => Err("digest_prefix"),
+                    Err(error) => return Err(error.into()),
+                };
+            assert_eq!(actual, expected, "{reference} caller={caller}");
+        }
+        Ok(())
+    }
 }
 
 mod response_tests {

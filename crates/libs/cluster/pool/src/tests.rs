@@ -4333,3 +4333,190 @@ async fn config_reads_keep_valid_rows_when_one_row_is_invalid() -> TestResult {
 
     Ok(())
 }
+
+/// One generic Firecracker template, `resolver-fixture`, seeded on its own:
+/// a subset of the API crate's resolver-world releases of that template, with
+/// the same names, hashes and `created_at` ages, except that the both-forms
+/// ages are swapped and the tags differ:
+/// `bare` (`aa…`, created 5d, tag `legacy` modified 2d ago and tag `archived`
+/// modified 4d ago), `prefixed` (`sha256:bb…`, 4d), `blake3` (`blake3:cc…`,
+/// 3d), `latest_holder` (`sha256:dd…`, 6d, `latest` moved onto it 1m ago from
+/// `newest_created`), `newest_created` (`sha256:ee…`, 1h), and one digest
+/// stored twice, `dual_bare` (`99…`, 8d, inserted first) and `dual_prefixed`
+/// (`sha256:99…`, 7d).
+struct ResolverReleases {
+    bare: Uuid,
+    prefixed: Uuid,
+    blake3: Uuid,
+    latest_holder: Uuid,
+    dual_bare: Uuid,
+    dual_prefixed: Uuid,
+}
+
+const RESOLVER_TEMPLATE: &str = "resolver-fixture";
+
+fn hex(c: char) -> String {
+    c.to_string().repeat(64)
+}
+
+async fn seed_resolver_releases(pool: &PgPool) -> TestResult<ResolverReleases> {
+    async fn release(pool: &PgPool, hash: String, age: &str) -> TestResult<Uuid> {
+        let id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO template_releases (id, template_name, type, hash, created_at)
+             VALUES ($1, $2, 'fc', $3, NOW() - $4::INTERVAL)",
+        )
+        .bind(id)
+        .bind(RESOLVER_TEMPLATE)
+        .bind(hash)
+        .bind(age)
+        .execute(pool)
+        .await?;
+        Ok(id)
+    }
+    async fn tag(pool: &PgPool, release: Uuid, tag: &str, age: &str) -> TestResult {
+        sqlx::query(
+            "INSERT INTO template_release_tags (template_release_id, template_name, tag)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (template_name, tag) DO UPDATE
+             SET template_release_id = EXCLUDED.template_release_id,
+                 modified_at = NOW() - $4::INTERVAL",
+        )
+        .bind(release)
+        .bind(RESOLVER_TEMPLATE)
+        .bind(tag)
+        .bind(age)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    insert_template(pool, RESOLVER_TEMPLATE).await?;
+    let newest_created = release(pool, format!("sha256:{}", hex('e')), "1 hour").await?;
+    let releases = ResolverReleases {
+        bare: release(pool, hex('a'), "5 days").await?,
+        prefixed: release(pool, format!("sha256:{}", hex('b')), "4 days").await?,
+        blake3: release(pool, format!("blake3:{}", hex('c')), "3 days").await?,
+        latest_holder: release(pool, format!("sha256:{}", hex('d')), "6 days").await?,
+        dual_bare: release(pool, hex('9'), "8 days").await?,
+        dual_prefixed: release(pool, format!("sha256:{}", hex('9')), "7 days").await?,
+    };
+    tag(pool, releases.bare, "legacy", "0 seconds").await?;
+    tag(pool, releases.bare, "legacy", "2 days").await?;
+    tag(pool, releases.bare, "archived", "0 seconds").await?;
+    tag(pool, releases.bare, "archived", "4 days").await?;
+    tag(pool, newest_created, "latest", "0 seconds").await?;
+    tag(pool, releases.latest_holder, "latest", "1 minute").await?;
+    Ok(releases)
+}
+
+/// Characterization of rolling-policy retention: each release ranked by its
+/// newest tag move, or by its `created_at` when it has no tag, keeping the top
+/// N. An untagged release created after a tagged release's last tag move
+/// outranks it: `newest_created` (1h) above `bare` (moved 2d ago). The runtime
+/// filter cannot be exercised: both `template_releases` and
+/// `warm_pool_policies` admit only `fc`. ClusterApi
+/// `ListLatestTemplateReleases` ranks the same releases by `created_at` alone:
+/// newest, blake3, prefixed for N = 3. Retention never reads `templates`, so a
+/// template being deleted keeps its releases protected.
+#[tokio::test(flavor = "current_thread")]
+async fn retained_policy_release_ranking_characterization() -> TestResult {
+    let fixture = postgres_fixture().await?;
+    seed_resolver_releases(&fixture.pool).await?;
+    let sha = |c| format!("sha256:{}", hex(c));
+
+    let cases = [
+        (1, "present", vec![sha('d')]),
+        (2, "present", vec![sha('d'), sha('e')]),
+        // `bare`'s newer tag (2d) outranks `blake3`'s newer created_at (3d);
+        // its older tag (4d) would not.
+        (3, "present", vec![hex('a'), sha('d'), sha('e')]),
+        (3, "deleting", vec![hex('a'), sha('d'), sha('e')]),
+    ];
+    for (retain, desired_state, expected) in cases {
+        sqlx::query("UPDATE templates SET desired_state = $2 WHERE name = $1")
+            .bind(RESOLVER_TEMPLATE)
+            .bind(desired_state)
+            .execute(&fixture.pool)
+            .await?;
+        upsert_warm_pool_policy(&fixture.pool, RESOLVER_TEMPLATE, 1, 10, retain).await?;
+        let mut protected = fixture
+            .store
+            .protected_template_releases()
+            .await?
+            .into_iter()
+            .map(|release| {
+                assert_eq!(release.template_name, RESOLVER_TEMPLATE);
+                release.content_hash
+            })
+            .collect::<Vec<_>>();
+        protected.sort();
+        assert_eq!(protected, expected, "retain={retain} {desired_state}");
+    }
+    Ok(())
+}
+
+/// Characterization of observed-demand matching: a recent sandbox's
+/// `content_hash` names the release stored in the same form first, else the
+/// one stored in the other of the bare and `sha256:` forms. Each case records
+/// enough demand for one unretained release and reports which release the
+/// autoscaler gave a pool beside the retained `latest_holder`. Matching never
+/// reads `templates`, so demand for a template being deleted still gets a pool.
+#[tokio::test(flavor = "current_thread")]
+async fn observed_demand_release_matching_characterization() -> TestResult {
+    let sha = |c| format!("sha256:{}", hex(c));
+    let blake = |c| format!("blake3:{}", hex(c));
+    type Pick = fn(&ResolverReleases) -> Uuid;
+    let cases: [(String, &str, Option<Pick>); 10] = [
+        (hex('a'), "present", Some(|w| w.bare)),
+        (sha('a'), "present", Some(|w| w.bare)),
+        (sha('b'), "present", Some(|w| w.prefixed)),
+        // The pool config upsert answers not found for this bare request.
+        (hex('b'), "present", Some(|w| w.prefixed)),
+        (blake('c'), "present", Some(|w| w.blake3)),
+        (hex('c'), "present", None),
+        (blake('a'), "present", None),
+        // The exact form wins over the newer `dual_prefixed`.
+        (hex('9'), "present", Some(|w| w.dual_bare)),
+        (sha('9'), "present", Some(|w| w.dual_prefixed)),
+        (hex('a'), "deleting", Some(|w| w.bare)),
+    ];
+    for (demand_hash, desired_state, expected) in cases {
+        let fixture = postgres_fixture().await?;
+        let w = seed_resolver_releases(&fixture.pool).await?;
+        sqlx::query("UPDATE templates SET desired_state = $2 WHERE name = $1")
+            .bind(RESOLVER_TEMPLATE)
+            .bind(desired_state)
+            .execute(&fixture.pool)
+            .await?;
+        upsert_warm_pool_policy(&fixture.pool, RESOLVER_TEMPLATE, 2, 10, 1).await?;
+        for _ in 0..10 {
+            insert_sandbox_for_template(
+                &fixture.pool,
+                RESOLVER_TEMPLATE,
+                "k8s",
+                &demand_hash,
+                None,
+                None,
+            )
+            .await?;
+        }
+
+        fixture.store.autoscale_configs("sandboxes").await?;
+
+        let demanded = sqlx::query_scalar::<_, Uuid>(
+            "SELECT template_release_id
+             FROM kubernetes_pool_configs
+             WHERE template_release_id <> $1",
+        )
+        .bind(w.latest_holder)
+        .fetch_optional(&fixture.pool)
+        .await?;
+        assert_eq!(
+            demanded,
+            expected.map(|pick| pick(&w)),
+            "demand={demand_hash} {desired_state}"
+        );
+    }
+    Ok(())
+}

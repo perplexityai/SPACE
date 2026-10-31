@@ -1590,6 +1590,329 @@ async fn list_latest_template_releases_orders_and_limits() -> TestResult {
     Ok(())
 }
 
+/// Characterization of ClusterApi `FindTemplateRelease`,
+/// `FindTemplateReleaseByHash` and `ListLatestTemplateReleases`. Each row is
+/// asked twice, with one expected answer per scope: by an unscoped caller (no
+/// auth layer, or the static token when Kubernetes authentication is disabled)
+/// and by a node-scoped caller at an address that is no registered node, as
+/// every caller is scoped once Kubernetes authentication is configured.
+/// Visibility granted by placement is pinned by
+/// `placed_sandbox_unlocks_private_release_for_its_node_only` and its
+/// siblings. The deploy-time publisher's request (`latest`, `fc`, no caller
+/// org) is the first by-tag row.
+///
+/// Releases: `bare` (`aa…`, created 5d, tag `legacy`), `prefixed`
+/// (`sha256:bb…`, 4d), `blake3` (`blake3:cc…`, 3d), `latest_holder`
+/// (`sha256:dd…`, 6d, `latest` moved onto it from `newest_created`),
+/// `newest_created` (`sha256:ee…`, 1h), and two digests stored twice with
+/// one storage location each, laid out opposite ways: `dual_prefixed`
+/// (`sha256:99…`, 8d, inserted first) and the owner `dual_bare` (`99…`, 7d);
+/// the owner `older_owner` (`sha256:88…`, 10d, inserted second) and `88…` (9d,
+/// inserted last). The owner is the newer, later, bare row in one pair and
+/// the older, earlier, prefixed row in the other, so ordering by age, id,
+/// insertion, hash or requested form misses it in one pair. `private`
+/// (`sha256:ff…`, `latest`) is org-specific to the seeded org. The untagged
+/// template has, in insertion order, `untagged_older` (`sha256:11…`, 2d),
+/// `untagged_newest` (`sha256:22…`, 1d) and `untagged_oldest` (`sha256:33…`,
+/// 3d), so its newest-first listing follows neither insertion, id nor hash
+/// order. The generic template being deleted has
+/// `deleting` (`sha256:77…`, `latest`).
+#[tokio::test(flavor = "current_thread")]
+async fn template_release_resolution_characterization() -> TestResult {
+    use std::net::Ipv4Addr;
+    /// `None` asks without the auth extension; `Some` asks as a node-scoped
+    /// caller from that address.
+    fn request<T>(message: T, node: Option<Ipv4Addr>) -> Request<T> {
+        match node {
+            Some(address) => node_scoped_request(message, address),
+            None => Request::new(message),
+        }
+    }
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let pool = &fixture.service.pool;
+    let (generic, private_name) = ("resolver-fixture", "resolver-fixture-private");
+    let (untagged, deleting_name) = ("resolver-fixture-untagged", "resolver-fixture-deleting");
+    let (owner, other) = (SEEDED_ORG_ID, Uuid::from_u128(0x5e50_1e00));
+    let unregistered = Some(Ipv4Addr::new(10, 0, 0, 99));
+    let hex = |c: char| c.to_string().repeat(64);
+    let sha = |c| format!("sha256:{}", hex(c));
+    let blake = |c| format!("blake3:{}", hex(c));
+    sqlx::query(sql!(
+        "INSERT INTO templates (id, name, org_id, visibility, desired_state)
+         VALUES ($1, $2, NULL, 'generic', 'present'),
+                ($3, $4, $5, 'org_specific', 'present'),
+                ($6, $7, NULL, 'generic', 'present'),
+                ($8, $9, NULL, 'generic', 'deleting')"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(generic)
+    .bind(Uuid::now_v7())
+    .bind(private_name)
+    .bind(owner)
+    .bind(Uuid::now_v7())
+    .bind(untagged)
+    .bind(Uuid::now_v7())
+    .bind(deleting_name)
+    .execute(pool)
+    .await?;
+    let release = |template: &'static str, hash: String, age: &'static str, org: Option<Uuid>| {
+        sqlx::query_scalar::<_, Uuid>(sql!(
+            "INSERT INTO template_releases (template_name, type, hash, org_id, created_at)
+             VALUES ($1, 'fc', $2, $3, NOW() - $4::INTERVAL)
+             RETURNING id"
+        ))
+        .bind(template)
+        .bind(hash)
+        .bind(org)
+        .bind(age)
+        .fetch_one(pool)
+    };
+    // `dual_prefixed`: never the answer, since `dual_bare` owns the storage.
+    release(generic, sha('9'), "8 days", None).await?;
+    let older_owner = release(generic, sha('8'), "10 days", None).await?;
+    let bare = release(generic, hex('a'), "5 days", None).await?;
+    let prefixed = release(generic, sha('b'), "4 days", None).await?;
+    let blake3 = release(generic, blake('c'), "3 days", None).await?;
+    let latest_holder = release(generic, sha('d'), "6 days", None).await?;
+    let newest_created = release(generic, sha('e'), "1 hour", None).await?;
+    let dual_bare = release(generic, hex('9'), "7 days", None).await?;
+    let private = release(private_name, sha('f'), "1 day", Some(owner)).await?;
+    let untagged_older = release(untagged, sha('1'), "2 days", None).await?;
+    let untagged_newest = release(untagged, sha('2'), "1 day", None).await?;
+    let untagged_oldest = release(untagged, sha('3'), "3 days", None).await?;
+    let deleting = release(deleting_name, sha('7'), "1 day", None).await?;
+    release(generic, hex('8'), "9 days", None).await?;
+    for (template, release, tag) in [
+        (generic, bare, "legacy"),
+        (generic, newest_created, "latest"),
+        (generic, latest_holder, "latest"),
+        (private_name, private, "latest"),
+        (deleting_name, deleting, "latest"),
+    ] {
+        sqlx::query(sql!(
+            "INSERT INTO template_release_tags (template_release_id, template_name, tag)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (template_name, tag) DO UPDATE
+             SET template_release_id = EXCLUDED.template_release_id, modified_at = NOW()"
+        ))
+        .bind(release)
+        .bind(template)
+        .bind(tag)
+        .execute(pool)
+        .await?;
+    }
+    sqlx::query(sql!(
+        "INSERT INTO template_release_storage_locations
+             (template_release_id, storage_connection_string)
+         VALUES ($1, 's3://bucket/templates/resolver-fixture/dual?region=us-east-1'),
+                ($2, 's3://bucket/templates/resolver-fixture/older?region=us-east-1')"
+    ))
+    .bind(dual_bare)
+    .bind(older_owner)
+    .execute(pool)
+    .await?;
+    let release_id = |response: Result<Response<FindTemplateReleaseResponse>, Status>| {
+        response.map(|response| response.into_inner().release.expect("release").id)
+    };
+    let nf = Err(Code::NotFound);
+
+    // (template, tag, runtime, caller org, unscoped, node-scoped)
+    let by_tag = [
+        (
+            generic,
+            "latest",
+            "fc",
+            None,
+            Ok(latest_holder),
+            Ok(latest_holder),
+        ),
+        (generic, "legacy", "firecracker", None, Ok(bare), Ok(bare)),
+        // No fallback; sandbox create answers `latest` here.
+        (generic, "missing", "fc", None, nf, nf),
+        // Rejected up front; sandbox create answers not found for Cloud
+        // Hypervisor.
+        (
+            generic,
+            "latest",
+            "ch",
+            None,
+            Err(Code::InvalidArgument),
+            Err(Code::InvalidArgument),
+        ),
+        (
+            generic,
+            "latest",
+            "fc",
+            Some(other),
+            Ok(latest_holder),
+            Ok(latest_holder),
+        ),
+        // No `latest`; the pool config upsert picks the newest by created_at.
+        (untagged, "latest", "fc", None, nf, nf),
+        // Unscoped with no caller org: unfiltered by org (sandbox create always
+        // has a caller org). Node-scoped: hidden until the control plane ties
+        // the template to the caller's node, whatever org it asserts.
+        (private_name, "latest", "fc", None, Ok(private), nf),
+        (private_name, "latest", "fc", Some(owner), Ok(private), nf),
+        (private_name, "latest", "fc", Some(other), nf, nf),
+        // A caller org requires `present`. Without one, an unscoped caller
+        // never reads it, and a node-scoped caller requires it only for a
+        // template not tied to its nodes; the placed case follows the tables.
+        (deleting_name, "latest", "fc", None, Ok(deleting), nf),
+        (deleting_name, "latest", "fc", Some(other), nf, nf),
+    ];
+    for (template, tag, runtime, caller, unscoped, node_scoped) in by_tag {
+        for (node, expected) in [(None, unscoped), (unregistered, node_scoped)] {
+            let response = fixture
+                .service
+                .find_template_release(request(
+                    FindTemplateReleaseRequest {
+                        generic_only: false,
+                        caller_org_id: caller.map(|org: Uuid| org.to_string()),
+                        template_name: template.to_string(),
+                        runtime: runtime.to_string(),
+                        tag: tag.to_string(),
+                    },
+                    node,
+                ))
+                .await;
+            assert_eq!(
+                release_id(response).map_err(|status| status.code()),
+                expected.map(|id: Uuid| id.to_string()),
+                "{template}:{tag} runtime={runtime} caller={caller:?} node={node:?}"
+            );
+        }
+    }
+
+    // The request carries no runtime; the digest alone selects the row.
+    // (template, hash, caller org, unscoped, node-scoped)
+    let by_hash = [
+        (generic, hex('a'), None, Ok(bare), Ok(bare)),
+        (generic, sha('a'), None, Ok(bare), Ok(bare)),
+        (generic, blake('a'), None, nf, nf),
+        (generic, sha('b'), None, Ok(prefixed), Ok(prefixed)),
+        // The pool config upsert answers not found for this bare request.
+        (generic, hex('b'), None, Ok(prefixed), Ok(prefixed)),
+        (generic, blake('c'), None, Ok(blake3), Ok(blake3)),
+        // A bare request is read as sha256, so it misses the blake3 row.
+        (generic, hex('c'), None, nf, nf),
+        // Both forms stored: the row with a storage location wins whichever
+        // form is asked; sandbox create, the pool config upsert and
+        // observed-demand matching answer the row stored in the requested form.
+        (generic, hex('9'), None, Ok(dual_bare), Ok(dual_bare)),
+        (generic, sha('9'), None, Ok(dual_bare), Ok(dual_bare)),
+        (generic, hex('8'), None, Ok(older_owner), Ok(older_owner)),
+        (generic, sha('8'), None, Ok(older_owner), Ok(older_owner)),
+        (private_name, sha('f'), None, Ok(private), nf),
+        (private_name, sha('f'), Some(owner), Ok(private), nf),
+        (private_name, sha('f'), Some(other), nf, nf),
+        (deleting_name, sha('7'), None, Ok(deleting), nf),
+        (deleting_name, sha('7'), Some(other), nf, nf),
+    ];
+    for (template, hash, caller, unscoped, node_scoped) in by_hash {
+        for (node, expected) in [(None, unscoped), (unregistered, node_scoped)] {
+            let response = fixture
+                .service
+                .find_template_release_by_hash(request(
+                    FindTemplateReleaseByHashRequest {
+                        generic_only: false,
+                        caller_org_id: caller.map(|org: Uuid| org.to_string()),
+                        template_name: template.to_string(),
+                        hash: hash.clone(),
+                    },
+                    node,
+                ))
+                .await;
+            assert_eq!(
+                release_id(response).map_err(|status| status.code()),
+                expected.map(|id: Uuid| id.to_string()),
+                "{template}@{hash} caller={caller:?} node={node:?}"
+            );
+        }
+    }
+
+    // Newest by created_at, ignoring tags. Pool retention ranks `latest_holder`
+    // first because its tag was modified most recently.
+    // (template, runtime, limit, unscoped, node-scoped)
+    let newest_three = vec![newest_created, blake3, prefixed];
+    let listed = [
+        (generic, "fc", 3, Ok(newest_three.clone()), Ok(newest_three)),
+        (
+            generic,
+            "ch",
+            3,
+            Err(Code::InvalidArgument),
+            Err(Code::InvalidArgument),
+        ),
+        // FindTemplateRelease answers not found for this template.
+        (
+            untagged,
+            "fc",
+            5,
+            Ok(vec![untagged_newest, untagged_older, untagged_oldest]),
+            Ok(vec![untagged_newest, untagged_older, untagged_oldest]),
+        ),
+        (private_name, "fc", 5, Ok(vec![private]), Ok(vec![])),
+        (deleting_name, "fc", 5, Ok(vec![deleting]), Ok(vec![])),
+    ];
+    for (template, runtime, limit, unscoped, node_scoped) in listed {
+        for (node, expected) in [(None, unscoped), (unregistered, node_scoped)] {
+            let response = fixture
+                .service
+                .list_latest_template_releases(request(
+                    ListLatestTemplateReleasesRequest {
+                        template_name: template.to_string(),
+                        runtime: runtime.to_string(),
+                        limit,
+                    },
+                    node,
+                ))
+                .await;
+            let actual = response
+                .map(|response| {
+                    let entries = response.into_inner().entries;
+                    entries
+                        .into_iter()
+                        .map(|entry| entry.release.expect("release").id)
+                        .collect::<Vec<_>>()
+                })
+                .map_err(|status| status.code());
+            assert_eq!(
+                actual,
+                expected.map(|ids: Vec<Uuid>| ids.iter().map(Uuid::to_string).collect()),
+                "{template} runtime={runtime} limit={limit} node={node:?}"
+            );
+        }
+    }
+
+    // A node-scoped caller with no caller org skips `desired_state` for a
+    // template the control plane has tied to its node: a sandbox placed on
+    // a registered worker still resolves the template being deleted, by tag,
+    // by hash and in the listing. The enabled warm pool and build-base grant
+    // paths skip it too and are not pinned here.
+    let placed = Ipv4Addr::new(10, 0, 0, 98);
+    let placed_node = insert_k8s_node(pool, placed, "worker").await?;
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (
+             id, user_id, org_id, managed_by, lifecycle, placement,
+             active_node_id, target_node_id, command_ready_pending,
+             network_policy_generation, template_id
+         )
+         VALUES ($1, $2::uuid, $3::uuid, 'k8s', 'started', 'on_node', $4, $4, TRUE, 1, $5)"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(SEEDED_USER_ID)
+    .bind(owner)
+    .bind(placed_node)
+    .bind(deleting_name)
+    .execute(pool)
+    .await?;
+    assert!(release_visible_from(&fixture, deleting_name, &sha('7'), placed, None).await?);
+    Ok(())
+}
+
 /// `list_warm_pool_template_releases` protects the on-node template GC
 /// from evicting builds a warm pool still targets. A pool config whose
 /// `enabled = FALSE` (a drained pool for a superseded release) targets
