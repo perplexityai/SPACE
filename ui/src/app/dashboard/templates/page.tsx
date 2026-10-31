@@ -492,6 +492,9 @@ export default function TemplatesPage() {
   const [warmPoolPolicies, setWarmPoolPolicies] = useState<WarmPoolPolicy[]>([]);
   const [warmPoolPolicyCapabilities, setWarmPoolPolicyCapabilities] = useState<WarmPoolPolicyCapabilities>({});
   const [loadingReleases, setLoadingReleases] = useState(true);
+  // Whether `templateReleases` holds an answer yet: before it does, no
+  // template can be said to have no release.
+  const [releasesLoaded, setReleasesLoaded] = useState(false);
   const [loadingTemplates, setLoadingTemplates] = useState(true);
   const [loadingInventory, setLoadingInventory] = useState(true);
   const loadingRef = useRef(true);
@@ -573,6 +576,7 @@ export default function TemplatesPage() {
     try {
       const items = await adminApi.get<TemplateRelease[]>('/v1/template-releases');
       setTemplateReleases(items);
+      setReleasesLoaded(true);
       return items;
     } catch (err: unknown) {
       console.warn(errorMessage(err));
@@ -1432,6 +1436,11 @@ export default function TemplatesPage() {
     [templates],
   );
 
+  const releasedTemplateNames = useMemo(
+    () => new Set(templateReleases.map((release) => release.template_name)),
+    [templateReleases],
+  );
+
   const templateColumns = useMemo<ColumnsType<Template>>(() => {
     const columns: ColumnsType<Template> = [
       {
@@ -1450,16 +1459,29 @@ export default function TemplatesPage() {
         title: 'Hash',
         dataIndex: 'content_hash',
         width: 135,
-        render: (value: string | null) =>
-          value ? (
-            <Tooltip title={value}>
-              <code>{shortHash(value)}</code>
+        // `content_hash` comes from builder inventory, not from releases:
+        // whether a template was ever published is read from the releases.
+        render: (value: string | null, record) => {
+          if (value) {
+            return (
+              <Tooltip title={value}>
+                <code>{shortHash(value)}</code>
+              </Tooltip>
+            );
+          }
+          if (releasesLoaded && record.desired_state === 'present' && !releasedTemplateNames.has(record.name)) {
+            return (
+              <Tooltip title="No release has been published for this template: it may never have been built, every build may have failed, or its releases were unpublished.">
+                <Tag style={{ marginInlineEnd: 0 }}>no release</Tag>
+              </Tooltip>
+            );
+          }
+          return releasedTemplateNames.has(record.name) ? (
+            <Tooltip title="Published; no builder node reports a build hash for it.">
+              <Text type="secondary">—</Text>
             </Tooltip>
-          ) : (
-            <Tooltip title="No release has been published for this template; a build may not have run or may have failed.">
-              <Tag style={{ marginInlineEnd: 0 }}>not built</Tag>
-            </Tooltip>
-          ),
+          ) : <Text type="secondary">—</Text>;
+        },
       },
       {
         title: 'Runtime',
@@ -1609,6 +1631,8 @@ export default function TemplatesPage() {
     return columns;
   }, [
     templateNameFilters,
+    releasedTemplateNames,
+    releasesLoaded,
     baseSnapshotPolicies,
     buildingSnapshot,
     isDirectSubstrate,
