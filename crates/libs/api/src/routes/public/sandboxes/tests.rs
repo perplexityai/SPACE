@@ -243,6 +243,7 @@ async fn native_create_persists_default_policy_in_operation_payload() -> TestDbR
             Some(admitted),
             None,
             None,
+            None,
         )
         .await
         .expect("native create should persist an operation");
@@ -256,6 +257,7 @@ async fn native_create_persists_default_policy_in_operation_payload() -> TestDbR
                 &idempotency_key,
                 create_request_with_auto_lifecycle(None),
                 Some(retried),
+                None,
                 None,
                 None,
             )
@@ -332,6 +334,7 @@ async fn native_create_refuses_a_new_create_at_the_org_quota() -> TestDbResult<(
                 None,
                 None,
                 quota,
+                None,
             )
             .await
         }
@@ -427,6 +430,7 @@ async fn a_native_create_that_waits_out_its_quota_lock_is_retryable() -> TestDbR
             org_limit: Some(1),
             subject: None,
         }),
+        None,
     )
     .await
     .expect_err("the quota lock stays held")
@@ -821,6 +825,7 @@ async fn queued_native_create(pool: &PgPool) -> TestDbResult<SandboxOperationRes
         UserId::from_uuid(SEED_USER_ID),
         &IdempotencyKey::parse("queued-native-create")?,
         create_request_with_auto_lifecycle(None),
+        None,
         None,
         None,
         None,
@@ -1683,6 +1688,7 @@ mod admission_pool_claim {
                 org_limit: Some(1),
                 subject: None,
             }),
+            None,
         );
         let meanwhile = async {
             wait_for_advisory_lock_waiter(&fixture.db.pool).await?;

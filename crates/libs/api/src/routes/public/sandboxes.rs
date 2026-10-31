@@ -124,6 +124,7 @@ pub async fn create_sandbox(
         state
             .native_sandbox_limits
             .for_create(org.id, owner.is_some().then_some(actor.id)),
+        Some(&state.inline_lifecycle),
     )
     .await?;
 
@@ -190,6 +191,11 @@ pub(crate) struct NativeCreatePoolClaims<'a> {
 /// none. A new create that would exceed one is refused with a non-retryable
 /// 429 naming it and records nothing; a replay of an admitted create still
 /// answers with it.
+///
+/// With `inline`, a create recorded without a slot may instead run in this
+/// process when [`InlineLifecycle`] offers it and admission claims it (see
+/// [`create_unclaimed_operation`]). It answers as a queued create does,
+/// without waiting for the execution.
 #[expect(
     clippy::too_many_arguments,
     reason = "the native create's request-scoped inputs; bundling them only moves the list"
@@ -203,6 +209,7 @@ pub(crate) async fn create_native_sandbox_operation(
     federated_create: Option<crate::fork_operations::ForkFederatedCreateContext>,
     pool_claims: Option<NativeCreatePoolClaims<'_>>,
     sandbox_quota: Option<SandboxQuota>,
+    inline: Option<&InlineLifecycle>,
 ) -> Result<SandboxOperationResponse, PublicApiError> {
     let (request, mut fingerprint) = prepare_native_create_request(request)?;
     if let Some(profiles) = federated_create
@@ -215,6 +222,7 @@ pub(crate) async fn create_native_sandbox_operation(
             "request": fingerprint, "egress_profiles": profiles,
         }))?;
     }
+    let cold_inline = inline;
     let inline = pool_claims
         .as_ref()
         .and_then(|claims| claims.inline.clone());
@@ -283,6 +291,7 @@ pub(crate) async fn create_native_sandbox_operation(
                 &idempotency,
                 sandbox_quota,
                 create(fresh_sandbox_id, &sandbox_id_string, None),
+                cold_inline,
             )
             .await?;
             (fresh_sandbox_id, outcome, result)
@@ -420,6 +429,7 @@ pub(crate) async fn create_native_sandbox_operation(
                                 &idempotency,
                                 sandbox_quota,
                                 create(fresh_sandbox_id, &sandbox_id_string, None),
+                                cold_inline,
                             )
                             .await?;
                             (fresh_sandbox_id, AdmissionClaimOutcome::Miss, result)
@@ -495,22 +505,64 @@ async fn finished_operation(
 }
 
 /// Record a native create that takes no warm-pool slot, holding a new one to
-/// the caller's quota when it has one. Without a quota this is the plain
-/// create that predates it.
+/// the caller's quota when it has one. Without a quota or inline execution
+/// this is the plain create that predates both.
+///
+/// With `inline` offering creates for the organization, a new create that is
+/// within its quota and gets a permit is recorded through
+/// [`PublicOperationAdmission::create_claimed_if_sole_active`] and, once
+/// claimed, runs in this process. Its sandbox ID is new, so nothing else is
+/// on its queue; only the organization's inline limit can leave it queued. A
+/// replay or a key conflict answers exactly as without inline execution.
 async fn create_unclaimed_operation(
     store: &PublicOperationStore,
     idempotency: &CreatePublicOperationIdempotency<'_>,
     sandbox_quota: Option<SandboxQuota>,
     input: CreatePublicOperation<'_>,
+    inline: Option<&InlineLifecycle>,
 ) -> Result<CreatePublicOperationResult, PublicApiError> {
-    let Some(quota) = sandbox_quota else {
+    let org_id = input.org_id;
+    let inline = inline.filter(|inline| inline.enabled_for(org_id, OperationKind::CreateSandbox));
+    if inline.is_none() && sandbox_quota.is_none() {
         return Ok(store.create_operation(input).await?);
-    };
+    }
     let mut admission = store
-        .begin_operation_admission(input.org_id, ApiProduct::Native, idempotency)
+        .begin_operation_admission(org_id, ApiProduct::Native, idempotency)
         .await?;
-    admit_within_sandbox_quota(&mut admission, quota).await?;
-    Ok(admission.create(input).await?)
+    let Some(inline) = inline else {
+        if let Some(quota) = sandbox_quota {
+            admit_within_sandbox_quota(&mut admission, quota).await?;
+        }
+        return Ok(admission.create(input).await?);
+    };
+    match admission.observation() {
+        ObservePublicOperationIdempotency::Missing => {}
+        ObservePublicOperationIdempotency::Existing(_) => {
+            inline.refuse_replay(
+                org_id,
+                OperationKind::CreateSandbox,
+                InlineAdmissionPath::ColdCreate,
+            );
+            return Ok(admission.create(input).await?);
+        }
+        ObservePublicOperationIdempotency::Conflict { .. } => {
+            return Ok(admission.create(input).await?);
+        }
+    }
+    if let Some(quota) = sandbox_quota {
+        admit_within_sandbox_quota(&mut admission, quota).await?;
+    }
+    let Some(permit) = inline.offer(
+        org_id,
+        OperationKind::CreateSandbox,
+        InlineAdmissionPath::ColdCreate,
+    ) else {
+        return Ok(admission.create(input).await?);
+    };
+    let recorded = admission
+        .create_claimed_if_sole_active(input, inline.org_limit())
+        .await?;
+    Ok(inline.settle(permit, store, recorded))
 }
 
 /// Hold a genuinely new create to `quota` in its admission transaction,

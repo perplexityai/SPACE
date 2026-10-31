@@ -228,6 +228,7 @@ impl AdmissionPoolFixture {
             None,
             pool_claims,
             None,
+            None,
         )
         .await
     }

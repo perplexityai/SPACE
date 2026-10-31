@@ -53,7 +53,8 @@ pub struct AppState {
     /// Claimed operations this process executes itself instead of leaving
     /// them to the dispatcher. See [`crate::inline_operations`].
     pub inline_operations: crate::inline_operations::InlineOperations,
-    /// Wakes, resumes and starts offered to [`Self::inline_operations`].
+    /// Cold creates, wakes, resumes and starts offered to
+    /// [`Self::inline_operations`].
     pub inline_lifecycle: crate::inline_operations::InlineLifecycle,
     /// Bookkeeping for the e2b-compat template build endpoints.
     /// See `routes::e2b::template_build` for the persisted keys.
@@ -192,8 +193,12 @@ impl AppState {
             route_signing,
         );
         task_tracker.spawn(inline_operations.report_slots(shutdown_token.child_token()));
-        let inline_lifecycle = crate::inline_operations::InlineLifecycle::with_lifecycle_executor(
+        let inline_lifecycle = crate::inline_operations::InlineLifecycle::with_native_executors(
             inline_operations.clone(),
+            crate::public_sandbox_operations::CreateSandboxOperationExecutor::new(
+                pool.clone(),
+                sandbox_controller.clone(),
+            ),
             crate::public_sandbox_operations::SandboxLifecycleOperationExecutor::new(
                 pool.clone(),
                 sandbox_controller.clone(),
