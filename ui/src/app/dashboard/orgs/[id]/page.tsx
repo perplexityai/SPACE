@@ -10,6 +10,7 @@ import { useCuriosityTheme } from '@/lib/theme';
 import { Organization, OrgMasterKey, Sandbox, User } from '@/lib/types';
 import { Card, Table, Typography, Form, Input, Button, App, Descriptions, Space, Switch, Tag } from 'antd';
 import { LockOutlined, SaveOutlined } from '@ant-design/icons';
+import { roleLabels } from '@/lib/userRoles';
 import type { ColumnsType } from 'antd/es/table';
 
 const { Title } = Typography;
@@ -85,7 +86,7 @@ export default function OrgDetailPage() {
   const userColumns: ColumnsType<User> = [
     { title: 'Name', dataIndex: 'display_name' },
     { title: 'Email', dataIndex: 'email' },
-    { title: 'Role', dataIndex: 'role' },
+    { title: 'Role', dataIndex: 'role', render: (role: User['role']) => roleLabels[role] ?? role },
     {
       title: 'Sandboxes',
       align: 'right',
