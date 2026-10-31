@@ -184,3 +184,8 @@ export function formatAge(value: string | null | undefined, nowMs: number): stri
   if (hours < 48) return `${hours}h`;
   return `${Math.floor(hours / 24)}d`;
 }
+
+// Metadata values are usually strings; anything else renders as compact JSON.
+export function formatMetadataValue(value: unknown): string {
+  return typeof value === 'string' ? value : JSON.stringify(value);
+}
