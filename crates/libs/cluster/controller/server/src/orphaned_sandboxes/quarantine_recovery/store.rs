@@ -135,18 +135,11 @@ pub(super) async fn recover(pool: &PgPool, expected: &Candidate) -> Result<bool,
            FROM sandbox_quarantine_state WHERE sandbox_id = $1"
     )).bind(expected.sandbox_id).bind(Uuid::now_v7()).bind(expected.snapshot_id.to_string())
         .execute(&mut *tx).await?;
-    sqlx::query(sql!(
-        "UPDATE sandboxes SET lifecycle = 'suspended', placement = 'unplaced',
-             active_node_id = NULL, target_node_id = NULL,
-             lifecycle_changed_at = NOW(), placement_changed_at = NULL, updated_at = NOW(),
-             current_local_artifact_id = $2, current_local_artifact_kind = 'full',
-             current_local_artifact_origin = 'suspend', command_ready_pending = FALSE,
-             restore_lease_expires_at = NULL, restore_lease_token = NULL
-          WHERE id = $1"
-    ))
-    .bind(expected.sandbox_id)
-    .bind(expected.artifact_id)
-    .execute(&mut *tx)
+    pplx_space_sandbox_store::repair::recover_quarantined_publication_to_suspended(
+        &mut tx,
+        expected.sandbox_id,
+        expected.artifact_id,
+    )
     .await?;
     sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions SET active = FALSE, state = 'suspended', pod_ip = NULL,
