@@ -4,7 +4,8 @@
 //! Holds the reconcile facets and their wire names, the facet observation
 //! keys, the `state_reconciliation_reason` Postgres enum (`ReconcileReason`),
 //! the facet and element references a reconcile trigger names, the facet and
-//! claim generation counters, and network-policy targets. It depends only on
+//! claim generation counters, network-policy targets, and the convergence
+//! episode vocabulary and policy in [`convergence`]. It depends only on
 //! common-core's sandbox and template identifiers, sqlx and thiserror, so a
 //! crate that needs only this vocabulary can depend on it without the service
 //! runtime in `pplx-space-common-svc`, which re-exports it as
@@ -16,6 +17,8 @@ use pplx_space_common_core::types::{
     SandboxId, SandboxIdParseError, TemplateName, TemplateParseError,
 };
 use thiserror::Error;
+
+pub mod convergence;
 
 pub const FACET_NETWORK_POLICY: &str = "network-policy";
 pub const FACET_SANDBOX_INVENTORY: &str = "sandbox-inventory";
