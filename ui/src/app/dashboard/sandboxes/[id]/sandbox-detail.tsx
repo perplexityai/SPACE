@@ -964,6 +964,11 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
       setError(null);
     } catch (err: any) {
       setError(err.message || 'Failed to load sandbox');
+      // A missing sandbox does not come back; stop asking every 4 s.
+      if (err?.status === 404 && pollRef.current) {
+        clearInterval(pollRef.current);
+        pollRef.current = null;
+      }
     } finally {
       if (showSpinner) setLoading(false);
     }

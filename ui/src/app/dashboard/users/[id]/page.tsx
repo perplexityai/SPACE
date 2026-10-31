@@ -2,11 +2,13 @@
 
 import { useEffect, useState } from 'react';
 import { useParams } from 'next/navigation';
+import Link from 'next/link';
 import { adminApi } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 import { AdminUser, Organization, UserRole } from '@/lib/types';
 import { assignableRoleOptions, canManageUserRole, roleColors, roleLabels } from '@/lib/userRoles';
-import { Typography, Descriptions, Select, Tag, App } from 'antd';
+import { Typography, Descriptions, Select, Tag, App, Result } from 'antd';
+import { ArrowLeftOutlined } from '@ant-design/icons';
 
 const { Title } = Typography;
 
@@ -18,16 +20,29 @@ export default function UserDetailPage() {
   const [org, setOrg] = useState<Organization | null>(null);
   const [visibleOrgIds, setVisibleOrgIds] = useState<string[]>([]);
   const [updatingRole, setUpdatingRole] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   useEffect(() => {
+    setLoadError(null);
     adminApi.get<AdminUser>(`/v1/users/${id}`).then((u) => {
       setUser(u);
       adminApi.get<Organization>(`/v1/orgs/${u.org_id}`).then(setOrg).catch(() => {});
-    });
+    }).catch((err: unknown) => setLoadError(err instanceof Error ? err.message : 'Failed to load user'));
     adminApi.get<Organization[]>('/v1/orgs')
       .then((orgs) => setVisibleOrgIds(orgs.map((org) => org.id)))
       .catch(() => setVisibleOrgIds([]));
   }, [id]);
+
+  if (loadError) {
+    return (
+      <Result
+        status="warning"
+        title="User not found"
+        subTitle={<>{loadError} <code>{id}</code></>}
+        extra={<Link href="/dashboard/users"><ArrowLeftOutlined /> Users</Link>}
+      />
+    );
+  }
 
   if (!user) return null;
 
