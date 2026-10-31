@@ -48,3 +48,16 @@ export function canDeleteUser(
 ): boolean {
   return canManageUserRole(actor, target, cluster, visibleOrgIds);
 }
+
+// The confirmation shown before a role change; granting organization admin
+// in the managing organization grants operator access to this console.
+export function roleChangeConfirmation(email: string, role: UserRole) {
+  return {
+    title: `Make ${email} ${roleLabels[role]}?`,
+    content:
+      role === 'organization_admin'
+        ? 'Organization admins manage their organization; in the organization that manages the cluster they can also operate it from this console.'
+        : 'They lose organization admin rights.',
+    okText: 'Change role',
+  };
+}
