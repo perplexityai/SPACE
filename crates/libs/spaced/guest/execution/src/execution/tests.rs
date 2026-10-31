@@ -304,3 +304,69 @@ async fn drain_retains_cancelled_direct_io_and_temporary_file_cleanup() {
     assert_eq!(names, ["blocked", "started"]);
     assert_eq!(tokio::fs::read(&marker).await.unwrap(), b"first effect");
 }
+
+#[test]
+fn process_retention_is_bounded() {
+    for retention in [
+        ProcessRetention {
+            completed: Duration::from_secs(30),
+            output: Duration::from_secs(31),
+            ..ProcessRetention::default()
+        },
+        ProcessRetention {
+            completed: Duration::ZERO,
+            ..ProcessRetention::default()
+        },
+        ProcessRetention {
+            output: Duration::ZERO,
+            ..ProcessRetention::default()
+        },
+        ProcessRetention {
+            output: MAX_RETENTION + Duration::from_secs(1),
+            ..ProcessRetention::default()
+        },
+        ProcessRetention {
+            idempotency: MAX_RETENTION + Duration::from_secs(1),
+            ..ProcessRetention::default()
+        },
+        ProcessRetention {
+            idempotency: Duration::ZERO,
+            ..ProcessRetention::default()
+        },
+        ProcessRetention {
+            completed: MAX_RETENTION + Duration::from_secs(1),
+            ..ProcessRetention::default()
+        },
+    ] {
+        let result = ExecutionService::with_config(
+            CancellationToken::new(),
+            ExecutionServiceConfig {
+                filesystem_execution: FilesystemExecutionMode::Direct,
+                identity_policy: IdentityPolicy::Guest,
+                process_retention: retention,
+                ..Default::default()
+            },
+        );
+        assert!(
+            matches!(
+                result,
+                Err(CreateExecutionServiceError::InvalidProcessRetention)
+            ),
+            "{retention:?} must be refused"
+        );
+    }
+    ExecutionService::with_config(
+        CancellationToken::new(),
+        ExecutionServiceConfig {
+            filesystem_execution: FilesystemExecutionMode::Direct,
+            identity_policy: IdentityPolicy::Guest,
+            process_retention: ProcessRetention {
+                completed: MAX_RETENTION,
+                output: MAX_RETENTION,
+                idempotency: MAX_RETENTION,
+            },
+            ..Default::default()
+        },
+    )
+    .expect("the maximum window is accepted");
+}
