@@ -100,7 +100,7 @@ async fn omitted_sandbox_counts_skip_the_sandbox_listing_and_keep_the_rest_of_th
     let listings = Arc::new(AtomicUsize::new(0));
     let lister = PoolSandboxLister::new({
         let listings = Arc::clone(&listings);
-        move |_| {
+        move |_, _| {
             listings.fetch_add(1, Ordering::SeqCst);
             let listing = listing.clone();
             Box::pin(async move { listing })
@@ -166,6 +166,117 @@ async fn omitted_sandbox_counts_skip_the_sandbox_listing_and_keep_the_rest_of_th
         pool.sandbox_ids.clear();
     }
     assert_eq!(omitted_pools, expected_pools);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn pool_counts_read_only_pool_members_and_match_a_sandbox_manager_that_ignores_the_filter() {
+    use pplx_space_sbx_mgr_client::ListSelection;
+    use sbx_proto::SandboxLifecycleState::{Creating, Failed, Paused, Started, Starting};
+
+    let unpooled =
+        |sandbox_id: &str, template: &str, lifecycle: sbx_proto::SandboxLifecycleState| {
+            sbx_proto::SandboxListElement {
+                sandbox_id: sandbox_id.to_string(),
+                template: Some(template.to_string()),
+                lifecycle: Some(lifecycle as i32),
+                ..Default::default()
+            }
+        };
+    let node_sandboxes = vec![
+        pool_sandbox("warm-a", "pooled", Paused),
+        unpooled("user-paused", "pooled", Paused),
+        pool_sandbox("filling", "pooled", Creating),
+        pool_sandbox("warm-b", "pooled", Paused),
+        unpooled("user-started", "other", Started),
+        pool_sandbox("starting", "pooled", Starting),
+        pool_sandbox("failed", "pooled", Failed),
+        pool_sandbox("other-warm", "other", Paused),
+    ];
+
+    let mut replies = Vec::new();
+    for honors_filter in [true, false] {
+        let conn = crate::db::test_conn();
+        insert_ready_build(&conn, "pooled", "sha256:pooled");
+        insert_ready_build(&conn, "other", "sha256:other");
+        insert_ready_build(&conn, "unpooled", "sha256:unpooled");
+        crate::db::insert_pool(&conn, "pooled", 3, "snapshot", 2, 1024).unwrap();
+        crate::db::insert_pool(&conn, "other", 1, "snapshot", 2, 1024).unwrap();
+        let selections = Arc::new(Mutex::new(Vec::new()));
+        let lister = PoolSandboxLister::new({
+            let selections = Arc::clone(&selections);
+            let node_sandboxes = node_sandboxes.clone();
+            move |_, selection| {
+                selections.lock().unwrap().push(selection);
+                let listed = node_sandboxes
+                    .iter()
+                    .filter(|sandbox| {
+                        !(honors_filter && selection == ListSelection::PoolMembers)
+                            || sandbox.pool_template.is_some()
+                    })
+                    .cloned()
+                    .collect();
+                Box::pin(async move { listed })
+            }
+        });
+        let service = TemplateManagerService::new(conn)
+            .unwrap()
+            .without_sbx_connect_retries()
+            .with_pool_sandbox_lister(lister);
+        let templates = service
+            .list_templates(internal_request(ListTemplatesRequest::default()))
+            .await
+            .unwrap()
+            .into_inner();
+        let pools = service
+            .pool_status(internal_request(PoolStatusRequest::default()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            *selections.lock().unwrap(),
+            vec![ListSelection::PoolMembers; 2],
+            "both counting reads must ask sandbox-manager for pool members only"
+        );
+        replies.push((templates, pools));
+    }
+
+    let (filtered, unfiltered) = (&replies[0], &replies[1]);
+    assert_eq!(filtered, unfiltered);
+    let (templates, pools) = filtered;
+    let pool_current = |name: &str| {
+        templates
+            .templates
+            .iter()
+            .find(|template| template.name == name)
+            .map(|template| template.pool_current)
+    };
+    assert_eq!(pool_current("pooled"), Some(2));
+    assert_eq!(pool_current("other"), Some(1));
+    assert_eq!(pool_current("unpooled"), Some(0));
+    let pool = |name: &str| {
+        pools
+            .pools
+            .iter()
+            .find(|pool| pool.template == name)
+            .map(|pool| {
+                (
+                    pool.current_count,
+                    pool.pending_count,
+                    pool.sandbox_ids.clone(),
+                )
+            })
+    };
+    assert_eq!(
+        pool("pooled"),
+        Some((
+            2,
+            2,
+            ["warm-a", "filling", "warm-b", "starting", "failed"]
+                .map(String::from)
+                .to_vec()
+        ))
+    );
+    assert_eq!(pool("other"), Some((1, 0, vec!["other-warm".to_string()])));
 }
 
 #[test]

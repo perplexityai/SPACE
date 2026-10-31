@@ -91,7 +91,7 @@ fn list_pages_cover_every_row_once_in_id_order() {
     let mut seen = Vec::new();
     let mut after = String::new();
     loop {
-        let page = list_page(&conn, &after, 2).unwrap();
+        let page = list_page(&conn, &after, 2, ListPageScope::All).unwrap();
         assert!(page.rows.len() <= 2);
         seen.extend(page_ids(&page));
         if !page.more {
@@ -117,10 +117,10 @@ fn list_page_ends_early_at_the_raw_budget_and_rejects_only_a_single_oversized_ro
         rusqlite::params![ids[2], template],
     )
     .unwrap();
-    let page = list_page(&conn, "", MAX_ITEMS).unwrap();
+    let page = list_page(&conn, "", MAX_ITEMS, ListPageScope::All).unwrap();
     assert_eq!(page_ids(&page), ids[..2]);
     assert!(page.more);
-    let page = list_page(&conn, &ids[1], MAX_ITEMS).unwrap();
+    let page = list_page(&conn, &ids[1], MAX_ITEMS, ListPageScope::All).unwrap();
     assert_eq!(page_ids(&page), ids[2..]);
     assert!(!page.more);
 
@@ -130,7 +130,7 @@ fn list_page_ends_early_at_the_raw_budget_and_rejects_only_a_single_oversized_ro
     )
     .unwrap();
     assert!(matches!(
-        list_page(&conn, "", MAX_ITEMS),
+        list_page(&conn, "", MAX_ITEMS, ListPageScope::All),
         Err(InventoryReadError::Limit(_))
     ));
 }
@@ -141,7 +141,7 @@ fn list_page_keeps_the_identity_of_an_undecodable_row() {
     let ids = insert_listed(&conn, 2);
     conn.execute("UPDATE sandboxes SET user = '' WHERE id = ?1", [&ids[0]])
         .unwrap();
-    let page = list_page(&conn, "", MAX_ITEMS).unwrap();
+    let page = list_page(&conn, "", MAX_ITEMS, ListPageScope::All).unwrap();
     assert_eq!(page_ids(&page), ids);
     assert!(matches!(
         &page.rows[0],
