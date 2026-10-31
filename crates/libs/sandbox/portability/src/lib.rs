@@ -1794,9 +1794,10 @@ fn inflight_snapshot_matches_current_suspend(sandbox_alias: &str) -> String {
 /// The internal API reads a node's absence as a deletion in two places, both
 /// only sound while the node's local row is the sandbox's sole existence:
 ///
-/// * `prune_absent_node_sandboxes` (`internal/api/server/src/status.rs`): a
-///   complete census that omits the sandbox drives a `marked_deleted` arm that
-///   sets `lifecycle = 'deleted'`.
+/// * `prune_absent_node_sandboxes` (`internal/api/server/src/status.rs`, through
+///   `pplx_space_sandbox_store::ingest::prune_census_absent_sandboxes`): a
+///   complete census that omits the sandbox drives that statement's
+///   `marked_deleted` arm, which sets `lifecycle = 'deleted'`.
 /// * `publish_sandbox_states` (`internal/api/server/src/published_state.rs`):
 ///   an explicit `present: false` for a stopped sandbox deletes its row and
 ///   detaches its snapshots' storage locations. A node reports that for any

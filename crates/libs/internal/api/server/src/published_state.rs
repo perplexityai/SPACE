@@ -37,9 +37,7 @@ use pplx_space_events::{
 };
 use pplx_space_net_common::proto::NetworkPolicySource;
 use pplx_space_sandbox_portability::{
-    SuspendedTargetNodeAssignment, node_published_execution_identity_matches,
-    publish_clear_or_preserve_current_local_artifact_marker_assignments,
-    started_suspend_revert_eligibility, stopped_artifact_durable, suspended_k8s_finalization_sql,
+    started_suspend_revert_eligibility, stopped_artifact_durable,
     suspended_projection_lifecycle_eligible,
 };
 use pplx_space_sbx_mgr_client::proto::{
@@ -48,7 +46,7 @@ use pplx_space_sbx_mgr_client::proto::{
 use pplx_space_template_mgr_client::proto::SnapshotInfo;
 
 use crate::proto::{PublishedSandboxState, PublishedTemplateState};
-use crate::sandbox_quarantine_store;
+use pplx_space_sandbox_store::ingest::SuspendedFinalizationCandidate;
 
 use super::{optional_trimmed, parse_sandbox_id, proto_network_policy_to_common, trimmed_required};
 
@@ -2417,21 +2415,11 @@ pub async fn publish_sandbox_states_with_retirement(
             let claimed_json = Json(serde_json::to_value(&claimed_sql).map_err(|err| {
                 Status::internal(format!("serialize claimed quarantine input: {err}"))
             })?);
-            let updated_ids = sqlx::query_scalar::<_, SandboxId>(sql!(
-                "UPDATE sandboxes s
-                 SET lifecycle = 'quarantined'
-                 FROM jsonb_to_recordset($1::jsonb) AS input(
-                     sandbox_id UUID,
-                     from_lifecycle TEXT
-                 )
-                 WHERE s.id = input.sandbox_id
-                   AND s.active_node_id = $2
-                   AND s.lifecycle = input.from_lifecycle
-                 RETURNING s.id"
-            ))
-            .bind(claimed_json.clone())
-            .bind(node_id)
-            .fetch_all(&mut *conn)
+            let updated_ids = pplx_space_sandbox_store::ingest::mark_published_quarantined(
+                &mut *conn,
+                node_id,
+                claimed_json,
+            )
             .await
             .map_err(|err| {
                 Status::internal(format!("mark quarantined sandbox lifecycle: {err}"))
@@ -2694,46 +2682,9 @@ async fn project_node_published_failed_sandboxes(
     node_id: NodeId,
     rows_json: Json<serde_json::Value>,
 ) -> Result<Vec<(SandboxId, String)>, Status> {
-    let failed_sandboxes = sqlx::query_as::<_, (Uuid, String)>(sql!(
-        "WITH input AS (
-             SELECT *
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 sandbox_id UUID,
-                 status TEXT
-             )
-         ),
-         claimed AS (
-             SELECT s.id, s.lifecycle
-             FROM sandboxes s
-             JOIN input ON input.sandbox_id = s.id
-             WHERE s.active_node_id = $1
-               AND s.managed_by = $3
-               AND LOWER(TRIM(input.status)) = 'failed'
-               AND LOWER(TRIM(s.lifecycle)) NOT IN (
-                   'failed',
-                   'quarantined',
-                   'deleted',
-                   'cleanup_required',
-                   'deleting'
-               )
-             FOR NO KEY UPDATE OF s
-         )
-         UPDATE sandboxes s
-         SET lifecycle = 'failed'
-         FROM claimed
-         WHERE s.id = claimed.id
-         RETURNING s.id, claimed.lifecycle"
-    ))
-    .bind(node_id)
-    .bind(rows_json)
-    .bind(SubstrateKind::Kubernetes)
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(|err| Status::internal(format!("mark failed sandbox lifecycle: {err}")))?;
-    Ok(failed_sandboxes
-        .into_iter()
-        .map(|(sandbox_id, lifecycle)| (SandboxId::from_uuid(sandbox_id), lifecycle))
-        .collect())
+    pplx_space_sandbox_store::ingest::mark_published_failed(&mut *conn, node_id, rows_json)
+        .await
+        .map_err(|err| Status::internal(format!("mark failed sandbox lifecycle: {err}")))
 }
 
 #[derive(Default)]
@@ -2876,13 +2827,6 @@ pub(crate) async fn project_ready_suspend_snapshot(
     }
 }
 
-struct SuspendedFinalizationCandidate {
-    sandbox_id: SandboxId,
-    clear_marker: bool,
-    published_artifact: Option<sandbox_quarantine_store::PublishedSuspendArtifact>,
-    published_execution_identity: Option<sandbox_quarantine_store::PublishedExecutionIdentity>,
-}
-
 async fn apply_suspended_k8s_finalization(
     conn: &mut sqlx::PgConnection,
     candidates: &[SuspendedFinalizationCandidate],
@@ -2890,156 +2834,9 @@ async fn apply_suspended_k8s_finalization(
     if candidates.is_empty() {
         return Ok(Vec::new());
     }
-    let artifact_marker_assignments =
-        publish_clear_or_preserve_current_local_artifact_marker_assignments(
-            "s",
-            "candidate.published_artifact_id",
-            "candidate.published_artifact_kind",
-            "candidate.published_artifact_origin",
-            "candidate.clear_marker",
-        );
-    let finalization = suspended_k8s_finalization_sql(
-        "s",
-        "candidate",
-        &artifact_marker_assignments,
-        SuspendedTargetNodeAssignment::PreserveOrBackfillActive,
-    );
-    let candidate_ids = candidates
-        .iter()
-        .map(|candidate| candidate.sandbox_id)
-        .collect::<Vec<_>>();
-    let clear_markers = candidates
-        .iter()
-        .map(|candidate| candidate.clear_marker)
-        .collect::<Vec<_>>();
-    let published_artifact_ids = candidates
-        .iter()
-        .map(|candidate| {
-            candidate
-                .published_artifact
-                .as_ref()
-                .map(|artifact| artifact.id.as_uuid())
-        })
-        .collect::<Vec<_>>();
-    let published_artifact_kinds = candidates
-        .iter()
-        .map(|candidate| {
-            candidate
-                .published_artifact
-                .as_ref()
-                .map(|artifact| artifact.kind.as_str())
-        })
-        .collect::<Vec<_>>();
-    let published_artifact_origins = candidates
-        .iter()
-        .map(|candidate| {
-            candidate
-                .published_artifact
-                .as_ref()
-                .map(|artifact| artifact.origin.as_str())
-        })
-        .collect::<Vec<_>>();
-    let published_execution_generations = candidates
-        .iter()
-        .map(|candidate| {
-            candidate
-                .published_execution_identity
-                .as_ref()
-                .map(|identity| identity.generation.get())
-        })
-        .collect::<Vec<_>>();
-    let published_pod_uids = candidates
-        .iter()
-        .map(|candidate| {
-            candidate
-                .published_execution_identity
-                .as_ref()
-                .map(|identity| identity.pod_uid.as_str())
-        })
-        .collect::<Vec<_>>();
-    let published_pod_uids_were_missing = candidates
-        .iter()
-        .map(|candidate| {
-            candidate
-                .published_execution_identity
-                .as_ref()
-                .map(|identity| identity.pod_uid_was_missing)
-        })
-        .collect::<Vec<_>>();
-    let candidate_cte = "candidate AS (
-             SELECT *
-               FROM UNNEST(
-                   $1::UUID[], $2::BOOL[], $3::UUID[], $4::TEXT[], $5::TEXT[],
-                   $6::BIGINT[], $7::TEXT[], $8::BOOL[]
-               ) AS candidate(
-                   id, clear_marker, published_artifact_id,
-                   published_artifact_kind, published_artifact_origin,
-                   published_execution_generation, published_pod_uid,
-                   published_pod_uid_was_missing
-               )
-         )";
-    let exact_execution_identity = node_published_execution_identity_matches(
-        "e",
-        "candidate.published_execution_generation",
-        "candidate.published_pod_uid",
-        "candidate.published_pod_uid_was_missing",
-    );
-    let finalization_query = format!(
-        "WITH {candidate_cte},
-         retired_execution AS (
-             UPDATE sandbox_k8s_executions e
-                SET {active_execution_assignments}
-               FROM candidate
-              WHERE e.sandbox_id = candidate.id
-                AND e.active
-                AND (
-                    candidate.published_artifact_id IS NULL
-                    OR ({exact_execution_identity})
-                )
-             RETURNING e.sandbox_id
-         ),
-         eligible_candidate AS (
-             SELECT candidate.*
-               FROM candidate
-              WHERE candidate.published_artifact_id IS NULL
-                 OR EXISTS (
-                     SELECT 1
-                       FROM retired_execution retired
-                      WHERE retired.sandbox_id = candidate.id
-                 )
-         ),
-         reset_port_exposures AS (
-             UPDATE sandbox_port_exposures spe
-                SET {open_port_exposure_assignments}
-               FROM eligible_candidate candidate
-              WHERE spe.sandbox_id = candidate.id
-                AND spe.desired_state = 'open'
-             RETURNING spe.sandbox_id
-         )
-         UPDATE sandboxes s
-            SET {sandbox_assignments}
-           FROM eligible_candidate candidate
-          WHERE s.id = candidate.id
-          RETURNING s.id, candidate.clear_marker",
-        active_execution_assignments = finalization.active_execution_assignments("e"),
-        open_port_exposure_assignments = finalization.open_port_exposure_assignments(),
-        sandbox_assignments = finalization.sandbox_assignments(),
-    );
-    let projected: Vec<(SandboxId, bool)> =
-        sqlx::query_as(sqlx::AssertSqlSafe(sql!(finalization_query.as_str())))
-            .bind(&candidate_ids)
-            .bind(&clear_markers)
-            .bind(&published_artifact_ids)
-            .bind(&published_artifact_kinds)
-            .bind(&published_artifact_origins)
-            .bind(&published_execution_generations)
-            .bind(&published_pod_uids)
-            .bind(&published_pod_uids_were_missing)
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(|err| {
-                Status::internal(format!("finalize suspended sandbox lifecycle: {err}"))
-            })?;
+    let projected = pplx_space_sandbox_store::ingest::finalize_suspended(&mut *conn, candidates)
+        .await
+        .map_err(|err| Status::internal(format!("finalize suspended sandbox lifecycle: {err}")))?;
 
     // A committed suspend finalization means the claimed pod was already torn
     // down, so the finalized sandbox's warm-pool slot row (if any) is only a
@@ -3896,37 +3693,6 @@ async fn converge_restored_sandboxes(
     node_id: NodeId,
     rows: &[PublishedSandboxRow],
 ) -> Result<Vec<SandboxId>, Status> {
-    // Publishing `started` proves the node-local runtime finished, but for
-    // Kubernetes sandboxes the control plane also needs a routable active
-    // execution row. The blocking wake/restore path is what hydrates that row
-    // with `running` + pod IP; if it timed out first, keep the row in
-    // `restoring` so the next connect can wait on and hydrate the in-flight
-    // pod instead of treating it as a started sandbox with a broken execution.
-    // Evacuation-marked rows are owned by the node-drain redrive (the same
-    // exemption the sweeper makes) and are left alone.
-    let routable_execution =
-        pplx_space_common_svc::sql::sandbox_routability::routable_execution_or_non_k8s("s", "$4");
-    let restored_convergence_query = format!(
-        "WITH input AS (
-             SELECT *
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 sandbox_id UUID,
-                 status TEXT,
-                 transition_receipt_kind TEXT
-             )
-         )
-         UPDATE sandboxes s
-         SET lifecycle = 'started'
-         FROM input
-         WHERE s.id = input.sandbox_id
-           AND s.active_node_id = $1
-           AND s.evacuation_restore_target IS NULL
-           AND LOWER(TRIM(input.status)) = 'started'
-           AND input.transition_receipt_kind IS DISTINCT FROM $3
-           AND LOWER(TRIM(s.lifecycle)) = 'restoring'
-           AND {routable_execution}
-         RETURNING s.id"
-    );
     let restored_rows = rows
         .iter()
         .filter(|row| {
@@ -3942,14 +3708,11 @@ async fn converge_restored_sandboxes(
         let restored_rows = Json(serde_json::to_value(restored_rows).map_err(|error| {
             Status::internal(format!("serialize restored publication rows: {error}"))
         })?);
-        sqlx::query_scalar::<_, SandboxId>(sqlx::AssertSqlSafe(sql!(
-            restored_convergence_query.as_str()
-        )))
-        .bind(node_id)
-        .bind(restored_rows)
-        .bind(SandboxTransitionReceiptKind::ActivationCompleted.as_str())
-        .bind(SubstrateKind::Kubernetes)
-        .fetch_all(&mut *conn)
+        pplx_space_sandbox_store::ingest::converge_published_restoring_to_started(
+            &mut *conn,
+            node_id,
+            restored_rows,
+        )
         .await
         .map_err(|err| Status::internal(format!("converge restored sandbox lifecycle: {err}")))?
     };
