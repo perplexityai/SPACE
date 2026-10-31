@@ -1,0 +1,11 @@
+# Known failures of the Kind Direct lane (.github/workflows/kind-direct-ci.yml),
+# read only when SPACE_SMOKE_KNOWN_FAILURES names this file. One
+# `<scenario id> | <phase> | <reason>` per line: the phase the scenario fails
+# in, then a plain reason; blank lines and comments are ignored. A listed
+# scenario is excused only for a fail verdict whose last recorded phase is the
+# listed one; any other result that does not pass fails the lane as it would
+# unlisted. One that passes is reported as an unexpected pass, so remove it
+# once its fix lands. Never read by the Kubernetes lane. See "Direct lane in
+# CI" in infra/space/kind/README.md.
+
+native.stopped_restart_preserves_rootfs | delete stopped sandbox and verify node cleanup | its node-cleanup check finds the sandbox's worker and waits for the stop's release through the sandbox pod, which the Direct substrate does not create

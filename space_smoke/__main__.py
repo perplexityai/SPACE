@@ -21,8 +21,12 @@ from space_smoke.services import (
 )
 from space_smoke.sharding import select_shard
 from space_smoke.suite import (
+    KNOWN_FAILURES_ENV,
     RESULT_PREFIX,
+    KnownFailure,
     ScenarioProcessResult,
+    is_known_failure,
+    load_known_failures,
     run_scenarios,
     suite_exit_code,
 )
@@ -219,6 +223,8 @@ def _print_not_passed(
     scenarios: tuple[Scenario[Any], ...],
     *,
     api_surface: str,
+    known_failures: dict[str, KnownFailure],
+    known_failures_path: str | None,
 ) -> None:
     """Repeat every scenario that did not pass where the log ends.
 
@@ -237,12 +243,10 @@ def _print_not_passed(
         verdict, summary = _verdict_and_summary(result)
         print(f"  {verdict.upper()} {result.scenario_id}: {summary}")
         evidence = (result.report or {}).get("evidence")
-        if isinstance(evidence, dict):
-            phases = evidence.get("phases")
-            if isinstance(phases, list) and phases and isinstance(phases[-1], dict):
-                print(f"    last phase: {phases[-1].get('name')}")
-            if evidence.get("sandbox_id"):
-                print(f"    sandbox_id: {evidence['sandbox_id']}")
+        if result.last_phase is not None:
+            print(f"    last phase: {result.last_phase}")
+        if isinstance(evidence, dict) and evidence.get("sandbox_id"):
+            print(f"    sandbox_id: {evidence['sandbox_id']}")
         for failure in _cleanup_failures(result):
             first, *rest = failure.splitlines() or [""]
             print(f"    cleanup failure: {first}")
@@ -251,17 +255,74 @@ def _print_not_passed(
         if result.report is None:
             for line in result.stdout.splitlines()[-OUTPUT_TAIL_LINES:]:
                 print(f"    | {line}")
+        listed = known_failures.get(result.scenario_id)
+        excused = is_known_failure(result, known_failures)
+        if listed is not None:
+            if excused:
+                print(f"    known failure: {listed.reason}")
+            else:
+                print(
+                    f"    listed in {known_failures_path} for phase \"{listed.phase}\"; "
+                    "not excused"
+                )
         rerun = reruns.get(result.scenario_id)
         if rerun is not None:
             print(f"    rerun: {rerun}")
         if os.environ.get("GITHUB_ACTIONS") == "true":
-            level = "warning" if result.exit_code == 42 else "error"
+            if excused:
+                level = "notice"
+            else:
+                level = "warning" if result.exit_code == 42 else "error"
             title = f"typed smoke ({api_surface}): {result.scenario_id}"
             message = _failure_detail(result)
             if rerun is not None:
                 message += f"\nrerun: {rerun}"
             print(
                 f"::{level} title={_workflow_command_value(title, for_property=True)}"
+                f"::{_workflow_command_value(message)}"
+            )
+    sys.stdout.flush()
+
+
+def _print_known_failures(
+    results: tuple[ScenarioProcessResult, ...],
+    known_failures: dict[str, KnownFailure],
+    *,
+    path: str,
+    api_surface: str,
+) -> None:
+    """Account for the run's known-failures list where the log ends.
+
+    A listed result that `is_known_failure` excuses is reported and excused;
+    any other result that did not pass counts as it would unlisted and is
+    reported under NOT PASSED. One that passed is an unexpected pass:
+    it still passes the run, but is raised so the list shrinks once its defect
+    is fixed. A listed scenario this pass did not run is not mentioned; the
+    other API surface's pass may run it.
+    """
+
+    ran = tuple(result for result in results if result.scenario_id in known_failures)
+    excused = tuple(result for result in ran if is_known_failure(result, known_failures))
+    passed = tuple(result for result in ran if result.exit_code == 0)
+    print(
+        f"KNOWN FAILURES ({path}): {len(excused)} failed as listed, "
+        f"{len(ran) - len(excused) - len(passed)} failed otherwise, "
+        f"{len(passed)} passed unexpectedly"
+    )
+    for result in excused:
+        reason = known_failures[result.scenario_id].reason
+        print(f"  KNOWN FAILURE {result.scenario_id}: {reason}")
+    for result in passed:
+        reason = known_failures[result.scenario_id].reason
+        print(
+            f"  UNEXPECTED PASS {result.scenario_id}: listed as \"{reason}\"; "
+            "remove it from the list if it keeps passing"
+        )
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            title = f"typed smoke ({api_surface}): {result.scenario_id}"
+            message = f"unexpected pass of a known failure listed in {path}: {reason}"
+            print(
+                f"::warning title={_workflow_command_value(title, for_property=True)}"
                 f"::{_workflow_command_value(message)}"
             )
     sys.stdout.flush()
@@ -294,6 +355,23 @@ def _run_all(
 ) -> int:
     template = os.environ.get("E2B_TEMPLATE") or None
     backend = os.environ.get("SPACE_SMOKE_BACKEND", "kind")
+    known_failures_path = os.environ.get(KNOWN_FAILURES_ENV) or None
+    known_failures: dict[str, KnownFailure] = {}
+    if known_failures_path is not None:
+        try:
+            known_failures = load_known_failures(
+                Path(known_failures_path), {scenario.id for scenario in REGISTRY}
+            )
+        except OSError as error:
+            print(
+                f"ERROR: cannot read the known-failures list {known_failures_path}: "
+                f"{error.strerror or error}",
+                file=sys.stderr,
+            )
+            return 2
+        except ValueError as error:
+            print(f"ERROR: {error}", file=sys.stderr)
+            return 2
     eligible = REGISTRY.select(category=category, template=template)
     # A quarantine is a visible hole in coverage, never a pass: name each one
     # and its reason so the run log shows what the suite did not prove.
@@ -427,8 +505,22 @@ def _run_all(
         f"SUITE: {passed} passed, {warned} warned, {failed} failed, "
         f"{incomplete} inconclusive or infrastructure errors"
     )
-    _print_not_passed(results, scenarios, api_surface=api_surface)
-    exit_code = suite_exit_code(results)
+    _print_not_passed(
+        results,
+        scenarios,
+        api_surface=api_surface,
+        known_failures=known_failures,
+        known_failures_path=known_failures_path,
+    )
+    if known_failures_path is not None:
+        _print_known_failures(
+            results, known_failures, path=known_failures_path, api_surface=api_surface
+        )
+    # Only a listed scenario's failure in its listed phase is left out; every
+    # other result decides the run as it would unlisted.
+    exit_code = suite_exit_code(
+        tuple(result for result in results if not is_known_failure(result, known_failures))
+    )
     if telemetry_error is not None:
         print(f"ERROR: {telemetry_error}", file=sys.stderr)
         if exit_code in (0, 42):
