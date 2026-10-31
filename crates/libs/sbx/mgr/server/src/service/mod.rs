@@ -79,6 +79,7 @@ pub(crate) mod network_policy;
 mod restart_admission;
 mod runtime_upgrade;
 mod suspend_snapshot_publication;
+pub(crate) use suspend_snapshot_publication::is_canonical_suspend_snapshot_dir;
 mod template_apps;
 
 /// Enables the network-credential authority path (off by default).
