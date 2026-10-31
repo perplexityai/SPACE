@@ -23,7 +23,7 @@ use pplx_space_metrics::sandbox::publication::{
     AutoLifecycleDeleteCompletionDisposition, AutoLifecycleDeleteCompletionReason,
 };
 use pplx_space_placement::StoredSandboxLifecycle;
-use pplx_space_sandbox_teardown::finalize_sandbox_db_delete_tx;
+use pplx_space_sandbox_store::delete::delete_with_dependents;
 use sqlx::{Acquire as _, FromRow, Postgres, Transaction, types::Json};
 use tonic::Status;
 
@@ -720,7 +720,7 @@ async fn apply_receipt(
         ));
     }
 
-    match finalize_sandbox_db_delete_tx(tx, completion.sandbox_id).await {
+    match delete_with_dependents(tx, completion.sandbox_id).await {
         Ok(()) => Ok(ReceiptOutcome::Applied { from_lifecycle }),
         Err(error) if is_retryable_finalize_error(&error) => Ok(ReceiptOutcome::Deferred(
             AutoLifecycleDeleteCompletionReason::FinalizeContended,

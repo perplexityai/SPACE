@@ -1,7 +1,7 @@
 //! Data access for the sandbox control-plane row (`sandboxes`).
 //!
-//! Today the row's SQL is written inline at ~150 call sites across six
-//! crates. This crate consolidates that access one CRUD verb at a time,
+//! Much of the row's SQL is still written inline in the control-plane crates
+//! that use it. This crate consolidates that access one CRUD verb at a time,
 //! following the per-table store convention: executor-generic free functions,
 //! a typed record, `sql!` locators, and a small error enum. Verbs
 //! so far: [`get`], [`update_desired_state`],
@@ -10,24 +10,35 @@
 //!
 //! # Boundaries
 //!
-//! * **Writes touch `sandboxes` only, and only its unguarded columns.** Of
-//!   the 81 production `UPDATE sandboxes` statements outside the node-local
-//!   SQLite table, 70 re-check a precondition in their `WHERE` and five more
-//!   are placement transitions; none of those belong here. What is left is
-//!   desired configuration — the columns a caller assigns directly.
+//! * **Every write of the row belongs here.** archcheck's
+//!   `pattern_ratchet.sandbox_writes` rule (`ARCHITECTURE.toml`) counts the
+//!   statements still written elsewhere; each move into this crate lowers its
+//!   cap in `architecture-baseline.toml`. The plain write verbs
+//!   ([`insert_unplaced`], [`insert_pooled`], [`update_desired_state`],
+//!   [`set_auto_lifecycle_policy`]) touch `sandboxes` only and re-check
+//!   nothing in their `WHERE` beyond the row's id.
 //! * **Column writes respect the row's triggers.** `sandboxes` carries five
 //!   `BEFORE UPDATE` triggers. `updated_at` is trigger-maintained, so no verb
 //!   here assigns it; and because two of the triggers have no change guard,
 //!   no verb may promise it touches only the columns it names. See
 //!   [`update_desired_state`].
 //!
-//! * **Guarded placement transitions are not CRUD.** Statements whose `WHERE`
-//!   re-checks a lifecycle/lease/generation precondition (the wake-completion
-//!   CAS, the restore claims) are correctness mechanisms, not row updates —
-//!   they stay named, guarded operations wherever they live, and no plain
-//!   `update` verb here may absorb one. A new one lands here in its own
-//!   module, named for the transition, as [`lost`] does; the caller
-//!   keeps the locks and the other tables' writes around it.
+//! * **Guarded transitions and the delete are modules, not CRUD.** Statements
+//!   whose `WHERE` re-checks a lifecycle/lease/generation precondition (the
+//!   wake-completion CAS, the restore claims) are correctness mechanisms, not
+//!   row updates, and no plain `update` verb here may absorb one. Each moves
+//!   here as its own module named for its transition, as [`lost`] and
+//!   [`delete`] have; the ratchet above counts the ones still elsewhere. The
+//!   caller keeps its locks and its transaction: these functions run inside
+//!   the caller's `Transaction` and never begin or commit one. [`delete`] is
+//!   the one write that reaches past the row: some rows that do not cascade
+//!   from it (observed state, reconcile state, claimed warm-pool slots) have
+//!   to be deleted, and snapshot storage locations detached, in the same
+//!   transaction. It calls `pplx-space-sandbox-teardown` for the
+//!   reconcile-state rows and `pplx-space-cluster-pool` for the slots; the
+//!   observed-state delete and the snapshot-storage detach are written
+//!   inline, although `snapshot_storage_locations` belongs to
+//!   `pplx-space-snapshot-store`.
 //! * **Locking reads are not gets.** `SELECT ... FOR UPDATE` acquires a row
 //!   lock inside a caller's transaction; converting one to [`get`] would drop
 //!   the lock. They stay at their call sites.
@@ -47,6 +58,11 @@
 //!   the caller keeps the domain logic that decides which ids to ask about.
 //!   A predicate that is neither shared nor latency-bound is still better off
 //!   as a `get` plus a filter.
+//! * **Each write's doc names the fact it records.** *Intent* records what a
+//!   caller asked for; an *operation step* claims, advances or ends in-flight
+//!   work (leases, markers, compensations); an *observed projection* copies
+//!   what a node reported; an *inference* is the control plane concluding
+//!   something on its own (sweeper ages, repairs, drain give-ups).
 //!
 //! # Growth policy
 //!
@@ -54,7 +70,8 @@
 //! Columns join the record when a migrated caller needs them; the `SELECT`
 //! list stays explicit so adding one is a reviewed change, not a `*`. Verbs
 //! are added the same way — with their first migrated caller, never
-//! speculatively.
+//! speculatively — and so are transition modules, which arrive with their
+//! first moved statement. Keep the module declarations below sorted.
 
 use pplx_space_common_core::types::{LocalArtifactId, OrgId, UserId};
 
@@ -73,6 +90,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 mod create;
+pub mod delete;
 pub mod fork_source_lifecycle;
 pub mod lost;
 
