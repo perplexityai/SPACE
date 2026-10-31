@@ -6,6 +6,14 @@ pub(super) const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(45);
 pub(super) const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 /// Both ten-second TLS handshakes plus acquisition/scheduling margin.
 pub(super) const ADMISSION_RESERVE: Duration = Duration::from_secs(30);
+/// How long after the first of a run of sandbox-manager's designed not-ready
+/// answers the owner keeps logging them at debug; a marked answer that arrives
+/// later warns as before. The owner checks only when an answer arrives, and
+/// retries back off (up to [`MAX_RETRY_BACKOFF`]), so the first answer past
+/// this window can come seconds after it ends. An activation that publishes
+/// the execution identity before the retry that would bring that answer logs
+/// no warning for the wait.
+pub(super) const QUIET_NOT_READY: Duration = Duration::from_secs(5);
 /// Two acquisition attempts, one maximum backoff and scheduling margin.
 pub(super) const MIN_REMAINING: Duration = ADMISSION_RESERVE
     .saturating_add(ACQUIRE_TIMEOUT.saturating_mul(2))

@@ -621,9 +621,11 @@ async fn owner_issues_over_host_control_after_assignment_and_stops_on_shutdown()
     // retry the same candidate. There is no gateway AWS-idempotency record to
     // escape by rekeying, and the route identity epoch is unchanged here.
     replies
-        .send(Reply::Error(Status::unavailable(
-            "gateway CA execution identity is incomplete",
-        )))
+        .send(Reply::Error(
+            pplx_space_common_grpc::RetryableNotReady.mark(Status::unavailable(
+                "gateway CA execution identity is incomplete",
+            )),
+        ))
         .await
         .unwrap();
     let same_key = tokio::time::timeout(Duration::from_secs(5), received.recv())
