@@ -18,6 +18,89 @@ const STATS_INSPECT_WARN_INTERVAL: Duration = Duration::from_secs(60);
 static STATS_INSPECT_WARNINGS: std::sync::LazyLock<PerSandboxWarnings> =
     std::sync::LazyLock::new(|| PerSandboxWarnings::new(STATS_INSPECT_WARN_INTERVAL));
 
+static STATS_NODE_MANAGER_OUTAGE: std::sync::LazyLock<NodeManagerOutage> =
+    std::sync::LazyLock::new(|| NodeManagerOutage::new(STATS_INSPECT_WARN_INTERVAL));
+
+/// Whether a failed `Stats` inspect found node-manager not listening: its
+/// socket is absent or refuses the dial, as through every node-manager
+/// restart. That is one fact about the node, not about each sandbox, so it is
+/// logged once per node rather than once per sandbox. Any other failure, such
+/// as a slow inspect or a reset stream, stays a per-sandbox warning.
+fn node_manager_unreachable(
+    error: &Status,
+) -> Option<pplx_space_common_grpc::ClientConnectFailureCause> {
+    pplx_space_common_grpc::client_connect_failure_cause(error)
+}
+
+/// What [`NodeManagerOutage::unreachable`] says to log.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutageLog {
+    /// The first unreachable inspect since the last answered one.
+    Started,
+    /// The outage has lasted this long and is still going on.
+    Continuing { lasted: Duration },
+}
+
+/// Whether node-manager is unreachable for `Stats` inspects, and when that
+/// was last logged, so an outage is logged when it starts, again at most once
+/// per interval while it lasts, and once when it ends.
+struct NodeManagerOutage {
+    interval: Duration,
+    state: Mutex<Option<OutageState>>,
+}
+
+#[derive(Clone, Copy)]
+struct OutageState {
+    since: Instant,
+    last_logged: Instant,
+}
+
+impl NodeManagerOutage {
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            state: Mutex::new(None),
+        }
+    }
+
+    /// An inspect at `now` found node-manager unreachable; what to log, if
+    /// anything.
+    fn unreachable(&self, now: Instant) -> Option<OutageLog> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match state.as_mut() {
+            None => {
+                *state = Some(OutageState {
+                    since: now,
+                    last_logged: now,
+                });
+                Some(OutageLog::Started)
+            }
+            Some(outage) if now.saturating_duration_since(outage.last_logged) >= self.interval => {
+                outage.last_logged = now;
+                Some(OutageLog::Continuing {
+                    lasted: now.saturating_duration_since(outage.since),
+                })
+            }
+            Some(_) => None,
+        }
+    }
+
+    /// An inspect at `now` was answered; how long the outage it ends lasted,
+    /// or `None` when there was none.
+    fn answered(&self, now: Instant) -> Option<Duration> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .take()
+            .map(|outage| now.saturating_duration_since(outage.since))
+    }
+}
+
 /// When each sandbox last had a warning let through. Entries older than the
 /// interval are dropped whenever one is let through, so the map holds only
 /// sandboxes warned about within the last interval.
@@ -118,9 +201,39 @@ impl SandboxManagerService {
         )
         .await
         {
-            Ok(response) => response.into_inner(),
+            Ok(response) => {
+                if let Some(outage) = STATS_NODE_MANAGER_OUTAGE.answered(Instant::now()) {
+                    tracing::info!(
+                        outage = ?outage,
+                        "node-manager reachable again; Stats answering with cgroup figures"
+                    );
+                }
+                response.into_inner()
+            }
             Err(error) => {
-                if STATS_INSPECT_WARNINGS.admit(id, Instant::now()) {
+                let now = Instant::now();
+                if let Some(cause) = node_manager_unreachable(&error) {
+                    tracing::debug!(
+                        sandbox_id = %id,
+                        %cause,
+                        %error,
+                        "node-manager unreachable; answering Stats without cgroup figures"
+                    );
+                    match STATS_NODE_MANAGER_OUTAGE.unreachable(now) {
+                        Some(OutageLog::Started) => tracing::warn!(
+                            %cause,
+                            %error,
+                            "node-manager unreachable; every sandbox's Stats answers without cgroup figures until it is back"
+                        ),
+                        Some(OutageLog::Continuing { lasted }) => tracing::warn!(
+                            %cause,
+                            %error,
+                            outage = ?lasted,
+                            "node-manager still unreachable; every sandbox's Stats answers without cgroup figures until it is back"
+                        ),
+                        None => {}
+                    }
+                } else if STATS_INSPECT_WARNINGS.admit(id, now) {
                     tracing::warn!(
                         sandbox_id = %id,
                         %error,
