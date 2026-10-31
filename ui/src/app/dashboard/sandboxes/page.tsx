@@ -794,6 +794,10 @@ function SandboxesPage() {
       setCustomCreateAutoLifecycle(null);
       createLifecycleForm.resetFields();
       refreshAndReport();
+      // The new row is listed once its create operation has run; refresh then
+      // instead of waiting for the next background refresh.
+      void (targetOrgId ? waitForAdminOperation : waitForPublicOperation)(sandbox.operation_id)
+        .then(() => refreshAndReport(), () => refreshAndReport());
       const sandboxId = sandbox.sandbox_id;
       const copyId = () => {
         if (typeof navigator !== 'undefined' && navigator.clipboard) {
