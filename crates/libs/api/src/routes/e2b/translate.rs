@@ -916,7 +916,7 @@ pub(super) fn e2b_metadata_value(value: &SandboxMetadataValue) -> String {
 }
 
 pub(crate) fn translate_sandbox_state(native: &SandboxResponse) -> Option<SandboxStateE2b> {
-    translate_lifecycle_state(raw_sandbox_lifecycle(native))
+    ecw_sandbox_state(&native.state_input)
 }
 
 fn translate_detail_sandbox_state(native: &SandboxResponse) -> Option<SandboxStateE2b> {
@@ -934,14 +934,6 @@ pub(super) fn terminal_sandbox_error(native: &SandboxResponse) -> E2bApiError {
     }
 }
 
-fn raw_sandbox_lifecycle(native: &SandboxResponse) -> &str {
-    native
-        .status
-        .as_deref()
-        .or(native.lifecycle.as_deref())
-        .unwrap_or("started")
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TerminalSandboxState {
     Failed,
@@ -949,22 +941,43 @@ enum TerminalSandboxState {
 }
 
 fn terminal_sandbox_state(native: &SandboxResponse) -> Option<TerminalSandboxState> {
-    terminal_state(raw_sandbox_lifecycle(native))
+    ecw_terminal_state(&native.state_input)
 }
 
-fn terminal_state(raw: &str) -> Option<TerminalSandboxState> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "failed" | "quarantined" => Some(TerminalSandboxState::Failed),
-        "stopped" => Some(TerminalSandboxState::Stopped),
-        _ => None,
-    }
+/// The lifecycle both ECW renders read.
+fn ecw_lifecycle(state: &SandboxStateInput) -> String {
+    // The node's observed status wins over the stored lifecycle; a sandbox
+    // with neither reads as started.
+    state
+        .observed_status()
+        .or(state.stored_lifecycle())
+        .unwrap_or("started")
+        .trim()
+        .to_ascii_lowercase()
 }
 
-pub(super) fn translate_lifecycle_state(raw: &str) -> Option<SandboxStateE2b> {
-    match raw.trim().to_ascii_lowercase().as_str() {
+/// The ECW state of a stored lifecycle read without its node's observation.
+pub(super) fn translate_lifecycle_state(lifecycle: &str) -> Option<SandboxStateE2b> {
+    ecw_sandbox_state(&SandboxStateInput::stored(lifecycle))
+}
+
+/// The ECW state: `None` hides a stopped or failed sandbox, and every
+/// lifecycle ECW does not name reads as running.
+fn ecw_sandbox_state(state: &SandboxStateInput) -> Option<SandboxStateE2b> {
+    match ecw_lifecycle(state).as_str() {
         "paused" | "suspended" => Some(SandboxStateE2b::Paused),
         "stopped" | "failed" | "quarantined" => None,
         _ => Some(SandboxStateE2b::Running),
+    }
+}
+
+/// Whether ECW reports a terminal sandbox as failed, or as stopped and so
+/// not found.
+fn ecw_terminal_state(state: &SandboxStateInput) -> Option<TerminalSandboxState> {
+    match ecw_lifecycle(state).as_str() {
+        "failed" | "quarantined" => Some(TerminalSandboxState::Failed),
+        "stopped" => Some(TerminalSandboxState::Stopped),
+        _ => None,
     }
 }
 
