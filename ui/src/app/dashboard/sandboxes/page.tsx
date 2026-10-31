@@ -606,6 +606,8 @@ function SandboxesPage() {
   const [editingLifecycleSandbox, setEditingLifecycleSandbox] = useState<Sandbox | null>(null);
   const [editingNetworkSandbox, setEditingNetworkSandbox] = useState<Sandbox | null>(null);
   const [manualRefreshing, setManualRefreshing] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const creatingRef = useRef(false);
   const [refreshCooldown, setRefreshCooldown] = useState(false);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const refreshCooldownRef = useRef(false);
@@ -750,9 +752,11 @@ function SandboxesPage() {
     org_id?: string;
     template: string;
     runtime: string;
-    boot_mode?: string;
     snapshots?: boolean;
   }) => {
+    if (creatingRef.current) return;
+    creatingRef.current = true;
+    setCreating(true);
     try {
       const payload = {
         name: values.name || null,
@@ -821,6 +825,9 @@ function SandboxesPage() {
       });
     } catch (err: any) {
       message.error(err.message);
+    } finally {
+      creatingRef.current = false;
+      setCreating(false);
     }
   };
 
@@ -1210,13 +1217,6 @@ function SandboxesPage() {
                 ))}
               </Select>
             </Form.Item>
-            <Form.Item name="boot_mode" style={{ marginBottom: 0 }}>
-              <Select placeholder="Boot mode" style={{ width: 140 }} allowClear>
-                <Select.Option value="cold">Cold boot</Select.Option>
-                <Select.Option value="snapshot">Snapshot</Select.Option>
-                <Select.Option value="pool">Pool</Select.Option>
-              </Select>
-            </Form.Item>
             <Form.Item name="snapshots" valuePropName="checked" style={{ marginBottom: 0 }}>
               <Checkbox>Snapshots</Checkbox>
             </Form.Item>
@@ -1229,7 +1229,7 @@ function SandboxesPage() {
                   Clear
                 </Button>
               ) : null}
-              <Button type="primary" htmlType="submit" icon={<PlusOutlined />}>Create</Button>
+              <Button type="primary" htmlType="submit" icon={<PlusOutlined />} loading={creating}>Create</Button>
             </Space>
           </div>
         </Form>
