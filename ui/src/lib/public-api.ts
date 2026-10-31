@@ -1,6 +1,7 @@
 import { OperationFailedError, OperationTimeoutError } from './accepted-create';
 import { adminApi, api, ApiError } from './api';
 import { parseSandboxRef, publicSandboxIdFromAny } from './sandbox-id';
+import type { SandboxDebug } from './sandbox-debug';
 import {
   PublicOperationRecord,
   PublicPage,
@@ -45,6 +46,33 @@ export async function getConsoleSandbox(id: string): Promise<Sandbox> {
     throw new ApiError(400, 'Not a sandbox ID, UUID or sandbox pod name');
   }
   return adminSandboxToConsoleSandbox(await adminApi.get<Sandbox>(`/v1/sandboxes/${ref.publicId}`));
+}
+
+export interface AdminOperationRecord extends PublicOperationRecord {
+  org_id: string | null;
+  actor_user_id: string | null;
+  api_product: string | null;
+  target_type: string | null;
+  target_id: string | null;
+  attempts: number;
+  requested_at: string | null;
+}
+
+// Everything the control plane records about one sandbox, from the admin
+// debug route, which takes the bare UUID.
+export async function getSandboxDebug(id: string): Promise<SandboxDebug> {
+  const ref = parseSandboxRef(id);
+  if (!ref) throw new ApiError(400, 'Not a sandbox ID, UUID or sandbox pod name');
+  return adminApi.get<SandboxDebug>(`/v1/debug/sandbox/${ref.uuid}`);
+}
+
+// Lifecycle operations recorded against a sandbox, newest first. They outlive
+// the sandbox row, so they also explain a sandbox that was deleted.
+export async function getSandboxOperations(id: string, limit = 50): Promise<AdminOperationRecord[]> {
+  const ref = parseSandboxRef(id);
+  if (!ref) throw new ApiError(400, 'Not a sandbox ID, UUID or sandbox pod name');
+  const params = new URLSearchParams({ target_type: 'sandbox', target_id: ref.publicId, limit: String(limit) });
+  return adminApi.get<AdminOperationRecord[]>(`/v1/operations?${params}`);
 }
 
 export async function postPublicOperation(
