@@ -48,6 +48,15 @@
 //!   A predicate that is neither shared nor latency-bound is still better off
 //!   as a `get` plus a filter.
 //!
+//! # Fact kinds
+//!
+//! Where a write's doc names the kind of fact it writes, the kinds are: an
+//! **intent** records what a caller asked for; an **operation step** claims,
+//! advances or ends in-flight work, such as a lease, a marker or a
+//! compensation; an **observed projection** copies what a node reported onto
+//! the row; and an **inference** is the control plane concluding something on
+//! its own, such as a sweeper's age limit, a repair or a drain give-up.
+//!
 //! # Growth policy
 //!
 //! [`SandboxRecord`] carries the row's identity/state core, not every column.
@@ -73,6 +82,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 mod create;
+pub mod delete;
 pub mod fork_source_lifecycle;
 pub mod lost;
 
