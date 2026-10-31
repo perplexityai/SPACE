@@ -144,15 +144,26 @@ export interface SandboxDebug {
   timeline: DebugSection<DebugTimelineEvent[]>;
 }
 
-// One line describing a timeline event's detail, most informative fields first.
+// One line describing a timeline event's detail, most informative fields
+// first. The keys are the ones the debug route's timeline source builds for
+// each event (`crates/libs/api/src/routes/debug/sources/timeline.rs`).
+const TIMELINE_DETAIL_KEYS = [
+  'lifecycle', 'placement', 'status', 'state', 'pod_name', 'generation', 'k8s_node_name',
+  'snapshot_type', 'retention_tier', 'size_bytes', 'disk_usage_bytes', 'failure_reason',
+  'protocol', 'guest_port', 'visibility', 'desired_state', 'apply_state', 'last_error', 'last_bridge_status',
+  'missing_publish_count',
+];
+const BYTE_KEYS = new Set(['size_bytes', 'disk_usage_bytes']);
+
 export function summarizeTimelineDetail(event: DebugTimelineEvent): string {
   const detail = event.detail ?? {};
-  const keys = ['lifecycle', 'state', 'placement', 'pod_name', 'generation', 'snapshot_type', 'size_bytes', 'failure_reason', 'guest_port', 'error'];
   const parts: string[] = [];
-  for (const key of keys) {
+  for (const key of TIMELINE_DETAIL_KEYS) {
     const value = detail[key];
     if (value === null || value === undefined || value === '') continue;
-    parts.push(`${key.replace(/_/g, ' ')}: ${key === 'size_bytes' ? formatBytes(Number(value)) : String(value)}`);
+    // A node that never missed a report is not news.
+    if (key === 'missing_publish_count' && Number(value) === 0) continue;
+    parts.push(`${key.replace(/_/g, ' ')}: ${BYTE_KEYS.has(key) ? formatBytes(Number(value)) : String(value)}`);
   }
   return parts.join(' · ');
 }
@@ -188,4 +199,24 @@ export function formatAge(value: string | null | undefined, nowMs: number): stri
 // Metadata values are usually strings; anything else renders as compact JSON.
 export function formatMetadataValue(value: unknown): string {
   return typeof value === 'string' ? value : JSON.stringify(value);
+}
+
+// Merge operation pages read under different target IDs: one row per
+// operation, newest first, at most `limit`.
+export function mergeOperationPages<T extends { id: string; created_at: string }>(
+  pages: T[][],
+  limit: number,
+): { operations: T[]; more: boolean } {
+  const seen = new Set<string>();
+  const merged: T[] = [];
+  for (const op of pages.flatMap((page) => page.slice(0, limit))) {
+    if (seen.has(op.id)) continue;
+    seen.add(op.id);
+    merged.push(op);
+  }
+  merged.sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at) || b.id.localeCompare(a.id));
+  return {
+    operations: merged.slice(0, limit),
+    more: merged.length > limit || pages.some((page) => page.length > limit),
+  };
 }
