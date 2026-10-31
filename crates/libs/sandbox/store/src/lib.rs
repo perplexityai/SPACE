@@ -10,7 +10,7 @@
 //!
 //! # Boundaries
 //!
-//! * **Writes touch `sandboxes` only, and only its unguarded columns.** Of
+//! * **Plain verbs write `sandboxes` only, and only its unguarded columns.** Of
 //!   the 81 production `UPDATE sandboxes` statements outside the node-local
 //!   SQLite table, 70 re-check a precondition in their `WHERE` and five more
 //!   are placement transitions; none of those belong here. What is left is
@@ -26,8 +26,11 @@
 //!   CAS, the restore claims) are correctness mechanisms, not row updates —
 //!   they stay named, guarded operations wherever they live, and no plain
 //!   `update` verb here may absorb one. A new one lands here in its own
-//!   module, named for the transition, as [`lost`] does; the caller
-//!   keeps the locks and the other tables' writes around it.
+//!   module, named for its transition or for the path that issues it, as
+//!   [`lost`] and [`ingest`] are; the caller keeps the locks and the other
+//!   tables' writes around it. A transition that is one statement whose CTEs
+//!   also write a sibling table, as several in [`ingest`] do, stays one
+//!   statement: splitting it would change what it does.
 //! * **Locking reads are not gets.** `SELECT ... FOR UPDATE` acquires a row
 //!   lock inside a caller's transaction; converting one to [`get`] would drop
 //!   the lock. They stay at their call sites.
@@ -47,6 +50,15 @@
 //!   the caller keeps the domain logic that decides which ids to ask about.
 //!   A predicate that is neither shared nor latency-bound is still better off
 //!   as a `get` plus a filter.
+//!
+//! # Fact kinds
+//!
+//! Where a transition's doc names the kind of fact it writes, the kinds are:
+//! an **intent** records what a caller asked for; an **operation step**
+//! claims, advances or ends in-flight work, such as a lease, a marker or a
+//! compensation; an **observed projection** copies what a node reported onto
+//! the row; and an **inference** is the control plane concluding something on
+//! its own, such as a sweeper's age limit, a repair or a drain give-up.
 //!
 //! # Growth policy
 //!
@@ -74,6 +86,7 @@ use uuid::Uuid;
 
 mod create;
 pub mod fork_source_lifecycle;
+pub mod ingest;
 pub mod lost;
 
 pub use create::{SandboxCreate, insert_pooled, insert_unplaced};

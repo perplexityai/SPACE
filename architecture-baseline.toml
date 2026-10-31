@@ -53,7 +53,7 @@
 "crates/libs/internal/api/server/src/data_plane_sessions.rs" = 1780
 "crates/libs/internal/api/server/src/lib.rs" = 1222
 "crates/libs/internal/api/server/src/metadata.rs" = 1078
-"crates/libs/internal/api/server/src/published_state.rs" = 3750
+"crates/libs/internal/api/server/src/published_state.rs" = 3658
 "crates/libs/metrics/src/sandbox/api.rs" = 1036
 "crates/libs/metrics/src/sandbox/worker.rs" = 1397
 "crates/libs/net/common/src/lib.rs" = 1508
@@ -172,9 +172,8 @@
 "crates/libs/cluster/controller/server/src/tombstone_retention.rs" = 1
 "crates/libs/cluster/controller/server/src/transient_lifecycle_sweeper/store.rs" = 12
 "crates/libs/internal/api/server/src/data_plane_sessions/service_route.rs" = 1
-"crates/libs/internal/api/server/src/published_state.rs" = 9
-"crates/libs/internal/api/server/src/sandbox_quarantine_store.rs" = 3
-"crates/libs/internal/api/server/src/status.rs" = 1
+"crates/libs/internal/api/server/src/published_state.rs" = 3
+"crates/libs/internal/api/server/src/sandbox_quarantine_store.rs" = 1
 "crates/libs/placement/machine/src/postgres.rs" = 1
 "crates/libs/sandbox/teardown/src/lib.rs" = 1
 

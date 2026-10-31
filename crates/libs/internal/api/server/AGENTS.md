@@ -31,7 +31,8 @@ table (`node_direct`, `sandbox_direct_route_*`), read the
   the write or under a `FOR UPDATE` or `FOR NO KEY UPDATE` row lock taken in
   the same transaction, that `active_node_id` is the authenticated publisher
   and that the current lifecycle is one it may leave, as the restored,
-  stopped, failed and quarantined projections (`src/published_state.rs`) do.
+  stopped, failed and quarantined projections (`src/published_state.rs` and
+  `pplx_space_sandbox_store::ingest`) do.
   Existing exceptions: activation-completion receipts recheck only the
   lifecycle and are fenced by the execution attempt they release
   (generation, attempt, `active`); delete receipts for stopped or suspended
