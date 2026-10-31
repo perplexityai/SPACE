@@ -24,8 +24,9 @@
 //!   time restores under the cluster policy. A `started` row left with no
 //!   active node by that race is adopted the same way when its worker is
 //!   looked up, including by `probe_runtime_client`. A cross-node restore
-//!   deletes the source copy only when it reads a record there that holds no
-//!   VM. Delete reaches the active node, else that target node; with neither
+//!   deletes the source copy only when it reads a record there whose
+//!   lifecycle is outside the live set (`lifecycle_holds_live_runtime`); it
+//!   keeps a live, undecodable or unreadable record. Delete reaches the active node, else that target node; with neither
 //!   it returns `Unavailable` and the caller removes the row without
 //!   node-local teardown.
 //! - Warm-pool claims adopt node-side.
@@ -550,14 +551,16 @@ fn resident_is_dormant(resident: &pplx_space_sbx_mgr_client::proto::SandboxInfo)
     )
 }
 
-/// Whether a record in `lifecycle` holds a VM, or is moving into or out of
-/// one. A restore's `Start` always carries a newly reserved execution
+/// Whether `lifecycle` is in the live set: a record running a VM, or moving
+/// into or out of one. A lifecycle outside it does not prove the VM stopped:
+/// a quarantine after an unconfirmed pause may still hold one. A restore's
+/// `Start` always carries a newly reserved execution
 /// generation: a started record running another execution refuses it, and a
 /// `Restoring` record resumes its interrupted restore instead of starting
 /// that one. A restore on another worker would run a second copy, so such a
 /// record is adopted when its fence allows
 /// (`DirectSubstrate::adopt_live_source_record`), and a cross-node restore's
-/// cleanup never deletes it.
+/// cleanup never deletes a record in this set.
 fn lifecycle_holds_live_runtime(
     lifecycle: pplx_space_sbx_mgr_client::proto::SandboxLifecycleState,
 ) -> bool {
@@ -3325,9 +3328,13 @@ impl DirectSubstrate {
     /// - On a tokenless row no restore owner can still persist a receipt or
     ///   complete: both fence on the token, which a claim writes and leaving
     ///   `restoring` clears. A reservation above the record was abandoned, or
-    ///   is a wake through this node's Wake, which the adoption joins.
-    /// - A newer execution on another worker would have moved the route
-    ///   identity there: a receipt moves it only to the row's active node.
+    ///   is a wake through this node's Wake, which the adoption joins. An
+    ///   abandoned restore may still have started a VM on another worker.
+    /// - A newer execution whose receipt landed on another worker would have
+    ///   moved the route identity there: a receipt moves it only to the row's
+    ///   active node. A restore whose receipt was refused after its lease was
+    ///   cleared can leave an untracked copy on another worker; no route
+    ///   reaches it, so adopting this node's record is still right.
     /// - A row that still holds a token (`restoring`, its lease expired) may
     ///   have an owner whose Start ran and whose receipt has not landed.
     ///   Adopting clears the token that receipt fences on, and an owner whose
@@ -3485,7 +3492,7 @@ impl DirectSubstrate {
 
         // A wake that raced the source's suspend can leave a live record
         // there, newer than the snapshot just restored, so the cleanup deletes
-        // only a record whose lifecycle it reads as one that holds no VM.
+        // only a record whose lifecycle it reads as outside the live set.
         match tokio::time::timeout(
             DIRECT_SOURCE_RECORD_READ_TIMEOUT,
             node_sandbox_record(&mut client, sandbox_id),
