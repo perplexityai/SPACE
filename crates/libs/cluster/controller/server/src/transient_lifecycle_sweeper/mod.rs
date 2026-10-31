@@ -188,7 +188,7 @@ use std::time::{Duration, Instant};
 
 use pplx_space_api::controllers::substrate::{
     AbandonedRestoreRetirement, CommandReadyProbe, PodFenceMismatch, RetireExecutionOutcome,
-    RetireFence, Substrate,
+    RetireFence, RetireStopRoute, Substrate,
 };
 use pplx_space_common_core::types::{PositiveDuration, SandboxId, SandboxLifecycle};
 use pplx_space_events::{
@@ -1362,11 +1362,13 @@ pub trait SweepSink: Send + Sync + 'static {
     ) -> impl std::future::Future<Output = Result<(), sqlx::Error>> + Send;
 
     /// Same contract as [`Self::cleanup_after_sweep`], for the failed-cleanup
-    /// pass's own candidates.
+    /// pass's own candidates, with `stop_route` naming where the retire sends
+    /// its in-VM stop.
     fn cleanup_failed_execution(
         &self,
         sandbox_id: SandboxId,
         fence: RetireFence,
+        stop_route: RetireStopRoute,
     ) -> impl std::future::Future<Output = Result<RetireExecutionOutcome, String>> + Send;
 
     /// CAS-repair a `failed` k8s sandbox that still has an active execution
@@ -2795,10 +2797,23 @@ impl<S: SweepSink> Reconciler<S> {
             .debug();
             report.failed_cleanup_attempts += 1;
 
+            // When a node answered the probe, by node name, that no VM is
+            // live, the stop goes back to that node's node-api. The pod's own
+            // IP reaches it only through forwarding in the pod's network
+            // namespace, which can be gone with the VM while the pod still
+            // looks Running; a stop sent there would fail on every tick. An
+            // execution that names no node is `missing_on_node` without a
+            // probe, and has no node-api to go back to, so it keeps the
+            // execution's own route, as does a live VM being retired.
+            let stop_route = if verdict.permits_failed_retire() && candidate.node_name.is_some() {
+                RetireStopRoute::Node
+            } else {
+                RetireStopRoute::Execution
+            };
             emit_failed_cleanup_event(sandbox_id, SandboxEventType::CleanupStarted, None, None);
             match self
                 .sink
-                .cleanup_failed_execution(sandbox_id, candidate.pod_fence.clone())
+                .cleanup_failed_execution(sandbox_id, candidate.pod_fence.clone(), stop_route)
                 .await
             {
                 Ok(RetireExecutionOutcome::Retired) => {

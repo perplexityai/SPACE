@@ -1796,12 +1796,13 @@ impl SweepSink for SubstrateSweepSink {
         &self,
         sandbox_id: SandboxId,
         fence: RetireFence,
+        stop_route: RetireStopRoute,
     ) -> Result<RetireExecutionOutcome, String> {
         self.substrate
             .retire_execution(RetireExecutionRequest {
                 sandbox_id,
                 fence,
-                stop_route: RetireStopRoute::Execution,
+                stop_route,
             })
             .await
             .map_err(|err| err.to_string())
