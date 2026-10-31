@@ -42,8 +42,9 @@ const menuItems: DashboardMenuItem[] = [
 ];
 
 export default function DashboardLayout({ children }: { children: React.ReactNode }) {
-  const { user, org, cluster, loading, logout, reloadCluster } = useAuth();
+  const { user, org, cluster, loading, logout, reloadCluster, authMode } = useAuth();
   const [reloadingCluster, setReloadingCluster] = useState(false);
+  const [clusterRetryError, setClusterRetryError] = useState<string | null>(null);
   const { mode, setMode, isDark } = useTheme();
   const { config, buttonClassName, primaryColor, surfaces } = useCuriosityTheme(org?.theme_primary);
   const router = useRouter();
@@ -74,14 +75,17 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
   if (loading || !user || !org) return null;
 
   const access = consoleAccess(user, cluster);
+  const providerSignOutOnly = authMode?.mode === 'external' && !authMode.logoutUrl;
   const visibleItems = access === 'operator' ? menuItems : [];
 
   const retryCluster = async () => {
     setReloadingCluster(true);
     try {
       await reloadCluster();
-    } catch {
-      // The notice stays up; the next Retry tries again.
+      setClusterRetryError(null);
+    } catch (err) {
+      // The notice stays up with the error; the next Retry tries again.
+      setClusterRetryError(err instanceof Error ? err.message : 'request failed');
     } finally {
       setReloadingCluster(false);
     }
@@ -145,7 +149,12 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
               <Result
                 status="warning"
                 title="Could not load cluster information"
-                subTitle="The console needs the cluster record to tell whether your organization manages this cluster."
+                subTitle={
+                  <>
+                    The console needs the cluster record to tell whether your organization manages this cluster.
+                    {clusterRetryError ? <><br />Retry failed: {clusterRetryError}</> : null}
+                  </>
+                }
                 extra={
                   <Button type="primary" icon={<ReloadOutlined />} loading={reloadingCluster} onClick={retryCluster}>
                     Retry
@@ -156,11 +165,23 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
               <Result
                 status="403"
                 title="This console is for cluster operators"
-                subTitle={`You are signed in as ${user.email} (${org.name}). The admin console requires an organization admin of the organization that manages this cluster.`}
+                subTitle={
+                  <>
+                    You are signed in as {user.email} ({org.name}). The admin console requires an organization admin of the
+                    organization that manages this cluster.
+                    {providerSignOutOnly ? (
+                      <><br />To use another account, sign out of {authMode?.mode === 'external' ? authMode.providerName : 'your sign-in provider'}.</>
+                    ) : null}
+                  </>
+                }
                 extra={
-                  <Button type="primary" icon={<LogoutOutlined />} onClick={() => setLogoutConfirmationOpen(true)}>
-                    Log out
-                  </Button>
+                  // External sign-in without a logout URL can only return to
+                  // /login, which signs the same account in again.
+                  providerSignOutOnly ? null : (
+                    <Button type="primary" icon={<LogoutOutlined />} onClick={() => setLogoutConfirmationOpen(true)}>
+                      Log out
+                    </Button>
+                  )
                 }
               />
             )}
