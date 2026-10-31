@@ -20,11 +20,12 @@ mod tests;
 pub use error::{PoolError, Result};
 #[cfg(feature = "kubernetes")]
 pub use models::{
-    AutoscaleRead, AutoscaleRun, ClaimedPoolSlot, ClaimedSlotBindSource, FailedAutoscaleCandidate,
-    InvalidAutoscaleRow, InvalidPoolConfigRow, ManualPoolConfigSpec, NewPoolSlot,
-    OpenPoolSlotDeleteLock, PoolAssignment, PoolConfig, PoolConfigRead, PoolConfigWithCounts,
-    PoolSlot, PoolSlotCounts, ProtectedTemplateRelease, ReleasePoolConfigWithCounts,
-    ReservedPoolSlot,
+    AutoscaleRead, AutoscaleRun, ClaimedPoolSlot, ClaimedSlotBindSource, DeletedDisabledWarmPools,
+    FailedAutoscaleCandidate, InvalidAutoscaleRow, InvalidPoolConfigRow, ManualPoolConfigSpec,
+    NewPoolSlot, OpenPoolSlotDeleteLock, PoolAssignment, PoolConfig, PoolConfigRead,
+    PoolConfigWithCounts, PoolSlot, PoolSlotCounts, ProtectedTemplateRelease,
+    ReleasePoolConfigWithCounts, ReservedPoolSlot, TEMPLATE_USAGE_SANDBOX_ID_LIMIT,
+    TemplateWarmPoolUsage, WarmPoolConfigRef, WarmPoolPolicyShape,
 };
 #[cfg(feature = "kubernetes")]
 pub use owner::{PoolConfigOwner, PoolConfigOwnerParseError};
