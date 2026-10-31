@@ -1587,6 +1587,9 @@ fn config_enabled(max_per_node: usize, max_per_cluster: usize) -> ReconcilerConf
         // here changes nothing — which is why it says so rather than implying
         // a gate that is not here.
         evacuate_stopped_residents: true,
+        // Not read by `Reconciler` either: the sink holds its own copy, and
+        // `store::stopped_evacuation_tests` owns the gate.
+        replace_stopped_evacuations: true,
         tick: Duration::from_millis(1),
         max_per_node,
         max_per_cluster,
@@ -1692,28 +1695,46 @@ fn c7_backup_queue_flag_is_read_from_the_config_environment() {
 }
 
 /// An operator turns stopped-resident evacuation on with its env var, and it
-/// takes effect only alongside the termination-blocking gate. Read from the
-/// environment the config is built from, like its siblings, so the default,
-/// the flag alone and the pair each resolve as documented.
+/// takes effect only alongside the termination-blocking gate and stopped
+/// re-placement. Read from the environment the config is built from, like its
+/// siblings, so the default, each flag missing in turn, and all three resolve as
+/// documented.
 #[test]
 fn c6_stopped_evacuation_flag_is_read_from_the_config_environment() {
-    let unset = ReconcilerConfig::from_environment(&pplx_space_test_env::TestEnv::default());
+    const EVACUATE: &str = "SPACE_NODE_DRAIN_EVACUATE_STOPPED_RESIDENTS";
+    const GATE: &str = "SPACE_NODE_DRAIN_TERMINATION_BLOCKING_GATE";
+    const REPLACE: &str = "SPACE_NODE_DRAIN_REPLACE_STOPPED_EVACUATIONS";
+    let config_with = |flags: &[&str]| {
+        let mut env = pplx_space_test_env::TestEnv::default();
+        for flag in flags {
+            env.set(flag, "true");
+        }
+        ReconcilerConfig::from_environment(&env)
+    };
+
+    let unset = config_with(&[]);
     assert!(!unset.evacuate_stopped_residents);
+    assert!(!unset.replace_stopped_evacuations);
     assert!(!unset.evacuates_stopped_residents());
 
-    let mut flag_only = pplx_space_test_env::TestEnv::default();
-    flag_only.set("SPACE_NODE_DRAIN_EVACUATE_STOPPED_RESIDENTS", "true");
-    let flag_only = ReconcilerConfig::from_environment(&flag_only);
-    assert!(flag_only.evacuate_stopped_residents);
-    assert!(
-        !flag_only.evacuates_stopped_residents(),
-        "without the termination-blocking gate the flag stays off"
-    );
+    let all = config_with(&[EVACUATE, GATE, REPLACE]);
+    assert!(all.replace_stopped_evacuations);
+    assert!(all.evacuates_stopped_residents());
 
-    let mut both = pplx_space_test_env::TestEnv::default();
-    both.set("SPACE_NODE_DRAIN_EVACUATE_STOPPED_RESIDENTS", "true");
-    both.set("SPACE_NODE_DRAIN_TERMINATION_BLOCKING_GATE", "true");
-    assert!(ReconcilerConfig::from_environment(&both).evacuates_stopped_residents());
+    for missing in [EVACUATE, GATE, REPLACE] {
+        let flags: Vec<&str> = [EVACUATE, GATE, REPLACE]
+            .into_iter()
+            .filter(|flag| *flag != missing)
+            .collect();
+        assert!(
+            !config_with(&flags).evacuates_stopped_residents(),
+            "without {missing} stopped-resident evacuation stays off"
+        );
+    }
+
+    // Re-placement reads only its own flag: it finishes evacuations opened
+    // while the others were on.
+    assert!(config_with(&[REPLACE]).replace_stopped_evacuations);
 }
 
 #[test]

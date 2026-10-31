@@ -644,7 +644,7 @@ async fn completed_actions_keep_a_terminal_lifecycle_that_landed_mid_flight() ->
 /// tombstone. Swept here over every stored value with today's outcome, so a
 /// change to that guard fails this table. Columns: `stamp` is
 /// `maybe_update_sandbox_lifecycle` with the pause stamp `paused`;
-/// `state_stamp` is `maybe_update_sandbox_state` with start's
+/// `state_stamp` is start's `maybe_mark_started_after_start`, which writes
 /// `started`/`on_node`; `post_wake` is `update_and_fetch_post_wake_sandbox`.
 ///
 /// `!` marks the known defect `completed_actions_keep_a_terminal_lifecycle_that_landed_mid_flight`
@@ -720,7 +720,7 @@ async fn post_action_stamps_write_every_stored_lifecycle_but_the_terminal_ones()
                     (Row::new("paused", "unplaced"), None)
                 }
                 Writer::StateStamp => {
-                    maybe_update_sandbox_state(pool, sandbox_id, "started", "on_node").await;
+                    maybe_mark_started_after_start(pool, sandbox_id).await;
                     (Row::new("started", "on_node"), None)
                 }
                 Writer::PostWake => {
@@ -750,7 +750,7 @@ async fn post_action_stamps_write_every_stored_lifecycle_but_the_terminal_ones()
 
 /// A native start operation whose post-result writes find a `stopped` written
 /// while its runtime call was in flight write `started` over it: first
-/// `maybe_update_sandbox_state(.., "started", "on_node")`, then the shared
+/// `maybe_mark_started_after_start`, then the shared
 /// `maybe_update_sandbox_lifecycle`. The lifecycle operation executor reports
 /// success, without a retry, with the sandbox running. This pins today's
 /// start write, which has no CAS on the lifecycle it read (only the terminal

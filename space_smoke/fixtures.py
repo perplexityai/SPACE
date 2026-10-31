@@ -80,6 +80,7 @@ from space_smoke.capabilities import (
     ProcessSandbox,
     ResidentLifecycleSandbox,
     StoppableLifecycleSandbox,
+    StoppedReplacementControl,
     RetentionSweeperConfig,
     SandboxInfo,
     SandboxPages,
@@ -113,6 +114,7 @@ from space_smoke.drain_gate import DrainGateAssertions
 from space_smoke.rate_limiters import RateLimiterAssertions
 from space_smoke.sandbox_network_isolation import SandboxNetworkIsolationAssertions
 from space_smoke.storage_exchange import StorageExchangeScopingAssertions
+from space_smoke.stopped_replacement import StoppedReplacementAssertions
 from space_smoke.telemetry_delivery import TelemetryDeliveryAssertions
 from space_smoke.leader_election import LeaderElectionAssertions
 from space_smoke.config import DEFAULT_SANDBOX_TIMEOUT_SECONDS
@@ -866,6 +868,7 @@ class CommandSandboxFixture:
     _stoppable_lifecycle: StoppableLifecycleSandbox | None = None
     _local_cleanup_control: ColdEvictionControl | None = None
     _encrypted_resuspend_control: EncryptedResuspendControl | None = None
+    _stopped_replacement_control: StoppedReplacementControl | None = None
     _processes: ProcessSandbox | None = None
 
     fixture_name: ClassVar[str] = "command_sandbox"
@@ -895,12 +898,36 @@ class CommandSandboxFixture:
             )
         return EncryptedResuspendAssertions(self, self._encrypted_resuspend_control)
 
+    @property
+    def stopped_replacement(self) -> StoppedReplacementAssertions:
+        """Drain the worker of a stopped sandbox and judge its re-placement, stopped, elsewhere.
+
+        Each access builds fresh assertions that own the scenario's drain and
+        env compensations, so a scenario takes it once.
+        """
+
+        if self._stopped_replacement_control is None or self._stoppable_lifecycle is None:
+            raise SmokeConfigurationError(
+                "stopped re-placement control is only available on the kind backend "
+                "with a stop/start lifecycle"
+            )
+        return StoppedReplacementAssertions(
+            self, self._stopped_replacement_control, self._context.scope
+        )
+
     def phase(self, name: str) -> AbstractContextManager[None]:
         return self._context.phase(name)
 
     def record(self, name: str, value: object) -> None:
         """Attach a named fact to the scenario's evidence without asserting it."""
         self._context.record(name, value)
+
+    def wait(self, seconds: float, *, reason: str | None = None) -> None:
+        if reason is None:
+            self._context.wait(seconds)
+            return
+        with self.phase(f"wait {reason}"):
+            self._context.wait(seconds)
 
     def verify(
         self,
@@ -1435,13 +1462,6 @@ class Ecw(CommandSandboxFixture):
         """Public protocol probes unavailable through the high-level SDK."""
 
         return self.sandbox.compatibility
-
-    def wait(self, seconds: float, *, reason: str | None = None) -> None:
-        if reason is None:
-            self._context.wait(seconds)
-            return
-        with self.phase(f"wait {reason}"):
-            self._context.wait(seconds)
 
     @contextmanager
     def watch_directory(

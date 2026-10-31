@@ -186,8 +186,11 @@ async fn claim_evacuation_suspend(
 /// mode reads as gentle everywhere else, and gentle promises not to touch
 /// residents.
 ///
-/// **A fresh claim requires `current_local_artifact_id IS NULL` — a backstop,
-/// not the guarantee.** The guarantee lives one call earlier, in
+/// **A fresh claim requires `current_local_artifact_id IS NULL`, or the one pin
+/// its caller matched against the node while that pin's backup is durable — a
+/// backstop, not the guarantee.** The second shape is a re-placed sandbox drained
+/// again; see step 0d of `evacuate_stopped_sandbox`. The
+/// guarantee lives one call earlier, in
 /// [`SubstrateSink::node_reported_artifact`], because the row that decides
 /// whether the next publish mints or reuses is sbx-mgr's, not this one. Read
 /// that first; this conjunct is here to make the refusal *atomic with the
@@ -327,7 +330,9 @@ async fn claim_stopped_evacuation(
     sandbox_id: SandboxId,
     source_node_id: NodeId,
     allow_new_claims: bool,
+    reused_durable_artifact: Option<LocalArtifactId>,
 ) -> Result<StoppedEvacuationClaim, sqlx::Error> {
+    let durable = current_disk_artifact_backup_ready("s");
     // The `prior` CTE reads the marker as it was before this statement: a
     // single statement evaluates against one snapshot, so the join yields the
     // pre-UPDATE value even though the SET overwrites it. That distinction is
@@ -335,7 +340,7 @@ async fn claim_stopped_evacuation(
     // one per evacuation instead of one per tick for the length of a
     // multi-gigabyte upload, which on a node carrying dozens of stopped
     // residents is the difference between a timeline and a flood.
-    let claimed: Option<bool> = sqlx::query_scalar(sql!(
+    let query = format!(
         // `prior` exists for one reason: this UPDATE overwrites
         // `evacuation_restore_target`, so `RETURNING` cannot tell a fresh claim
         // from a resumed one without the pre-write value. Nothing
@@ -390,7 +395,16 @@ async fn claim_stopped_evacuation(
                     --
                     -- Proved by a two-transaction test; reading the SQL does not
                     -- show it.
-                    AND s.current_local_artifact_id IS NULL
+                    --
+                    -- The one pinned row a fresh claim takes is the one the
+                    -- caller already matched against the node (`$6`, NULL
+                    -- otherwise, and `= NULL` is never true), and only while
+                    -- its artifact is still a durable disk backup of this
+                    -- sandbox; see step 0d of `evacuate_stopped_sandbox`.
+                    AND (
+                        s.current_local_artifact_id IS NULL
+                        OR (s.current_local_artifact_id = $6 AND {durable})
+                    )
                 )
                 OR prior.evacuation_restore_target = 'stopped'
             )
@@ -402,14 +416,16 @@ async fn claim_stopped_evacuation(
                    AND n.drain_mode = $4
             )
       RETURNING prior.evacuation_restore_target IS NULL"
-    ))
-    .bind(sandbox_id)
-    .bind(source_node_id)
-    .bind(PHASE_DRAINING)
-    .bind(NodeDrainMode::Forced)
-    .bind(allow_new_claims)
-    .fetch_optional(pool)
-    .await?;
+    );
+    let claimed: Option<bool> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(query.as_str())))
+        .bind(sandbox_id)
+        .bind(source_node_id)
+        .bind(PHASE_DRAINING)
+        .bind(NodeDrainMode::Forced)
+        .bind(allow_new_claims)
+        .bind(reused_durable_artifact)
+        .fetch_optional(pool)
+        .await?;
     Ok(match claimed {
         Some(true) => StoppedEvacuationClaim::Claimed,
         Some(false) => StoppedEvacuationClaim::Resumed,
@@ -479,14 +495,13 @@ impl StoppedEvacuationClaim {
 /// **The pin outlives an abandoned evacuation.** An `:undrain` before the
 /// teardown leaves the row `stopped` with this pin *and* the marker, so a later
 /// forced drain resumes the evacuation rather than opening a new one. Once the
-/// owner starts the sandbox, the lifecycle change drops the marker but nothing
-/// on the Kubernetes start path clears the pin: a later forced drain then
-/// refuses the sandbox at the cluster-pin check, and the disk-only restore
-/// selector offers this artifact to later starts, whose plan turns the source
-/// node into a preference with S3 as the fallback. A start that lands on
-/// another node takes the cross-node disk path, which cannot finish today and
-/// would restore stale bytes once it can. That blocks enabling the flag until
-/// the pin is cleared on a start or written later in the sequence.
+/// owner starts the sandbox, the lifecycle change drops the marker, and the
+/// start's own post-start write drops this `disk` pin
+/// (`maybe_mark_started_after_start` in the API, and the transient sweeper's
+/// repair of a start the node completed), so a later forced drain opens a
+/// fresh evacuation. Until then a start of the stopped row is pre-bound to the
+/// node holding its rootfs (`stopped_restore_plan`), never offered the artifact
+/// as a cross-node fallback.
 ///
 /// Neither term substitutes for [`SubstrateSink::node_reported_artifact`]. This
 /// row's pin is NULL for essentially every stopped sandbox, so `IS NULL` here
@@ -647,6 +662,22 @@ async fn revert_evacuation_suspend_claim(
 /// `unattributable_artifact` counter being visible, and it stops mattering when
 /// the refusal stops being the common case — see [`claim_stopped_evacuation`]
 /// for the node-side fact that makes it rare.
+///
+/// **An encrypted `stopped` sandbox is never listed**, on either the fresh or
+/// the in-flight disjunct. Its disk artifact can't be re-placed:
+/// sandbox-manager refuses to materialize an encrypted capture as a stopped
+/// sandbox, since it stages no plaintext rootfs. Evacuating one would publish
+/// it, release the node holding the only usable copy, and leave the sandbox on
+/// no node with nothing able to place it. Left unlisted, it keeps its node and
+/// its local copy like any other unevacuated `stopped` resident, and the
+/// termination-blocking gate holds that node in `draining` rather than letting
+/// it terminate. The exits are the ones such a park already has: the owner
+/// deleting the sandbox, or an operator undraining the node. The in-flight
+/// disjunct is covered too because a marker written before this exclusion
+/// existed would otherwise carry such a row to the teardown.
+/// `volume_encryption` is decided once, at create (`create_with_sandbox_id_inner`
+/// in `pplx-space-api`), so the listing can't race a change to it. NULL reads
+/// as plaintext, the way the API's sandbox projection reads it.
 fn evacuatable_sandbox_rows_query(residency: ResidencyEvidence) -> String {
     let occupies = occupies_node_predicate("s", "$1", residency);
     format!(
@@ -667,6 +698,10 @@ fn evacuatable_sandbox_rows_query(residency: ResidencyEvidence) -> String {
                     s.lifecycle = 'stopped'
                     AND s.evacuation_restore_target = 'stopped'
                 )
+            )
+            AND NOT (
+                s.lifecycle = 'stopped'
+                AND COALESCE(s.volume_encryption, FALSE)
             )
             AND {occupies}
           ORDER BY CASE WHEN s.lifecycle = 'stopped' THEN 1 ELSE 0 END,
@@ -1060,16 +1095,11 @@ pub(crate) fn restore_pending_evacuations_query(honor_backoff_windows: bool) -> 
                     s.evacuation_restore_target = 'stopped'
                     AND (
                         (s.lifecycle = 'stopped' AND s.active_node_id IS NULL)
-                        -- Unreachable today and kept deliberately: the claim
-                        -- admits a released stopped evacuation, but
-                        -- `restore_execution_inner` refuses a `Stopped` target
-                        -- before claiming, so nothing moves the row to
-                        -- `restoring` yet. Once that target is accepted, this is
-                        -- the arm a re-placement whose controller died
-                        -- mid-restore, or whose fresh claim failed (it is never
-                        -- rolled back), is re-driven through; omitting it would
-                        -- strand exactly those rows on the deploy that made them
-                        -- possible.
+                        -- A re-placement the claim already took: one whose
+                        -- controller died mid-restore, or whose attempt failed
+                        -- after the claim (a fresh stopped claim is never rolled
+                        -- back). This arm is how it is re-driven; omitting it
+                        -- would strand exactly those rows.
                         OR s.lifecycle = 'restoring'
                     )
                     AND {disk_backup_ready}
@@ -1085,12 +1115,13 @@ pub(crate) fn restore_pending_evacuations_query(honor_backoff_windows: bool) -> 
     )
 }
 
-/// Every evacuated `stopped` sandbox that is on no node — cluster-wide, and
-/// **deliberately not** the retry-eligible subset
+/// Every evacuated `stopped` sandbox that can't serve a `start` yet: released
+/// and on no node, or claimed for re-placement and not yet settled.
+/// Cluster-wide, and **deliberately not** the retry-eligible subset
 /// [`restore_pending_evacuations_query`] returns.
 ///
 /// This is the population an on-call alert reads, so it has to answer "how many
-/// sandboxes are currently nowhere", not "how many will the next sweep try".
+/// sandboxes are currently unstartable", not "how many will the next sweep try".
 /// Those differ by exactly the rows that matter most: a re-placement that keeps
 /// failing carries a `next_restore_attempt_at` up to the 30-minute backoff cap,
 /// which would drop it out of the work list — and therefore out of the gauge —
@@ -1102,20 +1133,26 @@ pub(crate) fn restore_pending_evacuations_query(honor_backoff_windows: bool) -> 
 /// is unplaceable rather than un-ready, and dropping it from the count would
 /// silence the one case with no automatic recovery at all.
 ///
-/// `active_node_id IS NULL` is what makes this "nowhere" rather than "mid
-/// evacuation": a claimed row still on its node is held by the drain, visible
-/// as a drain blocker, and startable again the moment the marker clears.
+/// The two lifecycles are read differently on purpose:
+///
+/// * a `stopped` row counts only with `active_node_id IS NULL`, which is what
+///   makes it "released" rather than "mid evacuation": a claimed row still on
+///   its node is held by the drain, visible as a drain blocker, and startable
+///   again the moment the marker clears;
+/// * a `restoring` row counts whatever its `active_node_id`. The re-placement
+///   pod's placement sets the column as soon as the pod binds, while the row
+///   stays unstartable until the drain settles it, which is exactly where a
+///   re-placement that never converges (a destination whose shim predates
+///   stopped materialization, say) sits indefinitely.
 pub(crate) fn stopped_replacements_pending_query() -> &'static str {
     sql!(
         "SELECT COUNT(*)::BIGINT
            FROM sandboxes s
           WHERE s.evacuation_restore_target = 'stopped'
-            AND s.active_node_id IS NULL
-            -- `restoring` is unreachable until a `Stopped` restore target is
-            -- accepted; included for the same reason as in
-            -- `restore_pending_evacuations_query`, so the two populations stay
-            -- the same population.
-            AND s.lifecycle IN ('stopped', 'restoring')"
+            AND (
+                (s.lifecycle = 'stopped' AND s.active_node_id IS NULL)
+                OR s.lifecycle = 'restoring'
+            )"
     )
 }
 
@@ -2438,12 +2475,14 @@ fn is_reupload_sandbox_restoring_rejection(reupload_error: &str) -> bool {
 /// `node_drain.failures{phase}` tags on the error path.
 ///
 /// A retryable substrate restore wait never reaches this type: restore lease
-/// contention and every `SubstrateError::Timeout` on the cohort-restore path
-/// — including the phase-tagged readiness-wait timeouts — are classified as
-/// [`RestoreOutcome::Converging`] before the failure mapping, so the
-/// readiness phase (`pod_never_ready` / `proxy_unreachable` /
+/// contention and every `SubstrateError::Timeout` on a `started` or `paused`
+/// cohort restore — including the phase-tagged readiness-wait timeouts — are
+/// classified as [`RestoreOutcome::Converging`] before the failure mapping, so
+/// the readiness phase (`pod_never_ready` / `proxy_unreachable` /
 /// `guest_not_ready`) is carried on `node_drain.restore_converging{phase}`
-/// rather than here.
+/// rather than here. A stopped re-placement's timeout is the exception (see
+/// [`converging_restore_outcome`]): it arrives as [`EvacuateError::Restore`],
+/// tagged `restore`, without its readiness phase.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum EvacuateError {
     #[error("suspend failed: {0}")]
@@ -2567,6 +2606,12 @@ pub struct SubstrateSink {
     /// lifecycles [`NodeDrainSink::list_evacuatable_sandboxes_on_node`] offers,
     /// and whether [`NodeDrainSink::evacuate_stopped_sandbox`] will act at all.
     evacuate_stopped_residents: bool,
+    /// Whether an evacuated `stopped` sandbox is placed again; see
+    /// [`super::ReconcilerConfig::replace_stopped_evacuations`]. Read by
+    /// [`NodeDrainSink::restore_evacuated_sandbox`], which opens a re-placement
+    /// only while it's on, and by `tear_down_stopped_local_copy`, which
+    /// releases a node's copy only while it's on.
+    replace_stopped_evacuations: bool,
 }
 
 enum SubstrateSinkBackend {
@@ -2777,9 +2822,12 @@ pub enum StoppedEvacuationOutcome {
     /// placement drifted, or the node stopped being force-drained between the
     /// listing and this call.
     Deferred { reason: String },
-    /// The sandbox already carried a disk-artifact pin this drain did not mint,
-    /// so nothing can be attributed to the rootfs as it stands and the
-    /// evacuation refuses to start. Nothing published, nothing destroyed.
+    /// The sandbox already carried a disk-artifact pin this drain did not mint
+    /// and can't attribute to the rootfs as it stands, so the evacuation
+    /// refuses to start. A cluster pin is attributable only when its backup is
+    /// durable and the node pins the same artifact and shows it current (step
+    /// 0d of `evacuate_stopped_sandbox`). Nothing published,
+    /// nothing destroyed.
     ///
     /// Distinct from [`Self::Deferred`] because it does not resolve on its own:
     /// only a successful start clears a node-local pin, and a forced drain
@@ -2802,14 +2850,18 @@ pub enum StoppedEvacuationOutcome {
 pub enum RestoreOutcome {
     /// The restore ran and the row was finalized to its target lifecycle.
     Restored,
-    /// The sandbox is no longer eligible for the cohort restore, so it was
-    /// left untouched for a later sweep rather than treated as a failure.
-    /// Either the durable S3 snapshot isn't `ready` yet (the upload is still
-    /// in flight — the snapshot-register trigger will re-drive once it lands),
-    /// or the `evacuation_restore_target` marker was cleared by a concurrent
-    /// user takeover between the sweep's list and the eligibility re-check, or
-    /// a control-plane statement lost a lock race (see
-    /// [`converging_restore_outcome`]).
+    /// The cohort restore can't proceed on this attempt, so the sandbox was
+    /// left for a later sweep rather than treated as a failure. On the
+    /// eligibility re-check: its restore source isn't `ready` (the durable
+    /// full snapshot, or for a `stopped` target its disk artifact's backup),
+    /// its `evacuation_restore_target` marker was cleared by
+    /// a concurrent user takeover, or its row is gone. Past the re-check: the
+    /// substrate's marker-guarded claim found nothing this attempt may take
+    /// (`SubstrateError::EvacuationClaimLost`), or the substrate reported
+    /// `SubstrateError::LockContention` (see [`converging_restore_outcome`]).
+    /// Only lock errors the substrate classifies as `LockContention` defer; one
+    /// on the eligibility read, the finalize, or a substrate statement that
+    /// reports a bare failure is a restore failure.
     Deferred,
     /// The blocking wake wait exhausted the API-side node-RPC budget while
     /// the node was still restoring. Not a failure: the substrate reports
@@ -2818,7 +2870,9 @@ pub enum RestoreOutcome {
     /// evacuation marker set, and the next sweep re-drives the same sandbox
     /// (the evacuation restore claim accepts an already-`restoring` row)
     /// until a re-driven wake finds the pod ready — converge-by-retry is the
-    /// designed path for restores slower than one wait budget. `detail`
+    /// designed path for restores slower than one wait budget. Only a
+    /// `started` or `paused` target's wait can end here: a `stopped`
+    /// re-placement's fails instead (see [`converging_restore_outcome`]). `detail`
     /// carries the substrate's timeout message for the caller's log line;
     /// `wait_phase` carries the readiness step the wait stalled in (`None`
     /// when the outer wake budget fired without entering a specific
@@ -2842,7 +2896,28 @@ impl RestoreOutcome {
 
 /// Retryable substrate ownership/wait outcomes that the cohort restore should
 /// re-drive on the next sweep instead of reporting as a failed evacuation.
-fn converging_restore_outcome(error: &SubstrateError) -> Option<RestoreOutcome> {
+///
+/// A wait that ran out its budget converges only for a target with a guest to
+/// wait for. Converge-by-retry exists for a guest whose readiness is slower than
+/// one wait. A `stopped` re-placement has no guest: it's done once the node has
+/// materialized the disk and confirmed the stopped row. One that outlasts a
+/// wait is either slow or, the case that never ends, on a destination that
+/// keeps refusing it (a shim or sandbox-manager that predates stopped
+/// materialization, a capture it can't materialize). Read as converging, the
+/// refused one would skip the backoff and stay in the never-failed tier, taking
+/// a `max_per_cluster` slot for a whole wait on every sweep. So its `Timeout`
+/// falls through to the failure path: a `RestoreFailed` event, the exponential
+/// backoff, and the escalation by id. A slow one still converges, because the
+/// shim starts the materialization when it creates the pod's container, not on
+/// the Wake, so the node keeps working through the backoff window. What it
+/// costs is that window, a `RestoreFailed` event and a
+/// `node_drain.failures{phase=restore}` count per wait it outlasts, and, once
+/// five have failed (about 26 minutes with the default 135 s wait and 60 s
+/// backoff base), the ERROR line that names it.
+fn converging_restore_outcome(
+    error: &SubstrateError,
+    target_lifecycle: SandboxLifecycle,
+) -> Option<RestoreOutcome> {
     match error {
         SubstrateError::RestoreInFlight { message, .. }
         | SubstrateError::RestoreSourcePending { message }
@@ -2850,6 +2925,7 @@ fn converging_restore_outcome(error: &SubstrateError) -> Option<RestoreOutcome> 
             detail: message.clone(),
             wait_phase: None,
         }),
+        SubstrateError::Timeout { .. } if target_lifecycle == SandboxLifecycle::Stopped => None,
         SubstrateError::Timeout { message, phase } => Some(RestoreOutcome::Converging {
             detail: message.clone(),
             wait_phase: *phase,
@@ -2877,6 +2953,7 @@ impl SubstrateSink {
         residency_evidence: ResidencyEvidence,
         termination_blocking_gate: bool,
         evacuate_stopped_residents: bool,
+        replace_stopped_evacuations: bool,
     ) -> Self {
         Self {
             pool,
@@ -2886,6 +2963,7 @@ impl SubstrateSink {
             residency_evidence,
             termination_blocking_gate,
             evacuate_stopped_residents,
+            replace_stopped_evacuations,
         }
     }
 
@@ -2905,6 +2983,7 @@ impl SubstrateSink {
             residency_evidence: ResidencyEvidence::NodeCensusAware,
             termination_blocking_gate: true,
             evacuate_stopped_residents: true,
+            replace_stopped_evacuations: true,
         }
     }
 
@@ -2927,6 +3006,7 @@ impl SubstrateSink {
             residency_evidence: ResidencyEvidence::NodeCensusAware,
             termination_blocking_gate: true,
             evacuate_stopped_residents: true,
+            replace_stopped_evacuations: true,
         }
     }
 
@@ -3275,7 +3355,7 @@ impl SubstrateSink {
     /// `node_drain.stopped_replacement_pending`, which carries no drain-phase
     /// term precisely so it keeps seeing rows whose drain has ended. The
     /// sandbox is then unreachable for exactly as long as every other evacuated
-    /// stopped sandbox is — until the three substrate refusals lift — and not
+    /// stopped sandbox is — until the restore sweep re-places it — and not
     /// because of the undrain. What the operator loses is the undo they thought
     /// they had, which is why it is written down here rather than left to be
     /// inferred from the conjunct.
@@ -3284,9 +3364,10 @@ impl SubstrateSink {
     /// is the one race this statement cannot see: after the undrain, the
     /// owner's `start` gets through and creates an execution, and an unfenced
     /// teardown would delete that pod and its rootfs. The teardown is therefore
-    /// fenced on "no active execution" (`delete_execution_for_teardown`), which
-    /// re-proves the absence inside the lock execution creation takes, and
-    /// reports `Deferred` with nothing deleted when the start won.
+    /// fenced (`delete_execution_for_teardown`): inside the lock execution
+    /// creation takes, it refuses an execution newer than the stop and a row
+    /// that has lost its marker, which any start clears, and reports
+    /// `Deferred` with nothing deleted when the start won.
     ///
     /// The two halves are reported apart because they mean opposite things to
     /// the caller: an undurable-but-ours row is the normal mid-upload state and
@@ -3324,33 +3405,34 @@ impl SubstrateSink {
 
     /// The teardown's one irreversible call, behind a seam so a test can
     /// observe whether it happened at all. Production has exactly one arm.
-    /// `Ok(false)` when an active execution appeared since the authorization
-    /// read, in which case nothing was torn down.
+    /// `Ok(false)` when an active execution newer than the stop exists, in
+    /// which case nothing was torn down.
     ///
-    /// Fenced on "no active execution" rather than unfenced: a stopped sandbox
-    /// has none, and one that has gained one since the read is being started by
-    /// its owner — an `:undrain` lets a `start` through — so the copy on the
-    /// node is live again and must not be deleted.
+    /// Fenced rather than unfenced, and on "no execution newer than the stop"
+    /// rather than "no active execution". On Kubernetes a stop leaves its
+    /// execution active until the next `start`, so every stopped
+    /// resident has one, and requiring none would refuse every teardown. That
+    /// pre-stop execution is retired as part of the teardown. One created after
+    /// the stop means the owner is starting the sandbox (an `:undrain` lets a
+    /// `start` through), so the copy on the node is live again and must not be
+    /// deleted.
     async fn delete_execution_for_teardown(
         &self,
         sandbox_id: SandboxId,
     ) -> Result<bool, SubstrateError> {
         #[cfg(test)]
         if let SubstrateSinkBackend::StoppedPath(fake) = &self.substrate {
-            // Mirror the real fence against the same database, so a test can
-            // reach the refusal by seeding an execution rather than by a knob.
-            let active: bool = sqlx::query_scalar(sql!(
-                "SELECT EXISTS (
-                     SELECT 1 FROM sandbox_k8s_executions WHERE sandbox_id = $1 AND active
-                 )"
-            ))
-            .bind(sandbox_id)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|err| SubstrateError::Failed {
-                message: err.to_string(),
-            })?;
-            if active {
+            // The real retirement, fence and transaction included, against the
+            // same database: a test reaches the refusal by seeding an execution
+            // rather than by a knob. What's faked is the Kubernetes half that
+            // follows it in production (the pod delete, and the placement clear
+            // that re-checks for an active execution).
+            if !pplx_space_api::controllers::substrate::kubernetes::retire_executions_predating_current_stop(
+                self.pool.clone(),
+                sandbox_id,
+            )
+            .await?
+            {
                 return Ok(false);
             }
             fake.teardowns
@@ -3361,7 +3443,7 @@ impl SubstrateSink {
         }
         self.substrate
             .kubernetes()
-            .delete_execution_with_no_active_execution(sandbox_id)
+            .delete_execution_retired_by_current_stop(sandbox_id)
             .await
     }
 
@@ -3433,6 +3515,21 @@ impl SubstrateSink {
         node_label: &str,
         pinned_artifact: Option<LocalArtifactId>,
     ) -> Result<StoppedEvacuationOutcome, EvacuateError> {
+        // The release is the one step that gives up the node's copy, so it
+        // waits for a re-placement that can actually happen. Checked here,
+        // where every route to the teardown passes, rather than at a caller: a
+        // claim resumed after the flag was turned off reaches the teardown
+        // both from a durable row (step 0) and from a pin recorded on this
+        // tick (step 5). Such a claim keeps its node and its copy until the
+        // flag comes back, exactly as an unevacuated stopped resident would.
+        if !self.replace_stopped_evacuations {
+            return Ok(StoppedEvacuationOutcome::Deferred {
+                reason: format!(
+                    "sandbox {sandbox_id}'s disk is durable, but stopped re-placement is off \
+                     (SPACE_NODE_DRAIN_REPLACE_STOPPED_EVACUATIONS); its node keeps the copy"
+                ),
+            });
+        }
         let node = self
             .node_reported_artifact_for_teardown(sandbox_id, source_node_id)
             .await?;
@@ -3494,8 +3591,9 @@ impl SubstrateSink {
         if !torn_down {
             return Ok(StoppedEvacuationOutcome::Deferred {
                 reason: format!(
-                    "sandbox {sandbox_id} gained an active execution after the teardown was \
-                     authorized; its copy on the node is live again and was left alone"
+                    "sandbox {sandbox_id} is being started, was started or lost its evacuation \
+                     marker after the teardown was authorized; its copy on the node was \
+                     left alone"
                 ),
             });
         }
@@ -3555,7 +3653,8 @@ impl SubstrateSink {
         // one, because `snapshots.timestamp` is registration time and a reused
         // pin decouples it from when the snapshot was taken. The property is
         // established upstream instead: `claim_stopped_evacuation` refuses to
-        // open an evacuation on a cluster row that already carries a pin, and
+        // open an evacuation on a cluster row that already carries a pin, other
+        // than a durable one the node pins too and shows current (step 0d), and
         // step 0c accepts a node pin only when the node shows it was captured
         // no earlier than the sandbox stopped. So everything this query can see was
         // minted by the evacuation asking about it, or is of the rootfs as it
@@ -3629,6 +3728,34 @@ impl SubstrateSink {
         ))
     }
 
+    /// Has the evacuation restore claim already moved this stopped
+    /// evacuation's row to `restoring`?
+    ///
+    /// Asked only when re-placement is switched off, to tell a re-placement
+    /// that hasn't been opened (refused) from one that has (finished). The
+    /// marker is part of the question because a markerless `restoring` row is
+    /// a user restore, which this sweep doesn't own.
+    async fn stopped_replacement_claimed(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<bool, EvacuateError> {
+        sqlx::query_scalar::<_, bool>(sql!(
+            "SELECT COALESCE(
+                        lifecycle = 'restoring' AND evacuation_restore_target = 'stopped',
+                        FALSE
+                    )
+               FROM sandboxes
+              WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|claimed| claimed.unwrap_or(false))
+        .map_err(|err| {
+            EvacuateError::Lookup(format!("stopped re-placement claim lookup failed: {err}"))
+        })
+    }
+
     /// Restore an evacuated sandbox onto a target-cohort node and finalize
     /// it to `target_lifecycle`, clearing the `evacuation_restore_target`
     /// marker. Driven by [`NodeDrainSink::restore_evacuated_sandbox`] (the
@@ -3637,11 +3764,16 @@ impl SubstrateSink {
     /// and the port-exposure reconcile live in one place.
     ///
     /// Returns [`RestoreOutcome::Deferred`] (not an error) when the sandbox is
-    /// no longer eligible — the newest full snapshot isn't `ready` yet, or the
-    /// marker was cleared by a concurrent user takeover. The caller leaves it
-    /// for the next sweep. Keyed on `latest_full_snapshot_ready` (NOT placement
-    /// freshness) so a failed restore's `placement_changed_at` bump can't drop
-    /// a still-marked evacuation, while still waiting for the current upload
+    /// no longer eligible — its restore source isn't `ready` yet (the newest
+    /// full snapshot, or for a `stopped` target the current disk artifact's
+    /// backup), the marker was cleared by a concurrent user takeover, or the
+    /// row is gone — and when the substrate's claim is lost
+    /// (`EvacuationClaimLost`) or the substrate reports a lock race as
+    /// `SubstrateError::LockContention`. The caller
+    /// leaves it for the next sweep. Keyed on `latest_full_snapshot_ready` and
+    /// `current_disk_artifact_backup_ready` (NOT placement freshness) so a
+    /// failed restore's `placement_changed_at` bump can't drop a still-marked
+    /// evacuation, while still waiting for the current upload
     /// rather than restoring a stale prior-cycle snapshot.
     async fn restore_evacuated_and_finalize(
         &self,
@@ -3746,10 +3878,11 @@ impl SubstrateSink {
             Err(SubstrateError::EvacuationClaimLost { .. }) => {
                 return Ok(RestoreOutcome::Deferred);
             }
-            // Retryable ownership contention and bounded readiness waits are
-            // still converging. Re-drive them on the next sweep without a
-            // restore-failed event, failure metric, or exponential backoff.
-            Err(err) if let Some(outcome) = converging_restore_outcome(&err) => {
+            // Retryable ownership contention and bounded readiness waits (a
+            // guest's, not a stopped re-placement's) are still converging.
+            // Re-drive them on the next sweep without a restore-failed event,
+            // failure metric, or exponential backoff.
+            Err(err) if let Some(outcome) = converging_restore_outcome(&err, target_lifecycle) => {
                 return Ok(outcome);
             }
             // Every other error — including a genuine `Conflict` (e.g. a real
@@ -3817,6 +3950,26 @@ impl SubstrateSink {
                 "post-restore finalize CAS missed for sandbox {sandbox_id} (lifecycle drifted \
                  from 'restoring' before final UPDATE landed); next tick will re-evaluate"
             )));
+        }
+
+        if target_lifecycle == SandboxLifecycle::Stopped {
+            // Best effort: a failure costs the destination the pod's slot
+            // until the owner's next `start` finds the pod stale and replaces
+            // it, and nothing about the sandbox's data. See
+            // `release_stopped_materialization_pod`.
+            if let Err(err) = self
+                .substrate
+                .kubernetes()
+                .release_stopped_materialization_pod(sandbox_id_typed)
+                .await
+            {
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    error = %err,
+                    "node_drain: failed to delete the re-placed stopped sandbox's \
+                     materialization pod; it holds a network slot until the next start"
+                );
+            }
         }
 
         emit_node_drain_event(
@@ -4992,23 +5145,22 @@ impl NodeDrainSink for SubstrateSink {
     /// persisted state, so the reconciler re-lists the row each tick and this
     /// resumes wherever the database says it got to.
     ///
-    /// ## What releases the node — and what does not yet re-place the sandbox
+    /// ## What releases the node, and what re-places the sandbox
     ///
     /// Step 5 is where this path's own work ends. Placing the row back on a
-    /// node belongs to the restore sweep, and **the substrate cannot serve that
-    /// request today**: `begin_evacuation_restore_lifecycle` admits a released
-    /// stopped evacuation for a `Stopped` target, but
-    /// `sandbox_lifecycle_to_wake_target_proto` accepts only `Started`/`Paused`
-    /// (checked before the claim), and the evacuation restore's source selector
-    /// wants a `full` snapshot (the disk-only one serves only a user `start` of a
-    /// `stopped` row, and only while the row is still `stopped`, which the claim
-    /// moves it out of). The sweep
-    /// therefore fails, backs off, and escalates. That is the reason the
-    /// feature ships disabled, and the reason the sweep's stopped arm is here
-    /// at all rather than withheld: once those refusals lift, every
-    /// already-evacuated sandbox is picked up automatically instead of needing
-    /// a further deploy to notice it.
-    ///
+    /// node belongs to the restore sweep
+    /// ([`NodeDrainSink::restore_evacuated_sandbox`] with a `Stopped` target):
+    /// the evacuation claim moves the row `stopped → restoring`, the substrate
+    /// creates a pod for it elsewhere whose shim has that node's sandbox-manager
+    /// stage the pinned disk artifact and leave the sandbox `stopped` without
+    /// launching a microVM, and the finalize settles the row `stopped` and
+    /// `on_node`. The sweep opens a re-placement only where
+    /// [`super::ReconcilerConfig::replace_stopped_evacuations`] is on, which
+    /// [`super::ReconcilerConfig::evacuates_stopped_residents`] requires, so
+    /// this path doesn't open an evacuation in a cluster that won't place the
+    /// sandbox again. A claim resumed after the flag was turned off doesn't
+    /// release its node either: the teardown defers while re-placement is off,
+    /// so the sandbox keeps its copy on that node until the flag comes back.
     ///
     /// Step 5's placement clear sets `placement = 'unplaced'`,
     /// `active_node_id = NULL`, `target_node_id = NULL`. `active_node_id = NULL`
@@ -5083,12 +5235,22 @@ impl NodeDrainSink for SubstrateSink {
         // on an outcome the metrics catalog documents as never self-resolving.
         // Those fall through to the claim below, which refuses them as
         // `Deferred`.
+        // Set only when the cluster row already pins an artifact this
+        // evacuation can take as describing the rootfs: see 0d.
+        let mut reused_durable_artifact: Option<LocalArtifactId> = None;
         if !state.claim_holds && !state.marked {
             // 0b. The cluster row's own pin. `claim_stopped_evacuation` enforces
             //     this too — it is the atomic guard — but repeating it here is
             //     what makes the refusal *reportable*: the claim's `UPDATE`
             //     cannot say why it matched nothing.
-            if let Some(pinned) = state.pinned_artifact {
+            //
+            //     A pin is refused outright unless its artifact is a ready,
+            //     durable disk backup of this sandbox (`bytes_durable`, the
+            //     same predicate the teardown authorization reads). One that is
+            //     can still be taken, but only on the node's word: see 0d.
+            if let Some(pinned) = state.pinned_artifact
+                && !state.bytes_durable
+            {
                 return Ok(StoppedEvacuationOutcome::UnattributableArtifact {
                     local_artifact_id: Some(pinned),
                 });
@@ -5167,6 +5329,29 @@ impl NodeDrainSink for SubstrateSink {
                     ),
                 });
             }
+            // 0d. A cluster pin that survived 0b names a durable backup of
+            //     this sandbox. That's what a stopped re-placement leaves: its
+            //     finalize settles the row `stopped` still pinning the artifact
+            //     it was materialized from, and the destination's row pins the
+            //     same artifact, recorded as the rootfs was staged from it. The
+            //     bytes on the node are that artifact's for as long as the
+            //     node keeps the pin, because the node drops a stopped row's pin
+            //     wherever the rootfs changes (a completed or failed start, a
+            //     rollback) and a later stop mints a new one. So it's taken
+            //     only when the node pins the same artifact and shows it current
+            //     by its own clock, the check 0c applies to any node pin; then
+            //     the evacuation skips the publish and the pin write and goes
+            //     to the teardown on that backup. Anything else, including a
+            //     pinless node, refuses: the cluster pin then says nothing
+            //     about the rootfs as it stands.
+            if let Some(cluster_pin) = state.pinned_artifact {
+                if node.pinned_artifact != Some(cluster_pin) || !node.pin_shown_current() {
+                    return Ok(StoppedEvacuationOutcome::UnattributableArtifact {
+                        local_artifact_id: Some(cluster_pin),
+                    });
+                }
+                reused_durable_artifact = Some(cluster_pin);
+            }
             // A pin the node would reuse is acceptable only if the node shows
             // it was captured during the current stopped episode: a stopped
             // rootfs can't change, so such an artifact is of the bytes about to
@@ -5174,7 +5359,7 @@ impl NodeDrainSink for SubstrateSink {
             // After the drift checks above, so the capture order is only ever
             // read for a node that reports the sandbox stopped, the one state
             // it means anything for; drift defers whatever the times say.
-            if let Some(pinned) = node.pinned_artifact
+            else if let Some(pinned) = node.pinned_artifact
                 && !node.pin_shown_current()
             {
                 // `debug`: this refusal repeats every tick for as long as the
@@ -5211,6 +5396,7 @@ impl NodeDrainSink for SubstrateSink {
                 sandbox_id,
                 source_node_id,
                 self.evacuate_stopped_residents,
+                reused_durable_artifact,
             )
             .await
             .map_err(|err| {
@@ -5255,7 +5441,8 @@ impl NodeDrainSink for SubstrateSink {
         //     on the next tick, once, and if it fails again there is one new row
         //     per failure rather than per tick — **provided the node's pin
         //     matches this row's**. It does by construction on the happy path,
-        //     because the claim proves the row pinless and step 3 writes back
+        //     because a claim that reaches step 2 proved the row pinless (a
+        //     pinned one step 0d took skips steps 2 and 3) and step 3 writes back
         //     whatever the node returned. If they ever diverge, this gate keys
         //     on the row's artifact while step 2 enqueues the node's, so the
         //     gate cannot see the in-flight attempt and the leak is per tick
@@ -5302,71 +5489,79 @@ impl NodeDrainSink for SubstrateSink {
             });
         }
 
-        // 2. Publish. Idempotent on the node for two of three shapes: an
-        //    existing pin is reused, an in-flight upload is joined, and an
-        //    already-ready backup returns without re-uploading. A *failed*
-        //    attempt is the exception — see step 1b.
-        let published = self
-            .enqueue_stopped_disk_backup(sandbox_id, source_node_id)
-            .await?;
-        let local_artifact_id = published.artifact.id;
-        // Only on the tick that opened the evacuation. Every later tick
-        // re-issues the same request against the same artifact — sbx-mgr joins
-        // the in-flight attempt rather than starting one — so a per-tick event
-        // would report a queue that was only ever entered once.
-        if claim == StoppedEvacuationClaim::Claimed {
-            emit_node_drain_event(
-                sandbox_id,
-                SandboxEventType::ArtifactBackupQueued,
-                "node_drain_stopped_evacuation",
-                SandboxEventDetails::default()
-                    .with_from_state(SandboxLifecycle::Stopped.as_str())
-                    .source_node_id(node_label.clone()),
-            );
-        }
+        // A pin 0d took is already this row's and already durable, so
+        // there's nothing to publish and nothing to record: straight to the
+        // durability re-read and the teardown.
+        let local_artifact_id = if let Some(reused) = reused_durable_artifact {
+            reused
+        } else {
+            // 2. Publish. Idempotent on the node for two of three shapes: an
+            //    existing pin is reused, an in-flight upload is joined, and an
+            //    already-ready backup returns without re-uploading. A *failed*
+            //    attempt is the exception — see step 1b.
+            let published = self
+                .enqueue_stopped_disk_backup(sandbox_id, source_node_id)
+                .await?;
+            let local_artifact_id = published.artifact.id;
+            // Only on the tick that opened the evacuation. Every later tick
+            // re-issues the same request against the same artifact — sbx-mgr joins
+            // the in-flight attempt rather than starting one — so a per-tick event
+            // would report a queue that was only ever entered once.
+            if claim == StoppedEvacuationClaim::Claimed {
+                emit_node_drain_event(
+                    sandbox_id,
+                    SandboxEventType::ArtifactBackupQueued,
+                    "node_drain_stopped_evacuation",
+                    SandboxEventDetails::default()
+                        .with_from_state(SandboxLifecycle::Stopped.as_str())
+                        .source_node_id(node_label.clone()),
+                );
+            }
 
-        // 3. Mirror the pin into the cluster row — only when the node handed
-        //    back an identity the row does not already carry. A miss means the
-        //    row drifted between the claim and here; stop rather than proceed
-        //    toward a teardown on stale evidence.
-        //
-        //    When the pin is unchanged and step 0 had *already* proved the claim,
-        //    there is nothing new to learn: that read consulted durability and
-        //    found it false, and the same artifact cannot have become durable
-        //    between two statements of the same tick. Return, and let the next
-        //    tick's step 0 pick it up five seconds later.
-        //
-        //    The `claim_holds` half of that condition is load-bearing, not
-        //    belt-and-braces. Step 0 computes `bytes_durable` unconditionally
-        //    but the entry point only *acts* on it when the claim held, so on
-        //    the path where this tick opened the claim, durability was read and
-        //    ignored — and may well have been true, for an artifact this drain
-        //    minted before a controller restart. Taking the shortcut there
-        //    would defer a teardown the evidence already authorized, and the
-        //    comment above would be asserting a premise this branch lacks.
-        if state.claim_holds && state.pinned_artifact == Some(local_artifact_id) {
-            return Ok(StoppedEvacuationOutcome::AwaitingDurableDisk { local_artifact_id });
-        }
-        let recorded = record_stopped_evacuation_artifact(
-            &self.pool,
-            sandbox_id,
-            source_node_id,
-            local_artifact_id,
-        )
-        .await
-        .map_err(|err| {
-            EvacuateError::Publish(format!(
-                "stopped evacuation artifact pin write failed: {err}"
-            ))
-        })?;
-        if !recorded {
-            return Ok(StoppedEvacuationOutcome::Deferred {
-                reason: format!(
-                    "sandbox {sandbox_id} drifted out of its stopped evacuation claim before its \
-                     disk artifact pin could be recorded"
-                ),
-            });
-        }
+            // 3. Mirror the pin into the cluster row — only when the node handed
+            //    back an identity the row does not already carry. A miss means the
+            //    row drifted between the claim and here; stop rather than proceed
+            //    toward a teardown on stale evidence.
+            //
+            //    When the pin is unchanged and step 0 had *already* proved the claim,
+            //    there is nothing new to learn: that read consulted durability and
+            //    found it false, and the same artifact cannot have become durable
+            //    between two statements of the same tick. Return, and let the next
+            //    tick's step 0 pick it up five seconds later.
+            //
+            //    The `claim_holds` half of that condition is load-bearing, not
+            //    belt-and-braces. Step 0 computes `bytes_durable` unconditionally
+            //    but the entry point only *acts* on it when the claim held, so on
+            //    the path where this tick opened the claim, durability was read and
+            //    ignored — and may well have been true, for an artifact this drain
+            //    minted before a controller restart. Taking the shortcut there
+            //    would defer a teardown the evidence already authorized, and the
+            //    comment above would be asserting a premise this branch lacks.
+            if state.claim_holds && state.pinned_artifact == Some(local_artifact_id) {
+                return Ok(StoppedEvacuationOutcome::AwaitingDurableDisk { local_artifact_id });
+            }
+            let recorded = record_stopped_evacuation_artifact(
+                &self.pool,
+                sandbox_id,
+                source_node_id,
+                local_artifact_id,
+            )
+            .await
+            .map_err(|err| {
+                EvacuateError::Publish(format!(
+                    "stopped evacuation artifact pin write failed: {err}"
+                ))
+            })?;
+            if !recorded {
+                return Ok(StoppedEvacuationOutcome::Deferred {
+                    reason: format!(
+                        "sandbox {sandbox_id} drifted out of its stopped evacuation claim before its \
+                         disk artifact pin could be recorded"
+                    ),
+                });
+            }
+            local_artifact_id
+        };
 
         // 4. Durability. Re-read only because the pin just changed: the
         //    artifact may already have a ready backup from an earlier attempt,
@@ -5530,6 +5725,20 @@ impl NodeDrainSink for SubstrateSink {
                  EVACUABLE_LIFECYCLES"
             )));
         }
+        if target_lifecycle == SandboxLifecycle::Stopped
+            && !self.replace_stopped_evacuations
+            && !self.stopped_replacement_claimed(sandbox_id).await?
+        {
+            // A failure rather than a deferral, so the row backs off and, once
+            // the retries stop looking transient, escalates by id: a released
+            // stopped evacuation is on no node, and can't be started until
+            // something places it. See `ReconcilerConfig::replace_stopped_evacuations`
+            // for why a claimed re-placement is let through.
+            return Err(EvacuateError::Restore(format!(
+                "sandbox {sandbox_id} is an evacuated stopped sandbox awaiting re-placement, \
+                 and SPACE_NODE_DRAIN_REPLACE_STOPPED_EVACUATIONS is off"
+            )));
+        }
         let outcome = self
             .restore_evacuated_and_finalize(
                 sandbox_id,
@@ -5539,21 +5748,24 @@ impl NodeDrainSink for SubstrateSink {
             )
             .await?;
         if matches!(outcome, RestoreOutcome::Deferred) {
-            // `list_restore_pending_evacuations` already confirmed the newest
-            // full snapshot is ready + the marker is set, so a Deferred here
-            // means the marker raced out from under us: a concurrent user
-            // restore (allowed once the snapshot is portable) cleared it
-            // between the sweep's list and this call. The ready snapshot can't
-            // disappear, and the readiness gate (`latest_full_snapshot_ready`)
-            // references no placement timestamp, so a `placement_changed_at`
-            // bump can't defer us. The caller leaves it for the next sweep and
-            // — crucially — does not record it as a restore (the outcome is
-            // returned so the restore-latency metric only counts real
-            // restores).
+            // The sweep listed it as eligible, so a Deferred here means either
+            // something changed since (the marker was cleared by a concurrent
+            // user takeover, the row is gone, the restore source isn't ready on
+            // the eligibility re-check, or the substrate found no claim this
+            // attempt may take: `EvacuationClaimLost`, whose doc points at
+            // where the cases are classified) or the substrate reported a lock
+            // race as `SubstrateError::LockContention`. Neither readiness gate
+            // (`latest_full_snapshot_ready`, `current_disk_artifact_backup_ready`)
+            // references a placement timestamp, so a `placement_changed_at`
+            // bump can't defer it. The
+            // caller leaves it for the next sweep and — crucially — does not
+            // record it as a restore (the outcome is returned so the
+            // restore-latency metric only counts real restores).
             tracing::info!(
                 sandbox_id = %sandbox_id,
-                "node_drain: cohort restore no longer eligible (evacuation marker \
-                 cleared by a user takeover); will re-evaluate on next sweep"
+                "node_drain: cohort restore deferred (evacuation marker cleared or row gone, \
+                 restore source not ready, claim lost or lock race); will re-evaluate on next \
+                 sweep"
             );
         }
         Ok(outcome)
@@ -6070,3 +6282,14 @@ async fn dispatch_backup(
         .await
         .map(|_| ())
 }
+
+/// Postgres-backed coverage for the guards around re-placing an evacuated
+/// `stopped` sandbox: the encrypted-resident exclusion and the re-placement
+/// flag.
+#[cfg(test)]
+mod stopped_replacement_tests;
+
+/// Postgres-backed coverage for draining a re-placed `stopped` sandbox again:
+/// the one cluster pin a fresh evacuation may take, and each one it refuses.
+#[cfg(test)]
+mod stopped_re_drain_tests;

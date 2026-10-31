@@ -37,7 +37,7 @@ from space_smoke.capabilities import (
 from space_smoke.runtime import Compensation, ResourceScope
 
 if TYPE_CHECKING:
-    from space_smoke.fixtures import KindEcw
+    from space_smoke.fixtures import CommandSandboxFixture
 
 DRAIN_KEEP_VALUE = "space-smoke-node-drain"
 
@@ -46,7 +46,7 @@ class NodeDrainAssertions:
     """Drain the sandbox's worker in either mode and judge what happened to the resident."""
 
     def __init__(
-        self, fixture: KindEcw, control: NodeDrainControl, scope: ResourceScope
+        self, fixture: CommandSandboxFixture, control: NodeDrainControl, scope: ResourceScope
     ) -> None:
         self._fixture = fixture
         self._control = control
@@ -57,6 +57,24 @@ class NodeDrainAssertions:
         self._node: AdminNodeView | None = None
         self._placement_before: SandboxPodPlacement | None = None
         self._residency_before: SandboxResidency | None = None
+
+    @property
+    def sandbox_id(self) -> str:
+        """The fixture sandbox's bare UUID, the form the pod label and the rows carry.
+
+        The native route answers `sbx_<uuid>`; the ECW route already speaks the
+        bare UUID, so the strip is a no-op there.
+        """
+
+        return self._fixture.sandbox.sandbox_id.removeprefix("sbx_")
+
+    @property
+    def drained_node(self) -> AdminNodeView:
+        """The SPACE node `resident_node()` recorded: the one the drain targets."""
+
+        if self._node is None:
+            raise RuntimeError("resident_node() must run first")
+        return self._node
 
     # --- preconditions --------------------------------------------------------
 
@@ -88,7 +106,7 @@ class NodeDrainAssertions:
     def resident_node(self) -> AdminNodeView:
         """The SPACE node hosting the fixture sandbox's pod, with the pod identity recorded."""
 
-        sandbox_id = self._fixture.sandbox.sandbox_id
+        sandbox_id = self.sandbox_id
         placement = self._control.sandbox_pod_placement(sandbox_id)
         self._fixture.verify(
             placement is not None,
@@ -120,6 +138,16 @@ class NodeDrainAssertions:
         self._fixture.record("resident_node", node.k8s_node_name)
         self._fixture.record("resident_pod_uid", placement.pod_uid)
         return node
+
+    def target_node(self, node: AdminNodeView) -> None:
+        """Drain `node` without recording a started resident on it.
+
+        For a worker whose resident is a `stopped` sandbox with no pod, which
+        `resident_node()` can't find through the pod and refuses as not started.
+        """
+
+        self._node = node
+        self._fixture.record("drain_target_node", node.k8s_node_name)
 
     # --- the drain ------------------------------------------------------------
 
@@ -201,9 +229,9 @@ class NodeDrainAssertions:
             raise RuntimeError("drain_gently() must run before expect_resident_untouched()")
         self._fixture.wait(hold_seconds, reason="for reconciler ticks under the gentle drain")
         now = self._admin_node(node.id)
-        placement = self._control.sandbox_pod_placement(self._fixture.sandbox.sandbox_id)
-        after = self._control.sandbox_residency(self._fixture.sandbox.sandbox_id)
-        snapshots = self._control.ready_full_snapshots(self._fixture.sandbox.sandbox_id)
+        placement = self._control.sandbox_pod_placement(self.sandbox_id)
+        after = self._control.sandbox_residency(self.sandbox_id)
+        snapshots = self._control.ready_full_snapshots(self.sandbox_id)
         self._fixture.verify(
             now.drain_phase == "draining"
             and after.lifecycle == "started"
@@ -243,7 +271,7 @@ class NodeDrainAssertions:
         node, before = self._node, self._placement_before
         if node is None or before is None:
             raise RuntimeError("drain_forced() must run before expect_evacuated()")
-        sandbox_id = self._fixture.sandbox.sandbox_id
+        sandbox_id = self.sandbox_id
         deadline = time.monotonic() + timeout
         while True:
             residency = self._control.sandbox_residency(sandbox_id)

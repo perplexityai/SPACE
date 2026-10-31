@@ -57,6 +57,7 @@ from space_smoke.capabilities import (
     SandboxPodRender,
     AdminNodeView,
     SandboxResidency,
+    StoppedResidency,
     EncryptedSnapshotObservation,
     ExecutionRow,
     RestoreCallerOutcome,
@@ -120,6 +121,12 @@ from space_smoke.orphaned_restore_pod_gc import (
     build_planted_orphan,
     validate_gc_keys,
     validate_gc_overrides,
+)
+from space_smoke.stopped_replacement import (
+    STOPPED_REPLACEMENT_ENV_KEYS,
+    parse_doctor_lifecycle,
+    validate_stopped_replacement_keys,
+    validate_stopped_replacement_overrides,
 )
 from space_smoke.runtime import (
     background,
@@ -597,6 +604,15 @@ CONTROL_PLANE_LABEL = "node-role.kubernetes.io/control-plane"
 KIND_WORKER_NODE_SELECTOR = f"!{CONTROL_PLANE_LABEL}"
 SANDBOX_RESIDENCY_SQL = """\
 SELECT lifecycle, coalesce(active_node_id::text, '') FROM sandboxes WHERE id = '{sandbox_id}'::uuid;
+"""
+STOPPED_RESIDENCY_SQL = """\
+SELECT lifecycle, coalesce(active_node_id::text, ''), placement, coalesce(evacuation_restore_target, '')
+FROM sandboxes WHERE id = '{sandbox_id}'::uuid;
+"""
+DISK_SNAPSHOT_IDS_SQL = """\
+SELECT id FROM snapshots
+ WHERE sandbox_id = '{sandbox_id}'::uuid AND type = 'disk'
+ ORDER BY id;
 """
 # The drain-gate Lease records the node it moved to `drained` and the row it
 # seeded, for the same reason the cordon Lease records its node: SPACE never
@@ -5081,23 +5097,29 @@ ON CONFLICT (key_hash) DO NOTHING;
             namespace=KIND_SANDBOX_NAMESPACE,
         )
         _require_ok(result, "list sandbox pods")
-        pods: list[SandboxPodView] = []
-        for pod in json.loads(result.stdout or "{}").get("items", []):
-            metadata = pod.get("metadata", {}) or {}
-            annotations = metadata.get("annotations", {}) or {}
-            pods.append(
-                SandboxPodView(
-                    pod_name=str(metadata.get("name", "")),
-                    phase=str((pod.get("status") or {}).get("phase", "")),
-                    node_name=str((pod.get("spec") or {}).get("nodeName", "") or ""),
-                    execution_generation=str(annotations.get(EXECUTION_GENERATION_ANNOTATION, "")),
-                    checkpoint=str(annotations.get(CHECKPOINT_ANNOTATION, "")),
-                    restore_source_node=str(annotations.get(RESTORE_SOURCE_NODE_ANNOTATION, "")),
-                    restore_storage_uri=str(annotations.get(RESTORE_STORAGE_URI_ANNOTATION, "")),
-                    deleting=bool(metadata.get("deletionTimestamp")),
-                )
-            )
+        pods = [_sandbox_pod_view(pod) for pod in json.loads(result.stdout or "{}").get("items", [])]
         return sorted(pods, key=lambda p: p.pod_name)
+
+    def watch_sandbox_pods(self, sandbox_id: str) -> KubectlPodWatch:
+        selector = quote(f"{SANDBOX_ID_LABEL}={_sql_uuid(sandbox_id)}", safe="")
+        path = f"/api/v1/namespaces/{KIND_SANDBOX_NAMESPACE}/pods?labelSelector={selector}"
+        listed = json.loads(
+            _require_ok(
+                self.kubectl("get", "--raw", path, timeout=15, namespace=KIND_SANDBOX_NAMESPACE),
+                "list the sandbox's pods to watch from",
+            )
+            or "{}"
+        )
+        resource_version = str((listed.get("metadata") or {}).get("resourceVersion") or "")
+        if not resource_version:
+            raise RuntimeError("the sandbox pod list carried no resourceVersion to watch from")
+        return KubectlPodWatch(
+            [
+                "kubectl", "--context", self.config.context, "get", "--raw",
+                f"{path}&watch=true&resourceVersion={resource_version}&timeoutSeconds=3600",
+            ],
+            initial=[pod for pod in listed.get("items") or [] if isinstance(pod, dict)],
+        )
 
     def delete_sandbox_pod(self, pod_name: str) -> None:
         self._require_isolated_kind("sandbox pod deletion")
@@ -5464,6 +5486,90 @@ ON CONFLICT (key_hash) DO NOTHING;
 
     def node_ctl_log(self, node_name: str, *, since_time: str) -> str:
         return self._node_service_logs(node_name, NODE_CTL, since_time=since_time)
+    # --- stopped-resident re-placement ---------------------------------------
+    #
+    # Thin wrappers; the key/value lists and the verdicts live in
+    # `space_smoke.stopped_replacement`. The controller-mutation Lease is
+    # `acquire_controller_mutation` above.
+
+    def stopped_replacement_env(self) -> dict[str, str | None]:
+        return self._deployment_env_literals(
+            self._controller_deployment(), STOPPED_REPLACEMENT_ENV_KEYS
+        )
+
+    def running_controller_stopped_replacement_envs(self) -> list[dict[str, str | None]]:
+        listing = self.kubectl(
+            "get", "pods", "-l", KIND_CONTROLLER_SELECTOR, "-o", "json", timeout=15
+        )
+        _require_ok(listing, "list cluster-controller pods")
+        envs: list[dict[str, str | None]] = []
+        for pod in json.loads(listing.stdout or "{}").get("items", []):
+            metadata = pod.get("metadata") or {}
+            if (pod.get("status") or {}).get("phase") != "Running" or metadata.get(
+                "deletionTimestamp"
+            ):
+                continue
+            containers = (pod.get("spec") or {}).get("containers") or [{}]
+            envs.append(
+                _env_literals(
+                    containers[0].get("env") or [],
+                    STOPPED_REPLACEMENT_ENV_KEYS,
+                    owner=str(metadata.get("name", "a cluster-controller pod")),
+                    value_from_refusal="; the scenario reads only literal flags",
+                )
+            )
+        return envs
+
+    def set_stopped_replacement_env(self, overrides: Mapping[str, str]) -> None:
+        validate_stopped_replacement_overrides(overrides)
+        self._apply_stopped_replacement_env(overrides)
+
+    def restore_stopped_replacement_env(self, standing: Mapping[str, str | None]) -> None:
+        # The captured literals go back verbatim: `truthy_default` reads an
+        # unrecognized value as the default, and restoring must not change that.
+        validate_stopped_replacement_keys(standing)
+        self._apply_stopped_replacement_env(standing)
+
+    def _apply_stopped_replacement_env(self, values: Mapping[str, str | None]) -> None:
+        self._require_isolated_kind("stopped-replacement controller env override")
+        ownership = self._retention_lease_ownership
+        if ownership is None:
+            raise SmokeConfigurationError(
+                "refusing a stopped-replacement controller deployment write without the "
+                "caller's live mutation Lease"
+            )
+        self._assert_lease_owned(ownership, "a stopped-replacement controller deployment write")
+        self._set_deployment_env(self._controller_deployment(), values, timeout=180)
+
+    def stopped_residency(self, sandbox_id: str) -> StoppedResidency:
+        row = self._psql(
+            STOPPED_RESIDENCY_SQL.format(sandbox_id=_sql_uuid(sandbox_id)),
+            action="read sandbox placement columns",
+        )
+        if not row:
+            raise RuntimeError(f"sandbox {sandbox_id} has no sandboxes row")
+        lifecycle, node, placement, marker = (part.strip() for part in row.split("|", 3))
+        return StoppedResidency(
+            lifecycle=lifecycle,
+            active_node_id=node or None,
+            placement=placement,
+            evacuation_restore_target=marker or None,
+        )
+
+    def disk_snapshot_ids(self, sandbox_id: str) -> list[str]:
+        rows = self._psql(
+            DISK_SNAPSHOT_IDS_SQL.format(sandbox_id=_sql_uuid(sandbox_id)),
+            action="list disk snapshots",
+        )
+        return [line.strip() for line in rows.splitlines() if line.strip()]
+
+    def sandbox_manager_lifecycle(self, node_name: str, sandbox_id: str) -> str:
+        canonical = _sql_uuid(sandbox_id)
+        result = self._node_shell_exec(
+            node_name, f"/space/bin/space-sbxmgr doctor {canonical}", timeout=30
+        )
+        output = _require_ok(result, f"read sandbox-manager state of {canonical} on {node_name}")
+        return parse_doctor_lifecycle(output)
 
     # --- template-manager startup recovery -------------------------------
 
@@ -7284,6 +7390,125 @@ def _controller_lease(document: Mapping[str, Any]) -> ControllerLease:
         duration_seconds=spec["leaseDurationSeconds"],
         transitions=int(spec.get("leaseTransitions") or 0),
     )
+
+
+def _sandbox_pod_view(pod: Mapping[str, Any]) -> SandboxPodView:
+    metadata = pod.get("metadata", {}) or {}
+    annotations = metadata.get("annotations", {}) or {}
+    return SandboxPodView(
+        pod_name=str(metadata.get("name", "")),
+        phase=str((pod.get("status") or {}).get("phase", "")),
+        node_name=str((pod.get("spec") or {}).get("nodeName", "") or ""),
+        execution_generation=str(annotations.get(EXECUTION_GENERATION_ANNOTATION, "")),
+        checkpoint=str(annotations.get(CHECKPOINT_ANNOTATION, "")),
+        restore_source_node=str(annotations.get(RESTORE_SOURCE_NODE_ANNOTATION, "")),
+        restore_storage_uri=str(annotations.get(RESTORE_STORAGE_URI_ANNOTATION, "")),
+        deleting=bool(metadata.get("deletionTimestamp")),
+    )
+
+
+class KubectlPodWatch:
+    """A watch of one sandbox's pods from a list's resourceVersion, keeping every version.
+
+    The caller lists the pods first and hands over that list; the watch then
+    starts from the list's resourceVersion, so every change after the list is
+    delivered however soon after it the watch request lands: a pod created,
+    bound and deleted between two polls arrives, deletion included. The
+    apiserver streams one JSON event per change. An `ERROR` event (for one, a
+    resourceVersion too old to resume from), an event that doesn't parse, or
+    kubectl exiting before `stop` means events may be missing, and `failure`
+    says so, so a short watch isn't read as "no pod was created".
+    """
+
+    STDERR_LIMIT = 4_000
+
+    def __init__(self, command: Sequence[str], *, initial: Sequence[Mapping[str, Any]]) -> None:
+        self._versions: list[tuple[SandboxPodView, Mapping[str, Any]]] = [
+            (_sandbox_pod_view(pod), pod) for pod in initial
+        ]
+        self._listed_uids = frozenset(
+            str(uid) for pod in initial if (uid := (pod.get("metadata") or {}).get("uid"))
+        )
+        self._error: str | None = None
+        self._stderr = ""
+        self._stopping = False
+        self._lock = threading.Lock()
+        self._process = subprocess.Popen(
+            list(command), stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        self._reader = threading.Thread(target=self._read, name="pod-watch", daemon=True)
+        self._reader.start()
+        self._stderr_reader = threading.Thread(
+            target=self._read_stderr, name="pod-watch-stderr", daemon=True
+        )
+        self._stderr_reader.start()
+
+    def _read(self) -> None:
+        assert self._process.stdout is not None
+        decoder = json.JSONDecoder()
+        buffer = ""
+        for chunk in iter(lambda: self._process.stdout.read1(65536), b""):  # type: ignore[union-attr]
+            buffer += chunk.decode(errors="replace")
+            while True:
+                buffer = buffer.lstrip()
+                try:
+                    event, end = decoder.raw_decode(buffer)
+                except ValueError:
+                    # The apiserver writes one event per line, so a complete
+                    # line that doesn't parse is skipped rather than left to
+                    # stall every event behind it, and recorded: the event it
+                    # carried is lost.
+                    if "\n" not in buffer:
+                        break
+                    line, buffer = buffer.split("\n", 1)
+                    with self._lock:
+                        self._error = self._error or f"unparsable watch event: {line[:500]!r}"
+                    continue
+                buffer = buffer[end:]
+                if not isinstance(event, dict):
+                    continue
+                pod = event.get("object")
+                if event.get("type") == "ERROR":
+                    with self._lock:
+                        self._error = self._error or f"watch error event: {json.dumps(pod)[:500]}"
+                elif isinstance(pod, dict) and (pod.get("metadata") or {}).get("name"):
+                    with self._lock:
+                        self._versions.append((_sandbox_pod_view(pod), pod))
+
+    def _read_stderr(self) -> None:
+        assert self._process.stderr is not None
+        for line in iter(self._process.stderr.readline, b""):
+            with self._lock:
+                self._stderr = (self._stderr + line.decode(errors="replace"))[-self.STDERR_LIMIT:]
+
+    def versions(self) -> list[tuple[SandboxPodView, Mapping[str, Any]]]:
+        with self._lock:
+            return list(self._versions)
+
+    def listed_uids(self) -> frozenset[str]:
+        return self._listed_uids
+
+    def failure(self) -> str | None:
+        code = self._process.poll()
+        with self._lock:
+            if self._error is not None:
+                return self._error
+            if code is not None and not self._stopping:
+                return f"kubectl exited {code}; stderr: {self._stderr.strip() or '<none>'}"
+        return None
+
+    def stop(self) -> None:
+        with self._lock:
+            self._stopping = True
+        if self._process.poll() is None:
+            self._process.terminate()
+            try:
+                self._process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+                self._process.wait(timeout=5)
+        self._reader.join(timeout=5)
+        self._stderr_reader.join(timeout=5)
 
 
 class KubectlLeaseWatch:
