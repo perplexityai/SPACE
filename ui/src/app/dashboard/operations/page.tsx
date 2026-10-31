@@ -26,13 +26,21 @@ interface AdminOperation extends PublicOperationRecord {
 const ACTOR_LOOKUPS = 6;
 const SBX_TARGET = /^sbx_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
 
+// Newer first, at the timestamps' full precision: the API's RFC 3339
+// strings have a fixed fractional width, so they sort as text (Date.parse
+// would drop the microseconds). The operation ID breaks only exact ties.
+function newerFirst(a: AdminOperation, b: AdminOperation): number {
+  if (a.created_at.length === b.created_at.length && a.created_at !== b.created_at) {
+    return a.created_at < b.created_at ? 1 : -1;
+  }
+  return Date.parse(b.created_at) - Date.parse(a.created_at) || b.id.localeCompare(a.id);
+}
+
 // Rows read under two target IDs, one per operation, newest first.
 function mergeNewest(pages: AdminOperation[][], limit: number): AdminOperation[] {
   const byId = new Map<string, AdminOperation>();
   for (const op of pages.flat()) byId.set(op.id, op);
-  return [...byId.values()]
-    .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at) || b.id.localeCompare(a.id))
-    .slice(0, limit);
+  return [...byId.values()].sort(newerFirst).slice(0, limit);
 }
 
 const STATES = ['queued', 'running', 'succeeded', 'failed', 'canceled', 'expired'];
@@ -44,9 +52,10 @@ function targetLink(op: AdminOperation) {
   if (!op.target_id) return '—';
   if (op.target_type === 'sandbox') {
     const link = <Link href={`/dashboard/sandboxes/${publicSandboxIdFromAny(op.target_id)}`}><code>{op.target_id}</code></Link>;
-    // A fork records its source sandbox by the bare UUID, not the sbx_ ID.
+    // A fork records its source sandbox by the bare UUID, not the sbx_ ID;
+    // filtering by the sbx_ ID also searches the bare UUID.
     return op.target_id.startsWith('sbx_') ? link : (
-      <Tooltip title="Forks are listed under their source sandbox's bare UUID; filter by that UUID to find them.">{link}</Tooltip>
+      <Tooltip title={`A fork lists its source sandbox by the bare UUID. Filter by ${publicSandboxIdFromAny(op.target_id)} to find the sandbox's operations and its forks.`}>{link}</Tooltip>
     );
   }
   return <code>{op.target_type ? `${op.target_type}:` : ''}{op.target_id}</code>;
@@ -86,8 +95,7 @@ export default function OperationsPage() {
   const [error, setError] = useState<string | null>(null);
   const [state, setState] = useState<string | undefined>();
   const [orgId, setOrgId] = useState<string | undefined>();
-  // What is typed, and what the loaded rows were filtered by: text filters
-  // apply on Enter and on clear, so a half-typed value never looks applied.
+  // What is typed, and what the loaded rows were filtered by.
   const [kindInput, setKindInput] = useState('');
   const [targetInput, setTargetInput] = useState('');
   const [kind, setKind] = useState('');
@@ -95,11 +103,20 @@ export default function OperationsPage() {
   const [limit, setLimit] = useState(100);
   // Only the newest request may write its answer.
   const request = useRef(0);
-  // Changing another filter applies whatever is typed in the text boxes too,
-  // so a box never shows a filter the rows do not have.
+  // Every path that applies filters (a dropdown, Enter in either box,
+  // clearing a box, Refresh) applies both text boxes as typed, so a box never
+  // shows a filter the rows do not have. A cleared box passes its new, empty
+  // value, which its state may not hold yet. Loading follows from the applied
+  // filters (the effect below).
+  const applyTyped = (typed: { kind?: string; target?: string } = {}) => {
+    const nextKind = (typed.kind ?? kindInput).trim();
+    const nextTarget = (typed.target ?? targetInput).trim();
+    setKind(nextKind);
+    setTargetId(nextTarget);
+    return nextKind !== kind || nextTarget !== targetId;
+  };
   const withTypedFilters = <V,>(set: (value: V) => void) => (value: V) => {
-    setKind(kindInput.trim());
-    setTargetId(targetInput.trim());
+    applyTyped();
     set(value);
   };
 
@@ -115,8 +132,10 @@ export default function OperationsPage() {
     };
     // A fork records its source sandbox by the bare UUID, so an `sbx_` target
     // also reads that form, and the two answers are merged.
-    const target = targetId.trim() || null;
-    const bare = target ? SBX_TARGET.exec(target)?.[1] ?? null : null;
+    // Target IDs match exactly, and forks record the lower-case UUID.
+    const typed = targetId.trim() || null;
+    const bare = typed ? SBX_TARGET.exec(typed)?.[1]?.toLowerCase() ?? null : null;
+    const target = bare ? `sbx_${bare}` : typed;
     setLoading(true);
     (bare ? Promise.all([query(target), query(bare)]).then(([a, b]) => mergeNewest([a, b], limit)) : query(target))
       .then((rows) => {
@@ -208,7 +227,7 @@ export default function OperationsPage() {
           <Title level={3} style={{ marginBottom: 4 }}>Operations</Title>
           <Text type="secondary">Lifecycle operations across every organization, newest first.</Text>
         </div>
-        <Button icon={<ReloadOutlined />} onClick={load} loading={loading}>Refresh</Button>
+        <Button icon={<ReloadOutlined />} onClick={() => { if (!applyTyped()) load(); }} loading={loading}>Refresh</Button>
       </Space>
       <Space wrap style={{ margin: '16px 0' }}>
         <Select allowClear placeholder="State" value={state} onChange={withTypedFilters(setState)} style={{ width: 150 }} options={STATES.map((s) => ({ value: s, label: s }))} />
@@ -226,9 +245,9 @@ export default function OperationsPage() {
           value={kindInput}
           onChange={(e) => {
             setKindInput(e.target.value);
-            if (!e.target.value) setKind('');
+            if (!e.target.value) applyTyped({ kind: '' });
           }}
-          onPressEnter={() => setKind(kindInput.trim())}
+          onPressEnter={() => applyTyped()}
           style={{ width: 220 }}
           aria-label="Kind"
         />
@@ -244,9 +263,9 @@ export default function OperationsPage() {
           value={targetInput}
           onChange={(e) => {
             setTargetInput(e.target.value);
-            if (!e.target.value) setTargetId('');
+            if (!e.target.value) applyTyped({ target: '' });
           }}
-          onPressEnter={() => setTargetId(targetInput.trim())}
+          onPressEnter={() => applyTyped()}
           style={{ width: 320 }}
           aria-label="Target ID"
         />

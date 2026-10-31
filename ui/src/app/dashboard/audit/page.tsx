@@ -109,7 +109,9 @@ export default function AuditPage() {
         size="small"
         loading={loading}
         pagination={tablePagination('events')}
-        locale={{ emptyText: error ? 'Not loaded' : needle ? 'No events match' : 'No audit events' }}
+        // "Not loaded" only when there is nothing to show; rows kept from the
+        // previous load can still fail to match the search.
+        locale={{ emptyText: error && events.length === 0 ? 'Not loaded' : needle ? 'No events match' : 'No audit events' }}
       />
     </div>
   );
