@@ -48,7 +48,6 @@ import {
 } from '@/lib/data-plane-terminal';
 import {
   ROLLBACK_NOT_ENABLED,
-  SNAPSHOTS_NOT_ENABLED,
   isHiddenOperationError,
 } from '@/lib/hidden-operations';
 import {
@@ -56,6 +55,9 @@ import {
   forceDeleteConsoleSandbox,
   getConsoleSandbox,
   getPublicPage,
+  getSandboxDebug,
+  getSandboxOperations,
+  type AdminOperationRecord,
   publicSnapshotToConsoleSnapshot,
   publicTemplateToConsoleTemplate,
   postPublicOperation,
@@ -71,6 +73,8 @@ import type {
   Template,
 } from '@/lib/types';
 import { tablePagination } from '@/lib/table-pagination';
+import { formatAge, sectionData, type DebugSnapshot, type SandboxDebug } from '@/lib/sandbox-debug';
+import { OperationsCard, OrgLink, PlacementCard, ResourcesCard, TimelineCard, UserLink } from './sandbox-insight';
 import NetworkPolicyDesigner, {
   compactNetworkPolicyLabel,
   NetworkPolicyDetails,
@@ -387,7 +391,48 @@ function snapshotCodec(type: string): { label: string; color: string } {
   return { label: type || '—', color: 'default' };
 }
 
-function SnapshotsCard({ sandboxId }: { sandboxId: string }) {
+// The public snapshot routes are org-scoped hidden operations; when they are
+// unavailable (another org's sandbox, or not enabled), list the snapshots the
+// admin debug route reports, without rollback.
+function AdminSnapshotsTable({ snapshots, nowMs }: { snapshots: DebugSnapshot[]; nowMs: number }) {
+  const { token } = theme.useToken();
+  const totalBytes = snapshots.reduce((acc, s) => acc + (s.size_bytes || 0), 0);
+  const columns: ColumnsType<DebugSnapshot> = [
+    { title: 'ID', dataIndex: 'id', ellipsis: true, render: (v: string, snap) => <Text code copyable={{ text: v }}>{snap.label || v}</Text> },
+    {
+      title: 'Codec', dataIndex: 'type', width: 110,
+      render: (v: string) => {
+        const codec = snapshotCodec(v);
+        return <Tag color={codec.color}>{codec.label}</Tag>;
+      },
+    },
+    { title: 'State', dataIndex: 'state', width: 100, render: (v: string) => <Tag color={v === 'ready' ? 'green' : v === 'failed' ? 'red' : 'default'}>{v}</Tag> },
+    { title: 'Age', dataIndex: 'timestamp', width: 90, render: (v: string) => <Tooltip title={v}>{formatAge(v, nowMs)}</Tooltip> },
+    { title: 'Size', dataIndex: 'size_bytes', width: 100, render: (v: number | null) => formatBytes(v) },
+    { title: 'Tier', dataIndex: 'retention_tier', width: 90, render: (v: string | null) => v || '—' },
+    { title: 'Failure', dataIndex: 'failure_reason', render: (v: string | null) => (v ? <Text type="danger">{v}</Text> : '—') },
+  ];
+  return (
+    <Table
+      columns={columns}
+      dataSource={snapshots}
+      rowKey="id"
+      size="small"
+      pagination={tablePagination('snapshots', 10)}
+      locale={{ emptyText: 'No snapshots' }}
+      footer={() =>
+        snapshots.length === 0 ? null : (
+          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, color: token.colorTextSecondary }}>
+            <span>{snapshots.length} snapshot{snapshots.length === 1 ? '' : 's'}</span>
+            <span>total {formatBytes(totalBytes)}</span>
+          </div>
+        )
+      }
+    />
+  );
+}
+
+function SnapshotsCard({ sandboxId, debug, nowMs }: { sandboxId: string; debug: SandboxDebug | null; nowMs: number }) {
   const { message } = App.useApp();
   const { token } = theme.useToken();
   const [snapshots, setSnapshots] = useState<SnapshotInfo[]>([]);
@@ -399,12 +444,10 @@ function SnapshotsCard({ sandboxId }: { sandboxId: string }) {
     setLoading(true);
     getPublicPage<PublicSnapshot>(`/sandboxes/${sandboxId}/snapshots`)
       .then((items) => setSnapshots(items.map(publicSnapshotToConsoleSnapshot)))
-      .catch((err: any) => {
-        if (isHiddenOperationError(err)) {
-          setSnapshotsOff(true);
-          return;
-        }
-        message.error(err.message || 'failed to load snapshots');
+      .catch(() => {
+        // Not enabled for this org, or another org's sandbox: fall back to the
+        // admin view below.
+        setSnapshotsOff(true);
       })
       .finally(() => setLoading(false));
   };
@@ -459,9 +502,14 @@ function SnapshotsCard({ sandboxId }: { sandboxId: string }) {
   ];
 
   if (snapshotsOff) {
+    const adminSnapshots = sectionData(debug?.snapshots)?.snapshots ?? [];
     return (
-      <Card size="small" title={<Space><CameraOutlined /> Snapshots</Space>}>
-        <Text type="secondary">{SNAPSHOTS_NOT_ENABLED}</Text>
+      <Card
+        size="small"
+        title={<Space><CameraOutlined /> Snapshots</Space>}
+        extra={<Text type="secondary" style={{ fontSize: 12 }}>Rollback unavailable: snapshot operations are not enabled for this sandbox&apos;s organization</Text>}
+      >
+        <AdminSnapshotsTable snapshots={adminSnapshots} nowMs={nowMs} />
       </Card>
     );
   }
@@ -949,6 +997,30 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
   const [error, setError] = useState<string | null>(null);
   const [editingNetwork, setEditingNetwork] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [debug, setDebug] = useState<SandboxDebug | null>(null);
+  const [operations, setOperations] = useState<AdminOperationRecord[]>([]);
+  const [operationsError, setOperationsError] = useState<string | null>(null);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  const sandboxRef = useRef<Sandbox | null>(null);
+  sandboxRef.current = sandbox;
+
+  // The debug and operations reads are heavier than the sandbox row, so they
+  // refresh on load, on Refresh, after an action, and every 20 s.
+  // `withDebug` is false when the sandbox row is gone: the debug route has
+  // nothing for it, while its operations are still recorded.
+  const loadInsight = async (withDebug = true) => {
+    const target = decodeURIComponent(id);
+    setNowMs(Date.now());
+    await Promise.all([
+      withDebug ? getSandboxDebug(target).then(setDebug).catch(() => setDebug(null)) : null,
+      getSandboxOperations(target)
+        .then((ops) => {
+          setOperations(ops);
+          setOperationsError(null);
+        })
+        .catch((err: any) => setOperationsError(err.message || 'failed to load operations')),
+    ]);
+  };
 
   const copyToClipboard = (value: string) => {
     if (typeof navigator !== 'undefined' && navigator.clipboard) {
@@ -957,7 +1029,7 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
     }
   };
 
-  const refresh = async (showSpinner = false) => {
+  const refresh = async (showSpinner = false): Promise<boolean> => {
     if (showSpinner) setLoading(true);
     try {
       const loaded = await getConsoleSandbox(decodeURIComponent(id));
@@ -965,8 +1037,10 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
       setError(null);
       // Any accepted identifier (bare UUID, pod name) lands on the canonical URL.
       if (loaded.id !== id) router.replace(`/dashboard/sandboxes/${loaded.id}`);
+      return true;
     } catch (err: any) {
       setError(err.message || 'Failed to load sandbox');
+      return false;
     } finally {
       if (showSpinner) setLoading(false);
     }
@@ -975,13 +1049,16 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
   useEffect(() => {
     if (!id) return;
     setLoading(true);
-    void refresh(true);
+    void refresh(true).then((found) => loadInsight(found));
     getPublicPage<PublicTemplate>('/templates?limit=1000')
       .then((items) => setTemplates(items.map(publicTemplateToConsoleTemplate)))
       .catch(() => {});
+    let ticks = 0;
     pollRef.current = setInterval(() => {
       if (typeof document !== 'undefined' && document.hidden) return;
       void refresh(false);
+      ticks += 1;
+      if (ticks % 5 === 0 && sandboxRef.current) void loadInsight();
     }, 4000);
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
@@ -1024,7 +1101,7 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
       message.success(`${action} queued`);
       await waitForAdminOperation(operation.operation_id);
       message.success(`Sandbox ${action} completed`);
-      await refresh(false);
+      await Promise.all([refresh(false), loadInsight()]);
     } catch (err: any) {
       message.error(err.message || `${action} failed`);
     } finally {
@@ -1078,6 +1155,14 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
         <Title level={3} style={{ marginTop: 8 }}>Sandbox not found</Title>
         <Paragraph type="danger">{error}</Paragraph>
         <Paragraph><code>{decodeURIComponent(id)}</code></Paragraph>
+        {operations.length ? (
+          <>
+            <Paragraph type="secondary">
+              The sandbox row is gone, but its lifecycle operations are still recorded:
+            </Paragraph>
+            <OperationsCard operations={operations} error={operationsError} nowMs={nowMs} />
+          </>
+        ) : null}
       </div>
     );
   }
@@ -1101,8 +1186,9 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
           <Link href="/dashboard/sandboxes"><ArrowLeftOutlined /> Sandboxes</Link>
           <Title level={3} style={{ margin: 0 }}>
-            <code>{sandboxLabelOrId(sandbox.id)}</code>
+            {sandbox.name || <code>{sandboxLabelOrId(sandbox.id)}</code>}
           </Title>
+          <Text code copyable={{ text: sandbox.id }}>{sandbox.id}</Text>
           {statusTag(sandbox.status, sandbox.failure_reason)}
           {sandbox.resource_type === 'pool_slot' ? <Tag color="cyan">Pool slot</Tag> : null}
           {sandbox.resource_type === 'observed_local' ? <Tag>Observed local</Tag> : null}
@@ -1124,7 +1210,9 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
               <Button
                 size="small"
                 icon={<ReloadOutlined />}
-                onClick={() => refresh(true)}
+                onClick={() => {
+                  void refresh(true).then((found) => loadInsight(found));
+                }}
                 loading={loading}
               >
                 Refresh
@@ -1163,10 +1251,10 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
             <Descriptions.Item label="User">{sandbox.user || '—'}</Descriptions.Item>
             <Descriptions.Item label="Created at">{sandbox.created_at || '—'}</Descriptions.Item>
             <Descriptions.Item label="Org">
-              {sandbox.org_id ? <code>{sandbox.org_id}</code> : '—'}
+              <OrgLink orgId={sandbox.org_id} />
             </Descriptions.Item>
             <Descriptions.Item label="Owner">
-              {sandbox.user_id ? <code>{sandbox.user_id}</code> : '—'}
+              <UserLink userId={sandbox.user_id} />
             </Descriptions.Item>
             {sandbox.pool_template ? (
               <Descriptions.Item label="Pool template">{sandbox.pool_template}</Descriptions.Item>
@@ -1182,6 +1270,16 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
         <Card size="small" title="Controls">
           <ControlButtons sandbox={sandbox} onAction={handleAction} busy={busy} />
         </Card>
+
+        <PlacementCard debug={debug} nowMs={nowMs} />
+
+        <TimelineCard debug={debug} nowMs={nowMs} />
+
+        <OperationsCard operations={operations} error={operationsError} nowMs={nowMs} />
+
+        {showSnapshots ? <SnapshotsCard sandboxId={sandbox.id} debug={debug} nowMs={nowMs} /> : null}
+
+        <ResourcesCard debug={debug} nowMs={nowMs} />
 
         <CollapsibleCard
           title="Network policy"
@@ -1250,7 +1348,6 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
 
         <TerminalCard sandbox={sandbox} />
 
-        {showSnapshots ? <SnapshotsCard sandboxId={sandbox.id} /> : null}
       </Space>
 
       {editingNetwork ? (
