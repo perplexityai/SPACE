@@ -100,6 +100,13 @@ const START_WAIT_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 /// barrier. Keep a hung manager from consuming the command-readiness budget.
 const RESIDENT_WAKE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const START_WAIT_COMMAND_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+/// How much longer than [`START_WAIT_COMMAND_PROBE_TIMEOUT`] the pooled
+/// readiness poll lets one probe run. The node starts that wait only after it
+/// connects to the guest's host agent, and sbx-mgr retries the host agent's
+/// `DeadlineExceeded`, so a probe for a guest that stays not ready runs until
+/// this client deadline ends it. The margin lets a guest that turns ready
+/// shortly after the requested wait answer the first probe.
+const START_WAIT_COMMAND_PROBE_CLIENT_MARGIN: Duration = Duration::from_secs(1);
 const POD_WORKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// The first dial to a sandbox pod's kept channel from a Native data-plane
 /// request. An in-cluster pod answers a SYN within milliseconds, so one that
