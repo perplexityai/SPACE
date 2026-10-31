@@ -4862,6 +4862,7 @@ dependencies = [
  "pplx-space-observability",
  "pplx-space-placement",
  "pplx-space-public-api",
+ "pplx-space-runtime-environment-catalog-store",
  "pplx-space-runtime-environment-policy-store",
  "pplx-space-sandbox-portability",
  "pplx-space-sandbox-store",
@@ -5188,6 +5189,9 @@ dependencies = [
  "pplx-space-observability",
  "pplx-space-placement",
  "pplx-space-public-api",
+ "pplx-space-runtime-environment-catalog-store",
+ "pplx-space-runtime-environment-policy-store",
+ "pplx-space-runtime-upgrade-campaign-store",
  "pplx-space-sandbox-portability",
  "pplx-space-sandbox-store",
  "pplx-space-sandbox-teardown",
@@ -6972,6 +6976,20 @@ dependencies = [
  "clap",
  "pplx-space-common-core",
  "pplx-space-node-runtime-supervisor",
+]
+
+[[package]]
+name = "pplx-space-runtime-upgrade-campaign-store"
+version = "0.8.0"
+dependencies = [
+ "pplx-space-common-core",
+ "pplx-space-db-test-fixtures",
+ "pplx-space-test-env",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.20",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
