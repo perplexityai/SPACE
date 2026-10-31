@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { Alert, Button, Input, Select, Space, Table, Tag, Tooltip, Typography } from 'antd';
 import { ReloadOutlined } from '@ant-design/icons';
@@ -11,8 +11,9 @@ import { tablePagination } from '@/lib/table-pagination';
 
 const { Title, Text } = Typography;
 
-// `GET /admin/api/v1/audit-events`: one row per admin mutation (every
-// non-GET request to /admin/api), newest first, at most 250.
+// `GET /admin/api/v1/audit-events`: one row per admin API request other than
+// GET, HEAD and OPTIONS that passed the operator check, whatever its status,
+// newest first, at most 250 (`admin_request_should_persist_audit_event`).
 interface AuditEvent {
   id: string;
   actor_user_id: string | null;
@@ -32,17 +33,26 @@ export default function AuditPage() {
   const [error, setError] = useState<string | null>(null);
   const [limit, setLimit] = useState(100);
   const [query, setQuery] = useState('');
+  // Only the newest request may write its answer.
+  const request = useRef(0);
 
   const load = () => {
+    const current = ++request.current;
     setLoading(true);
     adminApi
       .get<{ events: AuditEvent[] }>(`/v1/audit-events?limit=${limit}`)
       .then((body) => {
+        if (current !== request.current) return;
         setEvents(body.events);
         setError(null);
       })
-      .catch((err: unknown) => setError(err instanceof Error ? err.message : 'Failed to load audit events'))
-      .finally(() => setLoading(false));
+      .catch((err: unknown) => {
+        if (current !== request.current) return;
+        setError(err instanceof Error ? err.message : 'Failed to load audit events');
+      })
+      .finally(() => {
+        if (current === request.current) setLoading(false);
+      });
   };
 
   useEffect(load, [limit]);
@@ -73,7 +83,10 @@ export default function AuditPage() {
       <Space align="center" style={{ width: '100%', justifyContent: 'space-between' }}>
         <div>
           <Title level={3} style={{ marginBottom: 4 }}>Audit log</Title>
-          <Text type="secondary">Every change made through the admin API, newest first.</Text>
+          <Text type="secondary">
+            Every admin API request other than reads (GET, HEAD, OPTIONS) made by a signed-in operator, including refused
+            ones, newest first. Console actions sent through the public API appear under Operations.
+          </Text>
         </div>
         <Button icon={<ReloadOutlined />} onClick={load} loading={loading}>Refresh</Button>
       </Space>
@@ -81,7 +94,14 @@ export default function AuditPage() {
         <Input allowClear placeholder="Search actor, method, path or status" value={query} onChange={(e) => setQuery(e.target.value)} style={{ width: 360 }} />
         <Select value={limit} onChange={setLimit} style={{ width: 140 }} options={[50, 100, 250].map((n) => ({ value: n, label: `Newest ${n}` }))} />
       </Space>
-      {error ? <Alert type="error" showIcon title={error} style={{ marginBottom: 12 }} /> : null}
+      {error ? (
+        <Alert
+          type="error"
+          showIcon
+          title={events.length ? `${error}. The rows below are from the previous load.` : error}
+          style={{ marginBottom: 12 }}
+        />
+      ) : null}
       <Table
         columns={columns}
         dataSource={rows}
