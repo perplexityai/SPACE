@@ -368,6 +368,10 @@ USER_ID=00000000-0000-0000-0000-000000000012  # dev@local
 
 Sign in at `http://127.0.0.1:3000` with the chosen account. Repeat with the other `USER_ID` if needed; repeating for the same account changes its password.
 
+To exercise the console in a browser against this stack, with seeded synthetic
+data and recorded evidence per page, see the
+[console loop](../infra/space/kind/console-loop/README.md).
+
 <a id="shim-telemetry-selectors"></a>
 
 ## Select shim telemetry

@@ -31,6 +31,8 @@ Follow `CONTRIBUTING.md` for the development entry points and
 Follow `docs/installation.md` to install prerequisites and bring the Kind stack
 up with `infra/space/kind/scripts/up.sh`, which starts Tilt. Use `infra/space/kind/README.md` for the ongoing
 development loop and `docs/troubleshooting.md` for inspection and recovery.
+For admin console (`ui/`) changes, `infra/space/kind/console-loop/README.md`
+is the browser verification loop against that stack.
 Direct-node deployments require operator-supplied provisioning and service
 management; this repository does not provide a direct-deployment command.
 
