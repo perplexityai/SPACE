@@ -269,6 +269,9 @@ jobs:
       # rather than inherited so a default change cannot alter the shards
       # silently.
       SPACE_KIND_TELEMETRY_MODE: otel
+      # No smoke scenario reads the UI, and its image build is the longest
+      # single step of the bring-up (see the Tiltfile's KIND_UI).
+      SPACE_KIND_UI: "0"
     runs-on: ubuntu-24.04-16core
     timeout-minutes: 180
     steps:
