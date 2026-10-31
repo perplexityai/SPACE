@@ -3,11 +3,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import { Alert, App, Button, Input, Select, Space, Table, Tag, Tooltip, Typography } from 'antd';
-import { ReloadOutlined } from '@ant-design/icons';
+import { InfoCircleOutlined, ReloadOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 
 import { adminApi } from '@/lib/api';
-import { mapLimit } from '@/lib/map-limit';
 import { publicSandboxIdFromAny } from '@/lib/sandbox-id';
 import { tablePagination } from '@/lib/table-pagination';
 import type { Organization, PublicOperationRecord, User } from '@/lib/types';
@@ -22,6 +21,18 @@ interface AdminOperation extends PublicOperationRecord {
   target_type: string | null;
   target_id: string | null;
   attempts: number;
+}
+
+const ACTOR_LOOKUPS = 6;
+const SBX_TARGET = /^sbx_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
+
+// Rows read under two target IDs, one per operation, newest first.
+function mergeNewest(pages: AdminOperation[][], limit: number): AdminOperation[] {
+  const byId = new Map<string, AdminOperation>();
+  for (const op of pages.flat()) byId.set(op.id, op);
+  return [...byId.values()]
+    .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at) || b.id.localeCompare(a.id))
+    .slice(0, limit);
 }
 
 const STATES = ['queued', 'running', 'succeeded', 'failed', 'canceled', 'expired'];
@@ -84,17 +95,30 @@ export default function OperationsPage() {
   const [limit, setLimit] = useState(100);
   // Only the newest request may write its answer.
   const request = useRef(0);
+  // Changing another filter applies whatever is typed in the text boxes too,
+  // so a box never shows a filter the rows do not have.
+  const withTypedFilters = <V,>(set: (value: V) => void) => (value: V) => {
+    setKind(kindInput.trim());
+    setTargetId(targetInput.trim());
+    set(value);
+  };
 
   const load = () => {
     const current = ++request.current;
-    const params = new URLSearchParams({ limit: String(limit) });
-    if (state) params.set('state', state);
-    if (orgId) params.set('org_id', orgId);
-    if (kind.trim()) params.set('kind', kind.trim());
-    if (targetId.trim()) params.set('target_id', targetId.trim());
+    const query = (target: string | null) => {
+      const params = new URLSearchParams({ limit: String(limit) });
+      if (state) params.set('state', state);
+      if (orgId) params.set('org_id', orgId);
+      if (kind.trim()) params.set('kind', kind.trim());
+      if (target) params.set('target_id', target);
+      return adminApi.get<AdminOperation[]>(`/v1/operations?${params}`);
+    };
+    // A fork records its source sandbox by the bare UUID, so an `sbx_` target
+    // also reads that form, and the two answers are merged.
+    const target = targetId.trim() || null;
+    const bare = target ? SBX_TARGET.exec(target)?.[1] ?? null : null;
     setLoading(true);
-    adminApi
-      .get<AdminOperation[]>(`/v1/operations?${params}`)
+    (bare ? Promise.all([query(target), query(bare)]).then(([a, b]) => mergeNewest([a, b], limit)) : query(target))
       .then((rows) => {
         if (current !== request.current) return;
         setOperations(rows);
@@ -116,22 +140,43 @@ export default function OperationsPage() {
 
   const orgNames = useMemo(() => new Map(orgs.map((org) => [org.id, org.name])), [orgs]);
 
-  // Resolve each distinct actor to an email, at most 6 lookups at a time. A
-  // failed lookup is not remembered, so the next load tries it again.
+  // Resolve each distinct actor to an email. One queue per page keeps at
+  // most ACTOR_LOOKUPS lookups in flight across loads; leaving the page
+  // cancels them. A failed lookup is not remembered: the next load that
+  // lists the actor tries again.
   const [actorEmails, setActorEmails] = useState<Record<string, string>>({});
-  const actorLookups = useRef(new Set<string>());
+  const actorQueue = useRef<string[]>([]);
+  const actorPending = useRef(new Set<string>());
+  const actorInFlight = useRef(0);
+  const actorAbort = useRef<AbortController | null>(null);
+  useEffect(() => {
+    actorAbort.current = new AbortController();
+    return () => actorAbort.current?.abort();
+  }, []);
+  const pumpActors = () => {
+    const signal = actorAbort.current?.signal;
+    while (signal && !signal.aborted && actorInFlight.current < ACTOR_LOOKUPS && actorQueue.current.length) {
+      const userId = actorQueue.current.shift()!;
+      actorInFlight.current += 1;
+      adminApi
+        .get<User>(`/v1/users/${userId}`, { signal })
+        .then((u) => { if (!signal.aborted) setActorEmails((current) => ({ ...current, [userId]: u.email })); })
+        .catch(() => {})
+        .finally(() => {
+          actorInFlight.current -= 1;
+          actorPending.current.delete(userId);
+          pumpActors();
+        });
+    }
+  };
   useEffect(() => {
     const missing = [...new Set(operations.map((op) => op.actor_user_id).filter((v): v is string => !!v))]
-      .filter((userId) => !(userId in actorEmails) && !actorLookups.current.has(userId));
-    if (missing.length === 0) return;
-    missing.forEach((userId) => actorLookups.current.add(userId));
-    void mapLimit(missing, 6, (userId) => adminApi.get<User>(`/v1/users/${userId}`)).then((results) => {
-      missing.forEach((userId) => actorLookups.current.delete(userId));
-      const found = Object.fromEntries(
-        results.flatMap((r, i) => (r.status === 'fulfilled' ? [[missing[i], r.value.email] as const] : [])),
-      );
-      setActorEmails((current) => ({ ...current, ...found }));
-    });
+      .filter((userId) => !(userId in actorEmails) && !actorPending.current.has(userId));
+    for (const userId of missing) {
+      actorPending.current.add(userId);
+      actorQueue.current.push(userId);
+    }
+    pumpActors();
   }, [operations]);
 
   const columns: ColumnsType<AdminOperation> = [
@@ -166,12 +211,12 @@ export default function OperationsPage() {
         <Button icon={<ReloadOutlined />} onClick={load} loading={loading}>Refresh</Button>
       </Space>
       <Space wrap style={{ margin: '16px 0' }}>
-        <Select allowClear placeholder="State" value={state} onChange={setState} style={{ width: 150 }} options={STATES.map((s) => ({ value: s, label: s }))} />
+        <Select allowClear placeholder="State" value={state} onChange={withTypedFilters(setState)} style={{ width: 150 }} options={STATES.map((s) => ({ value: s, label: s }))} />
         <Select
           allowClear
           placeholder="Organization"
           value={orgId}
-          onChange={setOrgId}
+          onChange={withTypedFilters(setOrgId)}
           style={{ width: 200 }}
           options={orgs.map((org) => ({ value: org.id, label: org.name }))}
         />
@@ -190,6 +235,12 @@ export default function OperationsPage() {
         <Input
           allowClear
           placeholder="Target ID, e.g. sbx_… (Enter to apply)"
+          title="Forks are listed under their source sandbox's bare UUID; an sbx_ ID also finds them."
+          suffix={
+            <Tooltip title="Forks are listed under their source sandbox's bare UUID. An sbx_ ID here also searches that UUID, so its forks are included.">
+              <InfoCircleOutlined style={{ color: 'rgba(0,0,0,0.45)' }} />
+            </Tooltip>
+          }
           value={targetInput}
           onChange={(e) => {
             setTargetInput(e.target.value);
@@ -199,7 +250,7 @@ export default function OperationsPage() {
           style={{ width: 320 }}
           aria-label="Target ID"
         />
-        <Select value={limit} onChange={setLimit} style={{ width: 140 }} options={[50, 100, 250].map((n) => ({ value: n, label: `Newest ${n}` }))} />
+        <Select value={limit} onChange={withTypedFilters(setLimit)} style={{ width: 140 }} options={[50, 100, 250].map((n) => ({ value: n, label: `Newest ${n}` }))} />
       </Space>
       {error ? (
         <Alert
@@ -217,7 +268,7 @@ export default function OperationsPage() {
         loading={loading}
         scroll={{ x: 1300 }}
         pagination={tablePagination('operations')}
-        locale={{ emptyText: 'No operations match these filters' }}
+        locale={{ emptyText: error ? 'Not loaded' : 'No operations match these filters' }}
       />
     </div>
   );

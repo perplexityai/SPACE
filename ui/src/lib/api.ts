@@ -180,7 +180,8 @@ export const authApi = {
 };
 
 export const adminApi = {
-  get: <T>(path: string) => requestOnce<T>(ADMIN_BASE, path),
+  // `signal` lets a page cancel reads it no longer needs.
+  get: <T>(path: string, init?: { signal?: AbortSignal }) => requestOnce<T>(ADMIN_BASE, path, init ?? {}),
   post: <T>(path: string, body?: unknown, headers?: Record<string, string>) =>
     requestOnce<T>(ADMIN_BASE, path, { method: 'POST', body: body ? JSON.stringify(body) : undefined, headers }),
   patch: <T>(path: string, body?: unknown, headers?: Record<string, string>) =>
