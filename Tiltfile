@@ -364,24 +364,35 @@ space_image(
 # unchanged, so watch-mode rebuilds are cheap unless spaced changed. One
 # directory for both steps, resolved once: build-seed.sh writes
 # SPACE_SEED_OUTPUT_DIR (default below), and the image is built from what it
-# wrote.
+# wrote. The seed-artifacts resource below runs the same SEED_BUILD, with the
+# same resolution, earlier. The docker build reads that directory under
+# build-seed.sh's lock (--read-lock). A seed build either finishes before the
+# image build reads the directory, and the image gets its output, or waits
+# until the image is built. None rewrites the directory while the image build
+# reads it.
+SEED_BUILD = " && ".join([
+    'seed_dir="${SPACE_SEED_OUTPUT_DIR:-$HOME/.space-devbox/kind/seed/build}"',
+    'SPACE_SEED_OUTPUT_DIR="$seed_dir" SPACE_RUST_BUILD_IMAGE={} bash infra/space/kind/scripts/build-seed.sh'.format(
+        RUST_ARTIFACT_IMAGE),
+])
+SEED_DEPS = RUST_ARTIFACT_DEPS + [
+    "templates/firecracker/seed",
+    "templates/firecracker/recipes/seed.toml",
+    "infra/space/kind/scripts/build-seed.sh",
+]
 space_image(
     ref = "space-seed-publish:local",
     command = " && ".join([
         BUILD_INPUTS_SNAPSHOT,
         pull_base_images("docker/Dockerfile.seed-publish"),
         RUST_ARTIFACT_BUILD,
-        'seed_dir="${SPACE_SEED_OUTPUT_DIR:-$HOME/.space-devbox/kind/seed/build}"',
-        'SPACE_SEED_OUTPUT_DIR="$seed_dir" SPACE_RUST_BUILD_IMAGE={} bash infra/space/kind/scripts/build-seed.sh'.format(
-            RUST_ARTIFACT_IMAGE),
-        (image_build("space-seed-publish", revision_label = True) + " -t $SPACE_BUILD_REF " +
+        SEED_BUILD,
+        ('SPACE_SEED_OUTPUT_DIR="$seed_dir" bash infra/space/kind/scripts/build-seed.sh --read-lock -- ' +
+         image_build("space-seed-publish", revision_label = True) + " -t $SPACE_BUILD_REF " +
          '--build-context seed="$seed_dir" .'),
     ]),
-    deps = RUST_ARTIFACT_DEPS + [
-            "templates/firecracker/seed",
-            "templates/firecracker/recipes/seed.toml",
+    deps = SEED_DEPS + [
             "docker/Dockerfile.seed-publish",
-            "infra/space/kind/scripts/build-seed.sh",
             "infra/space/kind/scripts/seed-publish-entry.sh"],
 )
 
@@ -629,6 +640,24 @@ local_resource(
     labels = ["build"],
 )
 
+# The seed's rootfs, built as soon as the guest binaries it bakes in are,
+# alongside the space-api deploy chain, for the same reason: the seed-publish
+# image build is held until space-internal-api is ready, which kept the
+# privileged rootfs build (about a minute cold) off until then. The
+# custom_build still runs build-seed.sh first, so its image is never built
+# from seed output older than its inputs: after waiting on the script's lock
+# when this resource holds it, it finds the seed up to date or rebuilds it,
+# and then builds the image from the directory while holding the lock shared.
+# Only the publish Job needs space-internal-api; its resource keeps that gate.
+local_resource(
+    "seed-artifacts",
+    cmd = " && ".join([RUST_ARTIFACT_BUILD, SEED_BUILD]),
+    deps = SEED_DEPS,
+    allow_parallel = True,
+    resource_deps = ["rust-artifacts"],
+    labels = ["build"],
+)
+
 # ── Helm releases (in dependency order) ───────────────────────────────────
 
 def helm_release(name, chart, values = [], set = []):
@@ -708,18 +737,23 @@ k8s_resource(
 )
 
 # The Kind user stays locked in shared migrations. Provision only after the
-# API pod finishes migrations.
+# API pod finishes migrations. It only waits for the API's rollout and execs
+# into its pod, so allow_parallel lets it run while images still build rather
+# than when Tilt has nothing else in progress.
 local_resource(
     "provision-local-console",
     cmd = "SPACE_KIND_CLUSTER={} bash infra/space/kind/scripts/provision-local-console.sh".format(KIND_CLUSTER),
     deps = ["infra/space/kind/scripts/provision-local-console.sh"],
+    allow_parallel = True,
     labels = ["bootstrap"],
     resource_deps = ["space-api"],
 )
 
 # Internal (cluster) API — node-ctl publishes node state here (this is node
 # registration), template-manager resolves releases, and the seed publish
-# registers the seed release against it.
+# registers the seed release against it. It does not wait for the console
+# login: nothing it runs, and none of its callers (the seed publish Job
+# presents a projected ServiceAccount token), signs in as root@local.
 deploy_yaml(helm(
     "infra/space/kind/charts/space-internal-api-local",
     name = "space",
@@ -729,7 +763,7 @@ deploy_yaml(helm(
 k8s_resource(
     "space-internal-api",
     labels = ["control-plane"],
-    resource_deps = ["space-api", "provision-local-console", "label-kind-infra"],
+    resource_deps = ["space-api", "label-kind-infra"],
 )
 
 # Control-plane credential-manager authority: owns the credential tables and
