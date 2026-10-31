@@ -2,12 +2,13 @@
 
 import { useEffect, useState } from 'react';
 import { useParams } from 'next/navigation';
+import Link from 'next/link';
 import { adminApi } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 import { useCuriosityTheme } from '@/lib/theme';
 import { Organization, OrgMasterKey, Sandbox, User } from '@/lib/types';
-import { Card, Table, Typography, Form, Input, Button, App, Descriptions, Space, Switch, Tag } from 'antd';
-import { LockOutlined, SaveOutlined } from '@ant-design/icons';
+import { Card, Table, Typography, Form, Input, Button, App, Descriptions, Space, Switch, Tag, Result } from 'antd';
+import { ArrowLeftOutlined, LockOutlined, SaveOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 
 const { Title } = Typography;
@@ -22,9 +23,12 @@ export default function OrgDetailPage() {
   const [sandboxes, setSandboxes] = useState<Sandbox[]>([]);
   const [masterKey, setMasterKey] = useState<OrgMasterKey | null>(null);
   const [byokSaving, setByokSaving] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
   const [form] = Form.useForm();
 
   useEffect(() => {
+    setLoadError(null);
     adminApi.get<Organization>(`/v1/orgs/${id}`).then((o) => {
       setOrg(o);
       form.setFieldsValue({
@@ -32,7 +36,7 @@ export default function OrgDetailPage() {
         theme_secondary: o.theme_secondary || '',
         logo_url: o.logo_url || '',
       });
-    });
+    }).catch((err: unknown) => setLoadError(err instanceof Error ? err.message : 'Failed to load organization'));
     adminApi.get<User[]>(`/v1/orgs/${id}/users`).then(setUsers).catch(() => {});
     adminApi.get<Sandbox[]>(`/v1/sandboxes?org_id=${id}&limit=5000`).then(setSandboxes).catch(() => {});
     adminApi.get<OrgMasterKey | null>(`/v1/orgs/${id}/master-key`).then(setMasterKey).catch(() => {});
@@ -42,16 +46,23 @@ export default function OrgDetailPage() {
     sandboxes.filter((sandbox) => sandbox.user_id === userId).length;
 
   const handleSave = async (values: any) => {
-    const updated = await adminApi.patch<Organization>(`/v1/orgs/${id}`, {
-      theme_primary: values.theme_primary || null,
-      theme_secondary: values.theme_secondary || null,
-      logo_url: values.logo_url || null,
-    });
-    setOrg(updated);
-    if (authOrg && updated.id === authOrg.id) {
-      refreshOrg(updated);
+    setSaving(true);
+    try {
+      const updated = await adminApi.patch<Organization>(`/v1/orgs/${id}`, {
+        theme_primary: values.theme_primary || null,
+        theme_secondary: values.theme_secondary || null,
+        logo_url: values.logo_url || null,
+      });
+      setOrg(updated);
+      if (authOrg && updated.id === authOrg.id) {
+        refreshOrg(updated);
+      }
+      message.success('Branding saved');
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : 'Failed to save branding');
+    } finally {
+      setSaving(false);
     }
-    message.success('Branding saved');
   };
 
   const handleByokToggle = async (checked: boolean) => {
@@ -79,6 +90,17 @@ export default function OrgDetailPage() {
       render: (_, record) => sandboxCountByUser(record.id),
     },
   ];
+
+  if (loadError) {
+    return (
+      <Result
+        status="warning"
+        title="Organization not found"
+        subTitle={<>{loadError} <code>{id}</code></>}
+        extra={<Link href="/dashboard/orgs"><ArrowLeftOutlined /> Organizations</Link>}
+      />
+    );
+  }
 
   if (!org) return null;
 
@@ -133,7 +155,7 @@ export default function OrgDetailPage() {
             <Input placeholder="https://example.com/logo.png" />
           </Form.Item>
           <Form.Item>
-            <Button type="primary" htmlType="submit" icon={<SaveOutlined />}>
+            <Button type="primary" htmlType="submit" icon={<SaveOutlined />} loading={saving}>
               Save Branding
             </Button>
           </Form.Item>
