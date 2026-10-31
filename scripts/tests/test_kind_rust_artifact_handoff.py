@@ -194,3 +194,144 @@ def test_record_rejects_a_key_label_without_a_valid_revision(run, monkeypatch):
     monkeypatch.setenv("FAKE_LABELS", labels(revision="main"))
     with pytest.raises(ValueError, match="invalid input key or revision"):
         handed_off(run, monkeypatch)
+
+
+class FakeClock:
+    """Stands in for the handoff's `time`: sleeping advances it, nothing waits."""
+
+    def __init__(self):
+        self.now = 0.0
+        self.sleeps = []
+        # The timeout each `gh api` call was given.
+        self.timeouts = []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+@pytest.fixture
+def gh(run, monkeypatch):
+    """Answers each `gh api` call from a script; returns (script, clock)."""
+
+    script = []
+    clock = FakeClock()
+    real_run = subprocess.run
+
+    def fake_run(args, **kwargs):
+        if list(args[:2]) != ["gh", "api"]:
+            return real_run(args, **kwargs)
+        clock.timeouts.append(kwargs.get("timeout"))
+        answer = script.pop(0)
+        if answer == "timeout":
+            raise subprocess.TimeoutExpired(args, kwargs.get("timeout"))
+        code, stderr, stdout = answer
+        return subprocess.CompletedProcess(args, code, stdout, stderr)
+
+    monkeypatch.setattr(handoff.subprocess, "run", fake_run)
+    monkeypatch.setattr(handoff, "time", clock)
+    return script, clock
+
+
+def producer_jobs(conclusion="success"):
+    job = {"name": handoff.PRODUCER, "status": "completed", "conclusion": conclusion}
+    return (0, "", json.dumps([{"jobs": [job]}]))
+
+
+def producer_upload(attempt=1):
+    name = f"kind-rust-{handoff.os.environ['GITHUB_SHA']}-{attempt}"
+    return (0, "", json.dumps([{"artifacts": [{"name": name, "expired": False}]}]))
+
+
+def test_wait_rides_out_transient_api_failures(run, gh, capsys):
+    script, clock = gh
+    script.extend(
+        [
+            (1, "gh: Server Error (HTTP 502)", ""),
+            "timeout",
+            (1, "gh: API rate limit exceeded (HTTP 429)", ""),
+            (1, "error connecting to api.github.com", ""),
+            producer_jobs(),
+            (1, "gh: Service Unavailable (HTTP 503)", ""),
+            producer_upload(),
+        ]
+    )
+
+    handoff.wait(3600)
+
+    assert "SPACE_KIND_RUST_PRODUCER_ATTEMPT=1" in (run / "env").read_text()
+    assert clock.sleeps == [5, 10, 20, 30, 5]
+    out = capsys.readouterr().out
+    assert "Retrying the Rust producer status lookup in 5 s after HTTP 502" in out
+    assert f"after no answer within {handoff.API_CALL_SECONDS} s" in out
+    assert "after a transport failure" in out
+    assert "Retrying the Rust producer artifacts lookup in 5 s after HTTP 503" in out
+    # Only the status is printed, never the remote error text.
+    assert "Server Error" not in out and "rate limit exceeded" not in out
+
+
+def test_wait_fails_at_once_when_actions_read_is_refused(gh):
+    script, clock = gh
+    script.append((1, "gh: Resource not accessible by integration (HTTP 403)", ""))
+
+    with pytest.raises(RuntimeError, match=r"\(HTTP 403\); Actions read access is required"):
+        handoff.wait(3600)
+    assert clock.sleeps == []
+
+
+def test_wait_gives_up_at_its_deadline_during_a_persistent_outage(gh):
+    script, clock = gh
+    script.extend([(1, "gh: Bad Gateway (HTTP 502)", "")] * 10)
+
+    with pytest.raises(RuntimeError, match="before the wait's deadline: HTTP 502"):
+        handoff.wait(40)
+    # 5 + 10 + 20 s leaves less than the next 30 s pause before the deadline,
+    # and the last call's timeout is capped at the 5 s left.
+    assert clock.sleeps == [5, 10, 20]
+    assert clock.timeouts == [30, 30, 25, 5]
+
+
+def test_wait_refuses_a_failed_producer(gh):
+    script, _ = gh
+    script.append(producer_jobs(conclusion="failure"))
+
+    with pytest.raises(RuntimeError, match="refusing local compilation fallback"):
+        handoff.wait(3600)
+
+
+def test_wait_rides_out_a_rate_limit_reported_as_403_and_a_brief_404(run, gh, capsys):
+    script, clock = gh
+    script.extend(
+        [
+            (1, "gh: API rate limit exceeded for installation ID 1 (HTTP 403)", ""),
+            (1, "gh: Not Found (HTTP 404)", ""),
+            producer_jobs(),
+            producer_upload(),
+        ]
+    )
+
+    handoff.wait(3600)
+
+    assert clock.sleeps == [5, 10]
+    out = capsys.readouterr().out
+    assert "after HTTP 403 (rate limit)" in out and "after HTTP 404" in out
+    assert "installation ID" not in out
+
+
+@pytest.mark.parametrize(
+    ("answer", "message"),
+    [
+        ((4, "To get started with GitHub CLI, please run:  gh auth login", ""), "gh has no authentication"),
+        ((1, "gh: Validation Failed (HTTP 422)", ""), r"\(HTTP 422\)$"),
+    ],
+)
+def test_wait_fails_at_once_on_a_failure_that_cannot_heal(gh, answer, message):
+    script, clock = gh
+    script.append(answer)
+
+    with pytest.raises(RuntimeError, match=message):
+        handoff.wait(3600)
+    assert clock.sleeps == []

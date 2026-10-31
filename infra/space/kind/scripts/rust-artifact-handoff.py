@@ -222,42 +222,91 @@ def record(directory: Path) -> None:
     )
 
 
+# Each `gh api` call is bounded; the wait as a whole is bounded by its deadline.
+API_CALL_SECONDS = 30
+# Backoff between attempts of one lookup after a transient failure.
+API_RETRY_SECONDS = (5, 10, 20, 30)
+# `gh` exits 4 when it has no authentication to send; none appears later.
+GH_AUTH_EXIT = 4
+# The client errors worth retrying: a request timeout, a rate limit, and a 404,
+# which a run's newly created attempt may answer before its jobs are listed.
+RETRIED_CLIENT_STATUSES = ("404", "408", "429")
+
+
+def api_pages(path: str, what: str, deadline: float) -> list:
+    """The slurped pages of a `gh api` GET, retried through transient failures.
+
+    What cannot heal fails at once: `gh` without authentication, a refused
+    token (HTTP 401, or a 403 that is not a rate limit) and any other client
+    error but a request timeout, a rate limit or a 404. GitHub reports rate
+    limits as 403 or 429. Everything else (a 5xx, a rate limit, a 404, a
+    dropped connection or a call that outlives its timeout) is retried with
+    backoff until the caller's deadline: a shard that gives up while the
+    producer is still building fails the run for an API outage it could have
+    waited out. Each call's timeout is capped at the time left, so the wait
+    ends at its deadline. Only the HTTP status is ever printed, never a remote
+    error body or authentication diagnostics.
+    """
+
+    attempt = 0
+    while True:
+        call_seconds = max(1, min(API_CALL_SECONDS, int(deadline - time.monotonic())))
+        try:
+            result = subprocess.run(
+                ["gh", "api", "--paginate", "--slurp", path],
+                capture_output=True,
+                text=True,
+                timeout=call_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            failure = f"no answer within {call_seconds} s"
+        else:
+            if not result.returncode:
+                return json.loads(result.stdout)
+            if result.returncode == GH_AUTH_EXIT:
+                raise RuntimeError(
+                    f"cannot read {what}: gh has no authentication; Actions read access is required"
+                )
+            match = re.search(r"HTTP ([0-9]{3})", result.stderr)
+            status = match.group(1) if match else None
+            rate_limited = status in ("403", "429") and "rate limit" in result.stderr.lower()
+            if status in ("401", "403") and not rate_limited:
+                raise RuntimeError(
+                    f"cannot read {what} (HTTP {status}); Actions read access is required"
+                )
+            if (
+                status is not None
+                and status.startswith("4")
+                and status not in RETRIED_CLIENT_STATUSES
+                and not rate_limited
+            ):
+                raise RuntimeError(f"cannot read {what} (HTTP {status})")
+            if status is None:
+                failure = "a transport failure"
+            else:
+                failure = f"HTTP {status}" + (" (rate limit)" if rate_limited else "")
+        pause = API_RETRY_SECONDS[min(attempt, len(API_RETRY_SECONDS) - 1)]
+        if time.monotonic() + pause >= deadline:
+            raise RuntimeError(f"cannot read {what} before the wait's deadline: {failure}")
+        attempt += 1
+        print(f"Retrying the {what} lookup in {pause} s after {failure}", flush=True)
+        time.sleep(pause)
+
+
 def artifact_attempt(prefix: str, revision: str, current: int, deadline: float) -> int:
     """The newest attempt in this run that uploaded the producer image."""
 
     for attempt in range(current, 0, -1):
         name = f"kind-rust-{revision}-{attempt}"
-        for lookup in range(3):
-            result = subprocess.run(
-                [
-                    "gh",
-                    "api",
-                    "--paginate",
-                    "--slurp",
-                    f"{prefix}/artifacts?name={name}&per_page=100",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=False,
-            )
-            if not result.returncode:
-                break
-            # Never echo a remote error body or authentication diagnostics.
-            if lookup == 2 or any(
-                status in result.stderr for status in ("HTTP 401", "HTTP 403")
-            ):
-                raise RuntimeError(
-                    "cannot read Rust producer artifacts; Actions read access is required"
-                )
-            print(
-                "Retrying producer artifact lookup after a transport failure",
-                flush=True,
-            )
-            time.sleep(min(5, max(0, deadline - time.monotonic())))
+        pages = api_pages(
+            f"{prefix}/artifacts?name={name}&per_page=100",
+            "Rust producer artifacts",
+            deadline,
+        )
         if any(
             artifact["name"] == name and not artifact["expired"]
-            for page in json.loads(result.stdout)
+            for page in pages
             for artifact in page["artifacts"]
         ):
             return attempt
@@ -270,7 +319,6 @@ def wait(timeout: int) -> None:
     identity = context()
     prefix = f"repos/{identity['repository']}/actions/runs/{identity['run_id']}"
     deadline = time.monotonic() + timeout
-    read_failures = 0
     print(
         "Waiting for this attempt's Rust producer after cluster preparation", flush=True
     )
@@ -279,49 +327,20 @@ def wait(timeout: int) -> None:
         # the nearest producer in this run, never a different run or commit;
         # load still checks the source SHA and exact selected attempt.
         jobs = []
-        retry_lookup = False
         current_attempt = int(identity["run_attempt"])
         for attempt in range(current_attempt, 0, -1):
-            result = subprocess.run(
-                [
-                    "gh",
-                    "api",
-                    "--paginate",
-                    "--slurp",
-                    f"{prefix}/attempts/{attempt}/jobs?per_page=100",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=False,
-            )
-            if result.returncode:
-                # Never echo a remote error body or authentication diagnostics.
-                read_failures += 1
-                if read_failures >= 3 or any(
-                    status in result.stderr for status in ("HTTP 401", "HTTP 403")
-                ):
-                    raise RuntimeError(
-                        "cannot read Rust producer status; Actions read access is required"
-                    )
-                print(
-                    "Retrying producer status lookup after a transport failure",
-                    flush=True,
-                )
-                time.sleep(min(5, max(0, deadline - time.monotonic())))
-                retry_lookup = True
-                break
             jobs = [
                 job
-                for page in json.loads(result.stdout)
+                for page in api_pages(
+                    f"{prefix}/attempts/{attempt}/jobs?per_page=100",
+                    "Rust producer status",
+                    deadline,
+                )
                 for job in page["jobs"]
                 if job["name"] == PRODUCER or job["name"].endswith(" / " + PRODUCER)
             ]
             if jobs:
                 break
-        if retry_lookup:
-            continue
-        read_failures = 0
         if len(jobs) > 1:
             raise ValueError("multiple Rust producers in this run attempt")
         if jobs and jobs[0]["status"] == "completed":
