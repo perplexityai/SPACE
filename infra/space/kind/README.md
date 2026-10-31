@@ -287,11 +287,12 @@ any shard holding a scenario that declares a mode of that kind fails instead.
 least-loaded partition, with stable ID/index tie-breaking, then executes each
 partition in ID order. Unsharded runs keep their existing order.
 
-The duration hints are rounded scenario wall times (including fixture setup and
-cleanup) from [a successful Kind run](https://github.com/perplexityai/SPACE/actions/runs/36102493553),
+The duration hints are median scenario wall times (including fixture setup and
+cleanup) over the successful Kind runs that `space_smoke/sharding.py` names,
 except where a hint's own comment names another source.
 To refresh them, measure matching `=== RUN` / `=== END` timestamps separately
-for each API surface across all shards of a successful run. They are scheduling
+for each API surface across all shards of several successful runs, and take
+each scenario's median. They are scheduling
 hints only: new or renamed scenarios receive a 30-second estimate and still run;
 obsolete hints do not add scenarios. No assertion, timeout, or scenario is removed.
 Four shards shorten the serial critical path but duplicate cluster startup and
