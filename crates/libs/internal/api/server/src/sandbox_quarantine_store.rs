@@ -510,21 +510,24 @@ pub(super) async fn select_activation_rollback_candidates(
 /// of it that still runs, such as one a kubelet retry of its pod brought up,
 /// holds nothing the sandbox needs. A rollback to `suspended` is the one
 /// exception, as it is for the API's own restore revert. It retires as
-/// `replaced` only with abandoned-restore `retirement` enabled, for a row
-/// still `restoring`, not an evacuation restore, whose execution the restore
-/// created, and whose restore selection is proven to choose a ready, durably
-/// stored pre-restore source. That retirement also clears `placement_changed_at`, as the API's revert does:
-/// the restore's pod placement moved the clock past the pre-restore source,
-/// and the suspended selector takes a markerless snapshot only when it's
-/// newer than the last placement. Otherwise the execution reads `suspended`,
-/// and the fence admits a capture that may be the only copy of the sandbox's
-/// state: while retirement is off, a routing replica from before the
-/// restoring gate may have served the relaunched runtime, and an execution
-/// the restore reused may hold state of its own. Such a capture comes from
+/// `replaced` only with abandoned-restore `retirement` enabled, for a row still
+/// `restoring`, not an evacuation restore, whose execution the restore created,
+/// and whose restore selection is proven to choose a ready, durably stored
+/// pre-restore source. That retirement also clears `placement_changed_at`, as
+/// the API's revert does: the restore's pod placement moved the clock past the
+/// pre-restore source, and the suspended selector takes a markerless snapshot
+/// only when it's newer than the last placement. Otherwise the execution reads
+/// `suspended`, and the fence admits a capture that may be the only copy of the
+/// sandbox's state: while retirement is off, a routing replica from before the
+/// restoring gate may have served the relaunched runtime, and an execution the
+/// restore reused may hold state of its own. The orphaned-restore-pod GC leaves
+/// such a pod alone (`SkipClass::CaptureAdmitted`), so the capture comes from
 /// the pod's teardown suspend when the next restore's pre-claim lingering-pod
 /// sweep deletes the pod, or from an idle auto-suspend of the relaunched
-/// runtime. That restore has already chosen its source, so it doesn't load
-/// the capture; a later one may.
+/// runtime. A restore on that pod's node, its source node, then boots the
+/// capture from the local bytes the teardown left; one on another node that
+/// stages its selected storage URI doesn't, and a later restore may select the
+/// capture.
 pub(super) async fn apply_activation_rollback_candidates(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,

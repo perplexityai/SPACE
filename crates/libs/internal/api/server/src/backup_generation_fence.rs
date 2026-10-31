@@ -4,7 +4,20 @@
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{ExecutionGeneration, SandboxId};
 use pplx_space_node_api_client::cluster::backup_execution_superseded_status;
+use pplx_space_sandbox_portability::execution_supersession::{
+    ExecutionSupersessionRow, execution_generation_superseded,
+};
 use tonic::Status;
+
+/// One execution row as the fence's query selects it, decoded by column name
+/// so a reordered `SELECT` can't swap two of the flags.
+#[derive(sqlx::FromRow)]
+struct FenceRow {
+    generation: i64,
+    active: bool,
+    replaced: bool,
+    materialized: bool,
+}
 
 /// Refuse a new execution-bound backup whose generation the control plane has
 /// superseded: a newer execution is active or has materialized a pod, or this
@@ -46,9 +59,10 @@ pub(crate) async fn refuse_superseded_backup_execution(
     sandbox_id: SandboxId,
     generation: ExecutionGeneration,
 ) -> Result<(), Status> {
-    let executions: Vec<(i64, bool, String, bool)> = sqlx::query_as(sql!(
-        "SELECT generation, active, state,
+    let rows: Vec<FenceRow> = sqlx::query_as(sql!(
+        "SELECT generation, active, state = 'replaced' AS replaced,
                 pod_materialized_at IS NOT NULL OR NULLIF(BTRIM(pod_uid), '') IS NOT NULL
+                    AS materialized
            FROM sandbox_k8s_executions
           WHERE sandbox_id = $1
             AND generation >= $2
@@ -59,38 +73,20 @@ pub(crate) async fn refuse_superseded_backup_execution(
     .fetch_all(&mut **tx)
     .await
     .map_err(|e| Status::internal(format!("backup execution lookup: {e}")))?;
-    // A newer execution supersedes this one once it's active or has
-    // materialized a pod. A newer claim abandoned before it created one never
-    // ran, so it takes nothing from this execution. `pod_materialized_at` is
-    // the set-once record that the execution created a pod, which the
-    // substrate's execution store writes in the same statements that record
-    // or clear a `pod_uid`; `pod_uid` alone is current state, which
-    // re-materialization, failed-recovery pod absence and a cross-node
-    // re-drive's reset clear after the pod may have run. The record is NULL on
-    // rows that predate it until the backfill stamps them, so a non-blank
-    // `pod_uid` counts too, and a row whose `pod_uid` was cleared before it
-    // was stamped reads as never having run, as it did before the record
-    // existed.
-    //
-    // The store records a pod's UID when it creates the pod, before the
-    // scheduler places it, so a created pod counts even if it never started:
-    // a source-pinned restore pod ruled Unschedulable leaves its execution
-    // stamped after the cross-node re-drive deletes it and resets the row.
-    // That's deliberate. Counting only pods with a recorded IP or state would
-    // miss a pod that ran before either was recorded, and admitting a capture
-    // over a pod that ran registers stale bytes as the latest snapshot. A
-    // capture refused this way stays on its node unless a backed copy of the
-    // sandbox releases it.
-    let superseded =
-        executions
-            .iter()
-            .any(|(execution_generation, active, state, materialized)| {
-                if *execution_generation > generation.get() {
-                    *active || *materialized
-                } else {
-                    !*active && state == "replaced"
-                }
-            });
+    let executions: Vec<ExecutionSupersessionRow> = rows
+        .into_iter()
+        .map(|row| ExecutionSupersessionRow {
+            generation: row.generation,
+            active: row.active,
+            replaced: row.replaced,
+            materialized: row.materialized,
+        })
+        .collect();
+    // A capture refused here stays on its node unless a backed copy of the
+    // sandbox releases it. On a row that still exists, the orphaned-restore-pod
+    // GC reaps only pods this same predicate superseded when it last read the
+    // rows.
+    let superseded = execution_generation_superseded(&executions, generation.get());
     if !superseded {
         return Ok(());
     }

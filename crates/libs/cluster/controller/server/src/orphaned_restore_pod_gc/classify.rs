@@ -10,6 +10,9 @@
 
 use pplx_space_api::controllers::substrate::kubernetes::{SandboxPodKey, SandboxPodView};
 use pplx_space_common_core::types::{PodUid, SandboxId, SandboxLifecycle};
+use pplx_space_sandbox_portability::execution_supersession::{
+    ExecutionSupersessionRow, execution_generation_superseded,
+};
 use uuid::Uuid;
 
 /// Flattened, time-library-agnostic view of the parts of a `Pod` the reaper
@@ -78,21 +81,31 @@ impl RestorePodSnapshot {
     }
 }
 
-/// The owning `sandboxes` row as the classifier needs it: the lifecycle plus
-/// the generation of the row's *active* execution. Produced by the store's
-/// batched lookup.
+/// The owning `sandboxes` row as the classifier needs it: the lifecycle and
+/// the execution rows it reasons about. Produced by the store's batched
+/// lookup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxRestoreState {
     pub lifecycle: RowLifecycle,
-    /// `generation` of the sandbox's active execution row, or `None` when there
-    /// is no active execution. Execution generations are per-sandbox monotonic
-    /// (`MAX(generation) + 1`), so this is the fence: a pod whose generation is
-    /// strictly below it — or that has no active execution at all — is provably
-    /// superseded, and no current or future restore can adopt it. A pod at or
-    /// above the active generation is left alone: it is the current execution,
-    /// is still materializing, or sits at a generation a re-drive could resume
-    /// and adopt.
-    pub active_generation: Option<i64>,
+    /// The sandbox's active execution, wherever its generation sits, and every
+    /// execution at or above the lowest generation among its scanned restore
+    /// pods: what `BeginArtifactBackup`'s fence reads for any of those pods.
+    pub executions: Vec<ExecutionSupersessionRow>,
+}
+
+impl SandboxRestoreState {
+    /// `generation` of the sandbox's active execution, or `None` when there is
+    /// none. Execution generations are per-sandbox monotonic
+    /// (`MAX(generation) + 1`), so a pod strictly below it — or with no active
+    /// execution at all — is unadoptable. A pod at or above it is left alone:
+    /// it is the current execution, is still materializing, or sits at a
+    /// generation a re-drive could resume and adopt.
+    pub fn active_generation(&self) -> Option<i64> {
+        self.executions
+            .iter()
+            .find(|execution| execution.active)
+            .map(|execution| execution.generation)
+    }
 }
 
 /// The owning row's lifecycle as far as this loop can vouch for it.
@@ -128,8 +141,8 @@ pub enum Disposition {
 pub enum OrphanReason {
     /// The owning row exists in a resident lifecycle with the pod's generation
     /// strictly below the row's active execution, or is `suspended`/`failed`
-    /// with no active execution at all (the restore was reverted and its
-    /// execution retired).
+    /// with no active execution at all, and [`execution_generation_superseded`]
+    /// holds for the pod's generation.
     RowReverted,
     /// No owning `sandboxes` row: it was deleted (sandbox delete / create
     /// rollback) after the pod teardown failed. The row-driven orphaned-sandbox
@@ -186,8 +199,26 @@ pub enum SkipClass {
     /// unadoptable, but nothing proves it holds no unique state (a `paused`
     /// VM lives only in its pod), so the inconsistency is left to the
     /// reconciler that owns it. Only a reverted restore's settle states
-    /// (`suspended`/`failed`) with no active execution are reaped.
+    /// (`suspended`/`failed`) with no active execution can be reaped, and
+    /// then only as [`classify_disposition`] allows.
     NoActiveExecution,
+    /// The pod is unadoptable, but [`execution_generation_superseded`] doesn't
+    /// hold for its generation: its own execution was retired as something
+    /// other than `replaced` (or has no row), with nothing newer that ran.
+    /// `BeginArtifactBackup` admits that generation's capture, so the teardown
+    /// suspend a reap starts would register the pod's VM as a `ready` snapshot
+    /// the next restore selects. A plain suspend whose pod outlived it leaves
+    /// this shape, and an activation rollback to `suspended` with
+    /// abandoned-restore retirement off, or an older control plane's suspend
+    /// finalization over a node-side rollback to `paused`, leaves it with the
+    /// VM resident. Tallied apart so its count sizes that backlog. This loop
+    /// leaves such a pod to the sandbox's next restore, whose lingering-pod
+    /// sweep deletes it (see the module docs for what then becomes of a
+    /// resident VM's capture). A `failed` row can't restore until
+    /// `failed_restorable_repair` moves it back to `suspended`, which waits
+    /// while a node still reports the sandbox, so its pod can stay until the
+    /// sandbox is deleted (see the module docs).
+    CaptureAdmitted,
 }
 
 impl SkipClass {
@@ -200,23 +231,37 @@ impl SkipClass {
             Self::UnrecognizedRow => "unrecognized_row",
             Self::RowQuarantined => "row_quarantined",
             Self::NoActiveExecution => "no_active_execution",
+            Self::CaptureAdmitted => "capture_admitted",
         }
     }
 }
 
 /// Decide a restore pod's disposition from its owning row.
 ///
-/// The reaper only ever deletes a **provably-superseded** pod — one that no
-/// current or future restore can adopt — which is what makes the delete safe
-/// without holding a lock across it (see the reconciler). Because execution
-/// generations are per-sandbox monotonic (`MAX(generation) + 1`), a pod is
-/// superseded exactly when its generation is strictly below the active
-/// execution's, or when there is no active execution at all (a future restore
-/// will claim a strictly-higher generation). Both cases are unadoptable: no
-/// restore ever reuses a retired generation. Unadoptable isn't the same as
-/// holding nothing unique, so the no-active-execution case is reaped only on
-/// the reverted restore's settle states (`suspended`/`failed`), and a
-/// `quarantined` row is never touched.
+/// On a row that still exists (a soft-deleted tombstone counts as missing), the
+/// reaper only ever deletes a **provably-superseded** pod — one that no current
+/// or future restore can adopt, and whose teardown capture
+/// `BeginArtifactBackup`'s generation fence refuses when it checks it (an
+/// artifact's first registration that carries an execution generation) — which
+/// is what makes the delete safe without holding a lock across it (see the
+/// reconciler). Because execution generations are per-sandbox monotonic
+/// (`MAX(generation) + 1`), a pod is unadoptable when its generation is
+/// strictly below the active execution's, or when there is no active execution
+/// at all (a future restore will claim a strictly-higher generation): no
+/// restore ever reuses a retired generation.
+///
+/// Unadoptable isn't the same as disposable. A reap starts the pod's teardown
+/// suspend, and the fence admits a capture whose own execution was retired as
+/// anything but `replaced` with nothing newer active or materialized, because
+/// that capture may be the sandbox's latest state. An activation rollback to
+/// `suspended` with abandoned-restore retirement off, and an older control
+/// plane's suspend finalization over a node-side rollback to `paused`, both
+/// retire the execution that way while its VM stays resident. So among
+/// unadoptable pods only those [`execution_generation_superseded`] says are
+/// superseded — the fence's own predicate over the same rows — are reaped; the
+/// rest are [`SkipClass::CaptureAdmitted`]. The no-active-execution case is
+/// further limited to a reverted restore's settle states
+/// (`suspended`/`failed`), and a `quarantined` row is never touched.
 ///
 /// A pod at or *above* the active generation is **never** reaped, even if the
 /// active execution names a different UID. Restore re-drives reuse the same
@@ -224,19 +269,15 @@ impl SkipClass {
 /// resumes that generation — deleting it unlocked would race that adoption and
 /// could destroy a live or recoverable runtime. Such a pod is the current
 /// execution or is still materializing its UID; on a `suspended` row it is
-/// [`SkipClass::SuspendedSameGeneration`]. The writers that clear `active` on
-/// a `suspended` row do so only once that pod is gone or restore selection is
-/// proven to pick a durable snapshot (a restore revert retires its claim's
-/// execution as `replaced` under that proof), which is what makes this loop's
-/// no-active-execution reap of a `suspended` row safe; a writer that cleared
-/// `active` with the carrier still holding the only copy would break that.
+/// [`SkipClass::SuspendedSameGeneration`].
 ///
 /// Across the resident lifecycles: the live VM of a `started`/`paused` row, a
 /// `failed` row's recovery candidate the failed-cleanup probe may repair, and a
 /// lingering active execution on a `suspended` row all sit at or above the
-/// active generation and are skipped; a reverted `suspended`/`failed` row whose
-/// execution was retired, a deleted row, or a stale strictly-prior-generation
-/// pod are superseded and reaped.
+/// active generation and are skipped; a pod strictly below the active
+/// execution, a `suspended`/`failed` row's pod whose execution was retired as
+/// `replaced` or has a newer materialized one, and a deleted row's pod are
+/// reaped.
 ///
 /// The classifier is deliberately conservative on `restoring` and every other
 /// transient lifecycle: it never reaps a pod whose sandbox is mid-operation.
@@ -277,33 +318,34 @@ pub fn classify_disposition(
         L::Quarantined => Disposition::Skip(SkipClass::RowQuarantined),
         // Resident / terminal states: reap iff the pod is provably superseded.
         L::Created | L::Started | L::Paused | L::Suspended | L::Stopped | L::Failed => {
-            match state.active_generation {
-                // No active execution. For a reverted restore's settle states
-                // (`suspended`/`failed`) the pod is the abandoned attempt's
-                // leftover: whatever retired its execution already meant the
-                // pod to be gone, and a future restore claims a higher
-                // generation. Any other resident lifecycle should carry an
-                // active execution; without one nothing proves the pod holds no
-                // unique state, so skip.
-                None => match lifecycle {
-                    L::Suspended | L::Failed => Disposition::Orphaned(OrphanReason::RowReverted),
-                    _ => Disposition::Skip(SkipClass::NoActiveExecution),
-                },
-                // Strictly below the active execution — provably superseded by
-                // the row's current runtime.
-                Some(active_generation) if pod_generation < active_generation => {
-                    Disposition::Orphaned(OrphanReason::RowReverted)
-                }
+            match state.active_generation() {
+                // At or above the active generation — the current execution,
+                // still materializing, or a same-generation pod a re-drive could
+                // resume and adopt. Not provably superseded, so never reap it
+                // here.
                 Some(active_generation)
                     if lifecycle == L::Suspended && pod_generation == active_generation =>
                 {
                     Disposition::Skip(SkipClass::SuspendedSameGeneration)
                 }
-                // At or above the active generation — the current execution,
-                // still materializing, or a same-generation pod a re-drive could
-                // resume and adopt. Not provably superseded, so never reap it
-                // here.
-                Some(_) => Disposition::Skip(SkipClass::ActiveRuntime),
+                Some(active_generation) if pod_generation >= active_generation => {
+                    Disposition::Skip(SkipClass::ActiveRuntime)
+                }
+                // No active execution on a lifecycle that should carry one:
+                // nothing proves the pod holds no unique state, so skip.
+                None if !matches!(lifecycle, L::Suspended | L::Failed) => {
+                    Disposition::Skip(SkipClass::NoActiveExecution)
+                }
+                // Strictly below the active execution, or a reverted
+                // restore's settle state with none. Unadoptable either way;
+                // reap only when the shared predicate supersedes the pod's
+                // generation, so the fence refuses the capture if it checks it.
+                // Below an active execution that always holds, as the active
+                // row is newer.
+                _ if execution_generation_superseded(&state.executions, pod_generation) => {
+                    Disposition::Orphaned(OrphanReason::RowReverted)
+                }
+                _ => Disposition::Skip(SkipClass::CaptureAdmitted),
             }
         }
     }

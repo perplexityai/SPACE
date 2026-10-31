@@ -1,4 +1,6 @@
-//! Shared SQL fragments for the sandbox "is this snapshot portable?" decision.
+//! Shared SQL fragments for the sandbox "is this snapshot portable?" decision,
+//! plus [`execution_supersession`], the Rust predicate `BeginArtifactBackup`'s
+//! generation fence and the orphaned-restore-pod GC both decide with.
 //!
 //! A SPACE sandbox with `current_local_artifact_id` is **portable** when a
 //! `state='ready'` full backup for that exact artifact has been registered in
@@ -2452,6 +2454,8 @@ pub fn drain_gate_blockers_for_node(node_param: &str) -> String {
           WHERE gate_blockers.node_id = {node_param}"
     )
 }
+
+pub mod execution_supersession;
 
 #[cfg(test)]
 mod drain_gate_differential_tests;

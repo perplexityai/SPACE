@@ -10,8 +10,9 @@ use crate::env_config;
 
 pub(crate) const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
 /// Minimum time a restore pod must have been *continuously observed as
-/// provably superseded* (row deleted, no active execution, or active execution
-/// at a strictly-higher generation) before it is eligible for deletion.
+/// provably superseded* (row deleted, active execution at a strictly-higher
+/// generation, or no active execution with the pod's generation superseded)
+/// before it is eligible for deletion.
 /// Defense in depth: an in-flight restore's execution claim is inserted at the
 /// pod's generation before the pod is created, so the generation fence alone
 /// already skips it; the threshold additionally rides out any window where
