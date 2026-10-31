@@ -18,12 +18,18 @@ export default function DashboardPage() {
   const [errors, setErrors] = useState<string[]>([]);
 
   useEffect(() => {
-    const failed = (what: string) => (err: unknown) =>
-      setErrors((current) => [...current, `${what}: ${err instanceof Error ? err.message : 'request failed'}`]);
-    adminApi.get<Organization[]>('/v1/orgs').then((orgs) => setOrgCount(orgs.length)).catch(failed('Organizations'));
+    // Answers that land after the page is left are dropped.
+    let active = true;
+    const failed = (what: string) => (err: unknown) => {
+      if (active) setErrors((current) => [...current, `${what}: ${err instanceof Error ? err.message : 'request failed'}`]);
+    };
+    adminApi.get<Organization[]>('/v1/orgs').then((orgs) => { if (active) setOrgCount(orgs.length); }).catch(failed('Organizations'));
     getConsoleSandboxes()
-      .then((sbx) => setSandboxCount(sandboxRowCount(sbx)))
+      .then((sbx) => { if (active) setSandboxCount(sandboxRowCount(sbx)); })
       .catch(failed('Sandboxes'));
+    return () => {
+      active = false;
+    };
   }, []);
 
   return (
