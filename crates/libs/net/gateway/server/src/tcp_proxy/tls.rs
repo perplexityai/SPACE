@@ -4,6 +4,7 @@ use std::borrow::Cow;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -104,7 +105,8 @@ impl TlsTransportError {
             Self::Protocol => TlsFailure::new("alpn_mismatch"),
             Self::Certificate(_) => TlsFailure::new("certificate_material"),
             Self::Configuration(_) => TlsFailure::new("configuration"),
-            Self::Downstream(error) | Self::Upstream(error) => TlsFailure::io(error),
+            Self::Downstream(error) => TlsFailure::io(error),
+            Self::Upstream(error) => TlsFailure::origin(error),
             Self::Connect(transport::Error::Timeout) => TlsFailure::new("timeout"),
             Self::Connect(transport::Error::Io(_)) => TlsFailure::new("io"),
         }
@@ -137,6 +139,39 @@ impl TlsFailure {
         }
     }
 
+    /// An origin-leg failure, naming why the origin's certificate failed
+    /// verification when that is what ended the handshake.
+    fn origin(error: &io::Error) -> Self {
+        Self {
+            certificate: certificate_failure(error),
+            ..Self::io(error)
+        }
+    }
+
+    /// A failure on an established connection. A guest that ends a connection
+    /// by closing TCP without `close_notify`, as most keep-alive clients do,
+    /// reads as `UnexpectedEof`. That is a routine close unless a request or
+    /// upgraded stream was in flight (see `GuestActivity`).
+    fn established(
+        leg: TlsHandshakeLeg,
+        operation: &'static str,
+        error: &io::Error,
+        guest_idle: bool,
+    ) -> (Self, tracing::Level) {
+        if leg == TlsHandshakeLeg::ClientToNetgw
+            && operation == "read"
+            && error.kind() == io::ErrorKind::UnexpectedEof
+        {
+            let level = if guest_idle {
+                tracing::Level::DEBUG
+            } else {
+                tracing::Level::WARN
+            };
+            return (Self::new("peer_closed_without_close_notify"), level);
+        }
+        (Self::io(error), tracing::Level::WARN)
+    }
+
     /// The `alert` metric tag: the alert's wire value, or `none` when the
     /// peer sent no alert.
     fn alert_tag(&self) -> Cow<'static, str> {
@@ -146,6 +181,42 @@ impl TlsFailure {
 
     fn alert_code(&self) -> Option<u8> {
         self.alert.map(u8::from)
+    }
+}
+
+/// Why rustls rejected the origin's certificate, for the `certificate` metric
+/// tag and log field. Its variants carry names and times, so only a fixed set
+/// of labels leaves the gateway.
+fn certificate_failure(error: &io::Error) -> Option<&'static str> {
+    use rustls::CertificateError as Invalid;
+    match error.get_ref()?.downcast_ref::<rustls::Error>()? {
+        rustls::Error::InvalidCertificate(invalid) => Some(match invalid {
+            Invalid::UnknownIssuer => "unknown_issuer",
+            Invalid::NotValidForName | Invalid::NotValidForNameContext { .. } => {
+                "not_valid_for_name"
+            }
+            Invalid::Expired | Invalid::ExpiredContext { .. } => "expired",
+            Invalid::NotValidYet | Invalid::NotValidYetContext { .. } => "not_valid_yet",
+            Invalid::Revoked => "revoked",
+            _ => "other",
+        }),
+        _ => None,
+    }
+}
+
+/// The `io_kind` metric tag, from a fixed set of labels because
+/// `io::ErrorKind` is open-ended.
+fn io_kind_tag(kind: Option<io::ErrorKind>) -> &'static str {
+    match kind {
+        None => "none",
+        Some(io::ErrorKind::UnexpectedEof) => "unexpected_eof",
+        Some(io::ErrorKind::ConnectionReset) => "connection_reset",
+        Some(io::ErrorKind::ConnectionAborted) => "connection_aborted",
+        Some(io::ErrorKind::BrokenPipe) => "broken_pipe",
+        Some(io::ErrorKind::NotConnected) => "not_connected",
+        Some(io::ErrorKind::TimedOut) => "timed_out",
+        Some(io::ErrorKind::InvalidData) => "invalid_data",
+        Some(_) => "other",
     }
 }
 
@@ -430,6 +501,8 @@ impl HandshakeAttempt {
                     "success",
                     "none",
                     "none",
+                    "none",
+                    "none",
                 );
                 "success"
             }
@@ -448,6 +521,7 @@ impl HandshakeAttempt {
 
     fn record_failure(leg: TlsHandshakeLeg, error: &TlsTransportError) -> &'static str {
         let failure = error.failure();
+        let io_kind = error.io_error().map(io::Error::kind);
         let boundary = match leg {
             TlsHandshakeLeg::ClientToNetgw => "guest_tls",
             TlsHandshakeLeg::NetgwToOrigin => "origin_tls",
@@ -465,6 +539,8 @@ impl HandshakeAttempt {
             outcome,
             failure.reason,
             &failure.alert_tag(),
+            io_kind_tag(io_kind),
+            failure.certificate.unwrap_or("none"),
         );
         tracing::warn!(
             telemetry_type = "tls_handshake_error",
@@ -472,7 +548,7 @@ impl HandshakeAttempt {
             leg = leg.as_str(),
             outcome,
             reason = failure.reason,
-            io_kind = ?error.io_error().map(io::Error::kind),
+            io_kind = ?io_kind,
             tls_alert = failure.alert_code(),
             certificate_validation_reason = failure.certificate,
             "TLS handshake failed"
@@ -491,8 +567,35 @@ impl Drop for HandshakeAttempt {
             "cancelled",
             "work_dropped",
             "none",
+            "none",
+            "none",
         );
         self.record_duration("cancelled");
+    }
+}
+
+/// HTTP messages and upgraded streams in flight on one guest connection. The
+/// HTTP session holds an [`ActiveExchange`] for each; the guest's TLS leg
+/// reads the count to log a close at WARN only while an exchange is in flight.
+#[derive(Clone, Default)]
+pub(super) struct GuestActivity(Arc<AtomicUsize>);
+
+impl GuestActivity {
+    pub(super) fn begin(&self) -> ActiveExchange {
+        self.0.fetch_add(1, Ordering::Relaxed);
+        ActiveExchange(self.0.clone())
+    }
+
+    pub(super) fn is_idle(&self) -> bool {
+        self.0.load(Ordering::Relaxed) == 0
+    }
+}
+
+pub(super) struct ActiveExchange(Arc<AtomicUsize>);
+
+impl Drop for ActiveExchange {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -501,6 +604,7 @@ impl Drop for HandshakeAttempt {
 pub(super) struct TlsIo<T> {
     inner: T,
     leg: TlsHandshakeLeg,
+    activity: GuestActivity,
     error_reported: bool,
 }
 
@@ -509,28 +613,49 @@ impl<T> TlsIo<T> {
         Self {
             inner,
             leg,
+            activity: GuestActivity::default(),
             error_reported: false,
         }
+    }
+
+    /// What the HTTP session serving this guest connection reports in flight.
+    pub(super) fn activity(&self) -> GuestActivity {
+        self.activity.clone()
     }
 
     fn record_error(&mut self, operation: &'static str, error: &io::Error) {
         if self.error_reported {
             return;
         }
-        let failure = TlsFailure::io(error);
+        let (failure, level) =
+            TlsFailure::established(self.leg, operation, error, self.activity.is_idle());
         self.error_reported = true;
-        pplx_space_metrics::gateway::tls_connection_error(self.leg.as_str(), failure.reason);
-        tracing::warn!(
-            telemetry_type = "tls_connection_error",
-            boundary = "forwarding",
-            leg = self.leg.as_str(),
-            operation,
-            reason = failure.reason,
-            io_kind = ?error.kind(),
-            tls_alert = failure.alert_code(),
-            certificate_validation_reason = failure.certificate,
-            "established TLS connection failed"
+        pplx_space_metrics::gateway::tls_connection_error(
+            self.leg.as_str(),
+            failure.reason,
+            io_kind_tag(Some(error.kind())),
         );
+        macro_rules! log_failure {
+            ($level:expr) => {
+                tracing::event!(
+                    $level,
+                    telemetry_type = "tls_connection_error",
+                    boundary = "forwarding",
+                    leg = self.leg.as_str(),
+                    operation,
+                    reason = failure.reason,
+                    io_kind = ?error.kind(),
+                    tls_alert = failure.alert_code(),
+                    certificate_validation_reason = failure.certificate,
+                    "established TLS connection failed"
+                )
+            };
+        }
+        if level == tracing::Level::DEBUG {
+            log_failure!(tracing::Level::DEBUG);
+        } else {
+            log_failure!(tracing::Level::WARN);
+        }
     }
 }
 
