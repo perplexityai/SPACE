@@ -293,6 +293,105 @@ async fn admin_update_enqueues_under_sandbox_org_for_cross_org_caller() -> TestR
     Ok(())
 }
 
+/// An org-scoped list holds that org's sandboxes only. Rows nodes report
+/// without a database row (rowless pool slots, observed-local sandboxes)
+/// belong to no org, so only the unscoped list carries them.
+#[tokio::test(flavor = "current_thread")]
+async fn org_scoped_list_leaves_out_observed_only_rows() -> TestResult {
+    // `AppState::from_pool` picks its substrate from the environment; keep it
+    // Direct so construction never reaches a cluster.
+    if !pplx_space_test_env::enter_test_process(&[(
+        "SPACE_K8S_CONTROL_PLANE",
+        Some(std::ffi::OsStr::new("false")),
+    )]) {
+        return Ok(());
+    }
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org = seed_org(&db.pool).await?;
+    let user = seed_user(&db.pool, OrgId::from_uuid(org)).await?;
+    let owned = seed_sandbox(&db.pool, OrgId::from_uuid(org), UserId::from_uuid(user)).await?;
+
+    let node_id = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role, managed_by, state)
+         VALUES ($1, '127.0.0.1', 'worker', 'space', 'ready')"
+    ))
+    .bind(node_id)
+    .execute(&db.pool)
+    .await?;
+    let observed_only = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_observed_states (sandbox_id, node_id, status)
+         VALUES ($1, $2, 'running')"
+    ))
+    .bind(observed_only)
+    .bind(node_id)
+    .execute(&db.pool)
+    .await?;
+
+    let actor = sqlx::query_as::<_, User>(sql!(
+        "SELECT u.*
+         FROM users u
+         JOIN clusters c ON c.managing_org_id = u.org_id
+         WHERE c.singleton
+           AND u.role = 'organization_admin'
+         ORDER BY u.id
+         LIMIT 1"
+    ))
+    .fetch_one(&db.pool)
+    .await?;
+    let state = AppState::from_pool(db.pool.clone()).await?;
+
+    let list = |org_id: Option<OrgId>| {
+        let state = state.clone();
+        let actor = actor.clone();
+        async move {
+            let response = list_sandboxes(
+                State(state),
+                Extension(AuthUser(actor)),
+                Query(AdminSandboxListQuery {
+                    limit: None,
+                    org_id,
+                }),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+            let rows: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+            let ids = rows
+                .iter()
+                .filter_map(|row| row["id"].as_str().map(str::to_string))
+                .collect::<Vec<_>>();
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(ids)
+        }
+    };
+    let contains = |ids: &[String], id: Uuid| ids.iter().any(|row| row.contains(&id.to_string()));
+
+    let scoped = list(Some(OrgId::from_uuid(org))).await?;
+    assert!(
+        contains(&scoped, owned),
+        "org list holds the org's sandbox: {scoped:?}"
+    );
+    assert!(
+        !contains(&scoped, observed_only),
+        "org list leaves out observed-only rows: {scoped:?}"
+    );
+
+    let unscoped = list(None).await?;
+    assert!(
+        contains(&unscoped, owned),
+        "unscoped list holds the sandbox: {unscoped:?}"
+    );
+    assert!(
+        contains(&unscoped, observed_only),
+        "unscoped list keeps observed-only rows: {unscoped:?}"
+    );
+    Ok(())
+}
+
 async fn seed_org(pool: &sqlx::PgPool) -> Result<Uuid, sqlx::Error> {
     let id = Uuid::now_v7();
     sqlx::query(sql!(

@@ -3,6 +3,7 @@
 import { Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import styles from './inventory.module.css';
+import { orgOptionLabels, parseOrgParam } from '@/lib/org-filter';
 import { usePathname, useSearchParams } from 'next/navigation';
 import {
   DEFAULT_LIST_LIMIT,
@@ -650,7 +651,7 @@ function SandboxesPage() {
   // Bumped after every list load, so a direct lookup refreshes with the list.
   const [listGeneration, setListGeneration] = useState(0);
   // Applied by the admin API (`org_id`), so the newest rows are that org's.
-  const [orgFilter, setOrgFilter] = useState<string | null>(() => searchParams.get('org'));
+  const [orgFilter, setOrgFilter] = useState<string | null>(() => parseOrgParam(searchParams.get('org')));
   const orgFilterRef = useRef(orgFilter);
   // A full identifier that matches no loaded row is looked up directly, so a
   // sandbox outside the loaded rows can still be found.
@@ -1405,8 +1406,9 @@ function SandboxesPage() {
             placeholder="Org: any"
             value={orgFilter ?? undefined}
             onChange={(value) => changeOrgFilter(value ?? null)}
-            options={orgs.map((org) => ({ value: org.id, label: org.name }))}
-            style={{ width: 170 }}
+            options={orgOptionLabels(orgs)}
+            showSearch={{ optionFilterProp: 'label' }}
+            style={{ width: 200 }}
             aria-label="Organization"
           />
           <Select
@@ -1445,7 +1447,7 @@ function SandboxesPage() {
           type="info"
           showIcon
           style={{ marginBottom: 12 }}
-          title={`Showing the newest ${listLimit} sandboxes. Filters apply to these rows only; enter a full sandbox ID or pod name to look up any sandbox.`}
+          title={`Showing the newest ${listLimit} sandboxes${orgFilter ? ` of ${orgNames.get(orgFilter) ?? orgFilter}` : ''}. Filters apply to these rows only; enter a full sandbox ID or pod name to look up any sandbox.`}
         />
       ) : null}
 

@@ -32,8 +32,10 @@ export async function getPublicSandbox(id: string): Promise<Sandbox> {
   return publicSandboxToConsoleSandbox(await api.get<PublicSandbox>(`/sandboxes/${id}`));
 }
 
-// The newest `limit` sandbox rows across every org, followed by rows nodes
-// report without a database row (see `sandboxRowCount`). The admin list has
+// The newest `limit` sandbox rows, across every org or for `orgId` only. The
+// unscoped list then appends the rows nodes report without a database row
+// (rowless pool slots, observed-local sandboxes; see `sandboxRowCount`); those
+// belong to no org, so an org-scoped list leaves them out. The admin list has
 // no cursor.
 export async function getConsoleSandboxes(
   limit: number = DEFAULT_LIST_LIMIT,
