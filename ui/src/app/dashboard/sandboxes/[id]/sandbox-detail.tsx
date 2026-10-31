@@ -470,7 +470,10 @@ function SnapshotsCard({
   const [listingError, setListingError] = useState<string | null>(null);
   const [rollbackOff, setRollbackOff] = useState(false);
 
+  // Retries and Refresh can overlap; only the newest listing may write.
+  const listingRequest = useRef(0);
   const refresh = (background = false) => {
+    const request = ++listingRequest.current;
     if (foreignOrg) {
       setSnapshotsOff(true);
       setLoading(false);
@@ -479,11 +482,13 @@ function SnapshotsCard({
     if (!background) setLoading(true);
     getPublicPage<PublicSnapshot>(`/sandboxes/${sandboxId}/snapshots`)
       .then((items) => {
+        if (request !== listingRequest.current) return;
         setSnapshotsOff(false);
         setListingError(null);
         setSnapshots(items.map(publicSnapshotToConsoleSnapshot));
       })
       .catch((err: any) => {
+        if (request !== listingRequest.current) return;
         // Either way the admin view below lists the snapshots; only a hidden
         // operation is an expected answer, anything else is reported.
         setSnapshotsOff(true);
@@ -493,7 +498,9 @@ function SnapshotsCard({
           setListingError(err.message || 'failed to load snapshots');
         }
       })
-      .finally(() => setLoading(false));
+      .finally(() => {
+        if (request === listingRequest.current) setLoading(false);
+      });
   };
 
   useEffect(() => refresh(), [sandboxId, foreignOrg]);
@@ -1157,7 +1164,12 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
     let ticks = 0;
     pollRef.current = setInterval(() => {
       if (typeof document !== 'undefined' && document.hidden) return;
-      void refresh(false);
+      // A sandbox that was missing (still being created) loads its debug and
+      // operations as soon as it appears, not at the next insight tick.
+      const wasMissing = !sandboxRef.current;
+      void refresh(false).then((found) => {
+        if (found && wasMissing) void loadInsight(true);
+      });
       ticks += 1;
       // A deleted sandbox has no debug record, but its operations still change.
       if (ticks % 5 === 0) void loadInsight(!!sandboxRef.current);
@@ -1251,6 +1263,31 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
   }
 
   if (error && !sandbox) {
+    // A 404 while the sandbox's create operation is still queued or running
+    // means it does not exist yet: the 4 s poll keeps reading it and the page
+    // shows it as soon as it appears.
+    const pendingCreate = errorStatus === 404
+      ? operations.find((op) => op.kind === 'create_sandbox' && (op.state === 'queued' || op.state === 'running'))
+      : undefined;
+    if (pendingCreate) {
+      return (
+        <div>
+          <Link href="/dashboard/sandboxes"><ArrowLeftOutlined /> Sandboxes</Link>
+          <Title level={3} style={{ marginTop: 8 }}>Sandbox is being created</Title>
+          <Paragraph>
+            Its create operation is {pendingCreate.state}. This page keeps checking and shows the sandbox when it appears.
+          </Paragraph>
+          <Paragraph><code>{safeDecodeURIComponent(id)}</code></Paragraph>
+          <OperationsCard
+            operations={operations}
+            more={operationsMore}
+            error={operationsError}
+            loaded={operationsLoaded}
+            nowMs={nowMs}
+          />
+        </div>
+      );
+    }
     const gone = errorStatus === 404;
     return (
       <div>

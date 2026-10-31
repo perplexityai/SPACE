@@ -229,6 +229,10 @@ export function ResourcesCard({ view, nowMs }: { view: DebugView; nowMs: number 
   );
 }
 
+// `LIMIT 200` in the debug route's timeline source
+// (`crates/libs/api/src/routes/debug/sources/timeline.rs`).
+const TIMELINE_CAP = 200;
+
 const TIMELINE_COLORS: Record<string, string> = {
   sandbox_created: 'blue',
   pod_created: 'cyan',
@@ -241,13 +245,19 @@ export function TimelineCard({ view, nowMs }: { view: DebugView; nowMs: number }
   const { debug } = view;
   const events = sortedTimeline(sectionData(debug?.timeline) ?? []);
   const timelineState = sectionState(view, debug?.timeline);
+  // The debug route returns at most the newest TIMELINE_CAP events.
+  const capped = events.length >= TIMELINE_CAP;
   const columns: ColumnsType<DebugTimelineEvent> = [
     { title: 'When', dataIndex: 'at', width: 120, render: (v: string) => <When value={v} nowMs={nowMs} /> },
     { title: 'Event', dataIndex: 'kind', width: 190, render: (v: string) => <Tag color={TIMELINE_COLORS[v] ?? 'default'}>{v}</Tag> },
     { title: 'Detail', render: (_, event) => summarizeTimelineDetail(event) || '—' },
   ];
   return (
-    <Card size="small" title={<Space><HistoryOutlined /> Timeline</Space>}>
+    <Card
+      size="small"
+      title={<Space><HistoryOutlined /> Timeline</Space>}
+      extra={capped ? <Text type="secondary" style={{ fontSize: 12 }}>Newest {TIMELINE_CAP} events; older ones are not shown.</Text> : null}
+    >
       <SectionError what="the timeline" error={timelineState.error} />
       <Table
         columns={columns}
@@ -329,7 +339,7 @@ export function OperationsCard({
       extra={
         <Text type="secondary" style={{ fontSize: 12 }}>
           {more ? `Newest ${operations.length} shown; older ones exist. ` : ''}
-          Operations are removed 7 days after they were requested.
+          Finished operations are removed 7 days after they were requested; unfinished ones are kept.
         </Text>
       }
     >
