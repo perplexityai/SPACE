@@ -421,7 +421,9 @@ export default function NodesPage() {
   };
 
   const fetchAdminNodes = async () => {
-    const params = new URLSearchParams({ include_occupancy: 'false' });
+    // Occupancy adds per-node sandbox and slot counts: what an operator needs
+    // to see which node is full before draining or placing work.
+    const params = new URLSearchParams({ include_occupancy: 'true' });
     if (roleFilter !== 'all') params.set('role', roleFilter);
     return adminApi.get<AdminNodeResponse[]>(`/v1/nodes?${params.toString()}`);
   };
@@ -668,6 +670,38 @@ export default function NodesPage() {
         return (
           <Tooltip title={<span style={{ whiteSpace: 'pre-line' }}>{tooltip}</span>}>
             <Tag color={drainPhaseColor(phase)}>{label}</Tag>
+          </Tooltip>
+        );
+      },
+    },
+    {
+      title: 'Sandboxes',
+      width: 150,
+      render: (_, record) => {
+        if (record.role === 'cluster') return <Text type="secondary">—</Text>;
+        if (record.sandboxes_active === null || record.sandboxes_active === undefined) {
+          return <Text type="secondary">not computed</Text>;
+        }
+        const slots = record.network_slots;
+        const unhealthySlots = (slots?.degraded ?? 0) + (slots?.quarantined ?? 0);
+        return (
+          <Tooltip
+            title={
+              <span style={{ whiteSpace: 'pre-line' }}>
+                {[
+                  `active sandboxes: ${record.sandboxes_active}`,
+                  `local snapshots: ${record.sandboxes_local_snapshots ?? 'not computed'}`,
+                  slots ? `network slots leased: ${slots.leased} of ${slots.total} (max ${slots.max_slots})` : null,
+                  slots ? `ready ${slots.ready}, degraded ${slots.degraded}, quarantined ${slots.quarantined}` : null,
+                ].filter(Boolean).join('\n')}
+              </span>
+            }
+          >
+            <Space size={4} wrap>
+              <span>{record.sandboxes_active} active</span>
+              {record.sandboxes_local_snapshots ? <Tag>{record.sandboxes_local_snapshots} local snaps</Tag> : null}
+              {unhealthySlots > 0 ? <Tag color="orange">{unhealthySlots} slots unhealthy</Tag> : null}
+            </Space>
           </Tooltip>
         );
       },
