@@ -1003,7 +1003,16 @@ _RETENTION_BOOLEAN_ENV_VALUES = {
 }
 _RETENTION_ENV_VALUE = re.compile(r"[a-z0-9]{1,16}")
 # Limiter values: booleans, small numbers, a redis:// URL, a client id.
-_LIMITER_ENV_VALUE = re.compile(r"[A-Za-z0-9._:/@-]{1,64}")
+# A comma is in the class because `SPACE_API_CLIENT_CONCURRENCY_KNOWN_CLIENTS`
+# is a comma-separated allowlist by the limiter's own grammar, so any value
+# naming more than one client needs one. One class covers every limiter key, so
+# this admits a comma in the others too; that is safe rather than intended —
+# `_apply_public_api_env` hands each value to `kubectl set env` as one
+# `key=value` argv element, and kubectl splits that on the first `=` and never
+# on a comma, with no shell in between. Everything this guard exists to refuse — whitespace,
+# quotes, `$`, backticks, newlines — stays out.
+LIMITER_ENV_VALUE_MAX = 64
+_LIMITER_ENV_VALUE = re.compile(rf"[A-Za-z0-9._:/@,-]{{1,{LIMITER_ENV_VALUE_MAX}}}")
 _UNSIGNED_INTEGER = re.compile(r"\+?[0-9]+")
 
 
