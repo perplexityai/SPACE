@@ -127,7 +127,9 @@ impl MakeClassifier for GrpcClientMakeClassifier {
 }
 
 /// Keep the ingress exception tied to the status metadata, including trailers.
-/// Other RPCs retain their existing application-status policy.
+/// Other RPCs retain their existing application-status policy, except that on
+/// every RPC an UNAVAILABLE marked [`crate::RetryableNotReady`], in headers or
+/// trailers, is not logged as an error.
 #[derive(Clone, Debug)]
 pub struct GrpcClientClassifier {
     inner: GrpcErrorsAsFailures,
@@ -149,11 +151,13 @@ pub struct GrpcClientFailureClass {
 }
 
 impl GrpcClientFailureClass {
-    fn new(inner: GrpcFailureClass, service_port_ingress: bool) -> Self {
+    /// `not_ready` is whether the status block that carried this code was
+    /// marked [`crate::RetryableNotReady`].
+    fn new(inner: GrpcFailureClass, service_port_ingress: bool, not_ready: bool) -> Self {
         let is_error = match &inner {
             GrpcFailureClass::Status(status) => {
                 let code = tonic::Code::from_i32(status.code_raw());
-                grpc_status_is_error(code)
+                (grpc_status_is_error(code) && !not_ready)
                     || (service_port_ingress && code == tonic::Code::FailedPrecondition)
             }
             GrpcFailureClass::Error(_) => true,
@@ -174,6 +178,11 @@ fn is_guest_refusal(headers: &HeaderMap) -> bool {
         .is_some_and(|status| crate::GuestServiceUnavailable::from_status(&status).is_some())
 }
 
+fn is_retryable_not_ready(headers: &HeaderMap) -> bool {
+    tonic::Status::from_header_map(headers)
+        .is_some_and(|status| crate::RetryableNotReady::from_status(&status).is_some())
+}
+
 impl ClassifyResponse for GrpcClientClassifier {
     type FailureClass = GrpcClientFailureClass;
     type ClassifyEos = GrpcClientEosClassifier;
@@ -188,7 +197,11 @@ impl ClassifyResponse for GrpcClientClassifier {
         match self.inner.classify_response(response) {
             ClassifiedResponse::Ready(result) => {
                 ClassifiedResponse::Ready(result.map_err(|failure| {
-                    GrpcClientFailureClass::new(failure, self.service_port_ingress)
+                    GrpcClientFailureClass::new(
+                        failure,
+                        self.service_port_ingress,
+                        is_retryable_not_ready(response.headers()),
+                    )
                 }))
             }
             ClassifiedResponse::RequiresEos(inner) => {
@@ -201,7 +214,11 @@ impl ClassifyResponse for GrpcClientClassifier {
     }
 
     fn classify_error<E: std::fmt::Display + 'static>(self, error: &E) -> Self::FailureClass {
-        GrpcClientFailureClass::new(self.inner.classify_error(error), self.service_port_ingress)
+        GrpcClientFailureClass::new(
+            self.inner.classify_error(error),
+            self.service_port_ingress,
+            false,
+        )
     }
 }
 
@@ -212,13 +229,21 @@ impl ClassifyEos for GrpcClientEosClassifier {
         if self.service_port_ingress && trailers.is_some_and(is_guest_refusal) {
             return Ok(());
         }
-        self.inner
-            .classify_eos(trailers)
-            .map_err(|failure| GrpcClientFailureClass::new(failure, self.service_port_ingress))
+        self.inner.classify_eos(trailers).map_err(|failure| {
+            GrpcClientFailureClass::new(
+                failure,
+                self.service_port_ingress,
+                trailers.is_some_and(is_retryable_not_ready),
+            )
+        })
     }
 
     fn classify_error<E: std::fmt::Display + 'static>(self, error: &E) -> Self::FailureClass {
-        GrpcClientFailureClass::new(self.inner.classify_error(error), self.service_port_ingress)
+        GrpcClientFailureClass::new(
+            self.inner.classify_error(error),
+            self.service_port_ingress,
+            false,
+        )
     }
 }
 

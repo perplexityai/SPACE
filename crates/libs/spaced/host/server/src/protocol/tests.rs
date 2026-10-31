@@ -57,6 +57,27 @@ async fn relay_is_lazy_and_stops_at_first_error() {
     assert_eq!(polls.load(Ordering::SeqCst), 2);
 }
 
+// A guest's UNAVAILABLE stays a failure for the trace layers here and
+// upstream, whatever metadata the guest attached.
+#[tokio::test]
+async fn relayed_guest_statuses_lose_the_not_ready_mark() {
+    use futures_util::StreamExt;
+    use pplx_space_common_grpc::RetryableNotReady;
+    let guest_status = || RetryableNotReady.mark(Status::unavailable("guest not ready"));
+
+    let unary = host_relay_status(guest_status(), "bridge_guest_ping", "bridge_guest_meta");
+    let mut stream = relay_stream(
+        futures_util::stream::iter([Err::<u8, _>(guest_status())]),
+        Ok::<_, Status>,
+    );
+    let streamed = stream.next().await.unwrap().unwrap_err();
+
+    for relayed in [unary, streamed] {
+        assert_eq!(relayed.code(), tonic::Code::Unavailable);
+        assert_eq!(RetryableNotReady::from_status(&relayed), None);
+    }
+}
+
 #[test]
 fn descriptive_wire_enums_preserve_future_values() {
     for value in [1, 2, 42, -1] {
