@@ -1,5 +1,8 @@
 use super::*;
 
+/// node-manager refreshes the cached measurement on this cadence.
+const CACHE_REFRESH_CADENCE: Duration = Duration::from_secs(10);
+
 fn config() -> CacheDiskAdmissionConfig {
     CacheDiskAdmissionConfig {
         enabled: true,
@@ -82,20 +85,197 @@ fn scheduling_effect_is_the_single_admission_policy_mapping() {
 fn cached_evaluation_uses_last_measurement_without_refreshing() {
     let monitor = CacheDiskAdmissionMonitor::new();
     monitor
-        .refresh_with(|| Ok(measurement(500, 1_000)))
+        .refresh_with(CacheDiskRefreshKind::Periodic, Instant::now, || {
+            Ok(measurement(500, 1_000))
+        })
         .unwrap();
 
     let decision = monitor.evaluate_cached(config(), 490);
 
     assert_eq!(decision.state, CacheDiskAdmissionState::Full);
     assert_eq!(decision.effective_available_bytes, 10);
-    monitor
-        .refresh_with(|| Err(CacheDiskProbeError::Statvfs))
-        .unwrap_err();
-    assert_eq!(
-        monitor.evaluate_cached(config(), 0).state,
-        CacheDiskAdmissionState::Unavailable
-    );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ProbeFailure {
+    Statvfs,
+    /// statvfs read 300 available bytes, then the btrfs probe failed.
+    BtrfsAfterFreshStatvfs,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PreviousMeasurement {
+    None,
+    StatvfsOnly,
+    WithBtrfs,
+}
+
+#[derive(Debug, PartialEq)]
+enum Published {
+    Nothing,
+    Previous,
+    FreshStatvfsWithPreviousBtrfs,
+}
+
+/// What a failed refresh leaves cached, for every refresh kind, probe failure
+/// and earlier measurement.
+#[test]
+fn failed_refresh_publication_covers_every_kind_failure_and_previous_state() {
+    use CacheDiskRefreshKind::{AfterAllocation, Periodic};
+    use PreviousMeasurement as Prev;
+    use ProbeFailure::{BtrfsAfterFreshStatvfs, Statvfs};
+
+    fn expected(
+        kind: CacheDiskRefreshKind,
+        failure: ProbeFailure,
+        previous: PreviousMeasurement,
+    ) -> Published {
+        match (kind, failure, previous) {
+            (Periodic, Statvfs, Prev::None) => Published::Nothing,
+            (Periodic, Statvfs, Prev::StatvfsOnly) => Published::Previous,
+            (Periodic, Statvfs, Prev::WithBtrfs) => Published::Previous,
+            (Periodic, BtrfsAfterFreshStatvfs, Prev::None) => Published::Nothing,
+            (Periodic, BtrfsAfterFreshStatvfs, Prev::StatvfsOnly) => Published::Previous,
+            (Periodic, BtrfsAfterFreshStatvfs, Prev::WithBtrfs) => {
+                Published::FreshStatvfsWithPreviousBtrfs
+            }
+            (AfterAllocation, Statvfs, Prev::None) => Published::Nothing,
+            (AfterAllocation, Statvfs, Prev::StatvfsOnly) => Published::Nothing,
+            (AfterAllocation, Statvfs, Prev::WithBtrfs) => Published::Nothing,
+            (AfterAllocation, BtrfsAfterFreshStatvfs, Prev::None) => Published::Nothing,
+            (AfterAllocation, BtrfsAfterFreshStatvfs, Prev::StatvfsOnly) => Published::Nothing,
+            (AfterAllocation, BtrfsAfterFreshStatvfs, Prev::WithBtrfs) => {
+                Published::FreshStatvfsWithPreviousBtrfs
+            }
+        }
+    }
+
+    let t0 = Instant::now();
+    let refreshed_at = t0 + CACHE_REFRESH_CADENCE;
+    let with_btrfs = measurement(500, 1_000);
+    let statvfs_only = CacheDiskMeasurement {
+        btrfs: None,
+        ..with_btrfs
+    };
+    let fresh_status = measurement(300, 1_000).status;
+    for kind in [Periodic, AfterAllocation] {
+        for failure in [Statvfs, BtrfsAfterFreshStatvfs] {
+            for previous_state in [Prev::None, Prev::StatvfsOnly, Prev::WithBtrfs] {
+                let case = format!("{kind:?} / {failure:?} / previous {previous_state:?}");
+                let previous = match previous_state {
+                    Prev::None => None,
+                    Prev::StatvfsOnly => Some(statvfs_only),
+                    Prev::WithBtrfs => Some(with_btrfs),
+                };
+                let monitor = CacheDiskAdmissionMonitor::new();
+                if let Some(previous) = previous {
+                    monitor
+                        .refresh_with(Periodic, || t0, || Ok(previous))
+                        .unwrap();
+                }
+                let error = match failure {
+                    Statvfs => CacheDiskProbeError::Statvfs,
+                    BtrfsAfterFreshStatvfs => CacheDiskProbeError::Btrfs {
+                        status: fresh_status,
+                        detail: "timed out".to_string(),
+                    },
+                };
+                monitor
+                    .refresh_with(kind, || refreshed_at, || Err(error))
+                    .unwrap_err();
+
+                let cached = monitor
+                    .cached_measurement()
+                    .map(|cached| (cached.measured_at, cached.measurement));
+                let published = match cached {
+                    None => Published::Nothing,
+                    Some((at, m)) if at == t0 && Some(m) == previous => Published::Previous,
+                    Some((at, m))
+                        if at == t0
+                            && m == CacheDiskMeasurement {
+                                status: fresh_status,
+                                btrfs: with_btrfs.btrfs,
+                            } =>
+                    {
+                        Published::FreshStatvfsWithPreviousBtrfs
+                    }
+                    Some(other) => panic!("{case}: unexpected publication {other:?}"),
+                };
+                assert_eq!(published, expected(kind, failure, previous_state), "{case}");
+            }
+        }
+    }
+}
+
+#[test]
+fn consecutive_failed_periodic_refreshes_close_admission_at_the_ttl() {
+    // The refresh loop sleeps one cadence after each refresh finishes, and a
+    // btrfs probe that times out takes its 2 s timeout, so consecutive timed-out
+    // refreshes start this far apart. Each one stamps its probe's start. A
+    // statvfs failure returns before the btrfs probe runs, so real ones start
+    // about one cadence apart; that case reuses the btrfs timing.
+    const TIMED_OUT_PROBE: Duration = Duration::from_secs(2);
+    // Written out rather than taken from `DEFAULT_MEASUREMENT_TTL`, so a change
+    // to the constant fails here as well as a change to the check.
+    let ttl = Duration::from_secs(30);
+    let probe_period = CACHE_REFRESH_CADENCE + TIMED_OUT_PROBE;
+    let t0 = Instant::now();
+    type Failure = fn() -> CacheDiskProbeError;
+    let failures: [(&str, Failure); 2] = [
+        ("statvfs", || CacheDiskProbeError::Statvfs),
+        ("btrfs", || CacheDiskProbeError::Btrfs {
+            status: measurement(400, 1_000).status,
+            detail: "timed out".to_string(),
+        }),
+    ];
+    for (case, error) in failures {
+        let monitor = CacheDiskAdmissionMonitor::new();
+        monitor
+            .refresh_with(
+                CacheDiskRefreshKind::Periodic,
+                || t0,
+                || Ok(measurement(500, 1_000)),
+            )
+            .unwrap();
+        for failure in 1..=2 {
+            let started_at = t0 + probe_period * failure;
+            monitor
+                .refresh_with(
+                    CacheDiskRefreshKind::Periodic,
+                    || started_at,
+                    || Err(error()),
+                )
+                .unwrap_err();
+            let decision = monitor.evaluate_cached_at(started_at + TIMED_OUT_PROBE, config(), 0);
+            assert!(
+                decision.allows_new_allocation(),
+                "{case}: failure {failure} closed admission: {}",
+                decision.detail
+            );
+        }
+
+        let decision = monitor.evaluate_cached_at(t0 + ttl, config(), 0);
+        assert!(
+            decision.allows_new_allocation(),
+            "{case}: admission closed at the TTL: {}",
+            decision.detail
+        );
+        let decision = monitor.evaluate_cached_at(t0 + ttl + Duration::from_millis(1), config(), 0);
+        assert_eq!(
+            decision.state,
+            CacheDiskAdmissionState::Unavailable,
+            "{case}: admission still open just past the TTL"
+        );
+        assert_eq!(decision.reason, CacheDiskAdmissionReason::DiskUnknownStale);
+
+        let decision = monitor.evaluate_cached_at(t0 + probe_period * 3, config(), 0);
+        assert_eq!(
+            decision.state,
+            CacheDiskAdmissionState::Unavailable,
+            "{case}: admission still open when the third refresh starts"
+        );
+        assert_eq!(decision.reason, CacheDiskAdmissionReason::DiskUnknownStale);
+    }
 }
 
 #[test]
@@ -111,7 +291,6 @@ fn cached_evaluation_without_measurement_is_unavailable() {
 #[test]
 fn refresh_serializes_probe_and_publication() {
     use std::sync::{Arc, Barrier, mpsc};
-    use std::time::Duration;
 
     let monitor = CacheDiskAdmissionMonitor::new();
     let started = Arc::new(Barrier::new(2));
@@ -122,7 +301,7 @@ fn refresh_serializes_probe_and_publication() {
         let monitor = &monitor;
         scope.spawn(move || {
             monitor
-                .refresh_with(|| {
+                .refresh_with(CacheDiskRefreshKind::Periodic, Instant::now, || {
                     first_started.wait();
                     wait.recv_timeout(Duration::from_secs(5)).unwrap();
                     Ok(measurement(500, 1_000))
@@ -132,7 +311,7 @@ fn refresh_serializes_probe_and_publication() {
         started.wait();
         scope.spawn(|| {
             monitor
-                .refresh_with(|| {
+                .refresh_with(CacheDiskRefreshKind::Periodic, Instant::now, || {
                     entered.send(()).unwrap();
                     Ok(measurement(100, 1_000))
                 })
