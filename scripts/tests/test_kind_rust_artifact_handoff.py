@@ -194,3 +194,104 @@ def test_record_rejects_a_key_label_without_a_valid_revision(run, monkeypatch):
     monkeypatch.setenv("FAKE_LABELS", labels(revision="main"))
     with pytest.raises(ValueError, match="invalid input key or revision"):
         handed_off(run, monkeypatch)
+
+
+class FakeClock:
+    """Stands in for the handoff's `time`: sleeping advances it, nothing waits."""
+
+    def __init__(self):
+        self.now = 0.0
+        self.sleeps = []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+@pytest.fixture
+def gh(run, monkeypatch):
+    """Answers each `gh api` call from a script; returns (script, clock)."""
+
+    script = []
+    real_run = subprocess.run
+
+    def fake_run(args, **kwargs):
+        if list(args[:2]) != ["gh", "api"]:
+            return real_run(args, **kwargs)
+        answer = script.pop(0)
+        if answer == "timeout":
+            raise subprocess.TimeoutExpired(args, kwargs.get("timeout"))
+        code, stderr, stdout = answer
+        return subprocess.CompletedProcess(args, code, stdout, stderr)
+
+    monkeypatch.setattr(handoff.subprocess, "run", fake_run)
+    clock = FakeClock()
+    monkeypatch.setattr(handoff, "time", clock)
+    return script, clock
+
+
+def producer_jobs(conclusion="success"):
+    job = {"name": handoff.PRODUCER, "status": "completed", "conclusion": conclusion}
+    return (0, "", json.dumps([{"jobs": [job]}]))
+
+
+def producer_upload(attempt=1):
+    name = f"kind-rust-{handoff.os.environ['GITHUB_SHA']}-{attempt}"
+    return (0, "", json.dumps([{"artifacts": [{"name": name, "expired": False}]}]))
+
+
+def test_wait_rides_out_transient_api_failures(run, gh, capsys):
+    script, clock = gh
+    script.extend(
+        [
+            (1, "gh: Server Error (HTTP 502)", ""),
+            "timeout",
+            (1, "gh: API rate limit exceeded (HTTP 429)", ""),
+            (1, "error connecting to api.github.com", ""),
+            producer_jobs(),
+            (1, "gh: Service Unavailable (HTTP 503)", ""),
+            producer_upload(),
+        ]
+    )
+
+    handoff.wait(3600)
+
+    assert "SPACE_KIND_RUST_PRODUCER_ATTEMPT=1" in (run / "env").read_text()
+    assert clock.sleeps == [5, 10, 20, 30, 5]
+    out = capsys.readouterr().out
+    assert "Retrying the Rust producer status lookup in 5 s after HTTP 502" in out
+    assert f"after no answer within {handoff.API_CALL_SECONDS} s" in out
+    assert "after a transport failure" in out
+    assert "Retrying the Rust producer artifacts lookup in 5 s after HTTP 503" in out
+    # Only the status is printed, never the remote error text.
+    assert "Server Error" not in out and "rate limit exceeded" not in out
+
+
+def test_wait_fails_at_once_when_actions_read_is_refused(gh):
+    script, clock = gh
+    script.append((1, "gh: Resource not accessible by integration (HTTP 403)", ""))
+
+    with pytest.raises(RuntimeError, match=r"\(HTTP 403\); Actions read access is required"):
+        handoff.wait(3600)
+    assert clock.sleeps == []
+
+
+def test_wait_gives_up_at_its_deadline_during_a_persistent_outage(gh):
+    script, clock = gh
+    script.extend([(1, "gh: Bad Gateway (HTTP 502)", "")] * 10)
+
+    with pytest.raises(RuntimeError, match="before the wait's deadline: HTTP 502"):
+        handoff.wait(40)
+    # 5 + 10 + 20 s leaves less than the next 30 s pause before the deadline.
+    assert clock.sleeps == [5, 10, 20]
+
+
+def test_wait_refuses_a_failed_producer(gh):
+    script, _ = gh
+    script.append(producer_jobs(conclusion="failure"))
+
+    with pytest.raises(RuntimeError, match="refusing local compilation fallback"):
+        handoff.wait(3600)
