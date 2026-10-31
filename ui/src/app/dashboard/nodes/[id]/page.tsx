@@ -1,12 +1,14 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import { Alert, App, Button, Card, Descriptions, Result, Space, Table, Tag, Tooltip, Typography } from 'antd';
 import { ArrowLeftOutlined, ReloadOutlined } from '@ant-design/icons';
 
 import { adminApi } from '@/lib/api';
+import { useAuth } from '@/lib/auth';
+import { nodeActions, type ForceUploadResponse, type NodeAction } from '@/lib/node-actions';
 import { publicSandboxIdFromAny } from '@/lib/sandbox-id';
 import type { AdminNodeResponse, NodeHealthStatus } from '@/lib/types';
 
@@ -17,48 +19,6 @@ interface NodeSandboxPage {
   next_after: string | null;
 }
 
-// Node actions on `POST /admin/api/v1/nodes/{id}:{action}`, with what each
-// does to the node's sandboxes.
-const ACTIONS: {
-  action: string;
-  label: string;
-  body?: unknown;
-  danger?: boolean;
-  when: (node: AdminNodeResponse) => boolean;
-  confirm: string;
-}[] = [
-  // The admin node response does not report whether the substrate node is
-  // cordoned, so both are offered outside a drain.
-  {
-    action: 'cordon', label: 'Cordon', when: (n) => !n.drain_phase,
-    confirm: 'New sandboxes stop being placed on this node; running sandboxes are not touched.',
-  },
-  {
-    action: 'uncordon', label: 'Uncordon', when: (n) => !n.drain_phase,
-    confirm: 'The node accepts new sandboxes again. Has no effect if it is not cordoned.',
-  },
-  {
-    action: 'drain', label: 'Drain (gentle)', body: { mode: 'gentle' }, when: (n) => !n.drain_phase,
-    confirm: 'The node stops taking new sandboxes and waits for resident sandboxes to leave on their own.',
-  },
-  {
-    action: 'drain', label: 'Drain (forced)', body: { mode: 'forced' }, danger: true, when: (n) => !n.drain_phase || n.drain_mode !== 'forced',
-    confirm: 'Resident sandboxes are evacuated now: running sandboxes are suspended and moved, interrupting their work.',
-  },
-  {
-    action: 'undrain', label: 'Undrain', when: (n) => !!n.drain_phase && n.drain_phase !== 'terminating',
-    confirm: 'The drain is cancelled and the node accepts new sandboxes again.',
-  },
-  {
-    action: 'force-upload-local-snapshots', label: 'Upload local snapshots', when: (n) => !!n.drain_phase && (n.sandboxes_local_snapshots ?? 0) > 0,
-    confirm: 'Suspended sandboxes pinned to this node re-upload their snapshots to the object store, so they can restore elsewhere.',
-  },
-  {
-    action: 'terminate', label: 'Terminate', danger: true, when: (n) => n.drain_phase === 'drained',
-    confirm: 'The node is terminated. The API refuses while it still holds sandboxes or node-local snapshots.',
-  },
-];
-
 function formatUnix(secs: number) {
   return secs ? new Date(secs * 1000).toLocaleString() : '—';
 }
@@ -66,11 +26,15 @@ function formatUnix(secs: number) {
 export default function NodeDetailPage() {
   const { message, modal } = App.useApp();
   const { id } = useParams<{ id: string }>();
+  const { substrate } = useAuth();
   const [node, setNode] = useState<AdminNodeResponse | null>(null);
   const [health, setHealth] = useState<NodeHealthStatus | null>(null);
   const [healthError, setHealthError] = useState<string | null>(null);
   const [page, setPage] = useState<NodeSandboxPage | null>(null);
+  const [pageError, setPageError] = useState<string | null>(null);
   const [cursor, setCursor] = useState<string | undefined>();
+  // Paging and Refresh can overlap; only the newest request's answer is kept.
+  const pageRequest = useRef(0);
   const [error, setError] = useState<{ status: number | null; message: string } | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
@@ -80,41 +44,86 @@ export default function NodeDetailPage() {
       .then((loaded) => {
         setNode(loaded);
         setError(null);
+        // The API keeps health only for worker and builder nodes; others answer 400.
+        if (loaded.role !== 'worker' && loaded.role !== 'builder') {
+          setHealth(null);
+          setHealthError(null);
+          return;
+        }
+        adminApi
+          .get<NodeHealthStatus>(`/v1/nodes/${id}/health`)
+          .then((h) => {
+            setHealth(h);
+            setHealthError(null);
+          })
+          .catch((err: any) => setHealthError(err?.message || 'Failed to load health'));
       })
       .catch((err: any) => setError({ status: typeof err?.status === 'number' ? err.status : null, message: err?.message || 'Failed to load node' }));
+  };
+
+  const loadSandboxes = (after: string | undefined = cursor) => {
+    const request = ++pageRequest.current;
+    const params = new URLSearchParams();
+    if (after) params.set('after', after);
+    setPage(null);
+    setPageError(null);
     adminApi
-      .get<NodeHealthStatus>(`/v1/nodes/${id}/health`)
+      .get<NodeSandboxPage>(`/v1/nodes/${id}/sandboxes?${params}`)
       .then((loaded) => {
-        setHealth(loaded);
-        setHealthError(null);
+        if (request === pageRequest.current) setPage(loaded);
       })
-      .catch((err: any) => setHealthError(err?.message || 'Failed to load health'));
+      .catch((err: any) => {
+        if (request === pageRequest.current) setPageError(err?.message || 'Failed to load sandboxes');
+      });
+  };
+
+  const refreshAll = () => {
+    loadNode();
+    loadSandboxes();
   };
 
   useEffect(loadNode, [id]);
-  useEffect(() => {
-    const params = new URLSearchParams();
-    if (cursor) params.set('after', cursor);
-    setPage(null);
-    adminApi.get<NodeSandboxPage>(`/v1/nodes/${id}/sandboxes?${params}`).then(setPage).catch(() => setPage({ sandboxes: [], next_after: null }));
-  }, [id, cursor]);
+  useEffect(() => loadSandboxes(cursor), [id, cursor]);
 
-  const runAction = (item: (typeof ACTIONS)[number]) => {
+  const showUploadResult = (result: ForceUploadResponse) => {
+    const failed = result.failed ?? [];
+    modal.info({
+      title: `Uploaded ${result.reuploaded.length} snapshot${result.reuploaded.length === 1 ? '' : 's'}${failed.length ? `, ${failed.length} failed` : ''}`,
+      width: 640,
+      content: (
+        <Space direction="vertical" size={4} style={{ width: '100%' }}>
+          {failed.map((f) => (
+            <Text key={f.sandbox_id} type="danger">{publicSandboxIdFromAny(f.sandbox_id)}: {f.error}</Text>
+          ))}
+          {result.deferred?.length ? <Text>{result.deferred.length} deferred to the next call.</Text> : null}
+          {result.truncated ? <Text>More sandboxes are pinned to this node than one call handles (256); run it again.</Text> : null}
+        </Space>
+      ),
+    });
+  };
+
+  const runAction = (item: NodeAction) => {
     modal.confirm({
       title: `${item.label} ${node?.name ?? id}?`,
       content: item.confirm,
       okText: item.label,
-      okButtonProps: { danger: item.danger },
+      okButtonProps: { danger: item.dangerous },
+      autoFocusButton: item.dangerous ? 'cancel' : 'ok',
       onOk: async () => {
         setBusy(item.label);
         try {
-          await adminApi.post(`/v1/nodes/${id}:${item.action}`, item.body);
-          message.success(`${item.label} requested`);
-          loadNode();
+          const result = await adminApi.post<ForceUploadResponse | unknown>(`/v1/nodes/${id}:${item.action}`, item.body);
+          if (item.action === 'force-upload-local-snapshots' && result && typeof result === 'object' && 'reuploaded' in result) {
+            showUploadResult(result as ForceUploadResponse);
+          } else {
+            message.success(`${item.label} requested`);
+          }
         } catch (err: any) {
           message.error(err?.message || `${item.label} failed`);
         } finally {
           setBusy(null);
+          // Some actions commit and then report an error: always reload.
+          refreshAll();
         }
       },
     });
@@ -128,7 +137,7 @@ export default function NodeDetailPage() {
         subTitle={<>{error.message} <code>{id}</code></>}
         extra={
           <Space>
-            {error.status !== 404 ? <Button type="primary" icon={<ReloadOutlined />} onClick={loadNode}>Retry</Button> : null}
+            {error.status !== 404 ? <Button type="primary" icon={<ReloadOutlined />} onClick={refreshAll}>Retry</Button> : null}
             <Link href="/dashboard/nodes"><ArrowLeftOutlined /> Nodes</Link>
           </Space>
         }
@@ -151,12 +160,12 @@ export default function NodeDetailPage() {
           <Tag color={node.scheduling_status === 'ready' ? 'green' : 'default'}>{node.scheduling_status ?? 'unknown'}</Tag>
         </Space>
         <Space wrap>
-          {ACTIONS.filter((item) => item.when(node)).map((item) => (
-            <Button key={item.label} danger={item.danger} loading={busy === item.label} disabled={!!busy} onClick={() => runAction(item)}>
+          {nodeActions(node, substrate).map((item) => (
+            <Button key={item.label} danger={item.dangerous} loading={busy === item.label} disabled={!!busy} onClick={() => runAction(item)}>
               {item.label}
             </Button>
           ))}
-          <Button icon={<ReloadOutlined />} onClick={loadNode}>Refresh</Button>
+          <Button icon={<ReloadOutlined />} onClick={refreshAll}>Refresh</Button>
         </Space>
       </Space>
 
@@ -189,41 +198,54 @@ export default function NodeDetailPage() {
         </Descriptions>
       </Card>
 
-      <Card size="small" title="Health">
-        {healthError ? <Alert type="warning" showIcon title={`Could not load health: ${healthError}`} style={{ marginBottom: 8 }} /> : null}
-        {health ? (
-          <>
-            <Space style={{ marginBottom: 8 }}>
-              <Tag color={health.healthy ? 'green' : 'red'}>{health.healthy ? 'healthy' : 'unhealthy'}</Tag>
-              {!health.reachable ? <Tag color="red">unreachable</Tag> : null}
-              {health.error ? <Text type="danger">{health.error}</Text> : null}
-            </Space>
-            {health.services.length ? (
-              <Space wrap style={{ marginBottom: 8 }}>
-                {health.services.map((service) => (
-                  <Tooltip key={service.name} title={service.error || 'reachable'}>
-                    <Tag color={service.reachable ? 'green' : 'red'}>{service.name}</Tag>
-                  </Tooltip>
-                ))}
+      {node.role === 'worker' || node.role === 'builder' ? (
+        <Card size="small" title="Health">
+          {healthError ? <Alert type="warning" showIcon title={`Could not load health: ${healthError}`} style={{ marginBottom: 8 }} /> : null}
+          {health ? (
+            <>
+              <Space style={{ marginBottom: 8 }} wrap>
+                {!health.reachable ? (
+                  <Tag color="red">unreachable</Tag>
+                ) : (
+                  <Tag color={health.healthy ? 'green' : 'red'}>{health.healthy ? 'healthy' : 'unhealthy'}</Tag>
+                )}
+                {status?.observed_at ? (
+                  <Text type="secondary">
+                    as of {new Date(status.observed_at).toLocaleString()}{status.stale ? ' (stale)' : ''}
+                  </Text>
+                ) : null}
+                {health.error ? <Text type="danger">{health.error}</Text> : null}
+                {health.node_ctl && !health.node_ctl.reachable ? (
+                  <Text type="danger">node-ctl unreachable{health.node_ctl.error ? `: ${health.node_ctl.error}` : ''}</Text>
+                ) : null}
               </Space>
-            ) : null}
-            <Table
-              size="small"
-              rowKey="name"
-              pagination={false}
-              dataSource={health.node_ctl?.reconciliations ?? []}
-              locale={{ emptyText: health.node_ctl ? 'No reconcilers reported' : 'node-ctl not reachable' }}
-              columns={[
-                { title: 'Reconciler', dataIndex: 'name' },
-                { title: 'Last success', dataIndex: 'last_success_at_unix_secs', render: formatUnix },
-                { title: 'Next due', dataIndex: 'next_due_at_unix_secs', render: formatUnix },
-                { title: 'Seen (templates / sandboxes)', render: (_, r) => `${r.templates_seen} / ${r.sandboxes_seen}` },
-                { title: 'Last error', dataIndex: 'last_error', render: (v: string) => (v ? <Text type="danger">{v}</Text> : '—') },
-              ]}
-            />
-          </>
-        ) : null}
-      </Card>
+              {health.services.length ? (
+                <Space wrap style={{ marginBottom: 8 }}>
+                  {health.services.map((service) => (
+                    <Tooltip key={service.name} title={service.error || 'reachable'}>
+                      <Tag color={service.reachable ? 'green' : 'red'}>{service.name}</Tag>
+                    </Tooltip>
+                  ))}
+                </Space>
+              ) : null}
+              <Table
+                size="small"
+                rowKey="name"
+                pagination={false}
+                dataSource={health.node_ctl?.reconciliations ?? []}
+                locale={{ emptyText: health.node_ctl ? 'No reconcilers reported' : 'node-ctl not reachable' }}
+                columns={[
+                  { title: 'Reconciler', dataIndex: 'name' },
+                  { title: 'Last success', dataIndex: 'last_success_at_unix_secs', render: formatUnix },
+                  { title: 'Next due', dataIndex: 'next_due_at_unix_secs', render: formatUnix },
+                  { title: 'Seen (templates / sandboxes)', render: (_, r) => `${r.templates_seen} / ${r.sandboxes_seen}` },
+                  { title: 'Last error', dataIndex: 'last_error', render: (v: string) => (v ? <Text type="danger">{v}</Text> : '—') },
+                ]}
+              />
+            </>
+          ) : null}
+        </Card>
+      ) : null}
 
       <Card
         size="small"
@@ -231,17 +253,27 @@ export default function NodeDetailPage() {
         extra={
           <Space>
             <Button size="small" disabled={!cursor} onClick={() => setCursor(undefined)}>First page</Button>
+            <Button size="small" icon={<ReloadOutlined />} onClick={() => loadSandboxes()}>Reload</Button>
             <Button size="small" disabled={!page?.next_after} onClick={() => page?.next_after && setCursor(page.next_after)}>Next 100</Button>
           </Space>
         }
       >
+        {pageError ? (
+          <Alert
+            type="error"
+            showIcon
+            title={`Could not load this node's sandboxes: ${pageError}`}
+            action={<Button size="small" onClick={() => loadSandboxes()}>Retry</Button>}
+            style={{ marginBottom: 8 }}
+          />
+        ) : null}
         <Table
           size="small"
           rowKey="id"
-          loading={page === null}
+          loading={page === null && !pageError}
           dataSource={page?.sandboxes ?? []}
           pagination={false}
-          locale={{ emptyText: 'No sandboxes placed on this node' }}
+          locale={{ emptyText: pageError ? 'Not loaded' : 'No sandboxes placed on this node' }}
           columns={[
             {
               title: 'Sandbox', dataIndex: 'id',

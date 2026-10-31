@@ -3,6 +3,7 @@
 import { type ReactNode, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { adminApi } from '@/lib/api';
+import { DRAIN_TERMINATES } from '@/lib/node-actions';
 import { useAuth } from '@/lib/auth';
 import {
   AdminNodeResponse,
@@ -815,8 +816,10 @@ export default function NodesPage() {
               // dashboard button one misclick away from evacuating a node.
               <Popconfirm
                 title="Drain this node?"
-                description="Cordons the node and waits for its sandboxes to leave on their own. Use `space-admin-cli drain-node --forced` to evacuate them immediately instead."
+                description={`Cordons the node and waits for its sandboxes to leave on their own. ${DRAIN_TERMINATES} Use \`space-admin-cli drain-node --forced\` to evacuate them immediately instead.`}
                 okText="Drain"
+                placement="topRight"
+                styles={{ root: { maxWidth: 420 } }}
                 onConfirm={() => handleDrain(record.id, 'gentle')}
               >
                 <Tooltip title="Drain">
