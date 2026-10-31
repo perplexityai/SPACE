@@ -492,3 +492,127 @@ fn restore_guest_memory_uses_capture_shape_or_legacy_payload_and_rejects_conflic
         );
     }
 }
+
+/// A row whose effective policy ref cannot be built refuses the restore before
+/// its first launch call to node-manager, instead of at the gateway's first
+/// policy pull after Firecracker and the gateway are up. The policy is
+/// inherited, so the ref names the template, which here is empty or holds the
+/// ref separator. The policy hash cannot be malformed this way: it is computed
+/// from the policy itself.
+#[tokio::test]
+async fn restore_refuses_a_policy_ref_that_cannot_be_built_before_launch() {
+    use crate::node_manager_transport::fake::FakeNodeManager;
+    use crate::template_resolver::fake::FakeTemplateResolver;
+    use pplx_space_common_core::types::{RuntimeKind, SandboxRuntimeLabel};
+    use pplx_space_node_mgr_client::proto::NetworkPoolStatusResponse;
+    use pplx_space_template_mgr_client::proto::GetTemplateResponse;
+    for template in ["", "seed:malformed"] {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = directory.path().join("cache");
+        let conn = crate::db::test_conn();
+        let id = SandboxId::new().to_string();
+        crate::db::insert_sandbox(
+            &conn,
+            crate::db::InsertSandboxParams {
+                guest_image: Default::default(),
+                id: &id,
+                uuid8: &SandboxRuntimeLabel::from_sandbox_id(id.parse().unwrap()),
+                state: SandboxState::Suspended,
+                template,
+                template_hash: None,
+                user: &SandboxOwner::parse("user").unwrap(),
+                runtime: RuntimeKind::Firecracker.alias(),
+                snapshots_enabled: false,
+                rootfs_size_mb: Some(2048),
+                disk_io_limits: Default::default(),
+                pool_template: None,
+                volume_encryption: false,
+                process_env: &Default::default(),
+                auto_lifecycle: &AutoLifecyclePolicy::disabled(),
+                network_policy_override: None,
+                network_policy_generation: 0,
+                network_policy_authority: crate::db::PolicyAuthority::Cluster,
+                auto_lifecycle_authority: crate::db::PolicyAuthority::Cluster,
+            },
+        )
+        .unwrap();
+        // A retained rootfs restores without a template lookup, so the only
+        // template-manager call is the inherited policy's.
+        let instance = cache.join(&id).join("instance");
+        std::fs::create_dir_all(&instance).unwrap();
+        std::fs::write(instance.join("rootfs.ext4"), []).unwrap();
+        let templates = Arc::new(FakeTemplateResolver::new(|| {
+            Ok(tonic::Response::new(GetTemplateResponse {
+                network_policy: Some((&pplx_space_net_common::NetworkPolicyV1::allow_all()).into()),
+                network_policy_authority: pplx_space_net_common::proto::PolicyAuthority::Cluster
+                    as i32,
+                ..Default::default()
+            }))
+        }));
+        let node_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_node_calls = node_calls.clone();
+        let node = FakeNodeManager::default()
+            .unary(
+                "GetNetworkPoolStatus",
+                move |_: NetworkPoolStatusRequest| {
+                    observed_node_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(NetworkPoolStatusResponse::default())
+                },
+            )
+            .serve();
+        let service = SandboxManagerService::new_with_options(
+            conn,
+            SandboxManagerServiceOptions {
+                node_manager: node.connector(),
+                create_cache_dir: Some(cache),
+                template_resolver: templates.clone(),
+                ..SandboxManagerServiceOptions::for_test()
+            },
+        );
+        let row = service.lookup_sandbox(&id).unwrap();
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(20),
+            service.start_from_checkpoint(StartFromCheckpointLaunch {
+                vcpu: None,
+                activation_auto_lifecycle: None,
+                operation_activation_attempt_id: None,
+                sandbox: &row,
+                blocking: false,
+                netns_path: None,
+                target_state: SandboxState::Started,
+                execution_generation: None,
+                space_api_route_identity: Default::default(),
+                route_identity_provenance:
+                    crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::Unfenced,
+                open_activation_claim_eligible: false,
+                restored_snapshot: RestoredSnapshotProvenance::default(),
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::Internal, "{template:?}: {error}");
+        assert!(
+            error
+                .message()
+                .contains("effective network policy ref construction failed"),
+            "{template:?}: {error}"
+        );
+        assert_eq!(templates.requests().len(), 1, "{template:?}");
+        assert_eq!(
+            node_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "{template:?}"
+        );
+        let after = service.lookup_sandbox(&id).unwrap();
+        assert_eq!(after.state, SandboxState::Suspended, "{template:?}");
+        assert_eq!(after.cleanup_completion, None, "{template:?}");
+        service.shutdown_token.cancel();
+        service.task_tracker.close();
+        tokio::time::timeout(Duration::from_secs(20), service.task_tracker.wait())
+            .await
+            .unwrap();
+    }
+}

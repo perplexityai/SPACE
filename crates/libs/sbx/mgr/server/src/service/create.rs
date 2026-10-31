@@ -703,8 +703,11 @@ impl SandboxManagerService {
         .await?;
         let prepare_template = prepare_source.template;
         let prepare_template_dir = prepare_source.template_dir;
-        // Resolve the effective policy up front so a policy that cannot be
-        // resolved fails the restore before launch. The gateway is nudged to
+        // Resolve the effective policy and build its ref up front so a policy
+        // that cannot be resolved, or a row whose ref cannot be built, fails
+        // the restore before launch instead of at the gateway's first pull.
+        // The ref is discarded: host-control builds it again for each pull,
+        // and nothing after launch asserts it. The gateway is nudged to
         // hydrate in the background after launch (below). The gateway
         // namespace denies egress until policy and CA readiness (fail-closed).
         // Hydration overlaps snapshot load; the finalizer confirms traffic
@@ -716,12 +719,13 @@ impl SandboxManagerService {
         let has_network_identity = !Self::sandbox_is_pool_member(sandbox);
         if has_network_identity {
             // Cache resolution owns and measures the foreground deadline.
-            start_stage(
+            let effective_policy = start_stage(
                 "restore.effective_network_policy",
                 id,
                 self.effective_network_policy(sandbox),
             )
             .await?;
+            effective_network_policy_ref(sandbox, &effective_policy)?;
         }
         let mut node_client = start_stage_timeout(
             "restore.connect_node_mgr",
