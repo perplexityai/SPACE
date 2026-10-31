@@ -49,14 +49,21 @@ export default function UserDetailPage() {
   // Saves answer with the user as that request saw it; a profile save and a
   // role save in flight together could leave the older answer on screen.
   // Each save instead reloads the user, and only the newest reload applies.
+  // When that reload fails, the save's own answer applies instead (under the
+  // same check), so a later Edit does not send back what the save replaced.
   const userRequest = useRef(0);
-  const reloadUser = async () => {
+  const [reloadError, setReloadError] = useState<string | null>(null);
+  const reloadUser = async (saved?: AdminUser) => {
     const request = ++userRequest.current;
     try {
       const fresh = await adminApi.get<AdminUser>(`/v1/users/${id}`);
-      if (request === userRequest.current) setUser(fresh);
-    } catch {
-      // The save itself succeeded; the next load shows the current user.
+      if (request !== userRequest.current) return;
+      setUser(fresh);
+      setReloadError(null);
+    } catch (err: unknown) {
+      if (request !== userRequest.current) return;
+      if (saved) setUser(saved);
+      setReloadError(errorText(err, 'Failed to load user'));
     }
   };
   const [passwordForm] = Form.useForm<PasswordValues>();
@@ -122,15 +129,16 @@ export default function UserDetailPage() {
   // `null` when the cluster record did not load: console access is unknown.
   const inManagingOrg = cluster ? user.org_id === cluster.managing_org_id : null;
   // External sign-in matches the provider's email exactly against the user's
-  // email, so changing your own would lock you out with no way back.
+  // email, so changing your own would lock you out; only another
+  // administrator of the managing organization could change it back.
   const emailLocked = isSelf && authMode?.mode === 'external';
 
   const applyRole = async (role: UserRole) => {
     setUpdatingRole(true);
     try {
-      await adminApi.put<AdminUser>(`/v1/users/${user.id}/role`, { role });
+      const saved = await adminApi.put<AdminUser>(`/v1/users/${user.id}/role`, { role });
       message.success('Role updated');
-      await reloadUser();
+      await reloadUser(saved);
     } catch (err: any) {
       message.error(err.message);
     } finally {
@@ -146,7 +154,7 @@ export default function UserDetailPage() {
   const patchUser = async (body: Partial<{ email: string; display_name: string; password: string }>, done: string) => {
     setSaving(true);
     try {
-      await adminApi.patch<AdminUser>(`/v1/users/${user.id}`, body);
+      const saved = await adminApi.patch<AdminUser>(`/v1/users/${user.id}`, body);
       if (body.password !== undefined && isSelf) {
         // Setting a password ends every session of that user, this one too.
         setSignInNotice('Your password was changed and your sessions ended. Sign in with the new password.');
@@ -155,7 +163,7 @@ export default function UserDetailPage() {
         return true;
       }
       message.success(done);
-      await reloadUser();
+      await reloadUser(saved);
       return true;
     } catch (err: any) {
       message.error(err.message);
@@ -214,6 +222,15 @@ export default function UserDetailPage() {
           </Space>
         ) : null}
       </Space>
+      {reloadError ? (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 16 }}
+          message={`Saved; the page could not reload the user: ${reloadError}`}
+          action={<Button size="small" icon={<ReloadOutlined />} onClick={() => void reloadUser()}>Retry</Button>}
+        />
+      ) : null}
       <Descriptions size="small" column={2} style={{ marginBottom: 24 }}>
         <Descriptions.Item label="Email">{user.email}</Descriptions.Item>
         <Descriptions.Item label="Role">

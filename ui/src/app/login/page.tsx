@@ -33,7 +33,12 @@ export default function LoginPage() {
   const [error, setError] = useState('');
   // Set by a flow that ended this browser's session, such as a password change.
   const [notice, setNotice] = useState<string | null>(null);
-  useEffect(() => setNotice(takeSignInNotice()), []);
+  // Taking the notice clears it, so under React Strict Mode the effect's
+  // second run finds none; keep what the first run took.
+  useEffect(() => {
+    const taken = takeSignInNotice();
+    if (taken) setNotice(taken);
+  }, []);
   const [submitting, setSubmitting] = useState(false);
   const { user, loading, authMode, authModeError, accessProblem, login, logout, retry } = useAuth();
   const { surfaces } = useCuriosityTheme();
