@@ -9,10 +9,11 @@ acts on. This module is the typed form of the opt-in shell suite that proved
 them by reading cluster-controller log lines off the nodes; every verdict here
 comes from state instead.
 
-- **A budget sized for one run.** The liveness budget ships at 600 s. This
-  run asks for its floor through the controller's test hook, which every
-  replica and the contender read at startup, records the Deployment's standing
-  value first and puts it back in its last phase. The outage runs first: its
+- **A budget sized for one run.** The liveness budget ships at 600 s and the
+  lease TTL at 60 s. This run asks for the TTL's floor and the budget's floor
+  at that TTL through the controller's test hooks, which every replica and the
+  contender read at startup, records the Deployment's standing budget first
+  and puts both back in its last phase. The outage runs first: its
   budget exit has to land within the requested budget's ceiling, so a binary
   that ignored the hook fails there, before the refusal is judged against it.
 - **One leader, one runner.** Two healthy replicas, the Lease naming one of
@@ -101,16 +102,19 @@ if TYPE_CHECKING:
 
 # The timings `LeaderElectionConfig::from_environment` resolves
 # (crates/libs/cluster/controller/server/src/leader_election/mod.rs), which
-# nothing but the Lease's `leaseDurationSeconds` exposes: the lease TTL
-# (DEFAULT_LEASE_TTL, checked against the Lease) and the standby retry
-# interval (DEFAULT_RETRY_INTERVAL). The liveness budget is the requested one
-# raised to at least MIN_GRACE_LEASE_TTL_MULTIPLE TTLs and
-# MIN_GRACE_RETRY_INTERVALS retries, plus a per-pod spread of up to
+# nothing but the Lease's `leaseDurationSeconds` exposes: the lease TTL, which
+# this run requests at MIN_LEASE_TTL through LEASE_TTL_TEST_ENV (checked
+# against the Lease), and the standby retry interval, DEFAULT_RETRY_INTERVAL
+# clamped to the 2 s that TTL's renew deadline leaves room for. The liveness
+# budget is the requested one raised to at least MIN_GRACE_LEASE_TTL_MULTIPLE
+# TTLs and MIN_GRACE_RETRY_INTERVALS retries, plus a per-pod spread of up to
 # 1/GRACE_SPREAD_DIVISOR of it. The crate pins each of these with a
-# compile-time assert; change them here with it. This run requests the floor,
-# so every wait for a budget is bounded by the floor's ceiling.
-LEASE_TTL_SECONDS = 60
-RETRY_INTERVAL_SECONDS = 8.0
+# compile-time assert, and `the_lease_ttl_override_is_bounded_like_the_default`
+# pins the values at the TTL floor; change them here with it. This run
+# requests the floor, so every wait for a budget is bounded by the floor's
+# ceiling: 72 s and 90 s, where the default TTL's are 240 s and 300 s.
+LEASE_TTL_SECONDS = 18
+RETRY_INTERVAL_SECONDS = 2.0
 LIVENESS_BUDGET_SECONDS = max(4 * LEASE_TTL_SECONDS, 30 * int(RETRY_INTERVAL_SECONDS))
 LIVENESS_BUDGET_SPREAD = 1 + 1 / 4
 # Past the first refused call plus the budget's ceiling and one retry interval
@@ -157,6 +161,10 @@ RECONCILER_TICKS = "space_cluster_reconciler_loop_latency_milliseconds"
 ACQUIRE_FAILED = "space_cluster_controller_leader_election_acquire_failed_total"
 LEASE_LOST = "space_cluster_controller_leader_election_lease_lost_total"
 LEASE_UNREACHABLE = "space_cluster_controller_leader_election_lease_unreachable_total"
+# Evidence only: at the 18 s TTL a renewal stalled past about 4 s resigns the
+# holder, and a resignation inside a judged window fails the run. The counter
+# names that cause beside the window's own verdict.
+RENEW_FAILED = "space_cluster_controller_leader_election_renew_failed_total"
 
 POLL_SECONDS = 2.0
 # Cleanup's time plan after a failure with the apiserver down. Its budget is
@@ -260,7 +268,9 @@ class LeaderElectionAssertions:
             critical=True,
         )
         requested = str(LIVENESS_BUDGET_SECONDS)
-        self._control.set_controller_liveness_budget_env(requested)
+        self._control.set_controller_liveness_budget_env(
+            requested, lease_ttl=str(LEASE_TTL_SECONDS)
+        )
         live = self._control.controller_liveness_budget_env()
         self._fixture.verify(
             live == requested,
@@ -288,6 +298,7 @@ class LeaderElectionAssertions:
             after=after,
         )
         self._fixture.record("liveness_budget_env_after", after)
+        self._fixture.record("renewal_failures", self._renewal_failures())
         self._restore_budget.disarm()
         self._restore_budget = None
 
@@ -1013,7 +1024,24 @@ class LeaderElectionAssertions:
             except Exception as error:  # noqa: BLE001 - evidence must not mask the failure
                 logs[pod] = f"could not read logs: {type(error).__name__}: {error}"
         watches = {node: watch.diagnostics() for node, watch in sorted(self._exit_watches.items())}
-        return {"controller_logs": logs, **({"exit_watches": watches} if watches else {})}
+        return {
+            "controller_logs": logs,
+            "renewal_failures": self._renewal_failures(),
+            **({"exit_watches": watches} if watches else {}),
+        }
+
+    def _renewal_failures(self) -> dict[str, float] | str:
+        """Each pod's failed Lease renewals by reason, as Prometheus last saw them."""
+
+        try:
+            return {
+                f'{sample["metric"].get("k8s_pod_name", "")}/{sample["metric"].get("reason", "")}': float(
+                    sample["value"][1]
+                )
+                for sample in self._prometheus(f"sum by (k8s_pod_name, reason) ({RENEW_FAILED})")
+            }
+        except Exception as error:  # noqa: BLE001 - evidence must not mask the failure
+            return f"could not read {RENEW_FAILED}: {type(error).__name__}: {error}"
 
     def _poll(
         self,

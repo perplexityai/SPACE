@@ -350,6 +350,7 @@ the Kind services with no crate's `test-hooks` feature enabled:
 | `local.snapshot_reaper_reclaims_backed_fork_snapshot` | the chart's `SPACE_SBX_GC_*` target, interval, grace and idle | a release candidate is idle for a day before the reaper takes it |
 | `local.retention_claim_finish_forward`, `local.retention_restore_source_guard` | the retention sweeper's dry-run, tick and minimum age, which they stage | a release sweeper ticks every 300 s and keeps snapshots younger than an hour |
 | `local.rate_limiters_enforce_and_fail_open` | `SPACE_CLUSTER_ACTIVATION_ADMISSION_BURST`, which it shrinks to 2 | draining the release burst of 60 would take sixty real boots |
+| `local.leader_election_brownout_keeps_one_leader` | the cluster-controller's lease TTL and liveness budget, `SPACE_CLUSTER_CONTROLLER_LEADER_ELECTION_LEASE_TTL_SECS` and `..._LEASE_FAILURE_GRACE_SECS` | at the release 60 s TTL and 600 s budget, a replica spends its budget long after the outage's bound |
 
 The 40 GiB cache needs no replacement for the reservation hook: release
 binaries reserve 8 GiB per pending cache allocation
@@ -1457,11 +1458,12 @@ load-balanced entry, scaled on load.
 - **cluster-controller** runs two replicas with leader election on: the Lease
   holder runs every reconciler and the other stands by, Ready, to take over.
   The typed scenario `local.leader_election_brownout_keeps_one_leader`
-  exercises the handoff. It needs `otel` mode. It lowers the controller's
-  liveness budget to its floor for its own run, through a test hook that is
-  inert unless the `test-hooks` feature is compiled in, as the Kind build
-  does, and puts the standing value back at the end; it takes about 13
-  minutes. Run it alone with
+  exercises the handoff. It needs `otel` mode. For its own run it lowers the
+  controller's lease TTL to its 18 s floor and the liveness budget to the
+  72 s floor at that TTL, through two test hooks that are inert unless the
+  `test-hooks` feature is compiled in, as the Kind build does. At the end it
+  removes the TTL hook and puts the budget's standing value back; it takes
+  about 8 minutes. Run it alone with
   `uv run --frozen --python 3.11 -m space_smoke run
   local.leader_election_brownout_keeps_one_leader`.
 - **internal-api** (ClusterApi) runs two replicas behind its ClusterIP
