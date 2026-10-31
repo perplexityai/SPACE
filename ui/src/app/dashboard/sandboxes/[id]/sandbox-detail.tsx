@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import { useParams, useRouter } from 'next/navigation';
 import {
+  Alert,
   Button,
   Card,
   Descriptions,
@@ -73,6 +74,7 @@ import type {
   Template,
 } from '@/lib/types';
 import { tablePagination } from '@/lib/table-pagination';
+import { useAuth } from '@/lib/auth';
 import { formatAge, sectionData, type DebugSnapshot, type SandboxDebug } from '@/lib/sandbox-debug';
 import { OperationsCard, OrgLink, PlacementCard, ResourcesCard, TimelineCard, UserLink } from './sandbox-insight';
 import NetworkPolicyDesigner, {
@@ -432,27 +434,51 @@ function AdminSnapshotsTable({ snapshots, nowMs }: { snapshots: DebugSnapshot[];
   );
 }
 
-function SnapshotsCard({ sandboxId, debug, nowMs }: { sandboxId: string; debug: SandboxDebug | null; nowMs: number }) {
+function SnapshotsCard({
+  sandboxId,
+  foreignOrg,
+  debug,
+  nowMs,
+}: {
+  sandboxId: string;
+  // The public snapshot routes are scoped to the signed-in user's org.
+  foreignOrg: boolean;
+  debug: SandboxDebug | null;
+  nowMs: number;
+}) {
   const { message } = App.useApp();
   const { token } = theme.useToken();
   const [snapshots, setSnapshots] = useState<SnapshotInfo[]>([]);
   const [loading, setLoading] = useState(true);
-  const [snapshotsOff, setSnapshotsOff] = useState(false);
+  const [snapshotsOff, setSnapshotsOff] = useState(foreignOrg);
+  const [listingError, setListingError] = useState<string | null>(null);
   const [rollbackOff, setRollbackOff] = useState(false);
 
   const refresh = () => {
+    if (foreignOrg) {
+      setSnapshotsOff(true);
+      setLoading(false);
+      return;
+    }
     setLoading(true);
+    setListingError(null);
     getPublicPage<PublicSnapshot>(`/sandboxes/${sandboxId}/snapshots`)
-      .then((items) => setSnapshots(items.map(publicSnapshotToConsoleSnapshot)))
-      .catch(() => {
-        // Not enabled for this org, or another org's sandbox: fall back to the
-        // admin view below.
+      .then((items) => {
+        setSnapshotsOff(false);
+        setSnapshots(items.map(publicSnapshotToConsoleSnapshot));
+      })
+      .catch((err: any) => {
+        // Either way the admin view below lists the snapshots; only a hidden
+        // operation is an expected answer, anything else is reported.
         setSnapshotsOff(true);
+        if (!isHiddenOperationError(err)) {
+          setListingError(err.message || 'failed to load snapshots');
+        }
       })
       .finally(() => setLoading(false));
   };
 
-  useEffect(refresh, [sandboxId]);
+  useEffect(refresh, [sandboxId, foreignOrg]);
 
   const handleRollback = async (snapshotName: string) => {
     try {
@@ -507,8 +533,24 @@ function SnapshotsCard({ sandboxId, debug, nowMs }: { sandboxId: string; debug: 
       <Card
         size="small"
         title={<Space><CameraOutlined /> Snapshots</Space>}
-        extra={<Text type="secondary" style={{ fontSize: 12 }}>Rollback unavailable: snapshot operations are not enabled for this sandbox&apos;s organization</Text>}
+        extra={
+          listingError ? null : (
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              {foreignOrg
+                ? 'Rollback unavailable: this sandbox belongs to another organization'
+                : 'Rollback unavailable: snapshot operations are not enabled for this organization'}
+            </Text>
+          )
+        }
       >
+        {listingError ? (
+          <Alert
+            type="warning"
+            showIcon
+            style={{ marginBottom: 8 }}
+            title={`Could not load snapshots from the snapshot API: ${listingError}. Showing the snapshots the control plane records; rollback is unavailable.`}
+          />
+        ) : null}
         <AdminSnapshotsTable snapshots={adminSnapshots} nowMs={nowMs} />
       </Card>
     );
@@ -989,6 +1031,7 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
   const { message } = App.useApp();
   const params = useParams<{ id: string }>();
   const router = useRouter();
+  const { org: authOrg } = useAuth();
   const id = params.id;
   const [sandbox, setSandbox] = useState<Sandbox | null>(null);
   const [templates, setTemplates] = useState<Template[]>([]);
@@ -1277,7 +1320,14 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
 
         <OperationsCard operations={operations} error={operationsError} nowMs={nowMs} />
 
-        {showSnapshots ? <SnapshotsCard sandboxId={sandbox.id} debug={debug} nowMs={nowMs} /> : null}
+        {showSnapshots ? (
+          <SnapshotsCard
+            sandboxId={sandbox.id}
+            foreignOrg={!!authOrg && !!sandbox.org_id && sandbox.org_id !== authOrg.id}
+            debug={debug}
+            nowMs={nowMs}
+          />
+        ) : null}
 
         <ResourcesCard debug={debug} nowMs={nowMs} />
 
