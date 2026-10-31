@@ -16,3 +16,29 @@ export function orgOptionLabels(orgs: { id: string; name: string; slug: string }
     label: (counts.get(org.name) ?? 0) > 1 ? `${org.name} (${org.slug})` : org.name,
   }));
 }
+
+// Windows share a view's refresh timestamp under one key, so one window's
+// reload counts for all of them. A list scoped to an org, or larger than the
+// default, is a different view and keeps its own key; otherwise a window
+// showing another scope would keep it "fresh" and it would never reload.
+export function scopedRefreshKey(base: string, limit: number, defaultLimit: number, org: string | null): string {
+  if (org) return `${base}:org-${org}:limit-${limit}`;
+  return limit > defaultLimit ? `${base}:limit-${limit}` : base;
+}
+
+// What the direct-lookup notice says about a sandbox found outside the loaded
+// rows, under the selected org filter.
+export function lookupScopeText(
+  sandbox: { org_id: string | null },
+  selectedOrg: string | null,
+  orgName: (id: string) => string | undefined,
+  limit: number,
+): string {
+  if (!selectedOrg) return `It is not among the newest ${limit} sandboxes loaded below.`;
+  const selected = orgName(selectedOrg) ?? selectedOrg;
+  if (sandbox.org_id === selectedOrg) {
+    return `It is not among the newest ${limit} sandboxes of ${selected} loaded below.`;
+  }
+  const owner = sandbox.org_id ? orgName(sandbox.org_id) ?? 'another organization' : 'no organization';
+  return `It belongs to ${owner}, not ${selected}.`;
+}

@@ -3,7 +3,7 @@
 import { Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import styles from './inventory.module.css';
-import { orgOptionLabels, parseOrgParam } from '@/lib/org-filter';
+import { lookupScopeText, orgOptionLabels, parseOrgParam, scopedRefreshKey } from '@/lib/org-filter';
 import { usePathname, useSearchParams } from 'next/navigation';
 import {
   DEFAULT_LIST_LIMIT,
@@ -79,13 +79,18 @@ const { Title, Text } = Typography;
 const SANDBOXES_VIEW_REFRESH_KEY = 'dashboard:sandboxes';
 const LARGE_LIST_STALE_MS = 15_000;
 
-// Every console window shares a view's refresh timestamp, so one window's
-// reload counts for all of them. A list larger than the default is a
-// different, heavier view: it keeps its own timestamp, or a default-size
-// window elsewhere would keep it fresh and it would never reload.
-function sandboxesRefreshKey(limit: number): string {
-  return limit > DEFAULT_LIST_LIMIT ? `${SANDBOXES_VIEW_REFRESH_KEY}:limit-${limit}` : SANDBOXES_VIEW_REFRESH_KEY;
+// See `scopedRefreshKey`: each org and load size keeps its own timestamp.
+function sandboxesRefreshKey(scope: ListScope): string {
+  return scopedRefreshKey(SANDBOXES_VIEW_REFRESH_KEY, scope.limit, DEFAULT_LIST_LIMIT, scope.org);
 }
+
+// The org and load size one list request asked for.
+interface ListScope {
+  limit: number;
+  org: string | null;
+}
+
+const sameScope = (a: ListScope | null, b: ListScope) => a !== null && a.limit === b.limit && a.org === b.org;
 const REFRESH_CLICK_COOLDOWN_MS = 3000;
 
 type AgeWindow = '1h' | '24h' | '7d' | '30d' | '90d' | '1y' | 'all';
@@ -653,6 +658,14 @@ function SandboxesPage() {
   // Applied by the admin API (`org_id`), so the newest rows are that org's.
   const [orgFilter, setOrgFilter] = useState<string | null>(() => parseOrgParam(searchParams.get('org')));
   const orgFilterRef = useRef(orgFilter);
+  // Every list request takes the next number; only the newest one applies its
+  // rows, its error and the end of `loading`, so an older answer (even for
+  // the same org and size, after a change away and back) never wins.
+  const listRequestRef = useRef(0);
+  // The scope of the rows on screen, and the error of a load of another scope
+  // that failed (its rows are cleared rather than shown under the new label).
+  const shownScopeRef = useRef<ListScope | null>(null);
+  const [listError, setListError] = useState<string | null>(null);
   // A full identifier that matches no loaded row is looked up directly, so a
   // sandbox outside the loaded rows can still be found.
   const [lookup, setLookup] = useState<
@@ -700,23 +713,41 @@ function SandboxesPage() {
     return secs;
   };
 
-  const refresh = async ({ showLoading = true, reconcile = false }: { showLoading?: boolean; reconcile?: boolean } = {}) => {
+  const currentScope = (): ListScope => ({ limit: listLimitRef.current, org: orgFilterRef.current });
+
+  const refresh = async ({
+    showLoading = true,
+    reconcile = false,
+    scope = currentScope(),
+  }: { showLoading?: boolean; reconcile?: boolean; scope?: ListScope } = {}) => {
+    const request = ++listRequestRef.current;
+    const newest = () => request === listRequestRef.current;
     if (showLoading) setLoading(true);
     try {
-      const limit = listLimitRef.current;
-      const org = orgFilterRef.current;
-      const data = await getConsoleSandboxes(limit, org);
-      // The load size or org changed while this request ran; its answer is stale.
-      if (limit !== listLimitRef.current || org !== orgFilterRef.current) return;
+      const data = await getConsoleSandboxes(scope.limit, scope.org);
+      if (!newest()) return;
       data.sort((a, b) => parseUptime(b.uptime) - parseUptime(a.uptime) || a.id.localeCompare(b.id));
       setSandboxes(data);
+      shownScopeRef.current = scope;
+      setListError(null);
       setListGeneration((n) => n + 1);
-      markViewRefreshed(sandboxesRefreshKey(limit));
+      markViewRefreshed(sandboxesRefreshKey(scope));
     } catch (err: any) {
+      if (!newest()) return;
+      const text = err.message || 'failed to refresh sandboxes';
+      if (!sameScope(shownScopeRef.current, scope)) {
+        // The rows on screen belong to another org or size; do not show them
+        // under this one's label.
+        setSandboxes([]);
+        shownScopeRef.current = null;
+        setListError(text);
+        return;
+      }
       // Keep the last rendered view when a node-local manager is briefly unavailable.
-      throw new Error(err.message || 'failed to refresh sandboxes');
+      throw new Error(text);
     } finally {
-      if (showLoading) setLoading(false);
+      // Only the newest request ends `loading`, whichever request started it.
+      if (newest()) setLoading(false);
     }
   };
 
@@ -731,11 +762,12 @@ function SandboxesPage() {
     if (document.hidden) {
       return;
     }
+    const scope = currentScope();
     void runLockedViewRefresh(
-      sandboxesRefreshKey(listLimitRef.current),
-      () => refresh({ showLoading: false }),
+      sandboxesRefreshKey(scope),
+      () => refresh({ showLoading: false, scope }),
       // A larger load is a heavier query; poll it less often.
-      { staleMs: listLimitRef.current > DEFAULT_LIST_LIMIT ? LARGE_LIST_STALE_MS : VIEW_REFRESH_STALE_MS },
+      { staleMs: scope.limit > DEFAULT_LIST_LIMIT ? LARGE_LIST_STALE_MS : VIEW_REFRESH_STALE_MS },
     ).catch((err: any) => console.warn(err.message || err));
   };
 
@@ -773,9 +805,10 @@ function SandboxesPage() {
     if (refreshCooldownRef.current || manualRefreshing) return;
     startRefreshCooldown();
     setManualRefreshing(true);
+    const scope = currentScope();
     void runLockedViewRefresh(
-      sandboxesRefreshKey(listLimitRef.current),
-      () => refresh({ showLoading: false, reconcile: true }),
+      sandboxesRefreshKey(scope),
+      () => refresh({ showLoading: false, reconcile: true, scope }),
       { force: true },
     ).then((ran) => {
       if (!ran) {
@@ -1436,7 +1469,7 @@ function SandboxesPage() {
             type="info"
             showIcon
             style={{ marginBottom: 12 }}
-            title={`Found ${query.ref.publicId} by direct lookup. It is not among the newest ${listLimit} sandboxes loaded below.`}
+            title={`Found ${query.ref.publicId} by direct lookup. ${lookupScopeText(lookup.sandbox, orgFilter, (id) => orgNames.get(id), listLimit)}`}
             description={lookup.error ? `The last refresh of this row failed: ${lookup.error}` : undefined}
           />
         ) : lookup.error ? (
@@ -1448,6 +1481,16 @@ function SandboxesPage() {
           showIcon
           style={{ marginBottom: 12 }}
           title={`Showing the newest ${listLimit} sandboxes${orgFilter ? ` of ${orgNames.get(orgFilter) ?? orgFilter}` : ''}. Filters apply to these rows only; enter a full sandbox ID or pod name to look up any sandbox.`}
+        />
+      ) : null}
+
+      {listError ? (
+        <Alert
+          type="error"
+          showIcon
+          style={{ marginBottom: 12 }}
+          title={`Could not load the newest ${listLimit} sandboxes${orgFilter ? ` of ${orgNames.get(orgFilter) ?? orgFilter}` : ''}: ${listError}`}
+          action={<Button size="small" onClick={refreshAndReport}>Retry</Button>}
         />
       ) : null}
 
