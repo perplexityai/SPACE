@@ -2,6 +2,7 @@
 //
 //   npm run loop -- [--base-url URL] [--out DIR] [--only REGEX] [--skip REGEX]
 //                   [--no-mutate] [--label NAME] [--compare RUN] [--slow-ms N] [--headed] [--video]
+//                   [--allow-remote]
 //
 // Signs in through the real login page, runs the steps in src/steps.ts, and
 // writes <out>/runs/<time>[-label]/ with one screenshot per step and
@@ -15,7 +16,7 @@ import { chromium } from 'playwright';
 
 import { newContext, takeToasts, type Ctx } from './browser.ts';
 import { compareRuns, printComparison, readRun, type RunSummary } from './compare.ts';
-import { flag, loadConfig, option } from './config.ts';
+import { flag, guardTargets, loadConfig, option } from './config.ts';
 import { NON_FAILING, Recorder, writeJson, type StepResult } from './recorder.ts';
 import { readSeedState } from './seed.ts';
 import { steps } from './steps.ts';
@@ -30,6 +31,10 @@ async function main(): Promise<number> {
   const slowMs = Number(option(args, 'slow-ms', '1500'));
   const label = option(args, 'label');
   const compareWith = option(args, 'compare');
+  // The mutating steps create and delete objects: only on this host unless
+  // --allow-remote is given. Reading-only runs may target any console.
+  if (mutate) guardTargets(config, 'loop');
+  else console.log(`[loop] target: console ${config.baseUrl} (read-only: --no-mutate)`);
   // Read the comparison run before this run can replace `latest`.
   const before: RunSummary | null = compareWith ? readRun(compareWith) : null;
 
@@ -122,7 +127,7 @@ function markdown(summary: RunSummary, results: StepResult[]): string {
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
   main().then((code) => process.exit(code), (err) => {
-    console.error(err);
+    console.error(err instanceof Error ? err.message : err);
     process.exit(2);
   });
 }

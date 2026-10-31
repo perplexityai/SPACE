@@ -3,17 +3,30 @@
 //   npm run seed [-- --skip-sandboxes]
 //   npm run clean
 //
-// Everything goes through the public and admin APIs as the console account.
-// Every object's name starts with the prefix (default `loop`), so seeding is
-// rerunnable (existing objects are reused) and cleanup touches nothing else.
-// What was created is recorded in <out>/seed.json, which the driver reads.
+// Everything goes through the public and admin APIs as the console account,
+// and only against this host unless --allow-remote is given. Every object's
+// name starts with the prefix (default `loop`). Seeding is rerunnable: it
+// looks each object up by its prefixed name before creating it, so an
+// interrupted run leaves nothing a rerun duplicates. Every object the seed or
+// the loop creates is recorded in <out>/seed.json as soon as it exists, and
+// cleanup deletes only recorded objects.
 import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { Api, ApiError, type Operation } from './api.ts';
-import { flag, loadConfig, option, type Config } from './config.ts';
+import { flag, guardTargets, loadConfig, option, type Config } from './config.ts';
+
+export type CreatedKind = 'org' | 'user' | 'apiKey' | 'sandbox';
+
+export interface CreatedObject {
+  kind: CreatedKind;
+  id: string;
+  name: string;
+  // The org an API key belongs to; the org a sandbox or user was created in.
+  orgId?: string;
+}
 
 export interface SeedState {
   prefix: string;
@@ -24,6 +37,8 @@ export interface SeedState {
   users: Record<string, { id: string; org: string; role: string }>;
   apiKeys: Record<string, string>;
   sandboxes: Record<string, string>;
+  // Everything the seed and the loop created, in creation order.
+  created: CreatedObject[];
   notes: string[];
 }
 
@@ -33,16 +48,51 @@ export function seedStatePath(config: Config): string {
 
 export function readSeedState(config: Config): SeedState | null {
   const file = seedStatePath(config);
-  return fs.existsSync(file) ? (JSON.parse(fs.readFileSync(file, 'utf8')) as SeedState) : null;
+  if (!fs.existsSync(file)) return null;
+  const state = JSON.parse(fs.readFileSync(file, 'utf8')) as SeedState;
+  state.created ??= [];
+  return state;
+}
+
+export function writeSeedState(config: Config, state: SeedState): void {
+  fs.mkdirSync(config.outDir, { recursive: true });
+  const file = seedStatePath(config);
+  fs.writeFileSync(`${file}.tmp`, JSON.stringify(state, null, 2), { mode: 0o600 });
+  fs.renameSync(`${file}.tmp`, file);
+}
+
+// Record an object the loop created, so `npm run clean` can remove it if the
+// step that created it did not get to delete it.
+export function recordCreated(config: Config, object: CreatedObject): void {
+  const state = readSeedState(config);
+  if (!state) return;
+  if (!state.created.some((o) => o.kind === object.kind && o.id === object.id)) state.created.push(object);
+  writeSeedState(config, state);
 }
 
 interface Org { id: string; name: string; slug: string; parent_id: string | null }
 interface User { id: string; email: string }
 interface ApiKey { id: string; name: string }
-interface AdminSandbox { id: string; name: string | null; status: string | null; org_id: string | null }
+interface AdminSandbox { id: string; name: string | null; status: string | null; org_id: string | null; resource_type?: string }
+
+// The admin sandbox list has no cursor; past this many rows it cannot prove
+// that a sandbox is absent.
+const LIST_LIMIT = 5000;
 
 const log = (message: string) => console.log(`[seed] ${message}`);
 const publicId = (id: string) => (id.startsWith('sbx_') ? id : `sbx_${id}`);
+const isLive = (s: AdminSandbox) => !['deleted', 'deleting'].includes(s.status ?? '');
+
+// The sandboxes of one org whose name is `name`, or a loud failure when the
+// org has too many sandboxes to tell.
+async function findSandboxesByName(api: Api, orgId: string, name: string): Promise<AdminSandbox[]> {
+  const rows = await api.admin<AdminSandbox[]>('GET', `/sandboxes?org_id=${orgId}&limit=${LIST_LIMIT}`);
+  const found = rows.filter((s) => s.name === name && isLive(s));
+  if (!found.length && rows.filter((s) => s.resource_type === undefined || s.resource_type === 'sandbox').length >= LIST_LIMIT) {
+    throw new Error(`org ${orgId} has at least ${LIST_LIMIT} sandboxes, so the admin list cannot show whether ${name} exists`);
+  }
+  return found;
+}
 
 class Seeder {
   private readonly api: Api;
@@ -63,6 +113,7 @@ class Seeder {
       users: {},
       apiKeys: {},
       sandboxes: {},
+      created: [],
       notes: [],
     };
   }
@@ -76,11 +127,13 @@ class Seeder {
     if (!this.state.notes.includes(text)) this.state.notes.push(text);
   }
 
+  private record(object: CreatedObject): void {
+    if (!this.state.created.some((o) => o.kind === object.kind && o.id === object.id)) this.state.created.push(object);
+    this.save();
+  }
+
   save(): void {
-    fs.mkdirSync(this.config.outDir, { recursive: true });
-    const file = seedStatePath(this.config);
-    fs.writeFileSync(`${file}.tmp`, JSON.stringify(this.state, null, 2), { mode: 0o600 });
-    fs.renameSync(`${file}.tmp`, file);
+    writeSeedState(this.config, this.state);
   }
 
   async orgs(): Promise<void> {
@@ -88,20 +141,24 @@ class Seeder {
     this.state.managingOrgId = cluster.managing_org_id;
     this.state.orgs.managing = cluster.managing_org_id;
     const bySlug = new Map((await this.api.admin<Org[]>('GET', '/orgs')).map((org) => [org.slug, org]));
-    // Two tenant orgs, one with a child org.
+    // Two tenant orgs, one with a child org. Display names carry the prefix,
+    // so runs under two prefixes on one stack never pick each other's orgs.
     for (const [key, title, parent] of [
-      ['acme', 'Acme (synthetic)', null],
-      ['globex', 'Globex (synthetic)', null],
-      ['globex-research', 'Globex Research (synthetic)', 'globex'],
+      ['acme', 'Acme', null],
+      ['globex', 'Globex', null],
+      ['globex-research', 'Globex Research', 'globex'],
     ] as const) {
       const slug = this.name(key);
       let org = bySlug.get(slug);
       if (!org) {
         const parentId = parent ? this.state.orgs[parent] : null;
-        org = await this.api.admin<Org>('POST', '/orgs', { name: title, slug, parent_id: parentId });
+        org = await this.api.admin<Org>('POST', '/orgs', { name: orgDisplayName(this.config.prefix, title), slug, parent_id: parentId });
         bySlug.set(slug, org);
         log(`created org ${slug}`);
       }
+      // A reused org carries the prefix, so it is this seed's too (cleanup
+      // still refuses it while it holds anything unrecorded).
+      this.record({ kind: 'org', id: org.id, name: slug });
       this.state.orgs[key] = org.id;
     }
   }
@@ -122,11 +179,13 @@ class Seeder {
         email, password: this.state.userPassword, display_name: displayName, role,
       }));
       if (!existing) {
+        this.record({ kind: 'user', id: user.id, name: email, orgId });
         log(`created user ${email}`);
       } else if (!this.state.users[email]) {
         // Reused from an earlier seed whose state is gone: give it the
         // password this state records, so the role steps can sign in.
         await this.api.admin('PATCH', `/users/${user.id}`, { password: this.state.userPassword });
+        this.record({ kind: 'user', id: user.id, name: email, orgId });
       }
       this.state.users[email] = { id: user.id, org, role };
     }
@@ -141,15 +200,13 @@ class Seeder {
       const name = this.name(suffix);
       let key = keys.get(name);
       if (!key) {
+        // The response carries the key's secret; it is not kept.
         key = (await this.api.admin<{ api_key: ApiKey }>('POST', `/orgs/${orgId}/api-keys`, { name, allowed_surfaces: surfaces })).api_key;
         log(`created API key ${name}`);
       }
+      this.record({ kind: 'apiKey', id: key.id, name, orgId });
       this.state.apiKeys[suffix] = key.id;
     }
-  }
-
-  private async adminSandboxes(): Promise<AdminSandbox[]> {
-    return this.api.admin<AdminSandbox[]>('GET', '/sandboxes?limit=5000');
   }
 
   private async waitFor(id: string, states: string[], timeoutMs = 300_000): Promise<string> {
@@ -164,27 +221,37 @@ class Seeder {
   }
 
   private async create(name: string, org: string): Promise<string> {
-    const live = (await this.adminSandboxes()).find((s) => s.name === name && !['deleted', 'deleting'].includes(s.status ?? ''));
-    if (live) return publicId(live.id);
+    const orgId = this.state.orgs[org];
+    const existing = await findSandboxesByName(this.api, orgId, name);
+    if (existing.length > 1) this.note(`${existing.length} live sandboxes are named ${name}; using the first`);
+    if (existing.length) {
+      const id = publicId(existing[0].id);
+      this.record({ kind: 'sandbox', id, name, orgId });
+      return id;
+    }
     const sandbox = { template: this.template, runtime: 'fc', name };
     let accepted: { operation_id: string; sandbox_id?: string };
     let op: Operation;
     if (org === 'managing') {
       accepted = await this.api.public('POST', '/sandboxes', sandbox, { idempotent: true, timeoutMs: 120_000 });
-      op = await this.api.waitForOperation(accepted.operation_id);
     } else {
-      accepted = await this.api.admin('POST', '/sandboxes', { org_id: this.state.orgs[org], sandbox }, { idempotent: true, timeoutMs: 120_000 });
-      op = await this.api.waitForOperation(accepted.operation_id, { admin: true });
+      accepted = await this.api.admin('POST', '/sandboxes', { org_id: orgId, sandbox }, { idempotent: true, timeoutMs: 120_000 });
     }
+    // Record the sandbox before waiting: an interrupted wait must not leave
+    // an unrecorded sandbox behind.
+    if (accepted.sandbox_id) this.record({ kind: 'sandbox', id: publicId(accepted.sandbox_id), name, orgId });
+    op = await this.api.waitForOperation(accepted.operation_id, { admin: org !== 'managing' });
+    const id = publicId(accepted.sandbox_id ?? op.target_id ?? '');
+    this.record({ kind: 'sandbox', id, name, orgId });
     if (op.state !== 'succeeded') this.note(`create ${name}: operation ${op.state} ${op.progress_message ?? ''}`);
     log(`created sandbox ${name}`);
-    return publicId(accepted.sandbox_id ?? op.target_id ?? '');
+    return id;
   }
 
   private async act(id: string, action: string): Promise<void> {
     const accepted = await this.api.admin<{ operation_id: string }>('POST', `/sandboxes/${id}:force-${action}`, undefined, { idempotent: true, timeoutMs: 120_000 });
     const op = await this.api.waitForOperation(accepted.operation_id, { admin: true });
-    if (op.state !== 'succeeded') this.note(`${action} ${id}: operation ${op.state} ${op.progress_message ?? ''}`);
+    if (op.state !== 'succeeded') throw new Error(`${action} ${id}: operation ${op.state} ${op.progress_message ?? ''}`);
   }
 
   // One sandbox per resting state, one in a tenant org, and one deleted (its
@@ -226,6 +293,22 @@ class Seeder {
     }
   }
 
+  // Every recorded fixture must still exist, looked up by its ID.
+  async verify(): Promise<void> {
+    const missing: string[] = [];
+    for (const [key, id] of Object.entries(this.state.orgs)) {
+      await this.api.admin('GET', `/orgs/${id}`).catch(() => missing.push(`org ${key}`));
+    }
+    for (const [email, user] of Object.entries(this.state.users)) {
+      await this.api.admin('GET', `/users/${user.id}`).catch(() => missing.push(`user ${email}`));
+    }
+    for (const [key, id] of Object.entries(this.state.sandboxes)) {
+      if (key === 'deleted') continue;
+      await this.api.admin('GET', `/sandboxes/${id}`).catch(() => missing.push(`sandbox ${key}`));
+    }
+    if (missing.length) throw new Error(`seeded fixtures are missing: ${missing.join(', ')}`);
+  }
+
   async run(skipSandboxes: boolean): Promise<SeedState> {
     for (const step of [() => this.orgs(), () => this.users(), () => this.apiKeys()]) {
       await step();
@@ -233,68 +316,112 @@ class Seeder {
     }
     if (!skipSandboxes) await this.sandboxes();
     this.save();
+    await this.verify();
     return this.state;
   }
 }
 
-// Delete everything named with the prefix: sandboxes, users, API keys, then
-// orgs (children before parents).
-async function clean(api: Api, config: Config): Promise<void> {
-  const prefix = `${config.prefix}-`;
-  const failures: string[] = [];
-  const attempt = async (what: string, run: () => Promise<unknown>) => {
-    try {
-      await run();
-      log(`deleted ${what}`);
-    } catch (err) {
-      failures.push(`${what}: ${err instanceof ApiError ? `${err.status} ${err.body.slice(0, 200)}` : String(err)}`);
-    }
-  };
-  const sandboxes = (await api.admin<AdminSandbox[]>('GET', '/sandboxes?limit=5000'))
-    .filter((s) => s.name?.startsWith(prefix) && !['deleted', 'deleting'].includes(s.status ?? ''));
-  for (const sandbox of sandboxes) {
-    await attempt(`sandbox ${sandbox.name}`, async () => {
-      const accepted = await api.admin<{ operation_id: string }>('POST', `/sandboxes/${publicId(sandbox.id)}:force-delete`, undefined, { idempotent: true });
-      await api.waitForOperation(accepted.operation_id, { admin: true });
-    });
-  }
-  const cluster = await api.admin<{ managing_org_id: string }>('GET', '/cluster');
-  const orgs = await api.admin<Org[]>('GET', '/orgs');
-  for (const org of orgs.filter((o) => o.id === cluster.managing_org_id || o.slug.startsWith(prefix))) {
-    for (const user of (await api.admin<User[]>('GET', `/orgs/${org.id}/users`)).filter((u) => u.email.startsWith(prefix))) {
-      await attempt(`user ${user.email}`, () => api.admin('DELETE', `/users/${user.id}`));
-    }
-  }
-  const keys = await api.admin<ApiKey[]>('GET', `/orgs/${cluster.managing_org_id}/api-keys`);
-  for (const key of keys.filter((k) => k.name.startsWith(prefix))) {
-    await attempt(`API key ${key.name}`, () => api.admin('DELETE', `/orgs/${cluster.managing_org_id}/api-keys/${key.id}`));
-  }
-  const ours = orgs.filter((o) => o.slug.startsWith(prefix));
-  const depth = (org: Org): number => (org.parent_id && ours.some((o) => o.id === org.parent_id) ? 1 + depth(ours.find((o) => o.id === org.parent_id)!) : 0);
-  for (const org of ours.sort((a, b) => depth(b) - depth(a))) {
-    await attempt(`org ${org.slug}`, () => api.admin('DELETE', `/orgs/${org.id}`));
-  }
-  fs.rmSync(seedStatePath(config), { force: true });
-  if (failures.length) {
-    for (const failure of failures) log(`could not delete ${failure}`);
-    process.exitCode = 1;
-  }
+export function orgDisplayName(prefix: string, title: string): string {
+  return `${title} (${prefix})`;
 }
 
-async function main(): Promise<void> {
+// Delete what the state recorded: sandboxes, then users and API keys, then
+// orgs, children first. An org is deleted only when it holds nothing the
+// state did not record; otherwise it is left, and reported.
+async function clean(api: Api, config: Config): Promise<number> {
+  const state = readSeedState(config);
+  if (!state) {
+    log(`nothing to clean: no ${seedStatePath(config)}`);
+    return 0;
+  }
+  const recorded = (kind: CreatedKind) => state.created.filter((o) => o.kind === kind);
+  const ids = new Set(state.created.map((o) => `${o.kind}:${o.id.replace(/^sbx_/, '')}`));
+  const isRecorded = (kind: CreatedKind, id: string) => ids.has(`${kind}:${id.replace(/^sbx_/, '')}`);
+  const failures: string[] = [];
+  const done = new Set<string>();
+  const attempt = async (object: CreatedObject, run: () => Promise<void>) => {
+    try {
+      await run();
+      done.add(`${object.kind}:${object.id}`);
+      log(`deleted ${object.kind} ${object.name}`);
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 404) {
+        done.add(`${object.kind}:${object.id}`);
+        log(`already gone: ${object.kind} ${object.name}`);
+        return;
+      }
+      failures.push(`${object.kind} ${object.name}: ${err instanceof ApiError ? `${err.status} ${err.body.slice(0, 200)}` : err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+
+  for (const sandbox of recorded('sandbox')) {
+    await attempt(sandbox, async () => {
+      const current = await api.admin<AdminSandbox>('GET', `/sandboxes/${publicId(sandbox.id)}`);
+      if (!isLive(current)) return;
+      const accepted = await api.admin<{ operation_id: string }>('POST', `/sandboxes/${publicId(sandbox.id)}:force-delete`, undefined, { idempotent: true });
+      const op = await api.waitForOperation(accepted.operation_id, { admin: true });
+      if (op.state !== 'succeeded') throw new Error(`delete operation ${op.state}${op.progress_message ? `: ${op.progress_message}` : ''}`);
+    });
+  }
+  for (const user of recorded('user')) {
+    await attempt(user, () => api.admin('DELETE', `/users/${user.id}`));
+  }
+  for (const key of recorded('apiKey')) {
+    await attempt(key, () => api.admin('DELETE', `/orgs/${key.orgId}/api-keys/${key.id}`));
+  }
+
+  const orgs = await api.admin<Org[]>('GET', '/orgs');
+  const ours = recorded('org');
+  const depth = (id: string): number => {
+    const parent = orgs.find((o) => o.id === id)?.parent_id;
+    return parent ? 1 + depth(parent) : 0;
+  };
+  for (const org of [...ours].sort((a, b) => depth(b.id) - depth(a.id))) {
+    await attempt(org, async () => {
+      const foreign: string[] = [];
+      for (const child of orgs.filter((o) => o.parent_id === org.id && !done.has(`org:${o.id}`))) foreign.push(`child org ${child.slug}`);
+      for (const user of await api.admin<User[]>('GET', `/orgs/${org.id}/users`)) {
+        if (!isRecorded('user', user.id) || !done.has(`user:${user.id}`)) foreign.push(`user ${user.email}`);
+      }
+      for (const key of await api.admin<ApiKey[]>('GET', `/orgs/${org.id}/api-keys`)) foreign.push(`API key ${key.name}`);
+      for (const sandbox of (await api.admin<AdminSandbox[]>('GET', `/sandboxes?org_id=${org.id}&limit=${LIST_LIMIT}`)).filter(isLive)) {
+        if (sandbox.org_id === org.id) foreign.push(`sandbox ${sandbox.name ?? sandbox.id}`);
+      }
+      if (foreign.length) throw new Error(`refused: it still holds ${foreign.join(', ')}`);
+      await api.admin('DELETE', `/orgs/${org.id}`);
+    });
+  }
+
+  const remaining = state.created.filter((o) => !done.has(`${o.kind}:${o.id}`));
+  if (!remaining.length) {
+    fs.rmSync(seedStatePath(config), { force: true });
+    log('everything recorded is deleted');
+  } else {
+    state.created = remaining;
+    writeSeedState(config, state);
+  }
+  for (const failure of failures) log(`NOT deleted: ${failure}`);
+  if (failures.length) log(`${failures.length} object(s) not deleted; still recorded in ${seedStatePath(config)}`);
+  return failures.length ? 1 : 0;
+}
+
+async function main(): Promise<number> {
   const args = process.argv.slice(2);
   const config = loadConfig(args);
+  const cleaning = flag(args, 'clean');
+  guardTargets(config, cleaning ? 'clean' : 'seed');
   const api = new Api(config);
   await api.signIn(config.email, config.password);
-  if (flag(args, 'clean')) return clean(api, config);
+  if (cleaning) return clean(api, config);
   const template = option(args, 'template', process.env.CONSOLE_LOOP_TEMPLATE ?? 'seed:latest')!;
   const state = await new Seeder(api, config, template).run(flag(args, 'skip-sandboxes'));
-  log(`seeded under "${state.prefix}"; state in ${path.relative(process.cwd(), seedStatePath(config)) || seedStatePath(config)}`);
+  log(`seeded under "${state.prefix}"; state in ${seedStatePath(config)}`);
   for (const note of state.notes) log(`note: ${note}`);
+  return 0;
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
-  main().catch((err) => {
+  main().then((code) => process.exit(code), (err) => {
     console.error(err instanceof Error ? err.message : err);
     process.exit(2);
   });

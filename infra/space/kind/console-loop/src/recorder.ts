@@ -38,6 +38,10 @@ export interface StepResult {
 }
 
 const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+// An API key's secret is 64 hex characters; nothing of that shape is ever
+// written to a run directory.
+const SECRET = /\b[0-9a-f]{64}\b/gi;
+export const redact = (value: string): string => value.replace(SECRET, '<redacted>');
 
 export function normalizer(prefix: string): (value: string) => string {
   const seeded = new RegExp(`${prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}-[a-z0-9-]+`, 'g');
@@ -49,10 +53,21 @@ export function normalizer(prefix: string): (value: string) => string {
     .replace(seeded, '<seeded>');
 }
 
+// Development-build warnings that a production build does not print: React
+// 19 logs its development warnings with console.error, as format strings
+// whose `%s` placeholders reach the console unformatted, and antd logs its
+// deprecation warnings as "Warning: [antd: …]". Any other console error,
+// including React errors without placeholders, is a `console` event.
+export function isDevWarning(text: string): boolean {
+  return /^Warning: /.test(text) || /%[sdo]/.test(text);
+}
+
 export class Recorder {
   private events: StepEvent[] = [];
   private notes: string[] = [];
   private readonly started = new Map<Request, number>();
+  // The step during which each request was issued.
+  private readonly issuedBy = new Map<Request, string>();
   private stepName = '';
   private pending: Promise<unknown>[] = [];
   private readonly page: Page;
@@ -72,18 +87,22 @@ export class Recorder {
       // Chrome echoes every failed request as a console error; the http
       // event already carries it, with its body.
       if (/^Failed to load resource: the server responded with a status of/.test(text)) return;
-      const kind: EventKind = /^Warning: |React does not recognize|^Each child in a list/.test(text) ? 'devwarn' : 'console';
+      const kind: EventKind = isDevWarning(text) ? 'devwarn' : 'console';
       this.add({ kind, message: text.slice(0, 600), signature: `${kind}|${this.normalize(text).slice(0, 160)}` });
     });
     page.on('pageerror', (err) => {
       // A minified error class's name changes between builds; its message does not.
       this.add({ kind: 'pageerror', message: `${err.name}: ${err.message}`.slice(0, 600), signature: `pageerror|${this.normalize(err.message).slice(0, 160)}` });
     });
-    page.on('request', (req) => this.started.set(req, Date.now()));
+    page.on('request', (req) => {
+      this.started.set(req, Date.now());
+      this.issuedBy.set(req, this.stepName);
+    });
     page.on('requestfailed', (req) => {
       const failure = req.failure()?.errorText ?? 'failed';
       // Requests cut off by a navigation are expected.
       if (failure === 'net::ERR_ABORTED') return;
+      if (this.late(req, `${req.method()} ${req.url()} failed: ${failure}`)) return;
       this.add({ kind: 'netfail', message: `${req.method()} ${req.url()}: ${failure}`, url: req.url(), signature: `netfail|${req.method()} ${this.pathOf(req.url())}|${failure}` });
     });
     page.on('response', (res) => this.pending.push(this.onResponse(res)));
@@ -98,9 +117,20 @@ export class Recorder {
     }
   }
 
+  // A response or failure of a request an earlier step issued belongs to
+  // that step, which has already been written: note it here instead of
+  // counting it against this step.
+  private late(req: Request, what: string): boolean {
+    const issuer = this.issuedBy.get(req);
+    if (issuer === undefined || issuer === this.stepName) return false;
+    this.notes.push(redact(`late, from step ${issuer || '(before the first step)'}: ${what}`));
+    return true;
+  }
+
   private async onResponse(res: Response): Promise<void> {
     if (res.headers()[SYNTHETIC_HEADER]) return;
     const req = res.request();
+    if (res.status() >= 400 && this.late(req, `${req.method()} ${res.url()} -> ${res.status()}`)) return;
     const startedAt = this.started.get(req);
     const status = res.status();
     if (status >= 400) {
@@ -115,23 +145,30 @@ export class Recorder {
     // Long-lived streams and React Server Component fetches are not requests
     // an operator waits on.
     if (durationMs >= this.slowMs && ['fetch', 'xhr', 'document'].includes(type) && !/\/events(\?|$)|\/attach|metrics-stream|[?&]_rsc=/.test(res.url())) {
+      if (this.late(req, `${req.method()} ${res.url()} took ${durationMs} ms`)) return;
       this.add({ kind: 'slow', message: `${req.method()} ${res.url()} took ${durationMs} ms`, url: res.url(), status, durationMs, signature: `slow|${req.method()} ${this.pathOf(res.url())}` });
     }
   }
 
   add(event: StepEvent): void {
-    this.events.push({ ...event, signature: `${this.stepName}|${event.signature}` });
+    this.events.push({
+      ...event,
+      message: redact(event.message),
+      body: event.body === undefined ? undefined : redact(event.body),
+      url: event.url === undefined ? undefined : redact(event.url),
+      signature: `${this.stepName}|${redact(event.signature)}`,
+    });
   }
 
   // A failed check is an event; a passed one is a note in the summary.
   check(ok: boolean, message: string): void {
     // Counts in a message vary with the data; the check's identity does not.
-    if (ok) this.notes.push(`ok: ${message}`);
+    if (ok) this.notes.push(redact(`ok: ${message}`));
     else this.add({ kind: 'check', message, signature: `check|${this.normalize(message).replace(/\d+/g, '<n>').replace(/\([^)]*\)/g, '(…)').slice(0, 160)}` });
   }
 
   note(message: string): void {
-    this.notes.push(message);
+    this.notes.push(redact(message));
   }
 
   begin(name: string): void {
