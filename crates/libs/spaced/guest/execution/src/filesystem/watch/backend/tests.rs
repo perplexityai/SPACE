@@ -282,6 +282,9 @@ async fn nested_watchers_keep_their_own_relative_paths_and_excludes() {
                     consumers: Default::default(),
                     directory_count: 1,
                     discovering: false,
+                    unwatched: Default::default(),
+                    unwatched_truncated: false,
+                    unlisted: Default::default(),
                     shutdown: CancellationToken::new(),
                 },
             );
@@ -444,6 +447,7 @@ async fn removal_invalidation_retains_only_bounded_scan_roots() {
             Ok(DirectoryScanResult {
                 directories: Vec::new(),
                 skipped: Vec::new(),
+                skipped_truncated: false,
                 incomplete: false,
             })
         }),
@@ -556,6 +560,7 @@ async fn moved_subtrees_wait_for_admission_while_existing_events_progress() {
                         root: root.clone(),
                         descendants: vec![],
                         skipped: vec![],
+                        skipped_truncated: false,
                     },
                     tokio_util::task::TaskTracker::new(),
                 )
@@ -579,6 +584,7 @@ async fn moved_subtrees_wait_for_admission_while_existing_events_progress() {
                     }
                 }
             },
+            |_| std::future::ready(true),
             scan_spawner,
         );
 
@@ -683,6 +689,7 @@ async fn registration_does_not_follow_directory_symlinks() {
             root: root.clone(),
             descendants: vec![],
             skipped: vec![],
+            skipped_truncated: false,
         },
         tokio_util::task::TaskTracker::new(),
     )
@@ -727,6 +734,7 @@ async fn failed_registration_and_cancelled_operation_retain_physical_admission()
             root: directory.path().to_path_buf(),
             descendants: vec![],
             skipped: vec![],
+            skipped_truncated: false,
         },
         tasks.clone(),
     )
@@ -869,6 +877,7 @@ async fn verification_root_loss_is_terminal_without_a_backend_event() {
                 );
                 async { DirectoryAdjustment::Applied }
             },
+            |_| std::future::ready(true),
         );
         let status = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
             .await
@@ -967,6 +976,7 @@ async fn registration_skips_a_descendant_that_turned_unreadable_after_planning()
             root: root.clone(),
             descendants: vec![locked.clone()],
             skipped: vec![],
+            skipped_truncated: false,
         },
         tokio_util::task::TaskTracker::new(),
     )
@@ -978,8 +988,222 @@ async fn registration_skips_a_descendant_that_turned_unreadable_after_planning()
     // It was refused for its own mode, so it alone is remembered: a permission
     // change on it is what brings it back.
     assert_eq!(registration.skipped, vec![locked.clone()]);
+    assert!(registration.blocking_ancestors.is_empty());
     assert_eq!(registration.directory_count(), 1);
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
 
 mod recovery;
+
+#[test]
+fn skipped_directories_report_the_net_coverage_change_of_each_step() {
+    let root = PathBuf::from("/watched");
+    let set = |paths: &[&str]| {
+        paths
+            .iter()
+            .map(|path| root.join(path))
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let metadata = Event::new(EventKind::Modify(ModifyKind::Metadata(
+        notify::event::MetadataKind::Any,
+    )))
+    .add_path(root.join("a"));
+    let mut skipped = SkippedDirectories::default();
+    assert_eq!(skipped.take_changes(), None);
+
+    skipped.remember([root.join("a"), root.join("b/c"), root.join("d")]);
+    let change = skipped.take_changes().expect("new skips");
+    assert_eq!(change.unwatched, set(&["a", "b/c", "d"]));
+
+    // Being walked again isn't coverage, and a walk refused again changes
+    // nothing. Neither is a skip that is watched and refused within one step,
+    // as a listable directory whose entries can't be inspected is.
+    assert_eq!(skipped.take_hits(&metadata), vec![root.join("a")]);
+    skipped.remember([root.join("a")]);
+    skipped.forget(&[root.join("d")]);
+    skipped.remember([root.join("d")]);
+    assert_eq!(skipped.take_changes(), None);
+
+    // A skip that is watched again ends, and so does one removed with an
+    // ancestor; a removal elsewhere changes nothing.
+    skipped.forget(&[root.join("a")]);
+    skipped.forget_descendants(&[root.join("b"), root.join("bb")]);
+    let change = skipped.take_changes().expect("coverage change");
+    assert_eq!(change.rewatched, set(&["a", "b/c"]));
+    assert!(change.unwatched.is_empty() && !change.truncated);
+    skipped.forget_descendants(&[root.join("elsewhere")]);
+    assert_eq!(skipped.take_changes(), None);
+
+    // A directory kept only to recover another is walked again on its next
+    // permission change, but is never reported, even when it doesn't fit the
+    // recheck queue and is kept again.
+    let parent = Event::new(EventKind::Modify(ModifyKind::Metadata(
+        notify::event::MetadataKind::Any,
+    )))
+    .add_path(root.join("parent"));
+    skipped.remember_for_recovery([root.join("parent")]);
+    assert_eq!(skipped.take_hits(&parent), vec![root.join("parent")]);
+    skipped.remember_for_recovery([root.join("parent")]);
+    assert_eq!(skipped.take_changes(), None);
+    assert_eq!(skipped.take_hits(&parent), vec![root.join("parent")]);
+
+    // A skip that ends within the step it began in is never reported.
+    skipped.remember([root.join("e")]);
+    skipped.forget(&[root.join("e")]);
+    assert_eq!(skipped.take_changes(), None);
+
+    // A walk that found more skips than it kept says so once.
+    skipped.note_truncated();
+    assert!(skipped.take_changes().expect("truncation").truncated);
+    skipped.note_truncated();
+    assert_eq!(skipped.take_changes(), None);
+    skipped.incomplete = false;
+
+    // Past the cap the change says what it couldn't report.
+    skipped.remember((0..MAX_SKIPPED_DIRECTORIES).map(|index| root.join(index.to_string())));
+    let change = skipped.take_changes().expect("new skips");
+    assert_eq!(change.unwatched.len(), MAX_SKIPPED_DIRECTORIES - 1);
+    assert!(change.truncated);
+}
+
+#[tokio::test]
+async fn a_root_that_turned_unreadable_is_reported_as_an_incomplete_list() {
+    let root = PathBuf::from("/watched");
+    let mut skipped = SkippedDirectories::default();
+    skipped.remember([root.clone(), root.join("a"), PathBuf::from("/elsewhere")]);
+    let mut reported = None;
+    assert!(
+        report_coverage(&root, &mut skipped, &mut |change| {
+            reported = Some(change);
+            std::future::ready(true)
+        })
+        .await
+    );
+    let change = reported.expect("coverage changed");
+    assert_eq!(
+        change.unwatched,
+        std::collections::BTreeSet::from([root.join("a")])
+    );
+    assert!(change.truncated);
+    // A walk that claims a complete list while the root is still skipped,
+    // such as one whose results were dropped, leaves the list incomplete.
+    skipped.note_complete();
+    let mut reported = None;
+    report_coverage(&root, &mut skipped, &mut |change| {
+        reported = Some(change);
+        std::future::ready(true)
+    })
+    .await;
+    let change = reported.expect("the list is marked incomplete again");
+    assert!(change.truncated && !change.complete);
+    assert!(skipped.incomplete);
+    // Coming back asks for a rescan of the whole watch, but doesn't end the
+    // incomplete list: skips under it may still be missing.
+    skipped.forget(std::slice::from_ref(&root));
+    let mut reported = None;
+    report_coverage(&root, &mut skipped, &mut |change| {
+        reported = Some(change);
+        std::future::ready(true)
+    })
+    .await;
+    let change = reported.expect("the root returned");
+    assert_eq!(change.rewatched, std::collections::BTreeSet::from([root]));
+    assert!(!change.truncated && !change.complete);
+    assert!(skipped.incomplete);
+}
+
+#[test]
+fn a_reported_skip_stays_listed_when_its_recovery_cant_be_kept() {
+    let root = PathBuf::from("/watched");
+    let mut skipped = SkippedDirectories::default();
+    // Ancestors kept only for recovery fill the recovery budget.
+    skipped.remember_for_recovery(
+        (0..MAX_SKIPPED_DIRECTORIES).map(|index| root.join(format!("ancestor-{index}"))),
+    );
+    assert_eq!(skipped.take_changes(), None);
+    // Nothing walks the new skip again, so it stays unwatched: listing it is
+    // accurate, and the list stays complete.
+    skipped.remember([root.join("refused")]);
+    let change = skipped.take_changes().expect("a new skip");
+    assert_eq!(
+        change.unwatched,
+        std::collections::BTreeSet::from([root.join("refused")])
+    );
+    assert!(!change.truncated);
+    assert!(skipped.overflowed);
+}
+
+#[test]
+fn the_root_is_tracked_past_the_cap_on_reported_skips() {
+    let root = PathBuf::from("/watched");
+    let mut skipped = SkippedDirectories::for_root(root.clone());
+    skipped.remember((0..MAX_SKIPPED_DIRECTORIES).map(|index| root.join(index.to_string())));
+    skipped.take_changes();
+    // Its return is the only cue to rescan everything, so a full list
+    // doesn't hide the root turning unreadable.
+    skipped.remember([root.clone()]);
+    assert!(skipped.unwatched.contains(&root));
+    skipped.take_changes();
+    skipped.forget(std::slice::from_ref(&root));
+    assert_eq!(
+        skipped.take_changes().expect("the root returned").rewatched,
+        std::collections::BTreeSet::from([root])
+    );
+}
+
+// Unit-level: recording the root through a permission change on it first takes
+// every remembered skip under it, so the recovery set can't then be full; this
+// covers a root refused without such an event, as by a security-policy change.
+#[test]
+fn the_root_is_kept_for_recovery_when_the_recovery_set_is_full() {
+    let root = PathBuf::from("/watched");
+    let mut skipped = SkippedDirectories::for_root(root.clone());
+    skipped.remember((0..MAX_SKIPPED_DIRECTORIES).map(|index| root.join(index.to_string())));
+    assert!(!skipped.has_room_for(&root.join("one-more")));
+    skipped.remember([root.clone()]);
+    // A permission change on the root walks it again.
+    let chmod = Event::new(EventKind::Modify(ModifyKind::Metadata(
+        notify::event::MetadataKind::Any,
+    )))
+    .add_path(root.clone());
+    assert!(skipped.take_hits(&chmod).contains(&root));
+}
+
+// Many new directories under one unsearchable directory each name it as the
+// blocking ancestor; that's one skip, so it must not leave the scan without
+// room for a real one and mark the whole watch's list incomplete.
+#[cfg(target_os = "linux")]
+#[test]
+fn repeats_of_one_blocking_ancestor_leave_room_for_other_skips() {
+    use std::os::unix::fs::PermissionsExt;
+    if !pplx_space_test_env::unprivileged_or_skip("be refused an unreadable directory") {
+        return;
+    }
+    let mode = |path: &Path, mode| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    let temp_dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(temp_dir.path()).unwrap();
+    let blocked = root.join("blocked");
+    let mut candidates = (0..MAX_SKIPPED_DIRECTORIES)
+        .map(|index| blocked.join(index.to_string()))
+        .collect::<BTreeSet<_>>();
+    for candidate in &candidates {
+        std::fs::create_dir_all(candidate).unwrap();
+    }
+    let locked = root.join("other/locked");
+    std::fs::create_dir_all(&locked).unwrap();
+    candidates.insert(root.join("other"));
+    mode(&locked, 0o000);
+    mode(&blocked, 0o600);
+    let filter = WatchFilter::compile(
+        super::super::filter::WatchFilterConfig::new(Vec::new(), Vec::new(), false).unwrap(),
+    )
+    .unwrap();
+    let scan = scan_directory_candidates(&root, &filter, &candidates);
+    mode(&blocked, 0o700);
+    mode(&locked, 0o700);
+    let scan = scan.unwrap();
+    assert_eq!(scan.skipped, vec![blocked, locked]);
+    assert!(!scan.skipped_truncated);
+}

@@ -1,4 +1,5 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -12,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use tonic::Status;
 
 use super::metadata::path_to_string;
-use backend::{NotifyTaskConfig, RegisteredWatch, spawn_notify_task};
+use backend::{CoverageChange, NotifyTaskConfig, RegisteredWatch, spawn_notify_task};
 use event::{WatchEvent, WatchPathEncoding};
 pub(super) use filter::parse_watch_globs;
 use filter::{WatchFilter, WatchFilterConfig};
@@ -46,6 +47,10 @@ const MAX_WATCHED_DIRECTORIES: usize = 16_384;
 // Skipped directories are remembered so a permission change on one brings its
 // subtree into the watch. Past this bound, further skips are not remembered.
 const MAX_SKIPPED_DIRECTORIES: usize = 4_096;
+// Unwatched paths listed in one GetModifiedFiles response. Each can be a
+// maximal path, so they take about 1 MiB; with the ledger's own 1 MiB that
+// leaves the response well inside the filesystem service's 4 MiB limit.
+const MAX_REPORTED_UNWATCHED_PATHS: usize = 256;
 // Keep burst capacity for small events, but cap path payloads independently.
 // Overflow is explicit and requires the caller to rescan.
 const STREAM_BUFFER_CAPACITY: usize = 1024;
@@ -210,6 +215,7 @@ impl WatchManager {
                 .roots
                 .get_mut(&reference.root)
                 .ok_or_else(|| Status::not_found("watcher not found"))?;
+            let (unwatched, unwatched_truncated) = (&root.unwatched, root.coverage_incomplete());
             let consumer = root
                 .consumers
                 .get_mut(&reference.consumer_id)
@@ -234,6 +240,12 @@ impl WatchManager {
                 if *overflowed {
                     events.clear();
                     *overflowed = false;
+                    // The rescan this asks for can't see what is still
+                    // unwatched; the next poll says so first.
+                    for event in coverage_seed(&reference.root.root, unwatched, unwatched_truncated)
+                    {
+                        queue_pull_event(events, retained_bytes, overflowed, &event);
+                    }
                     Err(Status::resource_exhausted(
                         "watcher event history is incomplete",
                     ))
@@ -415,20 +427,19 @@ impl WatchManager {
         }
 
         let mut state = self.inner.lock().await;
+        let state = &mut *state;
         let discovering = matches!(&state.ledger, LedgerState::Active(ledger)
             if ledger.root_consumers.iter().any(|reference| state.roots.get(&reference.root).is_some_and(|root| root.discovering)));
         let LedgerState::Active(ledger) = &mut state.ledger else {
             return Ok(GetModifiedFilesResponse {
-                files: Vec::new(),
-                observed_since: None,
-                retained_since: None,
-                cursor: None,
-                monitoring_enabled: false,
                 overflowed: matches!(state.ledger, LedgerState::Lost),
+                ..Default::default()
             });
         };
         let mut response = ledger.modified_files_response(request)?;
         response.overflowed |= discovering;
+        (response.unwatched_paths, response.unwatched_paths_truncated) =
+            ledger_unwatched_paths(&state.roots, &ledger.root_consumers);
         Ok(response)
     }
 
@@ -507,6 +518,8 @@ impl WatchManager {
         let task_key = backend_key.clone();
         let directory_manager = self.clone();
         let directory_task_key = backend_key.clone();
+        let coverage_manager = self.clone();
+        let coverage_task_key = backend_key.clone();
         spawn_notify_task(
             NotifyTaskConfig {
                 tasks: self.tasks.clone(),
@@ -551,6 +564,15 @@ impl WatchManager {
                         .await
                 }
             },
+            move |change| {
+                let manager = coverage_manager.clone();
+                let task_key = coverage_task_key.clone();
+                async move {
+                    manager
+                        .apply_root_coverage(&task_key, generation, change)
+                        .await
+                }
+            },
         );
         state.roots.insert(
             backend_key.clone(),
@@ -559,6 +581,9 @@ impl WatchManager {
                 consumers: HashMap::new(),
                 directory_count,
                 discovering: backend_key.recursive,
+                unwatched: BTreeSet::new(),
+                unwatched_truncated: false,
+                unlisted: BTreeSet::new(),
                 shutdown,
             },
         );
@@ -593,6 +618,171 @@ impl WatchManager {
             }
         }
         result
+    }
+
+    /// Records a root's coverage change and reports it to every consumer of
+    /// the root, whatever its globs select: a skipped directory hides files
+    /// any of them may match. The ledger reads coverage from the root instead.
+    /// The record and the choice of consumers share one critical section, so
+    /// a consumer that joins meanwhile is told about a skip exactly once:
+    /// before it's seeded, or after.
+    async fn apply_root_coverage(
+        &self,
+        key: &WatchRootKey,
+        generation: WatchRootGeneration,
+        change: CoverageChange,
+    ) -> bool {
+        let CoverageChange {
+            unwatched,
+            rewatched,
+            truncated,
+            complete,
+        } = change;
+        let observed_unix_ms = now_unix_ms().unwrap_or_default();
+        let mut state = self.inner.lock().await;
+        if root_for_backend_mut(&mut state, key, generation).is_none() {
+            return false;
+        }
+        let root = root_for_backend_mut(&mut state, key, generation)
+            .expect("root generation checked while holding watch state lock");
+        let was_truncated = root.coverage_incomplete();
+        // A clean, complete walk of the root lists every skip again; what the
+        // same step found it couldn't report sets the flag again below.
+        if complete {
+            root.unwatched_truncated = false;
+        }
+        root.unwatched_truncated |= truncated;
+        for path in &rewatched {
+            root.unwatched.remove(path);
+            root.unlisted.remove(path);
+        }
+        // Rewatches have a budget of their own, so they never crowd out new
+        // skips; past it, one rescan of the whole watch stands in for them.
+        let mut rewatches = budgeted_rewatches(&key.root, &rewatched, observed_unix_ms);
+        // The root's own return is a rescan of the whole watch too.
+        let mut rescan_all = rewatches
+            .iter()
+            .any(|event| event.relative_path() == Path::new("."));
+        let mut new_skips = Vec::new();
+        for path in unwatched {
+            match coverage_event(&key.root, &path, FileEventKind::Unwatched, observed_unix_ms) {
+                Some(event) => {
+                    root.unwatched.insert(path);
+                    new_skips.push(event);
+                }
+                // A skip the wire can't name leaves the list incomplete.
+                None => {
+                    root.unlisted.insert(path);
+                }
+            }
+        }
+        // A list that turns complete is restated with a rescan of the whole
+        // watch: skips it didn't name may have ended while it was incomplete.
+        let restated = was_truncated && !root.coverage_incomplete();
+        if restated && !rescan_all {
+            rescan_all = true;
+            rewatches.push(WatchEvent::new(
+                key.root.clone(),
+                PathBuf::from("."),
+                FileEventKind::Rewatched,
+                observed_unix_ms,
+            ));
+        }
+        let events = if rescan_all {
+            // A consumer told to rescan everything can't tell which skips
+            // remain, so it's told them all again, as a joining one is.
+            let mut events = rewatches;
+            events.extend(coverage_seed(
+                &key.root,
+                &root.unwatched,
+                root.coverage_incomplete(),
+            ));
+            events
+        } else {
+            let mut batch = CoverageBatch::new(&key.root, observed_unix_ms);
+            for event in rewatches {
+                batch.push_unbudgeted(event);
+            }
+            for event in new_skips {
+                batch.push(event);
+            }
+            if root.coverage_incomplete() && !was_truncated {
+                batch.mark_incomplete();
+            }
+            // A batch past its budget tells only these consumers that their
+            // list is incomplete; the root's own list, which the ledger and
+            // later seeds read, stays whole.
+            batch.finish()
+        };
+        let mut stream_targets = Vec::new();
+        for (consumer_id, consumer) in &mut root.consumers {
+            match consumer {
+                WatchConsumer::Stream {
+                    tx,
+                    bytes,
+                    shutdown,
+                    ..
+                } => {
+                    stream_targets.push((*consumer_id, tx.clone(), shutdown.clone(), bytes.clone()))
+                }
+                WatchConsumer::Pull {
+                    events: queue,
+                    retained_bytes,
+                    overflowed,
+                    ..
+                } => {
+                    for event in &events {
+                        queue_pull_event(queue, retained_bytes, overflowed, event);
+                    }
+                }
+                WatchConsumer::Ledger { .. } => {}
+            }
+        }
+        // Changes made while a skip lasted weren't recorded, however it ended:
+        // a removal or rename away walks nothing, so discovery records no loss.
+        if (!rewatched.is_empty() || restated)
+            && let LedgerState::Active(ledger) = &mut state.ledger
+            && ledger
+                .root_consumers
+                .iter()
+                .any(|reference| &reference.root == key)
+        {
+            ledger.record_loss(observed_unix_ms);
+        }
+        drop(state);
+
+        let failed = stream_targets
+            .into_iter()
+            .filter(|(_, tx, shutdown, bytes)| {
+                !events
+                    .iter()
+                    .all(|event| send_stream_event(&self.tasks, tx, shutdown, bytes, event))
+            })
+            .map(|(consumer_id, ..)| consumer_id)
+            .collect::<Vec<_>>();
+        self.remove_failed_consumers(key, generation, failed).await;
+        true
+    }
+
+    async fn remove_failed_consumers(
+        &self,
+        key: &WatchRootKey,
+        generation: WatchRootGeneration,
+        consumer_ids: Vec<u64>,
+    ) {
+        if consumer_ids.is_empty() {
+            return;
+        }
+        let mut state = self.inner.lock().await;
+        let mut root_shutdown = None;
+        if root_for_backend_mut(&mut state, key, generation).is_some() {
+            for consumer_id in consumer_ids {
+                root_shutdown =
+                    root_shutdown.or_else(|| remove_consumer_locked(&mut state, key, consumer_id));
+            }
+        }
+        drop(state);
+        cancel_root(root_shutdown);
     }
 
     async fn remove_consumer(&self, key: &WatchRootKey, consumer_id: u64) {
@@ -665,18 +855,7 @@ impl WatchManager {
                     ) {
                         continue;
                     }
-                    let bytes = event.retained_bytes();
-                    if event.path_encoding() != WatchPathEncoding::Exact
-                        || events.len() >= PULL_WATCHER_BUFFER_CAPACITY
-                        || retained_bytes.saturating_add(bytes) > WATCH_CONSUMER_BYTE_CAPACITY
-                    {
-                        events.clear();
-                        *retained_bytes = 0;
-                        *overflowed = true;
-                    } else if !*overflowed {
-                        *retained_bytes += bytes;
-                        events.push_back(event.clone());
-                    }
+                    queue_pull_event(events, retained_bytes, overflowed, &event);
                 }
                 WatchConsumer::Ledger { root, filter } => {
                     let backend_filter_applies = root == &key.root;
@@ -698,62 +877,14 @@ impl WatchManager {
 
         drop(state);
 
-        let mut remove_consumers = Vec::new();
-        for (consumer_id, tx, shutdown, bytes) in stream_targets {
-            if event.path_encoding() != WatchPathEncoding::Exact {
-                send_stream_loss_and_cancel(
-                    &self.tasks,
-                    tx,
-                    shutdown,
-                    "file watch path cannot be represented exactly",
-                );
-                remove_consumers.push(consumer_id);
-                continue;
-            }
-            let proto = event.to_proto();
-            let size = proto.path.len() + std::mem::size_of::<QueuedFileEvent>();
-            let Ok(permit) = bytes.try_acquire_many_owned(size as u32) else {
-                send_stream_loss_and_cancel(
-                    &self.tasks,
-                    tx,
-                    shutdown,
-                    "file watch stream buffer full",
-                );
-                remove_consumers.push(consumer_id);
-                continue;
-            };
-            match tx.try_send(Ok(QueuedFileEvent {
-                event: proto,
-                _bytes: permit,
-            })) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    shutdown.cancel();
-                    remove_consumers.push(consumer_id);
-                }
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    send_stream_loss_and_cancel(
-                        &self.tasks,
-                        tx,
-                        shutdown,
-                        "file watch stream buffer full",
-                    );
-                    remove_consumers.push(consumer_id);
-                }
-            }
-        }
-        if !remove_consumers.is_empty() {
-            let mut state = self.inner.lock().await;
-            let mut root_shutdown = None;
-            if root_for_backend_mut(&mut state, key, generation).is_some() {
-                for consumer_id in remove_consumers {
-                    root_shutdown = root_shutdown
-                        .or_else(|| remove_consumer_locked(&mut state, key, consumer_id));
-                }
-            }
-            drop(state);
-            cancel_root(root_shutdown);
-        }
+        let failed = stream_targets
+            .into_iter()
+            .filter(|(_, tx, shutdown, bytes)| {
+                !send_stream_event(&self.tasks, tx, shutdown, bytes, &event)
+            })
+            .map(|(consumer_id, ..)| consumer_id)
+            .collect::<Vec<_>>();
+        self.remove_failed_consumers(key, generation, failed).await;
 
         if let Some(session_id) = active_ledger_session_id
             && !ledger_record_roots.is_empty()
@@ -914,7 +1045,7 @@ fn insert_consumer_locked(
     manager: &WatchManager,
     state: &mut WatchManagerState,
     backend_key: &WatchRootKey,
-    consumer: WatchConsumer,
+    mut consumer: WatchConsumer,
 ) -> Result<u64, Status> {
     let next_consumer_id = &mut state.next_consumer_id;
     let Some(root) = state.roots.get_mut(backend_key) else {
@@ -922,6 +1053,7 @@ fn insert_consumer_locked(
             "file watcher root registration missing after creation",
         ));
     };
+    seed_coverage(&manager.tasks, &backend_key.root, root, &mut consumer);
     *next_consumer_id += 1;
     let consumer_id = *next_consumer_id;
     let is_pull = matches!(&consumer, WatchConsumer::Pull { .. });
@@ -944,6 +1076,288 @@ fn insert_consumer_locked(
         );
     }
     Ok(consumer_id)
+}
+
+/// Tells a consumer joining a root which subtrees it already misses, before
+/// any later event.
+fn seed_coverage(
+    tasks: &tokio_util::task::TaskTracker,
+    root_path: &Path,
+    root: &WatchRoot,
+    consumer: &mut WatchConsumer,
+) {
+    let events = coverage_seed(root_path, &root.unwatched, root.coverage_incomplete());
+    match consumer {
+        WatchConsumer::Stream {
+            tx,
+            bytes,
+            shutdown,
+            ..
+        } => {
+            for event in &events {
+                if !send_stream_event(tasks, tx, shutdown, bytes, event) {
+                    break;
+                }
+            }
+        }
+        WatchConsumer::Pull {
+            events: queue,
+            retained_bytes,
+            overflowed,
+            ..
+        } => {
+            for event in &events {
+                queue_pull_event(queue, retained_bytes, overflowed, event);
+            }
+        }
+        WatchConsumer::Ledger { .. } => {}
+    }
+}
+
+/// UNWATCHED for each of a root's skips, as one [`CoverageBatch`].
+fn coverage_seed(root: &Path, unwatched: &BTreeSet<PathBuf>, truncated: bool) -> Vec<WatchEvent> {
+    let observed_unix_ms = now_unix_ms().unwrap_or_default();
+    let mut batch = CoverageBatch::new(root, observed_unix_ms);
+    if truncated {
+        batch.mark_incomplete();
+    }
+    for path in unwatched {
+        if batch.is_full() {
+            break;
+        }
+        // A root records only skips the wire can carry.
+        match coverage_event(root, path, FileEventKind::Unwatched, observed_unix_ms) {
+            Some(event) => batch.push(event),
+            None => batch.mark_incomplete(),
+        }
+    }
+    batch.finish()
+}
+
+/// The coverage events one step sends each consumer. Its UNWATCHED events
+/// fit within about a quarter of its smallest buffer, and so do its REWATCHED
+/// events (see [`budgeted_rewatches`]), so a seed always fits and one step's
+/// coverage can't by itself overflow a consumer that keeps up. Past that, or
+/// when the root's list is incomplete, the batch ends with UNWATCHED for the
+/// root itself. The ledger reads coverage from the root, so nothing is lost
+/// there.
+struct CoverageBatch {
+    events: Vec<WatchEvent>,
+    /// New-skip events in `events`, and their bytes with the marker's.
+    budgeted: usize,
+    bytes: usize,
+    full: bool,
+    incomplete: bool,
+    marker: WatchEvent,
+}
+
+impl CoverageBatch {
+    const EVENTS: usize = STREAM_BUFFER_CAPACITY / 4;
+    const BYTES: usize = WATCH_CONSUMER_BYTE_CAPACITY / 4;
+
+    fn new(root: &Path, observed_unix_ms: u64) -> Self {
+        let marker = incomplete_coverage_event(root, observed_unix_ms);
+        Self {
+            events: Vec::new(),
+            budgeted: 0,
+            // Room stays for the marker.
+            bytes: marker.retained_bytes(),
+            full: false,
+            incomplete: false,
+            marker,
+        }
+    }
+
+    fn push(&mut self, event: WatchEvent) {
+        if self.full {
+            self.incomplete = true;
+            return;
+        }
+        let bytes = self.bytes.saturating_add(event.retained_bytes());
+        if self.budgeted + 1 >= Self::EVENTS || bytes > Self::BYTES {
+            self.full = true;
+            self.incomplete = true;
+            return;
+        }
+        self.budgeted += 1;
+        self.bytes = bytes;
+        self.events.push(event);
+    }
+
+    /// Adds an event budgeted elsewhere, such as a rewatch. It doesn't count
+    /// against the budget for new skips.
+    fn push_unbudgeted(&mut self, event: WatchEvent) {
+        self.events.push(event);
+    }
+
+    fn is_full(&self) -> bool {
+        self.full
+    }
+
+    fn mark_incomplete(&mut self) {
+        self.incomplete = true;
+    }
+
+    fn finish(mut self) -> Vec<WatchEvent> {
+        if self.incomplete {
+            self.events.push(self.marker);
+        }
+        self.events
+    }
+}
+
+/// REWATCHED for `paths`, within the same budget as a step's new skips. Past
+/// it, REWATCHED for the root itself asks for a rescan of the whole watch, so
+/// a burst of returns, such as removing a tree of unreadable directories,
+/// doesn't end a consumer's history. A rewatch the wire can't name asks for
+/// the rescan too: nothing else would tell consumers to look.
+fn budgeted_rewatches(
+    root: &Path,
+    paths: &BTreeSet<PathBuf>,
+    observed_unix_ms: u64,
+) -> Vec<WatchEvent> {
+    let marker = WatchEvent::new(
+        root.to_path_buf(),
+        PathBuf::from("."),
+        FileEventKind::Rewatched,
+        observed_unix_ms,
+    );
+    let mut bytes = marker.retained_bytes();
+    let mut events = Vec::new();
+    for path in paths {
+        let Some(event) = coverage_event(root, path, FileEventKind::Rewatched, observed_unix_ms)
+        else {
+            events.push(marker);
+            return events;
+        };
+        bytes = bytes.saturating_add(event.retained_bytes());
+        if events.len() + 1 >= CoverageBatch::EVENTS || bytes > CoverageBatch::BYTES {
+            events.push(marker);
+            return events;
+        }
+        events.push(event);
+    }
+    events
+}
+
+/// A coverage event for `path`, or `None` when the wire can't carry it
+/// exactly.
+fn coverage_event(
+    root: &Path,
+    path: &Path,
+    kind: FileEventKind,
+    observed_unix_ms: u64,
+) -> Option<WatchEvent> {
+    let relative = backend::relative_event_path(root, path).ok()?;
+    let event = WatchEvent::new(path.to_path_buf(), relative, kind, observed_unix_ms);
+    (event.path_encoding() == WatchPathEncoding::Exact).then_some(event)
+}
+
+/// UNWATCHED for the watch root: some skips can't be listed, so the root's
+/// coverage is incomplete until a restated list leaves this out.
+fn incomplete_coverage_event(root: &Path, observed_unix_ms: u64) -> WatchEvent {
+    WatchEvent::new(
+        root.to_path_buf(),
+        PathBuf::from("."),
+        FileEventKind::Unwatched,
+        observed_unix_ms,
+    )
+}
+
+/// The ledger roots' unwatched directories, sorted and capped, and whether
+/// the list is incomplete. A root records only skips the wire can carry.
+fn ledger_unwatched_paths(
+    roots: &HashMap<WatchRootKey, WatchRoot>,
+    root_consumers: &[WatchConsumerRef],
+) -> (Vec<String>, bool) {
+    let mut truncated = false;
+    let mut paths = BTreeSet::new();
+    for root in root_consumers
+        .iter()
+        .filter_map(|reference| roots.get(&reference.root))
+    {
+        truncated |= root.coverage_incomplete();
+        paths.extend(root.unwatched.iter().filter_map(|path| path.to_str()));
+    }
+    truncated |= paths.len() > MAX_REPORTED_UNWATCHED_PATHS;
+    let paths = paths
+        .into_iter()
+        .take(MAX_REPORTED_UNWATCHED_PATHS)
+        .map(str::to_owned)
+        .collect();
+    (paths, truncated)
+}
+
+/// Queues an event for a pull watcher; past its buffer the history is lost
+/// and the next poll reports it.
+fn queue_pull_event(
+    events: &mut VecDeque<WatchEvent>,
+    retained_bytes: &mut usize,
+    overflowed: &mut bool,
+    event: &WatchEvent,
+) {
+    let bytes = event.retained_bytes();
+    if event.path_encoding() != WatchPathEncoding::Exact
+        || events.len() >= PULL_WATCHER_BUFFER_CAPACITY
+        || retained_bytes.saturating_add(bytes) > WATCH_CONSUMER_BYTE_CAPACITY
+    {
+        events.clear();
+        *retained_bytes = 0;
+        *overflowed = true;
+    } else if !*overflowed {
+        *retained_bytes += bytes;
+        events.push_back(event.clone());
+    }
+}
+
+/// Sends an event to a stream consumer; false when the consumer is gone or
+/// lost the event, and is ending.
+fn send_stream_event(
+    tasks: &tokio_util::task::TaskTracker,
+    tx: &mpsc::Sender<Result<QueuedFileEvent, Status>>,
+    shutdown: &CancellationToken,
+    bytes: &Arc<tokio::sync::Semaphore>,
+    event: &WatchEvent,
+) -> bool {
+    if event.path_encoding() != WatchPathEncoding::Exact {
+        send_stream_loss_and_cancel(
+            tasks,
+            tx.clone(),
+            shutdown.clone(),
+            "file watch path cannot be represented exactly",
+        );
+        return false;
+    }
+    let proto = event.to_proto();
+    let size = proto.path.len() + std::mem::size_of::<QueuedFileEvent>();
+    let Ok(permit) = Arc::clone(bytes).try_acquire_many_owned(size as u32) else {
+        send_stream_loss_and_cancel(
+            tasks,
+            tx.clone(),
+            shutdown.clone(),
+            "file watch stream buffer full",
+        );
+        return false;
+    };
+    match tx.try_send(Ok(QueuedFileEvent {
+        event: proto,
+        _bytes: permit,
+    })) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            shutdown.cancel();
+            false
+        }
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            send_stream_loss_and_cancel(
+                tasks,
+                tx.clone(),
+                shutdown.clone(),
+                "file watch stream buffer full",
+            );
+            false
+        }
+    }
 }
 
 fn send_stream_loss_and_cancel(

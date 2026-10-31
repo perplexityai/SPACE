@@ -31,6 +31,14 @@
 //! body limit, when admission is off). An upload without a `Content-Length` reserves the full
 //! body limit, so chunked uploads inflate `in_flight_bytes`. Org attribution
 //! is a per-upload log event, not a tag: org IDs are an unbounded set.
+//!
+//! `data_plane.ecw.file_event_dropped{event_kind}` counts spaced file events
+//! the ECW filesystem watch and watcher-poll endpoints drop because E2B has no
+//! equivalent: `unwatched` and `rewatched`, which report a subtree of a
+//! recursive watch losing and regaining coverage. A nonzero `unwatched` rate
+//! means E2B clients watched trees with directories they can't read, so
+//! changes under those weren't reported to them. Each still counts against
+//! the stream's buffer before it's dropped, as any event does.
 use std::{fmt, time::Instant};
 
 use crate::emit::{counter, elapsed_ms, gauge, tag, timing_ms};
@@ -452,6 +460,30 @@ pub fn backend_affected_streams(kind: &str, count: u64) {
         "data_plane.backend.affected_streams",
         count,
         &[tag("kind", kind)],
+    );
+}
+
+/// A spaced file event kind with no E2B equivalent, which ECW drops.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EcwDroppedFileEventKind {
+    Unwatched,
+    Rewatched,
+}
+
+impl EcwDroppedFileEventKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unwatched => "unwatched",
+            Self::Rewatched => "rewatched",
+        }
+    }
+}
+
+pub fn ecw_file_event_dropped(event_kind: EcwDroppedFileEventKind) {
+    counter(
+        "data_plane.ecw.file_event_dropped",
+        1,
+        &[tag("event_kind", event_kind.as_str())],
     );
 }
 
