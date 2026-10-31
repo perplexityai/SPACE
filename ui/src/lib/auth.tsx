@@ -21,6 +21,8 @@ interface AuthContextType {
   retry: () => void;
   refreshOrg: (org: Organization) => void;
   refreshCluster: (cluster: Cluster) => void;
+  // Refetch `GET /auth/v1/cluster`, for when it failed after sign-in.
+  reloadCluster: () => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextType>({
@@ -37,6 +39,7 @@ const AuthContext = createContext<AuthContextType>({
   retry: () => {},
   refreshOrg: () => {},
   refreshCluster: () => {},
+  reloadCluster: async () => {},
 });
 
 export function AuthProvider({ children }: { children: ReactNode }) {
@@ -92,9 +95,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         // never reused.
         localStorage.removeItem('token');
         try {
+          // A failed cluster read is not a failed sign-in: the console
+          // offers a retry for it (see `consoleAccess`).
           const [me, current] = await Promise.all([
             authApi.probe<MeResponse>('/me'),
-            authApi.probe<Cluster>('/cluster'),
+            authApi.probe<Cluster>('/cluster').catch(() => null),
           ]);
           signedIn(me, current);
         } catch (err) {
@@ -113,9 +118,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         return;
       }
       try {
+        // As at sign-in, a failed cluster read leaves the session in place
+        // and the console offers a retry; only a failed `/me` discards it.
         const [me, current] = await Promise.all([
           authApi.get<MeResponse>('/me'),
-          authApi.get<Cluster>('/cluster'),
+          authApi.get<Cluster>('/cluster').catch(() => null),
         ]);
         signedIn(me, current);
       } catch {
@@ -177,6 +184,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setCluster(updated);
   };
 
+  const reloadCluster = async () => {
+    const current =
+      authMode?.mode === 'external' ? await authApi.probe<Cluster>('/cluster') : await authApi.get<Cluster>('/cluster');
+    setCluster(current);
+  };
+
   return (
     <AuthContext.Provider
       value={{
@@ -193,6 +206,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         retry,
         refreshOrg,
         refreshCluster,
+        reloadCluster,
       }}
     >
       {children}
