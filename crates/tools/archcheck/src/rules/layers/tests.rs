@@ -14,9 +14,7 @@ use super::{
 };
 use crate::{
     config::{CoWriters, DomainFences, Layer, LayersConfig, LayersPolicy},
-    context::{
-        Crate, Dependency, Dialect, ProductionFile, TextFile, count_code_lines, declared_table,
-    },
+    context::{Crate, Dependency, Dialect, ProductionFile, TextFile, declared_table},
 };
 
 /// Every behaviour of `[rules.layers]`, as its key in `LayersPolicy.modes`.
@@ -241,7 +239,6 @@ fn items_used_through_a_dependency() {
     let files = [ProductionFile {
         path: "member/src/lib.rs".to_owned(),
         text: text.to_owned(),
-        code_lines: count_code_lines(text),
     }];
     let krate = Crate {
         name: "pplx-space-member".to_owned(),
@@ -283,7 +280,7 @@ fn lists_for_a_sentence() {
 /// its own line, including the state checks', and the table's first header.
 #[test]
 fn the_policy_and_its_lines() {
-    let text = "[rules.file_size]\nlimit = 5\n\
+    let text = "[rules.crate_names]\nallow = []\n\
                 [rules.layers.unmoved]\n\
                 l20_domain = [\n  \"pplx-space-b\",\n  \"pplx-space-a\",\n]\n\
                 [rules.layers.store_users]\n\
@@ -367,7 +364,7 @@ fn the_policy_and_its_lines() {
     assert!(!policy.has_check("dev_direction"));
 
     assert_eq!(
-        LayersPolicy::parse("[rules.file_size]\nlimit = 5\n").ok(),
+        LayersPolicy::parse("[rules.crate_names]\nallow = []\n").ok(),
         Some(None)
     );
     LayersPolicy::parse("[rules.layers]\nunmoved = 5\n").expect_err("unmoved is not a table");

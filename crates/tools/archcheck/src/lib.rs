@@ -34,17 +34,22 @@ pub fn check(ctx: &Context) -> Vec<Finding> {
 
 /// One line per behaviour [`check`] skipped for lack of an input. A base
 /// branch's copy that is not TOML at all skips every comparison with it for
-/// one reason, so it gets one line, not one per table.
+/// one reason, so it gets one line, not one per table; with no such
+/// comparison configured, each rule's own lines say what the copy costs it.
 pub fn skipped(ctx: &Context) -> Vec<String> {
     let rules = rules::registered();
-    let mut lines = if let BaseBaseline::Unusable(unusable) = &ctx.base_baseline {
-        let comparisons: Vec<String> = rules
-            .iter()
-            .flat_map(|rule| rule.base_comparisons(ctx))
-            .collect();
-        vec![BaseSkip::Unusable(unusable).message(&format!("{} skipped", comparisons.join(", ")))]
-    } else {
-        rules.iter().flat_map(|rule| rule.skipped(ctx)).collect()
+    let comparisons: Vec<String> = rules
+        .iter()
+        .flat_map(|rule| rule.base_comparisons(ctx))
+        .collect();
+    let mut lines = match &ctx.base_baseline {
+        BaseBaseline::Unusable(unusable) if !comparisons.is_empty() => {
+            vec![
+                BaseSkip::Unusable(unusable)
+                    .message(&format!("{} skipped", comparisons.join(", "))),
+            ]
+        }
+        _ => rules.iter().flat_map(|rule| rule.skipped(ctx)).collect(),
     };
     lines.extend(rules.iter().flat_map(|rule| rule.other_skips(ctx)));
     lines
@@ -65,9 +70,8 @@ pub struct WrittenBaseline {
 /// Updates every table of `architecture-baseline.toml` from its entries and
 /// the current tree: entries still in violation are kept and updated, the
 /// rest are removed, and none are added. A `pattern_ratchet` table the
-/// existing baseline lacks is not created; `[file_size]`, `[crate_names]`
-/// and, with the layers rule configured, each `[layers.<check>]` are always
-/// written.
+/// existing baseline lacks is not created; `[crate_names]` and, with the
+/// layers rule configured, each `[layers.<check>]` are always written.
 pub fn write_baseline(root: &Path) -> Result<WrittenBaseline, WriteBaselineError> {
     let ctx = Context::load(root)?;
     let (baseline, not_added) = update_baseline(&ctx);
@@ -75,8 +79,8 @@ pub fn write_baseline(root: &Path) -> Result<WrittenBaseline, WriteBaselineError
     Ok(WrittenBaseline::new(baseline, not_added))
 }
 
-/// Updates one table of `architecture-baseline.toml`, such as `file_size`
-/// or `pattern_ratchet.<instance>`, as [`write_baseline`] does, and keeps
+/// Updates one table of `architecture-baseline.toml`, such as
+/// `pattern_ratchet.<instance>`, as [`write_baseline`] does, and keeps
 /// every other table as the existing baseline has it. If the existing
 /// baseline lacks a `pattern_ratchet` table, the file is left alone: such a
 /// table, like an entry, is only ever added by hand.
@@ -84,8 +88,8 @@ pub fn write_baseline(root: &Path) -> Result<WrittenBaseline, WriteBaselineError
 /// The existing baseline must exist, parse and pass the same checks as for
 /// `cargo arch`, such as every `pattern_ratchet` table naming a configured
 /// instance, so the file written is one the next check accepts. `table` must
-/// be `file_size`, `crate_names`, a configured instance's table or, with the
-/// layers rule configured, `layers.<check>`.
+/// be `crate_names`, a configured instance's table or, with the layers rule
+/// configured, `layers.<check>`.
 pub fn write_baseline_table(
     root: &Path,
     table: &str,

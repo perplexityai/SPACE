@@ -285,7 +285,9 @@ impl Rule for Layers {
         findings
     }
 
-    /// Not called for a base branch's copy that is not TOML at all.
+    /// For a base branch's copy that is not TOML at all, called only when no
+    /// rule compares tables with the copy: then this rule is not configured
+    /// and reports nothing.
     fn skipped(&self, ctx: &Context) -> Vec<String> {
         if ctx.config.rules.layers.is_none() {
             return Vec::new();
