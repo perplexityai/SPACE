@@ -274,7 +274,8 @@ failed producer, expired artifact, or mismatched identity fails closed instead
 of compiling separately on each shard.
 
 Overlap needs runner capacity for the producer and six prepared shards: seven
-concurrent 16-core runners per run. This
+concurrent 16-core runners per run, and an eighth on a main push for Main CI's
+`kind_rust_state` (below). This
 does not add shard jobs or enlarge the cross-run cache, but runners start
 earlier. Verify both producer queue time and main CI completion time after a
 workflow change; shorter setup steps alone do not prove a faster critical path.
@@ -481,7 +482,8 @@ its job-scoped `GITHUB_TOKEN`, and exports `mode=max` layers. No personal token 
 new secret is used. Smoke jobs retain only `contents: read`.
 
 During migration, CI also imports the existing Actions cache scopes, using the
-job's exposed Actions runtime. Neither PRs nor main export to Actions. This
+job's exposed Actions runtime. Neither PRs nor main export BuildKit layers to
+Actions; the incremental build state (below) is a separate export. This
 read-only bridge preserves available cache hits while GHCR is unseeded or still
 private, without adding to the shared quota. BuildKit can import both sources;
 an Actions cache lookup has a 60-second timeout per target. An unavailable or
@@ -2277,6 +2279,31 @@ before, with a notice, including a fork, or any PR whose token cannot read the
 package. Setting the repository variable `SPACE_KIND_RUST_REUSE` to `off`
 turns PR reuse off without a code change. A reused image goes through the same
 handoff. The runtime images Tilt builds still record the checkout's commit.
+
+A PR whose Rust inputs match no published image builds incrementally from
+main's build state instead. Main CI's `kind_rust_state` job builds each main
+commit cold in incremental mode, beside the Kind shards and outside the
+required `space-ci`. It saves three directories to the GitHub Actions cache as
+zstd tar parts (`infra/space/kind/scripts/rust-state-cache.sh`): the Cargo
+target directory, the content-synced source mirror, and the Cargo home. A pull
+request's producer restores the newest state for the same toolchain, Cargo
+config, builder image and its pinned base, build lists and build scripts
+(`rust-state-cache.sh key`), preferring one built from the same `Cargo.lock`,
+and runs `build-rust-artifacts.sh` in incremental mode. The mirror keeps the
+mtimes of files whose content did not change, so Cargo recompiles only the
+crates whose inputs changed since main's build. Without a restored state, or
+when a part is missing or fails to unpack, the producer builds in Docker mode as
+before. The merge queue runs no Kind smoke, so for a PR that selects Kind its
+own run is the last Kind check before merge, and it tests incrementally built
+artifacts whenever a state restores. Building main's state cold keeps a saved
+state from inheriting a stale output of an earlier build, but an input Cargo
+does not track would carry main's compiled crate into a restoring PR; crates
+that embed a directory (`sqlx::migrate!`) watch it from a build script for that
+reason. Main CI's `rust_cache_cleanup` prunes superseded states with the other
+target-directory caches, keeping the newest state for each of the last three
+key inputs, so up to four states (about 0.8 GB each) can exist while a push
+saves. Setting the repository variable `SPACE_KIND_RUST_STATE` to `off` turns
+both the save and the restore off.
 
 To reproduce a shard, use `scripts/tests/smoke-kind-typed.sh all 1/6` (through
 `6/6`) with the same admin-token setup as a full `all` run, on a bench brought
