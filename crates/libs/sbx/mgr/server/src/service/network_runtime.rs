@@ -507,20 +507,157 @@ pub(super) async fn refresh_network_policy(
     reason: &'static str,
 ) -> Result<(), NetworkPolicyRefreshError> {
     let client = pplx_space_spaced_common::LazyClient::new();
-    refresh_network_policy_with_request(db, sandbox_id, expected_policy_ref, reason, |request| {
-        let client = &client;
+    let interception_readiness = refresh_network_policy_with_request(
+        db,
+        sandbox_id,
+        expected_policy_ref,
+        reason,
+        |request| {
+            let client = &client;
+            async move {
+                client
+                    .get_or_connect(|| pplx_space_net_gateway_client::connect(sandbox_id))
+                    .await
+                    .map_err(NetworkPolicyRefreshAttemptError::Connect)?
+                    .refresh_network_policy(request)
+                    .await
+                    .map(Response::into_inner)
+                    .map_err(NetworkPolicyRefreshAttemptError::Rpc)
+            }
+        },
+    )
+    .await?;
+    if interception_readiness.blocks_admission() {
+        spawn_interception_readiness_check(db.clone(), sandbox_id.to_owned(), reason);
+    }
+    Ok(())
+}
+
+/// The gateway is refused its CA until the activation publishes the execution
+/// identity, and gets it on a later retry. Some refreshes run before that
+/// publication (the restore path's background refresh runs before the
+/// snapshot loads), so a slow activation can still be not ready here.
+/// Dependencies still not ready after this long are worth a warning.
+const INTERCEPTION_NOT_READY_WARN_AFTER: Duration = Duration::from_secs(5);
+const INTERCEPTION_READINESS_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What the delayed re-check of a gateway's TLS-interception readiness found.
+#[derive(Debug, PartialEq)]
+enum InterceptionRecheck {
+    /// The gateway that was asked is no longer the sandbox's, or its sandbox
+    /// is tearing it down; a later activation's gateway has its own check.
+    GatewayGone,
+    Ready,
+    NotReady(pplx_space_net_gateway_client::proto::InterceptionReadiness),
+    /// The gateway is still registered but its readiness could not be read.
+    Failed(String),
+}
+
+/// Ask the sandbox's gateway again, once [`INTERCEPTION_NOT_READY_WARN_AFTER`]
+/// has passed, whether TLS-interception dependencies the start gate saw not
+/// ready are ready now, and warn if they are not or the gateway cannot say.
+fn spawn_interception_readiness_check(
+    db: crate::db::SharedConnection,
+    sandbox_id: String,
+    reason: &'static str,
+) {
+    let Some(gateway) = current_net_gateway_pid(&db, &sandbox_id) else {
+        return;
+    };
+    let span = super::drain::detached_trace_span("InterceptionReadinessCheck", &sandbox_id);
+    tokio::spawn(
         async move {
-            client
-                .get_or_connect(|| pplx_space_net_gateway_client::connect(sandbox_id))
-                .await
-                .map_err(NetworkPolicyRefreshAttemptError::Connect)?
-                .refresh_network_policy(request)
-                .await
-                .map(Response::into_inner)
-                .map_err(NetworkPolicyRefreshAttemptError::Rpc)
+            tokio::time::sleep(INTERCEPTION_NOT_READY_WARN_AFTER).await;
+            let recheck = recheck_interception_readiness(&db, &sandbox_id, gateway, || async {
+                let mut client = pplx_space_net_gateway_client::connect(&sandbox_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                client
+                    .get_network_state(
+                        pplx_space_net_gateway_client::proto::GetNetworkStateRequest {},
+                    )
+                    .await
+                    .map(Response::into_inner)
+                    .map_err(|status| status.to_string())
+            })
+            .await;
+            match recheck {
+                InterceptionRecheck::GatewayGone | InterceptionRecheck::Ready => {}
+                InterceptionRecheck::NotReady(interception_readiness) => tracing::warn!(
+                    sandbox_id,
+                    reason,
+                    interception_readiness = interception_readiness.as_str(),
+                    not_ready_after_ms = INTERCEPTION_NOT_READY_WARN_AFTER.as_millis() as u64,
+                    "TLS interception dependencies still not ready after network policy refresh; guest egress fails closed until they are"
+                ),
+                InterceptionRecheck::Failed(error) => tracing::warn!(
+                    sandbox_id,
+                    reason,
+                    %error,
+                    not_ready_after_ms = INTERCEPTION_NOT_READY_WARN_AFTER.as_millis() as u64,
+                    "TLS interception readiness could not be re-checked after network policy refresh; guest egress fails closed while its dependencies are not ready"
+                ),
+            }
         }
-    })
-    .await
+        .instrument(span),
+    );
+}
+
+/// Read `gateway`'s network state with `get_network_state` while it is the
+/// sandbox's registered gateway. Its answer, or its failure to answer, counts
+/// only if the gateway is still registered once the call returns.
+async fn recheck_interception_readiness<F, Fut>(
+    db: &crate::db::SharedConnection,
+    sandbox_id: &str,
+    gateway: u32,
+    get_network_state: F,
+) -> InterceptionRecheck
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<
+            Output = Result<pplx_space_net_gateway_client::proto::GetNetworkStateResponse, String>,
+        >,
+{
+    if current_net_gateway_pid(db, sandbox_id) != Some(gateway) {
+        return InterceptionRecheck::GatewayGone;
+    }
+    let state = tokio::time::timeout(INTERCEPTION_READINESS_CHECK_TIMEOUT, get_network_state())
+        .await
+        .unwrap_or_else(|_| Err("timed out".to_owned()));
+    if current_net_gateway_pid(db, sandbox_id) != Some(gateway) {
+        return InterceptionRecheck::GatewayGone;
+    }
+    let state = match state {
+        Ok(state) => state,
+        Err(error) => return InterceptionRecheck::Failed(error),
+    };
+    let interception_readiness =
+        pplx_space_net_gateway_client::proto::InterceptionReadiness::try_from(
+            state.interception_readiness,
+        )
+        .unwrap_or(pplx_space_net_gateway_client::proto::InterceptionReadiness::Unspecified);
+    if interception_readiness.blocks_admission() {
+        InterceptionRecheck::NotReady(interception_readiness)
+    } else {
+        InterceptionRecheck::Ready
+    }
+}
+
+/// The registered net-gateway of a sandbox that can still have a live one and
+/// is not tearing it down.
+fn current_net_gateway_pid(db: &crate::db::SharedConnection, sandbox_id: &str) -> Option<u32> {
+    let db = crate::node_state_sync::connection_or_signal_failure(db).ok()?;
+    crate::db::read::sandbox(&db, sandbox_id)
+        .ok()
+        .flatten()
+        .filter(|sandbox| {
+            sandbox.state.can_authorize_net_gateway()
+                && !matches!(
+                    sandbox.state,
+                    SandboxState::Stopping | SandboxState::Suspending
+                )
+        })
+        .and_then(|sandbox| sandbox.netgtw_pid)
 }
 
 pub(super) async fn refresh_network_policy_with_request<F, Fut>(
@@ -529,7 +666,7 @@ pub(super) async fn refresh_network_policy_with_request<F, Fut>(
     expected_policy_ref: Option<&EffectiveNetworkPolicyRef>,
     reason: &'static str,
     mut refresh: F,
-) -> Result<(), NetworkPolicyRefreshError>
+) -> Result<pplx_space_net_gateway_client::proto::InterceptionReadiness, NetworkPolicyRefreshError>
 where
     F: FnMut(pplx_space_net_gateway_client::proto::RefreshNetworkPolicyRequest) -> Fut,
     Fut: std::future::Future<
@@ -615,7 +752,9 @@ where
                     // separately; when it is not ready the sandbox still
                     // starts and guest egress fails closed per connection
                     // until the CA arrives. Surface it, never
-                    // fail on it.
+                    // fail on it. A gateway normally gets its CA moments
+                    // after the start publishes its identity, so this is
+                    // expected; the caller warns if it lasts.
                     let interception_readiness =
                         pplx_space_net_gateway_client::proto::InterceptionReadiness::try_from(
                             response.interception_readiness,
@@ -627,20 +766,13 @@ where
                         pplx_space_metrics::reconcile::network_policy_interception_not_ready(
                             reason,
                         );
-                        tracing::warn!(
-                            sandbox_id,
-                            expected_policy_ref = %request.expected_policy_ref,
-                            interception_readiness = interception_readiness.as_str(),
-                            "network policy refreshed in net-gateway; TLS interception dependencies not ready, guest egress fails closed until they are"
-                        );
-                    } else {
-                        tracing::info!(
-                            sandbox_id,
-                            expected_policy_ref = %request.expected_policy_ref,
-                            interception_readiness = interception_readiness.as_str(),
-                            "network policy refreshed in net-gateway"
-                        );
                     }
+                    tracing::info!(
+                        sandbox_id,
+                        expected_policy_ref = %request.expected_policy_ref,
+                        interception_readiness = interception_readiness.as_str(),
+                        "network policy refreshed in net-gateway"
+                    );
                     emit_sandbox_event(
                         sandbox_id,
                         SandboxEventType::NetworkPolicyRefreshCompleted,
@@ -652,7 +784,7 @@ where
                             .expected_network_policy_ref(request.expected_policy_ref.clone())
                             .installed_network_policy_ref(response.installed_policy_ref),
                     );
-                    return Ok(());
+                    return Ok(interception_readiness);
                 }
                 let last_error_kind =
                     pplx_space_net_gateway_client::proto::NetworkPolicyErrorKind::try_from(

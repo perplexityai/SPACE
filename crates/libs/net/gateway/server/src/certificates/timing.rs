@@ -6,6 +6,11 @@ pub(super) const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(45);
 pub(super) const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 /// Both ten-second TLS handshakes plus acquisition/scheduling margin.
 pub(super) const ADMISSION_RESERVE: Duration = Duration::from_secs(30);
+/// How long the owner retries sandbox-manager's designed not-ready answer
+/// before it reports each further retry. The answer lasts until the
+/// activation publishes the execution identity; an activation slower than
+/// this window still warns.
+pub(super) const QUIET_NOT_READY: Duration = Duration::from_secs(5);
 /// Two acquisition attempts, one maximum backoff and scheduling margin.
 pub(super) const MIN_REMAINING: Duration = ADMISSION_RESERVE
     .saturating_add(ACQUIRE_TIMEOUT.saturating_mul(2))

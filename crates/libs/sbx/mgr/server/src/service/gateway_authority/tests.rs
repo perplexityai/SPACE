@@ -304,10 +304,11 @@ async fn gateway_authority_retries_incomplete_identity_during_activation_transit
         fixture.write_route_identity(&identity);
         fixture.set_state(state);
 
-        assert_eq!(
-            fixture.issue().await.unwrap_err().code(),
-            tonic::Code::Unavailable,
-            "{state:?}"
+        let error = fixture.issue().await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unavailable, "{state:?}");
+        assert!(
+            pplx_space_common_grpc::RetryableNotReady::from_status(&error).is_some(),
+            "{state:?}: the designed wait must not be logged as a failed call"
         );
     }
     assert_eq!(
