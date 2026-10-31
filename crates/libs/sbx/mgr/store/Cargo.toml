@@ -7,6 +7,23 @@ authors.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[package.metadata.space.state]
+sqlite.sandbox-manager = [
+  "auto_lifecycle_delete_outbox",
+  "jobs",
+  "local_artifacts",
+  "node_dirty_ref_revision",
+  "node_dirty_refs",
+  "sandbox_cleanup_episodes",
+  "sandbox_execution_delete_receipts",
+  "sandbox_open_route_activations",
+  "sandbox_quarantine_history",
+  "sandbox_quarantine_state",
+  "sandbox_restore_transfer_scopes",
+  "sandbox_runtime_upgrades",
+  "sandboxes",
+]
+
 [lints]
 workspace = true
 
