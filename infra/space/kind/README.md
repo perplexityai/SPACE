@@ -261,7 +261,10 @@ Kind CI produces one Rust artifact image per run and hands it to six isolated
 runners. Main builds it from its commit; a PR reuses main's image when its Rust
 inputs are the same (see [Smoke test](#smoke-test)). Each runner boots its own Kind stack, proves the baseline,
 and runs its assigned typed scenarios serially. Cluster-wide fault injection
-must never run concurrently on a shared stack. Every shard must pass.
+must never run concurrently on a shared stack. Every shard must pass. The
+shards bring the stack up without the UI (`SPACE_KIND_UI=0`, read by the
+Tiltfile): no smoke scenario reads it, and its image build was the longest
+single step of their bring-up. A local `up.sh` deploys it by default.
 
 The shards prepare their node image, vendor mounts, cluster, and chart-image
 preloads while the Rust producer compiles or pulls the image. Application startup remains behind

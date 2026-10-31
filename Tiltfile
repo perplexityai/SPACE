@@ -416,17 +416,23 @@ space_image(
 # .next/required-server-files.json. Runtime env overrides are ignored. Both
 # name the in-cluster Services: the Dockerfile's localhost defaults would point
 # the UI pod's session proxy at itself.
-space_image(
-    ref = "space-ui:local",
-    command = " && ".join([
-        BUILD_INPUTS_SNAPSHOT,
-        pull_base_images("docker/Dockerfile.ui"),
-        (image_build("space-ui", revision_label = True) + " -t $SPACE_BUILD_REF " +
-         "--build-arg NEXT_PUBLIC_API_URL=http://space-api:8080 " +
-         "--build-arg NEXT_PUBLIC_DATA_PLANE_URL=http://space-data-plane:8090 ."),
-    ]),
-    deps = ["docker/Dockerfile.ui", "ui"],
-)
+#
+# SPACE_KIND_UI=0 leaves the UI out: no image build and no release. Kind CI's
+# smoke shards set it, because no smoke scenario reads the UI and its image
+# build is the longest single step of their bring-up.
+KIND_UI = os.getenv("SPACE_KIND_UI", "1") != "0"
+if KIND_UI:
+    space_image(
+        ref = "space-ui:local",
+        command = " && ".join([
+            BUILD_INPUTS_SNAPSHOT,
+            pull_base_images("docker/Dockerfile.ui"),
+            (image_build("space-ui", revision_label = True) + " -t $SPACE_BUILD_REF " +
+             "--build-arg NEXT_PUBLIC_API_URL=http://space-api:8080 " +
+             "--build-arg NEXT_PUBLIC_DATA_PLANE_URL=http://space-data-plane:8090 ."),
+        ]),
+        deps = ["docker/Dockerfile.ui", "ui"],
+    )
 
 # Every manifest goes to Tilt through deploy_yaml, which also records where
 # each image's pods can schedule: the nodeSelector, required node affinity and
@@ -805,13 +811,14 @@ k8s_resource(
     resource_deps = ["label-kind-infra", "internal-rpc-tls"],
 )
 
-deploy_yaml(helm_release("space", "infra/space/kind/charts/space-ui-local"))
-k8s_resource(
-    "space-ui",
-    port_forwards = ["3000:3000"],
-    labels = ["frontend"],
-    resource_deps = ["space-api", "provision-local-console"],
-)
+if KIND_UI:
+    deploy_yaml(helm_release("space", "infra/space/kind/charts/space-ui-local"))
+    k8s_resource(
+        "space-ui",
+        port_forwards = ["3000:3000"],
+        labels = ["frontend"],
+        resource_deps = ["space-api", "provision-local-console"],
+    )
 
 # ── Object store + node services + seed publish ──────────────────────────────
 #
