@@ -196,15 +196,19 @@ jobs:
 
   smoke:
     if: github.repository == 'perplexityai/SPACE'
-    name: Kind / Firecracker smoke (${{ matrix.shard }}/4)
+    name: Kind / Firecracker smoke (${{ matrix.shard }}/6)
     permissions:
       actions: read
       contents: read
       packages: read
     strategy:
       fail-fast: false
+      # Six shards: with the leader-election brownout at the lease TTL floor, it
+      # is about one shard's share of the ECW pass at six, so a seventh shard
+      # would not lower the slowest. Keep the list, the job name and
+      # SMOKE_SHARD's count in step.
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5, 6]
     env:
       # Image builds, the charts' images and the observability backends'
       # images come from the GHCR mirror; see ci/mirrored-images.txt.
@@ -373,7 +377,7 @@ jobs:
       - name: Run this shard of the typed Kind smoke
         env:
           SKIP_BOOTSTRAP: "1"
-          SMOKE_SHARD: ${{ matrix.shard }}/4
+          SMOKE_SHARD: ${{ matrix.shard }}/6
           SPACE_M1_GENERATOR_MIRROR: ghcr.io/perplexityai/space-ci-mirror
           SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE: ${{ runner.temp }}/space-smoke-admin-token
           SPACE_SMOKE_KIND_COLD_RECEIPTS: ${{ runner.temp }}/space-smoke-cold-receipts

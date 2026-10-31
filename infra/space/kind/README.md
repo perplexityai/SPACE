@@ -255,7 +255,7 @@ either (see [Service identities](#service-identities)).
 
 ## CI smoke partitions
 
-Kind CI produces one Rust artifact image per run and hands it to four isolated
+Kind CI produces one Rust artifact image per run and hands it to six isolated
 runners. Main builds it from its commit; a PR reuses main's image when its Rust
 inputs are the same (see [Smoke test](#smoke-test)). Each runner boots its own Kind stack, proves the baseline,
 and runs its assigned typed scenarios serially. Cluster-wide fault injection
@@ -271,7 +271,8 @@ successful producer from the same run, with the same source verification. A
 failed producer, expired artifact, or mismatched identity fails closed instead
 of compiling separately on each shard.
 
-Overlap needs runner capacity for the producer and four prepared shards. This
+Overlap needs runner capacity for the producer and six prepared shards: seven
+concurrent 16-core runners per run. This
 does not add shard jobs or enlarge the cross-run cache, but runners start
 earlier. Verify both producer queue time and main CI completion time after a
 workflow change; shorter setup steps alone do not prove a faster critical path.
@@ -295,8 +296,8 @@ for each API surface across all shards of several successful runs, and take
 each scenario's median. They are scheduling
 hints only: new or renamed scenarios receive a 30-second estimate and still run;
 obsolete hints do not add scenarios. No assertion, timeout, or scenario is removed.
-Four shards shorten the serial critical path but duplicate cluster startup and
-consume four concurrent runners; queue time remains a separate constraint.
+Six shards shorten the serial critical path but duplicate cluster startup and
+consume six concurrent runners; queue time remains a separate constraint.
 
 ## Release-build lane
 
@@ -373,7 +374,7 @@ SPACE_KIND_RUST_BUILD=release SPACE_KIND_TELEMETRY_MODE=otel SKIP_BOOTSTRAP=1 \
 
 On demand, `Kind Release-Build CI` (`.github/workflows/kind-release-ci.yml`,
 `workflow_dispatch` only) runs `kind-ci.yml` with `rust_build: release`: its
-producer builds the release image in Docker mode, and the four shards check its
+producer builds the release image in Docker mode, and the six shards check its
 label and run the baseline and their partitions. No required check depends on
 it and nothing schedules it.
 
@@ -382,7 +383,7 @@ it and nothing schedules it.
 ### CI layer cache
 
 Kind CI produces the Rust artifact image once per run and transfers that exact
-image to all four smoke shards. The run-local handoff is the same whether the
+image to every smoke shard. The run-local handoff is the same whether the
 producer built the image or reused main's from
 `ghcr.io/perplexityai/space-kind-rust-artifacts` (see [Smoke test](#smoke-test)):
 each shard verifies its run, source and image ID before use.
@@ -420,7 +421,7 @@ Rollout:
    repository caches. Verify the three tags can be inspected without credentials.
 3. Compare cold and warm runs: prove main exports, PRs import without exports,
    and unchanged dependency layers are cache hits. Confirm retained version counts
-   and all four smoke results. Do not claim a cache speedup from a cold run.
+   and every smoke shard's result. Do not claim a cache speedup from a cold run.
 4. Only after that evidence, remove the Actions import bridge and separately
    retire obsolete Kind Actions cache entries if needed. Other compiler/image
    caches are outside this change; no shared cache is deleted by this rollout.
@@ -444,7 +445,7 @@ cache cannot change which image a seed is built from. The copies of a commit's
 binaries are never exported.
 
 Only `kind_runtime_image_cache` in `main-ci.yml` writes these tags, after
-all four Kind shards of that commit have passed; `space-ci` does not require
+every Kind shard of that commit has passed; `space-ci` does not require
 it, and a failed export leaves the previous layers. It skips the stages of a
 Dockerfile whose mirrored base it could not reach, since layers built from
 the base's source would match no reader. Runs of successive main commits are
@@ -2147,8 +2148,8 @@ published templates.
 ## Smoke test
 
 Kind CI produces the Kind Rust artifact image once per run and hands that exact
-image to four isolated runners. Each runner brings up its own Kind/Firecracker stack,
-runs the baseline smoke, then runs one of four duration-balanced partitions of
+image to six isolated runners. Each runner brings up its own Kind/Firecracker stack,
+runs the baseline smoke, then runs one of six duration-balanced partitions of
 the eligible ECW and native inventories. Scenarios remain serial within each
 shard because some mutate cluster-wide state. Every shard must pass for
 `space-ci` to pass.
@@ -2188,13 +2189,13 @@ package. Setting the repository variable `SPACE_KIND_RUST_REUSE` to `off`
 turns PR reuse off without a code change. A reused image goes through the same
 handoff. The runtime images Tilt builds still record the checkout's commit.
 
-To reproduce a shard, use `scripts/tests/smoke-kind-typed.sh all 1/4` (through
-`4/4`) with the same admin-token setup as a full `all` run, on a bench brought
+To reproduce a shard, use `scripts/tests/smoke-kind-typed.sh all 1/6` (through
+`6/6`) with the same admin-token setup as a full `all` run, on a bench brought
 up with `SPACE_KIND_TELEMETRY_MODE=otel` and that variable still set, as CI
 does. With the variable set, a bench in another mode fails any shard holding a
 scenario that declares a telemetry mode, the brownout's included; without it,
 each such shard skips those scenarios and can pass. The direct CLI equivalent
-is `python -m space_smoke run --all --shard 1/4` for the selected API surface.
+is `python -m space_smoke run --all --shard 1/6` for the selected API surface.
 Shards partition the eligible scenarios by duration hint, as described above;
 run every shard from the same checkout. Never run shards concurrently against
 the same cluster. Without a shard argument, the full inventory and its existing
