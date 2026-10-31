@@ -11,6 +11,8 @@
 //! - F4 `f4_authoritative_state_races_skip`
 //! - F4b `f4b_repair_reverts_only_a_row_still_failed` — the apply's
 //!   lifecycle guard over every stored lifecycle.
+//! - F4c `f4c_apply_rechecks_snapshot_eligibility` — activity recorded
+//!   between scan and apply makes the apply refuse.
 //! - F5 `f5_marker_stale_with_newer_suspend_snapshot_clears_marker`
 //! - F6 `f6_unassigned_frozen_failed_projection_repaired_and_purged` — a
 //!   `failed`, pid-less observed record on an unassigned sandbox (the fossil
@@ -583,6 +585,36 @@ async fn f4b_repair_reverts_only_a_row_still_failed() -> TestResult {
         }
     }
     assert!(mismatches.is_empty(), "{mismatches:#?}");
+    Ok(())
+}
+
+/// The apply re-checks the snapshot eligibility, not only the row state: a
+/// command recorded after the listed candidate's snapshot means a markerless
+/// restore would lose it, so the apply refuses although every row-state guard
+/// still holds.
+#[tokio::test(flavor = "current_thread")]
+async fn f4c_apply_rechecks_snapshot_eligibility() -> TestResult {
+    let db = pg_test_db().await?;
+    let spec = FailedSandboxSpec::repairable(SandboxId::new());
+    insert_failed_sandbox(&db.pool, &spec).await?;
+    let store = RepairDbStore::new(db.pool.clone());
+    let candidates = store.list_candidates(100, None, min_age()).await?;
+    assert_eq!(candidates.len(), 1, "the repairable row is listed");
+
+    sqlx::query("UPDATE sandboxes SET last_command_at = NOW() WHERE id = $1")
+        .bind(spec.sandbox_id)
+        .execute(&db.pool)
+        .await?;
+    let outcome = store
+        .revert_failed_to_suspended(&candidates[0], min_age())
+        .await?;
+
+    assert_eq!(outcome, ApplyOutcome::SkippedRaced);
+    let lifecycle: String = sqlx::query_scalar("SELECT lifecycle FROM sandboxes WHERE id = $1")
+        .bind(spec.sandbox_id)
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(lifecycle, "failed");
     Ok(())
 }
 

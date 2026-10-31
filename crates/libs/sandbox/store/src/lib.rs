@@ -16,18 +16,20 @@
 //!   are placement transitions; none of those belong here. What is left is
 //!   desired configuration — the columns a caller assigns directly.
 //! * **Column writes respect the row's triggers.** `sandboxes` carries five
-//!   `BEFORE UPDATE` triggers. `updated_at` is trigger-maintained, so no verb
-//!   here assigns it; and because two of the triggers have no change guard,
-//!   no verb may promise it touches only the columns it names. See
-//!   [`update_desired_state`].
+//!   `BEFORE UPDATE` triggers. `updated_at` is trigger-maintained, so verbs
+//!   here leave it to the trigger, except
+//!   [`repair::recover_quarantined_publication_to_suspended`], whose
+//!   statement moved unchanged; and because two of the triggers have no
+//!   change guard, no verb may promise it touches only the columns it names.
+//!   See [`update_desired_state`].
 //!
 //! * **Guarded placement transitions are not CRUD.** Statements whose `WHERE`
 //!   re-checks a lifecycle/lease/generation precondition (the wake-completion
 //!   CAS, the restore claims) are correctness mechanisms, not row updates —
 //!   they stay named, guarded operations wherever they live, and no plain
 //!   `update` verb here may absorb one. A new one lands here in its own
-//!   module, named for the transition, as [`lost`] does; the caller
-//!   keeps the locks and the other tables' writes around it.
+//!   module, named for the transition, as [`lost`] and [`repair`] do; the
+//!   caller keeps the locks and the other tables' writes around it.
 //! * **Locking reads are not gets.** `SELECT ... FOR UPDATE` acquires a row
 //!   lock inside a caller's transaction; converting one to [`get`] would drop
 //!   the lock. They stay at their call sites.
@@ -75,6 +77,7 @@ use uuid::Uuid;
 mod create;
 pub mod fork_source_lifecycle;
 pub mod lost;
+pub mod repair;
 
 pub use create::{SandboxCreate, insert_pooled, insert_unplaced};
 
