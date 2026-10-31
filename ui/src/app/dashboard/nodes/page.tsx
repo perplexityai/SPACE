@@ -3,6 +3,7 @@
 import { type ReactNode, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { adminApi } from '@/lib/api';
+import { DRAIN_TERMINATES } from '@/lib/node-actions';
 import { useAuth } from '@/lib/auth';
 import {
   AdminNodeResponse,
@@ -667,9 +668,7 @@ export default function NodesPage() {
       dataIndex: 'name',
       width: 180,
       render: (name: string | null, record) => (
-        <Button type="link" style={{ padding: 0 }} onClick={() => void loadNodeSandboxes(record)}>
-          {name || record.id.slice(0, 8)}
-        </Button>
+        <Link href={`/dashboard/nodes/${record.id}`}>{name || record.id.slice(0, 8)}</Link>
       ),
     },
     {
@@ -756,7 +755,9 @@ export default function NodesPage() {
             }
           >
             <Space size={4} wrap>
-              <span>{counts.sandboxes_active} active</span>
+              <Button type="link" size="small" style={{ padding: 0 }} onClick={() => void loadNodeSandboxes(record)}>
+                {counts.sandboxes_active} active
+              </Button>
               {stale ? <Tag>stale</Tag> : null}
               {counts.sandboxes_local_snapshots ? <Tag>{counts.sandboxes_local_snapshots} local snaps</Tag> : null}
               {unhealthySlots > 0 ? <Tag color="orange">{unhealthySlots} slots unhealthy</Tag> : null}
@@ -815,8 +816,10 @@ export default function NodesPage() {
               // dashboard button one misclick away from evacuating a node.
               <Popconfirm
                 title="Drain this node?"
-                description="Cordons the node and waits for its sandboxes to leave on their own. Use `space-admin-cli drain-node --forced` to evacuate them immediately instead."
+                description={`Cordons the node and waits for its sandboxes to leave on their own. ${DRAIN_TERMINATES} Use \`space-admin-cli drain-node --forced\` to evacuate them immediately instead.`}
                 okText="Drain"
+                placement="topRight"
+                styles={{ root: { maxWidth: 420 } }}
                 onConfirm={() => handleDrain(record.id, 'gentle')}
               >
                 <Tooltip title="Drain">
