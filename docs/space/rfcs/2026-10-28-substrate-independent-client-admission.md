@@ -406,6 +406,15 @@ such as retry storms and runaway batch jobs. They don't stop a hostile
 caller from sending another client's id. Authentication, the
 per-organization quotas and the cluster limits do that.
 
+**Not authorization.** Client ids are for attribution and limits only. ECW
+access is scoped by owner alone: the API key's organization, or the
+federated owner's issuer, organization and subject (`ecw_access_scope` in
+`routes/e2b/translate.rs`, `sandbox_in_scope` in
+`controllers/sandbox/org.rs`). No access check reads a client id or the
+record. So a caller can reach any sandbox its owner scope allows, whichever
+client created it, and an explicit activation then re-attributes the
+runtime to that caller (Decision 1). This RFC doesn't change that.
+
 ## Decision 3: the record follows the runtime
 
 Add `sandboxes.activating_client_id text NULL`: the client id whose
