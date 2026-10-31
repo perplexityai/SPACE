@@ -4,10 +4,19 @@ import { Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import styles from './inventory.module.css';
 import { usePathname, useSearchParams } from 'next/navigation';
-import { sandboxLabelOrId } from '@/lib/sandbox-id';
+import {
+  DEFAULT_LIST_LIMIT,
+  LIST_LIMIT_OPTIONS,
+  listIsCapped,
+  matchesSandboxQuery,
+  parseListLimit,
+  sandboxLabelOrId,
+  sandboxQuery,
+} from '@/lib/sandbox-id';
 import {
   createConsoleSandboxForOrg,
   forceConsoleSandboxAction,
+  getConsoleSandbox,
   getConsoleSandboxes,
   getPublicPage,
   postPublicOperation,
@@ -56,7 +65,7 @@ import {
   summarizeAutoLifecycle,
 } from '@/components/auto-lifecycle';
 import {
-  App, Table, Button, Form, Input, Select, Typography, Space, Tag, Popconfirm, Card, Tooltip, Switch, Checkbox, Modal,
+  Alert, App, Table, Button, Form, Input, Select, Typography, Space, Tag, Popconfirm, Card, Tooltip, Switch, Checkbox, Modal,
 } from 'antd';
 import {
   PlusOutlined, StopOutlined, PauseCircleOutlined, ThunderboltOutlined,
@@ -67,6 +76,15 @@ import type { ColumnsType } from 'antd/es/table';
 
 const { Title, Text } = Typography;
 const SANDBOXES_VIEW_REFRESH_KEY = 'dashboard:sandboxes';
+const LARGE_LIST_STALE_MS = 15_000;
+
+// Every console window shares a view's refresh timestamp, so one window's
+// reload counts for all of them. A list larger than the default is a
+// different, heavier view: it keeps its own timestamp, or a default-size
+// window elsewhere would keep it fresh and it would never reload.
+function sandboxesRefreshKey(limit: number): string {
+  return limit > DEFAULT_LIST_LIMIT ? `${SANDBOXES_VIEW_REFRESH_KEY}:limit-${limit}` : SANDBOXES_VIEW_REFRESH_KEY;
+}
 const REFRESH_CLICK_COOLDOWN_MS = 3000;
 
 type AgeWindow = '1h' | '24h' | '7d' | '30d' | '90d' | '1y' | 'all';
@@ -625,6 +643,19 @@ function SandboxesPage() {
   const [statusFilter, setStatusFilter] = useState<string[]>(() => parseCsvParam(searchParams.get('status')));
   const [nodeFilter, setNodeFilter] = useState<NodeFilter>(() => parseNodeParam(searchParams.get('node')));
   const [ageWindow, setAgeWindow] = useState<AgeWindow>(() => parseAgeParam(searchParams.get('age')));
+  const [listLimit, setListLimit] = useState(() => parseListLimit(searchParams.get('limit')));
+  const listLimitRef = useRef(listLimit);
+  // Bumped after every list load, so a direct lookup refreshes with the list.
+  const [listGeneration, setListGeneration] = useState(0);
+  // A full identifier that matches no loaded row is looked up directly, so a
+  // sandbox outside the loaded rows can still be found.
+  const [lookup, setLookup] = useState<
+    // `answered`: some answer for this ID has arrived; until then the table
+    // shows as loading. Later refetches never bring the spinner back.
+    { publicId: string; sandbox: Sandbox | null; error: string | null; pending: boolean; answered: boolean } | null
+  >(null);
+  const lookupInFlightRef = useRef<string | null>(null);
+  const lookupTargetRef = useRef<string | null>(null);
 
   useEffect(() => {
     const params = new URLSearchParams();
@@ -633,10 +664,11 @@ function SandboxesPage() {
     if (statusFilter.length) params.set('status', statusFilter.join(','));
     if (nodeFilter !== DEFAULT_NODE_FILTER) params.set('node', nodeFilter);
     if (ageWindow !== DEFAULT_AGE_WINDOW) params.set('age', ageWindow);
+    if (listLimit !== DEFAULT_LIST_LIMIT) params.set('limit', String(listLimit));
     const qs = params.toString();
     const next = qs ? `${pathname}?${qs}` : pathname;
     window.history.replaceState(null, '', next);
-  }, [idFilter, templateFilter, statusFilter, nodeFilter, ageWindow, pathname]);
+  }, [idFilter, templateFilter, statusFilter, nodeFilter, ageWindow, listLimit, pathname]);
 
   const startRefreshCooldown = () => {
     refreshCooldownRef.current = true;
@@ -664,10 +696,14 @@ function SandboxesPage() {
   const refresh = async ({ showLoading = true, reconcile = false }: { showLoading?: boolean; reconcile?: boolean } = {}) => {
     if (showLoading) setLoading(true);
     try {
-      const data = await getConsoleSandboxes();
+      const limit = listLimitRef.current;
+      const data = await getConsoleSandboxes(limit);
+      // The load size changed while this request ran; its answer is stale.
+      if (limit !== listLimitRef.current) return;
       data.sort((a, b) => parseUptime(b.uptime) - parseUptime(a.uptime) || a.id.localeCompare(b.id));
       setSandboxes(data);
-      markViewRefreshed(SANDBOXES_VIEW_REFRESH_KEY);
+      setListGeneration((n) => n + 1);
+      markViewRefreshed(sandboxesRefreshKey(limit));
     } catch (err: any) {
       // Keep the last rendered view when a node-local manager is briefly unavailable.
       throw new Error(err.message || 'failed to refresh sandboxes');
@@ -688,9 +724,10 @@ function SandboxesPage() {
       return;
     }
     void runLockedViewRefresh(
-      SANDBOXES_VIEW_REFRESH_KEY,
+      sandboxesRefreshKey(listLimitRef.current),
       () => refresh({ showLoading: false }),
-      { staleMs: VIEW_REFRESH_STALE_MS },
+      // A larger load is a heavier query; poll it less often.
+      { staleMs: listLimitRef.current > DEFAULT_LIST_LIMIT ? LARGE_LIST_STALE_MS : VIEW_REFRESH_STALE_MS },
     ).catch((err: any) => console.warn(err.message || err));
   };
 
@@ -729,7 +766,7 @@ function SandboxesPage() {
     startRefreshCooldown();
     setManualRefreshing(true);
     void runLockedViewRefresh(
-      SANDBOXES_VIEW_REFRESH_KEY,
+      sandboxesRefreshKey(listLimitRef.current),
       () => refresh({ showLoading: false, reconcile: true }),
       { force: true },
     ).then((ran) => {
@@ -846,9 +883,8 @@ function SandboxesPage() {
     closeCreateLifecycleModal();
   };
 
-  const openLifecycleModal = (sandboxId: string) => {
-    const sandbox = sandboxes.find((entry) => entry.id === sandboxId);
-    if (!sandbox) return;
+  // Takes the row itself: a looked-up row is not among the loaded sandboxes.
+  const openLifecycleModal = (sandbox: Sandbox) => {
     lifecycleForm.setFieldsValue({
       auto_lifecycle: policyToFormValue(sandbox.auto_lifecycle),
     });
@@ -953,17 +989,22 @@ function SandboxesPage() {
     }
   };
 
+  const query = useMemo(() => sandboxQuery(idFilter), [idFilter]);
+  const listTruncated = listIsCapped(sandboxes, listLimit);
+
   const filteredSandboxes = useMemo(() => {
-    const idQuery = idFilter.trim().toLowerCase().replaceAll('-', '');
+    // A full identifier names one sandbox; the other filters do not hide it.
+    if (query.kind === 'ref') {
+      const loaded = sandboxes.filter((s) => matchesSandboxQuery(query, s));
+      if (loaded.length > 0) return loaded;
+      return lookup?.publicId === query.ref.publicId && lookup.sandbox ? [lookup.sandbox] : [];
+    }
+
     const ageMs = AGE_WINDOW_OPTIONS.find((opt) => opt.value === ageWindow)?.ms ?? null;
     const cutoff = ageMs === null ? null : Date.now() - ageMs;
 
     return sandboxes.filter((s) => {
-      if (idQuery) {
-        const compactId = s.id.replaceAll('-', '').toLowerCase();
-        const nameMatch = (s.name || '').toLowerCase().includes(idFilter.trim().toLowerCase());
-        if (!compactId.includes(idQuery) && !nameMatch) return false;
-      }
+      if (!matchesSandboxQuery(query, s)) return false;
 
       if (templateFilter.length > 0 && !templateFilter.includes(s.template || '')) {
         return false;
@@ -987,7 +1028,53 @@ function SandboxesPage() {
 
       return true;
     });
-  }, [sandboxes, idFilter, templateFilter, statusFilter, nodeFilter, ageWindow]);
+  }, [sandboxes, query, lookup, templateFilter, statusFilter, nodeFilter, ageWindow]);
+
+  const lookupNeeded =
+    query.kind === 'ref' && !loading && !sandboxes.some((s) => matchesSandboxQuery(query, s));
+  const lookupId = lookupNeeded && query.kind === 'ref' ? query.ref.publicId : null;
+  // The ID the search box names now; an answer for any other ID is dropped.
+  lookupTargetRef.current = query.kind === 'ref' ? query.ref.publicId : null;
+
+  useEffect(() => {
+    if (!lookupId) return;
+    // One request per ID at a time; the next list load refreshes it again.
+    if (lookupInFlightRef.current === lookupId) return;
+    lookupInFlightRef.current = lookupId;
+    setLookup((prev) =>
+      prev?.publicId === lookupId
+        ? { ...prev, pending: true }
+        : { publicId: lookupId, sandbox: null, error: null, pending: true, answered: false },
+    );
+    getConsoleSandbox(lookupId)
+      .then((sandbox) => {
+        if (lookupTargetRef.current !== lookupId) return;
+        setLookup({ publicId: lookupId, sandbox, error: null, pending: false, answered: true });
+      })
+      .catch((err: any) => {
+        if (lookupTargetRef.current !== lookupId) return;
+        const message = err?.message || 'lookup failed';
+        // A 404 means the sandbox is gone; any other failure keeps the last row.
+        setLookup((prev) => ({
+          publicId: lookupId,
+          sandbox: err?.status === 404 || prev?.publicId !== lookupId ? null : prev.sandbox,
+          error: message,
+          pending: false,
+          answered: true,
+        }));
+      })
+      .finally(() => {
+        if (lookupInFlightRef.current === lookupId) lookupInFlightRef.current = null;
+      });
+  }, [lookupId, listGeneration]);
+
+  const lookupPending = lookupId !== null && !(lookup?.publicId === lookupId && lookup.answered);
+
+  const changeListLimit = (value: number) => {
+    listLimitRef.current = value;
+    setListLimit(value);
+    refreshAndReport();
+  };
 
   const templateFilterOptions = useMemo(() => {
     const set = new Set<string>();
@@ -1080,7 +1167,7 @@ function SandboxesPage() {
               size="small"
               icon={<ClockCircleOutlined />}
               aria-label={configured ? 'Manage lifecycle policy' : 'Set lifecycle policy'}
-              onClick={() => openLifecycleModal(record.id)}
+              onClick={() => openLifecycleModal(record)}
             />
           </Tooltip>
         );
@@ -1241,10 +1328,10 @@ function SandboxesPage() {
           <Input
             allowClear
             size="small"
-            placeholder="ID or name"
+            placeholder="ID, pod name or name"
             value={idFilter}
             onChange={(e) => setIdFilter(e.target.value)}
-            style={{ width: 180 }}
+            style={{ width: 260 }}
           />
           <Select
             mode="multiple"
@@ -1286,8 +1373,18 @@ function SandboxesPage() {
             options={AGE_WINDOW_OPTIONS.map((opt) => ({ value: opt.value, label: opt.label }))}
             style={{ width: 150 }}
           />
+          <Select
+            size="small"
+            value={listLimit}
+            onChange={changeListLimit}
+            options={Array.from(new Set([...LIST_LIMIT_OPTIONS, listLimit]))
+              .sort((a, b) => a - b)
+              .map((value) => ({ value, label: `Load newest ${value}` }))}
+            style={{ width: 170 }}
+            aria-label="Number of sandboxes to load"
+          />
           <Text type="secondary" style={{ fontSize: 12 }}>
-            {filteredSandboxes.length} / {sandboxes.length}
+            {filteredSandboxes.length} / {sandboxes.length}{listTruncated ? '+' : ''}
           </Text>
           {filtersActive ? (
             <Button size="small" type="link" onClick={clearFilters}>Reset</Button>
@@ -1295,11 +1392,32 @@ function SandboxesPage() {
         </div>
       </Card>
 
+      {query.kind === 'ref' && lookupNeeded && lookup?.publicId === query.ref.publicId ? (
+        lookup.sandbox ? (
+          <Alert
+            type="info"
+            showIcon
+            style={{ marginBottom: 12 }}
+            title={`Found ${query.ref.publicId} by direct lookup. It is not among the newest ${listLimit} sandboxes loaded below.`}
+            description={lookup.error ? `The last refresh of this row failed: ${lookup.error}` : undefined}
+          />
+        ) : lookup.error ? (
+          <Alert type="warning" showIcon style={{ marginBottom: 12 }} title={`${query.ref.publicId}: ${lookup.error}`} />
+        ) : null
+      ) : listTruncated ? (
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 12 }}
+          title={`Showing the newest ${listLimit} sandboxes. Filters apply to these rows only; enter a full sandbox ID or pod name to look up any sandbox.`}
+        />
+      ) : null}
+
       <Table
         columns={columns}
         dataSource={filteredSandboxes}
         rowKey="id"
-        loading={loading}
+        loading={loading || lookupPending}
         size="small"
         pagination={tablePagination('sandboxes')}
         scroll={{ x: 1280 }}

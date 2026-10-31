@@ -1,6 +1,6 @@
 import { OperationFailedError, OperationTimeoutError } from './accepted-create';
 import { adminApi, api, ApiError } from './api';
-import { parseSandboxRef, publicSandboxIdFromAny } from './sandbox-id';
+import { DEFAULT_LIST_LIMIT, parseSandboxRef, publicSandboxIdFromAny } from './sandbox-id';
 import {
   PublicOperationRecord,
   PublicPage,
@@ -32,8 +32,11 @@ export async function getPublicSandbox(id: string): Promise<Sandbox> {
   return publicSandboxToConsoleSandbox(await api.get<PublicSandbox>(`/sandboxes/${id}`));
 }
 
-export async function getConsoleSandboxes(): Promise<Sandbox[]> {
-  const sandboxes = await adminApi.get<Sandbox[]>('/v1/sandboxes?limit=1000');
+// The newest `limit` sandbox rows across every org, followed by rows nodes
+// report without a database row (see `sandboxRowCount`). The admin list has
+// no cursor.
+export async function getConsoleSandboxes(limit: number = DEFAULT_LIST_LIMIT): Promise<Sandbox[]> {
+  const sandboxes = await adminApi.get<Sandbox[]>(`/v1/sandboxes?limit=${limit}`);
   return sandboxes.map(adminSandboxToConsoleSandbox);
 }
 
