@@ -1452,6 +1452,9 @@ pub trait SubstrateAdapter: Send + Sync {
     ) -> Result<Option<RuntimeClient>, ControllerError>;
 
     /// Probe without mutating routing evidence or deleting execution objects.
+    /// On Direct, the lookup may place a `started` row that has no active
+    /// node back on the node still running it. It changes no lifecycle and
+    /// reserves no generation.
     /// Cancellable ingress preparation uses this before assigning an activation owner.
     async fn probe_runtime_client(
         &self,
