@@ -7,10 +7,10 @@ use pplx_space_common_core::types::SubstrateKind;
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::PositiveDuration;
 use pplx_space_sandbox_portability::{
-    SuspendedK8sFinalizationSql, SuspendedTargetNodeAssignment,
-    clear_current_local_artifact_marker_assignments, started_repair_revert_eligibility,
+    SuspendedK8sFinalizationSql, SuspendedTargetNodeAssignment, started_repair_revert_eligibility,
     suspended_k8s_finalization_sql,
 };
+use pplx_space_sandbox_store::repair;
 use sqlx::PgPool;
 
 use super::{ApplyOutcome, NewestExecutionRow, RepairCandidate, RepairSink};
@@ -35,31 +35,6 @@ impl RepairDbStore {
 
 fn duration_secs_i64(duration: PositiveDuration) -> i64 {
     i64::try_from(duration.get().as_secs()).unwrap_or(i64::MAX)
-}
-
-/// The row-state guards shared by scan and apply: an aged
-/// `started` Kubernetes row with no active execution and no execution that
-/// still carries a `pod_ip` (a row that could describe a live route). The
-/// snapshot eligibility is composed in separately. `managed_by_param` is bound
-/// to [`SubstrateKind::Kubernetes`].
-fn row_state_guards(managed_by_param: &str, min_age_param: &str) -> String {
-    format!(
-        "s.managed_by = {managed_by_param}
-         AND s.lifecycle = 'started'
-         AND s.lifecycle_changed_at <= NOW() - make_interval(secs => {min_age_param}::BIGINT)
-         AND NOT EXISTS (
-             SELECT 1
-               FROM sandbox_k8s_executions e
-              WHERE e.sandbox_id = s.id
-                AND e.active
-         )
-         AND NOT EXISTS (
-             SELECT 1
-               FROM sandbox_k8s_executions e
-              WHERE e.sandbox_id = s.id
-                AND e.pod_ip IS NOT NULL
-         )"
-    )
 }
 
 impl RepairDbStore {
@@ -118,7 +93,7 @@ impl RepairDbStore {
              LIMIT $4
             ",
             clear_marker = eligibility.clear_marker,
-            guards = row_state_guards("$5", "$1"),
+            guards = repair::started_repair_row_state_guards("$5", "$1"),
             eligible = eligibility.eligible,
         );
         let rows: Vec<ExecutionCandidateRow> =
@@ -151,12 +126,11 @@ impl RepairDbStore {
             .collect())
     }
 
-    /// A guarded UPDATE re-verifies every scan
-    /// condition and additionally asserts the newest execution generation is
-    /// unchanged — a raced start allocates a higher generation, so the CAS
-    /// simply matches zero rows. The `pre` CTE re-derives the marker-clear
-    /// decision at apply time; `RETURNING pre.will_clear` reports what
-    /// actually happened.
+    /// A guarded UPDATE ([`repair::revert_started_to_suspended`]) re-verifies
+    /// every scan condition and additionally asserts the newest execution
+    /// generation is unchanged — a raced start allocates a higher generation,
+    /// so the CAS simply matches zero rows. It re-derives the marker-clear
+    /// decision at apply time and reports what actually happened.
     ///
     /// Concurrency: the sandbox row is locked (`SELECT ... FOR UPDATE`) in
     /// its own statement before the guarded UPDATE. Execution writers
@@ -187,50 +161,22 @@ impl RepairDbStore {
             return Ok(ApplyOutcome::SkippedRaced);
         }
 
-        let eligibility = started_repair_revert_eligibility("s");
-        let artifact_marker_assignments =
-            clear_current_local_artifact_marker_assignments("s", "pre.will_clear");
-        let finalization = suspended_k8s_finalization_sql(
-            "s",
-            "pre",
-            &artifact_marker_assignments,
-            SuspendedTargetNodeAssignment::Clear,
-        );
-        let query = format!(
-            "WITH pre AS (
-                 SELECT id,
-                        {clear_marker} AS will_clear
-                   FROM sandboxes s
-                  WHERE s.id = $1
-             )
-             UPDATE sandboxes s
-                SET {sandbox_assignments}
-               FROM pre
-              WHERE s.id = pre.id
-                AND {guards}
-                AND (SELECT COALESCE(MAX(e.generation), 0)
-                       FROM sandbox_k8s_executions e
-                      WHERE e.sandbox_id = s.id) = $3
-                AND {eligible}
-            RETURNING pre.will_clear",
-            clear_marker = eligibility.clear_marker,
-            sandbox_assignments = finalization.sandbox_assignments(),
-            guards = row_state_guards("$4", "$2"),
-            eligible = eligibility.eligible,
-        );
-        let cleared_marker: Option<bool> =
-            sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(query.as_str())))
-                .bind(candidate.sandbox_id)
-                .bind(duration_secs_i64(min_age))
-                .bind(newest_generation)
-                .bind(SubstrateKind::Kubernetes)
-                .fetch_optional(&mut *tx)
-                .await?;
-        let Some(cleared_marker) = cleared_marker else {
+        let Some(cleared_marker) = repair::revert_started_to_suspended(
+            &mut tx,
+            candidate.sandbox_id,
+            min_age,
+            newest_generation,
+        )
+        .await?
+        else {
             tx.rollback().await?;
             return Ok(ApplyOutcome::SkippedRaced);
         };
 
+        // Only the port-exposure assignments are read from this renderer;
+        // they do not depend on the marker policy the flip above applied.
+        let finalization =
+            suspended_k8s_finalization_sql("s", "pre", "", SuspendedTargetNodeAssignment::Clear);
         self.reset_open_port_exposures(&mut tx, candidate.sandbox_id, &finalization)
             .await?;
 

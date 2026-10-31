@@ -86,8 +86,8 @@ static SANDBOX_POPULATION_QUERY: LazyLock<String> = LazyLock::new(|| {
                               OR sos.pid IS NOT NULL
                               OR sb.active_node_id IS NOT NULL)))
          -- The repair loop's evidence that a failed sandbox's VM may still run
-         -- (`failed_restorable_repair::store::row_state_guards`): an execution
-         -- the Kubernetes substrate holds active or with a pod IP.
+         -- (`pplx_space_sandbox_store::repair::failed_repair_row_state_guards`):
+         -- an execution the Kubernetes substrate holds active or with a pod IP.
          CROSS JOIN LATERAL (
              SELECT EXISTS (
                  SELECT 1 FROM sandbox_k8s_executions e

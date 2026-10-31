@@ -1907,8 +1907,9 @@ fn inflight_snapshot_matches_current_suspend(sandbox_alias: &str) -> String {
 /// Every current Postgres writer of a non-NULL marker is a suspend path, and
 /// four write `'suspend'` whenever they write an origin at all: `kubernetes/store/suspend.rs`'s
 /// suspend-commit `UPDATE` and the cluster controller's quarantine recovery to
-/// `suspended` (`orphaned_sandboxes/quarantine_recovery/store.rs`, which also
-/// nulls `active_node_id`) spell it in their SQL, while
+/// `suspended`
+/// (`pplx_space_sandbox_store::repair::recover_quarantined_publication_to_suspended`,
+/// which also nulls `active_node_id`) spell it in their SQL, while
 /// `finalize_suspended_sandbox_in` (both callers bind `ArtifactOrigin::Suspend`)
 /// and `persist_optional_current_local_artifact` (whose only caller, the Direct
 /// substrate's `suspend_execution`, binds it too) take it as a parameter. The
