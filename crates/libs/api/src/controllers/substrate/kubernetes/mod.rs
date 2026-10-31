@@ -85,8 +85,8 @@ use super::{
     ExecutionIdentity, ExecutionRoutabilityCheck, NODE_RPC_TIMEOUT, NodeApiTarget,
     NodeInventoryEntry, ObservedPod, ObservedPodIdentity, OwnedNodeApiTarget, PodFenceMismatch,
     PodIdentityFence, RecordedExecution, RetireExecutionOutcome, RetireExecutionRequest,
-    RetireFence, RuntimeClient, SubstrateAdapter, SubstrateCapabilities, SubstrateError,
-    TeardownProgress, WaitReadyTimeoutPhase, connect_worker, node_api_endpoint,
+    RetireFence, RetireStopRoute, RuntimeClient, SubstrateAdapter, SubstrateCapabilities,
+    SubstrateError, TeardownProgress, WaitReadyTimeoutPhase, connect_worker, node_api_endpoint,
 };
 
 const START_WAIT_FAST_POLL_INTERVAL: Duration = Duration::from_millis(250);
