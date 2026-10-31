@@ -4,6 +4,7 @@ import { type ReactNode, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { adminApi } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
+import { publicSandboxIdFromAny } from '@/lib/sandbox-id';
 import {
   AdminNodeResponse,
   DrainMode,
@@ -794,7 +795,7 @@ export default function NodesPage() {
           scroll={{ y: 'calc(100vh - 300px)' }}
           pagination={false}
           columns={[
-            { title: 'Sandbox', dataIndex: 'id', width: 360, render: (id: string) => <Link href={`/dashboard/sandboxes/${id}`}>{id}</Link> },
+            { title: 'Sandbox', dataIndex: 'id', width: 360, render: (id: string) => <Link href={`/dashboard/sandboxes/${publicSandboxIdFromAny(id)}`}>{publicSandboxIdFromAny(id)}</Link> },
             { title: 'Lifecycle', dataIndex: 'lifecycle', width: 120 },
             { title: 'Placement', render: (_, row) => [row.active_node_id === selectedNode?.id ? 'active' : '', row.target_node_id === selectedNode?.id ? 'target' : ''].filter(Boolean).join(', ') },
           ]}

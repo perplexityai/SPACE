@@ -1,6 +1,6 @@
 import { OperationFailedError, OperationTimeoutError } from './accepted-create';
-import { adminApi, api } from './api';
-import { publicSandboxIdFromAny } from './sandbox-id';
+import { adminApi, api, ApiError } from './api';
+import { parseSandboxRef, publicSandboxIdFromAny } from './sandbox-id';
 import {
   PublicOperationRecord,
   PublicPage,
@@ -37,8 +37,14 @@ export async function getConsoleSandboxes(): Promise<Sandbox[]> {
   return sandboxes.map(adminSandboxToConsoleSandbox);
 }
 
+// `id` may be any form `parseSandboxRef` accepts; the admin route takes only
+// the `sbx_` form.
 export async function getConsoleSandbox(id: string): Promise<Sandbox> {
-  return adminSandboxToConsoleSandbox(await adminApi.get<Sandbox>(`/v1/sandboxes/${id}`));
+  const ref = parseSandboxRef(id);
+  if (!ref) {
+    throw new ApiError(400, 'Not a sandbox ID, UUID or sandbox pod name');
+  }
+  return adminSandboxToConsoleSandbox(await adminApi.get<Sandbox>(`/v1/sandboxes/${ref.publicId}`));
 }
 
 export async function postPublicOperation(
