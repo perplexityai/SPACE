@@ -17,6 +17,13 @@ import type { ColumnsType } from 'antd/es/table';
 
 const { Title } = Typography;
 
+const BYOK_VOLUME_SWITCH = 'SPACE_BYOK_VOLUME_ENCRYPTION';
+const BYOK_SHARED = 'The same flag is shared with credential encryption.';
+const BYOK_EXISTING = 'Existing sandboxes keep the encryption they were created with.';
+const BYOK_ENABLE_TEXT = `New sandboxes in this organization run on encrypted volumes keyed through the external provider, and are not created from warm pools, only where the cluster also enables BYOK volume encryption (${BYOK_VOLUME_SWITCH}). ${BYOK_SHARED} ${BYOK_EXISTING}`;
+const BYOK_DISABLE_TEXT = `New sandboxes in this organization are created without volume encryption. ${BYOK_SHARED} ${BYOK_EXISTING} Encrypted ones still start, suspend and restore.`;
+const BYOK_CARD_TEXT = `When enabled, and the cluster enables BYOK volume encryption (${BYOK_VOLUME_SWITCH}), newly created sandboxes run on encrypted volumes keyed through the configured external provider and are not created from warm pools. ${BYOK_SHARED} ${BYOK_EXISTING}`;
+
 export default function OrgDetailPage() {
   const { message, modal } = App.useApp();
   const { primaryColor: defaultPrimaryColor } = useCuriosityTheme();
@@ -73,13 +80,17 @@ export default function OrgDetailPage() {
     }
   };
 
-  // BYOK decides how every new sandbox in the org is created; confirm first.
+  // BYOK decides how new sandboxes in the org are created; confirm first. The
+  // texts follow the create path (`controllers/sandbox/queries.rs`): a new
+  // sandbox is encrypted only when the org flag and the cluster's
+  // SPACE_BYOK_VOLUME_ENCRYPTION are both on, the flag is shared with
+  // credential encryption, and a sandbox's encryption stamp never changes.
   const confirmByokToggle = (checked: boolean) => {
     modal.confirm({
       title: checked ? `Enable BYOK encryption for ${org?.name}?` : `Disable BYOK encryption for ${org?.name}?`,
       content: checked
-        ? 'New sandboxes in this organization will run on encrypted volumes keyed through the external provider and will not use warm pools. Existing sandboxes keep their current encryption.'
-        : 'New sandboxes in this organization will run on unencrypted volumes. Existing sandboxes keep their current encryption.',
+        ? BYOK_ENABLE_TEXT
+        : BYOK_DISABLE_TEXT,
       okText: checked ? 'Enable BYOK' : 'Disable BYOK',
       onOk: () => handleByokToggle(checked),
     });
@@ -264,11 +275,7 @@ export default function OrgDetailPage() {
               Encrypt this organization&apos;s sandboxes with its own key
             </Typography.Text>
           </Space>
-          <Typography.Text type="secondary">
-            When enabled, newly created sandboxes run on encrypted volumes keyed
-            through the configured external provider and bypass warm pools.
-            Existing sandboxes keep the encryption state they were created with.
-          </Typography.Text>
+          <Typography.Text type="secondary">{BYOK_CARD_TEXT}</Typography.Text>
 
           {masterKey ? (
             <Descriptions size="small" column={1}>
