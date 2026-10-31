@@ -153,11 +153,17 @@ fn ensure_delta_template_available(
     header: &crate::proto::ImportSandboxHeader,
 ) -> Result<(), Status> {
     if header.is_delta && !header.template_id.is_empty() && !header.content_hash.is_empty() {
-        let template_dir = pplx_space_common_core::host::linux::paths::template_build_dir(
-            &header.template_id,
-            &header.content_hash,
-        );
-        if !std::path::Path::new(&template_dir).is_dir() {
+        // Deltas apply to rootfs bytes, which every cache partition of the
+        // digest shares.
+        let template_rootfs =
+            pplx_space_common_core::host::linux::paths::cached_template_rootfs_path(
+                &header.template_id,
+                &header.content_hash,
+            );
+        if !std::path::Path::new(&template_rootfs)
+            .parent()
+            .is_some_and(std::path::Path::is_dir)
+        {
             return Err(Status::failed_precondition(format!(
                 "delta import requires template '{}' with hash '{}' on this node. Pull the template first, or use full transfer.",
                 header.template_id, header.content_hash
@@ -250,7 +256,7 @@ async fn apply_sandbox_delta_import(
     }
 
     let dest_file = format!("{}/rootfs.ext4", paths.instance_staging);
-    let template_rootfs = pplx_space_common_core::host::linux::paths::template_rootfs_path(
+    let template_rootfs = pplx_space_common_core::host::linux::paths::cached_template_rootfs_path(
         &header.template_id,
         &header.content_hash,
     );
@@ -467,7 +473,7 @@ impl SandboxManagerService {
                                 }
                             }
                             let template_rootfs =
-                                pplx_space_common_core::host::linux::paths::template_rootfs_path(
+                                pplx_space_common_core::host::linux::paths::cached_template_rootfs_path(
                                     &template,
                                     &template_hash,
                                 );

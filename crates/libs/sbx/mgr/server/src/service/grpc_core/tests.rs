@@ -1225,6 +1225,41 @@ fn template_catalog_preserves_owner_identity_with_corrupt_supplemental_metadata(
     assert!(templates[0].spaced_version.is_empty());
 }
 
+/// A build cached for another environment reads its metadata from its own
+/// cache partition's dir.
+#[test]
+fn template_catalog_reads_a_twin_s_metadata_from_its_partition() {
+    use pplx_space_common_core::types::{Digest, EnvironmentReference, TemplateCachePartition};
+    let cache = tempfile::tempdir().unwrap();
+    let hash = format!("sha256:{}", "a".repeat(64));
+    let twin = EnvironmentReference::new(Digest::sha256([2; 32]));
+    let directory = cache
+        .path()
+        .join("seed")
+        .join(TemplateCachePartition::Environment(twin).build_dir_name(&hash));
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(
+        directory.join("metadata.json"),
+        br#"{"description":"twin"}"#,
+    )
+    .unwrap();
+    let templates = project_template_catalog(
+        vec![TemplateFullInfo {
+            name: "seed".into(),
+            content_hash: Some(hash),
+            built_at: Some("2026-09-18".into()),
+            execution: Some(pplx_space_execution_common::proto::ExecutionMetadata {
+                environment: Some(twin.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }],
+        cache.path(),
+    )
+    .unwrap();
+    assert_eq!(templates[0].description, "twin");
+}
+
 #[test]
 fn template_catalog_selects_latest_owned_build_independent_of_cache_or_input_order() {
     let cache = tempfile::tempdir().unwrap();

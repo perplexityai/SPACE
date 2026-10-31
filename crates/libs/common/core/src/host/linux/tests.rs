@@ -95,3 +95,28 @@ fn content_addressed_file_name_is_exactly_name_dash_hex8() {
         );
     }
 }
+
+#[test]
+fn cached_template_rootfs_prefers_legacy_then_any_partition() {
+    use crate::types::{Digest, EnvironmentReference, TemplateCachePartition};
+    let root = tempfile::tempdir().unwrap();
+    let hash = format!("sha256:{}", "a".repeat(64));
+    let twin =
+        TemplateCachePartition::Environment(EnvironmentReference::new(Digest::sha256([2; 32])));
+    let rootfs = |partition: TemplateCachePartition| {
+        root.path()
+            .join("seed")
+            .join(partition.build_dir_name(&hash))
+            .join("rootfs.ext4")
+    };
+    let resolve = || paths::cached_template_rootfs_path_in(root.path(), "seed", &hash);
+    // Nothing cached: the legacy path, whose absence callers handle.
+    assert_eq!(resolve(), rootfs(TemplateCachePartition::Legacy));
+    for partition in [twin, TemplateCachePartition::Legacy] {
+        let path = rootfs(partition);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"rootfs").unwrap();
+        // Only the twin first, then both: the legacy build wins.
+        assert_eq!(resolve(), path);
+    }
+}

@@ -1078,11 +1078,29 @@ message DenyPortResponse {}
 
 // ─── Btrfs delegation messages ─────────────────────────────────────────
 
+// A template build bound to an environment other than the initial one. Its
+// node-local cache partition is `{content_hash}@{environment}`, separate from
+// the legacy `{content_hash}` build of the same rootfs, and its subvolume's
+// received_uuid covers the environment too. Unbound and initial-environment
+// builds keep using the legacy `content_hash` field.
+//
+// Requests carrying this message leave their legacy `content_hash` empty, so
+// a node-manager that predates partitions rejects them instead of acting on
+// the legacy build. Servers reject a request that sets both, and one whose
+// environment selects the legacy partition.
+message EnvironmentTemplateBuild {
+  string content_hash = 1;
+  string environment = 2;
+}
+
 message BtrfsCreateTemplateSubvolumeRequest {
   // Template identifiers — nodemgr derives the canonical digest dir
   // path from these. Callers do NOT pass arbitrary paths.
   string template_name = 1;
   string content_hash = 2;  // "sha256:..."
+  // Set instead of `content_hash` for a build in an environment's cache
+  // partition; see EnvironmentTemplateBuild.
+  EnvironmentTemplateBuild environment_build = 3;
 }
 message BtrfsCreateTemplateSubvolumeResponse {
   // The path nodemgr created, returned for logging / sanity-checking
@@ -1094,6 +1112,9 @@ message BtrfsCreateTemplateSubvolumeResponse {
 message BtrfsFinalizeTemplateSubvolumeRequest {
   string template_name = 1;
   string content_hash = 2;
+  // Set instead of `content_hash` for a build in an environment's cache
+  // partition; see EnvironmentTemplateBuild.
+  EnvironmentTemplateBuild environment_build = 3;
 }
 message BtrfsFinalizeTemplateSubvolumeResponse {
   // The UUIDv5 nodemgr stamped, returned so the caller can log it
@@ -1106,6 +1127,9 @@ message BtrfsFinalizeTemplateSubvolumeResponse {
 message BtrfsDeleteTemplateSubvolumeRequest {
   string template_name = 1;
   string content_hash = 2;
+  // Set instead of `content_hash` for a build in an environment's cache
+  // partition; see EnvironmentTemplateBuild.
+  EnvironmentTemplateBuild environment_build = 3;
 }
 message BtrfsDeleteTemplateSubvolumeResponse {}
 

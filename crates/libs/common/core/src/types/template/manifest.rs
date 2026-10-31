@@ -247,6 +247,16 @@ impl TemplateManifest {
         }
     }
 
+    /// The environment this document's execution metadata is bound to;
+    /// `None` for unbound documents.
+    pub fn environment(
+        &self,
+    ) -> Result<Option<crate::types::EnvironmentReference>, TemplateManifestSchemaError> {
+        Ok(self
+            .execution_metadata()?
+            .and_then(|execution| execution.environment()))
+    }
+
     /// The compressed sibling for the bootable artifact, when one is
     /// listed and well-formed. Returns `None` for legacy single-file
     /// builds that only ship `rootfs.ext4`.

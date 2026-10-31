@@ -215,9 +215,12 @@ pub async fn register_build_template(
     ensure_cluster_template(&mut cluster_api, &template, publication).await
 }
 
+/// Publishes a registered build from its template-manager cache directory,
+/// which is the cache partition of the `environment` it's bound to.
 pub async fn publish_build(
     template_id: &str,
     content_hash: &str,
+    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
     publish_tags: &[String],
     publication: TemplatePublication,
 ) -> Result<(), PublishError> {
@@ -226,6 +229,7 @@ pub async fn publish_build(
     let build_dir = PathBuf::from(template_build_dir(
         template.as_str(),
         &content_hash.to_string(),
+        pplx_space_node_runtime_core::catalog::template_cache_partition(environment),
     ));
     let mut cluster_api = match connect_cluster_api_from_env().await {
         Ok(client) => client,

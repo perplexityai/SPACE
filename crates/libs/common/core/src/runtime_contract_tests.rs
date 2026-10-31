@@ -21,8 +21,26 @@ fn host_linux_paths_preserve_space_layout() {
         "/space/cache/firecracker/sandboxes/sbx-1/metadata.json"
     );
     assert_eq!(
-        host::linux::paths::template_rootfs_path("seed", "abc"),
+        host::linux::paths::template_rootfs_path(
+            "seed",
+            "abc",
+            crate::types::TemplateCachePartition::Legacy
+        ),
         "/space/cache/firecracker/templates/seed/abc/rootfs.ext4"
+    );
+    let environment =
+        crate::types::EnvironmentReference::new(crate::types::Digest::sha256([2; 32]));
+    assert_eq!(
+        host::linux::paths::template_snapshot_dir(
+            "seed",
+            "abc",
+            crate::types::TemplateCachePartition::Environment(environment),
+            2,
+            1024
+        ),
+        format!(
+            "/space/cache/firecracker/templates/seed/snapshots/abc@{environment}/2vcpu-1024mib"
+        )
     );
 }
 
