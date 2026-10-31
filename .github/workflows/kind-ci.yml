@@ -88,14 +88,63 @@ jobs:
         continue-on-error: true
         run: python3 infra/space/kind/scripts/rust-artifact-handoff.py reuse ghcr.io/perplexityai/space-kind-rust-artifacts
 
+      # A PR that changes Rust inputs restores main's newest incremental build
+      # state instead of compiling the workspace from its dependencies up: the
+      # Cargo target directory, the source mirror whose mtimes tell Cargo what
+      # changed, and the Cargo home (infra/space/kind/scripts/rust-state-cache.sh).
+      # The build below then runs in incremental mode and recompiles only the
+      # crates whose inputs changed; without a restored state it builds in
+      # Docker mode, as before. The key never crosses the toolchain, the Cargo
+      # config, the builder image or the scripts that drive the build. It does
+      # cross Cargo.lock, whose changes Cargo's own fingerprints track. Main
+      # never restores one: rust_state below builds main's cold. Setting the
+      # repository variable SPACE_KIND_RUST_STATE to `off` turns this off.
+      - &rust-state-key
+        name: Name the Kind Rust build state
+        id: state-key
+        if: steps.reuse.outputs.reused != 'true' && inputs.rust_build != 'release' && vars.SPACE_KIND_RUST_STATE != 'off'
+        env:
+          FAMILY: space-target-v2-${{ runner.os }}-${{ runner.arch }}-kind-test-hooks
+          HARD: >-
+            ${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml', 'docker/Dockerfile.rust-build-common',
+            'docker/run-cargo-with-sccache.sh', 'infra/space/kind/scripts/build-rust-artifacts.sh',
+            'infra/space/kind/scripts/sync-rust-sources.py', 'infra/space/kind/scripts/rust-state-cache.sh') }}
+          LOCK: ${{ hashFiles('Cargo.lock') }}
+        run: |
+          {
+            echo "hard=${FAMILY}-${HARD:0:16}-"
+            echo "lock=${FAMILY}-${HARD:0:16}-${LOCK:0:16}-"
+            echo "key=${FAMILY}-${HARD:0:16}-${LOCK:0:16}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          } >>"${GITHUB_OUTPUT}"
+
+      - name: Restore main's Kind Rust build state
+        if: steps.state-key.outcome == 'success' && github.event_name != 'push'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/kind-rust-state-parts
+          key: ${{ steps.state-key.outputs.key }}
+          restore-keys: |
+            ${{ steps.state-key.outputs.lock }}
+            ${{ steps.state-key.outputs.hard }}
+
+      - name: Unpack the Kind Rust build state
+        id: state
+        if: steps.state-key.outcome == 'success' && github.event_name != 'push'
+        run: >-
+          bash infra/space/kind/scripts/rust-state-cache.sh unpack
+          "${RUNNER_TEMP}/kind-rust-state-parts" "${RUNNER_TEMP}/kind-rust-state"
+
       - name: Build the Rust artifact image once
         if: steps.reuse.outputs.reused != 'true'
         env:
           SPACE_CI_IMAGE_MIRROR: ghcr
-          SPACE_KIND_RUST_ARTIFACTS: docker
+          SPACE_KIND_RUST_ARTIFACTS: ${{ steps.state.outputs.restored == 'true' && 'incremental' || 'docker' }}
           SPACE_KIND_RUST_BUILD: ${{ inputs.rust_build == 'release' && 'release' || '' }}
           SPACE_KIND_BUILD_CACHE_REPOSITORY: ghcr.io/perplexityai/space-kind-build-cache
           SPACE_KIND_BUILD_CACHE_WRITE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && '1' || '0' }}
+          SPACE_KIND_RUST_TARGET_DIR: ${{ runner.temp }}/kind-rust-state/target
+          SPACE_KIND_RUST_SRC_DIR: ${{ runner.temp }}/kind-rust-state/src
+          SPACE_KIND_CARGO_HOME: ${{ runner.temp }}/kind-rust-state/cargo-home
         run: bash infra/space/kind/scripts/build-rust-artifacts.sh
 
       - name: Export this run's artifact image
@@ -113,6 +162,59 @@ jobs:
           compression-level: 0
           if-no-files-found: error
           retention-days: 1
+
+  # Main only: the build state pull requests restore in rust_artifacts. A cold
+  # incremental build of main's commit, beside the producer and off the
+  # shards' critical path. Building it cold is what catches an input Cargo was
+  # never told about. Each run saves under a key of its own, and Main CI's
+  # rust_cache_cleanup keeps the newest state for each of the last few build
+  # inputs (ci/scripts/sccache-snapshot.py prune). Best-effort: without a saved
+  # state, pull requests build in Docker mode.
+  rust_state:
+    if: >-
+      github.repository == 'perplexityai/SPACE' && github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' && inputs.rust_build != 'release' &&
+      vars.SPACE_KIND_RUST_STATE != 'off'
+    name: Save the Kind Rust build state
+    runs-on: ubuntu-24.04-16core
+    timeout-minutes: 60
+    continue-on-error: true
+    steps:
+      - name: Check out SPACE
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - *enable-containerd-store
+
+      - name: Expose the existing Actions cache for read-only imports
+        uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4.0.0
+
+      - *ghcr-login
+
+      - *rust-state-key
+
+      - name: Build the Rust artifacts cold in incremental mode
+        env:
+          SPACE_CI_IMAGE_MIRROR: ghcr
+          SPACE_KIND_RUST_ARTIFACTS: incremental
+          SPACE_KIND_BUILD_CACHE_REPOSITORY: ghcr.io/perplexityai/space-kind-build-cache
+          SPACE_KIND_RUST_TARGET_DIR: ${{ runner.temp }}/kind-rust-state/target
+          SPACE_KIND_RUST_SRC_DIR: ${{ runner.temp }}/kind-rust-state/src
+          SPACE_KIND_CARGO_HOME: ${{ runner.temp }}/kind-rust-state/cargo-home
+        run: bash infra/space/kind/scripts/build-rust-artifacts.sh
+
+      - name: Pack the Kind Rust build state for upload
+        run: >-
+          bash infra/space/kind/scripts/rust-state-cache.sh pack
+          "${RUNNER_TEMP}/kind-rust-state" "${RUNNER_TEMP}/kind-rust-state-parts"
+
+      - name: Save the Kind Rust build state
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/kind-rust-state-parts
+          key: ${{ steps.state-key.outputs.key }}
 
   # Main only: push the image main's producer just built under its Rust input
   # key, for PRs with the same key to reuse, and prune the producer's two
@@ -196,15 +298,19 @@ jobs:
 
   smoke:
     if: github.repository == 'perplexityai/SPACE'
-    name: Kind / Firecracker smoke (${{ matrix.shard }}/4)
+    name: Kind / Firecracker smoke (${{ matrix.shard }}/6)
     permissions:
       actions: read
       contents: read
       packages: read
     strategy:
       fail-fast: false
+      # Six shards: with the leader-election brownout at the lease TTL floor, it
+      # is about one shard's share of the ECW pass at six, so a seventh shard
+      # would not lower the slowest. Keep the list, the job name and
+      # SMOKE_SHARD's count in step.
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5, 6]
     env:
       # Image builds, the charts' images and the observability backends'
       # images come from the GHCR mirror; see ci/mirrored-images.txt.
@@ -312,6 +418,23 @@ jobs:
       - name: Prepare Kind while the Rust producer builds
         run: bash infra/space/kind/scripts/prepare-cluster.sh
 
+      # Tiltfile evaluation installs the selected observability profile before
+      # Tilt registers its context, and none of it needs a SPACE image. In otel
+      # mode that is minutes of image loads and Helm waits, which ran after the
+      # producer finished. Installed here, they overlap the producer instead,
+      # and Tilt's own pass finds each release unchanged. The Datadog preflight
+      # runs first, as it does in the Tiltfile. Inside Tilt the install was
+      # bounded by the bring-up's 1800 s initialization timeout; the step keeps
+      # that bound, since `ctr images ls` and `kind load` have none of their own.
+      - name: Install the observability profile while the Rust producer builds
+        timeout-minutes: 30
+        env:
+          SPACE_KIND_CLUSTER: space-local
+        run: |
+          set -euo pipefail
+          python3 infra/space/kind/scripts/datadog_backend.py preflight --for-deployment >/dev/null
+          bash infra/space/kind/scripts/install-observability.sh
+
       - name: Wait for this attempt's Rust producer
         timeout-minutes: 70
         env:
@@ -327,6 +450,21 @@ jobs:
       - name: Load and verify the shared Rust artifact image
         run: python3 infra/space/kind/scripts/rust-artifact-handoff.py load "${RUNNER_TEMP}/kind-rust"
 
+      # Where the bring-up after the artifact handoff spends its time, per Tilt
+      # resource: scripts/benchmarks/kind-bringup-timeline.py records build
+      # windows, pod and Job transitions and the Tilt log stamped on arrival,
+      # which a passing run otherwise keeps none of. It runs in the background
+      # through the baseline smoke; the step after the baseline stops it and
+      # reports.
+      - name: Record the Kind bring-up timeline
+        run: |
+          set -euo pipefail
+          dir="${RUNNER_TEMP}/kind-bringup-timeline"
+          install -d "${dir}"
+          setsid nohup python3 scripts/benchmarks/kind-bringup-timeline.py watch "${dir}" \
+            >"${dir}/watch.out" 2>&1 </dev/null &
+          echo "$!" >"${dir}/watch.pid"
+
       # DATA_PLANE_URL makes the bring-up wait for the public data plane as well as the API.
       # The data plane's ReplicaSet reaches ready a few minutes after the API on a cold
       # stack; without this wait the baseline passes on the API alone and the typed suite's
@@ -338,6 +476,32 @@ jobs:
           BOOTSTRAP_TIMEOUT: 1800
           DATA_PLANE_URL: http://127.0.0.1:8090
         run: bash scripts/tests/smoke-kind-e2e.sh
+
+      # Snapshots Tilt's build history while Tilt still runs, stops the
+      # recorder, prints the timeline and uploads its raw files. Never fails
+      # the shard: the timeline is evidence, not a check.
+      - name: Report the Kind bring-up timeline
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 3
+        run: |
+          dir="${RUNNER_TEMP}/kind-bringup-timeline"
+          [[ -s "${dir}/watch.pid" ]] || exit 0
+          timeout 60 python3 scripts/benchmarks/kind-bringup-timeline.py snapshot "${dir}" >/dev/null || true
+          pid="$(<"${dir}/watch.pid")"
+          kill -TERM "${pid}" 2>/dev/null || true
+          for _ in $(seq 1 20); do kill -0 "${pid}" 2>/dev/null || break; sleep 1; done
+          timeout 60 python3 scripts/benchmarks/kind-bringup-timeline.py report "${dir}" || true
+
+      - name: Upload the Kind bring-up timeline
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kind-bringup-timeline-${{ matrix.shard }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kind-bringup-timeline/
+          retention-days: 7
+          if-no-files-found: ignore
 
       # Together the shards cover every ecw, network_policy, native, and local scenario.
       # Each shard stays serial against the isolated stack its baseline proved. The suite
@@ -356,7 +520,7 @@ jobs:
       - name: Run this shard of the typed Kind smoke
         env:
           SKIP_BOOTSTRAP: "1"
-          SMOKE_SHARD: ${{ matrix.shard }}/4
+          SMOKE_SHARD: ${{ matrix.shard }}/6
           SPACE_M1_GENERATOR_MIRROR: ghcr.io/perplexityai/space-ci-mirror
           SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE: ${{ runner.temp }}/space-smoke-admin-token
           SPACE_SMOKE_KIND_COLD_RECEIPTS: ${{ runner.temp }}/space-smoke-cold-receipts

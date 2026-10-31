@@ -19,6 +19,7 @@ from typing import Any, cast
 
 from space_smoke.adapters import (
     CLEANUP_REQUEST_SECONDS,
+    LEASE_TTL_ENV,
     LIVENESS_BUDGET_ENV,
     KindConfig,
     KindHarness,
@@ -187,10 +188,26 @@ class CleanupRestoreTests(unittest.TestCase):
             [command[5:7] for command in commands],
             [("get", "lease"), ("get", "lease"), ("set", "env")],
         )
+        # One write puts the budget back and removes the TTL hook with it.
         self.assertIn(f"{LIVENESS_BUDGET_ENV}-", commands[-1])
+        self.assertIn(f"{LEASE_TTL_ENV}-", commands[-1])
         self.assertTrue(
             all(bound is not None and bound <= CLEANUP_REQUEST_SECONDS for _, bound in executor.calls)
         )
+
+    def test_the_budget_restore_writes_nothing_when_setup_never_wrote(self) -> None:
+        # A preset TTL key refuses setup before its first write; the restore
+        # cleanup armed before that call must then leave the Deployment alone.
+        executor = _Executor()
+        harness = KindHarness(cast(Any, executor), KindConfig())
+        harness._retention_lease_ownership = _LeaseOwnership(
+            name="space-smoke-retention-x", uid="lease-uid", holder="me",
+            subject="retention controller mutation",
+        )
+
+        harness.restore_controller_liveness_budget_env(None, wait=False)
+
+        self.assertEqual(executor.calls, [])
 
     def test_the_budget_restore_gives_up_after_its_second_try(self) -> None:
         stalled = CommandResult(("kubectl",), 124, "", "command timed out")

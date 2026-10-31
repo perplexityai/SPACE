@@ -218,6 +218,13 @@ const DEFAULT_LEASE_FAILURE_GRACE: Duration = Duration::from_secs(600);
 /// compiled in.
 const LEASE_FAILURE_GRACE_TEST_ENV: &str =
     "SPACE_CLUSTER_CONTROLLER_LEADER_ELECTION_LEASE_FAILURE_GRACE_SECS";
+/// Test hook (`pplx_space_common_core::env::test_hook`) for the lease TTL
+/// [`Timings::derive`] is asked for, in whole seconds; it is clamped into
+/// `MIN_LEASE_TTL..MAX_LEASE_TTL` like the default, and the retry interval
+/// and the budget's floor follow the resolved TTL. Lets a Kind scenario run
+/// the election at the TTL floor, where the budget's floor is 72 s instead of
+/// 240 s. Inert unless the `test-hooks` feature is compiled in.
+const LEASE_TTL_TEST_ENV: &str = "SPACE_CLUSTER_CONTROLLER_LEADER_ELECTION_LEASE_TTL_SECS";
 
 /// Floor for the liveness budget as a multiple of the resolved lease TTL: a
 /// budget near the lease timings would restart the pod on exactly the transients
@@ -404,7 +411,7 @@ const MIN_LEASE_TTL: Duration = Duration::from_secs(RENEW_DEADLINE_MARGIN.as_sec
 /// The election's settings, resolved once from the environment, which supplies
 /// the kill-switch and the identity (`HOSTNAME`). [`Self::lease_ttl`],
 /// [`Self::retry_interval`] and [`Self::lease_failure_grace`] are this module's
-/// defaults, and the budget alone has a test-hook override. The renewal cadence and deadline are
+/// defaults; the TTL and the budget have test-hook overrides. The renewal cadence and deadline are
 /// *derived* from the TTL, and the other two are bounded against it (see
 /// [`Timings`]), so the safety relationships hold whatever is requested.
 #[derive(Debug, Clone)]
@@ -475,10 +482,11 @@ impl LeaderElectionConfig {
     pub(crate) fn from_environment(env: &dyn pplx_space_common_core::env::Environment) -> Self {
         let config = crate::env_config::EnvConfig(env);
         let identity = election_identity(env);
+        let requested_ttl = config.test_duration_secs(LEASE_TTL_TEST_ENV, DEFAULT_LEASE_TTL);
         let requested_grace =
             config.test_duration_secs(LEASE_FAILURE_GRACE_TEST_ENV, DEFAULT_LEASE_FAILURE_GRACE);
         let timings = Timings::derive(
-            DEFAULT_LEASE_TTL,
+            requested_ttl,
             DEFAULT_RETRY_INTERVAL,
             Some(PositiveDuration::new_panic(requested_grace)),
             &identity,

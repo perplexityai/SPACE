@@ -84,7 +84,7 @@ The typed suite owns the public fork smoke coverage:
 These replace `scripts/tests/smoke-kind-sandbox-fork.py`. Run an individual
 scenario with `uv run --frozen --python 3.11 -m space_smoke run <scenario-id>`
 against a configured bench. Kind CI discovers them through the existing
-`--all` inventory and distributes them across its four isolated shards; no
+`--all` inventory and distributes them across its isolated shards; no
 additional runner or cluster bootstrap is introduced. Together they create
 three sources and four distinct children, with concurrency capped at two fork
 requests per scenario. Child cleanup is registered before dispatch with the
