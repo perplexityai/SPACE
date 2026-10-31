@@ -137,6 +137,17 @@ impl ListPageRow {
     }
 }
 
+/// Which rows a List page scans.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListPageScope {
+    All,
+    /// Warm-pool members: rows with `pool_template` set. No index covers it, so a
+    /// page walks the rows after the cursor until it finds `limit` + 1 members or
+    /// reaches the end, in one lock hold: unlike an `All` page, its work is
+    /// bounded by the table's row count, not by `limit`.
+    PoolMembers,
+}
+
 pub struct ListPage {
     pub rows: Vec<ListPageRow>,
     /// Rows remain after the last scanned row.
@@ -144,18 +155,26 @@ pub struct ListPage {
 }
 
 db_private_outside_tests! {
-    /// Scan up to `limit` rows with IDs after `after`, in ID order. The page ends
-    /// early rather than exceed the raw budget; only a single row over the budget
-    /// is an error. Keying on the immutable primary key keeps every row present for
-    /// the whole scan on exactly one page.
+    /// Scan up to `limit` rows in `scope` with IDs after `after`, in ID order.
+    /// The page ends early rather than exceed the raw budget; only a single row
+    /// over the budget is an error. Keying on the immutable primary key keeps
+    /// every row present for the whole scan on exactly one page.
     fn list_page(
         conn: &Connection,
         after: &str,
         limit: usize,
+        scope: ListPageScope,
     ) -> Result<ListPage, InventoryReadError> {
-        let mut stmt = conn.prepare_cached(&format!(
-            "SELECT {LIST_COLUMNS} FROM sandboxes WHERE id > ?1 ORDER BY id LIMIT ?2"
-        ))?;
+        let sql = match scope {
+            ListPageScope::All => {
+                format!("SELECT {LIST_COLUMNS} FROM sandboxes WHERE id > ?1 ORDER BY id LIMIT ?2")
+            }
+            ListPageScope::PoolMembers => format!(
+                "SELECT {LIST_COLUMNS} FROM sandboxes
+                 WHERE id > ?1 AND pool_template IS NOT NULL ORDER BY id LIMIT ?2"
+            ),
+        };
+        let mut stmt = conn.prepare_cached(&sql)?;
         let fetch = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
         let mut rows = stmt.query(rusqlite::params![after, fetch])?;
         let mut budget = InventoryBudget::new(limit, MAX_RAW_BYTES);
