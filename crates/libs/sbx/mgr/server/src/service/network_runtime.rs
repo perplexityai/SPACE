@@ -544,8 +544,12 @@ where
     // An empty expected ref tells the net-gateway (and the client-side match
     // below) to accept whatever the current effective policy is once the
     // gateway reaches Ready, rather than asserting a specific ref. The cold
-    // start gate uses this so a SetNetworkPolicy / template change landing
-    // mid-start can't surface as a policy_ref_mismatch and fail the start.
+    // start gate, the restore finalizer and the restore's background refresh
+    // (`spawn_network_policy_refresh`) all rely on this, so their own requests
+    // can't turn a SetNetworkPolicy or template change landing mid-activation
+    // into a policy_ref_mismatch, fail the activation, or clear the gateway's
+    // installed policy. Callers that assert a ref, such as the reconciler, are
+    // not covered by this.
     let request = pplx_space_net_gateway_client::proto::RefreshNetworkPolicyRequest {
         expected_policy_ref: expected_policy_ref
             .map(ToString::to_string)
