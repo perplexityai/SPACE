@@ -305,6 +305,19 @@ resources:
 # default in the bench (org enrollment still gates per-org).
 byokVolumeEncryption: "1"
 
+# Inline-durable execution (docs/configuration.md, SPACE_NATIVE_INLINE_*):
+# the API runs a cold create, a `:wake`, `:resume` or `:start`, or a command's
+# wake itself when it claims the operation at admission, and the dispatcher
+# re-drives one whose API pod dies. Off in the binary; on here so the native
+# smokes exercise it, including the `native_recovery.inline_*` scenarios.
+# The per-pod permits (SPACE_NATIVE_INLINE_MAX_CONCURRENT) and the per-org
+# limit (SPACE_NATIVE_INLINE_ORG_LIMIT) keep their defaults: 128 and none.
+# The `space-native-inline-operations` flag has no provider here, so it
+# falls back on and these decide.
+inlineOperations:
+  enabled: "true"
+  kinds: create_sandbox,wake_sandbox,resume_sandbox,start_sandbox
+
 # Node-census residency discount. **Must equal
 # `reconcilers.nodeDrain.env.SPACE_NODE_DRAIN_NODE_CENSUS_RESIDENCY` in
 # `charts/space-cluster-controller-local/values.yaml`** — that chart turns the
