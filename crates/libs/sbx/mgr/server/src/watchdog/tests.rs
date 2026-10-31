@@ -88,6 +88,7 @@ pub(super) fn test_health() -> SandboxHealth {
         next_health_probe_at: Instant::now(),
         health_probe_sequence: 0,
         last_console_tail_at: None,
+        node_lease_backoff: None,
     }
 }
 
@@ -157,20 +158,19 @@ fn restart_test_info(sandbox_id: &str) -> SidecarInfo {
 
 #[test]
 fn sidecar_restart_queue_deduplicates_and_releases_after_completion() {
+    let now = tokio::time::Instant::now();
     let mut queue = SidecarRestartQueue::default();
     let spaced = SidecarRestartRequest::SpacedHost(restart_test_info("sandbox-a"));
     let spaced_key = spaced.key();
-    assert!(queue.schedule(spaced));
-    assert!(
-        !queue.schedule(SidecarRestartRequest::SpacedHost(restart_test_info(
-            "sandbox-a"
-        )))
-    );
-    assert!(
-        queue.schedule(SidecarRestartRequest::NetGateway(restart_test_info(
-            "sandbox-a"
-        )))
-    );
+    assert!(queue.schedule(spaced, now));
+    assert!(!queue.schedule(
+        SidecarRestartRequest::SpacedHost(restart_test_info("sandbox-a")),
+        now
+    ));
+    assert!(queue.schedule(
+        SidecarRestartRequest::NetGateway(restart_test_info("sandbox-a")),
+        now
+    ));
 
     assert_eq!(queue.pop_front().expect("spaced request").key(), spaced_key);
     assert_eq!(
@@ -178,36 +178,34 @@ fn sidecar_restart_queue_deduplicates_and_releases_after_completion() {
         SidecarKind::NetGateway
     );
     assert!(queue.pop_front().is_none());
-    assert!(
-        !queue.schedule(SidecarRestartRequest::SpacedHost(restart_test_info(
-            "sandbox-a"
-        )))
-    );
+    assert!(!queue.schedule(
+        SidecarRestartRequest::SpacedHost(restart_test_info("sandbox-a")),
+        now
+    ));
 
     queue.complete(&spaced_key);
-    assert!(
-        queue.schedule(SidecarRestartRequest::SpacedHost(restart_test_info(
-            "sandbox-a"
-        )))
-    );
+    assert!(queue.schedule(
+        SidecarRestartRequest::SpacedHost(restart_test_info("sandbox-a")),
+        now
+    ));
 }
 
 #[test]
 fn sidecar_restart_queue_prunes_stale_pending_generation() {
+    let now = tokio::time::Instant::now();
     let mut queue = SidecarRestartQueue::default();
     let stale = SidecarRestartRequest::SpacedHost(restart_test_info("sandbox-a"));
     let key = stale.key();
-    assert!(queue.schedule(stale));
+    assert!(queue.schedule(stale, now));
 
     queue.retain_pending(|_| false);
 
     assert!(queue.pending.is_empty());
-    assert!(!queue.scheduled.contains(&key));
-    assert!(
-        queue.schedule(SidecarRestartRequest::SpacedHost(restart_test_info(
-            "sandbox-a"
-        )))
-    );
+    assert!(!queue.scheduled.contains_key(&key));
+    assert!(queue.schedule(
+        SidecarRestartRequest::SpacedHost(restart_test_info("sandbox-a")),
+        now
+    ));
 }
 
 #[test]
@@ -1462,4 +1460,424 @@ async fn successful_health_probes_leave_failed_lifecycle_unchanged() {
         .unwrap();
     assert_eq!(row.state, crate::state::SandboxState::Failed);
     assert!(row.failure_reason.is_some());
+}
+
+/// Sidecar-restart dependencies for one monitored sandbox whose runtime is
+/// alive and whose committed net-gateway is gone.
+struct DeadGatewayFixture {
+    sandbox_id: &'static str,
+    db: crate::db::SharedConnection,
+    sidecars: Arc<Mutex<HashMap<String, SidecarInfo>>>,
+    state: Arc<Mutex<HashMap<String, SandboxHealth>>>,
+    node_manager: crate::node_manager_transport::fake::ServedNodeManager,
+    queue: SidecarRestartQueue,
+    spaced_host_dead: bool,
+}
+
+/// How long each fake relaunch takes on the paused clock, so a failure is
+/// processed after the sweep that scheduled it, as in a real Launch call.
+const FAKE_LAUNCH_LATENCY: Duration = Duration::from_millis(100);
+
+impl DeadGatewayFixture {
+    fn new(
+        sandbox_id: &'static str,
+        launch: impl Fn() -> Result<u32, tonic::Status> + Send + Sync + 'static,
+    ) -> Self {
+        let conn = crate::db::test_conn();
+        insert_test_sandbox(&conn, sandbox_id, crate::state::SandboxState::Started);
+        set_runtime_fields(&conn, sandbox_id, test_route_identity());
+        let node_manager = crate::node_manager_transport::fake::FakeNodeManager::default()
+            .unary(
+                "Launch",
+                move |_: pplx_space_node_mgr_client::proto::LaunchRequest| {
+                    launch().map(|pid| pplx_space_node_mgr_client::proto::LaunchResponse { pid })
+                },
+            )
+            .serve();
+        Self {
+            sandbox_id,
+            db: crate::db::SharedConnection::new(conn),
+            sidecars: Arc::new(Mutex::new(HashMap::from([(
+                sandbox_id.to_owned(),
+                restart_test_info(sandbox_id),
+            )]))),
+            state: Arc::new(Mutex::new(HashMap::from([(
+                sandbox_id.to_owned(),
+                test_health(),
+            )]))),
+            node_manager,
+            queue: SidecarRestartQueue::default(),
+            spaced_host_dead: false,
+        }
+    }
+
+    /// The sweep observation of this sandbox. The `/run` and `/proc` liveness
+    /// probes are replaced by one in which the runtime is alive, the
+    /// spaced-host is committed unless `spaced_host_dead`, and the
+    /// net-gateway is not committed until its pid changes from the original.
+    fn observe(&self, info: &SidecarInfo) -> SidecarSweepObservation {
+        let netgtw_alive = info.netgtw_pid != Some(30_003);
+        SidecarSweepObservation {
+            runtime_alive: true,
+            spaced_host_live_pid: info.spaced_host_pid,
+            netgtw_live_pid: info.netgtw_pid.filter(|_| netgtw_alive),
+            spaced_host_alive: !self.spaced_host_dead,
+            netgtw_alive,
+        }
+    }
+
+    /// One sidecar sweep for this sandbox: its health record and its restart
+    /// pass. Returns whether it called node-manager's Launch.
+    async fn sweep(&mut self) -> bool {
+        let sweep_at = tokio::time::Instant::now();
+        let launches_before = self.launches();
+        let info = self.sidecars.lock().await[self.sandbox_id].clone();
+        let observation = self.observe(&info);
+        let backoff = record_sidecar_sweep(&self.state, &info, &observation).await;
+        schedule_sidecar_restarts(&mut self.queue, &info, &observation, backoff, sweep_at);
+        while let Some(request) = self.queue.pop_front() {
+            let outcome = self.run(request).await;
+            finish_sidecar_restart(&mut self.queue, &self.sidecars, &self.state, outcome).await;
+        }
+        self.launches() > launches_before
+    }
+
+    async fn run(&self, request: SidecarRestartRequest) -> SidecarRestartOutcome {
+        let result = run_sidecar_restart(
+            request.clone(),
+            self.db.clone(),
+            Arc::clone(&self.sidecars),
+            NetworkPolicyReconcileQueue::default(),
+            &self.state,
+            &pplx_space_feature_flags::FeatureFlagClient::disabled(),
+            &self.node_manager.connector(),
+        )
+        .await;
+        tokio::time::advance(FAKE_LAUNCH_LATENCY).await;
+        SidecarRestartOutcome { request, result }
+    }
+
+    /// Sweep every `SIDECAR_CHECK_INTERVAL` for `sweeps` ticks and return the
+    /// paused-clock offsets, from the first sweep, of each sweep that called
+    /// Launch.
+    async fn sweep_for(&mut self, sweeps: u32) -> Vec<Duration> {
+        let start = tokio::time::Instant::now();
+        let mut launched_at = Vec::new();
+        for tick in 1..=sweeps {
+            let sweep_offset = start.elapsed();
+            if self.sweep().await {
+                launched_at.push(sweep_offset);
+            }
+            let next_sweep = start + SIDECAR_CHECK_INTERVAL * tick;
+            tokio::time::advance(next_sweep - tokio::time::Instant::now()).await;
+        }
+        launched_at
+    }
+
+    fn launches(&self) -> usize {
+        self.node_manager
+            .calls()
+            .iter()
+            .filter(|method| *method == "Launch")
+            .count()
+    }
+
+    async fn backoff(&self) -> Option<NodeLeaseBackoff> {
+        self.state.lock().await[self.sandbox_id].node_lease_backoff
+    }
+
+    async fn apply_failed_gateway_probe(&self) {
+        let mut firecracker = sample(HealthProbeOutcome::Success);
+        firecracker.firecracker_state = Some(VmState::Running);
+        let mut net_gateway = sample(HealthProbeOutcome::Unavailable);
+        net_gateway.detail = "transport error".to_owned();
+        apply_composed_health_result(
+            &self.state,
+            &self.db,
+            Some(Ok((
+                self.sandbox_id.to_owned(),
+                Some(crate::state::SandboxState::Started),
+                0,
+                ComposedProbeResult {
+                    observations: [
+                        firecracker,
+                        sample(HealthProbeOutcome::Success),
+                        sample(HealthProbeOutcome::Success),
+                        net_gateway,
+                    ],
+                    guest_status: None,
+                },
+            ))),
+        )
+        .await;
+    }
+
+    async fn health(&self) -> crate::proto::GetSandboxHealthResponse {
+        self.state.lock().await[self.sandbox_id].to_proto(self.sandbox_id)
+    }
+
+    async fn last_net_gateway_detail(&self) -> String {
+        net_gateway_details(&self.health().await)
+            .pop()
+            .expect("a net-gateway observation")
+    }
+}
+
+fn net_gateway_details(health: &crate::proto::GetSandboxHealthResponse) -> Vec<String> {
+    health
+        .components
+        .iter()
+        .find(|component| component.component == HealthComponent::NetGateway.as_proto())
+        .expect("net-gateway component")
+        .observations
+        .iter()
+        .map(|observation| observation.detail.clone())
+        .collect()
+}
+
+fn sandbox_not_allocated() -> Result<u32, tonic::Status> {
+    Err(tonic::Status::not_found("sandbox not allocated"))
+}
+
+fn labelled_probe_detail(probe_detail: &str) -> String {
+    format!("{NODE_LEASE_MISSING_HEALTH_DETAIL}; probe: {probe_detail}")
+}
+
+#[tokio::test(start_paused = true)]
+async fn missing_node_lease_backs_off_net_gateway_relaunches() {
+    let mut fixture = DeadGatewayFixture::new(
+        "0199c1e0-0000-7000-8000-000000000007",
+        sandbox_not_allocated,
+    );
+
+    let launched_at = fixture.sweep_for(200).await;
+
+    let secs = |secs| Duration::from_secs(secs);
+    assert_eq!(
+        launched_at,
+        [0, 5, 15, 35, 75, 155, 315, 615, 915].map(secs),
+        "relaunches must double their spacing from the scheduling sweep up to the cap \
+         instead of running every sweep"
+    );
+    let backoff = fixture.backoff().await.expect("backoff stays armed");
+    assert_eq!(backoff.failures, 9);
+    assert_eq!(backoff.delay, NODE_LEASE_MISSING_BACKOFF_MAX);
+}
+
+#[tokio::test(start_paused = true)]
+async fn missing_node_lease_backs_off_both_sidecars_once_per_sweep() {
+    let mut fixture = DeadGatewayFixture::new(
+        "0199c1e0-0000-7000-8000-000000000010",
+        sandbox_not_allocated,
+    );
+    fixture.spaced_host_dead = true;
+
+    let launched_at = fixture.sweep_for(8).await;
+
+    assert_eq!(
+        launched_at,
+        [0, 5, 15, 35].map(Duration::from_secs),
+        "both sidecars' failures in one sweep count as one backoff step"
+    );
+    assert_eq!(fixture.launches(), 8);
+    assert_eq!(fixture.backoff().await.expect("backoff").failures, 4);
+}
+
+#[tokio::test(start_paused = true)]
+async fn missing_node_lease_names_the_reason_in_net_gateway_health() {
+    let mut fixture = DeadGatewayFixture::new(
+        "0199c1e0-0000-7000-8000-000000000008",
+        sandbox_not_allocated,
+    );
+    assert!(fixture.sweep().await);
+
+    for _ in 0..HEALTH_FAILURE_THRESHOLD {
+        fixture.apply_failed_gateway_probe().await;
+    }
+
+    let health = fixture.health().await;
+    assert_eq!(health.status, ComposedHealthStatus::Degraded.as_proto());
+    assert_eq!(
+        health.degraded_components,
+        [HealthComponent::NetGateway.as_proto()]
+    );
+    assert_eq!(
+        net_gateway_details(&health),
+        vec![labelled_probe_detail("transport error"); HEALTH_FAILURE_THRESHOLD]
+    );
+}
+
+#[test]
+fn node_lease_label_needs_a_live_runtime_and_a_down_sidecar() {
+    let mut health = test_health();
+    health.node_lease_backoff = Some(NodeLeaseBackoff::new(tokio::time::Instant::now()));
+    health.spaced_host_alive = false;
+    assert!(node_lease_missing_explains(
+        HealthComponent::NetGateway,
+        &health
+    ));
+    assert!(node_lease_missing_explains(
+        HealthComponent::SpacedHost,
+        &health
+    ));
+    assert!(!node_lease_missing_explains(
+        HealthComponent::Firecracker,
+        &health
+    ));
+
+    let mut gateway_running = test_health();
+    gateway_running.node_lease_backoff = health.node_lease_backoff;
+    gateway_running.netgtw_alive = true;
+    assert!(!node_lease_missing_explains(
+        HealthComponent::NetGateway,
+        &gateway_running
+    ));
+    assert!(
+        !node_lease_missing_explains(HealthComponent::SpacedHost, &gateway_running),
+        "a running spaced-host is not explained by a missing lease"
+    );
+
+    let mut runtime_dead = test_health();
+    runtime_dead.node_lease_backoff = health.node_lease_backoff;
+    runtime_dead.runtime_alive = false;
+    assert!(!node_lease_missing_explains(
+        HealthComponent::NetGateway,
+        &runtime_dead
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn other_launch_failure_clears_the_node_lease_health_label() {
+    let lease_missing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let launch_lease = Arc::clone(&lease_missing);
+    let mut fixture = DeadGatewayFixture::new("0199c1e0-0000-7000-8000-00000000000b", move || {
+        if launch_lease.load(Ordering::SeqCst) {
+            sandbox_not_allocated()
+        } else {
+            Err(tonic::Status::internal("runtime-supervisor launch failed"))
+        }
+    });
+    assert!(fixture.sweep().await);
+    fixture.apply_failed_gateway_probe().await;
+    assert_eq!(
+        fixture.last_net_gateway_detail().await,
+        labelled_probe_detail("transport error")
+    );
+
+    lease_missing.store(false, Ordering::SeqCst);
+    assert_eq!(fixture.sweep_for(2).await.len(), 1);
+    fixture.apply_failed_gateway_probe().await;
+
+    assert_eq!(
+        fixture.last_net_gateway_detail().await,
+        "transport error",
+        "a relaunch that failed for another reason removes the lease evidence"
+    );
+    assert_eq!(
+        fixture.sweep_for(3).await.len(),
+        3,
+        "other failures retry every sweep"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn successful_relaunch_ends_node_lease_backoff() {
+    let lease_restored = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let launch_lease = Arc::clone(&lease_restored);
+    let mut fixture = DeadGatewayFixture::new("0199c1e0-0000-7000-8000-000000000009", move || {
+        if launch_lease.load(Ordering::SeqCst) {
+            Ok(40_003)
+        } else {
+            sandbox_not_allocated()
+        }
+    });
+    assert_eq!(fixture.sweep_for(7).await.len(), 3);
+    assert!(fixture.backoff().await.is_some());
+
+    lease_restored.store(true, Ordering::SeqCst);
+    // The next attempt waits out the current backoff, then succeeds.
+    let launched_at = fixture.sweep_for(8).await;
+
+    assert_eq!(launched_at.len(), 1);
+    assert!(fixture.backoff().await.is_none());
+    assert_eq!(
+        fixture.sidecars.lock().await[fixture.sandbox_id].netgtw_pid,
+        Some(40_003)
+    );
+    fixture.apply_failed_gateway_probe().await;
+    assert_eq!(
+        fixture.last_net_gateway_detail().await,
+        "transport error",
+        "a failed probe after the lease returns reports its own error"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn sidecars_restored_elsewhere_end_node_lease_backoff_at_the_sweep() {
+    let mut fixture = DeadGatewayFixture::new(
+        "0199c1e0-0000-7000-8000-00000000000c",
+        sandbox_not_allocated,
+    );
+    assert!(fixture.sweep().await);
+    assert!(fixture.backoff().await.is_some());
+
+    // Another actor, such as a lifecycle relaunch, commits a new gateway.
+    fixture
+        .sidecars
+        .lock()
+        .await
+        .get_mut(fixture.sandbox_id)
+        .expect("monitored sandbox")
+        .netgtw_pid = Some(40_004);
+    tokio::time::advance(SIDECAR_CHECK_INTERVAL).await;
+
+    assert!(!fixture.sweep().await, "nothing is left to relaunch");
+    assert!(fixture.backoff().await.is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn stale_restart_outcome_leaves_a_reregistered_sandbox_without_backoff() {
+    let fixture = DeadGatewayFixture::new(
+        "0199c1e0-0000-7000-8000-00000000000d",
+        sandbox_not_allocated,
+    );
+    let mut queue = SidecarRestartQueue::default();
+    let info = fixture.sidecars.lock().await[fixture.sandbox_id].clone();
+    let request = SidecarRestartRequest::NetGateway(info.clone());
+    assert!(queue.schedule(request.clone(), tokio::time::Instant::now()));
+    let outcome = fixture.run(request).await;
+    assert!(matches!(
+        outcome.result,
+        Err(SidecarRestartFailure::NodeLeaseMissing(_))
+    ));
+
+    // The sandbox leaves the watchdog and registers again with a new gateway
+    // while the old registration's relaunch is in flight.
+    fixture.sidecars.lock().await.insert(
+        fixture.sandbox_id.to_owned(),
+        SidecarInfo {
+            netgtw_pid: Some(40_005),
+            ..info
+        },
+    );
+    fixture
+        .state
+        .lock()
+        .await
+        .insert(fixture.sandbox_id.to_owned(), test_health());
+    finish_sidecar_restart(&mut queue, &fixture.sidecars, &fixture.state, outcome).await;
+
+    assert!(fixture.backoff().await.is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn other_launch_failures_retry_every_sweep_without_backoff() {
+    let mut fixture = DeadGatewayFixture::new("0199c1e0-0000-7000-8000-00000000000a", || {
+        Err(tonic::Status::unavailable(
+            "runtime-supervisor launch failed",
+        ))
+    });
+
+    assert_eq!(fixture.sweep_for(6).await.len(), 6);
+    assert!(fixture.backoff().await.is_none());
 }
