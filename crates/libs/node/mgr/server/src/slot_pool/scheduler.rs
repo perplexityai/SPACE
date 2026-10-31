@@ -4,7 +4,15 @@ const REDISCOVERY_INTERVAL: Duration = Duration::from_secs(5);
 
 /// One coalesced hint and no pending queue. SQLite owns unfinished work; local
 /// monotonic deadlines only pace attempts and may restart with the daemon.
-pub(super) fn spawn_worker(pool: std::sync::Arc<NetworkPool>, mut wake: mpsc::Receiver<()>) {
+pub(super) fn spawn_worker(pool: std::sync::Arc<NetworkPool>, wake: mpsc::Receiver<()>) {
+    spawn_worker_with(pool, wake, net::teardown_network);
+}
+
+pub(super) fn spawn_worker_with(
+    pool: std::sync::Arc<NetworkPool>,
+    mut wake: mpsc::Receiver<()>,
+    teardown: fn(&str, &NetId, Option<&str>) -> Result<(), net::NetworkTeardownError>,
+) {
     if tokio::runtime::Handle::try_current().is_err() {
         tracing::warn!("network slot pool opened without a runtime; scheduler disabled");
         return;
@@ -13,6 +21,12 @@ pub(super) fn spawn_worker(pool: std::sync::Arc<NetworkPool>, mut wake: mpsc::Re
         let mut resets = JoinSet::new();
         let mut maintenance = JoinSet::new();
         let mut reset_backoff = HashMap::<u32, (u64, tokio::time::Instant)>::new();
+        // A reset deferred to a sandbox's mutation claim did not fail, so it
+        // waits for that claim's release instead of the failure backoff. A
+        // released slot is retried directly: the cursor may be pages away.
+        let mut claim_waits = JoinSet::new();
+        let mut awaiting_claim = HashMap::<u32, u64>::new();
+        let mut claim_released = Vec::<(u32, u64)>::new();
         let mut maintenance_backoff = None;
         let mut requested = false;
         let mut tick = tokio::time::interval(REDISCOVERY_INTERVAL);
@@ -24,7 +38,30 @@ pub(super) fn spawn_worker(pool: std::sync::Arc<NetworkPool>, mut wake: mpsc::Re
                 biased;
                 _ = pool.shutdown_token.cancelled() => break,
                 Some(result) = resets.join_next(), if !resets.is_empty() => {
-                    if let Err(error) = result { tracing::warn!(%error, "slot reset task failed; durable work retained"); }
+                    match result {
+                        Ok((slot, generation, ResetAttempt::ClaimHeld { sandbox_id })) => {
+                            reset_backoff.remove(&slot);
+                            awaiting_claim.insert(slot, generation);
+                            let pool = pool.clone();
+                            claim_waits.spawn(async move {
+                                tokio::select! {
+                                    _ = pool.shutdown_token.cancelled() => {}
+                                    _ = pool.sandbox_mutation_released(&sandbox_id) => {}
+                                }
+                                (slot, generation)
+                            });
+                        }
+                        Ok((_, _, ResetAttempt::Done)) => {}
+                        Err(error) => tracing::warn!(%error, "slot reset task failed; durable work retained"),
+                    }
+                }
+                Some(result) = claim_waits.join_next(), if !claim_waits.is_empty() => {
+                    if let Ok((slot, generation)) = result
+                        && awaiting_claim.get(&slot) == Some(&generation)
+                    {
+                        awaiting_claim.remove(&slot);
+                        claim_released.push((slot, generation));
+                    }
                 }
                 Some(result) = maintenance.join_next(), if !maintenance.is_empty() => {
                     let failed = pool.maintenance_failed.swap(false, Ordering::Relaxed);
@@ -44,6 +81,18 @@ pub(super) fn spawn_worker(pool: std::sync::Arc<NetworkPool>, mut wake: mpsc::Re
             if pool.shutdown_token.is_cancelled() { break; }
             let now = tokio::time::Instant::now();
             reset_backoff.retain(|_, (_, until)| *until > now);
+            claim_released.retain(|&(slot, generation)| {
+                if reset_backoff.get(&slot).is_some_and(|(old, _)| *old == generation) { return false; }
+                if resets.len() == RESET_CONCURRENCY
+                    || pool.active_resets.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(&slot)
+                {
+                    return true;
+                }
+                reset_backoff.insert(slot, (generation, now + POOL_FILL_RETRY_DELAY));
+                let pool = pool.clone();
+                resets.spawn(async move { (slot, generation, reset_slot_with(pool, slot, teardown).await) });
+                false
+            });
             if resets.len() < RESET_CONCURRENCY {
                 let scan_pool = pool.clone();
                 let work = pool.task_tracker.spawn_blocking(move || reset_candidates(&scan_pool, cursor)).await;
@@ -53,9 +102,13 @@ pub(super) fn spawn_worker(pool: std::sync::Arc<NetworkPool>, mut wake: mpsc::Re
                         // owners must not hide later dirty slots.
                         cursor = page.next_cursor;
                         for (slot, generation) in page.entries {
+                            if awaiting_claim.get(&slot) == Some(&generation) { continue; }
                             if reset_backoff.get(&slot).is_some_and(|(old, _)| *old == generation) { continue; }
                             reset_backoff.insert(slot, (generation, now + POOL_FILL_RETRY_DELAY));
-                            resets.spawn(reset_slot(pool.clone(), slot));
+                            let pool = pool.clone();
+                            resets.spawn(async move {
+                                (slot, generation, reset_slot_with(pool, slot, teardown).await)
+                            });
                             if resets.len() == RESET_CONCURRENCY { break; }
                         }
                     }
@@ -64,7 +117,7 @@ pub(super) fn spawn_worker(pool: std::sync::Arc<NetworkPool>, mut wake: mpsc::Re
             }
             if requested && maintenance.is_empty() && maintenance_backoff.is_none_or(|until| until <= now) {
                 requested = false;
-                maintenance.spawn(reconcile_pool(pool.clone(), maintenance_cursor));
+                maintenance.spawn(reconcile_pool_with(pool.clone(), maintenance_cursor, teardown));
             }
         }
         // Never abort a parent while its blocking child can still mutate host state.
@@ -101,10 +154,6 @@ pub(super) fn reset_candidates(
             .filter(|(slot, _)| !active.contains(slot))
             .collect(),
     })
-}
-
-async fn reconcile_pool(pool: std::sync::Arc<NetworkPool>, cursor: u32) -> u32 {
-    reconcile_pool_with(pool, cursor, net::teardown_network).await
 }
 
 pub(super) async fn reconcile_pool_with(
