@@ -247,9 +247,8 @@ impl JobExecutor for SnapshotUploadExecutor {
         }))
         .await;
 
-        // Per-job upload bytes in transfer-submission order: the
-        // VM artifacts followed (for new payloads) by the metadata
-        // document. Kept separate from the finalisation total because
+        // Per-job upload bytes in artifact order: the VM artifacts
+        // followed (for new payloads) by the metadata document. Kept separate from the finalisation total because
         // `FinalizeArtifactBackup.bytes_uploaded` is contractually the VM
         // artifacts only (see `vm_artifact_total_bytes`).
         let mut artifact_results = Vec::with_capacity(results.len());
