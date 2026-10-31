@@ -4,6 +4,7 @@ import { Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import styles from './inventory.module.css';
 import { usePathname, useSearchParams } from 'next/navigation';
+import { SANDBOX_LIFECYCLE_STATES, bringUpAction } from '@/lib/sandbox-lifecycle';
 import {
   DEFAULT_LIST_LIMIT,
   LIST_LIMIT_OPTIONS,
@@ -67,7 +68,7 @@ import {
   Alert, App, Table, Button, Form, Input, Select, Typography, Space, Tag, Popconfirm, Card, Tooltip, Switch, Checkbox, Modal,
 } from 'antd';
 import {
-  PlusOutlined, StopOutlined, PauseCircleOutlined, ThunderboltOutlined,
+  PlusOutlined, StopOutlined, PauseCircleOutlined, PlayCircleOutlined,
   SaveOutlined, DeleteOutlined, CameraOutlined, RollbackOutlined, ReloadOutlined,
   CopyOutlined, ClockCircleOutlined, GlobalOutlined, LockOutlined,
 } from '@ant-design/icons';
@@ -104,12 +105,7 @@ const AGE_WINDOW_OPTIONS: { value: AgeWindow; label: string; ms: number | null }
   { value: 'all', label: 'All time',    ms: null },
 ];
 
-const STATUS_FILTER_OPTIONS = [
-  'created', 'creating', 'starting', 'started', 'running', 'stopping', 'stopped',
-  'pausing', 'paused', 'resuming',
-  'suspending', 'suspended', 'restoring',
-  'deleting', 'deleted', 'failed',
-];
+const STATUS_FILTER_OPTIONS = SANDBOX_LIFECYCLE_STATES;
 
 function formatBytes(n: number | null | undefined) {
   if (n === null || n === undefined) return '—';
@@ -188,12 +184,10 @@ const STATE_ACTIONS: Record<string, Record<string, boolean>> = {
   creating:  { wake: false, stop: false, pause: false, suspend: false, delete: true },
   created:   { wake: true,  stop: false, pause: false, suspend: false, delete: true },
   started:   { wake: false, stop: true,  pause: true,  suspend: true,  delete: true },
-  running:   { wake: false, stop: true,  pause: true,  suspend: true,  delete: true },
   stopped:   { wake: true,  stop: false, pause: false, suspend: false, delete: true },
   paused:    { wake: true,  stop: false, pause: false, suspend: false, delete: true },
   suspended: { wake: true,  stop: false, pause: false, suspend: false, delete: true },
   deleting:  { wake: false, stop: false, pause: false, suspend: false, delete: false },
-  deleted:   { wake: false, stop: false, pause: false, suspend: false, delete: true },
   failed:    { wake: false, stop: false, pause: false, suspend: false, delete: true },
 };
 const TRANSIENT = { wake: false, stop: false, pause: false, suspend: false, delete: true };
@@ -388,6 +382,7 @@ function SandboxActions({ status, id, resourceType, poolTemplate, onAction }: {
   if (poolSlot) {
     actions.suspend = false;
   }
+  const bringUp = managedSandbox ? bringUpAction(s) : null;
 
   const confirmStop = async () => {
     if (!actions.stop || stopPending.current) return;
@@ -438,7 +433,8 @@ function SandboxActions({ status, id, resourceType, poolTemplate, onAction }: {
 
   return (
     <Space size={0}>
-      {actions.wake ? btn('wake', true, <ThunderboltOutlined />, 'Wake')
+      {actions.wake && bringUp
+        ? btn(bringUp.action, true, bringUp.action === 'restore' ? <RollbackOutlined /> : <PlayCircleOutlined />, bringUp.label)
         : btn('stop', actions.stop, <StopOutlined />, 'Stop', true)}
       {btn('pause', actions.pause, <PauseCircleOutlined />, 'Pause')}
       {btn('suspend', actions.suspend, <SaveOutlined />, 'Suspend')}
