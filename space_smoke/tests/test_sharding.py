@@ -96,3 +96,78 @@ def test_empty_shard_does_not_bootstrap_or_report_green():
     ):
         assert _run_all(shard=(count, count)) == 2
     bootstrap.assert_not_called()
+
+
+def _inventory(surface):
+    return {
+        scenario.id
+        for scenario in REGISTRY
+        if surface in scenario.api_surfaces
+        and "kind" in scenario.backends
+        and scenario.quarantined is None
+        and scenario.ignored is None
+        and scenario.applies_to(None)
+    }
+
+
+def test_both_surfaces_of_a_sharded_run_share_one_partition():
+    """Each (surface, scenario) pair runs on exactly one of eight shards."""
+
+    seen = []
+
+    def execute(scenarios, **kwargs):
+        surface = kwargs["environment"].get("SPACE_SMOKE_API_SURFACE")
+        seen.extend((surface, scenario.id) for scenario in scenarios)
+        return tuple(ScenarioProcessResult(s.id, 0, "", "") for s in scenarios)
+
+    for surface in ("ecw", "native"):
+        with (
+            mock.patch.dict(
+                "os.environ",
+                {"SPACE_SMOKE_BACKEND": "kind", "SPACE_SMOKE_API_SURFACE": surface},
+                clear=True,
+            ),
+            mock.patch(
+                "space_smoke.__main__.SmokeServices.from_environment",
+                **{
+                    "return_value.telemetry_mode.return_value": "otel",
+                    "return_value.storage_credentials.return_value": "exchange",
+                    "return_value.substrate.return_value": "kubernetes",
+                },
+            ),
+            mock.patch("space_smoke.__main__.run_scenarios", side_effect=execute),
+            redirect_stdout(StringIO()),
+        ):
+            for index in range(1, 9):
+                assert _run_all(shard=(index, 8)) == 0
+    expected = {(surface, sid) for surface in ("ecw", "native") for sid in _inventory(surface)}
+    assert len(seen) == len(expected)
+    assert set(seen) == expected
+
+
+def test_the_joint_partition_is_no_heavier_than_balancing_each_surface_alone():
+    from space_smoke.sharding import _DURATION_SECONDS, select_shard
+
+    pools = {
+        surface: tuple(
+            sorted(
+                (s for s in REGISTRY if s.id in _inventory(surface)), key=lambda s: s.id
+            )
+        )
+        for surface in ("ecw", "native")
+    }
+
+    def heaviest(joint):
+        loads = []
+        for index in range(1, 9):
+            load = 0
+            for surface, scenarios in pools.items():
+                share = select_shard(
+                    scenarios, index=index, count=8, api_surface=surface,
+                    inventories=pools if joint else None,
+                )
+                load += sum(_DURATION_SECONDS[surface].get(s.id, 30) for s in share)
+            loads.append(load)
+        return max(loads)
+
+    assert heaviest(joint=True) <= heaviest(joint=False)
