@@ -15,11 +15,12 @@ pub use pplx_space_sbx_mgr_protocol::{
     RESTART_RETRY_ON_SUCCESSOR_METADATA, RETAINED_FILESYSTEM_ONLY_COPY_REASON,
     SUSPEND_PUBLICATION_PENDING_REASON, TEARDOWN_SUSPEND_BACKUP_PERMANENTLY_FAILED_REASON,
     authoritative_route_identity_required_status, auto_lifecycle, direct_restore_start_request,
-    encode_optional_sandbox_id, is_authoritative_route_identity_required,
+    encode_optional_sandbox_id, is_authoritative_route_identity_required, is_memory_policy_refusal,
     is_restart_retry_on_successor, is_retained_filesystem_only_copy_status,
-    is_suspend_publication_pending_status, is_template_policy_dependency, lifecycle, operations,
-    proto, restart_retry_on_successor_status, retained_filesystem_only_copy_status,
-    suspend_publication_pending_status, template_policy_dependency_status,
+    is_suspend_publication_pending_status, is_template_policy_dependency, lifecycle,
+    memory_policy_refusal_status, operations, proto, restart_retry_on_successor_status,
+    retained_filesystem_only_copy_status, suspend_publication_pending_status,
+    template_policy_dependency_status,
 };
 
 #[cfg(any(test, feature = "test-support"))]

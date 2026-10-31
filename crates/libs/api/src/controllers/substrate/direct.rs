@@ -826,7 +826,9 @@ fn cached_worker_failure_from_create_status(status: &tonic::Status) -> Option<Ca
 }
 
 fn direct_status_error(status: tonic::Status, message: String) -> SubstrateError {
-    if pplx_space_credmgr_client::status_is_invalid_key_reference(&status) {
+    if pplx_space_credmgr_client::status_is_invalid_key_reference(&status)
+        || pplx_space_sbx_mgr_client::is_memory_policy_refusal(&status)
+    {
         return SubstrateError::FailedPrecondition { message };
     }
     SubstrateError::Failed { message }

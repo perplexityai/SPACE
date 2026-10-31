@@ -167,6 +167,28 @@ fn direct_create_stages_terminalize_invalid_key_precondition() {
 }
 
 #[test]
+fn direct_memory_policy_refusal_preserves_the_client_error() {
+    let status = pplx_space_sbx_mgr_client::memory_policy_refusal_status(1024, 512);
+    // Exercise the metadata boundary used by the node-api forwarder.
+    let mut trailers = tonic::codegen::http::HeaderMap::new();
+    status.add_header(&mut trailers).unwrap();
+    let decoded = tonic::Status::from_header_map(&trailers).unwrap();
+    let error = ControllerError::from(direct_create_start_status_error(decoded));
+    assert_eq!(error.status(), axum::http::StatusCode::PRECONDITION_FAILED);
+    assert!(
+        error
+            .to_string()
+            .contains("requested memory_mib 1024 exceeds this node's allowed 512 MiB")
+    );
+    assert!(matches!(
+        direct_create_start_status_error(tonic::Status::failed_precondition(
+            "worker-local failure"
+        )),
+        SubstrateError::Failed { .. }
+    ));
+}
+
+#[test]
 fn template_policy_dependency_does_not_change_worker_health() {
     for (code, expected_worker_failure) in [
         (Code::Unavailable, CachedWorkerFailure::Unavailable),
