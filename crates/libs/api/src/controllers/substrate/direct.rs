@@ -13,17 +13,19 @@
 //!   on the node holding the local artifact. Waking such a `suspended` or
 //!   `restoring` row, implicit or explicit, first reads that node's record.
 //!   An implicit wake refuses when the record is dormant under a Local
-//!   auto-lifecycle override that denies it. A record still running the
-//!   row's current execution generation (a wake raced the suspend) is
-//!   adopted: the row is placed back on that node and woken there. Otherwise
-//!   the wake restores through the restore lease, whose candidates try that
-//!   node first; a read that fails or does not answer in time restores under
-//!   the cluster policy. A `started` row left with no active node by that
-//!   race is adopted the same way when its worker is looked up. A cross-node
-//!   restore never deletes a source copy that reports a live record. Delete
-//!   reaches the active node, else that target node; with neither it returns
-//!   `Unavailable` and the caller removes the row without node-local
-//!   teardown.
+//!   auto-lifecycle override that denies it. A live record (a wake raced the
+//!   suspend) is adopted when it runs on the route identity's node, at or
+//!   above that identity's execution generation, and no restore owner can
+//!   still record a newer one: the row is placed back on that node and woken
+//!   there. Otherwise the wake restores through the restore lease, whose
+//!   candidates try that node first; a read that fails or does not answer in
+//!   time restores under the cluster policy. A `started` row left with no
+//!   active node by that race is adopted the same way when its worker is
+//!   looked up, including by `probe_runtime_client`. A cross-node restore
+//!   deletes the source copy only when it reads a record there that holds no
+//!   VM. Delete reaches the active node, else that target node; with neither
+//!   it returns `Unavailable` and the caller removes the row without
+//!   node-local teardown.
 //! - Warm-pool claims adopt node-side.
 //! - Custom vCPU or memory uses separate create and start calls: only
 //!   `StartRequest` carries those fields. A readiness wait still blocks on
@@ -197,9 +199,10 @@ const DIRECT_NODE_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const DIRECT_PULL_ON_CREATE_RPC_TIMEOUT: Duration = Duration::from_secs(600);
 const DIRECT_REMOTE_RESTORE_CANDIDATE_LIMIT: i64 = 7;
 /// Reading the record on the node that holds an unplaced sandbox's local
-/// state is advisory, so a slow or dead node costs a wake or a source cleanup
-/// this much. It bounds the whole read: finding that node, connecting to it
-/// and its `StateRequest`.
+/// state is advisory, so a slow or dead node costs a wake, a worker lookup or
+/// a source cleanup this much. On a wake or a lookup it bounds the whole
+/// read: finding that node, connecting to it and its `StateRequest`. On a
+/// cross-node restore's source cleanup it bounds only the `StateRequest`.
 const DIRECT_SOURCE_RECORD_READ_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -534,16 +537,21 @@ fn resident_is_dormant(resident: &pplx_space_sbx_mgr_client::proto::SandboxInfo)
     )
 }
 
-/// Whether `record` holds a VM, or is moving into or out of one. A restore's
-/// `Start`, which always carries a newly reserved execution generation, is
-/// refused there, and a restore on another worker would run a second copy,
-/// so such a record is adopted (`DirectSubstrate::adopt_live_source_record`)
-/// or, on a cross-node restore, never deleted.
-fn record_holds_live_runtime(record: &pplx_space_sbx_mgr_client::proto::SandboxInfo) -> bool {
+/// Whether a record in `lifecycle` holds a VM, or is moving into or out of
+/// one. A restore's `Start` always carries a newly reserved execution
+/// generation: a started record running another execution refuses it, and a
+/// `Restoring` record resumes its interrupted restore instead of starting
+/// that one. A restore on another worker would run a second copy, so such a
+/// record is adopted when its fence allows
+/// (`DirectSubstrate::adopt_live_source_record`), and a cross-node restore's
+/// cleanup never deletes it.
+fn lifecycle_holds_live_runtime(
+    lifecycle: pplx_space_sbx_mgr_client::proto::SandboxLifecycleState,
+) -> bool {
     use pplx_space_sbx_mgr_client::proto::SandboxLifecycleState;
     matches!(
-        record.observed_lifecycle(),
-        Ok(SandboxLifecycleState::Creating
+        lifecycle,
+        SandboxLifecycleState::Creating
             | SandboxLifecycleState::Starting
             | SandboxLifecycleState::Started
             | SandboxLifecycleState::Stopping
@@ -552,7 +560,7 @@ fn record_holds_live_runtime(record: &pplx_space_sbx_mgr_client::proto::SandboxI
             | SandboxLifecycleState::Resuming
             | SandboxLifecycleState::Checkpointing
             | SandboxLifecycleState::Suspending
-            | SandboxLifecycleState::Restoring)
+            | SandboxLifecycleState::Restoring
     )
 }
 
@@ -569,8 +577,9 @@ fn refuse_wake_denied_by_local_override(
 ) -> Result<(), SubstrateError> {
     use pplx_space_sbx_mgr_client::proto::SandboxLifecycleState;
 
-    // The worker refuses only a dormant record. A live one is adopted and
-    // woken through its worker, which applies its effective policy itself.
+    // The worker refuses a Created, Stopped, Paused or Suspended record its
+    // policy denies. Any other record is adopted, and its worker's Wake
+    // applies its own policy, or restored.
     if !matches!(
         record
             .lifecycle
@@ -3159,19 +3168,37 @@ impl DirectSubstrate {
     }
 
     /// Places a row with no active node back on `node` when the record there
-    /// still holds or is moving a VM at the row's current execution
-    /// generation. A wake that raced that node's suspend leaves such a
-    /// record: the projection clears `active_node_id` while the wake runs.
-    /// Restoring around it would start a second copy from an older snapshot,
-    /// so the row adopts the running one instead, with no new generation.
+    /// still holds or is moving a VM and no restore owner can still record a
+    /// newer execution. A wake that raced that node's suspend leaves such a
+    /// record: the projection clears `active_node_id` while the wake runs,
+    /// and that wake's receipt can lag the record, or never land if its API
+    /// process stops first. Restoring around it would start a second copy
+    /// from an older snapshot, so the row adopts the running one instead,
+    /// with no new generation.
     ///
     /// One guarded write fences on the lifecycle the caller read, no active
     /// node, no live restore lease (whose owner's restore answers for
     /// itself), and a route identity on `node` whose execution generation is
-    /// both the record's and the last one reserved. A running record leaves
-    /// the row `started`; one still moving keeps the read lifecycle for the
-    /// wake through its worker to finish. Returns the node the row is placed
-    /// on, which is another writer's when that writer placed it first.
+    /// at most the record's. The record's generation must be at most the last
+    /// one reserved, and that one unless the row holds no restore-lease
+    /// token:
+    ///
+    /// - On a tokenless row no restore owner can still persist a receipt or
+    ///   complete: both fence on the token, which a claim writes and leaving
+    ///   `restoring` clears. A reservation above the record was abandoned, or
+    ///   is a wake through this node's Wake, which the adoption joins.
+    /// - A newer execution on another worker would have moved the route
+    ///   identity there: a receipt moves it only to the row's active node.
+    /// - A row that still holds a token (`restoring`, its lease expired) may
+    ///   have an owner about to persist a newer execution, so it is adopted
+    ///   only at the last reserved generation.
+    /// - A record older than the route identity is not adopted.
+    ///
+    /// A `Started` record leaves the row `started`; any other keeps the read
+    /// lifecycle for the wake through its worker to finish, and that Wake's
+    /// receipt catches the route identity up to the record. Returns the node
+    /// the row is placed on, which is another writer's when that writer
+    /// placed it first.
     async fn adopt_live_source_record(
         &self,
         sandbox_id: SandboxId,
@@ -3181,7 +3208,10 @@ impl DirectSubstrate {
     ) -> Result<Option<DirectNode>, SubstrateError> {
         use pplx_space_sbx_mgr_client::proto::SandboxLifecycleState;
 
-        if !record_holds_live_runtime(record) {
+        if !record
+            .observed_lifecycle()
+            .is_ok_and(lifecycle_holds_live_runtime)
+        {
             return Ok(None);
         }
         let Some(execution_generation) = record.execution_generation else {
@@ -3207,9 +3237,13 @@ impl DirectSubstrate {
                 AND (s.restore_lease_expires_at IS NULL OR s.restore_lease_expires_at <= NOW())
                 AND route.sandbox_id = s.id
                 AND route.current_node_id = $2
-                AND route.execution_generation = $4
+                AND route.execution_generation <= $4
                 AND provenance.sandbox_id = s.id
-                AND provenance.last_execution_generation = $4"
+                AND provenance.last_execution_generation >= $4
+                AND (
+                    provenance.last_execution_generation = $4
+                    OR s.restore_lease_token IS NULL
+                )"
         ))
         .bind(sandbox_id.as_uuid())
         .bind(node.id.as_uuid())
@@ -3278,25 +3312,40 @@ impl DirectSubstrate {
 
         // A wake that raced the source's suspend can leave a live record
         // there, newer than the snapshot just restored, so the cleanup deletes
-        // only a record it reads as not live.
+        // only a record whose lifecycle it reads as one that holds no VM.
         match tokio::time::timeout(
             DIRECT_SOURCE_RECORD_READ_TIMEOUT,
             node_sandbox_record(&mut client, sandbox_id),
         )
         .await
         {
-            Ok(Ok(Some(record))) if !record_holds_live_runtime(&record) => {}
             Ok(Ok(None)) => return Ok(()),
-            Ok(Ok(Some(record))) => {
-                tracing::warn!(
-                    sandbox_id = %sandbox_id,
-                    source_node_id = %source_node_id,
-                    restored_node_id = %restored_node_id,
-                    lifecycle = record.observed_lifecycle().map_or("unknown", |state| state.label()),
-                    "leaving the source-node copy after direct cross-node restore because it reports a live record"
-                );
-                return Ok(());
-            }
+            Ok(Ok(Some(record))) => match record.observed_lifecycle() {
+                Ok(lifecycle) if !lifecycle_holds_live_runtime(lifecycle) => {}
+                Ok(lifecycle) => {
+                    tracing::warn!(
+                        sandbox_id = %sandbox_id,
+                        source_node_id = %source_node_id,
+                        restored_node_id = %restored_node_id,
+                        lifecycle = lifecycle.label(),
+                        "leaving the source-node copy after direct cross-node restore because it reports a live record"
+                    );
+                    return Ok(());
+                }
+                // sandbox-manager publishes `Unspecified` for a label it
+                // cannot parse, and an API older than its nodes cannot decode
+                // a newer value; either may still hold a VM.
+                Err(error) => {
+                    tracing::warn!(
+                        sandbox_id = %sandbox_id,
+                        source_node_id = %source_node_id,
+                        restored_node_id = %restored_node_id,
+                        %error,
+                        "leaving the source-node copy after direct cross-node restore because its record's lifecycle cannot be decoded"
+                    );
+                    return Ok(());
+                }
+            },
             Ok(Err(error)) => {
                 tracing::warn!(
                     sandbox_id = %sandbox_id,

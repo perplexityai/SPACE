@@ -1945,14 +1945,18 @@ async fn sim_wake(
         sim_install_activation_policy(state, sandbox_id, activation_policy.as_ref()).await?;
     }
     // Authoritative Wake adopts and acknowledges the requested identity even
-    // when the resident lifecycle needs no transition. Without a request,
-    // retain the legacy resident response: the record does not retain enough
-    // runtime-owned Kubernetes dimensions to reconstruct a complete receipt.
+    // when the resident lifecycle needs no transition. Without a request, a
+    // Direct record reports the identity it holds, as sandbox-manager does;
+    // a Kubernetes one keeps the legacy resident response: the record does
+    // not retain enough runtime-owned Kubernetes dimensions to reconstruct a
+    // complete receipt.
     let route_identity = match transition {
         sbx::WakeTransition::Noop | sbx::WakeTransition::Resume | sbx::WakeTransition::Wait
             if requested_identity.is_none() =>
         {
-            None
+            (rec.route_substrate_kind == Some(pplx_space_common_core::types::NodeManagedBy::Space))
+                .then(|| record_route_identity(state.node_id(), &rec))
+                .flatten()
         }
         _ => {
             let identity = match requested_identity {

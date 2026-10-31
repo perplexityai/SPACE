@@ -26,9 +26,10 @@ const FINALIZE_SANDBOX_DB_DELETE_BASE_DELAY_MS: u64 = 50;
 /// variant; enough to break the rate down by cause in telemetry.
 fn cluster_delete_miss_reason(err: &SubstrateError) -> &'static str {
     match err {
-        // No assigned/reachable worker — e.g. `active_node_id` is NULL because the
-        // sandbox is suspended/unplaced, or the node is unreachable. The node was
-        // never contacted, so any local state definitely survives.
+        // No assigned/reachable worker — e.g. no node holds its local state (on
+        // Direct, neither `active_node_id` nor `target_node_id` names a
+        // registered worker), or the node is unreachable. The node was never
+        // contacted, so any local state definitely survives.
         SubstrateError::Unavailable { .. } => "node_unavailable",
         // The node was reached but the delete RPC failed / timed out / was
         // cancelled — local teardown is unconfirmed.
