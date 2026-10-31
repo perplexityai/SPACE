@@ -7,7 +7,6 @@ use crate::controllers::substrate::{
     PooledExecutionPoolShape, PooledPrepareFailureCleanup, SubstrateCapabilities,
 };
 use crate::controllers::{db_contention_error, internal_error, pool_store_error};
-use crate::reconcile_queue::finalize_sandbox_db_delete_tx;
 use axum::http::StatusCode;
 use pplx_space_cluster_pool::WarmPoolStore;
 use pplx_space_common_core::sql;
@@ -20,6 +19,7 @@ use pplx_space_events::{
 };
 use pplx_space_net_common::TlsInterception;
 use pplx_space_public_api::OperationId;
+use pplx_space_sandbox_store::delete::delete_with_dependents;
 use std::collections::BTreeMap;
 use std::sync::{
     Arc,
@@ -2712,7 +2712,7 @@ impl SandboxController {
             .begin()
             .await
             .map_err(PooledCreateRollbackError::BeginCleanup)?;
-        finalize_sandbox_db_delete_tx(&mut tx, sandbox_id)
+        delete_with_dependents(&mut tx, sandbox_id)
             .await
             .map_err(PooledCreateRollbackError::Cleanup)?;
         tx.commit()

@@ -174,9 +174,9 @@ impl RetentionSink for TombstoneRetentionStore {
         .bind(max_records)
         .fetch_all(&mut *tx)
         .await?;
-        // Same rationale as finalize_sandbox_db_delete_tx (this reaper
-        // predates it): receipts are not foreign-keyed to `sandboxes`, and an
-        // orphaned receipt is unreachable by the suspended-fossil drain.
+        // Same rationale as the sandbox store's delete_with_dependents (this
+        // reaper predates it): receipts are not foreign-keyed to `sandboxes`,
+        // and an orphaned receipt is unreachable by the suspended-fossil drain.
         let deleted_reservations = deleted_sandbox_ids
             .iter()
             .map(|id| SandboxId::from_uuid(*id))

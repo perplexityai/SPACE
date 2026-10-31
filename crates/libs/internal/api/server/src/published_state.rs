@@ -2010,10 +2010,10 @@ pub async fn publish_sandbox_states_with_retirement(
                 "delete node-published absent stopped sandbox: {err}"
             ))
         })?;
-        // This delete predates finalize_sandbox_db_delete_tx and keeps its own
-        // cleanup statements; the warm-pool receipt retire from that helper
-        // applies here for the same reason (no FK, unreachable once the
-        // sandbox row is gone).
+        // This delete predates the sandbox store's delete_with_dependents and
+        // keeps its own cleanup statements; the warm-pool receipt retire from
+        // that helper applies here for the same reason (no FK, unreachable
+        // once the sandbox row is gone).
         let deleted_ids = deleted_ids.into_iter().collect::<Vec<_>>();
         pplx_space_cluster_pool::WarmPoolStore::delete_claimed_slots_for_retired_executions(
             &mut *conn,

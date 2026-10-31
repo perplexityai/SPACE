@@ -176,7 +176,6 @@
 "crates/libs/internal/api/server/src/sandbox_quarantine_store.rs" = 3
 "crates/libs/internal/api/server/src/status.rs" = 1
 "crates/libs/placement/machine/src/postgres.rs" = 1
-"crates/libs/sandbox/teardown/src/lib.rs" = 1
 
 # sbx-mgr code outside its SQLite store uses only the store's own handle,
 # transaction and error types, so no file is listed.

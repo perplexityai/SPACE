@@ -65,9 +65,13 @@ Not store verbs — leave these where they are:
 - **Guarded state transitions**, where the `WHERE` re-checks a precondition
   (a lifecycle CAS, a lease-token or generation guard). The guard is the
   correctness mechanism; flattening one into a plain `update` re-opens the
-  drift class where a pooled wake resurrected torn-down sandboxes. Sandbox
-  placement transitions specifically belong to `pplx-space-placement`
-  (see `crates/libs/placement/machine/src/lib.rs`).
+  drift class where a pooled wake resurrected torn-down sandboxes. The
+  `sandboxes` row is the exception to leaving them in place: its guarded
+  transitions move into `pplx-space-sandbox-store`, each as its own module
+  named for the transition (as `lost` is), and its canonical hard delete is
+  that crate's `delete` module. Unguarded column writes of the row belong in
+  ordinary verbs such as `update_desired_state`. The caller keeps its locks
+  and transaction (see the crate docs).
 - **`SELECT ... FOR UPDATE`**: a lock acquisition inside the caller's
   transaction. Converting it to a store read silently drops the lock.
 - **Predicates evaluated against the database clock** (`NOW()`-relative
