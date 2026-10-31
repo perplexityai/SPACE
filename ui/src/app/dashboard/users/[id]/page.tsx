@@ -3,6 +3,8 @@
 import { useEffect, useState } from 'react';
 import { useParams } from 'next/navigation';
 import { adminApi } from '@/lib/api';
+import { loadFailureFrom, type LoadFailure } from '@/lib/load-failure';
+import LoadFailureResult from '@/components/load-failure-result';
 import { useAuth } from '@/lib/auth';
 import { AdminUser, Organization, UserRole } from '@/lib/types';
 import { assignableRoleOptions, canManageUserRole, roleColors, roleLabels } from '@/lib/userRoles';
@@ -18,16 +20,32 @@ export default function UserDetailPage() {
   const [org, setOrg] = useState<Organization | null>(null);
   const [visibleOrgIds, setVisibleOrgIds] = useState<string[]>([]);
   const [updatingRole, setUpdatingRole] = useState(false);
+  const [loadError, setLoadError] = useState<LoadFailure | null>(null);
+  const [attempt, setAttempt] = useState(0);
 
   useEffect(() => {
+    setLoadError(null);
     adminApi.get<AdminUser>(`/v1/users/${id}`).then((u) => {
       setUser(u);
       adminApi.get<Organization>(`/v1/orgs/${u.org_id}`).then(setOrg).catch(() => {});
-    });
+    }).catch((err: unknown) => setLoadError(loadFailureFrom(err, 'Failed to load user')));
     adminApi.get<Organization[]>('/v1/orgs')
       .then((orgs) => setVisibleOrgIds(orgs.map((org) => org.id)))
       .catch(() => setVisibleOrgIds([]));
-  }, [id]);
+  }, [id, attempt]);
+
+  if (loadError) {
+    return (
+      <LoadFailureResult
+        failure={loadError}
+        noun="user"
+        id={id}
+        backHref="/dashboard/users"
+        backLabel="Users"
+        onRetry={() => setAttempt((value) => value + 1)}
+      />
+    );
+  }
 
   if (!user) return null;
 
