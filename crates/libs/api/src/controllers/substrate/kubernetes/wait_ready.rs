@@ -775,6 +775,12 @@ impl KubernetesSubstrate {
         // returned gRPC `Unavailable`, so the timeout message names node-mgr
         // only when a probe actually implicated it.
         let mut saw_unavailable_probe = false;
+        // What the swallowed probes returned, for the warning at the
+        // deadline. A node that stops answering and a guest that never
+        // reports both end every probe at its deadline, which the timeout's
+        // phase cannot tell apart.
+        let mut deadline_exceeded_probes = 0_usize;
+        let mut last_probe_status: Option<tonic::Status> = None;
 
         record_api_wait_ready_latency(
             sandbox_id,
@@ -795,15 +801,18 @@ impl KubernetesSubstrate {
 
         loop {
             let probe_started_at = Instant::now();
+            let probe_timeout = (START_WAIT_COMMAND_PROBE_TIMEOUT
+                + START_WAIT_COMMAND_PROBE_CLIENT_MARGIN)
+                .min(deadline.saturating_duration_since(probe_started_at));
             let mut worker_client = RetryingWorkerApiClient::new(client);
             let probe = worker_client.spaced_wait_ready_with_metadata(
                 wait_ready_lifecycle_request(SpacedWaitReadyRequest {
                     sandbox_id: sandbox_id.to_string(),
                     timeout: Some(duration_to_proto(START_WAIT_COMMAND_PROBE_TIMEOUT)),
                 }),
-                START_WAIT_COMMAND_PROBE_TIMEOUT,
+                probe_timeout,
             );
-            match timeout(START_WAIT_COMMAND_PROBE_TIMEOUT, probe).await {
+            match timeout(probe_timeout, probe).await {
                 Ok(Ok(_)) => {
                     record_api_wait_ready_latency(
                         sandbox_id,
@@ -835,9 +844,24 @@ impl KubernetesSubstrate {
                     if err.code() == Code::FailedPrecondition
                         && (err.message().contains("not started")
                             || err.message().contains("sandbox is starting")
-                            || err.message().contains("wait for start to complete")) => {}
+                            || err.message().contains("wait for start to complete")) =>
+                {
+                    last_probe_status = Some(err);
+                }
                 Ok(Err(err)) if err.code() == Code::Unavailable => {
                     saw_unavailable_probe = true;
+                    last_probe_status = Some(err);
+                }
+                // Not ready yet, like the outer timeout below: the readiness
+                // deadline, not one probe, decides when the guest has failed
+                // to start. Three sources end a probe this way: the client's
+                // per-probe deadline, which ends a probe for a guest that is
+                // not ready because the node keeps waiting for it; the
+                // retrying client running out of its budget while the node
+                // refuses connections; and the node's own expired wait.
+                Ok(Err(err)) if err.code() == Code::DeadlineExceeded => {
+                    deadline_exceeded_probes += 1;
+                    last_probe_status = Some(err);
                 }
                 Ok(Err(err)) => {
                     record_api_wait_ready_error(
@@ -851,7 +875,9 @@ impl KubernetesSubstrate {
                         message: format!("sandbox failed before start completed: {err}"),
                     });
                 }
-                Err(_) => {}
+                // The same bound as the client's deadline, which usually
+                // fires first.
+                Err(_) => deadline_exceeded_probes += 1,
             }
 
             if Instant::now() >= deadline {
@@ -860,8 +886,20 @@ impl KubernetesSubstrate {
                         sandbox_id, template,
                     );
                 }
-                // The caller hands us an already-connected client, so the
-                // proxy was reachable — the guest is what never reported in.
+                // The caller reached the node for the adoption's setup and
+                // Wake, so the timeout names the guest's phase. A probe that
+                // could not reach the node also ends in `DeadlineExceeded`;
+                // the warning carries what the probes returned. Keep it out of
+                // the message: a transport signature there would make the
+                // timeout reclaimable and spend another readiness budget on
+                // the same pod.
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    deadline_exceeded_probes,
+                    last_probe_code = ?last_probe_status.as_ref().map(tonic::Status::code),
+                    last_probe_message = last_probe_status.as_ref().map(tonic::Status::message),
+                    "pooled sandbox command readiness wait timed out"
+                );
                 return Err(command_ready_timeout_error(
                     WaitReadyTimeoutPhase::GuestNotReady,
                     saw_unavailable_probe,

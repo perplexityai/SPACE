@@ -156,6 +156,9 @@ fn with_reply(
     replies
 }
 
+/// The readiness budget [`prepare`] hands the adoption.
+const PREPARE_TIMEOUT: Duration = Duration::from_secs(10);
+
 async fn prepare(
     substrate: &KubernetesSubstrate,
     inputs: &PooledInputs,
@@ -168,7 +171,7 @@ async fn prepare(
             &inputs.claim,
             &inputs.create.auto_lifecycle,
             wait_until_ready,
-            Duration::from_secs(10),
+            PREPARE_TIMEOUT,
         )
         .await
 }
@@ -680,5 +683,177 @@ async fn started_pooled_adoption_publishes_a_legacy_route_after_the_wake_ack() -
         "the acknowledged Wake's activation attempt must be published as the route"
     );
     assert_eq!(attempt, None, "the finished attempt must be released");
+    Ok(())
+}
+
+const SPACED_WAIT_READY: &str = "WorkerApi/SpacedWaitReady";
+
+/// A started adoption whose guest never reports command readiness after the
+/// pool's Wake gives up at the adoption's own readiness cap, not at the end of
+/// the create's readiness budget, so a fallthrough create reaches its cold
+/// create without that stall. The timeout stays non-reclaimable.
+#[tokio::test(flavor = "current_thread")]
+async fn started_pooled_adoption_stops_waiting_for_a_never_ready_guest_at_its_cap() -> TestResult {
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let inputs = PooledInputs::new();
+    insert_claimed_pool_execution(&db.pool, &inputs.claim, inputs.claim.pool_slot_id).await?;
+    // The node holds every probe for a guest that is not ready.
+    let worker = start_scripted_worker(ScriptedWorkerConfig::new(with_reply(
+        started_setup(&inputs),
+        SPACED_WAIT_READY,
+        ScriptedReply::Hang,
+    )))
+    .await?;
+    let mut substrate = substrate_with_claimed_pod_store(&db.pool, &worker);
+    substrate.budgets.pooled_command_ready = Duration::from_millis(300);
+
+    let started = Instant::now();
+    let outcome = prepare(&substrate, &inputs, true).await;
+
+    let Err(error) = outcome else {
+        panic!("a guest that never reports ready must fail the adoption");
+    };
+    assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE, "{error:?}");
+    assert!(
+        !pooled_prepare_error_is_reclaimable(&error),
+        "the create path must not spend another readiness wait on this pod: {error}"
+    );
+    assert!(
+        started.elapsed() < PREPARE_TIMEOUT,
+        "the adoption's readiness cap, not the create's budget, must end the wait"
+    );
+    assert!(!worker.received(SPACED_WAIT_READY).is_empty());
+    Ok(())
+}
+
+/// How long the node holds the first readiness probe after the pool's Wake,
+/// for a guest still slow to report ready.
+#[derive(Debug, Clone, Copy)]
+enum SlowFirstProbe {
+    /// The guest reports ready late in the node's wait, before the client's
+    /// deadline.
+    AnswersReady,
+    /// The guest is still not ready when the client's deadline ends the
+    /// probe. The node keeps waiting, as sbx-mgr's retried host-agent wait
+    /// does.
+    OutlivesTheClientDeadline,
+}
+
+/// The node waits for the guest for the time a readiness probe asks for,
+/// after connecting to the guest's host agent, so a guest slow after the
+/// pool's Wake holds the first probe past that wait. The readiness poll waits
+/// out a late answer, and keeps polling to its own deadline when the client's
+/// deadline ends the probe, instead of failing the adoption on that one probe.
+#[rstest::rstest]
+#[case::answers_ready(SlowFirstProbe::AnswersReady, 1)]
+#[case::outlives_the_client_deadline(SlowFirstProbe::OutlivesTheClientDeadline, 2)]
+#[tokio::test(flavor = "current_thread")]
+async fn pooled_readiness_poll_outlasts_a_slow_first_probe(
+    #[case] first_probe: SlowFirstProbe,
+    #[case] expected_probes: usize,
+) -> TestResult {
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+    let client_deadline = START_WAIT_COMMAND_PROBE_TIMEOUT + START_WAIT_COMMAND_PROBE_CLIENT_MARGIN;
+    let held_for = match first_probe {
+        // Past the wait the probe asks for, as connecting to the host agent
+        // adds.
+        SlowFirstProbe::AnswersReady => {
+            START_WAIT_COMMAND_PROBE_TIMEOUT + Duration::from_millis(500)
+        }
+        SlowFirstProbe::OutlivesTheClientDeadline => client_deadline + Duration::from_secs(1),
+    };
+    let ready = ScriptedReply::message(&sbx::SpacedWaitReadyResponse::default());
+    let (probe_sent, mut probes) = tokio::sync::mpsc::unbounded_channel();
+    let observe_probe: CallObserver = Arc::new(move || {
+        let _ = probe_sent.send(());
+        Box::pin(std::future::ready(()))
+    });
+    let worker = start_scripted_worker(ScriptedWorkerConfig {
+        observers: HashMap::from([(SPACED_WAIT_READY, observe_probe)]),
+        ..ScriptedWorkerConfig::new([(
+            SPACED_WAIT_READY,
+            ScriptedReply::Sequence(Arc::from([
+                ScriptedReply::Delayed(held_for, Arc::new(ready.clone())),
+                ready,
+            ])),
+        )])
+    })
+    .await?;
+    let substrate = substrate_without_store(&worker);
+    let inputs = PooledInputs::new();
+    let endpoint =
+        KubernetesSubstrate::endpoint_for_pod_ip(PodIp::parse(&inputs.claim.pod_ip)?, worker.port)?;
+    let mut node_api = NodeApiClient::with_service_name("worker-node-api", endpoint.clone());
+    let binding = ExecutionBinding {
+        execution_object_id: inputs.claim.pod_name.clone(),
+        runtime_endpoint: endpoint,
+        execution_generation: inputs.claim.execution_generation,
+    };
+    // Move the clock only through the `advance` calls below. A paused clock
+    // still auto-advances while the runtime waits on I/O, unless a blocking
+    // task is running, and could jump to the client's deadline while a reply
+    // is in flight.
+    let (release_clock, clock_released) = std::sync::mpsc::channel::<()>();
+    // Blocks until `release_clock` is dropped.
+    let clock_hold = tokio::task::spawn_blocking(move || while clock_released.recv().is_ok() {});
+    tokio::time::pause();
+
+    let poll_returned = std::cell::Cell::new(false);
+    let (ready_binding, advanced) = tokio::join!(
+        async {
+            let ready_binding = Box::pin(substrate.poll_connected_client_until_command_ready(
+                &mut node_api,
+                inputs.claim.sandbox_id,
+                SandboxApiMetricIdentity::native("create"),
+                Duration::from_secs(10),
+                binding,
+                None,
+            ))
+            .await;
+            poll_returned.set(true);
+            ready_binding
+        },
+        async {
+            // The node's delay and the client's deadline both start as the
+            // first probe arrives. Timer deadlines round up to the next
+            // millisecond.
+            probes
+                .recv()
+                .await
+                .ok_or("the first probe must reach the node")?;
+            tokio::time::advance(held_for.min(client_deadline) + Duration::from_millis(1)).await;
+            // A poll that has its answer returns on the reply alone. Move the
+            // clock again only once real time shows the poll still waiting,
+            // then step through its backoff until the next probe reaches the
+            // node or the poll returns. Stepping while a reply travels could
+            // reach the client's deadline and end the probe it answers.
+            let grace_ends = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            for _ in 0..1_000 {
+                if poll_returned.get() || probes.try_recv().is_ok() {
+                    break;
+                }
+                tokio::task::spawn_blocking(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                })
+                .await?;
+                if std::time::Instant::now() >= grace_ends {
+                    tokio::time::advance(Duration::from_millis(50)).await;
+                }
+            }
+            Ok::<_, BoxError>(())
+        },
+    );
+    advanced?;
+    let ready_binding = ready_binding?;
+    drop(release_clock);
+    clock_hold.await?;
+
+    assert_eq!(ready_binding.execution_object_id, inputs.claim.pod_name);
+    assert_eq!(worker.received(SPACED_WAIT_READY).len(), expected_probes);
     Ok(())
 }
