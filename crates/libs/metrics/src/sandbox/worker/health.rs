@@ -1,4 +1,5 @@
-//! Sandbox health: probes, status, transitions, raw vsock checks and evidence reports.
+//! Sandbox health: probes, status, transitions, node-lease relaunch backoff, raw vsock
+//! checks and evidence reports.
 
 use super::*;
 
@@ -112,6 +113,15 @@ pub fn sandbox_health_status(value: usize, lifecycle: &str, status: SandboxHealt
         value as f64,
         &[tag("lifecycle", lifecycle), tag("status", status.as_str())],
     );
+}
+
+/// Sandboxes on this node whose VM runtime is alive and whose last sidecar
+/// relaunch found no node-manager network lease, so the watchdog is backing
+/// off relaunches (5 s doubling to 300 s). Set every watchdog sweep and drops
+/// as each episode ends. `GetSandboxHealth` names the sandboxes; this gauge
+/// carries no per-sandbox tags.
+pub fn sandbox_health_node_lease_missing(value: usize) {
+    gauge("sandbox.health.node_lease_missing", value as f64, &[]);
 }
 
 pub fn sandbox_health_transition(status: SandboxHealthStatus) {
