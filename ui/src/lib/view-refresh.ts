@@ -1,5 +1,10 @@
+// The interval only checks whether the view is stale, which is cheap; the
+// staleness window is what sets how often a list is refetched. Every refetch
+// of the sandbox, node or template list reads the whole admin list, so it
+// runs every 10 s rather than every second. Pages refresh right after an
+// operator's own action regardless.
 export const VIEW_REFRESH_INTERVAL_MS = 1_000;
-export const VIEW_REFRESH_STALE_MS = 1_000;
+export const VIEW_REFRESH_STALE_MS = 10_000;
 export const VIEW_REFRESH_LOCK_TTL_MS = 60_000;
 
 const STORAGE_PREFIX = 'space:view-refresh:';
