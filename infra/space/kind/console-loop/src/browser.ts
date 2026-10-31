@@ -146,3 +146,12 @@ export async function waitForStatus(c: Ctx, id: string, want: string[], timeoutM
 export function shortLabel(id: string): string {
   return id.replace(/^sbx_/, '').replaceAll('-', '').slice(-8);
 }
+
+// Hide every code block in a dialog (where the API Keys page shows a new
+// key's secret), for the rest of this page's life: screenshots and video
+// frames then never contain a secret.
+export async function maskApiKeySecrets(page: Page): Promise<void> {
+  await page.addStyleTag({
+    content: '.ant-modal .ant-typography code, .ant-modal code, .ant-modal pre { visibility: hidden !important; } .ant-modal .ant-typography:has(> code) { background: #444 !important; min-height: 1.6em; }',
+  });
+}

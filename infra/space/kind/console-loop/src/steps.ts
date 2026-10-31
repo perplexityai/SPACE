@@ -2,7 +2,8 @@
 // checks what an operator relies on; the runner records everything else
 // (errors, failed and slow requests, screenshots). Steps that create or
 // change something are marked `mutates` and clean up after themselves.
-import { adminFetch, confirmPopover, content, pickSelect, settle, shortLabel, signIn, text, visit, waitForStatus, type Ctx } from './browser.ts';
+import { adminFetch, confirmPopover, content, maskApiKeySecrets, pickSelect, settle, shortLabel, signIn, text, visit, waitForStatus, type Ctx } from './browser.ts';
+import { orgDisplayName, recordCreated } from './seed.ts';
 
 export interface Step {
   name: string;
@@ -22,6 +23,8 @@ const seeded = (c: Ctx) => {
 const orgId = (c: Ctx, key: string) => seeded(c).orgs[key];
 const sandboxId = (c: Ctx, key: string) => seeded(c).sandboxes[key];
 const email = (c: Ctx, local: string) => `${c.config.prefix}-${local}@example.test`;
+// Seeded org names carry the prefix, so two prefixes on one stack never mix.
+const orgName = (c: Ctx, title: string) => orgDisplayName(c.config.prefix, title);
 
 // --------------------------------------------------------------- sign-in
 step('login-page', ['auth'], async (c) => {
@@ -36,6 +39,22 @@ step('login', ['auth'], async (c) => {
   await c.page.waitForURL(/\/dashboard/, { timeout: 20_000 });
   await settle(c.page);
   c.rec.check(/\/dashboard/.test(c.page.url()), 'signing in lands on the dashboard');
+});
+
+// Every recorded fixture must exist, looked up by ID, or the steps that use
+// it would fail for the wrong reason (or pass on a list that misses it).
+step('fixtures', ['auth'], async (c) => {
+  if (!c.seed) return c.rec.check(false, 'seed state exists (run `npm run seed` with the same --out and --prefix)');
+  for (const [key, id] of Object.entries(c.seed.orgs)) {
+    c.rec.check((await adminFetch(c.page, 'GET', `/admin/api/v1/orgs/${id}`)).status === 200, `seeded org ${key} exists`);
+  }
+  for (const [address, user] of Object.entries(c.seed.users)) {
+    c.rec.check((await adminFetch(c.page, 'GET', `/admin/api/v1/users/${user.id}`)).status === 200, `seeded user ${address} exists`);
+  }
+  for (const [key, id] of Object.entries(c.seed.sandboxes)) {
+    if (key === 'deleted') continue;
+    c.rec.check((await adminFetch(c.page, 'GET', `/admin/api/v1/sandboxes/${id}`)).status === 200, `seeded sandbox ${key} exists`);
+  }
 });
 
 // ------------------------------------------------------------ every route
@@ -60,8 +79,8 @@ for (const [route, label] of [
 step('orgs-list', ['orgs'], async (c) => {
   await visit(c, '/dashboard/orgs');
   const t = await text(c.page);
-  for (const name of ['Acme (synthetic)', 'Globex (synthetic)', 'Globex Research (synthetic)']) {
-    c.rec.check(t.includes(name), `the organizations list shows ${name}`);
+  for (const title of ['Acme', 'Globex', 'Globex Research']) {
+    c.rec.check(t.includes(orgName(c, title)), `the organizations list shows ${orgName(c, title)}`);
   }
 });
 
@@ -85,6 +104,8 @@ step('org-create-delete', ['orgs', 'flows'], async (c) => {
   await modal.getByPlaceholder('Slug').fill(c.runTag);
   await modal.getByRole('button', { name: 'Create organization' }).click();
   await settle(c.page);
+  const created = ((await adminFetch(c.page, 'GET', '/admin/api/v1/orgs')).json ?? []).find((o: { slug: string }) => o.slug === c.runTag);
+  if (created) recordCreated(c.config, { kind: 'org', id: created.id, name: c.runTag });
   const row = c.page.locator('tr', { hasText: c.runTag });
   c.rec.check(await row.count() > 0, 'a created organization appears in the list');
   if (!(await row.count())) return;
@@ -102,7 +123,7 @@ step('users-list', ['users'], async (c) => {
 
 step('users-switch-org', ['users'], async (c) => {
   await visit(c, '/dashboard/users');
-  await pickSelect(c.page, content(c.page).locator('.ant-select').first(), 'Acme (synthetic)');
+  await pickSelect(c.page, content(c.page).locator('.ant-select').first(), orgName(c, 'Acme'));
   await settle(c.page);
   c.rec.check((await text(c.page)).includes(email(c, 'acme-dev')), "switching organization lists that organization's users");
 });
@@ -117,7 +138,7 @@ for (const local of ['ops-admin', 'acme-dev']) {
 
 step('user-create-role-delete', ['users', 'flows'], async (c) => {
   await visit(c, '/dashboard/users');
-  await pickSelect(c.page, content(c.page).locator('.ant-select').first(), 'Acme (synthetic)');
+  await pickSelect(c.page, content(c.page).locator('.ant-select').first(), orgName(c, 'Acme'));
   await settle(c.page);
   const address = `${c.runTag}@example.test`;
   await c.page.getByPlaceholder('Email').fill(address);
@@ -125,6 +146,8 @@ step('user-create-role-delete', ['users', 'flows'], async (c) => {
   await c.page.getByPlaceholder('Display Name').fill('Loop Temporary');
   await c.page.getByRole('button', { name: 'Create' }).click();
   await settle(c.page);
+  const listed = ((await adminFetch(c.page, 'GET', `/admin/api/v1/orgs/${orgId(c, 'acme')}/users`)).json ?? []).find((u: { email: string }) => u.email === address);
+  if (listed) recordCreated(c.config, { kind: 'user', id: listed.id, name: address, orgId: orgId(c, 'acme') });
   const row = c.page.locator('tr', { hasText: address });
   c.rec.check(await row.count() > 0, 'a created user appears in the list');
   if (!(await row.count())) return;
@@ -151,13 +174,24 @@ step('api-keys-list', ['api-keys'], async (c) => {
 
 step('api-key-create-revoke', ['api-keys', 'flows'], async (c) => {
   await visit(c, '/dashboard/api-keys');
+  // The new key's secret is shown once in a dialog: hide it before the
+  // dialog exists, so no screenshot or video frame of this step holds it.
+  await maskApiKeySecrets(c.page);
   await c.page.getByRole('button', { name: 'Create API key' }).click();
   const modal = c.page.locator('.ant-modal:visible');
   await modal.locator('input').first().fill(c.runTag);
   await modal.getByRole('button', { name: 'Create' }).click();
   // The secret is shown once; the loop does not keep it.
-  await c.page.locator('.ant-modal:visible', { hasText: 'Copy this key now' }).waitFor({ timeout: 10_000 });
+  const dialog = c.page.locator('.ant-modal:visible', { hasText: 'Copy this key now' });
+  await dialog.waitFor({ timeout: 10_000 });
+  const exposed = await dialog.locator('code').evaluateAll((els) => els.filter((el) => getComputedStyle(el).visibility !== 'hidden').length);
+  c.rec.check(exposed === 0, `the secret is hidden while its dialog is open (${exposed} visible)`);
+  await c.page.waitForTimeout(800);
+  await c.page.screenshot({ path: `${c.rec.outDir}/api-key-dialog-masked.png` });
   await c.page.getByRole('button', { name: 'Done' }).click();
+  const keys = (await adminFetch(c.page, 'GET', `/admin/api/v1/orgs/${seeded(c).managingOrgId}/api-keys`)).json ?? [];
+  const key = keys.find((k: { name: string }) => k.name === c.runTag);
+  if (key) recordCreated(c.config, { kind: 'apiKey', id: key.id, name: c.runTag, orgId: seeded(c).managingOrgId });
   const row = c.page.locator('tr', { hasText: c.runTag });
   c.rec.check(await row.count() > 0, 'a created key appears in the list');
   if (!(await row.count())) return;
@@ -218,7 +252,10 @@ step('sandbox-create', ['sandboxes', 'flows', 'lifecycle'], async (c) => {
     await c.page.waitForTimeout(3000);
     const list = await adminFetch(c.page, 'GET', '/admin/api/v1/sandboxes?limit=5000');
     const row = (list.json ?? []).find((s: { name: string | null }) => s.name === c.runTag);
-    if (row) c.shared.sandbox = row.id.startsWith('sbx_') ? row.id : `sbx_${row.id}`;
+    if (row) {
+      c.shared.sandbox = row.id.startsWith('sbx_') ? row.id : `sbx_${row.id}`;
+      recordCreated(c.config, { kind: 'sandbox', id: c.shared.sandbox, name: c.runTag, orgId: seeded(c).managingOrgId });
+    }
   }
   c.rec.check(!!c.shared.sandbox, 'creating a sandbox from the form produces one');
 }, true);
