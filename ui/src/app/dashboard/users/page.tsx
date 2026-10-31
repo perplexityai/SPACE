@@ -7,6 +7,7 @@ import { AdminUser, Organization, UserRole } from '@/lib/types';
 import { Table, Button, Form, Input, Select, Typography, Popconfirm, App, Card, Space, Tag } from 'antd';
 import { assignableRoleOptions, canDeleteUser, canManageUserRole, roleChangeConfirmation, roleColors, roleLabels } from '@/lib/userRoles';
 import { PlusOutlined, DeleteOutlined } from '@ant-design/icons';
+import { USER_DELETE_CONSEQUENCES, userDeleteFailureMessage } from '@/lib/user-delete';
 import Link from 'next/link';
 import type { ColumnsType } from 'antd/es/table';
 
@@ -82,8 +83,8 @@ export default function UsersPage() {
       await adminApi.delete(`/v1/users/${id}`);
       setUsers(users.filter((u) => u.id !== id));
       message.success('User deleted');
-    } catch (err: any) {
-      message.error(err.message);
+    } catch (err: unknown) {
+      message.error(userDeleteFailureMessage(err));
     }
   };
 
@@ -143,6 +144,9 @@ export default function UsersPage() {
         return (
           <Popconfirm
             title="Delete this user?"
+            description={USER_DELETE_CONSEQUENCES}
+            okText="Delete"
+            okButtonProps={{ danger: true }}
             onConfirm={() => handleDelete(record.id)}
             disabled={!canDelete}
           >
