@@ -63,6 +63,12 @@ const SPACED_GUEST_HEALTH_TIMEOUT: Duration = Duration::from_millis(500);
 const NET_GATEWAY_HEALTH_TIMEOUT: Duration = Duration::from_millis(250);
 const SIDECAR_RESTART_TIMEOUT: Duration = Duration::from_secs(10);
 const SIDECAR_RESTART_CONCURRENCY: usize = 16;
+// Without a node-manager network lease every sidecar Launch fails the same
+// way, and nothing in this service re-creates the lease, so retries slow down
+// instead of repeating every sweep.
+const NODE_LEASE_MISSING_BACKOFF_INITIAL: Duration = SIDECAR_CHECK_INTERVAL;
+const NODE_LEASE_MISSING_BACKOFF_MAX: Duration = Duration::from_secs(300);
+const NODE_LEASE_MISSING_HEALTH_DETAIL: &str = "node lease missing: the last sidecar relaunch found no node-manager network lease; relaunches are backing off";
 const RUN_DIR: &str = pplx_space_common_core::host::linux::paths::SANDBOX_RUN_DIR;
 const GUEST_HEALTH_LIFECYCLES: [crate::state::SandboxState; 9] = [
     crate::state::SandboxState::Starting,
@@ -136,6 +142,27 @@ enum NetGatewayRelaunchArgsError {
 }
 
 #[derive(Debug, thiserror::Error)]
+enum NetGatewayRelaunchError {
+    #[error("launch net-gateway replacement: {0}")]
+    Launch(#[source] tonic::Status),
+    #[error("{0}")]
+    Failed(String),
+}
+
+impl NetGatewayRelaunchError {
+    fn is_node_lease_missing(&self) -> bool {
+        matches!(self, Self::Launch(status) if launch_status_is_node_lease_missing(status))
+    }
+}
+
+/// Node-manager's Launch answers `NotFound` ("sandbox not allocated") when its
+/// slot pool holds no lease for the sandbox. It checks the execution identity
+/// first, which answers `FailedPrecondition`.
+fn launch_status_is_node_lease_missing(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::NotFound
+}
+
+#[derive(Debug, thiserror::Error)]
 enum SpacedHostRestartError {
     #[error("connect to node-manager for spaced-host restart: {0}")]
     NodeManagerConnect(#[from] pplx_space_node_mgr_client::ConnectError),
@@ -159,6 +186,12 @@ enum SpacedHostRestartError {
     DatabaseMutexPoisoned,
     #[error("persist spaced-host replacement pid: {0}")]
     Persist(#[source] crate::db::Error),
+}
+
+impl SpacedHostRestartError {
+    fn is_node_lease_missing(&self) -> bool {
+        matches!(self, Self::Launch(status) if launch_status_is_node_lease_missing(status))
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -264,6 +297,7 @@ fn sidecar_info_from_row(row: &crate::db::SandboxRow) -> SidecarInfo {
     }
 }
 
+#[derive(Clone)]
 enum SidecarRestartRequest {
     SpacedHost(SidecarInfo),
     NetGateway(SidecarInfo),
@@ -339,14 +373,18 @@ impl SidecarRestartRequest {
 #[derive(Default)]
 struct SidecarRestartQueue {
     pending: VecDeque<SidecarRestartRequest>,
-    scheduled: HashSet<SidecarRestartKey>,
+    /// The sweep that scheduled each key, which anchors a node-lease backoff
+    /// to the sweep cadence rather than to when the attempt finished.
+    scheduled: HashMap<SidecarRestartKey, tokio::time::Instant>,
 }
 
 impl SidecarRestartQueue {
-    fn schedule(&mut self, request: SidecarRestartRequest) -> bool {
-        if !self.scheduled.insert(request.key()) {
+    fn schedule(&mut self, request: SidecarRestartRequest, sweep_at: tokio::time::Instant) -> bool {
+        let key = request.key();
+        if self.scheduled.contains_key(&key) {
             return false;
         }
+        self.scheduled.insert(key, sweep_at);
         self.pending.push_back(request);
         true
     }
@@ -367,16 +405,79 @@ impl SidecarRestartQueue {
         });
     }
 
-    fn complete(&mut self, key: &SidecarRestartKey) {
-        self.scheduled.remove(key);
+    fn complete(&mut self, key: &SidecarRestartKey) -> Option<tokio::time::Instant> {
+        self.scheduled.remove(key)
     }
 }
 
 struct SidecarRestartOutcome {
-    key: SidecarRestartKey,
-    sandbox_id: String,
-    operation: &'static str,
-    result: Result<(), String>,
+    /// The request as scheduled, carrying the sidecar authority it acted on.
+    request: SidecarRestartRequest,
+    result: Result<(), SidecarRestartFailure>,
+}
+
+#[derive(Debug)]
+enum SidecarRestartFailure {
+    NodeLeaseMissing(String),
+    Other(String),
+}
+
+impl SidecarRestartFailure {
+    fn from_timeout<E>(
+        error: WatchdogTimeoutError<E>,
+        is_node_lease_missing: impl FnOnce(&E) -> bool,
+    ) -> Self
+    where
+        E: fmt::Debug + fmt::Display,
+    {
+        match &error {
+            WatchdogTimeoutError::Operation(source) if is_node_lease_missing(source) => {
+                Self::NodeLeaseMissing(error.to_string())
+            }
+            _ => Self::Other(error.to_string()),
+        }
+    }
+}
+
+/// Sidecar relaunch pacing for a sandbox whose node-manager network lease is
+/// missing. One backoff spans the episode: it starts at the first such
+/// failure and ends when a relaunch succeeds, the sweep finds nothing to
+/// relaunch while the VM runtime is alive, or the sandbox leaves the
+/// watchdog. Delays are measured from the sweep that scheduled the failed
+/// attempt.
+#[derive(Clone, Copy, Debug)]
+struct NodeLeaseBackoff {
+    failures: u32,
+    delay: Duration,
+    retry_at: tokio::time::Instant,
+    /// Whether the latest relaunch failed for a missing lease. A failure for
+    /// another reason clears it, so health stops naming the lease.
+    lease_missing: bool,
+}
+
+impl NodeLeaseBackoff {
+    fn new(scheduled_at: tokio::time::Instant) -> Self {
+        Self {
+            failures: 1,
+            delay: NODE_LEASE_MISSING_BACKOFF_INITIAL,
+            retry_at: scheduled_at + NODE_LEASE_MISSING_BACKOFF_INITIAL,
+            lease_missing: true,
+        }
+    }
+
+    fn record_failure(&mut self, scheduled_at: tokio::time::Instant) {
+        self.failures = self.failures.saturating_add(1);
+        self.delay = self
+            .delay
+            .saturating_mul(2)
+            .min(NODE_LEASE_MISSING_BACKOFF_MAX);
+        self.retry_at = scheduled_at + self.delay;
+        self.lease_missing = true;
+    }
+
+    fn allows_retry(self, now: tokio::time::Instant) -> bool {
+        now >= self.retry_at
+    }
 }
 
 type SidecarRestartFuture = BoxFuture<'static, SidecarRestartOutcome>;
@@ -433,6 +534,7 @@ pub struct SandboxHealth {
     /// sandbox cannot repeat them more often than
     /// `diagnostics::CONSOLE_TAIL_MIN_INTERVAL`.
     last_console_tail_at: Option<Instant>,
+    node_lease_backoff: Option<NodeLeaseBackoff>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -870,6 +972,7 @@ impl SandboxWatchdog {
             next_health_probe_at: now + initial_health_probe_delay(&id),
             health_probe_sequence: 0,
             last_console_tail_at: None,
+            node_lease_backoff: None,
         });
     }
 
@@ -1042,6 +1145,7 @@ impl SandboxWatchdog {
             &self.node_manager,
         )
         .await
+        .map_err(|error| error.to_string())
     }
 
     pub async fn update_network_counters(
@@ -1111,6 +1215,17 @@ impl SandboxWatchdog {
 }
 
 impl SandboxHealth {
+    fn end_node_lease_backoff(&mut self, sandbox_id: &str, reason: &str) {
+        if let Some(backoff) = self.node_lease_backoff.take() {
+            tracing::info!(
+                sandbox_id,
+                reason,
+                failures = backoff.failures,
+                "sidecar relaunch no longer lacks a node lease; ending backoff"
+            );
+        }
+    }
+
     fn observe_net_gateway_process(&mut self, process_pid: Option<u32>) {
         if self.netgtw_stats_pid == process_pid {
             return;
@@ -1282,12 +1397,15 @@ async fn sidecar_loop(
     let mut restart_queue = SidecarRestartQueue::default();
     let mut restart_futures = FuturesUnordered::<SidecarRestartFuture>::new();
     loop {
-        let run_sweep = tokio::select! {
+        // The tick's deadline, not the time this sweep reaches a sandbox,
+        // paces node-lease backoffs, so a delay that is a whole number of
+        // intervals lands exactly on a later sweep.
+        let sweep_at = tokio::select! {
             _ = shutdown_token.cancelled() => return,
-            _ = interval.tick() => true,
+            sweep_at = interval.tick() => Some(sweep_at),
             outcome = restart_futures.next(), if !restart_futures.is_empty() => {
                 if let Some(outcome) = outcome {
-                    finish_sidecar_restart(&mut restart_queue, outcome);
+                    finish_sidecar_restart(&mut restart_queue, &sidecars, &state, outcome).await;
                 }
                 fill_sidecar_restart_slots(
                     &mut restart_queue,
@@ -1300,12 +1418,12 @@ async fn sidecar_loop(
                     &node_manager,
                 )
                 .await;
-                false
+                None
             }
         };
-        if !run_sweep {
+        let Some(sweep_at) = sweep_at else {
             continue;
-        }
+        };
         tick = tick.wrapping_add(1);
 
         // Snapshot sidecar info for iteration
@@ -1342,18 +1460,14 @@ async fn sidecar_loop(
                 runtime_alive && sidecar_pid_is_committed(info.netgtw_pid, netgtw_live_pid);
 
             let observed_netgtw_pid = if netgtw_alive { netgtw_live_pid } else { None };
-            {
-                let mut map = state.lock().await;
-                if let Some(health) = map.get_mut(id.as_str()) {
-                    health.runtime_alive = runtime_alive;
-                    if !runtime_alive {
-                        // The composed health loop owns normal updates for this
-                        // observability-only bit.
-                        health.vsock_raw_ping_ok = false;
-                    }
-                    health.spaced_host_alive = spaced_alive;
-                }
-            }
+            let observation = SidecarSweepObservation {
+                runtime_alive,
+                spaced_host_live_pid: spaced_live_pid,
+                netgtw_live_pid,
+                spaced_host_alive: spaced_alive,
+                netgtw_alive,
+            };
+            let node_lease_backoff = record_sidecar_sweep(&state, info, &observation).await;
             let netgtw_observation_is_authoritative = observe_authoritative_net_gateway_process(
                 &state,
                 &sidecars,
@@ -1387,31 +1501,13 @@ async fn sidecar_loop(
                 .await;
             }
 
-            // Restart dead sidecars and finish partially committed replacements.
-            if info.guest_image.expects_agent()
-                && !spaced_alive
-                && info.uid.is_some()
-                && info.vsock_uds_path.is_some()
-                && restart_queue.schedule(SidecarRestartRequest::SpacedHost(info.clone()))
-            {
-                tracing::warn!(
-                    sandbox_id = %id,
-                    live_pid = ?spaced_live_pid,
-                    committed_pid = ?info.spaced_host_pid,
-                    "spaced-host missing or not committed; scheduling restart"
-                );
-            }
-            if !netgtw_alive
-                && info.uid.is_some()
-                && restart_queue.schedule(SidecarRestartRequest::NetGateway(info.clone()))
-            {
-                tracing::warn!(
-                    sandbox_id = %id,
-                    live_pid = ?netgtw_live_pid,
-                    committed_pid = ?info.netgtw_pid,
-                    "net-gateway missing or not committed; scheduling restart"
-                );
-            }
+            schedule_sidecar_restarts(
+                &mut restart_queue,
+                info,
+                &observation,
+                node_lease_backoff,
+                sweep_at,
+            );
         }
 
         fill_sidecar_restart_slots(
@@ -1450,6 +1546,96 @@ async fn sidecar_loop(
     }
 }
 
+/// What one sweep saw of a sandbox's sidecars.
+struct SidecarSweepObservation {
+    runtime_alive: bool,
+    spaced_host_live_pid: Option<u32>,
+    netgtw_live_pid: Option<u32>,
+    spaced_host_alive: bool,
+    netgtw_alive: bool,
+}
+
+impl SidecarSweepObservation {
+    fn spaced_host_needs_restart(&self, info: &SidecarInfo) -> bool {
+        info.guest_image.expects_agent()
+            && !self.spaced_host_alive
+            && info.uid.is_some()
+            && info.vsock_uds_path.is_some()
+    }
+
+    fn netgtw_needs_restart(&self, info: &SidecarInfo) -> bool {
+        !self.netgtw_alive && info.uid.is_some()
+    }
+
+    fn needs_restart(&self, info: &SidecarInfo) -> bool {
+        self.spaced_host_needs_restart(info) || self.netgtw_needs_restart(info)
+    }
+}
+
+/// Record one sweep's sidecar observation in the sandbox's health and return
+/// the node-lease backoff that still applies to it.
+async fn record_sidecar_sweep(
+    state: &Arc<Mutex<HashMap<String, SandboxHealth>>>,
+    info: &SidecarInfo,
+    observation: &SidecarSweepObservation,
+) -> Option<NodeLeaseBackoff> {
+    let mut map = state.lock().await;
+    let health = map.get_mut(info.sandbox_id.as_str())?;
+    health.runtime_alive = observation.runtime_alive;
+    if !observation.runtime_alive {
+        // The composed health loop owns normal updates for this
+        // observability-only bit.
+        health.vsock_raw_ping_ok = false;
+    }
+    health.spaced_host_alive = observation.spaced_host_alive;
+    // Another actor, such as a lifecycle relaunch, may have restored the
+    // sidecars while retries were backing off.
+    if observation.runtime_alive && !observation.needs_restart(info) {
+        health.end_node_lease_backoff(&info.sandbox_id, "sidecars are running");
+    }
+    health.node_lease_backoff
+}
+
+/// Restart dead sidecars and finish partially committed replacements, unless
+/// a missing node-manager lease has deferred this sandbox's next attempt.
+fn schedule_sidecar_restarts(
+    queue: &mut SidecarRestartQueue,
+    info: &SidecarInfo,
+    observation: &SidecarSweepObservation,
+    node_lease_backoff: Option<NodeLeaseBackoff>,
+    sweep_at: tokio::time::Instant,
+) {
+    if node_lease_backoff.is_some_and(|backoff| !backoff.allows_retry(sweep_at)) {
+        return;
+    }
+    // The first missing-lease failure of an episode is logged; retries that
+    // still find no lease are not.
+    let log_schedule = node_lease_backoff.is_none_or(|backoff| !backoff.lease_missing);
+    let id = &info.sandbox_id;
+    if observation.spaced_host_needs_restart(info)
+        && queue.schedule(SidecarRestartRequest::SpacedHost(info.clone()), sweep_at)
+        && log_schedule
+    {
+        tracing::warn!(
+            sandbox_id = %id,
+            live_pid = ?observation.spaced_host_live_pid,
+            committed_pid = ?info.spaced_host_pid,
+            "spaced-host missing or not committed; scheduling restart"
+        );
+    }
+    if observation.netgtw_needs_restart(info)
+        && queue.schedule(SidecarRestartRequest::NetGateway(info.clone()), sweep_at)
+        && log_schedule
+    {
+        tracing::warn!(
+            sandbox_id = %id,
+            live_pid = ?observation.netgtw_live_pid,
+            committed_pid = ?info.netgtw_pid,
+            "net-gateway missing or not committed; scheduling restart"
+        );
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "each restart task needs the sidecar loop's long-lived dependencies"
@@ -1484,8 +1670,7 @@ async fn fill_sidecar_restart_slots(
             continue;
         }
 
-        let sandbox_id = request.sandbox_id().to_string();
-        let operation = request.operation();
+        let scheduled = request.clone();
         let db = db.clone();
         let sidecars = Arc::clone(sidecars);
         let network_policy_reconcile_queue = network_policy_reconcile_queue.clone();
@@ -1493,42 +1678,26 @@ async fn fill_sidecar_restart_slots(
         let feature_flags = feature_flags.clone();
         let node_manager = node_manager.clone();
         let task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
-            match request {
-                SidecarRestartRequest::SpacedHost(info) => watchdog_timeout(
-                    SIDECAR_RESTART_TIMEOUT,
-                    operation,
-                    restart_spaced_host(&info, db, sidecars, &node_manager),
-                )
-                .await
-                .map(|_| ())
-                .map_err(|error| error.to_string()),
-                SidecarRestartRequest::NetGateway(info) => watchdog_timeout(
-                    SIDECAR_RESTART_TIMEOUT,
-                    operation,
-                    restart_netgtw(
-                        &info,
-                        db,
-                        sidecars,
-                        network_policy_reconcile_queue,
-                        &state,
-                        &feature_flags,
-                        &node_manager,
-                    ),
-                )
-                .await
-                .map(|_| ())
-                .map_err(|error| error.to_string()),
-            }
+            run_sidecar_restart(
+                request,
+                db,
+                sidecars,
+                network_policy_reconcile_queue,
+                &state,
+                &feature_flags,
+                &node_manager,
+            )
+            .await
         }));
         futures.push(
             async move {
                 let result = task.await.unwrap_or_else(|error| {
-                    Err(format!("restart task failed before completion: {error}"))
+                    Err(SidecarRestartFailure::Other(format!(
+                        "restart task failed before completion: {error}"
+                    )))
                 });
                 SidecarRestartOutcome {
-                    key,
-                    sandbox_id,
-                    operation,
+                    request: scheduled,
                     result,
                 }
             }
@@ -1537,15 +1706,125 @@ async fn fill_sidecar_restart_slots(
     }
 }
 
-fn finish_sidecar_restart(queue: &mut SidecarRestartQueue, outcome: SidecarRestartOutcome) {
-    queue.complete(&outcome.key);
-    if let Err(error) = outcome.result {
-        tracing::error!(
-            sandbox_id = outcome.sandbox_id,
-            %error,
-            operation = outcome.operation,
-            "sidecar restart failed"
-        );
+async fn run_sidecar_restart(
+    request: SidecarRestartRequest,
+    db: crate::db::SharedConnection,
+    sidecars: Arc<Mutex<HashMap<String, SidecarInfo>>>,
+    network_policy_reconcile_queue: NetworkPolicyReconcileQueue,
+    state: &Arc<Mutex<HashMap<String, SandboxHealth>>>,
+    feature_flags: &pplx_space_feature_flags::FeatureFlagClient,
+    node_manager: &NodeManagerConnector,
+) -> Result<(), SidecarRestartFailure> {
+    let operation = request.operation();
+    match request {
+        SidecarRestartRequest::SpacedHost(info) => watchdog_timeout(
+            SIDECAR_RESTART_TIMEOUT,
+            operation,
+            restart_spaced_host(&info, db, sidecars, node_manager),
+        )
+        .await
+        .map_err(|error| {
+            SidecarRestartFailure::from_timeout(
+                error,
+                SpacedHostRestartError::is_node_lease_missing,
+            )
+        }),
+        SidecarRestartRequest::NetGateway(info) => watchdog_timeout(
+            SIDECAR_RESTART_TIMEOUT,
+            operation,
+            restart_netgtw(
+                &info,
+                db,
+                sidecars,
+                network_policy_reconcile_queue,
+                state,
+                feature_flags,
+                node_manager,
+            ),
+        )
+        .await
+        .map_err(|error| {
+            SidecarRestartFailure::from_timeout(
+                error,
+                NetGatewayRelaunchError::is_node_lease_missing,
+            )
+        }),
+    }
+}
+
+async fn finish_sidecar_restart(
+    queue: &mut SidecarRestartQueue,
+    sidecars: &Arc<Mutex<HashMap<String, SidecarInfo>>>,
+    state: &Arc<Mutex<HashMap<String, SandboxHealth>>>,
+    outcome: SidecarRestartOutcome,
+) {
+    let SidecarRestartOutcome { request, result } = outcome;
+    let sandbox_id = request.sandbox_id();
+    let operation = request.operation();
+    let scheduled_at = queue
+        .complete(&request.key())
+        .unwrap_or_else(tokio::time::Instant::now);
+    let lease_error = match result {
+        Ok(()) => {
+            // The restart committed its pid under its own authority check.
+            if let Some(health) = state.lock().await.get_mut(sandbox_id) {
+                health.end_node_lease_backoff(sandbox_id, operation);
+            }
+            return;
+        }
+        Err(SidecarRestartFailure::NodeLeaseMissing(error)) => Some(error),
+        Err(SidecarRestartFailure::Other(error)) => {
+            tracing::error!(sandbox_id, %error, operation, "sidecar restart failed");
+            None
+        }
+    };
+    // Lock order matches `commit_netgtw_replacement`: health, then sidecars.
+    let mut map = state.lock().await;
+    // A sandbox that left the watchdog takes its backoff with it, and one
+    // registered again since this request was scheduled starts afresh.
+    let still_authoritative = sidecars
+        .lock()
+        .await
+        .get(sandbox_id)
+        .is_some_and(|current| request.still_has_authority(current));
+    let Some(health) = map.get_mut(sandbox_id).filter(|_| still_authoritative) else {
+        return;
+    };
+    let Some(error) = lease_error else {
+        // This attempt is no evidence that the lease is still missing.
+        if let Some(backoff) = &mut health.node_lease_backoff {
+            backoff.lease_missing = false;
+        }
+        return;
+    };
+    match &mut health.node_lease_backoff {
+        // A sibling sidecar's failure from the same sweep already re-armed it.
+        Some(backoff) if !backoff.allows_retry(scheduled_at) => {
+            backoff.lease_missing = true;
+        }
+        Some(backoff) => {
+            backoff.record_failure(scheduled_at);
+            tracing::debug!(
+                sandbox_id,
+                %error,
+                operation,
+                failures = backoff.failures,
+                retry_in = ?backoff.delay,
+                "sidecar restart still has no node lease"
+            );
+        }
+        None => {
+            let backoff = NodeLeaseBackoff::new(scheduled_at);
+            health.node_lease_backoff = Some(backoff);
+            tracing::error!(
+                sandbox_id,
+                %error,
+                operation,
+                retry_in = ?backoff.delay,
+                max_retry_interval = ?NODE_LEASE_MISSING_BACKOFF_MAX,
+                "sidecar restart failed: node-manager holds no network lease for the sandbox; backing off relaunches"
+            );
+        }
     }
 }
 
@@ -2551,6 +2830,22 @@ fn firecracker_health_observation(
     }
 }
 
+/// Whether the last relaunch's missing node lease is current evidence for why
+/// this component's sidecar is down: the VM runtime is alive and the sweep
+/// found the sidecar not running.
+fn node_lease_missing_explains(component: HealthComponent, health: &SandboxHealth) -> bool {
+    let sidecar_alive = match component {
+        HealthComponent::SpacedHost => health.spaced_host_alive,
+        HealthComponent::NetGateway => health.netgtw_alive,
+        HealthComponent::Firecracker | HealthComponent::SpacedGuest => return false,
+    };
+    health.runtime_alive
+        && !sidecar_alive
+        && health
+            .node_lease_backoff
+            .is_some_and(|backoff| backoff.lease_missing)
+}
+
 fn bounded_health_detail(mut detail: String) -> String {
     const MAX_DETAIL_CHARS: usize = 256;
     if detail.chars().count() > MAX_DETAIL_CHARS {
@@ -2662,6 +2957,14 @@ async fn apply_composed_health_result(
     let previous_guest_health = classify_guest_health(GuestHealthProbe::from(&*health));
     for (component, mut observation) in HealthComponent::ALL.into_iter().zip(observations) {
         observation.lifecycle_epoch = lifecycle_epoch;
+        // A sidecar's dial error says only that it is absent; name why it
+        // stays absent, for health readers and the transition line.
+        if !observation.outcome.is_success() && node_lease_missing_explains(component, health) {
+            observation.detail = bounded_health_detail(format!(
+                "{NODE_LEASE_MISSING_HEALTH_DETAIL}; probe: {}",
+                observation.detail
+            ));
+        }
         let outcome = observation.outcome;
         pplx_space_metrics::sandbox::worker::sandbox_health_probe(
             component.as_metric(),
@@ -3007,7 +3310,7 @@ async fn restart_netgtw(
     state: &Arc<Mutex<HashMap<String, SandboxHealth>>>,
     feature_flags: &pplx_space_feature_flags::FeatureFlagClient,
     node_manager: &NodeManagerConnector,
-) -> Result<(), String> {
+) -> Result<(), NetGatewayRelaunchError> {
     relaunch_netgtw(
         info,
         &db,
@@ -3038,17 +3341,21 @@ async fn relaunch_netgtw(
     state: &Arc<Mutex<HashMap<String, SandboxHealth>>>,
     feature_flags: &pplx_space_feature_flags::FeatureFlagClient,
     node_manager: &NodeManagerConnector,
-) -> Result<u32, String> {
+) -> Result<u32, NetGatewayRelaunchError> {
+    let failed = NetGatewayRelaunchError::Failed;
     let sandbox_id = &info.sandbox_id;
     let uid = info
         .uid
-        .ok_or_else(|| "missing sandbox uid for net-gateway restart".to_string())?;
-    let mut node_client = node_manager.connect().await.map_err(|e| e.to_string())?;
+        .ok_or_else(|| failed("missing sandbox uid for net-gateway restart".to_string()))?;
+    let mut node_client = node_manager
+        .connect()
+        .await
+        .map_err(|e| failed(e.to_string()))?;
 
     let args = net_gateway_relaunch_args(db, sandbox_id, feature_flags)
-        .map_err(|error| error.to_string())?;
-    let process_uid =
-        crate::service::gateway_identity::launch_uid(uid).map_err(|error| error.to_string())?;
+        .map_err(|error| failed(error.to_string()))?;
+    let process_uid = crate::service::gateway_identity::launch_uid(uid)
+        .map_err(|error| failed(error.to_string()))?;
 
     let resp = node_client
         .launch(pplx_space_node_mgr_client::proto::LaunchRequest {
@@ -3063,10 +3370,12 @@ async fn relaunch_netgtw(
             env: crate::sidecar_env::net_gateway_env(),
         })
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(NetGatewayRelaunchError::Launch)?;
     let pid = resp.get_ref().pid;
 
-    commit_netgtw_replacement(sandbox_id, uid, info.netgtw_pid, pid, db, sidecars, state).await?;
+    commit_netgtw_replacement(sandbox_id, uid, info.netgtw_pid, pid, db, sidecars, state)
+        .await
+        .map_err(failed)?;
 
     tracing::info!(
         sandbox_id = %sandbox_id,
@@ -3086,9 +3395,10 @@ async fn commit_netgtw_replacement(
     sidecars: &Arc<Mutex<HashMap<String, SidecarInfo>>>,
     state: &Arc<Mutex<HashMap<String, SandboxHealth>>>,
 ) -> Result<(), String> {
-    // Lock order for the only multi-map sidecar commit is health -> sidecars
-    // -> SQLite. Other watchdog paths snapshot these maps under separate
-    // guards; keep them that way so this order cannot form a cycle.
+    // Lock order for the multi-map sidecar paths, this commit and
+    // `finish_sidecar_restart`, is health -> sidecars -> SQLite. Other
+    // watchdog paths snapshot these maps under separate guards; keep them
+    // that way so this order cannot form a cycle.
     let mut health = state.lock().await;
     let mut sidecars = sidecars.lock().await;
     let current = sidecars
@@ -3108,6 +3418,9 @@ async fn commit_netgtw_replacement(
         .map_err(|e| e.to_string())?;
     current.netgtw_pid = Some(pid);
     clear_netgtw_probe_state(&mut health, sandbox_id);
+    if let Some(health) = health.get_mut(sandbox_id) {
+        health.end_node_lease_backoff(sandbox_id, "net-gateway restart");
+    }
     Ok(())
 }
 
