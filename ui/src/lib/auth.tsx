@@ -21,6 +21,8 @@ interface AuthContextType {
   retry: () => void;
   refreshOrg: (org: Organization) => void;
   refreshCluster: (cluster: Cluster) => void;
+  // Refetch `GET /auth/v1/cluster`, for when it failed after sign-in.
+  reloadCluster: () => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextType>({
@@ -37,6 +39,7 @@ const AuthContext = createContext<AuthContextType>({
   retry: () => {},
   refreshOrg: () => {},
   refreshCluster: () => {},
+  reloadCluster: async () => {},
 });
 
 export function AuthProvider({ children }: { children: ReactNode }) {
@@ -177,6 +180,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setCluster(updated);
   };
 
+  const reloadCluster = async () => {
+    const current =
+      authMode?.mode === 'external' ? await authApi.probe<Cluster>('/cluster') : await authApi.get<Cluster>('/cluster');
+    setCluster(current);
+  };
+
   return (
     <AuthContext.Provider
       value={{
@@ -193,6 +202,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         retry,
         refreshOrg,
         refreshCluster,
+        reloadCluster,
       }}
     >
       {children}

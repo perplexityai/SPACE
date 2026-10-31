@@ -5,7 +5,7 @@ import { useRouter, usePathname } from 'next/navigation';
 import Link from 'next/link';
 import { useAuth } from '@/lib/auth';
 import { useTheme, useCuriosityTheme } from '@/lib/theme';
-import { isManagingOrgAdmin } from '@/lib/userRoles';
+import { consoleAccess } from '@/lib/console-access';
 import { App, Layout, Menu, Typography, Button, ConfigProvider, Avatar, Space, Segmented, Modal, Result } from 'antd';
 import {
   DashboardOutlined,
@@ -16,6 +16,7 @@ import {
   ClusterOutlined,
   KeyOutlined,
   LogoutOutlined,
+  ReloadOutlined,
 } from '@ant-design/icons';
 
 const { Sider, Content } = Layout;
@@ -41,7 +42,8 @@ const menuItems: DashboardMenuItem[] = [
 ];
 
 export default function DashboardLayout({ children }: { children: React.ReactNode }) {
-  const { user, org, cluster, loading, logout } = useAuth();
+  const { user, org, cluster, loading, logout, reloadCluster } = useAuth();
+  const [reloadingCluster, setReloadingCluster] = useState(false);
   const { mode, setMode, isDark } = useTheme();
   const { config, buttonClassName, primaryColor, surfaces } = useCuriosityTheme(org?.theme_primary);
   const router = useRouter();
@@ -71,8 +73,19 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
 
   if (loading || !user || !org) return null;
 
-  const managingOrgAdmin = isManagingOrgAdmin(user, cluster);
-  const visibleItems = managingOrgAdmin ? menuItems : [];
+  const access = consoleAccess(user, cluster);
+  const visibleItems = access === 'operator' ? menuItems : [];
+
+  const retryCluster = async () => {
+    setReloadingCluster(true);
+    try {
+      await reloadCluster();
+    } catch {
+      // The notice stays up; the next Retry tries again.
+    } finally {
+      setReloadingCluster(false);
+    }
+  };
 
   const selectedKey = visibleItems
     .filter((item) => pathname.startsWith(item.key))
@@ -128,7 +141,18 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
             </div>
           </Sider>
           <Content style={{ padding: 24, minWidth: 0, overflowX: 'auto', background: surfaces.page }}>
-            {managingOrgAdmin ? children : (
+            {access === 'operator' ? children : access === 'cluster-unknown' ? (
+              <Result
+                status="warning"
+                title="Could not load cluster information"
+                subTitle="The console needs the cluster record to tell whether your organization manages this cluster."
+                extra={
+                  <Button type="primary" icon={<ReloadOutlined />} loading={reloadingCluster} onClick={retryCluster}>
+                    Retry
+                  </Button>
+                }
+              />
+            ) : (
               <Result
                 status="403"
                 title="This console is for cluster operators"
