@@ -14,9 +14,10 @@
 //! (`template_name`, `content_hash`); nodemgr derives the canonical
 //! host paths internally so callers can't smuggle arbitrary paths.
 
+use pplx_space_common_core::types::TemplateCachePartition;
 use pplx_space_node_mgr_client::proto::{
     BtrfsCreateTemplateSubvolumeRequest, BtrfsDeleteTemplateSubvolumeRequest,
-    BtrfsFinalizeTemplateSubvolumeRequest,
+    BtrfsFinalizeTemplateSubvolumeRequest, EnvironmentTemplateBuild,
 };
 use std::path::PathBuf;
 use thiserror::Error;
@@ -36,9 +37,28 @@ pub enum BtrfsViaNodemgrError {
     InvalidUuid { value: String, error: String },
 }
 
+/// Wire identity of a build: the legacy `content_hash` field, or an
+/// `EnvironmentTemplateBuild` that leaves it empty so a node-manager predating
+/// cache partitions rejects the call instead of acting on the legacy build.
+fn wire_build(
+    content_hash: &str,
+    partition: TemplateCachePartition,
+) -> (String, Option<EnvironmentTemplateBuild>) {
+    match partition.environment() {
+        None => (content_hash.to_string(), None),
+        Some(environment) => (
+            String::new(),
+            Some(EnvironmentTemplateBuild {
+                content_hash: content_hash.to_string(),
+                environment: environment.to_string(),
+            }),
+        ),
+    }
+}
+
 /// Create the canonical template digest dir as a btrfs subvolume.
 /// Returns the path nodemgr wrote at — always derived from
-/// `(name, content_hash)`, but echoed back for logging.
+/// `(name, content_hash, partition)`, but echoed back for logging.
 ///
 /// `AlreadyExists` from nodemgr is mapped to a successful return: the
 /// dir was already created by a prior coalesced pull or a partial
@@ -47,14 +67,17 @@ pub enum BtrfsViaNodemgrError {
 pub async fn create_template_subvolume(
     name: &str,
     content_hash: &str,
+    partition: TemplateCachePartition,
 ) -> Result<PathBuf, BtrfsViaNodemgrError> {
     let mut client = pplx_space_node_mgr_client::connect()
         .await
         .map_err(|e| BtrfsViaNodemgrError::Connect(e.to_string()))?;
+    let (wire_hash, environment_build) = wire_build(content_hash, partition);
     match client
         .btrfs_create_template_subvolume(BtrfsCreateTemplateSubvolumeRequest {
             template_name: name.to_string(),
-            content_hash: content_hash.to_string(),
+            content_hash: wire_hash,
+            environment_build,
         })
         .await
     {
@@ -66,10 +89,13 @@ pub async fn create_template_subvolume(
             // serialized this pull behind whoever created it, and
             // their cleanup-on-error guard would have wiped it if
             // their install failed.
-            Ok(PathBuf::from(format!(
-                "{}/{name}/{content_hash}",
-                pplx_space_common_core::host::linux::paths::TEMPLATE_DIR
-            )))
+            Ok(PathBuf::from(
+                pplx_space_common_core::host::linux::paths::template_build_dir(
+                    name,
+                    content_hash,
+                    partition,
+                ),
+            ))
         }
         Err(status) => Err(BtrfsViaNodemgrError::Rpc {
             rpc: "BtrfsCreateTemplateSubvolume",
@@ -87,14 +113,17 @@ pub async fn create_template_subvolume(
 pub async fn finalize_template_subvolume(
     name: &str,
     content_hash: &str,
+    partition: TemplateCachePartition,
 ) -> Result<Uuid, BtrfsViaNodemgrError> {
     let mut client = pplx_space_node_mgr_client::connect()
         .await
         .map_err(|e| BtrfsViaNodemgrError::Connect(e.to_string()))?;
+    let (wire_hash, environment_build) = wire_build(content_hash, partition);
     let response = client
         .btrfs_finalize_template_subvolume(BtrfsFinalizeTemplateSubvolumeRequest {
             template_name: name.to_string(),
-            content_hash: content_hash.to_string(),
+            content_hash: wire_hash,
+            environment_build,
         })
         .await
         .map_err(|status| BtrfsViaNodemgrError::Rpc {
@@ -115,14 +144,17 @@ pub async fn finalize_template_subvolume(
 pub async fn delete_template_subvolume(
     name: &str,
     content_hash: &str,
+    partition: TemplateCachePartition,
 ) -> Result<(), BtrfsViaNodemgrError> {
     let mut client = pplx_space_node_mgr_client::connect()
         .await
         .map_err(|e| BtrfsViaNodemgrError::Connect(e.to_string()))?;
+    let (wire_build_hash, environment_build) = wire_build(content_hash, partition);
     client
         .btrfs_delete_template_subvolume(BtrfsDeleteTemplateSubvolumeRequest {
             template_name: name.to_string(),
-            content_hash: content_hash.to_string(),
+            content_hash: wire_build_hash,
+            environment_build,
         })
         .await
         .map_err(|status| BtrfsViaNodemgrError::Rpc {

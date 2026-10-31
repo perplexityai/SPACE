@@ -269,6 +269,16 @@ impl TemplateMetadata {
         }
     }
 
+    /// The environment this document's execution metadata is bound to;
+    /// `None` for unbound documents.
+    pub fn environment(
+        &self,
+    ) -> Result<Option<crate::types::EnvironmentReference>, TemplateMetadataSchemaError> {
+        Ok(self
+            .execution_metadata()?
+            .and_then(|execution| execution.environment()))
+    }
+
     /// Filter `Option<u32>` / `Option<u8>` fields to drop `Some(0)`
     /// values — both build-manager and the seed builder occasionally
     /// emit zeros that mean "no default" rather than "default of
