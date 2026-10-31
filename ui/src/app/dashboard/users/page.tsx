@@ -63,7 +63,7 @@ export default function UsersPage() {
   const handleRoleChange = (target: AdminUser, role: UserRole) => {
     if (target.role === role) return;
     modal.confirm({
-      ...roleChangeConfirmation(target.email, role, { inManagingOrg: !!cluster && target.org_id === cluster.managing_org_id, currentRole: target.role }),
+      ...roleChangeConfirmation(target.email, role, { inManagingOrg: cluster ? target.org_id === cluster.managing_org_id : null, currentRole: target.role }),
       onOk: () => applyRole(target, role),
     });
   };

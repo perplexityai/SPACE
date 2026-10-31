@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { adminApi } from '@/lib/api';
@@ -8,6 +8,7 @@ import { loadFailureFrom, type LoadFailure } from '@/lib/load-failure';
 import LoadFailureResult from '@/components/load-failure-result';
 import { useAuth } from '@/lib/auth';
 import { publicSandboxIdFromAny } from '@/lib/sandbox-id';
+import { setSignInNotice } from '@/lib/sign-in-notice';
 import { AdminUser, ApiKeyMetadata, Organization, Sandbox, UserRole } from '@/lib/types';
 import { assignableRoleOptions, canDeleteUser, canManageUserRole, roleChangeConfirmation, roleColors, roleLabels } from '@/lib/userRoles';
 import { Typography, Descriptions, Select, Tag, App, Alert, Button, Card, Form, Input, Modal, Popconfirm, Space, Table, Tooltip } from 'antd';
@@ -45,6 +46,19 @@ export default function UserDetailPage() {
   const [passwordOpen, setPasswordOpen] = useState(false);
   const [saving, setSaving] = useState(false);
   const [editForm] = Form.useForm<EditValues>();
+  // Saves answer with the user as that request saw it; a profile save and a
+  // role save in flight together could leave the older answer on screen.
+  // Each save instead reloads the user, and only the newest reload applies.
+  const userRequest = useRef(0);
+  const reloadUser = async () => {
+    const request = ++userRequest.current;
+    try {
+      const fresh = await adminApi.get<AdminUser>(`/v1/users/${id}`);
+      if (request === userRequest.current) setUser(fresh);
+    } catch {
+      // The save itself succeeded; the next load shows the current user.
+    }
+  };
   const [passwordForm] = Form.useForm<PasswordValues>();
 
   const errorText = (err: unknown, fallback: string) => (err instanceof Error && err.message ? err.message : fallback);
@@ -105,14 +119,18 @@ export default function UserDetailPage() {
   // federated user, which its user response does not mark; that refusal is
   // shown as the API's message.
   const canSetPassword = canEdit && authMode?.mode !== 'external';
-  const inManagingOrg = !!cluster && user.org_id === cluster.managing_org_id;
+  // `null` when the cluster record did not load: console access is unknown.
+  const inManagingOrg = cluster ? user.org_id === cluster.managing_org_id : null;
+  // External sign-in matches the provider's email exactly against the user's
+  // email, so changing your own would lock you out with no way back.
+  const emailLocked = isSelf && authMode?.mode === 'external';
 
   const applyRole = async (role: UserRole) => {
     setUpdatingRole(true);
     try {
-      const updated = await adminApi.put<AdminUser>(`/v1/users/${user.id}/role`, { role });
-      setUser(updated);
+      await adminApi.put<AdminUser>(`/v1/users/${user.id}/role`, { role });
       message.success('Role updated');
+      await reloadUser();
     } catch (err: any) {
       message.error(err.message);
     } finally {
@@ -128,9 +146,16 @@ export default function UserDetailPage() {
   const patchUser = async (body: Partial<{ email: string; display_name: string; password: string }>, done: string) => {
     setSaving(true);
     try {
-      const updated = await adminApi.patch<AdminUser>(`/v1/users/${user.id}`, body);
-      setUser({ ...user, ...updated });
+      await adminApi.patch<AdminUser>(`/v1/users/${user.id}`, body);
+      if (body.password !== undefined && isSelf) {
+        // Setting a password ends every session of that user, this one too.
+        setSignInNotice('Your password was changed and your sessions ended. Sign in with the new password.');
+        localStorage.removeItem('token');
+        window.location.assign('/login');
+        return true;
+      }
       message.success(done);
+      await reloadUser();
       return true;
     } catch (err: any) {
       message.error(err.message);
@@ -290,14 +315,20 @@ export default function UserDetailPage() {
           // are initial values; setting fields before that is lost.
           initialValues={{ display_name: user.display_name, email: user.email }}
           onFinish={async (values) => {
-            if (await patchUser({ display_name: values.display_name, email: values.email }, 'User updated')) setEditOpen(false);
+            const body = emailLocked ? { display_name: values.display_name } : { display_name: values.display_name, email: values.email };
+            if (await patchUser(body, 'User updated')) setEditOpen(false);
           }}
         >
           <Form.Item name="display_name" label="Display name" rules={[{ required: true }]}>
             <Input autoComplete="off" />
           </Form.Item>
-          <Form.Item name="email" label="Email" rules={[{ required: true }, { pattern: LOOSE_EMAIL, message: 'Enter an email address' }]}>
-            <Input autoComplete="off" />
+          <Form.Item
+            name="email"
+            label="Email"
+            rules={emailLocked ? [] : [{ required: true }, { pattern: LOOSE_EMAIL, message: 'Enter an email address' }]}
+            extra={emailLocked ? 'Your email is how external sign-in identifies you. Changing it here would lock you out, so it cannot be edited from your own page.' : undefined}
+          >
+            <Input autoComplete="off" disabled={emailLocked} />
           </Form.Item>
         </Form>
       </Modal>
@@ -311,6 +342,11 @@ export default function UserDetailPage() {
         onCancel={() => setPasswordOpen(false)}
         destroyOnHidden
       >
+        <Typography.Paragraph type="secondary">
+          {isSelf
+            ? 'Setting a password ends all of your sessions, including this one: you will sign in again with the new password.'
+            : "Setting a password ends all of this user's sessions. Your own session is not affected."}
+        </Typography.Paragraph>
         <Form
           form={passwordForm}
           layout="vertical"
