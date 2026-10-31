@@ -960,8 +960,11 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
   const refresh = async (showSpinner = false) => {
     if (showSpinner) setLoading(true);
     try {
-      setSandbox(await getConsoleSandbox(id));
+      const loaded = await getConsoleSandbox(decodeURIComponent(id));
+      setSandbox(loaded);
       setError(null);
+      // Any accepted identifier (bare UUID, pod name) lands on the canonical URL.
+      if (loaded.id !== id) router.replace(`/dashboard/sandboxes/${loaded.id}`);
     } catch (err: any) {
       setError(err.message || 'Failed to load sandbox');
     } finally {
@@ -1074,7 +1077,7 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
         <Link href="/dashboard/sandboxes"><ArrowLeftOutlined /> Sandboxes</Link>
         <Title level={3} style={{ marginTop: 8 }}>Sandbox not found</Title>
         <Paragraph type="danger">{error}</Paragraph>
-        <Paragraph><code>{sandboxLabelOrId(id)}</code></Paragraph>
+        <Paragraph><code>{decodeURIComponent(id)}</code></Paragraph>
       </div>
     );
   }
