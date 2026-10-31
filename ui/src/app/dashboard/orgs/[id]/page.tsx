@@ -17,19 +17,20 @@ import type { ColumnsType } from 'antd/es/table';
 
 const { Title } = Typography;
 
-// What the BYOK flag does, on every path that reads it
-// (`controllers/sandbox/queries.rs`, `fork_operation_executor.rs`): a new
-// sandbox is encrypted, and then never adopts a warm-pool member, only when
-// the org flag and the cluster's SPACE_BYOK_VOLUME_ENCRYPTION are both on;
-// with the flag on, create admission never claims a warm-pool slot, and a
-// fork needs a source whose encryption matches the flag; the flag is shared
-// with credential encryption; a sandbox's encryption is fixed at create.
+// What the BYOK flag does, on every path that reads it: a new sandbox that is
+// not a fork is encrypted, and then never adopts a warm-pool member, only when
+// the org flag and the cluster's SPACE_BYOK_VOLUME_ENCRYPTION are both on; with
+// the flag on, create admission never claims a warm-pool slot
+// (`controllers/sandbox/queries.rs`); a fork keeps its source's encryption and
+// needs a source whose encryption matches the flag
+// (`fork_operation_executor.rs`); the flag is shared with credential
+// encryption; a sandbox's encryption is fixed at create.
 const BYOK_VOLUME_SWITCH = 'SPACE_BYOK_VOLUME_ENCRYPTION';
 const BYOK_SHARED = 'The same flag is shared with credential encryption.';
 const BYOK_EXISTING = 'Existing sandboxes keep the encryption they were created with.';
-const BYOK_ENABLE_TEXT = `New sandboxes in this organization run on encrypted volumes keyed through the external provider only where the cluster also enables BYOK volume encryption (${BYOK_VOLUME_SWITCH}); those never come from a warm pool. Whatever that setting, new sandboxes are not given a warm-pool slot at create admission, and forks of the organization's unencrypted sandboxes are refused. ${BYOK_SHARED} ${BYOK_EXISTING}`;
+const BYOK_ENABLE_TEXT = `New sandboxes in this organization run on encrypted volumes keyed through the external provider only where the cluster also enables BYOK volume encryption (${BYOK_VOLUME_SWITCH}); those never come from a warm pool. A fork keeps its source's encryption: forks of the organization's encrypted sandboxes stay encrypted whatever that setting, and forks of its unencrypted sandboxes are refused. Whatever that setting, new sandboxes are not given a warm-pool slot at create admission. ${BYOK_SHARED} ${BYOK_EXISTING}`;
 const BYOK_DISABLE_TEXT = `New sandboxes in this organization are created without volume encryption, and forks of its encrypted sandboxes are refused. ${BYOK_SHARED} ${BYOK_EXISTING} Encrypted ones can still start and restore.`;
-const BYOK_CARD_TEXT = `When enabled, and the cluster enables BYOK volume encryption (${BYOK_VOLUME_SWITCH}), newly created sandboxes run on encrypted volumes keyed through the configured external provider and never come from a warm pool. With the flag on, whatever that setting, new sandboxes are not given a warm-pool slot at create admission and a fork's source must be encrypted; with it off, a fork's source must be unencrypted. ${BYOK_SHARED} ${BYOK_EXISTING}`;
+const BYOK_CARD_TEXT = `When enabled, and the cluster enables BYOK volume encryption (${BYOK_VOLUME_SWITCH}), newly created sandboxes that are not forks run on encrypted volumes keyed through the configured external provider and never come from a warm pool. A fork keeps its source's encryption. With the flag on, whatever that setting, new sandboxes are not given a warm-pool slot at create admission and a fork's source must be encrypted; with it off, a fork's source must be unencrypted. ${BYOK_SHARED} ${BYOK_EXISTING}`;
 const ORG_SANDBOX_LIMIT = 5000;
 
 export default function OrgDetailPage() {
@@ -59,11 +60,14 @@ export default function OrgDetailPage() {
   const loadSandboxes = () => {
     setSandboxes(null);
     setSandboxesError(null);
+    setSandboxesCapped(false);
     adminApi.get<Sandbox[]>(`/v1/sandboxes?org_id=${id}&limit=${ORG_SANDBOX_LIMIT}`)
       .then((rows) => {
         const own = rows.filter((sandbox) => sandbox.resource_type === 'sandbox' && sandbox.org_id === id);
         setSandboxes(own);
-        setSandboxesCapped(own.length >= ORG_SANDBOX_LIMIT);
+        // Capped by what the API returned: the rows left out above count
+        // against its limit too.
+        setSandboxesCapped(rows.length >= ORG_SANDBOX_LIMIT);
       })
       .catch((err: unknown) => setSandboxesError(errorText(err, 'Failed to load sandboxes')));
   };
@@ -93,9 +97,16 @@ export default function OrgDetailPage() {
     adminApi.get<OrgMasterKey | null>(`/v1/orgs/${id}/master-key`).then(setMasterKey).catch(() => {});
   }, [id, attempt]);
 
-  const sandboxCountByUser = (userId: string) =>
-    sandboxes ? sandboxes.filter((sandbox) => sandbox.user_id === userId).length : null;
-  const sandboxTotal = sandboxes === null ? '…' : `${sandboxes.length}${sandboxesCapped ? '+' : ''}`;
+  // Counts over the loaded rows: when the list is capped they cover only the
+  // newest ORG_SANDBOX_LIMIT, so they are lower bounds.
+  const sandboxCountByUser = (userId: string) => {
+    if (!sandboxes) return null;
+    const count = sandboxes.filter((sandbox) => sandbox.user_id === userId).length;
+    return sandboxesCapped ? `≥${count}` : String(count);
+  };
+  const sandboxTotal = sandboxesError
+    ? 'not loaded'
+    : sandboxes === null ? '…' : `${sandboxes.length}${sandboxesCapped ? '+' : ''}`;
 
   const handleSave = async (values: any) => {
     setSaving(true);
@@ -118,10 +129,11 @@ export default function OrgDetailPage() {
   };
 
   // BYOK decides how new sandboxes in the org are created; confirm first. The
-  // texts follow the create path (`controllers/sandbox/queries.rs`): a new
-  // sandbox is encrypted only when the org flag and the cluster's
-  // SPACE_BYOK_VOLUME_ENCRYPTION are both on, the flag is shared with
-  // credential encryption, and a sandbox's encryption stamp never changes.
+  // texts follow the create and fork paths (see the constants above): a new
+  // sandbox that is not a fork is encrypted only when the org flag and the
+  // cluster's SPACE_BYOK_VOLUME_ENCRYPTION are both on, a fork keeps its
+  // source's encryption, the flag is shared with credential encryption, and a
+  // sandbox's encryption stamp never changes.
   const confirmByokToggle = (checked: boolean) => {
     modal.confirm({
       title: checked ? `Enable BYOK encryption for ${org?.name}?` : `Disable BYOK encryption for ${org?.name}?`,
@@ -155,7 +167,7 @@ export default function OrgDetailPage() {
     {
       title: 'Sandboxes',
       align: 'right',
-      render: (_, record) => sandboxCountByUser(record.id) ?? '—',
+      render: (_, record) => sandboxCountByUser(record.id) ?? (sandboxesError ? 'not loaded' : '…'),
     },
   ];
 
@@ -216,7 +228,7 @@ export default function OrgDetailPage() {
         ) : null}
         {sandboxesCapped ? (
           <Typography.Text type="secondary" style={{ display: 'block', marginBottom: 8 }}>
-            The newest {ORG_SANDBOX_LIMIT} are listed; the organization has at least that many.
+            The newest {ORG_SANDBOX_LIMIT} are listed; the organization has at least that many. The users&apos; sandbox counts cover only these.
           </Typography.Text>
         ) : null}
         <Table
@@ -242,7 +254,7 @@ export default function OrgDetailPage() {
       </Card>
 
       <Card
-        title={`API keys (${apiKeys ? apiKeys.length : '…'})`}
+        title={`API keys (${apiKeys ? apiKeys.length : apiKeysError ? 'not loaded' : '…'})`}
         size="small"
         style={{ marginBottom: 24 }}
         extra={<Link href={`/dashboard/api-keys?org=${org.id}`}>Manage API keys</Link>}
