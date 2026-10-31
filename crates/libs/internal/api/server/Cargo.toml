@@ -57,7 +57,6 @@ pplx-space-node-mgr-client = { workspace = true }
 pplx-space-placement = { workspace = true }
 pplx-space-sandbox-portability = { workspace = true }
 pplx-space-sandbox-store = { workspace = true }
-pplx-space-sandbox-teardown = { workspace = true }
 pplx-space-public-api = { workspace = true }
 pplx-space-execution-common = { workspace = true }
 pplx-space-sbx-mgr-client = { workspace = true }

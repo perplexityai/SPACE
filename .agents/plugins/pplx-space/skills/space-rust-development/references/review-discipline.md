@@ -23,7 +23,7 @@ no N/A explanations in the PR.
 
 - [ ] If a doc-comment claims "idempotent", the SQL has `ON CONFLICT (...) DO UPDATE/NOTHING` and the table has the matching unique index. Otherwise change the comment. See §2 in the SPACE lessons.
 - [ ] Any non-transactional side-effect after `tx.commit()` (RPC, file I/O, second commit) has explicit rollback or a documented eventual-consistency reconciler. The current function is not allowed to return `Err` while leaving committed half-state with no cleanup. See §4 in the SPACE lessons.
-- [ ] Searched the workspace for existing cleanup helpers (e.g. `finalize_sandbox_db_delete_tx`) before writing a new one. If the new path is intentionally different from the helper, the difference is explained in the PR description.
+- [ ] Searched the workspace for existing cleanup helpers (e.g. `pplx_space_sandbox_store::delete::delete_with_dependents`) before writing a new one. If the new path is intentionally different from the helper, the difference is explained in the PR description.
 
 ### Fail-loud discipline
 
