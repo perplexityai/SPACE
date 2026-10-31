@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { parseSandboxRef, publicSandboxIdFromAny } from './sandbox-id.ts';
+import { parseSandboxRef, publicSandboxIdFromAny, safeDecodeURIComponent } from './sandbox-id.ts';
 
 const uuid = '01a19089-216f-751e-9f56-1906865f5c23';
 const publicId = `sbx_${uuid}`;
@@ -35,8 +35,18 @@ for (const [name, input] of [
   });
 }
 
-test('publicSandboxIdFromAny canonicalizes every accepted form', () => {
+test('publicSandboxIdFromAny canonicalizes a bare UUID, a pod name and a public ID', () => {
   assert.equal(publicSandboxIdFromAny(uuid), publicId);
   assert.equal(publicSandboxIdFromAny(`space-sbx-${uuid.replaceAll('-', '')}-g3`), publicId);
   assert.equal(publicSandboxIdFromAny(publicId), publicId);
+});
+
+test('publicSandboxIdFromAny prefixes an unparseable ID unchanged', () => {
+  assert.equal(publicSandboxIdFromAny('not-a-uuid'), 'sbx_not-a-uuid');
+  assert.equal(publicSandboxIdFromAny('sbx_not-a-uuid'), 'sbx_not-a-uuid');
+});
+
+test('safeDecodeURIComponent decodes valid escapes and keeps malformed input', () => {
+  assert.equal(safeDecodeURIComponent('sandbox%3A' + uuid), `sandbox:${uuid}`);
+  assert.equal(safeDecodeURIComponent('%E0%A4%A'), '%E0%A4%A');
 });

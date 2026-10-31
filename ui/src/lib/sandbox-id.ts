@@ -41,6 +41,16 @@ export function parseSandboxRef(input: string): SandboxRef | null {
   return { uuid: value, publicId: `${PUBLIC_SANDBOX_ID_PREFIX}${value}` };
 }
 
+// `decodeURIComponent` that returns its input unchanged when it is not valid
+// percent-encoding, for identifiers taken from a URL path.
+export function safeDecodeURIComponent(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
 export function sandboxUuidPart(sandboxId: string): string {
   return sandboxId.startsWith(PUBLIC_SANDBOX_ID_PREFIX)
     ? sandboxId.slice(PUBLIC_SANDBOX_ID_PREFIX.length)
