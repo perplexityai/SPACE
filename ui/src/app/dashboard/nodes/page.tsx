@@ -667,9 +667,7 @@ export default function NodesPage() {
       dataIndex: 'name',
       width: 180,
       render: (name: string | null, record) => (
-        <Button type="link" style={{ padding: 0 }} onClick={() => void loadNodeSandboxes(record)}>
-          {name || record.id.slice(0, 8)}
-        </Button>
+        <Link href={`/dashboard/nodes/${record.id}`}>{name || record.id.slice(0, 8)}</Link>
       ),
     },
     {
@@ -756,7 +754,9 @@ export default function NodesPage() {
             }
           >
             <Space size={4} wrap>
-              <span>{counts.sandboxes_active} active</span>
+              <Button type="link" size="small" style={{ padding: 0 }} onClick={() => void loadNodeSandboxes(record)}>
+                {counts.sandboxes_active} active
+              </Button>
               {stale ? <Tag>stale</Tag> : null}
               {counts.sandboxes_local_snapshots ? <Tag>{counts.sandboxes_local_snapshots} local snaps</Tag> : null}
               {unhealthySlots > 0 ? <Tag color="orange">{unhealthySlots} slots unhealthy</Tag> : null}
