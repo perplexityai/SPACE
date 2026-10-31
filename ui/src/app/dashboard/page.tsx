@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react';
 import { adminApi } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 import { getConsoleSandboxes } from '@/lib/public-api';
-import { DEFAULT_LIST_LIMIT } from '@/lib/sandbox-id';
+import { DEFAULT_LIST_LIMIT, sandboxRowCount } from '@/lib/sandbox-id';
 import { Organization } from '@/lib/types';
 import { Card, Col, Row, Statistic, Typography } from 'antd';
 import { TeamOutlined, CloudServerOutlined } from '@ant-design/icons';
@@ -19,7 +19,7 @@ export default function DashboardPage() {
   useEffect(() => {
     adminApi.get<Organization[]>('/v1/orgs').then((orgs) => setOrgCount(orgs.length)).catch(() => {});
     getConsoleSandboxes()
-      .then((sbx) => setSandboxCount(sbx.length))
+      .then((sbx) => setSandboxCount(sandboxRowCount(sbx)))
       .catch(() => {});
   }, []);
 

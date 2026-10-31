@@ -32,7 +32,9 @@ export async function getPublicSandbox(id: string): Promise<Sandbox> {
   return publicSandboxToConsoleSandbox(await api.get<PublicSandbox>(`/sandboxes/${id}`));
 }
 
-// The newest `limit` sandboxes across every org; the admin list has no cursor.
+// The newest `limit` sandbox rows across every org, followed by rows nodes
+// report without a database row (see `sandboxRowCount`). The admin list has
+// no cursor.
 export async function getConsoleSandboxes(limit: number = DEFAULT_LIST_LIMIT): Promise<Sandbox[]> {
   const sandboxes = await adminApi.get<Sandbox[]>(`/v1/sandboxes?limit=${limit}`);
   return sandboxes.map(adminSandboxToConsoleSandbox);

@@ -3,12 +3,14 @@ import { test } from 'node:test';
 import {
   DEFAULT_LIST_LIMIT,
   MAX_LIST_LIMIT,
+  listIsCapped,
   matchesSandboxQuery,
   parseListLimit,
   parseSandboxRef,
   publicSandboxIdFromAny,
   safeDecodeURIComponent,
   sandboxQuery,
+  sandboxRowCount,
 } from './sandbox-id.ts';
 
 const uuid = '01a19089-216f-751e-9f56-1906865f5c23';
@@ -95,4 +97,16 @@ test('parseListLimit clamps to the admin API range', () => {
   assert.equal(parseListLimit('0'), DEFAULT_LIST_LIMIT);
   assert.equal(parseListLimit('3'), 3);
   assert.equal(parseListLimit('999999'), MAX_LIST_LIMIT);
+});
+
+test('only sandbox rows count against the list limit', () => {
+  const rows = [
+    { resource_type: 'sandbox' },
+    { resource_type: 'sandbox' },
+    { resource_type: 'pool_slot' },
+    { resource_type: 'observed_local' },
+  ];
+  assert.equal(sandboxRowCount(rows), 2);
+  assert.equal(listIsCapped(rows, 2), true);
+  assert.equal(listIsCapped(rows, 3), false);
 });
