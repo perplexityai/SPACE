@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react';
 import { adminApi } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 import { getConsoleSandboxes } from '@/lib/public-api';
+import { DEFAULT_LIST_LIMIT } from '@/lib/sandbox-id';
 import { Organization } from '@/lib/types';
 import { Card, Col, Row, Statistic, Typography } from 'antd';
 import { TeamOutlined, CloudServerOutlined } from '@ant-design/icons';
@@ -34,7 +35,11 @@ export default function DashboardPage() {
         </Col>
         <Col xs={24} sm={12} lg={6}>
           <Card>
-            <Statistic title="Sandboxes" value={sandboxCount} prefix={<CloudServerOutlined />} />
+            <Statistic
+              title="Sandboxes"
+              value={sandboxCount >= DEFAULT_LIST_LIMIT ? `${DEFAULT_LIST_LIMIT}+` : sandboxCount}
+              prefix={<CloudServerOutlined />}
+            />
           </Card>
         </Col>
       </Row>

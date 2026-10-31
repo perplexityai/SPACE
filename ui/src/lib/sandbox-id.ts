@@ -65,3 +65,44 @@ export function sandboxLabelOrId(sandboxId: string): string {
   }
   return compact.slice(-SANDBOX_LABEL_LEN);
 }
+
+// The admin list returns the newest sandboxes first, up to `limit` rows
+// (the API's default and maximum).
+export const DEFAULT_LIST_LIMIT = 1000;
+export const MAX_LIST_LIMIT = 5000;
+export const LIST_LIMIT_OPTIONS = [100, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT];
+
+export function parseListLimit(raw: string | null): number {
+  const value = raw === null ? NaN : Number(raw);
+  if (!Number.isInteger(value) || value < 1) return DEFAULT_LIST_LIMIT;
+  return Math.min(value, MAX_LIST_LIMIT);
+}
+
+// What the sandbox search box holds: nothing, one sandbox's full identifier
+// in any accepted form, or free text matched against IDs and names.
+export type SandboxQuery =
+  | { kind: 'empty' }
+  | { kind: 'ref'; ref: SandboxRef }
+  | { kind: 'text'; text: string; compact: string };
+
+export function sandboxQuery(input: string): SandboxQuery {
+  const text = input.trim().toLowerCase();
+  if (!text) return { kind: 'empty' };
+  const ref = parseSandboxRef(text);
+  if (ref) return { kind: 'ref', ref };
+  return { kind: 'text', text, compact: text.replaceAll('-', '') };
+}
+
+export function matchesSandboxQuery(query: SandboxQuery, sandbox: { id: string; name?: string | null }): boolean {
+  switch (query.kind) {
+    case 'empty':
+      return true;
+    case 'ref':
+      return publicSandboxIdFromAny(sandbox.id) === query.ref.publicId;
+    case 'text':
+      return (
+        sandbox.id.replaceAll('-', '').toLowerCase().includes(query.compact) ||
+        (sandbox.name || '').toLowerCase().includes(query.text)
+      );
+  }
+}

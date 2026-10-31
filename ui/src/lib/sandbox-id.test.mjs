@@ -1,6 +1,14 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { parseSandboxRef, publicSandboxIdFromAny } from './sandbox-id.ts';
+import {
+  DEFAULT_LIST_LIMIT,
+  MAX_LIST_LIMIT,
+  matchesSandboxQuery,
+  parseListLimit,
+  parseSandboxRef,
+  publicSandboxIdFromAny,
+  sandboxQuery,
+} from './sandbox-id.ts';
 
 const uuid = '01a19089-216f-751e-9f56-1906865f5c23';
 const publicId = `sbx_${uuid}`;
@@ -39,4 +47,41 @@ test('publicSandboxIdFromAny canonicalizes every accepted form', () => {
   assert.equal(publicSandboxIdFromAny(uuid), publicId);
   assert.equal(publicSandboxIdFromAny(`space-sbx-${uuid.replaceAll('-', '')}-g3`), publicId);
   assert.equal(publicSandboxIdFromAny(publicId), publicId);
+});
+
+const searchUuid = '01a19089-394a-70ba-ae1d-72e09b10b406';
+const sandbox = { id: `sbx_${searchUuid}`, name: 'build-cache' };
+const other = { id: 'sbx_01a19089-216f-751e-9f56-1906865f5c23', name: 'build-runner' };
+
+test('a full identifier in any form is an exact lookup', () => {
+  for (const input of [sandbox.id, searchUuid, `space-sbx-${searchUuid.replaceAll('-', '')}-g1`]) {
+    const query = sandboxQuery(input);
+    assert.equal(query.kind, 'ref');
+    assert.equal(matchesSandboxQuery(query, sandbox), true);
+    assert.equal(matchesSandboxQuery(query, other), false);
+  }
+});
+
+test('an exact lookup matches rows that carry bare UUIDs', () => {
+  assert.equal(matchesSandboxQuery(sandboxQuery(sandbox.id), { id: searchUuid }), true);
+});
+
+test('partial text matches ID fragments and names', () => {
+  assert.equal(matchesSandboxQuery(sandboxQuery('72e09b10'), sandbox), true);
+  assert.equal(matchesSandboxQuery(sandboxQuery('ae1d-72e0'), sandbox), true);
+  assert.equal(matchesSandboxQuery(sandboxQuery('Build'), sandbox), true);
+  assert.equal(matchesSandboxQuery(sandboxQuery('cache'), other), false);
+});
+
+test('an empty query matches everything', () => {
+  assert.equal(sandboxQuery('  ').kind, 'empty');
+  assert.equal(matchesSandboxQuery(sandboxQuery(''), other), true);
+});
+
+test('parseListLimit clamps to the admin API range', () => {
+  assert.equal(parseListLimit(null), DEFAULT_LIST_LIMIT);
+  assert.equal(parseListLimit('abc'), DEFAULT_LIST_LIMIT);
+  assert.equal(parseListLimit('0'), DEFAULT_LIST_LIMIT);
+  assert.equal(parseListLimit('3'), 3);
+  assert.equal(parseListLimit('999999'), MAX_LIST_LIMIT);
 });

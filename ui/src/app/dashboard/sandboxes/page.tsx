@@ -4,10 +4,18 @@ import { Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import styles from './inventory.module.css';
 import { usePathname, useSearchParams } from 'next/navigation';
-import { sandboxLabelOrId } from '@/lib/sandbox-id';
+import {
+  DEFAULT_LIST_LIMIT,
+  LIST_LIMIT_OPTIONS,
+  matchesSandboxQuery,
+  parseListLimit,
+  sandboxLabelOrId,
+  sandboxQuery,
+} from '@/lib/sandbox-id';
 import {
   createConsoleSandboxForOrg,
   forceConsoleSandboxAction,
+  getConsoleSandbox,
   getConsoleSandboxes,
   getPublicPage,
   postPublicOperation,
@@ -56,7 +64,7 @@ import {
   summarizeAutoLifecycle,
 } from '@/components/auto-lifecycle';
 import {
-  App, Table, Button, Form, Input, Select, Typography, Space, Tag, Popconfirm, Card, Tooltip, Switch, Checkbox, Modal,
+  Alert, App, Table, Button, Form, Input, Select, Typography, Space, Tag, Popconfirm, Card, Tooltip, Switch, Checkbox, Modal,
 } from 'antd';
 import {
   PlusOutlined, StopOutlined, PauseCircleOutlined, ThunderboltOutlined,
@@ -625,6 +633,13 @@ function SandboxesPage() {
   const [statusFilter, setStatusFilter] = useState<string[]>(() => parseCsvParam(searchParams.get('status')));
   const [nodeFilter, setNodeFilter] = useState<NodeFilter>(() => parseNodeParam(searchParams.get('node')));
   const [ageWindow, setAgeWindow] = useState<AgeWindow>(() => parseAgeParam(searchParams.get('age')));
+  const [listLimit, setListLimit] = useState(() => parseListLimit(searchParams.get('limit')));
+  const listLimitRef = useRef(listLimit);
+  // A full identifier that matches no loaded row is looked up directly, so a
+  // sandbox outside the newest `listLimit` can still be found.
+  const [lookup, setLookup] = useState<
+    { publicId: string; sandbox: Sandbox | null; error: string | null } | null
+  >(null);
 
   useEffect(() => {
     const params = new URLSearchParams();
@@ -633,10 +648,11 @@ function SandboxesPage() {
     if (statusFilter.length) params.set('status', statusFilter.join(','));
     if (nodeFilter !== DEFAULT_NODE_FILTER) params.set('node', nodeFilter);
     if (ageWindow !== DEFAULT_AGE_WINDOW) params.set('age', ageWindow);
+    if (listLimit !== DEFAULT_LIST_LIMIT) params.set('limit', String(listLimit));
     const qs = params.toString();
     const next = qs ? `${pathname}?${qs}` : pathname;
     window.history.replaceState(null, '', next);
-  }, [idFilter, templateFilter, statusFilter, nodeFilter, ageWindow, pathname]);
+  }, [idFilter, templateFilter, statusFilter, nodeFilter, ageWindow, listLimit, pathname]);
 
   const startRefreshCooldown = () => {
     refreshCooldownRef.current = true;
@@ -664,7 +680,7 @@ function SandboxesPage() {
   const refresh = async ({ showLoading = true, reconcile = false }: { showLoading?: boolean; reconcile?: boolean } = {}) => {
     if (showLoading) setLoading(true);
     try {
-      const data = await getConsoleSandboxes();
+      const data = await getConsoleSandboxes(listLimitRef.current);
       data.sort((a, b) => parseUptime(b.uptime) - parseUptime(a.uptime) || a.id.localeCompare(b.id));
       setSandboxes(data);
       markViewRefreshed(SANDBOXES_VIEW_REFRESH_KEY);
@@ -953,17 +969,22 @@ function SandboxesPage() {
     }
   };
 
+  const query = useMemo(() => sandboxQuery(idFilter), [idFilter]);
+  const listTruncated = sandboxes.length >= listLimit;
+
   const filteredSandboxes = useMemo(() => {
-    const idQuery = idFilter.trim().toLowerCase().replaceAll('-', '');
+    // A full identifier names one sandbox; the other filters do not hide it.
+    if (query.kind === 'ref') {
+      const loaded = sandboxes.filter((s) => matchesSandboxQuery(query, s));
+      if (loaded.length > 0) return loaded;
+      return lookup?.publicId === query.ref.publicId && lookup.sandbox ? [lookup.sandbox] : [];
+    }
+
     const ageMs = AGE_WINDOW_OPTIONS.find((opt) => opt.value === ageWindow)?.ms ?? null;
     const cutoff = ageMs === null ? null : Date.now() - ageMs;
 
     return sandboxes.filter((s) => {
-      if (idQuery) {
-        const compactId = s.id.replaceAll('-', '').toLowerCase();
-        const nameMatch = (s.name || '').toLowerCase().includes(idFilter.trim().toLowerCase());
-        if (!compactId.includes(idQuery) && !nameMatch) return false;
-      }
+      if (!matchesSandboxQuery(query, s)) return false;
 
       if (templateFilter.length > 0 && !templateFilter.includes(s.template || '')) {
         return false;
@@ -987,7 +1008,33 @@ function SandboxesPage() {
 
       return true;
     });
-  }, [sandboxes, idFilter, templateFilter, statusFilter, nodeFilter, ageWindow]);
+  }, [sandboxes, query, lookup, templateFilter, statusFilter, nodeFilter, ageWindow]);
+
+  const lookupNeeded =
+    query.kind === 'ref' && !loading && !sandboxes.some((s) => matchesSandboxQuery(query, s));
+  const lookupId = lookupNeeded && query.kind === 'ref' ? query.ref.publicId : null;
+
+  useEffect(() => {
+    if (!lookupId || lookup?.publicId === lookupId) return;
+    let active = true;
+    setLookup({ publicId: lookupId, sandbox: null, error: null });
+    getConsoleSandbox(lookupId)
+      .then((sandbox) => {
+        if (active) setLookup({ publicId: lookupId, sandbox, error: null });
+      })
+      .catch((err: any) => {
+        if (active) setLookup({ publicId: lookupId, sandbox: null, error: err.message || 'lookup failed' });
+      });
+    return () => {
+      active = false;
+    };
+  }, [lookupId]);
+
+  const changeListLimit = (value: number) => {
+    listLimitRef.current = value;
+    setListLimit(value);
+    refreshAndReport();
+  };
 
   const templateFilterOptions = useMemo(() => {
     const set = new Set<string>();
@@ -1241,10 +1288,10 @@ function SandboxesPage() {
           <Input
             allowClear
             size="small"
-            placeholder="ID or name"
+            placeholder="ID, pod name or name"
             value={idFilter}
             onChange={(e) => setIdFilter(e.target.value)}
-            style={{ width: 180 }}
+            style={{ width: 260 }}
           />
           <Select
             mode="multiple"
@@ -1286,14 +1333,44 @@ function SandboxesPage() {
             options={AGE_WINDOW_OPTIONS.map((opt) => ({ value: opt.value, label: opt.label }))}
             style={{ width: 150 }}
           />
+          <Select
+            size="small"
+            value={listLimit}
+            onChange={changeListLimit}
+            options={Array.from(new Set([...LIST_LIMIT_OPTIONS, listLimit]))
+              .sort((a, b) => a - b)
+              .map((value) => ({ value, label: `Load newest ${value}` }))}
+            style={{ width: 170 }}
+            aria-label="Number of sandboxes to load"
+          />
           <Text type="secondary" style={{ fontSize: 12 }}>
-            {filteredSandboxes.length} / {sandboxes.length}
+            {filteredSandboxes.length} / {sandboxes.length}{listTruncated ? '+' : ''}
           </Text>
           {filtersActive ? (
             <Button size="small" type="link" onClick={clearFilters}>Reset</Button>
           ) : null}
         </div>
       </Card>
+
+      {query.kind === 'ref' && lookupNeeded && lookup?.publicId === query.ref.publicId ? (
+        lookup.sandbox ? (
+          <Alert
+            type="info"
+            showIcon
+            style={{ marginBottom: 12 }}
+            title={`Found ${query.ref.publicId} by direct lookup. It is not among the newest ${sandboxes.length} sandboxes loaded below.`}
+          />
+        ) : lookup.error ? (
+          <Alert type="warning" showIcon style={{ marginBottom: 12 }} title={`${query.ref.publicId}: ${lookup.error}`} />
+        ) : null
+      ) : listTruncated ? (
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 12 }}
+          title={`Showing the newest ${listLimit} sandboxes. Filters apply to these rows only; enter a full sandbox ID or pod name to look up any sandbox.`}
+        />
+      ) : null}
 
       <Table
         columns={columns}
