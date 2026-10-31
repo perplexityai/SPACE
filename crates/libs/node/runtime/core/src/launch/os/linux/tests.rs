@@ -453,3 +453,29 @@ fn jailer_timeout_reports_its_output_without_waiting_for_its_descendants() {
         error.len()
     );
 }
+
+#[test]
+fn jailer_that_exits_zero_records_failure_when_its_output_cannot_be_collected() {
+    let capture = pplx_space_metrics::test_capture::capture_values_guard();
+    let error = super::run_jailer_command_with(
+        "sandbox-a",
+        crate::launch::JailerExecutable::LegacyPath("/bin/true"),
+        "",
+        &[],
+        std::time::Duration::from_secs(5),
+        |_| Err(std::io::Error::other("injected collection failure")),
+    )
+    .unwrap_err();
+
+    assert!(
+        error.starts_with("collect output after jailer for sandbox-a finished failed"),
+        "{error}"
+    );
+    let outcomes: Vec<_> = capture
+        .finish()
+        .into_iter()
+        .filter(|value| value.name == "runtime_supervisor.jailer.duration_ms")
+        .map(|value| value.tags)
+        .collect();
+    assert_eq!(outcomes, [["outcome:failed"]]);
+}

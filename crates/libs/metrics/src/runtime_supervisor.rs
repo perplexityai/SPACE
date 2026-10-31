@@ -17,7 +17,8 @@ metric_vocabulary!(
     JailerOutcome {
         /// The jailer exited with status zero.
         Succeeded => "succeeded",
-        /// The jailer exited non-zero, or could not be waited on.
+        /// The jailer exited non-zero, could not be waited on, or exited zero
+        /// but its output could not be collected.
         Failed => "failed",
         /// The jailer was still running at its start timeout and was killed.
         TimedOut => "timed_out",

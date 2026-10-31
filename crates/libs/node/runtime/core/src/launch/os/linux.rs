@@ -845,6 +845,26 @@ fn run_jailer_command(
     jailer_args: &[String],
     timeout: Duration,
 ) -> Result<(), String> {
+    run_jailer_command_with(
+        sandbox_id,
+        jailer,
+        console_path,
+        jailer_args,
+        timeout,
+        std::process::Child::wait_with_output,
+    )
+}
+
+/// [`run_jailer_command`] with how a piped jailer's output is collected after
+/// it exits, so tests can make that collection fail.
+fn run_jailer_command_with(
+    sandbox_id: &str,
+    jailer: crate::launch::JailerExecutable<'_>,
+    console_path: &str,
+    jailer_args: &[String],
+    timeout: Duration,
+    collect_output: impl FnOnce(std::process::Child) -> std::io::Result<std::process::Output>,
+) -> Result<(), String> {
     use pplx_space_metrics::runtime_supervisor::{JailerOutcome, jailer_finished};
     let label = format!("jailer for {sandbox_id}");
     let mut cmd = direct_jailer_command(jailer, jailer_args)
@@ -872,15 +892,7 @@ fn run_jailer_command(
     let waited = wait_for_jailer(&mut child, &label, timeout, started);
     let elapsed = started.elapsed();
     let status = match waited {
-        Ok(Some(status)) => {
-            let outcome = if status.success() {
-                JailerOutcome::Succeeded
-            } else {
-                JailerOutcome::Failed
-            };
-            jailer_finished(outcome, elapsed);
-            status
-        }
+        Ok(Some(status)) => status,
         Ok(None) => {
             jailer_finished(JailerOutcome::TimedOut, elapsed);
             return Err(jailer_timed_out(
@@ -898,27 +910,37 @@ fn run_jailer_command(
         }
     };
 
-    if console_path.is_empty() {
-        let output = child
-            .wait_with_output()
-            .map_err(|error| format!("collect output after {label} finished failed: {error}"))?;
-        if status.success() {
-            return Ok(());
-        }
-        return Err(format!(
-            "{label} exited with {}: {}",
-            status.code().unwrap_or(-1),
-            command_output_text(&output).trim()
-        ));
-    }
-    if status.success() {
+    let result = if console_path.is_empty() {
+        collect_output(child)
+            .map_err(|error| format!("collect output after {label} finished failed: {error}"))
+            .and_then(|output| {
+                if status.success() {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "{label} exited with {}: {}",
+                        status.code().unwrap_or(-1),
+                        command_output_text(&output).trim()
+                    ))
+                }
+            })
+    } else if status.success() {
         Ok(())
     } else {
         Err(format!(
             "{label} exited with {}; see console log {console_path}",
             status.code().unwrap_or(-1)
         ))
-    }
+    };
+    // Decided from the returned result, so a jailer that exited 0 but whose
+    // output could not be collected counts as the failed launch it causes.
+    let outcome = if result.is_ok() {
+        JailerOutcome::Succeeded
+    } else {
+        JailerOutcome::Failed
+    };
+    jailer_finished(outcome, elapsed);
+    result
 }
 
 /// Report a jailer killed at its start timeout with what it had written, so
