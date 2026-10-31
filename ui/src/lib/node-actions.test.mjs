@@ -36,3 +36,10 @@ test('the direct substrate keeps only undrain, and other roles get nothing', () 
   assert.deepEqual(names(node('drained', 'gentle'), 'space'), ['undrain']);
   assert.deepEqual(names(node(null, null, 'control'), 'kubernetes'), []);
 });
+
+test('the upload confirmation explains both per-call limits', () => {
+  const upload = nodeActions(node('drained', 'gentle'), 'kubernetes').find((a) => a.action === 'force-upload-local-snapshots');
+  assert.match(upload.confirm, /at most 32 uploads/);
+  assert.match(upload.confirm, /at most 256 pinned sandboxes/);
+  assert.match(upload.confirm, /not attempted in that call/);
+});

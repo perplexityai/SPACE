@@ -8,7 +8,15 @@ import { ArrowLeftOutlined, ReloadOutlined } from '@ant-design/icons';
 
 import { adminApi } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
-import { nodeActions, type ForceUploadResponse, type NodeAction } from '@/lib/node-actions';
+import {
+  UPLOAD_ACCEPTED_MEANS,
+  UPLOAD_ATTEMPTS_PER_CALL,
+  UPLOAD_LISTED_PER_CALL,
+  UPLOAD_RETRY_ORDER,
+  nodeActions,
+  type ForceUploadResponse,
+  type NodeAction,
+} from '@/lib/node-actions';
 import { publicSandboxIdFromAny } from '@/lib/sandbox-id';
 import type { AdminNodeResponse, NodeHealthStatus } from '@/lib/types';
 
@@ -28,37 +36,32 @@ export default function NodeDetailPage() {
   const { id } = useParams<{ id: string }>();
   const { substrate } = useAuth();
   const [node, setNode] = useState<AdminNodeResponse | null>(null);
-  const [health, setHealth] = useState<NodeHealthStatus | null>(null);
-  const [healthError, setHealthError] = useState<string | null>(null);
   const [page, setPage] = useState<NodeSandboxPage | null>(null);
   const [pageError, setPageError] = useState<string | null>(null);
   const [cursor, setCursor] = useState<string | undefined>();
   // Paging and Refresh can overlap; only the newest request's answer is kept.
   const pageRequest = useRef(0);
+  // The same for node reads. An action bumps it as it starts, so a read that
+  // began before the action cannot land after it and restore the old state.
+  const nodeRequest = useRef(0);
   const [error, setError] = useState<{ status: number | null; message: string } | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
-  const loadNode = () => {
-    adminApi
+  // Health comes from the node response's own status snapshot, so it is
+  // always shown with that snapshot's time, never with a newer read's.
+  const loadNode = (): Promise<void> => {
+    const request = ++nodeRequest.current;
+    return adminApi
       .get<AdminNodeResponse>(`/v1/nodes/${id}?include_occupancy=true`)
       .then((loaded) => {
+        if (request !== nodeRequest.current) return;
         setNode(loaded);
         setError(null);
-        // The API keeps health only for worker and builder nodes; others answer 400.
-        if (loaded.role !== 'worker' && loaded.role !== 'builder') {
-          setHealth(null);
-          setHealthError(null);
-          return;
-        }
-        adminApi
-          .get<NodeHealthStatus>(`/v1/nodes/${id}/health`)
-          .then((h) => {
-            setHealth(h);
-            setHealthError(null);
-          })
-          .catch((err: any) => setHealthError(err?.message || 'Failed to load health'));
       })
-      .catch((err: any) => setError({ status: typeof err?.status === 'number' ? err.status : null, message: err?.message || 'Failed to load node' }));
+      .catch((err: any) => {
+        if (request !== nodeRequest.current) return;
+        setError({ status: typeof err?.status === 'number' ? err.status : null, message: err?.message || 'Failed to load node' });
+      });
   };
 
   const loadSandboxes = (after: string | undefined = cursor) => {
@@ -78,25 +81,38 @@ export default function NodeDetailPage() {
   };
 
   const refreshAll = () => {
-    loadNode();
+    void loadNode();
     loadSandboxes();
   };
 
-  useEffect(loadNode, [id]);
+  useEffect(() => {
+    void loadNode();
+  }, [id]);
   useEffect(() => loadSandboxes(cursor), [id, cursor]);
 
   const showUploadResult = (result: ForceUploadResponse) => {
+    const accepted = result.reuploaded.length;
     const failed = result.failed ?? [];
+    const notAttempted = result.deferred ?? [];
     modal.info({
-      title: `Uploaded ${result.reuploaded.length} snapshot${result.reuploaded.length === 1 ? '' : 's'}${failed.length ? `, ${failed.length} failed` : ''}`,
+      title: `Upload requests accepted for ${accepted} sandbox${accepted === 1 ? '' : 'es'}${failed.length ? `; ${failed.length} not accepted` : ''}`,
       width: 640,
       content: (
         <Space direction="vertical" size={4} style={{ width: '100%' }}>
+          <Text>{UPLOAD_ACCEPTED_MEANS}</Text>
+          {failed.length ? <Text strong>Requests that failed:</Text> : null}
           {failed.map((f) => (
             <Text key={f.sandbox_id} type="danger">{publicSandboxIdFromAny(f.sandbox_id)}: {f.error}</Text>
           ))}
-          {result.deferred?.length ? <Text>{result.deferred.length} deferred to the next call.</Text> : null}
-          {result.truncated ? <Text>More sandboxes are pinned to this node than one call handles (256); run it again.</Text> : null}
+          {notAttempted.length ? (
+            <Text>
+              {notAttempted.length} sandbox{notAttempted.length === 1 ? '' : 'es'} not attempted in this call: one call attempts at most {UPLOAD_ATTEMPTS_PER_CALL}.
+            </Text>
+          ) : null}
+          {result.truncated ? (
+            <Text>More sandboxes are pinned to this node than one call lists ({UPLOAD_LISTED_PER_CALL}).</Text>
+          ) : null}
+          {notAttempted.length || result.truncated || failed.length ? <Text type="secondary">{UPLOAD_RETRY_ORDER}</Text> : null}
         </Space>
       ),
     });
@@ -111,6 +127,8 @@ export default function NodeDetailPage() {
       autoFocusButton: item.dangerous ? 'cancel' : 'ok',
       onOk: async () => {
         setBusy(item.label);
+        // Earlier reads describe the node before this action: drop them.
+        nodeRequest.current += 1;
         try {
           const result = await adminApi.post<ForceUploadResponse | unknown>(`/v1/nodes/${id}:${item.action}`, item.body);
           if (item.action === 'force-upload-local-snapshots' && result && typeof result === 'object' && 'reuploaded' in result) {
@@ -121,9 +139,11 @@ export default function NodeDetailPage() {
         } catch (err: any) {
           message.error(err?.message || `${item.label} failed`);
         } finally {
+          // Some actions commit and then report an error: always reload, and
+          // keep the actions disabled until that read settles.
+          loadSandboxes();
+          await loadNode();
           setBusy(null);
-          // Some actions commit and then report an error: always reload.
-          refreshAll();
         }
       },
     });
@@ -148,6 +168,8 @@ export default function NodeDetailPage() {
 
   const slots = node.network_slots;
   const status = node.status;
+  const health: NodeHealthStatus | null = status?.health ?? null;
+  const hasHealth = node.role === 'worker' || node.role === 'builder';
 
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
@@ -165,7 +187,7 @@ export default function NodeDetailPage() {
               {item.label}
             </Button>
           ))}
-          <Button icon={<ReloadOutlined />} onClick={refreshAll}>Refresh</Button>
+          <Button icon={<ReloadOutlined />} onClick={refreshAll} disabled={!!busy}>Refresh</Button>
         </Space>
       </Space>
 
@@ -198,9 +220,9 @@ export default function NodeDetailPage() {
         </Descriptions>
       </Card>
 
-      {node.role === 'worker' || node.role === 'builder' ? (
+      {hasHealth ? (
         <Card size="small" title="Health">
-          {healthError ? <Alert type="warning" showIcon title={`Could not load health: ${healthError}`} style={{ marginBottom: 8 }} /> : null}
+          {!health ? <Text type="secondary">No status snapshot has been received from this node.</Text> : null}
           {health ? (
             <>
               <Space style={{ marginBottom: 8 }} wrap>

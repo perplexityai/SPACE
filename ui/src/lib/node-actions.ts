@@ -11,6 +11,16 @@ export interface ForceUploadResponse {
 export const DRAIN_TERMINATES =
   'Once the node is drained it is terminated automatically wherever the drained-node terminator is enabled, unless the node carries the `space.pplx.net/drain-keep` annotation.';
 
+// `:force-upload-local-snapshots` (`routes/admin/nodes.rs`): the handler lists
+// at most 256 pinned sandboxes, in ascending ID order, and asks the node to
+// upload at most 32 of them; the node queues each upload on its durable
+// worker and the call returns. The node-drain reconciler also keeps going.
+export const UPLOAD_ATTEMPTS_PER_CALL = 32;
+export const UPLOAD_LISTED_PER_CALL = 256;
+export const UPLOAD_LIMITS = `One call attempts at most ${UPLOAD_ATTEMPTS_PER_CALL} uploads, and lists at most ${UPLOAD_LISTED_PER_CALL} pinned sandboxes; listed sandboxes past the first ${UPLOAD_ATTEMPTS_PER_CALL} are not attempted in that call. The node-drain reconciler also continues uploading on its own.`;
+export const UPLOAD_ACCEPTED_MEANS = 'An accepted request means the node has queued the upload. The snapshot is durable only once the upload completes and registers it in the object store.';
+export const UPLOAD_RETRY_ORDER = 'Running it again continues with the same list, in sandbox ID order, so sandboxes that failed are tried again first.';
+
 export type NodeAction = {
   action: string;
   label: string;
@@ -56,7 +66,7 @@ export function nodeActions(
   if (supportsDrain && uploadOpen) {
     actions.push({
       action: 'force-upload-local-snapshots', label: 'Upload local snapshots', dangerous: true,
-      confirm: 'Suspended sandboxes pinned to this node re-upload their snapshots to the object store, so they can restore elsewhere. One call handles at most 256 sandboxes.',
+      confirm: `Asks this node to upload the snapshots of suspended sandboxes pinned to it to the object store, so they can restore elsewhere. ${UPLOAD_LIMITS}`,
     });
   }
   return actions;
