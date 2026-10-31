@@ -60,12 +60,18 @@ fn incomplete_device_setup_is_discovered_without_a_cow_marker() {
     }
     std::fs::remove_dir(&mapper_dir).unwrap();
     std::fs::write(&mapper_dir, b"not a directory").unwrap();
-    assert!(
-        probe(id).is_err(),
-        "unreadable mapper inventory is not absence"
-    );
-    super::host_device_stack_exists(&root.path().join("unreadable"), &mapper_dir, &cache, id)
-        .unwrap_err();
+    let error = probe(id).expect_err("unreadable mapper inventory is not absence");
+    assert_names_path(&error, &mapper_dir);
+    let unreadable = root.path().join("unreadable");
+    let error = super::host_device_stack_exists(&unreadable, &mapper_dir, &cache, id).unwrap_err();
+    assert_names_path(&error, &unreadable);
+}
+
+/// Device inventory errors must name the path that failed, which is usually
+/// another device's, not the sandbox being cleaned.
+fn assert_names_path(error: &std::io::Error, path: &std::path::Path) {
+    let message = error.to_string();
+    assert!(message.contains(&path.display().to_string()), "{message}");
 }
 
 #[tokio::test(start_paused = true)]

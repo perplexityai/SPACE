@@ -1264,9 +1264,9 @@ fn cleanup_device_backings_with(
     instance: &Path,
     teardown: impl FnOnce() -> (Vec<String>, Vec<String>),
 ) -> Result<Vec<String>, RuntimeArtifactCleanupError> {
-    if !device_teardown_needed(instance).map_err(|error| {
-        RuntimeArtifactCleanupError(vec![format!("inspect {}: {error}", instance.display())])
-    })? {
+    if !device_teardown_needed(instance)
+        .map_err(|error| RuntimeArtifactCleanupError(vec![error.to_string()]))?
+    {
         return Ok(Vec::new());
     }
     let (errors, actions) = teardown();
@@ -1500,15 +1500,16 @@ fn teardown_encrypted_volumes_with(
 }
 
 /// Backing files, kernel devices and stale mapper nodes all retain teardown
-/// obligations. Unreadable inventory is never absence.
+/// obligations. Unreadable inventory is never absence. Errors name the
+/// inventory path that failed, which is usually not the sandbox's own.
 fn device_teardown_needed(instance_dir: &Path) -> std::io::Result<bool> {
     let entries = match std::fs::read_dir(instance_dir) {
         Ok(entries) => Some(entries),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error),
+        Err(error) => return Err(read_error(instance_dir)(error)),
     };
     for entry in entries.into_iter().flatten() {
-        let name = entry?.file_name();
+        let name = entry.map_err(read_error(instance_dir))?.file_name();
         if name.to_str().is_some_and(|name| {
             name == crate::rootfs_dmcrypt::POOL_COW_FILE || name.ends_with(".luks")
         }) {
@@ -1524,7 +1525,12 @@ fn device_teardown_needed(instance_dir: &Path) -> std::io::Result<bool> {
             .parent()
             .and_then(Path::file_name)
             .and_then(|id| id.to_str())
-            .ok_or_else(|| std::io::Error::other("missing sandbox identity"))?;
+            .ok_or_else(|| {
+                std::io::Error::other(format!(
+                    "missing sandbox identity in {}",
+                    instance_dir.display()
+                ))
+            })?;
         host_device_stack_exists(
             Path::new("/sys/block"),
             Path::new("/dev/mapper"),
@@ -1543,9 +1549,14 @@ fn host_device_stack_exists(
     cache_root: &Path,
     sandbox_id: &str,
 ) -> std::io::Result<bool> {
-    let cache_roots = sandbox_backing_roots(cache_root, sandbox_id)?;
-    for entry in std::fs::read_dir(sys_block)? {
-        let entry = entry?;
+    let cache_roots = sandbox_backing_roots(cache_root, sandbox_id).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("resolve {}: {error}", cache_root.display()),
+        )
+    })?;
+    for entry in std::fs::read_dir(sys_block).map_err(read_error(sys_block))? {
+        let entry = entry.map_err(read_error(sys_block))?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
         let probe = if name.starts_with("loop") {
@@ -1555,10 +1566,11 @@ fn host_device_stack_exists(
         } else {
             continue;
         };
-        let value = match std::fs::read_to_string(entry.path().join(probe)) {
+        let path = entry.path().join(probe);
+        let value = match std::fs::read_to_string(&path) {
             Ok(value) => value,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
+            Err(error) => return Err(read_error(&path)(error)),
         };
         let value = value.trim();
         if (name.starts_with("loop") && backing_belongs_to_sandbox(value, &cache_roots))
@@ -1570,12 +1582,13 @@ fn host_device_stack_exists(
     let nodes = match std::fs::read_dir(mapper_dir) {
         Ok(nodes) => nodes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error),
+        Err(error) => return Err(read_error(mapper_dir)(error)),
     };
     for entry in nodes {
         // Inspect directory entries, not their targets: dangling symlinks are
         // precisely the debt left by an interrupted device-node reconciliation.
-        if entry?
+        if entry
+            .map_err(read_error(mapper_dir))?
             .file_name()
             .to_str()
             .is_some_and(|name| mapper_belongs_to_sandbox(name, sandbox_id))
@@ -1584,6 +1597,10 @@ fn host_device_stack_exists(
         }
     }
     Ok(false)
+}
+
+fn read_error(path: &Path) -> impl FnOnce(std::io::Error) -> std::io::Error + '_ {
+    move |error| std::io::Error::new(error.kind(), format!("read {}: {error}", path.display()))
 }
 
 fn mapper_belongs_to_sandbox(name: &str, sandbox_id: &str) -> bool {
