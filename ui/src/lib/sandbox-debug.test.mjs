@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import {
   formatAge,
   formatBytes,
+  formatMetadataValue,
   sectionData,
   sectionError,
   sortedTimeline,
@@ -52,4 +53,12 @@ test('ages and sizes format compactly', () => {
   assert.equal(formatAge(null, now), '—');
   assert.equal(formatBytes(2813952), '2.8 MB');
   assert.equal(formatBytes(null), '—');
+});
+
+test('metadata values that are not strings render as compact JSON', () => {
+  assert.equal(formatMetadataValue('ci'), 'ci');
+  assert.equal(formatMetadataValue({ team: 'build', tier: 2 }), '{"team":"build","tier":2}');
+  assert.equal(formatMetadataValue(['a', 1]), '["a",1]');
+  assert.equal(formatMetadataValue(3), '3');
+  assert.equal(formatMetadataValue(null), 'null');
 });

@@ -19,6 +19,7 @@ import type { AdminOperationRecord } from '@/lib/public-api';
 import {
   formatAge,
   formatBytes,
+  formatMetadataValue,
   sectionData,
   sectionError,
   sortedTimeline,
@@ -179,7 +180,9 @@ export function ResourcesCard({ debug, nowMs }: { debug: SandboxDebug | null; no
         <Descriptions.Item label="Metadata" span={3}>
           {metadata.length ? (
             <Space size={4} wrap>
-              {metadata.map(([key, value]) => <Tag key={key}>{`${key}=${String(value)}`}</Tag>)}
+              {metadata.map(([key, value]) => (
+                <Tag key={key}>{`${key}=${formatMetadataValue(value)}`}</Tag>
+              ))}
             </Space>
           ) : <Text type="secondary">none</Text>}
         </Descriptions.Item>
