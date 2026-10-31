@@ -20,8 +20,8 @@
 #   no_raised_caps, which archcheck reports only for entries that differ from
 #   the base's copy of architecture-baseline.toml, by table and key, so they
 #   include the entries of a renamed or split table; and
-#   crate_names.policy_changed, which it reports only for differences from the
-#   base's ARCHITECTURE.toml.
+#   crate_names.policy_changed and layers.policy_changed, which it reports
+#   only for differences from the base's ARCHITECTURE.toml.
 # - Findings in a file the pull request changes, under its old or new name.
 #   archcheck's other findings in architecture-baseline.toml are stale
 #   entries, and crate_names.no_new findings on [crate_names] entries. One
@@ -79,7 +79,7 @@ jq --arg baseline "${baseline}" --arg own "${own}" --arg q "'" \
           | .number | tostring]
         | INDEX(.)) as $named_lines
     | def compares_with_base:
-        (.code.value // "") | test("\\.(no_new_entries|no_raised_caps)$|^crate_names\\.policy_changed$");
+        (.code.value // "") | test("\\.(no_new_entries|no_raised_caps)$|^(crate_names|layers)\\.policy_changed$");
       def own:
         compares_with_base
         or if .location.path == $baseline then $named_lines[.location.range.start.line // 0 | tostring] != null

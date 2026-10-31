@@ -7,7 +7,7 @@ use std::{collections::BTreeMap, fs};
 use super::*;
 use crate::{
     baseline::BaseBaseline,
-    config::{BaseArchitecture, CrateNamesPolicy},
+    config::{BaseArchitecture, CrateNamesPolicy, LayersPolicy},
     context::{code_lines, count_code_lines},
 };
 
@@ -94,6 +94,7 @@ fn context(baseline: Baseline, files: &[(&str, &str)]) -> Context {
         base_baseline: BaseBaseline::NotGiven,
         renames: None,
         crate_names_policy: CrateNamesPolicy::default(),
+        layers_policy: LayersPolicy::default(),
         base_architecture: BaseArchitecture::NotGiven,
         files,
         crates: Vec::new(),
