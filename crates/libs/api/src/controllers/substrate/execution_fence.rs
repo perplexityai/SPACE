@@ -383,6 +383,7 @@ pub struct ObservedPodIdentity {
 pub struct RetireExecutionRequest {
     pub sandbox_id: SandboxId,
     pub fence: RetireFence,
+    pub stop_route: RetireStopRoute,
 }
 
 impl RetireExecutionRequest {
@@ -390,8 +391,35 @@ impl RetireExecutionRequest {
         Self {
             sandbox_id,
             fence: RetireFence::Pod(pod_fence),
+            stop_route: RetireStopRoute::Execution,
         }
     }
+}
+
+/// Where a retire sends its in-VM stop, and the stopped-disk backup that
+/// follows it.
+///
+/// Both routes reach the same sbx-mgr. They differ in what has to be working
+/// on the way: a Kubernetes sandbox pod's IP reaches its node's node-api only
+/// through the forwarding its own network namespace carries, and that can be
+/// gone while the node-api itself answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetireStopRoute {
+    /// The execution's own runtime endpoint: on Kubernetes, the sandbox
+    /// pod's IP.
+    Execution,
+    /// The node-api of the node the execution is placed on, resolved by node
+    /// name, as the transient-lifecycle sweeper's probe reaches it. For a
+    /// caller whose probe of that node just reported no live VM: the
+    /// execution's own endpoint can have died with the VM, and sbx-mgr's
+    /// stop succeeds for a sandbox that is not running. Kubernetes takes the
+    /// node from the execution a pod fence verified: a retire on this route
+    /// that has a runtime to stop but no such node, because it is unfenced or
+    /// the execution names no node, fails before the pod delete and keeps the
+    /// execution tracked.
+    /// Direct always stops through the node's node-api, so there the two
+    /// routes are the same.
+    Node,
 }
 
 /// Which half of a [`PodIdentityFence`] the substrate found violated. Carried
