@@ -77,6 +77,14 @@ import type { ColumnsType } from 'antd/es/table';
 const { Title, Text } = Typography;
 const SANDBOXES_VIEW_REFRESH_KEY = 'dashboard:sandboxes';
 const LARGE_LIST_STALE_MS = 15_000;
+
+// Every console window shares a view's refresh timestamp, so one window's
+// reload counts for all of them. A list larger than the default is a
+// different, heavier view: it keeps its own timestamp, or a default-size
+// window elsewhere would keep it fresh and it would never reload.
+function sandboxesRefreshKey(limit: number): string {
+  return limit > DEFAULT_LIST_LIMIT ? `${SANDBOXES_VIEW_REFRESH_KEY}:limit-${limit}` : SANDBOXES_VIEW_REFRESH_KEY;
+}
 const REFRESH_CLICK_COOLDOWN_MS = 3000;
 
 type AgeWindow = '1h' | '24h' | '7d' | '30d' | '90d' | '1y' | 'all';
@@ -642,7 +650,9 @@ function SandboxesPage() {
   // A full identifier that matches no loaded row is looked up directly, so a
   // sandbox outside the loaded rows can still be found.
   const [lookup, setLookup] = useState<
-    { publicId: string; sandbox: Sandbox | null; error: string | null; pending: boolean } | null
+    // `answered`: some answer for this ID has arrived; until then the table
+    // shows as loading. Later refetches never bring the spinner back.
+    { publicId: string; sandbox: Sandbox | null; error: string | null; pending: boolean; answered: boolean } | null
   >(null);
   const lookupInFlightRef = useRef<string | null>(null);
   const lookupTargetRef = useRef<string | null>(null);
@@ -693,7 +703,7 @@ function SandboxesPage() {
       data.sort((a, b) => parseUptime(b.uptime) - parseUptime(a.uptime) || a.id.localeCompare(b.id));
       setSandboxes(data);
       setListGeneration((n) => n + 1);
-      markViewRefreshed(SANDBOXES_VIEW_REFRESH_KEY);
+      markViewRefreshed(sandboxesRefreshKey(limit));
     } catch (err: any) {
       // Keep the last rendered view when a node-local manager is briefly unavailable.
       throw new Error(err.message || 'failed to refresh sandboxes');
@@ -714,7 +724,7 @@ function SandboxesPage() {
       return;
     }
     void runLockedViewRefresh(
-      SANDBOXES_VIEW_REFRESH_KEY,
+      sandboxesRefreshKey(listLimitRef.current),
       () => refresh({ showLoading: false }),
       // A larger load is a heavier query; poll it less often.
       { staleMs: listLimitRef.current > DEFAULT_LIST_LIMIT ? LARGE_LIST_STALE_MS : VIEW_REFRESH_STALE_MS },
@@ -756,7 +766,7 @@ function SandboxesPage() {
     startRefreshCooldown();
     setManualRefreshing(true);
     void runLockedViewRefresh(
-      SANDBOXES_VIEW_REFRESH_KEY,
+      sandboxesRefreshKey(listLimitRef.current),
       () => refresh({ showLoading: false, reconcile: true }),
       { force: true },
     ).then((ran) => {
@@ -1034,12 +1044,12 @@ function SandboxesPage() {
     setLookup((prev) =>
       prev?.publicId === lookupId
         ? { ...prev, pending: true }
-        : { publicId: lookupId, sandbox: null, error: null, pending: true },
+        : { publicId: lookupId, sandbox: null, error: null, pending: true, answered: false },
     );
     getConsoleSandbox(lookupId)
       .then((sandbox) => {
         if (lookupTargetRef.current !== lookupId) return;
-        setLookup({ publicId: lookupId, sandbox, error: null, pending: false });
+        setLookup({ publicId: lookupId, sandbox, error: null, pending: false, answered: true });
       })
       .catch((err: any) => {
         if (lookupTargetRef.current !== lookupId) return;
@@ -1050,6 +1060,7 @@ function SandboxesPage() {
           sandbox: err?.status === 404 || prev?.publicId !== lookupId ? null : prev.sandbox,
           error: message,
           pending: false,
+          answered: true,
         }));
       })
       .finally(() => {
@@ -1057,8 +1068,7 @@ function SandboxesPage() {
       });
   }, [lookupId, listGeneration]);
 
-  const lookupPending =
-    lookupId !== null && (lookup?.publicId !== lookupId || (lookup.pending && !lookup.sandbox));
+  const lookupPending = lookupId !== null && !(lookup?.publicId === lookupId && lookup.answered);
 
   const changeListLimit = (value: number) => {
     listLimitRef.current = value;
