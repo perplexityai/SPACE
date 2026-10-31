@@ -10,8 +10,9 @@ import { useAuth } from '@/lib/auth';
 import { publicSandboxIdFromAny } from '@/lib/sandbox-id';
 import { AdminUser, ApiKeyMetadata, Organization, Sandbox, UserRole } from '@/lib/types';
 import { assignableRoleOptions, canDeleteUser, canManageUserRole, roleChangeConfirmation, roleColors, roleLabels } from '@/lib/userRoles';
-import { Typography, Descriptions, Select, Tag, App, Button, Card, Form, Input, Modal, Popconfirm, Space, Table } from 'antd';
+import { Typography, Descriptions, Select, Tag, App, Button, Card, Form, Input, Modal, Popconfirm, Space, Table, Tooltip } from 'antd';
 import { DeleteOutlined, EditOutlined, KeyOutlined } from '@ant-design/icons';
+import { USER_DELETE_CONSEQUENCES, USER_OWNS_SANDBOXES, userDeleteFailureMessage } from '@/lib/user-delete';
 
 const { Title, Text } = Typography;
 
@@ -113,10 +114,14 @@ export default function UserDetailPage() {
       await adminApi.delete(`/v1/users/${user.id}`);
       message.success('User deleted');
       router.push('/dashboard/users');
-    } catch (err: any) {
-      message.error(err.message);
+    } catch (err: unknown) {
+      message.error(userDeleteFailureMessage(err));
     }
   };
+
+  // The list covers the org's newest 1000 sandboxes, so a refused delete is
+  // still possible when it is empty; the handler reports that too.
+  const ownsSandboxes = (sandboxes?.length ?? 0) > 0;
 
   return (
     <div>
@@ -131,15 +136,21 @@ export default function UserDetailPage() {
               Set password
             </Button>
             {canDelete ? (
-              <Popconfirm
-                title="Delete this user?"
-                description="Their sessions end; sandboxes and API keys they own stay with the organization."
-                okText="Delete"
-                okButtonProps={{ danger: true }}
-                onConfirm={handleDelete}
-              >
-                <Button danger icon={<DeleteOutlined />}>Delete</Button>
-              </Popconfirm>
+              ownsSandboxes ? (
+                <Tooltip title={USER_OWNS_SANDBOXES}>
+                  <Button danger icon={<DeleteOutlined />} disabled>Delete</Button>
+                </Tooltip>
+              ) : (
+                <Popconfirm
+                  title="Delete this user?"
+                  description={USER_DELETE_CONSEQUENCES}
+                  okText="Delete"
+                  okButtonProps={{ danger: true }}
+                  onConfirm={handleDelete}
+                >
+                  <Button danger icon={<DeleteOutlined />}>Delete</Button>
+                </Popconfirm>
+              )
             ) : null}
           </Space>
         ) : null}
