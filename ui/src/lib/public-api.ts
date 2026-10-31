@@ -4,7 +4,6 @@ import { DEFAULT_LIST_LIMIT, parseSandboxRef, publicSandboxIdFromAny } from './s
 import {
   PublicOperationRecord,
   PublicPage,
-  PublicSandbox,
   PublicSnapshot,
   PublicTemplate,
   Sandbox,
@@ -26,10 +25,6 @@ export function idempotencyKey(): string {
 export async function getPublicPage<T>(path: string): Promise<T[]> {
   const page = await api.get<PublicPage<T>>(path);
   return page.data;
-}
-
-export async function getPublicSandbox(id: string): Promise<Sandbox> {
-  return publicSandboxToConsoleSandbox(await api.get<PublicSandbox>(`/sandboxes/${id}`));
 }
 
 // The newest `limit` sandbox rows, across every org or for `orgId` only. The
@@ -62,12 +57,6 @@ export async function postPublicOperation(
   body?: unknown,
 ): Promise<SandboxOperationResponse> {
   return api.post<SandboxOperationResponse>(path, body, {
-    'Idempotency-Key': idempotencyKey(),
-  });
-}
-
-export async function deletePublicOperation(path: string): Promise<SandboxOperationResponse> {
-  return api.delete<SandboxOperationResponse>(path, {
     'Idempotency-Key': idempotencyKey(),
   });
 }
@@ -112,15 +101,6 @@ export async function waitForAdminOperation(
   }
 
   throw new OperationTimeoutError(last?.progress_message || 'operation still running');
-}
-
-export async function runPublicSandboxOperation(
-  path: string,
-  body?: unknown,
-): Promise<SandboxOperationResponse> {
-  const response = await postPublicOperation(path, body);
-  void waitForPublicOperation(response.operation_id).catch(() => {});
-  return response;
 }
 
 // Cross-org admin lifecycle action. The console lists sandboxes across every
@@ -180,52 +160,6 @@ export async function createConsoleSandboxForOrg(
   );
 }
 
-export function publicSandboxToConsoleSandbox(sandbox: PublicSandbox): Sandbox {
-  return {
-    id: sandbox.id,
-    resource_type: 'sandbox',
-    name: sandbox.name,
-    user_id: null,
-    org_id: null,
-    managed_by: null,
-    lifecycle: sandbox.state,
-    placement: null,
-    active_node_id: null,
-    active_node: null,
-    created_at: sandbox.created_at,
-    updated_at: sandbox.updated_at,
-    last_used_at: null,
-    last_access_at: null,
-    last_command_at: null,
-    status: sandbox.state,
-    template: sandbox.template,
-    content_hash: sandbox.template_digest,
-    release_tags: [],
-    runtime: null,
-    pid: null,
-    namespace: null,
-    uptime: null,
-    user: null,
-    image_hash: null,
-    spaced_version: null,
-    snapshots_enabled_desired: false,
-    snapshots_enabled: null,
-    pool_template: null,
-    disk_usage_bytes: null,
-    failure_reason: failedConditionMessage(sandbox),
-    age: null,
-    volume_encryption: false,
-    auto_lifecycle: null,
-    auto_lifecycle_status: null,
-    network_policy_override: null,
-    template_network_policy: null,
-    effective_desired_network_policy: null,
-    network_policy: null,
-    network_policy_generation: null,
-    network_policy_status: null,
-  };
-}
-
 function adminSandboxToConsoleSandbox(sandbox: Sandbox): Sandbox {
   return {
     ...sandbox,
@@ -274,9 +208,3 @@ export function publicSnapshotToConsoleSnapshot(snapshot: PublicSnapshot): Snaps
   };
 }
 
-function failedConditionMessage(sandbox: PublicSandbox): string | null {
-  return (
-    sandbox.conditions.find((condition) => condition.status === 'false' && condition.message)
-      ?.message ?? null
-  );
-}

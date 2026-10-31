@@ -518,10 +518,6 @@ export default function NodesPage() {
     }
   };
 
-  const refreshAll = () => {
-    void loadNodes().catch(() => {});
-  };
-
   const handleCreate = async (values: {
     name?: string;
     address?: string;
