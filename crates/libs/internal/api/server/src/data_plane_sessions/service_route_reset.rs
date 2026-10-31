@@ -107,48 +107,15 @@ pub(super) async fn enqueue_sandbox_desired_state_reconcile_tx(
     active_node_id: NodeId,
 ) -> Result<(), Status> {
     let reference = ReconcileRef::sandbox_desired_state(sandbox_id);
-    sqlx::query(sql!(
-        "INSERT INTO node_reconcile_queue (
-             node_id,
-             facet,
-             element,
-             requested_at,
-             updated_at
-         )
-         VALUES ($1, $2, $3, NOW(), NOW())
-         ON CONFLICT (node_id, facet, element) DO UPDATE
-         SET generation = node_reconcile_queue.generation + 1,
-             requested_at = CASE
-                 WHEN node_reconcile_queue.dead_at IS NOT NULL
-                 THEN EXCLUDED.requested_at
-                 ELSE node_reconcile_queue.requested_at
-             END,
-             next_attempt_at = CASE
-                 WHEN node_reconcile_queue.dead_at IS NOT NULL
-                 THEN NOW()
-                 WHEN node_reconcile_queue.claim_token = ''
-                      AND node_reconcile_queue.attempts = 0
-                 THEN NOW()
-                 ELSE node_reconcile_queue.next_attempt_at
-             END,
-             attempts = CASE
-                 WHEN node_reconcile_queue.dead_at IS NOT NULL THEN 0
-                 ELSE node_reconcile_queue.attempts
-             END,
-             last_error = CASE
-                 WHEN node_reconcile_queue.dead_at IS NOT NULL
-                      OR node_reconcile_queue.attempts = 0
-                 THEN ''
-                 ELSE node_reconcile_queue.last_error
-             END,
-             dead_at = NULL,
-             dead_reason = '',
-             updated_at = NOW()"
-    ))
-    .bind(active_node_id.as_uuid())
-    .bind(reference.facet_str())
-    .bind(reference.element_string().unwrap_or_default())
-    .execute(&mut **tx)
+    queue_node_reconcile_refs(
+        &mut **tx,
+        &[active_node_id],
+        &[(
+            reference.facet_str().to_string(),
+            reference.element_string().unwrap_or_default(),
+        )],
+        QueuedRefConflict::KeepProgress,
+    )
     .await
     .map_err(|error| Status::internal(format!("enqueue sandbox route reconcile: {error}")))?;
 

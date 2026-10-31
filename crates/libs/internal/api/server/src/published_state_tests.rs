@@ -786,5 +786,7 @@ async fn post_selection_execution_identity_change_blocks_exact_finalization() ->
 
 // This file is loaded through `#[path]`, so a bare `mod` would resolve beside
 // it in `src/` rather than under `published_state_tests/`.
+#[path = "published_state_tests/first_seen_enqueue.rs"]
+mod first_seen_enqueue;
 #[path = "published_state_tests/lifecycle_writers.rs"]
 mod lifecycle_writers;
