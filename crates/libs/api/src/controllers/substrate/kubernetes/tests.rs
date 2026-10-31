@@ -14496,6 +14496,7 @@ mod kubernetes_tests {
             .retire_execution(RetireExecutionRequest {
                 sandbox_id,
                 fence: RetireFence::NoExecution,
+                stop_route: RetireStopRoute::Execution,
             })
             .await?;
 
@@ -14678,6 +14679,7 @@ mod kubernetes_tests {
             .retire_execution(RetireExecutionRequest {
                 sandbox_id,
                 fence: RetireFence::NoExecution,
+                stop_route: RetireStopRoute::Execution,
             })
             .await?;
 
@@ -14805,6 +14807,7 @@ mod kubernetes_tests {
             .retire_execution(RetireExecutionRequest {
                 sandbox_id,
                 fence: RetireFence::NoExecution,
+                stop_route: RetireStopRoute::Execution,
             })
             .await?;
 
@@ -14868,6 +14871,7 @@ mod kubernetes_tests {
             .retire_execution(RetireExecutionRequest {
                 sandbox_id,
                 fence: RetireFence::NoExecution,
+                stop_route: RetireStopRoute::Execution,
             })
             .await;
         assert!(outcome.is_err(), "a failed orphan delete must surface");
@@ -14918,6 +14922,7 @@ mod kubernetes_tests {
             .retire_execution(RetireExecutionRequest {
                 sandbox_id,
                 fence: RetireFence::NoExecution,
+                stop_route: RetireStopRoute::Execution,
             })
             .await?;
 
@@ -15952,6 +15957,7 @@ mod kubernetes_tests {
                 .retire_execution(RetireExecutionRequest {
                     sandbox_id,
                     fence: fence.clone(),
+                    stop_route: RetireStopRoute::Execution,
                 })
                 .await?,
             RetireExecutionOutcome::Retired

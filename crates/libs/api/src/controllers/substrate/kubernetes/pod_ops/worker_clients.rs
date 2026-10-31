@@ -26,14 +26,28 @@ impl KubernetesSubstrate {
             .map(crate::controllers::substrate::RuntimeClient::new)
     }
 
+    /// [`Self::pod_worker_client`] for a node-api address resolved some other
+    /// way, such as by node name.
+    pub(in crate::controllers::substrate::kubernetes) async fn worker_client_at(
+        addr: &str,
+        connect_timeout: Duration,
+    ) -> Option<crate::controllers::substrate::RuntimeClient> {
+        Self::worker_channel_at(addr, connect_timeout)
+            .await
+            .map(crate::controllers::substrate::RuntimeClient::new)
+    }
+
     pub(in crate::controllers::substrate::kubernetes) async fn pod_worker_channel(
         pod_ip: PodIp,
         port: u16,
         connect_timeout: Duration,
     ) -> Option<Channel> {
-        let addr = pod_ip.socket_addr(port).to_string();
+        Self::worker_channel_at(&pod_ip.socket_addr(port).to_string(), connect_timeout).await
+    }
+
+    async fn worker_channel_at(addr: &str, connect_timeout: Duration) -> Option<Channel> {
         let endpoint = node_api_endpoint(
-            &addr,
+            addr,
             connect_timeout,
             crate::controllers::substrate::NODE_RPC_TIMEOUT,
         )
