@@ -1,3 +1,4 @@
+// CI measurement only (change type: protobuf proto/sandbox/manager/v1/manager.proto). Never merged.
 syntax = "proto3";
 package space.sandbox.manager.v1;
 

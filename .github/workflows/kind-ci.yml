@@ -171,9 +171,9 @@ jobs:
   # inputs (ci/scripts/sccache-snapshot.py prune). Best-effort: without a saved
   # state, pull requests build in Docker mode.
   rust_state:
+    # MEASUREMENT ONLY (never merged): also save on this pull request, into its own cache scope.
     if: >-
-      github.repository == 'perplexityai/SPACE' && github.event_name == 'push' &&
-      github.ref == 'refs/heads/main' && inputs.rust_build != 'release' &&
+      github.repository == 'perplexityai/SPACE' && inputs.rust_build != 'release' &&
       vars.SPACE_KIND_RUST_STATE != 'off'
     name: Save the Kind Rust build state
     runs-on: ubuntu-24.04-16core

@@ -1,3 +1,4 @@
+// CI measurement only (change type: pplx-space-api). Never merged.
 //! The SPACE API service: the public API, the host-gated E2B compatibility
 //! API, and the admin API, together with the controllers, stores, and
 //! substrate wiring behind them.
