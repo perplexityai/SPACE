@@ -45,6 +45,7 @@
 //! - V23 `v23_alive_unroutable_restoring_without_pod_defers_no_converge`
 //! - V24 `v24_alive_routable_restoring_skips_routability_consult`
 //! - V25 `v25_routability_check_error_defers_without_converge`
+//! - V26 `v26_failed_cleanup_stops_through_the_node_only_when_one_answered`
 //!
 //! ## Crashed create — see `tests/crashed_create.rs`
 //! An alive `creating` row whose owner's activation lease expired a full age
@@ -187,6 +188,9 @@ struct FakeSinkState {
     failed_execution_cleanup_calls: Vec<SandboxId>,
     /// The pod-identity fence passed with each failed-execution cleanup.
     failed_execution_cleanup_fences: Vec<RetireFence>,
+    /// The stop route each failed-execution cleanup asked for, by sandbox, in
+    /// order, including retires that failed.
+    failed_execution_cleanup_routes: Vec<(SandboxId, RetireStopRoute)>,
     /// Failed active execution repair CAS attempts, in order.
     failed_active_repair_calls: Vec<SandboxId>,
     /// `command_ready_pending` candidates returned by
@@ -397,6 +401,14 @@ impl FakeSink {
             .lock()
             .unwrap()
             .failed_execution_cleanup_calls
+            .clone()
+    }
+
+    fn failed_execution_cleanup_routes(&self) -> Vec<(SandboxId, RetireStopRoute)> {
+        self.0
+            .lock()
+            .unwrap()
+            .failed_execution_cleanup_routes
             .clone()
     }
 
@@ -709,8 +721,12 @@ impl SweepSink for FakeSink {
         &self,
         sandbox_id: SandboxId,
         pod_fence: RetireFence,
+        stop_route: RetireStopRoute,
     ) -> Result<RetireExecutionOutcome, String> {
         let mut state = self.0.lock().unwrap();
+        state
+            .failed_execution_cleanup_routes
+            .push((sandbox_id, stop_route));
         let uuid = sandbox_id.as_uuid();
         if state
             .failed_execution_cleanup_failures
@@ -2149,6 +2165,69 @@ async fn v25_routability_check_error_defers_without_converge() {
     assert!(reconciler.sink.cleanup_calls().is_empty());
 }
 
+/// V26 — the failed-cleanup retire asks for the node route only when a node
+/// answered the probe that permits it, for each verdict that does. An
+/// execution that names no node is `missing_on_node` without a probe, so
+/// there is no node-api to stop it through, and its retire keeps the
+/// execution's own route, as does the retire of an abandoned create's live
+/// VM.
+#[tokio::test(flavor = "current_thread")]
+async fn v26_failed_cleanup_stops_through_the_node_only_when_one_answered() {
+    let sink = FakeSink::new();
+    let probed = SandboxId::new();
+    let dormant = SandboxId::new();
+    let missing = SandboxId::new();
+    let node_less = SandboxId::new();
+    let alive_create = SandboxId::new();
+    sink.enqueue_failed_cleanup(vec![
+        failed_candidate(probed),
+        failed_candidate(dormant),
+        failed_candidate(missing),
+        FailedCleanupCandidate {
+            node_name: None,
+            ..failed_candidate(node_less)
+        },
+        FailedCleanupCandidate {
+            first_activation: FirstActivation::Abandoned,
+            ..failed_candidate(alive_create)
+        },
+    ]);
+    sink.set_probe_verdict(probed, ProbeVerdict::DeadOnNode);
+    sink.set_probe_verdict(dormant, ProbeVerdict::DormantWithLocalArtifact);
+    sink.set_probe_verdict(missing, ProbeVerdict::MissingOnNode);
+    sink.set_probe_verdict(alive_create, ProbeVerdict::AliveOnNode);
+    let reconciler = Reconciler::new(
+        ReconcilerConfig {
+            enabled: false,
+            failed_cleanup_enabled: true,
+            ..ReconcilerConfig::default()
+        },
+        sink,
+    );
+
+    let report = reconciler.tick().await;
+
+    assert_eq!(report.failed_cleanup_attempts, 5, "{report:?}");
+    assert!(
+        reconciler
+            .sink
+            .probe_calls()
+            .iter()
+            .all(|(_, ids)| !ids.contains(&node_less)),
+        "an execution that names no node is not probed"
+    );
+    assert_eq!(
+        reconciler.sink.failed_execution_cleanup_routes(),
+        vec![
+            (probed, RetireStopRoute::Node),
+            (dormant, RetireStopRoute::Node),
+            (missing, RetireStopRoute::Node),
+            (node_less, RetireStopRoute::Execution),
+            (alive_create, RetireStopRoute::Execution),
+        ]
+    );
+}
+
 // -----------------------------------------------------------------
 // CRP — command-ready-pending reaper (heal vs reap)
 // -----------------------------------------------------------------
@@ -2605,6 +2684,7 @@ fn f5_only_an_observed_pod_yields_a_verifiable_fence() {
 mod activation_owner;
 mod crashed_create;
 mod episode_deadline;
+mod failed_cleanup_stop_route;
 
 mod postgres_backed {
 
