@@ -32,6 +32,12 @@ ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
 ARG NEXT_PUBLIC_DATA_PLANE_URL=http://localhost:8090
 ENV NEXT_PUBLIC_DATA_PLANE_URL=${NEXT_PUBLIC_DATA_PLANE_URL}
 
+# Optional separate origin for the /admin rewrite (a dedicated
+# `--surface admin` API). Empty, the default, keeps /admin on
+# NEXT_PUBLIC_API_URL; see ui/README.md.
+ARG NEXT_PUBLIC_ADMIN_API_URL=
+ENV NEXT_PUBLIC_ADMIN_API_URL=${NEXT_PUBLIC_ADMIN_API_URL}
+
 COPY ui/ ./
 
 RUN npm run build
