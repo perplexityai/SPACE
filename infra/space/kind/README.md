@@ -1262,6 +1262,10 @@ runs:
 
 Log in as `root@local` with the initial password (`password` by default). Set `SPACE_CONSOLE_PASSWORD` before the bring-up starts Tilt to choose a custom password. It is never printed or retained in a Kubernetes Secret. It is set only while the seeded account is locked; rerunning does not reset an existing password.
 
+To check console (`ui/`) changes in a browser against this stack, use the
+[console loop](console-loop/README.md): it seeds synthetic state, drives every
+console page, and compares a branch's run with `main`'s.
+
 ### Recovering from an unbundled migration version
 
 On a long-lived task-owned bench, the `space-db-migrate` Job may fail, and
