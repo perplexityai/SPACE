@@ -48,8 +48,8 @@ usage: archcheck [--root <path>] [--format human|rdjson]
                       (skipped without it)
   --write-baseline[=<table>]
                       update or remove the entries of architecture-baseline.toml
-                      to match the current tree, or with =<table> (file_size,
-                      crate_names, pattern_ratchet.<instance> or
+                      to match the current tree, or with =<table>
+                      (crate_names, pattern_ratchet.<instance> or
                       layers.<check>) only that
                       table's, keeping the others. It lists each violation
                       without an entry, with the entries to add by hand, and

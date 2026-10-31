@@ -36,30 +36,6 @@ findings, 1 with one, 2 for a configuration, usage or I/O error.
   --check` rejects such files). A leading byte order mark is ignored. Block
   comments and attributes count.
 
-`file_size` limits production files to `limit` code lines, with five
-behaviours:
-
-- `no_crossing`: a file outside the baseline is over the limit;
-- `no_new_entries`: the baseline has an entry that the base branch's copy
-  lacks (a renamed file counts as added, unless `--renames` pairs it with
-  its old path; see [Renamed files](#renamed-files));
-- `no_raised_caps`: an entry's cap is higher than in the base branch's copy;
-- `listed_no_growth`: a listed file grew past its cap;
-- `stale_entries`: an entry can be lowered or removed, because its file shrank,
-  is at or under the limit, or no longer exists (or the key names no
-  production file).
-
-`no_new_entries` and `no_raised_caps` compare with the base branch's copy of
-the baseline, given with `--base-baseline <path>`, so that the baseline is no
-way around the limit.
-Lowered caps and removed entries are silent. Only that copy's `[file_size]`
-table is read here, and other tables and keys are ignored, so a pull request
-can change the baseline's schema. If the copy can't be read, archcheck exits 2.
-If it isn't TOML, or its `[file_size]` isn't a table of integers, both
-behaviours are skipped with a warning. Without the flag (the local default)
-they are skipped too. Either way, one line after the summary line says so: on
-stdout for `human`, on stderr for `rdjson`.
-
 `pattern_ratchet` is a lint: it counts, per production file, the code lines
 that mention a name, and ratchets those counts. It has any number of named
 instances, each with its own patterns, allowed paths, modes and baseline
@@ -73,8 +49,7 @@ allow = ["crates/x/src/owner.rs", "crates/x/src/owner/**"]
 
 [rules.pattern_ratchet.<instance>.no_crossing]
 mode = "advisory"
-# ...and no_new_entries, no_raised_caps, listed_no_growth and stale_entries,
-# as for file_size
+# ...and no_new_entries, no_raised_caps, listed_no_growth and stale_entries
 ```
 
 It counts mentions, not uses. A code line matches if any pattern matches
@@ -104,28 +79,31 @@ check nothing and exits 2; omit it to check every production file. An empty
   table has a matching line;
 - `no_new_entries`: the instance's table has an entry that the base branch's
   copy of that table lacks (a renamed file counts as added, unless
-  `--renames` pairs it with its old path);
+  `--renames` pairs it with its old path; see [Renamed files](#renamed-files));
 - `no_raised_caps`: an entry's cap is higher than in the base branch's copy
   of the table;
 - `listed_no_growth`: a listed file has more matching lines than its cap;
 - `stale_entries`: an entry can be lowered or removed, because its file has
-  fewer matching lines, none, is now allowed, or no longer exists.
+  fewer matching lines, none, is now allowed, or no longer exists (or the key
+  names no production file).
 
-`no_new_entries` and `no_raised_caps` compare with the base branch's copy as
-`file_size`'s do. Each instance reads only its own `[pattern_ratchet.<instance>]`
-table from that copy, leniently: a table for an instance that is not
-configured, such as one this pull request renamed or removed, is ignored, with
-a line after the summary (`base baseline has [pattern_ratchet.<instance>],
-which is not configured; skipped`) so that the removal shows in the log; a
-missing table has no entries, so every entry of the instance's own table is
-new. If the instance's table, or `pattern_ratchet` itself, isn't a table of
-integers, that instance's two behaviours are skipped with a warning, and the
-other tables are still compared. If the copy isn't TOML at all, one warning
-line names every comparison skipped, `file_size`'s and each instance's.
-Without `--base-baseline`, they are skipped, one line per instance after the
-summary line. Loosening an instance in
-`ARCHITECTURE.toml`, by widening `allow` or narrowing `patterns`, is not
-reported by any behaviour: review such changes.
+`no_new_entries` and `no_raised_caps` compare with the base branch's copy of
+the baseline, given with `--base-baseline <path>`, so that the baseline is no
+way around the allowed paths. Lowered caps and removed entries are silent. If
+the copy can't be read, archcheck exits 2. Each instance reads only its own
+`[pattern_ratchet.<instance>]` table from that copy, leniently: a table for an
+instance that is not configured, such as one this pull request renamed or
+removed, is ignored, with a line after the summary (`base baseline has
+[pattern_ratchet.<instance>], which is not configured; skipped`) so that the
+removal shows in the log; a missing table has no entries, so every entry of the
+instance's own table is new. If the instance's table, or `pattern_ratchet`
+itself, isn't a table of integers, that instance's two behaviours are skipped
+with a warning, and the other tables are still compared. If the copy isn't TOML
+at all, one warning line names every comparison skipped. Without
+`--base-baseline` (the local default), they are skipped, one line per instance
+after the summary line: on stdout for `human`, on stderr for `rdjson`.
+Loosening an instance in `ARCHITECTURE.toml`, by widening `allow` or narrowing
+`patterns`, is not reported by any behaviour: review such changes.
 
 An instance name is lowercase ASCII letters, digits and underscores, starting
 with a letter. Adding an instance takes configuration and a baseline table, no
@@ -145,8 +123,8 @@ code changes:
 
 ### Renamed files
 
-A file the pull request renames keeps its entry: under `[file_size]` and in
-every `[pattern_ratchet.<instance>]` table, an entry whose path the base
+A file the pull request renames keeps its entry: in every
+`[pattern_ratchet.<instance>]` table, an entry whose path the base
 branch's copy lacks is compared with the entry of the path it was renamed
 from, so moving the entry to the new path is not a new entry, and at or
 below the old cap not a raised one. Above it, `no_raised_caps` reports
@@ -176,11 +154,11 @@ cargo arch --base-baseline /tmp/base-baseline.toml --renames /tmp/renames
 stderr, and renamed entries count as new.
 
 archcheck does not pair a gone entry with a new one whose cap fits, which
-would let an unrelated new file over the limit take over a deleted file's
-entry: git pairs a deleted file with an added one only when their contents
-are similar (by default, half), so a file deleted and an unrelated one added
-are still a new entry. A rename git does not detect, such as one that also
-rewrites most of the file, is reported as new too.
+would let an unrelated new file take over a deleted file's entry: git pairs a
+deleted file with an added one only when their contents are similar (by
+default, half), so a file deleted and an unrelated one added are still a new
+entry. A rename git does not detect, such as one that also rewrites most of the
+file, is reported as new too.
 
 A renamed file without an entry is reported as a `no_crossing` on its new
 path, and an old entry left behind as stale. With `--renames`, the
@@ -252,9 +230,9 @@ for the other tables, it lists no entries to paste: a hand-added entry fails
 the other tables; `--write-baseline=crate_names` updates it alone.
 
 Module names aren't checked. Catch-all modules haven't been appearing in the
-history, a module's reach is limited to its crate, `file_size` already bounds
-how much one can hold, and a check on module names is easy to evade (`util.rs`
-becomes `support.rs`) without changing what the module holds.
+history, a module's reach is limited to its crate, and a check on module names
+is easy to evade (`util.rs` becomes `support.rs`) without changing what the
+module holds.
 
 ## Dependency fences
 
@@ -850,9 +828,8 @@ so a new table is declared by its owner before its migration lands (see
 - **Moving a crate:** `git mv` it into its layer directory and remove its
   `unmoved` entry, which `stale_entries` asks for. Its layers baseline
   entries keep matching, but path-keyed configuration has to follow the
-  crate: ratchet `include` and `allow`, fence `members` and `allow`, the
-  `[file_size]` and ratchet baseline keys, and the member paths of
-  `[crate_names]` baseline entries.
+  crate: ratchet `include` and `allow`, fence `members` and `allow`, ratchet
+  baseline keys, and the member paths of `[crate_names]` baseline entries.
 
 ## Configuration and modes
 
@@ -873,10 +850,9 @@ that is not git's (see [Renamed files](#renamed-files)).
 ## Baseline
 
 Each table maps a repository-relative path to its cap, the count it had when
-listed: under `[file_size]`, each production file over the limit, with its
-code-line count; under `[pattern_ratchet.<instance>]`, each production file
-outside the instance's allowed paths with a matching line, with its count of
-matching lines. `[layers.<check>]` maps a package name to the packages it
+listed: under `[pattern_ratchet.<instance>]`, each production file outside the
+instance's allowed paths with a matching line, with its count of matching
+lines. `[layers.<check>]` maps a package name to the packages it
 depends on against the check instead, or for `codec_features` the
 `<package>/<feature>` entries it enables (see [Layers](#layers)),
 `[layers.unowned]` a database namespace to its tables without an owner (see
@@ -887,30 +863,28 @@ removed or lowered.
 
 `cargo arch --write-baseline` rewrites `architecture-baseline.toml` from its
 entries and the tree. An entry still in violation gets its current count as
-its cap: under `[file_size]`, a file still over the limit; under
-`[pattern_ratchet.<instance>]`, a file outside the allowed paths that still has
-a matching line. The other entries are removed. It never adds an entry, or a
-`[pattern_ratchet.<instance>]` table the file lacks (`[file_size]`,
-`[crate_names]` and, with the layers rule configured, both `[layers.<check>]`
-tables are always written, empty if the file had none; for `[crate_names]`
+its cap: under `[pattern_ratchet.<instance>]`, a file outside the allowed paths
+that still has a matching line. The other entries are removed. It never adds an
+entry, or a `[pattern_ratchet.<instance>]` table the file lacks
+(`[crate_names]` is always written and, with the layers rule configured, so is
+each `[layers.<check>]` table, empty if the file had none; for `[crate_names]`
 and the layers tables, which list no entries to paste, see [Crate
-names](#crate-names) and [Layers](#layers)). It prints `not added: <path> (N code lines); …` for each
-file over the limit without an entry instead, and `not added: <path> (N code
-lines matching the <instance> patterns); …` for each matching file without
-one, then, after its summary line, the entries they would need, as TOML, one
-block per table, each after a comment saying where it goes. For a table the
-file has, the block has no header and its comment says to add the entries
-inside that table, below its header: pasted at the end of the file, they would
-land in whichever table comes last. For a table the file lacks, the block
-starts with the table's header and goes at the end of the file. Fix the file,
-or, for a deliberate exception, add the entry by hand, inside its table, which
-`no_new_entries` then reports. Raised
+names](#crate-names) and [Layers](#layers)). It prints `not added: <path> (N
+code lines matching the <instance> patterns); …` for each matching file
+without an entry instead, then, after its summary line, the entries they would
+need, as TOML, one block per table, each after a comment saying where it goes.
+For a table the file has, the block has no header and its comment says to add
+the entries inside that table, below its header: pasted at the end of the file,
+they would land in whichever table comes last. For a table the file lacks, the
+block starts with the table's header and goes at the end of the file. Fix the
+file, or, for a deliberate exception, add the entry by hand, inside its table,
+which `no_new_entries` then reports. Raised
 caps are written too, and `no_raised_caps` reports each of them. It reads the
 existing file with the strict parser, so a missing or invalid baseline exits 2:
 it can't create one from scratch.
 
-`cargo arch --write-baseline=<table>`, with `<table>` `file_size`,
-`crate_names`, `pattern_ratchet.<instance>` for a configured instance or
+`cargo arch --write-baseline=<table>`, with `<table>` `crate_names`,
+`pattern_ratchet.<instance>` for a configured instance or
 `layers.<check>` with the layers rule configured, does
 the same for that
 table alone and keeps every other table as the existing baseline has it,
@@ -952,14 +926,13 @@ the step warns and runs without any of the flags: the `no_new_entries` and
 entries are skipped, and `crate_names.no_new` allows only the bootstrap
 entries. Each finding is a
 diagnostic with code `<rule>.<behaviour>`, or `<rule>.<instance>.<behaviour>`
-for a rule with instances, on line 1 of its file, with the path exactly as it
-is. A new catch-all crate points at the `name =` line of its `Cargo.toml`
-instead, and a new entry, a raised cap, a stale entry for a deleted file and a
-stale `[crate_names]` entry at the entry's line in the baseline. `layers`
-findings point at a crate's `name =` line (`placement`, `layout`), the
-manifest line declaring a dependency (an edge), the entry's line in
-`ARCHITECTURE.toml` (a new `unmoved` entry, `stale_entries`,
-`policy_changed`) or the edge's line in the baseline.
+for a rule with instances, with the path exactly as it is. A new catch-all
+crate points at the `name =` line of its `Cargo.toml`, and a new entry, a
+raised cap, a stale entry for a deleted file and a stale `[crate_names]` entry
+at the entry's line in the baseline. `layers` findings point at a crate's
+`name =` line (`placement`, `layout`), the manifest line declaring a dependency
+(an edge), the entry's line in `ARCHITECTURE.toml` (a new `unmoved` entry,
+`stale_entries`, `policy_changed`) or the edge's line in the baseline.
 `pattern_ratchet`'s `no_crossing`, `listed_no_growth` and shrank
 `stale_entries` findings point at the file's first matching line; one for a
 file with no matches left, at its line 1. Required findings are `ERROR`,
@@ -981,7 +954,7 @@ advisory ones `WARNING`.
   required finding already on the base branch fails it too, as
   `tests/repository.rs` fails every pull request's tests then.
 - GitHub shows a step's first 10 warning annotations, and the report lists
-  every `file_size` finding first. So
+  findings rule by rule, not by pull request. So
   [`order-archcheck-findings.sh`](../../../ci/scripts/order-archcheck-findings.sh)
   hands the advisory run the pull request's own findings first, then the rest.
   First come all `no_new_entries` and `no_raised_caps` findings: they compare
@@ -1017,7 +990,7 @@ A new instance of `pattern_ratchet` is configuration, not a new rule (see
 above). For a new kind of check:
 
 1. Add a module under `src/rules/`. A rule that caps a count per file in a
-   baseline table, as both rules do, implements `CountRule`
+   baseline table, as `pattern_ratchet` does, implements `CountRule`
    (`src/rules/ratchet.rs`): one `CountRatchet` per table, whose `measure`
    gives a violating file's count and the line findings about it point at, and
    whose wording the findings and `not added` lines are built from. The five
@@ -1040,9 +1013,6 @@ above). For a new kind of check:
    - read the rule's own key from the parsed document in
      `Baseline::load_base`, on its own, as for `pattern_ratchet`, and record
      the rule as read; a registered rule that is not read makes every
-     `--base-baseline` run whose base copy is TOML exit 2. Do not add a
-     field to `BaseBaselineFile`, which reads `[file_size]` alone: a second
-     field there would let one table that does not parse skip both rules'
-     comparisons;
+     `--base-baseline` run whose base copy is TOML exit 2;
    - describe the table in the generated header, `HEADER`.
 4. Register it in `rules::registered()` and add test cases to `tests/cli.rs`.

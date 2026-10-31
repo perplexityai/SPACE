@@ -20,7 +20,7 @@ fn repository_config_and_baseline_pass_every_required_rule() {
 
 #[test]
 fn node_manager_commands_reject_direct_spawns_without_restricting_other_services() {
-    use pplx_space_archcheck::context::{ProductionFile, count_code_lines};
+    use pplx_space_archcheck::context::ProductionFile;
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
     let mut ctx = Context::load(&root).unwrap();
     let cases = [
@@ -64,7 +64,6 @@ fn node_manager_commands_reject_direct_spawns_without_restricting_other_services
         ctx.files.push(ProductionFile {
             path: path.to_owned(),
             text: text.to_owned(),
-            code_lines: count_code_lines(text),
         });
         let found = check(&ctx).iter().any(|finding| {
             finding.path == path
@@ -101,8 +100,8 @@ fn sbxmgr_sqlite_findings(
 }
 
 /// A workspace with one crate whose sources are at `src`, checked by the
-/// repository's own `[rules.pattern_ratchet.<instance>]`, its
-/// `[rules.file_size]` and `[rules.crate_names]`, `entries` as the instance's
+/// repository's own `[rules.pattern_ratchet.<instance>]` and
+/// `[rules.crate_names]`, `entries` as the instance's
 /// baseline, and `files` under `src`. Returns the instance's findings as
 /// `(behaviour, message)`.
 fn ratchet_findings(
@@ -139,7 +138,7 @@ fn ratchet_findings(
 
     let dir = tempfile::tempdir().expect("create a temporary workspace");
     let member = src.trim_end_matches("/src");
-    let mut baseline = format!("[file_size]\n[crate_names]\n[pattern_ratchet.{instance}]\n");
+    let mut baseline = format!("[crate_names]\n[pattern_ratchet.{instance}]\n");
     for (path, cap) in entries {
         baseline.push_str(&format!("\"{src}/{path}\" = {cap}\n"));
     }

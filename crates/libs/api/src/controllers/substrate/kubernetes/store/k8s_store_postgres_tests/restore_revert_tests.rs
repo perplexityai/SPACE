@@ -1,9 +1,9 @@
 //! Postgres behaviors for rolling a failed fresh restore claim back to
 //! `suspended` (`K8sStore::revert_restore_claim_to_suspended`).
 //!
-//! A sibling module rather than more lines in the parent, which is already far
-//! past the repository's file-size guidance. Driven from
-//! `k8s_store_postgres_behaviors` against the parent's fixture.
+//! A sibling module rather than more lines in the parent, which is already very
+//! large. Driven from `k8s_store_postgres_behaviors` against the parent's
+//! fixture.
 
 use pplx_space_common_core::types::{
     LocalArtifactId, NodeId, SandboxActivationAttemptId, SandboxId,

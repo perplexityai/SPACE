@@ -2,14 +2,12 @@
 
 mod crate_names;
 mod dependency_fence;
-mod file_size;
 mod layers;
 mod pattern_ratchet;
 mod ratchet;
 
 pub(crate) use crate_names::CrateNames;
 pub(crate) use dependency_fence::DependencyFence;
-pub(crate) use file_size::FileSize;
 pub(crate) use layers::Layers;
 pub(crate) use pattern_ratchet::PatternRatchet;
 pub(crate) use ratchet::CountRule;
@@ -24,16 +22,17 @@ pub trait Rule {
     fn check(&self, ctx: &Context) -> Vec<Finding>;
 
     /// Behaviours this context cannot check, as one line per reason, such as
-    /// `file_size.no_new_entries and … skipped (…)`. Not called for a base
-    /// branch's copy that is not TOML at all: [`crate::skipped`] reports
-    /// that once, from every rule's [`Rule::base_comparisons`].
+    /// `pattern_ratchet.<instance>.no_new_entries and … skipped (…)`. For a
+    /// base branch's copy that is not TOML at all, [`crate::skipped`] reports
+    /// one line naming every rule's [`Rule::base_comparisons`] instead, and
+    /// calls this only when no rule returns any.
     fn skipped(&self, _ctx: &Context) -> Vec<String> {
         Vec::new()
     }
 
     /// The behaviours that compare with the base branch's copy, one phrase
-    /// per table, such as `file_size.no_new_entries and
-    /// file_size.no_raised_caps`.
+    /// per table, such as `pattern_ratchet.<instance>.no_new_entries and
+    /// pattern_ratchet.<instance>.no_raised_caps`.
     fn base_comparisons(&self, _ctx: &Context) -> Vec<String> {
         Vec::new()
     }
@@ -93,7 +92,6 @@ pub fn tables(config: &RulesConfig) -> Vec<String> {
 /// Every rule, in reporting order. Register a new rule here.
 pub fn registered() -> Vec<Box<dyn Rule>> {
     vec![
-        Box::new(FileSize),
         Box::new(PatternRatchet),
         Box::new(CrateNames),
         Box::new(DependencyFence),

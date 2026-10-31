@@ -150,13 +150,12 @@ pub enum LoadError {
     },
 }
 
-/// A production Rust file, its text and its code-line count.
+/// A production Rust file and its text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProductionFile {
     /// Repository-relative, `/`-separated.
     pub path: String,
     pub text: String,
-    pub code_lines: usize,
 }
 
 /// A workspace member's package.
@@ -403,11 +402,6 @@ pub fn is_test_file(name: &str) -> bool {
 /// `scripts/check-rust-error-policy.sh` excludes `*/tests/*` the same way.
 pub fn is_test_directory(name: &OsStr) -> bool {
     name == "tests"
-}
-
-/// The number of [`code_lines`] in `text`.
-pub fn count_code_lines(text: &str) -> usize {
-    code_lines(text).count()
 }
 
 /// Each code line of `text`, untrimmed and without its line ending, with its
@@ -684,7 +678,6 @@ fn production_files(root: &Path, crates: &[Crate]) -> Result<Vec<ProductionFile>
         .map(|path| {
             let text = read(&path)?;
             Ok(ProductionFile {
-                code_lines: count_code_lines(&text),
                 text,
                 path: relative_path(root, &path)?,
             })

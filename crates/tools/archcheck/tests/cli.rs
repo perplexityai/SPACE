@@ -5,17 +5,15 @@
 use std::{collections::BTreeMap, fs, path::Path, process::Command};
 
 use pplx_space_archcheck::{
-    BaseBaseline, Baseline, Context, Renames, check,
+    Baseline, Context, Renames, check,
     config::BaseArchitecture,
-    context::count_code_lines,
+    context::code_lines,
     finding::Finding,
     report::{Format, render},
     skipped, write_baseline,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
-
-const LIMIT: usize = 5;
 
 /// A file of `lines` code lines.
 fn code(lines: usize) -> String {
@@ -28,9 +26,9 @@ const ADVISORY: [&str; 5] = ["advisory"; 5];
 const POLICY_SKIPPED: &str =
     "archcheck: crate_names.policy_changed skipped (no --base-architecture given)\n";
 
-/// The summary's lines when neither base is given.
-const SKIPPED: &str = "archcheck: file_size.no_new_entries and file_size.no_raised_caps skipped \
-                       (no --base-baseline given)\n\
+/// The summary's lines when neither base is given, with [`old_tables_config`].
+const SKIPPED: &str = "archcheck: pattern_ratchet.old.no_new_entries and \
+                       pattern_ratchet.old.no_raised_caps skipped (no --base-baseline given)\n\
                        archcheck: crate_names.no_new allows only the 16 crates listed when the \
                        rule was added in [crate_names] (no --base-baseline given)\n\
                        archcheck: crate_names.policy_changed skipped (no --base-architecture \
@@ -53,31 +51,9 @@ const CRATE_NAMES: &str = "[rules.crate_names]\n\
                            [rules.crate_names.stale_entries]\nmode = \"advisory\"\n\
                            [rules.crate_names.policy_changed]\nmode = \"advisory\"\n";
 
-/// `modes` of file_size's no_crossing, no_new_entries, no_raised_caps,
-/// listed_no_growth and stale_entries, followed by [`CRATE_NAMES`].
-fn config(modes: [&str; 5]) -> String {
-    let [
-        no_crossing,
-        no_new_entries,
-        no_raised_caps,
-        listed_no_growth,
-        stale_entries,
-    ] = modes;
-    format!(
-        "[rules.file_size]\nlimit = {LIMIT}\n\
-         [rules.file_size.no_crossing]\nmode = \"{no_crossing}\"\n\
-         [rules.file_size.no_new_entries]\nmode = \"{no_new_entries}\"\n\
-         [rules.file_size.no_raised_caps]\nmode = \"{no_raised_caps}\"\n\
-         [rules.file_size.listed_no_growth]\nmode = \"{listed_no_growth}\"\n\
-         [rules.file_size.stale_entries]\nmode = \"{stale_entries}\"\n\
-         {CRATE_NAMES}"
-    )
-}
-
-/// [`config`] with file_size's behaviours advisory, and the `key` line of
-/// `[rules.crate_names]` replaced with `key = <value>`.
+/// [`CRATE_NAMES`] with its `key` line replaced with `key = <value>`.
 fn with_crate_names(key: &str, value: &str) -> String {
-    let advisory = config(ADVISORY);
+    let advisory = CRATE_NAMES;
     let line = advisory
         .lines()
         .find(|line| line.starts_with(&format!("{key} = ")))
@@ -85,18 +61,9 @@ fn with_crate_names(key: &str, value: &str) -> String {
     advisory.replace(line, &format!("{key} = {value}"))
 }
 
-/// `[file_size]` with `entries` and an empty `[crate_names]`.
-fn baseline(entries: &[(&str, usize)]) -> String {
-    tables(entries, &[])
-}
-
-/// `[file_size]` and `[crate_names]` with these entries.
-fn tables(file_size: &[(&str, usize)], crate_names: &[(&str, &str)]) -> String {
-    let mut text = String::from("[file_size]\n");
-    for (path, cap) in file_size {
-        text.push_str(&format!("{path:?} = {cap}\n"));
-    }
-    text.push_str("[crate_names]\n");
+/// `[crate_names]` with these entries.
+fn tables(crate_names: &[(&str, &str)]) -> String {
+    let mut text = String::from("[crate_names]\n");
     for (name, member) in crate_names {
         text.push_str(&format!("{name:?} = {member:?}\n"));
     }
@@ -109,8 +76,8 @@ fn package(name: &str) -> String {
     format!("[package]\nname = {name:?}\n[lib]\npath = \"lib.rs\"\n")
 }
 
-/// A workspace with members `crates/a` and `crates/b`, every behaviour
-/// advisory and an empty baseline, with `files` written over those defaults.
+/// A workspace with members `crates/a` and `crates/b`, [`CRATE_NAMES`] and an
+/// empty baseline, with `files` written over those defaults.
 fn workspace(files: &[(&str, String)]) -> TempDir {
     let dir = tempfile::tempdir().expect("create a temporary workspace");
     let defaults = [
@@ -120,8 +87,8 @@ fn workspace(files: &[(&str, String)]) -> TempDir {
         ),
         ("crates/a/Cargo.toml", package("a")),
         ("crates/b/Cargo.toml", package("b")),
-        ("ARCHITECTURE.toml", config(ADVISORY)),
-        ("architecture-baseline.toml", baseline(&[])),
+        ("ARCHITECTURE.toml", CRATE_NAMES.to_owned()),
+        ("architecture-baseline.toml", tables(&[])),
     ];
     for (path, contents) in defaults.iter().chain(files) {
         let path = dir.path().join(path);
@@ -178,11 +145,8 @@ fn load_with(root: &Path, base: Option<&str>, architecture: Option<&str>) -> Con
     ctx
 }
 
-/// `(behaviour, message)` of every finding, in reporting order.
-fn findings(root: &Path) -> Vec<(&'static str, String)> {
-    findings_against(root, None)
-}
-
+/// `(behaviour, message)` of every finding, in reporting order, with `base`
+/// as the base branch's baseline.
 fn findings_against(root: &Path, base: Option<&str>) -> Vec<(&'static str, String)> {
     findings_with_renames(root, base, None)
 }
@@ -249,7 +213,7 @@ fn counting() {
         ("U+2029 ends no comment", "// c\u{2029}fn f() {}", 0),
     ];
     for (name, text, expected) in cases {
-        assert_eq!(count_code_lines(text), *expected, "{name}");
+        assert_eq!(code_lines(text).count(), *expected, "{name}");
     }
 }
 
@@ -318,444 +282,16 @@ fn inventory() {
     assert_eq!(checked, expected);
 }
 
-/// One row per situation: the base branch's baseline entries (`None`
-/// without `--base-baseline`), baseline entries, file sizes, and the expected
-/// `(behaviour, start of message)` of each finding.
-#[test]
-fn behaviours() {
-    const LISTED: &str = "crates/a/src/listed.rs";
-    const NEW: &str = "crates/b/src/new.rs";
-    type Sizes<'a> = &'a [(&'a str, usize)];
-    type Case<'a> = (
-        &'a str,
-        Option<Sizes<'a>>,
-        Sizes<'a>,
-        Sizes<'a>,
-        &'a [(&'a str, &'a str)],
-    );
-    let cases: &[Case] = &[
-        (
-            "a new file over the limit",
-            None,
-            &[],
-            &[(NEW, LIMIT + 1)],
-            &[(
-                "no_crossing",
-                "crates/b/src/new.rs: 6 code lines, over the 5-line limit (comments and blank \
-                 lines are not counted). Split it into submodules by responsibility.",
-            )],
-        ),
-        ("a new file at the limit", None, &[], &[(NEW, LIMIT)], &[]),
-        (
-            "a listed file grew",
-            None,
-            &[(LISTED, 6)],
-            &[(LISTED, 7)],
-            &[(
-                "listed_no_growth",
-                "crates/a/src/listed.rs grew from 6 to 7 code lines. Once this rule is \
-                 required, split the file before adding to it.",
-            )],
-        ),
-        (
-            "a listed file at its cap",
-            None,
-            &[(LISTED, 6)],
-            &[(LISTED, 6)],
-            &[],
-        ),
-        (
-            "a listed file shrank",
-            None,
-            &[(LISTED, 8)],
-            &[(LISTED, 7)],
-            &[(
-                "stale_entries",
-                "crates/a/src/listed.rs shrank from 8 to 7 code lines. Lower its cap in \
-                 architecture-baseline.toml to 7.",
-            )],
-        ),
-        (
-            "a listed file fell to the limit",
-            None,
-            &[(LISTED, 8)],
-            &[(LISTED, LIMIT)],
-            &[(
-                "stale_entries",
-                "crates/a/src/listed.rs is down to 5 code lines, within the 5-line limit. \
-                 Remove it from architecture-baseline.toml.",
-            )],
-        ),
-        (
-            "a listed file is gone",
-            None,
-            &[(LISTED, 8)],
-            &[],
-            &[(
-                "stale_entries",
-                "crates/a/src/listed.rs: listed in architecture-baseline.toml but no longer a \
-                 production Rust file. Remove the entry; a renamed file is checked under its new \
-                 path.",
-            )],
-        ),
-        (
-            "a listed file was renamed",
-            None,
-            &[(LISTED, 8)],
-            &[(NEW, 8)],
-            &[
-                ("no_crossing", "crates/b/src/new.rs: 8 code lines, over"),
-                ("stale_entries", "crates/a/src/listed.rs: listed in"),
-            ],
-        ),
-        (
-            "a key that names no production file",
-            None,
-            &[("./crates/a/src/listed.rs", 8)],
-            &[(LISTED, 8)],
-            &[
-                ("no_crossing", "crates/a/src/listed.rs: 8 code lines, over"),
-                ("stale_entries", "./crates/a/src/listed.rs: listed in"),
-            ],
-        ),
-        (
-            "an entry was added",
-            Some(&[]),
-            &[(NEW, 6)],
-            &[(NEW, 6)],
-            &[(
-                "no_new_entries",
-                "crates/b/src/new.rs is in architecture-baseline.toml but not in the base branch's \
-                 copy; files over the 5-line limit can't be added (a renamed file counts as \
-                 added unless --renames pairs it with an old path the base branch's copy lists). \
-                 Split the file instead.",
-            )],
-        ),
-        (
-            "an entry was added without --base-baseline",
-            None,
-            &[(NEW, 6)],
-            &[(NEW, 6)],
-            &[],
-        ),
-        (
-            "a listed file was renamed and its entry with it",
-            Some(&[(LISTED, 8)]),
-            &[(NEW, 8)],
-            &[(NEW, 8)],
-            &[(
-                "no_new_entries",
-                "crates/b/src/new.rs is in architecture-baseline.toml but",
-            )],
-        ),
-        (
-            "an entry was removed",
-            Some(&[(LISTED, 8), (NEW, 6)]),
-            &[(NEW, 6)],
-            &[(LISTED, LIMIT), (NEW, 6)],
-            &[],
-        ),
-        (
-            "a cap was lowered",
-            Some(&[(LISTED, 8)]),
-            &[(LISTED, 7)],
-            &[(LISTED, 7)],
-            &[],
-        ),
-        (
-            "a cap was raised",
-            Some(&[(LISTED, 6)]),
-            &[(LISTED, 7)],
-            &[(LISTED, 7)],
-            &[(
-                "no_raised_caps",
-                "crates/a/src/listed.rs: cap raised from 6 to 7 in architecture-baseline.toml; \
-                 caps should only go down. Split the file instead.",
-            )],
-        ),
-        (
-            "an entry was added and a cap raised",
-            Some(&[(LISTED, 6)]),
-            &[(LISTED, 7), (NEW, 6)],
-            &[(LISTED, 7), (NEW, 6)],
-            &[
-                ("no_new_entries", "crates/b/src/new.rs is in"),
-                (
-                    "no_raised_caps",
-                    "crates/a/src/listed.rs: cap raised from 6 to 7",
-                ),
-            ],
-        ),
-        (
-            "a cap was raised without --base-baseline",
-            None,
-            &[(LISTED, 7)],
-            &[(LISTED, 7)],
-            &[],
-        ),
-        (
-            "a cap was lowered and another entry removed",
-            Some(&[(LISTED, 8), (NEW, 9)]),
-            &[(LISTED, 7)],
-            &[(LISTED, 7), (NEW, LIMIT)],
-            &[],
-        ),
-    ];
-    for (name, base, entries, sizes, expected) in cases {
-        let mut files: Vec<(&str, String)> = sizes
-            .iter()
-            .map(|(path, lines)| (*path, code(*lines)))
-            .collect();
-        files.push(("architecture-baseline.toml", baseline(entries)));
-        let ws = workspace(&files);
-
-        let found = findings_against(ws.path(), base.map(baseline).as_deref());
-
-        assert_eq!(found.len(), expected.len(), "{name}: {found:#?}");
-        for ((behaviour, message), (want_behaviour, want_message)) in found.iter().zip(*expected) {
-            assert_eq!(behaviour, want_behaviour, "{name}");
-            assert!(message.starts_with(want_message), "{name}: {message}");
-        }
-    }
-}
-
-/// An entry moved with a file `--renames` says was renamed is compared with
-/// the old path's entry in the base branch's copy: at or below its cap it is
-/// neither new nor raised. Each row changes one thing from the first: the
-/// base lists `old.rs` (cap 8), which became `new.rs` (8 code lines), and the
-/// baseline lists `new.rs` (cap 8).
-#[test]
-fn renames() {
-    const OLD: &str = "crates/a/src/old.rs";
-    const NEW: &str = "crates/b/src/new.rs";
-    const OLD2: &str = "crates/a/src/old2.rs";
-    const NEW2: &str = "crates/b/src/new2.rs";
-    const RENAMED: &[u8] = b"R097\0crates/a/src/old.rs\0crates/b/src/new.rs\0";
-    let crossing = |path: &str, lines: usize, advice: &str| {
-        (
-            "no_crossing",
-            format!(
-                "{path}: {lines} code lines, over the 5-line limit (comments and blank lines are \
-                 not counted). Split it into submodules by responsibility.{advice}"
-            ),
-        )
-    };
-    let new_entry = |path: &str| {
-        (
-            "no_new_entries",
-            format!(
-                "{path} is in architecture-baseline.toml but not in the base branch's copy; files \
-                 over the 5-line limit can't be added (a renamed file counts as added unless \
-                 --renames pairs it with an old path the base branch's copy lists). Split the \
-                 file instead."
-            ),
-        )
-    };
-    let raised = |path: &str, renamed: &str, from: usize, to: usize| {
-        (
-            "no_raised_caps",
-            format!(
-                "{path}:{renamed} cap raised from {from} to {to} in architecture-baseline.toml; \
-                 caps should only go down. Split the file instead."
-            ),
-        )
-    };
-    type Sizes<'a> = &'a [(&'a str, usize)];
-    // Name, base entries, entries, file sizes, renames and the expected
-    // `(behaviour, message)` of each finding.
-    type Case<'a> = (
-        &'a str,
-        Sizes<'a>,
-        Sizes<'a>,
-        Sizes<'a>,
-        Option<&'a [u8]>,
-        Vec<(&'a str, String)>,
-    );
-    let cases: Vec<Case> = vec![
-        (
-            "renamed at the same cap",
-            &[(OLD, 8)],
-            &[(NEW, 8)],
-            &[(NEW, 8)],
-            Some(RENAMED),
-            vec![],
-        ),
-        (
-            "renamed with a lower cap",
-            &[(OLD, 8)],
-            &[(NEW, 7)],
-            &[(NEW, 7)],
-            Some(RENAMED),
-            vec![],
-        ),
-        (
-            "renamed with a raised cap",
-            &[(OLD, 8)],
-            &[(NEW, 9)],
-            &[(NEW, 9)],
-            Some(RENAMED),
-            vec![raised(NEW, " renamed from crates/a/src/old.rs, with", 8, 9)],
-        ),
-        (
-            "renamed without --renames",
-            &[(OLD, 8)],
-            &[(NEW, 8)],
-            &[(NEW, 8)],
-            None,
-            vec![new_entry(NEW)],
-        ),
-        (
-            "a deleted file and an unrelated new file",
-            &[(OLD, 8)],
-            &[(NEW, 8)],
-            &[(NEW, 8)],
-            Some(b"D\0crates/a/src/old.rs\0A\0crates/b/src/new.rs\0"),
-            vec![new_entry(NEW)],
-        ),
-        (
-            "a copy, not a rename",
-            &[(OLD, 8)],
-            &[(OLD, 8), (NEW, 8)],
-            &[(OLD, 8), (NEW, 8)],
-            Some(b"C100\0crates/a/src/old.rs\0crates/b/src/new.rs\0"),
-            vec![new_entry(NEW)],
-        ),
-        (
-            "renamed from a file the base does not list",
-            &[],
-            &[(NEW, 8)],
-            &[(NEW, 8)],
-            Some(RENAMED),
-            vec![new_entry(NEW)],
-        ),
-        // A path the base lists is compared with its own entry, renamed or
-        // not, as without --renames.
-        (
-            "the base lists the new path too",
-            &[(OLD, 8), (NEW, 5)],
-            &[(NEW, 8)],
-            &[(NEW, 8)],
-            Some(RENAMED),
-            vec![raised(NEW, "", 5, 8)],
-        ),
-        (
-            "renamed, and the entry not moved",
-            &[(OLD, 8)],
-            &[(OLD, 8)],
-            &[(NEW, 8)],
-            Some(RENAMED),
-            vec![
-                crossing(
-                    NEW,
-                    8,
-                    " It was renamed from crates/a/src/old.rs: move that entry in \
-                     architecture-baseline.toml to the new path, at or below \
-                     crates/a/src/old.rs's cap of 8 in the base branch's copy.",
-                ),
-                (
-                    "stale_entries",
-                    "crates/a/src/old.rs: listed in architecture-baseline.toml but no longer a \
-                     production Rust file. Remove the entry; a renamed file is checked under its \
-                     new path."
-                        .to_owned(),
-                ),
-            ],
-        ),
-        (
-            "renamed, and the entry removed",
-            &[(OLD, 8)],
-            &[],
-            &[(NEW, 8)],
-            Some(RENAMED),
-            vec![crossing(
-                NEW,
-                8,
-                " It was renamed from crates/a/src/old.rs: give it an entry in \
-                 architecture-baseline.toml at or below crates/a/src/old.rs's cap of 8 in the base \
-                 branch's copy.",
-            )],
-        ),
-        // The advice names the cap the new entry would be compared with.
-        (
-            "renamed, the entry removed, and the base lists the new path",
-            &[(OLD, 8), (NEW, 5)],
-            &[],
-            &[(NEW, 8)],
-            Some(RENAMED),
-            vec![crossing(
-                NEW,
-                8,
-                " It was renamed from crates/a/src/old.rs: give it an entry in \
-                 architecture-baseline.toml at or below its cap of 5 in the base branch's copy.",
-            )],
-        ),
-        (
-            "renamed from a file neither lists",
-            &[],
-            &[],
-            &[(NEW, 8)],
-            Some(RENAMED),
-            vec![crossing(NEW, 8, "")],
-        ),
-        (
-            "a file over the limit that was not renamed",
-            &[(OLD, 8)],
-            &[(NEW, 8)],
-            &[(NEW, 8), ("crates/a/src/big.rs", 6)],
-            Some(RENAMED),
-            vec![crossing("crates/a/src/big.rs", 6, "")],
-        ),
-        // Git, not the caps, pairs old paths with new ones.
-        (
-            "two renames",
-            &[(OLD, 8), (OLD2, 6)],
-            &[(NEW, 8), (NEW2, 6)],
-            &[(NEW, 8), (NEW2, 6)],
-            Some(
-                b"R090\0crates/a/src/old.rs\0crates/b/src/new.rs\0\
-                  R080\0crates/a/src/old2.rs\0crates/b/src/new2.rs\0",
-            ),
-            vec![],
-        ),
-        (
-            "two renames, paired the other way",
-            &[(OLD, 8), (OLD2, 6)],
-            &[(NEW, 8), (NEW2, 6)],
-            &[(NEW, 8), (NEW2, 6)],
-            Some(
-                b"R090\0crates/a/src/old.rs\0crates/b/src/new2.rs\0\
-                  R080\0crates/a/src/old2.rs\0crates/b/src/new.rs\0",
-            ),
-            vec![raised(
-                NEW,
-                " renamed from crates/a/src/old2.rs, with",
-                6,
-                8,
-            )],
-        ),
-    ];
-    for (name, base, entries, sizes, renames, expected) in cases {
-        let mut files: Vec<(&str, String)> = sizes
-            .iter()
-            .map(|(path, lines)| (*path, code(*lines)))
-            .collect();
-        files.push(("architecture-baseline.toml", baseline(entries)));
-        let ws = workspace(&files);
-
-        let found = findings_with_renames(ws.path(), Some(&baseline(base)), renames);
-
-        assert_eq!(found, expected, "{name}");
-    }
-}
-
 /// From the binary, `--renames` takes git's own output, and a file that
 /// can't be read or isn't that output exits 2.
 #[test]
 fn renames_from_git() {
     const OLD: &str = "crates/a/src/old.rs";
+    let listed = |path: &str| ratchet_baseline(&[("old", &[(path, 1)])]);
     let ws = workspace(&[
-        ("architecture-baseline.toml", baseline(&[(OLD, 8)])),
-        (OLD, code(8)),
+        ("ARCHITECTURE.toml", old_tables_config(ADVISORY)),
+        ("architecture-baseline.toml", listed(OLD)),
+        (OLD, "old_table\n".to_owned()),
     ]);
     // Git acts on the temporary repository alone, even when the test runs
     // under a git hook or `git rebase -x`, which set GIT_DIR, GIT_INDEX_FILE
@@ -790,7 +326,7 @@ fn renames_from_git() {
         output.stdout
     };
     let base = ws.path().join("base-baseline.toml");
-    fs::write(&base, baseline(&[(OLD, 8)])).unwrap();
+    fs::write(&base, listed(OLD)).unwrap();
     // An empty template copies no hooks.
     git(&["init", "-q", "--template="]);
     git(&["add", "-A"]);
@@ -798,7 +334,7 @@ fn renames_from_git() {
     git(&["mv", OLD, "crates/a/src/new.rs"]);
     fs::write(
         ws.path().join("architecture-baseline.toml"),
-        baseline(&[("crates/a/src/new.rs", 8)]),
+        listed("crates/a/src/new.rs"),
     )
     .unwrap();
     let renames = ws.path().join("renames");
@@ -822,9 +358,9 @@ fn renames_from_git() {
     );
     let unpaired = run(ws.path(), &["--base-baseline", base]);
     assert!(
-        unpaired
-            .stdout
-            .starts_with("file_size.no_new_entries (advisory):\n  crates/a/src/new.rs is in"),
+        unpaired.stdout.starts_with(
+            "pattern_ratchet.old.no_new_entries (advisory):\n  crates/a/src/new.rs is in"
+        ),
         "{}",
         unpaired.stdout
     );
@@ -860,95 +396,6 @@ fn renames_from_git() {
     );
 }
 
-/// The base branch's copy is read leniently: only `[file_size]` matters, and
-/// a copy that does not parse skips the comparison with a one-line warning.
-/// The baseline lists `crates/a/src/listed.rs` (cap 8) and `crates/b/src/new.rs`.
-#[test]
-fn lenient_base_baseline() {
-    let cases: &[(&str, &str, &[&str], Option<&str>)] = &[
-        (
-            "an unknown table and key",
-            "version = 2\n[file_size]\n\"crates/a/src/listed.rs\" = 8\n[crate_names]\nx = \"y\"\n",
-            &["no_new_entries"],
-            None,
-        ),
-        (
-            "no [file_size] table",
-            "[crate_names]\n",
-            &["no_new_entries", "no_new_entries"],
-            None,
-        ),
-        (
-            "an empty file",
-            "",
-            &["no_new_entries", "no_new_entries"],
-            None,
-        ),
-        ("invalid TOML", "[file_size\n", &[], Some("at line 1")),
-        (
-            "a non-integer cap",
-            "[file_size]\n\"crates/a/src/listed.rs\" = 8\n\"crates/b/src/new.rs\" = \"9\"\n",
-            &[],
-            Some("at line 3"),
-        ),
-        (
-            "a negative cap",
-            "[file_size]\n\"x\" = -1\n",
-            &[],
-            Some("at line 2"),
-        ),
-        (
-            "[file_size] is not a table",
-            "file_size = 3\n",
-            &[],
-            Some("at line 1"),
-        ),
-    ];
-    for (name, base, expected, problem) in cases {
-        let ws = workspace(&[
-            (
-                "architecture-baseline.toml",
-                baseline(&[("crates/a/src/listed.rs", 8), ("crates/b/src/new.rs", 6)]),
-            ),
-            ("crates/a/src/listed.rs", code(8)),
-            ("crates/b/src/new.rs", code(6)),
-        ]);
-
-        let ctx = load(ws.path(), Some(base));
-
-        let found: Vec<_> = check(&ctx)
-            .iter()
-            .map(|finding| finding.behaviour)
-            .collect();
-        assert_eq!(found, *expected, "{name}");
-        let skipped: Vec<String> = skipped(&ctx)
-            .into_iter()
-            .filter(|line| line.contains("file_size."))
-            .collect();
-        match problem {
-            None => {
-                assert!(
-                    matches!(ctx.base_baseline, BaseBaseline::Loaded(_)),
-                    "{name}"
-                );
-                assert_eq!(skipped, Vec::<String>::new(), "{name}");
-            }
-            Some(at) => {
-                let path = ws.path().join("base-baseline.toml");
-                let [line] = skipped.as_slice() else {
-                    panic!("{name}: {skipped:?}");
-                };
-                let start = format!("warning: could not parse {} {at}: ", path.display());
-                let end = "; file_size.no_new_entries and file_size.no_raised_caps skipped";
-                assert!(
-                    line.starts_with(&start) && line.ends_with(end) && !line.contains('\n'),
-                    "{name}: {line}"
-                );
-            }
-        }
-    }
-}
-
 /// Pairs such as `(member, package name)` or `(behaviour, message)`.
 type Pairs<'a> = &'a [(&'a str, &'a str)];
 
@@ -966,11 +413,11 @@ impl Base<'_> {
     fn text(self) -> Option<String> {
         match self {
             Self::Unresolved => None,
-            Self::NoTable => Some("[file_size]\n".to_owned()),
+            Self::NoTable => Some(String::new()),
             Self::Names(names) => {
                 let entries: Vec<(&str, &str)> =
                     names.iter().map(|name| (*name, "crates/x")).collect();
-                Some(tables(&[], &entries))
+                Some(tables(&entries))
             }
         }
     }
@@ -1211,10 +658,7 @@ fn crate_names_behaviours() {
         ),
     ];
     for (name, base, entries, packages, expected) in cases {
-        let ws = crate_workspace(
-            packages,
-            &[("architecture-baseline.toml", tables(&[], entries))],
-        );
+        let ws = crate_workspace(packages, &[("architecture-baseline.toml", tables(entries))]);
 
         let found = crate_findings(&load(ws.path(), base.text().as_deref()));
 
@@ -1227,6 +671,7 @@ fn crate_names_behaviours() {
 #[test]
 fn implicit_members() {
     let ws = workspace(&[
+        ("ARCHITECTURE.toml", old_tables_config(ADVISORY)),
         (
             "crates/a/Cargo.toml",
             format!(
@@ -1236,8 +681,8 @@ fn implicit_members() {
             ),
         ),
         ("libs/foo-utils/Cargo.toml", package("pplx-space-foo-utils")),
-        ("libs/foo-utils/src/big.rs", code(LIMIT + 1)),
-        ("libs/foo-utils/src/ok.rs", code(LIMIT)),
+        ("libs/foo-utils/src/big.rs", "old_table\n".to_owned()),
+        ("libs/foo-utils/src/ok.rs", code(1)),
     ]);
 
     let ctx = load(ws.path(), None);
@@ -1369,7 +814,7 @@ fn crate_names_allow() {
             &[("crates/x", package)],
             &[
                 ("ARCHITECTURE.toml", with_crate_names("allow", allow)),
-                ("architecture-baseline.toml", tables(&[], entries)),
+                ("architecture-baseline.toml", tables(entries)),
             ],
         );
 
@@ -1387,7 +832,7 @@ fn crate_names_allow() {
             ),
             (
                 "architecture-baseline.toml",
-                tables(&[], &[(shared, "crates/x")]),
+                tables(&[(shared, "crates/x")]),
             ),
         ],
     );
@@ -1407,7 +852,7 @@ fn crate_names_allow() {
 /// base copy is read leniently.
 #[test]
 fn crate_names_policy_changed() {
-    let base = config(ADVISORY);
+    let base = CRATE_NAMES.to_owned();
     let without_misc = base.replace(", \"misc\"", "");
     let allowing = base.replace(
         "allow = []",
@@ -1473,7 +918,7 @@ fn crate_names_policy_changed() {
         ),
         (
             "a base from before the rule",
-            "[rules.file_size]\nlimit = 5\n",
+            "[rules]\n",
             base.clone(),
             &[(
                 tokens,
@@ -1553,7 +998,8 @@ fn crate_names_policy_changed() {
 #[test]
 fn crate_names_lenient_base_baseline() {
     /// Name, the base's copy, the `crate_names` behaviours found, the
-    /// summary's line, and the exit status.
+    /// summary's line or, for a warning, where and why the copy does not
+    /// parse, and the exit status.
     type Case<'a> = (&'a str, String, &'a [&'a str], Option<&'a str>, i32);
     let listed = "[crate_names]\n\"pplx-space-common-io\" = \"crates/x\"\n";
     let missing = CRATE_NAMES_SKIPPED[0];
@@ -1574,8 +1020,8 @@ fn crate_names_lenient_base_baseline() {
             0,
         ),
         (
-            "a [file_size] that does not parse",
-            format!("[file_size]\n\"x\" = \"9\"\n{listed}"),
+            "a [pattern_ratchet.<instance>] that does not parse",
+            format!("[pattern_ratchet.old]\n\"x\" = \"9\"\n{listed}"),
             &[],
             None,
             0,
@@ -1583,7 +1029,7 @@ fn crate_names_lenient_base_baseline() {
         ("an empty file", String::new(), &[], Some(missing), 0),
         (
             "no [crate_names] table",
-            "[file_size]\n".to_owned(),
+            "[pattern_ratchet.old]\n".to_owned(),
             &[],
             Some(missing),
             0,
@@ -1592,14 +1038,14 @@ fn crate_names_lenient_base_baseline() {
             "[crate_names] is not a table",
             "crate_names = 3\n".to_owned(),
             &["no_new"],
-            Some("at line 1: "),
+            Some("at line 1: invalid type: integer `3`, expected a map"),
             1,
         ),
         (
             "invalid TOML",
-            format!("{listed}[file_size\n"),
+            format!("{listed}[pattern_ratchet\n"),
             &["no_new"],
-            Some("at line 3: "),
+            Some("at line 3: unclosed table, expected `]`"),
             1,
         ),
     ];
@@ -1607,10 +1053,7 @@ fn crate_names_lenient_base_baseline() {
         let ws = crate_workspace(
             &[("crates/x", "pplx-space-common-io")],
             &[
-                (
-                    "architecture-baseline.toml",
-                    format!("[file_size]\n{listed}"),
-                ),
+                ("architecture-baseline.toml", listed.to_owned()),
                 ("base-baseline.toml", base.clone()),
             ],
         );
@@ -1633,32 +1076,30 @@ fn crate_names_lenient_base_baseline() {
             [POLICY_SKIPPED.trim_start_matches("archcheck: ").trim_end()],
             "{name}"
         );
-        let skipped: Vec<String> = skipped(&ctx)
-            .into_iter()
-            .filter(|line| {
-                line.contains("crate_names.no_new")
-                    || matches!(ctx.base_baseline, BaseBaseline::Unusable(_))
-                        && line.starts_with("warning: ")
-            })
+        let every_line = skipped(&ctx);
+        let skipped: Vec<String> = every_line
+            .iter()
+            .filter(|line| line.contains("crate_names.no_new"))
+            .cloned()
             .collect();
         match line {
             None => assert_eq!(skipped, Vec::<String>::new(), "{name}"),
             Some(at) if at.starts_with("at line") => {
-                let path = ws.path().join("base-baseline.toml");
-                let [line] = skipped.as_slice() else {
-                    panic!("{name}: {skipped:?}");
-                };
-                let start = format!("warning: could not parse {} {at}", path.display());
-                // A copy that is not TOML at all gets the one warning for
-                // every comparison skipped; no_new's findings say why.
-                let end = if matches!(ctx.base_baseline, BaseBaseline::Unusable(_)) {
-                    "; file_size.no_new_entries and file_size.no_raised_caps skipped"
-                } else {
-                    "; crate_names.no_new counts every [crate_names] entry as added"
-                };
-                assert!(
-                    line.starts_with(&start) && line.ends_with(end) && !line.contains('\n'),
-                    "{name}: {line}"
+                // A [crate_names] that does not parse or, with no other rule
+                // comparing with it, a copy that is not TOML at all gets
+                // crate_names' own warning.
+                let warning = format!(
+                    "warning: could not parse {} {at}; crate_names.no_new counts every \
+                     [crate_names] entry as added",
+                    ws.path().join("base-baseline.toml").display()
+                );
+                assert_eq!(
+                    every_line,
+                    [
+                        warning.as_str(),
+                        POLICY_SKIPPED.trim_start_matches("archcheck: ").trim_end()
+                    ],
+                    "{name}"
                 );
             }
             Some(line) => assert_eq!(skipped, [*line], "{name}"),
@@ -1688,7 +1129,7 @@ fn crate_names_write_baseline() {
                 ("pplx-space-io-buffers", "crates/y"),
                 ("pplx-space-gone-core", "crates/gone"),
             ],
-            "[file_size]\n[crate_names]\npplx-space-common-io = \"crates/x\"\n\
+            "[crate_names]\npplx-space-common-io = \"crates/x\"\n\
              pplx-space-common-jobs = \"crates/old\"\n",
             &[
                 "not added: pplx-space-foo-utils (crates/libs/foo-utils/Cargo.toml) uses \
@@ -1700,15 +1141,12 @@ fn crate_names_write_baseline() {
         (
             &[("crates/y", "pplx-space-io-buffers")],
             &[("pplx-space-gone-core", "crates/gone")],
-            "[file_size]\n[crate_names]\n",
+            "[crate_names]\n",
             &[],
         ),
     ];
     for (packages, entries, expected, expected_not_added) in rows {
-        let ws = crate_workspace(
-            packages,
-            &[("architecture-baseline.toml", tables(&[], entries))],
-        );
+        let ws = crate_workspace(packages, &[("architecture-baseline.toml", tables(entries))]);
 
         let written = write_baseline(ws.path()).unwrap();
 
@@ -1738,8 +1176,8 @@ fn crate_names_write_baseline() {
 }
 
 /// `--write-baseline=crate_names` updates only `[crate_names]`, and lists no
-/// entries to paste for a crate it did not add; `--write-baseline=file_size`
-/// keeps `[crate_names]` as it is.
+/// entries to paste for a crate it did not add; `--write-baseline=<table>`
+/// for another table keeps `[crate_names]` as it is.
 #[test]
 fn crate_names_scoped_write_baseline() {
     const BASELINE: &str = "architecture-baseline.toml";
@@ -1749,13 +1187,14 @@ fn crate_names_scoped_write_baseline() {
             ("crates/libs/foo-utils", "pplx-space-foo-utils"),
         ],
         &[
+            ("ARCHITECTURE.toml", old_tables_config(ADVISORY)),
             (
                 BASELINE,
-                "[file_size]\n\"crates/a/src/big.rs\" = 9\n\n[crate_names]\n\
+                "[pattern_ratchet.old]\n\"crates/a/src/big.rs\" = 9\n\n[crate_names]\n\
                  pplx-space-common-io = \"crates/x\"\npplx-space-gone-core = \"crates/gone\"\n"
                     .to_owned(),
             ),
-            ("crates/a/src/big.rs", code(LIMIT + 1)),
+            ("crates/a/src/big.rs", "old_table\n".to_owned()),
         ],
     );
 
@@ -1781,7 +1220,7 @@ fn crate_names_scoped_write_baseline() {
     assert_eq!(output.entries, "");
     let after = fs::read_to_string(ws.path().join(BASELINE)).unwrap();
     assert!(
-        after.contains("[file_size]\n\"crates/a/src/big.rs\" = 9\n"),
+        after.contains("[pattern_ratchet.old]\n\"crates/a/src/big.rs\" = 9\n"),
         "{after}"
     );
     assert!(
@@ -1789,20 +1228,20 @@ fn crate_names_scoped_write_baseline() {
         "{after}"
     );
 
-    let wrote = run(ws.path(), &["--write-baseline=file_size"]);
+    let wrote = run(ws.path(), &["--write-baseline=pattern_ratchet.old"]);
 
     assert_eq!(wrote.code, 0, "{}", wrote.stderr);
     let output = write_output(&wrote.stdout);
     assert!(
         output
             .summary
-            .starts_with("archcheck: wrote 1 file_size entries to "),
+            .starts_with("archcheck: wrote 1 pattern_ratchet.old entries to "),
         "{}",
         wrote.stdout
     );
     let kept = fs::read_to_string(ws.path().join(BASELINE)).unwrap();
     assert!(
-        kept.contains("[file_size]\n\"crates/a/src/big.rs\" = 6\n"),
+        kept.contains("[pattern_ratchet.old]\n\"crates/a/src/big.rs\" = 1\n"),
         "{kept}"
     );
     assert!(
@@ -1820,7 +1259,7 @@ fn crate_names_rdjson_and_exit_codes() {
         ("crates/x", "pplx-space-common-io"),
         ("crates/libs/foo-utils", "pplx-space-foo-utils"),
     ];
-    let baseline = "[file_size]\n\n[crate_names]\n# A comment.\n\"pplx-space-common-io\" = \
+    let baseline = "# A comment.\n\n[crate_names]\n# A comment.\n\"pplx-space-common-io\" = \
                     \"crates/x\"\n'pplx-space-gone-utils' = \"crates/gone\"\n";
     let ws = crate_workspace(
         &packages,
@@ -1886,13 +1325,10 @@ fn crate_names_rdjson_and_exit_codes() {
             ("architecture-baseline.toml", baseline.to_owned()),
             (
                 "base.toml",
-                tables(
-                    &[],
-                    &[
-                        ("pplx-space-common-io", "crates/x"),
-                        ("pplx-space-gone-utils", "crates/gone"),
-                    ],
-                ),
+                tables(&[
+                    ("pplx-space-common-io", "crates/x"),
+                    ("pplx-space-gone-utils", "crates/gone"),
+                ]),
             ),
         ],
     );
@@ -1931,7 +1367,7 @@ fn pattern_ratchet_include_scopes_measurement_without_changing_default() {
             rule = rule.replace("patterns =", &format!("include = {include}\npatterns ="));
         }
         let ws = workspace(&[
-            ("ARCHITECTURE.toml", format!("{}{rule}", config(ADVISORY))),
+            ("ARCHITECTURE.toml", format!("{CRATE_NAMES}{rule}")),
             (
                 "architecture-baseline.toml",
                 ratchet_baseline(&[("scoped", &[])]),
@@ -1952,7 +1388,7 @@ fn pattern_ratchet_include_scopes_measurement_without_changing_default() {
 
     let config = format!(
         "{}{}",
-        config(ADVISORY),
+        CRATE_NAMES.to_owned(),
         ratchet(
             "old",
             &[r"\bold_table\b"],
@@ -2116,7 +1552,7 @@ fn dependency_fence() {
                 ("crates/a/Cargo.toml", manifest("a", dependencies)),
                 ("crates/b/Cargo.toml", manifest("b", dependencies)),
                 ("crates/store/Cargo.toml", manifest("store", dependencies)),
-                ("ARCHITECTURE.toml", format!("{}{fence}", config(ADVISORY))),
+                ("ARCHITECTURE.toml", format!("{CRATE_NAMES}{fence}")),
             ],
         );
         let found: Vec<_> = check(&load(ws.path(), None))
@@ -2156,7 +1592,7 @@ fn dependency_fence() {
             "ARCHITECTURE.toml",
             format!(
                 "{}{}",
-                config(ADVISORY),
+                CRATE_NAMES.to_owned(),
                 fence.replace(line, &format!("{key} = []"))
             ),
         )]);
@@ -2181,7 +1617,7 @@ fn dependency_fence() {
             "ARCHITECTURE.toml",
             format!(
                 "{}{}",
-                config(ADVISORY),
+                CRATE_NAMES.to_owned(),
                 matching.replace(line, &format!("{key} = [\"crates/a\", \"crates/store\"]"))
             ),
         )]);
@@ -2196,129 +1632,16 @@ fn dependency_fence() {
     }
 }
 
-/// One finding per behaviour, each reported in its own mode; only required
-/// findings exit 1. Without `--base-baseline`, no_new_entries is skipped and
-/// the summary says so.
-#[test]
-fn modes_and_exit_codes() {
-    let files = |modes: [&str; 5]| {
-        vec![
-            ("ARCHITECTURE.toml", config(modes)),
-            (
-                "architecture-baseline.toml",
-                baseline(&[
-                    ("crates/a/src/added.rs", 6),
-                    ("crates/a/src/gone.rs", 9),
-                    ("crates/a/src/grew.rs", 6),
-                    ("crates/a/src/raised.rs", 7),
-                ]),
-            ),
-            (
-                "base-baseline.toml",
-                baseline(&[
-                    ("crates/a/src/gone.rs", 9),
-                    ("crates/a/src/grew.rs", 6),
-                    ("crates/a/src/raised.rs", 6),
-                ]),
-            ),
-            ("crates/a/src/added.rs", code(6)),
-            ("crates/a/src/grew.rs", code(7)),
-            ("crates/a/src/raised.rs", code(7)),
-            ("crates/b/src/new.rs", code(6)),
-        ]
-    };
-    let cases: &[([&str; 5], i32)] = &[(ADVISORY, 0)];
-    let required = (0..5).map(|index| {
-        let mut modes = ADVISORY;
-        modes[index] = "required";
-        (modes, 1)
-    });
-    let cases: Vec<_> = cases.iter().copied().chain(required).collect();
-    for (modes, expected) in &cases {
-        let ws = workspace(&files(*modes));
-        let base = ws.path().join("base-baseline.toml");
-
-        let run = run(ws.path(), &["--base-baseline", base.to_str().unwrap()]);
-
-        assert_eq!(
-            run.code, *expected,
-            "{modes:?}: {}{}",
-            run.stdout, run.stderr
-        );
-        let headings: Vec<&str> = run
-            .stdout
-            .lines()
-            .filter(|line| line.starts_with("file_size."))
-            .collect();
-        assert_eq!(
-            headings,
-            [
-                format!("file_size.no_crossing ({}):", modes[0]),
-                format!("file_size.no_new_entries ({}):", modes[1]),
-                format!("file_size.no_raised_caps ({}):", modes[2]),
-                format!("file_size.listed_no_growth ({}):", modes[3]),
-                format!("file_size.stale_entries ({}):", modes[4]),
-            ],
-        );
-    }
-
-    let ws = workspace(&files([
-        "advisory", "advisory", "advisory", "required", "advisory",
-    ]));
-    let growth = "crates/a/src/grew.rs grew from 6 to 7 code lines. Split the file before adding \
-                  to it.";
-    assert!(
-        findings(ws.path())
-            .iter()
-            .any(|(_, message)| message == growth)
-    );
-
-    // Without --base-baseline, both are skipped even when required.
-    let ws = workspace(&files([
-        "advisory", "required", "required", "advisory", "advisory",
-    ]));
-    let run_without_base = run(ws.path(), &[]);
-    assert_eq!(run_without_base.code, 0, "{}", run_without_base.stderr);
-    assert!(!run_without_base.stdout.contains("no_new_entries ("));
-    assert!(!run_without_base.stdout.contains("no_raised_caps ("));
-    assert!(run_without_base.stdout.ends_with(SKIPPED));
-
-    let clean = workspace(&[("ARCHITECTURE.toml", config(["required"; 5]))]);
-    let skipped = SKIPPED;
-    let summary = "archcheck: no findings (0 production Rust files checked)\n";
-    let base = clean.path().join("architecture-baseline.toml");
-    let architecture = clean.path().join("ARCHITECTURE.toml");
-    for (args, stdout) in [
-        (vec![], format!("{summary}{skipped}")),
-        (
-            vec!["--base-baseline", base.to_str().unwrap()],
-            format!("{summary}{POLICY_SKIPPED}"),
-        ),
-        (
-            vec![
-                "--base-baseline",
-                base.to_str().unwrap(),
-                "--base-architecture",
-                architecture.to_str().unwrap(),
-            ],
-            summary.to_owned(),
-        ),
-    ] {
-        let run = run(clean.path(), &args);
-        assert_eq!(run.code, 0, "{}", run.stderr);
-        assert_eq!(run.stdout, stdout);
-    }
-}
-
 #[test]
 fn human_report() {
     let ws = workspace(&[
+        ("ARCHITECTURE.toml", old_tables_config(ADVISORY)),
         (
             "architecture-baseline.toml",
-            baseline(&[("crates/a/src/grew.rs", 6)]),
+            ratchet_baseline(&[("old", &[("crates/a/src/grew.rs", 1)])]),
         ),
-        ("crates/a/src/grew.rs", code(7)),
-        ("crates/b/src/new.rs", code(6)),
+        ("crates/a/src/grew.rs", "old_table\nold_log\n".to_owned()),
+        ("crates/b/src/sub/new.rs", "old_table\n".to_owned()),
     ]);
 
     let run = run(ws.path(), &[]);
@@ -2326,56 +1649,19 @@ fn human_report() {
     assert_eq!(run.code, 0, "{}", run.stderr);
     assert_eq!(
         run.stdout,
-        "file_size.no_crossing (advisory):\n  \
-         crates/b/src/new.rs: 6 code lines, over the 5-line limit (comments and blank lines are \
-         not counted). Split it into submodules by responsibility. If the file was renamed, \
-         move its entry in architecture-baseline.toml to the new path; with --renames, \
+        "pattern_ratchet.old.no_crossing (advisory):\n  \
+         crates/b/src/sub/new.rs: 1 code line matches the old patterns, first on line 1, outside \
+         the paths [rules.pattern_ratchet.old] in ARCHITECTURE.toml allows. Move that code \
+         behind an allowed path. If the file was renamed, move its entry in \
+         [pattern_ratchet.old] in architecture-baseline.toml to the new path; with --renames, \
          no_new_entries accepts the moved entry at or below its old cap.\n\
-         file_size.listed_no_growth (advisory):\n  \
-         crates/a/src/grew.rs grew from 6 to 7 code lines. Once this rule is required, split \
-         the file before adding to it.\n\
+         pattern_ratchet.old.listed_no_growth (advisory):\n  \
+         crates/a/src/grew.rs grew from 1 to 2 code lines matching the old patterns. Once this \
+         rule is required, move new matches behind an allowed path.\n\
          \n\
          archcheck: 2 findings (2 advisory, 0 required; 2 production Rust files checked)\n"
             .to_owned()
             + SKIPPED
-    );
-}
-
-/// Limits are written with digit grouping; counts are not.
-#[test]
-fn messages_group_the_limit() {
-    let ws = workspace(&[
-        (
-            "ARCHITECTURE.toml",
-            config(ADVISORY).replace("limit = 5", "limit = 1000"),
-        ),
-        (
-            "architecture-baseline.toml",
-            baseline(&[("crates/a/src/listed.rs", 1002)]),
-        ),
-        ("crates/a/src/listed.rs", code(999)),
-        ("crates/b/src/new.rs", code(1001)),
-    ]);
-
-    assert_eq!(
-        findings(ws.path()),
-        [
-            (
-                "no_crossing",
-                "crates/b/src/new.rs: 1001 code lines, over the 1,000-line limit (comments and \
-                 blank lines are not counted). Split it into submodules by responsibility. If \
-                 the file was renamed, move its entry in architecture-baseline.toml to the new \
-                 path; with --renames, no_new_entries accepts the moved entry at or below its old \
-                 cap."
-                    .to_owned()
-            ),
-            (
-                "stale_entries",
-                "crates/a/src/listed.rs is down to 999 code lines, within the 1,000-line limit. \
-                 Remove it from architecture-baseline.toml."
-                    .to_owned()
-            ),
-        ]
     );
 }
 
@@ -2386,7 +1672,7 @@ fn configuration_errors() {
     const CONFIG: &str = "ARCHITECTURE.toml";
     const BASELINE: &str = "architecture-baseline.toml";
     const MANIFEST: &str = "Cargo.toml";
-    let advisory = config(ADVISORY);
+    let advisory = CRATE_NAMES;
     let text = |value: &str| Some(value.to_owned());
     let members = |member: &str| {
         text(&format!(
@@ -2403,18 +1689,6 @@ fn configuration_errors() {
     let tokens = |list: &str| crate_names("banned_tokens", list);
     let cases: &[(&str, &str, Option<String>, &str)] = &[
         (
-            "unknown behaviour key",
-            CONFIG,
-            Some(format!("{advisory}[rules.file_size.no_crossing.extra]\n")),
-            parse,
-        ),
-        (
-            "unknown rule key",
-            CONFIG,
-            Some(advisory.replace("limit = 5", "limit = 5\nlimt = 5")),
-            parse,
-        ),
-        (
             "unknown rule",
             CONFIG,
             Some(format!("{advisory}[rules.module_names]\n")),
@@ -2424,12 +1698,6 @@ fn configuration_errors() {
             "unknown mode",
             CONFIG,
             Some(advisory.replacen("advisory", "warn", 1)),
-            parse,
-        ),
-        (
-            "missing behaviour",
-            CONFIG,
-            Some(advisory.replace("[rules.file_size.stale_entries]\nmode = \"advisory\"\n", "")),
             parse,
         ),
         (
@@ -2495,7 +1763,7 @@ fn configuration_errors() {
             )),
             "missing field `policy_changed`",
         ),
-        ("unparseable", CONFIG, text("[rules.file_size\n"), parse),
+        ("unparseable", CONFIG, text("[rules.crate_names\n"), parse),
         (
             "bad regex",
             CONFIG,
@@ -2553,13 +1821,7 @@ fn configuration_errors() {
         (
             "unknown baseline section",
             BASELINE,
-            text("[file_size]\n[file_sizes]\n"),
-            parse,
-        ),
-        (
-            "non-integer cap",
-            BASELINE,
-            text("[file_size]\n\"crates/a/src/lib.rs\" = \"9\"\n"),
+            text("[crate_names]\n[crate_name]\n"),
             parse,
         ),
         ("missing baseline", BASELINE, None, "could not read"),
@@ -2567,13 +1829,13 @@ fn configuration_errors() {
         (
             "baseline table for no instance",
             BASELINE,
-            text("[file_size]\n[pattern_ratchet.gone]\n"),
+            text("[pattern_ratchet.gone]\n"),
             "[pattern_ratchet.gone] names no instance in ARCHITECTURE.toml",
         ),
         (
             "non-integer pattern_ratchet cap",
             BASELINE,
-            text("[file_size]\n[pattern_ratchet.old]\n\"crates/a/src/lib.rs\" = \"1\"\n"),
+            text("[pattern_ratchet.old]\n\"crates/a/src/lib.rs\" = \"1\"\n"),
             parse,
         ),
         (
@@ -2624,7 +1886,7 @@ fn configuration_errors() {
     let cases = [
         (
             "ARCHITECTURE.toml",
-            "[rules.file_size\n",
+            "[rules.crate_names\n",
             "could not parse ",
         ),
         (
@@ -2678,101 +1940,6 @@ fn a_rust_file_name_that_is_not_utf8_exits_2() {
     );
 }
 
-/// `--write-baseline` keeps the entries still over the limit at their
-/// current size and removes the rest; a file without an entry is listed, not
-/// added.
-#[test]
-fn write_baseline_output() {
-    type Sizes<'a> = &'a [(&'a str, usize)];
-    let not_added = |path: &str, lines: usize| {
-        format!(
-            "not added: {path} ({lines} code lines); split it, or add an entry by hand if this \
-             is a deliberate exception"
-        )
-    };
-    let cases: &[(Sizes, Sizes, &str, Vec<String>)] = &[
-        (
-            &[
-                ("crates/a/src/grew.rs", LIMIT + 1),
-                ("crates/a/src/shrank.rs", LIMIT + 4),
-                ("crates/a/src/same.rs", LIMIT + 2),
-                ("crates/a/src/fell.rs", LIMIT + 3),
-                ("crates/a/src/gone.rs", LIMIT + 3),
-                ("./crates/a/src/same.rs", LIMIT + 2),
-            ],
-            &[
-                ("crates/a/src/grew.rs", LIMIT + 3),
-                ("crates/a/src/shrank.rs", LIMIT + 1),
-                ("crates/a/src/same.rs", LIMIT + 2),
-                ("crates/a/src/fell.rs", LIMIT),
-                ("crates/b/src/new.rs", LIMIT + 7),
-                ("crates/a/src/ok.rs", LIMIT),
-                ("crates/a/src/tests.rs", LIMIT + 9),
-            ],
-            "[file_size]\n\"crates/a/src/grew.rs\" = 8\n\"crates/a/src/same.rs\" = 7\n\
-             \"crates/a/src/shrank.rs\" = 6\n[crate_names]\n",
-            vec![not_added("crates/b/src/new.rs", 12)],
-        ),
-        (
-            &[],
-            &[("crates/a/src/ok.rs", LIMIT)],
-            "[file_size]\n[crate_names]\n",
-            vec![],
-        ),
-    ];
-    for (entries, sizes, expected, expected_not_added) in cases {
-        let mut files: Vec<(&str, String)> = sizes
-            .iter()
-            .map(|(path, lines)| (*path, code(*lines)))
-            .collect();
-        files.push(("architecture-baseline.toml", baseline(entries)));
-        let ws = workspace(&files);
-
-        let written = write_baseline(ws.path()).unwrap();
-
-        assert_eq!(written.not_added, *expected_not_added);
-        let written = fs::read_to_string(ws.path().join("architecture-baseline.toml")).unwrap();
-        assert!(written.starts_with("# Existing violations"), "{written}");
-        let body: String = written
-            .lines()
-            .filter(|line| !line.starts_with('#') && !line.is_empty())
-            .map(|line| format!("{line}\n"))
-            .collect();
-        assert_eq!(body, *expected);
-        let left: Vec<_> = findings(ws.path())
-            .into_iter()
-            .map(|(behaviour, _)| behaviour)
-            .collect();
-        let expected_left = vec!["no_crossing"; expected_not_added.len()];
-        assert_eq!(left, expected_left);
-    }
-
-    // The old baseline is read, so one that does not parse is left alone.
-    let ws = workspace(&[("architecture-baseline.toml", "not toml".to_owned())]);
-    let error = write_baseline(ws.path()).unwrap_err().to_string();
-    assert!(error.contains("could not parse"), "{error}");
-    let left = fs::read_to_string(ws.path().join("architecture-baseline.toml")).unwrap();
-    assert_eq!(left, "not toml");
-
-    let ws = workspace(&[
-        (
-            "architecture-baseline.toml",
-            baseline(&[("crates/a/src/listed.rs", LIMIT + 1)]),
-        ),
-        ("crates/a/src/listed.rs", code(LIMIT + 2)),
-        ("crates/a/src/big.rs", code(LIMIT + 1)),
-    ]);
-    let run = run(ws.path(), &["--write-baseline"]);
-    assert_eq!(run.code, 0, "{}", run.stderr);
-    let (listed, wrote) = run.stdout.split_once('\n').unwrap();
-    assert_eq!(listed, not_added("crates/a/src/big.rs", 6));
-    assert!(
-        wrote.starts_with("archcheck: wrote 1 file_size, 0 crate_names entries to "),
-        "{}",
-        run.stdout
-    );
-}
-
 /// A `--base-baseline` that cannot be read is an error; one that does not
 /// parse is a warning after the summary, with the comparison skipped.
 #[test]
@@ -2783,20 +1950,20 @@ fn base_baseline_problems() {
         (
             "unparseable",
             "base.toml",
-            Some("[file_size\n"),
+            Some("[pattern_ratchet\n"),
             0,
             "could not parse",
         ),
         (
             "non-integer cap",
             "base.toml",
-            Some("[file_size]\n\"crates/a/src/lib.rs\" = \"9\"\n"),
+            Some("[pattern_ratchet.old]\n\"crates/a/src/lib.rs\" = \"9\"\n"),
             0,
             "could not parse",
         ),
     ];
     for (name, file, contents, code, problem) in cases {
-        let ws = workspace(&[]);
+        let ws = workspace(&[("ARCHITECTURE.toml", old_tables_config(ADVISORY))]);
         let path = ws.path().join(file);
         if let Some(contents) = contents {
             fs::write(&path, contents).unwrap();
@@ -2825,11 +1992,11 @@ fn base_baseline_problems() {
             };
             let warning = summary
                 .lines()
-                .find(|line| line.contains("file_size."))
+                .find(|line| line.contains("pattern_ratchet."))
                 .unwrap_or_default();
             assert!(
                 warning.starts_with(&format!("archcheck: warning: {problem} {path} at line "))
-                    && warning.ends_with("file_size.no_raised_caps skipped"),
+                    && warning.ends_with("pattern_ratchet.old.no_raised_caps skipped"),
                 "{name} {format}: {summary}"
             );
         }
@@ -2837,75 +2004,85 @@ fn base_baseline_problems() {
 }
 
 /// A finding is an `ERROR` in required mode and a `WARNING` in advisory
-/// mode, on line 1 of its file; a new entry, a raised cap, and a stale entry
-/// whose file is gone point at the entry's line in the baseline.
+/// mode, on its file's first matching line; a new entry, a raised cap, and a
+/// stale entry whose file is gone point at the entry's line in the baseline.
 #[test]
 fn rdjson_document() {
     let ws = workspace(&[
         (
             "ARCHITECTURE.toml",
-            config(["required", "advisory", "advisory", "advisory", "advisory"]),
+            old_tables_config(["required", "advisory", "advisory", "advisory", "advisory"]),
         ),
         (
             "architecture-baseline.toml",
-            "# A comment.\n\n[file_size]\n\"crates/a/src/grew.rs\" = 6\n\n\
-             'crates/a/src/gone.rs' = 9\n\"crates/a/src/added.rs\" = 6\n\
-             \"crates/a/src/raised.rs\" = 7\n"
+            "# A comment.\n\n[pattern_ratchet.old]\n\"crates/a/src/grew.rs\" = 1\n\n\
+             'crates/a/src/gone.rs' = 1\n\"crates/a/src/added.rs\" = 1\n\
+             \"crates/a/src/raised.rs\" = 2\n"
                 .to_owned(),
         ),
-        ("crates/a/src/added.rs", code(6)),
-        ("crates/a/src/raised.rs", code(7)),
-        ("crates/a/src/grew.rs", code(7)),
-        ("crates/b/src/new.rs", code(6)),
+        ("crates/a/src/added.rs", "old_table\n".to_owned()),
+        (
+            "crates/a/src/raised.rs",
+            "old_table\nold_table\n".to_owned(),
+        ),
+        ("crates/a/src/grew.rs", "old_table\nold_table\n".to_owned()),
+        ("crates/b/src/sub/new.rs", "old_table\n".to_owned()),
     ]);
     let diagnostic = |message: &str, path: &str, line: u64, severity: &str, behaviour: &str| {
         json!({
             "message": message,
             "location": {"path": path, "range": {"start": {"line": line}}},
             "severity": severity,
-            "code": {"value": format!("file_size.{behaviour}")},
+            "code": {"value": format!("pattern_ratchet.old.{behaviour}")},
         })
     };
 
-    let base = baseline(&[
-        ("crates/a/src/gone.rs", 9),
-        ("crates/a/src/grew.rs", 6),
-        ("crates/a/src/raised.rs", 6),
-    ]);
+    let base = ratchet_baseline(&[(
+        "old",
+        &[
+            ("crates/a/src/gone.rs", 1),
+            ("crates/a/src/grew.rs", 1),
+            ("crates/a/src/raised.rs", 1),
+        ],
+    )]);
     assert_eq!(
         rdjson(ws.path(), Some(&base)),
         json!({
             "source": {"name": "archcheck"},
             "diagnostics": [
                 diagnostic(
-                    "crates/b/src/new.rs: 6 code lines, over the 5-line limit (comments and blank \
-                     lines are not counted). Split it into submodules by responsibility. If the \
-                     file was renamed, move its entry in architecture-baseline.toml to the new \
+                    "crates/b/src/sub/new.rs: 1 code line matches the old patterns, first on line \
+                     1, outside the paths [rules.pattern_ratchet.old] in ARCHITECTURE.toml \
+                     allows. Move that code behind an allowed path. If the file was renamed, move \
+                     its entry in [pattern_ratchet.old] in architecture-baseline.toml to the new \
                      path; with --renames, no_new_entries accepts the moved entry at or below its \
                      old cap.",
-                    "crates/b/src/new.rs", 1, "ERROR", "no_crossing",
+                    "crates/b/src/sub/new.rs", 1, "ERROR", "no_crossing",
                 ),
                 diagnostic(
-                    "crates/a/src/added.rs is in architecture-baseline.toml but not in the base \
-                     branch's copy; files over the 5-line limit can't be added (a renamed file \
-                     counts as added unless --renames pairs it with an old path the base \
-                     branch's copy lists). Split the file instead.",
+                    "crates/a/src/added.rs is in [pattern_ratchet.old] in \
+                     architecture-baseline.toml but not in the base branch's copy; files outside \
+                     the paths [rules.pattern_ratchet.old] in ARCHITECTURE.toml allows can't be \
+                     added (a renamed file counts as added unless --renames pairs it with an old \
+                     path the base branch's copy lists). Move that code behind an allowed path \
+                     instead.",
                     "architecture-baseline.toml", 7, "WARNING", "no_new_entries",
                 ),
                 diagnostic(
-                    "crates/a/src/raised.rs: cap raised from 6 to 7 in architecture-baseline.toml; \
-                     caps should only go down. Split the file instead.",
+                    "crates/a/src/raised.rs: cap raised from 1 to 2 in [pattern_ratchet.old] in \
+                     architecture-baseline.toml; caps should only go down. Move that code behind \
+                     an allowed path instead.",
                     "architecture-baseline.toml", 8, "WARNING", "no_raised_caps",
                 ),
                 diagnostic(
-                    "crates/a/src/grew.rs grew from 6 to 7 code lines. Once this rule is \
-                     required, split the file before adding to it.",
+                    "crates/a/src/grew.rs grew from 1 to 2 code lines matching the old patterns. \
+                     Once this rule is required, move new matches behind an allowed path.",
                     "crates/a/src/grew.rs", 1, "WARNING", "listed_no_growth",
                 ),
                 diagnostic(
-                    "crates/a/src/gone.rs: listed in architecture-baseline.toml but no longer a \
-                     production Rust file. Remove the entry; a renamed file is checked under its \
-                     new path.",
+                    "crates/a/src/gone.rs: listed in [pattern_ratchet.old] in \
+                     architecture-baseline.toml but no longer a production Rust file. Remove the \
+                     entry; a renamed file is checked under its new path.",
                     "architecture-baseline.toml", 6, "WARNING", "stale_entries",
                 ),
             ],
@@ -2927,7 +2104,9 @@ fn rdjson_paths_are_exact() {
         "crates/a/src/tab\t.rs",
         "crates/a/src/new\nline.rs",
     ];
-    let ws = workspace(&names.map(|name| (name, code(LIMIT + 1))));
+    let mut files = names.map(|name| (name, "old_table\n".to_owned())).to_vec();
+    files.push(("ARCHITECTURE.toml", old_tables_config(ADVISORY)));
+    let ws = workspace(&files);
 
     let document = rdjson(ws.path(), None);
 
@@ -2948,9 +2127,9 @@ fn rdjson_on_stdout_and_the_summary_on_stderr() {
     let ws = workspace(&[
         (
             "ARCHITECTURE.toml",
-            config(["required", "advisory", "advisory", "advisory", "advisory"]),
+            old_tables_config(["required", "advisory", "advisory", "advisory", "advisory"]),
         ),
-        ("crates/b/src/new.rs", code(6)),
+        ("crates/b/src/sub/new.rs", "old_table\n".to_owned()),
     ]);
 
     let run = run(ws.path(), &["--format=rdjson"]);
@@ -3080,7 +2259,10 @@ fn output_write_errors_exit_2() {
             .open("/dev/full")
             .expect("open /dev/full")
     };
-    let ws = workspace(&[("crates/b/src/new.rs", code(LIMIT + 1))]);
+    let ws = workspace(&[
+        ("ARCHITECTURE.toml", old_tables_config(ADVISORY)),
+        ("crates/b/src/sub/new.rs", "old_table\n".to_owned()),
+    ]);
     let cases: &[&[&str]] = &[
         &[],
         &["--format", "rdjson"],
@@ -3117,8 +2299,7 @@ fn output_write_errors_exit_2() {
     assert_eq!(status.code(), Some(2));
 }
 
-/// The behaviours of `file_size` and of each `pattern_ratchet` instance, in
-/// reporting order.
+/// The behaviours of each `pattern_ratchet` instance, in reporting order.
 const BEHAVIOURS: [&str; 5] = [
     "no_crossing",
     "no_new_entries",
@@ -3152,14 +2333,13 @@ fn ratchet(instance: &str, patterns: &[&str], allow: &[&str], modes: [&str; 5]) 
     )
 }
 
-/// `ARCHITECTURE.toml` with advisory `file_size` and one instance, `old`,
+/// `ARCHITECTURE.toml` with [`CRATE_NAMES`] and one instance, `old`,
 /// restricting `old_table` and, in any case, `old_log` to
 /// `crates/a/src/allowed.rs`, `crates/a/src/allowed/**` and
 /// `crates/b/src/*.rs`.
 fn old_tables_config(modes: [&str; 5]) -> String {
     format!(
-        "{}{}",
-        config(ADVISORY),
+        "{CRATE_NAMES}{}",
         ratchet(
             "old",
             &[r"\bold_table\b", r"(?i)\bold_log\b"],
@@ -3173,11 +2353,11 @@ fn old_tables_config(modes: [&str; 5]) -> String {
     )
 }
 
-/// An empty `[file_size]` table and one `[pattern_ratchet.<instance>]` table
-/// per entry of `tables`.
-fn ratchet_baseline(tables: &[(&str, &[(&str, usize)])]) -> String {
-    let mut text = baseline(&[]);
-    for (instance, entries) in tables {
+/// An empty `[crate_names]` table and one `[pattern_ratchet.<instance>]`
+/// table per entry of `instances`.
+fn ratchet_baseline(instances: &[(&str, &[(&str, usize)])]) -> String {
+    let mut text = tables(&[]);
+    for (instance, entries) in instances {
         text.push_str(&format!("[pattern_ratchet.{instance}]\n"));
         for (path, cap) in *entries {
             text.push_str(&format!("{path:?} = {cap}\n"));
@@ -3453,6 +2633,15 @@ fn pattern_ratchet_behaviours() {
                 ("stale_entries", "crates/a/src/listed.rs: listed in"),
             ],
         ),
+        (
+            "a key that names no production file",
+            &[("./crates/a/src/listed.rs", 1)],
+            &[(LISTED, "old_table\n")],
+            &[
+                ("no_crossing", "crates/a/src/listed.rs: 1 code line matches"),
+                ("stale_entries", "./crates/a/src/listed.rs: listed in"),
+            ],
+        ),
     ];
     for (name, entries, files, expected) in cases {
         let mut files: Vec<(&str, String)> = files
@@ -3482,7 +2671,8 @@ fn pattern_ratchet_behaviours() {
 
 /// One finding per behaviour, each reported in its own mode; only required
 /// findings exit 1. Against the base branch's copy, gone.rs is a new entry
-/// and grew.rs's cap was raised from 1 to 2.
+/// and grew.rs's cap was raised from 1 to 2. Without `--base-baseline`,
+/// no_new_entries and no_raised_caps are skipped and the summary says so.
 #[test]
 fn pattern_ratchet_modes_and_exit_codes() {
     let files = |modes: [&str; 5]| {
@@ -3546,6 +2736,41 @@ fn pattern_ratchet_modes_and_exit_codes() {
             .iter()
             .any(|(_, message)| message == growth)
     );
+
+    // Without --base-baseline, both are skipped even when required.
+    let ws = workspace(&files([
+        "advisory", "required", "required", "advisory", "advisory",
+    ]));
+    let run_without_base = run(ws.path(), &[]);
+    assert_eq!(run_without_base.code, 0, "{}", run_without_base.stderr);
+    assert!(!run_without_base.stdout.contains("no_new_entries ("));
+    assert!(!run_without_base.stdout.contains("no_raised_caps ("));
+    assert!(run_without_base.stdout.ends_with(SKIPPED));
+
+    let clean = workspace(&[("ARCHITECTURE.toml", old_tables_config(REQUIRED))]);
+    let summary = "archcheck: no findings (0 production Rust files checked)\n";
+    let base = clean.path().join("architecture-baseline.toml");
+    let architecture = clean.path().join("ARCHITECTURE.toml");
+    for (args, stdout) in [
+        (vec![], format!("{summary}{SKIPPED}")),
+        (
+            vec!["--base-baseline", base.to_str().unwrap()],
+            format!("{summary}{POLICY_SKIPPED}"),
+        ),
+        (
+            vec![
+                "--base-baseline",
+                base.to_str().unwrap(),
+                "--base-architecture",
+                architecture.to_str().unwrap(),
+            ],
+            summary.to_owned(),
+        ),
+    ] {
+        let run = run(clean.path(), &args);
+        assert_eq!(run.code, 0, "{}", run.stderr);
+        assert_eq!(run.stdout, stdout);
+    }
 }
 
 /// `no_new_entries` and `no_raised_caps` compare each instance's table with
@@ -3587,6 +2812,16 @@ fn pattern_ratchet_base_baseline() {
             &[],
         ),
         (
+            "an unknown table and key",
+            Some(
+                "version = 2\n[pattern_ratchet.old]\n\"crates/a/src/listed.rs\" = 2\n\
+                 \"crates/a/src/kept.rs\" = 1\n[crate_names]\nx = \"y\"\n",
+            ),
+            &[],
+            &[],
+            &[],
+        ),
+        (
             "a new entry",
             Some("[pattern_ratchet.old]\n\"crates/a/src/kept.rs\" = 1\n"),
             &[new],
@@ -3614,11 +2849,12 @@ fn pattern_ratchet_base_baseline() {
         ),
         (
             "no table for the instance",
-            Some("[file_size]\n"),
+            Some("[crate_names]\n"),
             &[new, new],
             &[],
             &[],
         ),
+        ("an empty file", Some(""), &[new, new], &[], &[]),
         (
             "the instance renamed: the old name's table is ignored",
             Some(
@@ -3648,10 +2884,10 @@ fn pattern_ratchet_base_baseline() {
             &[],
         ),
         (
-            "[file_size] does not parse: only file_size is skipped",
-            Some("[file_size]\n\"x\" = -1\n[pattern_ratchet.old]\n\"crates/a/src/kept.rs\" = 1\n"),
+            "[crate_names] does not parse: only crate_names is skipped",
+            Some("crate_names = 3\n[pattern_ratchet.old]\n\"crates/a/src/kept.rs\" = 1\n"),
             &[new],
-            &[("file_size", "at line 2")],
+            &[],
             &[],
         ),
         (
@@ -3672,15 +2908,14 @@ fn pattern_ratchet_base_baseline() {
             "not TOML",
             Some("[pattern_ratchet\n"),
             &[],
-            // One line for both tables, not one each.
-            &[("file_size, pattern_ratchet.old", "at line 1")],
+            &[("pattern_ratchet.old", "at line 1")],
             &[],
         ),
         (
             "no --base-baseline",
             None,
             &[],
-            &[("file_size", ""), ("pattern_ratchet.old", "")],
+            &[("pattern_ratchet.old", "")],
             &[],
         ),
     ];
@@ -3771,10 +3006,10 @@ fn pattern_ratchet_base_baseline() {
     );
 }
 
-/// `ARCHITECTURE.toml` with advisory `file_size` and instances restricting
+/// `ARCHITECTURE.toml` with [`CRATE_NAMES`] and instances restricting
 /// `<instance>_table`, with no allowed paths.
 fn instances_config(instances: &[&str]) -> String {
-    let mut text = config(ADVISORY);
+    let mut text = CRATE_NAMES.to_owned();
     for instance in instances {
         text.push_str(&ratchet(
             instance,
@@ -3786,66 +3021,244 @@ fn instances_config(instances: &[&str]) -> String {
     text
 }
 
-/// An instance's table gets the same rename handling as `[file_size]`
-/// (see `renames`). The base's `[pattern_ratchet.old]` lists `old.rs` (cap
-/// 2), which became `new.rs`; the baseline lists `new.rs`, at its count.
+/// An entry moved with a file `--renames` says was renamed is compared with
+/// the old path's entry in the base branch's copy: at or below its cap it is
+/// neither new nor raised. Each row changes one thing from the first: the
+/// base's `[pattern_ratchet.old]` lists `old.rs` (cap 8), which became
+/// `new.rs` (8 matching lines), and the baseline lists `new.rs` (cap 8).
 #[test]
 fn pattern_ratchet_renames() {
+    const OLD: &str = "crates/a/src/old.rs";
     const NEW: &str = "crates/b/src/sub/new.rs";
-    const RENAMED: &[u8] = b"R100\0crates/a/src/old.rs\0crates/b/src/sub/new.rs\0";
-    // Name, the text of new.rs, renames and the expected `(behaviour,
-    // message)` of each finding.
-    type Case<'a> = (&'a str, &'a str, &'a [u8], &'a [(&'a str, &'a str)]);
-    let cases: &[Case] = &[
+    const OLD2: &str = "crates/a/src/old2.rs";
+    const NEW2: &str = "crates/b/src/sub/new2.rs";
+    const RENAMED: &[u8] = b"R097\0crates/a/src/old.rs\0crates/b/src/sub/new.rs\0";
+    let crossing = |path: &str, lines: usize, advice: &str| {
+        (
+            "no_crossing",
+            format!(
+                "{path}: {lines} code lines match the old patterns, first on line 1, outside the \
+                 paths [rules.pattern_ratchet.old] in ARCHITECTURE.toml allows. Move that code \
+                 behind an allowed path.{advice}"
+            ),
+        )
+    };
+    let new_entry = |path: &str| {
+        (
+            "no_new_entries",
+            format!(
+                "{path} is in [pattern_ratchet.old] in architecture-baseline.toml but not in the \
+                 base branch's copy; files outside the paths [rules.pattern_ratchet.old] in \
+                 ARCHITECTURE.toml allows can't be added (a renamed file counts as added unless \
+                 --renames pairs it with an old path the base branch's copy lists). Move that \
+                 code behind an allowed path instead."
+            ),
+        )
+    };
+    let raised = |path: &str, renamed: &str, from: usize, to: usize| {
+        (
+            "no_raised_caps",
+            format!(
+                "{path}:{renamed} cap raised from {from} to {to} in [pattern_ratchet.old] in \
+                 architecture-baseline.toml; caps should only go down. Move that code behind an \
+                 allowed path instead."
+            ),
+        )
+    };
+    type Counts<'a> = &'a [(&'a str, usize)];
+    // Name, base entries, entries, matching lines per file, renames and the
+    // expected `(behaviour, message)` of each finding.
+    type Case<'a> = (
+        &'a str,
+        Counts<'a>,
+        Counts<'a>,
+        Counts<'a>,
+        Option<&'a [u8]>,
+        Vec<(&'a str, String)>,
+    );
+    let cases: Vec<Case> = vec![
         (
             "renamed at the same cap",
-            "old_table\nold_log\n",
-            RENAMED,
-            &[],
+            &[(OLD, 8)],
+            &[(NEW, 8)],
+            &[(NEW, 8)],
+            Some(RENAMED),
+            vec![],
+        ),
+        (
+            "renamed with a lower cap",
+            &[(OLD, 8)],
+            &[(NEW, 7)],
+            &[(NEW, 7)],
+            Some(RENAMED),
+            vec![],
         ),
         (
             "renamed with a raised cap",
-            "old_table\nold_log\nold_table\n",
-            RENAMED,
-            &[(
-                "no_raised_caps",
-                "crates/b/src/sub/new.rs: renamed from crates/a/src/old.rs, with cap raised from \
-                 2 to 3 in [pattern_ratchet.old] in architecture-baseline.toml; caps should only \
-                 go down. Move that code behind an allowed path instead.",
-            )],
+            &[(OLD, 8)],
+            &[(NEW, 9)],
+            &[(NEW, 9)],
+            Some(RENAMED),
+            vec![raised(NEW, " renamed from crates/a/src/old.rs, with", 8, 9)],
+        ),
+        (
+            "renamed without --renames",
+            &[(OLD, 8)],
+            &[(NEW, 8)],
+            &[(NEW, 8)],
+            None,
+            vec![new_entry(NEW)],
         ),
         (
             "a deleted file and an unrelated new file",
-            "old_table\nold_log\n",
-            b"D\0crates/a/src/old.rs\0A\0crates/b/src/sub/new.rs\0",
-            &[(
-                "no_new_entries",
-                "crates/b/src/sub/new.rs is in [pattern_ratchet.old] in",
+            &[(OLD, 8)],
+            &[(NEW, 8)],
+            &[(NEW, 8)],
+            Some(b"D\0crates/a/src/old.rs\0A\0crates/b/src/sub/new.rs\0"),
+            vec![new_entry(NEW)],
+        ),
+        (
+            "a copy, not a rename",
+            &[(OLD, 8)],
+            &[(OLD, 8), (NEW, 8)],
+            &[(OLD, 8), (NEW, 8)],
+            Some(b"C100\0crates/a/src/old.rs\0crates/b/src/sub/new.rs\0"),
+            vec![new_entry(NEW)],
+        ),
+        (
+            "renamed from a file the base does not list",
+            &[],
+            &[(NEW, 8)],
+            &[(NEW, 8)],
+            Some(RENAMED),
+            vec![new_entry(NEW)],
+        ),
+        // A path the base lists is compared with its own entry, renamed or
+        // not, as without --renames.
+        (
+            "the base lists the new path too",
+            &[(OLD, 8), (NEW, 5)],
+            &[(NEW, 8)],
+            &[(NEW, 8)],
+            Some(RENAMED),
+            vec![raised(NEW, "", 5, 8)],
+        ),
+        (
+            "renamed, and the entry not moved",
+            &[(OLD, 8)],
+            &[(OLD, 8)],
+            &[(NEW, 8)],
+            Some(RENAMED),
+            vec![
+                crossing(
+                    NEW,
+                    8,
+                    " It was renamed from crates/a/src/old.rs: move that entry in \
+                     [pattern_ratchet.old] in architecture-baseline.toml to the new path, at or \
+                     below crates/a/src/old.rs's cap of 8 in the base branch's copy.",
+                ),
+                (
+                    "stale_entries",
+                    "crates/a/src/old.rs: listed in [pattern_ratchet.old] in \
+                     architecture-baseline.toml but no longer a production Rust file. Remove the \
+                     entry; a renamed file is checked under its new path."
+                        .to_owned(),
+                ),
+            ],
+        ),
+        (
+            "renamed, and the entry removed",
+            &[(OLD, 8)],
+            &[],
+            &[(NEW, 8)],
+            Some(RENAMED),
+            vec![crossing(
+                NEW,
+                8,
+                " It was renamed from crates/a/src/old.rs: give it an entry in \
+                 [pattern_ratchet.old] in architecture-baseline.toml at or below \
+                 crates/a/src/old.rs's cap of 8 in the base branch's copy.",
+            )],
+        ),
+        // The advice names the cap the new entry would be compared with.
+        (
+            "renamed, the entry removed, and the base lists the new path",
+            &[(OLD, 8), (NEW, 5)],
+            &[],
+            &[(NEW, 8)],
+            Some(RENAMED),
+            vec![crossing(
+                NEW,
+                8,
+                " It was renamed from crates/a/src/old.rs: give it an entry in \
+                 [pattern_ratchet.old] in architecture-baseline.toml at or below its cap of 5 in \
+                 the base branch's copy.",
+            )],
+        ),
+        (
+            "renamed from a file neither lists",
+            &[],
+            &[],
+            &[(NEW, 8)],
+            Some(RENAMED),
+            vec![crossing(NEW, 8, "")],
+        ),
+        (
+            "a matching file that was not renamed",
+            &[(OLD, 8)],
+            &[(NEW, 8)],
+            &[(NEW, 8), ("crates/a/src/big.rs", 6)],
+            Some(RENAMED),
+            vec![crossing("crates/a/src/big.rs", 6, "")],
+        ),
+        // Git, not the caps, pairs old paths with new ones.
+        (
+            "two renames",
+            &[(OLD, 8), (OLD2, 6)],
+            &[(NEW, 8), (NEW2, 6)],
+            &[(NEW, 8), (NEW2, 6)],
+            Some(
+                b"R090\0crates/a/src/old.rs\0crates/b/src/sub/new.rs\0\
+                  R080\0crates/a/src/old2.rs\0crates/b/src/sub/new2.rs\0",
+            ),
+            vec![],
+        ),
+        (
+            "two renames, paired the other way",
+            &[(OLD, 8), (OLD2, 6)],
+            &[(NEW, 8), (NEW2, 6)],
+            &[(NEW, 8), (NEW2, 6)],
+            Some(
+                b"R090\0crates/a/src/old.rs\0crates/b/src/sub/new2.rs\0\
+                  R080\0crates/a/src/old2.rs\0crates/b/src/sub/new.rs\0",
+            ),
+            vec![raised(
+                NEW,
+                " renamed from crates/a/src/old2.rs, with",
+                6,
+                8,
             )],
         ),
     ];
-    for (name, text, renames, expected) in cases {
-        let count = text.lines().count();
-        let ws = workspace(&[
-            ("ARCHITECTURE.toml", old_tables_config(ADVISORY)),
-            (
-                "architecture-baseline.toml",
-                ratchet_baseline(&[("old", &[(NEW, count)])]),
-            ),
-            (NEW, (*text).to_owned()),
-        ]);
+    for (name, base, entries, counts, renames, expected) in cases {
+        let mut files: Vec<(&str, String)> = counts
+            .iter()
+            .map(|(path, lines)| (*path, "old_table\n".repeat(*lines)))
+            .collect();
+        files.push(("ARCHITECTURE.toml", old_tables_config(ADVISORY)));
+        files.push((
+            "architecture-baseline.toml",
+            ratchet_baseline(&[("old", entries)]),
+        ));
+        let ws = workspace(&files);
 
         let found = findings_with_renames(
             ws.path(),
-            Some("[pattern_ratchet.old]\n\"crates/a/src/old.rs\" = 2\n"),
-            Some(renames),
+            Some(&ratchet_baseline(&[("old", base)])),
+            renames,
         );
 
-        assert_eq!(found.len(), expected.len(), "{name}: {found:#?}");
-        for ((behaviour, message), (want_behaviour, want_message)) in found.iter().zip(*expected) {
-            assert_eq!(behaviour, want_behaviour, "{name}");
-            assert!(message.starts_with(want_message), "{name}: {message}");
-        }
+        assert_eq!(found, expected, "{name}");
     }
 }
 
@@ -3908,9 +3321,10 @@ fn pattern_ratchet_base_table_that_does_not_parse_skips_only_its_instance() {
     );
 }
 
-/// The skip lines, in order: `file_size`'s, then each configured instance's,
-/// in configuration order, then one per table of an instance that is not
-/// configured, in name order, whatever the order of the base copy.
+/// The skip lines, in order: each configured instance's, in configuration
+/// order, then one per table of an instance that is not configured, in name
+/// order, whatever the order of the base copy. A copy that is not TOML gets
+/// one line naming every rule's and instance's comparisons.
 #[test]
 fn skip_lines_come_in_rule_then_instance_order() {
     let ws = workspace(&[
@@ -3927,8 +3341,7 @@ fn skip_lines_come_in_rule_then_instance_order() {
                 [pattern_ratchet.gamma]\n\"a\" = -2\n\
                 [pattern_ratchet.beta]\n\
                 [pattern_ratchet.delta]\nx = \"y\"\n\
-                [pattern_ratchet.alpha]\n\"a\" = \"1\"\n\
-                [file_size]\n\"x\" = -1\n";
+                [pattern_ratchet.alpha]\n\"a\" = \"1\"\n";
 
     let ctx = load(ws.path(), Some(base));
 
@@ -3943,11 +3356,6 @@ fn skip_lines_come_in_rule_then_instance_order() {
     assert_eq!(
         skipped(&ctx),
         [
-            warning(
-                10,
-                "invalid value: integer `-1`, expected usize",
-                "file_size"
-            ),
             warning(
                 8,
                 "invalid type: string \"1\", expected usize",
@@ -3965,6 +3373,41 @@ fn skip_lines_come_in_rule_then_instance_order() {
             CRATE_NAMES_SKIPPED[1].to_owned(),
         ]
     );
+
+    // A copy that is not TOML at all: one line names every rule's and
+    // instance's comparisons in the same order, and crate_names reports
+    // nothing of its own about the copy.
+    let ws = Layered {
+        tables: &format!(
+            "{}{}",
+            ratchet("alpha", &[r"\balpha_table\b"], &[], ADVISORY),
+            ratchet("beta", &[r"\bbeta_table\b"], &[], ADVISORY),
+        ),
+        ..Layered::default()
+    }
+    .build();
+
+    let ctx = load(ws.path(), Some("[pattern_ratchet\n"));
+
+    assert_eq!(
+        skipped(&ctx),
+        [
+            format!(
+                "warning: could not parse {} at line 1: unclosed table, expected `]`; \
+                 pattern_ratchet.alpha.no_new_entries and pattern_ratchet.alpha.no_raised_caps, \
+                 pattern_ratchet.beta.no_new_entries and pattern_ratchet.beta.no_raised_caps, \
+                 layers.direction.no_new_entries, layers.dev_direction.no_new_entries, \
+                 layers.storage_access.no_new_entries, layers.codec_features.no_new_entries, \
+                 layers.domain_dependencies.no_new_entries and \
+                 layers.model_protocol.no_new_entries skipped",
+                ws.path().join("base-baseline.toml").display()
+            ),
+            CRATE_NAMES_SKIPPED[1].to_owned(),
+            "layers.policy_changed and layers.placement's check for new unmoved entries skipped \
+             (no --base-architecture given)"
+                .to_owned(),
+        ]
+    );
 }
 
 /// Each instance reads only its own patterns, allowed paths, modes and
@@ -3977,7 +3420,7 @@ fn pattern_ratchet_instances_are_independent() {
                 "ARCHITECTURE.toml",
                 format!(
                     "{}{}{}",
-                    config(ADVISORY),
+                    CRATE_NAMES,
                     ratchet("alpha", &[r"\balpha_table\b"], &["crates/a/**"], ADVISORY,),
                     ratchet(
                         "beta",
@@ -4075,10 +3518,11 @@ fn pattern_ratchet_instances_are_independent() {
     );
 }
 
-/// `--write-baseline` updates every existing table of both rules, empty or
-/// not: an entry still matching gets its current count, an entry at zero,
-/// now allowed or whose file is gone is removed, and a matching file without
-/// an entry is listed, not added.
+/// `--write-baseline` updates every existing table, empty or not: an entry
+/// still matching gets its current count, an entry at zero, now allowed or
+/// whose file is gone is removed, as is a `./`-prefixed key that names no
+/// production file, and a matching file without an entry is listed, not
+/// added.
 #[test]
 fn pattern_ratchet_write_baseline() {
     let ws = workspace(&[
@@ -4092,11 +3536,10 @@ fn pattern_ratchet_write_baseline() {
         ),
         (
             "architecture-baseline.toml",
-            "[file_size]\n\"crates/b/src/sub/big.rs\" = 6\n\
-             [pattern_ratchet.old]\n\"crates/a/src/z.rs\" = 1\n\"crates/a/src/one.rs\" = 3\n\
+            "[pattern_ratchet.old]\n\"crates/a/src/z.rs\" = 1\n\"crates/a/src/one.rs\" = 3\n\
              \"crates/a/src/none.rs\" = 1\n\"crates/a/src/allowed.rs\" = 1\n\
              \"crates/a/src/gone.rs\" = 1\n\"crates/b/src/sub/big.rs\" = 2\n\
-             [pattern_ratchet.unused]\n"
+             \"./crates/a/src/one.rs\" = 1\n[pattern_ratchet.unused]\n"
                 .to_owned(),
         ),
         (
@@ -4107,11 +3550,7 @@ fn pattern_ratchet_write_baseline() {
         ("crates/a/src/none.rs", "old_tables\n".to_owned()),
         ("crates/a/src/allowed.rs", "old_table\n".to_owned()),
         ("crates/a/src/tests.rs", "old_table\n".to_owned()),
-        // Over the file_size limit, with matching lines.
-        (
-            "crates/b/src/sub/big.rs",
-            format!("old_table\nold_log\n{}", code(LIMIT)),
-        ),
+        ("crates/b/src/sub/big.rs", "old_table\nold_log\n".to_owned()),
         ("crates/a/src/new.rs", "old_table\nOLD_LOG\n".to_owned()),
     ]);
 
@@ -4128,8 +3567,8 @@ fn pattern_ratchet_write_baseline() {
     );
     assert!(
         output.summary.starts_with(
-            "archcheck: wrote 1 file_size, 3 pattern_ratchet.old, 0 pattern_ratchet.unused, \
-             0 crate_names entries to "
+            "archcheck: wrote 3 pattern_ratchet.old, 0 pattern_ratchet.unused, 0 crate_names \
+             entries to "
         ),
         "{}",
         wrote.stdout
@@ -4149,7 +3588,7 @@ fn pattern_ratchet_write_baseline() {
         .collect();
     assert_eq!(
         body,
-        "[file_size]\n\"crates/b/src/sub/big.rs\" = 7\n[pattern_ratchet.old]\n\
+        "[pattern_ratchet.old]\n\
          \"crates/a/src/one.rs\" = 1\n\"crates/a/src/z.rs\" = 2\n\
          \"crates/b/src/sub/big.rs\" = 2\n[pattern_ratchet.unused]\n[crate_names]\n"
     );
@@ -4157,6 +3596,13 @@ fn pattern_ratchet_write_baseline() {
     let checked = run(ws.path(), &[]);
     assert_eq!(checked.code, 1, "{}{}", checked.stdout, checked.stderr);
     assert_eq!(codes(ws.path()), ["pattern_ratchet.old.no_crossing"]);
+
+    // The old baseline is read, so one that does not parse is left alone.
+    let ws = workspace(&[("architecture-baseline.toml", "not toml".to_owned())]);
+    let error = write_baseline(ws.path()).unwrap_err().to_string();
+    assert!(error.contains("could not parse"), "{error}");
+    let left = fs::read_to_string(ws.path().join("architecture-baseline.toml")).unwrap();
+    assert_eq!(left, "not toml");
 }
 
 /// Neither form of `--write-baseline` creates the table of an instance the
@@ -4165,7 +3611,7 @@ fn pattern_ratchet_write_baseline() {
 #[test]
 fn pattern_ratchet_write_creates_no_table() {
     const BASELINE: &str = "architecture-baseline.toml";
-    let generated = "[file_size]\n[pattern_ratchet.old]\n\"crates/a/src/o.rs\" = 1\n";
+    let generated = "[pattern_ratchet.old]\n\"crates/a/src/o.rs\" = 1\n";
     let hint = "architecture-baseline.toml has no [pattern_ratchet.fresh] table; for a new \
                 instance, add the table and its entries by hand";
     let not_added = [
@@ -4208,7 +3654,7 @@ fn pattern_ratchet_write_creates_no_table() {
             )
         } else {
             format!(
-                "archcheck: wrote 0 file_size, 1 pattern_ratchet.old, 0 crate_names entries to {}",
+                "archcheck: wrote 1 pattern_ratchet.old, 0 crate_names entries to {}",
                 ws.path().join(BASELINE).display()
             )
         };
@@ -4251,7 +3697,7 @@ fn pattern_ratchet_rdjson() {
         ("ARCHITECTURE.toml", old_tables_config(modes)),
         (
             "architecture-baseline.toml",
-            "[file_size]\n\n[pattern_ratchet.old]\n\"crates/a/src/grew.rs\" = 1\n\
+            "# A comment.\n\n[pattern_ratchet.old]\n\"crates/a/src/grew.rs\" = 1\n\
              'crates/a/src/gone.rs' = 3\n\"crates/a/src/shrank.rs\" = 3\n\
              \"crates/a/src/none.rs\" = 1\n"
                 .to_owned(),
@@ -4359,12 +3805,10 @@ fn pattern_ratchet_scoped_write_baseline() {
         ),
         (
             BASELINE,
-            "[file_size]\n\"crates/a/src/big.rs\" = 6\n\
-             [pattern_ratchet.old]\n\"crates/a/src/shrinks.rs\" = 2\n\
+            "[pattern_ratchet.old]\n\"crates/a/src/shrinks.rs\" = 2\n\
              [pattern_ratchet.other]\n\"crates/b/src/sub/o.rs\" = 1\n"
                 .to_owned(),
         ),
-        ("crates/a/src/big.rs", code(LIMIT + 1)),
         ("crates/a/src/shrinks.rs", "old_table\nold_log\n".to_owned()),
         ("crates/b/src/sub/o.rs", "other_table\n".to_owned()),
     ]);
@@ -4373,16 +3817,15 @@ fn pattern_ratchet_scoped_write_baseline() {
     assert_eq!(generated.code, 0, "{}", generated.stderr);
     assert!(
         generated.stdout.starts_with(
-            "archcheck: wrote 1 file_size, 1 pattern_ratchet.old, 1 pattern_ratchet.other, \
-             0 crate_names entries to "
+            "archcheck: wrote 1 pattern_ratchet.old, 1 pattern_ratchet.other, 0 crate_names \
+             entries to "
         ),
         "{}",
         generated.stdout
     );
-    // Every table drifts: big.rs grows past its cap, shrinks.rs loses a
-    // matching line, a new file matches `old`, o.rs gains an `other` line,
-    // and a new file is over the limit.
-    fs::write(ws.path().join("crates/a/src/big.rs"), code(LIMIT + 3)).unwrap();
+    // Both tables drift: shrinks.rs loses a matching line, a new file
+    // matches `old`, o.rs gains an `other` line, and a new file matches
+    // `other`.
     fs::write(ws.path().join("crates/a/src/shrinks.rs"), "old_table\n").unwrap();
     fs::write(ws.path().join("crates/b/src/sub/new.rs"), "old_log\n").unwrap();
     fs::write(
@@ -4390,11 +3833,11 @@ fn pattern_ratchet_scoped_write_baseline() {
         "other_table\nother_table\n",
     )
     .unwrap();
-    fs::write(ws.path().join("crates/a/src/huge.rs"), code(LIMIT + 2)).unwrap();
+    fs::write(ws.path().join("crates/a/src/p.rs"), "other_table\n").unwrap();
     let before = fs::read_to_string(ws.path().join(BASELINE)).unwrap();
     assert_eq!(
-        table_section(&before, "file_size"),
-        "[file_size]\n\"crates/a/src/big.rs\" = 6\n\n"
+        generated_table(&before, "pattern_ratchet.other"),
+        "[pattern_ratchet.other]\n\"crates/b/src/sub/o.rs\" = 1\n"
     );
 
     let wrote = run(ws.path(), &["--write-baseline=pattern_ratchet.old"]);
@@ -4428,76 +3871,76 @@ fn pattern_ratchet_scoped_write_baseline() {
         table_section(&after, "pattern_ratchet.old"),
         "[pattern_ratchet.old]\n\"crates/a/src/shrinks.rs\" = 1\n\n"
     );
-    for kept in ["file_size", "pattern_ratchet.other"] {
-        assert_eq!(table_section(&after, kept), table_section(&before, kept));
-    }
+    assert_eq!(
+        table_section(&after, "pattern_ratchet.other"),
+        table_section(&before, "pattern_ratchet.other")
+    );
     assert_eq!(
         codes(ws.path()),
         [
-            "file_size.no_crossing",
-            "file_size.listed_no_growth",
             "pattern_ratchet.old.no_crossing",
+            "pattern_ratchet.other.no_crossing",
             "pattern_ratchet.other.listed_no_growth"
         ]
     );
 
-    // The other way round, with `old` drifted again: file_size is
-    // updated and both instance tables are kept.
+    // The other way round, with `old` drifted again: `other` is updated
+    // and `old` is kept.
     fs::write(
         ws.path().join("crates/a/src/shrinks.rs"),
         "old_table\nold_log\n",
     )
     .unwrap();
-    let wrote = run(ws.path(), &["--write-baseline=file_size"]);
+    let wrote = run(ws.path(), &["--write-baseline=pattern_ratchet.other"]);
     assert_eq!(wrote.code, 0, "{}", wrote.stderr);
     let output = write_output(&wrote.stdout);
     assert_eq!(
         output.not_added,
         [
-            "not added: crates/a/src/huge.rs (7 code lines); split it, or add an entry by hand if \
-          this is a deliberate exception"
+            "not added: crates/a/src/p.rs (1 code line matching the other patterns); move them \
+          behind an allowed path, or add an entry by hand if this is a deliberate exception"
         ]
     );
     assert!(
         output
             .summary
-            .starts_with("archcheck: wrote 1 file_size entries to "),
+            .starts_with("archcheck: wrote 1 pattern_ratchet.other entries to "),
         "{}",
         wrote.stdout
     );
     assert_eq!(
         output.entries,
-        format!("{}\"crates/a/src/huge.rs\" = 7\n", inside("file_size"))
+        format!(
+            "{}\"crates/a/src/p.rs\" = 1\n",
+            inside("pattern_ratchet.other")
+        )
     );
-    let after_file_size = fs::read_to_string(ws.path().join(BASELINE)).unwrap();
+    let after_other = fs::read_to_string(ws.path().join(BASELINE)).unwrap();
     assert_eq!(
-        table_section(&after_file_size, "file_size"),
-        "[file_size]\n\"crates/a/src/big.rs\" = 8\n\n"
+        generated_table(&after_other, "pattern_ratchet.other"),
+        "[pattern_ratchet.other]\n\"crates/b/src/sub/o.rs\" = 2\n"
     );
-    for kept in ["pattern_ratchet.old", "pattern_ratchet.other"] {
-        assert_eq!(
-            table_section(&after_file_size, kept),
-            table_section(&after, kept)
-        );
-    }
+    assert_eq!(
+        table_section(&after_other, "pattern_ratchet.old"),
+        table_section(&after, "pattern_ratchet.old")
+    );
     assert_eq!(
         codes(ws.path()),
         [
-            "file_size.no_crossing",
             "pattern_ratchet.old.no_crossing",
             "pattern_ratchet.old.listed_no_growth",
-            "pattern_ratchet.other.listed_no_growth"
+            "pattern_ratchet.other.no_crossing"
         ]
     );
 
     // An unknown table, or a baseline that does not parse, exits 2 and
     // leaves the file alone.
-    for table in ["pattern_ratchet.nope", "file_sizes", "pattern_ratchet", ""] {
+    for table in ["pattern_ratchet.nope", "crate_name", "pattern_ratchet", ""] {
         let failed = run(ws.path(), &[&format!("--write-baseline={table}")]);
         assert_eq!(failed.code, 2, "{table}: {}", failed.stdout);
         assert!(
             failed.stderr.starts_with(&format!(
-                "archcheck: error: no baseline table {table:?}; expected one of: file_size, \
+                "archcheck: error: no baseline table {table:?}; expected one of: \
                  pattern_ratchet.old, pattern_ratchet.other"
             )),
             "{table}: {}",
@@ -4505,11 +3948,11 @@ fn pattern_ratchet_scoped_write_baseline() {
         );
         assert_eq!(
             fs::read_to_string(ws.path().join(BASELINE)).unwrap(),
-            after_file_size
+            after_other
         );
     }
     fs::write(ws.path().join(BASELINE), "not toml").unwrap();
-    let failed = run(ws.path(), &["--write-baseline=file_size"]);
+    let failed = run(ws.path(), &["--write-baseline=pattern_ratchet.old"]);
     assert_eq!(failed.code, 2, "{}", failed.stdout);
     assert!(
         failed.stderr.contains("could not parse"),
@@ -4540,7 +3983,7 @@ fn pattern_ratchet_scoped_write_keeps_an_empty_table() {
         ),
         (
             BASELINE,
-            "[file_size]\n[pattern_ratchet.old]\n[pattern_ratchet.other]\n".to_owned(),
+            "[pattern_ratchet.old]\n[pattern_ratchet.other]\n".to_owned(),
         ),
         ("crates/a/src/n.rs", "old_table\n".to_owned()),
     ]);
@@ -4604,20 +4047,21 @@ fn write_baseline_entries_paste_into_their_tables() {
         (
             "ARCHITECTURE.toml",
             format!(
-                "{}{}{}",
+                "{}{}{}{}",
                 old_tables_config(REQUIRED),
+                ratchet("first", &[r"\bfirst_table\b"], &[], REQUIRED),
                 ratchet("fresh", &[r"\bfresh_table\b"], &[], REQUIRED),
                 ratchet("zz", &[r"\bzz_table\b"], &[], REQUIRED),
             ),
         ),
         (
             BASELINE,
-            "[file_size]\n\"crates/a/src/big.rs\" = 6\n[pattern_ratchet.old]\n\
+            "[pattern_ratchet.first]\n\"crates/a/src/big.rs\" = 1\n[pattern_ratchet.old]\n\
              \"crates/a/src/o.rs\" = 1\n[pattern_ratchet.zz]\n\"crates/a/src/z.rs\" = 1\n"
                 .to_owned(),
         ),
-        ("crates/a/src/big.rs", code(6)),
-        ("crates/a/src/huge.rs", code(7)),
+        ("crates/a/src/big.rs", "first_table\n".to_owned()),
+        ("crates/a/src/huge.rs", "first_table\n".to_owned()),
         ("crates/a/src/o.rs", "old_table\n".to_owned()),
         ("crates/a/src/n.rs", "old_table\n".to_owned()),
         ("crates/a/src/z.rs", "zz_table\n".to_owned()),
@@ -4632,11 +4076,11 @@ fn write_baseline_entries_paste_into_their_tables() {
     assert_eq!(
         output.entries,
         format!(
-            "{}\"crates/a/src/huge.rs\" = 7\n\
+            "{}\"crates/a/src/huge.rs\" = 1\n\
              # add as a new table, header included, at the end of the file\n\
              [pattern_ratchet.fresh]\n\"crates/a/src/f.rs\" = 1\n\
              {}\"crates/a/src/n.rs\" = 1\n",
-            inside("file_size"),
+            inside("pattern_ratchet.first"),
             inside("pattern_ratchet.old"),
         )
     );
@@ -4644,7 +4088,7 @@ fn write_baseline_entries_paste_into_their_tables() {
     assert_eq!(
         codes(ws.path()),
         [
-            "file_size.no_crossing",
+            "pattern_ratchet.first.no_crossing",
             "pattern_ratchet.fresh.no_crossing",
             "pattern_ratchet.old.no_crossing"
         ]
@@ -4660,7 +4104,7 @@ fn write_baseline_entries_paste_into_their_tables() {
     assert_eq!(
         pasted.table_names(),
         [
-            "file_size",
+            "pattern_ratchet.first",
             "pattern_ratchet.fresh",
             "pattern_ratchet.old",
             "pattern_ratchet.zz",
@@ -4683,13 +4127,12 @@ fn write_baseline_entries_paste_into_their_tables() {
 #[test]
 fn pattern_ratchet_write_baseline_errors() {
     const BASELINE: &str = "architecture-baseline.toml";
-    let stale = "[file_size]\n[pattern_ratchet.foo]\n\"crates/a/src/x.rs\" = 1\n";
+    let stale = "[pattern_ratchet.foo]\n\"crates/a/src/x.rs\" = 1\n";
     let ws = workspace(&[
         (
             "ARCHITECTURE.toml",
             format!(
-                "{}{}",
-                config(ADVISORY),
+                "{CRATE_NAMES}{}",
                 ratchet("bar", &[r"\bold_table\b"], &[], ADVISORY,),
             ),
         ),
@@ -4752,7 +4195,7 @@ fn write_baseline_takes_a_table_only_after_equals() {
         }
     };
 
-    for table in ["file_size", "pattern_ratchet.old"] {
+    for table in ["crate_names", "pattern_ratchet.old"] {
         let before = fs::read_to_string(&baseline).unwrap();
         let failed = run(ws.path(), &["--write-baseline", table]);
         assert_eq!(failed.code, 2, "{table}: {}", failed.stdout);
@@ -4768,7 +4211,7 @@ fn write_baseline_takes_a_table_only_after_equals() {
         assert_eq!(fs::read_to_string(&baseline).unwrap(), before, "{table}");
     }
     let before = fs::read_to_string(&baseline).unwrap();
-    let failed = run(ws.path(), &["--write-baseline=file_size", "extra"]);
+    let failed = run(ws.path(), &["--write-baseline=crate_names", "extra"]);
     assert_eq!(failed.code, 2, "{}", failed.stdout);
     assert!(
         failed
@@ -4797,7 +4240,7 @@ fn write_baseline_takes_a_table_only_after_equals() {
         assert_eq!(run.code, 0, "{}", run.stderr);
         assert!(
             run.stdout
-                .starts_with("archcheck: wrote 0 file_size, 0 crate_names entries to ")
+                .starts_with("archcheck: wrote 0 crate_names entries to ")
                 && !run.stdout.contains("other tables kept"),
             "{}",
             run.stdout
@@ -4819,7 +4262,7 @@ fn pattern_ratchet_without_a_baseline_table() {
             ratchet_findings(ws.path())
         };
 
-        let without_table = found(baseline(&[]));
+        let without_table = found(tables(&[]));
 
         assert_eq!(
             without_table.len(),
@@ -4854,8 +4297,7 @@ fn pattern_ratchet_instance_names() {
         let ws = workspace(&[(
             "ARCHITECTURE.toml",
             format!(
-                "{}{}",
-                config(ADVISORY),
+                "{CRATE_NAMES}{}",
                 ratchet(&format!("{name:?}"), &["x"], &[], ADVISORY,),
             ),
         )]);
@@ -4895,11 +4337,7 @@ fn pattern_ratchet_errors_point_at_the_line() {
         ),
     ];
     for (patterns, allow, key, problem) in cases {
-        let text = format!(
-            "{}{}",
-            config(ADVISORY),
-            ratchet("old", patterns, allow, ADVISORY),
-        );
+        let text = format!("{CRATE_NAMES}{}", ratchet("old", patterns, allow, ADVISORY));
         // The last: [rules.crate_names], before the instance, has an allow too.
         let lines: Vec<&str> = text.lines().collect();
         let line = 1 + lines
@@ -4969,12 +4407,12 @@ const LAYERED: [(&str, &str); 12] = [
 /// one.
 const STORAGE: &str = "[rules.layers.storage]\ndrivers = [\"redis\", \"sqlx\"]\n";
 
-/// [`config`] with file_size's behaviours advisory, followed by
-/// `[rules.layers]`: its `tables` (`unmoved`, `store_users`,
-/// `allowed_edges` and `storage`, as TOML; [`STORAGE`] without `storage`)
-/// and every check in `mode`, except `policy_changed`, which is advisory.
+/// [`CRATE_NAMES`], followed by `[rules.layers]`: its `tables` (`unmoved`,
+/// `store_users`, `allowed_edges` and `storage`, as TOML; [`STORAGE`] without
+/// `storage`) and every check in `mode`, except `policy_changed`, which is
+/// advisory.
 fn layers_config(tables: &str, mode: &str) -> String {
-    let mut text = format!("{}{tables}", config(ADVISORY));
+    let mut text = format!("{CRATE_NAMES}{tables}");
     if !tables.contains("[rules.layers.storage]") {
         text.push_str(STORAGE);
     }
@@ -4989,8 +4427,8 @@ fn layers_config(tables: &str, mode: &str) -> String {
     text
 }
 
-/// A baseline with an empty `[file_size]`, the two layers tables with these
-/// edges as `(from, to)`, and an empty `[crate_names]`.
+/// A baseline with the two layers tables with these edges as `(from, to)`,
+/// and an empty `[crate_names]`.
 fn layers_baseline(direction: &[(&str, &str)], dev_direction: &[(&str, &str)]) -> String {
     let table = |name: &str, edges: &[(&str, &str)]| {
         let mut text = format!("[layers.{name}]\n");
@@ -5000,7 +4438,7 @@ fn layers_baseline(direction: &[(&str, &str)], dev_direction: &[(&str, &str)]) -
         text
     };
     format!(
-        "[file_size]\n{}{}[crate_names]\n",
+        "{}{}[crate_names]\n",
         table("dev_direction", dev_direction),
         table("direction", direction)
     )
@@ -5202,7 +4640,7 @@ fn layers_placement() {
             )],
         ),
         ("a base with the entry", architecture.clone(), &[]),
-        ("a base without the rule", config(ADVISORY), &[]),
+        ("a base without the rule", CRATE_NAMES.to_owned(), &[]),
     ];
     let ws = Layered {
         extra: &OLD,
@@ -5565,15 +5003,15 @@ fn layers_baselined_checks() {
     const FD: (&str, &str) = ("pplx-space-f", "pplx-space-d");
     const CROSSING: [(&str, &str, &str); 1] = [("pplx-space-f", "dependencies", "pplx-space-d")];
     let with_rule = layers_config("", "required");
-    let without_rule = config(ADVISORY);
+    let without_rule = CRATE_NAMES.to_owned();
     // Another schema of the rule, as a pull request that changes it sees the
     // base's: the rule is there, so it does not seed the tables.
     let other_shape = format!("{without_rule}[rules.layers]\nunmoved = 5\n");
-    let no_tables = baseline(&[]);
+    let no_tables = tables(&[]);
     let empty_tables = layers_baseline(&[], &[]);
-    let dev_only = "[file_size]\n[layers.dev_direction]\n[crate_names]\n".to_owned();
+    let dev_only = "[layers.dev_direction]\n[crate_names]\n".to_owned();
     let listed = layers_baseline(&[FD], &[]);
-    let entry_line = "architecture-baseline.toml:4";
+    let entry_line = "architecture-baseline.toml:3";
     let new = "pplx-space-f -> pplx-space-d: is in [layers.direction] in architecture-baseline.toml \
                but not in the base branch's copy, and layer violations can't be added to the \
                baseline.";
@@ -5883,7 +5321,7 @@ fn layers_edge_checks() {
                      pplx-space-a duplicates a normal or build one, which [layers.direction] \
                      covers.";
     let listed = [("pplx-space-s-store", "pplx-space-a")];
-    let dev_entry = "architecture-baseline.toml:3";
+    let dev_entry = "architecture-baseline.toml:2";
     let cases: &[Case] = &[
         (
             "Storage dev to API",
@@ -6194,7 +5632,7 @@ fn layers_policy_changed() {
         ("unchanged", required.clone(), required.clone(), &[]),
         (
             "the whole table new",
-            config(ADVISORY),
+            CRATE_NAMES.to_owned(),
             required.clone(),
             &[(
                 "[rules.layers.storage]",
@@ -6467,11 +5905,8 @@ fn layers_policy_changed() {
     // Removing the whole table is advisory, on the file's first line.
     let ws = Layered {
         files: vec![
-            ("ARCHITECTURE.toml", config(ADVISORY)),
-            (
-                "architecture-baseline.toml",
-                "[file_size]\n[crate_names]\n".to_owned(),
-            ),
+            ("ARCHITECTURE.toml", CRATE_NAMES.to_owned()),
+            ("architecture-baseline.toml", tables(&[])),
         ],
         ..Layered::default()
     }
@@ -6493,7 +5928,7 @@ fn layers_policy_changed() {
     );
     assert!(!found[0].mode.is_required());
     // Without the base, or against one without the rule, nothing is said.
-    for base in [None, Some(config(ADVISORY))] {
+    for base in [None, Some(CRATE_NAMES.to_owned())] {
         let ctx = load_with(ws.path(), None, base.as_deref());
         assert!(
             !check(&ctx).iter().any(|finding| finding.rule == "layers"),
@@ -6506,7 +5941,7 @@ fn layers_policy_changed() {
     }
     // Against a base whose [rules.layers] can't be read, no finding says
     // whether the rule was removed, and a skip line says so.
-    let base = format!("{}[rules.layers]\nunmoved = 5\n", config(ADVISORY));
+    let base = format!("{CRATE_NAMES}[rules.layers]\nunmoved = 5\n");
     let ctx = load_with(ws.path(), None, Some(&base));
     assert!(!check(&ctx).iter().any(|finding| finding.rule == "layers"));
     let skips: Vec<String> = skipped(&ctx)
@@ -6525,7 +5960,7 @@ fn layers_policy_changed() {
     let ws = Layered::default().build();
     let base = format!(
         "{}[rules.layers]\nunmoved = 5\n",
-        config(ADVISORY).replace(", \"misc\"", "")
+        CRATE_NAMES.replace(", \"misc\"", "")
     );
     let ctx = load_with(ws.path(), None, Some(&base));
     let codes: Vec<String> = check(&ctx)
@@ -6640,14 +6075,13 @@ fn layers_configuration_errors() {
         (
             "a baseline table without the rule",
             "ARCHITECTURE.toml",
-            config(ADVISORY),
+            CRATE_NAMES.to_owned(),
             unknown_table,
         ),
         (
             "a baseline table of edges that is not a list",
             "architecture-baseline.toml",
-            "[file_size]\n[layers.direction]\npplx-space-f = \"pplx-space-d\"\n[crate_names]\n"
-                .to_owned(),
+            "[layers.direction]\npplx-space-f = \"pplx-space-d\"\n[crate_names]\n".to_owned(),
             "could not parse",
         ),
     ];
@@ -6697,10 +6131,9 @@ fn layers_write_baseline() {
         ("pplx-space-s-store", "dependencies", "pplx-space-a"),
         ("pplx-space-s-store", "dev-dependencies", "pplx-space-p"),
     ];
-    let hand_written = "[file_size]\n\"crates/gone.rs\" = 9\n\
-                        [layers.direction]\n\"pplx-space-f\" = [\"pplx-space-d\", \
+    let hand_written = "[layers.direction]\n\"pplx-space-f\" = [\"pplx-space-d\", \
                         \"pplx-space-g\"]\npplx-space-gone = [\"pplx-space-d\"]\n\
-                        [crate_names]\n";
+                        [crate_names]\npplx-space-gone-core = \"crates/gone\"\n";
     let ws = Layered {
         dependencies: &dependencies,
         files: vec![(BASELINE, hand_written.to_owned())],
@@ -6708,8 +6141,8 @@ fn layers_write_baseline() {
     }
     .build();
 
-    // Scoped: only [layers.direction] changes, and the stale file_size entry
-    // stays; the table the file lacks is not created.
+    // Scoped: only [layers.direction] changes, and the stale [crate_names]
+    // entry stays; the table the file lacks is not created.
     let scoped = run(ws.path(), &["--write-baseline=layers.direction"]);
     assert_eq!(scoped.code, 0, "{}", scoped.stderr);
     assert_eq!(
@@ -6737,7 +6170,10 @@ fn layers_write_baseline() {
         scoped.stdout
     );
     let text = fs::read_to_string(ws.path().join(BASELINE)).unwrap();
-    assert!(text.contains("\"crates/gone.rs\" = 9"), "{text}");
+    assert!(
+        text.contains("pplx-space-gone-core = \"crates/gone\""),
+        "{text}"
+    );
     assert_eq!(
         generated_table(&text, "layers.direction"),
         "[layers.direction]\npplx-space-f = [\n  \"pplx-space-d\",\n]\n",
@@ -6779,7 +6215,7 @@ fn layers_write_baseline() {
         all.stdout
     );
     let generated = fs::read_to_string(ws.path().join(BASELINE)).unwrap();
-    assert!(!generated.contains("crates/gone.rs"), "{generated}");
+    assert!(!generated.contains("pplx-space-gone-core"), "{generated}");
     assert_eq!(
         generated_table(&generated, "layers.dev_direction"),
         "[layers.dev_direction]\n",
@@ -6793,8 +6229,7 @@ fn layers_write_baseline() {
     );
     let layers_at = generated.find("[layers.dev_direction]").unwrap();
     assert!(
-        generated.find("[file_size]").unwrap() < layers_at
-            && layers_at < generated.find("[crate_names]").unwrap(),
+        layers_at < generated.find("[crate_names]").unwrap(),
         "{generated}"
     );
 
@@ -6825,7 +6260,7 @@ fn layers_write_baseline() {
 
     // A scoped write creates its table when the baseline lacks it, and only
     // that one.
-    fs::write(ws.path().join(BASELINE), "[file_size]\n[crate_names]\n").unwrap();
+    fs::write(ws.path().join(BASELINE), "[crate_names]\n").unwrap();
     let created = run(ws.path(), &["--write-baseline=layers.direction"]);
     assert_eq!(created.code, 0, "{}", created.stderr);
     let text = fs::read_to_string(ws.path().join(BASELINE)).unwrap();
@@ -6911,10 +6346,10 @@ fn layers_rdjson_and_exit_codes() {
                 layers_baseline(&[("pplx-space-f", "pplx-space-d")], &[]),
             ),
             ("base-architecture.toml", layers_config("", "required")),
-            ("not-toml.toml", "[file_size\n".to_owned()),
+            ("not-toml.toml", "[layers\n".to_owned()),
             (
                 "layers-not-a-table.toml",
-                "layers = 5\n[file_size]\n".to_owned(),
+                "layers = 5\n[crate_names]\n".to_owned(),
             ),
         ],
         ..Layered::default()
@@ -6960,8 +6395,7 @@ fn layers_rdjson_and_exit_codes() {
             "archcheck: warning: could not parse {} at line 1: ",
             path("not-toml.toml")
         )) && warnings[0].ends_with(
-            "file_size.no_new_entries and file_size.no_raised_caps, \
-             layers.direction.no_new_entries, layers.dev_direction.no_new_entries, \
+            "layers.direction.no_new_entries, layers.dev_direction.no_new_entries, \
              layers.storage_access.no_new_entries, layers.codec_features.no_new_entries, \
              layers.domain_dependencies.no_new_entries and \
              layers.model_protocol.no_new_entries skipped"
@@ -8619,16 +8053,15 @@ const CATALOGS: [(&str, &str); 6] = [
 const S_STORE: &str = "crates/l30_storage/s/store/Cargo.toml";
 const T_STORE: &str = "crates/l30_storage/t/store/Cargo.toml";
 
-/// A baseline with an empty `[file_size]`, these `(namespace, table)`
-/// entries in `[layers.unowned]`, each table on its own line from line 6,
+/// A baseline with these `(namespace, table)` entries in `[layers.unowned]`,
+/// each table on its own line from line 5,
 /// the other layers tables empty, and an empty `[crate_names]`.
 fn state_baseline(unowned: &[(&str, &str)]) -> String {
     let mut namespaces: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for (namespace, table) in unowned {
         namespaces.entry(namespace).or_default().push(table);
     }
-    let mut text =
-        "[file_size]\n[layers.dev_direction]\n[layers.direction]\n[layers.unowned]\n".to_owned();
+    let mut text = "[layers.dev_direction]\n[layers.direction]\n[layers.unowned]\n".to_owned();
     for (namespace, tables) in namespaces {
         text.push_str(&format!("{namespace:?} = [\n"));
         for table in tables {
@@ -9287,8 +8720,8 @@ fn layers_unowned_baseline() {
                base branch's copy, and a table can't be added to it.";
     let seeds = "postgres.b: is in [layers.unowned] in architecture-baseline.toml, and the base \
                  branch has no state checks yet, so this pull request seeds the table.";
-    let at_b = "architecture-baseline.toml:6";
-    let at_jobs = "architecture-baseline.toml:9";
+    let at_b = "architecture-baseline.toml:5";
+    let at_jobs = "architecture-baseline.toml:8";
     /// Name, base baseline, base architecture, and `(code, start of
     /// message, location, required)` of each finding.
     type Case<'a> = (
@@ -9344,7 +8777,7 @@ fn layers_unowned_baseline() {
         ),
         (
             "a base without any layers table",
-            Some("[file_size]\n"),
+            Some("[crate_names]\n"),
             None,
             vec![
                 ("layers.unowned.no_new_entries", seeds, at_b, false),
@@ -9409,7 +8842,7 @@ fn layers_unowned_baseline() {
             "sqlite.nope is no database; the namespaces are postgres, sqlite.svc",
         ),
     ];
-    let lines = ["6", "8", "11"].map(|line| format!("architecture-baseline.toml:{line}"));
+    let lines = ["5", "7", "10"].map(|line| format!("architecture-baseline.toml:{line}"));
     let expected: Vec<(&str, &str, &str)> = expected
         .iter()
         .zip(&lines)
