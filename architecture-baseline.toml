@@ -186,9 +186,45 @@
 # database migrator takes them from the store.
 [pattern_ratchet.sbxmgr_sqlite_schema]
 
-# [layers.<check>] maps each workspace package to the workspace packages it
-# depends on against the layers rule's <check>. Only remove entries: a pull
-# request that adds one is reported.
+# [layers.<check>] maps each workspace package to what it depends on against
+# the layers rule's <check>: workspace packages, drivers and storage helpers,
+# or, for codec_features, the <package>/<feature> it enables. Only remove
+# entries: a pull request that adds one is reported.
+[layers.codec_features]
+pplx-space-api = [
+  "pplx-space-common-core/sqlx",
+]
+pplx-space-cluster-controller-server = [
+  "pplx-space-common-core/sqlx",
+]
+pplx-space-common-core = [
+  "pplx-space-accounts/rusqlite",
+  "pplx-space-accounts/sqlx",
+  "pplx-space-k8s-ids/sqlx",
+  "pplx-space-semver/sqlx",
+]
+pplx-space-common-svc = [
+  "pplx-space-common-core/sqlx",
+]
+pplx-space-credmgr = [
+  "pplx-space-common-core/sqlx",
+]
+pplx-space-internal-api-server = [
+  "pplx-space-common-core/sqlx",
+]
+pplx-space-node-runtime-manager = [
+  "pplx-space-common-core/rusqlite",
+]
+pplx-space-runtime-manager-svc = [
+  "pplx-space-node-runtime-manager/s3",
+]
+pplx-space-snapshot-retention = [
+  "pplx-space-common-core/sqlx",
+]
+pplx-space-volmgr = [
+  "pplx-space-common-core/rusqlite",
+]
+
 [layers.dev_direction]
 pplx-space-sbx-mgr-store = [
   "pplx-space-node-runtime-core",
@@ -227,6 +263,88 @@ pplx-space-observability = [
 ]
 pplx-space-uds-peer-auth = [
   "pplx-space-common-core",
+]
+
+[layers.storage_access]
+pplx-space-accounts = [
+  "rusqlite",
+  "sqlx",
+]
+pplx-space-api = [
+  "deadpool-redis",
+  "redis",
+  "sqlx",
+]
+pplx-space-build-mgr = [
+  "pplx-space-object-store",
+]
+pplx-space-build-mgr-server = [
+  "pplx-space-common-jobs",
+  "rusqlite",
+]
+pplx-space-cluster-controller-server = [
+  "sqlx",
+]
+pplx-space-cluster-reconciler = [
+  "sqlx",
+]
+pplx-space-common-core = [
+  "rusqlite",
+  "sqlx",
+]
+pplx-space-common-svc = [
+  "pplx-space-postgres-contention",
+  "pplx-space-valkey",
+  "sqlx",
+]
+pplx-space-credmgr = [
+  "sqlx",
+]
+pplx-space-internal-api-server = [
+  "sqlx",
+]
+pplx-space-node-ctl-server = [
+  "pplx-space-sqlite",
+  "rusqlite",
+  "sqlx",
+]
+pplx-space-node-mgr = [
+  "pplx-space-sqlite",
+  "rusqlite",
+  "sqlx",
+]
+pplx-space-node-runtime-manager = [
+  "aws-sdk-s3",
+  "pplx-space-common-jobs",
+  "pplx-space-s3-http-client",
+  "pplx-space-sqlite",
+  "rusqlite",
+  "sqlx",
+]
+pplx-space-sbx-mgr = [
+  "pplx-space-common-jobs",
+]
+pplx-space-snapshot-retention = [
+  "sqlx",
+]
+pplx-space-state-reconciliation = [
+  "sqlx",
+]
+pplx-space-template-mgr = [
+  "pplx-space-common-jobs",
+  "pplx-space-sqlite",
+  "rusqlite",
+  "sqlx",
+]
+pplx-space-template-publisher = [
+  "pplx-space-object-store",
+]
+pplx-space-volmgr = [
+  "pplx-space-common-jobs",
+  "pplx-space-object-store",
+  "pplx-space-sqlite",
+  "rusqlite",
+  "sqlx",
 ]
 
 # [crate_names] maps each workspace package with a catch-all name (a part such

@@ -2,7 +2,13 @@
 //! whole workspaces: the layer matrix, paths below a layer directory, the
 //! items a finding names, and the lenient reading of `[rules.layers]`.
 
-use super::graph::{Problem, layer_dir, list, may_depend, name_segments, use_tree, used_items};
+use std::collections::BTreeMap;
+
+use super::{
+    and_list,
+    graph::{Member, Problem, layer_dir, list, may_depend, name_segments, use_tree, used_items},
+    storage::features_of,
+};
 use crate::{
     config::{Layer, LayersConfig, LayersPolicy},
     context::{Crate, Dependency, ProductionFile, count_code_lines},
@@ -11,7 +17,7 @@ use crate::{
 /// Every behaviour of `[rules.layers]`, as its key in `LayersPolicy.modes`.
 /// `LayersConfig` requires each and denies others, so this list is its
 /// list.
-const BEHAVIOURS: [&str; 13] = [
+const BEHAVIOURS: [&str; 19] = [
     "placement",
     "layout",
     "direction.no_crossing",
@@ -20,6 +26,12 @@ const BEHAVIOURS: [&str; 13] = [
     "dev_direction.no_crossing",
     "dev_direction.no_new_entries",
     "dev_direction.stale_entries",
+    "storage_access.no_crossing",
+    "storage_access.no_new_entries",
+    "storage_access.stale_entries",
+    "codec_features.no_crossing",
+    "codec_features.no_new_entries",
+    "codec_features.stale_entries",
     "test_only",
     "clients",
     "store_edges",
@@ -27,11 +39,13 @@ const BEHAVIOURS: [&str; 13] = [
     "policy_changed",
 ];
 
-/// Each behaviour as `[<prefix><behaviour>]` with an advisory mode.
+/// Each behaviour as `[<prefix><behaviour>]` with an advisory mode, and
+/// the `storage` table `LayersConfig` requires.
 fn behaviour_tables(prefix: &str) -> String {
     BEHAVIOURS
         .iter()
         .map(|behaviour| format!("[{prefix}{behaviour}]\nmode = \"advisory\"\n"))
+        .chain([format!("[{prefix}storage]\ndrivers = [\"sqlx\"]\n")])
         .collect()
 }
 
@@ -99,6 +113,70 @@ fn layer_directories() {
     assert_eq!(name_segments("other-name"), ["other", "name"]);
 }
 
+/// A crate's features for the storage checks: its `[features]`, and Cargo's
+/// implicit feature for each optional normal or build dependency that no
+/// `dep:` item names, under the name the manifest gives it. A required
+/// dependency has none. (Cargo rejects an optional dev-dependency.)
+#[test]
+fn features_with_implicit_ones() {
+    let dependency =
+        |package: &str, rename: Option<&str>, kind: Option<&str>, optional| Dependency {
+            package: package.to_owned(),
+            rename: rename.map(str::to_owned),
+            kind: kind.map(str::to_owned),
+            target: None,
+            line: 1,
+            optional,
+            features: Vec::new(),
+            uses_default_features: true,
+        };
+    let krate = Crate {
+        name: "x".to_owned(),
+        lib: None,
+        member: "crates/x".to_owned(),
+        name_line: 1,
+        lib_name_line: None,
+        dependencies: vec![
+            dependency("sqlx", None, None, true),
+            dependency("redis", Some("kv"), None, true),
+            dependency("rusqlite", None, None, true),
+            dependency("libsqlite3-sys", None, Some("build"), true),
+            dependency("aws-sdk-s3", None, None, false),
+        ],
+        features: BTreeMap::from([
+            ("db".to_owned(), vec![("dep:sqlx".to_owned(), 3)]),
+            ("default".to_owned(), vec![("db".to_owned(), 2)]),
+        ]),
+    };
+    let member = Member {
+        krate: &krate,
+        layer: Some(Layer::Foundation),
+        layer_path: Some("x"),
+    };
+    let features = features_of(&member);
+    let expected = BTreeMap::from([
+        ("db".to_owned(), vec!["dep:sqlx".to_owned()]),
+        ("default".to_owned(), vec!["db".to_owned()]),
+        ("kv".to_owned(), vec!["dep:kv".to_owned()]),
+        (
+            "libsqlite3-sys".to_owned(),
+            vec!["dep:libsqlite3-sys".to_owned()],
+        ),
+        ("rusqlite".to_owned(), vec!["dep:rusqlite".to_owned()]),
+    ]);
+    assert_eq!(features, expected);
+}
+
+#[test]
+fn and_lists() {
+    let items =
+        |items: &[&str]| -> Vec<String> { items.iter().map(|&item| item.to_owned()).collect() };
+    assert_eq!(and_list(&items(&[])), "");
+    assert_eq!(and_list(&items(&["a"])), "a");
+    assert_eq!(and_list(&items(&["a", "b"])), "a and b");
+    assert_eq!(and_list(&items(&["a", "b", "c"])), "a, b and c");
+}
+
 /// The paths a use tree or a path in code names, as a finding lists them.
 #[test]
 fn use_trees() {
@@ -152,6 +230,7 @@ fn items_used_through_a_dependency() {
         name_line: 2,
         lib_name_line: None,
         dependencies: Vec::new(),
+        features: BTreeMap::new(),
     };
     let dependency = |rename: Option<&str>| Dependency {
         package: "pplx-space-dep".to_owned(),
@@ -159,6 +238,9 @@ fn items_used_through_a_dependency() {
         kind: None,
         target: None,
         line: 6,
+        optional: false,
+        features: Vec::new(),
+        uses_default_features: true,
     };
     let used =
         |rename: Option<&str>, lib: &str| used_items(&files, &krate, &dependency(rename), lib);
