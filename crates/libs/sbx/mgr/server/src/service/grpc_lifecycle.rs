@@ -66,10 +66,12 @@ use self::suspend::emit_suspend_failed_event;
 use self::suspend::ensure_completed_suspend_retry_format;
 pub(super) use self::suspend::{suspend_superseded_by_wake, suspend_wake_arbitration_enabled};
 #[cfg(test)]
-use self::suspend_snapshot::encrypted_snapshot_prepare_error_status;
-#[cfg(test)]
 pub(super) use self::suspend_snapshot::{
     SuspendSnapshotStagingDisposition, failed_encrypted_capture_may_release_volume,
+};
+#[cfg(test)]
+use self::suspend_snapshot::{
+    btrfs_send_encode_falls_back_to_full, encrypted_snapshot_prepare_error_status,
 };
 #[cfg(test)]
 use self::teardown_suspend::teardown_artifact_backup_status;

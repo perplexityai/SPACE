@@ -8,10 +8,10 @@ use super::backup_submission::{
 };
 use super::{
     ArtifactBackupSubmissionError, OrgSnapshotConfigResolution, SuspendRequestContext,
-    artifact_backup_format, artifact_backup_lookup_error, current_instance_backup_precondition,
-    encrypted_snapshot_prepare_error_status, ensure_completed_suspend_retry_format,
-    pause_reconciliation_outcome, require_artifact_backup_files, reupload_format_from_sidecar,
-    teardown_artifact_backup_status,
+    artifact_backup_format, artifact_backup_lookup_error, btrfs_send_encode_falls_back_to_full,
+    current_instance_backup_precondition, encrypted_snapshot_prepare_error_status,
+    ensure_completed_suspend_retry_format, pause_reconciliation_outcome,
+    require_artifact_backup_files, reupload_format_from_sidecar, teardown_artifact_backup_status,
 };
 use crate::auto_lifecycle::AutoLifecycleCoordinator;
 use crate::guest_filesystem_flush::GuestSnapshotPreparationBudget;
@@ -336,6 +336,31 @@ fn completed_suspend_retry_respects_an_explicit_format_contract() {
     )
     .expect_err("an explicit full retry must reject a committed btrfs-send artifact");
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+}
+
+#[test]
+fn failed_precondition_demotes_only_a_default_codec_suspend_to_full() {
+    // Any FailedPrecondition demotes. Node-manager's suspend encode answers
+    // every lineage miss, including an absent template build, with one.
+    let precondition = Status::failed_precondition(
+        "btrfs-send codec requires template seed on this node, but its build is \
+         absent; retry with format=full",
+    );
+    assert!(btrfs_send_encode_falls_back_to_full(
+        &precondition,
+        SuspendSnapshotFormat::Unspecified,
+    ));
+    assert!(
+        !btrfs_send_encode_falls_back_to_full(&precondition, SuspendSnapshotFormat::BtrfsSend),
+        "an explicit btrfs-send request must see the precondition miss",
+    );
+    assert!(
+        !btrfs_send_encode_falls_back_to_full(
+            &Status::not_found("privileged directory component is absent"),
+            SuspendSnapshotFormat::Unspecified,
+        ),
+        "other codes are encode failures whose rootfs.ext4 may be gone",
+    );
 }
 
 #[test]
