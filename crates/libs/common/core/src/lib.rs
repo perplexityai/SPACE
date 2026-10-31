@@ -1,3 +1,4 @@
+// CI measurement only (change type: shared library). Never merged.
 //! Dependency-light shared primitives for SPACE services.
 //!
 //! The crate contains dependency-light shared helpers:
