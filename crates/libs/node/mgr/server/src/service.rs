@@ -732,6 +732,7 @@ mod artifact_fs;
 pub mod btrfs_balance;
 mod btrfs_delegation;
 mod btrfs_send_source;
+mod btrfs_send_stream;
 mod btrfs_send_transport;
 pub mod cgroup_reclaim;
 #[cfg(test)]

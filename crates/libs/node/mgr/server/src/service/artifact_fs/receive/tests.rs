@@ -3,11 +3,25 @@ use std::io::Write;
 use std::os::unix::fs::{MetadataExt, symlink};
 use std::path::PathBuf;
 
+fn receive_fixture() -> Option<PathBuf> {
+    const FIXTURE: &str = "SPACE_NODEMGR_RECEIVE_TEST_BTRFS_DIR";
+    if let Some(path) = std::env::var_os(FIXTURE).filter(|path| !path.is_empty()) {
+        return Some(path.into());
+    }
+    let required = std::env::var_os(pplx_space_test_env::REQUIRE_TEST_PRIVILEGE)
+        .is_some_and(|value| !value.is_empty() && value != "0");
+    assert!(
+        !required,
+        "CI requires receive coverage: set {FIXTURE} through the disposable Btrfs fixture wrapper"
+    );
+    eprintln!("SKIPPED: set {FIXTURE} to a disposable btrfs directory");
+    None
+}
+
 #[test]
 #[ignore = "requires root and an explicitly supplied disposable btrfs fixture directory"]
 fn receive_keeps_destination_identity_through_scrub_and_publication() {
-    let Some(fixture) = std::env::var_os("SPACE_NODEMGR_TEST_BTRFS_DIR") else {
-        eprintln!("not opted in: set SPACE_NODEMGR_TEST_BTRFS_DIR to a disposable btrfs directory");
+    let Some(fixture) = receive_fixture() else {
         return;
     };
     assert!(nix::unistd::geteuid().is_root());
@@ -59,14 +73,15 @@ fn receive_keeps_destination_identity_through_scrub_and_publication() {
             );
             assert!(destination.join("instance/stale").exists());
 
-            // A partial stream may leave a landing, but must not publish it.
-            // Retrying against the same pinned root scrubs that debt first.
+            // Validation fails before scrub, so a partial stream cannot erase
+            // the previous instance or create a receive landing.
             let bytes = std::fs::read(case.join("stream")).unwrap();
             std::fs::write(case.join("partial"), &bytes[..bytes.len() / 2]).unwrap();
             receive
                 .receive(File::open(case.join("partial")).unwrap(), None)
                 .unwrap_err();
-            assert!(!destination.join("instance").exists());
+            assert!(destination.join("instance/stale").exists());
+            assert!(!destination.join("instance.ro").exists());
             remove_at(&receive.directory, "instance.ro".as_ref()).unwrap();
             let mut original = destination.clone();
             let result = if replacement.starts_with("during-") || replacement == "cancel" {
@@ -77,8 +92,19 @@ fn receive_keeps_destination_identity_through_scrub_and_publication() {
                 let mut output = File::from(output);
                 let cancel = CancellationToken::new();
                 std::thread::scope(|scope| {
-                    let receiver =
-                        scope.spawn(|| receive.receive(File::from(input), Some(&cancel)));
+                    // Admission now requires a complete immutable file. Test
+                    // destination pinning during exec separately, feeding the
+                    // already validated fixture through a controllable pipe.
+                    ValidatedStream::prepare(
+                        &receive.directory,
+                        &File::open(case.join("stream")).unwrap(),
+                        None,
+                        std::time::Instant::now() + crate::host_command::MUTATION_BUDGET,
+                    )
+                    .unwrap();
+                    let receiver = scope.spawn(|| {
+                        receive.receive_validated(ValidatedStream(File::from(input)), Some(&cancel))
+                    });
                     // Protocol v1: 17-byte stream header, 10-byte command
                     // header, then the first command's declared payload.
                     let first = 27 + u32::from_le_bytes(bytes[17..21].try_into().unwrap()) as usize;
@@ -153,8 +179,7 @@ fn receive_keeps_destination_identity_through_scrub_and_publication() {
 #[test]
 #[ignore = "requires root and an explicitly supplied disposable btrfs fixture directory"]
 fn a_restarted_send_restores_from_its_complete_stream() {
-    let Some(fixture) = std::env::var_os("SPACE_NODEMGR_TEST_BTRFS_DIR") else {
-        eprintln!("not opted in: set SPACE_NODEMGR_TEST_BTRFS_DIR to a disposable btrfs directory");
+    let Some(fixture) = receive_fixture() else {
         return;
     };
     assert!(nix::unistd::geteuid().is_root());
@@ -226,6 +251,67 @@ fn a_restarted_send_restores_from_its_complete_stream() {
     }
 }
 
+#[test]
+#[ignore = "requires an explicitly supplied disposable btrfs fixture directory"]
+fn validation_pins_bytes_and_rejects_before_scrubbing() {
+    use std::io::Read;
+
+    let Some(fixture) = receive_fixture() else {
+        return;
+    };
+    let temp = tempfile::tempdir_in(fixture).unwrap();
+    let root = ReceiveRoot::open(temp.path()).unwrap();
+    let bytes = include_bytes!("../../../fixtures/btrfs_send_v1.stream");
+    let source_path = temp.path().join("stream");
+    std::fs::write(&source_path, bytes).unwrap();
+    let deadline = || std::time::Instant::now() + crate::host_command::MUTATION_BUDGET;
+    let mut prepared = ValidatedStream::prepare(
+        &root.directory,
+        &File::open(&source_path).unwrap(),
+        None,
+        deadline(),
+    )
+    .unwrap();
+    // Mutation through another descriptor must not change receive's input.
+    std::fs::write(&source_path, b"replacement").unwrap();
+    let mut actual = Vec::new();
+    prepared.0.read_to_end(&mut actual).unwrap();
+    assert_eq!(actual, bytes);
+    assert_eq!(prepared.0.metadata().unwrap().nlink(), 0);
+    drop(prepared);
+
+    std::fs::create_dir(temp.path().join("instance")).unwrap();
+    std::fs::write(temp.path().join("instance/stale"), b"preserve").unwrap();
+    let mut v2 = bytes.to_vec();
+    v2[13..17].copy_from_slice(&2_u32.to_le_bytes());
+    for input in [
+        bytes[..bytes.len() / 2].to_vec(),
+        [bytes.as_slice(), bytes].concat(),
+        v2,
+    ] {
+        std::fs::write(&source_path, input).unwrap();
+        let error = root
+            .receive(File::open(&source_path).unwrap(), None)
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            std::fs::read(temp.path().join("instance/stale")).unwrap(),
+            b"preserve"
+        );
+        assert!(!temp.path().join("instance.ro").exists());
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 2);
+    }
+    let error = ValidatedStream::prepare(
+        &root.directory,
+        &File::open(&source_path).unwrap(),
+        None,
+        std::time::Instant::now(),
+    )
+    .err()
+    .unwrap();
+    assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
+}
+
 fn replace_destination(destination: &Path, link: bool) -> std::io::Result<PathBuf> {
     let original = destination.with_file_name("original");
     std::fs::rename(destination, &original)?;
@@ -248,8 +334,7 @@ fn replace_destination(destination: &Path, link: bool) -> std::io::Result<PathBu
 fn receiver_namespace_follows_host_unmounts_and_stays_contained() {
     use std::io::BufRead;
 
-    let Some(fixture) = std::env::var_os("SPACE_NODEMGR_TEST_BTRFS_DIR") else {
-        eprintln!("not opted in: set SPACE_NODEMGR_TEST_BTRFS_DIR to a disposable btrfs directory");
+    let Some(fixture) = receive_fixture() else {
         return;
     };
     assert!(nix::unistd::geteuid().is_root());

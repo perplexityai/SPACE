@@ -38,7 +38,8 @@ Follow "Privileged tests and the CI host" in `docs/rust/space-conventions.md`.
   paths, memory admission, the lifecycle limiter or the supervisor client;
   inject test-owned ones.
 - Host-mutating tests need an environment opt-in naming a disposable target,
-  as `SPACE_NODEMGR_TEST_BTRFS_DIR` does.
+  as `SPACE_NODEMGR_RECEIVE_TEST_BTRFS_DIR` does for receive tests
+  (`SPACE_NODEMGR_TEST_BTRFS_DIR` opts into other Btrfs tests).
 
 Module moves change log targets: see "Log targets" in
 `docs/rust/space-conventions.md`.
