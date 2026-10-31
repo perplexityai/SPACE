@@ -241,6 +241,64 @@ pub struct PoolSlotCounts {
     pub ready: i64,
 }
 
+/// Warm-pool state that still uses a template, read by
+/// [`crate::WarmPoolStore::template_usage`]. A template delete is refused
+/// until this is empty: enabled configs and slots hold its releases through
+/// `ON DELETE RESTRICT` keys, and an enabled policy would keep materializing
+/// configs for the name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemplateWarmPoolUsage {
+    /// Enabled configs on any of the template's releases, oldest first.
+    pub enabled_configs: Vec<WarmPoolConfigRef>,
+    /// `warming`, `ready`, `claimed` and `cleanup_pending` slots on any of
+    /// the template's releases, whatever their config's state. `warming` and
+    /// `ready` ones drain once their config is disabled, and
+    /// `cleanup_pending` ones drain regardless. A `claimed` one belongs to a
+    /// create still in flight: it is bound, returned to `ready`, sent to
+    /// cleanup, or reaped by the stale-claim sweep within minutes.
+    pub open_slots: i64,
+    /// `bound` slots on any of the template's releases: the receipts of
+    /// sandboxes created from the pool. Each stays until its sandbox's pod
+    /// is retired, whatever its config's state.
+    pub sandbox_held_slots: i64,
+    /// Up to [`TEMPLATE_USAGE_SANDBOX_ID_LIMIT`] of the sandboxes holding
+    /// those slots, oldest claim first, then by id.
+    pub sandbox_ids: Vec<SandboxId>,
+    /// Enabled policies for the template name, by shape.
+    pub enabled_policies: Vec<WarmPoolPolicyShape>,
+}
+
+/// How many sandbox ids [`TemplateWarmPoolUsage::sandbox_ids`] names.
+pub const TEMPLATE_USAGE_SANDBOX_ID_LIMIT: usize = 5;
+
+impl TemplateWarmPoolUsage {
+    pub fn is_empty(&self) -> bool {
+        self.enabled_configs.is_empty()
+            && self.open_slots == 0
+            && self.sandbox_held_slots == 0
+            && self.enabled_policies.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]
+pub struct WarmPoolConfigRef {
+    pub id: Uuid,
+    pub managed_by: PoolConfigOwner,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]
+pub struct WarmPoolPolicyShape {
+    pub vcpu: i32,
+    pub memory_mib: i32,
+}
+
+/// Rows removed by [`crate::WarmPoolStore::delete_disabled_for_template`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeletedDisabledWarmPools {
+    pub configs: u64,
+    pub policies: u64,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct PoolAutoscaleCandidate {
     pub template_release_id: Uuid,

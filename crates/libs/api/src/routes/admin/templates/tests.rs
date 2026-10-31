@@ -2,6 +2,10 @@ use pplx_space_common_core::types::NodeId;
 use pplx_space_common_core::types::{OrgId, UserId};
 
 use super::*;
+use crate::public_template_operations::tests::{
+    claimed_delete_operation, insert_policy, insert_pool_config, insert_pool_slot, insert_release,
+};
+use pplx_space_cluster_pool::{PoolConfigOwner, PoolSlotState};
 use pplx_space_db_test_fixtures::pg_test_db;
 
 use pplx_space_test_env::TestResult;
@@ -469,7 +473,7 @@ async fn template_pool_observed_does_not_multiply_counts_by_sandbox_ids() -> Tes
 /// carries, and its wrappers must forward the scope.
 ///
 /// `api_error` derives `retryable` from the status, and 409 is absent from
-/// that set, so all six other 409s this module returns render
+/// that set, so all seven other 409s this module returns render
 /// `retryable: false` — see `contention_envelope`'s own doc for the list and
 /// for the caveat that a couple of them do clear on their own. What matters
 /// here is that a contention 409's message tells the caller to retry, so
@@ -1030,6 +1034,320 @@ async fn a_delete_after_a_failed_delete_operation_starts_a_replacement()
     .await?;
     assert_eq!(third_state, "queued", "the third attempt is dispatchable");
     Ok(())
+}
+
+/// A delete is refused up front while anything still uses the template: its
+/// operation could never delete releases that warm pools hold, and would
+/// retry until its budget ran out. Each use is named in the message and the
+/// details, the advice matches how that use clears, and the refusal leaves
+/// no operation and no `deleting` state behind.
+#[tokio::test]
+async fn delete_is_refused_while_the_template_is_in_use() -> TestResult {
+    enum Use {
+        EnabledPoolConfig,
+        EnabledPolicy,
+        OpenSlot,
+        ClaimedSlot,
+        SandboxHeldSlot,
+        ManySandboxHeldSlots,
+    }
+    const DRAIN: &str = "wait for their open slots to drain; a slot claimed by a create \
+                         still in flight settles within minutes, when the create finishes \
+                         or the stale claim is swept";
+    const RETIRE: &str = "clears when that sandbox's pod is retired, for example when the \
+                          sandbox is deleted or suspended";
+    let db = pg_test_db().await?;
+    let state = AppState::from_pool(db.pool.clone()).await?;
+    let uses = [
+        Use::EnabledPoolConfig,
+        Use::EnabledPolicy,
+        Use::OpenSlot,
+        Use::ClaimedSlot,
+        Use::SandboxHeldSlot,
+        Use::ManySandboxHeldSlots,
+    ];
+    for (index, template_use) in (0_u8..).zip(uses) {
+        let template = TemplateName::parse(format!("in-use-{index}"))?;
+        insert_template(&db.pool, &template).await?;
+        let release = insert_release(&db.pool, &template, 0x30 + index).await?;
+        let (expected, details, advice) = match template_use {
+            Use::EnabledPoolConfig => {
+                let id =
+                    insert_pool_config(&db.pool, release, PoolConfigOwner::Manual, true).await?;
+                (
+                    format!("enabled warm-pool configs {id} (manual)"),
+                    vec![("enabled_pool_config_ids", id.to_string())],
+                    DRAIN,
+                )
+            }
+            Use::EnabledPolicy => {
+                insert_policy(&db.pool, &template, true).await?;
+                (
+                    "enabled warm-pool policies 2 vCPU/4096 MiB".to_string(),
+                    vec![("enabled_pool_policies", "2 vCPU/4096 MiB".to_string())],
+                    DRAIN,
+                )
+            }
+            Use::OpenSlot => {
+                let config =
+                    insert_pool_config(&db.pool, release, PoolConfigOwner::Manual, false).await?;
+                insert_pool_slot(&db.pool, config, release, &template, PoolSlotState::Ready)
+                    .await?;
+                (
+                    "1 open warm-pool slot".to_string(),
+                    vec![("open_pool_slots", "1".to_string())],
+                    DRAIN,
+                )
+            }
+            // A claim has no sandbox row until its bind commits, so there is
+            // no sandbox to name or delete: the slot settles on its own.
+            Use::ClaimedSlot => {
+                let config =
+                    insert_pool_config(&db.pool, release, PoolConfigOwner::Manual, false).await?;
+                insert_pool_slot(&db.pool, config, release, &template, PoolSlotState::Claimed)
+                    .await?;
+                (
+                    "1 open warm-pool slot".to_string(),
+                    vec![("open_pool_slots", "1".to_string())],
+                    DRAIN,
+                )
+            }
+            Use::SandboxHeldSlot => {
+                let config =
+                    insert_pool_config(&db.pool, release, PoolConfigOwner::Manual, false).await?;
+                let sandbox =
+                    insert_pool_slot(&db.pool, config, release, &template, PoolSlotState::Bound)
+                        .await?;
+                (
+                    format!(
+                        "1 warm-pool slot held by a sandbox created from the pool \
+                         (sandbox {sandbox})"
+                    ),
+                    vec![
+                        ("sandbox_held_pool_slots", "1".to_string()),
+                        ("pool_slot_sandbox_ids", sandbox.to_string()),
+                    ],
+                    RETIRE,
+                )
+            }
+            Use::ManySandboxHeldSlots => {
+                let config =
+                    insert_pool_config(&db.pool, release, PoolConfigOwner::Manual, false).await?;
+                let mut sandboxes = Vec::new();
+                for _ in 0..6 {
+                    sandboxes.push(
+                        insert_pool_slot(
+                            &db.pool,
+                            config,
+                            release,
+                            &template,
+                            PoolSlotState::Bound,
+                        )
+                        .await?,
+                    );
+                }
+                // With no claim times the store names the lowest ids.
+                sandboxes.sort_unstable();
+                let named = sandboxes[..5]
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>();
+                (
+                    format!(
+                        "6 warm-pool slots held by sandboxes created from the pool \
+                         (including sandboxes {})",
+                        named.join(", ")
+                    ),
+                    vec![
+                        ("sandbox_held_pool_slots", "6".to_string()),
+                        ("pool_slot_sandbox_ids", named.join(",")),
+                    ],
+                    RETIRE,
+                )
+            }
+        };
+
+        let (status, body) = request_template_delete(&state, &template, "in-use").await?;
+
+        assert_eq!(status, StatusCode::CONFLICT, "{expected}: {body}");
+        let message = body["message"].as_str().unwrap_or_default();
+        assert!(message.contains(&expected), "{expected}: {message}");
+        for remedy in [DRAIN, RETIRE] {
+            assert_eq!(
+                message.contains(remedy),
+                remedy == advice,
+                "{remedy}: {message}"
+            );
+        }
+        let mut expected_details = vec![serde_json::json!({
+            "key": "reason",
+            "value": "template_in_use",
+        })];
+        expected_details.extend(
+            details
+                .into_iter()
+                .map(|(key, value)| serde_json::json!({ "key": key, "value": value })),
+        );
+        assert_eq!(
+            body["details"],
+            serde_json::Value::Array(expected_details),
+            "{expected}"
+        );
+        let operations: i64 = sqlx::query_scalar(sql!(
+            "SELECT COUNT(*) FROM public_operations WHERE target_id = $1"
+        ))
+        .bind(template.as_str())
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(operations, 0, "{expected}");
+        assert_eq!(
+            template_desired_state(&db.pool, &template).await?,
+            TemplateDesiredState::Present.as_str(),
+            "{expected}"
+        );
+    }
+    Ok(())
+}
+
+/// A use that appears after the delete was accepted fails its operation for
+/// good with the same refusal instead of retrying, and the template stays
+/// `deleting`. An enabled policy holds no release key, so only the
+/// operation's own re-check catches it. Once the use is gone, a new delete
+/// replaces the failed one and completes.
+#[tokio::test]
+async fn a_use_added_after_the_delete_was_accepted_fails_the_operation() -> TestResult {
+    let db = pg_test_db().await?;
+    let state = AppState::from_pool(db.pool.clone()).await?;
+    let template = TemplateName::parse("late-policy")?;
+    insert_template(&db.pool, &template).await?;
+    insert_release(&db.pool, &template, 0x40).await?;
+    let executor =
+        crate::public_template_operations::DeleteTemplateOperationExecutor::new(db.pool.clone());
+
+    let (status, body) = request_template_delete(&state, &template, "late-policy-first").await?;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let first = recorded_delete_operation(&db.pool, &template).await?;
+    insert_policy(&db.pool, &template, true).await?;
+    let result = executor
+        .execute(&claimed_delete_operation(first, &template))
+        .await;
+
+    assert_eq!(
+        result.state,
+        pplx_space_public_api::OperationState::Failed,
+        "{}",
+        result.progress_message
+    );
+    assert_eq!(result.terminal_error_code, Some(PublicErrorCode::Conflict));
+    assert!(
+        result
+            .progress_message
+            .contains("enabled warm-pool policies 2 vCPU/4096 MiB"),
+        "{}",
+        result.progress_message
+    );
+    assert_eq!(
+        template_desired_state(&db.pool, &template).await?,
+        TemplateDesiredState::Deleting.as_str()
+    );
+
+    // The dispatcher records the failure; the operator disables the policy.
+    sqlx::query(sql!(
+        "UPDATE public_operations
+         SET state = 'failed', completed_at = NOW()
+         WHERE operation_id = $1"
+    ))
+    .bind(first.as_uuid())
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE warm_pool_policies SET enabled = FALSE WHERE template_name = $1"
+    ))
+    .bind(template.as_str())
+    .execute(&db.pool)
+    .await?;
+
+    let (status, body) = request_template_delete(&state, &template, "late-policy-second").await?;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let second = recorded_delete_operation(&db.pool, &template).await?;
+    assert_ne!(second, first, "the failed delete is replaced");
+    let result = executor
+        .execute(&claimed_delete_operation(second, &template))
+        .await;
+    assert_eq!(
+        result.state,
+        pplx_space_public_api::OperationState::Succeeded,
+        "{}",
+        result.progress_message
+    );
+    assert_eq!(
+        template_desired_state(&db.pool, &template).await?,
+        TemplateDesiredState::Deleted.as_str()
+    );
+    Ok(())
+}
+
+fn template_admin() -> User {
+    use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID};
+
+    User {
+        id: UserId::from_uuid(SEED_USER_ID),
+        email: "template-admin@example.test".to_string(),
+        password_hash: String::new(),
+        display_name: "template admin".to_string(),
+        org_id: OrgId::from_uuid(SEED_ORG_ID),
+        role: crate::user_role::UserRole::OrganizationAdmin,
+        owner_source: pplx_space_common_core::types::SandboxOwnerSource::Local,
+        created_at: OffsetDateTime::now_utc(),
+        updated_at: OffsetDateTime::now_utc(),
+    }
+}
+
+async fn request_template_delete(
+    state: &AppState,
+    template: &TemplateName,
+    idempotency_key: &str,
+) -> TestResult<(StatusCode, serde_json::Value)> {
+    let mut headers = HeaderMap::new();
+    headers.insert(IDEMPOTENCY_KEY_HEADER, idempotency_key.parse()?);
+    let response = delete_template(
+        State(state.clone()),
+        Extension(AuthUser(template_admin())),
+        headers,
+        Path(template.clone()),
+    )
+    .await
+    .into_response();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 100_000).await?;
+    Ok((status, serde_json::from_slice(&body)?))
+}
+
+async fn recorded_delete_operation(
+    pool: &sqlx::PgPool,
+    template: &TemplateName,
+) -> TestResult<pplx_space_public_api::OperationId> {
+    let id: Option<Uuid> = sqlx::query_scalar(sql!(
+        "SELECT delete_operation_id FROM templates WHERE name = $1"
+    ))
+    .bind(template.as_str())
+    .fetch_one(pool)
+    .await?;
+    Ok(pplx_space_public_api::OperationId::from_uuid(
+        id.ok_or("no delete operation recorded")?,
+    ))
+}
+
+async fn template_desired_state(
+    pool: &sqlx::PgPool,
+    template: &TemplateName,
+) -> TestResult<String> {
+    Ok(
+        sqlx::query_scalar(sql!("SELECT desired_state FROM templates WHERE name = $1"))
+            .bind(template.as_str())
+            .fetch_one(pool)
+            .await?,
+    )
 }
 
 /// Template delete takes the same `Idempotency-Key` rule as the native routes.
