@@ -109,7 +109,7 @@ export default function AuditPage() {
         size="small"
         loading={loading}
         pagination={tablePagination('events')}
-        locale={{ emptyText: needle ? 'No events match' : 'No audit events' }}
+        locale={{ emptyText: error ? 'Not loaded' : needle ? 'No events match' : 'No audit events' }}
       />
     </div>
   );
