@@ -1,5 +1,73 @@
 use super::*;
 
+#[rstest::rstest]
+#[case(Some("6144"), Some(4096), Some(2048), Some(4096))]
+#[case(Some(" 6144 "), None, Some(2048), Some(6144))]
+#[case(Some("6144"), None, None, Some(6144))]
+#[case(None, None, Some(2048), Some(2048))]
+#[case(Some(" "), None, Some(2048), Some(2048))]
+#[case(None, None, None, crate::service::SandboxCgroupConfig::default().memory_mib)]
+fn sandbox_memory_environment_precedence(
+    #[case] env: Option<&str>,
+    #[case] cli: Option<u64>,
+    #[case] file: Option<u64>,
+    #[case] expected: Option<u64>,
+) {
+    if !pplx_space_test_env::enter_test_process(&[(
+        "SPACE_NODEMGR_SANDBOX_CGROUP_MEMORY_MIB",
+        env.map(std::ffi::OsStr::new),
+    )]) {
+        return;
+    }
+    let config = resolve_sandbox_cgroup_config(
+        &memory_cli_config(cli),
+        &SandboxCgroupFileConfig {
+            memory_mib: file,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(config.memory_mib, expected);
+}
+
+fn memory_cli_config(memory_mib: Option<u64>) -> NodeMgrRunConfig {
+    NodeMgrRunConfig {
+        socket_path: PathBuf::new(),
+        health_socket_path: None,
+        service_mutex_timeout: Duration::ZERO,
+        config_path: PathBuf::new(),
+        network_pool_max_slots: None,
+        network_pool_target: None,
+        network_pool_retain_ready: None,
+        network_pool_min_ready: None,
+        pod_netns_path: None,
+        service_port_ingress_isolation: None,
+        sandbox_cgroup_memory_mib: memory_mib,
+        sandbox_cgroup_vcpu_count: None,
+        memory_admission_reserve_mib: None,
+    }
+}
+
+#[rstest::rstest]
+#[case("invalid")]
+#[case("-1")]
+#[case("18446744073709551616")]
+#[case("0")]
+#[case("128")]
+fn sandbox_memory_environment_rejects_invalid_limits(#[case] value: &str) {
+    if !pplx_space_test_env::enter_test_process(&[(
+        "SPACE_NODEMGR_SANDBOX_CGROUP_MEMORY_MIB",
+        Some(std::ffi::OsStr::new(value)),
+    )]) {
+        return;
+    }
+    assert!(matches!(
+        resolve_sandbox_cgroup_config(&memory_cli_config(None), &Default::default()),
+        Err(RunNodeMgrError::EnvNotU64 { .. }
+            | RunNodeMgrError::SandboxCgroupMemoryBelowHeadroom { .. })
+    ));
+}
+
 #[test]
 fn configuration_precedence_and_owned_sections() {
     for (cli, env, file, expected) in [
