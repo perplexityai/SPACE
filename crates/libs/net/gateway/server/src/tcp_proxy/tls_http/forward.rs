@@ -76,7 +76,7 @@ where
                     websocket_response_headers(response.headers_mut());
                 }
                 Self::record(protocol, handshake.as_str(), response.status());
-                self.upgrades.spawn(
+                self.spawn_upgrade(
                     upgrade::relay(
                         guest,
                         origin,

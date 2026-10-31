@@ -534,8 +534,10 @@ configuration does not list is still sent but cannot be grouped or filtered
 on. That applies to tags added after the configuration was written, including
 the `reason` on `template.gc.tick` and `template.gc.tick_duration_ms` errors
 and the `error_kind` on `template.build.latency_ms`,
-`template.build.step.latency_ms` and `snapshot.restore.failed`, and the
-`fault` on `gateway.tcp.connection`. Add them to the
+`template.build.step.latency_ms` and `snapshot.restore.failed`, the
+`fault` on `gateway.tcp.connection`, the `io_kind` on
+`gateway.tls.connection_error` and `gateway.tls.handshake`, and the
+`certificate` on `gateway.tls.handshake`. Add them to the
 metric's tag configuration before relying on them; series without them are
 unaffected.
 

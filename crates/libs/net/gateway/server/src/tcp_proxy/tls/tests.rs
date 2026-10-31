@@ -72,6 +72,116 @@ fn upstream_protocol_requires_guest_compatibility() {
     }
 }
 
+/// Most keep-alive clients end a connection by closing TCP without
+/// `close_notify`. Only a read on the guest leg can see that close, and it is
+/// routine only while no exchange is in flight.
+#[test]
+fn guest_close_without_close_notify_is_routine_only_when_idle() {
+    use std::io::{Error, ErrorKind};
+    use tracing::Level;
+
+    use crate::tls_interception::TlsHandshakeLeg::{ClientToNetgw, NetgwToOrigin};
+
+    for (leg, operation, kind, idle, reason, level) in [
+        (
+            ClientToNetgw,
+            "read",
+            ErrorKind::UnexpectedEof,
+            true,
+            "peer_closed_without_close_notify",
+            Level::DEBUG,
+        ),
+        (
+            ClientToNetgw,
+            "read",
+            ErrorKind::UnexpectedEof,
+            false,
+            "peer_closed_without_close_notify",
+            Level::WARN,
+        ),
+        (
+            ClientToNetgw,
+            "read",
+            ErrorKind::ConnectionReset,
+            true,
+            "io",
+            Level::WARN,
+        ),
+        (
+            ClientToNetgw,
+            "write",
+            ErrorKind::UnexpectedEof,
+            true,
+            "io",
+            Level::WARN,
+        ),
+        (
+            NetgwToOrigin,
+            "read",
+            ErrorKind::UnexpectedEof,
+            true,
+            "io",
+            Level::WARN,
+        ),
+    ] {
+        let (failure, chosen) =
+            super::TlsFailure::established(leg, operation, &Error::from(kind), idle);
+        assert_eq!(
+            (failure.reason, chosen),
+            (reason, level),
+            "{leg:?} {operation} {kind:?} idle={idle}"
+        );
+    }
+}
+
+/// rustls reports a rejected origin certificate as `InvalidCertificate` inside
+/// the handshake's I/O error; it names the failure only on the origin leg.
+#[test]
+fn origin_certificate_rejection_names_its_reason() {
+    use rustls::CertificateError as Invalid;
+    use rustls::pki_types::{ServerName, UnixTime};
+
+    let rejected =
+        |error: rustls::Error| std::io::Error::new(std::io::ErrorKind::InvalidData, error);
+    let now = UnixTime::now();
+    for (error, certificate) in [
+        (Invalid::UnknownIssuer, "unknown_issuer"),
+        (
+            Invalid::NotValidForNameContext {
+                expected: ServerName::try_from("origin.example.test").unwrap(),
+                presented: vec!["other.example.test".into()],
+            },
+            "not_valid_for_name",
+        ),
+        (
+            Invalid::ExpiredContext {
+                time: now,
+                not_after: now,
+            },
+            "expired",
+        ),
+        (Invalid::BadSignature, "other"),
+    ] {
+        let failure =
+            TlsTransportError::Upstream(rejected(rustls::Error::InvalidCertificate(error.clone())))
+                .failure();
+        assert_eq!(
+            (failure.reason, failure.certificate),
+            ("io", Some(certificate)),
+            "{error:?}"
+        );
+    }
+    for error in [
+        TlsTransportError::Upstream(rejected(rustls::Error::DecryptError)),
+        TlsTransportError::Upstream(std::io::ErrorKind::ConnectionReset.into()),
+        TlsTransportError::Downstream(rejected(rustls::Error::InvalidCertificate(
+            Invalid::UnknownIssuer,
+        ))),
+    ] {
+        assert_eq!(error.failure().certificate, None, "{error:?}");
+    }
+}
+
 #[test]
 fn tls_diagnostics_do_not_export_the_guest_hostname() {
     #[derive(Clone, Default)]

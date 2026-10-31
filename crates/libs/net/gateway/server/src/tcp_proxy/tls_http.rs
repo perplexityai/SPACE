@@ -26,6 +26,7 @@ use super::http_host::HostBinding;
 use super::routing_headers::SanitizedRequest;
 #[cfg(test)]
 use super::tls::TlsTransportError;
+use super::tls::{ActiveExchange, GuestActivity};
 use super::upstream::{self, Upstream};
 use crate::certificates::CertificateLease;
 use crate::tls_sni::HttpAlpn;
@@ -106,11 +107,41 @@ impl HttpBody for ForwardingBody {
     }
 }
 
+/// A response body that keeps its exchange in flight on the guest connection
+/// until hyper has taken its last frame or dropped it. hyper may still be
+/// flushing that frame, or on HTTP/2 holding it for the guest's flow-control
+/// window.
+struct GuestBody {
+    body: Body,
+    _active: ActiveExchange,
+}
+
+impl HttpBody for GuestBody {
+    type Data = Bytes;
+    type Error = <Body as HttpBody>::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        Pin::new(&mut self.body).poll_frame(context)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.body.size_hint()
+    }
+}
+
 struct Session<F> {
     binding: HostBinding,
     lease: Arc<CertificateLease>,
     upstream: Upstream<F, Body>,
     upgrades: TaskTracker,
+    activity: GuestActivity,
     shutdown: CancellationToken,
     draining: CancellationToken,
 }
@@ -125,8 +156,12 @@ struct Session<F> {
 ///
 /// Protocol detection has no timeout; hyper's timers apply after it completes.
 /// `connect` lazily opens the origin with the detected guest protocol.
-pub(super) async fn serve<C, F, Fut, U>(
+/// Each request, from its complete head until hyper takes its response's last
+/// frame or drops the response, and each upgraded stream until its relay ends,
+/// is reported in flight to `activity`.
+pub(super) async fn serve_guest<C, F, Fut, U>(
     guest: C,
+    activity: GuestActivity,
     binding: HostBinding,
     lease: Arc<CertificateLease>,
     connect: F,
@@ -146,19 +181,25 @@ where
         lease,
         upstream: Upstream::new(connect, shutdown.clone(), draining.clone()),
         upgrades: TaskTracker::new(),
+        activity,
         shutdown,
         draining,
     });
     let service = service_fn(|request: Request<Incoming>| {
         let session = session.clone();
+        let active = session.activity.begin();
         let protocol = HttpProtocol::of(request.version());
         tracing::Span::current().record("protocol", protocol.as_str());
         let request = SanitizedRequest::try_from(request);
         async move {
-            Ok::<_, Infallible>(match request {
+            let response = match request {
                 Ok(request) => session.forward(request).await,
                 Err(_) => session.refuse(protocol, "invalid_headers", StatusCode::BAD_REQUEST),
-            })
+            };
+            Ok::<_, Infallible>(response.map(|body| GuestBody {
+                body,
+                _active: active,
+            }))
         }
     });
     let builder = guest_http_builder();
@@ -176,6 +217,23 @@ where
     session.shutdown.cancel();
     session.upstream.shutdown().await;
     result.map_err(HttpError::from)
+}
+
+/// Serve a guest stream whose in-flight exchanges nothing reads.
+#[cfg(test)]
+pub(super) async fn serve<C, F, Fut, U>(
+    guest: C,
+    binding: HostBinding,
+    lease: Arc<CertificateLease>,
+    connect: F,
+) -> Result<(), HttpError>
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    F: FnOnce(HttpProtocol) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<(U, HttpProtocol), upstream::Error>> + Send + 'static,
+    U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    serve_guest(guest, GuestActivity::default(), binding, lease, connect).await
 }
 
 fn guest_http_builder() -> auto::Builder<TokioExecutor> {
@@ -211,6 +269,16 @@ where
         operation: &'static str,
     ) -> ForwardingBody {
         ForwardingBody::new(body, protocol.as_str(), operation)
+    }
+
+    /// Relay an upgraded stream, which stays in flight on the guest
+    /// connection until the relay ends.
+    fn spawn_upgrade(&self, relay: impl Future<Output = ()> + Send + 'static) {
+        let active = self.activity.begin();
+        self.upgrades.spawn(async move {
+            let _active = active;
+            relay.await;
+        });
     }
 
     fn refuse(
