@@ -1,8 +1,12 @@
 //! Template-manager's cache-partition migration (20261026220935) was retired
 //! after some databases had applied it. A rollout can migrate a node's
 //! database from an init container while the previous template-manager still
-//! serves, so a schema change must be readable by the release before it, and a
-//! rollback must not need anything beyond the image.
+//! serves, so a schema change must be readable by the release before it.
+//! Reversing this retired migration, when that is lossless, needs nothing
+//! beyond the image. Rolling back past a later migration that the earlier
+//! release doesn't bundle, such as 20261031050126, needs the newer release's
+//! `space-db-migrator template-manager down` before the earlier image starts;
+//! see db/README.md.
 //!
 //! While the migration isn't bundled, a database that still records it is
 //! returned to the bundled schema with the migration's own down SQL, but only
