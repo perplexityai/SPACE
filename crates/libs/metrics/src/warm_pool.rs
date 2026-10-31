@@ -396,6 +396,14 @@ pub fn config_decode_failed(read: &str, template: &str) {
     );
 }
 
+/// Count one pass's autoscale step by `result`: `ok`, `partial` (it skipped an
+/// invalid row or a candidate whose write failed) or `failed`. The pass
+/// reconciles the stored configs either way, so `warm_pool.reconcile.tick`
+/// stays `ok`; this counter is the one that shows autoscaling stopped.
+pub fn autoscale(result: &str) {
+    counter("warm_pool.reconcile.autoscale", 1, &[tag("result", result)]);
+}
+
 pub fn reconcile_tick(result_ok: bool) {
     counter(
         "warm_pool.reconcile.tick",

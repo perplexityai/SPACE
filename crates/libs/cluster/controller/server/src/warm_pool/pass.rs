@@ -30,6 +30,30 @@ impl ConfigStage {
     }
 }
 
+/// How a pass's autoscale step went. A failed step does not fail the pass:
+/// the pass still reconciles the stored configs. Every pass runs the step
+/// first and sets this.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AutoscaleOutcome {
+    #[default]
+    Ok,
+    /// The step skipped an invalid row or a candidate whose write failed.
+    Partial,
+    Failed,
+}
+
+impl AutoscaleOutcome {
+    /// The `result` value of `warm_pool.reconcile.autoscale` and the pass
+    /// summary's `autoscale_result`.
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Partial => "partial",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 /// One stage across every config a pass reconciled.
 #[derive(Debug, Default, Clone, Copy)]
 pub(super) struct StageTally {
@@ -77,6 +101,7 @@ pub(super) struct PassReport {
     /// invalid config rows that the pass did not reconcile. `configs` also
     /// counts those rows.
     pub(super) failed_configs: usize,
+    pub(super) autoscale: AutoscaleOutcome,
 }
 
 impl PassReport {
@@ -138,8 +163,9 @@ pub(super) fn span() -> tracing::Span {
     )
 }
 
-/// Record a finished pass on its root: an error when the pass failed or any
-/// config failed, as `node_ctl.pass` does for a failed ref.
+/// Record a finished pass on its root: an error when the pass failed, its
+/// autoscale step failed or any config failed, as `node_ctl.pass` does for a
+/// failed ref.
 pub(super) fn record_outcome(span: &tracing::Span, report: &PassReport, pass_ok: bool) {
     span.record("configs", span_count(report.configs));
     span.record("failed_configs", span_count(report.failed_configs));
@@ -148,6 +174,12 @@ pub(super) fn record_outcome(span: &tracing::Span, report: &PassReport, pass_ok:
         span.record(
             "otel.status_description",
             "the pass failed before it reconciled the pool configs",
+        );
+    } else if report.autoscale == AutoscaleOutcome::Failed {
+        span.record("otel.status_code", "ERROR");
+        span.record(
+            "otel.status_description",
+            "autoscaling failed; the pass reconciled the stored pool configs",
         );
     } else if report.failed_configs > 0 {
         span.record("otel.status_code", "ERROR");
@@ -179,6 +211,7 @@ macro_rules! pass_summary {
             $level,
             reconciled_configs = report.configs,
             failed_configs = report.failed_configs,
+            autoscale_result = report.autoscale.as_str(),
             delete_mismatched_open_slots_result = delete_mismatched.result(),
             delete_mismatched_open_slots_duration_ms = delete_mismatched.duration_ms(),
             delete_mismatched_open_slots_failed_configs = delete_mismatched.failed_configs(),
