@@ -44,6 +44,7 @@ async fn seed_idle_suspended_sandbox(
 ) -> TestResult {
     insert_sandbox(pool, sandbox_id, Some(node_id)).await?;
     insert_direct_route_provenance(pool, sandbox_id, 1).await?;
+    let activation_attempt_id = SandboxActivationAttemptId::new();
     sqlx::query(sql!(
         "INSERT INTO sandbox_direct_route_identities
          (sandbox_id, route_generation, current_node_id, substrate_kind,
@@ -52,7 +53,7 @@ async fn seed_idle_suspended_sandbox(
     ))
     .bind(sandbox_id)
     .bind(node_id)
-    .bind(SandboxActivationAttemptId::new())
+    .bind(activation_attempt_id)
     .execute(pool)
     .await?;
     insert_observed_source(pool, sandbox_id, node_id).await?;
@@ -73,6 +74,9 @@ async fn seed_idle_suspended_sandbox(
         Some(NodeManagedBy::Space),
     );
     resident.status = "running".to_owned();
+    // A Wake that needs no transition reports this identity, as
+    // sandbox-manager does for the execution it holds.
+    resident.activation_attempt_id = Some(activation_attempt_id.to_string());
     if local_policy.is_some() {
         resident.auto_lifecycle_authority = PolicyAuthority::Local;
     }
@@ -806,6 +810,164 @@ async fn wake_adopts_a_live_record_on_its_artifact_node() -> TestResult {
                 );
             }
         }
+    }
+    drop(source_server);
+    drop(other_server);
+    Ok(())
+}
+
+/// A wake that adopts a `Started` record ahead of the route identity, whose
+/// receipt an earlier wake never persisted, commits the row `started` only
+/// with the route identity at the record's execution. A Wake that fails after
+/// the record was read leaves nothing the next wake cannot repair, through
+/// `wake_execution` or `access_runtime_client` alike, and nothing is restored
+/// on another worker.
+#[tokio::test(flavor = "current_thread")]
+async fn wake_adopts_a_started_record_only_at_its_route_identity() -> TestResult {
+    #[derive(Debug, Clone, Copy)]
+    enum Entry {
+        Wake,
+        Access,
+    }
+
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+    let Some(fixture) = postgres_fixture().await? else {
+        return Ok(());
+    };
+    let source_id = NodeId::new();
+    let other_id = NodeId::new();
+    let (source_server, source) = start_sim_worker(source_id).await?;
+    let (other_server, other) = start_sim_worker(other_id).await?;
+    seed_worker(&fixture.pool, source_id, source_server.endpoint()).await?;
+    seed_worker(&fixture.pool, other_id, other_server.endpoint()).await?;
+    let wake_on_access = crate::e2b::auto_lifecycle_policy(60, true, true);
+
+    for (label, entry, first_wake_fails) in [
+        ("wake whose first Wake fails", Entry::Wake, true),
+        ("access whose first Wake fails", Entry::Access, true),
+        ("access", Entry::Access, false),
+    ] {
+        let sandbox_id = SandboxId::new();
+        seed_idle_suspended_sandbox(&fixture.pool, &source, sandbox_id, source_id, None).await?;
+        sqlx::query(sql!(
+            "INSERT INTO snapshot_storage_locations
+                 (snapshot_id, storage_connection_string, org_id)
+             SELECT id, 's3://bucket/snapshots/sandbox', org_id
+               FROM snapshots
+              WHERE sandbox_id = $1"
+        ))
+        .bind(sandbox_id)
+        .execute(&fixture.pool)
+        .await?;
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET auto_lifecycle_json = $2 WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .bind(sqlx::types::Json(&wake_on_access))
+        .execute(&fixture.pool)
+        .await?;
+        set_route_and_provenance(&fixture.pool, sandbox_id, source_id, 1, 2).await?;
+        source
+            .set_route_identity_provenance(&sandbox_id.to_string(), Some(2), Some(2), None)
+            .await?;
+        source
+            .set_status(&sandbox_id.to_string(), "running")
+            .await?;
+
+        let wake = |sandbox: Sandbox| {
+            let substrate = &fixture.substrate;
+            async move {
+                match entry {
+                    Entry::Wake => Box::pin(substrate.wake_execution(
+                        pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native("wake"),
+                        &sandbox,
+                        Duration::from_secs(5),
+                        None,
+                        crate::controllers::substrate::RecoveryCharge::Exempt,
+                    ))
+                    .await
+                    .map(drop)
+                    .map_err(|error| format!("{error:?}")),
+                    Entry::Access => Box::pin(substrate.access_runtime_client(
+                        pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native(
+                            "ingress",
+                        ),
+                        &sandbox,
+                        ExecutionActivityKind::Access,
+                        Duration::from_secs(5),
+                        crate::controllers::substrate::RecoveryCharge::Exempt,
+                    ))
+                    .await
+                    .map(drop)
+                    .map_err(|error| error.to_string()),
+                }
+            }
+        };
+        let route = || async {
+            sqlx::query_as::<_, (NodeId, i64, i64)>(sql!(
+                "SELECT route.current_node_id, route.execution_generation,
+                        provenance.last_execution_generation
+                   FROM sandbox_direct_route_identities route
+                   JOIN sandbox_direct_route_provenance provenance
+                     ON provenance.sandbox_id = route.sandbox_id
+                  WHERE route.sandbox_id = $1"
+            ))
+            .bind(sandbox_id.as_uuid())
+            .fetch_one(&fixture.pool)
+            .await
+        };
+
+        if first_wake_fails {
+            source.fail_next_wake(sandbox_id.to_string()).await;
+            let sandbox = crate::controllers::sandbox::fetch_sandbox(&fixture.pool, sandbox_id)
+                .await?
+                .expect("sandbox row");
+            assert!(
+                wake(sandbox).await.is_err(),
+                "{label}: the failed Wake must fail the wake"
+            );
+            let row = placement(&fixture.pool, sandbox_id).await?;
+            let (_, route_generation, _) = route().await?;
+            assert!(
+                row.lifecycle != "started" || route_generation == 2,
+                "{label}: the row is `started` while its route identity trails the record: \
+                 {row:?}, route identity at {route_generation}"
+            );
+        }
+        let sandbox = crate::controllers::sandbox::fetch_sandbox(&fixture.pool, sandbox_id)
+            .await?
+            .expect("sandbox row");
+        wake(sandbox)
+            .await
+            .unwrap_or_else(|error| panic!("{label}: {error}"));
+
+        assert_eq!(
+            placement(&fixture.pool, sandbox_id).await?,
+            Placement {
+                lifecycle: "started".to_owned(),
+                placement: "on_node".to_owned(),
+                active_node_id: Some(source_id),
+                restore_lease_token: None,
+            },
+            "{label}"
+        );
+        assert_eq!(
+            route().await?,
+            (source_id, 2, 2),
+            "{label}: the route identity names the record's execution, and no \
+             generation is reserved"
+        );
+        assert_eq!(
+            source.get(&sandbox_id.to_string()).await?.status,
+            "running",
+            "{label}"
+        );
+        assert!(
+            other.get(&sandbox_id.to_string()).await.is_err(),
+            "{label}: nothing is restored on the other worker"
+        );
     }
     drop(source_server);
     drop(other_server);

@@ -17,7 +17,9 @@
 //!   suspend) is adopted when it runs on the route identity's node, at or
 //!   above that identity's execution generation, and no restore owner can
 //!   still record a newer one: the row is placed back on that node and woken
-//!   there. Otherwise the wake restores through the restore lease, whose
+//!   there. A running record ahead of the route identity is woken before the
+//!   row is placed, so its receipt lands before the row reads `started`.
+//!   Otherwise the wake restores through the restore lease, whose
 //!   candidates try that node first; a read that fails or does not answer in
 //!   time restores under the cluster policy. A `started` row left with no
 //!   active node by that race is adopted the same way when its worker is
@@ -520,6 +522,18 @@ fn direct_wake_request(
     }
 }
 
+/// What a wake does after catching up an unplaced row's route identity to
+/// the live record it adopts (`DirectSubstrate::catch_up_route_identity`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteCatchUp {
+    /// The route identity needs no catch-up: adopt the record as read.
+    NotNeeded,
+    /// The record's worker returned this receipt: adopt its execution.
+    CaughtUp { execution_generation: i64 },
+    /// The record no longer runs: restore.
+    NotRunning,
+}
+
 /// Whether waking `resident` restores or starts it, which sandbox-manager
 /// admits only with a reserved route identity.
 fn resident_is_dormant(resident: &pplx_space_sbx_mgr_client::proto::SandboxInfo) -> bool {
@@ -648,6 +662,22 @@ async fn node_sandbox_record(
 
 fn wake_requires_restore(status: &tonic::Status) -> bool {
     status.code() == Code::NotFound
+}
+
+fn wake_rpc_error(
+    status: &tonic::Status,
+    wake_activity: Option<ExecutionActivityKind>,
+) -> SubstrateError {
+    // The worker's effective policy refused an implicit wake. That is a
+    // terminal policy answer, not a transient runtime failure.
+    if wake_activity.is_some() && status.code() == Code::FailedPrecondition {
+        return SubstrateError::Conflict {
+            message: status.message().to_string(),
+        };
+    }
+    SubstrateError::Failed {
+        message: format!("node-api wake error: {status}"),
+    }
 }
 
 fn wake_lifecycle_allows_restore_fallback(lifecycle: &str) -> bool {
@@ -3166,6 +3196,115 @@ impl DirectSubstrate {
         }
     }
 
+    /// Persists the Wake receipt of a `Started` record on `node` before the
+    /// wake adopts it, when the route identity on that node trails the
+    /// record: a wake that reserved the record's generation stopped before
+    /// its receipt. The adoption writes `started` only at the route
+    /// identity's execution, and a route token minted from an older identity
+    /// is refused by the node. Waking first leaves an interrupted wake with
+    /// an unplaced row for the next wake to read again, never a `started` row
+    /// whose route identity trails it.
+    ///
+    /// Only a tokenless row is caught up, since one that holds a
+    /// restore-lease token is adopted only at its persisted receipt. The Wake
+    /// carries no route identity, so it cannot start a new execution; a
+    /// record that left `Started` and now needs one is restored instead.
+    async fn catch_up_route_identity(
+        &self,
+        sandbox: &Sandbox,
+        read_lifecycle: SandboxLifecycle,
+        node: &DirectNode,
+        record: &pplx_space_sbx_mgr_client::proto::SandboxInfo,
+        timeout: Duration,
+        wake_activity: Option<ExecutionActivityKind>,
+    ) -> Result<RouteCatchUp, SubstrateError> {
+        use pplx_space_sbx_mgr_client::proto::SandboxLifecycleState;
+
+        let (Ok(SandboxLifecycleState::Started), Some(record_generation)) =
+            (record.observed_lifecycle(), record.execution_generation)
+        else {
+            return Ok(RouteCatchUp::NotNeeded);
+        };
+        let trails = sqlx::query_scalar::<_, bool>(sql!(
+            "SELECT TRUE
+               FROM sandboxes s
+               JOIN sandbox_direct_route_identities route ON route.sandbox_id = s.id
+               JOIN sandbox_direct_route_provenance provenance
+                 ON provenance.sandbox_id = s.id
+              WHERE s.id = $1
+                AND s.managed_by = $4
+                AND s.active_node_id IS NULL
+                AND LOWER(TRIM(s.lifecycle)) = $5
+                AND s.restore_lease_token IS NULL
+                AND route.current_node_id = $2
+                AND route.execution_generation < $3
+                AND provenance.last_execution_generation >= $3"
+        ))
+        .bind(sandbox.id.as_uuid())
+        .bind(node.id.as_uuid())
+        .bind(record_generation)
+        .bind(SubstrateKind::Space)
+        .bind(read_lifecycle.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .db_context("failed to read the unplaced sandbox's route identity")?
+        .is_some();
+        if !trails {
+            return Ok(RouteCatchUp::NotNeeded);
+        }
+        let endpoint = Self::endpoint(&node.node_api_endpoint)?;
+        let mut observer = connect_worker(endpoint.clone()).await.map_err(|error| {
+            SubstrateError::Unavailable {
+                message: format!(
+                    "worker node {} API is unavailable at {endpoint:?}: {error}",
+                    node.id
+                ),
+            }
+        })?;
+        observer
+            .require_activation_policy_support(timeout)
+            .await
+            .map_err(|error| SubstrateError::Unavailable {
+                message: error.to_string(),
+            })?;
+        let response = match observer
+            .internal_client()
+            .wake_sandbox(
+                self.wake_request_with_policy(
+                    sandbox,
+                    None,
+                    Some(record_generation),
+                    wake_activity,
+                )
+                .await?,
+            )
+            .await
+        {
+            Ok(response) => response.into_inner(),
+            Err(status)
+                if pplx_space_sbx_mgr_client::is_authoritative_route_identity_required(&status)
+                    || wake_requires_restore(&status) =>
+            {
+                return Ok(RouteCatchUp::NotRunning);
+            }
+            Err(status) => return Err(wake_rpc_error(&status, wake_activity)),
+        };
+        // Only the worker's own receipt names the execution it runs; without
+        // one the adoption keeps the read lifecycle.
+        if response.route_identity.is_none() {
+            return Ok(RouteCatchUp::NotNeeded);
+        }
+        let receipt = self
+            .persist_wake_route_identity(sandbox.id, node.id, &response)
+            .await?;
+        Ok(match receipt {
+            Some(receipt) => RouteCatchUp::CaughtUp {
+                execution_generation: receipt.execution_generation().get(),
+            },
+            None => RouteCatchUp::NotNeeded,
+        })
+    }
+
     /// Places a row with no active node back on `node` when the record there
     /// still holds or is moving a VM and no restore owner can still record a
     /// newer execution. A wake that raced that node's suspend leaves such a
@@ -3198,11 +3337,15 @@ impl DirectSubstrate {
     ///   execution.
     /// - A record older than the route identity is not adopted.
     ///
-    /// A `Started` record leaves the row `started`; any other keeps the read
-    /// lifecycle for the wake through its worker to finish, and that Wake's
-    /// receipt catches the route identity up to the record. Returns the node
-    /// the row is placed on, which is another writer's when that writer
-    /// placed it first.
+    /// A `Started` record leaves the row `started` only when the route
+    /// identity already names the record's execution, so a route token minted
+    /// from it reaches that execution. The wake path catches a trailing route
+    /// identity up first (`catch_up_route_identity`). Otherwise the row keeps
+    /// the read lifecycle for the wake through its worker to finish, and that
+    /// Wake's receipt catches the route identity up. A `started` row the
+    /// lookup adopts stays `started` with its route identity as it was.
+    /// Returns the node the row is placed on, which is another writer's when
+    /// that writer placed it first.
     async fn adopt_live_source_record(
         &self,
         sandbox_id: SandboxId,
@@ -3225,13 +3368,36 @@ impl DirectSubstrate {
             record.observed_lifecycle(),
             Ok(SandboxLifecycleState::Started)
         );
+        self.adopt_live_execution(
+            sandbox_id,
+            read_lifecycle,
+            node,
+            execution_generation,
+            started,
+        )
+        .await
+    }
+
+    /// [`Self::adopt_live_source_record`] for an execution on `node` at
+    /// `execution_generation`, `started` when its worker runs it.
+    async fn adopt_live_execution(
+        &self,
+        sandbox_id: SandboxId,
+        read_lifecycle: SandboxLifecycle,
+        node: &DirectNode,
+        execution_generation: i64,
+        started: bool,
+    ) -> Result<Option<DirectNode>, SubstrateError> {
         let adopted = sqlx::query(sql!(
             "UPDATE sandboxes s
                 SET active_node_id = $2,
                     target_node_id = $2,
                     placement = 'on_node',
                     placement_changed_at = NOW(),
-                    lifecycle = CASE WHEN $5 THEN 'started' ELSE s.lifecycle END
+                    lifecycle = CASE
+                        WHEN $5 AND route.execution_generation = $4 THEN 'started'
+                        ELSE s.lifecycle
+                    END
                FROM sandbox_direct_route_identities route,
                     sandbox_direct_route_provenance provenance
               WHERE s.id = $1
@@ -4532,8 +4698,37 @@ impl SubstrateAdapter for DirectSubstrate {
                                 sandbox_id, node.id, &record, activity,
                             )?;
                         }
-                        self.adopt_live_source_record(sandbox_id, lifecycle, &node, &record)
+                        let budget =
+                            deadline.saturating_duration_since(tokio::time::Instant::now());
+                        match self
+                            .catch_up_route_identity(
+                                sandbox,
+                                lifecycle,
+                                &node,
+                                &record,
+                                budget,
+                                wake_activity,
+                            )
                             .await?
+                        {
+                            RouteCatchUp::NotNeeded => {
+                                self.adopt_live_source_record(sandbox_id, lifecycle, &node, &record)
+                                    .await?
+                            }
+                            RouteCatchUp::CaughtUp {
+                                execution_generation,
+                            } => {
+                                self.adopt_live_execution(
+                                    sandbox_id,
+                                    lifecycle,
+                                    &node,
+                                    execution_generation,
+                                    true,
+                                )
+                                .await?
+                            }
+                            RouteCatchUp::NotRunning => None,
+                        }
                     }
                     None => None,
                 };
@@ -4655,18 +4850,7 @@ impl SubstrateAdapter for DirectSubstrate {
             {
                 return self.restore_for_wake(sandbox, timeout).await;
             }
-            // The worker's effective policy refused an implicit wake. That is
-            // a terminal policy answer, not a transient runtime failure.
-            Err(status) if wake_activity.is_some() && status.code() == Code::FailedPrecondition => {
-                return Err(SubstrateError::Conflict {
-                    message: status.message().to_string(),
-                });
-            }
-            Err(error) => {
-                return Err(SubstrateError::Failed {
-                    message: format!("node-api wake error: {error}"),
-                });
-            }
+            Err(status) => return Err(wake_rpc_error(&status, wake_activity)),
         };
         let response = response.into_inner();
         let route_identity = self

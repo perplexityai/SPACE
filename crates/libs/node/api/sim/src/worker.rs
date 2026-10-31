@@ -1827,6 +1827,9 @@ async fn sim_wake(
     activation_policy: Option<sbx::AutoLifecyclePolicy>,
     expected_execution_generation: Option<i64>,
 ) -> Result<Response<sbx::WakeResponse>, Status> {
+    if state.take_wake_failure(sandbox_id).await {
+        return Err(Status::unavailable("simulated worker stopped answering"));
+    }
     if expected_execution_generation.is_some() && activation_policy.is_none() {
         return Err(Status::invalid_argument(
             "wake execution generation requires a policy",
@@ -1946,10 +1949,11 @@ async fn sim_wake(
     }
     // Authoritative Wake adopts and acknowledges the requested identity even
     // when the resident lifecycle needs no transition. Without a request, a
-    // Direct record reports the identity it holds, as sandbox-manager does;
-    // a Kubernetes one keeps the legacy resident response: the record does
-    // not retain enough runtime-owned Kubernetes dimensions to reconstruct a
-    // complete receipt.
+    // record seeded as Direct (`SandboxRecord::with_route_identity_provenance`)
+    // reports the identity it holds, as sandbox-manager does. Any other keeps
+    // the legacy resident response: the simulator's own Create and Start do
+    // not mark a record Direct, and a Kubernetes record does not retain
+    // enough runtime-owned dimensions to reconstruct a complete receipt.
     let route_identity = match transition {
         sbx::WakeTransition::Noop | sbx::WakeTransition::Resume | sbx::WakeTransition::Wait
             if requested_identity.is_none() =>

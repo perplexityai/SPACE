@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -120,6 +120,7 @@ const SNAPSHOT_VERSION: u32 = 1;
 pub struct SimState {
     inner: Arc<Mutex<HashMap<String, SandboxRecord>>>,
     transition_after_state_read: Arc<Mutex<HashMap<String, String>>>,
+    failing_wakes: Arc<Mutex<HashSet<String>>>,
     snapshot_dir: PathBuf,
     node_id: String,
     fs: crate::fs::SandboxFs,
@@ -162,6 +163,7 @@ impl SimState {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
             transition_after_state_read: Default::default(),
+            failing_wakes: Default::default(),
             snapshot_dir,
             node_id,
             fs: crate::fs::SandboxFs::new(sandbox_fs_dir),
@@ -285,6 +287,16 @@ impl SimState {
             .lock()
             .await
             .insert(sandbox_id, target.to_owned());
+    }
+
+    /// Fail the next Wake of `sandbox_id` before it touches the record, as a
+    /// worker that stops answering after a State observation does.
+    pub async fn fail_next_wake(&self, sandbox_id: String) {
+        self.failing_wakes.lock().await.insert(sandbox_id);
+    }
+
+    pub(crate) async fn take_wake_failure(&self, sandbox_id: &str) -> bool {
+        self.failing_wakes.lock().await.remove(sandbox_id)
     }
 
     pub async fn state_of(&self, ids: &[String]) -> (Vec<SandboxRecord>, Vec<String>) {
