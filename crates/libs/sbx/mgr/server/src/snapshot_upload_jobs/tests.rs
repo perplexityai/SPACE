@@ -59,6 +59,123 @@ async fn upload_executor_converges_unstaged_metadata_failure() {
     );
 }
 
+/// An upload whose artifact a newer suspend replaced fails for good on its
+/// first attempt, before reaching volume-manager, and cleans up after itself.
+#[tokio::test]
+async fn upload_of_a_replaced_artifact_fails_permanently_without_a_transfer() {
+    let staging = tempfile::tempdir().unwrap();
+    let snapshot_dir = staging.path().join("snapshot");
+    write_snapshot_dir_fixture(&snapshot_dir);
+    std::fs::write(
+        snapshot_dir.join(crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME),
+        format!(r#"{{"local_artifact_id":"{}"}}"#, LocalArtifactId::new()),
+    )
+    .unwrap();
+    let metadata_dir = staging.path().join("metadata");
+    std::fs::create_dir(&metadata_dir).unwrap();
+    let mut payload = reclaim_fixture_payload("01939e3e-eeee-7000-8000-000000000021", snapshot_dir);
+    payload.metadata_staging_dir = Some(metadata_dir.clone());
+    let executor = SnapshotUploadExecutor {
+        db: crate::db::SharedConnection::new(open_backfill_test_db()),
+        drain_state: crate::service::tests::closed_drain_for_test(),
+        node_manager: crate::node_manager_transport::fake::unbound_in_absent_dir(),
+        volume_manager_socket: absent_volume_manager_socket(),
+        retained_source_inspector: std::sync::Arc::new(crate::retained_source::FakeInspector::new(
+            crate::retained_source::RetainedSourceCheck::Absent,
+        )),
+    };
+    let job = job_fixture(
+        SNAPSHOT_UPLOAD_JOB_KIND,
+        serde_json::to_string(&payload).unwrap(),
+    );
+
+    let error = executor
+        .execute(&job, tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.kind(),
+        pplx_space_common_jobs::JobFailureKind::Permanent,
+        "{}",
+        error.message()
+    );
+    assert!(
+        error.message().starts_with("artifact superseded"),
+        "{}",
+        error.message()
+    );
+    assert!(!metadata_dir.exists());
+}
+
+/// A replaced artifact's attempt whose synchronous handoff staged its
+/// transfers before the newer suspend published continues with them.
+#[tokio::test(start_paused = true)]
+async fn upload_of_a_replaced_artifact_rejoins_the_transfers_its_handoff_staged() {
+    let staging = tempfile::tempdir().unwrap();
+    let snapshot_dir = staging.path().join("snapshot");
+    write_snapshot_dir_fixture(&snapshot_dir);
+    std::fs::write(
+        snapshot_dir.join(crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME),
+        format!(r#"{{"local_artifact_id":"{}"}}"#, LocalArtifactId::new()),
+    )
+    .unwrap();
+    let metadata_dir = staging.path().join("metadata");
+    std::fs::create_dir(&metadata_dir).unwrap();
+    let mut payload = reclaim_fixture_payload("01939e3e-eeee-7000-8000-000000000022", snapshot_dir);
+    payload.metadata_staging_dir = Some(metadata_dir.clone());
+    let db = crate::db::SharedConnection::new(open_backfill_test_db());
+    let executor = SnapshotUploadExecutor {
+        db: db.clone(),
+        drain_state: crate::service::tests::closed_drain_for_test(),
+        node_manager: crate::node_manager_transport::fake::unbound_in_absent_dir(),
+        volume_manager_socket: absent_volume_manager_socket(),
+        retained_source_inspector: std::sync::Arc::new(crate::retained_source::FakeInspector::new(
+            crate::retained_source::RetainedSourceCheck::Absent,
+        )),
+    };
+    let job = job_fixture(
+        SNAPSHOT_UPLOAD_JOB_KIND,
+        serde_json::to_string(&payload).unwrap(),
+    );
+    // The handoff persists the transfers after this attempt read the job.
+    let mut staged = payload.clone();
+    staged.job_ids = vec![JobId::new()];
+    pplx_space_common_jobs::db::insert_job(
+        db.lock().unwrap().raw(),
+        pplx_space_common_jobs::db::InsertJob {
+            job_id: &job.job_id,
+            kind: SNAPSHOT_UPLOAD_JOB_KIND,
+            payload: &serde_json::to_string(&staged).unwrap(),
+            subject_id: None,
+            dedup_key: None,
+            max_attempts: 1,
+            traceparent: None,
+            priority: Default::default(),
+        },
+    )
+    .unwrap();
+
+    let error = executor
+        .execute(&job, tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap_err();
+
+    // It goes on to observe the staged transfer, which needs a volume-manager.
+    assert_eq!(
+        error.kind(),
+        pplx_space_common_jobs::JobFailureKind::Retriable,
+        "{}",
+        error.message()
+    );
+    assert!(
+        error.message().contains(&staged.job_ids[0].to_string()),
+        "{}",
+        error.message()
+    );
+    assert!(metadata_dir.exists());
+}
+
 // The schedule `poll_artifact_job` probes on: soon after a completion, and
 // at a bounded rate through a long transfer. The probing itself needs a
 // volume-manager and is covered by the transfer tests.

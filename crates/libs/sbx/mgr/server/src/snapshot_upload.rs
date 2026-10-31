@@ -1022,11 +1022,12 @@ pub(crate) fn prepare_suspend_snapshot(
 ///
 /// The immutable snapshot attempt determines every source and destination, so
 /// replay after a worker restart rejoins vol-mgr's persisted transfer jobs.
-pub async fn submit_prepared_snapshot(
+pub(crate) async fn submit_prepared_snapshot(
     prepared: &SnapshotUploadJobs,
     node_manager: &crate::node_manager_transport::NodeManagerConnector,
     volume_manager_socket: &Path,
-) -> Result<SnapshotUploadJobs, String> {
+) -> Result<SnapshotUploadJobs, SubmitPreparedError> {
+    check_prepared_artifact(prepared).await?;
     let mut prepared = prepared.clone();
     if !prepared.deferred_metadata
         && let Some(source_id) = prepared.meta.rootfs_send_source_id
@@ -1073,9 +1074,15 @@ pub async fn submit_prepared_snapshot(
         .await
         .map_err(|e| format!("vol-mgr connect failed: {e}"))?;
     let mut job_ids = Vec::with_capacity(artifacts.len());
+    let mut attempted = 0;
     let mut errors = Vec::new();
+    // Volume-manager can refuse the rootfs send on its source identity, and no
+    // other transfer. Submitting it first keeps such a refusal from leaving the
+    // plain-file pushes queued under this attempt.
+    let mut order: Vec<_> = artifacts.iter().enumerate().collect();
+    order.sort_by_key(|(_, artifact)| artifact.kind != SnapshotArtifact::RootfsBtrfsSend);
 
-    for artifact in &artifacts {
+    for (index, artifact) in order {
         if prepared.deferred_metadata && artifact.kind == SnapshotArtifact::Metadata {
             continue;
         }
@@ -1093,6 +1100,7 @@ pub async fn submit_prepared_snapshot(
         let s3_uri = build_artifact_uri(&key, &prepared.config);
         let local_path = src.to_string_lossy().into_owned();
 
+        attempted += 1;
         let submitted =
             if prepared.deferred_metadata && artifact.kind == SnapshotArtifact::RootfsBtrfsSend {
                 client
@@ -1135,30 +1143,122 @@ pub async fn submit_prepared_snapshot(
                     job_id = %job_id,
                     "snapshot artifact upload submitted"
                 );
-                job_ids.push(job_id);
+                job_ids.push((index, job_id));
             }
             Err(e) => {
                 errors.push(format!("{}: {e}", artifact.local_name));
+                if artifact.kind == SnapshotArtifact::RootfsBtrfsSend {
+                    break;
+                }
             }
         }
     }
 
     if !errors.is_empty() {
-        return Err(format!(
-            "vol-mgr submit_push_file failed for {} of {} artifacts; \
-             {} successfully-queued upload(s) will run as S3 orphans for \
+        return Err(SubmitPreparedError::Failed(format!(
+            "vol-mgr submission failed for {} of the {attempted} artifact(s) \
+             submitted; {} queued upload(s) will run as S3 orphans for \
              snapshot {} until retention prunes them: [{}]",
             errors.len(),
-            artifacts.len(),
             job_ids.len(),
             prepared.snapshot_id,
             errors.join("; ")
-        ));
+        )));
     }
 
+    // A newer suspend can publish while this one materializes its stream or
+    // between two submissions. Publication renames a whole directory into
+    // place and volume-manager stages each source when it is submitted, so an
+    // unchanged sidecar proves every staged file was this artifact's.
+    check_prepared_artifact(&prepared).await?;
+
+    // The worker reads transfer results in artifact order.
+    job_ids.sort_unstable_by_key(|&(index, _)| index);
     let mut submitted = prepared.clone();
-    submitted.job_ids = job_ids;
+    submitted.job_ids = job_ids.into_iter().map(|(_, job_id)| job_id).collect();
     Ok(submitted)
+}
+
+/// Why [`submit_prepared_snapshot`] did not return the upload's transfers.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SubmitPreparedError {
+    /// The artifact directory holds another artifact, so no retry can upload
+    /// this one. Found after submitting, the transfers already queued are
+    /// left to run as orphans under this attempt.
+    #[error("artifact superseded: {0}")]
+    Superseded(#[from] Supersession),
+    #[error("{0}")]
+    Failed(String),
+}
+
+impl From<String> for SubmitPreparedError {
+    fn from(error: String) -> Self {
+        Self::Failed(error)
+    }
+}
+
+impl From<&'static str> for SubmitPreparedError {
+    fn from(error: &'static str) -> Self {
+        Self::Failed(error.to_owned())
+    }
+}
+
+/// A newer artifact published over the directory an upload was prepared
+/// from.
+#[derive(Debug, thiserror::Error)]
+#[error("{snapshot_dir} now holds artifact {found}, not {expected}")]
+pub(crate) struct Supersession {
+    snapshot_dir: PathBuf,
+    expected: LocalArtifactId,
+    found: LocalArtifactId,
+}
+
+/// Refuse an upload whose directory now holds another artifact. A suspend
+/// publishes over the sandbox's one canonical directory, so an upload
+/// submitted after a newer suspend would push that suspend's files under this
+/// attempt, then have its rootfs send refused on the old source identity on
+/// every retry.
+///
+/// Only a sidecar naming another artifact is evidence. A publication can be
+/// between its renames, so a missing sidecar or retained source is left to
+/// the submission, which fails it as retriable.
+async fn check_prepared_artifact(prepared: &SnapshotUploadJobs) -> Result<(), SubmitPreparedError> {
+    #[derive(serde::Deserialize)]
+    struct SidecarIdentity {
+        #[serde(default)]
+        local_artifact_id: Option<LocalArtifactId>,
+    }
+    let snapshot_dir = &prepared.snapshot_dir;
+    // Only a suspend publishes over a directory. An imported artifact's
+    // sidecar can carry another id than the one its upload names.
+    let (Some(ArtifactOrigin::Suspend), Some(expected)) = (
+        prepared.meta.artifact_origin,
+        prepared.meta.local_artifact_id,
+    ) else {
+        return Ok(());
+    };
+    if !crate::service::is_canonical_suspend_snapshot_dir(snapshot_dir) {
+        return Ok(());
+    }
+    let sidecar = snapshot_dir.join(SNAPSHOT_METADATA_FILENAME);
+    let bytes = match tokio::fs::read(&sidecar).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("read {}: {error}", sidecar.display()).into()),
+    };
+    let identity: SidecarIdentity = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("parse {}: {error}", sidecar.display()))?;
+    // A sidecar without an identity predates artifact ids and proves nothing
+    // either way.
+    match identity.local_artifact_id {
+        Some(found) if found != expected => Err(Supersession {
+            snapshot_dir: snapshot_dir.clone(),
+            expected,
+            found,
+        }
+        .into()),
+        _ => Ok(()),
+    }
 }
 
 pub(crate) fn cleanup_metadata_staging_dir(jobs: &SnapshotUploadJobs) {
