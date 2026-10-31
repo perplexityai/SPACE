@@ -77,6 +77,7 @@ pplx-space-db-test-fixtures = { workspace = true }
 pplx-space-placement = { workspace = true, features = ["test-support"] }
 pplx-space-metrics = { workspace = true, features = ["test-capture"] }
 pplx-space-node-api-sim = { workspace = true }
+pplx-space-observability = { workspace = true, features = ["otel", "test-capture"] }
 pplx-space-test-env = { workspace = true }
 rstest = { workspace = true }
 tempfile = { workspace = true }

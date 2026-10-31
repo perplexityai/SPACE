@@ -740,3 +740,45 @@ async fn a_reattach_wakes_an_unplaced_sandbox_whatever_its_direct_route_names()
     }
     Ok(())
 }
+
+/// A route reset coalesces onto a claimed ref without taking its retry
+/// progress, and saves the caller's trace context for the pass that applies it.
+#[tokio::test(flavor = "current_thread")]
+async fn route_reset_enqueue_keeps_a_claimed_refs_progress_and_saves_the_trace()
+-> pplx_space_test_env::TestResult {
+    use crate::tests::queued_ref::{
+        CALLER_TRACEPARENT, QueuedRefProgress, queue_claimed_retrying_ref, queued_ref_progress,
+    };
+
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let node_id = NodeId::new();
+    let sandbox_id = SandboxId::new();
+    pplx_space_db_test_fixtures::insert_ready_worker_node(&db.pool, node_id).await?;
+    let reference = ReconcileRef::sandbox_desired_state(sandbox_id);
+    let element = sandbox_id.to_string();
+    queue_claimed_retrying_ref(&db.pool, node_id, reference.facet_str(), &element).await?;
+
+    let mut tx = db.pool.begin().await?;
+    pplx_space_observability::test_trace::in_remote_parent_span(
+        CALLER_TRACEPARENT,
+        enqueue_sandbox_desired_state_reconcile_tx(&mut tx, sandbox_id, node_id),
+    )
+    .await?;
+    tx.commit().await?;
+
+    assert_eq!(
+        queued_ref_progress(&db.pool, node_id, reference.facet_str(), &element).await?,
+        (
+            QueuedRefProgress {
+                generation: 4,
+                attempts: 2,
+                last_error: "synthetic failure".to_string(),
+                claim_token: "claimant".to_string(),
+                requested_now: false,
+                due_now: false,
+            },
+            true,
+        )
+    );
+    Ok(())
+}
