@@ -5,7 +5,7 @@ import Link from 'next/link';
 import styles from './inventory.module.css';
 import { lookupScopeText, orgOptionLabels, parseOrgParam, scopedRefreshKey } from '@/lib/org-filter';
 import { usePathname, useSearchParams } from 'next/navigation';
-import { SANDBOX_LIFECYCLE_STATES, bringUpAction } from '@/lib/sandbox-lifecycle';
+import { SANDBOX_STATUS_FILTER_STATES, bringUpAction } from '@/lib/sandbox-lifecycle';
 import {
   DEFAULT_LIST_LIMIT,
   LIST_LIMIT_OPTIONS,
@@ -128,7 +128,7 @@ const AGE_WINDOW_OPTIONS: { value: AgeWindow; label: string; ms: number | null }
   { value: 'all', label: 'All time',    ms: null },
 ];
 
-const STATUS_FILTER_OPTIONS = SANDBOX_LIFECYCLE_STATES;
+const STATUS_FILTER_OPTIONS = SANDBOX_STATUS_FILTER_STATES;
 
 function formatBytes(n: number | null | undefined) {
   if (n === null || n === undefined) return '—';
