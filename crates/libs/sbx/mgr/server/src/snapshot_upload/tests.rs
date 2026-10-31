@@ -705,8 +705,9 @@ fn storage_uri_honours_key_prefix() {
 }
 
 /// A volume-manager that accepts every submission with a fresh transfer and
-/// records each call's method and transfer. `on_submit` runs as each call
-/// arrives.
+/// records each call's method and transfer, or refuses the rootfs send when
+/// `refuse_send`, as node-manager's stager refuses a changed or missing
+/// source. `on_submit` runs as each call arrives.
 struct RecordingVolumeManager {
     socket: std::path::PathBuf,
     calls: std::sync::Arc<std::sync::Mutex<Vec<(String, JobId)>>>,
@@ -742,11 +743,11 @@ async fn accept_transfer<Req: prost::Message + Default + Send + 'static>(
 }
 
 impl RecordingVolumeManager {
-    fn serve() -> Self {
-        Self::serve_with(|| {})
+    fn serve(refuse_send: bool) -> Self {
+        Self::serve_with(refuse_send, || {})
     }
 
-    fn serve_with(on_submit: impl Fn() + Clone + Send + 'static) -> Self {
+    fn serve_with(refuse_send: bool, on_submit: impl Fn() + Clone + Send + 'static) -> Self {
         use pplx_space_volmgr_client::proto as vol;
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("volume-manager.sock");
@@ -766,6 +767,10 @@ impl RecordingVolumeManager {
             on_submit();
             async move {
                 Ok::<_, std::convert::Infallible>(match method.as_str() {
+                    "SubmitPushBtrfsSend" if refuse_send => {
+                        tonic::Status::failed_precondition("send source identity changed")
+                            .into_http()
+                    }
                     "SubmitPushBtrfsSend" => {
                         accept_transfer::<vol::PushBtrfsSendRequest>(request, job_id).await
                     }
@@ -855,7 +860,7 @@ async fn upload_prepared_before_a_newer_publication_queues_no_transfer() {
     std::fs::rename(&canonical, tmp.path().join("retired")).unwrap();
     let newer = LocalArtifactId::new();
     publish_full_artifact(&canonical, newer);
-    let volume_manager = RecordingVolumeManager::serve();
+    let volume_manager = RecordingVolumeManager::serve(false);
 
     let error = submit_prepared_snapshot(
         &prepared,
@@ -884,7 +889,7 @@ async fn upload_of_an_unchanged_artifact_queues_every_transfer() {
         &canonical,
         &publish_full_artifact(&canonical, LocalArtifactId::new()),
     );
-    let volume_manager = RecordingVolumeManager::serve();
+    let volume_manager = RecordingVolumeManager::serve(false);
 
     let submitted = submit_prepared_snapshot(
         &prepared,
@@ -908,6 +913,9 @@ async fn upload_of_an_unchanged_artifact_queues_every_transfer() {
 /// A deferred upload's sidecar decides its submission: one naming another
 /// artifact supersedes it before any transfer. A missing retained source,
 /// which a publication between its renames also shows, supersedes nothing.
+/// Behind its own sidecar the upload submits the rootfs send first, so a
+/// refused send queues nothing else and stays retriable, and the transfers
+/// keep the artifact order the worker reads results in.
 #[tokio::test]
 async fn sidecar_identity_decides_a_deferred_submission() {
     use pplx_space_node_mgr_client::proto::{
@@ -919,13 +927,15 @@ async fn sidecar_identity_decides_a_deferred_submission() {
         Superseded,
         Failed,
     }
-    for (own_sidecar, methods, expected) in [
+    for (own_sidecar, refuse_send, methods, expected) in [
         (
             true,
-            vec!["SubmitPushFile", "SubmitPushFile", "SubmitPushBtrfsSend"],
+            false,
+            vec!["SubmitPushBtrfsSend", "SubmitPushFile", "SubmitPushFile"],
             Outcome::Submitted,
         ),
-        (false, vec![], Outcome::Superseded),
+        (true, true, vec!["SubmitPushBtrfsSend"], Outcome::Failed),
+        (false, false, vec![], Outcome::Superseded),
     ] {
         let artifact = DeferredArtifact::new();
         let local_artifact_id = LocalArtifactId::new();
@@ -962,13 +972,13 @@ async fn sidecar_identity_decides_a_deferred_submission() {
                 },
             )
             .serve();
-        let volume_manager = RecordingVolumeManager::serve();
+        let volume_manager = RecordingVolumeManager::serve(refuse_send);
 
         let result =
             submit_prepared_snapshot(&prepared, &node_manager.connector(), &volume_manager.socket)
                 .await;
 
-        let case = format!("own_sidecar={own_sidecar}: {result:?}");
+        let case = format!("own_sidecar={own_sidecar} refuse_send={refuse_send}: {result:?}");
         let outcome = match &result {
             Ok(_) => Outcome::Submitted,
             Err(SubmitPreparedError::Superseded(superseded)) if superseded.found == found => {
@@ -979,6 +989,17 @@ async fn sidecar_identity_decides_a_deferred_submission() {
         };
         assert_eq!(outcome, expected, "{case}");
         assert_eq!(volume_manager.methods(), methods, "{case}");
+        if let Ok(submitted) = result {
+            let send = upload_artifacts_for_meta(&submitted.meta)
+                .iter()
+                .position(|artifact| artifact.kind == SnapshotArtifact::RootfsBtrfsSend)
+                .unwrap();
+            assert_eq!(
+                submitted.job_ids[send],
+                volume_manager.calls()[0].1,
+                "{case}"
+            );
+        }
         cleanup_metadata_staging_dir(&prepared);
     }
 }
@@ -1005,7 +1026,7 @@ async fn upload_republished_during_submission_is_superseded() {
             });
         }
     };
-    let volume_manager = RecordingVolumeManager::serve_with(republish);
+    let volume_manager = RecordingVolumeManager::serve_with(false, republish);
 
     let error = submit_prepared_snapshot(
         &prepared,
@@ -1038,7 +1059,7 @@ async fn sidecar_identity_supersedes_only_a_canonical_suspend_upload() {
         // The sidecar names another id than the upload, as an import's
         // caller-supplied metadata can.
         publish_full_artifact(&dir, LocalArtifactId::new());
-        let volume_manager = RecordingVolumeManager::serve();
+        let volume_manager = RecordingVolumeManager::serve(false);
 
         let submitted = submit_prepared_snapshot(
             &prepared,

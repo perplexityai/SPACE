@@ -1074,9 +1074,15 @@ pub(crate) async fn submit_prepared_snapshot(
         .await
         .map_err(|e| format!("vol-mgr connect failed: {e}"))?;
     let mut job_ids = Vec::with_capacity(artifacts.len());
+    let mut attempted = 0;
     let mut errors = Vec::new();
+    // Volume-manager can refuse the rootfs send on its source identity, and no
+    // other transfer. Submitting it first keeps such a refusal from leaving the
+    // plain-file pushes queued under this attempt.
+    let mut order: Vec<_> = artifacts.iter().enumerate().collect();
+    order.sort_by_key(|(_, artifact)| artifact.kind != SnapshotArtifact::RootfsBtrfsSend);
 
-    for artifact in &artifacts {
+    for (index, artifact) in order {
         if prepared.deferred_metadata && artifact.kind == SnapshotArtifact::Metadata {
             continue;
         }
@@ -1094,6 +1100,7 @@ pub(crate) async fn submit_prepared_snapshot(
         let s3_uri = build_artifact_uri(&key, &prepared.config);
         let local_path = src.to_string_lossy().into_owned();
 
+        attempted += 1;
         let submitted =
             if prepared.deferred_metadata && artifact.kind == SnapshotArtifact::RootfsBtrfsSend {
                 client
@@ -1136,21 +1143,23 @@ pub(crate) async fn submit_prepared_snapshot(
                     job_id = %job_id,
                     "snapshot artifact upload submitted"
                 );
-                job_ids.push(job_id);
+                job_ids.push((index, job_id));
             }
             Err(e) => {
                 errors.push(format!("{}: {e}", artifact.local_name));
+                if artifact.kind == SnapshotArtifact::RootfsBtrfsSend {
+                    break;
+                }
             }
         }
     }
 
     if !errors.is_empty() {
         return Err(SubmitPreparedError::Failed(format!(
-            "vol-mgr submit_push_file failed for {} of {} artifacts; \
-             {} successfully-queued upload(s) will run as S3 orphans for \
+            "vol-mgr submission failed for {} of the {attempted} artifact(s) \
+             submitted; {} queued upload(s) will run as S3 orphans for \
              snapshot {} until retention prunes them: [{}]",
             errors.len(),
-            artifacts.len(),
             job_ids.len(),
             prepared.snapshot_id,
             errors.join("; ")
@@ -1163,8 +1172,10 @@ pub(crate) async fn submit_prepared_snapshot(
     // unchanged sidecar proves every staged file was this artifact's.
     check_prepared_artifact(&prepared).await?;
 
+    // The worker reads transfer results in artifact order.
+    job_ids.sort_unstable_by_key(|&(index, _)| index);
     let mut submitted = prepared.clone();
-    submitted.job_ids = job_ids;
+    submitted.job_ids = job_ids.into_iter().map(|(_, job_id)| job_id).collect();
     Ok(submitted)
 }
 
