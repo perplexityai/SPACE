@@ -1015,6 +1015,7 @@ impl SandboxManagerService {
         let ListRequest {
             page_size,
             page_token,
+            pool_members_only,
         } = request.into_inner();
         if page_token.len() > MAX_LIST_PAGE_TOKEN_BYTES {
             return Err(Status::invalid_argument("page_token is invalid"));
@@ -1025,9 +1026,14 @@ impl SandboxManagerService {
                 .unwrap_or(usize::MAX)
                 .min(pplx_space_common_core::inventory::MAX_ITEMS),
         };
+        let scope = if pool_members_only {
+            crate::db::inventory_read::ListPageScope::PoolMembers
+        } else {
+            crate::db::inventory_read::ListPageScope::All
+        };
         let page = self
             .storage(move |db| {
-                crate::db::scan::list_page(db, &page_token, limit)
+                crate::db::scan::list_page(db, &page_token, limit, scope)
                     .map_err(|error| error.into_status())
             })
             .await?;

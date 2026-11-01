@@ -2954,9 +2954,15 @@ type ListRequest struct {
 	// within its byte budgets. Zero selects the server's default page size.
 	PageSize uint32 `protobuf:"varint,1,opt,name=page_size,json=pageSize,proto3" json:"page_size,omitempty"`
 	// Opaque `next_page_token` from the previous page. Empty starts a scan.
-	PageToken     string `protobuf:"bytes,2,opt,name=page_token,json=pageToken,proto3" json:"page_token,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	PageToken string `protobuf:"bytes,2,opt,name=page_token,json=pageToken,proto3" json:"page_token,omitempty"`
+	// List only warm-pool members: sandboxes whose `pool_template` is set.
+	// Paging and the template-manager owner filter apply unchanged. A server
+	// that predates this field ignores it and lists every sandbox, so callers
+	// classify the rows they receive rather than trusting the filter. A sandbox
+	// that joins or leaves a pool during the scan may or may not appear.
+	PoolMembersOnly bool `protobuf:"varint,3,opt,name=pool_members_only,json=poolMembersOnly,proto3" json:"pool_members_only,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *ListRequest) Reset() {
@@ -3001,6 +3007,13 @@ func (x *ListRequest) GetPageToken() string {
 		return x.PageToken
 	}
 	return ""
+}
+
+func (x *ListRequest) GetPoolMembersOnly() bool {
+	if x != nil {
+		return x.PoolMembersOnly
+	}
+	return false
 }
 
 type ScanCleanupTargetsRequest struct {
@@ -13256,11 +13269,12 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"\x03env\x18\x01 \x03(\v21.space.sandbox.manager.v1.GetEnvResponse.EnvEntryR\x03env\x1a6\n" +
 	"\bEnvEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"I\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"u\n" +
 	"\vListRequest\x12\x1b\n" +
 	"\tpage_size\x18\x01 \x01(\rR\bpageSize\x12\x1d\n" +
 	"\n" +
-	"page_token\x18\x02 \x01(\tR\tpageToken\"\x1b\n" +
+	"page_token\x18\x02 \x01(\tR\tpageToken\x12*\n" +
+	"\x11pool_members_only\x18\x03 \x01(\bR\x0fpoolMembersOnly\"\x1b\n" +
 	"\x19ScanCleanupTargetsRequest\"\x8e\x01\n" +
 	"\x18CleanupTargetObservation\x12\x1d\n" +
 	"\n" +

@@ -563,6 +563,12 @@ message ListRequest {
   uint32 page_size = 1;
   // Opaque `next_page_token` from the previous page. Empty starts a scan.
   string page_token = 2;
+  // List only warm-pool members: sandboxes whose `pool_template` is set.
+  // Paging and the template-manager owner filter apply unchanged. A server
+  // that predates this field ignores it and lists every sandbox, so callers
+  // classify the rows they receive rather than trusting the filter. A sandbox
+  // that joins or leaves a pool during the scan may or may not appear.
+  bool pool_members_only = 3;
 }
 
 message ScanCleanupTargetsRequest {}
