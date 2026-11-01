@@ -59,7 +59,7 @@ async function main(): Promise<number> {
   if (mutate) {
     guardTargets(config, 'loop');
     if (!seed) throw new Error(`refusing to run the mutating steps without a seed state (${seedStatePath(config)}): run \`npm run seed\` first, or pass --no-mutate`);
-    await proveSameStack(config, seed.stack, 'loop');
+    await proveSameStack(config, seed.stack, 'loop', seedStatePath(config));
   } else {
     console.log(`[loop] target: console ${config.baseUrl} (read-only: --no-mutate)`);
   }
@@ -113,22 +113,33 @@ async function main(): Promise<number> {
   const recording = page.video();
   await context.close();
   await browser.close();
+  // A step that cleared the page because a live API key may have reached it
+  // (see the api-key-create-revoke step) leaves frames that may show one:
+  // the recording is deleted, not kept.
+  const exposed = c.shared.secretExposed;
+  let videoDeleted: string | undefined;
   if (recording) {
-    fs.renameSync(await recording.path(), path.join(runDir, 'run.webm'));
+    if (exposed) {
+      videoDeleted = `deleted the run's video: ${exposed}`;
+      console.log(videoDeleted);
+    } else {
+      fs.renameSync(await recording.path(), path.join(runDir, 'run.webm'));
+    }
     fs.rmSync(path.join(runDir, '.video'), { recursive: true, force: true });
   }
 
-  const summary: RunSummary & { mutate: boolean; slowMs: number; failingSteps: string[] } = {
+  const summary: RunSummary & { mutate: boolean; slowMs: number; failingSteps: string[]; videoDeleted?: string } = {
     baseUrl: config.baseUrl,
     startedAt: stamp,
     mutate,
     slowMs,
     steps: results.length,
     failingSteps: results.filter((r) => !r.ok).map((r) => r.name),
+    videoDeleted,
     results,
   };
   writeJson(path.join(runDir, 'summary.json'), summary);
-  fs.writeFileSync(path.join(runDir, 'summary.md'), markdown(summary, results));
+  fs.writeFileSync(path.join(runDir, 'summary.md'), markdown(summary, results, videoDeleted));
   const latest = path.join(config.outDir, 'runs', 'latest');
   fs.rmSync(latest, { force: true });
   fs.symlinkSync(path.basename(runDir), latest);
@@ -141,8 +152,9 @@ async function main(): Promise<number> {
   return comparison.newTypes.length ? 1 : 0;
 }
 
-function markdown(summary: RunSummary, results: StepResult[]): string {
+function markdown(summary: RunSummary, results: StepResult[], videoDeleted?: string): string {
   const lines = [`# Console loop run ${summary.startedAt}`, '', `Console: ${summary.baseUrl}`, ''];
+  if (videoDeleted) lines.push(`**${videoDeleted}**`, '');
   for (const r of results) {
     lines.push(`## ${r.index}. ${r.name} — ${r.ok ? 'ok' : 'events'}`, '', `URL: ${r.url}  `, `Screenshot: ${r.screenshot ?? 'none'}`, '');
     for (const e of r.events) lines.push(`- **${e.kind}** ${e.message}${e.body ? `\n  \`${e.body.replace(/\s+/g, ' ').slice(0, 300)}\`` : ''}`);

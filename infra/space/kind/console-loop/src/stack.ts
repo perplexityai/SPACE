@@ -53,7 +53,7 @@ export async function readStack(config: Config): Promise<StackReadings> {
 
 // Refuse unless every reading agrees and, when the state recorded a stack,
 // matches it. Returns the API client, signed in, and the identity.
-export async function proveSameStack(config: Config, recorded: StackIdentity | null, what: string): Promise<{ api: Api; identity: StackIdentity }> {
+export async function proveSameStack(config: Config, recorded: StackIdentity | null, what: string, stateFile: string): Promise<{ api: Api; identity: StackIdentity }> {
   const { readings, api } = await readStack(config);
   const [, identity] = readings[0];
   const disagree = readings.filter(([, reading]) => !sameStack(reading, identity));
@@ -62,7 +62,11 @@ export async function proveSameStack(config: Config, recorded: StackIdentity | n
     throw new Error(`refusing to ${what}: the console and the API are not one stack (${lines})`);
   }
   if (recorded && !sameStack(recorded, identity)) {
-    throw new Error(`refusing to ${what}: the seed state was recorded on ${show(recorded)}, but the target is ${show(identity)}`);
+    throw new Error(
+      `refusing to ${what}: the seed state ${stateFile} was recorded on ${show(recorded)}, but the target is ${show(identity)}. `
+      + `If the stack the state was recorded on no longer exists, delete ${stateFile}; its objects went with that stack. `
+      + 'Otherwise point --api-url and --base-url at that stack.',
+    );
   }
   console.log(`[${what}] stack: ${show(identity)}, read through the console and the API`);
   return { api, identity };

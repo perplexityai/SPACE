@@ -26,7 +26,15 @@ run that creates things:
   each signed in separately, through the API URL and through the console's
   origin, whose `/admin` and `/auth` proxies reach the backends its build
   names. They refuse when the readings differ, or differ from the identity
-  the seed recorded. API requests never follow a redirect.
+  the seed recorded. The tool's own API requests (the seeder's, `clean`'s
+  and the steps' checks) and the requests it intercepts in the browser never
+  follow a redirect; the console's own requests and navigations do.
+
+A state recorded on a stack that is gone, for example after the Kind cluster
+was recreated, is refused with the same message. If the stack the state was
+recorded on no longer exists, delete `<out>/seed-<prefix>.json`; its objects
+went with that stack. Otherwise point `--api-url` and `--base-url` at that
+stack.
 
 The check cannot prove more than that: the four readings came from one
 database at that moment. It does not cover the console's other routes
@@ -79,10 +87,20 @@ Each create is recorded before it is submitted, and its ID and operation as
 soon as the API answers. Seeding looks each object up by its prefixed name
 before creating it, and a rerun after an interruption first waits for the
 operations recorded for it. Organizations, users and API keys have no
-idempotent create, so a rerun finds them by slug, email or key name. A
-sandbox create is recorded with its idempotency key and request, and a
-rerun resubmits an unanswered one with the same key, which the API answers
-with the original operation if the first submit arrived. Seeding fails
+idempotent create, so a rerun finds them by slug, email or key name; their
+creates take effect before the API answers, so a lookup by name is
+authoritative. A sandbox create is recorded with its idempotency key and
+request, and a rerun resubmits an unanswered one with the same key and the
+recorded request, unchanged even when `--template` has changed since (the
+API refuses a key reused with another body), which the API answers with the
+original operation if the first submit arrived. Only a new create, after the
+earlier one has resolved, uses the current options and a new key.
+
+The outcome of each operation is recorded once it is seen finished, and not
+asked for again. The API deletes finished operations a week after they are
+created; one that is no longer there is recorded as `gone`, with an outcome
+nobody can read, and the seeder and `clean` decide from the object itself,
+looked up by its ID. Seeding fails
 (exit 2) when it cannot discover or set up a fixture. It ends by looking up
 every fixture the loop needs by ID: the organizations, users and API keys
 and, unless `--skip-sandboxes` was given, each sandbox in its resting state
@@ -94,20 +112,28 @@ through the console.
 - sandboxes, waiting first for every operation recorded for each, then for
   its delete and for it to leave `deleting`. A sandbox counts as gone only
   when it is deleted, or not found once nothing recorded for it is still
-  running. A create that was submitted but never answered is resubmitted
-  with its key to learn its operation;
+  running. A seed create that was submitted but never answered is
+  resubmitted, unchanged, with its key to learn its operation. A loop create
+  that left the browser with no answer, and has no sandbox of its name yet
+  (a create can stay queued, without a sandbox, after the loop is gone), is
+  unresolved: `clean` keeps it in the state, reports it, exits 1, and looks
+  it up by name in its organization again on the next run. `--forget-unresolved`
+  drops such creates on purpose. A loop create whose request never left the
+  browser is forgotten;
 - users and API keys, by ID, or by email or name when the create was never
-  answered.
+  answered;
+- the organizations loop runs created (`<prefix>-run-…`).
 
-It keeps organizations, since a seed reuses them by name, unless
+It keeps the seeded organizations (`<prefix>-acme`, `<prefix>-globex`,
+`<prefix>-globex-research`), which the next seed reuses by slug, unless
 `--delete-orgs` is given. Deleting an organization also deletes, by
 `ON DELETE CASCADE`, its API keys, organization and user credentials,
 credential references, master keys, storage vend identities, data-plane
 revocation epochs, public operations and idempotency records, and template
-build-base and publication grants. With `--delete-orgs`, `clean` deletes
-organizations children first, and refuses one that still holds a child
-organization, a user, an API key or a sandbox that is not deleted, and
-reports it. `clean` exits 1 when anything recorded was not deleted, and
+build-base and publication grants. `clean` deletes organizations children
+first, and refuses one that still holds a child organization, a user, an API
+key or a sandbox that is not deleted, and reports it; it does not check the
+rows that cascade. `clean` exits 1 when anything recorded was not deleted, and
 keeps those objects in the state for the next run. It removes the state file
 once nothing is left in it.
 
@@ -115,9 +141,10 @@ once nothing is left in it.
 exactly; a name that is neither is an error. The tags are `routes`, `orgs`,
 `users`, `api-keys`, `sandboxes`, `flows`, `lifecycle`, `templates`, `nodes`,
 `roles`. Sign-in always runs. Steps tagged `flows` create objects and delete
-them again; each records its object's name before it submits the create and
-the ID from the create's response, so if one fails before deleting, `npm run
-clean` removes what it recorded. They need a seed state for the prefix, and
+them again; each records its object's name before it submits the create, the
+ID from the create's response, and the operation of every sandbox action and
+delete as its answer arrives, so if one fails before deleting, `npm run clean`
+removes what it recorded. They need a seed state for the prefix, and
 the identity check above passes before any runs. `--no-mutate` skips them.
 The steps are in [`src/steps.ts`](src/steps.ts).
 
@@ -143,7 +170,8 @@ Every setting is a flag or an environment variable:
 | `--template` (seed) | `CONSOLE_LOOP_TEMPLATE` | `seed:latest` |
 
 A prefix is up to 32 lowercase letters, digits and dashes. `npm run seed`
-also takes `--skip-sandboxes`, and `npm run clean` takes `--delete-orgs`.
+also takes `--skip-sandboxes`, and `npm run clean` takes `--delete-orgs` and
+`--forget-unresolved`.
 `npm run loop` also takes `--label NAME`, `--slow-ms N` (default 1500),
 `--compare RUN`, `--headed`, and `--video`, which records the run as
 `run.webm` in its run directory. Run `npm run typecheck` and `npm test` (unit
@@ -257,15 +285,19 @@ This signs in, records the routes at 1280×800, and writes
 Step screenshots from a run are in its run directory. Attach media to the pull
 request instead of committing it.
 
-A new API key's secret is shown once, in a dialog. The API-key step answers
-the create request itself with `page.route`: it records the key's ID from
-the API's response and hands the page that response with the secret
-replaced, so the browser never holds a live key, and the dialog in its
-screenshots and video shows the placeholder
-`console-loop-placeholder-not-a-key`. The step fails, and skips its dialog
-screenshot, if the dialog shows anything shaped like a key, and the
-recorder replaces anything of that shape (64 hex characters) in what it
-writes with `<redacted>`. `npm run capture` only visits routes and creates
+A new API key's secret is shown once, in a dialog. The API-key step sends
+every POST through `page.route`: it fetches the answer without following a
+redirect (a 3xx is refused), records the key's ID from a create's answer (a
+POST whose path ends in `/api-keys`), and hands the page the answer with
+every `secret` replaced, so the browser never holds a live key, and the
+dialog in its screenshots and video shows the placeholder
+`console-loop-placeholder-not-a-key`. It fails closed: if a JSON answer with
+a `secret` reaches the page some other way, the dialog opens before the
+route answered the create, or the dialog shows anything shaped like a key,
+the step opens `about:blank` before any screenshot and fails, and with
+`--video` the run's video is deleted, which the run's output and summary
+say. The recorder replaces anything shaped like a key (64 hex characters) in
+what it writes with `<redacted>`. `npm run capture` only visits routes and creates
 no keys.
 
 The fixtures are synthetic, but screenshots and videos show everything the

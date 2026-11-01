@@ -2,9 +2,12 @@
 // checks what an operator relies on; the runner records everything else
 // (errors, failed and slow requests, screenshots). Steps that create or
 // change something are marked `mutates` and clean up after themselves.
-import type { Page, Response } from 'playwright';
+import type { Page, Request, Response, Route } from 'playwright';
 
-import { SECRET_PLACEHOLDER, adminFetch, confirmPopover, content, pickSelect, settle, shortLabel, signIn, text, visit, waitForStatus, withoutSecret, type Ctx } from './browser.ts';
+import {
+  SECRET_PLACEHOLDER, adminFetch, carriesSecret, confirmPopover, content, fetchWithoutRedirect, pickSelect, settle, shortLabel,
+  signIn, text, visit, waitForStatus, withoutSecret, type Ctx,
+} from './browser.ts';
 import { verifyFixtures } from './fixtures.ts';
 import { orgDisplayName, recordCreated } from './seed.ts';
 
@@ -29,6 +32,32 @@ const nextPost = (page: Page, pathname: (path: string) => boolean): Promise<Resp
   page.waitForResponse((res) => res.request().method() === 'POST' && pathname(new URL(res.url()).pathname), { timeout: 30_000 }).catch(() => null);
 const jsonOf = async (res: Response | null): Promise<any> => (res?.ok() ? res.json().catch(() => null) : null);
 const KEY_SHAPED = /\b[0-9a-f]{64}\b/i;
+const sbxId = (id: string) => (id.startsWith('sbx_') ? id : `sbx_${id}`);
+
+// Record the operation of every action or delete the page sends for a
+// sandbox, as its answer arrives, so `npm run clean` can wait for it. Call
+// the returned function when the step is done.
+const recordOperations = (c: Ctx, id: string, name: string): (() => Promise<void>) => {
+  const bare = id.replace(/^sbx_/, '');
+  const reads: Promise<void>[] = [];
+  const onResponse = (res: Response) => {
+    const method = res.request().method();
+    const pathname = new URL(res.url()).pathname;
+    if (method === 'GET' || !pathname.includes(bare)) return;
+    const colon = pathname.lastIndexOf(':');
+    const action = method === 'DELETE' ? 'delete' : colon >= 0 ? pathname.slice(colon + 1).replace(/^force-/, '') : method.toLowerCase();
+    reads.push(res.json().then((body) => {
+      if (typeof body?.operation_id === 'string') {
+        recordCreated(c.config, { kind: 'sandbox', name, operations: [{ id: body.operation_id, admin: pathname.startsWith('/admin/'), action }] });
+      }
+    }, () => {}));
+  };
+  c.page.on('response', onResponse);
+  return async () => {
+    c.page.off('response', onResponse);
+    await Promise.allSettled(reads);
+  };
+};
 const orgId = (c: Ctx, key: string) => seeded(c).orgs[key];
 const sandboxId = (c: Ctx, key: string) => seeded(c).sandboxes[key];
 const email = (c: Ctx, local: string) => `${c.config.prefix}-${local}@example.test`;
@@ -180,24 +209,51 @@ step('api-keys-list', ['api-keys'], async (c) => {
 });
 
 // The API answers a create with the new key's secret, which the page shows
-// once. The step answers that request itself: it records the key's ID from
-// the real response, then hands the page the response with the secret
-// replaced by a placeholder, so the browser never holds a live key.
+// once. For this step every POST goes through `page.route`: its answer is
+// fetched without following a redirect, any `secret` in it is replaced by a
+// placeholder before the page sees it, and a create (a POST whose path ends
+// in /api-keys) has its key's ID recorded first. It fails closed: when a
+// JSON answer with a `secret` reaches the page some other way, or the dialog
+// opens before the route answered the create, the page is cleared before
+// any screenshot, the step fails, and the loop deletes a --video recording.
 step('api-key-create-revoke', ['api-keys', 'flows'], async (c) => {
   const managing = seeded(c).managingOrgId;
-  const pattern = '**/admin/api/v1/orgs/*/api-keys';
-  let answered: (value: { id?: string; replaced: boolean } | null) => void = () => {};
-  const createAnswered = new Promise<{ id?: string; replaced: boolean } | null>((resolve) => { answered = resolve; });
-  await c.page.route(pattern, async (route) => {
-    if (route.request().method() !== 'POST') return route.fallback();
-    const response = await route.fetch();
+  const routed = new Set<Request>();
+  const reads: Promise<void>[] = [];
+  const leaks: string[] = [];
+  let created: { id?: string; replaced: boolean; refused?: boolean } | null = null;
+  const handler = async (route: Route) => {
+    const req = route.request();
+    if (req.method() !== 'POST') return route.fallback();
+    routed.add(req);
+    const isCreate = new URL(req.url()).pathname.endsWith('/api-keys');
+    const response = await fetchWithoutRedirect(route);
+    if (!response) {
+      if (isCreate) created = { replaced: false, refused: true };
+      return;
+    }
     const safe = withoutSecret(await response.text());
-    if (safe.id) recordCreated(c.config, { kind: 'apiKey', id: safe.id, name: c.runTag, orgId: managing });
-    answered({ id: safe.id, replaced: safe.replaced });
+    if (isCreate) {
+      if (safe.id) recordCreated(c.config, { kind: 'apiKey', id: safe.id, name: c.runTag, orgId: managing });
+      created = { id: safe.id, replaced: safe.replaced };
+    }
     const headers = { ...response.headers() };
     delete headers['content-length'];
     await route.fulfill({ status: response.status(), headers, body: safe.body });
-  });
+  };
+  const onResponse = (res: Response) => {
+    if (routed.has(res.request()) || !(res.headers()['content-type'] ?? '').includes('json')) return;
+    reads.push(res.text().then((body) => {
+      if (carriesSecret(body)) leaks.push(`${res.request().method()} ${new URL(res.url()).pathname}`);
+    }, () => {}));
+  };
+  const exposed = async (why: string): Promise<never> => {
+    await c.page.goto('about:blank');
+    c.shared.secretExposed = why;
+    throw new Error(`a live API key may have reached the page (${why}); the page was cleared before any screenshot`);
+  };
+  await c.page.route('**/*', handler);
+  c.page.on('response', onResponse);
   try {
     await visit(c, '/dashboard/api-keys');
     await c.page.getByRole('button', { name: 'Create API key' }).click();
@@ -205,20 +261,21 @@ step('api-key-create-revoke', ['api-keys', 'flows'], async (c) => {
     await modal.locator('input').first().fill(c.runTag);
     recordCreated(c.config, { kind: 'apiKey', name: c.runTag, orgId: managing });
     await modal.getByRole('button', { name: 'Create' }).click();
-    const created = await Promise.race([createAnswered, c.page.waitForTimeout(30_000).then(() => null)]);
-    c.rec.check(!!created?.id, "the create response carries the new key's ID");
-    c.rec.check(!!created?.replaced, "the create response's secret is replaced before the page sees it");
     const dialog = c.page.locator('.ant-modal:visible', { hasText: 'Copy this key now' });
-    await dialog.waitFor({ timeout: 10_000 });
+    const opened = await dialog.waitFor({ timeout: 30_000 }).then(() => true, () => false);
+    const answer = created as { id?: string; replaced: boolean; refused?: boolean } | null;
+    if (opened && !answer) await exposed('the dialog opened before the route answered the create');
+    await Promise.allSettled(reads);
+    if (leaks.length) await exposed(`an answer with a secret did not pass the route: ${leaks.join(', ')}`);
+    if (answer?.refused) return c.rec.check(false, 'the create is answered without a redirect');
+    c.rec.check(!!answer?.id, "the create response carries the new key's ID");
+    c.rec.check(!!answer?.replaced, "the create response's secret is replaced before the page sees it");
+    if (!opened) return c.rec.check(false, 'the dialog with the new key opens');
     const shown = await dialog.innerText();
-    const live = KEY_SHAPED.test(shown);
-    c.rec.check(!live && shown.includes(SECRET_PLACEHOLDER), 'the dialog shows the placeholder, not a key');
-    if (live) {
-      c.rec.note('dialog screenshot skipped: it shows something shaped like a key');
-    } else {
-      await c.page.waitForTimeout(800);
-      await c.page.screenshot({ path: `${c.rec.outDir}/api-key-dialog-placeholder.png` });
-    }
+    if (KEY_SHAPED.test(shown)) await exposed('the dialog shows something shaped like a key');
+    c.rec.check(shown.includes(SECRET_PLACEHOLDER), 'the dialog shows the placeholder, not a key');
+    await c.page.waitForTimeout(800);
+    await c.page.screenshot({ path: `${c.rec.outDir}/api-key-dialog-placeholder.png` });
     await c.page.getByRole('button', { name: 'Done' }).click();
     const row = c.page.locator('tr', { hasText: c.runTag });
     c.rec.check(await row.count() > 0, 'a created key appears in the list');
@@ -228,7 +285,8 @@ step('api-key-create-revoke', ['api-keys', 'flows'], async (c) => {
     await settle(c.page);
     c.rec.check(await c.page.locator('tr', { hasText: c.runTag }).count() === 0, 'a revoked key disappears');
   } finally {
-    await c.page.unroute(pattern);
+    c.page.off('response', onResponse);
+    await c.page.unroute('**/*', handler);
   }
 }, true);
 
@@ -279,23 +337,48 @@ step('sandbox-create', ['sandboxes', 'flows', 'lifecycle'], async (c) => {
   await card.getByPlaceholder('Name').fill(c.runTag);
   const managing = seeded(c).managingOrgId;
   recordCreated(c.config, { kind: 'sandbox', name: c.runTag, orgId: managing });
-  const response = nextPost(c.page, (p) => p.endsWith('/v1/sandboxes'));
-  await card.locator('button[type=submit]').click();
-  const res = await response;
-  const accepted = await jsonOf(res);
-  if (accepted?.operation_id) {
-    const admin = new URL(res!.url()).pathname.startsWith('/admin/');
-    const id = accepted.sandbox_id ? (accepted.sandbox_id.startsWith('sbx_') ? accepted.sandbox_id : `sbx_${accepted.sandbox_id}`) : undefined;
-    recordCreated(c.config, { kind: 'sandbox', id, name: c.runTag, orgId: managing, operations: [{ id: accepted.operation_id, admin, action: 'create' }] });
-    if (id) c.shared.sandbox = id;
+  // The create goes through `page.route`, so the state says the request
+  // left (`submitted`) before it does, and holds its operation as soon as
+  // the answer arrives: a create still queued when the loop dies is then
+  // kept as unresolved by `npm run clean`, not forgotten.
+  const isCreate = (url: URL) => url.pathname.endsWith('/v1/sandboxes');
+  let redirected = false;
+  const handler = async (route: Route) => {
+    if (route.request().method() !== 'POST') return route.fallback();
+    recordCreated(c.config, { kind: 'sandbox', name: c.runTag, orgId: managing, submitted: true });
+    const response = await fetchWithoutRedirect(route);
+    if (!response) {
+      redirected = true;
+      return;
+    }
+    const body = await response.text();
+    let accepted: { operation_id?: string; sandbox_id?: string } | null = null;
+    try { accepted = JSON.parse(body); } catch { /* not JSON */ }
+    if (response.ok() && typeof accepted?.operation_id === 'string') {
+      const id = typeof accepted.sandbox_id === 'string' ? sbxId(accepted.sandbox_id) : undefined;
+      const admin = new URL(route.request().url()).pathname.startsWith('/admin/');
+      recordCreated(c.config, { kind: 'sandbox', id, name: c.runTag, orgId: managing, operations: [{ id: accepted.operation_id, admin, action: 'create' }] });
+      if (id) c.shared.sandbox = id;
+    }
+    const headers = { ...response.headers() };
+    delete headers['content-length'];
+    await route.fulfill({ status: response.status(), headers, body });
+  };
+  await c.page.route(isCreate, handler);
+  try {
+    await card.locator('button[type=submit]').click();
+    await c.page.waitForTimeout(1500);
+  } finally {
+    await c.page.unroute(isCreate, handler);
   }
+  if (redirected) return c.rec.check(false, 'the create is answered without a redirect');
   const deadline = Date.now() + 120_000;
   while (Date.now() < deadline && !c.shared.sandbox) {
     await c.page.waitForTimeout(3000);
     const list = await adminFetch(c.page, 'GET', '/admin/api/v1/sandboxes?limit=5000');
     const row = (list.json ?? []).find((s: { name: string | null }) => s.name === c.runTag);
     if (row) {
-      c.shared.sandbox = row.id.startsWith('sbx_') ? row.id : `sbx_${row.id}`;
+      c.shared.sandbox = sbxId(row.id);
       recordCreated(c.config, { kind: 'sandbox', id: c.shared.sandbox, name: c.runTag, orgId: managing });
     }
   }
@@ -318,10 +401,15 @@ for (const [action, label, want, confirm] of [
     await waitForStatus(c, id, ['started', 'running', 'paused', 'suspended', 'stopped'], 120_000);
     const button = c.page.locator('.ant-card', { hasText: 'Controls' }).getByRole('button', { name: label });
     if (!(await button.isEnabled())) return c.rec.check(false, `${action} is enabled`);
-    await button.click();
-    if (confirm) await confirmPopover(c.page, label);
-    const reached = await waitForStatus(c, id, [...want], 240_000);
-    c.rec.check((want as readonly string[]).includes(reached), `${action} reaches ${want.join(' or ')} (${reached})`);
+    const recorded = recordOperations(c, id, c.runTag);
+    try {
+      await button.click();
+      if (confirm) await confirmPopover(c.page, label);
+      const reached = await waitForStatus(c, id, [...want], 240_000);
+      c.rec.check((want as readonly string[]).includes(reached), `${action} reaches ${want.join(' or ')} (${reached})`);
+    } finally {
+      await recorded();
+    }
   }, true);
 }
 
@@ -329,10 +417,15 @@ step('sandbox-delete', ['sandboxes', 'flows', 'lifecycle'], async (c) => {
   const id = c.shared.sandbox;
   if (!id) return;
   await visit(c, `/dashboard/sandboxes/${id}`, 2000);
-  await c.page.locator('.ant-card', { hasText: 'Controls' }).getByRole('button', { name: /Delete/ }).click();
-  await confirmPopover(c.page);
-  await c.page.waitForURL(/\/dashboard\/sandboxes$/, { timeout: 120_000 }).catch(() => {});
-  await settle(c.page, 2000);
+  const recorded = recordOperations(c, id, c.runTag);
+  try {
+    await c.page.locator('.ant-card', { hasText: 'Controls' }).getByRole('button', { name: /Delete/ }).click();
+    await confirmPopover(c.page);
+    await c.page.waitForURL(/\/dashboard\/sandboxes$/, { timeout: 120_000 }).catch(() => {});
+    await settle(c.page, 2000);
+  } finally {
+    await recorded();
+  }
   c.rec.check(/\/dashboard\/sandboxes$/.test(c.page.url()), 'deleting a sandbox returns to the list');
 }, true);
 

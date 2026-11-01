@@ -6,11 +6,15 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 
-import { SECRET_PLACEHOLDER, withoutSecret } from './browser.ts';
+import type { Operation } from './api.ts';
+import { SECRET_PLACEHOLDER, carriesSecret, withoutSecret } from './browser.ts';
 import { loadConfig } from './config.ts';
 import { isSelected, parseSelection } from './loop.ts';
 import { normalizer, redact } from './recorder.ts';
-import { readSeedState, seedStatePath, upsertCreated, writeSeedState, type SeedState } from './seed.ts';
+import {
+  isSeededOrg, nextCreate, readSeedState, seedStatePath, settleOperations, upsertCreated, writeSeedState,
+  type CreatedObject, type OperationRef, type SeedState,
+} from './seed.ts';
 import { sameStack } from './stack.ts';
 
 const STEPS = [
@@ -56,6 +60,9 @@ test('withoutSecret replaces the secret and redacts anything key-shaped', () => 
   assert.equal(other.replaced, false);
   assert.equal(other.body, 'not json <redacted>');
   assert.equal(withoutSecret('{"api_key":{"id":"k2"}}').replaced, false);
+  const nested = withoutSecret(JSON.stringify({ data: [{ secret: 'live-value' }] }));
+  assert.equal(nested.replaced, true);
+  assert.deepEqual(JSON.parse(nested.body), { data: [{ secret: SECRET_PLACEHOLDER }] });
   assert.equal(redact(`x ${secret} y`), 'x <redacted> y');
 });
 
@@ -106,4 +113,63 @@ test('two readings are one stack only when the cluster ID and creation time matc
   assert.equal(sameStack(a, { ...a }), true);
   assert.equal(sameStack(a, { ...a, clusterId: 'c2' }), false);
   assert.equal(sameStack(a, { ...a, clusterCreatedAt: 't2' }), false);
+});
+
+test('carriesSecret finds a secret string anywhere in a JSON body', () => {
+  assert.equal(carriesSecret('{"secret":"x"}'), true);
+  assert.equal(carriesSecret('{"items":[{"inner":{"secret":"x"}}]}'), true);
+  assert.equal(carriesSecret(`{"secret":"${SECRET_PLACEHOLDER}"}`), false);
+  assert.equal(carriesSecret('{"secret":null,"name":"secret"}'), false);
+  assert.equal(carriesSecret('secret: not json'), false);
+});
+
+test('settleOperations records outcomes, and a vanished operation as gone instead of failing', async () => {
+  const states: Record<string, (Operation | null)[]> = {
+    // Deleted by the operations GC: the API answers 404.
+    'op-gc': [null],
+    'op-run': [{ id: 'op-run', state: 'running' }, { id: 'op-run', state: 'succeeded', target_id: 'sbx_1' }],
+    'op-old': [{ id: 'op-old', state: 'failed' }],
+  };
+  const reads: string[] = [];
+  const read = async (op: OperationRef) => {
+    reads.push(op.id);
+    return states[op.id].length > 1 ? states[op.id].shift()! : states[op.id][0];
+  };
+  const entry: CreatedObject = {
+    kind: 'sandbox', name: 'loop-running',
+    operations: [
+      { id: 'op-gc', admin: false, action: 'create' },
+      { id: 'op-run', admin: true, action: 'delete' },
+      { id: 'op-old', admin: true, action: 'pause', outcome: 'failed' },
+    ],
+  };
+  let saves = 0;
+  await settleOperations(read, entry, () => { saves += 1; }, { pollMs: 0 });
+  assert.deepEqual(entry.operations, [
+    { id: 'op-gc', admin: false, action: 'create', outcome: 'gone' },
+    { id: 'op-run', admin: true, action: 'delete', outcome: 'succeeded', targetId: 'sbx_1' },
+    { id: 'op-old', admin: true, action: 'pause', outcome: 'failed' },
+  ]);
+  // An outcome already recorded is not asked for again, now or later.
+  assert.deepEqual(reads, ['op-gc', 'op-run', 'op-run']);
+  assert.equal(saves, 2);
+  await settleOperations(read, entry, () => { saves += 1; }, { pollMs: 0 });
+  assert.equal(reads.length, 3);
+});
+
+test('nextCreate replays an unanswered create unchanged and starts fresh only after one resolved', () => {
+  const recorded = { admin: false, body: { template: 'old:1', runtime: 'fc', name: 'loop-running' } };
+  const fresh = () => ({ idempotencyKey: 'new-key', request: { admin: false, body: { template: 'new:2', runtime: 'fc', name: 'loop-running' } } });
+  const unanswered: CreatedObject = { kind: 'sandbox', name: 'loop-running', idempotencyKey: 'old-key', request: recorded };
+  assert.deepEqual(nextCreate(unanswered, fresh), { idempotencyKey: 'old-key', request: recorded, replay: true });
+  const resolved: CreatedObject = { ...unanswered, operations: [{ id: 'op1', admin: false, action: 'create', outcome: 'gone' }] };
+  assert.deepEqual(nextCreate(resolved, fresh), { ...fresh(), replay: false });
+  assert.deepEqual(nextCreate(undefined, fresh), { ...fresh(), replay: false });
+});
+
+test('only the seeded org slugs are kept by default', () => {
+  assert.equal(isSeededOrg('loop', 'loop-acme'), true);
+  assert.equal(isSeededOrg('loop', 'loop-globex-research'), true);
+  assert.equal(isSeededOrg('loop', 'loop-run-mvxd0bs8'), false);
+  assert.equal(isSeededOrg('other', 'loop-acme'), false);
 });
