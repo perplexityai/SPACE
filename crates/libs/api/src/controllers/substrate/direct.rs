@@ -13,17 +13,22 @@
 //!   on the node holding the local artifact. Waking such a `suspended` or
 //!   `restoring` row, implicit or explicit, first reads that node's record.
 //!   An implicit wake refuses when the record is dormant under a Local
-//!   auto-lifecycle override that denies it. A record still running the
-//!   row's current execution generation (a wake raced the suspend) is
-//!   adopted: the row is placed back on that node and woken there. Otherwise
-//!   the wake restores through the restore lease, whose candidates try that
-//!   node first; a read that fails or does not answer in time restores under
-//!   the cluster policy. A `started` row left with no active node by that
-//!   race is adopted the same way when its worker is looked up. A cross-node
-//!   restore never deletes a source copy that reports a live record. Delete
-//!   reaches the active node, else that target node; with neither it returns
-//!   `Unavailable` and the caller removes the row without node-local
-//!   teardown.
+//!   auto-lifecycle override that denies it. A live record (a wake raced the
+//!   suspend) is adopted when it runs on the route identity's node, at or
+//!   above that identity's execution generation, and no restore owner can
+//!   still record a newer one: the row is placed back on that node and woken
+//!   there. A running record ahead of the route identity is woken before the
+//!   row is placed, so its receipt lands before the row reads `started`.
+//!   Otherwise the wake restores through the restore lease, whose
+//!   candidates try that node first; a read that fails or does not answer in
+//!   time restores under the cluster policy. A `started` row left with no
+//!   active node by that race is adopted the same way when its worker is
+//!   looked up, including by `probe_runtime_client`. A cross-node restore
+//!   deletes the source copy only when it reads a record there whose
+//!   lifecycle is outside the live set (`lifecycle_holds_live_runtime`); it
+//!   keeps a live, undecodable or unreadable record. Delete reaches the active node, else that target node; with neither
+//!   it returns `Unavailable` and the caller removes the row without
+//!   node-local teardown.
 //! - Warm-pool claims adopt node-side.
 //! - Custom vCPU or memory uses separate create and start calls: only
 //!   `StartRequest` carries those fields. A readiness wait still blocks on
@@ -196,9 +201,10 @@ const DIRECT_NODE_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const DIRECT_PULL_ON_CREATE_RPC_TIMEOUT: Duration = Duration::from_secs(600);
 const DIRECT_REMOTE_RESTORE_CANDIDATE_LIMIT: i64 = 7;
 /// Reading the record on the node that holds an unplaced sandbox's local
-/// state is advisory, so a slow or dead node costs a wake or a source cleanup
-/// this much. It bounds the whole read: finding that node, connecting to it
-/// and its `StateRequest`.
+/// state is advisory, so a slow or dead node costs a wake, a worker lookup or
+/// a source cleanup this much. On a wake or a lookup it bounds the whole
+/// read: finding that node, connecting to it and its `StateRequest`. On a
+/// cross-node restore's source cleanup it bounds only the `StateRequest`.
 const DIRECT_SOURCE_RECORD_READ_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -517,6 +523,18 @@ fn direct_wake_request(
     }
 }
 
+/// What a wake does after catching up an unplaced row's route identity to
+/// the live record it adopts (`DirectSubstrate::catch_up_route_identity`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteCatchUp {
+    /// The route identity needs no catch-up: adopt the record as read.
+    NotNeeded,
+    /// The record's worker returned this receipt: adopt its execution.
+    CaughtUp { execution_generation: i64 },
+    /// The record no longer runs: restore.
+    NotRunning,
+}
+
 /// Whether waking `resident` restores or starts it, which sandbox-manager
 /// admits only with a reserved route identity.
 fn resident_is_dormant(resident: &pplx_space_sbx_mgr_client::proto::SandboxInfo) -> bool {
@@ -533,16 +551,23 @@ fn resident_is_dormant(resident: &pplx_space_sbx_mgr_client::proto::SandboxInfo)
     )
 }
 
-/// Whether `record` holds a VM, or is moving into or out of one. A restore's
-/// `Start`, which always carries a newly reserved execution generation, is
-/// refused there, and a restore on another worker would run a second copy,
-/// so such a record is adopted (`DirectSubstrate::adopt_live_source_record`)
-/// or, on a cross-node restore, never deleted.
-fn record_holds_live_runtime(record: &pplx_space_sbx_mgr_client::proto::SandboxInfo) -> bool {
+/// Whether `lifecycle` is in the live set: a record running a VM, or moving
+/// into or out of one. A lifecycle outside it does not prove the VM stopped:
+/// a quarantine after an unconfirmed pause may still hold one. A restore's
+/// `Start` always carries a newly reserved execution
+/// generation: a started record running another execution refuses it, and a
+/// `Restoring` record resumes its interrupted restore instead of starting
+/// that one. A restore on another worker would run a second copy, so such a
+/// record is adopted when its fence allows
+/// (`DirectSubstrate::adopt_live_source_record`), and a cross-node restore's
+/// cleanup never deletes a record in this set.
+fn lifecycle_holds_live_runtime(
+    lifecycle: pplx_space_sbx_mgr_client::proto::SandboxLifecycleState,
+) -> bool {
     use pplx_space_sbx_mgr_client::proto::SandboxLifecycleState;
     matches!(
-        record.observed_lifecycle(),
-        Ok(SandboxLifecycleState::Creating
+        lifecycle,
+        SandboxLifecycleState::Creating
             | SandboxLifecycleState::Starting
             | SandboxLifecycleState::Started
             | SandboxLifecycleState::Stopping
@@ -551,7 +576,7 @@ fn record_holds_live_runtime(record: &pplx_space_sbx_mgr_client::proto::SandboxI
             | SandboxLifecycleState::Resuming
             | SandboxLifecycleState::Checkpointing
             | SandboxLifecycleState::Suspending
-            | SandboxLifecycleState::Restoring)
+            | SandboxLifecycleState::Restoring
     )
 }
 
@@ -568,8 +593,9 @@ fn refuse_wake_denied_by_local_override(
 ) -> Result<(), SubstrateError> {
     use pplx_space_sbx_mgr_client::proto::SandboxLifecycleState;
 
-    // The worker refuses only a dormant record. A live one is adopted and
-    // woken through its worker, which applies its effective policy itself.
+    // The worker refuses a Created, Stopped, Paused or Suspended record its
+    // policy denies. Any other record is adopted, and its worker's Wake
+    // applies its own policy, or restored.
     if !matches!(
         record
             .lifecycle
@@ -639,6 +665,22 @@ async fn node_sandbox_record(
 
 fn wake_requires_restore(status: &tonic::Status) -> bool {
     status.code() == Code::NotFound
+}
+
+fn wake_rpc_error(
+    status: &tonic::Status,
+    wake_activity: Option<ExecutionActivityKind>,
+) -> SubstrateError {
+    // The worker's effective policy refused an implicit wake. That is a
+    // terminal policy answer, not a transient runtime failure.
+    if wake_activity.is_some() && status.code() == Code::FailedPrecondition {
+        return SubstrateError::Conflict {
+            message: status.message().to_string(),
+        };
+    }
+    SubstrateError::Failed {
+        message: format!("node-api wake error: {status}"),
+    }
 }
 
 fn wake_lifecycle_allows_restore_fallback(lifecycle: &str) -> bool {
@@ -3157,20 +3199,160 @@ impl DirectSubstrate {
         }
     }
 
+    /// Persists the Wake receipt of a `Started` record on `node` before the
+    /// wake adopts it, when the route identity on that node trails the
+    /// record: a wake that reserved the record's generation stopped before
+    /// its receipt. The adoption writes `started` only at the route
+    /// identity's execution, and a route token minted from an older identity
+    /// is refused by the node. Waking first leaves an interrupted wake with
+    /// an unplaced row for the next wake to read again, never a `started` row
+    /// whose route identity trails it.
+    ///
+    /// Only a tokenless row is caught up, since one that holds a
+    /// restore-lease token is adopted only at its persisted receipt. The Wake
+    /// carries no route identity, so it cannot start a new execution; a
+    /// record that left `Started` and now needs one is restored instead.
+    async fn catch_up_route_identity(
+        &self,
+        sandbox: &Sandbox,
+        read_lifecycle: SandboxLifecycle,
+        node: &DirectNode,
+        record: &pplx_space_sbx_mgr_client::proto::SandboxInfo,
+        timeout: Duration,
+        wake_activity: Option<ExecutionActivityKind>,
+    ) -> Result<RouteCatchUp, SubstrateError> {
+        use pplx_space_sbx_mgr_client::proto::SandboxLifecycleState;
+
+        let (Ok(SandboxLifecycleState::Started), Some(record_generation)) =
+            (record.observed_lifecycle(), record.execution_generation)
+        else {
+            return Ok(RouteCatchUp::NotNeeded);
+        };
+        let trails = sqlx::query_scalar::<_, bool>(sql!(
+            "SELECT TRUE
+               FROM sandboxes s
+               JOIN sandbox_direct_route_identities route ON route.sandbox_id = s.id
+               JOIN sandbox_direct_route_provenance provenance
+                 ON provenance.sandbox_id = s.id
+              WHERE s.id = $1
+                AND s.managed_by = $4
+                AND s.active_node_id IS NULL
+                AND LOWER(TRIM(s.lifecycle)) = $5
+                AND s.restore_lease_token IS NULL
+                AND route.current_node_id = $2
+                AND route.execution_generation < $3
+                AND provenance.last_execution_generation >= $3"
+        ))
+        .bind(sandbox.id.as_uuid())
+        .bind(node.id.as_uuid())
+        .bind(record_generation)
+        .bind(SubstrateKind::Space)
+        .bind(read_lifecycle.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .db_context("failed to read the unplaced sandbox's route identity")?
+        .is_some();
+        if !trails {
+            return Ok(RouteCatchUp::NotNeeded);
+        }
+        let endpoint = Self::endpoint(&node.node_api_endpoint)?;
+        let mut observer = connect_worker(endpoint.clone()).await.map_err(|error| {
+            SubstrateError::Unavailable {
+                message: format!(
+                    "worker node {} API is unavailable at {endpoint:?}: {error}",
+                    node.id
+                ),
+            }
+        })?;
+        observer
+            .require_activation_policy_support(timeout)
+            .await
+            .map_err(|error| SubstrateError::Unavailable {
+                message: error.to_string(),
+            })?;
+        let response = match observer
+            .internal_client()
+            .wake_sandbox(
+                self.wake_request_with_policy(
+                    sandbox,
+                    None,
+                    Some(record_generation),
+                    wake_activity,
+                )
+                .await?,
+            )
+            .await
+        {
+            Ok(response) => response.into_inner(),
+            Err(status)
+                if pplx_space_sbx_mgr_client::is_authoritative_route_identity_required(&status)
+                    || wake_requires_restore(&status) =>
+            {
+                return Ok(RouteCatchUp::NotRunning);
+            }
+            Err(status) => return Err(wake_rpc_error(&status, wake_activity)),
+        };
+        // Only the worker's own receipt names the execution it runs; without
+        // one the adoption keeps the read lifecycle.
+        if response.route_identity.is_none() {
+            return Ok(RouteCatchUp::NotNeeded);
+        }
+        let receipt = self
+            .persist_wake_route_identity(sandbox.id, node.id, &response)
+            .await?;
+        Ok(match receipt {
+            Some(receipt) => RouteCatchUp::CaughtUp {
+                execution_generation: receipt.execution_generation().get(),
+            },
+            None => RouteCatchUp::NotNeeded,
+        })
+    }
+
     /// Places a row with no active node back on `node` when the record there
-    /// still holds or is moving a VM at the row's current execution
-    /// generation. A wake that raced that node's suspend leaves such a
-    /// record: the projection clears `active_node_id` while the wake runs.
-    /// Restoring around it would start a second copy from an older snapshot,
-    /// so the row adopts the running one instead, with no new generation.
+    /// still holds or is moving a VM and no restore owner can still record a
+    /// newer execution. A wake that raced that node's suspend leaves such a
+    /// record: the projection clears `active_node_id` while the wake runs,
+    /// and that wake's receipt can lag the record, or never land if its API
+    /// process stops first. Restoring around it would start a second copy
+    /// from an older snapshot, so the row adopts the running one instead,
+    /// with no new generation.
     ///
     /// One guarded write fences on the lifecycle the caller read, no active
     /// node, no live restore lease (whose owner's restore answers for
     /// itself), and a route identity on `node` whose execution generation is
-    /// both the record's and the last one reserved. A running record leaves
-    /// the row `started`; one still moving keeps the read lifecycle for the
-    /// wake through its worker to finish. Returns the node the row is placed
-    /// on, which is another writer's when that writer placed it first.
+    /// at most the record's. The record's generation must be at most the last
+    /// one reserved. A row that holds a restore-lease token is adopted only
+    /// when the route identity, the record and the last reservation are one
+    /// generation:
+    ///
+    /// - On a tokenless row no restore owner can still persist a receipt or
+    ///   complete: both fence on the token, which a claim writes and leaving
+    ///   `restoring` clears. A reservation above the record was abandoned, or
+    ///   is a wake through this node's Wake, which the adoption joins. An
+    ///   abandoned restore may still have started a VM on another worker.
+    /// - A newer execution whose receipt landed on another worker would have
+    ///   moved the route identity there: a receipt moves it only to the row's
+    ///   active node. A restore whose receipt was refused after its lease was
+    ///   cleared can leave an untracked copy on another worker; no route
+    ///   reaches it, so adopting this node's record is still right.
+    /// - A row that still holds a token (`restoring`, its lease expired) may
+    ///   have an owner whose Start ran and whose receipt has not landed.
+    ///   Adopting clears the token that receipt fences on, and an owner whose
+    ///   receipt is refused after a remote-snapshot restore deletes that
+    ///   destination, which may be the copy just adopted. Such a row is
+    ///   adopted only when its last reservation is the persisted receipt's
+    ///   execution.
+    /// - A record older than the route identity is not adopted.
+    ///
+    /// A `Started` record leaves the row `started` only when the route
+    /// identity already names the record's execution, so a route token minted
+    /// from it reaches that execution. The wake path catches a trailing route
+    /// identity up first (`catch_up_route_identity`). Otherwise the row keeps
+    /// the read lifecycle for the wake through its worker to finish, and that
+    /// Wake's receipt catches the route identity up. A `started` row the
+    /// lookup adopts stays `started` with its route identity as it was.
+    /// Returns the node the row is placed on, which is another writer's when
+    /// that writer placed it first.
     async fn adopt_live_source_record(
         &self,
         sandbox_id: SandboxId,
@@ -3180,7 +3362,10 @@ impl DirectSubstrate {
     ) -> Result<Option<DirectNode>, SubstrateError> {
         use pplx_space_sbx_mgr_client::proto::SandboxLifecycleState;
 
-        if !record_holds_live_runtime(record) {
+        if !record
+            .observed_lifecycle()
+            .is_ok_and(lifecycle_holds_live_runtime)
+        {
             return Ok(None);
         }
         let Some(execution_generation) = record.execution_generation else {
@@ -3190,13 +3375,36 @@ impl DirectSubstrate {
             record.observed_lifecycle(),
             Ok(SandboxLifecycleState::Started)
         );
+        self.adopt_live_execution(
+            sandbox_id,
+            read_lifecycle,
+            node,
+            execution_generation,
+            started,
+        )
+        .await
+    }
+
+    /// [`Self::adopt_live_source_record`] for an execution on `node` at
+    /// `execution_generation`, `started` when its worker runs it.
+    async fn adopt_live_execution(
+        &self,
+        sandbox_id: SandboxId,
+        read_lifecycle: SandboxLifecycle,
+        node: &DirectNode,
+        execution_generation: i64,
+        started: bool,
+    ) -> Result<Option<DirectNode>, SubstrateError> {
         let adopted = sqlx::query(sql!(
             "UPDATE sandboxes s
                 SET active_node_id = $2,
                     target_node_id = $2,
                     placement = 'on_node',
                     placement_changed_at = NOW(),
-                    lifecycle = CASE WHEN $5 THEN 'started' ELSE s.lifecycle END
+                    lifecycle = CASE
+                        WHEN $5 AND route.execution_generation = $4 THEN 'started'
+                        ELSE s.lifecycle
+                    END
                FROM sandbox_direct_route_identities route,
                     sandbox_direct_route_provenance provenance
               WHERE s.id = $1
@@ -3206,9 +3414,16 @@ impl DirectSubstrate {
                 AND (s.restore_lease_expires_at IS NULL OR s.restore_lease_expires_at <= NOW())
                 AND route.sandbox_id = s.id
                 AND route.current_node_id = $2
-                AND route.execution_generation = $4
+                AND route.execution_generation <= $4
                 AND provenance.sandbox_id = s.id
-                AND provenance.last_execution_generation = $4"
+                AND provenance.last_execution_generation >= $4
+                AND (
+                    s.restore_lease_token IS NULL
+                    OR (
+                        route.execution_generation = $4
+                        AND provenance.last_execution_generation = $4
+                    )
+                )"
         ))
         .bind(sandbox_id.as_uuid())
         .bind(node.id.as_uuid())
@@ -3277,25 +3492,40 @@ impl DirectSubstrate {
 
         // A wake that raced the source's suspend can leave a live record
         // there, newer than the snapshot just restored, so the cleanup deletes
-        // only a record it reads as not live.
+        // only a record whose lifecycle it reads as outside the live set.
         match tokio::time::timeout(
             DIRECT_SOURCE_RECORD_READ_TIMEOUT,
             node_sandbox_record(&mut client, sandbox_id),
         )
         .await
         {
-            Ok(Ok(Some(record))) if !record_holds_live_runtime(&record) => {}
             Ok(Ok(None)) => return Ok(()),
-            Ok(Ok(Some(record))) => {
-                tracing::warn!(
-                    sandbox_id = %sandbox_id,
-                    source_node_id = %source_node_id,
-                    restored_node_id = %restored_node_id,
-                    lifecycle = record.observed_lifecycle().map_or("unknown", |state| state.label()),
-                    "leaving the source-node copy after direct cross-node restore because it reports a live record"
-                );
-                return Ok(());
-            }
+            Ok(Ok(Some(record))) => match record.observed_lifecycle() {
+                Ok(lifecycle) if !lifecycle_holds_live_runtime(lifecycle) => {}
+                Ok(lifecycle) => {
+                    tracing::warn!(
+                        sandbox_id = %sandbox_id,
+                        source_node_id = %source_node_id,
+                        restored_node_id = %restored_node_id,
+                        lifecycle = lifecycle.label(),
+                        "leaving the source-node copy after direct cross-node restore because it reports a live record"
+                    );
+                    return Ok(());
+                }
+                // sandbox-manager publishes `Unspecified` for a label it
+                // cannot parse, and an API older than its nodes cannot decode
+                // a newer value; either may still hold a VM.
+                Err(error) => {
+                    tracing::warn!(
+                        sandbox_id = %sandbox_id,
+                        source_node_id = %source_node_id,
+                        restored_node_id = %restored_node_id,
+                        %error,
+                        "leaving the source-node copy after direct cross-node restore because its record's lifecycle cannot be decoded"
+                    );
+                    return Ok(());
+                }
+            },
             Ok(Err(error)) => {
                 tracing::warn!(
                     sandbox_id = %sandbox_id,
@@ -4475,8 +4705,37 @@ impl SubstrateAdapter for DirectSubstrate {
                                 sandbox_id, node.id, &record, activity,
                             )?;
                         }
-                        self.adopt_live_source_record(sandbox_id, lifecycle, &node, &record)
+                        let budget =
+                            deadline.saturating_duration_since(tokio::time::Instant::now());
+                        match self
+                            .catch_up_route_identity(
+                                sandbox,
+                                lifecycle,
+                                &node,
+                                &record,
+                                budget,
+                                wake_activity,
+                            )
                             .await?
+                        {
+                            RouteCatchUp::NotNeeded => {
+                                self.adopt_live_source_record(sandbox_id, lifecycle, &node, &record)
+                                    .await?
+                            }
+                            RouteCatchUp::CaughtUp {
+                                execution_generation,
+                            } => {
+                                self.adopt_live_execution(
+                                    sandbox_id,
+                                    lifecycle,
+                                    &node,
+                                    execution_generation,
+                                    true,
+                                )
+                                .await?
+                            }
+                            RouteCatchUp::NotRunning => None,
+                        }
                     }
                     None => None,
                 };
@@ -4598,18 +4857,7 @@ impl SubstrateAdapter for DirectSubstrate {
             {
                 return self.restore_for_wake(sandbox, timeout).await;
             }
-            // The worker's effective policy refused an implicit wake. That is
-            // a terminal policy answer, not a transient runtime failure.
-            Err(status) if wake_activity.is_some() && status.code() == Code::FailedPrecondition => {
-                return Err(SubstrateError::Conflict {
-                    message: status.message().to_string(),
-                });
-            }
-            Err(error) => {
-                return Err(SubstrateError::Failed {
-                    message: format!("node-api wake error: {error}"),
-                });
-            }
+            Err(status) => return Err(wake_rpc_error(&status, wake_activity)),
         };
         let response = response.into_inner();
         let route_identity = self
