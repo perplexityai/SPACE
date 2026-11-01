@@ -7,7 +7,6 @@ import {
   Button,
   Card,
   Descriptions,
-  Form,
   Input,
   App,
   Popconfirm,
@@ -74,7 +73,6 @@ import { tablePagination } from '@/lib/table-pagination';
 import NetworkPolicyDesigner, {
   compactNetworkPolicyLabel,
   NetworkPolicyDetails,
-  networkPoliciesEqual,
   summarizeNetworkPolicy,
 } from '@/components/network-policy-designer';
 import NetworkPolicyGenerationTag from '@/components/network-policy-generation-tag';

@@ -44,7 +44,6 @@ import {
 } from '@/lib/view-refresh';
 import NetworkPolicyDesigner, {
   compactNetworkPolicyLabel,
-  networkPoliciesEqual,
 } from '@/components/network-policy-designer';
 import NetworkPolicyGenerationTag from '@/components/network-policy-generation-tag';
 import {
