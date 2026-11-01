@@ -25,17 +25,15 @@ export interface BuildJob {
   lost: boolean;
 }
 
-// What a promotion moved, recorded from the click that confirmed it.
+// A promotion, recorded from the click that confirmed it. Only what it was
+// asked to do is stored; whether it is done is read from the tags each time
+// (see `promotionState`).
 export interface Promotion {
   // `latest` of each template as read when the operator confirmed, written
   // before the first tag request and never read again: the rollback target.
   previous: Record<SystemTemplate, string | null>;
-  targets: Record<SystemTemplate, string>;
+  targets: Partial<Record<SystemTemplate, string>>;
   confirmedAt: string;
-  // `latest` read back after the tag requests (the tag route can commit and
-  // still answer an error), or null until then.
-  readBack: Record<SystemTemplate, string | null> | null;
-  error: string | null;
 }
 
 export interface TestSandbox {
@@ -130,9 +128,33 @@ export function canBuild(run: RebuildRun | null, template: SystemTemplate): bool
   return run !== null && buildSucceeded(run.seed) && run.codeRuntime === null;
 }
 
+// Both builds are done, so the promotion step is offered: as Promote while
+// nothing is recorded, as Retry while the recorded one is not complete.
 export function canPromote(run: RebuildRun | null): boolean {
-  return run !== null && buildSucceeded(run.seed) && buildSucceeded(run.codeRuntime)
-    && (run.promotion === null || run.promotion.error !== null);
+  return run !== null && buildSucceeded(run.seed) && buildSucceeded(run.codeRuntime);
+}
+
+// The answer to a build or test-sandbox request is recorded only into the
+// still-empty step it was sent for. When the step already has one (another
+// tab, or another click, got there first), it is reported, not recorded.
+export type Accepted<T> =
+  | { kind: 'recorded'; run: RebuildRun }
+  | { kind: 'extra'; existing: T }
+  | { kind: 'gone' };
+
+export function acceptJob(stored: RebuildRun | null, runId: string, template: SystemTemplate, job: BuildJob): Accepted<BuildJob> {
+  if (!stored || stored.runId !== runId) return { kind: 'gone' };
+  const existing = jobOf(stored, template);
+  if (existing) return { kind: 'extra', existing };
+  const { [template]: _dropped, ...submitUnknown } = stored.submitUnknown;
+  return { kind: 'recorded', run: withJob({ ...stored, submitUnknown }, template, job) };
+}
+
+export function acceptTestSandbox(stored: RebuildRun | null, runId: string, template: SystemTemplate, sandbox: TestSandbox): Accepted<TestSandbox> {
+  if (!stored || stored.runId !== runId) return { kind: 'gone' };
+  const existing = stored.testSandboxes[template];
+  if (existing) return { kind: 'extra', existing };
+  return { kind: 'recorded', run: { ...stored, testSandboxes: { ...stored.testSandboxes, [template]: sandbox } } };
 }
 
 // Apply a status answer only to the run and job that asked for it: a late
@@ -171,17 +193,35 @@ export function pollDelayMs(consecutiveFailures: number): number {
 // A build request that failed: refused before it reached the builder, or an
 // outcome that is not known (a 5xx or a network error can arrive after the
 // builder accepted the job).
-export function submitFailureText(template: SystemTemplate, err: unknown): { known: boolean; text: string } {
+function failure(err: unknown): { status: number | null; message: string } {
   const status = typeof (err as { status?: unknown })?.status === 'number' ? (err as { status: number }).status : null;
-  const message = err instanceof Error ? err.message : String(err);
-  if (status !== null && status >= 400 && status < 500) {
-    return { known: true, text: `The ${template} build was not started: ${message}` };
-  }
+  return { status, message: err instanceof Error ? err.message : String(err) };
+}
+const refused = (status: number | null) => status !== null && status >= 400 && status < 500;
+
+export function submitFailureText(template: SystemTemplate, err: unknown): { known: boolean; text: string } {
+  const { status, message } = failure(err);
+  if (refused(status)) return { known: true, text: `The ${template} build was not started: ${message}` };
   return {
     known: false,
-    text: `The ${template} build request failed (${message}), and the builder may have accepted it. ` +
-      'Refresh Template Releases, and look for a new release, before building again.',
+    text: `The ${template} build request failed (${message}), and the builder may have accepted it. An accepted build ` +
+      'appears in Template Releases only when it finishes, and building again starts a second job: wait, refresh ' +
+      'Template Releases, and build again only if no new release appears.',
   };
+}
+
+export function testSandboxFailureText(name: string, err: unknown): { known: boolean; text: string } {
+  const { status, message } = failure(err);
+  if (refused(status)) return { known: true, text: `The test sandbox was not created: ${message}` };
+  return {
+    known: false,
+    text: `The test sandbox request failed (${message}), and the sandbox may have been created: look for ${name} ` +
+      'in the Sandboxes list before creating another.',
+  };
+}
+
+export function testSandboxName(template: SystemTemplate, runId: string): string {
+  return `rebuild-check-${template}-${runId.slice(0, 8)}`;
 }
 
 export function latestDigest(
@@ -200,70 +240,73 @@ export function findRelease<T extends Pick<TemplateRelease, 'template_name' | 'c
   return releases.find((release) => release.template_name === template && release.content_hash === contentHash) ?? null;
 }
 
+type Releases = Pick<TemplateRelease, 'template_name' | 'tags' | 'content_hash'>[];
+
 export interface PromotionPlanRow {
   template: SystemTemplate;
   from: string | null;
   to: string;
-  // `latest` is no longer what it was when the run started.
-  changedSinceStart: boolean;
+  // Needs an explicit confirmation: `latest` changed since the run started
+  // (a first promotion), or moved to neither the target nor the release a
+  // recorded promotion is rolling back from (a retry).
+  attention: 'changed-since-start' | 'diverged' | null;
 }
 
 // What a promotion would move, from releases read when the operator asks.
-export function promotionPlan(
-  run: RebuildRun,
-  releases: Pick<TemplateRelease, 'template_name' | 'tags' | 'content_hash'>[],
-  tag: string,
-): PromotionPlanRow[] {
+// A template that already carries its target needs no move and is left out.
+export function promotionPlan(run: RebuildRun, releases: Releases, tag: string): PromotionPlanRow[] {
   const targets: [SystemTemplate, BuildJob | null][] = [['seed', run.seed], ['code-runtime', run.codeRuntime]];
-  return targets.flatMap(([template, job]) => {
+  return targets.flatMap(([template, job]): PromotionPlanRow[] => {
     if (!buildSucceeded(job)) return [];
+    const to = run.promotion?.targets[template] ?? job.content_hash;
     const from = latestDigest(releases, template, tag);
-    // A template a first attempt already moved has not "changed" under the
-    // operator.
-    return [{ template, from, to: job.content_hash, changedSinceStart: from !== run.latestAtStart[template] && from !== job.content_hash }];
+    if (from === to) return [];
+    const attention = run.promotion
+      ? (from !== run.promotion.previous[template] ? 'diverged' : null)
+      : (from !== run.latestAtStart[template] ? 'changed-since-start' : null);
+    return [{ template, from, to, attention }];
   });
 }
 
+export function samePlan(a: PromotionPlanRow[], b: PromotionPlanRow[]): boolean {
+  return a.length === b.length && a.every((row, i) => row.template === b[i].template && row.from === b[i].from
+    && row.to === b[i].to && row.attention === b[i].attention);
+}
+
 // The promotion record written when the operator confirms, before any tag
-// request. A retry keeps the record's `previous`.
+// request. A retry keeps the record: its `previous` is the rollback target.
 export function confirmPromotion(run: RebuildRun, plan: PromotionPlanRow[], now = new Date()): RebuildRun {
-  if (run.promotion) return { ...run, promotion: { ...run.promotion, error: null } };
+  if (run.promotion) return run;
   const previous = { seed: null, 'code-runtime': null } as Record<SystemTemplate, string | null>;
-  const targets = {} as Record<SystemTemplate, string>;
+  const targets: Partial<Record<SystemTemplate, string>> = {};
   for (const row of plan) {
     previous[row.template] = row.from;
     targets[row.template] = row.to;
   }
-  return { ...run, promotion: { previous, targets, confirmedAt: now.toISOString(), readBack: null, error: null } };
+  return { ...run, promotion: { previous, targets, confirmedAt: now.toISOString() } };
 }
 
-export function readBackPromotion(
-  run: RebuildRun,
-  releases: Pick<TemplateRelease, 'template_name' | 'tags' | 'content_hash'>[],
-  tag: string,
-  requestError: string | null,
-): RebuildRun {
-  if (!run.promotion) return run;
-  const readBack = {
-    seed: latestDigest(releases, 'seed', tag),
-    'code-runtime': latestDigest(releases, 'code-runtime', tag),
-  } as Record<SystemTemplate, string | null>;
-  const unmoved = (Object.keys(run.promotion.targets) as SystemTemplate[]).filter((t) => readBack[t] !== run.promotion!.targets[t]);
-  const error = unmoved.length
-    ? `${unmoved.join(' and ')} ${unmoved.length > 1 ? 'do' : 'does'} not carry ${tag} on the new release${requestError ? ` (${requestError})` : ''}`
-    : null;
-  return { ...run, promotion: { ...run.promotion, readBack, error } };
-}
+export type PromotionState =
+  | { kind: 'complete'; latest: Partial<Record<SystemTemplate, string>> }
+  | { kind: 'incomplete'; remaining: SystemTemplate[]; diverged: { template: SystemTemplate; latest: string | null }[] };
 
-// The templates a retry still has to move, from a fresh read.
-export function promotionRemaining(
-  run: RebuildRun,
-  releases: Pick<TemplateRelease, 'template_name' | 'tags' | 'content_hash'>[],
-  tag: string,
-): SystemTemplate[] {
-  if (!run.promotion) return [];
-  return (Object.keys(run.promotion.targets) as SystemTemplate[])
-    .filter((template) => latestDigest(releases, template, tag) !== run.promotion!.targets[template]);
+// Whether a recorded promotion is done, from the tags as read now: complete
+// when every template's latest is its target; otherwise what still has to
+// move, and which latest moved to neither the target nor `previous`.
+export function promotionState(promotion: Promotion, releases: Releases, tag: string): PromotionState {
+  const remaining: SystemTemplate[] = [];
+  const diverged: { template: SystemTemplate; latest: string | null }[] = [];
+  const latest: Partial<Record<SystemTemplate, string>> = {};
+  for (const template of Object.keys(promotion.targets) as SystemTemplate[]) {
+    const now = latestDigest(releases, template, tag);
+    if (now === promotion.targets[template]) {
+      latest[template] = now;
+      continue;
+    }
+    remaining.push(template);
+    if (now !== promotion.previous[template]) diverged.push({ template, latest: now });
+  }
+  return remaining.length ? { kind: 'incomplete', remaining, diverged } : { kind: 'complete', latest };
 }
 
 // A stored run, if it is one this page wrote for this cluster and user and
@@ -299,12 +342,11 @@ function isJob(v: unknown): v is BuildJob {
 
 function isPromotion(v: unknown): v is Promotion {
   return isObject(v)
+    && Object.keys(v).every((k) => k === 'previous' || k === 'targets' || k === 'confirmedAt')
     && isDigestMap(v.previous, true)
     && isObject(v.targets) && Object.keys(v.targets).length > 0
     && Object.entries(v.targets).every(([k, d]) => (k === 'seed' || k === 'code-runtime') && typeof d === 'string' && d.length > 0)
-    && typeof v.confirmedAt === 'string' && !Number.isNaN(Date.parse(v.confirmedAt))
-    && (v.readBack === null || isDigestMap(v.readBack, true))
-    && (v.error === null || typeof v.error === 'string');
+    && typeof v.confirmedAt === 'string' && !Number.isNaN(Date.parse(v.confirmedAt));
 }
 
 function isRun(v: unknown): v is RebuildRun {

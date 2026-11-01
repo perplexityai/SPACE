@@ -486,6 +486,9 @@ export default function TemplatesPage() {
   const [warmPoolPolicies, setWarmPoolPolicies] = useState<WarmPoolPolicy[]>([]);
   const [warmPoolPolicyCapabilities, setWarmPoolPolicyCapabilities] = useState<WarmPoolPolicyCapabilities>({});
   const [loadingReleases, setLoadingReleases] = useState(true);
+  // A promotion's state is read from the releases; until they first load it
+  // is unknown.
+  const [releasesLoadedOnce, setReleasesLoadedOnce] = useState(false);
   // Whether `templateReleases` holds an answer yet: before it does, no
   // template can be said to have no release.
   const [releasesLoaded, setReleasesLoaded] = useState(false);
@@ -572,6 +575,7 @@ export default function TemplatesPage() {
     try {
       const items = await adminApi.get<TemplateRelease[]>('/v1/template-releases');
       setTemplateReleases(items);
+      setReleasesLoadedOnce(true);
       setReleasesLoaded(true);
       return items;
     } catch (err: unknown) {
@@ -2072,6 +2076,7 @@ export default function TemplatesPage() {
       {canAdminTemplates ? (
         <SystemTemplateRebuild
           releases={templateReleases}
+          releasesLoaded={releasesLoadedOnce}
           refreshReleases={() => refreshTemplateReleases({ showLoading: false })}
           title={<Title level={4} style={{ margin: 0 }}>Template Releases</Title>}
         />
