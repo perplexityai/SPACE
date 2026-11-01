@@ -3,18 +3,19 @@
 import { useEffect, useState } from 'react';
 import { adminApi } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
-import { AdminUser, Organization, UserRole } from '@/lib/types';
+import { AdminUser, Organization, Sandbox, UserRole } from '@/lib/types';
 import { Table, Button, Form, Input, Select, Typography, Popconfirm, App, Card, Space, Tag } from 'antd';
-import { assignableRoleOptions, canDeleteUser, canManageUserRole, roleColors, roleLabels } from '@/lib/userRoles';
+import { assignableRoleOptions, canDeleteUser, canManageUserRole, roleChangeConfirmation, roleColors, roleLabels } from '@/lib/userRoles';
 import { PlusOutlined, DeleteOutlined } from '@ant-design/icons';
+import { USER_DELETE_CONSEQUENCES, userDeleteFailureMessage } from '@/lib/user-delete';
 import Link from 'next/link';
 import type { ColumnsType } from 'antd/es/table';
 
 const { Title } = Typography;
 
 export default function UsersPage() {
-  const { message } = App.useApp();
-  const { user: currentUser, cluster } = useAuth();
+  const { message, modal } = App.useApp();
+  const { user: currentUser, org: currentOrg, cluster } = useAuth();
   const [orgs, setOrgs] = useState<Organization[]>([]);
   const [selectedOrgId, setSelectedOrgId] = useState('');
   const [users, setUsers] = useState<AdminUser[]>([]);
@@ -28,7 +29,7 @@ export default function UsersPage() {
     adminApi.get<Organization[]>('/v1/orgs').then((orgs) => {
       setOrgs(orgs);
       if (orgs.length > 0 && !selectedOrgId) {
-        setSelectedOrgId(orgs[0].id);
+        setSelectedOrgId((orgs.find((org) => org.id === currentOrg?.id) ?? orgs[0]).id);
       }
     }).catch((err: any) => message.error(err.message));
   }, []);
@@ -59,9 +60,15 @@ export default function UsersPage() {
     }
   };
 
-  const handleRoleChange = async (target: AdminUser, role: UserRole) => {
+  const handleRoleChange = (target: AdminUser, role: UserRole) => {
     if (target.role === role) return;
+    modal.confirm({
+      ...roleChangeConfirmation(target.email, role, { inManagingOrg: cluster ? target.org_id === cluster.managing_org_id : null, currentRole: target.role }),
+      onOk: () => applyRole(target, role),
+    });
+  };
 
+  const applyRole = async (target: AdminUser, role: UserRole) => {
     setUpdatingRoleId(target.id);
     try {
       const updated = await adminApi.put<AdminUser>(`/v1/users/${target.id}/role`, { role });
@@ -79,8 +86,18 @@ export default function UsersPage() {
       await adminApi.delete(`/v1/users/${id}`);
       setUsers(users.filter((u) => u.id !== id));
       message.success('User deleted');
-    } catch (err: any) {
-      message.error(err.message);
+    } catch (err: unknown) {
+      // The list has no sandbox column: on a 500, read the org's sandboxes
+      // to tell whether ownership is the likely cause.
+      let ownsSandboxes = false;
+      const target = users.find((u) => u.id === id);
+      if (target && (err as { status?: unknown })?.status === 500) {
+        ownsSandboxes = await adminApi
+          .get<Sandbox[]>(`/v1/sandboxes?org_id=${target.org_id}&limit=5000`)
+          .then((rows) => rows.some((sandbox) => sandbox.user_id === id))
+          .catch(() => false);
+      }
+      message.error(userDeleteFailureMessage(err, { ownsSandboxes }));
     }
   };
 
@@ -140,6 +157,9 @@ export default function UsersPage() {
         return (
           <Popconfirm
             title="Delete this user?"
+            description={USER_DELETE_CONSEQUENCES}
+            okText="Delete"
+            okButtonProps={{ danger: true }}
             onConfirm={() => handleDelete(record.id)}
             disabled={!canDelete}
           >

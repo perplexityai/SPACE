@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
+import { takeSignInNotice } from '@/lib/sign-in-notice';
 import { useAuth } from '@/lib/auth';
 import { ConsoleAccessProblem, SIGN_IN_AGAIN_PATH } from '@/lib/console-auth';
 import { useCuriosityTheme } from '@/lib/theme';
@@ -30,6 +31,14 @@ const ACCESS_PROBLEM_TEXT: Record<ConsoleAccessProblem, { message: string; descr
 
 export default function LoginPage() {
   const [error, setError] = useState('');
+  // Set by a flow that ended this browser's session, such as a password change.
+  const [notice, setNotice] = useState<string | null>(null);
+  // Taking the notice clears it, so under React Strict Mode the effect's
+  // second run finds none; keep what the first run took.
+  useEffect(() => {
+    const taken = takeSignInNotice();
+    if (taken) setNotice(taken);
+  }, []);
   const [submitting, setSubmitting] = useState(false);
   const { user, loading, authMode, authModeError, accessProblem, login, logout, retry } = useAuth();
   const { surfaces } = useCuriosityTheme();
@@ -124,6 +133,9 @@ export default function LoginPage() {
   } else {
     body = (
       <>
+        {notice && (
+          <Alert message={notice} type="info" showIcon closable style={{ marginBottom: 16 }} onClose={() => setNotice(null)} />
+        )}
         {error && (
           <Alert message={error} type="error" showIcon closable style={{ marginBottom: 16 }} onClose={() => setError('')} />
         )}
