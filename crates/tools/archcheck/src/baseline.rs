@@ -1,16 +1,17 @@
 //! `architecture-baseline.toml`: existing violations a rule tolerates for now.
 //!
 //! Each rule that needs a baseline owns a table: `[file_size]`, one
-//! `[pattern_ratchet.<instance>]` per configured instance, and
-//! `[crate_names]`. `cargo arch --write-baseline` updates and removes the
-//! entries of every table, or of one with `--write-baseline=<table>`, but
-//! never adds an entry or creates a `pattern_ratchet` table: those are hand
-//! edits, which the base branch comparison then reports. (`[file_size]` and
-//! `[crate_names]` are always written, empty if the file had none.) A missing
-//! table means the rule tolerates nothing, which can only make checks
-//! stricter. The base branch's copy, which a pull request's baseline is
-//! compared with, is read leniently and table by table, so that a change to
-//! the schema or a renamed instance does not break the comparison.
+//! `[pattern_ratchet.<instance>]` per configured instance, one
+//! `[layers.<check>]` per layers check with a baseline, and `[crate_names]`.
+//! `cargo arch --write-baseline` updates and removes the entries of every
+//! table, or of one with `--write-baseline=<table>`, but never adds an entry
+//! or creates a `pattern_ratchet` table: those are hand edits, which the base
+//! branch comparison then reports. (`[file_size]`, `[crate_names]` and the
+//! `[layers.<check>]` tables are always written, empty if the file had
+//! none.) A missing table means the rule tolerates nothing, which can only
+//! make checks stricter. The base branch's copy, which a pull request's
+//! baseline is compared with, is read leniently and table by table, so that a
+//! change to the schema or a renamed instance does not break the comparison.
 
 use std::{
     collections::{BTreeMap, BTreeSet, btree_map},
@@ -28,7 +29,7 @@ use toml::{
 
 use crate::{
     context::{LoadError, parse_toml_with_text, read},
-    rules::{self, CountRule, CrateNames, FileSize, PatternRatchet},
+    rules::{self, CountRule, CrateNames, FileSize, Layers, PatternRatchet},
 };
 
 #[cfg(test)]
@@ -46,6 +47,14 @@ const HEADER: &str = "\
 # production Rust file outside the instance's allowed paths to its cap on code
 # lines matching its patterns. Only remove entries or lower caps: a pull request
 # that adds an entry or raises a cap is reported.
+";
+
+/// Written above the `[layers.<check>]` tables, which follow the tables of
+/// caps.
+const LAYERS_COMMENT: &str = "\
+# [layers.<check>] maps each workspace package to the workspace packages it
+# depends on against the layers rule's <check>. Only remove entries: a pull
+# request that adds one is reported.
 ";
 
 /// Written above `[crate_names]`, which follows the other tables.
@@ -69,6 +78,62 @@ pub struct Baseline {
     /// The 1-based line of each `[crate_names]` key in the file the baseline
     /// was loaded from.
     pub crate_names_lines: BTreeMap<String, usize>,
+    /// Each `[layers.<check>]` table, by check. Written after the tables of
+    /// caps.
+    pub layers: BTreeMap<String, EdgeTable>,
+}
+
+/// One `[layers.<check>]` table: each package to the packages its tolerated
+/// edges point at.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EdgeTable {
+    pub edges: BTreeMap<String, BTreeSet<String>>,
+    /// The 1-based line of each `(from, to)` in the file the baseline was
+    /// loaded from.
+    lines: BTreeMap<(String, String), usize>,
+}
+
+impl EdgeTable {
+    pub const fn new() -> Self {
+        Self {
+            edges: BTreeMap::new(),
+            lines: BTreeMap::new(),
+        }
+    }
+
+    pub fn contains(&self, from: &str, to: &str) -> bool {
+        self.edges
+            .get(from)
+            .is_some_and(|to_set| to_set.contains(to))
+    }
+
+    /// Every `(from, to)`, sorted.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.edges
+            .iter()
+            .flat_map(|(from, to)| to.iter().map(move |to| (from.as_str(), to.as_str())))
+    }
+
+    pub fn insert(&mut self, from: &str, to: &str) {
+        self.edges
+            .entry(from.to_owned())
+            .or_default()
+            .insert(to.to_owned());
+    }
+
+    /// The number of edges.
+    pub fn len(&self) -> usize {
+        self.edges.values().map(BTreeSet::len).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The 1-based line of the edge in the file this table was loaded from.
+    pub fn line(&self, from: &str, to: &str) -> Option<usize> {
+        self.lines.get(&(from.to_owned(), to.to_owned())).copied()
+    }
 }
 
 /// One table: repository-relative path to the file's cap, its count when it
@@ -100,6 +165,8 @@ struct BaselineFile {
     pattern_ratchet: BTreeMap<String, BTreeMap<Spanned<String>, usize>>,
     #[serde(default)]
     crate_names: BTreeMap<Spanned<String>, String>,
+    #[serde(default)]
+    layers: BTreeMap<String, BTreeMap<Spanned<String>, Vec<Spanned<String>>>>,
 }
 
 /// The base branch's copy, for `[file_size]`: other tables and keys ignored.
@@ -134,7 +201,17 @@ pub struct BaseTables {
     /// The package names `[crate_names]` lists; `None` when the copy has no
     /// such table, as before the rule existed.
     crate_names: Option<BTreeSet<String>>,
+    /// Each `[layers.<check>]` table; `None` when the copy has no `[layers]`
+    /// key, as before the layers rule existed.
+    layers: Option<BTreeMap<String, BaseEdgeTable>>,
 }
+
+/// One `[layers.<check>]` table of the base branch's copy, or why it can't
+/// be compared.
+type BaseEdgeTable = Result<BTreeMap<String, BTreeSet<String>>, Box<UnusableBase>>;
+
+/// The `[layers.<check>]` table a base branch's copy without it compares as.
+static NO_EDGES: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
 /// One table of the base branch's copy, or why it can't be compared.
 type BaseTable = Result<BTreeMap<String, usize>, Box<UnusableBase>>;
@@ -221,6 +298,31 @@ impl BaseBaseline {
             .flat_map(|tables| tables.tables.keys().map(String::as_str))
     }
 
+    /// The base branch's `[layers.<check>]` table: empty if the copy has a
+    /// `[layers]` key without it, `None` if the copy has no `[layers]` key,
+    /// as before the layers rule existed.
+    pub fn layers_table(
+        &self,
+        check: &str,
+    ) -> Result<Option<&BTreeMap<String, BTreeSet<String>>>, BaseSkip<'_>> {
+        let tables = self.tables()?;
+        match tables.rules.get(Layers::NAME) {
+            None => return Err(BaseSkip::NotRead),
+            Some(Err(unusable)) => return Err(BaseSkip::Unusable(unusable)),
+            Some(Ok(())) => {}
+        }
+        let Some(layers) = &tables.layers else {
+            return Ok(None);
+        };
+        match layers.get(check) {
+            Some(table) => table
+                .as_ref()
+                .map(Some)
+                .map_err(|unusable| BaseSkip::Unusable(unusable)),
+            None => Ok(Some(&NO_EDGES)),
+        }
+    }
+
     /// The package names the base branch's `[crate_names]` lists, or `None`
     /// if it has no such table.
     pub fn crate_names(&self) -> Result<Option<&BTreeSet<String>>, BaseSkip<'_>> {
@@ -282,10 +384,28 @@ impl Baseline {
             );
         }
         let crate_names = with_lines(text, file.crate_names);
+        let layers = file
+            .layers
+            .into_iter()
+            .map(|(check, entries)| {
+                let mut table = EdgeTable::default();
+                for (from, to) in entries {
+                    let from = from.into_inner();
+                    for to in to {
+                        let line = line_of(text, to.span().start);
+                        let to = to.into_inner();
+                        table.insert(&from, &to);
+                        table.lines.insert((from.clone(), to), line);
+                    }
+                }
+                (check, table)
+            })
+            .collect();
         Self {
             tables,
             crate_names: crate_names.caps,
             crate_names_lines: crate_names.lines,
+            layers,
         }
     }
 
@@ -316,6 +436,7 @@ impl Baseline {
         read.insert(FileSize::NAME, Ok(()));
         let mut instances = Ok(());
         let mut crate_names = Ok(None);
+        let mut layers = Ok(None);
         for (key, value) in document {
             match key.get_ref().as_ref() {
                 PatternRatchet::NAME => {
@@ -326,10 +447,21 @@ impl Baseline {
                     });
                 }
                 CrateNames::NAME => crate_names = base_crate_names(value).map(Some),
+                Layers::NAME => layers = base_edge_tables(value, &unusable).map(Some),
                 _ => {}
             }
         }
         read.insert(PatternRatchet::NAME, instances);
+        let layers = match layers {
+            Ok(layers) => {
+                read.insert(Layers::NAME, Ok(()));
+                layers
+            }
+            Err(unusable) => {
+                read.insert(Layers::NAME, Err(unusable));
+                None
+            }
+        };
         let crate_names = match crate_names {
             Ok(names) => {
                 read.insert(CrateNames::NAME, Ok(()));
@@ -354,15 +486,22 @@ impl Baseline {
             tables,
             rules: read,
             crate_names,
+            layers,
         }))
     }
 
     /// Every table, by the name `--write-baseline=<table>` takes, in the
     /// order they are written: `file_size`, then `pattern_ratchet.<instance>`
-    /// for each instance, then `crate_names`.
+    /// for each instance, then `layers.<check>` for each check, then
+    /// `crate_names`.
     pub fn table_names(&self) -> Vec<String> {
         let tables = self.tables.keys().cloned();
+        let layers = self
+            .layers
+            .keys()
+            .map(|check| format!("{}.{check}", Layers::NAME));
         tables
+            .chain(layers)
             .chain(std::iter::once(CrateNames::NAME.to_owned()))
             .collect()
     }
@@ -378,6 +517,9 @@ impl Baseline {
     pub fn table_len(&self, name: &str) -> Option<usize> {
         if name == CrateNames::NAME {
             return Some(self.crate_names.len());
+        }
+        if let Some(table) = self.layers_table(name) {
+            return Some(table.len());
         }
         self.table(name).map(BTreeMap::len)
     }
@@ -402,6 +544,13 @@ impl Baseline {
             self.crate_names = fresh.crate_names.clone();
             return true;
         }
+        if let Some(check) = layers_check(name) {
+            let Some(table) = fresh.layers.get(check) else {
+                return false;
+            };
+            self.layers.insert(check.to_owned(), table.clone());
+            return true;
+        }
         let Some(caps) = fresh.table(name) else {
             return false;
         };
@@ -409,22 +558,99 @@ impl Baseline {
         true
     }
 
+    /// The `[layers.<check>]` table `name` (`layers.<check>`) names, if this
+    /// baseline has it.
+    pub fn layers_table(&self, name: &str) -> Option<&EdgeTable> {
+        self.layers.get(layers_check(name)?)
+    }
+
     /// Writes the header and every table in generated form: sorted keys, one
-    /// table after another, `[crate_names]` last after its comment. A
-    /// baseline loaded from a generated file and written back is
+    /// table after another, the `[layers.<check>]` tables after their
+    /// comment, one edge per line, and `[crate_names]` last after its
+    /// comment. A baseline loaded from a generated file and written back is
     /// byte-identical; hand-added comments, quoting or order are not kept.
     pub fn write(&self, path: &Path) -> Result<(), WriteBaselineError> {
         let crate_names =
             toml::to_string(&BTreeMap::from([(CrateNames::NAME, &self.crate_names)]))?;
         let text = format!(
-            "{HEADER}\n{}\n{CRATE_NAMES_COMMENT}{crate_names}",
-            toml::to_string(self)?
+            "{HEADER}\n{}{}\n{CRATE_NAMES_COMMENT}{crate_names}",
+            toml::to_string(self)?,
+            self.layers_text(),
         );
         std::fs::write(path, text).map_err(|source| WriteBaselineError::Write {
             path: path.to_path_buf(),
             source,
         })
     }
+}
+
+impl Baseline {
+    /// The `[layers.<check>]` tables in generated form, after a blank line
+    /// and their comment; empty without any.
+    fn layers_text(&self) -> String {
+        if self.layers.is_empty() {
+            return String::new();
+        }
+        let tables: Vec<String> = self
+            .layers
+            .iter()
+            .map(|(check, table)| {
+                let mut text = format!("[{}.{check}]\n", Layers::NAME);
+                for (from, to) in &table.edges {
+                    text.push_str(&format!("{} = [\n", toml_key(from)));
+                    for to in to {
+                        text.push_str(&format!("  {},\n", toml::Value::from(to.as_str())));
+                    }
+                    text.push_str("]\n");
+                }
+                text
+            })
+            .collect();
+        format!("\n{LAYERS_COMMENT}{}", tables.join("\n"))
+    }
+}
+
+/// `key` bare if TOML allows it, quoted otherwise.
+fn toml_key(key: &str) -> String {
+    let bare = !key.is_empty()
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if bare {
+        key.to_owned()
+    } else {
+        toml::Value::from(key).to_string()
+    }
+}
+
+/// `<check>` of a `layers.<check>` table name.
+fn layers_check(name: &str) -> Option<&str> {
+    name.strip_prefix(Layers::NAME)?.strip_prefix('.')
+}
+
+/// Each check's table under the base copy's `layers`, each parsed on its
+/// own.
+fn base_edge_tables(
+    value: Spanned<DeValue<'_>>,
+    unusable: &impl Fn(toml::de::Error) -> Box<UnusableBase>,
+) -> Result<BTreeMap<String, BaseEdgeTable>, Box<UnusableBase>> {
+    if let Err(error) =
+        BTreeMap::<String, IgnoredAny>::deserialize(ValueDeserializer::from(value.clone()))
+    {
+        return Err(unusable(error));
+    }
+    let DeValue::Table(checks) = value.into_inner() else {
+        return Ok(BTreeMap::new());
+    };
+    Ok(checks
+        .into_iter()
+        .map(|(check, table)| {
+            let edges =
+                BTreeMap::<String, BTreeSet<String>>::deserialize(ValueDeserializer::from(table))
+                    .map_err(unusable);
+            (check.into_inner().into_owned(), edges)
+        })
+        .collect())
 }
 
 /// Each instance's table under the base copy's `pattern_ratchet`, each

@@ -121,8 +121,8 @@ Reach for this shape only for foundational, repo-wide errors. Most error types s
 | Context                                                   | Use                       |
 | --------------------------------------------------------- | ------------------------- |
 | Terminal `main.rs` / CLI glue that reports and exits      | `anyhow::Result<T>`       |
-| Reusable code in `crates/libs/**`                         | typed `thiserror` enum    |
-| Service/reconciler/worker code in `crates/apps/**`        | typed `thiserror` enum    |
+| Reusable code in `crates/libs/**` and the `l10`–`l40` layer directories | typed `thiserror` enum |
+| Service/reconciler/worker code in `crates/apps/**` and `crates/l50_app/**` | typed `thiserror` enum |
 | Tests                                                     | `anyhow` or `eyre` is fine; clarity > rigor |
 
 Why the asymmetry. In terminal orchestration, the caller is the OS, which only cares about exit code + log line. Everywhere else, the caller is *us*, three months from now, trying to handle `Throttled` differently from `NotFound`. `anyhow` erases that distinction. The crate's location does not decide this: a controller or background worker under `crates/apps/**` is reusable code when its caller decides whether to retry, clean up, map a status, or continue.

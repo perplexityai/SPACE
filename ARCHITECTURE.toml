@@ -210,10 +210,12 @@ mode = "required"
 # sbx-mgr's node-local SQLite database also has a `sandboxes` table, a
 # different database on a different machine with its own store and fences
 # (`sbxmgr_sqlite` and `dependency_fence.sbxmgr_*` below), so its crates are
-# allowed whole: those rules guard `crates/libs/sbx/mgr/**` and
-# `crates/apps/sbx/**`, which today are all of `crates/libs/sbx` and
-# `crates/apps/sbx`, and a narrower glob would make this required rule fire
-# on moves within sbx-mgr. Test files are
+# allowed whole, by the globs those rules guard: `crates/l*/{sbx,sbxmgr}/**`
+# and `crates/apps/sbx/**`. Today they match all of `crates/libs/sbx` and
+# `crates/apps/sbx`; as the crates move, they match the layer directories'
+# `sbx` crates and the `sbxmgr` paths of `pplx-space-sbxmgr-svc` and
+# `pplx-space-sbxmgr-migrations` until those are renamed. A narrower glob
+# would make this required rule fire on moves within sbx-mgr. Test files are
 # filename-based, so `allow` adds the `#[cfg(test)]` support modules and
 # fixtures, which write rows to set up their cases; `#[cfg(test)]` code inline
 # in a production file counts, so test-only writes go in a `*_tests` file.
@@ -235,7 +237,7 @@ patterns = [
 allow = [
   "crates/libs/sandbox/store/**",
   # node-local sbx-mgr SQLite `sandboxes`: a different database
-  "crates/libs/sbx/**",
+  "crates/l*/{sbx,sbxmgr}/**",
   "crates/apps/sbx/**",
   "**/*_tests/**",
   "**/test_support.rs",
@@ -347,7 +349,7 @@ mode = "required"
 # graph assertion cover them. Other services' crates use rusqlite for their own databases, so
 # `include` limits the rule to sbx-mgr's.
 [rules.pattern_ratchet.sbxmgr_sqlite]
-include = ["crates/libs/sbx/mgr/**", "crates/apps/sbx/**"]
+include = ["crates/l*/{sbx,sbxmgr}/**", "crates/apps/sbx/**"]
 patterns = [
   '\brusqlite\s*::',
   '\buse\s+(?:::\s*)?rusqlite\b',
@@ -423,7 +425,7 @@ mode = "required"
 # dependency, for any target, under any name.
 [rules.dependency_fence.sbxmgr_rusqlite]
 packages = ["libsqlite3-sys", "pplx-space-sqlite", "rusqlite"]
-members = ["crates/libs/sbx/mgr/**", "crates/apps/sbx/**"]
+members = ["crates/l*/{sbx,sbxmgr}/**", "crates/apps/sbx/**"]
 allow = ["crates/libs/sbx/mgr/store"]
 
 [rules.dependency_fence.sbxmgr_rusqlite.no_crossing]
@@ -434,7 +436,7 @@ mode = "required"
 # names their `Migrator` type.
 [rules.dependency_fence.sbxmgr_sqlx]
 packages = ["sqlx", "sqlx-core", "sqlx-sqlite"]
-members = ["crates/libs/sbx/mgr/**", "crates/apps/sbx/**"]
+members = ["crates/l*/{sbx,sbxmgr}/**", "crates/apps/sbx/**"]
 allow = ["crates/libs/sbx/mgr/store", "crates/libs/sbx/mgr/migrations"]
 
 [rules.dependency_fence.sbxmgr_sqlx.no_crossing]
@@ -453,4 +455,309 @@ mode = "required"
 mode = "advisory"
 
 [rules.crate_names.policy_changed]    # changes to this table, compared with the base branch
+mode = "advisory"
+
+# Every workspace crate belongs to a layer: l10_foundation, l20_domain,
+# l30_storage, l40_api and l50_app, bottom-up, or test_support and tools beside
+# them. A crate in crates/<layer>/ takes its layer from the directory; the
+# crates that predate the layer directories are listed in `unmoved` until they
+# move. A new crate goes in a layer directory. What belongs in each layer, the
+# dependency matrix and how to fix a finding: crates/tools/archcheck/README.md
+# (Layers).
+[rules.layers.unmoved]
+l10_foundation = [
+  "pplx-space-aws-client",
+  "pplx-space-bearer-token",
+  "pplx-space-btrfs",
+  "pplx-space-byte-size",
+  "pplx-space-common-cli",
+  "pplx-space-common-connection-admission",
+  "pplx-space-common-grpc",
+  "pplx-space-common-grpc-lb",
+  "pplx-space-common-io",
+  "pplx-space-common-jobs",
+  "pplx-space-common-lru-reaper",
+  "pplx-space-common-proto-build",
+  "pplx-space-common-svc",
+  "pplx-space-common-work-coalescer",
+  "pplx-space-content-digest",
+  "pplx-space-cpu-arch",
+  "pplx-space-dependency-drain",
+  "pplx-space-durations",
+  "pplx-space-env-vars",
+  "pplx-space-feature-flags",
+  "pplx-space-grpc-metrics",
+  "pplx-space-grpc-rate-limiter",
+  "pplx-space-http-server",
+  "pplx-space-k8s-ids",
+  "pplx-space-kube-client",
+  "pplx-space-linux-ids",
+  "pplx-space-metrics",
+  "pplx-space-metrics-emit",
+  "pplx-space-migration-checksums",
+  "pplx-space-object-store",
+  "pplx-space-observability",
+  "pplx-space-page-cache",
+  "pplx-space-pii",
+  "pplx-space-postgres-contention",
+  "pplx-space-request-id",
+  "pplx-space-rustls-provider",
+  "pplx-space-s3-http-client",
+  "pplx-space-semver",
+  "pplx-space-service-lifecycle",
+  "pplx-space-service-mutex",
+  "pplx-space-spaced-build",
+  "pplx-space-sql-locator",
+  "pplx-space-sqlite",
+  "pplx-space-stopwatch",
+  "pplx-space-systemd-watchdog",
+  "pplx-space-tokio-runtime",
+  "pplx-space-uds-peer-auth",
+  "pplx-space-unix-socket-bind",
+  "pplx-space-unix-socket-path",
+  "pplx-space-valkey",
+]
+l20_domain = [
+  "pplx-space-accounts",
+  "pplx-space-api-route",
+  "pplx-space-auto-lifecycle",
+  "pplx-space-auto-lifecycle-receipt",
+  "pplx-space-cluster-id",
+  "pplx-space-common-core",
+  "pplx-space-credential-injection-core",
+  "pplx-space-credential-provider-proto",
+  "pplx-space-db-identity",
+  "pplx-space-ecw-credential",
+  "pplx-space-events",
+  "pplx-space-execution-catalog",
+  "pplx-space-execution-common",
+  "pplx-space-execution-spec",
+  "pplx-space-federated-identity",
+  "pplx-space-guest-process",
+  "pplx-space-k8s-node-id",
+  "pplx-space-net-common",
+  "pplx-space-net-gateway-protocol",
+  "pplx-space-network-roles",
+  "pplx-space-node-mgr-protocol",
+  "pplx-space-public-api",
+  "pplx-space-rpc-contracts",
+  "pplx-space-sbx-mgr-protocol",
+  "pplx-space-spaced-common",
+  "pplx-space-spaced-guest-protocol",
+  "pplx-space-state-reconciliation",
+]
+l30_storage = [
+  "pplx-space-cluster-pool",
+  "pplx-space-cluster-trigger-queue",
+  "pplx-space-credential-injection-store",
+  "pplx-space-db-migrate",
+  "pplx-space-federated-grant-store",
+  "pplx-space-node-registration-store",
+  "pplx-space-placement",
+  "pplx-space-runtime-environment-catalog-store",
+  "pplx-space-runtime-environment-policy-store",
+  "pplx-space-sandbox-portability",
+  "pplx-space-sandbox-quarantine-store",
+  "pplx-space-sandbox-routability",
+  "pplx-space-sandbox-store",
+  "pplx-space-sandbox-teardown",
+  "pplx-space-sbx-mgr-store",
+  "pplx-space-sbxmgr-migrations",
+  "pplx-space-snapshot-storage",
+  "pplx-space-snapshot-store",
+]
+l40_api = [
+  "pplx-space-api",
+  "pplx-space-build-mgr",
+  "pplx-space-build-mgr-client",
+  "pplx-space-build-mgr-server",
+  "pplx-space-cluster-controller-server",
+  "pplx-space-cluster-reconciler",
+  "pplx-space-credential-provider-client",
+  "pplx-space-credmgr",
+  "pplx-space-credmgr-client",
+  "pplx-space-data-plane-server",
+  "pplx-space-ingress-admission",
+  "pplx-space-internal-api-server",
+  "pplx-space-net-gateway",
+  "pplx-space-net-gateway-client",
+  "pplx-space-node-api-client",
+  "pplx-space-node-api-server",
+  "pplx-space-node-ctl-client",
+  "pplx-space-node-ctl-server",
+  "pplx-space-node-mgr",
+  "pplx-space-node-mgr-client",
+  "pplx-space-node-runtime-core",
+  "pplx-space-node-runtime-manager",
+  "pplx-space-node-runtime-manager-client",
+  "pplx-space-node-runtime-supervisor",
+  "pplx-space-placement-executor",
+  "pplx-space-sbx-mgr",
+  "pplx-space-sbx-mgr-client",
+  "pplx-space-snapshot-retention",
+  "pplx-space-spaced-guest-client",
+  "pplx-space-spaced-guest-execution",
+  "pplx-space-spaced-guest-server",
+  "pplx-space-spaced-host-client",
+  "pplx-space-spaced-host-server",
+  "pplx-space-template-mgr",
+  "pplx-space-template-mgr-client",
+  "pplx-space-template-publisher",
+  "pplx-space-volmgr",
+  "pplx-space-volmgr-client",
+]
+l50_app = [
+  "pplx-space-admin-cli",
+  "pplx-space-api-svc",
+  "pplx-space-build-mgr-cli",
+  "pplx-space-build-mgr-svc",
+  "pplx-space-cluster-controller",
+  "pplx-space-credmgr-svc",
+  "pplx-space-data-plane-svc",
+  "pplx-space-db-migrator",
+  "pplx-space-internal-api-svc",
+  "pplx-space-net-gateway-svc",
+  "pplx-space-node-api-svc",
+  "pplx-space-node-ctl-cli",
+  "pplx-space-node-ctl-svc",
+  "pplx-space-node-mgr-cli",
+  "pplx-space-node-mgr-svc",
+  "pplx-space-runtime-manager-cli",
+  "pplx-space-runtime-manager-svc",
+  "pplx-space-runtime-supervisor-svc",
+  "pplx-space-sbx-mgr-cli",
+  "pplx-space-sbxmgr-svc",
+  "pplx-space-spaced-guest-cli",
+  "pplx-space-spaced-guest-svc",
+  "pplx-space-spaced-guest-worker",
+  "pplx-space-spaced-host-cli",
+  "pplx-space-spaced-host-svc",
+  "pplx-space-ssh-cli",
+  "pplx-space-template-publish",
+  "pplx-space-tmplmgr-cli",
+  "pplx-space-tmplmgr-svc",
+  "pplx-space-volmgr-cli",
+  "pplx-space-volmgr-svc",
+]
+test_support = [
+  "pplx-space-db-test-fixtures",
+  "pplx-space-mock-branching-key-provider-svc",
+  "pplx-space-mock-llm-svc",
+  "pplx-space-node-api-sim",
+  "pplx-space-test-env",
+]
+tools = [
+  "pplx-space-netgtw-bench",
+  "pplx-space-spaced-loopback-test",
+]
+
+
+# Each store's allowed users: the l40_api and l30_storage crates that own its
+# state, including those that reach it today through common-svc's re-exports.
+[rules.layers.store_users]
+pplx-space-cluster-pool = [
+  "pplx-space-api",
+  "pplx-space-cluster-controller-server",
+  "pplx-space-internal-api-server",
+  "pplx-space-sandbox-teardown",
+]
+pplx-space-cluster-trigger-queue = [
+  "pplx-space-api",
+  "pplx-space-cluster-reconciler",
+  "pplx-space-internal-api-server",
+]
+pplx-space-credential-injection-store = ["pplx-space-api", "pplx-space-credmgr"]
+pplx-space-federated-grant-store = ["pplx-space-api", "pplx-space-credmgr"]
+pplx-space-node-registration-store = ["pplx-space-credmgr"]
+pplx-space-placement = ["pplx-space-internal-api-server", "pplx-space-placement-executor"]
+pplx-space-runtime-environment-catalog-store = ["pplx-space-internal-api-server"]
+pplx-space-runtime-environment-policy-store = [
+  "pplx-space-api",
+  "pplx-space-internal-api-server",
+]
+pplx-space-sandbox-portability = [
+  "pplx-space-api",
+  "pplx-space-cluster-controller-server",
+  "pplx-space-internal-api-server",
+  "pplx-space-sandbox-store",
+  "pplx-space-snapshot-retention",
+]
+pplx-space-sandbox-quarantine-store = [
+  "pplx-space-cluster-controller-server",
+  "pplx-space-internal-api-server",
+]
+pplx-space-sandbox-routability = [
+  "pplx-space-api",
+  "pplx-space-cluster-controller-server",
+  "pplx-space-internal-api-server",
+]
+pplx-space-sandbox-store = [
+  "pplx-space-api",
+  "pplx-space-cluster-controller-server",
+  "pplx-space-internal-api-server",
+  "pplx-space-snapshot-retention",
+]
+pplx-space-sandbox-teardown = [
+  "pplx-space-api",
+  "pplx-space-cluster-controller-server",
+  "pplx-space-internal-api-server",
+]
+pplx-space-sbx-mgr-store = ["pplx-space-db-migrate", "pplx-space-sbx-mgr"]
+pplx-space-sbxmgr-migrations = ["pplx-space-sbx-mgr-store"]
+pplx-space-snapshot-storage = [
+  "pplx-space-cluster-controller-server",
+  "pplx-space-snapshot-retention",
+]
+pplx-space-snapshot-store = [
+  "pplx-space-cluster-controller-server",
+  "pplx-space-internal-api-server",
+  "pplx-space-snapshot-retention",
+]
+
+# Edges the dependency matrix forbids, allowed by name.
+[rules.layers.allowed_edges]
+# The database migrator applies every store's migrations.
+pplx-space-db-migrator = ["pplx-space-db-migrate"]
+
+[rules.layers.placement]          # every crate has a layer; no new unmoved entries
+mode = "required"
+
+[rules.layers.layout]             # paths below a layer directory follow the package name
+mode = "required"
+
+# Normal and build edges follow the dependency matrix; today's exceptions are
+# baselined in [layers.direction], most of them from common-svc and other
+# Foundation crates that still name SPACE types.
+[rules.layers.direction.no_crossing]
+mode = "required"
+
+[rules.layers.direction.no_new_entries]
+mode = "required"
+
+[rules.layers.direction.stale_entries]
+mode = "required"
+
+# Dev edges point at the crate's own or a lower layer, or at test_support.
+[rules.layers.dev_direction.no_crossing]
+mode = "required"
+
+[rules.layers.dev_direction.no_new_entries]
+mode = "required"
+
+[rules.layers.dev_direction.stale_entries]
+mode = "required"
+
+[rules.layers.test_only]          # test_support only through dev-dependencies; nothing depends on tools
+mode = "required"
+
+[rules.layers.clients]            # *-client crates depend only on l20_domain, l10_foundation and clients
+mode = "required"
+
+[rules.layers.store_edges]        # API and Storage crates use only the stores that list them
+mode = "required"
+
+[rules.layers.stale_entries]      # unmoved, store_users and allowed_edges entries that no longer apply
+mode = "required"
+
+[rules.layers.policy_changed]     # changes to [rules.layers], compared with the base branch
 mode = "advisory"
