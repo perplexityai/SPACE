@@ -99,8 +99,14 @@ impl ImportFixture {
             name: "register-refresh-test".into(),
             content_hash: Some(content_hash.clone()),
             tag: None,
+            environment: None,
         };
-        let directory = build_artifacts_dir(&root, &template.name, &content_hash);
+        let directory = build_artifacts_dir(
+            &root,
+            &template.name,
+            &content_hash,
+            crate::db::TemplateCachePartition::Legacy,
+        );
         std::fs::create_dir_all(directory.parent().unwrap()).unwrap();
         std::fs::rename(source.path(), &directory).unwrap();
         let mut service =
@@ -208,6 +214,7 @@ impl ImportFixture {
             &self.service.artifact_store.root,
             &self.template.name,
             hash,
+            crate::db::TemplateCachePartition::Legacy,
             1,
             512,
         );
@@ -222,10 +229,13 @@ impl ImportFixture {
         }
         crate::db::upsert_snapshot(
             &self.service.db.lock().unwrap(),
-            &self.template.name,
-            hash,
-            1,
-            512,
+            crate::db::SnapshotKey {
+                name: &self.template.name,
+                content_hash: hash,
+                cache_partition: crate::db::TemplateCachePartition::Legacy,
+                vcpu: 1,
+                memory_mib: 512,
+            },
             "original",
         )
         .unwrap();
@@ -235,10 +245,13 @@ impl ImportFixture {
     fn snapshot_state(&self, path: &Path) -> (Vec<Vec<u8>>, String, String) {
         let row = crate::db::get_snapshot(
             &self.service.db.lock().unwrap(),
-            &self.template.name,
-            self.template.content_hash.as_deref().unwrap(),
-            1,
-            512,
+            crate::db::SnapshotKey {
+                name: &self.template.name,
+                content_hash: self.template.content_hash.as_deref().unwrap(),
+                cache_partition: crate::db::TemplateCachePartition::Legacy,
+                vcpu: 1,
+                memory_mib: 512,
+            },
         )
         .unwrap()
         .unwrap();
@@ -258,6 +271,7 @@ impl ImportFixture {
             &self.service.db.lock().unwrap(),
             &self.template.name,
             self.template.content_hash.as_deref().unwrap(),
+            crate::db::TemplateCachePartition::Legacy,
         )
         .unwrap()
         .unwrap();
@@ -467,4 +481,37 @@ async fn new_import_refuses_unknown_schema_without_waiting_for_disk_bytes() {
                 .exists()
         );
     }
+}
+
+/// While `DeleteTemplateBuild` holds a digest, an import of it into any
+/// partition refuses retryably instead of writing a dir the delete removes.
+#[tokio::test]
+async fn import_refuses_a_digest_a_delete_holds() {
+    use futures_util::StreamExt;
+    let mut fixture = ImportFixture::new().await;
+    let header = fixture.changed_header(Change::Unchanged);
+    let template = header.template.clone().unwrap();
+    let key = super::super::import_helpers::digest_delete_key(
+        &template.name,
+        template.content_hash.as_deref().unwrap(),
+    );
+    fixture
+        .service
+        .importing_templates
+        .lock()
+        .unwrap()
+        .insert(key);
+    let stream = tokio_stream::iter([ImportTemplateRequest {
+        payload: Some(Payload::Header(header)),
+    }])
+    .chain(futures_util::stream::pending());
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        fixture.client.import_template(stream),
+    )
+    .await
+    .expect("the import must refuse before reading its data");
+
+    assert_eq!(result.unwrap_err().code(), Code::Aborted);
 }

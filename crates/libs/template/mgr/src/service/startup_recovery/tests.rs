@@ -124,7 +124,13 @@ fn parse_manifest_rejects_files_map_key_with_dot_prefix() {
 fn manifest_self_consistency_accepts_canonical_manifest() {
     let fixture = write_digest_fixture(b"rootfs-bytes", b"zst-bytes");
     let manifest = canonical_manifest(&fixture);
-    validate_manifest_self_consistency(&fixture.rootfs_hash, &manifest).unwrap();
+    validate_manifest_self_consistency(
+        &fixture.rootfs_hash,
+        crate::db::TemplateCachePartition::Legacy,
+        &manifest,
+        &TemplateMetadata::default(),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -132,7 +138,13 @@ fn manifest_self_consistency_rejects_content_hash_mismatch() {
     let fixture = write_digest_fixture(b"rootfs-bytes", b"zst-bytes");
     let mut manifest = canonical_manifest(&fixture);
     manifest.content_hash = sha256_content_hash(b"different");
-    let err = validate_manifest_self_consistency(&fixture.rootfs_hash, &manifest).unwrap_err();
+    let err = validate_manifest_self_consistency(
+        &fixture.rootfs_hash,
+        crate::db::TemplateCachePartition::Legacy,
+        &manifest,
+        &TemplateMetadata::default(),
+    )
+    .unwrap_err();
     assert!(matches!(
         err,
         DigestDirRejection::ContentHashDisagreesWithDirName { .. }
@@ -144,7 +156,13 @@ fn manifest_self_consistency_rejects_empty_bootable_artifact() {
     let fixture = write_digest_fixture(b"rootfs-bytes", b"zst-bytes");
     let mut manifest = canonical_manifest(&fixture);
     manifest.bootable_artifact.clear();
-    let err = validate_manifest_self_consistency(&fixture.rootfs_hash, &manifest).unwrap_err();
+    let err = validate_manifest_self_consistency(
+        &fixture.rootfs_hash,
+        crate::db::TemplateCachePartition::Legacy,
+        &manifest,
+        &TemplateMetadata::default(),
+    )
+    .unwrap_err();
     assert!(matches!(
         err,
         DigestDirRejection::BootableArtifactNotDeclared
@@ -156,7 +174,13 @@ fn manifest_self_consistency_rejects_missing_bootable_entry() {
     let fixture = write_digest_fixture(b"rootfs-bytes", b"zst-bytes");
     let mut manifest = canonical_manifest(&fixture);
     manifest.files.remove(TEMPLATE_ROOTFS_FILE);
-    let err = validate_manifest_self_consistency(&fixture.rootfs_hash, &manifest).unwrap_err();
+    let err = validate_manifest_self_consistency(
+        &fixture.rootfs_hash,
+        crate::db::TemplateCachePartition::Legacy,
+        &manifest,
+        &TemplateMetadata::default(),
+    )
+    .unwrap_err();
     assert!(matches!(
         err,
         DigestDirRejection::BootableEntryAbsentFromFilesMap(_)
@@ -169,7 +193,13 @@ fn manifest_self_consistency_rejects_bootable_digest_mismatch() {
     let mut manifest = canonical_manifest(&fixture);
     manifest.files.get_mut(TEMPLATE_ROOTFS_FILE).unwrap().digest =
         sha256_content_hash(b"different");
-    let err = validate_manifest_self_consistency(&fixture.rootfs_hash, &manifest).unwrap_err();
+    let err = validate_manifest_self_consistency(
+        &fixture.rootfs_hash,
+        crate::db::TemplateCachePartition::Legacy,
+        &manifest,
+        &TemplateMetadata::default(),
+    )
+    .unwrap_err();
     assert!(matches!(
         err,
         DigestDirRejection::BootableEntryDigestDisagreesWithDirName { .. }
@@ -307,6 +337,7 @@ async fn prune_drops_deleting_row_when_artifacts_missing() {
         &crate::db::BuildUpsert {
             name: "seed",
             content_hash: hash,
+            cache_partition: crate::db::TemplateCachePartition::Legacy,
             build_date: "2026-01-01T00:00:00Z",
             manifest_json: "{}",
             runtime: "fc",
@@ -355,6 +386,7 @@ async fn prune_restores_deleting_row_when_artifacts_intact() {
         &crate::db::BuildUpsert {
             name: "seed",
             content_hash: hash,
+            cache_partition: crate::db::TemplateCachePartition::Legacy,
             build_date: "2026-01-01T00:00:00Z",
             manifest_json: "{}",
             runtime: "fc",
@@ -407,19 +439,833 @@ async fn recovery_adopts_blake3_bytes_and_rejects_corruption_without_a_catalog_r
     let service =
         TemplateManagerService::new_with_template_root(crate::db::test_conn(), fixture.dir.path())
             .unwrap();
-    reconcile_digest_dir_against_db(&service, "seed", hash, fixture.dir.path()).await;
+    reconcile_digest_dir_against_db(
+        &service,
+        DigestDirBuild {
+            name: "seed",
+            hash_name: hash,
+            partition: crate::db::TemplateCachePartition::Legacy,
+            digest_dir: fixture.dir.path(),
+        },
+    )
+    .await;
     assert!(
-        crate::db::get_build(&service.db.lock().unwrap(), "seed", hash)
+        crate::db::get_build(
+            &service.db.lock().unwrap(),
+            "seed",
+            hash,
+            crate::db::TemplateCachePartition::Legacy
+        )
+        .unwrap()
+        .is_some()
+    );
+    crate::db::delete_build(
+        &service.db.lock().unwrap(),
+        "seed",
+        hash,
+        crate::db::TemplateCachePartition::Legacy,
+    )
+    .unwrap();
+    std::fs::write(fixture.dir.path().join(TEMPLATE_ROOTFS_FILE), b"bad").unwrap();
+    reconcile_digest_dir_against_db(
+        &service,
+        DigestDirBuild {
+            name: "seed",
+            hash_name: hash,
+            partition: crate::db::TemplateCachePartition::Legacy,
+            digest_dir: fixture.dir.path(),
+        },
+    )
+    .await;
+    assert!(
+        crate::db::get_build(
+            &service.db.lock().unwrap(),
+            "seed",
+            hash,
+            crate::db::TemplateCachePartition::Legacy
+        )
+        .unwrap()
+        .is_none()
+    );
+    assert!(!fixture.dir.path().exists());
+}
+
+fn twin_partition() -> crate::db::TemplateCachePartition {
+    crate::db::TemplateCachePartition::Environment(
+        pplx_space_common_core::types::EnvironmentReference::new(
+            pplx_space_common_core::types::Digest::sha256([2; 32]),
+        ),
+    )
+}
+
+fn bind_manifest(manifest: &mut TemplateManifest, partition: crate::db::TemplateCachePartition) {
+    let execution = pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
+        pplx_space_common_core::types::Arch::X86_64,
+        vec![],
+    );
+    manifest.set_execution_metadata(match partition.environment() {
+        Some(environment) => execution.with_environment(environment),
+        None => execution,
+    });
+}
+
+#[test]
+fn self_consistency_rejects_a_dir_bound_elsewhere() {
+    let fixture = write_digest_fixture(b"rootfs", b"zst-bytes");
+    let mut manifest = canonical_manifest(&fixture);
+    bind_manifest(&mut manifest, crate::db::TemplateCachePartition::Legacy);
+    let err = validate_manifest_self_consistency(
+        &fixture.rootfs_hash,
+        twin_partition(),
+        &manifest,
+        &TemplateMetadata::default(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            DigestDirRejection::PartitionDisagreesWithDirName { .. }
+        ),
+        "{err}"
+    );
+    let mut manifest = canonical_manifest(&fixture);
+    bind_manifest(&mut manifest, twin_partition());
+    validate_manifest_self_consistency(
+        &fixture.rootfs_hash,
+        twin_partition(),
+        &manifest,
+        &TemplateMetadata::default(),
+    )
+    .unwrap();
+    // A legacy-layout dir bound to another environment is no exception.
+    let err = validate_manifest_self_consistency(
+        &fixture.rootfs_hash,
+        crate::db::TemplateCachePartition::Legacy,
+        &manifest,
+        &TemplateMetadata::default(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            DigestDirRejection::PartitionDisagreesWithDirName { .. }
+        ),
+        "{err}"
+    );
+
+    // A manifest without execution metadata takes metadata.json's binding,
+    // as registration does.
+    let unbound = canonical_manifest(&fixture);
+    assert!(unbound.execution.is_none());
+    let mut metadata = TemplateMetadata::default();
+    metadata.set_execution_metadata(
+        pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
+            pplx_space_common_core::types::Arch::X86_64,
+            vec![],
+        )
+        .with_environment(twin_partition().environment().unwrap()),
+    );
+    validate_manifest_self_consistency(&fixture.rootfs_hash, twin_partition(), &unbound, &metadata)
+        .unwrap();
+    let err = validate_manifest_self_consistency(
+        &fixture.rootfs_hash,
+        crate::db::TemplateCachePartition::Legacy,
+        &unbound,
+        &metadata,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            DigestDirRejection::PartitionDisagreesWithDirName { .. }
+        ),
+        "{err}"
+    );
+
+    // Unreadable execution metadata keeps a legacy dir's pre-partition
+    // handling, but a partitioned dir can't prove its binding.
+    manifest.schema_version = Some(u32::MAX);
+    validate_manifest_self_consistency(
+        &fixture.rootfs_hash,
+        crate::db::TemplateCachePartition::Legacy,
+        &manifest,
+        &TemplateMetadata::default(),
+    )
+    .unwrap();
+    let err = validate_manifest_self_consistency(
+        &fixture.rootfs_hash,
+        twin_partition(),
+        &manifest,
+        &TemplateMetadata::default(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, DigestDirRejection::ExecutionMetadataInvalid(_)),
+        "{err}"
+    );
+}
+
+/// The binding may sit only in metadata.json, as a pull interrupted before
+/// normalizing its manifest leaves it.
+#[rstest::rstest]
+#[case::in_manifest(false)]
+#[case::in_metadata(true)]
+#[tokio::test]
+async fn recovery_registers_a_twin_dir_in_its_own_partition(#[case] in_metadata: bool) {
+    let fixture = write_digest_fixture(b"twin-rootfs", b"zst-bytes");
+    let mut manifest = canonical_manifest(&fixture);
+    if in_metadata {
+        let mut bound = manifest.clone();
+        bind_manifest(&mut bound, twin_partition());
+        let mut metadata = TemplateMetadata::default();
+        metadata.set_execution_metadata(bound.execution.unwrap());
+        std::fs::write(
+            fixture.dir.path().join("metadata.json"),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+    } else {
+        bind_manifest(&mut manifest, twin_partition());
+    }
+    write_manifest_json(fixture.dir.path(), &manifest);
+    let service =
+        TemplateManagerService::new_with_template_root(crate::db::test_conn(), fixture.dir.path())
+            .unwrap();
+    reconcile_digest_dir_against_db(
+        &service,
+        DigestDirBuild {
+            name: "seed",
+            hash_name: &fixture.rootfs_hash,
+            partition: twin_partition(),
+            digest_dir: fixture.dir.path(),
+        },
+    )
+    .await;
+    let conn = service.db.lock().unwrap();
+    assert!(
+        crate::db::get_build(&conn, "seed", &fixture.rootfs_hash, twin_partition())
             .unwrap()
             .is_some()
     );
-    crate::db::delete_build(&service.db.lock().unwrap(), "seed", hash).unwrap();
-    std::fs::write(fixture.dir.path().join(TEMPLATE_ROOTFS_FILE), b"bad").unwrap();
-    reconcile_digest_dir_against_db(&service, "seed", hash, fixture.dir.path()).await;
     assert!(
-        crate::db::get_build(&service.db.lock().unwrap(), "seed", hash)
+        crate::db::get_build(
+            &conn,
+            "seed",
+            &fixture.rootfs_hash,
+            crate::db::TemplateCachePartition::Legacy
+        )
+        .unwrap()
+        .is_none()
+    );
+}
+
+/// A node that predates partitions can hold a build bound to another
+/// environment in the legacy layout, under a legacy row. Recovery drops it
+/// with its base snapshots, so a pull fetches it into its own partition.
+#[tokio::test]
+async fn recovery_drops_a_legacy_dir_bound_to_another_environment() {
+    let root = tempfile::tempdir().unwrap();
+    let fixture = write_digest_fixture(b"legacy-dir-rootfs", b"zst-bytes");
+    let mut manifest = canonical_manifest(&fixture);
+    bind_manifest(&mut manifest, twin_partition());
+    write_manifest_json(fixture.dir.path(), &manifest);
+    let conn = crate::db::test_conn();
+    conn.execute(
+        "INSERT INTO template_builds (name, content_hash, build_date, manifest_json, runtime, arch, created_at)
+         VALUES ('seed', ?1, 'd', ?2, 'fc', 'x86_64', '0')",
+        rusqlite::params![fixture.rootfs_hash, serde_json::to_string(&manifest).unwrap()],
+    )
+    .unwrap();
+    let service = TemplateManagerService::new_with_template_root(conn, root.path()).unwrap();
+    let snapshot = root
+        .path()
+        .join("seed/snapshots")
+        .join(&fixture.rootfs_hash)
+        .join("vcpu1_mem256");
+    std::fs::create_dir_all(&snapshot).unwrap();
+    std::fs::write(snapshot.join("snapshot.base"), b"memory").unwrap();
+
+    reconcile_digest_dir_against_db(
+        &service,
+        DigestDirBuild {
+            name: "seed",
+            hash_name: &fixture.rootfs_hash,
+            partition: crate::db::TemplateCachePartition::Legacy,
+            digest_dir: fixture.dir.path(),
+        },
+    )
+    .await;
+
+    assert!(!fixture.dir.path().exists());
+    assert!(!snapshot.exists());
+    assert!(
+        crate::db::get_build(
+            &service.db.lock().unwrap(),
+            "seed",
+            &fixture.rootfs_hash,
+            crate::db::TemplateCachePartition::Legacy,
+        )
+        .unwrap()
+        .is_none()
+    );
+}
+
+/// A partitioned dir only this code writes must hold its own environment's
+/// build; one that doesn't is dropped.
+#[tokio::test]
+async fn recovery_drops_a_partitioned_dir_bound_elsewhere() {
+    let root = tempfile::tempdir().unwrap();
+    let fixture = write_digest_fixture(b"twin-dir-rootfs", b"zst-bytes");
+    let mut manifest = canonical_manifest(&fixture);
+    bind_manifest(&mut manifest, crate::db::TemplateCachePartition::Legacy);
+    write_manifest_json(fixture.dir.path(), &manifest);
+    let service =
+        TemplateManagerService::new_with_template_root(crate::db::test_conn(), root.path())
+            .unwrap();
+
+    reconcile_digest_dir_against_db(
+        &service,
+        DigestDirBuild {
+            name: "seed",
+            hash_name: &fixture.rootfs_hash,
+            partition: twin_partition(),
+            digest_dir: fixture.dir.path(),
+        },
+    )
+    .await;
+
+    assert!(!fixture.dir.path().exists());
+}
+
+fn legacy_build(fixture: &DigestFixture) -> DigestDirBuild<'_> {
+    DigestDirBuild {
+        name: "seed",
+        hash_name: &fixture.rootfs_hash,
+        partition: crate::db::TemplateCachePartition::Legacy,
+        digest_dir: fixture.dir.path(),
+    }
+}
+
+fn registered(service: &TemplateManagerService, fixture: &DigestFixture) -> bool {
+    crate::db::get_build(
+        &service.db.lock().unwrap(),
+        "seed",
+        &fixture.rootfs_hash,
+        crate::db::TemplateCachePartition::Legacy,
+    )
+    .unwrap()
+    .is_some()
+}
+
+fn insert_row(conn: &rusqlite::Connection, fixture: &DigestFixture, manifest: &TemplateManifest) {
+    conn.execute(
+        "INSERT INTO template_builds (name, content_hash, build_date, manifest_json, runtime, arch, created_at)
+         VALUES ('seed', ?1, 'd', ?2, 'fc', 'x86_64', '0')",
+        rusqlite::params![fixture.rootfs_hash, serde_json::to_string(manifest).unwrap()],
+    )
+    .unwrap();
+}
+
+#[test]
+fn io_errors_that_can_clear_are_transient() {
+    use std::io::{Error, ErrorKind};
+    for kind in [
+        ErrorKind::NotFound,
+        ErrorKind::InvalidData,
+        ErrorKind::InvalidInput,
+        ErrorKind::InvalidFilename,
+        ErrorKind::IsADirectory,
+        ErrorKind::NotADirectory,
+    ] {
+        assert!(!io_error_is_transient(&Error::from(kind)), "{kind:?}");
+    }
+    let looped = Error::from_raw_os_error(rustix::io::Errno::LOOP.raw_os_error());
+    assert!(!io_error_is_transient(&looped), "{looped}");
+    for error in [
+        Error::from_raw_os_error(rustix::io::Errno::IO.raw_os_error()),
+        Error::from(ErrorKind::PermissionDenied),
+        Error::from(ErrorKind::Interrupted),
+        Error::from(ErrorKind::TimedOut),
+    ] {
+        assert!(io_error_is_transient(&error), "{error}");
+    }
+}
+
+/// A manifest that fails to read with EIO, here a link to an unmapped
+/// address of `/proc/self/mem`, never deletes the installed build: its row
+/// goes, so it can't be selected, and its dir stays. Once the manifest reads
+/// again, the next startup verifies the dir from scratch and registers it.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_transient_rejection_keeps_the_dir_and_the_next_startup_restores_it() {
+    let fixture = write_digest_fixture(b"transient-rootfs", b"zst-bytes");
+    let manifest = canonical_manifest(&fixture);
+    let manifest_path = fixture.dir.path().join("manifest.json");
+    std::os::unix::fs::symlink("/proc/self/mem", &manifest_path).unwrap();
+    let error = std::fs::read_to_string(&manifest_path).unwrap_err();
+    assert_eq!(
+        error.raw_os_error(),
+        Some(rustix::io::Errno::IO.raw_os_error()),
+        "{error}"
+    );
+    let conn = crate::db::test_conn();
+    insert_row(&conn, &fixture, &manifest);
+    let service = TemplateManagerService::new_with_template_root(conn, fixture.dir.path()).unwrap();
+
+    reconcile_digest_dir_against_db(&service, legacy_build(&fixture)).await;
+
+    assert!(fixture.dir.path().join(TEMPLATE_ROOTFS_FILE).exists());
+    assert!(!registered(&service, &fixture));
+    assert!(
+        crate::db::get_latest_build(&service.db.lock().unwrap(), "seed", None)
             .unwrap()
             .is_none()
     );
+
+    // The next startup, with the manifest readable again.
+    std::fs::remove_file(&manifest_path).unwrap();
+    write_manifest_json(fixture.dir.path(), &manifest);
+    reconcile_digest_dir_against_db(&service, legacy_build(&fixture)).await;
+
+    assert!(registered(&service, &fixture));
+}
+
+/// A bootable artifact whose read fails with EIO while it's hashed is a
+/// transient rejection. The ordinary reader reads from offset 0, which
+/// `/proc/self/mem` fails with EIO; the sparse one sizes the file first.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn hashing_a_rootfs_that_fails_with_eio_is_transient() {
+    let fixture = write_digest_fixture(b"unhashable-rootfs", b"zst-bytes");
+    let rootfs = fixture.dir.path().join(TEMPLATE_ROOTFS_FILE);
+    std::fs::remove_file(&rootfs).unwrap();
+    std::os::unix::fs::symlink("/proc/self/mem", &rootfs).unwrap();
+
+    let rejection = verify_bootable_artifact_hash(
+        fixture.dir.path(),
+        TEMPLATE_ROOTFS_FILE,
+        &fixture.rootfs_hash,
+        crate::file_reader::TemplateReadMode::Ordinary,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(
+            rejection,
+            DigestDirRejection::BootableArtifactUnreadable { .. }
+        ),
+        "{rejection}"
+    );
+    assert!(rejection.is_transient(), "{rejection}");
+}
+
+/// A manifest that can never read, because it's missing or its path is a
+/// directory, is a permanent rejection: the build and its row go, as before.
+#[rstest::rstest]
+#[case::missing(false)]
+#[case::directory(true)]
+#[tokio::test]
+async fn a_permanent_rejection_removes_the_build(#[case] directory: bool) {
+    let fixture = write_digest_fixture(b"no-manifest-rootfs", b"zst-bytes");
+    if directory {
+        std::fs::create_dir(fixture.dir.path().join("manifest.json")).unwrap();
+    }
+    let conn = crate::db::test_conn();
+    insert_row(&conn, &fixture, &canonical_manifest(&fixture));
+    let service = TemplateManagerService::new_with_template_root(conn, fixture.dir.path()).unwrap();
+
+    reconcile_digest_dir_against_db(&service, legacy_build(&fixture)).await;
+
     assert!(!fixture.dir.path().exists());
+    assert!(!registered(&service, &fixture));
+}
+
+/// A digest dir placed under `root` as `{template}/{hash}`, with a canonical
+/// manifest, and its hash.
+fn place_build_dir(root: &Path, template: &str, rootfs: &[u8]) -> (String, std::path::PathBuf) {
+    let fixture = write_digest_fixture(rootfs, b"zst-bytes");
+    write_manifest_json(fixture.dir.path(), &canonical_manifest(&fixture));
+    let dir = root.join(template).join(&fixture.rootfs_hash);
+    std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+    std::fs::rename(fixture.dir.path(), &dir).unwrap();
+    (fixture.rootfs_hash.clone(), dir)
+}
+
+fn row_exists(service: &TemplateManagerService, template: &str, hash: &str) -> bool {
+    crate::db::get_build(
+        &service.db.lock().unwrap(),
+        template,
+        hash,
+        crate::db::TemplateCachePartition::Legacy,
+    )
+    .unwrap()
+    .is_some()
+}
+
+/// A dir the stuck-eviction reaper left without a row is verified by the
+/// next GC tick: an intact one gets its row back, and one whose contents the
+/// eviction already wiped is removed, so neither blocks pulls of its build.
+#[tokio::test]
+async fn the_gc_tick_restores_or_removes_a_dir_the_reaper_left_rowless() {
+    let root = tempfile::tempdir().unwrap();
+    let (intact_hash, intact_dir) = place_build_dir(root.path(), "seed", b"reaped-intact-rootfs");
+    let (wiped_hash, wiped_dir) = place_build_dir(root.path(), "seed", b"reaped-wiped-rootfs");
+    for entry in std::fs::read_dir(&wiped_dir).unwrap() {
+        std::fs::remove_file(entry.unwrap().path()).unwrap();
+    }
+    let conn = crate::db::test_conn();
+    for hash in [&intact_hash, &wiped_hash] {
+        conn.execute(
+            "INSERT INTO template_builds (name, content_hash, build_date, manifest_json, runtime, arch, created_at, state)
+             VALUES ('seed', ?1, 'd', '{}', 'fc', 'x86_64', '0', 'deleting')",
+            [hash],
+        )
+        .unwrap();
+    }
+    let service = TemplateManagerService::new_with_template_root(conn, root.path()).unwrap();
+    let missing: crate::eviction::ReaperDiskProbeFn = std::sync::Arc::new(|_, _, _| {
+        Box::pin(async { crate::eviction::ReaperDiskState::Missing })
+    });
+    crate::eviction::reap_stuck_deleting(std::sync::Arc::clone(&service.db), &missing).await;
+    assert!(!row_exists(&service, "seed", &intact_hash));
+    assert!(intact_dir.exists() && wiped_dir.exists());
+
+    assert_eq!(service.reconcile_rowless_build_dirs(4).await, 2);
+
+    assert!(row_exists(&service, "seed", &intact_hash));
+    assert!(intact_dir.join(TEMPLATE_ROOTFS_FILE).exists());
+    assert!(!wiped_dir.exists());
+    assert!(!row_exists(&service, "seed", &wiped_hash));
+}
+
+/// The tick verifies at most `limit` dirs, and leaves dirs that have a row.
+#[tokio::test]
+async fn the_gc_tick_bounds_its_rowless_work() {
+    let root = tempfile::tempdir().unwrap();
+    let mut dirs = Vec::new();
+    for rootfs in [b"bound-a".as_slice(), b"bound-b", b"bound-c"] {
+        dirs.push(place_build_dir(root.path(), "seed", rootfs));
+    }
+    let service =
+        TemplateManagerService::new_with_template_root(crate::db::test_conn(), root.path())
+            .unwrap();
+
+    assert_eq!(service.reconcile_rowless_build_dirs(2).await, 2);
+    assert_eq!(service.reconcile_rowless_build_dirs(2).await, 1);
+    assert_eq!(service.reconcile_rowless_build_dirs(2).await, 0);
+    for (hash, _) in &dirs {
+        assert!(row_exists(&service, "seed", hash));
+    }
+}
+
+/// A read on the tick that fails in a way that can clear leaves the dir for
+/// a later tick, without a row.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_transient_error_on_the_gc_tick_leaves_the_dir() {
+    let root = tempfile::tempdir().unwrap();
+    let (hash, dir) = place_build_dir(root.path(), "seed", b"tick-transient-rootfs");
+    let manifest_path = dir.join("manifest.json");
+    std::fs::remove_file(&manifest_path).unwrap();
+    std::os::unix::fs::symlink("/proc/self/mem", &manifest_path).unwrap();
+    let service =
+        TemplateManagerService::new_with_template_root(crate::db::test_conn(), root.path())
+            .unwrap();
+
+    service.reconcile_rowless_build_dirs(4).await;
+
+    assert!(dir.join(TEMPLATE_ROOTFS_FILE).exists());
+    assert!(!row_exists(&service, "seed", &hash));
+}
+
+/// DeleteTemplateBuild accepts a digest whose only trace is a build dir
+/// without a row, checks sandboxes by the digest, and removes the dir; a
+/// digest with neither is still not found.
+#[tokio::test]
+async fn delete_template_build_clears_a_rowless_only_digest() {
+    let root = tempfile::tempdir().unwrap();
+    let (hash, dir) = place_build_dir(root.path(), "seed", b"rowless-delete-rootfs");
+    let service =
+        TemplateManagerService::new_with_template_root(crate::db::test_conn(), root.path())
+            .unwrap();
+    let missing = format!("sha256:{}", "e".repeat(64));
+    {
+        let conn = service.db.lock().unwrap();
+        assert!(
+            crate::service::lookup::cached_builds_to_delete(&conn, root.path(), "seed", &hash)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            crate::service::lookup::cached_builds_to_delete(&conn, root.path(), "seed", &missing)
+                .unwrap_err()
+                .code(),
+            tonic::Code::NotFound
+        );
+    }
+    let sandboxes = [pplx_space_sbx_mgr_client::proto::SandboxListElement {
+        sandbox_id: "suspended-child".to_string(),
+        template: Some("seed".to_string()),
+        image_hash: Some(hash.clone()),
+        ..Default::default()
+    }];
+    assert_eq!(
+        crate::service::dependent_sandbox_ids_for_template_delete_target(
+            &sandboxes,
+            crate::service::TemplateBuildDeleteTarget::Digest {
+                name: "seed",
+                content_hash: &hash,
+            },
+            crate::service::DependentSandboxScope::All,
+        ),
+        [(
+            "seed".to_string(),
+            hash.clone(),
+            vec!["suspended-child".to_string()]
+        )]
+    );
+
+    service
+        .delete_template_build_after_dependency_checks("seed", &hash)
+        .await
+        .unwrap();
+
+    assert!(!dir.exists());
+
+    // A base-snapshot dir a removed build left behind counts too.
+    let snapshot = root.path().join("seed/snapshots").join(&missing);
+    std::fs::create_dir_all(snapshot.join("vcpu1_mem256")).unwrap();
+    assert!(
+        crate::service::lookup::cached_builds_to_delete(
+            &service.db.lock().unwrap(),
+            root.path(),
+            "seed",
+            &missing,
+        )
+        .unwrap()
+        .is_empty()
+    );
+    service
+        .delete_template_build_after_dependency_checks("seed", &missing)
+        .await
+        .unwrap();
+    assert!(!snapshot.exists());
+}
+
+/// The tick takes rowless dirs from just after the last one it examined, so
+/// dirs that keep failing don't hold the rest back: with the first two
+/// failing on every tick, the next tick reaches and restores the third.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn the_gc_tick_rotates_past_dirs_that_keep_failing() {
+    let root = tempfile::tempdir().unwrap();
+    let mut failing = Vec::new();
+    for template in ["a-fail", "b-fail"] {
+        let (_, dir) = place_build_dir(root.path(), template, template.as_bytes());
+        let manifest = dir.join("manifest.json");
+        std::fs::remove_file(&manifest).unwrap();
+        std::os::unix::fs::symlink("/proc/self/mem", &manifest).unwrap();
+        failing.push(dir);
+    }
+    let (good_hash, _) = place_build_dir(root.path(), "c-good", b"rotated-to-rootfs");
+    let service =
+        TemplateManagerService::new_with_template_root(crate::db::test_conn(), root.path())
+            .unwrap();
+
+    assert_eq!(service.reconcile_rowless_build_dirs(2).await, 2);
+    assert!(!row_exists(&service, "c-good", &good_hash));
+
+    service.reconcile_rowless_build_dirs(2).await;
+
+    assert!(row_exists(&service, "c-good", &good_hash));
+    for dir in failing {
+        assert!(dir.join(TEMPLATE_ROOTFS_FILE).exists());
+    }
+}
+
+/// DeleteTemplateBuild takes the digest's pull claim first: while a pull
+/// holds it, the delete refuses retryably and the dir, and the row the pull
+/// then writes, survive. Once the pull lets go, the delete goes through.
+#[tokio::test]
+async fn delete_template_build_waits_for_a_pull_of_the_digest() {
+    let root = tempfile::tempdir().unwrap();
+    let (hash, dir) = place_build_dir(root.path(), "seed", b"claimed-rootfs");
+    let service =
+        TemplateManagerService::new_with_template_root(crate::db::test_conn(), root.path())
+            .unwrap();
+    let pull = service
+        .volume_puller
+        .try_claim_digest("seed", &hash)
+        .unwrap();
+
+    let error = service
+        .delete_template_build(crate::service::internal_request(
+            crate::proto::DeleteTemplateBuildRequest {
+                template: Some(crate::proto::TemplateRef {
+                    name: "seed".into(),
+                    content_hash: Some(hash.clone()),
+                    tag: None,
+                    environment: None,
+                }),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Aborted, "{error}");
+    // The pull finishes and registers its build.
+    service
+        .db
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO template_builds (name, content_hash, build_date, manifest_json, runtime, arch, created_at)
+             VALUES ('seed', ?1, 'd', '{}', 'fc', 'x86_64', '0')",
+            [&hash],
+        )
+        .unwrap();
+    assert!(dir.join(TEMPLATE_ROOTFS_FILE).exists());
+    assert!(row_exists(&service, "seed", &hash));
+    drop(pull);
+
+    let claim = service.claim_digest_for_delete("seed", &hash).unwrap();
+    service
+        .delete_template_build_after_dependency_checks("seed", &hash)
+        .await
+        .unwrap();
+    drop(claim);
+
+    assert!(!dir.exists());
+    assert!(!row_exists(&service, "seed", &hash));
+}
+
+/// An import of the digest holds the delete off the same way.
+#[tokio::test]
+async fn delete_template_build_waits_for_an_import_of_the_digest() {
+    let root = tempfile::tempdir().unwrap();
+    let (hash, dir) = place_build_dir(root.path(), "seed", b"importing-rootfs");
+    let service =
+        TemplateManagerService::new_with_template_root(crate::db::test_conn(), root.path())
+            .unwrap();
+    service
+        .importing_templates
+        .lock()
+        .unwrap()
+        .insert(format!("seed@{hash}"));
+
+    let Err(error) = service.claim_digest_for_delete("seed", &hash) else {
+        panic!("the delete must not claim a digest an import holds");
+    };
+
+    assert_eq!(error.code(), tonic::Code::Aborted, "{error}");
+    assert!(dir.join(TEMPLATE_ROOTFS_FILE).exists());
+    service
+        .importing_templates
+        .lock()
+        .unwrap()
+        .remove(&format!("seed@{hash}"));
+    drop(service.claim_digest_for_delete("seed", &hash).unwrap());
+}
+
+/// The delete's claim covers a partition the delete reaches only through its
+/// row, and holds every partition of the digest against new imports.
+#[tokio::test]
+async fn delete_claims_every_partition_it_can_reach() {
+    let root = tempfile::tempdir().unwrap();
+    let hash = format!("sha256:{}", "f".repeat(64));
+    let conn = crate::db::test_conn();
+    conn.execute(
+        "INSERT INTO template_builds (name, content_hash, cache_partition, build_date, manifest_json, runtime, arch, created_at)
+         VALUES ('seed', ?1, ?2, 'd', '{}', 'fc', 'x86_64', '0')",
+        rusqlite::params![hash, twin_partition().key()],
+    )
+    .unwrap();
+    let service = TemplateManagerService::new_with_template_root(conn, root.path()).unwrap();
+
+    let claim = service.claim_digest_for_delete("seed", &hash).unwrap();
+
+    let importing = service.importing_templates.lock().unwrap().clone();
+    assert!(importing.contains(&format!("seed@{}", twin_partition().build_dir_name(&hash))));
+    assert!(
+        importing.contains(&crate::service::import_helpers::digest_delete_key(
+            "seed", &hash
+        ))
+    );
+    drop(claim);
+    assert!(service.importing_templates.lock().unwrap().is_empty());
+}
+
+/// While someone else holds a build's claim, the tick leaves its dir alone
+/// and writes no row; once the claim goes, the next tick restores it.
+#[tokio::test]
+async fn the_gc_tick_skips_a_build_someone_else_claims() {
+    let root = tempfile::tempdir().unwrap();
+    let (hash, dir) = place_build_dir(root.path(), "seed", b"claimed-by-a-pull-rootfs");
+    let service =
+        TemplateManagerService::new_with_template_root(crate::db::test_conn(), root.path())
+            .unwrap();
+    let pull = service
+        .volume_puller
+        .try_claim_digest("seed", &hash)
+        .unwrap();
+
+    assert_eq!(service.reconcile_rowless_build_dirs(4).await, 0);
+    assert!(!row_exists(&service, "seed", &hash));
+    assert!(dir.join(TEMPLATE_ROOTFS_FILE).exists());
+
+    drop(pull);
+    assert_eq!(service.reconcile_rowless_build_dirs(4).await, 1);
+    assert!(row_exists(&service, "seed", &hash));
+}
+
+/// A delete that empties a dir and then fails holds the claim while it
+/// works, so the tick can't register the emptied dir as a ready build; after
+/// the delete lets go, the tick removes the empty dir instead.
+#[tokio::test]
+async fn a_delete_failing_midway_never_leaves_a_ready_row_over_an_empty_dir() {
+    let root = tempfile::tempdir().unwrap();
+    let (hash, dir) = place_build_dir(root.path(), "seed", b"half-deleted-rootfs");
+    let service =
+        TemplateManagerService::new_with_template_root(crate::db::test_conn(), root.path())
+            .unwrap();
+    let delete = service.claim_digest_for_delete("seed", &hash).unwrap();
+    // The delete removed the contents, then failed before the dir and rows.
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        std::fs::remove_file(entry.unwrap().path()).unwrap();
+    }
+
+    service.reconcile_rowless_build_dirs(4).await;
+    assert!(!row_exists(&service, "seed", &hash));
+    drop(delete);
+    service.reconcile_rowless_build_dirs(4).await;
+
+    assert!(!row_exists(&service, "seed", &hash));
+    assert!(!dir.exists());
+}
+
+/// A dir an import has in flight is skipped: it has no row until the import
+/// writes one.
+#[tokio::test]
+async fn the_gc_tick_skips_a_build_an_import_has_in_flight() {
+    let root = tempfile::tempdir().unwrap();
+    let (hash, dir) = place_build_dir(root.path(), "seed", b"mid-import-rootfs");
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.file_name().is_some_and(|name| name != "manifest.json") {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+    let service =
+        TemplateManagerService::new_with_template_root(crate::db::test_conn(), root.path())
+            .unwrap();
+    service
+        .importing_templates
+        .lock()
+        .unwrap()
+        .insert(format!("seed@{hash}"));
+
+    assert_eq!(service.reconcile_rowless_build_dirs(4).await, 0);
+
+    assert!(dir.join("manifest.json").exists());
+    assert!(!row_exists(&service, "seed", &hash));
 }

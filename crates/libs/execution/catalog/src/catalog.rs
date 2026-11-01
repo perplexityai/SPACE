@@ -34,6 +34,7 @@ mod uefi;
 mod verity;
 pub use environment::{
     CompiledEnvironment, CompiledEnvironmentDefinitionError, ResolveEnvironmentError,
+    initial_environment_reference, template_cache_partition,
 };
 pub use verity::compiled_verity_digest;
 

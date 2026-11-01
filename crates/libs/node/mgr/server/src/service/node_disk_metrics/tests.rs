@@ -102,11 +102,25 @@ fn classify_disk_metric_targets_uses_disk_layout() {
             .join("rootfs.ext4"),
     );
 
+    // A template cached only for another environment counts too.
+    let twin_build = templates.join("twin-runtime").join(format!(
+        "sha256:{}@sha256:{}",
+        "c".repeat(64),
+        "d".repeat(64)
+    ));
+    mkdir(&twin_build);
+    write(&twin_build.join("rootfs.ext4"));
+
     let targets = classify_disk_metric_targets(&sandbox_cache, &templates).unwrap();
 
+    let mut template_targets = targets.templates.clone();
+    template_targets.sort();
     assert_eq!(
-        targets.templates,
-        vec![path_string(templates.join("code-runtime"))]
+        template_targets,
+        vec![
+            path_string(templates.join("code-runtime")),
+            path_string(templates.join("twin-runtime")),
+        ]
     );
     assert_eq!(
         targets.snapshotted_sandboxes,

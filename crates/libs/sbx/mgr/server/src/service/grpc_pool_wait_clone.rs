@@ -389,6 +389,7 @@ impl SandboxManagerService {
                                 name: sandbox.template.clone(),
                                 content_hash: sandbox.template_hash.clone(),
                                 tag: None,
+                                environment: None,
                             },
                             template_lookup_scope(&sandbox.user, Some(&sandbox.id))?,
                         )
@@ -1116,6 +1117,7 @@ fn pool_clone_template_ref(
         name: donor.template.clone(),
         content_hash: Some(hash.clone()),
         tag: None,
+        environment: None,
     })
 }
 
