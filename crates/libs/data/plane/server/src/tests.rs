@@ -4413,9 +4413,12 @@ async fn cached_ingress_refreshes_replaced_execution_but_not_denied_access() {
                 &token_sha256(&client_token),
                 session_id.kind().connect_scope().as_str(),
             );
-            let mut attached =
-                crate::native::attached_session_from_route_response(native_stale, session_id, 1)
-                    .unwrap();
+            let mut attached = crate::native::attached_session_from_route_response(
+                native_stale,
+                session_id,
+                state.route_cache.next_cache_epoch(),
+            )
+            .unwrap();
             attached.cache_key = Some(key.clone());
             state
                 .route_cache
@@ -4435,6 +4438,7 @@ async fn cached_ingress_refreshes_replaced_execution_but_not_denied_access() {
             .await
             .map_err(|e| format!("{e:?}"))
         } else {
+            stale.cache_epoch = state.route_cache.next_cache_epoch();
             remember_ecw_ingress_route(&state, &target, stale);
             let request = Request::builder()
                 .uri("/service")
@@ -4459,11 +4463,11 @@ async fn cached_ingress_refreshes_replaced_execution_but_not_denied_access() {
                 "replacement"
             );
             assert_eq!(opens.load(Ordering::SeqCst), 2);
-            // ECW serves the just-recovered route from cache without
-            // reauthorizing it again; native reauthorizes before bytes.
+            // The just-recovered route is still cached, so it is not
+            // reauthorized again before bytes.
             assert_eq!(
                 resolves.load(Ordering::SeqCst),
-                if native { 2 } else { 1 },
+                1,
                 "recover, then reauthorize only a route the cache no longer serves"
             );
         } else {
@@ -4477,12 +4481,14 @@ async fn cached_ingress_refreshes_replaced_execution_but_not_denied_access() {
 }
 
 /// Every cluster resolve of an ingress route also reapplies its node port, so
-/// the reauthorization after an open happens only when the open may have
-/// outlived the route it used: an implicit wake that outlasts the cached route,
-/// a cache entry another request replaced during the open, or a token already
-/// inside its refresh window.
+/// the reauthorization after an open, on the ECW service proxy and the native
+/// session proxy alike, happens only when the open may have outlived the route
+/// it used: an implicit wake that outlasts the cached route, a cache entry
+/// another request replaced during the open, or a token already inside its
+/// refresh window. A request whose route is already cached and fresh makes no
+/// resolve at all.
 #[tokio::test]
-async fn ecw_ingress_open_reauthorizes_only_after_wake_or_near_expiry() {
+async fn ingress_open_reauthorizes_only_after_wake_or_near_expiry() {
     if !pplx_space_test_env::enter_test_process(&[
         ("SPACE_INTERNAL_TOKEN", Some(std::ffi::OsStr::new("test"))),
         (
@@ -4494,12 +4500,13 @@ async fn ecw_ingress_open_reauthorizes_only_after_wake_or_near_expiry() {
     }
     use prost::Message as _;
     let near_expiry = Some(SPACE_API_ROUTE_TOKEN_REFRESH_WINDOW.as_secs() / 2);
-    for (case, token_ttl_secs, route_cache_ttl, open_delay, replace_entry, expected_resolves) in [
+    let cases = [
         (
             "prompt open with a fresh route",
             None,
             Duration::from_secs(60),
             Duration::ZERO,
+            false,
             false,
             1,
         ),
@@ -4509,6 +4516,7 @@ async fn ecw_ingress_open_reauthorizes_only_after_wake_or_near_expiry() {
             Duration::from_millis(10),
             Duration::from_millis(50),
             false,
+            false,
             2,
         ),
         (
@@ -4517,6 +4525,7 @@ async fn ecw_ingress_open_reauthorizes_only_after_wake_or_near_expiry() {
             Duration::from_secs(60),
             Duration::ZERO,
             true,
+            false,
             2,
         ),
         (
@@ -4525,108 +4534,203 @@ async fn ecw_ingress_open_reauthorizes_only_after_wake_or_near_expiry() {
             Duration::from_secs(60),
             Duration::ZERO,
             false,
+            false,
             2,
         ),
-    ] {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let sandbox = SandboxId::new();
-        let mut claims = SpaceApiRouteEd25519Claims::service_port_ingress(
-            SpaceApiRouteEd25519Issuer::parse("cluster-api").unwrap(),
-            ClusterId::parse("testing").unwrap(),
-            test_route_identity(),
-            GuestPort::try_from_u16(8080).unwrap(),
-            SpaceApiRouteProtocol::Tcp,
-        )
-        .unwrap();
-        if let Some(token_ttl_secs) = token_ttl_secs {
-            claims.expires_at_unix_secs = claims.issued_at_unix_secs + token_ttl_secs;
-        }
-        let node_id = NodeId::new();
-        let resolved = UnstableResolveSandboxServiceRouteResponse {
-            sandbox_id: sandbox.to_string(),
-            org_id: OrgId::new().to_string(),
-            port: 8080,
-            lifecycle: "started".into(),
-            route_generation: 2,
-            current_node_id: node_id.to_string(),
-            backend: Some(DataPlaneBackendEndpoint {
-                node_id: node_id.to_string(),
-                endpoint: endpoint.clone(),
-                transport: None,
-            }),
-            template_id: Some("seed".into()),
-            space_api_route_token: None,
-            service_port_ingress_token: Some(proto_space_api_route_token_with_claims(claims)),
-        }
-        .encode_to_vec();
-        let opens = Arc::new(AtomicUsize::new(0));
-        let resolves = Arc::new(AtomicUsize::new(0));
-        let mut state = test_data_plane_state().await;
-        let service = Router::new().fallback({
-            let opens = opens.clone();
-            let resolves = resolves.clone();
-            let route_cache = state.route_cache.clone();
-            move |request: Request<Body>| {
+        (
+            "route already cached",
+            None,
+            Duration::from_secs(60),
+            Duration::ZERO,
+            false,
+            true,
+            0,
+        ),
+    ];
+    for native in [false, true] {
+        for (
+            case,
+            token_ttl_secs,
+            route_cache_ttl,
+            open_delay,
+            replace_entry,
+            precached,
+            expected_resolves,
+        ) in cases
+        {
+            let surface = if native { "native" } else { "ecw" };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let sandbox = SandboxId::new();
+            let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Port);
+            let client_token = format!("{DATA_PLANE_TOKEN_PREFIX}{}", "a".repeat(64));
+            let mut claims = SpaceApiRouteEd25519Claims::service_port_ingress(
+                SpaceApiRouteEd25519Issuer::parse("cluster-api").unwrap(),
+                ClusterId::parse("testing").unwrap(),
+                test_route_identity(),
+                GuestPort::try_from_u16(8080).unwrap(),
+                SpaceApiRouteProtocol::Tcp,
+            )
+            .unwrap();
+            if let Some(token_ttl_secs) = token_ttl_secs {
+                claims.expires_at_unix_secs = claims.issued_at_unix_secs + token_ttl_secs;
+            }
+            let route_token = proto_space_api_route_token_with_claims(claims);
+            let mut native_resolved =
+                route_response_with_token(session_id, Some(route_token.clone()));
+            native_resolved.sandbox_id = sandbox.to_string();
+            native_resolved.target_port = Some(8080);
+            native_resolved.backend.as_mut().unwrap().endpoint = endpoint.clone();
+            let resolved = if native {
+                native_resolved.clone().encode_to_vec()
+            } else {
+                let node_id = NodeId::new();
+                UnstableResolveSandboxServiceRouteResponse {
+                    sandbox_id: sandbox.to_string(),
+                    org_id: OrgId::new().to_string(),
+                    port: 8080,
+                    lifecycle: "started".into(),
+                    route_generation: 2,
+                    current_node_id: node_id.to_string(),
+                    backend: Some(DataPlaneBackendEndpoint {
+                        node_id: node_id.to_string(),
+                        endpoint: endpoint.clone(),
+                        transport: None,
+                    }),
+                    template_id: Some("seed".into()),
+                    space_api_route_token: None,
+                    service_port_ingress_token: Some(route_token.clone()),
+                }
+                .encode_to_vec()
+            };
+            let opens = Arc::new(AtomicUsize::new(0));
+            let resolves = Arc::new(AtomicUsize::new(0));
+            let mut state = test_data_plane_state().await;
+            let service = Router::new().fallback({
                 let opens = opens.clone();
                 let resolves = resolves.clone();
-                let resolved = resolved.clone();
-                let route_cache = route_cache.clone();
-                async move {
-                    let path = request.uri().path();
-                    if path.ends_with("/Check") {
-                        return grpc_test_response(vec![8, 1]);
-                    }
-                    if path.ends_with("/UnstableResolveSandboxServiceRoute") {
-                        resolves.fetch_add(1, Ordering::SeqCst);
-                        return grpc_test_response(resolved);
-                    }
-                    assert!(path.ends_with("/ServicePortIngress"));
-                    opens.fetch_add(1, Ordering::SeqCst);
-                    // The worker holds the open while it wakes the sandbox.
-                    tokio::time::sleep(open_delay).await;
-                    if replace_entry {
-                        // A concurrent request installs a newer route meanwhile.
-                        for mut entry in route_cache.ecw.iter_mut() {
-                            entry.value.cache_epoch = route_cache.next_cache_epoch();
+                let route_cache = state.route_cache.clone();
+                move |request: Request<Body>| {
+                    let opens = opens.clone();
+                    let resolves = resolves.clone();
+                    let resolved = resolved.clone();
+                    let route_cache = route_cache.clone();
+                    async move {
+                        let path = request.uri().path();
+                        if path.ends_with("/Check") {
+                            return grpc_test_response(vec![8, 1]);
                         }
+                        if path.ends_with(if native {
+                            "/ResolveDataPlaneSessionRoute"
+                        } else {
+                            "/UnstableResolveSandboxServiceRoute"
+                        }) {
+                            resolves.fetch_add(1, Ordering::SeqCst);
+                            return grpc_test_response(resolved);
+                        }
+                        assert!(path.ends_with("/ServicePortIngress"));
+                        opens.fetch_add(1, Ordering::SeqCst);
+                        // The worker holds the open while it wakes the sandbox.
+                        tokio::time::sleep(open_delay).await;
+                        if replace_entry {
+                            // A concurrent request installs a newer route meanwhile.
+                            for mut entry in route_cache.ecw.iter_mut() {
+                                entry.value.cache_epoch = route_cache.next_cache_epoch();
+                            }
+                            for mut entry in route_cache.native.iter_mut() {
+                                entry.value.cache_epoch = route_cache.next_cache_epoch();
+                            }
+                        }
+                        grpc_ingress_reply_after_request(request)
                     }
-                    grpc_ingress_reply_after_request(request)
                 }
+            });
+            let server = tokio::spawn(async move {
+                axum::serve(listener, service).await.unwrap();
+            });
+            state.cluster_api = ClusterApiClients::service_only(
+                pplx_space_node_api_client::cluster::connect(endpoint.clone(), "test")
+                    .await
+                    .unwrap(),
+            );
+            state.ecw_hosts = Arc::new(EcwHostConfig::from_env_value(Some(
+                r#"[{"host":"example.test"}]"#,
+            )));
+            state.route_cache_ttl = route_cache_ttl;
+            if precached && native {
+                let key = native_route_cache_key(
+                    session_id,
+                    &token_sha256(&client_token),
+                    session_id.kind().connect_scope().as_str(),
+                );
+                let mut attached = crate::native::attached_session_from_route_response(
+                    native_resolved,
+                    session_id,
+                    state.route_cache.next_cache_epoch(),
+                )
+                .unwrap();
+                attached.cache_key = Some(key.clone());
+                state
+                    .route_cache
+                    .remember_native(key, attached, route_cache_ttl);
+            } else if precached {
+                let target = EcwSandboxHost {
+                    sandbox_id: sandbox,
+                    port: 8080,
+                };
+                let mut cached = ecw_resolved_route(sandbox, 2, backend_endpoint(&endpoint));
+                cached.cache_epoch = state.route_cache.next_cache_epoch();
+                cached.origin.target = target.clone();
+                cached.origin.transport = EcwRouteTransport::ServicePortIngress;
+                cached.service_port_ingress_token = parse_proto_space_api_route_token(
+                    SpaceApiRouteTokenRouteSource::SandboxServiceRoute,
+                    route_token,
+                );
+                remember_ecw_ingress_route(&state, &target, cached);
             }
-        });
-        let server = tokio::spawn(async move {
-            axum::serve(listener, service).await.unwrap();
-        });
-        state.cluster_api = ClusterApiClients::service_only(
-            pplx_space_node_api_client::cluster::connect(endpoint, "test")
+
+            let response = if native {
+                let request = Request::builder()
+                    .uri(format!("/v1/sessions/{session_id}/proxy/service"))
+                    .header("authorization", format!("Bearer {client_token}"))
+                    .body(Body::empty())
+                    .unwrap();
+                Box::pin(crate::native::proxy_session(
+                    State(state.clone()),
+                    Path(crate::native::ProxySessionPath {
+                        session_id: session_id.to_string(),
+                    }),
+                    request,
+                ))
                 .await
-                .unwrap(),
-        );
-        state.ecw_hosts = Arc::new(EcwHostConfig::from_env_value(Some(
-            r#"[{"host":"example.test"}]"#,
-        )));
-        state.route_cache_ttl = route_cache_ttl;
-        let request = Request::builder()
-            .uri("/service")
-            .header("host", format!("8080-{sandbox}.example.test"))
-            .body(Body::empty())
-            .unwrap();
+                .map_err(|error| format!("{error:?}"))
+            } else {
+                let request = Request::builder()
+                    .uri("/service")
+                    .header("host", format!("8080-{sandbox}.example.test"))
+                    .body(Body::empty())
+                    .unwrap();
+                Box::pin(ecw_service_proxy(State(state.clone()), request))
+                    .await
+                    .map_err(|error| format!("{error:?}"))
+            }
+            .unwrap_or_else(|error| panic!("{surface} {case}: {error}"));
 
-        let response = Box::pin(ecw_service_proxy(State(state.clone()), request))
-            .await
-            .unwrap_or_else(|error| panic!("{case}: {error:?}"));
-
-        assert_eq!(response.status(), StatusCode::OK, "{case}");
-        assert_eq!(
-            response.into_body().collect().await.unwrap().to_bytes(),
-            "replacement",
-            "{case}"
-        );
-        assert_eq!(opens.load(Ordering::SeqCst), 1, "{case}");
-        assert_eq!(resolves.load(Ordering::SeqCst), expected_resolves, "{case}");
-        state.stream_shutdown_token.cancel();
-        server.abort();
+            assert_eq!(response.status(), StatusCode::OK, "{surface} {case}");
+            assert_eq!(
+                response.into_body().collect().await.unwrap().to_bytes(),
+                "replacement",
+                "{surface} {case}"
+            );
+            assert_eq!(opens.load(Ordering::SeqCst), 1, "{surface} {case}");
+            assert_eq!(
+                resolves.load(Ordering::SeqCst),
+                expected_resolves,
+                "{surface} {case}"
+            );
+            state.stream_shutdown_token.cancel();
+            server.abort();
+        }
     }
 }
 
