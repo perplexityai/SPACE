@@ -89,6 +89,7 @@ members = [
     "crates/libs/execution/catalog",
     "crates/libs/execution/runtime-environment-catalog-store",
     "crates/libs/execution/runtime-environment-policy-store",
+    "crates/libs/execution/runtime-upgrade-campaign-store",
     "crates/libs/net/common",
     "crates/libs/net/gateway/client",
     "crates/libs/net/gateway/protocol",
@@ -379,6 +380,7 @@ pplx-space-execution-catalog = { path = "crates/libs/execution/catalog" }
 pplx-space-execution-common = { path = "crates/libs/execution/common" }
 pplx-space-runtime-environment-catalog-store = { path = "crates/libs/execution/runtime-environment-catalog-store" }
 pplx-space-runtime-environment-policy-store = { path = "crates/libs/execution/runtime-environment-policy-store" }
+pplx-space-runtime-upgrade-campaign-store = { path = "crates/libs/execution/runtime-upgrade-campaign-store" }
 pplx-space-feature-flags = { path = "crates/libs/feature-flags" }
 pplx-space-events = { path = "crates/libs/events" }
 pplx-space-federated-grant-store = { path = "crates/libs/federated-grant-store" }

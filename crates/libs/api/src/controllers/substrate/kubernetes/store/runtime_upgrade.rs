@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::controllers::substrate::runtime_upgrade::{CatalogEnvironment, RecordedExecution};
-use pplx_space_common_core::types::{ArtifactComponentKind, EnvironmentReference, LocalArtifactId};
+use pplx_space_common_core::types::LocalArtifactId;
 
 /// An execution the control plane recorded, with the identity of what it
 /// records: the checkpoint's snapshot for a restore, the published execution
@@ -32,57 +32,18 @@ struct RecordedExecutionRow {
 impl From<RecordedExecutionRow> for RecordedActivation {
     fn from(row: RecordedExecutionRow) -> Self {
         let metadata = row.execution_metadata.map(|metadata| metadata.0);
-        let metadata = metadata.as_ref();
-        // Read leniently: a record is evidence, and a field it lacks or holds
-        // in another shape matches anything rather than failing the
-        // activation.
-        let environment = metadata
-            .and_then(|metadata| metadata.get("environment"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned);
-        let kernel_version = metadata
-            .and_then(|metadata| metadata.get("components"))
-            .and_then(serde_json::Value::as_array)
-            .and_then(|components| {
-                components.iter().find(|component| {
-                    component.get("kind").and_then(serde_json::Value::as_str)
-                        == Some(ArtifactComponentKind::Kernel.as_str())
-                })
-            })
-            .and_then(|kernel| kernel.get("version"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned);
         Self {
             subject: row.subject,
             local_artifact_id: row.local_artifact_id,
-            execution: RecordedExecution {
-                environment,
-                runtime: row.runtime,
-                runtime_version: row.runtime_version,
-                kernel_version,
-                state_format_name: row.state_format_name,
-                state_format_version: row.state_format_version,
-            },
+            execution: RecordedExecution::from_record(
+                metadata.as_ref(),
+                row.runtime,
+                row.runtime_version,
+                row.state_format_name,
+                row.state_format_version,
+            ),
         }
     }
-}
-
-#[derive(sqlx::FromRow)]
-struct CatalogRow {
-    environment_ref: String,
-    runtime: String,
-    runtime_version: String,
-    kernel_version: String,
-    state_format_name: String,
-    state_format_version: String,
-    upgrade_edges: Vec<String>,
-    memory_edges: Vec<String>,
-}
-
-fn catalog_reference(value: &str) -> Result<EnvironmentReference, SubstrateError> {
-    value.parse().map_err(|error| SubstrateError::Failed {
-        message: format!("runtime_environments holds an invalid reference {value:?}: {error}"),
-    })
 }
 
 impl K8sStore {
@@ -158,38 +119,22 @@ impl K8sStore {
     pub(in crate::controllers::substrate::kubernetes) async fn unretired_runtime_environments(
         &self,
     ) -> Result<Vec<CatalogEnvironment>, SubstrateError> {
-        let rows: Vec<CatalogRow> = sqlx::query_as(sql!(
-            "SELECT environment_ref, runtime, runtime_version, kernel_version,
-                    state_format_name, state_format_version, upgrade_edges, memory_edges
-               FROM runtime_environments
-              WHERE retired_at IS NULL
-              ORDER BY environment_ref"
-        ))
-        .fetch_all(&self.pool)
-        .await
-        .db_context("failed to read the runtime environment catalog")?;
-        rows.into_iter()
-            .map(|row| {
-                Ok(CatalogEnvironment {
-                    reference: catalog_reference(&row.environment_ref)?,
-                    runtime: row.runtime,
-                    runtime_version: row.runtime_version,
-                    kernel_version: row.kernel_version,
-                    state_format_name: row.state_format_name,
-                    state_format_version: row.state_format_version,
-                    upgrade_edges: row
-                        .upgrade_edges
-                        .iter()
-                        .map(|edge| catalog_reference(edge))
-                        .collect::<Result<_, _>>()?,
-                    memory_edges: row
-                        .memory_edges
-                        .iter()
-                        .map(|edge| catalog_reference(edge))
-                        .collect::<Result<_, _>>()?,
-                })
-            })
-            .collect()
+        use pplx_space_runtime_environment_catalog_store::ListUnretiredError;
+        let entries =
+            pplx_space_runtime_environment_catalog_store::list_unretired_entries(&self.pool)
+                .await
+                .map_err(|error| match error {
+                    ListUnretiredError::Database(error) => {
+                        crate::controllers::substrate::substrate_db_error(
+                            "failed to read the runtime environment catalog",
+                            &error,
+                        )
+                    }
+                    error => SubstrateError::Failed {
+                        message: format!("failed to read the runtime environment catalog: {error}"),
+                    },
+                })?;
+        Ok(entries.into_iter().map(CatalogEnvironment::from).collect())
     }
 
     /// The cluster's runtime environment policy.
