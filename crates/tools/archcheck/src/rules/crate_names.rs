@@ -247,8 +247,9 @@ impl Rule for CrateNames {
         findings
     }
 
-    /// Not called for a base branch's copy that is not TOML at all; `no_new`
-    /// then counts every entry as added, which its findings say.
+    /// Called for a base branch's copy that is not TOML at all only when no
+    /// rule compares tables with it; `no_new` then counts every entry as
+    /// added, which its findings say.
     fn skipped(&self, ctx: &Context) -> Vec<String> {
         let bootstrap = format!(
             "{RULE}.{NO_NEW} allows only the {} crates listed when the rule was added in \

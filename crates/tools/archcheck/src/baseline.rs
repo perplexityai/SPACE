@@ -1,17 +1,17 @@
 //! `architecture-baseline.toml`: existing violations a rule tolerates for now.
 //!
-//! Each rule that needs a baseline owns a table: `[file_size]`, one
+//! Each rule that needs a baseline owns a table: one
 //! `[pattern_ratchet.<instance>]` per configured instance, one
 //! `[layers.<check>]` per layers check with a baseline, and `[crate_names]`.
 //! `cargo arch --write-baseline` updates and removes the entries of every
 //! table, or of one with `--write-baseline=<table>`, but never adds an entry
 //! or creates a `pattern_ratchet` table: those are hand edits, which the base
-//! branch comparison then reports. (`[file_size]`, `[crate_names]` and the
-//! `[layers.<check>]` tables are always written, empty if the file had
-//! none.) A missing table means the rule tolerates nothing, which can only
-//! make checks stricter. The base branch's copy, which a pull request's
-//! baseline is compared with, is read leniently and table by table, so that a
-//! change to the schema or a renamed instance does not break the comparison.
+//! branch comparison then reports. (`[crate_names]` and the `[layers.<check>]`
+//! tables are always written, empty if the file had none.) A missing table
+//! means the rule tolerates nothing, which can only make checks stricter. The
+//! base branch's copy, which a pull request's baseline is compared with, is
+//! read leniently and table by table, so that a change to the schema or a
+//! renamed instance does not break the comparison.
 
 use std::{
     collections::{BTreeMap, BTreeSet, btree_map},
@@ -29,7 +29,7 @@ use toml::{
 
 use crate::{
     context::{LoadError, parse_toml_with_text, read},
-    rules::{self, CountRule, CrateNames, FileSize, Layers, PatternRatchet},
+    rules::{self, CountRule, CrateNames, Layers, PatternRatchet},
 };
 
 #[cfg(test)]
@@ -42,11 +42,10 @@ const HEADER: &str = "\
 # Updated by `cargo arch --write-baseline[=<table>]`, which never adds an entry
 # or a [pattern_ratchet.*] table; see crates/tools/archcheck/README.md.
 #
-# [file_size] maps each production Rust file over the code-line limit to its cap,
-# the code-line count it had when listed. [pattern_ratchet.<instance>] maps each
-# production Rust file outside the instance's allowed paths to its cap on code
-# lines matching its patterns. Only remove entries or lower caps: a pull request
-# that adds an entry or raises a cap is reported.
+# [pattern_ratchet.<instance>] maps each production Rust file outside the
+# instance's allowed paths to its cap on code lines matching its patterns. Only
+# remove entries or lower caps: a pull request that adds an entry or raises a
+# cap is reported.
 ";
 
 /// Written above the `[layers.<check>]` tables, which follow the tables of
@@ -70,8 +69,7 @@ const CRATE_NAMES_COMMENT: &str = "\
 /// Every table of caps, by the name `--write-baseline=<table>` takes:
 /// `<rule>`, or `<rule>.<instance>` for a rule with instances; and
 /// `[crate_names]`, which maps names to paths. The default is the baseline
-/// of an empty file: a `[file_size]` and a `[crate_names]` table without
-/// entries.
+/// of an empty file: a `[crate_names]` table without entries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Baseline {
     tables: BTreeMap<String, Table>,
@@ -163,20 +161,11 @@ impl<V> Default for Table<V> {
 #[serde(deny_unknown_fields)]
 struct BaselineFile {
     #[serde(default)]
-    file_size: BTreeMap<Spanned<String>, usize>,
-    #[serde(default)]
     pattern_ratchet: BTreeMap<String, BTreeMap<Spanned<String>, usize>>,
     #[serde(default)]
     crate_names: BTreeMap<Spanned<String>, String>,
     #[serde(default)]
     layers: BTreeMap<String, BTreeMap<Spanned<String>, Vec<Spanned<String>>>>,
-}
-
-/// The base branch's copy, for `[file_size]`: other tables and keys ignored.
-#[derive(Deserialize)]
-struct BaseBaselineFile {
-    #[serde(default)]
-    file_size: BTreeMap<String, usize>,
 }
 
 /// The base branch's baseline, given with `--base-baseline`.
@@ -193,9 +182,8 @@ pub enum BaseBaseline {
 /// that one that does not parse skips only its own comparisons.
 #[derive(Debug)]
 pub struct BaseTables {
-    /// Every table, by name as in [`Baseline`]: `[file_size]`, empty if the
-    /// copy has none, and every `[pattern_ratchet.<instance>]`, configured or
-    /// not.
+    /// Every `[pattern_ratchet.<instance>]` table, configured or not, by name
+    /// as in [`Baseline`].
     tables: BTreeMap<String, BaseTable>,
     /// Each rule whose tables were read: `Ok`, or, for a rule with instances
     /// whose key is not a table of tables, or for `[crate_names]`, why none
@@ -248,7 +236,8 @@ pub enum BaseSkip<'a> {
 
 impl BaseSkip<'_> {
     /// The line reporting the skip of `behaviours`, such as
-    /// `file_size.no_new_entries and file_size.no_raised_caps skipped`.
+    /// `pattern_ratchet.<instance>.no_new_entries and
+    /// pattern_ratchet.<instance>.no_raised_caps skipped`.
     pub fn message(&self, behaviours: &str) -> String {
         match self {
             Self::NotGiven => format!("{behaviours} (no --base-baseline given)"),
@@ -281,11 +270,11 @@ fn usable(table: &BaseTable) -> Result<&BTreeMap<String, usize>, BaseSkip<'_>> {
 pub(crate) static NO_ENTRIES: BTreeMap<String, usize> = BTreeMap::new();
 
 impl BaseBaseline {
-    /// The base branch's table `name`, such as `file_size` or
-    /// `pattern_ratchet.<instance>`, empty if it has none. Only the table
-    /// asked for is read, so one for an instance this branch renamed or
-    /// removed is ignored, even if it does not parse. A table of a rule
-    /// [`Baseline::load_base`] did not read is not taken as missing.
+    /// The base branch's table `name`, such as `pattern_ratchet.<instance>`,
+    /// empty if it has none. Only the table asked for is read, so one for an
+    /// instance this branch renamed or removed is ignored, even if it does not
+    /// parse. A table of a rule [`Baseline::load_base`] did not read is not
+    /// taken as missing.
     pub fn table(&self, name: &str) -> Result<&BTreeMap<String, usize>, BaseSkip<'_>> {
         let tables = self.tables()?;
         match tables.rules.get(rule_of(name)) {
@@ -383,7 +372,6 @@ impl Baseline {
     /// parsed from.
     fn from_file(file: BaselineFile, text: &str) -> Self {
         let mut tables = BTreeMap::new();
-        tables.insert(FileSize::NAME.to_owned(), with_lines(text, file.file_size));
         for (instance, table) in file.pattern_ratchet {
             tables.insert(
                 format!("{}.{instance}", PatternRatchet::NAME),
@@ -436,11 +424,6 @@ impl Baseline {
         };
         let mut tables = BTreeMap::new();
         let mut read = BTreeMap::new();
-        let file_size = toml::from_str::<BaseBaselineFile>(&text)
-            .map(|file| file.file_size)
-            .map_err(unusable);
-        tables.insert(FileSize::NAME.to_owned(), file_size);
-        read.insert(FileSize::NAME, Ok(()));
         let mut instances = Ok(());
         let mut crate_names = Ok(None);
         let mut layers = Ok(None);
@@ -498,9 +481,8 @@ impl Baseline {
     }
 
     /// Every table, by the name `--write-baseline=<table>` takes, in the
-    /// order they are written: `file_size`, then `pattern_ratchet.<instance>`
-    /// for each instance, then `layers.<check>` for each check, then
-    /// `crate_names`.
+    /// order they are written: `pattern_ratchet.<instance>` for each
+    /// instance, then `layers.<check>` for each check, then `crate_names`.
     pub fn table_names(&self) -> Vec<String> {
         let tables = self.tables.keys().cloned();
         let layers = self
@@ -579,11 +561,19 @@ impl Baseline {
     pub fn write(&self, path: &Path) -> Result<(), WriteBaselineError> {
         let crate_names =
             toml::to_string(&BTreeMap::from([(CrateNames::NAME, &self.crate_names)]))?;
-        let text = format!(
-            "{HEADER}\n{}{}\n{CRATE_NAMES_COMMENT}{crate_names}",
+        // A blank line between the parts, whichever tables there are.
+        let parts = [
+            HEADER.to_owned(),
             toml::to_string(self)?,
             self.layers_text(),
-        );
+            format!("{CRATE_NAMES_COMMENT}{crate_names}"),
+        ];
+        let text = parts
+            .iter()
+            .filter(|part| !part.is_empty())
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n");
         std::fs::write(path, text).map_err(|source| WriteBaselineError::Write {
             path: path.to_path_buf(),
             source,
@@ -592,8 +582,8 @@ impl Baseline {
 }
 
 impl Baseline {
-    /// The `[layers.<check>]` tables in generated form, after a blank line
-    /// and their comment; empty without any.
+    /// The `[layers.<check>]` tables in generated form, after their comment;
+    /// empty without any.
     fn layers_text(&self) -> String {
         if self.layers.is_empty() {
             return String::new();
@@ -613,7 +603,7 @@ impl Baseline {
                 text
             })
             .collect();
-        format!("\n{LAYERS_COMMENT}{}", tables.join("\n"))
+        format!("{LAYERS_COMMENT}{}", tables.join("\n"))
     }
 }
 

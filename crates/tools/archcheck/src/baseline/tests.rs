@@ -3,9 +3,9 @@ use std::fs;
 use super::*;
 use crate::{config::ArchitectureConfig, rules};
 
-/// `file_size`, two `pattern_ratchet` instances, `crate_names` and
-/// `layers` with its state checks, every behaviour advisory: a table of every registered rule with
-/// a baseline.
+/// Two `pattern_ratchet` instances, `crate_names` and `layers` with its
+/// state checks, every behaviour advisory: a table of every registered rule
+/// with a baseline.
 fn config() -> ArchitectureConfig {
     let behaviours = |table: &str| -> String {
         [
@@ -68,9 +68,8 @@ fn config() -> ArchitectureConfig {
     .chain(["[rules.layers.storage]\ndrivers = [\"sqlx\"]\n".to_owned()])
     .collect();
     let text = format!(
-        "[rules.file_size]\nlimit = 5\n{}{}{}\
+        "{}{}\
          [rules.crate_names]\nbanned_tokens = [\"common\"]\nallow = []\n{crate_names}{layers}",
-        behaviours("file_size"),
         instance("alpha"),
         instance("beta"),
     );
@@ -125,5 +124,59 @@ fn every_configured_table_is_read_from_a_base_copy() {
         let entries = base.table(table).ok();
         let expected = BTreeMap::from([(format!("{table}.rs"), cap)]);
         assert_eq!(entries, Some(&expected), "{table}");
+    }
+}
+
+/// [`Baseline::write`] with and without a table of caps and `[layers.<check>]`
+/// tables: the header first, then the caps, the layers comment and the
+/// crate_names comment in that order, each part after exactly one blank line,
+/// and one newline at the end.
+#[test]
+fn write_puts_one_blank_line_between_parts() {
+    for (caps, layers) in [(false, false), (true, false), (false, true), (true, true)] {
+        let shape = format!("caps: {caps}, layers: {layers}");
+        let mut baseline = Baseline::default();
+        if caps {
+            baseline.insert_table(
+                "pattern_ratchet.alpha".to_owned(),
+                BTreeMap::from([("crates/a/src/x.rs".to_owned(), 2)]),
+            );
+        }
+        if layers {
+            let mut table = EdgeTable::new();
+            table.insert("pplx-space-a", "pplx-space-b");
+            baseline.layers.insert("direction".to_owned(), table);
+        }
+        baseline
+            .crate_names
+            .insert("pplx-space-common-io".to_owned(), "crates/x".to_owned());
+        let dir = tempfile::tempdir().expect("create a temporary directory");
+        let path = dir.path().join(BASELINE_FILE);
+
+        baseline.write(&path).expect("write the baseline");
+
+        let text = fs::read_to_string(&path).expect("read the written baseline");
+        assert!(text.starts_with(HEADER), "{shape}:\n{text}");
+        assert!(!text.contains("\n\n\n"), "{shape}:\n{text}");
+        assert!(
+            text.ends_with('\n') && !text.ends_with("\n\n"),
+            "{shape}:\n{text}"
+        );
+        let parts: Vec<&str> = [
+            caps.then_some("[pattern_ratchet.alpha]\n"),
+            layers.then_some(LAYERS_COMMENT),
+            Some(CRATE_NAMES_COMMENT),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let starts: Vec<usize> = parts
+            .iter()
+            .map(|part| {
+                text.find(&format!("\n\n{part}"))
+                    .unwrap_or_else(|| panic!("{shape}: no blank line before {part:?}:\n{text}"))
+            })
+            .collect();
+        assert!(starts.is_sorted(), "{shape}:\n{text}");
     }
 }
