@@ -22,7 +22,7 @@ test('orgOptionLabels adds the slug only where a name repeats', () => {
 test('each list scope keeps its own refresh key', () => {
   const key = (limit, org) => scopedRefreshKey('dashboard:sandboxes', limit, 1000, org);
   assert.equal(key(1000, null), 'dashboard:sandboxes');
-  assert.equal(key(100, null), 'dashboard:sandboxes');
+  assert.equal(key(100, null), 'dashboard:sandboxes:limit-100');
   assert.equal(key(5000, null), 'dashboard:sandboxes:limit-5000');
   assert.equal(key(1000, 'org-a'), 'dashboard:sandboxes:org-org-a:limit-1000');
   assert.notEqual(key(1000, 'org-a'), key(1000, 'org-b'));

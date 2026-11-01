@@ -91,6 +91,13 @@ interface ListScope {
 }
 
 const sameScope = (a: ListScope | null, b: ListScope) => a !== null && a.limit === b.limit && a.org === b.org;
+
+// A refresh for an org or size that is no longer selected: it loaded
+// nothing, and the view's key is not marked fresh.
+class RefreshSkipped extends Error {}
+// A load error the page already shows above the table.
+class ShownListError extends Error {}
+const alreadyReported = (err: unknown) => err instanceof RefreshSkipped || err instanceof ShownListError;
 const REFRESH_CLICK_COOLDOWN_MS = 3000;
 
 type AgeWindow = '1h' | '24h' | '7d' | '30d' | '90d' | '1y' | 'all';
@@ -720,6 +727,10 @@ function SandboxesPage() {
     reconcile = false,
     scope = currentScope(),
   }: { showLoading?: boolean; reconcile?: boolean; scope?: ListScope } = {}) => {
+    // A poll or Refresh captures its scope before its lock callback runs; if
+    // the selection changed meanwhile, it must not take a newer number than
+    // the load for the new selection.
+    if (!sameScope(currentScope(), scope)) throw new RefreshSkipped('the selected org or size changed');
     const request = ++listRequestRef.current;
     const newest = () => request === listRequestRef.current;
     if (showLoading) setLoading(true);
@@ -741,7 +752,9 @@ function SandboxesPage() {
         setSandboxes([]);
         shownScopeRef.current = null;
         setListError(text);
-        return;
+        // A failure all the same: the key stays stale, and the alert, not a
+        // toast, reports it.
+        throw new ShownListError(text);
       }
       // Keep the last rendered view when a node-local manager is briefly unavailable.
       throw new Error(text);
@@ -752,7 +765,9 @@ function SandboxesPage() {
   };
 
   const refreshAndReport = () => {
-    void refresh().catch((err: any) => message.error(err.message || 'failed to refresh sandboxes'));
+    void refresh().catch((err: any) => {
+      if (!alreadyReported(err)) message.error(err.message || 'failed to refresh sandboxes');
+    });
   };
 
   const maybeRefresh = () => {
@@ -768,7 +783,9 @@ function SandboxesPage() {
       () => refresh({ showLoading: false, scope }),
       // A larger load is a heavier query; poll it less often.
       { staleMs: scope.limit > DEFAULT_LIST_LIMIT ? LARGE_LIST_STALE_MS : VIEW_REFRESH_STALE_MS },
-    ).catch((err: any) => console.warn(err.message || err));
+    ).catch((err: any) => {
+      if (!alreadyReported(err)) console.warn(err.message || err);
+    });
   };
 
   useEffect(() => {
@@ -780,7 +797,9 @@ function SandboxesPage() {
   }, []);
 
   useEffect(() => {
-    void refresh().catch((err: any) => message.error(err.message));
+    void refresh().catch((err: any) => {
+      if (!alreadyReported(err)) message.error(err.message);
+    });
     getPublicPage<PublicTemplate>('/templates?limit=1000').then((items) => {
       const t = items.map(publicTemplateToConsoleTemplate);
       setTemplates(t);
@@ -817,7 +836,8 @@ function SandboxesPage() {
       }
       message.success('Sandboxes refreshed');
     }).catch((err: any) => {
-      message.error(err.message);
+      if (err instanceof RefreshSkipped) message.info('Refresh skipped: the selected organization or size changed');
+      else if (!(err instanceof ShownListError)) message.error(err.message);
     }).finally(() => {
       setManualRefreshing(false);
     });
@@ -1112,18 +1132,23 @@ function SandboxesPage() {
   const lookupPending = lookupId !== null && !(lookup?.publicId === lookupId && lookup.answered);
 
   const changeListLimit = (value: number) => {
+    // An error belongs to the scope that failed.
+    setListError(null);
     listLimitRef.current = value;
     setListLimit(value);
     refreshAndReport();
   };
 
   const changeOrgFilter = (value: string | null) => {
+    setListError(null);
     orgFilterRef.current = value;
     setOrgFilter(value);
     refreshAndReport();
   };
 
-  const orgNames = useMemo(() => new Map(orgs.map((org) => [org.id, org.name])), [orgs]);
+  // The selector's labels, which add the slug where a name repeats, so the
+  // notices never read "It belongs to Acme, not Acme".
+  const orgNames = useMemo(() => new Map(orgOptionLabels(orgs).map((option) => [option.value, option.label])), [orgs]);
 
   const templateFilterOptions = useMemo(() => {
     const set = new Set<string>();

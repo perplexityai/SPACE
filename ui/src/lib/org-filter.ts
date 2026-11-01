@@ -18,12 +18,13 @@ export function orgOptionLabels(orgs: { id: string; name: string; slug: string }
 }
 
 // Windows share a view's refresh timestamp under one key, so one window's
-// reload counts for all of them. A list scoped to an org, or larger than the
-// default, is a different view and keeps its own key; otherwise a window
-// showing another scope would keep it "fresh" and it would never reload.
+// reload counts for all of them. Only the unscoped default-size list uses
+// the plain key; any other org or size is a different view with its own key,
+// or a window showing another scope would keep it "fresh" and it would never
+// reload.
 export function scopedRefreshKey(base: string, limit: number, defaultLimit: number, org: string | null): string {
   if (org) return `${base}:org-${org}:limit-${limit}`;
-  return limit > defaultLimit ? `${base}:limit-${limit}` : base;
+  return limit === defaultLimit ? base : `${base}:limit-${limit}`;
 }
 
 // What the direct-lookup notice says about a sandbox found outside the loaded
