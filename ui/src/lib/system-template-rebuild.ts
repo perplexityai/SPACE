@@ -25,14 +25,15 @@ export interface BuildJob {
   lost: boolean;
 }
 
-// A promotion, recorded from the click that confirmed it. Only what it was
-// asked to do is stored; whether it is done is read from the tags each time
-// (see `promotionState`).
+// A promotion, recorded from the click that confirmed it, for both
+// templates, including one whose latest already named its target. Only what
+// it was asked to do is stored; whether it is done is read from the tags each
+// time (see `promotionState`).
 export interface Promotion {
   // `latest` of each template as read when the operator confirmed, written
-  // before the first tag request and never read again: the rollback target.
+  // before the first tag request and never changed: the rollback target.
   previous: Record<SystemTemplate, string | null>;
-  targets: Partial<Record<SystemTemplate, string>>;
+  targets: Record<SystemTemplate, string>;
   confirmedAt: string;
 }
 
@@ -150,6 +151,30 @@ export function acceptJob(stored: RebuildRun | null, runId: string, template: Sy
   return { kind: 'recorded', run: withJob({ ...stored, submitUnknown }, template, job) };
 }
 
+// What the tab that sent a build says about its answer: nothing when the
+// run recorded it.
+export function jobOutcomeNotice(template: SystemTemplate, jobId: string, outcome: Accepted<BuildJob>): string | null {
+  switch (outcome.kind) {
+    case 'recorded':
+      return null;
+    case 'extra':
+      return `Another click also started ${template} job ${jobId}; this run follows job ${outcome.existing.job_id}. The extra job publishes a release of its own.`;
+    case 'gone':
+      return `The rebuild was dismissed or expired meanwhile; ${template} job ${jobId} keeps running on the builder.`;
+  }
+}
+
+export function sandboxOutcomeNotice(template: SystemTemplate, sandboxId: string, outcome: Accepted<TestSandbox>): string | null {
+  switch (outcome.kind) {
+    case 'recorded':
+      return null;
+    case 'extra':
+      return `Another click also created test sandbox ${sandboxId} for ${template}; this run keeps ${outcome.existing.id}. Delete ${sandboxId}.`;
+    case 'gone':
+      return `The rebuild was dismissed or expired meanwhile; test sandbox ${sandboxId} was created. Delete it when you are done.`;
+  }
+}
+
 export function acceptTestSandbox(stored: RebuildRun | null, runId: string, template: SystemTemplate, sandbox: TestSandbox): Accepted<TestSandbox> {
   if (!stored || stored.runId !== runId) return { kind: 'gone' };
   const existing = stored.testSandboxes[template];
@@ -252,13 +277,14 @@ export interface PromotionPlanRow {
   attention: 'changed-since-start' | 'diverged' | null;
 }
 
-// What a promotion would move, from releases read when the operator asks.
-// A template that already carries its target needs no move and is left out.
+// What a promotion would move, from releases read when the operator asks: the
+// tag requests to send. A template that already carries its target needs no
+// request and is left out (the record still names it).
 export function promotionPlan(run: RebuildRun, releases: Releases, tag: string): PromotionPlanRow[] {
   const targets: [SystemTemplate, BuildJob | null][] = [['seed', run.seed], ['code-runtime', run.codeRuntime]];
   return targets.flatMap(([template, job]): PromotionPlanRow[] => {
     if (!buildSucceeded(job)) return [];
-    const to = run.promotion?.targets[template] ?? job.content_hash;
+    const to = run.promotion ? run.promotion.targets[template] : job.content_hash;
     const from = latestDigest(releases, template, tag);
     if (from === to) return [];
     const attention = run.promotion
@@ -274,39 +300,51 @@ export function samePlan(a: PromotionPlanRow[], b: PromotionPlanRow[]): boolean 
 }
 
 // The promotion record written when the operator confirms, before any tag
-// request. A retry keeps the record: its `previous` is the rollback target.
-export function confirmPromotion(run: RebuildRun, plan: PromotionPlanRow[], now = new Date()): RebuildRun {
-  if (run.promotion) return run;
-  const previous = { seed: null, 'code-runtime': null } as Record<SystemTemplate, string | null>;
-  const targets: Partial<Record<SystemTemplate, string>> = {};
-  for (const row of plan) {
-    previous[row.template] = row.from;
-    targets[row.template] = row.to;
-  }
+// request: both templates' targets, and both templates' latest from the
+// releases just read. A retry keeps the record: its `previous` is the
+// rollback target.
+export function confirmPromotion(run: RebuildRun, releases: Releases, tag: string, now = new Date()): RebuildRun {
+  if (run.promotion || !buildSucceeded(run.seed) || !buildSucceeded(run.codeRuntime)) return run;
+  const previous = { seed: latestDigest(releases, 'seed', tag), 'code-runtime': latestDigest(releases, 'code-runtime', tag) };
+  const targets = { seed: run.seed.content_hash, 'code-runtime': run.codeRuntime.content_hash };
   return { ...run, promotion: { previous, targets, confirmedAt: now.toISOString() } };
 }
 
 export type PromotionState =
-  | { kind: 'complete'; latest: Partial<Record<SystemTemplate, string>> }
+  | { kind: 'complete'; latest: Record<SystemTemplate, string> }
+  // Every template whose latest can move back is on the release it named
+  // before. The tags do not say whether someone moved it back or a tag
+  // request never committed.
+  | { kind: 'previous'; back: SystemTemplate[] }
   | { kind: 'incomplete'; remaining: SystemTemplate[]; diverged: { template: SystemTemplate; latest: string | null }[] };
 
-// Whether a recorded promotion is done, from the tags as read now: complete
-// when every template's latest is its target; otherwise what still has to
-// move, and which latest moved to neither the target nor `previous`.
+const PROMOTED: SystemTemplate[] = ['seed', 'code-runtime'];
+
+// Whether a recorded promotion is done, from the tags as read now, over both
+// templates: complete when every latest is its target; back on `previous`
+// when every latest that can move back has (a template that had no latest
+// keeps the new release, since latest cannot be deleted); otherwise what
+// still has to move, and which latest moved to neither the target nor
+// `previous`.
 export function promotionState(promotion: Promotion, releases: Releases, tag: string): PromotionState {
-  const remaining: SystemTemplate[] = [];
+  const back: SystemTemplate[] = [];
   const diverged: { template: SystemTemplate; latest: string | null }[] = [];
-  const latest: Partial<Record<SystemTemplate, string>> = {};
-  for (const template of Object.keys(promotion.targets) as SystemTemplate[]) {
+  let movedForward = false;
+  for (const template of PROMOTED) {
     const now = latestDigest(releases, template, tag);
-    if (now === promotion.targets[template]) {
-      latest[template] = now;
-      continue;
+    const target = promotion.targets[template];
+    const previous = promotion.previous[template];
+    if (now === target) {
+      if (previous !== null && previous !== target) movedForward = true;
+    } else if (now === previous) {
+      back.push(template);
+    } else {
+      diverged.push({ template, latest: now });
     }
-    remaining.push(template);
-    if (now !== promotion.previous[template]) diverged.push({ template, latest: now });
   }
-  return remaining.length ? { kind: 'incomplete', remaining, diverged } : { kind: 'complete', latest };
+  if (!back.length && !diverged.length) return { kind: 'complete', latest: { ...promotion.targets } };
+  if (!diverged.length && !movedForward) return { kind: 'previous', back };
+  return { kind: 'incomplete', remaining: PROMOTED.filter((t) => back.includes(t) || diverged.some((d) => d.template === t)), diverged };
 }
 
 // A stored run, if it is one this page wrote for this cluster and user and
@@ -327,7 +365,7 @@ export function parseStoredRun(raw: string | null, expect: { clusterId: string; 
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 const isDigestOrNull = (v: unknown) => v === null || (typeof v === 'string' && v.length > 0);
-const isDigestMap = (v: unknown, required: boolean) => isObject(v)
+const isDigestMap = (v: unknown, required: boolean): v is Record<string, string | null> => isObject(v)
   && Object.entries(v).every(([k, d]) => (k === 'seed' || k === 'code-runtime') && isDigestOrNull(d))
   && (!required || ('seed' in v && 'code-runtime' in v));
 
@@ -344,8 +382,7 @@ function isPromotion(v: unknown): v is Promotion {
   return isObject(v)
     && Object.keys(v).every((k) => k === 'previous' || k === 'targets' || k === 'confirmedAt')
     && isDigestMap(v.previous, true)
-    && isObject(v.targets) && Object.keys(v.targets).length > 0
-    && Object.entries(v.targets).every(([k, d]) => (k === 'seed' || k === 'code-runtime') && typeof d === 'string' && d.length > 0)
+    && isDigestMap(v.targets, true) && Object.values(v.targets).every((d) => d !== null)
     && typeof v.confirmedAt === 'string' && !Number.isNaN(Date.parse(v.confirmedAt));
 }
 

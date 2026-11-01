@@ -9,6 +9,7 @@ import {
   canBuild,
   canPromote,
   confirmPromotion,
+  jobOutcomeNotice,
   newRun,
   parseStoredRun,
   pinnedTemplate,
@@ -16,6 +17,7 @@ import {
   promotionPlan,
   promotionState,
   samePlan,
+  sandboxOutcomeNotice,
   storageKey,
   submitFailureText,
   systemBuildRequest,
@@ -127,24 +129,35 @@ test('a first promotion flags a latest that changed since the run started', () =
   assert.equal(samePlan(unchanged, moved), false);
 });
 
+test('a build or test sandbox the run recorded gets no notice; an extra or late one does', () => {
+  const existing = job('pending', null, 'job-first');
+  assert.equal(jobOutcomeNotice('seed', 'job-1', { kind: 'recorded', run: built() }), null);
+  assert.match(jobOutcomeNotice('seed', 'job-2', { kind: 'extra', existing }), /Another click also started seed job job-2; this run follows job job-first/);
+  assert.match(jobOutcomeNotice('seed', 'job-3', { kind: 'gone' }), /dismissed or expired meanwhile; seed job job-3 keeps running/);
+  const sandbox = { id: 'sbx-first', createdAt: '2026-11-01T00:00:00Z' };
+  assert.equal(sandboxOutcomeNotice('seed', 'sbx-1', { kind: 'recorded', run: built() }), null);
+  assert.match(sandboxOutcomeNotice('seed', 'sbx-2', { kind: 'extra', existing: sandbox }), /this run keeps sbx-first\. Delete sbx-2\./);
+  assert.match(sandboxOutcomeNotice('seed', 'sbx-3', { kind: 'gone' }), /test sandbox sbx-3 was created\. Delete it/);
+});
+
 test('a promotion stores only what it was asked to do; its state is read from the tags', () => {
   const run = built();
   const before = [release('r1', 'seed', OLD_SEED, ['latest']), release('r2', 'code-runtime', OLD_CODE, ['latest'])];
-  const plan = promotionPlan(run, before, 'latest');
-  const confirmed = confirmPromotion(run, plan, new Date('2026-11-01T01:00:00Z'));
+  const confirmed = confirmPromotion(run, before, 'latest', new Date('2026-11-01T01:00:00Z'));
   assert.deepEqual(Object.keys(confirmed.promotion).sort(), ['confirmedAt', 'previous', 'targets']);
   assert.deepEqual(confirmed.promotion.previous, { seed: OLD_SEED, 'code-runtime': OLD_CODE });
   assert.deepEqual(confirmed.promotion.targets, { seed: SEED, 'code-runtime': CODE });
   assert.equal(canPromote(confirmed), true);
-  // Saved, then interrupted before any tag moved: incomplete, both remain.
-  assert.deepEqual(promotionState(confirmed.promotion, before, 'latest'), { kind: 'incomplete', remaining: ['seed', 'code-runtime'], diverged: [] });
+  // Saved, then no tag moved: every latest is on the release it named
+  // before, which reads the same as a rollback.
+  assert.deepEqual(promotionState(confirmed.promotion, before, 'latest'), { kind: 'previous', back: ['seed', 'code-runtime'] });
   // seed moved, code-runtime did not.
   const partial = [release('n1', 'seed', SEED, ['latest']), release('r2', 'code-runtime', OLD_CODE, ['latest'])];
   assert.deepEqual(promotionState(confirmed.promotion, partial, 'latest'), { kind: 'incomplete', remaining: ['code-runtime'], diverged: [] });
   // A retry plans only what remains, and keeps the record (and so the rollback target).
   const retryPlan = promotionPlan(confirmed, partial, 'latest');
   assert.deepEqual(retryPlan.map((r) => [r.template, r.attention]), [['code-runtime', null]]);
-  assert.equal(confirmPromotion(confirmed, retryPlan), confirmed);
+  assert.equal(confirmPromotion(confirmed, partial, 'latest'), confirmed);
   // Someone moved code-runtime to a third release meanwhile: diverged, and the retry asks first.
   const THIRD = 'sha256:' + '4'.repeat(64);
   const diverged = [release('n1', 'seed', SEED, ['latest']), release('x', 'code-runtime', THIRD, ['latest'])];
@@ -154,6 +167,38 @@ test('a promotion stores only what it was asked to do; its state is read from th
   const done = [release('n1', 'seed', SEED, ['latest']), release('n2', 'code-runtime', CODE, ['latest'])];
   assert.deepEqual(promotionState(confirmed.promotion, done, 'latest'), { kind: 'complete', latest: { seed: SEED, 'code-runtime': CODE } });
   assert.deepEqual(promotionPlan(confirmed, done, 'latest'), []);
+});
+
+test('a template already at its target is recorded too, so a later change to it is seen', () => {
+  const run = built();
+  const before = [release('n1', 'seed', SEED, ['latest']), release('r2', 'code-runtime', OLD_CODE, ['latest'])];
+  // Only code-runtime needs a tag request...
+  assert.deepEqual(promotionPlan(run, before, 'latest').map((r) => r.template), ['code-runtime']);
+  // ...but the record names both, with seed's latest as read.
+  const confirmed = confirmPromotion(run, before, 'latest');
+  assert.deepEqual(confirmed.promotion.targets, { seed: SEED, 'code-runtime': CODE });
+  assert.deepEqual(confirmed.promotion.previous, { seed: SEED, 'code-runtime': OLD_CODE });
+  const done = [release('n1', 'seed', SEED, ['latest']), release('n2', 'code-runtime', CODE, ['latest'])];
+  assert.equal(promotionState(confirmed.promotion, done, 'latest').kind, 'complete');
+  // Someone moves seed afterwards: not complete, and a retry asks before moving it back.
+  const THIRD = 'sha256:' + '4'.repeat(64);
+  const moved = [release('x', 'seed', THIRD, ['latest']), release('n2', 'code-runtime', CODE, ['latest'])];
+  assert.deepEqual(promotionState(confirmed.promotion, moved, 'latest'), { kind: 'incomplete', remaining: ['seed'], diverged: [{ template: 'seed', latest: THIRD }] });
+  assert.deepEqual(promotionPlan(confirmed, moved, 'latest').map((r) => [r.template, r.from, r.to, r.attention]), [['seed', THIRD, SEED, 'diverged']]);
+});
+
+test('latest moved back to the releases it named before reads as such, not as incomplete', () => {
+  // code-runtime had no latest before, so a rollback leaves it on the new release.
+  const run = withJob(withJob(newRun(ids, { seed: OLD_SEED, 'code-runtime': null }, new Date('2026-11-01T00:00:00Z')), 'seed', job('succeeded', SEED, 'job-s')), 'code-runtime', job('succeeded', CODE, 'job-c'));
+  const confirmed = confirmPromotion(run, [release('r1', 'seed', OLD_SEED, ['latest'])], 'latest');
+  assert.deepEqual(confirmed.promotion.previous, { seed: OLD_SEED, 'code-runtime': null });
+  const rolledBack = [release('r1', 'seed', OLD_SEED, ['latest']), release('n2', 'code-runtime', CODE, ['latest'])];
+  assert.deepEqual(promotionState(confirmed.promotion, rolledBack, 'latest'), { kind: 'previous', back: ['seed'] });
+  // Promoting again asks nothing extra: seed is where the record says it was.
+  assert.deepEqual(promotionPlan(confirmed, rolledBack, 'latest').map((r) => [r.template, r.attention]), [['seed', null]]);
+  // Interrupted after seed moved: still incomplete.
+  const interrupted = [release('n1', 'seed', SEED, ['latest'])];
+  assert.deepEqual(promotionState(confirmed.promotion, interrupted, 'latest'), { kind: 'incomplete', remaining: ['code-runtime'], diverged: [] });
 });
 
 test('a stored run is used only for its cluster and user, and only until it expires', () => {
@@ -183,6 +228,8 @@ test('a stored value in any shape this page does not write is ignored', () => {
     JSON.stringify({ ...run, promotion: { previous: {}, targets: {}, confirmedAt: 'x' } }),
     // The earlier shape, with a stored read-back.
     JSON.stringify({ ...run, promotion: { previous: { seed: OLD_SEED, 'code-runtime': OLD_CODE }, targets: { seed: SEED }, confirmedAt: '2026-11-01T01:00:00Z', readBack: null, error: null } }),
+    // A record naming one template only (before both were recorded).
+    JSON.stringify({ ...run, promotion: { previous: { seed: OLD_SEED, 'code-runtime': OLD_CODE }, targets: { seed: SEED }, confirmedAt: '2026-11-01T01:00:00Z' } }),
     JSON.stringify({ ...run, testSandboxes: { seed: { id: '' } } }),
     JSON.stringify({ ...run, submitUnknown: { other: 'x' } }),
   ];

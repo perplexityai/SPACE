@@ -492,6 +492,9 @@ export default function TemplatesPage() {
   // Whether `templateReleases` holds an answer yet: before it does, no
   // template can be said to have no release.
   const [releasesLoaded, setReleasesLoaded] = useState(false);
+  // Numbers each release read, so a slower, older answer cannot replace a
+  // newer one (a promotion's state is read from this list).
+  const releasesRequestRef = useRef(0);
   const [loadingTemplates, setLoadingTemplates] = useState(true);
   const [loadingInventory, setLoadingInventory] = useState(true);
   const [spacedCounts, setSpacedCounts] = useState<SpacedCounts | null>(null);
@@ -573,10 +576,13 @@ export default function TemplatesPage() {
   const refreshTemplateReleases = async ({ showLoading = true }: RefreshOptions = {}) => {
     if (showLoading) setLoadingReleases(true);
     try {
+      const request = ++releasesRequestRef.current;
       const items = await adminApi.get<TemplateRelease[]>('/v1/template-releases');
-      setTemplateReleases(items);
-      setReleasesLoadedOnce(true);
-      setReleasesLoaded(true);
+      if (request === releasesRequestRef.current) {
+        setTemplateReleases(items);
+        setReleasesLoadedOnce(true);
+        setReleasesLoaded(true);
+      }
       return items;
     } catch (err: unknown) {
       console.warn(errorMessage(err));

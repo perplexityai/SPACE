@@ -27,6 +27,7 @@ import {
   findRelease,
   isTerminal,
   jobOf,
+  jobOutcomeNotice,
   latestDigest,
   newRun,
   parseStoredRun,
@@ -36,12 +37,14 @@ import {
   promotionState,
   runExpiresAt,
   samePlan,
+  sandboxOutcomeNotice,
   storageKey,
   submitFailureText,
   systemBuildRequest,
   testSandboxFailureText,
   testSandboxName,
 } from '@/lib/system-template-rebuild';
+import { releaseViewRefreshLock, tryAcquireViewRefreshLock } from '@/lib/view-refresh';
 
 const { Text, Paragraph } = Typography;
 const TEMPLATES: SystemTemplate[] = ['seed', 'code-runtime'];
@@ -51,12 +54,30 @@ interface BrowserLocks {
   request<T>(name: string, callback: () => T | Promise<T>): Promise<T>;
 }
 
+// A fallback lock is held only while `work` runs, which is synchronous; the
+// TTL frees it if a tab dies holding it.
+const FALLBACK_LOCK_TTL_MS = 2_000;
+const FALLBACK_LOCK_RETRY_MS = 25;
+
 // Runs `work` while holding a lock shared by this browser's tabs, so two
-// tabs' read-modify-writes of the stored run do not interleave. Without the
-// Web Locks API it runs unlocked.
+// tabs' read-modify-writes of the stored run do not interleave. The Web Locks
+// API needs a secure context (https, or localhost); elsewhere a short-lived
+// lock in localStorage stands in. Its read-then-write is not atomic across
+// tabs, so it narrows the window rather than closing it.
 async function exclusive<T>(name: string, work: () => T): Promise<T> {
   const locks = typeof navigator !== 'undefined' ? (navigator as Navigator & { locks?: BrowserLocks }).locks : undefined;
-  return locks ? locks.request(name, () => work()) : work();
+  if (locks) return locks.request(name, () => work());
+  for (;;) {
+    const owner = tryAcquireViewRefreshLock(name, FALLBACK_LOCK_TTL_MS);
+    if (owner) {
+      try {
+        return work();
+      } finally {
+        releaseViewRefreshLock(name, owner);
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, FALLBACK_LOCK_RETRY_MS));
+  }
 }
 const digest = (hash: string | null | undefined) => <code>{shortHash(hash, 'none')}</code>;
 // The digests a promotion of this run would move latest to.
@@ -71,8 +92,9 @@ interface PromoteDialog {
   // The run and build digests the dialog was opened for.
   runKey: string;
   runId: string;
-  // A retry of a recorded promotion; decided when the dialog opens.
-  retry: boolean;
+  // A first promotion, a retry of a recorded one that stopped short, or a
+  // recorded one again after latest went back; decided when the dialog opens.
+  mode: 'first' | 'retry' | 'again';
   loading: boolean;
   plan: PromotionPlanRow[];
   error: string | null;
@@ -104,9 +126,14 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
   const [run, setRun] = useState<RebuildRun | null>(null);
   const [busy, setBusy] = useState<Set<string>>(() => new Set());
   const [trouble, setTrouble] = useState<Partial<Record<SystemTemplate, PollTrouble>>>({});
-  // What this tab saw that the run does not record: an extra job or sandbox
-  // from a click that lost the race, or a save that failed.
+  // What this tab saw about the run that the run does not record (a save
+  // that failed); cleared when the run changes.
   const [notices, setNotices] = useState<string[]>([]);
+  // Late outcomes of this tab's requests that the run did not record: an
+  // extra job or sandbox from a click that lost the race, one that arrived
+  // after the run was dismissed, or a test sandbox whose outcome is unknown.
+  // Shown outside the run, so they outlive Dismiss, until closed.
+  const [outcomes, setOutcomes] = useState<string[]>([]);
   const [promote, setPromote] = useState<PromoteDialog | null>(null);
   // How this tab's last promotion attempt ended, when it stopped short.
   // Cleared when another attempt starts; not shown once the tags read as
@@ -119,6 +146,9 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
   runRef.current = run;
 
   const notice = (text: string) => setNotices((current) => (current.includes(text) ? current : [...current, text]));
+  const outcome = (text: string | null) => {
+    if (text) setOutcomes((current) => (current.includes(text) ? current : [...current, text]));
+  };
 
   // The stored run; `available` is false when this browser's storage cannot
   // be read, and the run then lives in this tab only.
@@ -131,17 +161,21 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
     }
   };
 
-  // Saves the run (or forgets it); false when the browser refused.
-  const store = (next: RebuildRun | null): boolean => {
-    let saved = true;
-    if (key) {
-      try {
-        if (next) window.localStorage.setItem(key, JSON.stringify(next));
-        else window.localStorage.removeItem(key);
-      } catch {
-        saved = false;
-      }
+  // Writes the run (or forgets it) in storage; false when the browser refused.
+  const persist = (next: RebuildRun | null): boolean => {
+    if (!key) return false;
+    try {
+      if (next) window.localStorage.setItem(key, JSON.stringify(next));
+      else window.localStorage.removeItem(key);
+      return true;
+    } catch {
+      return false;
     }
+  };
+
+  // Saves the run (or forgets it) and shows it; false when the browser refused.
+  const store = (next: RebuildRun | null): boolean => {
+    const saved = persist(next);
     setRun(next);
     return saved;
   };
@@ -171,16 +205,23 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
     return next;
   });
 
-  useEffect(() => {
+  // An expired run, or one in a shape this page does not write, is dropped
+  // from storage, under the lock and re-read inside it, so a run another tab
+  // just wrote is not removed.
+  const dropUnusable = () => exclusive(lockName, () => {
     if (!key || !ids) return;
-    const stored = readStored();
-    // An expired run, or one in a shape this page does not write, is dropped.
     try {
-      if (stored.available && !stored.run && window.localStorage.getItem(key) !== null) window.localStorage.removeItem(key);
+      const raw = window.localStorage.getItem(key);
+      if (raw !== null && !parseStoredRun(raw, ids)) window.localStorage.removeItem(key);
     } catch {
       // Nothing to drop.
     }
-    setRun(stored.run);
+  });
+
+  useEffect(() => {
+    if (!key || !ids) return;
+    setRun(readStored().run);
+    void dropUnusable();
     const onStorage = (event: StorageEvent) => {
       if (event.key === key) setRun(parseStoredRun(event.newValue, ids));
     };
@@ -191,9 +232,19 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
   // The panel clears when the run expires, in every tab.
   useEffect(() => {
     if (!run) return;
-    const timer = setTimeout(() => live(run.runId), Math.max(0, runExpiresAt(run) - Date.now()) + 50);
+    const timer = setTimeout(() => {
+      live(run.runId);
+      void dropUnusable();
+    }, Math.max(0, runExpiresAt(run) - Date.now()) + 50);
     return () => clearTimeout(timer);
   }, [run?.runId, run?.startedAt]);
+
+  // What this tab noted about one run does not carry over to the next.
+  useEffect(() => {
+    setNotices([]);
+    setTrouble({});
+    setAttemptNote(null);
+  }, [run?.runId]);
 
   // The promotion dialog belongs to the run and build digests it opened
   // for; it closes when another tab dismisses the run or starts another.
@@ -279,10 +330,14 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
         setRun(existing);
         return;
       }
-      setNotices([]);
-      if (!store(newRun({ runId: idempotencyKey(), ...ids }, latestAtStart))) {
-        notice('This browser could not save the rebuild; it shows in this tab only, and a reload loses it.');
+      // A run that is not saved is not offered: every step re-reads it from
+      // storage, so its first click would find nothing.
+      const next = newRun({ runId: idempotencyKey(), ...ids }, latestAtStart);
+      if (!persist(next)) {
+        message.error('This browser could not save the rebuild (its storage is unavailable or full), so no rebuild was started.');
+        return;
       }
+      setRun(next);
     });
   });
 
@@ -295,16 +350,12 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
     try {
       const accepted = await adminApi.post<TemplateBuildStart>(`/v1/system-templates/${template}/builds`, systemBuildRequest(template, seedHash));
       const job: BuildJob = { job_id: accepted.job_id, state: 'pending', content_hash: null, error: null, lost: false };
-      const outcome = await exclusive(lockName, () => {
-        const accepted = acceptJob(live(current.runId), current.runId, template, job);
-        if (accepted.kind === 'recorded' && !store(accepted.run)) unsaved();
-        return accepted;
+      const recorded = await exclusive(lockName, () => {
+        const answer = acceptJob(live(current.runId), current.runId, template, job);
+        if (answer.kind === 'recorded' && !store(answer.run)) unsaved();
+        return answer;
       });
-      if (outcome.kind === 'extra') {
-        notice(`Another click also started ${template} job ${accepted.job_id}; this run follows job ${outcome.existing.job_id}. The extra job publishes a release of its own.`);
-      } else {
-        notice(`The rebuild was dismissed or expired meanwhile; ${template} job ${accepted.job_id} keeps running on the builder.`);
-      }
+      outcome(jobOutcomeNotice(template, accepted.job_id, recorded));
     } catch (err) {
       const failure = submitFailureText(template, err);
       if (failure.known) message.error(failure.text);
@@ -327,28 +378,23 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
         metadata: {},
         resources: null,
       });
-      const outcome = await exclusive(lockName, () => {
-        const recorded = acceptTestSandbox(live(current.runId), current.runId, template, { id: accepted.sandbox_id, createdAt: new Date().toISOString() });
-        if (recorded.kind === 'recorded' && !store(recorded.run)) unsaved();
-        return recorded;
+      const recorded = await exclusive(lockName, () => {
+        const answer = acceptTestSandbox(live(current.runId), current.runId, template, { id: accepted.sandbox_id, createdAt: new Date().toISOString() });
+        if (answer.kind === 'recorded' && !store(answer.run)) unsaved();
+        return answer;
       });
-      if (outcome.kind === 'recorded') {
-        message.success(`Test sandbox for ${template} requested`);
-      } else if (outcome.kind === 'extra') {
-        notice(`Another click also created test sandbox ${accepted.sandbox_id} for ${template}; this run keeps ${outcome.existing.id}. Delete ${accepted.sandbox_id}.`);
-      } else {
-        notice(`The rebuild was dismissed or expired meanwhile; test sandbox ${accepted.sandbox_id} was created. Delete it when you are done.`);
-      }
+      if (recorded.kind === 'recorded') message.success(`Test sandbox for ${template} requested`);
+      outcome(sandboxOutcomeNotice(template, accepted.sandbox_id, recorded));
     } catch (err) {
       const failure = testSandboxFailureText(name, err);
       if (failure.known) message.error(failure.text);
-      else notice(failure.text);
+      else outcome(failure.text);
     }
   });
 
-  const openPromote = async () => {
+  const openPromote = async (mode: PromoteDialog['mode']) => {
     if (!run || !canPromote(run)) return;
-    const base = { runKey: targetsKey(run), runId: run.runId, retry: Boolean(run.promotion), notice: null, acknowledged: false, running: false };
+    const base = { runKey: targetsKey(run), runId: run.runId, mode, notice: null, acknowledged: false, running: false };
     setPromote({ ...base, loading: true, plan: [], error: null });
     try {
       const fresh = await refreshReleases();
@@ -386,7 +432,7 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
     const saved = await exclusive(lockName, () => {
       const latest = live(dialog.runId);
       if (!latest || targetsKey(latest) !== dialog.runKey) return { ok: false as const, reason: 'gone' };
-      const next = confirmPromotion(latest, plan);
+      const next = confirmPromotion(latest, fresh, LATEST_TAG);
       if (next !== latest && !store(next)) {
         setRun(latest);
         return { ok: false as const, reason: 'unsaved' };
@@ -430,12 +476,20 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
     if (requestError) setAttemptNote(`The last promotion attempt stopped: ${requestError}.`);
   });
 
+  // Forgets the run this panel shows, under the lock and re-read inside it:
+  // a poll in another tab then finds no run to write back, and a run another
+  // tab started since is shown instead of removed.
   const dismiss = () => {
-    store(null);
-    setTrouble({});
-    setNotices([]);
-    setAttemptNote(null);
+    const runId = run?.runId;
     setPromote(null);
+    void exclusive(lockName, () => {
+      const stored = readStored();
+      if (stored.run && stored.run.runId !== runId) {
+        setRun(stored.run);
+        return;
+      }
+      if (!store(null)) message.error('This browser could not forget the run; a reload may show it again.');
+    });
   };
 
   // A recorded promotion's state, from the tags as last read.
@@ -445,12 +499,25 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
   );
 
   const header = (
-    <Space align="center" style={{ width: '100%', justifyContent: 'space-between', marginTop: 24 }}>
-      {title}
-      <Button onClick={() => void start()} loading={busy.has('start')} disabled={Boolean(run) || !ids} title={run ? 'Dismiss the current rebuild first' : undefined}>
-        Rebuild system templates
-      </Button>
-    </Space>
+    <>
+      <Space align="center" style={{ width: '100%', justifyContent: 'space-between', marginTop: 24 }}>
+        {title}
+        <Button onClick={() => void start()} loading={busy.has('start')} disabled={Boolean(run) || !ids} title={run ? 'Dismiss the current rebuild first' : undefined}>
+          Rebuild system templates
+        </Button>
+      </Space>
+      {outcomes.map((text) => (
+        <Alert
+          key={text}
+          type="warning"
+          showIcon
+          closable
+          style={{ marginTop: 8 }}
+          title={text}
+          onClose={() => setOutcomes((current) => current.filter((t) => t !== text))}
+        />
+      ))}
+    </>
   );
 
   if (!run) return header;
@@ -518,7 +585,7 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
             version it carries, and that it boots on this cluster.
           </Text>
           <Space>
-            <Button type="primary" loading={busy.has('promote')} onClick={() => void openPromote()}>Promote to latest…</Button>
+            <Button type="primary" loading={busy.has('promote')} onClick={() => void openPromote('first')}>Promote to latest…</Button>
           </Space>
         </Space>
       );
@@ -532,6 +599,30 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
           title={`Promoted ${formatTime(promotion.confirmedAt)}. As read just now, latest names ${(Object.keys(promotionView.latest) as SystemTemplate[]).map((t) => `${t} ${shortHash(promotionView.latest[t])}`).join(' and ')}.`}
           description={rollbackText(promotion)}
         />
+      );
+    }
+    if (promotionView.kind === 'previous') {
+      const kept = TEMPLATES.filter((t) => !promotionView.back.includes(t) && promotion.previous[t] === null);
+      return (
+        <Space orientation="vertical" size={4} style={{ width: '100%' }}>
+          <Alert
+            type="info"
+            showIcon
+            title={`latest is back on the release${promotionView.back.length > 1 ? 's' : ''} it named before the promotion of ${formatTime(promotion.confirmedAt)}: ${promotionView.back.map((t) => `${t} ${shortHash(promotion.previous[t], 'none')}`).join(', ')}.`}
+            description={(
+              <Space orientation="vertical" size={2}>
+                <Text>
+                  Someone moved it back, as a rollback does, or this promotion&apos;s tag request for it did not commit; the tags
+                  do not tell these apart.
+                </Text>
+                {kept.length ? <Text>{kept.join(' and ')} had no latest before, so {kept.length > 1 ? 'they keep' : 'it keeps'} the new release.</Text> : null}
+              </Space>
+            )}
+          />
+          <Space>
+            <Button loading={busy.has('promote')} onClick={() => void openPromote('again')}>Promote again…</Button>
+          </Space>
+        </Space>
       );
     }
     return (
@@ -553,7 +644,7 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
           )}
         />
         <Space>
-          <Button type="primary" loading={busy.has('promote')} onClick={() => void openPromote()}>Retry promotion…</Button>
+          <Button type="primary" loading={busy.has('promote')} onClick={() => void openPromote('retry')}>Retry promotion…</Button>
         </Space>
       </Space>
     );
@@ -600,8 +691,8 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
       />
       <Modal
         open={promote !== null}
-        title={promote?.retry ? 'Retry the promotion' : 'Promote to latest'}
-        okText={promote?.retry ? 'Retry' : 'Promote'}
+        title={promote?.mode === 'retry' ? 'Retry the promotion' : 'Promote to latest'}
+        okText={promote?.mode === 'retry' ? 'Retry' : 'Promote'}
         onCancel={() => setPromote(null)}
         confirmLoading={promote?.running}
         okButtonProps={{ disabled: !promote || promote.loading || Boolean(promote.error) || promote.plan.length === 0 || (needsAck && !promote.acknowledged) }}
@@ -639,7 +730,7 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
               <Alert
                 type="warning"
                 showIcon
-                title={promote.retry ? 'latest moved since the promotion was confirmed' : 'latest changed since this run started'}
+                title={promote.mode === 'first' ? 'latest changed since this run started' : 'latest moved since the promotion was confirmed'}
                 description={(
                   <Space orientation="vertical">
                     {promote.plan.filter((row) => row.attention).map((row) => (
@@ -649,13 +740,13 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
                       </Text>
                     ))}
                     <Checkbox checked={promote.acknowledged} onChange={(e) => setPromote((p) => p && { ...p, acknowledged: e.target.checked })}>
-                      {promote.retry ? 'Overwrite it' : 'Promote anyway'}
+                      {promote.mode === 'first' ? 'Promote anyway' : 'Overwrite it'}
                     </Checkbox>
                   </Space>
                 )}
               />
             ) : null}
-            {promote.retry && run.promotion ? <Text type="secondary">{rollbackText(run.promotion)}</Text> : null}
+            {promote.mode !== 'first' && run.promotion ? <Text type="secondary">{rollbackText(run.promotion)}</Text> : null}
           </Space>
         ) : null}
       </Modal>
@@ -667,8 +758,9 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
 // the tag dialog. A template that had no latest keeps the new release: the
 // API does not delete latest.
 function rollbackText(promotion: Promotion): string {
-  const parts = (Object.keys(promotion.targets) as SystemTemplate[]).map((t) => (
-    promotion.previous[t] ? `${t} ${shortHash(promotion.previous[t])}` : `${t}: none (it keeps the new release)`
-  ));
+  const parts = TEMPLATES.map((t) => {
+    if (promotion.previous[t] === promotion.targets[t]) return `${t}: already on the new release`;
+    return promotion.previous[t] ? `${t} ${shortHash(promotion.previous[t])}` : `${t}: none (it keeps the new release)`;
+  });
   return `To roll back, assign latest with the tag button in Template Releases to the releases it named before: ${parts.join('; ')}.`;
 }
