@@ -82,7 +82,9 @@ fn scheduling_effect_is_the_single_admission_policy_mapping() {
 fn cached_evaluation_uses_last_measurement_without_refreshing() {
     let monitor = CacheDiskAdmissionMonitor::new();
     monitor
-        .refresh_with(|| Ok(measurement(500, 1_000)))
+        .refresh_with(CacheDiskRefreshFailure::KeepLastGood, || {
+            Ok(measurement(500, 1_000))
+        })
         .unwrap();
 
     let decision = monitor.evaluate_cached(config(), 490);
@@ -90,7 +92,9 @@ fn cached_evaluation_uses_last_measurement_without_refreshing() {
     assert_eq!(decision.state, CacheDiskAdmissionState::Full);
     assert_eq!(decision.effective_available_bytes, 10);
     monitor
-        .refresh_with(|| Err(CacheDiskProbeError::Statvfs))
+        .refresh_with(CacheDiskRefreshFailure::Invalidate, || {
+            Err(CacheDiskProbeError::Statvfs)
+        })
         .unwrap_err();
     assert_eq!(
         monitor.evaluate_cached(config(), 0).state,
@@ -122,7 +126,7 @@ fn refresh_serializes_probe_and_publication() {
         let monitor = &monitor;
         scope.spawn(move || {
             monitor
-                .refresh_with(|| {
+                .refresh_with(CacheDiskRefreshFailure::KeepLastGood, || {
                     first_started.wait();
                     wait.recv_timeout(Duration::from_secs(5)).unwrap();
                     Ok(measurement(500, 1_000))
@@ -132,7 +136,7 @@ fn refresh_serializes_probe_and_publication() {
         started.wait();
         scope.spawn(|| {
             monitor
-                .refresh_with(|| {
+                .refresh_with(CacheDiskRefreshFailure::KeepLastGood, || {
                     entered.send(()).unwrap();
                     Ok(measurement(100, 1_000))
                 })
@@ -280,4 +284,26 @@ fn disabled_config_keeps_admission_open() {
 
     assert_eq!(decision.state, CacheDiskAdmissionState::Ready);
     assert_eq!(decision.reason, CacheDiskAdmissionReason::Disabled);
+}
+
+#[test]
+fn failed_periodic_refresh_keeps_last_good_measurement() {
+    let monitor = CacheDiskAdmissionMonitor::new();
+    monitor
+        .refresh_with(CacheDiskRefreshFailure::KeepLastGood, || {
+            Ok(measurement(500, 1_000))
+        })
+        .unwrap();
+    monitor
+        .refresh_with(CacheDiskRefreshFailure::KeepLastGood, || {
+            Err(CacheDiskProbeError::Btrfs(
+                "btrfs filesystem usage --raw timed out".to_string(),
+            ))
+        })
+        .unwrap_err();
+
+    let decision = monitor.evaluate_cached(config(), 0);
+
+    assert_eq!(decision.state, CacheDiskAdmissionState::Ready);
+    assert_eq!(decision.effective_available_bytes, 500);
 }
