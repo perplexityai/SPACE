@@ -1,0 +1,22 @@
+{
+  "name": "space-kind-console-loop",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Browser verification loop for the SPACE admin console on a local Kind stack.",
+  "type": "module",
+  "engines": { "node": ">=22.12.0", "npm": ">=10" },
+  "scripts": {
+    "seed": "node --experimental-strip-types src/seed.ts",
+    "clean": "node --experimental-strip-types src/seed.ts --clean",
+    "loop": "node --experimental-strip-types src/loop.ts",
+    "compare": "node --experimental-strip-types src/compare.ts",
+    "capture": "node --experimental-strip-types src/capture.ts",
+    "test": "node --experimental-strip-types --test src/*.test.ts",
+    "typecheck": "tsc --noEmit -p ."
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "playwright": "1.64.1",
+    "typescript": "5.9.3"
+  }
+}
