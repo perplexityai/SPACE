@@ -73,3 +73,69 @@ async fn an_unparseable_reference_fails_the_read() -> TestResult {
     );
     Ok(())
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn entries_carry_identity_and_edges_of_unretired_environments() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    insert(&db.pool, &environment(1).to_string(), true).await?;
+    insert(&db.pool, &environment(0).to_string(), false).await?;
+    sqlx::query(sql!(
+        "UPDATE runtime_environments
+         SET upgrade_edges = ARRAY[$2, $3], memory_edges = ARRAY[$3]
+         WHERE environment_ref = $1"
+    ))
+    .bind(environment(0).to_string())
+    .bind(environment(2).to_string())
+    .bind(environment(3).to_string())
+    .execute(&db.pool)
+    .await?;
+
+    assert_eq!(
+        list_unretired_entries(&db.pool).await?,
+        vec![CatalogEntry {
+            reference: environment(0),
+            runtime: "firecracker".to_owned(),
+            runtime_version: "1.17.0".to_owned(),
+            kernel_version: "6.1.155".to_owned(),
+            state_format_name: "firecracker-snapshot".to_owned(),
+            state_format_version: "12.0.0".to_owned(),
+            upgrade_edges: vec![environment(2), environment(3)],
+            memory_edges: vec![environment(3)],
+        }]
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_unparseable_edge_fails_the_entries_read() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    sqlx::query(sql!(
+        "ALTER TABLE runtime_environments
+         DROP CONSTRAINT runtime_environments_upgrade_edges_check"
+    ))
+    .execute(&db.pool)
+    .await?;
+    insert(&db.pool, &environment(0).to_string(), false).await?;
+    sqlx::query(sql!(
+        "UPDATE runtime_environments SET upgrade_edges = ARRAY['sha256:bad']"
+    ))
+    .execute(&db.pool)
+    .await?;
+
+    let error = list_unretired_entries(&db.pool)
+        .await
+        .expect_err("a malformed edge must fail the whole read");
+    assert!(
+        matches!(
+            &error,
+            ListUnretiredError::InvalidEnvironmentReference { value, .. }
+                if value == "sha256:bad"
+        ),
+        "{error:?}"
+    );
+    Ok(())
+}

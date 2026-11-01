@@ -38,6 +38,7 @@ mod public_operation_dispatcher;
 mod public_operation_retention;
 mod reconcile_queue_gc;
 mod reconcilers;
+pub mod runtime_upgrade;
 mod snapshot_retention_sweeper;
 mod snapshot_storage_sweeper;
 mod started_sandbox_repair;
