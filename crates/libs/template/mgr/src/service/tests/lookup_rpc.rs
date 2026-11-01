@@ -60,6 +60,7 @@ async fn cached_lookup_preserves_offline_behavior_during_rollout(
             name: "base".into(),
             content_hash: Some(hash_a.clone()),
             tag: None,
+            environment: None,
         }),
         ..Default::default()
     });
@@ -165,6 +166,7 @@ async fn cold_lookup_preserves_scope_at_catalog(
             name: TEMPLATE.into(),
             content_hash: by_hash.then(|| format!("sha256:{}", "a".repeat(64))),
             tag: None,
+            environment: None,
         }),
         vcpu: Some(1),
         memory_mib: Some(512),

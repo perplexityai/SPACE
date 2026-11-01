@@ -323,6 +323,7 @@ async fn backend_with_scope(
                         name: "example-template".into(),
                         content_hash: Some(format!("sha256:{}", "a".repeat(64))),
                         tag: None,
+                        environment: None,
                     }),
                     state: "ready".into(),
                     ..Default::default()

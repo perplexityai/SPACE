@@ -208,13 +208,19 @@ impl BuildBackend for MockBuildBackend {
             .lock()
             .unwrap()
             .pop_front()
-            .unwrap_or_else(|| Ok(BuildOutcome { content_hash: None }))
+            .unwrap_or_else(|| {
+                Ok(BuildOutcome {
+                    content_hash: None,
+                    environment: None,
+                })
+            })
     }
 
     async fn publish(
         &self,
         template_id: &str,
         content_hash: &str,
+        _environment: Option<pplx_space_common_core::types::EnvironmentReference>,
         publish_tags: &[String],
         publication: TemplatePublication,
     ) -> Result<(), PublishError> {
@@ -262,6 +268,7 @@ impl BuildBackend for BlockingBuildBackend {
                 "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
                     .to_string(),
             ),
+            environment: None,
         })
     }
 
@@ -269,6 +276,7 @@ impl BuildBackend for BlockingBuildBackend {
         &self,
         _template_id: &str,
         _content_hash: &str,
+        _environment: Option<pplx_space_common_core::types::EnvironmentReference>,
         _publish_tags: &[String],
         _publication: TemplatePublication,
     ) -> Result<(), PublishError> {
@@ -494,6 +502,7 @@ async fn prune_runs_after_success_when_no_sibling_active() -> TestResult {
         content_hash: Some(
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
         ),
+        environment: None,
     }));
     backend.push_publish_result(Ok(()));
     let service = BuildManagerDaemonService::with_backend(1, backend.clone())?;
@@ -528,6 +537,7 @@ async fn prune_skipped_while_sibling_same_template_job_active() -> TestResult {
         content_hash: Some(
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
         ),
+        environment: None,
     }));
     backend.push_publish_result(Ok(()));
     let service = BuildManagerDaemonService::with_backend(2, backend.clone())?;
@@ -570,6 +580,7 @@ async fn build_defaults_to_publish_enabled() -> TestResult {
         content_hash: Some(
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
         ),
+        environment: None,
     }));
     backend.push_publish_result(Ok(()));
     let service = BuildManagerDaemonService::with_backend(1, backend.clone())?;
@@ -615,6 +626,7 @@ async fn build_publish_carries_publication_authority() -> TestResult {
         let hash = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let backend = MockBuildBackend::with_build_result(Ok(BuildOutcome {
             content_hash: Some(hash.to_string()),
+            environment: None,
         }));
         let service = BuildManagerDaemonService::with_backend(1, backend.clone())?;
         let mut request = start_build_request(
@@ -654,6 +666,7 @@ async fn template_registration_failure_stops_before_local_build() -> TestResult 
         content_hash: Some(
             "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
         ),
+        environment: None,
     }));
     backend.push_cluster_template_result(Err(PublishError::RegisterTemplate(
         Status::permission_denied("template belongs to a different organization"),
@@ -712,6 +725,7 @@ async fn build_materializes_blob_inputs_before_calling_backend() -> TestResult {
         content_hash: Some(
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
         ),
+        environment: None,
     }));
     let service = BuildManagerDaemonService::with_backend(1, backend)?;
     let mut recipe = test_recipe();
@@ -774,6 +788,7 @@ async fn publish_failure_is_distinct_terminal_state_and_keeps_hash() -> TestResu
         content_hash: Some(
             "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_string(),
         ),
+        environment: None,
     }));
     backend.push_publish_result(Err(PublishError::RegisterTemplateRelease(
         tonic::Status::new(Code::AlreadyExists, "tag 'latest' already exists"),
@@ -886,6 +901,7 @@ async fn terminal_job_status_survives_service_recreation() -> TestResult {
         content_hash: Some(
             "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_string(),
         ),
+        environment: None,
     }));
     let service =
         BuildManagerDaemonService::with_backend_and_db_path(&db_path, 1, backend.clone())?;
@@ -933,6 +949,7 @@ async fn expired_running_job_lease_is_marked_failed() -> TestResult {
         content_hash: Some(
             "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_string(),
         ),
+        environment: None,
     }));
     let service = BuildManagerDaemonService::with_backend(1, backend)?;
     let job_id = pplx_space_common_jobs::JobId::new();
@@ -1306,6 +1323,7 @@ async fn unauthenticated_owner_claim_does_not_enqueue_a_build() -> TestResult {
         content_hash: Some(
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
         ),
+        environment: None,
     }));
     let service = BuildManagerDaemonService::with_backend(1, backend.clone())?;
 
@@ -1366,7 +1384,10 @@ async fn environment_preflight_precedes_blob_and_publication_effects() -> TestRe
         return Ok(());
     }
     for with_blob in [true, false] {
-        let backend = MockBuildBackend::with_build_result(Ok(BuildOutcome { content_hash: None }));
+        let backend = MockBuildBackend::with_build_result(Ok(BuildOutcome {
+            content_hash: None,
+            environment: None,
+        }));
         let service = BuildManagerDaemonService::with_backend(1, backend.clone())?;
         let mut recipe = test_recipe();
         recipe.steps.push(recipe::Step {
@@ -1415,7 +1436,10 @@ async fn selected_build_survives_queue_and_old_wire_readers_reject_before_enqueu
     }
     let reference =
         "sha256:959f1181ac69f0dde7125fbc81be6fcd75b64e9e06e7a393f067b96eb6fb2ac4".parse()?;
-    let backend = MockBuildBackend::with_build_result(Ok(BuildOutcome { content_hash: None }));
+    let backend = MockBuildBackend::with_build_result(Ok(BuildOutcome {
+        content_hash: None,
+        environment: None,
+    }));
     let service = BuildManagerDaemonService::with_backend(1, backend.clone())?;
     let mut request = start_build_request(Some(test_recipe()), "benchmark-c", vec![]);
     pplx_space_build_mgr_client::environment::bind(&mut request, reference);
