@@ -328,19 +328,19 @@ impl<P: PodBackend, S: SandboxStore> Reconciler<P, S> {
         cap.saturating_sub(self.delete_history.len())
     }
 
-    /// Classify the owning rows for `ids` in `batch_size` chunks so a single
-    /// `ANY($1)` query never carries an unbounded id array. Returns the merged
+    /// Classify the owning rows for `floors` in `batch_size` chunks so a
+    /// single query never carries an unbounded id array. Returns the merged
     /// map; an error from any chunk aborts the tick (the whole classification
     /// pass retries next tick).
     async fn classify_all(
         &self,
-        ids: &[SandboxId],
+        floors: &[(SandboxId, i64)],
     ) -> Result<HashMap<SandboxId, SandboxRestoreState>, sqlx::Error> {
         let chunk = usize::try_from(self.config.batch_size)
             .unwrap_or(usize::MAX)
             .max(1);
-        let mut states = HashMap::with_capacity(ids.len());
-        for window in ids.chunks(chunk) {
+        let mut states = HashMap::with_capacity(floors.len());
+        for window in floors.chunks(chunk) {
             states.extend(self.store.classify_sandboxes(window).await?);
         }
         Ok(states)
@@ -594,12 +594,19 @@ impl<P: PodBackend, S: SandboxStore> Reconciler<P, S> {
 
         self.settle_teardowns(&present, &mut report);
 
-        // Batched owning-row classification. One id per sandbox (dedup so many
-        // pods on one sandbox don't blow up the id array).
-        let mut ids: Vec<SandboxId> = eligible.iter().map(|e| e.sandbox_id).collect();
-        ids.sort_unstable();
-        ids.dedup();
-        let classified = tokio::time::timeout_at(deadline, self.classify_all(&ids)).await;
+        // Batched owning-row classification. One entry per sandbox (so many
+        // pods on one sandbox don't blow up the id array), carrying its pods'
+        // lowest generation: the store returns the execution rows from there
+        // up, which covers what the backup fence reads for each of them.
+        let mut floors: BTreeMap<SandboxId, i64> = BTreeMap::new();
+        for eligible in &eligible {
+            let floor = floors
+                .entry(eligible.sandbox_id)
+                .or_insert(eligible.generation);
+            *floor = (*floor).min(eligible.generation);
+        }
+        let floors: Vec<(SandboxId, i64)> = floors.into_iter().collect();
+        let classified = tokio::time::timeout_at(deadline, self.classify_all(&floors)).await;
         let states = match classified {
             Ok(Ok(states)) => states,
             Err(_elapsed) => {
@@ -840,13 +847,15 @@ impl<P: PodBackend, S: SandboxStore> Reconciler<P, S> {
 
         // Authoritative recheck against the owning row (unlocked — see below),
         // bounded by the tick deadline. Re-reads the active execution's
-        // generation so the supersession verdict is current, and catches a row
+        // generation and the execution rows the backup fence reads so the
+        // supersession verdict is current, and catches a row
         // that a concurrent operation moved back to `restoring` (a
         // same-generation re-drive) or that became this pod's active runtime
         // between the cached scan and now.
         let recheck = match tokio::time::timeout_at(
             deadline,
-            self.store.classify_sandboxes(&[candidate.sandbox_id]),
+            self.store
+                .classify_sandboxes(&[(candidate.sandbox_id, candidate.generation)]),
         )
         .await
         {
@@ -900,12 +909,13 @@ impl<P: PodBackend, S: SandboxStore> Reconciler<P, S> {
 
         // Live delete. No lock is held across it: the recheck confirmed the pod
         // is *provably superseded* — a strictly-older execution generation, a
-        // `suspended`/`failed` row with no active execution, or a deleted row —
-        // and generations are monotonic, so no current or future restore can
-        // adopt this pod. The delete is therefore safe under any concurrency: a
+        // `suspended`/`failed` row with no active execution whose generation
+        // the backup fence supersedes, or a deleted row — and generations are
+        // monotonic, so no current or future restore can adopt this pod. A
         // restore racing in, or a DELETE cancelled by the deadline yet still
         // applied by the apiserver, can only remove this unadoptable pod, never
-        // a live runtime. `cleanup_requested` precedes the DELETE (evidence of
+        // a live runtime. The fence verdict can still change before the
+        // teardown capture registers (see the module docs). `cleanup_requested` precedes the DELETE (evidence of
         // the attempt even on a mid-delete crash); the UID + resourceVersion
         // precondition makes a same-name newer pod or a status change a benign
         // conflict rather than a collateral removal.
@@ -1016,10 +1026,11 @@ impl<P: PodBackend, S: SandboxStore> Reconciler<P, S> {
 ///
 /// Unlike the stuck-ContainerCreating GC, this reaper needs no DB-convergence
 /// companion: it only reaps a pod the owning row has provably superseded (row
-/// deleted, no active execution, or a strictly-higher active generation, on a
-/// non-transient row), so the row already reflects the desired state and deleting the stranded pod
-/// converges Kubernetes to it without leaving a lifecycle for another
-/// reconciler to retire. Ships default-disabled; when enabled, starts in
+/// deleted, a strictly-higher active generation, or no active execution with
+/// the pod's generation superseded, on a non-transient row), so the row
+/// already reflects the desired state and deleting the stranded pod converges
+/// Kubernetes to it without leaving a lifecycle for another reconciler to
+/// retire. Ships default-disabled; when enabled, starts in
 /// dry-run.
 pub async fn run(
     pool: PgPool,
@@ -1078,6 +1089,11 @@ pub async fn run(
                         suspended_same_generation = report
                             .skipped
                             .get(&SkipClass::SuspendedSameGeneration)
+                            .copied()
+                            .unwrap_or(0),
+                        capture_admitted = report
+                            .skipped
+                            .get(&SkipClass::CaptureAdmitted)
                             .copied()
                             .unwrap_or(0),
                         terminating = report.terminating,

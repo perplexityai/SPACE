@@ -507,14 +507,14 @@ pub async fn run_reconcilers(
             )));
 
             // Orphaned-restore-pod GC: reaps restore pods that are provably
-            // superseded by their owning `sandboxes` row (row deleted, no
-            // active execution, or active execution at a strictly-higher
-            // generation) — the unrouted VM an interrupted source-pinned
-            // restore leaves behind when its pinned pod binds after the row
-            // moved on. Pod-cache-driven with a batched Postgres
-            // classification; needs no DB-convergence companion (the row
-            // already reflects the desired state). Default-disabled; starts
-            // in dry-run.
+            // superseded by their owning `sandboxes` row (row deleted, active
+            // execution at a strictly-higher generation, or no active
+            // execution with the pod's generation superseded) — the unrouted
+            // VM an interrupted source-pinned restore leaves behind when its
+            // pinned pod binds after the row moved on. Pod-cache-driven with
+            // a batched Postgres classification; needs no DB-convergence
+            // companion (the row already reflects the desired state).
+            // Default-disabled; starts in dry-run.
             handles.push(tokio::spawn(orphaned_restore_pod_gc::run(
                 pool.clone(),
                 kube.clone(),
