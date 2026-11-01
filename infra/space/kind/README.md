@@ -796,6 +796,8 @@ every node at the linux/amd64 digest `ci/mirrored-images.txt` lists for the
 charts' pin, under the tag the Kind profiles name, so the pods start without a
 registry pull. GitHub CI takes these images from the GHCR mirror; elsewhere
 they come from Docker Hub. A load that fails leaves the pull to the kubelet.
+The pulls and the loads run in parallel, as do the metrics and traces
+releases; the logs and Grafana releases follow them in that order.
 
 The `off` and `datadog` modes install no local OSS backends:
 
