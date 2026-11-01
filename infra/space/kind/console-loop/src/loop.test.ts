@@ -12,7 +12,8 @@ import { loadConfig } from './config.ts';
 import { isSelected, parseSelection } from './loop.ts';
 import { normalizer, redact } from './recorder.ts';
 import {
-  isSeededOrg, nextCreate, readSeedState, seedStatePath, settleOperations, upsertCreated, writeSeedState,
+  isSeededOrg, nextCreate, readSeedState, rejectedBeforeAdmission, seedStatePath, settleOperations, unfoundCreate, upsertCreated,
+  writeSeedState,
   type CreatedObject, type OperationRef, type SeedState,
 } from './seed.ts';
 import { sameStack } from './stack.ts';
@@ -172,4 +173,26 @@ test('only the seeded org slugs are kept by default', () => {
   assert.equal(isSeededOrg('loop', 'loop-globex-research'), true);
   assert.equal(isSeededOrg('loop', 'loop-run-mvxd0bs8'), false);
   assert.equal(isSeededOrg('other', 'loop-acme'), false);
+});
+
+test('a create rejected before admission resolves: a corrected seed starts fresh, and clean drops it', () => {
+  for (const status of [400, 401, 403, 415, 422, 429]) assert.equal(rejectedBeforeAdmission(status), true, `${status}`);
+  for (const status of [202, 409, 500, 503]) assert.equal(rejectedBeforeAdmission(status), false, `${status}`);
+  const bad = { admin: false, body: { template: '', runtime: 'fc', name: 'loop-running' } };
+  const good = { admin: false, body: { template: 'seed:latest', runtime: 'fc', name: 'loop-running' } };
+  const corrected = () => ({ idempotencyKey: 'key-2', request: good });
+  // Seeded with an empty template: the API answered 422.
+  const rejected: CreatedObject = { kind: 'sandbox', name: 'loop-running', orgId: 'm', idempotencyKey: 'key-1', request: bad, rejected: 422 };
+  // The corrected seed makes a new create with its options and a new key.
+  assert.deepEqual(nextCreate(rejected, corrected), { idempotencyKey: 'key-2', request: good, replay: false });
+  // Clean, finding no sandbox, drops the rejected intent instead of replaying it.
+  assert.equal(unfoundCreate(rejected), 'rejected');
+  // A 409 records nothing: the create stays unresolved, is replayed exactly, and keeps its key.
+  const conflicted: CreatedObject = { ...rejected, rejected: undefined };
+  assert.deepEqual(nextCreate(conflicted, corrected), { idempotencyKey: 'key-1', request: bad, replay: true });
+  assert.equal(unfoundCreate(conflicted), 'replay');
+  // The same for a browser create: rejected is dropped, unanswered is kept.
+  assert.equal(unfoundCreate({ kind: 'sandbox', name: 'loop-run-x', submitted: true, rejected: 400 }), 'rejected');
+  assert.equal(unfoundCreate({ kind: 'sandbox', name: 'loop-run-x', submitted: true }), 'unresolved');
+  assert.equal(unfoundCreate({ kind: 'sandbox', name: 'loop-run-x' }), 'never submitted');
 });

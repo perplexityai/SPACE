@@ -67,7 +67,7 @@ npm run seed                  # rerunnable; reuses what exists
 npm run loop                  # every step, against http://localhost:3000
 npm run loop -- --no-mutate   # skip the steps that create and delete things
 npm run loop -- --only sandboxes,nodes --skip lifecycle
-npm run clean                 # delete what the seed and loop created, except organizations
+npm run clean                 # delete what the seed and loop created, except the seeded organizations
 ```
 
 The seed creates, under a name prefix (`loop` by default), three tenant
@@ -93,8 +93,14 @@ authoritative. A sandbox create is recorded with its idempotency key and
 request, and a rerun resubmits an unanswered one with the same key and the
 recorded request, unchanged even when `--template` has changed since (the
 API refuses a key reused with another body), which the API answers with the
-original operation if the first submit arrived. Only a new create, after the
-earlier one has resolved, uses the current options and a new key.
+original operation if the first submit arrived. A create has resolved once
+it was answered with an operation, or rejected before the API admitted it: a
+4xx other than 409 (for example a 422 for an empty `--template`, or a 401,
+403 or 429). Only a new create, after the earlier one has resolved, uses the
+current options and a new key, so a rerun with a corrected option recovers
+from a rejected one. A 409 means the key was already used with another body:
+that create stays unresolved, its request is resubmitted unchanged, and its
+key is never replaced.
 
 The outcome of each operation is recorded once it is seen finished, and not
 asked for again. The API deletes finished operations a week after they are
@@ -113,7 +119,10 @@ through the console.
   its delete and for it to leave `deleting`. A sandbox counts as gone only
   when it is deleted, or not found once nothing recorded for it is still
   running. A seed create that was submitted but never answered is
-  resubmitted, unchanged, with its key to learn its operation. A loop create
+  resubmitted, unchanged, with its key to learn its operation. A create the
+  API rejected before admitting it (a 4xx other than 409), by the seed or the
+  loop, is dropped: nothing was made. One answered with 409 stays unresolved.
+  A loop create
   that left the browser with no answer, and has no sandbox of its name yet
   (a create can stay queued, without a sandbox, after the loop is gone), is
   unresolved: `clean` keeps it in the state, reports it, exits 1, and looks
@@ -294,9 +303,13 @@ dialog in its screenshots and video shows the placeholder
 `console-loop-placeholder-not-a-key`. It fails closed: if a JSON answer with
 a `secret` reaches the page some other way, the dialog opens before the
 route answered the create, or the dialog shows anything shaped like a key,
-the step opens `about:blank` before any screenshot and fails, and with
-`--video` the run's video is deleted, which the run's output and summary
-say. The recorder replaces anything shaped like a key (64 hex characters) in
+the step opens `about:blank` before any screenshot and fails, and the run
+stops: no later step runs, the browser is closed, and with `--video` the
+run's recording is deleted on the way out, which the run's output and
+summary say; the run exits 1. A run interrupted while it closes the browser
+or deletes the recording (or killed at any point) can still leave a raw
+recording under its run directory's `.video/`: delete that directory before
+you share a run. The recorder replaces anything shaped like a key (64 hex characters) in
 what it writes with `<redacted>`. `npm run capture` only visits routes and creates
 no keys.
 
