@@ -9,7 +9,7 @@ import {
   signIn, text, visit, waitForStatus, withoutSecret, type Ctx,
 } from './browser.ts';
 import { verifyFixtures } from './fixtures.ts';
-import { orgDisplayName, recordCreated } from './seed.ts';
+import { orgDisplayName, recordCreated, rejectedBeforeAdmission } from './seed.ts';
 
 export interface Step {
   name: string;
@@ -247,9 +247,11 @@ step('api-key-create-revoke', ['api-keys', 'flows'], async (c) => {
       if (carriesSecret(body)) leaks.push(`${res.request().method()} ${new URL(res.url()).pathname}`);
     }, () => {}));
   };
+  // The flag comes first: the runner stops the run on it and deletes a
+  // --video recording, even if leaving the page fails.
   const exposed = async (why: string): Promise<never> => {
-    await c.page.goto('about:blank');
     c.shared.secretExposed = why;
+    await c.page.goto('about:blank').catch(() => {});
     throw new Error(`a live API key may have reached the page (${why}); the page was cleared before any screenshot`);
   };
   await c.page.route('**/*', handler);
@@ -352,6 +354,8 @@ step('sandbox-create', ['sandboxes', 'flows', 'lifecycle'], async (c) => {
       return;
     }
     const body = await response.text();
+    // Refused before admission: the create resolved with nothing made.
+    if (rejectedBeforeAdmission(response.status())) recordCreated(c.config, { kind: 'sandbox', name: c.runTag, orgId: managing, rejected: response.status() });
     let accepted: { operation_id?: string; sandbox_id?: string } | null = null;
     try { accepted = JSON.parse(body); } catch { /* not JSON */ }
     if (response.ok() && typeof accepted?.operation_id === 'string') {

@@ -85,76 +85,90 @@ async function main(): Promise<number> {
 
   const results: StepResult[] = [];
   let index = 0;
-  for (const s of steps) {
-    const selected = isSelected(s, only, skip) && (mutate || !s.mutates);
-    // Sign-in always runs, so a filtered run is still signed in.
-    if (!selected && !s.tags.includes('auth')) continue;
-    if (!selected && s.name === 'logout') continue;
-    index += 1;
-    rec.begin(s.name);
-    const startedAt = Date.now();
-    let failure: unknown = null;
-    try {
-      await s.run(c);
-    } catch (err) {
-      failure = err;
-    }
-    // An error toast is a failed check; others are notes.
-    for (const toast of await takeToasts(page).catch(() => [])) {
-      if (toast.type === 'error' || toast.type === 'warning') rec.check(false, `toast ${toast.type}: ${toast.text}`);
-      else rec.note(`toast ${toast.type}: ${toast.text}`);
-    }
-    const result = await rec.end(index, startedAt, failure);
-    results.push(result);
-    const bad = result.events.filter((e) => !NON_FAILING.includes(e.kind));
-    console.log(`${result.ok ? 'ok  ' : 'FAIL'} ${String(index).padStart(3)} ${s.name} (${result.durationMs} ms)${bad.length ? ` — ${bad.length} event(s)` : ''}`);
-    for (const e of bad) console.log(`       ${e.kind}: ${e.message}`);
-  }
-  const recording = page.video();
-  await context.close();
-  await browser.close();
-  // A step that cleared the page because a live API key may have reached it
-  // (see the api-key-create-revoke step) leaves frames that may show one:
-  // the recording is deleted, not kept.
-  const exposed = c.shared.secretExposed;
+  let stopped: string | undefined;
   let videoDeleted: string | undefined;
-  if (recording) {
-    if (exposed) {
+  try {
+    for (const s of steps) {
+      const selected = isSelected(s, only, skip) && (mutate || !s.mutates);
+      // Sign-in always runs, so a filtered run is still signed in.
+      if (!selected && !s.tags.includes('auth')) continue;
+      if (!selected && s.name === 'logout') continue;
+      index += 1;
+      rec.begin(s.name);
+      const startedAt = Date.now();
+      let failure: unknown = null;
+      try {
+        await s.run(c);
+      } catch (err) {
+        failure = err;
+      }
+      // An error toast is a failed check; others are notes.
+      for (const toast of await takeToasts(page).catch(() => [])) {
+        if (toast.type === 'error' || toast.type === 'warning') rec.check(false, `toast ${toast.type}: ${toast.text}`);
+        else rec.note(`toast ${toast.type}: ${toast.text}`);
+      }
+      const result = await rec.end(index, startedAt, failure);
+      results.push(result);
+      const bad = result.events.filter((e) => !NON_FAILING.includes(e.kind));
+      console.log(`${result.ok ? 'ok  ' : 'FAIL'} ${String(index).padStart(3)} ${s.name} (${result.durationMs} ms)${bad.length ? ` — ${bad.length} event(s)` : ''}`);
+      for (const e of bad) console.log(`       ${e.kind}: ${e.message}`);
+      // A step that cleared the page because a live API key may have reached
+      // it (see the api-key-create-revoke step) ends the run: no later step
+      // runs or records anything.
+      if (c.shared.secretExposed) {
+        stopped = `stopped after ${s.name}: ${c.shared.secretExposed}`;
+        console.log(stopped);
+        break;
+      }
+    }
+  } finally {
+    // Closing the context finishes the recording. One that may show a live
+    // key is deleted, not kept, however the run ended.
+    const recording = page.video();
+    await context.close().catch(() => {});
+    await browser.close().catch(() => {});
+    const exposed = c.shared.secretExposed;
+    if (recording && exposed) {
+      fs.rmSync(path.join(runDir, '.video'), { recursive: true, force: true });
       videoDeleted = `deleted the run's video: ${exposed}`;
       console.log(videoDeleted);
-    } else {
-      fs.renameSync(await recording.path(), path.join(runDir, 'run.webm'));
+    } else if (recording) {
+      try {
+        fs.renameSync(await recording.path(), path.join(runDir, 'run.webm'));
+      } finally {
+        fs.rmSync(path.join(runDir, '.video'), { recursive: true, force: true });
+      }
     }
-    fs.rmSync(path.join(runDir, '.video'), { recursive: true, force: true });
   }
 
-  const summary: RunSummary & { mutate: boolean; slowMs: number; failingSteps: string[]; videoDeleted?: string } = {
+  const summary: RunSummary & { mutate: boolean; slowMs: number; failingSteps: string[]; stopped?: string; videoDeleted?: string } = {
     baseUrl: config.baseUrl,
     startedAt: stamp,
     mutate,
     slowMs,
     steps: results.length,
     failingSteps: results.filter((r) => !r.ok).map((r) => r.name),
+    stopped,
     videoDeleted,
     results,
   };
   writeJson(path.join(runDir, 'summary.json'), summary);
-  fs.writeFileSync(path.join(runDir, 'summary.md'), markdown(summary, results, videoDeleted));
+  fs.writeFileSync(path.join(runDir, 'summary.md'), markdown(summary, results, [stopped, videoDeleted]));
   const latest = path.join(config.outDir, 'runs', 'latest');
   fs.rmSync(latest, { force: true });
   fs.symlinkSync(path.basename(runDir), latest);
   console.log(`\n${results.length} steps, ${summary.failingSteps.length} with events → ${runDir}`);
 
-  if (!before) return 0;
+  if (!before) return stopped ? 1 : 0;
   const comparison = compareRuns(before, summary);
   writeJson(path.join(runDir, 'comparison.json'), { against: compareWith, ...comparison });
   printComparison(comparison);
-  return comparison.newTypes.length ? 1 : 0;
+  return comparison.newTypes.length || stopped ? 1 : 0;
 }
 
-function markdown(summary: RunSummary, results: StepResult[], videoDeleted?: string): string {
+function markdown(summary: RunSummary, results: StepResult[], warnings: (string | undefined)[]): string {
   const lines = [`# Console loop run ${summary.startedAt}`, '', `Console: ${summary.baseUrl}`, ''];
-  if (videoDeleted) lines.push(`**${videoDeleted}**`, '');
+  for (const warning of warnings) if (warning) lines.push(`**${warning}**`, '');
   for (const r of results) {
     lines.push(`## ${r.index}. ${r.name} — ${r.ok ? 'ok' : 'events'}`, '', `URL: ${r.url}  `, `Screenshot: ${r.screenshot ?? 'none'}`, '');
     for (const e of r.events) lines.push(`- **${e.kind}** ${e.message}${e.body ? `\n  \`${e.body.replace(/\s+/g, ' ').slice(0, 300)}\`` : ''}`);

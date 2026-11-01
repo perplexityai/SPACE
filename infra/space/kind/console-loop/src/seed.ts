@@ -55,6 +55,10 @@ export interface CreatedObject {
   // before any answer. A submitted create with no answer and no sandbox of
   // its name is unresolved, and `clean` keeps it.
   submitted?: boolean;
+  // The status of a 4xx other than 409 the API answered the create with: it
+  // refused the create before admitting it, so the create resolved with
+  // nothing made. (A 409 is an idempotency conflict, which stays unresolved.)
+  rejected?: number;
   // Every create, action and delete operation submitted for it.
   operations?: OperationRef[];
 }
@@ -226,8 +230,18 @@ export async function settleOperations(
 const createdTarget = (entry: CreatedObject | undefined): string | undefined =>
   entry?.operations?.find((op) => op.action === 'create' && op.outcome === 'succeeded' && op.targetId)?.targetId;
 
+// Whether an answer to a create means the API refused it before admitting
+// it: a 4xx other than 409, for example the body extractor's 400, 415 or
+// 422, or a 401, 403 or 429. A 409 is an idempotency conflict: the key was
+// admitted with another body, so the create is not resolved.
+export const rejectedBeforeAdmission = (status: number) => status >= 400 && status < 500 && status !== 409;
+
+// Whether a create has resolved: it was answered with an operation, or
+// rejected before admission.
+const resolved = (entry: CreatedObject | undefined) => !!entry?.rejected || !!entry?.operations?.some((o) => o.action === 'create');
+
 // What a sandbox create submits next. An unanswered create (a key and
-// request recorded, no operation) is resubmitted unchanged, whatever the
+// request recorded, not resolved) is resubmitted unchanged, whatever the
 // current options: the API refuses the same key with another body. Only a
 // create that has resolved, or none, takes a fresh key and the current
 // options.
@@ -235,9 +249,19 @@ export function nextCreate(
   entry: CreatedObject | undefined,
   fresh: () => { idempotencyKey: string; request: { admin: boolean; body: unknown } },
 ): { idempotencyKey: string; request: { admin: boolean; body: unknown }; replay: boolean } {
-  const answered = entry?.operations?.some((o) => o.action === 'create');
-  if (entry?.idempotencyKey && entry.request && !answered) return { idempotencyKey: entry.idempotencyKey, request: entry.request, replay: true };
+  if (entry?.idempotencyKey && entry.request && !resolved(entry)) return { idempotencyKey: entry.idempotencyKey, request: entry.request, replay: true };
   return { ...fresh(), replay: false };
+}
+
+// What `clean` does with a sandbox create it found no sandbox for: replay a
+// seed create that never resolved, drop one that was rejected or never left
+// the browser, keep a browser create that left with no answer as
+// unresolved, and forget one whose create finished (nothing of it is left).
+export function unfoundCreate(entry: CreatedObject): 'replay' | 'rejected' | 'never submitted' | 'unresolved' | 'finished' {
+  if (entry.rejected) return 'rejected';
+  if (entry.operations?.some((o) => o.action === 'create')) return 'finished';
+  if (entry.idempotencyKey && entry.request) return 'replay';
+  return entry.submitted ? 'unresolved' : 'never submitted';
 }
 
 // Org slugs the seed creates and reuses; any other recorded org is one a
@@ -389,13 +413,28 @@ class Seeder {
     if (replay) {
       log(`resubmitting the unanswered create of ${name} unchanged, with its recorded key`);
     } else {
-      // Every earlier operation has finished and its sandbox is gone.
+      // Every earlier operation has finished and its sandbox is gone, or
+      // the earlier create was rejected.
       const pending = this.record({ kind: 'sandbox', name, orgId, idempotencyKey, request });
       pending.id = undefined;
       pending.operations = [];
+      pending.rejected = undefined;
       this.save();
     }
-    const accepted = await submitCreate(this.api, request, idempotencyKey);
+    let accepted: Accepted;
+    try {
+      accepted = await submitCreate(this.api, request, idempotencyKey);
+    } catch (err) {
+      if (err instanceof ApiError && rejectedBeforeAdmission(err.status)) {
+        findCreated(this.state, 'sandbox', name)!.rejected = err.status;
+        this.save();
+        throw new Error(`create ${name} was rejected (${err.status}): ${err.body.slice(0, 200)}; a rerun makes a new create with the current options`);
+      }
+      if (err instanceof ApiError && err.status === 409) {
+        throw new Error(`create ${name} conflicts with an earlier use of its key (409); it stays recorded, and the same request is resubmitted on a rerun: ${err.body.slice(0, 200)}`);
+      }
+      throw err;
+    }
     const surface = request.admin;
     this.record({
       kind: 'sandbox', name, orgId,
@@ -509,7 +548,9 @@ export function orgDisplayName(prefix: string, title: string): string {
 // never left the browser, and `unresolved` for one that left with no answer
 // and no sandbox of its name yet: a create can stay queued, without a
 // sandbox, after the loop is gone.
-async function cleanSandbox(api: Api, entry: CreatedObject, save: () => void): Promise<'deleted' | 'never submitted' | 'unresolved'> {
+type CleanedSandbox = { outcome: 'deleted' | 'never submitted' | 'rejected' | 'unresolved'; why?: string };
+
+async function cleanSandbox(api: Api, entry: CreatedObject, save: () => void): Promise<CleanedSandbox> {
   await settleOperations(readOperation(api), entry, save);
   const ids = new Set<string>();
   if (entry.id) ids.add(publicId(entry.id));
@@ -518,16 +559,28 @@ async function cleanSandbox(api: Api, entry: CreatedObject, save: () => void): P
   if (!ids.size && entry.orgId) {
     for (const found of await findSandboxesByName(api, entry.orgId, entry.name, { deleting: true })) ids.add(publicId(found.id));
   }
-  const answered = entry.operations?.some((o) => o.action === 'create');
-  if (!ids.size && entry.idempotencyKey && entry.request && !answered) {
+  if (!ids.size && unfoundCreate(entry) === 'replay') {
     // A seed create submitted but never answered. A create still queued has
     // no sandbox to find by name, so resubmit it, unchanged, with its key:
     // the API answers with the original operation if the first submit
     // arrived (or creates it now), and either way the sandbox is then
     // deleted.
     log(`resubmitting the unanswered create of ${entry.name} unchanged, with its key, to learn its operation`);
-    const accepted = await submitCreate(api, entry.request, entry.idempotencyKey);
-    addOperation(entry, { id: accepted.operation_id, admin: entry.request.admin, action: 'create' });
+    let accepted: Accepted;
+    try {
+      accepted = await submitCreate(api, entry.request!, entry.idempotencyKey!);
+    } catch (err) {
+      if (err instanceof ApiError && rejectedBeforeAdmission(err.status)) {
+        entry.rejected = err.status;
+        save();
+        return { outcome: 'rejected', why: `${err.status}` };
+      }
+      if (err instanceof ApiError && err.status === 409) {
+        return { outcome: 'unresolved', why: 'its key conflicts with an earlier use (409); the same request is resubmitted next time' };
+      }
+      throw err;
+    }
+    addOperation(entry, { id: accepted.operation_id, admin: entry.request!.admin, action: 'create' });
     if (accepted.sandbox_id) entry.id = publicId(accepted.sandbox_id);
     save();
     await settleOperations(readOperation(api), entry, save);
@@ -535,8 +588,12 @@ async function cleanSandbox(api: Api, entry: CreatedObject, save: () => void): P
     if (id) ids.add(publicId(id));
   }
   if (!ids.size) {
-    if (answered) return 'deleted'; // its create finished, and nothing of it is left
-    return entry.submitted ? 'unresolved' : 'never submitted';
+    switch (unfoundCreate(entry)) {
+      case 'rejected': return { outcome: 'rejected', why: `${entry.rejected}` };
+      case 'unresolved': return { outcome: 'unresolved', why: 'its create left the browser with no answer, and no sandbox has its name yet' };
+      case 'never submitted': return { outcome: 'never submitted' };
+      default: return { outcome: 'deleted' }; // its create finished, and nothing of it is left
+    }
   }
   for (const id of ids) {
     let current = await getSandbox(api, id);
@@ -564,7 +621,7 @@ async function cleanSandbox(api: Api, entry: CreatedObject, save: () => void): P
     }
     if (current && current.status !== 'deleted') throw new Error(`${id} is ${current.status} after its delete`);
   }
-  return 'deleted';
+  return { outcome: 'deleted' };
 }
 
 // Delete what the state recorded: sandboxes, then users and API keys, then
@@ -602,13 +659,15 @@ async function clean(api: Api, config: Config, state: SeedState, { deleteOrgs, f
 
   for (const sandbox of recorded('sandbox')) {
     try {
-      const result = await cleanSandbox(api, sandbox, save);
-      if (result === 'unresolved' && !forgetUnresolved) {
+      const { outcome, why } = await cleanSandbox(api, sandbox, save);
+      if (outcome === 'unresolved' && !forgetUnresolved) {
         unresolved.push(sandbox.name);
-        log(`unresolved: sandbox ${sandbox.name}: its create left the browser with no answer, and no sandbox has its name yet`);
+        log(`unresolved: sandbox ${sandbox.name}: ${why}`);
         continue;
       }
-      log(`${result === 'unresolved' ? 'forgotten (--forget-unresolved)' : result}: sandbox ${sandbox.name}`);
+      const shown = outcome === 'unresolved' ? 'forgotten (--forget-unresolved)'
+        : outcome === 'rejected' ? `dropped, the API rejected its create (${why})` : outcome;
+      log(`${shown}: sandbox ${sandbox.name}`);
       gone.add(sandbox);
     } catch (err) {
       failures.push(`sandbox ${sandbox.name}: ${describe(err)}`);
