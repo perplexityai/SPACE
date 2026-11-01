@@ -1,4 +1,5 @@
-//! `layers.stale_entries` for `[rules.layers]` entries that no longer apply,
+//! `layers.stale_entries` for `[rules.layers]` entries that no longer apply
+//! (those of `[rules.layers.storage]` are [`super::storage`]'s),
 //! and `layers.policy_changed` for every change to `[rules.layers]` from the
 //! base branch's `ARCHITECTURE.toml`, including its removal.
 
@@ -15,9 +16,10 @@ use crate::{
 };
 
 /// `unmoved` entries for crates that are gone or in their layer directory,
-/// `store_users` entries that allow nothing, and `allowed_edges` entries
-/// for edges that don't exist or need no exception. An entry naming a crate
-/// without a layer is left to that crate's `placement` finding.
+/// `legacy` entries for crates that are gone, `store_users` entries that
+/// allow nothing, and `allowed_edges` entries for edges that don't exist or
+/// need no exception. An entry naming a crate without a layer is left to
+/// that crate's `placement` finding.
 pub(super) fn stale_entries(
     ctx: &Context,
     config: &LayersConfig,
@@ -53,6 +55,19 @@ pub(super) fn stale_entries(
             line,
             format!(
                 ": is in [rules.{RULE}] unmoved in {CONFIG_FILE}, but {reason}. Remove the entry."
+            ),
+        ));
+    }
+    for package in config.legacy.iter() {
+        if graph.member(package).is_some() {
+            continue;
+        }
+        findings.push(finding(
+            package,
+            policy.legacy.get(package).copied().or(policy.legacy_line),
+            format!(
+                ": is in [rules.{RULE}] legacy in {CONFIG_FILE}, but no workspace member has \
+                 this name. Remove it."
             ),
         ));
     }
@@ -292,6 +307,41 @@ fn changes(base: Option<&LayersPolicy>, policy: &LayersPolicy) -> Vec<(usize, St
                 }
             }
         }
+    }
+    let storage = format!("[rules.{RULE}.storage]");
+    for (key, old, new) in [
+        ("drivers", &base.storage.drivers, &policy.storage.drivers),
+        ("helpers", &base.storage.helpers, &policy.storage.helpers),
+    ] {
+        for (package, line) in new {
+            if !old.contains_key(package) {
+                changes.push((
+                    *line,
+                    format!(": `{package}` was added to {storage} {key}."),
+                ));
+            }
+        }
+        for package in old.keys().filter(|package| !new.contains_key(*package)) {
+            changes.push((
+                policy.storage.line.unwrap_or(policy.line),
+                format!(": `{package}` was removed from {storage} {key}."),
+            ));
+        }
+    }
+    for (package, line) in &policy.legacy {
+        if !base.legacy.contains_key(package) {
+            changes.push((*line, format!(": `{package}` was added to {table} legacy.")));
+        }
+    }
+    for package in base
+        .legacy
+        .keys()
+        .filter(|package| !policy.legacy.contains_key(*package))
+    {
+        changes.push((
+            policy.legacy_line.unwrap_or(policy.line),
+            format!(": `{package}` was removed from {table} legacy."),
+        ));
     }
     let behaviours: BTreeSet<&String> = base.modes.keys().chain(policy.modes.keys()).collect();
     for behaviour in behaviours {
