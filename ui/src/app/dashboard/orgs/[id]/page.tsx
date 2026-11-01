@@ -65,9 +65,9 @@ export default function OrgDetailPage() {
       .then((rows) => {
         const own = rows.filter((sandbox) => sandbox.resource_type === 'sandbox' && sandbox.org_id === id);
         setSandboxes(own);
-        // Capped by what the API returned: the rows left out above count
-        // against its limit too.
-        setSandboxesCapped(rows.length >= ORG_SANDBOX_LIMIT);
+        // The API's limit counts only database rows, all of which belong to
+        // this org; it appends node-reported rows beyond the limit.
+        setSandboxesCapped(own.length >= ORG_SANDBOX_LIMIT);
       })
       .catch((err: unknown) => setSandboxesError(errorText(err, 'Failed to load sandboxes')));
   };
