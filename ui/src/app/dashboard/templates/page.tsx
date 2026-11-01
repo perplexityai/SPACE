@@ -19,8 +19,12 @@ import {
   TemplateRelease,
   TemplateReleaseWarmPool,
   TemplateOperationResponse,
+  Sandbox,
 } from '@/lib/types';
 import { tablePagination } from '@/lib/table-pagination';
+import { LATEST_TAG as DEFAULT_TEMPLATE_TAG, errorMessage, shortHash } from '@/lib/template-format';
+import { SPACED_SAMPLE_LIMIT, SpacedCounts, spacedCounts as countSpaced, spacedCoverage } from '@/lib/spaced-counts';
+import SystemTemplateRebuild from './system-template-rebuild';
 import {
   markViewRefreshed,
   runLockedViewRefresh,
@@ -41,7 +45,7 @@ import {
 } from '@/components/auto-lifecycle';
 import {
   Table, Button, Form, Input, InputNumber, Select, Typography, Space, Tag, Popconfirm,
-  App, Modal, Switch, Tooltip, theme,
+  App, Modal, Switch, Tooltip, theme, Alert,
 } from 'antd';
 import {
   DeleteOutlined, ReloadOutlined, DownloadOutlined,
@@ -51,7 +55,6 @@ import {
 import type { ColumnsType } from 'antd/es/table';
 
 const { Title, Text } = Typography;
-const DEFAULT_TEMPLATE_TAG = 'latest';
 const TEMPLATES_VIEW_REFRESH_KEY = 'dashboard:templates';
 const REFRESH_CLICK_COOLDOWN_MS = 3000;
 
@@ -204,11 +207,6 @@ function roleColor(role: NodeRole) {
   }
 }
 
-function shortHash(hash: string | null) {
-  if (!hash) return DEFAULT_TEMPLATE_TAG;
-  return hash.replace('sha256:', '').slice(0, 12);
-}
-
 function isDigestTag(tag: string) {
   return tag.startsWith('sha256:') || /^[a-f0-9]{64}$/i.test(tag);
 }
@@ -227,10 +225,6 @@ function visibleTemplateTags(tags: string[], contentHash: string | null) {
 
 function canDeleteVisibleTemplateTag(tag: string) {
   return tag !== DEFAULT_TEMPLATE_TAG && !isDigestTag(tag);
-}
-
-function errorMessage(err: unknown) {
-  return err instanceof Error ? err.message : String(err);
 }
 
 function hasObservedPoolSandboxes(template: Template) {
@@ -497,6 +491,8 @@ export default function TemplatesPage() {
   const [releasesLoaded, setReleasesLoaded] = useState(false);
   const [loadingTemplates, setLoadingTemplates] = useState(true);
   const [loadingInventory, setLoadingInventory] = useState(true);
+  const [spacedCounts, setSpacedCounts] = useState<SpacedCounts | null>(null);
+  const [spacedCountsError, setSpacedCountsError] = useState<string | null>(null);
   const loadingRef = useRef(true);
   const [poolForm] = Form.useForm();
   const [clusterPoolForm] = Form.useForm();
@@ -583,6 +579,21 @@ export default function TemplatesPage() {
       throw new Error('failed to refresh template releases');
     } finally {
       if (showLoading) setLoadingReleases(false);
+    }
+  };
+
+  // The spaced versions of running sandboxes, per template, from the admin
+  // list's newest rows. Read on load and on Refresh only, not on the periodic
+  // refresh: the list is large. A failed read keeps the last counts, with the
+  // error shown.
+  const refreshSpacedCounts = async () => {
+    if (!canAdminTemplates) return;
+    try {
+      const rows = await adminApi.get<Sandbox[]>(`/v1/sandboxes?limit=${SPACED_SAMPLE_LIMIT}`);
+      setSpacedCounts(countSpaced(rows));
+      setSpacedCountsError(null);
+    } catch (err: unknown) {
+      setSpacedCountsError(errorMessage(err));
     }
   };
 
@@ -732,6 +743,7 @@ export default function TemplatesPage() {
   }: RefreshOptions = {}) => {
     await Promise.all([
       refreshTemplateReleases({ showLoading }),
+      refreshSpacedCounts(),
       refreshTemplates({ showLoading, includeBaseSnapshotPolicies }),
       refreshInventory({ showLoading }),
       refreshClusterPools(),
@@ -1994,6 +2006,20 @@ export default function TemplatesPage() {
     ? templateCapableNodes.filter((node) => !pullTemplate.nodes.some((source) => source.node.id === node.id))
     : [];
 
+  // One row per template and reported spaced version.
+  const spacedRows = spacedCounts
+    ? [...spacedCounts.byTemplate.entries()]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .flatMap(([template, versions]) => [...versions.entries()]
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([version, count]) => ({ key: `${template}:${version}`, template, version, count })))
+    : [];
+  const spacedColumns: ColumnsType<(typeof spacedRows)[number]> = [
+    { title: 'Template', dataIndex: 'template', render: (value: string) => <strong>{value}</strong> },
+    { title: 'spaced version', dataIndex: 'version', render: (value: string) => <code>{value}</code> },
+    { title: 'Running sandboxes', dataIndex: 'count', align: 'right' },
+  ];
+
   return (
     <div className="compact-table">
       <style>{`.compact-table .ant-table-cell { padding: 4px 6px !important; } .compact-table .icon-action-btn { padding-left: 6px; padding-right: 6px; } .compact-table .icon-action-btn .anticon { font-size: 18px; }`}</style>
@@ -2043,7 +2069,15 @@ export default function TemplatesPage() {
         } : undefined}
       />
 
-      <Title level={4} style={{ marginTop: 24 }}>Template Releases</Title>
+      {canAdminTemplates ? (
+        <SystemTemplateRebuild
+          releases={templateReleases}
+          refreshReleases={() => refreshTemplateReleases({ showLoading: false })}
+          title={<Title level={4} style={{ margin: 0 }}>Template Releases</Title>}
+        />
+      ) : (
+        <Title level={4} style={{ marginTop: 24 }}>Template Releases</Title>
+      )}
 
       <Table
         columns={releaseColumns}
@@ -2054,6 +2088,33 @@ export default function TemplatesPage() {
         pagination={tablePagination('template releases')}
         scroll={{ x: 1120 }}
       />
+
+      {canAdminTemplates ? (
+        <>
+          <Title level={4} style={{ marginTop: 24 }}>spaced in running sandboxes</Title>
+          <Text type="secondary" style={{ display: 'block', marginBottom: 8 }}>
+            {spacedCounts ? spacedCoverage(spacedCounts, (iso) => new Date(iso).toLocaleString()) : 'Counted from the admin sandbox list.'}
+          </Text>
+          {spacedCountsError ? (
+            <Alert
+              type="warning"
+              showIcon
+              style={{ marginBottom: 8, maxWidth: 720 }}
+              title={`Could not refresh the sandbox list: ${spacedCountsError}${spacedCounts ? '. The counts below are from the previous read.' : ''}`}
+            />
+          ) : null}
+          <Table
+            columns={spacedColumns}
+            dataSource={spacedRows}
+            rowKey="key"
+            size="small"
+            pagination={false}
+            loading={!spacedCounts && !spacedCountsError}
+            locale={{ emptyText: spacedCounts ? 'No running sandboxes among the listed ones' : 'Not loaded' }}
+            style={{ maxWidth: 720 }}
+          />
+        </>
+      ) : null}
 
       <Title level={4} style={{ marginTop: 24 }}>Node Availability</Title>
       <Table
