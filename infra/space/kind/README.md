@@ -257,7 +257,7 @@ either (see [Service identities](#service-identities)).
 
 ## CI smoke partitions
 
-Kind CI produces one Rust artifact image per run and hands it to six isolated
+Kind CI produces one Rust artifact image per run and hands it to eight isolated
 runners. Main builds it from its commit; a PR reuses main's image when its Rust
 inputs are the same (see [Smoke test](#smoke-test)). Each runner boots its own Kind stack, proves the baseline,
 and runs its assigned typed scenarios serially. Cluster-wide fault injection
@@ -273,16 +273,17 @@ successful producer from the same run, with the same source verification. A
 failed producer, expired artifact, or mismatched identity fails closed instead
 of compiling separately on each shard.
 
-Overlap needs runner capacity for the producer and six prepared shards: seven
-concurrent 16-core runners per run, and an eighth on a main push for Main CI's
+Overlap needs runner capacity for the producer and eight prepared shards: nine
+concurrent 16-core runners per run, and a tenth on a main push for Main CI's
 `kind_rust_state` (below). This
 does not add shard jobs or enlarge the cross-run cache, but runners start
 earlier. Verify both producer queue time and main CI completion time after a
 workflow change; shorter setup steps alone do not prove a faster critical path.
 
 `scripts/tests/smoke-kind-typed.sh all INDEX/COUNT` partitions the eligible ECW
-and native inventories independently, after the normal backend, template, and
-quarantine filters. The telemetry and storage credentials mode filters read the
+and native inventories together, after the normal backend, template, and
+quarantine filters: a shard runs its ECW share and then its native share, so
+the two are balanced as one load, and each pass computes the same partition. The telemetry and storage credentials mode filters read the
 bench and run after partitioning, so on a bench in another mode a shard can be
 left with nothing to run; it prints its skips, says so and exits 0. A runner
 that names a mode the bench doesn't run (CI names `otel`) filters nothing, so
@@ -299,8 +300,8 @@ for each API surface across all shards of several successful runs, and take
 each scenario's median. They are scheduling
 hints only: new or renamed scenarios receive a 30-second estimate and still run;
 obsolete hints do not add scenarios. No assertion, timeout, or scenario is removed.
-Six shards shorten the serial critical path but duplicate cluster startup and
-consume six concurrent runners; queue time remains a separate constraint.
+Eight shards shorten the serial critical path but duplicate cluster startup and
+consume eight concurrent runners; queue time remains a separate constraint.
 
 ## Release-build lane
 
@@ -377,7 +378,7 @@ SPACE_KIND_RUST_BUILD=release SPACE_KIND_TELEMETRY_MODE=otel SKIP_BOOTSTRAP=1 \
 
 On demand, `Kind Release-Build CI` (`.github/workflows/kind-release-ci.yml`,
 `workflow_dispatch` only) runs `kind-ci.yml` with `rust_build: release`: its
-producer builds the release image in Docker mode, and the six shards check its
+producer builds the release image in Docker mode, and the eight shards check its
 label and run the baseline and their partitions. No required check depends on
 it and nothing schedules it.
 
@@ -2239,8 +2240,8 @@ published templates.
 ## Smoke test
 
 Kind CI produces the Kind Rust artifact image once per run and hands that exact
-image to six isolated runners. Each runner brings up its own Kind/Firecracker stack,
-runs the baseline smoke, then runs one of six duration-balanced partitions of
+image to eight isolated runners. Each runner brings up its own Kind/Firecracker stack,
+runs the baseline smoke, then runs one of eight duration-balanced partitions of
 the eligible ECW and native inventories. Scenarios remain serial within each
 shard because some mutate cluster-wide state. Every shard must pass for
 `space-ci` to pass.
@@ -2305,13 +2306,13 @@ key inputs, so up to four states (about 0.8 GB each) can exist while a push
 saves. Setting the repository variable `SPACE_KIND_RUST_STATE` to `off` turns
 both the save and the restore off.
 
-To reproduce a shard, use `scripts/tests/smoke-kind-typed.sh all 1/6` (through
-`6/6`) with the same admin-token setup as a full `all` run, on a bench brought
+To reproduce a shard, use `scripts/tests/smoke-kind-typed.sh all 1/8` (through
+`8/8`) with the same admin-token setup as a full `all` run, on a bench brought
 up with `SPACE_KIND_TELEMETRY_MODE=otel` and that variable still set, as CI
 does. With the variable set, a bench in another mode fails any shard holding a
 scenario that declares a telemetry mode, the brownout's included; without it,
 each such shard skips those scenarios and can pass. The direct CLI equivalent
-is `python -m space_smoke run --all --shard 1/6` for the selected API surface.
+is `python -m space_smoke run --all --shard 1/8` for the selected API surface.
 Shards partition the eligible scenarios by duration hint, as described above;
 run every shard from the same checkout. Never run shards concurrently against
 the same cluster. Without a shard argument, the full inventory and its existing
