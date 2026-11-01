@@ -45,7 +45,6 @@ export default function UserDetailPage() {
   const [editOpen, setEditOpen] = useState(false);
   const [passwordOpen, setPasswordOpen] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [editForm] = Form.useForm<EditValues>();
   // Saves answer with the user as that request saw it; a profile save and a
   // role save in flight together could leave the older answer on screen.
   // Each save instead reloads the user, and only the newest reload applies.
@@ -315,40 +314,18 @@ export default function UserDetailPage() {
         />
       </Card>
 
-      <Modal
-        title="Edit user"
-        open={editOpen}
-        okText="Save"
-        confirmLoading={saving}
-        onOk={() => editForm.submit()}
-        onCancel={() => setEditOpen(false)}
-        destroyOnHidden
-      >
-        <Form
-          form={editForm}
-          layout="vertical"
-          preserve={false}
-          // The dialog mounts its form when it opens, so the current values
-          // are initial values; setting fields before that is lost.
-          initialValues={{ display_name: user.display_name, email: user.email }}
-          onFinish={async (values) => {
+      {editOpen ? (
+        <EditUserDialog
+          user={user}
+          emailLocked={emailLocked}
+          saving={saving}
+          onCancel={() => setEditOpen(false)}
+          onSave={async (values) => {
             const body = emailLocked ? { display_name: values.display_name } : { display_name: values.display_name, email: values.email };
             if (await patchUser(body, 'User updated')) setEditOpen(false);
           }}
-        >
-          <Form.Item name="display_name" label="Display name" rules={[{ required: true }]}>
-            <Input autoComplete="off" />
-          </Form.Item>
-          <Form.Item
-            name="email"
-            label="Email"
-            rules={emailLocked ? [] : [{ required: true }, { pattern: LOOSE_EMAIL, message: 'Enter an email address' }]}
-            extra={emailLocked ? 'Your email is how external sign-in identifies you. Changing it here would lock you out, so it cannot be edited from your own page.' : undefined}
-          >
-            <Input autoComplete="off" disabled={emailLocked} />
-          </Form.Item>
-        </Form>
-      </Modal>
+        />
+      ) : null}
 
       <Modal
         title={`Set password for ${user.email}`}
@@ -402,5 +379,40 @@ export default function UserDetailPage() {
         </Form>
       </Modal>
     </div>
+  );
+}
+
+// The edit dialog, mounted only while open, with its own form: a form store
+// kept across opens would hold the previous open's values, which a new
+// mount's initial values do not replace.
+function EditUserDialog({ user, emailLocked, saving, onCancel, onSave }: {
+  user: AdminUser;
+  emailLocked: boolean;
+  saving: boolean;
+  onCancel: () => void;
+  onSave: (values: EditValues) => Promise<void>;
+}) {
+  const [form] = Form.useForm<EditValues>();
+  return (
+    <Modal title="Edit user" open okText="Save" confirmLoading={saving} onOk={() => form.submit()} onCancel={onCancel}>
+      <Form
+        form={form}
+        layout="vertical"
+        initialValues={{ display_name: user.display_name, email: user.email }}
+        onFinish={onSave}
+      >
+        <Form.Item name="display_name" label="Display name" rules={[{ required: true }]}>
+          <Input autoComplete="off" />
+        </Form.Item>
+        <Form.Item
+          name="email"
+          label="Email"
+          rules={emailLocked ? [] : [{ required: true }, { pattern: LOOSE_EMAIL, message: 'Enter an email address' }]}
+          extra={emailLocked ? 'Your email is how external sign-in identifies you. Changing it here would lock you out, so it cannot be edited from your own page.' : undefined}
+        >
+          <Input autoComplete="off" disabled={emailLocked} />
+        </Form.Item>
+      </Form>
+    </Modal>
   );
 }
