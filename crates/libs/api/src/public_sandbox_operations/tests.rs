@@ -800,6 +800,37 @@ fn cluster_admission_429_is_marked_backpressure() {
     );
 }
 
+/// Each activation-admission refusal requeues the create the way its kind
+/// says: only the shared bucket is backpressure, and the capacity refusals
+/// spend the transient-error budget. The hint is the admission's own.
+#[test]
+fn activation_rejection_kinds_requeue_as_their_kind_says() {
+    use crate::controllers::substrate::ActivationRejectionKind;
+    let op = claimed_create_operation();
+    let hint = std::time::Duration::from_secs(4);
+    for (kind, reason) in [
+        (
+            ActivationRejectionKind::RateLimited,
+            PublicOperationRequeueReason::ActivationBackpressure,
+        ),
+        (
+            ActivationRejectionKind::EmptyCluster,
+            PublicOperationRequeueReason::TransientFailure,
+        ),
+        (
+            ActivationRejectionKind::NoFreeSlot,
+            PublicOperationRequeueReason::TransientFailure,
+        ),
+    ] {
+        let result = controller_error_result(
+            &op,
+            kind.controller_error("refused".to_string(), Some(hint)),
+        );
+        assert_eq!(result.requeue_reason, reason, "{kind:?}");
+        assert_eq!(result.retry_after, Some(hint), "{kind:?}");
+    }
+}
+
 #[test]
 fn controller_create_request_uses_public_contract_defaults() {
     let controller = controller_create_request(public_create_request(), None);

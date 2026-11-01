@@ -73,6 +73,7 @@ pub(crate) fn enabled_config() -> ClusterSandboxAdmissionConfig {
         refill_rps: 6.0,
         burst: 60.0,
         redis_url: None,
+        slot_check_enabled: false,
     }
 }
 

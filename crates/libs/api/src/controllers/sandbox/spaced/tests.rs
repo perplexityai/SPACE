@@ -296,3 +296,33 @@ fn a_kept_connection_is_retired_after_a_timeout_or_transport_close_only() {
         assert!(!should_retire_kept_connection(&status), "{status:?}");
     }
 }
+
+/// The control fallback passes every admission refusal through, matched on
+/// its marker rather than its status, and still falls back for a plain
+/// unreachable-runtime error.
+#[test]
+fn the_control_fallback_passes_admission_refusals_through() {
+    use crate::controllers::substrate::ActivationRejectionKind;
+    for kind in [
+        ActivationRejectionKind::RateLimited,
+        ActivationRejectionKind::EmptyCluster,
+        ActivationRejectionKind::NoFreeSlot,
+    ] {
+        let refusal = kind.controller_error("refused".to_string(), None);
+        assert_eq!(refusal.activation_rejection(), Some(kind));
+        assert!(control_fallback_passes_through(&refusal), "{kind:?}");
+    }
+    let no_free_slot = ActivationRejectionKind::NoFreeSlot.controller_error(
+        "refused".to_string(),
+        Some(std::time::Duration::from_secs(2)),
+    );
+    assert_eq!(no_free_slot.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(control_fallback_passes_through(&no_free_slot));
+
+    let unreachable =
+        ControllerError::service_unavailable("sandbox runtime is not currently reachable");
+    assert!(!control_fallback_passes_through(&unreachable));
+    assert!(control_fallback_passes_through(
+        &ControllerError::rate_limited("a 429 from elsewhere")
+    ));
+}

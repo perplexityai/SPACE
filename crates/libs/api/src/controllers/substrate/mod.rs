@@ -87,6 +87,7 @@ mod pool_claims;
 mod recovery_charge;
 pub mod runtime_upgrade;
 mod sandbox_state_probe;
+mod slot_headroom;
 
 pub use execution_fence::*;
 pub use local_artifact::*;
@@ -94,6 +95,7 @@ pub use node_api_client::*;
 pub use pool_claims::*;
 pub use recovery_charge::*;
 pub use sandbox_state_probe::*;
+pub use slot_headroom::*;
 
 /// Outcome of a non-recovering guest command-readiness probe.
 ///
@@ -564,6 +566,16 @@ impl std::fmt::Display for WaitReadyTimeoutPhase {
 pub enum SubstrateError {
     #[error("{message}")]
     Unavailable { message: String },
+    /// kube-scheduler marked the sandbox pod `Unschedulable`: no node it may
+    /// use can take it, usually because their network slots are full. Raised
+    /// where the substrate reads that verdict off a pod. Code that handles a
+    /// failed pod read treats it like [`Self::Unavailable`]; the transport
+    /// classifiers (node-client eviction, node-mgr reachability) leave it out,
+    /// since no connection failed. Its HTTP answer carries the same jittered
+    /// `Retry-After` as the limiter's capacity refusals, except where a create
+    /// rolls back and strips every retry hint from its error.
+    #[error("{message}")]
+    Unschedulable { message: String },
     #[error("{message}")]
     Conflict { message: String },
     #[error("{message}")]
@@ -630,10 +642,9 @@ pub enum SubstrateError {
     AdmissionRejected {
         message: String,
         retry_after: Option<Duration>,
-        /// Rate-limit rejections carry the admission cause the async
-        /// dispatcher treats as indefinite backpressure; empty-cluster
-        /// rejections get a bounded retry instead.
-        rate_limited: bool,
+        /// Decides the status and whether the async dispatcher waits it out
+        /// as backpressure or retries it against a bounded budget.
+        kind: ActivationRejectionKind,
     },
     #[error("{message}")]
     Cancelled { message: String },
@@ -864,6 +875,12 @@ impl From<SubstrateError> for ControllerError {
             SubstrateError::Unavailable { message } => {
                 ControllerError::service_unavailable(message)
             }
+            // Slots free as sandboxes stop, which nothing here can predict, so
+            // this spreads the retries rather than sizing the wait.
+            SubstrateError::Unschedulable { message } => {
+                ControllerError::service_unavailable(message)
+                    .with_retry_after_header(crate::cluster_admission::capacity_retry_after())
+            }
             SubstrateError::Conflict { message } => {
                 ControllerError::new(axum::http::StatusCode::CONFLICT, message)
             }
@@ -931,19 +948,8 @@ impl From<SubstrateError> for ControllerError {
             SubstrateError::AdmissionRejected {
                 message,
                 retry_after,
-                rate_limited,
-            } => {
-                let mut error = ControllerError::rate_limited(message);
-                if let Some(retry_after) = retry_after {
-                    error = error.with_retry_after_header(retry_after);
-                }
-                if rate_limited {
-                    error = error.with_retry_after_cause(
-                        ControllerRetryAfterCause::ClusterActivationAdmission,
-                    );
-                }
-                error
-            }
+                kind,
+            } => kind.controller_error(message, retry_after),
             SubstrateError::Cancelled { message } => ControllerError::service_unavailable(message),
             SubstrateError::Unsupported { message } => {
                 ControllerError::new(axum::http::StatusCode::NOT_IMPLEMENTED, message)
@@ -1932,6 +1938,18 @@ impl Substrate {
             Inner::Direct(substrate) => Ok(Some(substrate.eligible_start_node_count().await?)),
             #[cfg(feature = "kubernetes")]
             Inner::Kubernetes(substrate) => Ok(substrate.eligible_start_node_count()),
+        }
+    }
+
+    /// Whether any node [`Self::eligible_start_node_count`] counts has a free
+    /// network slot. A cache read: it makes no apiserver or database call.
+    pub fn network_slot_headroom(&self) -> NetworkSlotHeadroom {
+        match &self.inner {
+            Inner::Direct(_) => {
+                NetworkSlotHeadroom::Unknown(NetworkSlotHeadroomUnknown::Unsupported)
+            }
+            #[cfg(feature = "kubernetes")]
+            Inner::Kubernetes(substrate) => substrate.network_slot_headroom(),
         }
     }
 

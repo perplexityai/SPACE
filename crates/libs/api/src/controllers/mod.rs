@@ -42,6 +42,12 @@ pub struct ControllerError {
     /// The guest reported the requested path missing, as its status said
     /// (`pplx_space_common_grpc::is_guest_path_not_found`).
     guest_path_not_found: bool,
+    /// Activation admission refused this request, and why. Set only by
+    /// [`substrate::ActivationRejectionKind::controller_error`], so a caller
+    /// with a fallback can tell an admission refusal from a failed call
+    /// whatever its status, and pass it through instead of retrying under a
+    /// weaker charge.
+    activation_rejection: Option<substrate::ActivationRejectionKind>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,7 +130,23 @@ impl ControllerError {
             retry_after_cause: None,
             refused_before_start: false,
             guest_path_not_found: false,
+            activation_rejection: None,
         }
+    }
+
+    /// Mark this error as an activation admission refusal of `kind`. Leaves
+    /// the status and every retry hint as they are.
+    pub(crate) fn with_activation_rejection(
+        mut self,
+        kind: substrate::ActivationRejectionKind,
+    ) -> Self {
+        self.activation_rejection = Some(kind);
+        self
+    }
+
+    /// The activation admission refusal this error carries, if it is one.
+    pub(crate) fn activation_rejection(&self) -> Option<substrate::ActivationRejectionKind> {
+        self.activation_rejection
     }
 
     /// Whether the backend said it refused this request before doing any of

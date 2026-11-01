@@ -219,7 +219,7 @@ impl KubernetesSubstrate {
             };
 
             if let Some(message) = pod.unschedulable_message() {
-                return Err(SubstrateError::Unavailable {
+                return Err(SubstrateError::Unschedulable {
                     message: format!("sandbox pod is unschedulable: {message}"),
                 });
             }

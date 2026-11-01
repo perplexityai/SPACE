@@ -558,7 +558,7 @@ fn reconnect_error_outcome(
             ReconnectTerminalPhase::Api,
             ReconnectReason::WaitBudget,
         ),
-        SubstrateError::Unavailable { .. } => (
+        SubstrateError::Unavailable { .. } | SubstrateError::Unschedulable { .. } => (
             ReconnectOutcome::WakeFailed,
             initial_lifecycle_terminal_phase(initial_lifecycle),
             ReconnectReason::Unavailable,

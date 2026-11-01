@@ -1,4 +1,5 @@
 use super::*;
+use crate::controllers::substrate::ActivationRejectionKind;
 
 type ReconnectTagTuple = (
     &'static str,
@@ -250,11 +251,16 @@ fn reconnect_tags_classify_deferred_restore_admission_rejection() {
     // direct-wake admission 429 (exhausted/wait_budget), not the generic
     // `rejected/unavailable`, so restore-path and direct-wake admission
     // rejections don't split across two outcome/reason series.
-    for rate_limited in [true, false] {
+    // The substrate's charges never run the slot check, so `NoFreeSlot`
+    // can't arrive this way.
+    for kind in [
+        ActivationRejectionKind::RateLimited,
+        ActivationRejectionKind::EmptyCluster,
+    ] {
         let err = SubstrateError::AdmissionRejected {
             message: "cluster activation admission rejected".to_string(),
             retry_after: Some(std::time::Duration::from_secs(1)),
-            rate_limited,
+            kind,
         };
         let (outcome, terminal_phase, reason) = reconnect_error_outcome("suspended", &err);
         assert_eq!(
@@ -300,7 +306,7 @@ fn reconnect_tags_classify_a_lost_database_lock_race() {
     let admission = SubstrateError::AdmissionRejected {
         message: "cluster activation admission rejected".to_string(),
         retry_after: Some(std::time::Duration::from_secs(1)),
-        rate_limited: true,
+        kind: ActivationRejectionKind::RateLimited,
     };
     let (admission_outcome, _, admission_reason) = reconnect_error_outcome("suspended", &admission);
     assert_eq!(admission_outcome.as_str(), outcome.as_str());

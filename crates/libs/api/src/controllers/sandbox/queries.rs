@@ -1412,8 +1412,8 @@ impl SandboxController {
         )
         .await?;
 
-        self.admit_cluster_activation(crate::cluster_admission::ClusterActivationClass::Cold)
-            .await?;
+        // A warm-pool hit returned above, so this create builds a new pod.
+        self.admit_cluster_cold_create().await?;
 
         // Store the resolved hash as the sandbox's immutable build pin; wake and restore
         // keep using it even if a tag moves later.

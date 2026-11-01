@@ -139,6 +139,32 @@ pub(in crate::controllers::substrate::kubernetes) fn network_slot_capacity_prefl
     }
 }
 
+/// Headroom over nodes the caller already filtered to the start-eligible set.
+///
+/// A node that doesn't advertise the slot resource, or advertises none, adds
+/// no headroom: every sandbox pod requests one slot, so kube-scheduler can't
+/// place one there. Such a node is still reported, because it usually means
+/// node-ctl isn't advertising the node-manager's slot capacity on the Node,
+/// which the metric should show
+/// whether or not the cluster is full.
+pub(in crate::controllers::substrate::kubernetes) fn network_slot_headroom(
+    eligible_nodes: &[std::sync::Arc<Node>],
+    network_slots: &NodeNetworkSlots,
+) -> crate::controllers::substrate::NetworkSlotHeadroom {
+    use crate::controllers::substrate::NetworkSlotHeadroom;
+    let slotless_nodes = eligible_nodes
+        .iter()
+        .any(|node| node_network_slot_capacity(node).is_none());
+    if eligible_nodes
+        .iter()
+        .any(|node| node_network_slot_available(node, network_slots))
+    {
+        NetworkSlotHeadroom::Available { slotless_nodes }
+    } else {
+        NetworkSlotHeadroom::Full { slotless_nodes }
+    }
+}
+
 impl KubernetesSubstrate {
     /// Resolve the node a slow-create pod can be preserved on, or `None` if it
     /// isn't usefully preservable. Used by the slow-create preserve path to

@@ -26,7 +26,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::controllers::substrate::{
     ActivationAdmission, ActivationAdmissionClass, ActivationAdmissionFuture,
-    ActivationAdmissionRejection, GATEWAY_RETRY_AFTER, Substrate,
+    ActivationAdmissionRejection, ActivationRejectionKind, GATEWAY_RETRY_AFTER,
+    NetworkSlotHeadroom, Substrate,
 };
 
 mod redis_bucket;
@@ -42,6 +43,8 @@ const DEFAULT_REFILL_RPS: f64 = 60.0;
 const DEFAULT_BURST: f64 = 60.0;
 const DEFAULT_ENABLED: bool = true;
 const ENABLED_ENV: &str = "SPACE_CLUSTER_ACTIVATION_ADMISSION_ENABLED";
+const DEFAULT_SLOT_CHECK_ENABLED: bool = false;
+const SLOT_CHECK_ENABLED_ENV: &str = "SPACE_CLUSTER_ACTIVATION_ADMISSION_SLOT_CHECK_ENABLED";
 /// Test-only: smoke runs shrink the bucket so a short probe can drain it.
 const BURST_ENV: &str = "SPACE_CLUSTER_ACTIVATION_ADMISSION_BURST";
 const REFILL_RPS_ENV: &str = "SPACE_CLUSTER_ACTIVATION_ADMISSION_REFILL_RPS";
@@ -170,6 +173,10 @@ pub struct ClusterSandboxAdmissionConfig {
     /// `with_config` is a complete, testable interface; the process-env read
     /// lives only in [`Self::from_env`].
     pub redis_url: Option<String>,
+    /// Refuse an activation with a 503 when no start-eligible node has a free
+    /// network slot. Off by default, and independent of `enabled`: it runs
+    /// with the limiter off too.
+    pub slot_check_enabled: bool,
 }
 
 impl Default for ClusterSandboxAdmissionConfig {
@@ -179,6 +186,7 @@ impl Default for ClusterSandboxAdmissionConfig {
             refill_rps: DEFAULT_REFILL_RPS,
             burst: DEFAULT_BURST,
             redis_url: None,
+            slot_check_enabled: DEFAULT_SLOT_CHECK_ENABLED,
         }
     }
 }
@@ -197,6 +205,7 @@ impl ClusterSandboxAdmissionConfig {
                 .ok()
                 .map(|url| url.trim().to_string())
                 .filter(|url| !url.is_empty()),
+            slot_check_enabled: env_flag_var(SLOT_CHECK_ENABLED_ENV, defaults.slot_check_enabled),
         }
     }
 }
@@ -221,36 +230,38 @@ impl ClusterActivationClass {
 /// open inside [`ClusterSandboxAdmission::admit_activation`] and never reaches a
 /// caller — the limiter is a guardrail, not a create-path SPOF.
 ///
-/// The two rejection reasons are **kept distinct** because the async dispatcher
-/// must treat them differently: [`Self::RateLimited`] (full token bucket) is
-/// transient backpressure that should re-queue indefinitely behind the limiter,
-/// but [`Self::EmptyCluster`] (a confident zero eligible nodes) is a durable
-/// capacity outage that must re-queue against the bounded transient-error budget
+/// The [`ActivationRejectionKind`] decides how a caller is answered and how the
+/// async dispatcher retries: a full token bucket is transient backpressure that
+/// re-queues indefinitely behind the limiter, while an empty or full cluster is
+/// a capacity outage that re-queues against the bounded transient-error budget,
 /// so a full-cluster incident eventually terminates the create rather than
 /// re-queuing forever.
 #[derive(Debug, thiserror::Error)]
-pub enum ClusterAdmissionError {
-    /// The shared token bucket is empty — wait behind the limiter (backpressure).
-    #[error("{message}")]
-    RateLimited {
-        message: String,
-        retry_after: Duration,
-    },
-    /// No eligible start-capable nodes — bounded retry, not indefinite backpressure.
-    #[error("{message}")]
-    EmptyCluster {
-        message: String,
-        retry_after: Duration,
-    },
+#[error("{message}")]
+pub struct ClusterAdmissionError {
+    kind: ActivationRejectionKind,
+    message: String,
+    retry_after: Duration,
 }
 
 impl ClusterAdmissionError {
-    pub fn retry_after(&self) -> Option<Duration> {
-        match self {
-            Self::RateLimited { retry_after, .. } | Self::EmptyCluster { retry_after, .. } => {
-                Some(*retry_after)
-            }
-        }
+    pub fn kind(&self) -> ActivationRejectionKind {
+        self.kind
+    }
+
+    pub fn retry_after(&self) -> Duration {
+        self.retry_after
+    }
+}
+
+impl From<ClusterAdmissionError> for crate::controllers::ControllerError {
+    fn from(error: ClusterAdmissionError) -> Self {
+        let ClusterAdmissionError {
+            kind,
+            message,
+            retry_after,
+        } = error;
+        kind.controller_error(message, Some(retry_after))
     }
 }
 
@@ -324,14 +335,40 @@ impl ClusterSandboxAdmission {
 
     /// Consume one activation token from the shared cluster bucket.
     ///
-    /// Rejects with [`ClusterAdmissionError::EmptyCluster`] when the cluster has
-    /// no start-capable nodes, or [`ClusterAdmissionError::RateLimited`] when the
-    /// shared bucket is empty. On any Redis error the limiter fails open: the
-    /// activation is admitted and a `store_unavailable` decision metric is
+    /// Rejects as [`ActivationRejectionKind::EmptyCluster`] when the cluster has
+    /// no start-capable nodes, or [`ActivationRejectionKind::RateLimited`] when
+    /// the shared bucket is empty. On any Redis error the limiter fails open:
+    /// the activation is admitted and a `store_unavailable` decision metric is
     /// emitted rather than returning an error.
+    ///
+    /// Never runs the slot check: an activation charged through here may reuse
+    /// a pod an earlier owner created, or be bound to one node with
+    /// `spec.nodeName`, and a cluster-wide count can't tell either from a full
+    /// cluster. See [`Self::admit_cold_create`].
     pub async fn admit_activation(
         &self,
         class: ClusterActivationClass,
+    ) -> Result<(), ClusterAdmissionError> {
+        self.admit_with_slot_check(class, false).await
+    }
+
+    /// [`Self::admit_activation`] for a cold create, after its warm-pool
+    /// attempt missed or when it skips the pool (a node-pool or fork-restore
+    /// create): the one activation that always builds a new pod kube-scheduler
+    /// places. A start of a `stopped` sandbox may be bound to the node its
+    /// disk is on, and a `created` one may already have a pod, so neither
+    /// comes here. With the slot check on, it also rejects as
+    /// [`ActivationRejectionKind::NoFreeSlot`] when no start-eligible node has a
+    /// free network slot.
+    pub async fn admit_cold_create(&self) -> Result<(), ClusterAdmissionError> {
+        self.admit_with_slot_check(ClusterActivationClass::Cold, true)
+            .await
+    }
+
+    async fn admit_with_slot_check(
+        &self,
+        class: ClusterActivationClass,
+        slot_check: bool,
     ) -> Result<(), ClusterAdmissionError> {
         // `false` means admission is disabled or a capacity probe failed —
         // already metered inside `prepare_activation_admission`, which admits
@@ -341,6 +378,7 @@ impl ClusterSandboxAdmission {
             &self.config,
             self.admission_enabled(),
             class,
+            slot_check && self.config.slot_check_enabled,
         )
         .await?
         {
@@ -386,7 +424,8 @@ impl ClusterSandboxAdmission {
                     AdmissionRejectReason::RateLimited,
                     Some(remaining),
                 );
-                Err(ClusterAdmissionError::RateLimited {
+                Err(ClusterAdmissionError {
+                    kind: ActivationRejectionKind::RateLimited,
                     // Server-wide throttle, worded so a client can tell it apart
                     // from the per-client concurrency limit: this one is not
                     // caused by (nor fixable by) the client's own request rate.
@@ -422,14 +461,15 @@ impl ActivationAdmission for ClusterSandboxAdmission {
             ActivationAdmissionClass::Restore => ClusterActivationClass::Restore,
         };
         Box::pin(async move {
-            self.admit_activation(class).await.map_err(|error| {
-                let rate_limited = matches!(&error, ClusterAdmissionError::RateLimited { .. });
-                ActivationAdmissionRejection::new(
-                    error.to_string(),
-                    error.retry_after(),
-                    rate_limited,
-                )
-            })
+            self.admit_with_slot_check(class, false)
+                .await
+                .map_err(|error| {
+                    ActivationAdmissionRejection::new(
+                        error.to_string(),
+                        Some(error.retry_after()),
+                        error.kind(),
+                    )
+                })
         })
     }
 }
@@ -458,31 +498,55 @@ fn build_bucket(url: Option<&str>) -> Option<RedisTokenBucket> {
 ///
 /// Returns `Ok(true)` when the caller should consume a token from the shared
 /// bucket, and `Ok(false)` when the activation is admitted open without the
-/// bucket (disabled, or a fail-open capacity-probe error) — the fail-open
-/// decision metric is already emitted here in that case. Returns
-/// `Err(EmptyCluster)` only on a confident empty cluster.
+/// bucket (limiter disabled, or a fail-open capacity-probe error) — the
+/// fail-open decision metric is already emitted here in that case. Returns
+/// an `EmptyCluster` rejection only on a confident empty cluster, and a
+/// `NoFreeSlot` one only on a confident full one.
+///
+/// The limiter's own gates, the empty-cluster guard (which reads its refill
+/// rate) and the bucket, run only while it's `enabled`. The slot check runs on
+/// its own switch, so it still applies with the limiter off or after a failed
+/// node-count probe; those fail open only the limiter's gates.
 async fn prepare_activation_admission(
     substrate: &Substrate,
     config: &ClusterSandboxAdmissionConfig,
     enabled: bool,
     class: ClusterActivationClass,
+    slot_check: bool,
 ) -> Result<bool, ClusterAdmissionError> {
-    if !enabled {
-        emit_decision(
-            class,
-            AdmissionDecision::Accepted,
-            AdmissionRejectReason::Disabled,
-            None,
-        );
-        return Ok(false);
+    let fail_open = if enabled {
+        limiter_gates(substrate, config, class).await?
+    } else {
+        Some(AdmissionRejectReason::Disabled)
+    };
+
+    if slot_check {
+        check_network_slot_headroom(substrate, class)?;
     }
 
+    // Metered after the slot check, so a refusal there isn't also counted as
+    // an admission.
+    if let Some(reason) = fail_open {
+        emit_decision(class, AdmissionDecision::Accepted, reason, None);
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// The empty-cluster guard, which only an enabled limiter runs. Returns the
+/// fail-open reason when the node-count probe failed, so the caller skips the
+/// bucket, and `None` when the guard passed.
+async fn limiter_gates(
+    substrate: &Substrate,
+    config: &ClusterSandboxAdmissionConfig,
+    class: ClusterActivationClass,
+) -> Result<Option<AdmissionRejectReason>, ClusterAdmissionError> {
     let eligible_nodes = match substrate.eligible_start_node_count().await {
         Ok(eligible_nodes) => eligible_nodes,
         Err(error) => {
             // Fail open on a capacity-probe failure: the limiter must never be a
             // single point of failure on the create path, so a transient
-            // substrate/DB error admits the activation (bypassing the bucket)
+            // substrate/DB error skips the empty-cluster guard and the bucket
             // rather than surfacing as a hard error that rejects the create.
             // Distinct fail-open reason from `store_unavailable` (Redis) so it
             // can be alerted on separately.
@@ -491,13 +555,7 @@ async fn prepare_activation_admission(
                 operation_class = %class.metric_class(),
                 "cluster activation admission capacity probe failed; admitting (fail open)"
             );
-            emit_decision(
-                class,
-                AdmissionDecision::Accepted,
-                AdmissionRejectReason::CapacityUnavailable,
-                None,
-            );
-            return Ok(false);
+            return Ok(Some(AdmissionRejectReason::CapacityUnavailable));
         }
     };
     // Emit the outcome-independent gauges exactly once, here, so the bucket-path
@@ -514,7 +572,8 @@ async fn prepare_activation_admission(
             AdmissionRejectReason::EmptyCluster,
             None,
         );
-        return Err(ClusterAdmissionError::EmptyCluster {
+        return Err(ClusterAdmissionError {
+            kind: ActivationRejectionKind::EmptyCluster,
             message: "Server capacity limit: no eligible sandbox activation nodes are \
                       available. Not specific to your client — retry with backoff."
                 .to_string(),
@@ -536,9 +595,8 @@ async fn prepare_activation_admission(
             //
             // The cost this accepts: an empty-cluster requeue *counts* against
             // the dispatcher's attempt budget. A rate-limited one does not,
-            // because `cluster_admission_controller_error` in
-            // `controllers::sandbox::lifecycle` attaches
-            // `ClusterActivationAdmission` to that variant and deliberately
+            // because `ActivationRejectionKind::controller_error` attaches
+            // `ClusterActivationAdmission` to that kind and deliberately
             // omits it here — this path is a bounded retry, not indefinite
             // backpressure. The budget is a count — 16 attempts by
             // default — not a deadline, so pacing them 1–5s apart instead of 1s
@@ -550,11 +608,50 @@ async fn prepare_activation_admission(
             // condition that may clear on its own, and it buys no execution
             // slot: releasing with a hint clears the claim, so the operation
             // waits unclaimed.
-            retry_after: jittered_retry_after(RETRY_AFTER_FLOOR),
+            retry_after: capacity_retry_after(),
         });
     }
 
-    Ok(true)
+    Ok(None)
+}
+
+/// The slot check: refuse with `NoFreeSlot` when no start-eligible node has a
+/// free network slot, counting a node that advertises none as full, and admit
+/// when either cache is cold. Only
+/// [`ClusterSandboxAdmission::admit_cold_create`] runs it.
+///
+/// Runs after the empty-cluster guard, so while the limiter is on a cluster
+/// with no eligible node keeps answering `empty_cluster`; with it off, no free
+/// slot is found and this answers `no_free_slot`. Runs before the bucket, so a
+/// refusal spends no token. An unreadable headroom only books its reason: the decision counter is
+/// written once per activation, by whichever gate decides it.
+fn check_network_slot_headroom(
+    substrate: &Substrate,
+    class: ClusterActivationClass,
+) -> Result<(), ClusterAdmissionError> {
+    let headroom = substrate.network_slot_headroom();
+    pplx_space_metrics::sandbox::admission::cluster_slot_headroom(
+        class.metric_class(),
+        headroom.metric(),
+    );
+    if !matches!(headroom, NetworkSlotHeadroom::Full { .. }) {
+        return Ok(());
+    }
+    emit_decision(
+        class,
+        AdmissionDecision::Rejected,
+        AdmissionRejectReason::NoFreeSlot,
+        None,
+    );
+    Err(ClusterAdmissionError {
+        kind: ActivationRejectionKind::NoFreeSlot,
+        message: "Server capacity limit: no eligible sandbox node has a free sandbox \
+                  slot. Not specific to your client — retry with backoff."
+            .to_string(),
+        // No duration signal here either: slots free as sandboxes stop, which
+        // the server can't predict. Same window as the empty-cluster guard.
+        retry_after: capacity_retry_after(),
+    })
 }
 
 /// The `Retry-After` hint for a bucket rejection, paced by the configured refill
@@ -570,6 +667,14 @@ fn rate_limited_retry_after(remaining: f64, refill_rps: f64) -> Duration {
     // Every activation requests exactly one token, so the deficit is whatever
     // fraction of that token the bucket is short.
     jittered_retry_after(earliest_refill(1.0 - remaining, refill_rps))
+}
+
+/// The `Retry-After` for a capacity refusal, which carries no signal about how
+/// long it lasts: the header floor plus whole-second jitter, 1 to 5 seconds.
+/// The empty-cluster and no-free-slot refusals use it, and so does a sandbox
+/// pod the scheduler found no node for.
+pub(crate) fn capacity_retry_after() -> Duration {
+    jittered_retry_after(RETRY_AFTER_FLOOR)
 }
 
 /// Sample the `Retry-After` hint for one shed activation: `earliest` — the first
@@ -715,5 +820,6 @@ fn sanitize_config(config: ClusterSandboxAdmissionConfig) -> ClusterSandboxAdmis
             .map(|burst| burst.max(1.0))
             .unwrap_or(defaults.burst),
         redis_url: config.redis_url,
+        slot_check_enabled: config.slot_check_enabled,
     }
 }
