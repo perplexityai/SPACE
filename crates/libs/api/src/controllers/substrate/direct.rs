@@ -30,7 +30,16 @@
 //!   ([`super::ActivationClientAttribution`], read in
 //!   `Substrate::from_env_with_lifecycle`), a create records its activating
 //!   client in `sandboxes.activating_client_id` when it inserts the row. Off,
-//!   the default, nothing records it.
+//!   the default, nothing records it. Because the worker creates each later
+//!   runtime, Direct also writes the record from its receipts, in the
+//!   transaction that commits the route identity: an owned restore, a
+//!   resident start charged here or upstream, and a wake whose transition
+//!   started or restored the VM. A reconnect, an adoption of a record still
+//!   running, an exempt start, a rollback, a refused receipt, a start or wake
+//!   through a worker from before route-identity receipts (it returns none)
+//!   and an inheriting activation that found no record leave it as it was. An
+//!   owned restore through such a worker still writes, with the identity the
+//!   API supplied.
 //! - Custom vCPU or memory uses separate create and start calls: only
 //!   `StartRequest` carries those fields. A readiness wait still blocks on
 //!   start. Default shapes and disk-only overrides can use one-shot create,
@@ -53,7 +62,6 @@
 //! | Stopped-disk backup on retire | `retire_execution` enqueues none; the stopped disk stays on the node (see below) | ac-pplx | A retried Direct retire (next row), then the enqueue |
 //! | Retire retry | Nothing retries a failed Direct retire (see below) | ac-pplx | The sweeper's failed-cleanup retry running for both substrates |
 //! | Drain and evacuation | [`SubstrateCapabilities::supports_node_drain`] is false. Admin `:drain`, `:terminate`, `:cordon`, `:uncordon` and `:force-upload-local-snapshots` return 501 before reading or writing the node. `:undrain` clears a `draining` or `drained` phase an earlier drain left, without a substrate call | ac-pplx | Core drain and evacuation for both substrates over a Direct `set_node_schedulability` |
-//! | Activation attribution | Only a create records the activating client; a later start, restore or wake doesn't re-attribute `sandboxes.activating_client_id`, so it keeps the creating client | the-gigi-pplx | Recording the activating client on Direct's start and restore receipts |
 //! | Drain, orphan, failed-row repair and node-sync loops | Not started on Direct (below) | ac-pplx | Those loops running for both substrates through the adapter |
 //!
 //! # Kubernetes-only reconcilers
@@ -105,8 +113,11 @@ use super::{
     node_api_endpoint, substrate_db_error,
 };
 use crate::controllers::auto_lifecycle::policy_to_proto;
+use crate::controllers::substrate::{ChargeState, KeyResolution, RecoveryCharge};
 use crate::controllers::{ControllerError, db_contention_error};
 use crate::models::Sandbox;
+use pplx_space_common_core::types::ClientId;
+use pplx_space_sandbox_store::attribute_runtime::set_activating_client;
 
 fn network_policy_to_proto(policy: &NetworkPolicyV1) -> NetworkPolicyProto {
     NetworkPolicyProto::from(policy)
@@ -659,10 +670,72 @@ fn wake_lifecycle_allows_restore_fallback(lifecycle: &str) -> bool {
 
 fn wake_response_requires_activation_identity(response: &WakeResponse) -> bool {
     response.route_identity.is_none()
-        && matches!(
-            WakeTransition::try_from(response.transition),
-            Ok(WakeTransition::Restore | WakeTransition::Start)
-        )
+        && WakeTransition::try_from(response.transition).is_ok_and(wake_transition_activates)
+}
+
+/// Whether a committed receipt writes the record
+/// (`sandboxes.activating_client_id`). The record follows the runtime, so only
+/// a receipt for a node response that started or restored a VM writes it, with
+/// the client id the activation resolved to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReceiptRecord<'a> {
+    /// The response created no runtime, or the activation has nothing of its
+    /// own to record: an inheriting activation that found the record `NULL`,
+    /// or one that never resolved it.
+    Unchanged,
+    /// Set the record to this client id.
+    Write(&'a ClientId),
+}
+
+impl<'a> ReceiptRecord<'a> {
+    /// The record a runtime this activation created carries.
+    fn for_runtime(charge: &'a RecoveryCharge) -> Self {
+        match charge.attribution().key() {
+            KeyResolution::Resolved(Some(id)) => Self::Write(id),
+            KeyResolution::Resolved(None) | KeyResolution::Unresolved => Self::Unchanged,
+        }
+    }
+
+    /// A resident start writes only when it's charged, here or upstream.
+    fn for_start(charge: &'a RecoveryCharge) -> Self {
+        match charge.state() {
+            ChargeState::Enforce | ChargeState::Paid => Self::for_runtime(charge),
+            ChargeState::Exempt => Self::Unchanged,
+        }
+    }
+
+    /// A wake writes only when it started or restored the VM: `transition` is
+    /// the answer whose receipt is committed, and `activated_earlier` says
+    /// whether an earlier, identity-free answer in the same wake already did.
+    fn for_wake(self, transition: WakeTransition, activated_earlier: bool) -> Self {
+        if activated_earlier || wake_transition_activates(transition) {
+            self
+        } else {
+            Self::Unchanged
+        }
+    }
+
+    /// Write the record, unless attribution is off: then no receipt writes it.
+    async fn write(
+        self,
+        attribution: super::ActivationClientAttribution,
+        connection: &mut sqlx::PgConnection,
+        sandbox_id: SandboxId,
+    ) -> Result<(), SubstrateError> {
+        if !attribution.is_enabled() {
+            return Ok(());
+        }
+        if let Self::Write(client_id) = self {
+            set_activating_client(connection, sandbox_id, Some(client_id))
+                .await
+                .db_context("failed to record the activating client")?;
+        }
+        Ok(())
+    }
+}
+
+fn wake_transition_activates(transition: WakeTransition) -> bool {
+    matches!(transition, WakeTransition::Restore | WakeTransition::Start)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -922,6 +995,7 @@ impl DirectSubstrate {
         response_sandbox_id: &str,
         route_identity: Option<pplx_space_sbx_mgr_client::proto::SpaceApiRouteIdentity>,
         operation: DirectRouteIdentityOperation,
+        record: ReceiptRecord<'_>,
     ) -> Result<Option<SandboxRouteIdentity>, SubstrateError> {
         if response_sandbox_id != sandbox_id.to_string() {
             return self
@@ -938,6 +1012,8 @@ impl DirectSubstrate {
         let Some(identity) = route_identity else {
             // A successful activation through an older sandbox-manager must
             // not leave a strict receipt from the previous incarnation live.
+            // A start or wake writes no record either: the record rides only
+            // with an accepted route identity, so the previous one stays.
             self.clear_direct_route_identity(sandbox_id).await?;
             return Ok(None);
         };
@@ -972,6 +1048,17 @@ impl DirectSubstrate {
             .begin()
             .await
             .db_context("failed to begin direct route identity transaction")?;
+        // The record first: when it changes, it takes the `sandboxes` row lock
+        // before the route identity rows, the order the owned restore receipt
+        // uses. A refused upsert below rolls it back with the rest of the
+        // transaction.
+        record
+            .write(
+                self.activation_client_attribution(),
+                &mut transaction,
+                sandbox_id,
+            )
+            .await?;
         let persisted = sqlx::query_scalar::<_, i64>(sql!(
             "INSERT INTO sandbox_direct_route_identities (
                  sandbox_id,
@@ -1057,6 +1144,7 @@ impl DirectSubstrate {
         response: &pplx_space_sbx_mgr_client::proto::StartResponse,
         supplied_identity: pplx_space_sbx_mgr_client::proto::SpaceApiRouteIdentity,
         lease: DirectRestoreLease,
+        record: ReceiptRecord<'_>,
     ) -> Result<Option<SandboxRouteIdentity>, SubstrateError> {
         // During a rolling deploy, an older sandbox-manager can apply the
         // supplied identity without returning a receipt. The API still owns
@@ -1134,6 +1222,13 @@ impl DirectSubstrate {
                 "direct restore ownership changed for sandbox {sandbox_id}"
             )));
         }
+        record
+            .write(
+                self.activation_client_attribution(),
+                &mut transaction,
+                sandbox_id,
+            )
+            .await?;
         transaction
             .commit()
             .await
@@ -1146,6 +1241,7 @@ impl DirectSubstrate {
         sandbox_id: SandboxId,
         expected_node_id: NodeId,
         response: &pplx_space_sbx_mgr_client::proto::StartResponse,
+        record: ReceiptRecord<'_>,
     ) -> Result<Option<SandboxRouteIdentity>, SubstrateError> {
         self.persist_route_identity_receipt(
             sandbox_id,
@@ -1153,6 +1249,7 @@ impl DirectSubstrate {
             &response.sandbox_id,
             response.route_identity.clone(),
             DirectRouteIdentityOperation::Start,
+            record,
         )
         .await
     }
@@ -1233,6 +1330,8 @@ impl DirectSubstrate {
         sandbox_id: SandboxId,
         expected_node_id: NodeId,
         response: &WakeResponse,
+        record: ReceiptRecord<'_>,
+        activated_earlier: bool,
     ) -> Result<Option<SandboxRouteIdentity>, SubstrateError> {
         let transition =
             WakeTransition::try_from(response.transition).map_err(|_| SubstrateError::Failed {
@@ -1241,6 +1340,7 @@ impl DirectSubstrate {
                     response.transition
                 ),
             })?;
+        let record = record.for_wake(transition, activated_earlier);
         match (transition, response.route_identity.clone()) {
             (WakeTransition::Unspecified, _) => Err(SubstrateError::Failed {
                 message: "node-api wake omitted its transition".to_string(),
@@ -1252,6 +1352,7 @@ impl DirectSubstrate {
                     &response.sandbox_id,
                     Some(identity),
                     DirectRouteIdentityOperation::Wake,
+                    record,
                 )
                 .await
             }
@@ -1262,6 +1363,7 @@ impl DirectSubstrate {
                     &response.sandbox_id,
                     None,
                     DirectRouteIdentityOperation::Wake,
+                    record,
                 )
                 .await
             }
@@ -1329,6 +1431,7 @@ impl DirectSubstrate {
             &sandbox_id.to_string(),
             route_identity,
             DirectRouteIdentityOperation::Rollback,
+            ReceiptRecord::Unchanged,
         )
         .await?;
         Ok(())
@@ -1550,6 +1653,8 @@ impl DirectSubstrate {
                 response_sandbox_id,
                 route_identity,
                 operation,
+                // The row insert recorded the create's client.
+                ReceiptRecord::Unchanged,
             )
             .await
         {
@@ -2875,6 +2980,7 @@ impl DirectSubstrate {
         &self,
         sandbox_id: SandboxId,
         options: ActivationOptions,
+        charge: &RecoveryCharge,
     ) -> Result<DirectRestoreResult, SubstrateError> {
         // A read-only preflight avoids two lifecycle writes for a wake that
         // has no usable source. It is only an optimization: the candidate set
@@ -2995,6 +3101,7 @@ impl DirectSubstrate {
                             response.get_ref(),
                             route_identity,
                             lease,
+                            ReceiptRecord::for_runtime(charge),
                         )
                         .await;
                     let route_identity = match persist_result {
@@ -3113,6 +3220,7 @@ impl DirectSubstrate {
         &self,
         sandbox: &Sandbox,
         timeout: Duration,
+        charge: &RecoveryCharge,
     ) -> Result<ExecutionActivation, SubstrateError> {
         let restored = self
             .restore_execution_with_candidates(
@@ -3121,6 +3229,7 @@ impl DirectSubstrate {
                     blocking: true,
                     ready_timeout: timeout,
                 },
+                charge,
             )
             .await?;
         Ok(ExecutionActivation::owned(ExecutionBinding {
@@ -3952,6 +4061,8 @@ impl SubstrateAdapter for DirectSubstrate {
             &sandbox_id.to_string(),
             response.into_inner().route_identity,
             DirectRouteIdentityOperation::Resume,
+            // The adoption's `insert_pooled` recorded the claiming client.
+            ReceiptRecord::Unchanged,
         )
         .await
         .map_err(ControllerError::from)?;
@@ -4412,7 +4523,12 @@ impl SubstrateAdapter for DirectSubstrate {
                 message: format!("node-api start error: {err}"),
             })?;
         let route_identity = self
-            .persist_start_route_identity(sandbox_id, node.id, response.get_ref())
+            .persist_start_route_identity(
+                sandbox_id,
+                node.id,
+                response.get_ref(),
+                ReceiptRecord::for_start(&charge),
+            )
             .await?;
         let execution_generation = receipt_execution_generation(route_identity.as_ref());
 
@@ -4434,7 +4550,7 @@ impl SubstrateAdapter for DirectSubstrate {
         // charged at entry because the Direct path does not support joining a
         // prior owner's completion.
         charge.charge_restore_claim().await?;
-        self.restore_execution_with_candidates(sandbox_id, options)
+        self.restore_execution_with_candidates(sandbox_id, options, &charge)
             .await?;
         Ok(ActivationCompletion::Owned)
     }
@@ -4515,7 +4631,7 @@ impl SubstrateAdapter for DirectSubstrate {
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 match adopted {
                     Some(node) => (node, remaining),
-                    None => return self.restore_for_wake(sandbox, remaining).await,
+                    None => return self.restore_for_wake(sandbox, remaining, &charge).await,
                 }
             }
         };
@@ -4582,6 +4698,9 @@ impl SubstrateAdapter for DirectSubstrate {
                 .await?,
             )
             .await;
+        // Set when the first answer started or restored the VM without a
+        // receipt; the hydrating retry then reports the VM already running.
+        let mut activated_earlier = false;
         let wake = match initial_wake {
             Err(status)
                 if pplx_space_sbx_mgr_client::is_authoritative_route_identity_required(&status) =>
@@ -4605,6 +4724,7 @@ impl SubstrateAdapter for DirectSubstrate {
                 // Compatibility mode can allow an identity-free activation. Hydrate
                 // that now-active execution with the control-plane identity before
                 // returning it to callers or persisting its receipt.
+                activated_earlier = true;
                 let route_identity = self
                     .reserve_direct_activation_route_identity(sandbox_id, node.id)
                     .await?;
@@ -4628,7 +4748,7 @@ impl SubstrateAdapter for DirectSubstrate {
                 if wake_requires_restore(&status)
                     && wake_lifecycle_allows_restore_fallback(&sandbox.lifecycle) =>
             {
-                return self.restore_for_wake(sandbox, timeout).await;
+                return self.restore_for_wake(sandbox, timeout, &charge).await;
             }
             // The worker's effective policy refused an implicit wake. That is
             // a terminal policy answer, not a transient runtime failure.
@@ -4645,7 +4765,13 @@ impl SubstrateAdapter for DirectSubstrate {
         };
         let response = response.into_inner();
         let route_identity = self
-            .persist_wake_route_identity(sandbox_id, node.id, &response)
+            .persist_wake_route_identity(
+                sandbox_id,
+                node.id,
+                &response,
+                ReceiptRecord::for_runtime(&charge),
+                activated_earlier,
+            )
             .await?;
         let execution_generation = receipt_execution_generation(route_identity.as_ref());
 
