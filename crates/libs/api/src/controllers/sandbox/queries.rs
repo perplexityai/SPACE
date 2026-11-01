@@ -1,3 +1,4 @@
+use crate::client_live_cap::LiveReservation;
 use crate::controllers::substrate::{
     ActivationAttribution, ActivationClient, AdoptionLabelOutcome, AdoptionLabelTransient,
     CapPolicy, RecoveryCharge,
@@ -165,6 +166,11 @@ struct PooledCreateInput<'a> {
     /// global volume-encryption switch). See the pool bypass in
     /// `try_create_from_pool_with_substrate` for why these cold-create today.
     volume_encryption: bool,
+    /// The create's live-cap reservation, moved to each claimed pool sandbox
+    /// before its label patch, so the adopted sandbox counts once: as the
+    /// labeled pod once the reflectors see it, and as the pending member
+    /// until then.
+    live_cap: Option<&'a tokio::sync::Mutex<LiveReservation>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1352,6 +1358,17 @@ impl SandboxController {
                 "node_pool placement is incompatible with boot_mode=pool",
             ));
         }
+        // The live cap runs before the create branches between an admitted
+        // claim, a pool bypass and a pool attempt, so forks and pinned creates
+        // are capped too and a warm pod isn't claimed only to be refused. A
+        // refusal comes before any cluster token is spent.
+        let live = super::lifecycle::reserve_live_cap(
+            self.cluster_admission.as_ref(),
+            sandbox_uuid,
+            &attribution,
+        )
+        .await?
+        .map(tokio::sync::Mutex::new);
         let pooled_input = PooledCreateInput {
             federated_grant_audience: self.federated_grant_audience.clone(),
             pool,
@@ -1376,6 +1393,7 @@ impl SandboxController {
             federated_service_grant,
             volume_encryption,
             client_id: client_id.as_ref(),
+            live_cap: live.as_ref(),
         };
         // Set when this create was admitted against a warm-pool slot and is
         // building cold instead: the slot's pod used this ID's generation 1.
@@ -1396,6 +1414,9 @@ impl SandboxController {
             .await?;
             create_path.set_observation(observation);
             if let Some(response) = response {
+                // The pool attempt already moved the member to the adopted
+                // sandbox's id.
+                super::lifecycle::keep_live(live.map(tokio::sync::Mutex::into_inner));
                 create_path.mark_request_succeeded();
                 pplx_space_metrics::sandbox::api::sandbox_created(tls_interception_on);
                 return Ok(response);
@@ -1414,11 +1435,26 @@ impl SandboxController {
                 .await?;
             create_path.set_observation(observation);
             if let Some(response) = response {
+                // The pool attempt already moved the member to the adopted
+                // sandbox's id.
+                super::lifecycle::keep_live(live.map(tokio::sync::Mutex::into_inner));
                 create_path.mark_request_succeeded();
                 pplx_space_metrics::sandbox::api::sandbox_created(tls_interception_on);
                 return Ok(response);
             }
         }
+        let live = live.map(tokio::sync::Mutex::into_inner);
+        // A pool attempt that fell back to cold may have moved the member to
+        // a claimed pool sandbox: it counts under this create's own id again,
+        // and no pod exists for it until the cold create makes one.
+        let live = match live {
+            Some(mut live) => {
+                live.swap(sandbox_uuid).await;
+                live.no_pod_yet();
+                Some(live)
+            }
+            None => None,
+        };
         if boot_mode == CreateBootMode::Pool {
             return Err(ControllerError::service_unavailable(
                 "boot_mode=pool requested but no warm-pool sandbox is available",
@@ -1566,6 +1602,15 @@ impl SandboxController {
         })?;
         let actor_ref = ActorRef::new(create_owner.user_id, create_owner.org_id, actor_email);
 
+        // The substrate may persist the pod even when the call then fails (an
+        // ambiguous create, or an error after the pod exists), so from here a
+        // failure lets the member lapse. The cap bounds what failed creates
+        // can hold this way: once they fill it, the next reserve refuses
+        // before reaching here.
+        let mut live = live;
+        if let Some(live) = live.as_mut() {
+            live.pod_may_exist();
+        }
         let outcome = match self
             .substrate
             .create_execution(CreateExecutionRequest {
@@ -1633,6 +1678,11 @@ impl SandboxController {
                 });
             }
         };
+
+        // The runtime exists from here on, so a later error still leaves a
+        // live sandbox: the member lapses after one TTL rather than being
+        // released, covering the reflectors' watch delay.
+        super::lifecycle::keep_live(live);
 
         let outcome_sandbox_uuid = outcome.sandbox_id;
         let mut lifecycle = outcome.initial_lifecycle;
@@ -1711,7 +1761,11 @@ impl SandboxController {
                             ready_timeout: DEFAULT_BLOCKING_WAIT_TIMEOUT,
                         },
                         // Charged as this create's cold activation.
-                        RecoveryCharge::paid(CapPolicy::Skip, attribution.clone()),
+                        RecoveryCharge::paid(
+                            self.cluster_admission.as_ref(),
+                            CapPolicy::Skip,
+                            attribution.clone(),
+                        ),
                     )
                     .await
                 {
@@ -1739,7 +1793,11 @@ impl SandboxController {
                 .substrate
                 .runtime_client(
                     outcome.sandbox_id,
-                    RecoveryCharge::paid(CapPolicy::Skip, attribution.clone()),
+                    RecoveryCharge::paid(
+                        self.cluster_admission.as_ref(),
+                        CapPolicy::Skip,
+                        attribution.clone(),
+                    ),
                 )
                 .await
             {
@@ -2116,6 +2174,20 @@ impl SandboxController {
                 }
             };
 
+            // The create counts under the claimed sandbox from here on, so
+            // the labeled pool pod isn't counted twice. A fallback to cold
+            // moves the member back to the planned id.
+            //
+            // From the label patch on, the pod may carry this client's label
+            // even when the patch reports an error, so a later failure lets
+            // the member lapse rather than releasing it. A throttled patch is
+            // the exception: the apiserver refused every attempt, so no label
+            // landed.
+            if let Some(live) = input.live_cap {
+                let mut live = live.lock().await;
+                live.swap(claim.sandbox_id).await;
+                live.pod_may_exist();
+            }
             // Adoption is the pool pod's activation, so it takes the
             // adopter's label before the adoption commits. A pod that can't be
             // labeled isn't adopted: the create builds cold, which labels its
@@ -2135,7 +2207,14 @@ impl SandboxController {
                 .map_err(ControllerError::demoted_after_side_effect)?
             {
                 AdoptionLabelOutcome::Labeled => {}
-                AdoptionLabelOutcome::Transient => return Err(adoption_label_transient()),
+                AdoptionLabelOutcome::Transient => {
+                    // The slot went back unlabeled, and the retry reserves
+                    // under a new planned id, so release this member now.
+                    if let Some(live) = input.live_cap {
+                        live.lock().await.no_pod_yet();
+                    }
+                    return Err(adoption_label_transient());
+                }
                 AdoptionLabelOutcome::Invalidated => {
                     return Ok(PoolCreateResult::cold(
                         PoolCreateObservation::after_pool_recovery_failure(),
@@ -2529,9 +2608,16 @@ impl SandboxController {
             return Err(admitted_pool_slot_release_pending());
         }
 
-        // A slot that can't be labeled is invalidated. The admitted slot
-        // reserves this operation's planned id, so the create waits for the
-        // pool to collect it, then builds cold under that id.
+        // A slot that can't be labeled is invalidated, unless the apiserver
+        // is throttling, when the claim is kept for the retry. The admitted
+        // slot reserves this operation's planned id, so after an invalidation
+        // the create waits for the pool to collect it, then builds cold under
+        // that id. As in the pool loop, the label may land even when the
+        // patch reports an error, so from here a failure lets the member
+        // lapse; a throttled retry reserves the same id, so it's one member.
+        if let Some(live) = input.live_cap {
+            live.lock().await.pod_may_exist();
+        }
         match substrate
             .label_adopted_execution(&claim, input.client_id, AdoptionLabelTransient::KeepClaim)
             .await

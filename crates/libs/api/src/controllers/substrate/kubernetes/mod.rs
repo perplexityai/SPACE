@@ -47,6 +47,7 @@ use uuid::Uuid;
 mod budgets;
 mod caches;
 mod cancel_rate_tracker;
+mod client_live_pods;
 mod pod_reflector;
 mod pod_worker_channels;
 mod restore_waiters;
@@ -56,6 +57,8 @@ mod store;
 use budgets::SubstrateBudgets;
 pub use pod_reflector::ReflectorReady;
 use sandbox_pod_view::NodeNetworkSlots;
+#[cfg(any(test, feature = "test-hooks"))]
+use sandbox_pod_view::SandboxPodIndexes;
 pub use sandbox_pod_view::{
     SandboxContainerState, SandboxContainerStatuses, SandboxContainerTerminated,
     SandboxContainerWaiting, SandboxPodKey, SandboxPodView,
@@ -835,6 +838,9 @@ pub struct KubernetesSubstrate {
     /// Per-node active network-slot totals, written from the same reflector
     /// events as `pod_store`. Read by the create-path capacity preflight.
     pod_network_slots: NodeNetworkSlots,
+    /// Per-client live sandbox-pod index and reflector freshness, written
+    /// from the same reflector events as `pod_store`. Read by the live cap.
+    pod_client_index: client_live_pods::ClientLivePods,
     /// Per-pod-name event signaller fed by the same reflector watch. Lets
     /// `read_sandbox_pod` wait briefly for the next reflector update before
     /// falling through to a direct `GET` during the brief window between pod
@@ -901,7 +907,7 @@ impl KubernetesSubstrate {
     ) -> Result<Option<Self>, SubstrateError> {
         match KubernetesState::try_from_env().await {
             Ok(Some(k8s)) => {
-                let (pod_store, pod_network_slots, pod_events, pod_reflector_ready) =
+                let (pod_store, pod_indexes, pod_events, pod_reflector_ready) =
                     pod_reflector::start(k8s.client.clone(), k8s.sandbox_namespace.clone());
                 let store = K8sStore::new(
                     pool.clone(),
@@ -927,7 +933,8 @@ impl KubernetesSubstrate {
                     ),
                     store,
                     pod_store,
-                    pod_network_slots,
+                    pod_network_slots: pod_indexes.network_slots,
+                    pod_client_index: pod_indexes.client_pods,
                     pod_events,
                     pod_reflector_ready,
                     k8s,
@@ -961,6 +968,31 @@ impl KubernetesSubstrate {
 
     pub fn readiness(&self) -> pod_reflector::ReflectorReady {
         self.pod_reflector_ready.clone()
+    }
+
+    /// Mark the sandbox-pod watch as failed, as a watch error does, so tests
+    /// can drive the live cap's stale path.
+    #[cfg(test)]
+    pub(crate) fn mark_pod_watch_error_for_test(&self) {
+        self.pod_client_index.mark_watch_error();
+    }
+
+    /// Count `ids`'s live sandboxes from the sandbox-pod reflector. See
+    /// [`crate::controllers::substrate::Substrate::live_sandboxes_for_client`].
+    pub(super) fn live_sandboxes_for_client(
+        &self,
+        ids: &super::CountedIds,
+        activating: Option<SandboxId>,
+        already_pending: &std::collections::HashSet<SandboxId>,
+    ) -> super::LiveSandboxCount {
+        self.pod_client_index.count(
+            ids,
+            &super::LiveCountExclusions {
+                activating,
+                already_pending,
+            },
+            self.pod_reflector_ready.is_ready(),
+        )
     }
 
     /// Shorten the follower-join poll pacing for a test that needs a join to

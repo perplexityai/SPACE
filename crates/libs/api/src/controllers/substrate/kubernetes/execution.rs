@@ -6,7 +6,7 @@ use super::wait_ready::CommandReadyPod;
 use super::*;
 use crate::controllers::substrate::runtime_upgrade::UpgradeActivation;
 use crate::controllers::substrate::{
-    ActivationAttribution, ActivationOptions, CapPolicy, RecoveryCharge,
+    ActivationAttribution, ActivationOptions, CapPolicy, ChargeState, KeyResolution, RecoveryCharge,
 };
 use pplx_space_common_core::kubernetes::EvacuationPlacement;
 use pplx_space_common_core::types::{
@@ -275,6 +275,126 @@ impl RestoreClaimHandling {
 }
 
 impl KubernetesSubstrate {
+    /// Decide a lease winner's live cap (`CapPolicy::ReserveAtClaim`, RFC
+    /// Decision 6). A fresh claim from `suspended` gives the sandbox a new
+    /// runtime for certain, so it reserves before its charge and becomes
+    /// `Reserved`. (`FreshFromStopped` is evacuation-only, whose charge is
+    /// uncapped, so it never reaches this arm with `ReserveAtClaim`.) A takeover of a lapsed `restoring` lease can reuse
+    /// the pod an earlier attempt built, so it becomes `Check` and is decided
+    /// where a pod would be created. Any other policy passes through.
+    async fn decide_restore_claim_cap(
+        &self,
+        charge: &RecoveryCharge,
+        sandbox_id: SandboxId,
+        claim: RestoreClaim,
+    ) -> Result<
+        (
+            RecoveryCharge,
+            Option<crate::client_live_cap::LiveReservation>,
+        ),
+        SubstrateError,
+    > {
+        if charge.cap() != CapPolicy::ReserveAtClaim {
+            return Ok((charge.clone(), None));
+        }
+        match claim {
+            RestoreClaim::FreshFromSuspended { .. } | RestoreClaim::FreshFromStopped => {
+                let record = self.unresolved_record(charge, sandbox_id).await?;
+                let live = charge.reserve_live_cap(sandbox_id, record.as_ref()).await?;
+                Ok((charge.with_cap(CapPolicy::Reserved), live))
+            }
+            RestoreClaim::RedroveRestoring { .. } => {
+                let checked = charge.with_cap(CapPolicy::Check);
+                self.precheck_live_cap_before_takeover_charge(&checked, sandbox_id)
+                    .await?;
+                Ok((checked, None))
+            }
+        }
+    }
+
+    /// The sandbox's record, for a charge that didn't resolve its client at
+    /// entry; every lease-claiming caller resolved it, so this reads nothing
+    /// for them.
+    async fn unresolved_record(
+        &self,
+        charge: &RecoveryCharge,
+        sandbox_id: SandboxId,
+    ) -> Result<Option<pplx_space_common_core::types::ClientId>, SubstrateError> {
+        Ok(match charge.attribution().key() {
+            KeyResolution::Unresolved => {
+                self.store
+                    .require_sandbox(sandbox_id)
+                    .await?
+                    .activating_client_id
+            }
+            KeyResolution::Resolved(_) => None,
+        })
+    }
+
+    /// Before a lease takeover's charge: the takeover's cap is decided where
+    /// a pod would be created (`Check`), after its token is spent. When no
+    /// reusable pod is visible, a read-only pre-check refuses a client at its
+    /// cap first, so each retry of a takeover doesn't spend a token only to
+    /// be refused. A refusal here is a refused charge: the caller releases
+    /// the claim.
+    async fn precheck_live_cap_before_takeover_charge(
+        &self,
+        charge: &RecoveryCharge,
+        sandbox_id: SandboxId,
+    ) -> Result<(), SubstrateError> {
+        if charge.state() != ChargeState::Enforce
+            || charge.cap() != CapPolicy::Check
+            || self.sandbox_has_reusable_pod(sandbox_id)
+        {
+            return Ok(());
+        }
+        let record = self.unresolved_record(charge, sandbox_id).await?;
+        charge.precheck_live_cap(sandbox_id, record.as_ref()).await
+    }
+
+    /// Before a deferred cold charge that runs ahead of
+    /// `ensure_pod_exists`'s decision: when the reflector shows no reusable
+    /// pod for the sandbox, a read-only pre-check of the live cap refuses a
+    /// client at its cap before it spends a cluster token on every retry. A
+    /// reusable pod is reused, so the pre-check is skipped and a running
+    /// sandbox is never refused.
+    pub(super) async fn precheck_live_cap_before_cold_charge(
+        &self,
+        charge: &RecoveryCharge,
+        sandbox: &Sandbox,
+    ) -> Result<(), SubstrateError> {
+        if charge.state() != ChargeState::Enforce
+            || !matches!(charge.cap(), CapPolicy::Check | CapPolicy::ReserveAtClaim)
+            || self.sandbox_has_reusable_pod(sandbox.id)
+        {
+            return Ok(());
+        }
+        charge
+            .precheck_live_cap(sandbox.id, sandbox.activating_client_id.as_ref())
+            .await
+    }
+
+    /// Whether the reflector holds a pod for `sandbox_id`, labeled or not,
+    /// that this activation can reuse: not being deleted, and either ready or
+    /// still `Pending` (starting) without the scheduler having marked it
+    /// Unschedulable. A pod left on a lost node keeps its `Running` phase but
+    /// stops reading as ready once the node does, and an unschedulable pinned
+    /// restore pod is about to be replaced by a re-drive, so neither skips the
+    /// pre-check for the replacement it's about to need.
+    fn sandbox_has_reusable_pod(&self, sandbox_id: SandboxId) -> bool {
+        let sandbox_id = sandbox_id.to_string();
+        self.pod_store
+            .find(|pod| {
+                (pod.is_ready()
+                    || (pod.phase() == Some("Pending") && pod.unschedulable_message().is_none()))
+                    && !pod.is_deleting()
+                    && !pod.is_terminal()
+                    && pod.annotation_or_label(super::sandbox_pod_view::SandboxPodKey::SandboxId)
+                        == Some(sandbox_id.as_str())
+            })
+            .is_some()
+    }
+
     async fn publish_started_recovery_completion(
         &self,
         sandbox_id: SandboxId,
@@ -858,7 +978,20 @@ impl KubernetesSubstrate {
             }
             Err(error) => return Err(ControllerError::from(error)),
         };
-        if let Err(error) = charge.charge_restore_claim().await {
+        // A takeover of a lapsed lease can reuse the pod the earlier attempt
+        // built, so its live cap is decided where a pod would be created.
+        let charge = match charge.cap() {
+            CapPolicy::ReserveAtClaim => charge.with_cap(CapPolicy::Check),
+            _ => charge,
+        };
+        let charged = match self
+            .precheck_live_cap_before_takeover_charge(&charge, sandbox_id)
+            .await
+        {
+            Ok(()) => charge.charge_restore_claim().await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = charged {
             self.release_rejected_restore_claim(sandbox_id, restore_claim)
                 .await;
             return Err(ControllerError::from(error));
@@ -1044,7 +1177,13 @@ impl KubernetesSubstrate {
             started_recovery.map(StartedRecoveryOwnership::generation);
 
         if (started_recovery_generation.is_some() || !is_dormant_lifecycle(&sandbox.lifecycle))
-            && let Err(error) = charge.charge_cold_activation().await
+            && let Err(error) = match self
+                .precheck_live_cap_before_cold_charge(&charge, sandbox)
+                .await
+            {
+                Ok(()) => charge.charge_cold_activation().await,
+                Err(error) => Err(error),
+            }
         {
             self.publish_started_recovery_completion(
                 sandbox_id,
@@ -1066,21 +1205,24 @@ impl KubernetesSubstrate {
         let wait = async {
             // Boxed: `ensure_pod_exists` is a large future; inlining it here
             // overflows the test thread's stack.
-            let (activation_attempt_id, joined_attempt_id) = match Box::pin(self.ensure_pod_exists(
-                sandbox,
-                None,
-                // No source-node pin on the access path (see the fn doc): the
-                // started-recovery lease can't fence the re-drive a required
-                // pin would trigger.
-                None,
-                suspend_restore_storage_uri,
-                PodMaterializationOwnership::new(
-                    started_recovery,
-                    // Access/join path holds no restore lease.
+            let (activation_attempt_id, joined_attempt_id) = match Box::pin(
+                self.ensure_pod_exists(
+                    sandbox,
                     None,
-                    Some(activation_assignment.clone()),
+                    // No source-node pin on the access path (see the fn doc): the
+                    // started-recovery lease can't fence the re-drive a required
+                    // pin would trigger.
+                    None,
+                    suspend_restore_storage_uri,
+                    PodMaterializationOwnership::new(
+                        started_recovery,
+                        // Access/join path holds no restore lease.
+                        None,
+                        Some(activation_assignment.clone()),
+                    )
+                    .with_charge(&charge),
                 ),
-            ))
+            )
             .await
             {
                 Ok(()) => (activation_assignment.assigned_or_requested(), None),
@@ -1243,7 +1385,10 @@ impl KubernetesSubstrate {
             target_state,
             // A drain evacuation: nobody charges it, and the restored pod is
             // labeled from the sandbox's record.
-            RecoveryCharge::exempt(CapPolicy::Skip, ActivationAttribution::inherit_unresolved()),
+            RecoveryCharge::uncapped(
+                ChargeState::Exempt,
+                ActivationAttribution::inherit_unresolved(),
+            ),
         )
         .await
         .map(|_| ())
@@ -1341,6 +1486,19 @@ impl KubernetesSubstrate {
                 Err(err) => return Err(err),
             }
         };
+        // The live cap runs before the charge, so a client at its cap is
+        // refused before it spends a cluster token.
+        let (charge, live) = match self
+            .decide_restore_claim_cap(&charge, sandbox_id, restore_claim)
+            .await
+        {
+            Ok(decided) => decided,
+            Err(err) => {
+                self.release_rejected_restore_claim(sandbox_id, restore_claim)
+                    .await;
+                return Err(err);
+            }
+        };
         if let Err(err) = charge.charge_restore_claim().await {
             self.release_rejected_restore_claim(sandbox_id, restore_claim)
                 .await;
@@ -1356,8 +1514,13 @@ impl KubernetesSubstrate {
                 WakeTarget::Explicit(target_state),
                 RestoreClaimHandling::preclaimed_with_cleanup(restore_claim, &charge),
             )
-            .await?;
-        Ok(activation.completion)
+            .await;
+        // A wake that failed may still have created its pod, and which it
+        // did isn't known here, so the count lapses after one TTL either way.
+        if let Some(live) = live {
+            live.keep();
+        }
+        Ok(activation?.completion)
     }
 
     pub(super) async fn wake_execution_with_metric_identity(
@@ -1706,16 +1869,30 @@ impl KubernetesSubstrate {
             };
             pplx_space_metrics::sandbox::api::restore_claim_lap(metric_identity, lap);
         };
-        let charge = restore_claim_handling.charge.clone();
-        // The claim-winner pays the deferred activation charge; a rejection
-        // releases the claim it just won so another caller can take over.
+        let mut charge = restore_claim_handling.charge.clone();
+        let mut live = None;
+        // The claim-winner decides its live cap, then pays the deferred
+        // activation charge; a refusal or rejection releases the claim it just
+        // won so another caller can take over.
         if restore_claim_handling.preclaimed.is_none()
             && let Some(won_claim) = prepared.restore_claim
-            && let Err(err) = restore_claim_handling.charge.charge_restore_claim().await
         {
-            self.release_rejected_restore_claim(sandbox_id, won_claim)
-                .await;
-            return Err(err);
+            let charged = match self
+                .decide_restore_claim_cap(&charge, sandbox_id, won_claim)
+                .await
+            {
+                Ok((decided, reservation)) => {
+                    charge = decided;
+                    live = reservation;
+                    charge.charge_restore_claim().await
+                }
+                Err(err) => Err(err),
+            };
+            if let Err(err) = charged {
+                self.release_rejected_restore_claim(sandbox_id, won_claim)
+                    .await;
+                return Err(err);
+            }
         }
 
         // Once this request wins the durable restore claim, node work must no
@@ -1745,7 +1922,9 @@ impl KubernetesSubstrate {
                     charge,
                 });
                 tokio::pin!(drive);
-                tokio::select! {
+                // The reservation rides with the detached leader, so a
+                // disconnected caller doesn't uncount a restore still running.
+                let result = tokio::select! {
                     result = &mut drive => result,
                     _ = shutdown_token.cancelled() => {
                         tracing::info!(
@@ -1763,7 +1942,13 @@ impl KubernetesSubstrate {
                         }
                         result
                     }
+                };
+                // As in the inline restore: a failed drive may have left its
+                // pod, so the count lapses after one TTL either way.
+                if let Some(live) = live {
+                    live.keep();
                 }
+                result
             })
             .instrument(leader_span),
         );
@@ -1917,7 +2102,8 @@ impl KubernetesSubstrate {
                             .restore_claim
                             .and_then(RestoreClaim::restore_lease_token),
                         Some(activation_assignment.clone()),
-                    ),
+                    )
+                    .with_charge(&charge),
                 ),
             )
             .await
