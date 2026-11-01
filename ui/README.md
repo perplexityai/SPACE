@@ -6,10 +6,24 @@ dashboard URL validation tests.
 
 ## API proxy routing
 
-`NEXT_PUBLIC_API_URL` selects the backend for `/api/*` and `/auth/*`, defaulting
-to `http://localhost:8080`. Admin requests under `/admin/*` use the same backend
-unless `NEXT_PUBLIC_ADMIN_API_URL` is set to a separate admin API origin. An
-unset or empty admin override preserves the existing fallback.
+The console proxies API calls through its own origin. `next build` evaluates
+the rewrites in `next.config.js` once and bakes them into the build, so these
+variables must be set when the image is built (`docker/Dockerfile.ui` takes
+each as a build argument); setting them on the running container has no
+effect.
+
+| Variable | Routes | Default |
+|---|---|---|
+| `NEXT_PUBLIC_API_URL` | `/api/*`, `/auth/*` | `http://localhost:8080` |
+| `NEXT_PUBLIC_ADMIN_API_URL` | `/admin/*` | unset: `NEXT_PUBLIC_API_URL` |
+| `NEXT_PUBLIC_DATA_PLANE_URL` | `/v1/sessions/*` (command and terminal streams) | `http://localhost:8090` (the Dockerfile's default; a `next build` outside it without the variable uses `http://space-data-plane:8090`) |
+
+An unset or empty `NEXT_PUBLIC_ADMIN_API_URL` keeps the admin routes on the
+main API origin. Set it to the origin of a dedicated admin API
+(`--surface admin`), which also serves `/auth/v1`.
+
+`GET /healthz` answers `ok` without signing in, for load balancer and
+container probes.
 
 ## Curiosity theme
 
