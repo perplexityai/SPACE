@@ -2530,9 +2530,10 @@ ON CONFLICT (key_hash) DO NOTHING;
         # A snapshots dir that does not exist is a legitimate "none". Any
         # other `ls` failure (it exits 2 for unreadable paths too) or an exec
         # failure must propagate rather than read as "reaped".
+        # `-A`: GC staging, `.gc-pending-<id>`, is a dot entry.
         result = self._node_shell_exec(
             node_name,
-            f"if [ ! -e {path} ]; then exit 0; fi; ls -1 {path}",
+            f"if [ ! -e {path} ]; then exit 0; fi; ls -1A {path}",
             timeout=30,
         )
         if result.returncode != 0:

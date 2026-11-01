@@ -339,7 +339,18 @@ pub mod paths {
 
     /// Returns the directory path for one sandbox snapshot.
     pub fn sandbox_snapshot_dir(sandbox_id: &str, snapshot_name: &str) -> String {
-        format!("{}/{snapshot_name}", sandbox_snapshots_dir(sandbox_id))
+        sandbox_snapshot_dir_in(SANDBOX_CACHE_DIR, sandbox_id, snapshot_name)
+    }
+
+    /// Returns the directory path for one sandbox snapshot under an injectable
+    /// cache root.
+    pub fn sandbox_snapshot_dir_in(
+        cache_root: &str,
+        sandbox_id: &str,
+        snapshot_name: &str,
+    ) -> String {
+        let id = canonical_sandbox_id(sandbox_id);
+        format!("{cache_root}/{id}/snapshots/{snapshot_name}")
     }
 
     /// Returns the metadata path for one sandbox snapshot.

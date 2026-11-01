@@ -728,3 +728,33 @@ fn snapshot_publication_refuses_an_unusable_destination_without_cataloging_it() 
         fixture.assert_staging_retained(&case);
     }
 }
+
+/// An import may name its snapshot, but not with the `.gc-pending-` marker GC
+/// staging reserves: such a snapshot would be imported and then hidden from,
+/// and refused by, every snapshot RPC.
+#[test]
+fn import_refuses_the_reserved_staging_marker() {
+    for name in [
+        "d-user.gc-pending-note",
+        "d-user.gc-pending-019f9ce3-2370-7a33-8706-fda0d0496d33",
+    ] {
+        let status = import_target_name(Some(name), "d").unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{name}");
+        assert!(status.message().contains("reserved"), "{name}: {status}");
+    }
+    assert_eq!(
+        import_target_name(Some("d-user.gc-pending"), "d").unwrap(),
+        "d-user.gc-pending",
+        "only the marker with its trailing `-` is reserved"
+    );
+    assert_eq!(import_target_name(Some("d-user"), "d").unwrap(), "d-user");
+    assert!(
+        import_target_name(None, "f")
+            .unwrap()
+            .starts_with("f-imported-")
+    );
+    assert_eq!(
+        import_target_name(Some("f-user"), "d").unwrap_err().code(),
+        tonic::Code::InvalidArgument
+    );
+}

@@ -13,7 +13,6 @@ use super::create_support::*;
 use super::spaced_bridge::*;
 use super::tail_support::*;
 use super::*;
-use crate::local_artifacts::{CheckoutError, NamedSnapshotDelete};
 use futures_util::StreamExt;
 use pplx_space_common_core::types::{GuestPort, SandboxId};
 use pplx_space_events::{
@@ -25,13 +24,20 @@ use rollback_state::restage_rolled_back_full_snapshot;
 use std::str::FromStr;
 use tracing::Instrument;
 
+/// This module's log target, kept by the handlers that moved into children.
+const LOG_TARGET: &str = module_path!();
+
 const CURRENT_INSTANCE_DISK_ARTIFACT_PREFIX: &str = "d-stop-";
 const OPERATION_DISK_ARTIFACT_PREFIX: &str =
     pplx_space_common_core::host::linux::paths::INTERNAL_OPERATION_SNAPSHOT_PREFIX;
 
+/// A snapshot directory users can't list, delete, roll back to, export or
+/// back up: sbx-mgr's own disk artifacts, and GC staging (logically deleted
+/// bytes that only the orphan sweep removes).
 pub(super) fn is_internal_snapshot_name(snapshot_name: &str) -> bool {
     snapshot_name.starts_with(CURRENT_INSTANCE_DISK_ARTIFACT_PREFIX)
         || snapshot_name.starts_with(OPERATION_DISK_ARTIFACT_PREFIX)
+        || crate::local_artifacts::is_gc_staging_name(snapshot_name)
 }
 
 fn disk_snapshot_rollback_start_request(
@@ -1025,6 +1031,7 @@ fn project_snapshot_inventory(
                     .charge(name.len())
                     .map_err(crate::inventory_budget::exceeded)?;
                 if !name.starts_with("f-")
+                    || is_internal_snapshot_name(&name)
                     || !entry
                         .file_type()
                         .map_err(|error| Status::internal(format!("read snapshot type: {error}")))?
@@ -1175,32 +1182,6 @@ fn project_snapshot_inventory(
     Ok(snapshots.into_values().collect())
 }
 
-/// [`crate::local_artifacts::LocalArtifacts::delete_named_snapshot`] with
-/// node-manager's DeleteCacheArtifact of `local_path` as the byte delete.
-async fn delete_cached_snapshot(
-    service: &SandboxManagerService,
-    (sandbox_id, snapshot_name): (&str, &str),
-    local_path: String,
-    node_client: &mut pplx_space_node_mgr_client::NodeManagerGrpcClient,
-) -> NamedSnapshotDelete {
-    let request = pplx_space_node_mgr_client::proto::DeleteCacheArtifactRequest {
-        local_path: local_path.clone(),
-    };
-    let delete_bytes = async { node_client.delete_cache_artifact(request).await.map(drop) };
-    service
-        .local_artifacts
-        .delete_named_snapshot(sandbox_id, snapshot_name, &local_path, delete_bytes)
-        .await
-}
-
-fn snapshot_delete_refusal(error: CheckoutError) -> Status {
-    if error.is_in_use() {
-        Status::failed_precondition(format!("snapshot is in use: {error}"))
-    } else {
-        Status::internal(format!("inspect snapshot publication: {error}"))
-    }
-}
-
 impl SandboxManagerService {
     fn checkout_rollback_snapshot(
         &self,
@@ -1251,125 +1232,6 @@ impl SandboxManagerService {
         }
         // A rollback would rewrite the disk an upgrade preserved or is booting.
         super::runtime_upgrade::refuse_runtime_upgrade_fence_in(&db, sandbox_id)
-    }
-
-    pub(super) async fn delete_snapshots(
-        &self,
-        request: Request<DeleteSnapshotsRequest>,
-    ) -> Result<Response<DeleteSnapshotsResponse>, Status> {
-        self.authorize_peer(&request, "DeleteSnapshots", ALLOW_SANDBOX_OPERATOR)?;
-        let req = request.get_ref();
-        let sandbox = self.lookup_sandbox(&req.sandbox_id)?;
-        let artifact_lock = self.auto_lifecycle.artifact_lock(&sandbox.id);
-        let _guard = artifact_lock.lock().await;
-        let sandbox = self.lookup_sandbox(&sandbox.id)?;
-        self.require_snapshot_mutation_ownership(&sandbox.id)?;
-        let protected_instance_path = sandbox.current_local_artifact_id.and_then(|artifact_id| {
-            self.local_artifacts
-                .get(artifact_id)
-                .ok()
-                .flatten()
-                .filter(|artifact| {
-                    artifact.artifact_origin
-                        != pplx_space_common_core::types::ArtifactOrigin::Snapshot
-                })
-                .map(|artifact| artifact.local_path)
-        });
-
-        let mut node_client = connect_node(&self.node_manager)
-            .await
-            .map_err(|e| Status::internal(format!("cannot connect to node-manager: {e}")))?;
-
-        if req.all {
-            let mut deleted = Vec::new();
-
-            // Delete btrfs snapshots (d-* subvolumes) via node-manager
-            let sandbox_id = sandbox
-                .id
-                .parse::<SandboxId>()
-                .map_err(|error| Status::internal(format!("invalid stored sandbox id: {error}")))?;
-            let mut pages = pplx_space_node_mgr_client::SnapshotPages::new(sandbox_id, false);
-            while let Some(page) = pages.next(&mut node_client).await? {
-                for snap in page {
-                    if is_internal_snapshot_name(&snap.name) {
-                        continue;
-                    }
-                    let local_path =
-                        pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir(
-                            &sandbox.id,
-                            &snap.name,
-                        );
-                    if protected_instance_path.as_deref() == Some(local_path.as_str()) {
-                        continue;
-                    }
-                    if deleted.len() >= 4096 {
-                        return Err(Status::resource_exhausted(
-                            "deleted 4096 snapshots; retry delete-all to continue",
-                        ));
-                    }
-                    let names = (sandbox.id.as_str(), snap.name.as_str());
-                    match delete_cached_snapshot(self, names, local_path, &mut node_client).await {
-                        NamedSnapshotDelete::Deleted => deleted.push(snap.name),
-                        NamedSnapshotDelete::BytesNotDeleted(status) => return Err(status),
-                        // A refused row or a differing path: kept and left out of
-                        // `deleted`, as delete-all did before rows were checked out.
-                        kept => tracing::warn!(
-                            sandbox_id = %sandbox.id,
-                            snapshot_name = %snap.name,
-                            outcome = ?kept,
-                            "delete-all retains a snapshot it cannot delete",
-                        ),
-                    }
-                }
-            }
-            // Note: list_btrfs_snapshots returns both d-* and f-* entries, so the loop
-            // above already covers full snapshots. No separate f-* scan needed.
-
-            Ok(Response::new(DeleteSnapshotsResponse { deleted }))
-        } else if let Some(snapshot_name) = req.snapshot_name.as_deref().filter(|s| !s.is_empty()) {
-            validate_snapshot_name(snapshot_name)?;
-            if is_internal_snapshot_name(snapshot_name) {
-                return Err(Status::failed_precondition(
-                    "cannot delete an internal snapshot artifact",
-                ));
-            }
-            let local_path = pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir(
-                &sandbox.id,
-                snapshot_name,
-            );
-            if protected_instance_path.as_deref() == Some(local_path.as_str()) {
-                return Err(Status::failed_precondition(
-                    "cannot delete the current instance artifact",
-                ));
-            }
-
-            // Both disk and full snapshots may be btrfs subvolumes —
-            // delete via node-manager (root). DeleteCacheArtifact
-            // handles both the subvolume case (privileged
-            // `btrfs subvolume delete`) and the plain-directory case
-            // (`remove_dir_all`), and is idempotent on a missing path.
-            let names = (sandbox.id.as_str(), snapshot_name);
-            match delete_cached_snapshot(self, names, local_path, &mut node_client).await {
-                NamedSnapshotDelete::Deleted => {}
-                NamedSnapshotDelete::Refused(error) => return Err(snapshot_delete_refusal(error)),
-                NamedSnapshotDelete::PathDiffers { .. } => {
-                    return Err(Status::failed_precondition(
-                        "delete snapshot publication path differs",
-                    ));
-                }
-                NamedSnapshotDelete::BytesNotDeleted(e) => {
-                    return Err(Status::internal(format!("delete snapshot failed: {e}")));
-                }
-            }
-
-            Ok(Response::new(DeleteSnapshotsResponse {
-                deleted: vec![snapshot_name.to_string()],
-            }))
-        } else {
-            Err(Status::invalid_argument(
-                "provide snapshot_name or set all=true",
-            ))
-        }
     }
 
     pub(super) async fn rollback(
@@ -1795,6 +1657,7 @@ fn start_process_options(
     })
 }
 
+mod named_delete;
 mod rollback_state;
 
 #[cfg(test)]

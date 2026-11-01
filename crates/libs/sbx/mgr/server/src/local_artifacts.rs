@@ -136,18 +136,34 @@ impl CheckoutError {
 pub(crate) enum NamedSnapshotDelete {
     /// `local_path` is gone. Its row, if one was published, is deleted, or
     /// stays `deleting` for startup recovery when that commit failed.
-    Deleted,
+    /// `staging` is where a catalogued snapshot's bytes now wait, once nothing
+    /// owns them: the caller deletes it with `snapshot_gc::delete_gc_staging`
+    /// after releasing its locks, and the reaper's orphan sweep deletes what
+    /// that leaves. It is `None` when nothing was at `local_path`, when the
+    /// snapshot had no row, and when a failed row delete left the row owning
+    /// the staging for startup recovery.
+    Deleted { staging: Option<String> },
     /// The row refused deletion, so the bytes were left alone.
     Refused(CheckoutError),
     /// The row's `local_path` is not the path the caller deletes, so the
     /// bytes were left alone and the row is `ready` again.
     PathDiffers { local_path: String },
-    /// The byte delete failed and `local_path` still exists, or could not be
-    /// read. The row, if any, is `ready` again. A partly deleted tree still
-    /// exists, so it is not detected and comes back `ready`. A delete that
-    /// panics returns no outcome: its row stays `deleting` for startup
-    /// recovery.
+    /// The bytes are still at `local_path`: the rename to GC staging failed
+    /// and the row is `ready` again, or the byte delete of a snapshot without
+    /// a row failed.
     BytesNotDeleted(tonic::Status),
+}
+
+/// Why [`DeleteLease::commit_through_gc_staging`] did not finish.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum GcStagingError {
+    /// The bytes are still at `local_path`, and the row is `ready` again.
+    #[error("rename to GC staging: {0}")]
+    Rename(std::io::Error),
+    /// The bytes left `local_path`, but the row delete failed, so the row
+    /// stays `deleting` for startup recovery.
+    #[error("delete row after GC staging: {0}")]
+    Commit(crate::db::Error),
 }
 
 #[derive(Clone, Copy)]
@@ -634,31 +650,38 @@ impl LocalArtifacts {
         self.check_out_for_delete(id)
     }
 
-    /// Delete a named snapshot's bytes at `delete_path` with `delete_bytes`
-    /// under a delete lease on its row: checkout, then the bytes, then the row.
-    /// A row that refuses checkout, or whose `local_path` is not `delete_path`,
-    /// keeps its bytes. A byte delete that fails is judged from the disk: a
-    /// missing `local_path` commits the row delete, and a present or
-    /// unreadable one rolls the row back to `ready` so the delete can be
-    /// retried; `NotFound` is judged the same way. A snapshot without a row
-    /// (older snapshots predate the catalog) has only its bytes deleted, and
-    /// for it `NotFound` counts as deleted.
+    /// Delete a named snapshot at `delete_path` the way the snapshot reaper
+    /// deletes an artifact (`snapshot_gc::execute_one`): check its row out,
+    /// rename `local_path` to its GC staging sibling and delete the row
+    /// ([`DeleteLease::commit_through_gc_staging`]), and return the staging
+    /// for the caller to delete once its locks are released. Node-manager
+    /// deletes some trees entry by entry, so a failed delete can leave part of
+    /// one behind; the rename keeps such a tree away from `local_path`, and
+    /// the reaper's orphan sweep finishes it.
+    ///
+    /// A row that refuses checkout, or whose `local_path` is not
+    /// `delete_path`, keeps its bytes. A failed rename keeps them too and
+    /// returns the row to `ready`; a rename that finds nothing at
+    /// `local_path` deletes the row. A snapshot without a row (older
+    /// snapshots predate the catalog) has no id to stage under, so
+    /// `delete_in_place` deletes it, under the caller's locks as before, and
+    /// for it `NotFound` counts as deleted. `delete_in_place` runs only then.
     ///
     /// Callers run this to completion. DeleteSnapshots is a state-writer RPC,
     /// and restart admission runs its handler on a tracked task that a client
     /// deadline or disconnect does not cancel (`service::restart_admission`);
     /// a retention tick is not dropped mid-delete. Only a panic or a runtime
-    /// shutdown mid-delete drops the lease after the byte delete began, and
+    /// shutdown drops the lease between the rename and the row delete, and
     /// then the row stays `deleting` for startup recovery.
     pub(crate) async fn delete_named_snapshot(
         &self,
         sandbox_id: &str,
         snapshot_name: &str,
         delete_path: &str,
-        delete_bytes: impl Future<Output = Result<(), tonic::Status>>,
+        delete_in_place: impl Future<Output = Result<(), tonic::Status>>,
     ) -> NamedSnapshotDelete {
         // A name that does not parse can have no row.
-        let mut lease = match SnapshotName::parse(snapshot_name.to_string()) {
+        let lease = match SnapshotName::parse(snapshot_name.to_string()) {
             Ok(name) => match self.check_out_named_for_delete(sandbox_id, &name) {
                 Ok(lease) if lease.local_path() != delete_path => {
                     let local_path = lease.local_path().to_owned();
@@ -674,42 +697,43 @@ impl LocalArtifacts {
             },
             Err(_) => None,
         };
-        if let Some(lease) = lease.as_mut() {
-            lease.mark_path_vacated();
-        }
-        let result = delete_bytes.await;
         let Some(lease) = lease else {
-            return match result {
-                Ok(()) => NamedSnapshotDelete::Deleted,
+            return match delete_in_place.await {
+                Ok(()) => NamedSnapshotDelete::Deleted { staging: None },
                 Err(status) if status.code() == tonic::Code::NotFound => {
-                    NamedSnapshotDelete::Deleted
+                    NamedSnapshotDelete::Deleted { staging: None }
                 }
                 Err(status) => NamedSnapshotDelete::BytesNotDeleted(status),
             };
         };
-        // Node-manager can answer NotFound when it fails to stat a path that
-        // still exists, so with a row NotFound is judged from the disk too.
-        if let Err(error) = result {
-            match tokio::fs::try_exists(lease.local_path()).await {
-                Ok(false) => {}
-                present => {
-                    if let Err(probe) = present {
-                        tracing::warn!(sandbox_id, snapshot_name, error = %probe,
-                            "snapshot byte delete failed and its path is unreadable; returning local artifact row to 'ready'");
-                    }
-                    if let Err(rollback) = lease.roll_back() {
-                        tracing::warn!(sandbox_id, snapshot_name, error = %rollback,
-                            "snapshot bytes were not deleted; failed to roll back local artifact row");
-                    }
-                    return NamedSnapshotDelete::BytesNotDeleted(error);
+        // The reaper runs the rename and the row delete on the blocking pool
+        // too. A task that never ran dropped its lease before the rename, which
+        // returned the row to `ready`.
+        let staged =
+            match tokio::task::spawn_blocking(move || lease.commit_through_gc_staging()).await {
+                Ok(staged) => staged,
+                Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+                Err(error) => {
+                    return NamedSnapshotDelete::BytesNotDeleted(tonic::Status::unavailable(
+                        format!("snapshot delete did not run: {error}"),
+                    ));
                 }
+            };
+        match staged {
+            Ok(staging) => NamedSnapshotDelete::Deleted { staging },
+            Err(error @ GcStagingError::Rename(_)) => {
+                tracing::warn!(sandbox_id, snapshot_name, %error,
+                    "snapshot bytes were not moved aside; local artifact row returned to 'ready'");
+                NamedSnapshotDelete::BytesNotDeleted(tonic::Status::internal(error.to_string()))
+            }
+            // The row still owns the staging, so it waits for startup recovery
+            // to delete the row and the sweep to delete the staging.
+            Err(error @ GcStagingError::Commit(_)) => {
+                tracing::warn!(sandbox_id, snapshot_name, %error,
+                    "moved snapshot bytes aside but failed to remove local artifact row; startup recovery finishes it");
+                NamedSnapshotDelete::Deleted { staging: None }
             }
         }
-        if let Err(error) = lease.commit() {
-            tracing::warn!(sandbox_id, snapshot_name, %error,
-                "deleted snapshot but failed to remove local artifact row; startup recovery finishes it");
-        }
-        NamedSnapshotDelete::Deleted
     }
 
     /// Crash recovery for rows stranded in a non-`Ready` state.
@@ -725,8 +749,9 @@ impl LocalArtifacts {
     ///   artifact's bytes; whatever the crash interrupted, the disk
     ///   contents are intact.
     /// - `deleting` → decide by disk state. The delete sequence is
-    ///   checkout → `rename(local_path, <local_path>.gc-pending-<id>)`
-    ///   → row DELETE, so:
+    ///   checkout → `rename(local_path, <parent>/.gc-pending-<id>)`
+    ///   → row DELETE, so (an earlier version staged at
+    ///   `<local_path>.gc-pending-<id>`, which counts as staging too):
     ///     - original path present and no staging dir → crash was
     ///       before the rename; the bytes are intact → reset to
     ///       `ready`.
@@ -754,13 +779,15 @@ impl LocalArtifacts {
         let mut deleting_deferred = 0usize;
         for (id, local_path) in stuck_deleting {
             let staging = gc_pending_staging_path(&local_path, &id);
+            let legacy_staging = legacy_gc_pending_staging_path(&local_path, &id);
             let (original_present, staging_present) = match (
                 std::path::Path::new(&local_path).try_exists(),
                 std::path::Path::new(&staging).try_exists(),
+                legacy_staging_exists(&legacy_staging),
             ) {
-                (Ok(original), Ok(staging)) => (original, staging),
-                (original, staging) => {
-                    tracing::warn!(artifact_id = %id, ?original, ?staging,
+                (Ok(original), Ok(staging), Ok(legacy)) => (original, staging || legacy),
+                (original, staging, legacy) => {
+                    tracing::warn!(artifact_id = %id, ?original, ?staging, ?legacy,
                         "retaining deleting artifact with unreadable recovery paths");
                     deleting_deferred += 1;
                     continue;
@@ -960,10 +987,50 @@ impl Drop for RestoreLease {
     }
 }
 
-/// Where a deleted artifact's bytes wait for removal. Startup recovery and the
-/// reaper's orphan sweep recognize exactly this shape.
+/// Where a deleted artifact's bytes wait for removal: `.gc-pending-<id>` beside
+/// `local_path`. The name has a fixed length, so a rename can stage a
+/// `local_path` whose own name is as long as the filesystem allows. Startup
+/// recovery and the reaper's orphan sweep recognize this shape and the
+/// [`legacy_gc_pending_staging_path`] one; every name containing
+/// `.gc-pending-` is internal, never a snapshot.
 pub(crate) fn gc_pending_staging_path(local_path: &str, id: impl std::fmt::Display) -> String {
-    format!("{local_path}.gc-pending-{id}")
+    match local_path.trim_end_matches('/').rsplit_once('/') {
+        Some((parent, _)) => format!("{parent}/{GC_PENDING_MARKER}{id}"),
+        None => format!("{GC_PENDING_MARKER}{id}"),
+    }
+}
+
+/// What every GC staging name contains, in either shape, just before the
+/// artifact id.
+pub(crate) const GC_PENDING_MARKER: &str = ".gc-pending-";
+
+/// Whether a directory name is GC staging, in either shape. Staging is
+/// logically deleted bytes that only the orphan sweep may touch, so callers
+/// that list a sandbox's snapshots treat such a name as internal.
+pub(crate) fn is_gc_staging_name(name: &str) -> bool {
+    name.contains(GC_PENDING_MARKER)
+}
+
+/// Whether `<local_path>.gc-pending-<id>` exists. That shape is 48 bytes longer
+/// than `local_path`'s own name, so for a name of 208 bytes or more the path is
+/// too long to exist, and the probe's ENAMETOOLONG means absent; treating it as
+/// unreadable would defer the row on every restart. Every other error stays an
+/// error.
+fn legacy_staging_exists(legacy_staging: &str) -> std::io::Result<bool> {
+    match std::path::Path::new(legacy_staging).try_exists() {
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidFilename => Ok(false),
+        result => result,
+    }
+}
+
+/// The staging shape before [`gc_pending_staging_path`] dropped the original
+/// name, `<local_path>.gc-pending-<id>`. An earlier version may have left it
+/// behind, so startup recovery still looks for it.
+pub(crate) fn legacy_gc_pending_staging_path(
+    local_path: &str,
+    id: impl std::fmt::Display,
+) -> String {
+    format!("{local_path}{GC_PENDING_MARKER}{id}")
 }
 
 /// Active checkout of an artifact in `Deleting` state. The caller is
@@ -1023,10 +1090,31 @@ impl DeleteLease {
         Ok(present.then_some(staging))
     }
 
-    /// Return the row to `ready` because `local_path` still exists, surfacing
-    /// a failure that `Drop` could only log; on failure `Drop` retries the
-    /// rollback. Existence is all the caller checked: a partly deleted tree is
-    /// not detected and comes back `ready`.
+    /// GC's delete after checkout: rename the bytes to their staging sibling
+    /// ([`Self::vacate_to_gc_staging`]), then delete the row. Returns the
+    /// staging path for the caller to delete through node-manager, or `None`
+    /// when nothing was at `local_path`. On a rename error the bytes stay and
+    /// the row returns to `ready`; on a row-delete error the row stays
+    /// `deleting` and owns the staging until startup recovery.
+    pub(crate) fn commit_through_gc_staging(mut self) -> Result<Option<String>, GcStagingError> {
+        let staging = match self.vacate_to_gc_staging() {
+            Ok(staging) => staging,
+            Err(error) => {
+                let id = self.id;
+                if let Err(rollback) = self.roll_back() {
+                    tracing::warn!(local_artifact_id = %id, error = %rollback,
+                        "rename to GC staging failed; retrying the local artifact row rollback on drop");
+                }
+                return Err(GcStagingError::Rename(error));
+            }
+        };
+        self.commit().map_err(GcStagingError::Commit)?;
+        Ok(staging)
+    }
+
+    /// Return the row to `ready` because the bytes are still at `local_path`,
+    /// surfacing a failure that `Drop` could only log; on failure `Drop`
+    /// retries the rollback.
     pub fn roll_back(mut self) -> crate::db::Result<()> {
         self.on_drop = DeleteDrop::RollBack;
         let conn = lock_db(&self.db)?;

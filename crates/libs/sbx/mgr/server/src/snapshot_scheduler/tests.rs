@@ -519,15 +519,22 @@ fn checkpoint_sidecar_execution_metadata_records_the_capturing_host_cpu() {
 /// that helper's tests own the row and byte ordering. A pinned or leased
 /// snapshot is kept, and so is one whose row cannot be read or names another
 /// path, without stopping the rest of the prune: it runs before every
-/// scheduled capture. A failed
-/// byte delete stops the prune at that snapshot.
+/// scheduled capture. A catalogued snapshot is renamed to its GC staging
+/// sibling, which DeleteCacheArtifact deletes once the artifact lock is
+/// released; one whose delete fails partway there is still pruned, because its
+/// row and `local_path` are gone and the reaper's orphan sweep owns the
+/// staging. A failed byte delete of a snapshot without a row stops the prune
+/// at that snapshot, and the capture with it.
 #[tokio::test]
 async fn retention_prune_skips_pinned_and_leased_snapshot_artifacts() {
+    use crate::db::OptionalExtension as _;
     use crate::local_artifacts::LocalArtifacts;
     use pplx_space_node_mgr_client::proto::{
         BtrfsSnapshotInfo, DeleteBtrfsSnapshotRequest, DeleteBtrfsSnapshotResponse,
-        ListBtrfsSnapshotsRequest, ListBtrfsSnapshotsResponse,
+        DeleteCacheArtifactRequest, DeleteCacheArtifactResponse, ListBtrfsSnapshotsRequest,
+        ListBtrfsSnapshotsResponse,
     };
+    use std::path::Path;
 
     #[derive(Clone, Copy, Debug, PartialEq)]
     enum Setup {
@@ -537,6 +544,11 @@ async fn retention_prune_skips_pinned_and_leased_snapshot_artifacts() {
         PathDiffers,
         Uncatalogued,
         Deletable,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum StagingDelete {
+        Removes,
+        FailsPartway,
     }
     // The six oldest of eleven 1m snapshots fall outside retention and are
     // considered oldest first. The snapshot without a row precedes the
@@ -552,19 +564,51 @@ async fn retention_prune_skips_pinned_and_leased_snapshot_artifacts() {
     let names: Vec<String> = (0..11)
         .map(|minute| format!("d-1m-20260101T00{minute:02}00Z"))
         .collect();
-    // (byte deletes fail, prune fails, snapshots whose deletion is requested)
-    for (delete_fails, fails, requested) in [
-        (false, false, vec![names[4].clone(), names[5].clone()]),
-        (true, true, vec![names[4].clone()]),
+    // (the uncatalogued byte delete fails, how a staging delete ends, prune
+    // fails, snapshots deleted by name, whether the deletable one is staged)
+    for (uncatalogued_fails, staging_delete, fails, by_name, staged) in [
+        (
+            false,
+            StagingDelete::Removes,
+            false,
+            vec![names[4].clone()],
+            true,
+        ),
+        (
+            false,
+            StagingDelete::FailsPartway,
+            false,
+            vec![names[4].clone()],
+            true,
+        ),
+        (
+            true,
+            StagingDelete::Removes,
+            true,
+            vec![names[4].clone()],
+            false,
+        ),
     ] {
+        let case = format!("uncatalogued_fails={uncatalogued_fails}, {staging_delete:?}");
+        let root = tempfile::TempDir::new().unwrap();
+        let cache_root = root.path().to_str().unwrap().to_owned();
         let (ctx, sandbox_id) = checkpoint_context(SandboxState::Started);
         let artifacts = LocalArtifacts::new(ctx.db.clone());
         let mut ids = Vec::new();
+        let mut paths = Vec::new();
         for (name, setup) in names.iter().zip(candidates) {
             let id = LocalArtifactId::new();
             ids.push(id);
-            let local_path =
-                pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir(&sandbox_id, name);
+            let local_path = pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir_in(
+                &cache_root,
+                &sandbox_id,
+                name,
+            );
+            std::fs::create_dir_all(&local_path).unwrap();
+            for file in ["memory", "vmstate"] {
+                std::fs::write(Path::new(&local_path).join(file), file).unwrap();
+            }
+            paths.push(local_path.clone());
             if matches!(
                 setup,
                 Setup::Pinned | Setup::Restoring | Setup::PathDiffers | Setup::Deletable
@@ -608,7 +652,17 @@ async fn retention_prune_skips_pinned_and_leased_snapshot_artifacts() {
             }
         }
         let reader = artifacts.check_out_for_restore(ids[1]).unwrap();
-        let deletions = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let deletable = (paths[5].clone(), ids[5]);
+        let staging = format!(
+            "{cache_root}/{sandbox_id}/snapshots/.gc-pending-{}",
+            deletable.1
+        );
+        // Whether the sandbox's artifact lock was free while each staging
+        // delete ran, and whether it was held while the capture ran.
+        let lock_free_at_staging_delete = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let coordinator = ctx.auto_lifecycle.clone();
+        let deleted_by_name = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let deleted_by_path = Arc::new(std::sync::Mutex::new(Vec::new()));
         let listed = names.clone();
         let node_manager = crate::node_manager_transport::fake::FakeNodeManager::default()
             .unary("ListBtrfsSnapshots", move |_: ListBtrfsSnapshotsRequest| {
@@ -624,27 +678,141 @@ async fn retention_prune_skips_pinned_and_leased_snapshot_artifacts() {
                 })
             })
             .unary("DeleteBtrfsSnapshot", {
-                let deletions = Arc::clone(&deletions);
+                let deleted_by_name = Arc::clone(&deleted_by_name);
                 move |request: DeleteBtrfsSnapshotRequest| {
-                    deletions.lock().unwrap().push(request.snapshot_name);
-                    if delete_fails {
+                    deleted_by_name.lock().unwrap().push(request.snapshot_name);
+                    if uncatalogued_fails {
                         return Err(tonic::Status::unavailable("injected byte delete failure"));
                     }
                     Ok(DeleteBtrfsSnapshotResponse {})
                 }
             })
+            .unary("DeleteCacheArtifact", {
+                let (deleted_by_path, root) =
+                    (Arc::clone(&deleted_by_path), root.path().to_owned());
+                let (lock_free, coordinator, sandbox_id) = (
+                    Arc::clone(&lock_free_at_staging_delete),
+                    coordinator.clone(),
+                    sandbox_id.clone(),
+                );
+                move |request: DeleteCacheArtifactRequest| {
+                    lock_free.lock().unwrap().push(
+                        coordinator
+                            .artifact_lock(&sandbox_id)
+                            .try_lock_owned()
+                            .is_ok(),
+                    );
+                    let path = Path::new(&request.local_path);
+                    assert!(path.starts_with(&root));
+                    let result = match staging_delete {
+                        StagingDelete::Removes => {
+                            std::fs::remove_dir_all(path).unwrap();
+                            Ok(DeleteCacheArtifactResponse { was_present: true })
+                        }
+                        StagingDelete::FailsPartway => {
+                            std::fs::remove_file(path.join("memory")).unwrap();
+                            Err(tonic::Status::internal("injected partial delete"))
+                        }
+                    };
+                    deleted_by_path.lock().unwrap().push(request.local_path);
+                    result
+                }
+            })
             .serve();
 
-        let result =
-            prune_scheduled_snapshots(&mut node_manager.connector().lazy(), &ctx, &sandbox_id)
-                .await;
+        let captured_under_lock = std::sync::Mutex::new(None);
+        let result = super::retention::prune_and_capture(
+            &mut node_manager.connector().lazy(),
+            &ctx,
+            &sandbox_id,
+            &cache_root,
+            async |_| {
+                let held = coordinator
+                    .artifact_lock(&sandbox_id)
+                    .try_lock_owned()
+                    .is_err();
+                *captured_under_lock.lock().unwrap() = Some(held);
+                Ok(())
+            },
+        )
+        .await;
 
-        assert_eq!(result.is_err(), fails, "delete_fails={delete_fails}");
+        assert_eq!(result.is_err(), fails, "{case}");
+        // A failed prune skips the capture; a successful one captures under
+        // the lock. The staging is deleted after the lock is released.
         assert_eq!(
-            *deletions.lock().unwrap(),
-            requested,
-            "delete_fails={delete_fails}"
+            *captured_under_lock.lock().unwrap(),
+            (!fails).then_some(true),
+            "{case}"
         );
+        assert_eq!(
+            *lock_free_at_staging_delete.lock().unwrap(),
+            vec![true; usize::from(staged)],
+            "{case}"
+        );
+        assert_eq!(*deleted_by_name.lock().unwrap(), by_name, "{case}");
+        let by_path = if staged {
+            vec![staging.clone()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(*deleted_by_path.lock().unwrap(), by_path, "{case}");
+        // The kept snapshots were not renamed or touched.
+        for path in &paths[..4] {
+            assert_eq!(
+                std::fs::read(Path::new(path).join("memory")).unwrap(),
+                b"memory",
+                "{case}: {path}"
+            );
+        }
+        let row: Option<String> = ctx
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM local_artifacts WHERE local_artifact_id = ?1",
+                [deletable.1.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        if staged {
+            assert_eq!(row, None, "{case}");
+            assert!(!Path::new(&deletable.0).exists(), "{case}");
+            let staged_bytes = std::fs::read(Path::new(&staging).join("vmstate")).ok();
+            let expected = match staging_delete {
+                StagingDelete::Removes => None,
+                StagingDelete::FailsPartway => Some(b"vmstate".to_vec()),
+            };
+            assert_eq!(staged_bytes, expected, "{case}");
+            assert!(!Path::new(&staging).join("memory").exists(), "{case}");
+        } else {
+            assert_eq!(row.as_deref(), Some("ready"), "{case}");
+            assert!(Path::new(&deletable.0).join("memory").exists(), "{case}");
+            assert!(!Path::new(&staging).exists(), "{case}");
+        }
         drop(reader);
+    }
+}
+
+/// GC staging keeps the tier prefix of the snapshot it once was, in the earlier
+/// `<name>.gc-pending-<id>` shape. It takes no retained slot, so it cannot
+/// push a real snapshot out early, and is never a candidate itself.
+#[test]
+fn retention_ignores_gc_staging() {
+    let mut retained = std::array::from_fn(|_| std::collections::BTreeSet::new());
+    let id = "01939e3e-0000-7000-8000-000000000001";
+    let names = (1..=KEEP_D_1M)
+        .map(|minute| format!("d-1m-20260101T00{minute:02}00Z"))
+        .chain([
+            format!("d-1m-20260101T005900Z.gc-pending-{id}"),
+            format!(".gc-pending-{id}"),
+        ]);
+    for name in names {
+        assert_eq!(
+            retention_candidate(&mut retained, name.clone()),
+            None,
+            "{name}"
+        );
     }
 }

@@ -2,6 +2,30 @@ use super::cleanup_support::CleanupLockTryResult;
 use super::create_support::{validate_path_component, validate_snapshot_name};
 use super::*;
 
+/// The name an import publishes its snapshot under: the client's
+/// `target_name`, which must be a valid name of the snapshot's type, or a
+/// generated one. `.gc-pending-` is reserved for GC staging, which no snapshot
+/// RPC treats as a snapshot, so a name containing it is refused rather than
+/// imported and then hidden.
+fn import_target_name(target_name: Option<&str>, prefix: &str) -> Result<String, Status> {
+    let Some(name) = target_name.filter(|name| !name.is_empty()) else {
+        return Ok(format!("{prefix}-imported-{}", uuid::Uuid::now_v7()));
+    };
+    validate_snapshot_name(name)?;
+    if !name.starts_with(&format!("{prefix}-")) {
+        return Err(Status::invalid_argument(
+            "snapshot name does not match snapshot type",
+        ));
+    }
+    if crate::local_artifacts::is_gc_staging_name(name) {
+        return Err(Status::invalid_argument(format!(
+            "invalid snapshot_name: {name}: `{}` is reserved",
+            crate::local_artifacts::GC_PENDING_MARKER
+        )));
+    }
+    Ok(name.to_owned())
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -75,6 +99,12 @@ impl SandboxManagerService {
             return Err(Status::invalid_argument("snapshot_name is required"));
         }
         validate_snapshot_name(&snapshot_name)?;
+        // GC staging is logically deleted bytes, never a snapshot.
+        if crate::local_artifacts::is_gc_staging_name(&snapshot_name) {
+            return Err(Status::failed_precondition(
+                "cannot export an internal snapshot artifact",
+            ));
+        }
 
         // Both d-* (disk) and f-* (full) snapshots are exportable.
         // d-* contains rootfs.ext4 only, f-* contains rootfs.ext4 + VM state files.
@@ -297,22 +327,7 @@ impl SandboxManagerService {
         } else {
             "f"
         };
-        let name = match header
-            .target_name
-            .as_deref()
-            .filter(|name| !name.is_empty())
-        {
-            Some(name) => {
-                validate_snapshot_name(name)?;
-                if !name.starts_with(&format!("{prefix}-")) {
-                    return Err(Status::invalid_argument(
-                        "snapshot name does not match snapshot type",
-                    ));
-                }
-                name.to_owned()
-            }
-            None => format!("{prefix}-imported-{}", uuid::Uuid::now_v7()),
-        };
+        let name = import_target_name(header.target_name.as_deref(), prefix)?;
         let _wake = super::restart_admission::wait_for_activation_admission(
             &sandbox_id,
             self.auto_lifecycle.wake_lock(&sandbox_id).lock_owned(),

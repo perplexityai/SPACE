@@ -196,7 +196,7 @@ async fn within_node_manager_wait<F: std::future::Future>(future: F) -> F::Outpu
 }
 
 /// Backup-completed + idle + not pinned → reaped. The row is gone, and the
-/// artifact directory moves to its `.gc-pending-<id>` staging sibling, which
+/// artifact directory moves to `.gc-pending-<id>` beside it, which
 /// node-manager is asked to delete.
 #[tokio::test(start_paused = true)]
 async fn reaps_idle_uploaded_unpinned_artifact() {
@@ -242,7 +242,7 @@ async fn reaps_idle_uploaded_unpinned_artifact() {
     assert_eq!(report.deleted, 1);
     assert!(report.bytes_freed >= 4096);
     assert!(!std::path::Path::new(&path).exists());
-    let staging = format!("{path}.gc-pending-{TEST_ART_ID}");
+    let staging = format!("{}/.gc-pending-{TEST_ART_ID}", tmp.path().display());
     // The fake acknowledges without deleting, so the staging directory stays.
     assert!(std::path::Path::new(&staging).is_dir());
     assert_eq!(*deletions.lock().unwrap(), vec![staging]);
@@ -774,7 +774,7 @@ fn row_commit_failure_after_the_rename_is_finished_by_startup_recovery() {
         if present {
             make_artifact_dir(&tmp, "art1", 4096);
         }
-        let staging = format!("{path}.gc-pending-{TEST_ART_ID}");
+        let staging = format!("{}/.gc-pending-{TEST_ART_ID}", tmp.path().display());
         if staging_occupied {
             fs::create_dir_all(&staging).unwrap();
             fs::write(Path::new(&staging).join("occupant"), b"x").unwrap();
@@ -821,5 +821,241 @@ fn row_commit_failure_after_the_rename_is_finished_by_startup_recovery() {
         assert_eq!(recovery.total(), finished, "{case}");
         let row = artifacts.get(TEST_ART_ID.parse().unwrap()).unwrap();
         assert_eq!(row.is_none(), finished == 1, "{case}");
+    }
+}
+
+/// Node-manager deletes some snapshot trees entry by entry, so a delete can
+/// fail partway. A named delete stages the bytes as the reaper does and hands
+/// the staging back, so such a failure in its caller's staging delete (this
+/// module's `delete_gc_staging`) leaves part of the tree in
+/// `.gc-pending-<id>`, never at `local_path`; with its row gone, this module's
+/// orphan sweep reclaims it.
+#[tokio::test]
+async fn named_delete_failing_partway_leaves_staging_for_the_orphan_sweep() {
+    use crate::local_artifacts::NamedSnapshotDelete;
+    use pplx_space_common_core::types::{ArtifactKind, SandboxId, SnapshotName};
+    use pplx_space_node_mgr_client::proto::{
+        DeleteCacheArtifactRequest, DeleteCacheArtifactResponse,
+    };
+
+    const NAME: &str = "d-user-partial";
+    let root = TempDir::new().unwrap();
+    let cache_root = root.path().to_str().unwrap().to_owned();
+    let sandbox = SandboxId::new().to_string();
+    let local_path = pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir_in(
+        &cache_root,
+        &sandbox,
+        NAME,
+    );
+    fs::create_dir_all(Path::new(&local_path).join("nested")).unwrap();
+    for file in ["memory", "vmstate", "nested/rootfs"] {
+        fs::write(Path::new(&local_path).join(file), file).unwrap();
+    }
+    let conn = open_test_db();
+    crate::db::fixture::insert_test_sandbox(&conn, &sandbox, crate::state::SandboxState::Stopped);
+    let db = crate::db::SharedConnection::new(conn);
+    let artifacts = LocalArtifacts::new(db.clone());
+    let id = LocalArtifactId::new();
+    artifacts
+        .publish_named_snapshot(
+            &sandbox,
+            id,
+            ArtifactKind::Disk,
+            &SnapshotName::parse(NAME).unwrap(),
+            &local_path,
+        )
+        .unwrap();
+    let staging = format!("{cache_root}/{sandbox}/snapshots/.gc-pending-{id}");
+    // The first delete removes one file of the tree and one of its directory,
+    // then fails; later ones delete the whole path.
+    let deletions = Arc::new(Mutex::new(Vec::new()));
+    let node_manager = crate::node_manager_transport::fake::FakeNodeManager::default()
+        .unary("DeleteCacheArtifact", {
+            let (deletions, root) = (Arc::clone(&deletions), root.path().to_owned());
+            move |request: DeleteCacheArtifactRequest| {
+                let path = Path::new(&request.local_path);
+                assert!(path.starts_with(&root));
+                let mut deletions = deletions.lock().unwrap();
+                deletions.push(request.local_path.clone());
+                if deletions.len() == 1 {
+                    fs::remove_file(path.join("memory")).unwrap();
+                    fs::remove_file(path.join("nested/rootfs")).unwrap();
+                    return Err(tonic::Status::deadline_exceeded("injected partial delete"));
+                }
+                fs::remove_dir_all(path).unwrap();
+                Ok(DeleteCacheArtifactResponse { was_present: true })
+            }
+        })
+        .serve();
+
+    let result = artifacts
+        .delete_named_snapshot(&sandbox, NAME, &local_path, async {
+            Err(tonic::Status::internal("never deleted in place"))
+        })
+        .await;
+    let NamedSnapshotDelete::Deleted {
+        staging: Some(handed),
+    } = result
+    else {
+        panic!("expected the staging back, got {result:?}");
+    };
+    assert_eq!(handed, staging);
+    let mut client = node_manager.connector().lazy();
+    delete_gc_staging(&mut client, &handed, "test", NAME)
+        .await
+        .unwrap_err();
+
+    assert!(artifacts.get(id).unwrap().is_none());
+    assert!(!Path::new(&local_path).exists());
+    assert_eq!(
+        fs::read(Path::new(&staging).join("vmstate")).unwrap(),
+        b"vmstate"
+    );
+    assert!(!Path::new(&staging).join("memory").exists());
+
+    let ownership = GcOwnership {
+        node_manager: node_manager.connector(),
+        ..test_ownership()
+    };
+    sweep_orphans(
+        &mut OrphanScan::default(),
+        OrphanKind::GcPending,
+        root.path(),
+        &artifacts,
+        Arc::new(crate::service::fork_artifact::CopyOperationReservations::default()),
+        &ownership,
+    )
+    .await;
+
+    assert_eq!(
+        *deletions.lock().unwrap(),
+        vec![staging.clone(), staging.clone()]
+    );
+    assert!(!Path::new(&staging).exists());
+}
+
+/// The sweep reclaims unowned staging in both shapes: the fixed-length
+/// `.gc-pending-<id>` and `<name>.gc-pending-<id>`, which an earlier version
+/// left, beside a suspend artifact and inside `snapshots/`. Staging whose row
+/// still exists is kept.
+#[tokio::test]
+async fn orphan_sweep_reclaims_staging_in_either_shape() {
+    use pplx_space_node_mgr_client::proto::{
+        DeleteCacheArtifactRequest, DeleteCacheArtifactResponse,
+    };
+
+    let root = TempDir::new().unwrap();
+    let sandbox = root.path().join("01939e3e-0000-7000-8000-0000000000aa");
+    fs::create_dir_all(sandbox.join("snapshots")).unwrap();
+    let ids: Vec<LocalArtifactId> = (0..5).map(|_| LocalArtifactId::new()).collect();
+    let unowned = [
+        sandbox.join(format!(".gc-pending-{}", ids[0])),
+        sandbox.join(format!("snapshot.gc-pending-{}", ids[1])),
+        sandbox.join(format!("snapshots/.gc-pending-{}", ids[2])),
+        sandbox.join(format!(
+            "snapshots/d-1m-20260101T000000Z.gc-pending-{}",
+            ids[3]
+        )),
+    ];
+    let owned = sandbox.join(format!("snapshots/.gc-pending-{}", ids[4]));
+    for dir in unowned.iter().chain([&owned]) {
+        fs::create_dir(dir).unwrap();
+        fs::write(dir.join("memory"), b"staged").unwrap();
+    }
+    let conn = open_test_db();
+    insert_artifact_row(
+        &conn,
+        &ids[4].to_string(),
+        "sbx-owned",
+        "/missing",
+        0,
+        0,
+        None,
+    );
+    let artifacts = LocalArtifacts::new(crate::db::SharedConnection::new(conn));
+    let deletions = Arc::new(Mutex::new(Vec::new()));
+    let node_manager = crate::node_manager_transport::fake::FakeNodeManager::default()
+        .unary("DeleteCacheArtifact", {
+            let (deletions, root) = (Arc::clone(&deletions), root.path().to_owned());
+            move |request: DeleteCacheArtifactRequest| {
+                assert!(Path::new(&request.local_path).starts_with(&root));
+                fs::remove_dir_all(&request.local_path).unwrap();
+                deletions.lock().unwrap().push(request.local_path);
+                Ok(DeleteCacheArtifactResponse { was_present: true })
+            }
+        })
+        .serve();
+    let ownership = GcOwnership {
+        node_manager: node_manager.connector(),
+        ..test_ownership()
+    };
+
+    sweep_orphans(
+        &mut OrphanScan::default(),
+        OrphanKind::GcPending,
+        root.path(),
+        &artifacts,
+        Arc::new(crate::service::fork_artifact::CopyOperationReservations::default()),
+        &ownership,
+    )
+    .await;
+
+    let mut deleted = deletions.lock().unwrap().clone();
+    deleted.sort();
+    let mut expected: Vec<String> = unowned
+        .iter()
+        .map(|dir| dir.to_string_lossy().into_owned())
+        .collect();
+    expected.sort();
+    assert_eq!(deleted, expected);
+    assert!(unowned.iter().all(|dir| !dir.exists()));
+    assert!(owned.join("memory").exists());
+}
+
+/// The reaper evicts artifacts whose names are as long as a filename can be:
+/// staging has a fixed-length name, where `<name>.gc-pending-<id>` would fail
+/// the rename with ENAMETOOLONG from 208 bytes and leave the artifact
+/// unevictable.
+#[test]
+fn reaper_evicts_artifacts_whose_names_are_long() {
+    for length in [207, 208, 255] {
+        let conn = open_test_db();
+        let tmp = TempDir::new().unwrap();
+        let name = format!("d-{}", "x".repeat(length - 2));
+        let path = make_artifact_dir(&tmp, &name, 4096);
+        insert_artifact_row(&conn, TEST_ART_ID, "sbx1", &path, 0, 0, Some(0));
+        insert_sandbox_row(&conn, "sbx1", None);
+        let artifacts = LocalArtifacts::new(crate::db::SharedConnection::new(conn));
+
+        let (outcome, staging) = execute_one(
+            &artifacts,
+            TEST_ART_ID,
+            "sbx1",
+            GcEligibility {
+                now_secs: now_secs(),
+                idle_secs: 0,
+                grace_secs: 0,
+            },
+        )
+        .unwrap_or_else(|error| panic!("{length} bytes: {error}"));
+
+        let expected = format!("{}/.gc-pending-{TEST_ART_ID}", tmp.path().display());
+        assert_eq!(outcome, EvictionOutcome::Deleted, "{length} bytes");
+        assert_eq!(
+            staging.as_deref(),
+            Some(expected.as_str()),
+            "{length} bytes"
+        );
+        assert!(!Path::new(&path).exists(), "{length} bytes");
+        assert!(
+            Path::new(&expected).join("memory").exists(),
+            "{length} bytes"
+        );
+        assert!(
+            artifacts
+                .get(TEST_ART_ID.parse().unwrap())
+                .unwrap()
+                .is_none()
+        );
     }
 }
