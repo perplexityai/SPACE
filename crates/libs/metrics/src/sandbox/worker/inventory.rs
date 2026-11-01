@@ -23,6 +23,18 @@ pub fn lifecycle_count(value: u64, state: &str) {
     );
 }
 
+/// Sandboxes whose pinned lifecycle artifact has no durable remote copy yet,
+/// and how long the oldest of them has waited since it was captured. Both
+/// fall back to zero once every backup completes.
+pub fn pending_backups(count: u64, oldest_age_seconds: u64) {
+    gauge("sandbox.worker.backup.pending", count as f64, &[]);
+    gauge(
+        "sandbox.worker.backup.pending_oldest_age_seconds",
+        oldest_age_seconds as f64,
+        &[],
+    );
+}
+
 /// Disposition of an inventory-reconcile orphan row materialization — which
 /// arm fired when the reconcile found sandbox evidence (disk or runtime)
 /// with no sbx-manager metadata row. Shared by the
