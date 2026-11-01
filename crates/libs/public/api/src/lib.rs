@@ -927,6 +927,43 @@ pub enum DataPlaneClientFrame {
     Close,
 }
 
+/// The first client frame on `createAndAttachProcessSession`: what a
+/// `createProcessSession` call would send, as a frame because a browser
+/// WebSocket cannot carry a request body or arbitrary headers.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", serde(tag = "type", rename_all = "snake_case"))]
+pub enum ProcessSessionCreateClientFrame {
+    Create {
+        /// Sent as the create's `Idempotency-Key` header.
+        idempotency_key: Option<String>,
+        /// The `createProcessSession` request body, forwarded unchanged so
+        /// the create validates it exactly as it validates a POST.
+        request: serde_json::Value,
+    },
+}
+
+/// The server's answer to [`ProcessSessionCreateClientFrame::Create`], sent
+/// before any [`DataPlaneServerFrame`].
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", serde(tag = "type", rename_all = "snake_case"))]
+pub enum ProcessSessionCreateServerFrame {
+    /// The `createProcessSession` response body. The socket goes on to attach
+    /// it; its `attach.token` reattaches through `attachSession`.
+    Session { session: serde_json::Value },
+    /// The create was answered with an error: its HTTP status and error body,
+    /// exactly as `createProcessSession` returns them. The socket then closes.
+    CreateFailed {
+        status: u16,
+        error: Option<serde_json::Value>,
+    },
+    /// The create could not be completed. The session may exist, so retry
+    /// with the same idempotency key, here or through `createProcessSession`.
+    /// The socket then closes.
+    CreateUnavailable { message: String },
+}
+
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Eq, PartialEq)]
