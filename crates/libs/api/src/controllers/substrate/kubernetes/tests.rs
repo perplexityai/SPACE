@@ -538,9 +538,9 @@ mod kubernetes_tests {
 
     /// The per-node slot index the reflector would build from `pods`.
     fn network_slots_for(pods: &[Arc<Pod>]) -> NodeNetworkSlots {
-        let (_, network_slots, _) =
+        let (_, indexes, _) =
             sandbox_pod_view::seeded_sandbox_pod_cache(pods.iter().map(|pod| (**pod).clone()));
-        network_slots
+        indexes.network_slots
     }
 
     #[test]
@@ -1916,7 +1916,7 @@ mod kubernetes_tests {
         nodes: Vec<Node>,
     ) -> KubernetesSubstrate {
         let (node_api_pod_store, mut node_api_pod_writer) = reflector::store::<Pod>();
-        let (pod_store, pod_network_slots, mut pod_writer) = sandbox_pod_view::sandbox_pod_cache();
+        let (pod_store, pod_indexes, mut pod_writer) = sandbox_pod_view::sandbox_pod_cache();
         if !pods.is_empty() {
             use kube::runtime::watcher::Event;
             node_api_pod_writer.apply_watcher_event(&Event::Init);
@@ -1942,7 +1942,7 @@ mod kubernetes_tests {
             sandbox_proxy_port,
             SandboxPodConfigValues::default(),
             caches,
-            (pod_store, pod_network_slots),
+            (pod_store, pod_indexes),
         )
     }
 
@@ -9420,7 +9420,7 @@ mod kubernetes_tests {
         node_writer.apply_watcher_event(&Event::InitDone);
 
         let (node_api_pod_store, _) = reflector::store::<Pod>();
-        let (pod_store, pod_network_slots, _) = sandbox_pod_view::sandbox_pod_cache();
+        let (pod_store, pod_indexes, _) = sandbox_pod_view::sandbox_pod_cache();
         let caches = Arc::new(K8sCaches::for_test(
             node_api_pod_store,
             node_store,
@@ -9437,7 +9437,7 @@ mod kubernetes_tests {
             DEFAULT_SANDBOX_PROXY_PORT,
             sandbox_pod_config,
             caches,
-            (pod_store, pod_network_slots),
+            (pod_store, pod_indexes),
         )
     }
 

@@ -80,6 +80,7 @@ use crate::models::{ClusterPoolConfigRequest, ClusterPoolConfigResponse, Sandbox
 use sqlx::{PgPool, Postgres, Transaction};
 
 mod execution_fence;
+mod live_count;
 mod local_artifact;
 pub(crate) mod native_access;
 mod node_api_client;
@@ -89,6 +90,7 @@ pub mod runtime_upgrade;
 mod sandbox_state_probe;
 
 pub use execution_fence::*;
+pub use live_count::*;
 pub use local_artifact::*;
 pub use node_api_client::*;
 pub use pool_claims::*;
@@ -1981,6 +1983,27 @@ impl Substrate {
             Inner::Direct(_) => ReflectorReady::always_ready(),
             #[cfg(feature = "kubernetes")]
             Inner::Kubernetes(substrate) => substrate.readiness(),
+        }
+    }
+
+    /// How many sandboxes with a live runtime the client ids `ids` select
+    /// hold, other than `activating` and the sandboxes in `already_pending`.
+    /// A synchronous cache read: Kubernetes counts from the sandbox-pod
+    /// reflector, and Direct, with no in-memory inventory, answers
+    /// [`LiveSandboxCountUnknown::Unsupported`], so the live cap admits.
+    #[cfg_attr(not(feature = "kubernetes"), allow(unused_variables))]
+    pub fn live_sandboxes_for_client(
+        &self,
+        ids: &CountedIds,
+        activating: Option<SandboxId>,
+        already_pending: &std::collections::HashSet<SandboxId>,
+    ) -> LiveSandboxCount {
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.live_sandboxes_for_client(),
+            #[cfg(feature = "kubernetes")]
+            Inner::Kubernetes(substrate) => {
+                substrate.live_sandboxes_for_client(ids, activating, already_pending)
+            }
         }
     }
 

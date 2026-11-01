@@ -64,7 +64,8 @@ async fn reflect_sandbox_pods_updates_store_and_slots_then_broadcasts_touched_na
     use futures_util::stream;
     use kube::runtime::watcher::Event;
 
-    let (store, network_slots, writer) = sandbox_pod_view::sandbox_pod_cache();
+    let (store, indexes, writer) = sandbox_pod_view::sandbox_pod_cache();
+    let network_slots = indexes.network_slots;
     let (_events, tx) = PodEvents::new();
     let mut rx = tx.subscribe();
 

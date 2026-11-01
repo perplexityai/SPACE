@@ -142,6 +142,8 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_API_CLIENT_CONCURRENCY_MAX_PER_CLIENT` | 32 | |
 | `SPACE_API_CLIENT_CONCURRENCY_KNOWN_CLIENTS` | empty | Comma-separated `X-Client-ID` values that get their own limiter bucket. These IDs, plus the keys of the runtime quota overrides, are also the only values the limiter and reconnect metrics report as `client_id`; any other caller is `unknown`, and an override-only caller past the per-process cap of 64 is `overflow`. The IDs `unknown`, `overflow` and `native`, in any case, are reserved, and an ID must be a valid Kubernetes label value. Listed here or as an override key, any other entry is ignored, and its caller shares the unspecified bucket. IDs that differ only in case keep separate buckets but share one `client_id` series, because Datadog lowercases tag values; startup warns about these and the ignored entries in this list, and the first request that matches an ignored override key warns about that key. |
 | `SPACE_ACTIVATION_CLIENT_ATTRIBUTION_ENABLED` | off | API and cluster controller: whether SPACE records which client's activation created a sandbox's runtime. On Kubernetes, with it on, new sandbox and restore pods carry a `space.pplx.net/client-id` label, a warm-pool adoption patches the adopter's label onto the pod before it commits (one apiserver write per adopted create, up to three while the apiserver throttles; a pod that can't be labeled isn't adopted: a transient failure (throttling past the retries, a 408 or 5xx, a dropped connection) fails the create retryably, giving the slot back or, for a create whose slot was claimed at admission, keeping the claim for the retry, and a permanent refusal invalidates the slot), and creates and pod tracking write `sandboxes.activating_client_id`. On Direct, with it on, creates write that record. On either substrate, with it on, an ECW resume also takes a slot under the per-client concurrency limit (`SPACE_API_CLIENT_CONCURRENCY_*`). Off, none of these happens on either substrate: no label, no patch, no record and no resume slot, so a deployment that already enforces the limiter sees no new resume 429s until it turns this on. A per-client live-sandbox cap counts nothing until it's on. Set it the same on the API and the cluster controller. `1`, `true`, `yes`, `on` or `enabled` turns it on; anything else keeps it off. See [Client attribution](ecw.md#client-attribution). |
+| `SPACE_API_CLIENT_LIVE_CAP_PER_CLIENT` | unset | The most sandboxes with a live runtime one listed ECW client may hold. A listed client is one named in `SPACE_API_CLIENT_CONCURRENCY_KNOWN_CLIENTS` or in the quotas flag (in `live`, or in `overrides` while the concurrency limiter isn't `off`) while this variable is set. Unset or `0` means no cap. See "Live cap" below the table. |
+| `SPACE_API_CLIENT_LIVE_CAP_UNKNOWN` | unset | The cap that every unlisted ECW client shares, including callers that send no valid `X-Client-ID`. Unset or `0` means no cap. Native `/v1` and admin calls are never capped as `native`; an implicit wake of a sandbox an ECW client activated, such as a native file read, counts against that client. |
 | `SPACE_API_CLIENT_CLASSES` | empty | JSON map; invalid JSON fails startup. |
 | `SPACE_CLUSTER_ACTIVATION_ADMISSION_ENABLED` | on | Fails open (with a warning) when `SPACE_REDIS_URL` is unset. |
 | `SPACE_CLUSTER_ACTIVATION_ADMISSION_REFILL_RPS` | 60 | |
@@ -260,6 +262,64 @@ it already taken; it should stay at 0.
 | `operations.requeued` (by `reason`) | `activation_backpressure` counts cluster admission refusals: past that point, more slots only queue behind the bucket. |
 | `node.sandbox_admission.in_flight` and `node.sandbox_admission.queue_wait_ms` | Activations at the node limit, and how long they wait for it. |
 | `cluster.sandbox_admission.rate.decision` | The cluster bucket's admissions and refusals. |
+
+### Live cap
+
+The live cap refuses an ECW activation that would give a client more sandboxes
+with a live runtime than its cap: a create or fork, a connect or resume that
+wakes a dormant sandbox, or a rebuild of a lost pod. The refusal is a `429`
+with a `Retry-After` and a message naming the cap. It's checked before any
+cluster activation token is spent wherever a new runtime is certain, and
+otherwise where a pod is about to be created. A call that reaches a sandbox
+whose runtime is still running is never refused.
+
+On Kubernetes a client's count is the sandboxes whose live pods carry its
+`space.pplx.net/client-id` label, plus admissions still in progress and, for
+about half a minute, any admission that created (or may have created) a pod
+the API's pod cache hasn't seen yet. Those are kept in Redis
+(`SPACE_REDIS_URL`). The Direct substrate keeps no per-client inventory, so
+the cap admits there. It counts only while
+`SPACE_ACTIVATION_CLIENT_ATTRIBUTION_ENABLED` is on, since pods carry no
+client label otherwise; with it off, every check admits. A Redis error, a cold
+pod cache, or a missing Redis URL also admits. While the pod cache can't be
+trusted (after a watch error, or during a re-list), the cap counts the recent
+admissions alone, so the pods a stale cache still holds never cause a refusal;
+recent admissions still can. Every decision is counted in
+`sandbox.api.client_live_cap.decision`, tagged with the client key and the
+reason, so a cap that can't see shows up as its own reason.
+
+A pod counts until it's gone. A stopped or paused sandbox keeps its pod and
+still counts, so suspending or deleting a sandbox is what frees its place. A
+terminating pod still counts, including one left on a lost node until the
+node is removed.
+
+Pods count only once they carry the label. Pods created by an older release,
+or while attribution was off, don't, and neither does a pod that later
+replaces one of theirs without an ECW request: a sandbox with no recorded
+activating client gets its client again only from an ECW create, fork,
+connect or resume. Turn attribution on first; the cap undercounts each
+client's older sandboxes until such an activation relabels them.
+
+The cluster controller runs ECW operations it dispatches through its own
+cap, so set the `SPACE_API_CLIENT_LIVE_CAP_*` variables, like the attribution
+switch, the same on the API and the cluster controller. A component without
+them doesn't cap, and emits no decision metric.
+
+Per-client caps come from the `live` field of the client quotas flag, a map
+from client id to cap (`unknown` sets the shared cap). The flag only tunes a
+cap the environment enabled: a client's `live` entry applies only while the
+matching variable above is set, and a `0` entry is ignored. Naming a client
+in the flag moves it from the shared `unknown` cap to its own cap under the
+per-client default, so it changes which cap applies. To cap only some clients,
+set a high default and lower overrides. When the flag stops resolving, the
+last valid value stands for ten minutes; after that the allowlist alone sets
+which clients are listed. A client listed only in the flag then counts
+under the shared `unknown` cap until the flag resolves again, so a long flag
+outage can refuse unlisted clients that the shared cap no longer fits.
+
+A client named in `SPACE_API_CLIENT_CONCURRENCY_KNOWN_CLIENTS` is a listed
+client, so with only `SPACE_API_CLIENT_LIVE_CAP_UNKNOWN` set it has no live
+cap.
 
 ## Templates and builds
 
