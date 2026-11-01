@@ -1191,3 +1191,87 @@ async fn postgres_admitted_pool_cleanup_pending_reports_failed_adoptions() -> Te
     assert!(admitted_pool_cleanup_pending(&db.pool, slot.sandbox_id).await?);
     Ok(())
 }
+
+/// Characterization of the release choice of the Kubernetes pool config upsert
+/// (`resolve_pool_template_release`): the release whose stored hash equals the
+/// requested string when a hash is given; otherwise the `latest` holder, else
+/// the newest by `created_at`. It takes no runtime and no caller org, and never
+/// reads `templates`. The create path's pool claim passes the release sandbox
+/// create resolved and skips it.
+#[tokio::test(flavor = "current_thread")]
+async fn pool_template_release_resolution_characterization() -> TestResult {
+    use crate::controllers::test_fixtures::{
+        RESOLVER_DELETING_TEMPLATE, RESOLVER_PRIVATE_TEMPLATE, RESOLVER_TEMPLATE,
+        RESOLVER_UNTAGGED_TEMPLATE, hex, seed_resolver_world,
+    };
+    let db = pg_test_db().await?;
+    let w = seed_resolver_world(&db.pool).await?;
+    let sha = |c| format!("sha256:{}", hex(c));
+    let blake = |c| format!("blake3:{}", hex(c));
+
+    let cases = [
+        // The `latest` holder, not the most recently tagged `bare`.
+        (RESOLVER_TEMPLATE, None, Some((w.latest_holder, sha('d')))),
+        (RESOLVER_TEMPLATE, Some(hex('a')), Some((w.bare, hex('a')))),
+        // Exact string match only; sandbox create, ClusterApi by-hash and
+        // observed-demand matching find the bare row here.
+        (RESOLVER_TEMPLATE, Some(sha('a')), None),
+        (
+            RESOLVER_TEMPLATE,
+            Some(sha('b')),
+            Some((w.prefixed, sha('b'))),
+        ),
+        // ClusterApi by-hash and observed-demand matching find the prefixed row
+        // for this bare request.
+        (RESOLVER_TEMPLATE, Some(hex('b')), None),
+        (
+            RESOLVER_TEMPLATE,
+            Some(blake('c')),
+            Some((w.blake3, blake('c'))),
+        ),
+        // A missed hash does not fall back to `latest`.
+        (RESOLVER_TEMPLATE, Some(sha('c')), None),
+        (
+            RESOLVER_TEMPLATE,
+            Some(hex('9')),
+            Some((w.dual_bare, hex('9'))),
+        ),
+        (
+            RESOLVER_TEMPLATE,
+            Some(sha('9')),
+            Some((w.dual_prefixed, sha('9'))),
+        ),
+        // No `latest`: the newest by created_at, which is neither first nor
+        // last by insertion, id or hash. Sandbox create, build base and
+        // ClusterApi FindTemplateRelease answer not found.
+        (
+            RESOLVER_UNTAGGED_TEMPLATE,
+            None,
+            Some((w.untagged_newest, sha('2'))),
+        ),
+        (
+            RESOLVER_UNTAGGED_TEMPLATE,
+            Some(sha('1')),
+            Some((w.untagged_older, sha('1'))),
+        ),
+        // No org scope: an org-specific template resolves with no caller.
+        (RESOLVER_PRIVATE_TEMPLATE, None, Some((w.private, sha('f')))),
+        // `desired_state` is not read: a template being deleted still resolves.
+        (
+            RESOLVER_DELETING_TEMPLATE,
+            None,
+            Some((w.deleting, sha('7'))),
+        ),
+    ];
+    for (template, hash, expected) in cases {
+        let mut tx = db.pool.begin().await?;
+        let resolved = resolve_pool_template_release(&mut tx, template, hash.as_deref()).await?;
+        tx.rollback().await?;
+        assert_eq!(
+            resolved.map(|row| (row.id, row.content_hash)),
+            expected,
+            "{template} hash={hash:?}"
+        );
+    }
+    Ok(())
+}
