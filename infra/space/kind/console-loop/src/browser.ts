@@ -1,5 +1,5 @@
 // Page helpers shared by the steps and the capture flows.
-import type { Browser, BrowserContext, Locator, Page } from 'playwright';
+import type { APIResponse, Browser, BrowserContext, Locator, Page, Route } from 'playwright';
 
 import type { Config } from './config.ts';
 import { redact, type Recorder } from './recorder.ts';
@@ -150,20 +150,55 @@ export function shortLabel(id: string): string {
   return id.replace(/^sbx_/, '').replaceAll('-', '').slice(-8);
 }
 
+// Send an intercepted request on to the server without following a
+// redirect. A 3xx answer is refused: the request fails in the page, and
+// this returns null.
+export async function fetchWithoutRedirect(route: Route): Promise<APIResponse | null> {
+  const response = await route.fetch({ maxRedirects: 0 });
+  if (response.status() >= 300 && response.status() < 400) {
+    await route.abort('blockedbyclient');
+    return null;
+  }
+  return response;
+}
+
 // What the page receives instead of a new API key's secret: the API Keys
 // page shows the secret once, in a dialog, and the loop answers the create
 // request itself (`page.route`) with this in its place, so the browser never
 // holds a live key and no screenshot or video frame can show one.
 export const SECRET_PLACEHOLDER = 'console-loop-placeholder-not-a-key';
 
-// The create response's body with its `secret` replaced, and anything else
-// shaped like a key redacted; the key's ID when the body carries one.
+// Replace every `secret` string in a parsed JSON value; returns how many.
+function replaceSecrets(value: unknown): number {
+  if (!value || typeof value !== 'object') return 0;
+  let count = 0;
+  for (const [field, inner] of Object.entries(value)) {
+    if (field === 'secret' && typeof inner === 'string' && inner !== SECRET_PLACEHOLDER) {
+      (value as Record<string, unknown>)[field] = SECRET_PLACEHOLDER;
+      count += 1;
+    } else {
+      count += replaceSecrets(inner);
+    }
+  }
+  return count;
+}
+
+// Whether a response body is JSON that carries a `secret` string.
+export function carriesSecret(text: string): boolean {
+  try {
+    return replaceSecrets(JSON.parse(text)) > 0;
+  } catch {
+    return false;
+  }
+}
+
+// A response body with every `secret` replaced, and anything else shaped
+// like a key redacted; the created key's ID when the body carries one.
 export function withoutSecret(text: string): { body: string; replaced: boolean; id?: string } {
-  let parsed: { secret?: unknown; api_key?: { id?: unknown } } | null = null;
+  let parsed: { api_key?: { id?: unknown } } | null = null;
   try { parsed = JSON.parse(text); } catch { /* not JSON */ }
   if (!parsed || typeof parsed !== 'object') return { body: redact(text), replaced: false };
-  const replaced = typeof parsed.secret === 'string';
-  if (replaced) parsed.secret = SECRET_PLACEHOLDER;
+  const replaced = replaceSecrets(parsed) > 0;
   const id = typeof parsed.api_key?.id === 'string' ? parsed.api_key.id : undefined;
   return { body: redact(JSON.stringify(parsed)), replaced, id };
 }
