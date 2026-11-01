@@ -39,7 +39,7 @@ import {
   StopOutlined,
   ThunderboltOutlined,
 } from '@ant-design/icons';
-import { sandboxLabelOrId, sandboxUuidPart } from '@/lib/sandbox-id';
+import { parseSandboxRef, safeDecodeURIComponent, sandboxLabelOrId, sandboxUuidPart } from '@/lib/sandbox-id';
 import { runSandboxCommand, type ProcessRunResult } from '@/lib/data-plane-process';
 import {
   openSandboxTerminal,
@@ -960,7 +960,7 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
   const refresh = async (showSpinner = false) => {
     if (showSpinner) setLoading(true);
     try {
-      setSandbox(await getConsoleSandbox(id));
+      setSandbox(await getConsoleSandbox(safeDecodeURIComponent(id)));
       setError(null);
     } catch (err: any) {
       setError(err.message || 'Failed to load sandbox');
@@ -971,6 +971,13 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
 
   useEffect(() => {
     if (!id) return;
+    // Any accepted identifier (bare UUID, pod name) moves to the canonical
+    // URL before anything loads; the effect then runs again for that URL.
+    const ref = parseSandboxRef(safeDecodeURIComponent(id));
+    if (ref && ref.publicId !== id) {
+      router.replace(`/dashboard/sandboxes/${ref.publicId}`);
+      return;
+    }
     setLoading(true);
     void refresh(true);
     getPublicPage<PublicTemplate>('/templates?limit=1000')
@@ -1074,7 +1081,7 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
         <Link href="/dashboard/sandboxes"><ArrowLeftOutlined /> Sandboxes</Link>
         <Title level={3} style={{ marginTop: 8 }}>Sandbox not found</Title>
         <Paragraph type="danger">{error}</Paragraph>
-        <Paragraph><code>{sandboxLabelOrId(id)}</code></Paragraph>
+        <Paragraph><code>{safeDecodeURIComponent(id)}</code></Paragraph>
       </div>
     );
   }
