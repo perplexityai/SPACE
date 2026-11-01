@@ -1,8 +1,8 @@
 //! `GetNodeRuntimeDesiredState`: whole-node runtime intent. It carries the
 //! cluster's execution environment policy and a provisioning recipe, each
 //! behind its own setting that every cluster API replica reads at startup,
-//! off by default. The recipe is [`catalog_store::list_unretired`], served to
-//! the nodes [`RuntimeProvisioningCohort`] admits.
+//! off by default. The recipe is [`catalog_store::list_unretired_for_node`],
+//! served to the nodes [`RuntimeProvisioningCohort`] admits.
 //!
 //! [`RuntimeProvisioningCohort`]: crate::runtime_provisioning_cohort::RuntimeProvisioningCohort
 
@@ -81,8 +81,10 @@ impl ClusterApiService {
 
     /// `None` unless the node is in the cohort. Keyed on the registered role,
     /// not the request's hint: cluster nodes run no microVMs, so they're
-    /// assigned no recipe; workers and builders both do, and get the same one.
-    /// Absence never implies an E0 installation or permission to remove files.
+    /// assigned no recipe; workers and builders both do, by the same rule: the
+    /// unretired environments the node's build reports it knows, or the whole
+    /// catalog before it reports any. Absence never implies an E0 installation
+    /// or permission to remove files.
     ///
     /// A catalog that can't be read, or that lists more than a recipe may,
     /// omits the recipe from this one response rather than failing the call,
@@ -102,17 +104,22 @@ impl ClusterApiService {
         {
             return None;
         }
-        let environments = match catalog_store::list_unretired(&self.runtime_catalog_pool).await {
-            Ok(environments) => environments,
-            Err(error) => {
-                log_store_read_failure(&error, "runtime environment catalog");
-                return None;
-            }
-        };
+        let environments =
+            match catalog_store::list_unretired_for_node(&self.runtime_catalog_pool, origin.id)
+                .await
+            {
+                Ok(environments) => environments,
+                Err(error) => {
+                    log_store_read_failure(&error, "runtime environment catalog");
+                    return None;
+                }
+            };
         if environments.len() > MAX_RECIPE_ENVIRONMENTS {
             // `required_environments` admits at most this many. Omitted rather
             // than trimmed, since trimming would pick which certified
             // environments to skip; a node would refuse the whole list anyway.
+            // The publication path samples each node's recipe size, so this
+            // is alerted on before it happens.
             tracing::error!(
                 environments = environments.len(),
                 limit = MAX_RECIPE_ENVIRONMENTS,
