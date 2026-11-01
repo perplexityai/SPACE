@@ -2,7 +2,7 @@
 import type { Browser, BrowserContext, Locator, Page } from 'playwright';
 
 import type { Config } from './config.ts';
-import type { Recorder } from './recorder.ts';
+import { redact, type Recorder } from './recorder.ts';
 import type { SeedState } from './seed.ts';
 
 export interface Ctx {
@@ -91,11 +91,13 @@ export async function pickSelect(page: Page, select: Locator, option: string): P
   await item.click();
 }
 
-export async function confirmPopover(page: Page, okText?: string): Promise<void> {
+// `okName` matches the confirm button's accessible name, which starts with
+// its icon's label when it has one.
+export async function confirmPopover(page: Page, okName?: RegExp): Promise<void> {
   const pop = page.locator('.ant-popover:visible, .ant-popconfirm:visible').last();
   await pop.waitFor({ timeout: 5000 });
-  const button = okText
-    ? pop.getByRole('button', { name: new RegExp(`(^|\\s)${okText}$`) })
+  const button = okName
+    ? pop.getByRole('button', { name: okName })
     : pop.locator('.ant-btn-primary, .ant-btn-dangerous').last();
   await button.click();
 }
@@ -112,6 +114,7 @@ export async function adminFetch(page: Page, method: string, apiPath: string, bo
         ...(method !== 'GET' ? { 'idempotency-key': crypto.randomUUID() } : {}),
       },
       body: body === undefined ? undefined : JSON.stringify(body),
+      redirect: 'error',
     });
     const raw = await response.text();
     let json: unknown = null;
@@ -147,11 +150,20 @@ export function shortLabel(id: string): string {
   return id.replace(/^sbx_/, '').replaceAll('-', '').slice(-8);
 }
 
-// Hide every code block in a dialog (where the API Keys page shows a new
-// key's secret), for the rest of this page's life: screenshots and video
-// frames then never contain a secret.
-export async function maskApiKeySecrets(page: Page): Promise<void> {
-  await page.addStyleTag({
-    content: '.ant-modal .ant-typography code, .ant-modal code, .ant-modal pre { visibility: hidden !important; } .ant-modal .ant-typography:has(> code) { background: #444 !important; min-height: 1.6em; }',
-  });
+// What the page receives instead of a new API key's secret: the API Keys
+// page shows the secret once, in a dialog, and the loop answers the create
+// request itself (`page.route`) with this in its place, so the browser never
+// holds a live key and no screenshot or video frame can show one.
+export const SECRET_PLACEHOLDER = 'console-loop-placeholder-not-a-key';
+
+// The create response's body with its `secret` replaced, and anything else
+// shaped like a key redacted; the key's ID when the body carries one.
+export function withoutSecret(text: string): { body: string; replaced: boolean; id?: string } {
+  let parsed: { secret?: unknown; api_key?: { id?: unknown } } | null = null;
+  try { parsed = JSON.parse(text); } catch { /* not JSON */ }
+  if (!parsed || typeof parsed !== 'object') return { body: redact(text), replaced: false };
+  const replaced = typeof parsed.secret === 'string';
+  if (replaced) parsed.secret = SECRET_PLACEHOLDER;
+  const id = typeof parsed.api_key?.id === 'string' ? parsed.api_key.id : undefined;
+  return { body: redact(JSON.stringify(parsed)), replaced, id };
 }

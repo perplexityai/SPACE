@@ -31,8 +31,14 @@ export interface Config {
   allowRemote: boolean;
 }
 
+// A prefix names seeded objects and the seed state file, so it is kept to
+// what is safe in both.
+const PREFIX = /^[a-z0-9][a-z0-9-]{0,31}$/;
+
 export function loadConfig(args: string[]): Config {
   const env = process.env;
+  const prefix = option(args, 'prefix', env.CONSOLE_LOOP_PREFIX ?? 'loop')!;
+  if (!PREFIX.test(prefix)) throw new Error(`--prefix must be lowercase letters, digits and dashes, at most 32 characters (got "${prefix}")`);
   return {
     baseUrl: trim(option(args, 'base-url', env.CONSOLE_LOOP_BASE_URL ?? 'http://localhost:3000')!),
     apiUrl: trim(option(args, 'api-url', env.CONSOLE_LOOP_API_URL ?? 'http://localhost:8080')!),
@@ -41,7 +47,7 @@ export function loadConfig(args: string[]): Config {
     email: option(args, 'email', env.CONSOLE_LOOP_EMAIL ?? 'root@local')!,
     password: option(args, 'password', env.CONSOLE_LOOP_PASSWORD ?? env.SPACE_CONSOLE_PASSWORD ?? 'password')!,
     outDir: path.resolve(option(args, 'out', env.CONSOLE_LOOP_OUT ?? path.join(PACKAGE_DIR, 'out'))!),
-    prefix: option(args, 'prefix', env.CONSOLE_LOOP_PREFIX ?? 'loop')!,
+    prefix,
     allowRemote: flag(args, 'allow-remote'),
   };
 }

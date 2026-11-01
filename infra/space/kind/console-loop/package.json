@@ -11,6 +11,7 @@
     "loop": "node --experimental-strip-types src/loop.ts",
     "compare": "node --experimental-strip-types src/compare.ts",
     "capture": "node --experimental-strip-types src/capture.ts",
+    "test": "node --experimental-strip-types --test src/*.test.ts",
     "typecheck": "tsc --noEmit -p ."
   },
   "devDependencies": {
