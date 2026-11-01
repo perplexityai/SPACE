@@ -2,12 +2,15 @@
 // checks what an operator relies on; the runner records everything else
 // (errors, failed and slow requests, screenshots). Steps that create or
 // change something are marked `mutates` and clean up after themselves.
-import { adminFetch, confirmPopover, content, maskApiKeySecrets, pickSelect, settle, shortLabel, signIn, text, visit, waitForStatus, type Ctx } from './browser.ts';
+import type { Page, Response } from 'playwright';
+
+import { SECRET_PLACEHOLDER, adminFetch, confirmPopover, content, pickSelect, settle, shortLabel, signIn, text, visit, waitForStatus, withoutSecret, type Ctx } from './browser.ts';
+import { verifyFixtures } from './fixtures.ts';
 import { orgDisplayName, recordCreated } from './seed.ts';
 
 export interface Step {
   name: string;
-  // Tags select steps with --only/--skip (matched against name and tags).
+  // --only and --skip select steps by exact name or tag.
   tags: string[];
   mutates: boolean;
   run: (c: Ctx) => Promise<void>;
@@ -20,6 +23,12 @@ const seeded = (c: Ctx) => {
   if (!c.seed) throw new Error('no seed state: run `npm run seed` first, with the same --out and --prefix');
   return c.seed;
 };
+// The response to the next POST to `pathname` on any origin, or null; start
+// waiting before the click that sends it.
+const nextPost = (page: Page, pathname: (path: string) => boolean): Promise<Response | null> =>
+  page.waitForResponse((res) => res.request().method() === 'POST' && pathname(new URL(res.url()).pathname), { timeout: 30_000 }).catch(() => null);
+const jsonOf = async (res: Response | null): Promise<any> => (res?.ok() ? res.json().catch(() => null) : null);
+const KEY_SHAPED = /\b[0-9a-f]{64}\b/i;
 const orgId = (c: Ctx, key: string) => seeded(c).orgs[key];
 const sandboxId = (c: Ctx, key: string) => seeded(c).sandboxes[key];
 const email = (c: Ctx, local: string) => `${c.config.prefix}-${local}@example.test`;
@@ -41,20 +50,14 @@ step('login', ['auth'], async (c) => {
   c.rec.check(/\/dashboard/.test(c.page.url()), 'signing in lands on the dashboard');
 });
 
-// Every recorded fixture must exist, looked up by ID, or the steps that use
-// it would fail for the wrong reason (or pass on a list that misses it).
+// Every fixture the seed creates must exist, looked up by ID through the
+// console, or the steps that use it would fail for the wrong reason (or pass
+// on a list that misses it).
 step('fixtures', ['auth'], async (c) => {
   if (!c.seed) return c.rec.check(false, 'seed state exists (run `npm run seed` with the same --out and --prefix)');
-  for (const [key, id] of Object.entries(c.seed.orgs)) {
-    c.rec.check((await adminFetch(c.page, 'GET', `/admin/api/v1/orgs/${id}`)).status === 200, `seeded org ${key} exists`);
-  }
-  for (const [address, user] of Object.entries(c.seed.users)) {
-    c.rec.check((await adminFetch(c.page, 'GET', `/admin/api/v1/users/${user.id}`)).status === 200, `seeded user ${address} exists`);
-  }
-  for (const [key, id] of Object.entries(c.seed.sandboxes)) {
-    if (key === 'deleted') continue;
-    c.rec.check((await adminFetch(c.page, 'GET', `/admin/api/v1/sandboxes/${id}`)).status === 200, `seeded sandbox ${key} exists`);
-  }
+  const report = await verifyFixtures(c.seed, (apiPath) => adminFetch(c.page, 'GET', apiPath), { statuses: false });
+  for (const ok of report.ok) c.rec.check(true, `seeded ${ok}`);
+  for (const problem of report.problems) c.rec.check(false, `seeded ${problem}`);
 });
 
 // ------------------------------------------------------------ every route
@@ -102,10 +105,12 @@ step('org-create-delete', ['orgs', 'flows'], async (c) => {
   const modal = c.page.locator('.ant-modal:visible');
   await modal.getByPlaceholder('Name').fill(`${c.runTag} org`);
   await modal.getByPlaceholder('Slug').fill(c.runTag);
+  recordCreated(c.config, { kind: 'org', name: c.runTag });
+  const response = nextPost(c.page, (p) => p === '/admin/api/v1/orgs');
   await modal.getByRole('button', { name: 'Create organization' }).click();
+  const created = await jsonOf(await response);
+  if (created?.id) recordCreated(c.config, { kind: 'org', id: created.id, name: c.runTag });
   await settle(c.page);
-  const created = ((await adminFetch(c.page, 'GET', '/admin/api/v1/orgs')).json ?? []).find((o: { slug: string }) => o.slug === c.runTag);
-  if (created) recordCreated(c.config, { kind: 'org', id: created.id, name: c.runTag });
   const row = c.page.locator('tr', { hasText: c.runTag });
   c.rec.check(await row.count() > 0, 'a created organization appears in the list');
   if (!(await row.count())) return;
@@ -144,10 +149,12 @@ step('user-create-role-delete', ['users', 'flows'], async (c) => {
   await c.page.getByPlaceholder('Email').fill(address);
   await c.page.getByPlaceholder('Password').fill(seeded(c).userPassword);
   await c.page.getByPlaceholder('Display Name').fill('Loop Temporary');
+  recordCreated(c.config, { kind: 'user', name: address, orgId: orgId(c, 'acme') });
+  const response = nextPost(c.page, (p) => p === `/admin/api/v1/orgs/${orgId(c, 'acme')}/users`);
   await c.page.getByRole('button', { name: 'Create' }).click();
+  const listed = await jsonOf(await response);
+  if (listed?.id) recordCreated(c.config, { kind: 'user', id: listed.id, name: address, orgId: orgId(c, 'acme') });
   await settle(c.page);
-  const listed = ((await adminFetch(c.page, 'GET', `/admin/api/v1/orgs/${orgId(c, 'acme')}/users`)).json ?? []).find((u: { email: string }) => u.email === address);
-  if (listed) recordCreated(c.config, { kind: 'user', id: listed.id, name: address, orgId: orgId(c, 'acme') });
   const row = c.page.locator('tr', { hasText: address });
   c.rec.check(await row.count() > 0, 'a created user appears in the list');
   if (!(await row.count())) return;
@@ -172,33 +179,57 @@ step('api-keys-list', ['api-keys'], async (c) => {
   c.rec.check((await text(c.page)).includes(`${c.config.prefix}-native`), 'the API keys list shows the seeded key');
 });
 
+// The API answers a create with the new key's secret, which the page shows
+// once. The step answers that request itself: it records the key's ID from
+// the real response, then hands the page the response with the secret
+// replaced by a placeholder, so the browser never holds a live key.
 step('api-key-create-revoke', ['api-keys', 'flows'], async (c) => {
-  await visit(c, '/dashboard/api-keys');
-  // The new key's secret is shown once in a dialog: hide it before the
-  // dialog exists, so no screenshot or video frame of this step holds it.
-  await maskApiKeySecrets(c.page);
-  await c.page.getByRole('button', { name: 'Create API key' }).click();
-  const modal = c.page.locator('.ant-modal:visible');
-  await modal.locator('input').first().fill(c.runTag);
-  await modal.getByRole('button', { name: 'Create' }).click();
-  // The secret is shown once; the loop does not keep it.
-  const dialog = c.page.locator('.ant-modal:visible', { hasText: 'Copy this key now' });
-  await dialog.waitFor({ timeout: 10_000 });
-  const exposed = await dialog.locator('code').evaluateAll((els) => els.filter((el) => getComputedStyle(el).visibility !== 'hidden').length);
-  c.rec.check(exposed === 0, `the secret is hidden while its dialog is open (${exposed} visible)`);
-  await c.page.waitForTimeout(800);
-  await c.page.screenshot({ path: `${c.rec.outDir}/api-key-dialog-masked.png` });
-  await c.page.getByRole('button', { name: 'Done' }).click();
-  const keys = (await adminFetch(c.page, 'GET', `/admin/api/v1/orgs/${seeded(c).managingOrgId}/api-keys`)).json ?? [];
-  const key = keys.find((k: { name: string }) => k.name === c.runTag);
-  if (key) recordCreated(c.config, { kind: 'apiKey', id: key.id, name: c.runTag, orgId: seeded(c).managingOrgId });
-  const row = c.page.locator('tr', { hasText: c.runTag });
-  c.rec.check(await row.count() > 0, 'a created key appears in the list');
-  if (!(await row.count())) return;
-  await row.getByRole('button', { name: `Revoke ${c.runTag}` }).click();
-  await confirmPopover(c.page, 'Revoke');
-  await settle(c.page);
-  c.rec.check(await c.page.locator('tr', { hasText: c.runTag }).count() === 0, 'a revoked key disappears');
+  const managing = seeded(c).managingOrgId;
+  const pattern = '**/admin/api/v1/orgs/*/api-keys';
+  let answered: (value: { id?: string; replaced: boolean } | null) => void = () => {};
+  const createAnswered = new Promise<{ id?: string; replaced: boolean } | null>((resolve) => { answered = resolve; });
+  await c.page.route(pattern, async (route) => {
+    if (route.request().method() !== 'POST') return route.fallback();
+    const response = await route.fetch();
+    const safe = withoutSecret(await response.text());
+    if (safe.id) recordCreated(c.config, { kind: 'apiKey', id: safe.id, name: c.runTag, orgId: managing });
+    answered({ id: safe.id, replaced: safe.replaced });
+    const headers = { ...response.headers() };
+    delete headers['content-length'];
+    await route.fulfill({ status: response.status(), headers, body: safe.body });
+  });
+  try {
+    await visit(c, '/dashboard/api-keys');
+    await c.page.getByRole('button', { name: 'Create API key' }).click();
+    const modal = c.page.locator('.ant-modal:visible');
+    await modal.locator('input').first().fill(c.runTag);
+    recordCreated(c.config, { kind: 'apiKey', name: c.runTag, orgId: managing });
+    await modal.getByRole('button', { name: 'Create' }).click();
+    const created = await Promise.race([createAnswered, c.page.waitForTimeout(30_000).then(() => null)]);
+    c.rec.check(!!created?.id, "the create response carries the new key's ID");
+    c.rec.check(!!created?.replaced, "the create response's secret is replaced before the page sees it");
+    const dialog = c.page.locator('.ant-modal:visible', { hasText: 'Copy this key now' });
+    await dialog.waitFor({ timeout: 10_000 });
+    const shown = await dialog.innerText();
+    const live = KEY_SHAPED.test(shown);
+    c.rec.check(!live && shown.includes(SECRET_PLACEHOLDER), 'the dialog shows the placeholder, not a key');
+    if (live) {
+      c.rec.note('dialog screenshot skipped: it shows something shaped like a key');
+    } else {
+      await c.page.waitForTimeout(800);
+      await c.page.screenshot({ path: `${c.rec.outDir}/api-key-dialog-placeholder.png` });
+    }
+    await c.page.getByRole('button', { name: 'Done' }).click();
+    const row = c.page.locator('tr', { hasText: c.runTag });
+    c.rec.check(await row.count() > 0, 'a created key appears in the list');
+    if (!(await row.count())) return;
+    await row.getByRole('button', { name: `Revoke ${c.runTag}` }).click();
+    await confirmPopover(c.page, /(^|\s)Revoke$/);
+    await settle(c.page);
+    c.rec.check(await c.page.locator('tr', { hasText: c.runTag }).count() === 0, 'a revoked key disappears');
+  } finally {
+    await c.page.unroute(pattern);
+  }
 }, true);
 
 // --------------------------------------------------------------- sandboxes
@@ -246,7 +277,18 @@ step('sandbox-create', ['sandboxes', 'flows', 'lifecycle'], async (c) => {
   await visit(c, '/dashboard/sandboxes', 3000);
   const card = c.page.locator('.ant-card', { hasText: 'Create sandbox' });
   await card.getByPlaceholder('Name').fill(c.runTag);
+  const managing = seeded(c).managingOrgId;
+  recordCreated(c.config, { kind: 'sandbox', name: c.runTag, orgId: managing });
+  const response = nextPost(c.page, (p) => p.endsWith('/v1/sandboxes'));
   await card.locator('button[type=submit]').click();
+  const res = await response;
+  const accepted = await jsonOf(res);
+  if (accepted?.operation_id) {
+    const admin = new URL(res!.url()).pathname.startsWith('/admin/');
+    const id = accepted.sandbox_id ? (accepted.sandbox_id.startsWith('sbx_') ? accepted.sandbox_id : `sbx_${accepted.sandbox_id}`) : undefined;
+    recordCreated(c.config, { kind: 'sandbox', id, name: c.runTag, orgId: managing, operations: [{ id: accepted.operation_id, admin, action: 'create' }] });
+    if (id) c.shared.sandbox = id;
+  }
   const deadline = Date.now() + 120_000;
   while (Date.now() < deadline && !c.shared.sandbox) {
     await c.page.waitForTimeout(3000);
@@ -254,27 +296,28 @@ step('sandbox-create', ['sandboxes', 'flows', 'lifecycle'], async (c) => {
     const row = (list.json ?? []).find((s: { name: string | null }) => s.name === c.runTag);
     if (row) {
       c.shared.sandbox = row.id.startsWith('sbx_') ? row.id : `sbx_${row.id}`;
-      recordCreated(c.config, { kind: 'sandbox', id: c.shared.sandbox, name: c.runTag, orgId: seeded(c).managingOrgId });
+      recordCreated(c.config, { kind: 'sandbox', id: c.shared.sandbox, name: c.runTag, orgId: managing });
     }
   }
   c.rec.check(!!c.shared.sandbox, 'creating a sandbox from the form produces one');
 }, true);
 
+// A control's accessible name starts with its icon's label.
 for (const [action, label, want, confirm] of [
-  ['pause', 'Pause', ['paused'], false],
-  ['resume', 'Resume', ['started', 'running'], false],
-  ['suspend', 'Suspend', ['suspended'], false],
-  ['restore', 'Restore', ['started', 'running'], false],
-  ['stop', 'Stop', ['stopped'], true],
-  ['start', 'Start', ['started', 'running'], false],
+  ['pause', /(^|\s)Pause$/, ['paused'], false],
+  ['resume', /(^|\s)Resume$/, ['started', 'running'], false],
+  ['suspend', /(^|\s)Suspend$/, ['suspended'], false],
+  ['restore', /(^|\s)Restore$/, ['started', 'running'], false],
+  ['stop', /(^|\s)Stop$/, ['stopped'], true],
+  ['start', /(^|\s)Start$/, ['started', 'running'], false],
 ] as const) {
   step(`sandbox-${action}`, ['sandboxes', 'flows', 'lifecycle'], async (c) => {
     const id = c.shared.sandbox;
     if (!id) return c.rec.check(false, 'a sandbox was created by sandbox-create');
     await visit(c, `/dashboard/sandboxes/${id}`, 2000);
     await waitForStatus(c, id, ['started', 'running', 'paused', 'suspended', 'stopped'], 120_000);
-    const button = c.page.locator('.ant-card', { hasText: 'Controls' }).getByRole('button', { name: new RegExp(`(^|\\s)${label}$`) });
-    if (!(await button.isEnabled())) return c.rec.check(false, `${label} is enabled`);
+    const button = c.page.locator('.ant-card', { hasText: 'Controls' }).getByRole('button', { name: label });
+    if (!(await button.isEnabled())) return c.rec.check(false, `${action} is enabled`);
     await button.click();
     if (confirm) await confirmPopover(c.page, label);
     const reached = await waitForStatus(c, id, [...want], 240_000);

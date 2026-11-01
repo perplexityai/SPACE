@@ -44,13 +44,19 @@ const SECRET = /\b[0-9a-f]{64}\b/gi;
 export const redact = (value: string): string => value.replace(SECRET, '<redacted>');
 
 export function normalizer(prefix: string): (value: string) => string {
-  const seeded = new RegExp(`${prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}-[a-z0-9-]+`, 'g');
+  // A seeded name is the prefix, a dash and at least one more name character,
+  // anywhere in a run of name characters.
+  const marker = `${prefix}-`;
+  const seeded = (run: string) => {
+    const at = run.indexOf(marker);
+    return at >= 0 && run.length > at + marker.length ? `${run.slice(0, at)}<seeded>` : run;
+  };
   return (value) => value
     .replace(/sbx_[0-9a-f-]{32,36}/gi, 'sbx_<id>')
     .replace(UUID, '<uuid>')
     .replace(/[0-9a-f]{32,}/gi, '<hex>')
     .replace(/\b\d{2,}\b/g, '<n>')
-    .replace(seeded, '<seeded>');
+    .replace(/[a-z0-9-]+/g, seeded);
 }
 
 // Development-build warnings that a production build does not print: React
@@ -62,13 +68,22 @@ export function isDevWarning(text: string): boolean {
   return /^Warning: /.test(text) || /%[sdo]/.test(text);
 }
 
+// One step's evidence. It closes when the step's result is taken; nothing is
+// added to it after that.
+interface StepRecord {
+  name: string;
+  events: StepEvent[];
+  notes: string[];
+  open: boolean;
+}
+
 export class Recorder {
-  private events: StepEvent[] = [];
-  private notes: string[] = [];
+  private step: StepRecord = { name: '', events: [], notes: [], open: true };
+  // What arrived after one step closed and before the next began.
+  private carried: string[] = [];
   private readonly started = new Map<Request, number>();
   // The step during which each request was issued.
-  private readonly issuedBy = new Map<Request, string>();
-  private stepName = '';
+  private readonly issuedBy = new Map<Request, StepRecord>();
   private pending: Promise<unknown>[] = [];
   private readonly page: Page;
   private readonly slowMs: number;
@@ -96,7 +111,7 @@ export class Recorder {
     });
     page.on('request', (req) => {
       this.started.set(req, Date.now());
-      this.issuedBy.set(req, this.stepName);
+      this.issuedBy.set(req, this.step);
     });
     page.on('requestfailed', (req) => {
       const failure = req.failure()?.errorText ?? 'failed';
@@ -118,13 +133,19 @@ export class Recorder {
   }
 
   // A response or failure of a request an earlier step issued belongs to
-  // that step, which has already been written: note it here instead of
-  // counting it against this step.
+  // that step, which has already been written: note it in the current step
+  // instead of counting it against either. Asked again after every await,
+  // since the issuing step may have closed in the meantime.
   private late(req: Request, what: string): boolean {
     const issuer = this.issuedBy.get(req);
-    if (issuer === undefined || issuer === this.stepName) return false;
-    this.notes.push(redact(`late, from step ${issuer || '(before the first step)'}: ${what}`));
+    if (issuer === undefined || (issuer === this.step && issuer.open)) return false;
+    this.noteNow(`late, from step ${issuer.name || '(before the first step)'}: ${what}`);
     return true;
+  }
+
+  private noteNow(text: string): void {
+    if (this.step.open) this.step.notes.push(redact(text));
+    else this.carried.push(redact(text));
   }
 
   private async onResponse(res: Response): Promise<void> {
@@ -136,6 +157,7 @@ export class Recorder {
     if (status >= 400) {
       let body = '';
       try { body = (await res.text()).slice(0, 500); } catch { body = '<unreadable>'; }
+      if (this.late(req, `${req.method()} ${res.url()} -> ${status}`)) return;
       this.add({ kind: 'http', message: `${req.method()} ${res.url()} -> ${status}`, url: res.url(), status, body, signature: `http|${req.method()} ${this.pathOf(res.url())}|${status}` });
     }
     if (startedAt === undefined) return;
@@ -151,30 +173,34 @@ export class Recorder {
   }
 
   add(event: StepEvent): void {
-    this.events.push({
+    // Between two steps nothing owns an event; the next step notes it.
+    if (!this.step.open) {
+      this.carried.push(redact(`between steps, after ${this.step.name}: ${event.kind}: ${event.message}`));
+      return;
+    }
+    this.step.events.push({
       ...event,
       message: redact(event.message),
       body: event.body === undefined ? undefined : redact(event.body),
       url: event.url === undefined ? undefined : redact(event.url),
-      signature: `${this.stepName}|${redact(event.signature)}`,
+      signature: `${this.step.name}|${redact(event.signature)}`,
     });
   }
 
   // A failed check is an event; a passed one is a note in the summary.
   check(ok: boolean, message: string): void {
     // Counts in a message vary with the data; the check's identity does not.
-    if (ok) this.notes.push(redact(`ok: ${message}`));
+    if (ok) this.noteNow(`ok: ${message}`);
     else this.add({ kind: 'check', message, signature: `check|${this.normalize(message).replace(/\d+/g, '<n>').replace(/\([^)]*\)/g, '(…)').slice(0, 160)}` });
   }
 
   note(message: string): void {
-    this.notes.push(redact(message));
+    this.noteNow(message);
   }
 
   begin(name: string): void {
-    this.stepName = name;
-    this.events = [];
-    this.notes = [];
+    this.step = { name, events: [], notes: this.carried, open: true };
+    this.carried = [];
     this.pending = [];
   }
 
@@ -186,23 +212,25 @@ export class Recorder {
     // Let in-flight responses settle so their bodies land in this step.
     await this.page.waitForTimeout(400);
     await Promise.race([Promise.allSettled(this.pending), this.page.waitForTimeout(3000)]);
-    const file = `${String(index).padStart(3, '0')}-${this.stepName.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}.png`;
+    const step = this.step;
+    const file = `${String(index).padStart(3, '0')}-${step.name.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}.png`;
     let screenshot: string | null = path.join(this.outDir, file);
     try {
       await this.page.screenshot({ path: screenshot, fullPage: true, timeout: 15_000 });
     } catch {
       screenshot = null;
     }
-    const events = this.events;
+    step.open = false;
+    const events = [...step.events];
     return {
       index,
-      name: this.stepName,
+      name: step.name,
       url: this.page.url(),
       screenshot: screenshot ? path.basename(screenshot) : null,
       durationMs: Date.now() - startedAt,
       ok: !events.some((event) => !NON_FAILING.includes(event.kind)),
       events,
-      notes: this.notes,
+      notes: [...step.notes],
     };
   }
 }

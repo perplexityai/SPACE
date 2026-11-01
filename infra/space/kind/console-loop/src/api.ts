@@ -1,6 +1,7 @@
 // A small client for the public (/v1) and admin (/admin/api/v1) APIs, signed
 // in as the console account. The seeder and the driver's checks use it; the
-// driver itself goes through the browser.
+// driver itself goes through the browser. It never follows a redirect, so a
+// request cannot land on a host other than the one it names.
 import { randomUUID } from 'node:crypto';
 
 import type { Config } from './config.ts';
@@ -15,14 +16,17 @@ export class ApiError extends Error {
   }
 }
 
-type Options = { idempotent?: boolean; timeoutMs?: number };
+// `idempotencyKey` sends that key; `idempotent` sends a fresh one.
+type Options = { idempotent?: boolean; idempotencyKey?: string; timeoutMs?: number };
 
 export class Api {
   private readonly base: string;
   private token: string | null = null;
 
-  constructor(config: Config) {
-    this.base = config.apiUrl;
+  // `base` is the API by default; the console's origin reaches the same
+  // routes through its proxy.
+  constructor(config: Config, base: string = config.apiUrl) {
+    this.base = base;
   }
 
   async signIn(email: string, password: string): Promise<string> {
@@ -42,12 +46,19 @@ export class Api {
   async request<T>(method: string, path: string, body?: unknown, options: Options = {}): Promise<T> {
     const headers: Record<string, string> = { 'content-type': 'application/json' };
     if (this.token) headers.authorization = `Bearer ${this.token}`;
-    if (options.idempotent) headers['idempotency-key'] = randomUUID();
+    if (options.idempotencyKey) headers['idempotency-key'] = options.idempotencyKey;
+    else if (options.idempotent) headers['idempotency-key'] = randomUUID();
     const response = await fetch(`${this.base}${path}`, {
       method,
       headers,
+      redirect: 'error',
       body: body === undefined ? undefined : JSON.stringify(body),
       signal: AbortSignal.timeout(options.timeoutMs ?? 60_000),
+    }).catch((err: unknown) => {
+      // fetch reports a refused redirect or connection as "fetch failed",
+      // with the reason in `cause`.
+      const cause = err instanceof Error && err.cause instanceof Error ? `: ${err.cause.message}` : '';
+      throw new Error(`${method} ${this.base}${path} failed${cause}`, { cause: err });
     });
     const text = await response.text();
     if (!response.ok) throw new ApiError(response.status, method, path, text);
@@ -61,12 +72,14 @@ export class Api {
       const op = admin
         ? await this.admin<Operation>('GET', `/operations/${id}`)
         : await this.public<Operation>('GET', `/operations/${id}`);
-      if (['succeeded', 'failed', 'canceled', 'expired'].includes(op.state)) return op;
+      if (TERMINAL_OPERATION_STATES.includes(op.state)) return op;
       if (Date.now() > deadline) throw new Error(`operation ${id} still ${op.state}`);
       await sleep(2000);
     }
   }
 }
+
+export const TERMINAL_OPERATION_STATES = ['succeeded', 'failed', 'canceled', 'expired'];
 
 export interface Operation {
   id: string;

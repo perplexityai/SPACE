@@ -14,10 +14,26 @@ against a Kind or deployed stack are typed `space_smoke` scenarios (see the
 `space-validation` skill's smoke-testing reference); typed console scenarios
 are a separate follow-up.
 
-It acts only on a stack on this host: `seed`, `clean`, and every `loop` run
-that creates things refuse an API or console URL that is not loopback
-(`localhost`, `127.0.0.0/8`, `::1`) unless `--allow-remote` is passed, and
-print the target they act on.
+It acts only on one stack, on this host. `seed`, `clean`, and every `loop`
+run that creates things:
+
+- refuse an API or console URL that is not loopback (`localhost`,
+  `127.0.0.0/8`, `::1`) unless `--allow-remote` is passed, and print the
+  target they act on;
+- read the stack's identity, the `id` and `created_at` of its cluster row
+  (generated when its database is created; `managing_org_id` is the same on
+  every stack), four ways: `/admin/api/v1/cluster` and `/auth/v1/cluster`,
+  each signed in separately, through the API URL and through the console's
+  origin, whose `/admin` and `/auth` proxies reach the backends its build
+  names. They refuse when the readings differ, or differ from the identity
+  the seed recorded. API requests never follow a redirect.
+
+The check cannot prove more than that: the four readings came from one
+database at that moment. It does not cover the console's other routes
+(`/api`, the data plane's `/v1/sessions`) or requests the browser sends to
+another origin, a proxy that routes differently later or per request, or two
+stacks that share one database or a copy of it. `--allow-remote` drops only
+the loopback check.
 
 ## Prerequisites
 
@@ -42,8 +58,8 @@ print the target they act on.
 npm run seed                  # rerunnable; reuses what exists
 npm run loop                  # every step, against http://localhost:3000
 npm run loop -- --no-mutate   # skip the steps that create and delete things
-npm run loop -- --only 'sandboxes|nodes' --skip lifecycle
-npm run clean                 # delete everything the seed created
+npm run loop -- --only sandboxes,nodes --skip lifecycle
+npm run clean                 # delete what the seed and loop created, except organizations
 ```
 
 The seed creates, under a name prefix (`loop` by default), three tenant
@@ -54,27 +70,56 @@ deleted. Every name and organization display name carries the prefix, so
 runs under two prefixes can share a stack. Seeding sandboxes boots
 Firecracker VMs and takes a minute or two; `--skip-sandboxes` leaves them out.
 
-Seeding looks each object up by its prefixed name before creating it, so a
-rerun after an interruption reuses what exists instead of duplicating it, and
-it ends by looking every recorded fixture up by ID. Everything the seed
-creates, and everything a `flows` step of the loop creates, is recorded in
-`out/seed.json` as soon as it exists, together with the generated password
-of the seeded users. The loop's first step checks that each recorded fixture
-still exists.
+The state is `out/seed-<prefix>.json`: the stack it was seeded on, the
+generated password of the seeded users, and every object the seed creates
+and every object a `flows` step of the loop creates. `seed`, `loop` and
+`clean` refuse a state that records another prefix than `--prefix`.
 
-`npm run clean` deletes exactly what `out/seed.json` records: sandboxes
-(waiting for each delete operation to succeed), users and API keys, then
-organizations, children first. It refuses to delete an organization that
-still holds anything it did not record (a child organization, a user, an API
-key or a live sandbox), and reports it. It exits 1 when anything recorded was
-not deleted, and keeps those objects in `out/seed.json` for the next run.
+Each create is recorded before it is submitted, and its ID and operation as
+soon as the API answers. Seeding looks each object up by its prefixed name
+before creating it, and a rerun after an interruption first waits for the
+operations recorded for it. Organizations, users and API keys have no
+idempotent create, so a rerun finds them by slug, email or key name. A
+sandbox create is recorded with its idempotency key and request, and a
+rerun resubmits an unanswered one with the same key, which the API answers
+with the original operation if the first submit arrived. Seeding fails
+(exit 2) when it cannot discover or set up a fixture. It ends by looking up
+every fixture the loop needs by ID: the organizations, users and API keys
+and, unless `--skip-sandboxes` was given, each sandbox in its resting state
+and the deleted one gone. The loop's `fixtures` step checks the same set
+through the console.
 
-`--only` and `--skip` take a regular expression matched against each step's
-name and tags (`routes`, `orgs`, `users`, `api-keys`, `sandboxes`, `flows`,
-`lifecycle`, `templates`, `nodes`, `roles`). Sign-in always runs. Steps tagged
-`flows` create objects and delete them again; if one fails before deleting,
-`npm run clean` removes what it recorded. `--no-mutate` skips them. The steps
-are in [`src/steps.ts`](src/steps.ts).
+`npm run clean` deletes what the state records:
+
+- sandboxes, waiting first for every operation recorded for each, then for
+  its delete and for it to leave `deleting`. A sandbox counts as gone only
+  when it is deleted, or not found once nothing recorded for it is still
+  running. A create that was submitted but never answered is resubmitted
+  with its key to learn its operation;
+- users and API keys, by ID, or by email or name when the create was never
+  answered.
+
+It keeps organizations, since a seed reuses them by name, unless
+`--delete-orgs` is given. Deleting an organization also deletes, by
+`ON DELETE CASCADE`, its API keys, organization and user credentials,
+credential references, master keys, storage vend identities, data-plane
+revocation epochs, public operations and idempotency records, and template
+build-base and publication grants. With `--delete-orgs`, `clean` deletes
+organizations children first, and refuses one that still holds a child
+organization, a user, an API key or a sandbox that is not deleted, and
+reports it. `clean` exits 1 when anything recorded was not deleted, and
+keeps those objects in the state for the next run. It removes the state file
+once nothing is left in it.
+
+`--only` and `--skip` take comma-separated step names or tags, each matched
+exactly; a name that is neither is an error. The tags are `routes`, `orgs`,
+`users`, `api-keys`, `sandboxes`, `flows`, `lifecycle`, `templates`, `nodes`,
+`roles`. Sign-in always runs. Steps tagged `flows` create objects and delete
+them again; each records its object's name before it submits the create and
+the ID from the create's response, so if one fails before deleting, `npm run
+clean` removes what it recorded. They need a seed state for the prefix, and
+the identity check above passes before any runs. `--no-mutate` skips them.
+The steps are in [`src/steps.ts`](src/steps.ts).
 
 Each run writes `out/runs/<time>[-<label>]/`:
 
@@ -97,10 +142,12 @@ Every setting is a flag or an environment variable:
 | `--prefix` | `CONSOLE_LOOP_PREFIX` | `loop` |
 | `--template` (seed) | `CONSOLE_LOOP_TEMPLATE` | `seed:latest` |
 
+A prefix is up to 32 lowercase letters, digits and dashes. `npm run seed`
+also takes `--skip-sandboxes`, and `npm run clean` takes `--delete-orgs`.
 `npm run loop` also takes `--label NAME`, `--slow-ms N` (default 1500),
 `--compare RUN`, `--headed`, and `--video`, which records the run as
-`run.webm` in its run directory. Run `npm run typecheck` after changing the
-scripts.
+`run.webm` in its run directory. Run `npm run typecheck` and `npm test` (unit
+tests that need no stack) after changing the scripts.
 
 ## The fast loop: `next dev`
 
@@ -165,8 +212,9 @@ not cover (it did not run every step they appeared in, for example with
 `devwarn` events are reported but never fail a comparison.
 
 Each event belongs to the step that issued its request. A response that
-arrives after that step has ended is listed in the current step's notes as
-"late", not counted against it.
+arrives after that step has ended, including a body that finishes reading
+after it, is listed in the current step's notes as "late", not counted
+against it; a step's evidence is fixed once its result is taken.
 
 To compare without switching the Tilt checkout, serve `main` with a production
 build on another port and pass `--base-url` to each run. The backend addresses
@@ -209,10 +257,19 @@ This signs in, records the routes at 1280×800, and writes
 Step screenshots from a run are in its run directory. Attach media to the pull
 request instead of committing it.
 
-A new API key's secret is shown once, in a dialog. The API-key step hides
-that dialog's key before the dialog opens, so its screenshots and video
-frames never show it, and the recorder replaces anything shaped like a key
-(64 hex characters) in what it writes with `<redacted>`. Do not capture that
-dialog with `npm run capture`, which does not hide it. With that, run media
-show only synthetic data from the seed; look at each image before you share
-it all the same.
+A new API key's secret is shown once, in a dialog. The API-key step answers
+the create request itself with `page.route`: it records the key's ID from
+the API's response and hands the page that response with the secret
+replaced, so the browser never holds a live key, and the dialog in its
+screenshots and video shows the placeholder
+`console-loop-placeholder-not-a-key`. The step fails, and skips its dialog
+screenshot, if the dialog shows anything shaped like a key, and the
+recorder replaces anything of that shape (64 hex characters) in what it
+writes with `<redacted>`. `npm run capture` only visits routes and creates
+no keys.
+
+The fixtures are synthetic, but screenshots and videos show everything the
+console account can see on the stack: other organizations, users, sandboxes,
+nodes and templates, whoever created them. Run the loop on a disposable
+stack that holds nothing else, and look at each image before you share
+it.
