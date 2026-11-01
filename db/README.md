@@ -76,6 +76,51 @@ This is not a mechanism for changing schema or data behavior: those
 changes still require a new migration. Rollbacks to versions predating a registry
 entry can reject a database created with the revised SQL.
 
+## Unbundled template-manager migrations
+
+A rollout can migrate template-manager's node-local database from an init
+container while the previous pod still serves, so a template-manager schema
+change must be readable by the release before it, and a rollback must need
+nothing beyond the image. A release can still find a migration recorded that it
+doesn't bundle: a withdrawn one, or the next release's after an image rollback.
+The runner keeps a list of those it can reverse, with each one's original up
+SQL (for its checksum) and down SQL under `db/template-manager/history/`. A new
+template-manager migration joins that list one release before the release that
+bundles it, so the image a rollback returns to can reverse it. Once a release
+lists a migration, the release that bundles it must ship the same up SQL byte
+for byte, comments included. The listing release compares the recorded
+checksum only with its own copy, so a changed file, even one registered as an
+accepted checksum, makes it refuse the database. A changed migration needs a
+new version.
+
+When a release migrates a database that records listed migrations it doesn't
+bundle, the runner first checks each one: its history row must hold the
+original checksum, and the migration's own check must find no data worth
+keeping that reversing would drop. Any failed check stops migration before any
+write. The runner then applies their down SQL newest first and removes their
+history rows, all in one transaction. History validation runs after that
+transaction commits and still refuses any other recorded version the release
+doesn't bundle, so such a database is reversed and then refused. Only `up` and
+template-manager's own startup reverse them; `space-db-migrator
+template-manager down` and `status` don't. A catalog that bundles a version
+applies it normally.
+
+`20261031050126_node_dirty_ref_revisions` adds a `revision` column to
+`node_dirty_refs`, the `node_dirty_ref_revision` counter and the triggers that
+stamp it. Reversing it drops only those and keeps every outbox row, so its
+check never refuses. It does give up what the revision is for: a release
+without the migration acknowledges rows by key, so, as before the migration, a
+re-enqueue made while a send is in flight can be lost, and re-applying the
+migration restarts every revision at 0. Where a rollout runs
+`space-db-migrator` in an init container beside a serving pod of the newer
+release, that pod still reads `revision` after the reversal: its outbox reads
+and acknowledgements fail, and its rows stay queued, until it exits or a
+migrator re-applies the migration. A send it started before the reversal and
+acknowledges after a re-apply can match a restarted revision and delete a
+re-enqueue made during that send. A release without the migration writes the
+outbox without naming `revision`, so it keeps serving while a migrator applies
+it.
+
 ## Retired template-manager migration
 
 Template-manager's `20261026220935_template_cache_partitions` was withdrawn
@@ -307,7 +352,8 @@ writes, then applies common schema before service schema. Failed, modified,
 missing, or unbundled applied versions are rejected without recreating the
 database. A binary rollback therefore requires a catalog compatible with the
 complete applied history, even for an otherwise backward-compatible schema.
-Use expand/contract sequencing and retain verified backups.
+Use expand/contract sequencing and retain verified backups. Template-manager's
+exceptions are described under 'Unbundled template-manager migrations'.
 
 The migrator never adopts untracked schemas, repairs rejected history, or
 recreates a database after a migration failure. Baseline history conversion is
