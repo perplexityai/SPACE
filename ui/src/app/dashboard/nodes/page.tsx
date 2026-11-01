@@ -52,6 +52,14 @@ interface NodeSandboxPage {
 }
 
 const NODE_STATUS_REFRESH_KEY_PREFIX = 'dashboard:nodes:status';
+const OCCUPANCY_REFRESH_MS = 30_000;
+
+// The counts `include_occupancy=true` adds; network slots come with every
+// node response.
+interface NodeOccupancy {
+  sandboxes_active: number | null;
+  sandboxes_local_snapshots: number | null;
+}
 const DEFAULT_RECONCILIATION_PERIOD_SECS = 60;
 const RECONCILER_STALE_GRACE_SECS = 30;
 const REFRESH_CLICK_COOLDOWN_MS = 3000;
@@ -383,6 +391,14 @@ export default function NodesPage() {
   };
 
   const [nodes, setNodes] = useState<NodeView[]>([]);
+  const [occupancy, setOccupancy] = useState<Map<string, NodeOccupancy>>(() => new Map());
+  const [occupancyAtMs, setOccupancyAtMs] = useState<number | null>(null);
+  const [occupancyFailed, setOccupancyFailed] = useState(false);
+  // Responses for an older request or another role filter are dropped.
+  const occupancyRequest = useRef(0);
+  const occupancyGeneration = useRef(0);
+  const occupancyOf = (node: NodeView): NodeOccupancy =>
+    occupancy.get(node.id) ?? { sandboxes_active: null, sandboxes_local_snapshots: null };
   const [loadingNodes, setLoadingNodes] = useState(true);
   const loadingNodesRef = useRef(true);
   const [drainingNodeId, setDrainingNodeId] = useState<string | null>(null);
@@ -420,8 +436,12 @@ export default function NodesPage() {
     }, REFRESH_CLICK_COOLDOWN_MS);
   };
 
-  const fetchAdminNodes = async () => {
-    const params = new URLSearchParams({ include_occupancy: 'false' });
+  // Node reads are metadata-only. Occupancy (per-node sandbox and snapshot
+  // counts) runs a counting query, so it is a separate best-effort read after
+  // the page loads, on Refresh, after a node action and every
+  // OCCUPANCY_REFRESH_MS, merged into the rows by node ID.
+  const fetchAdminNodes = async (includeOccupancy: boolean) => {
+    const params = new URLSearchParams({ include_occupancy: includeOccupancy ? 'true' : 'false' });
     if (roleFilter !== 'all') params.set('role', roleFilter);
     return adminApi.get<AdminNodeResponse[]>(`/v1/nodes?${params.toString()}`);
   };
@@ -451,13 +471,30 @@ export default function NodesPage() {
     reconcile_trigger: null,
   });
 
+  const loadOccupancy = async () => {
+    const request = ++occupancyRequest.current;
+    const generation = occupancyGeneration.current;
+    try {
+      const adminNodes = await fetchAdminNodes(true);
+      if (request !== occupancyRequest.current || generation !== occupancyGeneration.current) return;
+      setOccupancy(new Map(adminNodes.map((admin) => [admin.id, {
+        sandboxes_active: admin.sandboxes_active,
+        sandboxes_local_snapshots: admin.sandboxes_local_snapshots,
+      }])));
+      setOccupancyAtMs(Date.now());
+      setOccupancyFailed(false);
+    } catch {
+      if (request === occupancyRequest.current && generation === occupancyGeneration.current) setOccupancyFailed(true);
+    }
+  };
+
   const loadNodes = async ({
     showLoading = true,
     suppressError = false,
   }: { showLoading?: boolean; suppressError?: boolean } = {}) => {
     if (showLoading) setLoadingNodes(true);
     try {
-      const adminNodes = await fetchAdminNodes();
+      const adminNodes = await fetchAdminNodes(false);
       const next = adminNodes.map((admin) => buildNodeView(admin));
       setNodes((previous) => mergeNodesMonotonic(previous, next));
       setNodeAgeReferenceMs(Date.now());
@@ -489,9 +526,21 @@ export default function NodesPage() {
   }, [refreshingNodeStatus]);
 
   useEffect(() => {
+    occupancyGeneration.current += 1;
+    setOccupancy(new Map());
+    setOccupancyAtMs(null);
+    setOccupancyFailed(false);
     void loadNodes().then(() => markViewRefreshed(nodeRefreshKey)).catch(() => {});
+    void loadOccupancy();
     const interval = setInterval(maybeRefreshNodes, VIEW_REFRESH_INTERVAL_MS);
-    return () => clearInterval(interval);
+    const occupancyInterval = setInterval(() => {
+      if (document.hidden) return;
+      void loadOccupancy();
+    }, OCCUPANCY_REFRESH_MS);
+    return () => {
+      clearInterval(interval);
+      clearInterval(occupancyInterval);
+    };
   }, [roleFilter]);
 
   useEffect(() => () => {
@@ -505,6 +554,7 @@ export default function NodesPage() {
     setRefreshingNodeStatus(true);
     try {
       await loadNodes({ showLoading: false });
+      void loadOccupancy();
       markViewRefreshed(nodeRefreshKey);
       if (force) {
         message.success('Nodes refreshed');
@@ -539,6 +589,7 @@ export default function NodesPage() {
       form.resetFields();
       form.setFieldsValue({ role: 'worker', verify: true });
       await loadNodes({ showLoading: false });
+      void loadOccupancy();
       message.success('Node registered');
     } catch (err: any) {
       message.error(err.message);
@@ -550,6 +601,7 @@ export default function NodesPage() {
     try {
       await adminApi.delete(`/v1/nodes/${id}`);
       await loadNodes({ showLoading: false });
+      void loadOccupancy();
       message.success('Node deleted');
     } catch (err: any) {
       message.error(err.message);
@@ -569,6 +621,7 @@ export default function NodesPage() {
     try {
       await adminApi.post(`/v1/nodes/${id}/network-policy:reconcile`);
       await loadNodes({ showLoading: false });
+      void loadOccupancy();
       message.success('Network policy reconcile queued');
     } catch (err: any) {
       message.error(err.message);
@@ -590,6 +643,7 @@ export default function NodesPage() {
     } finally {
       setDrainingNodeId(null);
       void loadNodes({ showLoading: false }).catch(() => {});
+      void loadOccupancy();
     }
   };
 
@@ -603,6 +657,7 @@ export default function NodesPage() {
     } finally {
       setUndrainingNodeId(null);
       void loadNodes({ showLoading: false }).catch(() => {});
+      void loadOccupancy();
     }
   };
 
@@ -660,14 +715,52 @@ export default function NodesPage() {
           record.drain_started_at
             ? `started: ${new Date(record.drain_started_at).toLocaleString()}`
             : null,
-          `active sandboxes: ${record.sandboxes_active ?? 'not computed'}`,
-          `local snapshots: ${record.sandboxes_local_snapshots ?? 'not computed'}`,
+          `active sandboxes: ${occupancyOf(record).sandboxes_active ?? 'not computed'}`,
+          `local snapshots: ${occupancyOf(record).sandboxes_local_snapshots ?? 'not computed'}`,
         ]
           .filter(Boolean)
           .join('\n');
         return (
           <Tooltip title={<span style={{ whiteSpace: 'pre-line' }}>{tooltip}</span>}>
             <Tag color={drainPhaseColor(phase)}>{label}</Tag>
+          </Tooltip>
+        );
+      },
+    },
+    {
+      title: 'Sandboxes',
+      width: 150,
+      render: (_, record) => {
+        if (record.role === 'cluster') return <Text type="secondary">—</Text>;
+        const counts = occupancyOf(record);
+        if (counts.sandboxes_active === null || counts.sandboxes_active === undefined) {
+          return <Text type="secondary">{occupancyFailed ? 'could not count' : 'not computed'}</Text>;
+        }
+        const slots = record.network_slots;
+        const slot = (value: number | null | undefined) => value ?? '—';
+        const stale = occupancyFailed || occupancyAtMs === null || nodeAgeReferenceMs - occupancyAtMs > 2 * OCCUPANCY_REFRESH_MS;
+        const unhealthySlots = (slots?.degraded ?? 0) + (slots?.quarantined ?? 0);
+        return (
+          <Tooltip
+            title={
+              <span style={{ whiteSpace: 'pre-line' }}>
+                {[
+                  `active sandboxes: ${counts.sandboxes_active}`,
+                  `local snapshots: ${counts.sandboxes_local_snapshots ?? 'not computed'}`,
+                  slots ? `network slots leased: ${slot(slots.leased)} of ${slot(slots.total)} (max ${slot(slots.max_slots)})` : null,
+                  slots ? `ready ${slot(slots.ready)}, degraded ${slot(slots.degraded)}, quarantined ${slot(slots.quarantined)}` : null,
+                  occupancyAtMs ? `counted ${formatUnixAge(Math.floor(occupancyAtMs / 1000), nodeAgeReferenceMs)}` : null,
+                  stale ? (occupancyFailed ? 'the last count failed; these counts are stale' : 'these counts are stale') : null,
+                ].filter(Boolean).join('\n')}
+              </span>
+            }
+          >
+            <Space size={4} wrap>
+              <span>{counts.sandboxes_active} active</span>
+              {stale ? <Tag>stale</Tag> : null}
+              {counts.sandboxes_local_snapshots ? <Tag>{counts.sandboxes_local_snapshots} local snaps</Tag> : null}
+              {unhealthySlots > 0 ? <Tag color="orange">{unhealthySlots} slots unhealthy</Tag> : null}
+            </Space>
           </Tooltip>
         );
       },
