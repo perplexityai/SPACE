@@ -851,12 +851,27 @@ open_wire_enum!(ReconnectReason, "reconnect reason", {
     DataPlaneRestart => "data_plane_restart",
 });
 
+// `unwatched` and `rewatched` report coverage of a recursive watch rather
+// than a change: the subtree at the event path stopped being fully watched
+// (this identity can't read it; directories already watched under it stay
+// watched), or is watched again or was removed and changes
+// made under it in between were missed, so rescan it. For the watch root
+// itself (path `.`), `unwatched` means the caller wasn't told about every gap,
+// or the root turned unreadable, so its coverage stays incomplete until the
+// gaps are restated without it, after a `rewatched` for `.` or a pull
+// watcher's lost history; a restatement with more gaps than one step carries
+// ends with `unwatched` for `.` again. `rewatched` for `.` asks for a rescan
+// of the whole watch. Both are scoped and
+// leave the watch running, unlike `overflowed` or a lost stream, which mean
+// rescan everything.
 open_wire_enum!(FileEventKind, "file event kind", {
     Created => "created",
     Modified => "modified",
     Removed => "removed",
     Renamed => "renamed",
     Chmod => "chmod",
+    Unwatched => "unwatched",
+    Rewatched => "rewatched",
     Unknown => "unknown",
 });
 
@@ -1911,7 +1926,32 @@ pub struct FileModifiedResponse {
     pub retained_since: Option<String>,
     pub cursor: Option<String>,
     pub monitoring_enabled: bool,
+    /// Changes were lost: rescan every root.
     pub overflowed: bool,
+    /// Absolute directories the roots don't currently cover because this
+    /// identity can't read them, or can't inspect their entries, sorted. Only
+    /// these subtrees are affected; a listed directory that is itself watched
+    /// misses only its subdirectories. A path that was listed and no longer is
+    /// was watched again or removed, or a capped list left it out: rescan it.
+    /// A gap that ends, however it ends, also sets `overflowed` for a query
+    /// reaching back before it ended; once the list is truncated, removing a
+    /// gap it doesn't name may not. Empty for older sandboxes, which don't
+    /// report gaps; a watch on one may still have them.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub unwatched_paths: Vec<String>,
+    /// `unwatched_paths` is incomplete, so a path's absence proves nothing:
+    /// it was capped, a path couldn't be listed, a root skipped more
+    /// directories than it tracks, or a root turned unreadable. Each cause
+    /// clears on its own: a capped list once it fits, a path that couldn't be
+    /// listed once its gap ends, and the last two only once a walk of the
+    /// root, as when it turns readable again, finishes with every gap and
+    /// result it found. A walk some of whose results a directory's removal or
+    /// rename made stale doesn't count, and the root may not be walked again,
+    /// so those two can leave it set for the rest of the watch. A directory
+    /// created or moved in during the walk is reported by a later walk of it
+    /// or one of its ancestors, while `overflowed` is set.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub unwatched_paths_truncated: bool,
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]

@@ -59,7 +59,7 @@ export const modelGroups = [
       ['StreamCloseReason', 'Stream close reason', 'Why a stream closed; closure alone does not prove command success.'],
       ['ReconnectReason', 'Reconnect reason', 'The reported reason for a stream reconnection.'],
       ['SessionKind', 'Session kind', 'The session kind reported by stream metadata; not a list of supported session-creation endpoints.'],
-      ['FileEventKind', 'File event kind', 'The kind of a file-watch event in the shared stream frame vocabulary.'],
+      ['FileEventKind', 'File event kind', 'The kind of a file-watch event in the shared stream frame vocabulary. unwatched means the subtree at the event path is no longer watched because this identity can\'t read it; rewatched means it is watched again, or it was removed, and changes made in between were missed, so rescan it. unwatched for the watch root itself (path .) means the caller wasn\'t told about every skipped directory, or the root turned unreadable, and rewatched for it asks for a rescan of the whole watch. Both leave the watch running and concern only that subtree, unlike a lost stream, which means rescan everything.'],
     ],
   },
   {

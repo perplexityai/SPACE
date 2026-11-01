@@ -42,6 +42,7 @@ pub(crate) struct MockBridgeGuest {
     pub(crate) flush_calls: Arc<AtomicUsize>,
     pub(crate) env_reply_failure: Option<(Arc<AtomicUsize>, tonic::Code)>,
     pub(crate) lost_reply_calls: Option<Arc<AtomicUsize>>,
+    pub(crate) unwatched_paths: Vec<String>,
 }
 
 impl Default for MockBridgeGuest {
@@ -58,6 +59,7 @@ impl Default for MockBridgeGuest {
             flush_calls: Arc::default(),
             lost_reply_calls: None,
             env_reply_failure: None,
+            unwatched_paths: Vec::new(),
         }
     }
 }
@@ -361,6 +363,8 @@ impl Filesystem for MockBridgeGuest {
             cursor: Some("1".into()),
             monitoring_enabled: true,
             overflowed: false,
+            unwatched_paths: self.unwatched_paths.clone(),
+            unwatched_paths_truncated: false,
         }))
     }
 }

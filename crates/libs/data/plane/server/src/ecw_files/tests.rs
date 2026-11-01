@@ -794,6 +794,26 @@ fn e2b_event_from_spaced_filters_outside_root() {
 }
 
 #[test]
+fn e2b_event_from_spaced_drops_and_counts_coverage_events() {
+    for (kind, tag) in [
+        (SpacedFileEventKind::Unwatched, "event_kind:unwatched"),
+        (SpacedFileEventKind::Rewatched, "event_kind:rewatched"),
+    ] {
+        let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+        let event = SpacedFileEvent {
+            path: "/workspace/src/private".to_string(),
+            kind: kind as i32,
+            observed_at: None,
+        };
+        assert!(e2b_event_from_spaced("/workspace/src", event).is_none());
+        let counters = capture.finish();
+        assert_eq!(counters.len(), 1, "{kind:?}");
+        assert_eq!(counters[0].name, "data_plane.ecw.file_event_dropped");
+        assert_eq!(counters[0].tags, [tag]);
+    }
+}
+
+#[test]
 fn content_length_precheck_rejects_oversized_uploads() {
     let mut headers = HeaderMap::new();
     headers.insert(

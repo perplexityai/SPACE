@@ -16,6 +16,7 @@ use futures_util::{Stream, StreamExt, stream};
 use http_body_util::BodyExt;
 use pplx_space_common_core::types::{GuestUserName, SandboxId, validate_linux_guest_path_input};
 use pplx_space_common_svc::bootstrap::wrap_grpc_client_channel;
+use pplx_space_metrics::data_plane::EcwDroppedFileEventKind;
 use pplx_space_node_api_client::{
     NodeApiOperationBudget, proto::worker_api_client::WorkerApiClient,
 };
@@ -1729,6 +1730,19 @@ fn e2b_event_from_spaced(root: &str, event: SpacedFileEvent) -> Option<E2bFilesy
         SpacedFileEventKind::Removed => E2bEventType::Remove,
         SpacedFileEventKind::Renamed => E2bEventType::Rename,
         SpacedFileEventKind::Chmod => E2bEventType::Chmod,
+        // E2B has no event for a subtree losing or regaining watch coverage.
+        SpacedFileEventKind::Unwatched => {
+            pplx_space_metrics::data_plane::ecw_file_event_dropped(
+                EcwDroppedFileEventKind::Unwatched,
+            );
+            return None;
+        }
+        SpacedFileEventKind::Rewatched => {
+            pplx_space_metrics::data_plane::ecw_file_event_dropped(
+                EcwDroppedFileEventKind::Rewatched,
+            );
+            return None;
+        }
         SpacedFileEventKind::Unspecified => return None,
     };
     let name = e2b_event_name(root, &event.path)?;
