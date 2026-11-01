@@ -19,7 +19,7 @@ from space_smoke.services import (
     SmokeServices,
     repair_orphaned_kind_faults,
 )
-from space_smoke.sharding import select_shard
+from space_smoke.sharding import JOINT_SURFACES, select_shard
 from space_smoke.suite import (
     RESULT_PREFIX,
     ScenarioProcessResult,
@@ -340,8 +340,25 @@ def _run_all(
         index, count = shard
         # Partition the eligible inventory, not execution: scenarios mutate
         # cluster-wide state and must remain serial within an isolated shard.
+        # An `--all` pass balances its surface together with the others a
+        # sharded run covers, from the same registry and filters, so every
+        # pass of the run computes one partition.
+        inventories = None
+        if category is None and api_surface in JOINT_SURFACES:
+            inventories = {
+                surface: tuple(
+                    scenario
+                    for scenario in REGISTRY.select(category=None, template=template)
+                    if surface in scenario.api_surfaces and backend in scenario.backends
+                )
+                for surface in JOINT_SURFACES
+            }
         scenarios = select_shard(
-            scenarios, index=index, count=count, api_surface=api_surface
+            scenarios,
+            index=index,
+            count=count,
+            api_surface=api_surface,
+            inventories=inventories,
         )
         print(f"SHARD {index}/{count}: {len(scenarios)} scenarios ({api_surface})")
     selection = f"category {category!r}" if category is not None else "this run"

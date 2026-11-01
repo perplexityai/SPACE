@@ -1,5 +1,6 @@
 """Deterministic duration-balanced partitions of an already eligible inventory."""
 
+from collections.abc import Mapping
 from typing import Any
 
 from space_smoke.registry import Scenario
@@ -155,23 +156,45 @@ _DURATION_SECONDS = {
 }
 
 
+# The API surfaces a sharded `--all` run covers, in the order
+# scripts/tests/smoke-kind-typed.sh runs them. A shard runs its ECW scenarios
+# and then its native ones, so its time is the sum of both passes: they are
+# balanced together, not each on its own.
+JOINT_SURFACES = ("ecw", "native")
+
+
 def select_shard(
     scenarios: tuple[Scenario[Any], ...],
     *,
     index: int,
     count: int,
     api_surface: str,
+    inventories: Mapping[str, tuple[Scenario[Any], ...]] | None = None,
 ) -> tuple[Scenario[Any], ...]:
-    """Place expensive scenarios first on the lightest shard, then run by ID."""
-    durations = _DURATION_SECONDS.get(api_surface, {})
+    """Place expensive scenarios first on the lightest shard, then run by ID.
+
+    With `inventories`, the eligible scenarios of every surface in it (the
+    current one's being `scenarios`), the partition is of all their (surface,
+    scenario) pairs at once, and this returns the current surface's share of
+    shard `index`. Every pass of a run computes the same partition, so each
+    pair still runs on exactly one shard.
+    """
+
+    pools = dict(inventories or {})
+    pools[api_surface] = scenarios
+    items = [
+        (surface, scenario, _DURATION_SECONDS.get(surface, {}).get(scenario.id, 30))
+        for surface in sorted(pools)
+        for scenario in pools[surface]
+    ]
     loads = [0] * count
-    partitions: list[list[Scenario[Any]]] = [[] for _ in range(count)]
-    for scenario in sorted(
-        scenarios, key=lambda scenario: (-durations.get(scenario.id, 30), scenario.id)
-    ):
-        # Equal loads choose the lower shard index. Neither discovery order nor
-        # process-local hash randomization may change the partition assignment.
+    chosen: list[Scenario[Any]] = []
+    # Equal hints order by surface and ID, and equal loads choose the lower
+    # shard index: neither discovery order nor process-local hash
+    # randomization may change the assignment.
+    for surface, scenario, seconds in sorted(items, key=lambda item: (-item[2], item[0], item[1].id)):
         target = min(range(count), key=loads.__getitem__)
-        partitions[target].append(scenario)
-        loads[target] += durations.get(scenario.id, 30)
-    return tuple(sorted(partitions[index - 1], key=lambda scenario: scenario.id))
+        loads[target] += seconds
+        if target == index - 1 and surface == api_surface:
+            chosen.append(scenario)
+    return tuple(sorted(chosen, key=lambda scenario: scenario.id))
