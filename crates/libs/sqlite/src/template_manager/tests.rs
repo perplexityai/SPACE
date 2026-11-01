@@ -4,9 +4,22 @@ use super::*;
 
 static BUNDLED: Migrator = sqlx::migrate!("../../../db/template-manager");
 static COMMON: Migrator = sqlx::migrate!("../../../db/common");
-/// The catalog of a release that bundles the retired migration.
+/// The catalog of a release that bundles the retired migration together with
+/// this catalog's later migrations.
 static PARTITIONED: LazyLock<Migrator> = LazyLock::new(|| {
     let mut migrations = BUNDLED.migrations.to_vec();
+    migrations.push(retired_migration());
+    Migrator::with_migrations(migrations)
+});
+/// The catalog of the release that recorded the retired migration: the
+/// baseline and that migration only.
+static HISTORICAL: LazyLock<Migrator> = LazyLock::new(|| {
+    let mut migrations = BUNDLED
+        .migrations
+        .iter()
+        .filter(|migration| migration.version == crate::baselines::PUBLIC_SQLITE_BASELINE)
+        .cloned()
+        .collect::<Vec<_>>();
     migrations.push(retired_migration());
     Migrator::with_migrations(migrations)
 });
@@ -103,6 +116,17 @@ fn history(conn: &Connection) -> Vec<i64> {
         .unwrap()
 }
 
+/// The versions that migrating with `service` records.
+fn bundled_versions(service: &Migrator) -> Vec<i64> {
+    let mut versions = service
+        .iter()
+        .filter(|migration| migration.migration_type.is_up_migration())
+        .map(|migration| migration.version)
+        .collect::<Vec<_>>();
+    versions.sort_unstable();
+    versions
+}
+
 async fn fresh_schema(service: &Migrator) -> Vec<(String, String)> {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("template-manager.db");
@@ -123,14 +147,17 @@ async fn a_bundled_schema_is_left_untouched() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("template-manager.db");
     migrate(&path, &BUNDLED).await.unwrap();
-    seed_legacy(&Connection::open(&path).unwrap());
-    let before = rows(&Connection::open(&path).unwrap());
+    let conn = Connection::open(&path).unwrap();
+    seed_legacy(&conn);
+    seed_outbox(&conn);
+    let before = (rows(&conn), outbox(&conn), revisions(&conn));
+    assert_eq!(before.2, (3, vec![3, 2]));
 
     migrate(&path, &BUNDLED).await.unwrap();
 
     let conn = Connection::open(&path).unwrap();
-    assert_eq!(rows(&conn), before);
-    assert_eq!(history(&conn), [crate::baselines::PUBLIC_SQLITE_BASELINE]);
+    assert_eq!((rows(&conn), outbox(&conn), revisions(&conn)), before);
+    assert_eq!(history(&conn), bundled_versions(&BUNDLED));
     assert_eq!(schema(&conn), fresh_schema(&BUNDLED).await);
 }
 
@@ -146,21 +173,9 @@ async fn a_legacy_only_partitioned_database_reverses_and_reapplies() {
 
     // Rolling back, forward again, then back once more is image-only each way.
     for (service, expected, versions) in [
-        (
-            &BUNDLED,
-            &bundled,
-            vec![crate::baselines::PUBLIC_SQLITE_BASELINE],
-        ),
-        (
-            &*PARTITIONED,
-            &partitioned,
-            vec![crate::baselines::PUBLIC_SQLITE_BASELINE, VERSION],
-        ),
-        (
-            &BUNDLED,
-            &bundled,
-            vec![crate::baselines::PUBLIC_SQLITE_BASELINE],
-        ),
+        (&BUNDLED, &bundled, bundled_versions(&BUNDLED)),
+        (&*PARTITIONED, &partitioned, bundled_versions(&PARTITIONED)),
+        (&BUNDLED, &bundled, bundled_versions(&BUNDLED)),
     ] {
         migrate(&path, service).await.unwrap();
 
@@ -169,6 +184,27 @@ async fn a_legacy_only_partitioned_database_reverses_and_reapplies() {
         assert_eq!(history(&conn), versions);
         assert_eq!(&schema(&conn), expected);
     }
+}
+
+#[tokio::test]
+async fn a_database_from_the_partitioned_release_reverses_then_applies_later_migrations() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("template-manager.db");
+    migrate(&path, &HISTORICAL).await.unwrap();
+    let conn = Connection::open(&path).unwrap();
+    seed_legacy(&conn);
+    assert_eq!(
+        history(&conn),
+        [crate::baselines::PUBLIC_SQLITE_BASELINE, VERSION]
+    );
+    let seeded = rows(&conn);
+
+    migrate(&path, &BUNDLED).await.unwrap();
+
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(rows(&conn), seeded);
+    assert_eq!(history(&conn), bundled_versions(&BUNDLED));
+    assert_eq!(schema(&conn), fresh_schema(&BUNDLED).await);
 }
 
 #[tokio::test]
@@ -194,10 +230,7 @@ async fn a_row_outside_the_legacy_partition_refuses_reversal() {
         );
         let conn = Connection::open(&path).unwrap();
         assert_eq!((rows(&conn), schema(&conn)), before);
-        assert_eq!(
-            history(&conn),
-            [crate::baselines::PUBLIC_SQLITE_BASELINE, VERSION]
-        );
+        assert_eq!(history(&conn), bundled_versions(&PARTITIONED));
     }
 }
 
@@ -217,7 +250,7 @@ async fn orphaned_children_and_finished_stamp_jobs_do_not_block_reversal() {
 
         let conn = Connection::open(&path).unwrap();
         assert_eq!(rows(&conn), seeded, "{statement}");
-        assert_eq!(history(&conn), [crate::baselines::PUBLIC_SQLITE_BASELINE]);
+        assert_eq!(history(&conn), bundled_versions(&BUNDLED));
     }
 }
 
@@ -249,17 +282,17 @@ async fn a_failed_or_modified_retired_migration_refuses_reversal() {
     }
 }
 
-/// The catalog of the next release, which bundles the dirty-ref revisions.
-static REVISIONED: LazyLock<Migrator> = LazyLock::new(|| {
-    let mut migrations = BUNDLED.migrations.to_vec();
-    migrations.push(DIRTY_REF_REVISIONS.migration());
-    Migrator::with_migrations(migrations)
-});
-/// A catalog that bundles both the retired migration and the revisions.
-static PARTITIONED_REVISIONED: LazyLock<Migrator> = LazyLock::new(|| {
-    let mut migrations = PARTITIONED.migrations.to_vec();
-    migrations.push(DIRTY_REF_REVISIONS.migration());
-    Migrator::with_migrations(migrations)
+/// The catalog of the release before this one, which lists the dirty-ref
+/// revisions without bundling them: what an image rollback returns to.
+static UNREVISIONED: LazyLock<Migrator> = LazyLock::new(|| {
+    Migrator::with_migrations(
+        BUNDLED
+            .migrations
+            .iter()
+            .filter(|migration| migration.version != DIRTY_REF_REVISIONS.version)
+            .cloned()
+            .collect(),
+    )
 });
 
 /// Outbox rows written without naming the revision, then one re-enqueue, so
@@ -286,6 +319,24 @@ fn outbox(conn: &Connection) -> Vec<String> {
     .unwrap()
     .collect::<Result<_, _>>()
     .unwrap()
+}
+
+/// The revision counter and each outbox row's revision, by facet. Reversing
+/// and re-applying the migration would restart them at 0.
+fn revisions(conn: &Connection) -> (i64, Vec<i64>) {
+    let counter = conn
+        .query_row("SELECT value FROM node_dirty_ref_revision", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let rows = conn
+        .prepare("SELECT revision FROM node_dirty_refs ORDER BY facet")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    (counter, rows)
 }
 
 #[test]
@@ -321,33 +372,27 @@ fn every_listed_migration_matches_the_catalog_that_bundles_it() {
 async fn a_database_with_dirty_ref_revisions_reverses_and_reapplies() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("template-manager.db");
-    migrate(&path, &REVISIONED).await.unwrap();
+    migrate(&path, &UNREVISIONED).await.unwrap();
     let conn = Connection::open(&path).unwrap();
     seed_legacy(&conn);
     seed_outbox(&conn);
     let seeded = (rows(&conn), outbox(&conn));
-    let bundled = fresh_schema(&BUNDLED).await;
-    let revisioned = fresh_schema(&REVISIONED).await;
+    let unrevisioned = fresh_schema(&UNREVISIONED).await;
+    let revisioned = fresh_schema(&BUNDLED).await;
+    let unrevisioned_versions = vec![crate::baselines::PUBLIC_SQLITE_BASELINE];
     let revisioned_versions = vec![
         crate::baselines::PUBLIC_SQLITE_BASELINE,
         DIRTY_REF_REVISIONS.version,
     ];
 
-    // The next release migrating again leaves its schema alone; rolling back,
-    // forward again, then back once more is image-only each way.
+    // This release applies the migration and, migrating again, keeps it;
+    // rolling back, forward again, then back once more is image-only each way.
     for (service, expected, versions) in [
-        (&*REVISIONED, &revisioned, revisioned_versions.clone()),
-        (
-            &BUNDLED,
-            &bundled,
-            vec![crate::baselines::PUBLIC_SQLITE_BASELINE],
-        ),
-        (&*REVISIONED, &revisioned, revisioned_versions.clone()),
-        (
-            &BUNDLED,
-            &bundled,
-            vec![crate::baselines::PUBLIC_SQLITE_BASELINE],
-        ),
+        (&BUNDLED, &revisioned, revisioned_versions.clone()),
+        (&BUNDLED, &revisioned, revisioned_versions.clone()),
+        (&*UNREVISIONED, &unrevisioned, unrevisioned_versions.clone()),
+        (&BUNDLED, &revisioned, revisioned_versions.clone()),
+        (&*UNREVISIONED, &unrevisioned, unrevisioned_versions.clone()),
     ] {
         migrate(&path, service).await.unwrap();
 
@@ -363,7 +408,7 @@ async fn a_failed_or_modified_dirty_ref_revisions_refuses_reversal() {
     for update in ["checksum = x'00'", "success = 0"] {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("template-manager.db");
-        migrate(&path, &REVISIONED).await.unwrap();
+        migrate(&path, &BUNDLED).await.unwrap();
         let conn = Connection::open(&path).unwrap();
         conn.execute(
             &format!("UPDATE _sqlx_migrations SET {update} WHERE version = ?1"),
@@ -371,7 +416,7 @@ async fn a_failed_or_modified_dirty_ref_revisions_refuses_reversal() {
         )
         .unwrap();
 
-        let error = migrate(&path, &BUNDLED).await.unwrap_err();
+        let error = migrate(&path, &UNREVISIONED).await.unwrap_err();
 
         assert!(
             error
@@ -381,7 +426,7 @@ async fn a_failed_or_modified_dirty_ref_revisions_refuses_reversal() {
         );
         assert_eq!(
             schema(&Connection::open(&path).unwrap()),
-            fresh_schema(&REVISIONED).await
+            fresh_schema(&BUNDLED).await
         );
     }
 }
@@ -391,7 +436,7 @@ async fn every_unbundled_migration_reverses_together_or_not_at_all() {
     for statement in [None, Some(NON_LEGACY[0])] {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("template-manager.db");
-        migrate(&path, &PARTITIONED_REVISIONED).await.unwrap();
+        migrate(&path, &PARTITIONED).await.unwrap();
         let conn = Connection::open(&path).unwrap();
         seed_legacy(&conn);
         seed_outbox(&conn);
@@ -400,7 +445,7 @@ async fn every_unbundled_migration_reverses_together_or_not_at_all() {
         }
         let before = (rows(&conn), outbox(&conn), schema(&conn), history(&conn));
 
-        let result = migrate(&path, &BUNDLED).await;
+        let result = migrate(&path, &UNREVISIONED).await;
 
         let conn = Connection::open(&path).unwrap();
         if statement.is_some() {
@@ -421,7 +466,7 @@ async fn every_unbundled_migration_reverses_together_or_not_at_all() {
             result.unwrap();
             assert_eq!((rows(&conn), outbox(&conn)), (before.0, before.1));
             assert_eq!(history(&conn), [crate::baselines::PUBLIC_SQLITE_BASELINE]);
-            assert_eq!(schema(&conn), fresh_schema(&BUNDLED).await);
+            assert_eq!(schema(&conn), fresh_schema(&UNREVISIONED).await);
         }
     }
 }
@@ -430,7 +475,7 @@ async fn every_unbundled_migration_reverses_together_or_not_at_all() {
 async fn a_failure_after_the_first_reversal_rolls_back_every_reversal() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("template-manager.db");
-    migrate(&path, &PARTITIONED_REVISIONED).await.unwrap();
+    migrate(&path, &PARTITIONED).await.unwrap();
     let conn = Connection::open(&path).unwrap();
     seed_legacy(&conn);
     seed_outbox(&conn);
@@ -443,7 +488,7 @@ async fn a_failure_after_the_first_reversal_rolls_back_every_reversal() {
     .unwrap();
     let before = (rows(&conn), outbox(&conn), schema(&conn), history(&conn));
 
-    let error = migrate(&path, &BUNDLED).await.unwrap_err();
+    let error = migrate(&path, &UNREVISIONED).await.unwrap_err();
 
     assert!(error.to_string().contains("injected"), "{error}");
     let conn = Connection::open(&path).unwrap();
