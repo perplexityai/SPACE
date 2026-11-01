@@ -54,6 +54,44 @@ pub struct PooledExecutionClaimRequest<'a> {
     /// creates bypass the pool until claim-time re-homing can stamp and apply
     /// the flag at adoption.
     pub volume_encryption: bool,
+    /// The create's client id: the ECW caller's, or `native`; `None` adopts
+    /// an unlabeled pod.
+    pub client_id: Option<&'a pplx_space_common_core::types::ClientId>,
+}
+
+/// What `label_adopted_execution` does with a claim whose label patch failed
+/// transiently: throttled past its retries, a 408 or 5xx, or a dropped
+/// connection. The failure doesn't speak to the pod, and the patch is
+/// UID-fenced and idempotent, so the slot isn't invalidated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdoptionLabelTransient {
+    /// Give the slot back to the pool for a later create.
+    ReleaseSlot,
+    /// Keep the claim, so a retry of the same operation adopts the same slot.
+    /// An admitted claim reserves its operation's planned sandbox id, which a
+    /// released slot would hand to another create.
+    KeepClaim,
+}
+
+/// The result of labeling an adopted pool pod with its adopter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdoptionLabelOutcome {
+    /// The pod carries the adopter's label, or there's no label to set.
+    Labeled,
+    /// The patch failed transiently (see [`AdoptionLabelTransient`]). The slot
+    /// is released or the claim kept, as the caller asked; the adoption must
+    /// not proceed, and the create shouldn't fall back to a cold pod, which
+    /// would add apiserver writes while the apiserver is struggling. A patch
+    /// whose outcome is unknown may still have landed, so a released pod can
+    /// carry this adopter's label; it has no sandbox row for tracking to
+    /// record, and the next adoption's patch replaces the label.
+    Transient,
+    /// The apiserver refused the patch for good, or the pod has no recorded
+    /// UID, and the slot is invalidated so no create adopts it; the pool's
+    /// cleanup deletes the pod. A permanently failed slot is never given back:
+    /// a refusal that repeats (a replaced pod, a missing RBAC verb) would hand
+    /// the same slot, first in claim order, to every later create.
+    Invalidated,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

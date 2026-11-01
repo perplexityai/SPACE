@@ -478,6 +478,11 @@ fn on_demand_request<'a>(
     }
 }
 
+/// The activating client every test runtime is attributed to, so the golden
+/// pod snapshots show the `space.pplx.net/client-id` label.
+static TEST_CLIENT_ID: std::sync::LazyLock<crate::types::ClientId> =
+    std::sync::LazyLock::new(|| crate::types::ClientId::from_header(Some("example-client")));
+
 /// Exhaustive `SandboxRuntimePodMetadata` literal for tests to mutate or
 /// struct-update from. Neither pod-render type derives `Default` (every field
 /// is meant to be considered at the call site), so this is the one place the
@@ -493,6 +498,7 @@ fn test_runtime<'a>(
         sandbox_owner,
         user_id: TEST_USER_ID,
         org_id: TEST_ORG_ID,
+        client_id: Some(&TEST_CLIENT_ID),
         auto_lifecycle_json,
         auto_lifecycle_authority: PolicyAuthority::Cluster,
         network_policy_json,
@@ -2510,6 +2516,7 @@ fn placement_test_runtime<'a>(
         sandbox_owner,
         user_id: TEST_USER_ID,
         org_id: TEST_ORG_ID,
+        client_id: Some(&TEST_CLIENT_ID),
         auto_lifecycle_json,
         auto_lifecycle_authority: PolicyAuthority::Cluster,
         network_policy_json,

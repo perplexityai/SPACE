@@ -992,6 +992,7 @@ async fn direct_create_rejects_node_pool_placement() -> TestResult {
             wait_until_ready: true,
             volume_encryption: false,
             node_pool: Some(&node_pool),
+            client_id: None,
         })
         .await;
     let error = match result {
@@ -2708,6 +2709,7 @@ async fn direct_create_receipt_failure_deletes_node_local_sandbox() -> TestResul
             wait_until_ready: true,
             volume_encryption: false,
             node_pool: None,
+            client_id: None,
         })
         .await;
 
@@ -2785,6 +2787,7 @@ async fn direct_create_identity_preparation_failure_deletes_node_local_sandbox()
             wait_until_ready: false,
             volume_encryption: false,
             node_pool: None,
+            client_id: None,
         })
         .await;
 
@@ -2858,6 +2861,7 @@ async fn two_step_direct_create_initializes_identity_for_initial_start() -> Test
             wait_until_ready: false,
             volume_encryption: false,
             node_pool: None,
+            client_id: None,
         })
         .await?;
 
@@ -2886,6 +2890,13 @@ struct DirectCreateFixture {
 }
 
 async fn direct_create_fixture() -> TestResult<Option<DirectCreateFixture>> {
+    direct_create_fixture_with(crate::controllers::substrate::ActivationClientAttribution::Disabled)
+        .await
+}
+
+async fn direct_create_fixture_with(
+    attribution: crate::controllers::substrate::ActivationClientAttribution,
+) -> TestResult<Option<DirectCreateFixture>> {
     let Some(postgres) = postgres_fixture().await? else {
         return Ok(None);
     };
@@ -2917,9 +2928,11 @@ async fn direct_create_fixture() -> TestResult<Option<DirectCreateFixture>> {
     ))
     .fetch_one(&postgres.pool)
     .await?;
-    let controller = crate::controllers::sandbox::SandboxController::new(
-        super::super::Substrate::from_direct(DirectSubstrate::new(postgres.pool.clone())),
-    );
+    let controller =
+        crate::controllers::sandbox::SandboxController::new(super::super::Substrate::from_direct(
+            DirectSubstrate::new(postgres.pool.clone())
+                .with_activation_client_attribution(attribution),
+        ));
     Ok(Some(DirectCreateFixture {
         postgres,
         controller,
@@ -2955,6 +2968,18 @@ impl DirectCreateFixture {
         &self,
         request: &crate::models::CreateSandboxRequest,
     ) -> Result<crate::models::SandboxResponse, ControllerError> {
+        self.create_as(
+            request,
+            crate::controllers::substrate::ActivationClient::Native,
+        )
+        .await
+    }
+
+    async fn create_as(
+        &self,
+        request: &crate::models::CreateSandboxRequest,
+        activating_client: crate::controllers::substrate::ActivationClient,
+    ) -> Result<crate::models::SandboxResponse, ControllerError> {
         self.controller
             .create(
                 &self.postgres.pool,
@@ -2962,9 +2987,56 @@ impl DirectCreateFixture {
                 request,
                 pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native("create"),
                 crate::controllers::sandbox::FederatedSandboxCreateContext::new(None, None),
+                activating_client,
             )
             .await
     }
+}
+
+/// A create records its activating client on the row it inserts: an ECW
+/// caller's id, or `native` for a native call. The insert is shared by both
+/// substrates. With attribution off, nothing is recorded.
+#[rstest::rstest]
+#[case::on(crate::controllers::substrate::ActivationClientAttribution::Enabled)]
+#[case::off(crate::controllers::substrate::ActivationClientAttribution::Disabled)]
+#[tokio::test(flavor = "current_thread")]
+async fn a_create_records_its_activating_client(
+    #[case] attribution: crate::controllers::substrate::ActivationClientAttribution,
+) -> TestResult {
+    use crate::controllers::substrate::ActivationClient;
+    use pplx_space_common_core::types::ClientId;
+
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+    let Some(fixture) = direct_create_fixture_with(attribution).await? else {
+        return Ok(());
+    };
+    for (activating_client, expected) in [
+        (
+            ActivationClient::Client(ClientId::parse("creator")?),
+            "creator",
+        ),
+        (ActivationClient::Native, "native"),
+    ] {
+        let response = fixture
+            .create_as(&one_shot_create_request()?, activating_client)
+            .await?;
+
+        let record = pplx_space_sandbox_store::attribute_runtime::activating_client(
+            &fixture.postgres.pool,
+            response.id,
+        )
+        .await?
+        .expect("created sandbox row");
+        assert_eq!(
+            record.as_ref().map(ClientId::as_str),
+            (attribution == crate::controllers::substrate::ActivationClientAttribution::Enabled)
+                .then_some(expected),
+            "{attribution:?}"
+        );
+    }
+    Ok(())
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -3131,7 +3203,7 @@ async fn live_cpu_update_preserves_allocation_across_cold_restart() -> TestResul
                         blocking: true,
                         ready_timeout: Duration::from_secs(5),
                     },
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
                 )
                 .await?;
         }
@@ -3190,7 +3262,7 @@ async fn direct_start_persists_complete_route_identity_receipt() -> TestResult {
                 blocking: true,
                 ready_timeout: Duration::from_secs(5),
             },
-            crate::controllers::substrate::RecoveryCharge::Exempt,
+            crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
         )
         .await?;
 
@@ -3752,7 +3824,7 @@ async fn direct_start_rejects_wrong_worker_receipt_and_clears_stale_identity() -
                 blocking: true,
                 ready_timeout: Duration::from_secs(5),
             },
-            crate::controllers::substrate::RecoveryCharge::Exempt,
+            crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
         )
         .await
         .expect_err("a receipt for another worker must fail closed");
@@ -3906,6 +3978,7 @@ async fn pooled_claim_persists_route_receipt_after_api_sandbox_insert() -> TestR
         template_network_policy: &policy,
         template_network_policy_generation: 1,
         volume_encryption: false,
+        client_id: None,
     };
     let mut transaction = fixture.pool.begin().await?;
 
@@ -4036,7 +4109,7 @@ async fn cross_node_restore_handles_candidate_failures(
                 blocking: true,
                 ready_timeout: Duration::from_secs(5),
             },
-            crate::controllers::substrate::RecoveryCharge::Exempt,
+            crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
         )
         .await;
     if !alternate_support {
@@ -4192,7 +4265,7 @@ async fn cross_node_restore_retains_source_after_receipt_persistence_failure() -
                 blocking: true,
                 ready_timeout: Duration::from_secs(5),
             },
-            crate::controllers::substrate::RecoveryCharge::Exempt,
+            crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
         )
         .await
         .expect_err("mismatched destination receipt must fail closed");
@@ -4472,7 +4545,7 @@ async fn implicit_access_wake_honors_the_workers_effective_policy() -> TestResul
                 &sandbox,
                 ExecutionActivityKind::Access,
                 Duration::from_secs(5),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
             )
             .await;
 
@@ -4522,7 +4595,7 @@ async fn implicit_access_wake_refuses_when_the_cluster_policy_denies_it() -> Tes
             &sandbox,
             ExecutionActivityKind::Access,
             Duration::from_secs(5),
-            crate::controllers::substrate::RecoveryCharge::Exempt,
+            crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
         )
         .await
     {
@@ -4567,6 +4640,7 @@ async fn pooled_claim_checks_capability_before_adopting_and_retains_its_generati
         template_network_policy: &network,
         template_network_policy_generation: 1,
         volume_encryption: false,
+        client_id: None,
     };
     for supported in [false, true] {
         let node = NodeId::new();
@@ -4694,7 +4768,7 @@ async fn wake_reserves_fresh_identity_when_observed_resident_retires() -> TestRe
             &sandbox,
             Duration::from_secs(5),
             None,
-            crate::controllers::substrate::RecoveryCharge::Exempt,
+            crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
         )
         .await?;
     let running = state.get(&sandbox_id.to_string()).await?;
@@ -4755,7 +4829,7 @@ async fn wake_keeps_generation_observed_during_resident_transition(
             &sandbox,
             Duration::from_secs(5),
             Some(ExecutionActivityKind::Access),
-            crate::controllers::substrate::RecoveryCharge::Exempt,
+            crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
         )
         .await?;
     let resumed = state.get(&sandbox_id.to_string()).await?;

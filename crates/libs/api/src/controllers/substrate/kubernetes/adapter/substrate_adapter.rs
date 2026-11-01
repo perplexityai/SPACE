@@ -418,6 +418,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                 execution.generation,
                 pod_uid.as_deref(),
                 pod_ip_string.as_deref(),
+                pod.client_id().as_ref(),
             )
             .await
         {
@@ -968,6 +969,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
         let activation_assignment = ActivationAttemptAssignment::new(
             requested_attempt_id,
             SandboxTransitionTargetState::Started,
+            charge.attribution().key().clone(),
         );
         let wait = async {
             // Boxed: `ensure_pod_exists` is a large future, and inlining it in
@@ -1636,7 +1638,8 @@ impl SubstrateAdapter for KubernetesSubstrate {
                     sandbox,
                     timeout,
                     metric_identity,
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    // The access entrypoint already charged it.
+                    charge.after_charge(),
                 )
                 .await;
         }
@@ -2453,6 +2456,79 @@ impl SubstrateAdapter for KubernetesSubstrate {
                     claim.pod_name
                 ))
             })
+    }
+
+    /// Patch the adopter's `space.pplx.net/client-id` label onto the pool pod,
+    /// synchronously and before the adoption commits, retrying while the
+    /// apiserver throttles, so the label exists before the client can use the
+    /// sandbox. A pod that can't be labeled isn't adopted, and its slot is
+    /// invalidated.
+    async fn label_adopted_execution(
+        &self,
+        claim: &PooledExecutionClaim,
+        client_id: Option<&pplx_space_common_core::types::ClientId>,
+        on_transient: crate::controllers::substrate::AdoptionLabelTransient,
+    ) -> Result<crate::controllers::substrate::AdoptionLabelOutcome, ControllerError> {
+        use crate::controllers::substrate::{AdoptionLabelOutcome, AdoptionLabelTransient};
+        use kube::api::{Patch, PatchParams};
+        use pplx_space_common_core::kubernetes::SANDBOX_CLIENT_ID_LABEL;
+
+        let Some(client_id) = self.k8s.activation_client_attribution.gate(client_id) else {
+            return Ok(AdoptionLabelOutcome::Labeled);
+        };
+        // Without the claimed UID the patch can't be fenced to the claimed
+        // pod, so a pod that can't be identified isn't adopted.
+        let Some(pod_uid) = &claim.pod_uid else {
+            tracing::warn!(
+                sandbox_id = %claim.sandbox_id,
+                pod_name = %claim.pod_name,
+                "adopted pool pod has no recorded UID; abandoning the adoption"
+            );
+            self.rollback_pooled_execution_claim(claim).await?;
+            return Ok(AdoptionLabelOutcome::Invalidated);
+        };
+        let pods: Api<Pod> = Api::namespaced(self.k8s.client.clone(), &self.k8s.sandbox_namespace);
+        // The claimed UID fences the patch: UID is immutable, so the apiserver
+        // rejects it (422) for a pod recreated under the same name.
+        let patch = Patch::Merge(serde_json::json!({
+            "metadata": {
+                "uid": pod_uid.as_str(),
+                "labels": { SANDBOX_CLIENT_ID_LABEL: client_id.as_str() }
+            }
+        }));
+        let params = PatchParams::default();
+        let result = super::super::pod_ops::retry_kube_throttling("label_adopted_pod", || {
+            pods.patch(&claim.pod_name, &params, &patch)
+        })
+        .await;
+        let error = match result {
+            Ok(_) => return Ok(AdoptionLabelOutcome::Labeled),
+            Err(error) => error,
+        };
+        // A transient failure (throttling that outlasted the retries, a 408
+        // or 5xx, a dropped connection) says nothing about the pod, and the
+        // patch is UID-fenced and idempotent: the slot stays good.
+        if super::super::pod_ops::is_transient_kube_read_error(&error) {
+            tracing::warn!(
+                sandbox_id = %claim.sandbox_id,
+                pod_name = %claim.pod_name,
+                %error,
+                ?on_transient,
+                "adopted pool pod label failed transiently; not adopting it now"
+            );
+            if on_transient == AdoptionLabelTransient::ReleaseSlot {
+                pool::release_claimed_pool_slot(self.store.pool(), claim).await?;
+            }
+            return Ok(AdoptionLabelOutcome::Transient);
+        }
+        tracing::warn!(
+            sandbox_id = %claim.sandbox_id,
+            pod_name = %claim.pod_name,
+            %error,
+            "failed to label the adopted pool pod; abandoning the adoption"
+        );
+        self.rollback_pooled_execution_claim(claim).await?;
+        Ok(AdoptionLabelOutcome::Invalidated)
     }
 
     async fn cleanup_failed_pooled_prepare(

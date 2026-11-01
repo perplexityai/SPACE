@@ -1160,7 +1160,7 @@ impl K8sStore {
                     e.k8s_node_name, e.state, s.lifecycle,
                     e.updated_at <= NOW() - make_interval(secs => $2) AS create_age_expired,
                     e.activation_attempt_id,
-                    e.route_activation_id
+                    e.route_activation_id, s.activating_client_id
              FROM sandbox_k8s_executions e
              JOIN sandboxes s ON s.id = e.sandbox_id
              WHERE e.sandbox_id = $1 AND e.active"

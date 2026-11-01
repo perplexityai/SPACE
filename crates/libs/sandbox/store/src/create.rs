@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use pplx_space_common_core::{
     sql,
-    types::{AutoLifecyclePolicy, DiskIoLimits, NodeId, OrgId, SandboxId, UserId},
+    types::{AutoLifecyclePolicy, ClientId, DiskIoLimits, NodeId, OrgId, SandboxId, UserId},
 };
 use sqlx::types::JsonValue;
 use uuid::Uuid;
@@ -28,6 +28,10 @@ pub struct SandboxCreate<'a> {
     pub auto_lifecycle: &'a AutoLifecyclePolicy,
     pub network_policy_override_json: Option<&'a JsonValue>,
     pub egress_profiles: &'a [&'a str],
+    /// The client whose activation creates the sandbox's first runtime: the
+    /// ECW caller's id, or `native`. Written to `activating_client_id`;
+    /// `None` (an activation with no client to attribute) leaves it `NULL`.
+    pub activating_client_id: Option<&'a ClientId>,
 }
 
 /// Insert an unplaced sandbox. A restore token starts it in `restoring` and
@@ -48,7 +52,8 @@ pub async fn insert_unplaced(
             metadata, auto_lifecycle_json, network_policy_override_json,
             network_policy_generation, volume_encryption,
             restore_lease_token, restore_lease_expires_at,
-            preserve_local_artifact_on_restore_failure, egress_profiles
+            preserve_local_artifact_on_restore_failure, egress_profiles,
+            activating_client_id
         ) VALUES (
             $1, $2, $3, $4, $5,
             CASE WHEN $18::uuid IS NULL THEN 'creating' ELSE 'restoring' END,
@@ -58,7 +63,7 @@ pub async fn insert_unplaced(
                  THEN NULL
                  ELSE NOW() + make_interval(secs => $19::double precision)
             END,
-            $18::uuid IS NOT NULL, $20
+            $18::uuid IS NOT NULL, $20, $21
         )"
     ))
     .bind(input.id)
@@ -81,6 +86,7 @@ pub async fn insert_unplaced(
     .bind(restore_lease_token)
     .bind(restore_lease_seconds)
     .bind(input.egress_profiles)
+    .bind(input.activating_client_id)
     .execute(executor)
     .await?;
     Ok(())
@@ -102,12 +108,12 @@ pub async fn insert_pooled(
             disk_io_max_operations_per_sec,
             disk_io_max_bandwidth_mib_per_sec, env, metadata,
             auto_lifecycle_json, network_policy_override_json, network_policy_generation,
-            egress_profiles
+            egress_profiles, activating_client_id
         )
         VALUES (
             $1, $2, $3, $4, $5, 'paused', 'on_node',
             $6, $6, NOW(),
-            $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 1, $18
+            $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 1, $18, $19
         )"
     ))
     .bind(input.id)
@@ -128,6 +134,7 @@ pub async fn insert_pooled(
     .bind(sqlx::types::Json(input.auto_lifecycle))
     .bind(input.network_policy_override_json)
     .bind(input.egress_profiles)
+    .bind(input.activating_client_id)
     .execute(executor)
     .await?;
     Ok(())

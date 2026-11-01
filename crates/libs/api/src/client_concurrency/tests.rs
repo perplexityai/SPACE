@@ -564,7 +564,7 @@ fn override_only_ids_keep_their_bucket_past_the_interning_cap() {
 /// Prefers `SPACE_TEST_REDIS_URL` so the Lua can be exercised without Docker;
 /// otherwise starts a throwaway container. `None` skips the test, which only a
 /// run that opted out of required test dependencies allows.
-async fn try_redis_url() -> TestResult<Option<(Option<ContainerAsync<Redis>>, String)>> {
+pub(crate) async fn try_redis_url() -> TestResult<Option<(Option<ContainerAsync<Redis>>, String)>> {
     if let Ok(url) = std::env::var("SPACE_TEST_REDIS_URL")
         && !url.trim().is_empty()
     {
@@ -731,7 +731,10 @@ async fn concurrent_acquires_cannot_overspend_the_cap() -> TestResult {
     Ok(())
 }
 
-fn redis_limiter(url: &str, config: ClientConcurrencyConfig) -> ClientConcurrencyLimiter {
+pub(crate) fn redis_limiter(
+    url: &str,
+    config: ClientConcurrencyConfig,
+) -> ClientConcurrencyLimiter {
     limiter_with(ClientConcurrencyConfig {
         redis_url: Some(url.to_string()),
         ..config
@@ -740,7 +743,7 @@ fn redis_limiter(url: &str, config: ClientConcurrencyConfig) -> ClientConcurrenc
 
 /// An enforce-mode config keyed to a single allowlisted `client`, sized so one
 /// slot fills the per-client and unspecified caps.
-fn tight_enforce(client: &str) -> ClientConcurrencyConfig {
+pub(crate) fn tight_enforce(client: &str) -> ClientConcurrencyConfig {
     ClientConcurrencyConfig {
         mode: Mode::Enforce,
         max_in_flight_per_client: 1,

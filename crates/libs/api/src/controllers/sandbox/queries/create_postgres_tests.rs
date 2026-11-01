@@ -46,7 +46,7 @@ use crate::models::{SandboxMetadata, SandboxMetadataValue};
 use pplx_space_common_core::types::{UpstreamIssuer, UpstreamOrgId, UpstreamSubjectId};
 use pplx_space_common_svc::types::ReconcileFacet;
 use pplx_space_db_test_fixtures::{
-    SEED_ORG_ID, SEED_USER_ID, insert_ready_worker_node, pg_test_db,
+    SEED_ORG_ID, SEED_USER_ID, TestDb, insert_ready_worker_node, pg_test_db,
 };
 use pplx_space_placement::test_support::stored_lifecycle_matrix;
 use sqlx::{PgPool, Postgres, Transaction};
@@ -675,6 +675,7 @@ fn pooled_create_input<'a>(
         federated_owner: None,
         federated_service_grant: None,
         volume_encryption: false,
+        client_id: None,
     }
 }
 
@@ -742,6 +743,11 @@ struct RetryingPoolSubstrate {
     admitted_lookup_calls: AtomicUsize,
     rollback_calls: AtomicUsize,
     prepare_wait_until_ready: Mutex<Vec<bool>>,
+    /// What `label_adopted_execution` answers.
+    label_outcome: AdoptionLabelOutcome,
+    /// Each `label_adopted_execution` call: the client, the transient-failure policy,
+    /// and whether the sandbox row existed yet.
+    label_calls: Mutex<Vec<(Option<ClientId>, AdoptionLabelTransient, bool)>>,
 }
 
 impl RetryingPoolSubstrate {
@@ -767,6 +773,8 @@ impl RetryingPoolSubstrate {
             admitted_lookup_calls: AtomicUsize::new(0),
             rollback_calls: AtomicUsize::new(0),
             prepare_wait_until_ready: Mutex::new(Vec::new()),
+            label_outcome: AdoptionLabelOutcome::Labeled,
+            label_calls: Mutex::new(Vec::new()),
         }
     }
 
@@ -978,6 +986,25 @@ impl SubstrateAdapter for RetryingPoolSubstrate {
     ) -> Result<(), ControllerError> {
         self.rollback_calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
+    }
+
+    async fn label_adopted_execution(
+        &self,
+        claim: &PooledExecutionClaim,
+        client_id: Option<&ClientId>,
+        on_transient: AdoptionLabelTransient,
+    ) -> Result<AdoptionLabelOutcome, ControllerError> {
+        let committed: bool =
+            sqlx::query_scalar(sql!("SELECT EXISTS(SELECT 1 FROM sandboxes WHERE id = $1)"))
+                .bind(claim.sandbox_id)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|error| ControllerError::internal(error.to_string()))?;
+        self.label_calls
+            .lock()
+            .unwrap()
+            .push((client_id.cloned(), on_transient, committed));
+        Ok(self.label_outcome)
     }
 
     async fn persist_pooled_execution_claim(
@@ -1305,6 +1332,17 @@ impl SubstrateAdapter for NodeRpcStubbedKubernetes {
         self.inner.rollback_pooled_execution_claim(claim).await
     }
 
+    async fn label_adopted_execution(
+        &self,
+        claim: &PooledExecutionClaim,
+        client_id: Option<&pplx_space_common_core::types::ClientId>,
+        on_transient: AdoptionLabelTransient,
+    ) -> Result<crate::controllers::substrate::AdoptionLabelOutcome, ControllerError> {
+        self.inner
+            .label_adopted_execution(claim, client_id, on_transient)
+            .await
+    }
+
     async fn persist_pooled_execution_claim(
         &self,
         tx: &mut Transaction<'_, Postgres>,
@@ -1601,6 +1639,7 @@ async fn postgres_cold_federated_create_is_atomic_with_grant_upsert() -> TestRes
                 Some(&federated_owner),
                 Some(&federated_service_grant),
             ),
+            crate::controllers::substrate::ActivationClient::Native,
         )
         .await;
 
@@ -1656,6 +1695,7 @@ async fn postgres_federated_create_denies_api_key_org_specific_template() -> Tes
                 Some(&federated_owner),
                 Some(&federated_service_grant),
             ),
+            crate::controllers::substrate::ActivationClient::Native,
         )
         .await;
 
@@ -1705,6 +1745,7 @@ async fn postgres_federated_create_allows_mapped_org_specific_template() -> Test
                 Some(&federated_owner),
                 Some(&federated_service_grant),
             ),
+            crate::controllers::substrate::ActivationClient::Native,
         )
         .await;
 
@@ -2702,6 +2743,82 @@ async fn postgres_admitted_pool_claim_releases_a_slot_it_may_not_adopt() -> Test
     Ok(())
 }
 
+/// An admitted slot is labeled before anything commits. It reserves the
+/// operation's planned id, so a pod that can't be labeled leaves the create
+/// waiting for the pool to collect the slot, then building cold under the same
+/// id.
+#[tokio::test(flavor = "current_thread")]
+async fn postgres_admitted_pool_claim_waits_when_its_pod_cant_be_labeled() -> TestResult {
+    let fixture = AdmittedCreateFixture::new().await?;
+    let admitted = fixture.admitted();
+    let mut substrate =
+        fixture
+            .substrate()
+            .with_admitted_lookup(AdmittedPoolClaimLookup::Adoptable {
+                claim: Box::new(fixture.claim(admitted)),
+                pool_shape: PooledExecutionPoolShape::new(4, 2048, Default::default()),
+            });
+    substrate.label_outcome = AdoptionLabelOutcome::Invalidated;
+
+    let error = match fixture.run(&substrate, admitted, false).await {
+        Ok(_) => panic!("an unlabeled pod must not be adopted"),
+        Err(error) => error,
+    };
+
+    assert_eq!(
+        error.retry_after_cause(),
+        Some(ControllerRetryAfterCause::PoolSlotRelease)
+    );
+    assert_eq!(
+        *substrate.label_calls.lock().unwrap(),
+        vec![(None, AdoptionLabelTransient::KeepClaim, false)]
+    );
+    assert_eq!(substrate.prepare_calls(), 0);
+    assert_eq!(fixture.sandbox_rows().await?, 0);
+    Ok(())
+}
+
+/// An admitted slot whose label patch failed transiently keeps its claim:
+/// the create is told to retry soon, without the pool-release wait, and nothing
+/// commits or rolls back, so the retry adopts the same slot.
+#[tokio::test(flavor = "current_thread")]
+async fn postgres_admitted_pool_claim_keeps_its_claim_when_its_label_fails_transiently()
+-> TestResult {
+    let fixture = AdmittedCreateFixture::new().await?;
+    let admitted = fixture.admitted();
+    let mut substrate =
+        fixture
+            .substrate()
+            .with_admitted_lookup(AdmittedPoolClaimLookup::Adoptable {
+                claim: Box::new(fixture.claim(admitted)),
+                pool_shape: PooledExecutionPoolShape::new(4, 2048, Default::default()),
+            });
+    substrate.label_outcome = AdoptionLabelOutcome::Transient;
+
+    let error = match fixture.run(&substrate, admitted, false).await {
+        Ok(_) => panic!("a transiently failed label must not adopt"),
+        Err(error) => error,
+    };
+
+    assert_eq!(
+        error.retry_after_cause(),
+        Some(ControllerRetryAfterCause::PoolSlotRelease)
+    );
+    assert_eq!(
+        error.retry_after_header(),
+        Some(ADOPTION_LABEL_TRANSIENT_RETRY),
+        "a transient label failure retries sooner than a pending slot release"
+    );
+    assert_eq!(
+        *substrate.label_calls.lock().unwrap(),
+        vec![(None, AdoptionLabelTransient::KeepClaim, false)]
+    );
+    assert_eq!(substrate.rollback_calls(), 0, "the claim is kept");
+    assert_eq!(substrate.prepare_calls(), 0);
+    assert_eq!(fixture.sandbox_rows().await?, 0);
+    Ok(())
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn postgres_admitted_pool_claim_prepare_failure_never_reclaims() -> TestResult {
     // A failed adoption must not fall back to another slot (the ID is fixed)
@@ -2897,6 +3014,7 @@ async fn postgres_federated_restore_inserts_restore_ownership() -> TestResult {
                     storage_uri: Some("s3://bucket/snapshot-1"),
                     source_sandbox_id,
                 },
+                activating_client: crate::controllers::substrate::ActivationClient::Inherit,
             },
         )
         .await
@@ -3353,5 +3471,152 @@ async fn admission_claim_executes_and_runs_under_the_claimed_id(
         ("bound", Some(admitted.claim_id)),
         "the admission claim is the one that bound"
     );
+    Ok(())
+}
+
+/// A pool hit, created by the `adopter` client, whose
+/// `label_adopted_execution` answers `outcome`.
+async fn pooled_create_labeled(
+    outcome: AdoptionLabelOutcome,
+) -> TestResult<(
+    TestDb,
+    SandboxId,
+    RetryingPoolSubstrate,
+    Result<Option<SandboxResponse>, ControllerError>,
+)> {
+    let db = pg_test_db().await?;
+    let actor = insert_actor(&db.pool).await?;
+    let node_id = NodeId::new();
+    let release_id = insert_template_release(&db.pool, "seed", "sha256:pooled").await?;
+    let pool_config_id = Uuid::now_v7();
+    let sandbox_id = SandboxId::new();
+    let auto_lifecycle = AutoLifecyclePolicy::disabled();
+    let mut req = pooled_create_request("pooled-sandbox-adoption-label", None);
+    req.boot_mode = None;
+    let template_network_policy = NetworkPolicyV1::deny_all();
+    let requested_template = TemplateReference::latest(TemplateName::parse("seed").unwrap());
+    let create_owner = SandboxCreateOwner::local(&actor);
+    let adopter = ClientId::parse("adopter").expect("test client id");
+    let mut input = pooled_create_input(
+        &db.pool,
+        &req,
+        &requested_template,
+        &auto_lifecycle,
+        &template_network_policy,
+        &create_owner,
+    );
+    input.template_release_id = release_id;
+    input.boot_mode = CreateBootMode::Fallthrough;
+    input.client_id = Some(&adopter);
+    insert_node(&db.pool, node_id).await?;
+    sqlx::query(sql!(
+        "INSERT INTO kubernetes_pool_configs (
+             id, template_release_id, vcpu, memory_mib, target_ready_slots,
+             refill_per_tick, max_warming_slots, namespace, enabled
+         )
+         VALUES ($1, $2, 4, 2048, 3, 1, 1, 'space', true)"
+    ))
+    .bind(pool_config_id)
+    .bind(release_id)
+    .execute(&db.pool)
+    .await?;
+    let mut substrate = RetryingPoolSubstrate::new(
+        db.pool.clone(),
+        pool_config_id,
+        release_id,
+        vec![pooled_claim(sandbox_id, node_id)],
+        vec![true],
+    );
+    substrate.label_outcome = outcome;
+
+    let response = SandboxController::try_create_from_pool_with_substrate(
+        &substrate,
+        input,
+        Arc::new(AtomicU64::new(0)),
+    )
+    .await
+    .map(|result| result.response);
+    Ok((db, sandbox_id, substrate, response))
+}
+
+/// The adopter's label is patched before the adoption commits, and the
+/// committed sandbox records the adopter.
+#[tokio::test(flavor = "current_thread")]
+async fn postgres_pooled_adoption_labels_the_pod_before_it_commits() -> TestResult {
+    let (db, sandbox_id, substrate, response) =
+        pooled_create_labeled(AdoptionLabelOutcome::Labeled).await?;
+
+    assert_eq!(response?.expect("labeled adoption commits").id, sandbox_id);
+    assert_eq!(
+        *substrate.label_calls.lock().unwrap(),
+        vec![(
+            Some(ClientId::parse("adopter").unwrap()),
+            AdoptionLabelTransient::ReleaseSlot,
+            false
+        )],
+        "labeled once, before the sandbox row exists"
+    );
+    let record: Option<String> = sqlx::query_scalar(sql!(
+        "SELECT activating_client_id FROM sandboxes WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(record.as_deref(), Some("adopter"));
+    Ok(())
+}
+
+/// A pool pod that can't be labeled isn't adopted: nothing commits or
+/// prepares, and the create falls back to a cold build.
+#[tokio::test(flavor = "current_thread")]
+async fn postgres_pooled_adoption_falls_back_cold_when_the_pod_cant_be_labeled() -> TestResult {
+    let (db, sandbox_id, substrate, response) =
+        pooled_create_labeled(AdoptionLabelOutcome::Invalidated).await?;
+
+    assert!(response?.is_none(), "the create builds cold");
+    assert_eq!(substrate.prepare_calls(), 0);
+    let committed: bool =
+        sqlx::query_scalar(sql!("SELECT EXISTS(SELECT 1 FROM sandboxes WHERE id = $1)"))
+            .bind(sandbox_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert!(!committed, "the adoption didn't commit");
+    Ok(())
+}
+
+/// A pool pod whose label patch failed transiently isn't adopted, and the
+/// create doesn't build cold either, which would add apiserver writes while
+/// it struggles: it fails retryably, with the slot given back to the pool.
+#[tokio::test(flavor = "current_thread")]
+async fn postgres_pooled_adoption_transient_label_failure_fails_retryably_without_cold_fallback()
+-> TestResult {
+    let (db, sandbox_id, substrate, response) =
+        pooled_create_labeled(AdoptionLabelOutcome::Transient).await?;
+
+    let error = match response {
+        Ok(response) => {
+            panic!("a transiently failed adoption must not resolve the create: {response:?}")
+        }
+        Err(error) => error,
+    };
+    assert_eq!(error.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    assert!(error.retry_after_header().is_some());
+    assert_eq!(
+        substrate
+            .label_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, on_transient, _)| *on_transient)
+            .collect::<Vec<_>>(),
+        vec![AdoptionLabelTransient::ReleaseSlot]
+    );
+    assert_eq!(substrate.prepare_calls(), 0);
+    let committed: bool =
+        sqlx::query_scalar(sql!("SELECT EXISTS(SELECT 1 FROM sandboxes WHERE id = $1)"))
+            .bind(sandbox_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert!(!committed, "the adoption didn't commit");
     Ok(())
 }
