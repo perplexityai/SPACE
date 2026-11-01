@@ -8588,3 +8588,1190 @@ fn layers_domain_base_comparison_and_write_baseline() {
         "{text}"
     );
 }
+
+/// `[rules.layers.state]` and `[rules.layers.unowned]`: `db/common` applied
+/// to `svc`, every check required except `pending`, which is advisory.
+const STATE: &str = "[rules.layers.state.shared_catalogs]\ncommon = [\"svc\"]\n\
+                     [rules.layers.state.declarations]\nmode = \"required\"\n\
+                     [rules.layers.state.owners]\nmode = \"required\"\n\
+                     [rules.layers.state.writes]\nmode = \"required\"\n\
+                     [rules.layers.state.pending]\nmode = \"advisory\"\n\
+                     [rules.layers.unowned.no_crossing]\nmode = \"required\"\n\
+                     [rules.layers.unowned.no_new_entries]\nmode = \"required\"\n\
+                     [rules.layers.unowned.stale_entries]\nmode = \"required\"\n";
+
+/// The catalogs of a workspace with the state checks: `postgres` leaves `a`
+/// and `b`, and `svc` `items` and, from `common`, `jobs`. Down files and
+/// `history/` are not read.
+const CATALOGS: [(&str, &str); 6] = [
+    (
+        "db/postgres/1_baseline.up.sql",
+        "CREATE TABLE public.a (id int);\nCREATE TABLE b ();\nCREATE TABLE gone ();\n",
+    ),
+    ("db/postgres/1_baseline.down.sql", "CREATE TABLE down ();\n"),
+    ("db/postgres/2_drop.up.sql", "DROP TABLE gone;\n"),
+    ("db/postgres/history/0_old.up.sql", "CREATE TABLE old ();\n"),
+    ("db/svc/1_baseline.up.sql", "\nCREATE TABLE items ();\n"),
+    ("db/common/1_baseline.up.sql", "CREATE TABLE \"jobs\" ();\n"),
+];
+
+/// The manifests of the two stores of [`LAYERED`].
+const S_STORE: &str = "crates/l30_storage/s/store/Cargo.toml";
+const T_STORE: &str = "crates/l30_storage/t/store/Cargo.toml";
+
+/// A baseline with an empty `[file_size]`, these `(namespace, table)`
+/// entries in `[layers.unowned]`, each table on its own line from line 6,
+/// the other layers tables empty, and an empty `[crate_names]`.
+fn state_baseline(unowned: &[(&str, &str)]) -> String {
+    let mut namespaces: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (namespace, table) in unowned {
+        namespaces.entry(namespace).or_default().push(table);
+    }
+    let mut text =
+        "[file_size]\n[layers.dev_direction]\n[layers.direction]\n[layers.unowned]\n".to_owned();
+    for (namespace, tables) in namespaces {
+        text.push_str(&format!("{namespace:?} = [\n"));
+        for table in tables {
+            text.push_str(&format!("  {table:?},\n"));
+        }
+        text.push_str("]\n");
+    }
+    text.push_str(
+        "[layers.codec_features]\n[layers.domain_dependencies]\n\
+         [layers.model_protocol]\n[layers.storage_access]\n[crate_names]\n",
+    );
+    text
+}
+
+/// `name`'s manifest with `state` as its `[package.metadata.space.state]`,
+/// whose first entry is on line 6.
+fn stated_manifest(name: &str, state: &str) -> String {
+    format!("{}[package.metadata.space.state]\n{state}", package(name))
+}
+
+/// A workspace of [`LAYERED`]'s members with the state checks and
+/// [`CATALOGS`]: `pplx-space-s-store` owns `postgres.a` and
+/// `pplx-space-t-store` `sqlite.svc.items`, the other two live tables are in
+/// `[layers.unowned]`, and `files` are written over that.
+fn stated(files: Vec<(&str, String)>) -> TempDir {
+    let mut all = vec![
+        ("ARCHITECTURE.toml", layers_config(STATE, "required")),
+        (
+            "architecture-baseline.toml",
+            state_baseline(&[("postgres", "b"), ("sqlite.svc", "jobs")]),
+        ),
+        (
+            S_STORE,
+            stated_manifest("pplx-space-s-store", "postgres = [\"a\"]\n"),
+        ),
+        (
+            T_STORE,
+            stated_manifest("pplx-space-t-store", "sqlite.svc = [\"items\"]\n"),
+        ),
+    ];
+    all.extend(
+        CATALOGS
+            .iter()
+            .map(|(path, text)| (*path, (*text).to_owned())),
+    );
+    all.extend(files);
+    Layered {
+        files: all,
+        ..Layered::default()
+    }
+    .build()
+}
+
+/// `(code, message, location)` of each state finding, in reporting order.
+fn state_findings(ctx: &Context) -> Vec<(String, String, String)> {
+    layer_findings(ctx)
+        .into_iter()
+        .filter(|(code, _, _)| {
+            code.starts_with("layers.state.") || code.starts_with("layers.unowned.")
+        })
+        .collect()
+}
+
+/// Name, files written over [`stated`]'s, and `(code, start of message,
+/// location)` of each state finding.
+type StateCase<'a> = (
+    &'a str,
+    Vec<(&'a str, String)>,
+    Vec<(&'a str, &'a str, &'a str)>,
+);
+
+/// Every store declares its databases and only stores declare state; each
+/// live table has one owner or a baseline entry; a declared table no
+/// migration creates yet is advisory.
+#[test]
+fn layers_state_declarations_and_owners() {
+    const API: &str = "crates/l40_api/a/server/Cargo.toml";
+    let declarations = "layers.state.declarations";
+    let cases: Vec<StateCase> = vec![
+        ("declared and baselined", vec![], vec![]),
+        (
+            "a live table neither declared nor listed",
+            vec![(
+                "architecture-baseline.toml",
+                state_baseline(&[("postgres", "b")]),
+            )],
+            vec![(
+                "layers.unowned.no_crossing",
+                "sqlite.svc.jobs: is created by db/common/1_baseline.up.sql, but no store \
+                 declares it in [package.metadata.space.state], and [layers.unowned] in \
+                 architecture-baseline.toml doesn't list it. Declare it in the l30_storage crate \
+                 that owns it, as `sqlite.svc = [\"jobs\"]` in that store's state table.",
+                "db/common/1_baseline.up.sql:1",
+            )],
+        ),
+        (
+            "a store without a state table",
+            vec![(S_STORE, package("pplx-space-s-store"))],
+            vec![
+                (
+                    declarations,
+                    "crates/l30_storage/s/store/Cargo.toml: pplx-space-s-store is a store \
+                     (l30_storage), but its Cargo.toml has no [package.metadata.space.state].",
+                    "crates/l30_storage/s/store/Cargo.toml:2",
+                ),
+                (
+                    "layers.unowned.no_crossing",
+                    "postgres.a: is created by db/postgres/1_baseline.up.sql",
+                    "db/postgres/1_baseline.up.sql:1",
+                ),
+            ],
+        ),
+        (
+            "an empty state table, for a store without a database",
+            vec![(S_STORE, stated_manifest("pplx-space-s-store", "# S3\n"))],
+            vec![(
+                "layers.unowned.no_crossing",
+                "postgres.a: is created by",
+                "db/postgres/1_baseline.up.sql:1",
+            )],
+        ),
+        (
+            "a crate outside Storage with a state table",
+            vec![(API, stated_manifest("pplx-space-a", "postgres = []\n"))],
+            vec![(
+                declarations,
+                "crates/l40_api/a/server/Cargo.toml: pplx-space-a (l40_api) has a \
+                 [package.metadata.space.state], but only l30_storage crates own tables.",
+                "crates/l40_api/a/server/Cargo.toml:5",
+            )],
+        ),
+        (
+            "namespaces that are no database",
+            vec![(
+                T_STORE,
+                stated_manifest(
+                    "pplx-space-t-store",
+                    "sqlite.svc = [\"items\"]\nsqlite.common = []\nsqlite.nope = []\n",
+                ),
+            )],
+            vec![
+                (
+                    declarations,
+                    "crates/l30_storage/t/store/Cargo.toml: pplx-space-t-store declares \
+                     `sqlite.common`, which is no database. The namespaces are postgres, \
+                     sqlite.svc:",
+                    "crates/l30_storage/t/store/Cargo.toml:7",
+                ),
+                (
+                    declarations,
+                    "crates/l30_storage/t/store/Cargo.toml: pplx-space-t-store declares \
+                     `sqlite.nope`, which is no database.",
+                    "crates/l30_storage/t/store/Cargo.toml:8",
+                ),
+            ],
+        ),
+        (
+            "two owners",
+            vec![(
+                T_STORE,
+                stated_manifest(
+                    "pplx-space-t-store",
+                    "sqlite.svc = [\"items\"]\npostgres = [\n  \"a\",\n]\n",
+                ),
+            )],
+            vec![
+                (
+                    "layers.state.owners",
+                    "crates/l30_storage/s/store/Cargo.toml: pplx-space-s-store declares \
+                     postgres.a, which pplx-space-t-store also declares, but a table has one \
+                     owner.",
+                    "crates/l30_storage/s/store/Cargo.toml:6",
+                ),
+                (
+                    "layers.state.owners",
+                    "crates/l30_storage/t/store/Cargo.toml: pplx-space-t-store declares \
+                     postgres.a, which pplx-space-s-store also declares",
+                    "crates/l30_storage/t/store/Cargo.toml:8",
+                ),
+            ],
+        ),
+        (
+            "declared names keyed as live ones: public. dropped, other schemas kept",
+            vec![
+                (
+                    "db/postgres/3_audit.up.sql",
+                    "CREATE TABLE audit.events ();\n".to_owned(),
+                ),
+                (
+                    S_STORE,
+                    stated_manifest(
+                        "pplx-space-s-store",
+                        "postgres = [\"public.a\", \"audit.events\"]\n",
+                    ),
+                ),
+            ],
+            vec![],
+        ),
+        (
+            "declared names as each database stores them: Postgres keeps case, and its \
+             default schema is public, not main",
+            vec![
+                (
+                    S_STORE,
+                    stated_manifest("pplx-space-s-store", "postgres = [\"A\", \"main.b\"]\n"),
+                ),
+                (
+                    T_STORE,
+                    stated_manifest("pplx-space-t-store", "sqlite.svc = [\"Main.ITEMS\"]\n"),
+                ),
+            ],
+            vec![
+                (
+                    "layers.state.pending",
+                    "postgres.A: pplx-space-s-store declares it",
+                    "crates/l30_storage/s/store/Cargo.toml:6",
+                ),
+                (
+                    "layers.state.pending",
+                    "postgres.main.b: pplx-space-s-store declares it",
+                    "crates/l30_storage/s/store/Cargo.toml:6",
+                ),
+                (
+                    "layers.unowned.no_crossing",
+                    "postgres.a: is created by db/postgres/1_baseline.up.sql",
+                    "db/postgres/1_baseline.up.sql:1",
+                ),
+            ],
+        ),
+        (
+            "a declared table no migration creates yet",
+            vec![(
+                S_STORE,
+                stated_manifest(
+                    "pplx-space-s-store",
+                    "postgres = [\"a\", \"later\"]\nsqlite.nope = [\"x\"]\n",
+                ),
+            )],
+            vec![
+                (
+                    declarations,
+                    "crates/l30_storage/s/store/Cargo.toml: pplx-space-s-store declares \
+                     `sqlite.nope`",
+                    "crates/l30_storage/s/store/Cargo.toml:7",
+                ),
+                (
+                    "layers.state.pending",
+                    "postgres.later: pplx-space-s-store declares it in \
+                     [package.metadata.space.state], but no migration in db/postgres creates it \
+                     yet. A new table lands that way: the declaration first, then the migration \
+                     in a pull request of its own.",
+                    "crates/l30_storage/s/store/Cargo.toml:6",
+                ),
+            ],
+        ),
+    ];
+    for (name, files, expected) in cases {
+        let ws = stated(files);
+        let ctx = load(ws.path(), None);
+        let found = state_findings(&ctx);
+        assert_layer_findings(name, &found, &expected);
+        let pending = check(&ctx)
+            .into_iter()
+            .filter(|finding| finding.behaviour == "pending")
+            .all(|finding| !finding.mode.is_required());
+        assert!(pending, "{name}: pending is advisory");
+    }
+}
+
+/// `[rules.layers.state.co_writers]` with `grants`, as TOML, after
+/// [`STATE`].
+fn granted(grants: &str) -> (&'static str, String) {
+    (
+        "ARCHITECTURE.toml",
+        layers_config(&format!("{STATE}{grants}"), "required"),
+    )
+}
+
+/// Among the stores, only a table's owner and its co-writers have a write
+/// head naming it, in a Rust string literal or a `.sql` file under `src/`:
+/// a store is checked against every database, so one that doesn't declare
+/// a table's database is too. Test files and crates outside Storage are not
+/// read.
+#[test]
+fn layers_state_writes() {
+    const LIB: &str = "crates/l30_storage/t/store/src/lib.rs";
+    let writes = "fn f() {\n    q(\"UPDATE a SET x = 1\");\n    q(r#\"\n        delete from \
+                  b\"#);\n    q(\"UPDATE items SET y = 2\");\n}\n";
+    let t_store = |state: &str| (T_STORE, stated_manifest("pplx-space-t-store", state));
+    let in_both = "sqlite.svc = [\"items\"]\npostgres = []\n";
+    let finding = "crates/l30_storage/t/store/src/lib.rs: pplx-space-t-store writes postgres.a \
+                   here (UPDATE a), but pplx-space-s-store owns that table, and \
+                   pplx-space-t-store is neither its owner nor a co-writer. Move the statement \
+                   into pplx-space-s-store and call it from there; or, for an approved \
+                   co-writer, add \"pplx-space-t-store\" to a in \
+                   [rules.layers.state.co_writers.postgres] in ARCHITECTURE.toml, a policy \
+                   change that layers.policy_changed reports for review.";
+    let undeclared = "crates/l30_storage/t/store/src/lib.rs: pplx-space-t-store writes \
+                      postgres.a here (UPDATE a), a table pplx-space-s-store owns in a database \
+                      pplx-space-t-store doesn't declare, and pplx-space-t-store is not its \
+                      co-writer. Move the statement into pplx-space-s-store";
+    let cases: Vec<StateCase> = vec![
+        (
+            "a write to another store's table",
+            vec![
+                t_store(in_both),
+                (LIB, writes.to_owned()),
+                (
+                    "crates/l30_storage/t/store/src/claim.sql",
+                    "-- UPDATE a\nINSERT INTO public.a VALUES (1);\n".to_owned(),
+                ),
+                (
+                    "crates/l30_storage/t/store/src/tests.rs",
+                    "q(\"UPDATE a\");\n".to_owned(),
+                ),
+                (
+                    "crates/l30_storage/t/store/src/tests/x.sql",
+                    "UPDATE a;\n".to_owned(),
+                ),
+            ],
+            vec![
+                (
+                    "layers.state.writes",
+                    finding,
+                    "crates/l30_storage/t/store/src/lib.rs:2",
+                ),
+                (
+                    "layers.state.writes",
+                    "crates/l30_storage/t/store/src/claim.sql: pplx-space-t-store writes \
+                     postgres.a here (INSERT INTO a)",
+                    "crates/l30_storage/t/store/src/claim.sql:2",
+                ),
+            ],
+        ),
+        (
+            "a co-writer",
+            vec![
+                granted("[rules.layers.state.co_writers.postgres]\na = [\"pplx-space-t-store\"]\n"),
+                t_store(in_both),
+                (LIB, writes.to_owned()),
+            ],
+            vec![],
+        ),
+        (
+            "a store that does not declare the database",
+            vec![
+                t_store("sqlite.svc = [\"items\"]\n"),
+                (LIB, writes.to_owned()),
+            ],
+            vec![(
+                "layers.state.writes",
+                undeclared,
+                "crates/l30_storage/t/store/src/lib.rs:2",
+            )],
+        ),
+        (
+            "a store without a database",
+            vec![
+                (
+                    S_STORE,
+                    stated_manifest(
+                        "pplx-space-s-store",
+                        "postgres = [\"a\"]\nsqlite.svc = [\"items\"]\n",
+                    ),
+                ),
+                t_store("# S3\n"),
+                (LIB, writes.to_owned()),
+            ],
+            vec![
+                (
+                    "layers.state.writes",
+                    undeclared,
+                    "crates/l30_storage/t/store/src/lib.rs:2",
+                ),
+                (
+                    "layers.state.writes",
+                    "crates/l30_storage/t/store/src/lib.rs: pplx-space-t-store writes \
+                     sqlite.svc.items here (UPDATE items), a table pplx-space-s-store owns in a \
+                     database pplx-space-t-store doesn't declare",
+                    "crates/l30_storage/t/store/src/lib.rs:5",
+                ),
+            ],
+        ),
+        (
+            "a granted store that does not declare the database",
+            vec![
+                granted("[rules.layers.state.co_writers.postgres]\na = [\"pplx-space-t-store\"]\n"),
+                t_store("sqlite.svc = [\"items\"]\n"),
+                (LIB, writes.to_owned()),
+            ],
+            vec![],
+        ),
+        (
+            "a crate outside Storage",
+            vec![("crates/l40_api/a/server/src/lib.rs", writes.to_owned())],
+            vec![],
+        ),
+        (
+            "a name in two of the store's databases, one of them its own",
+            vec![
+                (
+                    "db/postgres/3_items.up.sql",
+                    "CREATE TABLE items ();\n".to_owned(),
+                ),
+                (
+                    S_STORE,
+                    stated_manifest("pplx-space-s-store", "postgres = [\"a\", \"items\"]\n"),
+                ),
+                t_store(in_both),
+                (LIB, "q(\"UPDATE items SET y = 2\");\n".to_owned()),
+            ],
+            vec![],
+        ),
+        (
+            "a name in two of the store's databases, owned in one and unowned in the other",
+            vec![
+                (
+                    "db/postgres/3_jobs.up.sql",
+                    "CREATE TABLE jobs ();\n".to_owned(),
+                ),
+                (
+                    "architecture-baseline.toml",
+                    state_baseline(&[("postgres", "b"), ("postgres", "jobs")]),
+                ),
+                t_store("sqlite.svc = [\"items\", \"jobs\"]\n"),
+                (
+                    S_STORE,
+                    stated_manifest(
+                        "pplx-space-s-store",
+                        "postgres = [\"a\"]\nsqlite.svc = []\n",
+                    ),
+                ),
+                (
+                    "crates/l30_storage/s/store/src/lib.rs",
+                    "q(\"DELETE FROM jobs\");\nq(\"DELETE FROM items\");\n".to_owned(),
+                ),
+            ],
+            vec![(
+                "layers.state.writes",
+                "crates/l30_storage/s/store/src/lib.rs: pplx-space-s-store writes \
+                 sqlite.svc.items here (DELETE FROM items), but pplx-space-t-store owns that \
+                 table",
+                "crates/l30_storage/s/store/src/lib.rs:2",
+            )],
+        ),
+        (
+            "names keyed as each database reads them",
+            vec![
+                t_store(in_both),
+                (
+                    S_STORE,
+                    stated_manifest(
+                        "pplx-space-s-store",
+                        "postgres = [\"a\"]\nsqlite.svc = []\n",
+                    ),
+                ),
+                (
+                    "crates/l30_storage/s/store/src/lib.rs",
+                    "q(\"UPDATE \\\"ITEMS\\\" SET y = 2\");\n".to_owned(),
+                ),
+                (
+                    LIB,
+                    r#"q("UPDATE \"A\" SET x = 1");
+q("UPDATE A SET x = 1");
+q("UPDATE space.public.a SET x = 1");
+q("UPDATE main.a SET x = 1");
+"#
+                    .to_owned(),
+                ),
+            ],
+            vec![
+                (
+                    "layers.state.writes",
+                    "crates/l30_storage/s/store/src/lib.rs: pplx-space-s-store writes \
+                     sqlite.svc.items here (UPDATE items), but pplx-space-t-store owns that \
+                     table",
+                    "crates/l30_storage/s/store/src/lib.rs:1",
+                ),
+                (
+                    "layers.state.writes",
+                    finding,
+                    "crates/l30_storage/t/store/src/lib.rs:2",
+                ),
+                (
+                    "layers.state.writes",
+                    finding,
+                    "crates/l30_storage/t/store/src/lib.rs:3",
+                ),
+            ],
+        ),
+        (
+            "a quoted name with a dot, declared and written",
+            vec![
+                (
+                    "db/postgres/3_audit.up.sql",
+                    "CREATE TABLE audit.\"events.v1\" ();\n".to_owned(),
+                ),
+                (
+                    S_STORE,
+                    stated_manifest(
+                        "pplx-space-s-store",
+                        "postgres = [\"a\", 'audit.\"events.v1\"']\n",
+                    ),
+                ),
+                t_store(in_both),
+                (
+                    LIB,
+                    "q(\"INSERT INTO audit.\\\"events.v1\\\" VALUES (1)\");\n".to_owned(),
+                ),
+            ],
+            vec![(
+                "layers.state.writes",
+                "crates/l30_storage/t/store/src/lib.rs: pplx-space-t-store writes \
+                 postgres.audit.events.v1 here (INSERT INTO audit.events.v1), but \
+                 pplx-space-s-store owns that table",
+                "crates/l30_storage/t/store/src/lib.rs:1",
+            )],
+        ),
+        (
+            "a quoted name with a dot, granted",
+            vec![
+                granted(
+                    "[rules.layers.state.co_writers.postgres]\n\
+                     'audit.\"events.v1\"' = [\"pplx-space-t-store\"]\n",
+                ),
+                (
+                    "db/postgres/3_audit.up.sql",
+                    "CREATE TABLE audit.\"events.v1\" ();\n".to_owned(),
+                ),
+                (
+                    S_STORE,
+                    stated_manifest(
+                        "pplx-space-s-store",
+                        "postgres = [\"a\", 'audit.\"events.v1\"']\n",
+                    ),
+                ),
+                t_store(in_both),
+                (
+                    LIB,
+                    "q(\"INSERT INTO audit.\\\"events.v1\\\" VALUES (1)\");\n".to_owned(),
+                ),
+            ],
+            vec![],
+        ),
+        (
+            "schema-qualified writes, and strings that are values",
+            vec![
+                (
+                    "db/postgres/3_audit.up.sql",
+                    "CREATE TABLE audit.events ();\n".to_owned(),
+                ),
+                (
+                    S_STORE,
+                    stated_manifest(
+                        "pplx-space-s-store",
+                        "postgres = [\"a\", \"audit.events\"]\n",
+                    ),
+                ),
+                t_store(in_both),
+                (
+                    LIB,
+                    "q(\"INSERT INTO audit.events VALUES (1)\");\n\
+                     q(\"INSERT INTO items (note) VALUES ('UPDATE a SET x = 1')\");\n\
+                     q(\"UPDATE events SET x = 1\");\n"
+                        .to_owned(),
+                ),
+            ],
+            vec![(
+                "layers.state.writes",
+                "crates/l30_storage/t/store/src/lib.rs: pplx-space-t-store writes \
+                 postgres.audit.events here (INSERT INTO audit.events), but \
+                 pplx-space-s-store owns that table",
+                "crates/l30_storage/t/store/src/lib.rs:1",
+            )],
+        ),
+    ];
+    for (name, files, expected) in cases {
+        let ws = stated(files);
+        let found = state_findings(&load(ws.path(), None));
+        assert_layer_findings(name, &found, &expected);
+    }
+}
+
+/// A `[rules.layers.state.co_writers]` grant that allows nothing is a
+/// `layers.stale_entries` finding on its line.
+#[test]
+fn layers_state_co_writer_grants() {
+    let grants = "[rules.layers.state.co_writers.postgres]\n\
+                  a = [\"pplx-space-t-store\", \"pplx-space-a\", \"pplx-space-nope\"]\n\
+                  \"public.b\" = [\"pplx-space-t-store\"]\n\
+                  [rules.layers.state.co_writers.sqlite.svc]\nitems = [\"pplx-space-t-store\"]\n\
+                  [rules.layers.state.co_writers.sqlite.nope]\nx = [\"pplx-space-t-store\"]\n";
+    let ws = stated(vec![granted(grants)]);
+    let architecture = fs::read_to_string(ws.path().join("ARCHITECTURE.toml")).unwrap();
+    let at = |needle: &str| format!("ARCHITECTURE.toml:{}", line_with(&architecture, needle));
+    let found: Vec<(String, String, String)> = layer_findings(&load(ws.path(), None))
+        .into_iter()
+        .filter(|(code, _, _)| code == "layers.stale_entries" || code.starts_with("layers.state."))
+        .collect();
+    let a = at("a = [\"pplx-space-t-store\"");
+    let expected = [
+        (
+            "postgres.a: lists pplx-space-a in [rules.layers.state.co_writers.postgres] in \
+             ARCHITECTURE.toml, but it is not a store: its layer is l40_api, not l30_storage, so \
+             the grant allows nothing. Remove it from the list.",
+            a.clone(),
+        ),
+        (
+            "postgres.a: lists pplx-space-nope in [rules.layers.state.co_writers.postgres] in \
+             ARCHITECTURE.toml, but no workspace member has this name",
+            a.clone(),
+        ),
+        (
+            "postgres.a: lists pplx-space-t-store in [rules.layers.state.co_writers.postgres] in \
+             ARCHITECTURE.toml, but no write statement in its production code names a, so it \
+             needs no grant",
+            a,
+        ),
+        (
+            "postgres.b: lists pplx-space-t-store in [rules.layers.state.co_writers.postgres] in \
+             ARCHITECTURE.toml, but no store owns postgres.b",
+            at("\"public.b\""),
+        ),
+        (
+            "sqlite.nope.x: lists pplx-space-t-store in \
+             [rules.layers.state.co_writers.sqlite.nope] in ARCHITECTURE.toml, but sqlite.nope \
+             is no database; the namespaces are postgres, sqlite.svc",
+            at("x = [\"pplx-space-t-store\"]"),
+        ),
+        (
+            "sqlite.svc.items: lists pplx-space-t-store in \
+             [rules.layers.state.co_writers.sqlite.svc] in ARCHITECTURE.toml, but \
+             pplx-space-t-store owns that table",
+            at("items = [\"pplx-space-t-store\"]"),
+        ),
+    ];
+    let expected: Vec<(&str, &str, &str)> = expected
+        .iter()
+        .map(|(message, at)| ("layers.stale_entries", *message, at.as_str()))
+        .collect();
+    assert_layer_findings("stale grants", &found, &expected);
+}
+
+/// `[layers.unowned]`'s entries are compared with the base branch's copy,
+/// which seeds the table while the base has no state checks, and are stale
+/// once their table is declared, dropped or in no database.
+#[test]
+fn layers_unowned_baseline() {
+    const ENTRIES: [(&str, &str); 2] = [("postgres", "b"), ("sqlite.svc", "jobs")];
+    let with_state = layers_config(STATE, "required");
+    let without_state = layers_config("", "required");
+    let listed = state_baseline(&ENTRIES);
+    let empty = state_baseline(&[]);
+    let edges_only = layers_baseline(&[], &[]);
+    let new = "postgres.b: is in [layers.unowned] in architecture-baseline.toml but not in the \
+               base branch's copy, and a table can't be added to it.";
+    let seeds = "postgres.b: is in [layers.unowned] in architecture-baseline.toml, and the base \
+                 branch has no state checks yet, so this pull request seeds the table.";
+    let at_b = "architecture-baseline.toml:6";
+    let at_jobs = "architecture-baseline.toml:9";
+    /// Name, base baseline, base architecture, and `(code, start of
+    /// message, location, required)` of each finding.
+    type Case<'a> = (
+        &'a str,
+        Option<&'a str>,
+        Option<&'a str>,
+        Vec<(&'a str, &'a str, &'a str, bool)>,
+    );
+    let jobs_new = "sqlite.svc.jobs: is in [layers.unowned]";
+    let cases: Vec<Case> = vec![
+        ("no base", None, None, vec![]),
+        (
+            "the base lists them",
+            Some(&listed),
+            Some(&with_state),
+            vec![],
+        ),
+        (
+            "the base's table lacks them",
+            Some(&empty),
+            None,
+            vec![
+                ("layers.unowned.no_new_entries", new, at_b, true),
+                ("layers.unowned.no_new_entries", jobs_new, at_jobs, true),
+            ],
+        ),
+        (
+            "a base with the state checks but without the table",
+            Some(&edges_only),
+            Some(&with_state),
+            vec![
+                ("layers.unowned.no_new_entries", new, at_b, true),
+                ("layers.unowned.no_new_entries", jobs_new, at_jobs, true),
+            ],
+        ),
+        (
+            "a base without the state checks seeds the table",
+            Some(&edges_only),
+            Some(&without_state),
+            vec![
+                ("layers.unowned.no_new_entries", seeds, at_b, false),
+                ("layers.unowned.no_new_entries", jobs_new, at_jobs, false),
+            ],
+        ),
+        (
+            "a base baseline without the table, and no base architecture",
+            Some(&edges_only),
+            None,
+            vec![
+                ("layers.unowned.no_new_entries", seeds, at_b, false),
+                ("layers.unowned.no_new_entries", jobs_new, at_jobs, false),
+            ],
+        ),
+        (
+            "a base without any layers table",
+            Some("[file_size]\n"),
+            None,
+            vec![
+                ("layers.unowned.no_new_entries", seeds, at_b, false),
+                ("layers.unowned.no_new_entries", jobs_new, at_jobs, false),
+            ],
+        ),
+    ];
+    for (name, base, architecture, expected) in cases {
+        let ws = stated(vec![]);
+        let ctx = load_with(ws.path(), base, architecture);
+        let found: Vec<_> = check(&ctx)
+            .into_iter()
+            .filter(|finding| finding.instance.as_deref() == Some("unowned"))
+            .collect();
+        assert_eq!(found.len(), expected.len(), "{name}: {found:#?}");
+        for (finding, (code, message, at, required)) in found.iter().zip(&expected) {
+            assert_eq!(finding.code(), *code, "{name}");
+            assert!(
+                finding.message().starts_with(message),
+                "{name}: {}",
+                finding.message()
+            );
+            let location = format!("{}:{}", finding.location.path, finding.location.line);
+            assert_eq!(location, *at, "{name}");
+            assert_eq!(finding.mode.is_required(), *required, "{name}");
+        }
+        let skips = skipped(&ctx);
+        assert_eq!(
+            skips
+                .iter()
+                .any(|line| line.contains("layers.unowned.no_new_entries")),
+            base.is_none(),
+            "{name}: {skips:?}"
+        );
+    }
+
+    let stale = |table: &str, reason: &str| {
+        format!(
+            "{table}: is in [layers.unowned] in architecture-baseline.toml, but {reason}. Remove \
+             the entry (cargo arch --write-baseline=layers.unowned)."
+        )
+    };
+    let ws = stated(vec![(
+        "architecture-baseline.toml",
+        state_baseline(&[
+            ("postgres", "a"),
+            ("postgres", "b"),
+            ("postgres", "gone"),
+            ("sqlite.nope", "x"),
+            ("sqlite.svc", "jobs"),
+        ]),
+    )]);
+    let found = state_findings(&load(ws.path(), None));
+    let expected = [
+        stale("postgres.a", "pplx-space-s-store declares it now"),
+        stale(
+            "postgres.gone",
+            "no migration in db/postgres leaves a table gone",
+        ),
+        stale(
+            "sqlite.nope.x",
+            "sqlite.nope is no database; the namespaces are postgres, sqlite.svc",
+        ),
+    ];
+    let lines = ["6", "8", "11"].map(|line| format!("architecture-baseline.toml:{line}"));
+    let expected: Vec<(&str, &str, &str)> = expected
+        .iter()
+        .zip(&lines)
+        .map(|(message, at)| {
+            (
+                "layers.unowned.stale_entries",
+                message.as_str(),
+                at.as_str(),
+            )
+        })
+        .collect();
+    assert_layer_findings("stale entries", &found, &expected);
+}
+
+/// `--write-baseline=layers.unowned` keeps each entry whose table is still
+/// live without an owner, removes the others, and lists each such table
+/// without an entry as `not added`.
+#[test]
+fn layers_unowned_write_baseline() {
+    let ws = stated(vec![(
+        "architecture-baseline.toml",
+        state_baseline(&[("postgres", "b"), ("postgres", "gone")]),
+    )]);
+    let written = run(ws.path(), &["--write-baseline=layers.unowned"]);
+    assert_eq!(written.code, 0, "{}", written.stderr);
+    assert!(
+        written.stdout.contains(
+            "not added: sqlite.svc.jobs (created by db/common/1_baseline.up.sql) in \
+             [layers.unowned], which only shrinks (layers.unowned.no_new_entries); declare it in \
+             the store that owns it, before its migration lands (layers.state.pending), as cargo \
+             arch says"
+        ),
+        "{}",
+        written.stdout
+    );
+    let text = fs::read_to_string(ws.path().join("architecture-baseline.toml")).unwrap();
+    assert_eq!(
+        generated_table(&text, "layers.unowned"),
+        "[layers.unowned]\npostgres = [\n  \"b\",\n]\n"
+    );
+    assert!(text.contains("[layers.direction]"), "{text}");
+    // The generated form is written back byte-identical.
+    let again = run(ws.path(), &["--write-baseline"]);
+    assert_eq!(again.code, 0, "{}", again.stderr);
+    let rewritten = fs::read_to_string(ws.path().join("architecture-baseline.toml")).unwrap();
+    assert_eq!(rewritten, text);
+
+    // Without the state checks, the unscoped write has no such table.
+    let ws = Layered::default().build();
+    assert_eq!(run(ws.path(), &["--write-baseline"]).code, 0);
+    let text = fs::read_to_string(ws.path().join("architecture-baseline.toml")).unwrap();
+    assert!(
+        !text.lines().any(|line| line == "[layers.unowned]"),
+        "{text}"
+    );
+}
+
+/// The state checks' configuration and declarations, read strictly, exit 2.
+#[test]
+fn layers_state_configuration_errors() {
+    let state = |text: &str| layers_config(&STATE.replace("common = [\"svc\"]", text), "required");
+    let cases: Vec<(&str, &str, String, &str)> = vec![
+        (
+            "state without unowned",
+            "ARCHITECTURE.toml",
+            layers_config(
+                STATE.split("[rules.layers.unowned").next().unwrap(),
+                "required",
+            ),
+            "[rules.layers.state] and [rules.layers.unowned] in ARCHITECTURE.toml go together",
+        ),
+        (
+            "unowned without state",
+            "ARCHITECTURE.toml",
+            layers_config(
+                &format!(
+                    "[rules.layers.unowned{}",
+                    STATE.split_once("[rules.layers.unowned").unwrap().1
+                ),
+                "required",
+            ),
+            "[rules.layers.state] and [rules.layers.unowned] in ARCHITECTURE.toml go together",
+        ),
+        (
+            "an unknown shared catalog",
+            "ARCHITECTURE.toml",
+            state("commons = [\"svc\"]"),
+            "[rules.layers.state.shared_catalogs] commons in ARCHITECTURE.toml names \
+             \"commons\", which is not a directory under db/",
+        ),
+        (
+            "an unknown database",
+            "ARCHITECTURE.toml",
+            state("common = [\"svc\", \"nope\"]"),
+            "names \"nope\", which is not a directory under db/",
+        ),
+        (
+            "a shared catalog as a database",
+            "ARCHITECTURE.toml",
+            state("common = [\"svc\"]\npostgres = [\"common\"]"),
+            "[rules.layers.state.shared_catalogs] postgres in ARCHITECTURE.toml lists \"common\", \
+             which is a shared catalog, not a database",
+        ),
+        (
+            "a database listed twice",
+            "ARCHITECTURE.toml",
+            state("common = [\"svc\", \"svc\"]"),
+            "\"svc\" is listed twice",
+        ),
+        (
+            "an unowned table without the state checks",
+            "ARCHITECTURE.toml",
+            layers_config("", "required"),
+            "[layers.unowned] is not a table of the layers rule",
+        ),
+        (
+            "a misspelled namespace",
+            S_STORE,
+            stated_manifest("pplx-space-s-store", "postgress = [\"a\"]\n"),
+            "unknown field `postgress`",
+        ),
+        (
+            "tables that are not a list",
+            T_STORE,
+            stated_manifest("pplx-space-t-store", "sqlite.svc = \"items\"\n"),
+            "invalid type: string \"items\", expected a sequence",
+        ),
+        (
+            "a co-writer granted in a manifest",
+            T_STORE,
+            stated_manifest(
+                "pplx-space-t-store",
+                "sqlite.svc = [\"items\"]\nco_writer.postgres = [\"a\"]\n",
+            ),
+            "unknown field `co_writer`, expected `postgres` or `sqlite`",
+        ),
+        (
+            "a grant in a misspelled namespace",
+            "ARCHITECTURE.toml",
+            layers_config(
+                &format!("{STATE}[rules.layers.state.co_writers.postgress]\na = [\"x\"]\n"),
+                "required",
+            ),
+            "unknown field `postgress`",
+        ),
+        (
+            "a store granted a table twice",
+            "ARCHITECTURE.toml",
+            layers_config(
+                &format!("{STATE}[rules.layers.state.co_writers.postgres]\na = [\"x\", \"x\"]\n"),
+                "required",
+            ),
+            "\"x\" is listed twice",
+        ),
+        (
+            "two grant keys that name one table",
+            "ARCHITECTURE.toml",
+            layers_config(
+                &format!(
+                    "{STATE}[rules.layers.state.co_writers.postgres]\n\
+                     a = [\"pplx-space-t-store\"]\n\"public.a\" = [\"pplx-space-x\"]\n"
+                ),
+                "required",
+            ),
+            "[rules.layers.state.co_writers.postgres] names the table a twice, as \"a\" and \
+             \"public.a\"; merge their stores into one key",
+        ),
+        (
+            "two SQLite grant keys that differ in case",
+            "ARCHITECTURE.toml",
+            layers_config(
+                &format!(
+                    "{STATE}[rules.layers.state.co_writers.sqlite.svc]\n\
+                     items = [\"pplx-space-s-store\"]\nITEMS = [\"pplx-space-x\"]\n"
+                ),
+                "required",
+            ),
+            "[rules.layers.state.co_writers.sqlite.svc] names the table items twice, as \
+             \"ITEMS\" and \"items\"",
+        ),
+        (
+            "two declarations that name one table",
+            S_STORE,
+            stated_manifest("pplx-space-s-store", "postgres = [\"a\", \"public.a\"]\n"),
+            "[package.metadata.space.state] postgres names the table a twice, as \"a\" and \
+             \"public.a\"; keep one",
+        ),
+        (
+            "two SQLite declarations that differ in case",
+            T_STORE,
+            stated_manifest(
+                "pplx-space-t-store",
+                "sqlite.svc = [\"items\", \"main.ITEMS\"]\n",
+            ),
+            "[package.metadata.space.state] sqlite.svc names the table items twice, as \
+             \"items\" and \"main.ITEMS\"",
+        ),
+        (
+            "a table declared twice",
+            S_STORE,
+            stated_manifest("pplx-space-s-store", "postgres = [\"a\", \"a\"]\n"),
+            "postgres names the table a twice, as \"a\" and \"a\"",
+        ),
+    ];
+    for (name, path, text, error) in cases {
+        let ws = stated(vec![(path, text)]);
+        let checked = run(ws.path(), &[]);
+        assert_eq!(checked.code, 2, "{name}: {}", checked.stdout);
+        assert!(checked.stderr.contains(error), "{name}: {}", checked.stderr);
+    }
+}
+
+/// Changes to the shared catalogs, including one added or removed without
+/// databases, the co-writer grants and the state checks' modes are policy
+/// changes; a required state finding fails the run.
+#[test]
+fn layers_state_policy_changed_and_exit_codes() {
+    let grants = |grants: &str| format!("[rules.layers.state.co_writers.postgres]\n{grants}");
+    let ws = stated(vec![
+        granted(&grants("a = [\"pplx-space-t-store\"]\n")),
+        (
+            "base-architecture.toml",
+            layers_config(
+                &format!(
+                    "{}{}",
+                    STATE
+                        .replace("common = [\"svc\"]", "common = [\"old\"]")
+                        .replace(
+                            "[rules.layers.state.pending]\nmode = \"advisory\"",
+                            "[rules.layers.state.pending]\nmode = \"required\"",
+                        ),
+                    grants("a = [\"pplx-space-old\"]\nb = [\"pplx-space-t-store\"]\n"),
+                ),
+                "required",
+            ),
+        ),
+    ]);
+    let architecture = fs::read_to_string(ws.path().join("ARCHITECTURE.toml")).unwrap();
+    let base = fs::read_to_string(ws.path().join("base-architecture.toml")).unwrap();
+    let ctx = load_with(ws.path(), None, Some(&base));
+    let changed: Vec<(String, usize)> = check(&ctx)
+        .into_iter()
+        .filter(|finding| finding.behaviour == "policy_changed")
+        .map(|finding| (finding.message(), finding.location.line))
+        .collect();
+    let catalogs = line_with(&architecture, "common = [\"svc\"]");
+    let pending = line_with(&architecture, "[rules.layers.state.pending]") + 1;
+    let granted = line_with(&architecture, "a = [\"pplx-space-t-store\"]");
+    let grants_header = line_with(&architecture, "[rules.layers.state.co_writers.postgres]");
+    assert_eq!(
+        changed,
+        [
+            (
+                "ARCHITECTURE.toml: `svc` was added to the databases of `common` in \
+                 [rules.layers] state.shared_catalogs."
+                    .to_owned(),
+                catalogs
+            ),
+            (
+                "ARCHITECTURE.toml: `old` was removed from the databases of `common` in \
+                 [rules.layers] state.shared_catalogs."
+                    .to_owned(),
+                catalogs
+            ),
+            (
+                "ARCHITECTURE.toml: `pplx-space-t-store` was added to the co-writers of \
+                 `postgres.a` in [rules.layers] state.co_writers."
+                    .to_owned(),
+                granted
+            ),
+            (
+                "ARCHITECTURE.toml: `pplx-space-old` was removed from the co-writers of \
+                 `postgres.a` in [rules.layers] state.co_writers."
+                    .to_owned(),
+                granted
+            ),
+            (
+                "ARCHITECTURE.toml: `pplx-space-t-store` was removed from the co-writers of \
+                 `postgres.b` in [rules.layers] state.co_writers."
+                    .to_owned(),
+                grants_header
+            ),
+            (
+                "ARCHITECTURE.toml: layers.state.pending mode changed from required to \
+                 advisory."
+                    .to_owned(),
+                pending
+            ),
+        ]
+    );
+    let without = layers_config("", "required");
+    let ctx = load_with(ws.path(), None, Some(&without));
+    let modes = check(&ctx)
+        .into_iter()
+        .filter(|finding| {
+            finding.behaviour == "policy_changed" && finding.message().contains("from unset to")
+        })
+        .count();
+    assert_eq!(modes, 7, "each state check's mode is new");
+
+    // A shared catalog with no database is still no database of its own.
+    let catalogs = |extra: &str| {
+        layers_config(
+            &STATE.replace(
+                "common = [\"svc\"]",
+                &format!("common = [\"svc\"]\n{extra}"),
+            ),
+            "required",
+        )
+    };
+    let ws = stated(vec![
+        ("db/scratch/1_baseline.up.sql", String::new()),
+        ("db/retired/1_baseline.up.sql", String::new()),
+        ("ARCHITECTURE.toml", catalogs("scratch = []")),
+    ]);
+    let architecture = fs::read_to_string(ws.path().join("ARCHITECTURE.toml")).unwrap();
+    let ctx = load_with(ws.path(), None, Some(&catalogs("retired = []")));
+    let changed: Vec<(String, usize)> = check(&ctx)
+        .into_iter()
+        .filter(|finding| finding.behaviour == "policy_changed")
+        .map(|finding| (finding.message(), finding.location.line))
+        .collect();
+    assert_eq!(
+        changed,
+        [
+            (
+                "ARCHITECTURE.toml: `retired` was removed from [rules.layers] \
+                 state.shared_catalogs, so db/retired is a database of its own."
+                    .to_owned(),
+                line_with(&architecture, "[rules.layers.state.shared_catalogs]")
+            ),
+            (
+                "ARCHITECTURE.toml: `scratch` was added to [rules.layers] state.shared_catalogs, \
+                 so db/scratch is no database of its own."
+                    .to_owned(),
+                line_with(&architecture, "scratch = []")
+            ),
+        ]
+    );
+
+    let failing = stated(vec![(S_STORE, package("pplx-space-s-store"))]);
+    let found = run(failing.path(), &["--format", "rdjson"]);
+    assert_eq!(found.code, 1, "{}", found.stderr);
+    let document: Value = serde_json::from_str(&found.stdout).unwrap();
+    let codes: Vec<&str> = document["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|d| d["code"]["value"].as_str())
+        .collect();
+    assert_eq!(
+        codes,
+        ["layers.state.declarations", "layers.unowned.no_crossing"]
+    );
+    assert!(
+        found.stderr.contains(
+            "archcheck: layers.direction.no_new_entries, layers.dev_direction.no_new_entries, \
+             layers.storage_access.no_new_entries, layers.codec_features.no_new_entries, \
+             layers.domain_dependencies.no_new_entries, layers.model_protocol.no_new_entries \
+             and layers.unowned.no_new_entries skipped (no --base-baseline given)"
+        ),
+        "{}",
+        found.stderr
+    );
+}

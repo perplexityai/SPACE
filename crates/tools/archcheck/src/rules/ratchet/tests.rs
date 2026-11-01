@@ -98,6 +98,8 @@ fn context(baseline: Baseline, files: &[(&str, &str)]) -> Context {
         base_architecture: BaseArchitecture::NotGiven,
         files,
         crates: Vec::new(),
+        catalogs: Vec::new(),
+        sql_files: Vec::new(),
     }
 }
 

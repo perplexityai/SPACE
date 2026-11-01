@@ -406,23 +406,26 @@ The checks, each with its own mode:
   a `[rules.layers.storage]` `helpers` entry that is gone, outside
   `l10_foundation`, also `legacy`, or a helper by its own driver dependency
   already; a `protocols` entry that is gone, outside `l20_domain` or a
-  protocol by its name already, and a `[rules.layers.domain_fences]` package
+  protocol by its name already; a `[rules.layers.domain_fences]` package
   that is a driver or a storage helper, which `storage_access` checks
-  instead, or a Foundation crate that its own dependencies fence already.
-  An entry naming a crate without a layer isn't stale: the crate's
-  `placement` finding covers it. Each is shown on its line in
-  `ARCHITECTURE.toml`.
+  instead, or a Foundation crate that its own dependencies fence already;
+  and, with the state checks, a `[rules.layers.state.co_writers]` grant
+  that allows nothing (see [State ownership](#state-ownership)). An entry
+  naming a crate without a layer isn't stale: the crate's `placement`
+  finding covers it. Each is shown on its line in `ARCHITECTURE.toml`.
 - `policy_changed`: every difference in `[rules.layers]` from the base
   branch's `ARCHITECTURE.toml`, given with `--base-architecture`: an
   `unmoved` entry added or moved to another layer, a store user or allowed
   edge added or removed, a legacy crate or a protocol added or removed, a
   driver or helper added to or removed from `[rules.layers.storage]`, a
   package added to, removed from or moved between
-  `[rules.layers.domain_fences]` families, a mode changed, or the whole
-  table new. A removed `unmoved` entry is one only if its crate moved into
-  another layer's directory than the entry's (shown on the `unmoved` header,
-  or the first `[rules.layers…]` one); otherwise its crate moved where the
-  entry said, was deleted, or is a `placement` finding. A base with
+  `[rules.layers.domain_fences]` families, a shared catalog, or one of its
+  databases, or a co-writer grant added or removed (see [State
+  ownership](#state-ownership)), a mode changed, or the whole table new. A
+  removed `unmoved` entry is one only if its crate moved into another
+  layer's directory than the entry's (shown on the `unmoved` header, or the
+  first `[rules.layers…]` one); otherwise its crate moved where the entry
+  said, was deleted, or is a `placement` finding. A base with
   `[rules.layers]` and a branch without it gets one advisory finding on line
   1 of `ARCHITECTURE.toml`: the whole rule was removed and no longer runs.
   The copy is read as for `crate_names`; a
@@ -463,10 +466,10 @@ saying to fix the dependency, since an entry added by hand fails
 has to reach storage for good becomes a store or a storage helper (see
 [Storage access](#storage-access)), and a Domain crate that needs a fenced
 package is not Domain code and moves to its layer (see [Domain](#domain)).
-As for `crate_names`, it lists no TOML to paste. It always writes all six
-tables, after the tables of caps and before `[crate_names]`;
-`--write-baseline=layers.<check>` updates one, creating it if the file lacks
-it.
+As for `crate_names`, it lists no TOML to paste. It always writes every
+layers table, `[layers.unowned]` with the state checks, after the tables of
+caps and before `[crate_names]`; `--write-baseline=layers.<check>` updates
+one, creating it if the file lacks it.
 
 ### Storage access
 
@@ -601,6 +604,197 @@ behaviours above and a table keyed by package:
   protocol crate of its own. `[layers.model_protocol]` maps each model to the
   protocols it depends on.
 
+### State ownership
+
+With `[rules.layers.state]`, the layers rule also checks which store owns
+each table. Each store declares the tables it owns, by database, in its own
+`Cargo.toml`:
+
+```toml
+[package.metadata.space.state]
+postgres = ["sandboxes", "sandbox_snapshots"]   # db/postgres
+sqlite.sandbox-manager = ["jobs", "sandboxes"]  # db/sandbox-manager
+```
+
+A database's namespace is `postgres` for `db/postgres` and
+`sqlite.<database>` for every other directory under `db/` that is not a
+shared catalog. An empty list puts the store in that database without owning
+a table there, and an empty table declares a store without a database. The
+table is read strictly: an unknown key, such as a misspelled namespace or a
+`co_writer` one, a value that is not a list of names, or two names of one
+table in a namespace, such as `"x"` and `"public.x"` in `postgres`, exits 2.
+In SQLite, whose default schema is `main`, those are two tables, and
+`"x"` and `"main.x"` are one.
+
+A namespace line is reviewed like a grant: listing a database, even with an
+empty list, widens what the store may write. A write statement's table is
+looked up in each database the store declares (see `state.writes`), so with
+`sqlite.<database> = []` a store may write any table of that name that
+database has without an owner, although another store owns a table of the
+same name elsewhere. The manifest diff is where review sees it;
+`layers.policy_changed` does not.
+
+A store that must write a table another store owns, an approved exception
+such as placement claiming a sandbox, is its co-writer by a grant in
+`ARCHITECTURE.toml`, not in its own manifest, so that adding one is a policy
+change `layers.policy_changed` reports for review:
+
+```toml
+[rules.layers.state.co_writers.postgres]     # or .sqlite.<database>
+sandboxes = ["pplx-space-placement"]          # table = the stores granted it
+```
+
+A grant's keys are read as strictly as the manifests', and a store listed
+twice for a table, or two keys of a namespace that name one table, such as
+`sandboxes` and `"public.sandboxes"`, exit 2, so `policy_changed`, which
+compares grants by table, reports every grant added or removed.
+
+The live tables of a database are what its catalog's migrations leave: its
+top-level `*.up.sql` files, in SQLx's version order, applied one after
+another. `CREATE TABLE` adds a table, `DROP TABLE` removes each it lists (one
+it never saw, with `IF EXISTS`, is fine), and `ALTER TABLE … RENAME TO`
+renames one in its schema; a `TEMP` or `TEMPORARY` table, or one in SQLite's
+`temp` schema or Postgres's `pg_temp` (or a `pg_temp_<n>`), is not live, and
+a `DROP` or `RENAME` of one changes no live table. Comments, `'…'` strings and
+`$tag$…$tag$` bodies are not read, so DDL inside a function is not either;
+a `[` is read as the database reads it (see `state.writes`).
+
+Tables are named as each kind of database names them, in live tables and
+write statements alike. A name may be quoted as `"…"`, or, as SQLite allows,
+`` `…` `` or `[…]`. In Postgres (`postgres`), an unquoted name is folded to
+lower case and a quoted one keeps its case, so `"Jobs"` and `jobs` are two
+tables; the default schema is `public`. In SQLite (`sqlite.<database>`), no
+name keeps its case, quoted or not; the default schemas are `main` and
+`temp`. A table in a default schema is named without it, so `public.x` is
+`x` in Postgres and `main.x` is `x` in SQLite, while `main.x` stays
+`main.x` in Postgres; one in another schema keeps it, as `audit.x`. Of a
+name of three parts, such as Postgres's `space.public.x`, the last two are
+read. A declaration or a grant names a table as its database stores it,
+which in Postgres is case by case: `x` for a table created as `X` or `x`,
+and `X` for one created as `"X"`. Its parts are read as SQL's are, so a
+`.` inside quotes is part of a name: `'audit."events.v1"'` is the table
+`events.v1` in the schema `audit`, as `CREATE TABLE audit."events.v1"`
+creates it; unlike in SQL, an unquoted part keeps its case. A table is reported where it was
+created, even after a rename. `history/` and `*.down.sql` are
+not read, nor are SQLx's and the migrator's own bookkeeping tables, which no
+catalog creates. A shared catalog, such as `db/common`, is no database:
+`[rules.layers.state.shared_catalogs]` lists the databases it is applied to,
+and its tables are live in each of them, before their own catalog's.
+
+```toml
+[rules.layers.state.shared_catalogs]
+common = ["build-manager", "runtime-manager", "sandbox-manager", "template-manager", "volume-manager"]
+
+[rules.layers.state.declarations]
+mode = "required"
+# ...and owners, writes and pending, each with a mode, and unowned with
+# no_crossing, no_new_entries and stale_entries.
+```
+
+A shared catalog or a database it lists that is not a directory under `db/`,
+a shared catalog listed as a database, and `[rules.layers.state]` without
+`[rules.layers.unowned]`, or the other way round, exit 2.
+
+The checks, each with its own mode, shown on the manifest line they are
+about unless said otherwise:
+
+- `state.declarations`: a store (`l30_storage`) without a state table, shown
+  on its `name =` line; a crate outside Storage with one, since only stores
+  own or co-write tables; a namespace that is no database, such as a shared
+  catalog's, whose tables are declared in each database instead.
+- `state.owners`: a table two crates declare, once on each declaration.
+  Keep it in the store whose state it is; the others move their writes into
+  it, or are granted the table as co-writers if review approves.
+- `state.writes`: a write statement in a store naming a table that another
+  store owns, when this store is not its co-writer. Shown on the statement's
+  line. A write statement is a head of `INSERT [OR …] INTO`, `REPLACE INTO`,
+  `UPDATE [OR …]`, `DELETE FROM`, `MERGE INTO` or `TRUNCATE [TABLE]`, in any
+  case, followed by a table name: in a string literal of a production Rust
+  file (plain, raw, byte or C, decoded, so a head across a line continuation
+  or in a multi-line literal counts), or in a `.sql` file under the crate's
+  `src/` outside `tests/`, such as one loaded with `include_str!`. SQL
+  comments and `'…'` string values are skipped, but `$tag$…$tag$` bodies are
+  read, as the code they are. A Postgres escape string, `E'…'`, ends at no
+  `\'`. A comment marker inside a quoted name, such as `"a--b"`, starts no
+  comment. `[` is read as each database reads it: in SQLite, `[…]` quotes a
+  name up to the first `]`, `'`s included, as in `[a'--b]`; in Postgres, it
+  is an array's or a subscript's, so the comments and strings inside it,
+  as in `ARRAY['a' /* ] */]`, are skipped as anywhere else. The scan can't
+  tell which kind of database a file's SQL is for, so each file is read
+  both ways, and a name is looked up in each database as that kind reads
+  it. Production files are archcheck's: everything
+  under `src/` but `tests/` directories, `tests.rs` and `*_tests.rs`, so
+  inline `#[cfg(test)]` code, and a file declared by `#[cfg(test)] mod x;`
+  under another name, are scanned. Every store is scanned, whether or not it
+  declares a database. A name is looked up in the databases the store
+  declares that have the table, live or declared, and allowed if the store
+  may write it in any of them: there it has no owner, or the store owns it
+  or is granted it. The scan can't tell which database a statement runs
+  against, so a name such as `jobs`, owned in one of the store's databases
+  and unowned in another, is allowed. A name in none of the store's
+  databases is reported if another store owns it in any database and this
+  store is not granted it there, so a store can't write another store's
+  table by leaving its database undeclared. Crates outside Storage
+  are not scanned: writes there are the layer rules' and the
+  `pattern_ratchet` instances' concern. A head built at run time, split
+  across literals with `concat!`, or in a trigger or migration, is not seen;
+  nor is a `SET` list one crate renders for another's `UPDATE`, which counts
+  for the crate with the head. Every string literal is read as SQL, so text
+  that is not SQL is a false positive when it has a head and a name: an
+  error message such as `"could not UPDATE sandboxes"` is read as a write
+  to `sandboxes`. Reword such a message so that no head is followed by a
+  table's name, as in `"sandbox update failed"`. Fix a finding by moving the statement into
+  the owner and calling it, or, for an approved exception, by granting the
+  store the table in `[rules.layers.state.co_writers]`.
+- `stale_entries`, the layers rule's: a co-writer grant that allows nothing,
+  on its line in `ARCHITECTURE.toml`, because its namespace is no database,
+  the package is not a store, no store or the package itself owns the
+  table, or none of the package's write statements names it.
+- `state.pending` (advisory): a declared table that no migration creates
+  yet: `declared, no migration creates it yet`. That is how a new table
+  lands. The Postgres migration isolation guard
+  (`scripts/check-postgres-migrations-isolated.sh`), which covers
+  `db/postgres` only, keeps a pull request that adds a migration there from
+  changing anything under `crates/`, so the
+  owner's `Cargo.toml` can't change with it, and `unowned.no_new_entries`
+  keeps the migration's pull request from listing the table as unowned. So
+  the owning store declares the table first, reported here, and the
+  migration follows in a pull request of its own, after which the table is
+  live and owned. A declaration whose migration has landed under another
+  name stays here: check the name.
+- `unowned`, with a baseline table, `[layers.unowned]`, that maps each
+  database namespace to its live tables that no store declares, one per
+  line:
+  - `no_crossing`: a live table no store declares and the table doesn't
+    list, shown on the line of the migration that creates it;
+  - `no_new_entries`: an entry the base branch's copy lacks. If the base
+    branch has no state checks yet (no `[layers.unowned]` in its baseline
+    and, with `--base-architecture`, no `[rules.layers.unowned]`), every
+    entry is reported as advisory instead, as the pull request seeding the
+    table;
+  - `stale_entries`: an entry for a namespace that is no database, a table
+    that is not live, or a table a store declares now.
+
+`--write-baseline` keeps the `[layers.unowned]` entries still live without an
+owner, removes the rest, and adds none, printing `not added: …` for each such
+table without an entry; `--write-baseline=layers.unowned` updates it alone.
+
+`layers.policy_changed` reports changes to `shared_catalogs`, including a
+shared catalog added or removed with an empty list, which changes the
+databases as much as one with databases does, to the co-writer grants and
+to the state checks' modes. The declarations
+themselves are in the stores' manifests, which the base branch's
+`ARCHITECTURE.toml` and baseline don't include, so a changed declaration,
+such as a new owner, is not reported: the manifest diff is what review sees.
+
+To make a store the owner of a table, add the table to its declaration and
+remove its `[layers.unowned]` entry, which `unowned.stale_entries` asks for.
+To let a second store write a table, grant it the table in
+`[rules.layers.state.co_writers]` with a comment saying why. A table no store
+owns yet stays in `[layers.unowned]` until one does; the list only shrinks,
+so a new table is declared by its owner before its migration lands (see
+`state.pending`).
+
 ### Limits
 
 - The checks see direct dependencies only. An edge through a re-export, such
@@ -670,10 +864,11 @@ name that is not one of the seven, a package listed twice in `unmoved` or in
 one `store_users` or `allowed_edges` list or in a `[rules.layers.storage]` list,
 a package listed twice in `protocols` or in two `[rules.layers.domain_fences]`
 families, an empty `drivers`, a baseline table for an instance or layers check
-that is not configured, and a failing `cargo metadata` exit 2. So
-does a `--base-baseline`, `--renames` or `--base-architecture` that can't be
-read, or one combined with `--write-baseline`, and `--renames` input that is
-not git's (see [Renamed files](#renamed-files)).
+that is not configured, a state configuration or declaration that can't be
+read (see [State ownership](#state-ownership)), and a failing `cargo metadata`
+exit 2. So does a `--base-baseline`, `--renames` or `--base-architecture` that
+can't be read, or one combined with `--write-baseline`, and `--renames` input
+that is not git's (see [Renamed files](#renamed-files)).
 
 ## Baseline
 
@@ -683,7 +878,9 @@ code-line count; under `[pattern_ratchet.<instance>]`, each production file
 outside the instance's allowed paths with a matching line, with its count of
 matching lines. `[layers.<check>]` maps a package name to the packages it
 depends on against the check instead, or for `codec_features` the
-`<package>/<feature>` entries it enables (see [Layers](#layers)), and
+`<package>/<feature>` entries it enables (see [Layers](#layers)),
+`[layers.unowned]` a database namespace to its tables without an owner (see
+[State ownership](#state-ownership)), and
 `[crate_names]`, written last, a package name to its member path (see
 [Crate names](#crate-names)). Entries should only be
 removed or lowered.
