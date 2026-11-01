@@ -2,7 +2,8 @@
 //! to node-ctl's poll interval.
 //!
 //! node-ctl publishes node status on every reconcile tick, and between ticks
-//! only when a facet is marked dirty. Every publication carries node-ctl's
+//! only when a facet is marked dirty or a publication that failed to reach
+//! the cluster is retried within seconds. Every publication carries node-ctl's
 //! reconciliation statuses, including the interval it polls at. A quiet node
 //! (cordoned, or simply idle) therefore publishes about once per interval, so a
 //! window shorter than the interval makes a healthy node read stale for part

@@ -329,7 +329,7 @@ pub(super) async fn publish_network_policy(
     node_role: Option<NodeRole>,
     scope: FacetScope,
     node_status: Option<PublishedNodeStatus>,
-) -> Result<ReconcileStats, String> {
+) -> Result<ReconcileStats, OutboundError> {
     let (templates, sandbox_ids) = resolve_network_policy_publish_scope(scope)?;
     let (sandboxes, sandboxes_seen) =
         collect_sandbox_states(sandbox_ids, SandboxPublishPayload::NetworkPolicy).await?;

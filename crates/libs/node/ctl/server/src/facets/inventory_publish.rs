@@ -8,7 +8,7 @@ pub(super) async fn publish_sandbox_inventory(
     node_role: Option<NodeRole>,
     scope: FacetScope,
     node_status: Option<PublishedNodeStatus>,
-) -> Result<ReconcileStats, String> {
+) -> Result<ReconcileStats, OutboundError> {
     let complete = matches!(scope, FacetScope::Full);
     let (sandboxes, sandboxes_seen) =
         collect_sandbox_states(scope, SandboxPublishPayload::Inventory).await?;
@@ -78,7 +78,7 @@ pub(super) async fn publish_template_inventory(
     node_role: Option<NodeRole>,
     scope: FacetScope,
     node_status: Option<PublishedNodeStatus>,
-) -> Result<ReconcileStats, String> {
+) -> Result<ReconcileStats, OutboundError> {
     let complete = matches!(scope, FacetScope::Full);
     let (templates, templates_seen) = collect_template_states(scope).await?;
     publish_node_state(
@@ -104,7 +104,7 @@ pub(super) async fn publish_node_status(
     node_id: &str,
     node_role: Option<NodeRole>,
     node_status: Option<PublishedNodeStatus>,
-) -> Result<ReconcileStats, String> {
+) -> Result<ReconcileStats, OutboundError> {
     let execution_observation = execution_inventory::collect(node_role).await;
     publish_node_state(
         node_id,
