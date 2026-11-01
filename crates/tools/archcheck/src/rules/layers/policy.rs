@@ -1,5 +1,6 @@
 //! `layers.stale_entries` for `[rules.layers]` entries that no longer apply
-//! (those of `[rules.layers.storage]` are [`super::storage`]'s),
+//! (those of `[rules.layers.storage]` are [`super::storage`]'s, and those of
+//! `protocols` and `[rules.layers.domain_fences]` [`super::domain`]'s),
 //! and `layers.policy_changed` for every change to `[rules.layers]` from the
 //! base branch's `ARCHITECTURE.toml`, including its removal.
 
@@ -342,6 +343,46 @@ fn changes(base: Option<&LayersPolicy>, policy: &LayersPolicy) -> Vec<(usize, St
             policy.legacy_line.unwrap_or(policy.line),
             format!(": `{package}` was removed from {table} legacy."),
         ));
+    }
+    for (package, line) in &policy.protocols {
+        if !base.protocols.contains_key(package) {
+            changes.push((
+                *line,
+                format!(": `{package}` was added to {table} protocols."),
+            ));
+        }
+    }
+    for package in base
+        .protocols
+        .keys()
+        .filter(|package| !policy.protocols.contains_key(*package))
+    {
+        changes.push((
+            policy.protocols_line.unwrap_or(policy.line),
+            format!(": `{package}` was removed from {table} protocols."),
+        ));
+    }
+    let fences = format!("[rules.{RULE}.domain_fences]");
+    for (package, (family, line)) in &policy.domain_fences.entries {
+        match base.domain_fences.entries.get(package) {
+            None => changes.push((
+                *line,
+                format!(": `{package}` was added to {fences}, in {family}."),
+            )),
+            Some((old, _)) if old != family => changes.push((
+                *line,
+                format!(": `{package}` moved from {old} to {family} in {fences}."),
+            )),
+            Some(_) => {}
+        }
+    }
+    for (package, (family, _)) in &base.domain_fences.entries {
+        if !policy.domain_fences.entries.contains_key(package) {
+            changes.push((
+                policy.domain_fences.line.unwrap_or(policy.line),
+                format!(": `{package}` was removed from {fences}, where it was in {family}."),
+            ));
+        }
     }
     let behaviours: BTreeSet<&String> = base.modes.keys().chain(policy.modes.keys()).collect();
     for behaviour in behaviours {
