@@ -390,6 +390,22 @@ fn known_clients_parse_trims_deduplicates_and_drops_empty_tokens() {
     }
 }
 
+#[test]
+fn client_id_tag_names_only_allowlisted_clients() {
+    let limiter = limiter_with(ClientConcurrencyConfig {
+        known_clients: known_set(&["foreground_client"]),
+        ..ClientConcurrencyConfig::default()
+    });
+
+    assert_eq!(
+        limiter.client_id_tag(Some("foreground_client")).as_str(),
+        "foreground_client"
+    );
+    for header in [None, Some(""), Some("caller-chosen-value")] {
+        assert_eq!(limiter.client_id_tag(header), ClientIdTag::UNKNOWN);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Fail-open policy (no Docker needed).
 // ---------------------------------------------------------------------------

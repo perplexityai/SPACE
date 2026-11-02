@@ -1,8 +1,17 @@
 use std::time::Instant;
 
-use axum::{extract::Request, http::Method, middleware::Next, response::Response};
-use pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity;
+use axum::{
+    extract::{Request, State},
+    http::Method,
+    middleware::Next,
+    response::Response,
+};
+use pplx_space_metrics::sandbox::api::{SandboxApiMetricIdentity, scope_request_client_id};
 use pplx_space_public_api::SandboxLifecycleAction;
+
+use super::AppState;
+
+const CLIENT_ID_HEADER: &str = "x-client-id";
 
 /// Carries the requested sandbox template name from a create handler back to
 /// `record_sandbox_route_metrics` via response extensions, so the route-level
@@ -10,10 +19,23 @@ use pplx_space_public_api::SandboxLifecycleAction;
 #[derive(Clone)]
 pub(crate) struct RouteTemplateName(pub(crate) String);
 
-pub async fn record_sandbox_route_metrics(request: Request, next: Next) -> Response {
-    let identity = sandbox_route_metric(request.method(), request.uri().path());
+/// Times every sandbox route and attributes it, and every API metric the
+/// handler emits, to the caller's allowlisted `X-Client-ID`. The raw header
+/// never becomes a tag: anything the allowlist doesn't name is `unknown`.
+pub async fn record_sandbox_route_metrics(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let client_id = request
+        .headers()
+        .get(CLIENT_ID_HEADER)
+        .and_then(|value| value.to_str().ok());
+    let client_id = state.client_concurrency.client_id_tag(client_id);
+    let identity = sandbox_route_metric(request.method(), request.uri().path())
+        .map(|identity| identity.with_client_id(client_id));
     let started_at = Instant::now();
-    let response = next.run(request).await;
+    let response = scope_request_client_id(client_id, next.run(request)).await;
 
     if let Some(identity) = identity {
         let template_name = response

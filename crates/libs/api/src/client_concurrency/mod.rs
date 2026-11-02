@@ -771,6 +771,14 @@ impl ClientConcurrencyLimiter {
         )
     }
 
+    /// The bounded metric tag for an `X-Client-ID` header value, resolved
+    /// against the static allowlist only. Route metrics call this on every
+    /// request, so it skips the Eppo override map: an override-only client is
+    /// named on the limiter's decision metric but reads `unknown` here.
+    pub fn client_id_tag(&self, client_id: Option<&str>) -> ClientIdTag {
+        ClientKey::classify(client_id, &self.inner.known, None).client_id_tag()
+    }
+
     /// Attempt to reserve a cluster-wide concurrency slot for `operation` on
     /// behalf of the client identified by `client_id` (the `X-Client-ID` header
     /// value, if any).

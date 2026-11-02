@@ -343,8 +343,11 @@ pub fn router(state: AppState) -> Router {
         .merge(public_api_router(state.clone()))
         .merge(session_auth_router(state.clone()))
         .merge(e2b_dedicated_host_router(state.clone()))
-        .with_state(state)
-        .layer(middleware::from_fn(metrics::record_sandbox_route_metrics))
+        .with_state(state.clone())
+        .layer(middleware::from_fn_with_state(
+            state,
+            metrics::record_sandbox_route_metrics,
+        ))
         .layer(http_trace_layer(HttpServerMakeSpan::new(
             ApiHttpSpanMetadata,
         )))
@@ -359,8 +362,11 @@ pub fn shared_host_router(state: AppState) -> Router {
         .merge(e2b_dedicated_host_router(state.clone()))
         .nest(E2B_API_PATH_ROOT, e2b_path_router(state.clone()))
         .merge(admin_shared_host_router(state.clone()))
-        .with_state(state)
-        .layer(middleware::from_fn(metrics::record_sandbox_route_metrics))
+        .with_state(state.clone())
+        .layer(middleware::from_fn_with_state(
+            state,
+            metrics::record_sandbox_route_metrics,
+        ))
         .layer(http_trace_layer(HttpServerMakeSpan::new(
             ApiHttpSpanMetadata,
         )))

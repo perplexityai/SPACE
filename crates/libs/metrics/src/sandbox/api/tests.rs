@@ -1,7 +1,28 @@
 use std::time::Instant;
 
-use super::{SandboxApiMetricIdentity, route_outcome};
-use crate::emit::test_capture::capture_counters_guard;
+use super::{
+    ClientIdTag, SandboxApiMetricIdentity, lifecycle_error, route_outcome, sandbox_created,
+    scope_request_client_id,
+};
+use crate::emit::test_capture::{CapturedCounter, capture_counters_guard};
+use pplx_space_common_core::types::SandboxId;
+
+fn client_id_tags(counter: &CapturedCounter) -> Vec<&str> {
+    counter
+        .tags
+        .iter()
+        .filter(|tag| tag.starts_with("client_id:"))
+        .map(String::as_str)
+        .collect()
+}
+
+/// Runs `emit` inside a request scope on this thread, where the capture lives.
+fn in_request_scope(client_id: ClientIdTag, emit: impl FnOnce()) {
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime")
+        .block_on(scope_request_client_id(client_id, async { emit() }));
+}
 
 #[test]
 fn failed_route_counts_once_as_request_error() {
@@ -73,5 +94,74 @@ fn route_outcome_never_emits_step_error_metric() {
             .iter()
             .all(|counter| counter.name == "sandbox.api.request_error"),
         "{captured:?}"
+    );
+}
+
+#[test]
+fn route_metrics_carry_the_stamped_client_id() {
+    let capture = capture_counters_guard();
+    route_outcome(
+        SandboxApiMetricIdentity::ecw("pause")
+            .with_client_id(ClientIdTag::allowlisted("foreground_client")),
+        503,
+        Instant::now(),
+        None,
+    );
+    let captured = capture.finish();
+
+    assert_eq!(captured.len(), 1, "{captured:?}");
+    assert_eq!(
+        client_id_tags(&captured[0]),
+        ["client_id:foreground_client"]
+    );
+}
+
+#[test]
+fn identity_metrics_inherit_the_request_client_id() {
+    let capture = capture_counters_guard();
+    in_request_scope(ClientIdTag::allowlisted("background_client"), || {
+        lifecycle_error(
+            SandboxId::new(),
+            SandboxApiMetricIdentity::ecw("resume"),
+            "boom",
+        );
+        sandbox_created(false);
+    });
+    lifecycle_error(
+        SandboxId::new(),
+        SandboxApiMetricIdentity::ecw("resume"),
+        "boom",
+    );
+    let captured = capture.finish();
+
+    let client_ids = captured.iter().map(client_id_tags).collect::<Vec<_>>();
+    assert_eq!(
+        client_ids,
+        [
+            ["client_id:background_client"],
+            ["client_id:background_client"],
+            ["client_id:unknown"]
+        ],
+        "{captured:?}"
+    );
+}
+
+#[test]
+fn stamped_client_id_wins_over_the_request_scope() {
+    let capture = capture_counters_guard();
+    in_request_scope(ClientIdTag::allowlisted("background_client"), || {
+        lifecycle_error(
+            SandboxId::new(),
+            SandboxApiMetricIdentity::ecw("connect")
+                .with_client_id(ClientIdTag::allowlisted("foreground_client")),
+            "boom",
+        );
+    });
+    let captured = capture.finish();
+
+    assert_eq!(captured.len(), 1, "{captured:?}");
+    assert_eq!(
+        client_id_tags(&captured[0]),
+        ["client_id:foreground_client"]
     );
 }
