@@ -48,7 +48,8 @@
 #                            the credential-manager authority's AWS integrations
 #                            (sandbox account only)
 #   SPACE_KIND_MIN_FREE_GIB  warn before bring-up when the Docker data root or
-#                            SPACE_KIND_DATA_ROOT has less free (default: 30)
+#                            SPACE_KIND_DATA_ROOT has less free (default: 30,
+#                            plus 10 per SPACE node for the Docker data root)
 #   SPACE_VENDOR_ROOT, SPACE_KIND_DATA_ROOT
 #                            host paths the cluster bind-mounts; see
 #                            infra/space/kind/scripts/lib/kind-host-paths.sh
