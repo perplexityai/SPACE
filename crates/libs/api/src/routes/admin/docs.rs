@@ -48,7 +48,7 @@ fn admin_openapi_value() -> Value {
             "/nodes": {
                 "get": {
                     "summary": "List node inventory and optional diagnostic counts",
-                    "description": "Set include_occupancy=false for metadata-only inventory with null occupancy counts. Legacy requests compute counts; sort=drainability always computes diagnostics.",
+                    "description": "Set include_occupancy=false for metadata-only inventory with null occupancy counts. Legacy requests compute counts; sort=drainability always computes diagnostics. Every node also carries runtime_installations, reconcile_trigger when one is queued, node_group_id when the node is labeled into a group, and cordoned (the Kubernetes Node's spec.unschedulable) on the Kubernetes substrate.",
                     "parameters": [
                         { "name": "include_occupancy", "in": "query", "schema": { "type": "boolean", "default": true } }
                     ],
@@ -60,7 +60,7 @@ fn admin_openapi_value() -> Value {
             "/nodes/{node_id}": {
                 "get": {
                     "summary": "Get one node and optional diagnostic counts",
-                    "description": "Set include_occupancy=false to read metadata without sandbox or snapshot accounting; occupancy counts are then null.",
+                    "description": "Set include_occupancy=false to read metadata without sandbox or snapshot accounting; occupancy counts are then null. The node also carries runtime_installations, reconcile_trigger when one is queued, node_group_id when the node is labeled into a group, and cordoned (the Kubernetes Node's spec.unschedulable) on the Kubernetes substrate.",
                     "parameters": [
                         { "name": "include_occupancy", "in": "query", "schema": { "type": "boolean", "default": true } },
                         { "name": "node_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }

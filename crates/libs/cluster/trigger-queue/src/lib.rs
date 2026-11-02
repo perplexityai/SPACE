@@ -8,6 +8,7 @@ use pplx_space_common_svc::types::{
     normalize_reconcile_reason as normalize_shared_reconcile_reason,
 };
 use sqlx::{FromRow, PgPool};
+use time::OffsetDateTime;
 
 mod reconcile_refs;
 pub use reconcile_refs::{QueuedReconcileRefs, QueuedRefConflict, queue_node_reconcile_refs};
@@ -471,6 +472,87 @@ async fn release_refreshed_trigger_claims(
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+/// A trigger still in `node_reconcile_triggers`: requested and not yet drained.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedTrigger {
+    pub node_id: NodeId,
+    /// `state_reconciliation_reason` wire values, newest first. Kept as text
+    /// so a reason written by a newer build still reads.
+    pub reasons: Vec<String>,
+    pub requested_at: OffsetDateTime,
+    pub next_attempt_at: OffsetDateTime,
+    pub attempts: i32,
+    pub claimed_at: Option<OffsetDateTime>,
+    pub dead_at: Option<OffsetDateTime>,
+    /// `None` when no attempt has failed since the last request.
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, FromRow)]
+struct QueuedTriggerRow {
+    node_id: NodeId,
+    reasons: Vec<String>,
+    diagnostic_reason: String,
+    requested_at: OffsetDateTime,
+    next_attempt_at: OffsetDateTime,
+    attempts: i32,
+    claimed_at: Option<OffsetDateTime>,
+    dead_at: Option<OffsetDateTime>,
+    last_error: String,
+}
+
+/// The queued triggers of `node_ids`, at most one per node. A node with
+/// nothing queued has no entry.
+pub async fn queued_triggers(
+    executor: impl sqlx::PgExecutor<'_>,
+    node_ids: &[NodeId],
+) -> Result<Vec<QueuedTrigger>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, QueuedTriggerRow>(sql!(
+        "SELECT node_id,
+                reasons::TEXT[] AS reasons,
+                reason AS diagnostic_reason,
+                requested_at,
+                next_attempt_at,
+                attempts,
+                claimed_at,
+                dead_at,
+                last_error
+         FROM node_reconcile_triggers
+         WHERE node_id = ANY($1)
+         ORDER BY node_id"
+    ))
+    .bind(node_ids)
+    .fetch_all(executor)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            // Rows written before the `reasons` array carry only the
+            // comma-joined diagnostic text, as `coalesced_reasons` reads them.
+            let reasons = if row.reasons.is_empty() {
+                row.diagnostic_reason
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|reason| !reason.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            } else {
+                row.reasons
+            };
+            QueuedTrigger {
+                node_id: row.node_id,
+                reasons,
+                requested_at: row.requested_at,
+                next_attempt_at: row.next_attempt_at,
+                attempts: row.attempts,
+                claimed_at: row.claimed_at,
+                dead_at: row.dead_at,
+                last_error: (!row.last_error.is_empty()).then_some(row.last_error),
+            }
+        })
+        .collect())
 }
 
 pub fn normalize_trigger_reason(reason: &str) -> String {

@@ -1765,6 +1765,16 @@ impl Substrate {
         }
     }
 
+    /// Whether each node is cordoned, keyed by substrate node id. `None` where
+    /// the substrate has no cordon (Direct) or cannot answer yet.
+    pub fn node_cordon_states(&self) -> Option<std::collections::HashMap<String, bool>> {
+        match &self.inner {
+            Inner::Direct(_) => None,
+            #[cfg(feature = "kubernetes")]
+            Inner::Kubernetes(substrate) => substrate.node_cordon_states(),
+        }
+    }
+
     pub async fn try_resolve_node_api_endpoint(
         &self,
         target: &NodeApiTarget<'_>,

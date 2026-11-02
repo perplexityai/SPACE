@@ -33,6 +33,9 @@ use crate::middleware::auth::AuthUser;
 use crate::models::User;
 use crate::routes::AppState;
 
+mod read_state;
+use read_state::attach_node_read_state;
+
 /// Drain-phase states stored in `nodes.drain_phase`. NULL means the node is
 /// in normal placement service (no drain in progress).
 const PHASE_DRAINING: &str = "draining";
@@ -505,6 +508,7 @@ fn admin_node_response(
         drain_started_at: format_optional_time(row.drain_started_at),
         drain_last_error: row.drain_last_error,
         terminate_decrement_capacity: row.terminate_decrement_capacity,
+        node_group_id: row.node_group_id,
         k8s_node_name: row.substrate_node_id,
         metadata: row
             .metadata
@@ -528,6 +532,9 @@ fn admin_node_response(
             max_slots: row.network_pool_max_slots,
         },
         status,
+        cordoned: None,
+        reconcile_trigger: None,
+        runtime_installations: None,
     }
 }
 
@@ -560,13 +567,14 @@ pub async fn list_admin_nodes(
         Err(err) => return db_error(err).into_response(),
     };
     if filters.include_occupancy == Some(false) && !sort.needs_drainability() {
-        return Json(
-            nodes
-                .into_iter()
-                .map(|node| admin_node_response(node, None, None))
-                .collect::<Vec<_>>(),
-        )
-        .into_response();
+        let mut responses: Vec<_> = nodes
+            .into_iter()
+            .map(|node| admin_node_response(node, None, None))
+            .collect();
+        if let Err(err) = attach_node_read_state(&state, &store, &mut responses).await {
+            return db_error(err).into_response();
+        }
+        return Json(responses).into_response();
     }
     let node_ids: Vec<NodeId> = nodes.iter().map(|n| n.id).collect();
     // The census probes are only paid for when the caller is ranking by them:
@@ -605,6 +613,9 @@ pub async fn list_admin_nodes(
     // (role, name) order and successive calls agree.
     if ranking.is_some() {
         responses.sort_by_key(drainability_rank);
+    }
+    if let Err(err) = attach_node_read_state(&state, &store, &mut responses).await {
+        return db_error(err).into_response();
     }
     Json(responses).into_response()
 }
@@ -846,7 +857,8 @@ pub async fn get_admin_node(
         Err(err) => return db_error(err).into_response(),
     };
     if filters.include_occupancy == Some(false) {
-        return Json(admin_node_response(node, None, None)).into_response();
+        return single_node_read_response(&state, &store, admin_node_response(node, None, None))
+            .await;
     }
     // Legacy detail requests retain the authoritative diagnostic counts.
     let residency = cluster_residency_evidence();
@@ -862,7 +874,7 @@ pub async fn get_admin_node(
         Err(err) => return db_error(err).into_response(),
     };
     let occupancy = node_occupancy.occupancy;
-    Json(admin_node_response(
+    let response = admin_node_response(
         node,
         Some(occupancy),
         Some(drainability_block(
@@ -870,8 +882,19 @@ pub async fn get_admin_node(
             residency,
             DEFAULT_LONG_RUNNER_AGE,
         )),
-    ))
-    .into_response()
+    );
+    single_node_read_response(&state, &store, response).await
+}
+
+async fn single_node_read_response(
+    state: &AppState,
+    store: &AdminNodeStore,
+    mut response: AdminNodeResponse,
+) -> axum::response::Response {
+    match attach_node_read_state(state, store, std::slice::from_mut(&mut response)).await {
+        Ok(()) => Json(response).into_response(),
+        Err(err) => db_error(err).into_response(),
+    }
 }
 
 /// Dispatch a `POST /v1/nodes/{spec}` where `spec` is either a bare

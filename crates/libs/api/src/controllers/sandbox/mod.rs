@@ -1115,6 +1115,10 @@ impl SandboxController {
             .await
     }
 
+    pub fn node_cordon_states(&self) -> Option<std::collections::HashMap<String, bool>> {
+        self.substrate.node_cordon_states()
+    }
+
     pub async fn resolve_node_api_endpoint(
         &self,
         target: &NodeApiTarget<'_>,
