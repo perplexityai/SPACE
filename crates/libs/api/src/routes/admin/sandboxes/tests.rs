@@ -672,3 +672,63 @@ fn admin_idempotency_key_is_header_text_within_the_cap() {
         assert_eq!(error.message, message);
     }
 }
+
+/// An admin create keeps the owner as the operation's actor and, when the
+/// requester is recorded, reports the administrator as `requested_by_user_id`
+/// in the admin operations API; a create without it reports none.
+#[tokio::test]
+async fn an_admin_create_reports_its_requester_apart_from_the_owner() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let admin = UserId::from_uuid(pplx_space_db_test_fixtures::SEED_USER_ID);
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let owner = UserId::from_uuid(seed_user(&db.pool, org_id).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    for (key, requested_by) in [
+        ("requested-by-recorded", Some(admin)),
+        ("requested-by-off", None),
+    ] {
+        let request = serde_json::from_value(serde_json::json!({
+            "org_id": org_id,
+            "user_id": owner,
+            "sandbox": {
+                "name": null,
+                "template": "seed",
+                "runtime": "fc",
+                "env": {},
+                "metadata": {},
+                "resources": null
+            },
+        }))?;
+        let response = create_sandbox_for_org(
+            &db.pool,
+            request,
+            &IdempotencyKey::parse_header(key.as_bytes())?,
+            requested_by,
+            false,
+        )
+        .await
+        .map_err(|error| error.message)?;
+        let operation = store
+            .fetch_operation_admin(response.operation_id)
+            .await?
+            .expect("the create's operation exists");
+        assert_eq!(operation.actor_user_id, Some(owner), "{key}");
+        assert_eq!(operation.requested_by_user_id, requested_by, "{key}");
+        let listed = store
+            .list_operations_admin(crate::public_operations::ListAdminPublicOperations {
+                org_id: Some(org_id),
+                state: None,
+                kind: None,
+                target_type: None,
+                target_id: Some(response.sandbox_id.to_string()),
+                limit: 10,
+            })
+            .await?;
+        assert_eq!(listed.len(), 1, "{key}");
+        assert_eq!(listed[0].requested_by_user_id, requested_by, "{key}");
+    }
+    db.pool.close().await;
+    Ok(())
+}

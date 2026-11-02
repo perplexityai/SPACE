@@ -180,6 +180,7 @@ fn admin_openapi_value() -> Value {
             "/operations": {
                 "get": {
                     "summary": "List public operations across tenants for operator diagnostics",
+                    "description": "actor_user_id is the user an operation runs as; for an admin sandbox create that is the sandbox owner. requested_by_user_id is set only on create_sandbox operations an administrator submitted on the owner's behalf while SPACE_ADMIN_CREATE_REQUESTED_BY_ENABLED was on, naming that administrator; it is null on every other operation.",
                     "parameters": [
                         { "name": "org_id", "in": "query", "required": false, "schema": { "type": "string", "format": "uuid" } },
                         { "name": "state", "in": "query", "required": false, "schema": { "type": "string" } },

@@ -57,6 +57,7 @@ fn claimed_create_operation_for(
             node_pool: None,
             federated_create: None,
             pool_claim: None,
+            requested_by_user_id: None,
         }
         .into_json(),
         attempts: 1,
@@ -199,6 +200,7 @@ async fn native_create_executor_preserves_operator_policy_across_replacements() 
                 node_pool: None,
                 federated_create: federated.then_some(context),
                 pool_claim: None,
+                requested_by_user_id: None,
             }
             .into_json();
 
@@ -489,6 +491,7 @@ async fn existing_row_create_persists_the_renewed_grant() -> TestResult {
                 crate::fork_operations::ForkFederatedCreateContext::from_request(&owner, &renewed),
             ),
             pool_claim: None,
+            requested_by_user_id: None,
         }
         .into_json();
 
@@ -760,6 +763,7 @@ async fn seed_unpinned_create_operation(pool: &PgPool) -> ClaimedPublicOperation
             node_pool: None,
             federated_create: None,
             pool_claim: None,
+            requested_by_user_id: None,
         }
         .into_json(),
         attempts: 1,
@@ -853,6 +857,7 @@ fn create_operation_payload_is_wire_compatible_with_old_shape() {
         node_pool: None,
         federated_create: None,
         pool_claim: None,
+        requested_by_user_id: None,
     };
     let value = serde_json::to_value(&unpinned).unwrap();
     assert!(
@@ -872,12 +877,60 @@ fn create_operation_payload_is_wire_compatible_with_old_shape() {
         node_pool: Some(NodePoolName::parse("isolated-test-pool").unwrap()),
         federated_create: None,
         pool_claim: None,
+        requested_by_user_id: None,
     };
     let pinned_value = serde_json::to_value(&pinned).unwrap();
     assert_eq!(
         pinned_value.get("node_pool").and_then(|v| v.as_str()),
         Some("isolated-test-pool")
     );
+}
+
+/// The create payload as executors from before `requested_by_user_id` parse
+/// it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct PreRequesterCreateOperationPayload {
+    sandbox_id: PublicSandboxId,
+    request: pplx_space_public_api::CreateSandboxRequest,
+    #[serde(default)]
+    node_pool: Option<NodePoolName>,
+    #[serde(default)]
+    federated_create: Option<crate::fork_operations::ForkFederatedCreateContext>,
+    #[serde(default)]
+    pool_claim: Option<CreateSandboxPoolClaim>,
+}
+
+#[test]
+fn create_payload_without_a_requester_is_wire_compatible_with_old_shape() {
+    let payload = |requested_by_user_id| CreateSandboxOperationPayload {
+        sandbox_id: PublicSandboxId::new(),
+        request: public_create_request(),
+        node_pool: None,
+        federated_create: None,
+        pool_claim: None,
+        requested_by_user_id,
+    };
+
+    // Unrecorded, an older executor parses the payload, and an old payload
+    // parses here with no requester.
+    let unrecorded = payload(None).into_json();
+    assert!(
+        unrecorded.get("requested_by_user_id").is_none(),
+        "{unrecorded}"
+    );
+    serde_json::from_value::<PreRequesterCreateOperationPayload>(unrecorded.clone()).unwrap();
+    let parsed: CreateSandboxOperationPayload = serde_json::from_value(unrecorded).unwrap();
+    assert_eq!(parsed.requested_by_user_id, None);
+
+    // Recorded, it round-trips, and an older executor refuses it: the
+    // consumer-first precondition `ADMIN_CREATE_REQUESTED_BY_ENV` guards.
+    let admin = UserId::new();
+    let recorded = payload(Some(admin)).into_json();
+    let parsed: CreateSandboxOperationPayload = serde_json::from_value(recorded.clone()).unwrap();
+    assert_eq!(parsed.requested_by_user_id, Some(admin));
+    assert!(serde_json::from_value::<PreRequesterCreateOperationPayload>(recorded).is_err());
 }
 
 /// The wake payload as executors from before `wake_activity` parse it.
@@ -1216,6 +1269,7 @@ fn create_operation_payload_pool_claim_is_optional_on_the_wire() {
         node_pool: None,
         federated_create: None,
         pool_claim: None,
+        requested_by_user_id: None,
     };
     let value = serde_json::to_value(&cold).unwrap();
     assert!(

@@ -275,6 +275,7 @@ pub(crate) async fn create_native_sandbox_operation(
                     node_pool: None,
                     federated_create: federated_create.clone(),
                     pool_claim: pool_claim.map(|claim| claim.claim.into()),
+                    requested_by_user_id: None,
                 }
                 .into_json(),
                 idempotency: Some(idempotency.clone()),

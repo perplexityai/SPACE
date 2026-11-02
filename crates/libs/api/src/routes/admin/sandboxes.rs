@@ -170,10 +170,13 @@ pub async fn create_sandbox(
         Err(err) => return err.into_response(),
     };
     let org_id = request.org_id;
+    let requested_by =
+        crate::public_sandbox_operations::admin_create_requested_by_enabled().then_some(actor.id);
     match create_sandbox_for_org(
         &state.pool,
         request,
         &idempotency_key,
+        requested_by,
         state
             .sandbox_controller
             .substrate_capabilities()
@@ -204,6 +207,7 @@ async fn create_sandbox_for_org(
     pool: &sqlx::PgPool,
     request: AdminCreateSandboxRequest,
     idempotency_key: &IdempotencyKey,
+    requested_by: Option<UserId>,
     substrate_supports_node_pool_placement: bool,
 ) -> Result<SandboxOperationResponse, AdminSandboxActionError> {
     let org_id = request.org_id;
@@ -280,6 +284,7 @@ async fn create_sandbox_for_org(
         node_pool: request.node_pool,
         federated_create: None,
         pool_claim: None,
+        requested_by_user_id: requested_by,
     }
     .into_json();
 
