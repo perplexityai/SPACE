@@ -221,8 +221,10 @@ if [[ ! -x "$version_dir/bin/firecracker" ]]; then
   # GitHub's release downloads can answer 500 for longer than fixed 2 s
   # retries last: six attempts over 13 s have all failed. curl's doubling
   # backoff spreads seven attempts over about a minute, and --retry-all-errors
-  # also retries a reset connection.
+  # also retries a reset connection. A stalled transfer, under 10 KB/s for
+  # 30 s, is dropped and retried as install-prereqs.sh's downloads are.
   curl -fsSL --retry 6 --retry-all-errors \
+    --connect-timeout 20 --speed-limit 10240 --speed-time 30 \
     "https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VERSION}/firecracker-${FC_VERSION}-${ARCH}.tgz" \
     -o "$tmp/fc.tgz"
   tar -xzf "$tmp/fc.tgz" -C "$tmp"
