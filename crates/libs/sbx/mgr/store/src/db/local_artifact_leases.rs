@@ -26,6 +26,15 @@ pub struct PendingBackup {
     pub artifact_kind: ArtifactKind,
 }
 
+/// How many sandboxes [`PendingBackup`] would list, and how long the oldest
+/// pinned artifact among them has waited, in seconds since it was created.
+/// A pin that names no row it owns counts but has no age.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PendingBackupBacklog {
+    pub count: u64,
+    pub oldest_age_secs: u64,
+}
+
 /// Logical state of a `local_artifacts` row. Encoded on the row's
 /// `state` column; transitions are CAS via
 /// `LocalArtifacts::check_out_for_restore` /
@@ -125,6 +134,31 @@ db_private_outside_tests! {
         })?
         .collect::<rusqlite::Result<_>>()
         .map_err(crate::db::Error::from)
+    }
+}
+
+db_private_outside_tests! {
+    /// [`list_pending_backups`]'s rows, counted in SQL, with the oldest
+    /// pinned artifact's age.
+    fn pending_backup_backlog(conn: &Connection) -> Result<PendingBackupBacklog> {
+        let now = crate::db::now_epoch_i64()?;
+        let (count, oldest) = conn.query_row(
+            "SELECT COUNT(*), MIN(CAST(a.created_at AS INTEGER))
+           FROM sandboxes AS s
+           LEFT JOIN local_artifacts AS a
+             ON a.local_artifact_id = s.current_local_artifact_id
+            AND a.sandbox_id = s.id
+          WHERE s.current_local_artifact_id IS NOT NULL
+            AND (a.local_artifact_id IS NULL OR a.backup_completed_at IS NULL)",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )?;
+        Ok(PendingBackupBacklog {
+            count: u64::try_from(count).unwrap_or_default(),
+            oldest_age_secs: oldest
+                .and_then(|created_at| u64::try_from(now.saturating_sub(created_at)).ok())
+                .unwrap_or_default(),
+        })
     }
 }
 
