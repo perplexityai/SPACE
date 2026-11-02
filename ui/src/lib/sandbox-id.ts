@@ -77,15 +77,16 @@ export function sandboxLabelOrId(sandboxId: string): string {
 }
 
 // The admin list returns the newest sandbox rows first, up to `limit` of
-// them (the API's default limit is 1000 and its maximum 5000), plus the
-// node-reported rows described below.
+// them (the API's default limit is 1000 and its maximum 5000); the unscoped
+// list also appends the node-reported rows described below.
 export const DEFAULT_LIST_LIMIT = 1000;
 export const MAX_LIST_LIMIT = 5000;
 export const LIST_LIMIT_OPTIONS = [100, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT];
 
-// The admin list returns at most `limit` sandbox rows, then appends rows the
-// nodes report without a database row (rowless pool slots, observed-local
-// sandboxes). Only the sandbox rows count against the limit.
+// The admin list returns at most `limit` sandbox rows. Without `org_id` it
+// then appends rows the nodes report without a database row (rowless pool
+// slots, observed-local sandboxes), which belong to no org; an org-scoped
+// list does not. Only the sandbox rows count against the limit.
 export function sandboxRowCount(rows: { resource_type?: string }[]): number {
   return rows.filter((row) => row.resource_type === 'sandbox').length;
 }

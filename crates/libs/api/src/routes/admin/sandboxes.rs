@@ -102,9 +102,12 @@ pub async fn list_sandboxes(
                 .into_response();
         }
     };
+    // Rowless warm-pool slots and observed-local sandboxes have no org, so
+    // only the unscoped list carries them.
+    let include_observed_only = query.org_id.is_none();
     match state
         .sandbox_controller
-        .list_responses(&state.pool, &sandboxes, true)
+        .list_responses(&state.pool, &sandboxes, include_observed_only)
         .await
     {
         Ok(response) => Json(response).into_response(),
