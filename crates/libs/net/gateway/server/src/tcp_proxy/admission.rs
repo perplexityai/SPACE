@@ -45,14 +45,14 @@ impl TcpProxy {
         }
     }
 
-    /// How the ClientHello peek must treat a flow that shows none. Two kinds
-    /// of admitted flow are denied for lacking one:
+    /// How the ClientHello peek must treat a flow that shows none:
     ///
-    /// - a destination the default deny refuses without DNS evidence, and the
-    ///   guest's DNS evidence admits (see [`Self::admit`]);
-    /// - with TLS interception on, any destination admitted without DNS
-    ///   evidence, unless its IP is exempt, because interception closes a flow without SNI
-    ///   (see `tls_interception::require_certificates`).
+    /// - denied: a destination the default deny refuses without DNS evidence,
+    ///   and the guest's DNS evidence admits (see [`Self::admit`]);
+    /// - probed: with TLS interception on, a destination admitted without DNS
+    ///   evidence whose IP is not exempt. Interception closes a flow without
+    ///   SNI, so a silent guest first gets the server-first probe
+    ///   (see `super::server_first`).
     ///
     /// A guardrail or an explicit deny refuses the flow before its ClientHello
     /// is read, and with interception off every other flow is decided without
@@ -80,6 +80,24 @@ impl TcpProxy {
         policy: &NetworkPolicyV1,
     ) -> Result<AdmittedTcp, TcpAdmissionDenial> {
         crate::egress::admit_tcp(
+            destination,
+            scan,
+            policy,
+            self.network_state.dns_allow_cache(),
+        )
+    }
+
+    /// [`Self::admit`] for a flow the server-first probe may admit again.
+    pub(super) fn admit_deferred(
+        &self,
+        destination: SocketAddr,
+        scan: &ClientHelloScan,
+        policy: &NetworkPolicyV1,
+    ) -> (
+        Result<AdmittedTcp, TcpAdmissionDenial>,
+        crate::egress::TcpDecision,
+    ) {
+        crate::egress::admit_tcp_deferred(
             destination,
             scan,
             policy,

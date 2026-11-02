@@ -11,7 +11,10 @@ use crate::dns::DnsAllowCache;
 
 mod tcp;
 mod tracker;
-pub(crate) use tcp::{AdmittedTcp, TcpAdmissionDenial, admit_tcp, missing_client_hello};
+pub(crate) use tcp::{
+    AdmittedTcp, TcpAdmissionDenial, TcpDecision, admit_tcp, admit_tcp_deferred,
+    missing_client_hello,
+};
 pub use tracker::DnsAttributedTcpTracker;
 
 /// Transport an egress decision applies to.

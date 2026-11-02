@@ -65,7 +65,7 @@ pub(crate) fn missing_client_hello(
             MissingClientHello::Denied
         }
         None if !policy.tls_interception_for(destination.ip(), None).is_off() => {
-            MissingClientHello::Denied
+            MissingClientHello::ProbesServer
         }
         _ => MissingClientHello::Proceeds,
     }
@@ -77,6 +77,19 @@ pub(crate) fn admit_tcp(
     policy: &NetworkPolicyV1,
     dns_allow_cache: &DnsAllowCache,
 ) -> Result<AdmittedTcp, TcpAdmissionDenial> {
+    let (result, decision) = admit_tcp_deferred(destination, scan, policy, dns_allow_cache);
+    drop(decision);
+    result
+}
+
+/// [`admit_tcp`] for a flow that may be admitted again, so that it counts one
+/// admission decision: the returned [`TcpDecision`] records it on drop.
+pub(crate) fn admit_tcp_deferred(
+    destination: SocketAddr,
+    scan: &ClientHelloScan,
+    policy: &NetworkPolicyV1,
+    dns_allow_cache: &DnsAllowCache,
+) -> (Result<AdmittedTcp, TcpAdmissionDenial>, TcpDecision) {
     let dns_allowed = dns_allow_cache.allows_ip(destination.ip(), policy);
     let attributed_host = dns_attributed_host(destination, scan, dns_allow_cache);
     let context = EgressContext::Admission(EgressProtocol::Tcp);
@@ -89,8 +102,32 @@ pub(crate) fn admit_tcp(
         dns_allowed,
         attributed_host,
     );
-    record_tcp_decision(context, started_at, &result, policy);
-    result.map_err(TcpAdmissionDenial::DnsAttribution)
+    record_latency(context, started_at);
+    let decision = TcpDecision(Some((egress_decision(&result), policy.tls_interception)));
+    (result.map_err(TcpAdmissionDenial::DnsAttribution), decision)
+}
+
+/// A TCP admission decision, recorded when dropped unless superseded.
+#[must_use]
+pub(crate) struct TcpDecision(Option<(EgressDecision, TlsInterception)>);
+
+impl TcpDecision {
+    /// Drop without recording, because the flow is admitted again.
+    pub(crate) fn superseded(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for TcpDecision {
+    fn drop(&mut self) {
+        if let Some((decision, interception)) = self.0.take() {
+            record_decision(
+                EgressContext::Admission(EgressProtocol::Tcp),
+                decision,
+                interception,
+            );
+        }
+    }
 }
 
 pub(super) fn revalidate_tcp(
@@ -135,12 +172,15 @@ fn record_tcp_decision(
     result: &Result<AdmittedTcp, DenyReason>,
     policy: &NetworkPolicyV1,
 ) {
-    let decision = match result {
+    record_latency(context, started_at);
+    record_decision(context, egress_decision(result), policy.tls_interception);
+}
+
+const fn egress_decision(result: &Result<AdmittedTcp, DenyReason>) -> EgressDecision {
+    match result {
         Ok(_) => EgressDecision::Allow,
         Err(reason) => EgressDecision::Deny { reason: *reason },
-    };
-    record_latency(context, started_at);
-    record_decision(context, decision, policy.tls_interception);
+    }
 }
 
 fn check_tcp(

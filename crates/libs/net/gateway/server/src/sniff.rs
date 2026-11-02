@@ -26,9 +26,8 @@ const PEEK_MAX_BYTES: usize = 16_640;
 /// idle one pays at most this before proceeding with no SNI.
 const FIRST_BYTES_TIMEOUT: Duration = Duration::from_millis(50);
 /// How long to wait for the client's first bytes when a flow without a
-/// ClientHello is denied: a destination only its DNS evidence can admit, or
-/// any admitted flow under TLS interception, which closes a flow it cannot
-/// read SNI from. A domain-derived allow rejects an absent ClientHello
+/// ClientHello is denied: a destination only its DNS evidence can admit.
+/// A domain-derived allow rejects an absent ClientHello
 /// deliberately, so a guest cannot bypass hostname binding by delaying its
 /// first write, and a longer wait grants no bypass. 50 ms is shorter than one
 /// TCP retransmit (Linux's minimum RTO is 200 ms), so a cold guest's lost or
@@ -59,12 +58,18 @@ pub(crate) enum MissingClientHello {
     Proceeds,
     /// The flow is denied, so a late first segment must not read as none.
     Denied,
+    /// Interception needs SNI, but the destination was admitted without DNS
+    /// evidence, so a silent guest may be waiting for a server greeting. The
+    /// flow goes to `tcp_proxy::server_first`, which keeps watching the guest.
+    ProbesServer,
 }
 
 impl MissingClientHello {
     const fn first_bytes_timeout(self) -> Duration {
         match self {
-            Self::Proceeds => FIRST_BYTES_TIMEOUT,
+            // The probe keeps watching the guest, so waiting longer here would
+            // only delay a greeting.
+            Self::Proceeds | Self::ProbesServer => FIRST_BYTES_TIMEOUT,
             Self::Denied => FAIL_CLOSED_FIRST_BYTES_TIMEOUT,
         }
     }
@@ -81,6 +86,13 @@ pub(crate) enum MissingSniDetail {
     ConnectionClosed,
     ReadError,
     ClientHelloTooLarge,
+    /// The destination spoke first, so the flow was relayed opaquely.
+    ServerFirst,
+    /// Neither side spoke within the server-first probe window.
+    ServerFirstTimeout,
+    /// The destination closed or failed before speaking, and the guest then
+    /// sent nothing.
+    ServerFirstUpstreamClosed,
 }
 
 impl MissingSniDetail {
@@ -94,6 +106,9 @@ impl MissingSniDetail {
             Self::ConnectionClosed => "connection_closed",
             Self::ReadError => "read_error",
             Self::ClientHelloTooLarge => "client_hello_too_large",
+            Self::ServerFirst => "server_first",
+            Self::ServerFirstTimeout => "server_first_timeout",
+            Self::ServerFirstUpstreamClosed => "server_first_upstream_closed",
         }
     }
 }
