@@ -87,14 +87,15 @@ class HelperTests(unittest.TestCase):
         self.assertIsNone(xnode.parse_activation("runtime_activated but not json", "w1"))
 
     def test_classify(self):
-        def act(node, boot="snapshot", prov="remote_only"):
-            return xnode.Activation("s", node, boot, prov, True, "1", 0)
+        def act(node, boot="snapshot", prov="remote_only", uri=True):
+            return xnode.Activation("s", node, boot, prov, uri, "1", 0)
 
         self.assertEqual(xnode.classify("w1", act("w2"), NODES), "cross_node_download")
         self.assertEqual(xnode.classify("w1", act("w1"), NODES), "same_node")
         self.assertEqual(xnode.classify("w1", act("w9"), NODES), "outside_pool")
-        self.assertEqual(xnode.classify("w1", act("w2", prov="remote_matches_local"), NODES),
-                         "cross_node_local_copy")
+        for prov in ("remote_matches_local", "remote_local_mismatch"):
+            self.assertEqual(xnode.classify("w1", act("w2", prov=prov), NODES), "cross_node_download")
+        self.assertEqual(xnode.classify("w1", act("w2", uri=False), NODES), "cross_node_no_remote")
         self.assertEqual(xnode.classify("w1", act("w2", prov="local"), NODES), "cross_node_no_remote")
         self.assertEqual(xnode.classify("w1", act("w2", boot="cold"), NODES), "not_snapshot")
         self.assertEqual(xnode.classify("w1", None, NODES), "unclassified")
@@ -264,7 +265,7 @@ class FakeRunTests(unittest.TestCase):
                 self.assertTrue(wake["correctness_ok"])
                 place = placements[wake["wake_id"]]
                 self.assertNotEqual(place["landed_node"], wake["source_node"])
-                self.assertIn(place["classification"], {"cross_node_download", "cross_node_local_copy"})
+                self.assertEqual(place["classification"], "cross_node_download")
             self.assertTrue(any(r["kind"] == "probe" for r in rows))
             self.assertTrue(any(r["kind"] == "suspend" and r["phase"] == "paired" for r in rows))
             self.assertEqual([r["variant"] for r in rows if r["kind"] == "block"], ["baseline", "reporting"])

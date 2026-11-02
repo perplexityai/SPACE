@@ -40,7 +40,7 @@ from typing import Any, Iterable, Sequence
 
 MIN_SAMPLES = {"loaded": 2000, "quiet": 400}
 MIN_BLOCKS = {"loaded": 4, "quiet": 1}
-NOT_ELIGIBLE = {"same_node", "outside_pool", "not_snapshot", "cross_node_local_copy", "cross_node_no_remote"}
+NOT_ELIGIBLE = {"same_node", "outside_pool", "not_snapshot", "cross_node_no_remote"}
 
 
 def percentile(sorted_values: Sequence[float], q: float) -> float | None:
