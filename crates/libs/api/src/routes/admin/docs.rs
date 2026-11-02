@@ -314,7 +314,7 @@ fn admin_openapi_value() -> Value {
                     "summary": "Delete a user",
                     "responses": {
                         "204": { "description": "Deleted" },
-                        "409": { "description": "Caller attempted to delete itself" }
+                        "409": { "description": "Not deleted. reason is self_mutation when the caller targeted itself, user_owns_sandboxes when the user still owns sandboxes, user_owns_retained_deleted_sandboxes when its only sandboxes are deleted ones whose records are kept for retention until retained_until (retry after that), or user_owns_archived_sandboxes when it still owns archived sandboxes" }
                     }
                 }
             },

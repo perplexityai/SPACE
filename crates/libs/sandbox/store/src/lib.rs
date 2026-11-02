@@ -4,7 +4,7 @@
 //! that use it. This crate consolidates that access one CRUD verb at a time,
 //! following the per-table store convention: executor-generic free functions,
 //! a typed record, `sql!` locators, and a small error enum. Verbs
-//! so far: [`get`], [`update_desired_state`],
+//! so far: [`get`], [`update_desired_state`], [`user_sandbox_rows`],
 //! [`any_undescribed_artifact_owner`], [`network_policy_inputs_placed_on`],
 //! [`snapshot_storage_placed_on`].
 //!
@@ -88,6 +88,7 @@ use pplx_space_common_core::types::{LocalArtifactId, OrgId, UserId};
 
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
+use std::time::Duration;
 
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{NodeId, SandboxId, SubstrateKind};
@@ -192,6 +193,44 @@ pub async fn get(
     .fetch_optional(executor)
     .await?;
     Ok(record)
+}
+
+/// How long a deleted sandbox's row is kept, measured from its last update,
+/// before the cluster-controller's tombstone retention removes it. Until then
+/// the row still holds `sandboxes`' foreign keys, such as the one to its user.
+pub const DELETED_SANDBOX_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// What `user_id`'s `sandboxes` rows are, as far as deleting the user goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UserSandboxRows {
+    /// The user has no sandbox rows.
+    None,
+    /// At least one of them is not deleted.
+    Live,
+    /// Every one is deleted; retention removes the last around this time.
+    DeletedOnly { retained_until: OffsetDateTime },
+}
+
+/// Classify `user_id`'s sandbox rows; see [`UserSandboxRows`].
+pub async fn user_sandbox_rows(
+    executor: impl sqlx::PgExecutor<'_>,
+    user_id: UserId,
+) -> Result<UserSandboxRows, SandboxStoreError> {
+    let (live, retained_until) = sqlx::query_as::<_, (Option<bool>, Option<OffsetDateTime>)>(sql!(
+        "SELECT bool_or(lifecycle <> 'deleted'),
+                MAX(COALESCE(updated_at, created_at)) + make_interval(secs => $2)
+         FROM sandboxes
+         WHERE user_id = $1"
+    ))
+    .bind(user_id)
+    .bind(DELETED_SANDBOX_RETENTION.as_secs_f64())
+    .fetch_one(executor)
+    .await?;
+    Ok(match (live, retained_until) {
+        (Some(true), _) => UserSandboxRows::Live,
+        (Some(false), Some(retained_until)) => UserSandboxRows::DeletedOnly { retained_until },
+        _ => UserSandboxRows::None,
+    })
 }
 
 /// The network-policy inputs of one sandbox placed on a node: its own

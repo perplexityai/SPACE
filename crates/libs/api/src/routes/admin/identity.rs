@@ -10,6 +10,8 @@ use pplx_space_common_core::{
     sql,
     types::{KekProvider, platform_default_kek_provider},
 };
+use pplx_space_sandbox_store::UserSandboxRows;
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::super::authz;
@@ -34,6 +36,11 @@ pub(super) enum IdentityAdminError {
     NotFound,
     #[error("cannot modify your own role or delete yourself")]
     SelfMutation,
+    /// The user still owns rows whose foreign key to `users` restricts the
+    /// delete. Ownership is not reassigned here, so those rows have to go
+    /// first.
+    #[error("{}", .0.message())]
+    StillOwns(UserDeleteBlocker),
     #[error("{0}")]
     InvalidRequest(&'static str),
     #[error("internal server error")]
@@ -81,10 +88,26 @@ impl IdentityAdminError {
         match self {
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::NotFound => StatusCode::NOT_FOUND,
-            Self::SelfMutation => StatusCode::CONFLICT,
+            Self::SelfMutation | Self::StillOwns(_) => StatusCode::CONFLICT,
             Self::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             Self::Internal(_) | Self::Password(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Contended { status, .. } => *status,
+        }
+    }
+
+    /// A stable machine-readable reason for the 409s callers must tell
+    /// apart. It is not `code`, which elsewhere in `/admin/api/v1` is the
+    /// status category. The other variants keep the message-only body.
+    const fn reason(&self) -> Option<&'static str> {
+        match self {
+            Self::SelfMutation => Some("self_mutation"),
+            Self::StillOwns(blocker) => Some(blocker.reason()),
+            Self::Forbidden
+            | Self::NotFound
+            | Self::InvalidRequest(_)
+            | Self::Internal(_)
+            | Self::Password(_)
+            | Self::Contended { .. } => None,
         }
     }
 }
@@ -92,12 +115,104 @@ impl IdentityAdminError {
 impl IntoResponse for IdentityAdminError {
     fn into_response(self) -> Response {
         let status = self.status();
-        (
-            status,
-            Json(serde_json::json!({ "error": self.to_string() })),
-        )
-            .into_response()
+        let mut body = serde_json::Map::new();
+        body.insert("error".to_string(), self.to_string().into());
+        if let Some(reason) = self.reason() {
+            body.insert("reason".to_string(), reason.into());
+        }
+        if let Self::StillOwns(UserDeleteBlocker::DeletedSandboxes { retained_until }) = &self {
+            body.insert(
+                "retained_until".to_string(),
+                format_rfc3339(*retained_until).into(),
+            );
+        }
+        (status, Json(body)).into_response()
     }
+}
+
+/// A row kind whose foreign key to `users` has no `ON DELETE` action, so it
+/// refuses the user's delete while any such row exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum UserDeleteBlocker {
+    /// `sandboxes.user_id`, which includes sandboxes still being torn down.
+    Sandboxes,
+    /// `sandboxes.user_id` held only by deleted sandboxes, whose rows
+    /// tombstone retention keeps until about `retained_until`.
+    DeletedSandboxes { retained_until: OffsetDateTime },
+    /// `sandbox_archives.user_id` (`ON DELETE RESTRICT`).
+    ArchivedSandboxes,
+}
+
+impl UserDeleteBlocker {
+    /// The blocker named by a foreign-key violation from `DELETE FROM users`,
+    /// or `None` for any other database error.
+    fn from_delete_error(error: &sqlx::Error) -> Option<Self> {
+        let sqlx::Error::Database(db) = error else {
+            return None;
+        };
+        if !db.is_foreign_key_violation() {
+            return None;
+        }
+        match db.constraint()? {
+            "sandboxes_user_id_fkey" => Some(Self::Sandboxes),
+            "sandbox_archives_user_id_fkey" => Some(Self::ArchivedSandboxes),
+            _ => None,
+        }
+    }
+
+    /// Refine [`Self::Sandboxes`] to [`Self::DeletedSandboxes`] when every
+    /// sandbox row still holding the user is already deleted, so the operator
+    /// is told to wait out retention rather than delete them again.
+    async fn refine(self, state: &AppState, user_id: UserId) -> Result<Self, IdentityAdminError> {
+        if self != Self::Sandboxes {
+            return Ok(self);
+        }
+        let rows = pplx_space_sandbox_store::user_sandbox_rows(&state.pool, user_id)
+            .await
+            .map_err(
+                |pplx_space_sandbox_store::SandboxStoreError::Database(error)| {
+                    IdentityAdminError::from(error)
+                },
+            )?;
+        Ok(match rows {
+            UserSandboxRows::DeletedOnly { retained_until } => {
+                Self::DeletedSandboxes { retained_until }
+            }
+            // `None`: the rows went between the delete and this read; the
+            // operator's retry then succeeds.
+            UserSandboxRows::Live | UserSandboxRows::None => Self::Sandboxes,
+        })
+    }
+
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::Sandboxes => "user_owns_sandboxes",
+            Self::DeletedSandboxes { .. } => "user_owns_retained_deleted_sandboxes",
+            Self::ArchivedSandboxes => "user_owns_archived_sandboxes",
+        }
+    }
+
+    fn message(self) -> String {
+        match self {
+            Self::Sandboxes => {
+                "user still owns sandboxes; delete them before deleting the user".to_string()
+            }
+            Self::DeletedSandboxes { retained_until } => format!(
+                "user's sandboxes are all deleted, but their records are kept for retention \
+                 until about {}; retry the delete after that",
+                format_rfc3339(retained_until)
+            ),
+            Self::ArchivedSandboxes => "user still owns archived sandboxes; they must be purged \
+                                        before the user can be deleted"
+                .to_string(),
+        }
+    }
+}
+
+fn format_rfc3339(value: OffsetDateTime) -> String {
+    value
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default()
 }
 
 pub(super) async fn list_orgs(
@@ -453,7 +568,18 @@ pub(super) async fn delete_user(
     let result = sqlx::query(sql!("DELETE FROM users WHERE id = $1"))
         .bind(user_id)
         .execute(&state.pool)
-        .await?;
+        .await;
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            return Err(match UserDeleteBlocker::from_delete_error(&error) {
+                Some(blocker) => {
+                    IdentityAdminError::StillOwns(blocker.refine(&state, user_id).await?)
+                }
+                None => IdentityAdminError::from(error),
+            });
+        }
+    };
     if result.rows_affected() == 0 {
         return Err(IdentityAdminError::NotFound);
     }

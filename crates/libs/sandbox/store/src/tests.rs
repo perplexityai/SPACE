@@ -8,8 +8,8 @@ use uuid::Uuid;
 
 use super::{
     AutoLifecycleExecution, FieldPatch, SandboxDesiredStatePatch, SandboxMetadata,
-    SandboxMetadataValue, any_undescribed_artifact_owner, durably_restorable, get,
-    update_desired_state,
+    SandboxMetadataValue, UserSandboxRows, any_undescribed_artifact_owner, durably_restorable, get,
+    update_desired_state, user_sandbox_rows,
 };
 
 mod insert_unplaced_tests;
@@ -876,5 +876,43 @@ async fn durably_restorable_follows_the_marker_and_placement() -> TestResult {
     );
 
     assert!(!durably_restorable(pool, SandboxId::new()).await?);
+    Ok(())
+}
+
+/// A user's sandbox rows hold the user until the most recently updated
+/// deleted one leaves retention, a week later; any other row holds it
+/// outright.
+#[tokio::test]
+async fn user_sandbox_rows_reports_when_deleted_rows_leave_retention() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let user = UserId::from_uuid(SEED_USER);
+    sqlx::query(sql!("DELETE FROM sandboxes WHERE user_id = $1"))
+        .bind(user)
+        .execute(&db.pool)
+        .await?;
+    assert_eq!(
+        user_sandbox_rows(&db.pool, user).await?,
+        UserSandboxRows::None
+    );
+
+    let first = insert_sandbox(&db.pool, None, "deleted").await?;
+    let second = insert_sandbox(&db.pool, None, "deleted").await?;
+    let newest_update = read_updated_at(&db.pool, first)
+        .await?
+        .max(read_updated_at(&db.pool, second).await?);
+    assert_eq!(
+        user_sandbox_rows(&db.pool, user).await?,
+        UserSandboxRows::DeletedOnly {
+            retained_until: newest_update + time::Duration::days(7),
+        }
+    );
+
+    insert_sandbox(&db.pool, None, "running").await?;
+    assert_eq!(
+        user_sandbox_rows(&db.pool, user).await?,
+        UserSandboxRows::Live
+    );
     Ok(())
 }

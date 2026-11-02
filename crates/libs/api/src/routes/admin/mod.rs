@@ -57,8 +57,11 @@ mod sandboxes;
 // `/admin/api/v1` tree agrees on the *status* a lost lock race gets. The body
 // still differs by module: this layer, `templates`, and `sandboxes`'
 // `create_command` render a `PublicErrorEnvelope`; `sandboxes`' action
-// handlers render `{"error", "operation_id", "retryable"}`; the rest a bare
-// `{"error": …}` with no retry field. `Retry-After` comes only from the two
+// handlers render `{"error", "operation_id", "retryable"}`; `identity` a
+// `{"error": …}` that its 409s extend with a `reason` (and, for a user held
+// only by deleted sandboxes, `retained_until`), never named `code`, which in
+// the envelope is the status category; the rest a bare `{"error": …}` with no
+// retry field. `Retry-After` comes only from the two
 // paths that answer through `PublicApiError` — this layer, and
 // `create_command`, which has two — its sandbox lookup through
 // `database_error` and its session write through
