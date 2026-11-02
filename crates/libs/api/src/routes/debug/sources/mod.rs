@@ -9,13 +9,20 @@ pub(super) mod quarantine;
 pub(super) mod snapshots;
 pub(super) mod timeline;
 
+/// A read-only transaction for one debug source. `REPEATABLE READ` so the
+/// several statements a source runs over the same rows see one snapshot:
+/// under `READ COMMITTED` a snapshot could read `creating` beside a storage
+/// placement taken after it finished, or a quarantine episode beside history
+/// that already records its release.
 pub(in crate::routes::debug) async fn begin_read_only(
     pool: &PgPool,
 ) -> Result<Transaction<'_, Postgres>, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    sqlx::query(sql!("SET TRANSACTION READ ONLY"))
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(sql!(
+        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+    ))
+    .execute(&mut *tx)
+    .await?;
     Ok(tx)
 }
 

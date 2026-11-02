@@ -252,6 +252,9 @@ pub(super) struct PodExecution {
 pub(super) struct SnapshotsSection {
     pub snapshots: Vec<Snapshot>,
     pub inventory: Vec<SnapshotInventory>,
+    /// Why the snapshots carry no `storage`, when the placement read failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_error: Option<String>,
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -321,8 +324,6 @@ impl SnapshotStorage {
 #[derive(Debug, Serialize, sqlx::FromRow)]
 pub(super) struct SnapshotInventory {
     pub sandbox_id: SandboxId,
-    /// The node that reported the snapshot, which holds it locally.
-    pub node_id: NodeId,
     pub snapshot_id: String,
     pub r#type: String,
     pub state: String,
