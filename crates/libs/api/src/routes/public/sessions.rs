@@ -75,6 +75,7 @@ pub async fn create_terminal_session(
         sandbox_id,
         request,
         idempotency_key(&headers)?,
+        OperationPathTemplate::new(TERMINAL_SESSION_PATH_TEMPLATE),
     )
     .await?;
 
@@ -84,6 +85,8 @@ pub async fn create_terminal_session(
 /// Create a terminal session in a sandbox `org_id` owns, after the caller has
 /// established that it does. Shared with the admin route, which resolves the
 /// owning organization itself; both mint the same session-scoped attach token.
+/// `path_template` scopes `idempotency_key`, so each route replays only its own
+/// sessions.
 pub(crate) async fn create_terminal_session_for_sandbox(
     state: &AppState,
     org_id: OrgId,
@@ -91,6 +94,7 @@ pub(crate) async fn create_terminal_session_for_sandbox(
     sandbox_id: PublicSandboxId,
     request: CreateTerminalSessionRequest,
     idempotency_key: IdempotencyKey,
+    path_template: OperationPathTemplate,
 ) -> Result<PublicSession, PublicApiError> {
     validate_terminal_size(request.size.as_ref())?;
     let request_json = serde_json::to_value(&request).map_err(|error| {
@@ -118,7 +122,7 @@ pub(crate) async fn create_terminal_session_for_sandbox(
             request_json,
             fingerprint_payload,
             idempotency_key,
-            path_template: OperationPathTemplate::new(TERMINAL_SESSION_PATH_TEMPLATE),
+            path_template,
         },
         || Ok(()),
     )

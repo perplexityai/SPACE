@@ -507,11 +507,6 @@ pub(super) async fn update_org(
     Json(request): Json<UpdateOrgRequest>,
 ) -> Result<Json<Organization>, IdentityAdminError> {
     require_org_admin(&state, &actor, org_id).await?;
-    validate_branding(
-        patch_value(request.theme_primary.as_ref()),
-        patch_value(request.theme_secondary.as_ref()),
-        patch_value(request.logo_url.as_ref()),
-    )?;
     let (theme_primary_present, theme_primary) = nullable_patch_bind(request.theme_primary);
     let (theme_secondary_present, theme_secondary) = nullable_patch_bind(request.theme_secondary);
     let (logo_url_present, logo_url) = nullable_patch_bind(request.logo_url);
@@ -531,6 +526,37 @@ pub(super) async fn update_org(
         )?;
     }
     let mut tx = state.pool.begin().await?;
+    // Branding is validated only where the patch changes it: the console
+    // re-sends every branding field on save, and a value stored before
+    // validation existed must not block an edit to another field. Locked so
+    // the comparison holds until the update.
+    let stored = sqlx::query_as::<_, StoredBranding>(sql!(
+        "SELECT theme_primary, theme_secondary, logo_url
+         FROM organizations
+         WHERE id = $1
+         FOR UPDATE"
+    ))
+    .bind(org_id)
+    .fetch_optional(tx.as_mut())
+    .await?
+    .ok_or(IdentityAdminError::NotFound)?;
+    validate_branding(
+        changed_value(
+            theme_primary_present,
+            theme_primary.as_deref(),
+            stored.theme_primary.as_deref(),
+        ),
+        changed_value(
+            theme_secondary_present,
+            theme_secondary.as_deref(),
+            stored.theme_secondary.as_deref(),
+        ),
+        changed_value(
+            logo_url_present,
+            logo_url.as_deref(),
+            stored.logo_url.as_deref(),
+        ),
+    )?;
     let org = sqlx::query_as::<_, Organization>(sql!(
         "UPDATE organizations
          SET name = COALESCE($2, name),
@@ -970,11 +996,21 @@ fn is_logo_url(value: &str) -> bool {
     }
 }
 
-fn patch_value(patch: Option<&crate::models::NullablePatch<String>>) -> Option<&str> {
-    match patch {
-        Some(crate::models::NullablePatch::Set(value)) => Some(value),
-        Some(crate::models::NullablePatch::Clear) | None => None,
-    }
+#[derive(sqlx::FromRow)]
+struct StoredBranding {
+    theme_primary: Option<String>,
+    theme_secondary: Option<String>,
+    logo_url: Option<String>,
+}
+
+/// The value a patch field sets, when it sets one other than the stored
+/// value; clearing and leaving a field alone need no validation.
+fn changed_value<'a>(
+    present: bool,
+    patched: Option<&'a str>,
+    stored: Option<&str>,
+) -> Option<&'a str> {
+    patched.filter(|value| present && Some(*value) != stored)
 }
 
 fn nullable_patch_bind<T>(patch: Option<crate::models::NullablePatch<T>>) -> (bool, Option<T>) {

@@ -706,7 +706,6 @@ async fn an_admin_create_reports_its_requester_apart_from_the_owner() -> TestRes
             request,
             &IdempotencyKey::parse_header(key.as_bytes())?,
             requested_by,
-            false,
         )
         .await
         .map_err(|error| error.message)?;
@@ -788,7 +787,10 @@ mod cross_org_routes {
     use serde_json::json;
 
     use super::*;
-    use crate::routes::admin::test_fixtures::{AdminRouterHarness, admin_router_harness};
+    use crate::routes::admin::test_fixtures::{
+        AdminRouterHarness, admin_router_harness, admin_router_harness_with,
+    };
+    use crate::routes::public::hidden_operations::HiddenOperationsGate;
 
     async fn tenant_sandbox(harness: &AdminRouterHarness) -> TestResult<PublicSandboxId> {
         let id = seed_sandbox(&harness.db.pool, harness.tenant_org, harness.tenant_admin).await?;
@@ -896,6 +898,89 @@ mod cross_org_routes {
             StatusCode::BAD_REQUEST,
             "Idempotency-Key is required"
         );
+
+        // The two refusals came after the sandbox resolved, so they name it too.
+        let events = harness.audit_events(&path).await;
+        let statuses: Vec<_> = events
+            .iter()
+            .map(|event| event["status_code"].clone())
+            .collect();
+        assert_eq!(statuses, vec![json!(400), json!(400), json!(201)]);
+        for event in &events {
+            assert_names_sandbox(event, &harness, sandbox);
+        }
+        let missing_events = harness
+            .audit_events(&format!("/sandboxes/{missing}/terminal-sessions"))
+            .await;
+        assert_eq!(missing_events.len(), 1);
+        assert_eq!(missing_events[0]["target_id"], serde_json::Value::Null);
+        Ok(())
+    }
+
+    /// The admin route scopes its idempotency keys apart from the public
+    /// route's: the tenant sending the operator's key and body gets a session
+    /// of its own, and the operator's session and attach token are untouched.
+    #[tokio::test]
+    async fn admin_and_public_terminal_sessions_never_replay_each_other() -> TestResult {
+        let Some(harness) = admin_router_harness().await? else {
+            return Ok(());
+        };
+        let sandbox = tenant_sandbox(&harness).await?;
+        let path = format!("/sandboxes/{sandbox}/terminal-sessions");
+        let key = "shared-terminal-key";
+        let body = json!({"size": {"rows": 24, "cols": 80}});
+        let (status, admin_session) = harness
+            .as_operator(
+                Method::POST,
+                &path,
+                &[("idempotency-key", key)],
+                Some(body.clone()),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{admin_session}");
+        let admin_session_id = admin_session["id"].as_str().expect("session id").to_owned();
+        let token_hash = |session_id: String| {
+            let pool = harness.db.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Option<String>>(sql!(
+                    "SELECT token_hash FROM data_plane_sessions WHERE session_id = $1"
+                ))
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+            }
+        };
+        let admin_token_hash = token_hash(admin_session_id.clone()).await?;
+
+        let tenant_session = crate::routes::public::sessions::create_terminal_session_for_sandbox(
+            &harness.state,
+            harness.tenant_org,
+            harness.tenant_admin,
+            sandbox,
+            serde_json::from_value(body.clone())?,
+            IdempotencyKey::parse(key.to_owned())?,
+            crate::public_operations::OperationPathTemplate::new(
+                pplx_space_public_api::routes::CREATE_TERMINAL_SESSION.path(),
+            ),
+        )
+        .await
+        .map_err(|error| format!("public create failed: {error:?}"))?;
+        assert_ne!(tenant_session.id.to_string(), admin_session_id);
+        assert_eq!(
+            token_hash(admin_session_id.clone()).await?,
+            admin_token_hash,
+            "the operator's attach token was not rotated"
+        );
+
+        let (status, replay) = harness
+            .as_operator(Method::POST, &path, &[("idempotency-key", key)], Some(body))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{replay}");
+        assert_eq!(
+            replay["id"],
+            admin_session_id.as_str(),
+            "the admin route replays its own"
+        );
         Ok(())
     }
 
@@ -946,15 +1031,27 @@ mod cross_org_routes {
         assert_eq!(events[0]["method"], "GET");
         assert_names_sandbox(&events[0], &harness, sandbox);
 
-        let (status, _) = harness
-            .as_operator(
-                Method::GET,
-                &format!("{path}?cursor=not-a-cursor"),
-                &[],
-                None,
-            )
-            .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        for query in ["cursor=not-a-cursor", "limit=many"] {
+            let (status, _) = harness
+                .as_operator(Method::GET, &format!("{path}?{query}"), &[], None)
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
+            let events = harness.audit_events(&format!("{path}?{query}")).await;
+            assert!(events.is_empty(), "the path is recorded without its query");
+        }
+        let events = harness.audit_events(&path).await;
+        let statuses: Vec<_> = events
+            .iter()
+            .map(|event| event["status_code"].clone())
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![json!(400), json!(400), json!(200)],
+            "a refused read of a resolved sandbox is audited"
+        );
+        for event in &events {
+            assert_names_sandbox(event, &harness, sandbox);
+        }
         let missing = PublicSandboxId::from_uuid(Uuid::now_v7());
         let (status, _) = harness
             .as_operator(
@@ -968,12 +1065,17 @@ mod cross_org_routes {
         Ok(())
     }
 
-    /// `:force-rollback` carries the public `:rollback` body to the operation,
-    /// under the sandbox's organization, and the body is part of the request's
-    /// idempotency fingerprint.
+    /// With rollback enabled for the sandbox's organization, `:force-rollback`
+    /// carries the public `:rollback` body to the operation, under that
+    /// organization, and the body is part of the request's idempotency
+    /// fingerprint.
     #[tokio::test]
     async fn an_operator_rolls_back_another_organizations_sandbox() -> TestResult {
-        let Some(harness) = admin_router_harness().await? else {
+        let Some(harness) = admin_router_harness_with(|state| {
+            state.native_hidden_operations = HiddenOperationsGate::all_orgs();
+        })
+        .await?
+        else {
             return Ok(());
         };
         let sandbox = tenant_sandbox(&harness).await?;
@@ -1021,12 +1123,6 @@ mod cross_org_routes {
             .await;
         assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
 
-        let events = harness.audit_events(&path).await;
-        assert_eq!(events.len(), 3, "{events:?}");
-        for event in &events {
-            assert_names_sandbox(event, &harness, sandbox);
-        }
-
         for missing_body in [None, Some(json!({"auto_restart": true}))] {
             let (status, error) = harness
                 .as_operator(
@@ -1037,6 +1133,139 @@ mod cross_org_routes {
                 )
                 .await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        }
+        let events = harness.audit_events(&path).await;
+        assert_eq!(events.len(), 5, "{events:?}");
+        for event in &events {
+            assert_names_sandbox(event, &harness, sandbox);
+        }
+        Ok(())
+    }
+
+    /// Rollback stays behind the public `:rollback`'s hidden-operation gate:
+    /// with it closed for the sandbox's organization, `:force-rollback` enqueues
+    /// nothing, and the refusal is audited against the sandbox.
+    #[tokio::test]
+    async fn rollback_is_refused_while_its_gate_is_closed() -> TestResult {
+        let Some(harness) = admin_router_harness_with(|state| {
+            state.native_hidden_operations = HiddenOperationsGate::default();
+        })
+        .await?
+        else {
+            return Ok(());
+        };
+        let sandbox = tenant_sandbox(&harness).await?;
+        let path = format!("/sandboxes/{sandbox}:force-rollback");
+        let (status, error) = harness
+            .as_operator(
+                Method::POST,
+                &path,
+                &[("idempotency-key", "rollback-closed")],
+                Some(json!({"snapshot_name": "checkpoint-1"})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{error}");
+        assert!(
+            error["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("rollback is not enabled"),
+            "{error}"
+        );
+        let operations: i64 = sqlx::query_scalar(sql!(
+            "SELECT count(*) FROM public_operations WHERE target_id = $1"
+        ))
+        .bind(sandbox.to_string())
+        .fetch_one(&harness.db.pool)
+        .await?;
+        assert_eq!(operations, 0);
+        let events = harness.audit_events(&path).await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_names_sandbox(&events[0], &harness, sandbox);
+
+        let (status, accepted) = harness
+            .as_operator(
+                Method::POST,
+                &format!("/sandboxes/{sandbox}:force-stop"),
+                &[("idempotency-key", "stop-open")],
+                None,
+            )
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "other actions are ungated: {accepted}"
+        );
+        Ok(())
+    }
+
+    /// Once the sandbox or organization resolves, a refused admin sandbox write
+    /// names it in the audit event, as a successful one does.
+    #[tokio::test]
+    async fn refused_sandbox_writes_name_the_resolved_target() -> TestResult {
+        let Some(harness) = admin_router_harness().await? else {
+            return Ok(());
+        };
+        let sandbox = tenant_sandbox(&harness).await?;
+        let command = json!({"command": ["true"], "cwd": null, "env": {}, "pty": null, "stdin": false, "timeout": null});
+        let refusals = [
+            (
+                Method::POST,
+                format!("/sandboxes/{sandbox}/commands"),
+                Some(command),
+            ),
+            (
+                Method::POST,
+                format!("/sandboxes/{sandbox}:force-stop"),
+                None,
+            ),
+            (
+                Method::PATCH,
+                format!("/sandboxes/{sandbox}"),
+                Some(json!({"resources": {"disk_mib": 2048}})),
+            ),
+        ];
+        for (method, path, body) in refusals {
+            // No Idempotency-Key, or an immutable field: refused after lookup.
+            let (status, error) = harness.as_operator(method.clone(), &path, &[], body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {path}: {error}");
+            let events = harness.audit_events(&path).await;
+            assert_eq!(events.len(), 1, "{method} {path}: {events:?}");
+            assert_names_sandbox(&events[0], &harness, sandbox);
+        }
+
+        let create = |user_id: Option<UserId>| {
+            json!({
+                "org_id": harness.tenant_org,
+                "user_id": user_id,
+                "sandbox": {"name": null, "template": "seed", "runtime": "fc", "env": {}, "metadata": {}, "resources": null},
+            })
+        };
+        let (status, error) = harness
+            .as_operator(
+                Method::POST,
+                "/sandboxes",
+                &[("idempotency-key", "create-foreign-owner")],
+                Some(create(Some(harness.operator.id))),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        let (status, accepted) = harness
+            .as_operator(
+                Method::POST,
+                "/sandboxes",
+                &[("idempotency-key", "create-tenant-owner")],
+                Some(create(None)),
+            )
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+        let events = harness.audit_events("/sandboxes").await;
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0]["target_id"], accepted["sandbox_id"]);
+        assert_eq!(events[1]["target_id"], serde_json::Value::Null);
+        for event in &events {
+            assert_eq!(event["target_org_id"], harness.tenant_org.to_string());
+            assert_eq!(event["target_type"], "sandbox");
         }
         Ok(())
     }

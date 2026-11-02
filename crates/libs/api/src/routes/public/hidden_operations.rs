@@ -184,7 +184,7 @@ fn parse_flag_master(raw: &str) -> Result<bool, HiddenOperationsConfigError> {
 }
 
 /// Whether `org_id` may use `operation`; see [`HiddenOperationsGate::allows`].
-pub(super) fn visible(state: &AppState, org_id: OrgId, operation: NativeOperation) -> bool {
+pub(crate) fn visible(state: &AppState, org_id: OrgId, operation: NativeOperation) -> bool {
     state
         .native_hidden_operations
         .allows(&state.feature_flags, org_id, operation)

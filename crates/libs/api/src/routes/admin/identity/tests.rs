@@ -1030,6 +1030,35 @@ async fn org_branding_updates_answer_a_field_error_for_invalid_values()
         "null still clears"
     );
 
+    // A value stored before validation existed is re-sent unchanged by the
+    // console's save; only a field the patch changes is checked.
+    sqlx::query(sql!(
+        "UPDATE organizations SET theme_primary = 'blue' WHERE id = $1"
+    ))
+    .bind(harness.tenant_org)
+    .execute(&harness.db.pool)
+    .await?;
+    let (status, org) = harness
+        .as_operator(
+            Method::PATCH,
+            &path,
+            &[],
+            Some(json!({"theme_primary": "blue", "theme_secondary": "#123", "logo_url": null})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{org}");
+    assert_eq!(org["theme_secondary"], "#123");
+    let (status, error) = harness
+        .as_operator(
+            Method::PATCH,
+            &path,
+            &[],
+            Some(json!({"theme_primary": "green"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+    assert_eq!(error["field"], "theme_primary");
+
     let (status, error) = harness
         .as_operator(
             Method::POST,

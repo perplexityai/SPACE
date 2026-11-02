@@ -58,6 +58,9 @@ pub(super) struct AdminAuditEvent {
     /// release writes still lists.
     target_type: Option<String>,
     target_id: Option<String>,
+    /// The user the target acts as: for an API key, the user it was created
+    /// to act as.
+    target_user_id: Option<UserId>,
     #[serde(with = "time::serde::rfc3339")]
     created_at: OffsetDateTime,
 }
@@ -77,13 +80,21 @@ pub(super) struct AdminAuditRequestEntry<'a> {
 ///
 /// For handlers that act on another organization's resources, where the
 /// request path does not name the owning organization or the resource the
-/// request created. A `GET` that returns one is persisted too, so a read of
-/// another organization's data is audited like a write.
+/// request created. A handler returns one once the resource resolves, on
+/// failures as well as successes, and names only what resolved: a request for
+/// a resource that doesn't exist, or isn't under the organization its path
+/// names, carries none.
+///
+/// Every admin write is persisted whether or not it carries a target. Reads
+/// are persisted only when they carry one, which today means only
+/// `GET /sandboxes/{sandbox_id}/snapshots`; other admin reads, including
+/// those of another organization's sandboxes, users and API keys, are not.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct AdminAuditTarget {
     pub org_id: OrgId,
     pub target_type: AdminAuditTargetType,
     pub target_id: Option<String>,
+    pub user_id: Option<UserId>,
 }
 
 impl AdminAuditTarget {
@@ -92,14 +103,32 @@ impl AdminAuditTarget {
             org_id,
             target_type: AdminAuditTargetType::Sandbox,
             target_id: Some(sandbox_id.to_string()),
+            user_id: None,
         }
     }
 
-    pub(super) fn api_key(org_id: OrgId, api_key_id: Option<ApiKeyId>) -> Self {
+    /// A sandbox create under `org_id` that failed before it had an id.
+    pub(super) fn sandbox_create(org_id: OrgId) -> Self {
+        Self {
+            org_id,
+            target_type: AdminAuditTargetType::Sandbox,
+            target_id: None,
+            user_id: None,
+        }
+    }
+
+    /// An API key of `org_id`: its id once it exists, and the user it acts as
+    /// once that is chosen.
+    pub(super) fn api_key(
+        org_id: OrgId,
+        api_key_id: Option<ApiKeyId>,
+        user_id: Option<UserId>,
+    ) -> Self {
         Self {
             org_id,
             target_type: AdminAuditTargetType::ApiKey,
             target_id: api_key_id.map(|id| id.to_string()),
+            user_id,
         }
     }
 }
@@ -138,6 +167,7 @@ pub(super) async fn list_audit_events(
              target_org_id,
              target_type,
              target_id,
+             target_user_id,
              created_at
          FROM admin_audit_events
          ORDER BY created_at DESC, id DESC
@@ -168,9 +198,10 @@ pub(super) async fn record_request(
              duration_ms,
              target_org_id,
              target_type,
-             target_id
+             target_id,
+             target_user_id
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)"
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)"
     ))
     .bind(Uuid::now_v7())
     .bind(entry.actor.id)
@@ -184,6 +215,7 @@ pub(super) async fn record_request(
     .bind(entry.target.map(|target| target.org_id))
     .bind(entry.target.map(|target| target.target_type.as_str()))
     .bind(entry.target.and_then(|target| target.target_id.as_deref()))
+    .bind(entry.target.and_then(|target| target.user_id))
     .execute(pool)
     .await?;
 

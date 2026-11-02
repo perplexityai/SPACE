@@ -13,8 +13,11 @@ use crate::user_role::UserRole;
 pub struct ApiKeyAuthContext {
     pub api_key: ApiKey,
     pub org: Organization,
-    /// Resolved actor for the key. `None` if the key has `created_by` set but
-    /// the user no longer exists, or if the org has no users at all.
+    /// The user the key acts as: its `created_by`, which must be a user of the
+    /// key's org, or the org's oldest user when `created_by` is NULL (the
+    /// recorded user was deleted, or the key predates recording one). `None`
+    /// when `created_by` names a user outside the key's org, or the org has no
+    /// users.
     pub actor: Option<User>,
 }
 
@@ -120,10 +123,6 @@ pub(crate) const API_KEY_LAST_USED_GRANULARITY: std::time::Duration =
 /// not scoped to `surface` is indistinguishable from no key at all, which is
 /// the right answer for an auth boundary.
 ///
-/// The key acts as its creator when the creator belongs to the key's
-/// organization. A key with no creator, or one a managing-organization admin
-/// created for another organization, acts as that organization's oldest user.
-///
 /// A successful lookup records the key's use; see [`record_api_key_use`].
 pub async fn get_api_key_org(
     pool: &PgPool,
@@ -169,15 +168,7 @@ pub async fn get_api_key_org(
              SELECT *
              FROM users
              WHERE org_id = k.org_id
-               AND (
-                   id = k.created_by
-                   OR NOT EXISTS (
-                       SELECT 1
-                       FROM users creator
-                       WHERE creator.id = k.created_by
-                         AND creator.org_id = k.org_id
-                   )
-               )
+               AND (k.created_by IS NULL OR id = k.created_by)
              ORDER BY created_at ASC
              LIMIT 1
          ) u ON TRUE
@@ -199,6 +190,10 @@ pub async fn get_api_key_org(
 /// Advance the key's `last_used_at` when it is older than
 /// [`API_KEY_LAST_USED_GRANULARITY`], best effort: a failure is logged and
 /// never fails the request it is recording.
+///
+/// Only lookups through this API record a use. The ECW data-plane route
+/// resolver checks a key's hash on its own and records nothing, so a key used
+/// only for guest traffic keeps its last API use.
 ///
 /// The value the lookup just read decides whether to write at all, so most
 /// requests issue no statement. The `UPDATE` repeats the check against the

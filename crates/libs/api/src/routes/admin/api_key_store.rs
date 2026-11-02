@@ -54,7 +54,7 @@ pub(super) async fn list_for_organization(
                 k.created_at,
                 k.updated_at
            FROM api_keys k
-           LEFT JOIN users u ON u.id = k.created_by
+           LEFT JOIN users u ON u.id = k.created_by AND u.org_id = k.org_id
           WHERE k.org_id = $1
             AND ($2 OR k.revoked_at IS NULL)
           ORDER BY k.created_at DESC, k.id DESC"
@@ -103,7 +103,7 @@ pub(super) async fn create(
                 k.created_at,
                 k.updated_at
            FROM inserted k
-           LEFT JOIN users u ON u.id = k.created_by"
+           LEFT JOIN users u ON u.id = k.created_by AND u.org_id = k.org_id"
     ))
     .bind(input.id)
     .bind(input.org_id)
@@ -130,39 +130,67 @@ pub(super) enum RevokeOutcome {
 /// every lookup by `key_hash`, including those of releases that predate the
 /// column, stops matching the key in the same statement. `revoked_at` is kept
 /// from the first revocation.
+///
+/// One statement, so it composes into the caller's transaction. Its `EXISTS`
+/// reads the snapshot from before the `UPDATE`, which revokes without
+/// removing the row, so a key this statement revokes still counts as found.
 pub(super) async fn revoke(
-    executor: impl PgExecutor<'_> + Copy,
+    executor: impl PgExecutor<'_>,
     org_id: OrgId,
     api_key_id: ApiKeyId,
 ) -> Result<RevokeOutcome, sqlx::Error> {
-    let result = sqlx::query(sql!(
-        "UPDATE api_keys
-            SET revoked_at = NOW(),
-                updated_at = NOW(),
-                key_hash = 'revoked:' || id::text
-          WHERE id = $1
-            AND org_id = $2
-            AND revoked_at IS NULL"
-    ))
-    .bind(api_key_id)
-    .bind(org_id)
-    .execute(executor)
-    .await?;
-    if result.rows_affected() == 1 {
-        return Ok(RevokeOutcome::Revoked);
-    }
-    let exists = sqlx::query_scalar::<_, bool>(sql!(
-        "SELECT EXISTS(SELECT 1 FROM api_keys WHERE id = $1 AND org_id = $2)"
+    let (revoked, found) = sqlx::query_as::<_, (bool, bool)>(sql!(
+        "WITH revoked AS (
+             UPDATE api_keys
+                SET revoked_at = NOW(),
+                    updated_at = NOW(),
+                    key_hash = 'revoked:' || id::text
+              WHERE id = $1
+                AND org_id = $2
+                AND revoked_at IS NULL
+          RETURNING id
+         )
+         SELECT EXISTS(SELECT 1 FROM revoked),
+                EXISTS(SELECT 1 FROM api_keys WHERE id = $1 AND org_id = $2)"
     ))
     .bind(api_key_id)
     .bind(org_id)
     .fetch_one(executor)
     .await?;
-    Ok(if exists {
-        RevokeOutcome::AlreadyRevoked
-    } else {
-        RevokeOutcome::NotFound
+    Ok(match (revoked, found) {
+        (true, _) => RevokeOutcome::Revoked,
+        (false, true) => RevokeOutcome::AlreadyRevoked,
+        (false, false) => RevokeOutcome::NotFound,
     })
+}
+
+/// Whether `user_id` is a user of `org_id`.
+pub(super) async fn user_in_organization(
+    executor: impl PgExecutor<'_>,
+    org_id: OrgId,
+    user_id: UserId,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(sql!(
+        "SELECT EXISTS(SELECT 1 FROM users WHERE id = $1 AND org_id = $2)"
+    ))
+    .bind(user_id)
+    .bind(org_id)
+    .fetch_one(executor)
+    .await
+}
+
+/// The organization's oldest user, ties broken by id; `None` when it has no
+/// users.
+pub(super) async fn oldest_user(
+    executor: impl PgExecutor<'_>,
+    org_id: OrgId,
+) -> Result<Option<UserId>, sqlx::Error> {
+    sqlx::query_scalar::<_, UserId>(sql!(
+        "SELECT id FROM users WHERE org_id = $1 ORDER BY created_at, id LIMIT 1"
+    ))
+    .bind(org_id)
+    .fetch_optional(executor)
+    .await
 }
 
 #[cfg(test)]

@@ -13,9 +13,7 @@ use super::{
     audit::AdminAuditTarget,
     support::{self, ContentionScope, api_error},
 };
-use crate::{
-    api_surface::ApiSurface, auth::hash_token, middleware::auth::AuthUser, routes::AppState,
-};
+use crate::{api_surface::ApiSurface, auth::hash_token, routes::AppState};
 
 const API_KEY_NAME_MAX_CHARS: usize = 128;
 
@@ -24,6 +22,10 @@ const API_KEY_NAME_MAX_CHARS: usize = 128;
 pub(super) struct CreateApiKeyRequest {
     name: String,
     allowed_surfaces: Vec<ApiSurface>,
+    /// The user of the organization the key acts as, recorded as its
+    /// `created_by`. Defaults to the organization's oldest user.
+    #[serde(default)]
+    user_id: Option<UserId>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -40,11 +42,16 @@ pub(super) struct ApiKeyMetadata {
     id: ApiKeyId,
     org_id: OrgId,
     name: String,
+    /// The user the key acts as. A key created through this API records the
+    /// user chosen at creation; the calling admin is recorded in the request's
+    /// audit event.
     created_by: Option<UserId>,
     created_by_email: Option<String>,
     allowed_surfaces: Vec<ApiSurface>,
-    /// When the key last authenticated, to the precision of
+    /// When the key last authenticated through this API, to the precision of
     /// `auth::API_KEY_LAST_USED_GRANULARITY`; `None` if it never has.
+    /// Data-plane uses are not recorded: a key used only for ECW guest traffic
+    /// keeps its last API use.
     #[serde(with = "time::serde::rfc3339::option")]
     last_used_at: Option<OffsetDateTime>,
     /// When the key was revoked; `None` while it is live. A revoked key no
@@ -106,41 +113,46 @@ pub(super) async fn list_api_keys(
     }
 }
 
-/// Create a key for any organization, attributed to the calling admin.
+/// Create a key for any organization.
 ///
-/// The key belongs to `org_id` and calls the APIs in `allowed_surfaces` as
-/// that organization. The request's audit event names the organization and
-/// the new key's id; the secret appears only in this response.
+/// The key belongs to `org_id`, calls the APIs in `allowed_surfaces`, and acts
+/// as the user chosen here: `user_id`, which must be a user of the
+/// organization, or else the organization's oldest user. That user is stored
+/// as the key's `created_by`, the column every release's key lookup reads, so
+/// no release resolves the key to a different user or to none. An
+/// organization with no users answers 409.
+///
+/// The request's audit event names the calling admin, the organization, the
+/// new key and its user; the secret appears only in this response.
 pub(super) async fn create_api_key(
     State(state): State<AppState>,
-    Extension(AuthUser(actor)): Extension<AuthUser>,
     Path(org_id): Path<OrgId>,
     Json(request): Json<CreateApiKeyRequest>,
 ) -> Response {
-    let audit_target = Extension(AdminAuditTarget::api_key(org_id, None));
+    match api_key_store::organization_exists(&state.pool, org_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return api_error(StatusCode::NOT_FOUND, "Organization not found").into_response();
+        }
+        Err(error) => return read_error(error),
+    }
+    let org_target = Extension(AdminAuditTarget::api_key(org_id, None, None));
     let name = match api_key_name(&request.name) {
         Ok(name) => name,
         Err(message) => {
-            return (audit_target, api_error(StatusCode::BAD_REQUEST, message)).into_response();
+            return (org_target, api_error(StatusCode::BAD_REQUEST, message)).into_response();
         }
     };
     let allowed_surfaces = match allowed_surfaces(request.allowed_surfaces) {
         Ok(surfaces) => surfaces,
         Err(message) => {
-            return (audit_target, api_error(StatusCode::BAD_REQUEST, message)).into_response();
+            return (org_target, api_error(StatusCode::BAD_REQUEST, message)).into_response();
         }
     };
-    match api_key_store::organization_exists(&state.pool, org_id).await {
-        Ok(true) => {}
-        Ok(false) => {
-            return (
-                audit_target,
-                api_error(StatusCode::NOT_FOUND, "Organization not found"),
-            )
-                .into_response();
-        }
-        Err(error) => return (audit_target, read_error(error)).into_response(),
-    }
+    let user_id = match key_user(&state, org_id, request.user_id).await {
+        Ok(user_id) => user_id,
+        Err(refusal) => return (org_target, refusal.into_response()).into_response(),
+    };
     let secret = generate_api_key();
     let key_hash = hash_token(&secret);
     let api_key_id = ApiKeyId::new();
@@ -149,42 +161,100 @@ pub(super) async fn create_api_key(
         org_id,
         name,
         key_hash: &key_hash,
-        created_by: actor.id,
+        created_by: user_id,
         allowed_surfaces: &allowed_surfaces,
     };
     match api_key_store::create(&state.pool, input).await {
         Ok(row) => (
             StatusCode::CREATED,
             [(header::CACHE_CONTROL, "no-store")],
-            Extension(AdminAuditTarget::api_key(org_id, Some(api_key_id))),
+            Extension(AdminAuditTarget::api_key(
+                org_id,
+                Some(api_key_id),
+                Some(user_id),
+            )),
             Json(CreatedApiKey {
                 api_key: row.into(),
                 secret,
             }),
         )
             .into_response(),
-        Err(error) => (audit_target, support::db_error(error)).into_response(),
+        Err(error) => (
+            Extension(AdminAuditTarget::api_key(org_id, None, Some(user_id))),
+            support::db_error(error),
+        )
+            .into_response(),
+    }
+}
+
+/// Why no user could be chosen for a new key.
+enum KeyUserRefusal {
+    NotInOrganization,
+    NoUsers,
+    Read(sqlx::Error),
+}
+
+impl KeyUserRefusal {
+    fn into_response(self) -> Response {
+        match self {
+            Self::NotInOrganization => api_error(
+                StatusCode::BAD_REQUEST,
+                "user_id must name a user of the organization",
+            )
+            .into_response(),
+            Self::NoUsers => api_error(
+                StatusCode::CONFLICT,
+                "The organization has no users for the key to act as; create a user first",
+            )
+            .into_response(),
+            Self::Read(error) => read_error(error),
+        }
+    }
+}
+
+/// The user a new key of `org_id` acts as.
+async fn key_user(
+    state: &AppState,
+    org_id: OrgId,
+    requested: Option<UserId>,
+) -> Result<UserId, KeyUserRefusal> {
+    match requested {
+        Some(user_id) => {
+            match api_key_store::user_in_organization(&state.pool, org_id, user_id).await {
+                Ok(true) => Ok(user_id),
+                Ok(false) => Err(KeyUserRefusal::NotInOrganization),
+                Err(error) => Err(KeyUserRefusal::Read(error)),
+            }
+        }
+        None => match api_key_store::oldest_user(&state.pool, org_id).await {
+            Ok(Some(user_id)) => Ok(user_id),
+            Ok(None) => Err(KeyUserRefusal::NoUsers),
+            Err(error) => Err(KeyUserRefusal::Read(error)),
+        },
     }
 }
 
 /// Revoke a key. It stops authenticating at once and lists, with
-/// `revoked_at`, under `include_revoked`. Revoking a revoked key succeeds and keeps its
-/// first revocation time.
+/// `revoked_at`, under `include_revoked`. Revoking a revoked key succeeds and
+/// keeps its first revocation time.
+///
+/// The audit event names the key and its organization only when the key is
+/// one of the path's organization's.
 pub(super) async fn delete_api_key(
     State(state): State<AppState>,
     Path((org_id, api_key_id)): Path<(OrgId, ApiKeyId)>,
 ) -> Response {
-    let audit_target = Extension(AdminAuditTarget::api_key(org_id, Some(api_key_id)));
-    let response = match api_key_store::revoke(&state.pool, org_id, api_key_id).await {
-        Ok(RevokeOutcome::Revoked | RevokeOutcome::AlreadyRevoked) => {
-            StatusCode::NO_CONTENT.into_response()
-        }
+    match api_key_store::revoke(&state.pool, org_id, api_key_id).await {
+        Ok(RevokeOutcome::Revoked | RevokeOutcome::AlreadyRevoked) => (
+            StatusCode::NO_CONTENT,
+            Extension(AdminAuditTarget::api_key(org_id, Some(api_key_id), None)),
+        )
+            .into_response(),
         Ok(RevokeOutcome::NotFound) => {
             api_error(StatusCode::NOT_FOUND, "API key not found").into_response()
         }
         Err(error) => support::db_error(error).into_response(),
-    };
-    (audit_target, response).into_response()
+    }
 }
 
 fn api_key_name(raw: &str) -> Result<&str, &'static str> {

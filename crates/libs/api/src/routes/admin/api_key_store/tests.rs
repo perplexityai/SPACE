@@ -73,6 +73,20 @@ async fn create_list_and_org_scoped_revoke_preserve_key_metadata() -> TestResult
         RevokeOutcome::NotFound,
         "an organization cannot revoke another organization's key"
     );
+    // Revocation composes into the caller's transaction: rolled back, the key
+    // is still live.
+    let mut tx = db.pool.begin().await?;
+    assert_eq!(
+        revoke(&mut *tx, org_id, key_id).await?,
+        RevokeOutcome::Revoked
+    );
+    tx.rollback().await?;
+    assert!(
+        crate::auth::get_api_key_org(&db.pool, raw_key, ApiSurface::Native)
+            .await?
+            .is_some(),
+        "a rolled-back revocation leaves the key live"
+    );
     assert_eq!(
         revoke(&db.pool, org_id, key_id).await?,
         RevokeOutcome::Revoked

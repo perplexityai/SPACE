@@ -1,4 +1,4 @@
-//! What a successful API key lookup records and whom the key acts as.
+//! What a successful API key lookup records.
 
 use pplx_space_common_core::{
     sql,
@@ -43,21 +43,6 @@ async fn last_used_at(pool: &PgPool, id: Uuid) -> TestResult<Option<OffsetDateTi
             .fetch_one(pool)
             .await?,
     )
-}
-
-async fn insert_user(pool: &PgPool, org_id: OrgId, created_at: &str) -> TestResult<UserId> {
-    let id = UserId::new();
-    sqlx::query(sql!(
-        "INSERT INTO users (id, email, password_hash, display_name, org_id, role, created_at)
-         VALUES ($1, $2, '!', 'api key use test', $3, 'member', $4::timestamptz)"
-    ))
-    .bind(id)
-    .bind(format!("{id}@example.invalid"))
-    .bind(org_id)
-    .bind(created_at)
-    .execute(pool)
-    .await?;
-    Ok(id)
 }
 
 #[tokio::test]
@@ -107,39 +92,5 @@ async fn a_use_records_last_used_at_once_per_window() -> TestResult {
             .await?
             .is_none()
     );
-    Ok(())
-}
-
-#[tokio::test]
-async fn a_key_acts_as_its_creator_only_inside_the_keys_organization() -> TestResult {
-    let db = pg_test_db().await?;
-    let pool = &db.pool;
-    let operator_org = OrgId::from_uuid(Uuid::parse_str(SEED_ORG_ID)?);
-    let operator = insert_user(pool, operator_org, "2026-01-01T00:00:00Z").await?;
-    let tenant_org = OrgId::new();
-    sqlx::query(sql!(
-        "INSERT INTO organizations (id, name, slug) VALUES ($1, 'Tenant', $2)"
-    ))
-    .bind(tenant_org)
-    .bind(format!("tenant-{tenant_org}"))
-    .execute(pool)
-    .await?;
-    let oldest = insert_user(pool, tenant_org, "2026-01-01T00:00:00Z").await?;
-    let newer = insert_user(pool, tenant_org, "2026-02-01T00:00:00Z").await?;
-
-    for (raw_key, created_by, expected_actor) in [
-        ("key_tenant_creator", Some(newer), newer),
-        ("key_operator_creator", Some(operator), oldest),
-        ("key_no_creator", None, oldest),
-    ] {
-        seed_key(pool, tenant_org, created_by, raw_key).await?;
-        let context = get_api_key_org(pool, raw_key, ApiSurface::Native)
-            .await?
-            .expect("key resolves");
-        assert_eq!(context.org.id, tenant_org, "{raw_key} keeps its org");
-        let actor = context.actor.expect("key resolves an actor");
-        assert_eq!(actor.id, expected_actor, "{raw_key} actor");
-        assert_eq!(actor.org_id, tenant_org, "{raw_key} actor org");
-    }
     Ok(())
 }

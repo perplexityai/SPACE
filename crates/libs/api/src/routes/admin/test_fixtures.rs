@@ -30,12 +30,20 @@ pub(super) struct AdminRouterHarness {
     pub(super) tenant_org: pplx_space_common_core::types::OrgId,
     pub(super) tenant_admin: pplx_space_common_core::types::UserId,
     pub(super) tenant_admin_token: String,
+    pub(super) state: crate::routes::AppState,
 }
 
 /// The managing organization the migrations seed.
 const MANAGING_ORG: uuid::Uuid = uuid::Uuid::from_u128(0x1);
 
 pub(super) async fn admin_router_harness() -> TestResult<Option<AdminRouterHarness>> {
+    admin_router_harness_with(|_| {}).await
+}
+
+/// [`admin_router_harness`] with `configure` applied to the router's state.
+pub(super) async fn admin_router_harness_with(
+    configure: impl FnOnce(&mut crate::routes::AppState),
+) -> TestResult<Option<AdminRouterHarness>> {
     use pplx_space_common_core::{
         sql,
         types::{OrgId, UserId},
@@ -82,8 +90,9 @@ pub(super) async fn admin_router_harness() -> TestResult<Option<AdminRouterHarne
             .bind(operator_id)
             .fetch_one(&db.pool)
             .await?;
-    let state = crate::routes::AppState::from_pool(db.pool.clone()).await?;
-    let app = super::shared_host_router(state.clone()).with_state(state);
+    let mut state = crate::routes::AppState::from_pool(db.pool.clone()).await?;
+    configure(&mut state);
+    let app = super::shared_host_router(state.clone()).with_state(state.clone());
     Ok(Some(AdminRouterHarness {
         db,
         app,
@@ -92,6 +101,7 @@ pub(super) async fn admin_router_harness() -> TestResult<Option<AdminRouterHarne
         tenant_org,
         tenant_admin,
         tenant_admin_token,
+        state,
     }))
 }
 
