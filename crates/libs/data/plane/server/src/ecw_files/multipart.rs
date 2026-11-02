@@ -29,8 +29,8 @@ use super::{
 pub(super) const E2B_MULTIPART_PARSE_BUFFER_LIMIT_BYTES: usize = 64 * 1024;
 /// The CRLF that ends each part's data before the next boundary.
 pub(super) const MULTIPART_PART_DATA_TERMINATOR_BYTES: usize = 2;
-/// Parts per request, `file` or not. Each `file` part is staged in its own
-/// spool file before any is written. The cap also bounds how far
+/// Parts per request, `file` or not. Every `file` part is staged in the
+/// request's spool file before any is written. The cap also bounds how far
 /// `multipart_part_framing_lower_bound`'s undercount accumulates for typical
 /// clients: two headers per part at two bytes each is 4,000 bytes over 1000
 /// parts, well under the parse-buffer cap.

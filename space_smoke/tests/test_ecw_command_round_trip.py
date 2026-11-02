@@ -1568,6 +1568,15 @@ class EcwCommandRoundTripTests(unittest.TestCase):
             ) -> None:
                 seen["write"] = (path, data, user, request_timeout)
 
+            def write_files(
+                self,
+                files: list[dict[str, object]],
+                *,
+                use_octet_stream: bool,
+                request_timeout: float,
+            ) -> None:
+                seen["write_files"] = (files, use_octet_stream, request_timeout)
+
             def read(
                 self,
                 path: str,
@@ -1719,6 +1728,10 @@ class EcwCommandRoundTripTests(unittest.TestCase):
                 user="user",
                 request_timeout=8,
             )
+            sandbox.files.write_files(
+                [("/tmp/root/a", b"a"), ("/tmp/root/b", b"b")],
+                request_timeout=8.5,
+            )
             text = sandbox.files.read("/tmp/root/file", user="user", request_timeout=9)
             binary = sandbox.files.read_bytes(
                 "/tmp/root/binary", user="root", request_timeout=10
@@ -1777,6 +1790,17 @@ class EcwCommandRoundTripTests(unittest.TestCase):
         self.assertEqual(
             seen["write"],
             ("/tmp/root/file", streamed, "user", 8),
+        )
+        self.assertEqual(
+            seen["write_files"],
+            (
+                [
+                    {"path": "/tmp/root/a", "data": b"a"},
+                    {"path": "/tmp/root/b", "data": b"b"},
+                ],
+                False,
+                8.5,
+            ),
         )
         self.assertEqual(
             reads,

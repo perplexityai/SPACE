@@ -7902,6 +7902,23 @@ class _SdkFilesystem:
             )
         )
 
+    def write_files(
+        self,
+        files: Sequence[tuple[str, bytes]],
+        *,
+        request_timeout: float = 60,
+    ) -> None:
+        # Without octet-stream uploads, the SDK sends more than one entry as
+        # one multipart request, each entry a `file` part named by its path.
+        entries = [{"path": path, "data": data} for path, data in files]
+        _sdk_data_plane_call(
+            lambda: self._sandbox._data_plane_sdk().files.write_files(
+                entries,
+                use_octet_stream=False,
+                request_timeout=request_timeout,
+            )
+        )
+
     def read(
         self,
         path: str,

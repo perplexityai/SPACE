@@ -117,6 +117,7 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "ecw.immediate_egress",
                 "ecw.internet_access_allowed",
                 "ecw.internet_access_denied",
+                "ecw.large_multipart_upload_round_trip",
                 "ecw.large_stdout_integrity",
                 "ecw.loopback_route_stays_open",
                 "ecw.pause_connect",

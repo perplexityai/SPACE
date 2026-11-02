@@ -334,6 +334,15 @@ class EcwFilesystem(Protocol):
         request_timeout: float = 60,
     ) -> None: ...
 
+    def write_files(
+        self,
+        files: Sequence[tuple[str, bytes]],
+        *,
+        request_timeout: float = 60,
+    ) -> None:
+        """Write every `(path, data)` pair in one multipart `POST /files`."""
+        ...
+
     def read(
         self,
         path: str,
