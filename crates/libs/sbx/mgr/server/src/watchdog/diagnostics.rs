@@ -69,6 +69,11 @@ const SMALL_FILE_MAX_BYTES: u64 = 16 * 1024;
 /// caps how many such threads collectors can strand.
 const HOST_READS_IN_FLIGHT: usize = admission::EVIDENCE_COLLECTORS;
 const GUEST_CONSOLE_LOG_FILE: &str = "guest-console.log";
+/// Where sandbox-manager sees the node's sandbox cgroup parent,
+/// `/sys/fs/cgroup/space`. Its container has its own cgroup namespace, so its
+/// `/sys/fs/cgroup` is only the container's cgroup; the sandbox-manager chart
+/// mounts the parent here read-only.
+const SANDBOX_CGROUP_PARENT: &str = "/space/cgroup";
 const MIB: u64 = 1024 * 1024;
 
 /// Correlates a transition line with its evidence line.
@@ -474,9 +479,14 @@ pub(super) struct EvidencePaths {
 }
 
 impl EvidencePaths {
-    fn for_sandbox(sandbox_id: &str) -> Self {
+    /// `cgroup_parent` is where this process sees the node's sandbox cgroup
+    /// parent.
+    fn for_sandbox(cgroup_parent: &Path, sandbox_id: &str) -> Self {
         Self {
-            cgroup: pplx_space_node_runtime_core::cgroup_paths::jailer_cgroup_path(sandbox_id),
+            cgroup: pplx_space_node_runtime_core::cgroup_paths::jailer_cgroup_path_in(
+                cgroup_parent,
+                sandbox_id,
+            ),
             // The launch configures Firecracker's own log inside the jail.
             firecracker_log: paths::jail_root(sandbox_id).join(paths::FIRECRACKER_LOG_FILE),
             // Created only when `SPACE_ENABLE_GUEST_CONSOLE_LOGS` is set, as
@@ -844,7 +854,8 @@ pub(super) async fn run_evidence_collector(
             .await
             .get(&request.sandbox_id)
             .map(EvidenceTarget::of);
-        let paths = EvidencePaths::for_sandbox(&request.sandbox_id);
+        let paths =
+            EvidencePaths::for_sandbox(Path::new(SANDBOX_CGROUP_PARENT), &request.sandbox_id);
         let evidence = tokio::select! {
             biased;
             _ = shutdown_token.cancelled() => return,
