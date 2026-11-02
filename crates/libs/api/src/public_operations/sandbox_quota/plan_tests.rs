@@ -21,10 +21,8 @@
 //! [`the_count_reads_only_the_orgs_rows_and_in_flight_operations`]
 //! bounds the rows every plan node handles, under both plan modes, by a few
 //! passes over those inputs, and [`seed`] sizes the fixture so each of the
-//! four costs above exceeds that bound on its own. Like the plan tests in
-//! `routes::admin::node_store`, it reads rows off the plan rather than
-//! naming an index or timing the statement: which linear plan the planner
-//! takes is its business.
+//! four costs above exceeds that bound on its own. It reads rows off the
+//! plan through [`super::super::plan_explain`].
 
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{OrgId, UserId};
@@ -32,6 +30,7 @@ use pplx_space_db_test_fixtures::try_pg_test_db;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 
+use super::super::plan_explain::{PLAN_CACHE_MODES, PlanNode, explain_prepared};
 use super::SANDBOXES_HELD;
 
 /// How many plan nodes may handle each input row. The count's linear plans
@@ -68,85 +67,6 @@ struct Fixture {
     org_in_flight: u64,
     /// Every `queued` or `running` operation in the cluster.
     cluster_in_flight: u64,
-}
-
-/// One `EXPLAIN (ANALYZE, FORMAT JSON)` statement's result.
-#[derive(Debug, serde::Deserialize)]
-struct Explained {
-    #[serde(rename = "Plan")]
-    plan: PlanNode,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct PlanNode {
-    #[serde(rename = "Node Type")]
-    node_type: String,
-    #[serde(rename = "Join Type", default)]
-    join_type: Option<String>,
-    #[serde(rename = "Relation Name", default)]
-    relation: Option<String>,
-    #[serde(rename = "Index Name", default)]
-    index: Option<String>,
-    #[serde(rename = "Actual Rows", default)]
-    rows: f64,
-    #[serde(rename = "Rows Removed by Filter", default)]
-    removed_by_filter: f64,
-    #[serde(rename = "Rows Removed by Join Filter", default)]
-    removed_by_join_filter: f64,
-    #[serde(rename = "Rows Removed by Index Recheck", default)]
-    removed_by_recheck: f64,
-    #[serde(rename = "Actual Loops", default)]
-    loops: f64,
-    #[serde(rename = "Plans", default)]
-    children: Vec<PlanNode>,
-}
-
-impl PlanNode {
-    /// The rows every node in the plan emitted or discarded, times its
-    /// loops: `EXPLAIN` reports both per loop. A join that compares every
-    /// pair of its inputs discards the unmatched pairs by its join filter,
-    /// so they count here too.
-    fn rows_handled(&self) -> f64 {
-        let own = (self.rows
-            + self.removed_by_filter
-            + self.removed_by_join_filter
-            + self.removed_by_recheck)
-            * self.loops.max(1.0);
-        own + self
-            .children
-            .iter()
-            .map(PlanNode::rows_handled)
-            .sum::<f64>()
-    }
-
-    /// One line per node, indented by depth: its type and join type, the
-    /// table and index it reads, and the rows it and its children handled,
-    /// so a failure names the node that broke the bound. Only plan
-    /// structure, no fixture values.
-    fn outline(&self, depth: usize, out: &mut String) {
-        use std::fmt::Write as _;
-
-        let _ = write!(
-            out,
-            "\n{:indent$}{}",
-            "",
-            self.node_type,
-            indent = depth * 2
-        );
-        if let Some(join_type) = &self.join_type {
-            let _ = write!(out, " {join_type}");
-        }
-        if let Some(relation) = &self.relation {
-            let _ = write!(out, " on {relation}");
-        }
-        if let Some(index) = &self.index {
-            let _ = write!(out, " using {index}");
-        }
-        let _ = write!(out, ": {} rows", self.rows_handled());
-        for child in &self.children {
-            child.outline(depth + 1, out);
-        }
-    }
 }
 
 /// The count's bound: [`PASSES`] over the org's rows and the org's
@@ -188,11 +108,10 @@ async fn the_count_reads_only_the_orgs_rows_and_in_flight_operations() -> TestRe
         );
     }
 
-    for plan_cache_mode in ["force_custom_plan", "force_generic_plan"] {
-        let plan = explain_prepared(pool, &fixture, plan_cache_mode).await?;
+    for plan_cache_mode in PLAN_CACHE_MODES {
+        let plan = explain_count(pool, &fixture, plan_cache_mode).await?;
         let handled = plan.rows_handled();
-        let mut outline = String::new();
-        plan.outline(1, &mut outline);
+        let outline = plan.outline();
         assert!(
             handled <= bound as f64,
             "the count must handle no more rows than {PASSES} passes over the org's {} rows \
@@ -207,44 +126,21 @@ async fn the_count_reads_only_the_orgs_rows_and_in_flight_operations() -> TestRe
 
 /// `EXPLAIN (ANALYZE, FORMAT JSON)` the count for the fixture's org under a
 /// forced `plan_cache_mode`.
-///
-/// A generic plan exists only for a prepared statement, so this prepares
-/// the count on a connection of its own, forces the mode there, and explains
-/// its `EXECUTE`.
-async fn explain_prepared(
+async fn explain_count(
     pool: &PgPool,
     fixture: &Fixture,
     plan_cache_mode: &str,
 ) -> TestResult<PlanNode> {
-    use sqlx::Connection as _;
-
-    // Detached, so the prepared statement and the forced mode leave with this
-    // connection instead of going back to the pool, however this returns.
-    let mut conn = pool.acquire().await?.detach();
     let prepare = format!("PREPARE held(uuid, uuid, text, text, text) AS {SANDBOXES_HELD}");
-    sqlx::query(sqlx::AssertSqlSafe(sql!(prepare.as_str())))
-        .execute(&mut conn)
-        .await?;
-    let set_mode = format!("SET plan_cache_mode = {plan_cache_mode}");
-    sqlx::query(sqlx::AssertSqlSafe(sql!(set_mode.as_str())))
-        .execute(&mut conn)
-        .await?;
-    // `EXECUTE` takes no bind parameters of its own, so the arguments are
-    // literals here: fixture-generated UUIDs and the crate's own constants.
-    let statement = format!(
-        "EXPLAIN (ANALYZE, TIMING OFF, FORMAT JSON) EXECUTE held('{}', '{}', '{}', '{}', '{}')",
+    let execute = format!(
+        "EXECUTE held('{}', '{}', '{}', '{}', '{}')",
         fixture.org_id,
         fixture.user_id,
         super::ApiProduct::Native.as_str(),
         pplx_space_public_api::OperationKind::CreateSandbox.as_str(),
         pplx_space_public_api::PUBLIC_SANDBOX_ID_PREFIX,
     );
-    let raw: serde_json::Value = sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(statement.as_str())))
-        .fetch_one(&mut conn)
-        .await?;
-    conn.close().await?;
-    let mut explained: Vec<Explained> = serde_json::from_value(raw)?;
-    Ok(explained.pop().ok_or("EXPLAIN returned no plan")?.plan)
+    explain_prepared(pool, &prepare, &execute, plan_cache_mode).await
 }
 
 /// A cluster of [`SMALL_ORGS`] small orgs and the counted org, analyzed so
