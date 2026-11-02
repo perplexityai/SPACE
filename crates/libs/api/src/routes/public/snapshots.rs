@@ -34,9 +34,22 @@ pub async fn list_snapshots(
     Query(query): Query<ListSnapshotsQuery>,
 ) -> Result<Json<PublicPage<PublicSnapshot>>, PublicApiError> {
     let sandbox_id = parse_public_sandbox_id(&sandbox_id)?;
+    snapshot_page(&state.pool, org.id, sandbox_id, &query)
+        .await
+        .map(Json)
+}
+
+/// One page of the snapshots of a sandbox `org_id` owns. Shared with the
+/// admin route, which resolves the owning organization itself.
+pub(crate) async fn snapshot_page(
+    pool: &PgPool,
+    org_id: OrgId,
+    sandbox_id: PublicSandboxId,
+    query: &ListSnapshotsQuery,
+) -> Result<PublicPage<PublicSnapshot>, PublicApiError> {
     let limit = query.limit();
     let cursor = query.cursor_parts()?;
-    let rows = fetch_snapshot_rows(&state.pool, org.id, sandbox_id, cursor, limit)
+    let rows = fetch_snapshot_rows(pool, org_id, sandbox_id, cursor, limit)
         .await
         .map_err(database_error)?;
     let (rows, next_cursor) = snapshot_page_rows(rows, limit)?;
@@ -45,7 +58,7 @@ pub async fn list_snapshots(
         .map(public_snapshot_from_row)
         .collect::<Result<Vec<_>, _>>()?;
 
-    Ok(Json(PublicPage { data, next_cursor }))
+    Ok(PublicPage { data, next_cursor })
 }
 
 pub async fn get_snapshot(

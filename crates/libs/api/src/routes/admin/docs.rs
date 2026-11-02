@@ -6,6 +6,8 @@ use axum::{
 use pplx_space_runtime_environment_policy_store::PolicyChangeReason;
 use serde_json::{Map, Value, json};
 
+mod cross_org;
+
 const ADMIN_LLMS_TXT: &str = "SPACE Admin API\n\n\
 - Admin OpenAPI: /openapi.json on admin.api.space hosts, /admin/api/openapi.json on shared hosts\n\
 - Admin API base path: /v1 on admin.api.space hosts, /admin/api/v1 on shared hosts\n\
@@ -371,6 +373,7 @@ fn admin_openapi_value() -> Value {
     insert_audit_event_paths(paths);
     insert_debug_paths(paths);
     insert_runtime_environment_paths(paths);
+    cross_org::insert_cross_org_paths(paths);
     spec
 }
 

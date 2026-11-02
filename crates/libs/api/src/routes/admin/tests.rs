@@ -98,7 +98,12 @@ fn admin_route_patterns_are_valid() {
                     .route("/users/{user_id}/role", axum::routing::put(h))
                     .route("/sandboxes", get(h))
                     .route("/sandboxes/{spec}", get(h).patch(h).post(h))
-                    .route("/sandboxes/{spec}/commands", axum::routing::post(h)),
+                    .route("/sandboxes/{spec}/commands", axum::routing::post(h))
+                    .route(
+                        "/sandboxes/{spec}/terminal-sessions",
+                        axum::routing::post(h),
+                    )
+                    .route("/sandboxes/{spec}/snapshots", get(h)),
             ),
     );
     let _router: Router = Router::new()
@@ -167,7 +172,12 @@ fn admin_route_patterns_are_valid() {
                 .route("/users/{user_id}/role", axum::routing::put(h))
                 .route("/sandboxes", get(h))
                 .route("/sandboxes/{spec}", get(h).patch(h).post(h))
-                .route("/sandboxes/{spec}/commands", axum::routing::post(h)),
+                .route("/sandboxes/{spec}/commands", axum::routing::post(h))
+                .route(
+                    "/sandboxes/{spec}/terminal-sessions",
+                    axum::routing::post(h),
+                )
+                .route("/sandboxes/{spec}/snapshots", get(h)),
         );
 }
 

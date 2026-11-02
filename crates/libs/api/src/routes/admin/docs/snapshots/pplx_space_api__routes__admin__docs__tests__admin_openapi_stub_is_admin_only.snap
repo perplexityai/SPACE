@@ -119,6 +119,12 @@ expression: paths_by_method
     "get",
     "patch"
   ],
+  "/sandboxes/{sandbox_id}/snapshots": [
+    "get"
+  ],
+  "/sandboxes/{sandbox_id}/terminal-sessions": [
+    "post"
+  ],
   "/sandboxes/{sandbox_id}:force-{action}": [
     "post"
   ],

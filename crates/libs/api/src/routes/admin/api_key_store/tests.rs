@@ -5,7 +5,7 @@ use pplx_space_common_core::types::{OrgId, UserId};
 use crate::routes::admin::test_fixtures::{TestResult, postgres_fixture};
 
 #[tokio::test(flavor = "current_thread")]
-async fn create_list_and_org_scoped_delete_preserve_key_metadata() -> TestResult {
+async fn create_list_and_org_scoped_revoke_preserve_key_metadata() -> TestResult {
     let Some(db) = postgres_fixture().await? else {
         return Ok(());
     };
@@ -59,7 +59,7 @@ async fn create_list_and_org_scoped_delete_preserve_key_metadata() -> TestResult
     .execute(&db.pool)
     .await?;
 
-    let listed = list_for_organization(&db.pool, org_id).await?;
+    let listed = list_for_organization(&db.pool, org_id, false).await?;
     assert!(listed.iter().any(|key| key.id == key_id));
     assert!(
         listed
@@ -68,11 +68,58 @@ async fn create_list_and_org_scoped_delete_preserve_key_metadata() -> TestResult
         "legacy keys without a surviving creator remain visible"
     );
 
-    assert!(
-        !delete(&db.pool, OrgId::new(), key_id).await?,
+    assert_eq!(
+        revoke(&db.pool, OrgId::new(), key_id).await?,
+        RevokeOutcome::NotFound,
         "an organization cannot revoke another organization's key"
     );
-    assert!(delete(&db.pool, org_id, key_id).await?);
-    assert!(!delete(&db.pool, org_id, key_id).await?);
+    assert_eq!(
+        revoke(&db.pool, org_id, key_id).await?,
+        RevokeOutcome::Revoked
+    );
+    for surface in [ApiSurface::Ecw, ApiSurface::Native] {
+        assert!(
+            crate::auth::get_api_key_org(&db.pool, raw_key, surface)
+                .await?
+                .is_none(),
+            "a revoked key must stop authenticating on its {surface} surface"
+        );
+    }
+    assert!(
+        !list_for_organization(&db.pool, org_id, false)
+            .await?
+            .iter()
+            .any(|key| key.id == key_id),
+        "a revoked key is listed only on request"
+    );
+    let revoked = list_for_organization(&db.pool, org_id, true)
+        .await?
+        .into_iter()
+        .find(|key| key.id == key_id)
+        .expect("a revoked key is listed on request");
+    let revoked_at = revoked.revoked_at.expect("a revoked key lists as revoked");
+    assert!(
+        revoked.last_used_at.is_some(),
+        "the key's authentications before revocation are recorded"
+    );
+
+    assert_eq!(
+        revoke(&db.pool, org_id, key_id).await?,
+        RevokeOutcome::AlreadyRevoked
+    );
+    let revoked_again = list_for_organization(&db.pool, org_id, true)
+        .await?
+        .into_iter()
+        .find(|key| key.id == key_id)
+        .expect("a revoked key is listed on request");
+    assert_eq!(
+        revoked_again.revoked_at,
+        Some(revoked_at),
+        "revoking again keeps the first revocation time"
+    );
+    assert_eq!(
+        revoke(&db.pool, org_id, ApiKeyId::new()).await?,
+        RevokeOutcome::NotFound
+    );
     Ok(())
 }

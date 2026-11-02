@@ -301,6 +301,14 @@ pub fn v1_router(state: AppState) -> Router<AppState> {
             "/sandboxes/{spec}/commands",
             axum::routing::post(sandboxes::create_command),
         )
+        .route(
+            "/sandboxes/{spec}/terminal-sessions",
+            axum::routing::post(sandboxes::create_terminal_session),
+        )
+        .route(
+            "/sandboxes/{spec}/snapshots",
+            get(sandboxes::list_snapshots),
+        )
         .merge(debug::admin_v1_debug_router())
         .layer(middleware::from_fn_with_state(state, require_admin_auth))
 }
@@ -416,8 +424,9 @@ async fn require_admin_auth(
     let response = next.run(request).await;
     let status_code = response.status().as_u16();
     let duration_ms = i64::try_from(started_at.elapsed().as_millis()).unwrap_or(i64::MAX);
+    let audit_target = response.extensions().get::<audit::AdminAuditTarget>();
 
-    if admin_request_should_persist_audit_event(&method)
+    if (admin_request_should_persist_audit_event(&method) || audit_target.is_some())
         && let Err(error) = audit::record_request(
             &state.pool,
             audit::AdminAuditRequestEntry {
@@ -426,6 +435,7 @@ async fn require_admin_auth(
                 path: &path,
                 status_code,
                 duration_ms,
+                target: audit_target,
             },
         )
         .await

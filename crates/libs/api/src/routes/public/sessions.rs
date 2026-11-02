@@ -68,6 +68,31 @@ pub async fn create_terminal_session(
     validate_terminal_size(request.size.as_ref())?;
     let sandbox_id = parse_public_sandbox_id(&sandbox_id)?;
     let _sandbox = ensure_sandbox_owner(authorized, &state.pool, org.id, sandbox_id).await?;
+    let session = create_terminal_session_for_sandbox(
+        &state,
+        org.id,
+        actor.id,
+        sandbox_id,
+        request,
+        idempotency_key(&headers)?,
+    )
+    .await?;
+
+    Ok((StatusCode::CREATED, Json(session)))
+}
+
+/// Create a terminal session in a sandbox `org_id` owns, after the caller has
+/// established that it does. Shared with the admin route, which resolves the
+/// owning organization itself; both mint the same session-scoped attach token.
+pub(crate) async fn create_terminal_session_for_sandbox(
+    state: &AppState,
+    org_id: OrgId,
+    actor_user_id: UserId,
+    sandbox_id: PublicSandboxId,
+    request: CreateTerminalSessionRequest,
+    idempotency_key: IdempotencyKey,
+) -> Result<PublicSession, PublicApiError> {
+    validate_terminal_size(request.size.as_ref())?;
     let request_json = serde_json::to_value(&request).map_err(|error| {
         tracing::error!(error = %error, "failed to serialize terminal session request");
         PublicApiError::internal()
@@ -80,11 +105,11 @@ pub async fn create_terminal_session(
         None,
         &request_json,
     );
-    let session = create_session(
-        &state,
+    create_session(
+        state,
         RouteSessionCreate {
-            org_id: org.id,
-            actor_user_id: actor.id,
+            org_id,
+            actor_user_id,
             sandbox_id,
             kind: SessionKind::Terminal,
             target_port: None,
@@ -92,14 +117,12 @@ pub async fn create_terminal_session(
             target_path: None,
             request_json,
             fingerprint_payload,
-            idempotency_key: idempotency_key(&headers)?,
+            idempotency_key,
             path_template: OperationPathTemplate::new(TERMINAL_SESSION_PATH_TEMPLATE),
         },
         || Ok(()),
     )
-    .await?;
-
-    Ok((StatusCode::CREATED, Json(session)))
+    .await
 }
 
 pub async fn create_process_session(

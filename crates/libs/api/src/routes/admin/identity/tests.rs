@@ -929,3 +929,116 @@ async fn an_email_in_use_answers_conflict_on_create_and_update() -> pplx_space_t
     );
     Ok(())
 }
+
+#[test]
+fn branding_accepts_hex_colors_and_https_logos_only() {
+    for (value, valid) in [
+        ("#abc", true),
+        ("#A1b2C3", true),
+        ("abc", false),
+        ("#abcd", false),
+        ("#ggg", false),
+        ("", false),
+        ("red", false),
+    ] {
+        assert_eq!(is_hex_color(value), valid, "color {value:?}");
+    }
+    for (value, valid) in [
+        ("https://cdn.example.com/logo.png", true),
+        ("https://example.com:8443/a/b.svg?v=1", true),
+        ("http://localhost:3000/logo.png", true),
+        ("http://127.0.0.1/logo.png", true),
+        ("http://[::1]/logo.png", true),
+        ("http://example.com/logo.png", false),
+        ("https://user:secret@example.com/logo.png", false),
+        ("//example.com/logo.png", false),
+        ("/logo.png", false),
+        ("javascript:alert(1)", false),
+        ("data:image/png;base64,AAAA", false),
+        ("https://", false),
+        ("", false),
+    ] {
+        assert_eq!(is_logo_url(value), valid, "logo {value:?}");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn org_branding_updates_answer_a_field_error_for_invalid_values()
+-> pplx_space_test_env::TestResult {
+    use axum::http::Method;
+    use serde_json::json;
+
+    let Some(harness) = crate::routes::admin::test_fixtures::admin_router_harness().await? else {
+        return Ok(());
+    };
+    let path = format!("/orgs/{}", harness.tenant_org);
+    harness
+        .assert_refused_to_non_operators(
+            Method::PATCH,
+            &path,
+            Some(json!({"theme_primary": "#fff"})),
+        )
+        .await;
+
+    for (body, field) in [
+        (json!({"theme_primary": "blue"}), "theme_primary"),
+        (json!({"theme_secondary": "#12345"}), "theme_secondary"),
+        (
+            json!({"logo_url": "http://example.com/logo.png"}),
+            "logo_url",
+        ),
+        (
+            json!({"theme_primary": "#fff", "logo_url": "ftp://example.com/x"}),
+            "logo_url",
+        ),
+    ] {
+        let (status, error) = harness
+            .as_operator(Method::PATCH, &path, &[], Some(body))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        assert_eq!(error["field"], field, "{error}");
+    }
+    let (_, unchanged) = harness.as_operator(Method::GET, &path, &[], None).await;
+    assert_eq!(
+        unchanged["theme_primary"],
+        serde_json::Value::Null,
+        "a refused patch writes nothing"
+    );
+
+    let (status, org) = harness
+        .as_operator(
+            Method::PATCH,
+            &path,
+            &[],
+            Some(json!({
+                "theme_primary": "#0a7",
+                "theme_secondary": "#00AA77",
+                "logo_url": "https://cdn.example.com/logo.png"
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{org}");
+    assert_eq!(org["theme_primary"], "#0a7");
+    assert_eq!(org["logo_url"], "https://cdn.example.com/logo.png");
+    let (status, org) = harness
+        .as_operator(Method::PATCH, &path, &[], Some(json!({"logo_url": null})))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{org}");
+    assert_eq!(
+        org["logo_url"],
+        serde_json::Value::Null,
+        "null still clears"
+    );
+
+    let (status, error) = harness
+        .as_operator(
+            Method::POST,
+            "/orgs",
+            &[],
+            Some(json!({"name": "Branded", "slug": "branded", "theme_primary": "nope"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+    assert_eq!(error["field"], "theme_primary");
+    Ok(())
+}

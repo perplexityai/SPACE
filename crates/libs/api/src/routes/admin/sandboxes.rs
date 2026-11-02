@@ -4,6 +4,7 @@ use std::str::FromStr;
 
 use axum::{
     Extension, Json,
+    body::Bytes,
     extract::{FromRequest, Path, Request, State, rejection::JsonRejection},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
@@ -15,13 +16,13 @@ use pplx_space_common_core::types::{IdempotencyKey, NodePoolName, OrgId, Sandbox
 use pplx_space_public_api::{
     CreateCommandRequest, CreateSandboxRequest as PublicCreateSandboxRequest, OperationId,
     OperationKind, OperationTargetType, PublicCommand, PublicSandboxId, RequestFingerprint,
-    SandboxLifecycleAction, SandboxOperationResponse,
+    RollbackSandboxRequest, SandboxLifecycleAction, SandboxOperationResponse,
     UpdateSandboxRequest as PublicUpdateSandboxRequest,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use super::audit::{self, AdminSandboxAuditEntry};
+use super::audit::{self, AdminAuditTarget, AdminSandboxAuditEntry};
 use super::sandbox_id::{AdminSandboxIdError, parse_admin_sandbox_id};
 use crate::middleware::auth::AuthUser;
 use crate::models::{Sandbox, SandboxResponse, User};
@@ -41,6 +42,9 @@ use crate::routes::public::error::PublicApiError;
 use crate::routes::public::sessions::{
     create_command_session, idempotency_key as session_idempotency_key,
 };
+
+mod guest_access;
+pub use guest_access::{create_terminal_session, list_snapshots};
 
 const ADMIN_SANDBOX_ACTION_PREFIX: &str = "force-";
 /// Distinct from the public `/v1/sandboxes` template so admin and public
@@ -386,11 +390,16 @@ fn admin_create_fingerprint(
     })
 }
 
+/// Enqueue a lifecycle operation on any organization's sandbox, under the
+/// sandbox's owning organization. `:force-rollback` takes the public
+/// `:rollback` body, `{"snapshot_name", "auto_restart"?}`; every other action
+/// ignores the body.
 pub async fn dispatch_sandbox_action(
     State(state): State<AppState>,
     Extension(AuthUser(actor)): Extension<AuthUser>,
     headers: HeaderMap,
     Path(spec): Path<String>,
+    body: Bytes,
 ) -> axum::response::Response {
     if let Err(err) = require_managing_org_admin(&state.pool, &actor).await {
         return err.into_response();
@@ -398,6 +407,13 @@ pub async fn dispatch_sandbox_action(
     let (target, action) = match parse_spec(&spec) {
         Ok(value) => value,
         Err(err) => return err.into_response(),
+    };
+    let rollback = match rollback_request(action, &body) {
+        Ok(rollback) => rollback,
+        Err(err) => {
+            audit_failure(&actor, target, action, None, err.message.as_str());
+            return err.into_response();
+        }
     };
     let idempotency_key = match idempotency_key(&headers) {
         Ok(value) => value,
@@ -432,17 +448,23 @@ pub async fn dispatch_sandbox_action(
         .as_ref()
         .map(|sandbox| sandbox.org_id)
         .unwrap_or_else(|| actor.org_id);
+    // Only a sandbox that exists names its organization; a delete of one
+    // already gone is recorded by its path alone.
+    let audit_target = sandbox
+        .as_ref()
+        .map(|sandbox| Extension(AdminAuditTarget::sandbox(sandbox.org_id, target.public_id)));
     let actor_user_id = actor.id;
-    match enqueue_admin_lifecycle_operation(
+    let result = enqueue_admin_lifecycle_operation(
         &state.pool,
         operation_org_id,
         actor_user_id,
         target,
         action,
+        rollback,
         &idempotency_key,
     )
-    .await
-    {
+    .await;
+    let response = match result {
         Ok(response) => {
             audit::record_sandbox(AdminSandboxAuditEntry {
                 actor: &actor,
@@ -467,7 +489,8 @@ pub async fn dispatch_sandbox_action(
             });
             err.into_response()
         }
-    }
+    };
+    (audit_target, response).into_response()
 }
 
 /// Run a one-shot command in a sandbox from the operator surface.
@@ -485,7 +508,7 @@ pub async fn create_command(
     headers: HeaderMap,
     Path(spec): Path<String>,
     Json(request): Json<CreateCommandRequest>,
-) -> Result<(StatusCode, Json<PublicCommand>), PublicApiError> {
+) -> Result<(StatusCode, Extension<AdminAuditTarget>, Json<PublicCommand>), PublicApiError> {
     let target = AdminSandboxTarget::parse(&spec)
         .map_err(|error| PublicApiError::bad_request(error.to_string()))?;
     let sandbox = fetch_admin_sandbox(&state.pool, target)
@@ -511,7 +534,11 @@ pub async fn create_command(
     )
     .await?;
 
-    Ok((StatusCode::CREATED, Json(command)))
+    Ok((
+        StatusCode::CREATED,
+        Extension(AdminAuditTarget::sandbox(sandbox.org_id, target.public_id)),
+        Json(command),
+    ))
 }
 
 /// Update a sandbox (network policy, auto-lifecycle, metadata) from the
@@ -725,14 +752,15 @@ async fn enqueue_admin_lifecycle_operation(
     actor_user_id: UserId,
     target: AdminSandboxTarget,
     action: SandboxLifecycleAction,
+    rollback: Option<RollbackSandboxRequest>,
     idempotency_key: &IdempotencyKey,
 ) -> Result<SandboxOperationResponse, AdminSandboxActionError> {
     let sandbox_id_string = target.public_id.to_string();
-    let fingerprint = lifecycle_request_fingerprint(target, action)?;
+    let fingerprint = lifecycle_request_fingerprint(target, action, rollback.as_ref())?;
     let payload_json = SandboxLifecycleOperationPayload {
         sandbox_id: target.public_id,
         action,
-        rollback: None,
+        rollback,
         wake_activity: None,
     }
     .into_json();
@@ -895,13 +923,22 @@ fn idempotency_key(headers: &HeaderMap) -> Result<IdempotencyKey, AdminSandboxAc
 fn lifecycle_request_fingerprint(
     target: AdminSandboxTarget,
     action: SandboxLifecycleAction,
+    rollback: Option<&RollbackSandboxRequest>,
 ) -> Result<RequestFingerprint, AdminSandboxActionError> {
-    let bytes = serde_json::to_vec(&serde_json::json!({
-        "sandbox_id": target.public_id.to_string(),
-        "action": action.as_str(),
-        "admin": true,
-    }))
-    .map_err(|error| {
+    let mut fingerprint = serde_json::Map::new();
+    fingerprint.insert(
+        "sandbox_id".to_string(),
+        target.public_id.to_string().into(),
+    );
+    fingerprint.insert("action".to_string(), action.as_str().into());
+    fingerprint.insert("admin".to_string(), true.into());
+    // Only a rollback carries a body, so every other action keeps the
+    // fingerprint it had before rollbacks did, and a replay across releases
+    // still matches.
+    if let Some(rollback) = rollback {
+        fingerprint.insert("rollback".to_string(), serde_json::json!(rollback));
+    }
+    let bytes = serde_json::to_vec(&fingerprint).map_err(|error| {
         tracing::error!(%error, "failed to serialize admin lifecycle request fingerprint");
         AdminSandboxActionError::new(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
     })?;
@@ -910,6 +947,31 @@ fn lifecycle_request_fingerprint(
         tracing::error!(%error, "failed to build admin request fingerprint");
         AdminSandboxActionError::new(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
     })
+}
+
+/// The `:force-rollback` body, parsed as the public `:rollback` parses it;
+/// `None` for every other action, whose body is ignored.
+fn rollback_request(
+    action: SandboxLifecycleAction,
+    body: &[u8],
+) -> Result<Option<RollbackSandboxRequest>, AdminSandboxActionError> {
+    if action != SandboxLifecycleAction::Rollback {
+        return Ok(None);
+    }
+    if body.is_empty() {
+        return Err(AdminSandboxActionError::new(
+            StatusCode::BAD_REQUEST,
+            "rollback requires snapshot_name",
+        ));
+    }
+    serde_json::from_slice::<RollbackSandboxRequest>(body)
+        .map(Some)
+        .map_err(|error| {
+            AdminSandboxActionError::new(
+                StatusCode::BAD_REQUEST,
+                format!("invalid rollback request: {error}"),
+            )
+        })
 }
 
 fn admin_action_label(action: SandboxLifecycleAction) -> &'static str {
