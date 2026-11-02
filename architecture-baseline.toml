@@ -9,7 +9,7 @@
 # that adds an entry or raises a cap is reported.
 
 [file_size]
-"crates/libs/api/src/controllers/sandbox/lifecycle.rs" = 1815
+"crates/libs/api/src/controllers/sandbox/lifecycle.rs" = 1793
 "crates/libs/api/src/controllers/sandbox/mod.rs" = 1086
 "crates/libs/api/src/controllers/sandbox/queries.rs" = 2571
 "crates/libs/api/src/controllers/sandbox/spaced.rs" = 1107
@@ -149,7 +149,7 @@
 # and their calls to sandbox-portability's assignment renderers. They move into
 # the store; lower each cap as they go.
 [pattern_ratchet.sandbox_writes]
-"crates/libs/api/src/controllers/sandbox/lifecycle.rs" = 4
+"crates/libs/api/src/controllers/sandbox/lifecycle.rs" = 1
 "crates/libs/api/src/controllers/sandbox/queries.rs" = 4
 "crates/libs/api/src/controllers/sandbox/responses.rs" = 3
 "crates/libs/api/src/controllers/sandbox/updates.rs" = 4
