@@ -2775,7 +2775,7 @@ async fn a_response_reservation_answers_replays_without_repeating_work() -> Test
     ));
 
     // A reservation whose work may have happened keeps the key for good,
-    // and its replays carry what it noted.
+    // and its replays report the outcome unknown at once, with what it noted.
     sqlx::query(sql!(
         "DELETE FROM public_idempotency_records WHERE org_id = $1"
     ))
@@ -2787,11 +2787,11 @@ async fn a_response_reservation_answers_replays_without_repeating_work() -> Test
     };
     let known = serde_json::json!({ "job_id": "synthetic-job" });
     assert!(store.note_unresolved_response(third, known.clone()).await?);
-    let ResponseReservation::InProgress {
+    let ResponseReservation::OutcomeUnknown {
         known: replayed, ..
     } = reserve(&same).await?
     else {
-        panic!("a noted reservation stays in progress");
+        panic!("a noted reservation has an unknown outcome at once");
     };
     assert_eq!(replayed, Some(known));
     assert!(!store.release_response_reservation(third).await?);

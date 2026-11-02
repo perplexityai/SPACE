@@ -11,16 +11,18 @@ use super::*;
 /// survives all three, and its replays never repeat the work:
 ///
 /// - a completed record answers with the recorded response;
-/// - a pending one younger than the reservation lifetime is still in flight;
-/// - a pending one older than that has an unknown outcome, which only the
-///   operator can settle, until the record itself expires. The work may still
-///   be running: the lifetime is the caller's estimate of how long the work
-///   takes, not a bound on it.
+/// - a pending one younger than the reservation lifetime may still be in
+///   flight;
+/// - a pending one older than that, or one its request noted as unresolved,
+///   has an unknown outcome, which only the operator can settle, until the
+///   record itself expires. The work may still be running: the lifetime is
+///   the caller's estimate of how long the work takes, not a bound on it.
 ///
-/// A request whose work may have happened without a result to record keeps
-/// its reservation pending for good, noting what it learned, such as a job
-/// ID, so replays can name it ([`PublicOperationStore::note_unresolved_response`]).
-/// A panic or a process exit leaves it pending the same way, without a note.
+/// A request whose work may have happened without a result to record notes
+/// its reservation as unresolved, with what it learned, such as a job ID, so
+/// replays name it at once ([`PublicOperationStore::note_unresolved_response`]).
+/// A panic, a process exit or a failed note leaves the reservation pending
+/// without one, and replays report it unknown once the lifetime passes.
 ///
 /// The record's `response_json` holds a [`StoredReservation`], so this API
 /// owns every record under the path templates it is used for; those paths
@@ -30,14 +32,12 @@ pub(crate) enum ResponseReservation {
     Reserved(ReservationId),
     /// An earlier request recorded this response.
     Completed(serde_json::Value),
-    /// An earlier request holds the key and is still within its lifetime.
-    /// `known` is what it noted about its outcome, if anything.
-    InProgress {
-        reserved_at: OffsetDateTime,
-        known: Option<serde_json::Value>,
-    },
-    /// An earlier request reserved the key and recorded no outcome within the
-    /// lifetime. `known` is what it noted, if anything.
+    /// An earlier request holds the key, is still within its lifetime, and
+    /// has noted nothing, so it may still be in flight.
+    InProgress { reserved_at: OffsetDateTime },
+    /// An earlier request reserved the key and noted it unresolved, or
+    /// recorded nothing within the lifetime. `known` is what it noted, if
+    /// anything.
     OutcomeUnknown {
         reserved_at: OffsetDateTime,
         known: Option<serde_json::Value>,
@@ -115,14 +115,15 @@ impl PublicOperationStore {
                 Some(Ok(StoredReservation::Completed { response })) => {
                     Ok(ResponseReservation::Completed(response))
                 }
-                Some(Ok(StoredReservation::Pending { known })) if row.reservation_expired => {
-                    Ok(ResponseReservation::OutcomeUnknown {
+                Some(Ok(StoredReservation::Pending { known: None }))
+                    if !row.reservation_expired =>
+                {
+                    Ok(ResponseReservation::InProgress {
                         reserved_at: row.created_at,
-                        known,
                     })
                 }
                 Some(Ok(StoredReservation::Pending { known })) => {
-                    Ok(ResponseReservation::InProgress {
+                    Ok(ResponseReservation::OutcomeUnknown {
                         reserved_at: row.created_at,
                         known,
                     })
@@ -182,8 +183,9 @@ impl PublicOperationStore {
     }
 
     /// Keep a reservation whose work may have happened pending for good,
-    /// noting `known` for its replays. It can no longer be completed or
-    /// released, so no replay repeats the work while the record lives.
+    /// noting `known` for its replays, which report its outcome unknown from
+    /// then on. It can no longer be completed or released, so no replay
+    /// repeats the work while the record lives.
     /// `false` means it was no longer as reserved.
     pub(crate) async fn note_unresolved_response(
         &self,

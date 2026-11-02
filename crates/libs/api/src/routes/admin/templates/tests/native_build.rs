@@ -672,9 +672,11 @@ async fn a_failed_system_build_frees_its_key_only_if_the_builder_did_not_take_it
         fixture.builds.try_recv().is_ok(),
         "the build reached the builder"
     );
+    // Nothing will complete the record, so the replay says the outcome is
+    // unknown at once rather than asking for a retry.
     let (status, replay) = build("synthetic-lost-answer").await?;
     assert_eq!(status, StatusCode::CONFLICT, "{replay}");
-    assert_eq!(replay["retryable"], true, "{replay}");
+    assert_eq!(replay["retryable"], false, "{replay}");
     assert!(
         fixture.builds.try_recv().is_err(),
         "a replay of a build the builder may have taken must not start another"
@@ -709,6 +711,7 @@ async fn a_failed_system_build_frees_its_key_only_if_the_builder_did_not_take_it
     .await?;
     let (status, replay) = build("synthetic-unrecorded-job").await?;
     assert_eq!(status, StatusCode::CONFLICT, "{replay}");
+    assert_eq!(replay["retryable"], false, "{replay}");
     assert!(
         replay["details"]
             .as_array()

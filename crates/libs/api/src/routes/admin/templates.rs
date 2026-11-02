@@ -1680,13 +1680,12 @@ impl SystemTemplateBuild {
             Ok(ResponseReservation::Completed(response)) => {
                 return (StatusCode::ACCEPTED, Json(response)).into_response();
             }
-            Ok(ResponseReservation::InProgress { reserved_at, known }) => {
+            Ok(ResponseReservation::InProgress { reserved_at }) => {
                 return build_reservation_conflict(
-                    "a build with this Idempotency-Key is still being submitted, or may have \
-                     started without its job being recorded; retry shortly"
+                    "a build with this Idempotency-Key may still be being submitted; retry shortly"
                         .to_string(),
                     reserved_at,
-                    known.as_ref(),
+                    None,
                     true,
                 )
                 .into_response();
@@ -1694,10 +1693,12 @@ impl SystemTemplateBuild {
             Ok(ResponseReservation::OutcomeUnknown { reserved_at, known }) => {
                 return build_reservation_conflict(
                     format!(
-                        "the build submitted with this Idempotency-Key at {} recorded no \
-                         outcome; it may have started and may still be running. Check Template \
-                         Releases (/template-releases), or the build's status when job_id is \
-                         given, before submitting again with a new key",
+                        "the build submitted with this Idempotency-Key at {} has an unknown \
+                         outcome: it failed without proof that the builder did not take it, or \
+                         recorded nothing within 15 minutes. It may have started and may still \
+                         be running. Check Template Releases (/template-releases), or the \
+                         build's status when job_id is given, before submitting again with a \
+                         new key",
                         format_time(reserved_at)
                     ),
                     reserved_at,
@@ -1749,19 +1750,22 @@ impl SystemTemplateBuild {
                             );
                         }
                     }
-                    BuildDispatchOutcome::MaybeAccepted { job_id: None } => {}
-                    BuildDispatchOutcome::MaybeAccepted {
-                        job_id: Some(job_id),
-                    } => {
-                        let known = serde_json::json!({ "job_id": job_id.to_string() });
+                    // Nothing will complete the record now, so it is noted
+                    // unresolved and replays say so at once instead of
+                    // asking for a retry that cannot succeed.
+                    BuildDispatchOutcome::MaybeAccepted { job_id } => {
+                        let known = match job_id {
+                            Some(job_id) => serde_json::json!({ "job_id": job_id.to_string() }),
+                            None => serde_json::json!({}),
+                        };
                         if let Err(error) = store.note_unresolved_response(reservation, known).await
                         {
                             tracing::warn!(
                                 %error,
                                 %template,
-                                %job_id,
-                                "failed to note the job of a system template build whose \
-                                 acceptance was not recorded"
+                                ?job_id,
+                                "failed to note a system template build the builder may have \
+                                 taken; replays report it in progress, then of unknown outcome"
                             );
                         }
                     }
