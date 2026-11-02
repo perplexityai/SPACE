@@ -4867,6 +4867,7 @@ dependencies = [
  "pplx-space-sandbox-store",
  "pplx-space-sandbox-teardown",
  "pplx-space-sbx-mgr-client",
+ "pplx-space-snapshot-store",
  "pplx-space-template-mgr-client",
  "pplx-space-test-env",
  "prost",
@@ -7007,6 +7008,15 @@ dependencies = [
 [[package]]
 name = "pplx-space-sandbox-quarantine-store"
 version = "0.8.0"
+dependencies = [
+ "pplx-space-common-core",
+ "pplx-space-db-test-fixtures",
+ "pplx-space-test-env",
+ "sqlx",
+ "time",
+ "tokio",
+ "uuid",
+]
 
 [[package]]
 name = "pplx-space-sandbox-routability"
@@ -7294,6 +7304,7 @@ dependencies = [
  "jiff",
  "pplx-space-common-core",
  "pplx-space-db-test-fixtures",
+ "pplx-space-sandbox-portability",
  "pplx-space-test-env",
  "serde_json",
  "sqlx",

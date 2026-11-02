@@ -20,6 +20,7 @@ uuid = { workspace = true }
 
 # internal
 pplx-space-common-core = { workspace = true, features = ["serde", "sqlx"] }
+pplx-space-sandbox-portability = { workspace = true }
 
 [dev-dependencies]
 pplx-space-db-test-fixtures = { workspace = true }

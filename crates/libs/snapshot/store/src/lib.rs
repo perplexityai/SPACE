@@ -19,6 +19,9 @@ use sqlx::types::Json;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+mod placement;
+pub use placement::{SnapshotStoragePlacement, storage_placements};
+
 /// Reading a snapshot catalog row failed.
 #[derive(Debug, thiserror::Error)]
 pub enum GetSnapshotError {

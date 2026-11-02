@@ -5,6 +5,7 @@ pub(super) mod lifecycle;
 pub(super) mod observed;
 pub(super) mod pods;
 pub(super) mod ports;
+pub(super) mod quarantine;
 pub(super) mod snapshots;
 pub(super) mod timeline;
 

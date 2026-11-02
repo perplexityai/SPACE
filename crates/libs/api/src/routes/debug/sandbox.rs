@@ -99,9 +99,10 @@ async fn fetch_postgres_debug_sections(
     let snapshots = sources::snapshots::fetch(&state.pool, sandbox_id);
     let ports = sources::ports::fetch(&state.pool, sandbox_id);
     let timeline = sources::timeline::fetch(&state.pool, sandbox_id);
+    let quarantine = sources::quarantine::fetch(&state.pool, sandbox_id);
 
-    let (observed, pods, snapshots, ports, timeline) =
-        tokio::join!(observed, pods, snapshots, ports, timeline);
+    let (observed, pods, snapshots, ports, timeline, quarantine) =
+        tokio::join!(observed, pods, snapshots, ports, timeline, quarantine);
     let observed = observed.map_err(source_error);
     let sections = sandbox.into_sections(observed.as_ref().ok().cloned().flatten());
 
@@ -125,6 +126,9 @@ async fn fetch_postgres_debug_sections(
             .map(DebugSection::data)
             .unwrap_or_else(|error| DebugSection::error(source_error(error))),
         timeline: timeline
+            .map(DebugSection::data)
+            .unwrap_or_else(|error| DebugSection::error(source_error(error))),
+        quarantine: quarantine
             .map(DebugSection::data)
             .unwrap_or_else(|error| DebugSection::error(source_error(error))),
     }))
