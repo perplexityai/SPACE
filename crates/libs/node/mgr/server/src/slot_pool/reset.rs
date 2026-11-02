@@ -966,6 +966,11 @@ pub(super) fn validate_slot_ready(
             "namespace src_valid_mark is not disabled".to_string(),
         ));
     }
+    if !net::try_ns_sysctl_check(&ns, "net.mptcp.enabled", "0")? {
+        return Err(SlotValidationError::Invalid(
+            "namespace MPTCP is not disabled".to_string(),
+        ));
+    }
     Ok(())
 }
 
