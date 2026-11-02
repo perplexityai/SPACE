@@ -177,14 +177,20 @@ async fn upload_of_a_replaced_artifact_rejoins_the_transfers_its_handoff_staged(
 }
 
 /// A payload with `transfer_id` queued, as the earlier binary persisted it:
-/// without `sidecar_artifact_id`.
+/// without `sidecar_artifact_id`. A retained capture's names its source and
+/// stages its metadata in `metadata_dir`.
 fn earlier_binary_submitted_payload(
     artifact_id: &str,
     snapshot_dir: std::path::PathBuf,
     transfer_id: JobId,
+    metadata_dir: Option<std::path::PathBuf>,
 ) -> String {
     let mut payload = reclaim_fixture_payload(artifact_id, snapshot_dir);
     payload.job_ids = vec![transfer_id];
+    if let Some(metadata_dir) = metadata_dir {
+        payload.meta.rootfs_send_source_id = Some(uuid::Uuid::now_v7());
+        payload.metadata_staging_dir = Some(metadata_dir);
+    }
     let mut json = serde_json::to_value(&payload).unwrap();
     json.as_object_mut().unwrap().remove("sidecar_artifact_id");
     json.to_string()
@@ -209,23 +215,47 @@ fn insert_running_upload(db: &crate::db::SharedConnection, job: &Job) {
 
 /// The earlier binary queued an upload's transfers without reading the
 /// sidecar after them, so they can be a newer suspend's files. Before polling
-/// them, a sidecar naming another artifact ends the attempt for good, as a
-/// fresh superseded upload, and a missing one fails it as retriable.
+/// them, a sidecar naming another artifact, and for a retained capture another
+/// source, ends the attempt for good, as a fresh superseded upload. A missing
+/// one fails it as retriable.
 #[tokio::test(start_paused = true)]
 async fn transfers_an_earlier_binary_queued_are_checked_before_polling() {
-    for newer_published in [true, false] {
+    #[derive(Clone, Copy, Debug)]
+    enum Sidecar {
+        /// A newer suspend's, of a retained capture when `retained`.
+        Newer {
+            retained: bool,
+        },
+        Missing,
+    }
+    for case in [
+        Sidecar::Newer { retained: false },
+        Sidecar::Newer { retained: true },
+        Sidecar::Missing,
+    ] {
         let staging = tempfile::tempdir().unwrap();
         let snapshot_dir = staging.path().join("snapshot");
         write_snapshot_dir_fixture(&snapshot_dir);
         let sidecar = snapshot_dir.join(crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME);
-        if newer_published {
-            std::fs::write(
-                &sidecar,
-                format!(r#"{{"local_artifact_id":"{}"}}"#, LocalArtifactId::new()),
-            )
-            .unwrap();
-        } else {
-            std::fs::remove_file(&sidecar).unwrap();
+        let mut metadata_dir = None;
+        match case {
+            Sidecar::Newer { retained } => {
+                std::fs::write(
+                    &sidecar,
+                    serde_json::json!({
+                        "local_artifact_id": LocalArtifactId::new(),
+                        "rootfs_send_source_id": retained.then(uuid::Uuid::now_v7),
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+                if retained {
+                    let dir = staging.path().join("metadata");
+                    std::fs::create_dir(&dir).unwrap();
+                    metadata_dir = Some(dir);
+                }
+            }
+            Sidecar::Missing => std::fs::remove_file(&sidecar).unwrap(),
         }
         let transfer_id = JobId::new();
         let db = crate::db::SharedConnection::new(open_backfill_test_db());
@@ -246,6 +276,7 @@ async fn transfers_an_earlier_binary_queued_are_checked_before_polling() {
                 "01939e3e-eeee-7000-8000-000000000023",
                 snapshot_dir,
                 transfer_id,
+                metadata_dir,
             ),
         );
         insert_running_upload(&db, &job);
@@ -255,8 +286,9 @@ async fn transfers_an_earlier_binary_queued_are_checked_before_polling() {
             .await
             .unwrap_err();
 
-        let case = format!("newer_published={newer_published}: {}", error.message());
-        if newer_published {
+        let newer = matches!(case, Sidecar::Newer { .. });
+        let case = format!("{case:?}: {}", error.message());
+        if newer {
             assert_eq!(
                 error.kind(),
                 pplx_space_common_jobs::JobFailureKind::Permanent,
@@ -305,7 +337,7 @@ async fn transfers_an_earlier_binary_queued_for_the_named_artifact_are_polled() 
     };
     let job = job_fixture(
         SNAPSHOT_UPLOAD_JOB_KIND,
-        earlier_binary_submitted_payload(artifact_id, snapshot_dir, transfer_id),
+        earlier_binary_submitted_payload(artifact_id, snapshot_dir, transfer_id, None),
     );
     insert_running_upload(&db, &job);
 
