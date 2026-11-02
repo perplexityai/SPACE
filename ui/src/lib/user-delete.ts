@@ -13,12 +13,15 @@ export const USER_OWNS_SANDBOXES =
 const OWNERSHIP_REFUSAL =
   'The user could not be deleted. A user who owns sandboxes or archived sandboxes cannot be deleted; delete their sandboxes first.';
 
-// The ownership explanation only where it is the likely cause: a 409, or a
-// 500 while the caller's own sandbox list shows the user owns sandboxes.
-// Anything else, including a retryable 503, keeps the API's message.
+// The ownership explanation only where it is the likely cause: a 500 while
+// the caller's own sandbox list shows the user owns sandboxes. The admin API
+// answers the database's ownership refusal with a 500; this stays until it
+// answers that refusal with its own status. Anything else keeps the API's
+// message: a 409 is the API refusing to let callers delete themselves, and
+// a 503 is retryable.
 export function userDeleteFailureMessage(err: unknown, { ownsSandboxes = false }: { ownsSandboxes?: boolean } = {}): string {
   const status = typeof err === 'object' && err !== null ? (err as { status?: unknown }).status : undefined;
-  if (status === 409 || (status === 500 && ownsSandboxes)) return OWNERSHIP_REFUSAL;
+  if (status === 500 && ownsSandboxes) return OWNERSHIP_REFUSAL;
   return err instanceof Error && err.message ? err.message : 'The user could not be deleted.';
 }
 

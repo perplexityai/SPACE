@@ -15,8 +15,10 @@ test('the confirmation says what deleting a user does, including keys that keep 
   assert.match(USER_DELETE_CONSEQUENCES, /refused while they own sandboxes/);
 });
 
-test('a 409 explains the sandbox ownership', () => {
-  assert.match(userDeleteFailureMessage(new ApiError(409, 'conflict')), /owns sandboxes/);
+test('a 409 keeps the API message, even when the user owns sandboxes', () => {
+  const refusal = 'cannot modify your own role or delete yourself';
+  assert.equal(userDeleteFailureMessage(new ApiError(409, refusal)), refusal);
+  assert.equal(userDeleteFailureMessage(new ApiError(409, refusal), { ownsSandboxes: true }), refusal);
 });
 
 test('a 500 explains the ownership only when the page shows the user owns sandboxes', () => {
