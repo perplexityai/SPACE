@@ -53,7 +53,7 @@ use crate::{
     middleware::auth::{AuthFederatedOwner, AuthOrg, AuthUser},
     models::{Sandbox, SandboxMetadata as ControllerSandboxMetadata, SandboxMetadataValue},
     public_operations::{
-        ApiProduct, CreateClaimedPublicOperationResult, CreatePublicOperation,
+        ApiProduct, CreateInlinePublicOperationResult, CreatePublicOperation,
         CreatePublicOperationIdempotency, CreatePublicOperationResult, HttpOperationMethod,
         ObservePublicOperationIdempotency, OperationPathTemplate, PublicOperationAdmission,
         PublicOperationStore, SandboxQuota, SandboxQuotaOutcome, SandboxQuotaRefusal,
@@ -348,27 +348,19 @@ pub(crate) async fn create_native_sandbox_operation(
                             // Without a permit, or with the org at its
                             // inline limit, the create is recorded queued,
                             // as with the kill switch off.
-                            let mut permit = inline.as_ref().and_then(|inline| {
+                            let offered = inline.as_ref().and_then(|inline| {
                                 inline
                                     .runner
                                     .try_acquire(InlineAdmissionPath::WarmPoolCreate)
                                     .ok()
+                                    .map(|permit| (inline, permit))
                             });
-                            if let Some(inline) = &inline
-                                && permit.is_some()
-                                && admission
-                                    .inline_org_at_limit(org_id, inline.runner.org_limit())
+                            let result = if let Some((inline, permit)) = offered {
+                                match admission
+                                    .create_claimed_or_roll_back(input, inline.runner.org_limit())
                                     .await?
-                            {
-                                permit = None;
-                                inline.runner.refuse(
-                                    InlineAdmissionPath::WarmPoolCreate,
-                                    InlineRefusal::OrgLimit,
-                                );
-                            }
-                            let result = if let Some(permit) = permit {
-                                match admission.create_claimed_or_roll_back(input).await? {
-                                    CreateClaimedPublicOperationResult::Claimed {
+                                {
+                                    CreateInlinePublicOperationResult::Claimed {
                                         claim_token,
                                         operation,
                                     } => {
@@ -376,19 +368,17 @@ pub(crate) async fn create_native_sandbox_operation(
                                         inline_claim = Some((permit, claim_token, operation));
                                         CreatePublicOperationResult::Created(operation_id)
                                     }
-                                    CreateClaimedPublicOperationResult::Existing(operation_id) => {
-                                        CreatePublicOperationResult::Existing(operation_id)
-                                    }
-                                    CreateClaimedPublicOperationResult::IdempotencyConflict {
+                                    CreateInlinePublicOperationResult::Queued(
                                         operation_id,
-                                        expected_fingerprint,
-                                    } => CreatePublicOperationResult::IdempotencyConflict {
-                                        operation_id,
-                                        expected_fingerprint,
-                                    },
-                                    CreateClaimedPublicOperationResult::AdmissionDenied => {
-                                        CreatePublicOperationResult::AdmissionDenied
+                                        reason,
+                                    ) => {
+                                        inline.runner.refuse(
+                                            InlineAdmissionPath::WarmPoolCreate,
+                                            reason.into(),
+                                        );
+                                        CreatePublicOperationResult::Created(operation_id)
                                     }
+                                    CreateInlinePublicOperationResult::NotCreated(result) => result,
                                 }
                             } else {
                                 admission.create_or_roll_back(input).await?

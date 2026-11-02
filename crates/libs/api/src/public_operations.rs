@@ -1229,8 +1229,8 @@ async fn claim_created_operation_tx(
 /// on every surface, runs a release that takes the lock, and is turned off
 /// before the keyed claim is.
 ///
-/// The organization limit is soft: it counts claims committed before this
-/// statement's snapshot (see [`inline_org_at_limit_tx`]).
+/// The organization limit is applied as [`claim_created_within_org_limit_tx`]
+/// applies it.
 async fn claim_created_if_sole_active_tx(
     tx: &mut Transaction<'_, Postgres>,
     org_id: OrgId,
@@ -1265,6 +1265,22 @@ async fn claim_created_if_sole_active_tx(
             InlineQueueReason::Busy,
         ));
     }
+    claim_created_within_org_limit_tx(tx, org_id, operation_id, org_limit).await
+}
+
+/// [`claim_created_operation_tx`] for `operation_id`, an operation this
+/// transaction just created, unless `org_id` is at `org_limit`; then it
+/// stays queued for the dispatcher. Every admission that claims for inline
+/// execution claims through here, so the limit holds on all of them.
+///
+/// The limit is soft: it counts claims committed before this statement's
+/// snapshot (see [`inline_org_at_limit_tx`]).
+async fn claim_created_within_org_limit_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    org_id: OrgId,
+    operation_id: OperationId,
+    org_limit: Option<InlineOrgLimit>,
+) -> Result<CreateInlinePublicOperationResult, PublicOperationStoreError> {
     if let Some(org_limit) = org_limit
         && inline_org_at_limit_tx(tx, org_id, org_limit).await?
     {
@@ -1303,8 +1319,12 @@ pub struct InlineOrgLimit {
 /// one. Each such admission holds an inline permit in its process, so the
 /// overshoot is bounded by the permits free across the API processes.
 ///
-/// Running rows are few, so the `(state, next_attempt_at)` index keeps this
-/// count cheap.
+/// No index leads with the organization and the state, so this reads more
+/// than the organization's running rows: every running row in the fleet
+/// through `(state, next_attempt_at)`, or, under a generic plan, every
+/// operation the organization retains through `(org_id, created_at)`. An
+/// `(org_id, state, claimed_at)` index bounds it to the organization's
+/// running rows.
 async fn inline_org_at_limit_tx(
     tx: &mut Transaction<'_, Postgres>,
     org_id: OrgId,
@@ -1352,7 +1372,8 @@ pub enum InlineQueueReason {
     OrgLimit,
 }
 
-/// What [`PublicOperationAdmission::create_claimed_if_sole_active`] recorded.
+/// What [`PublicOperationAdmission::create_claimed_if_sole_active`] or
+/// [`PublicOperationAdmission::create_claimed_or_roll_back`] recorded.
 #[derive(Debug, Clone)]
 pub enum CreateInlinePublicOperationResult {
     /// Created and claimed, with an admission claim token: the caller owns
@@ -1507,21 +1528,6 @@ impl PublicOperationAdmission {
         Ok(recorded)
     }
 
-    /// Whether `org_id` is at `org_limit` for operations claimed for inline
-    /// execution, read in this admission's transaction; `None` sets no
-    /// limit. For a route that claims its operation by other means (a
-    /// warm-pool create) and records it queued instead when this is true.
-    pub(crate) async fn inline_org_at_limit(
-        &mut self,
-        org_id: OrgId,
-        org_limit: Option<InlineOrgLimit>,
-    ) -> Result<bool, PublicOperationStoreError> {
-        let Some(org_limit) = org_limit else {
-            return Ok(false);
-        };
-        Ok(inline_org_at_limit_tx(&mut self.tx, org_id, org_limit).await?)
-    }
-
     /// [`Self::create`] for a caller's `:wake`, except that it joins a wake
     /// for the sandbox with nothing else for the sandbox queued behind it, as
     /// [`PublicOperationStore::create_or_join_active_sandbox_wake`] does: the
@@ -1660,39 +1666,26 @@ impl PublicOperationAdmission {
 
     /// [`Self::create_or_roll_back`], except that a newly created operation
     /// is also claimed in the same transaction, for the caller to execute
-    /// inline. Nothing is claimed for a replay or a conflict, and both roll
-    /// back, as there.
+    /// inline, when its organization is under `org_limit`; at the limit it
+    /// commits queued for the dispatcher instead. Nothing is created for a
+    /// replay or a conflict, and both roll back, as there.
     pub(crate) async fn create_claimed_or_roll_back(
         mut self,
         input: CreatePublicOperation<'_>,
-    ) -> Result<CreateClaimedPublicOperationResult, PublicOperationStoreError> {
+        org_limit: Option<InlineOrgLimit>,
+    ) -> Result<CreateInlinePublicOperationResult, PublicOperationStoreError> {
+        let org_id = input.org_id;
         let api_product = input.api_product;
         let kind = input.kind;
         let target_type = input.target_type.clone();
         let (created, superseded) = create_operation_tx(&mut self.tx, input).await?;
-        let operation_id = match created {
-            CreatePublicOperationResult::Created(operation_id) => operation_id,
-            CreatePublicOperationResult::Existing(operation_id) => {
-                self.tx.rollback().await?;
-                return Ok(CreateClaimedPublicOperationResult::Existing(operation_id));
-            }
-            CreatePublicOperationResult::IdempotencyConflict {
-                operation_id,
-                expected_fingerprint,
-            } => {
-                self.tx.rollback().await?;
-                return Ok(CreateClaimedPublicOperationResult::IdempotencyConflict {
-                    operation_id,
-                    expected_fingerprint,
-                });
-            }
-            CreatePublicOperationResult::AdmissionDenied => {
-                self.tx.rollback().await?;
-                return Ok(CreateClaimedPublicOperationResult::AdmissionDenied);
-            }
+        let CreatePublicOperationResult::Created(operation_id) = created else {
+            self.tx.rollback().await?;
+            return Ok(CreateInlinePublicOperationResult::NotCreated(created));
         };
-        let (claim_token, operation) =
-            claim_created_operation_tx(&mut self.tx, operation_id).await?;
+        let recorded =
+            claim_created_within_org_limit_tx(&mut self.tx, org_id, operation_id, org_limit)
+                .await?;
         self.tx.commit().await?;
         superseded.record();
         pplx_space_metrics::operations::created(
@@ -1703,10 +1696,7 @@ impl PublicOperationAdmission {
                 .map(OperationTargetType::as_str)
                 .unwrap_or("none"),
         );
-        Ok(CreateClaimedPublicOperationResult::Claimed {
-            claim_token,
-            operation,
-        })
+        Ok(recorded)
     }
 }
 
