@@ -45,6 +45,8 @@ use crate::{encrypted_volume, rootfs_dmcrypt};
 
 use super::{ALLOW_NODE_ADMIN_OR_SBXMGR, NodeManagerService};
 
+mod compaction;
+
 /// Plaintext, reflinked-from-template rootfs file inside `instance/` — the
 /// dm-snapshot origin of the encrypted rootfs.
 const ROOTFS_ORIGIN_FILE: &str = "rootfs.ext4";
@@ -438,6 +440,7 @@ impl NodeManagerService {
         &self,
         sandbox_id: SandboxId,
         local_artifact_id: pplx_space_common_core::types::LocalArtifactId,
+        fresh: bool,
         execution_fence: Option<crate::proto::ExecutionFence>,
     ) -> Result<(), Status> {
         let metric = DeviceOpMetric::stage(pplx_space_metrics::byok::OP_SNAPSHOT_VOLUME);
@@ -447,9 +450,28 @@ impl NodeManagerService {
             &sandbox_id.to_string(),
             local_artifact_id,
         ));
+        let backing_path = volume_backing_path(&sandbox_id, volume_name);
+        // The volume stays open: a live Firecracker may still map its memory
+        // file, privately, which never writes the file. Read-only is what keeps
+        // the flushed bytes fixed while they are copied.
+        let mount_dir = volume_mount_dir(&sandbox_id, volume_name);
+        let compaction =
+            compaction::plan(&sandbox_id, volume_name, &backing_path, &mount_dir, fresh).await;
+        if let Err(error) =
+            encrypted_volume::make_read_only(&sandbox_id, volume_name, &mount_dir).await
+        {
+            metric.failed(dmcrypt_error_phase(&error));
+            return Err(dmcrypt_error_to_status(error));
+        }
+        let compacted = match compaction {
+            Some(plan) => {
+                compaction::copy(&sandbox_id, volume_name, &backing_path, &mount_dir, plan).await
+            }
+            None => None,
+        };
         let artifacts = vec![
             (
-                volume_backing_path(&sandbox_id, volume_name),
+                compacted.as_ref().unwrap_or(&backing_path).clone(),
                 "snapshot.luks".to_string(),
             ),
             (
@@ -458,16 +480,6 @@ impl NodeManagerService {
                 ROOTFS_COW_FILE.to_string(),
             ),
         ];
-        // The volume stays open: a live Firecracker may still map its memory
-        // file, privately, which never writes the file. Read-only is what keeps
-        // the flushed bytes fixed while they are copied.
-        let mount_dir = volume_mount_dir(&sandbox_id, volume_name);
-        if let Err(error) =
-            encrypted_volume::make_read_only(&sandbox_id, volume_name, &mount_dir).await
-        {
-            metric.failed(dmcrypt_error_phase(&error));
-            return Err(dmcrypt_error_to_status(error));
-        }
         // The rootfs COW is staged from a live runtime too: flush what
         // Firecracker has written through the buffered composite first.
         let staged = match rootfs_dmcrypt::flush_composite(&sandbox_id).await {
@@ -476,6 +488,10 @@ impl NodeManagerService {
                 .map_err(|error| (pplx_space_metrics::byok::PHASE_STAGE, error)),
             Err(error) => Err((dmcrypt_error_phase(&error), dmcrypt_error_to_status(error))),
         };
+        if compacted.is_some() {
+            encrypted_volume::compact::discard(&sandbox_id, volume_name, &backing_path, &mount_dir)
+                .await;
+        }
         // The copies are immutable reflinks now. Leave the volume as a capture
         // finds it, so nothing that predates read-only staging meets it.
         if let Err(error) = encrypted_volume::remount_read_write(&mount_dir).await {

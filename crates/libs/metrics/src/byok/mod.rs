@@ -67,6 +67,11 @@ pub const CLOSE_BUSY_EXHAUSTED: &str = "exhausted";
 /// A retry after a busy refusal failed for another reason.
 pub const CLOSE_BUSY_FAILED: &str = "failed";
 
+/// A compacted copy of a bloated volume was published in its place.
+pub const COMPACTION_COMPACTED: &str = "compacted";
+/// A due compaction stopped; the volume was published as it is.
+pub const COMPACTION_SKIPPED: &str = "skipped";
+
 /// credmgr was not reachable at all (socket missing, peer down).
 pub const DEK_UNREACHABLE: &str = "unreachable";
 /// credmgr answered and refused: org not enrolled, KEK revoked, purpose
@@ -153,6 +158,28 @@ pub fn device_stage_failed(op: &str, phase: &str) {
 /// end in a force-freed mapping, and for a suspend, an unsealed snapshot.
 pub fn volume_close_busy(outcome: &str) {
     counter("byok.volume_close.busy", 1, &[tag("outcome", outcome)]);
+}
+
+/// A suspend's encrypted volume was due for compaction, bucketed by
+/// `outcome`: [`COMPACTION_COMPACTED`] or [`COMPACTION_SKIPPED`].
+///
+/// Each re-suspend rewrites the memory file in place, so the volume only
+/// grows; compaction copies it into a fresh volume once it uses twice what it
+/// did right after it was last freshly written, or once on a volume whose
+/// history is unknown. `skipped` counts suspends whose volume keeps growing,
+/// and with it their restore time.
+pub fn volume_compaction(outcome: &str) {
+    counter("byok.volume_compaction", 1, &[tag("outcome", outcome)]);
+}
+
+/// Wall time of a compaction whose copy was published. It runs inside the
+/// suspend's staging, so it adds to that suspend's capture time.
+pub fn volume_compaction_duration(started: Instant) {
+    timing_ms(
+        "byok.volume_compaction.duration_ms",
+        elapsed_ms(started),
+        &[],
+    );
 }
 
 /// A volume-DEK fetch from credmgr was attempted.
