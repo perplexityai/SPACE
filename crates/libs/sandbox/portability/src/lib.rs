@@ -279,16 +279,35 @@ pub fn artifact_has_durable_copy(
     artifact_kind: &str,
 ) -> String {
     let matches_artifact = snapshot_matches_artifact("ready_snapshot", artifact_id, artifact_kind);
+    let durable = snapshot_has_durable_copy("ready_snapshot");
     format!(
         "EXISTS (\n\
              SELECT 1\n\
                FROM snapshots ready_snapshot\n\
-               JOIN snapshot_storage_locations ready_storage\n\
-                 ON ready_storage.snapshot_id = ready_snapshot.id\n\
-                AND ready_storage.orphaned_at IS NULL\n\
               WHERE ready_snapshot.sandbox_id = {sandbox_id}\n\
-                AND ready_snapshot.state = 'ready'\n\
                 AND {matches_artifact}\n\
+                AND {durable}\n\
+         )"
+    )
+}
+
+/// Returns a boolean SQL fragment evaluating to TRUE iff the snapshot aliased
+/// as `snapshot_alias` has a durable copy: it is `state='ready'` and has a
+/// storage location that has not been orphaned.
+///
+/// The per-snapshot half of [`artifact_has_durable_copy`], which asks it of
+/// any snapshot of one artifact. Compose it into a query that already has the
+/// `snapshots` row; it is never NULL.
+pub fn snapshot_has_durable_copy(snapshot_alias: &str) -> String {
+    format!(
+        "(\n\
+             {snapshot_alias}.state = 'ready'\n\
+             AND EXISTS (\n\
+                 SELECT 1\n\
+                   FROM snapshot_storage_locations durable_storage\n\
+                  WHERE durable_storage.snapshot_id = {snapshot_alias}.id\n\
+                    AND durable_storage.orphaned_at IS NULL\n\
+             )\n\
          )"
     )
 }

@@ -1128,7 +1128,13 @@ impl SandboxController {
         }
         let template_reference = create_template_reference(req);
         let Ok(resolved_template) = self
-            .resolve_create_template(pool, &template_reference, runtime, org_id)
+            .resolve_create_template(
+                pool,
+                &template_reference,
+                runtime,
+                org_id,
+                ReleaseMissReport::Classified,
+            )
             .await
         else {
             return AdmissionPoolPlan::TemplateMiss;
@@ -1248,7 +1254,13 @@ impl SandboxController {
             None => SandboxCreateOwner::local(actor),
         };
         let resolved_template = self
-            .resolve_create_template(pool, &template_reference, runtime, create_owner.org_id)
+            .resolve_create_template(
+                pool,
+                &template_reference,
+                runtime,
+                create_owner.org_id,
+                ReleaseMissReport::Classified,
+            )
             .await?;
         let resolved_template_release_id = resolved_template.template_release_id;
         let resolved_content_hash = resolved_template.content_hash.clone();
@@ -2727,10 +2739,11 @@ impl SandboxController {
         template: &TemplateReference,
         runtime: RuntimeKind,
         caller_org: OrgId,
+        miss_report: ReleaseMissReport,
     ) -> Result<ResolvedCreateTemplate, ControllerError> {
         let runtime_alias = runtime.alias();
         let (template_release_id, content_hash) =
-            resolve_template_release(pool, template, runtime, caller_org).await?;
+            resolve_template_release(pool, template, runtime, caller_org, miss_report).await?;
         let defaults = load_create_template_defaults(
             pool,
             template.name().as_str(),
@@ -2773,8 +2786,18 @@ impl SandboxController {
             TemplateReference::latest(template)
         };
 
+        // `sandboxes` records no runtime, so the update passes Firecracker
+        // whatever the sandbox runs. A classified miss would then say the
+        // template has no matching release when it may have one for the
+        // sandbox's real runtime, so a miss here stays the plain not-found.
         Ok(self
-            .resolve_create_template(pool, &template, runtime, caller_org)
+            .resolve_create_template(
+                pool,
+                &template,
+                runtime,
+                caller_org,
+                ReleaseMissReport::NotFound,
+            )
             .await?
             .default_auto_lifecycle)
     }

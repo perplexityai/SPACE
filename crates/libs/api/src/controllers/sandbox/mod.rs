@@ -42,7 +42,7 @@ use super::substrate::{
     NodeInventoryEntry, RuntimeClient, SandboxResources, Substrate, SubstrateAdapter,
     SubstrateError, TemplateRef, WaitReadyTimeoutPhase,
 };
-use super::{ControllerError, ControllerRetryAfterCause, db_contention_error};
+use super::{ControllerError, ControllerRetryAfterCause, TemplateReleaseMiss, db_contention_error};
 use crate::controllers::auto_lifecycle::{
     policy_from_proto, status_from_proto, validate_v1_policy,
 };
@@ -161,7 +161,8 @@ fn template_release_not_found(
     let template_name = template.name().as_str();
     if let Some(digest) = template.artifact_digest() {
         return ControllerError::not_found(format!(
-            "no release found for template '{template_name}' hash '{digest}'"
+            "no release found for template '{template_name}' runtime '{}' hash '{digest}'",
+            runtime.alias(),
         ));
     }
     match template.tag() {
@@ -244,16 +245,29 @@ pub(crate) async fn gate_template_access(
     }
 }
 
+/// How [`resolve_template_release`] reports a reference that matched no
+/// release.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ReleaseMissReport {
+    /// Say whether the template has any release ([`classify_release_miss`]).
+    Classified,
+    /// The plain not-found, for a caller that may resolve with a runtime
+    /// other than the sandbox's, where a classification could be wrong.
+    NotFound,
+}
+
 async fn resolve_template_release(
     pool: &PgPool,
     template: &TemplateReference,
     runtime: RuntimeKind,
     caller_org: OrgId,
+    miss_report: ReleaseMissReport,
 ) -> Result<(Uuid, String), ControllerError> {
     validate_create_template_reference(template)?;
     let template_name = template.name().as_str();
 
-    if gate_template_access(pool, template.name(), caller_org).await? == TemplateAccess::Denied {
+    let access = gate_template_access(pool, template.name(), caller_org).await?;
+    if access == TemplateAccess::Denied {
         return Err(template_release_not_found(template, runtime));
     }
 
@@ -272,7 +286,12 @@ async fn resolve_template_release(
         .await
         .map_err(|err| db_contention_error("failed to resolve template release by hash", &err))?;
 
-        return resolved.ok_or_else(|| template_release_not_found(template, runtime));
+        return match resolved {
+            Some(release) => Ok(release),
+            None => {
+                Err(release_miss(pool, template, runtime, caller_org, access, miss_report).await?)
+            }
+        };
     }
 
     let tag = template
@@ -306,7 +325,55 @@ async fn resolve_template_release(
         }
     }
 
-    Err(template_release_not_found(template, runtime))
+    Err(release_miss(pool, template, runtime, caller_org, access, miss_report).await?)
+}
+
+async fn release_miss(
+    pool: &PgPool,
+    template: &TemplateReference,
+    runtime: RuntimeKind,
+    caller_org: OrgId,
+    access: TemplateAccess,
+    miss_report: ReleaseMissReport,
+) -> Result<ControllerError, ControllerError> {
+    match miss_report {
+        ReleaseMissReport::Classified => {
+            classify_release_miss(pool, template, runtime, caller_org, access).await
+        }
+        ReleaseMissReport::NotFound => Ok(template_release_not_found(template, runtime)),
+    }
+}
+
+/// The error for a template reference whose lookups matched no release.
+///
+/// Status and message are the same whatever the cause, so a synchronous
+/// surface cannot tell the cases apart. Only for a template the gate
+/// authorized does the kind say whether the template has any release at all;
+/// an absent or denied template stays the plain not-found, and the existence
+/// check that tells the two apart runs only then, on the failure path.
+async fn classify_release_miss(
+    pool: &PgPool,
+    template: &TemplateReference,
+    runtime: RuntimeKind,
+    caller_org: OrgId,
+    access: TemplateAccess,
+) -> Result<ControllerError, ControllerError> {
+    let not_found = template_release_not_found(template, runtime);
+    if !matches!(access, TemplateAccess::Authorized { .. }) {
+        return Ok(not_found);
+    }
+    let has_release = crate::template_releases_store::template_has_visible_release(
+        pool,
+        template.name(),
+        caller_org,
+    )
+    .await
+    .map_err(|err| db_contention_error("failed to check template releases", &err))?;
+    Ok(not_found.with_template_release_miss(if has_release {
+        TemplateReleaseMiss::NoMatchingRelease
+    } else {
+        TemplateReleaseMiss::NoRelease
+    }))
 }
 
 pub(crate) async fn resolve_template_release_by_tag(
@@ -1115,6 +1182,10 @@ impl SandboxController {
         self.substrate
             .set_node_schedulability(request, desired)
             .await
+    }
+
+    pub fn node_cordon_states(&self) -> Option<std::collections::HashMap<String, bool>> {
+        self.substrate.node_cordon_states()
     }
 
     pub async fn resolve_node_api_endpoint(

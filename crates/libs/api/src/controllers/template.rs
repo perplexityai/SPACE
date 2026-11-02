@@ -13,12 +13,24 @@ use pplx_space_node_api_client::proto::BuildTemplateResponse;
 
 use super::{
     ControllerError, db_contention_error,
-    substrate::{Substrate, SubstrateAdapter},
+    substrate::{BuilderClient, Substrate, SubstrateAdapter},
 };
 use crate::models::{ClusterPoolConfigRequest, ClusterPoolConfigResponse};
 use crate::template_build_jobs_store::{
-    BuildBaseGrantId, BuilderPinnedGrants, TemplateBuildJobsStore, TemplateBuildJobsStoreError,
+    BuildBaseGrantId, BuilderPinnedGrants, RecordedBuild, TemplateBuildJobsStore,
+    TemplateBuildJobsStoreError,
 };
+
+/// One job's status from a builder client the caller already resolved.
+pub(crate) async fn template_build_status_with(
+    client: &mut BuilderClient,
+    job_id: String,
+) -> Result<GetBuildStatusResponse, ControllerError> {
+    Ok(client
+        .get_build_template_status(GetBuildStatusRequest { job_id })
+        .await?
+        .into_inner())
+}
 
 /// The build-jobs store's errors at the controller boundary.
 ///
@@ -490,19 +502,38 @@ impl TemplateController {
             .find_builder_node(parsed_job_id)
             .await
             .map_err(|error| build_jobs_store_error("failed to load template build job", error))?;
-        let mut client = match builder_node_id {
+        let mut client = self.builder_client_for_job(builder_node_id).await?;
+        template_build_status_with(&mut client, job_id).await
+    }
+
+    pub(crate) async fn recent_template_builds(
+        &self,
+        template_name: &TemplateName,
+        limit: u32,
+    ) -> Result<Vec<RecordedBuild>, ControllerError> {
+        self.build_jobs
+            .recent_builds(template_name, limit)
+            .await
+            .map_err(|error| build_jobs_store_error("failed to list template build jobs", error))
+    }
+
+    /// A client for the builder that answers for a job with this recorded
+    /// routing: the pinned builder when `builder_node_id` is set, unpinned
+    /// discovery otherwise. The client can be cloned for several jobs on the
+    /// same builder.
+    pub(crate) async fn builder_client_for_job(
+        &self,
+        builder_node_id: Option<NodeId>,
+    ) -> Result<BuilderClient, ControllerError> {
+        match builder_node_id {
             Some(builder_node_id) => {
                 self.substrate
                     .builder_client_for_node(builder_node_id)
-                    .await?
+                    .await
             }
             // Jobs without routing ownership use unpinned discovery.
-            None => self.substrate.builder_client().await?,
-        };
-        Ok(client
-            .get_build_template_status(GetBuildStatusRequest { job_id })
-            .await?
-            .into_inner())
+            None => self.substrate.builder_client().await,
+        }
     }
 
     pub async fn poll_template_build_status(

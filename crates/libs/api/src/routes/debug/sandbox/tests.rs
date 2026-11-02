@@ -123,3 +123,157 @@ async fn the_debug_handler_answers_a_contended_read_with_a_503()
     db.pool.close().await;
     Ok(())
 }
+
+/// The debug read carries the quarantine section and each snapshot's storage
+/// placement, and a sandbox with neither reads as not quarantined with empty
+/// lists. The placement and quarantine rules are the stores' own tests; this
+/// pins that the route attaches them.
+#[tokio::test]
+async fn the_debug_read_reports_quarantine_and_snapshot_storage()
+-> pplx_space_db_test_fixtures::TestDbResult<()> {
+    use axum::extract::{Path, State};
+    use pplx_space_common_core::sql;
+    use pplx_space_common_core::types::NodeId;
+    use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, insert_ready_worker_node};
+
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let state = crate::routes::AppState::from_pool(db.pool.clone())
+        .await
+        .expect("app state from the test pool");
+    let actor = User {
+        id: UserId::new(),
+        email: "debug-read@example.test".to_string(),
+        password_hash: String::new(),
+        display_name: "debug read".to_string(),
+        org_id: OrgId::from_uuid(SEED_ORG_ID),
+        role: crate::user_role::UserRole::OrganizationAdmin,
+        owner_source: pplx_space_common_core::types::SandboxOwnerSource::Local,
+        created_at: OffsetDateTime::now_utc(),
+        updated_at: OffsetDateTime::now_utc(),
+    };
+    let node_id = NodeId::new();
+    insert_ready_worker_node(&db.pool, node_id).await?;
+    let artifact = uuid::Uuid::now_v7();
+    let plain = SandboxId::new();
+    let quarantined = SandboxId::new();
+    for (sandbox_id, artifact) in [(plain, None), (quarantined, Some(artifact))] {
+        sqlx::query(sql!(
+            "INSERT INTO sandboxes (id, user_id, org_id, network_policy_generation, lifecycle,
+                                    placement, active_node_id, current_local_artifact_id,
+                                    current_local_artifact_kind, current_local_artifact_origin)
+             VALUES ($1, $2, $3, 1, 'quarantined', 'placed', $4, $5,
+                     CASE WHEN $5::UUID IS NULL THEN NULL ELSE 'full' END,
+                     CASE WHEN $5::UUID IS NULL THEN NULL ELSE 'suspend' END)"
+        ))
+        .bind(sandbox_id)
+        .bind(SEED_USER_ID)
+        .bind(SEED_ORG_ID)
+        .bind(node_id)
+        .bind(artifact)
+        .execute(&db.pool)
+        .await?;
+    }
+    let quarantine_id = uuid::Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_quarantine_state
+             (sandbox_id, quarantine_id, source, reason_code, next_action)
+         VALUES ($1, $2, 'sbx_manager', 'pause_failed', 'requires_operator_attention')"
+    ))
+    .bind(quarantined)
+    .bind(quarantine_id)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_quarantine_history
+             (id, quarantine_id, sandbox_id, source, action, reason_code)
+         VALUES ($1, $2, $3, 'sbx_manager', 'entered_quarantine', 'pause_failed')"
+    ))
+    .bind(uuid::Uuid::now_v7())
+    .bind(quarantine_id)
+    .bind(quarantined)
+    .execute(&db.pool)
+    .await?;
+    let snapshot_id = uuid::Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO snapshots (id, sandbox_id, type, state, org_id, local_artifact_id,
+                                artifact_kind, artifact_origin)
+         VALUES ($1, $2, 'full', 'ready', $3, $4, 'full', 'suspend')"
+    ))
+    .bind(snapshot_id)
+    .bind(quarantined)
+    .bind(SEED_ORG_ID)
+    .bind(artifact)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO snapshot_storage_locations (snapshot_id, storage_connection_string, org_id)
+         VALUES ($1, 's3://synthetic-bucket/snapshots/x', $2)"
+    ))
+    .bind(snapshot_id)
+    .bind(SEED_ORG_ID)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_observed_states (sandbox_id, node_id) VALUES ($1, $2)"
+    ))
+    .bind(quarantined)
+    .bind(node_id)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_snapshot_inventory (sandbox_id, snapshot_id, type, state)
+         VALUES ($1, 'f-synthetic', 'full', 'ready')"
+    ))
+    .bind(quarantined)
+    .execute(&db.pool)
+    .await?;
+
+    let read = |sandbox_id: SandboxId| {
+        let state = state.clone();
+        let actor = actor.clone();
+        async move {
+            let response = get_sandbox_debug(
+                State(state),
+                axum::Extension(crate::middleware::auth::AuthUser(actor)),
+                Path(sandbox_id),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 1_000_000).await?;
+            pplx_space_db_test_fixtures::TestDbResult::Ok(serde_json::from_slice::<
+                serde_json::Value,
+            >(&body)?)
+        }
+    };
+
+    let body = read(plain).await?;
+    assert_eq!(
+        body["quarantine"],
+        serde_json::json!({"quarantined": false, "active": null, "history": []})
+    );
+    assert_eq!(body["snapshots"]["snapshots"], serde_json::json!([]));
+
+    let body = read(quarantined).await?;
+    assert_eq!(body["quarantine"]["quarantined"], true);
+    assert_eq!(
+        body["quarantine"]["active"]["quarantine_id"],
+        quarantine_id.to_string()
+    );
+    assert_eq!(body["quarantine"]["active"]["reason_code"], "pause_failed");
+    assert_eq!(
+        body["quarantine"]["history"][0]["action"],
+        "entered_quarantine"
+    );
+    // A quarantined sandbox is not settled on its node, so only the object
+    // store copy is reported (the placement rule is the store's own test).
+    assert_eq!(
+        body["snapshots"]["snapshots"][0]["storage"],
+        serde_json::json!({"location": "object_store", "node_id": null})
+    );
+    assert_eq!(body["snapshots"].get("storage_error"), None);
+    assert_eq!(
+        body["snapshots"]["inventory"][0]["snapshot_id"],
+        "f-synthetic"
+    );
+    Ok(())
+}

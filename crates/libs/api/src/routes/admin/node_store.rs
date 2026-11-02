@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 
 use pplx_space_common_core::types::{
-    NodeAddress, NodeDrainMode, NodeDrainPhase, NodeDrainState, NodeId, NodeManagedBy, NodeRole,
-    SandboxId,
+    NodeAddress, NodeDrainMode, NodeDrainPhase, NodeDrainState, NodeGroupId, NodeId, NodeManagedBy,
+    NodeRole, SandboxId,
     admin::{AdminNodeCtlStatus, AdminNodeServiceHealth, ListAdminNodesFilters},
 };
 use pplx_space_common_svc::sql::sandbox_residency::{
@@ -67,6 +67,7 @@ pub(super) struct AdminNodeRow {
     pub(super) drain_started_at: Option<OffsetDateTime>,
     pub(super) drain_last_error: Option<String>,
     pub(super) terminate_decrement_capacity: bool,
+    pub(super) node_group_id: Option<NodeGroupId>,
     pub(super) metadata: Option<sqlx::types::Json<serde_json::Value>>,
     pub(super) last_heartbeat: Option<OffsetDateTime>,
     pub(super) status_observed_at: Option<OffsetDateTime>,
@@ -83,6 +84,17 @@ pub(super) struct AdminNodeRow {
     pub(super) updated_at: Option<OffsetDateTime>,
     pub(super) deleted_at: Option<OffsetDateTime>,
     pub(super) substrate_node_id: Option<String>,
+}
+
+/// One guest platform of one runtime installation a node reported.
+#[derive(Debug, Clone, FromRow)]
+pub(super) struct NodeRuntimeInstallationRow {
+    pub(super) node_id: NodeId,
+    pub(super) runtime: String,
+    pub(super) runtime_version: String,
+    pub(super) observed_at: OffsetDateTime,
+    pub(super) guest_os: Option<String>,
+    pub(super) guest_arch: Option<String>,
 }
 
 impl AdminNodeRow {
@@ -330,6 +342,7 @@ const ADMIN_NODE_SELECT: &str = "SELECT n.id,
        n.drain_started_at,
        n.drain_last_error,
        n.terminate_decrement_capacity,
+       n.node_group_id,
        nd.metadata,
        n.last_heartbeat,
        nss.observed_at AS status_observed_at,
@@ -430,6 +443,33 @@ impl AdminNodeStore {
             .bind(phase_param)
             .fetch_all(&self.pool)
             .await
+    }
+
+    /// The runtime installations each of `node_ids` last reported, one row
+    /// per guest platform; an installation with no guest row has `guest_os`
+    /// and `guest_arch` NULL. Ordered by node, runtime and version.
+    pub(super) async fn runtime_installations_for_nodes(
+        &self,
+        node_ids: &[NodeId],
+    ) -> Result<Vec<NodeRuntimeInstallationRow>, sqlx::Error> {
+        sqlx::query_as(sql!(
+            "SELECT i.node_id,
+                    i.runtime,
+                    i.runtime_version,
+                    i.observed_at,
+                    g.guest_os,
+                    g.guest_arch
+             FROM node_runtime_installations i
+             LEFT JOIN node_runtime_guests g
+               ON g.node_id = i.node_id
+              AND g.runtime = i.runtime
+              AND g.runtime_version = i.runtime_version
+             WHERE i.node_id = ANY($1)
+             ORDER BY i.node_id, i.runtime, i.runtime_version, g.guest_os, g.guest_arch"
+        ))
+        .bind(node_ids)
+        .fetch_all(&self.pool)
+        .await
     }
 
     /// Occupancy lookup keyed on `node_id`. Returns the count of

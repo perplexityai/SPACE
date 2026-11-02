@@ -40,6 +40,7 @@ fn test_admin_node_row() -> AdminNodeRow {
         drain_started_at: None,
         drain_last_error: None,
         terminate_decrement_capacity: false,
+        node_group_id: None,
         metadata: None,
         last_heartbeat: None,
         status_observed_at: None,
@@ -2311,4 +2312,263 @@ fn the_terminate_conflict_body_keeps_the_key_the_rollout_tool_reads() {
         "the classification key the tool branches on stays put; this is why \
          dropping the alias would be silent rather than loud"
     );
+}
+
+/// The read routes report cordon from the substrate's Node cache, and the
+/// node group, queued trigger and runtime installations from Postgres. A node
+/// with none of them reads as absent or empty, and Direct, which has no
+/// cordon, never reports one.
+#[cfg(feature = "kubernetes")]
+#[tokio::test(flavor = "current_thread")]
+async fn node_reads_report_cordon_group_trigger_and_runtimes() -> TestResult {
+    use crate::controllers::substrate::{Substrate, kubernetes::tests as k8s};
+
+    if !enter_direct_test_process() {
+        return Ok(());
+    }
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let group_id = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO node_groups (id, name) VALUES ($1, 'synthetic-group')"
+    ))
+    .bind(group_id)
+    .execute(&db.pool)
+    .await?;
+    let busy = insert_drain_test_node(&db.pool, NodeManagedBy::Kubernetes, None).await?;
+    let idle = insert_drain_test_node(&db.pool, NodeManagedBy::Kubernetes, None).await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_k8s (node_id, k8s_node_name)
+         VALUES ($1, 'synthetic-busy'), ($2, 'synthetic-idle')"
+    ))
+    .bind(busy)
+    .bind(idle)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!("UPDATE nodes SET node_group_id = $2 WHERE id = $1"))
+        .bind(busy)
+        .bind(group_id)
+        .execute(&db.pool)
+        .await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_runtime_installations (node_id, runtime, runtime_version)
+         VALUES ($1, 'fc', '1.15.1'), ($1, 'fc', '1.16.0')"
+    ))
+    .bind(busy)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_runtime_guests (node_id, runtime, runtime_version, guest_os, guest_arch)
+         VALUES ($1, 'fc', '1.15.1', 'linux', 'aarch64'), ($1, 'fc', '1.15.1', 'linux', 'x86_64')"
+    ))
+    .bind(busy)
+    .execute(&db.pool)
+    .await?;
+    crate::reconcile_trigger::enqueue_triggers(
+        &db.pool,
+        [busy],
+        pplx_space_common_svc::types::ReconcileReason::ManualNodeReconcile,
+    )
+    .await?;
+
+    let direct = AppState::from_pool(db.pool.clone()).await?;
+    let mut kubernetes = direct.clone();
+    kubernetes.sandbox_controller = crate::controllers::sandbox::SandboxController::new(
+        Substrate::from_kubernetes(k8s::substrate_with_store_client_pods_and_nodes(
+            db.pool.clone(),
+            k8s::inert_kubernetes_client(),
+            Vec::new(),
+            vec![
+                k8s::node_with_network_slots(
+                    "synthetic-busy",
+                    Default::default(),
+                    None,
+                    None,
+                    true,
+                    true,
+                )
+                .as_ref()
+                .clone(),
+                k8s::node_with_network_slots(
+                    "synthetic-idle",
+                    Default::default(),
+                    None,
+                    None,
+                    true,
+                    false,
+                )
+                .as_ref()
+                .clone(),
+            ],
+        )),
+    );
+    let actor =
+        inventory_test_actor(crate::routes::authz::cluster_managing_org_id(&db.pool).await?);
+    for (state, busy_cordoned, idle_cordoned) in
+        [(direct, None, None), (kubernetes, Some(true), Some(false))]
+    {
+        let app = axum::Router::new()
+            .route("/admin/api/v1/nodes", axum::routing::get(list_admin_nodes))
+            .route(
+                "/admin/api/v1/nodes/{spec}",
+                axum::routing::get(get_admin_node),
+            )
+            .layer(Extension(AuthUser(actor.clone())))
+            .with_state(state);
+        let read = |uri: String| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .uri(uri)
+                            .body(axum::body::Body::empty())?,
+                    )
+                    .await?;
+                assert_eq!(response.status(), StatusCode::OK);
+                TestResult::Ok(serde_json::from_slice::<serde_json::Value>(
+                    &axum::body::to_bytes(response.into_body(), 100_000).await?,
+                )?)
+            }
+        };
+        // Each node reads the same from the list and the detail route, with
+        // and without occupancy.
+        for suffix in ["", "?include_occupancy=false"] {
+            let listed = read(format!("/admin/api/v1/nodes{suffix}")).await?;
+            for (node_id, cordoned) in [(busy, busy_cordoned), (idle, idle_cordoned)] {
+                let from_list = listed
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|row| row["id"] == node_id.to_string())
+                    .expect("listed node")
+                    .clone();
+                let detail = read(format!("/admin/api/v1/nodes/{node_id}{suffix}")).await?;
+                for row in [from_list, detail] {
+                    assert_eq!(
+                        row.get("cordoned").and_then(|v| v.as_bool()),
+                        cordoned,
+                        "{suffix}"
+                    );
+                    let node: AdminNodeResponse = serde_json::from_value(row)?;
+                    if node_id == idle {
+                        assert_eq!(node.node_group_id, None);
+                        assert_eq!(node.reconcile_trigger, None);
+                        assert_eq!(node.runtime_installations, Some(Vec::new()));
+                        continue;
+                    }
+                    assert_eq!(node.node_group_id.map(|id| id.as_uuid()), Some(group_id));
+                    let trigger = node.reconcile_trigger.expect("queued trigger");
+                    assert_eq!(trigger.reasons, vec!["manual_node_reconcile"]);
+                    assert_eq!((trigger.attempts, trigger.claimed_at), (0, None));
+                    let installations = node.runtime_installations.expect("installations");
+                    assert_eq!(
+                        installations
+                            .iter()
+                            .map(|i| (i.runtime_version.as_str(), i.guests.clone()))
+                            .collect::<Vec<_>>(),
+                        vec![
+                            (
+                                "1.15.1",
+                                vec!["linux/aarch64".to_string(), "linux/x86_64".to_string()]
+                            ),
+                            ("1.16.0", Vec::new()),
+                        ]
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A failed trigger or installation read leaves the node routes up. Each node
+/// still lists, without either field and with a `read_state_error`, so a
+/// client can tell "could not read" from "nothing queued".
+#[tokio::test]
+async fn node_reads_survive_a_failed_read_state_read() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(
+            db.pool
+                .connect_options()
+                .as_ref()
+                .clone()
+                .options([("lock_timeout", "100ms")]),
+        )
+        .await?;
+    let state = AppState::from_pool(pool).await?;
+    let actor =
+        inventory_test_actor(crate::routes::authz::cluster_managing_org_id(&db.pool).await?);
+    let node_id = insert_drain_test_node(&db.pool, NodeManagedBy::Space, None).await?;
+    crate::reconcile_trigger::enqueue_triggers(
+        &db.pool,
+        [node_id],
+        pplx_space_common_svc::types::ReconcileReason::ManualNodeReconcile,
+    )
+    .await?;
+    let read_node = |response: axum::response::Response| async move {
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 100_000).await?;
+        let nodes = match serde_json::from_slice::<Vec<AdminNodeResponse>>(&body) {
+            Ok(nodes) => nodes,
+            Err(_) => vec![serde_json::from_slice::<AdminNodeResponse>(&body)?],
+        };
+        TestResult::Ok(
+            nodes
+                .into_iter()
+                .find(|node| node.id == node_id)
+                .expect("node listed"),
+        )
+    };
+    let reads = || async {
+        let mut nodes = Vec::new();
+        for include_occupancy in [Some(false), None] {
+            let response = list_admin_nodes(
+                State(state.clone()),
+                Extension(AuthUser(actor.clone())),
+                Query(ListAdminNodesFilters {
+                    include_occupancy,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .into_response();
+            nodes.push(read_node(response).await?);
+        }
+        let response = get_admin_node(
+            Query(GetAdminNodeFilters::default()),
+            State(state.clone()),
+            Extension(AuthUser(actor.clone())),
+            Path(node_id.to_string()),
+        )
+        .await;
+        nodes.push(read_node(response).await?);
+        TestResult::Ok(nodes)
+    };
+
+    let mut lock = db.pool.begin().await?;
+    sqlx::query(sql!(
+        "LOCK TABLE node_reconcile_triggers IN ACCESS EXCLUSIVE MODE"
+    ))
+    .execute(&mut *lock)
+    .await?;
+    for node in reads().await? {
+        assert_eq!(node.reconcile_trigger, None);
+        assert_eq!(node.runtime_installations, None);
+        let error = node.read_state_error.expect("read_state_error");
+        assert!(error.contains("lock timeout"), "{error}");
+    }
+    lock.rollback().await?;
+
+    for node in reads().await? {
+        assert_eq!(node.read_state_error, None);
+        assert!(node.reconcile_trigger.is_some());
+        assert_eq!(node.runtime_installations, Some(Vec::new()));
+    }
+    Ok(())
 }

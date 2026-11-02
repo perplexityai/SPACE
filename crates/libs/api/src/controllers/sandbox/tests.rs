@@ -462,9 +462,14 @@ mod template_release_resolution_postgres_tests {
         );
         assert_eq!(template.artifact_digest(), None);
 
-        let resolved =
-            resolve_template_release(&db.pool, &template, RuntimeKind::Firecracker, OrgId::new())
-                .await?;
+        let resolved = resolve_template_release(
+            &db.pool,
+            &template,
+            RuntimeKind::Firecracker,
+            OrgId::new(),
+            ReleaseMissReport::Classified,
+        )
+        .await?;
 
         assert_eq!(resolved, (release_id, content_hash.to_string()));
         Ok(())
@@ -485,10 +490,15 @@ mod template_release_resolution_postgres_tests {
         .await?;
         let caller_org = OrgId::new();
         let missing = "custom-template:v123".parse::<TemplateReference>()?;
-        let error =
-            resolve_template_release(&db.pool, &missing, RuntimeKind::Firecracker, caller_org)
-                .await
-                .unwrap_err();
+        let error = resolve_template_release(
+            &db.pool,
+            &missing,
+            RuntimeKind::Firecracker,
+            caller_org,
+            ReleaseMissReport::Classified,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(error.status(), axum::http::StatusCode::NOT_FOUND);
 
         insert_release_with_latest_tag(&db.pool, "custom-template", release_id, content_hash, None)
@@ -500,9 +510,14 @@ mod template_release_resolution_postgres_tests {
         ] {
             let template = reference.parse::<TemplateReference>()?;
 
-            let resolved =
-                resolve_template_release(&db.pool, &template, RuntimeKind::Firecracker, caller_org)
-                    .await?;
+            let resolved = resolve_template_release(
+                &db.pool,
+                &template,
+                RuntimeKind::Firecracker,
+                caller_org,
+                ReleaseMissReport::Classified,
+            )
+            .await?;
 
             assert_eq!(resolved, (release_id, content_hash.to_string()));
         }
@@ -513,6 +528,7 @@ mod template_release_resolution_postgres_tests {
             &missing_digest,
             RuntimeKind::Firecracker,
             caller_org,
+            ReleaseMissReport::Classified,
         )
         .await
         .unwrap_err();
@@ -557,6 +573,7 @@ mod template_release_resolution_postgres_tests {
             &tagged_template,
             RuntimeKind::Firecracker,
             cross_org_caller,
+            ReleaseMissReport::Classified,
         )
         .await?;
         assert_eq!(resolved_tag, (release_id, content_hash.to_string()));
@@ -569,6 +586,7 @@ mod template_release_resolution_postgres_tests {
             &digest_template,
             RuntimeKind::Firecracker,
             cross_org_caller,
+            ReleaseMissReport::Classified,
         )
         .await?;
         assert_eq!(resolved_digest, (release_id, content_hash.to_string()));
@@ -578,6 +596,7 @@ mod template_release_resolution_postgres_tests {
             &digest_template,
             RuntimeKind::CloudHypervisor,
             cross_org_caller,
+            ReleaseMissReport::Classified,
         )
         .await
         .unwrap_err();
@@ -665,6 +684,7 @@ mod template_release_resolution_postgres_tests {
             &template,
             RuntimeKind::Firecracker,
             org(TENANT_ORG),
+            ReleaseMissReport::Classified,
         )
         .await?;
 
@@ -696,6 +716,7 @@ mod template_release_resolution_postgres_tests {
             &denied_template,
             RuntimeKind::Firecracker,
             org(OTHER_ORG),
+            ReleaseMissReport::Classified,
         )
         .await
         .unwrap_err();
@@ -710,6 +731,7 @@ mod template_release_resolution_postgres_tests {
             &absent_template,
             RuntimeKind::Firecracker,
             org(OTHER_ORG),
+            ReleaseMissReport::Classified,
         )
         .await
         .unwrap_err();
@@ -718,6 +740,9 @@ mod template_release_resolution_postgres_tests {
             denied.to_string().replace("tenant-secret", "{name}"),
             absent.to_string().replace("tenant-absent", "{name}"),
         );
+
+        assert_eq!(denied.template_release_miss(), None);
+        assert_eq!(absent.template_release_miss(), None);
 
         // The digest path is gated too, with the digest-shaped message.
         let denied_digest_template = format!("tenant-secret@{content_hash}")
@@ -728,15 +753,159 @@ mod template_release_resolution_postgres_tests {
             &denied_digest_template,
             RuntimeKind::Firecracker,
             org(OTHER_ORG),
+            ReleaseMissReport::Classified,
         )
         .await
         .unwrap_err();
         assert_eq!(denied_digest.status(), axum::http::StatusCode::NOT_FOUND);
         assert_eq!(
             denied_digest.to_string(),
-            format!("no release found for template 'tenant-secret' hash '{content_hash}'"),
+            format!(
+                "no release found for template 'tenant-secret' runtime 'fc' hash '{content_hash}'"
+            ),
         );
+        assert_eq!(denied_digest.template_release_miss(), None);
 
+        Ok(())
+    }
+
+    /// A miss on a template the caller may use says whether the template has
+    /// any release at all, on the tag and digest paths alike; an absent or
+    /// foreign template stays the plain not-found. The status and message do
+    /// not depend on the cause, so synchronous surfaces cannot tell them apart.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_release_miss_says_whether_the_template_has_any_release() -> TestResult {
+        use crate::controllers::TemplateReleaseMiss::{NoMatchingRelease, NoRelease};
+
+        let db = pg_test_db().await?;
+        let released_hash =
+            "sha256:6666666666666666666666666666666666666666666666666666666666666666";
+        let other_hash = "sha256:7777777777777777777777777777777777777777777777777777777777777777";
+        let caller = Uuid::parse_str(OTHER_ORG)?;
+        insert_org_specific_template(&db.pool, "own-unreleased", caller).await?;
+        insert_org_specific_template(&db.pool, "own-released", caller).await?;
+        insert_release_with_latest_tag(
+            &db.pool,
+            "own-released",
+            Uuid::now_v7(),
+            released_hash,
+            Some(caller),
+        )
+        .await?;
+        // Released, but `latest` points nowhere: only a `v1` tag exists.
+        insert_org_specific_template(&db.pool, "own-untagged", caller).await?;
+        let untagged_release = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO template_releases (id, template_name, type, hash, org_id)
+             VALUES ($1, 'own-untagged', 'fc', $2, $3)",
+        )
+        .bind(untagged_release)
+        .bind(other_hash)
+        .bind(caller)
+        .execute(&db.pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO template_release_tags (template_release_id, template_name, tag)
+             VALUES ($1, 'own-untagged', 'v1')",
+        )
+        .bind(untagged_release)
+        .execute(&db.pool)
+        .await?;
+        insert_org_specific_template(&db.pool, "foreign", Uuid::parse_str(TENANT_ORG)?).await?;
+
+        for (reference, runtime, expected) in [
+            (
+                "own-unreleased:latest",
+                RuntimeKind::Firecracker,
+                Some(NoRelease),
+            ),
+            (
+                &format!("own-unreleased@{other_hash}"),
+                RuntimeKind::Firecracker,
+                Some(NoRelease),
+            ),
+            // Every stored release is Firecracker's.
+            (
+                "own-released:latest",
+                RuntimeKind::Gvisor,
+                Some(NoMatchingRelease),
+            ),
+            (
+                &format!("own-released@{released_hash}"),
+                RuntimeKind::CloudHypervisor,
+                Some(NoMatchingRelease),
+            ),
+            (
+                &format!("own-released@{other_hash}"),
+                RuntimeKind::Firecracker,
+                Some(NoMatchingRelease),
+            ),
+            (
+                "own-untagged:v2",
+                RuntimeKind::Firecracker,
+                Some(NoMatchingRelease),
+            ),
+            ("absent:latest", RuntimeKind::Firecracker, None),
+            (
+                &format!("absent@{other_hash}"),
+                RuntimeKind::Firecracker,
+                None,
+            ),
+            ("foreign:latest", RuntimeKind::Firecracker, None),
+            (
+                &format!("foreign@{other_hash}"),
+                RuntimeKind::Firecracker,
+                None,
+            ),
+        ] {
+            let template = reference.parse::<TemplateReference>().unwrap();
+            let error = resolve_template_release(
+                &db.pool,
+                &template,
+                runtime,
+                org(OTHER_ORG),
+                ReleaseMissReport::Classified,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error.status(),
+                axum::http::StatusCode::NOT_FOUND,
+                "{reference}"
+            );
+            assert_eq!(
+                error.template_release_miss(),
+                expected,
+                "{reference} {runtime:?}"
+            );
+            let name = template.name().as_str();
+            // The auto-lifecycle update resolves with a runtime that may not
+            // be the sandbox's, so it keeps the plain not-found.
+            let unclassified = resolve_template_release(
+                &db.pool,
+                &template,
+                runtime,
+                org(OTHER_ORG),
+                ReleaseMissReport::NotFound,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(unclassified.template_release_miss(), None, "{reference}");
+            assert_eq!(unclassified.to_string(), error.to_string(), "{reference}");
+            let shape = error.to_string().replace(&format!("'{name}'"), "'{name}'");
+            let expected_shape = match template.artifact_digest() {
+                Some(digest) => format!(
+                    "no release found for template '{{name}}' runtime '{}' hash '{digest}'",
+                    runtime.alias()
+                ),
+                None => format!(
+                    "no release found for template '{{name}}' runtime '{}' tag '{}'",
+                    runtime.alias(),
+                    template.tag().unwrap().as_str()
+                ),
+            };
+            assert_eq!(shape, expected_shape, "{reference}");
+        }
         Ok(())
     }
 
@@ -774,6 +943,7 @@ mod template_release_resolution_postgres_tests {
                 &reference.parse()?,
                 RuntimeKind::Firecracker,
                 org(caller),
+                ReleaseMissReport::Classified,
             )
             .await
             .expect_err("inventory cannot publish a release");
@@ -856,6 +1026,7 @@ mod template_release_resolution_postgres_tests {
             &format!("{template_name}:latest").parse()?,
             RuntimeKind::Firecracker,
             org(OTHER_ORG),
+            ReleaseMissReport::Classified,
         )
         .await?;
         let latest = sqlx::query_as::<_, (Uuid, time::OffsetDateTime)>(

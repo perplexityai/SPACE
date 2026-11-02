@@ -1216,6 +1216,31 @@ impl KubernetesSubstrate {
         Some(names)
     }
 
+    /// Each cached Node's `spec.unschedulable`, keyed by Node name. `None`
+    /// until the Node reflector's first list completes, so a cold cache does
+    /// not read as every node schedulable.
+    pub fn node_cordon_states(&self) -> Option<std::collections::HashMap<String, bool>> {
+        if !self.k8s.caches.nodes_ready() {
+            return None;
+        }
+        let states = self
+            .k8s
+            .caches
+            .nodes
+            .state()
+            .iter()
+            .filter_map(|node| {
+                let cordoned = node
+                    .spec
+                    .as_ref()
+                    .and_then(|spec| spec.unschedulable)
+                    .unwrap_or(false);
+                node.metadata.name.clone().map(|name| (name, cordoned))
+            })
+            .collect();
+        Some(states)
+    }
+
     /// Confirm one Node's current API-server presence after a destructive
     /// reconciler has observed sustained reflector absence. This bounded GET
     /// is deliberately separate from the reflector snapshot: a stalled watch

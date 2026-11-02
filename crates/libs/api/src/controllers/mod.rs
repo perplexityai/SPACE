@@ -56,10 +56,25 @@ enum ControllerErrorKind {
     /// which blames the sandbox fleet for a Postgres lock race and puts the
     /// wrong `origin` on the response metrics.
     LockContention,
+    /// A template the caller may use resolved to no release. The status stays
+    /// the plain 404, so surfaces that answer synchronously are unchanged;
+    /// the operation executors read the kind to fail with a template-specific
+    /// reason.
+    TemplateReleaseMiss(TemplateReleaseMiss),
     /// A DELETE refused because a snapshot upload is still in flight.
     /// Carried so the native delete executor can wait for the upload to
     /// finalize instead of failing the operation.
     SnapshotUploadInFlight(SnapshotUploadInFlight),
+}
+
+/// Why a template the caller may use resolved to no release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TemplateReleaseMiss {
+    /// The template has no release at all, as when its only build failed.
+    NoRelease,
+    /// The template has releases, but none matches the requested tag or
+    /// digest and runtime.
+    NoMatchingRelease,
 }
 
 /// The in-flight snapshot upload a delete check refused a DELETE for.
@@ -323,6 +338,22 @@ impl ControllerError {
         let mut error = Self::conflict("sandbox already exists");
         error.kind = ControllerErrorKind::SandboxAlreadyExists;
         error
+    }
+
+    /// Mark a release-not-found error with why the caller's template resolved
+    /// to no release. Only for a template the caller is authorized to use: an
+    /// absent or cross-org template must stay indistinguishable from one
+    /// another.
+    pub(crate) fn with_template_release_miss(mut self, miss: TemplateReleaseMiss) -> Self {
+        self.kind = ControllerErrorKind::TemplateReleaseMiss(miss);
+        self
+    }
+
+    pub(crate) const fn template_release_miss(&self) -> Option<TemplateReleaseMiss> {
+        match self.kind {
+            ControllerErrorKind::TemplateReleaseMiss(miss) => Some(miss),
+            _ => None,
+        }
     }
 
     pub(crate) const fn is_sandbox_already_exists(&self) -> bool {

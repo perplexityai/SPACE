@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::NodeId;
+use pplx_space_common_core::types::{BuildRunId, NodeId};
 use pplx_space_common_core::types::{OrgId, UserId};
 
 use super::*;
@@ -1066,4 +1066,332 @@ fn template_delete_idempotency_key_is_header_text_within_the_cap() {
         assert_eq!(error.0, StatusCode::BAD_REQUEST, "{message}");
         assert_eq!(error.1.message, message);
     }
+}
+
+/// The peer address of each status call a fake builder served: one entry per
+/// call, and one distinct address per client connection.
+type BuilderCalls = std::sync::Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>>;
+
+/// Serve a builder's `GetBuildTemplateStatus` for the given jobs, recording
+/// each call's connection. A job it does not know answers gRPC `NOT_FOUND`.
+async fn spawn_status_builder(
+    jobs: HashMap<String, build_proto::GetBuildStatusResponse>,
+    calls: BuilderCalls,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> TestResult<std::net::SocketAddr> {
+    use axum::body::{Body, Bytes};
+    use axum::http::{HeaderMap, header};
+    use http_body_util::StreamBody;
+    use hyper::body::Frame;
+    use prost::Message as _;
+
+    let builder = axum::Router::new().route(
+        "/space.node.api.v1.BuilderApi/GetBuildTemplateStatus",
+        axum::routing::post(
+            move |axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<
+                std::net::SocketAddr,
+            >,
+                  body: Bytes| {
+                let jobs = jobs.clone();
+                let calls = calls.clone();
+                async move {
+                    calls.lock().unwrap().push(peer);
+                    let request = build_proto::GetBuildStatusRequest::decode(&body[5..]).unwrap();
+                    let mut trailers = HeaderMap::new();
+                    let mut frames = Vec::new();
+                    match jobs.get(&request.job_id) {
+                        Some(response) => {
+                            let response = response.encode_to_vec();
+                            let mut frame = vec![0];
+                            frame.extend_from_slice(
+                                &u32::try_from(response.len()).unwrap().to_be_bytes(),
+                            );
+                            frame.extend_from_slice(&response);
+                            frames.push(Ok::<_, std::convert::Infallible>(Frame::data(
+                                Bytes::from(frame),
+                            )));
+                            trailers.insert("grpc-status", "0".parse().unwrap());
+                        }
+                        None => {
+                            trailers.insert("grpc-status", "5".parse().unwrap());
+                            trailers.insert("grpc-message", "build job not found".parse().unwrap());
+                        }
+                    }
+                    frames.push(Ok(Frame::trailers(trailers)));
+                    (
+                        [(header::CONTENT_TYPE, "application/grpc")],
+                        Body::new(StreamBody::new(tokio_stream::iter(frames))),
+                    )
+                }
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            builder.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown.cancelled_owned())
+        .await
+        .unwrap();
+    });
+    Ok(address)
+}
+
+/// A Direct builder that unpinned discovery can pick: registered, routed to
+/// `endpoint`, with a fresh ready status snapshot.
+async fn insert_direct_builder(
+    pool: &sqlx::PgPool,
+    node_id: NodeId,
+    endpoint: std::net::SocketAddr,
+) -> TestResult {
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role, managed_by, state)
+         VALUES ($1, '127.0.0.1'::INET, 'builder', 'space', 'registered')"
+    ))
+    .bind(node_id)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_direct (node_id, name, node_api_endpoint) VALUES ($1, $2, $3)"
+    ))
+    .bind(node_id)
+    .bind(format!("builder-{node_id}"))
+    .bind(endpoint.to_string())
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_status_snapshots
+         (node_id, observed_at, stale_after, reachable, role, scheduling_status,
+          health_healthy, services, updated_at)
+         VALUES ($1, NOW(), NOW() + INTERVAL '1 hour', TRUE, 'builder', 'ready',
+                 TRUE, '[]'::JSONB, NOW())"
+    ))
+    .bind(node_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The builds listing reads the recorded jobs newest first, bounded by
+/// `limit`, and reports what each job's builder answers: success with its
+/// content hash, failure with its error, and a status for another template as
+/// a `status_error`. A builder that cannot be reached stamps one error on each
+/// of its jobs without a call, a job with no pinned builder is asked through
+/// unpinned discovery, and the reachable builder gets one call per job. A template
+/// with no builds lists none; an unknown template is a 404.
+#[tokio::test]
+async fn template_builds_list_reports_each_jobs_builder_status() -> TestResult {
+    // The fake builder speaks plaintext gRPC and ignores the bearer token.
+    if !pplx_space_test_env::enter_test_process(&[
+        (
+            "SPACE_INTERNAL_RPC_INSECURE_DEV",
+            Some(std::ffi::OsStr::new("true")),
+        ),
+        (
+            "SPACE_INTERNAL_TOKEN",
+            Some(std::ffi::OsStr::new("synthetic-test-token")),
+        ),
+    ]) {
+        return Ok(());
+    }
+    let db = pg_test_db().await?;
+    let state = AppState::from_pool(db.pool.clone()).await?;
+    let managing_org_id = crate::routes::authz::cluster_managing_org_id(&db.pool).await?;
+    let actor = User {
+        id: UserId::new(),
+        email: "builds-test@example.invalid".into(),
+        password_hash: String::new(),
+        display_name: "Builds test".into(),
+        org_id: managing_org_id,
+        role: crate::user_role::UserRole::OrganizationAdmin,
+        owner_source: pplx_space_common_core::types::SandboxOwnerSource::Local,
+        created_at: time::OffsetDateTime::UNIX_EPOCH,
+        updated_at: time::OffsetDateTime::UNIX_EPOCH,
+    };
+    let built = TemplateName::parse("synthetic-built")?;
+    let unbuilt = TemplateName::parse("synthetic-unbuilt")?;
+    insert_template(&db.pool, &built).await?;
+    insert_template(&db.pool, &unbuilt).await?;
+
+    let [succeeded, failed, foreign, down_a, down_b, unpinned] =
+        std::array::from_fn(|_| BuildRunId::new());
+    let status = |template: &str, state: build_proto::BuildState, hash: &str, error: &str| {
+        build_proto::GetBuildStatusResponse {
+            state: state as i32,
+            template_id: template.to_string(),
+            template_version: String::new(),
+            content_hash: hash.to_string(),
+            error: error.to_string(),
+        }
+    };
+    let hash = "blake3:1111111111111111111111111111111111111111111111111111111111111111";
+    let jobs = HashMap::from([
+        (
+            succeeded.to_string(),
+            status(built.as_str(), build_proto::BuildState::Succeeded, hash, ""),
+        ),
+        (
+            failed.to_string(),
+            status(
+                built.as_str(),
+                build_proto::BuildState::Failed,
+                "",
+                "step 1 failed",
+            ),
+        ),
+        (
+            foreign.to_string(),
+            status(
+                "synthetic-other",
+                build_proto::BuildState::Succeeded,
+                hash,
+                "",
+            ),
+        ),
+        (
+            unpinned.to_string(),
+            status(built.as_str(), build_proto::BuildState::Running, "", ""),
+        ),
+    ]);
+    let calls = BuilderCalls::default();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let _stop = shutdown.clone().drop_guard();
+    let reachable = NodeId::new();
+    insert_direct_builder(
+        &db.pool,
+        reachable,
+        spawn_status_builder(jobs, calls.clone(), shutdown).await?,
+    )
+    .await?;
+    // A builder row with no route, so resolving its client fails.
+    let unreachable = NodeId::new();
+    insert_node(&db.pool, unreachable, "builder").await?;
+
+    // Newest first: (job, builder, minutes ago).
+    let recorded: [(Option<BuildRunId>, Option<NodeId>, i32); 7] = [
+        (Some(succeeded), Some(reachable), 1),
+        (Some(failed), Some(reachable), 2),
+        (Some(foreign), Some(reachable), 3),
+        (Some(down_a), Some(unreachable), 4),
+        (Some(down_b), Some(unreachable), 5),
+        (Some(unpinned), None, 6),
+        (None, None, 7),
+    ];
+    for (index, (job, builder, minutes_ago)) in recorded.into_iter().enumerate() {
+        sqlx::query(sql!(
+            "INSERT INTO template_build_jobs
+                 (template_id, build_id, daemon_job_id, builder_node_id, created_at)
+             VALUES ($1, $2, $3, $4, NOW() - make_interval(mins => $5))"
+        ))
+        .bind(built.as_str())
+        .bind(format!("build-{index}"))
+        .bind(job.map(|job| job.to_string()))
+        .bind(builder)
+        .bind(minutes_ago)
+        .execute(&db.pool)
+        .await?;
+    }
+
+    let list = |template: &TemplateName, limit: Option<u32>| {
+        list_template_builds(
+            State(state.clone()),
+            Extension(AuthUser(actor.clone())),
+            Path(template.clone()),
+            axum::extract::Query(ListTemplateBuildsQuery { limit }),
+        )
+    };
+    let read = |response: axum::response::Response| async move {
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 100_000).await?;
+        TestResult::Ok((status, serde_json::from_slice::<serde_json::Value>(&body)?))
+    };
+
+    let (status, body) = read(list(&built, None).await.into_response()).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let entries: Vec<TemplateBuildListEntry> = serde_json::from_value(body)?;
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.job_id.clone())
+            .collect::<Vec<_>>(),
+        [succeeded, failed, foreign, down_a, down_b, unpinned].map(|job| job.to_string())
+    );
+    let reported: Vec<_> = entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.builder_node_id,
+                entry.state,
+                entry.content_hash.as_deref(),
+                entry.error.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        reported,
+        vec![
+            (
+                Some(reachable),
+                Some(TemplateBuildStateResponse::Succeeded),
+                Some(hash),
+                None
+            ),
+            (
+                Some(reachable),
+                Some(TemplateBuildStateResponse::Failed),
+                None,
+                Some("step 1 failed")
+            ),
+            (Some(reachable), None, None, None),
+            (Some(unreachable), None, None, None),
+            (Some(unreachable), None, None, None),
+            (None, Some(TemplateBuildStateResponse::Running), None, None),
+        ],
+        "{entries:#?}"
+    );
+    assert_eq!(
+        entries[2].status_error.as_deref(),
+        Some("builder reported the job for another template")
+    );
+    let down_error = entries[3]
+        .status_error
+        .clone()
+        .expect("unreachable builder");
+    assert_eq!(
+        entries[4].status_error.as_deref(),
+        Some(down_error.as_str())
+    );
+    for entry in [&entries[0], &entries[1], &entries[5]] {
+        assert_eq!(entry.status_error, None, "{entry:?}");
+    }
+    // Four jobs reached the reachable builder: three pinned to it, and the
+    // unpinned one through discovery. The unreachable builder's two got none.
+    // They arrived over one connection per resolved client: one for the
+    // three pinned jobs, one for discovery's.
+    let calls = calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 4);
+    assert_eq!(
+        calls.iter().collect::<std::collections::HashSet<_>>().len(),
+        2,
+        "{calls:?}"
+    );
+
+    let (_, body) = read(list(&built, Some(1)).await.into_response()).await?;
+    assert_eq!(body.as_array().map(Vec::len), Some(1));
+    assert_eq!(body[0]["job_id"], succeeded.to_string());
+
+    let (status, body) = read(list(&unbuilt, None).await.into_response()).await?;
+    assert_eq!((status, body), (StatusCode::OK, serde_json::json!([])));
+
+    for limit in [0, MAX_TEMPLATE_BUILDS_LIMIT + 1] {
+        let (status, _) = read(list(&built, Some(limit)).await.into_response()).await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "limit {limit}");
+    }
+    let missing = TemplateName::parse("synthetic-missing")?;
+    let (status, _) = read(list(&missing, None).await.into_response()).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    Ok(())
 }

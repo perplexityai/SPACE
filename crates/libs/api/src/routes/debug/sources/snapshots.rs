@@ -4,8 +4,8 @@ use pplx_space_common_core::sql;
 use sqlx::PgPool;
 
 use crate::routes::debug::{
-    response::{Snapshot, SnapshotInventory, SnapshotsSection},
-    sources::begin_read_only,
+    response::{Snapshot, SnapshotInventory, SnapshotStorage, SnapshotsSection},
+    sources::{begin_read_only, source_error},
 };
 
 pub(in crate::routes::debug) async fn fetch(
@@ -13,7 +13,7 @@ pub(in crate::routes::debug) async fn fetch(
     sandbox_id: SandboxId,
 ) -> Result<SnapshotsSection, sqlx::Error> {
     let mut tx = begin_read_only(pool).await?;
-    let snapshots = sqlx::query_as::<_, Snapshot>(sql!(
+    let mut snapshots = sqlx::query_as::<_, Snapshot>(sql!(
         "SELECT id,
                 sandbox_id,
                 type,
@@ -62,9 +62,31 @@ pub(in crate::routes::debug) async fn fetch(
     .fetch_all(&mut *tx)
     .await?;
 
-    tx.commit().await?;
+    // Last, because a failed statement aborts the transaction: the catalog
+    // and inventory above are already read, and only `storage` is lost.
+    let storage_error =
+        match pplx_space_snapshot_store::storage_placements(&mut *tx, sandbox_id).await {
+            Ok(placements) => {
+                for snapshot in &mut snapshots {
+                    snapshot.storage = placements
+                        .iter()
+                        .find(|placement| placement.snapshot_id.as_uuid() == snapshot.id)
+                        .map(|placement| {
+                            SnapshotStorage::new(
+                                placement.in_object_store,
+                                placement.node_local_node_id,
+                            )
+                        });
+                }
+                tx.commit().await?;
+                None
+            }
+            // Dropping the aborted transaction rolls it back.
+            Err(error) => Some(source_error(error)),
+        };
     Ok(SnapshotsSection {
         snapshots,
         inventory,
+        storage_error,
     })
 }

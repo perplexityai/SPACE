@@ -421,3 +421,147 @@ async fn fetch_targets_treats_empty_live_snapshot_as_unknown_membership() -> Tes
     assert!(targets.permanently_unavailable.is_empty());
     Ok(())
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn queued_triggers_reports_each_node_until_its_trigger_drains() -> TestResult {
+    let db = pg_test_db().await?;
+    let queued_node = NodeId::new();
+    let idle_node = NodeId::new();
+    for node_id in [queued_node, idle_node] {
+        insert_node(
+            &db.pool,
+            node_id,
+            SpaceNodeRole::Worker.as_str(),
+            "space",
+            None,
+        )
+        .await?;
+    }
+    let nodes = [queued_node, idle_node];
+    assert!(queued_triggers(&db.pool, &nodes).await?.is_empty());
+
+    enqueue_triggers(&db.pool, [queued_node], ReconcileReason::NodeRegistered).await?;
+    enqueue_triggers(
+        &db.pool,
+        [queued_node],
+        ReconcileReason::ManualNodeReconcile,
+    )
+    .await?;
+    let [queued] = queued_triggers(&db.pool, &nodes).await?.try_into().unwrap();
+    assert_eq!(queued.node_id, queued_node);
+    assert_eq!(
+        queued.reasons,
+        vec!["manual_node_reconcile", "node_registered"]
+    );
+    assert_eq!(
+        (
+            queued.attempts,
+            queued.claimed_at,
+            queued.dead_at,
+            queued.last_error
+        ),
+        (0, None, None, None)
+    );
+
+    let claim = claim_triggers(&db.pool, 10).await?;
+    let [claimed] = queued_triggers(&db.pool, &nodes).await?.try_into().unwrap();
+    assert!(claimed.claimed_at.is_some());
+
+    complete_claim(
+        &db.pool,
+        &claim.claim_token,
+        &[],
+        &[(queued_node, "node unreachable".to_string())],
+    )
+    .await?;
+    let [failed] = queued_triggers(&db.pool, &nodes).await?.try_into().unwrap();
+    assert_eq!(failed.attempts, 1);
+    assert_eq!(failed.claimed_at, None);
+    assert_eq!(failed.last_error.as_deref(), Some("node unreachable"));
+    assert!(failed.next_attempt_at > failed.requested_at);
+
+    sqlx::query(sql!(
+        "UPDATE node_reconcile_triggers SET next_attempt_at = NOW() WHERE node_id = $1"
+    ))
+    .bind(queued_node)
+    .execute(&db.pool)
+    .await?;
+    let claim = claim_triggers(&db.pool, 10).await?;
+    complete_claim(&db.pool, &claim.claim_token, &[queued_node], &[]).await?;
+    assert!(queued_triggers(&db.pool, &nodes).await?.is_empty());
+
+    // Dead-lettered at once, as for a node whose Kubernetes Node is gone.
+    enqueue_triggers(&db.pool, [queued_node], ReconcileReason::NodeUpdated).await?;
+    let claim = claim_triggers(&db.pool, 10).await?;
+    dead_letter_claim(
+        &db.pool,
+        &claim.claim_token,
+        &[(queued_node, "node is gone".to_string())],
+    )
+    .await?;
+    let [dead] = queued_triggers(&db.pool, &nodes).await?.try_into().unwrap();
+    assert_eq!(
+        (
+            dead.attempts,
+            dead.claimed_at,
+            dead.dead_at.is_some(),
+            dead.dead_reason.as_deref(),
+            dead.last_error.as_deref(),
+        ),
+        (
+            TRIGGER_MAX_ATTEMPTS,
+            None,
+            true,
+            Some("node is gone"),
+            Some("node is gone")
+        )
+    );
+    assert_eq!(queued.dead_reason, None);
+    Ok(())
+}
+
+/// A row written before the `reasons` array reads its reasons from the
+/// comma-joined text the way a claim does: each known reason once, dropping
+/// the fragment truncation leaves at the end.
+#[tokio::test(flavor = "current_thread")]
+async fn queued_triggers_reads_a_legacy_row_as_a_claim_does() -> TestResult {
+    let db = pg_test_db().await?;
+    let node_id = NodeId::new();
+    insert_node(
+        &db.pool,
+        node_id,
+        SpaceNodeRole::Worker.as_str(),
+        "space",
+        None,
+    )
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_reconcile_triggers (node_id, reason)
+         VALUES ($1, 'node_updated,manual_node_reconcile, node_updated,manual_node_rec')"
+    ))
+    .bind(node_id)
+    .execute(&db.pool)
+    .await?;
+
+    let [queued] = queued_triggers(&db.pool, &[node_id])
+        .await?
+        .try_into()
+        .unwrap();
+    assert_eq!(
+        queued.reasons,
+        vec!["node_updated", "manual_node_reconcile"]
+    );
+    let [claimed] = claim_triggers(&db.pool, 10)
+        .await?
+        .triggers
+        .try_into()
+        .unwrap();
+    assert_eq!(
+        claimed.reasons,
+        vec![
+            ReconcileReason::NodeUpdated,
+            ReconcileReason::ManualNodeReconcile
+        ]
+    );
+    Ok(())
+}

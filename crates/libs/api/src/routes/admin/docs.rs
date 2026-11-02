@@ -48,7 +48,7 @@ fn admin_openapi_value() -> Value {
             "/nodes": {
                 "get": {
                     "summary": "List node inventory and optional diagnostic counts",
-                    "description": "Set include_occupancy=false for metadata-only inventory with null occupancy counts. Legacy requests compute counts; sort=drainability always computes diagnostics.",
+                    "description": "Set include_occupancy=false for metadata-only inventory with null occupancy counts. Legacy requests compute counts; sort=drainability always computes diagnostics. Every node also carries runtime_installations and, when recorded, node_group_id and cordoned (the Kubernetes Node's spec.unschedulable from the API's reflector cache). reconcile_trigger is present when the node has a queued state-reconciliation trigger; per-facet work in node_reconcile_queue is not shown.",
                     "parameters": [
                         { "name": "include_occupancy", "in": "query", "schema": { "type": "boolean", "default": true } }
                     ],
@@ -60,7 +60,7 @@ fn admin_openapi_value() -> Value {
             "/nodes/{node_id}": {
                 "get": {
                     "summary": "Get one node and optional diagnostic counts",
-                    "description": "Set include_occupancy=false to read metadata without sandbox or snapshot accounting; occupancy counts are then null.",
+                    "description": "Set include_occupancy=false to read metadata without sandbox or snapshot accounting; occupancy counts are then null. The node also carries runtime_installations and, when recorded, node_group_id and cordoned (the Kubernetes Node's spec.unschedulable from the API's reflector cache). reconcile_trigger is present when the node has a queued state-reconciliation trigger; per-facet work in node_reconcile_queue is not shown.",
                     "parameters": [
                         { "name": "include_occupancy", "in": "query", "schema": { "type": "boolean", "default": true } },
                         { "name": "node_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
@@ -635,6 +635,19 @@ fn insert_template_admin_paths(paths: &mut Map<String, Value>) {
     paths.insert(
         "/templates/{template_name}/builds".to_string(),
         json!({
+            "get": {
+                "summary": "List a template's recent build jobs",
+                "description": "Newest first. Each entry carries the job's recorded builder and created_at, and the state, content_hash (on success) and error (on failure) its builder reports now; when the builder cannot report the job, state is null and status_error says why.",
+                "parameters": [
+                    { "name": "template_name", "in": "path", "required": true, "schema": { "type": "string" } },
+                    { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 50, "default": 20 } }
+                ],
+                "responses": {
+                    "200": { "description": "Build jobs; empty for a template with none" },
+                    "400": { "description": "Invalid limit" },
+                    "404": { "description": "Template not found" }
+                }
+            },
             "post": {
                 "summary": "Start a template build through the selected builder node",
                 "parameters": [

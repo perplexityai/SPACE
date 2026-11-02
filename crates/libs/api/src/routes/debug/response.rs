@@ -48,6 +48,7 @@ pub(super) struct SandboxDebugResponse {
     pub snapshots: DebugSection<SnapshotsSection>,
     pub ports: DebugSection<Vec<PortExposure>>,
     pub timeline: DebugSection<Vec<TimelineEvent>>,
+    pub quarantine: DebugSection<QuarantineSection>,
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -251,6 +252,9 @@ pub(super) struct PodExecution {
 pub(super) struct SnapshotsSection {
     pub snapshots: Vec<Snapshot>,
     pub inventory: Vec<SnapshotInventory>,
+    /// Why the snapshots carry no `storage`, when the placement read failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_error: Option<String>,
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -271,6 +275,57 @@ pub(super) struct Snapshot {
     pub content_hash: Option<String>,
     pub org_id: Option<OrgId>,
     pub failure_reason: Option<String>,
+    /// Filled from the snapshot catalog's storage placement after the read.
+    /// Omitted when that read failed; the section's `storage_error` says why.
+    #[sqlx(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage: Option<SnapshotStorage>,
+}
+
+/// Where a catalog snapshot's bytes are.
+#[derive(Debug, Serialize)]
+pub(super) struct SnapshotStorage {
+    pub location: SnapshotStorageLocation,
+    /// The node holding the local copy, for `node_local` and `both`: the
+    /// node the snapshot uploaded from, which is also the sandbox's target
+    /// node, else its active node.
+    pub node_id: Option<NodeId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum SnapshotStorageLocation {
+    /// Only on the sandbox's node, not in the object store: the current local
+    /// artifact of a sandbox settled in `suspended` or `stopped` on the node
+    /// the snapshot uploaded from. A sandbox in any other lifecycle, one whose
+    /// placement names a different node (as after a failed cross-node
+    /// restore), and a snapshot with no recorded source node report no
+    /// node-local copy.
+    NodeLocal,
+    /// Only in the object store.
+    ObjectStore,
+    Both,
+    /// Neither recorded. An older artifact with no live stored copy (an
+    /// upload that failed or is in flight, or one orphaned), or a current
+    /// artifact not yet stored whose local copy the rule above cannot place.
+    /// The current artifact of a settled sandbox on its upload node reads
+    /// `node_local` even while its upload is in flight or after it failed.
+    None,
+}
+
+impl SnapshotStorage {
+    pub(super) fn new(in_object_store: bool, node_local_node_id: Option<NodeId>) -> Self {
+        let location = match (in_object_store, node_local_node_id.is_some()) {
+            (true, true) => SnapshotStorageLocation::Both,
+            (true, false) => SnapshotStorageLocation::ObjectStore,
+            (false, true) => SnapshotStorageLocation::NodeLocal,
+            (false, false) => SnapshotStorageLocation::None,
+        };
+        Self {
+            location,
+            node_id: node_local_node_id,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -293,6 +348,51 @@ pub(super) struct SnapshotInventory {
     pub observed_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
+}
+
+/// A sandbox's quarantine state: the open episode, if any, and its recent
+/// quarantine events across all episodes.
+#[derive(Debug, Serialize)]
+pub(super) struct QuarantineSection {
+    pub quarantined: bool,
+    pub active: Option<ActiveQuarantine>,
+    /// Newest first, at most [`QUARANTINE_HISTORY_LIMIT`] entries.
+    pub history: Vec<QuarantineHistoryEntry>,
+}
+
+pub(super) const QUARANTINE_HISTORY_LIMIT: u32 = 50;
+
+#[derive(Debug, Serialize)]
+pub(super) struct ActiveQuarantine {
+    pub quarantine_id: Uuid,
+    #[serde(with = "time::serde::rfc3339")]
+    pub entered_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+    pub entered_from_lifecycle: Option<String>,
+    pub source: String,
+    pub reason_code: String,
+    pub reason_message: Option<String>,
+    pub next_action: String,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub next_action_after: Option<OffsetDateTime>,
+    pub attempt_count: i64,
+    pub last_error: Option<String>,
+    pub last_observed_node_id: Option<NodeId>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct QuarantineHistoryEntry {
+    pub id: Uuid,
+    pub quarantine_id: Uuid,
+    #[serde(with = "time::serde::rfc3339")]
+    pub occurred_at: OffsetDateTime,
+    pub source: String,
+    pub action: String,
+    pub reason_code: Option<String>,
+    pub message: Option<String>,
+    pub next_action: Option<String>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]

@@ -9,9 +9,24 @@
 use pplx_space_common_core::types::OrgId;
 
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::TemplateVisibility;
+use pplx_space_common_core::types::{TemplateDesiredState, TemplateName, TemplateVisibility};
 use pplx_space_sandbox_portability::failed_repair_revert_eligibility;
 use sqlx::{FromRow, Postgres, Transaction};
+
+/// Whether a template row named `template_name` exists and is not deleted:
+/// the rows the template read routes list.
+pub(super) async fn template_exists(
+    executor: impl sqlx::PgExecutor<'_>,
+    template_name: &TemplateName,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(sql!(
+        "SELECT EXISTS (SELECT 1 FROM templates WHERE name = $1 AND desired_state <> $2)"
+    ))
+    .bind(template_name.as_str())
+    .bind(TemplateDesiredState::Deleted.as_str())
+    .fetch_one(executor)
+    .await
+}
 
 #[derive(Debug, Clone, FromRow)]
 pub(super) struct TemplateVisibilityRow {

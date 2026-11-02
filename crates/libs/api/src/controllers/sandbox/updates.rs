@@ -392,6 +392,8 @@ impl SandboxController {
                             "cannot inherit template auto lifecycle: sandbox has no template",
                         )
                     })?;
+                    // `sandboxes` records no runtime, so this resolves as
+                    // Firecracker, and a miss stays the plain not-found.
                     self.template_default_auto_lifecycle(
                         pool,
                         template,

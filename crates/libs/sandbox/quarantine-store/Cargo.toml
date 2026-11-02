@@ -9,3 +9,16 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+sqlx = { workspace = true, features = ["derive", "postgres", "runtime-tokio", "time", "tls-rustls-aws-lc-rs", "uuid"] }
+time = { workspace = true }
+uuid = { workspace = true }
+
+# internal
+pplx-space-common-core = { workspace = true, features = ["sqlx"] }
+
+[dev-dependencies]
+pplx-space-db-test-fixtures = { workspace = true }
+pplx-space-test-env = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }

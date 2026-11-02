@@ -120,6 +120,85 @@ pub struct AdminNodeResponse {
     /// publication, but worker/builder rows should normally carry it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<AdminNodeStatusSnapshot>,
+    /// The Kubernetes Node's `spec.unschedulable`, from this API server's
+    /// Node reflector cache. Set only on `GET /nodes` and `GET /nodes/{id}`.
+    /// Absent there on the Direct substrate, before the cache's first list,
+    /// and for a node the cache does not hold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cordoned: Option<bool>,
+    /// The node group the cluster controller mirrored from the Node's
+    /// `space-node-group` label. Absent for an unlabeled node; such a worker
+    /// belongs to the default group (`is_default` in `GET /node-groups`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_group_id: Option<crate::types::NodeGroupId>,
+    /// Present on `GET /nodes` and `GET /nodes/{id}` when the node has a
+    /// queued state-reconciliation trigger; per-facet work in
+    /// `node_reconcile_queue` is not shown. Action responses never carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconcile_trigger: Option<AdminNodeReconcileTrigger>,
+    /// Runtime installations the node last reported in its execution
+    /// inventory. Set only on `GET /nodes` and `GET /nodes/{id}`; an empty list
+    /// there means the node has reported none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_installations: Option<Vec<AdminNodeRuntimeInstallation>>,
+    /// Why `reconcile_trigger` and `runtime_installations` were not read, on
+    /// `GET /nodes` and `GET /nodes/{id}` when either read failed. Both are
+    /// then absent, so while this is set an absent trigger means unknown, not
+    /// nothing queued.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_state_error: Option<String>,
+}
+
+/// A node's queued state-reconciliation trigger, from
+/// `node_reconcile_triggers`. Repeated requests collapse into one trigger per
+/// node until the cluster controller claims and drains it; a drained trigger
+/// is deleted.
+///
+/// `#[serde(default)]` at the container level for the same forward-compat
+/// reason as [`AdminNodeDrainability`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AdminNodeReconcileTrigger {
+    /// Distinct reasons, newest first by first request, as the
+    /// `state_reconciliation_reason` wire values (`manual_node_reconcile`,
+    /// `node_registered`, ...).
+    pub reasons: Vec<String>,
+    /// When the trigger was last requested while unclaimed. A request that
+    /// arrives while the controller holds the claim keeps the earlier time.
+    pub requested_at: String,
+    /// Earliest time the controller will claim it, unless `dead_at` is set;
+    /// later than `requested_at` while it backs off after a failed attempt.
+    pub next_attempt_at: String,
+    /// Failed drain attempts since the trigger was last requested while
+    /// unclaimed. Set to the retry limit when the trigger is dead-lettered at
+    /// once, as for a node whose Kubernetes Node is gone.
+    pub attempts: i32,
+    /// When the controller's current claim on it began. Cleared when that
+    /// attempt ends without draining it (a failure, a dead letter, or a new
+    /// request during the claim); a claim older than a minute counts as
+    /// abandoned and the next claim replaces it.
+    pub claimed_at: Option<String>,
+    /// When the controller stopped retrying it: at the retry limit, or at
+    /// once when the node's Kubernetes Node is gone. A dead trigger is never
+    /// claimed, and a new request re-arms it.
+    pub dead_at: Option<String>,
+    /// Why it was dead-lettered, when `dead_at` is set.
+    pub dead_reason: Option<String>,
+    /// The last failed attempt's error.
+    pub last_error: Option<String>,
+}
+
+/// One runtime installation a node reported, with the guest platforms it can
+/// run.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AdminNodeRuntimeInstallation {
+    pub runtime: String,
+    pub runtime_version: String,
+    /// Guest platforms as `os/arch`, for example `linux/x86_64`.
+    pub guests: Vec<String>,
+    /// When the control plane recorded the installation.
+    pub observed_at: String,
 }
 
 /// How easily a node can be drained, in the terms an operator ranks candidates

@@ -70,6 +70,11 @@ fn row(id: &str) -> AdminNodeResponse {
         residency_evidence: None,
         network_slots: AdminNodeNetworkSlots::default(),
         status: None,
+        cordoned: None,
+        node_group_id: None,
+        reconcile_trigger: None,
+        runtime_installations: None,
+        read_state_error: None,
     }
 }
 

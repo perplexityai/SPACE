@@ -147,6 +147,7 @@ expression: paths_by_method
     "post"
   ],
   "/templates/{template_name}/builds": [
+    "get",
     "post"
   ],
   "/templates/{template_name}/builds/{job_id}": [
