@@ -250,6 +250,65 @@ node that's already draining returns 409 if it disagrees with how that drain
 was started. Omit it to escalate on the existing terms, or run `undrain-node`
 and start a fresh drain to change them.
 
+### Drain parked on a sandbox with no pod
+
+On a forced drain, a `started` or `paused` resident whose suspend finds no
+pod can't be evacuated, so it keeps the node in `draining`. Find it like this:
+
+- `list-nodes --drain-phase draining -v` lists the stuck nodes; the
+  `DRAIN ERROR` column carries the last recorded error.
+- `get-node <node> --diagnostics` shows counts only (`Drain Gate Blockers`,
+  `Live Residents`). The sandbox IDs come from
+  `GET /admin/api/v1/nodes/{node_id}/sandboxes`, 100 per page, continued with
+  `?after=`, or from the controller logs below.
+- With the pod-less give-up off (the default), the controller logs
+  `node_drain: sandbox evacuation (suspend) failed; will retry on next tick`
+  every tick, with an error such as `sandbox is not assigned to a pod`, and
+  counts `node_drain.failures{phase=suspend}`.
+- With the give-up on, each attempt counts
+  `node_drain.sandbox_no_pod{node,pre_lifecycle,outcome,reason}`. A hold that
+  won't clear on its own logs `node_drain: sandbox has no pod and the pod-less
+  give-up can't release it, so it stays and parks the drain`, at most hourly
+  per node and reason. The metric's
+  [doc comment](../../../libs/metrics/src/node_drain.rs) explains each reason.
+
+Recover in this order:
+
+1. **Back out.** `undrain-node <node>` clears the drain phase and uncordons
+   the node. The sandbox stays `started` on it, and the next access may
+   recreate its pod, though that depends on the sandbox's restore state and
+   isn't guaranteed. The node takes new placements again.
+2. **Let the give-up release it.** Set
+   `SPACE_NODE_DRAIN_POD_LESS_GIVEUP_STALE_SECS` on the cluster controller (see
+   [configuration](../../../../docs/configuration.md)). Once the pod and VM are
+   proven gone, recovery has stalled for that long, the draining node's
+   delete receipt covers the newest generation, and a durable snapshot can
+   restore the sandbox without losing newer bytes, the controller reverts it
+   to `suspended` off the node and logs `node_drain: sandbox has no pod and
+   recovery has stopped; reverted it to suspended off the node so drain can
+   proceed`. Every other case parks. That includes a started recovery whose
+   newest generation never got a pod (`reason=node_pending`), which the node
+   never learned and so can't vouch for.
+3. **Delete it, as a last resort.** Only with the sandbox owner's agreement:
+   `POST /admin/api/v1/sandboxes/sbx_<uuid>:force-delete` with an
+   `Idempotency-Key` header, as a managing-organization admin. It returns 202
+   and enqueues the delete, which isn't drain-gated but returns 409 while a
+   snapshot upload is in flight. It's irreversible, and any bytes still only
+   on the node are lost when the node terminates. Confirm with
+   `get-node <node> --diagnostics` that both counts reach 0; until they do,
+   the drain stays parked.
+
+What doesn't help:
+
+- `force-start` and `force-wake` either return 409 under the drain or
+  complete at once as no-ops, because a `started` sandbox already reports
+  `running`.
+- `force-suspend` hits the same missing pod, and `force-stop` and `force-kill`
+  fail with 503 because the sandbox runtime is unreachable. None of them moves
+  the sandbox.
+- `terminate-node` is accepted only from `drained` and returns 409 while the
+  node has active residents or drain blockers. It has no override.
+
 ## Warm pools
 
 `warm-pool create` creates or updates a cluster warm-pool config through

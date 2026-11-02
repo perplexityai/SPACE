@@ -57,6 +57,18 @@ impl KubernetesSubstrate {
         fetch_sandbox_pod_uncached(&self.k8s, pod_name).await
     }
 
+    /// Like [`Self::read_sandbox_pod_uncached`], but in `namespace` rather than
+    /// the configured sandbox namespace. For callers proving a pod absent from
+    /// an execution row's recorded `pod_namespace`: reading a pod tracked in
+    /// another namespace from the configured one would 404 and read as absent.
+    pub async fn read_sandbox_pod_uncached_in_namespace(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+    ) -> Result<Option<Arc<SandboxPodView>>, KubeError> {
+        fetch_sandbox_pod_uncached_in(&self.k8s, namespace, pod_name).await
+    }
+
     /// Reads a sandbox pod with cache-first, event-wait, kube-apiserver-
     /// fallback semantics.
     ///

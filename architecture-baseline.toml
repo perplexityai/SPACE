@@ -163,6 +163,7 @@
 "crates/libs/api/src/controllers/substrate/mod.rs" = 1
 "crates/libs/cluster/controller/server/src/drained_node_terminator/store.rs" = 1
 "crates/libs/cluster/controller/server/src/node_drain/store.rs" = 15
+"crates/libs/cluster/controller/server/src/node_drain/store/pod_less_giveup.rs" = 3
 "crates/libs/cluster/controller/server/src/orphaned_sandboxes.rs" = 5
 "crates/libs/cluster/controller/server/src/tombstone_retention.rs" = 1
 "crates/libs/cluster/controller/server/src/transient_lifecycle_sweeper/store.rs" = 2

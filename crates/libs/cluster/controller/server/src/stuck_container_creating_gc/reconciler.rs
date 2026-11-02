@@ -771,7 +771,7 @@ fn orphaned_sandbox_reconciler_is_live() -> bool {
 const MAX_TRANSIENT_CONVERGENCE_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Whether a transient lifecycle's effective sweep age makes it a live
-/// convergence path: not [`LifecycleAge::Disabled`], and — resolving
+/// convergence path: not [`LifecycleAge::Disabled`](crate::transient_lifecycle_sweeper::LifecycleAge::Disabled), and — resolving
 /// `UseDefault` to the sweeper's `default_age` — bounded below
 /// [`MAX_TRANSIENT_CONVERGENCE_AGE`]. Pure so the boundary is unit-testable.
 pub(crate) fn transient_lifecycle_covered(
@@ -793,7 +793,7 @@ pub(crate) fn transient_lifecycle_covered(
 /// its master gate is enabled *and* the relevant knob is on:
 /// - `suspending` / `checkpointing` — a user action racing a stuck `started`
 ///   pod into a transient state; needs the per-lifecycle *effective* age to be
-///   set (not [`LifecycleAge::Disabled`]) and bounded (see
+///   set (not [`LifecycleAge::Disabled`](crate::transient_lifecycle_sweeper::LifecycleAge::Disabled)) and bounded (see
 ///   [`transient_lifecycle_covered`]), not merely non-`Disabled` — `UseDefault`
 ///   inherits `default_age`, which can exceed the convergence bound.
 /// - `failed` — the sweeper gave up on a wedged transition but its best-effort
