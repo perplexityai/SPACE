@@ -499,14 +499,17 @@ async fn publication_requires_unambiguous_reviewed_pod_and_node() {
                 BTreeSet::new(),
                 accounts(&["space-build-manager"]),
             );
+            reviewer.surface = BuildSurface::Publication;
+            reviewer.reviewed_ttl =
+                reviewed_ttl(BuildSurface::Publication, Duration::from_secs(30));
 
-            // The second call is denied from the cached identity.
+            // Publication reviews every call: the second is reviewed again.
             for _ in 0..2 {
                 let result = reviewer.authenticate(TOKEN).await;
 
                 assert_eq!(result.unwrap_err().code(), Code::PermissionDenied);
             }
-            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
         }
     }
 }
@@ -614,4 +617,32 @@ async fn calls_waiting_on_a_hung_review_fail_within_one_timeout() {
         started.elapsed()
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// Publication reviews every call: an accepted publisher token is reviewed
+/// again on the next call.
+#[tokio::test]
+async fn publication_reviews_every_call() {
+    let (mut reviewer, calls) = reviewer(
+        bound_publisher_status(
+            "space-cluster-api",
+            "system:serviceaccount:space:space-build-manager",
+        ),
+        "space-cluster-api",
+    );
+    reviewer.policy = BuildPolicy::new(
+        BuildSurface::Publication,
+        "space-cluster-api".into(),
+        accounts(&["space-build-manager"]),
+        BTreeSet::new(),
+        accounts(&["space-build-manager"]),
+    );
+    reviewer.surface = BuildSurface::Publication;
+    reviewer.reviewed_ttl = reviewed_ttl(BuildSurface::Publication, Duration::from_secs(30));
+
+    for _ in 0..3 {
+        reviewer.authenticate(TOKEN).await.unwrap();
+    }
+
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
 }

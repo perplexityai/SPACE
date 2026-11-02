@@ -21,6 +21,19 @@ use crate::auth::k8s::{
 /// The least time left on a call's deadline for it to start a review.
 const MIN_REVIEW_TIME: Duration = Duration::from_millis(100);
 
+/// How long an accepted review may be reused on `surface`.
+///
+/// Publication binds a tenant grant to the reviewed pod's node and makes only
+/// a few calls per build, so it reviews every call and the node identity it
+/// supplies is always freshly reviewed. Build-manager and node-api reuse a
+/// review for node-api's TTL; their status polls are what spend the budget.
+fn reviewed_ttl(surface: BuildSurface, cache_ttl: Duration) -> Duration {
+    match surface {
+        BuildSurface::Publication => Duration::ZERO,
+        BuildSurface::Manager | BuildSurface::NodeApi => cache_ttl,
+    }
+}
+
 pub(super) struct BuildTokenReviewer {
     reviews: kube::Api<TokenReview>,
     policy: BuildPolicy,
@@ -33,7 +46,7 @@ pub(super) struct BuildTokenReviewer {
     /// applied to a cached identity on every call. A rejected or failed review
     /// is not cached.
     reviewed: TokenReviewCache<ReviewedBuildToken>,
-    /// `K8sTokenAuthConfig::cache_ttl`, the TTL node-api's verifier uses.
+    /// See [`reviewed_ttl`]. Zero means every call is reviewed.
     reviewed_ttl: Duration,
 }
 
@@ -156,7 +169,7 @@ impl BuildTokenReviewer {
             }),
             timeout: config.review_timeout,
             reviewed: TokenReviewCache::new(config.cache_max_entries),
-            reviewed_ttl: config.cache_ttl,
+            reviewed_ttl: reviewed_ttl(surface, config.cache_ttl),
         })
     }
 
@@ -171,6 +184,12 @@ impl BuildTokenReviewer {
         // it, callers bearing one token would review in turn behind a hung
         // apiserver, the k-th failing only after k timeouts.
         let deadline = tokio::time::Instant::now() + self.timeout;
+        if self.reviewed_ttl.is_zero() {
+            // Nothing would be cached, so a call waiting on another call's
+            // review would only review again after it: review at once.
+            let reviewed = self.review(token, deadline).await?;
+            return self.policy.authorize(&reviewed);
+        }
         let key = TokenCacheKey::new(token, &self.policy.audience);
         let _claim = loop {
             if let Some(reviewed) = self.cached(&key) {
