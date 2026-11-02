@@ -29,6 +29,8 @@ mod sink;
 mod sqlx_otel;
 #[cfg(any(test, feature = "test-capture"))]
 pub mod test_capture;
+#[cfg(all(feature = "otel", any(test, feature = "test-capture")))]
+pub mod test_trace;
 mod traces;
 pub mod warning_tap;
 

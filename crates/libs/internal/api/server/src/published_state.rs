@@ -10,7 +10,9 @@ use tonic::Status;
 use uuid::Uuid;
 
 use crate::metadata::artifact_kind_from_proto;
-use pplx_space_cluster_trigger_queue::enqueue_triggers_conn;
+use pplx_space_cluster_trigger_queue::{
+    QueuedRefConflict, enqueue_triggers_conn, queue_node_reconcile_refs,
+};
 use pplx_space_common_core::types::{
     Arch, ArtifactKind, ArtifactOrigin, AutoLifecyclePolicy, ExecutionGeneration,
     ExecutionMetadata, LocalArtifactId, NodeRole, PodUid, PolicyAuthority, RuntimeKind,
@@ -55,17 +57,6 @@ use super::{optional_trimmed, parse_sandbox_id, proto_network_policy_to_common, 
 #[path = "published_state/input.rs"]
 mod input;
 use input::PublishedSandboxRow;
-
-const NODE_RECONCILE_QUEUE_FIRST_SEEN_ON_CONFLICT: &str = "
-ON CONFLICT (node_id, facet, element) DO UPDATE
-SET generation = node_reconcile_queue.generation + 1,
-    requested_at = EXCLUDED.requested_at,
-    next_attempt_at = NOW(),
-    attempts = 0,
-    last_error = '',
-    dead_at = NULL,
-    dead_reason = '',
-    updated_at = NOW()";
 
 const QUARANTINE_RECOVERY_OBSERVATION_HEARTBEAT_SECS: i64 = 60 * 60;
 
@@ -757,29 +748,11 @@ async fn queue_policy_reconcile_refs_for_new_inventory(
         return Ok(());
     }
 
-    let facets = refs
-        .iter()
-        .map(|(facet, _)| (*facet).to_string())
+    let refs = refs
+        .into_iter()
+        .map(|(facet, element)| (facet.to_string(), element))
         .collect::<Vec<_>>();
-    let elements = refs
-        .iter()
-        .map(|(_, element)| element.clone())
-        .collect::<Vec<_>>();
-    let query = format!(
-        "WITH refs AS (
-             SELECT DISTINCT facet, element
-             FROM UNNEST($2::TEXT[], $3::TEXT[]) AS refs(facet, element)
-         )
-         INSERT INTO node_reconcile_queue (node_id, facet, element, requested_at, updated_at)
-         SELECT $1, facet, element, NOW(), NOW()
-         FROM refs
-         {NODE_RECONCILE_QUEUE_FIRST_SEEN_ON_CONFLICT}",
-    );
-    sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .bind(node_id)
-        .bind(&facets)
-        .bind(&elements)
-        .execute(&mut *conn)
+    queue_node_reconcile_refs(&mut *conn, &[node_id], &refs, QueuedRefConflict::RetryNow)
         .await
         .map_err(|err| {
             Status::internal(format!("enqueue first-seen inventory reconcile: {err}"))
