@@ -194,6 +194,12 @@ const ECW_SERVICE_PROXY_STRIPPED_SPACE_HEADERS: &[&str] = &[
     FEDERATED_USER_ID_HEADER,
 ];
 const ECW_MISSING_RETRY_AFTER_FLOOR: Duration = Duration::from_secs(1);
+/// Paces a caller that resends after a backend call went unanswered on a ready
+/// sandbox. The failed call's deadline varies: a start's open budget is capped
+/// by its command timeout, and a spaced-host shutdown cancels at once. A backend
+/// that just stalled is still unlikely to answer within a second, and each
+/// early resend could hold another call open against it.
+const ECW_RUNTIME_DID_NOT_RESPOND_RETRY_AFTER: Duration = Duration::from_secs(5);
 
 fn record_ecw_backend_rpc_latency(
     operation: &'static str,
@@ -1519,6 +1525,18 @@ fn ecw_error_for_runtime_access(
                 Duration::from_millis(access.retry_after_ms)
             };
             EcwProxyError::sandbox_waking(retry_after)
+        }
+        SandboxRuntimeAccessDecision::Ready if original.runtime_did_not_respond => {
+            // The answer keeps the original origin and kind, so only this
+            // event tells it apart from a not-running answer. It is a debug
+            // event: it shows only when the data plane's log filter enables
+            // debug for this target.
+            tracing::debug!(
+                response_origin = original.origin.as_str(),
+                response_kind = original.kind.as_str(),
+                "answering an unanswered ECW backend call on a ready sandbox as runtime did not respond",
+            );
+            original.into_runtime_did_not_respond()
         }
         SandboxRuntimeAccessDecision::Ready
         | SandboxRuntimeAccessDecision::Unknown

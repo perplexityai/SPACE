@@ -1609,6 +1609,14 @@ pub(super) struct EcwProxyError {
     /// draining headers.
     pub(super) draining: bool,
     pub(super) can_use_runtime_access: bool,
+    /// The backend call went unanswered: the node returned `DeadlineExceeded`
+    /// or `Cancelled` (which a spaced-host shutdown also returns), or the data
+    /// plane's own budget expired, which also covers the route refresh and the
+    /// node connect. Neither says which component stalled or whether the
+    /// sandbox is still running. Only the control plane can say the latter, so
+    /// this keeps the not-running shape until a `Ready` runtime-access
+    /// decision turns it into [`Self::into_runtime_did_not_respond`].
+    pub(super) runtime_did_not_respond: bool,
     pub(super) origin: ResponseOrigin,
     pub(super) kind: ResponseKind,
     backend_status: Option<tonic::Status>,
@@ -1655,6 +1663,29 @@ impl EcwProxyError {
     pub(super) fn sandbox_timeout() -> Self {
         Self::sandbox_data_plane_unavailable()
             .with_classification(ResponseOrigin::Cluster, ResponseKind::Timeout)
+    }
+
+    /// An unanswered backend call on a sandbox the control plane reports
+    /// `Ready`.
+    ///
+    /// 502, like [`Self::sandbox_waking`]: the pinned E2B SDK turns a 502 from
+    /// both the Connect and the envd file routes into the same
+    /// `TimeoutException` it raises for "Sandbox is not running", whereas a
+    /// 503 file response would become a plain `SandboxException`. The message
+    /// is what tells this apart from a stopped sandbox. It doesn't ask for a
+    /// retry: the call may already have taken effect, and resending stdin
+    /// input, a signal or a keyless start could deliver it twice. `Retry-After`
+    /// only paces a caller that chooses to resend. The classification and any
+    /// backend status stay, so neither the response metrics nor the code a
+    /// reopened `Process.Start` stream ends with change.
+    pub(super) fn into_runtime_did_not_respond(self) -> Self {
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            message: "Sandbox runtime did not respond".to_string(),
+            retry_after: Some(ECW_RUNTIME_DID_NOT_RESPOND_RETRY_AFTER),
+            runtime_did_not_respond: false,
+            ..self
+        }
     }
 
     pub(super) fn sandbox_waking(retry_after: Duration) -> Self {
@@ -1823,6 +1854,7 @@ impl EcwProxyError {
             retry_after: None,
             draining: false,
             can_use_runtime_access: true,
+            runtime_did_not_respond: false,
             origin,
             kind,
             backend_status: None,
@@ -1837,6 +1869,11 @@ impl EcwProxyError {
 
     pub(super) fn with_retry_after(mut self, retry_after: Duration) -> Self {
         self.retry_after = Some(retry_after);
+        self
+    }
+
+    pub(super) fn with_runtime_did_not_respond(mut self) -> Self {
+        self.runtime_did_not_respond = true;
         self
     }
 

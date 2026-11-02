@@ -472,9 +472,19 @@ pub(super) fn tonic_status_to_ecw_error(status: tonic::Status) -> EcwProxyError 
     };
 
     if tonic_status_needs_ecw_not_running_shape(&status) {
-        return EcwProxyError::sandbox_timeout()
-            .with_classification(origin, kind)
-            .with_backend_status(status);
+        let error = EcwProxyError::sandbox_timeout().with_classification(origin, kind);
+        // A failed precondition is the node saying the sandbox isn't running.
+        // A deadline or a cancellation, including a spaced-host shutdown, says
+        // only that the call went unanswered.
+        let error = if matches!(
+            status.code(),
+            tonic::Code::DeadlineExceeded | tonic::Code::Cancelled
+        ) {
+            error.with_runtime_did_not_respond()
+        } else {
+            error
+        };
+        return error.with_backend_status(status);
     }
     if tonic_status_is_guest_capability_unsupported(&status) {
         return EcwProxyError::new(

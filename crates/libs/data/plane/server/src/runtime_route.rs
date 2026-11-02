@@ -933,7 +933,8 @@ async fn ecw_backend_timeout(
         timeout_observer(route, timeout);
     }
     let error = EcwProxyError::sandbox_timeout()
-        .with_classification(ResponseOrigin::Node, ResponseKind::Timeout);
+        .with_classification(ResponseOrigin::Node, ResponseKind::Timeout)
+        .with_runtime_did_not_respond();
     crate::ecw_runtime_access_error(state, route.sandbox_id, error).await
 }
 
