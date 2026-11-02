@@ -558,7 +558,9 @@ fn reconnect_error_outcome(
             ReconnectTerminalPhase::Api,
             ReconnectReason::WaitBudget,
         ),
-        SubstrateError::Unavailable { .. } => (
+        // Only suspend returns `SandboxNoPod`, so a wake never sees it; it
+        // shares `Unavailable`'s arm, as it shares its 503.
+        SubstrateError::Unavailable { .. } | SubstrateError::SandboxNoPod { .. } => (
             ReconnectOutcome::WakeFailed,
             initial_lifecycle_terminal_phase(initial_lifecycle),
             ReconnectReason::Unavailable,

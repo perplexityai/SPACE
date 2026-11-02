@@ -127,12 +127,20 @@
 
 use pplx_space_common_core::types::{LocalArtifactId, NodeId, SandboxId};
 
+use super::store::PodLessHold;
 use super::*;
 use crate::drained_node_terminator::InstanceLookupError;
 use pplx_space_api::controllers::substrate::WaitReadyTimeoutPhase;
 use pplx_space_common_core::kubernetes::EvacuationPlacement;
 
+use std::collections::VecDeque;
 use std::sync::Mutex as StdMutex;
+
+/// The pod-less give-up window the suite runs with.
+const TEST_POD_LESS_GIVEUP_STALE: Duration = Duration::from_secs(600);
+
+/// One recorded `recover_pod_less_sandbox` call.
+type PodLessRecoveryCall = (SandboxId, NodeId, SandboxLifecycle, PositiveDuration);
 
 /// Queue-of-queues per node mirroring how the production
 /// `list_evacuatable_sandboxes_on_node` advances across ticks: each
@@ -389,11 +397,25 @@ struct FakeSink {
     // Count of `redrive_stranded_suspending_evacuations` calls, so a test can
     // assert the re-drive runs on every restore sweep.
     redrive_stranded_calls: StdMutex<usize>,
+
+    // Recorded `(sandbox_id, source_node_id, pre_lifecycle, stale)` per
+    // `recover_pod_less_sandbox` call, and the outcome each call returns
+    // (front first; `NotEligible` once the queue is empty).
+    pod_less_recoveries: StdMutex<Vec<PodLessRecoveryCall>>,
+    pod_less_outcomes: StdMutex<VecDeque<PodLessRecovery>>,
 }
 
 impl FakeSink {
     fn new() -> Self {
         Self::default()
+    }
+
+    fn recovered_pod_less(&self) -> Vec<PodLessRecoveryCall> {
+        self.pod_less_recoveries.lock().unwrap().clone()
+    }
+
+    fn enqueue_pod_less_outcome(&self, outcome: PodLessRecovery) {
+        self.pod_less_outcomes.lock().unwrap().push_back(outcome);
     }
 
     fn set_initial_state(&self, node: NodeId, state: &str) {
@@ -1114,6 +1136,27 @@ impl NodeDrainSink for FakeSink {
         Ok(1)
     }
 
+    async fn recover_pod_less_sandbox(
+        &self,
+        sandbox_id: SandboxId,
+        source_node_id: NodeId,
+        pre_lifecycle: SandboxLifecycle,
+        stale: PositiveDuration,
+    ) -> Result<PodLessRecovery, sqlx::Error> {
+        self.pod_less_recoveries.lock().unwrap().push((
+            sandbox_id,
+            source_node_id,
+            pre_lifecycle,
+            stale,
+        ));
+        Ok(self
+            .pod_less_outcomes
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(PodLessRecovery::NotEligible(PodLessHold::RecentProgress)))
+    }
+
     async fn make_sandbox_durable_from_remote_snapshot(
         &self,
         sandbox_id: SandboxId,
@@ -1602,6 +1645,9 @@ fn config_enabled(max_per_node: usize, max_per_cluster: usize) -> ReconcilerConf
         reupload_giveup_settle: PositiveDuration::new(Duration::from_secs(
             DEFAULT_REUPLOAD_GIVEUP_SETTLE_SECS,
         )),
+        // On for the suite, unlike the production default, so the give-up's
+        // dispatch is exercised; `f8` covers it off.
+        pod_less_giveup_stale: PositiveDuration::new(TEST_POD_LESS_GIVEUP_STALE),
         // Real defaults so failure-path tests exercise the restore retry
         // backoff bookkeeping on the same code path production runs; tests
         // that need it disabled override on the returned struct.
@@ -1664,6 +1710,9 @@ fn c1_defaults_when_env_unset() {
         cfg.stale_abandon,
         PositiveDuration::new(Duration::from_secs(DEFAULT_STALE_ABANDON_SECS)),
     );
+    // Off by default: the give-up moves user sandboxes off a draining node
+    // without anyone asking, so each environment opts in.
+    assert_eq!(cfg.pod_less_giveup_stale, None);
     assert_eq!(
         cfg.restore_backoff_base,
         PositiveDuration::new(Duration::from_secs(DEFAULT_RESTORE_BACKOFF_BASE_SECS)),
@@ -1689,6 +1738,36 @@ fn c7_backup_queue_flag_is_read_from_the_config_environment() {
     let mut on = pplx_space_test_env::TestEnv::default();
     on.set("SPACE_NODE_DRAIN_BACKUP_QUEUE_ENABLED", "true");
     assert!(ReconcilerConfig::from_environment(&on).backup_queue_enabled);
+}
+
+/// The pod-less give-up window reads from its env var: unset, garbage or `0`
+/// leaves the give-up off, and a number sets the window within its bounds.
+#[test]
+fn c8_pod_less_giveup_window_is_read_from_the_config_environment() {
+    let read = |value: Option<&str>| {
+        let mut env = pplx_space_test_env::TestEnv::default();
+        if let Some(value) = value {
+            env.set("SPACE_NODE_DRAIN_POD_LESS_GIVEUP_STALE_SECS", value);
+        }
+        ReconcilerConfig::from_environment(&env).pod_less_giveup_stale
+    };
+    assert_eq!(read(None), None);
+    assert_eq!(read(Some("soon")), None);
+    assert_eq!(read(Some("0")), None);
+    assert_eq!(
+        read(Some("99999999999999999")),
+        PositiveDuration::new(MAX_POD_LESS_GIVEUP_STALE),
+        "a window too long for a SQL interval clamps down"
+    );
+    assert_eq!(
+        read(Some("30")),
+        PositiveDuration::new(MIN_POD_LESS_GIVEUP_STALE),
+        "a window shorter than a pod create can take clamps up"
+    );
+    assert_eq!(
+        read(Some("1200")),
+        PositiveDuration::new(Duration::from_secs(1200))
+    );
 }
 
 /// An operator turns stopped-resident evacuation on with its env var, and it
@@ -1859,6 +1938,17 @@ impl NodeDrainSink for ArcSink {
         source: NodeId,
     ) -> Result<u64, sqlx::Error> {
         self.0.mark_sandbox_failed_on_node(s, source).await
+    }
+    async fn recover_pod_less_sandbox(
+        &self,
+        s: SandboxId,
+        source: NodeId,
+        pre_lifecycle: SandboxLifecycle,
+        stale: PositiveDuration,
+    ) -> Result<PodLessRecovery, sqlx::Error> {
+        self.0
+            .recover_pod_less_sandbox(s, source, pre_lifecycle, stale)
+            .await
     }
     async fn make_sandbox_durable_from_remote_snapshot(
         &self,
@@ -3550,6 +3640,12 @@ async fn f3_evacuate_error_phase_tags_correctly() {
         EvacuateError::SandboxFailedOnNode("x".into()).phase(),
         "sandbox_failed_on_node"
     );
+    // An ordinary suspend failure when the give-up is off, as before it
+    // existed; the give-up has its own `node_drain.sandbox_no_pod`.
+    assert_eq!(
+        EvacuateError::SandboxNoPodOnNode("x".into()).phase(),
+        "suspend"
+    );
     // A restore wake that timed out in a readiness wait is not a failure at
     // all — it surfaces as `RestoreOutcome::Converging` and drives
     // `node_drain.restore_converging{phase}` with the step that stalled
@@ -3642,6 +3738,129 @@ async fn f5_failed_on_node_drift_is_tolerated() {
     );
     // No drained transition this tick: the sandbox is still resident.
     assert_eq!(r1.drained_transitions, 0);
+}
+
+/// A forced-draining node with one resident whose suspend finds no pod.
+fn pod_less_resident_sink() -> (NodeId, SandboxId, FakeSink) {
+    let node = NodeId::new();
+    let sandbox = SandboxId::new();
+    let sink = FakeSink::new();
+    sink.set_initial_state(node, PHASE_DRAINING);
+    sink.set_draining_list_forced(vec![node]);
+    sink.enqueue_resident(node, vec![sandbox]);
+    sink.fail_evacuate(
+        sandbox,
+        EvacuateError::SandboxNoPodOnNode("sandbox is not assigned to a pod".into()),
+    );
+    (node, sandbox, sink)
+}
+
+#[tokio::test]
+async fn f6_pod_less_suspend_routes_to_the_give_up() {
+    // A resident whose suspend finds no pod was retried every tick as an
+    // ordinary suspend failure. The suspend failure now hands the row to the
+    // pod-less give-up. Whether that releases the row is the sink's decision;
+    // this scripts a release to show the reconciler drains the node once the
+    // row is off it.
+    let outcome = PodLessRecovery::RevertedToSuspended;
+    let (node, sandbox, sink) = pod_less_resident_sink();
+    sink.enqueue_pod_less_outcome(outcome);
+    sink.enqueue_resident(node, vec![]);
+    let reconciler = Reconciler::new(config_enabled(4, 8), sink, FakeTerminator::default());
+
+    let r1 = reconciler.tick().await;
+    assert_eq!(r1.spawned_evacuations, 1, "{outcome:?}");
+    wait_in_flight_empty(&reconciler).await;
+    assert_eq!(
+        reconciler.sink.recovered_pod_less(),
+        vec![(
+            sandbox,
+            node,
+            SandboxLifecycle::Started,
+            PositiveDuration::new_panic(TEST_POD_LESS_GIVEUP_STALE),
+        )],
+        "{outcome:?}: a pod-less suspend must route to the give-up"
+    );
+    assert!(
+        reconciler.sink.marked_failed_on_node().is_empty(),
+        "{outcome:?}: the failed-on-node give-up is for a different divergence"
+    );
+
+    let r2 = reconciler.tick().await;
+    assert_eq!(r2.drained_transitions, 1, "{outcome:?}: node must drain");
+    assert_eq!(
+        reconciler.sink.current_state(node).as_deref(),
+        Some(PHASE_DRAINED)
+    );
+}
+
+#[tokio::test]
+async fn f7_ineligible_pod_less_resident_keeps_the_node_draining() {
+    // A guard held (a pod may exist, or recovery is still progressing): the
+    // give-up changes nothing, the resident stays, and the next tick retries.
+    let (node, sandbox, sink) = pod_less_resident_sink();
+    sink.enqueue_pod_less_outcome(PodLessRecovery::NotEligible(PodLessHold::RecentProgress));
+    sink.enqueue_resident(node, vec![sandbox]);
+    let reconciler = Reconciler::new(config_enabled(4, 8), sink, FakeTerminator::default());
+
+    reconciler.tick().await;
+    wait_in_flight_empty(&reconciler).await;
+    assert_eq!(reconciler.sink.recovered_pod_less().len(), 1);
+
+    let r2 = reconciler.tick().await;
+    assert_eq!(r2.drained_transitions, 0, "resident still blocks the drain");
+    assert_eq!(
+        reconciler.sink.current_state(node).as_deref(),
+        Some(PHASE_DRAINING)
+    );
+}
+
+#[tokio::test]
+async fn f9_park_warn_is_paced_per_node_and_reason() {
+    // A hold that doesn't clear on its own WARNs through the reconciler's
+    // pacer: the first tick opens the node's window for that reason, while
+    // other reasons keep their own windows. A hold that clears on its own (a
+    // row still aging in, a lost lock race) opens none.
+    for (hold, parks) in [
+        (PodLessHold::VmObserved, true),
+        (PodLessHold::PodUnreadable, true),
+        (PodLessHold::NodePending, true),
+        (PodLessHold::NoRestoreSource, true),
+        (PodLessHold::RecentProgress, false),
+        (PodLessHold::LockContended, false),
+    ] {
+        let reason = hold.tag();
+        let (node, sandbox, sink) = pod_less_resident_sink();
+        sink.enqueue_pod_less_outcome(PodLessRecovery::NotEligible(hold));
+        sink.enqueue_resident(node, vec![sandbox]);
+        let reconciler = Reconciler::new(config_enabled(4, 8), sink, FakeTerminator::default());
+
+        reconciler.tick().await;
+        wait_in_flight_empty(&reconciler).await;
+        assert_eq!(reconciler.sink.recovered_pod_less().len(), 1, "{reason}");
+        assert_eq!(reconciler.warn_pacer.is_tracking(node), parks, "{reason}");
+        if parks {
+            assert!(
+                !reconciler.warn_pacer.due(node, reason),
+                "{reason}: the first tick's WARN opened this node's window"
+            );
+            assert!(reconciler.warn_pacer.due(node, "row_drifted"), "{reason}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn f8_disabled_pod_less_give_up_retries_the_suspend() {
+    // `None` restores the prior behavior: the failure is an ordinary
+    // retryable suspend failure and the give-up is never called.
+    let (_node, _sandbox, sink) = pod_less_resident_sink();
+    let mut config = config_enabled(4, 8);
+    config.pod_less_giveup_stale = None;
+    let reconciler = Reconciler::new(config, sink, FakeTerminator::default());
+
+    reconciler.tick().await;
+    wait_in_flight_empty(&reconciler).await;
+    assert!(reconciler.sink.recovered_pod_less().is_empty());
 }
 
 // =================================================================

@@ -371,8 +371,10 @@ pub fn sandbox_attached_anywhere(sandbox_alias: &str) -> String {
 /// 'deleted'` looks like a safe short-circuit — nothing will restore it, so
 /// its bytes are not state anyone can lose — and releasing on it does clear
 /// the noise where an ordinary space-managed delete otherwise leaves a row
-/// counted into [`local_backup_queue_absent_not_durable`] until tombstone
-/// retention hard-deletes the `sandboxes` row and the foreign key cascades.
+/// counted into
+/// `pplx_space_metrics::internal_api::local_backup_queue_absent_not_durable`
+/// until tombstone retention hard-deletes the `sandboxes` row and the foreign
+/// key cascades.
 ///
 /// It is still wrong, because `prune_absent_node_sandboxes` *mints*
 /// tombstones from census absence: it marks `deleted` every space-managed
@@ -1258,6 +1260,110 @@ pub fn started_repair_revert_eligibility(sandbox_alias: &str) -> SuspendRevertEl
     let marker_current = exact_marker_snapshot_backup_current(sandbox_alias);
     let newest_current = newest_suspend_snapshot_current(sandbox_alias);
     suspend_revert_eligibility(sandbox_alias, marker_current, newest_current)
+}
+
+/// TRUE when reverting the row to `suspended` and unplacing it can't lose
+/// bytes newer than the snapshot the revert restores, as far as the control
+/// plane's records go. Three things could hold such bytes:
+///
+/// - the marked local artifact, unless it's absent or has a durable copy;
+/// - any full snapshot still uploading. This is wider than
+///   [`inflight_suspend_upload_exists`], which only sees an upload of the
+///   marked artifact (or, markerless, one registered since placement), while a
+///   newer artifact's upload can be in flight before the marker moves. An
+///   upload whose worker died holds the row until the stuck-snapshot reaper
+///   finalizes it;
+/// - a full snapshot whose upload failed after the newest ready one. Its local
+///   artifact may still be on the node, and the markerless eligibility only
+///   reads ready snapshots. A failed retry of an artifact that already has a
+///   ready copy carries nothing newer and doesn't count.
+///
+/// Necessary, not sufficient. A rootfs written after the newest snapshot
+/// leaves no record here, so node drain's pod-less give-up conjoins this with
+/// [`newest_full_snapshot_unambiguous`] and with the node's own answer for
+/// the generation that ran there: a local delete.
+pub fn pod_less_drain_revert_loses_no_newer_bytes(sandbox_alias: &str) -> String {
+    let marker_durable = artifact_has_durable_copy(
+        &format!("{sandbox_alias}.id"),
+        &format!("{sandbox_alias}.current_local_artifact_id"),
+        &format!("{sandbox_alias}.current_local_artifact_kind"),
+    );
+    format!(
+        "(({sandbox_alias}.current_local_artifact_id IS NULL OR {marker_durable})
+          AND NOT EXISTS (
+              SELECT 1
+                FROM snapshots uploading
+               WHERE uploading.sandbox_id = {sandbox_alias}.id
+                 AND uploading.type = 'full'
+                 AND uploading.state = 'creating'
+          )
+          AND NOT EXISTS (
+              SELECT 1
+                FROM snapshots failed
+               WHERE failed.sandbox_id = {sandbox_alias}.id
+                 AND failed.type = 'full'
+                 AND failed.state = 'failed'
+                 AND failed.timestamp > COALESCE(
+                     (
+                         SELECT MAX(ready.timestamp)
+                           FROM snapshots ready
+                          WHERE ready.sandbox_id = {sandbox_alias}.id
+                            AND ready.type = 'full'
+                            AND ready.state = 'ready'
+                     ),
+                     '-infinity'::timestamptz
+                 )
+                 AND NOT EXISTS (
+                     SELECT 1
+                       FROM snapshots copy
+                      WHERE copy.sandbox_id = {sandbox_alias}.id
+                        AND copy.state = 'ready'
+                        AND copy.local_artifact_id = failed.local_artifact_id
+                 )
+          ))"
+    )
+}
+
+/// TRUE when the snapshot a markerless suspend restore would select is
+/// unambiguous: one ready full snapshot with storage that isn't orphaned, no
+/// newer full snapshot in any state other than a failed retry of the same
+/// artifact, and no other ready full snapshot at the same timestamp unless
+/// it holds the same artifact.
+///
+/// The restore orders ready full snapshots by timestamp alone, so a tie can
+/// load either, and a newer snapshot still `deleting` (or in any state other
+/// than ready) names bytes the activity-anchored eligibility, which reads
+/// only ready snapshots, never compares against. Node drain's pod-less
+/// give-up conjoins this with that eligibility before unplacing a row.
+pub fn newest_full_snapshot_unambiguous(sandbox_alias: &str) -> String {
+    let newest = no_newer_full_snapshot_ignoring_failed_retry(sandbox_alias, "source");
+    format!(
+        "EXISTS (\n\
+             SELECT 1\n\
+               FROM snapshots source\n\
+               JOIN snapshot_storage_locations source_storage\n\
+                 ON source_storage.snapshot_id = source.id\n\
+                AND source_storage.orphaned_at IS NULL\n\
+              WHERE source.sandbox_id = {sandbox_alias}.id\n\
+                AND source.type = 'full'\n\
+                AND source.state = 'ready'\n\
+                AND {newest}\n\
+                AND NOT EXISTS (\n\
+                    SELECT 1\n\
+                      FROM snapshots tied\n\
+                     WHERE tied.sandbox_id = {sandbox_alias}.id\n\
+                       AND tied.type = 'full'\n\
+                       AND tied.state = 'ready'\n\
+                       AND tied.timestamp = source.timestamp\n\
+                       AND tied.id <> source.id\n\
+                       AND NOT (\n\
+                           source.local_artifact_id IS NOT NULL\n\
+                           AND tied.local_artifact_id = source.local_artifact_id\n\
+                           AND tied.artifact_kind IS NOT DISTINCT FROM source.artifact_kind\n\
+                       )\n\
+                )\n\
+         )"
+    )
 }
 
 /// Like [`newest_suspend_snapshot_current`], but anchored on the activity

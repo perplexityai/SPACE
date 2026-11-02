@@ -272,6 +272,66 @@ pub fn sandbox_failed_on_node(node_id: &str, pre_lifecycle: &str) {
     );
 }
 
+/// One run of the pod-less give-up: the evacuation suspend of a
+/// `started`/`paused` resident (the `pre_lifecycle` tag) found no pod. `outcome`
+/// is one of:
+///
+/// - `"reverted_to_suspended"`: no pod or VM, recovery stalled past the
+///   staleness window, the node vouched for the local state, and a durable
+///   suspend snapshot made the sandbox recoverable. It's now `suspended` off
+///   the node.
+/// - `"not_eligible"`: a guard held (a pod or VM may still exist, recovery is
+///   still progressing, nothing can restore it, the node doesn't vouch for
+///   it, an upload is in flight, or the row moved). Nothing changed and the
+///   next tick retries, so a sandbox inside its staleness window counts once
+///   per tick until it ages in. A sustained rate for one node with no
+///   terminal outcome is a drain parked on a pod-less resident.
+///
+/// `reason` names the guard for `not_eligible` and is `none` otherwise. The
+/// cluster controller's `PodLessHold` defines the set and which of them clear
+/// on their own; this list follows it.
+///
+/// Clears on its own, so the row is only counted: `recent_progress` (an
+/// execution advanced inside the window; the reason a row still aging in
+/// reports), `row_drifted` (it left the drained node, changed lifecycle,
+/// gained an evacuation marker or is gone, or the node stopped
+/// force-draining), `no_pod_name` (the execution rows changed between
+/// reads), `generation_changed` (a newer generation appeared since the
+/// reads), `snapshot_changed`, and `lock_contended`.
+///
+/// Can keep the drain parked indefinitely, so each also WARNs, paced per node
+/// and reason; the give-up never fails these rows, so they wait for the
+/// state to change or an operator. The row's own state: `vm_observed` (a
+/// node still publishes a live VM or a suspended local row), `pod_bound` (the
+/// active execution carries a pod UID, or any execution a pod IP),
+/// `pod_present` (a recorded pod reads as present or unready), and
+/// `pod_unreadable`. The snapshot state: `no_restore_source` (no durable
+/// suspend snapshot can restore it) and `held_for_data_safety` (a marked
+/// artifact with no durable copy, an upload in flight, a failed upload newer
+/// than the newest ready snapshot, a newer full snapshot in another state,
+/// or two ready snapshots tied as newest). And the node: `no_execution_row`
+/// (no generation to ask it about), `node_pending` (no delete receipt covers
+/// the newest generation: the node never learned it, still holds a row for
+/// it without a durable artifact, or has no row and no receipt for the
+/// sandbox), `node_suspended` (it holds a suspended local row),
+/// `node_superseded` (a newer execution owns the local state, or a
+/// generation-fenced stop or activation rollback retired this one),
+/// `node_refused` (it refused the generation: a quarantined row, a job with
+/// no row left, or a failed job it won't retry), and `node_unreadable` (it
+/// couldn't be asked). The set is fixed and small.
+pub fn sandbox_no_pod(node_id: &str, pre_lifecycle: &str, outcome: &str, reason: &str) {
+    counter(
+        "node_drain.sandbox_no_pod",
+        1,
+        &[
+            tag("node", node_id),
+            tag("pre_lifecycle", pre_lifecycle),
+            tag("outcome", outcome),
+            tag("reason", reason),
+        ],
+    );
+}
+
 /// One tick's worth of work on a `stopped` resident's evacuation, tagged with
 /// the step it reached. `outcome` is one of:
 ///

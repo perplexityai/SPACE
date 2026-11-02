@@ -522,6 +522,76 @@ fn generation_suspend_requires_the_exact_suspend_artifact() {
     assert!(matches!(error, SubstrateError::Failed { .. }));
 }
 
+/// The pod-less give-up's evidence: each outcome maps to its answer, and an
+/// outcome it can't read is an error rather than an answer.
+#[test]
+fn teardown_observation_maps_each_outcome() {
+    for (outcome, expected) in [
+        (
+            TeardownSuspendOutcome::Deleted,
+            GenerationTeardownEvidence::Deleted,
+        ),
+        (
+            TeardownSuspendOutcome::Durable,
+            GenerationTeardownEvidence::Durable,
+        ),
+        (
+            TeardownSuspendOutcome::Superseded,
+            GenerationTeardownEvidence::Superseded,
+        ),
+        (
+            TeardownSuspendOutcome::Pending,
+            GenerationTeardownEvidence::Pending,
+        ),
+    ] {
+        let response = PrepareTeardownSuspendResponse {
+            outcome: outcome as i32,
+            reason: None,
+            published_artifact: None,
+        };
+        assert_eq!(
+            generation_teardown_evidence(response, "http://node-api").unwrap(),
+            expected,
+            "{outcome:?}"
+        );
+    }
+    let unspecified = PrepareTeardownSuspendResponse {
+        outcome: TeardownSuspendOutcome::Unspecified as i32,
+        reason: None,
+        published_artifact: None,
+    };
+    assert!(
+        generation_teardown_evidence(unspecified, "http://node-api").is_err(),
+        "an unreadable outcome must not read as evidence"
+    );
+}
+
+/// A quarantined row is refused with `FAILED_PRECONDITION` under observe-only
+/// (pinned on the node by
+/// `teardown_suspend_terminal_driver_failures_stop_polling_without_release_proof`),
+/// and that reads as the node's refusal, which the give-up parks under
+/// `node_refused`, not as a node it couldn't reach. Other errors stay errors.
+#[test]
+fn a_refused_teardown_observation_is_an_answer_not_an_outage() {
+    assert_eq!(
+        failed_teardown_observation(
+            tonic::Status::failed_precondition("sandbox is quarantined"),
+            "http://node-api",
+        )
+        .unwrap(),
+        GenerationTeardownEvidence::Refused
+    );
+    for status in [
+        tonic::Status::unavailable("connection refused"),
+        tonic::Status::internal("db error"),
+    ] {
+        assert!(matches!(
+            failed_teardown_observation(status, "http://node-api"),
+            Err(SubstrateError::Unavailable { .. })
+        ));
+    }
+}
+
 #[test]
 fn unconfirmed_suspend_delete_never_authorizes_retirement() {
     for outcome in [

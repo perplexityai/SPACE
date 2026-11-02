@@ -40,7 +40,7 @@ pub enum BackendError {
     Kube(#[from] kube::Error),
 }
 
-/// Kubernetes pod access. All reads are cache-first except [`read_pod_fresh`],
+/// Kubernetes pod access. All reads are cache-first except [`PodBackend::read_pod_fresh`],
 /// which is an authoritative cache-bypassing GET for the verify-before-destroy
 /// step.
 pub trait PodBackend: Send + Sync {
