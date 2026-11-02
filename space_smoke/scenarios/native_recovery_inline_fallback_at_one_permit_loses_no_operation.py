@@ -3,7 +3,7 @@
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from space_smoke.native_inline import inline_permits, operation, require_inline
+from space_smoke.native_inline import inline_execution, operation
 from space_smoke.native_recovery import RECOVERY_ENVIRONMENT, KindNativeHardeningFixture, expect_response
 from space_smoke.registry import scenario
 from space_smoke.runtime import InconclusiveSmoke
@@ -27,8 +27,7 @@ def inline_fallback_at_one_permit_loses_no_operation(fixture: KindNativeHardenin
     """
 
     control = fixture.recovery
-    require_inline(control, "create_sandbox")
-    with inline_permits(fixture, control, 1), control.owned_faults():
+    with inline_execution(fixture, control, ("create_sandbox",), permits=1), control.owned_faults():
         api_pods = control._captures["space-api"].replicas
         if api_pods >= CREATES:
             raise InconclusiveSmoke(f"{api_pods} API pods leave no create past their permits")
@@ -44,8 +43,11 @@ def inline_fallback_at_one_permit_loses_no_operation(fixture: KindNativeHardenin
                 started |= {op for op in operations if operation(fixture, op)["state"] != "queued"}
                 time.sleep(0.5)
             fixture.context.record("inline_started_while_stopped", len(started))
-            if not started:
-                raise InconclusiveSmoke("no create ran inline")
+            fixture.context.verify(
+                bool(started),
+                "with a permit free on each API pod and no dispatcher running, the API must run a create",
+                inline_started=len(started),
+            )
             fixture.context.verify(
                 len(started) <= api_pods,
                 "creates past each API pod's one permit must be queued for the dispatcher",

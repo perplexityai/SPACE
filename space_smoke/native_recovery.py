@@ -459,10 +459,9 @@ class NativeRecoveryControl:
 
         Each deleted pod gets SIGTERM and exits on its own schedule; a data
         plane serving an open stream keeps running until the stream ends.
-        Restarting every cluster-controller pod hands its leadership over.
         """
-        if name not in {"space-api", "space-data-plane", "space-cluster-controller"}:
-            raise ValueError("only API, data-plane and controller restarts are supported")
+        if name not in {"space-api", "space-data-plane"}:
+            raise ValueError("only API and data-plane restarts are supported")
         self._fence()
         pods = self._pods(name)
         before = {pod["metadata"]["uid"] for pod in pods}

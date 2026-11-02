@@ -1,6 +1,6 @@
 """An inline wake abandoned by a killed API pod is re-driven by the dispatcher."""
 
-from space_smoke.native_inline import claims, lifecycle, operation, require_inline, suspended_sandbox, wait_state
+from space_smoke.native_inline import claims, inline_execution, lifecycle, operation, suspended_sandbox, wait_state
 from space_smoke.native_recovery import (
     RECOVERY_ENVIRONMENT,
     KindNativeHardeningFixture,
@@ -30,8 +30,7 @@ def inline_wake_survives_api_pod_kill(fixture: KindNativeHardeningFixture) -> No
     """
 
     control = fixture.recovery
-    with control.owned_faults():
-        require_inline(control, "wake_sandbox")
+    with inline_execution(fixture, control, ("wake_sandbox",)), control.owned_faults():
         with fixture.context.phase("suspend a sandbox"):
             sandbox_id = suspended_sandbox(fixture)
         with fixture.context.phase("start an inline wake with no dispatcher running"):
@@ -39,8 +38,11 @@ def inline_wake_survives_api_pod_kill(fixture: KindNativeHardeningFixture) -> No
             wake = lifecycle(fixture, sandbox_id, "wake")
             state = wait_state(fixture, wake, {"running"}, timeout=15)
             fixture.context.record("inline_wake_state_before_kill", state)
-            if state == "queued":
-                raise InconclusiveSmoke("the wake was queued, not run inline")
+            fixture.context.verify(
+                state != "queued",
+                "with inline execution on and no dispatcher running, the API must run the wake",
+                inline_wake_state_before_kill=state,
+            )
             if state != "running":
                 raise InconclusiveSmoke(f"the wake ended ({state}) before the API pod could be killed")
         with fixture.context.phase("kill every API pod mid-wake"):

@@ -2,7 +2,7 @@
 
 import time
 
-from space_smoke.native_inline import lifecycle, operation, require_inline
+from space_smoke.native_inline import inline_execution, lifecycle, operation
 from space_smoke.native_recovery import (
     RECOVERY_ENVIRONMENT,
     KindNativeHardeningFixture,
@@ -30,8 +30,7 @@ def inline_wake_waits_behind_queued_suspend(fixture: KindNativeHardeningFixture)
     """
 
     control = fixture.recovery
-    with control.owned_faults():
-        require_inline(control, "wake_sandbox")
+    with inline_execution(fixture, control, ("wake_sandbox",)), control.owned_faults():
         with fixture.context.phase("prepare a running sandbox"):
             sandbox_id = fixture.create_ready(timeout=120)
         with fixture.context.phase("queue a suspend, then a wake, with no dispatcher running"):
