@@ -1160,10 +1160,7 @@ impl SandboxController {
             Ok(mut tx) => {
                 let result = async {
                     delete_reconcile_state_for_elements(&mut tx, &cleanup_refs).await?;
-                    sqlx::query("DELETE FROM sandboxes WHERE id = $1")
-                        .bind(sandbox_id.as_uuid())
-                        .execute(&mut *tx)
-                        .await?;
+                    sandbox_store::create::delete_failed_create(&mut *tx, sandbox_id).await?;
                     tx.commit().await
                 }
                 .await;
@@ -1181,10 +1178,8 @@ impl SandboxController {
                     error = %err,
                     "failed to begin sandbox create rollback cleanup transaction"
                 );
-                if let Err(delete_err) = sqlx::query("DELETE FROM sandboxes WHERE id = $1")
-                    .bind(sandbox_id.as_uuid())
-                    .execute(pool)
-                    .await
+                if let Err(delete_err) =
+                    sandbox_store::create::delete_failed_create(pool, sandbox_id).await
                 {
                     tracing::warn!(
                         sandbox_id = %sandbox_id,
