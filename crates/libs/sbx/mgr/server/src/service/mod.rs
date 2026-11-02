@@ -466,6 +466,7 @@ pub struct SandboxManagerService {
     >,
     route_ed25519_verification_refresh_lock: Arc<Mutex<()>>,
     route_stream_epochs: Arc<Mutex<BTreeMap<SandboxId, RouteStreamEpoch>>>,
+    endpoint_proof_flights: spaced_bridge::endpoint_proof_flights::EndpointProofFlights,
     service_port_ingress_admission: ServicePortIngressAdmission,
 }
 
@@ -1862,6 +1863,7 @@ impl SandboxManagerService {
             )),
             route_ed25519_verification_refresh_lock: Arc::new(Mutex::new(())),
             route_stream_epochs: Arc::new(Mutex::new(BTreeMap::new())),
+            endpoint_proof_flights: Default::default(),
             service_port_ingress_admission: ServicePortIngressAdmission::default(),
         }
     }

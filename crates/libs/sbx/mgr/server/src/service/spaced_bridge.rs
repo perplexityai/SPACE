@@ -4,6 +4,8 @@ use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };
 
+pub(super) mod endpoint_proof_flights;
+
 pub(super) async fn launch_spaced_host_via_node(
     node_client: &mut NodeManagerGrpcClient,
     execution_fence: pplx_space_node_mgr_client::execution_fence::ExecutionFence,
@@ -136,10 +138,12 @@ impl SandboxManagerService {
             ActivationEndpointProofRequirement::DeferredUntilPoolAdoption,
         ) = (policy, requirement)
         {
+            let client = connect_spaced_host_live(sandbox).await?;
             spaced_endpoint_attestation(
                 SpacedEndpointAttestationResult::DeferredIdentityFreePoolDonor,
+                super::start::short_grpc_code(tonic::Code::Ok),
             );
-            return connect_spaced_host_live(sandbox).await;
+            return Ok(client);
         }
 
         let runtime = spaced_endpoint_runtime_identity(sandbox)?;
@@ -186,13 +190,20 @@ impl SandboxManagerService {
             }
         };
         let client = connect_spaced_host_live(sandbox).await?;
-        if let Err(error) = validate_spaced_endpoint_proof(&mut node_client, &proof, &runtime).await
+        if let Err(error) = validate_spaced_endpoint_proof(
+            &self.endpoint_proof_flights,
+            &node_client,
+            &proof,
+            &runtime,
+        )
+        .await
         {
             record_endpoint_attestation_error(&error);
             return Err(error);
         }
         pplx_space_metrics::sandbox::worker::spaced_endpoint_attestation(
             pplx_space_metrics::sandbox::worker::SpacedEndpointAttestationResult::Ok,
+            super::start::short_grpc_code(tonic::Code::Ok),
         );
         Ok(client)
     }
@@ -300,7 +311,9 @@ pub(super) async fn capture_spaced_endpoint_proof(
         .capture_sandbox_endpoint_proof(request)
         .await
         .map(Response::into_inner)
-        .map_err(node_endpoint_proof_status)?;
+        .map_err(|error| {
+            node_endpoint_proof_status(runtime.sandbox_id, "capture_sandbox_endpoint_proof", error)
+        })?;
     crate::endpoint_proof::SpacedEndpointProof::from_node_proof(&runtime, node_proof)
         .map_err(endpoint_proof_error_status)
 }
@@ -335,32 +348,47 @@ fn activation_capture_retry_delay(attempt: usize, error: &Status) -> Option<std:
 }
 
 async fn validate_spaced_endpoint_proof(
-    node_client: &mut NodeManagerGrpcClient,
+    flights: &endpoint_proof_flights::EndpointProofFlights,
+    node_client: &NodeManagerGrpcClient,
     proof: &crate::endpoint_proof::SpacedEndpointProof,
     runtime: &crate::endpoint_proof::SpacedEndpointRuntimeIdentity,
 ) -> Result<(), Status> {
-    const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
     proof
         .validate_runtime(runtime)
         .map_err(endpoint_proof_error_status)?;
-    let node_client = node_client.clone();
+    flights
+        .validate(proof, || {
+            validate_spaced_endpoint_proof_with_node(node_client.clone(), proof)
+        })
+        .await
+}
+
+fn validate_spaced_endpoint_proof_with_node(
+    node_client: NodeManagerGrpcClient,
+    proof: &crate::endpoint_proof::SpacedEndpointProof,
+) -> impl std::future::Future<Output = Result<(), Status>> + Send + 'static {
+    const COMMAND: &str = "validate_sandbox_endpoint_proof";
+    const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+    let sandbox_id = proof.sandbox_id;
     let node_proof = proof.node_proof();
-    call_endpoint_proof_rpc("validate_sandbox_endpoint_proof", || {
-        let mut node_client = node_client.clone();
-        let node_proof = node_proof.clone();
-        async move {
-            let mut request = Request::new(
-                pplx_space_node_mgr_client::proto::ValidateSandboxEndpointProofRequest {
-                    proof: Some(node_proof),
-                },
-            );
-            request.set_timeout(RPC_TIMEOUT);
-            node_client.validate_sandbox_endpoint_proof(request).await
-        }
-    })
-    .await
-    .map(|_| ())
-    .map_err(node_endpoint_proof_status)
+    async move {
+        call_endpoint_proof_rpc(COMMAND, || {
+            let mut node_client = node_client.clone();
+            let node_proof = node_proof.clone();
+            async move {
+                let mut request = Request::new(
+                    pplx_space_node_mgr_client::proto::ValidateSandboxEndpointProofRequest {
+                        proof: Some(node_proof),
+                    },
+                );
+                request.set_timeout(RPC_TIMEOUT);
+                node_client.validate_sandbox_endpoint_proof(request).await
+            }
+        })
+        .await
+        .map(|_| ())
+        .map_err(|error| node_endpoint_proof_status(sandbox_id, COMMAND, error))
+    }
 }
 
 async fn call_endpoint_proof_rpc<T, F, Fut>(
@@ -393,7 +421,7 @@ where
             matches!(
                 status.code(),
                 tonic::Code::DeadlineExceeded | tonic::Code::Unimplemented
-            )
+            ) || is_node_connection_failure(status)
         },
         operation,
     )
@@ -411,13 +439,31 @@ fn endpoint_proof_error_status(error: crate::endpoint_proof::SpacedEndpointProof
     }
 }
 
-fn node_endpoint_proof_status(error: Status) -> Status {
+fn node_endpoint_proof_status(
+    sandbox_id: pplx_space_common_core::types::SandboxId,
+    command: &'static str,
+    error: Status,
+) -> Status {
+    tracing::warn!(
+        %sandbox_id,
+        command,
+        code = ?error.code(),
+        error = %error,
+        error_chain = %status_source_chain(&error),
+        "node-manager endpoint proof call failed"
+    );
     match error.code() {
         tonic::Code::NotFound
         | tonic::Code::Unavailable
         | tonic::Code::Unimplemented
         | tonic::Code::Unknown
-        | tonic::Code::DeadlineExceeded => {
+        | tonic::Code::DeadlineExceeded
+        // Node-manager's load shed and rate limits are temporary too, even
+        // those the retry window does not wait out.
+        | tonic::Code::ResourceExhausted => {
+            Status::unavailable("spaced endpoint proof is temporarily unavailable")
+        }
+        _ if is_node_connection_failure(&error) => {
             Status::unavailable("spaced endpoint proof is temporarily unavailable")
         }
         tonic::Code::InvalidArgument => {
@@ -428,6 +474,46 @@ fn node_endpoint_proof_status(error: Status) -> Status {
         }
         _ => Status::internal("spaced endpoint attestation could not be evaluated"),
     }
+}
+
+/// Whether `status` is the client's own connection to node-manager failing
+/// rather than node-manager's answer, so the call can be replayed on the same
+/// channel, which dials again once the connection has closed. An endpoint
+/// proof call reads node state and is safe to replay.
+///
+/// tonic reports these locally: a request it timed out, or one that was still
+/// queued when the connection closed, as `Cancelled`; an HTTP/2 stream or
+/// connection error as the code of its h2 reason, so `ResourceExhausted` for
+/// the `ENHANCE_YOUR_CALM` a server's rapid-reset guard sends, and `Internal`
+/// for a GOAWAY with `PROTOCOL_ERROR`, `INTERNAL_ERROR` or `NO_ERROR`. Only
+/// those local statuses carry the h2 error in their source chain. A status
+/// node-manager sends in its trailers carries none, so this predicate counts
+/// neither its `Internal` nor its `ResourceExhausted`. Its `Internal` answers
+/// `Internal`. Its `ResourceExhausted` is replayed only while the shared retry
+/// rule waits out a retry hint (up to 2 s), and `node_endpoint_proof_status`
+/// answers it `Unavailable`. `Cancelled` counts whichever side sent it;
+/// node-manager also answers a request it timed out with `Cancelled`, and a
+/// timed-out read is safe to replay.
+fn is_node_connection_failure(status: &Status) -> bool {
+    match status.code() {
+        tonic::Code::Cancelled => true,
+        tonic::Code::ResourceExhausted | tonic::Code::Internal => {
+            std::iter::successors(std::error::Error::source(status), |error| error.source())
+                .any(|error| error.is::<h2::Error>())
+        }
+        _ => false,
+    }
+}
+
+/// `status`'s error sources, outermost first; empty for a status decoded from
+/// the server's trailers, which carries none.
+fn status_source_chain(status: &Status) -> String {
+    let mut messages: Vec<String> =
+        std::iter::successors(std::error::Error::source(status), |error| error.source())
+            .map(ToString::to_string)
+            .collect();
+    messages.dedup();
+    messages.join(": ")
 }
 
 fn endpoint_proof_cas_lost_status() -> Status {
@@ -458,7 +544,7 @@ fn record_endpoint_attestation_error(error: &Status) {
         }
         _ => SpacedEndpointAttestationResult::Unavailable,
     };
-    spaced_endpoint_attestation(result);
+    spaced_endpoint_attestation(result, super::start::short_grpc_code(error.code()));
 }
 
 async fn connect_spaced_host_live(
@@ -481,7 +567,7 @@ async fn connect_spaced_host_live(
         } else {
             SpacedEndpointAttestationResult::LocalBindingRejected
         };
-        spaced_endpoint_attestation(result);
+        spaced_endpoint_attestation(result, super::start::short_grpc_code(error.code()));
         return Err(error);
     }
     let config = pplx_space_spaced_host_client::SpacedHostClientConfig::default()
@@ -499,12 +585,18 @@ async fn connect_spaced_host_live(
         Ok(client) => Ok(client),
         Err(error) => {
             if error_chain_has_permission_denied(&error) {
-                spaced_endpoint_attestation(SpacedEndpointAttestationResult::UdsPeerRejected);
+                spaced_endpoint_attestation(
+                    SpacedEndpointAttestationResult::UdsPeerRejected,
+                    super::start::short_grpc_code(tonic::Code::PermissionDenied),
+                );
                 Err(Status::permission_denied(format!(
                     "spaced-host endpoint identity verification failed: {error}"
                 )))
             } else {
-                spaced_endpoint_attestation(SpacedEndpointAttestationResult::Unavailable);
+                spaced_endpoint_attestation(
+                    SpacedEndpointAttestationResult::Unavailable,
+                    super::start::short_grpc_code(tonic::Code::Unavailable),
+                );
                 Err(Status::unavailable(format!(
                     "spaced-host unavailable: {error}"
                 )))

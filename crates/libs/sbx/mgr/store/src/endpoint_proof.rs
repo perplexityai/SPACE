@@ -10,7 +10,7 @@ use pplx_space_node_mgr_protocol::proto::{
 };
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct ProcessActivationIdentity {
     pub pid: LinuxPid,
     pub start_time_ticks: u64,
@@ -18,7 +18,7 @@ pub struct ProcessActivationIdentity {
     pub executable_inode: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct VsockActivationIdentity {
     pub path: PathBuf,
     pub device: u64,
@@ -30,7 +30,7 @@ pub struct VsockActivationIdentity {
     pub runtime_socket_inode: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct SpacedEndpointProof {
     pub sandbox_id: SandboxId,
     pub execution_generation: ExecutionGeneration,
