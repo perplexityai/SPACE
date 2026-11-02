@@ -3,7 +3,7 @@
 // Cards built from the admin debug route and the operations log: where the
 // sandbox runs and ran, what happened to it, and what it was given.
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import { Alert, Card, Descriptions, Space, Table, Tag, Tooltip, Typography } from 'antd';
 import {
@@ -78,6 +78,15 @@ export function OrgLink({ orgId }: { orgId: string | null }) {
   );
 }
 
+function UserAnchor({ userId, email }: { userId: string | null; email: string | null | undefined }) {
+  if (!userId) return <Text type="secondary">—</Text>;
+  return (
+    <Link href={`/dashboard/users/${userId}`}>
+      {email ? email : <code>{userId}</code>}
+    </Link>
+  );
+}
+
 export function UserLink({ userId }: { userId: string | null }) {
   const [user, setUser] = useState<AdminUser | null>(null);
   useEffect(() => {
@@ -85,12 +94,24 @@ export function UserLink({ userId }: { userId: string | null }) {
     if (!userId) return;
     adminApi.get<AdminUser>(`/v1/users/${userId}`).then(setUser).catch(() => setUser(null));
   }, [userId]);
-  if (!userId) return <Text type="secondary">—</Text>;
-  return (
-    <Link href={`/dashboard/users/${userId}`}>
-      {user ? user.email : <code>{userId}</code>}
-    </Link>
-  );
+  return <UserAnchor userId={userId} email={user?.email} />;
+}
+
+// Emails of the given users, each looked up once while the caller is
+// mounted. A failed lookup is tried again when the set of users changes.
+function useUserEmails(userIds: string[]): Map<string, string> {
+  const [emails, setEmails] = useState<Map<string, string>>(() => new Map());
+  const requested = useRef(new Set<string>());
+  useEffect(() => {
+    for (const userId of userIds) {
+      if (requested.current.has(userId)) continue;
+      requested.current.add(userId);
+      adminApi.get<AdminUser>(`/v1/users/${userId}`)
+        .then((user) => setEmails((known) => new Map(known).set(userId, user.email)))
+        .catch(() => { requested.current.delete(userId); });
+    }
+  }, [userIds.join(',')]);
+  return emails;
 }
 
 function nodeLabel(name: string | null, address: string | null, role: string | null) {
@@ -300,6 +321,12 @@ export function OperationsCard({
   loaded: boolean;
   nowMs: number;
 }) {
+  // One lookup per distinct user, not one per row.
+  const actorIds = useMemo(
+    () => [...new Set(operations.flatMap((op) => (op.actor_user_id ? [op.actor_user_id] : [])))].sort(),
+    [operations],
+  );
+  const actorEmails = useUserEmails(actorIds);
   const columns: ColumnsType<AdminOperationRecord> = [
     { title: 'Requested', dataIndex: 'created_at', width: 110, render: (v: string) => <When value={v} nowMs={nowMs} /> },
     {
@@ -321,7 +348,7 @@ export function OperationsCard({
       title: <Tooltip title="The user the operation was recorded for. Creates through the admin API record the sandbox owner.">Recorded for</Tooltip>,
       dataIndex: 'actor_user_id',
       width: 220,
-      render: (v: string | null) => <UserLink userId={v} />,
+      render: (v: string | null) => <UserAnchor userId={v} email={v ? actorEmails.get(v) : null} />,
     },
     { title: 'Attempts', dataIndex: 'attempts', width: 80 },
     {
