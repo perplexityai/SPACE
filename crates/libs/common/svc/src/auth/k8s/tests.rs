@@ -1,5 +1,8 @@
+use super::review_cache::{CachedTokenReview, insert_token_review, prune_token_review_cache};
 use super::*;
 use crate::auth::NodeApiAuthenticator;
+use crate::auth::test_support::jwt_with_exp;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use k8s_openapi::api::authentication::v1::UserInfo;
@@ -165,13 +168,13 @@ async fn data_plane_identity_cannot_reuse_guest_authority_for_control_or_transfe
 }
 
 fn cache_key(token: &str, audience: &str) -> TokenCacheKey {
-    TokenCacheKey {
-        token_digest: token_digest(token),
-        audience: audience.to_string(),
-    }
+    TokenCacheKey::new(token, audience)
 }
 
-fn accepted_cache_entry(username: &str, expires_at: Instant) -> CachedTokenReview {
+fn accepted_cache_entry(
+    username: &str,
+    expires_at: Instant,
+) -> CachedTokenReview<CachedTokenReviewResult> {
     CachedTokenReview {
         result: CachedTokenReviewResult::Accepted {
             username: username.to_string(),
@@ -262,13 +265,6 @@ fn reviewer_that_hangs(config: K8sTokenAuthConfig) -> K8sTokenReviewer {
     });
     let client = ClientBuilder::new(service, "space").build();
     K8sTokenReviewer::with_client(config, client)
-}
-
-fn jwt_with_exp(exp: u64) -> String {
-    let header = general_purpose::URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);
-    let payload =
-        general_purpose::URL_SAFE_NO_PAD.encode(serde_json::json!({ "exp": exp }).to_string());
-    format!("{header}.{payload}.signature")
 }
 
 fn jwt_with_payload(payload: serde_json::Value) -> String {
@@ -628,23 +624,24 @@ fn prune_token_review_cache_clears_when_capacity_is_zero() {
 }
 
 #[test]
-fn cache_token_review_result_caches_negative_result() {
+fn insert_token_review_caches_negative_result() {
     let now = Instant::now();
     let key = cache_key("bad", "space-node-api");
     let mut cache = HashMap::new();
+    let rejected = CachedTokenReviewResult::Rejected {
+        reason: TokenReviewRejectReason::Rejected,
+    };
+    assert_eq!(rejected.insert_metric(), "insert_deny");
 
-    let (tag, evicted_capacity) = cache_token_review_result(
+    let evicted_capacity = insert_token_review(
         &mut cache,
         key.clone(),
-        CachedTokenReviewResult::Rejected {
-            reason: TokenReviewRejectReason::Rejected,
-        },
+        rejected,
         now + Duration::from_secs(2),
         now,
         10,
     );
 
-    assert_eq!(tag, "insert_deny");
     assert!(!evicted_capacity);
     assert_eq!(
         cache[&key].result,
@@ -655,7 +652,7 @@ fn cache_token_review_result_caches_negative_result() {
 }
 
 #[test]
-fn cache_token_review_result_evicts_earliest_expiring_entry_at_capacity() {
+fn insert_token_review_evicts_earliest_expiring_entry_at_capacity() {
     let now = Instant::now();
     let earliest = cache_key("first", "space-node-api");
     let later = cache_key("second", "space-node-api");
@@ -671,19 +668,21 @@ fn cache_token_review_result_evicts_earliest_expiring_entry_at_capacity() {
         ),
     ]);
 
-    let (tag, evicted_capacity) = cache_token_review_result(
+    let accepted = CachedTokenReviewResult::Accepted {
+        username: "third-sa".to_string(),
+        node_identity: AuthenticatedNodeIdentity::MissingKubernetesClaims,
+    };
+    assert_eq!(accepted.insert_metric(), "insert_authenticated");
+
+    let evicted_capacity = insert_token_review(
         &mut cache,
         inserted.clone(),
-        CachedTokenReviewResult::Accepted {
-            username: "third-sa".to_string(),
-            node_identity: AuthenticatedNodeIdentity::MissingKubernetesClaims,
-        },
+        accepted,
         now + Duration::from_secs(20),
         now,
         2,
     );
 
-    assert_eq!(tag, "insert_authenticated");
     assert!(evicted_capacity);
     assert!(!cache.contains_key(&earliest));
     assert!(cache.contains_key(&later));
@@ -746,13 +745,13 @@ async fn cached_result_evicts_expired_positive_entry() {
         accepted_token_review_status("space-node-api"),
     );
     let key = cache_key("expired", "space-node-api");
-    lock_or_recover(&reviewer.cache).insert(
+    lock_or_recover(&reviewer.cache.entries).insert(
         key.clone(),
         accepted_cache_entry("system:serviceaccount:space:space-api", Instant::now()),
     );
 
     assert_eq!(reviewer.cached_result(&key), None);
-    assert!(!lock_or_recover(&reviewer.cache).contains_key(&key));
+    assert!(!lock_or_recover(&reviewer.cache.entries).contains_key(&key));
 }
 
 #[tokio::test]
@@ -762,11 +761,11 @@ async fn in_flight_claim_drop_wakes_waiters() {
         accepted_token_review_status("space-node-api"),
     );
     let key = cache_key("token", "space-node-api");
-    let claim = match reviewer.join_in_flight_or_claim(&key) {
+    let claim = match reviewer.cache.join_in_flight_or_claim(&key) {
         InFlightState::Claimed(claim) => claim,
         InFlightState::Waiting(_) => panic!("first caller should claim in-flight work"),
     };
-    let waiter = match reviewer.join_in_flight_or_claim(&key) {
+    let waiter = match reviewer.cache.join_in_flight_or_claim(&key) {
         InFlightState::Waiting(waiter) => waiter,
         InFlightState::Claimed(_) => panic!("second caller should wait"),
     };
@@ -775,7 +774,7 @@ async fn in_flight_claim_drop_wakes_waiters() {
 
     waiter.await.unwrap();
     assert!(matches!(
-        reviewer.join_in_flight_or_claim(&key),
+        reviewer.cache.join_in_flight_or_claim(&key),
         InFlightState::Claimed(_)
     ));
 }
@@ -791,7 +790,7 @@ async fn in_flight_claim_drop_on_panic_allows_next_claim() {
         let reviewer = reviewer.clone();
         let key = key.clone();
         tokio::spawn(async move {
-            match reviewer.join_in_flight_or_claim(&key) {
+            match reviewer.cache.join_in_flight_or_claim(&key) {
                 InFlightState::Claimed(_claim) => panic!("leader panicked"),
                 InFlightState::Waiting(_) => panic!("first caller should claim in-flight work"),
             }
@@ -800,7 +799,7 @@ async fn in_flight_claim_drop_on_panic_allows_next_claim() {
 
     assert!(task.await.unwrap_err().is_panic());
     assert!(matches!(
-        reviewer.join_in_flight_or_claim(&key),
+        reviewer.cache.join_in_flight_or_claim(&key),
         InFlightState::Claimed(_)
     ));
 }
@@ -1012,7 +1011,7 @@ async fn accepted_expired_token_review_is_not_cached() {
         .unwrap();
 
     assert!(
-        !lock_or_recover(&reviewer.cache)
+        !lock_or_recover(&reviewer.cache.entries)
             .contains_key(&cache_key(&expired_token, "space-node-api"))
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -1106,7 +1105,7 @@ async fn concurrent_cache_inserts_at_capacity_do_not_panic() {
         task.await.unwrap();
     }
 
-    assert!(lock_or_recover(&reviewer.cache).len() <= reviewer.config.cache_max_entries);
+    assert!(lock_or_recover(&reviewer.cache.entries).len() <= reviewer.config.cache_max_entries);
 }
 
 #[test]

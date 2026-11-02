@@ -59,6 +59,23 @@ pub fn token_review_cache(result: &str) {
     counter("auth.token_review.cache", 1, &[tag("result", result)]);
 }
 
+/// One cache or refusal event of a build reviewer, tagged with its build
+/// surface (`build-manager`, `node-api-build` or `template-publication`).
+/// `result` is one of `hit_authenticated`, `miss`, `in_flight_wait`,
+/// `insert_authenticated`, `evict_expired` and `evict_capacity` (as in
+/// [`token_review_cache`]; a build reviewer caches no denials), `busy` (every
+/// review permit in use), `rate_limited` (the second's review budget is spent)
+/// and `in_flight_timeout` (the call's deadline passed while another call's
+/// review of the token was in flight, or left too little time to review). Kept apart from `auth.token_review.cache`, which node-api's and
+/// internal-api's own verifiers emit in the same processes.
+pub fn build_token_review_cache(surface: &str, result: &str) {
+    counter(
+        "auth.build.token_review.cache",
+        1,
+        &[tag("surface", surface), tag("result", result)],
+    );
+}
+
 /// Outcome of binding a reviewed pod token to registered template-catalog nodes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TemplateNodeBinding {
