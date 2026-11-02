@@ -274,8 +274,8 @@ failed producer, expired artifact, or mismatched identity fails closed instead
 of compiling separately on each shard.
 
 Overlap needs runner capacity for the producer and eight prepared shards: nine
-concurrent 16-core runners per run, and a tenth on a main push for Main CI's
-`kind_rust_state` (below). This
+concurrent 32-core runners per run, and a 16-core runner on a main push for
+Main CI's `kind_rust_state` (below). This
 does not add shard jobs or enlarge the cross-run cache, but runners start
 earlier. Verify both producer queue time and main CI completion time after a
 workflow change; shorter setup steps alone do not prove a faster critical path.

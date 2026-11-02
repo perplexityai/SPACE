@@ -24,7 +24,9 @@ jobs:
   rust_artifacts:
     if: github.repository == 'perplexityai/SPACE'
     name: Build shared Kind Rust artifacts
-    runs-on: ubuntu-24.04-16core
+    # The shards wait on this build when a PR changes Rust, so its cores are
+    # on the required check's critical path.
+    runs-on: ubuntu-24.04-32core
     timeout-minutes: 60
     steps:
       - name: Check out SPACE
@@ -269,7 +271,9 @@ jobs:
       # rather than inherited so a default change cannot alter the shards
       # silently.
       SPACE_KIND_TELEMETRY_MODE: otel
-    runs-on: ubuntu-24.04-16core
+    # Bring-up is CPU-bound: Tilt's image builds and loads and the pods'
+    # startup took 38% longer on 8 cores than on 16.
+    runs-on: ubuntu-24.04-32core
     timeout-minutes: 180
     steps:
       - name: Check out SPACE
