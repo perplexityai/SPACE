@@ -219,6 +219,14 @@ pub enum SandboxEventType {
     /// deletion, not a runtime lifecycle transition. Carries the pruned
     /// `snapshot_id` and its `age_secs`.
     SnapshotPruned,
+    /// A node's snapshot scheduler stopped capturing a sandbox's scheduled
+    /// snapshots, its full checkpoints included: enough unowned GC staging
+    /// waits under the sandbox's `snapshots/` that more captures would only
+    /// grow it. Emitted when the gate closes, not on every skipped tick.
+    ScheduledSnapshotsBlocked,
+    /// Deletes brought the sandbox's unowned GC staging back below the
+    /// scheduler's limit, and scheduled captures resume.
+    ScheduledSnapshotsUnblocked,
     SnapshotArtifactUploadQueued,
     SnapshotArtifactUploadCompleted,
     SnapshotArtifactUploadFailed,
@@ -349,6 +357,8 @@ pub const SANDBOX_EVENT_TYPES: &[SandboxEventType] = &[
     SandboxEventType::LocalEvictionFailed,
     SandboxEventType::RootfsStreamReclaimed,
     SandboxEventType::SnapshotPruned,
+    SandboxEventType::ScheduledSnapshotsBlocked,
+    SandboxEventType::ScheduledSnapshotsUnblocked,
     SandboxEventType::SnapshotArtifactUploadQueued,
     SandboxEventType::SnapshotArtifactUploadCompleted,
     SandboxEventType::SnapshotArtifactUploadFailed,
@@ -481,6 +491,8 @@ impl SandboxEventType {
             Self::LocalEvictionFailed => "local_eviction_failed",
             Self::RootfsStreamReclaimed => "rootfs_stream_reclaimed",
             Self::SnapshotPruned => "snapshot_pruned",
+            Self::ScheduledSnapshotsBlocked => "scheduled_snapshots_blocked",
+            Self::ScheduledSnapshotsUnblocked => "scheduled_snapshots_unblocked",
             Self::SnapshotArtifactUploadQueued => "snapshot_artifact_upload_queued",
             Self::SnapshotArtifactUploadCompleted => "snapshot_artifact_upload_completed",
             Self::SnapshotArtifactUploadFailed => "snapshot_artifact_upload_failed",
@@ -581,6 +593,7 @@ impl SandboxEventType {
             | Self::LocalEvictionCompleted
             | Self::RootfsStreamReclaimed
             | Self::SnapshotPruned
+            | Self::ScheduledSnapshotsUnblocked
             | Self::SnapshotArtifactUploadCompleted
             | Self::RuntimeActivated
             | Self::GuestBridgeReady
@@ -610,6 +623,7 @@ impl SandboxEventType {
             | Self::SandboxFailed
             | Self::SandboxQuarantined
             | Self::SandboxLost
+            | Self::ScheduledSnapshotsBlocked
             | Self::CleanupFailed
             | Self::GuestProcessStartFailed
             | Self::SnapshotRestoreFailed

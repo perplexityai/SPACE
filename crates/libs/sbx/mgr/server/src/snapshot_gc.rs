@@ -654,7 +654,9 @@ async fn delete_cache_artifact_via_node_mgr(
 /// directory. Its row is already gone, so a failure is only logged here: the
 /// orphan sweep finds unowned staging on every pass and retries it. Named
 /// snapshot deletes and retention call this too, after releasing their locks,
-/// so the log names the deleter in `deleter`.
+/// so the log names the deleter in `deleter`. Retention may also retry the
+/// delete itself (`snapshot_scheduler::retention`), so the log promises only
+/// that the directory stays until some later delete removes it.
 pub(crate) async fn delete_gc_staging(
     client: &mut pplx_space_node_mgr_client::NodeManagerGrpcClient,
     staging_path: &str,
@@ -671,7 +673,7 @@ pub(crate) async fn delete_gc_staging(
             staging_path,
             code = %status.code(),
             message = %status.message(),
-            "GC staging: DeleteCacheArtifact RPC failed; the orphan sweep retries the staging directory",
+            "GC staging: DeleteCacheArtifact RPC failed; the staging directory stays until a later delete by its deleter or the orphan sweep removes it",
         );
     })
 }
@@ -764,7 +766,7 @@ async fn sweep_orphans(
 }
 
 /// Whether `path` is GC staging that no row owns, so its bytes may be deleted.
-fn gc_pending_is_unowned(artifacts: &LocalArtifacts, path: &Path) -> bool {
+pub(crate) fn gc_pending_is_unowned(artifacts: &LocalArtifacts, path: &Path) -> bool {
     let Some(id) = path
         .file_name()
         .and_then(|name| name.to_str())
