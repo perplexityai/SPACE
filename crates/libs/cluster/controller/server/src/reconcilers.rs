@@ -627,20 +627,24 @@ pub async fn run_reconcilers(
             let evacuates_stopped_residents = node_drain_config.evacuates_stopped_residents();
             if node_drain_config.evacuate_stopped_residents && !evacuates_stopped_residents {
                 // Worth a WARN rather than silence: the operator asked for a
-                // behaviour they are not getting, and the reason is a second
+                // behaviour they are not getting, and the reason is another
                 // flag rather than anything they can see in this one. Left
                 // unstated, the symptom is a fleet where nothing changes and
                 // no log says why.
                 tracing::warn!(
+                    termination_blocking_gate = node_drain_config.termination_blocking_gate,
+                    replace_stopped_evacuations = node_drain_config.replace_stopped_evacuations,
                     "SPACE_NODE_DRAIN_EVACUATE_STOPPED_RESIDENTS is set but \
-                     SPACE_NODE_DRAIN_TERMINATION_BLOCKING_GATE is not; stopped-resident \
-                     evacuation stays off. It only takes effect in a cluster that already holds \
-                     draining nodes for stopped residents, so enable the termination-blocking \
-                     gate first"
+                     SPACE_NODE_DRAIN_TERMINATION_BLOCKING_GATE or \
+                     SPACE_NODE_DRAIN_REPLACE_STOPPED_EVACUATIONS is not; stopped-resident \
+                     evacuation stays off. It needs the termination-blocking gate, so draining \
+                     nodes holding stopped residents stay in view, and re-placement, so an \
+                     evacuated sandbox can be placed again; enable both first"
                 );
             }
             tracing::info!(
                 evacuate_stopped_residents = evacuates_stopped_residents,
+                replace_stopped_evacuations = node_drain_config.replace_stopped_evacuations,
                 "resolved stopped-resident evacuation for the node-drain reconciler"
             );
             if node_drain_enabled {
@@ -659,6 +663,7 @@ pub async fn run_reconcilers(
                     residency_evidence,
                     node_drain_config.termination_blocking_gate,
                     evacuates_stopped_residents,
+                    node_drain_config.replace_stopped_evacuations,
                 );
                 match kind {
                     TerminatorKind::Aws => {

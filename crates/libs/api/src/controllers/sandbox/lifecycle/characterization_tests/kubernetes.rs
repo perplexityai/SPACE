@@ -810,7 +810,7 @@ async fn completed_actions_keep_a_terminal_lifecycle_that_landed_mid_flight() ->
 /// route-receipt trigger: the native start operation writes `started` over
 /// it and succeeds without a retry. A Kubernetes start of a `created` row
 /// publishes the route once the node acknowledged its Wake, then the shared
-/// `maybe_update_sandbox_state(.., "started", "on_node")` runs unguarded, so
+/// `maybe_mark_started_after_start` runs unguarded, so
 /// the activation-receipt path the direct test's doc mentions is not what
 /// writes `started` here.
 #[tokio::test(flavor = "current_thread")]

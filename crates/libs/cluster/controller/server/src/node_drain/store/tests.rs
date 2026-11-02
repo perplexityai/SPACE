@@ -24,13 +24,36 @@ fn suspend_in_flight_restore_defers_to_the_next_sweep() {
         message: "suspend finalization owns the execution".to_string(),
     };
 
-    let outcome = converging_restore_outcome(&error)
+    let outcome = converging_restore_outcome(&error, SandboxLifecycle::Started)
         .expect("suspend ownership must remain a retryable restore outcome");
     let RestoreOutcome::Converging { detail, wait_phase } = outcome else {
         panic!("suspend ownership must classify as converging");
     };
     assert_eq!(detail, "suspend finalization owns the execution");
     assert_eq!(wait_phase, None);
+}
+
+/// A wait that runs out its budget converges for a target with a guest to wait
+/// for, and is a failure for a stopped re-placement, which has none.
+#[test]
+fn only_a_guest_target_converges_on_a_timed_out_wait() {
+    let error = SubstrateError::Timeout {
+        message: "sandbox wake did not reach readiness within 1s".to_string(),
+        phase: None,
+    };
+    for target in [SandboxLifecycle::Started, SandboxLifecycle::Paused] {
+        assert!(
+            matches!(
+                converging_restore_outcome(&error, target),
+                Some(RestoreOutcome::Converging { .. })
+            ),
+            "a {target} restore slower than one wait must converge across sweeps"
+        );
+    }
+    assert!(
+        converging_restore_outcome(&error, SandboxLifecycle::Stopped).is_none(),
+        "a stopped re-placement that outlasts a wait must fail and back off"
+    );
 }
 
 #[test]
@@ -40,7 +63,7 @@ fn retained_only_copy_is_not_a_converging_suspend() {
     };
 
     assert!(
-        converging_restore_outcome(&error).is_none(),
+        converging_restore_outcome(&error, SandboxLifecycle::Started).is_none(),
         "a retained-only-copy refusal requires recovery and must remain visible as a stuck evacuation"
     );
 }
@@ -51,7 +74,7 @@ fn pending_restore_source_defers_to_the_next_sweep() {
         message: "restore source is not yet portable".to_string(),
     };
 
-    let outcome = converging_restore_outcome(&error)
+    let outcome = converging_restore_outcome(&error, SandboxLifecycle::Started)
         .expect("pending restore source must remain a retryable restore outcome");
     let RestoreOutcome::Converging { detail, wait_phase } = outcome else {
         panic!("pending restore source must classify as converging");
