@@ -285,24 +285,29 @@ pub(super) struct Snapshot {
 pub(super) struct SnapshotStorage {
     pub location: SnapshotStorageLocation,
     /// The node holding the local copy, for `node_local` and `both`: the
-    /// sandbox's target node, else its active node.
+    /// node the snapshot uploaded from, which is also the sandbox's target
+    /// node, else its active node.
     pub node_id: Option<NodeId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum SnapshotStorageLocation {
-    /// Only on the sandbox's node: the current local artifact of a sandbox
-    /// settled in `suspended` or `stopped`, not in the object store. A
-    /// sandbox in any other lifecycle, including one moving between nodes,
-    /// reports no node-local copy.
+    /// Only on the sandbox's node, not in the object store: the current local
+    /// artifact of a sandbox settled in `suspended` or `stopped` on the node
+    /// the snapshot uploaded from. A sandbox in any other lifecycle, one whose
+    /// placement names a different node (as after a failed cross-node
+    /// restore), and a snapshot with no recorded source node report no
+    /// node-local copy.
     NodeLocal,
     /// Only in the object store.
     ObjectStore,
     Both,
-    /// Neither recorded: an upload in flight or failed, an older artifact
-    /// whose stored copy has been orphaned, or a current artifact of a
-    /// sandbox that is not settled on a node.
+    /// Neither recorded. An older artifact with no live stored copy (an
+    /// upload that failed or is in flight, or one orphaned), or a current
+    /// artifact not yet stored whose local copy the rule above cannot place.
+    /// The current artifact of a settled sandbox on its upload node reads
+    /// `node_local` even while its upload is in flight or after it failed.
     None,
 }
 

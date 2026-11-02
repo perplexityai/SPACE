@@ -519,10 +519,11 @@ async fn another_attempts_registration_of_an_artifact_is_found() -> TestResult {
 }
 
 /// A catalog snapshot is in the object store only when it is `ready` with a
-/// live location, and node-local on the sandbox's node only when it is the
-/// current local artifact of a sandbox settled in `suspended` or `stopped`.
-/// During a move the placement columns may already name the destination, so
-/// a `restoring` sandbox reports no node-local copy.
+/// live location, and node-local only when it is the current local artifact
+/// of a sandbox settled in `suspended` or `stopped` on the node it uploaded
+/// from. During a move, and after a failed cross-node restore rolls the row
+/// back with the placement still on the destination, no node-local copy is
+/// reported.
 #[tokio::test(flavor = "current_thread")]
 async fn storage_placements_report_object_store_and_node_copies() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
@@ -549,13 +550,67 @@ async fn storage_placements_report_object_store_and_node_copies() -> TestResult 
             .is_empty()
     );
 
-    // (lifecycle, target, active) -> the node a current artifact is local to.
-    for (lifecycle, target, active, expected_node) in [
-        ("suspended", Some(source), None, Some(source)),
-        ("stopped", None, Some(source), Some(source)),
-        // A restore onto another node, once its pod is scheduled.
-        ("restoring", Some(destination), Some(destination), None),
-        ("started", Some(source), Some(source), None),
+    // (case, lifecycle, target, active, uploaded from) -> the node a current
+    // artifact is local to.
+    for (case, lifecycle, target, active, uploaded_from, expected_node) in [
+        (
+            "suspended",
+            "suspended",
+            Some(source),
+            None,
+            Some(source),
+            Some(source),
+        ),
+        (
+            "stopped",
+            "stopped",
+            None,
+            Some(source),
+            Some(source),
+            Some(source),
+        ),
+        (
+            "restore placed on the destination",
+            "restoring",
+            Some(destination),
+            Some(destination),
+            Some(source),
+            None,
+        ),
+        // The same restore failed and rolled back: settled again, but both
+        // placement columns still name the destination.
+        (
+            "rolled-back restore",
+            "suspended",
+            Some(destination),
+            Some(destination),
+            Some(source),
+            None,
+        ),
+        (
+            "rolled-back restore, active cleared",
+            "suspended",
+            Some(destination),
+            None,
+            Some(source),
+            None,
+        ),
+        (
+            "no recorded source node",
+            "suspended",
+            Some(source),
+            None,
+            None,
+            None,
+        ),
+        (
+            "started",
+            "started",
+            Some(source),
+            Some(source),
+            Some(source),
+            None,
+        ),
     ] {
         let current = LocalArtifactId::new();
         let sandbox_id = SandboxId::new();
@@ -579,7 +634,18 @@ async fn storage_placements_report_object_store_and_node_copies() -> TestResult 
         ];
         let mut ids = Vec::new();
         for (age, (state, artifact, orphaned)) in rows.into_iter().enumerate() {
-            ids.push(insert_snapshot(&db.pool, sandbox_id, state, artifact, orphaned, age).await?);
+            ids.push(
+                insert_snapshot(
+                    &db.pool,
+                    sandbox_id,
+                    state,
+                    artifact,
+                    uploaded_from,
+                    orphaned,
+                    age,
+                )
+                .await?,
+            );
         }
         let current_node = expected_node;
         assert_eq!(
@@ -597,7 +663,7 @@ async fn storage_placements_report_object_store_and_node_copies() -> TestResult 
                 (ids[4], false, None),
                 (ids[5], false, None),
             ],
-            "{lifecycle}"
+            "{case}"
         );
     }
     Ok(())
@@ -639,15 +705,17 @@ async fn insert_snapshot(
     sandbox_id: SandboxId,
     state: &str,
     artifact: LocalArtifactId,
+    source_node: Option<NodeId>,
     orphaned: Option<bool>,
     minutes_ago: usize,
 ) -> TestResult<SnapshotId> {
     let snapshot_id = SnapshotId::new();
     sqlx::query(sql!(
         "INSERT INTO snapshots (id, sandbox_id, type, state, timestamp, org_id,
-                                local_artifact_id, artifact_kind, artifact_origin)
+                                local_artifact_id, artifact_kind, artifact_origin,
+                                source_node_id)
          VALUES ($1, $2, 'full', $3, NOW() - make_interval(mins => $4), $5::UUID, $6,
-                 'full', 'suspend')"
+                 'full', 'suspend', $7)"
     ))
     .bind(snapshot_id.as_uuid())
     .bind(sandbox_id)
@@ -655,6 +723,7 @@ async fn insert_snapshot(
     .bind(i32::try_from(minutes_ago)?)
     .bind(SEEDED_ORG_ID)
     .bind(artifact.as_uuid())
+    .bind(source_node)
     .execute(pool)
     .await?;
     if let Some(orphaned) = orphaned {

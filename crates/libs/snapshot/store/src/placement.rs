@@ -12,22 +12,29 @@ pub struct SnapshotStoragePlacement {
     /// A `ready` snapshot with a live (not orphaned) storage location: its
     /// bytes are in the object store.
     pub in_object_store: bool,
-    /// The node holding the bytes locally: the sandbox's node, when this
-    /// snapshot is the current local artifact that node published for it and
-    /// the sandbox is settled in a lifecycle that keeps it there
-    /// ([`NODE_LOCAL_LIFECYCLES`]). `None` for an older artifact, a sandbox
-    /// placed on no node, and a sandbox in any other lifecycle.
+    /// The node holding the bytes locally, when all of these hold:
+    ///
+    /// - the snapshot is the sandbox's current local artifact;
+    /// - the sandbox is settled in [`NODE_LOCAL_LIFECYCLES`];
+    /// - its node (target, else active) is the node the snapshot uploaded
+    ///   from (`snapshots.source_node_id`).
+    ///
+    /// Otherwise `None`, including when `source_node_id` is NULL: the catalog
+    /// cannot place the copy, and no guess is reported.
     pub node_local_node_id: Option<NodeId>,
 }
 
-/// The lifecycles in which the sandbox's placement columns name the node
-/// holding its current local artifact. In the others the row may already
-/// record a different node: a restore onto another node writes the
-/// destination into both `active_node_id` and `target_node_id` once its pod
-/// is scheduled, before that node holds any bytes, and the artifact marker
-/// still names the source's copy. The row does not record which node
-/// published the marker, so a move in flight reports no node-local copy
-/// rather than a wrong one.
+/// The lifecycles in which the sandbox's placement columns can name the node
+/// holding its current local artifact. In the others a move may be in flight:
+/// a restore onto another node writes the destination into both
+/// `active_node_id` and `target_node_id` once its pod is scheduled, before that
+/// node holds any bytes, while the artifact marker still names the source's
+/// copy.
+///
+/// Settling is not enough on its own: a failed restore onto another node
+/// returns the row to `suspended` with the placement columns still naming the
+/// destination, as do the sweeper's revert and unplace paths. So the
+/// placement node must also be the node the snapshot uploaded from.
 pub const NODE_LOCAL_LIFECYCLES: [SandboxLifecycle; 2] =
     [SandboxLifecycle::Suspended, SandboxLifecycle::Stopped];
 
@@ -45,8 +52,10 @@ static STORAGE_PLACEMENTS_SQL: std::sync::LazyLock<String> = std::sync::LazyLock
                      WHERE ssl.snapshot_id = s.id
                        AND ssl.orphaned_at IS NULL
                 )) AS in_object_store,
-                CASE WHEN {current_artifact} AND sb.lifecycle = ANY($2)
-                     THEN COALESCE(sb.target_node_id, sb.active_node_id)
+                CASE WHEN {current_artifact}
+                          AND sb.lifecycle = ANY($2)
+                          AND s.source_node_id = COALESCE(sb.target_node_id, sb.active_node_id)
+                     THEN s.source_node_id
                 END AS node_local_node_id
            FROM snapshots s
            JOIN sandboxes sb ON sb.id = s.sandbox_id
