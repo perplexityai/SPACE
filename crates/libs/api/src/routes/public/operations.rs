@@ -1,3 +1,4 @@
+use crate::routes::public::error::database_error;
 use pplx_space_common_core::types::OrgId;
 
 use std::{collections::VecDeque, convert::Infallible, str::FromStr, time::Duration};
@@ -105,7 +106,10 @@ pub async fn stream_sandbox_lifecycle_events(
     Path(sandbox_id): Path<String>,
 ) -> Result<Response, PublicApiError> {
     let sandbox_id = parse_public_sandbox_id(&sandbox_id)?;
-    let Some(sandbox) = fetch_sandbox(&state.pool, sandbox_id.into()).await? else {
+    let Some(sandbox) = fetch_sandbox(&state.pool, sandbox_id.into())
+        .await
+        .map_err(database_error)?
+    else {
         return Err(PublicApiError::not_found("sandbox not found"));
     };
     if sandbox.org_id != org.id {

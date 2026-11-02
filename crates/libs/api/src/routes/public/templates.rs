@@ -1,3 +1,4 @@
+use crate::routes::public::error::database_error;
 use pplx_space_common_core::types::OrgId;
 
 use pplx_space_common_core::sql;
@@ -33,10 +34,14 @@ pub async fn list_templates(
 ) -> Result<Json<PublicPage<PublicTemplate>>, PublicApiError> {
     let limit = query.limit();
     let cursor = query.cursor()?;
-    let rows = fetch_template_rows(&state.pool, org.id, cursor.as_deref(), limit).await?;
+    let rows = fetch_template_rows(&state.pool, org.id, cursor.as_deref(), limit)
+        .await
+        .map_err(database_error)?;
     let (rows, next_cursor) = template_page_rows(rows, limit)?;
     let names = rows.iter().map(|row| row.name.clone()).collect::<Vec<_>>();
-    let variants = fetch_template_variants(&state.pool, &names).await?;
+    let variants = fetch_template_variants(&state.pool, &names)
+        .await
+        .map_err(database_error)?;
     let data = public_templates(rows, variants);
 
     Ok(Json(PublicPage { data, next_cursor }))
@@ -51,11 +56,15 @@ pub async fn get_template(
         .map_err(|error| PublicApiError::bad_request(format!("invalid template name: {error}")))?
         .as_str()
         .to_string();
-    let Some(row) = fetch_template_row(&state.pool, org.id, &template_name).await? else {
+    let Some(row) = fetch_template_row(&state.pool, org.id, &template_name)
+        .await
+        .map_err(database_error)?
+    else {
         return Err(PublicApiError::not_found("template not found"));
     };
-    let variants =
-        fetch_template_variants(&state.pool, std::slice::from_ref(&template_name)).await?;
+    let variants = fetch_template_variants(&state.pool, std::slice::from_ref(&template_name))
+        .await
+        .map_err(database_error)?;
     let mut data = public_templates(vec![row], variants);
 
     Ok(Json(data.pop().ok_or_else(PublicApiError::internal)?))

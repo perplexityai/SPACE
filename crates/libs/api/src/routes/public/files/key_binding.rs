@@ -1,5 +1,6 @@
+use crate::routes::public::error::database_error;
 use pplx_space_common_core::types::IdempotencyKey;
-use pplx_space_native_files::{FingerprintError, RequestDigest};
+use pplx_space_native_files::RequestDigest;
 use pplx_space_public_api::{
     RequestFingerprint,
     routes::{NativeHttpMethod, NativeOperation},
@@ -47,17 +48,14 @@ pub(super) async fn bind_request_key(
         key: &scoped,
         request_fingerprint: fingerprint,
     };
-    if bind_idempotency_key(&state.pool, sandbox.org_id, &idempotency).await? {
+    if bind_idempotency_key(&state.pool, sandbox.org_id, &idempotency)
+        .await
+        .map_err(database_error)?
+    {
         Ok(())
     } else {
         Err(PublicApiError::idempotency_conflict(
             "idempotency key was already used with a different request",
         ))
-    }
-}
-
-impl From<FingerprintError> for PublicApiError {
-    fn from(_: FingerprintError) -> Self {
-        Self::internal()
     }
 }

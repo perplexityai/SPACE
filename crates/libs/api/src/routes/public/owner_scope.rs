@@ -2,6 +2,7 @@
 //! handler can read, mutate, mint a data-plane capability, or replay a response.
 //! ECW's legacy-org bridge is intentionally not part of this contract.
 
+use crate::routes::public::error::database_error;
 use pplx_space_common_core::types::{OrgId, UserId};
 
 use axum::{
@@ -57,7 +58,8 @@ pub(super) async fn authorized_sandbox(
             sandbox
         }
         _ => fetch_sandbox(pool, sandbox_id.into())
-            .await?
+            .await
+            .map_err(database_error)?
             .ok_or_else(|| PublicApiError::not_found("sandbox not found"))?,
     };
     if sandbox.org_id != org_id {
@@ -112,7 +114,9 @@ async fn authorize_request(state: &AppState, request: Request) -> Result<Request
             .extensions
             .get::<axum::extract::MatchedPath>()
             .is_some_and(|path| path.as_str().ends_with("/sandboxes"))
-        && !crate::auth::org_has_local_owner(&state.pool, org_id).await?
+        && !crate::auth::org_has_local_owner(&state.pool, org_id)
+            .await
+            .map_err(database_error)?
     {
         return Err(PublicApiError::forbidden(
             "federated sandbox creation requires an asserted owner and grant",

@@ -1,3 +1,4 @@
+use crate::routes::public::error::database_error;
 use pplx_space_common_core::types::OrgId;
 
 use axum::{
@@ -257,7 +258,8 @@ async fn find_idempotent_port_response(
     .bind(path_template.as_str())
     .bind(key.as_str())
     .fetch_optional(&state.pool)
-    .await?;
+    .await
+    .map_err(database_error)?;
 
     let Some((stored_fingerprint, response_json)) = row else {
         return Ok(None);
@@ -294,7 +296,7 @@ async fn record_idempotent_port_response(
         tracing::error!(%error, "failed to serialize port response for idempotency");
         PublicApiError::internal()
     })?;
-    let mut tx = state.pool.begin().await?;
+    let mut tx = state.pool.begin().await.map_err(database_error)?;
     delete_expired_idempotency_record_tx(
         &mut tx,
         org_id,
@@ -303,7 +305,8 @@ async fn record_idempotent_port_response(
         path_template,
         &key,
     )
-    .await?;
+    .await
+    .map_err(database_error)?;
     let inserted = sqlx::query(sql!(
         "INSERT INTO public_idempotency_records (
              id,
@@ -325,14 +328,15 @@ async fn record_idempotent_port_response(
     .bind(fingerprint.as_str())
     .bind(SqlJson(response_json))
     .execute(&mut *tx)
-    .await?;
+    .await
+    .map_err(database_error)?;
 
     if inserted.rows_affected() == 1 {
-        tx.commit().await?;
+        tx.commit().await.map_err(database_error)?;
         return Ok(response.clone());
     }
 
-    tx.commit().await?;
+    tx.commit().await.map_err(database_error)?;
 
     find_idempotent_port_response(state, org_id, &key, path_template, &fingerprint)
         .await?

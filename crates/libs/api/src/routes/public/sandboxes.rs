@@ -1,3 +1,4 @@
+use crate::routes::public::error::database_error;
 use pplx_space_common_core::types::{NodeId, OrgId, SandboxId, UserId};
 
 use pplx_space_common_core::sql;
@@ -629,7 +630,9 @@ pub async fn list_sandboxes(
                 .ok_or_else(PublicApiError::internal)
         })
         .transpose()?;
-    let rows = fetch_sandboxes_page(&state.pool, org.id, subject_id, cursor, limit).await?;
+    let rows = fetch_sandboxes_page(&state.pool, org.id, subject_id, cursor, limit)
+        .await
+        .map_err(database_error)?;
     Ok(Json(sandboxes_page(rows, limit)?))
 }
 
@@ -649,7 +652,10 @@ pub(crate) async fn read_public_sandbox(
     org_id: OrgId,
     sandbox_id: PublicSandboxId,
 ) -> Result<PublicSandbox, PublicApiError> {
-    let Some(sandbox) = fetch_public_sandbox(pool, org_id, sandbox_id).await? else {
+    let Some(sandbox) = fetch_public_sandbox(pool, org_id, sandbox_id)
+        .await
+        .map_err(database_error)?
+    else {
         return Err(PublicApiError::not_found("sandbox not found"));
     };
     public_sandbox_from_row(sandbox)
@@ -661,7 +667,10 @@ pub async fn get_sandbox_stats(
     Path(sandbox_id): Path<String>,
 ) -> Result<Json<SandboxStatsResponse>, PublicApiError> {
     let sandbox_id = parse_public_sandbox_id(&sandbox_id)?;
-    let Some(sandbox) = fetch_sandbox(&state.pool, sandbox_id.into()).await? else {
+    let Some(sandbox) = fetch_sandbox(&state.pool, sandbox_id.into())
+        .await
+        .map_err(database_error)?
+    else {
         return Err(PublicApiError::not_found("sandbox not found"));
     };
     if sandbox.org_id != org.id {
@@ -681,7 +690,10 @@ pub async fn stream_sandbox_metrics(
     Path(sandbox_id): Path<String>,
 ) -> Result<Response, PublicApiError> {
     let sandbox_id = parse_public_sandbox_id(&sandbox_id)?;
-    let Some(sandbox) = fetch_sandbox(&state.pool, sandbox_id.into()).await? else {
+    let Some(sandbox) = fetch_sandbox(&state.pool, sandbox_id.into())
+        .await
+        .map_err(database_error)?
+    else {
         return Err(PublicApiError::not_found("sandbox not found"));
     };
     if sandbox.org_id != org.id {
@@ -1144,7 +1156,8 @@ async fn ensure_sandbox_owner(
     .bind(sandbox_id.as_uuid())
     .bind(org_id)
     .fetch_one(pool)
-    .await?;
+    .await
+    .map_err(database_error)?;
     if !found {
         return Err(PublicApiError::not_found("sandbox not found"));
     }

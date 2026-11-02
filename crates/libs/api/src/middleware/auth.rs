@@ -1,3 +1,4 @@
+use crate::routes::public::error::database_error;
 use pplx_space_common_core::types::OrgId;
 
 use crate::api_surface::ApiSurface;
@@ -125,7 +126,7 @@ pub async fn require_auth(State(state): State<AppState>, request: Request, next:
         // every authenticated console request, so a lock race on the session
         // lookup would 500 the request before the handler's own 503 could ever
         // be reached.
-        Err(error) => crate::routes::public::error::PublicApiError::from(error).into_response(),
+        Err(error) => database_error(error).into_response(),
     }
 }
 
@@ -262,7 +263,9 @@ fn federated_identity_error(
 ) -> PublicApiError {
     use crate::federated_identity::ResolvePrincipalError;
     match error {
-        ResolvePrincipalError::Lookup(error) | ResolvePrincipalError::Reload(error) => error.into(),
+        ResolvePrincipalError::Lookup(error) | ResolvePrincipalError::Reload(error) => {
+            database_error(error)
+        }
         ResolvePrincipalError::Materialize(error) => {
             if error.is_lock_contention() {
                 tracing::warn!(%error, "database statement lost a lock race; retryable");
@@ -342,7 +345,7 @@ pub async fn require_native_auth(
             }
             Ok(None) => {}
             Err(error) => {
-                return crate::routes::public::error::PublicApiError::from(error).into_response();
+                return database_error(error).into_response();
             }
         }
     }
@@ -399,7 +402,7 @@ pub async fn require_native_auth(
         .into_response(),
         Err(error) => {
             tracing::error!(%error, "native service-credential lookup failed");
-            crate::routes::public::error::PublicApiError::from(error).into_response()
+            database_error(error).into_response()
         }
     }
 }

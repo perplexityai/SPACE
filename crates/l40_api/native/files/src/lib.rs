@@ -12,6 +12,7 @@
 mod failure;
 pub mod limits;
 mod parents;
+mod public_error;
 mod request;
 mod worker;
 

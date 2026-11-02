@@ -1,3 +1,4 @@
+use crate::routes::public::error::database_error;
 use pplx_space_common_core::types::{NodeGroupId, NodeId, OrgId, UserId};
 
 use axum::{
@@ -85,7 +86,8 @@ pub(super) async fn list_audit_events(
     ))
     .bind(limit)
     .fetch_all(&state.pool)
-    .await?;
+    .await
+    .map_err(database_error)?;
 
     Ok(Json(ListAdminAuditEventsResponse { events }))
 }
