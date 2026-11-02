@@ -13299,8 +13299,6 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Suspended);
-        let service = SandboxManagerService::for_test(conn);
-        let sandbox = service.lookup_sandbox(&sandbox_id).unwrap();
         let snapshot_root = tempfile::tempdir().unwrap();
         let local_artifact_id = LocalArtifactId::new();
         let snapshot_dir = snapshot_root.path().join("snapshot");
@@ -13310,6 +13308,17 @@ pub(crate) mod service_tests {
             local_artifact_id,
             b"deduplicated-backup",
         );
+        assert!(
+            crate::db::adopt_suspended_local_artifact(
+                &conn,
+                &sandbox_id,
+                local_artifact_id,
+                snapshot_dir.to_str().unwrap(),
+            )
+            .unwrap()
+        );
+        let service = SandboxManagerService::for_test(conn);
+        let sandbox = service.lookup_sandbox(&sandbox_id).unwrap();
         let upload_config = crate::snapshot_upload::SnapshotUploadConfig::from_uri(
             "s3://test-bucket/prefix?region=us-east-1",
         )
@@ -13363,8 +13372,6 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Suspended);
-        let service = SandboxManagerService::for_test(conn);
-        let sandbox = service.lookup_sandbox(&sandbox_id).unwrap();
         let snapshot_root = tempfile::tempdir().unwrap();
         let local_artifact_id = LocalArtifactId::new();
         let snapshot_dir = snapshot_root.path().join("snapshot");
@@ -13374,6 +13381,17 @@ pub(crate) mod service_tests {
             local_artifact_id,
             b"restore-visible-backup",
         );
+        assert!(
+            crate::db::adopt_suspended_local_artifact(
+                &conn,
+                &sandbox_id,
+                local_artifact_id,
+                snapshot_dir.to_str().unwrap(),
+            )
+            .unwrap()
+        );
+        let service = SandboxManagerService::for_test(conn);
+        let sandbox = service.lookup_sandbox(&sandbox_id).unwrap();
         let upload_config = crate::snapshot_upload::SnapshotUploadConfig::from_uri(
             "s3://test-bucket/prefix?region=us-east-1",
         )

@@ -272,6 +272,32 @@ impl SandboxManagerService {
             handoff,
             execution_generation,
         } = submission;
+        // A suspend publishes over the sandbox's one suspend directory, so a
+        // suspend artifact there is the one the row pins, or a newer suspend
+        // replaced it and its files are that suspend's. A teardown fence
+        // hands off the capture its own suspend just published, which the row
+        // pins only once that suspend commits.
+        if handoff != ArtifactBackupHandoff::TeardownFence
+            && artifact_origin == ArtifactOrigin::Suspend
+            && crate::service::is_canonical_suspend_snapshot_dir(std::path::Path::new(snapshot_dir))
+        {
+            let pinned = {
+                let db = self
+                    .db_conn()
+                    .map_err(|status| status.message().to_owned())?;
+                crate::db::read::sandbox(&db, &sandbox.id)
+                    .map_err(|error| format!("read sandbox {}: {error}", sandbox.id))?
+                    .and_then(|row| row.current_local_artifact_id)
+            };
+            if pinned != Some(local_artifact_id) {
+                return Err(ArtifactBackupSubmissionError::Replaced(format!(
+                    "local artifact {local_artifact_id} was replaced in {snapshot_dir}: \
+                     sandbox {} pins {}",
+                    sandbox.id,
+                    pinned.map_or_else(|| "no artifact".to_owned(), |id| id.to_string()),
+                )));
+            }
+        }
         let config: &crate::snapshot_upload::SnapshotUploadConfig = match request_override {
             Some(c) => c,
             None => match self.snapshot_upload_config.as_ref() {
@@ -306,7 +332,7 @@ impl SandboxManagerService {
             }
         };
         // An imported artifact's sidecar names the exporter's id, not the one
-        // this backup adopted.
+        // this backup adopts.
         let sidecar_artifact_id = meta.local_artifact_id;
         meta.local_artifact_id = Some(local_artifact_id);
         meta.artifact_kind = Some(artifact_kind);
@@ -349,7 +375,9 @@ impl SandboxManagerService {
         )
         .map_err(|error| format!("prepare snapshot upload intent failed: {error}"))?;
         jobs.execution_generation = execution_generation;
-        jobs.sidecar_artifact_id = sidecar_artifact_id;
+        if jobs.metadata_staging_dir.is_some() && sidecar_artifact_id.is_some() {
+            jobs.sidecar_artifact_id = sidecar_artifact_id;
+        }
         let mut storage_uri = jobs.storage_uri.clone();
         let dedup_key = crate::snapshot_upload_jobs::artifact_backup_dedup_key(local_artifact_id);
         let local_artifact_id = local_artifact_id.to_string();

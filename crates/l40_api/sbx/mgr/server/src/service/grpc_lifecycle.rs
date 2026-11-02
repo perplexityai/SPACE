@@ -342,6 +342,10 @@ pub(super) const AUTO_LIFECYCLE_SUSPEND_BACKUP_FENCE_FAILED_METADATA: &str =
 enum ArtifactBackupSubmissionError {
     #[error("{0}")]
     Other(String),
+    /// A newer suspend replaced the requested artifact in the sandbox's
+    /// suspend directory, so no attempt can back it up.
+    #[error("{0}")]
+    Replaced(String),
     /// `superseded_generation` is the generation the control plane named
     /// when it refused the registration as superseded.
     #[error("begin restore-visible snapshot backup: {error}")]
