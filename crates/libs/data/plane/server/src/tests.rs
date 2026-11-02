@@ -68,6 +68,33 @@ async fn unsupported_envd_surfaces_return_explicit_ecw_errors() {
 }
 
 #[tokio::test]
+async fn routed_requests_record_latency_by_route_template() {
+    if !pplx_space_test_env::enter_test_process(&[(
+        "SPACE_INTERNAL_RPC_INSECURE_DEV",
+        Some(std::ffi::OsStr::new("true")),
+    )]) {
+        return;
+    }
+
+    let capture = pplx_space_metrics::test_capture::capture_values_guard();
+    let response = router(test_data_plane_state().await)
+        .oneshot(Request::get("/files/compose").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    let tags: Vec<_> = capture
+        .finish()
+        .into_iter()
+        .filter(|value| value.name == "data_plane.request.latency_ms")
+        .map(|value| value.tags)
+        .collect();
+    assert_eq!(
+        tags,
+        [["method:GET", "route:/files/compose", "status_code:501"]]
+    );
+}
+
+#[tokio::test]
 async fn unsupported_envd_method_returns_explicit_ecw_error() {
     if !pplx_space_test_env::enter_test_process(&[(
         "SPACE_INTERNAL_RPC_INSECURE_DEV",
