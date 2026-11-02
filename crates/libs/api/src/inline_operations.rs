@@ -14,8 +14,14 @@
 //! grace period), and no new work once the process drains or when it has no
 //! route-signing authority to execute with. A route that cannot get a permit
 //! records its operation queued for the dispatcher, exactly as it would with
-//! inline execution off. Across processes, [`InlineOrgLimit`] bounds what one
-//! organization runs inline; admission checks it as it claims.
+//! inline execution off. Admission takes the permit only once it has created
+//! the operation and found nothing else holding it back, so a request that
+//! joins other work, or waits on the sandbox's locks, holds none. Across
+//! processes, [`InlineOrgLimit`] bounds what one organization runs inline;
+//! admission checks it as it claims.
+//!
+//! A claim is committed in the task that runs it ([`InlineOperations::start`]),
+//! so a request dropped mid-commit cannot leave a claim that nothing runs.
 //!
 //! [`InlineLifecycle`] offers the lifecycle operations callers wait on
 //! (wakes, resumes and starts) to the runner, under the env switches and the
@@ -32,8 +38,8 @@ use pplx_space_common_core::types::OrgId;
 use pplx_space_common_svc::DrainSignal;
 use pplx_space_feature_flags::{FeatureFlagClient, SPACE_NATIVE_INLINE_OPERATIONS_FLAG};
 use pplx_space_metrics::operations::{InlineAdmissionPath, InlineAdmissionReason};
-use pplx_space_public_api::OperationKind;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use pplx_space_public_api::{OperationId, OperationKind};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::Instrument as _;
@@ -44,7 +50,8 @@ use crate::public_operation_driver::{
 };
 use crate::public_operations::{
     ClaimedPublicOperation, CreateInlinePublicOperationResult, CreatePublicOperationResult,
-    InlineOrgLimit, InlineQueueReason, PublicOperationStore,
+    InlineClaim, InlineClaimOffer, InlineClaimed, InlineOrgLimit, InlineQueueReason,
+    PublicOperationStore, PublicOperationStoreError,
 };
 use crate::public_sandbox_operations::{
     CreateSandboxOperationExecutor, SandboxLifecycleOperationExecutor,
@@ -187,15 +194,6 @@ pub enum InlineRefusal {
     Joined,
 }
 
-impl From<InlineQueueReason> for InlineRefusal {
-    fn from(reason: InlineQueueReason) -> Self {
-        match reason {
-            InlineQueueReason::Busy => Self::Busy,
-            InlineQueueReason::OrgLimit => Self::OrgLimit,
-        }
-    }
-}
-
 impl InlineRefusal {
     const fn reason(self) -> InlineAdmissionReason {
         match self {
@@ -211,7 +209,7 @@ impl InlineRefusal {
     }
 }
 
-/// One of the process's inline permits, taken before a route claims its
+/// One of the process's inline permits, taken as admission claims an
 /// operation, and held by the execution until it ends. Dropping it unused
 /// (the operation was queued after all) frees it.
 pub struct InlinePermit {
@@ -288,8 +286,8 @@ impl InlineOperations {
         })
     }
 
-    /// A permit to run one operation offered on `path` inline, taken before
-    /// the route claims it. A refusal is counted here; the route records the
+    /// A permit to run one operation offered on `path` inline, taken as
+    /// admission claims it. A refusal is counted here; admission records the
     /// operation queued.
     pub fn try_acquire(&self, path: InlineAdmissionPath) -> Result<InlinePermit, InlineRefusal> {
         let inner = &self.inner;
@@ -314,6 +312,31 @@ impl InlineOperations {
                 Err(refusal)
             }
         }
+    }
+
+    /// The offer admission claims an operation offered on `path` under: this
+    /// process's organization limit, and a permit taken only once nothing
+    /// else holds the operation back.
+    pub(crate) fn claim_offer(
+        &self,
+        path: InlineAdmissionPath,
+    ) -> InlineClaimOffer<impl FnOnce() -> Option<InlinePermit> + Send + 'static> {
+        let runner = self.clone();
+        InlineClaimOffer {
+            org_limit: self.org_limit(),
+            acquire: move || runner.try_acquire(path).ok(),
+        }
+    }
+
+    /// Count why admission left an operation offered on `path` queued. A
+    /// permit refused was counted when it was refused.
+    pub(crate) fn refuse_queued(&self, path: InlineAdmissionPath, reason: InlineQueueReason) {
+        let refusal = match reason {
+            InlineQueueReason::Busy => InlineRefusal::Busy,
+            InlineQueueReason::OrgLimit => InlineRefusal::OrgLimit,
+            InlineQueueReason::NoPermit => return,
+        };
+        self.refuse(path, refusal);
     }
 
     /// Report `operations.inline.in_flight` against this process's capacity
@@ -347,38 +370,54 @@ impl InlineOperations {
         pplx_space_metrics::operations::inline_admission(path, refusal.reason());
     }
 
-    /// Drive `operation`, claimed under `claim_token`, to its recorded
-    /// outcome in a task on the API's tracker, holding `permit` until it
-    /// ends. Dropping the handle detaches the task; it keeps running. If it
-    /// dies, the claim goes stale and the dispatcher re-drives the operation.
-    pub fn spawn<F>(
+    /// Commit `claim` and drive its operation to its recorded outcome, both
+    /// in one task on the API's tracker, holding the claim's permit until the
+    /// execution ends. [`InlineStart::committed`] answers once the commit
+    /// has. Dropping the [`InlineStart`], or the request awaiting it, stops
+    /// neither the commit nor the execution after it, so a client that
+    /// disconnects mid-commit cannot leave a committed claim that nothing
+    /// runs. If the task dies, the claim goes stale and the dispatcher
+    /// re-drives the operation.
+    pub fn start<F>(
         &self,
-        permit: InlinePermit,
         store: PublicOperationStore,
-        claim_token: String,
-        operation: ClaimedPublicOperation,
+        claim: InlineClaim<InlinePermit>,
         execution: F,
-    ) -> tokio::task::JoinHandle<()>
+    ) -> InlineStart
     where
         F: Future<Output = OperationExecutionResult> + Send + 'static,
     {
-        pplx_space_metrics::operations::inline_admission(
-            permit.path,
-            InlineAdmissionReason::Admitted,
-        );
-        let in_flight = InFlight::enter(Arc::clone(&self.inner));
-        let execution_config = self.inner.execution;
-        let span = execution_span(&operation);
-        self.inner.tasks.spawn(
+        let (answer, committed) = oneshot::channel();
+        let operation_id = claim.operation().id;
+        let inner = Arc::clone(&self.inner);
+        let span = execution_span(claim.operation());
+        let finished = self.inner.tasks.spawn(
             async move {
+                let InlineClaimed {
+                    claim_token,
+                    operation,
+                    permit,
+                } = match claim.commit().await {
+                    Ok(committed) => committed,
+                    Err(error) => {
+                        let _ = answer.send(Err(error));
+                        return;
+                    }
+                };
+                pplx_space_metrics::operations::inline_admission(
+                    permit.path,
+                    InlineAdmissionReason::Admitted,
+                );
                 let _permit = permit;
-                let _in_flight = in_flight;
+                let _in_flight = InFlight::enter(Arc::clone(&inner));
+                // The request may be gone; the execution runs regardless.
+                let _ = answer.send(Ok(()));
                 let operation_id = operation.id;
                 let kind = operation.kind;
                 match drive_deferrable_operation(
                     store,
                     claim_token,
-                    execution_config,
+                    inner.execution,
                     operation,
                     OperationExecutor::Inline,
                     execution,
@@ -405,7 +444,41 @@ impl InlineOperations {
                 }
             }
             .instrument(span),
-        )
+        );
+        InlineStart {
+            operation_id,
+            committed,
+            finished,
+        }
+    }
+}
+
+/// An inline execution [`InlineOperations::start`] started.
+pub struct InlineStart {
+    operation_id: OperationId,
+    committed: oneshot::Receiver<Result<(), PublicOperationStoreError>>,
+    finished: tokio::task::JoinHandle<()>,
+}
+
+impl InlineStart {
+    /// Wait for the claim's commit. An error is the commit's, or the task's
+    /// if it ended before the commit answered; either way nothing runs it
+    /// here, and a claim that did commit goes stale for the dispatcher.
+    pub async fn committed(&mut self) -> Result<(), PublicOperationStoreError> {
+        (&mut self.committed)
+            .await
+            .unwrap_or(Err(PublicOperationStoreError::Sql(
+                sqlx::Error::WorkerCrashed,
+            )))
+    }
+
+    pub fn operation_id(&self) -> OperationId {
+        self.operation_id
+    }
+
+    /// The task, which ends with the execution.
+    pub fn finished(self) -> tokio::task::JoinHandle<()> {
+        self.finished
     }
 }
 
@@ -481,24 +554,18 @@ impl InlineLifecycle {
         org_enabled && self.runner.kind_enabled(kind)
     }
 
-    /// A permit to offer an operation of `kind` for `org_id` on `path` for
-    /// inline execution, or `None` to record it queued. A refused permit is
-    /// counted; an operation not offered at all is not.
+    /// The offer admission claims an operation of `kind` for `org_id` on
+    /// `path` under, or `None` when it is not offered for inline execution
+    /// and is recorded as without it. The offer's permit is taken only once
+    /// the operation is otherwise claimable, and a refusal is counted then.
     pub(crate) fn offer(
         &self,
         org_id: OrgId,
         kind: OperationKind,
         path: InlineAdmissionPath,
-    ) -> Option<InlinePermit> {
-        if !self.enabled_for(org_id, kind) {
-            return None;
-        }
-        self.runner.try_acquire(path).ok()
-    }
-
-    /// The organization limit admission holds the claim to.
-    pub(crate) fn org_limit(&self) -> Option<InlineOrgLimit> {
-        self.runner.org_limit()
+    ) -> Option<InlineClaimOffer<impl FnOnce() -> Option<InlinePermit> + Send + 'static>> {
+        self.enabled_for(org_id, kind)
+            .then(|| self.runner.claim_offer(path))
     }
 
     /// Count a replay of an operation of `kind` that would have been offered.
@@ -513,40 +580,37 @@ impl InlineLifecycle {
         }
     }
 
-    /// Act on what admission recorded under `permit`: run a claimed
-    /// operation inline, holding the permit, or count why it was left
-    /// queued or not created. Answers what was recorded, as a plain create
-    /// answers it, so the route responds exactly as without inline
-    /// execution. The execution runs detached; the route does not wait.
-    pub(crate) fn settle(
+    /// Act on what admission recorded for an operation offered on `path`:
+    /// commit a claimed one and run it inline, holding its permit, or count
+    /// why it was left queued or not created. Answers what was recorded, as
+    /// a plain create answers it, so the route responds exactly as without
+    /// inline execution. It waits for the commit, not the execution; neither
+    /// stops if this future is dropped.
+    pub(crate) async fn settle(
         &self,
-        permit: InlinePermit,
+        path: InlineAdmissionPath,
         store: &PublicOperationStore,
-        recorded: CreateInlinePublicOperationResult,
-    ) -> CreatePublicOperationResult {
-        let path = permit.path;
+        recorded: CreateInlinePublicOperationResult<InlinePermit>,
+    ) -> Result<CreatePublicOperationResult, PublicOperationStoreError> {
         match recorded {
-            CreateInlinePublicOperationResult::Claimed {
-                claim_token,
-                operation,
-            } => {
-                let operation_id = operation.id;
-                let execution = self.executor.execute(operation.clone());
-                drop(
-                    self.runner
-                        .spawn(permit, store.clone(), claim_token, operation, execution),
-                );
-                CreatePublicOperationResult::Created(operation_id)
+            CreateInlinePublicOperationResult::Claimed(claim) => {
+                let operation_id = claim.operation().id;
+                let execution = self.executor.execute(claim.operation().clone());
+                self.runner
+                    .start(store.clone(), claim, execution)
+                    .committed()
+                    .await?;
+                Ok(CreatePublicOperationResult::Created(operation_id))
             }
             CreateInlinePublicOperationResult::Queued(operation_id, reason) => {
-                self.runner.refuse(path, reason.into());
-                CreatePublicOperationResult::Created(operation_id)
+                self.runner.refuse_queued(path, reason);
+                Ok(CreatePublicOperationResult::Created(operation_id))
             }
             CreateInlinePublicOperationResult::NotCreated(result) => {
                 if matches!(result, CreatePublicOperationResult::Existing(_)) {
                     self.runner.refuse(path, InlineRefusal::Joined);
                 }
-                result
+                Ok(result)
             }
         }
     }

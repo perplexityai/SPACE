@@ -342,14 +342,11 @@ async fn enqueue_implicit_wake(
     let store = PublicOperationStore::new(pool.clone());
     let target_id = sandbox_id.to_string();
     let traceparent = crate::public_operations::request_traceparent();
+    let path = InlineAdmissionPath::ImplicitWake;
     let offered = inline.and_then(|inline| {
         inline
-            .offer(
-                org_id,
-                OperationKind::WakeSandbox,
-                InlineAdmissionPath::ImplicitWake,
-            )
-            .map(|permit| (inline, permit))
+            .offer(org_id, OperationKind::WakeSandbox, path)
+            .map(|offer| (inline, offer))
     });
     match offered {
         None => {
@@ -357,17 +354,17 @@ async fn enqueue_implicit_wake(
                 .create_or_join_active_sandbox_wake(org_id, &target_id, payload, traceparent)
                 .await?;
         }
-        Some((inline, permit)) => {
+        Some((inline, offer)) => {
             let recorded = store
                 .create_or_join_active_sandbox_wake_claimed_if_sole_active(
                     org_id,
                     &target_id,
                     payload,
                     traceparent,
-                    inline.org_limit(),
+                    offer,
                 )
                 .await?;
-            inline.settle(permit, &store, recorded);
+            inline.settle(path, &store, recorded).await?;
         }
     }
     Ok(())

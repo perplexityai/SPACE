@@ -1169,22 +1169,36 @@ mod not_running {
         /// Inline execution of every inline-capable kind for every
         /// organization, through this script.
         fn inline(&self) -> InlineLifecycle {
+            self.inline_on(inline_runner(
+                InlineOperationsConfig::default().max_concurrent,
+            ))
+        }
+
+        /// [`Self::inline`] on `runner`.
+        fn inline_on(&self, runner: InlineOperations) -> InlineLifecycle {
             InlineLifecycle::new(
-                InlineOperations::new(
-                    InlineOperationsConfig {
-                        enabled: true,
-                        kinds: INLINE_CAPABLE_KINDS.to_vec(),
-                        ..Default::default()
-                    },
-                    tokio_util::task::TaskTracker::new(),
-                    pplx_space_common_svc::DrainSignal::new(),
-                    OperationExecutionConfig::default(),
-                    true,
-                ),
+                runner,
                 Arc::new(self.clone()),
                 pplx_space_feature_flags::FeatureFlagClient::disabled(),
             )
         }
+    }
+
+    /// A process running every inline-capable kind inline, with
+    /// `max_concurrent` permits.
+    fn inline_runner(max_concurrent: usize) -> InlineOperations {
+        InlineOperations::new(
+            InlineOperationsConfig {
+                enabled: true,
+                kinds: INLINE_CAPABLE_KINDS.to_vec(),
+                max_concurrent,
+                ..Default::default()
+            },
+            tokio_util::task::TaskTracker::new(),
+            pplx_space_common_svc::DrainSignal::new(),
+            OperationExecutionConfig::default(),
+            true,
+        )
     }
 
     impl InlineExecutor for ScriptedWake {
@@ -1512,6 +1526,145 @@ mod not_running {
             assert_eq!(recorded, 1, "{action}");
             assert_eq!(script.executed(), vec![first], "{action}");
         }
+        Ok(())
+    }
+
+    /// Returns once some backend waits on an advisory lock.
+    async fn wait_for_advisory_lock_waiter(pool: &sqlx::PgPool) -> TestDbResult<()> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let waiting: bool = sqlx::query_scalar(sql!(
+                "SELECT EXISTS (
+                     SELECT 1 FROM pg_stat_activity
+                      WHERE datname = current_database()
+                        AND wait_event_type = 'Lock'
+                        AND wait_event = 'advisory'
+                 )"
+            ))
+            .fetch_one(pool)
+            .await?;
+            if waiting {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("nothing waited on an advisory lock".into());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A waker that joins a wake already queued takes no inline permit, not
+    /// even while it waits for the sandbox's wake lock: with one permit in
+    /// the process, the permit stays free for other sandboxes' wakes.
+    #[tokio::test]
+    async fn a_waker_that_joins_a_queued_wake_holds_no_inline_permit() -> TestDbResult<()> {
+        let org_id = OrgId::from_uuid(SEED_ORG_ID);
+        for waker in [
+            Waker::Action("wake"),
+            Waker::Command("commands"),
+            Waker::Attach,
+        ] {
+            let script = ScriptedWake::new(WakeScript::Succeed);
+            let runner = inline_runner(1);
+            let fixture = fixture_with(Some(script.inline_on(runner.clone()))).await?;
+            let sandbox_id = sandbox(&fixture, "suspended", &["access", "command"]).await?;
+            let target_id = sandbox_id.to_string();
+            let CreatePublicOperationResult::Created(queued) =
+                PublicOperationStore::new(fixture.db.pool.clone())
+                    .create_or_join_active_sandbox_wake(org_id, &target_id, json!({}), None)
+                    .await?
+            else {
+                panic!("{waker:?}: a queued system wake");
+            };
+
+            // Outside the routes' two-connection pool: the lock's holder and
+            // the observer of the waker's wait.
+            let observer = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(2)
+                .connect(&fixture.db.database_url)
+                .await?;
+            let mut holder = observer.begin().await?;
+            crate::public_operations::lock_active_sandbox_operation(
+                &mut holder,
+                org_id,
+                OperationKind::WakeSandbox,
+                &target_id,
+            )
+            .await?;
+            let joining = wake_by(&fixture, sandbox_id, waker);
+            tokio::pin!(joining);
+            tokio::select! {
+                joined = &mut joining => panic!("{waker:?} got past a held wake lock: {joined:?}"),
+                waiting = wait_for_advisory_lock_waiter(&observer) => waiting?,
+            }
+            let permit = runner
+                .try_acquire(InlineAdmissionPath::ImplicitWake)
+                .unwrap_or_else(|refusal| {
+                    panic!("{waker:?} holds the only permit while it waits: {refusal:?}")
+                });
+            drop(permit);
+            holder.rollback().await?;
+
+            assert_eq!(joining.await?, queued.as_uuid(), "{waker:?}");
+            assert_eq!(
+                state_and_attempts(&fixture, queued.as_uuid()).await?,
+                ("queued", 0),
+                "{waker:?}"
+            );
+            assert!(script.executed().is_empty(), "{waker:?}");
+        }
+        Ok(())
+    }
+
+    /// A request dropped once admission has claimed its wake, at its first
+    /// wait after (the claim's commit), does not strand the claim: the
+    /// commit and the execution run in one task on the inline tracker, so
+    /// the wake still runs and completes in this process.
+    #[tokio::test]
+    async fn a_request_dropped_as_its_inline_wake_commits_still_runs_it() -> TestDbResult<()> {
+        let org_id = OrgId::from_uuid(SEED_ORG_ID);
+        let script = ScriptedWake::new(WakeScript::Succeed);
+        let inline = script.inline();
+        let fixture = fixture_with(Some(inline.clone())).await?;
+        let sandbox_id = sandbox(&fixture, "suspended", &["command"]).await?;
+        let store = PublicOperationStore::new(fixture.db.pool.clone());
+        let path = InlineAdmissionPath::ImplicitWake;
+        let recorded = store
+            .create_or_join_active_sandbox_wake_claimed_if_sole_active(
+                org_id,
+                &sandbox_id.to_string(),
+                crate::public_sandbox_operations::SandboxLifecycleOperationPayload {
+                    sandbox_id,
+                    action: SandboxLifecycleAction::Wake,
+                    rollback: None,
+                    wake_activity: None,
+                }
+                .into_json(),
+                None,
+                inline
+                    .offer(org_id, OperationKind::WakeSandbox, path)
+                    .expect("wakes are offered"),
+            )
+            .await?;
+        let crate::public_operations::CreateInlinePublicOperationResult::Claimed(claim) = &recorded
+        else {
+            panic!("a wake on an idle sandbox is claimed");
+        };
+        let wake = claim.operation().id.as_uuid();
+
+        // Polled once, to its first wait, then dropped, as a disconnect drops
+        // the request.
+        let mut settled = Box::pin(inline.settle(path, &store, recorded));
+        let first = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(settled.as_mut(), cx))
+        })
+        .await;
+        assert!(first.is_pending(), "the request waits for the commit");
+        drop(settled);
+
+        wait_for_state(&fixture, wake, "succeeded").await?;
+        assert_eq!(script.executed(), vec![wake]);
+        assert_eq!(state_and_attempts(&fixture, wake).await?, ("succeeded", 1));
         Ok(())
     }
 }

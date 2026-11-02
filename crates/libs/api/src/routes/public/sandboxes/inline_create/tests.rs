@@ -30,7 +30,7 @@ mod postgres {
     use crate::public_operation_driver::{OperationExecutionConfig, OperationExecutor};
     use crate::public_operation_driver::{OperationExecutionResult, drive_claimed_operation};
     use crate::public_operations::{
-        ClaimLimits, ClaimPublicOperations, PublicOperationRequeueReason,
+        ClaimLimits, ClaimPublicOperations, ClaimedPublicOperation, PublicOperationRequeueReason,
     };
     use crate::routes::public::sandboxes::NativeCreatePoolClaims;
     use crate::routes::public::sandboxes::admission_test_fixture::AdmissionPoolFixture;

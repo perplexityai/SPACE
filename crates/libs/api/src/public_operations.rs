@@ -681,29 +681,55 @@ impl PublicOperationStore {
     /// [`Self::create_or_join_active_sandbox_wake`], except that a wake it
     /// creates is also claimed in the same transaction, for the caller to
     /// execute, when nothing else for the sandbox is queued or running and
-    /// the organization is under `org_limit` (see
+    /// `offer` allows it (see
     /// [`PublicOperationAdmission::create_claimed_if_sole_active`], and its
     /// precondition). A joined wake is never claimed: whoever created it, or
     /// the dispatcher, runs it.
-    pub async fn create_or_join_active_sandbox_wake_claimed_if_sole_active(
+    pub async fn create_or_join_active_sandbox_wake_claimed_if_sole_active<P>(
         &self,
         org_id: OrgId,
         target_id: &str,
         payload_json: serde_json::Value,
         traceparent: Option<String>,
-        org_limit: Option<InlineOrgLimit>,
-    ) -> Result<CreateInlinePublicOperationResult, PublicOperationStoreError> {
-        let (result, claimed) = self
-            .create_or_join_active_sandbox_operation_tx(
+        offer: InlineClaimOffer<impl FnOnce() -> Option<P>>,
+    ) -> Result<CreateInlinePublicOperationResult<P>, PublicOperationStoreError> {
+        let kind = OperationKind::WakeSandbox;
+        let (mut tx, result, superseded) = match self
+            .join_or_insert_active_sandbox_operation(
                 org_id,
-                OperationKind::WakeSandbox,
+                kind,
                 target_id,
                 payload_json,
                 traceparent,
-                ClaimCreated::IfSoleActive(org_limit),
             )
-            .await?;
-        Ok(claimed.unwrap_or(CreateInlinePublicOperationResult::NotCreated(result)))
+            .await?
+        {
+            JoinedOrInserted::Joined(operation_id) => {
+                return Ok(CreateInlinePublicOperationResult::NotCreated(
+                    CreatePublicOperationResult::Existing(operation_id),
+                ));
+            }
+            JoinedOrInserted::Inserted {
+                tx,
+                result,
+                superseded,
+            } => (tx, result, superseded),
+        };
+        let creation = CreationRecord {
+            superseded,
+            api_product: ApiProduct::Native,
+            kind,
+            target_type: Some(OperationTargetType::Sandbox),
+        };
+        let CreatePublicOperationResult::Created(operation_id) = result else {
+            tx.commit().await?;
+            creation.superseded.record();
+            return Ok(CreateInlinePublicOperationResult::NotCreated(result));
+        };
+        let decision =
+            claim_created_if_sole_active_tx(&mut tx, org_id, target_id, operation_id, offer)
+                .await?;
+        decision.record(tx, operation_id, creation).await
     }
 
     /// The system's (actorless) operation of `kind` on a sandbox, joining one
@@ -718,38 +744,49 @@ impl PublicOperationStore {
         payload_json: serde_json::Value,
         traceparent: Option<String>,
     ) -> Result<CreatePublicOperationResult, PublicOperationStoreError> {
-        let (result, _) = self
-            .create_or_join_active_sandbox_operation_tx(
+        match self
+            .join_or_insert_active_sandbox_operation(
                 org_id,
                 kind,
                 target_id,
                 payload_json,
                 traceparent,
-                ClaimCreated::Never,
             )
-            .await?;
-        Ok(result)
+            .await?
+        {
+            JoinedOrInserted::Joined(operation_id) => {
+                Ok(CreatePublicOperationResult::Existing(operation_id))
+            }
+            JoinedOrInserted::Inserted {
+                tx,
+                result,
+                superseded,
+            } => {
+                tx.commit().await?;
+                superseded.record();
+                if matches!(result, CreatePublicOperationResult::Created(_)) {
+                    pplx_space_metrics::operations::created(
+                        ApiProduct::Native.as_str(),
+                        kind.as_str(),
+                        OperationTargetType::Sandbox.as_str(),
+                    );
+                }
+                Ok(result)
+            }
+        }
     }
 
-    /// [`Self::create_or_join_active_sandbox_operation`]; with
-    /// [`ClaimCreated::IfSoleActive`], an operation it creates is also
-    /// offered to [`claim_created_if_sole_active_tx`], whose answer comes
-    /// back beside the result.
-    async fn create_or_join_active_sandbox_operation_tx(
+    /// [`Self::create_or_join_active_sandbox_operation`] up to its commit: a
+    /// join commits here, and an insert is left in its transaction, holding
+    /// the sandbox's locks, for the caller to claim or commit.
+    async fn join_or_insert_active_sandbox_operation(
         &self,
         org_id: OrgId,
         kind: OperationKind,
         target_id: &str,
         payload_json: serde_json::Value,
         traceparent: Option<String>,
-        claim: ClaimCreated,
-    ) -> Result<
-        (
-            CreatePublicOperationResult,
-            Option<CreateInlinePublicOperationResult>,
-        ),
-        PublicOperationStoreError,
-    > {
+    ) -> Result<JoinedOrInserted, PublicOperationStoreError> {
         let mut tx = self.pool.begin().await?;
         lock_active_sandbox_operation(&mut tx, org_id, kind, target_id).await?;
         let existing = if kind == OperationKind::DeleteSandbox {
@@ -776,10 +813,9 @@ impl PublicOperationStore {
         };
         if let Some(operation_id) = existing {
             tx.commit().await?;
-            return Ok((
-                CreatePublicOperationResult::Existing(OperationId::from_uuid(operation_id)),
-                None,
-            ));
+            return Ok(JoinedOrInserted::Joined(OperationId::from_uuid(
+                operation_id,
+            )));
         }
         let (result, superseded) = create_operation_tx(
             &mut tx,
@@ -798,32 +834,11 @@ impl PublicOperationStore {
             },
         )
         .await?;
-        let claimed = match (&result, claim) {
-            (
-                CreatePublicOperationResult::Created(operation_id),
-                ClaimCreated::IfSoleActive(org_limit),
-            ) => Some(
-                claim_created_if_sole_active_tx(
-                    &mut tx,
-                    org_id,
-                    target_id,
-                    *operation_id,
-                    org_limit,
-                )
-                .await?,
-            ),
-            _ => None,
-        };
-        tx.commit().await?;
-        superseded.record();
-        if matches!(result, CreatePublicOperationResult::Created(_)) {
-            pplx_space_metrics::operations::created(
-                ApiProduct::Native.as_str(),
-                kind.as_str(),
-                OperationTargetType::Sandbox.as_str(),
-            );
-        }
-        Ok((result, claimed))
+        Ok(JoinedOrInserted::Inserted {
+            tx,
+            result,
+            superseded,
+        })
     }
 
     pub async fn begin_operation_admission(
@@ -1231,13 +1246,13 @@ async fn claim_created_operation_tx(
 ///
 /// The organization limit is applied as [`claim_created_within_org_limit_tx`]
 /// applies it.
-async fn claim_created_if_sole_active_tx(
+async fn claim_created_if_sole_active_tx<P>(
     tx: &mut Transaction<'_, Postgres>,
     org_id: OrgId,
     target_id: &str,
     operation_id: OperationId,
-    org_limit: Option<InlineOrgLimit>,
-) -> Result<CreateInlinePublicOperationResult, PublicOperationStoreError> {
+    offer: InlineClaimOffer<impl FnOnce() -> Option<P>>,
+) -> Result<InlineClaimDecision<P>, PublicOperationStoreError> {
     let others_active = sqlx::query_scalar::<_, bool>(sql!(
         "SELECT EXISTS (
              SELECT 1
@@ -1260,40 +1275,176 @@ async fn claim_created_if_sole_active_tx(
     .fetch_one(&mut **tx)
     .await?;
     if others_active {
-        return Ok(CreateInlinePublicOperationResult::Queued(
-            operation_id,
-            InlineQueueReason::Busy,
-        ));
+        return Ok(InlineClaimDecision::Queued(InlineQueueReason::Busy));
     }
-    claim_created_within_org_limit_tx(tx, org_id, operation_id, org_limit).await
+    claim_created_within_org_limit_tx(tx, org_id, operation_id, offer).await
 }
 
 /// [`claim_created_operation_tx`] for `operation_id`, an operation this
-/// transaction just created, unless `org_id` is at `org_limit`; then it
+/// transaction just created, under the permit `offer` acquires, unless it
+/// acquires none or `org_id` is at the offer's organization limit; then it
 /// stays queued for the dispatcher. Every admission that claims for inline
-/// execution claims through here, so the limit holds on all of them.
+/// execution claims through here, so the limit holds on all of them, and
+/// none holds a permit before it gets here.
 ///
 /// The limit is soft: it counts claims committed before this statement's
 /// snapshot (see [`inline_org_at_limit_tx`]).
-async fn claim_created_within_org_limit_tx(
+async fn claim_created_within_org_limit_tx<P>(
     tx: &mut Transaction<'_, Postgres>,
     org_id: OrgId,
     operation_id: OperationId,
-    org_limit: Option<InlineOrgLimit>,
-) -> Result<CreateInlinePublicOperationResult, PublicOperationStoreError> {
-    if let Some(org_limit) = org_limit
+    offer: InlineClaimOffer<impl FnOnce() -> Option<P>>,
+) -> Result<InlineClaimDecision<P>, PublicOperationStoreError> {
+    let Some(permit) = (offer.acquire)() else {
+        return Ok(InlineClaimDecision::Queued(InlineQueueReason::NoPermit));
+    };
+    if let Some(org_limit) = offer.org_limit
         && inline_org_at_limit_tx(tx, org_id, org_limit).await?
     {
-        return Ok(CreateInlinePublicOperationResult::Queued(
-            operation_id,
-            InlineQueueReason::OrgLimit,
-        ));
+        return Ok(InlineClaimDecision::Queued(InlineQueueReason::OrgLimit));
     }
     let (claim_token, operation) = claim_created_operation_tx(tx, operation_id).await?;
-    Ok(CreateInlinePublicOperationResult::Claimed {
+    Ok(InlineClaimDecision::Claimed(Box::new(InlineClaimed {
         claim_token,
         operation,
-    })
+        permit,
+    })))
+}
+
+/// What admission needs to claim an operation it creates for the caller to
+/// execute inline.
+pub struct InlineClaimOffer<F> {
+    /// The organization limit the claim is held to.
+    pub org_limit: Option<InlineOrgLimit>,
+    /// Takes the caller's permit to execute the operation, called only once
+    /// the operation is created and nothing else for its sandbox holds it
+    /// back; `None` leaves it queued ([`InlineQueueReason::NoPermit`]). A
+    /// request that joins an operation, or waits for the sandbox's locks,
+    /// holds no permit meanwhile.
+    pub acquire: F,
+}
+
+/// Whether [`claim_created_within_org_limit_tx`] claimed an operation.
+enum InlineClaimDecision<P> {
+    Claimed(Box<InlineClaimed<P>>),
+    Queued(InlineQueueReason),
+}
+
+impl<P> InlineClaimDecision<P> {
+    /// Hand a claimed `operation_id` back in its transaction, uncommitted;
+    /// commit one left queued, and count its creation.
+    async fn record(
+        self,
+        tx: Transaction<'static, Postgres>,
+        operation_id: OperationId,
+        creation: CreationRecord,
+    ) -> Result<CreateInlinePublicOperationResult<P>, PublicOperationStoreError> {
+        match self {
+            Self::Claimed(claimed) => Ok(CreateInlinePublicOperationResult::Claimed(InlineClaim(
+                Box::new(InlineClaimParts {
+                    tx,
+                    claimed: *claimed,
+                    creation,
+                }),
+            ))),
+            Self::Queued(reason) => {
+                tx.commit().await?;
+                creation.record();
+                Ok(CreateInlinePublicOperationResult::Queued(
+                    operation_id,
+                    reason,
+                ))
+            }
+        }
+    }
+}
+
+/// What [`PublicOperationStore::join_or_insert_active_sandbox_operation`]
+/// did.
+enum JoinedOrInserted {
+    /// Joined this operation, already queued or running; committed.
+    Joined(OperationId),
+    /// Recorded `result` in `tx`, not yet committed.
+    Inserted {
+        tx: Transaction<'static, Postgres>,
+        result: CreatePublicOperationResult,
+        superseded: SupersededCreates,
+    },
+}
+
+/// What to count once the transaction that created an operation commits.
+struct CreationRecord {
+    superseded: SupersededCreates,
+    api_product: ApiProduct,
+    kind: OperationKind,
+    target_type: Option<OperationTargetType>,
+}
+
+impl CreationRecord {
+    fn record(self) {
+        self.superseded.record();
+        pplx_space_metrics::operations::created(
+            self.api_product.as_str(),
+            self.kind.as_str(),
+            self.target_type
+                .as_ref()
+                .map(OperationTargetType::as_str)
+                .unwrap_or("none"),
+        );
+    }
+}
+
+/// An operation created and claimed for inline execution, with the caller's
+/// permit to execute it, in a transaction not yet committed.
+///
+/// Commit it ([`Self::commit`]) in the task that executes it, not in the
+/// request: a request dropped once the commit is sent, before the execution
+/// starts, would leave a committed claim that nothing runs or renews, and
+/// the sandbox's other work held back behind it until it goes stale.
+/// Dropped uncommitted, the transaction rolls back and nothing was created.
+pub struct InlineClaim<P>(Box<InlineClaimParts<P>>);
+
+struct InlineClaimParts<P> {
+    tx: Transaction<'static, Postgres>,
+    claimed: InlineClaimed<P>,
+    creation: CreationRecord,
+}
+
+impl<P> InlineClaim<P> {
+    pub fn operation(&self) -> &ClaimedPublicOperation {
+        &self.0.claimed.operation
+    }
+
+    /// Commit the operation and its claim. The caller then owns this attempt
+    /// and must record its outcome under the claim token; if the caller
+    /// dies, the claim goes stale and the dispatcher re-drives it.
+    pub async fn commit(self) -> Result<InlineClaimed<P>, PublicOperationStoreError> {
+        let InlineClaimParts {
+            tx,
+            claimed,
+            creation,
+        } = *self.0;
+        tx.commit().await?;
+        creation.record();
+        Ok(claimed)
+    }
+}
+
+impl<P> std::fmt::Debug for InlineClaim<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InlineClaim")
+            .field("operation_id", &self.operation().id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// An inline claim: its admission claim token, the operation it claimed and
+/// the caller's permit to execute it.
+#[derive(Debug)]
+pub struct InlineClaimed<P> {
+    pub claim_token: String,
+    pub operation: ClaimedPublicOperation,
+    pub permit: P,
 }
 
 /// The most operations one organization may have claimed for inline
@@ -1353,15 +1504,6 @@ async fn inline_org_at_limit_tx(
     .await
 }
 
-/// Whether a sandbox operation the system creates or joins is also offered
-/// for an inline claim.
-#[derive(Debug, Clone, Copy)]
-enum ClaimCreated {
-    Never,
-    /// Through [`claim_created_if_sole_active_tx`], under this limit.
-    IfSoleActive(Option<InlineOrgLimit>),
-}
-
 /// Why admission left an operation it created queued instead of claiming it
 /// for inline execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1370,19 +1512,17 @@ pub enum InlineQueueReason {
     Busy,
     /// Its organization is at its [`InlineOrgLimit`].
     OrgLimit,
+    /// The offer acquired no permit to execute it.
+    NoPermit,
 }
 
 /// What [`PublicOperationAdmission::create_claimed_if_sole_active`] or
 /// [`PublicOperationAdmission::create_claimed_or_roll_back`] recorded.
-#[derive(Debug, Clone)]
-pub enum CreateInlinePublicOperationResult {
-    /// Created and claimed, with an admission claim token: the caller owns
-    /// this attempt and must record its outcome under `claim_token`. If the
-    /// caller dies, the claim goes stale and the dispatcher re-drives it.
-    Claimed {
-        claim_token: String,
-        operation: ClaimedPublicOperation,
-    },
+#[derive(Debug)]
+pub enum CreateInlinePublicOperationResult<P = ()> {
+    /// Created and claimed, with an admission claim token, under the offer's
+    /// permit; not yet committed (see [`InlineClaim`]).
+    Claimed(InlineClaim<P>),
     /// Created and left queued for the dispatcher, for this reason.
     Queued(OperationId, InlineQueueReason),
     /// Nothing was created: a replay, a key conflict or an admission denial.
@@ -1481,11 +1621,11 @@ impl PublicOperationAdmission {
     /// per-organization slot limit does not count. It is sound only under
     /// the precondition on `claim_created_if_sole_active_tx`: every API
     /// process takes the queue lock, and the dispatcher claims keyed.
-    pub async fn create_claimed_if_sole_active(
+    pub async fn create_claimed_if_sole_active<P>(
         mut self,
         input: CreatePublicOperation<'_>,
-        org_limit: Option<InlineOrgLimit>,
-    ) -> Result<CreateInlinePublicOperationResult, PublicOperationStoreError> {
+        offer: InlineClaimOffer<impl FnOnce() -> Option<P>>,
+    ) -> Result<CreateInlinePublicOperationResult<P>, PublicOperationStoreError> {
         let api_product = input.api_product;
         let kind = input.kind;
         let target_type = input.target_type.clone();
@@ -1499,33 +1639,27 @@ impl PublicOperationAdmission {
                 return Ok(CreateInlinePublicOperationResult::NotCreated(other));
             }
         };
-        let recorded = match queue {
+        let decision = match queue {
             Some(target_id) => {
                 claim_created_if_sole_active_tx(
                     &mut self.tx,
                     org_id,
                     target_id,
                     operation_id,
-                    org_limit,
+                    offer,
                 )
                 .await?
             }
             // In no sandbox's queue, so nothing rules out other work on it.
-            None => {
-                CreateInlinePublicOperationResult::Queued(operation_id, InlineQueueReason::Busy)
-            }
+            None => InlineClaimDecision::Queued(InlineQueueReason::Busy),
         };
-        self.tx.commit().await?;
-        superseded.record();
-        pplx_space_metrics::operations::created(
-            api_product.as_str(),
-            kind.as_str(),
-            target_type
-                .as_ref()
-                .map(OperationTargetType::as_str)
-                .unwrap_or("none"),
-        );
-        Ok(recorded)
+        let creation = CreationRecord {
+            superseded,
+            api_product,
+            kind,
+            target_type,
+        };
+        decision.record(self.tx, operation_id, creation).await
     }
 
     /// [`Self::create`] for a caller's `:wake`, except that it joins a wake
@@ -1566,18 +1700,18 @@ impl PublicOperationAdmission {
     /// runs: it is not queued any more, so the caller's wake is created
     /// behind it, left queued since the sandbox is busy, and completes as
     /// already done once that wake has placed the sandbox.
-    pub(crate) async fn create_or_join_active_wake_claimed_if_sole_active(
+    pub(crate) async fn create_or_join_active_wake_claimed_if_sole_active<P>(
         mut self,
         input: CreatePublicOperation<'_>,
-        org_limit: Option<InlineOrgLimit>,
-    ) -> Result<CreateInlinePublicOperationResult, PublicOperationStoreError> {
+        offer: InlineClaimOffer<impl FnOnce() -> Option<P>>,
+    ) -> Result<CreateInlinePublicOperationResult<P>, PublicOperationStoreError> {
         if let Some(operation_id) = self.join_active_wake(&input).await? {
             self.tx.commit().await?;
             return Ok(CreateInlinePublicOperationResult::NotCreated(
                 CreatePublicOperationResult::Existing(operation_id),
             ));
         }
-        self.create_claimed_if_sole_active(input, org_limit).await
+        self.create_claimed_if_sole_active(input, offer).await
     }
 
     /// The wake [`Self::create_or_join_active_wake`] joins for `input`, with
@@ -1701,14 +1835,15 @@ impl PublicOperationAdmission {
 
     /// [`Self::create_or_roll_back`], except that a newly created operation
     /// is also claimed in the same transaction, for the caller to execute
-    /// inline, when its organization is under `org_limit`; at the limit it
-    /// commits queued for the dispatcher instead. Nothing is created for a
-    /// replay or a conflict, and both roll back, as there.
-    pub(crate) async fn create_claimed_or_roll_back(
+    /// inline, when `offer` acquires a permit and its organization is under
+    /// the offer's limit; otherwise it commits queued for the dispatcher.
+    /// Nothing is created for a replay or a conflict, and both roll back, as
+    /// there.
+    pub(crate) async fn create_claimed_or_roll_back<P>(
         mut self,
         input: CreatePublicOperation<'_>,
-        org_limit: Option<InlineOrgLimit>,
-    ) -> Result<CreateInlinePublicOperationResult, PublicOperationStoreError> {
+        offer: InlineClaimOffer<impl FnOnce() -> Option<P>>,
+    ) -> Result<CreateInlinePublicOperationResult<P>, PublicOperationStoreError> {
         let org_id = input.org_id;
         let api_product = input.api_product;
         let kind = input.kind;
@@ -1718,20 +1853,15 @@ impl PublicOperationAdmission {
             self.tx.rollback().await?;
             return Ok(CreateInlinePublicOperationResult::NotCreated(created));
         };
-        let recorded =
-            claim_created_within_org_limit_tx(&mut self.tx, org_id, operation_id, org_limit)
-                .await?;
-        self.tx.commit().await?;
-        superseded.record();
-        pplx_space_metrics::operations::created(
-            api_product.as_str(),
-            kind.as_str(),
-            target_type
-                .as_ref()
-                .map(OperationTargetType::as_str)
-                .unwrap_or("none"),
-        );
-        Ok(recorded)
+        let decision =
+            claim_created_within_org_limit_tx(&mut self.tx, org_id, operation_id, offer).await?;
+        let creation = CreationRecord {
+            superseded,
+            api_product,
+            kind,
+            target_type,
+        };
+        decision.record(self.tx, operation_id, creation).await
     }
 }
 
@@ -2416,7 +2546,7 @@ async fn insert_idempotency_record_tx(
 
 /// Serialize creating or joining the active `kind` operation for one sandbox.
 /// Deletes keep the lock key they always had.
-async fn lock_active_sandbox_operation(
+pub(crate) async fn lock_active_sandbox_operation(
     tx: &mut Transaction<'_, Postgres>,
     org_id: OrgId,
     kind: OperationKind,
