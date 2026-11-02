@@ -322,8 +322,12 @@ async fn native_build_session_ownership(
         .execute(&fixture.db.pool)
         .await?;
     }
-    let password_hash =
-        tokio::task::spawn_blocking(|| crate::auth::hash_password("build-password")).await??;
+    let password = Uuid::now_v7().to_string();
+    let password_hash = tokio::task::spawn_blocking({
+        let password = password.clone();
+        move || crate::auth::hash_password(&password)
+    })
+    .await??;
     sqlx::query(sql!(
         "INSERT INTO users (id, email, password_hash, display_name, org_id, role)
          VALUES ($1, 'native-builder@example.com', $2, 'Native Builder', $3, $4)"
@@ -342,7 +346,7 @@ async fn native_build_session_ownership(
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     serde_json::json!({
-                        "email": "native-builder@example.com", "password": "build-password"
+                        "email": "native-builder@example.com", "password": password
                     })
                     .to_string(),
                 ))?,
@@ -780,8 +784,12 @@ async fn a_failed_system_build_frees_its_key_only_if_the_builder_did_not_take_it
 
 /// A session token for a new administrator of the fixture's managing org.
 async fn build_admin_token(fixture: &NativeBuildFixture) -> TestResult<String> {
-    let password_hash =
-        tokio::task::spawn_blocking(|| crate::auth::hash_password("build-password")).await??;
+    let password = Uuid::now_v7().to_string();
+    let password_hash = tokio::task::spawn_blocking({
+        let password = password.clone();
+        move || crate::auth::hash_password(&password)
+    })
+    .await??;
     let email = format!("replay-builder-{}@example.com", Uuid::now_v7());
     sqlx::query(sql!(
         "INSERT INTO users (id, email, password_hash, display_name, org_id, role)
@@ -801,7 +809,7 @@ async fn build_admin_token(fixture: &NativeBuildFixture) -> TestResult<String> {
             Request::post("/auth/v1/sessions")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
-                    serde_json::json!({ "email": email, "password": "build-password" }).to_string(),
+                    serde_json::json!({ "email": email, "password": password }).to_string(),
                 ))?,
         )
         .await?;

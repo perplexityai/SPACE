@@ -78,7 +78,7 @@ async fn fork_operation_kind_persists_in_native_scope() -> TestResult {
                 .map(|operation| operation.id)
                 .collect::<Vec<_>>(),
             vec![operation_id],
-            "{target_id}"
+            "the admin filter must find the fork row by either form of the source's id"
         );
     }
 

@@ -498,7 +498,7 @@ async fn capture_leader_election_spans_both_target_id_forms() {
 
         assert_eq!(
             leader, earlier,
-            "{earlier_target} must lead the fork recorded as {claimed_target}"
+            "the earlier fork must lead the later one (earlier_is_public: {earlier_is_public})"
         );
         assert_eq!(payload.capture_operation_id(), Some(earlier));
     }
