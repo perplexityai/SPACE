@@ -79,7 +79,10 @@ to an exact digest by the API before dispatch.
 
 Omit `--publish-tag latest` to publish only the immutable digest release. Tags
 are assigned after successful publication; promotion of the two templates is
-not atomic. If the derived build fails, the already-published seed remains.
+not atomic. Between the two tag moves, or after one fails, `seed`'s `latest`
+can name the new release while `code-runtime`'s still names the old one; that
+pair is consistent, because each `code-runtime` release was built on a pinned
+seed digest. If the derived build fails, the already-published seed remains.
 Existing sandboxes retain their template release. New requests using `latest`
 resolve the promoted release; previously pinned warm pools remain pinned.
 
