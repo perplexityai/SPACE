@@ -3,7 +3,7 @@ use std::str::FromStr;
 
 use axum::{
     Extension, Json,
-    extract::{FromRequest, Path, Query, Request, State, rejection::JsonRejection},
+    extract::{FromRequest, Path, Request, State, rejection::JsonRejection},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
@@ -21,6 +21,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use super::audit::{self, AdminSandboxAuditEntry};
+use super::sandbox_id::{AdminSandboxIdError, parse_admin_sandbox_id};
 use crate::middleware::auth::AuthUser;
 use crate::models::{Sandbox, SandboxResponse, User};
 use crate::public_operations::{
@@ -41,8 +42,6 @@ use crate::routes::public::sessions::{
 };
 
 const ADMIN_SANDBOX_ACTION_PREFIX: &str = "force-";
-const DEFAULT_ADMIN_SANDBOX_LIMIT: u32 = 1000;
-const MAX_ADMIN_SANDBOX_LIMIT: u32 = 5000;
 /// Distinct from the public `/v1/sandboxes` template so admin and public
 /// idempotency records never collide on the same key.
 const ADMIN_CREATE_SANDBOX_PATH_TEMPLATE: &str = "/v1/sandboxes:admin-create";
@@ -64,73 +63,11 @@ impl AdminSandboxTarget {
             domain_id: public_id.into(),
         }
     }
-}
 
-#[derive(Debug, Deserialize)]
-pub struct AdminSandboxListQuery {
-    limit: Option<u32>,
-    org_id: Option<OrgId>,
-}
-
-pub async fn list_sandboxes(
-    State(state): State<AppState>,
-    Extension(AuthUser(actor)): Extension<AuthUser>,
-    Query(query): Query<AdminSandboxListQuery>,
-) -> axum::response::Response {
-    if let Err(err) = require_managing_org_admin(&state.pool, &actor).await {
-        return err.into_response();
-    }
-    let limit = query
-        .limit
-        .unwrap_or(DEFAULT_ADMIN_SANDBOX_LIMIT)
-        .clamp(1, MAX_ADMIN_SANDBOX_LIMIT);
-    let sandboxes = match fetch_admin_sandboxes(&state.pool, limit, query.org_id).await {
-        Ok(sandboxes) => sandboxes,
-        // `ReadOnly`: the busiest admin read on this surface, and a plain
-        // `SELECT` over `sandboxes`, so it blocks behind DDL on the hottest
-        // table in the schema. It wrote nothing, so every contention SQLSTATE
-        // answers a retryable 503 and none takes the write-specific 409 — see
-        // `support::contention_disposition`.
-        Err(error) => {
-            if let Some((status, message)) =
-                support::contention_disposition(ContentionScope::ReadOnly, &error)
-            {
-                return api_error(status, message).into_response();
-            }
-            tracing::warn!(%error, "admin sandbox list query failed");
-            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
-                .into_response();
-        }
-    };
-    // Rowless warm-pool slots and observed-local sandboxes have no org, so
-    // only the unscoped list carries them.
-    let include_observed_only = query.org_id.is_none();
-    match state
-        .sandbox_controller
-        .list_responses(&state.pool, &sandboxes, include_observed_only)
-        .await
-    {
-        Ok(response) => Json(response).into_response(),
-        // A known remainder, in two halves, neither of which is useful
-        // without the other.
-        //
-        // `list_responses` reaches `responses::fetch_sandbox_observed_states`
-        // and `fetch_observed_only_sandboxes`, both of which erase the
-        // SQLSTATE into `ControllerError::internal` — so no contention
-        // identity exists to honour here yet. And this arm flattens the
-        // `ControllerError` to a 500 regardless of the status it carried, so
-        // classifying those reads alone would not surface it either.
-        //
-        // Adding an `is_lock_contention()` check here today would be a guard
-        // for a state nothing produces. Projection needs to preserve the
-        // database error identity, and this handler must also preserve the
-        // resulting status. These are independent fixes: classification
-        // recovers contention identity, while flattening discards every status,
-        // not just contention. Neither alone makes this path retryable.
-        // Same shape on `get_sandbox` below.
-        Err(error) => super::support::controller_read_error(&error, || {
-            tracing::warn!(%error, "admin sandbox response projection failed");
-        }),
+    /// The sandbox an admin route's path names, in any form
+    /// [`parse_admin_sandbox_id`] accepts.
+    fn parse(spec: &str) -> Result<Self, AdminSandboxIdError> {
+        parse_admin_sandbox_id(spec).map(|id| Self::from_public_id(id.into()))
     }
 }
 
@@ -142,26 +79,19 @@ pub async fn get_sandbox(
     if let Err(err) = require_managing_org_admin(&state.pool, &actor).await {
         return err.into_response();
     }
-    let public_id = match PublicSandboxId::from_str(&spec) {
-        Ok(value) => value,
-        Err(_) => {
-            return api_error(
-                StatusCode::BAD_REQUEST,
-                "sandbox id must be an sbx_ prefixed UUID",
-            )
-            .into_response();
-        }
+    let target = match AdminSandboxTarget::parse(&spec) {
+        Ok(target) => target,
+        Err(error) => return api_error(StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     };
-    let target = AdminSandboxTarget::from_public_id(public_id);
     let response = match fetch_admin_sandbox_response(&state.pool, &state, target).await {
         Ok(Some(response)) => response,
         Ok(None) => {
             return api_error(StatusCode::NOT_FOUND, "Sandbox not found").into_response();
         }
-        // Not classified, for the reason spelled out on `list_sandboxes`'s
-        // projection arm: this flattens a `ControllerError` rather than
-        // honouring the status it carries, and the reads behind it do not
-        // classify yet either.
+        // Not classified, for the reason spelled out on
+        // `sandbox_list::list_sandboxes`'s projection arm: this flattens a
+        // `ControllerError` rather than honouring the status it carries, and
+        // the reads behind it do not classify yet either.
         Err(error) => {
             return super::support::controller_read_error(&error, || {
                 tracing::warn!(
@@ -552,9 +482,8 @@ pub async fn create_command(
     Path(spec): Path<String>,
     Json(request): Json<CreateCommandRequest>,
 ) -> Result<(StatusCode, Json<PublicCommand>), PublicApiError> {
-    let public_id = PublicSandboxId::from_str(&spec)
-        .map_err(|_| PublicApiError::bad_request("sandbox id must be an sbx_ prefixed UUID"))?;
-    let target = AdminSandboxTarget::from_public_id(public_id);
+    let target = AdminSandboxTarget::parse(&spec)
+        .map_err(|error| PublicApiError::bad_request(error.to_string()))?;
     let sandbox = fetch_admin_sandbox(&state.pool, target)
         .await
         // `From<sqlx::Error> for PublicApiError` classifies contention (and
@@ -571,7 +500,7 @@ pub async fn create_command(
         &state.public_session_store(),
         sandbox.org_id,
         actor.id,
-        public_id,
+        target.public_id,
         request,
         idempotency_key,
         || Ok(()),
@@ -599,17 +528,13 @@ pub async fn update_sandbox(
     if let Err(err) = require_managing_org_admin(&state.pool, &actor).await {
         return err.into_response();
     }
-    let public_id = match PublicSandboxId::from_str(&spec) {
-        Ok(value) => value,
-        Err(_) => {
-            return AdminSandboxActionError::new(
-                StatusCode::BAD_REQUEST,
-                "sandbox id must be an sbx_ prefixed UUID",
-            )
-            .into_response();
+    let target = match AdminSandboxTarget::parse(&spec) {
+        Ok(target) => target,
+        Err(error) => {
+            return AdminSandboxActionError::new(StatusCode::BAD_REQUEST, error.to_string())
+                .into_response();
         }
     };
-    let target = AdminSandboxTarget::from_public_id(public_id);
     if request
         .resources
         .as_ref()
@@ -900,25 +825,6 @@ async fn fetch_admin_sandbox(
     crate::controllers::sandbox::fetch_sandbox(pool, target.domain_id).await
 }
 
-async fn fetch_admin_sandboxes(
-    pool: &sqlx::PgPool,
-    limit: u32,
-    org_id: Option<OrgId>,
-) -> Result<Vec<Sandbox>, sqlx::Error> {
-    let sql = crate::controllers::sandbox::sandbox_query(
-        "SELECT {sandbox_columns}
-         FROM {sandbox_from}
-         WHERE ($2::uuid IS NULL OR s.org_id = $2)
-         ORDER BY s.created_at DESC, s.id DESC
-         LIMIT $1",
-    );
-    sqlx::query_as::<_, Sandbox>(sqlx::AssertSqlSafe(sql!(sql.as_str())))
-        .bind(i64::from(limit))
-        .bind(org_id.map(OrgId::as_uuid))
-        .fetch_all(pool)
-        .await
-}
-
 async fn fetch_admin_sandbox_response(
     pool: &sqlx::PgPool,
     state: &AppState,
@@ -956,11 +862,8 @@ fn parse_spec(
             "invalid sandbox action path",
         ));
     }
-    let sandbox_id = PublicSandboxId::from_str(sandbox_id).map_err(|_| {
-        AdminSandboxActionError::new(
-            StatusCode::BAD_REQUEST,
-            "sandbox id must be an sbx_ prefixed UUID",
-        )
+    let target = AdminSandboxTarget::parse(sandbox_id).map_err(|error| {
+        AdminSandboxActionError::new(StatusCode::BAD_REQUEST, error.to_string())
     })?;
     let Some(action) = action.strip_prefix(ADMIN_SANDBOX_ACTION_PREFIX) else {
         return Err(AdminSandboxActionError::new(
@@ -971,7 +874,7 @@ fn parse_spec(
     let action = SandboxLifecycleAction::parse_known(action).map_err(|_| {
         AdminSandboxActionError::new(StatusCode::NOT_FOUND, "unknown admin sandbox action")
     })?;
-    Ok((AdminSandboxTarget::from_public_id(sandbox_id), action))
+    Ok((target, action))
 }
 
 fn idempotency_key(headers: &HeaderMap) -> Result<IdempotencyKey, AdminSandboxActionError> {

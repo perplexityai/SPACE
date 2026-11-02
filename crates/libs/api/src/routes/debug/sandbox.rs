@@ -13,6 +13,7 @@ use crate::{
     models::User,
     routes::{
         AppState,
+        admin::sandbox_id::parse_admin_sandbox_id,
         admin::support::{self, ContentionScope},
         authz::is_managing_org_admin,
         debug::{
@@ -67,11 +68,14 @@ async fn require_managing_org_admin(state: &AppState, actor: &User) -> Result<()
 pub async fn get_sandbox_debug(
     State(state): State<AppState>,
     Extension(AuthUser(actor)): Extension<AuthUser>,
-    Path(sandbox_id): Path<SandboxId>,
+    Path(spec): Path<String>,
 ) -> Response {
     if let Err(response) = require_managing_org_admin(&state, &actor).await {
         return *response;
     }
+    let Ok(sandbox_id) = parse_admin_sandbox_id(&spec) else {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_sandbox_id");
+    };
 
     match fetch_postgres_debug_sections(&state, sandbox_id).await {
         Ok(Some(response)) => Json(response).into_response(),

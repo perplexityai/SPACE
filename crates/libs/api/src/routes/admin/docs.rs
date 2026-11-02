@@ -331,13 +331,13 @@ fn admin_openapi_value() -> Value {
                 "post": {
                     "summary": "Enqueue an audited break-glass sandbox lifecycle operation",
                     "parameters": [
-                        { "name": "sandbox_id", "in": "path", "required": true, "schema": { "type": "string", "pattern": "^sbx_" } },
+                        { "name": "sandbox_id", "in": "path", "required": true, "description": "sbx_<uuid>, a dashed or undashed UUID in either case, or the sandbox pod name (space-sbx-<undashed uuid>, optionally with its -g<generation> suffix)", "schema": { "type": "string" } },
                         { "name": "action", "in": "path", "required": true, "schema": { "type": "string", "enum": ["start", "stop", "pause", "resume", "suspend", "restore", "wake", "kill", "delete"] } },
                         { "name": "Idempotency-Key", "in": "header", "required": true, "schema": { "type": "string" } }
                     ],
                     "responses": {
                         "202": { "description": "Operation enqueued" },
-                        "400": { "description": "Invalid action or idempotency key" },
+                        "400": { "description": "Invalid sandbox id, action or idempotency key" },
                         "404": { "description": "Sandbox not found" },
                         "409": { "description": "Idempotency conflict" }
                     }
@@ -790,12 +790,23 @@ fn insert_admin_sandbox_create_paths(paths: &mut Map<String, Value>) {
         json!({
             "get": {
                 "summary": "List sandboxes across every organization",
+                "description": "Newest first by created_at, then id. Without cursor the response is a bare array of at most limit sandboxes; with no filter, it is followed by the sandboxes nodes report that have no sandbox row. Pass cursor, empty for the first page, to page: the response is then {sandboxes, next_cursor}, next_cursor is null on the last page, and the node-reported rows come on the first page only. Rows created while paging sort before the cursor and do not appear on later pages. Filters, org_id included, combine and leave out the node-reported rows. Unknown parameters are ignored.",
                 "parameters": [
-                    { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer" } },
-                    { "name": "org_id", "in": "query", "required": false, "schema": { "type": "string" } }
+                    { "name": "limit", "in": "query", "required": false, "description": "1 to 5000, default 1000", "schema": { "type": "integer" } },
+                    { "name": "cursor", "in": "query", "required": false, "description": "Opaque; empty for the first page, then the previous page's next_cursor", "schema": { "type": "string" } },
+                    { "name": "org_id", "in": "query", "required": false, "schema": { "type": "string" } },
+                    { "name": "lifecycle", "in": "query", "required": false, "description": "Comma-separated stored lifecycles, including deleted and cleanup_required. A row's reported lifecycle can differ while its node's observation lags.", "schema": { "type": "string" } },
+                    { "name": "template", "in": "query", "required": false, "description": "The sandbox row's template", "schema": { "type": "string" } },
+                    { "name": "node_id", "in": "query", "required": false, "description": "The node reported as active_node_id", "schema": { "type": "string" } },
+                    { "name": "assigned", "in": "query", "required": false, "description": "true for sandboxes with an active node, false for those without; false cannot be combined with node_id", "schema": { "type": "boolean" } },
+                    { "name": "user_id", "in": "query", "required": false, "schema": { "type": "string" } },
+                    { "name": "created_after", "in": "query", "required": false, "description": "RFC 3339; exclusive", "schema": { "type": "string" } },
+                    { "name": "created_before", "in": "query", "required": false, "description": "RFC 3339; exclusive, later than created_after", "schema": { "type": "string" } },
+                    { "name": "prefix", "in": "query", "required": false, "description": "Case-sensitive name prefix, or an ID prefix with optional sbx_ and dashes where a UUID has them", "schema": { "type": "string" } }
                 ],
                 "responses": {
-                    "200": { "description": "Sandbox list" }
+                    "200": { "description": "Sandbox array, or {sandboxes, next_cursor} when cursor is set" },
+                    "400": { "description": "Invalid cursor or filter" }
                 }
             },
             "post": {
@@ -813,12 +824,38 @@ fn insert_admin_sandbox_create_paths(paths: &mut Map<String, Value>) {
         }),
     );
     paths.insert(
+        "/sandboxes/spaced-versions".to_string(),
+        json!({
+            "get": {
+                "summary": "Count sandboxes by template, spaced version and lifecycle",
+                "description": "Every sandbox that is not deleted, grouped by its template (else the one its node reports), the spaced version its node last reported (null before any report) and its stored lifecycle.",
+                "parameters": [
+                    { "name": "org_id", "in": "query", "required": false, "schema": { "type": "string" } }
+                ],
+                "responses": {
+                    "200": { "description": "Object with counts (template, spaced_version, lifecycle, count)" }
+                }
+            }
+        }),
+    );
+    paths.insert(
         "/sandboxes/{sandbox_id}".to_string(),
         json!({
+            "get": {
+                "summary": "Get a sandbox in any organization",
+                "parameters": [
+                    { "name": "sandbox_id", "in": "path", "required": true, "description": "sbx_<uuid>, a dashed or undashed UUID in either case, or the sandbox pod name (space-sbx-<undashed uuid>, optionally with its -g<generation> suffix)", "schema": { "type": "string" } }
+                ],
+                "responses": {
+                    "200": { "description": "Sandbox" },
+                    "400": { "description": "Invalid sandbox id" },
+                    "404": { "description": "Sandbox not found" }
+                }
+            },
             "patch": {
                 "summary": "Enqueue a sandbox update (network policy, auto-lifecycle, metadata) under the sandbox's owning organization",
                 "parameters": [
-                    { "name": "sandbox_id", "in": "path", "required": true, "schema": { "type": "string", "pattern": "^sbx_" } },
+                    { "name": "sandbox_id", "in": "path", "required": true, "description": "sbx_<uuid>, a dashed or undashed UUID in either case, or the sandbox pod name (space-sbx-<undashed uuid>, optionally with its -g<generation> suffix)", "schema": { "type": "string" } },
                     { "name": "Idempotency-Key", "in": "header", "required": true, "schema": { "type": "string" } }
                 ],
                 "responses": {

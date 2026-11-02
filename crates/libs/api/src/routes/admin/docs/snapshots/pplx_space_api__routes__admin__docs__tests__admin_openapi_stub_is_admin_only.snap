@@ -109,7 +109,11 @@ expression: paths_by_method
     "get",
     "post"
   ],
+  "/sandboxes/spaced-versions": [
+    "get"
+  ],
   "/sandboxes/{sandbox_id}": [
+    "get",
     "patch"
   ],
   "/sandboxes/{sandbox_id}:force-{action}": [

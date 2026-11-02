@@ -89,6 +89,7 @@ pplx-space-events = { workspace = true }
 pplx-space-metrics = { workspace = true }
 pplx-space-observability = { workspace = true, default-features = false }
 pplx-space-public-api = { workspace = true, features = ["schema", "serde"] }
+pplx-space-placement = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["serde", "sqlx"] }
 pplx-space-common-grpc = { workspace = true, features = ["internal-tls"] }
 pplx-space-common-svc = { workspace = true }
