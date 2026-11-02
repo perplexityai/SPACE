@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use pplx_space_common_core::host::disk_admission::{
     CacheDiskAdmissionConfig, CacheDiskAdmissionDecision, CacheDiskAdmissionReason,
-    CacheDiskAdmissionState as CoreCacheDiskAdmissionState,
+    CacheDiskAdmissionState as CoreCacheDiskAdmissionState, CacheDiskRefreshKind,
 };
 use pplx_space_common_svc::disk_admission::CacheDiskAdmissionHandle;
 use tokio_util::sync::CancellationToken;
@@ -102,9 +102,11 @@ impl DiskAdmission {
     }
 
     async fn refresh_once_result(&self) -> Result<(), String> {
-        let result =
-            pplx_space_common_svc::disk_admission::refresh_cache_disk_admission_once(&self.handle)
-                .await;
+        let result = pplx_space_common_svc::disk_admission::refresh_cache_disk_admission_once(
+            &self.handle,
+            CacheDiskRefreshKind::AfterAllocation,
+        )
+        .await;
         self.emit_metrics();
         result
     }
