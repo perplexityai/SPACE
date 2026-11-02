@@ -4404,6 +4404,63 @@ pub(crate) mod service_tests {
     }
 
     #[tokio::test]
+    async fn an_encoded_budget_split_continues_a_pool_member_page_after_its_last_listed_member() {
+        use pplx_space_common_core::inventory::MAX_ENCODED_BYTES;
+        let window = crate::db::inventory_read::POOL_MEMBER_WINDOW_ROWS;
+        let conn = crate::db::test_conn();
+        let mut ids = (0..=window)
+            .map(|_| {
+                let id = SandboxId::new().to_string();
+                insert_test_sandbox(&conn, &id, SandboxState::Started);
+                id
+            })
+            .collect::<Vec<_>>();
+        ids.sort();
+        // Two template-manager pool members in the first window that fit the
+        // raw budget together but not one encoded page, so the store's page
+        // continues after the window while the response must stop after the
+        // first member.
+        let template = "t".repeat(MAX_ENCODED_BYTES / 2 + 1);
+        for id in &ids[..2] {
+            conn.execute(
+                "UPDATE sandboxes SET template = ?2, user = ?3, pool_template = 'seed' WHERE id = ?1",
+                crate::db::fixture::params![
+                    id,
+                    template,
+                    pplx_space_common_core::types::TEMPLATE_MANAGER_SANDBOX_OWNER.as_str()
+                ],
+            )
+            .unwrap();
+        }
+        let service = service_for_teardown_test(conn);
+
+        let first = service
+            .list(tmplmgr_request(ListRequest {
+                page_size: 128,
+                page_token: String::new(),
+                pool_members_only: true,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(first.next_page_token, ids[0]);
+        let pages = Box::pin(list_all_selected_pages(&service, true, 128, true)).await;
+        assert_eq!(
+            pages
+                .iter()
+                .map(|page| page
+                    .iter()
+                    .map(|sandbox| sandbox.sandbox_id.as_str())
+                    .collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            vec![vec![ids[0].as_str()], vec![ids[1].as_str()]]
+        );
+        service.shutdown_token.cancel();
+        service.task_tracker.close();
+        service.task_tracker.wait().await;
+    }
+
+    #[tokio::test]
     async fn unary_build_referencing_list_reports_rather_than_rejects_an_over_budget_inventory() {
         use pplx_space_common_core::inventory::MAX_RAW_BYTES;
         let conn = crate::db::test_conn();

@@ -2951,7 +2951,10 @@ func (x *GetEnvResponse) GetEnv() map[string]string {
 type ListRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Maximum sandboxes per page; the server caps it and may return fewer to stay
-	// within its byte budgets. Zero selects the server's default page size.
+	// within its byte budgets. A `pool_members_only` page examines a bounded
+	// number of rows, so it may also be short or empty while its
+	// `next_page_token` continues the scan. Zero selects the server's default
+	// page size.
 	PageSize uint32 `protobuf:"varint,1,opt,name=page_size,json=pageSize,proto3" json:"page_size,omitempty"`
 	// Opaque `next_page_token` from the previous page. Empty starts a scan.
 	PageToken string `protobuf:"bytes,2,opt,name=page_token,json=pageToken,proto3" json:"page_token,omitempty"`

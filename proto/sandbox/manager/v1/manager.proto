@@ -559,7 +559,10 @@ message GetEnvResponse {
 
 message ListRequest {
   // Maximum sandboxes per page; the server caps it and may return fewer to stay
-  // within its byte budgets. Zero selects the server's default page size.
+  // within its byte budgets. A `pool_members_only` page examines a bounded
+  // number of rows, so it may also be short or empty while its
+  // `next_page_token` continues the scan. Zero selects the server's default
+  // page size.
   uint32 page_size = 1;
   // Opaque `next_page_token` from the previous page. Empty starts a scan.
   string page_token = 2;

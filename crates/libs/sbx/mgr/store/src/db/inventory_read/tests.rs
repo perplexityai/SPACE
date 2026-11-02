@@ -94,11 +94,11 @@ fn list_pages_cover_every_row_once_in_id_order() {
         let page = list_page(&conn, &after, 2, ListPageScope::All).unwrap();
         assert!(page.rows.len() <= 2);
         seen.extend(page_ids(&page));
-        let Some(resume_after) = page.resume_after else {
+        let Some(next_after) = page.next_after else {
             break;
         };
-        assert_eq!(resume_after, seen.last().unwrap().as_str());
-        after = resume_after;
+        assert_eq!(next_after, seen.last().unwrap().as_str());
+        after = next_after;
     }
     assert_eq!(seen, ids);
 }
@@ -120,10 +120,10 @@ fn list_page_ends_early_at_the_raw_budget_and_rejects_only_a_single_oversized_ro
     .unwrap();
     let page = list_page(&conn, "", MAX_ITEMS, ListPageScope::All).unwrap();
     assert_eq!(page_ids(&page), ids[..2]);
-    assert_eq!(page.resume_after.as_ref(), Some(&ids[1]));
+    assert_eq!(page.next_after.as_ref(), Some(&ids[1]));
     let page = list_page(&conn, &ids[1], MAX_ITEMS, ListPageScope::All).unwrap();
     assert_eq!(page_ids(&page), ids[2..]);
-    assert_eq!(page.resume_after, None);
+    assert_eq!(page.next_after, None);
 
     conn.execute(
         "UPDATE sandboxes SET template = ?2 WHERE id = ?1",
@@ -161,7 +161,7 @@ fn make_pool_members(conn: &Connection, ids: &[&String]) {
     }
 }
 
-/// Every page of a scan, with the cursor each one resumes after.
+/// Every page of a scan, with the cursor each one continues after.
 fn scan_pages(
     conn: &Connection,
     limit: usize,
@@ -171,9 +171,9 @@ fn scan_pages(
     let mut after = String::new();
     loop {
         let page = list_page(conn, &after, limit, scope).unwrap();
-        pages.push((page_ids(&page), page.resume_after.clone()));
-        match page.resume_after {
-            Some(resume_after) => after = resume_after,
+        pages.push((page_ids(&page), page.next_after.clone()));
+        match page.next_after {
+            Some(next_after) => after = next_after,
             None => return pages,
         }
     }
@@ -204,7 +204,7 @@ fn pool_member_pages_examine_one_window_each_and_continue_past_empty_ones() {
 }
 
 #[test]
-fn a_full_pool_member_page_resumes_after_its_last_member() {
+fn a_pool_member_page_the_budget_fills_continues_after_its_last_member() {
     let conn = crate::db::test_conn();
     let ids = insert_listed(&conn, 8);
     make_pool_members(&conn, &[&ids[1], &ids[2], &ids[4], &ids[6]]);
@@ -213,6 +213,30 @@ fn a_full_pool_member_page_resumes_after_its_last_member() {
         vec![
             (vec![ids[1].clone(), ids[2].clone()], Some(ids[2].clone())),
             (vec![ids[4].clone(), ids[6].clone()], None),
+        ]
+    );
+}
+
+#[test]
+fn a_pool_member_the_raw_budget_refuses_at_the_window_end_continues_after_the_last_member() {
+    const WINDOW: usize = POOL_MEMBER_WINDOW_ROWS;
+    let conn = crate::db::test_conn();
+    let ids = insert_listed(&conn, WINDOW + 1);
+    // The second member is the window's last row, so the window end is already
+    // recorded when the raw budget refuses it.
+    let template = "t".repeat(MAX_RAW_BYTES / 2);
+    for id in [&ids[0], &ids[WINDOW - 1]] {
+        conn.execute(
+            "UPDATE sandboxes SET template = ?2, pool_template = 'seed' WHERE id = ?1",
+            rusqlite::params![id, template],
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        scan_pages(&conn, MAX_ITEMS, ListPageScope::PoolMembers),
+        vec![
+            (vec![ids[0].clone()], Some(ids[0].clone())),
+            (vec![ids[WINDOW - 1].clone()], None),
         ]
     );
 }

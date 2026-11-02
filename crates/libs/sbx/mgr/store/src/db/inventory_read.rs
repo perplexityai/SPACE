@@ -143,31 +143,36 @@ pub enum ListPageScope {
     All,
     /// Warm-pool members: rows with `pool_template` set. No index covers it, so
     /// a page examines a window of [`POOL_MEMBER_WINDOW_ROWS`] rows after the
-    /// cursor and returns the members among them. A page whose window holds
-    /// fewer than `limit` members comes back short, or empty, and resumes
-    /// after the window, which keeps each page's lock hold proportional to the
-    /// window rather than to the table.
+    /// cursor and returns the members among them, which keeps each page's lock
+    /// hold proportional to the window rather than to the table. When the
+    /// budget refuses a further member, the page continues after its last
+    /// member; otherwise it continues after the window's last row, or ends the
+    /// scan when the window reached the table's last row. A page may therefore
+    /// come back short, or empty, and still continue.
     PoolMembers,
 }
 
 /// Rows a `PoolMembers` page examines. The page skips non-members before
 /// charging or decoding them, so a window of this size holds the database lock
-/// about as long as an `All` page of `READ_BATCH_ITEMS` rows, and a scan takes
-/// a quarter as many pages.
+/// about as long as an `All` page of `READ_BATCH_ITEMS` rows. Where members are
+/// sparse, a scan takes a quarter as many pages as an unfiltered one.
 pub const POOL_MEMBER_WINDOW_ROWS: usize = 512;
 
 pub struct ListPage {
     pub rows: Vec<ListPageRow>,
     /// The id the next page scans after, or `None` once the scan has examined
     /// every row.
-    pub resume_after: Option<String>,
+    pub next_after: Option<String>,
 }
 
 db_private_outside_tests! {
-    /// Scan up to `limit` rows in `scope` with IDs after `after`, in ID order.
-    /// The page ends early rather than exceed the raw budget; only a single row
-    /// over the budget is an error. Keying on the immutable primary key keeps
-    /// every row present for the whole scan on exactly one page.
+    /// Scan up to `limit` rows in `scope` with IDs after `after`, in ID order:
+    /// the next `limit` rows for `All`, or the members among the next
+    /// [`POOL_MEMBER_WINDOW_ROWS`] rows for `PoolMembers`. The page ends early
+    /// rather than exceed the raw budget; only a single row over the budget is
+    /// an error. `next_after` is the cursor the next page continues after.
+    /// Keying on the immutable primary key keeps every row present for the
+    /// whole scan on exactly one page.
     fn list_page(
         conn: &Connection,
         after: &str,
@@ -197,7 +202,7 @@ db_private_outside_tests! {
                 if examined == window {
                     return Ok(ListPage {
                         rows: page,
-                        resume_after: window_end,
+                        next_after: window_end,
                     });
                 }
                 examined += 1;
@@ -211,10 +216,10 @@ db_private_outside_tests! {
             match check_row(row, &mut budget) {
                 Ok(()) => {}
                 Err(InventoryReadError::Limit(_)) if !page.is_empty() => {
-                    let resume_after = page.last().map(|row| row.id().to_owned());
+                    let next_after = page.last().map(|row| row.id().to_owned());
                     return Ok(ListPage {
                         rows: page,
-                        resume_after,
+                        next_after,
                     });
                 }
                 Err(error) => return Err(error),
@@ -230,7 +235,7 @@ db_private_outside_tests! {
         }
         Ok(ListPage {
             rows: page,
-            resume_after: None,
+            next_after: None,
         })
     }
 }
