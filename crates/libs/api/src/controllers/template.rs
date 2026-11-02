@@ -240,12 +240,67 @@ impl TemplateBuildAttemptError {
             Self::Rpc(status) => status.into(),
         }
     }
+
+    /// Whether the builder may have taken the build despite this failure.
+    /// Only three failures prove it did not: no builder to send to, a dial
+    /// that failed before any request bytes left
+    /// ([`pplx_space_common_grpc::is_client_connect_failure`]), and the
+    /// draining refusal, which build-manager makes before it enqueues. A
+    /// timeout, a transport error after sending, or any other status can
+    /// follow an accepted build whose answer was lost.
+    fn may_have_been_accepted(&self) -> bool {
+        match self {
+            Self::Route(_) => false,
+            Self::Rpc(status) => {
+                !(pplx_space_common_grpc::is_client_connect_failure(status)
+                    || pplx_space_build_mgr_client::is_build_manager_draining_status(status))
+            }
+        }
+    }
+}
+
+/// A [`TemplateController::submit_template_build`] that failed, by whether
+/// the builder may have taken the build. A caller that offers a retry under
+/// the same identity, such as an idempotency key, may only offer it after
+/// [`Self::NotAccepted`].
+#[derive(Debug, thiserror::Error)]
+pub enum TemplateBuildSubmitError {
+    /// The builder did not take the build: the submission failed before its
+    /// request was sent, or the builder provably refused it.
+    #[error("{0}")]
+    NotAccepted(ControllerError),
+    /// The builder may have taken the build, or took it and the API could
+    /// not record its job. `job_id` is the job the builder named, when it
+    /// answered. The publication grant is revoked on a best-effort basis
+    /// only, so such a build may still publish.
+    #[error("{error}")]
+    MaybeAccepted {
+        error: ControllerError,
+        job_id: Option<BuildRunId>,
+    },
+}
+
+impl TemplateBuildSubmitError {
+    pub fn error(&self) -> &ControllerError {
+        match self {
+            Self::NotAccepted(error) | Self::MaybeAccepted { error, .. } => error,
+        }
+    }
+}
+
+impl From<TemplateBuildSubmitError> for ControllerError {
+    fn from(error: TemplateBuildSubmitError) -> Self {
+        match error {
+            TemplateBuildSubmitError::NotAccepted(error)
+            | TemplateBuildSubmitError::MaybeAccepted { error, .. } => error,
+        }
+    }
 }
 
 async fn start_template_build_with_retry<F, Fut>(
     request: StartBuildRequest,
     mut start: F,
-) -> Result<BuildTemplateResponse, ControllerError>
+) -> Result<BuildTemplateResponse, TemplateBuildAttemptError>
 where
     F: FnMut(StartBuildRequest) -> Fut,
     Fut: Future<Output = Result<BuildTemplateResponse, TemplateBuildAttemptError>>,
@@ -266,7 +321,7 @@ where
                 attempt += 1;
                 tokio::time::sleep(TEMPLATE_BUILD_SUBMIT_RETRY_DELAY).await;
             }
-            Err(error) => return Err(error.into_controller_error()),
+            Err(error) => return Err(error),
         }
     }
 }
@@ -283,7 +338,64 @@ impl TemplateController {
     pub async fn submit_template_build(
         &self,
         mut submission: TemplateBuildSubmission,
-    ) -> Result<StartBuildResponse, ControllerError> {
+    ) -> Result<StartBuildResponse, TemplateBuildSubmitError> {
+        let org_id = submission.org_id;
+        let template_name = submission.target.template_name();
+        let (base_grant, publication_grant) = self
+            .authorize_submission(&mut submission)
+            .await
+            .map_err(TemplateBuildSubmitError::NotAccepted)?;
+        let client_build_id = submission.client_build_id.clone();
+        let response = match self
+            .start_template_build_request(
+                submission.into_start_build_request(Some(publication_grant)),
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                // An undispatched submission authorizes no publication. The
+                // revocation is best effort: it can fail, and a build that
+                // published before its answer was lost has already consumed
+                // the grant. So it does not settle whether the build ran.
+                if let Err(revoke_error) = self.revoke_publication_grant(publication_grant).await {
+                    tracing::warn!(
+                        error = %revoke_error,
+                        %template_name,
+                        "failed to withdraw an undispatched publication grant; it expires on its own"
+                    );
+                }
+                let accepted = error.may_have_been_accepted();
+                let error = error.into_controller_error();
+                return Err(if accepted {
+                    TemplateBuildSubmitError::MaybeAccepted {
+                        error,
+                        job_id: None,
+                    }
+                } else {
+                    TemplateBuildSubmitError::NotAccepted(error)
+                });
+            }
+        };
+        let job_id = response.job_id.parse::<BuildRunId>().ok();
+        self.record_template_build_response(
+            org_id,
+            template_name,
+            client_build_id.as_deref(),
+            response,
+            base_grant,
+            Some(publication_grant),
+        )
+        .await
+        .map_err(|error| TemplateBuildSubmitError::MaybeAccepted { error, job_id })
+    }
+
+    /// Everything a submission does before it is sent: the ownership check
+    /// and the grants dispatch needs. A failure here sent nothing.
+    async fn authorize_submission(
+        &self,
+        submission: &mut TemplateBuildSubmission,
+    ) -> Result<(Option<BuildBaseGrantId>, PublicationGrant), ControllerError> {
         let org_id = submission.org_id;
         let template_name = submission.target.template_name();
         if !self
@@ -336,37 +448,7 @@ impl TemplateController {
                     })?,
             ),
         };
-        let client_build_id = submission.client_build_id.clone();
-        let response = match self
-            .start_template_build_request(
-                submission.into_start_build_request(Some(publication_grant)),
-            )
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                // An undispatched submission authorizes no publication. If an
-                // ambiguous failure did start the build, its publication is
-                // denied and the build must be resubmitted.
-                if let Err(revoke_error) = self.revoke_publication_grant(publication_grant).await {
-                    tracing::warn!(
-                        error = %revoke_error,
-                        %template_name,
-                        "failed to withdraw an undispatched publication grant; it expires on its own"
-                    );
-                }
-                return Err(error);
-            }
-        };
-        self.record_template_build_response(
-            org_id,
-            template_name,
-            client_build_id.as_deref(),
-            response,
-            base_grant,
-            Some(publication_grant),
-        )
-        .await
+        Ok((base_grant, publication_grant))
     }
 
     async fn record_template_build_response(
@@ -482,7 +564,7 @@ impl TemplateController {
     async fn start_template_build_request(
         &self,
         request: StartBuildRequest,
-    ) -> Result<BuildTemplateResponse, ControllerError> {
+    ) -> Result<BuildTemplateResponse, TemplateBuildAttemptError> {
         start_template_build_with_retry(request, |request| async move {
             let mut client = self
                 .substrate

@@ -1,6 +1,10 @@
 use pplx_space_common_core::types::{NodeId, OrgId};
 
 use std::convert::Infallible;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use axum::{
     Router,
@@ -27,6 +31,10 @@ struct NativeBuildFixture {
     org_id: OrgId,
     job_id: Uuid,
     builds: mpsc::Receiver<build_proto::StartBuildRequest>,
+    /// When set, the builder takes each build, then answers `INTERNAL`, as
+    /// a builder whose answer was lost after it enqueued the job.
+    builder_fails_after_taking: Arc<AtomicBool>,
+    builder_endpoint: String,
     shutdown: CancellationToken,
     tasks: TaskTracker,
 }
@@ -73,6 +81,7 @@ async fn native_build_fixture() -> TestResult<NativeBuildFixture> {
     .bind(listener.local_addr()?.to_string())
     .execute(&db.pool)
     .await?;
+    let builder_endpoint = listener.local_addr()?.to_string();
     sqlx::query(sql!(
         "INSERT INTO node_status_snapshots
          (node_id, observed_at, stale_after, reachable, role, scheduling_status,
@@ -87,11 +96,14 @@ async fn native_build_fixture() -> TestResult<NativeBuildFixture> {
     // Only the builder RPC is simulated; HTTP auth, routing and job persistence are real.
     let (sender, builds) = mpsc::channel(1);
     let grant_pool = db.pool.clone();
+    let builder_fails_after_taking = Arc::new(AtomicBool::new(false));
+    let fails = builder_fails_after_taking.clone();
     let builder = Router::new().route(
         "/space.node.api.v1.BuilderApi/BuildTemplate",
         post(move |body: Bytes| {
             let sender = sender.clone();
             let grant_pool = grant_pool.clone();
+            let fails = fails.clone();
             async move {
                 assert_eq!(body[0], 0, "the build RPC must be uncompressed");
                 let request = build_proto::StartBuildRequest::decode(&body[5..]).unwrap();
@@ -135,6 +147,17 @@ async fn native_build_fixture() -> TestResult<NativeBuildFixture> {
                     assert_eq!(pinned, None, "the accepting builder is not known yet");
                 }
                 sender.send(request).await.unwrap();
+                if fails.load(Ordering::SeqCst) {
+                    let mut trailers = HeaderMap::new();
+                    trailers.insert("grpc-status", "13".parse().unwrap());
+                    trailers.insert("grpc-message", "synthetic lost answer".parse().unwrap());
+                    return (
+                        [(header::CONTENT_TYPE, "application/grpc")],
+                        Body::new(StreamBody::new(tokio_stream::iter([Ok::<_, Infallible>(
+                            Frame::trailers(trailers),
+                        )]))),
+                    );
+                }
                 let response = BuildTemplateResponse {
                     job_id: job_id.to_string(),
                     builder_node_id: node_id.to_string(),
@@ -182,6 +205,8 @@ async fn native_build_fixture() -> TestResult<NativeBuildFixture> {
         org_id,
         job_id,
         builds,
+        builder_fails_after_taking,
+        builder_endpoint,
         shutdown,
         tasks,
     })
@@ -495,57 +520,9 @@ async fn a_system_build_replay_with_its_idempotency_key_starts_one_job(
         return Ok(());
     }
     let mut fixture = native_build_fixture.await?;
-    let password_hash =
-        tokio::task::spawn_blocking(|| crate::auth::hash_password("build-password")).await??;
-    sqlx::query(sql!(
-        "INSERT INTO users (id, email, password_hash, display_name, org_id, role)
-         VALUES ($1, 'replay-builder@example.com', $2, 'Replay Builder', $3, $4)"
-    ))
-    .bind(Uuid::now_v7())
-    .bind(password_hash)
-    .bind(fixture.org_id)
-    .bind(UserRole::OrganizationAdmin)
-    .execute(&fixture.db.pool)
-    .await?;
-    let login = fixture
-        .app
-        .clone()
-        .oneshot(
-            Request::post("/auth/v1/sessions")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    serde_json::json!({
-                        "email": "replay-builder@example.com", "password": "build-password"
-                    })
-                    .to_string(),
-                ))?,
-        )
-        .await?;
-    assert_eq!(login.status(), StatusCode::OK);
-    let login: serde_json::Value =
-        serde_json::from_slice(&to_bytes(login.into_body(), usize::MAX).await?)?;
-    let token = login["token"]
-        .as_str()
-        .expect("login returns a session token")
-        .to_string();
+    let token = build_admin_token(&fixture).await?;
     let build = |key: &'static str, body: serde_json::Value| {
-        let app = fixture.app.clone();
-        let token = token.clone();
-        async move {
-            let response = app
-                .oneshot(
-                    Request::post("/admin/api/v1/system-templates/seed/builds")
-                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                        .header(header::CONTENT_TYPE, "application/json")
-                        .header("idempotency-key", key)
-                        .body(Body::from(body.to_string()))?,
-                )
-                .await?;
-            let status = response.status();
-            let body: serde_json::Value =
-                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await?)?;
-            TestResult::Ok((status, body))
-        }
+        post_system_build(fixture.app.clone(), token.clone(), key, body)
     };
 
     let (status, first) = build(KEY, serde_json::json!({ "publish_tags": ["candidate"] })).await?;
@@ -662,3 +639,174 @@ const KEY: &str = "synthetic-build-key-1";
 const UNRECORDED: &str = "synthetic-build-key-2";
 const HELD: &str = "synthetic-build-key-3";
 const DISCONNECTED: &str = "synthetic-build-key-4";
+
+/// A build whose dispatch fails keeps its key while the builder may have
+/// taken it, so no replay starts a second job, and frees it when the builder
+/// certainly did not.
+#[rstest]
+#[tokio::test]
+async fn a_failed_system_build_frees_its_key_only_if_the_builder_did_not_take_it(
+    #[future] native_build_fixture: TestResult<NativeBuildFixture>,
+) -> TestResult {
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+    let mut fixture = native_build_fixture.await?;
+    let token = build_admin_token(&fixture).await?;
+    let build = |key: &'static str| {
+        post_system_build(
+            fixture.app.clone(),
+            token.clone(),
+            key,
+            serde_json::json!({}),
+        )
+    };
+
+    // The builder takes the build, then its answer is an error.
+    fixture
+        .builder_fails_after_taking
+        .store(true, Ordering::SeqCst);
+    let (status, body) = build("synthetic-lost-answer").await?;
+    assert!(status.is_server_error(), "{status} {body}");
+    assert!(
+        fixture.builds.try_recv().is_ok(),
+        "the build reached the builder"
+    );
+    let (status, replay) = build("synthetic-lost-answer").await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{replay}");
+    assert_eq!(replay["retryable"], true, "{replay}");
+    assert!(
+        fixture.builds.try_recv().is_err(),
+        "a replay of a build the builder may have taken must not start another"
+    );
+    fixture
+        .builder_fails_after_taking
+        .store(false, Ordering::SeqCst);
+
+    // The builder accepts, and recording its job fails: the replay names the job.
+    sqlx::query(sql!(
+        "CREATE FUNCTION fail_build_job_record() RETURNS trigger
+         LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic job record failure'; END $$"
+    ))
+    .execute(&fixture.db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "CREATE TRIGGER fail_build_job_record BEFORE INSERT ON template_build_jobs
+         FOR EACH ROW EXECUTE FUNCTION fail_build_job_record()"
+    ))
+    .execute(&fixture.db.pool)
+    .await?;
+    let (status, body) = build("synthetic-unrecorded-job").await?;
+    assert!(status.is_server_error(), "{status} {body}");
+    assert!(
+        fixture.builds.try_recv().is_ok(),
+        "the build reached the builder"
+    );
+    sqlx::query(sql!(
+        "DROP TRIGGER fail_build_job_record ON template_build_jobs"
+    ))
+    .execute(&fixture.db.pool)
+    .await?;
+    let (status, replay) = build("synthetic-unrecorded-job").await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{replay}");
+    assert!(
+        replay["details"]
+            .as_array()
+            .expect("details")
+            .iter()
+            .any(
+                |detail| detail["key"] == "job_id" && detail["value"] == fixture.job_id.to_string()
+            ),
+        "{replay}"
+    );
+    assert!(
+        fixture.builds.try_recv().is_err(),
+        "a replay of an unrecorded job must not start another"
+    );
+
+    // The builder refuses the connection, so nothing was sent: the key is
+    // freed, and once the builder is back the same key starts the build.
+    let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let closed_endpoint = closed.local_addr()?.to_string();
+    drop(closed);
+    let point_builder_at = |endpoint: String| {
+        let pool = fixture.db.pool.clone();
+        async move {
+            sqlx::query(sql!(
+                "UPDATE node_direct SET node_api_endpoint = $1 WHERE name = 'native-build-test'"
+            ))
+            .bind(endpoint)
+            .execute(&pool)
+            .await
+        }
+    };
+    point_builder_at(closed_endpoint).await?;
+    let (status, body) = build("synthetic-refused").await?;
+    assert!(status.is_server_error(), "{status} {body}");
+    point_builder_at(fixture.builder_endpoint.clone()).await?;
+    let (status, started) = build("synthetic-refused").await?;
+    assert_eq!(status, StatusCode::ACCEPTED, "{started}");
+    assert!(
+        fixture.builds.try_recv().is_ok(),
+        "the freed key starts its build"
+    );
+    Ok(())
+}
+
+/// A session token for a new administrator of the fixture's managing org.
+async fn build_admin_token(fixture: &NativeBuildFixture) -> TestResult<String> {
+    let password_hash =
+        tokio::task::spawn_blocking(|| crate::auth::hash_password("build-password")).await??;
+    let email = format!("replay-builder-{}@example.com", Uuid::now_v7());
+    sqlx::query(sql!(
+        "INSERT INTO users (id, email, password_hash, display_name, org_id, role)
+         VALUES ($1, $2, $3, 'Replay Builder', $4, $5)"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(&email)
+    .bind(password_hash)
+    .bind(fixture.org_id)
+    .bind(UserRole::OrganizationAdmin)
+    .execute(&fixture.db.pool)
+    .await?;
+    let login = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::post("/auth/v1/sessions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "email": email, "password": "build-password" }).to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(login.status(), StatusCode::OK);
+    let login: serde_json::Value =
+        serde_json::from_slice(&to_bytes(login.into_body(), usize::MAX).await?)?;
+    Ok(login["token"]
+        .as_str()
+        .expect("login returns a session token")
+        .to_string())
+}
+
+/// `POST /admin/api/v1/system-templates/seed/builds` with `key`.
+async fn post_system_build(
+    app: Router,
+    token: String,
+    key: &'static str,
+    body: serde_json::Value,
+) -> TestResult<(StatusCode, serde_json::Value)> {
+    let response = app
+        .oneshot(
+            Request::post("/admin/api/v1/system-templates/seed/builds")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("idempotency-key", key)
+                .body(Body::from(body.to_string()))?,
+        )
+        .await?;
+    let status = response.status();
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await?)?;
+    Ok((status, body))
+}

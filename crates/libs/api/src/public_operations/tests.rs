@@ -2700,7 +2700,7 @@ async fn an_expired_key_binding_takes_the_next_request() -> TestResult {
 const RESERVED_BUILD: &str = "/admin/v1/system-templates/{template}/builds";
 
 /// A committed reservation answers every replay without repeating the work:
-/// in flight while young, abandoned once older than its lifetime, the
+/// in flight while young, of unknown outcome once older than its lifetime, the
 /// recorded response once completed; a released one can be taken again, and
 /// a different request is refused throughout.
 #[tokio::test]
@@ -2753,8 +2753,8 @@ async fn a_response_reservation_answers_replays_without_repeating_work() -> Test
     .bind(org_id)
     .execute(&db.pool)
     .await?;
-    let ResponseReservation::Abandoned { reserved_at } = reserve(&same).await? else {
-        panic!("a pending reservation past its lifetime is abandoned");
+    let ResponseReservation::OutcomeUnknown { reserved_at, .. } = reserve(&same).await? else {
+        panic!("a pending reservation past its lifetime has an unknown outcome");
     };
     assert!(reserved_at < OffsetDateTime::now_utc() - Duration::from_secs(600));
 
@@ -2773,6 +2773,33 @@ async fn a_response_reservation_answers_replays_without_repeating_work() -> Test
         reserve(&other).await,
         Err(ResponseAdmissionError::Conflict)
     ));
+
+    // A reservation whose work may have happened keeps the key for good,
+    // and its replays carry what it noted.
+    sqlx::query(sql!(
+        "DELETE FROM public_idempotency_records WHERE org_id = $1"
+    ))
+    .bind(org_id)
+    .execute(&db.pool)
+    .await?;
+    let ResponseReservation::Reserved(third) = reserve(&same).await? else {
+        panic!("an unused key is reserved");
+    };
+    let known = serde_json::json!({ "job_id": "synthetic-job" });
+    assert!(store.note_unresolved_response(third, known.clone()).await?);
+    let ResponseReservation::InProgress {
+        known: replayed, ..
+    } = reserve(&same).await?
+    else {
+        panic!("a noted reservation stays in progress");
+    };
+    assert_eq!(replayed, Some(known));
+    assert!(!store.release_response_reservation(third).await?);
+    assert!(
+        !store
+            .complete_response_reservation(third, response.clone())
+            .await?
+    );
     Ok(())
 }
 

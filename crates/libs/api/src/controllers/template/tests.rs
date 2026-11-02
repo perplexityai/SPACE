@@ -466,7 +466,60 @@ async fn template_build_submission_does_not_retry_other_unavailable_errors() {
     .expect_err("an ambiguous unavailable response must not be retried");
 
     assert_eq!(attempts, 1);
-    assert_eq!(error.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        error.may_have_been_accepted(),
+        "a builder that closed the connection may have taken the build"
+    );
+    assert_eq!(
+        error.into_controller_error().status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+}
+
+/// Only a failure that proves nothing was taken lets a caller retry under
+/// the same identity; anything that can follow an accepted build cannot.
+#[test]
+fn a_failed_attempt_may_have_been_accepted_unless_it_proves_otherwise() {
+    let refused = {
+        let mut status = tonic::Status::unavailable("tcp connect error");
+        status.set_source(std::sync::Arc::new(std::io::Error::from(
+            std::io::ErrorKind::ConnectionRefused,
+        )));
+        status
+    };
+    let draining = tonic::Status::unavailable(format!(
+        "build-manager StartBuild: {}",
+        pplx_space_build_mgr_client::BUILD_MANAGER_DRAINING_MESSAGE
+    ));
+    let cases = [
+        (
+            TemplateBuildAttemptError::Route(ControllerError::service_unavailable(
+                "no builder node is registered",
+            )),
+            false,
+        ),
+        (TemplateBuildAttemptError::Rpc(refused), false),
+        (TemplateBuildAttemptError::Rpc(draining), false),
+        (
+            TemplateBuildAttemptError::Rpc(tonic::Status::unavailable("connection closed")),
+            true,
+        ),
+        (
+            TemplateBuildAttemptError::Rpc(tonic::Status::deadline_exceeded("timeout")),
+            true,
+        ),
+        (
+            TemplateBuildAttemptError::Rpc(tonic::Status::cancelled("timeout expired")),
+            true,
+        ),
+        (
+            TemplateBuildAttemptError::Rpc(tonic::Status::internal("lost answer")),
+            true,
+        ),
+    ];
+    for (error, expected) in cases {
+        assert_eq!(error.may_have_been_accepted(), expected, "{error}");
+    }
 }
 
 #[rstest]
