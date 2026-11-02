@@ -255,3 +255,5 @@ pub async fn run(
         Err(RunClusterControllerError::LeadershipLost)
     }
 }
+
+// Disposable producer-timing probe: never merge.
