@@ -37,11 +37,12 @@ export default function LoginPage() {
 
   const external = authMode?.mode === 'external';
 
+  // Someone already signed in (either mode) has nothing to do here.
   useEffect(() => {
-    if (!loading && user && external) {
+    if (!loading && user && !submitting) {
       router.replace('/dashboard');
     }
-  }, [loading, user, external, router]);
+  }, [loading, user, submitting, router]);
 
   const handleSubmit = async (values: { email: string; password: string }) => {
     setError('');
