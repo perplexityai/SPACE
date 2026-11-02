@@ -47,6 +47,7 @@ const ALLOW_NET_SERVICE: &[UdsPeerPrincipal] = &[
 ];
 
 pub struct NetGatewayControlService {
+    gateway_instance: String,
     stats: Arc<ProxyStats>,
     network_state: GatewayNetworkState,
     policy_loader: PolicyLoader,
@@ -68,6 +69,7 @@ impl NetGatewayControlService {
         shutdown_token: CancellationToken,
     ) -> Self {
         Self {
+            gateway_instance: format!("{:032x}", rand::random::<u128>()),
             stats,
             network_state,
             policy_loader,
@@ -294,8 +296,12 @@ impl NetGatewayControl for NetGatewayControlService {
     ) -> Result<Response<GetNetworkStateResponse>, Status> {
         self.peer_authorizer
             .authorize_request(&request, "GetNetworkState", ALLOW_NET_OBSERVER)?;
-        let snapshot = self.network_state.snapshot().await;
+        let (snapshot, pending_tcp_revocations) = self.network_state.observe_policy().await;
         Ok(Response::new(GetNetworkStateResponse {
+            policy_observation: Some(crate::proto::PolicyObservation {
+                gateway_instance: self.gateway_instance.clone(),
+                pending_tcp_revocations,
+            }),
             state: snapshot.mode as i32,
             installed_policy_ref: snapshot.installed_policy_ref,
             last_error: snapshot.last_error,

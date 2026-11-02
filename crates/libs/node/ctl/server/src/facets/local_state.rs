@@ -305,6 +305,7 @@ pub(super) async fn fetch_sandbox_network_policies(
     }
     let response = client
         .get_network_policy(Request::new(SbxGetNetworkPolicyRequest {
+            observe_gateway: false,
             sandbox_ids: sandbox_ids.iter().map(ToString::to_string).collect(),
         }))
         .await

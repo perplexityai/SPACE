@@ -2,7 +2,9 @@
 use super::http_host::{HostBinding, MeteredIo};
 use super::tls::TlsTransportError;
 use super::tls_http::{HttpError, HttpProtocol};
+use super::tracked_io::TrackedIo;
 use super::{TcpProxy, tls, tls_http, transport};
+use crate::egress::TcpConnectionGuard;
 use crate::{
     certificates::CertificateLease,
     egress::AdmittedTcp,
@@ -27,6 +29,7 @@ impl TcpProxy {
         admitted: AdmittedTcp,
         lease: Arc<CertificateLease>,
         client_alpn: ClientAlpnOffer,
+        connection: Arc<TcpConnectionGuard>,
     ) -> Result<(), HttpError> {
         let span = tracing::info_span!(
             "tls.server",
@@ -49,6 +52,7 @@ impl TcpProxy {
             }
             let accounting = WireAccounting::new(self.stats.clone());
             let operation = async {
+                let client = TrackedIo::new(client, connection.clone());
                 // ALPN is telemetry here. `tls_http::serve` detects the
                 // version from the guest's first bytes and records `protocol`
                 // once the first request arrives.
@@ -65,7 +69,10 @@ impl TcpProxy {
                 let connect = move |guest_protocol| async move {
                     let origin = async {
                         Ok(MeteredIo {
-                            inner: transport::connect(destination).await?,
+                            inner: TrackedIo::new(
+                                transport::connect(destination).await?,
+                                connection,
+                            ),
                             read: wire_read,
                             written: wire_written,
                         })

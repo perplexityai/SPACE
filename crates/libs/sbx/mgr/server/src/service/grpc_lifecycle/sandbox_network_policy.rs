@@ -16,7 +16,13 @@ impl SandboxManagerService {
         for sandbox_id in sandbox_ids {
             let sandbox = self.lookup_sandbox(&sandbox_id)?;
             let effective_policy = self.effective_network_policy(&sandbox).await?;
+            let observation = if req.observe_gateway {
+                self.observe_network_policy(&sandbox).await
+            } else {
+                None
+            };
             let detail = NetworkPolicyDetail {
+                observation,
                 sandbox_id: sandbox.id.clone(),
                 effective_policy: Some(network_policy_to_proto(&effective_policy.policy)),
                 inherited: effective_policy.inherited,
@@ -34,6 +40,48 @@ impl SandboxManagerService {
         }
 
         Ok(Response::new(response))
+    }
+
+    /// No cached applied fields or wake calls participate in this observation.
+    async fn observe_network_policy(
+        &self,
+        sandbox: &crate::db::SandboxRow,
+    ) -> Option<crate::proto::LiveNetworkPolicyObservation> {
+        let execution = sandbox.space_api_route_identity.execution_generation?;
+        let gateway = sandbox.netgtw_pid?;
+        if sandbox.state != SandboxState::Started || Self::sandbox_is_pool_member(sandbox) {
+            return None;
+        }
+        let state = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let mut client = pplx_space_net_gateway_client::connect(&sandbox.id)
+                .await
+                .ok()?;
+            client
+                .get_network_state(pplx_space_net_gateway_client::proto::GetNetworkStateRequest {})
+                .await
+                .ok()
+                .map(Response::into_inner)
+        })
+        .await
+        .ok()??;
+        let observed = state.policy_observation?;
+        let current = self.lookup_sandbox(&sandbox.id).ok()?;
+        if current.state != SandboxState::Started
+            || current.netgtw_pid != Some(gateway)
+            || current.node_execution_id != sandbox.node_execution_id
+            || current.space_api_route_identity != sandbox.space_api_route_identity
+            || observed.gateway_instance.is_empty()
+        {
+            return None;
+        }
+        Some(crate::proto::LiveNetworkPolicyObservation {
+            execution_generation: execution.get(),
+            gateway_instance: observed.gateway_instance,
+            installed_policy_ref: state.installed_policy_ref,
+            ready: state.state == pplx_space_net_gateway_client::proto::NetworkState::Ready as i32,
+            pending_tcp_revocations: observed.pending_tcp_revocations,
+            error: state.last_error,
+        })
     }
 
     pub(in crate::service) async fn set_network_policy(

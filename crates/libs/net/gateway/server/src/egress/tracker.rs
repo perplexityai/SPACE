@@ -115,6 +115,17 @@ impl DnsAttributedTcpTracker {
         cancelled
     }
 
+    /// A cancellation request is not completion: the relay holds its guard
+    /// until its forwarding future and sockets have been dropped.
+    pub(crate) fn pending_revocations(&self) -> u64 {
+        self.inner
+            .connections
+            .lock()
+            .values()
+            .filter(|connection| connection.shutdown_token.is_cancelled())
+            .count() as u64
+    }
+
     fn unregister(&self, id: u64) {
         self.inner.connections.lock().remove(&id);
     }

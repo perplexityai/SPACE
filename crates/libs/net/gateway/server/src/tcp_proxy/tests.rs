@@ -14,6 +14,63 @@ use tracing_subscriber::layer::SubscriberExt as _;
 
 mod tls_interception;
 
+#[tokio::test]
+async fn revoked_http_driver_keeps_policy_pending_until_its_socket_closes() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let (proxy, policy) = dns_attributed_pypi_proxy().await;
+    let destination = "93.184.216.34:80".parse().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (guest, accepted) = tokio::join!(
+        TcpStream::connect(listener.local_addr().unwrap()),
+        listener.accept(),
+    );
+    let mut guest = guest.unwrap();
+    let gateway_guest = accepted.unwrap().0;
+    let (gateway_origin, mut origin) = tokio::io::duplex(4096);
+    guest
+        .write_all(b"GET / HTTP/1.1\r\nHost: pypi.org\r\n\r\n")
+        .await
+        .unwrap();
+    let shutdown = CancellationToken::new();
+    let connection = Arc::new(proxy.network_state.tcp_connections().register(
+        destination,
+        ClientHelloScan::NotTls,
+        &policy,
+        proxy.network_state.dns_allow_cache(),
+        shutdown,
+    ));
+    let mut serving = Box::pin(async {
+        let outcome = proxy
+            .host_bound_http(gateway_guest, destination, connection.clone(), |_| async {
+                Ok(gateway_origin)
+            })
+            .await;
+        drop(connection);
+        outcome
+    });
+    let mut request = [0; 4096];
+    tokio::select! {
+        _ = &mut serving => panic!("HTTP session ended before forwarding"),
+        received = origin.read(&mut request) => assert!(received.unwrap() > 0),
+    }
+    install_policy(
+        &proxy.network_state,
+        NetworkPolicyV1::deny_all(),
+        "2123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    )
+    .await;
+    drop(serving);
+    // The current-thread runtime has not polled the cancelled origin driver
+    // yet. Its socket is still open even though the guest session is gone.
+    assert_eq!(proxy.network_state.observe_policy().await.1, 1);
+    tokio::time::timeout(Duration::from_secs(1), origin.read_to_end(&mut Vec::new()))
+        .await
+        .expect("cancelled origin driver must close its socket")
+        .unwrap();
+    assert_eq!(proxy.network_state.observe_policy().await.1, 0);
+}
+
 fn dns_attribution_denied(reason: DenyReason) -> TcpAdmissionDenial {
     TcpAdmissionDenial::DnsAttribution(reason)
 }
@@ -125,16 +182,28 @@ async fn failed_plaintext_connect() -> FailedPlaintextConnect {
     let subscriber = tracing_subscriber::registry().with(layer);
     let relay = tokio::spawn(
         async move {
+            let connection = Arc::new(proxy.network_state.tcp_connections().register(
+                destination,
+                ClientHelloScan::NotTls,
+                &policy,
+                proxy.network_state.dns_allow_cache(),
+                CancellationToken::new(),
+            ));
             proxy
-                .host_bound_http(gateway_guest, destination, |destination| async move {
-                    Err::<DuplexStream, _>(
-                        io::Error::new(
-                            io::ErrorKind::ConnectionRefused,
-                            format!("test connect refusal to {destination}"),
+                .host_bound_http(
+                    gateway_guest,
+                    destination,
+                    connection,
+                    |destination| async move {
+                        Err::<DuplexStream, _>(
+                            io::Error::new(
+                                io::ErrorKind::ConnectionRefused,
+                                format!("test connect refusal to {destination}"),
+                            )
+                            .into(),
                         )
-                        .into(),
-                    )
-                })
+                    },
+                )
                 .await
         }
         .with_subscriber(subscriber),

@@ -317,6 +317,16 @@ impl GatewayNetworkState {
         self.owner_contacted.subscribe()
     }
 
+    /// Observe one installed policy after its DNS prune and TCP resweep.
+    /// Serialize with publication so a count cannot describe a different policy.
+    pub(crate) async fn observe_policy(&self) -> (NetworkStateSnapshot, u64) {
+        let _guard = self.writer_lock.lock().await;
+        (
+            self.snapshot().await,
+            self.tcp_connections.pending_revocations(),
+        )
+    }
+
     pub async fn snapshot(&self) -> NetworkStateSnapshot {
         let inner = self.state_rx.borrow().clone();
         self.snapshot_from_inner(inner.as_ref())

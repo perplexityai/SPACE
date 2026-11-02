@@ -1430,7 +1430,11 @@ message TouchAutoLifecycleResponse {
   AutoLifecycleTouchResult result = 3;
 }
 
-message GetNetworkPolicyRequest { repeated string sandbox_ids = 1; }
+message GetNetworkPolicyRequest {
+  repeated string sandbox_ids = 1;
+  // Bounded, non-waking live reads. Missing observations never imply applied.
+  bool observe_gateway = 2;
+}
 
 message GetNetworkPolicyResponse {
   repeated NetworkPolicyDetail policies = 1;
@@ -1724,6 +1728,16 @@ message NetworkPolicyDetail {
   uint64 applied_generation = 6;
   space.net.policy.v1.NetworkPolicySource applied_source = 7;
   space.net.policy.v1.PolicyAuthority authority = 8;
+  LiveNetworkPolicyObservation observation = 9;
+}
+
+message LiveNetworkPolicyObservation {
+  int64 execution_generation = 1;
+  string gateway_instance = 2;
+  string installed_policy_ref = 3;
+  bool ready = 4;
+  uint64 pending_tcp_revocations = 5;
+  string error = 6;
 }
 
 enum TeardownSuspendAction {

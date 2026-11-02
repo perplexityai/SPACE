@@ -26,6 +26,7 @@ service WorkerApi {
   rpc StopSandbox(space.sandbox.manager.v1.StopRequest) returns (space.sandbox.manager.v1.StopResponse);
   rpc KillSandbox(space.sandbox.manager.v1.KillRequest) returns (space.sandbox.manager.v1.KillResponse);
   rpc DeleteSandbox(space.sandbox.manager.v1.DeleteRequest) returns (space.sandbox.manager.v1.DeleteResponse);
+  rpc SandboxNetworkPolicy(space.sandbox.manager.v1.GetNetworkPolicyRequest) returns (space.sandbox.manager.v1.GetNetworkPolicyResponse);
   rpc SandboxState(space.sandbox.manager.v1.StateRequest) returns (space.sandbox.manager.v1.StateResponse);
 
   // ── Sandbox state management ───────────────────────────────────────────────

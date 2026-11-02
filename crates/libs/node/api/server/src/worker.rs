@@ -650,6 +650,16 @@ impl WorkerApi for WorkerApiService {
         fwd_sbx_handoff!(self, "DeleteSandbox", delete, r)
     }
 
+    async fn sandbox_network_policy(
+        &self,
+        r: Request<pplx_space_sbx_mgr_client::proto::GetNetworkPolicyRequest>,
+    ) -> Result<Response<pplx_space_sbx_mgr_client::proto::GetNetworkPolicyResponse>, Status> {
+        if r.get_ref().sandbox_ids.len() != 1 {
+            return Err(Status::invalid_argument("exactly one sandbox is required"));
+        }
+        fwd_sbx_read!(self, "SandboxNetworkPolicy", get_network_policy, r)
+    }
+
     async fn sandbox_state(
         &self,
         r: Request<pplx_space_sbx_mgr_client::proto::StateRequest>,
