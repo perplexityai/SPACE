@@ -35,7 +35,10 @@ enum AccessOutcome {
 #[tonic::async_trait]
 trait AccessBackend: Send + Sync {
     async fn observe(&self, id: SandboxId) -> Result<Observation, Status>;
-    /// Read-only probe: no wake, recovery, or lifecycle reconciliation.
+    /// Read-only probe: no wake, recovery, or lifecycle reconciliation. On
+    /// Direct, the lookup may place a `started` row that has no active node
+    /// back on the node still running it. It changes no lifecycle and
+    /// reserves no generation.
     async fn reachable(&self, id: SandboxId) -> Result<bool, Status>;
     async fn access(&self, id: SandboxId) -> Result<AccessOutcome, Status>;
     /// Queue, or join, the system wake a session on the sandbox waits for,
