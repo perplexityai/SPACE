@@ -170,6 +170,7 @@ impl KubernetesSubstrate {
             started_recovery,
             restore_lease_token,
             activation_attempt,
+            stopped_materialization_artifact_id,
         } = ownership;
         let started_recovery_owner_generation =
             started_recovery.map(StartedRecoveryOwnership::generation);
@@ -364,12 +365,28 @@ impl KubernetesSubstrate {
         // we just drop the source-node pin and emit no extra placement.
         let evacuation_toleration_slot: Option<[PodToleration; 1]> =
             evacuation_placement.and_then(|placement| placement.map(|p| [p.to_toleration()]));
+        // A stopped re-placement stays off every node an earlier execution ran
+        // on; see `stopped_replacement_excluded_nodes`.
+        let stopped_replacement_excluded_nodes = match stopped_materialization_artifact_id {
+            Some(_) => {
+                self.store
+                    .stopped_replacement_excluded_nodes(sandbox_id)
+                    .await?
+            }
+            None => Vec::new(),
+        };
         let evacuation_context = evacuation_placement.map(|placement| EvacuationContext {
             extra_tolerations: evacuation_toleration_slot
                 .as_ref()
                 .map(|slot| slot.as_slice())
                 .unwrap_or(&[]),
             extra_required_affinity: placement.map(EvacuationPlacement::to_required_affinity),
+            stopped_materialization: stopped_materialization_artifact_id.map(|artifact_id| {
+                StoppedMaterialization {
+                    artifact_id,
+                    excluded_node_names: &stopped_replacement_excluded_nodes,
+                }
+            }),
         });
 
         let mut pod_name = claim.row.pod_name.clone();
@@ -414,8 +431,10 @@ impl KubernetesSubstrate {
                 None => None,
             };
             // An *unpinned* pod matching this execution under a still-`creating`
-            // claim is a successor an interrupted re-drive created but never
-            // persisted. Hydrate it now — without this the create-in-flight
+            // claim may be one whose create was interrupted before its
+            // persist: a successor an interrupted re-drive created, or a
+            // stopped re-placement's pod (it pins no source node, only excludes
+            // prior hosts). Hydrate it now — without this the create-in-flight
             // early return below would leave the row unmaterialized until the
             // stale-create age expires. An interrupted *direct-node*
             // (`spec.nodeName`, local-only) pod takes this path too, and that

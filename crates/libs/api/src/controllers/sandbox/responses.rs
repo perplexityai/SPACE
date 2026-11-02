@@ -366,34 +366,49 @@ pub(super) async fn maybe_update_sandbox_lifecycle(pool: &PgPool, id: SandboxId,
     }
 }
 
-/// Best-effort `(lifecycle, placement)` write that refuses to overwrite
-/// a terminal state. Same terminal-state guard as
+/// Best-effort write of a successful start: `started`, `on_node`, refusing to
+/// overwrite a terminal state. Same terminal-state guard as
 /// [`maybe_update_sandbox_lifecycle`]; see that function's doc for the
 /// transient-lifecycle-sweeper safety contract.
-pub(super) async fn maybe_update_sandbox_state(
-    pool: &PgPool,
-    id: SandboxId,
-    lifecycle: &str,
-    placement: &str,
-) {
+///
+/// It also drops a `disk` artifact pin. A disk pin names the bytes of a
+/// stopped rootfs, and a started guest can write past them, so once the start
+/// lands the pin describes nothing current; the node drops its own pin when a
+/// cold start completes (sandbox-manager's `mark_start_succeeded`). Left set,
+/// the cluster pin would outlive the next stop and make a later forced drain
+/// refuse the sandbox as an unattributable artifact on every tick. The pins
+/// this clears are the node drain's (`record_stopped_evacuation_artifact`),
+/// which a stopped re-placement's finalize keeps in place. A `full` pin is
+/// kept: this write also completes a start that restored a suspended sandbox,
+/// and the node keeps that pin across a restore (`mark_restore_succeeded`).
+pub(super) async fn maybe_mark_started_after_start(pool: &PgPool, id: SandboxId) {
     if let Err(err) = sqlx::query(sql!(
         "UPDATE sandboxes
-            SET lifecycle = $1, placement = $2
-          WHERE id = $3
+            SET lifecycle = 'started',
+                placement = 'on_node',
+                current_local_artifact_id = CASE
+                    WHEN current_local_artifact_kind = 'disk' THEN NULL
+                    ELSE current_local_artifact_id
+                END,
+                current_local_artifact_kind = CASE
+                    WHEN current_local_artifact_kind = 'disk' THEN NULL
+                    ELSE current_local_artifact_kind
+                END,
+                current_local_artifact_origin = CASE
+                    WHEN current_local_artifact_kind = 'disk' THEN NULL
+                    ELSE current_local_artifact_origin
+                END
+          WHERE id = $1
             AND lifecycle NOT IN ('failed', 'quarantined', 'deleted', 'cleanup_required')"
     ))
-    .bind(lifecycle)
-    .bind(placement)
     .bind(id)
     .execute(pool)
     .await
     {
         tracing::warn!(
             sandbox_id = %id,
-            lifecycle,
-            placement,
             error = %err,
-            "best-effort sandbox state update failed"
+            "best-effort post-start sandbox state update failed"
         );
     }
 }

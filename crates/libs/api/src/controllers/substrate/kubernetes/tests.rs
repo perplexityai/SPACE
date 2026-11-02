@@ -461,6 +461,26 @@ mod kubernetes_tests {
         }));
         assert!(!SandboxPodView::from(required_no_pin).has_required_source_pin());
 
+        // Required matchFields metadata.name NotIn (a stopped re-placement's
+        // prior-host exclusion) keeps the pod off a node rather than pinning it
+        // -> not pinned, though the key is the pin's.
+        let excluded = pod_with_affinity(Some(Affinity {
+            node_affinity: Some(NodeAffinity {
+                required_during_scheduling_ignored_during_execution: Some(NodeSelector {
+                    node_selector_terms: vec![NodeSelectorTerm {
+                        match_fields: Some(vec![NodeSelectorRequirement {
+                            operator: "NotIn".to_string(),
+                            ..name_match()
+                        }]),
+                        ..Default::default()
+                    }],
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        assert!(!SandboxPodView::from(excluded).has_required_source_pin());
+
         // No affinity at all -> not pinned.
         assert!(!SandboxPodView::from(pod_with_affinity(None)).has_required_source_pin());
     }
@@ -4616,62 +4636,72 @@ mod kubernetes_tests {
         Ok(())
     }
 
-    /// An evacuation restore whose target the wake can't express yet — `Stopped`,
-    /// the only target a stopped evacuation asks for — is refused before the
-    /// claim. A sandbox that is on no node keeps its marker, its retry
-    /// bookkeeping and its `stopped` lifecycle, and no pod is created. The
-    /// refusal is a `Conflict`.
+    /// A restore target the wake can't serve is refused before the claim: an
+    /// evacuation restore toward a lifecycle no wake reaches (`Suspended`), and
+    /// a user restore toward `Stopped`, which only the drain's re-placement may
+    /// ask for. Each runs against the shape a stopped evacuation's teardown
+    /// leaves, which the evacuation claim would otherwise take: the sandbox
+    /// keeps its marker, its retry bookkeeping and its `stopped` lifecycle, no
+    /// pod is created, and the refusal is a `Conflict`.
     #[tokio::test(flavor = "current_thread")]
-    async fn unservable_evacuation_restore_target_is_refused_before_the_claim()
-    -> Result<(), BoxError> {
-        // Arrange: the shape a stopped evacuation's teardown leaves, which
-        // the evacuation claim would otherwise take.
-        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
-        let pool = db.pool.clone();
-        let sandbox_id = SandboxId::new();
-        insert_test_sandbox_row(&pool, sandbox_id, "stopped").await?;
-        sqlx::query(
-            "UPDATE sandboxes
-                SET evacuation_restore_target = 'stopped',
-                    placement = 'unplaced',
-                    active_node_id = NULL,
-                    restore_attempt_count = 3
-              WHERE id = $1",
-        )
-        .bind(sandbox_id)
-        .execute(&pool)
-        .await?;
-        let (substrate, request_count) = substrate_with_failed_pod_creates(pool.clone());
-
-        // Act.
-        let error = substrate
-            .restore_evacuated_execution(
-                SandboxApiMetricIdentity::native("node_drain.evacuate"),
-                sandbox_id,
-                crate::controllers::substrate::ActivationOptions {
-                    blocking: true,
-                    ready_timeout: Duration::from_secs(2),
-                },
-                None,
-                SandboxLifecycle::Stopped,
+    async fn unservable_restore_targets_are_refused_before_the_claim() -> Result<(), BoxError> {
+        for (target, evacuation) in [
+            (SandboxLifecycle::Suspended, true),
+            (SandboxLifecycle::Stopped, false),
+        ] {
+            // Arrange.
+            let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+            let pool = db.pool.clone();
+            let sandbox_id = SandboxId::new();
+            insert_test_sandbox_row(&pool, sandbox_id, "stopped").await?;
+            sqlx::query(
+                "UPDATE sandboxes
+                    SET evacuation_restore_target = 'stopped',
+                        placement = 'unplaced',
+                        active_node_id = NULL,
+                        restore_attempt_count = 3
+                  WHERE id = $1",
             )
-            .await
-            .expect_err("the wake can't express a stopped target yet");
+            .bind(sandbox_id)
+            .execute(&pool)
+            .await?;
+            let (substrate, request_count) = substrate_with_failed_pod_creates(pool.clone());
 
-        // Assert.
-        assert!(
-            matches!(error, SubstrateError::Conflict { .. }),
-            "got {error:?}"
-        );
-        let row: (String, Option<String>, i32) = sqlx::query_as(
-            "SELECT lifecycle, evacuation_restore_target, restore_attempt_count
-               FROM sandboxes WHERE id = $1",
-        )
-        .bind(sandbox_id)
-        .fetch_one(&pool)
-        .await?;
-        assert_eq!(row, ("stopped".to_string(), Some("stopped".to_string()), 3));
-        assert_eq!(request_count.load(Ordering::SeqCst), 0);
+            // Act.
+            let error = substrate
+                .restore_execution_inner(
+                    SandboxApiMetricIdentity::native("node_drain.evacuate"),
+                    sandbox_id,
+                    crate::controllers::substrate::ActivationOptions {
+                        blocking: true,
+                        ready_timeout: Duration::from_secs(2),
+                    },
+                    evacuation.then_some(None),
+                    target,
+                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                )
+                .await
+                .expect_err("an unservable restore target must be refused");
+
+            // Assert.
+            assert!(
+                matches!(error, SubstrateError::Conflict { .. }),
+                "{target}/evacuation={evacuation}: got {error:?}"
+            );
+            let row: (String, Option<String>, i32) = sqlx::query_as(
+                "SELECT lifecycle, evacuation_restore_target, restore_attempt_count
+                   FROM sandboxes WHERE id = $1",
+            )
+            .bind(sandbox_id)
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(
+                row,
+                ("stopped".to_string(), Some("stopped".to_string()), 3),
+                "{target}/evacuation={evacuation}: the row must be untouched"
+            );
+            assert_eq!(request_count.load(Ordering::SeqCst), 0);
+        }
         Ok(())
     }
 
@@ -7467,6 +7497,7 @@ mod kubernetes_tests {
                 preferred_node_name: None,
             }),
             PodCreateContext::Restore(RestoreContext::Evacuation {
+                stopped_materialization: None,
                 suspend_restore_storage_uri: Some("s3://bucket/key"),
                 extra_tolerations: &[],
                 extra_required_affinity: None,
@@ -13433,6 +13464,32 @@ mod kubernetes_tests {
                 WakeWaitPolicy::RequireIdentity,
                 false,
             ),
+            // A stopped re-placement never waits on a route the node can't
+            // echo, whichever route shape the execution has.
+            (
+                "restoring",
+                ActiveExecutionState::Running,
+                SandboxLifecycle::Stopped,
+                Some(route),
+                WakeWaitPolicy::RequireMaterialization,
+                true,
+            ),
+            (
+                "restoring",
+                ActiveExecutionState::Running,
+                SandboxLifecycle::Stopped,
+                Some(operation),
+                WakeWaitPolicy::RequireMaterialization,
+                false,
+            ),
+            (
+                "restoring",
+                ActiveExecutionState::Running,
+                SandboxLifecycle::Stopped,
+                None,
+                WakeWaitPolicy::RequireMaterialization,
+                false,
+            ),
         ] {
             let execution = super::store::ActiveExecutionStatusRow {
                 generation: 1,
@@ -14650,6 +14707,471 @@ mod kubernetes_tests {
                 .any(|(path, _)| path.ends_with(&pod_name)),
             "the retired execution's pod must be deleted"
         );
+        Ok(())
+    }
+
+    /// The shape a stop really leaves on Kubernetes: the sandbox `stopped`
+    /// and the execution it ran in still `active`, created before the stop.
+    /// The drain's teardown must retire that execution and release the node,
+    /// where the plain no-execution teardown refuses it outright. An
+    /// execution created *after* the stop is a `start` in flight, and the
+    /// same call must leave it, its pod and its placement alone. Both rows are
+    /// active in both cases, so only the stop boundary separates them.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stopped_teardown_retires_the_execution_its_stop_left_active() -> Result<(), BoxError>
+    {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+
+        // Retired by the stop: the execution exists before the lifecycle moves.
+        let stopped = SandboxId::new();
+        let stopped_pod = format!("space-sbx-{}-g1", stopped.as_uuid().simple());
+        insert_test_sandbox_row(&pool, stopped, "started").await?;
+        place_on_fresh_node(&pool, stopped).await?;
+        insert_k8s_execution(&pool, stopped, 1, &stopped_pod, "uid-pre-stop", None, true).await?;
+        sqlx::query("UPDATE sandboxes SET lifecycle = 'stopped' WHERE id = $1")
+            .bind(stopped)
+            .execute(&pool)
+            .await?;
+        // The drain's claim on it.
+        mark_stopped_evacuation(&pool, stopped).await?;
+
+        // A whole start→stop cycle since the drain's claim: the execution
+        // predates the new stop, but the start cleared the marker.
+        let cycled = SandboxId::new();
+        let cycled_pod = format!("space-sbx-{}-g2", cycled.as_uuid().simple());
+        insert_test_sandbox_row(&pool, cycled, "stopped").await?;
+        mark_stopped_evacuation(&pool, cycled).await?;
+        sqlx::query("UPDATE sandboxes SET lifecycle = 'starting' WHERE id = $1")
+            .bind(cycled)
+            .execute(&pool)
+            .await?;
+        let cycled_node = place_on_fresh_node(&pool, cycled).await?;
+        insert_k8s_execution(&pool, cycled, 2, &cycled_pod, "uid-cycled", None, true).await?;
+        sqlx::query("UPDATE sandboxes SET lifecycle = 'stopped' WHERE id = $1")
+            .bind(cycled)
+            .execute(&pool)
+            .await?;
+
+        // A start in flight: the execution is created after the stop.
+        let starting = SandboxId::new();
+        let starting_pod = format!("space-sbx-{}-g2", starting.as_uuid().simple());
+        insert_test_sandbox_row(&pool, starting, "stopped").await?;
+        let starting_node = place_on_fresh_node(&pool, starting).await?;
+        sqlx::query(
+            "UPDATE sandboxes SET lifecycle_changed_at = NOW() - INTERVAL '1 minute' WHERE id = $1",
+        )
+        .bind(starting)
+        .execute(&pool)
+        .await?;
+        insert_k8s_execution(&pool, starting, 2, &starting_pod, "uid-start", None, true).await?;
+        mark_stopped_evacuation(&pool, starting).await?;
+
+        let captured_deletes = Arc::new(Mutex::new(Vec::new()));
+        let substrate = substrate_with_store_client_proxy_port_and_pod(
+            pool.clone(),
+            delete_capturing_kubernetes_client(Arc::clone(&captured_deletes), None),
+            DEFAULT_SANDBOX_PROXY_PORT,
+            None,
+        );
+
+        assert!(
+            !substrate
+                .delete_execution_with_no_active_execution(stopped)
+                .await?,
+            "precondition: the plain no-execution teardown refuses the shape a stop leaves"
+        );
+        assert!(
+            substrate
+                .delete_execution_retired_by_current_stop(stopped)
+                .await?,
+            "the execution the stop left active must not block the teardown"
+        );
+        assert!(
+            active_execution_generations(&pool, stopped)
+                .await
+                .is_empty()
+        );
+        assert_eq!(placement_of(&pool, stopped).await, (None, true));
+        assert!(
+            captured_deletes
+                .lock()
+                .expect("capture mutex poisoned")
+                .iter()
+                .any(|(path, _)| path.ends_with(&stopped_pod)),
+            "the pre-stop execution's pod must be deleted"
+        );
+
+        assert!(
+            !substrate
+                .delete_execution_retired_by_current_stop(starting)
+                .await?,
+            "an execution newer than the stop must refuse the teardown"
+        );
+        assert_eq!(active_execution_generations(&pool, starting).await, vec![2]);
+        assert_eq!(
+            placement_of(&pool, starting).await,
+            (Some(starting_node), false)
+        );
+        assert!(
+            !captured_deletes
+                .lock()
+                .expect("capture mutex poisoned")
+                .iter()
+                .any(|(path, _)| path.ends_with(&starting_pod)),
+            "the starting sandbox's pod must survive"
+        );
+
+        assert!(
+            !substrate
+                .delete_execution_retired_by_current_stop(cycled)
+                .await?,
+            "a start→stop cycle since the claim must refuse the teardown"
+        );
+        assert_eq!(active_execution_generations(&pool, cycled).await, vec![2]);
+        assert_eq!(
+            placement_of(&pool, cycled).await,
+            (Some(cycled_node), false)
+        );
+        Ok(())
+    }
+
+    /// A `start` that finds no pod under the pre-stop execution's name reuses
+    /// that execution and creates the pod under the same name, so the stop
+    /// boundary still reads it as pre-stop and the row stays `stopped` with
+    /// its marker. Its live activation attempt is what refuses the teardown,
+    /// which would otherwise retire the execution the start is booting. An
+    /// expired attempt, left by a crashed owner, doesn't hold the node. The
+    /// two rows differ only in the attempt's expiry.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stopped_teardown_leaves_a_start_that_reused_the_pre_stop_execution()
+    -> Result<(), BoxError> {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+
+        let mut rows = Vec::new();
+        for (expires_in, generation) in [("5 minutes", 1_i64), ("-1 second", 1_i64)] {
+            let sandbox_id = SandboxId::new();
+            let pod = format!("space-sbx-{}-g{generation}", sandbox_id.as_uuid().simple());
+            insert_test_sandbox_row(&pool, sandbox_id, "started").await?;
+            let node = place_on_fresh_node(&pool, sandbox_id).await?;
+            insert_k8s_execution(
+                &pool,
+                sandbox_id,
+                generation,
+                &pod,
+                "uid-pre-stop",
+                None,
+                true,
+            )
+            .await?;
+            sqlx::query("UPDATE sandboxes SET lifecycle = 'stopped' WHERE id = $1")
+                .bind(sandbox_id)
+                .execute(&pool)
+                .await?;
+            mark_stopped_evacuation(&pool, sandbox_id).await?;
+            sqlx::query(
+                "UPDATE sandbox_k8s_executions
+                    SET activation_attempt_id = $2,
+                        activation_attempt_expires_at = NOW() + $3::INTERVAL,
+                        activation_attempt_target_state = 'started'
+                  WHERE sandbox_id = $1 AND active",
+            )
+            .bind(sandbox_id)
+            .bind(pplx_space_common_core::types::SandboxActivationAttemptId::new())
+            .bind(expires_in)
+            .execute(&pool)
+            .await?;
+            rows.push((sandbox_id, node));
+        }
+        let [(starting, starting_node), (abandoned, _)] = rows[..] else {
+            unreachable!("two rows were seeded");
+        };
+
+        let substrate = substrate_with_store_client_proxy_port_and_pod(
+            pool.clone(),
+            delete_capturing_kubernetes_client(Arc::new(Mutex::new(Vec::new())), None),
+            DEFAULT_SANDBOX_PROXY_PORT,
+            None,
+        );
+
+        assert!(
+            !substrate
+                .delete_execution_retired_by_current_stop(starting)
+                .await?,
+            "a start holding a live attempt on the pre-stop execution must refuse the teardown"
+        );
+        assert_eq!(active_execution_generations(&pool, starting).await, vec![1]);
+        assert_eq!(
+            placement_of(&pool, starting).await,
+            (Some(starting_node), false)
+        );
+
+        assert!(
+            substrate
+                .delete_execution_retired_by_current_stop(abandoned)
+                .await?,
+            "an expired attempt must not hold the node"
+        );
+        assert!(
+            active_execution_generations(&pool, abandoned)
+                .await
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    /// With the sandbox row gone the teardown refuses: there's no row to lock
+    /// and no marker, and either refuses on its own, so this guards the pair.
+    /// (A row whose marker alone is gone refuses on the marker clause; the
+    /// start→stop case in `a_stopped_teardown_retires_the_execution_its_stop_left_active`
+    /// covers that.)
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stopped_teardown_of_a_vanished_sandbox_refuses() -> Result<(), BoxError> {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let substrate = substrate_with_store_client_proxy_port_and_pod(
+            db.pool.clone(),
+            delete_capturing_kubernetes_client(Arc::new(Mutex::new(Vec::new())), None),
+            DEFAULT_SANDBOX_PROXY_PORT,
+            None,
+        );
+
+        assert!(
+            !substrate
+                .delete_execution_retired_by_current_stop(SandboxId::new())
+                .await?,
+            "a teardown with no sandbox row must refuse"
+        );
+        Ok(())
+    }
+
+    async fn mark_stopped_evacuation(pool: &PgPool, sandbox_id: SandboxId) -> Result<(), BoxError> {
+        sqlx::query("UPDATE sandboxes SET evacuation_restore_target = 'stopped' WHERE id = $1")
+            .bind(sandbox_id)
+            .execute(pool)
+            .await?;
+        Ok(())
+    }
+
+    /// After a stopped re-placement settles, its VM-less materialization pod
+    /// is deleted, so the destination doesn't keep a network slot for a
+    /// sandbox that isn't running. Only the execution the stop predates loses
+    /// its pod: one a `start` created since belongs to the owner and keeps it.
+    /// Both executions are active, so only the stop boundary separates them.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_settled_stopped_re_placement_releases_only_its_materialization_pod()
+    -> Result<(), BoxError> {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+
+        let settled = SandboxId::new();
+        let settled_pod = format!("space-sbx-{}-g2", settled.as_uuid().simple());
+        insert_test_sandbox_row(&pool, settled, "restoring").await?;
+        insert_k8s_execution(
+            &pool,
+            settled,
+            2,
+            &settled_pod,
+            "uid-materialize",
+            None,
+            true,
+        )
+        .await?;
+        sqlx::query("UPDATE sandboxes SET lifecycle = 'stopped' WHERE id = $1")
+            .bind(settled)
+            .execute(&pool)
+            .await?;
+
+        let started = SandboxId::new();
+        let started_pod = format!("space-sbx-{}-g3", started.as_uuid().simple());
+        insert_test_sandbox_row(&pool, started, "stopped").await?;
+        sqlx::query(
+            "UPDATE sandboxes SET lifecycle_changed_at = NOW() - INTERVAL '1 minute' WHERE id = $1",
+        )
+        .bind(started)
+        .execute(&pool)
+        .await?;
+        insert_k8s_execution(&pool, started, 3, &started_pod, "uid-start", None, true).await?;
+
+        let captured_deletes = Arc::new(Mutex::new(Vec::new()));
+        let substrate = substrate_with_store_client_proxy_port_and_pod(
+            pool.clone(),
+            delete_capturing_kubernetes_client(Arc::clone(&captured_deletes), None),
+            DEFAULT_SANDBOX_PROXY_PORT,
+            None,
+        );
+
+        assert!(
+            substrate
+                .release_stopped_materialization_pod(settled)
+                .await?
+        );
+        assert!(
+            !substrate
+                .release_stopped_materialization_pod(started)
+                .await?
+        );
+        let captured = captured_deletes
+            .lock()
+            .expect("capture mutex poisoned")
+            .clone();
+        let deleted: Vec<String> = captured.iter().map(|(path, _)| path.clone()).collect();
+        // A `start` that finds no pod under this name recreates it under the
+        // same name, so only the recorded UID identifies the pod to delete.
+        let settled_delete = captured
+            .iter()
+            .find(|(path, _)| path.ends_with(&settled_pod))
+            .map(|(_, options)| options.clone());
+        assert_eq!(
+            settled_delete
+                .as_ref()
+                .and_then(|options| options.pointer("/preconditions/uid"))
+                .and_then(serde_json::Value::as_str),
+            Some("uid-materialize"),
+            "the delete must be preconditioned on the recorded pod UID: {settled_delete:?}"
+        );
+        assert!(
+            deleted.iter().any(|path| path.ends_with(&settled_pod)),
+            "the materialization pod must be deleted: {deleted:?}"
+        );
+        assert!(
+            !deleted.iter().any(|path| path.ends_with(&started_pod)),
+            "a pod a start created must survive: {deleted:?}"
+        );
+        assert_eq!(
+            active_execution_generations(&pool, settled).await,
+            vec![2],
+            "the execution row stays active, as an ordinarily stopped sandbox's does"
+        );
+        Ok(())
+    }
+
+    /// The race the UID precondition closes: a `start` that found no pod
+    /// under the execution's name recreated one under that same name before
+    /// the release ran. The apiserver refuses the preconditioned delete (409),
+    /// and the release reports nothing released rather than an error. With no
+    /// UID on the row, nothing identifies the pod, so no delete is sent; and a
+    /// `start` still in flight, which has recorded its own pod's UID, is
+    /// recognized by its activation attempt and isn't sent one either.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stopped_re_placement_release_spares_a_pod_a_start_recreated() -> Result<(), BoxError>
+    {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+
+        let recreated = SandboxId::new();
+        let recreated_pod = format!("space-sbx-{}-g2", recreated.as_uuid().simple());
+        insert_test_sandbox_row(&pool, recreated, "restoring").await?;
+        insert_k8s_execution(
+            &pool,
+            recreated,
+            2,
+            &recreated_pod,
+            "uid-materialize",
+            None,
+            true,
+        )
+        .await?;
+        let unrecorded = SandboxId::new();
+        let unrecorded_pod = format!("space-sbx-{}-g2", unrecorded.as_uuid().simple());
+        insert_test_sandbox_row(&pool, unrecorded, "restoring").await?;
+        insert_k8s_execution(&pool, unrecorded, 2, &unrecorded_pod, "", None, true).await?;
+        // A `start` in flight on the same generation, which has recorded its
+        // own pod's UID: its activation attempt keeps the release away.
+        let in_flight = SandboxId::new();
+        let in_flight_pod = format!("space-sbx-{}-g2", in_flight.as_uuid().simple());
+        insert_test_sandbox_row(&pool, in_flight, "restoring").await?;
+        insert_k8s_execution(&pool, in_flight, 2, &in_flight_pod, "uid-start", None, true).await?;
+        sqlx::query(
+            "UPDATE sandbox_k8s_executions
+                SET activation_attempt_id = $2,
+                    activation_attempt_expires_at = NOW() + INTERVAL '5 minutes',
+                    activation_attempt_target_state = 'started'
+              WHERE sandbox_id = $1 AND active",
+        )
+        .bind(in_flight)
+        .bind(pplx_space_common_core::types::SandboxActivationAttemptId::new())
+        .execute(&pool)
+        .await?;
+        for sandbox_id in [recreated, unrecorded, in_flight] {
+            sqlx::query("UPDATE sandboxes SET lifecycle = 'stopped' WHERE id = $1")
+                .bind(sandbox_id)
+                .execute(&pool)
+                .await?;
+        }
+
+        let deletes = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&deletes);
+        let service = tower::service_fn(move |req: Request<Body>| {
+            let seen = Arc::clone(&seen);
+            async move {
+                let (status, body) = if req.method() == Method::DELETE {
+                    seen.lock()
+                        .expect("capture mutex poisoned")
+                        .push(req.uri().path().to_string());
+                    (
+                        StatusCode::CONFLICT,
+                        serde_json::json!({
+                            "kind": "Status",
+                            "apiVersion": "v1",
+                            "status": "Failure",
+                            "reason": "Conflict",
+                            "message": "Precondition failed: UID in precondition does not match",
+                            "code": 409
+                        }),
+                    )
+                } else {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({
+                            "kind": "Status",
+                            "apiVersion": "v1",
+                            "status": "Failure",
+                            "reason": "BadRequest",
+                            "code": 400
+                        }),
+                    )
+                };
+                Ok::<_, BoxError>(
+                    Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&body)?))?,
+                )
+            }
+        });
+        let substrate = substrate_with_store_client_proxy_port_and_pod(
+            pool.clone(),
+            ClientBuilder::new(service, "space").build(),
+            DEFAULT_SANDBOX_PROXY_PORT,
+            None,
+        );
+
+        assert!(
+            !substrate
+                .release_stopped_materialization_pod(recreated)
+                .await?,
+            "a refused delete released nothing"
+        );
+        assert!(
+            !substrate
+                .release_stopped_materialization_pod(unrecorded)
+                .await?,
+            "an execution with no recorded UID releases nothing"
+        );
+        assert!(
+            !substrate
+                .release_stopped_materialization_pod(in_flight)
+                .await?,
+            "a start in flight keeps its pod"
+        );
+        let sent = deletes.lock().expect("capture mutex poisoned").clone();
+        assert_eq!(
+            sent.len(),
+            1,
+            "only the recorded pod is asked for: {sent:?}"
+        );
+        assert!(sent[0].ends_with(&recreated_pod), "{sent:?}");
         Ok(())
     }
 

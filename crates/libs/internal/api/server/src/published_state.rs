@@ -3993,6 +3993,20 @@ async fn converge_stopped_sandboxes(
                'stopping',
                'restoring'
            )
+           -- A `restoring` row marked for a stopped re-placement is the
+           -- drain's restore in flight (the `restoring -> started`
+           -- convergence above exempts every marked row for the same
+           -- reason). Its node reports `stopped` as soon as the shim has
+           -- staged the disk, before the drain has confirmed it; promoting
+           -- it here would take the row out from under the drain's
+           -- finalize, which then misses its CAS and never releases the
+           -- materialization pod. A row marked `started` or `paused` still
+           -- converges: a node reporting `stopped` for it means the restore
+           -- ended in a stopped VM, which the drain's re-drive can't recover.
+           AND NOT (
+               LOWER(TRIM(s.lifecycle)) = 'restoring'
+               AND s.evacuation_restore_target IS NOT DISTINCT FROM 'stopped'
+           )
          RETURNING s.id"
         ))
         .bind(node_id)
