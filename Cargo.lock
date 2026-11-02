@@ -6165,11 +6165,20 @@ dependencies = [
 name = "pplx-space-native-files"
 version = "0.8.0"
 dependencies = [
+ "base64 0.23.1",
  "hex",
+ "http 1.5.0",
+ "pplx-space-common-core",
+ "pplx-space-common-grpc",
  "pplx-space-guest-process",
  "pplx-space-public-api",
+ "pplx-space-sbx-mgr-protocol",
+ "prost-types",
  "sha2 0.11.0",
  "thiserror 2.0.20",
+ "time",
+ "tonic",
+ "tracing",
 ]
 
 [[package]]

@@ -11,10 +11,19 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+base64 = { workspace = true }
 hex = { workspace = true }
+http = { workspace = true }
+prost-types = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
+time = { workspace = true, features = ["formatting", "parsing"] }
+tonic = { workspace = true }
+tracing = { workspace = true }
 
 # internal
+pplx-space-common-core = { workspace = true }
+pplx-space-common-grpc = { workspace = true }
 pplx-space-guest-process = { workspace = true }
 pplx-space-public-api = { workspace = true }
+pplx-space-sbx-mgr-protocol = { workspace = true }
