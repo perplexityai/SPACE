@@ -6,6 +6,7 @@ import {
   accessProblemForStatus,
   consoleRequestHeaders,
   parseConsoleAuthConfig,
+  providerSignOutOnly,
   safeLogoutUrl,
 } from './console-auth.ts';
 
@@ -88,4 +89,14 @@ test('status codes map to the access problem shown on the login page', () => {
   assert.equal(accessProblemForStatus(503), 'unavailable');
   assert.equal(accessProblemForStatus(502), 'unavailable');
   assert.equal(accessProblemForStatus(500), 'error');
+});
+
+test('only external sign-in without a logout URL leaves the user to sign out of the provider', () => {
+  assert.equal(providerSignOutOnly({ mode: 'external', providerName: 'Company SSO', logoutUrl: null }), 'Company SSO');
+  assert.equal(
+    providerSignOutOnly({ mode: 'external', providerName: 'Company SSO', logoutUrl: 'https://sso.example.test/logout' }),
+    null,
+  );
+  assert.equal(providerSignOutOnly(PASSWORD_MODE), null);
+  assert.equal(providerSignOutOnly(null), null);
 });

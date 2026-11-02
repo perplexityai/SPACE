@@ -6,6 +6,7 @@ import Link from 'next/link';
 import { useAuth } from '@/lib/auth';
 import { useTheme, useCuriosityTheme } from '@/lib/theme';
 import { consoleAccess } from '@/lib/console-access';
+import { providerSignOutOnly } from '@/lib/console-auth';
 import { App, Layout, Menu, Typography, Button, ConfigProvider, Avatar, Space, Segmented, Modal, Result } from 'antd';
 import {
   DashboardOutlined,
@@ -75,7 +76,7 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
   if (loading || !user || !org) return null;
 
   const access = consoleAccess(user, cluster);
-  const providerSignOutOnly = authMode?.mode === 'external' && !authMode.logoutUrl;
+  const signOutProvider = providerSignOutOnly(authMode);
   const visibleItems = access === 'operator' ? menuItems : [];
 
   const retryCluster = async () => {
@@ -138,9 +139,17 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
                     <Text type="secondary" style={{ fontSize: 11 }}>{user.role}</Text>
                   </div>
                 </Space>
-                <Button type="text" icon={<LogoutOutlined />} onClick={() => setLogoutConfirmationOpen(true)} size="small" block>
-                  Log out
-                </Button>
+                {signOutProvider ? (
+                  // Logging out here would only return to /login and sign the
+                  // same account back in.
+                  <Text type="secondary" style={{ fontSize: 11 }}>
+                    Sign out of {signOutProvider} to end your session.
+                  </Text>
+                ) : (
+                  <Button type="text" icon={<LogoutOutlined />} onClick={() => setLogoutConfirmationOpen(true)} size="small" block>
+                    Log out
+                  </Button>
+                )}
               </Space>
             </div>
           </Sider>
@@ -169,15 +178,15 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
                   <>
                     You are signed in as {user.email} ({org.name}). The admin console requires an organization admin of the
                     organization that manages this cluster.
-                    {providerSignOutOnly ? (
-                      <><br />To use another account, sign out of {authMode?.mode === 'external' ? authMode.providerName : 'your sign-in provider'}.</>
+                    {signOutProvider ? (
+                      <><br />To use another account, sign out of {signOutProvider}.</>
                     ) : null}
                   </>
                 }
                 extra={
                   // External sign-in without a logout URL can only return to
                   // /login, which signs the same account in again.
-                  providerSignOutOnly ? null : (
+                  signOutProvider ? null : (
                     <Button type="primary" icon={<LogoutOutlined />} onClick={() => setLogoutConfirmationOpen(true)}>
                       Log out
                     </Button>
