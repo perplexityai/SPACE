@@ -1199,15 +1199,15 @@ pub(crate) async fn submit_prepared_snapshot(
 /// Check transfers an earlier binary submitted before polling them. That
 /// binary did not read the sidecar after its last transfer, as
 /// [`submit_prepared_snapshot`] does, so they can be a newer suspend's files.
-/// The returned payload records the identity the check proved, so a later
-/// attempt polls without checking again.
+/// The returned payload records the id the sidecar named, so a later attempt
+/// polls without checking again.
 pub(crate) async fn check_earlier_submission(
     submitted: &SnapshotUploadJobs,
 ) -> Result<SnapshotUploadJobs, SubmitPreparedError> {
-    check_prepared_artifact(submitted, SidecarCheck::AfterSubmission).await?;
+    let named = check_prepared_artifact(submitted, SidecarCheck::AfterSubmission).await?;
     let mut checked = submitted.clone();
-    if checked.metadata_staging_dir.is_none() {
-        checked.sidecar_artifact_id = checked.meta.local_artifact_id;
+    if named.is_some() {
+        checked.sidecar_artifact_id = named;
     }
     Ok(checked)
 }
@@ -1266,15 +1266,18 @@ enum SidecarCheck {
 /// every retry.
 ///
 /// Only a sidecar naming another artifact is evidence of that. A missing one
-/// is left to `check`.
+/// is left to `check`. Returns the id the sidecar named when it proved the
+/// directory still holds this artifact.
 async fn check_prepared_artifact(
     prepared: &SnapshotUploadJobs,
     check: SidecarCheck,
-) -> Result<(), SubmitPreparedError> {
+) -> Result<Option<LocalArtifactId>, SubmitPreparedError> {
     #[derive(serde::Deserialize)]
     struct SidecarIdentity {
         #[serde(default)]
         local_artifact_id: Option<LocalArtifactId>,
+        #[serde(default)]
+        rootfs_send_source_id: Option<uuid::Uuid>,
     }
     let snapshot_dir = &prepared.snapshot_dir;
     // Only a suspend publishes over a directory, and only over the canonical
@@ -1283,25 +1286,17 @@ async fn check_prepared_artifact(
         prepared.meta.artifact_origin,
         prepared.meta.local_artifact_id,
     ) else {
-        return Ok(());
+        return Ok(None);
     };
     if !crate::service::is_canonical_suspend_snapshot_dir(snapshot_dir) {
-        return Ok(());
+        return Ok(None);
     }
-    let expected = match (prepared.sidecar_artifact_id, &prepared.metadata_staging_dir) {
-        (Some(expected), _) => expected,
-        // An earlier binary recorded no identity. Its preparation rewrote an
-        // in-place sidecar with the upload's id, but one it left in place
-        // names an id it did not record, such as an import's exporter id.
-        (None, None) => upload_id,
-        (None, Some(_)) => return Ok(()),
-    };
     let sidecar = snapshot_dir.join(SNAPSHOT_METADATA_FILENAME);
     let bytes = match tokio::fs::read(&sidecar).await {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return match check {
-                SidecarCheck::BeforeSubmission => Ok(()),
+                SidecarCheck::BeforeSubmission => Ok(None),
                 SidecarCheck::AfterSubmission => Err(format!(
                     "{} is missing after submission, so the queued uploads are not \
                      proven this artifact's",
@@ -1316,15 +1311,30 @@ async fn check_prepared_artifact(
         .map_err(|error| format!("parse {}: {error}", sidecar.display()))?;
     // A sidecar without an identity predates artifact ids and proves nothing
     // either way.
-    match identity.local_artifact_id {
-        Some(found) if found != expected => Err(Supersession {
+    let Some(found) = identity.local_artifact_id else {
+        return Ok(None);
+    };
+    let expected = prepared.sidecar_artifact_id.unwrap_or(upload_id);
+    let holds_this_artifact = match (prepared.sidecar_artifact_id, &prepared.metadata_staging_dir) {
+        (Some(_), _) | (None, None) => found == expected,
+        // An earlier binary recorded no identity, and a sidecar its
+        // preparation left in place can name an id it never saw, such as an
+        // import's exporter id. That sidecar still names the retained source
+        // the upload was prepared from; a newer suspend's names its own.
+        (None, Some(_)) => {
+            found == upload_id
+                || identity.rootfs_send_source_id == prepared.meta.rootfs_send_source_id
+        }
+    };
+    if !holds_this_artifact {
+        return Err(Supersession {
             snapshot_dir: snapshot_dir.clone(),
             expected,
             found,
         }
-        .into()),
-        _ => Ok(()),
+        .into());
     }
+    Ok(Some(found))
 }
 
 pub(crate) fn cleanup_metadata_staging_dir(jobs: &SnapshotUploadJobs) {

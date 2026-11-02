@@ -1151,46 +1151,76 @@ async fn imported_artifact_is_superseded_only_by_a_newer_publication() {
 
 /// The earlier binary recorded no identity. Its btrfs-send import staged the
 /// uploaded metadata and left the sidecar naming the exporter's id, which is
-/// no evidence of a newer publication, so the upload submits.
+/// no evidence of a newer publication, so the upload submits. That sidecar
+/// still names the retained source the upload was prepared from; a newer
+/// suspend's names its own, and supersedes the upload.
 #[tokio::test]
-async fn staged_import_an_earlier_binary_prepared_submits() {
-    let tmp = tempfile::tempdir().unwrap();
-    let canonical = tmp.path().join("snapshot");
-    let mut meta = publish_full_artifact(&canonical, LocalArtifactId::new());
-    std::fs::remove_file(canonical.join(ROOTFS_FULL_FILENAME)).unwrap();
-    std::fs::write(canonical.join(ROOTFS_BTRFS_SEND_FILENAME), [0u8; 30]).unwrap();
-    meta.rootfs_diff_format = Some(ROOTFS_DIFF_FORMAT_BTRFS_SEND_V1.to_owned());
-    meta.rootfs_send_source_id = Some(uuid::Uuid::now_v7());
-    let format = SuspendSnapshotFormat::BtrfsSend;
-    meta =
-        write_snapshot_metadata(&meta, &canonical, &vm_artifacts_for_format(format), None).unwrap();
-    meta.local_artifact_id = Some(LocalArtifactId::new());
-    let prepared = prepare_suspend_snapshot(
-        &meta,
-        &uuid::Uuid::now_v7().to_string(),
-        &canonical,
-        &fixture_config(),
-        ArtifactKind::Full,
-        format,
-        None,
-    )
-    .unwrap();
-    let mut json = serde_json::to_value(&prepared).unwrap();
-    json.as_object_mut().unwrap().remove("sidecar_artifact_id");
-    let earlier: SnapshotUploadJobs = serde_json::from_value(json).unwrap();
-    assert!(earlier.metadata_staging_dir.is_some());
-    let volume_manager = RecordingVolumeManager::serve(false);
+async fn staged_import_an_earlier_binary_prepared_is_superseded_only_by_a_newer_capture() {
+    /// Publish a btrfs-send artifact with a fresh retained source.
+    fn publish_btrfs_send_artifact(dir: &Path, local_artifact_id: LocalArtifactId) -> SnapshotMeta {
+        let mut meta = publish_full_artifact(dir, local_artifact_id);
+        std::fs::remove_file(dir.join(ROOTFS_FULL_FILENAME)).unwrap();
+        std::fs::write(dir.join(ROOTFS_BTRFS_SEND_FILENAME), [0u8; 30]).unwrap();
+        meta.rootfs_diff_format = Some(ROOTFS_DIFF_FORMAT_BTRFS_SEND_V1.to_owned());
+        meta.rootfs_send_source_id = Some(uuid::Uuid::now_v7());
+        write_snapshot_metadata(
+            &meta,
+            dir,
+            &vm_artifacts_for_format(SuspendSnapshotFormat::BtrfsSend),
+            None,
+        )
+        .unwrap()
+    }
+    for republished in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let canonical = tmp.path().join("snapshot");
+        let mut meta = publish_btrfs_send_artifact(&canonical, LocalArtifactId::new());
+        meta.local_artifact_id = Some(LocalArtifactId::new());
+        let prepared = prepare_suspend_snapshot(
+            &meta,
+            &uuid::Uuid::now_v7().to_string(),
+            &canonical,
+            &fixture_config(),
+            ArtifactKind::Full,
+            SuspendSnapshotFormat::BtrfsSend,
+            None,
+        )
+        .unwrap();
+        let mut json = serde_json::to_value(&prepared).unwrap();
+        json.as_object_mut().unwrap().remove("sidecar_artifact_id");
+        let earlier: SnapshotUploadJobs = serde_json::from_value(json).unwrap();
+        assert!(earlier.metadata_staging_dir.is_some());
+        let newer = LocalArtifactId::new();
+        if republished {
+            std::fs::rename(&canonical, tmp.path().join("retired")).unwrap();
+            publish_btrfs_send_artifact(&canonical, newer);
+        }
+        let volume_manager = RecordingVolumeManager::serve(false);
 
-    let result = submit_prepared_snapshot(
-        &earlier,
-        &crate::node_manager_transport::fake::unbound_in_absent_dir(),
-        &volume_manager.socket,
-    )
-    .await;
+        let result = submit_prepared_snapshot(
+            &earlier,
+            &crate::node_manager_transport::fake::unbound_in_absent_dir(),
+            &volume_manager.socket,
+        )
+        .await;
 
-    assert!(result.is_ok(), "{result:?}");
-    assert_eq!(volume_manager.methods(), vec!["SubmitPushFile"; 4]);
-    cleanup_metadata_staging_dir(&prepared);
+        let case = format!("republished={republished}: {result:?}");
+        if republished {
+            assert!(
+                matches!(&result, Err(SubmitPreparedError::Superseded(superseded)) if superseded.found == newer),
+                "{case}"
+            );
+            assert_eq!(volume_manager.methods(), Vec::<String>::new(), "{case}");
+        } else {
+            assert!(result.is_ok(), "{case}");
+            assert_eq!(
+                volume_manager.methods(),
+                vec!["SubmitPushFile"; 4],
+                "{case}"
+            );
+        }
+        cleanup_metadata_staging_dir(&prepared);
+    }
 }
 
 /// Only a suspend publishes over a directory, and only over the canonical
