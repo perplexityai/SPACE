@@ -305,6 +305,9 @@ impl SandboxManagerService {
                 .into());
             }
         };
+        // An imported artifact's sidecar names the exporter's id, not the one
+        // this backup adopted.
+        let sidecar_artifact_id = meta.local_artifact_id;
         meta.local_artifact_id = Some(local_artifact_id);
         meta.artifact_kind = Some(artifact_kind);
         meta.artifact_origin = Some(artifact_origin);
@@ -346,6 +349,7 @@ impl SandboxManagerService {
         )
         .map_err(|error| format!("prepare snapshot upload intent failed: {error}"))?;
         jobs.execution_generation = execution_generation;
+        jobs.sidecar_artifact_id = sidecar_artifact_id;
         let mut storage_uri = jobs.storage_uri.clone();
         let dedup_key = crate::snapshot_upload_jobs::artifact_backup_dedup_key(local_artifact_id);
         let local_artifact_id = local_artifact_id.to_string();

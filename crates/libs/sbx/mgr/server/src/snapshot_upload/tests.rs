@@ -553,6 +553,7 @@ fn new_payload_round_trips_metadata_job_flag() {
         deferred_metadata: false,
         execution_generation: None,
         failure_scope: Default::default(),
+        sidecar_artifact_id: None,
     };
     let round: SnapshotUploadJobs =
         serde_json::from_str(&serde_json::to_string(&jobs).unwrap()).unwrap();
@@ -577,6 +578,7 @@ fn payload_round_trips_execution_generation() {
         deferred_metadata: false,
         execution_generation: Some(generation),
         failure_scope: Default::default(),
+        sidecar_artifact_id: None,
     };
     let encoded = serde_json::to_value(&jobs).unwrap();
     let round: SnapshotUploadJobs = serde_json::from_value(encoded.clone()).unwrap();
@@ -612,6 +614,7 @@ fn cleanup_metadata_staging_dir_removes_only_owned_staging_dir() {
         deferred_metadata: false,
         execution_generation: None,
         failure_scope: Default::default(),
+        sidecar_artifact_id: None,
     };
 
     cleanup_metadata_staging_dir(&jobs);
@@ -702,4 +705,477 @@ fn storage_uri_honours_key_prefix() {
             "s3://test-bucket/clusters/abc/suspend_snapshots/{shard:02x}/sbx-1/snap-1?region=us-east-1"
         ),
     );
+}
+
+/// A volume-manager that accepts every submission with a fresh transfer and
+/// records each call's method and transfer, or refuses the rootfs send when
+/// `refuse_send`, as node-manager's stager refuses a changed or missing
+/// source. `on_submit` runs as each call arrives.
+struct RecordingVolumeManager {
+    socket: std::path::PathBuf,
+    calls: std::sync::Arc<std::sync::Mutex<Vec<(String, JobId)>>>,
+    stop: tokio_util::sync::CancellationToken,
+    _dir: tempfile::TempDir,
+}
+
+struct AcceptTransfer(JobId);
+
+impl<Req> tonic::server::UnaryService<Req> for AcceptTransfer {
+    type Response = pplx_space_volmgr_client::proto::SubmitTransferResponse;
+    type Future = std::future::Ready<Result<tonic::Response<Self::Response>, tonic::Status>>;
+
+    fn call(&mut self, _: tonic::Request<Req>) -> Self::Future {
+        std::future::ready(Ok(tonic::Response::new(
+            pplx_space_volmgr_client::proto::SubmitTransferResponse {
+                job_id: self.0.to_string(),
+            },
+        )))
+    }
+}
+
+async fn accept_transfer<Req: prost::Message + Default + Send + 'static>(
+    request: http::Request<tonic::body::Body>,
+    job_id: JobId,
+) -> http::Response<tonic::body::Body> {
+    tonic::server::Grpc::new(tonic_prost::ProstCodec::<
+        pplx_space_volmgr_client::proto::SubmitTransferResponse,
+        Req,
+    >::default())
+    .unary(AcceptTransfer(job_id), request)
+    .await
+}
+
+impl RecordingVolumeManager {
+    fn serve(refuse_send: bool) -> Self {
+        Self::serve_with(refuse_send, || {})
+    }
+
+    fn serve_with(refuse_send: bool, on_submit: impl Fn() + Clone + Send + 'static) -> Self {
+        use pplx_space_volmgr_client::proto as vol;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("volume-manager.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = std::sync::Arc::clone(&calls);
+        let rpc = tower::service_fn(move |request: http::Request<tonic::body::Body>| {
+            let method = request
+                .uri()
+                .path()
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            let job_id = JobId::new();
+            recorded.lock().unwrap().push((method.clone(), job_id));
+            on_submit();
+            async move {
+                Ok::<_, std::convert::Infallible>(match method.as_str() {
+                    "SubmitPushBtrfsSend" if refuse_send => {
+                        tonic::Status::failed_precondition("send source identity changed")
+                            .into_http()
+                    }
+                    "SubmitPushBtrfsSend" => {
+                        accept_transfer::<vol::PushBtrfsSendRequest>(request, job_id).await
+                    }
+                    "SubmitPushFile" => {
+                        accept_transfer::<vol::PushFileRequest>(request, job_id).await
+                    }
+                    _ => tonic::Status::unimplemented(method).into_http(),
+                })
+            }
+        });
+        let stop = tokio_util::sync::CancellationToken::new();
+        tokio::spawn(
+            tonic::transport::Server::builder().serve_with_incoming_shutdown(
+                rpc,
+                tokio_stream::wrappers::UnixListenerStream::new(listener),
+                stop.clone().cancelled_owned(),
+            ),
+        );
+        Self {
+            socket,
+            calls,
+            stop,
+            _dir: dir,
+        }
+    }
+
+    fn calls(&self) -> Vec<(String, JobId)> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    fn methods(&self) -> Vec<String> {
+        self.calls().into_iter().map(|(method, _)| method).collect()
+    }
+}
+
+impl Drop for RecordingVolumeManager {
+    fn drop(&mut self) {
+        self.stop.cancel();
+    }
+}
+
+/// Publish a full-codec suspend artifact `local_artifact_id` at `dir`, with
+/// its own sidecar, as a suspend's publication leaves it.
+fn publish_full_artifact(
+    dir: &std::path::Path,
+    local_artifact_id: LocalArtifactId,
+) -> SnapshotMeta {
+    std::fs::create_dir_all(dir).unwrap();
+    for (name, len) in [("vmstate", 10), ("memory", 20), ("rootfs.ext4", 30)] {
+        std::fs::write(dir.join(name), vec![0u8; len]).unwrap();
+    }
+    let mut meta = fixture_meta(None);
+    meta.local_artifact_id = Some(local_artifact_id);
+    meta.artifact_kind = Some(ArtifactKind::Full);
+    meta.artifact_origin = Some(ArtifactOrigin::Suspend);
+    write_snapshot_metadata(
+        &meta,
+        dir,
+        &vm_artifacts_for_format(SuspendSnapshotFormat::Full),
+        None,
+    )
+    .unwrap()
+}
+
+fn prepare_full_artifact(dir: &std::path::Path, meta: &SnapshotMeta) -> SnapshotUploadJobs {
+    prepare_suspend_snapshot(
+        meta,
+        &uuid::Uuid::now_v7().to_string(),
+        dir,
+        &fixture_config(),
+        ArtifactKind::Full,
+        SuspendSnapshotFormat::Full,
+        None,
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn upload_prepared_before_a_newer_publication_queues_no_transfer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let canonical = tmp.path().join("snapshot");
+    let prepared = prepare_full_artifact(
+        &canonical,
+        &publish_full_artifact(&canonical, LocalArtifactId::new()),
+    );
+    // A newer suspend publishes its own artifact over the same directory.
+    std::fs::rename(&canonical, tmp.path().join("retired")).unwrap();
+    let newer = LocalArtifactId::new();
+    publish_full_artifact(&canonical, newer);
+    let volume_manager = RecordingVolumeManager::serve(false);
+
+    let error = submit_prepared_snapshot(
+        &prepared,
+        &crate::node_manager_transport::fake::unbound_in_absent_dir(),
+        &volume_manager.socket,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(
+            error,
+            SubmitPreparedError::Superseded(Supersession { found, .. })
+                if found == newer
+        ),
+        "{error}"
+    );
+    assert_eq!(volume_manager.methods(), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn upload_of_an_unchanged_artifact_queues_every_transfer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let canonical = tmp.path().join("snapshot");
+    let prepared = prepare_full_artifact(
+        &canonical,
+        &publish_full_artifact(&canonical, LocalArtifactId::new()),
+    );
+    let volume_manager = RecordingVolumeManager::serve(false);
+
+    let submitted = submit_prepared_snapshot(
+        &prepared,
+        &crate::node_manager_transport::fake::unbound_in_absent_dir(),
+        &volume_manager.socket,
+    )
+    .await
+    .unwrap();
+
+    let calls = volume_manager.calls();
+    assert_eq!(volume_manager.methods(), vec!["SubmitPushFile"; 4]);
+    assert_eq!(
+        submitted.job_ids,
+        calls
+            .into_iter()
+            .map(|(_, job_id)| job_id)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// A deferred upload's sidecar decides its submission: one naming another
+/// artifact supersedes it before any transfer. Behind its own sidecar the
+/// upload submits the rootfs send first, so a send volume-manager refuses, as
+/// it does for a changed or missing retained source, queues nothing else and
+/// stays retriable, and the transfers keep the artifact order the worker
+/// reads results in.
+#[tokio::test]
+async fn sidecar_identity_decides_a_deferred_submission() {
+    use pplx_space_node_mgr_client::proto::{
+        BtrfsInspectSendSourceRequest, BtrfsInspectSendSourceResponse,
+    };
+    #[derive(Debug, PartialEq)]
+    enum Outcome {
+        Submitted,
+        Superseded,
+        Failed,
+    }
+    for (own_sidecar, refuse_send, methods, expected) in [
+        (
+            true,
+            false,
+            vec!["SubmitPushBtrfsSend", "SubmitPushFile", "SubmitPushFile"],
+            Outcome::Submitted,
+        ),
+        (true, true, vec!["SubmitPushBtrfsSend"], Outcome::Failed),
+        (false, false, vec![], Outcome::Superseded),
+    ] {
+        let artifact = DeferredArtifact::new();
+        let local_artifact_id = LocalArtifactId::new();
+        let mut meta = artifact.meta();
+        meta.local_artifact_id = Some(local_artifact_id);
+        meta.artifact_origin = Some(ArtifactOrigin::Suspend);
+        let found = if own_sidecar {
+            local_artifact_id
+        } else {
+            LocalArtifactId::new()
+        };
+        std::fs::write(
+            artifact.dir.join(SNAPSHOT_METADATA_FILENAME),
+            format!(r#"{{"local_artifact_id":"{found}"}}"#),
+        )
+        .unwrap();
+        let prepared = prepare_suspend_snapshot(
+            &meta,
+            &uuid::Uuid::now_v7().to_string(),
+            &artifact.dir,
+            &fixture_config(),
+            ArtifactKind::Full,
+            SuspendSnapshotFormat::BtrfsSend,
+            Some(artifact.retained(1000, true)),
+        )
+        .unwrap();
+        // Node-manager would report the retained source missing if asked.
+        // Only the sidecar decides, so submission does not ask.
+        let node_manager = crate::node_manager_transport::fake::FakeNodeManager::default()
+            .unary(
+                "BtrfsInspectSendSource",
+                |_: BtrfsInspectSendSourceRequest| {
+                    Err::<BtrfsInspectSendSourceResponse, _>(tonic::Status::not_found(
+                        "no retained source",
+                    ))
+                },
+            )
+            .serve();
+        let volume_manager = RecordingVolumeManager::serve(refuse_send);
+
+        let result =
+            submit_prepared_snapshot(&prepared, &node_manager.connector(), &volume_manager.socket)
+                .await;
+
+        let case = format!("own_sidecar={own_sidecar} refuse_send={refuse_send}: {result:?}");
+        let outcome = match &result {
+            Ok(_) => Outcome::Submitted,
+            Err(SubmitPreparedError::Superseded(superseded)) if superseded.found == found => {
+                Outcome::Superseded
+            }
+            Err(SubmitPreparedError::Superseded(_)) => panic!("{case}"),
+            Err(SubmitPreparedError::Failed(_)) => Outcome::Failed,
+        };
+        assert_eq!(outcome, expected, "{case}");
+        assert_eq!(volume_manager.methods(), methods, "{case}");
+        if let Ok(submitted) = result {
+            let send = upload_artifacts_for_meta(&submitted.meta)
+                .iter()
+                .position(|artifact| artifact.kind == SnapshotArtifact::RootfsBtrfsSend)
+                .unwrap();
+            assert_eq!(
+                submitted.job_ids[send],
+                volume_manager.calls()[0].1,
+                "{case}"
+            );
+        }
+        cleanup_metadata_staging_dir(&prepared);
+    }
+}
+
+/// After the last transfer, only a sidecar still naming the upload proves
+/// the transfers were its files. A newer suspend publishing while the upload
+/// submits supersedes it, although every transfer was queued. A directory
+/// gone after the last submission proves nothing and fails as retriable: the
+/// submissions before it can have staged a newer suspend's files.
+#[tokio::test]
+async fn submission_ends_with_the_sidecar_naming_the_upload() {
+    #[derive(Clone, Copy, Debug)]
+    enum Change {
+        /// A newer suspend publishes as the first transfer is submitted.
+        Republish,
+        /// The directory moves away as the last transfer is submitted.
+        Remove,
+    }
+    for change in [Change::Republish, Change::Remove] {
+        let tmp = tempfile::tempdir().unwrap();
+        let canonical = tmp.path().join("snapshot");
+        let prepared = prepare_full_artifact(
+            &canonical,
+            &publish_full_artifact(&canonical, LocalArtifactId::new()),
+        );
+        let newer = LocalArtifactId::new();
+        let on_submit = {
+            let (canonical, retired) = (canonical.clone(), tmp.path().join("retired"));
+            let submitted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            move || {
+                let call = submitted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                match change {
+                    Change::Republish if call == 1 => {
+                        std::fs::rename(&canonical, &retired).unwrap();
+                        publish_full_artifact(&canonical, newer);
+                    }
+                    Change::Remove if call == 4 => std::fs::rename(&canonical, &retired).unwrap(),
+                    Change::Republish | Change::Remove => {}
+                }
+            }
+        };
+        let volume_manager = RecordingVolumeManager::serve_with(false, on_submit);
+
+        let error = submit_prepared_snapshot(
+            &prepared,
+            &crate::node_manager_transport::fake::unbound_in_absent_dir(),
+            &volume_manager.socket,
+        )
+        .await
+        .unwrap_err();
+
+        match change {
+            Change::Republish => assert!(
+                matches!(&error, SubmitPreparedError::Superseded(superseded) if superseded.found == newer),
+                "{change:?}: {error}"
+            ),
+            Change::Remove => assert!(
+                matches!(error, SubmitPreparedError::Failed(_)),
+                "{change:?}: {error}"
+            ),
+        }
+        assert_eq!(
+            volume_manager.methods(),
+            vec!["SubmitPushFile"; 4],
+            "{change:?}"
+        );
+    }
+}
+
+/// An imported artifact's sidecar names the exporter's id, and its backup
+/// adopts a fresh one. A btrfs-send import stages its uploaded metadata and
+/// leaves that sidecar in place; a full-codec import rewrites it with the
+/// adopted id. Either way only a newer publication supersedes the upload.
+#[tokio::test]
+async fn imported_artifact_is_superseded_only_by_a_newer_publication() {
+    for (format, republished) in [
+        (SuspendSnapshotFormat::BtrfsSend, false),
+        (SuspendSnapshotFormat::Full, false),
+        (SuspendSnapshotFormat::BtrfsSend, true),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let canonical = tmp.path().join("snapshot");
+        let exporter = LocalArtifactId::new();
+        let mut meta = publish_full_artifact(&canonical, exporter);
+        if format == SuspendSnapshotFormat::BtrfsSend {
+            // The export carried the materialized stream and the sidecar
+            // naming its retained source, but not the source.
+            std::fs::remove_file(canonical.join(ROOTFS_FULL_FILENAME)).unwrap();
+            std::fs::write(canonical.join(ROOTFS_BTRFS_SEND_FILENAME), [0u8; 30]).unwrap();
+            meta.rootfs_diff_format = Some(ROOTFS_DIFF_FORMAT_BTRFS_SEND_V1.to_owned());
+            meta.rootfs_send_source_id = Some(uuid::Uuid::now_v7());
+            meta =
+                write_snapshot_metadata(&meta, &canonical, &vm_artifacts_for_format(format), None)
+                    .unwrap();
+        }
+        meta.local_artifact_id = Some(LocalArtifactId::new());
+        let mut prepared = prepare_suspend_snapshot(
+            &meta,
+            &uuid::Uuid::now_v7().to_string(),
+            &canonical,
+            &fixture_config(),
+            ArtifactKind::Full,
+            format,
+            None,
+        )
+        .unwrap();
+        // Recorded as the backup's submission read it.
+        prepared.sidecar_artifact_id = Some(exporter);
+        let newer = LocalArtifactId::new();
+        if republished {
+            std::fs::rename(&canonical, tmp.path().join("retired")).unwrap();
+            publish_full_artifact(&canonical, newer);
+        }
+        let volume_manager = RecordingVolumeManager::serve(false);
+
+        let result = submit_prepared_snapshot(
+            &prepared,
+            &crate::node_manager_transport::fake::unbound_in_absent_dir(),
+            &volume_manager.socket,
+        )
+        .await;
+
+        let case = format!("{format:?} republished={republished}: {result:?}");
+        if republished {
+            assert!(
+                matches!(&result, Err(SubmitPreparedError::Superseded(superseded)) if superseded.found == newer),
+                "{case}"
+            );
+            assert_eq!(volume_manager.methods(), Vec::<String>::new(), "{case}");
+        } else {
+            assert!(result.is_ok(), "{case}");
+            assert_eq!(
+                volume_manager.methods(),
+                vec!["SubmitPushFile"; 4],
+                "{case}"
+            );
+        }
+        cleanup_metadata_staging_dir(&prepared);
+    }
+}
+
+/// Only a suspend publishes over a directory, and only over the canonical
+/// one, so a sidecar naming another artifact supersedes no other upload.
+#[tokio::test]
+async fn sidecar_identity_supersedes_only_a_canonical_suspend_upload() {
+    for (origin, dir_name) in [
+        (ArtifactOrigin::Snapshot, "snapshot"),
+        (ArtifactOrigin::Suspend, "elsewhere"),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(dir_name);
+        let mut meta = publish_full_artifact(&dir, LocalArtifactId::new());
+        meta.artifact_origin = Some(origin);
+        let prepared = prepare_full_artifact(&dir, &meta);
+        // The sidecar now names another artifact.
+        publish_full_artifact(&dir, LocalArtifactId::new());
+        let volume_manager = RecordingVolumeManager::serve(false);
+
+        let submitted = submit_prepared_snapshot(
+            &prepared,
+            &crate::node_manager_transport::fake::unbound_in_absent_dir(),
+            &volume_manager.socket,
+        )
+        .await;
+
+        let case = format!("{origin:?} in {dir_name}");
+        assert!(submitted.is_ok(), "{case}: {submitted:?}");
+        assert_eq!(
+            volume_manager.methods(),
+            vec!["SubmitPushFile"; 4],
+            "{case}"
+        );
+    }
 }
