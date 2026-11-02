@@ -4164,6 +4164,24 @@ pub(crate) mod service_tests {
         ] {
             assert_eq!(result.unwrap_err().code(), tonic::Code::Internal);
         }
+        // The pool-member filter never lists the undecodable non-member, so
+        // pool counting does not fail on it.
+        let members = service
+            .list(tmplmgr_request(ListRequest {
+                pool_members_only: true,
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            members
+                .sandboxes
+                .iter()
+                .map(|sandbox| sandbox.sandbox_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![pool_sandbox.as_str()]
+        );
     }
 
     async fn list_all_pages(
@@ -4171,12 +4189,22 @@ pub(crate) mod service_tests {
         tmplmgr: bool,
         page_size: u32,
     ) -> Vec<Vec<SandboxListElement>> {
+        list_all_selected_pages(service, tmplmgr, page_size, false).await
+    }
+
+    async fn list_all_selected_pages(
+        service: &SandboxManagerService,
+        tmplmgr: bool,
+        page_size: u32,
+        pool_members_only: bool,
+    ) -> Vec<Vec<SandboxListElement>> {
         let mut pages = Vec::new();
         let mut page_token = String::new();
         loop {
             let request = ListRequest {
                 page_size,
                 page_token,
+                pool_members_only,
             };
             let request = if tmplmgr {
                 tmplmgr_request(request)
@@ -4203,16 +4231,28 @@ pub(crate) mod service_tests {
             })
             .collect::<Vec<_>>();
         ids.sort();
-        // Only the last sandbox is template-manager-owned, so earlier pages
-        // are empty for a template-manager peer yet must continue the scan.
-        conn.execute(
-            "UPDATE sandboxes SET user = ?2 WHERE id = ?1",
-            crate::db::fixture::params![
-                ids[4],
-                pplx_space_common_core::types::TEMPLATE_MANAGER_SANDBOX_OWNER.as_str()
-            ],
-        )
-        .unwrap();
+        // Only the third and last sandboxes are template-manager-owned, so the
+        // first page is empty for a template-manager peer yet must continue
+        // the scan.
+        for id in [&ids[2], &ids[4]] {
+            conn.execute(
+                "UPDATE sandboxes SET user = ?2 WHERE id = ?1",
+                crate::db::fixture::params![
+                    id,
+                    pplx_space_common_core::types::TEMPLATE_MANAGER_SANDBOX_OWNER.as_str()
+                ],
+            )
+            .unwrap();
+        }
+        // Two warm-pool members, only the last of them template-manager-owned.
+        // The unfiltered listings below must still return every sandbox.
+        for id in [&ids[1], &ids[4]] {
+            conn.execute(
+                "UPDATE sandboxes SET pool_template = 'seed' WHERE id = ?1",
+                [id],
+            )
+            .unwrap();
+        }
         let service = service_for_teardown_test(conn);
 
         let pages = list_all_pages(&service, false, 2).await;
@@ -4230,20 +4270,94 @@ pub(crate) mod service_tests {
         let pages = list_all_pages(&service, true, 2).await;
         assert_eq!(
             pages.iter().map(Vec::len).collect::<Vec<_>>(),
-            vec![0, 0, 1]
+            vec![0, 1, 1]
         );
+        assert_eq!(pages[1][0].sandbox_id, ids[2]);
         assert_eq!(pages[2][0].sandbox_id, ids[4]);
+
+        // The pool-member filter pages over only the members; a
+        // template-manager peer still sees only the members it owns.
+        let pages = list_all_selected_pages(&service, false, 1, true).await;
+        let listed = pages
+            .into_iter()
+            .map(|page| {
+                page.into_iter()
+                    .map(|sandbox| sandbox.sandbox_id)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(listed, vec![vec![ids[1].clone()], vec![ids[4].clone()]]);
+        let pages = list_all_selected_pages(&service, true, 128, true).await;
+        assert_eq!(pages.len(), 1);
+        assert_eq!(
+            pages[0]
+                .iter()
+                .map(|sandbox| sandbox.sandbox_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![ids[4].as_str()]
+        );
 
         assert_eq!(
             service
                 .list(internal_request(ListRequest {
                     page_size: 1,
                     page_token: "x".repeat(257),
+                    pool_members_only: false,
                 }))
                 .await
                 .unwrap_err()
                 .code(),
             tonic::Code::InvalidArgument
+        );
+        service.shutdown_token.cancel();
+        service.task_tracker.close();
+        service.task_tracker.wait().await;
+    }
+
+    #[tokio::test]
+    async fn pool_member_list_continues_past_a_window_without_members() {
+        let window = crate::db::inventory_read::POOL_MEMBER_WINDOW_ROWS;
+        let conn = crate::db::test_conn();
+        let mut ids = (0..=window)
+            .map(|_| {
+                let id = SandboxId::new().to_string();
+                insert_test_sandbox(&conn, &id, SandboxState::Started);
+                id
+            })
+            .collect::<Vec<_>>();
+        ids.sort();
+        // Only the row past the first window is a template-manager pool member.
+        conn.execute(
+            "UPDATE sandboxes SET user = ?2, pool_template = 'seed' WHERE id = ?1",
+            crate::db::fixture::params![
+                &ids[window],
+                pplx_space_common_core::types::TEMPLATE_MANAGER_SANDBOX_OWNER.as_str()
+            ],
+        )
+        .unwrap();
+        let service = service_for_teardown_test(conn);
+
+        let first = service
+            .list(tmplmgr_request(ListRequest {
+                page_size: 128,
+                page_token: String::new(),
+                pool_members_only: true,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(first.sandboxes.is_empty());
+        assert_eq!(first.next_page_token, ids[window - 1]);
+        let pages = Box::pin(list_all_selected_pages(&service, true, 128, true)).await;
+        assert_eq!(
+            pages
+                .iter()
+                .map(|page| page
+                    .iter()
+                    .map(|sandbox| sandbox.sandbox_id.as_str())
+                    .collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            vec![vec![], vec![ids[window].as_str()]]
         );
         service.shutdown_token.cancel();
         service.task_tracker.close();
@@ -4283,6 +4397,63 @@ pub(crate) mod service_tests {
         assert_eq!(
             degraded.lifecycle,
             Some(crate::proto::SandboxLifecycleState::Started as i32)
+        );
+        service.shutdown_token.cancel();
+        service.task_tracker.close();
+        service.task_tracker.wait().await;
+    }
+
+    #[tokio::test]
+    async fn an_encoded_budget_split_continues_a_pool_member_page_after_its_last_listed_member() {
+        use pplx_space_common_core::inventory::MAX_ENCODED_BYTES;
+        let window = crate::db::inventory_read::POOL_MEMBER_WINDOW_ROWS;
+        let conn = crate::db::test_conn();
+        let mut ids = (0..=window)
+            .map(|_| {
+                let id = SandboxId::new().to_string();
+                insert_test_sandbox(&conn, &id, SandboxState::Started);
+                id
+            })
+            .collect::<Vec<_>>();
+        ids.sort();
+        // Two template-manager pool members in the first window that fit the
+        // raw budget together but not one encoded page, so the store's page
+        // continues after the window while the response must stop after the
+        // first member.
+        let template = "t".repeat(MAX_ENCODED_BYTES / 2 + 1);
+        for id in &ids[..2] {
+            conn.execute(
+                "UPDATE sandboxes SET template = ?2, user = ?3, pool_template = 'seed' WHERE id = ?1",
+                crate::db::fixture::params![
+                    id,
+                    template,
+                    pplx_space_common_core::types::TEMPLATE_MANAGER_SANDBOX_OWNER.as_str()
+                ],
+            )
+            .unwrap();
+        }
+        let service = service_for_teardown_test(conn);
+
+        let first = service
+            .list(tmplmgr_request(ListRequest {
+                page_size: 128,
+                page_token: String::new(),
+                pool_members_only: true,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(first.next_page_token, ids[0]);
+        let pages = Box::pin(list_all_selected_pages(&service, true, 128, true)).await;
+        assert_eq!(
+            pages
+                .iter()
+                .map(|page| page
+                    .iter()
+                    .map(|sandbox| sandbox.sandbox_id.as_str())
+                    .collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            vec![vec![ids[0].as_str()], vec![ids[1].as_str()]]
         );
         service.shutdown_token.cancel();
         service.task_tracker.close();

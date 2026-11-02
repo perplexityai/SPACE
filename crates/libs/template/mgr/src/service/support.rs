@@ -18,12 +18,13 @@ impl Drop for ImportGuard {
 
 type PoolSandboxListFn = dyn Fn(
         pplx_space_sbx_mgr_client::GrpcRetryPolicy,
+        pplx_space_sbx_mgr_client::ListSelection,
     ) -> futures_util::future::BoxFuture<'static, Vec<sbx_proto::SandboxListElement>>
     + Send
     + Sync;
 
-/// Lists the node's sandboxes for the pool counts `ListTemplates` and
-/// `PoolStatus` report.
+/// Lists the node's sandboxes, as selected, for the pool counts
+/// `ListTemplates` and `PoolStatus` report.
 #[derive(Clone)]
 pub(super) struct PoolSandboxLister(Arc<PoolSandboxListFn>);
 
@@ -31,6 +32,7 @@ impl PoolSandboxLister {
     pub(super) fn new(
         list: impl Fn(
             pplx_space_sbx_mgr_client::GrpcRetryPolicy,
+            pplx_space_sbx_mgr_client::ListSelection,
         )
             -> futures_util::future::BoxFuture<'static, Vec<sbx_proto::SandboxListElement>>
         + Send
@@ -44,14 +46,14 @@ impl PoolSandboxLister {
     /// sandbox-manager reads as no sandboxes, so the counts report zero
     /// instead of failing the reply.
     pub(super) fn sandbox_manager() -> Self {
-        Self::new(|retry_policy| {
+        Self::new(|retry_policy, selection| {
             Box::pin(async move {
                 let Ok(mut client) =
                     pplx_space_sbx_mgr_client::connect_with_retry_policy(retry_policy).await
                 else {
                     return Vec::new();
                 };
-                pplx_space_sbx_mgr_client::list_all_sandboxes(&mut client)
+                pplx_space_sbx_mgr_client::list_sandboxes(&mut client, selection)
                     .await
                     .unwrap_or_default()
             })
@@ -61,7 +63,9 @@ impl PoolSandboxLister {
 
 impl TemplateManagerService {
     /// The sandboxes pool counts are computed from, or none when the caller
-    /// asked to omit the counts.
+    /// asked to omit the counts. Only pool members can count, so only they are
+    /// asked for; a sandbox-manager that ignores the filter returns every
+    /// sandbox, which the callers' own classification still counts correctly.
     pub(super) async fn pool_count_sandboxes(
         &self,
         omit_sandbox_counts: bool,
@@ -69,7 +73,11 @@ impl TemplateManagerService {
         if omit_sandbox_counts {
             return Vec::new();
         }
-        (self.pool_sandbox_lister.0)(self.sbx_connect_retry_policy).await
+        (self.pool_sandbox_lister.0)(
+            self.sbx_connect_retry_policy,
+            pplx_space_sbx_mgr_client::ListSelection::PoolMembers,
+        )
+        .await
     }
 }
 

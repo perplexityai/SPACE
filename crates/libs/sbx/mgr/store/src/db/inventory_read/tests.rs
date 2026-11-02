@@ -91,13 +91,14 @@ fn list_pages_cover_every_row_once_in_id_order() {
     let mut seen = Vec::new();
     let mut after = String::new();
     loop {
-        let page = list_page(&conn, &after, 2).unwrap();
+        let page = list_page(&conn, &after, 2, ListPageScope::All).unwrap();
         assert!(page.rows.len() <= 2);
         seen.extend(page_ids(&page));
-        if !page.more {
+        let Some(next_after) = page.next_after else {
             break;
-        }
-        after = page.rows.last().unwrap().id().to_owned();
+        };
+        assert_eq!(next_after, seen.last().unwrap().as_str());
+        after = next_after;
     }
     assert_eq!(seen, ids);
 }
@@ -117,12 +118,12 @@ fn list_page_ends_early_at_the_raw_budget_and_rejects_only_a_single_oversized_ro
         rusqlite::params![ids[2], template],
     )
     .unwrap();
-    let page = list_page(&conn, "", MAX_ITEMS).unwrap();
+    let page = list_page(&conn, "", MAX_ITEMS, ListPageScope::All).unwrap();
     assert_eq!(page_ids(&page), ids[..2]);
-    assert!(page.more);
-    let page = list_page(&conn, &ids[1], MAX_ITEMS).unwrap();
+    assert_eq!(page.next_after.as_ref(), Some(&ids[1]));
+    let page = list_page(&conn, &ids[1], MAX_ITEMS, ListPageScope::All).unwrap();
     assert_eq!(page_ids(&page), ids[2..]);
-    assert!(!page.more);
+    assert_eq!(page.next_after, None);
 
     conn.execute(
         "UPDATE sandboxes SET template = ?2 WHERE id = ?1",
@@ -130,7 +131,7 @@ fn list_page_ends_early_at_the_raw_budget_and_rejects_only_a_single_oversized_ro
     )
     .unwrap();
     assert!(matches!(
-        list_page(&conn, "", MAX_ITEMS),
+        list_page(&conn, "", MAX_ITEMS, ListPageScope::All),
         Err(InventoryReadError::Limit(_))
     ));
 }
@@ -141,11 +142,101 @@ fn list_page_keeps_the_identity_of_an_undecodable_row() {
     let ids = insert_listed(&conn, 2);
     conn.execute("UPDATE sandboxes SET user = '' WHERE id = ?1", [&ids[0]])
         .unwrap();
-    let page = list_page(&conn, "", MAX_ITEMS).unwrap();
+    let page = list_page(&conn, "", MAX_ITEMS, ListPageScope::All).unwrap();
     assert_eq!(page_ids(&page), ids);
     assert!(matches!(
         &page.rows[0],
         ListPageRow::Undecodable { state: Some(state), .. } if state == "started"
     ));
     assert!(matches!(page.rows[1], ListPageRow::Decoded(_)));
+}
+
+fn make_pool_members(conn: &Connection, ids: &[&String]) {
+    for id in ids {
+        conn.execute(
+            "UPDATE sandboxes SET pool_template = 'seed' WHERE id = ?1",
+            [id],
+        )
+        .unwrap();
+    }
+}
+
+/// Every page of a scan, with the cursor each one continues after.
+fn scan_pages(
+    conn: &Connection,
+    limit: usize,
+    scope: ListPageScope,
+) -> Vec<(Vec<String>, Option<String>)> {
+    let mut pages = Vec::new();
+    let mut after = String::new();
+    loop {
+        let page = list_page(conn, &after, limit, scope).unwrap();
+        pages.push((page_ids(&page), page.next_after.clone()));
+        match page.next_after {
+            Some(next_after) => after = next_after,
+            None => return pages,
+        }
+    }
+}
+
+#[test]
+fn pool_member_pages_examine_one_window_each_and_continue_past_empty_ones() {
+    const WINDOW: usize = POOL_MEMBER_WINDOW_ROWS;
+    let conn = crate::db::test_conn();
+    // Three full windows; the second holds no member and the third ends at the
+    // table's last row.
+    let ids = insert_listed(&conn, 3 * WINDOW);
+    make_pool_members(
+        &conn,
+        &[&ids[5], &ids[2 * WINDOW + 10], &ids[3 * WINDOW - 1]],
+    );
+    assert_eq!(
+        scan_pages(&conn, MAX_ITEMS, ListPageScope::PoolMembers),
+        vec![
+            (vec![ids[5].clone()], Some(ids[WINDOW - 1].clone())),
+            (vec![], Some(ids[2 * WINDOW - 1].clone())),
+            (
+                vec![ids[2 * WINDOW + 10].clone(), ids[3 * WINDOW - 1].clone()],
+                None
+            ),
+        ]
+    );
+}
+
+#[test]
+fn a_pool_member_page_the_budget_fills_continues_after_its_last_member() {
+    let conn = crate::db::test_conn();
+    let ids = insert_listed(&conn, 8);
+    make_pool_members(&conn, &[&ids[1], &ids[2], &ids[4], &ids[6]]);
+    assert_eq!(
+        scan_pages(&conn, 2, ListPageScope::PoolMembers),
+        vec![
+            (vec![ids[1].clone(), ids[2].clone()], Some(ids[2].clone())),
+            (vec![ids[4].clone(), ids[6].clone()], None),
+        ]
+    );
+}
+
+#[test]
+fn a_pool_member_the_raw_budget_refuses_at_the_window_end_continues_after_the_last_member() {
+    const WINDOW: usize = POOL_MEMBER_WINDOW_ROWS;
+    let conn = crate::db::test_conn();
+    let ids = insert_listed(&conn, WINDOW + 1);
+    // The second member is the window's last row, so the window end is already
+    // recorded when the raw budget refuses it.
+    let template = "t".repeat(MAX_RAW_BYTES / 2);
+    for id in [&ids[0], &ids[WINDOW - 1]] {
+        conn.execute(
+            "UPDATE sandboxes SET template = ?2, pool_template = 'seed' WHERE id = ?1",
+            rusqlite::params![id, template],
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        scan_pages(&conn, MAX_ITEMS, ListPageScope::PoolMembers),
+        vec![
+            (vec![ids[0].clone()], Some(ids[0].clone())),
+            (vec![ids[WINDOW - 1].clone()], None),
+        ]
+    );
 }

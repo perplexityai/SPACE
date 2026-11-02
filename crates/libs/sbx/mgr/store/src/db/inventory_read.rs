@@ -137,36 +137,89 @@ impl ListPageRow {
     }
 }
 
+/// Which rows a List page scans.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListPageScope {
+    All,
+    /// Warm-pool members: rows with `pool_template` set. No index covers it, so
+    /// a page examines a window of [`POOL_MEMBER_WINDOW_ROWS`] rows after the
+    /// cursor and returns the members among them, which keeps each page's lock
+    /// hold proportional to the window rather than to the table. When the
+    /// budget refuses a further member, the page continues after its last
+    /// member; otherwise it continues after the window's last row, or ends the
+    /// scan when the window reached the table's last row. A page may therefore
+    /// come back short, or empty, and still continue.
+    PoolMembers,
+}
+
+/// Rows a `PoolMembers` page examines. The page skips non-members before
+/// charging or decoding them, so a window of this size holds the database lock
+/// about as long as an `All` page of `READ_BATCH_ITEMS` rows. Where members are
+/// sparse, a scan takes a quarter as many pages as an unfiltered one.
+pub const POOL_MEMBER_WINDOW_ROWS: usize = 512;
+
 pub struct ListPage {
     pub rows: Vec<ListPageRow>,
-    /// Rows remain after the last scanned row.
-    pub more: bool,
+    /// The id the next page scans after, or `None` once the scan has examined
+    /// every row.
+    pub next_after: Option<String>,
 }
 
 db_private_outside_tests! {
-    /// Scan up to `limit` rows with IDs after `after`, in ID order. The page ends
-    /// early rather than exceed the raw budget; only a single row over the budget
-    /// is an error. Keying on the immutable primary key keeps every row present for
-    /// the whole scan on exactly one page.
+    /// Scan up to `limit` rows in `scope` with IDs after `after`, in ID order:
+    /// the next `limit` rows for `All`, or the members among the next
+    /// [`POOL_MEMBER_WINDOW_ROWS`] rows for `PoolMembers`. The page ends early
+    /// rather than exceed the raw budget; only a single row over the budget is
+    /// an error. `next_after` is the cursor the next page continues after.
+    /// Keying on the immutable primary key keeps every row present for the
+    /// whole scan on exactly one page.
     fn list_page(
         conn: &Connection,
         after: &str,
         limit: usize,
+        scope: ListPageScope,
     ) -> Result<ListPage, InventoryReadError> {
+        // An `All` page reads one row past `limit`, which the budget refuses
+        // and which proves more rows remain. A `PoolMembers` page reads its
+        // window and one row past it, which proves the same.
+        let (fetch, window) = match scope {
+            ListPageScope::All => (limit.saturating_add(1), None),
+            ListPageScope::PoolMembers => {
+                (POOL_MEMBER_WINDOW_ROWS + 1, Some(POOL_MEMBER_WINDOW_ROWS))
+            }
+        };
         let mut stmt = conn.prepare_cached(&format!(
             "SELECT {LIST_COLUMNS} FROM sandboxes WHERE id > ?1 ORDER BY id LIMIT ?2"
         ))?;
-        let fetch = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+        let fetch = i64::try_from(fetch).unwrap_or(i64::MAX);
         let mut rows = stmt.query(rusqlite::params![after, fetch])?;
         let mut budget = InventoryBudget::new(limit, MAX_RAW_BYTES);
-        let mut page = Vec::new();
+        let mut page: Vec<ListPageRow> = Vec::new();
+        let mut examined = 0usize;
+        let mut window_end = None;
         while let Some(row) = rows.next()? {
+            if let Some(window) = window {
+                if examined == window {
+                    return Ok(ListPage {
+                        rows: page,
+                        next_after: window_end,
+                    });
+                }
+                examined += 1;
+                if examined == window {
+                    window_end = Some(row.get("id")?);
+                }
+                if matches!(row.get_ref("pool_template")?, ValueRef::Null) {
+                    continue;
+                }
+            }
             match check_row(row, &mut budget) {
                 Ok(()) => {}
                 Err(InventoryReadError::Limit(_)) if !page.is_empty() => {
+                    let next_after = page.last().map(|row| row.id().to_owned());
                     return Ok(ListPage {
                         rows: page,
-                        more: true,
+                        next_after,
                     });
                 }
                 Err(error) => return Err(error),
@@ -182,7 +235,7 @@ db_private_outside_tests! {
         }
         Ok(ListPage {
             rows: page,
-            more: false,
+            next_after: None,
         })
     }
 }

@@ -134,11 +134,37 @@ const LIST_PAGE_SIZE: u32 = {
     size as u32
 };
 
+/// Which sandboxes a paged [`list_sandboxes`] read asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListSelection {
+    /// Every sandbox the caller may observe.
+    All,
+    /// Only warm-pool members (`pool_template` set). A sandbox-manager that
+    /// predates the filter ignores it and lists every sandbox, so the caller
+    /// must still classify each row it receives.
+    PoolMembers,
+}
+
+impl ListSelection {
+    fn pool_members_only(self) -> bool {
+        self == Self::PoolMembers
+    }
+}
+
 /// Read every sandbox through paged `List`. Each sandbox present for the whole
 /// scan appears exactly once; see the RPC contract for concurrent changes. An
 /// empty `next_page_token` ends the scan.
 pub async fn list_all_sandboxes(
     client: &mut SandboxManagerGrpcClient,
+) -> Result<Vec<proto::SandboxListElement>, tonic::Status> {
+    list_sandboxes(client, ListSelection::All).await
+}
+
+/// Read the sandboxes `selection` asks for through paged `List`, with the
+/// paging contract of [`list_all_sandboxes`].
+pub async fn list_sandboxes(
+    client: &mut SandboxManagerGrpcClient,
+    selection: ListSelection,
 ) -> Result<Vec<proto::SandboxListElement>, tonic::Status> {
     let mut sandboxes = Vec::new();
     let mut page_token = String::new();
@@ -147,6 +173,7 @@ pub async fn list_all_sandboxes(
             .list(proto::ListRequest {
                 page_size: LIST_PAGE_SIZE,
                 page_token: page_token.clone(),
+                pool_members_only: selection.pool_members_only(),
             })
             .await?
             .into_inner();
