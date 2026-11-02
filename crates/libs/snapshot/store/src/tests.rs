@@ -518,93 +518,157 @@ async fn another_attempts_registration_of_an_artifact_is_found() -> TestResult {
     Ok(())
 }
 
-/// Each catalog snapshot reads as in the object store when it is `ready` with
-/// a live location, and as node-local on the sandbox's node when it is the
-/// current local artifact; one can be both or neither.
+/// A catalog snapshot is in the object store only when it is `ready` with a
+/// live location, and node-local on the sandbox's node only when it is the
+/// current local artifact of a sandbox settled in `suspended` or `stopped`.
+/// During a move the placement columns may already name the destination, so
+/// a `restoring` sandbox reports no node-local copy.
 #[tokio::test(flavor = "current_thread")]
 async fn storage_placements_report_object_store_and_node_copies() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
-    let node_id = NodeId::new();
-    pplx_space_db_test_fixtures::insert_ready_worker_node(&db.pool, node_id).await?;
-    let current = LocalArtifactId::new();
-    let sandbox_id = SandboxId::new();
+    let source = NodeId::new();
+    let destination = NodeId::new();
+    for node in [source, destination] {
+        pplx_space_db_test_fixtures::insert_ready_worker_node(&db.pool, node).await?;
+    }
     let unsnapshotted = SandboxId::new();
-    for (id, artifact) in [(sandbox_id, Some(current)), (unsnapshotted, None)] {
-        sqlx::query(sql!(
-            "INSERT INTO sandboxes (id, user_id, org_id, network_policy_generation, lifecycle,
-                                    placement, target_node_id, current_local_artifact_id,
-                                    current_local_artifact_kind, current_local_artifact_origin)
-             VALUES ($1, $2::UUID, $3::UUID, 1, 'suspended', 'placed', $4, $5,
-                     CASE WHEN $5::UUID IS NULL THEN NULL ELSE 'full' END,
-                     CASE WHEN $5::UUID IS NULL THEN NULL ELSE 'suspend' END)"
-        ))
-        .bind(id)
-        .bind(SEEDED_USER_ID)
-        .bind(SEEDED_ORG_ID)
-        .bind(node_id)
-        .bind(artifact.map(LocalArtifactId::as_uuid))
-        .execute(&db.pool)
-        .await?;
-    }
-    // (state, artifact, location orphaned?, minutes ago), newest first.
-    let rows = [
-        ("creating", current, None, 1),
-        ("ready", current, Some(false), 2),
-        ("ready", LocalArtifactId::new(), Some(false), 3),
-        ("ready", LocalArtifactId::new(), Some(true), 4),
-    ];
-    let mut ids = Vec::new();
-    for (state, artifact, orphaned, minutes_ago) in rows {
-        let snapshot_id = SnapshotId::new();
-        sqlx::query(sql!(
-            "INSERT INTO snapshots (id, sandbox_id, type, state, timestamp, org_id,
-                                    local_artifact_id, artifact_kind, artifact_origin)
-             VALUES ($1, $2, 'full', $3, NOW() - make_interval(mins => $4), $5::UUID, $6,
-                     'full', 'suspend')"
-        ))
-        .bind(snapshot_id.as_uuid())
-        .bind(sandbox_id)
-        .bind(state)
-        .bind(minutes_ago)
-        .bind(SEEDED_ORG_ID)
-        .bind(artifact.as_uuid())
-        .execute(&db.pool)
-        .await?;
-        if let Some(orphaned) = orphaned {
-            sqlx::query(sql!(
-                "INSERT INTO snapshot_storage_locations
-                     (snapshot_id, storage_connection_string, org_id, orphaned_at)
-                 VALUES ($1, 's3://synthetic-bucket/snapshots/x', $2::UUID,
-                         CASE WHEN $3 THEN NOW() END)"
-            ))
-            .bind(snapshot_id.as_uuid())
-            .bind(SEEDED_ORG_ID)
-            .bind(orphaned)
-            .execute(&db.pool)
-            .await?;
-        }
-        ids.push(snapshot_id);
-    }
-
-    let placements = super::storage_placements(&db.pool, sandbox_id).await?;
-    assert_eq!(
-        placements
-            .iter()
-            .map(|p| (p.snapshot_id, p.in_object_store, p.node_local_node_id))
-            .collect::<Vec<_>>(),
-        vec![
-            (ids[0], false, Some(node_id)),
-            (ids[1], true, Some(node_id)),
-            (ids[2], true, None),
-            (ids[3], false, None),
-        ]
-    );
+    insert_placed_sandbox(
+        &db.pool,
+        unsnapshotted,
+        "suspended",
+        Some(source),
+        None,
+        None,
+    )
+    .await?;
     assert!(
         super::storage_placements(&db.pool, unsnapshotted)
             .await?
             .is_empty()
     );
+
+    // (lifecycle, target, active) -> the node a current artifact is local to.
+    for (lifecycle, target, active, expected_node) in [
+        ("suspended", Some(source), None, Some(source)),
+        ("stopped", None, Some(source), Some(source)),
+        // A restore onto another node, once its pod is scheduled.
+        ("restoring", Some(destination), Some(destination), None),
+        ("started", Some(source), Some(source), None),
+    ] {
+        let current = LocalArtifactId::new();
+        let sandbox_id = SandboxId::new();
+        insert_placed_sandbox(
+            &db.pool,
+            sandbox_id,
+            lifecycle,
+            target,
+            active,
+            Some(current),
+        )
+        .await?;
+        // (state, artifact, location orphaned?) newest first.
+        let rows = [
+            ("creating", current, Some(false)),
+            ("ready", current, Some(false)),
+            ("failed", LocalArtifactId::new(), Some(false)),
+            ("ready", LocalArtifactId::new(), Some(false)),
+            ("ready", LocalArtifactId::new(), Some(true)),
+            ("ready", LocalArtifactId::new(), None),
+        ];
+        let mut ids = Vec::new();
+        for (age, (state, artifact, orphaned)) in rows.into_iter().enumerate() {
+            ids.push(insert_snapshot(&db.pool, sandbox_id, state, artifact, orphaned, age).await?);
+        }
+        let current_node = expected_node;
+        assert_eq!(
+            super::storage_placements(&db.pool, sandbox_id)
+                .await?
+                .iter()
+                .map(|p| (p.snapshot_id, p.in_object_store, p.node_local_node_id))
+                .collect::<Vec<_>>(),
+            vec![
+                // Uploading: a live location does not make it stored yet.
+                (ids[0], false, current_node),
+                (ids[1], true, current_node),
+                (ids[2], false, None),
+                (ids[3], true, None),
+                (ids[4], false, None),
+                (ids[5], false, None),
+            ],
+            "{lifecycle}"
+        );
+    }
     Ok(())
+}
+
+async fn insert_placed_sandbox(
+    pool: &sqlx::PgPool,
+    sandbox_id: SandboxId,
+    lifecycle: &str,
+    target: Option<NodeId>,
+    active: Option<NodeId>,
+    artifact: Option<LocalArtifactId>,
+) -> TestResult {
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (id, user_id, org_id, network_policy_generation, lifecycle,
+                                placement, target_node_id, active_node_id,
+                                current_local_artifact_id, current_local_artifact_kind,
+                                current_local_artifact_origin)
+         VALUES ($1, $2::UUID, $3::UUID, 1, $4, 'placed', $5, $6, $7,
+                 CASE WHEN $7::UUID IS NULL THEN NULL ELSE 'full' END,
+                 CASE WHEN $7::UUID IS NULL THEN NULL ELSE 'suspend' END)"
+    ))
+    .bind(sandbox_id)
+    .bind(SEEDED_USER_ID)
+    .bind(SEEDED_ORG_ID)
+    .bind(lifecycle)
+    .bind(target)
+    .bind(active)
+    .bind(artifact.map(LocalArtifactId::as_uuid))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// A full suspend snapshot `minutes_ago` old, with a storage location unless
+/// `orphaned` is `None`.
+async fn insert_snapshot(
+    pool: &sqlx::PgPool,
+    sandbox_id: SandboxId,
+    state: &str,
+    artifact: LocalArtifactId,
+    orphaned: Option<bool>,
+    minutes_ago: usize,
+) -> TestResult<SnapshotId> {
+    let snapshot_id = SnapshotId::new();
+    sqlx::query(sql!(
+        "INSERT INTO snapshots (id, sandbox_id, type, state, timestamp, org_id,
+                                local_artifact_id, artifact_kind, artifact_origin)
+         VALUES ($1, $2, 'full', $3, NOW() - make_interval(mins => $4), $5::UUID, $6,
+                 'full', 'suspend')"
+    ))
+    .bind(snapshot_id.as_uuid())
+    .bind(sandbox_id)
+    .bind(state)
+    .bind(i32::try_from(minutes_ago)?)
+    .bind(SEEDED_ORG_ID)
+    .bind(artifact.as_uuid())
+    .execute(pool)
+    .await?;
+    if let Some(orphaned) = orphaned {
+        sqlx::query(sql!(
+            "INSERT INTO snapshot_storage_locations
+                 (snapshot_id, storage_connection_string, org_id, orphaned_at)
+             VALUES ($1, 's3://synthetic-bucket/snapshots/x', $2::UUID,
+                     CASE WHEN $3 THEN NOW() END)"
+        ))
+        .bind(snapshot_id.as_uuid())
+        .bind(SEEDED_ORG_ID)
+        .bind(orphaned)
+        .execute(pool)
+        .await?;
+    }
+    Ok(snapshot_id)
 }

@@ -2,7 +2,7 @@
 //! holds the sandbox's current local artifact, both, or neither.
 
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{NodeId, SandboxId, SnapshotId};
+use pplx_space_common_core::types::{NodeId, SandboxId, SandboxLifecycle, SnapshotId};
 use sqlx::FromRow;
 
 /// Where one catalog snapshot's bytes are, as the catalog records it.
@@ -13,10 +13,23 @@ pub struct SnapshotStoragePlacement {
     /// bytes are in the object store.
     pub in_object_store: bool,
     /// The node holding the bytes locally: the sandbox's node, when this
-    /// snapshot is the current local artifact that node published for it.
-    /// `None` for an older artifact, or a sandbox placed on no node.
+    /// snapshot is the current local artifact that node published for it and
+    /// the sandbox is settled in a lifecycle that keeps it there
+    /// ([`NODE_LOCAL_LIFECYCLES`]). `None` for an older artifact, a sandbox
+    /// placed on no node, and a sandbox in any other lifecycle.
     pub node_local_node_id: Option<NodeId>,
 }
+
+/// The lifecycles in which the sandbox's placement columns name the node
+/// holding its current local artifact. In the others the row may already
+/// record a different node: a restore onto another node writes the
+/// destination into both `active_node_id` and `target_node_id` once its pod
+/// is scheduled, before that node holds any bytes, and the artifact marker
+/// still names the source's copy. The row does not record which node
+/// published the marker, so a move in flight reports no node-local copy
+/// rather than a wrong one.
+pub const NODE_LOCAL_LIFECYCLES: [SandboxLifecycle; 2] =
+    [SandboxLifecycle::Suspended, SandboxLifecycle::Stopped];
 
 /// One statement, built once, so the current-artifact test is the shared
 /// portability fragment rather than a second spelling of it. "The sandbox's
@@ -32,7 +45,7 @@ static STORAGE_PLACEMENTS_SQL: std::sync::LazyLock<String> = std::sync::LazyLock
                      WHERE ssl.snapshot_id = s.id
                        AND ssl.orphaned_at IS NULL
                 )) AS in_object_store,
-                CASE WHEN {current_artifact}
+                CASE WHEN {current_artifact} AND sb.lifecycle = ANY($2)
                      THEN COALESCE(sb.target_node_id, sb.active_node_id)
                 END AS node_local_node_id
            FROM snapshots s
@@ -53,6 +66,7 @@ pub async fn storage_placements(
         STORAGE_PLACEMENTS_SQL.as_str()
     )))
     .bind(sandbox_id)
+    .bind(NODE_LOCAL_LIFECYCLES.map(SandboxLifecycle::as_str).to_vec())
     .fetch_all(executor)
     .await
 }

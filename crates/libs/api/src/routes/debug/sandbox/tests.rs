@@ -264,13 +264,16 @@ async fn the_debug_read_reports_quarantine_and_snapshot_storage()
         body["quarantine"]["history"][0]["action"],
         "entered_quarantine"
     );
+    // A quarantined sandbox is not settled on its node, so only the object
+    // store copy is reported (the placement rule is the store's own test).
     assert_eq!(
         body["snapshots"]["snapshots"][0]["storage"],
-        serde_json::json!({"location": "both", "node_id": node_id.to_string()})
+        serde_json::json!({"location": "object_store", "node_id": null})
     );
+    assert_eq!(body["snapshots"].get("storage_error"), None);
     assert_eq!(
-        body["snapshots"]["inventory"][0]["node_id"],
-        node_id.to_string()
+        body["snapshots"]["inventory"][0]["snapshot_id"],
+        "f-synthetic"
     );
     Ok(())
 }

@@ -281,21 +281,25 @@ pub(super) struct Snapshot {
 #[derive(Debug, Serialize)]
 pub(super) struct SnapshotStorage {
     pub location: SnapshotStorageLocation,
-    /// The node holding the local copy, for `node_local` and `both`.
+    /// The node holding the local copy, for `node_local` and `both`: the
+    /// sandbox's target node, else its active node.
     pub node_id: Option<NodeId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum SnapshotStorageLocation {
-    /// Only on the sandbox's node: the current local artifact, not yet
-    /// uploaded.
+    /// Only on the sandbox's node: the current local artifact of a sandbox
+    /// settled in `suspended` or `stopped`, not in the object store. A
+    /// sandbox in any other lifecycle, including one moving between nodes,
+    /// reports no node-local copy.
     NodeLocal,
     /// Only in the object store.
     ObjectStore,
     Both,
-    /// Neither: an upload in flight or failed, or an older artifact whose
-    /// stored copy has been orphaned.
+    /// Neither recorded: an upload in flight or failed, an older artifact
+    /// whose stored copy has been orphaned, or a current artifact of a
+    /// sandbox that is not settled on a node.
     None,
 }
 
