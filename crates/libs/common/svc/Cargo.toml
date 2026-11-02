@@ -104,6 +104,8 @@ pplx-space-unix-socket-path = { workspace = true }
 pplx-space-valkey = { workspace = true }
 
 [dev-dependencies]
+# `test-util` enables `#[tokio::test(start_paused = true)]`.
+tokio = { workspace = true, features = ["test-util"] }
 pplx-space-common-core = { workspace = true, features = ["test-hooks"] }
 nix = { workspace = true, features = ["signal"] }
 tonic-prost = { workspace = true }

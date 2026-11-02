@@ -78,6 +78,15 @@ pub fn projected_token(service_account: &str) -> String {
     )
 }
 
+/// An unsigned JWT-shaped token whose payload carries only `exp`, in Unix
+/// seconds.
+pub fn jwt_with_exp(exp: u64) -> String {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);
+    let payload = URL_SAFE_NO_PAD.encode(serde_json::json!({ "exp": exp }).to_string());
+    format!("{header}.{payload}.signature")
+}
+
 pub fn kubeconfig_for_endpoint(endpoint: std::net::SocketAddr) -> String {
     format!(
         "apiVersion: v1\nkind: Config\nclusters:\n- name: test\n  cluster:\n    server: http://{endpoint}\ncontexts:\n- name: test\n  context:\n    cluster: test\n    user: test\ncurrent-context: test\nusers:\n- name: test\n  user: {{}}\n"
