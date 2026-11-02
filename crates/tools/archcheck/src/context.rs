@@ -13,10 +13,10 @@ use thiserror::Error;
 use toml::Spanned;
 
 use crate::{
-    baseline::{BASELINE_FILE, BaseBaseline, Baseline, line_of},
-    config::{ArchitectureConfig, BaseArchitecture, CONFIG_FILE, CrateNamesPolicy},
+    baseline::{BASELINE_FILE, BaseBaseline, Baseline, line_of, rule_of},
+    config::{ArchitectureConfig, BaseArchitecture, CONFIG_FILE, CrateNamesPolicy, LayersPolicy},
     renames::{Renames, RenamesError},
-    rules,
+    rules::{self, Layers},
 };
 
 /// The root manifest, the workspace `cargo metadata` reads.
@@ -88,6 +88,17 @@ pub enum LoadError {
          the instance was renamed"
     )]
     UnknownBaselineTable { path: PathBuf, table: String },
+    /// A `[layers.<check>]` table is checked only with `[rules.layers]`, and
+    /// only for a check with a baseline.
+    #[error(
+        "{path}: [{table}] is not a table of the layers rule: with [rules.layers] in {CONFIG_FILE}, \
+         its tables are {known}, and without it there are none; remove that table"
+    )]
+    UnknownLayersTable {
+        path: PathBuf,
+        table: String,
+        known: String,
+    },
     #[error("could not read {path} as renames: {source}")]
     Renames {
         path: PathBuf,
@@ -147,6 +158,31 @@ pub struct Dependency {
     pub line: usize,
 }
 
+impl Dependency {
+    /// How the manifest declares it, such as `a normal dependency` or
+    /// `renamed sqlite, a dev-dependency, for target cfg(unix)`.
+    pub fn describe(&self) -> String {
+        let mut declared = Vec::new();
+        if let Some(rename) = &self.rename {
+            declared.push(format!("renamed {rename}"));
+        }
+        declared.push(match self.kind.as_deref() {
+            None => "a normal dependency".to_owned(),
+            Some(kind) => format!("a {kind}-dependency"),
+        });
+        if let Some(target) = &self.target {
+            declared.push(format!("for target {target}"));
+        }
+        declared.join(", ")
+    }
+
+    /// Whether it is a `[dev-dependencies]` entry, which only tests,
+    /// examples and benchmarks build with.
+    pub fn is_dev(&self) -> bool {
+        self.kind.as_deref() == Some("dev")
+    }
+}
+
 impl Crate {
     /// Repository-relative, `/`-separated.
     pub fn manifest(&self) -> String {
@@ -173,7 +209,10 @@ pub struct Context {
     /// `[rules.crate_names]` of `ARCHITECTURE.toml`, with the line of each
     /// part.
     pub crate_names_policy: CrateNamesPolicy,
-    /// The same table of the base branch's `ARCHITECTURE.toml`, given with
+    /// `[rules.layers]` of `ARCHITECTURE.toml`, with the line of each entry;
+    /// empty without one.
+    pub layers_policy: LayersPolicy,
+    /// The base branch's `ARCHITECTURE.toml`, given with
     /// `--base-architecture`.
     pub base_architecture: BaseArchitecture,
     /// Every production Rust file of the workspace members, sorted by path.
@@ -200,16 +239,25 @@ impl Context {
             .into_iter()
             .find(|table| !configured.contains(table))
         {
-            return Err(LoadError::UnknownBaselineTable {
-                path: root.join(BASELINE_FILE),
-                table,
-            });
+            let path = root.join(BASELINE_FILE);
+            if rule_of(&table) == Layers::NAME {
+                return Err(LoadError::UnknownLayersTable {
+                    path,
+                    table,
+                    known: Layers::table_names().join(" and "),
+                });
+            }
+            return Err(LoadError::UnknownBaselineTable { path, table });
         }
+        let parse_error = |source| LoadError::Parse {
+            path: config_path.clone(),
+            source,
+        };
         let crate_names_policy = CrateNamesPolicy::parse(&config_text)
-            .map_err(|source| LoadError::Parse {
-                path: config_path,
-                source,
-            })?
+            .map_err(parse_error)?
+            .unwrap_or_default();
+        let layers_policy = LayersPolicy::parse(&config_text)
+            .map_err(parse_error)?
             .unwrap_or_default();
         if let Some(name) = baseline
             .crate_names
@@ -238,6 +286,7 @@ impl Context {
             base_baseline: BaseBaseline::default(),
             renames: None,
             crate_names_policy,
+            layers_policy,
             base_architecture: BaseArchitecture::NotGiven,
             files,
             crates,

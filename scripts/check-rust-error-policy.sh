@@ -8,8 +8,23 @@ cd "${repo_root}"
 
 status=0
 
+# Library crates, and every crate root. The layer directories under crates/
+# fill as crates move into them, so a root that doesn't exist yet is skipped.
+library_roots=(crates/libs crates/l10_foundation crates/l20_domain crates/l30_storage crates/l40_api)
+all_roots=("${library_roots[@]}" crates/apps crates/l50_app crates/test_support crates/tools)
+
 production_rust_files() {
-    find "$@" -name '*.rs' \
+    local roots=()
+    local root
+    for root in "$@"; do
+        if [ -d "${root}" ]; then
+            roots+=("${root}")
+        fi
+    done
+    if [ "${#roots[@]}" -eq 0 ]; then
+        return 0
+    fi
+    find "${roots[@]}" -name '*.rs' \
         ! -name build.rs \
         ! -name '*tests.rs' \
         ! -path '*/tests/*' \
@@ -34,15 +49,15 @@ report_matches() {
 report_matches \
     'production library code must return typed errors, not anyhow' \
     'anyhow::|use[[:space:]]+anyhow' \
-    crates/libs
+    "${library_roots[@]}"
 
 report_matches \
     'derive thiserror::Error instead of implementing std::error::Error manually' \
     'impl[[:space:]]+(std::error::Error|Error)[[:space:]]+for[[:space:]]' \
-    crates/apps crates/libs crates/tools
+    "${all_roots[@]}"
 
 derive_without_debug="$(
-    production_rust_files crates/apps crates/libs crates/tools \
+    production_rust_files "${all_roots[@]}" \
         | xargs -0 grep -nE '#\[derive\([^]]*(thiserror::Error|Error)' \
         | grep -v 'Debug' \
         || true

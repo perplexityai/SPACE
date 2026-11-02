@@ -103,8 +103,8 @@ The point: you should be able to build the cluster-agnostic core of SPACE withou
 
 ## Logging / tracing: `tracing` everywhere, `tracing-subscriber` only in apps
 
-- **Libraries (`crates/libs/**`) use the `tracing` crate.** Emit spans and events; never configure a global subscriber from a library. Never use `log`, `slog`, `env_logger`, or `println!` for diagnostic output in library code.
-- **Apps (`crates/apps/**`) own the subscriber.** They call into our common helpers for service / CLI runtime to set up subscribers consistently. Those helpers decide when to send to `journald`, when to send to Datadog, when to render to a terminal, what JSON layer to use in production, etc.
+- **Libraries (`crates/libs/**` and the `l10`–`l40` layer directories) use the `tracing` crate.** Emit spans and events; never configure a global subscriber from a library. Never use `log`, `slog`, `env_logger`, or `println!` for diagnostic output in library code.
+- **Apps (`crates/apps/**` and `crates/l50_app/**`) own the subscriber.** They call into our common helpers for service / CLI runtime to set up subscribers consistently. Those helpers decide when to send to `journald`, when to send to Datadog, when to render to a terminal, what JSON layer to use in production, etc.
 - **Choosing the output sink is the app's job, not the library's.** A library that prints to stderr is broken in a service that wants structured JSON to Datadog and broken in a CLI that wants pretty terminal output.
 
 Span discipline (see `docs/rust/space-review-lessons.md` § 11 for the full lesson):
