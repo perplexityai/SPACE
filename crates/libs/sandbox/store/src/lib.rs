@@ -31,11 +31,11 @@
 //!   wake-completion CAS, the restore claims) are correctness mechanisms, not
 //!   row updates, and no plain `update` verb here may absorb one. Each moves
 //!   here as its own module, named for its transition or for the path that
-//!   issues it, as [`lost`], [`delete`], [`ingest`] and [`repair`] have; the
-//!   ratchet above counts the ones still elsewhere. The caller keeps its
-//!   locks and its transaction: each function runs on the transaction or
-//!   executor its caller passes, and none begins or commits a transaction.
-//!   [`delete::delete_with_dependents`] reaches past the row:
+//!   issues it, as [`lost`], [`delete`], [`ingest`], [`repair`] and
+//!   [`sweeper`] have; the ratchet above counts the ones still elsewhere. The
+//!   caller keeps its locks and its transaction: each function runs on the
+//!   transaction or executor its caller passes, and none begins or commits a
+//!   transaction. [`delete::delete_with_dependents`] reaches past the row:
 //!   some rows that do not cascade from it (observed state, reconcile state,
 //!   claimed warm-pool slots) have to be deleted, and snapshot storage
 //!   locations detached, in the same transaction. It calls
@@ -106,6 +106,7 @@ pub mod fork_source_lifecycle;
 pub mod ingest;
 pub mod lost;
 pub mod repair;
+pub mod sweeper;
 
 pub use create::{SandboxCreate, insert_pooled, insert_unplaced};
 
