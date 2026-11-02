@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::NodeId;
+use pplx_space_common_core::types::{BuildRunId, NodeId};
 use pplx_space_common_core::types::{OrgId, UserId};
 
 use super::*;
@@ -1066,4 +1066,94 @@ fn template_delete_idempotency_key_is_header_text_within_the_cap() {
         assert_eq!(error.0, StatusCode::BAD_REQUEST, "{message}");
         assert_eq!(error.1.message, message);
     }
+}
+
+/// The builds listing reads the recorded jobs newest first, bounded by
+/// `limit`, and still lists a job whose builder cannot report it. A template
+/// with no builds lists none; an unknown template is a 404.
+#[tokio::test]
+async fn template_builds_list_recorded_jobs_newest_first() -> TestResult {
+    let db = pg_test_db().await?;
+    let state = AppState::from_pool(db.pool.clone()).await?;
+    let managing_org_id = crate::routes::authz::cluster_managing_org_id(&db.pool).await?;
+    let actor = User {
+        id: UserId::new(),
+        email: "builds-test@example.invalid".into(),
+        password_hash: String::new(),
+        display_name: "Builds test".into(),
+        org_id: managing_org_id,
+        role: crate::user_role::UserRole::OrganizationAdmin,
+        owner_source: pplx_space_common_core::types::SandboxOwnerSource::Local,
+        created_at: time::OffsetDateTime::UNIX_EPOCH,
+        updated_at: time::OffsetDateTime::UNIX_EPOCH,
+    };
+    let built = TemplateName::parse("synthetic-built")?;
+    let unbuilt = TemplateName::parse("synthetic-unbuilt")?;
+    insert_template(&db.pool, &built).await?;
+    insert_template(&db.pool, &unbuilt).await?;
+    // A builder row with no route, so its status call fails without a network.
+    let builder = NodeId::new();
+    insert_node(&db.pool, builder, "builder").await?;
+    let older = BuildRunId::new();
+    let newer = BuildRunId::new();
+    sqlx::query(sql!(
+        "INSERT INTO template_build_jobs
+             (template_id, build_id, daemon_job_id, builder_node_id, created_at)
+         VALUES ($1, 'older', $2, $4, NOW() - INTERVAL '2 hours'),
+                ($1, 'newer', $3, $4, NOW() - INTERVAL '1 hour'),
+                ($1, 'unsubmitted', NULL, NULL, NOW())"
+    ))
+    .bind(built.as_str())
+    .bind(older.to_string())
+    .bind(newer.to_string())
+    .bind(builder)
+    .execute(&db.pool)
+    .await?;
+
+    let list = |template: &TemplateName, limit: Option<u32>| {
+        list_template_builds(
+            State(state.clone()),
+            Extension(AuthUser(actor.clone())),
+            Path(template.clone()),
+            axum::extract::Query(ListTemplateBuildsQuery { limit }),
+        )
+    };
+    let read = |response: axum::response::Response| async move {
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 100_000).await?;
+        TestResult::Ok((status, serde_json::from_slice::<serde_json::Value>(&body)?))
+    };
+
+    let (status, body) = read(list(&built, None).await.into_response()).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let entries: Vec<TemplateBuildListEntry> = serde_json::from_value(body)?;
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.job_id.clone())
+            .collect::<Vec<_>>(),
+        vec![newer.to_string(), older.to_string()]
+    );
+    for entry in &entries {
+        assert_eq!(entry.template_name, built.as_str());
+        assert_eq!(entry.builder_node_id, Some(builder));
+        assert_eq!(entry.state, None);
+        assert!(entry.status_error.is_some(), "{entry:?}");
+    }
+
+    let (_, body) = read(list(&built, Some(1)).await.into_response()).await?;
+    assert_eq!(body.as_array().map(Vec::len), Some(1));
+    assert_eq!(body[0]["job_id"], newer.to_string());
+
+    let (status, body) = read(list(&unbuilt, None).await.into_response()).await?;
+    assert_eq!((status, body), (StatusCode::OK, serde_json::json!([])));
+
+    for limit in [0, MAX_TEMPLATE_BUILDS_LIMIT + 1] {
+        let (status, _) = read(list(&built, Some(limit)).await.into_response()).await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "limit {limit}");
+    }
+    let missing = TemplateName::parse("synthetic-missing")?;
+    let (status, _) = read(list(&missing, None).await.into_response()).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    Ok(())
 }

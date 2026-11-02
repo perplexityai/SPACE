@@ -635,6 +635,19 @@ fn insert_template_admin_paths(paths: &mut Map<String, Value>) {
     paths.insert(
         "/templates/{template_name}/builds".to_string(),
         json!({
+            "get": {
+                "summary": "List a template's recent build jobs",
+                "description": "Newest first. Each entry carries the job's recorded builder and created_at, and the state, content_hash (on success) and error (on failure) its builder reports now; when the builder cannot report the job, state is null and status_error says why.",
+                "parameters": [
+                    { "name": "template_name", "in": "path", "required": true, "schema": { "type": "string" } },
+                    { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 50, "default": 20 } }
+                ],
+                "responses": {
+                    "200": { "description": "Build jobs; empty for a template with none" },
+                    "400": { "description": "Invalid limit" },
+                    "404": { "description": "Template not found" }
+                }
+            },
             "post": {
                 "summary": "Start a template build through the selected builder node",
                 "parameters": [

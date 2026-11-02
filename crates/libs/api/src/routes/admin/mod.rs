@@ -205,7 +205,7 @@ pub fn v1_router(state: AppState) -> Router<AppState> {
         )
         .route(
             "/templates/{template_name}/builds",
-            axum::routing::post(templates::start_template_build),
+            get(templates::list_template_builds).post(templates::start_template_build),
         )
         .route(
             "/templates/{template_name}/builds/{job_id}",

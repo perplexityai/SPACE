@@ -10,6 +10,7 @@ use axum::{
     response::IntoResponse,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use futures_util::StreamExt as _;
 use pplx_space_build_mgr_client::proto as build_proto;
 use pplx_space_cluster_pool::WarmPoolStore;
 use pplx_space_common_core::types::{
@@ -33,7 +34,7 @@ use crate::{
     models::{
         CreatePoolApiRequest, CreateTemplateRequest, NetworkPolicyStatus,
         SystemTemplateBuildRequest, TemplateBaseSnapshotPolicyRequest, TemplateBuildClientContext,
-        TemplateBuildConfig, TemplateBuildCopyStep, TemplateBuildOrigin,
+        TemplateBuildConfig, TemplateBuildCopyStep, TemplateBuildListEntry, TemplateBuildOrigin,
         TemplateBuildPackageManager, TemplateBuildRecipe, TemplateBuildRequest,
         TemplateBuildSource, TemplateBuildStartResponse, TemplateBuildStateResponse,
         TemplateBuildStatusResponse, TemplateBuildStep, TemplateOperationResponse,
@@ -56,6 +57,7 @@ use crate::{
         authz,
         public::request_context,
     },
+    template_build_jobs_store::RecordedBuild,
 };
 
 type ApiErrorResponse = (StatusCode, Json<PublicErrorEnvelope>);
@@ -1707,6 +1709,117 @@ pub async fn get_template_build_status(
         Ok(_) => api_error(StatusCode::NOT_FOUND, "Build job not found").into_response(),
         Err(error) => error.into_response(),
     }
+}
+
+/// Builds listed when the caller omits `limit`.
+const DEFAULT_TEMPLATE_BUILDS_LIMIT: u32 = 20;
+/// Largest `limit`. Each listed job costs one builder status call, so this and
+/// the two bounds below keep the route within its latency budget.
+const MAX_TEMPLATE_BUILDS_LIMIT: u32 = 50;
+const TEMPLATE_BUILD_STATUS_CONCURRENCY: usize = 16;
+const TEMPLATE_BUILD_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListTemplateBuildsQuery {
+    limit: Option<u32>,
+}
+
+/// `GET /templates/{template_name}/builds`: the template's recorded build
+/// jobs, newest first, each with the status its builder reports now.
+///
+/// Postgres records which builder accepted each job; state, content hash and
+/// failure message live only on that builder, so each job is one bounded
+/// status call. A job its builder cannot report still lists, with `state`
+/// unset and `status_error` saying why.
+pub async fn list_template_builds(
+    State(state): State<AppState>,
+    Extension(AuthUser(actor)): Extension<AuthUser>,
+    Path(template_name): Path<TemplateName>,
+    axum::extract::Query(query): axum::extract::Query<ListTemplateBuildsQuery>,
+) -> impl IntoResponse {
+    if let Err(error) = require_template_admin(&state.pool, &actor).await {
+        return error.into_response();
+    }
+    let limit = query.limit.unwrap_or(DEFAULT_TEMPLATE_BUILDS_LIMIT);
+    if !(1..=MAX_TEMPLATE_BUILDS_LIMIT).contains(&limit) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            format!("limit must be between 1 and {MAX_TEMPLATE_BUILDS_LIMIT}"),
+        )
+        .into_response();
+    }
+    match fetch_template(&state.pool, &template_name).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return api_error(StatusCode::NOT_FOUND, "Template not found").into_response(),
+        Err(error) => {
+            return contention_response(ContentionScope::ReadOnly, &error)
+                .unwrap_or_else(|| {
+                    tracing::error!(%error, template = template_name.as_str(), "failed to load template for build listing");
+                    api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
+                })
+                .into_response();
+        }
+    }
+    let builds = match state
+        .template_controller
+        .recent_template_builds(&template_name, limit)
+        .await
+    {
+        Ok(builds) => builds,
+        Err(error) => return error.into_response(),
+    };
+    let entries: Vec<TemplateBuildListEntry> = futures_util::stream::iter(builds)
+        .map(|build| template_build_list_entry(&state, &template_name, build))
+        .buffered(TEMPLATE_BUILD_STATUS_CONCURRENCY)
+        .collect()
+        .await;
+    Json(entries).into_response()
+}
+
+async fn template_build_list_entry(
+    state: &AppState,
+    template_name: &TemplateName,
+    build: RecordedBuild,
+) -> TemplateBuildListEntry {
+    let job_id = build.daemon_job_id.to_string();
+    let status = tokio::time::timeout(
+        TEMPLATE_BUILD_STATUS_TIMEOUT,
+        state
+            .template_controller
+            .get_template_build_status_on(job_id.clone(), build.builder_node_id),
+    )
+    .await;
+    let mut entry = TemplateBuildListEntry {
+        job_id,
+        template_name: template_name.to_string(),
+        created_at: format_time(build.created_at),
+        builder_node_id: build.builder_node_id,
+        state: None,
+        content_hash: None,
+        error: None,
+        status_error: None,
+    };
+    match status {
+        Ok(Ok(response)) if response.template_id == template_name.as_str() => {
+            let build_state = build_proto::BuildState::try_from(response.state)
+                .unwrap_or(build_proto::BuildState::Unspecified);
+            entry.state = Some(template_build_state_response(build_state));
+            entry.content_hash = optional_nonempty(response.content_hash);
+            entry.error = optional_nonempty(response.error);
+        }
+        Ok(Ok(_)) => {
+            entry.status_error = Some("builder reported the job for another template".to_string());
+        }
+        Ok(Err(error)) => entry.status_error = Some(error.to_string()),
+        Err(_) => {
+            entry.status_error = Some(format!(
+                "builder status timed out after {}s",
+                TEMPLATE_BUILD_STATUS_TIMEOUT.as_secs()
+            ));
+        }
+    }
+    entry
 }
 
 pub async fn list_template_releases(

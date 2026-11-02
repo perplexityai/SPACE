@@ -8,6 +8,7 @@ use pplx_space_common_core::{
     },
 };
 use sqlx::{PgExecutor, PgPool};
+use time::OffsetDateTime;
 
 #[derive(Clone)]
 pub struct TemplateBuildJobsStore {
@@ -17,6 +18,16 @@ pub struct TemplateBuildJobsStore {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BuildJob {
     pub daemon_job_id: BuildRunId,
+}
+
+/// A build a builder accepted, as the control plane recorded it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RecordedBuild {
+    pub daemon_job_id: BuildRunId,
+    /// The builder that accepted the job; `None` for jobs routed without one.
+    pub builder_node_id: Option<NodeId>,
+    /// When the job was first recorded.
+    pub created_at: OffsetDateTime,
 }
 
 /// One build submission's pre-dispatch base grant
@@ -366,6 +377,37 @@ impl TemplateBuildJobsStore {
         .await
         .map(|row| row.and_then(|(builder_node_id,)| builder_node_id.map(NodeId::from_uuid)))
         .map_err(Into::into)
+    }
+
+    /// The newest `limit` builds of `template_name` that a builder accepted,
+    /// newest first. Rows the ECW flow recorded before submitting carry no
+    /// job ID yet and are left out.
+    pub(crate) async fn recent_builds(
+        &self,
+        template_name: &TemplateName,
+        limit: u32,
+    ) -> Result<Vec<RecordedBuild>, TemplateBuildJobsStoreError> {
+        let rows = sqlx::query_as::<_, (String, Option<uuid::Uuid>, OffsetDateTime)>(sql!(
+            "SELECT daemon_job_id, builder_node_id, created_at
+             FROM template_build_jobs
+             WHERE template_id = $1
+               AND daemon_job_id IS NOT NULL
+             ORDER BY created_at DESC, build_id DESC
+             LIMIT $2"
+        ))
+        .bind(template_name.as_str())
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(daemon_job_id, builder_node_id, created_at)| {
+                Ok(RecordedBuild {
+                    daemon_job_id: BuildRunId::from_str(&daemon_job_id)?,
+                    builder_node_id: builder_node_id.map(NodeId::from_uuid),
+                    created_at,
+                })
+            })
+            .collect()
     }
 
     pub(crate) async fn record_build_spec(

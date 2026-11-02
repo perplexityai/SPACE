@@ -1022,6 +1022,28 @@ pub struct TemplateBuildStatusResponse {
     pub error: Option<String>,
 }
 
+/// One entry of `GET /admin/api/v1/templates/{name}/builds`: a recorded
+/// build job and the status its builder reports for it now.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TemplateBuildListEntry {
+    pub job_id: String,
+    pub template_name: String,
+    /// When the control plane recorded the builder's acceptance of the job.
+    pub created_at: String,
+    /// The builder pinned to the job; `None` when it was routed without one.
+    pub builder_node_id: Option<NodeId>,
+    /// `None` when the builder could not report the job; `status_error` says
+    /// why.
+    pub state: Option<TemplateBuildStateResponse>,
+    /// Set once the build succeeds.
+    pub content_hash: Option<String>,
+    /// The build's failure message.
+    pub error: Option<String>,
+    /// Why `state` is missing: the builder was unreachable, timed out, or no
+    /// longer has the job, as after the builder node was replaced.
+    pub status_error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ClusterPoolConfigResponse {
     pub id: Uuid,

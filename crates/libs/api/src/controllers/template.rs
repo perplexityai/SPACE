@@ -17,7 +17,8 @@ use super::{
 };
 use crate::models::{ClusterPoolConfigRequest, ClusterPoolConfigResponse};
 use crate::template_build_jobs_store::{
-    BuildBaseGrantId, BuilderPinnedGrants, TemplateBuildJobsStore, TemplateBuildJobsStoreError,
+    BuildBaseGrantId, BuilderPinnedGrants, RecordedBuild, TemplateBuildJobsStore,
+    TemplateBuildJobsStoreError,
 };
 
 /// The build-jobs store's errors at the controller boundary.
@@ -490,6 +491,29 @@ impl TemplateController {
             .find_builder_node(parsed_job_id)
             .await
             .map_err(|error| build_jobs_store_error("failed to load template build job", error))?;
+        self.get_template_build_status_on(job_id, builder_node_id)
+            .await
+    }
+
+    pub(crate) async fn recent_template_builds(
+        &self,
+        template_name: &TemplateName,
+        limit: u32,
+    ) -> Result<Vec<RecordedBuild>, ControllerError> {
+        self.build_jobs
+            .recent_builds(template_name, limit)
+            .await
+            .map_err(|error| build_jobs_store_error("failed to list template build jobs", error))
+    }
+
+    /// The builder's status for a job whose routing the caller already read:
+    /// the pinned builder when `builder_node_id` is set, unpinned discovery
+    /// otherwise.
+    pub(crate) async fn get_template_build_status_on(
+        &self,
+        job_id: String,
+        builder_node_id: Option<NodeId>,
+    ) -> Result<GetBuildStatusResponse, ControllerError> {
         let mut client = match builder_node_id {
             Some(builder_node_id) => {
                 self.substrate

@@ -136,6 +136,9 @@ curl -sS -X POST "$SPACE_API_URL/admin/api/v1/templates/my-template/builds" \
 The build returns a `job_id`. Poll
 `GET /admin/api/v1/templates/my-template/builds/{job_id}` until `state` is
 `succeeded`. The response then includes the new `content_hash`.
+`GET /admin/api/v1/templates/my-template/builds` lists the template's recent
+builds, newest first, with each one's state, `content_hash` on success and
+`error` on failure.
 
 The **Template Releases** table in the UI lists every release with its tags.
 Existing sandboxes and existing warm pools stay on their release when `latest`
