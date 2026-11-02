@@ -83,54 +83,29 @@ generated password of the seeded users, and every object the seed creates
 and every object a `flows` step of the loop creates. `seed`, `loop` and
 `clean` refuse a state that records another prefix than `--prefix`.
 
-Each create is recorded before it is submitted, and its ID and operation as
-soon as the API answers. Seeding looks each object up by its prefixed name
-before creating it, and a rerun after an interruption first waits for the
-operations recorded for it. Organizations, users and API keys have no
-idempotent create, so a rerun finds them by slug, email or key name; their
-creates take effect before the API answers, so a lookup by name is
-authoritative. A sandbox create is recorded with its idempotency key and
-request, and a rerun resubmits an unanswered one with the same key and the
-recorded request, unchanged even when `--template` has changed since (the
-API refuses a key reused with another body), which the API answers with the
-original operation if the first submit arrived. A create has resolved once
-it was answered with an operation, or rejected before the API admitted it: a
-4xx other than 409 (for example a 422 for an empty `--template`, or a 401,
-403 or 429). Only a new create, after the earlier one has resolved, uses the
-current options and a new key, so a rerun with a corrected option recovers
-from a rejected one. A 409 means the key was already used with another body:
-that create stays unresolved, its request is resubmitted unchanged, and its
-key is never replaced.
+Each object is recorded as soon as the API answers its create. A rerun
+reuses what exists: it looks each organization, user and API key up by slug,
+email or key name, and each sandbox by its recorded ID, then by its prefixed
+name. Seeding fails (exit 2) when it cannot discover or set up a fixture. It
+ends by looking up every fixture the loop needs by ID: the organizations,
+users and API keys and, unless `--skip-sandboxes` was given, each sandbox in
+its resting state and the deleted one gone. The loop's `fixtures` step checks
+the same set through the console.
 
-The outcome of each operation is recorded once it is seen finished, and not
-asked for again. The API deletes finished operations a week after they are
-created; one that is no longer there is recorded as `gone`, with an outcome
-nobody can read, and the seeder and `clean` decide from the object itself,
-looked up by its ID. Seeding fails
-(exit 2) when it cannot discover or set up a fixture. It ends by looking up
-every fixture the loop needs by ID: the organizations, users and API keys
-and, unless `--skip-sandboxes` was given, each sandbox in its resting state
-and the deleted one gone. The loop's `fixtures` step checks the same set
-through the console.
+The stack is disposable, and so is the state: the tool does not journal
+creates or replay interrupted ones. If a rerun does not recover from an
+interrupted `seed`, `loop` or `clean`, delete `out/seed-<prefix>.json` and run
+`npm run seed` again, or recreate the stack. A create interrupted before the
+API answered is not recorded, so `clean` does not delete what it made; a
+reseed adopts a seeded fixture by its name, and recreating the stack removes
+the rest.
 
 `npm run clean` deletes what the state records:
 
-- sandboxes, waiting first for every operation recorded for each, then for
-  its delete and for it to leave `deleting`. A sandbox counts as gone only
-  when it is deleted, or not found once nothing recorded for it is still
-  running. A seed create that was submitted but never answered is
-  resubmitted, unchanged, with its key to learn its operation. A create the
-  API rejected before admitting it (a 4xx other than 409), by the seed or the
-  loop, is dropped: nothing was made. One answered with 409 stays unresolved.
-  A loop create
-  that left the browser with no answer, and has no sandbox of its name yet
-  (a create can stay queued, without a sandbox, after the loop is gone), is
-  unresolved: `clean` keeps it in the state, reports it, exits 1, and looks
-  it up by name in its organization again on the next run. `--forget-unresolved`
-  drops such creates on purpose. A loop create whose request never left the
-  browser is forgotten;
-- users and API keys, by ID, or by email or name when the create was never
-  answered;
+- sandboxes, each by ID: it submits the delete, waits for its operation and
+  for the sandbox to leave `deleting`, and counts one that is no longer
+  found as gone;
+- users and API keys, by ID;
 - the organizations loop runs created (`<prefix>-run-…`).
 
 It keeps the seeded organizations (`<prefix>-acme`, `<prefix>-globex`,
@@ -150,12 +125,10 @@ once nothing is left in it.
 exactly; a name that is neither is an error. The tags are `routes`, `orgs`,
 `users`, `api-keys`, `sandboxes`, `flows`, `lifecycle`, `templates`, `nodes`,
 `roles`. Sign-in always runs. Steps tagged `flows` create objects and delete
-them again; each records its object's name before it submits the create, the
-ID from the create's response, and the operation of every sandbox action and
-delete as its answer arrives, so if one fails before deleting, `npm run clean`
-removes what it recorded. They need a seed state for the prefix, and
-the identity check above passes before any runs. `--no-mutate` skips them.
-The steps are in [`src/steps.ts`](src/steps.ts).
+them again; each records its object's ID as soon as the create is answered,
+so if one fails before deleting, `npm run clean` removes it. They need a seed
+state for the prefix, and the identity check above passes before any runs.
+`--no-mutate` skips them. The steps are in [`src/steps.ts`](src/steps.ts).
 
 Each run writes `out/runs/<time>[-<label>]/`:
 
@@ -179,8 +152,7 @@ Every setting is a flag or an environment variable:
 | `--template` (seed) | `CONSOLE_LOOP_TEMPLATE` | `seed:latest` |
 
 A prefix is up to 32 lowercase letters, digits and dashes. `npm run seed`
-also takes `--skip-sandboxes`, and `npm run clean` takes `--delete-orgs` and
-`--forget-unresolved`.
+also takes `--skip-sandboxes`, and `npm run clean` takes `--delete-orgs`.
 `npm run loop` also takes `--label NAME`, `--slow-ms N` (default 1500),
 `--compare RUN`, `--headed`, and `--video`, which records the run as
 `run.webm` in its run directory. Run `npm run typecheck` and `npm test` (unit

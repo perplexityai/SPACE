@@ -7,60 +7,30 @@
 // only against this host unless --allow-remote is given, and only once the
 // console and the API have been shown to be one stack (src/stack.ts). Every
 // object's name starts with the prefix (default `loop`), and the state lives
-// in <out>/seed-<prefix>.json. Each create is recorded there before it is
-// submitted, by name and, for sandboxes, with its idempotency key, and its
-// ID and operation are recorded as soon as the API answers, so a rerun after
-// an interruption reuses what exists instead of duplicating it. Cleanup
-// deletes only recorded objects.
-import { randomBytes, randomUUID } from 'node:crypto';
+// in <out>/seed-<prefix>.json. Each created object is recorded there as soon
+// as the API answers, and cleanup deletes only recorded objects. A rerun
+// reuses what exists by name. The stack is disposable: when a state is no
+// longer usable, delete it and reseed, or recreate the stack.
+import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-import { Api, ApiError, TERMINAL_OPERATION_STATES, sleep, type Operation } from './api.ts';
+import { Api, ApiError, sleep } from './api.ts';
 import { flag, guardTargets, loadConfig, option, type Config } from './config.ts';
 import { API_KEYS, ORGS, SANDBOXES, USERS, userEmail, verifyFixtures, type Get } from './fixtures.ts';
 import { proveSameStack, type StackIdentity } from './stack.ts';
 
 export type CreatedKind = 'org' | 'user' | 'apiKey' | 'sandbox';
 
-export interface OperationRef {
-  id: string;
-  // Read from the admin operations route (else the public one).
-  admin: boolean;
-  action: string;
-  // Set once the operation is seen finished, so later runs stop asking:
-  // its terminal state, or `gone` when the API no longer has it (it deletes
-  // finished operations after a week) and the outcome is unknown.
-  outcome?: string;
-  // The operation's target, when it was seen finished.
-  targetId?: string;
-}
-
-// One object the seed or the loop created, or is about to. It is recorded,
-// by kind and name, before its create is submitted; `id` is set once the API
-// answers.
+// One object the seed or the loop created, recorded once the API answered
+// its create.
 export interface CreatedObject {
   kind: CreatedKind;
   name: string;
-  id?: string;
+  id: string;
   // The org an API key belongs to; the org a sandbox or user was created in.
   orgId?: string;
-  // Sandbox creates by the seed only: the key and request a rerun resubmits,
-  // unchanged, which the API answers with the original operation when the
-  // first submit arrived.
-  idempotencyKey?: string;
-  request?: { admin: boolean; body: unknown };
-  // Sandbox creates by the loop: set as the browser's create request leaves,
-  // before any answer. A submitted create with no answer and no sandbox of
-  // its name is unresolved, and `clean` keeps it.
-  submitted?: boolean;
-  // The status of a 4xx other than 409 the API answered the create with: it
-  // refused the create before admitting it, so the create resolved with
-  // nothing made. (A 409 is an idempotency conflict, which stays unresolved.)
-  rejected?: number;
-  // Every create, action and delete operation submitted for it.
-  operations?: OperationRef[];
 }
 
 export interface SeedState {
@@ -85,16 +55,24 @@ export function seedStatePath(config: Config): string {
   return path.join(config.outDir, `seed-${config.prefix}.json`);
 }
 
+// The way out of a state that cannot be used.
+export const resetAdvice = (file: string) => `delete ${file} and run \`npm run seed\` again, or recreate the stack`;
+
 // The state for --prefix, or null when there is none. A state recorded for
 // another prefix, or without the stack it was seeded on, is refused.
 export function readSeedState(config: Config): SeedState | null {
   const file = seedStatePath(config);
   if (!fs.existsSync(file)) return null;
-  const state = JSON.parse(fs.readFileSync(file, 'utf8')) as SeedState;
+  let state: SeedState;
+  try {
+    state = JSON.parse(fs.readFileSync(file, 'utf8')) as SeedState;
+  } catch (err) {
+    throw new Error(`cannot read ${file} (${err instanceof Error ? err.message : String(err)}): ${resetAdvice(file)}`);
+  }
   if (state.prefix !== config.prefix) {
     throw new Error(`refusing ${file}: it records prefix "${state.prefix}", not --prefix "${config.prefix}"`);
   }
-  if (!state.stack?.clusterId) throw new Error(`refusing ${file}: it does not record the stack it was seeded on`);
+  if (!state.stack?.clusterId) throw new Error(`refusing ${file}: it does not record the stack it was seeded on; ${resetAdvice(file)}`);
   state.created ??= [];
   return state;
 }
@@ -106,32 +84,16 @@ export function writeSeedState(config: Config, state: SeedState): void {
   fs.renameSync(`${file}.tmp`, file);
 }
 
-export function findCreated(state: SeedState, kind: CreatedKind, name: string): CreatedObject | undefined {
-  return state.created.find((o) => o.kind === kind && o.name === name);
+// Add an object to the state, or replace the one of that kind and name.
+export function upsertCreated(state: SeedState, object: CreatedObject): void {
+  const index = state.created.findIndex((o) => o.kind === object.kind && o.name === object.name);
+  if (index < 0) state.created.push(object);
+  else state.created[index] = object;
 }
 
-// Add an object to the state, or merge into the one of that kind and name:
-// given fields replace recorded ones, operations accumulate.
-export function upsertCreated(state: SeedState, object: CreatedObject): CreatedObject {
-  const entry = findCreated(state, object.kind, object.name);
-  if (!entry) {
-    state.created.push(object);
-    return object;
-  }
-  const { operations, ...fields } = object;
-  for (const [field, value] of Object.entries(fields)) if (value !== undefined) (entry as unknown as Record<string, unknown>)[field] = value;
-  for (const op of operations ?? []) addOperation(entry, op);
-  return entry;
-}
-
-function addOperation(entry: CreatedObject, op: OperationRef): void {
-  entry.operations ??= [];
-  if (!entry.operations.some((o) => o.id === op.id)) entry.operations.push(op);
-}
-
-// Record an object a loop step is creating (before it submits, by name) or
-// created (with its ID), so `npm run clean` can remove it if the step that
-// created it did not get to delete it.
+// Record an object a loop step created, as soon as the API answers, so
+// `npm run clean` can remove it if the step that created it did not get to
+// delete it.
 export function recordCreated(config: Config, object: CreatedObject): void {
   const state = readSeedState(config);
   if (!state) throw new Error(`no seed state at ${seedStatePath(config)} to record ${object.kind} ${object.name} in`);
@@ -175,93 +137,15 @@ async function getSandbox(api: Api, id: string): Promise<AdminSandbox | null> {
   }
 }
 
-// The live sandboxes of one org whose name is `name` (with `deleting`, also
-// those being deleted), or a loud failure when the org has too many
-// sandboxes to tell.
-async function findSandboxesByName(api: Api, orgId: string, name: string, { deleting = false } = {}): Promise<AdminSandbox[]> {
+// The live sandboxes of one org whose name is `name`, or a loud failure
+// when the org has too many sandboxes to tell.
+async function findSandboxesByName(api: Api, orgId: string, name: string): Promise<AdminSandbox[]> {
   const rows = await api.admin<AdminSandbox[]>('GET', `/sandboxes?org_id=${orgId}&limit=${LIST_LIMIT}`);
-  const found = rows.filter((s) => s.name === name && (isLive(s) || (deleting && s.status === 'deleting')));
+  const found = rows.filter((s) => s.name === name && isLive(s));
   if (!found.length && rows.filter((s) => s.resource_type === undefined || s.resource_type === 'sandbox').length >= LIST_LIMIT) {
     throw new Error(`org ${orgId} has at least ${LIST_LIMIT} sandboxes, so the admin list cannot show whether ${name} exists`);
   }
   return found;
-}
-
-// Read one operation; null when the API no longer has it.
-export type ReadOperation = (op: OperationRef) => Promise<Operation | null>;
-
-export const readOperation = (api: Api): ReadOperation => async (op) => {
-  try {
-    const path = `/operations/${op.id}`;
-    return op.admin ? await api.admin<Operation>('GET', path) : await api.public<Operation>('GET', path);
-  } catch (err) {
-    if (err instanceof ApiError && err.status === 404) return null;
-    throw err;
-  }
-};
-
-// Wait for every operation recorded for an object to finish, and record
-// each outcome as soon as it is seen (`save` writes the state). An operation
-// the API no longer has finished long ago, with an outcome nobody can read
-// now: it is recorded as `gone`, and callers decide from the object itself.
-export async function settleOperations(
-  read: ReadOperation,
-  entry: CreatedObject | undefined,
-  save: () => void,
-  { pollMs = 2000, timeoutMs = OPERATION_TIMEOUT_MS }: { pollMs?: number; timeoutMs?: number } = {},
-): Promise<void> {
-  for (const op of entry?.operations ?? []) {
-    if (op.outcome) continue;
-    const deadline = Date.now() + timeoutMs;
-    let current = await read(op);
-    if (current && !TERMINAL_OPERATION_STATES.includes(current.state)) log(`waiting for the ${op.action} operation ${op.id} of ${entry!.name} (${current.state})`);
-    while (current && !TERMINAL_OPERATION_STATES.includes(current.state)) {
-      if (Date.now() > deadline) throw new Error(`operation ${op.id} is still ${current.state}`);
-      await sleep(pollMs);
-      current = await read(op);
-    }
-    op.outcome = current ? current.state : 'gone';
-    if (current?.target_id) op.targetId = current.target_id;
-    save();
-  }
-}
-
-// The sandbox a finished create made, as far as the state knows.
-const createdTarget = (entry: CreatedObject | undefined): string | undefined =>
-  entry?.operations?.find((op) => op.action === 'create' && op.outcome === 'succeeded' && op.targetId)?.targetId;
-
-// Whether an answer to a create means the API refused it before admitting
-// it: a 4xx other than 409, for example the body extractor's 400, 415 or
-// 422, or a 401, 403 or 429. A 409 is an idempotency conflict: the key was
-// admitted with another body, so the create is not resolved.
-export const rejectedBeforeAdmission = (status: number) => status >= 400 && status < 500 && status !== 409;
-
-// Whether a create has resolved: it was answered with an operation, or
-// rejected before admission.
-const resolved = (entry: CreatedObject | undefined) => !!entry?.rejected || !!entry?.operations?.some((o) => o.action === 'create');
-
-// What a sandbox create submits next. An unanswered create (a key and
-// request recorded, not resolved) is resubmitted unchanged, whatever the
-// current options: the API refuses the same key with another body. Only a
-// create that has resolved, or none, takes a fresh key and the current
-// options.
-export function nextCreate(
-  entry: CreatedObject | undefined,
-  fresh: () => { idempotencyKey: string; request: { admin: boolean; body: unknown } },
-): { idempotencyKey: string; request: { admin: boolean; body: unknown }; replay: boolean } {
-  if (entry?.idempotencyKey && entry.request && !resolved(entry)) return { idempotencyKey: entry.idempotencyKey, request: entry.request, replay: true };
-  return { ...fresh(), replay: false };
-}
-
-// What `clean` does with a sandbox create it found no sandbox for: replay a
-// seed create that never resolved, drop one that was rejected or never left
-// the browser, keep a browser create that left with no answer as
-// unresolved, and forget one whose create finished (nothing of it is left).
-export function unfoundCreate(entry: CreatedObject): 'replay' | 'rejected' | 'never submitted' | 'unresolved' | 'finished' {
-  if (entry.rejected) return 'rejected';
-  if (entry.operations?.some((o) => o.action === 'create')) return 'finished';
-  if (entry.idempotencyKey && entry.request) return 'replay';
-  return entry.submitted ? 'unresolved' : 'never submitted';
 }
 
 // Org slugs the seed creates and reuses; any other recorded org is one a
@@ -302,19 +186,18 @@ class Seeder {
     if (!this.state.notes.includes(text)) this.state.notes.push(text);
   }
 
-  private record(object: CreatedObject): CreatedObject {
-    const entry = upsertCreated(this.state, object);
+  private record(object: CreatedObject): string {
+    upsertCreated(this.state, object);
     this.save();
-    return entry;
+    return object.id;
   }
 
   save(): void {
     writeSeedState(this.config, this.state);
   }
 
-  // Orgs, users and API keys have no idempotent create; their names (slug,
-  // email, key name) are what a rerun and cleanup find them by, and each is
-  // recorded before its create is submitted.
+  // Orgs, users and API keys are found by slug, email or key name; one that
+  // exists carries the prefix, so it is this seed's and is reused.
   async orgs(): Promise<void> {
     const cluster = await this.api.admin<{ managing_org_id: string }>('GET', '/cluster');
     this.state.managingOrgId = cluster.managing_org_id;
@@ -327,14 +210,11 @@ class Seeder {
       let org = bySlug.get(slug);
       if (!org) {
         const parentId = parent ? this.state.orgs[parent] : null;
-        this.record({ kind: 'org', name: slug });
         org = await this.api.admin<Org>('POST', '/orgs', { name: orgDisplayName(this.config.prefix, title), slug, parent_id: parentId });
         bySlug.set(slug, org);
         log(`created org ${slug}`);
       }
-      // A reused org carries the prefix, so it is this seed's too.
-      this.record({ kind: 'org', id: org.id, name: slug });
-      this.state.orgs[key] = org.id;
+      this.state.orgs[key] = this.record({ kind: 'org', id: org.id, name: slug });
     }
   }
 
@@ -348,7 +228,6 @@ class Seeder {
         // password this state records, so the role steps can sign in.
         await this.api.admin('PATCH', `/users/${existing.id}`, { password: this.state.userPassword });
       }
-      if (!existing) this.record({ kind: 'user', name: email, orgId });
       const user = existing ?? (await this.api.admin<User>('POST', `/orgs/${orgId}/users`, {
         email, password: this.state.userPassword, display_name: displayName, role,
       }));
@@ -367,13 +246,11 @@ class Seeder {
       const name = this.name(suffix);
       let key = keys.get(name);
       if (!key) {
-        this.record({ kind: 'apiKey', name, orgId });
         // The response carries the key's secret; it is not kept.
         key = (await this.api.admin<{ api_key: ApiKey }>('POST', `/orgs/${orgId}/api-keys`, { name, allowed_surfaces: surfaces })).api_key;
         log(`created API key ${name}`);
       }
-      this.record({ kind: 'apiKey', id: key.id, name, orgId });
-      this.state.apiKeys[suffix] = key.id;
+      this.state.apiKeys[suffix] = this.record({ kind: 'apiKey', id: key.id, name, orgId });
     }
   }
 
@@ -389,83 +266,41 @@ class Seeder {
   }
 
   // A live sandbox named `name` in `org`: the recorded one, one found by
-  // name, or a new one. A rerun first waits for the operations recorded for
-  // it, then resubmits an unanswered create with its recorded key.
+  // name, or a new one.
   private async create(name: string, org: string): Promise<string> {
     const orgId = this.state.orgs[org];
-    const admin = org !== 'managing';
-    const entry = findCreated(this.state, 'sandbox', name);
-    await settleOperations(readOperation(this.api), entry, () => this.save());
-    const target = createdTarget(entry);
-    const recordedId = entry?.id ?? (target ? publicId(target) : undefined);
-    if (recordedId) {
-      const current = await getSandbox(this.api, recordedId);
-      if (current && isLive(current)) return this.record({ kind: 'sandbox', id: recordedId, name, orgId }).id!;
+    const recorded = this.state.created.find((o) => o.kind === 'sandbox' && o.name === name);
+    if (recorded) {
+      const current = await getSandbox(this.api, recorded.id);
+      if (current && isLive(current)) return recorded.id;
     }
     const existing = await findSandboxesByName(this.api, orgId, name);
     if (existing.length > 1) this.note(`${existing.length} live sandboxes are named ${name}; using the first`);
-    if (existing.length) return this.record({ kind: 'sandbox', id: publicId(existing[0].id), name, orgId }).id!;
+    if (existing.length) return this.record({ kind: 'sandbox', id: publicId(existing[0].id), name, orgId });
 
-    const { idempotencyKey, request, replay } = nextCreate(entry, () => {
-      const sandbox = { template: this.template, runtime: 'fc', name };
-      return { idempotencyKey: randomUUID(), request: { admin, body: admin ? { org_id: orgId, sandbox } : sandbox } };
-    });
-    if (replay) {
-      log(`resubmitting the unanswered create of ${name} unchanged, with its recorded key`);
-    } else {
-      // Every earlier operation has finished and its sandbox is gone, or
-      // the earlier create was rejected.
-      const pending = this.record({ kind: 'sandbox', name, orgId, idempotencyKey, request });
-      pending.id = undefined;
-      pending.operations = [];
-      pending.rejected = undefined;
-      this.save();
-    }
-    let accepted: Accepted;
-    try {
-      accepted = await submitCreate(this.api, request, idempotencyKey);
-    } catch (err) {
-      if (err instanceof ApiError && rejectedBeforeAdmission(err.status)) {
-        findCreated(this.state, 'sandbox', name)!.rejected = err.status;
-        this.save();
-        throw new Error(`create ${name} was rejected (${err.status}): ${err.body.slice(0, 200)}; a rerun makes a new create with the current options`);
-      }
-      if (err instanceof ApiError && err.status === 409) {
-        throw new Error(`create ${name} conflicts with an earlier use of its key (409); it stays recorded, and the same request is resubmitted on a rerun: ${err.body.slice(0, 200)}`);
-      }
-      throw err;
-    }
-    const surface = request.admin;
-    this.record({
-      kind: 'sandbox', name, orgId,
-      id: accepted.sandbox_id ? publicId(accepted.sandbox_id) : undefined,
-      operations: [{ id: accepted.operation_id, admin: surface, action: 'create' }],
-    });
-    const op = await this.api.waitForOperation(accepted.operation_id, { admin: surface, timeoutMs: OPERATION_TIMEOUT_MS });
-    const id = publicId(accepted.sandbox_id ?? op.target_id ?? '');
-    const entryNow = this.record({ kind: 'sandbox', id, name, orgId });
-    const created = entryNow.operations!.find((o) => o.id === op.id)!;
-    created.outcome = op.state;
-    if (op.target_id) created.targetId = op.target_id;
-    this.save();
-    if (op.state !== 'succeeded') throw new Error(`create ${name}: operation ${op.state} ${op.progress_message ?? ''}`);
+    const admin = org !== 'managing';
+    const sandbox = { template: this.template, runtime: 'fc', name };
+    const options = { idempotent: true, timeoutMs: 120_000 };
+    const accepted = admin
+      ? await this.api.admin<Accepted>('POST', '/sandboxes', { org_id: orgId, sandbox }, options)
+      : await this.api.public<Accepted>('POST', '/sandboxes', sandbox, options);
+    if (accepted.sandbox_id) this.record({ kind: 'sandbox', id: publicId(accepted.sandbox_id), name, orgId });
+    const op = await this.api.waitForOperation(accepted.operation_id, { admin, timeoutMs: OPERATION_TIMEOUT_MS });
+    const target = accepted.sandbox_id ?? op.target_id;
+    if (target) this.record({ kind: 'sandbox', id: publicId(target), name, orgId });
+    if (op.state !== 'succeeded' || !target) throw new Error(`create ${name}: operation ${op.state} ${op.progress_message ?? ''}`);
     log(`created sandbox ${name}`);
-    return id;
+    return publicId(target);
   }
 
-  private async act(id: string, name: string, action: string): Promise<void> {
+  private async act(id: string, action: string): Promise<void> {
     const accepted = await this.api.admin<{ operation_id: string }>('POST', `/sandboxes/${id}:force-${action}`, undefined, { idempotent: true, timeoutMs: 120_000 });
-    this.record({ kind: 'sandbox', name, operations: [{ id: accepted.operation_id, admin: true, action }] });
     const op = await this.api.waitForOperation(accepted.operation_id, { admin: true, timeoutMs: OPERATION_TIMEOUT_MS });
-    const recorded = findCreated(this.state, 'sandbox', name)!.operations!.find((o) => o.id === op.id)!;
-    recorded.outcome = op.state;
-    this.save();
     if (op.state !== 'succeeded') throw new Error(`${action} ${id}: operation ${op.state} ${op.progress_message ?? ''}`);
   }
 
-  // One sandbox per resting state, one in a tenant org, and one deleted (its
-  // operations outlive it). Any that cannot be set up fails the seed, after
-  // the others are tried.
+  // One sandbox per resting state, one in a tenant org, and one deleted. Any
+  // that cannot be set up fails the seed, after the others are tried.
   async sandboxes(): Promise<void> {
     const failures: string[] = [];
     for (const [key, org, action, state] of SANDBOXES) {
@@ -478,7 +313,7 @@ class Seeder {
         if (current === state) continue;
         await this.waitFor(id, ['started', state]);
         if (action) {
-          await this.act(id, name, action);
+          await this.act(id, action);
           await this.waitFor(id, [state]);
           log(`${name} is ${state}`);
         }
@@ -497,20 +332,9 @@ class Seeder {
   private async deletedSandbox(): Promise<void> {
     if (this.state.sandboxes.deleted) return;
     const name = this.name('deleted');
-    const entry = findCreated(this.state, 'sandbox', name);
-    // A rerun after the delete was submitted: wait for it instead of
-    // creating another.
-    if (entry?.id && entry.operations?.some((o) => o.action === 'delete')) {
-      await settleOperations(readOperation(this.api), entry, () => this.save());
-      const current = await getSandbox(this.api, entry.id);
-      if (!current || !isLive(current)) {
-        this.state.sandboxes.deleted = entry.id;
-        return;
-      }
-    }
     const id = await this.create(name, 'managing');
     await this.waitFor(id, ['started']);
-    await this.act(id, name, 'delete');
+    await this.act(id, 'delete');
     this.state.sandboxes.deleted = id;
     log(`${name} created and deleted`);
   }
@@ -531,97 +355,34 @@ class Seeder {
   }
 }
 
-function submitCreate(api: Api, request: { admin: boolean; body: unknown }, idempotencyKey: string): Promise<Accepted> {
-  return request.admin
-    ? api.admin<Accepted>('POST', '/sandboxes', request.body, { idempotencyKey, timeoutMs: 120_000 })
-    : api.public<Accepted>('POST', '/sandboxes', request.body, { idempotencyKey, timeoutMs: 120_000 });
-}
-
 export function orgDisplayName(prefix: string, title: string): string {
   return `${title} (${prefix})`;
 }
 
-// Delete one recorded sandbox. Returns `deleted` once it is gone: every
-// operation recorded for it has finished, and it is deleted or no longer
-// found by ID. A 404 counts as gone only once nothing recorded for it is
-// still running. Returns `never submitted` for a loop create whose request
-// never left the browser, and `unresolved` for one that left with no answer
-// and no sandbox of its name yet: a create can stay queued, without a
-// sandbox, after the loop is gone.
-type CleanedSandbox = { outcome: 'deleted' | 'never submitted' | 'rejected' | 'unresolved'; why?: string };
-
-async function cleanSandbox(api: Api, entry: CreatedObject, save: () => void): Promise<CleanedSandbox> {
-  await settleOperations(readOperation(api), entry, save);
-  const ids = new Set<string>();
-  if (entry.id) ids.add(publicId(entry.id));
-  const target = createdTarget(entry);
-  if (target) ids.add(publicId(target));
-  if (!ids.size && entry.orgId) {
-    for (const found of await findSandboxesByName(api, entry.orgId, entry.name, { deleting: true })) ids.add(publicId(found.id));
-  }
-  if (!ids.size && unfoundCreate(entry) === 'replay') {
-    // A seed create submitted but never answered. A create still queued has
-    // no sandbox to find by name, so resubmit it, unchanged, with its key:
-    // the API answers with the original operation if the first submit
-    // arrived (or creates it now), and either way the sandbox is then
-    // deleted.
-    log(`resubmitting the unanswered create of ${entry.name} unchanged, with its key, to learn its operation`);
-    let accepted: Accepted;
-    try {
-      accepted = await submitCreate(api, entry.request!, entry.idempotencyKey!);
-    } catch (err) {
-      if (err instanceof ApiError && rejectedBeforeAdmission(err.status)) {
-        entry.rejected = err.status;
-        save();
-        return { outcome: 'rejected', why: `${err.status}` };
-      }
-      if (err instanceof ApiError && err.status === 409) {
-        return { outcome: 'unresolved', why: 'its key conflicts with an earlier use (409); the same request is resubmitted next time' };
-      }
-      throw err;
-    }
-    addOperation(entry, { id: accepted.operation_id, admin: entry.request!.admin, action: 'create' });
-    if (accepted.sandbox_id) entry.id = publicId(accepted.sandbox_id);
-    save();
-    await settleOperations(readOperation(api), entry, save);
-    const id = accepted.sandbox_id ?? createdTarget(entry);
-    if (id) ids.add(publicId(id));
-  }
-  if (!ids.size) {
-    switch (unfoundCreate(entry)) {
-      case 'rejected': return { outcome: 'rejected', why: `${entry.rejected}` };
-      case 'unresolved': return { outcome: 'unresolved', why: 'its create left the browser with no answer, and no sandbox has its name yet' };
-      case 'never submitted': return { outcome: 'never submitted' };
-      default: return { outcome: 'deleted' }; // its create finished, and nothing of it is left
+// Delete one recorded sandbox and wait until it is deleted or no longer
+// found by ID.
+async function cleanSandbox(api: Api, entry: CreatedObject): Promise<string> {
+  let current = await getSandbox(api, entry.id);
+  if (!current) return 'already gone';
+  if (current.status !== 'deleted' && current.status !== 'deleting') {
+    const accepted = await api.admin<{ operation_id: string }>('POST', `/sandboxes/${entry.id}:force-delete`, undefined, { idempotent: true });
+    const op = await api.waitForOperation(accepted.operation_id, { admin: true, timeoutMs: OPERATION_TIMEOUT_MS });
+    current = await getSandbox(api, entry.id);
+    // A delete that fails because another delete got there first is fine
+    // once the sandbox is going.
+    if (op.state !== 'succeeded' && current && current.status !== 'deleted' && current.status !== 'deleting') {
+      throw new Error(`delete operation ${op.state}${op.progress_message ? `: ${op.progress_message}` : ''}`);
     }
   }
-  for (const id of ids) {
-    let current = await getSandbox(api, id);
-    if (current && current.status !== 'deleted' && current.status !== 'deleting') {
-      const accepted = await api.admin<{ operation_id: string }>('POST', `/sandboxes/${id}:force-delete`, undefined, { idempotent: true });
-      addOperation(entry, { id: accepted.operation_id, admin: true, action: 'delete' });
-      save();
-      const op = await api.waitForOperation(accepted.operation_id, { admin: true, timeoutMs: OPERATION_TIMEOUT_MS });
-      const recorded = entry.operations!.find((o) => o.id === op.id)!;
-      recorded.outcome = op.state;
-      save();
-      current = await getSandbox(api, id);
-      // A delete that fails because another delete got there first is fine
-      // once the sandbox is going.
-      if (op.state !== 'succeeded' && current && current.status !== 'deleted' && current.status !== 'deleting') {
-        throw new Error(`delete operation ${op.state}${op.progress_message ? `: ${op.progress_message}` : ''}`);
-      }
-    }
-    const deadline = Date.now() + OPERATION_TIMEOUT_MS;
-    if (current?.status === 'deleting') log(`waiting for ${entry.name} (${id}) to finish deleting`);
-    while (current?.status === 'deleting') {
-      if (Date.now() > deadline) throw new Error(`${id} is still deleting`);
-      await sleep(3000);
-      current = await getSandbox(api, id);
-    }
-    if (current && current.status !== 'deleted') throw new Error(`${id} is ${current.status} after its delete`);
+  const deadline = Date.now() + OPERATION_TIMEOUT_MS;
+  if (current?.status === 'deleting') log(`waiting for ${entry.name} (${entry.id}) to finish deleting`);
+  while (current?.status === 'deleting') {
+    if (Date.now() > deadline) throw new Error(`${entry.id} is still deleting`);
+    await sleep(3000);
+    current = await getSandbox(api, entry.id);
   }
-  return { outcome: 'deleted' };
+  if (current && current.status !== 'deleted') throw new Error(`${entry.id} is ${current.status} after its delete`);
+  return 'deleted';
 }
 
 // Delete what the state recorded: sandboxes, then users and API keys, then
@@ -630,13 +391,10 @@ async function cleanSandbox(api: Api, entry: CreatedObject, save: () => void): P
 // and each is refused while it holds a child org, a user, an API key, or a
 // sandbox that is not deleted. Its credentials, credential references,
 // master keys, template grants and other cascaded rows are not checked:
-// they go with the org (see README.md). An unresolved sandbox create is
-// kept, and reported, unless `forgetUnresolved` is set.
-async function clean(api: Api, config: Config, state: SeedState, { deleteOrgs, forgetUnresolved }: { deleteOrgs: boolean; forgetUnresolved: boolean }): Promise<number> {
+// they go with the org (see README.md).
+async function clean(api: Api, config: Config, state: SeedState, { deleteOrgs }: { deleteOrgs: boolean }): Promise<number> {
   const failures: string[] = [];
-  const unresolved: string[] = [];
   const gone = new Set<CreatedObject>();
-  const save = () => writeSeedState(config, state);
   const recorded = (kind: CreatedKind) => state.created.filter((o) => o.kind === kind);
   const attempt = async (object: CreatedObject, run: () => Promise<string>) => {
     try {
@@ -657,52 +415,20 @@ async function clean(api: Api, config: Config, state: SeedState, { deleteOrgs, f
     }
   };
 
-  for (const sandbox of recorded('sandbox')) {
-    try {
-      const { outcome, why } = await cleanSandbox(api, sandbox, save);
-      if (outcome === 'unresolved' && !forgetUnresolved) {
-        unresolved.push(sandbox.name);
-        log(`unresolved: sandbox ${sandbox.name}: ${why}`);
-        continue;
-      }
-      const shown = outcome === 'unresolved' ? 'forgotten (--forget-unresolved)'
-        : outcome === 'rejected' ? `dropped, the API rejected its create (${why})` : outcome;
-      log(`${shown}: sandbox ${sandbox.name}`);
-      gone.add(sandbox);
-    } catch (err) {
-      failures.push(`sandbox ${sandbox.name}: ${describe(err)}`);
-    }
-  }
-  for (const user of recorded('user')) {
-    await attempt(user, async () => {
-      const ids = user.id ? [user.id]
-        : (await api.admin<User[]>('GET', `/orgs/${user.orgId}/users`)).filter((u) => u.email === user.name).map((u) => u.id);
-      if (!ids.length) return 'never created';
-      for (const id of ids) await remove(`/users/${id}`);
-      return 'deleted';
-    });
-  }
-  for (const key of recorded('apiKey')) {
-    await attempt(key, async () => {
-      const ids = key.id ? [key.id]
-        : (await api.admin<ApiKey[]>('GET', `/orgs/${key.orgId}/api-keys`)).filter((k) => k.name === key.name).map((k) => k.id);
-      if (!ids.length) return 'never created';
-      for (const id of ids) await remove(`/orgs/${key.orgId}/api-keys/${id}`);
-      return 'deleted';
-    });
-  }
+  for (const sandbox of recorded('sandbox')) await attempt(sandbox, () => cleanSandbox(api, sandbox));
+  for (const user of recorded('user')) await attempt(user, () => remove(`/users/${user.id}`));
+  for (const key of recorded('apiKey')) await attempt(key, () => remove(`/orgs/${key.orgId}/api-keys/${key.id}`));
 
   const orgs = await api.admin<Org[]>('GET', '/orgs');
-  const ours = recorded('org').map((org) => ({ org, id: org.id ?? orgs.find((o) => o.slug === org.name)?.id }));
   const deletedOrgs = new Set<string>();
   const kept: string[] = [];
-  const depth = (id: string | undefined): number => {
+  const depth = (id: string): number => {
     const parent = orgs.find((o) => o.id === id)?.parent_id;
     return parent ? 1 + depth(parent) : 0;
   };
-  for (const { org, id } of ours.sort((a, b) => depth(b.id) - depth(a.id))) {
-    if (!id || !orgs.some((o) => o.id === id)) {
-      await attempt(org, async () => (id ? 'already gone' : 'never created'));
+  for (const org of recorded('org').sort((a, b) => depth(b.id) - depth(a.id))) {
+    if (!orgs.some((o) => o.id === org.id)) {
+      await attempt(org, async () => 'already gone');
       continue;
     }
     if (!deleteOrgs && isSeededOrg(state.prefix, org.name)) {
@@ -711,15 +437,15 @@ async function clean(api: Api, config: Config, state: SeedState, { deleteOrgs, f
     }
     await attempt(org, async () => {
       const foreign: string[] = [];
-      for (const child of orgs.filter((o) => o.parent_id === id && !deletedOrgs.has(o.id))) foreign.push(`child org ${child.slug}`);
-      for (const user of await api.admin<User[]>('GET', `/orgs/${id}/users`)) foreign.push(`user ${user.email}`);
-      for (const key of await api.admin<ApiKey[]>('GET', `/orgs/${id}/api-keys`)) foreign.push(`API key ${key.name}`);
-      for (const sandbox of await api.admin<AdminSandbox[]>('GET', `/sandboxes?org_id=${id}&limit=${LIST_LIMIT}`)) {
-        if (sandbox.org_id === id && sandbox.status !== 'deleted') foreign.push(`sandbox ${sandbox.name ?? sandbox.id} (${sandbox.status})`);
+      for (const child of orgs.filter((o) => o.parent_id === org.id && !deletedOrgs.has(o.id))) foreign.push(`child org ${child.slug}`);
+      for (const user of await api.admin<User[]>('GET', `/orgs/${org.id}/users`)) foreign.push(`user ${user.email}`);
+      for (const key of await api.admin<ApiKey[]>('GET', `/orgs/${org.id}/api-keys`)) foreign.push(`API key ${key.name}`);
+      for (const sandbox of await api.admin<AdminSandbox[]>('GET', `/sandboxes?org_id=${org.id}&limit=${LIST_LIMIT}`)) {
+        if (sandbox.org_id === org.id && sandbox.status !== 'deleted') foreign.push(`sandbox ${sandbox.name ?? sandbox.id} (${sandbox.status})`);
       }
       if (foreign.length) throw new Error(`refused: it still holds ${foreign.join(', ')}`);
-      const result = await remove(`/orgs/${id}`);
-      deletedOrgs.add(id);
+      const result = await remove(`/orgs/${org.id}`);
+      deletedOrgs.add(org.id);
       return result;
     });
   }
@@ -734,23 +460,23 @@ async function clean(api: Api, config: Config, state: SeedState, { deleteOrgs, f
   state.apiKeys = Object.fromEntries(Object.entries(state.apiKeys).filter(([, id]) => keys.has(id)));
   state.sandboxes = Object.fromEntries(Object.entries(state.sandboxes).filter(([, id]) => sandboxes.has(id)));
   state.orgs = Object.fromEntries(Object.entries(state.orgs).filter(([key, id]) => key === 'managing' || orgIds.has(id)));
+  const file = seedStatePath(config);
   if (!state.created.length) {
-    fs.rmSync(seedStatePath(config), { force: true });
+    fs.rmSync(file, { force: true });
     log('everything recorded is deleted');
   } else {
-    save();
+    writeSeedState(config, state);
   }
   if (kept.length) {
     log(`kept ${kept.length} seeded organization(s), which a seed reuses: ${kept.join(', ')}`);
     log('pass --delete-orgs to delete them; deleting an organization also deletes its credentials, keys and grants (see README.md)');
   }
   for (const failure of failures) log(`NOT deleted: ${failure}`);
-  if (failures.length) log(`${failures.length} object(s) not deleted; still recorded in ${seedStatePath(config)}`);
-  if (unresolved.length) {
-    log(`${unresolved.length} unresolved sandbox create(s), still recorded: ${unresolved.join(', ')}`);
-    log('a later clean looks them up by name again; pass --forget-unresolved to drop them');
+  if (failures.length) {
+    log(`${failures.length} object(s) not deleted; still recorded in ${file}`);
+    log(`rerun \`npm run clean\`; if it keeps failing, ${resetAdvice(file)}`);
   }
-  return failures.length || unresolved.length ? 1 : 0;
+  return failures.length ? 1 : 0;
 }
 
 async function main(): Promise<number> {
@@ -766,11 +492,15 @@ async function main(): Promise<number> {
     return 0;
   }
   const { api, identity } = await proveSameStack(config, previous?.stack ?? null, what, seedStatePath(config));
-  if (cleaning) return clean(api, config, previous!, { deleteOrgs: flag(args, 'delete-orgs'), forgetUnresolved: flag(args, 'forget-unresolved') });
+  if (cleaning) return clean(api, config, previous!, { deleteOrgs: flag(args, 'delete-orgs') });
   const template = option(args, 'template', process.env.CONSOLE_LOOP_TEMPLATE ?? 'seed:latest')!;
-  const state = await new Seeder(api, config, template, previous, identity).run(flag(args, 'skip-sandboxes'));
-  log(`seeded under "${state.prefix}"; state in ${seedStatePath(config)}`);
-  for (const note of state.notes) log(`note: ${note}`);
+  try {
+    const state = await new Seeder(api, config, template, previous, identity).run(flag(args, 'skip-sandboxes'));
+    log(`seeded under "${state.prefix}"; state in ${seedStatePath(config)}`);
+    for (const note of state.notes) log(`note: ${note}`);
+  } catch (err) {
+    throw new Error(`${describe(err)}\nrerun \`npm run seed\`, which reuses what exists; if it keeps failing, ${resetAdvice(seedStatePath(config))}`);
+  }
   return 0;
 }
 

@@ -9,7 +9,7 @@ import {
   signIn, text, visit, waitForStatus, withoutSecret, type Ctx,
 } from './browser.ts';
 import { verifyFixtures } from './fixtures.ts';
-import { orgDisplayName, recordCreated, rejectedBeforeAdmission } from './seed.ts';
+import { orgDisplayName, recordCreated } from './seed.ts';
 
 export interface Step {
   name: string;
@@ -34,30 +34,6 @@ const jsonOf = async (res: Response | null): Promise<any> => (res?.ok() ? res.js
 const KEY_SHAPED = /\b[0-9a-f]{64}\b/i;
 const sbxId = (id: string) => (id.startsWith('sbx_') ? id : `sbx_${id}`);
 
-// Record the operation of every action or delete the page sends for a
-// sandbox, as its answer arrives, so `npm run clean` can wait for it. Call
-// the returned function when the step is done.
-const recordOperations = (c: Ctx, id: string, name: string): (() => Promise<void>) => {
-  const bare = id.replace(/^sbx_/, '');
-  const reads: Promise<void>[] = [];
-  const onResponse = (res: Response) => {
-    const method = res.request().method();
-    const pathname = new URL(res.url()).pathname;
-    if (method === 'GET' || !pathname.includes(bare)) return;
-    const colon = pathname.lastIndexOf(':');
-    const action = method === 'DELETE' ? 'delete' : colon >= 0 ? pathname.slice(colon + 1).replace(/^force-/, '') : method.toLowerCase();
-    reads.push(res.json().then((body) => {
-      if (typeof body?.operation_id === 'string') {
-        recordCreated(c.config, { kind: 'sandbox', name, operations: [{ id: body.operation_id, admin: pathname.startsWith('/admin/'), action }] });
-      }
-    }, () => {}));
-  };
-  c.page.on('response', onResponse);
-  return async () => {
-    c.page.off('response', onResponse);
-    await Promise.allSettled(reads);
-  };
-};
 const orgId = (c: Ctx, key: string) => seeded(c).orgs[key];
 const sandboxId = (c: Ctx, key: string) => seeded(c).sandboxes[key];
 const email = (c: Ctx, local: string) => `${c.config.prefix}-${local}@example.test`;
@@ -134,7 +110,6 @@ step('org-create-delete', ['orgs', 'flows'], async (c) => {
   const modal = c.page.locator('.ant-modal:visible');
   await modal.getByPlaceholder('Name').fill(`${c.runTag} org`);
   await modal.getByPlaceholder('Slug').fill(c.runTag);
-  recordCreated(c.config, { kind: 'org', name: c.runTag });
   const response = nextPost(c.page, (p) => p === '/admin/api/v1/orgs');
   await modal.getByRole('button', { name: 'Create organization' }).click();
   const created = await jsonOf(await response);
@@ -178,7 +153,6 @@ step('user-create-role-delete', ['users', 'flows'], async (c) => {
   await c.page.getByPlaceholder('Email').fill(address);
   await c.page.getByPlaceholder('Password').fill(seeded(c).userPassword);
   await c.page.getByPlaceholder('Display Name').fill('Loop Temporary');
-  recordCreated(c.config, { kind: 'user', name: address, orgId: orgId(c, 'acme') });
   const response = nextPost(c.page, (p) => p === `/admin/api/v1/orgs/${orgId(c, 'acme')}/users`);
   await c.page.getByRole('button', { name: 'Create' }).click();
   const listed = await jsonOf(await response);
@@ -261,7 +235,6 @@ step('api-key-create-revoke', ['api-keys', 'flows'], async (c) => {
     await c.page.getByRole('button', { name: 'Create API key' }).click();
     const modal = c.page.locator('.ant-modal:visible');
     await modal.locator('input').first().fill(c.runTag);
-    recordCreated(c.config, { kind: 'apiKey', name: c.runTag, orgId: managing });
     await modal.getByRole('button', { name: 'Create' }).click();
     const dialog = c.page.locator('.ant-modal:visible', { hasText: 'Copy this key now' });
     const opened = await dialog.waitFor({ timeout: 30_000 }).then(() => true, () => false);
@@ -338,44 +311,13 @@ step('sandbox-create', ['sandboxes', 'flows', 'lifecycle'], async (c) => {
   const card = c.page.locator('.ant-card', { hasText: 'Create sandbox' });
   await card.getByPlaceholder('Name').fill(c.runTag);
   const managing = seeded(c).managingOrgId;
-  recordCreated(c.config, { kind: 'sandbox', name: c.runTag, orgId: managing });
-  // The create goes through `page.route`, so the state says the request
-  // left (`submitted`) before it does, and holds its operation as soon as
-  // the answer arrives: a create still queued when the loop dies is then
-  // kept as unresolved by `npm run clean`, not forgotten.
-  const isCreate = (url: URL) => url.pathname.endsWith('/v1/sandboxes');
-  let redirected = false;
-  const handler = async (route: Route) => {
-    if (route.request().method() !== 'POST') return route.fallback();
-    recordCreated(c.config, { kind: 'sandbox', name: c.runTag, orgId: managing, submitted: true });
-    const response = await fetchWithoutRedirect(route);
-    if (!response) {
-      redirected = true;
-      return;
-    }
-    const body = await response.text();
-    // Refused before admission: the create resolved with nothing made.
-    if (rejectedBeforeAdmission(response.status())) recordCreated(c.config, { kind: 'sandbox', name: c.runTag, orgId: managing, rejected: response.status() });
-    let accepted: { operation_id?: string; sandbox_id?: string } | null = null;
-    try { accepted = JSON.parse(body); } catch { /* not JSON */ }
-    if (response.ok() && typeof accepted?.operation_id === 'string') {
-      const id = typeof accepted.sandbox_id === 'string' ? sbxId(accepted.sandbox_id) : undefined;
-      const admin = new URL(route.request().url()).pathname.startsWith('/admin/');
-      recordCreated(c.config, { kind: 'sandbox', id, name: c.runTag, orgId: managing, operations: [{ id: accepted.operation_id, admin, action: 'create' }] });
-      if (id) c.shared.sandbox = id;
-    }
-    const headers = { ...response.headers() };
-    delete headers['content-length'];
-    await route.fulfill({ status: response.status(), headers, body });
-  };
-  await c.page.route(isCreate, handler);
-  try {
-    await card.locator('button[type=submit]').click();
-    await c.page.waitForTimeout(1500);
-  } finally {
-    await c.page.unroute(isCreate, handler);
+  const response = nextPost(c.page, (p) => p.endsWith('/v1/sandboxes'));
+  await card.locator('button[type=submit]').click();
+  const accepted = await jsonOf(await response);
+  if (typeof accepted?.sandbox_id === 'string') {
+    c.shared.sandbox = sbxId(accepted.sandbox_id);
+    recordCreated(c.config, { kind: 'sandbox', id: c.shared.sandbox, name: c.runTag, orgId: managing });
   }
-  if (redirected) return c.rec.check(false, 'the create is answered without a redirect');
   const deadline = Date.now() + 120_000;
   while (Date.now() < deadline && !c.shared.sandbox) {
     await c.page.waitForTimeout(3000);
@@ -405,15 +347,10 @@ for (const [action, label, want, confirm] of [
     await waitForStatus(c, id, ['started', 'running', 'paused', 'suspended', 'stopped'], 120_000);
     const button = c.page.locator('.ant-card', { hasText: 'Controls' }).getByRole('button', { name: label });
     if (!(await button.isEnabled())) return c.rec.check(false, `${action} is enabled`);
-    const recorded = recordOperations(c, id, c.runTag);
-    try {
-      await button.click();
-      if (confirm) await confirmPopover(c.page, label);
-      const reached = await waitForStatus(c, id, [...want], 240_000);
-      c.rec.check((want as readonly string[]).includes(reached), `${action} reaches ${want.join(' or ')} (${reached})`);
-    } finally {
-      await recorded();
-    }
+    await button.click();
+    if (confirm) await confirmPopover(c.page, label);
+    const reached = await waitForStatus(c, id, [...want], 240_000);
+    c.rec.check((want as readonly string[]).includes(reached), `${action} reaches ${want.join(' or ')} (${reached})`);
   }, true);
 }
 
@@ -421,15 +358,10 @@ step('sandbox-delete', ['sandboxes', 'flows', 'lifecycle'], async (c) => {
   const id = c.shared.sandbox;
   if (!id) return;
   await visit(c, `/dashboard/sandboxes/${id}`, 2000);
-  const recorded = recordOperations(c, id, c.runTag);
-  try {
-    await c.page.locator('.ant-card', { hasText: 'Controls' }).getByRole('button', { name: /Delete/ }).click();
-    await confirmPopover(c.page);
-    await c.page.waitForURL(/\/dashboard\/sandboxes$/, { timeout: 120_000 }).catch(() => {});
-    await settle(c.page, 2000);
-  } finally {
-    await recorded();
-  }
+  await c.page.locator('.ant-card', { hasText: 'Controls' }).getByRole('button', { name: /Delete/ }).click();
+  await confirmPopover(c.page);
+  await c.page.waitForURL(/\/dashboard\/sandboxes$/, { timeout: 120_000 }).catch(() => {});
+  await settle(c.page, 2000);
   c.rec.check(/\/dashboard\/sandboxes$/.test(c.page.url()), 'deleting a sandbox returns to the list');
 }, true);
 
