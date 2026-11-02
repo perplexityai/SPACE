@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use sqlx::PgPool;
 
+use pplx_space_sandbox_store::delete::delete_with_dependents;
 use pplx_space_sandbox_store::fork_source_lifecycle::{
     active_fork_source_operation_exists, lock_fork_source_lifecycle,
 };
@@ -14,8 +15,7 @@ pub use pplx_space_common_svc::types::{
     NetworkPolicyTarget, ReconcileElementRef, ReconcileFacet, ReconcileReason, ReconcileRef,
 };
 pub use pplx_space_sandbox_teardown::{
-    delete_reconcile_state_for_elements, finalize_sandbox_db_delete_tx,
-    sandbox_reconcile_cleanup_refs,
+    delete_reconcile_state_for_elements, sandbox_reconcile_cleanup_refs,
 };
 
 use crate::reconcile_trigger::{enqueue_triggers, enqueue_triggers_tx};
@@ -36,7 +36,7 @@ pub struct EnqueuedNodeReconcile {
 /// (`crates/libs/node/api/server/src/cluster.rs`) INSERTs the `snapshots`
 /// row with `state='creating'` **before** the S3 upload starts, and flips
 /// to `state='ready'` only after the upload completes. If a user DELETEs
-/// the sandbox in that window, [`finalize_sandbox_db_delete_tx`]'s
+/// the sandbox in that window, [`delete_with_dependents`]'s
 /// CASCADE drops the `snapshots` row and the storage-location row's
 /// `snapshot_id` becomes NULL — but the S3 upload is still actively
 /// writing under the prefix. The orphan-storage-location sweeper
@@ -133,7 +133,7 @@ pub async fn in_flight_snapshot_upload_idle_for<'e>(
 ///   proceeds normally after we release).
 ///
 /// Without the parent-row lock, a `BeginArtifactBackup` arriving
-/// between the snapshot scan and `finalize_sandbox_db_delete_tx`
+/// between the snapshot scan and `delete_with_dependents`
 /// would slip a fresh `state='creating'` row past the gate.
 pub async fn finalize_sandbox_db_delete_user_initiated(
     pool: &PgPool,
@@ -145,14 +145,15 @@ pub async fn finalize_sandbox_db_delete_user_initiated(
     // concurrent BeginArtifactBackup INSERT (which acquires the
     // implicit FK FOR KEY SHARE on this row). Result is discarded —
     // if the sandbox doesn't exist (already deleted), the
-    // subsequent finalize_sandbox_db_delete_tx is a no-op.
+    // subsequent delete_with_dependents deletes no `sandboxes` row
+    // and only clears any dependent rows left for this id.
     sqlx::query(sql!("SELECT 1 FROM sandboxes WHERE id = $1 FOR UPDATE"))
         .bind(sandbox_id)
         .fetch_optional(&mut *tx)
         .await?;
     // Under the parent-row lock above, no new `creating` row can
     // appear between this SELECT and the orphan UPDATE inside
-    // `finalize_sandbox_db_delete_tx`. A plain SELECT (no row lock)
+    // `delete_with_dependents`. A plain SELECT (no row lock)
     // is enough.
     if let Some(idle_for) = in_flight_snapshot_upload_idle_for(&mut *tx, sandbox_id).await? {
         // Drop tx without commit; abandoning the transaction
@@ -163,7 +164,7 @@ pub async fn finalize_sandbox_db_delete_user_initiated(
     if active_fork_source_operation_exists(&mut tx, sandbox_id).await? {
         return Err(FinalizeSandboxDbDeleteError::ForkInProgress);
     }
-    finalize_sandbox_db_delete_tx(&mut tx, sandbox_id).await?;
+    delete_with_dependents(&mut tx, sandbox_id).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -173,7 +174,7 @@ pub async fn finalize_sandbox_db_delete(
     sandbox_id: SandboxId,
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
-    finalize_sandbox_db_delete_tx(&mut tx, sandbox_id).await?;
+    delete_with_dependents(&mut tx, sandbox_id).await?;
     tx.commit().await
 }
 

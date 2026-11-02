@@ -6024,7 +6024,6 @@ dependencies = [
  "pplx-space-runtime-environment-policy-store",
  "pplx-space-sandbox-portability",
  "pplx-space-sandbox-store",
- "pplx-space-sandbox-teardown",
  "pplx-space-sbx-mgr-client",
  "pplx-space-snapshot-store",
  "pplx-space-template-mgr-client",
@@ -7016,10 +7015,12 @@ version = "0.8.0"
 name = "pplx-space-sandbox-store"
 version = "0.8.0"
 dependencies = [
+ "pplx-space-cluster-pool",
  "pplx-space-common-core",
  "pplx-space-db-test-fixtures",
  "pplx-space-placement",
  "pplx-space-sandbox-portability",
+ "pplx-space-sandbox-teardown",
  "pplx-space-test-env",
  "serde",
  "serde_json",
@@ -7034,9 +7035,8 @@ dependencies = [
 name = "pplx-space-sandbox-teardown"
 version = "0.8.0"
 dependencies = [
- "pplx-space-cluster-pool",
  "pplx-space-common-core",
- "pplx-space-common-svc",
+ "pplx-space-state-reconciliation",
  "sqlx",
 ]
 

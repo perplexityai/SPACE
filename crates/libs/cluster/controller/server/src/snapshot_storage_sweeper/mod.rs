@@ -3,8 +3,8 @@
 //!
 //! ## Why this exists
 //!
-//! `finalize_sandbox_db_delete_tx` (in
-//! `crates/libs/sandbox/teardown/src/lib.rs`) detaches
+//! `delete_with_dependents` (in
+//! `crates/libs/sandbox/store/src/delete.rs`) detaches
 //! `snapshot_storage_locations` rows from the snapshot chain on sandbox
 //! delete — sets `snapshot_id = NULL` and stamps `orphaned_at = NOW()`
 //! — so the cascading `sandboxes -> snapshots` DELETE can complete
