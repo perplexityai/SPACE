@@ -53,9 +53,10 @@ const HEADER: &str = "\
 /// caps.
 const LAYERS_COMMENT: &str = "\
 # [layers.<check>] maps each workspace package to what it depends on against
-# the layers rule's <check>: workspace packages, drivers and storage helpers,
-# or, for codec_features, the <package>/<feature> it enables. Only remove
-# entries: a pull request that adds one is reported.
+# the layers rule's <check>: workspace packages, drivers, storage helpers and
+# packages Domain may not depend on, or, for codec_features, the
+# <package>/<feature> it enables. Only remove entries: a pull request that
+# adds one is reported.
 ";
 
 /// Written above `[crate_names]`, which follows the other tables.
