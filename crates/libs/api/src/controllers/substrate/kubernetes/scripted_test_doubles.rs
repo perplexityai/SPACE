@@ -147,6 +147,9 @@ pub(super) enum ScriptedReply {
     Message(Bytes),
     /// Never answer, for callers that bound the call with their own budget.
     Hang,
+    /// Answer with the inner reply after the delay, as a node that
+    /// long-polls the guest before it answers does.
+    Delayed(Duration, Arc<ScriptedReply>),
     /// Answers the n-th call to its method with the n-th reply and every
     /// later call with the last one. An empty sequence scripts nothing.
     Sequence(Arc<[ScriptedReply]>),
@@ -234,10 +237,16 @@ where
             if let Some(observer) = observer {
                 observer().await;
             }
-            match reply.as_ref().map(|reply| reply.for_attempt(attempt)) {
+            let mut reply = reply.as_ref().map(|reply| reply.for_attempt(attempt));
+            while let Some(ScriptedReply::Delayed(delay, inner)) = reply {
+                tokio::time::sleep(*delay).await;
+                reply = Some(inner.for_attempt(attempt));
+            }
+            match reply {
                 Some(ScriptedReply::Status(status)) => Ok(status.clone().into_http()),
                 Some(ScriptedReply::Message(message)) => Ok(grpc_unary_ok(message.clone())),
                 Some(ScriptedReply::Hang) => std::future::pending().await,
+                Some(ScriptedReply::Delayed(..)) => unreachable!("every delay was waited out"),
                 Some(ScriptedReply::Sequence(_)) | None => {
                     let request = http::Request::from_parts(
                         parts,

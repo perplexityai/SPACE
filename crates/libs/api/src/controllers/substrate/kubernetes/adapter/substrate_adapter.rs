@@ -2748,7 +2748,8 @@ impl SubstrateAdapter for KubernetesSubstrate {
                     metric_identity,
                     wake_deadline
                         .checked_duration_since(Instant::now())
-                        .unwrap_or_default(),
+                        .unwrap_or_default()
+                        .min(self.budgets.pooled_command_ready),
                     ExecutionBinding {
                         execution_object_id: claim.pod_name.clone(),
                         runtime_endpoint: Self::endpoint_for_pod_ip(
