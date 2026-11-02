@@ -9,8 +9,10 @@ use sqlx::FromRow;
 #[derive(Clone, Debug, Eq, PartialEq, FromRow)]
 pub struct SnapshotStoragePlacement {
     pub snapshot_id: SnapshotId,
-    /// A `ready` snapshot with a live (not orphaned) storage location: its
-    /// bytes are in the object store.
+    /// The snapshot has a durable copy, as
+    /// `pplx_space_sandbox_portability::snapshot_has_durable_copy` defines it
+    /// (`ready`, with a storage location that is not orphaned): its bytes are
+    /// in the object store.
     pub in_object_store: bool,
     /// The node holding the bytes locally, when all of these hold:
     ///
@@ -38,20 +40,17 @@ pub struct SnapshotStoragePlacement {
 pub const NODE_LOCAL_LIFECYCLES: [SandboxLifecycle; 2] =
     [SandboxLifecycle::Suspended, SandboxLifecycle::Stopped];
 
-/// One statement, built once, so the current-artifact test is the shared
-/// portability fragment rather than a second spelling of it. "The sandbox's
-/// node" is its target, else its active node, as restore picks its source.
+/// One statement, built once, so the durable-copy and current-artifact tests
+/// are the shared portability fragments rather than second spellings of them.
+/// "The sandbox's node" is its target, else its active node, as restore picks
+/// its source.
 static STORAGE_PLACEMENTS_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let durable_copy = pplx_space_sandbox_portability::snapshot_has_durable_copy("s");
     let current_artifact =
         pplx_space_sandbox_portability::snapshot_is_current_local_artifact("sb", "s");
     format!(
         "SELECT s.id AS snapshot_id,
-                (s.state = 'ready' AND EXISTS (
-                    SELECT 1
-                      FROM snapshot_storage_locations ssl
-                     WHERE ssl.snapshot_id = s.id
-                       AND ssl.orphaned_at IS NULL
-                )) AS in_object_store,
+                {durable_copy} AS in_object_store,
                 CASE WHEN {current_artifact}
                           AND sb.lifecycle = ANY($2)
                           AND s.source_node_id = COALESCE(sb.target_node_id, sb.active_node_id)
