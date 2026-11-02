@@ -4315,6 +4315,56 @@ pub(crate) mod service_tests {
     }
 
     #[tokio::test]
+    async fn pool_member_list_continues_past_a_window_without_members() {
+        let window = crate::db::inventory_read::POOL_MEMBER_WINDOW_ROWS;
+        let conn = crate::db::test_conn();
+        let mut ids = (0..=window)
+            .map(|_| {
+                let id = SandboxId::new().to_string();
+                insert_test_sandbox(&conn, &id, SandboxState::Started);
+                id
+            })
+            .collect::<Vec<_>>();
+        ids.sort();
+        // Only the row past the first window is a template-manager pool member.
+        conn.execute(
+            "UPDATE sandboxes SET user = ?2, pool_template = 'seed' WHERE id = ?1",
+            crate::db::fixture::params![
+                &ids[window],
+                pplx_space_common_core::types::TEMPLATE_MANAGER_SANDBOX_OWNER.as_str()
+            ],
+        )
+        .unwrap();
+        let service = service_for_teardown_test(conn);
+
+        let first = service
+            .list(tmplmgr_request(ListRequest {
+                page_size: 128,
+                page_token: String::new(),
+                pool_members_only: true,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(first.sandboxes.is_empty());
+        assert_eq!(first.next_page_token, ids[window - 1]);
+        let pages = Box::pin(list_all_selected_pages(&service, true, 128, true)).await;
+        assert_eq!(
+            pages
+                .iter()
+                .map(|page| page
+                    .iter()
+                    .map(|sandbox| sandbox.sandbox_id.as_str())
+                    .collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            vec![vec![], vec![ids[window].as_str()]]
+        );
+        service.shutdown_token.cancel();
+        service.task_tracker.close();
+        service.task_tracker.wait().await;
+    }
+
+    #[tokio::test]
     async fn paged_list_splits_at_the_encoded_budget_and_degrades_undecodable_rows() {
         use pplx_space_common_core::inventory::MAX_ENCODED_BYTES;
         let conn = crate::db::test_conn();

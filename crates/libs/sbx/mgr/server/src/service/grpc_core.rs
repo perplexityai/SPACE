@@ -46,9 +46,10 @@ const MAX_LIST_PAGE_TOKEN_BYTES: usize = 256;
 /// List page size when the request leaves `page_size` unset (zero).
 const DEFAULT_LIST_PAGE_SIZE: usize = pplx_space_common_core::inventory::READ_BATCH_ITEMS;
 
-/// Assemble one List page within the encoded budget. The cursor advances past
-/// every row the page accounts for, including rows the owner filter hides, so
-/// a filtered page may be empty yet still continue the scan.
+/// Assemble one List page within the encoded budget. A page that fits resumes
+/// where the store's page did; one the budget splits resumes after the last row
+/// it accounts for, including rows the owner filter hides. Either way a page
+/// may be empty yet still continue the scan.
 fn list_page_response(
     page: crate::db::inventory_read::ListPage,
     template_manager_peer: bool,
@@ -61,7 +62,7 @@ fn list_page_response(
     let mut sandboxes = Vec::new();
     let mut encoded = 0usize;
     let mut cursor: Option<&str> = None;
-    let mut more = page.more;
+    let mut resume_after = page.resume_after.as_deref();
     for row in &page.rows {
         let element = match row {
             ListPageRow::Decoded(row) => {
@@ -106,21 +107,16 @@ fn list_page_response(
             if cursor.is_none() {
                 return Err(crate::inventory_budget::exceeded(InventoryLimitExceeded));
             }
-            more = true;
+            resume_after = cursor;
             break;
         }
         encoded += framed;
         sandboxes.push(element);
         cursor = Some(row.id());
     }
-    let next_page_token = match (more, cursor) {
-        (false, _) => String::new(),
-        (true, Some(cursor)) => cursor.to_owned(),
-        (true, None) => return Err(Status::internal("List page has no cursor")),
-    };
     crate::inventory_budget::response(ListResponse {
         sandboxes,
-        next_page_token,
+        next_page_token: resume_after.unwrap_or_default().to_owned(),
     })
 }
 

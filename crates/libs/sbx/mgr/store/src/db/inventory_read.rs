@@ -141,17 +141,26 @@ impl ListPageRow {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ListPageScope {
     All,
-    /// Warm-pool members: rows with `pool_template` set. No index covers it, so a
-    /// page walks the rows after the cursor until it finds `limit` + 1 members or
-    /// reaches the end, in one lock hold: unlike an `All` page, its work is
-    /// bounded by the table's row count, not by `limit`.
+    /// Warm-pool members: rows with `pool_template` set. No index covers it, so
+    /// a page examines a window of [`POOL_MEMBER_WINDOW_ROWS`] rows after the
+    /// cursor and returns the members among them. A page whose window holds
+    /// fewer than `limit` members comes back short, or empty, and resumes
+    /// after the window, which keeps each page's lock hold proportional to the
+    /// window rather than to the table.
     PoolMembers,
 }
 
+/// Rows a `PoolMembers` page examines. The page skips non-members before
+/// charging or decoding them, so a window of this size holds the database lock
+/// about as long as an `All` page of `READ_BATCH_ITEMS` rows, and a scan takes
+/// a quarter as many pages.
+pub const POOL_MEMBER_WINDOW_ROWS: usize = 512;
+
 pub struct ListPage {
     pub rows: Vec<ListPageRow>,
-    /// Rows remain after the last scanned row.
-    pub more: bool,
+    /// The id the next page scans after, or `None` once the scan has examined
+    /// every row.
+    pub resume_after: Option<String>,
 }
 
 db_private_outside_tests! {
@@ -165,27 +174,47 @@ db_private_outside_tests! {
         limit: usize,
         scope: ListPageScope,
     ) -> Result<ListPage, InventoryReadError> {
-        let sql = match scope {
-            ListPageScope::All => {
-                format!("SELECT {LIST_COLUMNS} FROM sandboxes WHERE id > ?1 ORDER BY id LIMIT ?2")
+        // An `All` page reads one row past `limit`, which the budget refuses
+        // and which proves more rows remain. A `PoolMembers` page reads its
+        // window and one row past it, which proves the same.
+        let (fetch, window) = match scope {
+            ListPageScope::All => (limit.saturating_add(1), None),
+            ListPageScope::PoolMembers => {
+                (POOL_MEMBER_WINDOW_ROWS + 1, Some(POOL_MEMBER_WINDOW_ROWS))
             }
-            ListPageScope::PoolMembers => format!(
-                "SELECT {LIST_COLUMNS} FROM sandboxes
-                 WHERE id > ?1 AND pool_template IS NOT NULL ORDER BY id LIMIT ?2"
-            ),
         };
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let fetch = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {LIST_COLUMNS} FROM sandboxes WHERE id > ?1 ORDER BY id LIMIT ?2"
+        ))?;
+        let fetch = i64::try_from(fetch).unwrap_or(i64::MAX);
         let mut rows = stmt.query(rusqlite::params![after, fetch])?;
         let mut budget = InventoryBudget::new(limit, MAX_RAW_BYTES);
-        let mut page = Vec::new();
+        let mut page: Vec<ListPageRow> = Vec::new();
+        let mut examined = 0usize;
+        let mut window_end = None;
         while let Some(row) = rows.next()? {
+            if let Some(window) = window {
+                if examined == window {
+                    return Ok(ListPage {
+                        rows: page,
+                        resume_after: window_end,
+                    });
+                }
+                examined += 1;
+                if examined == window {
+                    window_end = Some(row.get("id")?);
+                }
+                if matches!(row.get_ref("pool_template")?, ValueRef::Null) {
+                    continue;
+                }
+            }
             match check_row(row, &mut budget) {
                 Ok(()) => {}
                 Err(InventoryReadError::Limit(_)) if !page.is_empty() => {
+                    let resume_after = page.last().map(|row| row.id().to_owned());
                     return Ok(ListPage {
                         rows: page,
-                        more: true,
+                        resume_after,
                     });
                 }
                 Err(error) => return Err(error),
@@ -201,7 +230,7 @@ db_private_outside_tests! {
         }
         Ok(ListPage {
             rows: page,
-            more: false,
+            resume_after: None,
         })
     }
 }
