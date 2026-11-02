@@ -111,16 +111,21 @@ pub struct LayersConfig {
     /// order forbids it.
     #[serde(default)]
     pub allowed_edges: BTreeMap<String, PackageSet>,
+    /// What `storage_access` and `codec_features` treat as storage.
+    pub storage: StorageConfig,
     /// Crates that predate the layers and are being dissolved. Every check
     /// covers legacy crates, with today's edges baselined; a store user that
     /// reaches a store only through one, as through a re-export, still uses
-    /// it.
+    /// it. A legacy Foundation crate is no storage helper even with a
+    /// required driver dependency.
     #[serde(default)]
     pub legacy: PackageSet,
     pub placement: BehaviourConfig,
     pub layout: BehaviourConfig,
     pub direction: EdgeBehaviours,
     pub dev_direction: EdgeBehaviours,
+    pub storage_access: EdgeBehaviours,
+    pub codec_features: EdgeBehaviours,
     pub test_only: BehaviourConfig,
     pub clients: BehaviourConfig,
     pub store_edges: BehaviourConfig,
@@ -170,6 +175,55 @@ impl TryFrom<BTreeMap<Layer, PackageSet>> for Unmoved {
             }
         }
         Ok(Self(unmoved))
+    }
+}
+
+/// `[rules.layers.storage]`: the packages that reach a database or object
+/// storage, and every storage helper.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageConfig {
+    /// Packages outside the workspace that talk to a database or object
+    /// storage, such as `sqlx`.
+    pub drivers: Drivers,
+    /// The Foundation crates that are storage helpers, all of them: one with
+    /// a required dependency on a driver must be listed.
+    #[serde(default)]
+    pub helpers: PackageSet,
+}
+
+/// A [`PackageSet`] with at least one package, since without a driver the
+/// storage checks would check nothing.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(try_from = "Vec<String>")]
+pub struct Drivers(PackageSet);
+
+#[derive(Debug, Error)]
+pub enum DriversError {
+    #[error("drivers must list at least one package")]
+    Empty,
+    #[error(transparent)]
+    Duplicate(#[from] DuplicatePackageError),
+}
+
+impl Drivers {
+    pub fn contains(&self, package: &str) -> bool {
+        self.0.contains(package)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &String> {
+        self.0.iter()
+    }
+}
+
+impl TryFrom<Vec<String>> for Drivers {
+    type Error = DriversError;
+
+    fn try_from(packages: Vec<String>) -> Result<Self, Self::Error> {
+        if packages.is_empty() {
+            return Err(DriversError::Empty);
+        }
+        Ok(Self(PackageSet::try_from(packages)?))
     }
 }
 
@@ -228,6 +282,7 @@ pub struct LayersPolicy {
     pub unmoved: Entries<String>,
     pub store_users: Entries<BTreeMap<String, usize>>,
     pub allowed_edges: Entries<BTreeMap<String, usize>>,
+    pub storage: StoragePolicy,
     /// `legacy`, each package with the line it is written on.
     pub legacy: BTreeMap<String, usize>,
     /// The line of the `legacy` key, or without one, of the
@@ -236,6 +291,16 @@ pub struct LayersPolicy {
     /// Behaviour name, such as `placement` or `direction.no_crossing`, to
     /// its mode as written and the mode's line.
     pub modes: BTreeMap<String, (String, usize)>,
+}
+
+/// `[rules.layers.storage]`'s lists, each package with the line it is
+/// written on.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoragePolicy {
+    /// The line of the table's header, if it has one.
+    pub line: Option<usize>,
+    pub drivers: BTreeMap<String, usize>,
+    pub helpers: BTreeMap<String, usize>,
 }
 
 /// One table of `[rules.layers]` keyed by package name.
@@ -265,16 +330,25 @@ struct PolicyTable {
     unmoved: Option<BTreeMap<String, Vec<Spanned<String>>>>,
     store_users: Option<BTreeMap<Spanned<String>, Vec<Spanned<String>>>>,
     allowed_edges: Option<BTreeMap<Spanned<String>, Vec<Spanned<String>>>>,
+    storage: Option<PolicyStorage>,
     legacy: Option<Spanned<Vec<Spanned<String>>>>,
     placement: Option<PolicyBehaviour>,
     layout: Option<PolicyBehaviour>,
     direction: Option<PolicyEdgeBehaviours>,
     dev_direction: Option<PolicyEdgeBehaviours>,
+    storage_access: Option<PolicyEdgeBehaviours>,
+    codec_features: Option<PolicyEdgeBehaviours>,
     test_only: Option<PolicyBehaviour>,
     clients: Option<PolicyBehaviour>,
     store_edges: Option<PolicyBehaviour>,
     stale_entries: Option<PolicyBehaviour>,
     policy_changed: Option<PolicyBehaviour>,
+}
+
+#[derive(Deserialize)]
+struct PolicyStorage {
+    drivers: Option<Vec<Spanned<String>>>,
+    helpers: Option<Vec<Spanned<String>>>,
 }
 
 #[derive(Deserialize)]
@@ -343,6 +417,14 @@ impl LayersPolicy {
                 })
                 .collect()
         };
+        let storage = match table.storage {
+            None => StoragePolicy::default(),
+            Some(storage) => StoragePolicy {
+                line: header("storage"),
+                drivers: packages(storage.drivers),
+                helpers: packages(storage.helpers),
+            },
+        };
         let legacy_line = match &table.legacy {
             Some(legacy) => Some(line(legacy.span())),
             None => header_line(text, "[rules.layers]"),
@@ -368,6 +450,8 @@ impl LayersPolicy {
         for (check, entry) in [
             ("direction", table.direction),
             ("dev_direction", table.dev_direction),
+            ("storage_access", table.storage_access),
+            ("codec_features", table.codec_features),
         ] {
             let Some(entry) = entry else { continue };
             for (behaviour, entry) in [
@@ -390,6 +474,7 @@ impl LayersPolicy {
             unmoved,
             store_users,
             allowed_edges,
+            storage,
             legacy,
             legacy_line,
             modes,

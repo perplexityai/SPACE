@@ -340,14 +340,19 @@ pplx-space-sandbox-store = ["pplx-space-api"]
 [rules.layers.allowed_edges]           # edges the matrix forbids, allowed by name
 pplx-space-db-migrator = ["pplx-space-db-migrate"]
 
+[rules.layers.storage]                 # see Storage access below
+drivers = ["sqlx", "rusqlite"]         # packages that reach a database or object storage
+helpers = ["pplx-space-s3-http-client", "pplx-space-sqlite"]  # every storage helper
+
 [rules.layers]
-legacy = ["pplx-space-common-svc"]     # crates being dissolved
+legacy = ["pplx-space-common-svc"]     # crates being dissolved; see Storage access below
 
 [rules.layers.placement]
 mode = "required"
 # ...and layout, test_only, clients, store_edges, stale_entries and
-# policy_changed, each with a mode, and direction and dev_direction, each with
-# no_crossing, no_new_entries and stale_entries.
+# policy_changed, each with a mode, and direction, dev_direction,
+# storage_access and codec_features, each with no_crossing, no_new_entries and
+# stale_entries.
 ```
 
 The checks, each with its own mode:
@@ -404,15 +409,18 @@ The checks, each with its own mode:
   it, directly or through a `legacy` crate that depends on it, since the list
   says who uses the store today; an `allowed_edges` entry whose normal or
   build dependency is gone, that needs no exception, or that is for a
-  `test_only` edge, which it can't exempt. An entry naming a crate without a
-  layer isn't stale: the crate's `placement` finding covers it. Each is shown
-  on its line in `ARCHITECTURE.toml`.
+  `test_only` edge, which it can't exempt; and a `[rules.layers.storage]`
+  `helpers` entry that is gone, outside `l10_foundation` or also `legacy`.
+  An entry naming a crate without a layer isn't stale: the crate's
+  `placement` finding covers it. Each is shown on its line in
+  `ARCHITECTURE.toml`.
 - `policy_changed`: every difference in `[rules.layers]` from the base
   branch's `ARCHITECTURE.toml`, given with `--base-architecture`: an
   `unmoved` entry added or moved to another layer, a store user or allowed
-  edge added or removed, a legacy crate added or removed, a mode changed, or
-  the whole table new. A removed
-  `unmoved` entry is one only if its crate moved into another layer's
+  edge added or removed, a legacy crate added or removed, a driver or helper
+  added to or removed from `[rules.layers.storage]`, a mode changed, or the
+  whole table new. A removed `unmoved` entry is one only if its crate moved
+  into another layer's
   directory than the entry's (shown on the `unmoved` header, or the first
   `[rules.layers…]` one); otherwise its crate moved where the entry said, was
   deleted, or is a `placement` finding. A base with `[rules.layers]` and a
@@ -425,21 +433,23 @@ The checks, each with its own mode:
 
 `direction` and `dev_direction` have baseline tables, `[layers.direction]`
 and `[layers.dev_direction]`, which map each package to the packages it
-depends on against the check today, one per line. Package names, not paths,
-so moving a crate into its layer directory leaves its entries alone. Each
-check has three behaviours:
+depends on against the check today, one per line; so do `storage_access` and
+`codec_features` (see [Storage access](#storage-access)). Package names, not
+paths, so moving a crate into its layer directory leaves its entries alone.
+Each check has three behaviours:
 
 - `no_crossing`: an edge with the check's problem that its table doesn't
   list;
 - `no_new_entries`: an entry the base branch's copy of the table lacks,
-  given with `--base-baseline`. A copy with a `[layers]` key but without the
-  table, or whose `ARCHITECTURE.toml` has a `[rules.layers]`, even one this
-  branch can't read, tolerates nothing. If the base branch has no layers rule
-  yet (neither a `[layers]` key in its baseline nor, with
-  `--base-architecture`, a `[rules.layers]`), every entry is reported as
-  advisory instead, as the pull request seeding the table. Without the flag,
-  or with a `[layers]` key or table that doesn't parse, it is skipped with a
-  line after the summary;
+  given with `--base-baseline`. If the base branch has no layers rule yet
+  (neither a `[layers]` key in its baseline nor, with `--base-architecture`,
+  a `[rules.layers]`), or its `[rules.layers]` has none of the check's modes,
+  as before the check existed, every entry is reported as advisory instead,
+  as the pull request seeding the table. Otherwise a copy without the table,
+  such as one with a `[layers]` key but not the table, or one whose
+  `ARCHITECTURE.toml` has a `[rules.layers]` this branch can't read,
+  tolerates nothing. Without the flag, or with a `[layers]` key or table
+  that doesn't parse, it is skipped with a line after the summary;
 - `stale_entries`: an entry whose edge is gone, whose package is gone or has
   no layer, or that the check no longer reports, such as a dev entry whose
   dependency is also a normal one.
@@ -448,12 +458,99 @@ check has three behaviours:
 rest, and adds none: it prints `not added: …` for each edge without one,
 saying to fix the dependency, since an entry added by hand fails
 `no_new_entries`; a reviewed, permanent exception to `direction` goes in
-`[rules.layers.allowed_edges]`, which `policy_changed` reports, and
-`dev_direction` has no exception path. As for `crate_names`, it lists no TOML
-to paste. It always writes both tables, after
-the tables of caps and before `[crate_names]`;
-`--write-baseline=layers.<check>` updates one, creating it if the file lacks
-it.
+`[rules.layers.allowed_edges]`, which `policy_changed` reports,
+`dev_direction` has no exception path, and a crate that has to reach storage
+for good becomes a store or a storage helper (see [Storage
+access](#storage-access)). As for `crate_names`, it lists no TOML to paste.
+It always writes all four tables, after the tables of caps and before
+`[crate_names]`; `--write-baseline=layers.<check>` updates one, creating it
+if the file lacks it.
+
+### Storage access
+
+Nothing above Storage talks to a database or object storage directly,
+Domain never does, and Foundation does only in a storage helper, which names
+nothing SPACE-specific. `[rules.layers.storage]` says what that means:
+
+- `drivers`: the packages outside the workspace that reach a database or
+  object storage, such as `sqlx`, `rusqlite`, `redis`, `deadpool-redis` and
+  `aws-sdk-s3`, and their sub-crates, so that depending on `sqlx-core`
+  instead of `sqlx` is no way around the checks. At least one.
+- `helpers`: every **storage helper**, an `l10_foundation` crate that names
+  nothing SPACE-specific and may reach storage, such as `pplx-space-sqlite`;
+  `policy_changed` reports each change to the list. Derivation only checks
+  that the list is complete: an `l10_foundation` crate with a required
+  (normal or build, not optional) dependency on a driver that `helpers`
+  doesn't list is a `storage_access` finding on that dependency, saying to
+  add it to `helpers`, whose change `policy_changed` reports for review,
+  and is no helper until it is listed. A listed helper need not depend on a
+  driver: `pplx-space-s3-http-client`, which plugs an HTTP connector into
+  an `aws-sdk-s3` client without depending on it, is the one derivation
+  can't see.
+- `[rules.layers] legacy` (see [Layers](#layers)): for these checks, a
+  legacy `l10_foundation` crate is no helper, listed or with a required
+  driver dependency, so it is checked like every other crate, with today's
+  edges baselined, and a crate that depends on one does not reach storage
+  through it. Test support and tools are left out of both checks.
+
+Two checks, each with the three baselined behaviours above and a table
+keyed by package:
+
+- `storage_access`: only stores and helpers may have a normal or build
+  dependency on a driver or helper. An optional dependency counts too, since
+  a feature turns it on, except from an `l10_foundation` crate: there it is a
+  codec behind a feature, such as `sqlx` impls for an identifier type, and
+  `codec_features` covers whoever turns it on. The finding is shown on the
+  manifest line that declares the dependency, names the items the crate
+  uses from it, and gives the fixes for its kind: an API crate moves that
+  code into a store that lists it as a user and calls the store, or, for a
+  generic mechanism, into a storage helper that such a store calls; an app,
+  which never depends on a store, uses the API crate that owns the state;
+  a client, which never depends on one either, moves the storage work into
+  its server, behind its protocol; from Domain, a codec's impls move into
+  the store that persists the types; from Foundation, a crate that names
+  nothing SPACE-specific can be added to `helpers`. Moving the code into a
+  new helper never lets the original crate depend on that helper:
+  `storage_access` checks that edge too. `[layers.storage_access]` maps each
+  package to the drivers and helpers it depends on, such as
+  `pplx-space-api = ["sqlx"]`.
+- `codec_features`: a **driver feature** is a feature of a crate outside
+  Storage that turns on an optional dependency on a driver or helper, with
+  `dep:<name>`, `<name>/<feature>` or Cargo's implicit feature for the
+  dependency, that turns on an optional dependency whose `features` or
+  default features include another crate's driver feature, or that
+  forwards to another driver feature, its own or another such crate's
+  (`<name>/<feature>` or `<name>?/<feature>`). Only stores and
+  helpers may enable one: with `features = […]` on a normal or build
+  dependency, through its default features when `default` is a driver
+  feature, or by forwarding from their own `[features]`. As an optional
+  driver dependency of an `l10_foundation` crate is exempt from
+  `storage_access`, so is its enabling behind a feature of its own, on an
+  optional dependency or by forwarding: that feature is a driver feature
+  itself, and whoever turns it on is checked. The finding is shown
+  on that dependency's or `[features]` item's line and says which driver the
+  feature reaches. `[layers.codec_features]` maps each package to the
+  `<package>/<feature>` entries it enables, such as `pplx-space-api =
+  ["pplx-space-common-core/sqlx"]`. A store's own driver features are not
+  checked: depending on a store is how an API crate reaches storage, and a
+  feature that reaches a driver only through a store's is no driver feature.
+
+Dev-dependencies are not checked: tests may open a database. A finding that
+is stale names the reason: the crate or the dependency is gone, the crate is
+now a store, a helper or left out, the target is no longer a driver or
+helper, an optional Foundation dependency or a Foundation crate's enabling
+behind its own feature is a codec, or the feature no longer reaches a
+driver.
+
+There are no per-edge exceptions, as `allowed_edges` gives the matrix: a
+crate that has to reach storage for good becomes a store, in `l30_storage`,
+or, if it names nothing SPACE-specific, a storage helper (see below). Moving
+it into `l30_storage` is reviewed as a change to its layer, and listing it in
+`[rules.layers.storage] helpers`, which every helper needs, is a policy
+change, which `policy_changed` reports. For a Foundation crate's driver
+dependency that makes it a helper the list lacks, `--write-baseline`'s `not
+added` line says to add it to `helpers`. A violation to fix later gets no
+entry: a hand-added one fails `no_new_entries`.
 
 ### Limits
 
@@ -462,6 +559,22 @@ it.
   that re-export go. Only `stale_entries` looks one crate further: a store
   user that depends on a `legacy` crate depending on the store still uses
   it, so its entry stays.
+- A Foundation crate that gains a required driver dependency gets a
+  `storage_access` finding until it is added to `helpers`, and is no helper
+  before: its dependents get `storage_access` findings only once it is
+  listed. Stores, other helpers, test support and tools, and
+  `l10_foundation` crates whose dependency on it is optional are exempt.
+- `codec_features` reads the feature requests in each crate's own manifest,
+  not the features Cargo unifies for a build. `common-svc` enables
+  `common-core/sqlx`, so its dependents build against `common-core`'s `sqlx`
+  impls whatever they request; one that drops `"sqlx"` from its own
+  manifest loses its baseline entry, which `stale_entries` reports, but
+  keeps the impls.
+- The drivers are a hand-kept list, and `cargo metadata` runs with
+  `--no-deps`, so a crate outside the workspace that wraps or re-exports a
+  driver is not seen unless it is listed. A workspace crate that does is a
+  storage helper only once it is in `l10_foundation` and listed in
+  `helpers`.
 - The package-keyed tables have no rename map. Renaming a package that a
   `[layers.*]` baseline entry names fails `no_new_entries` until its edges
   are fixed. Renaming one that an `unmoved` entry names fails `placement`,
@@ -482,6 +595,11 @@ it.
   `[rules.layers.allowed_edges]` with a comment saying why; `policy_changed`
   reports it. A violation to fix later doesn't: it fails `no_crossing`, and
   a hand-added baseline entry fails `no_new_entries`.
+- **A storage helper:** an `l10_foundation` crate that names nothing
+  SPACE-specific goes in `[rules.layers.storage] helpers`, which lists every
+  helper; `policy_changed` reports the change for review. One that wraps a
+  driver's client without depending on the driver gets a comment saying
+  why, since derivation can't see it.
 - **Moving a crate:** `git mv` it into its layer directory and remove its
   `unmoved` entry, which `stale_entries` asks for. Its layers baseline
   entries keep matching, but path-keyed configuration has to follow the
@@ -496,8 +614,9 @@ also fail the check, so behaviours can graduate one at a time. Unknown keys,
 sections or modes, a missing file, bad TOML, an invalid regex, glob or instance
 name, an empty `patterns`, `include`, `packages` or `members` list, a layer
 name that is not one of the seven, a package listed twice in `unmoved` or in
-one `store_users` or `allowed_edges` list, a baseline table for an instance or
-layers check that is not configured, and a failing `cargo metadata` exit 2. So
+one `store_users` or `allowed_edges` list or in a `[rules.layers.storage]` list,
+an empty `drivers`, a baseline table for an instance or layers check that is
+not configured, and a failing `cargo metadata` exit 2. So
 does a `--base-baseline`, `--renames` or `--base-architecture` that can't be
 read, or one combined with `--write-baseline`, and `--renames` input that is
 not git's (see [Renamed files](#renamed-files)).
@@ -509,7 +628,8 @@ listed: under `[file_size]`, each production file over the limit, with its
 code-line count; under `[pattern_ratchet.<instance>]`, each production file
 outside the instance's allowed paths with a matching line, with its count of
 matching lines. `[layers.<check>]` maps a package name to the packages it
-depends on against the check instead (see [Layers](#layers)), and
+depends on against the check instead, or for `codec_features` the
+`<package>/<feature>` entries it enables (see [Layers](#layers)), and
 `[crate_names]`, written last, a package name to its member path (see
 [Crate names](#crate-names)). Entries should only be
 removed or lowered.
