@@ -251,9 +251,13 @@ An agent or reviewer checks a change with the runs, not by guessing at the UI:
   `page.route(…, (route) => route.fulfill(…))`. Set the `x-console-loop-synthetic`
   header on such a response; the recorder does not report responses that
   carry it.
-- Add a step to `src/steps.ts` for each behavior a change introduces, run it on
-  the base branch and on the change, and keep it if it fails before and passes
-  after.
+- Put a behavior check that does not need a browser in a typed `space_smoke`
+  scenario, per the `space-validation` skill's smoke-testing reference, not in
+  the loop. Add a step to `src/steps.ts` only for what a browser alone can
+  show: how a page renders, navigation, dialogs, and console errors.
+- The runs are development and review evidence, not a pass/fail gate: a step
+  that passes does not certify a change, and the loop is not a regression
+  suite.
 
 ## Capturing media for a pull request
 
