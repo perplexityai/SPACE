@@ -214,6 +214,26 @@ fn guest_source_guard_exprs(guest_ip: &str) -> Vec<serde_json::Value> {
     ]
 }
 
+fn mptcp_guard_exprs() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({
+            "match": {
+                "left": { "meta": { "key": "iifname" } },
+                "right": "tap0",
+                "op": "=="
+            }
+        }),
+        serde_json::json!({
+            "match": {
+                "left": { "tcp option": { "name": "mptcp" } },
+                "right": true,
+                "op": "=="
+            }
+        }),
+        serde_json::json!({ "drop": null }),
+    ]
+}
+
 fn established_bypass_exprs() -> Vec<serde_json::Value> {
     vec![
         serde_json::json!({
@@ -272,6 +292,12 @@ fn namespace_source_guard_precedes_established_conntrack_bypass() {
     assert!(
         source_guard_position < established_bypass_position,
         "guest source validation must run before established traffic can bypass filtering"
+    );
+    let mptcp_guard_position =
+        rule_position(&mptcp_guard_exprs()).expect("tap0 must drop guest MPTCP segments");
+    assert!(
+        mptcp_guard_position < established_bypass_position,
+        "MPTCP segments on established flows must not bypass the guard"
     );
 }
 
@@ -353,6 +379,7 @@ fn rule_with_exprs(exprs: Vec<serde_json::Value>) -> serde_json::Value {
 fn namespace_source_guard_validator_rejects_ineffective_rules() {
     let guest_ip = "169.254.0.21";
     let source_guard = rule_with_exprs(guest_source_guard_exprs(guest_ip));
+    let mptcp_guard = rule_with_exprs(mptcp_guard_exprs());
     let established_bypass = rule_with_exprs(established_bypass_exprs());
     let (valid, packaged) = udp443_validation_fixture();
     let udp443 = valid["nftables"]
@@ -367,6 +394,7 @@ fn namespace_source_guard_validator_rejects_ineffective_rules() {
     validate_pre_tproxy_guardrails_chain(
         &chain_with_rules(vec![
             source_guard.clone(),
+            mptcp_guard.clone(),
             established_bypass.clone(),
             udp443,
         ]),
@@ -391,8 +419,18 @@ fn namespace_source_guard_validator_rejects_ineffective_rules() {
         ),
         (
             "after established bypass",
-            chain_with_rules(vec![established_bypass, source_guard]),
+            chain_with_rules(vec![established_bypass.clone(), source_guard.clone()]),
             "namespace tap0 guest source guard must precede established/related return",
+        ),
+        (
+            "missing MPTCP guard",
+            chain_with_rules(vec![source_guard.clone(), established_bypass.clone()]),
+            "namespace pre-TPROXY guardrails chain is missing tap0 MPTCP guard",
+        ),
+        (
+            "MPTCP guard after established bypass",
+            chain_with_rules(vec![source_guard, established_bypass, mptcp_guard]),
+            "namespace tap0 MPTCP guard must precede established/related return",
         ),
     ];
 
