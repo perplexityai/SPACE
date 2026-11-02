@@ -166,7 +166,7 @@
 "crates/libs/cluster/controller/server/src/node_drain/store.rs" = 15
 "crates/libs/cluster/controller/server/src/orphaned_sandboxes.rs" = 5
 "crates/libs/cluster/controller/server/src/tombstone_retention.rs" = 1
-"crates/libs/cluster/controller/server/src/transient_lifecycle_sweeper/store.rs" = 12
+"crates/libs/cluster/controller/server/src/transient_lifecycle_sweeper/store.rs" = 2
 "crates/libs/internal/api/server/src/data_plane_sessions/service_route.rs" = 1
 "crates/libs/internal/api/server/src/published_state.rs" = 3
 "crates/libs/internal/api/server/src/sandbox_quarantine_store.rs" = 1
