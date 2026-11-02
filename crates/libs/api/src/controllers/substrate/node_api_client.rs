@@ -440,6 +440,9 @@ pub async fn connect_worker_internal(
     )))
 }
 
+/// The internal bearer token a [`BuilderClient`] sends on every call.
+pub(crate) const BUILDER_BEARER_TOKEN: SpaceBearerToken = SpaceBearerToken::NodeApi;
+
 pub async fn connect_builder(endpoint: Endpoint) -> Result<BuilderClient, ControllerError> {
     let channel = node_api_connect_endpoint(endpoint)
         .await?
@@ -453,9 +456,6 @@ pub async fn connect_builder(endpoint: Endpoint) -> Result<BuilderClient, Contro
             ControllerError::service_unavailable(format!("node-api not reachable: {err}"))
         })?;
     Ok(BuilderApiClient::new(wrap_grpc_client_channel(
-        InterceptedService::new(
-            channel,
-            SpaceBearerInterceptor::new(SpaceBearerToken::NodeApi),
-        ),
+        InterceptedService::new(channel, SpaceBearerInterceptor::new(BUILDER_BEARER_TOKEN)),
     )))
 }

@@ -231,6 +231,10 @@ enum TemplateBuildAttemptError {
     Route(#[source] ControllerError),
     #[error("builder RPC: {0}")]
     Rpc(#[source] tonic::Status),
+    /// The bearer token the builder client attaches could not be read, so
+    /// the call was not made.
+    #[error("builder credential: {0}")]
+    Credential(#[source] pplx_space_common_svc::bearer_token::BearerTokenError),
 }
 
 impl TemplateBuildAttemptError {
@@ -238,19 +242,22 @@ impl TemplateBuildAttemptError {
         match self {
             Self::Route(error) => error,
             Self::Rpc(status) => status.into(),
+            Self::Credential(error) => ControllerError::service_unavailable(format!(
+                "failed to attach the builder's bearer token: {error}"
+            )),
         }
     }
 
     /// Whether the builder may have taken the build despite this failure.
-    /// Only three failures prove it did not: no builder to send to, a dial
-    /// that failed before any request bytes left
+    /// Only these failures prove it did not: no builder to send to, no
+    /// bearer token to send, a dial that failed before any request bytes left
     /// ([`pplx_space_common_grpc::is_client_connect_failure`]), and the
     /// draining refusal, which build-manager makes before it enqueues. A
     /// timeout, a transport error after sending, or any other status can
     /// follow an accepted build whose answer was lost.
     fn may_have_been_accepted(&self) -> bool {
         match self {
-            Self::Route(_) => false,
+            Self::Route(_) | Self::Credential(_) => false,
             Self::Rpc(status) => {
                 !(pplx_space_common_grpc::is_client_connect_failure(status)
                     || pplx_space_build_mgr_client::is_build_manager_draining_status(status))
@@ -571,6 +578,15 @@ impl TemplateController {
                 .builder_client()
                 .await
                 .map_err(TemplateBuildAttemptError::Route)?;
+            // The client's interceptor reads this token on every call, and one
+            // it cannot read fails the call with a bare UNAVAILABLE that reads
+            // like the wire's. Reading it here first makes that failure one
+            // that provably sent nothing. A token that goes missing between
+            // the two reads still fails as UNAVAILABLE, possibly accepted.
+            pplx_space_common_svc::bearer_token::space_bearer_token(
+                crate::controllers::substrate::BUILDER_BEARER_TOKEN,
+            )
+            .map_err(TemplateBuildAttemptError::Credential)?;
             client
                 .build_template(request)
                 .await

@@ -498,10 +498,26 @@ fn a_failed_attempt_may_have_been_accepted_unless_it_proves_otherwise() {
             )),
             false,
         ),
+        (
+            TemplateBuildAttemptError::Credential(
+                pplx_space_common_svc::bearer_token::BearerTokenError::EmptyEnv {
+                    env_var: "SYNTHETIC_TOKEN",
+                },
+            ),
+            false,
+        ),
         (TemplateBuildAttemptError::Rpc(refused), false),
         (TemplateBuildAttemptError::Rpc(draining), false),
         (
             TemplateBuildAttemptError::Rpc(tonic::Status::unavailable("connection closed")),
+            true,
+        ),
+        // What the interceptor answers for a token it cannot read: on the
+        // call itself it cannot be told from the wire's.
+        (
+            TemplateBuildAttemptError::Rpc(tonic::Status::unavailable(
+                "failed to attach node-api bearer token: token file missing",
+            )),
             true,
         ),
         (

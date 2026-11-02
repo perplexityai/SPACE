@@ -648,7 +648,7 @@ const DISCONNECTED: &str = "synthetic-build-key-4";
 async fn a_failed_system_build_frees_its_key_only_if_the_builder_did_not_take_it(
     #[future] native_build_fixture: TestResult<NativeBuildFixture>,
 ) -> TestResult {
-    if !crate::test_support::enter_sim_worker_process() {
+    if !crate::test_support::enter_sim_worker_process_with_owned_token_files() {
         return Ok(());
     }
     let mut fixture = native_build_fixture.await?;
@@ -725,6 +725,28 @@ async fn a_failed_system_build_frees_its_key_only_if_the_builder_did_not_take_it
     assert!(
         fixture.builds.try_recv().is_err(),
         "a replay of an unrecorded job must not start another"
+    );
+
+    // The builder's bearer token cannot be read, so the call is not made:
+    // the key is freed, and once the token is back the same key builds.
+    let token_path = std::path::PathBuf::from(
+        std::env::var_os(pplx_space_common_svc::bearer_token::SpaceBearerToken::NodeApi.path_env())
+            .expect("the test owns the node-api token file"),
+    );
+    let moved = token_path.with_extension("moved");
+    std::fs::rename(&token_path, &moved)?;
+    let (status, body) = build("synthetic-no-credential").await?;
+    assert!(status.is_server_error(), "{status} {body}");
+    assert!(
+        fixture.builds.try_recv().is_err(),
+        "nothing reached the builder"
+    );
+    std::fs::rename(&moved, &token_path)?;
+    let (status, started) = build("synthetic-no-credential").await?;
+    assert_eq!(status, StatusCode::ACCEPTED, "{started}");
+    assert!(
+        fixture.builds.try_recv().is_ok(),
+        "the freed key starts its build"
     );
 
     // The builder refuses the connection, so nothing was sent: the key is
