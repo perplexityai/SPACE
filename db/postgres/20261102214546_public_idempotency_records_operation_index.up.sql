@@ -1,10 +1,11 @@
 -- no-transaction
 -- Index the public_idempotency_records -> public_operations foreign key.
--- Deleting an operation runs the ON DELETE SET NULL action against
--- public_idempotency_records, and without this index each deleted operation
--- scans the whole table. With ~1M idempotency rows, public-operation retention
--- batches exceed the 10s statement timeout, roll back, and never delete
--- anything, so public_operations and public_operation_events grow unbounded.
+-- Retention deletes an operation's idempotency records by operation_id, and
+-- deleting the operation then runs the ON DELETE SET NULL action against
+-- public_idempotency_records. Without this index, both scan the whole table
+-- for every deleted operation. With ~1M idempotency rows, a retention batch
+-- exceeds the 10s statement timeout and rolls back, so no operation is ever
+-- pruned and public_operations and public_operation_events grow unbounded.
 --
 -- CONCURRENTLY because idempotency records are written on every keyed create
 -- and ECW delete; a plain build holds SHARE on the table and would stall those
@@ -19,5 +20,4 @@
 -- concurrently takes SHARE UPDATE EXCLUSIVE, which does not block writers.
 -- squawk-ignore require-lock-timeout, require-statement-timeout
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_public_idempotency_records_operation
-    ON public_idempotency_records (operation_id)
-    WHERE operation_id IS NOT NULL;
+    ON public_idempotency_records (operation_id);
