@@ -887,7 +887,8 @@ so a new table is declared by its owner before its migration lands (see
   entries keep matching, but path-keyed configuration has to follow the
   crate: ratchet `include` and `allow`, fence `members` and `allow`, the
   `[file_size]` and ratchet baseline keys, and the member paths of
-  `[crate_names]` baseline entries.
+  `[crate_names]` baseline entries. `scripts/move_crates.py` does this, and
+  rewrites every other reference, from a reviewed mapping.
 
 ## Configuration and modes
 

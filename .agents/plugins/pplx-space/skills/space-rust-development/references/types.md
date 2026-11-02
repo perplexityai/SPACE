@@ -67,7 +67,7 @@ Rules:
 
 - Implement `FromStr`, `TryFrom<&str>`, `Serialize`/`Deserialize` via `try_from`/`into`. This is what makes serde, query parsing, env, and CLI all parse-don't-validate at the boundary.
 - Do **not** implement `Deref<Target = str>`. That re-erases the distinction.
-- Put a type a second crate could plausibly need in the existing crate that owns its concept; if none fits, create a small single-responsibility crate named for its responsibility (archcheck's `crate_names` rule bans `common`, `shared`, `util(s)`, `helper(s)`, `misc` and `core`). Do not add it to `common-core` or `common-svc`.
+- Put a type a second crate could plausibly need in the existing crate that owns its concept; if none fits, create a small single-responsibility crate in the layer directory its contents belong to (`crates/<layer>/AGENTS.md`), named for its responsibility (archcheck's `crate_names` rule bans `common`, `shared`, `util(s)`, `helper(s)`, `misc` and `core`). Do not add it to `common-core` or `common-svc`.
 
 ### 4. Strings → enums
 

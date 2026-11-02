@@ -48,7 +48,7 @@ impl AsRef<str> for SandboxId { fn as_ref(&self) -> &str { &self.0 } }
 - Implement `From<NewType> for String` (or the inner type) so re-serializing onto a wire is free.
 - Don't implement `Deref<Target=str>`. It papers over the distinction the newtype was created to enforce.
 - Prefer immutability: `pub struct SandboxId(String);` not `pub struct SandboxId { pub inner: String }`.
-- Share each newtype from the crate that owns its concept, and extend it there instead of duplicating it. Don't fork parallel types per crate; that fragments the vocabulary and forces lossy conversions at every boundary. A new shared type goes in its owning crate (a protocol, value-type or service crate) or a new single-responsibility crate, not in `common-core`/`common-svc`.
+- Share each newtype from the crate that owns its concept, and extend it there instead of duplicating it. Don't fork parallel types per crate; that fragments the vocabulary and forces lossy conversions at every boundary. A new shared type goes in its owning crate (a protocol, value-type or service crate) or a new single-responsibility crate in the layer its contents belong to (`crates/<layer>/AGENTS.md`), not in `common-core`/`common-svc`.
 
 ---
 

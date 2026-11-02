@@ -303,6 +303,17 @@ SPACE_RUN_CONTAINMENT_BENCHMARK=1 cargo test -p pplx-space-node-mgr --lib \
   linux_containment_benchmark -- --ignored --nocapture
 ```
 
+## Crate layout
+
+The Rust workspace is layered, bottom-up: generic building blocks
+(`l10_foundation`), SPACE models and wire protocols without I/O (`l20_domain`),
+stores (`l30_storage`), use cases and service entry points with their clients
+(`l40_api`), and thin binaries (`l50_app`), with `test_support` and `tools`
+beside them. Each is a directory under `crates/` whose `AGENTS.md` says what
+belongs there; "Layers" in
+[archcheck's README](../crates/tools/archcheck/README.md#layers) gives the
+dependency rules CI enforces.
+
 ## Security boundaries
 
 Firecracker isolates guest execution. Host-side services still require privileges to manage VMs, storage, and networking.

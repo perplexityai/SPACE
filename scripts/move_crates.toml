@@ -1,0 +1,202 @@
+# Where each workspace crate moves, read by scripts/move_crates.py. Generated
+# by `scripts/move_crates.py --generate`, which keeps the choices below, then
+# reviewed. A crate's target is crates/<layer>/ and its package name without
+# `pplx-space-`, split on `-`, with a leaf where another crate's path would
+# nest inside it; `rename` changes the package name only, never a binary's.
+# A legacy crate stays until it is dissolved; another stays only for a
+# reviewed reason.
+
+[crates]
+# l10_foundation (48)
+"pplx-space-aws-client" = { to = "crates/l10_foundation/aws/client" }
+"pplx-space-bearer-token" = { to = "crates/l10_foundation/bearer/token" }
+"pplx-space-btrfs" = { to = "crates/l10_foundation/btrfs" }
+"pplx-space-byte-size" = { to = "crates/l10_foundation/byte/size" }
+"pplx-space-common-cli" = { to = "crates/l10_foundation/common/cli" }
+"pplx-space-common-connection-admission" = { to = "crates/l10_foundation/common/connection/admission" }
+"pplx-space-common-grpc-lb" = { to = "crates/l10_foundation/common/grpc/lb" }
+"pplx-space-common-grpc" = { to = "crates/l10_foundation/common/grpc/transport" }  # leaf: pplx-space-common-grpc-lb nest in l10_foundation/common/grpc
+"pplx-space-common-io" = { to = "crates/l10_foundation/common/io" }
+"pplx-space-common-jobs" = { to = "crates/l10_foundation/common/jobs" }
+"pplx-space-common-lru-reaper" = { to = "crates/l10_foundation/common/lru/reaper" }
+"pplx-space-common-proto-build" = { to = "crates/l10_foundation/common/proto/build" }
+"pplx-space-common-work-coalescer" = { to = "crates/l10_foundation/common/work/coalescer" }
+"pplx-space-content-digest" = { to = "crates/l10_foundation/content/digest" }
+"pplx-space-cpu-arch" = { to = "crates/l10_foundation/cpu/arch" }
+"pplx-space-dependency-drain" = { to = "crates/l10_foundation/dependency/drain" }
+"pplx-space-durations" = { to = "crates/l10_foundation/durations" }
+"pplx-space-env-vars" = { to = "crates/l10_foundation/env/vars" }
+"pplx-space-feature-flags" = { to = "crates/l10_foundation/feature/flags" }
+"pplx-space-grpc-metrics" = { to = "crates/l10_foundation/grpc/metrics" }
+"pplx-space-grpc-rate-limiter" = { to = "crates/l10_foundation/grpc/rate/limiter" }
+"pplx-space-http-server" = { to = "crates/l10_foundation/http/server" }
+"pplx-space-k8s-ids" = { to = "crates/l10_foundation/k8s/ids" }
+"pplx-space-kube-client" = { to = "crates/l10_foundation/kube/client" }
+"pplx-space-linux-ids" = { to = "crates/l10_foundation/linux/ids" }
+"pplx-space-metrics-emit" = { to = "crates/l10_foundation/metrics/emit" }
+"pplx-space-migration-checksums" = { to = "crates/l10_foundation/migration/checksums" }
+"pplx-space-object-store" = { to = "crates/l10_foundation/object/store" }
+"pplx-space-observability" = { to = "crates/l10_foundation/observability" }
+"pplx-space-page-cache" = { to = "crates/l10_foundation/page/cache" }
+"pplx-space-pii" = { to = "crates/l10_foundation/pii" }
+"pplx-space-postgres-contention" = { to = "crates/l10_foundation/postgres/contention" }
+"pplx-space-request-id" = { to = "crates/l10_foundation/request/id" }
+"pplx-space-rustls-provider" = { to = "crates/l10_foundation/rustls/provider" }
+"pplx-space-s3-http-client" = { to = "crates/l10_foundation/s3/http/client" }
+"pplx-space-semver" = { to = "crates/l10_foundation/semver" }
+"pplx-space-service-lifecycle" = { to = "crates/l10_foundation/service/lifecycle" }
+"pplx-space-service-mutex" = { to = "crates/l10_foundation/service/mutex" }
+"pplx-space-spaced-build" = { to = "crates/l10_foundation/spaced/build" }
+"pplx-space-sql-locator" = { to = "crates/l10_foundation/sql/locator" }
+"pplx-space-sqlite" = { to = "crates/l10_foundation/sqlite" }
+"pplx-space-stopwatch" = { to = "crates/l10_foundation/stopwatch" }
+"pplx-space-systemd-watchdog" = { to = "crates/l10_foundation/systemd/watchdog" }
+"pplx-space-tokio-runtime" = { to = "crates/l10_foundation/tokio/runtime" }
+"pplx-space-uds-peer-auth" = { to = "crates/l10_foundation/uds/peer/auth" }
+"pplx-space-unix-socket-bind" = { to = "crates/l10_foundation/unix/socket/bind" }
+"pplx-space-unix-socket-path" = { to = "crates/l10_foundation/unix/socket/path" }
+"pplx-space-valkey" = { to = "crates/l10_foundation/valkey" }
+# l20_domain (25)
+"pplx-space-accounts" = { to = "crates/l20_domain/accounts" }
+"pplx-space-api-route" = { to = "crates/l20_domain/api/route" }
+"pplx-space-auto-lifecycle" = { to = "crates/l20_domain/auto/lifecycle/policy" }  # leaf: pplx-space-auto-lifecycle-receipt nest in l20_domain/auto/lifecycle
+"pplx-space-auto-lifecycle-receipt" = { to = "crates/l20_domain/auto/lifecycle/receipt" }
+"pplx-space-cluster-id" = { to = "crates/l20_domain/cluster/id" }
+"pplx-space-credential-injection-core" = { to = "crates/l20_domain/credential/injection/core" }
+"pplx-space-credential-provider-proto" = { to = "crates/l20_domain/credential/provider/proto" }
+"pplx-space-db-identity" = { to = "crates/l20_domain/db/identity" }
+"pplx-space-ecw-credential" = { to = "crates/l20_domain/ecw/credential" }
+"pplx-space-events" = { to = "crates/l20_domain/events" }
+"pplx-space-execution-common" = { to = "crates/l20_domain/execution/common" }
+"pplx-space-execution-spec" = { to = "crates/l20_domain/execution/spec" }
+"pplx-space-federated-identity" = { to = "crates/l20_domain/federated/identity" }
+"pplx-space-guest-process" = { to = "crates/l20_domain/guest/process" }
+"pplx-space-k8s-node-id" = { to = "crates/l20_domain/k8s/node/id" }
+"pplx-space-net-common" = { to = "crates/l20_domain/net/common" }
+"pplx-space-net-gateway-protocol" = { to = "crates/l20_domain/net/gateway/protocol" }
+"pplx-space-network-roles" = { to = "crates/l20_domain/network/roles" }
+"pplx-space-node-mgr-protocol" = { to = "crates/l20_domain/node/mgr/protocol" }
+"pplx-space-public-api" = { to = "crates/l20_domain/public/api" }
+"pplx-space-rpc-contracts" = { to = "crates/l20_domain/rpc/contracts" }
+"pplx-space-sbx-mgr-protocol" = { to = "crates/l20_domain/sbx/mgr/protocol" }
+"pplx-space-spaced-common" = { to = "crates/l20_domain/spaced/common" }
+"pplx-space-spaced-guest-protocol" = { to = "crates/l20_domain/spaced/guest/protocol" }
+"pplx-space-state-reconciliation" = { to = "crates/l20_domain/state/reconciliation" }
+# l30_storage (18)
+"pplx-space-cluster-pool" = { to = "crates/l30_storage/cluster/pool" }
+"pplx-space-cluster-trigger-queue" = { to = "crates/l30_storage/cluster/trigger/queue" }
+"pplx-space-credential-injection-store" = { to = "crates/l30_storage/credential/injection/store" }
+"pplx-space-db-migrate" = { to = "crates/l30_storage/db/migrate" }
+"pplx-space-federated-grant-store" = { to = "crates/l30_storage/federated/grant/store" }
+"pplx-space-node-registration-store" = { to = "crates/l30_storage/node/registration/store" }
+"pplx-space-placement" = { to = "crates/l30_storage/placement" }
+"pplx-space-runtime-environment-catalog-store" = { to = "crates/l30_storage/runtime/environment/catalog/store" }
+"pplx-space-runtime-environment-policy-store" = { to = "crates/l30_storage/runtime/environment/policy/store" }
+"pplx-space-sandbox-portability" = { to = "crates/l30_storage/sandbox/portability" }
+"pplx-space-sandbox-quarantine-store" = { to = "crates/l30_storage/sandbox/quarantine/store" }
+"pplx-space-sandbox-routability" = { to = "crates/l30_storage/sandbox/routability" }
+"pplx-space-sandbox-store" = { to = "crates/l30_storage/sandbox/store" }
+"pplx-space-sandbox-teardown" = { to = "crates/l30_storage/sandbox/teardown" }
+"pplx-space-sbxmgr-migrations" = { to = "crates/l30_storage/sbx/mgr/migrations", rename = "pplx-space-sbx-mgr-migrations" }  # renamed
+"pplx-space-sbx-mgr-store" = { to = "crates/l30_storage/sbx/mgr/store" }
+"pplx-space-snapshot-storage" = { to = "crates/l30_storage/snapshot/storage" }
+"pplx-space-snapshot-store" = { to = "crates/l30_storage/snapshot/store" }
+# l40_api (39)
+"pplx-space-api" = { to = "crates/l40_api/api" }
+"pplx-space-build-mgr-client" = { to = "crates/l40_api/build/mgr/client" }
+"pplx-space-build-mgr" = { to = "crates/l40_api/build/mgr/engine" }  # leaf: pplx-space-build-mgr-client, pplx-space-build-mgr-server nest in l40_api/build/mgr
+"pplx-space-build-mgr-server" = { to = "crates/l40_api/build/mgr/server" }
+"pplx-space-cluster-controller-server" = { to = "crates/l40_api/cluster/controller/server" }
+"pplx-space-cluster-reconciler" = { to = "crates/l40_api/cluster/reconciler" }
+"pplx-space-credential-provider-client" = { to = "crates/l40_api/credential/provider/client" }
+"pplx-space-credmgr-client" = { to = "crates/l40_api/credmgr/client" }
+"pplx-space-credmgr" = { to = "crates/l40_api/credmgr/server" }  # leaf: pplx-space-credmgr-client nest in l40_api/credmgr
+"pplx-space-data-plane-server" = { to = "crates/l40_api/data/plane/server" }
+"pplx-space-execution-catalog" = { to = "crates/l40_api/execution/catalog" }
+"pplx-space-ingress-admission" = { to = "crates/l40_api/ingress/admission" }
+"pplx-space-internal-api-server" = { to = "crates/l40_api/internal/api/server" }
+"pplx-space-net-gateway-client" = { to = "crates/l40_api/net/gateway/client" }
+"pplx-space-net-gateway" = { to = "crates/l40_api/net/gateway/server" }  # leaf: pplx-space-net-gateway-client nest in l40_api/net/gateway
+"pplx-space-node-api-client" = { to = "crates/l40_api/node/api/client" }
+"pplx-space-node-api-server" = { to = "crates/l40_api/node/api/server" }
+"pplx-space-node-ctl-client" = { to = "crates/l40_api/node/ctl/client" }
+"pplx-space-node-ctl-server" = { to = "crates/l40_api/node/ctl/server" }
+"pplx-space-node-mgr-client" = { to = "crates/l40_api/node/mgr/client" }
+"pplx-space-node-mgr" = { to = "crates/l40_api/node/mgr/server" }  # leaf: pplx-space-node-mgr-client nest in l40_api/node/mgr
+"pplx-space-node-runtime-core" = { to = "crates/l40_api/node/runtime/core" }
+"pplx-space-node-runtime-manager-client" = { to = "crates/l40_api/node/runtime/manager/client" }
+"pplx-space-node-runtime-manager" = { to = "crates/l40_api/node/runtime/manager/server" }  # leaf: pplx-space-node-runtime-manager-client nest in l40_api/node/runtime/manager
+"pplx-space-node-runtime-supervisor" = { to = "crates/l40_api/node/runtime/supervisor" }
+"pplx-space-placement-executor" = { to = "crates/l40_api/placement/executor" }
+"pplx-space-sbx-mgr-client" = { to = "crates/l40_api/sbx/mgr/client" }
+"pplx-space-sbx-mgr" = { to = "crates/l40_api/sbx/mgr/server" }  # leaf: pplx-space-sbx-mgr-client nest in l40_api/sbx/mgr
+"pplx-space-snapshot-retention" = { to = "crates/l40_api/snapshot/retention" }
+"pplx-space-spaced-guest-client" = { to = "crates/l40_api/spaced/guest/client" }
+"pplx-space-spaced-guest-execution" = { to = "crates/l40_api/spaced/guest/execution" }
+"pplx-space-spaced-guest-server" = { to = "crates/l40_api/spaced/guest/server" }
+"pplx-space-spaced-host-client" = { to = "crates/l40_api/spaced/host/client" }
+"pplx-space-spaced-host-server" = { to = "crates/l40_api/spaced/host/server" }
+"pplx-space-template-mgr-client" = { to = "crates/l40_api/template/mgr/client" }
+"pplx-space-template-mgr" = { to = "crates/l40_api/template/mgr/server" }  # leaf: pplx-space-template-mgr-client nest in l40_api/template/mgr
+"pplx-space-template-publisher" = { to = "crates/l40_api/template/publisher" }
+"pplx-space-volmgr-client" = { to = "crates/l40_api/volmgr/client" }
+"pplx-space-volmgr" = { to = "crates/l40_api/volmgr/server" }  # leaf: pplx-space-volmgr-client nest in l40_api/volmgr
+# l50_app (30)
+"pplx-space-admin-cli" = { to = "crates/l50_app/admin/cli" }
+"pplx-space-api-svc" = { to = "crates/l50_app/api/svc" }
+"pplx-space-build-mgr-cli" = { to = "crates/l50_app/build/mgr/cli" }
+"pplx-space-build-mgr-svc" = { to = "crates/l50_app/build/mgr/svc" }
+"pplx-space-cluster-controller" = { to = "crates/l50_app/cluster/controller/svc", rename = "pplx-space-cluster-controller-svc" }  # renamed
+"pplx-space-credmgr-svc" = { to = "crates/l50_app/credmgr/svc" }
+"pplx-space-data-plane-svc" = { to = "crates/l50_app/data/plane/svc" }
+"pplx-space-db-migrator" = { to = "crates/l50_app/db/migrator" }
+"pplx-space-internal-api-svc" = { to = "crates/l50_app/internal/api/svc" }
+"pplx-space-net-gateway-svc" = { to = "crates/l50_app/net/gateway/svc" }
+"pplx-space-node-api-svc" = { to = "crates/l50_app/node/api/svc" }
+"pplx-space-node-ctl-cli" = { to = "crates/l50_app/node/ctl/cli" }
+"pplx-space-node-ctl-svc" = { to = "crates/l50_app/node/ctl/svc" }
+"pplx-space-node-mgr-cli" = { to = "crates/l50_app/node/mgr/cli" }
+"pplx-space-node-mgr-svc" = { to = "crates/l50_app/node/mgr/svc" }
+"pplx-space-runtime-manager-cli" = { to = "crates/l50_app/node/runtime/manager/cli", rename = "pplx-space-node-runtime-manager-cli" }  # renamed
+"pplx-space-runtime-supervisor-svc" = { to = "crates/l50_app/node/runtime/supervisor/svc", rename = "pplx-space-node-runtime-supervisor-svc" }  # renamed
+"pplx-space-sbx-mgr-cli" = { to = "crates/l50_app/sbx/mgr/cli" }
+"pplx-space-sbxmgr-svc" = { to = "crates/l50_app/sbx/mgr/svc", rename = "pplx-space-sbx-mgr-svc" }  # renamed
+"pplx-space-spaced-guest-cli" = { to = "crates/l50_app/spaced/guest/cli" }
+"pplx-space-spaced-guest-svc" = { to = "crates/l50_app/spaced/guest/svc" }
+"pplx-space-spaced-guest-worker" = { to = "crates/l50_app/spaced/guest/worker" }
+"pplx-space-spaced-host-cli" = { to = "crates/l50_app/spaced/host/cli" }
+"pplx-space-spaced-host-svc" = { to = "crates/l50_app/spaced/host/svc" }
+"pplx-space-ssh-cli" = { to = "crates/l50_app/ssh/cli" }
+"pplx-space-tmplmgr-cli" = { to = "crates/l50_app/template/mgr/cli", rename = "pplx-space-template-mgr-cli" }  # renamed
+"pplx-space-tmplmgr-svc" = { to = "crates/l50_app/template/mgr/svc", rename = "pplx-space-template-mgr-svc" }  # renamed
+"pplx-space-template-publish" = { to = "crates/l50_app/template/publish" }
+"pplx-space-volmgr-cli" = { to = "crates/l50_app/volmgr/cli" }
+"pplx-space-volmgr-svc" = { to = "crates/l50_app/volmgr/svc" }
+# test_support (4)
+"pplx-space-db-test-fixtures" = { to = "crates/test_support/db/test/fixtures" }
+"pplx-space-mock-branching-key-provider-svc" = { to = "crates/test_support/mock/branching/key/provider/svc" }
+"pplx-space-node-api-sim" = { to = "crates/test_support/node/api/sim" }
+"pplx-space-test-env" = { to = "crates/test_support/test/env" }
+# tools (3)
+"pplx-space-archcheck" = { to = "crates/tools/archcheck" }
+"pplx-space-netgtw-bench" = { to = "crates/tools/net/gateway/bench", rename = "pplx-space-net-gateway-bench" }  # renamed
+"pplx-space-spaced-loopback-test" = { to = "crates/tools/spaced/loopback/test" }
+# stay (4)
+"pplx-space-common-core" = "stay"
+"pplx-space-common-svc" = "stay"
+"pplx-space-metrics" = "stay"
+"pplx-space-runtime-manager-svc" = { stay = "its rename re-keys its [layers.codec_features] baseline entry (the s3 feature of pplx-space-node-runtime-manager), which no_new_entries reads as new: move it with its rename once that edge is fixed" }
+
+# Tracked files below crates/apps and crates/libs outside a crate, moving
+# with the layer most of their family's crates go to.
+[files]
+"crates/apps/space-cli/tests/login.rs" = "stay"
+"crates/libs/net/gateway/AGENTS.md" = "crates/l40_api/net/gateway/AGENTS.md"
+"crates/libs/net/gateway/CLAUDE.md" = "crates/l40_api/net/gateway/CLAUDE.md"
+"crates/libs/spaced/AGENTS.md" = "crates/l40_api/spaced/AGENTS.md"
+"crates/libs/spaced/CLAUDE.md" = "crates/l40_api/spaced/CLAUDE.md"
+
+# Files the move leaves as they are, which may keep naming old paths, with why.
+[stale_paths]
+"scripts/move_crates.toml" = "the mapping itself: it names each crate by its package before the move, and each non-crate file by its old path"
+"scripts/netgtw/bench/build-rev.sh" = "builds the bench harness at any revision, so it names the harness's path, package and anchor member in both layouts"

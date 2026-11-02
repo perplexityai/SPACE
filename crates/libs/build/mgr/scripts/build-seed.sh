@@ -26,7 +26,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="${SPACE_SEED_REPO_ROOT:-$(cd "${SCRIPT_DIR}/../../../.." 2>/dev/null && pwd || true)}"
+REPO_ROOT="${SPACE_SEED_REPO_ROOT:-$(cd "${SCRIPT_DIR}/../../../../.." 2>/dev/null && pwd || true)}"
 ROOTFS_BUILDER_SCRIPT="${SPACE_SEED_ROOTFS_BUILDER_SCRIPT:-${REPO_ROOT}/templates/firecracker/seed/rootfs-builder.sh}"
 
 ID="seed"

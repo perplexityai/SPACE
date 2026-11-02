@@ -33,7 +33,6 @@ members = [
     "crates/apps/template/mgr/cli",
     "crates/apps/template/publish",
     "crates/apps/vol/mgr/cli",
-    "crates/apps/mock/llm/svc",
     "crates/apps/mock/branching-key-provider/svc",
     "crates/libs/spaced/build",
     "crates/libs/spaced/guest/execution",

@@ -366,7 +366,8 @@ unit tests. Use one only when the test genuinely wants integration semantics:
 - It **spawns the built binary** via `CARGO_BIN_EXE_*`.
 - It needs a **multi-file `support/` harness** shared across several test
   binaries, included per-binary with `#[path = "support/x.rs"]` — the shape used
-  by `crates/libs/spaced/{guest,host}/server/tests/`. Note the repo has no
+  by `crates/libs/spaced/guest/server/tests/` and
+  `crates/libs/spaced/host/server/tests/`. Note the repo has no
   `tests/common/mod.rs` anywhere; don't introduce one.
 
 Why not by default: the large majority of existing test modules touch private
@@ -527,13 +528,6 @@ servers, service-mutex and handoff sequencing, and every test. The library's
 deployment that needs private wiring supplies its own `main` against the
 library, so whatever sits in the public main is what a private one has to copy
 and keep in step with.
-
-`scripts/source_guards/thin_service_mains.py` enforces the shape (no `mod`, no
-`sqlx::migrate!`, no `env::var`, no server assembly, at most 80 lines outside the
-clap items since the flag surface is help text and may grow, nothing beside
-`main.rs` in `src/`) and carries a burn-down allowlist for services whose split
-has not merged. The PR that thins a main removes its entry; the guard fails on
-an allowlisted main that is already thin.
 
 ## Where these conventions live
 

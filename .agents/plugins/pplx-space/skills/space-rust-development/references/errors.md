@@ -7,7 +7,7 @@ lives in `docs/rust/error-handling.md` and `docs/rust/principles.md` § 3.
 
 ## When to read this reference
 
-- A function in `crates/libs/**` returns `Result<_, _>`.
+- A library function (in `crates/libs/**` or an `l10`–`l40` layer directory) returns `Result<_, _>`.
 - A function returns `Result<_, String>`. (Almost always wrong — fix it.)
 - A library crate signature has `anyhow::Result<_>` or `Box<dyn std::error::Error>`. (Always wrong in a public lib signature.)
 - A crate has a single `Error` enum that mixes I/O, network, parse, and business errors. (Kitchen sink — split it.)
@@ -79,12 +79,12 @@ return Err(format!("foo failed: {}", e));
 
 | Where                                       | Use                       |
 | ------------------------------------------- | ------------------------- |
-| `crates/apps/*/main.rs`, binary glue        | `anyhow::Result<T>`       |
-| `crates/libs/**` public signatures          | typed `thiserror` enum    |
-| Throwaway helpers private to one `libs/` file | typed if reused, `anyhow` only if truly local |
+| An app's `main.rs`, binary glue             | `anyhow::Result<T>`       |
+| Library public signatures (`crates/libs/**`, `l10`–`l40`) | typed `thiserror` enum |
+| Throwaway helpers private to one library file | typed if reused, `anyhow` only if truly local |
 | Tests, `examples/`, build scripts           | `anyhow` / `eyre` fine    |
 
-A typed enum in `main.rs` is fine; `anyhow` in a `libs/` public signature is not. The asymmetry exists because in `main`, the caller is the OS; in a library, the caller is us in three months trying to handle one variant differently from another.
+A typed enum in `main.rs` is fine; `anyhow` in a library's public signature is not. The asymmetry exists because in `main`, the caller is the OS; in a library, the caller is us in three months trying to handle one variant differently from another.
 
 ### 6. Foundational vocabulary errors — the `io::Error` shape
 
@@ -146,7 +146,7 @@ Carry the smallest values needed to understand the failure. Don't carry the enti
 
 ## Self-review before opening the PR
 
-- [ ] Every fallible function in a `libs/` crate returns a typed `thiserror` enum, never `Result<_, String>` and never `anyhow::Result` (except in `main`).
+- [ ] Every fallible function in a library crate returns a typed `thiserror` enum, never `Result<_, String>` and never `anyhow::Result` (except in `main`).
 - [ ] Every error enum has `#[derive(Debug, thiserror::Error)]`. Internal enums are exhaustive (no `#[non_exhaustive]`); SDK-published enums get `#[non_exhaustive]` when we ship one.
 - [ ] Each variant has a `#[error("...")]` whose message would help on-call at 3am.
 - [ ] Sub-errors lift via `#[from]` (lossless) or are wrapped with `#[source]` + context — not flattened.
