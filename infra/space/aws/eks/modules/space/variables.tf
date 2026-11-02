@@ -400,8 +400,8 @@ variable "workers_ami_id" {
   default     = null
   nullable    = true
 
-  # Every worker MNG (workers-cgnat, workers-1, the workers-N capacity groups)
-  # is `ami_type = "CUSTOM"` on the shared worker launch template. With no
+  # Every worker MNG (workers-cgnat, workers-1, the rollout cohorts, the
+  # workers-N capacity groups) is `ami_type = "CUSTOM"` on the shared worker launch template. With no
   # selector, workers-cgnat is silently filtered out of `rollout_managed` and
   # the others fail at apply with a launch template that has no image.
   validation {
@@ -459,10 +459,11 @@ variable "workers_labels" {
   nullable = false
 
   # Merged into this module's worker-MNG label surfaces: the legacy
-  # workers-cgnat pool (`locals.tf`), workers-1 (`rollout.tf`), and the
-  # `workers-N` capacity groups (`worker_capacity.tf`). `locals.tf` and
-  # `rollout.tf` merge it *last*, so a key set here wins over the literal label
-  # map rather than losing to it. Worker MNGs a calling root declares itself
+  # workers-cgnat pool, workers-1 and the rollout cohorts
+  # (`local.worker_rollout_labels`), and the `workers-N` capacity groups
+  # (`worker_capacity.tf`). `local.worker_rollout_labels` merges it *last*,
+  # so a key set here wins over the literal label map rather than losing to
+  # it. Worker MNGs a calling root declares itself
   # (a canary group, smoke or test nodes) carry their own labels and never
   # merge this variable, so this validation does not fence them; the root has
   # to hold them to the same contract.
@@ -482,7 +483,7 @@ variable "workers_labels" {
 }
 
 variable "workers_taints" {
-  description = "Taints for every worker node group: workers-cgnat, workers-1, and the workers-N capacity groups"
+  description = "Taints for every worker node group: workers-cgnat, workers-1, the workers_rollout_cohorts targets, and the workers-N capacity groups"
   type = list(object({
     effect = string
     key    = string
@@ -516,9 +517,8 @@ variable "workers_service_account_namespace" {
 # per-cohort inputs for a cluster's `workers-cgnat -> workers-1`
 # rollout. They are only used while `workers_cgnat_retired = false` and
 # are dropped again in the rollout cleanup PR after workers-1 is promoted
-# to steady state. A future `workers-1 -> workers-2` rollout PR will
-# re-introduce `workers_2_*` variables for its duration, and the matching
-# cleanup PR will drop them again.
+# to steady state. Later rollouts onto a fresh workers-N MNG go through
+# `workers_rollout_cohorts` below instead of a per-index variable set.
 variable "workers_1_headroom_count" {
   description = "Initial rollout headroom (`H`) for the `workers-cgnat -> workers-1` migration. Setting this to a non-null value creates the target `workers-1` MNG at `min=0, desired=H, max=H` while the legacy MNG still exists. Leave null outside an active rollout window."
   type        = number
@@ -539,6 +539,145 @@ variable "workers_1_cohort_taint_value" {
   validation {
     condition     = length(var.workers_1_cohort_taint_value) > 0
     error_message = "workers_1_cohort_taint_value must be non-empty."
+  }
+}
+
+# Sizing and taint for workers-1 itself, separate from the steady-state
+# `workers_*` triple. After workers-1 has been the source of a later
+# rollout, it sits at zero as that rollout's rollback artifact while the
+# promoted cohort carries the fleet, so the triple no longer describes it.
+# `rollout-mng` ignores live scaling changes, so these record intent in
+# tfvars and only take effect when the MNG is created.
+variable "workers_1_min_size" {
+  description = "Minimum size recorded for the workers-1 MNG. Null keeps the default: `workers_min_size` once workers_cgnat_retired, 0 during the workers-cgnat rollout. Terraform ignores live scaling changes on workers-1, so changing this plans no update on an existing MNG."
+  type        = number
+  default     = null
+
+  validation {
+    condition     = var.workers_1_min_size == null ? true : var.workers_1_min_size >= 0 && floor(var.workers_1_min_size) == var.workers_1_min_size
+    error_message = "workers_1_min_size must be null or a whole number of nodes, at least 0."
+  }
+}
+
+variable "workers_1_desired_size" {
+  description = "Desired size recorded for the workers-1 MNG. Null keeps the default: `workers_desired_size` once workers_cgnat_retired, `workers_1_headroom_count` during the workers-cgnat rollout. Terraform ignores live scaling changes on workers-1, so changing this plans no update on an existing MNG."
+  type        = number
+  default     = null
+
+  validation {
+    condition     = var.workers_1_desired_size == null ? true : var.workers_1_desired_size >= 0 && floor(var.workers_1_desired_size) == var.workers_1_desired_size
+    error_message = "workers_1_desired_size must be null or a whole number of nodes, at least 0."
+  }
+}
+
+variable "workers_1_max_size" {
+  description = "Maximum size recorded for the workers-1 MNG. Null keeps the default: `workers_max_size` once workers_cgnat_retired, `workers_1_headroom_count` during the workers-cgnat rollout. EKS requires a maximum of at least 1, so a workers-1 held at zero records `min_size = desired_size = 0` with this at 1 or more. Terraform ignores live scaling changes on workers-1, so changing this plans no update on an existing MNG."
+  type        = number
+  default     = null
+
+  validation {
+    condition     = var.workers_1_max_size == null ? true : var.workers_1_max_size >= 1 && floor(var.workers_1_max_size) == var.workers_1_max_size
+    error_message = "workers_1_max_size must be null or a whole number of nodes, at least 1; EKS rejects a node group maximum of 0."
+  }
+
+  # Checks the sizes rollout.tf resolves, defaults included, so a partial
+  # override such as `workers_1_desired_size = 0` alone can't leave the
+  # inherited `workers_min_size` above it.
+  validation {
+    condition = (
+      var.workers_1_min_size != null || var.workers_1_desired_size != null || var.workers_1_max_size != null
+      ) ? (
+      coalesce(var.workers_1_min_size, var.workers_cgnat_retired ? var.workers_min_size : 0) <= coalesce(var.workers_1_desired_size, var.workers_cgnat_retired ? var.workers_desired_size : coalesce(var.workers_1_headroom_count, 0)) &&
+      coalesce(var.workers_1_desired_size, var.workers_cgnat_retired ? var.workers_desired_size : coalesce(var.workers_1_headroom_count, 0)) <= coalesce(var.workers_1_max_size, var.workers_cgnat_retired ? var.workers_max_size : coalesce(var.workers_1_headroom_count, 0))
+    ) : true
+    error_message = "With the workers_1 sizing inputs applied over their defaults, workers-1 must satisfy min_size <= desired_size <= max_size."
+  }
+}
+
+variable "workers_1_rollback_cohort_taint_value" {
+  description = "Cohort taint and label value to put back on workers-1 after workers_cgnat_retired, for a rollback from a workers_rollout_cohorts target onto workers-1. Null, the default, leaves workers-1 untainted; setting it back to null drops the taint and cohort label from the MNG configuration. EKS removes the label from live nodes, but nodes registered while it was set keep the taint until it's removed from them directly (`rollout-mng/README.md`). Must differ from every workers_rollout_cohorts cohort value, so evacuation pods pinned to one cohort can't land on the other. While workers_cgnat_retired is false, workers-1 takes workers_1_cohort_taint_value instead and this is ignored."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.workers_1_rollback_cohort_taint_value == null ? true : trimspace(var.workers_1_rollback_cohort_taint_value) != ""
+    error_message = "workers_1_rollback_cohort_taint_value must be null or non-empty."
+  }
+
+  validation {
+    condition = var.workers_1_rollback_cohort_taint_value == null ? true : !contains(
+      [for cohort in values(var.workers_rollout_cohorts) : cohort.cohort_taint_value],
+      var.workers_1_rollback_cohort_taint_value,
+    )
+    error_message = "workers_1_rollback_cohort_taint_value must differ from every workers_rollout_cohorts cohort_taint_value."
+  }
+}
+
+# Target cohorts for worker rollouts; see `module "workers_rollout_cohort"` in rollout.tf.
+variable "workers_rollout_cohorts" {
+  description = <<-EOT
+    Target worker MNGs for blue/green rollouts after workers_cgnat_retired, keyed by MNG name (`workers-N`, N >= 2, not a worker_capacity_groups key). Empty, the default, creates nothing.
+
+    Each entry launches from the shared worker launch template's latest version when it's created, with workers-1's subnets, instance types, capacity type, labels and taints, so a cohort carries a launch template delta only. Changing workers_instance_types, workers_capacity_type or the default worker subnet set (the tier-discovered secondary subnets, or the worker_subnet_pools entry marked default_for_existing_mngs) replaces workers-1 and every cohort. A workers_capacity_type change also replaces every worker_capacity_groups entry, and a subnet change replaces any entry whose resolved subnets change. Bumping the template updates every worker_capacity_groups entry in place. Each entry joins the cluster-controller and rollout-orchestrator worker IAM scope. Create a target at `min_size = 0` and `desired_size = max_size = H`, the headroom, with a `cohort_taint_value` matching `clusterController.drainEvacuationPlacement.cohortValue` (by convention the MNG's index as a string, `"2"` for `workers-2`); the orchestrator resizes it from there. The rollout-mng module ignores live scaling and launch template changes, so later edits to the sizing record intent in tfvars without planning an update. The cleanup after promotion sets `cohort_taint_value = null`, which drops the taint and cohort label from the MNG configuration; nodes registered before that apply keep the taint until it's removed from them directly (`rollout-mng/README.md`).
+
+    `cohort_taint_value` has no default, so each entry states whether it's tainted. Renaming or removing an entry replaces or destroys its MNG. Each entry's ASG gets the worker common tags plus `Name` and `NodeGroup`, keyed by entry name as the capacity groups' are, so adding one is a single apply.
+  EOT
+  type = map(object({
+    min_size           = optional(number, 0)
+    desired_size       = number
+    max_size           = number
+    cohort_taint_value = string
+  }))
+  default  = {}
+  nullable = false
+
+  validation {
+    condition = alltrue([
+      for name in keys(var.workers_rollout_cohorts) :
+      can(regex("^workers-(?:[2-9]|[1-9][0-9]+)$", name))
+    ])
+    error_message = "workers_rollout_cohorts keys must be workers-N MNG names with N of 2 or more; workers-1 is declared separately."
+  }
+
+  validation {
+    condition     = length(setintersection(keys(var.workers_rollout_cohorts), keys(var.worker_capacity_groups))) == 0
+    error_message = "workers_rollout_cohorts keys must not reuse a worker_capacity_groups name; capacity groups and rollout cohorts share the workers-N namespace."
+  }
+
+  validation {
+    condition     = length(var.workers_rollout_cohorts) == 0 || var.workers_cgnat_retired
+    error_message = "workers_rollout_cohorts needs workers_cgnat_retired = true; the workers-cgnat to workers-1 rollout uses workers_1_headroom_count."
+  }
+
+  validation {
+    condition = alltrue([
+      for cohort in values(var.workers_rollout_cohorts) :
+      anytrue([cohort.min_size == null, cohort.desired_size == null, cohort.max_size == null]) ? false : (
+        floor(cohort.min_size) == cohort.min_size &&
+        floor(cohort.desired_size) == cohort.desired_size &&
+        floor(cohort.max_size) == cohort.max_size &&
+        0 <= cohort.min_size &&
+        cohort.min_size <= cohort.desired_size &&
+        cohort.desired_size <= cohort.max_size &&
+        cohort.max_size >= 1
+      )
+    ])
+    error_message = "Each workers_rollout_cohorts entry needs whole-number sizes with 0 <= min_size <= desired_size <= max_size and max_size >= 1."
+  }
+
+  validation {
+    condition = alltrue([
+      for cohort in values(var.workers_rollout_cohorts) :
+      cohort.cohort_taint_value == null ? true : trimspace(cohort.cohort_taint_value) != ""
+    ])
+    error_message = "Each workers_rollout_cohorts cohort_taint_value must be null or non-empty."
+  }
+
+  validation {
+    condition = length(compact([for cohort in values(var.workers_rollout_cohorts) : cohort.cohort_taint_value])) == length(distinct(compact([
+      for cohort in values(var.workers_rollout_cohorts) : cohort.cohort_taint_value
+    ])))
+    error_message = "workers_rollout_cohorts cohort_taint_value values must be distinct, so evacuation pods pin to exactly one cohort."
   }
 }
 
@@ -939,7 +1078,7 @@ variable "eks_cluster_tags" {
 }
 
 variable "worker_asg_tag_propagation_enabled" {
-  description = "Propagate worker common tags to the workers-cgnat, workers-1, and additional_worker_asg_names ASGs. That propagation's for_each is keyed by ASG names that exist only after those node groups are created, so it must be false for any apply that creates one: a fresh cluster's first apply, and on an existing cluster any apply that adds workers-1 (setting workers_1_headroom_count, or setting workers_cgnat_retired = true on a cluster that never set it) or a new additional_worker_asg_names entry. Defaults off so a fresh cluster plans; set true and re-apply once the node groups exist. The workers-N capacity groups are keyed by group name and always get their tags."
+  description = "Propagate worker common tags to the workers-cgnat, workers-1, and additional_worker_asg_names ASGs. That propagation's for_each is keyed by ASG names that exist only after those node groups are created, so it must be false for any apply that creates one: a fresh cluster's first apply, and on an existing cluster any apply that adds workers-1 (setting workers_1_headroom_count, or setting workers_cgnat_retired = true on a cluster that never set it) or a new additional_worker_asg_names entry. Defaults off so a fresh cluster plans; set true and re-apply once the node groups exist. The workers-N capacity groups and the workers_rollout_cohorts targets are keyed by name and always get their tags."
   type        = bool
   default     = false
   nullable    = false

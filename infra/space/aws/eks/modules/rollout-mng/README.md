@@ -169,7 +169,10 @@ monotonically increasing `workers-N` index.
    and permanent capacity group, with the new cohort's configuration
    delta. The convention is `min_size = 0, desired_size = H, max_size
    = H` so EKS provisions the headroom nodes at apply time and the
-   rollout can begin draining as soon as those nodes are `Ready`.
+   rollout can begin draining as soon as those nodes are `Ready`. In
+   the `space` module, later launch-template rollouts are entries in
+   `workers_rollout_cohorts`, not new module blocks. Those entries share
+   the steady-state pool's instance types, capacity type and subnets.
 2. **Drive the rollout.** The operator runs the rollout script. It
    ratchets the new MNG's `desired_size` up wave-by-wave, calls the
    admin `:drain` endpoint on incumbent nodes with
@@ -185,7 +188,9 @@ monotonically increasing `workers-N` index.
    - deletes the explicitly recorded older *rollout* rollback artifact — never
      a permanent capacity group selected by index arithmetic — to return the
      rollout lineage to two-MNG steady state (skip on the first rollout from
-     `workers-cgnat`),
+     `workers-cgnat`, and when that artifact is the `space` module's
+     `workers-1`, which is permanent once `workers_cgnat_retired` is set and
+     stays at zero instead),
    - sets `cohort_taint_value = null` on this module instance so both
      the `dynamic "taint"` block and the cohort key in the `labels`
      merge drop out of the EKS node group configuration — later
