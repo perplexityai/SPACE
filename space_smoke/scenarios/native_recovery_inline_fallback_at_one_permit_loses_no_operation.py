@@ -9,9 +9,15 @@ from space_smoke.registry import scenario
 from space_smoke.runtime import InconclusiveSmoke
 
 CREATES = 4
-# Long enough for every admitted create to have been claimed had admission
-# let it run inline.
-HOLD_SECONDS = 8
+# How long the creates are watched with no dispatcher running. Admission
+# claims a create before it answers, so this only gives a claim admission
+# should not have made time to show.
+WATCH_SECONDS = 8
+# An inline create waits this long before it starts, holding its permit, so
+# the permit is still taken when the next create is admitted. Without it a
+# fast runner ends a create, and frees its permit, before the next request
+# arrives, and that one runs inline too. It far outlasts the admissions.
+PERMIT_HOLD_SECONDS = 30
 
 
 @scenario(
@@ -19,6 +25,8 @@ HOLD_SECONDS = 8
     api_surfaces=("native",),
     required_tools=("kubectl", "kind"),
     rerun_environment=RECOVERY_ENVIRONMENT,
+    test_hooks="SPACE_NATIVE_INLINE_TEST_HOLD_SECS, which keeps each inline create's permit taken while the rest "
+    "are admitted",
 )
 def inline_fallback_at_one_permit_loses_no_operation(fixture: KindNativeHardeningFixture) -> None:
     """At `SPACE_NATIVE_INLINE_MAX_CONCURRENT=1`, concurrent creates with no
@@ -27,7 +35,10 @@ def inline_fallback_at_one_permit_loses_no_operation(fixture: KindNativeHardenin
     """
 
     control = fixture.recovery
-    with inline_execution(fixture, control, ("create_sandbox",), permits=1), control.owned_faults():
+    with (
+        inline_execution(fixture, control, ("create_sandbox",), permits=1, hold=PERMIT_HOLD_SECONDS),
+        control.owned_faults(),
+    ):
         api_pods = control._captures["space-api"].replicas
         if api_pods >= CREATES:
             raise InconclusiveSmoke(f"{api_pods} API pods leave no create past their permits")
@@ -38,7 +49,7 @@ def inline_fallback_at_one_permit_loses_no_operation(fixture: KindNativeHardenin
             accepted = [expect_response(fixture, response, 202) for response in responses]
             operations = [body["operation_id"] for body in accepted]
             started = set()
-            deadline = time.monotonic() + HOLD_SECONDS
+            deadline = time.monotonic() + WATCH_SECONDS
             while time.monotonic() < deadline:
                 started |= {op for op in operations if operation(fixture, op)["state"] != "queued"}
                 time.sleep(0.5)

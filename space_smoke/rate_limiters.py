@@ -48,8 +48,9 @@ PER_CLIENT_LIMIT_MESSAGE = "Per-client rate limit:"
 # else. `enable` refuses anything outside it before kubectl runs. The store's
 # URL is not among them: the chart renders it, and the fail-open half takes
 # the store itself away instead. The inline switches and permit count are
-# the API's own, which the `native_recovery.inline_*` scenarios set for their
-# run (`native_inline.inline_execution`); they share the Lease's record and
+# the API's own, and the inline hold its test hook, which the
+# `native_recovery.inline_*` scenarios set for their run
+# (`native_inline.inline_execution`); they share the Lease's record and
 # repair.
 LIMITER_ENV_KEYS: tuple[str, ...] = (
     "SPACE_CLUSTER_ACTIVATION_ADMISSION_ENABLED",
@@ -61,6 +62,7 @@ LIMITER_ENV_KEYS: tuple[str, ...] = (
     "SPACE_NATIVE_INLINE_OPERATIONS_ENABLED",
     "SPACE_NATIVE_INLINE_KINDS",
     "SPACE_NATIVE_INLINE_MAX_CONCURRENT",
+    "SPACE_NATIVE_INLINE_TEST_HOLD_SECS",
 )
 REDIS_URL_ENV = "SPACE_REDIS_URL"
 
