@@ -1509,3 +1509,261 @@ fn the_budget_outlasts_several_connect_retry_attempts() {
          before a fourth dial attempt"
     );
 }
+
+/// What a publish attempt on a real tonic channel ran into.
+enum PublishTarget {
+    /// A local port nothing listens on.
+    ClosedPort,
+    /// A ClusterApi server that answers every call with this status.
+    Answering(tonic::Code, &'static str),
+    /// A ClusterApi server whose connection is cut once the call reaches it,
+    /// before it answers or after it sent its response headers.
+    CutMidCall { after_headers: bool },
+}
+
+/// A ClusterApi server that answers every call the way a tonic handler or
+/// tower layer rejects one, or holds it, reporting that it arrived, and
+/// sends response headers but never the rest of the response.
+#[derive(Clone)]
+enum ClusterApiAnswer {
+    Status(tonic::Code, &'static str),
+    Hold(std::sync::Arc<tokio::sync::Notify>),
+}
+
+impl tonic::server::NamedService for ClusterApiAnswer {
+    const NAME: &'static str = "space.node.api.v1.ClusterApi";
+}
+
+/// A response body that never yields a frame.
+struct EndlessBody;
+
+impl http_body::Body for EndlessBody {
+    type Data = bytes::Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        std::task::Poll::Pending
+    }
+}
+
+impl tower::Service<http::Request<tonic::body::Body>> for ClusterApiAnswer {
+    type Response = http::Response<tonic::body::Body>;
+    type Error = std::convert::Infallible;
+    type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _request: http::Request<tonic::body::Body>) -> Self::Future {
+        std::future::ready(Ok(match self {
+            Self::Status(code, message) => tonic::Status::new(*code, *message).into_http(),
+            Self::Hold(reached) => {
+                reached.notify_one();
+                http::Response::builder()
+                    .header("content-type", "application/grpc")
+                    .body(tonic::body::Body::new(EndlessBody))
+                    .expect("static response")
+            }
+        }))
+    }
+}
+
+async fn serve_cluster_api(answer: ClusterApiAnswer) -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the ClusterApi stand-in");
+    let address = listener.local_addr().expect("ClusterApi stand-in address");
+    tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(answer)
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+    );
+    address
+}
+
+/// When a relay cuts the connection of a call it carries.
+enum Cut {
+    /// Once the server has the call, before the client has any answer.
+    OnArrival(std::sync::Arc<tokio::sync::Notify>),
+    /// Once the client has the server's response headers.
+    AfterResponseHeaders,
+}
+
+/// A TCP relay to `server` for one connection. It passes the server's HTTP/2
+/// frames on one at a time, response headers only when the cut comes after
+/// them, and, at `cut`, ends the client's side of the connection, as a peer
+/// that went away mid-call would.
+async fn relay_until_cut(server: std::net::SocketAddr, cut: Cut) -> std::net::SocketAddr {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    const HEADERS_FRAME: u8 = 0x1;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the relay");
+    let address = listener.local_addr().expect("relay address");
+    tokio::spawn(async move {
+        let (client, _) = listener.accept().await.expect("accept the client");
+        let upstream = tokio::net::TcpStream::connect(server)
+            .await
+            .expect("dial the ClusterApi stand-in");
+        let (mut from_client, mut to_client) = client.into_split();
+        let (mut from_server, mut to_server) = upstream.into_split();
+        let requests = tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut from_client, &mut to_server).await;
+        });
+        let cut_after_headers = matches!(cut, Cut::AfterResponseHeaders);
+        let responses = async {
+            loop {
+                let mut header = [0_u8; 9];
+                from_server.read_exact(&mut header).await?;
+                let length = u32::from_be_bytes([0, header[0], header[1], header[2]]);
+                let mut payload = vec![0_u8; length as usize];
+                from_server.read_exact(&mut payload).await?;
+                let headers = header[3] == HEADERS_FRAME;
+                // A cut on arrival leaves the client no answer at all, so the
+                // response headers are dropped, not raced against the cut.
+                if headers && !cut_after_headers {
+                    continue;
+                }
+                to_client.write_all(&header).await?;
+                to_client.write_all(&payload).await?;
+                if headers {
+                    return Ok::<_, std::io::Error>(());
+                }
+            }
+        };
+        let arrived = async {
+            match &cut {
+                Cut::OnArrival(reached) => reached.notified().await,
+                Cut::AfterResponseHeaders => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            _ = responses => {}
+            () = arrived => {}
+        }
+        let _ = to_client.shutdown().await;
+        let _ = requests.await;
+    });
+    address
+}
+
+/// The status a `PublishNodeState` call fails with on a channel built as
+/// node-ctl builds its ClusterApi channel, with a stand-in bearer.
+async fn publish_status_from(target: PublishTarget) -> tonic::Status {
+    let address = match target {
+        PublishTarget::ClosedPort => {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("reserve a local port");
+            listener.local_addr().expect("reserved port")
+        }
+        PublishTarget::Answering(code, message) => {
+            serve_cluster_api(ClusterApiAnswer::Status(code, message)).await
+        }
+        PublishTarget::CutMidCall { after_headers } => {
+            let reached = std::sync::Arc::new(tokio::sync::Notify::new());
+            let server = serve_cluster_api(ClusterApiAnswer::Hold(reached.clone())).await;
+            let cut = if after_headers {
+                Cut::AfterResponseHeaders
+            } else {
+                Cut::OnArrival(reached)
+            };
+            relay_until_cut(server, cut).await
+        }
+    };
+    let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+        .expect("endpoint")
+        .tcp_nodelay(true)
+        .connect_timeout(crate::CLUSTER_CONNECT_TIMEOUT)
+        .timeout(crate::CLUSTER_RPC_TIMEOUT);
+    let channel = pplx_space_common_grpc::connect_tcp_channel_lazy(endpoint, None)
+        .expect("plaintext TCP endpoint");
+    let channel =
+        tonic::service::interceptor::InterceptedService::new(channel, |mut request: Request<()>| {
+            request.metadata_mut().insert(
+                "authorization",
+                "Bearer stand-in".parse().expect("static metadata"),
+            );
+            Ok(request)
+        });
+    let mut client = pplx_space_node_api_client::proto::cluster_api_client::ClusterApiClient::new(
+        pplx_space_common_svc::bootstrap::wrap_grpc_client_channel(channel),
+    );
+    client
+        .publish_node_state(PublishNodeStateRequest::default())
+        .await
+        .expect_err("the publish fails")
+}
+
+fn source_chain(status: &tonic::Status) -> Vec<String> {
+    let mut chain = Vec::new();
+    let mut source = std::error::Error::source(status);
+    while let Some(error) = source {
+        chain.push(format!("{error:?}"));
+        source = error.source();
+    }
+    chain
+}
+
+/// The same classification on statuses a real tonic client produced. A
+/// refused connect and the server's own `Unavailable` share a code, so only
+/// who produced the status separates them.
+#[tokio::test]
+async fn publish_statuses_from_a_real_channel_retry_only_transport_failures() {
+    let cases = [
+        (PublishTarget::ClosedPort, Code::Unavailable, true),
+        (
+            PublishTarget::Answering(Code::Unavailable, "token validation is rate limited"),
+            Code::Unavailable,
+            false,
+        ),
+        (
+            PublishTarget::Answering(
+                Code::Internal,
+                "commit node state publish: error communicating with database: \
+                 Connection reset by peer (os error 104)",
+            ),
+            Code::Internal,
+            false,
+        ),
+        (
+            PublishTarget::Answering(Code::Unknown, "connection closed"),
+            Code::Unknown,
+            false,
+        ),
+        (
+            PublishTarget::CutMidCall {
+                after_headers: false,
+            },
+            Code::Unknown,
+            true,
+        ),
+        (
+            PublishTarget::CutMidCall {
+                after_headers: true,
+            },
+            Code::Unknown,
+            true,
+        ),
+    ];
+    let mut misclassified = Vec::new();
+    for (target, code, retried) in cases {
+        let status = publish_status_from(target).await;
+        let retry_soon = OutboundError::from_publish_status(&status).retry_soon();
+        if (status.code(), retry_soon) != (code, retried) {
+            misclassified.push(format!(
+                "{status:?} (sources {:?}): expected {code:?}, retried={retried}",
+                source_chain(&status)
+            ));
+        }
+    }
+    assert!(misclassified.is_empty(), "{misclassified:#?}");
+}

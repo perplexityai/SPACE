@@ -51,9 +51,11 @@ mod facets;
 #[cfg(feature = "kubernetes")]
 mod kubernetes_controller;
 mod orphan_inventory;
+mod outbound_retry;
 mod util;
 
 use cluster_reconcile_trigger::{ClusterReconcileTrigger, trigger_request_reason};
+use outbound_retry::{OutboundOutcome, OutboundPass, OutboundRetry};
 
 /// The group node-ctl's clients reach its production socket through.
 pub const DEFAULT_NODE_CTL_SOCKET_GROUP: &str = group_names::SPACE_NODECTLCLIENTS;
@@ -412,11 +414,55 @@ struct NodeCtlWorker {
     cluster_reconcile_trigger: ClusterReconcileTrigger,
     resource_status_reader: NodeResourceStatusReader,
     network_pool_status_reader: NetworkPoolStatusReader,
-    orphan_inventory: orphan_inventory::Observer,
+    orphan_inventory: Box<dyn OrphanInventoryObserver>,
     runtime_provisioning: Arc<facets::Provisioning>,
     /// The Kubernetes node-local controller when this node runs one.
     node_objects: Option<Box<dyn NodeObjectReconciles>>,
+    /// Where outbound facets publish to.
+    publisher: Arc<dyn OutboundPublisher>,
+    /// The pending retry of a failed node-state publication.
+    outbound_retry: OutboundRetry,
     rx: mpsc::Receiver<WorkItem>,
+}
+
+/// Where outbound facets publish: ClusterApi, through
+/// [`facets::FacetKind::run_outbound`]. A trait so a test can script publish
+/// results.
+#[tonic::async_trait]
+trait OutboundPublisher: Send + Sync {
+    /// Whether node-ctl has a cluster endpoint to publish to.
+    fn cluster_configured(&self) -> bool;
+
+    async fn publish(
+        &self,
+        facet: facets::FacetKind,
+        node_id: &str,
+        node_role: Option<NodeRole>,
+        scope: facets::FacetScope,
+        node_status: Option<PublishedNodeStatus>,
+    ) -> Result<ReconcileStats, facets::OutboundError>;
+}
+
+struct ClusterApiPublisher;
+
+#[tonic::async_trait]
+impl OutboundPublisher for ClusterApiPublisher {
+    fn cluster_configured(&self) -> bool {
+        cluster_sync_configured()
+    }
+
+    async fn publish(
+        &self,
+        facet: facets::FacetKind,
+        node_id: &str,
+        node_role: Option<NodeRole>,
+        scope: facets::FacetScope,
+        node_status: Option<PublishedNodeStatus>,
+    ) -> Result<ReconcileStats, facets::OutboundError> {
+        facet
+            .run_outbound(node_id, node_role, scope, node_status)
+            .await
+    }
 }
 
 /// The node's Kubernetes object reconciles: template-presence node metadata,
@@ -428,6 +474,20 @@ struct NodeCtlWorker {
 trait NodeObjectReconciles: Send + Sync {
     /// Run each reconcile once; a failure is logged and the rest still run.
     async fn reconcile_node_objects(&mut self);
+}
+
+/// Each tick's read-only orphan-inventory page from node-manager. A trait so
+/// a test can stand in for node-manager.
+#[tonic::async_trait]
+trait OrphanInventoryObserver: Send + Sync {
+    async fn observe(&mut self);
+}
+
+#[tonic::async_trait]
+impl OrphanInventoryObserver for orphan_inventory::Observer {
+    async fn observe(&mut self) {
+        orphan_inventory::Observer::observe(self).await;
+    }
 }
 
 #[cfg(feature = "kubernetes")]
@@ -566,13 +626,15 @@ pub async fn run(
         cluster_reconcile_trigger: cluster_reconcile_trigger.clone(),
         resource_status_reader,
         network_pool_status_reader,
-        orphan_inventory: orphan_inventory::Observer::default(),
+        orphan_inventory: Box::new(orphan_inventory::Observer::default()),
         runtime_provisioning: Arc::default(),
         #[cfg(feature = "kubernetes")]
         node_objects: kubernetes_controller
             .map(|controller| Box::new(controller) as Box<dyn NodeObjectReconciles>),
         #[cfg(not(feature = "kubernetes"))]
         node_objects: None,
+        publisher: Arc::new(ClusterApiPublisher),
+        outbound_retry: OutboundRetry::default(),
         rx,
     };
     let mut worker_task = tokio::spawn(worker.run(worker_shutdown_token));
@@ -1089,8 +1151,17 @@ impl NodeCtlWorker {
     async fn run(mut self, shutdown_token: CancellationToken) {
         loop {
             let work = tokio::select! {
+                // Queued work before a due retry: a tick waiting behind the
+                // retry would publish the same facets straight after it.
+                biased;
                 () = shutdown_token.cancelled() => break,
                 work = self.rx.recv() => work,
+                () = self.outbound_retry.until_due() => {
+                    let refs = self.outbound_retry.take();
+                    self.run_outbound_sync(refs, OutboundPass::Retry, shutdown_token.child_token())
+                        .await;
+                    continue;
+                }
             };
             let Some(work) = work else {
                 break;
@@ -1112,6 +1183,7 @@ impl NodeCtlWorker {
                     }
                     self.run_outbound_sync(
                         facets::periodic_outbound_refs(),
+                        OutboundPass::Scheduled,
                         shutdown_token.child_token(),
                     )
                     .await;
@@ -1123,16 +1195,24 @@ impl NodeCtlWorker {
                 WorkItem::ManualRefresh { refs } => {
                     self.run_inbound_reconcile(refs, shutdown_token.child_token())
                         .await;
-                    self.run_outbound_sync(Vec::new(), shutdown_token.child_token())
-                        .await;
+                    self.run_outbound_sync(
+                        Vec::new(),
+                        OutboundPass::Scheduled,
+                        shutdown_token.child_token(),
+                    )
+                    .await;
                 }
                 WorkItem::DrainClusterQueue => {
                     self.run_cluster_queue_drain(shutdown_token.child_token())
                         .await;
                 }
                 WorkItem::SyncDirty => {
-                    self.run_outbound_sync(Vec::new(), shutdown_token.child_token())
-                        .await;
+                    self.run_outbound_sync(
+                        Vec::new(),
+                        OutboundPass::Scheduled,
+                        shutdown_token.child_token(),
+                    )
+                    .await;
                 }
             }
         }
@@ -1312,43 +1392,81 @@ impl NodeCtlWorker {
         report
     }
 
+    /// Publish the dirty outbound facets plus `periodic_refs`, then schedule
+    /// a retry of any full publish that failed (see `outbound_retry`).
     async fn run_outbound_sync(
         &mut self,
         periodic_refs: Vec<dirty_state::FacetRef>,
+        pass: OutboundPass,
         shutdown_token: CancellationToken,
     ) {
+        let outcome = self
+            .publish_outbound(periodic_refs, pass, shutdown_token.clone())
+            .await;
+        // A pass cut short by shutdown says nothing about the cluster.
+        if shutdown_token.is_cancelled() {
+            return;
+        }
+        if let Some(end) = self
+            .outbound_retry
+            .record(pass, outcome, tokio::time::Instant::now())
+        {
+            end.log(pass);
+        }
+    }
+
+    async fn publish_outbound(
+        &mut self,
+        periodic_refs: Vec<dirty_state::FacetRef>,
+        pass: OutboundPass,
+        shutdown_token: CancellationToken,
+    ) -> OutboundOutcome {
+        let mut outcome = OutboundOutcome::default();
         let mut batch = match dirty_state::read(&self.db) {
             Ok(batch) => batch,
             Err(error) => {
                 tracing::warn!(%error, "failed to read dirty node state");
-                return;
+                return OutboundOutcome::none_published(&periodic_refs);
             }
         };
-        for reference in periodic_refs {
-            batch.push_ref(reference);
-        }
-        if batch.is_empty() {
-            return;
-        }
         // The node-local Kubernetes object reconciles (template-presence node
         // metadata, network-slot status capacity, the SSD placement labels, and
         // the host-CPU label) share this cadence: the template-inventory facet
         // is pushed on every periodic outbound tick, so gating on it runs each
-        // of these reconciles every tick and self-heals drift.
-        if batch.facets().any(|(facet_name, _)| {
-            facets::FacetKind::parse(facet_name) == Some(facets::FacetKind::TemplateInventory)
-        }) && let Some(node_objects) = &mut self.node_objects
-        {
+        // of these reconciles every tick and self-heals drift. A retry's own
+        // template-inventory ref does not run them: they do not go through
+        // the cluster, and the pass it retries already ran them. Dirty
+        // template-inventory work the retry pass picks up still does.
+        let carries_template_inventory = |batch: &dirty_state::DirtyFacetBatch| {
+            batch.facets().any(|(facet_name, _)| {
+                facets::FacetKind::parse(facet_name) == Some(facets::FacetKind::TemplateInventory)
+            })
+        };
+        let dirty_template_inventory = carries_template_inventory(&batch);
+        for reference in periodic_refs {
+            batch.push_ref(reference);
+        }
+        if batch.is_empty() {
+            return outcome;
+        }
+        let reconcile_node_objects = match pass {
+            OutboundPass::Scheduled => carries_template_inventory(&batch),
+            OutboundPass::Retry => dirty_template_inventory,
+        };
+        if reconcile_node_objects && let Some(node_objects) = &mut self.node_objects {
             node_objects.reconcile_node_objects().await;
         }
 
-        if !cluster_sync_configured() {
-            for (facet_name, _) in batch.facets() {
+        if !self.publisher.cluster_configured() {
+            for (facet_name, items) in batch.facets() {
                 let Some(facet) = facets::FacetKind::parse(facet_name) else {
                     continue;
                 };
                 if !facet.supports_outbound() {
                     continue;
+                }
+                if items.is_none() {
+                    outcome.settled(facet);
                 }
                 let status_name = outbound_reconciler_name(facet);
                 if let Err(error) = self.mark_reconcile_started_for(status_name) {
@@ -1360,7 +1478,7 @@ impl NodeCtlWorker {
                     tracing::warn!(%error, "failed to persist skipped outbound sync result");
                 }
             }
-            return;
+            return outcome;
         }
 
         let mut succeeded = batch.empty_with_claim();
@@ -1383,12 +1501,16 @@ impl NodeCtlWorker {
             if let Err(error) = self.mark_reconcile_started_for(status_name) {
                 tracing::warn!(%error, "failed to persist outbound sync start");
             }
+            let scope = facets::FacetScope::from_optional_items(items);
             match dirty_state::is_disabled(
                 &self.db,
                 facet.name(),
                 dirty_state::SyncDirection::Outbound,
             ) {
                 Ok(true) => {
+                    if scope == facets::FacetScope::Full {
+                        outcome.settled(facet);
+                    }
                     if let Err(db_error) = self.mark_reconcile_finished_for(
                         status_name,
                         &ReconcileStats::default(),
@@ -1401,6 +1523,9 @@ impl NodeCtlWorker {
                 Ok(false) => {}
                 Err(error) => {
                     let error = format!("read outbound sync override: {error}");
+                    if scope == facets::FacetScope::Full {
+                        outcome.failed(facet, &facets::OutboundError::Other(error.clone()));
+                    }
                     let mut failed = batch.empty_with_claim();
                     failed.copy_scope_from(&batch, facet.name());
                     if let Err(db_error) = dirty_state::mark_error(&self.db, &failed, &error) {
@@ -1426,7 +1551,6 @@ impl NodeCtlWorker {
                 node_status_for_batch = Some(node_status.clone());
                 node_status
             };
-            let scope = facets::FacetScope::from_optional_items(items);
             let facet_token = shutdown_token.child_token();
             let (scope_kind, scope_items) = facet_scope_span_fields(&scope);
             let span = tracing::info_span!(
@@ -1436,41 +1560,56 @@ impl NodeCtlWorker {
                 node_id = %node_id,
                 scope = scope_kind,
                 scope_items,
+                pass = pass.as_str(),
             );
+            let publisher = self.publisher.clone();
             jobs.push(
                 async move {
+                    let full = scope == facets::FacetScope::Full;
                     let started_at = Instant::now();
                     let timeout = tokio::time::sleep(FACET_RUN_TIMEOUT);
                     tokio::pin!(timeout);
                     let result = tokio::select! {
-                        () = facet_token.cancelled() => Err(format!(
+                        () = facet_token.cancelled() => Err(facets::OutboundError::Other(format!(
                             "outbound facet {} cancelled during shutdown",
                             facet.name(),
-                        )),
-                        () = &mut timeout => Err(format!(
+                        ))),
+                        () = &mut timeout => Err(facets::OutboundError::Other(format!(
                             "outbound facet {} timed out after {}s",
                             facet.name(),
                             FACET_RUN_TIMEOUT.as_secs()
-                        )),
-                        result = facet.run_outbound(&node_id, node_role, scope, node_status) => result,
+                        ))),
+                        result = publisher.publish(facet, &node_id, node_role, scope, node_status) => result,
                     };
-                    (facet, status_name, started_at, result)
+                    (facet, full, status_name, started_at, result)
                 }
                 .instrument(span),
             );
         }
 
-        for (facet, status_name, started_at, result) in join_all(jobs).await {
+        for (facet, full, status_name, started_at, result) in join_all(jobs).await {
+            if full {
+                match &result {
+                    Ok(_) => outcome.settled(facet),
+                    Err(error) => outcome.failed(facet, error),
+                }
+            }
             match result {
                 Err(error) => {
+                    let error = error.to_string();
                     pplx_space_metrics::reconcile::run_duration(
                         facet.name(),
                         "outbound",
                         "error",
-                        "node_ctl",
+                        pass.metric_trigger(),
                         started_at,
                     );
-                    tracing::warn!(facet = facet.name(), %error, "outbound facet sync failed");
+                    tracing::warn!(
+                        facet = facet.name(),
+                        pass = pass.as_str(),
+                        %error,
+                        "outbound facet sync failed"
+                    );
                     let mut failed = batch.empty_with_claim();
                     failed.copy_scope_from(&batch, facet.name());
                     if let Err(db_error) = dirty_state::mark_error(&self.db, &failed, &error) {
@@ -1489,7 +1628,7 @@ impl NodeCtlWorker {
                         facet.name(),
                         "outbound",
                         "ok",
-                        "node_ctl",
+                        pass.metric_trigger(),
                         started_at,
                     );
                     pplx_space_metrics::reconcile::run_items(
@@ -1515,6 +1654,7 @@ impl NodeCtlWorker {
         {
             tracing::warn!(%db_error, "failed to clear dirty node state");
         }
+        outcome
     }
 
     fn mark_next_due(&self, next_due_at: i64) -> rusqlite::Result<()> {

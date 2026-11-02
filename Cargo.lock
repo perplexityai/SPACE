@@ -5346,8 +5346,10 @@ version = "0.8.0"
 dependencies = [
  "bytes",
  "futures-core",
+ "h2",
  "http 1.5.0",
  "http-body 1.1.0",
+ "hyper",
  "hyper-util",
  "pplx-space-common-core",
  "pplx-space-grpc-metrics",
@@ -6483,8 +6485,11 @@ name = "pplx-space-node-ctl-server"
 version = "0.8.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "dashmap",
  "futures-util",
+ "http 1.5.0",
+ "http-body 1.1.0",
  "insta",
  "k8s-openapi",
  "kube",
@@ -6514,6 +6519,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tonic",
+ "tower",
  "tracing",
 ]
 

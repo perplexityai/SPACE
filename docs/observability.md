@@ -462,6 +462,39 @@ gets no root, unless it fails: whether it fails is known only once it has run,
 so a childless `node_ctl.pass` reports the failure afterward. A tick that
 claims nothing emits nothing.
 
+When a full publish of the node's state (sandbox inventory, template
+inventory or node status) never reaches internal-api or loses its transport
+(a refused or failed connect or TLS handshake, no endpoints, or a lost
+connection, as node-ctl's client reports it), node-ctl retries the facets
+that failed within seconds rather than at the next tick, with jittered
+backoff from 1 s to a 16 s cap. Every status internal-api answered waits for
+the next tick, whatever its code or message, `Unavailable`, `Unknown` and a
+database error included, and so does a stream internal-api reset, a handler
+panic included, so a struggling dependency behind internal-api does not draw
+retries from every node. A client deadline, a bearer token that failed to
+attach, or a node-local collection failure also waits for the next tick. A
+retried dial that fails costs internal-api nothing, and a retried TLS
+handshake that fails costs it at most the handshake, since internal-api
+terminates TLS itself.
+While publishes cannot reach internal-api, retries add up to 10 retry passes
+in a node's first minute of failure and at most 8 a minute once the backoff
+reaches its 16 s cap. Each pass sends one `PublishNodeState` per failing
+facet, up to three. Ticks and dirty-driven publishes run on top of that.
+Each failed attempt still logs `outbound facet sync failed`, now with `pass`
+(`scheduled` or `retry`). Scheduling a retry logs `outbound publish failed;
+retry scheduled` (`failed_passes`, `retry_in_ms`, `facets`). The pass that
+leaves nothing to retry logs `outbound publish recovered; back to the tick
+cadence` when every retried facet has since settled (published in full, or
+skipped because its outbound sync is disabled or no cluster is configured),
+or `outbound publish failed in a way a retry cannot fix; back to the tick
+cadence` (`facets`) when some retried facet then failed in a way a retry
+cannot fix and has not settled since. Every `reconcile.run` and `reconcile.run.duration_ms` point
+from a retry pass carries `trigger:node_ctl_retry` instead of
+`trigger:node_ctl`, including the due dirty refs that pass also publishes, so
+`trigger:node_ctl` no longer counts those; `reconcile.run.items` has no
+`trigger` tag and counts both. The pass's `node_ctl.reconcile` spans record
+`pass:retry`.
+
 The cluster-controller's warm-pool reconciler runs each pass, every five
 seconds on the leader, under a `warm_pool.pass` root. No request causes a pass,
 so it links to nothing and the configured sampler decides it. That is one

@@ -107,6 +107,59 @@ enum SandboxInventoryEnrichmentError {
     MissingNetworkPolicy(SandboxId),
 }
 
+/// Why an outbound facet failed to publish, as far as retrying it goes.
+#[derive(Clone, Debug, thiserror::Error)]
+pub(crate) enum OutboundError {
+    /// The publish never reached internal-api or lost its transport: a
+    /// refused or failed connect, no endpoints, or a lost connection, as the
+    /// client itself reported it. A publish soon can succeed.
+    #[error("{0}")]
+    ClusterUnavailable(String),
+    /// Anything a publish soon would only repeat or pile onto: every status
+    /// internal-api answered, whatever its code or message, a stream
+    /// internal-api reset, a client deadline, a bearer token that failed to
+    /// attach, a node-local collection failure, a missing endpoint, a
+    /// timeout or a shutdown.
+    #[error("{0}")]
+    Other(String),
+}
+
+impl OutboundError {
+    /// Classify a failed `PublishNodeState` call by who produced its status.
+    /// Retried soon: a status the client made because its transport to
+    /// internal-api failed (`is_client_transport_failure`). One lost mid-call
+    /// may have reached internal-api, but the publish is idempotent.
+    ///
+    /// Every status internal-api answered waits for the tick, `Unavailable`,
+    /// `Unknown` and an `Internal` carrying a database error included, and
+    /// so does a stream internal-api reset, a handler panic among them: an
+    /// answer means internal-api is up and a dependency of its own may be
+    /// struggling, and every node retrying within seconds would multiply the
+    /// load on it. A client-side DeadlineExceeded or call timeout waits too:
+    /// the server is slow, not gone. A bearer token that fails to attach
+    /// locally surfaces as Unavailable without reaching internal-api, but a
+    /// retry within seconds would not fix it.
+    pub(crate) fn from_publish_status(status: &tonic::Status) -> Self {
+        let error = format!("cluster node state publish failed: {status}");
+        if pplx_space_common_grpc::is_client_transport_failure(status) {
+            Self::ClusterUnavailable(error)
+        } else {
+            Self::Other(error)
+        }
+    }
+
+    /// Whether node-ctl retries the publish ahead of the next tick.
+    pub(crate) fn retry_soon(&self) -> bool {
+        matches!(self, Self::ClusterUnavailable(_))
+    }
+}
+
+impl From<String> for OutboundError {
+    fn from(error: String) -> Self {
+        Self::Other(error)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct FacetPlugin {
     kind: FacetKind,
@@ -369,13 +422,13 @@ impl FacetKind {
         }
     }
 
-    pub async fn run_outbound(
+    pub(crate) async fn run_outbound(
         self,
         node_id: &str,
         node_role: Option<NodeRole>,
         scope: FacetScope,
         node_status: Option<PublishedNodeStatus>,
-    ) -> Result<ReconcileStats, String> {
+    ) -> Result<ReconcileStats, OutboundError> {
         match self {
             Self::NetworkPolicy => {
                 publish_network_policy(node_id, node_role, scope, node_status).await
@@ -445,7 +498,7 @@ async fn publish_node_state(
     node_id: &str,
     node_role: Option<NodeRole>,
     state: NodeStatePublish,
-) -> Result<ReconcileStats, String> {
+) -> Result<ReconcileStats, OutboundError> {
     if state.sandboxes.is_empty()
         && state.templates.is_empty()
         && !state.sandbox_inventory_complete
@@ -488,7 +541,7 @@ async fn publish_node_state(
             pending_local_backups: state.pending_local_backups,
         })
         .await
-        .map_err(|error| format!("cluster node state publish failed: {error}"))?
+        .map_err(|status| OutboundError::from_publish_status(&status))?
         .into_inner();
 
     acknowledge_auto_lifecycle_delete_completions(
