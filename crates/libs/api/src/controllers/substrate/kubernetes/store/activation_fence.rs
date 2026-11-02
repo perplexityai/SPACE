@@ -546,16 +546,9 @@ impl K8sStore {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<bool, SubstrateError> {
-        let result = sqlx::query(sql!(
-            "UPDATE sandboxes
-             SET command_ready_pending = FALSE
-             WHERE id = $1 AND lifecycle = 'started' AND command_ready_pending"
-        ))
-        .bind(sandbox_id)
-        .execute(&self.pool)
-        .await
-        .db_context("failed to clear command_ready_pending")?;
-        Ok(result.rows_affected() > 0)
+        pplx_space_sandbox_store::wake::clear_command_ready_pending(&self.pool, sandbox_id)
+            .await
+            .db_context("failed to clear command_ready_pending")
     }
 
     pub(in crate::controllers::substrate::kubernetes) async fn reconcile_activation_fence(

@@ -335,25 +335,18 @@ pub(super) async fn clear_sandbox_command_ready_pending(
     pool: &sqlx::PgPool,
     sandbox_id: SandboxId,
 ) -> Result<bool, Status> {
-    // This CAS must match the substrate access-side clear in
-    // `KubernetesStore::clear_command_ready_pending`: the `lifecycle =
-    // 'started'` guard makes both access paths lose to the command-ready
-    // reaper when it has already claimed the sandbox for teardown, instead of
-    // clearing a marker on a runtime that is no longer safe to hand back.
-    let result = sqlx::query(sql!(
-        "UPDATE sandboxes
-         SET command_ready_pending = FALSE
-         WHERE id = $1 AND lifecycle = 'started' AND command_ready_pending"
-    ))
-    .bind(sandbox_id.as_uuid())
-    .execute(pool)
-    .await
-    .map_err(|error| {
-        Status::internal(format!(
-            "clear sandbox service route command readiness marker: {error}"
-        ))
-    })?;
-    Ok(result.rows_affected() > 0)
+    // Shared with the substrate access-side clear
+    // (`K8sStore::clear_command_ready_pending`): the `lifecycle = 'started'`
+    // guard makes both access paths lose to the command-ready reaper when it
+    // has already claimed the sandbox for teardown, instead of clearing a
+    // marker on a runtime that is no longer safe to hand back.
+    sandbox_store::wake::clear_command_ready_pending(pool, sandbox_id)
+        .await
+        .map_err(|error| {
+            Status::internal(format!(
+                "clear sandbox service route command readiness marker: {error}"
+            ))
+        })
 }
 
 pub(super) async fn sandbox_lifecycle_is_started(

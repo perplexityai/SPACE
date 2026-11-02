@@ -725,22 +725,15 @@ impl K8sStore {
         Self::lock_sandbox_for_execution_lifecycle_in(&mut tx, sandbox_id, expected_lifecycle)
             .await?;
         if let Some(restore_lease_token) = restore_lease_token {
-            let renewed = sqlx::query_scalar::<_, bool>(sql!(
-                "UPDATE sandboxes
-                    SET restore_lease_expires_at =
-                        NOW() + make_interval(secs => $3)
-                  WHERE id = $1
-                    AND restore_lease_token = $2
-                    AND restore_lease_expires_at > NOW()
-                RETURNING TRUE"
-            ))
-            .bind(sandbox_id.as_uuid())
-            .bind(restore_lease_token)
-            .bind(super::super::RESTORE_EXECUTION_OWNERSHIP_TTL_SECS)
-            .fetch_optional(&mut *tx)
+            let renewed = pplx_space_sandbox_store::wake::renew_restore_lease_for_execution_claim(
+                &mut *tx,
+                sandbox_id,
+                restore_lease_token,
+                super::super::RESTORE_EXECUTION_OWNERSHIP_TTL_SECS,
+            )
             .await
             .db_context("failed to renew restore materialization ownership")?;
-            if renewed.is_none() {
+            if !renewed {
                 let lease_remaining_secs = sqlx::query_scalar::<_, f64>(sql!(
                     "SELECT GREATEST(
                                 EXTRACT(EPOCH FROM (restore_lease_expires_at - NOW())),

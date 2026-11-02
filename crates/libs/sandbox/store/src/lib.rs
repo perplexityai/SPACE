@@ -107,6 +107,7 @@ pub mod ingest;
 pub mod lost;
 pub mod repair;
 pub mod sweeper;
+pub mod wake;
 
 pub use create::{SandboxCreate, insert_pooled, insert_unplaced};
 

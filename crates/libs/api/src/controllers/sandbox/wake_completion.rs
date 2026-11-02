@@ -38,8 +38,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use futures_util::future::BoxFuture;
-use pplx_space_common_core::types::{SandboxId, SandboxLifecycle, SubstrateKind};
-use pplx_space_common_svc::sql::sandbox_routability::routable_execution_or_non_k8s;
+use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
@@ -223,37 +222,12 @@ impl Drop for WakeCompletionGuard {
     }
 }
 
-/// The completion CAS the redrive runs: same shape as the handler's post-wake
-/// write, hardened for running without a live attempt behind it — it claims
-/// only a row still in `restoring`, and only when a routable execution (or a
-/// non-k8s substrate) backs the wake target at flip time. The shared
-/// routability predicate is the same fragment the transient-lifecycle
-/// sweeper's converge CAS and the node published-state convergence use; `$2`
-/// binds `SubstrateKind::Kubernetes` for it.
-/// The restore-lease guard makes the redrive honor the same ownership
-/// invariant as the sweeper's converge CAS and `begin_restore_lifecycle`:
-/// an unexpired lease means a restore attempt — most likely a client retry
-/// that fired after our caller hung up — is actively driving the row and
-/// will run its own completion. The cancelled attempt's *own* lease also
-/// blocks the CAS until it expires (the lease TTL is the node-RPC timeout),
-/// which is why [`redrive_budget`] must exceed that TTL.
-fn fenced_completion_cas() -> String {
-    let routable = routable_execution_or_non_k8s("sandboxes", "$2");
-    format!(
-        "UPDATE sandboxes
-            SET lifecycle = 'started', placement = 'on_node'
-          WHERE id = $1
-            AND lifecycle = 'restoring'
-            AND (restore_lease_expires_at IS NULL OR restore_lease_expires_at <= NOW())
-            AND {routable}"
-    )
-}
-
 /// Build the production redrive future for a cancelled wake: polls the
 /// substrate's [`SubstrateAdapter::ensure_routable_execution`] (the same
 /// repair primitive the sweeper uses; on Kubernetes, the kube-verified
 /// execution hydration) until the execution is routable, then runs the
-/// fenced completion CAS. Bounded by `budget`.
+/// fenced completion CAS ([`sandbox_store::wake::complete_redriven_wake`]).
+/// Bounded by `budget`.
 pub(super) fn wake_completion_redrive(
     pool: PgPool,
     substrate: Substrate,
@@ -485,13 +459,8 @@ where
             }
             Ok(Some(_)) => match hydrate().await {
                 Ok(true) => {
-                    match sqlx::query(sqlx::AssertSqlSafe(sql!(fenced_completion_cas())))
-                        .bind(sandbox_id)
-                        .bind(SubstrateKind::Kubernetes)
-                        .execute(pool)
-                        .await
-                    {
-                        Ok(claimed) if claimed.rows_affected() > 0 => {
+                    match sandbox_store::wake::complete_redriven_wake(pool, sandbox_id).await {
+                        Ok(true) => {
                             SandboxEvent::new(
                                 sandbox_id,
                                 completed_event_for(action),
@@ -507,7 +476,7 @@ where
                             );
                             return WakeCompletionRedriveOutcome::Completed;
                         }
-                        Ok(_) => {
+                        Ok(false) => {
                             // Routable a moment ago but the CAS claimed
                             // nothing: either the row moved on (a concurrent
                             // completion won — resolved) or the execution was

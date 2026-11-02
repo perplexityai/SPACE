@@ -215,22 +215,9 @@ impl K8sStore {
                 .await?;
 
             if active_execution {
-                sqlx::query(sql!(
-                    "UPDATE sandboxes
-                     SET active_node_id = $1,
-                         target_node_id = $1,
-                         placement = 'on_node',
-                         placement_changed_at = NOW()
-                     WHERE id = $2
-                       AND (
-                         active_node_id IS DISTINCT FROM $1
-                         OR target_node_id IS DISTINCT FROM $1
-                         OR placement IS DISTINCT FROM 'on_node'
-                       )"
-                ))
-                .bind(node_id)
-                .bind(sandbox_id)
-                .execute(&mut *tx)
+                pplx_space_sandbox_store::wake::record_pod_node_placement(
+                    &mut *tx, sandbox_id, node_id,
+                )
                 .await
                 // Classified like every sibling in this transaction; the
                 // post-side-effect demotion is applied to the whole function's
