@@ -11,9 +11,8 @@ from space_smoke.scenarios import REGISTRY
 from space_smoke.suite import ScenarioProcessResult
 
 
-@pytest.mark.parametrize("surface", ["ecw", "native"])
-def test_shards_run_every_eligible_scenario_once_and_propagate_failures(surface):
-    inventory = {
+def _inventory(surface):
+    return {
         scenario.id
         for scenario in REGISTRY
         if surface in scenario.api_surfaces
@@ -22,37 +21,56 @@ def test_shards_run_every_eligible_scenario_once_and_propagate_failures(surface)
         and scenario.ignored is None
         and scenario.applies_to(None)
     }
+
+
+# Nine shards leave the brownout's shard with no native scenario.
+@pytest.mark.parametrize("count", [4, 8, 9])
+def test_shards_run_every_eligible_scenario_once_and_propagate_failures(count):
+    """Each (surface, scenario) pair of a sharded run runs on exactly one shard."""
+
     seen = []
 
     def execute(scenarios, **kwargs):
-        seen.extend(scenario.id for scenario in scenarios)
+        surface = kwargs["environment"].get("SPACE_SMOKE_API_SURFACE")
+        seen.extend((surface, scenario.id) for scenario in scenarios)
         assert kwargs["environment"]["SKIP_BOOTSTRAP"] == "1"
         return tuple(
             ScenarioProcessResult(s.id, 1 if i == 0 else 0, "", "")
             for i, s in enumerate(scenarios)
         )
 
-    with (
-        mock.patch.dict(
-            "os.environ",
-            {"SPACE_SMOKE_BACKEND": "kind", "SPACE_SMOKE_API_SURFACE": surface},
-            clear=True,
-        ),
-        mock.patch(
-            "space_smoke.__main__.SmokeServices.from_environment",
-            **{
-                "return_value.telemetry_mode.return_value": "otel",
-                "return_value.storage_credentials.return_value": "exchange",
-                "return_value.substrate.return_value": "kubernetes",
-            },
-        ),
-        mock.patch("space_smoke.__main__.run_scenarios", side_effect=execute),
-        redirect_stdout(StringIO()),
-    ):
-        for index in range(1, 5):
-            assert _run_all(shard=(index, 4)) == 1
-    assert set(seen) == inventory
-    assert len(seen) == len(inventory)
+    for surface in ("ecw", "native"):
+        with (
+            mock.patch.dict(
+                "os.environ",
+                {"SPACE_SMOKE_BACKEND": "kind", "SPACE_SMOKE_API_SURFACE": surface},
+                clear=True,
+            ),
+            mock.patch(
+                "space_smoke.__main__.SmokeServices.from_environment",
+                **{
+                    "return_value.telemetry_mode.return_value": "otel",
+                    "return_value.storage_credentials.return_value": "exchange",
+                    "return_value.substrate.return_value": "kubernetes",
+                },
+            ) as bootstrap,
+            mock.patch("space_smoke.__main__.run_scenarios", side_effect=execute),
+            redirect_stdout(StringIO()),
+        ):
+            for index in range(1, count + 1):
+                before = len(seen)
+                bootstraps = bootstrap.call_count
+                status = _run_all(shard=(index, count))
+                # A pass whose share is empty skips its bootstrap and passes;
+                # one that ran scenarios reports the first one's failure.
+                if len(seen) == before:
+                    assert status == 0
+                    assert bootstrap.call_count == bootstraps
+                else:
+                    assert status == 1
+    expected = {(surface, sid) for surface in ("ecw", "native") for sid in _inventory(surface)}
+    assert len(seen) == len(expected)
+    assert set(seen) == expected
 
 
 @pytest.mark.parametrize("shard", ["0/2", "3/2", "1/0", "1", "a/2", "1/2/3"])
@@ -96,3 +114,31 @@ def test_empty_shard_does_not_bootstrap_or_report_green():
     ):
         assert _run_all(shard=(count, count)) == 2
     bootstrap.assert_not_called()
+
+
+def test_the_joint_partition_is_lighter_than_balancing_each_surface_alone():
+    from space_smoke.sharding import _DURATION_SECONDS, select_shard
+
+    pools = {
+        surface: tuple(
+            sorted(
+                (s for s in REGISTRY if s.id in _inventory(surface)), key=lambda s: s.id
+            )
+        )
+        for surface in ("ecw", "native")
+    }
+
+    def heaviest(joint):
+        loads = []
+        for index in range(1, 9):
+            load = 0
+            for surface, scenarios in pools.items():
+                share = select_shard(
+                    scenarios, index=index, count=8, api_surface=surface,
+                    inventories=pools if joint else None,
+                )
+                load += sum(_DURATION_SECONDS[surface].get(s.id, 30) for s in share)
+            loads.append(load)
+        return max(loads)
+
+    assert heaviest(joint=True) < heaviest(joint=False)
