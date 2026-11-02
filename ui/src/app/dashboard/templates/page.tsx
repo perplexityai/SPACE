@@ -452,6 +452,9 @@ export default function TemplatesPage() {
   const [warmPoolPolicies, setWarmPoolPolicies] = useState<WarmPoolPolicy[]>([]);
   const [warmPoolPolicyCapabilities, setWarmPoolPolicyCapabilities] = useState<WarmPoolPolicyCapabilities>({});
   const [loadingReleases, setLoadingReleases] = useState(true);
+  // Whether `templateReleases` holds an answer yet: before it does, no
+  // template can be said to have no release.
+  const [releasesLoaded, setReleasesLoaded] = useState(false);
   const [loadingTemplates, setLoadingTemplates] = useState(true);
   const [loadingInventory, setLoadingInventory] = useState(true);
   const loadingRef = useRef(true);
@@ -533,6 +536,7 @@ export default function TemplatesPage() {
     try {
       const items = await adminApi.get<TemplateRelease[]>('/v1/template-releases');
       setTemplateReleases(items);
+      setReleasesLoaded(true);
       return items;
     } catch (err: unknown) {
       console.warn(errorMessage(err));
@@ -1376,6 +1380,11 @@ export default function TemplatesPage() {
     [templates],
   );
 
+  const releasedTemplateNames = useMemo(
+    () => new Set(templateReleases.map((release) => release.template_name)),
+    [templateReleases],
+  );
+
   const templateColumns = useMemo<ColumnsType<Template>>(() => {
     const columns: ColumnsType<Template> = [
       {
@@ -1393,12 +1402,30 @@ export default function TemplatesPage() {
       {
         title: 'Hash',
         dataIndex: 'content_hash',
-        width: 110,
-        render: (value: string | null) => (
-          <Tooltip title={value ?? DEFAULT_TEMPLATE_TAG}>
-            <code>{shortHash(value)}</code>
-          </Tooltip>
-        ),
+        width: 135,
+        // `content_hash` comes from builder inventory, not from releases:
+        // whether a template was ever published is read from the releases.
+        render: (value: string | null, record) => {
+          if (value) {
+            return (
+              <Tooltip title={value}>
+                <code>{shortHash(value)}</code>
+              </Tooltip>
+            );
+          }
+          if (releasesLoaded && record.desired_state === 'present' && !releasedTemplateNames.has(record.name)) {
+            return (
+              <Tooltip title="No release has been published for this template: it may never have been built, every build may have failed, or its releases were unpublished.">
+                <Tag style={{ marginInlineEnd: 0 }}>no release</Tag>
+              </Tooltip>
+            );
+          }
+          return releasedTemplateNames.has(record.name) ? (
+            <Tooltip title="Published; no builder node reports a build hash for it.">
+              <Text type="secondary">—</Text>
+            </Tooltip>
+          ) : <Text type="secondary">—</Text>;
+        },
       },
       {
         title: 'Runtime',
@@ -1452,9 +1479,9 @@ export default function TemplatesPage() {
       {
         title: 'Network',
         dataIndex: 'network_policy',
-        width: 150,
+        width: 230,
         render: (_, record) => (
-          <Space size={4}>
+          <Space size={4} wrap>
             <Tag
               color={compactNetworkPolicyLabel(record.network_policy) === 'open' ? 'green' : undefined}
               style={{ marginRight: 0 }}
@@ -1548,6 +1575,8 @@ export default function TemplatesPage() {
     return columns;
   }, [
     templateNameFilters,
+    releasedTemplateNames,
+    releasesLoaded,
     baseSnapshotPolicies,
     buildingSnapshot,
     isDirectSubstrate,
@@ -1912,35 +1941,8 @@ export default function TemplatesPage() {
   return (
     <div className="compact-table">
       <style>{`.compact-table .ant-table-cell { padding: 4px 6px !important; } .compact-table .icon-action-btn { padding-left: 6px; padding-right: 6px; } .compact-table .icon-action-btn .anticon { font-size: 18px; }`}</style>
-      {supportsClusterPools ? (
-        <>
-          <Space align="center" style={{ width: '100%', justifyContent: 'space-between' }}>
-            <div>
-              <Title level={4} style={{ marginBottom: 0 }}>Rolling Warm Pool Policies</Title>
-              <Text type="secondary">
-                Deployment-like policies create release-specific pools; the baseline is minimum ready slots multiplied by retained releases.
-              </Text>
-            </div>
-            {canAdminTemplates ? (
-              <Button type="primary" onClick={() => openWarmPoolPolicyModal()}>
-                New Policy
-              </Button>
-            ) : null}
-          </Space>
-          <Table
-            columns={warmPoolPolicyColumns}
-            dataSource={warmPoolPolicies}
-            rowKey={(policy) => `${policy.template_name}:${policy.runtime}:${policy.vcpu}:${policy.memory_mib}`}
-            loading={loadingReleases}
-            size="small"
-            pagination={false}
-            style={{ marginTop: 12, marginBottom: 24 }}
-            scroll={{ x: 1080 }}
-          />
-        </>
-      ) : null}
-      <Space align="center" style={{ width: '100%', justifyContent: 'space-between' }}>
-        <Title level={4}>Template Releases</Title>
+      <Space align="center" style={{ width: '100%', justifyContent: 'space-between', marginBottom: 8 }}>
+        <Title level={3} style={{ margin: 0 }}>Templates</Title>
         <Button
           icon={<ReloadOutlined />}
           loading={manualRefreshing}
@@ -1950,18 +1952,6 @@ export default function TemplatesPage() {
           Refresh
         </Button>
       </Space>
-
-      <Table
-        columns={releaseColumns}
-        dataSource={templateReleases}
-        rowKey="id"
-        loading={loadingReleases}
-        size="small"
-        pagination={tablePagination('template releases')}
-        scroll={{ x: 1120 }}
-      />
-
-      <Title level={4} style={{ marginTop: 24 }}>Templates</Title>
       <Table
         columns={templateColumns}
         dataSource={templates}
@@ -1997,6 +1987,18 @@ export default function TemplatesPage() {
         } : undefined}
       />
 
+      <Title level={4} style={{ marginTop: 24 }}>Template Releases</Title>
+
+      <Table
+        columns={releaseColumns}
+        dataSource={templateReleases}
+        rowKey="id"
+        loading={loadingReleases}
+        size="small"
+        pagination={tablePagination('template releases')}
+        scroll={{ x: 1120 }}
+      />
+
       <Title level={4} style={{ marginTop: 24 }}>Node Availability</Title>
       <Table
         columns={inventoryColumns}
@@ -2007,6 +2009,33 @@ export default function TemplatesPage() {
         pagination={tablePagination('template builds')}
         scroll={{ x: 1000 }}
       />
+      {supportsClusterPools ? (
+        <>
+          <Space align="center" style={{ width: '100%', justifyContent: 'space-between', marginTop: 24 }}>
+            <div>
+              <Title level={4} style={{ marginBottom: 0 }}>Rolling Warm Pool Policies</Title>
+              <Text type="secondary">
+                Deployment-like policies create release-specific pools; the baseline is minimum ready slots multiplied by retained releases.
+              </Text>
+            </div>
+            {canAdminTemplates ? (
+              <Button type="primary" onClick={() => openWarmPoolPolicyModal()}>
+                New Policy
+              </Button>
+            ) : null}
+          </Space>
+          <Table
+            columns={warmPoolPolicyColumns}
+            dataSource={warmPoolPolicies}
+            rowKey={(policy) => `${policy.template_name}:${policy.runtime}:${policy.vcpu}:${policy.memory_mib}`}
+            loading={loadingReleases}
+            size="small"
+            pagination={false}
+            style={{ marginTop: 12, marginBottom: 24 }}
+            scroll={{ x: 1080 }}
+          />
+        </>
+      ) : null}
 
       <Modal
         title={warmPoolPolicyModal.policy
