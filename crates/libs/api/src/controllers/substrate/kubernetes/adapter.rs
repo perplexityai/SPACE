@@ -65,6 +65,13 @@ const MAX_STALE_POOL_CLAIMS_PER_REQUEST: usize = 3;
 const NODE_API_ENDPOINT_RESOLVE_TIMEOUT: Duration = Duration::from_secs(15);
 const NODE_API_ENDPOINT_RESOLVE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 pub(super) const WARM_POOL_SETUP_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a started warm-pool adoption waits after the pool's Wake for the
+/// guest to report command readiness. A pool member was booted and ready
+/// before it was claimed, so a healthy one reports within the first probe or
+/// two. Without this cap a guest that never reports, or a node that stops
+/// answering, holds the create for the rest of its readiness budget before a
+/// fallthrough create starts its cold create.
+pub(super) const POOLED_COMMAND_READY_BUDGET: Duration = Duration::from_secs(10);
 // Planned teardown waits for the exact snapshot upload to become remotely
 // durable before retiring the pod. Full-codec artifacts can outlive the
 // generic node-RPC budget, so this path needs its own outer deadline.
