@@ -399,15 +399,12 @@ struct SandboxesHeld {
 /// but Postgres evaluates it many times slower than this pair.
 ///
 /// Cost: the org's rows through `idx_sandboxes_org_id`, `deleted`
-/// tombstones included; each of the org's in-flight creates joined to its
-/// row by id; and every queued or running operation in the cluster, of any
-/// kind or product, through `idx_public_operations_state_next_attempt`,
-/// which has neither column, so the native-create filter applies after the
-/// read. `OFFSET 0` keeps the org filter out of that last scan: pushed into
-/// it, both plan modes intersect the state index with
-/// `idx_public_operations_tenant_created`, which reads the org's whole
-/// retained operation history. A constant rather than a literal at its
-/// query site so `plan_tests` can `EXPLAIN` the text this runs.
+/// tombstones included; the org's queued or running operations, of any
+/// kind or product, through `idx_public_operations_org_state`, which has
+/// neither of those columns, so the native-create filter applies after the
+/// read; and each of the org's in-flight creates joined to its row by id.
+/// A constant rather than a literal at its query site so `plan_tests` can
+/// `EXPLAIN` the text this runs.
 const SANDBOXES_HELD: &str = sql!(
     "SELECT COUNT(*), COUNT(*) FILTER (WHERE held.user_id = $2)
        FROM (
@@ -417,15 +414,11 @@ const SANDBOXES_HELD: &str = sql!(
                AND s.lifecycle NOT IN ('failed', 'quarantined', 'deleted', 'cleanup_required')
             UNION ALL
             SELECT op.actor_user_id
-              FROM (
-                   SELECT op.org_id, op.actor_user_id, op.target_id
-                     FROM public_operations op
-                    WHERE op.state IN ('queued', 'running')
-                      AND op.api_product = $3
-                      AND op.kind = $4
-                   OFFSET 0
-              ) op
+              FROM public_operations op
              WHERE op.org_id = $1
+               AND op.state IN ('queued', 'running')
+               AND op.api_product = $3
+               AND op.kind = $4
                AND NOT EXISTS (
                    SELECT 1
                      FROM sandboxes s
