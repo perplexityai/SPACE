@@ -23,6 +23,7 @@ import type { ColumnsType } from 'antd/es/table';
 import { KeyOutlined, SafetyCertificateOutlined, SearchOutlined } from '@ant-design/icons';
 
 import { adminApi } from '@/lib/api';
+import { parseSandboxRef, publicSandboxIdFromAny, sandboxLabelOrId } from '@/lib/sandbox-id';
 import {
   credentialHostDecision,
   formatPolicyDestination,
@@ -147,9 +148,12 @@ export default function CredentialRulesPage() {
   );
   const filteredRows = useMemo(() => {
     const needle = query.trim().toLowerCase();
+    // A full sandbox identifier in any form (pod name, bare UUID) matches its rows.
+    const sandboxRef = parseSandboxRef(query);
     return rows.filter((row) => {
       if (decisionFilter !== 'all' && row.hostDecision.action !== decisionFilter) return false;
       if (!needle) return true;
+      if (sandboxRef && publicSandboxIdFromAny(row.sandbox.id) === sandboxRef.publicId) return true;
       return [
         row.sandbox.name,
         row.sandbox.id,
@@ -176,11 +180,11 @@ export default function CredentialRulesPage() {
       width: 210,
       render: (_, row) => (
         <Space orientation="vertical" size={0}>
-          <Link href={`/dashboard/sandboxes/${row.sandbox.id}`}>
-            {row.sandbox.name || row.sandbox.id.slice(0, 8)}
+          <Link href={`/dashboard/sandboxes/${publicSandboxIdFromAny(row.sandbox.id)}`}>
+            {row.sandbox.name || sandboxLabelOrId(row.sandbox.id)}
           </Link>
-          <Text type="secondary" style={{ fontSize: 12 }} copyable={{ text: row.sandbox.id }}>
-            {row.sandbox.id.slice(0, 8)}…
+          <Text type="secondary" style={{ fontSize: 12 }} copyable={{ text: publicSandboxIdFromAny(row.sandbox.id) }}>
+            {sandboxLabelOrId(row.sandbox.id)}
           </Text>
           <Text type="secondary" style={{ fontSize: 12 }}>
             {row.sandbox.org_id
