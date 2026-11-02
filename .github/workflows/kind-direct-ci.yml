@@ -1,0 +1,44 @@
+name: Kind Direct CI
+
+# The Kind smoke on the Direct substrate ("Direct substrate lane" and "Direct
+# lane in CI" in infra/space/kind/README.md): nightly on main, on demand, and
+# on pull requests that change a path in the filter below; the nightly run
+# covers everything else. No required check depends on it; space-pull-ci
+# requires only the Kubernetes lane. A workflow of its own, not a job of
+# pull-ci.yml, so a path filter can select it and its result never reaches
+# that aggregate.
+on:
+  schedule:
+    - cron: '23 4 * * *'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - crates/libs/api/src/controllers/substrate/**
+      - crates/libs/api/src/routes/admin/node_maintenance*
+      - crates/libs/api/src/routes/admin/node_maintenance/**
+      - crates/libs/internal/api/server/**
+      - crates/libs/cluster/controller/server/**
+      - crates/libs/sbx/mgr/**
+      - infra/space/kind/**
+      - Tiltfile
+      - scripts/tests/lib/bootstrap-kind-stack.sh
+      - scripts/tests/smoke-kind-typed.sh
+      - examples/first_sandbox.py
+      - space_smoke/registry.py
+      - space_smoke/__main__.py
+      - space_smoke/suite.py
+      - ci/kind-direct-known-failures.txt
+      - .github/workflows/kind-direct-ci.yml
+      - .github/workflows/kind-ci.yml
+
+permissions:
+  actions: read
+  contents: read
+  packages: read
+
+jobs:
+  kind_direct_smoke:
+    if: github.repository == 'perplexityai/SPACE'
+    uses: ./.github/workflows/kind-ci.yml
+    with:
+      substrate: direct
