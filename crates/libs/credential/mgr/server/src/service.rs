@@ -3,9 +3,8 @@
 use pplx_space_common_core::types::UserId;
 
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use aws_credential_types::provider::ProvideCredentials;
 use aws_credential_types::provider::error::CredentialsError;
 use aws_runtime::retries::classifiers::{THROTTLING_ERRORS, TRANSIENT_ERRORS};
 use aws_sdk_sts::error::{ConnectorError, ProvideErrorMetadata, SdkError};
@@ -142,6 +141,12 @@ pub struct CredentialManagerService {
     /// path prevents a Ready authority from discovering a malformed role only
     /// after callers depend on it.
     storage_vend_role: Option<VendRoleArn>,
+    /// STS client for storage-role `AssumeRole`, built on first use and
+    /// shared by every clone of the service. One client keeps the base
+    /// identity's credentials cached and its STS connections pooled, so an
+    /// exchange makes one STS call over an established connection instead of
+    /// re-resolving the base identity and reconnecting on every request.
+    storage_sts_client: Arc<tokio::sync::OnceCell<aws_sdk_sts::Client>>,
     /// Pluggable backend that wraps DEKs under per-org KEKs. The
     /// concrete impl (external provider or explicit in-memory stub)
     /// is chosen by the binary at startup so handlers stay backend-
@@ -232,6 +237,7 @@ impl CredentialManagerService {
                 .with_process_check_mode(peer_process_check_mode),
             ),
             storage_vend_role: None,
+            storage_sts_client: Arc::default(),
             key_wrapper,
             kek_store: None,
             database_pool: None,
@@ -247,6 +253,15 @@ impl CredentialManagerService {
     /// Configure the startup-validated platform storage vending role.
     pub(crate) fn with_storage_vend_role(mut self, role: VendRoleArn) -> Self {
         self.storage_vend_role = Some(role);
+        self
+    }
+
+    /// Build the storage-role STS client from `config` instead of the default
+    /// chain.
+    #[cfg(test)]
+    pub(crate) fn with_storage_sts_config(mut self, config: &aws_config::SdkConfig) -> Self {
+        let client = aws_sdk_sts::Client::new(config);
+        self.storage_sts_client = Arc::new(tokio::sync::OnceCell::new_with(Some(client)));
         self
     }
 
@@ -426,11 +441,16 @@ impl CredentialManager for CredentialManagerService {
                 return Err(storage_exchange_error_to_status(error));
             }
         };
-        let sdk_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        let sts = self
+            .storage_sts_client
+            .get_or_init(|| async {
+                aws_sdk_sts::Client::new(
+                    &aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await,
+                )
+            })
+            .await;
         let aws_credentials =
-            match assume_s3_vend_role(&sdk_config, role.as_str(), &policy, authorized.ttl_seconds)
-                .await
-            {
+            match assume_s3_vend_role(sts, role.as_str(), &policy, authorized.ttl_seconds).await {
                 Ok(credentials) => credentials,
                 Err(status) => {
                     audit_exchange_failure(&caller, &authorized, status.code());
@@ -1251,7 +1271,7 @@ fn unwrap_error_to_status(e: UnwrapError) -> Status {
 /// TTL. Ambient and static credentials are inputs to STS only, never response
 /// values.
 async fn assume_s3_vend_role(
-    config: &aws_config::SdkConfig,
+    sts: &aws_sdk_sts::Client,
     role_arn: &str,
     session_policy: &str,
     ttl_seconds: u32,
@@ -1268,16 +1288,35 @@ async fn assume_s3_vend_role(
         rpc.service = "STS",
         rpc.method = "AssumeRole",
     );
+    // The same request and error mapping as `aws_config`'s
+    // `AssumeRoleProvider`, which builds a client per call that caches no base
+    // credentials and pools no connections.
     let assumed = async {
-        aws_config::sts::AssumeRoleProvider::builder(role_arn)
-            .session_name("space-storage-exchange")
-            .session_length(Duration::from_secs(u64::from(ttl_seconds)))
+        match sts
+            .assume_role()
+            .role_arn(role_arn)
+            .role_session_name("space-storage-exchange")
+            .duration_seconds(i32::try_from(ttl_seconds).unwrap_or(i32::MAX))
             .policy(session_policy)
-            .configure(config)
-            .build()
+            .send()
             .await
-            .provide_credentials()
-            .await
+        {
+            Ok(output) => output
+                .credentials
+                .ok_or_else(|| CredentialsError::unhandled("STS returned no credentials")),
+            Err(SdkError::ServiceError(context))
+                if matches!(
+                    context.err(),
+                    AssumeRoleError::RegionDisabledException(_)
+                        | AssumeRoleError::MalformedPolicyDocumentException(_)
+                ) =>
+            {
+                Err(CredentialsError::invalid_configuration(
+                    SdkError::ServiceError(context),
+                ))
+            }
+            Err(error) => Err(CredentialsError::provider_error(error)),
+        }
     }
     .instrument(span.clone())
     .await;
@@ -1305,15 +1344,12 @@ async fn assume_s3_vend_role(
         tracing::warn!(error = %e, "storage role assumption failed");
         assume_role_failure_status(&e)
     })?;
-    let expires_at_unix = creds
-        .expiry()
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_secs())
-        .ok_or_else(|| Status::internal("STS returned storage credentials without an expiry"))?;
+    let expires_at_unix = u64::try_from(creds.expiration.secs())
+        .map_err(|_| Status::internal("STS returned storage credentials without an expiry"))?;
     Ok(AwsCredentials {
-        access_key_id: creds.access_key_id().to_string(),
-        secret_access_key: creds.secret_access_key().to_string(),
-        session_token: creds.session_token().map(str::to_string),
+        access_key_id: creds.access_key_id,
+        secret_access_key: creds.secret_access_key,
+        session_token: Some(creds.session_token),
         expires_at_unix: Some(expires_at_unix),
     })
 }
