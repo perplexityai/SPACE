@@ -169,6 +169,7 @@ locals {
     user_data_template = "worker-bootstrap.sh.tftpl"
     user_data_extra_vars = {
       bootstrap_bucket           = var.bootstrap_bucket
+      cluster_dns_ips            = var.workers_cluster_dns_ips
       shim_dogstatsd_socket_path = var.worker_shim_dogstatsd_socket_path
       shim_environment           = var.environment
     }

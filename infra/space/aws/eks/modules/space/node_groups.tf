@@ -75,6 +75,7 @@ resource "aws_launch_template" "workers" {
       cluster_name               = module.eks.cluster_name
       cluster_service_cidr       = var.cluster_service_cidr
       cluster_ca_data            = module.eks.cluster_certificate_authority_data
+      cluster_dns_ips            = var.workers_cluster_dns_ips
       space_cache_nvme_mount     = file("${path.module}/templates/space-cache-nvme-mount.sh")
       bootstrap_bucket           = var.bootstrap_bucket
       shim_dogstatsd_socket_path = var.worker_shim_dogstatsd_socket_path
