@@ -136,12 +136,7 @@ fn direct_controller(pool: &PgPool) -> SandboxController {
 fn controller_with_empty_cluster_admission(pool: &PgPool) -> SandboxController {
     let admission = crate::cluster_admission::ClusterSandboxAdmission::with_config(
         direct_substrate(pool),
-        crate::cluster_admission::ClusterSandboxAdmissionConfig {
-            enabled: true,
-            refill_rps: 6.0,
-            burst: 60.0,
-            redis_url: None,
-        },
+        crate::test_support::enabled_config(),
         pplx_space_feature_flags::FeatureFlagClient::disabled(),
     );
     SandboxController::with_cluster_admission(direct_substrate(pool), admission)

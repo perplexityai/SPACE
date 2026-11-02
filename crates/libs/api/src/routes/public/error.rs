@@ -44,11 +44,14 @@ pub struct PublicApiError {
 ///
 /// `RateLimited` covers *both* cluster-activation-limiter rejections: an
 /// exhausted shared activation bucket and a cluster with no start-capable node
-/// (`ClusterAdmissionError::EmptyCluster`). Both carry `Retry-After`. The
+/// (`ActivationRejectionKind::EmptyCluster`). Both carry `Retry-After`. The
 /// empty-cluster case is deliberately not `CapacityUnavailable`: at admission
 /// the API cannot tell a node roll from an outage, so it asks for backoff
 /// rather than declaring capacity gone. `CapacityUnavailable` is reserved for
-/// placement failing after a request was admitted.
+/// placement failing after a request was admitted. The limiter's slot check
+/// refuses only a cold create, which the native API queues: its operation
+/// retries on the hint, and if the cluster stays full it fails with
+/// `retry_attempts_exhausted`, not with this code.
 ///
 /// `QuotaExceeded` is a create refused by the organization or per-user
 /// sandbox limit ([`PublicApiError::sandbox_quota_exceeded`]). A 429 like

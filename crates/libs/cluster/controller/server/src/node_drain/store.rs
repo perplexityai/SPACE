@@ -4114,6 +4114,7 @@ impl NodeDrainSink for SubstrateSink {
             Err(SubstrateError::LockContention { message }) => Err(PromoteError::Db(message)),
             Err(
                 SubstrateError::Unavailable { message }
+                | SubstrateError::Unschedulable { message }
                 | SubstrateError::NotFound { message }
                 | SubstrateError::Conflict { message }
                 | SubstrateError::FailedPrecondition { message }

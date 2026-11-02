@@ -66,12 +66,12 @@ impl SandboxController {
             .await
         {
             Ok(client) => Ok(client),
-            // A recovery admission rejection (429) from the first call must
-            // propagate — not fall into the dormant-wake fallback below, which
-            // no-ops the charge for a live lifecycle and then `wake_execution`s
-            // the pod back anyway, re-opening the lost-pod bypass. Only genuine
-            // "not assigned / unreachable" errors should reach the wake path.
-            Err(err) if err.status() == StatusCode::TOO_MANY_REQUESTS => Err(err),
+            // A recovery admission refusal from the first call must propagate,
+            // not fall into the dormant-wake fallback below, which no-ops the
+            // charge for a live lifecycle and then `wake_execution`s the pod
+            // back anyway, re-opening the lost-pod bypass. Only genuine "not
+            // assigned / unreachable" errors should reach the wake path.
+            Err(err) if control_fallback_passes_through(&err) => Err(err),
             // Any other failure wakes and reconnects only where a wake can
             // give the row a runtime; otherwise, including for a label that
             // does not parse, the last arm returns the error.
@@ -1233,6 +1233,17 @@ impl SpacedSandboxClient {
         SpacedConnectProcessRequest,
         SpacedProcessEventStream
     );
+}
+
+/// Whether `control_runtime_client` returns its first, charged call's error
+/// rather than trying the uncharged fallback wake: any `429`, and any
+/// activation admission refusal whatever its status. Falling back on a
+/// refusal would rebuild the pod under a weaker charge than the one that was
+/// just refused. Today every refusal that charge can raise is a `429`; the
+/// marker keeps a refusal answered with another status, such as a `503`,
+/// from slipping past if that charge ever raises one.
+fn control_fallback_passes_through(err: &ControllerError) -> bool {
+    err.status() == StatusCode::TOO_MANY_REQUESTS || err.activation_rejection().is_some()
 }
 
 #[cfg(test)]

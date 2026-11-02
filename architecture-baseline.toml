@@ -9,7 +9,7 @@
 # that adds an entry or raises a cap is reported.
 
 [file_size]
-"crates/libs/api/src/controllers/sandbox/lifecycle.rs" = 1815
+"crates/libs/api/src/controllers/sandbox/lifecycle.rs" = 1806
 "crates/libs/api/src/controllers/sandbox/mod.rs" = 1086
 "crates/libs/api/src/controllers/sandbox/queries.rs" = 2571
 "crates/libs/api/src/controllers/sandbox/spaced.rs" = 1107
