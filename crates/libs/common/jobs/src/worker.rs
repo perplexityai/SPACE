@@ -1,5 +1,5 @@
 use pplx_space_common_core::types::{JobId, SubjectId};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -10,7 +10,7 @@ use tracing::Instrument as _;
 
 use crate::db;
 use crate::scheduler::{PriorityPermit, PriorityScheduler, SchedulerBand};
-use crate::{Job, JobError, JobExecutor, JobFailureKind, JobPriority};
+use crate::{Job, JobError, JobExecutor, JobFailureKind, JobFailureReason, JobPriority};
 
 mod completion;
 
@@ -132,11 +132,6 @@ impl RetryBackoffSchedule {
             .sum()
     }
 }
-
-/// Cap on permanent-failure rows scanned at shutdown. A queue accumulating
-/// failures over many restarts should not turn shutdown into an O(N) log
-/// spew; the operator gets a count plus the most recent entries.
-const PERMANENT_FAILURE_LOG_CAP: u32 = 100;
 
 /// Configuration for a [`BackgroundWorker`].
 pub struct WorkerConfig {
@@ -566,7 +561,8 @@ impl<E: JobExecutor> BackgroundWorker<E> {
     }
 
     /// Shutdown helper that drains durable jobs and spawned executor tasks,
-    /// then logs any permanent failures still in the queue. Replaces the
+    /// then reports permanent failures via
+    /// [`log_permanent_failures`](Self::log_permanent_failures). Replaces the
     /// `drain(..).await; log_permanent_failures();` pair every service
     /// binary used to write at the end of `main`. Returns whether the worker
     /// proved quiescence before the deadline.
@@ -1148,38 +1144,41 @@ impl<E: JobExecutor> BackgroundWorker<E> {
         self.lease.as_ref().map(|lease| lease.worker_id.as_str())
     }
 
-    /// Log permanently failed jobs at ERROR level. Call before exit so
-    /// operators can see which jobs need manual remediation. The number of
-    /// per-job log lines is capped at [`PERMANENT_FAILURE_LOG_CAP`]; the count
-    /// in the summary line is the full total.
+    /// Summarize permanent failures before exit in one WARN line, counting
+    /// every stored permanent failure by job kind and failure reason. Failed
+    /// rows are retained for [`FAILED_JOB_RETENTION`], so the line counts
+    /// failures from earlier processes too; each failure was logged at ERROR
+    /// once, when it was recorded: by the worker for its executors' errors,
+    /// and by the owning store for the jobs it fails directly.
     pub fn log_permanent_failures(&self) {
-        let (jobs, total) = {
+        let counts = {
             let conn = self.lock_db_for_background();
-            let total = db::count_permanent_failures(&conn).unwrap_or(0);
-            let jobs =
-                db::list_permanent_failures(&conn, PERMANENT_FAILURE_LOG_CAP).unwrap_or_default();
-            (jobs, total)
+            db::count_permanent_failures_by_kind_and_reason(&conn)
         };
-        if total == 0 {
+        let counts = match counts {
+            Ok(counts) => counts,
+            Err(error) => {
+                tracing::warn!(%error, "failed to count permanently failed jobs");
+                return;
+            }
+        };
+        if counts.is_empty() {
             return;
         }
-        tracing::error!(
-            count = total,
-            logged = jobs.len(),
-            "permanently failed jobs in queue — these will NOT be retried and require \
-             manual intervention:"
+        let total: u64 = counts.iter().map(|(_, _, count)| count).sum();
+        let by_kind_and_reason = counts
+            .iter()
+            .map(|(kind, reason, count)| {
+                let reason = reason.map_or("unspecified", JobFailureReason::as_str);
+                format!("{kind}/{reason}={count}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        tracing::warn!(
+            total,
+            by_kind_and_reason,
+            "permanently failed jobs retained in queue; they will not be retried"
         );
-        for job in &jobs {
-            tracing::error!(
-                job_id = %job.job_id,
-                kind = %job.kind,
-                subject_id = ?job.subject_id,
-                error = ?job.error,
-                attempts = job.attempts,
-                completed_at = ?job.completed_at,
-                "permanently failed job"
-            );
-        }
     }
 
     /// Wait until all pending and running jobs complete or the timeout elapses.
@@ -1246,7 +1245,7 @@ impl<E: JobExecutor> BackgroundWorker<E> {
             let conn = self.lock_db_for_background();
             let depth = db::count_active_jobs_by_kind_and_status(&conn).unwrap_or_default();
             let oldest = db::oldest_pending_age_secs_by_kind(&conn).unwrap_or_default();
-            let perm = db::count_permanent_failures_by_kind(&conn).unwrap_or_default();
+            let perm = db::count_permanent_failures_by_kind_and_reason(&conn).unwrap_or_default();
             (depth, oldest, perm)
         };
         for (kind, status, count) in depth {
@@ -1259,8 +1258,12 @@ impl<E: JobExecutor> BackgroundWorker<E> {
         for (kind, age) in oldest {
             pplx_space_metrics::jobs::queue_oldest_pending_age_seconds(&kind, age.max(0) as f64);
         }
-        for (kind, count) in perm {
-            pplx_space_metrics::jobs::permanent_failures(&kind, db::nonnegative_i64_to_u64(count));
+        let mut perm_by_kind = BTreeMap::<String, u64>::new();
+        for (kind, _, count) in perm {
+            *perm_by_kind.entry(kind).or_default() += count;
+        }
+        for (kind, count) in perm_by_kind {
+            pplx_space_metrics::jobs::permanent_failures(&kind, count);
         }
         for (kind, scheduler) in self.schedulers.iter() {
             let snapshot = scheduler.snapshot();

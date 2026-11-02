@@ -6,7 +6,8 @@ pub const TEARDOWN_SUSPEND_JOB_KIND: &str = "teardown_suspend";
 
 pub const PLANNED_TEARDOWN_SUSPEND_OPERATION: &str = "planned_teardown";
 
-const TEARDOWN_SUSPEND_SUPERSEDED_REASON: &str = "superseded by a newer local execution lease";
+pub(super) const TEARDOWN_SUSPEND_SUPERSEDED_REASON: &str =
+    "superseded by a newer local execution lease";
 
 #[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize)]
 struct TeardownSuspendJobPayload {
@@ -170,11 +171,10 @@ pub(super) fn ensure_teardown_suspend_operation(
         }
         if active.execution_generation < execution_generation {
             superseded_generation = Some(active.execution_generation);
-            pplx_space_common_jobs::db::fail_job_permanent(
-                conn.raw(),
+            super::store_job_failures::fail_job_permanent(
+                conn,
                 &active.job_id,
                 TEARDOWN_SUSPEND_SUPERSEDED_REASON,
-                None,
             )?;
         }
     }
@@ -324,11 +324,10 @@ pub(super) fn advance_teardown_suspend_lease(
             return Ok(superseded_generation);
         }
         superseded_generation = Some(active.execution_generation);
-        pplx_space_common_jobs::db::fail_job_permanent(
-            conn.raw(),
+        super::store_job_failures::fail_job_permanent(
+            conn,
             &active.job_id,
             TEARDOWN_SUSPEND_SUPERSEDED_REASON,
-            None,
         )?;
     }
 
