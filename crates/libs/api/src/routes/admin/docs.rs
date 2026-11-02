@@ -365,6 +365,7 @@ fn admin_openapi_value() -> Value {
     insert_admin_sandbox_create_paths(paths);
     insert_identity_profile_paths(paths);
     insert_audit_event_paths(paths);
+    insert_debug_paths(paths);
     insert_runtime_environment_paths(paths);
     spec
 }
@@ -902,6 +903,26 @@ fn insert_identity_profile_paths(paths: &mut Map<String, Value>) {
             }),
         );
     }
+}
+
+fn insert_debug_paths(paths: &mut Map<String, Value>) {
+    paths.insert(
+        "/debug/sandbox/{sandbox_id}".to_string(),
+        json!({
+                "get": {
+                    "summary": "Read one sandbox's control-plane diagnostics",
+                    "description": "Requires a managing-organization administrator. Every section is present; a section whose source failed is { error, data: null }. resources.env lists the sandbox's environment variable names, not values: each name maps to null.",
+                    "parameters": [
+                        { "name": "sandbox_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
+                    ],
+                    "responses": {
+                        "200": { "description": "Sandbox diagnostics" },
+                        "403": { "description": "Caller is not a managing-organization administrator" },
+                        "404": { "description": "Sandbox not found" }
+                    }
+                }
+            }),
+    );
 }
 
 fn insert_audit_event_paths(paths: &mut Map<String, Value>) {

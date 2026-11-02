@@ -1,7 +1,7 @@
 use pplx_space_common_core::types::{OrgId, SandboxId, UserId};
 
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use sqlx::types::Json as SqlxJson;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -35,6 +35,10 @@ impl<T> DebugSection<T> {
 /// (`lifecycle.state`, `timeline[0].kind`). Failed sections
 /// serialize as `{ "error": "...", "data": null }` so callers can distinguish
 /// source failures without losing the rest of the response.
+///
+/// `resources.env` lists the sandbox's environment variable names, not their
+/// values: it keeps the stored `{ "NAME": value }` object shape with every
+/// value `null`, so diagnostics can see which variables are set.
 #[derive(Debug, Serialize)]
 pub(super) struct SandboxDebugResponse {
     pub sandbox_id: SandboxId,
@@ -132,7 +136,8 @@ pub(super) struct ResourcesSection {
     pub vcpu: Option<i32>,
     pub memory_mib: Option<i32>,
     pub disk_mib: Option<i32>,
-    pub env: SqlxJson<Value>,
+    /// Variable names, each mapped to `null`; see [`env_names`].
+    pub env: Map<String, Value>,
     pub metadata: SqlxJson<Value>,
     pub auto_lifecycle: SqlxJson<Value>,
     pub auto_lifecycle_state: SqlxJson<Value>,
@@ -183,7 +188,7 @@ impl SandboxRecord {
                 vcpu: self.vcpu,
                 memory_mib: self.memory_mib,
                 disk_mib: self.disk_mib,
-                env: self.env,
+                env: env_names(self.env.0),
                 metadata: self.metadata,
                 auto_lifecycle: self.auto_lifecycle,
                 auto_lifecycle_state: self.auto_lifecycle_state,
@@ -194,6 +199,20 @@ impl SandboxRecord {
                 observed,
             },
         }
+    }
+}
+
+/// The names in a stored `sandboxes.env` object, each mapped to `null`.
+///
+/// The column has no object constraint, so anything other than an object
+/// yields no names rather than echoing the stored value.
+fn env_names(env: Value) -> Map<String, Value> {
+    match env {
+        Value::Object(env) => env
+            .into_iter()
+            .map(|(name, _)| (name, Value::Null))
+            .collect(),
+        _ => Map::new(),
     }
 }
 
