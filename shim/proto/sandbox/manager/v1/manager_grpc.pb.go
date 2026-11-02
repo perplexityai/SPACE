@@ -201,11 +201,15 @@ type SandboxManagerClient interface {
 	// By name, a snapshot whose local artifact is pinned, checked out, still
 	// being deleted, shares its path with another artifact, or records another
 	// path answers FAILED_PRECONDITION and keeps its bytes; one whose artifact
-	// record cannot be read answers INTERNAL. A failed byte delete answers
-	// INTERNAL "delete snapshot failed", whatever node-manager's status. With
-	// `all`, each such snapshot is kept, left out of `deleted`, and the rest are
-	// still deleted; a failed byte delete fails the request with node-manager's
-	// status.
+	// record cannot be read answers INTERNAL. A snapshot with an artifact record
+	// is first renamed aside, and once it is renamed it counts as deleted, even if
+	// deleting its record then fails (startup recovery finishes it) or
+	// node-manager fails to remove the renamed bytes (sandbox-manager's orphan
+	// sweep finishes them). A failed rename, or a failed byte delete of a
+	// snapshot without a record, answers INTERNAL
+	// "delete snapshot failed", whatever node-manager's status. With `all`, each
+	// such kept snapshot is left out of `deleted` and the rest are still
+	// deleted; a failed rename or byte delete fails the request.
 	DeleteSnapshots(ctx context.Context, in *DeleteSnapshotsRequest, opts ...grpc.CallOption) (*DeleteSnapshotsResponse, error)
 	// Roll back a sandbox's filesystem to a previous snapshot.
 	Rollback(ctx context.Context, in *RollbackRequest, opts ...grpc.CallOption) (*RollbackResponse, error)
@@ -1296,11 +1300,15 @@ type SandboxManagerServer interface {
 	// By name, a snapshot whose local artifact is pinned, checked out, still
 	// being deleted, shares its path with another artifact, or records another
 	// path answers FAILED_PRECONDITION and keeps its bytes; one whose artifact
-	// record cannot be read answers INTERNAL. A failed byte delete answers
-	// INTERNAL "delete snapshot failed", whatever node-manager's status. With
-	// `all`, each such snapshot is kept, left out of `deleted`, and the rest are
-	// still deleted; a failed byte delete fails the request with node-manager's
-	// status.
+	// record cannot be read answers INTERNAL. A snapshot with an artifact record
+	// is first renamed aside, and once it is renamed it counts as deleted, even if
+	// deleting its record then fails (startup recovery finishes it) or
+	// node-manager fails to remove the renamed bytes (sandbox-manager's orphan
+	// sweep finishes them). A failed rename, or a failed byte delete of a
+	// snapshot without a record, answers INTERNAL
+	// "delete snapshot failed", whatever node-manager's status. With `all`, each
+	// such kept snapshot is left out of `deleted` and the rest are still
+	// deleted; a failed rename or byte delete fails the request.
 	DeleteSnapshots(context.Context, *DeleteSnapshotsRequest) (*DeleteSnapshotsResponse, error)
 	// Roll back a sandbox's filesystem to a previous snapshot.
 	Rollback(context.Context, *RollbackRequest) (*RollbackResponse, error)

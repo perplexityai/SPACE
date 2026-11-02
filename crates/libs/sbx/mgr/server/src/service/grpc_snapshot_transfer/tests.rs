@@ -728,3 +728,44 @@ fn snapshot_publication_refuses_an_unusable_destination_without_cataloging_it() 
         fixture.assert_staging_retained(&case);
     }
 }
+
+/// An import may name its snapshot, but not with the `.gc-pending-` marker GC
+/// staging reserves: such a snapshot would be imported and then hidden from,
+/// and refused by, every snapshot RPC.
+#[test]
+fn import_refuses_the_reserved_staging_marker() {
+    for (prefix, name) in [
+        (
+            "d",
+            "d-user.gc-pending-019f9ce3-2370-7a33-8706-fda0d0496d33",
+        ),
+        (
+            "f",
+            "f-user.gc-pending-019f9ce3-2370-7a33-8706-fda0d0496d33",
+        ),
+    ] {
+        let status = import_target_name(Some(name), prefix).unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{name}");
+        assert!(status.message().contains("reserved"), "{name}: {status}");
+    }
+    // Only staging's own shape, the marker followed by an artifact id, is
+    // reserved: the orphan sweep could never reclaim any other name.
+    for name in [
+        "d-user.gc-pending",
+        "d-user.gc-pending-note",
+        "d-run.gc-pending-1",
+        "d-user.gc-pending-019f9ce3-2370-7a33-8706-fda0d0496d33.tar",
+    ] {
+        assert_eq!(import_target_name(Some(name), "d").unwrap(), name);
+    }
+    assert_eq!(import_target_name(Some("d-user"), "d").unwrap(), "d-user");
+    assert!(
+        import_target_name(None, "f")
+            .unwrap()
+            .starts_with("f-imported-")
+    );
+    assert_eq!(
+        import_target_name(Some("f-user"), "d").unwrap_err().code(),
+        tonic::Code::InvalidArgument
+    );
+}

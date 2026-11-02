@@ -90,7 +90,7 @@ impl OrphanScan {
                 OrphanKind::GcPending => entry
                     .file_name()
                     .to_str()
-                    .is_some_and(|name| name.contains(".gc-pending-")),
+                    .is_some_and(crate::local_artifacts::is_gc_staging_name),
                 OrphanKind::ForkCopy => {
                     if crate::service::fork_artifact::is_copy_operation_reserved(active, &path) {
                         continue;

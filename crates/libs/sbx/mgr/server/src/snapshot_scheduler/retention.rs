@@ -1,9 +1,14 @@
 //! Scheduled-snapshot retention: which snapshots each tier keeps, and the
 //! prune that deletes the rest.
 
+use std::path::Path;
+
 use pplx_space_common_core::types::SandboxId;
 
 use super::CheckpointContext;
+use pplx_space_common_core::types::ArtifactKind;
+use pplx_space_node_mgr_client::NodeManagerGrpcClient;
+
 use crate::local_artifacts::{CheckoutError, NamedSnapshotDelete};
 
 /// Snapshot retention per tier. Each tier's count covers the gap to the next tier.
@@ -24,6 +29,11 @@ pub(super) fn retention_candidate(
     retained: &mut [std::collections::BTreeSet<(String, String)>; 5],
     name: String,
 ) -> Option<String> {
+    // GC staging keeps the tier prefix of the snapshot it once was. It is no
+    // snapshot: it must neither take a retained slot nor be pruned by name.
+    if crate::local_artifacts::is_gc_staging_name(&name) {
+        return None;
+    }
     let (index, keep, timestamp) = [
         ("d-1m-", 0, KEEP_D_1M),
         ("1m-", 0, KEEP_D_1M),
@@ -46,10 +56,72 @@ pub(super) fn retention_candidate(
         .map(|(_, name)| name)
 }
 
-pub(super) async fn prune_scheduled_snapshots(
-    node_client: &mut pplx_space_node_mgr_client::NodeManagerGrpcClient,
+/// Prune `sandbox_id`'s scheduled snapshots under `cache_root` (a test's own
+/// directory, or the sandbox cache), delete the staging the prune leaves, and
+/// then run `capture`. The prune and the capture each run under the sandbox's
+/// disk artifact publication locks, so backup selection never races a
+/// snapshot's creation or its retention deletion. The capture depends on
+/// nothing the prune read, so the locks are released between them.
+///
+/// The staging is deleted with the locks released: the pruned rows are gone,
+/// so nothing owns it, and under the locks a node-manager deletion backlog
+/// would stall the sandbox's publication, rollback, export and backup
+/// enqueue. Besides this prune's own staging, the prune hands back every
+/// unowned staging it lists, such as one an earlier delete failed to remove.
+///
+/// `capture` runs only after a successful prune whose staging is all deleted,
+/// so a failing byte delete blocks further growth. While DeleteCacheArtifact
+/// keeps failing, each tick retries the staging and captures nothing: the
+/// staging holds at most what one prune moved aside, and no tier gains a
+/// snapshot.
+pub(super) async fn prune_and_capture(
+    node_client: &mut NodeManagerGrpcClient,
     ctx: &CheckpointContext,
     sandbox_id: &str,
+    cache_root: &str,
+    capture: impl AsyncFnOnce(&mut NodeManagerGrpcClient) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut staged = Vec::new();
+    let pruned = {
+        let (_wake_guard, _artifact_guard) = ctx
+            .auto_lifecycle
+            .artifact_publication_locks(sandbox_id, ArtifactKind::Disk)
+            .await;
+        prune_scheduled_snapshots(node_client, ctx, sandbox_id, cache_root, &mut staged).await
+    };
+    let mut not_deleted = 0usize;
+    for (snapshot_name, staging) in &staged {
+        if crate::snapshot_gc::delete_gc_staging(node_client, staging, "retention", snapshot_name)
+            .await
+            .is_err()
+        {
+            not_deleted += 1;
+        }
+    }
+    pruned?;
+    if not_deleted > 0 {
+        return Err(format!(
+            "{not_deleted} of {} GC staging directories not deleted; \
+             capture skipped until a later tick deletes them",
+            staged.len()
+        ));
+    }
+    let (_wake_guard, _artifact_guard) = ctx
+        .auto_lifecycle
+        .artifact_publication_locks(sandbox_id, ArtifactKind::Disk)
+        .await;
+    capture(node_client).await
+}
+
+/// Delete the scheduled snapshots outside each tier's retention. Each
+/// catalogued snapshot's GC staging, with its name, goes to `staged`, and so
+/// does each unowned GC staging the listing shows.
+async fn prune_scheduled_snapshots(
+    node_client: &mut NodeManagerGrpcClient,
+    ctx: &CheckpointContext,
+    sandbox_id: &str,
+    cache_root: &str,
+    staged: &mut Vec<(String, String)>,
 ) -> Result<(), String> {
     let sandbox = sandbox_id
         .parse::<SandboxId>()
@@ -63,22 +135,40 @@ pub(super) async fn prune_scheduled_snapshots(
         .map_err(|e| format!("list snapshots: {e}"))?
     {
         for snapshot in snapshots {
+            if crate::local_artifacts::is_gc_staging_name(&snapshot.name) {
+                let staging = pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir_in(
+                    cache_root,
+                    sandbox_id,
+                    &snapshot.name,
+                );
+                if crate::snapshot_gc::gc_pending_is_unowned(&artifacts, Path::new(&staging)) {
+                    staged.push((snapshot.name, staging));
+                }
+                continue;
+            }
             let Some(name) = retention_candidate(&mut retained, snapshot.name) else {
                 continue;
             };
+            // A snapshot without a row is deleted by name: node-manager's
+            // DeleteBtrfsSnapshot deletes this path. A catalogued one is
+            // renamed to its GC staging sibling, which the caller deletes
+            // with DeleteCacheArtifact once it releases its locks.
+            let delete_path = pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir_in(
+                cache_root, sandbox_id, &name,
+            );
             let request = pplx_space_node_mgr_client::proto::DeleteBtrfsSnapshotRequest {
                 sandbox_id: sandbox_id.to_string(),
                 snapshot_name: name.clone(),
             };
-            let delete_bytes = async { node_client.delete_btrfs_snapshot(request).await.map(drop) };
-            // Node-manager deletes this sandbox's snapshot of that name here.
-            let delete_path =
-                pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir(sandbox_id, &name);
+            let delete_in_place =
+                async { node_client.delete_btrfs_snapshot(request).await.map(drop) };
             match artifacts
-                .delete_named_snapshot(sandbox_id, &name, &delete_path, delete_bytes)
+                .delete_named_snapshot(sandbox_id, &name, &delete_path, delete_in_place)
                 .await
             {
-                NamedSnapshotDelete::Deleted => {}
+                NamedSnapshotDelete::Deleted { staging } => {
+                    staged.extend(staging.map(|staging| (name.clone(), staging)));
+                }
                 // The prune runs before every scheduled capture, so a snapshot
                 // it keeps must not stop the rest of retention or capture, and
                 // one a later prune can retry (pinned, leased or still being
