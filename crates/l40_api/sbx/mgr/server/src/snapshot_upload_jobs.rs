@@ -209,17 +209,7 @@ impl JobExecutor for SnapshotUploadExecutor {
                     // suspend published. They are still this attempt's.
                     match persisted_payload(&self.db, &job.job_id)? {
                         Some(persisted) if !persisted.job_ids.is_empty() => persisted,
-                        _ => {
-                            let error =
-                                JobError::permanent(format!("artifact superseded: {superseded}"));
-                            converge_failed_upload(
-                                &payload,
-                                "artifact_superseded",
-                                error.message(),
-                            )
-                            .await;
-                            return Err(error);
-                        }
+                        _ => return Err(end_superseded_upload(&payload, &superseded).await),
                     }
                 }
                 Err(error) => {
@@ -229,6 +219,24 @@ impl JobExecutor for SnapshotUploadExecutor {
                 }
             };
             persist_submitted_transfer_ids(&self.db, &job.job_id, &payload)?;
+        } else if payload.sidecar_artifact_id.is_none() {
+            // An earlier binary submitted these transfers and did not check
+            // the sidecar after them.
+            let checked = match crate::snapshot_upload::check_earlier_submission(&payload).await {
+                Ok(checked) => checked,
+                Err(crate::snapshot_upload::SubmitPreparedError::Superseded(superseded)) => {
+                    return Err(end_superseded_upload(&payload, &superseded).await);
+                }
+                Err(error) => {
+                    return Err(JobError::retriable(format!(
+                        "check transfers an earlier binary submitted: {error}"
+                    )));
+                }
+            };
+            if checked.sidecar_artifact_id != payload.sidecar_artifact_id {
+                payload = checked;
+                persist_submitted_transfer_ids(&self.db, &job.job_id, &payload)?;
+            }
         }
 
         // Heartbeat the cluster row at the start of every attempt (including
@@ -862,6 +870,16 @@ async fn converge_failed_upload(payload: &SnapshotUploadJobs, reason: &'static s
             .error(error),
     );
     crate::snapshot_upload::cleanup_metadata_staging_dir(payload);
+}
+
+/// End for good an upload whose artifact a newer suspend replaced.
+async fn end_superseded_upload(
+    payload: &SnapshotUploadJobs,
+    superseded: &crate::snapshot_upload::Supersession,
+) -> JobError {
+    let error = JobError::permanent(format!("artifact superseded: {superseded}"));
+    converge_failed_upload(payload, "artifact_superseded", error.message()).await;
+    error
 }
 
 /// Whether a finalized upload's payload is in scope for the post-backup

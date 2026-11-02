@@ -176,6 +176,168 @@ async fn upload_of_a_replaced_artifact_rejoins_the_transfers_its_handoff_staged(
     assert!(metadata_dir.exists());
 }
 
+/// A payload with `transfer_id` queued, as the earlier binary persisted it:
+/// without `sidecar_artifact_id`.
+fn earlier_binary_submitted_payload(
+    artifact_id: &str,
+    snapshot_dir: std::path::PathBuf,
+    transfer_id: JobId,
+) -> String {
+    let mut payload = reclaim_fixture_payload(artifact_id, snapshot_dir);
+    payload.job_ids = vec![transfer_id];
+    let mut json = serde_json::to_value(&payload).unwrap();
+    json.as_object_mut().unwrap().remove("sidecar_artifact_id");
+    json.to_string()
+}
+
+fn insert_running_upload(db: &crate::db::SharedConnection, job: &Job) {
+    pplx_space_common_jobs::db::insert_job(
+        db.lock().unwrap().raw(),
+        pplx_space_common_jobs::db::InsertJob {
+            job_id: &job.job_id,
+            kind: SNAPSHOT_UPLOAD_JOB_KIND,
+            payload: &job.payload,
+            subject_id: None,
+            dedup_key: None,
+            max_attempts: 1,
+            traceparent: None,
+            priority: Default::default(),
+        },
+    )
+    .unwrap();
+}
+
+/// The earlier binary queued an upload's transfers without reading the
+/// sidecar after them, so they can be a newer suspend's files. Before polling
+/// them, a sidecar naming another artifact ends the attempt for good, as a
+/// fresh superseded upload, and a missing one fails it as retriable.
+#[tokio::test(start_paused = true)]
+async fn transfers_an_earlier_binary_queued_are_checked_before_polling() {
+    for newer_published in [true, false] {
+        let staging = tempfile::tempdir().unwrap();
+        let snapshot_dir = staging.path().join("snapshot");
+        write_snapshot_dir_fixture(&snapshot_dir);
+        let sidecar = snapshot_dir.join(crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME);
+        if newer_published {
+            std::fs::write(
+                &sidecar,
+                format!(r#"{{"local_artifact_id":"{}"}}"#, LocalArtifactId::new()),
+            )
+            .unwrap();
+        } else {
+            std::fs::remove_file(&sidecar).unwrap();
+        }
+        let transfer_id = JobId::new();
+        let db = crate::db::SharedConnection::new(open_backfill_test_db());
+        let executor = SnapshotUploadExecutor {
+            db: db.clone(),
+            drain_state: crate::service::tests::closed_drain_for_test(),
+            node_manager: crate::node_manager_transport::fake::unbound_in_absent_dir(),
+            volume_manager_socket: absent_volume_manager_socket(),
+            retained_source_inspector: std::sync::Arc::new(
+                crate::retained_source::FakeInspector::new(
+                    crate::retained_source::RetainedSourceCheck::Absent,
+                ),
+            ),
+        };
+        let job = job_fixture(
+            SNAPSHOT_UPLOAD_JOB_KIND,
+            earlier_binary_submitted_payload(
+                "01939e3e-eeee-7000-8000-000000000023",
+                snapshot_dir,
+                transfer_id,
+            ),
+        );
+        insert_running_upload(&db, &job);
+
+        let error = executor
+            .execute(&job, tokio_util::sync::CancellationToken::new())
+            .await
+            .unwrap_err();
+
+        let case = format!("newer_published={newer_published}: {}", error.message());
+        if newer_published {
+            assert_eq!(
+                error.kind(),
+                pplx_space_common_jobs::JobFailureKind::Permanent,
+                "{case}"
+            );
+            assert!(error.message().starts_with("artifact superseded"), "{case}");
+        } else {
+            assert_eq!(
+                error.kind(),
+                pplx_space_common_jobs::JobFailureKind::Retriable,
+                "{case}"
+            );
+        }
+        // Neither polled the queued transfer.
+        assert!(
+            !error.message().contains(&transfer_id.to_string()),
+            "{case}"
+        );
+    }
+}
+
+/// An earlier binary's transfers whose sidecar still names the upload are
+/// its files: publication is an atomic rename. The worker polls them and
+/// records the identity, so a later attempt polls without checking again.
+#[tokio::test(start_paused = true)]
+async fn transfers_an_earlier_binary_queued_for_the_named_artifact_are_polled() {
+    let artifact_id = "01939e3e-eeee-7000-8000-000000000024";
+    let staging = tempfile::tempdir().unwrap();
+    let snapshot_dir = staging.path().join("snapshot");
+    write_snapshot_dir_fixture(&snapshot_dir);
+    std::fs::write(
+        snapshot_dir.join(crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME),
+        format!(r#"{{"local_artifact_id":"{artifact_id}"}}"#),
+    )
+    .unwrap();
+    let transfer_id = JobId::new();
+    let db = crate::db::SharedConnection::new(open_backfill_test_db());
+    let executor = SnapshotUploadExecutor {
+        db: db.clone(),
+        drain_state: crate::service::tests::closed_drain_for_test(),
+        node_manager: crate::node_manager_transport::fake::unbound_in_absent_dir(),
+        volume_manager_socket: absent_volume_manager_socket(),
+        retained_source_inspector: std::sync::Arc::new(crate::retained_source::FakeInspector::new(
+            crate::retained_source::RetainedSourceCheck::Absent,
+        )),
+    };
+    let job = job_fixture(
+        SNAPSHOT_UPLOAD_JOB_KIND,
+        earlier_binary_submitted_payload(artifact_id, snapshot_dir, transfer_id),
+    );
+    insert_running_upload(&db, &job);
+
+    let error = executor
+        .execute(&job, tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap_err();
+
+    // Observing the transfer needs a volume-manager.
+    assert_eq!(
+        error.kind(),
+        pplx_space_common_jobs::JobFailureKind::Retriable,
+        "{}",
+        error.message()
+    );
+    assert!(
+        error.message().contains(&transfer_id.to_string()),
+        "{}",
+        error.message()
+    );
+    let persisted = pplx_space_common_jobs::db::get_job(db.lock().unwrap().raw(), &job.job_id)
+        .unwrap()
+        .unwrap()
+        .payload_as::<SnapshotUploadJobs>()
+        .unwrap();
+    assert_eq!(persisted.job_ids, vec![transfer_id]);
+    assert_eq!(
+        persisted.sidecar_artifact_id,
+        Some(artifact_id.parse().unwrap())
+    );
+}
+
 // The schedule `poll_artifact_job` probes on: soon after a completion, and
 // at a bounded rate through a long transfer. The probing itself needs a
 // volume-manager and is covered by the transfer tests.
@@ -899,7 +1061,7 @@ pub(crate) fn reclaim_fixture_payload(
         deferred_metadata: false,
         execution_generation: None,
         failure_scope: Default::default(),
-        sidecar_artifact_id: None,
+        sidecar_artifact_id: Some(artifact_id.parse().unwrap()),
     }
 }
 

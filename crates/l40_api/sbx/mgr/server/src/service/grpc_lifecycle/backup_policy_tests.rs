@@ -458,6 +458,9 @@ async fn durable_artifact_backup_persists_the_submitted_artifact_identity() {
         metadata: Option<&'static [u8]>,
         /// The published metadata names another artifact.
         sidecar_names_another: bool,
+        /// The intent records the exporter's id as the one its sidecar names,
+        /// because preparation leaves that sidecar in place.
+        records_exporter: bool,
         request_bucket: Option<&'static str>,
         default_bucket: Option<&'static str>,
         /// Bucket of the persisted intent; `None` expects no intent at all.
@@ -471,6 +474,7 @@ async fn durable_artifact_backup_persists_the_submitted_artifact_identity() {
         files: FULL,
         metadata: None,
         sidecar_names_another: false,
+        records_exporter: false,
         request_bucket: Some("request-bucket"),
         default_bucket: Some("default-bucket"),
         persisted_bucket: Some("request-bucket"),
@@ -493,6 +497,16 @@ async fn durable_artifact_backup_persists_the_submitted_artifact_identity() {
         Case {
             name: "imported artifact whose metadata names the exporter's id",
             sidecar_names_another: true,
+            ..base
+        },
+        Case {
+            name: "imported disk artifact whose metadata stays in place",
+            kind: ArtifactKind::Disk,
+            origin: ArtifactOrigin::Snapshot,
+            snapshot_name: Some("d-disk"),
+            files: &["rootfs.ext4"],
+            sidecar_names_another: true,
+            records_exporter: true,
             ..base
         },
         Case {
@@ -624,11 +638,12 @@ async fn durable_artifact_backup_persists_the_submitted_artifact_identity() {
             "{}",
             case.name
         );
-        assert_eq!(
-            payload.sidecar_artifact_id, sidecar_artifact_id,
-            "{}",
-            case.name
-        );
+        let recorded = if case.records_exporter {
+            sidecar_artifact_id
+        } else {
+            Some(local_artifact_id)
+        };
+        assert_eq!(payload.sidecar_artifact_id, recorded, "{}", case.name);
         assert_eq!(payload.meta.artifact_kind, Some(case.kind), "{}", case.name);
         assert_eq!(
             payload.meta.artifact_origin,
@@ -648,6 +663,132 @@ async fn durable_artifact_backup_persists_the_submitted_artifact_identity() {
         );
         assert!(payload.meta.execution.is_some(), "{}", case.name);
     }
+}
+
+/// A suspend publishes over the sandbox's one suspend directory. A backup of
+/// a suspend artifact there that the row no longer pins would upload a newer
+/// suspend's files under its id, so admission refuses it before preparing
+/// anything.
+#[tokio::test]
+async fn backup_of_a_replaced_suspend_artifact_is_refused_at_admission() {
+    for newer_pinned in [true, false] {
+        let conn = crate::db::test_conn();
+        let id = SandboxId::new().to_string();
+        insert_test_sandbox(&conn, &id, SandboxState::Suspended);
+        let root = tempfile::tempdir().unwrap();
+        let snapshot_dir = root.path().join("snapshot");
+        let newer = LocalArtifactId::new();
+        write_artifact(
+            &snapshot_dir,
+            &id,
+            &["vmstate", "memory", "rootfs.ext4"],
+            Some(newer),
+        );
+        if newer_pinned {
+            assert!(
+                crate::db::adopt_suspended_local_artifact(
+                    &conn,
+                    &id,
+                    newer,
+                    snapshot_dir.to_str().unwrap(),
+                )
+                .unwrap()
+            );
+        }
+        let service = SandboxManagerService::for_test(conn);
+        let sandbox = service.lookup_sandbox(&id).unwrap();
+        let replaced = LocalArtifactId::new();
+        let config = upload_config("request-bucket");
+
+        let outcome = service
+            .submit_artifact_backup(
+                &sandbox,
+                ArtifactBackupSubmission {
+                    local_artifact_id: replaced,
+                    artifact_kind: ArtifactKind::Full,
+                    artifact_origin: ArtifactOrigin::Suspend,
+                    snapshot_name: None,
+                    backup_attempt_id: BackupAttemptId::new(),
+                    snapshot_dir: snapshot_dir.to_str().unwrap(),
+                    request_override: Some(&config),
+                    format: SuspendSnapshotFormat::Full,
+                    handoff: ArtifactBackupHandoff::RestoreVisible,
+                    execution_generation: None,
+                },
+            )
+            .await;
+
+        let case = format!("newer_pinned={newer_pinned}: {outcome:?}");
+        let Err(error) = outcome else {
+            panic!("{case}")
+        };
+        assert_eq!(
+            super::artifact_backup::artifact_backup_submission_status(
+                "artifact backup enqueue failed",
+                error,
+            )
+            .code(),
+            tonic::Code::FailedPrecondition,
+            "{case}"
+        );
+        assert_eq!(snapshot_upload_jobs(&service, &id), 0, "{case}");
+    }
+}
+
+/// An imported artifact's sidecar names the exporter's id while the row pins
+/// the id its adoption gave it, so its backup is admitted.
+#[tokio::test]
+async fn backup_of_a_pinned_imported_artifact_is_admitted() {
+    let conn = crate::db::test_conn();
+    let id = SandboxId::new().to_string();
+    insert_test_sandbox(&conn, &id, SandboxState::Suspended);
+    let root = tempfile::tempdir().unwrap();
+    let snapshot_dir = root.path().join("snapshot");
+    write_artifact(
+        &snapshot_dir,
+        &id,
+        &["vmstate", "memory", "rootfs.ext4"],
+        Some(LocalArtifactId::new()),
+    );
+    let adopted = LocalArtifactId::new();
+    assert!(
+        crate::db::adopt_suspended_local_artifact(
+            &conn,
+            &id,
+            adopted,
+            snapshot_dir.to_str().unwrap(),
+        )
+        .unwrap()
+    );
+    let service = SandboxManagerService::for_test(conn);
+    let sandbox = service.lookup_sandbox(&id).unwrap();
+    let config = upload_config("request-bucket");
+
+    // `EnqueueArtifactBackup` hands off restore-visibly, which goes on to
+    // begin the backup remotely. Admission is the same for the durable worker.
+    let outcome = service
+        .submit_artifact_backup(
+            &sandbox,
+            ArtifactBackupSubmission {
+                local_artifact_id: adopted,
+                artifact_kind: ArtifactKind::Full,
+                artifact_origin: ArtifactOrigin::Suspend,
+                snapshot_name: None,
+                backup_attempt_id: BackupAttemptId::new(),
+                snapshot_dir: snapshot_dir.to_str().unwrap(),
+                request_override: Some(&config),
+                format: SuspendSnapshotFormat::Full,
+                handoff: ArtifactBackupHandoff::DurableWorker,
+                execution_generation: None,
+            },
+        )
+        .await;
+
+    assert!(
+        matches!(outcome, Ok(SubmitSuspendSnapshotOutcome::Enqueued { .. })),
+        "{outcome:?}"
+    );
+    assert_eq!(snapshot_upload_jobs(&service, &id), 1);
 }
 
 #[derive(Clone, Copy, Debug)]

@@ -487,11 +487,15 @@ pub struct SnapshotUploadJobs {
     /// [`UploadFailureScope::Attempt`].
     #[serde(default, skip_serializing_if = "UploadFailureScope::is_attempt")]
     pub failure_scope: UploadFailureScope,
-    /// The local artifact id the directory's sidecar named before submission
-    /// read it, which can differ from `meta.local_artifact_id`: an imported
-    /// artifact's sidecar keeps the exporter's id, and a backup of it adopts
-    /// a fresh one. Absent when the sidecar named none, and in payloads
-    /// persisted before this field existed.
+    /// The local artifact id the directory's sidecar names while the directory
+    /// holds this upload's artifact. Preparation rewrites an in-place sidecar
+    /// with `meta.local_artifact_id`. One it leaves in place, because it
+    /// staged the uploaded metadata elsewhere, keeps what it named: an
+    /// imported artifact's names the exporter's id, and a backup of it adopts
+    /// a fresh one.
+    ///
+    /// Absent in a payload an earlier binary persisted. That binary recorded
+    /// no identity and did not read the sidecar after submitting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidecar_artifact_id: Option<LocalArtifactId>,
 }
@@ -1023,7 +1027,9 @@ pub(crate) fn prepare_suspend_snapshot(
         deferred_metadata,
         execution_generation: None,
         failure_scope: UploadFailureScope::Attempt,
-        sidecar_artifact_id: None,
+        // What an in-place sidecar names once rewritten. A caller whose
+        // sidecar stays in place records what that sidecar named instead.
+        sidecar_artifact_id: meta.local_artifact_id,
     })
 }
 
@@ -1190,6 +1196,22 @@ pub(crate) async fn submit_prepared_snapshot(
     Ok(submitted)
 }
 
+/// Check transfers an earlier binary submitted before polling them. That
+/// binary did not read the sidecar after its last transfer, as
+/// [`submit_prepared_snapshot`] does, so they can be a newer suspend's files.
+/// The returned payload records the identity the check proved, so a later
+/// attempt polls without checking again.
+pub(crate) async fn check_earlier_submission(
+    submitted: &SnapshotUploadJobs,
+) -> Result<SnapshotUploadJobs, SubmitPreparedError> {
+    check_prepared_artifact(submitted, SidecarCheck::AfterSubmission).await?;
+    let mut checked = submitted.clone();
+    if checked.metadata_staging_dir.is_none() {
+        checked.sidecar_artifact_id = checked.meta.local_artifact_id;
+    }
+    Ok(checked)
+}
+
 /// Why [`submit_prepared_snapshot`] did not return the upload's transfers.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SubmitPreparedError {
@@ -1266,13 +1288,13 @@ async fn check_prepared_artifact(
     if !crate::service::is_canonical_suspend_snapshot_dir(snapshot_dir) {
         return Ok(());
     }
-    // Preparation rewrites the sidecar with the upload's id unless it stages
-    // the uploaded metadata elsewhere. A staged upload leaves the sidecar
-    // naming what it named before, which for an imported artifact is the
-    // exporter's id.
-    let expected = match prepared.metadata_staging_dir {
-        Some(_) => prepared.sidecar_artifact_id.unwrap_or(upload_id),
-        None => upload_id,
+    let expected = match (prepared.sidecar_artifact_id, &prepared.metadata_staging_dir) {
+        (Some(expected), _) => expected,
+        // An earlier binary recorded no identity. Its preparation rewrote an
+        // in-place sidecar with the upload's id, but one it left in place
+        // names an id it did not record, such as an import's exporter id.
+        (None, None) => upload_id,
+        (None, Some(_)) => return Ok(()),
     };
     let sidecar = snapshot_dir.join(SNAPSHOT_METADATA_FILENAME);
     let bytes = match tokio::fs::read(&sidecar).await {
