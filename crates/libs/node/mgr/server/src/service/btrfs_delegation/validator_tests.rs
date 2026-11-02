@@ -149,3 +149,32 @@ fn paths_compose_under_expected_roots() {
         );
     }
 }
+
+#[test]
+fn absent_template_build_is_a_lineage_precondition_only_for_suspend() {
+    let content_hash = "sha256:6dfaca783bd73dbb42fe5833b46e575a7c9555e56801e79cda7f01f573f2ebb1";
+    let temp = tempfile::tempdir().unwrap();
+    let templates = temp.path().canonicalize().unwrap().join("templates");
+    // An absent digest directory, then an absent template directory.
+    std::fs::create_dir_all(templates.join("present")).unwrap();
+    for name in ["present", "absent"] {
+        let path = templates.join(name).join(content_hash);
+        let Err(status) = validated_suspend_send_parent_at(path.clone(), name, content_hash) else {
+            panic!("{name}: an absent build cannot be a send parent");
+        };
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{name}");
+        assert_eq!(
+            status.metadata().get(LINEAGE_CAUSE_METADATA).unwrap(),
+            "template_missing",
+            "{name}"
+        );
+        assert!(status.message().contains("format=full"), "{name}");
+
+        // Operation snapshots have no Full codec, so the named-snapshot
+        // encode keeps a terminal NotFound rather than a fork refreeze.
+        let Err(status) = validated_send_parent_at(path, name, content_hash) else {
+            panic!("{name}: an absent build cannot be a send parent");
+        };
+        assert_eq!(status.code(), tonic::Code::NotFound, "{name}");
+    }
+}

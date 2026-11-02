@@ -43,6 +43,18 @@ pub(in crate::service) fn failed_encrypted_capture_may_release_volume(runtime_li
     !runtime_live
 }
 
+/// Whether a failed btrfs-send encode demotes this suspend to the Full codec.
+/// Node-manager answers `FailedPrecondition` only when it refused before
+/// touching Firecracker's `rootfs.ext4`; an explicit `format=BtrfsSend` keeps
+/// that refusal visible to its caller.
+pub(in crate::service) fn btrfs_send_encode_falls_back_to_full(
+    status: &Status,
+    requested_format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
+) -> bool {
+    status.code() == tonic::Code::FailedPrecondition
+        && requested_format != pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat::BtrfsSend
+}
+
 /// Re-arms watchdog monitoring for a still-live sandbox if the suspend
 /// publication is abandoned before its intentional teardown — a failure that
 /// rolls the sandbox back to `paused` *or* a dropped handler future (client
@@ -821,8 +833,8 @@ impl SandboxManagerService {
             //
             // - `FailedPrecondition` from the encoder means the sandbox
             //   is btrfs-send-*ineligible* (instance not a subvolume,
-            //   template plain-dir, parent_uuid lineage broken,
-            //   received_uuid mismatch). The encoder bails before any
+            //   template build absent or plain-dir, parent_uuid lineage
+            //   broken, received_uuid mismatch). The encoder bails before any
             //   side-effect; FC's `rootfs.ext4` from `create_snapshot` is
             //   still intact on disk. If the caller didn't *explicitly*
             //   request btrfs-send (i.e. it was the env-var/template
@@ -860,9 +872,7 @@ impl SandboxManagerService {
                         );
                     }
                     Err(status)
-                        if status.code() == tonic::Code::FailedPrecondition
-                            && requested_format
-                                != pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat::BtrfsSend =>
+                        if btrfs_send_encode_falls_back_to_full(&status, requested_format) =>
                     {
                         // Reactive fallback: the caller didn't explicitly
                         // pick btrfs-send (env-var default did), the

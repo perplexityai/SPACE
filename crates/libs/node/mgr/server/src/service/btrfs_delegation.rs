@@ -175,7 +175,63 @@ fn validated_send_parent(
 ) -> Result<ValidatedSendParent, Status> {
     validate_template_name(template_name)?;
     validate_content_hash(content_hash)?;
-    let path = template_digest_dir(template_name, content_hash);
+    validated_send_parent_at(
+        template_digest_dir(template_name, content_hash),
+        template_name,
+        content_hash,
+    )
+}
+
+/// The suspend encode's send parent. Only suspend has a Full codec to fall
+/// back to, so only suspend maps an absent build to a lineage precondition;
+/// operation snapshots keep the walker's `NotFound`.
+fn validated_suspend_send_parent(
+    template_name: &str,
+    content_hash: &str,
+) -> Result<ValidatedSendParent, Status> {
+    validate_template_name(template_name)?;
+    validate_content_hash(content_hash)?;
+    validated_suspend_send_parent_at(
+        template_digest_dir(template_name, content_hash),
+        template_name,
+        content_hash,
+    )
+}
+
+fn validated_suspend_send_parent_at(
+    path: PathBuf,
+    template_name: &str,
+    content_hash: &str,
+) -> Result<ValidatedSendParent, Status> {
+    match validated_send_parent_at(path, template_name, content_hash) {
+        // A build can leave the node while an instance still descends from
+        // it. Fetching it again cannot help: the new build is a different
+        // subvolume, so the instance's parent_uuid never matches it. Full is
+        // the only codec left for this sandbox. The template probe is the
+        // only `NotFound` the validator returns.
+        Err(status) if status.code() == tonic::Code::NotFound => {
+            tracing::warn!(
+                template = template_name,
+                content_hash,
+                "btrfs-send parent template build is absent on this node"
+            );
+            Err(lineage_precondition(
+                LineageFallbackCause::TemplateMissing,
+                format!(
+                    "btrfs-send codec requires template {template_name}@{content_hash} on this \
+                     node, but its build is absent; retry with format=full"
+                ),
+            ))
+        }
+        result => result,
+    }
+}
+
+fn validated_send_parent_at(
+    path: PathBuf,
+    template_name: &str,
+    content_hash: &str,
+) -> Result<ValidatedSendParent, Status> {
     if !artifact_fs::is_subvolume(&path)? {
         return Err(lineage_precondition(
             LineageFallbackCause::TemplateNotSubvolume,
@@ -299,6 +355,7 @@ enum LineageFallbackCause {
     InstanceParentMismatch,
     SnapshotNotSubvolume,
     SnapshotParentMismatch,
+    TemplateMissing,
     TemplateNotSubvolume,
     TemplateReceivedUuidMismatch,
 }
@@ -310,6 +367,7 @@ impl LineageFallbackCause {
             Self::InstanceParentMismatch => "instance_parent_mismatch",
             Self::SnapshotNotSubvolume => "snapshot_not_subvolume",
             Self::SnapshotParentMismatch => "snapshot_parent_mismatch",
+            Self::TemplateMissing => "template_missing",
             Self::TemplateNotSubvolume => "template_not_subvolume",
             Self::TemplateReceivedUuidMismatch => "template_received_uuid_mismatch",
         }
@@ -587,7 +645,7 @@ impl NodeManagerService {
                         snapshot_dir.display()
                     ))
                 })?;
-                validated_send_parent(&template_name, &content_hash)
+                validated_suspend_send_parent(&template_name, &content_hash)
             })
             .await?
         };
