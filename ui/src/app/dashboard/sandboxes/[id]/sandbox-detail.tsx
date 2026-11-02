@@ -456,8 +456,10 @@ function SnapshotsCard({
   // The public snapshot routes are scoped to the signed-in user's org.
   foreignOrg: boolean;
   debugView: DebugView;
-  // Changes on the page's Refresh and insight interval: a failed listing is
-  // retried then, so one error does not switch the card off for good.
+  // Changes on every insight load (the page's Refresh, each action, and every
+  // 20 s), and the card lists its snapshots again each time. A failed listing
+  // after a good one keeps the last good one, with a warning; a card whose
+  // first listing failed recovers at the next listing that succeeds.
   reloadKey: number;
   nowMs: number;
 }) {
@@ -468,10 +470,14 @@ function SnapshotsCard({
   const [loading, setLoading] = useState(true);
   const [snapshotsOff, setSnapshotsOff] = useState(foreignOrg);
   const [listingError, setListingError] = useState<string | null>(null);
+  // When the shown listing loaded, while a later listing has failed.
+  const [staleSince, setStaleSince] = useState<number | null>(null);
   const [rollbackOff, setRollbackOff] = useState(false);
 
   // Retries and Refresh can overlap; only the newest listing may write.
   const listingRequest = useRef(0);
+  // When the last good listing of this sandbox loaded, if one has.
+  const listedAt = useRef<number | null>(null);
   const refresh = (background = false) => {
     const request = ++listingRequest.current;
     if (foreignOrg) {
@@ -483,19 +489,30 @@ function SnapshotsCard({
     getPublicPage<PublicSnapshot>(`/sandboxes/${sandboxId}/snapshots`)
       .then((items) => {
         if (request !== listingRequest.current) return;
+        listedAt.current = Date.now();
         setSnapshotsOff(false);
         setListingError(null);
+        setStaleSince(null);
         setSnapshots(items.map(publicSnapshotToConsoleSnapshot));
       })
       .catch((err: any) => {
         if (request !== listingRequest.current) return;
-        // Either way the admin view below lists the snapshots; only a hidden
-        // operation is an expected answer, anything else is reported.
-        setSnapshotsOff(true);
+        // A hidden operation means snapshots are not enabled: the admin view
+        // below lists them, without rollback.
         if (isHiddenOperationError(err)) {
+          listedAt.current = null;
+          setSnapshotsOff(true);
           setListingError(null);
+          setStaleSince(null);
+          return;
+        }
+        setListingError(err.message || 'failed to load snapshots');
+        // Any other failure after a good listing keeps that listing and its
+        // rollback; without one, the admin view lists the snapshots.
+        if (listedAt.current === null) {
+          setSnapshotsOff(true);
         } else {
-          setListingError(err.message || 'failed to load snapshots');
+          setStaleSince(listedAt.current);
         }
       })
       .finally(() => {
@@ -503,7 +520,11 @@ function SnapshotsCard({
       });
   };
 
-  useEffect(() => refresh(), [sandboxId, foreignOrg]);
+  useEffect(() => {
+    listedAt.current = null;
+    setStaleSince(null);
+    refresh();
+  }, [sandboxId, foreignOrg]);
   const firstReload = useRef(true);
   useEffect(() => {
     if (firstReload.current) {
@@ -600,6 +621,15 @@ function SnapshotsCard({
       title={<Space><CameraOutlined /> Snapshots</Space>}
       extra={<Button size="small" icon={<ReloadOutlined />} onClick={() => refresh()}>Refresh</Button>}
     >
+      {listingError && staleSince !== null ? (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 8 }}
+          title={`Could not refresh snapshots from the snapshot API: ${listingError}. Showing the listing loaded at ${new Date(staleSince).toLocaleTimeString()}; the card retries every 20 s.`}
+          action={<Button size="small" onClick={() => refresh()}>Retry</Button>}
+        />
+      ) : null}
       <Table
         columns={[...columns, ...rollbackColumns]}
         dataSource={snapshots}
@@ -1085,7 +1115,7 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
   const [operationsMore, setOperationsMore] = useState(false);
   const [operationsLoaded, setOperationsLoaded] = useState(false);
   const [operationsError, setOperationsError] = useState<string | null>(null);
-  // Bumped on every insight load, so the snapshot card retries with it.
+  // Bumped on every insight load, so the snapshot card lists again with it.
   const [insightGeneration, setInsightGeneration] = useState(0);
   // Only the newest insight request may write its answers.
   const insightRequest = useRef(0);
