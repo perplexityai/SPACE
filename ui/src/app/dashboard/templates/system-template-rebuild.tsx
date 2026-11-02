@@ -45,40 +45,21 @@ import {
   testSandboxName,
 } from '@/lib/system-template-rebuild';
 import { releaseViewRefreshLock, tryAcquireViewRefreshLock } from '@/lib/view-refresh';
+import { exclusiveWith, type BrowserLocks } from '@/lib/exclusive';
 
 const { Text, Paragraph } = Typography;
 const TEMPLATES: SystemTemplate[] = ['seed', 'code-runtime'];
 const formatTime = (iso: string | number) => new Date(iso).toLocaleString();
 
-interface BrowserLocks {
-  request<T>(name: string, callback: () => T | Promise<T>): Promise<T>;
-}
+// `exclusiveWith` owns the fallback lock's TTL and retry loop; this wires it to
+// the browser's Web Locks, the stored view-refresh lock and timers.
+const exclusive = <T,>(name: string, work: () => T): Promise<T> => exclusiveWith({
+  locks: typeof navigator !== 'undefined' ? (navigator as Navigator & { locks?: BrowserLocks }).locks : undefined,
+  acquire: (lockName, ttlMs) => tryAcquireViewRefreshLock(lockName, ttlMs),
+  release: releaseViewRefreshLock,
+  wait: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+}, name, work);
 
-// A fallback lock is held only while `work` runs, which is synchronous; the
-// TTL frees it if a tab dies holding it.
-const FALLBACK_LOCK_TTL_MS = 2_000;
-const FALLBACK_LOCK_RETRY_MS = 25;
-
-// Runs `work` while holding a lock shared by this browser's tabs, so two
-// tabs' read-modify-writes of the stored run do not interleave. The Web Locks
-// API needs a secure context (https, or localhost); elsewhere a short-lived
-// lock in localStorage stands in. Its read-then-write is not atomic across
-// tabs, so it narrows the window rather than closing it.
-async function exclusive<T>(name: string, work: () => T): Promise<T> {
-  const locks = typeof navigator !== 'undefined' ? (navigator as Navigator & { locks?: BrowserLocks }).locks : undefined;
-  if (locks) return locks.request(name, () => work());
-  for (;;) {
-    const owner = tryAcquireViewRefreshLock(name, FALLBACK_LOCK_TTL_MS);
-    if (owner) {
-      try {
-        return work();
-      } finally {
-        releaseViewRefreshLock(name, owner);
-      }
-    }
-    await new Promise((resolve) => setTimeout(resolve, FALLBACK_LOCK_RETRY_MS));
-  }
-}
 const digest = (hash: string | null | undefined) => <code>{shortHash(hash, 'none')}</code>;
 // The digests a promotion of this run would move latest to.
 const targetsKey = (run: RebuildRun | null) => (run ? `${run.runId}:${run.seed?.content_hash ?? ''}:${run.codeRuntime?.content_hash ?? ''}` : '');
