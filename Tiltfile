@@ -788,7 +788,10 @@ k8s_resource(
 
 # The cluster-controller materializes per-sandbox pods under the
 # KubernetesSubstrate and hosts the cluster-singleton reconcilers.
+# values-kind.yaml carries the bench's shorter reconciler ticks, which the
+# caller-provided-cluster chart must not inherit.
 deploy_yaml(helm_release("space", "infra/space/kind/charts/space-cluster-controller-local",
+                         values = ["infra/space/kind/charts/space-cluster-controller-local/values-kind.yaml"],
                          set = ["substrate=" + SUBSTRATE]))
 k8s_resource(
     "space-cluster-controller",

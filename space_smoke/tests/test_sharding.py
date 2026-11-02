@@ -23,12 +23,13 @@ def _inventory(surface):
     }
 
 
-# Nine shards leave the brownout's shard with no native scenario.
-@pytest.mark.parametrize("count", [4, 8, 9])
+# Twelve, CI's count, leave the brownout's shard with no native scenario.
+@pytest.mark.parametrize("count", [4, 8, 12])
 def test_shards_run_every_eligible_scenario_once_and_propagate_failures(count):
     """Each (surface, scenario) pair of a sharded run runs on exactly one shard."""
 
     seen = []
+    empty_passes = []
 
     def execute(scenarios, **kwargs):
         surface = kwargs["environment"].get("SPACE_SMOKE_API_SURFACE")
@@ -66,11 +67,14 @@ def test_shards_run_every_eligible_scenario_once_and_propagate_failures(count):
                 if len(seen) == before:
                     assert status == 0
                     assert bootstrap.call_count == bootstraps
+                    empty_passes.append((surface, index))
                 else:
                     assert status == 1
     expected = {(surface, sid) for surface in ("ecw", "native") for sid in _inventory(surface)}
     assert len(seen) == len(expected)
     assert set(seen) == expected
+    if count == 12:
+        assert empty_passes, "twelve shards no longer exercise an empty pass"
 
 
 @pytest.mark.parametrize("shard", ["0/2", "3/2", "1/0", "1", "a/2", "1/2/3"])

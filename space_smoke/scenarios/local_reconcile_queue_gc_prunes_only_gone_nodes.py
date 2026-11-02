@@ -3,9 +3,8 @@
 import space_smoke as smoke
 
 
-# The GC runs at the binary's fixed timers (a 300 s tick, 24 h retention), so
-# the body seeds synthetic non-ready nodes with backdated refs and waits out
-# one tick; its EC2 lookups reach Kind's fake EC2 endpoint, which answers
+# The GC runs at Kind's 10 s tick and the binary's 24 h retention, so the body
+# seeds synthetic non-ready nodes with backdated refs and waits out one tick; its EC2 lookups reach Kind's fake EC2 endpoint, which answers
 # from the Nodes (see `space_smoke.reconcile_queue_gc`). The sandbox is the
 # fixture's and unused; its timeout outlasts the wait.
 @smoke.scenario(

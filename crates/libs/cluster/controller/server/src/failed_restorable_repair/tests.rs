@@ -1,6 +1,7 @@
 //! # Test matrix
 //!
 //! - C1 `c1_default_is_enabled`
+//! - C3 `c3_tick_defaults_to_a_minute_and_the_test_hook_takes_whole_seconds`
 //! - F1 `f1_lists_the_wedge_shape_and_defers_everything_else` — the
 //!   repairable fixture's snapshot predates `lifecycle_changed_at` /
 //!   `placement_changed_at` (the wedge itself); every unsafe variant is
@@ -310,6 +311,23 @@ fn c2_malformed_kill_switch_disables_the_repair() {
             !ReconcilerConfig::from_environment(&env).enabled,
             "{value:?}"
         );
+    }
+}
+
+/// The scan interval is a whole-second test hook: Kind shortens it so a smoke
+/// waits less for a tick. Anything but a positive count keeps the default.
+#[test]
+fn c3_tick_defaults_to_a_minute_and_the_test_hook_takes_whole_seconds() {
+    const TICK_ENV: &str = "SPACE_FAILED_RESTORABLE_REPAIR_TICK_SECS";
+    let tick = |env: &pplx_space_test_env::TestEnv| ReconcilerConfig::from_environment(env).tick;
+    let mut env = pplx_space_test_env::TestEnv::default();
+    assert_eq!(tick(&env), Duration::from_secs(60));
+    assert_eq!(ReconcilerConfig::default().tick, TICK);
+    env.set(TICK_ENV, "15");
+    assert_eq!(tick(&env), Duration::from_secs(15));
+    for invalid in ["0", "abc", ""] {
+        env.set(TICK_ENV, invalid);
+        assert_eq!(tick(&env), TICK, "{invalid:?}");
     }
 }
 

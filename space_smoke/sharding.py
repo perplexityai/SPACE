@@ -65,10 +65,11 @@ _DURATION_SECONDS = {
         "local.forced_drain_evacuates_sandbox": 22,
         "local.fork_suspended_cross_node": 13,
         "local.gentle_drain_leaves_sandbox_resident": 36,
-        # At the 18 s lease TTL floor, with the budget at its 72 s floor: three
-        # Kind runs took 448-469 s, most of it the outage's budget wait, the
-        # contender's watch of about 120 s and two 60 s tick windows.
-        "local.leader_election_brownout_keeps_one_leader": 457,
+        # At the 18 s lease TTL floor, with the budget at its 72 s floor, the
+        # outage's budget wait and the contender's watch of about 120 s: one
+        # Kind run with the chart's 10 s reconciler ticks took 295 s. Three
+        # runs at the 60 s ticks took 448-469 s.
+        "local.leader_election_brownout_keeps_one_leader": 295,
         "local.node_ctl_fence_refuses_and_reconciles": 11,
         "local.node_group_boundary_schedules": 37,
         "local.node_selector_extras_render_and_enforce": 63,
@@ -76,7 +77,10 @@ _DURATION_SECONDS = {
         "local.pending_backup_census_reports_blocked_upload": 17,
         "local.private_template_build_isolation": 62,
         "local.rate_limiters_enforce_and_fail_open": 48,
-        "local.reconcile_queue_gc_prunes_only_gone_nodes": 132,
+        # An estimate until Kind runs refresh it: the seed, at most one 10 s
+        # GC tick on Kind and the checks. At the binary's 300 s tick it took
+        # 26-300 s.
+        "local.reconcile_queue_gc_prunes_only_gone_nodes": 35,
         "local.restarted_btrfs_send_is_rejected_and_retried": 30,
         "local.retention_claim_finish_forward": 68,
         "local.retention_restore_source_guard": 40,

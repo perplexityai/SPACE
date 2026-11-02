@@ -1,0 +1,30 @@
+# Kind bring-up overrides for the cluster-controller that the
+# caller-provided-cluster chart (infra/space/cluster/chart) must not inherit.
+# The Tiltfile passes this file; see values.yaml for what each loop does.
+
+# The slowest loops that record the reconciler tick histogram ship at 60 s:
+# started_sandbox_repair, failed_restorable_repair,
+# transient_lifecycle_sweeper and the orphaned-restore-pod GC. Kind ticks them
+# every 10 s, so a smoke that waits for one tick of each (the leader-election
+# brownout's runner windows, space_smoke/leader_election.py) waits 10 s rather
+# than a minute. Each loop keeps its ages and thresholds. The sweeper's tick
+# and the GC's interval and tick budget are deployment settings, set here; the
+# two repairs' ticks are test hooks, in testHookEnv below. The GC's budget
+# stays below its interval, as its config asks.
+reconcilers:
+  transientLifecycleSweeper:
+    env:
+      SPACE_TRANSIENT_LIFECYCLE_SWEEPER_TICK_SECS: "10"
+  orphanedRestorePodGc:
+    env:
+      SPACE_ORPHANED_RESTORE_POD_GC_INTERVAL_SECS: "10"
+      SPACE_ORPHANED_RESTORE_POD_GC_TICK_BUDGET_SECS: "9"
+
+# Rendered only for the test-hooks build (values.yaml). The reconcile-queue
+# GC's EC2 instance ticks every 10 s rather than 300 s, so its scenario waits
+# seconds, not up to five minutes, for a tick; the release lane renders no
+# hook, and the scenario then waits out the binary's 300 s tick.
+testHookEnv:
+  SPACE_STARTED_SANDBOX_REPAIR_TICK_SECS: "10"
+  SPACE_FAILED_RESTORABLE_REPAIR_TICK_SECS: "10"
+  SPACE_RECONCILE_QUEUE_GC_TICK_SECS: "10"

@@ -26,8 +26,8 @@ comes from state instead.
   which is no earlier than the phase, the holder's current container or its
   acquisition: a holder that restarts keeps its name and can keep its
   `acquireTime`, so an older anchor would credit it with its predecessor's
-  ticks. The window stays open for two of the slowest loop's 60 s ticks, so a
-  second runner that starts late is still seen. That is judged once the
+  ticks. The window stays open for two of the slowest loop's ticks (10 s on
+  Kind), so a second runner that starts late is still seen. That is judged once the
   apiserver is back, with the refused contender already running, and opens at
   the restore, so the outage's record checks run inside it. Before the outage
   the window lasts one tick of every loop plus two exports, enough to show the
@@ -127,17 +127,42 @@ LIVENESS_BUDGET_SPREAD = 1 + 1 / 4
 REFUSAL_RESTART_SEEN_SECONDS = 30.0
 # The OTLP metric export interval (crates/libs/observability/src/sink/otlp.rs).
 EXPORT_INTERVAL_SECONDS = 10.0
-# The interval of the loops that record the reconciler tick histogram in Kind:
-# 60 s for started_sandbox_repair, failed_restorable_repair,
-# transient_lifecycle_sweeper and the two pod GCs. The warm pool's 5 s loop
-# records it only with its orphan GC on, which Kind leaves off.
-SLOWEST_TICK_SECONDS = 60.0
+# The loops that record the reconciler tick histogram in Kind, by the
+# controller setting that ticks each: started_sandbox_repair,
+# failed_restorable_repair, transient_lifecycle_sweeper and the
+# orphaned-restore-pod GC ship at 60 s, and the Kind bring-up ticks them every
+# 10 s (infra/space/kind/charts/space-cluster-controller-local/values-kind.yaml).
+# The stuck-ContainerCreating GC, also at 60 s, is off on Kind. The warm
+# pool's 5 s loop records it only with its orphan GC on, which Kind leaves off.
+# The preflight reads these from the controller Deployment, so a bench that
+# still ticks at 60 s gets the windows a minute's ticks need.
+RECONCILER_TICK_ENV: dict[str, float] = {
+    "SPACE_STARTED_SANDBOX_REPAIR_TICK_SECS": 60.0,
+    "SPACE_FAILED_RESTORABLE_REPAIR_TICK_SECS": 60.0,
+    "SPACE_TRANSIENT_LIFECYCLE_SWEEPER_TICK_SECS": 60.0,
+    "SPACE_ORPHANED_RESTORE_POD_GC_INTERVAL_SECS": 60.0,
+}
+
+
+def slowest_tick_seconds(env: Mapping[str, str | None]) -> float:
+    """The slowest of those loops' ticks, as the controller reads its env.
+
+    A setting that is unset, or not a positive whole number of seconds, leaves
+    that loop at its default.
+    """
+
+    ticks = []
+    for key, default in RECONCILER_TICK_ENV.items():
+        raw = env.get(key) or ""
+        ticks.append(float(raw) if raw.isdigit() and int(raw) > 0 else default)
+    return max(ticks)
 # A process that runs the reconcilers throughout this window records a tick of
-# every loop above in its first 60 s, and exports it with an export interval
+# every loop above in its first tick, and exports it with an export interval
 # to spare, even when it started in the same second as the holder and its
 # first tick fell just before the window opened. Before the outage this
 # shows the holder running and no other process running throughout.
-ONE_TICK_WINDOW_SECONDS = SLOWEST_TICK_SECONDS + 2 * EXPORT_INTERVAL_SECONDS
+def one_tick_window_seconds(slowest_tick: float) -> float:
+    return slowest_tick + 2 * EXPORT_INTERVAL_SECONDS
 # How far past the Lease's expiry the holder's process may still exit. It stops
 # acting at its renew deadline, the duration less RENEW_DEADLINE_MARGIN (12 s),
 # after its last confirmed renewal, whose call was issued before the
@@ -198,6 +223,8 @@ class LeaderElectionAssertions:
         self._remove_contender: Compensation | None = None
         self._restore_apiserver: Compensation | None = None
         self._restore_budget: Compensation | None = None
+        # The slowest histogram-recording loop's tick, read in the preflight.
+        self._slowest_tick = max(RECONCILER_TICK_ENV.values())
         self._standing_budget: str | None = None
         # The ceiling of the budget this run requested, once it is live.
         self._budget_ceiling: float | None = None
@@ -236,6 +263,8 @@ class LeaderElectionAssertions:
             raise SmokeConfigurationError(
                 f"requires two cluster-controller replicas with leader election on; found {replicas}"
             )
+        self._slowest_tick = slowest_tick_seconds(self._control.controller_reconciler_tick_env())
+        self._fixture.record("slowest_reconciler_tick_seconds", self._slowest_tick)
         release = self._control.acquire_retention_sweeper_mutation()
         self._scope.defer("release the Kind mutation Lease", release, critical=True)
         # A contender a killed run left behind, in this shape or an earlier one.
@@ -408,7 +437,9 @@ class LeaderElectionAssertions:
 
         assert self._initial is not None
         lease, since = self._initial
-        self._expect_only_runner(lease, label="initial", since=since, window=ONE_TICK_WINDOW_SECONDS)
+        self._expect_only_runner(
+            lease, label="initial", since=since, window=one_tick_window_seconds(self._slowest_tick)
+        )
 
     def expect_recovered_leader(self) -> str:
         """One fresh holder and one runner, judged from the restore on.
@@ -460,7 +491,7 @@ class LeaderElectionAssertions:
         *,
         label: str,
         since: float,
-        window: float = 2 * SLOWEST_TICK_SECONDS,
+        window: float | None = None,
     ) -> None:
         """Only the holder's reconciler tick count moves in a window opened now.
 
@@ -473,6 +504,7 @@ class LeaderElectionAssertions:
         count has moved; any other pod's count moving fails at once.
         """
 
+        window = 2 * self._slowest_tick if window is None else window
         holder_started = self._healthy[lease.holder].started_at or 0.0
         # The two Kubernetes times are rounded down, so each floors the window
         # one resolution later; the phase start is the runner's own clock.

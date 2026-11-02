@@ -252,6 +252,22 @@ fn ec2_config_uses_default_operational_limits() {
     );
 }
 
+/// The EC2 instance's tick is a whole-second test hook; anything but a
+/// positive count keeps the default.
+#[test]
+fn ec2_tick_test_hook_takes_whole_seconds() {
+    const TICK_ENV: &str = "SPACE_RECONCILE_QUEUE_GC_TICK_SECS";
+    let tick =
+        |env: &pplx_space_test_env::TestEnv| ReconcilerConfig::from_environment_ec2(env).tick;
+    let mut env = pplx_space_test_env::TestEnv::default();
+    env.set(TICK_ENV, "10");
+    assert_eq!(tick(&env), Duration::from_secs(10));
+    for invalid in ["0", "abc", ""] {
+        env.set(TICK_ENV, invalid);
+        assert_eq!(tick(&env), DEFAULT_TICK, "{invalid:?}");
+    }
+}
+
 #[test]
 fn kube_config_defaults_enabled_dry_run_without_dead_prune() {
     let env = pplx_space_test_env::TestEnv::default();
