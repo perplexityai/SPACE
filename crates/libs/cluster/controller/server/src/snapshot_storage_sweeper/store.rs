@@ -49,7 +49,7 @@ impl SweeperSink for SnapshotStorageDbStore {
         // shape is more robust to future schema drift).
         //
         // Defense-in-depth on the orphan contract: the writer
-        // (`finalize_sandbox_db_delete_tx`) sets `snapshot_id = NULL`
+        // (`delete_with_dependents`) sets `snapshot_id = NULL`
         // and stamps `orphaned_at` in the same statement, so today
         // either column alone identifies an orphan. Both filters here
         // (and in `delete_storage_location_if_orphan` below) make the

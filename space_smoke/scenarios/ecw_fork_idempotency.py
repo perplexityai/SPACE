@@ -10,7 +10,11 @@ from space_smoke.capabilities import EcwForkResult
 PATH = "/tmp/space-smoke-fork-replay.txt"
 
 
-@smoke.scenario("ecw.fork_idempotency", sandbox=smoke.SandboxConfig(timeout=600))
+# Forks are Kubernetes-only: the Direct substrate answers them Unsupported
+# (crates/libs/api/src/controllers/substrate/direct.rs).
+@smoke.scenario(
+    "ecw.fork_idempotency", sandbox=smoke.SandboxConfig(timeout=600), substrates=("kubernetes",)
+)
 def fork_idempotency(test: smoke.Ecw) -> None:
     """A replay returns the existing child, including its post-fork writes."""
 

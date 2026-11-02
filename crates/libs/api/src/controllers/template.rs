@@ -10,11 +10,6 @@ use pplx_space_common_core::types::{
     TemplateReference, TenantPublicationGrantId,
 };
 use pplx_space_node_api_client::proto::BuildTemplateResponse;
-use pplx_space_template_mgr_client::proto::{
-    CreatePoolRequest, DeletePoolRequest, DeletePoolResponse, DeleteTemplateRequest,
-    GetTemplateRequest, GetTemplateResponse, ListTemplatesRequest, PoolStatusRequest,
-    PoolStatusResponse, TemplateFullInfo, UpdateTemplateSettingsRequest,
-};
 
 use super::{
     ControllerError, db_contention_error,
@@ -262,41 +257,6 @@ impl TemplateController {
             build_jobs: TemplateBuildJobsStore::new(pool.clone()),
             pool,
         }
-    }
-
-    pub async fn list_templates(&self) -> Result<Vec<TemplateFullInfo>, ControllerError> {
-        let mut client = self.substrate.builder_client().await?;
-        client
-            .list_templates(ListTemplatesRequest {})
-            .await
-            .map(|resp| resp.into_inner().templates)
-            .map_err(|err| ControllerError::internal(format!("node-api: {err}")))
-    }
-
-    pub async fn get_template(
-        &self,
-        request: GetTemplateRequest,
-    ) -> Result<GetTemplateResponse, ControllerError> {
-        let mut client = self.substrate.builder_client().await?;
-        Ok(client.get_template(request).await?.into_inner())
-    }
-
-    pub async fn update_template_settings(
-        &self,
-        request: UpdateTemplateSettingsRequest,
-    ) -> Result<(), ControllerError> {
-        let mut client = self.substrate.builder_client().await?;
-        client.update_template_settings(request).await?;
-        Ok(())
-    }
-
-    pub async fn delete_template(&self, name: String) -> Result<(), ControllerError> {
-        let mut client = self.substrate.builder_client().await?;
-        client
-            .delete_template(DeleteTemplateRequest { template: name })
-            .await
-            .map(|_| ())
-            .map_err(|err| ControllerError::internal(format!("node-api: {err}")))
     }
 
     pub async fn submit_template_build(
@@ -571,28 +531,6 @@ impl TemplateController {
     {
         let mut client = self.substrate.builder_client().await?;
         Ok(client.upload_build_blob(stream).await?.into_inner())
-    }
-
-    pub async fn create_pool(&self, request: CreatePoolRequest) -> Result<(), ControllerError> {
-        let mut client = self.substrate.builder_client().await?;
-        client.create_pool(request).await?;
-        Ok(())
-    }
-
-    pub async fn delete_pool(
-        &self,
-        request: DeletePoolRequest,
-    ) -> Result<DeletePoolResponse, ControllerError> {
-        let mut client = self.substrate.builder_client().await?;
-        Ok(client.delete_pool(request).await?.into_inner())
-    }
-
-    pub async fn pool_status(
-        &self,
-        request: PoolStatusRequest,
-    ) -> Result<PoolStatusResponse, ControllerError> {
-        let mut client = self.substrate.builder_client().await?;
-        Ok(client.pool_status(request).await?.into_inner())
     }
 
     pub async fn list_cluster_pool_configs(

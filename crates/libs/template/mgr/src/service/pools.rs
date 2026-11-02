@@ -10,6 +10,11 @@ impl TemplateManagerService {
         let req = request.get_ref();
         validate_template_name(&req.template)?;
 
+        if self.template_guest_image(&req.template).await?.is_some() {
+            return Err(Status::failed_precondition(
+                "firmware guests do not support warm pools",
+            ));
+        }
         let requested_shape = optional_pool_shape(req.vcpu, req.memory_mib)?;
         let (existing_pool, settings, runtime_defaults) = {
             let db = Arc::clone(&self.db);
@@ -194,6 +199,7 @@ impl TemplateManagerService {
     ) -> Result<Response<PoolStatusResponse>, Status> {
         self.authorize_peer(&request, "PoolStatus", ALLOW_TEMPLATE_OBSERVER)?;
         let req = request.get_ref();
+        let omit_sandbox_counts = req.omit_sandbox_counts;
         let template = req
             .template
             .as_deref()
@@ -224,16 +230,7 @@ impl TemplateManagerService {
         };
 
         // Fetch sandbox list from sbx-manager to compute pool counts
-        let sbx_connect = pplx_space_sbx_mgr_client::connect()
-            .await
-            .map_err(|e| e.to_string());
-        let sbx_sandboxes = if let Ok(mut sbx_client) = sbx_connect {
-            pplx_space_sbx_mgr_client::list_all_sandboxes(&mut sbx_client)
-                .await
-                .unwrap_or_default()
-        } else {
-            vec![]
-        };
+        let sbx_sandboxes = self.pool_count_sandboxes(omit_sandbox_counts).await;
 
         for sandbox in &sbx_sandboxes {
             sandbox

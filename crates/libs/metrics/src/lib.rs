@@ -42,6 +42,8 @@ pub mod operations;
 pub use pplx_space_grpc_metrics::payload;
 pub mod reconcile;
 pub mod response;
+pub mod runtime_supervisor;
+pub mod runtime_upgrade;
 pub mod sandbox;
 pub mod sandbox_eviction;
 pub mod sandbox_fork;

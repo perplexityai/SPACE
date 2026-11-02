@@ -53,6 +53,9 @@ pub const DEFAULT_HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 pub const DEFAULT_HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_NODE_CTL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub const NODE_API_DRAINING_MESSAGE: &str = "node-api draining";
+/// Most environments one `RuntimeProvisioningRecipe` may list. node-ctl
+/// refuses a larger recipe whole, installing none of it.
+pub const MAX_RECIPE_ENVIRONMENTS: usize = 32;
 /// HTTP/2 connection window for a node-api connection that carries many
 /// callers' streams at once: 16 default-sized (2 MiB) stream windows, so
 /// concurrent calls share a larger buffer. It bounds the response data one
@@ -461,11 +464,8 @@ impl<'a> WorkerApiClient<'a> {
         kill_sandbox, proto::worker_api_client::WorkerApiClient::new, pplx_space_sbx_mgr_client::proto::KillRequest, pplx_space_sbx_mgr_client::proto::KillResponse;
         delete_sandbox, proto::worker_api_client::WorkerApiClient::new, pplx_space_sbx_mgr_client::proto::DeleteRequest, pplx_space_sbx_mgr_client::proto::DeleteResponse;
         sandbox_state, proto::worker_api_client::WorkerApiClient::new, pplx_space_sbx_mgr_client::proto::StateRequest, pplx_space_sbx_mgr_client::proto::StateResponse;
-        get_sandbox_health, proto::worker_api_client::WorkerApiClient::new, pplx_space_sbx_mgr_client::proto::GetSandboxHealthRequest, pplx_space_sbx_mgr_client::proto::GetSandboxHealthResponse;
-        list_sandboxes, proto::worker_api_client::WorkerApiClient::new, pplx_space_sbx_mgr_client::proto::ListRequest, pplx_space_sbx_mgr_client::proto::ListResponse;
         pause_sandbox, proto::worker_api_client::WorkerApiClient::new, pplx_space_sbx_mgr_client::proto::PauseRequest, pplx_space_sbx_mgr_client::proto::PauseResponse;
         resume_sandbox, proto::worker_api_client::WorkerApiClient::new, pplx_space_sbx_mgr_client::proto::ResumeRequest, pplx_space_sbx_mgr_client::proto::ResumeResponse;
-        wake_sandbox, proto::worker_api_client::WorkerApiClient::new, pplx_space_sbx_mgr_client::proto::WakeRequest, pplx_space_sbx_mgr_client::proto::WakeResponse;
         create_sandbox_snapshot, proto::worker_api_client::WorkerApiClient::new, pplx_space_sbx_mgr_client::proto::CreateSnapshotRequest, pplx_space_sbx_mgr_client::proto::CreateSnapshotResponse;
         suspend_sandbox, proto::worker_api_client::WorkerApiClient::new, pplx_space_sbx_mgr_client::proto::SuspendRequest, pplx_space_sbx_mgr_client::proto::SuspendResponse;
         prepare_teardown_suspend, proto::worker_api_client::WorkerApiClient::new, pplx_space_sbx_mgr_client::proto::PrepareTeardownSuspendRequest, pplx_space_sbx_mgr_client::proto::PrepareTeardownSuspendResponse;
@@ -475,7 +475,6 @@ impl<'a> WorkerApiClient<'a> {
         set_sandbox_auto_lifecycle_policy, proto::worker_api_client::WorkerApiClient::new, pplx_space_sbx_mgr_client::proto::SetAutoLifecyclePolicyRequest, pplx_space_sbx_mgr_client::proto::SetAutoLifecyclePolicyResponse;
         touch_sandbox_auto_lifecycle, proto::worker_api_client::WorkerApiClient::new, pplx_space_sbx_mgr_client::proto::TouchAutoLifecycleRequest, pplx_space_sbx_mgr_client::proto::TouchAutoLifecycleResponse;
         set_sandbox_network_policy, proto::worker_api_client::WorkerApiClient::new, pplx_space_sbx_mgr_client::proto::SetNetworkPolicyRequest, pplx_space_sbx_mgr_client::proto::SetNetworkPolicyResponse;
-        spaced_ping_guest, proto::worker_api_client::WorkerApiClient::new, pplx_space_sbx_mgr_client::proto::SpacedPingGuestRequest, pplx_space_sbx_mgr_client::proto::SpacedPingGuestResponse;
         spaced_get_status, proto::worker_api_client::WorkerApiClient::new, pplx_space_sbx_mgr_client::proto::SpacedGetStatusRequest, pplx_space_sbx_mgr_client::proto::SpacedGetStatusResponse;
         spaced_wait_ready, proto::worker_api_client::WorkerApiClient::new, pplx_space_sbx_mgr_client::proto::SpacedWaitReadyRequest, pplx_space_sbx_mgr_client::proto::SpacedWaitReadyResponse;
         spaced_stat, proto::worker_api_client::WorkerApiClient::new, pplx_space_sbx_mgr_client::proto::SpacedStatRequest, pplx_space_sbx_mgr_client::operations::StatResponse;
@@ -498,27 +497,14 @@ impl<'a> WorkerApiClient<'a> {
         spaced_kill_process, proto::worker_api_client::WorkerApiClient::new, pplx_space_sbx_mgr_client::proto::SpacedKillProcessRequest, pplx_space_sbx_mgr_client::operations::KillResponse;
         spaced_open_loopback_bridge, proto::worker_api_client::WorkerApiClient::new, pplx_space_sbx_mgr_client::proto::SpacedOpenLoopbackBridgeRequest, pplx_space_sbx_mgr_client::operations::OpenLoopbackBridgeResponse;
         spaced_close_loopback_bridge, proto::worker_api_client::WorkerApiClient::new, pplx_space_sbx_mgr_client::proto::SpacedCloseLoopbackBridgeRequest, pplx_space_sbx_mgr_client::operations::CloseLoopbackBridgeResponse;
-        enable_snapshots, proto::worker_api_client::WorkerApiClient::new, pplx_space_sbx_mgr_client::proto::EnableSnapshotsRequest, pplx_space_sbx_mgr_client::proto::EnableSnapshotsResponse;
-        disable_snapshots, proto::worker_api_client::WorkerApiClient::new, pplx_space_sbx_mgr_client::proto::DisableSnapshotsRequest, pplx_space_sbx_mgr_client::proto::DisableSnapshotsResponse;
         list_snapshots, proto::worker_api_client::WorkerApiClient::new, pplx_space_sbx_mgr_client::proto::ListSnapshotsRequest, pplx_space_sbx_mgr_client::proto::ListSnapshotsResponse;
-        delete_snapshots, proto::worker_api_client::WorkerApiClient::new, pplx_space_sbx_mgr_client::proto::DeleteSnapshotsRequest, pplx_space_sbx_mgr_client::proto::DeleteSnapshotsResponse;
         rollback_sandbox, proto::worker_api_client::WorkerApiClient::new, pplx_space_sbx_mgr_client::proto::RollbackRequest, pplx_space_sbx_mgr_client::proto::RollbackResponse;
         delete_template, proto::worker_api_client::WorkerApiClient::new, pplx_space_template_mgr_client::proto::DeleteTemplateRequest, pplx_space_template_mgr_client::proto::DeleteTemplateResponse;
         delete_template_build, proto::worker_api_client::WorkerApiClient::new, pplx_space_template_mgr_client::proto::DeleteTemplateBuildRequest, pplx_space_template_mgr_client::proto::DeleteTemplateBuildResponse;
-        list_templates, proto::worker_api_client::WorkerApiClient::new, pplx_space_template_mgr_client::proto::ListTemplatesRequest, pplx_space_template_mgr_client::proto::ListTemplatesResponse;
-        get_template, proto::worker_api_client::WorkerApiClient::new, pplx_space_template_mgr_client::proto::GetTemplateRequest, pplx_space_template_mgr_client::proto::GetTemplateResponse;
-        update_template_settings, proto::worker_api_client::WorkerApiClient::new, pplx_space_template_mgr_client::proto::UpdateTemplateSettingsRequest, pplx_space_template_mgr_client::proto::UpdateTemplateSettingsResponse;
-        update_template_snapshot_policy, proto::worker_api_client::WorkerApiClient::new, pplx_space_template_mgr_client::proto::UpdateTemplateSnapshotPolicyRequest, pplx_space_template_mgr_client::proto::UpdateTemplateSnapshotPolicyResponse;
-        create_pool, proto::worker_api_client::WorkerApiClient::new, pplx_space_template_mgr_client::proto::CreatePoolRequest, pplx_space_template_mgr_client::proto::CreatePoolResponse;
-        delete_pool, proto::worker_api_client::WorkerApiClient::new, pplx_space_template_mgr_client::proto::DeletePoolRequest, pplx_space_template_mgr_client::proto::DeletePoolResponse;
-        pool_status, proto::worker_api_client::WorkerApiClient::new, pplx_space_template_mgr_client::proto::PoolStatusRequest, pplx_space_template_mgr_client::proto::PoolStatusResponse;
         expose_port, proto::worker_api_client::WorkerApiClient::new, pplx_space_node_mgr_client::proto::ExposePortRequest, pplx_space_node_mgr_client::proto::ExposePortResponse;
-        unexpose_port, proto::worker_api_client::WorkerApiClient::new, pplx_space_node_mgr_client::proto::UnexposePortRequest, pplx_space_node_mgr_client::proto::UnexposePortResponse;
         allow_port, proto::worker_api_client::WorkerApiClient::new, pplx_space_node_mgr_client::proto::AllowPortRequest, pplx_space_node_mgr_client::proto::AllowPortResponse;
-        deny_port, proto::worker_api_client::WorkerApiClient::new, pplx_space_node_mgr_client::proto::DenyPortRequest, pplx_space_node_mgr_client::proto::DenyPortResponse;
         pull_template, proto::worker_api_client::WorkerApiClient::new, proto::PullTemplateRequest, proto::PullTemplateResponse;
         list_node_templates, proto::worker_api_client::WorkerApiClient::new, proto::ListNodeTemplatesRequest, proto::ListNodeTemplatesResponse;
-        refresh_facet_state, proto::worker_api_client::WorkerApiClient::new, proto::RefreshFacetStateRequest, proto::RefreshFacetStateResponse;
         trigger_state_reconciliation, proto::worker_api_client::WorkerApiClient::new, proto::TriggerStateReconciliationRequest, proto::TriggerStateReconciliationResponse;
     }
 }
@@ -541,22 +527,10 @@ impl<'a> BuilderApiClient<'a> {
     }
 
     node_api_unary_methods! {
-        sandbox_state, proto::builder_api_client::BuilderApiClient::new, pplx_space_sbx_mgr_client::proto::StateRequest, pplx_space_sbx_mgr_client::proto::StateResponse;
-        list_sandboxes, proto::builder_api_client::BuilderApiClient::new, pplx_space_sbx_mgr_client::proto::ListRequest, pplx_space_sbx_mgr_client::proto::ListResponse;
-        stop_sandbox, proto::builder_api_client::BuilderApiClient::new, pplx_space_sbx_mgr_client::proto::StopRequest, pplx_space_sbx_mgr_client::proto::StopResponse;
-        delete_sandbox, proto::builder_api_client::BuilderApiClient::new, pplx_space_sbx_mgr_client::proto::DeleteRequest, pplx_space_sbx_mgr_client::proto::DeleteResponse;
         delete_template, proto::builder_api_client::BuilderApiClient::new, pplx_space_template_mgr_client::proto::DeleteTemplateRequest, pplx_space_template_mgr_client::proto::DeleteTemplateResponse;
         delete_template_build, proto::builder_api_client::BuilderApiClient::new, pplx_space_template_mgr_client::proto::DeleteTemplateBuildRequest, pplx_space_template_mgr_client::proto::DeleteTemplateBuildResponse;
-        list_templates, proto::builder_api_client::BuilderApiClient::new, pplx_space_template_mgr_client::proto::ListTemplatesRequest, pplx_space_template_mgr_client::proto::ListTemplatesResponse;
-        get_template, proto::builder_api_client::BuilderApiClient::new, pplx_space_template_mgr_client::proto::GetTemplateRequest, pplx_space_template_mgr_client::proto::GetTemplateResponse;
-        update_template_settings, proto::builder_api_client::BuilderApiClient::new, pplx_space_template_mgr_client::proto::UpdateTemplateSettingsRequest, pplx_space_template_mgr_client::proto::UpdateTemplateSettingsResponse;
-        update_template_snapshot_policy, proto::builder_api_client::BuilderApiClient::new, pplx_space_template_mgr_client::proto::UpdateTemplateSnapshotPolicyRequest, pplx_space_template_mgr_client::proto::UpdateTemplateSnapshotPolicyResponse;
-        create_pool, proto::builder_api_client::BuilderApiClient::new, pplx_space_template_mgr_client::proto::CreatePoolRequest, pplx_space_template_mgr_client::proto::CreatePoolResponse;
-        delete_pool, proto::builder_api_client::BuilderApiClient::new, pplx_space_template_mgr_client::proto::DeletePoolRequest, pplx_space_template_mgr_client::proto::DeletePoolResponse;
-        pool_status, proto::builder_api_client::BuilderApiClient::new, pplx_space_template_mgr_client::proto::PoolStatusRequest, pplx_space_template_mgr_client::proto::PoolStatusResponse;
         pull_template, proto::builder_api_client::BuilderApiClient::new, proto::PullTemplateRequest, proto::PullTemplateResponse;
         list_node_templates, proto::builder_api_client::BuilderApiClient::new, proto::ListNodeTemplatesRequest, proto::ListNodeTemplatesResponse;
-        refresh_facet_state, proto::builder_api_client::BuilderApiClient::new, proto::RefreshFacetStateRequest, proto::RefreshFacetStateResponse;
         trigger_state_reconciliation, proto::builder_api_client::BuilderApiClient::new, proto::TriggerStateReconciliationRequest, proto::TriggerStateReconciliationResponse;
         build_template, proto::builder_api_client::BuilderApiClient::new, pplx_space_build_mgr_client::proto::StartBuildRequest, proto::BuildTemplateResponse;
         get_build_template_status, proto::builder_api_client::BuilderApiClient::new, pplx_space_build_mgr_client::proto::GetBuildStatusRequest, pplx_space_build_mgr_client::proto::GetBuildStatusResponse;

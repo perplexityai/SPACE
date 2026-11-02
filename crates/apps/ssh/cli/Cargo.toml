@@ -15,6 +15,7 @@ name = "space-ssh"
 path = "src/main.rs"
 
 [dependencies]
+pplx-space-net-common = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 

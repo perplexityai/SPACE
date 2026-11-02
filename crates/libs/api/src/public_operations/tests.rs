@@ -493,6 +493,524 @@ async fn operation_sorts_after_one_committed_during_its_idempotency_lock_wait() 
     Ok(())
 }
 
+/// Inserts for one sandbox wait for each other to commit, so the sandbox's
+/// request order is its commit order; another sandbox's inserts don't wait.
+#[tokio::test]
+async fn inserts_for_one_sandbox_commit_in_request_order() -> TestResult {
+    let Some(db) = try_pg_test_db_with_max_connections(6).await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let target_id = PublicSandboxId::new().to_string();
+    let other_target_id = PublicSandboxId::new().to_string();
+
+    let mut first = db.pool.begin().await?;
+    let (created, superseded) = create_operation_tx(
+        &mut first,
+        CreatePublicOperation {
+            org_id,
+            actor_user_id: None,
+            api_product: ApiProduct::Native,
+            kind: OperationKind::WakeSandbox,
+            target_type: Some(OperationTargetType::Sandbox),
+            target_id: Some(&target_id),
+            payload_json: serde_json::json!({}),
+            idempotency: None,
+            traceparent: None,
+        },
+    )
+    .await?;
+    let first_id = created.expect_created();
+    let second = tokio::spawn({
+        let store = store.clone();
+        let target_id = target_id.clone();
+        async move {
+            create_test_operation_for_target(&store, org_id, OperationKind::StopSandbox, &target_id)
+                .await
+        }
+    });
+    wait_for_advisory_lock_waiter(&db.pool).await?;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        create_test_operation_for_target(
+            &store,
+            org_id,
+            OperationKind::StopSandbox,
+            &other_target_id,
+        ),
+    )
+    .await
+    .expect("another sandbox's insert does not wait on this sandbox's queue")?
+    .expect_created();
+
+    let committing_at: time::OffsetDateTime = sqlx::query_scalar(sql!("SELECT clock_timestamp()"))
+        .fetch_one(&mut *first)
+        .await?;
+    first.commit().await?;
+    superseded.record();
+    let second_id = second.await??.expect_created();
+
+    let second_requested_at: time::OffsetDateTime = sqlx::query_scalar(sql!(
+        "SELECT requested_at FROM public_operations WHERE operation_id = $1"
+    ))
+    .bind(second_id.as_uuid())
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(
+        second_requested_at > committing_at,
+        "the second insert is stamped after the first commits"
+    );
+    assert_eq!(
+        dispatch_order(&db.pool, org_id, &target_id).await?,
+        vec![first_id.as_uuid(), second_id.as_uuid()]
+    );
+    Ok(())
+}
+
+/// The sandbox queue lock comes before row locks: a delete holds it while it
+/// waits for a create's row, so a later insert for the sandbox waits behind
+/// the delete. Claims and releases, which lock rows, never wait for it, so a
+/// release holding the create's row can't wait on the delete.
+#[tokio::test]
+async fn the_sandbox_queue_lock_is_taken_before_row_locks_and_never_by_claims() -> TestResult {
+    let Some(db) = try_pg_test_db_with_max_connections(8).await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let target_id = PublicSandboxId::new().to_string();
+    let claim_create = || {
+        store.claim_operations(ClaimPublicOperations {
+            limits: ClaimLimits::any(4),
+            claim_stale_after: Duration::from_secs(60),
+            claimable_kinds: &[OperationKind::CreateSandbox],
+        })
+    };
+    let create_id =
+        create_test_operation_for_target(&store, org_id, OperationKind::CreateSandbox, &target_id)
+            .await?
+            .expect_created();
+
+    // While an insert for the sandbox holds its queue, a claim and a
+    // release of its create go ahead.
+    let mut inserting = db.pool.begin().await?;
+    lock_sandbox_queue(&mut inserting, org_id, &target_id).await?;
+    let claim = tokio::time::timeout(Duration::from_secs(5), claim_create()).await??;
+    assert_eq!(claim.operations.len(), 1);
+    let released = tokio::time::timeout(
+        Duration::from_secs(5),
+        store.release_claimed_operation(ReleaseClaimedPublicOperation {
+            claim_token: claim.claim_token,
+            operation_id: create_id,
+            progress_message: "sandbox pod is not ready".to_string(),
+            retry_after: Duration::ZERO,
+            count_attempt: true,
+            undo_first_start: false,
+            cancel_if_superseded: true,
+            carried_error: None,
+        }),
+    )
+    .await??;
+    assert_eq!(released, ReleasedClaim::Requeued);
+    inserting.rollback().await?;
+
+    // Hold the claimed create's row, as a release does until it commits.
+    let claim = claim_create().await?;
+    assert_eq!(claim.operations.len(), 1);
+    let mut releasing = db.pool.begin().await?;
+    sqlx::query(sql!(
+        "SELECT 1 FROM public_operations WHERE operation_id = $1 FOR UPDATE"
+    ))
+    .bind(create_id.as_uuid())
+    .execute(&mut *releasing)
+    .await?;
+    let delete = tokio::spawn({
+        let store = store.clone();
+        let target_id = target_id.clone();
+        async move {
+            create_test_operation_for_target(
+                &store,
+                org_id,
+                OperationKind::DeleteSandbox,
+                &target_id,
+            )
+            .await
+        }
+    });
+    wait_for_row_lock_waiter(&db.pool).await?;
+    let wake = tokio::spawn({
+        let store = store.clone();
+        let target_id = target_id.clone();
+        async move {
+            create_test_operation_for_target(&store, org_id, OperationKind::WakeSandbox, &target_id)
+                .await
+        }
+    });
+    // The wake waits on the queue the delete holds while it waits for the
+    // row.
+    wait_for_advisory_lock_waiter(&db.pool).await?;
+    assert!(!wake.is_finished());
+
+    releasing.commit().await?;
+    let delete_id = delete.await??.expect_created();
+    let wake_id = wake.await??.expect_created();
+    assert_eq!(
+        dispatch_order(&db.pool, org_id, &target_id).await?,
+        vec![create_id.as_uuid(), delete_id.as_uuid(), wake_id.as_uuid()]
+    );
+    Ok(())
+}
+
+/// What a sandbox already has when admission records a new operation for it.
+#[derive(Debug, Clone, Copy)]
+enum SandboxAhead {
+    Nothing,
+    Finished,
+    AnotherSandboxBusy,
+    Queued,
+    QueuedInBackoff,
+    LiveClaim,
+    StaleClaim,
+}
+
+/// A claim of every due wake, as the dispatcher's claim would take them.
+async fn claim_wakes(
+    store: &PublicOperationStore,
+) -> Result<PublicOperationClaim, PublicOperationStoreError> {
+    store
+        .claim_operations(ClaimPublicOperations {
+            limits: ClaimLimits::any(16),
+            claim_stale_after: Duration::from_secs(60),
+            claimable_kinds: &[OperationKind::WakeSandbox],
+        })
+        .await
+}
+
+async fn operation_state_and_attempts(
+    pool: &PgPool,
+    operation_id: OperationId,
+) -> Result<(String, i32), sqlx::Error> {
+    sqlx::query_as(sql!(
+        "SELECT state, attempts FROM public_operations WHERE operation_id = $1"
+    ))
+    .bind(operation_id.as_uuid())
+    .fetch_one(pool)
+    .await
+}
+
+/// Admission claims the operation it records only when nothing else for its
+/// sandbox is queued or running; otherwise it is queued behind that work.
+#[tokio::test]
+async fn admission_claims_a_new_operation_only_on_an_otherwise_idle_sandbox() -> TestResult {
+    for (ahead, claimed) in [
+        (SandboxAhead::Nothing, true),
+        (SandboxAhead::Finished, true),
+        (SandboxAhead::AnotherSandboxBusy, true),
+        (SandboxAhead::Queued, false),
+        (SandboxAhead::QueuedInBackoff, false),
+        (SandboxAhead::LiveClaim, false),
+        (SandboxAhead::StaleClaim, false),
+    ] {
+        let Some(db) = try_pg_test_db().await? else {
+            return Ok(());
+        };
+        let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+        let store = PublicOperationStore::new(db.pool.clone());
+        let target_id = PublicSandboxId::new().to_string();
+        let ahead_target = match ahead {
+            SandboxAhead::AnotherSandboxBusy => PublicSandboxId::new().to_string(),
+            _ => target_id.clone(),
+        };
+        if !matches!(ahead, SandboxAhead::Nothing) {
+            let earlier = create_test_operation_for_target(
+                &store,
+                org_id,
+                OperationKind::WakeSandbox,
+                &ahead_target,
+            )
+            .await?
+            .expect_created();
+            match ahead {
+                SandboxAhead::QueuedInBackoff => {
+                    sqlx::query(sql!(
+                        "UPDATE public_operations
+                         SET next_attempt_at = NOW() + INTERVAL '5 minutes'
+                         WHERE operation_id = $1"
+                    ))
+                    .bind(earlier.as_uuid())
+                    .execute(&db.pool)
+                    .await?;
+                }
+                SandboxAhead::Finished | SandboxAhead::LiveClaim | SandboxAhead::StaleClaim => {
+                    let claim = claim_wakes(&store).await?;
+                    assert_eq!(claim.operations.len(), 1, "{ahead:?}");
+                    if matches!(ahead, SandboxAhead::Finished) {
+                        assert!(
+                            store
+                                .complete_claimed_operation(CompleteClaimedPublicOperation {
+                                    claim_token: claim.claim_token,
+                                    operation_id: earlier,
+                                    progress_message: "woken".to_string(),
+                                    result_json: serde_json::json!({}),
+                                })
+                                .await?
+                        );
+                    }
+                    if matches!(ahead, SandboxAhead::StaleClaim) {
+                        sqlx::query(sql!(
+                            "UPDATE public_operations
+                             SET claimed_at = NOW() - INTERVAL '10 minutes'
+                             WHERE operation_id = $1"
+                        ))
+                        .bind(earlier.as_uuid())
+                        .execute(&db.pool)
+                        .await?;
+                    }
+                }
+                SandboxAhead::Nothing | SandboxAhead::AnotherSandboxBusy | SandboxAhead::Queued => {
+                }
+            }
+        }
+
+        let key = IdempotencyKey::parse("stop-if-idle")?;
+        let fingerprint = RequestFingerprint::parse("f".repeat(64))?;
+        let idempotency = CreatePublicOperationIdempotency {
+            method: HttpOperationMethod::Post,
+            path_template: OperationPathTemplate::new("/v1/sandboxes/{sandbox_id}:stop"),
+            key: &key,
+            request_fingerprint: &fingerprint,
+        };
+        let input = || CreatePublicOperation {
+            org_id,
+            actor_user_id: None,
+            api_product: ApiProduct::Native,
+            kind: OperationKind::StopSandbox,
+            target_type: Some(OperationTargetType::Sandbox),
+            target_id: Some(&target_id),
+            payload_json: serde_json::json!({}),
+            idempotency: Some(idempotency.clone()),
+            traceparent: None,
+        };
+        let recorded = store
+            .begin_operation_admission(org_id, ApiProduct::Native, &idempotency)
+            .await?
+            .create_claimed_if_sole_active(input())
+            .await?;
+        let operation_id = match (claimed, recorded) {
+            (
+                true,
+                CreateInlinePublicOperationResult::Claimed {
+                    claim_token,
+                    operation,
+                },
+            ) => {
+                assert!(claim_token.starts_with(ADMISSION_CLAIM_TOKEN_PREFIX));
+                assert_eq!(operation.kind, OperationKind::StopSandbox);
+                assert_eq!(
+                    operation_state_and_attempts(&db.pool, operation.id).await?,
+                    ("running".to_string(), 1),
+                    "{ahead:?}"
+                );
+                // Live, so the dispatcher leaves it to its claimant.
+                assert!(
+                    store
+                        .claim_operations(ClaimPublicOperations {
+                            limits: ClaimLimits::any(16),
+                            claim_stale_after: Duration::from_secs(60),
+                            claimable_kinds: &[OperationKind::StopSandbox],
+                        })
+                        .await?
+                        .operations
+                        .is_empty()
+                );
+                operation.id
+            }
+            (false, CreateInlinePublicOperationResult::Queued(operation_id)) => {
+                assert_eq!(
+                    operation_state_and_attempts(&db.pool, operation_id).await?,
+                    ("queued".to_string(), 0),
+                    "{ahead:?}"
+                );
+                operation_id
+            }
+            (_, other) => panic!("{ahead:?}: unexpected {other:?}"),
+        };
+
+        // A replay neither records nor claims anything.
+        let replay = store
+            .begin_operation_admission(org_id, ApiProduct::Native, &idempotency)
+            .await?
+            .create_claimed_if_sole_active(input())
+            .await?;
+        assert!(
+            matches!(
+                replay,
+                CreateInlinePublicOperationResult::NotCreated(
+                    CreatePublicOperationResult::Existing(id)
+                ) if id == operation_id
+            ),
+            "{ahead:?}: {replay:?}"
+        );
+    }
+    Ok(())
+}
+
+/// An admission that waited on the sandbox's queue lock longer than the
+/// claim staleness window still commits a live claim: it is stamped when it
+/// is taken, not when the admission's transaction began, so the dispatcher
+/// leaves it to its claimant.
+#[tokio::test]
+async fn an_admission_claim_is_stamped_when_taken_not_when_its_transaction_began() -> TestResult {
+    let Some(db) = try_pg_test_db_with_max_connections(4).await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let target_id = PublicSandboxId::new().to_string();
+    let claim_stale_after = Duration::from_secs(1);
+
+    // Another insert for the sandbox holds its queue past the window.
+    let mut holding = db.pool.begin().await?;
+    lock_sandbox_queue(&mut holding, org_id, &target_id).await?;
+    let admission = tokio::spawn({
+        let store = store.clone();
+        let target_id = target_id.clone();
+        async move {
+            let key = IdempotencyKey::parse("stop-after-a-wait")?;
+            let fingerprint = RequestFingerprint::parse("f".repeat(64))?;
+            let idempotency = CreatePublicOperationIdempotency {
+                method: HttpOperationMethod::Post,
+                path_template: OperationPathTemplate::new("/v1/sandboxes/{sandbox_id}:stop"),
+                key: &key,
+                request_fingerprint: &fingerprint,
+            };
+            let recorded = store
+                .begin_operation_admission(org_id, ApiProduct::Native, &idempotency)
+                .await?
+                .create_claimed_if_sole_active(CreatePublicOperation {
+                    org_id,
+                    actor_user_id: None,
+                    api_product: ApiProduct::Native,
+                    kind: OperationKind::StopSandbox,
+                    target_type: Some(OperationTargetType::Sandbox),
+                    target_id: Some(&target_id),
+                    payload_json: serde_json::json!({}),
+                    idempotency: Some(idempotency.clone()),
+                    traceparent: None,
+                })
+                .await?;
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(recorded)
+        }
+    });
+    wait_for_advisory_lock_waiter(&db.pool).await?;
+    tokio::time::sleep(claim_stale_after + Duration::from_millis(500)).await;
+    holding.rollback().await?;
+    let CreateInlinePublicOperationResult::Claimed { operation, .. } =
+        admission.await?.map_err(|error| error.to_string())?
+    else {
+        panic!("admission claims the stop on its otherwise idle sandbox");
+    };
+
+    let dispatched = store
+        .claim_operations(ClaimPublicOperations {
+            limits: ClaimLimits::any(4),
+            claim_stale_after,
+            claimable_kinds: &[OperationKind::StopSandbox],
+        })
+        .await?;
+    assert!(
+        dispatched.operations.is_empty(),
+        "the dispatcher took over {} as stale the moment admission committed its claim",
+        operation.id
+    );
+    Ok(())
+}
+
+/// A system wake is claimed when it is created on an idle sandbox; one that
+/// joins a wake is not, and one queued behind other work stays queued.
+#[tokio::test]
+async fn an_implicit_wake_is_claimed_only_when_created_on_an_idle_sandbox() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let target_id = PublicSandboxId::new().to_string();
+    let wake = || {
+        store.create_or_join_active_sandbox_wake_claimed_if_sole_active(
+            org_id,
+            &target_id,
+            serde_json::json!({"action": "wake"}),
+            None,
+        )
+    };
+
+    let CreateInlinePublicOperationResult::Claimed {
+        claim_token,
+        operation,
+    } = wake().await?
+    else {
+        panic!("a wake on an idle sandbox is claimed");
+    };
+    assert_eq!(operation.actor_user_id, None);
+    assert!(matches!(
+        wake().await?,
+        CreateInlinePublicOperationResult::NotCreated(CreatePublicOperationResult::Existing(id))
+            if id == operation.id
+    ));
+    assert!(
+        store
+            .complete_claimed_operation(CompleteClaimedPublicOperation {
+                claim_token,
+                operation_id: operation.id,
+                progress_message: "woken".to_string(),
+                result_json: serde_json::json!({}),
+            })
+            .await?
+    );
+
+    let suspend =
+        create_test_operation_for_target(&store, org_id, OperationKind::SuspendSandbox, &target_id)
+            .await?
+            .expect_created();
+    let CreateInlinePublicOperationResult::Queued(behind) = wake().await? else {
+        panic!("a wake behind a queued suspend stays queued");
+    };
+    assert_eq!(
+        dispatch_order(&db.pool, org_id, &target_id).await?,
+        vec![operation.id.as_uuid(), suspend.as_uuid(), behind.as_uuid()]
+    );
+    assert_eq!(
+        operation_state_and_attempts(&db.pool, behind).await?,
+        ("queued".to_string(), 0)
+    );
+    Ok(())
+}
+
+/// Returns once some transaction waits for a row another one has locked.
+async fn wait_for_row_lock_waiter(pool: &PgPool) -> TestResult {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(sql!(
+                "SELECT COUNT(*)
+                   FROM pg_stat_activity
+                  WHERE datname = current_database()
+                    AND wait_event_type = 'Lock'
+                    AND wait_event IN ('transactionid', 'tuple')"
+            ))
+            .fetch_one(pool)
+            .await?;
+            if waiting > 0 {
+                return Ok::<_, sqlx::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    Ok(())
+}
+
 /// Returns once some transaction waits on an advisory lock in this database.
 async fn wait_for_advisory_lock_waiter(pool: &PgPool) -> TestResult {
     tokio::time::timeout(Duration::from_secs(10), async {

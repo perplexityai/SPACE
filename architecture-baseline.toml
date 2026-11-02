@@ -9,17 +9,17 @@
 # that adds an entry or raises a cap is reported.
 
 [file_size]
-"crates/libs/api/src/controllers/sandbox/lifecycle.rs" = 1825
-"crates/libs/api/src/controllers/sandbox/mod.rs" = 1193
+"crates/libs/api/src/controllers/sandbox/lifecycle.rs" = 1793
+"crates/libs/api/src/controllers/sandbox/mod.rs" = 1086
 "crates/libs/api/src/controllers/sandbox/queries.rs" = 2571
-"crates/libs/api/src/controllers/sandbox/spaced.rs" = 1113
+"crates/libs/api/src/controllers/sandbox/spaced.rs" = 1107
 "crates/libs/api/src/controllers/sandbox/updates.rs" = 1008
 "crates/libs/api/src/controllers/substrate/direct.rs" = 3907
-"crates/libs/api/src/controllers/substrate/kubernetes/adapter/substrate_adapter.rs" = 2467
+"crates/libs/api/src/controllers/substrate/kubernetes/adapter/substrate_adapter.rs" = 2344
 "crates/libs/api/src/controllers/substrate/kubernetes/execution.rs" = 1670
 "crates/libs/api/src/controllers/substrate/kubernetes/pod_ops/ensure_pod.rs" = 1111
 "crates/libs/api/src/controllers/substrate/kubernetes/support.rs" = 1018
-"crates/libs/api/src/controllers/substrate/mod.rs" = 2771
+"crates/libs/api/src/controllers/substrate/mod.rs" = 2089
 "crates/libs/api/src/fork_operation_executor.rs" = 1755
 "crates/libs/api/src/public_operations.rs" = 1787
 "crates/libs/api/src/public_sandbox_operations.rs" = 1023
@@ -53,7 +53,7 @@
 "crates/libs/internal/api/server/src/data_plane_sessions.rs" = 1780
 "crates/libs/internal/api/server/src/lib.rs" = 1222
 "crates/libs/internal/api/server/src/metadata.rs" = 1078
-"crates/libs/internal/api/server/src/published_state.rs" = 3750
+"crates/libs/internal/api/server/src/published_state.rs" = 3658
 "crates/libs/metrics/src/sandbox/api.rs" = 1036
 "crates/libs/metrics/src/sandbox/worker.rs" = 1397
 "crates/libs/net/common/src/lib.rs" = 1508
@@ -120,6 +120,7 @@
 "crates/libs/cluster/controller/server/src/tombstone_retention.rs" = 2
 "crates/libs/cluster/trigger-queue/src/lib.rs" = 1
 "crates/libs/internal/api/server/src/data_plane_sessions/route_rows.rs" = 7
+"crates/libs/internal/api/server/src/data_plane_sessions/service_route_reset.rs" = 1
 "crates/libs/internal/api/server/src/lib.rs" = 1
 "crates/libs/internal/api/server/src/published_state.rs" = 4
 "crates/libs/sandbox/store/src/lib.rs" = 2
@@ -148,12 +149,12 @@
 # and their calls to sandbox-portability's assignment renderers. They move into
 # the store; lower each cap as they go.
 [pattern_ratchet.sandbox_writes]
-"crates/libs/api/src/controllers/sandbox/lifecycle.rs" = 4
+"crates/libs/api/src/controllers/sandbox/lifecycle.rs" = 1
 "crates/libs/api/src/controllers/sandbox/queries.rs" = 4
 "crates/libs/api/src/controllers/sandbox/responses.rs" = 3
 "crates/libs/api/src/controllers/sandbox/updates.rs" = 4
 "crates/libs/api/src/controllers/sandbox/wake_completion.rs" = 1
-"crates/libs/api/src/controllers/substrate/direct.rs" = 5
+"crates/libs/api/src/controllers/substrate/direct.rs" = 6
 "crates/libs/api/src/controllers/substrate/kubernetes/store/activation_fence.rs" = 1
 "crates/libs/api/src/controllers/substrate/kubernetes/store/execution_rows.rs" = 1
 "crates/libs/api/src/controllers/substrate/kubernetes/store/pod_placement.rs" = 1
@@ -162,20 +163,14 @@
 "crates/libs/api/src/controllers/substrate/kubernetes/store/suspend.rs" = 8
 "crates/libs/api/src/controllers/substrate/mod.rs" = 1
 "crates/libs/cluster/controller/server/src/drained_node_terminator/store.rs" = 1
-"crates/libs/cluster/controller/server/src/failed_restorable_repair/store.rs" = 3
 "crates/libs/cluster/controller/server/src/node_drain/store.rs" = 15
 "crates/libs/cluster/controller/server/src/orphaned_sandboxes.rs" = 5
-"crates/libs/cluster/controller/server/src/orphaned_sandboxes/quarantine_recovery/store.rs" = 1
-"crates/libs/cluster/controller/server/src/started_sandbox_repair/store.rs" = 3
-"crates/libs/cluster/controller/server/src/suspended_execution_reaper/store.rs" = 1
 "crates/libs/cluster/controller/server/src/tombstone_retention.rs" = 1
-"crates/libs/cluster/controller/server/src/transient_lifecycle_sweeper/store.rs" = 12
+"crates/libs/cluster/controller/server/src/transient_lifecycle_sweeper/store.rs" = 2
 "crates/libs/internal/api/server/src/data_plane_sessions/service_route.rs" = 1
-"crates/libs/internal/api/server/src/published_state.rs" = 9
-"crates/libs/internal/api/server/src/sandbox_quarantine_store.rs" = 3
-"crates/libs/internal/api/server/src/status.rs" = 1
+"crates/libs/internal/api/server/src/published_state.rs" = 3
+"crates/libs/internal/api/server/src/sandbox_quarantine_store.rs" = 1
 "crates/libs/placement/machine/src/postgres.rs" = 1
-"crates/libs/sandbox/teardown/src/lib.rs" = 1
 
 # sbx-mgr code outside its SQLite store uses only the store's own handle,
 # transaction and error types, so no file is listed.

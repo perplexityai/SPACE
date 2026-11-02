@@ -30,7 +30,7 @@ use crate::{
     middleware::auth::AuthOrg,
     models::{
         CreateSandboxRequest, Organization, Sandbox, SandboxMetadata, SandboxMetadataValue,
-        SandboxResponse,
+        SandboxResponse, SandboxStateInput,
     },
 };
 
@@ -64,5 +64,7 @@ pub(crate) use translate::translate_sandbox_state;
 use translate::*;
 use types::*;
 
+#[cfg(test)]
+mod state_render_tests;
 #[cfg(test)]
 mod tests;

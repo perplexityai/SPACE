@@ -93,6 +93,7 @@ mod sandboxes;
 mod startup_recovery;
 mod state_transitions;
 mod state_write;
+mod store_job_failures;
 mod teardown_suspend;
 pub use auto_lifecycle::*;
 pub use cleanup_episodes::*;
@@ -738,6 +739,7 @@ pub mod fixture {
         crate::db::insert_sandbox(
             conn,
             crate::db::InsertSandboxParams {
+                guest_image: Default::default(),
                 id,
                 uuid8: &uuid8,
                 state,

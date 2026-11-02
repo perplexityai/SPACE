@@ -27,10 +27,16 @@
 //!   lease's holder so a standby takes over within one retry interval rather
 //!   than waiting out the TTL.
 //!
-//! Leader election only runs on the Kubernetes substrate (where there is an
-//! apiserver to host the `Lease` and where the Deployment runs multiple
-//! replicas). On the Direct substrate the process is a single local instance,
-//! so `main` runs the reconcilers unconditionally without contending.
+//! While the kill-switch leaves election enabled (the default), leader
+//! election runs when the process runs in a Kubernetes pod, where an apiserver
+//! can host the `Lease` and a Deployment may run several replicas, whichever
+//! substrate places the sandboxes; and wherever a substrate that drives the
+//! Kubernetes API runs, since its client reaches the same apiserver and the
+//! process may share the cluster with in-cluster replicas (see
+//! [`LeaderElectionConfig::election`]). Otherwise (a Direct controller outside
+//! a pod, such as on a systemd host, or the kill-switch off) `main` runs the
+//! reconcilers unconditionally without contending, which assumes a single
+//! instance.
 //!
 //! # Readiness and liveness: two different questions
 //!
@@ -212,6 +218,13 @@ const DEFAULT_LEASE_FAILURE_GRACE: Duration = Duration::from_secs(600);
 /// compiled in.
 const LEASE_FAILURE_GRACE_TEST_ENV: &str =
     "SPACE_CLUSTER_CONTROLLER_LEADER_ELECTION_LEASE_FAILURE_GRACE_SECS";
+/// Test hook (`pplx_space_common_core::env::test_hook`) for the lease TTL
+/// [`Timings::derive`] is asked for, in whole seconds; it is clamped into
+/// `MIN_LEASE_TTL..MAX_LEASE_TTL` like the default, and the retry interval
+/// and the budget's floor follow the resolved TTL. Lets a Kind scenario run
+/// the election at the TTL floor, where the budget's floor is 72 s instead of
+/// 240 s. Inert unless the `test-hooks` feature is compiled in.
+const LEASE_TTL_TEST_ENV: &str = "SPACE_CLUSTER_CONTROLLER_LEADER_ELECTION_LEASE_TTL_SECS";
 
 /// Floor for the liveness budget as a multiple of the resolved lease TTL: a
 /// budget near the lease timings would restart the pod on exactly the transients
@@ -398,7 +411,7 @@ const MIN_LEASE_TTL: Duration = Duration::from_secs(RENEW_DEADLINE_MARGIN.as_sec
 /// The election's settings, resolved once from the environment, which supplies
 /// the kill-switch and the identity (`HOSTNAME`). [`Self::lease_ttl`],
 /// [`Self::retry_interval`] and [`Self::lease_failure_grace`] are this module's
-/// defaults, and the budget alone has a test-hook override. The renewal cadence and deadline are
+/// defaults; the TTL and the budget have test-hook overrides. The renewal cadence and deadline are
 /// *derived* from the TTL, and the other two are bounded against it (see
 /// [`Timings`]), so the safety relationships hold whatever is requested.
 #[derive(Debug, Clone)]
@@ -444,11 +457,22 @@ pub struct LeaderElectionConfig {
 
 impl LeaderElectionConfig {
     /// Whether this replica contends for the leader lease before running the
-    /// reconcilers: only on a substrate whose
-    /// [`contends_for_leader_lease`](SubstrateCapabilities::contends_for_leader_lease)
-    /// is set, and only while the kill-switch leaves election enabled.
-    pub fn contends(&self, capabilities: SubstrateCapabilities) -> bool {
-        self.enabled && capabilities.contends_for_leader_lease
+    /// reconcilers: only while the kill-switch leaves election enabled, and
+    /// then when the process runs in a Kubernetes pod, whatever its substrate
+    /// (a Direct controller in a multi-replica Deployment needs the lease as
+    /// much as a Kubernetes one), or its substrate
+    /// [`uses_kubernetes_api`](SubstrateCapabilities::uses_kubernetes_api),
+    /// wherever it runs (a kubeconfig reaches the apiserver that in-cluster
+    /// replicas contend on).
+    pub fn election(&self, host: ProcessHost, capabilities: SubstrateCapabilities) -> Election {
+        if !self.enabled {
+            return Election::Skip(ElectionSkip::Disabled);
+        }
+        match host {
+            ProcessHost::Kubernetes => Election::Contend,
+            ProcessHost::OutsideKubernetes if capabilities.uses_kubernetes_api => Election::Contend,
+            ProcessHost::OutsideKubernetes => Election::Skip(ElectionSkip::OutsideKubernetes),
+        }
     }
 
     pub fn from_env() -> Self {
@@ -458,10 +482,11 @@ impl LeaderElectionConfig {
     pub(crate) fn from_environment(env: &dyn pplx_space_common_core::env::Environment) -> Self {
         let config = crate::env_config::EnvConfig(env);
         let identity = election_identity(env);
+        let requested_ttl = config.test_duration_secs(LEASE_TTL_TEST_ENV, DEFAULT_LEASE_TTL);
         let requested_grace =
             config.test_duration_secs(LEASE_FAILURE_GRACE_TEST_ENV, DEFAULT_LEASE_FAILURE_GRACE);
         let timings = Timings::derive(
-            DEFAULT_LEASE_TTL,
+            requested_ttl,
             DEFAULT_RETRY_INTERVAL,
             Some(PositiveDuration::new_panic(requested_grace)),
             &identity,
@@ -476,6 +501,76 @@ impl LeaderElectionConfig {
             readiness_file: Some(PathBuf::from("/tmp/space-cluster-controller-ready")),
             lease_failure_grace: timings.lease_failure_grace,
         }
+    }
+}
+
+/// Where this process runs, as far as the leader `Lease` is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessHost {
+    /// A Kubernetes pod: an apiserver can host the `Lease`, and the Deployment
+    /// may run several replicas.
+    Kubernetes,
+    /// Anywhere else, such as a systemd host or a workstation with a
+    /// kubeconfig. Whether such a process contends depends on its substrate;
+    /// see [`LeaderElectionConfig::election`].
+    OutsideKubernetes,
+}
+
+impl ProcessHost {
+    pub fn from_env() -> Self {
+        Self::from_environment(&pplx_space_common_core::env::ProcessEnvironment)
+    }
+
+    /// A pod is recognised by the two service variables the kubelet injects
+    /// into every container. Both must be set, the rule the kube client (after
+    /// client-go) applies before it builds an in-cluster config. A kubeconfig
+    /// does not count: it reaches an apiserver from anywhere, a workstation
+    /// included, and says nothing about how many replicas run. (A controller
+    /// on a substrate that drives the Kubernetes API contends outside a pod
+    /// anyway; [`LeaderElectionConfig::election`] decides that, not this.)
+    pub(crate) fn from_environment(env: &dyn pplx_space_common_core::env::Environment) -> Self {
+        if env.var_os("KUBERNETES_SERVICE_HOST").is_some()
+            && env.var_os("KUBERNETES_SERVICE_PORT").is_some()
+        {
+            Self::Kubernetes
+        } else {
+            Self::OutsideKubernetes
+        }
+    }
+}
+
+/// What [`LeaderElectionConfig::election`] decided for this replica.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Election {
+    /// Contend for the lease; only the holder runs the reconcilers.
+    Contend,
+    /// Run the reconcilers without the lease, which is only safe at one
+    /// replica.
+    Skip(ElectionSkip),
+}
+
+/// Why a replica runs the reconcilers without leader election.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElectionSkip {
+    /// The kill-switch turned election off.
+    Disabled,
+    /// The process does not run in a Kubernetes pod, and its substrate does
+    /// not drive the Kubernetes API.
+    OutsideKubernetes,
+}
+
+impl ElectionSkip {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "leader election disabled",
+            Self::OutsideKubernetes => "not running in Kubernetes or driving its API",
+        }
+    }
+}
+
+impl std::fmt::Display for ElectionSkip {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -728,9 +823,9 @@ pub enum ReconcilerAuthority<S: LeaseStore + Send + Sync + 'static> {
     /// This replica holds the lease. Drive the reconcilers off
     /// [`Leadership::token`] and resign when they stop.
     Leader(Leadership<S>),
-    /// Election does not apply here — the Direct substrate, or the kill-switch —
-    /// so the reconcilers run off the process shutdown token. Only safe at one
-    /// replica, which is what the chart enforces for this case.
+    /// Election does not apply here — the kill-switch, or a Direct process
+    /// outside a pod — so the reconcilers run off the process shutdown token.
+    /// Only safe at one replica, which is what the chart enforces for this case.
     ElectionDisabled,
 }
 
@@ -757,8 +852,9 @@ impl<S: LeaseStore + Send + Sync + 'static> ReconcilerAuthority<S> {
 
 /// Contend for leadership, returning once this replica has won (or shutdown
 /// fires first). While waiting as a standby, retries acquisition every
-/// [`LeaderElectionConfig::retry_interval`]. Call only when leader election is
-/// actually wanted (Kubernetes substrate + not kill-switched); `main` decides.
+/// [`LeaderElectionConfig::retry_interval`]. Call only when
+/// [`LeaderElectionConfig::election`] returns [`Election::Contend`]; `main`
+/// decides.
 pub async fn campaign<S>(
     store: Arc<S>,
     config: LeaderElectionConfig,
@@ -1162,9 +1258,9 @@ async fn reconcile_marker(path: &Path, healthy: bool) {
     }
 }
 
-/// Signal readiness directly, for the non-election path (`main` on the Direct
-/// substrate, or with the kill-switch on): the process runs the reconcilers
-/// unconditionally, so it is ready immediately.
+/// Signal readiness directly, for the non-election path (`main` when it does
+/// not contend: see [`LeaderElectionConfig::election`]): the process runs the
+/// reconcilers unconditionally, so it is ready immediately.
 ///
 /// The returned handle must be **bound**, not discarded: dropping the last one
 /// stops the writer task. Bind it for the life of the reconcilers.

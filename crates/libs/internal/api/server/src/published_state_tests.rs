@@ -1,6 +1,7 @@
 use super::*;
 use crate::ClusterApiService;
 use crate::proto::cluster_api_server::ClusterApi;
+use crate::sandbox_quarantine_store;
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{LocalArtifactId, NodeId, SandboxId};
 use pplx_space_db_test_fixtures::{insert_ready_worker_node, pg_test_db, try_pg_test_db};
@@ -126,6 +127,7 @@ async fn execution_metadata_and_node_capabilities_are_queryable() -> TestResult 
                     can_load: true,
                 })
                 .collect(),
+            version_sort_key: Vec::new(),
         }],
         components: execution
             .components()
@@ -136,6 +138,7 @@ async fn execution_metadata_and_node_capabilities_are_queryable() -> TestResult 
                 legacy_default: true,
             })
             .collect(),
+        environments: None,
     };
     let mut template = template_state();
     template.execution = Some((&execution).into());
@@ -784,5 +787,7 @@ async fn post_selection_execution_identity_change_blocks_exact_finalization() ->
 
 // This file is loaded through `#[path]`, so a bare `mod` would resolve beside
 // it in `src/` rather than under `published_state_tests/`.
+#[path = "published_state_tests/first_seen_enqueue.rs"]
+mod first_seen_enqueue;
 #[path = "published_state_tests/lifecycle_writers.rs"]
 mod lifecycle_writers;

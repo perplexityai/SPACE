@@ -18,6 +18,8 @@
 //! - T6 `t6_failed_cleanup_cleans_listed_active_executions`
 //! - T7 `t7_failed_cleanup_keeps_going_after_cleanup_failure`
 //! - T8 `t8_failed_cleanup_rotates_and_does_not_starve_later_ids`
+//! - T9 `t9_failed_cleanup_backs_off_a_retire_that_keeps_failing`
+//! - T10 `t10_failed_cleanup_failure_events_keep_the_failed_result`
 //!
 //! ## V — Verify-before-destroy (probe -> classify -> act)
 //! - V1 `v1_alive_restoring_converges_to_wake_target`
@@ -45,6 +47,7 @@
 //! - V23 `v23_alive_unroutable_restoring_without_pod_defers_no_converge`
 //! - V24 `v24_alive_routable_restoring_skips_routability_consult`
 //! - V25 `v25_routability_check_error_defers_without_converge`
+//! - V26 `v26_failed_cleanup_stops_through_the_node_only_when_one_answered`
 //!
 //! ## Crashed create — see `tests/crashed_create.rs`
 //! An alive `creating` row whose owner's activation lease expired a full age
@@ -187,6 +190,9 @@ struct FakeSinkState {
     failed_execution_cleanup_calls: Vec<SandboxId>,
     /// The pod-identity fence passed with each failed-execution cleanup.
     failed_execution_cleanup_fences: Vec<RetireFence>,
+    /// The stop route each failed-execution cleanup asked for, by sandbox, in
+    /// order, including retires that failed.
+    failed_execution_cleanup_routes: Vec<(SandboxId, RetireStopRoute)>,
     /// Failed active execution repair CAS attempts, in order.
     failed_active_repair_calls: Vec<SandboxId>,
     /// `command_ready_pending` candidates returned by
@@ -313,6 +319,14 @@ impl FakeSink {
             .insert(sandbox_id);
     }
 
+    fn clear_failed_execution_cleanup_failure(&self, sandbox_id: SandboxId) {
+        self.0
+            .lock()
+            .unwrap()
+            .failed_execution_cleanup_failures
+            .remove(&sandbox_id);
+    }
+
     fn list_calls(&self) -> Vec<(SandboxLifecycle, PositiveDuration)> {
         self.0.lock().unwrap().list_calls.clone()
     }
@@ -397,6 +411,14 @@ impl FakeSink {
             .lock()
             .unwrap()
             .failed_execution_cleanup_calls
+            .clone()
+    }
+
+    fn failed_execution_cleanup_routes(&self) -> Vec<(SandboxId, RetireStopRoute)> {
+        self.0
+            .lock()
+            .unwrap()
+            .failed_execution_cleanup_routes
             .clone()
     }
 
@@ -709,8 +731,12 @@ impl SweepSink for FakeSink {
         &self,
         sandbox_id: SandboxId,
         pod_fence: RetireFence,
+        stop_route: RetireStopRoute,
     ) -> Result<RetireExecutionOutcome, String> {
         let mut state = self.0.lock().unwrap();
+        state
+            .failed_execution_cleanup_routes
+            .push((sandbox_id, stop_route));
         let uuid = sandbox_id.as_uuid();
         if state
             .failed_execution_cleanup_failures
@@ -803,6 +829,7 @@ fn candidate(lifecycle: SandboxLifecycle) -> SweepCandidate {
         node_name: Some("node-a".to_string()),
         routable_execution: true,
         activation_abandoned: false,
+        episode_overdue: false,
         activation_attempt_held: true,
         pod_fence: pod_fence(),
     }
@@ -879,6 +906,7 @@ fn config_with_all_overrides(age: PositiveDuration) -> ReconcilerConfig {
         unrestorable_restoring_enabled: true,
         unrestorable_restoring_min_placement_age: age,
         abandoned_restore_retirement: Default::default(),
+        restoring_episode_deadline: None,
     }
 }
 
@@ -1129,6 +1157,122 @@ async fn t8_failed_cleanup_rotates_and_does_not_starve_later_ids() {
         reconciler.sink.failed_execution_cleanup_calls(),
         vec![later]
     );
+}
+
+/// T9 — a retire that keeps failing is retried after a wait that doubles up
+/// to a cap, and is neither probed nor retired while it waits, though it
+/// still rotates and its sibling is cleaned on its first tick. Once the retire
+/// succeeds the wait is forgotten.
+#[tokio::test(flavor = "current_thread")]
+async fn t9_failed_cleanup_backs_off_a_retire_that_keeps_failing() {
+    let sink = FakeSink::new();
+    let failing = SandboxId::new();
+    let sibling = SandboxId::new();
+    sink.enqueue_failed_cleanup(vec![failed_candidate(failing), failed_candidate(sibling)]);
+    sink.set_probe_verdict(failing, ProbeVerdict::DeadOnNode);
+    sink.set_probe_verdict(sibling, ProbeVerdict::DeadOnNode);
+    sink.enqueue_failed_execution_cleanup_failure(failing);
+    let reconciler = Reconciler::new(
+        ReconcilerConfig {
+            enabled: false,
+            failed_cleanup_enabled: true,
+            ..ReconcilerConfig::default()
+        },
+        sink,
+    );
+
+    let mut failed_ticks = Vec::new();
+    for tick in 1..=40 {
+        let report = reconciler.tick().await;
+        if report.failed_cleanup_failures > 0 {
+            failed_ticks.push(tick);
+        }
+        assert_eq!(
+            report.failed_cleanup_failures + report.failed_cleanup_backed_off,
+            1,
+            "tick {tick}: the failing sandbox is either retried or waiting: {report:?}"
+        );
+    }
+    assert_eq!(failed_ticks, vec![1, 2, 4, 8, 16, 32]);
+    let probed_failing = reconciler
+        .sink
+        .probe_calls()
+        .iter()
+        .filter(|(_, ids)| ids.contains(&failing))
+        .count();
+    assert_eq!(
+        probed_failing,
+        failed_ticks.len(),
+        "a waiting sandbox is not probed"
+    );
+    let rotations = reconciler.sink.failed_cleanup_attempts();
+    assert_eq!(
+        rotations.iter().filter(|id| **id == failing).count(),
+        40,
+        "a waiting sandbox still rotates"
+    );
+    // The sibling's retire succeeds, and the fake keeps listing it; it is
+    // retried on every tick, never waiting.
+    assert_eq!(
+        reconciler
+            .sink
+            .failed_execution_cleanup_calls()
+            .iter()
+            .filter(|id| **id == sibling)
+            .count(),
+        40
+    );
+
+    // The fault clears. The capped wait after the failure on tick 32 runs to
+    // tick 48, where the retire succeeds, and the fake keeps listing the
+    // sandbox: on tick 49 it is retried at once.
+    reconciler
+        .sink
+        .clear_failed_execution_cleanup_failure(failing);
+    let mut cleaned_ticks = Vec::new();
+    for tick in 41..=49 {
+        let report = reconciler.tick().await;
+        if report.failed_cleanup_attempts == 2 {
+            cleaned_ticks.push(tick);
+        }
+    }
+    assert_eq!(cleaned_ticks, vec![48, 49]);
+}
+
+/// T10 — every `cleanup_failed` event a retire that keeps failing is
+/// reported with carries `result = failed`, so a filter on the result still
+/// matches the sandbox that stays stuck. Only the last one, at the cap, is
+/// marked persistent, and after it there are none.
+#[test]
+fn t10_failed_cleanup_failure_events_keep_the_failed_result() {
+    let sandbox_id = SandboxId::new();
+    let mut backoff = failed_cleanup_backoff::FailedCleanupBackoff::default();
+    let events: Vec<_> = (0..failed_cleanup_backoff::QUIET_AFTER_FAILURES + 2)
+        .map(|_| {
+            backoff.start_tick();
+            failed_cleanup_failure_event(backoff.record_failure(sandbox_id), "retire failed")
+        })
+        .collect();
+    let reported: Vec<_> = events.iter().flatten().collect();
+    assert_eq!(
+        reported.len(),
+        failed_cleanup_backoff::QUIET_AFTER_FAILURES as usize,
+        "failures after the persistent report emit no event"
+    );
+    for (index, details) in reported.iter().enumerate() {
+        assert_eq!(details.result.as_deref(), Some("failed"), "event {index}");
+        assert_eq!(
+            details.error.as_deref(),
+            Some("retire failed"),
+            "event {index}"
+        );
+        let last = index + 1 == reported.len();
+        assert_eq!(
+            details.persistent,
+            last.then_some(true),
+            "only the event at the cap is marked persistent: event {index}"
+        );
+    }
 }
 
 // -----------------------------------------------------------------
@@ -1535,6 +1679,28 @@ async fn v5_missing_restoring_with_ready_snapshot_reverts() {
     assert_eq!(report.aged_out, 0);
     assert_eq!(reconciler.sink.revert_calls(), vec![missing_id]);
     assert_eq!(reconciler.sink.cleanup_calls(), vec![missing_id]);
+}
+
+/// A revert reports the deadline as its reason only for a candidate the
+/// deadline let through; every other revert reports its snapshot.
+#[test]
+fn a_revert_reports_the_deadline_only_when_it_let_the_row_through() {
+    let ordinary = SweepCandidate {
+        ready_snapshot: true,
+        ..candidate(SandboxLifecycle::Restoring)
+    };
+    let overdue = SweepCandidate {
+        episode_overdue: true,
+        ..ordinary.clone()
+    };
+    assert_eq!(
+        restoring_episode::revert_reason(&ordinary),
+        "recoverable_snapshot"
+    );
+    assert_eq!(
+        restoring_episode::revert_reason(&overdue),
+        "restoring_episode_deadline"
+    );
 }
 
 /// V6 — a probe error downgrades every candidate on that node to
@@ -2125,6 +2291,69 @@ async fn v25_routability_check_error_defers_without_converge() {
     assert!(reconciler.sink.cleanup_calls().is_empty());
 }
 
+/// V26 — the failed-cleanup retire asks for the node route only when a node
+/// answered the probe that permits it, for each verdict that does. An
+/// execution that names no node is `missing_on_node` without a probe, so
+/// there is no node-api to stop it through, and its retire keeps the
+/// execution's own route, as does the retire of an abandoned create's live
+/// VM.
+#[tokio::test(flavor = "current_thread")]
+async fn v26_failed_cleanup_stops_through_the_node_only_when_one_answered() {
+    let sink = FakeSink::new();
+    let probed = SandboxId::new();
+    let dormant = SandboxId::new();
+    let missing = SandboxId::new();
+    let node_less = SandboxId::new();
+    let alive_create = SandboxId::new();
+    sink.enqueue_failed_cleanup(vec![
+        failed_candidate(probed),
+        failed_candidate(dormant),
+        failed_candidate(missing),
+        FailedCleanupCandidate {
+            node_name: None,
+            ..failed_candidate(node_less)
+        },
+        FailedCleanupCandidate {
+            first_activation: FirstActivation::Abandoned,
+            ..failed_candidate(alive_create)
+        },
+    ]);
+    sink.set_probe_verdict(probed, ProbeVerdict::DeadOnNode);
+    sink.set_probe_verdict(dormant, ProbeVerdict::DormantWithLocalArtifact);
+    sink.set_probe_verdict(missing, ProbeVerdict::MissingOnNode);
+    sink.set_probe_verdict(alive_create, ProbeVerdict::AliveOnNode);
+    let reconciler = Reconciler::new(
+        ReconcilerConfig {
+            enabled: false,
+            failed_cleanup_enabled: true,
+            ..ReconcilerConfig::default()
+        },
+        sink,
+    );
+
+    let report = reconciler.tick().await;
+
+    assert_eq!(report.failed_cleanup_attempts, 5, "{report:?}");
+    assert!(
+        reconciler
+            .sink
+            .probe_calls()
+            .iter()
+            .all(|(_, ids)| !ids.contains(&node_less)),
+        "an execution that names no node is not probed"
+    );
+    assert_eq!(
+        reconciler.sink.failed_execution_cleanup_routes(),
+        vec![
+            (probed, RetireStopRoute::Node),
+            (dormant, RetireStopRoute::Node),
+            (missing, RetireStopRoute::Node),
+            (node_less, RetireStopRoute::Execution),
+            (alive_create, RetireStopRoute::Execution),
+        ]
+    );
+}
+
 // -----------------------------------------------------------------
 // CRP — command-ready-pending reaper (heal vs reap)
 // -----------------------------------------------------------------
@@ -2580,22 +2809,26 @@ fn f5_only_an_observed_pod_yields_a_verifiable_fence() {
 
 mod activation_owner;
 mod crashed_create;
+mod episode_deadline;
+mod failed_cleanup_stop_route;
 
 mod postgres_backed {
 
     use super::super::store::{
-        AgedTransientRow, HEAL_COMMAND_READY_PENDING_SQL, LIST_COMMAND_READY_PENDING_SQL,
-        LIST_FAILED_ACTIVE_EXECUTIONS_SQL, NOTE_FAILED_CLEANUP_ATTEMPT_SQL,
-        REAP_COMMAND_READY_PENDING_SQL, REPAIR_FAILED_ACTIVE_EXECUTION_SQL,
-        converge_restoring_query, fail_candidate_query, fail_unrestorable_restoring_query,
+        AgedTransientRow, LIST_COMMAND_READY_PENDING_SQL, LIST_FAILED_ACTIVE_EXECUTIONS_SQL,
+        NOTE_FAILED_CLEANUP_ATTEMPT_SQL, REPAIR_FAILED_ACTIVE_EXECUTION_SQL, fail_candidate_query,
         failed_active_execution_scope, list_aged_transient_query,
-        list_unrestorable_restoring_query, revert_to_suspended_query,
-        undo_revert_to_suspended_query,
+        list_unrestorable_restoring_query,
     };
     use super::*;
     use pplx_space_common_core::types::SandboxLifecycle;
     use pplx_space_common_core::types::{NodeId, SandboxId, SnapshotId, SubstrateKind};
     use pplx_space_db_test_fixtures::try_pg_test_db;
+    use pplx_space_sandbox_store::sweeper::{
+        HEAL_COMMAND_READY_PENDING_SQL, REAP_COMMAND_READY_PENDING_SQL, converge_restoring_query,
+        fail_unrestorable_restoring_query, revert_to_suspended_query,
+        undo_revert_to_suspended_query,
+    };
     use sqlx::PgPool;
 
     use pplx_space_test_env::TestResult;
@@ -2645,6 +2878,7 @@ mod postgres_backed {
                         .bind(1_i64)
                         .bind(1000_i64)
                         .bind(SubstrateKind::Kubernetes)
+                        .bind(None::<i64>)
                         .fetch_all(&db.pool)
                         .await?;
                 assert!(candidates.iter().all(|row| row.id != id));
@@ -2778,6 +3012,7 @@ mod postgres_backed {
                 .bind(age_secs)
                 .bind(1000_i64)
                 .bind(SubstrateKind::Kubernetes)
+                .bind(None::<i64>)
                 .fetch_all(pool)
                 .await?,
         )
@@ -2986,6 +3221,7 @@ mod postgres_backed {
         .bind(60_i64)
         .bind(1000_i64)
         .bind(SubstrateKind::Kubernetes)
+        .bind(None::<i64>)
         .fetch_all(pool)
         .await?;
         let listed_ids: Vec<SandboxId> = listed.into_iter().map(|row| row.id).collect();
@@ -3352,6 +3588,7 @@ mod postgres_backed {
         .bind(60_i64)
         .bind(1000_i64)
         .bind(SubstrateKind::Kubernetes)
+        .bind(None::<i64>)
         .fetch_all(pool)
         .await?;
         let fact = |id: SandboxId| {
@@ -4130,6 +4367,8 @@ mod postgres_backed {
                 .bind(lifecycle.to_string())
                 .bind(60_i64)
                 .bind(sandbox_id)
+                .bind(None::<i64>)
+                .bind(SubstrateKind::Kubernetes)
                 .fetch_optional(pool)
                 .await?,
         )

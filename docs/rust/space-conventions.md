@@ -178,11 +178,14 @@ sqlx::query_scalar::<_, NodeId>(sql!(
 
 The statement stays syntactically whole, as the store rules require: new code
 writes whole statements with bound values, not fragments around the value.
-The started- and failed-restorable repair `row_state_guards` helpers and the
-shared `routable_execution_or_non_k8s` routability fragment
-(`crates/libs/sandbox/routability/src/lib.rs`) take their
-placeholder as an argument only because they are existing fragments; they are
-not a pattern for new code. Read a `managed_by` column back as `SubstrateKind`
+The started- and failed-restorable repair guard builders
+(`started_repair_row_state_guards` and `failed_repair_row_state_guards` in
+`crates/libs/sandbox/store/src/repair.rs`, public only because the cluster
+controller's candidate scans compose them) and the shared
+`routable_execution_or_non_k8s` routability fragment
+(`crates/libs/sandbox/routability/src/lib.rs`) take their placeholder as an
+argument only because they are existing fragments; they are not a pattern for
+new code. Read a `managed_by` column back as `SubstrateKind`
 rather than comparing strings. Where one bad row must not fail the batch, read
 it as text and parse it per row, as `orphaned_restore_pod_gc` does: a typed
 decode fails the whole `fetch_all` on an unrecognized value. Test fixtures may
@@ -463,6 +466,11 @@ run locally without root, it prints a SKIPPED line, and when CI sets
 test missing from the group fails the unprivileged half instead of passing
 there without testing anything. Keep the group small; a test that needs
 privilege only for an incidental step should lose that step instead.
+A test of what an unprivileged caller is refused has the opposite need, since
+root bypasses permission checks: call
+`pplx_space_test_env::unprivileged_or_skip(...)` and return when it returns
+false, so a root run prints a SKIPPED line instead of passing silently. The
+unprivileged CI step refuses to run as root, so these tests run there.
 
 The group's filter has one clause per line. The job checks that each clause
 matches at least one test and that every test it matches is in the group, so

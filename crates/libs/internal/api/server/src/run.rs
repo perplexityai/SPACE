@@ -27,6 +27,10 @@ pub const SERVICE_NAME: &str = "space-cluster-api";
 /// the sideline pool rather than to the general one.
 const VISIBILITY_POOL_APPLICATION_NAME: &str = "space-cluster-api-visibility";
 
+/// Application name of the runtime environment catalog sideline pool, distinct
+/// for the same `pg_stat_activity` attribution.
+const RUNTIME_CATALOG_POOL_APPLICATION_NAME: &str = "space-cluster-api-runtime-catalog";
+
 /// Where the binary's `--listen` default points, exposed so the flag's default
 /// lives next to the code that binds it.
 pub const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:9800";
@@ -59,6 +63,20 @@ const VISIBILITY_POOL_MAX_CONNECTIONS: std::num::NonZeroU32 =
 /// field to UNSPECIFIED. Applied per connection on this pool only, so no other
 /// `space_user` query is affected.
 const VISIBILITY_POOL_STATEMENT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(500);
+
+/// Connection ceiling for the runtime environment catalog sideline pool. The
+/// read is one primary-key scan of a table of a few rows, once per admitted
+/// node per tick, so two connections cover steady state while capping what a
+/// blocked `runtime_environments` read can hold.
+const RUNTIME_CATALOG_POOL_MAX_CONNECTIONS: std::num::NonZeroU32 =
+    std::num::NonZeroU32::new(2).expect("2 is non-zero");
+
+/// Server-side `statement_timeout` for the runtime environment catalog sideline
+/// pool, chosen as for [`VISIBILITY_POOL_STATEMENT_TIMEOUT`]: anything near it
+/// is a relation lock, not work, and a cancelled read only omits the recipe
+/// from that response.
+const RUNTIME_CATALOG_POOL_STATEMENT_TIMEOUT: std::time::Duration =
     std::time::Duration::from_millis(500);
 
 const SPACE_NODE_ID_ENV: &str = "SPACE_NODE_ID";
@@ -105,6 +123,8 @@ pub enum RunInternalApiError {
     Pool(#[source] pplx_space_common_svc::sql::DatabaseConnectOptionsError),
     #[error("failed to initialize the cluster API template-visibility pool")]
     VisibilityPool(#[source] pplx_space_common_svc::sql::DatabaseConnectOptionsError),
+    #[error("failed to initialize the cluster API runtime environment catalog pool")]
+    RuntimeCatalogPool(#[source] pplx_space_common_svc::sql::DatabaseConnectOptionsError),
     #[error("failed to build the cluster API reflection service")]
     Reflection(#[from] tonic_reflection::server::Error),
     #[error("failed to initialize ClusterApiService")]
@@ -334,6 +354,28 @@ pub async fn run(
     .await
     .map_err(RunInternalApiError::ClusterApiService)?
     .with_visibility_pool(visibility_pool);
+    // The provisioning recipe's catalog read is best-effort too: a failed read
+    // omits the recipe and still serves the policy. Sidelined so a blocked
+    // `runtime_environments` read can't drain the pool the policy and node
+    // authentication reads use. Built only while recipes are served: a lazy
+    // pool still keeps its minimum connections open, and with the setting off
+    // nothing reads the catalog.
+    if svc.serves_provisioning_recipes() {
+        let runtime_catalog_pool =
+            pplx_space_common_svc::sql::connect_space_user_sideline_pool_lazy(
+                &database_url,
+                RUNTIME_CATALOG_POOL_APPLICATION_NAME,
+                RUNTIME_CATALOG_POOL_MAX_CONNECTIONS,
+                Some(RUNTIME_CATALOG_POOL_STATEMENT_TIMEOUT),
+            )
+            .map_err(RunInternalApiError::RuntimeCatalogPool)?;
+        tracing::info!(
+            max_connections = RUNTIME_CATALOG_POOL_MAX_CONNECTIONS,
+            statement_timeout_ms = RUNTIME_CATALOG_POOL_STATEMENT_TIMEOUT.as_millis(),
+            "prepared lazy runtime environment catalog database pool"
+        );
+        svc = svc.with_runtime_catalog_pool(runtime_catalog_pool);
+    }
     svc.ingress_activation = Some(activation);
     let node_info = ClusterNodeInfoService::new(node_id);
     let publisher_auth =

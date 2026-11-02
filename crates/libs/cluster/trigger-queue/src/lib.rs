@@ -9,6 +9,9 @@ use pplx_space_common_svc::types::{
 };
 use sqlx::{FromRow, PgPool};
 
+mod reconcile_refs;
+pub use reconcile_refs::{QueuedReconcileRefs, QueuedRefConflict, queue_node_reconcile_refs};
+
 const TRIGGER_CLAIM_STALE_SECS: i64 = 60;
 const TRIGGER_MAX_ATTEMPTS: i32 = 16;
 const TRIGGER_FAILURE_BACKOFF_MAX_SECS: i32 = 60;

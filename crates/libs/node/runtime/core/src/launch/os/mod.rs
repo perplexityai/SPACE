@@ -8,6 +8,15 @@ pub use linux::*;
 #[cfg(not(target_os = "linux"))]
 pub use other::*;
 
+/// The default limit on the jailer run in [`launch_via_jailer`], which ends
+/// once the jailer has built the chroot, cgroups and namespaces and daemonized
+/// Firecracker. That work copies the Firecracker binary and writes cgroup
+/// files, so it slows down with the rest of a loaded node, as the pidfile and
+/// API-socket waits after it do. Those waits allow 5 s each; a tighter limit
+/// on the jailer alone would fail launches that every later stage would have
+/// let finish.
+pub const DEFAULT_JAILER_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// A lifetime witness without signaling authority. The namespace runner must
 /// observe itself across fork, where the signalable handle's self-PID guard
 /// deliberately does not apply.

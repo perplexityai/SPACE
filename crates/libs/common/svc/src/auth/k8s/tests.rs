@@ -77,7 +77,7 @@ async fn data_plane_identity_cannot_reuse_guest_authority_for_control_or_transfe
             ("/space.node.api.v1.WorkerApi/ServicePortIngress", true),
             ("/space.node.api.v1.NodeInfo/GetNodeInfo", true),
             ("/space.node.api.v1.WorkerApi/CreateSandboxSnapshot", false),
-            ("/space.node.api.v1.WorkerApi/ListSandboxes", false),
+            ("/space.node.api.v1.WorkerApi/KillSandbox", false),
             (
                 "/space.node.api.v1.WorkerApi/SpacedFuturePrivilegedMethod",
                 false,
@@ -311,7 +311,7 @@ async fn peer_node_identity_is_confined_to_template_export() {
         reviewer_returning_status(config, token_review_status("space-node-api", username));
     let token = projected_token();
     for (method, allowed) in [
-        ("/space.node.api.v1.WorkerApi/ListSandboxes", false),
+        ("/space.node.api.v1.WorkerApi/KillSandbox", false),
         ("/space.node.api.v1.WorkerApi/NodeExportTemplate", true),
         ("/space.node.api.v1.WorkerApi/SandboxState", false),
         ("/space.node.api.v1.WorkerApi/SandboxStats", false),
@@ -351,7 +351,7 @@ async fn peer_node_identity_is_confined_to_template_export() {
         .unwrap();
     for (method, allowed) in [
         ("/space.node.api.v1.BuilderApi/NodeExportTemplate", true),
-        ("/space.node.api.v1.BuilderApi/SandboxState", false),
+        ("/space.node.api.v1.BuilderApi/DeleteTemplate", false),
         ("/space.node.api.v1.BuilderApi/BuildTemplate", false),
         ("/space.node.api.v1.WorkerApi/NodeExportTemplate", false),
     ] {

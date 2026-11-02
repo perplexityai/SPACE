@@ -423,7 +423,8 @@ where
                     .await
                 }
                 "FinalizeArtifactBackup" => {
-                    answer(request, |_: api::FinalizeArtifactBackupRequest| {
+                    answer(request, |request: api::FinalizeArtifactBackupRequest| {
+                        super::retired_teardown_tests::record_finalized_backup(&request);
                         Ok(api::FinalizeArtifactBackupResponse::default())
                     })
                     .await
@@ -462,6 +463,8 @@ where
 /// How the fake vol-mgr's transfers stand when the worker asks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Transfers {
+    /// As vol-mgr refuses new pushes while it hands off.
+    Refused,
     Running,
     Completed,
     /// As vol-mgr reports a transfer whose retries ran out during an
@@ -498,7 +501,10 @@ impl FakeVolumeManager {
             async move {
                 Ok::<_, std::convert::Infallible>(match method.as_str() {
                     "SubmitPushFile" => {
-                        answer(request, |_: vol::PushFileRequest| {
+                        answer(request, move |_: vol::PushFileRequest| {
+                            if transfers == Transfers::Refused {
+                                return Err(Status::unavailable("volume-manager is handing off"));
+                            }
                             Ok(vol::SubmitTransferResponse {
                                 job_id: JobId::new().to_string(),
                             })
@@ -508,7 +514,9 @@ impl FakeVolumeManager {
                     "GetTransferJob" => {
                         answer(request, move |request: vol::GetTransferJobRequest| {
                             let (status, error) = match transfers {
-                                Transfers::Running => (vol::TransferJobStatus::Running, None),
+                                Transfers::Refused | Transfers::Running => {
+                                    (vol::TransferJobStatus::Running, None)
+                                }
                                 Transfers::Completed => (vol::TransferJobStatus::Completed, None),
                                 Transfers::Failed => (
                                     vol::TransferJobStatus::Failed,
@@ -589,35 +597,43 @@ struct NodeLocalSuspended {
 
 const GENERATION: i64 = 7;
 
-async fn suspended_after_node_local_upload(
-    upload: NodeLocalUpload,
+/// A node-local suspend of a paused Kubernetes sandbox, up to the result of
+/// handing its published capture to an upload. The real worker runs that
+/// upload against `volume_manager`.
+struct NodeLocalHandoff {
+    service: SandboxManagerService,
+    artifact_id: LocalArtifactId,
+    snapshot_dir: std::path::PathBuf,
+    handoff: Result<SubmitSuspendSnapshotOutcome, Status>,
+}
+
+/// Suspend `sandbox_id` up to its backup handoff. The runtime probe reads the
+/// scratch run directory, where nothing runs, unless `runtime_live`.
+async fn node_local_handoff(
+    sandbox_id: SandboxId,
     volume_manager: &FakeVolumeManager,
     scratch: &std::path::Path,
-) -> NodeLocalSuspended {
+    runtime_live: bool,
+) -> NodeLocalHandoff {
     use crate::service::tests::service_tests::{insert_test_sandbox, runtime_fields};
     use pplx_space_common_core::types::ExecutionGeneration;
 
     let conn = crate::db::test_conn();
-    let sandbox_id = match upload {
-        NodeLocalUpload::RegistrationRefused => SandboxId::from_uuid(REFUSED_SANDBOX),
-        NodeLocalUpload::RegistrationRecovers => SandboxId::from_uuid(RECOVERING_SANDBOX),
-        _ => SandboxId::new(),
-    };
     let id = sandbox_id.to_string();
-    let generation = ExecutionGeneration::new(GENERATION).unwrap();
     insert_test_sandbox(&conn, &id, SandboxState::Paused);
-    let mut fields = runtime_fields(generation, 7);
+    let mut fields = runtime_fields(ExecutionGeneration::new(GENERATION).unwrap(), 7);
     fields.space_api_route_identity.substrate_kind =
         Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes);
     crate::db::update_runtime_fields(&conn, sandbox_id, fields).unwrap();
     assert!(crate::db::begin_suspend(&conn, &id).unwrap());
-    let service = SandboxManagerService::new_with_options(
-        conn,
-        SandboxManagerServiceOptions {
-            volume_manager_socket_path: volume_manager.socket.clone(),
-            ..SandboxManagerServiceOptions::for_test_in(scratch)
-        },
-    );
+    let mut options = SandboxManagerServiceOptions {
+        volume_manager_socket_path: volume_manager.socket.clone(),
+        ..SandboxManagerServiceOptions::for_test_in(scratch)
+    };
+    if runtime_live {
+        options.sandbox_runtime_live = std::sync::Arc::new(|_| true);
+    }
+    let service = SandboxManagerService::new_with_options(conn, options);
     let artifact_id = LocalArtifactId::new();
     let snapshot_dir = scratch.join("suspend");
     crate::service::suspend_snapshot_publication::write_full_suspend_artifact(
@@ -636,6 +652,34 @@ async fn suspended_after_node_local_upload(
             SuspendSnapshotFormat::Full,
         )
         .await;
+    NodeLocalHandoff {
+        service,
+        artifact_id,
+        snapshot_dir,
+        handoff,
+    }
+}
+
+async fn suspended_after_node_local_upload(
+    upload: NodeLocalUpload,
+    volume_manager: &FakeVolumeManager,
+    scratch: &std::path::Path,
+) -> NodeLocalSuspended {
+    use pplx_space_common_core::types::ExecutionGeneration;
+
+    let sandbox_id = match upload {
+        NodeLocalUpload::RegistrationRefused => SandboxId::from_uuid(REFUSED_SANDBOX),
+        NodeLocalUpload::RegistrationRecovers => SandboxId::from_uuid(RECOVERING_SANDBOX),
+        _ => SandboxId::new(),
+    };
+    let id = sandbox_id.to_string();
+    let generation = ExecutionGeneration::new(GENERATION).unwrap();
+    let NodeLocalHandoff {
+        service,
+        artifact_id,
+        snapshot_dir,
+        handoff,
+    } = node_local_handoff(sandbox_id, volume_manager, scratch, false).await;
     match upload {
         // The refusal would roll a real suspend back when the handoff meets
         // it; one only the worker meets leaves the suspend published, which
@@ -1015,4 +1059,150 @@ async fn teardown_after_node_local_upload(upload: NodeLocalUpload) {
         }
     }
     super::retired_teardown_tests::drain(&service).await;
+}
+
+/// The backup attempt an upload job carries.
+fn backup_attempt(job: &pplx_space_common_jobs::Job) -> String {
+    job.payload_as::<crate::snapshot_upload::SnapshotUploadJobs>()
+        .unwrap()
+        .snapshot_id
+}
+
+/// How a node-local suspend whose backup handoff vol-mgr refused stands when
+/// the upload it persisted finalizes.
+#[derive(Clone, Copy, Debug)]
+enum AfterRefusedHandoff {
+    /// Rolled back to `paused` with its runtime live, and still there.
+    Paused,
+    /// Rolled back to `paused`, then another suspend of it began.
+    Resuspends,
+    /// Quarantined, because no runtime was live to roll back to.
+    Quarantined,
+    /// Quarantined over its live runtime, as the failure is when rolling it
+    /// back to `paused` fails.
+    QuarantinedLive,
+}
+
+/// Refuse a node-local suspend's handoff, let `after` happen, and return the
+/// backup attempt of the upload that then finalizes.
+async fn upload_after_refused_handoff(after: AfterRefusedHandoff) -> String {
+    use pplx_space_common_jobs::JobStatus;
+
+    let volume_manager = FakeVolumeManager::serve(Transfers::Refused);
+    let scratch = tempfile::tempdir().unwrap();
+    let sandbox_id = SandboxId::new();
+    let id = sandbox_id.to_string();
+    let runtime_live = !matches!(after, AfterRefusedHandoff::Quarantined);
+    let NodeLocalHandoff {
+        service,
+        artifact_id,
+        handoff,
+        ..
+    } = node_local_handoff(sandbox_id, &volume_manager, scratch.path(), runtime_live).await;
+    if matches!(after, AfterRefusedHandoff::QuarantinedLive) {
+        // The quarantine the failure falls back to when the rollback's write
+        // fails; the test can't fail that write.
+        handoff.expect_err("vol-mgr refuses the handoff's pushes");
+        let db = service.db.lock().unwrap();
+        assert!(crate::db::mark_suspending_quarantined(&db, &id, "rollback failed").unwrap());
+    } else {
+        service
+            .require_node_local_backup_handoff(&id, artifact_id, handoff)
+            .expect_err("vol-mgr refuses the handoff's pushes");
+    }
+    let expected = match after {
+        AfterRefusedHandoff::Paused => SandboxState::Paused,
+        AfterRefusedHandoff::Resuspends => {
+            let db = service.db.lock().unwrap();
+            assert!(crate::db::begin_suspend(&db, &id).unwrap());
+            SandboxState::Suspending
+        }
+        AfterRefusedHandoff::Quarantined | AfterRefusedHandoff::QuarantinedLive => {
+            SandboxState::Quarantined
+        }
+    };
+
+    // vol-mgr takes the pushes again; the upload's retry stages and
+    // completes the capture.
+    volume_manager.report(Transfers::Completed);
+    let upload = only_upload(&service, &id);
+    let completed = ended(&service, &upload.job_id, JobStatus::Completed).await;
+    assert_eq!(service.lookup_sandbox(&id).unwrap().state, expected);
+    super::retired_teardown_tests::drain(&service).await;
+    backup_attempt(&completed)
+}
+
+/// A node-local suspend whose backup handoff meets a vol-mgr refusing pushes
+/// rolls back to `paused` with its runtime resident, while the upload it
+/// persisted goes on. When vol-mgr takes the pushes again, that upload
+/// finalizes ready and reports the suspend uncommitted, so the control plane
+/// doesn't project the row `suspended` over the runtime. It does so whether the
+/// sandbox stayed paused or another suspend has begun since, and when the
+/// suspend was quarantined instead, with its runtime live or not, since nothing
+/// on the node settles a quarantined VM. An upload whose suspend committed
+/// finalizes without that report.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_of_a_rolled_back_suspend_reports_it_uncommitted() {
+    use super::retired_teardown_tests::{FinalizedBackup, finalized_backups, with_cluster_api};
+    use pplx_space_common_jobs::JobStatus;
+
+    with_cluster_api(BackupControlPlane::default(), async || {
+        let committed = async {
+            let scratch = tempfile::tempdir().unwrap();
+            let volume_manager = FakeVolumeManager::serve(Transfers::Running);
+            let suspended = suspended_after_node_local_upload(
+                NodeLocalUpload::Running,
+                &volume_manager,
+                scratch.path(),
+            )
+            .await;
+            volume_manager.report(Transfers::Completed);
+            let completed = ended(
+                &suspended.service,
+                &suspended.node_local,
+                JobStatus::Completed,
+            )
+            .await;
+            super::retired_teardown_tests::drain(&suspended.service).await;
+            backup_attempt(&completed)
+        };
+        // Each refused handoff's upload waits out a retry backoff; run the
+        // cases side by side.
+        let ((paused, resuspended), (quarantined, quarantined_live), committed) =
+            futures_util::future::join3(
+                futures_util::future::join(
+                    Box::pin(upload_after_refused_handoff(AfterRefusedHandoff::Paused)),
+                    Box::pin(upload_after_refused_handoff(
+                        AfterRefusedHandoff::Resuspends,
+                    )),
+                ),
+                futures_util::future::join(
+                    Box::pin(upload_after_refused_handoff(
+                        AfterRefusedHandoff::Quarantined,
+                    )),
+                    Box::pin(upload_after_refused_handoff(
+                        AfterRefusedHandoff::QuarantinedLive,
+                    )),
+                ),
+                Box::pin(committed),
+            )
+            .await;
+
+        let mut finalized = finalized_backups();
+        finalized.sort_by(|a, b| a.backup_attempt_id.cmp(&b.backup_attempt_id));
+        let mut expected = [
+            (paused, true),
+            (resuspended, true),
+            (quarantined, true),
+            (quarantined_live, true),
+            (committed, false),
+        ]
+        .map(|(backup_attempt_id, suspend_uncommitted)| FinalizedBackup {
+            backup_attempt_id,
+            suspend_uncommitted,
+        });
+        expected.sort_by(|a, b| a.backup_attempt_id.cmp(&b.backup_attempt_id));
+        assert_eq!(finalized, expected);
+    })
+    .await;
 }

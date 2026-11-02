@@ -42,7 +42,7 @@ use pplx_space_common_svc::space_api_route::wait_ready_lifecycle_request;
 use pplx_space_metrics::warm_pool::{
     ProbeOutcome, ProbeStep, ProbeStepOutcome, PromoteOutcome, SlotDeleteReason,
 };
-use pplx_space_sandbox_teardown::finalize_sandbox_db_delete_tx;
+use pplx_space_sandbox_store::delete::delete_with_dependents;
 use pplx_space_sbx_mgr_client::proto::SpacedWaitReadyRequest;
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::{
@@ -2052,7 +2052,7 @@ impl Reconciler {
         }
         self.timed_postgres(
             "cleanup-pending-finalize-sandbox-delete",
-            finalize_sandbox_db_delete_tx(&mut tx, slot.reserved_sandbox_id),
+            delete_with_dependents(&mut tx, slot.reserved_sandbox_id),
         )
         .await?;
         self.timed_postgres(

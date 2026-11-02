@@ -85,8 +85,8 @@ use super::{
     ExecutionIdentity, ExecutionRoutabilityCheck, NODE_RPC_TIMEOUT, NodeApiTarget,
     NodeInventoryEntry, ObservedPod, ObservedPodIdentity, OwnedNodeApiTarget, PodFenceMismatch,
     PodIdentityFence, RecordedExecution, RetireExecutionOutcome, RetireExecutionRequest,
-    RetireFence, RuntimeClient, SubstrateAdapter, SubstrateCapabilities, SubstrateError,
-    TeardownProgress, WaitReadyTimeoutPhase, connect_worker, node_api_endpoint,
+    RetireFence, RetireStopRoute, RuntimeClient, SubstrateAdapter, SubstrateCapabilities,
+    SubstrateError, TeardownProgress, WaitReadyTimeoutPhase, connect_worker, node_api_endpoint,
 };
 
 const START_WAIT_FAST_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -100,6 +100,13 @@ const START_WAIT_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 /// barrier. Keep a hung manager from consuming the command-readiness budget.
 const RESIDENT_WAKE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const START_WAIT_COMMAND_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+/// How much longer than [`START_WAIT_COMMAND_PROBE_TIMEOUT`] the pooled
+/// readiness poll lets one probe run. The node starts that wait only after it
+/// connects to the guest's host agent, and sbx-mgr retries the host agent's
+/// `DeadlineExceeded`, so a probe for a guest that stays not ready runs until
+/// this client deadline ends it. The margin lets a guest that turns ready
+/// shortly after the requested wait answer the first probe.
+const START_WAIT_COMMAND_PROBE_CLIENT_MARGIN: Duration = Duration::from_secs(1);
 const POD_WORKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// The first dial to a sandbox pod's kept channel from a Native data-plane
 /// request. An in-cluster pod answers a SYN within milliseconds, so one that
@@ -427,6 +434,9 @@ pub struct KubernetesState {
     /// Whether a failed restore claim's rollback retires its execution
     /// (`SPACE_ABANDONED_RESTORE_RETIREMENT_ENABLED`, default off).
     pub abandoned_restore_retirement: super::AbandonedRestoreRetirement,
+    /// Whether resume and start decide a runtime upgrade
+    /// (`SPACE_RUNTIME_UPGRADE_AT_ACTIVATION_ENABLED`, default off).
+    pub runtime_upgrade_at_activation: super::runtime_upgrade::RuntimeUpgradeAtActivation,
     pub caches: Arc<K8sCaches>,
 }
 
@@ -480,6 +490,8 @@ impl KubernetesState {
             create_data_plane_ready_timeout,
             k8s_blocking_delete_timeout: DEFAULT_K8S_BLOCKING_DELETE_TIMEOUT,
             abandoned_restore_retirement: super::AbandonedRestoreRetirement::from_env(),
+            runtime_upgrade_at_activation:
+                super::runtime_upgrade::RuntimeUpgradeAtActivation::from_env(),
             sandbox_proxy_port: DEFAULT_SANDBOX_PROXY_PORT,
             node_api_port: DEFAULT_SANDBOX_PROXY_PORT,
             sandbox_pod_config: SandboxPodConfigValues::from_env()?,
@@ -865,6 +877,9 @@ pub struct KubernetesSubstrate {
     /// directly so a join's re-check interval is settable in tests;
     /// production takes the default, which is those constants.
     recovery_join_backoff: execution::RecoveryJoinBackoffPolicy,
+    /// The runtime environment policy the resume- and start-time upgrade
+    /// decision reads, shared by clones.
+    runtime_policy: super::runtime_upgrade::RuntimePolicyCache,
     /// Readiness, preserve-decision, suspend and connect budgets. Production
     /// takes the default, which is the constants each one names.
     budgets: SubstrateBudgets,
@@ -918,6 +933,7 @@ impl KubernetesSubstrate {
                     node_group_placement,
                     cancel_tracker: CancelRateTracker::with_default_budget(),
                     recovery_join_backoff: execution::RecoveryJoinBackoffPolicy::default(),
+                    runtime_policy: super::runtime_upgrade::RuntimePolicyCache::default(),
                     budgets: SubstrateBudgets::default(),
                     shutdown_token,
                     task_tracker,
@@ -1240,6 +1256,7 @@ mod node_sync;
 mod per_sandbox_setup;
 mod pod_ops;
 mod pool;
+mod runtime_upgrade;
 #[cfg(test)]
 pub(crate) mod scripted_test_doubles;
 mod support;

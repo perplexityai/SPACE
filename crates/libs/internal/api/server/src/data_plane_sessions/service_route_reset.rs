@@ -36,16 +36,21 @@ pub(crate) async fn reset_sandbox_service_route(
         .await
         .map_err(|error| Status::internal(format!("begin reset sandbox service route: {error}")))?;
 
+    // The caller's generation is the one the service-route resolver handed
+    // out, so it is resolved as the shared route readers resolve it: a Direct
+    // sandbox has no execution row, and its generation is its route identity's.
     let reset = sqlx::query_as::<_, UnstableResetSandboxServiceRouteRow>(sql!(
         "WITH current_route AS (
              SELECT s.id AS sandbox_id, s.active_node_id
              FROM sandboxes s
-             JOIN sandbox_k8s_executions e
+             LEFT JOIN sandbox_k8s_executions e
                ON e.sandbox_id = s.id
               AND e.active
-              AND e.generation = $3
+             LEFT JOIN sandbox_direct_route_identities direct_route
+               ON direct_route.sandbox_id = s.id
              WHERE s.id = $1
                AND s.active_node_id IS NOT NULL
+               AND COALESCE(e.generation, direct_route.execution_generation) = $3
          ),
          updated AS (
              UPDATE sandbox_port_exposures spe
@@ -102,48 +107,15 @@ pub(super) async fn enqueue_sandbox_desired_state_reconcile_tx(
     active_node_id: NodeId,
 ) -> Result<(), Status> {
     let reference = ReconcileRef::sandbox_desired_state(sandbox_id);
-    sqlx::query(sql!(
-        "INSERT INTO node_reconcile_queue (
-             node_id,
-             facet,
-             element,
-             requested_at,
-             updated_at
-         )
-         VALUES ($1, $2, $3, NOW(), NOW())
-         ON CONFLICT (node_id, facet, element) DO UPDATE
-         SET generation = node_reconcile_queue.generation + 1,
-             requested_at = CASE
-                 WHEN node_reconcile_queue.dead_at IS NOT NULL
-                 THEN EXCLUDED.requested_at
-                 ELSE node_reconcile_queue.requested_at
-             END,
-             next_attempt_at = CASE
-                 WHEN node_reconcile_queue.dead_at IS NOT NULL
-                 THEN NOW()
-                 WHEN node_reconcile_queue.claim_token = ''
-                      AND node_reconcile_queue.attempts = 0
-                 THEN NOW()
-                 ELSE node_reconcile_queue.next_attempt_at
-             END,
-             attempts = CASE
-                 WHEN node_reconcile_queue.dead_at IS NOT NULL THEN 0
-                 ELSE node_reconcile_queue.attempts
-             END,
-             last_error = CASE
-                 WHEN node_reconcile_queue.dead_at IS NOT NULL
-                      OR node_reconcile_queue.attempts = 0
-                 THEN ''
-                 ELSE node_reconcile_queue.last_error
-             END,
-             dead_at = NULL,
-             dead_reason = '',
-             updated_at = NOW()"
-    ))
-    .bind(active_node_id.as_uuid())
-    .bind(reference.facet_str())
-    .bind(reference.element_string().unwrap_or_default())
-    .execute(&mut **tx)
+    queue_node_reconcile_refs(
+        &mut **tx,
+        &[active_node_id],
+        &[(
+            reference.facet_str().to_string(),
+            reference.element_string().unwrap_or_default(),
+        )],
+        QueuedRefConflict::KeepProgress,
+    )
     .await
     .map_err(|error| Status::internal(format!("enqueue sandbox route reconcile: {error}")))?;
 

@@ -709,3 +709,322 @@ async fn a_stop_that_cant_open_its_claim_is_refused() {
         .unwrap();
     assert_eq!(f.row().state, SandboxState::Started);
 }
+
+/// A Wake that carries `upgrade`, shaped as the control plane sends one.
+fn upgrade_wake(
+    sandbox_id: &str,
+    upgrade: Option<crate::proto::WakeRuntimeUpgrade>,
+) -> crate::proto::WakeRequest {
+    crate::proto::WakeRequest {
+        sandbox_id: sandbox_id.to_string(),
+        blocking: true,
+        start_context: Some(crate::proto::WakeStartContext {
+            route_identity: Some(crate::proto::SpaceApiRouteIdentity {
+                sandbox_id: Some(sandbox_id.to_string()),
+                route_generation: Some(1),
+                current_node_id: Some(uuid::Uuid::now_v7().to_string()),
+                substrate_kind: crate::proto::SandboxSubstrateKind::Direct as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        runtime_upgrade: upgrade,
+        ..Default::default()
+    }
+}
+
+/// The environment the compiled catalog certifies an upgrade edge to from
+/// `source`.
+fn certified_target(source: &ExecutionMetadata) -> ExecutionMetadata {
+    use pplx_space_node_runtime_core::catalog::CompiledEnvironment;
+    let compiled =
+        CompiledEnvironment::for_architecture(pplx_space_common_core::types::Arch::X86_64).unwrap();
+    let target = CompiledEnvironment::of_execution(&compiled, source)
+        .unwrap()
+        .upgrade_targets()[0];
+    compiled
+        .iter()
+        .find(|environment| environment.definition().reference() == target)
+        .unwrap()
+        .definition()
+        .execution_requirements()
+        .unwrap()
+}
+
+fn wake_upgrade_to(
+    target: &ExecutionMetadata,
+    operation_id: &str,
+) -> crate::proto::WakeRuntimeUpgrade {
+    crate::proto::WakeRuntimeUpgrade {
+        operation_id: operation_id.to_string(),
+        target_environment: target.environment().unwrap().to_string(),
+        authorization: Some(crate::proto::RuntimeUpgradeAuthorization {
+            authorization_id: "environment-block".into(),
+            reason: "the source environment is blocked".into(),
+            memory_loss: true,
+        }),
+        checkpoint_local_artifact_id: None,
+    }
+}
+
+#[tokio::test]
+async fn a_wake_carrying_an_upgrade_runs_the_upgrade_instead_of_a_start() {
+    // The fake answers the upgrade's disk copy but not its target
+    // resolution, so the upgrade fences, preserves the disk under the Wake's
+    // operation id and rolls back before booting. That shows the Wake ran
+    // the upgrade rather than a plain start, and left the old pair.
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let (deleted, created) = (calls.clone(), calls.clone());
+    let node = FakeNodeManager::default()
+        .unary(
+            "DeleteBtrfsSnapshot",
+            move |request: DeleteBtrfsSnapshotRequest| {
+                recording(&deleted, format!("delete {}", request.snapshot_name));
+                Err::<DeleteBtrfsSnapshotResponse, _>(Status::not_found("absent"))
+            },
+        )
+        .unary(
+            "CreateBtrfsSnapshot",
+            move |request: CreateBtrfsSnapshotRequest| {
+                recording(&created, format!("create {}", request.snapshot_name));
+                Ok(CreateBtrfsSnapshotResponse {})
+            },
+        );
+    let f = fixture(SandboxState::Stopped, false, node);
+    let target = certified_target(&f.source);
+    let operation_id = uuid::Uuid::now_v7().to_string();
+    let preserved = format!("d-operation-runtime-upgrade-{operation_id}");
+
+    let error = f
+        .service
+        .wake(crate::service::activation_support::internal_request(
+            upgrade_wake(&f.sandbox_id, Some(wake_upgrade_to(&target, &operation_id))),
+        ))
+        .await
+        .expect_err("the harness can't boot a sandbox");
+
+    assert!(error.message().contains("rolled back"), "{error}");
+    assert_eq!(
+        *calls.lock().unwrap(),
+        [
+            format!("delete {preserved}"),
+            format!("create {preserved}"),
+            format!("delete {preserved}"),
+        ],
+        "{error}"
+    );
+    // The failed boot left the old pair: stopped, unfenced and bound to the
+    // environment it ran under.
+    let row = f.row();
+    assert_eq!(row.state, SandboxState::Stopped, "{error}");
+    assert_eq!(
+        row.execution_metadata
+            .as_ref()
+            .and_then(ExecutionMetadata::environment),
+        f.source.environment()
+    );
+    assert_eq!(
+        crate::db::read::runtime_upgrade_fence(&f.service.db.lock().unwrap(), &f.sandbox_id)
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn a_wake_upgrade_of_a_sandbox_already_on_its_target_wakes_it_as_usual() {
+    // Nothing answers the upgrade's node work, so reaching any of it fails
+    // the test; a sandbox already on the target goes straight to its start.
+    let f = fixture(SandboxState::Stopped, false, FakeNodeManager::default());
+    crate::db::upsert_sandbox_execution_metadata(
+        &f.service.db.lock().unwrap(),
+        &f.sandbox_id,
+        &f.target,
+    )
+    .unwrap();
+    let plain = f
+        .service
+        .wake(crate::service::activation_support::internal_request(
+            upgrade_wake(&f.sandbox_id, None),
+        ))
+        .await
+        .expect_err("the harness can't boot a sandbox");
+    let upgraded = f
+        .service
+        .wake(crate::service::activation_support::internal_request(
+            upgrade_wake(
+                &f.sandbox_id,
+                Some(wake_upgrade_to(
+                    &f.target,
+                    &uuid::Uuid::now_v7().to_string(),
+                )),
+            ),
+        ))
+        .await
+        .expect_err("the harness can't boot a sandbox");
+    assert_eq!(upgraded.code(), plain.code(), "{upgraded} / {plain}");
+    assert_eq!(upgraded.message(), plain.message());
+    assert!(
+        !f._node
+            .calls()
+            .iter()
+            .any(|call| call.contains("BtrfsSnapshot") || call.contains("InstanceSnapshot")),
+        "{:?}",
+        f._node.calls()
+    );
+}
+
+#[tokio::test]
+async fn a_wake_upgrade_must_be_an_internal_blocking_started_wake() {
+    let f = fixture(SandboxState::Stopped, false, FakeNodeManager::default());
+    let upgrade = || {
+        Some(wake_upgrade_to(
+            &f.target,
+            &uuid::Uuid::now_v7().to_string(),
+        ))
+    };
+    let mut without_context = upgrade_wake(&f.sandbox_id, upgrade());
+    without_context.start_context = None;
+    let mut nonblocking = upgrade_wake(&f.sandbox_id, upgrade());
+    nonblocking.blocking = false;
+    let mut paused = upgrade_wake(&f.sandbox_id, upgrade());
+    paused.target_state = crate::proto::WakeTargetState::Paused as i32;
+    let mut stopped = upgrade_wake(&f.sandbox_id, upgrade());
+    stopped.target_state = crate::proto::WakeTargetState::Stopped as i32;
+    let mut unparsable = upgrade_wake(&f.sandbox_id, upgrade());
+    unparsable
+        .runtime_upgrade
+        .as_mut()
+        .unwrap()
+        .target_environment = "not-a-reference".into();
+    let mut unauthorized = upgrade_wake(&f.sandbox_id, upgrade());
+    unauthorized.runtime_upgrade.as_mut().unwrap().authorization = None;
+    for (case, request) in [
+        ("without start_context", without_context),
+        ("nonblocking", nonblocking),
+        ("paused", paused),
+        ("stopped", stopped),
+        ("unparsable target", unparsable),
+        ("no authorization", unauthorized),
+    ] {
+        let error = f
+            .service
+            .wake(crate::service::activation_support::internal_request(
+                request,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code(),
+            tonic::Code::InvalidArgument,
+            "{case}: {error}"
+        );
+    }
+    assert_eq!(f.row().state, SandboxState::Stopped);
+    assert!(f._node.calls().is_empty(), "{:?}", f._node.calls());
+}
+
+#[tokio::test]
+async fn staging_for_an_upgrade_leaves_a_present_sandbox_alone() {
+    let f = fixture(SandboxState::Suspended, false, FakeNodeManager::default());
+    f.service
+        .stage_missing_checkpoint(crate::proto::StartRequest {
+            sandbox_id: f.sandbox_id.clone(),
+            checkpoint: Some("suspend".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(f.row().state, SandboxState::Suspended);
+    assert!(f._node.calls().is_empty(), "{:?}", f._node.calls());
+}
+
+#[test]
+fn every_caller_allowed_a_wake_start_context_may_also_upgrade() {
+    // A Wake's upgrade runs as its caller, so the Wake checks the upgrade's
+    // authority too; today it never refuses a caller the start context
+    // admitted, and this pins that the two lists stay in step.
+    for principal in crate::service::ALLOW_SANDBOX_START_CONTEXT {
+        assert!(
+            crate::service::ALLOW_SANDBOX_RUNTIME_UPGRADE
+                .iter()
+                .any(|allowed| principal.satisfies(*allowed)),
+            "{principal:?}"
+        );
+    }
+}
+
+/// A suspended Wake upgrade naming another node as the checkpoint's source
+/// and a backup to stage, as the control plane sends for a pod placed away
+/// from the checkpoint.
+fn remote_upgrade_wake(
+    f: &Fixture,
+    checkpoint: Option<LocalArtifactId>,
+) -> crate::proto::WakeRequest {
+    let target = certified_target(&f.source);
+    let mut upgrade = wake_upgrade_to(&target, &uuid::Uuid::now_v7().to_string());
+    upgrade.checkpoint_local_artifact_id = checkpoint.map(|id| id.to_string());
+    let mut request = upgrade_wake(&f.sandbox_id, Some(upgrade));
+    let context = request.start_context.as_mut().unwrap();
+    context.suspend_restore_source_node = Some("another-node".into());
+    context.suspend_restore_storage_uri = Some("s3://bucket/newer-checkpoint".into());
+    request
+}
+
+#[tokio::test]
+async fn a_wake_upgrade_never_boots_a_checkpoint_other_than_the_one_decided_on() {
+    // A stale copy: the row pins another artifact than the checkpoint the
+    // upgrade was decided from. An upgrade naming no checkpoint has nothing
+    // to check the copy against, whatever placement says.
+    // (named checkpoint, whether the row pins a checkpoint of its own)
+    for (decided, pinned) in [
+        (Some(LocalArtifactId::new()), true),
+        (None, true),
+        (None, false),
+    ] {
+        let f = fixture(SandboxState::Suspended, false, FakeNodeManager::default());
+        if pinned {
+            f.adopt_checkpoint();
+        }
+        let error = f
+            .service
+            .wake(crate::service::activation_support::internal_request(
+                remote_upgrade_wake(&f, decided),
+            ))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+        assert!(error.message().contains("decided from"), "{error}");
+        assert_eq!(f.row().state, SandboxState::Suspended);
+        assert!(f._node.calls().is_empty(), "{:?}", f._node.calls());
+        assert_eq!(
+            crate::db::read::runtime_upgrade_fence(&f.service.db.lock().unwrap(), &f.sandbox_id)
+                .unwrap(),
+            None
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_wake_upgrade_boots_the_checkpoint_it_was_decided_from_wherever_it_was_staged() {
+    // The row pins the decided checkpoint, as staging it here leaves it, so
+    // the upgrade proceeds although the restore names another source node.
+    let f = fixture(SandboxState::Suspended, false, FakeNodeManager::default());
+    let checkpoint = f.adopt_checkpoint();
+    let error = f
+        .service
+        .wake(crate::service::activation_support::internal_request(
+            remote_upgrade_wake(&f, Some(checkpoint)),
+        ))
+        .await
+        .unwrap_err();
+    // It reached the upgrade's node work, which this fake doesn't answer.
+    assert!(
+        f._node
+            .calls()
+            .iter()
+            .any(|call| call.contains("BtrfsSnapshot")),
+        "{error}: {:?}",
+        f._node.calls()
+    );
+}

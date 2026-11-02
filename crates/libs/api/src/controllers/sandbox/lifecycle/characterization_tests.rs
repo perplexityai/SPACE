@@ -179,6 +179,11 @@ async fn start_sim_worker(pool: &PgPool) -> TestResult<(SimWorkerHarness, NodeId
         .with_internal_api()
         .start()
         .await?;
+    register_direct_worker(pool, node_id, harness.endpoint()).await?;
+    Ok((harness, node_id))
+}
+
+async fn register_direct_worker(pool: &PgPool, node_id: NodeId, endpoint: &str) -> TestResult {
     sqlx::query(sql!(
         "INSERT INTO nodes (id, address, role, managed_by, state)
          VALUES ($1, '127.0.0.1', 'worker', 'space', 'ready')"
@@ -190,10 +195,10 @@ async fn start_sim_worker(pool: &PgPool) -> TestResult<(SimWorkerHarness, NodeId
         "INSERT INTO node_direct (node_id, node_api_endpoint) VALUES ($1, $2)"
     ))
     .bind(node_id)
-    .bind(harness.endpoint())
+    .bind(endpoint)
     .execute(pool)
     .await?;
-    Ok((harness, node_id))
+    Ok(())
 }
 
 async fn insert_resident(state: &SimState, sandbox_id: SandboxId, status: &str) -> TestResult {
@@ -319,7 +324,6 @@ async fn non_lifecycle_actions_are_bad_requests_and_write_nothing() -> TestResul
     // Direct is only a placeholder here: this test never reaches the substrate.
     let controller = direct_controller(pool);
     let internal_labels = [
-        SandboxAction::Access,
         SandboxAction::Stats,
         SandboxAction::OpenPort,
         SandboxAction::Rollback,
@@ -1297,6 +1301,129 @@ async fn untracked_actions_report_status_and_leave_the_row() -> TestResult {
             "{action:?}"
         );
     }
+    Ok(())
+}
+
+/// Records every Wake and the bearer it arrived with. It serves only the
+/// internal worker service, so a call that reached any other one fails.
+#[derive(Clone, Default)]
+struct RecordingInternalWorker {
+    wakes: std::sync::Arc<std::sync::Mutex<Vec<RecordedWake>>>,
+}
+
+type RecordedWake = (
+    WakeRequest,
+    Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
+);
+
+#[tonic::async_trait]
+impl pplx_space_node_api_client::proto::worker_api_internal_server::WorkerApiInternal
+    for RecordingInternalWorker
+{
+    async fn adopt_pool_sandbox(
+        &self,
+        _request: tonic::Request<pplx_space_sbx_mgr_client::proto::AdoptPoolSandboxRequest>,
+    ) -> Result<
+        tonic::Response<pplx_space_sbx_mgr_client::proto::AdoptPoolSandboxResponse>,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented("not used by this test"))
+    }
+
+    async fn wake_sandbox(
+        &self,
+        request: tonic::Request<WakeRequest>,
+    ) -> Result<tonic::Response<pplx_space_sbx_mgr_client::proto::WakeResponse>, tonic::Status>
+    {
+        let bearer = request.metadata().get("authorization").cloned();
+        let request = request.into_inner();
+        self.wakes.lock().unwrap().push((request.clone(), bearer));
+        Ok(tonic::Response::new(
+            pplx_space_sbx_mgr_client::proto::WakeResponse {
+                sandbox_id: request.sandbox_id,
+                transition: pplx_space_sbx_mgr_client::proto::WakeTransition::Resume as i32,
+                route_identity: None,
+            },
+        ))
+    }
+}
+
+/// With no row to build a start context from, an untracked wake sends the
+/// worker's internal Wake a bare request under the control-plane bearer,
+/// the call a tracked wake makes with its context.
+#[tokio::test(flavor = "current_thread")]
+async fn untracked_wake_uses_the_internal_worker_wake() -> TestResult {
+    use pplx_space_common_svc::bearer_token::{SpaceBearerToken, space_bearer_metadata};
+    use pplx_space_node_api_client::proto::worker_api_internal_server::WorkerApiInternalServer;
+
+    if !crate::test_support::enter_sim_worker_process_with_owned_token_files() {
+        return Ok(());
+    }
+    let db = pg_test_db_with_max_connections(3).await?;
+    let pool = &db.pool;
+    let controller = direct_controller(pool);
+    let worker = RecordingInternalWorker::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = listener.local_addr()?.to_string();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let server = tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(WorkerApiInternalServer::new(worker.clone()))
+            .serve_with_incoming_shutdown(
+                tonic::transport::server::TcpIncoming::from(listener),
+                shutdown.clone().cancelled_owned(),
+            ),
+    );
+    let node_id = NodeId::new();
+    register_direct_worker(pool, node_id, &endpoint).await?;
+
+    let explicit = SandboxId::new();
+    let implicit = SandboxId::new();
+    let activity = ExecutionActivityKind::Command;
+    for (sandbox_id, action) in [
+        (explicit, SandboxAction::Wake),
+        (implicit, SandboxAction::ImplicitWake(activity)),
+    ] {
+        insert_sandbox(pool, sandbox_id, "created", "space").await?;
+        place_on_node(pool, sandbox_id, node_id).await?;
+        let body = Box::pin(run_action(
+            &controller,
+            pool,
+            sandbox_id,
+            None,
+            action,
+            None,
+        ))
+        .await?;
+        assert_eq!(body["status"], "started", "{action:?}");
+    }
+    shutdown.cancel();
+    server.await??;
+
+    let control_bearer = space_bearer_metadata(SpaceBearerToken::NodeApiInternal)?;
+    let wakes = worker.wakes.lock().unwrap().clone();
+    assert_eq!(
+        wakes,
+        [
+            (
+                WakeRequest {
+                    sandbox_id: explicit.to_string(),
+                    blocking: true,
+                    ..Default::default()
+                },
+                Some(control_bearer.clone()),
+            ),
+            (
+                WakeRequest {
+                    sandbox_id: implicit.to_string(),
+                    blocking: true,
+                    implicit_wake_source: activity.wake_source(),
+                    ..Default::default()
+                },
+                Some(control_bearer),
+            ),
+        ]
+    );
     Ok(())
 }
 

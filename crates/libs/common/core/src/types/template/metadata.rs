@@ -77,6 +77,8 @@ use serde::{Deserialize, Serialize};
 pub const TEMPLATE_METADATA_SCHEMA_VERSION: u32 = 2;
 /// Environment-bound documents require readers that preserve the binding.
 pub const BOUND_TEMPLATE_METADATA_SCHEMA_VERSION: u32 = 3;
+/// Non-default image handling requires readers that understand the guest contract.
+pub const GUEST_TEMPLATE_METADATA_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum TemplateMetadataSchemaError {
@@ -88,6 +90,10 @@ pub enum TemplateMetadataSchemaError {
     LegacyExecution,
     #[error("template schema and execution environment binding disagree")]
     EnvironmentBinding,
+    #[error(
+        "guest image contract must match schema version 4, a bound environment and its disk requirements"
+    )]
+    GuestImageContract,
 }
 
 /// Typed view of `metadata.json` carried with every template build.
@@ -119,6 +125,14 @@ pub struct TemplateMetadata {
         serde(default, skip_serializing_if = "Option::is_none")
     )]
     pub execution: Option<crate::types::ExecutionMetadata>,
+
+    /// Omitted for legacy Linux images. Version 4 prevents old readers from
+    /// applying ext4 tools or waiting for an absent guest agent.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub guest_image: Option<pplx_space_execution_spec::guest_image::GuestImageContract>,
 
     /// Logical template identifier (matches the directory under
     /// `/space/cache/templates/`).
@@ -236,33 +250,60 @@ pub struct TemplateMetadata {
 
 impl TemplateMetadata {
     pub fn set_execution_metadata(&mut self, execution: crate::types::ExecutionMetadata) {
-        self.schema_version = Some(if execution.environment().is_some() {
+        self.execution = Some(execution);
+        self.refresh_schema_version();
+    }
+    pub fn set_guest_image(
+        &mut self,
+        image: Option<pplx_space_execution_spec::guest_image::GuestImageContract>,
+    ) {
+        self.guest_image = image;
+        self.refresh_schema_version();
+    }
+    fn refresh_schema_version(&mut self) {
+        self.schema_version = Some(if self.guest_image.is_some() {
+            GUEST_TEMPLATE_METADATA_SCHEMA_VERSION
+        } else if self
+            .execution
+            .as_ref()
+            .is_some_and(|execution| execution.environment().is_some())
+        {
             BOUND_TEMPLATE_METADATA_SCHEMA_VERSION
         } else {
             TEMPLATE_METADATA_SCHEMA_VERSION
         });
-        self.execution = Some(execution);
     }
 
     pub fn execution_metadata(
         &self,
     ) -> Result<Option<&crate::types::ExecutionMetadata>, TemplateMetadataSchemaError> {
+        if self.guest_image.is_some()
+            != (self.schema_version == Some(GUEST_TEMPLATE_METADATA_SCHEMA_VERSION))
+        {
+            return Err(TemplateMetadataSchemaError::GuestImageContract);
+        }
         match (self.schema_version, self.execution.as_ref()) {
             (None, None) => Ok(None),
             (None, Some(_)) => Err(TemplateMetadataSchemaError::LegacyExecution),
             (Some(version), Some(execution))
                 if version == TEMPLATE_METADATA_SCHEMA_VERSION
-                    || version == BOUND_TEMPLATE_METADATA_SCHEMA_VERSION =>
+                    || version == BOUND_TEMPLATE_METADATA_SCHEMA_VERSION
+                    || version == GUEST_TEMPLATE_METADATA_SCHEMA_VERSION =>
             {
                 if execution.environment().is_some()
-                    != (version == BOUND_TEMPLATE_METADATA_SCHEMA_VERSION)
+                    != (version == BOUND_TEMPLATE_METADATA_SCHEMA_VERSION
+                        || version == GUEST_TEMPLATE_METADATA_SCHEMA_VERSION)
                 {
                     return Err(TemplateMetadataSchemaError::EnvironmentBinding);
                 }
                 Ok(Some(execution))
             }
             (
-                Some(TEMPLATE_METADATA_SCHEMA_VERSION | BOUND_TEMPLATE_METADATA_SCHEMA_VERSION),
+                Some(
+                    TEMPLATE_METADATA_SCHEMA_VERSION
+                    | BOUND_TEMPLATE_METADATA_SCHEMA_VERSION
+                    | GUEST_TEMPLATE_METADATA_SCHEMA_VERSION,
+                ),
                 None,
             ) => Err(TemplateMetadataSchemaError::MissingExecution),
             (Some(version), _) => Err(TemplateMetadataSchemaError::UnsupportedVersion(version)),

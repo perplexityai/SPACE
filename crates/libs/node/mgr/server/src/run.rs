@@ -784,6 +784,7 @@ pub async fn run(
         // leaves execution unchanged; each mutation rechecks its own prerequisites.
         // Leftover deletion runs separately from readiness.
         service.prepare_artifact_store().await;
+        service.start_guest_network_reconciler();
 
         let sandbox_cgroup_vcpu_count = sandbox_cgroup_config
             .vcpu_count

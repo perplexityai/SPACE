@@ -88,6 +88,11 @@ pub enum BtrfsError {
         timeout: Duration,
     },
 
+    /// Another in-process probe of the same kind was still running, possibly
+    /// a timed-out child not yet reaped, so this one did not start.
+    #[error("btrfs {op} {path} not started: another probe is still running")]
+    ProbeBusy { op: &'static str, path: PathBuf },
+
     /// `open(path, O_RDONLY)` failed when preparing for an ioctl. Usually
     /// "no such file" if the caller hands us a path that doesn't exist
     /// yet, or `EPERM`/`EACCES` if the helper isn't running as root.
@@ -496,10 +501,9 @@ pub fn read_filesystem_usage(path: &Path) -> Result<FilesystemUsage, BtrfsError>
     let op = "filesystem usage --raw";
     let Some(probe_guard) = ProbeInFlightGuard::try_acquire(&FILESYSTEM_USAGE_PROBE_IN_FLIGHT)
     else {
-        return Err(BtrfsError::CliTimedOut {
+        return Err(BtrfsError::ProbeBusy {
             op,
             path: path.to_path_buf(),
-            timeout: BTRFS_FILESYSTEM_USAGE_TIMEOUT,
         });
     };
     let out = command_output_with_timeout_guarded(

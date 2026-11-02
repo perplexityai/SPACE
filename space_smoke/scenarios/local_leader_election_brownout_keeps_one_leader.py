@@ -7,7 +7,8 @@ import space_smoke as smoke
 # main and on every PR whose paths select the Kind smoke in Pull CI. It waits
 # out the controller's liveness budget twice, once with the control-plane
 # apiserver deliberately down and once with a refused contender, at the floor
-# the run requests through the controller's test hook. The faults and the
+# of the shortest lease TTL, both requested through the controller's test
+# hooks. The faults and the
 # budget are captured and undone by this run; the Kind mutation Lease keeps
 # cooperating smokes off the cluster meanwhile. See
 # space_smoke/leader_election.py for what is read where.
@@ -18,6 +19,9 @@ import space_smoke as smoke
     # timeout while the apiserver is down.
     sandbox=smoke.SandboxConfig(timeout=3600),
     telemetry_mode="otel",
+    test_hooks="SPACE_CLUSTER_CONTROLLER_LEADER_ELECTION_LEASE_TTL_SECS and "
+    "SPACE_CLUSTER_CONTROLLER_LEADER_ELECTION_LEASE_FAILURE_GRACE_SECS, which it sets to their "
+    "floors; at the release TTL and budget each budget wait is minutes longer",
 )
 def leader_election_brownout_keeps_one_leader(test: smoke.KindEcw) -> None:
     """With the liveness budget at its floor for this run, two Ready
@@ -34,14 +38,14 @@ def leader_election_brownout_keeps_one_leader(test: smoke.KindEcw) -> None:
     reconciler tick count in Prometheus, both replicas are Ready, and the
     contender stays NotReady and is not restarted for a full liveness budget
     while the pair keeps its holder. The standing budget is put back last.
-    Expected wall time about 13 minutes."""
+    Expected wall time about 7 minutes."""
 
     election = test.leader_election
 
     with test.phase("preflight: two replicas, election on, otel; hold the mutation Lease"):
         election.take_ownership()
 
-    with test.phase("request the liveness budget's floor and await the controller rollout"):
+    with test.phase("request the lease TTL's and liveness budget's floors; await the rollout"):
         election.shrink_liveness_budget()
 
     with test.phase("two Ready replicas and a Lease holder renewing among them"):

@@ -156,6 +156,26 @@ visibilityCache:
   ttlSeconds: ""
   staleCeilingSeconds: ""
 
+# Runtime environment desired state that GetNodeRuntimeDesiredState serves to
+# nodes ("Cluster desired policy" and "Node runtime provisioning" in
+# docs/execution-environments.md). Every key is empty, which renders no env var
+# and leaves the binary's default in force: both settings off. Quote the scalar
+# values, as for visibilityCache above.
+runtimeDesiredState:
+  # SPACE_INTERNAL_API_RUNTIME_DESIRED_STATE_ENABLED: serve the cluster
+  # execution environment policy.
+  executionPolicyEnabled: ""
+  # SPACE_INTERNAL_API_RUNTIME_PROVISIONING_RECIPE_ENABLED: serve the
+  # provisioning recipe to the cohort the next two keys admit. Separate from the
+  # policy, so each is turned on and off on its own.
+  provisioningRecipeEnabled: ""
+  # SPACE_INTERNAL_API_RUNTIME_PROVISIONING_CANARY_NODES: nodes admitted by the
+  # name they report (the Kubernetes node name here) or their node ID.
+  provisioningCanaryNodes: []
+  # SPACE_INTERNAL_API_RUNTIME_PROVISIONING_PERCENT: whole percentage, "0" to
+  # "100", of nodes admitted by a stable hash of their node ID.
+  provisioningPercent: ""
+
 # Ingress activation must use the same substrate and pod configuration as the API.
 k8s:
   # The API's sandbox namespace (space-api-local's k8s.sandboxNamespace).

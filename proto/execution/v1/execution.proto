@@ -84,6 +84,10 @@ message RuntimeInstallation {
   RuntimeIdentity runtime = 1;
   repeated GuestPlatform supported_guests = 2;
   repeated StateFormatCapability state_formats = 3;
+  // The runtime driver's ordering key for this release, compared element-wise
+  // and only within one runtime kind. Empty when the driver defines no order
+  // for the version, or the node predates this field.
+  repeated uint32 version_sort_key = 4;
 }
 
 message ArtifactComponentInstallation {
@@ -99,6 +103,35 @@ message NodeExecutionInventory {
   // policy. Independent of installed/usable artifacts. Absence means unknown
   // support, never implicit E0 approval.
   ExecutionPolicyObservation policy = 3;
+  // Absent from nodes that predate environment observations. Absence means
+  // unknown, never an empty catalog or a node with nothing usable.
+  EnvironmentObservation environments = 4;
+}
+
+// Which environments this node's build certifies and which it can run. Usable
+// is not executable: the policy observation says what this node admits.
+message EnvironmentObservation {
+  uint32 schema_version = 1;
+  // Every environment compiled into this node's catalog, whatever its policy.
+  repeated KnownEnvironment known = 2;
+  // Known environments this node can cold boot: its startup policy allows
+  // them, and a new cold boot resolves to them from verified artifacts. This
+  // is evidence, not a reservation. Cluster policy and freshness are for the
+  // reader to apply, and restore readiness isn't covered.
+  repeated string usable_environments = 3;
+}
+
+message KnownEnvironment {
+  // A generic schema-2 definition; observations never use the historical
+  // schema-1 representation.
+  EnvironmentDefinition definition = 1;
+  // Ordering key of the environment's runtime release; see
+  // RuntimeInstallation.version_sort_key.
+  repeated uint32 runtime_version_sort_key = 2;
+  // Known environments this one is certified to be cold-boot upgraded to.
+  repeated string upgrade_edges = 3;
+  // Upgrade targets also certified to restore this environment's checkpoints.
+  repeated string memory_edges = 4;
 }
 
 message ExecutionPolicyObservation {

@@ -225,6 +225,10 @@ async fn invalid_requests_fail_before_hickory_lookup() {
             query("allowed.example", RecordType::TXT),
             ResponseCode::NotImp,
         ),
+        (
+            query("_http._tcp.service.example", RecordType::SRV),
+            ResponseCode::NotImp,
+        ),
         (non_in.to_vec().unwrap(), ResponseCode::NotImp),
         (non_in_aaaa.to_vec().unwrap(), ResponseCode::NotImp),
         (response.to_vec().unwrap(), ResponseCode::FormErr),
@@ -236,11 +240,20 @@ async fn invalid_requests_fail_before_hickory_lookup() {
         ),
     ] {
         let reply = resolve_wire(&core, "1.1.1.1", &wire, &policy).await;
-        assert_eq!(response_code(&reply), expected);
-        assert_eq!(
-            response_code(&core.udp_capacity_response("test", ReservedResolver::Cloudflare, &wire)),
-            expected
-        );
+        let capacity_reply =
+            core.udp_capacity_response("test", ReservedResolver::Cloudflare, &wire);
+        for reply in [reply, capacity_reply] {
+            let response = Message::from_vec(&reply).unwrap();
+            assert_eq!(response.metadata.response_code, expected);
+            if expected == ResponseCode::NotImp {
+                // Resolvers match errors to the original question before handling the RCODE.
+                let request = Message::from_vec(&wire).unwrap();
+                assert_eq!(response.metadata.id, request.metadata.id);
+                assert_eq!(response.queries, request.queries);
+            } else {
+                assert!(response.queries.is_empty());
+            }
+        }
     }
     assert!(resolver.requests().is_empty());
 }

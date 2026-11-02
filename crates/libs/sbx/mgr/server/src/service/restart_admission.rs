@@ -58,6 +58,24 @@ pub(super) async fn wait_for_activation_admission<T>(
     }
 }
 
+/// Run a passive observation at an activation admission boundary, abandoning
+/// it as soon as the caller disconnects. Like [`wait_for_activation_admission`],
+/// only for observations with no side effects: a lock the caller holds is then
+/// released with the caller rather than when the observation gives up.
+pub(super) async fn observe_unless_caller_cancelled<T>(
+    sandbox_id: &str,
+    observation: impl Future<Output = T>,
+) -> Result<T, tonic::Status> {
+    let cancelled = CALLER_CANCELLED.try_with(Clone::clone).unwrap_or_default();
+    tokio::select! {
+        biased;
+        _ = cancelled.cancelled() => Err(tonic::Status::cancelled(format!(
+            "activation caller disconnected before admission for sandbox {sandbox_id}"
+        ))),
+        result = observation => Ok(result),
+    }
+}
+
 /// How a guest process start ended.
 #[derive(Debug)]
 pub(super) enum GuestStartOutcome<T> {

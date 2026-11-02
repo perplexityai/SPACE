@@ -11,9 +11,12 @@ use uuid::Uuid;
 
 use super::*;
 use pplx_space_api::controllers::substrate::kubernetes::SandboxPodView;
+use pplx_space_sandbox_portability::execution_supersession::{
+    ExecutionSupersessionRow, execution_generation_superseded,
+};
 
 /// Every `restore_pod` fixture carries this execution generation; store states
-/// set `active_generation` relative to it to drive the supersession fence.
+/// set the active generation relative to it to drive the supersession fence.
 const POD_GEN: i64 = 7;
 
 // ---------------------------------------------------------------------------
@@ -158,6 +161,8 @@ struct FakeStore {
     states: HashMap<SandboxId, SandboxRestoreState>,
     recheck: HashMap<SandboxId, SandboxRestoreState>,
     calls: Mutex<HashMap<SandboxId, u32>>,
+    /// Every `(sandbox id, floor)` the store was asked for, in call order.
+    floors: Mutex<Vec<(SandboxId, i64)>>,
     /// When true, every `classify_sandboxes` call returns an error.
     fail: bool,
     /// When true, the recheck call (call index >= 1 for an id) errors.
@@ -193,16 +198,20 @@ impl FakeStore {
 impl SandboxStore for FakeStore {
     async fn classify_sandboxes(
         &self,
-        ids: &[SandboxId],
+        floors: &[(SandboxId, i64)],
     ) -> Result<HashMap<SandboxId, SandboxRestoreState>, sqlx::Error> {
         if self.fail {
             return Err(sqlx::Error::PoolClosed);
         }
+        self.floors
+            .lock()
+            .expect("floors lock")
+            .extend_from_slice(floors);
         let block = {
             let mut calls = self.calls.lock().expect("calls lock");
             let mut out = HashMap::new();
             let mut block = false;
-            for id in ids {
+            for (id, _floor) in floors {
                 let count = calls.entry(*id).or_insert(0);
                 if *count >= 1 && self.fail_recheck {
                     return Err(sqlx::Error::PoolClosed);
@@ -260,11 +269,35 @@ fn restore_pod(
     }
 }
 
+/// A row whose active execution, when there is one, is a running pod at
+/// `active_generation`, and which has no other execution the store returns.
 fn state(lifecycle: SandboxLifecycle, active_generation: Option<i64>) -> SandboxRestoreState {
+    let executions = active_generation
+        .map(|generation| ExecutionSupersessionRow::new(generation, true, false, true))
+        .into_iter()
+        .collect();
+    with_executions(lifecycle, executions)
+}
+
+fn with_executions(
+    lifecycle: SandboxLifecycle,
+    executions: Vec<ExecutionSupersessionRow>,
+) -> SandboxRestoreState {
     SandboxRestoreState {
         lifecycle: RowLifecycle::Known(lifecycle),
-        active_generation,
+        executions,
     }
+}
+
+/// A row with no active execution whose `POD_GEN` execution was retired, as
+/// `replaced` or otherwise.
+fn retired_state(lifecycle: SandboxLifecycle, replaced: bool) -> SandboxRestoreState {
+    with_executions(
+        lifecycle,
+        vec![ExecutionSupersessionRow::new(
+            POD_GEN, false, replaced, true,
+        )],
+    )
 }
 
 fn config(dry_run: bool) -> ReconcilerConfig {
@@ -453,16 +486,148 @@ fn other_transient_rows_are_skipped() {
 
 #[test]
 fn reverted_row_with_no_active_execution_is_orphaned() {
-    // A reverted restore's settle states with no active execution: whatever
-    // retired the execution meant the pod to be gone, and a future restore
+    // A reverted restore's settle states with the pod's execution retired as
+    // `replaced`: the backup fence refuses its capture, and a future restore
     // claims a strictly-higher generation.
     for lifecycle in [SandboxLifecycle::Suspended, SandboxLifecycle::Failed] {
-        let s = state(lifecycle, None);
+        let s = retired_state(lifecycle, true);
         assert_eq!(
             classify_disposition(Some(&s), POD_GEN),
             Disposition::Orphaned(OrphanReason::RowReverted),
             "lifecycle {lifecycle:?} with no active execution should be an orphan"
         );
+    }
+}
+
+#[test]
+fn retired_but_not_replaced_highest_generation_is_skipped() {
+    // An activation rollback with abandoned-restore retirement off, and an
+    // older control plane's suspend finalization over a node-side rollback to
+    // `paused`, both retire the pod's execution as something other than
+    // `replaced` while its VM stays resident, and nothing newer exists. The
+    // fence admits that generation's capture, so a reap's teardown suspend
+    // would register the VM as a `ready` snapshot the next restore selects. A
+    // pod whose generation has no execution row at all is admitted too.
+    for lifecycle in [SandboxLifecycle::Suspended, SandboxLifecycle::Failed] {
+        for s in [
+            retired_state(lifecycle, false),
+            with_executions(lifecycle, Vec::new()),
+        ] {
+            assert_eq!(
+                classify_disposition(Some(&s), POD_GEN),
+                Disposition::Skip(SkipClass::CaptureAdmitted),
+                "{s:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn retired_not_replaced_is_reaped_once_a_newer_execution_materializes() {
+    let own = ExecutionSupersessionRow::new(POD_GEN, false, false, true);
+    for lifecycle in [SandboxLifecycle::Suspended, SandboxLifecycle::Failed] {
+        // A newer claim abandoned before it created a pod never ran: still
+        // admitted, so still skipped.
+        let s = with_executions(
+            lifecycle,
+            vec![
+                own,
+                ExecutionSupersessionRow::new(POD_GEN + 1, false, true, false),
+            ],
+        );
+        assert_eq!(
+            classify_disposition(Some(&s), POD_GEN),
+            Disposition::Skip(SkipClass::CaptureAdmitted),
+            "{lifecycle:?} with an unmaterialized newer claim"
+        );
+        // A newer execution that materialized a pod, since retired.
+        let s = with_executions(
+            lifecycle,
+            vec![
+                own,
+                ExecutionSupersessionRow::new(POD_GEN + 1, false, false, true),
+            ],
+        );
+        assert_eq!(
+            classify_disposition(Some(&s), POD_GEN),
+            Disposition::Orphaned(OrphanReason::RowReverted),
+            "{lifecycle:?} with a materialized newer execution"
+        );
+    }
+}
+
+/// Every combination of the pod's own execution row (absent, or each of the
+/// four flags) and a newer row (absent, or each flag) the store could return.
+fn execution_shapes() -> Vec<Vec<ExecutionSupersessionRow>> {
+    let mut own = vec![None];
+    let mut newer = vec![None];
+    for active in [false, true] {
+        for replaced in [false, true] {
+            for materialized in [false, true] {
+                own.push(Some(ExecutionSupersessionRow::new(
+                    POD_GEN,
+                    active,
+                    replaced,
+                    materialized,
+                )));
+                newer.push(Some(ExecutionSupersessionRow::new(
+                    POD_GEN + 1,
+                    active,
+                    replaced,
+                    materialized,
+                )));
+            }
+        }
+    }
+    let mut shapes = Vec::new();
+    for own in &own {
+        for newer in &newer {
+            shapes.push(own.iter().chain(newer.iter()).copied().collect());
+        }
+    }
+    shapes
+}
+
+#[test]
+fn unadoptable_pods_are_reaped_exactly_when_the_shared_predicate_holds() {
+    // A reap starts the pod's teardown suspend, so the classifier may only
+    // reap a pod whose capture `BeginArtifactBackup` refuses. Over the
+    // unadoptable pods (no active execution on a settle state, or below the
+    // active execution) it reaps exactly those the shared predicate
+    // supersedes, and it reaps nothing else. The fence calls the same
+    // function; each query's columns are covered by its own Postgres tests.
+    for executions in execution_shapes() {
+        let refused = execution_generation_superseded(&executions, POD_GEN);
+        let active_generation = executions
+            .iter()
+            .find(|execution| execution.active)
+            .map(|execution| execution.generation);
+        for lifecycle in [
+            SandboxLifecycle::Created,
+            SandboxLifecycle::Started,
+            SandboxLifecycle::Paused,
+            SandboxLifecycle::Suspended,
+            SandboxLifecycle::Stopped,
+            SandboxLifecycle::Failed,
+        ] {
+            let s = with_executions(lifecycle, executions.clone());
+            let reaped = matches!(
+                classify_disposition(Some(&s), POD_GEN),
+                Disposition::Orphaned(_)
+            );
+            let unadoptable = match active_generation {
+                Some(active) => active > POD_GEN,
+                None => matches!(
+                    lifecycle,
+                    SandboxLifecycle::Suspended | SandboxLifecycle::Failed
+                ),
+            };
+            if unadoptable {
+                assert_eq!(reaped, refused, "{lifecycle:?} {executions:?}");
+            } else {
+                assert!(!reaped, "{lifecycle:?} {executions:?}");
+            }
+        }
     }
 }
 
@@ -542,7 +707,7 @@ fn same_generation_pod_is_never_reaped_even_when_row_reverted() {
     // adopt it, and a suspend that raced a wake leaves this same shape with
     // the only copy of the sandbox's state in the pod. It's tallied apart from
     // the live runtimes so the backlog is visible; once a revert retires the
-    // execution, this loop reaps the pod as no-active-execution.
+    // execution as `replaced`, this loop reaps the pod as no-active-execution.
     let s = state(SandboxLifecycle::Suspended, Some(POD_GEN));
     assert_eq!(
         classify_disposition(Some(&s), POD_GEN),
@@ -568,7 +733,7 @@ fn unrecognized_row_is_skipped_even_when_otherwise_superseded() {
     // is skipped, even with no active execution — it has an owner.
     let s = SandboxRestoreState {
         lifecycle: RowLifecycle::Unrecognized,
-        active_generation: None,
+        executions: vec![ExecutionSupersessionRow::new(POD_GEN, false, true, true)],
     };
     assert_eq!(
         classify_disposition(Some(&s), POD_GEN),
@@ -631,9 +796,9 @@ fn reconciler(
 }
 
 /// A store state that makes a `POD_GEN` pod an orphan: suspended row whose
-/// execution was already retired (no active execution).
+/// execution was already retired as `replaced` (no active execution).
 fn orphan_state() -> SandboxRestoreState {
-    state(SandboxLifecycle::Suspended, None)
+    retired_state(SandboxLifecycle::Suspended, true)
 }
 
 #[tokio::test]
@@ -775,6 +940,59 @@ async fn current_generation_pod_is_never_reaped() {
 }
 
 #[tokio::test]
+async fn capture_admitted_pod_is_never_reaped_in_live_mode() {
+    // The pod's execution was retired as `suspended` with nothing newer: the
+    // fence would admit its teardown capture, so live mode leaves it alone and
+    // tallies it.
+    let sid = sandbox_id();
+    let pods = FakePods::new(vec![restore_pod("sbx-a", "uid-a", sid, Some("node-1"))]);
+    let store = FakeStore::default().with(sid, retired_state(SandboxLifecycle::Suspended, false));
+    let base = Instant::now();
+    let mut r = reconciler(
+        config(false),
+        pods,
+        store,
+        fixed_clock(base, Duration::ZERO),
+    );
+    r.observe_since("uid-a", base - Duration::from_secs(301));
+
+    let report = r.tick().await;
+
+    assert_eq!(report.orphans_detected, 0);
+    assert_eq!(
+        report.skipped.get(&SkipClass::CaptureAdmitted).copied(),
+        Some(1)
+    );
+    assert!(r.pod_backend.deletes().is_empty());
+}
+
+#[tokio::test]
+async fn scan_asks_for_each_sandboxs_lowest_pod_generation() {
+    // The store returns execution rows from the floor up, so the floor must be
+    // the lowest generation among the sandbox's pods, or the fence verdict for
+    // the lower pod would miss its own row.
+    let sid = sandbox_id();
+    let mut low = restore_pod("sbx-low", "uid-low", sid, None);
+    low.generation = Some(POD_GEN - 2);
+    let pods = FakePods::new(vec![restore_pod("sbx-a", "uid-a", sid, None), low]);
+    let store = FakeStore::default().with(sid, state(SandboxLifecycle::Started, Some(POD_GEN)));
+    let base = Instant::now();
+    let mut r = reconciler(
+        config(false),
+        pods,
+        store,
+        fixed_clock(base, Duration::ZERO),
+    );
+
+    r.tick().await;
+
+    assert_eq!(
+        *r.store.floors.lock().expect("floors lock"),
+        vec![(sid, POD_GEN - 2)]
+    );
+}
+
+#[tokio::test]
 async fn recheck_race_with_new_restore_skips_delete() {
     // Scan classifies the pod an orphan (row suspended, no active execution),
     // but between scan and the verify-before-destroy recheck a new restore
@@ -800,6 +1018,61 @@ async fn recheck_race_with_new_restore_skips_delete() {
     assert!(
         r.pod_backend.deletes().is_empty(),
         "must not delete a pod a new restore re-claimed"
+    );
+}
+
+#[tokio::test]
+async fn recheck_that_finds_the_capture_admitted_skips_delete() {
+    // At the scan a newer claim is active, so the pod is below the active
+    // execution and the fence would refuse its capture. By the recheck that
+    // claim was abandoned as `replaced` before it created a pod, so nothing
+    // newer ran and the pod's own execution reads `suspended`: the fence
+    // would now admit the capture, and the reaper must not delete the pod.
+    let sid = sandbox_id();
+    let pods = FakePods::new(vec![restore_pod("sbx-a", "uid-a", sid, Some("node-1"))]);
+    let own = ExecutionSupersessionRow::new(POD_GEN, false, false, true);
+    let store = FakeStore::default()
+        .with(
+            sid,
+            with_executions(
+                SandboxLifecycle::Suspended,
+                vec![
+                    own,
+                    ExecutionSupersessionRow::new(POD_GEN + 1, true, false, false),
+                ],
+            ),
+        )
+        .with_recheck(
+            sid,
+            with_executions(
+                SandboxLifecycle::Suspended,
+                vec![
+                    own,
+                    ExecutionSupersessionRow::new(POD_GEN + 1, false, true, false),
+                ],
+            ),
+        );
+    let base = Instant::now();
+    let mut r = reconciler(
+        config(false),
+        pods,
+        store,
+        fixed_clock(base, Duration::ZERO),
+    );
+    r.observe_since("uid-a", base - Duration::from_secs(301));
+
+    let report = r.tick().await;
+
+    assert_eq!(report.orphans_detected, 1);
+    assert_eq!(report.reaped, 0);
+    assert_eq!(
+        r.store.calls.lock().expect("calls lock").get(&sid).copied(),
+        Some(2),
+        "the recheck must have run"
+    );
+    assert!(
+        r.pod_backend.deletes().is_empty(),
+        "must not delete a pod whose capture the fence would now admit"
     );
 }
 
@@ -920,7 +1193,9 @@ async fn pod_gone_on_fresh_read_skips_delete() {
     let sid = sandbox_id();
     let pods = FakePods::new(vec![restore_pod("sbx-a", "uid-a", sid, None)])
         .with_fresh("sbx-a", FreshRead::Gone);
-    let store = FakeStore::default().with(sid, state(SandboxLifecycle::Failed, None));
+    // A candidate: its execution was retired as `replaced`, so it classifies
+    // as an orphan and reaches the fresh read.
+    let store = FakeStore::default().with(sid, retired_state(SandboxLifecycle::Failed, true));
     let base = Instant::now();
     let mut r = reconciler(
         config(false),
@@ -932,8 +1207,14 @@ async fn pod_gone_on_fresh_read_skips_delete() {
 
     let report = r.tick().await;
 
+    assert_eq!(report.orphans_detected, 1);
     assert_eq!(report.reaped, 0);
     assert!(r.pod_backend.deletes().is_empty());
+    // The fresh read stopped it: the store saw only the scan, no recheck.
+    assert_eq!(
+        r.store.calls.lock().expect("calls lock").get(&sid).copied(),
+        Some(1)
+    );
 }
 
 #[tokio::test]
@@ -1528,10 +1809,10 @@ async fn terminating_pod_seen_after_restart_is_tracked_for_stuck_teardown() {
 // ---------------------------------------------------------------------------
 // Postgres-backed store test
 //
-// Exercises the real classify SQL (the `LEFT JOIN` + `ANY($1)`, the
-// `managed_by` handling, the active generation, the tombstone and
-// unrecognized-lifecycle rows) against a throwaway Postgres. Skips silently
-// when no Docker daemon is reachable.
+// Exercises the real classify SQL (the `UNNEST` floors and execution
+// `LEFT JOIN`, the `managed_by` handling, the active generation, the
+// tombstone and unrecognized-lifecycle rows) against a throwaway Postgres.
+// They fail without one unless `SPACE_TEST_DEPS_OPTIONAL` is set.
 // ---------------------------------------------------------------------------
 
 mod postgres_backed {
@@ -1545,6 +1826,7 @@ mod postgres_backed {
     use crate::orphaned_restore_pod_gc::backend::SandboxStore;
     use crate::orphaned_restore_pod_gc::store::SandboxDbStore;
     use pplx_space_common_core::types::SandboxLifecycle;
+    use pplx_space_sandbox_portability::execution_supersession::ExecutionSupersessionRow;
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -1589,17 +1871,29 @@ mod postgres_backed {
         pod_uid: Option<&str>,
         active: bool,
     ) -> TestResult {
+        let state = if active { "running" } else { "replaced" };
+        insert_execution_in_state(pool, sandbox_id, generation, pod_uid, active, state).await
+    }
+
+    async fn insert_execution_in_state(
+        pool: &PgPool,
+        sandbox_id: Uuid,
+        generation: i64,
+        pod_uid: Option<&str>,
+        active: bool,
+        state: &str,
+    ) -> TestResult {
         sqlx::query(sql!(
             "INSERT INTO sandbox_k8s_executions
                 (sandbox_id, generation, pod_name, pod_namespace, pod_uid, state, active)
-             VALUES ($1, $2, $3, 'sandboxes', $4,
-                     CASE WHEN $5 THEN 'running' ELSE 'replaced' END, $5)"
+             VALUES ($1, $2, $3, 'sandboxes', $4, $6, $5)"
         ))
         .bind(sandbox_id)
         .bind(generation)
         .bind(format!("space-sbx-{}-g{generation}", sandbox_id.simple()))
         .bind(pod_uid)
         .bind(active)
+        .bind(state)
         .execute(pool)
         .await?;
         Ok(())
@@ -1626,8 +1920,8 @@ mod postgres_backed {
         let cleanup_required = Uuid::now_v7();
         insert_sandbox(&db.pool, suspended, "k8s", "suspended").await?;
         insert_sandbox(&db.pool, started, "k8s", "started").await?;
-        // A retired (inactive) execution at a higher generation must not be
-        // mistaken for the active one: only `e.active` rows join.
+        // A retired (inactive) execution at a higher generation comes back as
+        // a row but must not be mistaken for the active one.
         insert_execution(&db.pool, started, 4, Some("uid-retired"), false).await?;
         insert_active_execution(&db.pool, started, 3, Some("uid-live")).await?;
         insert_execution(&db.pool, suspended, 2, Some("uid-old"), false).await?;
@@ -1637,12 +1931,12 @@ mod postgres_backed {
 
         let states = store
             .classify_sandboxes(&[
-                SandboxId::from_uuid(suspended),
-                SandboxId::from_uuid(started),
-                SandboxId::from_uuid(non_k8s),
-                SandboxId::from_uuid(missing),
-                SandboxId::from_uuid(deleted),
-                SandboxId::from_uuid(cleanup_required),
+                (SandboxId::from_uuid(suspended), 2),
+                (SandboxId::from_uuid(started), 3),
+                (SandboxId::from_uuid(non_k8s), 1),
+                (SandboxId::from_uuid(missing), 1),
+                (SandboxId::from_uuid(deleted), 1),
+                (SandboxId::from_uuid(cleanup_required), 1),
             ])
             .await?;
 
@@ -1654,13 +1948,26 @@ mod postgres_backed {
             s.lifecycle,
             RowLifecycle::Known(SandboxLifecycle::Suspended)
         );
-        assert_eq!(s.active_generation, None);
+        assert_eq!(s.active_generation(), None);
+        assert_eq!(
+            s.executions,
+            vec![ExecutionSupersessionRow::new(2, false, true, true)]
+        );
         // Started: present, active execution's generation surfaced.
         let s = states
             .get(&SandboxId::from_uuid(started))
             .expect("started sandbox classified");
         assert_eq!(s.lifecycle, RowLifecycle::Known(SandboxLifecycle::Started));
-        assert_eq!(s.active_generation, Some(3));
+        assert_eq!(s.active_generation(), Some(3));
+        let mut executions = s.executions.clone();
+        executions.sort_by_key(|execution| execution.generation);
+        assert_eq!(
+            executions,
+            vec![
+                ExecutionSupersessionRow::new(3, true, false, true),
+                ExecutionSupersessionRow::new(4, false, true, true),
+            ]
+        );
         // Non-k8s and unrecognized-lifecycle rows are present but
         // `Unrecognized` (skipped at the caller), not absent — an absent row
         // would read as `SandboxMissing` and get its pod reaped.
@@ -1674,6 +1981,83 @@ mod postgres_backed {
         // caller).
         assert!(!states.contains_key(&SandboxId::from_uuid(missing)));
         assert!(!states.contains_key(&SandboxId::from_uuid(deleted)));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn classify_sandboxes_reads_executions_from_the_floor_up() -> TestResult {
+        let Some(db) = try_pg_test_db().await? else {
+            return Ok(());
+        };
+        let store = SandboxDbStore::new(db.pool.clone());
+
+        // A suspend finalization's shape: the pod's own execution retired as
+        // `suspended` with a pod, nothing newer. Rows below the floor are
+        // left out; a newer claim that never created a pod reads as
+        // unmaterialized; a sandbox with nothing at or above the floor still
+        // comes back, with no rows.
+        let sandbox = Uuid::now_v7();
+        let empty = Uuid::now_v7();
+        // The active execution comes back even below the floor, so the
+        // classifier always sees it.
+        let active_below = Uuid::now_v7();
+        insert_sandbox(&db.pool, sandbox, "k8s", "suspended").await?;
+        insert_sandbox(&db.pool, empty, "k8s", "suspended").await?;
+        insert_sandbox(&db.pool, active_below, "k8s", "started").await?;
+        insert_active_execution(&db.pool, active_below, 2, Some("uid-a")).await?;
+        insert_execution_in_state(&db.pool, sandbox, 1, Some("uid-1"), false, "replaced").await?;
+        insert_execution_in_state(&db.pool, sandbox, 2, Some("uid-2"), false, "suspended").await?;
+        insert_execution_in_state(&db.pool, sandbox, 3, None, false, "replaced").await?;
+        // Materialized by the set-once record alone: its `pod_uid` was
+        // cleared after the pod ran.
+        insert_execution_in_state(&db.pool, sandbox, 4, None, false, "suspended").await?;
+        sqlx::query(sql!(
+            "UPDATE sandbox_k8s_executions
+                SET pod_materialized_at = NOW()
+              WHERE sandbox_id = $1 AND generation = 4"
+        ))
+        .bind(sandbox)
+        .execute(&db.pool)
+        .await?;
+        insert_execution_in_state(&db.pool, empty, 1, Some("uid-e"), false, "suspended").await?;
+
+        let states = store
+            .classify_sandboxes(&[
+                (SandboxId::from_uuid(sandbox), 2),
+                (SandboxId::from_uuid(empty), 5),
+                (SandboxId::from_uuid(active_below), 4),
+            ])
+            .await?;
+
+        let s = states
+            .get(&SandboxId::from_uuid(sandbox))
+            .expect("sandbox classified");
+        let mut executions = s.executions.clone();
+        executions.sort_by_key(|execution| execution.generation);
+        assert_eq!(
+            executions,
+            vec![
+                ExecutionSupersessionRow::new(2, false, false, true),
+                ExecutionSupersessionRow::new(3, false, true, false),
+                ExecutionSupersessionRow::new(4, false, false, true),
+            ]
+        );
+        let e = states
+            .get(&SandboxId::from_uuid(empty))
+            .expect("sandbox with no rows above the floor classified");
+        assert_eq!(
+            e.lifecycle,
+            RowLifecycle::Known(SandboxLifecycle::Suspended)
+        );
+        assert!(e.executions.is_empty());
+        let a = states
+            .get(&SandboxId::from_uuid(active_below))
+            .expect("sandbox with its active execution below the floor classified");
+        assert_eq!(
+            a.executions,
+            vec![ExecutionSupersessionRow::new(2, true, false, true)]
+        );
+        assert_eq!(a.active_generation(), Some(2));
         Ok(())
     }
 }

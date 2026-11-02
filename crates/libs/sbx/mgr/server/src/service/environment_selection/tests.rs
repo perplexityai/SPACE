@@ -19,7 +19,9 @@ async fn only_missing_acknowledgement_retains_the_exact_source_during_rollout() 
         .iter()
         .find(|entry| {
             entry.release().release.version.as_str() == "1.17.0"
-                && entry.kernel().version.as_str() == "6.1.155"
+                && entry
+                    .kernel()
+                    .is_some_and(|kernel| kernel.version.as_str() == "6.1.155")
         })
         .unwrap();
     for (intent, acknowledgement, exact_allowed, expected) in [

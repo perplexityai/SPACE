@@ -18,7 +18,9 @@ uuid = { workspace = true, features = ["v7"] }
 pplx-space-common-core = { workspace = true, features = ["sqlx"] }
 pplx-space-common-svc = { workspace = true }
 pplx-space-metrics = { workspace = true }
+pplx-space-observability = { workspace = true, default-features = false }
 
 [dev-dependencies]
 pplx-space-db-test-fixtures = { workspace = true }
+pplx-space-observability = { workspace = true, features = ["otel", "test-capture"] }
 tokio = { workspace = true, features = ["macros", "rt"] }

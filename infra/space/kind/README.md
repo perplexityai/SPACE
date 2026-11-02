@@ -37,15 +37,17 @@ whose update failed. It restarts Tilt when Tilt was started with other values of
 the settings Tilt reads from its environment once, at start: the list is
 `TILT_SETTINGS` in `up.sh` (the telemetry, Datadog and storage credentials
 modes, the prune and parallel-update switches, `SPACE_LOOP_DEVICE_TARGET`,
-`SPACE_SEED_OUTPUT_DIR`, the Rust artifact mode and profile, and
-`SPACE_KIND_RUST_BUILD`), each compared with its default, plus the optional
+`SPACE_SEED_OUTPUT_DIR`, the Rust artifact mode and profile,
+`SPACE_KIND_RUST_BUILD` and `SPACE_KIND_SUBSTRATE`), each compared with its default, plus the optional
 AWS credentials when storage credentials are `static`. Nothing else restarts
 it, so a refreshed AWS session token in the default mode keeps the running
 Tilt. Before stopping it, `up.sh` checks its own refusals (the timeout, storage
-mode, Rust build and profile, and parallelism, and the cluster's mounts,
-node image, layout, Postgres data and nodes' vendor copies, after staging the
-vendor tree as the bring-up does); a refusal at Tiltfile load is not
-pre-checked. Tilt's log
+mode, Rust build and profile, substrate, and parallelism, and the cluster's
+mounts, node image, layout, Postgres data, substrate and nodes' vendor copies,
+after staging the vendor tree as the bring-up does), and the telemetry
+configuration and substrate request that the Tiltfile also refuses at load (an
+invalid `SPACE_KIND_SUBSTRATE`, or `direct` without static storage credentials).
+Tilt's log
 is `~/.space-devbox/kind/tilt-space-local.log`, its pid is in
 `~/.space-devbox/kind/tilt-space-local.pid`, and `teardown.sh` stops it.
 
@@ -255,7 +257,7 @@ either (see [Service identities](#service-identities)).
 
 ## CI smoke partitions
 
-Kind CI produces one Rust artifact image per run and hands it to four isolated
+Kind CI produces one Rust artifact image per run and hands it to eight isolated
 runners. Main builds it from its commit; a PR reuses main's image when its Rust
 inputs are the same (see [Smoke test](#smoke-test)). Each runner boots its own Kind stack, proves the baseline,
 and runs its assigned typed scenarios serially. Cluster-wide fault injection
@@ -271,31 +273,40 @@ successful producer from the same run, with the same source verification. A
 failed producer, expired artifact, or mismatched identity fails closed instead
 of compiling separately on each shard.
 
-Overlap needs runner capacity for the producer and four prepared shards. This
+Overlap needs runner capacity for the producer and eight prepared shards: nine
+concurrent 16-core runners per run, and a tenth on a main push for Main CI's
+`kind_rust_state` (below). This
 does not add shard jobs or enlarge the cross-run cache, but runners start
 earlier. Verify both producer queue time and main CI completion time after a
 workflow change; shorter setup steps alone do not prove a faster critical path.
 
 `scripts/tests/smoke-kind-typed.sh all INDEX/COUNT` partitions the eligible ECW
-and native inventories independently, after the normal backend, template, and
-quarantine filters. The telemetry and storage credentials mode filters read the
+and native inventories together, after the normal backend, template, and
+quarantine filters: a shard runs its ECW share and then its native share, so
+the two are balanced as one load, and each pass computes the same partition.
+A long scenario can fill one shard's load by itself, so a pass can find its
+share empty while the shard's other pass has work; it says so and exits 0
+without a bootstrap. A shard with nothing on either surface fails. The
+telemetry and storage credentials mode filters read the
 bench and run after partitioning, so on a bench in another mode a shard can be
 left with nothing to run; it prints its skips, says so and exits 0. A runner
 that names a mode the bench doesn't run (CI names `otel`) filters nothing, so
 any shard holding a scenario that declares a mode of that kind fails instead.
 `space_smoke/sharding.py` assigns longest scenarios first to the
-least-loaded partition, with stable ID/index tie-breaking, then executes each
+least-loaded partition (equal hints by surface, then ID; equal loads to the
+lower index), then executes each
 partition in ID order. Unsharded runs keep their existing order.
 
-The duration hints are rounded scenario wall times (including fixture setup and
-cleanup) from [a successful Kind run](https://github.com/perplexityai/SPACE/actions/runs/36102493553),
+The duration hints are median scenario wall times (including fixture setup and
+cleanup) over the successful Kind runs that `space_smoke/sharding.py` names,
 except where a hint's own comment names another source.
 To refresh them, measure matching `=== RUN` / `=== END` timestamps separately
-for each API surface across all shards of a successful run. They are scheduling
+for each API surface across all shards of several successful runs, and take
+each scenario's median. They are scheduling
 hints only: new or renamed scenarios receive a 30-second estimate and still run;
 obsolete hints do not add scenarios. No assertion, timeout, or scenario is removed.
-Four shards shorten the serial critical path but duplicate cluster startup and
-consume four concurrent runners; queue time remains a separate constraint.
+Eight shards shorten the serial critical path but duplicate cluster startup and
+consume eight concurrent runners; queue time remains a separate constraint.
 
 ## Release-build lane
 
@@ -350,6 +361,7 @@ the Kind services with no crate's `test-hooks` feature enabled:
 | `local.snapshot_reaper_reclaims_backed_fork_snapshot` | the chart's `SPACE_SBX_GC_*` target, interval, grace and idle | a release candidate is idle for a day before the reaper takes it |
 | `local.retention_claim_finish_forward`, `local.retention_restore_source_guard` | the retention sweeper's dry-run, tick and minimum age, which they stage | a release sweeper ticks every 300 s and keeps snapshots younger than an hour |
 | `local.rate_limiters_enforce_and_fail_open` | `SPACE_CLUSTER_ACTIVATION_ADMISSION_BURST`, which it shrinks to 2 | draining the release burst of 60 would take sixty real boots |
+| `local.leader_election_brownout_keeps_one_leader` | the cluster-controller's lease TTL and liveness budget, `SPACE_CLUSTER_CONTROLLER_LEADER_ELECTION_LEASE_TTL_SECS` and `..._LEASE_FAILURE_GRACE_SECS` | at the release 60 s TTL and 600 s budget, a replica spends its budget long after the outage's bound |
 
 The 40 GiB cache needs no replacement for the reservation hook: release
 binaries reserve 8 GiB per pending cache allocation
@@ -371,16 +383,98 @@ SPACE_KIND_RUST_BUILD=release SPACE_KIND_TELEMETRY_MODE=otel SKIP_BOOTSTRAP=1 \
 
 On demand, `Kind Release-Build CI` (`.github/workflows/kind-release-ci.yml`,
 `workflow_dispatch` only) runs `kind-ci.yml` with `rust_build: release`: its
-producer builds the release image in Docker mode, and the four shards check its
+producer builds the release image in Docker mode, and the eight shards check its
 label and run the baseline and their partitions. No required check depends on
 it and nothing schedules it.
+
+## Direct substrate lane
+
+The harness normally runs the Kubernetes substrate: a pod per sandbox, placed
+by kube-scheduler. `SPACE_KIND_SUBSTRATE=direct` (`lib/substrate.sh`; the
+default is `kubernetes`) runs the same cluster and images with the API and
+cluster controller on the Direct substrate
+(`crates/libs/api/src/controllers/substrate/direct.rs`): they place node-local
+VMs on the nodes in the Direct node registry and create no sandbox pods. The
+selection is per cluster, for its lifetime. Its database holds one substrate's
+node and sandbox rows, so the bring-up refuses a cluster running the other one
+and names the teardown that switches it.
+
+- **Charts.** The Tiltfile renders `substrate=direct` into `space-api-local`
+  and `space-cluster-controller-local`, which set `SPACE_K8S_CONTROL_PLANE`
+  to `false`. The default `substrate: kubernetes` renders every chart
+  byte-identically to a chart without the value. The controller keeps its
+  two replicas: in a pod it contends for the Lease on either substrate, so
+  only the holder runs the reconcilers, as on the default lane. The node
+  services take `node.substrate=direct` (see below).
+- **Node identity.** A Direct node is known by a node UUID: the admin
+  registry records the id its node-api reports, and ClusterApi resolves a
+  kube node name only to a Kubernetes registration. On this lane the
+  node-service charts leave `SPACE_NODE_ID` unset
+  (`space-node-service.env.identity`). node-api and node-ctl then read
+  `/space/etc/node-id`, mounted on its own (`mount.nodeId`), as on a Direct
+  host. sandbox-manager reads it through its own `/space/etc` mount for its
+  activation identity only: its restore placement and quarantine recovery
+  read only `SPACE_NODE_ID`. The other node services get no node id. Before
+  the node services start, Tilt's
+  `seed-direct-node-ids` writes a random UUID there on each sandbox and
+  builder node that has none (`scripts/register-direct-nodes.sh seed-ids`).
+- **Node registration.** Kubernetes node sync doesn't run on Direct. Once the
+  API and every node-api serve, Tilt's `register-direct-nodes`
+  (`register-direct-nodes.sh register`) registers each sandbox and builder
+  node with `POST /admin/api/v1/nodes`: its kube name, its InternalIP as the
+  address and `<InternalIP>:9800` as the node-api endpoint, with
+  `verify: true`. The API then checks the node-api's id and role before
+  writing the `nodes` and `node_direct` rows, and enqueues the node's first
+  publish. The address must be the source address of the node's host-network
+  ClusterApi calls, which ClusterApi checks against it. The bring-up's
+  publication wait (`wait-node-publication.sh`) matches a Direct registration
+  by its name.
+- **Storage credentials.** The lane runs only with
+  `SPACE_KIND_STORAGE_CREDENTIALS=static`, and the bring-up refuses it
+  otherwise. In `exchange` mode the credential-manager authority admits a
+  node service by its pod's Kubernetes node registration (`node_k8s`,
+  `check_node_registration` in
+  `crates/libs/credential/mgr/server/src/k8s_identity.rs`). A Direct node has
+  none, so the authority refuses every template pull with
+  `node_identity_mismatch` and no worker ever holds a template. The same check
+  guards the authority's other node calls, such as volume keys and network
+  credentials, in either mode.
+- **Scenarios.** The typed suite reads the bench's substrate from the API
+  Deployment's `SPACE_K8S_CONTROL_PLANE`, runs the scenarios it serves and
+  prints the rest as `SKIPPED`; a run whose `SPACE_SMOKE_SUBSTRATE` or
+  `SPACE_KIND_SUBSTRATE` names the other substrate fails. On Direct it runs
+  the scenarios whose fixture needs no Kind-only Kubernetes wiring (`Ecw`,
+  `CommandSandboxFixture`, `NativeHardeningFixture`). A scenario narrows that
+  set with `substrates=` only for what Direct doesn't support by contract: the
+  fork scenarios, and a scenario that asserts sandbox pods, narrow to
+  `kubernetes`. Every Kind scenario serves Kubernetes, so the default lane's
+  inventory is unchanged. On the deployed backend, `SPACE_SMOKE_SUBSTRATE`
+  names the deployment's substrate; unset, it filters nothing.
+- **Defects.** A Direct-only defect is tracked by its issue and fails on the
+  Direct lane. Don't quarantine it: a quarantine withholds the scenario on
+  every substrate, the required Kubernetes lane included.
+
+Bring a cluster up in the lane, run the baseline, then the typed suite:
+
+```bash
+export SPACE_KIND_SUBSTRATE=direct SPACE_KIND_STORAGE_CREDENTIALS=static
+bash infra/space/kind/scripts/up.sh
+python3 examples/first_sandbox.py
+SKIP_BOOTSTRAP=1 bash scripts/tests/smoke-kind-typed.sh all
+```
+
+The suite needs no `SPACE_SMOKE_SUBSTRATE`: it reads the substrate from the
+bench and checks the exported `SPACE_KIND_SUBSTRATE` against it, as the
+bring-up does under `SKIP_BOOTSTRAP=1`. `first_sandbox.py` needs the
+environment from [the first-sandbox guide](../../../docs/first-sandbox.md). No
+CI job runs the lane.
 
 ## Bring it up
 
 ### CI layer cache
 
 Kind CI produces the Rust artifact image once per run and transfers that exact
-image to all four smoke shards. The run-local handoff is the same whether the
+image to every smoke shard. The run-local handoff is the same whether the
 producer built the image or reused main's from
 `ghcr.io/perplexityai/space-kind-rust-artifacts` (see [Smoke test](#smoke-test)):
 each shard verifies its run, source and image ID before use.
@@ -394,7 +488,8 @@ its job-scoped `GITHUB_TOKEN`, and exports `mode=max` layers. No personal token 
 new secret is used. Smoke jobs retain only `contents: read`.
 
 During migration, CI also imports the existing Actions cache scopes, using the
-job's exposed Actions runtime. Neither PRs nor main export to Actions. This
+job's exposed Actions runtime. Neither PRs nor main export BuildKit layers to
+Actions; the incremental build state (below) is a separate export. This
 read-only bridge preserves available cache hits while GHCR is unseeded or still
 private, without adding to the shared quota. BuildKit can import both sources;
 an Actions cache lookup has a 60-second timeout per target. An unavailable or
@@ -418,7 +513,7 @@ Rollout:
    repository caches. Verify the three tags can be inspected without credentials.
 3. Compare cold and warm runs: prove main exports, PRs import without exports,
    and unchanged dependency layers are cache hits. Confirm retained version counts
-   and all four smoke results. Do not claim a cache speedup from a cold run.
+   and every smoke shard's result. Do not claim a cache speedup from a cold run.
 4. Only after that evidence, remove the Actions import bridge and separately
    retire obsolete Kind Actions cache entries if needed. Other compiler/image
    caches are outside this change; no shared cache is deleted by this rollout.
@@ -442,7 +537,7 @@ cache cannot change which image a seed is built from. The copies of a commit's
 binaries are never exported.
 
 Only `kind_runtime_image_cache` in `main-ci.yml` writes these tags, after
-all four Kind shards of that commit have passed; `space-ci` does not require
+every Kind shard of that commit has passed; `space-ci` does not require
 it, and a failed export leaves the previous layers. It skips the stages of a
 Dockerfile whose mirrored base it could not reach, since layers built from
 the base's source would match no reader. Runs of successive main commits are
@@ -698,12 +793,20 @@ default; `SPACE_BOOTSTRAP_TIMEOUT` for `up.sh`) for that initialization, while s
 An exited Tilt process or failed evaluation ends the wait early with a log
 tail. Detached bring-up also waits for this initialization, but not application
 builds or rollouts; the timeout is per stage, not a whole-bring-up deadline.
+Kind CI runs `install-observability.sh` in a step of its own while the Rust
+producer builds, so Tilt's evaluation finds each release unchanged.
 
 Before installing, `install-observability.sh` loads each backend image onto
 every node at the linux/amd64 digest `ci/mirrored-images.txt` lists for the
 charts' pin, under the tag the Kind profiles name, so the pods start without a
 registry pull. GitHub CI takes these images from the GHCR mirror; elsewhere
 they come from Docker Hub. A load that fails leaves the pull to the kubelet.
+In GitHub CI the mirror pulls run in parallel; with `GHCR_TOKEN` set, the
+first one logs in alone before the rest. Elsewhere the images are pulled one
+at a time. The loads run in parallel, and the local metrics and traces
+releases install at the same time; the logs and Grafana releases follow them
+in that order. A failed release fails the install; a failed pull or load only
+warns, as before.
 
 The `off` and `datadog` modes install no local OSS backends:
 
@@ -1356,13 +1459,13 @@ kind cluster: space-local (kind-cluster.yaml.tmpl — 6 nodes)
 │   ├── space-object-store-iam (Deployment; versitygw's standalone IAM service: the storage exchange's STS and sessions)
 │   ├── space-kind-sts-bridge (Deployment; Kind-only STS front for the authority's storage exchange, and the token issuer the IAM service trusts)
 │   ├── space-redis           (Deployment; the rate limiters' store, which api, admin-api and cluster-controller reach through SPACE_REDIS_URL)
-│   ├── space-api             (Deployment, 2–3 replicas by HPA; SPACE_K8S_CONTROL_PLANE=true)
+│   ├── space-api             (Deployment, 2–3 replicas by HPA; SPACE_K8S_CONTROL_PLANE=true on the default (Kubernetes) lane, see "Direct substrate lane")
 │   ├── space-admin-api       (Deployment; the same binary on the dedicated admin surface)
 │   ├── space-internal-api    (Deployment, 2 replicas; ClusterApi — node state + template releases)
 │   ├── space-credmgr-authority (Deployment, 2 replicas; credential-manager authority — credential tables + platform KEK)
 │   ├── space-kind-key-broker (Deployment; Kind-only intermediate-key broker fixture behind the platform KEK)
 │   ├── space-data-plane      (Deployment, 2–3 replicas by HPA)
-│   ├── space-cluster-controller (Deployment, 2 replicas, one leader; materializes per-sandbox pods)
+│   ├── space-cluster-controller (Deployment, 2 replicas, one leader; materializes per-sandbox pods on the default (Kubernetes) lane)
 │   ├── space-kind-fake-ec2   (Deployment; Kind-only fake EC2 endpoint the reconcile-queue GC asks about non-ready nodes)
 │   ├── metrics-server        (Deployment in kube-system; resource metrics for the HPAs)
 │   ├── space-seed-publish    (Job; publishes the locally built seed)
@@ -1452,14 +1555,16 @@ load-balanced entry, scaled on load.
   competing runner can turn a retried lock race into a failed run
   (`crates/libs/db/migrator/src/migration_retry.rs`). Tilt makes `space-api`
   wait for the Job.
-- **cluster-controller** runs two replicas with leader election on: the Lease
-  holder runs every reconciler and the other stands by, Ready, to take over.
+- **cluster-controller** runs two replicas with leader election on, on either
+  substrate: the Lease holder runs every reconciler and the other stands by,
+  Ready, to take over.
   The typed scenario `local.leader_election_brownout_keeps_one_leader`
-  exercises the handoff. It needs `otel` mode. It lowers the controller's
-  liveness budget to its floor for its own run, through a test hook that is
-  inert unless the `test-hooks` feature is compiled in, as the Kind build
-  does, and puts the standing value back at the end; it takes about 13
-  minutes. Run it alone with
+  exercises the handoff. It needs `otel` mode. For its own run it lowers the
+  controller's lease TTL to its 18 s floor and the liveness budget to the
+  72 s floor at that TTL, through two test hooks that are inert unless the
+  `test-hooks` feature is compiled in, as the Kind build does. At the end it
+  removes the TTL hook and puts the budget's standing value back; it takes
+  about 8 minutes. Run it alone with
   `uv run --frozen --python 3.11 -m space_smoke run
   local.leader_election_brownout_keeps_one_leader`.
 - **internal-api** (ClusterApi) runs two replicas behind its ClusterIP
@@ -1538,6 +1643,9 @@ too. Each chart's values cite the code behind its numbers.
   node is gone (see the differences table).
 
 ## How the node registers itself
+
+This section describes the default (Kubernetes) lane; for the Direct one, see
+[Direct substrate lane](#direct-substrate-lane).
 
 Every node-service chart passes `SPACE_NODE_ID` as the raw kube node name
 (fieldRef `spec.nodeName`) plus its worker or builder `SPACE_NODE_ROLE`;
@@ -1815,8 +1923,9 @@ NodeInfo, `space-node-api-internal` for WorkerApiInternal, and
 it, set in `charts/space-node-api-local/values.yaml` (workers),
 `values-builder.yaml` (builders) and `charts/space-build-manager-local/values.yaml`.
 Nothing in Kind starts a peer template transfer by itself: the admin
-template-pull route serves only the direct substrate and answers 501 here, as on
-any Kubernetes deployment. An operator starts one with `PullTemplate` on the
+template-pull route serves only the direct substrate, so on the default
+(Kubernetes) lane it answers 501, as on any Kubernetes deployment, and only the
+[Direct substrate lane](#direct-substrate-lane) serves it. An operator starts one with `PullTemplate` on the
 target node-api and a `space-api` token, and the transfer list admits that call
 and the target node-api's export request to the source:
 
@@ -1824,9 +1933,9 @@ and the target node-api's export request to the source:
 |---|---|
 | worker WorkerApi, NodeInfo | `space-api` (shared and admin api), `space-cluster-controller`, `space-data-plane` (guest bridge, guest calls only), `space-internal-api`, both node-api accounts (template transfers) |
 | worker WorkerApiInternal | `space-api`, `space-cluster-controller` |
-| worker lifecycle-probe `SpacedWaitReady`, caller-supplied policy, template and pool mutation | `space-api`, `space-cluster-controller` |
+| worker lifecycle-probe `SpacedWaitReady`, caller-supplied policy, template deletion | `space-api`, `space-cluster-controller` |
 | builder BuilderApi, NodeInfo | `space-api`, `space-cluster-controller`, both node-api accounts |
-| builder `BuildTemplate` (system and tenant), policy, template deletion | `space-api` |
+| builder `BuildTemplate` (system and tenant), template deletion | `space-api` |
 | peer template transfers (`PullTemplate`, `NodeExportTemplate`), both roles | `space-api` (starts a pull), both node-api accounts (the target asks the source for the export) |
 | build-manager (system and tenant builds) | `space-builder-node-api` |
 
@@ -2142,8 +2251,8 @@ published templates.
 ## Smoke test
 
 Kind CI produces the Kind Rust artifact image once per run and hands that exact
-image to four isolated runners. Each runner brings up its own Kind/Firecracker stack,
-runs the baseline smoke, then runs one of four duration-balanced partitions of
+image to eight isolated runners. Each runner brings up its own Kind/Firecracker stack,
+runs the baseline smoke, then runs one of eight duration-balanced partitions of
 the eligible ECW and native inventories. Scenarios remain serial within each
 shard because some mutate cluster-wide state. Every shard must pass for
 `space-ci` to pass.
@@ -2183,13 +2292,38 @@ package. Setting the repository variable `SPACE_KIND_RUST_REUSE` to `off`
 turns PR reuse off without a code change. A reused image goes through the same
 handoff. The runtime images Tilt builds still record the checkout's commit.
 
-To reproduce a shard, use `scripts/tests/smoke-kind-typed.sh all 1/4` (through
-`4/4`) with the same admin-token setup as a full `all` run, on a bench brought
+A PR whose Rust inputs match no published image builds incrementally from
+main's build state instead. Main CI's `kind_rust_state` job builds each main
+commit cold in incremental mode, beside the Kind shards and outside the
+required `space-ci`. It saves three directories to the GitHub Actions cache as
+zstd tar parts (`infra/space/kind/scripts/rust-state-cache.sh`): the Cargo
+target directory, the content-synced source mirror, and the Cargo home. A pull
+request's producer restores the newest state for the same toolchain, Cargo
+config, builder image and its pinned base, build lists and build scripts
+(`rust-state-cache.sh key`), preferring one built from the same `Cargo.lock`,
+and runs `build-rust-artifacts.sh` in incremental mode. The mirror keeps the
+mtimes of files whose content did not change, so Cargo recompiles only the
+crates whose inputs changed since main's build. Without a restored state, or
+when a part is missing or fails to unpack, the producer builds in Docker mode as
+before. The merge queue runs no Kind smoke, so for a PR that selects Kind its
+own run is the last Kind check before merge, and it tests incrementally built
+artifacts whenever a state restores. Building main's state cold keeps a saved
+state from inheriting a stale output of an earlier build, but an input Cargo
+does not track would carry main's compiled crate into a restoring PR; crates
+that embed a directory (`sqlx::migrate!`) watch it from a build script for that
+reason. Main CI's `rust_cache_cleanup` prunes superseded states with the other
+target-directory caches, keeping the newest state for each of the last three
+key inputs, so up to four states (about 0.8 GB each) can exist while a push
+saves. Setting the repository variable `SPACE_KIND_RUST_STATE` to `off` turns
+both the save and the restore off.
+
+To reproduce a shard, use `scripts/tests/smoke-kind-typed.sh all 1/8` (through
+`8/8`) with the same admin-token setup as a full `all` run, on a bench brought
 up with `SPACE_KIND_TELEMETRY_MODE=otel` and that variable still set, as CI
 does. With the variable set, a bench in another mode fails any shard holding a
 scenario that declares a telemetry mode, the brownout's included; without it,
 each such shard skips those scenarios and can pass. The direct CLI equivalent
-is `python -m space_smoke run --all --shard 1/4` for the selected API surface.
+is `python -m space_smoke run --all --shard 1/8` for the selected API surface.
 Shards partition the eligible scenarios by duration hint, as described above;
 run every shard from the same checkout. Never run shards concurrently against
 the same cluster. Without a shard argument, the full inventory and its existing

@@ -1,30 +1,30 @@
 //! Inline execution of a native create that won an admission-time
 //! warm-pool claim.
 //!
-//! The request records the create already claimed (see
-//! `PublicOperationAdmission::create_claimed_or_roll_back`), so the
-//! dispatcher never picks it up while this process runs it. The execution
-//! runs in its own task through the same driver the dispatcher uses, so it
-//! renews the claim and records the result identically. The request waits
-//! for it only up to a short deadline. Past that deadline, or after a
-//! client disconnect, the task keeps running. If the task dies, the claim
-//! goes stale and the dispatcher re-drives the same operation through the
-//! admitted-claim path.
+//! The request takes an inline permit, then records the create already
+//! claimed (see `PublicOperationAdmission::create_claimed_or_roll_back`), so
+//! the dispatcher never picks it up while this process runs it. The
+//! execution runs on [`InlineOperations`], through the same driver and
+//! settings the dispatcher uses, so it renews the claim and records the
+//! result identically. The request waits for it only up to a short deadline.
+//! Past that deadline, or after a client disconnect, the task keeps running.
+//! If the task dies, the claim goes stale and the dispatcher re-drives the
+//! same operation through the admitted-claim path.
+//!
+//! Without a permit (none free, the process draining, no route-signing
+//! authority), a create that wins a claim is recorded queued for the
+//! dispatcher instead, as with the kill switch off.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tracing::Instrument as _;
-
-use crate::controllers::sandbox::SandboxController;
-use crate::public_operation_driver::{
-    OperationExecutionConfig, OperationExecutionResult, OperationExecutor, drive_claimed_operation,
-    execution_span,
-};
+use crate::inline_operations::{InlineOperations, InlinePermit};
+use crate::public_operation_driver::OperationExecutionResult;
 use crate::public_operations::{ClaimedPublicOperation, PublicOperationStore};
 use crate::public_sandbox_operations::CreateSandboxOperationExecutor;
+use crate::routes::AppState;
 
 /// Kill switch for inline execution, read only while admission-time claims
 /// are on. Off records claimed creates queued for the dispatcher, as before.
@@ -55,12 +55,13 @@ impl InlineCreateExecutor for CreateSandboxOperationExecutor {
 pub(crate) struct InlineCreate {
     pub(crate) wait: Duration,
     pub(crate) executor: Arc<dyn InlineCreateExecutor>,
+    pub(crate) runner: InlineOperations,
 }
 
 impl InlineCreate {
-    /// Inline execution through `controller`, or `None` when the kill switch
-    /// is off.
-    pub(crate) fn from_env(pool: &sqlx::PgPool, controller: &SandboxController) -> Option<Self> {
+    /// Inline execution through the state's controller, or `None` when the
+    /// kill switch is off.
+    pub(crate) fn from_env(state: &AppState) -> Option<Self> {
         if !pplx_space_common_core::env::env_flag_var(
             NATIVE_CREATE_INLINE_ENV,
             DEFAULT_NATIVE_CREATE_INLINE_ENABLED,
@@ -70,9 +71,10 @@ impl InlineCreate {
         Some(Self {
             wait: inline_wait(std::env::var(NATIVE_CREATE_INLINE_WAIT_ENV).ok().as_deref()),
             executor: Arc::new(CreateSandboxOperationExecutor::new(
-                pool.clone(),
-                controller.clone(),
+                state.pool.clone(),
+                state.sandbox_controller.clone(),
             )),
+            runner: state.inline_operations.clone(),
         })
     }
 
@@ -82,12 +84,16 @@ impl InlineCreate {
     /// deadline, so whatever it recorded is already durable.
     pub(crate) async fn run(
         &self,
+        permit: InlinePermit,
         store: PublicOperationStore,
         claim_token: String,
         operation: ClaimedPublicOperation,
     ) -> bool {
         let operation_id = operation.id;
-        let task = self.spawn(store, claim_token, operation);
+        let execution = self.executor.execute(operation.clone());
+        let task = self
+            .runner
+            .spawn(permit, store, claim_token, operation, execution);
         match tokio::time::timeout(self.wait, task).await {
             Ok(Ok(())) => true,
             Ok(Err(error)) => {
@@ -107,49 +113,6 @@ impl InlineCreate {
                 false
             }
         }
-    }
-
-    /// The detached task that drives `operation` to its recorded outcome.
-    fn spawn(
-        &self,
-        store: PublicOperationStore,
-        claim_token: String,
-        operation: ClaimedPublicOperation,
-    ) -> tokio::task::JoinHandle<()> {
-        let operation_id = operation.id;
-        let span = execution_span(&operation);
-        let execution = self.executor.execute(operation.clone());
-        tokio::spawn(
-            async move {
-                match drive_claimed_operation(
-                    store,
-                    claim_token,
-                    OperationExecutionConfig::default(),
-                    operation,
-                    OperationExecutor::Inline,
-                    execution,
-                )
-                .await
-                {
-                    Ok(report) => tracing::debug!(
-                        operation_id = %operation_id,
-                        succeeded = report.succeeded,
-                        failed = report.failed,
-                        retried = report.retried,
-                        stale_claims = report.stale_claims,
-                        "inline native create completed"
-                    ),
-                    // The claim is left to go stale, and the dispatcher
-                    // re-drives the operation.
-                    Err(error) => tracing::warn!(
-                        operation_id = %operation_id,
-                        %error,
-                        "inline native create could not record its outcome"
-                    ),
-                }
-            }
-            .instrument(span),
-        )
     }
 }
 

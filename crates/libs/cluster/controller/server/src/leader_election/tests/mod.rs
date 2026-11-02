@@ -19,23 +19,62 @@ use fixtures::{
 
 use super::{Campaign, LeaderElectionConfig};
 
-/// A replica contends for the lease only on a substrate that runs the
-/// controller as several replicas, and the kill-switch turns contention off
-/// everywhere. Direct is a single local process and runs the reconcilers
-/// unconditionally.
+/// A replica contends for the lease only while the kill-switch leaves election
+/// on, and then when the process runs in a Kubernetes pod (where an apiserver
+/// can host the `Lease` and a Deployment may run several replicas) or its
+/// substrate drives the Kubernetes API (whose client reaches the `Lease` from
+/// anywhere, beside any in-cluster replicas). So a Direct controller in a pod
+/// contends like a Kubernetes one, a Kubernetes-substrate controller contends
+/// wherever it runs, and only an off-cluster Direct controller (a systemd host)
+/// runs the reconcilers without election.
 #[test]
-fn contention_follows_the_substrate_and_the_kill_switch() {
+fn contention_follows_the_process_host_the_substrate_and_the_kill_switch() {
     use pplx_space_api::controllers::substrate::SubstrateCapabilities;
 
-    for (substrate, capabilities, enabled, expected) in [
-        ("direct", SubstrateCapabilities::DIRECT, true, false),
-        ("direct", SubstrateCapabilities::DIRECT, false, false),
-        ("kubernetes", SubstrateCapabilities::KUBERNETES, true, true),
+    use super::{Election, ElectionSkip, ProcessHost};
+
+    const DIRECT: (&str, SubstrateCapabilities) = ("direct", SubstrateCapabilities::DIRECT);
+    const KUBERNETES: (&str, SubstrateCapabilities) =
+        ("kubernetes", SubstrateCapabilities::KUBERNETES);
+
+    for (enabled, host, (substrate, capabilities), expected) in [
+        (true, ProcessHost::Kubernetes, DIRECT, Election::Contend),
+        (true, ProcessHost::Kubernetes, KUBERNETES, Election::Contend),
         (
-            "kubernetes",
-            SubstrateCapabilities::KUBERNETES,
+            true,
+            ProcessHost::OutsideKubernetes,
+            DIRECT,
+            Election::Skip(ElectionSkip::OutsideKubernetes),
+        ),
+        (
+            true,
+            ProcessHost::OutsideKubernetes,
+            KUBERNETES,
+            Election::Contend,
+        ),
+        (
             false,
+            ProcessHost::Kubernetes,
+            DIRECT,
+            Election::Skip(ElectionSkip::Disabled),
+        ),
+        (
             false,
+            ProcessHost::Kubernetes,
+            KUBERNETES,
+            Election::Skip(ElectionSkip::Disabled),
+        ),
+        (
+            false,
+            ProcessHost::OutsideKubernetes,
+            DIRECT,
+            Election::Skip(ElectionSkip::Disabled),
+        ),
+        (
+            false,
+            ProcessHost::OutsideKubernetes,
+            KUBERNETES,
+            Election::Skip(ElectionSkip::Disabled),
         ),
     ] {
         let config = LeaderElectionConfig {
@@ -43,9 +82,37 @@ fn contention_follows_the_substrate_and_the_kill_switch() {
             ..test_config("replica-a")
         };
         assert_eq!(
-            config.contends(capabilities),
+            config.election(host, capabilities),
             expected,
-            "{substrate} substrate, election enabled: {enabled}"
+            "election enabled: {enabled}, host: {host:?}, {substrate} substrate"
+        );
+    }
+}
+
+/// The process runs inside Kubernetes when both service variables the kubelet
+/// injects into every pod are set, which is the rule the kube client applies
+/// before it builds an in-cluster config. Either one alone is not a pod.
+#[test]
+fn process_host_is_kubernetes_only_with_both_service_variables() {
+    use super::ProcessHost;
+
+    for (service_host, service_port, expected) in [
+        (None, None, ProcessHost::OutsideKubernetes),
+        (Some("10.96.0.1"), None, ProcessHost::OutsideKubernetes),
+        (None, Some("443"), ProcessHost::OutsideKubernetes),
+        (Some("10.96.0.1"), Some("443"), ProcessHost::Kubernetes),
+    ] {
+        let mut env = pplx_space_test_env::TestEnv::default();
+        if let Some(value) = service_host {
+            env.set("KUBERNETES_SERVICE_HOST", value);
+        }
+        if let Some(value) = service_port {
+            env.set("KUBERNETES_SERVICE_PORT", value);
+        }
+        assert_eq!(
+            ProcessHost::from_environment(&env),
+            expected,
+            "KUBERNETES_SERVICE_HOST: {service_host:?}, KUBERNETES_SERVICE_PORT: {service_port:?}"
         );
     }
 }
@@ -622,8 +689,8 @@ async fn readiness_marker_follows_the_leaders_renewals() {
 }
 
 /// Winning the lease reports Ready, and `signal_ready` does so for the
-/// non-election paths (Direct substrate, kill-switch) where the process runs the
-/// reconcilers unconditionally.
+/// non-election paths (kill-switch, or a Direct process outside a pod) where
+/// the process runs the reconcilers unconditionally.
 #[tokio::test(start_paused = true)]
 async fn readiness_marker_written_for_leader_and_for_the_non_election_path() {
     let path = marker_path("leader");
@@ -1401,6 +1468,51 @@ fn the_liveness_budget_override_is_bounded_like_the_default() {
             budget(unusable),
             DEFAULT_LEASE_FAILURE_GRACE,
             &format!("{unusable:?} leaves the default"),
+        );
+    }
+}
+
+/// The test-hook TTL is a request to `Timings::derive` like the default:
+/// clamped into the TTL's range, and the retry interval and the budget's floor
+/// follow the resolved TTL. At the TTL floor the brownout scenario's budget
+/// floor is 72 s; an absent or unusable value leaves the default TTL.
+#[test]
+fn the_lease_ttl_override_is_bounded_like_the_default() {
+    use super::{
+        DEFAULT_LEASE_TTL, LEASE_FAILURE_GRACE_TEST_ENV, LEASE_TTL_TEST_ENV, LeaderElectionConfig,
+        MAX_LEASE_TTL, MIN_LEASE_TTL,
+    };
+
+    let config = |ttl: Option<&str>, budget: Option<&str>| {
+        let mut env = pplx_space_test_env::TestEnv::default();
+        env.set("HOSTNAME", "space-cluster-controller-abc123");
+        if let Some(ttl) = ttl {
+            env.set(LEASE_TTL_TEST_ENV, ttl);
+        }
+        if let Some(budget) = budget {
+            env.set(LEASE_FAILURE_GRACE_TEST_ENV, budget);
+        }
+        LeaderElectionConfig::from_environment(&env)
+    };
+
+    let floor = config(Some("18"), Some("1"));
+    assert_eq!(floor.lease_ttl, MIN_LEASE_TTL);
+    assert_eq!(floor.renew_deadline, Duration::from_secs(6));
+    assert_eq!(floor.retry_interval, Duration::from_secs(2));
+    assert_budget_near(
+        floor.lease_failure_grace,
+        Duration::from_secs(72),
+        "the budget's floor follows the TTL floor",
+    );
+
+    assert_eq!(config(Some("30"), None).lease_ttl, Duration::from_secs(30));
+    assert_eq!(config(Some("5"), None).lease_ttl, MIN_LEASE_TTL);
+    assert_eq!(config(Some("999999"), None).lease_ttl, MAX_LEASE_TTL);
+    for unusable in [None, Some(""), Some("0"), Some("ten"), Some("-5")] {
+        assert_eq!(
+            config(unusable, None).lease_ttl,
+            DEFAULT_LEASE_TTL,
+            "{unusable:?} leaves the default"
         );
     }
 }

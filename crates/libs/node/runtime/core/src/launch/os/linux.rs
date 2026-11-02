@@ -121,7 +121,16 @@ impl ProcessHandle {
     pub fn has_exited(&self) -> std::io::Result<bool> {
         use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
         let mut descriptors = [PollFd::new(self.pidfd.as_fd(), PollFlags::POLLIN)];
-        poll(&mut descriptors, PollTimeout::ZERO)?;
+        // poll(2) is never restarted after a signal handler, and the
+        // supervisor handles SIGCHLD for every child it reaps. A zero-timeout
+        // poll has no side effects, so retrying it is always safe.
+        loop {
+            match poll(&mut descriptors, PollTimeout::ZERO) {
+                Ok(_) => break,
+                Err(nix::errno::Errno::EINTR) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
         let [descriptor] = descriptors;
         let events = descriptor
             .revents()
@@ -177,7 +186,8 @@ fn signal_process_handle(
 const FIRECRACKER_READINESS_POLL: Duration = Duration::from_millis(5);
 const FIRECRACKER_LAUNCH_READINESS_POLL: Duration = Duration::from_millis(1);
 const FIRECRACKER_READINESS_TIMEOUT: Duration = Duration::from_secs(5);
-const JAILER_START_TIMEOUT: Duration = Duration::from_secs(2);
+/// How much of each output stream a timed-out jailer left behind to report.
+const JAILER_OUTPUT_TAIL_BYTES: usize = 1024;
 
 fn read_firecracker_pidfile(pid_file: &str) -> Option<String> {
     std::fs::read_to_string(pid_file)
@@ -287,6 +297,8 @@ pub struct JailerLaunch<'a> {
     pub fc_metrics_path: &'a str,
     pub fc_console_path: &'a str,
     pub cgroup_limits: &'a crate::cgroup::CgroupLimits,
+    /// How long the jailer may run before it is killed and the launch fails.
+    pub jailer_start_timeout: Duration,
 }
 
 fn clear_cloexec(fd: impl AsFd) -> Result<(), String> {
@@ -523,6 +535,7 @@ pub fn launch_via_jailer(config: JailerLaunch<'_>) -> Result<u32, String> {
         fc_metrics_path,
         fc_console_path,
         cgroup_limits,
+        jailer_start_timeout,
     } = config;
 
     let pid_file = format!("{chroot_base_dir}/firecracker/{sandbox_id}/root/firecracker.pid");
@@ -539,7 +552,13 @@ pub fn launch_via_jailer(config: JailerLaunch<'_>) -> Result<u32, String> {
         cgroup_limits,
         daemonize: true,
     });
-    run_jailer_command(sandbox_id, jailer, fc_console_path, &jailer_args)?;
+    run_jailer_command(
+        sandbox_id,
+        jailer,
+        fc_console_path,
+        &jailer_args,
+        jailer_start_timeout,
+    )?;
 
     // Let jailer daemonize Firecracker, then read the pidfile ourselves. Jailer
     // intentionally moves Firecracker under its own delegated cgroup/chroot
@@ -752,34 +771,25 @@ fn bind_jailer_descriptor(
     Ok(())
 }
 
-fn command_output_with_timeout(
-    cmd: &mut std::process::Command,
+/// Wait for a spawned jailer, killing it at `timeout`. `Ok(None)` means it was
+/// still running at the limit and has been killed and reaped.
+fn wait_for_jailer(
+    child: &mut std::process::Child,
     label: &str,
-) -> Result<std::process::Output, String> {
-    let mut child = cmd
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("{label}: {error}"))?;
-    let deadline = Instant::now() + JAILER_START_TIMEOUT;
-
+    timeout: Duration,
+    started: Instant,
+) -> Result<Option<std::process::ExitStatus>, String> {
+    let deadline = started + timeout;
     loop {
         match child.try_wait() {
-            Ok(Some(_status)) => {
-                return child.wait_with_output().map_err(|error| {
-                    format!("collect output after {label} finished failed: {error}")
-                });
-            }
+            Ok(Some(status)) => return Ok(Some(status)),
             Ok(None) if Instant::now() < deadline => {
                 std::thread::sleep(FIRECRACKER_READINESS_POLL);
             }
             Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!(
-                    "{label} timed out after {:?}",
-                    JAILER_START_TIMEOUT
-                ));
+                return Ok(None);
             }
             Err(error) => {
                 let _ = child.kill();
@@ -788,6 +798,36 @@ fn command_output_with_timeout(
             }
         }
     }
+}
+
+/// The last [`JAILER_OUTPUT_TAIL_BYTES`] a killed jailer wrote to `pipe`.
+///
+/// This reads only what is already buffered and never waits for end of file:
+/// a process the jailer forked may still hold the write end open.
+fn killed_jailer_output_tail(pipe: Option<impl std::io::Read + AsFd>) -> String {
+    use nix::fcntl::OFlag;
+    use std::io::Read as _;
+    // A default pipe holds this much; the limit also stops a surviving writer
+    // from keeping the read going.
+    const READ_LIMIT: u64 = 64 * 1024;
+    let Some(pipe) = pipe else {
+        return String::new();
+    };
+    let nonblocking = fcntl(pipe.as_fd(), FcntlArg::F_GETFL).and_then(|flags| {
+        fcntl(
+            pipe.as_fd(),
+            FcntlArg::F_SETFL(OFlag::from_bits_retain(flags) | OFlag::O_NONBLOCK),
+        )
+    });
+    if let Err(error) = nonblocking {
+        return format!("<unreadable: {error}>");
+    }
+    let mut output = Vec::new();
+    // An empty pipe ends the read with WouldBlock; what was read before it
+    // stays in `output`.
+    let _ = pipe.take(READ_LIMIT).read_to_end(&mut output);
+    let tail = output.split_off(output.len().saturating_sub(JAILER_OUTPUT_TAIL_BYTES));
+    String::from_utf8_lossy(&tail).trim().to_owned()
 }
 
 fn command_output_text(output: &std::process::Output) -> String {
@@ -798,71 +838,79 @@ fn command_output_text(output: &std::process::Output) -> String {
     )
 }
 
-fn command_status_with_timeout(
-    cmd: &mut std::process::Command,
-    label: &str,
-) -> Result<std::process::ExitStatus, String> {
-    let mut child = cmd.spawn().map_err(|error| format!("{label}: {error}"))?;
-    let deadline = Instant::now() + JAILER_START_TIMEOUT;
-
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Ok(status),
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(FIRECRACKER_READINESS_POLL);
-            }
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!(
-                    "{label} timed out after {:?}",
-                    JAILER_START_TIMEOUT
-                ));
-            }
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("{label}: {error}"));
-            }
-        }
-    }
-}
-
 fn run_jailer_command(
     sandbox_id: &str,
     jailer: crate::launch::JailerExecutable<'_>,
     console_path: &str,
     jailer_args: &[String],
+    timeout: Duration,
 ) -> Result<(), String> {
+    use pplx_space_metrics::runtime_supervisor::{JailerOutcome, jailer_finished};
     let label = format!("jailer for {sandbox_id}");
     let mut cmd = direct_jailer_command(jailer, jailer_args)
         .map_err(|error| format!("prepare jailer execution: {error}"))?;
     cmd.stdin(std::process::Stdio::null());
 
     if console_path.is_empty() {
-        let output = command_output_with_timeout(&mut cmd, &label)?;
-        if output.status.success() {
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+    } else {
+        let stdout = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(console_path)
+            .map_err(|error| format!("open Firecracker console {console_path}: {error}"))?;
+        let stderr = stdout
+            .try_clone()
+            .map_err(|error| format!("clone Firecracker console {console_path}: {error}"))?;
+        cmd.stdout(std::process::Stdio::from(stdout));
+        cmd.stderr(std::process::Stdio::from(stderr));
+    }
+
+    let started = Instant::now();
+    let mut child = cmd.spawn().map_err(|error| format!("{label}: {error}"))?;
+    let waited = wait_for_jailer(&mut child, &label, timeout, started);
+    let elapsed = started.elapsed();
+    let status = match waited {
+        Ok(Some(status)) => {
+            let outcome = if status.success() {
+                JailerOutcome::Succeeded
+            } else {
+                JailerOutcome::Failed
+            };
+            jailer_finished(outcome, elapsed);
+            status
+        }
+        Ok(None) => {
+            jailer_finished(JailerOutcome::TimedOut, elapsed);
+            return Err(jailer_timed_out(
+                sandbox_id,
+                &label,
+                child,
+                console_path,
+                elapsed,
+                timeout,
+            ));
+        }
+        Err(error) => {
+            jailer_finished(JailerOutcome::Failed, elapsed);
+            return Err(error);
+        }
+    };
+
+    if console_path.is_empty() {
+        let output = child
+            .wait_with_output()
+            .map_err(|error| format!("collect output after {label} finished failed: {error}"))?;
+        if status.success() {
             return Ok(());
         }
         return Err(format!(
             "{label} exited with {}: {}",
-            output.status.code().unwrap_or(-1),
+            status.code().unwrap_or(-1),
             command_output_text(&output).trim()
         ));
     }
-
-    let stdout = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(console_path)
-        .map_err(|error| format!("open Firecracker console {console_path}: {error}"))?;
-    let stderr = stdout
-        .try_clone()
-        .map_err(|error| format!("clone Firecracker console {console_path}: {error}"))?;
-    cmd.stdout(std::process::Stdio::from(stdout));
-    cmd.stderr(std::process::Stdio::from(stderr));
-
-    let status = command_status_with_timeout(&mut cmd, &label)?;
     if status.success() {
         Ok(())
     } else {
@@ -871,6 +919,43 @@ fn run_jailer_command(
             status.code().unwrap_or(-1)
         ))
     }
+}
+
+/// Report a jailer killed at its start timeout with what it had written, so
+/// the error says how far it got.
+fn jailer_timed_out(
+    sandbox_id: &str,
+    label: &str,
+    mut child: std::process::Child,
+    console_path: &str,
+    elapsed: Duration,
+    timeout: Duration,
+) -> String {
+    let elapsed_ms = elapsed.as_millis() as u64;
+    let timeout_ms = timeout.as_millis() as u64;
+    let output = if console_path.is_empty() {
+        let stdout = killed_jailer_output_tail(child.stdout.take());
+        let stderr = killed_jailer_output_tail(child.stderr.take());
+        tracing::warn!(
+            sandbox_id,
+            elapsed_ms,
+            timeout_ms,
+            stdout,
+            stderr,
+            "killed jailer at its start timeout"
+        );
+        format!("stdout tail {stdout:?}, stderr tail {stderr:?}")
+    } else {
+        tracing::warn!(
+            sandbox_id,
+            elapsed_ms,
+            timeout_ms,
+            console_path,
+            "killed jailer at its start timeout"
+        );
+        format!("output in console log {console_path}")
+    };
+    format!("{label} timed out after {elapsed_ms}ms (limit {timeout_ms}ms); {output}")
 }
 
 #[cfg(test)]

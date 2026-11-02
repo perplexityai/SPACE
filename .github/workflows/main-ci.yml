@@ -205,7 +205,7 @@ jobs:
   # The only job that writes the Kind runtime images' and the seed builder's
   # tags in ghcr.io/perplexityai/space-kind-build-cache, which every Kind
   # shard's bring-up imports (infra/space/kind/scripts/runtime-image-cache.sh).
-  # It exports only after all four shards of this commit passed, so a layer
+  # It exports only after every shard of this commit passed, so a layer
   # that broke the smoke is not published. It rebuilds a changed stage from
   # upstream at its own time, though: a layer broken then stays in use until
   # SPACE_KIND_LAYER_CACHE_EPOCH (infra/space/kind/lib/build-cache.sh) is
@@ -269,6 +269,92 @@ jobs:
   # do not fill the repository's cache quota. Only this job holds
   # actions:write. It is not required by space-ci: a failed deletion leaves
   # every check correct, and the next main run retries it.
+  # The incremental build state that pull requests' Kind producers restore
+  # (kind-ci.yml's rust_artifacts): a cold incremental build of this commit,
+  # beside the Kind shards and off their critical path. Building it cold keeps
+  # a saved state from inheriting a stale output of an earlier build. It does
+  # not catch a build input Cargo does not track: a pull request that restores
+  # a state reuses main's compiled crate for it, and main's Docker-mode producer
+  # is the first clean build after merge. Each run saves under a key of its own
+  # (infra/space/kind/scripts/rust-state-cache.sh key), and rust_cache_cleanup
+  # keeps the newest state for each of the last few build inputs. space-ci does
+  # not require it: without a saved state, pull requests build in Docker mode.
+  # Setting the repository variable SPACE_KIND_RUST_STATE to `off` skips it.
+  kind_rust_state:
+    if: github.repository == 'perplexityai/SPACE' && vars.SPACE_KIND_RUST_STATE != 'off'
+    name: Save the Kind Rust build state
+    runs-on: ubuntu-24.04-16core
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Check out SPACE
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Enable the containerd image store for the builder image cache
+        run: |
+          set -euo pipefail
+          sudo install -d -m 0755 /etc/docker
+          if [[ -s /etc/docker/daemon.json ]]; then
+            sudo jq '.features["containerd-snapshotter"] = true' /etc/docker/daemon.json \
+              | sudo tee /etc/docker/daemon.json.new >/dev/null
+            sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+          else
+            echo '{"features":{"containerd-snapshotter":true}}' | sudo tee /etc/docker/daemon.json >/dev/null
+          fi
+          sudo systemctl restart docker
+          if ! docker info --format '{{json .DriverStatus}}' | grep -q 'io.containerd.snapshotter'; then
+            echo "::error::The containerd image store did not activate; the builder image's cache import requires it"
+            exit 1
+          fi
+
+      - name: Expose the existing Actions cache for read-only imports
+        uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4.0.0
+
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          if ! printf '%s' "$GHCR_TOKEN" |
+            timeout --kill-after=10 60 docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin; then
+            echo "::warning::Could not log in to GHCR; its reads fall back to their sources"
+          fi
+
+      - name: Name the Kind Rust build state
+        id: state-key
+        run: bash infra/space/kind/scripts/rust-state-cache.sh key
+
+      - name: Build the Rust artifacts cold in incremental mode
+        id: build
+        timeout-minutes: 30
+        env:
+          SPACE_CI_IMAGE_MIRROR: ghcr
+          SPACE_KIND_RUST_ARTIFACTS: incremental
+          SPACE_KIND_BUILD_CACHE_REPOSITORY: ghcr.io/perplexityai/space-kind-build-cache
+          SPACE_KIND_RUST_TARGET_DIR: ${{ runner.temp }}/kind-rust-state/target
+          SPACE_KIND_RUST_SRC_DIR: ${{ runner.temp }}/kind-rust-state/src
+          SPACE_KIND_CARGO_HOME: ${{ runner.temp }}/kind-rust-state/cargo-home
+        run: bash infra/space/kind/scripts/build-rust-artifacts.sh
+
+      # Only a complete build is packed and saved, so no state is partial.
+      - name: Pack the Kind Rust build state for upload
+        id: pack
+        if: steps.build.outcome == 'success'
+        run: >-
+          bash infra/space/kind/scripts/rust-state-cache.sh pack
+          "${RUNNER_TEMP}/kind-rust-state" "${RUNNER_TEMP}/kind-rust-state-parts"
+
+      - name: Save the Kind Rust build state
+        if: steps.pack.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/kind-rust-state-parts
+          key: ${{ steps.state-key.outputs.key }}
+
   rust_cache_cleanup:
     if: ${{ !cancelled() && github.repository == 'perplexityai/SPACE' }}
     name: Delete superseded Rust and package caches

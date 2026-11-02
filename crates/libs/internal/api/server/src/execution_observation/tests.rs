@@ -24,6 +24,7 @@ fn installed() -> NodeExecutionInventory {
             ..Default::default()
         }],
         components: vec![],
+        environments: None,
     }
 }
 
@@ -186,6 +187,7 @@ async fn observation_and_projection_follow_publication_outcomes_atomically() -> 
         policy: None,
         runtimes: vec![RuntimeInstallation::default()],
         components: vec![],
+        environments: None,
     });
     let mut tx = db.pool.begin().await?;
     let error = publish_with_status(&mut tx, node_id, Some(&malformed), None)
@@ -543,5 +545,150 @@ async fn policy_receipts_clear_unknown_evidence_and_commit_atomically() -> TestR
         .await?;
         assert_eq!(receipt().fetch_one(&db.pool).await?, received_at);
     }
+    Ok(())
+}
+
+/// What a current node publishes on top of `inventory`: E0 known and usable,
+/// and a sort key on each runtime.
+fn with_observation(mut inventory: NodeExecutionInventory) -> NodeExecutionInventory {
+    use pplx_space_common_core::types::VersionSortKey;
+    use pplx_space_execution_common::environment::{
+        EnvironmentDefinition, EnvironmentObservation, KnownEnvironment,
+    };
+    let e0 = EnvironmentDefinition::from_document(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../../../proto/execution/v1/fixtures/e0.json"
+    )))
+    .unwrap()
+    .into_runtime_neutral()
+    .unwrap();
+    let reference = e0.reference();
+    let observation = EnvironmentObservation::new(
+        [KnownEnvironment::new(
+            e0,
+            Some(VersionSortKey::new(vec![1, 15, 1]).unwrap()),
+            [],
+            [],
+        )
+        .unwrap()],
+        [reference],
+    )
+    .unwrap();
+    for runtime in &mut inventory.runtimes {
+        runtime.version_sort_key = vec![1, 15, 1];
+    }
+    inventory.environments = Some((&observation).into());
+    inventory
+}
+
+/// The inventory messages as deployed cluster-api replicas decode them,
+/// before environment observations and runtime sort keys existed.
+mod deployed {
+    use prost::Message;
+
+    #[derive(Clone, PartialEq, Message)]
+    pub(super) struct RuntimeInstallation {
+        #[prost(message, optional, tag = "1")]
+        pub runtime: Option<pplx_space_execution_common::proto::RuntimeIdentity>,
+        #[prost(message, repeated, tag = "2")]
+        pub supported_guests: Vec<pplx_space_execution_common::proto::GuestPlatform>,
+        #[prost(message, repeated, tag = "3")]
+        pub state_formats: Vec<pplx_space_execution_common::proto::StateFormatCapability>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub(super) struct NodeExecutionInventory {
+        #[prost(message, repeated, tag = "1")]
+        pub runtimes: Vec<RuntimeInstallation>,
+        #[prost(message, repeated, tag = "2")]
+        pub components: Vec<pplx_space_execution_common::proto::ArtifactComponentInstallation>,
+        #[prost(message, optional, tag = "3")]
+        pub policy: Option<pplx_space_execution_common::proto::ExecutionPolicyObservation>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub(super) struct ExecutionInventoryObservation {
+        #[prost(message, optional, tag = "1")]
+        pub complete: Option<NodeExecutionInventory>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub(super) struct Publication {
+        #[prost(message, optional, tag = "8")]
+        pub execution_inventory: Option<NodeExecutionInventory>,
+        #[prost(message, optional, tag = "11")]
+        pub execution_observation: Option<ExecutionInventoryObservation>,
+    }
+}
+
+#[test]
+fn deployed_readers_drop_environment_observations_from_both_inventories_alike() {
+    let inventory = with_observation(installed());
+    let request = crate::proto::PublishNodeStateRequest {
+        execution_inventory: Some(inventory.clone()),
+        execution_observation: Some(complete(inventory.clone())),
+        ..Default::default()
+    };
+    let old = deployed::Publication::decode(request.encode_to_vec().as_slice()).unwrap();
+    let legacy = old.execution_inventory.unwrap();
+    let observed = old.execution_observation.unwrap().complete.unwrap();
+    // Deployed decode() rejects a complete report that differs from field 8.
+    assert_eq!(legacy, observed);
+    assert_eq!(legacy.runtimes.len(), 1);
+    assert_eq!(legacy.runtimes[0].runtime, inventory.runtimes[0].runtime);
+    assert_eq!(legacy.policy, inventory.policy);
+}
+
+#[test]
+fn current_readers_accept_observations_and_old_nodes_without_them() {
+    use pplx_space_execution_common::environment::EnvironmentObservation;
+    let current = with_observation(installed());
+    assert!(matches!(
+        decode(Some(&complete(current.clone())), Some(&current)).unwrap(),
+        Some(Report::Complete(_))
+    ));
+    let observation = EnvironmentObservation::from_inventory(&current)
+        .unwrap()
+        .unwrap();
+    assert_eq!(observation.known().len(), 1);
+    assert_eq!(observation.usable().len(), 1);
+    // A node built before observations sends both copies without them.
+    let old = installed();
+    let wire = crate::proto::PublishNodeStateRequest {
+        execution_inventory: Some(old.clone()),
+        execution_observation: Some(complete(old)),
+        ..Default::default()
+    };
+    let decoded =
+        crate::proto::PublishNodeStateRequest::decode(wire.encode_to_vec().as_slice()).unwrap();
+    let Some(Report::Complete(inventory)) = decode(
+        decoded.execution_observation.as_ref(),
+        decoded.execution_inventory.as_ref(),
+    )
+    .unwrap() else {
+        panic!("an old node's complete report stays complete");
+    };
+    assert_eq!(
+        EnvironmentObservation::from_inventory(inventory).unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn observations_leave_the_inventory_projection_unchanged() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let node_id = NodeId::new();
+    insert_ready_worker_node(&db.pool, node_id).await?;
+    commit_inventory(&db.pool, node_id, populated_inventory()).await?;
+    let before = projection_rows(&db.pool, node_id).await?;
+    assert_eq!(before.len(), 4);
+    commit_inventory(&db.pool, node_id, with_observation(populated_inventory())).await?;
+    assert_eq!(projection_rows(&db.pool, node_id).await?, before);
+    assert_eq!(
+        observed(&db.pool, node_id).await?.0.as_deref(),
+        Some("complete")
+    );
     Ok(())
 }

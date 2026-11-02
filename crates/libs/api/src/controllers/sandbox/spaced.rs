@@ -182,45 +182,6 @@ impl SandboxController {
         })
     }
 
-    pub async fn spaced_ping_guest(
-        &self,
-        pool: &PgPool,
-        sandbox: &Sandbox,
-        metric_identity: SandboxApiMetricIdentity,
-        id: SandboxId,
-    ) -> Result<SpacedPingGuestResponse, ControllerError> {
-        let mut client = self
-            .spaced_client(
-                pool,
-                sandbox,
-                metric_identity,
-                Some(ExecutionActivityKind::Command),
-            )
-            .await?;
-        client
-            .spaced_ping_guest(SpacedPingGuestRequest {
-                sandbox_id: id.to_string(),
-            })
-            .await
-    }
-
-    pub async fn spaced_get_status(
-        &self,
-        pool: &PgPool,
-        sandbox: &Sandbox,
-        metric_identity: SandboxApiMetricIdentity,
-        id: SandboxId,
-    ) -> Result<SpacedGetStatusResponse, ControllerError> {
-        let mut client = self
-            .spaced_client(pool, sandbox, metric_identity, None)
-            .await?;
-        client
-            .spaced_get_status(SpacedGetStatusRequest {
-                sandbox_id: id.to_string(),
-            })
-            .await
-    }
-
     pub async fn spaced_wait_ready(
         &self,
         pool: &PgPool,
@@ -1108,18 +1069,6 @@ impl SpacedSandboxClient {
         Ok(())
     }
 
-    spaced_client_call!(
-        spaced_ping_guest,
-        SpacedPingGuestRequest,
-        SpacedPingGuestResponse,
-        NodeApiOperationBudget::RuntimeMetadata
-    );
-    spaced_client_call!(
-        spaced_get_status,
-        SpacedGetStatusRequest,
-        SpacedGetStatusResponse,
-        NodeApiOperationBudget::RuntimeMetadata
-    );
     spaced_client_call!(
         spaced_stat,
         SpacedStatRequest,

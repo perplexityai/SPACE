@@ -184,7 +184,7 @@ async fn exercise_recovery(restore: bool) {
             slot: 1,
             guest_cid: 52,
             pid: 4242,
-            spaced_host_pid: 4243,
+            spaced_host_pid: Some(4243),
             netgtw_pid: gateway_pid,
             vsock_uds_path: "fixture-vsock",
             api_socket_path: "fixture-firecracker",
@@ -271,7 +271,7 @@ async fn exercise_recovery(restore: bool) {
                     control.refresh_network_policy(request).await.map(Response::into_inner)
                         .map_err(super::super::super::network_runtime::NetworkPolicyRefreshAttemptError::Rpc)
                 }
-            }).await.map_err(network_policy_refresh_error_to_status)
+            }).await.map(drop).map_err(network_policy_refresh_error_to_status)
         }
     };
     let (cleanup_tx, mut cleanup_rx) = tokio::sync::oneshot::channel();
@@ -306,7 +306,8 @@ async fn exercise_recovery(restore: bool) {
                     Some(episode.id),
                     StartReadiness {
                         guest: std::future::ready(Ok(
-                            pplx_space_spaced_host_client::proto::WaitReadyResponse::default(),
+                            pplx_space_spaced_host_client::proto::WaitReadyResponse::default()
+                                .into(),
                         )),
                         policy: Some(network_ready),
                     },

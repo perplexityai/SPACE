@@ -113,10 +113,12 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "ecw.filesystem_write_identity",
                 "ecw.fork_idempotency",
                 "ecw.fork_isolation",
+                "ecw.guest_mptcp_segments_dropped",
                 "ecw.guest_vlan_frames_dropped",
                 "ecw.immediate_egress",
                 "ecw.internet_access_allowed",
                 "ecw.internet_access_denied",
+                "ecw.large_multipart_upload_round_trip",
                 "ecw.large_stdout_integrity",
                 "ecw.loopback_route_stays_open",
                 "ecw.pause_connect",
@@ -221,6 +223,7 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "node.runtime_crash_preserves_disk",
                 "node.runtime_memory_lifecycle",
                 "node.runtime_survives_manager_restarts",
+                "node.windows_sandbox_lifecycle",
             ],
         )
         self.assertIs(registered.fixture_type, CommandSandboxFixture)

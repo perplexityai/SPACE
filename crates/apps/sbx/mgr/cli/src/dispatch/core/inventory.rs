@@ -116,7 +116,7 @@ async fn handle_list(client: &mut SandboxClient) {
 
 async fn template_hashes(client: &mut SandboxClient) -> HashMap<String, String> {
     client
-        .list_templates(ListTemplatesRequest {})
+        .list_templates(ListTemplatesRequest::default())
         .await
         .ok()
         .map(|r| {

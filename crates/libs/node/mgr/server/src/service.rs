@@ -189,6 +189,8 @@ const MAX_CACHE_ARTIFACT_DELETES: usize = 4;
 
 #[derive(Clone)]
 pub struct NodeManagerService {
+    guest_networks: std::sync::Arc<guest_network::GuestNetworks>,
+    guest_access: std::sync::Arc<guest_control::GuestAccessBudgets>,
     pool: std::sync::Arc<NetworkPool>,
     peer_authorizer: UdsPeerAuthorizer,
     sandbox_cgroup_config: SandboxCgroupConfig,
@@ -322,6 +324,26 @@ impl NodeManagerService {
         let policy = execution_policy::observation(&self.execution_policy())
             .map_err(|error| Status::internal(error.to_string()))?;
         report.policy = Some((&policy).into());
+        // Known is the whole compiled catalog, never the policy's E0-only
+        // fallback; usable is judged against the startup ceiling discovery
+        // used. When the catalog can't load, or the observation can't be
+        // built from it, omit the observation (unknown) rather than the
+        // inventory.
+        report.environments = match node_artifacts::compiled_environments() {
+            Ok(catalog) => {
+                match inventory.environment_observation(catalog, self.execution_policy.startup()) {
+                    Ok(observation) => Some((&observation).into()),
+                    Err(error) => {
+                        tracing::error!(%error, "compiled environment observation is invalid; omitting it");
+                        None
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "compiled catalog unavailable; omitting environment observation");
+                None
+            }
+        };
         Ok(Response::new(report))
     }
 
@@ -374,6 +396,8 @@ impl NodeManagerService {
         )
         .with_task_tracker(task_tracker.clone());
         Ok(Self {
+            guest_networks: Default::default(),
+            guest_access: Default::default(),
             pool,
             peer_authorizer: node_peer_authorizer(),
             sandbox_cgroup_config,
@@ -708,6 +732,7 @@ mod artifact_fs;
 pub mod btrfs_balance;
 mod btrfs_delegation;
 mod btrfs_send_source;
+mod btrfs_send_stream;
 mod btrfs_send_transport;
 pub mod cgroup_reclaim;
 #[cfg(test)]
@@ -745,3 +770,7 @@ use network_helpers::*;
 use crate::snapshot_request::{StateCapture, StateRestore};
 
 mod runtime_control;
+
+mod guest_control;
+
+mod guest_network;

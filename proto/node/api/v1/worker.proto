@@ -8,8 +8,16 @@ import "template/manager/v1/manager.proto";
 import "node/v1/node.proto";
 import "node/api/v1/common.proto";
 
-// WorkerApi is the external API for a SPACE worker node.
-// Exposes full sandbox lifecycle, template management, and network operations.
+// WorkerApi is the external API for a SPACE worker node: sandbox lifecycle
+// (Wake is on WorkerApiInternal), guest operations, sandbox snapshots, template
+// deletion and transfer, and port exposure.
+//
+// Retired in 0.9.0; services cannot reserve names, so do not reuse these:
+// GetSandboxHealth, ListSandboxes, WakeSandbox (WorkerApiInternal keeps its
+// own), SpacedPingGuest, EnableSnapshots, DisableSnapshots, DeleteSnapshots,
+// ListTemplates, GetTemplate, UpdateTemplateSettings,
+// UpdateTemplateSnapshotPolicy, CreatePool, DeletePool, PoolStatus,
+// UnexposePort, DenyPort, RefreshFacetState.
 service WorkerApi {
   // ── Sandbox lifecycle ──────────────────────────────────────────────────────
 
@@ -19,14 +27,11 @@ service WorkerApi {
   rpc KillSandbox(space.sandbox.manager.v1.KillRequest) returns (space.sandbox.manager.v1.KillResponse);
   rpc DeleteSandbox(space.sandbox.manager.v1.DeleteRequest) returns (space.sandbox.manager.v1.DeleteResponse);
   rpc SandboxState(space.sandbox.manager.v1.StateRequest) returns (space.sandbox.manager.v1.StateResponse);
-  rpc GetSandboxHealth(space.sandbox.manager.v1.GetSandboxHealthRequest) returns (space.sandbox.manager.v1.GetSandboxHealthResponse);
-  rpc ListSandboxes(space.sandbox.manager.v1.ListRequest) returns (space.sandbox.manager.v1.ListResponse);
 
   // ── Sandbox state management ───────────────────────────────────────────────
 
   rpc PauseSandbox(space.sandbox.manager.v1.PauseRequest) returns (space.sandbox.manager.v1.PauseResponse);
   rpc ResumeSandbox(space.sandbox.manager.v1.ResumeRequest) returns (space.sandbox.manager.v1.ResumeResponse);
-  rpc WakeSandbox(space.sandbox.manager.v1.WakeRequest) returns (space.sandbox.manager.v1.WakeResponse);
   rpc CreateSandboxSnapshot(space.sandbox.manager.v1.CreateSnapshotRequest) returns (space.sandbox.manager.v1.CreateSnapshotResponse);
   rpc SuspendSandbox(space.sandbox.manager.v1.SuspendRequest) returns (space.sandbox.manager.v1.SuspendResponse);
   rpc PrepareTeardownSuspend(space.sandbox.manager.v1.PrepareTeardownSuspendRequest) returns (space.sandbox.manager.v1.PrepareTeardownSuspendResponse);
@@ -42,7 +47,6 @@ service WorkerApi {
 
   // ── Spaced guest operations (via sandbox-manager) ─────────────────────────
 
-  rpc SpacedPingGuest(space.sandbox.manager.v1.SpacedPingGuestRequest) returns (space.sandbox.manager.v1.SpacedPingGuestResponse);
   rpc SpacedGetStatus(space.sandbox.manager.v1.SpacedGetStatusRequest) returns (space.sandbox.manager.v1.SpacedGetStatusResponse);
   rpc SpacedWaitReady(space.sandbox.manager.v1.SpacedWaitReadyRequest) returns (space.sandbox.manager.v1.SpacedWaitReadyResponse);
   rpc SpacedStat(space.sandbox.manager.v1.SpacedStatRequest) returns (space.spaced.operations.v1.StatResponse);
@@ -79,30 +83,18 @@ service WorkerApi {
 
   // ── Sandbox snapshots ──────────────────────────────────────────────────────
 
-  rpc EnableSnapshots(space.sandbox.manager.v1.EnableSnapshotsRequest) returns (space.sandbox.manager.v1.EnableSnapshotsResponse);
-  rpc DisableSnapshots(space.sandbox.manager.v1.DisableSnapshotsRequest) returns (space.sandbox.manager.v1.DisableSnapshotsResponse);
   rpc ListSnapshots(space.sandbox.manager.v1.ListSnapshotsRequest) returns (space.sandbox.manager.v1.ListSnapshotsResponse);
-  rpc DeleteSnapshots(space.sandbox.manager.v1.DeleteSnapshotsRequest) returns (space.sandbox.manager.v1.DeleteSnapshotsResponse);
   rpc RollbackSandbox(space.sandbox.manager.v1.RollbackRequest) returns (space.sandbox.manager.v1.RollbackResponse);
 
   // ── Template management (via template-manager) ─────────────────────────────
 
   rpc DeleteTemplate(space.template.manager.v1.DeleteTemplateRequest) returns (space.template.manager.v1.DeleteTemplateResponse);
   rpc DeleteTemplateBuild(space.template.manager.v1.DeleteTemplateBuildRequest) returns (space.template.manager.v1.DeleteTemplateBuildResponse);
-  rpc ListTemplates(space.template.manager.v1.ListTemplatesRequest) returns (space.template.manager.v1.ListTemplatesResponse);
-  rpc GetTemplate(space.template.manager.v1.GetTemplateRequest) returns (space.template.manager.v1.GetTemplateResponse);
-  rpc UpdateTemplateSettings(space.template.manager.v1.UpdateTemplateSettingsRequest) returns (space.template.manager.v1.UpdateTemplateSettingsResponse);
-  rpc UpdateTemplateSnapshotPolicy(space.template.manager.v1.UpdateTemplateSnapshotPolicyRequest) returns (space.template.manager.v1.UpdateTemplateSnapshotPolicyResponse);
-  rpc CreatePool(space.template.manager.v1.CreatePoolRequest) returns (space.template.manager.v1.CreatePoolResponse);
-  rpc DeletePool(space.template.manager.v1.DeletePoolRequest) returns (space.template.manager.v1.DeletePoolResponse);
-  rpc PoolStatus(space.template.manager.v1.PoolStatusRequest) returns (space.template.manager.v1.PoolStatusResponse);
 
   // ── Network (via node-manager) ─────────────────────────────────────────────
 
   rpc ExposePort(space.node.v1.ExposePortRequest) returns (space.node.v1.ExposePortResponse);
-  rpc UnexposePort(space.node.v1.UnexposePortRequest) returns (space.node.v1.UnexposePortResponse);
   rpc AllowPort(space.node.v1.AllowPortRequest) returns (space.node.v1.AllowPortResponse);
-  rpc DenyPort(space.node.v1.DenyPortRequest) returns (space.node.v1.DenyPortResponse);
 
   // ── Template transfer ───────────────────────────────────────────────────────
 
@@ -119,12 +111,13 @@ service WorkerApi {
 
   // ── Node-level orchestration ───────────────────────────────────────────────
 
-  rpc RefreshFacetState(RefreshFacetStateRequest) returns (RefreshFacetStateResponse);
   rpc TriggerStateReconciliation(TriggerStateReconciliationRequest) returns (TriggerStateReconciliationResponse);
 }
 
-// WorkerApiInternal is the node-local worker surface for recovery/orchestration
-// RPCs that can carry privileged WakeRequest.start_context.
+// WorkerApiInternal is the worker's control-plane surface, served on the same
+// listener as WorkerApi with its own credential: pool adoption, and the only Wake
+// node-api serves, whose request can carry a privileged start_context or
+// runtime_upgrade.
 service WorkerApiInternal {
   rpc AdoptPoolSandbox(space.sandbox.manager.v1.AdoptPoolSandboxRequest) returns (space.sandbox.manager.v1.AdoptPoolSandboxResponse);
   rpc WakeSandbox(space.sandbox.manager.v1.WakeRequest) returns (space.sandbox.manager.v1.WakeResponse);

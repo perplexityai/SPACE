@@ -649,9 +649,10 @@ impl fmt::Display for WarmPoolOrphanGcOutcome {
 /// Per-candidate resolution of the orphaned-restore-pod GC
 /// (`loop:orphaned_restore_pod_gc, sweep:main`). The pod-cache-driven reaper
 /// deletes restore pods their owning `sandboxes` row has provably superseded
-/// (row deleted, no active execution, or a strictly-higher active generation)
-/// — the unrouted VM an interrupted source-pinned restore leaves behind when
-/// its pod binds after the row moved on.
+/// (row deleted, a strictly-higher active generation, or no active execution
+/// with the pod's generation superseded) — the unrouted VM an interrupted
+/// source-pinned restore leaves behind when its pod binds after the row moved
+/// on.
 ///
 /// Follows the two-tier `cluster_reconciler.outcome` vocabulary. A live reap
 /// has two state changes: `requested_orphaned_restore_pod_delete` when the
@@ -685,8 +686,10 @@ pub enum OrphanedRestorePodOutcome {
     AlreadyGone,
     /// The authoritative DB recheck no longer classifies the pod as an orphan:
     /// the row re-entered a transient lifecycle (a new restore or other
-    /// operation re-claimed it) or its active execution is at or above the
-    /// pod's generation. The specific `SkipClass` is in the log `detail`.
+    /// operation re-claimed it), its active execution is at or above the pod's
+    /// generation, or the backup fence would now admit the pod's teardown
+    /// capture (`capture_admitted`). The specific `SkipClass` is in the log
+    /// `detail`.
     NotOrphanOnRecheck,
     // No-ops: `deferred` — retry next tick (budget not ready / tick elapsed).
     RateLimited,

@@ -214,6 +214,26 @@ fn guest_source_guard_exprs(guest_ip: &str) -> Vec<serde_json::Value> {
     ]
 }
 
+fn mptcp_guard_exprs() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({
+            "match": {
+                "left": { "meta": { "key": "iifname" } },
+                "right": "tap0",
+                "op": "=="
+            }
+        }),
+        serde_json::json!({
+            "match": {
+                "left": { "tcp option": { "name": "mptcp" } },
+                "right": true,
+                "op": "=="
+            }
+        }),
+        serde_json::json!({ "drop": null }),
+    ]
+}
+
 fn established_bypass_exprs() -> Vec<serde_json::Value> {
     vec![
         serde_json::json!({
@@ -272,6 +292,12 @@ fn namespace_source_guard_precedes_established_conntrack_bypass() {
     assert!(
         source_guard_position < established_bypass_position,
         "guest source validation must run before established traffic can bypass filtering"
+    );
+    let mptcp_guard_position =
+        rule_position(&mptcp_guard_exprs()).expect("tap0 must drop guest MPTCP segments");
+    assert!(
+        mptcp_guard_position < established_bypass_position,
+        "MPTCP segments on established flows must not bypass the guard"
     );
 }
 
@@ -353,6 +379,7 @@ fn rule_with_exprs(exprs: Vec<serde_json::Value>) -> serde_json::Value {
 fn namespace_source_guard_validator_rejects_ineffective_rules() {
     let guest_ip = "169.254.0.21";
     let source_guard = rule_with_exprs(guest_source_guard_exprs(guest_ip));
+    let mptcp_guard = rule_with_exprs(mptcp_guard_exprs());
     let established_bypass = rule_with_exprs(established_bypass_exprs());
     let (valid, packaged) = udp443_validation_fixture();
     let udp443 = valid["nftables"]
@@ -367,6 +394,7 @@ fn namespace_source_guard_validator_rejects_ineffective_rules() {
     validate_pre_tproxy_guardrails_chain(
         &chain_with_rules(vec![
             source_guard.clone(),
+            mptcp_guard.clone(),
             established_bypass.clone(),
             udp443,
         ]),
@@ -391,8 +419,18 @@ fn namespace_source_guard_validator_rejects_ineffective_rules() {
         ),
         (
             "after established bypass",
-            chain_with_rules(vec![established_bypass, source_guard]),
+            chain_with_rules(vec![established_bypass.clone(), source_guard.clone()]),
             "namespace tap0 guest source guard must precede established/related return",
+        ),
+        (
+            "missing MPTCP guard",
+            chain_with_rules(vec![source_guard.clone(), established_bypass.clone()]),
+            "namespace pre-TPROXY guardrails chain is missing tap0 MPTCP guard",
+        ),
+        (
+            "MPTCP guard after established bypass",
+            chain_with_rules(vec![source_guard, established_bypass, mptcp_guard]),
+            "namespace tap0 MPTCP guard must precede established/related return",
         ),
     ];
 
@@ -509,7 +547,7 @@ fn inbound_reply_disable_fails_closed_without_rule_handle() {
 #[test]
 fn proxy_keeps_only_local_service_reply_exception() {
     let generated: serde_json::Value =
-        serde_json::from_str(&netgtw_tproxy_rules_json(12345)).unwrap();
+        serde_json::from_str(&netgtw_tproxy_rules_json(12345, false)).unwrap();
     let rules: Vec<_> = generated["nftables"]
         .as_array()
         .unwrap()
@@ -915,4 +953,78 @@ fn udp443_guardrail_requires_source_validation_and_packaged_policy() {
             "{defect}: {result:?}"
         );
     }
+}
+
+#[test]
+fn dhcp_bypass_is_owned_by_each_atomic_gateway_ruleset() {
+    for dhcp in [false, true] {
+        let generated: serde_json::Value =
+            serde_json::from_str(&netgtw_tproxy_rules_json(12345, dhcp)).unwrap();
+        let commands = generated["nftables"].as_array().unwrap();
+        let bypass = commands
+            .iter()
+            .position(|entry| entry["add"]["rule"]["comment"] == "execution-local-dhcp");
+        assert_eq!(bypass.is_some(), dhcp);
+        if let Some(bypass) = bypass {
+            let last_flush = commands
+                .iter()
+                .rposition(|entry| entry.get("flush").is_some())
+                .unwrap();
+            let first_tproxy = commands
+                .iter()
+                .position(|entry| {
+                    entry["add"]["rule"]["expr"]
+                        .as_array()
+                        .is_some_and(|expr| expr.iter().any(|e| e.get("tproxy").is_some()))
+                })
+                .unwrap();
+            assert!(last_flush < bypass && bypass < first_tproxy);
+            assert_eq!(commands[bypass]["add"]["rule"], guest_dhcp_proxy_rule());
+        }
+    }
+}
+
+#[test]
+fn dhcp_reconcile_accepts_nft_listing_and_repairs_old_or_duplicate_rules() {
+    // nft's listed form omits the implied l4proto match and may reorder sets.
+    let installed = serde_json::json!({"rule": {
+        "family":"ip", "table":"sandbox", "chain":"pre_tproxy_guardrails",
+        "handle":42, "comment":"execution-dhcp-bootstrap", "expr":[
+            {"match":{"left":{"meta":{"key":"iifname"}},"op":"==","right":"tap0"}},
+            {"match":{"left":{"payload":{"protocol":"ip","field":"daddr"}},"op":"in","right":{"set":["169.254.0.22","255.255.255.255"]}}},
+            {"match":{"left":{"payload":{"protocol":"udp","field":"sport"}},"op":"==","right":68}},
+            {"match":{"left":{"payload":{"protocol":"udp","field":"dport"}},"op":"==","right":67}},
+            {"return":null}
+        ]
+    }});
+    let unrelated = serde_json::json!({"rule":{"handle":99,"comment":"drop-spoofed-guest-source","expr":[{"drop":null}]}});
+    let valid = serde_json::json!({"nftables":[installed.clone(),unrelated.clone()]});
+    assert!(
+        guest_dhcp_bootstrap_updates(Some(&valid))
+            .unwrap()
+            .is_empty()
+    );
+    for mode in 0..3 {
+        let mut chain = valid.clone();
+        match mode {
+            0 => {
+                chain["nftables"][0]["rule"]["expr"][1]["match"]["right"] =
+                    serde_json::json!("255.255.255.255");
+            }
+            1 => {
+                let mut duplicate = installed.clone();
+                duplicate["rule"]["handle"] = 43.into();
+                chain["nftables"].as_array_mut().unwrap().push(duplicate);
+            }
+            2 => {
+                chain["nftables"].as_array_mut().unwrap().swap(0, 1);
+            }
+            _ => unreachable!(),
+        }
+        let updates = guest_dhcp_bootstrap_updates(Some(&chain)).unwrap();
+        assert_eq!(updates.len(), if mode == 1 { 3 } else { 2 });
+        assert!(updates.iter().all(|update| update.pointer("/delete/rule/handle") != Some(&serde_json::json!(99))));
+        assert!(updates.last().unwrap().get("insert").is_some());
+    }
+    assert_eq!(guest_dhcp_bootstrap_updates(None).unwrap().len(), 1);
 }

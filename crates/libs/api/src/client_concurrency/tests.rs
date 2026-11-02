@@ -1,5 +1,4 @@
 use std::collections::BTreeSet;
-use std::sync::Arc;
 
 use pplx_space_feature_flags::FeatureFlagClient;
 use testcontainers::runners::AsyncRunner;
@@ -18,6 +17,20 @@ use pplx_space_test_env::TestResult;
 
 fn known_set(ids: &[&str]) -> BTreeSet<String> {
     ids.iter().map(|s| s.to_string()).collect()
+}
+
+/// [`ClientKey::classify`] against `config`'s static allowlist, as the
+/// limiter built from `config` would resolve it.
+fn classify(
+    client_id: Option<&str>,
+    config: &ClientConcurrencyConfig,
+    overrides: Option<&QuotaOverrides>,
+) -> ClientKey {
+    ClientKey::classify(
+        client_id,
+        &KnownClients::new(&config.known_clients),
+        overrides,
+    )
 }
 
 fn env_caps() -> ClientConcurrencyConfig {
@@ -63,7 +76,7 @@ fn classify_routes_only_allowlisted_ids_to_their_own_bucket() {
 
     // Known id → its own bucket.
     assert!(matches!(
-        ClientKey::classify(Some("foreground_client"), &config, None),
+        classify(Some("foreground_client"), &config, None),
         ClientKey::Client(_)
     ));
     // No id, blank id, and *unrecognized* id all collapse to the shared bucket —
@@ -76,7 +89,7 @@ fn classify_routes_only_allowlisted_ids_to_their_own_bucket() {
         Some("unspecified"),
     ] {
         assert_eq!(
-            ClientKey::classify(shared, &config, None),
+            classify(shared, &config, None),
             ClientKey::Unspecified,
             "{shared:?} must share the unspecified bucket"
         );
@@ -95,20 +108,20 @@ fn eppo_override_key_allowlists_a_client_at_runtime() {
 
     // Without the flag `newbot` is unknown → shared bucket.
     assert_eq!(
-        ClientKey::classify(Some("newbot"), &config, None),
+        classify(Some("newbot"), &config, None),
         ClientKey::Unspecified
     );
     // With the override present, `newbot` is allowlisted → its own bucket.
-    assert!(matches!(
-        ClientKey::classify(Some("newbot"), &config, Some(&overrides)),
-        ClientKey::Client(_)
-    ));
+    assert_eq!(
+        classify(Some("newbot"), &config, Some(&overrides)),
+        ClientKey::Client("newbot".into())
+    );
 }
 
 #[test]
 fn cap_for_falls_back_to_env_when_no_overrides() {
     let config = env_caps();
-    let foreground_client = ClientKey::classify(Some("foreground_client"), &config, None);
+    let foreground_client = classify(Some("foreground_client"), &config, None);
     assert_eq!(config.cap_for(&foreground_client, None), 128);
     assert_eq!(config.cap_for(&ClientKey::Unspecified, None), 16);
 }
@@ -121,12 +134,7 @@ fn eppo_overrides_take_precedence_over_env() {
     });
     let overrides: QuotaOverrides = serde_json::from_value(json).unwrap();
     let config = env_caps();
-    let cap = |id| {
-        config.cap_for(
-            &ClientKey::classify(id, &config, Some(&overrides)),
-            Some(&overrides),
-        )
-    };
+    let cap = |id| config.cap_for(&classify(id, &config, Some(&overrides)), Some(&overrides));
 
     // Per-client override wins.
     assert_eq!(cap(Some("foreground_client")), 256);
@@ -144,12 +152,7 @@ fn partial_eppo_overrides_fall_back_to_env_per_field() {
     let json = serde_json::json!({ "overrides": { "scheduled-client": 8 } });
     let overrides: QuotaOverrides = serde_json::from_value(json).unwrap();
     let config = env_caps();
-    let cap = |id| {
-        config.cap_for(
-            &ClientKey::classify(id, &config, Some(&overrides)),
-            Some(&overrides),
-        )
-    };
+    let cap = |id| config.cap_for(&classify(id, &config, Some(&overrides)), Some(&overrides));
 
     assert_eq!(cap(Some("scheduled-client")), 8);
     // Allowlisted, no override → env per-client cap.
@@ -240,7 +243,7 @@ fn a_rejected_override_map_reports_the_offending_value() {
 #[test]
 fn redis_key_is_namespaced_and_distinguishes_unspecified() {
     assert_eq!(
-        ClientKey::Client(Arc::from("foreground_client")).redis_key(),
+        ClientKey::Client("foreground_client".into()).redis_key(),
         "space:api:client_concurrency:v1:client:foreground_client"
     );
     assert_eq!(
@@ -251,7 +254,7 @@ fn redis_key_is_namespaced_and_distinguishes_unspecified() {
     // `:client:`, so it can't collide with the shared bucket.
     for adversarial in ["unspecified", "__unspecified__"] {
         assert_ne!(
-            ClientKey::Client(Arc::from(adversarial)).redis_key(),
+            ClientKey::Client(adversarial.into()).redis_key(),
             ClientKey::Unspecified.redis_key(),
             "client id {adversarial:?} must not share the shared-bucket key"
         );
@@ -400,7 +403,9 @@ fn admit(decision: ClientConcurrencyDecision) -> ClientConcurrencyGuard {
 
 fn assert_rejected(decision: ClientConcurrencyDecision) {
     match decision {
-        ClientConcurrencyDecision::Rejected { retry_after } => assert_eq!(retry_after, RETRY_AFTER),
+        ClientConcurrencyDecision::Rejected { retry_after, .. } => {
+            assert_eq!(retry_after, RETRY_AFTER)
+        }
         ClientConcurrencyDecision::Admitted(_) => panic!("expected rejected, got admitted"),
     }
 }
@@ -459,6 +464,97 @@ async fn unreachable_store_fails_open() {
             .try_acquire(Operation::Create, Some("foreground_client"))
             .await,
     );
+}
+
+#[test]
+fn key_set_entries_that_cant_name_a_client_are_ignored() {
+    // Reserved keys in any case, then entries that aren't Kubernetes label
+    // values: a space, an edge that isn't alphanumeric, a DogStatsD separator,
+    // and one character past the 63-character limit.
+    let rejected = [
+        "unknown",
+        "Unknown",
+        "overflow",
+        "OVERFLOW",
+        "native",
+        "Native",
+        "two words",
+        "-leading-dash",
+        "a|b",
+        "a,b",
+        &"x".repeat(64),
+    ];
+    let accepted = ["foreground_client", "batch.7", &"x".repeat(63)];
+    let entries: Vec<&str> = rejected.iter().chain(&accepted).copied().collect();
+
+    // Each entry once in the static allowlist, once only as an override key.
+    let static_only = ClientConcurrencyConfig {
+        known_clients: known_set(&entries),
+        ..env_caps()
+    };
+    let override_only = ClientConcurrencyConfig {
+        known_clients: BTreeSet::new(),
+        ..env_caps()
+    };
+    let overrides = QuotaOverrides {
+        overrides: entries.iter().map(|id| (id.to_string(), 5)).collect(),
+        ..QuotaOverrides::default()
+    };
+
+    for (config, overrides) in [(&static_only, None), (&override_only, Some(&overrides))] {
+        for id in rejected {
+            assert_eq!(
+                classify(Some(id), config, overrides),
+                ClientKey::Unspecified,
+                "{id:?} can't name a client, so it must share the unspecified bucket"
+            );
+        }
+        for id in accepted {
+            assert_eq!(
+                classify(Some(id), config, overrides),
+                ClientKey::Client(id.to_string().into()),
+                "{id:?} is a valid key-set entry"
+            );
+        }
+    }
+}
+
+#[test]
+fn override_only_ids_keep_their_bucket_past_the_interning_cap() {
+    let config = ClientConcurrencyConfig {
+        known_clients: BTreeSet::new(),
+        ..env_caps()
+    };
+    // Unique ids so no other test in this process has interned them, and more
+    // of them than the cap can hold however many runtime ids are already
+    // interned.
+    let ids: Vec<String> = (0..=MAX_RUNTIME_CLIENT_IDS)
+        .map(|n| format!("rotating-override-{}-{n}", Uuid::now_v7()))
+        .collect();
+    let overrides = QuotaOverrides {
+        overrides: ids.iter().map(|id| (id.clone(), 5)).collect(),
+        ..QuotaOverrides::default()
+    };
+
+    // Interning bounds memory, not buckets: every override-only id keeps its
+    // own bucket and cap however full the interning cap is.
+    let interned: Vec<Option<&'static str>> =
+        ids.iter().map(|id| intern_override_client_id(id)).collect();
+    for id in &ids {
+        let key = classify(Some(id), &config, Some(&overrides));
+        assert_eq!(key, ClientKey::Client(id.clone().into()));
+        assert_eq!(config.cap_for(&key, Some(&overrides)), 5);
+    }
+
+    // The interned set stops growing at the cap, and an id interned before it
+    // filled resolves to the same copy again rather than leaking another.
+    assert_eq!(interned.last(), Some(&None));
+    for (id, copy) in ids.iter().zip(&interned) {
+        if let Some(copy) = copy {
+            let again = intern_override_client_id(id).expect("interned ids stay interned");
+            assert!(std::ptr::eq(*copy, again));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -678,7 +774,7 @@ async fn disabled_limiter_short_circuits_before_the_store() -> TestResult {
     // Probe the shared store directly: the disabled call reserved nothing, so
     // this probe's own slot is the only member (count 1).
     let store = RedisConcurrencyStore::from_url(&url)?;
-    let key = ClientKey::Client(Arc::from(client.as_str())).redis_key();
+    let key = ClientKey::Client(client.clone().into()).redis_key();
     let probe = store
         .acquire(&key, 100, HOLD, KEY_TTL, &Uuid::now_v7().to_string(), false)
         .await?;

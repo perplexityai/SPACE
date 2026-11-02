@@ -21,8 +21,10 @@ enum Attempt {
 
 #[derive(Default)]
 pub(crate) struct Provisioning {
-    // At most two artifacts per required environment. Only current intent is
-    // retained, and observed installations evict their entries on every pass.
+    // Only artifacts of the last plan that reached reconcile, at most one
+    // entry each: each such pass keeps only its missing artifacts. An empty
+    // recipe clears the memo; an absent one, or a pass that fails before
+    // reconcile, leaves it as it was.
     attempts: Mutex<Vec<(runtime::ArtifactIdentity, Attempt)>>,
 }
 
@@ -71,29 +73,16 @@ impl Provisioning {
             Some(Attempt::Published(id)) => Err(Status::failed_precondition(format!(
                 "installation {id} succeeded but its artifact is still not verified in inventory"
             ))),
-            Some(Attempt::Active(id)) => {
-                match manager.operation(id.clone()).await {
-                    Ok(operation) => accept(&identity, Some(&id), operation),
-                    // A lost/expired job may be resubmitted after backoff. A
-                    // transport failure must not forget an otherwise live job.
-                    Err(error) if error.code() != Code::NotFound => return Err(error),
-                    Err(error) => Err(error),
-                }
-            }
-            None | Some(Attempt::Backoff { .. }) => match manager.install(identity.clone()).await {
-                Ok(operation) => accept(&identity, None, operation),
-                // No terminal job failure was observed. A lost reply may hide
-                // an accepted job; the next pass safely rejoins it by identity.
-                Err(error)
-                    if matches!(
-                        error.code(),
-                        Code::Unavailable | Code::DeadlineExceeded | Code::Cancelled
-                    ) =>
-                {
-                    return Err(error);
-                }
-                Err(error) => Err(error),
+            Some(Attempt::Active(id)) => match manager.operation(id.clone()).await {
+                Ok(operation) => accept(&identity, Some(&id), operation),
+                // rtmgr no longer knows the job: it expired before this poll,
+                // so no failure was observed. Submit afresh, which rejoins a
+                // live job for the same identity.
+                Err(error) if error.code() == Code::NotFound => submit(manager, &identity).await?,
+                // A transport failure must not forget an otherwise live job.
+                Err(error) => return Err(error),
             },
+            None | Some(Attempt::Backoff { .. }) => submit(manager, &identity).await?,
         };
         match result {
             Ok(attempt) => {
@@ -111,6 +100,28 @@ impl Provisioning {
                 Err(error)
             }
         }
+    }
+}
+
+/// Submit an install. The outer error is a transient RPC failure that observed
+/// no job outcome, so the caller retries next pass without backoff: a lost
+/// reply may hide an accepted job, which the next submission rejoins by
+/// identity. The inner result is the job's acceptance or a failure to back off.
+async fn submit(
+    manager: &impl ArtifactManager,
+    identity: &runtime::ArtifactIdentity,
+) -> Result<Result<Attempt, Status>, Status> {
+    match manager.install(identity.clone()).await {
+        Ok(operation) => Ok(accept(identity, None, operation)),
+        Err(error)
+            if matches!(
+                error.code(),
+                Code::Unavailable | Code::DeadlineExceeded | Code::Cancelled
+            ) =>
+        {
+            Err(error)
+        }
+        Err(error) => Ok(Err(error)),
     }
 }
 

@@ -276,6 +276,9 @@ pub(super) enum Commands {
         /// Restore from checkpoint or "suspend" state instead of fresh boot
         #[arg(long)]
         checkpoint: Option<String>,
+        /// Guest memory in MiB for this start
+        #[arg(long)]
+        memory: Option<u32>,
         /// Start from base memory snapshot instead of cold boot
         #[arg(long)]
         from_warm: bool,

@@ -36,6 +36,7 @@ fn insert_sandbox(conn: &Connection, sandbox_id: SandboxId) -> AutoLifecycleDele
     crate::db::insert_sandbox(
         conn,
         crate::db::InsertSandboxParams {
+            guest_image: Default::default(),
             id: &sandbox_id.to_string(),
             uuid8: &runtime_label,
             state: crate::state::SandboxState::Started,
@@ -1339,7 +1340,7 @@ fn deleting_row_rejects_runtime_attachment_without_retiring_its_receipt() {
             slot: 7,
             guest_cid: 37,
             pid: std::process::id(),
-            spaced_host_pid: 10_001,
+            spaced_host_pid: Some(10_001),
             netgtw_pid: 10_002,
             vsock_uds_path: "/space/run/firecracker/sandboxes/test/root/v.sock",
             api_socket_path: "/space/run/firecracker/sandboxes/test/api.sock",
@@ -1502,7 +1503,7 @@ fn generation_writers_discard_an_older_pending_receipt_without_complete_route_ev
             slot: 7,
             guest_cid: 37,
             pid: std::process::id(),
-            spaced_host_pid: 10_001,
+            spaced_host_pid: Some(10_001),
             netgtw_pid: 10_002,
             vsock_uds_path: "/space/run/firecracker/sandboxes/test/root/v.sock",
             api_socket_path: "/space/run/firecracker/sandboxes/test/api.sock",

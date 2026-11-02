@@ -34,28 +34,42 @@ fn chunked_body(chunks: Vec<Vec<u8>>) -> Body {
     Body::from_stream(stream::iter(chunks.into_iter().map(Ok::<_, Infallible>)))
 }
 
-async fn collect_spooled_write(upload: StagedUpload, path: &str) -> (SpacedWriteOpen, Vec<u8>) {
-    let file = tokio::fs::File::open(upload.path).await.unwrap();
+/// The open message and each data message's chunk, as written to the guest.
+async fn collect_spooled_write_chunks(
+    upload: &StagedUpload,
+    path: &str,
+) -> (SpacedWriteOpen, Vec<Vec<u8>>) {
     let (read_failed, _read_failure) = tokio::sync::oneshot::channel();
-    let requests =
-        spooled_write_requests(SandboxId::new(), path.to_string(), file, None, read_failed)
-            .collect::<Vec<_>>()
-            .await;
+    let requests = spooled_write_requests(
+        SandboxId::new(),
+        path.to_string(),
+        upload.chunks(),
+        None,
+        read_failed,
+    )
+    .collect::<Vec<_>>()
+    .await;
     let mut requests = requests.into_iter();
     let open = requests.next().unwrap().operation.unwrap().message.unwrap();
     let spaced_write_request::Message::Open(open) = open else {
         panic!("first request must open the file");
     };
-    let mut data = Vec::new();
-    for request in requests {
-        let spaced_write_request::Message::Data(chunk) =
-            request.operation.unwrap().message.unwrap()
-        else {
-            panic!("requests after open must carry file data");
-        };
-        data.extend_from_slice(&chunk);
-    }
-    (open, data)
+    let chunks = requests
+        .map(|request| {
+            let spaced_write_request::Message::Data(chunk) =
+                request.operation.unwrap().message.unwrap()
+            else {
+                panic!("requests after open must carry file data");
+            };
+            chunk
+        })
+        .collect();
+    (open, chunks)
+}
+
+async fn collect_spooled_write(upload: &StagedUpload, path: &str) -> (SpacedWriteOpen, Vec<u8>) {
+    let (open, chunks) = collect_spooled_write_chunks(upload, path).await;
+    (open, chunks.concat())
 }
 
 #[test]
@@ -95,7 +109,7 @@ async fn multipart_single_file_is_spooled_with_filename_and_content() {
 
     assert_eq!(writes.len(), 1);
     let (path, upload) = writes.pop().unwrap();
-    let (open, data) = collect_spooled_write(upload, &path).await;
+    let (open, data) = collect_spooled_write(&upload, &path).await;
     assert_eq!(path, "nested/a.txt");
     assert_eq!(open.path, "nested/a.txt");
     assert_eq!(data, b"hello");
@@ -122,7 +136,7 @@ async fn multipart_multiple_files_are_spooled_independently() {
     assert_eq!(writes.len(), 2);
     let mut actual = Vec::new();
     for (path, upload) in writes {
-        let (open, data) = collect_spooled_write(upload, &path).await;
+        let (open, data) = collect_spooled_write(&upload, &path).await;
         actual.push((open.path, data));
     }
     assert_eq!(
@@ -145,7 +159,7 @@ async fn multipart_path_query_overrides_filename_and_rejects_multiple_files() {
     let mut writes =
         resolve_multipart_uploads(uploads, Some("override.txt".to_string()), None).unwrap();
     let (path, upload) = writes.pop().unwrap();
-    let (open, data) = collect_spooled_write(upload, &path).await;
+    let (open, data) = collect_spooled_write(&upload, &path).await;
     assert_eq!(path, "override.txt");
     assert_eq!(open.path, "override.txt");
     assert_eq!(data, b"content");
@@ -396,7 +410,7 @@ async fn multipart_file_part_with_filename_before_name_is_spooled() {
     assert_eq!(uploads.len(), 1);
     let upload = uploads.into_iter().next().unwrap();
     assert_eq!(upload.filename.as_deref(), Some("my name.txt"));
-    let (_, data) = collect_spooled_write(upload.upload, "/my name.txt").await;
+    let (_, data) = collect_spooled_write(&upload.upload, "/my name.txt").await;
     assert_eq!(data, b"content");
 }
 
@@ -634,7 +648,7 @@ async fn multipart_framing_overhead_beyond_the_parse_buffer_is_accepted() {
     assert_eq!(uploads.len(), 1);
     let upload = uploads.into_iter().next().unwrap();
     assert_eq!(upload.filename.as_deref(), Some("last.txt"));
-    let (_, data) = collect_spooled_write(upload.upload, "/last.txt").await;
+    let (_, data) = collect_spooled_write(&upload.upload, "/last.txt").await;
     assert_eq!(data, b"content");
 }
 
@@ -662,7 +676,7 @@ async fn multipart_file_larger_than_the_parse_buffer_streams_in_frames() {
     assert_eq!(uploads.len(), 1);
     let upload = uploads.into_iter().next().unwrap();
     assert_eq!(upload.filename.as_deref(), Some("large.bin"));
-    let (_, data) = collect_spooled_write(upload.upload, "/large.bin").await;
+    let (_, data) = collect_spooled_write(&upload.upload, "/large.bin").await;
     assert_eq!(data, content);
 }
 
@@ -822,14 +836,12 @@ async fn octet_stream_upload_is_spooled_and_written_in_chunks() {
     )
     .await
     .unwrap();
-    assert_eq!(upload.len, b"hello world".len());
-    let file = tokio::fs::File::open(&upload.path).await.unwrap();
-
+    assert_eq!(upload.len(), b"hello world".len());
     let (read_failed, _read_failure) = tokio::sync::oneshot::channel();
     let requests = spooled_write_requests(
         sandbox_id,
         "/tmp/hello.txt".to_string(),
-        file,
+        upload.chunks(),
         Some(GuestUserName::parse("user").unwrap()),
         read_failed,
     )
@@ -887,27 +899,6 @@ async fn in_memory_write_requests_are_replayable() {
     assert_eq!(first.len(), 2);
 }
 
-/// Yields `chunks`, then fails every later read.
-struct FailingAfter {
-    chunks: std::collections::VecDeque<Vec<u8>>,
-}
-
-impl tokio::io::AsyncRead for FailingAfter {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        _context: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::task::Poll::Ready(match self.chunks.pop_front() {
-            Some(chunk) => {
-                buf.put_slice(&chunk);
-                Ok(())
-            }
-            None => Err(std::io::Error::other("injected spool read failure")),
-        })
-    }
-}
-
 #[tokio::test]
 async fn spool_read_failure_signals_the_transfer_instead_of_ending_the_stream() {
     use futures_util::FutureExt as _;
@@ -916,9 +907,10 @@ async fn spool_read_failure_signals_the_transfer_instead_of_ending_the_stream() 
     let mut stream = Box::pin(spooled_write_requests(
         SandboxId::new(),
         "/workspace/a".to_string(),
-        FailingAfter {
-            chunks: [b"first chunk".to_vec()].into(),
-        },
+        stream::iter([
+            Ok(b"first chunk".to_vec()),
+            Err(std::io::Error::other("injected spool read failure")),
+        ]),
         None,
         read_failed,
     ));
@@ -947,24 +939,154 @@ fn spooled_write_must_acknowledge_every_staged_byte() {
     check_spooled_write_len(12, 11).unwrap_err();
 }
 
-async fn spool_dir_entries(dir: &std::path::Path) -> usize {
-    std::fs::read_dir(dir).unwrap().count()
-}
-
-/// Spool removal runs on a blocking task after the guard drops.
-async fn wait_for_empty_spool_dir(dir: &std::path::Path) {
-    for _ in 0..500 {
-        if spool_dir_entries(dir).await == 0 {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    panic!("spool files were not removed: {dir:?}");
+/// The whole part, as one attempt would stream it.
+async fn read_staged(upload: &StagedUpload) -> std::io::Result<Vec<u8>> {
+    let chunks = upload.chunks().collect::<Vec<_>>().await;
+    Ok(chunks
+        .into_iter()
+        .collect::<std::io::Result<Vec<_>>>()?
+        .concat())
 }
 
 #[tokio::test]
-async fn staged_spool_files_are_removed_when_a_later_part_fails() {
+async fn staged_parts_leave_no_spool_dir_entries() {
     let dir = tempfile::tempdir().unwrap();
+    let parts = (0..64usize)
+        .map(|index| {
+            let content = vec![u8::try_from(index).unwrap(); 1000 + index];
+            (format!("{index}.txt"), content)
+        })
+        .collect::<Vec<_>>();
+    let body = multipart_body(
+        &parts
+            .iter()
+            .map(|(name, content)| ("file", Some(name.as_str()), content.as_slice()))
+            .collect::<Vec<_>>(),
+    );
+    let mut spool = SpoolFiles::in_dir(dir.path().to_path_buf());
+    let uploads = spool_multipart_uploads(Body::from(body), MULTIPART_BOUNDARY, true, &mut spool)
+        .await
+        .unwrap();
+    assert!(spool.has_file());
+    // Every part is staged and readable, and none of them has a name.
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    assert_eq!(uploads.len(), parts.len());
+    for (upload, (_, content)) in uploads.iter().zip(&parts) {
+        assert_eq!(upload.upload.len(), content.len());
+        assert_eq!(&read_staged(&upload.upload).await.unwrap(), content);
+    }
+}
+
+#[tokio::test]
+async fn every_write_attempt_streams_the_whole_part_in_write_chunks() {
+    let content = (0..E2B_FILE_WRITE_CHUNK_BYTES * 2 + 17)
+        .map(|index| u8::try_from(index % 251).unwrap())
+        .collect::<Vec<_>>();
+    let mut spool = SpoolFiles::default();
+    // A small part first, so this one starts mid-file.
+    spool_body_upload(chunked_body(vec![b"first".to_vec()]), &mut spool)
+        .await
+        .unwrap();
+    let upload = spool_body_upload(chunked_body(vec![content.clone()]), &mut spool)
+        .await
+        .unwrap();
+
+    // An attempt abandoned after its first chunk doesn't move the retry.
+    let mut abandoned = Box::pin(upload.chunks());
+    let first = abandoned.next().await.unwrap().unwrap();
+    assert_eq!(first.len(), E2B_FILE_WRITE_CHUNK_BYTES);
+    let (_open, chunks) = collect_spooled_write_chunks(&upload, "/workspace/large").await;
+    assert_eq!(
+        chunks.iter().map(Vec::len).collect::<Vec<_>>(),
+        [E2B_FILE_WRITE_CHUNK_BYTES, E2B_FILE_WRITE_CHUNK_BYTES, 17]
+    );
+    assert_eq!(chunks.concat(), content);
+    // The abandoned attempt, resumed, still reads its own position.
+    let rest = abandoned.next().await.unwrap().unwrap();
+    assert_eq!(
+        rest,
+        content[E2B_FILE_WRITE_CHUNK_BYTES..2 * E2B_FILE_WRITE_CHUNK_BYTES]
+    );
+}
+
+#[tokio::test]
+async fn staged_part_cut_short_in_the_spool_file_fails_the_read() {
+    let mut spool = SpoolFiles::default();
+    let mut upload = spool_body_upload(chunked_body(vec![b"hello".to_vec()]), &mut spool)
+        .await
+        .unwrap();
+    // Claims more than the file holds.
+    upload.overstate_len(1);
+    let chunks = upload.chunks().collect::<Vec<_>>().await;
+    let [Ok(first), Err(error)] = chunks.as_slice() else {
+        panic!("expected one chunk, then a read error: {chunks:?}");
+    };
+    assert_eq!(first, b"hello");
+    assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+}
+
+#[tokio::test]
+async fn no_part_starts_after_an_unfinished_one() {
+    let mut spool = SpoolFiles::default();
+    {
+        let mut abandoned = spool.create().await.unwrap();
+        abandoned.write_chunk(b"partial").await.unwrap();
+    }
+    // Where the abandoned part's bytes ended isn't known, so nothing is
+    // staged after them.
+    let error = spool.create().await.unwrap_err();
+    assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn a_part_whose_write_failed_never_finishes() {
+    let mut spool = SpoolFiles::default();
+    // Read-only, so every write fails.
+    spool
+        .replace_writer(std::fs::File::open("/dev/null").unwrap())
+        .await;
+    let mut upload = spool.create().await.unwrap();
+    // tokio accepts the first chunk and fails its write in the background,
+    // then reports that failure, once, on the next write.
+    upload.write_chunk(b"first").await.unwrap();
+    upload.write_chunk(b"second").await.unwrap_err();
+    // tokio has forgotten that failure, so a third write would be accepted;
+    // the upload refuses it.
+    upload.write_chunk(b"third").await.unwrap_err();
+    // The flush now has nothing left to report, so only the upload itself
+    // remembers that its bytes never landed.
+    let error = upload.finish().await.unwrap_err();
+    assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn a_part_whose_write_was_cancelled_never_finishes() {
+    use futures_util::FutureExt as _;
+
+    // Nothing reads the pipe, so once its buffer fills, tokio's background
+    // write blocks until the read end closes.
+    let (pipe_reader, pipe_writer) = std::io::pipe().unwrap();
+    let mut spool = SpoolFiles::default();
+    spool
+        .replace_writer(std::fs::File::from(std::os::fd::OwnedFd::from(pipe_writer)))
+        .await;
+    let mut upload = spool.create().await.unwrap();
+    // More than tokio takes in one poll: it accepts the first piece, then
+    // waits on the blocked write, so the write is abandoned partway.
+    let chunk = vec![1; 2 * E2B_FILE_WRITE_CHUNK_BYTES];
+    assert!(upload.write_chunk(&chunk).now_or_never().is_none());
+    // Without the part refusing, this flush would wait on the blocked write.
+    let error = tokio::time::timeout(StdDuration::from_secs(5), upload.finish())
+        .await
+        .expect("finish must refuse a cancelled part without flushing")
+        .unwrap_err();
+    assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+    // Ends the blocked write, which then fails with a broken pipe.
+    drop(pipe_reader);
+}
+
+#[tokio::test]
+async fn spool_file_is_released_when_a_later_part_fails() {
     let mut body = multipart_body(&[
         ("file", Some("a.txt"), b"a"),
         ("file", Some("b.txt"), b"b"),
@@ -976,41 +1098,43 @@ async fn staged_spool_files_are_removed_when_a_later_part_fails() {
         format!("--{MULTIPART_BOUNDARY}\r\nContent-Disposition: form-data; name=\"file\"")
             .as_bytes(),
     );
-    let mut spool = SpoolFiles::in_dir(dir.path().to_path_buf());
+    let mut spool = SpoolFiles::default();
+    let file = spool.tracked_file().await;
     spool_multipart_uploads(Body::from(body), MULTIPART_BOUNDARY, true, &mut spool)
         .await
         .unwrap_err();
-    assert_eq!(spool_dir_entries(dir.path()).await, 3);
+    // The failed request dropped its staged parts; only the guard holds it.
+    assert_eq!(file.strong_count(), 1);
 
     drop(spool);
-    wait_for_empty_spool_dir(dir.path()).await;
+    assert_eq!(file.strong_count(), 0);
 }
 
 #[tokio::test]
-async fn staged_spool_files_are_removed_when_the_request_is_cancelled() {
-    let dir = tempfile::tempdir().unwrap();
+async fn spool_file_is_released_when_the_request_is_cancelled() {
     let staged = multipart_body(&[("file", Some("a.txt"), b"a"), ("file", Some("b.txt"), b"b")]);
     // Both parts' headers arrive and the body stalls inside the second
-    // part's data, so both spool files exist but the request never finishes.
+    // part's data, so the first part is staged but the request never finishes.
     let prefix = staged[..staged.len() - format!("--{MULTIPART_BOUNDARY}--\r\n").len()].to_vec();
     let body =
         Body::from_stream(stream::iter([Ok::<_, Infallible>(prefix)]).chain(stream::pending()));
-    let spool_dir = dir.path().to_path_buf();
+    let mut spool = SpoolFiles::default();
+    let file = spool.tracked_file().await;
     let request = tokio::spawn(async move {
-        let mut spool = SpoolFiles::in_dir(spool_dir);
         spool_multipart_uploads(body, MULTIPART_BOUNDARY, true, &mut spool).await
     });
+    // The guard plus the first staged part.
     for _ in 0..500 {
-        if spool_dir_entries(dir.path()).await == 2 {
+        if file.strong_count() == 2 {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    assert_eq!(spool_dir_entries(dir.path()).await, 2);
+    assert_eq!(file.strong_count(), 2);
 
     request.abort();
     assert!(request.await.unwrap_err().is_cancelled());
-    wait_for_empty_spool_dir(dir.path()).await;
+    assert_eq!(file.strong_count(), 0);
 }
 
 #[tokio::test]
@@ -1065,7 +1189,6 @@ async fn write_completes_when_the_spool_was_read_to_the_end() {
 
 #[tokio::test]
 async fn invalid_multipart_filename_is_rejected_before_spooling() {
-    let dir = tempfile::tempdir().unwrap();
     // Both pass multipart header parsing and fail only guest-path validation:
     // a tab is a control character httparse allows in header values.
     for (filename, message) in [
@@ -1076,13 +1199,13 @@ async fn invalid_multipart_filename_is_rejected_before_spooling() {
         ("a\tb.txt", "guest path must be bounded and control-free"),
     ] {
         let body = multipart_body(&[("file", Some(filename), b"content")]);
-        let mut spool = SpoolFiles::in_dir(dir.path().to_path_buf());
+        let mut spool = SpoolFiles::default();
         let error = spool_multipart_uploads(Body::from(body), MULTIPART_BOUNDARY, true, &mut spool)
             .await
             .unwrap_err();
         assert_eq!(error.status, StatusCode::BAD_REQUEST, "{filename:?}");
         assert_eq!(error.message, message, "{filename:?}");
-        assert_eq!(spool_dir_entries(dir.path()).await, 0, "{filename:?}");
+        assert!(!spool.has_file(), "{filename:?}");
     }
 }
 
@@ -1094,8 +1217,7 @@ async fn filename_with_an_escaped_backslash_is_rejected_only_when_it_names_the_d
             "--{MULTIPART_BOUNDARY}\r\nContent-Disposition: {header}\r\n\r\ncontent\r\n--{MULTIPART_BOUNDARY}--\r\n"
         )
     };
-    let dir = tempfile::tempdir().unwrap();
-    let mut spool = SpoolFiles::in_dir(dir.path().to_path_buf());
+    let mut spool = SpoolFiles::default();
     let error = spool_multipart_uploads(Body::from(body()), MULTIPART_BOUNDARY, true, &mut spool)
         .await
         .unwrap_err();
@@ -1105,7 +1227,7 @@ async fn filename_with_an_escaped_backslash_is_rejected_only_when_it_names_the_d
         "{}",
         error.message
     );
-    assert_eq!(spool_dir_entries(dir.path()).await, 0);
+    assert!(!spool.has_file());
 
     // With a path query the filename is ignored, so the part is written.
     let mut spool = SpoolFiles::default();

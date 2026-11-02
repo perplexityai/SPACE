@@ -9,6 +9,7 @@ use tracing_subscriber::layer::SubscriberExt as _;
 
 mod export;
 mod lookup_rpc;
+mod schema_guards;
 
 #[tokio::test(flavor = "current_thread")]
 async fn background_loop_observer_contains_inner_panic() {
@@ -63,6 +64,108 @@ fn insert_ready_build(conn: &rusqlite::Connection, name: &str, content_hash: &st
         },
     )
     .unwrap();
+}
+
+fn pool_sandbox(
+    sandbox_id: &str,
+    pool_template: &str,
+    lifecycle: sbx_proto::SandboxLifecycleState,
+) -> sbx_proto::SandboxListElement {
+    sbx_proto::SandboxListElement {
+        sandbox_id: sandbox_id.to_string(),
+        template: Some(pool_template.to_string()),
+        pool_template: Some(pool_template.to_string()),
+        lifecycle: Some(lifecycle as i32),
+        ..Default::default()
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn omitted_sandbox_counts_skip_the_sandbox_listing_and_keep_the_rest_of_the_reply() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let conn = crate::db::test_conn();
+    insert_ready_build(&conn, "pooled", "sha256:pooled");
+    insert_ready_build(&conn, "unpooled", "sha256:unpooled");
+    crate::db::insert_pool(&conn, "pooled", 3, "snapshot", 2, 1024).unwrap();
+    let listing = vec![
+        pool_sandbox("warm-a", "pooled", sbx_proto::SandboxLifecycleState::Paused),
+        pool_sandbox("warm-b", "pooled", sbx_proto::SandboxLifecycleState::Paused),
+        pool_sandbox(
+            "filling",
+            "pooled",
+            sbx_proto::SandboxLifecycleState::Creating,
+        ),
+    ];
+    let listings = Arc::new(AtomicUsize::new(0));
+    let lister = PoolSandboxLister::new({
+        let listings = Arc::clone(&listings);
+        move |_| {
+            listings.fetch_add(1, Ordering::SeqCst);
+            let listing = listing.clone();
+            Box::pin(async move { listing })
+        }
+    });
+    let service = TemplateManagerService::new(conn)
+        .unwrap()
+        .without_sbx_connect_retries()
+        .with_pool_sandbox_lister(lister);
+
+    let counted_templates = service
+        .list_templates(internal_request(ListTemplatesRequest::default()))
+        .await
+        .unwrap()
+        .into_inner();
+    let counted_pools = service
+        .pool_status(internal_request(PoolStatusRequest::default()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(listings.load(Ordering::SeqCst), 2);
+    let pooled = counted_templates
+        .templates
+        .iter()
+        .find(|template| template.name == "pooled")
+        .expect("pooled template listed");
+    assert_eq!(pooled.pool_current, 2);
+    assert_eq!(counted_pools.pools.len(), 1);
+    assert_eq!(counted_pools.pools[0].current_count, 2);
+    assert_eq!(counted_pools.pools[0].pending_count, 1);
+    assert_eq!(counted_pools.pools[0].sandbox_ids.len(), 3);
+
+    let omitted_templates = service
+        .list_templates(internal_request(ListTemplatesRequest {
+            omit_sandbox_counts: true,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let omitted_pools = service
+        .pool_status(internal_request(PoolStatusRequest {
+            template: None,
+            omit_sandbox_counts: true,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        listings.load(Ordering::SeqCst),
+        2,
+        "omitting the counts must not list the node's sandboxes"
+    );
+
+    let mut expected_templates = counted_templates;
+    for template in &mut expected_templates.templates {
+        template.pool_current = 0;
+    }
+    assert_eq!(omitted_templates, expected_templates);
+    let mut expected_pools = counted_pools;
+    for pool in &mut expected_pools.pools {
+        pool.current_count = 0;
+        pool.pending_count = 0;
+        pool.sandbox_ids.clear();
+    }
+    assert_eq!(omitted_pools, expected_pools);
 }
 
 #[test]
@@ -156,7 +259,7 @@ fn list_templates_projects_stored_execution_metadata() {
         .build()
         .unwrap();
     let response = runtime
-        .block_on(service.list_templates(internal_request(ListTemplatesRequest {})))
+        .block_on(service.list_templates(internal_request(ListTemplatesRequest::default())))
         .unwrap()
         .into_inner();
 
@@ -2196,25 +2299,22 @@ async fn register_template_uses_producer_algorithm(
         std::fs::copy(fixture.path().join(file), source.join(file)).unwrap();
     }
     if cloud_hypervisor {
-        use pplx_space_common_core::types::{
-            Arch, ExecutionMetadata, GuestOperatingSystem, GuestPlatform, RuntimeIdentity,
-            RuntimeKind, TemplateMetadata,
-        };
+        use pplx_space_common_core::types::{Arch, TemplateMetadata};
+        let environments =
+            pplx_space_execution_catalog::catalog::CompiledEnvironment::for_architecture(
+                Arch::X86_64,
+            )
+            .unwrap();
+        let definition = environments
+            .iter()
+            .find(|environment| environment.name() == "ch-54.0-linux-7.2.8")
+            .unwrap()
+            .definition();
         let mut metadata = TemplateMetadata::default();
         metadata.set_execution_metadata(
-            ExecutionMetadata::new(
-                RuntimeIdentity {
-                    kind: RuntimeKind::CloudHypervisor,
-                    version: "54.0".parse().unwrap(),
-                },
-                GuestPlatform {
-                    os: GuestOperatingSystem::Linux,
-                    architecture: Arch::X86_64,
-                },
-                None,
-                vec![],
-            )
-            .unwrap(),
+            definition
+                .bind_execution(definition.execution_requirements().unwrap())
+                .unwrap(),
         );
         metadata.arch = Some("x86_64".into());
         std::fs::write(
@@ -2278,4 +2378,76 @@ async fn register_template_uses_producer_algorithm(
         assert_eq!(manifest.runtime, "ch");
         assert_eq!(build.runtime, "ch");
     }
+}
+
+#[tokio::test]
+async fn firmware_template_refuses_pool_and_snapshot_intent_before_persisting() {
+    let root = tempfile::tempdir().unwrap();
+    let conn = crate::db::test_conn();
+    let execution = serde_json::from_value(serde_json::json!({
+        "environment": format!("sha256:{}", "a".repeat(64)),
+        "runtime": {"kind": "cloud-hypervisor", "version": "54.0"},
+        "guest": {"os": "windows", "architecture": "x86_64"},
+        "components": [{"kind":"firmware", "role":"firmware", "version":"test-1",
+            "digest": format!("sha256:{}", "b".repeat(64)), "format":"edk2-fd"}]
+    }))
+    .unwrap();
+    let image = serde_json::from_value(serde_json::json!({
+        "version":1, "disk":"opaque_raw_disk", "network":"slot_dhcp_v1", "agent":"absent",
+        "readiness":{"kind":"tcp_service", "port":3389}
+    }))
+    .unwrap();
+    let mut manifest = pplx_space_common_core::types::TemplateManifest {
+        guest_image: Some(image),
+        ..Default::default()
+    };
+    manifest.set_execution_metadata(execution);
+    let hash = format!("blake3:{}", "c".repeat(64));
+    crate::db::upsert_build(
+        &conn,
+        &crate::db::BuildUpsert {
+            name: "firmware-test",
+            content_hash: &hash,
+            build_date: "2026-01-01T00:00:00Z",
+            manifest_json: &serde_json::to_string(&manifest).unwrap(),
+            runtime: "ch",
+            arch: "x86_64",
+            artifact_size_bytes: 0,
+            state: "ready",
+        },
+    )
+    .unwrap();
+    let service = TemplateManagerService::new_with_template_root(conn, root.path()).unwrap();
+    let original = crate::db::get_template_settings(&service.db.lock().unwrap(), "firmware-test")
+        .unwrap()
+        .unwrap();
+    let pool = service
+        .create_pool(internal_request(CreatePoolRequest {
+            template: "firmware-test".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    let snapshot = service
+        .update_template_snapshot_policy(internal_request(UpdateTemplateSnapshotPolicyRequest {
+            template: "firmware-test".into(),
+            ensure_base_snapshot: true,
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(pool.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(snapshot.code(), tonic::Code::FailedPrecondition);
+    let db = service.db.lock().unwrap();
+    assert!(crate::db::get_pool(&db, "firmware-test").unwrap().is_none());
+    let retained = crate::db::get_template_settings(&db, "firmware-test")
+        .unwrap()
+        .unwrap();
+    assert_eq!(retained.ensure_base_snapshot, original.ensure_base_snapshot);
+    assert_eq!(
+        retained.base_snapshot_policy_set_at,
+        original.base_snapshot_policy_set_at
+    );
+    assert_eq!(retained.snapshot_vcpu, original.snapshot_vcpu);
+    assert_eq!(retained.snapshot_memory_mib, original.snapshot_memory_mib);
 }

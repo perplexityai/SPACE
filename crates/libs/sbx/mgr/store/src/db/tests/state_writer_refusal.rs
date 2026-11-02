@@ -89,6 +89,7 @@ fn with_insert_params<T>(
     let process_env = BTreeMap::new();
     let auto_lifecycle = AutoLifecyclePolicy::disabled();
     let inserted = insert(InsertSandboxParams {
+        guest_image: Default::default(),
         id: &id,
         uuid8: &uuid8,
         state,

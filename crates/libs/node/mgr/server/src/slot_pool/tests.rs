@@ -2654,6 +2654,81 @@ mod slot_pool_tests {
         let _ = std::fs::remove_dir_all(temp_root);
     }
 
+    /// Cleanup releases the slot while it still holds the sandbox's mutation
+    /// claim, so the first reset attempt defers. That deferral is not a reset
+    /// failure: the reset runs once the claim drops, not after the backoff,
+    /// and not when the scan cursor next reaches the slot.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn released_slot_resets_once_the_cleanup_claim_drops() {
+        // Ten scan pages of dirty rows, so most scans miss slot 0.
+        const BACKLOG: u32 = 10 * 2 * RESET_CONCURRENCY as u32;
+        let cache_root = tempfile::tempdir().unwrap();
+        let mut config = NetworkPoolConfig::new(BACKLOG + 1);
+        config.target_ready_slots = 0;
+        config.retained_ready_slots = 0;
+        config.min_ready_slots = 0;
+        config.sandbox_cache_dir = cache_root.path().to_path_buf();
+        let mut pool = test_pool(config);
+        let (sender, wake) = mpsc::channel(1);
+        std::sync::Arc::get_mut(&mut pool).unwrap().job_tx = sender;
+        let sandbox_id = SandboxId::new().to_string();
+        pool.db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE network_slots
+                 SET generation = 1, state = 'leased', health = 'healthy',
+                     sandbox_id = ?1, sandbox_uid = ?2, pid = NULL, lease_kind = ?3,
+                     memory_reservation_mib = 8320
+                 WHERE slot_id = 0",
+                params![
+                    sandbox_id,
+                    net::sandbox_uid_for_slot(0),
+                    LeaseKind::Ephemeral.as_str()
+                ],
+            )
+            .unwrap();
+        // Long-running owners hold the backlog, so scans page past it.
+        pool.db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE network_slots SET state = 'dirty' WHERE slot_id BETWEEN 1 AND ?1",
+                [BACKLOG],
+            )
+            .unwrap();
+        pool.active_resets.lock().unwrap().extend(1..=BACKLOG);
+        // With no ready-slot target and an ephemeral lease, the reset and
+        // maintenance reach host networking only through this teardown.
+        spawn_worker_with(pool.clone(), wake, |_, _, _| Ok(()));
+
+        let cleanup = pool.try_claim_sandbox_mutation(&sandbox_id).unwrap();
+        pool.release(&sandbox_id).unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(record(&pool, 0).state, SlotState::Dirty);
+
+        drop(cleanup);
+        let released = tokio::time::Instant::now();
+        while record(&pool, 0).state != SlotState::Missing {
+            assert!(
+                released.elapsed() < 2 * POOL_FILL_RETRY_DELAY,
+                "the reset never ran"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            released.elapsed() < Duration::from_secs(1),
+            "the reset waited {:?} after the claim dropped",
+            released.elapsed()
+        );
+        pool.shutdown_token.cancel();
+        pool.task_tracker.close();
+        tokio::time::timeout(Duration::from_secs(1), pool.task_tracker.wait())
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn set_pid_fails_without_active_lease() {
         let mut config = NetworkPoolConfig::new(1);

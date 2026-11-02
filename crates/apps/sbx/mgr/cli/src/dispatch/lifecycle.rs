@@ -67,6 +67,7 @@ pub(super) async fn handle(
                     blocking,
                     start_context: None,
                     target_state: 0,
+                    runtime_upgrade: None,
                 })
                 .await
                 .unwrap_or_else(|e| exit_error(e));

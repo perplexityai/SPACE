@@ -91,7 +91,7 @@ fn simulated_kubernetes_identity_fills_a_canonical_node_id() {
 }
 
 #[tokio::test]
-async fn create_then_state_then_start_then_list() {
+async fn create_then_state_then_start() {
     let (_dir, svc, _internal, _state) = fresh_pair("node-a");
 
     let create = svc
@@ -135,17 +135,6 @@ async fn create_then_state_then_start_then_list() {
     }))
     .await
     .unwrap();
-
-    let list = svc
-        .list_sandboxes(Request::new(sbx::ListRequest::default()))
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(list.sandboxes.len(), 1);
-    assert_eq!(
-        list.sandboxes[0].observed_lifecycle().unwrap(),
-        sbx::SandboxLifecycleState::Started
-    );
 }
 
 #[tokio::test]
@@ -253,6 +242,7 @@ async fn suspend_on_node_a_then_wake_on_node_b_restores() {
             blocking: true,
             start_context: None,
             target_state: 0,
+            runtime_upgrade: None,
         }))
         .await
         .unwrap()
@@ -489,22 +479,6 @@ async fn spaced_write_rejects_path_traversal() {
         })];
     let stream = tokio_stream::iter(messages);
     let err = super::spaced_write_impl(&state, stream).await.unwrap_err();
-    assert_eq!(err.code(), tonic::Code::InvalidArgument);
-}
-
-#[tokio::test]
-async fn public_wake_rejects_start_context() {
-    let (_dir, svc, _internal, _state) = fresh_pair("node-a");
-    let err = svc
-        .wake_sandbox(Request::new(sbx::WakeRequest {
-            implicit_wake_source: 0,
-            sandbox_id: "sbx-1".into(),
-            blocking: true,
-            start_context: Some(sbx::WakeStartContext::default()),
-            target_state: 0,
-        }))
-        .await
-        .unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
 }
 
@@ -839,6 +813,7 @@ async fn internal_wake_prefers_and_records_the_start_context_identity() {
                 ..Default::default()
             }),
             target_state: 0,
+            runtime_upgrade: None,
         }))
         .await
         .unwrap()
@@ -875,6 +850,7 @@ async fn internal_wake_prefers_and_records_the_start_context_identity() {
                 ..Default::default()
             }),
             target_state: 0,
+            runtime_upgrade: None,
         }))
         .await
         .unwrap()
@@ -919,6 +895,7 @@ async fn resident_kubernetes_wake_acknowledges_and_records_requested_identity() 
                     ..Default::default()
                 }),
                 target_state: 0,
+                runtime_upgrade: None,
             }))
             .await
             .unwrap()
@@ -1002,6 +979,7 @@ async fn wake_replays_the_recorded_activation_attempt() {
             blocking: true,
             start_context: None,
             target_state: 0,
+            runtime_upgrade: None,
         }))
         .await
         .unwrap()

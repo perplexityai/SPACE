@@ -144,6 +144,19 @@ async fn resolve_session_route_with_cache(
     Ok(attached)
 }
 
+/// Whether the route cache would still hand this exact session route to a new
+/// request without asking ClusterApi.
+///
+/// A port or protocol session's ClusterApi resolve also repeats its node-port
+/// setup, so the session proxy skips the post-open resolve while this holds, on
+/// the same terms as [`crate::runtime_route::ecw_route_still_cached`].
+fn native_route_still_cached(state: &DataPlaneState, attached: &AttachedSession) -> bool {
+    attached
+        .cache_key
+        .as_deref()
+        .is_some_and(|key| state.route_cache.lookup_native(key).still_serves(attached))
+}
+
 /// Resolve the authoritative session route after a rejection or a worker going
 /// away, replacing a still-live stale cache entry without renewing its auth.
 ///
@@ -614,6 +627,12 @@ pub(super) async fn proxy_session(
             for attempt in 0..2 {
                 match native_service_port_ingress_io(&state, &attached).await {
                     Ok(io) => {
+                        // Renew authorization after a potentially long implicit wake,
+                        // before the first application byte is sent, unless the open
+                        // finished while the cache still serves this route.
+                        if native_route_still_cached(&state, &attached) {
+                            return Ok(io);
+                        }
                         let fresh =
                             resolve_session_route_with_cache(&state, session_id, &token, false)
                                 .await

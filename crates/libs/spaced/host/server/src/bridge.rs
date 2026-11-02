@@ -564,7 +564,11 @@ impl SpacedHostService {
                     .await
                 {
                     Ok(response) => response.into_inner(),
-                    Err(error) => return Err(error),
+                    // Callers return this guest status, so it loses its
+                    // not-ready mark as in `host_relay_status`.
+                    Err(error) => {
+                        return Err(pplx_space_common_grpc::RetryableNotReady::strip(error));
+                    }
                 };
                 self.guest_ready_snapshot_from_wait(response)
             },

@@ -1,4 +1,6 @@
-//! Shared SQL fragments for the sandbox "is this snapshot portable?" decision.
+//! Shared SQL fragments for the sandbox "is this snapshot portable?" decision,
+//! plus [`execution_supersession`], the Rust predicate `BeginArtifactBackup`'s
+//! generation fence and the orphaned-restore-pod GC both decide with.
 //!
 //! A SPACE sandbox with `current_local_artifact_id` is **portable** when a
 //! `state='ready'` full backup for that exact artifact has been registered in
@@ -1794,9 +1796,10 @@ fn inflight_snapshot_matches_current_suspend(sandbox_alias: &str) -> String {
 /// The internal API reads a node's absence as a deletion in two places, both
 /// only sound while the node's local row is the sandbox's sole existence:
 ///
-/// * `prune_absent_node_sandboxes` (`internal/api/server/src/status.rs`): a
-///   complete census that omits the sandbox drives a `marked_deleted` arm that
-///   sets `lifecycle = 'deleted'`.
+/// * `prune_absent_node_sandboxes` (`internal/api/server/src/status.rs`, through
+///   `pplx_space_sandbox_store::ingest::prune_census_absent_sandboxes`): a
+///   complete census that omits the sandbox drives that statement's
+///   `marked_deleted` arm, which sets `lifecycle = 'deleted'`.
 /// * `publish_sandbox_states` (`internal/api/server/src/published_state.rs`):
 ///   an explicit `present: false` for a stopped sandbox deletes its row and
 ///   detaches its snapshots' storage locations. A node reports that for any
@@ -1907,8 +1910,9 @@ fn inflight_snapshot_matches_current_suspend(sandbox_alias: &str) -> String {
 /// Every current Postgres writer of a non-NULL marker is a suspend path, and
 /// four write `'suspend'` whenever they write an origin at all: `kubernetes/store/suspend.rs`'s
 /// suspend-commit `UPDATE` and the cluster controller's quarantine recovery to
-/// `suspended` (`orphaned_sandboxes/quarantine_recovery/store.rs`, which also
-/// nulls `active_node_id`) spell it in their SQL, while
+/// `suspended`
+/// (`pplx_space_sandbox_store::repair::recover_quarantined_publication_to_suspended`,
+/// which also nulls `active_node_id`) spell it in their SQL, while
 /// `finalize_suspended_sandbox_in` (both callers bind `ArtifactOrigin::Suspend`)
 /// and `persist_optional_current_local_artifact` (whose only caller, the Direct
 /// substrate's `suspend_execution`, binds it too) take it as a parameter. The
@@ -2452,6 +2456,8 @@ pub fn drain_gate_blockers_for_node(node_param: &str) -> String {
           WHERE gate_blockers.node_id = {node_param}"
     )
 }
+
+pub mod execution_supersession;
 
 #[cfg(test)]
 mod drain_gate_differential_tests;

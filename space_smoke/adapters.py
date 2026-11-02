@@ -481,11 +481,13 @@ CONTROLLER_READINESS_MARKER = "/tmp/space-cluster-controller-ready"
 # (truthy_default in crates/libs/cluster/controller/server/src/env_config.rs).
 LEADER_ELECTION_ENV = "SPACE_CLUSTER_CONTROLLER_LEADER_ELECTION_ENABLED"
 LEADER_ELECTION_FALSE_VALUES = frozenset({"0", "false", "False", "FALSE"})
-# The liveness-budget test hook the brownout scenario scopes to its own run
-# (LEASE_FAILURE_GRACE_TEST_ENV in leader_election/mod.rs), the one
-# controller env key the leader-election operations write. Inert unless the
-# `test-hooks` feature is compiled in.
+# The liveness-budget and lease-TTL test hooks the brownout scenario scopes to
+# its own run (LEASE_FAILURE_GRACE_TEST_ENV and LEASE_TTL_TEST_ENV in
+# leader_election/mod.rs), the two controller env keys the leader-election
+# operations write, always together. Inert unless the `test-hooks` feature is
+# compiled in.
 LIVENESS_BUDGET_ENV = "SPACE_CLUSTER_CONTROLLER_LEADER_ELECTION_LEASE_FAILURE_GRACE_SECS"
+LEASE_TTL_ENV = "SPACE_CLUSTER_CONTROLLER_LEADER_ELECTION_LEASE_TTL_SECS"
 # The bound on each request the brownout scenario's cleanup makes; its time
 # plan is in space_smoke/leader_election.py. The mutation Lease's release uses
 # it for every caller: a release request that outlasts it has stalled.
@@ -680,6 +682,8 @@ UNSELECTED_POD_LABEL = "space.pplx.net/smoke-unselected"
 UNSELECTED_POD_IMAGE = "registry.k8s.io/pause:3.10"
 UNSELECTED_POD_READY_SECONDS = 120
 PUBLIC_API_DEPLOYMENT_SELECTOR = "app.kubernetes.io/name=space-api"
+# "true" runs the API on the Kubernetes substrate, "false" on the Direct one.
+K8S_CONTROL_PLANE_ENV = "SPACE_K8S_CONTROL_PLANE"
 KIND_REDIS_DEPLOYMENT = "space-redis"
 KIND_OBJECT_STORE_DEPLOYMENT = "space-object-store"
 KIND_OBJECT_STORE_POD_SELECTOR = "app.kubernetes.io/name=space-object-store"
@@ -756,9 +760,10 @@ LOCAL_SANDBOX_RECLAIM_POD_POLL_SECONDS = 0.5
 # retried within the delete budget: sbx-manager's quarantine recovery
 # completing (`CleanupAdmissionError` in
 # crates/libs/sbx/mgr/server/src/service/cleanup.rs), and node-manager's
-# sandbox mutation claim held by another host mutation or reset
-# (`claim_sandbox_mutation` in crates/libs/node/mgr/server/src/service.rs),
-# which the delete's durable cleanup passes through. A pending suspend
+# sandbox mutation claim held by another host mutation or reset past
+# cleanup's bounded wait (`cleanup_sandbox_phases` in
+# crates/libs/node/mgr/server/src/service/cleanup_inspect.rs), which the
+# delete's durable cleanup passes through. A pending suspend
 # publication cannot land once the cluster row is gone, so it is reported as
 # such. Every other refusal, `RetainedFilesystemOnlyCopy` included, is reported
 # with the daemon's own message.
@@ -5657,6 +5662,18 @@ ON CONFLICT (key_hash) DO NOTHING;
             raise SmokeConfigurationError(f"the bench runs no single Rust build: {result.detail()}")
         return result.stdout.strip()
 
+    def substrate(self) -> str:
+        # The API Deployment's SPACE_K8S_CONTROL_PLANE, which the bring-up
+        # reads too (space_kind_deployed_substrate, infra/space/kind/lib/substrate.sh).
+        name = self._public_api_deployment()
+        value = self._read_deployment_env(name, (K8S_CONTROL_PLANE_ENV,))[K8S_CONTROL_PLANE_ENV]
+        substrate = {"true": "kubernetes", "false": "direct"}.get(value or "")
+        if substrate is None:
+            raise SmokeConfigurationError(
+                f"{name} runs no known substrate: {K8S_CONTROL_PLANE_ENV}={value or 'unset'}"
+            )
+        return substrate
+
     # --- cluster-controller leader election ------------------------------------
     #
     # The two faults behind `local.leader_election_brownout_keeps_one_leader`:
@@ -5693,23 +5710,40 @@ ON CONFLICT (key_hash) DO NOTHING;
             value_from_refusal="",
         )[LIVENESS_BUDGET_ENV]
 
-    def set_controller_liveness_budget_env(self, seconds: str) -> None:
-        if _LIVENESS_BUDGET_VALUE.fullmatch(seconds) is None:
-            raise ValueError(f"refusing liveness-budget value {seconds!r}")
+    def set_controller_liveness_budget_env(self, seconds: str, *, lease_ttl: str) -> None:
+        for name, value in (("liveness-budget", seconds), ("lease-TTL", lease_ttl)):
+            if _LIVENESS_BUDGET_VALUE.fullmatch(value) is None:
+                raise ValueError(f"refusing {name} value {value!r}")
         # Resolved here, in setup, so the restore in cleanup looks nothing up.
         deployment = self._controller_deployment()
+        # The restore removes the TTL key rather than writing a captured
+        # literal back, which is verbatim only while nothing else sets it.
+        standing_ttl = self._deployment_env_literals(deployment, (LEASE_TTL_ENV,))[LEASE_TTL_ENV]
+        if standing_ttl is not None:
+            raise SmokeConfigurationError(
+                f"refusing a controller Deployment that already sets {LEASE_TTL_ENV}={standing_ttl}"
+            )
         self._liveness_budget_target = (deployment, self._public_api_container(deployment))
-        self._apply_controller_liveness_budget_env(seconds)
+        self._apply_controller_liveness_budget_env(seconds, lease_ttl=lease_ttl)
 
     def restore_controller_liveness_budget_env(
         self, standing: str | None, *, wait: bool = True
     ) -> None:
         # The captured literal goes back verbatim: the controller keeps its
         # default on an unparseable value, and restoring must not change that.
-        self._apply_controller_liveness_budget_env(standing, wait=wait)
+        # The TTL key, which setup refused to find set, is removed.
+        if self._liveness_budget_target is None:
+            # Setup refused before its first write (a preset TTL key, or a value
+            # it would not write), so there is nothing to put back, and the
+            # preset key the refusal named stays as it was. The target is set
+            # before the first write, so a write that half-applied is restored.
+            return
+        self._apply_controller_liveness_budget_env(standing, lease_ttl=None, wait=wait)
 
-    def _apply_controller_liveness_budget_env(self, value: str | None, *, wait: bool = True) -> None:
-        """Write the key under the caller's Lease; with `wait`, await the rollout.
+    def _apply_controller_liveness_budget_env(
+        self, value: str | None, *, lease_ttl: str | None, wait: bool = True
+    ) -> None:
+        """Write both keys in one request under the caller's Lease; with `wait`, await the rollout.
 
         Every request is bounded by CLEANUP_REQUEST_SECONDS. Without `wait`,
         as cleanup calls it, the ownership read and the write are tried twice,
@@ -5726,7 +5760,10 @@ ON CONFLICT (key_hash) DO NOTHING;
                 "live mutation Lease"
             )
         deployment, container = target
-        assignment = f"{LIVENESS_BUDGET_ENV}-" if value is None else f"{LIVENESS_BUDGET_ENV}={value}"
+        assignments = (
+            f"{LIVENESS_BUDGET_ENV}-" if value is None else f"{LIVENESS_BUDGET_ENV}={value}",
+            f"{LEASE_TTL_ENV}-" if lease_ttl is None else f"{LEASE_TTL_ENV}={lease_ttl}",
+        )
         attempts = 1 if wait else 2
         for attempt in range(1, attempts + 1):
             try:
@@ -5736,7 +5773,7 @@ ON CONFLICT (key_hash) DO NOTHING;
                 )
                 _require_ok(
                     self.kubectl(
-                        "set", "env", f"deploy/{deployment}", "-c", container, assignment,
+                        "set", "env", f"deploy/{deployment}", "-c", container, *assignments,
                         timeout=CLEANUP_REQUEST_SECONDS,
                     ),
                     f"set env on {deployment}",
@@ -7862,6 +7899,23 @@ class _SdkFilesystem:
                 path,
                 data,
                 **options,
+            )
+        )
+
+    def write_files(
+        self,
+        files: Sequence[tuple[str, bytes]],
+        *,
+        request_timeout: float = 60,
+    ) -> None:
+        # Without octet-stream uploads, the SDK sends more than one entry as
+        # one multipart request, each entry a `file` part named by its path.
+        entries = [{"path": path, "data": data} for path, data in files]
+        _sdk_data_plane_call(
+            lambda: self._sandbox._data_plane_sdk().files.write_files(
+                entries,
+                use_octet_stream=False,
+                request_timeout=request_timeout,
             )
         )
 

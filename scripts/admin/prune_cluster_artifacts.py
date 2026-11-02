@@ -2383,8 +2383,6 @@ WITH affected AS (
         next_attempt_at = NOW(),
         attempts = 0,
         last_error = '',
-        claim_token = '',
-        claimed_at = NULL,
         dead_at = NULL,
         dead_reason = '',
         updated_at = NOW()
@@ -2419,8 +2417,6 @@ SET generation = node_reconcile_triggers.generation + 1,
     next_attempt_at = NOW(),
     attempts = 0,
     last_error = '',
-    claim_token = '',
-    claimed_at = NULL,
     dead_at = NULL,
     dead_reason = '',
     updated_at = NOW();

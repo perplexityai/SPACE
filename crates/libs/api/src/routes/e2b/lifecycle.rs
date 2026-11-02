@@ -51,7 +51,6 @@ pub(super) async fn acquire_client_slot(
     client_id: Option<&str>,
     minimum_hold: Option<std::time::Duration>,
 ) -> Result<crate::client_concurrency::ClientConcurrencyGuard, E2bApiError> {
-    use crate::client_concurrency::ClientConcurrencyDecision;
     let decision = match minimum_hold {
         Some(minimum_hold) => {
             state
@@ -66,9 +65,19 @@ pub(super) async fn acquire_client_slot(
                 .await
         }
     };
+    client_slot_result(decision)
+}
+
+/// Map a limiter decision to the slot guard or the ECW 429. Split from
+/// [`acquire_client_slot`] for the connect handler, which reads the decision's
+/// bounded client id before mapping it.
+pub(super) fn client_slot_result(
+    decision: crate::client_concurrency::ClientConcurrencyDecision,
+) -> Result<crate::client_concurrency::ClientConcurrencyGuard, E2bApiError> {
+    use crate::client_concurrency::ClientConcurrencyDecision;
     match decision {
         ClientConcurrencyDecision::Admitted(guard) => Ok(guard),
-        ClientConcurrencyDecision::Rejected { retry_after } => {
+        ClientConcurrencyDecision::Rejected { retry_after, .. } => {
             Err(E2bApiError::too_many_client_operations().with_retry_after(retry_after))
         }
     }
@@ -808,22 +817,24 @@ pub(super) async fn connect_sandbox_inner(
     let wake_trace = crate::wake_trace::current().unwrap_or_else(crate::wake_trace::WakeTrace::new);
     let reconnect_started_at = std::time::Instant::now();
     let client_id = request_client_id(&headers);
-    // Stamp the coarse client class onto the metric identity once. It flows
-    // through every reconnect emission this handler drives — the route-level
-    // rejections below and the controller wake path — so the retry-storm alert
-    // can split interactive from cron traffic using the configured client classes.
-    let reconnect_identity = SandboxApiMetricIdentity::ecw("connect")
-        .with_client_class(state.client_classification.classify(client_id.as_deref()));
     // Reserve a per-client concurrency slot before touching the control plane.
     // Held for the whole handler; released on return.
-    let _client_slot = match acquire_client_slot(
-        &state,
-        pplx_space_metrics::sandbox::api::client_limit::Operation::Reconnect,
-        client_id.as_deref(),
-        None,
-    )
-    .await
-    {
+    let client_slot = state
+        .client_concurrency
+        .try_acquire(
+            pplx_space_metrics::sandbox::api::client_limit::Operation::Reconnect,
+            client_id.as_deref(),
+        )
+        .await;
+    // Stamp the coarse client class and the limiter's bounded client id onto
+    // the metric identity once. They flow through every reconnect emission
+    // this handler drives — the route-level rejections below and the
+    // controller wake path — so the retry-storm alert can split interactive
+    // from cron traffic and name the allowlisted caller behind a storm.
+    let reconnect_identity = SandboxApiMetricIdentity::ecw("connect")
+        .with_client_class(state.client_classification.classify(client_id.as_deref()))
+        .with_client_id(client_slot.client_id());
+    let _client_slot = match client_slot_result(client_slot) {
         Ok(slot) => slot,
         Err(err) => {
             // In enforce mode the per-client limiter rejects here, before any

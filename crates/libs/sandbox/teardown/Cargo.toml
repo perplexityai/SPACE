@@ -14,6 +14,5 @@ workspace = true
 sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-aws-lc-rs", "uuid"] }
 
 # internal
-pplx-space-cluster-pool = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["sqlx"] }
-pplx-space-common-svc = { workspace = true }
+pplx-space-state-reconciliation = { workspace = true }

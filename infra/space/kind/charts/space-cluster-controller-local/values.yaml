@@ -57,9 +57,14 @@ serviceAccount:
 # refreshes them at 80% of that.
 nodeApiTokenExpirationSeconds: 600
 
+# The substrate, as space-api-local's `substrate`: `kubernetes` or `direct`.
+# Both must name the same one.
+substrate: kubernetes
+
 # Same KubernetesSubstrate env block as the api-server. The cluster-controller
-# requires SPACE_K8S_CONTROL_PLANE=true to even start, and shares the same
-# substrate plumbing for orphan-sweep + warm-pool reconcilers.
+# builds the same substrate as the API (and starts on Direct too, without the
+# Kubernetes-only reconcilers), and shares the same substrate plumbing for
+# orphan-sweep + warm-pool reconcilers.
 k8s:
   # The API's sandbox namespace (space-api-local's k8s.sandboxNamespace).
   sandboxNamespace: sandboxes

@@ -342,17 +342,9 @@ impl TemplateManagerService {
             .map_err(|e| Status::internal(format!("spawn_blocking: {e}")))??;
 
         // Fetch live sandbox list to compute pool_current
-        let sbx_connect =
-            pplx_space_sbx_mgr_client::connect_with_retry_policy(self.sbx_connect_retry_policy)
-                .await
-                .map_err(|e| e.to_string());
-        let sbx_sandboxes = if let Ok(mut sbx_client) = sbx_connect {
-            pplx_space_sbx_mgr_client::list_all_sandboxes(&mut sbx_client)
-                .await
-                .unwrap_or_default()
-        } else {
-            vec![]
-        };
+        let sbx_sandboxes = self
+            .pool_count_sandboxes(request.get_ref().omit_sandbox_counts)
+            .await;
         let mut effective_snapshot_memory_by_requested = HashMap::new();
         for build in &builds {
             let settings = template_settings.get(&build.name);
@@ -591,6 +583,39 @@ impl TemplateManagerService {
             }
         };
 
+        let metadata_bytes = match std::fs::read(register_source.metadata_path()) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => {
+                return Err(Status::failed_precondition(format!(
+                    "read template metadata: {error}"
+                )));
+            }
+        };
+        let source_manifest = register_source
+            .metadata_path()
+            .with_file_name("manifest.json");
+        let manifest_bytes = match std::fs::read(&source_manifest) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => {
+                return Err(Status::failed_precondition(format!(
+                    "read template manifest: {error}"
+                )));
+            }
+        };
+        let metadata = validate_guest_documents(&metadata_bytes, &manifest_bytes)?;
+        if metadata.guest_image.is_some() {
+            self.authorize_peer(
+                &request,
+                "RegisterFirmwareTemplate",
+                &[
+                    UdsPeerPrincipal::Root,
+                    UdsPeerPrincipal::Role(LocalRole::Operator),
+                ],
+            )?;
+        }
+
         // Network policy validation is independent of the content hash, so run
         // it before any disk work.
         if let Some(requested_policy) = requested_network_policy.as_ref() {
@@ -633,8 +658,7 @@ impl TemplateManagerService {
         // Read metadata for build_date / arch.
         let meta_path = format!("{staging_dir}/metadata.json");
         let metadata_json = std::fs::read_to_string(&meta_path).unwrap_or_default();
-        let metadata: pplx_space_common_core::types::TemplateMetadata =
-            serde_json::from_str(&metadata_json).unwrap_or_default();
+        let metadata = validate_guest_documents(metadata_json.as_bytes(), &[])?;
         let build_date = metadata.built_at.clone();
         // No manifest on disk yet during register — the empty default is
         // the equivalent of the previous `serde_json::Value::Null`.

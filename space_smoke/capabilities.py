@@ -334,6 +334,15 @@ class EcwFilesystem(Protocol):
         request_timeout: float = 60,
     ) -> None: ...
 
+    def write_files(
+        self,
+        files: Sequence[tuple[str, bytes]],
+        *,
+        request_timeout: float = 60,
+    ) -> None:
+        """Write every `(path, data)` pair in one multipart `POST /files`."""
+        ...
+
     def read(
         self,
         path: str,
@@ -1335,6 +1344,8 @@ class KindEnvironment(Protocol):
     def telemetry_mode(self) -> str: ...
 
     def rust_build(self) -> str: ...
+
+    def substrate(self) -> str: ...
 
     def admin_request(
         self, method: str, resource: str, body: dict[str, object] | None = None,
@@ -2514,14 +2525,20 @@ class LeaderElectionControl(TelemetryBackendControl, Protocol):
         """
         ...
 
-    def set_controller_liveness_budget_env(self, seconds: str) -> None:
-        """Set the hook to whole seconds under the caller's mutation Lease and await the rollout."""
+    def set_controller_liveness_budget_env(self, seconds: str, *, lease_ttl: str) -> None:
+        """Set the budget and lease-TTL hooks to whole seconds in one write.
+
+        Written under the caller's mutation Lease, then awaits the rollout.
+        Refuses a Deployment that already sets the TTL hook.
+        """
         ...
 
     def restore_controller_liveness_budget_env(
         self, standing: str | None, *, wait: bool = True
     ) -> None:
-        """Put a captured literal back verbatim, removing the key for None.
+        """Put a captured budget literal back verbatim, removing the key for None.
+
+        Always removes the lease-TTL hook.
 
         Awaits the rollout unless `wait` is False, which cleanup uses so the
         write fits its budget.

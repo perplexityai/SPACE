@@ -24,6 +24,7 @@ mod node_inventory;
 mod route_identity;
 mod run;
 mod runtime_desired_state;
+mod runtime_provisioning_cohort;
 mod sandbox_service_ports;
 mod trusted_storage;
 mod visibility_observations;
@@ -107,6 +108,20 @@ use crate::proto::{
     UnstableResolveSandboxServiceRouteRequest, UnstableResolveSandboxServiceRouteResponse,
     WarmPoolTemplateRelease, facet_ref, network_policy_target_ref,
 };
+
+/// What a node reports when it closes a backup attempt, as
+/// [`ClusterApiService::finalize_backup_attempt`] applies it.
+struct BackupAttemptFinalization<'a> {
+    target_state: SnapshotState,
+    bytes_uploaded: i64,
+    failure_reason: Option<&'a str>,
+    artifact_digests: &'a [snapshot_store::SnapshotArtifactDigest],
+    /// The node may still hold the runtime this attempt's suspend capture was
+    /// meant to release, so a READY backup must not project the sandbox
+    /// `suspended`.
+    suspend_uncommitted: bool,
+}
+
 /// The `snapshots` row [`ClusterApiService::finalize_backup_attempt`] flips,
 /// exactly as that statement's `RETURNING` produces it.
 #[derive(Debug, FromRow)]
@@ -145,7 +160,7 @@ impl FinalizedSnapshotRow {
 #[path = "published_state.rs"]
 mod published_state;
 /// Re-exported so Space's Datadog DBM query tests (private to Space) can drive the publish path.
-pub use published_state::publish_sandbox_states;
+pub use published_state::{publish_sandbox_states, publish_sandbox_states_with_retirement};
 mod sandbox_quarantine_store;
 use published_state::{
     capture_host_cpu, project_ready_suspend_snapshot, prune_absent_node_templates,
@@ -304,6 +319,13 @@ pub struct ClusterApiService {
     /// [`ClusterApiService::with_visibility_pool`]. Tests share one pool because
     /// the isolation is a pool-configuration property, not request logic.
     visibility_pool: sqlx::PgPool,
+    /// Pool for the best-effort runtime environment catalog read behind
+    /// `GetNodeRuntimeDesiredState`'s provisioning recipe, sidelined for the
+    /// same reason as `visibility_pool`: a blocked catalog read pins only its
+    /// own connections, never the general pool the policy and auth reads use.
+    /// Defaults to a clone of `pool`; the service binary replaces it via
+    /// [`ClusterApiService::with_runtime_catalog_pool`].
+    runtime_catalog_pool: sqlx::PgPool,
     visibility_observations: std::sync::Arc<visibility_observations::Observations>,
     template_releases_store: template_releases_store::TemplateReleasesStore,
     route_ed25519_authority: Option<
@@ -325,6 +347,13 @@ pub struct ClusterApiService {
     /// unless `from_env_with_security_state` reads it on, so tests don't
     /// inherit the developer's shell.
     runtime_desired_state: runtime_desired_state::RuntimeDesiredState,
+    /// Which nodes `GetNodeRuntimeDesiredState` assigns a provisioning recipe.
+    /// None unless `from_env_with_security_state` reads it on.
+    runtime_provisioning_cohort: runtime_provisioning_cohort::RuntimeProvisioningCohort,
+    /// Whether applying a node's rollback receipt for a restore may retire
+    /// its execution as `replaced`. Off unless `from_env_with_security_state`
+    /// reads it on, for the same reason.
+    abandoned_restore_retirement: pplx_space_common_core::types::AbandonedRestoreRetirement,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -580,6 +609,7 @@ impl ClusterApiService {
             reserved_template_names: template_publication::ReservedTemplateNames::default(),
             trusted_template_storage: trusted_storage::TrustedTemplateStorageBuckets::default(),
             visibility_pool: pool.clone(),
+            runtime_catalog_pool: pool.clone(),
             visibility_observations: std::sync::Arc::new(
                 visibility_observations::Observations::new(),
             ),
@@ -590,6 +620,10 @@ impl ClusterApiService {
             route_ed25519_authority,
             ecw_credential_keyring,
             runtime_desired_state: runtime_desired_state::RuntimeDesiredState::Disabled,
+            runtime_provisioning_cohort:
+                runtime_provisioning_cohort::RuntimeProvisioningCohort::Disabled,
+            abandoned_restore_retirement:
+                pplx_space_common_core::types::AbandonedRestoreRetirement::Disabled,
         }
     }
 
@@ -602,6 +636,25 @@ impl ClusterApiService {
     #[must_use]
     pub fn with_visibility_pool(mut self, visibility_pool: sqlx::PgPool) -> Self {
         self.visibility_pool = visibility_pool;
+        self
+    }
+
+    /// Whether the recipe setting is on. While it's off no node is assigned a
+    /// recipe and nothing reads the catalog.
+    pub(crate) fn serves_provisioning_recipes(&self) -> bool {
+        self.runtime_provisioning_cohort
+            != runtime_provisioning_cohort::RuntimeProvisioningCohort::Disabled
+    }
+
+    /// Point the runtime environment catalog read at its own pool.
+    ///
+    /// See [`ClusterApiService::runtime_catalog_pool`]. Call this with a small
+    /// dedicated pool in any deployment that admits nodes to the provisioning
+    /// recipe; without it a blocked `runtime_environments` read shares the
+    /// load-bearing pool.
+    #[must_use]
+    pub fn with_runtime_catalog_pool(mut self, runtime_catalog_pool: sqlx::PgPool) -> Self {
+        self.runtime_catalog_pool = runtime_catalog_pool;
         self
     }
 
@@ -641,6 +694,11 @@ impl ClusterApiService {
             trusted_storage::TrustedTemplateStorageBuckets::from_env()
                 .map_err(|error| Status::failed_precondition(error.to_string()))?;
         service.runtime_desired_state = runtime_desired_state::RuntimeDesiredState::from_env();
+        service.runtime_provisioning_cohort =
+            runtime_provisioning_cohort::RuntimeProvisioningCohort::from_env()
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        service.abandoned_restore_retirement =
+            pplx_space_common_core::types::AbandonedRestoreRetirement::from_env();
         Ok(service)
     }
 
@@ -661,15 +719,23 @@ impl ClusterApiService {
     ///
     /// Only the attempt's source node may close it; the check precedes the
     /// transaction so a refused caller writes nothing.
+    ///
+    /// A READY suspend backup projects the sandbox `suspended` unless
+    /// `suspend_uncommitted` says the source node may still hold the runtime,
+    /// as after it rolled the capturing suspend back to `paused`.
     async fn finalize_backup_attempt(
         &self,
         snapshot_id: SnapshotId,
-        target_state: SnapshotState,
-        bytes_uploaded: i64,
-        failure_reason: Option<&str>,
-        artifact_digests: &[snapshot_store::SnapshotArtifactDigest],
+        finalization: BackupAttemptFinalization<'_>,
         remote_addr: Option<std::net::SocketAddr>,
     ) -> Result<(), Status> {
+        let BackupAttemptFinalization {
+            target_state,
+            bytes_uploaded,
+            failure_reason,
+            artifact_digests,
+            suspend_uncommitted,
+        } = finalization;
         let attempt = self
             .registered_backup_attempt(snapshot_id)
             .await?
@@ -772,7 +838,7 @@ impl ClusterApiService {
                 })?;
         }
 
-        let suspend_projection = if target_state.is_ready() {
+        let suspend_projection = if target_state.is_ready() && !suspend_uncommitted {
             project_ready_suspend_snapshot(&mut tx, snapshot_id).await?
         } else {
             None
@@ -1034,10 +1100,13 @@ impl ClusterApiService {
         let artifact_digests = parse_artifact_digests(&req.artifact_digests)?;
         self.finalize_backup_attempt(
             SnapshotId::from_uuid(backup_attempt_id.as_uuid()),
-            target_state,
-            req.bytes_uploaded,
-            req.failure_reason.as_deref(),
-            &artifact_digests,
+            BackupAttemptFinalization {
+                target_state,
+                bytes_uploaded: req.bytes_uploaded,
+                failure_reason: req.failure_reason.as_deref(),
+                artifact_digests: &artifact_digests,
+                suspend_uncommitted: req.suspend_uncommitted,
+            },
             remote_addr,
         )
         .await?;

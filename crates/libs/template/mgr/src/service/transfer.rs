@@ -103,8 +103,22 @@ impl TemplateManagerService {
 
         let metadata_json = std::fs::read(build_path.join("metadata.json")).unwrap_or_default();
         let manifest_json = std::fs::read(build_path.join("manifest.json")).unwrap_or_default();
+        let metadata =
+            validate_guest_documents(&metadata_json, &manifest_json).map_err(|error| {
+                if error.code() == tonic::Code::InvalidArgument {
+                    Status::data_loss(error.message())
+                } else {
+                    error
+                }
+            })?;
+        if metadata.guest_image.is_some() {
+            return Err(Status::failed_precondition(
+                "firmware templates cannot be exported or distributed",
+            ));
+        }
         let manifest: pplx_space_common_core::types::TemplateManifest =
-            serde_json::from_slice(&manifest_json).unwrap_or_default();
+            serde_json::from_slice(&manifest_json)
+                .map_err(|error| Status::data_loss(error.to_string()))?;
         let (rootfs_hash, mut files) = if let Some(files) =
             compressed_template_export_files(&build_path, &manifest)
         {
@@ -296,7 +310,7 @@ impl TemplateManagerService {
     ) -> Result<Response<crate::proto::ImportTemplateResponse>, Status> {
         use tokio_stream::StreamExt;
 
-        self.authorize_peer(&request, "ImportTemplate", ALLOW_TEMPLATE_OPERATOR)?;
+        let peer = self.authorize_peer(&request, "ImportTemplate", ALLOW_TEMPLATE_OPERATOR)?;
         let mut stream = request.into_inner();
 
         // First message must be the header
@@ -310,6 +324,23 @@ impl TemplateManagerService {
             Some(crate::proto::import_template_request::Payload::Header(h)) => h,
             _ => return Err(Status::invalid_argument("first message must be header")),
         };
+
+        let metadata = validate_guest_documents(&header.metadata_json, &header.manifest_json)?;
+        if metadata.guest_image.is_some() {
+            if !matches!(
+                peer.principal(),
+                UdsPeerPrincipal::Root | UdsPeerPrincipal::Role(LocalRole::Operator)
+            ) {
+                return Err(Status::permission_denied(
+                    "firmware image import is local operator-only",
+                ));
+            }
+            if header.include_snapshot {
+                return Err(Status::failed_precondition(
+                    "firmware image snapshots are unsupported",
+                ));
+            }
+        }
 
         let tmpl_ref = header
             .template

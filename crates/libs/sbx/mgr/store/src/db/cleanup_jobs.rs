@@ -55,12 +55,7 @@ pub fn finish(conn: &Connection, id: &JobId, outcome: &CleanupOutcome) -> crate:
                 message: message.clone(),
             })
             .map_err(Error::to_sql_conversion)?;
-            Ok(jobs::fail_running_job_permanent(
-                conn.raw(),
-                id,
-                &error,
-                None,
-            )?)
+            super::store_job_failures::fail_running_job_permanent(conn, id, &error)
         }
     }
 }

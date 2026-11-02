@@ -74,6 +74,9 @@ message DeletePoolResponse {
 
 message PoolStatusRequest {
   optional string template = 1;
+  // See ListTemplatesRequest.omit_sandbox_counts. When set, every PoolInfo
+  // reports current_count and pending_count as 0 and sandbox_ids as empty.
+  bool omit_sandbox_counts = 2;
 }
 
 message PoolStatusResponse {
@@ -102,7 +105,14 @@ message DeleteIdleTemplateRequest {
 
 message DeleteIdleTemplateResponse {}
 
-message ListTemplatesRequest {}
+message ListTemplatesRequest {
+  // Skip listing the node's sandboxes, which only pool counts need: every
+  // TemplateFullInfo reports pool_current as 0. For callers that read only
+  // template identity or settings. Unset keeps the counts. A
+  // template-manager, or a node-api relay, that predates the field ignores or
+  // drops it, and the counts are then computed.
+  bool omit_sandbox_counts = 1;
+}
 
 message ListTemplatesResponse {
   repeated TemplateFullInfo templates = 1;

@@ -66,6 +66,46 @@ expression: sorted_json(actual)
       "add": {
         "rule": {
           "chain": "pre_tproxy_guardrails",
+          "comment": "drop-guest-mptcp",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "op": "==",
+                "right": "tap0"
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "tcp option": {
+                    "name": "mptcp"
+                  }
+                },
+                "op": "==",
+                "right": true
+              }
+            },
+            {
+              "counter": null
+            },
+            {
+              "drop": null
+            }
+          ],
+          "family": "ip",
+          "table": "sandbox"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "chain": "pre_tproxy_guardrails",
           "comment": "pre-tproxy-allow-established-related",
           "expr": [
             {

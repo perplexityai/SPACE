@@ -6,10 +6,11 @@
 use pplx_space_common_core::types::{LocalArtifactId, RateLimiter, TokenBucket};
 
 use super::activation_support::{
-    ActivationFailureStage, IdentityFreeDirectActivationAuthority, StartStateTransition,
-    operation_activation_attempt_id_from_wire, space_api_route_identity_for_runtime_activation,
-    space_api_route_identity_from_start_request, space_api_route_identity_to_wire,
-    spawn_wait_ready_state_transition, wait_ready_and_mark_started, wake_target_state_from_proto,
+    ActivationFailureStage, IdentityFreeDirectActivationAuthority, NodeIdentitySource,
+    StartStateTransition, operation_activation_attempt_id_from_wire,
+    space_api_route_identity_for_runtime_activation, space_api_route_identity_from_start_request,
+    space_api_route_identity_to_wire, spawn_wait_ready_state_transition,
+    wait_ready_and_mark_started, wake_target_state_from_proto,
 };
 use super::cleanup_support::{ActivationCleanupSpec, read_node_execution_fence};
 use super::create::StartFromCheckpointLaunch;
@@ -254,6 +255,13 @@ fn interrupted_restore_action(
 
 impl StartSandboxContext {
     fn from_request(req: &StartRequest) -> Result<Self, Status> {
+        Self::from_request_on_node(req, &NodeIdentitySource::from_process())
+    }
+
+    fn from_request_on_node(
+        req: &StartRequest,
+        node_identity: &NodeIdentitySource,
+    ) -> Result<Self, Status> {
         let checkpoint = req.checkpoint.clone().unwrap_or_default();
         let suspend_restore_storage_uri = req.suspend_restore_storage_uri.clone();
         let parsed_suspend_restore_storage_uri = suspend_restore_storage_uri
@@ -275,7 +283,7 @@ impl StartSandboxContext {
             ));
         }
 
-        let local_node_id = std::env::var("SPACE_NODE_ID").ok();
+        let local_node_id = node_identity.configured_node_id();
         let restore_placement = suspend_restore_placement(
             suspend_restore_source_node.as_deref(),
             local_node_id.as_deref(),
@@ -1239,6 +1247,28 @@ impl SandboxManagerService {
         }
     }
 
+    /// Stage a sandbox absent from this node from its suspend checkpoint, and
+    /// leave its row suspended without launching anything. A Wake that runs a
+    /// runtime upgrade boots the staged disk by cold start instead of loading
+    /// the checkpoint, which may belong to a runtime that must not execute.
+    /// A sandbox already on this node, in any state, is left to the upgrade,
+    /// which checks its checkpoint against the one it was decided from.
+    pub(super) async fn stage_missing_checkpoint(&self, req: StartRequest) -> Result<(), Status> {
+        let mut start_ctx = StartSandboxContext::from_request(&req)?;
+        match self.resolve_start_sandbox_target(&req.sandbox_id, &start_ctx, false)? {
+            // Another activation created the row since the caller looked.
+            StartSandboxTarget::Local(_) => Ok(()),
+            StartSandboxTarget::MissingCheckpointRestore { sandbox_id } => self
+                .materialize_missing_checkpoint_restore(&sandbox_id, &mut start_ctx)
+                .instrument(tracing::info_span!(
+                    "sbxmgr.start.runtime_upgrade_stage",
+                    sandbox_id = %sandbox_id
+                ))
+                .await
+                .map(drop),
+        }
+    }
+
     async fn restore_suspended_checkpoint_start(
         &self,
         req: &StartRequest,
@@ -2011,6 +2041,10 @@ impl SandboxManagerService {
             ));
         }
 
+        self.admit_guest_image(sandbox.guest_image, sandbox.execution_metadata.as_ref())
+            .await?;
+        super::guest_image::validate_policy(sandbox.guest_image, &sandbox.auto_lifecycle)?;
+
         if let Some(response) = self
             .try_start_from_warm_snapshot(&mut start_ctx, &sandbox)
             .await?
@@ -2072,14 +2106,6 @@ impl SandboxManagerService {
             start_ctx.route_identity_provenance,
             start_ctx.open_activation_claim_eligible,
         );
-        if let Err(error) = self
-            .refuse_retired_activation_retry(id, open_route_activation.as_ref())
-            .await
-        {
-            activation_admission_permit.finish(AdmissionPermitOutcome::Failed);
-            return Err(error);
-        }
-
         // Serialize the whole activation boundary with cleanup. A cleanup
         // admitted for the previous execution must either finish before this
         // start claims the row, or observe the attached replacement generation
@@ -2092,6 +2118,20 @@ impl SandboxManagerService {
         );
         let activation_fence =
             wait_for_activation_admission(id, activation_lock_owner.lock()).await?;
+        // Under the activation lock, so a rollback cleanup of this claim has
+        // either finished, leaving its receipt for the check to see, or can't
+        // finish before this start claims the row.
+        if let Err(error) = self
+            .refuse_retired_activation_retry(id, open_route_activation.as_ref())
+            .await
+        {
+            activation_admission_permit.finish(if error.code() == tonic::Code::Cancelled {
+                AdmissionPermitOutcome::Cancelled
+            } else {
+                AdmissionPermitOutcome::Failed
+            });
+            return Err(error);
+        }
 
         let cleanup_episode = {
             let db = self.db_conn()?;
@@ -2313,7 +2353,7 @@ impl SandboxManagerService {
         let guest_cid = alloc.slot.checked_add(3).ok_or_else(|| {
             activation_cleanup.failure(Status::internal("allocated guest CID overflows"))
         })?;
-        let boot = pplx_space_node_runtime_core::boot::LinuxBoot {
+        let boot = pplx_space_node_runtime_core::boot::GuestBoot {
             guest: prepare_source.execution.guest(),
             cpus: pplx_space_common_core::types::VcpuCount::try_from_u32(vcpu).map_err(
                 |error| activation_cleanup.failure(Status::invalid_argument(error.to_string())),
@@ -2333,6 +2373,12 @@ impl SandboxManagerService {
             huge_pages: self.config.hugepages,
             console: guest_console_logs_enabled(),
             builder: is_builder,
+            source: pplx_space_node_runtime_core::boot::BootSource::from_execution(
+                &prepare_source.execution,
+            )
+            .map_err(|error| {
+                activation_cleanup.failure(Status::failed_precondition(error.to_string()))
+            })?,
         };
         let vm_config = pplx_space_node_runtime_core::boot::configuration(
             prepare_source.execution.runtime().kind,
@@ -2655,15 +2701,22 @@ impl SandboxManagerService {
         let pid = jailer_resp.pid;
         let (spaced_host_result, netgtw_result) = {
             let mut spaced_host_client = node_client.clone();
-            let launch_spaced_host = launch_spaced_host_via_node(
-                &mut spaced_host_client,
-                execution_fence,
-                id,
-                sbx_uid,
-                &vsock_uds_path,
-                &self.host_control_socket_path,
-                "fresh",
-            );
+            let launch_spaced_host = async {
+                if !sandbox.guest_image.expects_agent() {
+                    return Ok(None);
+                }
+                launch_spaced_host_via_node(
+                    &mut spaced_host_client,
+                    execution_fence,
+                    id,
+                    sbx_uid,
+                    &vsock_uds_path,
+                    &self.host_control_socket_path,
+                    "fresh",
+                )
+                .await
+                .map(Some)
+            };
             let wait_netgtw = async {
                 netgtw_task.await.map_err(|error| {
                     Status::internal(format!("net-gateway launch task failed: {error}"))
@@ -2706,49 +2759,55 @@ impl SandboxManagerService {
                 return Err(e);
             }
         };
-        let endpoint_proof = match activation_endpoint_proof_requirement(
-            &route_identity,
-            sandbox.pool_template.as_deref(),
-        ) {
-            ActivationEndpointProofRequirement::DeferredUntilPoolAdoption => None,
-            ActivationEndpointProofRequirement::Required => {
-                let endpoint_runtime = match endpoint_runtime_identity_for_activation(
-                    id,
-                    &route_identity,
-                    spaced_host_resp.pid,
-                    pid,
-                    sbx_uid,
-                    guest_cid,
-                    &vsock_uds_path,
-                ) {
-                    Ok(runtime) => runtime,
-                    Err(error) => {
-                        let reason = format!("construct spaced endpoint identity failed: {error}");
-                        activation_cleanup.cleanup_after_failure(
-                            ActivationFailureStage::ColdSidecarLaunch.reason_code(),
-                            reason,
-                        );
-                        return Err(error);
-                    }
-                };
-                match capture_spaced_endpoint_proof_for_activation(
-                    &mut node_client,
-                    endpoint_runtime,
-                )
-                .await
-                {
-                    Ok(proof) => Some(proof),
-                    Err(error) => {
-                        let reason = format!("capture spaced endpoint proof failed: {error}");
-                        activation_cleanup.cleanup_after_failure(
-                            ActivationFailureStage::ColdSidecarLaunch.reason_code(),
-                            reason,
-                        );
-                        return Err(error);
+        let endpoint_proof = if let Some(spaced_host_resp) = &spaced_host_resp {
+            match activation_endpoint_proof_requirement(
+                &route_identity,
+                sandbox.pool_template.as_deref(),
+            ) {
+                ActivationEndpointProofRequirement::DeferredUntilPoolAdoption => None,
+                ActivationEndpointProofRequirement::Required => {
+                    let endpoint_runtime = match endpoint_runtime_identity_for_activation(
+                        id,
+                        &route_identity,
+                        spaced_host_resp.pid,
+                        pid,
+                        sbx_uid,
+                        guest_cid,
+                        &vsock_uds_path,
+                    ) {
+                        Ok(runtime) => runtime,
+                        Err(error) => {
+                            let reason =
+                                format!("construct spaced endpoint identity failed: {error}");
+                            activation_cleanup.cleanup_after_failure(
+                                ActivationFailureStage::ColdSidecarLaunch.reason_code(),
+                                reason,
+                            );
+                            return Err(error);
+                        }
+                    };
+                    match capture_spaced_endpoint_proof_for_activation(
+                        &mut node_client,
+                        endpoint_runtime,
+                    )
+                    .await
+                    {
+                        Ok(proof) => Some(proof),
+                        Err(error) => {
+                            let reason = format!("capture spaced endpoint proof failed: {error}");
+                            activation_cleanup.cleanup_after_failure(
+                                ActivationFailureStage::ColdSidecarLaunch.reason_code(),
+                                reason,
+                            );
+                            return Err(error);
+                        }
                     }
                 }
             }
+        } else {
+            None
         };
+        let spaced_host_pid = spaced_host_resp.as_ref().map(|response| response.pid);
         // Update SQLite with runtime fields (state stays Starting until guest Ready)
         let api_socket_path = format!("{RUN_DIR}/{id}/api.sock");
         let response_route_identity = space_api_route_identity_to_wire(&route_identity);
@@ -2768,7 +2827,7 @@ impl SandboxManagerService {
                     slot: alloc.slot,
                     guest_cid,
                     pid,
-                    spaced_host_pid: spaced_host_resp.pid,
+                    spaced_host_pid,
                     netgtw_pid: netgtw_resp.pid,
                     vsock_uds_path: &vsock_uds_path,
                     api_socket_path: &api_socket_path,
@@ -2784,7 +2843,7 @@ impl SandboxManagerService {
             sandbox_id: id,
             boot_type: "fresh",
             pid,
-            spaced_host_pid: spaced_host_resp.pid,
+            spaced_host_pid,
             net_gateway_pid: netgtw_resp.pid,
             sandbox_uid: sbx_uid,
             network_slot: alloc.slot,
@@ -2804,11 +2863,12 @@ impl SandboxManagerService {
         });
         self.watchdog
             .add_sandbox(crate::watchdog::SidecarInfo {
+                guest_image: sandbox.guest_image,
                 node_execution_id: Some(execution_fence.current()),
                 sandbox_id: id.clone(),
                 uid: Some(sbx_uid),
                 runtime_pid: Some(pid),
-                spaced_host_pid: Some(spaced_host_resp.pid),
+                spaced_host_pid,
                 netgtw_pid: Some(netgtw_resp.pid),
                 vsock_uds_path: Some(vsock_uds_path.clone()),
                 process_env: sandbox.process_env.clone(),

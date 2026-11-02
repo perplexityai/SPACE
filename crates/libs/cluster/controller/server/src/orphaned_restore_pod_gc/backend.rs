@@ -5,7 +5,8 @@
 //!   one authoritatively, and delete one with a UID + resourceVersion
 //!   precondition. Live impl: [`KubernetesPodBackend`].
 //! - [`SandboxStore`] — classify the owning `sandboxes` rows for a batch of
-//!   ids. Live impl: [`super::store::SandboxDbStore`].
+//!   sandbox ids, each with its pods' lowest generation. Live impl:
+//!   [`super::store::SandboxDbStore`].
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -74,15 +75,17 @@ pub trait PodBackend: Send + Sync {
 
 /// Postgres access: classify the owning rows for a set of sandbox ids.
 pub trait SandboxStore: Send + Sync {
-    /// Look up the lifecycle + active-execution generation for each id in
-    /// `ids`. Ids with no `sandboxes` row
-    /// are simply absent from the map (the caller treats a missing entry as
-    /// `SandboxMissing`). No lock: the reaper only deletes provably-superseded
-    /// pods (see [`super::classify::classify_disposition`]), which no restore
-    /// can adopt, so a stale read can never cause a live pod to be reaped.
+    /// Look up the lifecycle and execution rows for each `(sandbox id, floor)`
+    /// in `floors`, where the floor is the lowest generation among that
+    /// sandbox's restore pods: the rows returned are the active execution and
+    /// those at or above the floor. Ids with no `sandboxes` row are simply absent from the
+    /// map (the caller treats a missing entry as `SandboxMissing`). No lock:
+    /// the reaper only deletes provably-superseded pods (see
+    /// [`super::classify::classify_disposition`]), which no restore can adopt,
+    /// so a stale read can never cause a live pod to be reaped.
     fn classify_sandboxes(
         &self,
-        ids: &[SandboxId],
+        floors: &[(SandboxId, i64)],
     ) -> impl std::future::Future<
         Output = Result<HashMap<SandboxId, SandboxRestoreState>, sqlx::Error>,
     > + Send;

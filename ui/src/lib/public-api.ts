@@ -1,10 +1,10 @@
 import { OperationFailedError, OperationTimeoutError } from './accepted-create';
-import { adminApi, api } from './api';
-import { publicSandboxIdFromAny } from './sandbox-id';
+import { adminApi, api, ApiError } from './api';
+import { DEFAULT_LIST_LIMIT, parseSandboxRef, publicSandboxIdFromAny } from './sandbox-id';
+import { mergeOperationPages, type SandboxDebug } from './sandbox-debug';
 import {
   PublicOperationRecord,
   PublicPage,
-  PublicSandbox,
   PublicSnapshot,
   PublicTemplate,
   Sandbox,
@@ -28,17 +28,67 @@ export async function getPublicPage<T>(path: string): Promise<T[]> {
   return page.data;
 }
 
-export async function getPublicSandbox(id: string): Promise<Sandbox> {
-  return publicSandboxToConsoleSandbox(await api.get<PublicSandbox>(`/sandboxes/${id}`));
-}
-
-export async function getConsoleSandboxes(): Promise<Sandbox[]> {
-  const sandboxes = await adminApi.get<Sandbox[]>('/v1/sandboxes?limit=1000');
+// The newest `limit` sandbox rows, across every org or for `orgId` only. The
+// unscoped list then appends the rows nodes report without a database row
+// (rowless pool slots, observed-local sandboxes; see `sandboxRowCount`); those
+// belong to no org, so an org-scoped list leaves them out. The admin list has
+// no cursor.
+export async function getConsoleSandboxes(
+  limit: number = DEFAULT_LIST_LIMIT,
+  orgId: string | null = null,
+): Promise<Sandbox[]> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (orgId) params.set('org_id', orgId);
+  const sandboxes = await adminApi.get<Sandbox[]>(`/v1/sandboxes?${params}`);
   return sandboxes.map(adminSandboxToConsoleSandbox);
 }
 
+// `id` may be any form `parseSandboxRef` accepts; the admin route takes only
+// the `sbx_` form.
 export async function getConsoleSandbox(id: string): Promise<Sandbox> {
-  return adminSandboxToConsoleSandbox(await adminApi.get<Sandbox>(`/v1/sandboxes/${id}`));
+  const ref = parseSandboxRef(id);
+  if (!ref) {
+    throw new ApiError(400, 'Not a sandbox ID, UUID or sandbox pod name');
+  }
+  return adminSandboxToConsoleSandbox(await adminApi.get<Sandbox>(`/v1/sandboxes/${ref.publicId}`));
+}
+
+export interface AdminOperationRecord extends PublicOperationRecord {
+  org_id: string | null;
+  actor_user_id: string | null;
+  api_product: string | null;
+  target_type: string | null;
+  target_id: string | null;
+  attempts: number;
+  requested_at: string | null;
+}
+
+// Everything the control plane records about one sandbox, from the admin
+// debug route, which takes the bare UUID.
+export async function getSandboxDebug(id: string): Promise<SandboxDebug> {
+  const ref = parseSandboxRef(id);
+  if (!ref) throw new ApiError(400, 'Not a sandbox ID, UUID or sandbox pod name');
+  return adminApi.get<SandboxDebug>(`/v1/debug/sandbox/${ref.uuid}`);
+}
+
+// Lifecycle operations recorded against a sandbox, newest first. They outlive
+// the sandbox row, so they also explain a sandbox that was deleted. Most
+// operations name the sandbox by its `sbx_` ID; a fork names its source by
+// the bare UUID, so both are read and merged. `more` is true when either read
+// held more than `limit` rows.
+export async function getSandboxOperations(
+  id: string,
+  { limit = 50, orgId = null }: { limit?: number; orgId?: string | null } = {},
+): Promise<{ operations: AdminOperationRecord[]; more: boolean }> {
+  const ref = parseSandboxRef(id);
+  if (!ref) throw new ApiError(400, 'Not a sandbox ID, UUID or sandbox pod name');
+  const read = (targetId: string) => {
+    const params = new URLSearchParams({ target_type: 'sandbox', target_id: targetId, limit: String(limit + 1) });
+    if (orgId) params.set('org_id', orgId);
+    return adminApi.get<AdminOperationRecord[]>(`/v1/operations?${params}`);
+  };
+  const [byPublicId, byUuid] = await Promise.all([read(ref.publicId), read(ref.uuid)]);
+  return mergeOperationPages([byPublicId, byUuid], limit);
 }
 
 export async function postPublicOperation(
@@ -46,12 +96,6 @@ export async function postPublicOperation(
   body?: unknown,
 ): Promise<SandboxOperationResponse> {
   return api.post<SandboxOperationResponse>(path, body, {
-    'Idempotency-Key': idempotencyKey(),
-  });
-}
-
-export async function deletePublicOperation(path: string): Promise<SandboxOperationResponse> {
-  return api.delete<SandboxOperationResponse>(path, {
     'Idempotency-Key': idempotencyKey(),
   });
 }
@@ -96,15 +140,6 @@ export async function waitForAdminOperation(
   }
 
   throw new OperationTimeoutError(last?.progress_message || 'operation still running');
-}
-
-export async function runPublicSandboxOperation(
-  path: string,
-  body?: unknown,
-): Promise<SandboxOperationResponse> {
-  const response = await postPublicOperation(path, body);
-  void waitForPublicOperation(response.operation_id).catch(() => {});
-  return response;
 }
 
 // Cross-org admin lifecycle action. The console lists sandboxes across every
@@ -164,52 +199,6 @@ export async function createConsoleSandboxForOrg(
   );
 }
 
-export function publicSandboxToConsoleSandbox(sandbox: PublicSandbox): Sandbox {
-  return {
-    id: sandbox.id,
-    resource_type: 'sandbox',
-    name: sandbox.name,
-    user_id: null,
-    org_id: null,
-    managed_by: null,
-    lifecycle: sandbox.state,
-    placement: null,
-    active_node_id: null,
-    active_node: null,
-    created_at: sandbox.created_at,
-    updated_at: sandbox.updated_at,
-    last_used_at: null,
-    last_access_at: null,
-    last_command_at: null,
-    status: sandbox.state,
-    template: sandbox.template,
-    content_hash: sandbox.template_digest,
-    release_tags: [],
-    runtime: null,
-    pid: null,
-    namespace: null,
-    uptime: null,
-    user: null,
-    image_hash: null,
-    spaced_version: null,
-    snapshots_enabled_desired: false,
-    snapshots_enabled: null,
-    pool_template: null,
-    disk_usage_bytes: null,
-    failure_reason: failedConditionMessage(sandbox),
-    age: null,
-    volume_encryption: false,
-    auto_lifecycle: null,
-    auto_lifecycle_status: null,
-    network_policy_override: null,
-    template_network_policy: null,
-    effective_desired_network_policy: null,
-    network_policy: null,
-    network_policy_generation: null,
-    network_policy_status: null,
-  };
-}
-
 function adminSandboxToConsoleSandbox(sandbox: Sandbox): Sandbox {
   return {
     ...sandbox,
@@ -258,9 +247,3 @@ export function publicSnapshotToConsoleSnapshot(snapshot: PublicSnapshot): Snaps
   };
 }
 
-function failedConditionMessage(sandbox: PublicSandbox): string | null {
-  return (
-    sandbox.conditions.find((condition) => condition.status === 'false' && condition.message)
-      ?.message ?? null
-  );
-}

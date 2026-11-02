@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use sqlx::PgPool;
 
+use pplx_space_sandbox_store::delete::delete_with_dependents;
 use pplx_space_sandbox_store::fork_source_lifecycle::{
     active_fork_source_operation_exists, lock_fork_source_lifecycle,
 };
@@ -14,11 +15,13 @@ pub use pplx_space_common_svc::types::{
     NetworkPolicyTarget, ReconcileElementRef, ReconcileFacet, ReconcileReason, ReconcileRef,
 };
 pub use pplx_space_sandbox_teardown::{
-    delete_reconcile_state_for_elements, finalize_sandbox_db_delete_tx,
-    sandbox_reconcile_cleanup_refs,
+    delete_reconcile_state_for_elements, sandbox_reconcile_cleanup_refs,
 };
 
 use crate::reconcile_trigger::{enqueue_triggers, enqueue_triggers_tx};
+use pplx_space_cluster_trigger_queue::{
+    QueuedReconcileRefs, QueuedRefConflict, queue_node_reconcile_refs,
+};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct EnqueuedNodeReconcile {
@@ -33,7 +36,7 @@ pub struct EnqueuedNodeReconcile {
 /// (`crates/libs/node/api/server/src/cluster.rs`) INSERTs the `snapshots`
 /// row with `state='creating'` **before** the S3 upload starts, and flips
 /// to `state='ready'` only after the upload completes. If a user DELETEs
-/// the sandbox in that window, [`finalize_sandbox_db_delete_tx`]'s
+/// the sandbox in that window, [`delete_with_dependents`]'s
 /// CASCADE drops the `snapshots` row and the storage-location row's
 /// `snapshot_id` becomes NULL — but the S3 upload is still actively
 /// writing under the prefix. The orphan-storage-location sweeper
@@ -130,7 +133,7 @@ pub async fn in_flight_snapshot_upload_idle_for<'e>(
 ///   proceeds normally after we release).
 ///
 /// Without the parent-row lock, a `BeginArtifactBackup` arriving
-/// between the snapshot scan and `finalize_sandbox_db_delete_tx`
+/// between the snapshot scan and `delete_with_dependents`
 /// would slip a fresh `state='creating'` row past the gate.
 pub async fn finalize_sandbox_db_delete_user_initiated(
     pool: &PgPool,
@@ -142,14 +145,15 @@ pub async fn finalize_sandbox_db_delete_user_initiated(
     // concurrent BeginArtifactBackup INSERT (which acquires the
     // implicit FK FOR KEY SHARE on this row). Result is discarded —
     // if the sandbox doesn't exist (already deleted), the
-    // subsequent finalize_sandbox_db_delete_tx is a no-op.
+    // subsequent delete_with_dependents deletes no `sandboxes` row
+    // and only clears any dependent rows left for this id.
     sqlx::query(sql!("SELECT 1 FROM sandboxes WHERE id = $1 FOR UPDATE"))
         .bind(sandbox_id)
         .fetch_optional(&mut *tx)
         .await?;
     // Under the parent-row lock above, no new `creating` row can
     // appear between this SELECT and the orphan UPDATE inside
-    // `finalize_sandbox_db_delete_tx`. A plain SELECT (no row lock)
+    // `delete_with_dependents`. A plain SELECT (no row lock)
     // is enough.
     if let Some(idle_for) = in_flight_snapshot_upload_idle_for(&mut *tx, sandbox_id).await? {
         // Drop tx without commit; abandoning the transaction
@@ -160,7 +164,7 @@ pub async fn finalize_sandbox_db_delete_user_initiated(
     if active_fork_source_operation_exists(&mut tx, sandbox_id).await? {
         return Err(FinalizeSandboxDbDeleteError::ForkInProgress);
     }
-    finalize_sandbox_db_delete_tx(&mut tx, sandbox_id).await?;
+    delete_with_dependents(&mut tx, sandbox_id).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -170,7 +174,7 @@ pub async fn finalize_sandbox_db_delete(
     sandbox_id: SandboxId,
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
-    finalize_sandbox_db_delete_tx(&mut tx, sandbox_id).await?;
+    delete_with_dependents(&mut tx, sandbox_id).await?;
     tx.commit().await
 }
 
@@ -249,35 +253,21 @@ fn normalized_refs(refs: &[ReconcileRef]) -> Vec<(String, String)> {
         .collect()
 }
 
-async fn enqueue_node_reconcile_refs_for_nodes_on<'e, E>(
-    executor: E,
+async fn enqueue_node_reconcile_refs_for_nodes_on<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
     node_ids: &[NodeId],
     refs: &[(String, String)],
-) -> Result<Vec<EnqueuedNodeReconcile>, sqlx::Error>
-where
-    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
-{
-    let facets = refs
-        .iter()
-        .map(|(facet, _)| facet.clone())
-        .collect::<Vec<_>>();
-    let elements = refs
-        .iter()
-        .map(|(_, element)| element.clone())
-        .collect::<Vec<_>>();
-    let rows = upsert_node_reconcile_refs(
-        executor,
-        node_ids,
-        &facets,
-        &elements,
-        current_storable_traceparent().as_deref(),
-    )
-    .await;
-    match rows {
+) -> Result<Vec<EnqueuedNodeReconcile>, sqlx::Error> {
+    match queue_node_reconcile_refs(executor, node_ids, refs, QueuedRefConflict::KeepProgress).await
+    {
         Ok(rows) => {
             let mut by_node = BTreeMap::<NodeId, u64>::new();
-            for (node_id, facet, queued) in rows {
-                let queued = u64::try_from(queued).unwrap_or(0);
+            for QueuedReconcileRefs {
+                node_id,
+                facet,
+                queued,
+            } in rows
+            {
                 if queued > 0 {
                     pplx_space_metrics::reconcile::queued_count(&facet, "ok", queued);
                 }
@@ -300,98 +290,6 @@ where
             Err(error)
         }
     }
-}
-
-/// The writer's trace context, for the pass that applies the refs to link
-/// to. Refs queued outside any traced span save none.
-fn current_storable_traceparent() -> Option<String> {
-    pplx_space_observability::trace_propagation::current_traceparent()
-        .filter(|traceparent| pplx_space_observability::is_storable_traceparent(traceparent))
-}
-
-/// Queue each ref on each node, reviving a dead row and keeping a live one's
-/// place, and return how many rows each node and facet queued.
-///
-/// `traceparent` is saved with each row. A writer without one keeps the
-/// context a row already has, so a background write that coalesces onto a
-/// request's pending ref does not erase the request's context, and an
-/// unsampled writer's context never replaces a sampled one, so the pass that
-/// applies the ref still follows the sampled request.
-async fn upsert_node_reconcile_refs<'e, E>(
-    executor: E,
-    node_ids: &[NodeId],
-    facets: &[String],
-    elements: &[String],
-    traceparent: Option<&str>,
-) -> Result<Vec<(NodeId, String, i64)>, sqlx::Error>
-where
-    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
-{
-    sqlx::query_as::<_, (NodeId, String, i64)>(sql!(
-        "WITH nodes AS (
-             SELECT DISTINCT node_id
-             FROM UNNEST($1::UUID[]) AS nodes(node_id)
-         ),
-         refs AS (
-             SELECT DISTINCT facet, element
-             FROM UNNEST($2::TEXT[], $3::TEXT[]) AS refs(facet, element)
-         ),
-         upserted AS (
-             INSERT INTO node_reconcile_queue (
-                 node_id, facet, element, requested_at, updated_at, traceparent
-             )
-             SELECT nodes.node_id, refs.facet, refs.element, NOW(), NOW(), $4
-             FROM nodes
-             CROSS JOIN refs
-             ON CONFLICT (node_id, facet, element) DO UPDATE
-             SET generation = node_reconcile_queue.generation + 1,
-                 requested_at = CASE
-                     WHEN node_reconcile_queue.dead_at IS NOT NULL
-                     THEN EXCLUDED.requested_at
-                     ELSE node_reconcile_queue.requested_at
-                 END,
-                 next_attempt_at = CASE
-                     WHEN node_reconcile_queue.dead_at IS NOT NULL
-                     THEN NOW()
-                     WHEN node_reconcile_queue.claim_token = ''
-                          AND node_reconcile_queue.attempts = 0
-                     THEN NOW()
-                     ELSE node_reconcile_queue.next_attempt_at
-                 END,
-                 attempts = CASE
-                     WHEN node_reconcile_queue.dead_at IS NOT NULL THEN 0
-                     ELSE node_reconcile_queue.attempts
-                 END,
-                 last_error = CASE
-                     WHEN node_reconcile_queue.dead_at IS NOT NULL
-                          OR node_reconcile_queue.attempts = 0
-                     THEN ''
-                     ELSE node_reconcile_queue.last_error
-                 END,
-                 dead_at = NULL,
-                 dead_reason = '',
-                 updated_at = NOW(),
-                 traceparent = CASE
-                     WHEN EXCLUDED.traceparent IS NULL
-                     THEN node_reconcile_queue.traceparent
-                     WHEN get_byte(decode(right(node_reconcile_queue.traceparent, 2), 'hex'), 0) & 1 = 1
-                          AND get_byte(decode(right(EXCLUDED.traceparent, 2), 'hex'), 0) & 1 = 0
-                     THEN node_reconcile_queue.traceparent
-                     ELSE EXCLUDED.traceparent
-                 END
-             RETURNING node_id, facet
-         )
-         SELECT node_id, facet, COUNT(*)::BIGINT AS queued
-         FROM upserted
-         GROUP BY node_id, facet
-         ORDER BY node_id, facet"
-    ))
-    .bind(node_ids)
-    .bind(facets)
-    .bind(elements)
-    .bind(traceparent)
-    .fetch_all(executor)
-    .await
 }
 
 pub async fn enqueue_node_reconcile_refs_and_trigger(

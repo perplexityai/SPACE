@@ -584,8 +584,10 @@ pub(super) fn sandbox_to_cached_response(
 ) -> SandboxResponse {
     let mut response = sandbox_to_response(sandbox, None);
     if let Some(observed) = observed {
-        response.lifecycle = observed.status.clone().or(response.lifecycle);
-        response.status = observed.status.clone().or(response.status);
+        response.set_state(SandboxStateInput::new(
+            Some(sandbox.lifecycle.clone()),
+            observed.status.clone(),
+        ));
         response.spaced_version = observed.spaced_version.clone();
         response.pid = observed.pid.and_then(|value| u32::try_from(value).ok());
         response.namespace = observed.namespace.clone();
@@ -626,11 +628,9 @@ pub(super) fn observed_only_sandbox_response(observed: &SandboxObservedState) ->
         } else {
             SandboxResourceType::ObservedLocal
         },
-        lifecycle: observed.status.clone(),
         placement: Some("observed".to_string()),
         active_node_id: None,
         active_node: None,
-        status: observed.status.clone(),
         runtime: None,
         spaced_version: observed.spaced_version.clone(),
         pid: observed.pid.and_then(|value| u32::try_from(value).ok()),
@@ -659,6 +659,7 @@ pub(super) fn observed_only_sandbox_response(observed: &SandboxObservedState) ->
         ..SandboxResponse::default()
     };
     response.template = observed_template(observed);
+    response.set_state(SandboxStateInput::new(None, observed.status.clone()));
     response
 }
 
@@ -675,6 +676,12 @@ pub fn sandbox_to_response(sandbox: &Sandbox, live: Option<&SandboxInfo>) -> San
     let live_status = live
         .and_then(|info| info.auto_lifecycle_status.as_ref())
         .and_then(|status| status_from_proto(status).ok());
+    let live_lifecycle = live.map(|info| {
+        info.observed_lifecycle()
+            .map(|state| state.label().to_string())
+            .unwrap_or_else(|_| "unknown".into())
+    });
+    let state_input = SandboxStateInput::new(Some(sandbox.lifecycle.clone()), live_lifecycle);
 
     SandboxResponse {
         id: sandbox.id,
@@ -682,13 +689,7 @@ pub fn sandbox_to_response(sandbox: &Sandbox, live: Option<&SandboxInfo>) -> San
         name: sandbox.name.clone(),
         user_id: Some(sandbox.user_id),
         org_id: Some(sandbox.org_id),
-        lifecycle: live
-            .map(|info| {
-                info.observed_lifecycle()
-                    .map(|state| state.label().to_string())
-                    .unwrap_or_else(|_| "unknown".into())
-            })
-            .or_else(|| Some(sandbox.lifecycle.clone())),
+        lifecycle: state_input.reported_lifecycle(),
         placement: Some(if live.is_some() {
             "on_node".to_string()
         } else {
@@ -712,13 +713,8 @@ pub fn sandbox_to_response(sandbox: &Sandbox, live: Option<&SandboxInfo>) -> San
         effective_desired_network_policy: sandbox_effective_desired_policy(sandbox),
         network_policy_generation: sandbox_effective_network_policy_generation(sandbox),
         network_policy_status: network_policy_status_for(Some(sandbox), None, live),
-        status: live
-            .map(|info| {
-                info.observed_lifecycle()
-                    .map(|state| state.label().to_string())
-                    .unwrap_or_else(|_| "unknown".into())
-            })
-            .or_else(|| Some(sandbox.lifecycle.clone())),
+        status: state_input.reported_lifecycle(),
+        state_input,
         template: live
             .and_then(|info| info.template.clone())
             .or_else(|| sandbox.template_id.clone()),

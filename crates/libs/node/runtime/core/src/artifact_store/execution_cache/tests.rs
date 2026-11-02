@@ -268,14 +268,11 @@ fn empty_release_skeleton_is_reclaimed_without_touching_other_entries() {
             }
             Contents::Unexpected => std::fs::create_dir(target.join("unrecognized")).unwrap(),
         }
-        let plans = ["bin/firecracker", "bin/jailer"].map(|path| SealedPlan {
-            file: PlannedFile {
-                path,
-                sha256: sha256(b"retained"),
-                size: None,
-                mode: 0o755,
-            },
-            expected: crate::verity::VerityDigest::new(sha256(b"retained")),
+        let plans = ["bin/firecracker", "bin/jailer"].map(|path| PlannedFile {
+            path,
+            sha256: sha256(b"retained"),
+            size: None,
+            mode: 0o755,
         });
         reclaim_empty_execution_target(&target, &plans, fixture.store.owner).unwrap();
         assert_eq!(target.exists(), !matches!(contents, Contents::Empty));

@@ -205,6 +205,8 @@ pub struct JailerLaunch<'a> {
     pub fc_metrics_path: &'a str,
     pub fc_console_path: &'a str,
     pub cgroup_limits: &'a crate::cgroup::CgroupLimits,
+    /// How long the jailer may run before it is killed and the launch fails.
+    pub jailer_start_timeout: std::time::Duration,
 }
 
 pub fn launch_via_jailer(_config: JailerLaunch<'_>) -> Result<u32, String> {

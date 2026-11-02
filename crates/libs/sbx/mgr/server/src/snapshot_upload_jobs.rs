@@ -315,8 +315,14 @@ impl JobExecutor for SnapshotUploadExecutor {
             .map(|observation| observation.bytes)
             .collect::<Vec<_>>();
         let vm_total_bytes = vm_artifact_total_bytes(&artifact_bytes, vm_artifact_count);
+        // Read just before finalizing: a suspend that failed its own handoff
+        // rolled back to `paused` and kept the runtime while this job went on
+        // uploading the capture.
+        let suspend_uncommitted = suspend_uncommitted(&self.db, &payload.meta)?;
         let finalize_started_at = Instant::now();
-        let finalize_result = finalize_with_cluster_api_ready(&snapshot_id, vm_total_bytes).await;
+        let finalize_result =
+            finalize_with_cluster_api_ready(&snapshot_id, vm_total_bytes, suspend_uncommitted)
+                .await;
         pplx_space_metrics::snapshot::delivery_duration_ms(
             "cluster_finalize",
             origin,
@@ -1364,11 +1370,81 @@ fn begin_artifact_backup_request(
     }
 }
 
+/// Whether the node may still hold the runtime this upload's capture was
+/// meant to release, so a ready backup of it must not make the control plane
+/// retire the sandbox's execution. Only suspend captures are projected, so any
+/// other origin answers `false`.
+///
+/// A row in a state that may hold a runtime outside a suspend
+/// ([`SandboxState::holds_runtime_outside_suspend`]) answers `true`: a suspend
+/// rolled back to `paused` lands there, as does a sandbox woken since, and so
+/// does a quarantined one, whose VM nothing on the node settles. A
+/// `suspending` or `suspended` row answers `true` unless it pins this capture.
+/// A suspend begun after a rollback clears the pin, and a `suspended` row that
+/// pins another capture committed that one instead. A node-local suspend pins
+/// its capture only when its cleanup completes, so while it is still
+/// `suspending` the node's own `suspended` report projects the row; a teardown
+/// suspend pins its capture before it tears down. Every other state, like a
+/// missing row, answers `false` and keeps the projection as before. That
+/// includes the cleanup states, even after a node-local suspend's cleanup
+/// fails without pinning its capture; a VM such a row keeps is the cleanup's
+/// to settle. A state this binary can't parse answers `true`: withholding the
+/// projection leaves it to the node's own `suspended` report, while a wrong
+/// projection retires a live runtime.
+///
+/// The answer is read before the finalize call and not held across it, so a
+/// wake that starts in between still meets a projection.
+///
+/// [`SandboxState::holds_runtime_outside_suspend`]: crate::state::SandboxState::holds_runtime_outside_suspend
+fn suspend_uncommitted(
+    db: &crate::db::SharedConnection,
+    meta: &SnapshotMeta,
+) -> Result<bool, JobError> {
+    use crate::state::SandboxState;
+
+    if meta
+        .artifact_origin
+        .is_some_and(|origin| origin != pplx_space_common_core::types::ArtifactOrigin::Suspend)
+    {
+        return Ok(false);
+    }
+    let sandbox_id = &meta.sandbox_id;
+    let read_failed = |error: crate::db::Error| {
+        JobError::retriable(format!(
+            "read sandbox {sandbox_id} before finalize: {error}"
+        ))
+    };
+    let conn = db
+        .lock()
+        .map_err(|_| JobError::retriable("snapshot-upload database mutex poisoned"))?;
+    let view = crate::db::read::sandbox_view(&conn, sandbox_id);
+    let Some(label) = view.current_state_label().map_err(read_failed)? else {
+        return Ok(false);
+    };
+    Ok(match label.parse::<SandboxState>() {
+        Err(_) => true,
+        // A legacy payload names no artifact; it keeps the projection.
+        Ok(SandboxState::Suspending | SandboxState::Suspended) => match meta.local_artifact_id {
+            Some(artifact) => {
+                let pin = view
+                    .pinned_artifact()
+                    .pin_and_updated_at()
+                    .map_err(read_failed)?
+                    .and_then(|(pin, _)| pin);
+                pin.as_deref() != Some(artifact.to_string().as_str())
+            }
+            None => false,
+        },
+        Ok(state) => state.holds_runtime_outside_suspend(),
+    })
+}
+
 /// Flip the backup row to `state='ready'`. This is the terminal step of the
 /// durable worker's `execute` and makes the row visible to restore.
 async fn finalize_with_cluster_api_ready(
     snapshot_id: &str,
     bytes_uploaded: u64,
+    suspend_uncommitted: bool,
 ) -> Result<(), JobError> {
     let bytes = bytes_uploaded_i64(snapshot_id, bytes_uploaded);
     let mut client = connect_cluster_api().await?;
@@ -1378,6 +1454,7 @@ async fn finalize_with_cluster_api_ready(
         bytes_uploaded: bytes,
         failure_reason: None,
         artifact_digests: Vec::new(),
+        suspend_uncommitted,
     };
 
     match client.finalize_artifact_backup(req).await {
@@ -1385,6 +1462,7 @@ async fn finalize_with_cluster_api_ready(
             tracing::info!(
                 snapshot_id,
                 bytes = bytes_uploaded,
+                suspend_uncommitted,
                 "snapshot finalized ready with cluster-api"
             );
             Ok(())
@@ -1455,6 +1533,7 @@ pub(crate) async fn finalize_with_cluster_api_failed(snapshot_id: &str, reason: 
         bytes_uploaded: 0,
         failure_reason: Some(reason.to_string()),
         artifact_digests: Vec::new(),
+        suspend_uncommitted: false,
     };
     if let Err(status) = client.finalize_artifact_backup(req).await {
         tracing::warn!(

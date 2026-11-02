@@ -207,6 +207,18 @@ impl RuntimeControl for Client {
             Ok(())
         })
     }
+    fn request_guest_shutdown(&self) -> ControlFuture<'_, ()> {
+        Box::pin(async move {
+            self.request(
+                Method::PUT,
+                "/api/v1/vm.power-button",
+                Bytes::new(),
+                REQUEST_TIMEOUT,
+            )
+            .await?;
+            Ok(())
+        })
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]

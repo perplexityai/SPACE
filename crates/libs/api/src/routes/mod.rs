@@ -50,6 +50,9 @@ pub struct AppState {
     /// fresh replica does not receive traffic with a cold cache.
     pub readiness: crate::controllers::substrate::ReflectorReady,
     pub drain_signal: pplx_space_common_svc::DrainSignal,
+    /// Claimed operations this process executes itself instead of leaving
+    /// them to the dispatcher. See [`crate::inline_operations`].
+    pub inline_operations: crate::inline_operations::InlineOperations,
     /// Bookkeeping for the e2b-compat template build endpoints.
     /// See `routes::e2b::template_build` for the persisted keys.
     pub template_build_state: std::sync::Arc<crate::routes::e2b::TemplateBuildState>,
@@ -126,6 +129,7 @@ impl AppState {
             >,
         >,
     ) -> Result<Self, AppStateError> {
+        let route_signing = route_ed25519_authority.is_some();
         let federated_identity = crate::federated_identity::FederatedIdentityConfig::from_env()?;
         let egress_profiles = crate::egress_profiles::EgressProfiles::from_env()?;
         let tls_interception_exemptions =
@@ -176,6 +180,16 @@ impl AppState {
         let data_plane_base_url = crate::public_sessions::data_plane_base_url_from_env();
         let command_stream =
             crate::command_stream::CommandStreamProxy::from_env(shutdown_token.child_token())?;
+        // Startup check: without a route-signing authority, nothing runs
+        // inline.
+        let inline_operations = crate::inline_operations::InlineOperations::new(
+            crate::inline_operations::InlineOperationsConfig::from_env(),
+            task_tracker.clone(),
+            drain_signal.clone(),
+            crate::public_operation_driver::OperationExecutionConfig::from_env(),
+            route_signing,
+        );
+        task_tracker.spawn(inline_operations.report_slots(shutdown_token.child_token()));
         let ecw_credential_keyring = std::sync::Arc::new(
             pplx_space_common_svc::ecw_credential::EcwCredentialKeyring::load_from_env()?,
         );
@@ -190,6 +204,7 @@ impl AppState {
             native_sandbox_limits,
             readiness,
             drain_signal,
+            inline_operations,
             template_build_state,
             federated_identity,
             external_console: None,

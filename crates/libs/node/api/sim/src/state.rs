@@ -230,13 +230,14 @@ impl SimState {
             .ok_or_else(|| SimStateError::NotFound(sandbox_id.to_string()))
     }
 
+    #[cfg(test)]
     pub async fn list(&self) -> Vec<SandboxRecord> {
         self.inner.lock().await.values().cloned().collect()
     }
 
     /// Get the record for `sandbox_id`, inserting a default-running record if
     /// the simulator has never seen this id before. Used by the read-only
-    /// surface (Spaced ping/status/wait_ready/files) when the simulator runs
+    /// surface (Spaced status/wait_ready/files) when the simulator runs
     /// as the per-sandbox pod under K8s substrate, where the api-server
     /// never calls `CreateSandbox` — the pod's mere existence on a pod IP is
     /// the substrate's "creation" event.

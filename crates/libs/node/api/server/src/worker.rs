@@ -2,10 +2,7 @@ use crate::clients::BackendClients;
 use crate::node_ctl;
 use crate::proto::worker_api_internal_server::WorkerApiInternal;
 use crate::proto::worker_api_server::WorkerApi;
-use crate::proto::{
-    RefreshFacetStateRequest, RefreshFacetStateResponse, TriggerStateReconciliationRequest,
-    TriggerStateReconciliationResponse,
-};
+use crate::proto::{TriggerStateReconciliationRequest, TriggerStateReconciliationResponse};
 use crate::restart_handoff::RpcReplaySafety;
 use crate::uds_per_sandbox_limiter::{SandboxBudget, UdsPerSandboxLimiter, UdsPerSandboxPermit};
 use std::future::Future;
@@ -36,15 +33,17 @@ pub struct WorkerApiService {
     shutdown_token: CancellationToken,
 }
 
-/// Reject policy-mutation RPCs from callers node-api did not classify as the
-/// trusted control plane. `SetSandboxNetworkPolicy`, `SetSandboxAutoLifecyclePolicy`,
-/// and a policy-bearing `UpdateTemplateSettings` carry an attacker-controllable
-/// `authority` and `generation`; a data-plane service-account token that reached
-/// the backend with one could pin a node-local or stale-generation policy that
-/// cluster reconciliation can never override (a template policy also propagates to
-/// every running sandbox inheriting it). Absent an authenticated caller (auth
-/// layer disabled, e.g. local dev/tests) the request forwards as before.
-pub(crate) fn require_policy_mutation_authority<T>(request: &Request<T>) -> Result<(), Status> {
+/// Reject policy-bearing requests from callers node-api did not classify as the
+/// trusted control plane: `SetSandboxNetworkPolicy` and
+/// `SetSandboxAutoLifecyclePolicy`, a `CreateSandbox` or `AdoptPoolSandbox` with a
+/// policy override or a nonzero generation, an activation auto-lifecycle policy on
+/// `StartSandbox`, `ResumeSandbox` or the internal Wake, and the internal Wake's
+/// runtime upgrade. Policy requests carry an attacker-controllable `authority` and
+/// `generation`; a data-plane service-account token that reached the backend with
+/// one could pin a node-local or stale-generation policy that cluster
+/// reconciliation can never override. Absent an authenticated caller (auth layer
+/// disabled, e.g. local dev/tests) the request forwards as before.
+fn require_policy_mutation_authority<T>(request: &Request<T>) -> Result<(), Status> {
     check_policy_mutation_authority(
         request
             .extensions()
@@ -408,7 +407,6 @@ sandbox_scoped_requests!(
     pplx_space_sbx_mgr_client::proto::SetAutoLifecyclePolicyRequest,
     pplx_space_sbx_mgr_client::proto::TouchAutoLifecycleRequest,
     pplx_space_sbx_mgr_client::proto::SetNetworkPolicyRequest,
-    pplx_space_sbx_mgr_client::proto::SpacedPingGuestRequest,
     pplx_space_sbx_mgr_client::proto::SpacedGetStatusRequest,
     pplx_space_sbx_mgr_client::proto::SpacedWaitReadyRequest,
     pplx_space_sbx_mgr_client::proto::SpacedStatRequest,
@@ -437,9 +435,6 @@ sandbox_scoped_requests!(
     pplx_space_sbx_mgr_client::proto::SpacedKillProcessRequest,
     pplx_space_sbx_mgr_client::proto::SpacedOpenLoopbackBridgeRequest,
     pplx_space_sbx_mgr_client::proto::SpacedCloseLoopbackBridgeRequest,
-    pplx_space_sbx_mgr_client::proto::EnableSnapshotsRequest,
-    pplx_space_sbx_mgr_client::proto::DisableSnapshotsRequest,
-    pplx_space_sbx_mgr_client::proto::DeleteSnapshotsRequest,
     pplx_space_sbx_mgr_client::proto::RollbackRequest,
 );
 
@@ -559,18 +554,6 @@ fn reject_public_suspend_restore_context(
     Ok(())
 }
 
-fn reject_public_wake_start_context(
-    rpc: &'static str,
-    start_context: &Option<pplx_space_sbx_mgr_client::proto::WakeStartContext>,
-) -> Result<(), Status> {
-    if start_context.is_some() {
-        return Err(Status::invalid_argument(format!(
-            "{rpc}.start_context is internal-only; use WorkerApiInternal"
-        )));
-    }
-    Ok(())
-}
-
 fn reject_public_operation_activation_attempt(operation: &Option<String>) -> Result<(), Status> {
     if operation.is_some() {
         return Err(Status::invalid_argument(
@@ -677,21 +660,6 @@ impl WorkerApi for WorkerApiService {
         fwd_sbx_read!(self, "SandboxState", state, r)
     }
 
-    async fn get_sandbox_health(
-        &self,
-        r: Request<pplx_space_sbx_mgr_client::proto::GetSandboxHealthRequest>,
-    ) -> Result<Response<pplx_space_sbx_mgr_client::proto::GetSandboxHealthResponse>, Status> {
-        record_sandbox_id(&tracing::Span::current(), &r.get_ref().sandbox_id);
-        fwd_sbx_read!(self, "GetSandboxHealth", get_sandbox_health, r)
-    }
-
-    async fn list_sandboxes(
-        &self,
-        r: Request<pplx_space_sbx_mgr_client::proto::ListRequest>,
-    ) -> Result<Response<pplx_space_sbx_mgr_client::proto::ListResponse>, Status> {
-        fwd_sbx_read!(self, "ListSandboxes", list, r)
-    }
-
     // ── Sandbox state management (sandbox-manager) ───────────────────────────
 
     async fn pause_sandbox(
@@ -711,15 +679,6 @@ impl WorkerApi for WorkerApiService {
             require_policy_mutation_authority(&r)?;
         }
         fwd_sbx!(self, "ResumeSandbox", resume, r)
-    }
-
-    async fn wake_sandbox(
-        &self,
-        r: Request<pplx_space_sbx_mgr_client::proto::WakeRequest>,
-    ) -> Result<Response<pplx_space_sbx_mgr_client::proto::WakeResponse>, Status> {
-        record_sandbox_id(&tracing::Span::current(), &r.get_ref().sandbox_id);
-        reject_public_wake_start_context("WakeSandbox", &r.get_ref().start_context)?;
-        fwd_sbx!(self, "WakeSandbox", wake, r)
     }
 
     async fn create_sandbox_snapshot(
@@ -802,13 +761,6 @@ impl WorkerApi for WorkerApiService {
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::SetNetworkPolicyResponse>, Status> {
         require_policy_mutation_authority(&r)?;
         fwd_sbx!(self, "SetSandboxNetworkPolicy", set_network_policy, r)
-    }
-
-    async fn spaced_ping_guest(
-        &self,
-        r: Request<pplx_space_sbx_mgr_client::proto::SpacedPingGuestRequest>,
-    ) -> Result<Response<pplx_space_sbx_mgr_client::proto::SpacedPingGuestResponse>, Status> {
-        fwd_sbx!(self, "SpacedPingGuest", spaced_ping_guest, r)
     }
 
     async fn spaced_get_status(
@@ -1172,32 +1124,11 @@ impl WorkerApi for WorkerApiService {
 
     // ── Sandbox snapshots (sandbox-manager) ──────────────────────────────────
 
-    async fn enable_snapshots(
-        &self,
-        r: Request<pplx_space_sbx_mgr_client::proto::EnableSnapshotsRequest>,
-    ) -> Result<Response<pplx_space_sbx_mgr_client::proto::EnableSnapshotsResponse>, Status> {
-        fwd_sbx!(self, "EnableSnapshots", enable_snapshots, r)
-    }
-
-    async fn disable_snapshots(
-        &self,
-        r: Request<pplx_space_sbx_mgr_client::proto::DisableSnapshotsRequest>,
-    ) -> Result<Response<pplx_space_sbx_mgr_client::proto::DisableSnapshotsResponse>, Status> {
-        fwd_sbx!(self, "DisableSnapshots", disable_snapshots, r)
-    }
-
     async fn list_snapshots(
         &self,
         r: Request<pplx_space_sbx_mgr_client::proto::ListSnapshotsRequest>,
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::ListSnapshotsResponse>, Status> {
         fwd_sbx_read!(self, "ListSandboxSnapshots", list_snapshots, r)
-    }
-
-    async fn delete_snapshots(
-        &self,
-        r: Request<pplx_space_sbx_mgr_client::proto::DeleteSnapshotsRequest>,
-    ) -> Result<Response<pplx_space_sbx_mgr_client::proto::DeleteSnapshotsResponse>, Status> {
-        fwd_sbx!(self, "DeleteSnapshots", delete_snapshots, r)
     }
 
     async fn rollback_sandbox(
@@ -1228,73 +1159,6 @@ impl WorkerApi for WorkerApiService {
         fwd!(self.clients.tmpl(), delete_template_build, r)
     }
 
-    async fn list_templates(
-        &self,
-        r: Request<pplx_space_template_mgr_client::proto::ListTemplatesRequest>,
-    ) -> Result<Response<pplx_space_template_mgr_client::proto::ListTemplatesResponse>, Status>
-    {
-        fwd_retry!("template-manager", self.clients.tmpl(), list_templates, r)
-    }
-
-    async fn get_template(
-        &self,
-        mut r: Request<pplx_space_template_mgr_client::proto::GetTemplateRequest>,
-    ) -> Result<Response<pplx_space_template_mgr_client::proto::GetTemplateResponse>, Status> {
-        let scope = crate::template_lookup::bind_caller_scope(&mut r)?;
-        let response = fwd_retry!("template-manager", self.clients.tmpl(), get_template, r)?;
-        scope.observe_response(&response)?;
-        Ok(response)
-    }
-
-    async fn update_template_settings(
-        &self,
-        r: Request<pplx_space_template_mgr_client::proto::UpdateTemplateSettingsRequest>,
-    ) -> Result<
-        Response<pplx_space_template_mgr_client::proto::UpdateTemplateSettingsResponse>,
-        Status,
-    > {
-        let req = r.get_ref();
-        if req.network_policy.is_some() || req.default_auto_lifecycle.is_some() {
-            require_policy_mutation_authority(&r)?;
-        }
-        fwd!(self.clients.tmpl(), update_template_settings, r)
-    }
-
-    async fn update_template_snapshot_policy(
-        &self,
-        r: Request<pplx_space_template_mgr_client::proto::UpdateTemplateSnapshotPolicyRequest>,
-    ) -> Result<
-        Response<pplx_space_template_mgr_client::proto::UpdateTemplateSnapshotPolicyResponse>,
-        Status,
-    > {
-        fwd!(self.clients.tmpl(), update_template_snapshot_policy, r)
-    }
-
-    // ── Template pools (template-manager) ────────────────────────────────────
-
-    async fn create_pool(
-        &self,
-        r: Request<pplx_space_template_mgr_client::proto::CreatePoolRequest>,
-    ) -> Result<Response<pplx_space_template_mgr_client::proto::CreatePoolResponse>, Status> {
-        pplx_space_common_svc::auth::template::require_template_mutation_authority(&r)?;
-        fwd!(self.clients.tmpl(), create_pool, r)
-    }
-
-    async fn delete_pool(
-        &self,
-        r: Request<pplx_space_template_mgr_client::proto::DeletePoolRequest>,
-    ) -> Result<Response<pplx_space_template_mgr_client::proto::DeletePoolResponse>, Status> {
-        pplx_space_common_svc::auth::template::require_template_mutation_authority(&r)?;
-        fwd!(self.clients.tmpl(), delete_pool, r)
-    }
-
-    async fn pool_status(
-        &self,
-        r: Request<pplx_space_template_mgr_client::proto::PoolStatusRequest>,
-    ) -> Result<Response<pplx_space_template_mgr_client::proto::PoolStatusResponse>, Status> {
-        fwd_retry!("template-manager", self.clients.tmpl(), pool_status, r)
-    }
-
     // ── Network (node-manager) ───────────────────────────────────────────────
 
     async fn expose_port(
@@ -1302,13 +1166,6 @@ impl WorkerApi for WorkerApiService {
         r: Request<pplx_space_node_mgr_client::proto::ExposePortRequest>,
     ) -> Result<Response<pplx_space_node_mgr_client::proto::ExposePortResponse>, Status> {
         fwd!(self.clients.node(), expose_port, r)
-    }
-
-    async fn unexpose_port(
-        &self,
-        r: Request<pplx_space_node_mgr_client::proto::UnexposePortRequest>,
-    ) -> Result<Response<pplx_space_node_mgr_client::proto::UnexposePortResponse>, Status> {
-        fwd!(self.clients.node(), unexpose_port, r)
     }
 
     async fn allow_port(
@@ -1324,22 +1181,7 @@ impl WorkerApi for WorkerApiService {
         result
     }
 
-    async fn deny_port(
-        &self,
-        r: Request<pplx_space_node_mgr_client::proto::DenyPortRequest>,
-    ) -> Result<Response<pplx_space_node_mgr_client::proto::DenyPortResponse>, Status> {
-        fwd!(self.clients.node(), deny_port, r)
-    }
-
     // ── Custom orchestration ─────────────────────────────────────────────────
-
-    async fn refresh_facet_state(
-        &self,
-        r: Request<RefreshFacetStateRequest>,
-    ) -> Result<Response<RefreshFacetStateResponse>, Status> {
-        node_ctl::refresh_facet_state(r.into_inner()).await?;
-        Ok(Response::new(RefreshFacetStateResponse {}))
-    }
 
     async fn trigger_state_reconciliation(
         &self,
@@ -1378,7 +1220,8 @@ impl WorkerApi for WorkerApiService {
         &self,
         _r: Request<crate::proto::ListNodeTemplatesRequest>,
     ) -> Result<Response<crate::proto::ListNodeTemplatesResponse>, Status> {
-        let request = Request::new(pplx_space_template_mgr_client::proto::ListTemplatesRequest {});
+        let request =
+            Request::new(pplx_space_template_mgr_client::proto::ListTemplatesRequest::default());
         let resp = fwd_retry!(
             "template-manager",
             self.clients.tmpl(),
@@ -1445,10 +1288,14 @@ impl WorkerApiInternal for WorkerApiService {
         r: Request<pplx_space_sbx_mgr_client::proto::WakeRequest>,
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::WakeResponse>, Status> {
         record_sandbox_id(&tracing::Span::current(), &r.get_ref().sandbox_id);
-        if r.get_ref()
-            .start_context
-            .as_ref()
-            .is_some_and(|context| context.activation_auto_lifecycle.is_some())
+        // A runtime upgrade discards a suspended sandbox's memory under an
+        // authorization the caller names, so it takes the same control-plane
+        // authority as a policy write.
+        if r.get_ref().runtime_upgrade.is_some()
+            || r.get_ref()
+                .start_context
+                .as_ref()
+                .is_some_and(|context| context.activation_auto_lifecycle.is_some())
         {
             require_policy_mutation_authority(&r)?;
         }

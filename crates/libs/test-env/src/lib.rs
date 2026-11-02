@@ -107,6 +107,21 @@ pub fn root_or_skip(requirement: &str) -> bool {
     false
 }
 
+/// Whether a test that needs an ordinary user can run: root bypasses
+/// permission checks, so a test of what an unprivileged caller is refused
+/// passes as root without testing anything. Returns true when not root, and
+/// otherwise reports the skip on stderr and returns false. CI runs such tests
+/// in its unprivileged step. Return from the test when this returns false.
+#[cfg(unix)]
+#[must_use = "return from the test when this returns false"]
+pub fn unprivileged_or_skip(requirement: &str) -> bool {
+    if !nix::unistd::geteuid().is_root() {
+        return true;
+    }
+    eprintln!("SKIPPED: requires a non-root user to {requirement}");
+    false
+}
+
 /// Run a test command with a deadline, returning its PID and captured output.
 /// Each returned output stream contains at most its final MiB. On Unix, timeout and
 /// unwinding terminate the owned process group; the direct child is reaped.

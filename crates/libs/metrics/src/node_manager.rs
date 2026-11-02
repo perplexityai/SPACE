@@ -249,6 +249,8 @@ metric_vocabulary!(
         BadMagic => "bad_magic",
         /// The stream header names a version node-manager does not read.
         Version => "version",
+        /// The command is outside the protocol v1 command set SPACE emits.
+        Command => "command",
         /// A command declares more payload than a send command can carry.
         CommandTooLarge => "command_too_large",
         /// A command's CRC does not match: the kernel restarted the send

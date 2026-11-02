@@ -10,8 +10,6 @@ const API_BASE = '/api/v1';
 const AUTH_BASE = '/auth/v1';
 const ADMIN_BASE = '/admin/api';
 
-type RequestMode = 'same-origin' | 'prefer-direct';
-
 export class ApiError extends Error {
   constructor(public status: number, message: string) {
     super(message);
@@ -49,25 +47,6 @@ interface RequestBehavior {
   // Report a 401 to the caller instead of navigating to sign-in. Used by the
   // auth provider's own probe, which must not loop through the login page.
   probe?: boolean;
-}
-
-function directApiBase(base: string): string | null {
-  if (typeof window === 'undefined') {
-    return null;
-  }
-  // External sign-in is attached by the proxy in front of the console, so a
-  // direct request to the API port would arrive without it.
-  if (isExternalConsoleAuth()) {
-    return null;
-  }
-  if (window.location.protocol !== 'http:' || window.location.port !== '3000') {
-    return null;
-  }
-  const host = window.location.hostname;
-  if (!host || host === 'localhost' || host === '127.0.0.1' || host === '[::1]') {
-    return null;
-  }
-  return `http://${host}:8080${base}`;
 }
 
 async function responseOnce(
@@ -127,22 +106,8 @@ async function requestOnce<T>(
 async function request<T>(
   path: string,
   options: RequestInit = {},
-  mode: RequestMode = 'same-origin',
   base: string = API_BASE,
 ): Promise<T> {
-  if (mode === 'prefer-direct') {
-    const directBase = directApiBase(base);
-    if (directBase) {
-      try {
-        return await requestOnce<T>(directBase, path, options);
-      } catch (err) {
-        if (err instanceof ApiError) {
-          throw err;
-        }
-      }
-    }
-  }
-
   return requestOnce<T>(base, path, options);
 }
 
@@ -150,12 +115,6 @@ export const api = {
   get: <T>(path: string) => request<T>(path),
   post: <T>(path: string, body?: unknown, headers?: Record<string, string>) =>
     request<T>(path, { method: 'POST', body: body ? JSON.stringify(body) : undefined, headers }),
-  postPreferDirect: <T>(path: string, body?: unknown) =>
-    request<T>(
-      path,
-      { method: 'POST', body: body ? JSON.stringify(body) : undefined },
-      'prefer-direct',
-    ),
   patch: <T>(path: string, body?: unknown, headers?: Record<string, string>) =>
     request<T>(path, { method: 'PATCH', body: body ? JSON.stringify(body) : undefined, headers }),
   put: <T>(path: string, body?: unknown) =>
@@ -165,18 +124,17 @@ export const api = {
 };
 
 export const authApi = {
-  get: <T>(path: string) => request<T>(path, {}, 'same-origin', AUTH_BASE),
+  get: <T>(path: string) => request<T>(path, {}, AUTH_BASE),
   // Like `get`, but a 401 is returned to the caller instead of navigating.
   probe: <T>(path: string) => requestOnce<T>(AUTH_BASE, path, {}, { probe: true }),
   post: <T>(path: string, body?: unknown) =>
     request<T>(
       path,
       { method: 'POST', body: body ? JSON.stringify(body) : undefined },
-      'same-origin',
       AUTH_BASE,
     ),
   delete: <T>(path: string) =>
-    request<T>(path, { method: 'DELETE' }, 'same-origin', AUTH_BASE),
+    request<T>(path, { method: 'DELETE' }, AUTH_BASE),
 };
 
 export const adminApi = {

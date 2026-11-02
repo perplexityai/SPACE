@@ -161,8 +161,25 @@ impl CacheDiskAdmissionDecision {
 pub enum CacheDiskProbeError {
     #[error("statvfs /space/cache failed")]
     Statvfs,
-    #[error("btrfs filesystem usage /space/cache failed: {0}")]
-    Btrfs(String),
+    /// statvfs succeeded; `status` is that fresh reading.
+    #[error("btrfs filesystem usage /space/cache failed: {detail}")]
+    Btrfs { status: DiskStatus, detail: String },
+}
+
+/// Why a refresh ran, which decides what a failed probe does to the cached
+/// measurement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheDiskRefreshKind {
+    /// A scheduled refresh. A failure keeps the last measurement, or, when
+    /// only the btrfs probe failed, publishes the fresh statvfs reading with
+    /// the last btrfs usage and its timestamp. [`DEFAULT_MEASUREMENT_TTL`]
+    /// bounds how long admission trusts either, so only a run of consecutive
+    /// failures closes admission.
+    Periodic,
+    /// A refresh after an allocation consumed space. A failure never keeps
+    /// statvfs free space measured before that allocation, because the caller
+    /// is about to release the reservation that covered it.
+    AfterAllocation,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -187,6 +204,15 @@ impl CacheDiskAdmissionMonitor {
         config: CacheDiskAdmissionConfig,
         pending_reservation_bytes: u64,
     ) -> CacheDiskAdmissionDecision {
+        self.evaluate_cached_at(Instant::now(), config, pending_reservation_bytes)
+    }
+
+    fn evaluate_cached_at(
+        &self,
+        now: Instant,
+        config: CacheDiskAdmissionConfig,
+        pending_reservation_bytes: u64,
+    ) -> CacheDiskAdmissionDecision {
         if !config.enabled {
             return disabled_decision(pending_reservation_bytes);
         }
@@ -199,7 +225,7 @@ impl CacheDiskAdmissionMonitor {
             );
         };
 
-        if cached.measured_at.elapsed() > DEFAULT_MEASUREMENT_TTL {
+        if now.saturating_duration_since(cached.measured_at) > DEFAULT_MEASUREMENT_TTL {
             return unavailable_decision(
                 config,
                 pending_reservation_bytes,
@@ -210,27 +236,33 @@ impl CacheDiskAdmissionMonitor {
         evaluate_cache_disk_measurement(config, cached.measurement, pending_reservation_bytes)
     }
 
-    pub fn refresh(&self) -> Result<CacheDiskMeasurement, CacheDiskProbeError> {
-        self.refresh_with(read_cache_disk_measurement)
+    pub fn refresh(
+        &self,
+        kind: CacheDiskRefreshKind,
+    ) -> Result<CacheDiskMeasurement, CacheDiskProbeError> {
+        self.refresh_with(kind, Instant::now, read_cache_disk_measurement)
     }
 
     fn refresh_with(
         &self,
+        kind: CacheDiskRefreshKind,
+        now: impl FnOnce() -> Instant,
         probe: impl FnOnce() -> Result<CacheDiskMeasurement, CacheDiskProbeError>,
     ) -> Result<CacheDiskMeasurement, CacheDiskProbeError> {
         // The blocking job owns this lock, including when its async waiter is
         // cancelled. Never publish an older probe after releasing a reservation
         // against a newer observation, or make a slow observation look fresh.
         let _refresh = self.refresh_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let measured_at = Instant::now();
+        let measured_at = now();
         let result = probe();
         let mut last_good = self.last_good.lock().unwrap_or_else(|e| e.into_inner());
-        *last_good = result.as_ref().ok().map(|measurement| CachedMeasurement {
-            measured_at,
-            measurement: *measurement,
-        });
-        // A failed post-allocation refresh must invalidate earlier free space
-        // before the caller releases its reservation. The periodic owner retries.
+        *last_good = match &result {
+            Ok(measurement) => Some(CachedMeasurement {
+                measured_at,
+                measurement: *measurement,
+            }),
+            Err(error) => retained_after_failed_refresh(*last_good, kind, error),
+        };
         result
     }
 
@@ -243,6 +275,37 @@ impl CacheDiskAdmissionMonitor {
     }
 }
 
+/// The measurement to keep after a failed probe; `None` closes admission.
+fn retained_after_failed_refresh(
+    previous: Option<CachedMeasurement>,
+    kind: CacheDiskRefreshKind,
+    error: &CacheDiskProbeError,
+) -> Option<CachedMeasurement> {
+    let previous_btrfs = previous.and_then(|cached| {
+        let btrfs = cached.measurement.btrfs?;
+        Some((cached.measured_at, btrfs))
+    });
+    if let (CacheDiskProbeError::Btrfs { status, .. }, Some((measured_at, btrfs))) =
+        (error, previous_btrfs)
+    {
+        // The fresh statvfs reading already reflects any finished allocation,
+        // so it is safe to publish even after one. The btrfs usage beside it
+        // may be up to the TTL old and may predate allocations that finished
+        // since; keeping its timestamp stops the merge from extending that.
+        return Some(CachedMeasurement {
+            measured_at,
+            measurement: CacheDiskMeasurement {
+                status: *status,
+                btrfs: Some(btrfs),
+            },
+        });
+    }
+    match kind {
+        CacheDiskRefreshKind::Periodic => previous,
+        CacheDiskRefreshKind::AfterAllocation => None,
+    }
+}
+
 pub fn read_cache_disk_measurement() -> Result<CacheDiskMeasurement, CacheDiskProbeError> {
     let status = read_cache_disk_status().ok_or(CacheDiskProbeError::Statvfs)?;
     let path = Path::new(crate::host::linux::paths::SPACE_CACHE_DIR);
@@ -250,7 +313,10 @@ pub fn read_cache_disk_measurement() -> Result<CacheDiskMeasurement, CacheDiskPr
         Ok(usage) => Some(usage),
         Err(error) if is_non_btrfs_usage_error(&error) => None,
         Err(error) => {
-            return Err(CacheDiskProbeError::Btrfs(error.to_string()));
+            return Err(CacheDiskProbeError::Btrfs {
+                status,
+                detail: error.to_string(),
+            });
         }
     };
     Ok(CacheDiskMeasurement { status, btrfs })

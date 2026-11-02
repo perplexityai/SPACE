@@ -96,6 +96,21 @@ if config.tilt_subcommand != "down":
 # hook into the charts. See "Release-build lane" in infra/space/kind/README.md.
 RUST_BUILD = str(local(["bash", "infra/space/kind/lib/rust-build.sh"], quiet = True)).strip()
 watch_file("infra/space/kind/lib/rust-build.sh")
+# Which substrate the control plane runs: kubernetes (the default) or direct,
+# the DirectSubstrate over nodes registered through the admin node registry.
+# A cluster keeps the substrate it was created with; refuse the other one
+# before applying a chart. See "Direct substrate lane" in
+# infra/space/kind/README.md.
+SUBSTRATE = str(local(["bash", "infra/space/kind/lib/substrate.sh"], quiet = True)).strip()
+watch_file("infra/space/kind/lib/substrate.sh")
+local(["bash", "infra/space/kind/lib/substrate.sh", "check", KIND_CLUSTER], quiet = True)
+DIRECT = SUBSTRATE == "direct"
+# The exchange mode's credential-manager authority admits a node service by its
+# pod's Kubernetes node registration (`node_k8s`; check_node_registration in
+# crates/libs/credential/mgr/server/src/k8s_identity.rs), which a Direct node
+# does not have, so every template pull would be refused.
+if DIRECT and STORAGE_CREDENTIALS != "static":
+    fail("SPACE_KIND_SUBSTRATE=direct needs SPACE_KIND_STORAGE_CREDENTIALS=static; see \"Direct substrate lane\" in infra/space/kind/README.md")
 CHART_SET = TELEMETRY_SET + [
     "storageCredentials=" + STORAGE_CREDENTIALS,
     "storageExchange.secretChecksum=" + STS_BRIDGE_SECRET_CHECKSUM,
@@ -610,8 +625,8 @@ local_resource(
 
 # ── Helm releases (in dependency order) ───────────────────────────────────
 
-def helm_release(name, chart, values = []):
-    return helm(chart, name = name, namespace = NAMESPACE, values = values, set = CHART_SET)
+def helm_release(name, chart, values = [], set = []):
+    return helm(chart, name = name, namespace = NAMESPACE, values = values, set = CHART_SET + set)
 
 # A fresh render on every evaluation, so a backend transition never reuses the
 # other backend's values. Fake mode never consumes SaaS credentials; SaaS uses
@@ -655,7 +670,8 @@ SPACE_API_DEPS = ["space-postgres", "label-kind-workers", "label-kind-infra",
 # values-kind.yaml carries the bench's non-test-hook overrides, which the
 # caller-provided-cluster chart must not inherit.
 deploy_yaml(helm_release("space", "infra/space/kind/charts/space-api-local",
-                         values = ["infra/space/kind/charts/space-api-local/values-kind.yaml"]))
+                         values = ["infra/space/kind/charts/space-api-local/values-kind.yaml"],
+                         set = ["substrate=" + SUBSTRATE]))
 k8s_resource(
     "space-api",
     labels = ["control-plane"],
@@ -772,7 +788,8 @@ k8s_resource(
 
 # The cluster-controller materializes per-sandbox pods under the
 # KubernetesSubstrate and hosts the cluster-singleton reconcilers.
-deploy_yaml(helm_release("space", "infra/space/kind/charts/space-cluster-controller-local"))
+deploy_yaml(helm_release("space", "infra/space/kind/charts/space-cluster-controller-local",
+                         set = ["substrate=" + SUBSTRATE]))
 k8s_resource(
     "space-cluster-controller",
     labels = ["control-plane"],
@@ -870,7 +887,7 @@ for line in NODE_RELEASES:
     values = []
     if role == "builder" and os.path.exists(chart + "/values-builder.yaml"):
         values = [chart + "/values-builder.yaml"]
-    node_set = CHART_SET + ["node.role={}".format(role)]
+    node_set = CHART_SET + ["node.role={}".format(role), "node.substrate=" + SUBSTRATE]
     if service == "node-manager" and LOOP_DEVICE_TARGET:
         node_set.append("loopDeviceTarget={}".format(LOOP_DEVICE_TARGET))
     deploy_yaml(helm(chart, name = release, namespace = NAMESPACE, values = values, set = node_set))
@@ -878,7 +895,35 @@ for line in NODE_RELEASES:
         "{}-{}".format(release, service),
         labels = ["node-" + role],
         resource_deps = ["check-kind-node-image", "label-kind-workers", "label-kind-infra",
-                         "sandbox-ssh-secret", "internal-rpc-tls"],
+                         "sandbox-ssh-secret", "internal-rpc-tls"] + (["seed-direct-node-ids"] if DIRECT else []),
+    )
+
+# The Direct substrate lane's node registration (register-direct-nodes.sh):
+# each node's UUID is seeded before its services start, since they report it,
+# and the node is registered through the admin API once the API and its
+# node-api serve. Kubernetes nodes are registered by the cluster controller's
+# node sync instead.
+if DIRECT:
+    local_resource(
+        "seed-direct-node-ids",
+        cmd = "SPACE_KIND_CLUSTER={} bash infra/space/kind/scripts/register-direct-nodes.sh seed-ids".format(KIND_CLUSTER),
+        deps = ["infra/space/kind/scripts/register-direct-nodes.sh"],
+        labels = ["bootstrap"],
+        resource_deps = ["check-kind-node-image", "label-kind-workers"],
+        # Tilt runs nothing else beside a serial local resource; this one only
+        # runs docker exec on the nodes.
+        allow_parallel = True,
+    )
+    local_resource(
+        "register-direct-nodes",
+        cmd = "SPACE_KIND_CLUSTER={} bash infra/space/kind/scripts/register-direct-nodes.sh register".format(KIND_CLUSTER),
+        deps = ["infra/space/kind/scripts/register-direct-nodes.sh"],
+        labels = ["bootstrap"],
+        resource_deps = ["space-api", "provision-local-console", "space-node-api", "space-builder-node-api"],
+        # Tilt runs nothing else beside a serial local resource, and this one's
+        # retries can last minutes; it only runs docker exec, a port-forward
+        # and curl.
+        allow_parallel = True,
     )
 
 # Kind-only operator shell on every sandbox worker and builder; the smoke

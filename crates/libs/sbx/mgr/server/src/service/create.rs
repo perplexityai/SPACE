@@ -303,6 +303,7 @@ impl SandboxManagerService {
         args: CreateWithIdArgs<'_>,
     ) -> Result<Response<CreateResponse>, Status> {
         let CreateWithIdArgs {
+            guest_image,
             req,
             sandbox_owner,
             effective_mode,
@@ -326,6 +327,18 @@ impl SandboxManagerService {
         }
 
         let template_hash = template_create_hash(template_dir, content_hash_resolved)?;
+        self.admit_guest_image(guest_image, execution).await?;
+        super::guest_image::validate_policy(guest_image, auto_lifecycle)?;
+        if !guest_image.expects_agent()
+            && (req.snapshots_enabled
+                || req.pool_template.is_some()
+                || effective_mode != BootMode::Cold
+                || !req.env.is_empty())
+        {
+            return Err(Status::failed_precondition(
+                "firmware guests require cold boot without snapshots, pools or guest-agent configuration",
+            ));
+        }
 
         let pool_template = req.pool_template.as_deref().filter(|s| !s.is_empty());
         validate_pool_member_create_options(
@@ -388,6 +401,7 @@ impl SandboxManagerService {
             crate::db::insert_sandbox_with_cleanup_episode_and_route_evidence(
                 &db,
                 crate::db::InsertSandboxParams {
+                    guest_image,
                     id: &id,
                     uuid8: &uuid8,
                     state: SandboxState::Creating,
@@ -689,27 +703,26 @@ impl SandboxManagerService {
         .await?;
         let prepare_template = prepare_source.template;
         let prepare_template_dir = prepare_source.template_dir;
-        // Resolve the effective policy ref up front; it is pushed to the
-        // net-gateway in the background after launch (below). The gateway
+        // Resolve the effective policy up front so a policy that cannot be
+        // resolved fails the restore before launch. The gateway is nudged to
+        // hydrate in the background after launch (below). The gateway
         // namespace denies egress until policy and CA readiness (fail-closed).
         // Hydration overlaps snapshot load; the finalizer confirms traffic
         // readiness before publishing Started. Hydration requires that the
-        // gateway can actually pull policy as soon as its
-        // process starts: host-control authorizes those pulls by the gateway's
-        // registered (pid, uid), so the launch below persists the registration
+        // gateway can actually pull policy as soon as its process starts:
+        // host-control authorizes those pulls by the gateway's registered
+        // (pid, uid), so the launch below persists the registration
         // inside the gateway launch arm rather than after the jailer join.
-        let effective_policy_ref = if Self::sandbox_is_pool_member(sandbox) {
-            None
-        } else {
+        let has_network_identity = !Self::sandbox_is_pool_member(sandbox);
+        if has_network_identity {
             // Cache resolution owns and measures the foreground deadline.
-            let effective_policy = start_stage(
+            start_stage(
                 "restore.effective_network_policy",
                 id,
                 self.effective_network_policy(sandbox),
             )
             .await?;
-            Some(effective_network_policy_ref(sandbox, &effective_policy)?)
-        };
+        }
         let mut node_client = start_stage_timeout(
             "restore.connect_node_mgr",
             START_NODE_METADATA_TIMEOUT,
@@ -775,12 +788,6 @@ impl SandboxManagerService {
             route_identity_provenance,
             open_activation_claim_eligible,
         );
-        // An in-place restore already asked before staging, so this ask
-        // catches a retirement that landed during staging. A warm start asks
-        // only here.
-        self.refuse_retired_activation_retry(id, open_route_activation.as_ref())
-            .await?;
-
         // Serialize the whole activation boundary with cleanup. A cleanup
         // admitted for the previous execution must either finish before this
         // restore claims the row, or observe the attached replacement
@@ -796,6 +803,13 @@ impl SandboxManagerService {
             activation_lock_owner.lock(),
         )
         .await?;
+        // An in-place restore already asked before staging, so this ask
+        // catches a retirement that landed during staging. A warm start asks
+        // only here. It asks under the activation lock, so a rollback cleanup
+        // of this claim has either finished, leaving its receipt for the check
+        // to see, or can't finish before this restore claims the row.
+        self.refuse_retired_activation_retry(id, open_route_activation.as_ref())
+            .await?;
 
         let cleanup_episode = {
             let db = self.db_conn()?;
@@ -978,7 +992,13 @@ impl SandboxManagerService {
             let builder = sandbox.user.kind() == SandboxOwnerKind::Builder;
             pplx_space_node_runtime_core::boot::configuration(
                 runtime,
-                &pplx_space_node_runtime_core::boot::LinuxBoot {
+                &pplx_space_node_runtime_core::boot::GuestBoot {
+                    source: pplx_space_node_runtime_core::boot::BootSource::from_execution(
+                        &requested_execution,
+                    )
+                    .map_err(|error| {
+                        activation_cleanup.failure(Status::failed_precondition(error.to_string()))
+                    })?,
                     guest: requested_execution.guest(),
                     cpus,
                     memory_mib,
@@ -1220,13 +1240,8 @@ impl SandboxManagerService {
                 return Err(e);
             }
         };
-        if let Some(effective_policy_ref) = effective_policy_ref {
-            spawn_network_policy_refresh(
-                self.db.clone(),
-                id.to_string(),
-                effective_policy_ref,
-                "snapshot-restore",
-            );
+        if has_network_identity {
+            spawn_network_policy_refresh(self.db.clone(), id.to_string(), "snapshot-restore");
         }
 
         // Load the snapshot and start spaced-host concurrently. spaced-host only
@@ -1398,7 +1413,7 @@ impl SandboxManagerService {
                 slot: alloc.slot,
                 guest_cid,
                 pid,
-                spaced_host_pid: spaced_host_resp.pid,
+                spaced_host_pid: Some(spaced_host_resp.pid),
                 netgtw_pid: netgtw_resp.pid,
                 vsock_uds_path: &vsock_uds_path,
                 api_socket_path: &api_socket_path,
@@ -1413,7 +1428,7 @@ impl SandboxManagerService {
             sandbox_id: id,
             boot_type: "snapshot",
             pid,
-            spaced_host_pid: spaced_host_resp.pid,
+            spaced_host_pid: Some(spaced_host_resp.pid),
             net_gateway_pid: netgtw_resp.pid,
             sandbox_uid: sbx_uid,
             network_slot: alloc.slot,
@@ -1433,6 +1448,7 @@ impl SandboxManagerService {
         });
         self.watchdog
             .add_sandbox(crate::watchdog::SidecarInfo {
+                guest_image: Default::default(),
                 node_execution_id: Some(execution_fence.current()),
                 sandbox_id: id.clone(),
                 uid: Some(sbx_uid),

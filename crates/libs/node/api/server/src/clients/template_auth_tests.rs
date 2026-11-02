@@ -24,8 +24,6 @@ use crate::{
 enum TemplateRpc {
     DeleteTemplate,
     DeleteTemplateBuild,
-    CreatePool,
-    DeletePool,
 }
 
 #[rstest]
@@ -42,13 +40,7 @@ async fn template_mutation_authority_survives_the_wire(
     #[case] token: &'static str,
     #[case] mutation: bool,
     #[values(NodeRole::Worker, NodeRole::Builder)] role: NodeRole,
-    #[values(
-        TemplateRpc::DeleteTemplate,
-        TemplateRpc::DeleteTemplateBuild,
-        TemplateRpc::CreatePool,
-        TemplateRpc::DeletePool
-    )]
-    rpc: TemplateRpc,
+    #[values(TemplateRpc::DeleteTemplate, TemplateRpc::DeleteTemplateBuild)] rpc: TemplateRpc,
 ) {
     let (clients, calls, shutdown, mut servers) = backend().await;
     let _cancel_on_drop = shutdown.clone().drop_guard();
@@ -100,8 +92,6 @@ async fn template_mutation_authority_survives_the_wire(
             delete_template_build,
             tmpl::DeleteTemplateBuildRequest::default()
         ),
-        TemplateRpc::CreatePool => call!(create_pool, tmpl::CreatePoolRequest::default()),
-        TemplateRpc::DeletePool => call!(delete_pool, tmpl::DeletePoolRequest::default()),
     };
 
     assert_eq!(

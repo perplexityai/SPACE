@@ -15,10 +15,12 @@ MARKER = "space-smoke-encrypted-double-restore-ok"
 # and the next restore is deferred behind it until the wake fails. Generation 2
 # is the first restored execution, so the second cycle is the regression.
 # Unlike `local.encrypted_resuspend_preserves_cow`, nothing force-clears a pod.
+# It asserts sandbox pods, which the Direct substrate has none of by contract.
 @smoke.scenario(
     "native.encrypted_double_restore_retires_prior_pods",
     sandbox=smoke.SandboxConfig(kind_byok=True),
     api_surfaces=("native",),
+    substrates=("kubernetes",),
 )
 def encrypted_double_restore_retires_prior_pods(
     test: smoke.CommandSandboxFixture,

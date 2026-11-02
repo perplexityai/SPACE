@@ -7,16 +7,13 @@ use std::sync::{
 };
 
 use crate::{
-    builder::BuilderApiService,
     proto::{
-        builder_api_client::BuilderApiClient, worker_api_client::WorkerApiClient,
-        worker_api_internal_client::WorkerApiInternalClient,
+        worker_api_client::WorkerApiClient, worker_api_internal_client::WorkerApiInternalClient,
         worker_api_internal_server::WorkerApiInternalServer, worker_api_server::WorkerApiServer,
     },
     worker::WorkerApiService,
 };
 use axum::{Router, body::Body, routing::any};
-use pplx_space_common_core::types::NodeId;
 use pplx_space_common_svc::{
     auth::{NodeApiAuthConfig, NodeApiAuthLayer, NodeRole},
     bootstrap::wrap_grpc_client_channel,
@@ -137,8 +134,6 @@ pub(super) fn bearer<T>(body: T, token: &str) -> Request<T> {
 enum Rpc {
     Create,
     Adopt,
-    WorkerTemplate,
-    BuilderTemplate,
     Network,
     Lifecycle,
 }
@@ -154,30 +149,15 @@ async fn policy_rpc_authentication_reaches_handlers() {
         (true, "space-api", STATIC_TOKEN, false),
         (false, "space-api", STATIC_TOKEN, true),
     ] {
-        for rpc in [
-            Rpc::Create,
-            Rpc::Adopt,
-            Rpc::WorkerTemplate,
-            Rpc::BuilderTemplate,
-            Rpc::Network,
-            Rpc::Lifecycle,
-        ] {
-            let role = match rpc {
-                Rpc::BuilderTemplate => NodeRole::Builder,
-                _ => NodeRole::Worker,
-            };
+        for rpc in [Rpc::Create, Rpc::Adopt, Rpc::Network, Rpc::Lifecycle] {
             let reviews = Arc::new(AtomicUsize::new(0));
-            let auth = auth_layer(role, k8s, username, reviews.clone());
+            let auth = auth_layer(NodeRole::Worker, k8s, username, reviews.clone());
             let routes = tonic::service::Routes::new(WorkerApiServer::new(WorkerApiService::new(
                 clients.clone(),
             )))
             .add_service(WorkerApiInternalServer::new(WorkerApiService::new(
                 clients.clone(),
-            )))
-            .add_service(
-                BuilderApiService::new(clients.clone(), NodeId::new())
-                    .into_grpc_service(Arc::new(tokio::sync::Semaphore::new(32))),
-            );
+            )));
             let service = auth.layer(routes);
             for (network, lifecycle, generation) in [
                 (false, false, 0),
@@ -220,29 +200,6 @@ async fn policy_rpc_authentication_reaches_handlers() {
                         ))
                         .await
                         .map(|_| ()),
-                    Rpc::WorkerTemplate | Rpc::BuilderTemplate => {
-                        let request = bearer(
-                            tmpl::UpdateTemplateSettingsRequest {
-                                network_policy,
-                                default_auto_lifecycle: auto_lifecycle,
-                                network_policy_generation: generation,
-                                network_policy_authority: authority,
-                                auto_lifecycle_authority: authority,
-                                ..Default::default()
-                            },
-                            token,
-                        );
-                        match rpc {
-                            Rpc::WorkerTemplate => WorkerApiClient::new(service.clone())
-                                .update_template_settings(request)
-                                .await
-                                .map(|_| ()),
-                            _ => BuilderApiClient::new(service.clone())
-                                .update_template_settings(request)
-                                .await
-                                .map(|_| ()),
-                        }
-                    }
                     Rpc::Network => WorkerApiClient::new(service.clone())
                         .set_sandbox_network_policy(bearer(
                             sbx::SetNetworkPolicyRequest {
@@ -281,7 +238,6 @@ async fn policy_rpc_authentication_reaches_handlers() {
                 let requires_authority = match rpc {
                     Rpc::Network | Rpc::Lifecycle => true,
                     Rpc::Create | Rpc::Adopt => network || lifecycle || generation != 0,
-                    Rpc::WorkerTemplate | Rpc::BuilderTemplate => network || lifecycle,
                 };
                 let allowed = trusted || !requires_authority;
                 assert_eq!(

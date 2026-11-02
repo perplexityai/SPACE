@@ -249,14 +249,102 @@ async fn stuck_sandboxes_hand_back_their_slots_and_never_starve_other_sandboxes(
     Ok(())
 }
 
+/// One round of a lifecycle route admitting work inline on each of
+/// `sandboxes`: it records an operation, and runs it through `executor`
+/// beside the dispatchers when admission claims it, as an API process does.
+/// Returns the operations it recorded and how many it claimed.
+async fn admit_inline_round(
+    store: &PublicOperationStore,
+    org_id: OrgId,
+    executor: &KeyedRecordingExecutor,
+    sandboxes: &[&str],
+    round: usize,
+    inline_runs: &mut JoinSet<ExecutionOutcome>,
+) -> Result<(Vec<OperationId>, usize), Box<dyn std::error::Error + Send + Sync>> {
+    use pplx_space_api::public_operations::{
+        CreateInlinePublicOperationResult, CreatePublicOperation, CreatePublicOperationIdempotency,
+        HttpOperationMethod, OperationPathTemplate,
+    };
+
+    let mut recorded = Vec::new();
+    let mut claimed = 0;
+    for sandbox in sandboxes {
+        let key = pplx_space_common_core::types::IdempotencyKey::parse(format!(
+            "inline-{round}-{sandbox}"
+        ))?;
+        let fingerprint = pplx_space_public_api::RequestFingerprint::parse("a".repeat(64))?;
+        let idempotency = CreatePublicOperationIdempotency {
+            method: HttpOperationMethod::Post,
+            path_template: OperationPathTemplate::new("/v1/sandboxes/{sandbox_id}:wake"),
+            key: &key,
+            request_fingerprint: &fingerprint,
+        };
+        let kind = if round.is_multiple_of(2) {
+            OperationKind::WakeSandbox
+        } else {
+            OperationKind::StopSandbox
+        };
+        let result = store
+            .begin_operation_admission(org_id, ApiProduct::Native, &idempotency)
+            .await?
+            .create_claimed_if_sole_active(CreatePublicOperation {
+                org_id,
+                actor_user_id: None,
+                api_product: ApiProduct::Native,
+                kind,
+                target_type: Some(pplx_space_public_api::OperationTargetType::Sandbox),
+                target_id: Some(sandbox),
+                payload_json: serde_json::json!({}),
+                idempotency: Some(idempotency.clone()),
+                traceparent: None,
+            })
+            .await?;
+        match result {
+            CreateInlinePublicOperationResult::Claimed {
+                claim_token,
+                operation,
+            } => {
+                claimed += 1;
+                recorded.push(operation.id);
+                let executor = executor.clone();
+                let store = store.clone();
+                inline_runs.spawn(async move {
+                    let execution = {
+                        let claim_token = claim_token.clone();
+                        let operation = operation.clone();
+                        async move { executor.execute(&claim_token, operation).await }
+                    };
+                    drive_deferrable_operation(
+                        store,
+                        claim_token,
+                        OperationExecutionConfig::default(),
+                        operation,
+                        OperationExecutor::Inline,
+                        execution,
+                    )
+                    .await
+                });
+            }
+            CreateInlinePublicOperationResult::Queued(operation_id) => recorded.push(operation_id),
+            CreateInlinePublicOperationResult::NotCreated(other) => {
+                panic!("a new key records an operation: {other:?}")
+            }
+        }
+    }
+    Ok((recorded, claimed))
+}
+
+/// Two dispatchers and an API process claiming the operations it admits all
+/// run one sandbox's operations one at a time, in request order.
 #[tokio::test]
 async fn one_sandboxs_operations_never_overlap_across_two_dispatchers() -> TestResult {
-    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db_with_max_connections(12).await?
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db_with_max_connections(16).await?
     else {
         return Ok(());
     };
     let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
     let store = PublicOperationStore::new(db.pool.clone());
+    let shared = ["sbx_shared_a", "sbx_shared_b", "sbx_shared_c"];
     let kinds = [
         OperationKind::WakeSandbox,
         OperationKind::StopSandbox,
@@ -264,14 +352,10 @@ async fn one_sandboxs_operations_never_overlap_across_two_dispatchers() -> TestR
         OperationKind::StopSandbox,
         OperationKind::WakeSandbox,
     ];
-    let mut expected: HashMap<String, Vec<OperationId>> = HashMap::new();
+    let mut recorded = Vec::new();
     for kind in kinds {
-        for sandbox in ["sbx_shared_a", "sbx_shared_b", "sbx_shared_c"] {
-            let operation_id = create_op(&store, org_id, kind, sandbox).await?;
-            expected
-                .entry(sandbox.to_string())
-                .or_default()
-                .push(operation_id);
+        for sandbox in shared {
+            recorded.push(create_op(&store, org_id, kind, sandbox).await?);
         }
     }
     // A delete passes a wake in backoff; the wake comes due while the delete
@@ -292,6 +376,13 @@ async fn one_sandboxs_operations_never_overlap_across_two_dispatchers() -> TestR
         bypassed.push(create_op(&store, org_id, OperationKind::DeleteSandbox, &key).await?);
     }
     let executor = KeyedRecordingExecutor::default();
+    let mut inline_runs = JoinSet::new();
+    // Work queued on every sandbox: admission queues behind it.
+    let (queued, claimed) =
+        admit_inline_round(&store, org_id, &executor, &shared, 0, &mut inline_runs).await?;
+    assert_eq!(claimed, 0);
+    recorded.extend(queued);
+
     let shutdown = CancellationToken::new();
     let dispatchers = [
         tokio::spawn(run(
@@ -307,8 +398,24 @@ async fn one_sandboxs_operations_never_overlap_across_two_dispatchers() -> TestR
             shutdown.clone(),
         )),
     ];
-
-    for operation_id in expected.values().flatten().chain(&bypassed) {
+    // Admission keeps racing the dispatchers as they drain the sandboxes.
+    for round in 1..=30 {
+        let (more, _) =
+            admit_inline_round(&store, org_id, &executor, &shared, round, &mut inline_runs).await?;
+        recorded.extend(more);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    for operation_id in recorded.iter().chain(&bypassed) {
+        wait_for_state(&db.pool, *operation_id, OperationState::Succeeded).await?;
+    }
+    // Every sandbox idle again: admission claims each new operation.
+    let (last, claimed) =
+        admit_inline_round(&store, org_id, &executor, &shared, 31, &mut inline_runs).await?;
+    assert_eq!(claimed, shared.len());
+    while let Some(run) = inline_runs.join_next().await {
+        run??;
+    }
+    for operation_id in &last {
         wait_for_state(&db.pool, *operation_id, OperationState::Succeeded).await?;
     }
     shutdown.cancel();
@@ -318,13 +425,20 @@ async fn one_sandboxs_operations_never_overlap_across_two_dispatchers() -> TestR
 
     assert_eq!(executor.max_overlap_per_key.load(Ordering::SeqCst), 1);
     let completed = executor.completed.lock().expect("lock").clone();
-    for (sandbox, operation_ids) in expected {
+    for sandbox in shared {
         let ran = completed
             .iter()
-            .filter(|(key, _)| *key == sandbox)
-            .map(|(_, operation_id)| *operation_id)
+            .filter(|(key, _)| key == sandbox)
+            .map(|(_, operation_id)| operation_id.as_uuid())
             .collect::<Vec<_>>();
-        assert_eq!(ran, operation_ids, "{sandbox} ran in request order");
+        let requested: Vec<uuid::Uuid> = sqlx::query_scalar(sql!(
+            "SELECT operation_id FROM public_operations
+             WHERE target_id = $1 ORDER BY requested_at, operation_id"
+        ))
+        .bind(sandbox)
+        .fetch_all(&db.pool)
+        .await?;
+        assert_eq!(ran, requested, "{sandbox} ran in request order");
     }
     Ok(())
 }

@@ -40,8 +40,9 @@
 //!
 //! Only **recognized** client ids get their own per-client bucket. The
 //! allowlist is `known_clients` (env-configured; defaults to empty) plus any id
-//! present in the Eppo `overrides` map. Every other request — no `X-Client-ID`,
-//! **or** an unrecognized id — shares one
+//! present in the Eppo `overrides` map, less any entry that's reserved or isn't
+//! a valid Kubernetes label value (see [`check_client_id`]). Every other
+//! request — no `X-Client-ID`, **or** an unrecognized id — shares one
 //! [`ClientKey::Unspecified`] bucket with a deliberately tighter cap. This
 //! matters: without the allowlist a client rotating a fresh id per request would
 //! mint a new full-cap bucket each time and never throttle; funnelling all
@@ -79,18 +80,19 @@
 //! [`Mode::Enforce`]; observe mode never rejects, it only meters would-be
 //! rejections.
 
-use std::collections::BTreeSet;
+use std::borrow::Cow;
+use std::collections::{BTreeSet, HashSet};
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Duration;
 
+use pplx_space_common_core::types::LabelValue;
 use pplx_space_feature_flags::{
     FeatureFlagClient, SPACE_API_CLIENT_CONCURRENCY_LIMITER_FLAG,
     SPACE_API_CLIENT_CONCURRENCY_QUOTAS_FLAG,
 };
-use pplx_space_metrics::sandbox::api::client_limit::{
-    self, ClientScope, Decision, Operation, Reason,
-};
+use pplx_space_metrics::sandbox::api::ClientIdTag;
+use pplx_space_metrics::sandbox::api::client_limit::{self, Decision, Operation, Reason};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -202,7 +204,8 @@ pub struct ClientConcurrencyConfig {
     /// Recognized `X-Client-ID` values that get their own per-client bucket. Any
     /// id **not** in this set (and not added via the Eppo `overrides` map) shares
     /// the `unspecified` bucket, so a per-request-random id can't carve out its
-    /// own allowance.
+    /// own allowance. So does an entry that's reserved or isn't a valid
+    /// Kubernetes label value; startup warns about each.
     pub known_clients: BTreeSet<String>,
     /// How long a reserved slot survives without an explicit release before it
     /// is reclaimed as abandoned (crash / timeout safety).
@@ -249,13 +252,6 @@ impl ClientConcurrencyConfig {
         }
     }
 
-    /// Whether `id` gets its own per-client bucket: it's either in the static
-    /// allowlist or has an explicit Eppo `overrides` entry (which also implies
-    /// "known"). Everything else shares the `unspecified` bucket.
-    fn is_known(&self, id: &str, overrides: Option<&QuotaOverrides>) -> bool {
-        self.known_clients.contains(id) || overrides.is_some_and(|o| o.overrides.contains_key(id))
-    }
-
     /// The per-bucket cap for `key`, preferring an Eppo runtime `override` and
     /// falling back to the env-configured cap. Zero means "no limit for this
     /// bucket".
@@ -282,7 +278,8 @@ struct QuotaOverrides {
     unspecified: Option<usize>,
     /// Per-`X-Client-ID` caps for explicitly configured clients.
     /// Presence of a key here **also allowlists** that id at runtime, so ops can
-    /// add a recognized client without a redeploy.
+    /// add a recognized client without a redeploy, unless the key is reserved
+    /// or isn't a valid Kubernetes label value.
     #[serde(deserialize_with = "deserialize_overrides")]
     overrides: std::collections::HashMap<String, usize>,
 }
@@ -356,12 +353,219 @@ fn parse_known_clients(raw: &str) -> BTreeSet<String> {
         .collect()
 }
 
+/// Allowlisted client IDs, interned for the life of the process so a resolved
+/// ID can ride in the `Copy` metric identity as a `&'static str`.
+///
+/// Interning is a metrics rule, applied when a [`ClientKey`] becomes its tag
+/// ([`ClientKey::client_id_tag`]); bucketing never depends on it. Only key-set
+/// entries are interned: operator configuration, not caller input. The static
+/// allowlist is interned once, in [`KnownClients::new`], and is fixed for the
+/// process. Override keys can change at runtime and are never freed, so at most
+/// [`MAX_RUNTIME_CLIENT_IDS`] of them are interned; past that, an override-only
+/// client keeps its own bucket but reports [`ClientIdTag::OVERFLOW`]. Which ones
+/// fit is first-come per process, so replicas can name different override-only
+/// clients once the cap fills.
+static INTERNED_CLIENT_IDS: LazyLock<RwLock<InternedClientIds>> = LazyLock::new(RwLock::default);
+
+/// The most override-only client IDs a process interns over its lifetime.
+/// Generous for an operator-curated override map, small enough that the leak
+/// stays a fixed number of operator-chosen strings however often the map
+/// changes.
+const MAX_RUNTIME_CLIENT_IDS: usize = 64;
+
+#[derive(Default)]
+struct InternedClientIds {
+    ids: HashSet<&'static str>,
+    /// How many of `ids` were interned at runtime, against
+    /// [`MAX_RUNTIME_CLIENT_IDS`].
+    runtime: usize,
+}
+
+/// The process-lifetime copy of a static allowlist entry.
+fn intern_static_client_id(id: &str) -> &'static str {
+    intern_client_id(id, false).unwrap_or_else(|| unreachable!("only runtime interning is capped"))
+}
+
+/// The process-lifetime copy of an override-only `id`, or `None` once
+/// [`MAX_RUNTIME_CLIENT_IDS`] runtime IDs are interned.
+fn intern_override_client_id(id: &str) -> Option<&'static str> {
+    intern_client_id(id, true)
+}
+
+fn intern_client_id(id: &str, runtime: bool) -> Option<&'static str> {
+    // A poisoned lock only means another thread panicked mid-insert; the set
+    // itself is still a valid set of leaked strings.
+    {
+        let interned = INTERNED_CLIENT_IDS
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(existing) = interned.ids.get(id) {
+            return Some(existing);
+        }
+        // Once the cap is full, a new runtime id is refused here, so requests
+        // past it never contend on the write lock.
+        if runtime && interned.runtime >= MAX_RUNTIME_CLIENT_IDS {
+            return None;
+        }
+    }
+    let mut interned = INTERNED_CLIENT_IDS
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Re-check under the write lock: another request may have interned it.
+    if let Some(existing) = interned.ids.get(id) {
+        return Some(existing);
+    }
+    if runtime {
+        if interned.runtime >= MAX_RUNTIME_CLIENT_IDS {
+            return None;
+        }
+        interned.runtime += 1;
+    }
+    let leaked: &'static str = Box::leak(id.into());
+    interned.ids.insert(leaked);
+    Some(leaked)
+}
+
+/// Reserved for callers that don't come through the ECW surface, so no ECW
+/// caller or key-set entry can claim it. Nothing resolves to it yet.
+const NATIVE_CLIENT_KEY: &str = "native";
+
+/// Keys no single ECW client may hold: `unknown` for the shared bucket,
+/// `overflow` past the runtime interning cap, and [`NATIVE_CLIENT_KEY`]. An
+/// allowlist entry or override key spelled like any of them is ignored, so a
+/// tag never names an allowlisted client and a group of callers with one
+/// value.
+///
+/// Matched case-insensitively: Datadog lowercases tag values, so an `Unknown`
+/// entry would read as `client_id:unknown` after ingestion.
+const RESERVED_CLIENT_IDS: [&str; 3] = [
+    ClientIdTag::UNKNOWN.as_str(),
+    ClientIdTag::OVERFLOW.as_str(),
+    NATIVE_CLIENT_KEY,
+];
+
+fn is_reserved_client_id(id: &str) -> bool {
+    RESERVED_CLIENT_IDS
+        .iter()
+        .any(|reserved| id.eq_ignore_ascii_case(reserved))
+}
+
+/// Why a key-set entry can't name a client of its own.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RejectedClientId {
+    Reserved,
+    /// Not a valid Kubernetes label value: the grammar client ids are held to,
+    /// so a key can also be written as a label. It also keeps DogStatsD
+    /// separators out of metric tags.
+    NotALabelValue,
+}
+
+/// Whether a key-set entry may name a client: a valid Kubernetes label value
+/// that isn't reserved.
+fn check_client_id(id: &str) -> Result<(), RejectedClientId> {
+    if is_reserved_client_id(id) {
+        return Err(RejectedClientId::Reserved);
+    }
+    LabelValue::parse(id).map_err(|_| RejectedClientId::NotALabelValue)?;
+    Ok(())
+}
+
+/// The static allowlist, interned once at construction so resolving one of its
+/// IDs on the request path is a lock-free set lookup.
+#[derive(Debug, Default)]
+struct KnownClients(BTreeSet<&'static str>);
+
+impl KnownClients {
+    /// Intern `ids`, dropping with a warning every entry that can't name a
+    /// client ([`check_client_id`]): reserved ids and ones that aren't label
+    /// values, whose callers share the unspecified bucket. Ids that differ only
+    /// in case keep separate buckets but share one `client_id` series after
+    /// Datadog lowercases tag values, so they're warned about too.
+    fn new(ids: &BTreeSet<String>) -> Self {
+        let mut folded = BTreeSet::new();
+        let mut known = BTreeSet::new();
+        for id in ids {
+            match check_client_id(id) {
+                Ok(()) => {}
+                Err(RejectedClientId::Reserved) => {
+                    tracing::warn!(
+                        client_id = %id,
+                        "SPACE_API_CLIENT_CONCURRENCY_KNOWN_CLIENTS lists a reserved client id; it shares the unspecified bucket and reports as client_id:unknown"
+                    );
+                    continue;
+                }
+                Err(RejectedClientId::NotALabelValue) => {
+                    tracing::warn!(
+                        client_id = %id,
+                        "SPACE_API_CLIENT_CONCURRENCY_KNOWN_CLIENTS lists a client id that isn't a valid Kubernetes label value; it's ignored, so that caller shares the unspecified bucket and reports as client_id:unknown"
+                    );
+                    continue;
+                }
+            }
+            if !folded.insert(id.to_ascii_lowercase()) {
+                tracing::warn!(
+                    client_id = %id,
+                    "SPACE_API_CLIENT_CONCURRENCY_KNOWN_CLIENTS lists client ids that differ only in case; they keep separate buckets but share one client_id metric series"
+                );
+            }
+            known.insert(intern_static_client_id(id));
+        }
+        Self(known)
+    }
+
+    fn get(&self, id: &str) -> Option<&'static str> {
+        self.0.get(id).copied()
+    }
+}
+
+/// Override keys already warned about by [`warn_ignored_override_once`].
+/// Capped like the interned set, since override keys can change at runtime.
+static WARNED_OVERRIDE_KEYS: LazyLock<RwLock<BTreeSet<String>>> = LazyLock::new(Default::default);
+
+/// Warn once per process about an override key [`check_client_id`] rejected.
+/// Override keys aren't known until a request reads the flag, so this runs on
+/// the first request that matches one; later matches, and new keys once
+/// [`MAX_RUNTIME_CLIENT_IDS`] have been warned about, stay quiet. Those take
+/// only the read lock, so a storm from an ignored key doesn't serialize on it.
+fn warn_ignored_override_once(id: &str, rejected: RejectedClientId) {
+    let done =
+        |warned: &BTreeSet<String>| warned.contains(id) || warned.len() >= MAX_RUNTIME_CLIENT_IDS;
+    if done(
+        &WARNED_OVERRIDE_KEYS
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    ) {
+        return;
+    }
+    let mut warned = WARNED_OVERRIDE_KEYS
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Re-check under the write lock: another request may have warned first.
+    if done(&warned) {
+        return;
+    }
+    warned.insert(id.to_owned());
+    let reason = match rejected {
+        RejectedClientId::Reserved => "is a reserved client id",
+        RejectedClientId::NotALabelValue => "isn't a valid Kubernetes label value",
+    };
+    tracing::warn!(
+        client_id = %id,
+        flag = SPACE_API_CLIENT_CONCURRENCY_QUOTAS_FLAG.key(),
+        "client-concurrency quota override key {reason}; it's ignored, so that caller shares the unspecified bucket and reports as client_id:unknown"
+    );
+}
+
 /// Identifies the bucket a request is tracked against. Allowlisted clients get
 /// their own [`ClientKey::Client`] bucket; everything else (no `X-Client-ID`, or
 /// an unrecognized id) shares the single [`ClientKey::Unspecified`] bucket.
+///
+/// A `Client` id borrows the copy [`KnownClients`] interned for a static entry,
+/// so the common case doesn't allocate, and owns an override-only id. Its
+/// metric tag derives from it ([`Self::client_id_tag`]).
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum ClientKey {
-    Client(Arc<str>),
+    Client(Cow<'static, str>),
     Unspecified,
 }
 
@@ -371,39 +575,48 @@ impl ClientKey {
         client_id.map(str::trim).filter(|id| !id.is_empty())
     }
 
-    /// Classify a raw header value into its bucket: an allowlisted id gets its
-    /// own `Client` bucket (allocating the `Arc<str>` only then); a blank,
-    /// absent, or unrecognized id shares the `Unspecified` bucket — so a
-    /// per-request-random id can't mint itself a fresh per-client allowance.
+    /// Resolve a raw header value to its key: an id the key set names gets
+    /// its own `Client` bucket; a blank, absent, or unrecognized id shares the
+    /// `Unspecified` bucket — so a per-request-random id can't mint itself a
+    /// fresh per-client allowance.
+    ///
+    /// The key set is the static `known` set plus the Eppo `overrides` keys
+    /// (an override also implies "known"), less every entry
+    /// [`check_client_id`] rejects. `known` was checked at construction; an
+    /// override key is checked here, only once a header has matched it.
     fn classify(
         client_id: Option<&str>,
-        config: &ClientConcurrencyConfig,
+        known: &KnownClients,
         overrides: Option<&QuotaOverrides>,
     ) -> Self {
-        match Self::normalize(client_id) {
-            Some(id) if config.is_known(id, overrides) => Self::Client(Arc::from(id)),
-            _ => Self::Unspecified,
+        let Some(id) = Self::normalize(client_id) else {
+            return Self::Unspecified;
+        };
+        if let Some(known) = known.get(id) {
+            return Self::Client(Cow::Borrowed(known));
+        }
+        if !overrides.is_some_and(|o| o.overrides.contains_key(id)) {
+            return Self::Unspecified;
+        }
+        match check_client_id(id) {
+            Ok(()) => Self::Client(Cow::Owned(id.to_owned())),
+            Err(rejected) => {
+                warn_ignored_override_once(id, rejected);
+                Self::Unspecified
+            }
         }
     }
 
-    fn scope(&self) -> ClientScope {
+    /// The bounded `client_id` metric tag for this key: the interned id,
+    /// `overflow` for an override-only id past the interning cap, or `unknown`
+    /// for the shared bucket. Interning happens here, not in [`Self::classify`],
+    /// because it bounds metric memory, not buckets.
+    fn client_id_tag(&self) -> ClientIdTag {
         match self {
-            Self::Client(_) => ClientScope::Client,
-            Self::Unspecified => ClientScope::Unspecified,
-        }
-    }
-
-    /// The metric [`ClientScope`] for a request *without* building a key
-    /// (allocating the `Arc<str>`). Used on the disabled fast-path, which only
-    /// needs the scope for the metric tag and should stay allocation-free.
-    fn scope_of(
-        client_id: Option<&str>,
-        config: &ClientConcurrencyConfig,
-        overrides: Option<&QuotaOverrides>,
-    ) -> ClientScope {
-        match Self::normalize(client_id) {
-            Some(id) if config.is_known(id, overrides) => ClientScope::Client,
-            _ => ClientScope::Unspecified,
+            Self::Client(Cow::Borrowed(id)) => ClientIdTag::allowlisted(id),
+            Self::Client(Cow::Owned(id)) => intern_override_client_id(id)
+                .map_or(ClientIdTag::OVERFLOW, ClientIdTag::allowlisted),
+            Self::Unspecified => ClientIdTag::UNKNOWN,
         }
     }
 
@@ -424,7 +637,22 @@ pub enum ClientConcurrencyDecision {
     /// releases the slot.
     Admitted(ClientConcurrencyGuard),
     /// The client is at its concurrent-operation cap. Return HTTP 429.
-    Rejected { retry_after: Duration },
+    Rejected {
+        retry_after: Duration,
+        client_id: ClientIdTag,
+    },
+}
+
+impl ClientConcurrencyDecision {
+    /// The bounded client the limiter attributed this request to — the same
+    /// value its decision metric carried — so a handler can put it on its own
+    /// metrics without resolving the allowlist again.
+    pub fn client_id(&self) -> ClientIdTag {
+        match self {
+            Self::Admitted(guard) => guard.client_id,
+            Self::Rejected { client_id, .. } => *client_id,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -434,6 +662,9 @@ pub struct ClientConcurrencyLimiter {
 
 struct Inner {
     config: ClientConcurrencyConfig,
+    /// `config.known_clients` without the entries [`check_client_id`] rejects,
+    /// interned.
+    known: KnownClients,
     feature_flags: FeatureFlagClient,
     /// The shared ZSET store. `None` when no usable `SPACE_REDIS_URL` is
     /// configured — the limiter then fails open (`misconfigured`).
@@ -446,7 +677,8 @@ impl ClientConcurrencyLimiter {
     }
 
     pub fn with_config(config: ClientConcurrencyConfig, feature_flags: FeatureFlagClient) -> Self {
-        if config.mode == Mode::Enforce && config.known_clients.is_empty() {
+        let known = KnownClients::new(&config.known_clients);
+        if config.mode == Mode::Enforce && known.0.is_empty() {
             tracing::warn!(
                 max_in_flight_unspecified = config.max_in_flight_unspecified,
                 "client concurrency enforcement has an empty allowlist; clients without Eppo overrides share the unspecified bucket; configure SPACE_API_CLIENT_CONCURRENCY_KNOWN_CLIENTS before enforcing per-client limits"
@@ -456,6 +688,7 @@ impl ClientConcurrencyLimiter {
         Self {
             inner: Arc::new(Inner {
                 config,
+                known,
                 feature_flags,
                 store,
             }),
@@ -563,29 +796,29 @@ impl ClientConcurrencyLimiter {
 
         // Env-master-first: the env kill-switch is the hard off, and the flag
         // can only disable a limiter it enabled. Checked before touching
-        // Redis. Metric scope is derived against the static allowlist only
-        // (allocation-free) since we may not consult the override map here.
+        // Redis. The metric scope and client id are derived against the static
+        // allowlist only, since the override map isn't consulted here.
         if !self.limiter_active() {
-            let scope = ClientKey::scope_of(client_id, config, None);
-            return admit_untracked(operation, Reason::Disabled, scope);
+            let key = ClientKey::classify(client_id, &self.inner.known, None);
+            return admit_untracked(operation, Reason::Disabled, key.client_id_tag());
         }
 
         // Fetch the Eppo overrides once: they both extend the allowlist and
         // supply per-client caps.
         let overrides = self.quota_overrides();
-        let key = ClientKey::classify(client_id, config, overrides.as_ref());
-        let scope = key.scope();
+        let key = ClientKey::classify(client_id, &self.inner.known, overrides.as_ref());
+        let client_tag = key.client_id_tag();
         // Cap resolves from the Eppo override map, falling back to env. A zero
         // cap disables this bucket.
         let cap = config.cap_for(&key, overrides.as_ref());
         if cap == 0 {
-            return admit_untracked(operation, Reason::Disabled, scope);
+            return admit_untracked(operation, Reason::Disabled, client_tag);
         }
 
         // No usable store: admit, but flag it as the pageable `misconfigured`
         // steady-state signal — the guardrail is silently absent.
         let Some(store) = self.inner.store.as_ref() else {
-            return admit_untracked(operation, Reason::Misconfigured, scope);
+            return admit_untracked(operation, Reason::Misconfigured, client_tag);
         };
 
         let redis_key = key.redis_key();
@@ -606,10 +839,11 @@ impl ClientConcurrencyLimiter {
                     operation,
                     Decision::Rejected,
                     Reason::ConcurrencyFull,
-                    scope,
+                    client_tag,
                 );
                 ClientConcurrencyDecision::Rejected {
                     retry_after: RETRY_AFTER,
+                    client_id: client_tag,
                 }
             }
             Ok(outcome) => {
@@ -618,7 +852,7 @@ impl ClientConcurrencyLimiter {
                 } else {
                     (Decision::Admitted, Reason::None)
                 };
-                client_limit::decision(operation, decision, reason, scope);
+                client_limit::decision(operation, decision, reason, client_tag);
                 client_limit::in_flight(outcome.count as usize);
                 ClientConcurrencyDecision::Admitted(ClientConcurrencyGuard {
                     slot: Some(Slot {
@@ -626,6 +860,7 @@ impl ClientConcurrencyLimiter {
                         redis_key,
                         member,
                     }),
+                    client_id: client_tag,
                 })
             }
             Err(error) => {
@@ -636,7 +871,7 @@ impl ClientConcurrencyLimiter {
                     operation = %operation,
                     "client concurrency store unavailable; admitting (fail open)"
                 );
-                admit_untracked(operation, Reason::StoreUnavailable, scope)
+                admit_untracked(operation, Reason::StoreUnavailable, client_tag)
             }
         }
     }
@@ -663,10 +898,10 @@ fn build_store(url: Option<&str>) -> Option<RedisConcurrencyStore> {
 fn admit_untracked(
     operation: Operation,
     reason: Reason,
-    scope: ClientScope,
+    client_id: ClientIdTag,
 ) -> ClientConcurrencyDecision {
-    client_limit::decision(operation, Decision::Admitted, reason, scope);
-    ClientConcurrencyDecision::Admitted(ClientConcurrencyGuard::noop())
+    client_limit::decision(operation, Decision::Admitted, reason, client_id);
+    ClientConcurrencyDecision::Admitted(ClientConcurrencyGuard::noop(client_id))
 }
 
 struct Slot {
@@ -682,11 +917,15 @@ struct Slot {
 #[must_use = "the slot is released as soon as the guard is dropped; hold it for the operation's duration"]
 pub struct ClientConcurrencyGuard {
     slot: Option<Slot>,
+    client_id: ClientIdTag,
 }
 
 impl ClientConcurrencyGuard {
-    fn noop() -> Self {
-        Self { slot: None }
+    fn noop(client_id: ClientIdTag) -> Self {
+        Self {
+            slot: None,
+            client_id,
+        }
     }
 }
 

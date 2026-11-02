@@ -21,3 +21,18 @@ consumed by a service.
 - name: SPACE_DB_BOOTSTRAP_CREDS_PASSWORD
   {{- include "space-cluster.dbPassword" (dict "ctx" . "role" "CREDS" "value" .Values.postgres.managedCredentialsPassword) | nindent 2 }}
 {{- end }}
+
+{{/*
+SPACE_K8S_CONTROL_PLANE for `substrate`: "true" runs the KubernetesSubstrate,
+"false" the DirectSubstrate (Substrate::from_env_with_lifecycle in
+crates/libs/api/src/controllers/substrate/mod.rs; the flag is read by
+KubernetesState::try_from_env in substrate/kubernetes/mod.rs). Any other
+substrate fails the render.
+*/}}
+{{- define "space-api-local.k8sControlPlane" -}}
+{{- $substrate := .Values.substrate | default "kubernetes" -}}
+{{- if not (has $substrate (list "kubernetes" "direct")) -}}
+{{- fail (printf "substrate must be kubernetes or direct, got %q" $substrate) -}}
+{{- end -}}
+{{- eq $substrate "kubernetes" | ternary "true" "false" | quote -}}
+{{- end -}}

@@ -83,3 +83,65 @@ impl PublishedSandboxRow {
         }
     }
 }
+
+/// Checked activity timestamps retain their serialized RFC3339 spelling so the
+/// existing PostgreSQL timestamp casts and update thresholds remain authoritative.
+#[derive(serde::Serialize)]
+pub(super) struct PublishedActivityRow<'a> {
+    sandbox_id: SandboxId,
+    last_used_at: Option<&'a str>,
+    last_access_at: Option<&'a str>,
+    last_command_at: Option<&'a str>,
+}
+
+impl PublishedSandboxRow {
+    pub(super) fn activity_projection(&self) -> PublishedActivityRow<'_> {
+        PublishedActivityRow {
+            sandbox_id: self.sandbox_id,
+            last_used_at: self.last_used_at.as_deref(),
+            last_access_at: self.last_access_at.as_deref(),
+            last_command_at: self.last_command_at.as_deref(),
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+pub(super) struct PublishedRestoreRow<'a> {
+    sandbox_id: SandboxId,
+    status: Option<&'a str>,
+    transition_receipt_kind: Option<&'static str>,
+}
+
+impl PublishedSandboxRow {
+    pub(super) fn restore_projection(&self) -> PublishedRestoreRow<'_> {
+        PublishedRestoreRow {
+            sandbox_id: self.sandbox_id,
+            status: self.status.as_deref(),
+            transition_receipt_kind: self.transition_receipt_kind,
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+pub(super) struct PublishedRecoveryObservationRow<'a> {
+    sandbox_id: SandboxId,
+    quarantine_recovery_payload: Option<&'a serde_json::Value>,
+    quarantine_recovery_observation_degraded: bool,
+}
+
+impl PublishedSandboxRow {
+    /// jsonb_to_recordset treats JSON null and an absent value as SQL NULL.
+    pub(super) fn has_recovery_observation(&self) -> bool {
+        self.quarantine_recovery_payload
+            .as_ref()
+            .is_some_and(|payload| !payload.is_null())
+    }
+
+    pub(super) fn recovery_observation_projection(&self) -> PublishedRecoveryObservationRow<'_> {
+        PublishedRecoveryObservationRow {
+            sandbox_id: self.sandbox_id,
+            quarantine_recovery_payload: self.quarantine_recovery_payload.as_ref(),
+            quarantine_recovery_observation_degraded: self.quarantine_recovery_observation_degraded,
+        }
+    }
+}

@@ -131,30 +131,6 @@ fn reconnect_tags_preserve_wait_ready_timeout_phase_for_dataplane() {
 }
 
 #[test]
-fn successful_dataplane_access_only_records_when_access_may_wake() {
-    assert_eq!(
-        successful_access_reconnect_outcome("suspended"),
-        Some((
-            ReconnectOutcome::WakeSubmitted,
-            ReconnectTerminalPhase::Ready,
-            ReconnectReason::Ok,
-        ))
-    );
-    assert_eq!(
-        successful_access_reconnect_outcome("paused"),
-        Some((
-            ReconnectOutcome::WakeSubmitted,
-            ReconnectTerminalPhase::Ready,
-            ReconnectReason::Ok,
-        ))
-    );
-
-    assert_eq!(successful_access_reconnect_outcome("started"), None);
-    assert_eq!(successful_access_reconnect_outcome("starting"), None);
-    assert_eq!(successful_access_reconnect_outcome("unknown"), None);
-}
-
-#[test]
 fn reconnect_tags_classify_rejections_and_post_wake_cas_loss() {
     for (outcome, terminal_phase, reason, initial_lifecycle, expected) in [
         (
@@ -221,9 +197,9 @@ fn reconnect_tags_classify_client_limiter_rejection() {
 #[test]
 fn reconnect_tags_classify_cluster_admission_rejection() {
     // The cluster activation limiter rejects a wake/restore with a 429.
-    // Both the Wake admission gate and the data-plane access charge now
-    // record this on the reconnect series instead of 429ing silently, so a
-    // control-plane-throttled retry storm stays visible to the monitor.
+    // The Wake admission gate records this on the reconnect series instead
+    // of 429ing silently, so a control-plane-throttled retry storm stays
+    // visible to the monitor.
     // These build the two *actual* admission error shapes (see
     // `cluster_activation_admission_error`): the rate-limited case carries a
     // `ClusterActivationAdmission` cause; the empty-cluster case is a bare

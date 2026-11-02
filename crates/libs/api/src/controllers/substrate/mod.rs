@@ -85,6 +85,7 @@ pub(crate) mod native_access;
 mod node_api_client;
 mod pool_claims;
 mod recovery_charge;
+pub mod runtime_upgrade;
 mod sandbox_state_probe;
 
 pub use execution_fence::*;
@@ -208,51 +209,7 @@ impl ActivationCompletion {
     }
 }
 
-/// Whether a restore rollback retires the abandoned restore's execution, and
-/// so makes its pod disposable: the API's rollback of a failed restore claim
-/// and the transient-lifecycle sweeper's revert of an aged `restoring` row.
-///
-/// Retiring is safe only once no user request can have reached a `restoring`
-/// sandbox's pod, which every routing replica (API and internal API) running
-/// the restoring gate guarantees. A replica from before that gate still
-/// routes to a reachable restore pod, and a retirement would then delete
-/// what it served. So retirement ships disabled, behind
-/// [`Self::ENV`], and is enabled per deployment once every routing replica
-/// runs the gate; rolling back to older routing binaries disables it first.
-/// Disabled, both writers revert only the lifecycle, as they did before.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum AbandonedRestoreRetirement {
-    /// Revert only the lifecycle; the restore's execution stays active.
-    #[default]
-    Disabled,
-    /// Retire the abandoned restore's execution in the revert.
-    Enabled,
-}
-
-impl AbandonedRestoreRetirement {
-    /// The switch both the API and the cluster controller read
-    /// ([`Self::from_env`]): `1`, `true`, `yes`, `on` or `enabled`, in any
-    /// case, turns retirement on; unset or anything else keeps it disabled.
-    pub const ENV: &'static str = "SPACE_ABANDONED_RESTORE_RETIREMENT_ENABLED";
-
-    pub fn from_enabled(enabled: bool) -> Self {
-        if enabled {
-            Self::Enabled
-        } else {
-            Self::Disabled
-        }
-    }
-
-    /// The switch as both components read it, so they agree on what turns
-    /// it on.
-    pub fn from_env() -> Self {
-        Self::from_enabled(pplx_space_common_core::env::env_flag_var(Self::ENV, false))
-    }
-
-    pub fn is_enabled(self) -> bool {
-        self == Self::Enabled
-    }
-}
+pub use pplx_space_common_core::types::AbandonedRestoreRetirement;
 
 /// Exact operation lease to release after the controller publishes its lifecycle.
 /// A later owner or execution must never be released by this completion.
@@ -1126,8 +1083,8 @@ pub struct SubstrateCapabilities {
     /// fallthrough create takes a configured or policy pool shape, and
     /// otherwise vCPU and memory the request left unset come from the
     /// template's build shape. Without it, the requested shape goes to the
-    /// node unchanged, except that Direct refuses a one-shot create that sets
-    /// vCPU or memory, which it cannot carry (see the [`direct`] module doc).
+    /// node unchanged; Direct sends a custom vCPU or memory on its separate
+    /// start call (see the [`direct`] module doc).
     pub resolves_cold_create_shape: bool,
     /// Create requests may carry a Kubernetes node-pool placement pin.
     pub supports_node_pool_placement: bool,
@@ -1141,13 +1098,13 @@ pub struct SubstrateCapabilities {
     /// A node row's counterpart is
     /// [`SubstrateKind::has_node_drain_reconciler`](pplx_space_common_core::types::SubstrateKind::has_node_drain_reconciler).
     pub supports_node_drain: bool,
-    /// The cluster controller may run as several replicas, so each one
-    /// contends for a leader `Lease` on the apiserver and only the holder runs
-    /// the reconcilers (unless the leader-election kill-switch is off). When
-    /// false, the controller is a single local process and runs the
-    /// reconcilers unconditionally. The lease client comes from the process
-    /// environment, not from the substrate.
-    pub contends_for_leader_lease: bool,
+    /// The adapter drives sandboxes through a Kubernetes apiserver, with a
+    /// client the process builds from its environment (an in-cluster config
+    /// or a kubeconfig). The cluster controller can therefore reach a leader
+    /// `Lease` on that apiserver wherever it runs, and may share the cluster
+    /// with in-cluster replicas, so it contends for the `Lease` even outside
+    /// a pod.
+    pub uses_kubernetes_api: bool,
     /// A successful [`SubstrateAdapter::suspend_execution`] has already
     /// committed `lifecycle = 'suspended'`, under the fence of the execution
     /// it suspended. The caller then writes no lifecycle of its own: an
@@ -1167,7 +1124,7 @@ impl SubstrateCapabilities {
         resolves_cold_create_shape: false,
         supports_node_pool_placement: false,
         supports_node_drain: false,
-        contends_for_leader_lease: false,
+        uses_kubernetes_api: false,
         suspend_commits_lifecycle: false,
     };
 
@@ -1178,7 +1135,7 @@ impl SubstrateCapabilities {
         resolves_cold_create_shape: true,
         supports_node_pool_placement: true,
         supports_node_drain: true,
-        contends_for_leader_lease: true,
+        uses_kubernetes_api: true,
         suspend_commits_lifecycle: true,
     };
 }
@@ -1514,28 +1471,6 @@ pub trait SubstrateAdapter: Send + Sync {
         timeout: Duration,
         charge: RecoveryCharge,
     ) -> Result<RuntimeClient, ControllerError>;
-
-    /// Return a dialable sandbox IP for arbitrary service-port traffic.
-    ///
-    /// Service proxying owns the destination port, so substrates only expose
-    /// the execution IP here. Substrates without a routable sandbox IP can
-    /// return `None`.
-    async fn sandbox_ip(&self, sandbox_id: SandboxId) -> Result<Option<String>, ControllerError>;
-
-    /// Return a dialable sandbox IP for guest service traffic.
-    ///
-    /// Like `access_runtime_client`, this may recreate missing execution
-    /// objects, but must honor implicit-wake policy when the sandbox is
-    /// dormant. `admission` charges the cluster limiter when a live sandbox's
-    /// pod has to be recreated (a real activation the stored-lifecycle
-    /// entrypoint charge misses).
-    async fn access_sandbox_ip(
-        &self,
-        metric_identity: SandboxApiMetricIdentity,
-        sandbox: &Sandbox,
-        timeout: Duration,
-        charge: RecoveryCharge,
-    ) -> Result<Option<String>, ControllerError>;
 
     /// Connect to the node-api builder surface for substrate-level template work.
     ///
@@ -2810,36 +2745,6 @@ impl SubstrateAdapter for Substrate {
             Inner::Kubernetes(substrate) => {
                 substrate
                     .access_runtime_client(metric_identity, sandbox, activity, timeout, charge)
-                    .await
-            }
-        }
-    }
-
-    async fn sandbox_ip(&self, sandbox_id: SandboxId) -> Result<Option<String>, ControllerError> {
-        match &self.inner {
-            Inner::Direct(substrate) => substrate.sandbox_ip(sandbox_id).await,
-            #[cfg(feature = "kubernetes")]
-            Inner::Kubernetes(substrate) => substrate.sandbox_ip(sandbox_id).await,
-        }
-    }
-
-    async fn access_sandbox_ip(
-        &self,
-        metric_identity: SandboxApiMetricIdentity,
-        sandbox: &Sandbox,
-        timeout: Duration,
-        charge: RecoveryCharge,
-    ) -> Result<Option<String>, ControllerError> {
-        match &self.inner {
-            Inner::Direct(substrate) => {
-                substrate
-                    .access_sandbox_ip(metric_identity, sandbox, timeout, charge)
-                    .await
-            }
-            #[cfg(feature = "kubernetes")]
-            Inner::Kubernetes(substrate) => {
-                substrate
-                    .access_sandbox_ip(metric_identity, sandbox, timeout, charge)
                     .await
             }
         }

@@ -1,8 +1,8 @@
-use super::{BootConfigError, LinuxBoot, object};
+use super::{BootConfigError, BootSource, GuestBoot, object};
 use pplx_space_common_core::types::{Arch, RuntimeKind};
 use serde_json::{Value, json};
 
-pub(super) fn configuration(input: &LinuxBoot<'_>) -> Result<Value, BootConfigError> {
+pub(super) fn configuration(input: &GuestBoot<'_>) -> Result<Value, BootConfigError> {
     super::validate_resources(
         RuntimeKind::CloudHypervisor,
         input.balloon.is_some(),
@@ -40,19 +40,38 @@ pub(super) fn configuration(input: &LinuxBoot<'_>) -> Result<Value, BootConfigEr
         Arch::Aarch64 => "ttyAMA0",
         Arch::X86_64 => "ttyS0",
     };
+    let payload = match input.source {
+        BootSource::LinuxDirect => object([
+            ("kernel", json!("/vmlinux.bin")),
+            (
+                "cmdline",
+                json!(super::command_line(input, "net.ifnames=0", "", console)),
+            ),
+        ]),
+        BootSource::Uefi => object([("firmware", json!("/firmware.fd"))]),
+    };
+    let mut cpus = object([
+        ("boot_vcpus", json!(input.cpus.get())),
+        ("max_vcpus", json!(input.cpus.get())),
+    ]);
+    if input.source == BootSource::Uefi {
+        cpus.insert("kvm_hyperv".into(), json!(true));
+    }
     let rendered = json!({
-        "cpus": { "boot_vcpus": input.cpus.get(), "max_vcpus": input.cpus.get() },
+        "cpus": cpus,
         "memory": { "size": bytes, "shared": false, "hugepages": false, "thp": false },
-        "payload": { "kernel": "/vmlinux.bin", "cmdline": super::command_line(input, "net.ifnames=0", "", console) },
+        "payload": payload,
         "disks": [disk], "net": [net],
         "vsock": { "cid": input.guest_cid.get(), "socket": "/v.sock" },
-        "serial": { "mode": if input.console { "Tty" } else { "Off" } },
+        "serial": if input.source == BootSource::Uefi {
+            json!({ "mode": "Socket", "socket": "/serial.sock" })
+        } else { json!({ "mode": if input.console { "Tty" } else { "Off" } }) },
         "console": { "mode": "Off" },
         "landlock_enable": true,
         "landlock_rules": [{"path": "/state", "access": "rw"}]
     });
     let parsed: Configuration = serde_json::from_value(rendered)?;
-    parsed.validate()?;
+    parsed.validate(input.source)?;
     Ok(serde_json::to_value(parsed)?)
 }
 
@@ -76,6 +95,8 @@ pub(super) struct Configuration {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Cpus {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kvm_hyperv: Option<bool>,
     boot_vcpus: std::num::NonZeroU32,
     max_vcpus: std::num::NonZeroU32,
 }
@@ -88,8 +109,19 @@ struct Memory {
     thp: bool,
 }
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+enum Payload {
+    Linux(LinuxPayload),
+    Uefi(FirmwarePayload),
+}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Payload {
+struct FirmwarePayload {
+    firmware: String,
+}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LinuxPayload {
     kernel: String,
     cmdline: String,
 }
@@ -150,10 +182,13 @@ enum VsockId {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Console {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    socket: Option<String>,
     mode: ConsoleMode,
 }
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 enum ConsoleMode {
+    Socket,
     Off,
     Tty,
 }
@@ -203,8 +238,12 @@ impl Configuration {
     }
 
     pub(super) fn restore_on(&mut self, target: &Self) -> Result<(), BootConfigError> {
-        self.validate()?;
-        target.validate()?;
+        let source = match &target.payload {
+            Payload::Linux(_) => BootSource::LinuxDirect,
+            Payload::Uefi(_) => BootSource::Uefi,
+        };
+        self.validate(source)?;
+        target.validate(source)?;
         self.require_state_access()?;
         target.require_state_access()?;
         if self.cpus.boot_vcpus != target.cpus.boot_vcpus || self.memory.size != target.memory.size
@@ -221,9 +260,37 @@ impl Configuration {
         Ok(())
     }
 
-    fn validate(&self) -> Result<(), BootConfigError> {
+    fn validate(&self, source: BootSource) -> Result<(), BootConfigError> {
+        match (&self.payload, source) {
+            (Payload::Linux(payload), BootSource::LinuxDirect) => {
+                if payload.kernel != "/vmlinux.bin"
+                    || self.cpus.kvm_hyperv.is_some()
+                    || self.serial.socket.is_some()
+                    || !matches!(self.serial.mode, ConsoleMode::Off | ConsoleMode::Tty)
+                {
+                    return Err(BootConfigError::Invalid(
+                        "payload differs from the execution contract",
+                    ));
+                }
+            }
+            (Payload::Uefi(payload), BootSource::Uefi) => {
+                if payload.firmware != "/firmware.fd"
+                    || self.cpus.kvm_hyperv != Some(true)
+                    || self.serial.mode != ConsoleMode::Socket
+                    || self.serial.socket.as_deref() != Some("/serial.sock")
+                {
+                    return Err(BootConfigError::Invalid(
+                        "payload differs from the execution contract",
+                    ));
+                }
+            }
+            _ => {
+                return Err(BootConfigError::Invalid(
+                    "payload differs from the execution contract",
+                ));
+            }
+        }
         if !self.landlock_enable
-            || self.payload.kernel != "/vmlinux.bin"
             || self.disks[0].id != "rootfs"
             || self.net[0].id != "eth0"
             || self.disks[0].path != "/rootfs.ext4"
@@ -234,6 +301,7 @@ impl Configuration {
             || self.disks[0].backing_files
             || self.disks[0].readonly
             || self.net[0].num_queues != 2
+            || self.console.socket.is_some()
             || self.console.mode != ConsoleMode::Off
             || self.cpus.boot_vcpus != self.cpus.max_vcpus
         {
@@ -243,8 +311,11 @@ impl Configuration {
     }
 }
 
-pub(super) fn parse(configuration: &str) -> Result<Configuration, BootConfigError> {
+pub(super) fn parse(
+    configuration: &str,
+    source: BootSource,
+) -> Result<Configuration, BootConfigError> {
     let parsed: Configuration = serde_json::from_str(configuration)?;
-    parsed.validate()?;
+    parsed.validate(source)?;
     Ok(parsed)
 }

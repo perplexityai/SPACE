@@ -38,6 +38,7 @@ pub(super) async fn handle(command: Commands, client: &mut SandboxClient) {
         Commands::Start {
             sandbox_id,
             checkpoint,
+            memory,
             from_warm,
             blocking,
             ready_timeout_secs,
@@ -46,6 +47,7 @@ pub(super) async fn handle(command: Commands, client: &mut SandboxClient) {
                 client,
                 sandbox_id,
                 checkpoint,
+                memory,
                 from_warm,
                 blocking,
                 ready_timeout_secs,
@@ -208,6 +210,7 @@ async fn handle_start(
     client: &mut SandboxClient,
     sandbox_id: SandboxSelector,
     checkpoint: Option<String>,
+    memory: Option<u32>,
     from_warm: bool,
     blocking: bool,
     ready_timeout_secs: Option<u32>,
@@ -216,6 +219,7 @@ async fn handle_start(
         .start(local_start_request(
             sandbox_id.to_string(),
             checkpoint,
+            memory,
             from_warm,
             blocking,
             ready_timeout_secs,
@@ -234,6 +238,7 @@ async fn handle_start(
 fn local_start_request(
     sandbox_id: String,
     checkpoint: Option<String>,
+    memory: Option<u32>,
     from_warm: bool,
     blocking: bool,
     ready_timeout_secs: Option<u32>,
@@ -245,7 +250,7 @@ fn local_start_request(
         expected_local_artifact_id: None,
         sandbox_id,
         vcpu: None,
-        memory_mib: None,
+        memory_mib: memory,
         checkpoint,
         from_warm,
         blocking,

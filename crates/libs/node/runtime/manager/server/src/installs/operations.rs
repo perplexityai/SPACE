@@ -9,9 +9,9 @@ use super::release_source::VerifiableRelease;
 use super::source::{KernelVersion, RuntimeLine, SourceError, VerifiableKernel};
 use super::staging::{self, PrepareStagingError};
 use super::store::{self, JobOutcome, JobResult, StoreError};
-use pplx_space_common_core::types::{Digest, JobId, RuntimeIdentity};
+use pplx_space_common_core::types::{ComponentIdentity, Digest, JobId, RuntimeIdentity};
 use pplx_space_common_jobs::{BackgroundWorker, Job, JobStatus, ParseJobStatusError, WorkerConfig};
-use pplx_space_node_runtime_core::catalog::CatalogError;
+use pplx_space_node_runtime_core::catalog::{CatalogError, PinnedBootArtifact};
 use tokio_util::sync::CancellationToken;
 
 pub(super) const INSTALL_JOB_KIND: &str = "artifact-install";
@@ -42,6 +42,12 @@ pub struct InstallLimits {
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub(crate) enum InstallOperation {
+    InstallBootArtifact {
+        pin: PinnedBootArtifact,
+    },
+    UninstallBootArtifact {
+        identity: ComponentIdentity,
+    },
     InstallKernel {
         kernel: VerifiableKernel,
     },
@@ -63,6 +69,8 @@ impl InstallOperation {
     pub(crate) fn artifact(&self) -> super::publisher::NodeArtifactRef {
         use super::publisher::NodeArtifactRef;
         match self {
+            Self::InstallBootArtifact { pin } => NodeArtifactRef::Boot(pin.identity().clone()),
+            Self::UninstallBootArtifact { identity } => NodeArtifactRef::Boot(identity.clone()),
             Self::InstallKernel { kernel } => {
                 NodeArtifactRef::Kernel(kernel.version.clone(), kernel.digest)
             }
@@ -82,6 +90,12 @@ impl InstallOperation {
     /// a release as `<runtime>-<version>`.
     pub(crate) fn subject(&self) -> String {
         match self {
+            Self::InstallBootArtifact { pin } => {
+                format!("{}-{}", pin.identity().kind, pin.identity().version)
+            }
+            Self::UninstallBootArtifact { identity } => {
+                format!("{}-{}", identity.kind, identity.version)
+            }
             Self::InstallKernel { kernel } => kernel.version.to_string(),
             Self::UninstallKernel { version, .. } => version.to_string(),
             Self::InstallRelease { release, .. } => release_subject(&release.release),
@@ -93,7 +107,9 @@ impl InstallOperation {
     pub(crate) const fn is_removal(&self) -> bool {
         matches!(
             self,
-            Self::UninstallKernel { .. } | Self::UninstallRelease { .. }
+            Self::UninstallKernel { .. }
+                | Self::UninstallRelease { .. }
+                | Self::UninstallBootArtifact { .. }
         )
     }
 
@@ -101,6 +117,16 @@ impl InstallOperation {
     /// transfer evidence; it does not create a second component identity.
     fn dedup_key(&self) -> String {
         match self {
+            Self::InstallBootArtifact { pin } => format!(
+                "install-component:{}:{}:{}",
+                pin.identity().kind,
+                pin.identity().version,
+                pin.identity().digest
+            ),
+            Self::UninstallBootArtifact { identity } => format!(
+                "uninstall-component:{}:{}:{}",
+                identity.kind, identity.version, identity.digest
+            ),
             Self::InstallKernel { kernel } => format!(
                 "install-component:kernel:{}:{}",
                 kernel.version, kernel.digest
@@ -394,6 +420,41 @@ impl Installer {
             return Err(SubmitOperationError::Disabled);
         }
         self.enqueue(InstallOperation::UninstallRelease { release, digest })
+            .await
+    }
+
+    pub(crate) fn boot_source(&self) -> Option<&Path> {
+        self.executor.context().boot_source.as_deref()
+    }
+
+    pub(crate) async fn install_boot_artifact(
+        &self,
+        identity: ComponentIdentity,
+    ) -> Result<Operation, SubmitOperationError> {
+        if self.boot_source().is_none() {
+            return Err(SubmitOperationError::Disabled);
+        }
+        let checking = self.clone();
+        let pin = tokio::task::spawn_blocking(move || {
+            let catalog = checking.catalog()?;
+            let pin = catalog
+                .boot_artifact(&identity, checking.executor.context().host_arch)
+                .ok_or(SubmitOperationError::NotPinned)?;
+            if pin.size() > checking.executor.context().limits.max_bytes {
+                return Err(SubmitOperationError::TooLarge);
+            }
+            Ok::<_, SubmitOperationError>(pin.clone())
+        })
+        .await??;
+        self.enqueue(InstallOperation::InstallBootArtifact { pin })
+            .await
+    }
+
+    pub(crate) async fn uninstall_boot_artifact(
+        &self,
+        identity: ComponentIdentity,
+    ) -> Result<Operation, SubmitOperationError> {
+        self.enqueue(InstallOperation::UninstallBootArtifact { identity })
             .await
     }
 

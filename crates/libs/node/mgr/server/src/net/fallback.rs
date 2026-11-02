@@ -455,3 +455,20 @@ fn run(program: &str, args: &[&str]) -> Result<(), String> {
     }
     Ok(())
 }
+
+pub(crate) fn guest_tcp_stream(
+    _ns: &str,
+    _port: std::num::NonZeroU16,
+) -> std::io::Result<std::net::TcpStream> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "guest channels require Linux namespaces",
+    ))
+}
+
+pub(crate) fn guest_dhcp_socket(_ns: &str) -> std::io::Result<std::net::UdpSocket> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "guest DHCP requires Linux namespaces",
+    ))
+}

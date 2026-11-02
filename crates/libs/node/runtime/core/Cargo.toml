@@ -12,12 +12,13 @@ workspace = true
 
 [features]
 default = []
-host-runtime = ["dep:aws-lc-rs", "dep:nix", "dep:rustix", "dep:subtle", "dep:zeroize", "dep:pplx-space-net-common"]
+host-runtime = ["dep:aws-lc-rs", "dep:nix", "dep:rustix", "dep:subtle", "dep:zeroize", "dep:pplx-space-net-common", "dep:pplx-space-metrics"]
 # The node's root-owned store of runtime releases and guest kernels, which
 # node-manager publishes into.
 artifact-store = ["dep:rustix", "rustix/fs"]
 
 [dependencies]
+pplx-space-execution-catalog = { workspace = true }
 aws-lc-rs = { workspace = true, optional = true }
 subtle = { workspace = true, optional = true }
 zeroize = { workspace = true, optional = true }
@@ -45,6 +46,7 @@ pplx-space-common-core = { workspace = true, features = ["serde"] }
 pplx-space-common-grpc = { workspace = true }
 pplx-space-common-io = { workspace = true, features = ["reflink"] }
 pplx-space-execution-common = { workspace = true }
+pplx-space-metrics = { workspace = true, optional = true }
 pplx-space-net-common = { workspace = true, features = ["host-sockets"], optional = true }
 
 [build-dependencies]
@@ -52,6 +54,7 @@ anyhow = { workspace = true }
 pplx-space-common-proto-build = { workspace = true }
 tonic-prost-build = { workspace = true }
 [dev-dependencies]
+pplx-space-execution-catalog = { workspace = true, features = ["test-support"] }
 pplx-space-test-env = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "macros", "test-util"] }

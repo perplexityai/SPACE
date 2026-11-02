@@ -1,0 +1,23 @@
+[package]
+name = "space-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+pplx-space-net-common = { path = "../crates/libs/net/common" }
+
+[workspace]
+resolver = "3"
+members = ["."]
+
+[[bin]]
+name = "slot_dhcp"
+path = "fuzz_targets/slot_dhcp.rs"
+test = false
+doc = false
+bench = false

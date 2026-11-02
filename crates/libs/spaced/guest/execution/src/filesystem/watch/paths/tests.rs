@@ -22,7 +22,7 @@ async fn registration_plans_bound_nonrecursive_and_filtered_walks() {
         let filter =
             WatchFilter::compile(WatchFilterConfig::new(vec![], excludes, false).expect("config"))
                 .expect("filter");
-        let directories = plan_watch_registration(
+        let plan = plan_watch_registration(
             directory.path(),
             recursive,
             &filter,
@@ -30,12 +30,11 @@ async fn registration_plans_bound_nonrecursive_and_filtered_walks() {
             &tokio_util::task::TaskTracker::new(),
         )
         .await
-        .expect("plan")
-        .into_directories();
-        assert_eq!(directories.len(), count);
-        assert!(directories.contains(&directory.path().to_path_buf()));
+        .expect("plan");
+        assert_eq!(plan.len(), count);
+        assert_eq!(plan.root, directory.path());
         assert_eq!(
-            directories.contains(&directory.path().join("target")),
+            plan.descendants.contains(&directory.path().join("target")),
             recursive && !excluded
         );
     }
@@ -75,7 +74,8 @@ fn directory_walk_treats_a_disappeared_start_as_an_empty_tree() {
     .expect("filter");
 
     let directories = collect_watch_directories(temp_dir.path(), &removed, &filter)
-        .expect("a disappeared candidate is an ordinary traversal race");
+        .expect("a disappeared candidate is an ordinary traversal race")
+        .directories;
 
     assert!(directories.is_empty());
 }
@@ -83,7 +83,7 @@ fn directory_walk_treats_a_disappeared_start_as_an_empty_tree() {
 #[test]
 fn directory_walk_rejects_a_wide_frontier_and_preserves_filtered_capacity() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
-    for index in 0..16 {
+    for index in 0..24 {
         std::fs::create_dir(temp_dir.path().join(format!("child-{index}"))).expect("child");
     }
     let filter = WatchFilter::compile(
@@ -103,9 +103,99 @@ fn directory_walk_rejects_a_wide_frontier_and_preserves_filtered_capacity() {
     .expect("filter");
     assert_eq!(
         collect_watch_directories_with_limit(temp_dir.path(), temp_dir.path(), &filter, 1)
-            .expect("excluded directories consume no traversal capacity"),
+            .expect("excluded directories consume no traversal capacity")
+            .directories,
         vec![temp_dir.path().to_path_buf()],
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_directories_take_no_directory_budget() {
+    use std::os::unix::fs::PermissionsExt;
+    if !pplx_space_test_env::unprivileged_or_skip("be refused an unreadable directory") {
+        return;
+    }
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let root = temp_dir.path();
+    std::fs::create_dir(root.join("readable")).expect("readable child");
+    let locked = root.join("locked");
+    std::fs::create_dir(&locked).expect("locked child");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    let filter = WatchFilter::compile(
+        WatchFilterConfig::new(Vec::new(), Vec::new(), false).expect("filter config"),
+    )
+    .expect("filter");
+
+    let walk = collect_watch_directories_with_limit(root, root, &filter, 2)
+        .expect("the watchable tree fits the budget");
+    assert_eq!(walk.skipped, vec![locked.clone()]);
+    let mut directories = walk.directories;
+
+    directories.sort();
+    assert_eq!(directories, vec![root.to_path_buf(), root.join("readable")]);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_refused_lookup_remembers_the_ancestor_that_blocks_it() {
+    use std::os::unix::fs::PermissionsExt;
+    if !pplx_space_test_env::unprivileged_or_skip("be refused a lookup") {
+        return;
+    }
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let root = temp_dir.path();
+    let blocker = root.join("a");
+    let start = blocker.join("b/c");
+    std::fs::create_dir_all(&start).expect("tree");
+    // Readable but not searchable: nothing below `a` can be looked up, so
+    // `a/b` is no better a place to wait for a permission change than `c`.
+    std::fs::set_permissions(&blocker, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    let filter = WatchFilter::compile(
+        WatchFilterConfig::new(Vec::new(), Vec::new(), false).expect("filter config"),
+    )
+    .expect("filter");
+
+    let walk = collect_watch_directories(root, &start, &filter);
+    std::fs::set_permissions(&blocker, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+
+    let walk = walk.expect("a refused descendant is skipped");
+    assert!(walk.directories.is_empty());
+    assert_eq!(walk.skipped, vec![blocker]);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_walk_reports_a_root_it_cannot_list_only_when_asked() {
+    use std::os::unix::fs::PermissionsExt;
+    if !pplx_space_test_env::unprivileged_or_skip("be refused an unreadable directory") {
+        return;
+    }
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let root = temp_dir.path().join("root");
+    std::fs::create_dir(&root).expect("root");
+    let filter = WatchFilter::compile(
+        WatchFilterConfig::new(Vec::new(), Vec::new(), false).expect("filter config"),
+    )
+    .expect("filter");
+
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o300)).expect("chmod");
+    let reported = collect_watch_directories_or_root_refusal(&root, &root, &filter);
+    let failed = collect_watch_directories(&root, &root, &filter);
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+
+    // Discovery keeps the watch and waits for the root's next change...
+    assert!(matches!(reported, Ok(None)));
+    // ...while setting a watch up refuses the root.
+    assert_eq!(
+        failed.expect_err("an unreadable root fails").code(),
+        tonic::Code::PermissionDenied
+    );
+    let walk = collect_watch_directories_or_root_refusal(&root, &root, &filter)
+        .expect("a readable root walks")
+        .expect("a readable root is walked");
+    assert_eq!(walk.directories, vec![root]);
 }
 
 #[tokio::test]

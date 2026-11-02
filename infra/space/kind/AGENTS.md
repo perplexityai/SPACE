@@ -1,8 +1,9 @@
 # `infra/space/kind` harness
 
 This Kind cluster runs the production worker image and SPACE binaries against
-the real Kubernetes substrate, containerd shim, jailer, and Firecracker on a
-Linux/KVM devbox. It is the only local runtime tier: the docker-compose
+either control-plane substrate (Kubernetes by default, or Direct; see "Direct
+substrate lane" in `README.md`), the containerd shim, jailer, and Firecracker
+on a Linux/KVM devbox. It is the only local runtime tier: the docker-compose
 harness with its stub substrate was deleted on 2026-09-22.
 
 ## Load detail by task
@@ -88,7 +89,9 @@ or suites.
   listed in `scripts/kind-node-image.sh`, so a file the Dockerfile copies must be
   listed there. Clusters on another node image are recreated, not patched
   (`scripts/check-kind-node-image.sh`). Do not move these duties back into a
-  pod.
+  pod. The one exception is the Direct lane, which seeds only the per-node
+  identity file (`scripts/register-direct-nodes.sh seed-ids`) and registers
+  nodes through the admin API; nothing else is written onto nodes.
 - Preserve cache-loop autoclear and the shared `/space/cache` mount (set by
   `space-cache.service`), node-manager's `Bidirectional` view of `/space/cache`
   and `/var/run/netns`, every other pod's `HostToContainer` view of the cache

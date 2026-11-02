@@ -70,14 +70,15 @@ pub use identity::{
 };
 #[cfg(feature = "serde")]
 pub use manifest::{
-    BOUND_TEMPLATE_MANIFEST_SCHEMA_VERSION, TEMPLATE_MANIFEST_SCHEMA_VERSION, TemplateManifest,
-    TemplateManifestCompression, TemplateManifestFile, TemplateManifestFilenameError,
-    TemplateManifestSchemaError, ZSTD_CODEC, ZSTD_FILENAME_SUFFIX,
+    BOUND_TEMPLATE_MANIFEST_SCHEMA_VERSION, GUEST_TEMPLATE_MANIFEST_SCHEMA_VERSION,
+    TEMPLATE_MANIFEST_SCHEMA_VERSION, TemplateManifest, TemplateManifestCompression,
+    TemplateManifestFile, TemplateManifestFilenameError, TemplateManifestSchemaError, ZSTD_CODEC,
+    ZSTD_FILENAME_SUFFIX,
 };
 #[cfg(feature = "serde")]
 pub use metadata::{
-    BOUND_TEMPLATE_METADATA_SCHEMA_VERSION, TEMPLATE_METADATA_SCHEMA_VERSION, TemplateMetadata,
-    TemplateMetadataSchemaError,
+    BOUND_TEMPLATE_METADATA_SCHEMA_VERSION, GUEST_TEMPLATE_METADATA_SCHEMA_VERSION,
+    TEMPLATE_METADATA_SCHEMA_VERSION, TemplateMetadata, TemplateMetadataSchemaError,
 };
 pub use reference::{
     ResolvedTemplateReference, ResolvedTemplateVariant, RuntimeScopedTemplateReference,

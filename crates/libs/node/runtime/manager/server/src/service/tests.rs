@@ -557,7 +557,9 @@ async fn catalog_listing_routes_only_configured_sources_without_a_mutation_worke
         FakeExecutableSource, FakeReleaseSource, FakeSource, TestPins, release_pin,
     };
     use pplx_space_common_core::types::RuntimeKind;
-    for include_ch in [false, true] {
+    for (include_ch, include_kernels) in
+        [(false, false), (false, true), (true, false), (true, true)]
+    {
         let dir = tempfile::tempdir().unwrap();
         let source = Arc::new(FakeSource::default());
         source.offer("1.16", "6.1.158", b"synthetic kernel");
@@ -583,7 +585,11 @@ async fn catalog_listing_routes_only_configured_sources_without_a_mutation_worke
             });
         }
         let service = service(dir.path())
-            .with_kernel_source(crate::installs::test_support::kernel_sources(source))
+            .with_kernel_source(if include_kernels {
+                crate::installs::test_support::kernel_sources(source)
+            } else {
+                Default::default()
+            })
             .with_catalog(
                 pins,
                 crate::installs::ReleaseSources::new(releases).unwrap(),
@@ -593,7 +599,21 @@ async fn catalog_listing_routes_only_configured_sources_without_a_mutation_worke
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(response.artifacts.len(), 2);
+        assert_eq!(response.artifacts.len(), 1 + usize::from(include_kernels));
+        let kernels = service
+            .list_available_artifacts(peer_request(
+                ListAvailableArtifactsRequest {
+                    kinds: vec![ExecutionArtifactKind::Component as i32],
+                    component_kinds: vec![ArtifactComponentKind::Kernel as i32],
+                    ..Default::default()
+                },
+                0,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(kernels.artifacts.len(), usize::from(include_kernels));
+
         let response = service
             .list_available_artifacts(peer_request(
                 ListAvailableArtifactsRequest {

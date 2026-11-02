@@ -27,18 +27,6 @@ impl EnvConfig<'_> {
         }
     }
 
-    pub(crate) fn test_optional_positive_duration_secs(
-        &self,
-        var: &str,
-        default: Option<PositiveDuration>,
-    ) -> Option<PositiveDuration> {
-        match self.test_raw(var).and_then(|raw| raw.parse::<u64>().ok()) {
-            Some(0) => None,
-            Some(value) => PositiveDuration::new(Duration::from_secs(value)),
-            None => default,
-        }
-    }
-
     pub(crate) fn truthy_default(&self, var: &str, default: bool) -> bool {
         match self.0.var(var).as_deref() {
             Ok("1" | "true" | "True" | "TRUE") => true,
@@ -74,6 +62,20 @@ impl EnvConfig<'_> {
     /// running. Same semantics as the shared `env_destructive_gate`.
     pub(crate) fn destructive_gate(&self, var: &str) -> bool {
         pplx_space_common_core::env::env_destructive_gate(self.0.var(var).ok().as_deref())
+    }
+
+    /// An optional positive duration from seconds: unset or unparseable keeps
+    /// `default`, and `0` turns it off.
+    pub(crate) fn optional_positive_duration_secs(
+        &self,
+        var: &str,
+        default: Option<PositiveDuration>,
+    ) -> Option<PositiveDuration> {
+        match self.0.var(var).ok().and_then(|raw| raw.parse::<u64>().ok()) {
+            Some(0) => None,
+            Some(value) => PositiveDuration::new(Duration::from_secs(value)),
+            None => default,
+        }
     }
 
     pub(crate) fn duration_secs(&self, var: &str, default: Duration) -> Duration {

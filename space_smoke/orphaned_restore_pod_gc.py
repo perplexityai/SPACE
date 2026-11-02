@@ -3,8 +3,10 @@
 The cluster-controller reconciler `orphaned_restore_pod_gc`
 (crates/libs/cluster/controller/server/src/orphaned_restore_pod_gc/) deletes
 restore pods their owning `sandboxes` row has provably superseded: no row at
-all, a `suspended`/`failed` row with no active execution, or a resident row
-whose active execution generation is strictly higher than the pod's. It ships
+all, or a resident row whose active execution generation is strictly higher
+than the pod's, or a `suspended`/`failed` row with no active execution whose
+pod generation the backup fence supersedes (its execution was retired as
+`replaced`, or a newer one materialized). It ships
 default-off and dry-run and reads its config once at startup, so the scenario
 scopes a live, short-threshold config to itself: the controller Deployment's
 `SPACE_ORPHANED_RESTORE_POD_GC_*` env is captured, overridden, and put back
@@ -35,7 +37,7 @@ import re
 import secrets
 import time
 import uuid
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -224,6 +226,12 @@ class GcSettings:
         return self.threshold_seconds + 6 * self.interval_seconds + 60
 
     @property
+    def poll_seconds(self) -> float:
+        """Well inside one GC tick, so the window between a bound and a deletion holds a poll."""
+
+        return max(0.5, self.interval_seconds / 4)
+
+    @property
     def survival_window_seconds(self) -> float:
         """Well past the threshold plus several ticks: a pod the loop would act on is gone by then."""
 
@@ -238,7 +246,8 @@ class PlantedOrphan:
     generation: int
     token: str
     reason: str
-    """The `OrphanReason` the reaper must report: `row_reverted` or `sandbox_missing`."""
+    """The `OrphanReason` the reaper reports if it reaps the plant: `row_reverted`
+    or `sandbox_missing`. A plant the reaper must leave alone is never reported."""
     planted_at: float = 0.0
     """`time.monotonic()` once the create returned: the pod existed by then, and
     the plant's own read right after saw it present."""
@@ -388,9 +397,10 @@ class OrphanedRestorePodGcAssertions:
     def plant(self, *, generation: int, sandbox_id: str | None = None) -> PlantedOrphan:
         """Plant a Pending clone of the template at `generation`.
 
-        With `sandbox_id` it sits on that sandbox's row (the caller picks a
-        retired generation, so the row has superseded it); without one it
-        names a sandbox id no row has. The removal is armed before the create.
+        With `sandbox_id` it sits on that sandbox's row at a retired
+        generation the caller picks, which the reaper reaps or leaves alone
+        depending on how that execution was retired; without one it names a
+        sandbox id no row has. The removal is armed before the create.
         """
 
         template = self._template
@@ -447,9 +457,6 @@ class OrphanedRestorePodGcAssertions:
         """
 
         settings = self._require_settings()
-        # Polls well inside one GC tick, so the window between the bound and
-        # the deletion holds a poll.
-        poll_seconds = max(0.5, settings.interval_seconds / 4)
         last_present = {orphan.token: orphan.planted_at for orphan in orphans}
         outstanding = list(orphans)
         deadline = max(orphan.planted_at for orphan in orphans) + settings.reap_budget_seconds
@@ -470,7 +477,33 @@ class OrphanedRestorePodGcAssertions:
                 reap_budget_seconds=settings.reap_budget_seconds,
                 failure_evidence=lambda: self._gc_evidence(*(o.name for o in outstanding)),
             )
-            self._fixture.wait(poll_seconds)
+            self._fixture.wait(settings.poll_seconds)
+
+    def expect_left_alone(self, orphan: PlantedOrphan) -> None:
+        """Through the survival window the plant keeps its uid and isn't deleted."""
+
+        self._hold_through_window(
+            orphan.name,
+            orphan.uid,
+            "the GC deleted a planted pod at a generation the backup fence would not refuse",
+            record_key=f"left_alone_g{orphan.generation}_{orphan.token}",
+        )
+
+    def expect_gone(self, orphan: PlantedOrphan) -> None:
+        """The plant is gone within the reap budget, whoever removed it."""
+
+        settings = self._require_settings()
+        deadline = time.monotonic() + settings.reap_budget_seconds
+        while self._control.restore_pod_document(orphan.name) is not None:
+            self._fixture.verify(
+                time.monotonic() < deadline,
+                "a superseded planted pod was not removed within the budget",
+                pod=orphan.name,
+                reap_budget_seconds=settings.reap_budget_seconds,
+                failure_evidence=lambda: self._gc_evidence(orphan.name),
+            )
+            self._fixture.wait(settings.poll_seconds)
+        self._release_removal(orphan.token)
 
     def _judge_reap(
         self, orphan: PlantedOrphan, last_present: float, first_gone: float, settings: GcSettings
@@ -495,7 +528,10 @@ class OrphanedRestorePodGcAssertions:
             interval_seconds=settings.interval_seconds,
             failure_evidence=lambda: self._gc_evidence(orphan.name),
         )
-        removal = self._removals.pop(orphan.token, None)
+        self._release_removal(orphan.token)
+
+    def _release_removal(self, token: str) -> None:
+        removal = self._removals.pop(token, None)
         if removal is not None:
             removal.release()
 
@@ -512,33 +548,57 @@ class OrphanedRestorePodGcAssertions:
         """Through the survival window the pod keeps its uid and one execution stays
         active at its generation."""
 
-        settings = self._require_settings()
         sandbox_id = self._fixture.sandbox.sandbox_id
-        deadline = time.monotonic() + settings.survival_window_seconds
-        while True:
-            document = self._control.restore_pod_document(live.name)
-            metadata = (document or {}).get("metadata") or {}
+
+        def one_active_execution() -> tuple[bool, dict[str, object]]:
             rows = self._control.sandbox_executions(sandbox_id)
             active = [r for r in rows if r.active]
+            held = len(active) == 1 and active[0].generation == live.generation
+            return held, {"executions": _rows(rows)}
+
+        self._hold_through_window(
+            live.name,
+            live.uid,
+            "the restored pod or its execution was disturbed while the GC ran",
+            record_key="undisturbed_seconds",
+            also=one_active_execution,
+        )
+
+    def _hold_through_window(
+        self,
+        pod_name: str,
+        uid: str,
+        message: str,
+        *,
+        record_key: str,
+        also: Callable[[], tuple[bool, dict[str, object]]] | None = None,
+    ) -> None:
+        """Through the survival window the pod keeps `uid`, isn't deleting, and `also` holds."""
+
+        settings = self._require_settings()
+        deadline = time.monotonic() + settings.survival_window_seconds
+        while True:
+            document = self._control.restore_pod_document(pod_name)
+            metadata = (document or {}).get("metadata") or {}
+            also_held, also_evidence = also() if also is not None else (True, {})
             self._fixture.verify(
                 document is not None
-                and metadata.get("uid") == live.uid
+                and metadata.get("uid") == uid
                 and not metadata.get("deletionTimestamp")
-                and len(active) == 1
-                and active[0].generation == live.generation,
-                "the restored pod or its execution was disturbed while the GC ran",
-                pod=live.name,
+                and also_held,
+                message,
+                pod=pod_name,
                 present=document is not None,
                 uid_now=metadata.get("uid"),
-                uid_before=live.uid,
+                uid_before=uid,
                 deleting=bool(metadata.get("deletionTimestamp")),
-                executions=_rows(rows),
-                failure_evidence=lambda: self._gc_evidence(live.name),
+                **also_evidence,
+                failure_evidence=lambda: self._gc_evidence(pod_name),
             )
             if time.monotonic() >= deadline:
                 break
             self._fixture.wait(settings.interval_seconds)
-        self._fixture.record("undisturbed_seconds", settings.survival_window_seconds)
+        self._fixture.record(record_key, settings.survival_window_seconds)
 
     def wait_until_suspended(self, *, timeout: float = 180) -> list[ExecutionRow]:
         """The row settles `suspended` with no active execution; returns its execution rows."""

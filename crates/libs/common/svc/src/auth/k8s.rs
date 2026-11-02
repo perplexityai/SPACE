@@ -611,9 +611,10 @@ impl K8sTokenAuthConfig {
         if role == NodeRole::Worker && self.node_api_trusted_wait_ready_usernames.is_empty() {
             return Err(AuthConfigError::TrustedWaitReadyServiceAccountsMissing);
         }
-        // Worker and builder both serve the policy-mutation RPCs, so both must
-        // ship a non-empty trusted policy allowlist. Fail closed at startup
-        // rather than silently admitting every allow-listed caller.
+        // A worker serves the policy-mutation RPCs, and both roles gate template
+        // deletion on this allowlist, so both must ship a non-empty one. Fail
+        // closed at startup rather than silently admitting every allow-listed
+        // caller.
         if matches!(role, NodeRole::Worker | NodeRole::Builder)
             && self.node_api_trusted_policy_usernames.is_empty()
         {
@@ -656,8 +657,9 @@ impl K8sTokenAuthConfig {
 
         // Policy-mutation trust is an explicit, independently-configured
         // allowlist (validated non-empty at startup for worker/builder). It is
-        // `Some` only on the surfaces that serve the policy RPCs; every other
-        // surface reports `None`, which the authority check treats as "deny".
+        // `Some` only on the surfaces that serve policy or template-mutation
+        // RPCs; every other surface reports `None`, which the authority check
+        // treats as "deny".
         let trusted_policy_usernames = match (role, surface) {
             // Internal pool adoption also accepts caller-supplied policy. Its
             // caller must pass the internal allowlist as well as policy trust.
@@ -747,8 +749,7 @@ fn guest_bridge_method(role: NodeRole, path: &str) -> bool {
     };
     matches!(
         method,
-        "SpacedPingGuest"
-            | "SpacedGetStatus"
+        "SpacedGetStatus"
             | "SpacedWaitReady"
             | "SpacedStat"
             | "SpacedList"

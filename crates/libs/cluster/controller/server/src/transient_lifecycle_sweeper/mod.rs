@@ -128,6 +128,16 @@
 //! unrestorable-`restoring` fail doesn't apply this check; it matches only a
 //! row with no active execution.
 //!
+//! A client that keeps retrying a failed restore renews both on every retry,
+//! so the check alone would spare its row, and the pending pod holding a node
+//! slot, for as long as the client keeps going. The restoring-episode
+//! deadline ([`ReconcilerConfig::restoring_episode_deadline`]) ends that: past
+//! it, a Kubernetes `restoring` row whose active execution has no pod IP, and
+//! whose pre-restore snapshot proves a revert safe, is listed whatever its
+//! leases say. Its probe still decides the action, and only the revert to
+//! `suspended` honors the deadline; the fail and converge CASes still apply
+//! the check. See `pplx_space_sandbox_store::sweeper::restoring_episode_overdue`.
+//!
 //! Of these lifecycles only `creating` and `restoring` are ever written to
 //! the row today: the start and resume paths keep the row's old lifecycle
 //! while they run, and nothing writes `pausing` or `checkpointing`. The other
@@ -170,19 +180,23 @@
 //! salvageable local artifact (see
 //! [`ProbeVerdict::permits_failed_retire`]). Attempts rotate by
 //! `sandbox_k8s_executions.updated_at` so a persistently bad row cannot
-//! starve later failed sandboxes.
+//! starve later failed sandboxes, and a sandbox whose retire keeps failing is
+//! retried at exponentially growing intervals, warned about until the
+//! interval reaches its cap, and reported once there (see
+//! `failed_cleanup_backoff`).
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use pplx_space_api::controllers::substrate::{
     AbandonedRestoreRetirement, CommandReadyProbe, PodFenceMismatch, RetireExecutionOutcome,
-    RetireFence, Substrate,
+    RetireFence, RetireStopRoute, Substrate,
 };
 use pplx_space_common_core::types::{PositiveDuration, SandboxId, SandboxLifecycle};
 use pplx_space_events::{
-    SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
+    SandboxEvent, SandboxEventBoolField, SandboxEventDetails, SandboxEventSource,
+    SandboxEventTrigger, SandboxEventType,
 };
 use pplx_space_metrics::cluster_reconciler::{
     self as metrics, AgedTransientOutcome, CleanupOutcome, CommandReadyOutcome,
@@ -192,9 +206,12 @@ use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
 use crate::env_config;
+use failed_cleanup_backoff::{FailedCleanupBackoff, FailureReport};
 
 pub mod classify;
+mod failed_cleanup_backoff;
 pub mod probe;
+mod restoring_episode;
 pub mod store;
 
 #[cfg(test)]
@@ -499,6 +516,17 @@ fn emit_failed_cleanup_event(
     result: Option<&str>,
     error: Option<String>,
 ) {
+    emit_failed_cleanup_event_with(
+        sandbox_id,
+        event_type,
+        failed_cleanup_event_details(result, error),
+    );
+}
+
+fn failed_cleanup_event_details(
+    result: Option<&str>,
+    error: Option<String>,
+) -> SandboxEventDetails {
     let mut details = SandboxEventDetails::default()
         .reason("failed_sandbox_active_execution_cleanup")
         .operation("failed_sandbox_active_execution_cleanup")
@@ -510,7 +538,33 @@ fn emit_failed_cleanup_event(
     if let Some(error) = error {
         details = details.error(error);
     }
+    details
+}
 
+/// The `cleanup_failed` event a failed retire is reported with, if any. Every
+/// one carries `result = failed`, so a filter on the result also matches the
+/// failure reported as persistent. That one is also marked
+/// `persistent = true`, and is the last event for that sandbox until its
+/// retire stops failing.
+fn failed_cleanup_failure_event(
+    report_as: FailureReport,
+    error: &str,
+) -> Option<SandboxEventDetails> {
+    let details = failed_cleanup_event_details(Some("failed"), Some(error.to_string()));
+    match report_as {
+        FailureReport::Warn => Some(details),
+        FailureReport::Persistent => {
+            Some(details.bool_field(SandboxEventBoolField::Persistent, true))
+        }
+        FailureReport::Quiet => None,
+    }
+}
+
+fn emit_failed_cleanup_event_with(
+    sandbox_id: SandboxId,
+    event_type: SandboxEventType,
+    details: SandboxEventDetails,
+) {
     SandboxEvent::new(
         sandbox_id,
         event_type,
@@ -691,11 +745,30 @@ pub(crate) const DEFAULT_COMMAND_READY_PENDING_PROBE_TIMEOUT: Duration = Duratio
 pub(crate) const DEFAULT_COMMAND_READY_PENDING_TERMINAL_AGE_SECS: u64 = 3600;
 /// Minimum time since the last placement change before a provably-
 /// unrestorable `restoring` row (no source node, no eligible snapshot, no
-/// in-flight upload — see `store::unrestorable_restoring_guards`) is failed.
+/// in-flight upload — see
+/// `pplx_space_sandbox_store::sweeper::unrestorable_restoring_guards`) is
+/// failed.
 /// The predicate itself is the primary guard; this window is belt-and-braces
 /// against enqueue latency and unmodeled transients, so it only needs to
 /// comfortably exceed suspend→backup-enqueue time (seconds).
 pub(crate) const DEFAULT_UNRESTORABLE_RESTORING_AGE_SECS: u64 = 300;
+/// Default restoring-episode deadline: how long a `restoring` row may go,
+/// from the claim that started its episode, while its active execution has no
+/// pod IP, before the sweep may revert it even under a live retry.
+///
+/// Priced against both failure modes. A restore pod has no IP until its node
+/// has loaded the snapshot and resumed the VM: the shim makes that start
+/// inside the pod sandbox's creation, and kubelet publishes the IP only once
+/// that returns. So the deadline has to clear the slowest healthy load,
+/// including one that first downloads the snapshot from durable storage, and
+/// reverting one wastes that load and starts a fresh restore from the same
+/// snapshot. Every minute past it holds a node slot for a restore that won't
+/// finish. Half an hour is three default `restoring` ages and six
+/// restore-ownership windows, far past any load a healthy node takes, so a
+/// slow episode gets several full retries first. It's a budget for the whole
+/// episode, not for each attempt: time a failed attempt spent counts against
+/// the attempt after it.
+pub(crate) const DEFAULT_RESTORING_EPISODE_DEADLINE_SECS: u64 = 1800;
 
 #[derive(Debug, Clone)]
 pub struct ReconcilerConfig {
@@ -765,6 +838,15 @@ pub struct ReconcilerConfig {
     /// the lifecycle and the cleanup retires the execution afterwards,
     /// refusing a pod that came up since the candidate was observed.
     pub abandoned_restore_retirement: AbandonedRestoreRetirement,
+    /// How long a Kubernetes `restoring` episode may run while its active
+    /// execution has no pod IP before the sweep may revert it to `suspended`,
+    /// however recently a client retry renewed its restore lease and
+    /// activation attempt (`SPACE_TRANSIENT_LIFECYCLE_SWEEPER_RESTORING_EPISODE_DEADLINE_SECS`,
+    /// default [`DEFAULT_RESTORING_EPISODE_DEADLINE_SECS`], `0` turns it off).
+    /// Measured from `lifecycle_changed_at`, which re-drives don't move, and
+    /// effective only past the `restoring` age too. See
+    /// `pplx_space_sandbox_store::sweeper::restoring_episode_overdue`.
+    pub restoring_episode_deadline: Option<PositiveDuration>,
 }
 
 /// Per-lifecycle override resolution.
@@ -814,6 +896,9 @@ impl Default for ReconcilerConfig {
                 Duration::from_secs(DEFAULT_UNRESTORABLE_RESTORING_AGE_SECS),
             ),
             abandoned_restore_retirement: AbandonedRestoreRetirement::Disabled,
+            restoring_episode_deadline: Some(PositiveDuration::new_panic(Duration::from_secs(
+                DEFAULT_RESTORING_EPISODE_DEADLINE_SECS,
+            ))),
         }
     }
 }
@@ -875,6 +960,10 @@ impl ReconcilerConfig {
             unrestorable_restoring_min_placement_age: default
                 .unrestorable_restoring_min_placement_age,
             abandoned_restore_retirement: AbandonedRestoreRetirement::from_env(),
+            restoring_episode_deadline: config.optional_positive_duration_secs(
+                "SPACE_TRANSIENT_LIFECYCLE_SWEEPER_RESTORING_EPISODE_DEADLINE_SECS",
+                default.restoring_episode_deadline,
+            ),
         }
     }
 
@@ -1172,8 +1261,9 @@ pub trait SweepSink: Send + Sync + 'static {
     /// `placement_changed_at`, **not** `lifecycle_changed_at`: restore claims
     /// preserve the latter as the source-selection boundary, so it is not an
     /// activity clock; legacy rows may also carry prior lifecycle-clock
-    /// refreshes. See `store::unrestorable_restoring_guards` for the full
-    /// predicate and the deliberate absence of a lease guard.
+    /// refreshes. See
+    /// `pplx_space_sandbox_store::sweeper::unrestorable_restoring_guards` for
+    /// the full predicate and the deliberate absence of a lease guard.
     fn list_unrestorable_restoring(
         &self,
         min_placement_age: PositiveDuration,
@@ -1318,11 +1408,13 @@ pub trait SweepSink: Send + Sync + 'static {
     ) -> impl std::future::Future<Output = Result<(), sqlx::Error>> + Send;
 
     /// Same contract as [`Self::cleanup_after_sweep`], for the failed-cleanup
-    /// pass's own candidates.
+    /// pass's own candidates, with `stop_route` naming where the retire sends
+    /// its in-VM stop.
     fn cleanup_failed_execution(
         &self,
         sandbox_id: SandboxId,
         fence: RetireFence,
+        stop_route: RetireStopRoute,
     ) -> impl std::future::Future<Output = Result<RetireExecutionOutcome, String>> + Send;
 
     /// CAS-repair a `failed` k8s sandbox that still has an active execution
@@ -1405,6 +1497,10 @@ pub struct TickReport {
     /// Failed-row cleanups skipped because the probe could not prove the
     /// sandbox is gone from its node.
     pub failed_cleanup_deferred: usize,
+    /// Failed-row cleanups not attempted because the sandbox's last retire
+    /// failed and its retry wait has not passed. They are neither probed
+    /// nor retired, only rotated.
+    pub failed_cleanup_backed_off: usize,
     /// Failed rows repaired back to `started` because the node already
     /// reported a live started sandbox.
     pub failed_cleanup_repaired: usize,
@@ -1420,6 +1516,8 @@ pub struct TickReport {
 pub struct Reconciler<S: SweepSink> {
     config: ReconcilerConfig,
     sink: Arc<S>,
+    /// Held only between awaits, never across one.
+    failed_cleanup_backoff: Mutex<FailedCleanupBackoff>,
 }
 
 impl<S: SweepSink> Reconciler<S> {
@@ -1427,7 +1525,16 @@ impl<S: SweepSink> Reconciler<S> {
         Self {
             config,
             sink: Arc::new(sink),
+            failed_cleanup_backoff: Mutex::default(),
         }
+    }
+
+    fn failed_cleanup_backoff(&self) -> MutexGuard<'_, FailedCleanupBackoff> {
+        // The state only spaces retries out; whatever a panic left behind in
+        // it is still a valid spacing.
+        self.failed_cleanup_backoff
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     pub async fn tick(&self) -> TickReport {
@@ -1785,12 +1892,13 @@ impl<S: SweepSink> Reconciler<S> {
             .debug();
             return;
         };
+        let reason = restoring_episode::revert_reason(candidate);
         OutcomeEvent::aged_transient(
             AgedTransientOutcome::RevertedToDurableSnapshot,
             candidate.lifecycle.as_str(),
             verdict.as_str(),
         )
-        .reason("recoverable_snapshot")
+        .reason(reason)
         .sandbox_id(candidate.sandbox_id)
         .age_secs(candidate.age.as_secs())
         .warn();
@@ -1802,7 +1910,7 @@ impl<S: SweepSink> Reconciler<S> {
             Some(SandboxLifecycle::Suspended),
             verdict,
             candidate.age,
-            "recoverable_snapshot",
+            reason,
         );
 
         // The revert already retired the restore's execution, so what's left
@@ -2565,6 +2673,7 @@ impl<S: SweepSink> Reconciler<S> {
     ) {
         match self.sink.repair_failed_active_execution(sandbox_id).await {
             Ok(true) => {
+                self.failed_cleanup_backoff().forget(sandbox_id);
                 OutcomeEvent::failed_cleanup(
                     FailedCleanupOutcome::RepairedFailedRowToLiveVm,
                     observation.verdict.as_str(),
@@ -2621,6 +2730,7 @@ impl<S: SweepSink> Reconciler<S> {
     }
 
     async fn cleanup_failed_active_executions(&self, report: &mut TickReport) {
+        self.failed_cleanup_backoff().start_tick();
         let candidates = match self
             .sink
             .list_failed_active_executions(self.config.failed_cleanup_batch_size)
@@ -2640,18 +2750,45 @@ impl<S: SweepSink> Reconciler<S> {
             return;
         }
 
-        tracing::warn!(
-            failed_active_executions = candidates.len(),
-            "transient_lifecycle_sweeper: cleaning active executions for failed sandboxes"
-        );
+        let (waiting, unreported) = {
+            let backoff = self.failed_cleanup_backoff();
+            let waiting: HashSet<SandboxId> = candidates
+                .iter()
+                .map(|candidate| candidate.sandbox_id)
+                .filter(|sandbox_id| backoff.waiting(*sandbox_id))
+                .collect();
+            let unreported = candidates
+                .iter()
+                .filter(|candidate| {
+                    !waiting.contains(&candidate.sandbox_id) && !backoff.quiet(candidate.sandbox_id)
+                })
+                .count();
+            (waiting, unreported)
+        };
+        if unreported > 0 {
+            tracing::warn!(
+                failed_active_executions = candidates.len(),
+                backing_off = waiting.len(),
+                "transient_lifecycle_sweeper: cleaning active executions for failed sandboxes"
+            );
+        } else {
+            tracing::debug!(
+                failed_active_executions = candidates.len(),
+                backing_off = waiting.len(),
+                "transient_lifecycle_sweeper: every listed failed sandbox is waiting out a retry \
+                 or was already reported as persistently failing"
+            );
+        }
 
         // Probe gate: only a live VM (version-skew suspend failures during a
         // deploy produced `failed` rows whose VM was in fact alive and
         // serving) or an unreachable node defers. See
         // [`ProbeVerdict::permits_failed_retire`] for why a dormant row with
-        // a salvageable local artifact proceeds.
+        // a salvageable local artifact proceeds. A sandbox waiting out a
+        // failed retire is not probed: nothing would act on the answer.
         let targets: Vec<(SandboxId, Option<String>)> = candidates
             .iter()
+            .filter(|candidate| !waiting.contains(&candidate.sandbox_id))
             .map(|candidate| (candidate.sandbox_id, candidate.node_name.clone()))
             .collect();
         let observations = probe::probe_targets(
@@ -2678,6 +2815,10 @@ impl<S: SweepSink> Reconciler<S> {
                     error = %error,
                     "transient_lifecycle_sweeper: failed to rotate failed cleanup candidate; skipping attempt"
                 );
+                continue;
+            }
+            if waiting.contains(&sandbox_id) {
+                report.failed_cleanup_backed_off += 1;
                 continue;
             }
 
@@ -2750,13 +2891,30 @@ impl<S: SweepSink> Reconciler<S> {
             .debug();
             report.failed_cleanup_attempts += 1;
 
-            emit_failed_cleanup_event(sandbox_id, SandboxEventType::CleanupStarted, None, None);
+            // When a node answered the probe, by node name, that no VM is
+            // live, the stop goes back to that node's node-api. The pod's own
+            // IP reaches it only through forwarding in the pod's network
+            // namespace, which can be gone with the VM while the pod still
+            // looks Running; a stop sent there would fail on every tick. An
+            // execution that names no node is `missing_on_node` without a
+            // probe, and has no node-api to go back to, so it keeps the
+            // execution's own route, as does a live VM being retired.
+            let stop_route = if verdict.permits_failed_retire() && candidate.node_name.is_some() {
+                RetireStopRoute::Node
+            } else {
+                RetireStopRoute::Execution
+            };
+            let quiet = self.failed_cleanup_backoff().quiet(sandbox_id);
+            if !quiet {
+                emit_failed_cleanup_event(sandbox_id, SandboxEventType::CleanupStarted, None, None);
+            }
             match self
                 .sink
-                .cleanup_failed_execution(sandbox_id, candidate.pod_fence.clone())
+                .cleanup_failed_execution(sandbox_id, candidate.pod_fence.clone(), stop_route)
                 .await
             {
                 Ok(RetireExecutionOutcome::Retired) => {
+                    self.failed_cleanup_backoff().forget(sandbox_id);
                     OutcomeEvent::substrate_cleanup(CleanupOutcome::Completed, "failed")
                         .sandbox_id(sandbox_id)
                         .info();
@@ -2768,6 +2926,9 @@ impl<S: SweepSink> Reconciler<S> {
                     );
                 }
                 Ok(RetireExecutionOutcome::PodIdentityChanged { mismatch, .. }) => {
+                    // The sandbox moved on, so whatever kept failing was about
+                    // the execution it no longer is.
+                    self.failed_cleanup_backoff().forget(sandbox_id);
                     note_cleanup_pod_identity_deferral(
                         sandbox_id,
                         CleanupPass::FailedCleanup,
@@ -2778,18 +2939,32 @@ impl<S: SweepSink> Reconciler<S> {
                     );
                 }
                 Err(error) => {
-                    OutcomeEvent::substrate_cleanup(CleanupOutcome::Error, "failed")
-                        .sandbox_id(sandbox_id)
-                        .error(&error)
-                        .detail("cleanup failed; rotated retry behind older work")
-                        .warn();
                     report.failed_cleanup_failures += 1;
-                    emit_failed_cleanup_event(
-                        sandbox_id,
-                        SandboxEventType::CleanupFailed,
-                        Some("failed"),
-                        Some(error.clone()),
-                    );
+                    let outcome = OutcomeEvent::substrate_cleanup(CleanupOutcome::Error, "failed")
+                        .sandbox_id(sandbox_id)
+                        .error(&error);
+                    let report_as = self.failed_cleanup_backoff().record_failure(sandbox_id);
+                    match report_as {
+                        FailureReport::Warn => outcome
+                            .detail("cleanup failed; retrying after a growing wait")
+                            .warn(),
+                        FailureReport::Persistent => outcome
+                            .detail(format!(
+                                "cleanup failed {} times in a row; retrying every {} ticks \
+                                 without further warnings until it succeeds",
+                                failed_cleanup_backoff::QUIET_AFTER_FAILURES,
+                                failed_cleanup_backoff::MAX_BACKOFF_TICKS,
+                            ))
+                            .warn(),
+                        FailureReport::Quiet => outcome.debug(),
+                    }
+                    if let Some(details) = failed_cleanup_failure_event(report_as, &error) {
+                        emit_failed_cleanup_event_with(
+                            sandbox_id,
+                            SandboxEventType::CleanupFailed,
+                            details,
+                        );
+                    }
                 }
             }
         }
@@ -2861,6 +3036,7 @@ pub async fn run_with_substrate(
     shutdown_token: CancellationToken,
 ) {
     let sink = SubstrateSweepSink::new(pool, substrate)
-        .with_abandoned_restore_retirement(config.abandoned_restore_retirement);
+        .with_abandoned_restore_retirement(config.abandoned_restore_retirement)
+        .with_restoring_episode_deadline(config.restoring_episode_deadline);
     run(config, sink, shutdown_token).await;
 }

@@ -4,6 +4,15 @@ use super::*;
 
 pub(super) const DEFAULT_NODE_API_PORT: u16 = 9800;
 
+// Each read here places the sandbox on
+// `COALESCE(direct_route.current_node_id, s.active_node_id)`, and joins the
+// Direct route identity only while `s.active_node_id` is set. A worker's own
+// suspend (an idle suspend) clears `active_node_id` but leaves the identity
+// naming that worker, where the sandbox no longer runs; routed by it, a
+// reattach would never ask for the wake an unplaced row gets. The only live
+// identity without `active_node_id` is a create's receipt before the create
+// records its node, and that `creating` row is unplaced on Kubernetes too.
+
 pub(super) async fn fetch_route_row(
     pool: &sqlx::PgPool,
     session_id: &str,
@@ -50,6 +59,7 @@ pub(super) async fn fetch_route_row(
          LEFT JOIN data_plane_org_revocation_epochs o ON o.org_id = d.org_id
          LEFT JOIN sandbox_direct_route_identities direct_route
            ON direct_route.sandbox_id = s.id
+          AND s.active_node_id IS NOT NULL
          LEFT JOIN nodes n
            ON n.id = COALESCE(direct_route.current_node_id, s.active_node_id)
          LEFT JOIN node_k8s nk ON nk.node_id = n.id
@@ -97,6 +107,7 @@ pub(super) async fn update_route_row(
          LEFT JOIN data_plane_org_revocation_epochs o ON o.org_id = s.org_id
          LEFT JOIN sandbox_direct_route_identities direct_route
            ON direct_route.sandbox_id = s.id
+          AND s.active_node_id IS NOT NULL
          LEFT JOIN nodes n
            ON n.id = COALESCE(direct_route.current_node_id, s.active_node_id)
          LEFT JOIN node_k8s nk ON nk.node_id = n.id
@@ -228,6 +239,7 @@ pub(super) async fn fetch_sandbox_service_route_row(
          FROM sandboxes s
          LEFT JOIN sandbox_direct_route_identities direct_route
            ON direct_route.sandbox_id = s.id
+          AND s.active_node_id IS NOT NULL
          LEFT JOIN nodes n
            ON n.id = COALESCE(direct_route.current_node_id, s.active_node_id)
          LEFT JOIN node_k8s nk ON nk.node_id = n.id

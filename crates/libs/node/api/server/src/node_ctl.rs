@@ -1,6 +1,6 @@
 use pplx_space_node_api_client::proto::{
     FacetSyncOverride, GetReconciliationStatusRequest, NodeCtlStatus, ReconciliationStatus,
-    RefreshFacetStateRequest, TriggerStateReconciliationRequest,
+    TriggerStateReconciliationRequest,
 };
 use tonic::{Request, Status};
 
@@ -40,12 +40,6 @@ pub async fn node_ctl_status_if_present() -> Option<NodeCtlStatus> {
         return None;
     }
     Some(node_ctl_status().await)
-}
-
-pub async fn refresh_facet_state(request: RefreshFacetStateRequest) -> Result<(), Status> {
-    let mut client = client().await?;
-    client.refresh_facet_state(Request::new(request)).await?;
-    Ok(())
 }
 
 pub async fn trigger_state_reconciliation(

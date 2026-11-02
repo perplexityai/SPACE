@@ -686,6 +686,8 @@ pub(super) mod service_tests {
     pub(in crate::service) async fn service_for_unit_tests() -> NodeManagerService {
         let vacant = vacant_test_root();
         NodeManagerService {
+            guest_networks: Default::default(),
+            guest_access: Default::default(),
             pool: NetworkPool::open_in_memory_for_test(NetworkPoolConfig::new(1)),
             peer_authorizer: node_peer_authorizer(),
             sandbox_cgroup_config: SandboxCgroupConfig::default(),

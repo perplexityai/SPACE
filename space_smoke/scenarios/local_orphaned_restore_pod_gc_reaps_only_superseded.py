@@ -26,7 +26,7 @@ INTERVAL_SECONDS = 2
 @smoke.scenario(
     "local.orphaned_restore_pod_gc_reaps_only_superseded",
     # Two controller rollouts, three suspend/restore cycles, three reaps of
-    # about threshold plus two ticks each, and one survival window.
+    # about threshold plus two ticks each, and two survival windows.
     sandbox=smoke.SandboxConfig(timeout=1800),
 )
 def orphaned_restore_pod_gc_reaps_only_superseded(test: smoke.KindEcw) -> None:
@@ -35,8 +35,11 @@ def orphaned_restore_pod_gc_reaps_only_superseded(test: smoke.KindEcw) -> None:
     no sooner than the threshold; a restore done while the GC is live leaves
     one execution whose pod keeps its uid well past the threshold plus
     several ticks; and a suspended sandbox with an orphan on its own row at
-    its retired generation has that orphan reaped and still restores with its
-    state."""
+    its retired generation, which suspend retired as `suspended` rather than
+    `replaced`, keeps that orphan through the survival window (the backup
+    fence would admit its teardown capture) while a row-less control planted
+    beside it is reaped, then restores with its state and the orphan is gone
+    once the restore supersedes it."""
 
     marker = f"{MARKER}-{test.sandbox.sandbox_id}"
     gc = test.orphaned_restore_pod_gc
@@ -85,16 +88,36 @@ def orphaned_restore_pod_gc_reaps_only_superseded(test: smoke.KindEcw) -> None:
             live = gc.expect_one_live_execution(above=max(r.generation for r in rows))
             gc.expect_undisturbed(live)
 
-        with test.phase("suspended: an orphan on the suspended row is reaped; the sandbox still restores"):
+        with test.phase(
+            "suspended: an orphan at the row's unreplaced retired generation is left alone until a restore"
+        ):
             test.pause()
             rows = gc.wait_until_suspended()
             retired = max(r.generation for r in rows)
+            # The phase rests on the suspend retiring its execution as
+            # something other than `replaced`: that's what the fence admits.
+            retired_states = [r.state for r in rows if r.generation == retired]
+            test.verify(
+                "replaced" not in retired_states,
+                "the suspend retired its execution as `replaced`, so the GC would rightly reap the plant",
+                generation=retired,
+                states=retired_states,
+            )
             own = gc.plant(sandbox_id=test.sandbox.sandbox_id, generation=retired)
-            # Reaped before the restore, so its own lingering-pod sweep of older
-            # generations cannot be what removed it.
-            gc.expect_reaped(own)
+            # A row-less control planted beside it shows the GC is acting
+            # while `own` ages: the control is reaped, then `own` must still
+            # be there through a further survival window.
+            control = gc.plant(generation=1)
+            gc.expect_reaped(control)
+            # A suspend retires its execution as `suspended`, not `replaced`,
+            # and nothing newer has run, so the fence would admit the teardown
+            # capture a reap of a bound pod starts: the GC must leave it alone.
+            gc.expect_left_alone(own)
             test.reconnect_by_id()
             test.expect_command(test.run_command_when_ready(f"cat {shlex.quote(PATH)}"), stdout=marker)
+            # The restore's execution supersedes the plant. Its lingering-pod
+            # sweep or the GC removes it; either is correct.
+            gc.expect_gone(own)
             gc.expect_one_live_execution(above=retired)
 
         # A failed body still restores as it unwinds; this phase accounts for

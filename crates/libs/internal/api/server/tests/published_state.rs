@@ -7,11 +7,11 @@ use pplx_space_common_core::types::{LocalArtifactId, NodeId, SnapshotId};
 use pplx_space_common_core::{
     sql,
     types::{
-        Arch, AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleDeleteReceiptId,
-        AutoLifecycleIdleAction, AutoLifecyclePolicy, AutoLifecycleStage, ExecutionMetadata,
-        PolicyAuthority, SandboxActivationAttemptId, SandboxId, SandboxLifecycle,
-        SandboxQuarantineHistoryAction, SandboxQuarantineNextAction, SandboxQuarantineReasonCode,
-        SandboxQuarantineSource,
+        AbandonedRestoreRetirement, Arch, AutoLifecycleConditionSet, AutoLifecycleConditionSetId,
+        AutoLifecycleDeleteReceiptId, AutoLifecycleIdleAction, AutoLifecyclePolicy,
+        AutoLifecycleStage, ExecutionMetadata, PolicyAuthority, SandboxActivationAttemptId,
+        SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction, SandboxQuarantineNextAction,
+        SandboxQuarantineReasonCode, SandboxQuarantineSource,
     },
 };
 use pplx_space_common_svc::types::{
@@ -29,7 +29,7 @@ use pplx_space_internal_api_server::{
         GetQuarantineRecoveryPlanRequest, NodeRole as ProtoNodeRole, PublishNodeStateRequest,
         PublishedSandboxState, cluster_api_server::ClusterApi,
     },
-    publish_sandbox_states,
+    publish_sandbox_states, publish_sandbox_states_with_retirement,
 };
 use pplx_space_net_common::proto::NetworkPolicySource;
 use pplx_space_test_env::TestResult;
@@ -2479,6 +2479,20 @@ async fn publish_sandbox_state_updates_activity_clocks_without_touching_updated_
     insert_active_sandbox(&db.pool, sandbox_id, node_id, "started").await?;
     set_sandbox_updated_at_for_test(&db.pool, sandbox_id, original_updated_at).await?;
 
+    let mut conn = db.pool.acquire().await?;
+    publish_sandbox_states(
+        &mut conn,
+        node_id,
+        &[published_sandbox_state(sandbox_id, "started")],
+    )
+    .await?;
+    drop(conn);
+    assert_eq!(
+        sandbox_activity_at(&db.pool, sandbox_id).await?,
+        (None, None, None),
+        "a report with no activity must leave all three clocks unset"
+    );
+
     let mut state = published_sandbox_state(sandbox_id, "started");
     state.last_access_at = Some(timestamp(1_800_000_000));
     state.last_command_at = Some(timestamp(1_800_000_120));
@@ -2507,6 +2521,21 @@ async fn publish_sandbox_state_updates_activity_clocks_without_touching_updated_
             .unix_timestamp(),
         1_800_000_120
     );
+    let foreign_node = NodeId::new();
+    insert_ready_worker_node(&db.pool, foreign_node).await?;
+    let mut foreign_state = published_sandbox_state(sandbox_id, "started");
+    foreign_state.last_used_at = Some(timestamp(1_900_000_000));
+    foreign_state.last_access_at = Some(timestamp(1_900_000_000));
+    foreign_state.last_command_at = Some(timestamp(1_900_000_000));
+    let mut conn = db.pool.acquire().await?;
+    publish_sandbox_states(&mut conn, foreign_node, &[foreign_state]).await?;
+    drop(conn);
+    assert_eq!(
+        sandbox_activity_at(&db.pool, sandbox_id).await?,
+        (last_used_at, last_access_at, last_command_at),
+        "a foreign publisher cannot advance any of the sandbox's activity clocks"
+    );
+
     let updated_at = sandbox_updated_at(&db.pool, sandbox_id).await?;
     assert_eq!(
         updated_at.unix_timestamp(),
@@ -3564,98 +3593,243 @@ async fn activation_rollback_receipts_converge_stable_targets_with_attempt_fence
     let node_id = NodeId::new();
     insert_ready_worker_node(&db.pool, node_id).await?;
 
-    for (target, central_lifecycle, reason_code) in [
-        (
-            "created",
-            "created",
-            SandboxQuarantineReasonCode::CreateInterrupted,
-        ),
-        (
-            "stopped",
-            "stopped",
-            SandboxQuarantineReasonCode::ColdActivationInterrupted,
-        ),
-        (
-            "suspended",
-            "restoring",
-            SandboxQuarantineReasonCode::RestoreActivationInterrupted,
-        ),
+    // A rollback to `suspended` retires its execution as `replaced`, which the
+    // backup fence refuses a capture of, only with abandoned-restore
+    // retirement enabled, for a row still `restoring` that isn't an evacuation
+    // restore, whose execution the restore created, and whose restore
+    // selection is proven to choose a durable pre-restore snapshot; otherwise
+    // a capture may be the sandbox's only copy, so the execution reads
+    // `suspended`. A row another writer already moved off `restoring` no
+    // longer dates the restore, so its snapshot proves nothing.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Source {
+        /// No snapshot: nothing proves a pre-restore source.
+        Missing,
+        /// A durable pre-restore snapshot, and an execution and pod placement
+        /// the restore made after entering `restoring`.
+        Durable,
+        /// As `Durable`, but the execution predates the restore, which
+        /// reused it.
+        DurableReusedExecution,
+        /// As `Durable`, on an evacuation restore.
+        DurableEvacuation,
+        /// As `Durable`, with the row's artifact marker naming the snapshot's
+        /// artifact, so the exact-artifact branch of the proof decides.
+        DurableMarked,
+        /// As `Durable`, but the marker names a newer artifact the control
+        /// plane holds no durable snapshot of. The older durable snapshot
+        /// isn't that artifact, so it proves nothing.
+        MarkedWithoutBackup,
+    }
+    const REPLACED_IF_ENABLED: &str = "replaced if retirement is enabled";
+    for retirement in [
+        AbandonedRestoreRetirement::Disabled,
+        AbandonedRestoreRetirement::Enabled,
     ] {
-        let sandbox_id = SandboxId::new();
-        insert_active_sandbox(&db.pool, sandbox_id, node_id, central_lifecycle).await?;
-        insert_k8s_execution(&db.pool, sandbox_id, 7, "creating", Some("100.64.0.7")).await?;
-        if target == "suspended" {
-            let snapshot_id = insert_ready_suspend_snapshot(&db.pool, sandbox_id, node_id).await?;
-            sqlx::query(
-                "UPDATE snapshots
+        for (target, central_lifecycle, reason_code, source, execution_state_after) in [
+            (
+                "created",
+                "created",
+                SandboxQuarantineReasonCode::CreateInterrupted,
+                Source::Missing,
+                "replaced",
+            ),
+            (
+                "stopped",
+                "stopped",
+                SandboxQuarantineReasonCode::ColdActivationInterrupted,
+                Source::Missing,
+                "replaced",
+            ),
+            (
+                "suspended",
+                "restoring",
+                SandboxQuarantineReasonCode::RestoreActivationInterrupted,
+                Source::Durable,
+                REPLACED_IF_ENABLED,
+            ),
+            (
+                "suspended",
+                "restoring",
+                SandboxQuarantineReasonCode::RestorePrepareFailed,
+                Source::Missing,
+                "suspended",
+            ),
+            (
+                "suspended",
+                "suspended",
+                SandboxQuarantineReasonCode::RestoreActivationInterrupted,
+                Source::Durable,
+                "suspended",
+            ),
+            (
+                "suspended",
+                "restoring",
+                SandboxQuarantineReasonCode::RestoreActivationInterrupted,
+                Source::DurableReusedExecution,
+                "suspended",
+            ),
+            (
+                "suspended",
+                "restoring",
+                SandboxQuarantineReasonCode::RestoreActivationInterrupted,
+                Source::DurableEvacuation,
+                "suspended",
+            ),
+            (
+                "suspended",
+                "restoring",
+                SandboxQuarantineReasonCode::RestoreActivationInterrupted,
+                Source::DurableMarked,
+                REPLACED_IF_ENABLED,
+            ),
+            (
+                "suspended",
+                "restoring",
+                SandboxQuarantineReasonCode::RestoreActivationInterrupted,
+                Source::MarkedWithoutBackup,
+                "suspended",
+            ),
+        ] {
+            let sandbox_id = SandboxId::new();
+            insert_active_sandbox(&db.pool, sandbox_id, node_id, central_lifecycle).await?;
+            if source != Source::Missing {
+                let snapshot_id =
+                    insert_ready_suspend_snapshot(&db.pool, sandbox_id, node_id).await?;
+                sqlx::query(
+                    "UPDATE snapshots
                     SET timestamp = NOW() - INTERVAL '1 minute'
                   WHERE id = $1",
-            )
-            .bind(snapshot_id)
-            .execute(&db.pool)
-            .await?;
-            sqlx::query("UPDATE sandboxes SET lifecycle_changed_at = NOW() WHERE id = $1")
+                )
+                .bind(snapshot_id)
+                .execute(&db.pool)
+                .await?;
+                // The restore's transition, then the placement of its pod.
+                sqlx::query(
+                    "UPDATE sandboxes
+                        SET lifecycle_changed_at = NOW() - INTERVAL '30 seconds',
+                            placement_changed_at = NOW() - INTERVAL '20 seconds',
+                            evacuation_restore_target = CASE WHEN $2 THEN 'started' END
+                      WHERE id = $1",
+                )
+                .bind(sandbox_id)
+                .bind(source == Source::DurableEvacuation)
+                .execute(&db.pool)
+                .await?;
+                let marker = match source {
+                    Source::DurableMarked => {
+                        Some(snapshot_local_artifact_id(&db.pool, snapshot_id).await?)
+                    }
+                    Source::MarkedWithoutBackup => Some(Uuid::now_v7()),
+                    _ => None,
+                };
+                if let Some(marker) = marker {
+                    sqlx::query(
+                        "UPDATE sandboxes
+                            SET current_local_artifact_id = $2,
+                                current_local_artifact_kind = 'full',
+                                current_local_artifact_origin = 'suspend'
+                          WHERE id = $1",
+                    )
+                    .bind(sandbox_id)
+                    .bind(marker)
+                    .execute(&db.pool)
+                    .await?;
+                }
+            }
+            insert_k8s_execution(&db.pool, sandbox_id, 7, "creating", Some("100.64.0.7")).await?;
+            if source == Source::DurableReusedExecution {
+                // The execution predates the restore that reused it.
+                sqlx::query(
+                    "UPDATE sandbox_k8s_executions
+                        SET created_at = NOW() - INTERVAL '1 hour'
+                      WHERE sandbox_id = $1 AND generation = 7",
+                )
                 .bind(sandbox_id)
                 .execute(&db.pool)
                 .await?;
-        }
+            }
 
-        let activation_attempt_id = Uuid::now_v7();
-        sqlx::query(
-            "UPDATE sandbox_k8s_executions
+            let activation_attempt_id = Uuid::now_v7();
+            sqlx::query(
+                "UPDATE sandbox_k8s_executions
                 SET activation_attempt_id = $2
               WHERE sandbox_id = $1 AND generation = 7",
-        )
-        .bind(sandbox_id)
-        .bind(activation_attempt_id)
-        .execute(&db.pool)
-        .await?;
-        let receipt = activation_rollback_state(
-            sandbox_id,
-            Uuid::now_v7(),
-            target,
-            7,
-            activation_attempt_id,
-            reason_code,
-        );
-        let mut conn = db.pool.acquire().await?;
-        let outcome =
-            publish_sandbox_states(&mut conn, node_id, std::slice::from_ref(&receipt)).await?;
-        assert_eq!(outcome.post_commit_events.len(), 1);
-        assert_eq!(sandbox_lifecycle(&db.pool, sandbox_id).await?, target);
-        let (placement, active_node_id, target_node_id) =
-            sqlx::query_as::<_, (String, Option<NodeId>, Option<NodeId>)>(
-                "SELECT placement, active_node_id, target_node_id
-                   FROM sandboxes WHERE id = $1",
             )
             .bind(sandbox_id)
-            .fetch_one(&db.pool)
+            .bind(activation_attempt_id)
+            .execute(&db.pool)
             .await?;
-        assert_eq!(placement, "unplaced");
-        assert!(active_node_id.is_none());
-        assert_eq!(target_node_id, Some(node_id));
-        let (active, execution_state, pod_ip) =
-            sqlx::query_as::<_, (bool, String, Option<String>)>(
-                "SELECT active, state, pod_ip::TEXT
+            let receipt = activation_rollback_state(
+                sandbox_id,
+                Uuid::now_v7(),
+                target,
+                7,
+                activation_attempt_id,
+                reason_code,
+            );
+            let mut conn = db.pool.acquire().await?;
+            let outcome = publish_sandbox_states_with_retirement(
+                &mut conn,
+                node_id,
+                std::slice::from_ref(&receipt),
+                retirement,
+            )
+            .await?;
+            assert_eq!(outcome.post_commit_events.len(), 1);
+            assert_eq!(sandbox_lifecycle(&db.pool, sandbox_id).await?, target);
+            let (placement, active_node_id, target_node_id) =
+                sqlx::query_as::<_, (String, Option<NodeId>, Option<NodeId>)>(
+                    "SELECT placement, active_node_id, target_node_id
+                   FROM sandboxes WHERE id = $1",
+                )
+                .bind(sandbox_id)
+                .fetch_one(&db.pool)
+                .await?;
+            assert_eq!(placement, "unplaced");
+            assert!(active_node_id.is_none());
+            assert_eq!(target_node_id, Some(node_id));
+            let (active, execution_state, pod_ip) =
+                sqlx::query_as::<_, (bool, String, Option<String>)>(
+                    "SELECT active, state, pod_ip::TEXT
                    FROM sandbox_k8s_executions
                   WHERE sandbox_id = $1 AND generation = 7",
-            )
-            .bind(sandbox_id)
-            .fetch_one(&db.pool)
-            .await?;
-        assert!(!active);
-        assert_eq!(
-            execution_state,
-            if target == "suspended" {
-                "suspended"
-            } else {
-                "replaced"
+                )
+                .bind(sandbox_id)
+                .fetch_one(&db.pool)
+                .await?;
+            assert!(!active);
+            let expected_state = match execution_state_after {
+                REPLACED_IF_ENABLED if retirement.is_enabled() => "replaced",
+                REPLACED_IF_ENABLED => "suspended",
+                state => state,
+            };
+            assert_eq!(
+                execution_state, expected_state,
+                "{reason_code} {source:?} {retirement:?}"
+            );
+            // A retirement clears the placement clock the restore's pod set,
+            // so the suspended selector still takes the pre-restore snapshot.
+            if source != Source::Missing {
+                let placement_cleared = sqlx::query_scalar::<_, bool>(
+                    "SELECT placement_changed_at IS NULL FROM sandboxes WHERE id = $1",
+                )
+                .bind(sandbox_id)
+                .fetch_one(&db.pool)
+                .await?;
+                assert_eq!(
+                    placement_cleared,
+                    expected_state == "replaced",
+                    "{reason_code} {source:?} {retirement:?}"
+                );
             }
-        );
-        assert!(pod_ip.is_none());
+            assert!(pod_ip.is_none());
 
-        let replay = publish_sandbox_states(&mut conn, node_id, &[receipt]).await?;
-        assert!(replay.post_commit_events.is_empty());
+            let replay =
+                publish_sandbox_states_with_retirement(&mut conn, node_id, &[receipt], retirement)
+                    .await?;
+            assert!(replay.post_commit_events.is_empty());
+        }
     }
 
     let stale_id = SandboxId::new();

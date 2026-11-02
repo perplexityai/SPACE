@@ -52,6 +52,10 @@ from space_smoke.scenarios.ecw_filesystem_ownership import (
     filesystem_ownership,
 )
 from space_smoke.scenarios.ecw_immediate_egress import PROBE_URL, immediate_egress
+from space_smoke.scenarios.ecw_large_multipart_upload_round_trip import (
+    FILES as LARGE_UPLOAD_FILES,
+    large_multipart_upload_round_trip,
+)
 from space_smoke.scenarios.ecw_large_stdout_integrity import (
     PATH as LARGE_STDOUT_PATH,
     PAYLOAD_BYTES,
@@ -95,6 +99,18 @@ class _Filesystem:
             self.directories.add(str(parent))
             self.owners.setdefault(str(parent), uid)
             parent = parent.parent
+
+    def write_files(
+        self,
+        files: list[tuple[str, bytes]] | tuple[tuple[str, bytes], ...],
+        *,
+        request_timeout: float = 60,
+    ) -> None:
+        self.trace.append(
+            f"files.write-files:{[path for path, _ in files]}:{request_timeout}"
+        )
+        for path, content in files:
+            self.files[path] = content
 
     def read(self, path: str, *, request_timeout: float = 60) -> str:
         self.trace.append(f"files.read:{path}:{request_timeout}")
@@ -590,6 +606,40 @@ class EcwAdditionalScenarioTests(unittest.TestCase):
             "did not leave the workspace tree owned by the sandbox user",
         ):
             filesystem_ownership.verify(_fixture(sandbox))
+
+    def test_large_multipart_upload_writes_both_files_in_one_request(self) -> None:
+        sandbox = _Sandbox()
+
+        large_multipart_upload_round_trip.verify(_fixture(sandbox))
+
+        paths = [path for path, _ in LARGE_UPLOAD_FILES]
+        self.assertEqual(
+            sandbox.trace,
+            [f"files.write-files:{paths}:120"]
+            + [f"files.read-bytes:{path}:120" for path in paths],
+        )
+        sizes = [len(sandbox.files.files[path]) for path in paths]
+        self.assertEqual(sizes, [size for _, size in LARGE_UPLOAD_FILES])
+        # Each is larger than one 3 MiB write message.
+        self.assertTrue(all(size > 3 * 1024 * 1024 for size in sizes))
+        first, second = (sandbox.files.files[path] for path in paths)
+        self.assertNotEqual(first[: len(second)], second)
+
+    def test_large_multipart_upload_fails_when_a_file_changes(self) -> None:
+        sandbox = _Sandbox()
+        write_files = sandbox.files.write_files
+
+        def truncating_write_files(files, *, request_timeout: float = 60) -> None:
+            write_files(files, request_timeout=request_timeout)
+            path, _ = LARGE_UPLOAD_FILES[1]
+            sandbox.files.files[path] = sandbox.files.files[path][:-1]
+
+        sandbox.files.write_files = truncating_write_files  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(
+            InvariantViolation, "changed on its way to the guest"
+        ):
+            large_multipart_upload_round_trip.verify(_fixture(sandbox))
 
     def test_large_stdout_is_verified_at_the_legacy_payload_size(self) -> None:
         sandbox = _Sandbox()

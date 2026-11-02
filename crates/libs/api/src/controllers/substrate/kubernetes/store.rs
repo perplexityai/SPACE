@@ -49,6 +49,7 @@ mod pod_placement;
 mod pod_tracking;
 mod restore_lease;
 mod restore_source;
+mod runtime_upgrade;
 mod started_recovery;
 mod suspend;
 

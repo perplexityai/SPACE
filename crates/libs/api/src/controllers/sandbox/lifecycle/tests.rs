@@ -1,7 +1,7 @@
 use pplx_space_common_core::types::OrgId;
 use pplx_space_common_core::types::{NodeId, SandboxId};
 
-use crate::reconcile_queue::finalize_sandbox_db_delete_tx;
+use pplx_space_sandbox_store::delete::delete_with_dependents;
 
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, pg_test_db_with_max_connections, raise_sqlstate};
 
@@ -127,7 +127,7 @@ async fn finalize_sandbox_db_delete_removes_live_sandbox() -> TestResult {
     .await?;
 
     let mut tx = db.pool.begin().await?;
-    finalize_sandbox_db_delete_tx(&mut tx, sandbox_id).await?;
+    delete_with_dependents(&mut tx, sandbox_id).await?;
     tx.commit().await?;
 
     let row = sqlx::query_scalar::<_, Uuid>(sql!(

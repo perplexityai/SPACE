@@ -48,6 +48,7 @@ use crate::{InboundFacetResult, ReconcileStats, connect_cluster_api, local_manag
 
 mod cluster_deleted_eviction;
 mod execution_inventory;
+mod inbound_sandbox_listing;
 mod inventory_publish;
 mod local_state;
 mod network_policy;
@@ -59,6 +60,7 @@ mod template_desired_state;
 mod unanswered_templates;
 
 use cluster_deleted_eviction::*;
+pub(crate) use inbound_sandbox_listing::InboundSandboxListing;
 use inventory_publish::*;
 use local_state::*;
 pub use network_policy::*;
@@ -116,6 +118,12 @@ pub struct FacetPlugin {
 pub enum FacetScope {
     Full,
     Items(Vec<String>),
+}
+
+/// What every inbound facet of one reconcile pass shares.
+pub(crate) struct InboundPass<'a> {
+    pub(crate) provisioning: &'a Provisioning,
+    pub(crate) sandbox_listing: &'a InboundSandboxListing,
 }
 
 struct NodeStatePublish {
@@ -321,20 +329,29 @@ impl FacetKind {
         scope: FacetScope,
         progress: crate::FacetProgress,
         sync_interval: std::time::Duration,
-        provisioning: &Provisioning,
+        pass: InboundPass<'_>,
     ) -> Result<InboundFacetResult, String> {
         match self {
             Self::RuntimeProvisioning => {
-                runtime_provisioning::refresh(node_id, node_role, provisioning)
+                runtime_provisioning::refresh(node_id, node_role, pass.provisioning)
                     .await
                     .map(|()| InboundFacetResult::default())
                     .map_err(|error| error.to_string())
             }
-            Self::NetworkPolicy => refresh_network_policy(node_id, node_role, scope, progress)
-                .await
-                .map(InboundFacetResult::from_stats),
+            Self::NetworkPolicy => {
+                refresh_network_policy(node_id, node_role, scope, progress, pass.sandbox_listing)
+                    .await
+                    .map(InboundFacetResult::from_stats)
+            }
             Self::SandboxDesiredState => {
-                refresh_sandbox_desired_state(node_id, node_role, scope, sync_interval).await
+                refresh_sandbox_desired_state(
+                    node_id,
+                    node_role,
+                    scope,
+                    sync_interval,
+                    pass.sandbox_listing,
+                )
+                .await
             }
             Self::TemplateBaseSnapshotPolicy => {
                 refresh_template_base_snapshot_policy(node_id, node_role, scope)

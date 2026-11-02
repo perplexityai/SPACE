@@ -251,6 +251,7 @@ async fn standalone_payloads_use_the_same_verified_release_pipeline() {
         let publisher = LocalPublisher::new(&context.root, root.path(), &staging, pins.clone());
         let executor = InstallExecutor::new(
             ExecutorParts {
+                boot_source: None,
                 kernels_root: root.path().to_path_buf(),
                 staging: staging.clone(),
                 limits: super::super::operations::InstallLimits {

@@ -1,73 +1,10 @@
-use pplx_space_common_core::types::{NodeId, SubstrateKind};
+use pplx_space_common_core::types::NodeId;
 
 use super::*;
 use pplx_space_common_core::sql;
-use std::sync::LazyLock;
 
-/// Built once: every input is bound, so the text is the same on every publish.
-/// Mirrors `sandbox_quarantine_store`'s composed queries in this crate.
-///
-/// The interpolated term comes from `pplx_space_sandbox_portability` rather
-/// than being spelled here because that crate is the single definition of "are
-/// this sandbox's bytes recoverable elsewhere", and a deletion path is exactly
-/// where a second spelling does damage.
-static PRUNE_ABSENT_NODE_SANDBOXES_QUERY: LazyLock<String> = LazyLock::new(|| {
-    let released_with_durable_artifact =
-        pplx_space_sandbox_portability::stopped_artifact_durable("s");
-    sql!(
-        format!(
-            "WITH removed AS (
-             DELETE FROM sandbox_observed_states sos
-             WHERE sos.node_id = $1
-               AND NOT (sos.sandbox_id = ANY($2))
-             RETURNING sos.sandbox_id
-         ),
-         removed_elements AS (
-             SELECT 'sandbox:' || sandbox_id::text AS element
-             FROM removed
-         ),
-         deleted_status AS (
-             DELETE FROM node_facet_observed_status nfos
-             USING removed_elements
-             WHERE nfos.node_id = $1
-               AND nfos.facet = $3
-               AND nfos.element = removed_elements.element
-         ),
-         deleted_conditions AS (
-             DELETE FROM node_facet_conditions nfc
-             USING removed_elements
-             WHERE nfc.node_id = $1
-               AND nfc.facet = $3
-               AND nfc.element = removed_elements.element
-         ),
-         marked_deleted AS (
-             UPDATE sandboxes s
-             SET lifecycle = 'deleted',
-                 placement = 'unplaced',
-                 active_node_id = NULL,
-                 target_node_id = NULL,
-                 placement_changed_at = NOW(),
-                 lifecycle_changed_at = NOW(),
-                 updated_at = NOW(),
-                 command_ready_pending = FALSE,
-                 restore_lease_expires_at = NULL,
-                 restore_lease_token = NULL
-             WHERE s.active_node_id = $1
-               AND s.managed_by = $4
-               AND s.lifecycle NOT IN ('deleted', 'deleting')
-               AND NOT {released_with_durable_artifact}
-               AND NOT (s.id = ANY($2))
-             RETURNING s.id AS sandbox_id
-         )
-         DELETE FROM sandbox_snapshot_inventory
-         WHERE sandbox_id IN (SELECT sandbox_id FROM removed)
-            OR sandbox_id IN (SELECT sandbox_id FROM marked_deleted)"
-        )
-        .as_str()
-    )
-});
-
-/// Reconcile a node's complete sandbox census against the cluster's own state.
+/// Reconcile a node's complete sandbox census against the cluster's own state,
+/// through [`pplx_space_sandbox_store::ingest::prune_census_absent_sandboxes`].
 ///
 /// Two readings of the same absence, with very different weight:
 ///
@@ -113,14 +50,12 @@ pub(super) async fn prune_absent_node_sandboxes(
     node_id: NodeId,
     present_sandbox_ids: &[SandboxId],
 ) -> Result<(), Status> {
-    sqlx::query(sqlx::AssertSqlSafe(
-        PRUNE_ABSENT_NODE_SANDBOXES_QUERY.as_str(),
-    ))
-    .bind(node_id)
-    .bind(present_sandbox_ids)
-    .bind(FACET_NETWORK_POLICY)
-    .bind(SubstrateKind::Space)
-    .execute(&mut *conn)
+    pplx_space_sandbox_store::ingest::prune_census_absent_sandboxes(
+        &mut *conn,
+        node_id,
+        present_sandbox_ids,
+        FACET_NETWORK_POLICY,
+    )
     .await
     .map_err(|err| {
         Status::internal(format!(

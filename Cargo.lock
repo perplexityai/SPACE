@@ -5270,6 +5270,7 @@ dependencies = [
  "pplx-space-common-svc",
  "pplx-space-db-test-fixtures",
  "pplx-space-metrics",
+ "pplx-space-observability",
  "sqlx",
  "tokio",
  "uuid",
@@ -5852,6 +5853,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-execution-catalog"
+version = "0.8.0"
+dependencies = [
+ "pplx-space-common-core",
+ "pplx-space-execution-common",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
 name = "pplx-space-execution-common"
 version = "0.8.0"
 dependencies = [
@@ -6001,12 +6017,13 @@ dependencies = [
  "pplx-space-node-api-client",
  "pplx-space-node-api-sim",
  "pplx-space-node-mgr-client",
+ "pplx-space-observability",
  "pplx-space-placement",
  "pplx-space-public-api",
+ "pplx-space-runtime-environment-catalog-store",
  "pplx-space-runtime-environment-policy-store",
  "pplx-space-sandbox-portability",
  "pplx-space-sandbox-store",
- "pplx-space-sandbox-teardown",
  "pplx-space-sbx-mgr-client",
  "pplx-space-snapshot-store",
  "pplx-space-template-mgr-client",
@@ -6584,6 +6601,7 @@ dependencies = [
  "pplx-space-node-mgr-client",
  "serde_json",
  "tokio",
+ "tokio-stream",
  "tonic",
 ]
 
@@ -6650,7 +6668,9 @@ dependencies = [
  "pplx-space-common-grpc",
  "pplx-space-common-io",
  "pplx-space-common-proto-build",
+ "pplx-space-execution-catalog",
  "pplx-space-execution-common",
+ "pplx-space-metrics",
  "pplx-space-net-common",
  "pplx-space-test-env",
  "prost",
@@ -6893,6 +6913,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-runtime-environment-catalog-store"
+version = "0.8.0"
+dependencies = [
+ "pplx-space-common-core",
+ "pplx-space-db-test-fixtures",
+ "pplx-space-test-env",
+ "sqlx",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "pplx-space-runtime-environment-policy-store"
 version = "0.8.0"
 dependencies = [
@@ -6983,10 +7015,13 @@ version = "0.8.0"
 name = "pplx-space-sandbox-store"
 version = "0.8.0"
 dependencies = [
+ "pplx-space-cluster-pool",
  "pplx-space-common-core",
  "pplx-space-db-test-fixtures",
  "pplx-space-placement",
  "pplx-space-sandbox-portability",
+ "pplx-space-sandbox-routability",
+ "pplx-space-sandbox-teardown",
  "pplx-space-test-env",
  "serde",
  "serde_json",
@@ -7001,9 +7036,8 @@ dependencies = [
 name = "pplx-space-sandbox-teardown"
 version = "0.8.0"
 dependencies = [
- "pplx-space-cluster-pool",
  "pplx-space-common-core",
- "pplx-space-common-svc",
+ "pplx-space-state-reconciliation",
  "sqlx",
 ]
 
@@ -7563,6 +7597,7 @@ dependencies = [
  "clap",
  "pplx-space-common-cli",
  "pplx-space-common-core",
+ "pplx-space-net-common",
  "pplx-space-sbx-mgr-client",
  "tokio",
 ]
@@ -7605,6 +7640,7 @@ dependencies = [
  "pplx-space-common-lru-reaper",
  "pplx-space-common-svc",
  "pplx-space-db-test-fixtures",
+ "pplx-space-execution-catalog",
  "pplx-space-execution-common",
  "pplx-space-feature-flags",
  "pplx-space-internal-api-server",
@@ -8010,9 +8046,9 @@ dependencies = [
 
 [[package]]
 name = "pulldown-cmark"
-version = "0.13.5"
+version = "0.13.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "278e9268c93b9e498a2da46c34d90ba93a3255eb99009646398f34bc73ab36eb"
+checksum = "3db2be46835f013dd3f4fa7f5f7402c537787b54ebb6fe2b94bbdd7e2669bb7b"
 dependencies = [
  "bitflags 2.13.2",
  "memchr",

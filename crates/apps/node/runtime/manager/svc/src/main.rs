@@ -97,6 +97,10 @@ struct Cli {
     #[arg(long, default_value = paths::RUNTIME_MANAGER_STAGING_DIR)]
     staging_dir: PathBuf,
 
+    /// Read-only auxiliary boot source: <kind>-<version>--<digest-prefix>/image.
+    #[arg(long)]
+    boot_artifacts_source: Option<PathBuf>,
+
     /// Root-owned catalog files adding release and kernel pins to the
     /// compiled ones.
     #[arg(long, default_value = paths::RUNTIME_MANAGER_CATALOG_DIR)]
@@ -168,6 +172,7 @@ impl TryFrom<Cli> for RuntimeManagerRunConfig {
         let install = (!cli.list_only).then(|| RuntimeManagerInstallConfig {
             kernels_root: cli.node_kernels_dir.clone(),
             staging_dir: cli.staging_dir,
+            boot_artifacts_source: cli.boot_artifacts_source,
             limits: InstallLimits {
                 max_bytes: cli.max_install_bytes,
                 download_idle_timeout: Duration::from_secs(cli.download_idle_timeout_secs),

@@ -1315,6 +1315,43 @@ impl<T> RouteCacheLookup<T> {
     }
 }
 
+/// A resolved route the route cache hands to new requests, without asking
+/// ClusterApi, until its entry expires or a route token enters its refresh
+/// window.
+pub(super) trait CachedRoute {
+    fn cache_epoch(&self) -> u64;
+    fn tokens_need_refresh(&self) -> bool;
+}
+
+impl CachedRoute for AttachedSession {
+    fn cache_epoch(&self) -> u64 {
+        self.cache_epoch
+    }
+
+    fn tokens_need_refresh(&self) -> bool {
+        space_api_route_token_needs_refresh(&self.space_api_route_token)
+    }
+}
+
+impl CachedRoute for EcwResolvedRoute {
+    fn cache_epoch(&self) -> u64 {
+        self.cache_epoch
+    }
+
+    fn tokens_need_refresh(&self) -> bool {
+        ecw_route_tokens_need_refresh(self)
+    }
+}
+
+impl<T: CachedRoute> RouteCacheLookup<T> {
+    /// Whether this lookup hit the very entry `route` came from and the cache
+    /// would still hand `route` to a new request without asking ClusterApi.
+    pub(super) fn still_serves(self, route: &T) -> bool {
+        matches!(self, Self::Hit(current) if current.cache_epoch() == route.cache_epoch())
+            && !route.tokens_need_refresh()
+    }
+}
+
 #[derive(Debug, Default)]
 pub(super) struct EcwProcessInputLocks {
     pub(super) locks: DashMap<EcwProcessInputKey, Arc<tokio::sync::Mutex<()>>>,

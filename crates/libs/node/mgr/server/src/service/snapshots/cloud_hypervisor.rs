@@ -41,8 +41,12 @@ fn configuration(
 ) -> Result<pplx_space_node_runtime_core::boot::StandaloneBoot, Status> {
     let bytes = read_bounded(directory, "vm-config.json")?;
     let text = std::str::from_utf8(&bytes).map_err(artifact_fs::error)?;
-    pplx_space_node_runtime_core::boot::validate_standalone(RuntimeKind::CloudHypervisor, text)
-        .map_err(|error| Status::failed_precondition(error.to_string()))
+    pplx_space_node_runtime_core::boot::validate_standalone(
+        RuntimeKind::CloudHypervisor,
+        text,
+        pplx_space_node_runtime_core::boot::BootSource::LinuxDirect,
+    )
+    .map_err(|error| Status::failed_precondition(error.to_string()))
 }
 
 fn workspace(state: &std::fs::File, name: &str, uid: u32) -> Result<std::fs::File, Status> {

@@ -10,6 +10,7 @@ use pplx_space_events::{
 };
 use pplx_space_sandbox_portability::portable_for_restore_affinity;
 use pplx_space_sandbox_store as sandbox_store;
+use pplx_space_sandbox_store::delete::{mark_deleting, restore_lifecycle_from_deleting};
 use pplx_space_sandbox_store::fork_source_lifecycle::{
     active_fork_source_operation_exists, lock_fork_source_lifecycle,
 };
@@ -185,15 +186,9 @@ async fn begin_delete_against_active_fork(
             })
     })
     .transpose()?;
-    sqlx::query(sql!(
-        "UPDATE sandboxes
-         SET lifecycle = 'deleting'
-         WHERE id = $1"
-    ))
-    .bind(sandbox_id)
-    .execute(&mut *guard)
-    .await
-    .map_err(|error| db_contention_error("failed to persist sandbox delete intent", &error))?;
+    mark_deleting(&mut guard, sandbox_id)
+        .await
+        .map_err(|error| db_contention_error("failed to persist sandbox delete intent", &error))?;
     guard
         .commit()
         .await
@@ -206,27 +201,19 @@ async fn restore_lifecycle_after_failed_delete(
     sandbox_id: SandboxId,
     lifecycle: pplx_space_common_core::types::SandboxLifecycle,
 ) -> Result<(), ControllerError> {
-    let changed = sqlx::query(sql!(
-        "UPDATE sandboxes
-         SET lifecycle = $2
-         WHERE id = $1 AND lifecycle = 'deleting'"
-    ))
-    .bind(sandbox_id)
-    .bind(lifecycle.as_str())
-    .execute(pool)
-    .await
-    // This compensating UPDATE takes a row lock on `sandboxes`, so it can lose
-    // a race with any concurrent writer of that row. Its caller uses `?`, so a
-    // failure here replaces the original delete error *and* leaves the row in
-    // `lifecycle = 'deleting'` — which denies fork admission against the
-    // sandbox and makes the "retry the DELETE" advice unachievable. Classified
-    // so the caller is at least told to retry; the residual is that a failed
-    // restore still leaves the row pinned until that retry lands.
-    .map_err(|error| {
-        db_contention_error("failed to restore sandbox after deferred deletion", &error)
-    })?
-    .rows_affected();
-    if changed == 1 {
+    let restored = restore_lifecycle_from_deleting(pool, sandbox_id, lifecycle)
+        .await
+        // This compensating UPDATE takes a row lock on `sandboxes`, so it can lose
+        // a race with any concurrent writer of that row. Its caller uses `?`, so a
+        // failure here replaces the original delete error *and* leaves the row in
+        // `lifecycle = 'deleting'` — which denies fork admission against the
+        // sandbox and makes the "retry the DELETE" advice unachievable. Classified
+        // so the caller is at least told to retry; the residual is that a failed
+        // restore still leaves the row pinned until that retry lands.
+        .map_err(|error| {
+            db_contention_error("failed to restore sandbox after deferred deletion", &error)
+        })?;
+    if restored {
         Ok(())
     } else {
         Err(ControllerError::internal(
@@ -243,30 +230,22 @@ async fn restore_lifecycle_after_failed_finalize_delete(
     let Some(previous_lifecycle) = previous_lifecycle else {
         return Ok(());
     };
-    let changed = sqlx::query(sql!(
-        "UPDATE sandboxes
-         SET lifecycle = $2
-         WHERE id = $1 AND lifecycle = 'deleting'"
-    ))
-    .bind(sandbox_id)
-    .bind(previous_lifecycle.as_str())
-    .execute(pool)
-    .await
-    // This compensating UPDATE takes a row lock on `sandboxes`, so it can lose
-    // a race with any concurrent writer of that row. Its caller uses `?`, so a
-    // failure here replaces the original delete error *and* leaves the row in
-    // `lifecycle = 'deleting'` — which denies fork admission against the
-    // sandbox and makes the "retry the DELETE" advice unachievable. Classified
-    // so the caller is at least told to retry; the residual is that a failed
-    // restore still leaves the row pinned until that retry lands.
-    .map_err(|error| {
-        db_contention_error(
-            "failed to restore sandbox after deletion finalization",
-            &error,
-        )
-    })?
-    .rows_affected();
-    if changed == 1 {
+    let restored = restore_lifecycle_from_deleting(pool, sandbox_id, previous_lifecycle)
+        .await
+        // This compensating UPDATE takes a row lock on `sandboxes`, so it can lose
+        // a race with any concurrent writer of that row. Its caller uses `?`, so a
+        // failure here replaces the original delete error *and* leaves the row in
+        // `lifecycle = 'deleting'` — which denies fork admission against the
+        // sandbox and makes the "retry the DELETE" advice unachievable. Classified
+        // so the caller is at least told to retry; the residual is that a failed
+        // restore still leaves the row pinned until that retry lands.
+        .map_err(|error| {
+            db_contention_error(
+                "failed to restore sandbox after deletion finalization",
+                &error,
+            )
+        })?;
+    if restored {
         return Ok(());
     }
 
@@ -450,11 +429,11 @@ async fn complete_wake_lifecycle(
 /// Variants split into two groups:
 /// - **HTTP-parseable lifecycle verbs** (`start`, `wake`, …, `enable_snapshots`,
 ///   `disable_snapshots`). These come from public routes via `FromStr`.
-/// - **Internal access-path labels** (`Access`, `Stats`, `OpenPort`,
-///   `Rollback`, `Spaced`, `Update`). These are constructed directly at the
-///   call site (they're not user-visible action verbs); they exist so the
-///   drain-guard 409 body and metrics name the operation the user actually
-///   invoked rather than a misleading literal like `"wake"`.
+/// - **Internal access-path labels** (`Stats`, `OpenPort`, `Rollback`,
+///   `Spaced`, `Update`). These are constructed directly at the call site
+///   (they're not user-visible action verbs); they exist so the drain-guard
+///   409 body and metrics name the operation the user actually invoked rather
+///   than a misleading literal like `"wake"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SandboxAction {
     Start,
@@ -469,7 +448,6 @@ pub enum SandboxAction {
     Checkpoint,
     EnableSnapshots,
     DisableSnapshots,
-    Access,
     Stats,
     OpenPort,
     Rollback,
@@ -498,7 +476,6 @@ impl SandboxAction {
             Self::Checkpoint => "checkpoint",
             Self::EnableSnapshots => "enable_snapshots",
             Self::DisableSnapshots => "disable_snapshots",
-            Self::Access => "access",
             Self::Stats => "stats",
             Self::OpenPort => "open_port",
             Self::Rollback => "rollback",
@@ -602,12 +579,9 @@ impl SandboxAction {
             Self::EnableSnapshots | Self::DisableSnapshots => {
                 SandboxEventType::SnapshotPolicyUpdateRequested
             }
-            Self::Access
-            | Self::Stats
-            | Self::OpenPort
-            | Self::Rollback
-            | Self::Spaced
-            | Self::Update => return None,
+            Self::Stats | Self::OpenPort | Self::Rollback | Self::Spaced | Self::Update => {
+                return None;
+            }
         })
     }
 
@@ -625,12 +599,9 @@ impl SandboxAction {
             Self::EnableSnapshots | Self::DisableSnapshots => {
                 SandboxEventType::SnapshotPolicyUpdateCompleted
             }
-            Self::Access
-            | Self::Stats
-            | Self::OpenPort
-            | Self::Rollback
-            | Self::Spaced
-            | Self::Update => return None,
+            Self::Stats | Self::OpenPort | Self::Rollback | Self::Spaced | Self::Update => {
+                return None;
+            }
         })
     }
 
@@ -648,12 +619,9 @@ impl SandboxAction {
             Self::EnableSnapshots | Self::DisableSnapshots => {
                 SandboxEventType::SnapshotPolicyUpdateFailed
             }
-            Self::Access
-            | Self::Stats
-            | Self::OpenPort
-            | Self::Rollback
-            | Self::Spaced
-            | Self::Update => return None,
+            Self::Stats | Self::OpenPort | Self::Rollback | Self::Spaced | Self::Update => {
+                return None;
+            }
         })
     }
 }
@@ -747,9 +715,9 @@ fn cluster_admission_controller_error(
 
 /// Classify the cluster-activation cost of *implicitly* waking a sandbox from
 /// its currently-observed lifecycle. Covers the data-plane access path
-/// (`access_runtime_client` / `access_sandbox_ip`) and the control-plane
-/// `control_runtime_client` wake — the sites that spend a real node slot (and
-/// often a Kubernetes pod) without going through an explicit lifecycle action.
+/// (`access_runtime_client`) and the control-plane `control_runtime_client`
+/// wake — the sites that spend a real node slot (and often a Kubernetes pod)
+/// without going through an explicit lifecycle action.
 ///
 /// Mirrors the explicit-action [`SandboxAction::activation_class`] granularity:
 /// only dormant states that (re)occupy a node slot are charged — `suspended`
@@ -1206,13 +1174,12 @@ pub(super) async fn ensure_resolved_node_not_draining(
 
 /// Access-path drain gate. Returns 409 when the sandbox's resolved node
 /// (`COALESCE(target_node_id, active_node_id)`) blocks placement, for any
-/// lifecycle. Used by access paths (`access_sandbox_ip`,
-/// `spaced_client(activity)`, `exec`, `apply_open_sandbox_port`) that flow
-/// through the substrate's `access_runtime_client` / `access_sandbox_ip` —
-/// both of which call `ensure_pod_exists` for any recoverable-live lifecycle
-/// when the pod IP is gone, re-pinning the new pod to `target_node_id`. A
-/// dormant-only gate would let a `started` sandbox whose runtime is briefly
-/// unreachable race the reconciler. Under a **forced** drain the cost is that
+/// lifecycle. Used by access paths (`spaced_client(activity)`, `exec`,
+/// `apply_open_sandbox_port`) that flow through the substrate's
+/// `access_runtime_client`, which calls `ensure_pod_exists` for any
+/// recoverable-live lifecycle when the pod IP is gone, re-pinning the new pod
+/// to `target_node_id`. A dormant-only gate would let a `started` sandbox whose
+/// runtime is briefly unreachable race the reconciler. Under a **forced** drain the cost is that
 /// exec/spaced/proxy traffic against a live sandbox on a draining node 409s
 /// for the short window before the reconciler suspends + migrates it; users
 /// see a clear "node is draining" error rather than a flaky stuck pod.
@@ -2020,10 +1987,10 @@ impl SandboxController {
                 //   itself trigger `ensure_pod_exists` on the cordoned
                 //   source node (racing the drain reconciler). When the
                 //   runtime is unreachable we return 503 instead of
-                //   optimistically marking the sandbox stopped — see the
-                //   earlier `sandbox_ip` disambiguation attempt that
-                //   conflated "pod gone" with "pod Pending / no IP yet"
-                //   and falsely reported success on a still-running VM.
+                //   optimistically marking the sandbox stopped: an earlier
+                //   version that decided from the pod-IP lookup conflated
+                //   "pod gone" with "pod Pending / no IP yet" and falsely
+                //   reported success on a still-running VM.
                 //
                 // This branch keys on the drain *phase* only, not the mode. A
                 // gentle drain still cordons the node, so `ensure_pod_exists`
@@ -2135,8 +2102,7 @@ impl SandboxController {
                         _ => unreachable!("outer match guards Pause | Checkpoint | Resume"),
                     }
                 }
-                SandboxAction::Access
-                | SandboxAction::Stats
+                SandboxAction::Stats
                 | SandboxAction::OpenPort
                 | SandboxAction::Rollback
                 | SandboxAction::Spaced
@@ -2208,14 +2174,15 @@ impl SandboxController {
                 SandboxLifecycleStatus::Started
             }
             SandboxAction::Wake | SandboxAction::ImplicitWake(_) => {
-                let mut client = self
-                    .substrate
+                // The worker serves Wake only on its internal surface. With no
+                // row there is no start context to send.
+                self.substrate
                     .runtime_client(
                         typed_id,
                         crate::controllers::substrate::RecoveryCharge::Exempt,
                     )
-                    .await?;
-                client
+                    .await?
+                    .internal_client()
                     .wake_sandbox(WakeRequest {
                         implicit_wake_source: action
                             .wake_activity()
@@ -2224,6 +2191,7 @@ impl SandboxController {
                         blocking: true,
                         start_context: None,
                         target_state: 0,
+                        runtime_upgrade: None,
                     })
                     .await?;
                 SandboxLifecycleStatus::Started
@@ -2340,7 +2308,6 @@ impl SandboxController {
             }
             SandboxAction::EnableSnapshots
             | SandboxAction::DisableSnapshots
-            | SandboxAction::Access
             | SandboxAction::Stats
             | SandboxAction::OpenPort
             | SandboxAction::Rollback

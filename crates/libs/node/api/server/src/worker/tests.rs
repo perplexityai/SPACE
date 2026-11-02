@@ -59,15 +59,6 @@ fn public_worker_api_rejects_explicit_netns_path() {
 }
 
 #[test]
-fn public_worker_api_rejects_wake_start_context() {
-    let start_context = Some(pplx_space_sbx_mgr_client::proto::WakeStartContext::default());
-    let error = reject_public_wake_start_context("WakeSandbox", &start_context).unwrap_err();
-
-    assert_eq!(error.code(), tonic::Code::InvalidArgument);
-    assert!(error.message().contains("internal-only"));
-}
-
-#[test]
 fn public_worker_api_rejects_explicit_suspend_restore_storage_uri() {
     let storage_uri = Some("s3://space/snapshot?region=us-east-1".to_string());
     let error =
@@ -286,4 +277,36 @@ async fn sandbox_kill_is_admitted_while_every_sandbox_permit_is_held() {
         }))
         .await;
     assert_eq!(sandbox_kill.unwrap_err().code(), tonic::Code::Unimplemented);
+}
+
+/// Sandbox-manager authorizes an upgrade by its caller, which is node-api, so
+/// node-api's internal Wake forwards one only for the control plane.
+#[tokio::test]
+async fn the_internal_wake_forwards_a_runtime_upgrade_only_for_the_control_plane() {
+    use pplx_space_node_api_client::proto::worker_api_internal_server::WorkerApiInternal;
+    let service =
+        service_with_limiter(UdsPerSandboxLimiter::for_tests_with_reserved(1, 1, 8)).await;
+    let wake = || {
+        Request::new(proto::WakeRequest {
+            sandbox_id: SandboxId::new().to_string(),
+            blocking: true,
+            runtime_upgrade: Some(proto::WakeRuntimeUpgrade::default()),
+            ..Default::default()
+        })
+    };
+
+    let mut unprivileged = wake();
+    unprivileged.extensions_mut().insert(
+        pplx_space_common_svc::auth::NodeApiAuthenticatedCaller::unprivileged_workload_for_test(),
+    );
+    let denied = WorkerApiInternal::wake_sandbox(&service, unprivileged)
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::PermissionDenied, "{denied}");
+
+    // The fake sandbox-manager answers whatever reaches it with Unimplemented.
+    let forwarded = WorkerApiInternal::wake_sandbox(&service, wake())
+        .await
+        .unwrap_err();
+    assert_eq!(forwarded.code(), tonic::Code::Unimplemented, "{forwarded}");
 }

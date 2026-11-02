@@ -30,6 +30,10 @@ fn cleanup_job_admission_is_atomic_deduplicated_and_strength_preserving() {
     let tx = Transaction::deferred(&conn).unwrap();
     let id = persist(&tx, work.clone()).unwrap();
     tx.commit().unwrap();
+    let started = crate::db::read::cleanup_job_created_at(&conn, &id)
+        .unwrap()
+        .unwrap();
+    assert!(started.get() > 0);
     let mut kill = work.clone();
     kill.immediate_kill = true;
     let tx = Transaction::deferred(&conn).unwrap();
@@ -40,6 +44,10 @@ fn cleanup_job_admission_is_atomic_deduplicated_and_strength_preserving() {
         decode(&jobs::get_job(conn.raw(), &id).unwrap().unwrap().payload)
             .unwrap()
             .immediate_kill
+    );
+    assert_eq!(
+        crate::db::read::cleanup_job_created_at(&conn, &id).unwrap(),
+        Some(started)
     );
     let mut recovery = work.clone();
     recovery.published_artifact = None;

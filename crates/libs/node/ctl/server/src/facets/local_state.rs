@@ -56,10 +56,13 @@ pub(super) async fn resolve_template_scope(scope: FacetScope) -> Result<Vec<Stri
     }
 }
 
-pub(super) async fn resolve_sandbox_scope(scope: FacetScope) -> Result<Vec<String>, String> {
+pub(super) async fn resolve_sandbox_scope(
+    scope: FacetScope,
+    sandbox_listing: &InboundSandboxListing,
+) -> Result<Vec<String>, String> {
     match scope {
         FacetScope::Items(items) => Ok(util::dedupe_non_empty(items)),
-        FacetScope::Full => list_local_sandbox_ids().await,
+        FacetScope::Full => sandbox_listing.sandbox_ids().await,
     }
 }
 
@@ -68,7 +71,9 @@ pub(super) async fn list_local_template_names() -> Result<Vec<String>, String> {
         .await
         .map_err(|error| format!("connect template-manager: {error}"))?;
     let response = tmpl
-        .list_templates(Request::new(ListTemplatesRequest {}))
+        .list_templates(Request::new(ListTemplatesRequest {
+            omit_sandbox_counts: true,
+        }))
         .await
         .map_err(|error| format!("list templates: {error}"))?
         .into_inner();
@@ -496,13 +501,13 @@ pub(super) async fn collect_template_states(
         .await
         .map_err(|error| format!("connect template-manager: {error}"))?;
     let templates = client
-        .list_templates(Request::new(ListTemplatesRequest {}))
+        .list_templates(Request::new(ListTemplatesRequest::default()))
         .await
         .map_err(|error| format!("list templates: {error}"))?
         .into_inner()
         .templates;
     let pools = client
-        .pool_status(Request::new(PoolStatusRequest { template: None }))
+        .pool_status(Request::new(PoolStatusRequest::default()))
         .await
         .map(|response| response.into_inner().pools)
         .unwrap_or_default();

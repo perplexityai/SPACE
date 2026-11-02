@@ -28,7 +28,9 @@ const INGRESS_TABLE: &str = "ingress";
 const INGRESS_DNAT_COMMENT_PREFIX: &str = "space-dnat-";
 const LEGACY_INGRESS_DNAT_COMMENT_PREFIX: &str = "dnat-";
 const PRE_TPROXY_GUARDRAILS_CHAIN: &str = "pre_tproxy_guardrails";
+const DHCP_BOOTSTRAP_COMMENT: &str = "execution-dhcp-bootstrap";
 const UDP443_COMMENT: &str = "platform-egress-pre-tproxy-guardrail-quic-udp443";
+const MPTCP_GUARD_COMMENT: &str = "drop-guest-mptcp";
 const PRE_TPROXY_GUARDRAILS_PRIO: i32 = -175;
 const PRE_TPROXY_GUARDRAILS_POLICY_PATH: &str =
     "/etc/space/nftables/sandbox-pre-tproxy-guardrails.json";
@@ -122,6 +124,19 @@ pub enum FirewallError {
     Exec(#[source] std::io::Error),
     #[error("nft apply failed: {stderr}\ninput: {input}")]
     Apply { stderr: String, input: String },
+}
+
+impl FirewallError {
+    /// nft never ran because its network namespace's /run/netns entry was
+    /// gone or unmounted.
+    pub(crate) fn is_namespace_missing(&self) -> bool {
+        match self {
+            Self::ListStart(error) | Self::DeleteStart(error) | Self::Exec(error) => {
+                crate::net::is_namespace_missing_io_error(error)
+            }
+            _ => false,
+        }
+    }
 }
 
 pub type FirewallResult<T> = Result<T, FirewallError>;
@@ -264,9 +279,12 @@ fn namespace_rules_json(
     // "inet" would require "snat ip" qualifier which the JSON API doesn't support cleanly.
     let namespace_guardrail_rules =
         platform_guardrail_drop_rules_json("ip", SANDBOX_TABLE, "guardrails", "tap0");
-    // This rule must precede the packaged policy's established/related return.
+    // These rules must precede the packaged policy's established/related return.
     // A guest can otherwise forge the reverse tuple of a gateway-owned socket,
     // inherit its conntrack state, and reach the local socket without TPROXY.
+    // The MPTCP guard drops every guest segment carrying TCP option 30, in any
+    // conntrack state, before this namespace's TCP stack parses it. No gateway
+    // listener speaks MPTCP, so guest TCP is unaffected; non-TCP never matches.
     format!(
         r#"{{ "nftables": [
   {{ "add": {{ "table": {{ "family": "ip", "name": "{SANDBOX_TABLE}" }} }} }},
@@ -279,6 +297,16 @@ fn namespace_rules_json(
                      "right": "tap0", "op": "==" }} }},
       {{ "match": {{ "left": {{ "payload": {{ "protocol": "ip", "field": "saddr" }} }},
                      "right": "{guest_ip}", "op": "!=" }} }},
+      {{ "drop": null }}
+    ] }} }} }},
+  {{ "add": {{ "rule": {{ "family": "ip", "table": "{SANDBOX_TABLE}", "chain": "{PRE_TPROXY_GUARDRAILS_CHAIN}",
+    "comment": "{MPTCP_GUARD_COMMENT}",
+    "expr": [
+      {{ "match": {{ "left": {{ "meta": {{ "key": "iifname" }} }},
+                     "right": "tap0", "op": "==" }} }},
+      {{ "match": {{ "left": {{ "tcp option": {{ "name": "mptcp" }} }},
+                     "right": true, "op": "==" }} }},
+      {{ "counter": null }},
       {{ "drop": null }}
     ] }} }} }},
 {pre_tproxy_guardrail_rules},
@@ -307,6 +335,101 @@ fn namespace_rules_json(
     ] }} }} }}
 ] }}"#
     )
+}
+
+/// Install only for an execution with a DHCP responder. The narrow DHCP
+/// exception precedes source validation so a stale lease can receive a NAK.
+/// All other traffic retains the normal anti-spoofing policy.
+pub(crate) fn ensure_guest_dhcp_bootstrap(ns: &str) -> FirewallResult<()> {
+    let chain = nft_chain_json(Some(ns), "ip", SANDBOX_TABLE, PRE_TPROXY_GUARDRAILS_CHAIN)?;
+    let updates = guest_dhcp_bootstrap_updates(chain.as_ref())?;
+    if updates.is_empty() {
+        return Ok(());
+    }
+    apply_nft_json(
+        &serde_json::json!({"nftables": updates}).to_string(),
+        Some(ns),
+    )
+}
+
+fn guest_dhcp_bootstrap_updates(
+    chain: Option<&serde_json::Value>,
+) -> FirewallResult<Vec<serde_json::Value>> {
+    let desired = guest_dhcp_bootstrap_rule();
+    let expressions = |rule: &serde_json::Value| {
+        rule.get("expr")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| {
+                        let mut item = normalize_set_membership_op(item);
+                        if let Some(set) = item
+                            .pointer_mut("/match/right/set")
+                            .and_then(serde_json::Value::as_array_mut)
+                        {
+                            set.sort_by_key(serde_json::Value::to_string);
+                        }
+                        item
+                    })
+                    .collect::<Vec<_>>()
+            })
+    };
+    let rules = chain
+        .and_then(|chain| chain.get("nftables"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("rule"))
+        .collect::<Vec<_>>();
+    let owned = rules
+        .iter()
+        .filter(|rule| rule["comment"] == DHCP_BOOTSTRAP_COMMENT)
+        .count();
+    if owned == 1
+        && rules.first().is_some_and(|rule| {
+            rule["comment"] == DHCP_BOOTSTRAP_COMMENT && expressions(rule) == expressions(&desired)
+        })
+    {
+        return Ok(Vec::new());
+    }
+    // Repair old source-zero-only rules and duplicates in one transaction.
+    let mut updates = owned_rule_removals(
+        chain,
+        SANDBOX_TABLE,
+        PRE_TPROXY_GUARDRAILS_CHAIN,
+        DHCP_BOOTSTRAP_COMMENT,
+    )?;
+    updates.push(serde_json::json!({"insert": {"rule": desired}}));
+    Ok(updates)
+}
+
+fn guest_dhcp_proxy_rule() -> serde_json::Value {
+    serde_json::json!({
+        "family": "ip", "table": PROXY_TABLE, "chain": "prerouting",
+        "comment": "execution-local-dhcp",
+        "expr": [
+            {"match": {"left": {"meta": {"key": "iifname"}}, "right": "tap0", "op": "=="}},
+            {"match": {"left": {"payload": {"protocol": "udp", "field": "sport"}}, "right": 68, "op": "=="}},
+            {"match": {"left": {"payload": {"protocol": "udp", "field": "dport"}}, "right": 67, "op": "=="}},
+            {"match": {"left": {"payload": {"protocol": "ip", "field": "daddr"}}, "right": {"set": ["255.255.255.255", crate::net::GUEST_GATEWAY]}, "op": "=="}},
+            {"return": null}
+        ]
+    })
+}
+
+fn guest_dhcp_bootstrap_rule() -> serde_json::Value {
+    serde_json::json!({
+        "family": "ip", "table": SANDBOX_TABLE, "chain": PRE_TPROXY_GUARDRAILS_CHAIN,
+        "comment": DHCP_BOOTSTRAP_COMMENT,
+        "expr": [
+            {"match": {"left": {"meta": {"key": "iifname"}}, "right": "tap0", "op": "=="}},
+            {"match": {"left": {"payload": {"protocol": "ip", "field": "daddr"}}, "right": {"set": ["255.255.255.255", crate::net::GUEST_GATEWAY]}, "op": "=="}},
+            {"match": {"left": {"payload": {"protocol": "udp", "field": "sport"}}, "right": 68, "op": "=="}},
+            {"match": {"left": {"payload": {"protocol": "udp", "field": "dport"}}, "right": 67, "op": "=="}},
+            {"return": null}
+        ]
+    })
 }
 
 fn load_pre_tproxy_guardrail_rules() -> FirewallResult<String> {
@@ -439,16 +562,29 @@ const PROXY_TABLE: &str = "proxy";
 /// 6. Create "inbound" chain at priority -1 for guest port allowlist (empty = all closed).
 ///
 /// Requires policy routing to be set up separately via `setup_tproxy_policy_routing`.
-pub fn setup_netgtw_tproxy_rules(ns: &str, uid: u32, vpeer: &str) -> FirewallResult<()> {
+pub fn setup_netgtw_tproxy_rules(
+    ns: &str,
+    uid: u32,
+    vpeer: &str,
+    dhcp: bool,
+) -> FirewallResult<()> {
     ensure_namespace_forward_drop_rules(ns, vpeer)?;
-    apply_nft_json(&netgtw_tproxy_rules_json(uid), Some(ns))
+    apply_nft_json(&netgtw_tproxy_rules_json(uid, dhcp), Some(ns))
 }
 
-fn netgtw_tproxy_rules_json(uid: u32) -> String {
+fn netgtw_tproxy_rules_json(uid: u32, dhcp: bool) -> String {
     // This function exclusively owns proxy/prerouting and proxy/divert; other
     // callers must not add rules there. Rebuild both in one nft transaction so
     // legacy broad reply exceptions cannot survive ahead of the corrected rules.
     let guest_gateway = crate::net::GUEST_GATEWAY;
+    let dhcp_rule = if dhcp {
+        format!(
+            "{},",
+            serde_json::json!({"add": {"rule": guest_dhcp_proxy_rule()}})
+        )
+    } else {
+        String::new()
+    };
     format!(
         r#"{{ "nftables": [
   {{ "add": {{ "table": {{ "family": "ip", "name": "{PROXY_TABLE}" }} }} }},
@@ -458,6 +594,7 @@ fn netgtw_tproxy_rules_json(uid: u32) -> String {
     "type": "filter", "hook": "prerouting", "prio": -149 }} }} }},
   {{ "flush": {{ "chain": {{ "family": "ip", "table": "{PROXY_TABLE}", "name": "prerouting" }} }} }},
   {{ "flush": {{ "chain": {{ "family": "ip", "table": "{PROXY_TABLE}", "name": "divert" }} }} }},
+  {dhcp_rule}
   {{ "add": {{ "rule": {{ "family": "ip", "table": "{PROXY_TABLE}", "chain": "prerouting",
     "expr": [
       {{ "match": {{ "left": {{ "meta": {{ "key": "mark" }} }},
@@ -911,6 +1048,23 @@ fn validate_pre_tproxy_guardrails_chain(
         }),
         serde_json::json!({ "return": null }),
     ];
+    let mptcp_guard = [
+        serde_json::json!({
+            "match": {
+                "left": { "meta": { "key": "iifname" } },
+                "right": "tap0",
+                "op": "=="
+            }
+        }),
+        serde_json::json!({
+            "match": {
+                "left": { "tcp option": { "name": "mptcp" } },
+                "right": true,
+                "op": "=="
+            }
+        }),
+        serde_json::json!({ "drop": null }),
+    ];
     let source_guard_position = nft_chain_rule_position(pre_tproxy_guardrails, &source_guard)
         .ok_or_else(|| {
             FirewallValidationError::Missing(
@@ -928,6 +1082,17 @@ fn validate_pre_tproxy_guardrails_chain(
     if source_guard_position >= established_bypass_position {
         return Err(FirewallValidationError::Missing(
             "namespace tap0 guest source guard must precede established/related return".to_string(),
+        ));
+    }
+    let mptcp_guard_position = nft_chain_rule_position(pre_tproxy_guardrails, &mptcp_guard)
+        .ok_or_else(|| {
+            FirewallValidationError::Missing(
+                "namespace pre-TPROXY guardrails chain is missing tap0 MPTCP guard".to_string(),
+            )
+        })?;
+    if mptcp_guard_position >= established_bypass_position {
+        return Err(FirewallValidationError::Missing(
+            "namespace tap0 MPTCP guard must precede established/related return".to_string(),
         ));
     }
     let expected = packaged

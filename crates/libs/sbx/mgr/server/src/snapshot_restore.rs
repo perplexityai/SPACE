@@ -1501,30 +1501,15 @@ fn bounded_log_detail(detail: &str) -> String {
 async fn quarantine_recovery_plan_inner(
     sandbox_id: &str,
 ) -> Result<QuarantineRecoveryPlanResolution, RestoreError> {
-    let node_id = std::env::var("SPACE_NODE_ID")
-        .map_err(|_| RestoreError::ClusterApiUnconfigured("SPACE_NODE_ID is unset".to_string()))?;
-    let role = match std::env::var("SPACE_NODE_ROLE").ok().as_deref() {
-        Some("worker") | None => Some(pplx_space_node_api_client::proto::NodeRole::Worker as i32),
-        Some("builder") => Some(pplx_space_node_api_client::proto::NodeRole::Builder as i32),
-        Some(other) => {
-            return Err(RestoreError::Other(format!(
-                "unsupported SPACE_NODE_ROLE for quarantine recovery: {other}"
-            )));
-        }
-    };
+    let request = quarantine_recovery_plan_request(
+        sandbox_id,
+        &crate::service::NodeIdentitySource::from_process(),
+        std::env::var("SPACE_NODE_ROLE").ok().as_deref(),
+    )?;
     let mut cluster = pplx_space_node_api_client::cluster::connect_from_env()
         .await
         .map_err(restore_error_from_cluster_connect)?;
-    let plan = match cluster
-        .get_quarantine_recovery_plan(
-            pplx_space_node_api_client::proto::GetQuarantineRecoveryPlanRequest {
-                node_id,
-                sandbox_id: sandbox_id.to_string(),
-                role,
-            },
-        )
-        .await
-    {
+    let plan = match cluster.get_quarantine_recovery_plan(request).await {
         Ok(response) => response.into_inner(),
         Err(status) if status.code() == tonic::Code::NotFound => {
             return Ok(QuarantineRecoveryPlanResolution::NoProgress(
@@ -1549,6 +1534,34 @@ async fn quarantine_recovery_plan_inner(
         }
     };
     resolve_quarantine_recovery_plan_response(sandbox_id, plan)
+}
+
+fn quarantine_recovery_plan_request(
+    sandbox_id: &str,
+    node_identity: &crate::service::NodeIdentitySource,
+    node_role: Option<&str>,
+) -> Result<pplx_space_node_api_client::proto::GetQuarantineRecoveryPlanRequest, RestoreError> {
+    let node_id = node_identity.configured_node_id().ok_or_else(|| {
+        RestoreError::ClusterApiUnconfigured(
+            "neither SPACE_NODE_ID nor the node-id file names this node".to_string(),
+        )
+    })?;
+    let role = match node_role {
+        Some("worker") | None => Some(pplx_space_node_api_client::proto::NodeRole::Worker as i32),
+        Some("builder") => Some(pplx_space_node_api_client::proto::NodeRole::Builder as i32),
+        Some(other) => {
+            return Err(RestoreError::Other(format!(
+                "unsupported SPACE_NODE_ROLE for quarantine recovery: {other}"
+            )));
+        }
+    };
+    Ok(
+        pplx_space_node_api_client::proto::GetQuarantineRecoveryPlanRequest {
+            node_id,
+            sandbox_id: sandbox_id.to_string(),
+            role,
+        },
+    )
 }
 
 /// Turn a plan response into a resolution.
@@ -1755,6 +1768,14 @@ pub(crate) fn validate_restore_metadata_identity(
     target_sandbox_id: &str,
     expected_source_sandbox_id: &str,
 ) -> Result<(), RestoreError> {
+    if let Some(metadata) = meta.execution.as_ref() {
+        // Snapshot transport does not carry non-legacy image semantics.
+        pplx_space_node_runtime_core::boot::GuestProfile::resolve(
+            metadata.execution(),
+            Default::default(),
+        )
+        .map_err(|error| RestoreError::Other(error.to_string()))?;
+    }
     let expected_identity = if meta.artifact_origin == Some(ArtifactOrigin::Fork) {
         target_sandbox_id
     } else {

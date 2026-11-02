@@ -1447,14 +1447,23 @@ func (x *NormalizeWatchRootResponse) GetRoot() string {
 }
 
 type WatchRequest struct {
-	state                 protoimpl.MessageState `protogen:"open.v1"`
-	Path                  string                 `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"`
-	Recursive             bool                   `protobuf:"varint,2,opt,name=recursive,proto3" json:"recursive,omitempty"`
-	IncludeMetadataEvents bool                   `protobuf:"varint,3,opt,name=include_metadata_events,json=includeMetadataEvents,proto3" json:"include_metadata_events,omitempty"`
-	IncludeGlobs          []string               `protobuf:"bytes,4,rep,name=include_globs,json=includeGlobs,proto3" json:"include_globs,omitempty"`
-	ExcludeGlobs          []string               `protobuf:"bytes,5,rep,name=exclude_globs,json=excludeGlobs,proto3" json:"exclude_globs,omitempty"`
-	UseDefaultExcludes    *bool                  `protobuf:"varint,6,opt,name=use_default_excludes,json=useDefaultExcludes,proto3,oneof" json:"use_default_excludes,omitempty"`
-	User                  *string                `protobuf:"bytes,7,opt,name=user,proto3,oneof" json:"user,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Path  string                 `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"`
+	// A recursive watch leaves out what the caller can't reach and keeps
+	// watching the rest: a descendant directory it can't read, with its
+	// subtree, or the subdirectories of one it can read but not search. A later
+	// permission change on the directory where it stopped walks that part again,
+	// as does creating or renaming it; a watch remembers a bounded number of
+	// such directories. Changes that raise no file event, such as a
+	// security-policy update, don't, and files written while it was left out
+	// aren't reported.
+	// An unreadable root is refused at setup.
+	Recursive             bool     `protobuf:"varint,2,opt,name=recursive,proto3" json:"recursive,omitempty"`
+	IncludeMetadataEvents bool     `protobuf:"varint,3,opt,name=include_metadata_events,json=includeMetadataEvents,proto3" json:"include_metadata_events,omitempty"`
+	IncludeGlobs          []string `protobuf:"bytes,4,rep,name=include_globs,json=includeGlobs,proto3" json:"include_globs,omitempty"`
+	ExcludeGlobs          []string `protobuf:"bytes,5,rep,name=exclude_globs,json=excludeGlobs,proto3" json:"exclude_globs,omitempty"`
+	UseDefaultExcludes    *bool    `protobuf:"varint,6,opt,name=use_default_excludes,json=useDefaultExcludes,proto3,oneof" json:"use_default_excludes,omitempty"`
+	User                  *string  `protobuf:"bytes,7,opt,name=user,proto3,oneof" json:"user,omitempty"`
 	unknownFields         protoimpl.UnknownFields
 	sizeCache             protoimpl.SizeCache
 }
@@ -1913,8 +1922,10 @@ func (*RemoveWatcherResponse) Descriptor() ([]byte, []int) {
 type EnableFileChangesRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Empty selects /home/user and /tmp.
-	// Every selected root must be an accessible directory; setup fails rather
-	// than silently monitoring a subset. Create missing roots before enabling.
+	// Every selected root must be a readable directory. If any root is missing,
+	// isn't a directory or can't be read, setup fails rather than monitoring
+	// only the other roots. Create missing roots before enabling. Inside a root,
+	// descendants the caller can't reach are left out as for a recursive watch.
 	Roots              []string `protobuf:"bytes,1,rep,name=roots,proto3" json:"roots,omitempty"`
 	IncludeGlobs       []string `protobuf:"bytes,2,rep,name=include_globs,json=includeGlobs,proto3" json:"include_globs,omitempty"`
 	ExcludeGlobs       []string `protobuf:"bytes,3,rep,name=exclude_globs,json=excludeGlobs,proto3" json:"exclude_globs,omitempty"`

@@ -113,11 +113,11 @@ pub(super) async fn log_ecw_request(request: Request, next: Next) -> Response {
                 .map(str::to_owned)
         })
         .flatten();
-    // Informational X-Client-ID (e.g. `example-client`, `cleanup`) the caller sends;
-    // the per-client concurrency limiter drops it from its metric for bounded
-    // cardinality, so this log is the only place it survives for the top-N
-    // 429-sources-by-triplet view. A missing header logs the same `unspecified`
-    // string as the limiter's `client_scope` bucket, keeping the two aligned.
+    // Informational X-Client-ID (e.g. `example-client`, `cleanup`) the caller sends.
+    // The limiter's metrics carry it only when it's allowlisted (else
+    // `client_id:unknown`), so the top-N 429-sources-by-triplet view reads an
+    // unlisted ID from this log. A missing header logs the same `unspecified`
+    // string as the limiter's `client_scope` bucket.
     let client_id = log_raw_caller_metadata.then(|| {
         request_client_id(request.headers())
             .unwrap_or_else(|| ClientScope::Unspecified.as_str().to_string())

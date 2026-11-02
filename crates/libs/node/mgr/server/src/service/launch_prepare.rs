@@ -148,57 +148,54 @@ fn parse_execution_selection_mode(value: i32) -> Result<ExecutionSelectionMode, 
     }
 }
 
-fn sandbox_metadata_json(
+fn sandbox_metadata(
     req: &PrepareSandboxRequest,
     execution: pplx_space_common_core::types::ExecutionMetadata,
-) -> Result<Vec<u8>, Status> {
+) -> Result<pplx_space_common_core::types::SandboxArtifactMetadata, Status> {
     use std::str::FromStr;
 
     use pplx_space_common_core::types::{
         ContentHash, ORPHANED_SANDBOX_TEMPLATE, SandboxArtifactMetadata, SandboxId, TemplateName,
     };
 
-    if !req.metadata_json.is_empty() {
+    let sandbox_id = SandboxId::from_str(&req.sandbox_id)
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    let metadata = if !req.metadata_json.is_empty() {
         let mut metadata: SandboxArtifactMetadata = serde_json::from_str(&req.metadata_json)
             .map_err(|error| {
                 Status::invalid_argument(format!("invalid sandbox metadata: {error}"))
             })?;
-        let sandbox_id = SandboxId::from_str(&req.sandbox_id)
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
         if metadata.sandbox_id != sandbox_id {
             return Err(Status::invalid_argument(
                 "sandbox metadata id does not match request",
             ));
         }
         metadata.execution = execution;
-        return serde_json::to_vec_pretty(&metadata)
-            .map_err(|error| Status::internal(format!("serialize sandbox metadata: {error}")));
-    }
-
-    let sandbox_id = SandboxId::from_str(&req.sandbox_id)
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
-    let template = req
-        .artifact_template
-        .as_deref()
-        .or(req.template.as_deref())
-        .filter(|value| !value.is_empty())
-        .unwrap_or(ORPHANED_SANDBOX_TEMPLATE);
-    let template = TemplateName::parse(template)
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
-    let content_hash = req
-        .content_hash
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .map(ContentHash::from_str)
-        .transpose()
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
-    serde_json::to_vec_pretty(&SandboxArtifactMetadata::new(
-        sandbox_id,
-        execution,
-        template,
-        content_hash,
-    ))
-    .map_err(|error| Status::internal(format!("serialize sandbox metadata: {error}")))
+        metadata
+    } else {
+        let template = req
+            .artifact_template
+            .as_deref()
+            .or(req.template.as_deref())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(ORPHANED_SANDBOX_TEMPLATE);
+        let template = TemplateName::parse(template)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let content_hash = req
+            .content_hash
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .map(ContentHash::from_str)
+            .transpose()
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        SandboxArtifactMetadata::new(sandbox_id, execution, template, content_hash)
+    };
+    pplx_space_node_runtime_core::boot::GuestProfile::resolve(
+        &metadata.execution,
+        metadata.guest_image(),
+    )
+    .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    Ok(metadata)
 }
 
 fn write_sandbox_metadata_atomic(path: &Path, contents: &[u8]) -> Result<(), Status> {
@@ -349,7 +346,13 @@ impl NodeManagerService {
         let sandbox_uid =
             validate_sandbox_uid_gid(sandbox_id, req.uid, req.gid, lease.sandbox_uid)?;
         let ns_path = lease.ns_path();
-        let boot_kernel = if req.snapshot_restore && !standalone {
+        let boot_source = pplx_space_node_runtime_core::boot::BootSource::from_execution(
+            &resolved_execution.execution,
+        )
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        let boot_kernel = if (req.snapshot_restore && !standalone)
+            || boot_source == pplx_space_node_runtime_core::boot::BootSource::Uefi
+        {
             None
         } else {
             Some(
@@ -362,6 +365,23 @@ impl NodeManagerService {
                         Status::failed_precondition("resolved runtime is missing its boot kernel")
                     })?,
             )
+        };
+
+        let boot_firmware = if boot_source == pplx_space_node_runtime_core::boot::BootSource::Uefi {
+            Some(
+                resolved_execution
+                    .component(
+                        pplx_space_common_core::types::ArtifactComponentKind::Firmware,
+                        Some(&"firmware".parse().map_err(|error| {
+                            Status::internal(format!("firmware role: {error}"))
+                        })?),
+                    )
+                    .ok_or_else(|| {
+                        Status::failed_precondition("resolved runtime is missing its firmware")
+                    })?,
+            )
+        } else {
+            None
         };
 
         // Jailer chroot base on btrfs so hard-links to rootfs work (same filesystem).
@@ -529,8 +549,6 @@ impl NodeManagerService {
             .map_err(|e| Status::internal(e.to_string()))??;
         }
 
-        let kernel_dst = format!("{jail_root}/vmlinux.bin");
-
         // Chown jail root to sandbox UID (--no-dereference to avoid symlink
         // attacks). A partial chown leaves root-owned files in the jail, so
         // refuse the launch rather than boot a sandbox on an inconsistent jail.
@@ -544,18 +562,19 @@ impl NodeManagerService {
         )
         .await?;
 
-        // Firecracker restores without a kernel file; CH also validates the
-        // saved payload and creates its Landlock rule during restore. Link the
-        // authenticated image after chown: its inode is shared with other jails
-        // and must remain root-owned and unwritable by the sandbox UID.
-        if let Some(kernel) = boot_kernel {
-            let kernel_src = kernel.path.clone();
+        // CH restore also needs authenticated boot inputs. Inputs are linked after
+        // chown: their root-owned inodes are shared with the authenticated
+        // cache and must never be handed to the sandbox UID.
+        for (component, name) in [(boot_kernel, "vmlinux.bin"), (boot_firmware, "firmware.fd")] {
+            let Some(component) = component else { continue };
+            let source = component.path.clone();
+            let destination = PathBuf::from(&jail_root).join(name);
             use pplx_space_node_runtime_core::authenticated_source::{
                 AuthenticatedFile, Authentication,
             };
-            let authentication = match kernel.integrity {
+            let authentication = match component.integrity {
                 ExecutionSourceIntegrity::FsVerity => Some(Authentication::FsVerity(
-                    kernel
+                    component
                         .metadata
                         .digest
                         .map(pplx_space_node_runtime_core::catalog::compiled_verity_digest)
@@ -564,14 +583,14 @@ impl NodeManagerService {
                         .flatten()
                         .ok_or_else(|| {
                             Status::failed_precondition(
-                                "sealed boot kernel has no trusted measurement",
+                                "sealed boot component has no trusted measurement",
                             )
                         })?,
                 )),
                 ExecutionSourceIntegrity::CatalogSha256 if standalone => Some(
-                    Authentication::CatalogSha256(kernel.metadata.digest.ok_or_else(|| {
+                    Authentication::CatalogSha256(component.metadata.digest.ok_or_else(|| {
                         Status::failed_precondition(
-                            "authenticated boot kernel has no catalog digest",
+                            "authenticated boot component has no catalog digest",
                         )
                     })?),
                 ),
@@ -582,23 +601,25 @@ impl NodeManagerService {
             spawn_lifecycle_blocking(&_lifecycle_permit, move || {
                 if let Some(authentication) = authentication {
                     let file =
-                        AuthenticatedFile::open(&kernel_src, authentication).map_err(|error| {
+                        AuthenticatedFile::open(&source, authentication).map_err(|error| {
                             if error.is_transient() {
                                 Status::internal(error.to_string())
                             } else {
                                 Status::failed_precondition(error.to_string())
                             }
                         })?;
-                    file.link_to(std::path::Path::new(&kernel_dst))
+                    file.link_to(std::path::Path::new(&destination))
                 } else {
-                    std::fs::hard_link(&kernel_src, &kernel_dst)
+                    std::fs::hard_link(&source, &destination)
                 }
                 .map_err(|error| {
-                    Status::internal(format!("cannot hard-link kernel into jail: {error}"))
+                    Status::internal(format!(
+                        "cannot hard-link boot component into jail: {error}"
+                    ))
                 })
             })
             .await
-            .map_err(|e| Status::internal(format!("link kernel task failed: {e}")))??;
+            .map_err(|e| Status::internal(format!("link boot component task failed: {e}")))??;
         }
 
         // For snapshot restore: start FC idle (no config, just API socket)
@@ -653,6 +674,7 @@ impl NodeManagerService {
                 self.standalone_configuration(
                     runtime,
                     PathBuf::from(format!("{jail_root}/vm-config.json")),
+                    boot_source,
                 )
                 .await?,
             )
@@ -679,6 +701,14 @@ impl NodeManagerService {
             resource_limits: Some(self.launch_cgroup_limits(req)),
             verified_runtime,
         };
+        if self
+            .recorded_guest_profile(sandbox_id.to_owned())
+            .await?
+            .is_some_and(|profile| profile.uses_dhcp())
+        {
+            self.ensure_guest_dhcp(sandbox_id, req.execution_fence.as_ref())
+                .await?;
+        }
         let launched = self.launch_admitted_runtime(sandbox_id, request).await?;
         let fc_pid = launched.pid;
         if let Err(error) = self.pool.set_pid(sandbox_id, fc_pid) {
@@ -829,7 +859,10 @@ impl NodeManagerService {
             .resolve_bound_execution(requested_runtime.as_ref(), runtime, selection_mode)
             .await?;
         log_resolved_execution("prepare", sandbox_id, &runtime_installation.execution);
-        let sandbox_metadata = sandbox_metadata_json(req, runtime_installation.execution.clone())?;
+        let metadata = sandbox_metadata(req, runtime_installation.execution.clone())?;
+        let disk_layout = metadata.guest_image().disk();
+        let sandbox_metadata = serde_json::to_vec_pretty(&metadata)
+            .map_err(|error| Status::internal(format!("serialize sandbox metadata: {error}")))?;
         let lifecycle_permit = self
             .lifecycle_limiter
             .acquire(crate::lifecycle_limiter::LifecycleMethod::PrepareSandbox)
@@ -973,7 +1006,7 @@ impl NodeManagerService {
                     trusted_paths::create_directory(Path::new(&snapshots_dir_b))?;
 
                     if let Some(rootfs_size_mb) = rootfs_size_mb {
-                        resize_ext4_rootfs(&rootfs_path_b, rootfs_size_mb)?;
+                        resize_guest_disk(&rootfs_path_b, rootfs_size_mb, disk_layout)?;
                     }
                 }
 
@@ -1109,7 +1142,11 @@ fn protected_launch_environment(
     }
 }
 
-fn resize_ext4_rootfs(rootfs_path: &str, rootfs_size_mb: u32) -> Result<(), Status> {
+fn resize_guest_disk(
+    rootfs_path: &str,
+    rootfs_size_mb: u32,
+    layout: pplx_space_common_core::types::guest_image::GuestDiskLayout,
+) -> Result<(), Status> {
     let target_bytes = validate_rootfs_mib(rootfs_size_mb)
         .map_err(|error| Status::invalid_argument(error.to_string()))?
         .as_bytes();
@@ -1136,6 +1173,9 @@ fn resize_ext4_rootfs(rootfs_path: &str, rootfs_size_mb: u32) -> Result<(), Stat
     backing
         .resize(target_bytes)
         .map_err(super::artifact_fs::error)?;
+    if layout == pplx_space_common_core::types::guest_image::GuestDiskLayout::OpaqueRawDisk {
+        return Ok(());
+    }
     // These tools must see the pinned inode too, not a cache pathname which
     // could be replaced after set_len. The loop detaches when this scope ends.
     let device = crate::device_backing::LoopDevice::attach(&backing, false)

@@ -460,6 +460,7 @@ fn insert_owned_sandbox(conn: &crate::db::Connection, id: &str, owner: &str) {
     crate::db::insert_sandbox(
         conn,
         crate::db::InsertSandboxParams {
+            guest_image: Default::default(),
             id,
             uuid8: &SandboxRuntimeLabel::from_sandbox_id(sandbox_id),
             state: SandboxState::Started,
@@ -982,6 +983,7 @@ fn insert_armed_pool_clone(
     crate::db::insert_sandbox_with_cleanup_episode_and_route_evidence(
         conn,
         crate::db::InsertSandboxParams {
+            guest_image: Default::default(),
             id: &id.to_string(),
             uuid8: &SandboxRuntimeLabel::from_sandbox_id(id),
             state: SandboxState::Creating,

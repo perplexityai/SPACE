@@ -225,6 +225,41 @@ async fn process_interactive_control_rejects_legacy_guest_version_without_forwar
 }
 
 #[tokio::test]
+async fn interactive_control_readiness_refresh_relays_guest_status_without_not_ready_mark() {
+    let temp_dir = tempfile::tempdir().expect("temp dir created");
+    let bridge_guest_socket = temp_dir.path().join("spaced-bridge-guest.sock");
+    let interactive_calls = Arc::new(AtomicUsize::new(0));
+    let bridge_task = start_mock_bridge_guest_with_service(
+        bridge_guest_socket.clone(),
+        MockBridgeGuest {
+            wait_ready_not_ready_mark: true,
+            interactive_process_control_calls: Some(interactive_calls.clone()),
+            ..MockBridgeGuest::default()
+        },
+    )
+    .await;
+    let fixture = HostFixture::start(Some(bridge_guest_socket)).await;
+    let client = fixture.client().await;
+
+    // No WaitReady first: SendInput refreshes readiness itself and returns
+    // the guest's answer.
+    let error = client
+        .send_input("proc-1".into(), b"hello stdin\n".to_vec())
+        .await
+        .expect_err("guest readiness refusal is returned");
+    assert_eq!(error.code(), tonic::Code::Unavailable);
+    assert_eq!(error.message(), "guest marked itself not ready");
+    assert_eq!(
+        pplx_space_common_grpc::RetryableNotReady::from_status(&error),
+        None
+    );
+    assert_eq!(interactive_calls.load(Ordering::SeqCst), 0);
+
+    fixture.stop().await;
+    bridge_task.abort();
+}
+
+#[tokio::test]
 async fn process_connect_and_kill_relay_to_guest_bridge() {
     let temp_dir = tempfile::tempdir().expect("temp dir created");
     let bridge_guest_socket = temp_dir.path().join("spaced-bridge-guest.sock");

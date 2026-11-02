@@ -64,6 +64,46 @@
           "family": "ip",
           "table": "sandbox",
           "chain": "pre_tproxy_guardrails",
+          "comment": "drop-guest-mptcp",
+          "expr": [
+            {
+              "match": {
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "tap0",
+                "op": "=="
+              }
+            },
+            {
+              "match": {
+                "left": {
+                  "tcp option": {
+                    "name": "mptcp"
+                  }
+                },
+                "right": true,
+                "op": "=="
+              }
+            },
+            {
+              "counter": null
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "family": "ip",
+          "table": "sandbox",
+          "chain": "pre_tproxy_guardrails",
           "comment": "pre-tproxy-allow-established-related",
           "expr": [
             {

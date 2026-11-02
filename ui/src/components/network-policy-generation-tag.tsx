@@ -2,6 +2,7 @@
 
 import { WarningOutlined } from '@ant-design/icons';
 import { Tag, Tooltip } from 'antd';
+import { networkPolicyTagText } from '@/lib/network-policy';
 
 interface NetworkPolicyGenerationTagProps {
   desired: number | null | undefined;
@@ -41,16 +42,18 @@ export default function NetworkPolicyGenerationTag({
   observedSource,
 }: NetworkPolicyGenerationTagProps) {
   if (!desired) return null;
-  const label = policyLabel ? `g${desired}(${policyLabel})` : `g${desired}`;
+  const text = networkPolicyTagText(policyLabel, desired, applied);
+  const label = text.label;
   const sourceMatches = !desiredSource || !observedSource || desiredSource === observedSource;
   const tooltipTitle = () => {
     const current = generationLabel(observedSource ?? desiredSource, applied);
+    const summary = `${text.meaning}\n${text.sync}`;
     if (applied === desired && sourceMatches) {
-      return <span style={{ whiteSpace: 'pre-line' }}>{`current: ${current}`}</span>;
+      return <span style={{ whiteSpace: 'pre-line' }}>{`${summary}\ncurrent: ${current}`}</span>;
     }
     return (
       <span style={{ whiteSpace: 'pre-line' }}>
-        {`desired: ${generationLabel(desiredSource, desired)}\ncurrent: ${current}`}
+        {`${summary}\ndesired: ${generationLabel(desiredSource, desired)}\ncurrent: ${current}`}
       </span>
     );
   };

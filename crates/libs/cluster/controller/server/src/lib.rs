@@ -136,13 +136,16 @@ pub async fn run(
         .await
         .map_err(RunClusterControllerError::Substrate)?;
 
-    // Contend for cluster-controller leadership — but only on a substrate that
-    // `contends_for_leader_lease` (Kubernetes: an apiserver to host the
-    // `Lease`, and a multi-replica Deployment). Only the lease holder runs the
-    // reconciler set: two concurrent runners would double-provision the warm
-    // pool and double-drive every CAS loop. The Direct substrate is a single
-    // local process, so it runs the reconcilers unconditionally; likewise the
-    // kill-switch (which then assumes a single replica).
+    // Contend for cluster-controller leadership when the process runs in a
+    // Kubernetes pod, where an apiserver hosts the `Lease` and a Deployment may
+    // run several replicas, whichever substrate places the sandboxes, or when
+    // the substrate drives the Kubernetes API, whose client reaches that
+    // apiserver from anywhere (`LeaderElectionConfig::election` owns the rule).
+    // Only the lease holder runs the reconciler set: two concurrent runners
+    // would double-drive every dispatcher, sweeper and CAS loop. A Direct
+    // process outside a pod runs the reconcilers unconditionally, which
+    // assumes it is the only instance; likewise the kill-switch (which then
+    // assumes a single replica).
     let le_config = leader_election::LeaderElectionConfig::from_env();
     // Bound out here, not inside the branch that creates it: the readiness
     // marker's writer task lives only as long as a handle does, and a
@@ -151,57 +154,66 @@ pub async fn run(
     // immediately.
     let mut _readiness = None;
     let authority: leader_election::ReconcilerAuthority<leader_election::KubeLeaseStore> =
-        if le_config.contends(substrate.capabilities()) {
-            // Renewals and standby polls are the idle steady state, so the
-            // lease gets a client that records spans only for failures.
-            // The renewal in flight at shutdown is abandoned, not failed.
-            let lease_client =
-                pplx_space_common_svc::kube_client::failure_traced_kube_client_from_env(
-                    shutdown_token.clone(),
-                )
-                .await
-                .map_err(RunClusterControllerError::LeaseClient)?;
-            let store = std::sync::Arc::new(leader_election::KubeLeaseStore::new(
-                lease_client,
-                &config.lease_namespace,
-            ));
-            tracing::info!(
-                identity = %le_config.identity,
-                liveness_budget_secs = le_config
-                    .lease_failure_grace
-                    .map(|g| g.get().as_secs_f64()),
-                "{SERVICE_NAME} contending for leadership"
-            );
-            // `resolve` owns the outcome-to-action mapping so it can be
-            // tested; the arms below only carry it out. The liveness exit
-            // must be non-zero: retrying in-process won't recover a wedged
-            // client, and a NotReady-forever standby that nothing restarts
-            // is the gap this closes. The error log that precedes it already
-            // carries the identity, the measured window and the budget, so
-            // this only has to be the exit.
-            match leader_election::campaign(store, le_config, shutdown_token.clone())
-                .await
-                .resolve()
-            {
-                leader_election::CampaignAction::ExitZero => {
-                    tracing::info!("{SERVICE_NAME} asked to shut down before winning leadership");
-                    return Ok(());
-                }
-                leader_election::CampaignAction::ExitNonZero => {
-                    return Err(RunClusterControllerError::LeaseUnreachable);
-                }
-                leader_election::CampaignAction::Lead(leadership) => {
-                    tracing::info!("{SERVICE_NAME} elected leader; starting reconcilers");
-                    leader_election::ReconcilerAuthority::Leader(leadership)
+        match le_config.election(
+            leader_election::ProcessHost::from_env(),
+            substrate.capabilities(),
+        ) {
+            leader_election::Election::Contend => {
+                // Renewals and standby polls are the idle steady state, so the
+                // lease gets a client that records spans only for failures.
+                // The renewal in flight at shutdown is abandoned, not failed.
+                let lease_client =
+                    pplx_space_common_svc::kube_client::failure_traced_kube_client_from_env(
+                        shutdown_token.clone(),
+                    )
+                    .await
+                    .map_err(RunClusterControllerError::LeaseClient)?;
+                let store = std::sync::Arc::new(leader_election::KubeLeaseStore::new(
+                    lease_client,
+                    &config.lease_namespace,
+                ));
+                tracing::info!(
+                    identity = %le_config.identity,
+                    liveness_budget_secs = le_config
+                        .lease_failure_grace
+                        .map(|g| g.get().as_secs_f64()),
+                    "{SERVICE_NAME} contending for leadership"
+                );
+                // `resolve` owns the outcome-to-action mapping so it can be
+                // tested; the arms below only carry it out. The liveness exit
+                // must be non-zero: retrying in-process won't recover a wedged
+                // client, and a NotReady-forever standby that nothing restarts
+                // is the gap this closes. The error log that precedes it already
+                // carries the identity, the measured window and the budget, so
+                // this only has to be the exit.
+                match leader_election::campaign(store, le_config, shutdown_token.clone())
+                    .await
+                    .resolve()
+                {
+                    leader_election::CampaignAction::ExitZero => {
+                        tracing::info!(
+                            "{SERVICE_NAME} asked to shut down before winning leadership"
+                        );
+                        return Ok(());
+                    }
+                    leader_election::CampaignAction::ExitNonZero => {
+                        return Err(RunClusterControllerError::LeaseUnreachable);
+                    }
+                    leader_election::CampaignAction::Lead(leadership) => {
+                        tracing::info!("{SERVICE_NAME} elected leader; starting reconcilers");
+                        leader_election::ReconcilerAuthority::Leader(leadership)
+                    }
                 }
             }
-        } else {
-            tracing::info!(
-                "{SERVICE_NAME} running reconcilers without leader election \
-                     (direct substrate or kill-switch); this assumes a single replica"
-            );
-            _readiness = Some(leader_election::signal_ready(&le_config));
-            leader_election::ReconcilerAuthority::ElectionDisabled
+            leader_election::Election::Skip(reason) => {
+                tracing::info!(
+                    %reason,
+                    "{SERVICE_NAME} running reconcilers without leader election ({reason}); \
+                     this assumes a single replica"
+                );
+                _readiness = Some(leader_election::signal_ready(&le_config));
+                leader_election::ReconcilerAuthority::ElectionDisabled
+            }
         };
 
     // Drive the reconcilers off the leadership token (cancelled on process

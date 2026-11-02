@@ -5,7 +5,7 @@ use crate::db::Connection;
 use crate::db::db_private_outside_tests;
 use pplx_space_common_core::types::{
     ExecutionGeneration, NodeId, NodeManagedBy, PodUid, RouteGeneration,
-    SandboxActivationAttemptId, SpaceApiRouteIdentity,
+    SandboxActivationAttemptId, SandboxTransitionReceiptKind, SpaceApiRouteIdentity,
 };
 use pplx_space_sqlite::SqliteU64;
 use rusqlite::params;
@@ -126,6 +126,40 @@ db_private_outside_tests! {
                 claim.pod_uid.as_str(),
                 claim.activation_attempt_id.to_string(),
                 RouteIdentityProvenance::ClusterFenced.as_str(),
+            ],
+            |row| row.get(0),
+        )
+    }
+}
+
+db_private_outside_tests! {
+    /// Whether this node rolled back the activation of `claim`, which the caller
+    /// has matched as the open claim: the row carries an activation-rollback
+    /// receipt for the claim's execution generation. Every activation clears the
+    /// receipt when it begins and writes the claim, so while the claim still
+    /// matches, such a receipt can only come from that activation's own rollback
+    /// cleanup, which kept the claim open. The receipt names the operation's
+    /// attempt, which an API-driven wake may carry apart from the route attempt
+    /// the claim holds, so the attempt isn't compared. Some later state writes
+    /// clear the receipt and some keep it; either way the activation that
+    /// follows has to claim the row from the state the rollback left.
+    fn claim_rolled_back(
+        conn: &Connection,
+        sandbox_id: &str,
+        claim: &OpenRouteActivationClaim,
+    ) -> crate::db::Result<bool> {
+        conn.query_row(
+            "SELECT EXISTS (
+                 SELECT 1
+                   FROM sandboxes
+                  WHERE id = ?1
+                    AND transition_receipt_kind = ?2
+                    AND transition_receipt_execution_generation = ?3
+             )",
+            params![
+                sandbox_id,
+                SandboxTransitionReceiptKind::ActivationRollback.as_str(),
+                claim.execution_generation.get(),
             ],
             |row| row.get(0),
         )

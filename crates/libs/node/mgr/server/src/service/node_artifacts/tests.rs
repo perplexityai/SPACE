@@ -591,11 +591,52 @@ async fn legacy_runtime_placement_is_not_hidden_by_a_compiled_environment() {
         .unwrap()
         .into_inner();
     assert!(report.runtimes.iter().any(|entry| {
-        entry
-            .runtime
-            .as_ref()
-            .is_some_and(|runtime| runtime.version == "1.17.0")
+        entry.runtime.as_ref().is_some_and(|runtime| {
+            runtime.version == "1.17.0" && entry.version_sort_key == [1, 17, 0]
+        })
     }));
+    // The legacy copy is placement evidence only. The observation still names
+    // the whole compiled catalog, and no binding it never verified as usable.
+    let observation =
+        pplx_space_execution_common::environment::EnvironmentObservation::from_inventory(&report)
+            .unwrap()
+            .expect("current nodes publish an environment observation");
+    let catalog =
+        pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(Arch::X86_64)
+            .unwrap();
+    assert_eq!(observation.known().len(), catalog.len());
+    for entry in &catalog {
+        assert!(observation.get(entry.definition().reference()).is_some());
+    }
+    assert!(observation.usable().is_empty());
+    // Published definitions use the generic representation only.
+    for known in &report.environments.as_ref().unwrap().known {
+        assert_eq!(
+            known.definition.as_ref().unwrap().schema_version,
+            pplx_space_execution_common::environment::RUNTIME_NEUTRAL_ENVIRONMENT_SCHEMA_VERSION
+        );
+    }
+    // A policy validated against E0 alone, as when its catalog failed to load,
+    // doesn't shrink what the build reports as known.
+    let initial =
+        pplx_space_node_runtime_core::catalog::InitialEnvironment::for_architecture(Arch::X86_64)
+            .unwrap()
+            .compiled_environment()
+            .unwrap();
+    service.set_startup_execution_policy_for_test(
+        pplx_space_node_runtime_core::selection::ExecutionPolicy::parse(None, None, &[initial])
+            .unwrap(),
+    );
+    let report = service
+        .get_execution_inventory(root_request(crate::proto::GetExecutionInventoryRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+    let observation =
+        pplx_space_execution_common::environment::EnvironmentObservation::from_inventory(&report)
+            .unwrap()
+            .unwrap();
+    assert_eq!(observation.known().len(), catalog.len());
 }
 
 #[test]

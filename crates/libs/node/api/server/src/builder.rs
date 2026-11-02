@@ -2,10 +2,8 @@ use crate::clients::BackendClients;
 use crate::node_ctl;
 use crate::proto::builder_api_server::BuilderApi;
 use crate::proto::{
-    BuildTemplateResponse, RefreshFacetStateRequest, RefreshFacetStateResponse,
-    TriggerStateReconciliationRequest, TriggerStateReconciliationResponse,
+    BuildTemplateResponse, TriggerStateReconciliationRequest, TriggerStateReconciliationResponse,
 };
-use crate::restart_handoff::RpcReplaySafety;
 use pplx_space_build_mgr_client::proto as build_proto;
 use pplx_space_common_core::types::{NodeId, SystemTemplate};
 use pplx_space_common_grpc::{RequestAdmission, fwd_retry};
@@ -68,60 +66,8 @@ macro_rules! fwd {
     };
 }
 
-// Sandbox-manager forwards must survive a restart handoff: the drain
-// interceptor can mark any RPC, so writers replay on proof and reads replay
-// broadly, exactly as on the worker surface.
-macro_rules! fwd_sbx_handoff {
-    ($service:expr, $method:literal, $safety:expr, $rpc:ident, $req:expr) => {
-        crate::restart_handoff::call_with_restart_handoff(
-            $method,
-            $safety,
-            $req,
-            $service.clients.sbx(),
-            |mut client, request| async move { client.$rpc(request).await },
-        )
-        .await
-    };
-}
-
 #[tonic::async_trait]
 impl BuilderApi for BuilderApiService {
-    // ── Sandbox query + cleanup (sandbox-manager) ────────────────────────────
-
-    async fn sandbox_state(
-        &self,
-        r: Request<pplx_space_sbx_mgr_client::proto::StateRequest>,
-    ) -> Result<Response<pplx_space_sbx_mgr_client::proto::StateResponse>, Status> {
-        fwd_sbx_handoff!(self, "SandboxState", RpcReplaySafety::ReadOnly, state, r)
-    }
-
-    async fn list_sandboxes(
-        &self,
-        r: Request<pplx_space_sbx_mgr_client::proto::ListRequest>,
-    ) -> Result<Response<pplx_space_sbx_mgr_client::proto::ListResponse>, Status> {
-        fwd_sbx_handoff!(self, "ListSandboxes", RpcReplaySafety::ReadOnly, list, r)
-    }
-
-    async fn stop_sandbox(
-        &self,
-        r: Request<pplx_space_sbx_mgr_client::proto::StopRequest>,
-    ) -> Result<Response<pplx_space_sbx_mgr_client::proto::StopResponse>, Status> {
-        fwd_sbx_handoff!(self, "StopSandbox", RpcReplaySafety::RequiresProof, stop, r)
-    }
-
-    async fn delete_sandbox(
-        &self,
-        r: Request<pplx_space_sbx_mgr_client::proto::DeleteRequest>,
-    ) -> Result<Response<pplx_space_sbx_mgr_client::proto::DeleteResponse>, Status> {
-        fwd_sbx_handoff!(
-            self,
-            "DeleteSandbox",
-            RpcReplaySafety::RequiresProof,
-            delete,
-            r
-        )
-    }
-
     // ── Template management (template-manager) ──────────────────────────────
 
     async fn delete_template(
@@ -142,86 +88,7 @@ impl BuilderApi for BuilderApiService {
         fwd!(self.clients.tmpl(), delete_template_build, r)
     }
 
-    async fn list_templates(
-        &self,
-        r: Request<pplx_space_template_mgr_client::proto::ListTemplatesRequest>,
-    ) -> Result<Response<pplx_space_template_mgr_client::proto::ListTemplatesResponse>, Status>
-    {
-        fwd_retry!("template-manager", self.clients.tmpl(), list_templates, r)
-    }
-
-    async fn get_template(
-        &self,
-        mut r: Request<pplx_space_template_mgr_client::proto::GetTemplateRequest>,
-    ) -> Result<Response<pplx_space_template_mgr_client::proto::GetTemplateResponse>, Status> {
-        let scope = crate::template_lookup::bind_caller_scope(&mut r)?;
-        let response = fwd_retry!("template-manager", self.clients.tmpl(), get_template, r)?;
-        scope.observe_response(&response)?;
-        Ok(response)
-    }
-
-    async fn update_template_settings(
-        &self,
-        r: Request<pplx_space_template_mgr_client::proto::UpdateTemplateSettingsRequest>,
-    ) -> Result<
-        Response<pplx_space_template_mgr_client::proto::UpdateTemplateSettingsResponse>,
-        Status,
-    > {
-        // A policy-bearing template update sets the default network or
-        // auto-lifecycle policy inherited by every sandbox of this template, so
-        // it must be gated on the same control-plane capability as the sandbox
-        // policy RPCs.
-        let req = r.get_ref();
-        if req.network_policy.is_some() || req.default_auto_lifecycle.is_some() {
-            crate::worker::require_policy_mutation_authority(&r)?;
-        }
-        fwd!(self.clients.tmpl(), update_template_settings, r)
-    }
-
-    async fn update_template_snapshot_policy(
-        &self,
-        r: Request<pplx_space_template_mgr_client::proto::UpdateTemplateSnapshotPolicyRequest>,
-    ) -> Result<
-        Response<pplx_space_template_mgr_client::proto::UpdateTemplateSnapshotPolicyResponse>,
-        Status,
-    > {
-        fwd!(self.clients.tmpl(), update_template_snapshot_policy, r)
-    }
-
-    // ── Template pools (template-manager) ────────────────────────────────────
-
-    async fn create_pool(
-        &self,
-        r: Request<pplx_space_template_mgr_client::proto::CreatePoolRequest>,
-    ) -> Result<Response<pplx_space_template_mgr_client::proto::CreatePoolResponse>, Status> {
-        pplx_space_common_svc::auth::template::require_template_mutation_authority(&r)?;
-        fwd!(self.clients.tmpl(), create_pool, r)
-    }
-
-    async fn delete_pool(
-        &self,
-        r: Request<pplx_space_template_mgr_client::proto::DeletePoolRequest>,
-    ) -> Result<Response<pplx_space_template_mgr_client::proto::DeletePoolResponse>, Status> {
-        pplx_space_common_svc::auth::template::require_template_mutation_authority(&r)?;
-        fwd!(self.clients.tmpl(), delete_pool, r)
-    }
-
-    async fn pool_status(
-        &self,
-        r: Request<pplx_space_template_mgr_client::proto::PoolStatusRequest>,
-    ) -> Result<Response<pplx_space_template_mgr_client::proto::PoolStatusResponse>, Status> {
-        fwd_retry!("template-manager", self.clients.tmpl(), pool_status, r)
-    }
-
     // ── Custom orchestration ─────────────────────────────────────────────────
-
-    async fn refresh_facet_state(
-        &self,
-        r: Request<RefreshFacetStateRequest>,
-    ) -> Result<Response<RefreshFacetStateResponse>, Status> {
-        node_ctl::refresh_facet_state(r.into_inner()).await?;
-        Ok(Response::new(RefreshFacetStateResponse {}))
-    }
 
     async fn trigger_state_reconciliation(
         &self,
@@ -260,7 +127,8 @@ impl BuilderApi for BuilderApiService {
         &self,
         _r: Request<crate::proto::ListNodeTemplatesRequest>,
     ) -> Result<Response<crate::proto::ListNodeTemplatesResponse>, Status> {
-        let request = Request::new(pplx_space_template_mgr_client::proto::ListTemplatesRequest {});
+        let request =
+            Request::new(pplx_space_template_mgr_client::proto::ListTemplatesRequest::default());
         let resp = fwd_retry!(
             "template-manager",
             self.clients.tmpl(),

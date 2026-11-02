@@ -1071,6 +1071,22 @@ Unmapped callers are `other`; requests rejected by middleware or extractors
 before reaching the handler may have no class. Do not silently count either as
 interactive traffic.
 
+`sandbox.reconnect.attempts` and `sandbox.reconnect.duration_ms` also carry
+`client_id`, and `sandbox.api.client_concurrency.decision` carries it next to
+`client_scope`. Its value is the caller's trimmed `X-Client-ID` when the per-client
+concurrency limiter lists it (`SPACE_API_CLIENT_CONCURRENCY_KNOWN_CLIENTS` or a
+runtime quota override key) as a valid, unreserved entry (see
+`docs/configuration.md`), else `unknown`, so it names allowlisted callers that
+`client_class` folds into `other` without letting a caller mint new series. On
+the limiter decision, `client_scope:unspecified` always reports `client_id:unknown`.
+A process names at most 64 override-only callers over its lifetime; past that,
+a new override-only caller keeps its own limiter bucket but reports
+`client_id:overflow`. Which callers fit is first-come per process, so replicas
+can disagree once the cap fills. While the limiter is off it resolves against
+the static list only. Reconnects through the data-plane entrypoint aren't
+attributed and report `unknown`.
+Deployments that filter tags by key must keep `client_id` on these metrics.
+
 Two independent signals describe a restore:
 
 | Signal | Evidence and limits |

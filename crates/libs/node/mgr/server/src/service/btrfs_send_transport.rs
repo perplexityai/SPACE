@@ -11,7 +11,8 @@ use uuid::Uuid;
 use super::{NodeManagerService, artifact_fs, btrfs_send_source, trusted_paths};
 use crate::proto::*;
 
-pub(in crate::service) mod framing;
+#[cfg(target_os = "linux")]
+use super::btrfs_send_stream as framing;
 #[cfg(all(test, target_os = "linux"))]
 mod tests;
 
@@ -46,6 +47,7 @@ fn framing_status(error: framing::FramingError) -> Status {
     let reason = match error {
         FramingError::BadMagic => Rejection::BadMagic,
         FramingError::Version(_) => Rejection::Version,
+        FramingError::Command { .. } => Rejection::Command,
         FramingError::CommandTooLarge { .. } => Rejection::CommandTooLarge,
         FramingError::Crc { .. } => Rejection::Crc,
         FramingError::DataAfterEnd { .. } => Rejection::DataAfterEnd,

@@ -11,6 +11,7 @@ use pplx_space_node_api_sim::{SandboxRecord, SimState, SimWorkerHarness};
 use pplx_space_placement::test_support::stored_lifecycle_matrix;
 use sqlx::PgPool;
 
+mod idle_suspended;
 mod restore_lease_completion;
 mod substrate_scope;
 
@@ -3119,6 +3120,7 @@ async fn live_cpu_update_preserves_allocation_across_cold_restart() -> TestResul
                 .retire_execution(RetireExecutionRequest {
                     sandbox_id,
                     fence: super::super::RetireFence::Unobserved,
+                    stop_route: super::super::RetireStopRoute::Execution,
                 })
                 .await?;
             fixture

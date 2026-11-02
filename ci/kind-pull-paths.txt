@@ -9,11 +9,15 @@ ci/kind-pull-paths.txt
 ci/scripts/kind-pull-needed.sh
 infra/space/kind/**
 scripts/tests/smoke-kind-*.sh
+# Every shard runs the bring-up recorder; its steps tolerate failure, so only
+# a Kind run shows that a change to it still records.
+scripts/benchmarks/kind-bringup-timeline.py
 scripts/tests/lib/bootstrap-kind-stack.sh
 space_smoke/**
 Tiltfile
 docker/Dockerfile.rust-build-kind
 docker/Dockerfile.worker
+docker/build-btrfs-progs.sh
 # The runtime images Tilt builds, whose dependency stages
 # infra/space/kind/scripts/runtime-image-cache.sh names, and the seed
 # builder infra/space/kind/scripts/build-seed.sh runs.

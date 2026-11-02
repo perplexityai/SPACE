@@ -41,6 +41,10 @@ use sha2::{Digest as _, Sha256};
 
 use crate::catalog::{ManagedDirectoryName, PinnedKernel, PinnedRelease};
 
+mod boot_artifact;
+mod boot_file;
+pub use boot_artifact::{BOOT_ARTIFACT_IMAGE, boot_artifact_directory, boot_artifact_staging};
+use boot_file::BootFilePlan;
 mod protection;
 pub use protection::verify_execution_directory;
 use protection::{RootProtection, check_root};
@@ -138,7 +142,13 @@ pub fn kernel_directory_names(version: &ArtifactVersion, digest: Digest) -> [Str
 
 /// Prefer the compact copy, but never hide an unreadable or invalid preferred
 /// entry by selecting an older copy. Authentication is the caller's next step.
-pub fn existing_artifact_path(root: &Path, names: &[String; 2]) -> std::io::Result<PathBuf> {
+pub fn existing_artifact_path(root: &Path, names: &[String]) -> std::io::Result<PathBuf> {
+    let preferred = names.first().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "artifact locator is required",
+        )
+    })?;
     for name in names {
         let path = root.join(name);
         match std::fs::symlink_metadata(&path) {
@@ -147,7 +157,7 @@ pub fn existing_artifact_path(root: &Path, names: &[String; 2]) -> std::io::Resu
             Err(error) => return Err(error),
         }
     }
-    Ok(root.join(&names[0]))
+    Ok(root.join(preferred))
 }
 
 pub fn managed_kernel_directory(version: &ArtifactVersion, digest: Digest) -> String {
@@ -515,61 +525,18 @@ impl ArtifactStore {
         pin: &PinnedKernel,
         cache: &Path,
     ) -> Result<Publication, PublishError> {
-        RootProtection::Store.check(&self.kernels_root, self.owner)?;
-        let _source_lock = lock_root(&self.kernels_root)
-            .map_err(|source| io_publish("lock", &self.kernels_root, source))?;
-        RootProtection::ExecutionCache.check(cache, self.owner)?;
-        let _cache_lock = lock_root(cache).map_err(|source| io_publish("lock", cache, source))?;
-        let target =
-            existing_artifact_path(cache, &kernel_directory_names(&pin.version, pin.sha256))
-                .map_err(|error| io_publish("locate execution kernel", cache, error))?;
-        let directory = target
-            .file_name()
-            .and_then(|name| name.to_str())
-            .expect("catalog-derived directory name");
-        // Cache loss can unlink the image while leaving its directory. Reclaim
-        // only an empty, protected directory; never replace an existing image
-        // or unlink an inode that might still be used by a jail.
-        if matches!(std::fs::symlink_metadata(target.join(KERNEL_IMAGE)), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
-            && std::fs::symlink_metadata(&target).is_ok()
-        {
-            RootProtection::ExecutionCache.check(&target, self.owner)?;
-            std::fs::remove_dir(&target).map_err(|source| {
-                io_publish("remove empty execution cache directory", &target, source)
-            })?;
-        }
-        let source = existing_artifact_path(
-            &self.kernels_root,
-            &kernel_directory_names(&pin.version, pin.sha256),
-        )
-        .map_err(|source| io_publish("inspect", &self.kernels_root, source))?;
-        let source_directory = source
-            .file_name()
-            .and_then(|name| name.to_str())
-            .expect("catalog-derived directory name");
-        self.publish(
-            cache,
-            directory,
-            PublishSource::Store {
-                root: &self.kernels_root,
-                directory: source_directory,
-            },
-            &[PlannedFile {
-                path: KERNEL_IMAGE,
-                sha256: pin.sha256,
-                size: Some(pin.size),
-                mode: 0o644,
-            }],
-            pin.sha256,
-            RootProtection::ExecutionCache,
-        )
+        self.stage_boot_file(&BootFilePlan::kernel(self, pin), cache)
     }
 
     /// Create only missing managed directories under a protected vendor parent.
     /// Existing paths are verified, never re-owned or linked to execution roots.
     /// Failure disables management, not execution. Blocking.
     pub fn prepare_roots(&self) -> Result<(), std::io::Error> {
-        for root in [&self.releases_root, &self.kernels_root] {
+        for root in [
+            &self.releases_root,
+            &self.kernels_root,
+            &self.boot_artifacts_root(),
+        ] {
             let parent = root.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
             let vendor = parent.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
             for directory in [vendor, parent, root.as_path()] {
@@ -649,40 +616,7 @@ impl ArtifactStore {
         pin: &PinnedKernel,
         staged: &StagedName,
     ) -> Result<Publication, PublishError> {
-        if !store_version(&pin.version) {
-            return Err(PublishError::InvalidVersion {
-                version: pin.version.clone(),
-            });
-        }
-        let files = [PlannedFile {
-            path: KERNEL_IMAGE,
-            sha256: pin.sha256,
-            size: Some(pin.size),
-            mode: 0o644,
-        }];
-        RootProtection::Store.check(&self.kernels_root, self.owner)?;
-        let _locked = lock_root(&self.kernels_root)
-            .map_err(|source| io_publish("lock", &self.kernels_root, source))?;
-        let target = existing_artifact_path(
-            &self.kernels_root,
-            &kernel_directory_names(&pin.version, pin.sha256),
-        )
-        .map_err(|source| io_publish("inspect", &self.kernels_root, source))?;
-        if exists(&target).map_err(|source| io_publish("inspect", &target, source))? {
-            return self.already_present(&target, &files, pin.sha256, RootProtection::Store);
-        }
-        self.publish(
-            &self.kernels_root,
-            &managed_kernel_directory(&pin.version, pin.sha256),
-            PublishSource::Staging {
-                namespace: &kernel_staging(pin.runtime),
-                staged,
-                directory: pin.version.as_str(),
-            },
-            &files,
-            pin.sha256,
-            RootProtection::Store,
-        )
+        self.publish_boot_file(&BootFilePlan::kernel(self, pin), staged)
     }
 
     /// Remove `release` from the store. Blocking.
@@ -741,43 +675,13 @@ impl ArtifactStore {
         version: &ArtifactVersion,
         digest: Digest,
     ) -> Result<RemoveOutcome, RemoveError> {
-        if !store_version(version) {
-            return Err(RemoveError::InvalidVersion {
-                version: version.clone(),
-            });
-        }
-        let root = &self.kernels_root;
-        check_root(root, self.owner).map_err(RemoveError::from)?;
-        let _locked = lock_root(root).map_err(|source| io("lock", root, source))?;
-        let mut verified = Vec::new();
-        for name in kernel_directory_names(version, digest) {
-            let target = root.join(name);
-            if !exists(&target).map_err(|source| io("inspect", &target, source))? {
-                continue;
-            }
-            let image = target.join(KERNEL_IMAGE);
-            let metadata = std::fs::symlink_metadata(&image)
-                .map_err(|source| removal_evidence_error("inspect", &image, source))?;
-            if !metadata.is_file() || metadata.len() > self.max_file_bytes {
-                return Err(RemoveError::IdentityChanged { path: image });
-            }
-            let found = sha256_file(&image)
-                .map_err(|source| removal_evidence_error("hash", &image, source))?;
-            if found != digest {
-                return Err(RemoveError::IdentityChanged { path: image });
-            }
-            verified.push(target);
-        }
-        // Validate both layouts before deleting either: a conflicting historical
-        // copy must not turn a refused removal into a partial mutation.
-        for target in &verified {
-            remove_directory(root, target)?;
-        }
-        Ok(if verified.is_empty() {
-            RemoveOutcome::Absent
-        } else {
-            RemoveOutcome::Removed
-        })
+        self.remove_boot_file(
+            &self.kernels_root,
+            version,
+            digest,
+            KERNEL_IMAGE,
+            &kernel_directory_names(version, digest),
+        )
     }
 
     /// Make the staging root a directory only `uid` can use, owned by
@@ -827,7 +731,11 @@ impl ArtifactStore {
     /// Returns how many entries were removed. Blocking.
     pub fn clear_leftovers(&self) -> Result<usize, std::io::Error> {
         let mut removed = 0;
-        for root in [&self.releases_root, &self.kernels_root] {
+        for root in [
+            &self.releases_root,
+            &self.kernels_root,
+            &self.boot_artifacts_root(),
+        ] {
             // Listing-only nodes may never provision managed roots.
             match std::fs::symlink_metadata(root) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,

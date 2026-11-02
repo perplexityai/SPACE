@@ -438,3 +438,347 @@ fn a_reattach_asks_for_the_wake_the_node_would_allow() {
         );
     }
 }
+
+/// A stale-route reset re-opens the port exposure applied on the sandbox's
+/// active node only for the route generation the resolver hands out now: a
+/// Kubernetes sandbox's active execution generation, or a Direct sandbox's
+/// route identity generation, since a Direct sandbox has no execution row.
+#[tokio::test]
+async fn a_service_route_reset_is_fenced_by_the_current_route_generation()
+-> pplx_space_db_test_fixtures::TestDbResult<()> {
+    use pplx_space_common_core::sql;
+    use pplx_space_common_core::types::SubstrateKind;
+    const PORT: u16 = 8080;
+    const GENERATION: i64 = 3;
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let pool = &db.pool;
+    for substrate in [SubstrateKind::Kubernetes, SubstrateKind::Space] {
+        for (route_generation, applied_on_active_node, reset) in [
+            (GENERATION - 1, true, false),
+            (GENERATION, false, false),
+            (GENERATION, true, true),
+        ] {
+            let case = format!(
+                "{substrate} sandbox, route generation {route_generation}, \
+                 applied on the active node: {applied_on_active_node}"
+            );
+            let node_id = NodeId::new();
+            let sandbox_id = SandboxId::new();
+            sqlx::query(sql!(
+                "INSERT INTO nodes (id, address, role, managed_by, state)
+                 VALUES ($1, '10.0.0.48'::INET, 'worker', $2, 'ready')"
+            ))
+            .bind(node_id)
+            .bind(substrate)
+            .execute(pool)
+            .await?;
+            sqlx::query(sql!(
+                "INSERT INTO sandboxes (
+                     id, user_id, org_id, managed_by, lifecycle, placement,
+                     active_node_id, target_node_id, network_policy_generation
+                 )
+                 VALUES (
+                     $1,
+                     '00000000-0000-0000-0000-000000000010',
+                     '00000000-0000-0000-0000-000000000001',
+                     $2, 'started', 'placed', $3, $3, 1
+                 )"
+            ))
+            .bind(sandbox_id)
+            .bind(substrate)
+            .bind(node_id)
+            .execute(pool)
+            .await?;
+            match substrate {
+                SubstrateKind::Kubernetes => {
+                    crate::tests::insert_active_execution(
+                        pool,
+                        sandbox_id,
+                        "10.80.0.48",
+                        GENERATION,
+                    )
+                    .await?;
+                }
+                SubstrateKind::Space => {
+                    sqlx::query(sql!(
+                        "INSERT INTO sandbox_direct_route_identities (
+                             sandbox_id, route_generation, current_node_id, substrate_kind,
+                             execution_generation, activation_attempt_id
+                         )
+                         VALUES ($1, 1, $2, $3, $4, $5)"
+                    ))
+                    .bind(sandbox_id)
+                    .bind(node_id)
+                    .bind(substrate)
+                    .bind(GENERATION)
+                    .bind(Uuid::now_v7())
+                    .execute(pool)
+                    .await?;
+                }
+            }
+            let applied_node_id = if applied_on_active_node {
+                node_id
+            } else {
+                NodeId::new()
+            };
+            sqlx::query(sql!(
+                "INSERT INTO sandbox_port_exposures (
+                     sandbox_id, protocol, guest_port, visibility, source, desired_state,
+                     apply_state, last_applied_node_id, last_bridge_status, last_observed_at
+                 )
+                 VALUES ($1, 'tcp', $2, 'private', 'native', 'open',
+                         'applied', $3, 'loopback_forwarded', NOW())"
+            ))
+            .bind(sandbox_id)
+            .bind(i32::from(PORT))
+            .bind(applied_node_id)
+            .execute(pool)
+            .await?;
+
+            let response = Box::pin(reset_sandbox_service_route(
+                pool,
+                UnstableResetSandboxServiceRouteRequest {
+                    route: Some(crate::proto::SandboxServiceRouteKey {
+                        sandbox_id: sandbox_id.to_string(),
+                        port: u32::from(PORT),
+                        kind: SandboxServiceRouteKind::ServicePort as i32,
+                    }),
+                    route_generation: u64::try_from(route_generation)?,
+                    diagnostic_message: Some("synthetic stale route".to_string()),
+                },
+            ))
+            .await?;
+
+            let expected = if reset {
+                UnstableResetSandboxServiceRouteResult::Reset
+            } else {
+                UnstableResetSandboxServiceRouteResult::Noop
+            };
+            assert_eq!(
+                (response.result, response.reconcile_enqueued),
+                (expected as i32, reset),
+                "{case}"
+            );
+            let (apply_state, last_applied_node_id): (String, Option<NodeId>) =
+                sqlx::query_as(sql!(
+                    "SELECT apply_state, last_applied_node_id
+                     FROM sandbox_port_exposures
+                     WHERE sandbox_id = $1"
+                ))
+                .bind(sandbox_id)
+                .fetch_one(pool)
+                .await?;
+            let expected_exposure = if reset {
+                ("pending".to_string(), None)
+            } else {
+                ("applied".to_string(), Some(applied_node_id))
+            };
+            assert_eq!(
+                (apply_state, last_applied_node_id),
+                expected_exposure,
+                "{case}"
+            );
+            let queued: i64 = sqlx::query_scalar(sql!(
+                "SELECT COUNT(*) FROM node_reconcile_queue
+                 WHERE node_id = $1 AND element = $2"
+            ))
+            .bind(node_id)
+            .bind(sandbox_id.to_string())
+            .fetch_one(pool)
+            .await?;
+            assert_eq!(queued, i64::from(reset), "{case}");
+        }
+    }
+    Ok(())
+}
+
+/// An activation owner that queues every wake it is asked for and records it.
+#[derive(Default)]
+struct QueuingOwner(std::sync::Mutex<Vec<ImplicitWakeActivity>>);
+
+#[tonic::async_trait]
+impl crate::ingress_activation::IngressActivation for QueuingOwner {
+    async fn prepare(&self, _: SandboxId, _: std::time::Duration) -> Result<(), Status> {
+        Err(Status::internal("a reattach must not be prepared"))
+    }
+    async fn queue_implicit_wake(
+        &self,
+        _: SandboxId,
+        activity: ImplicitWakeActivity,
+        _: std::time::Duration,
+    ) -> Result<bool, Status> {
+        self.0.lock().unwrap().push(activity);
+        Ok(true)
+    }
+}
+
+/// A worker that idle-suspends a Direct sandbox clears `active_node_id` but
+/// leaves its Direct route identity naming the worker, which no longer holds
+/// it. A reattach to that row must queue its wake, as one to the same
+/// Kubernetes row does, and not route to the worker; a placed Direct row
+/// still routes to its worker.
+#[tokio::test(flavor = "current_thread")]
+async fn a_reattach_wakes_an_unplaced_sandbox_whatever_its_direct_route_names()
+-> pplx_space_test_env::TestResult {
+    use pplx_space_common_core::sql;
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let authority = crate::tests::test_route_ed25519_authority();
+    let node_id = NodeId::new();
+    let endpoint = "https://direct-worker-a:9802";
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role, managed_by, state)
+         VALUES ($1, '10.0.0.48'::INET, 'worker', 'space', 'ready')"
+    ))
+    .bind(node_id)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_direct (node_id, node_api_endpoint) VALUES ($1, $2)"
+    ))
+    .bind(node_id)
+    .bind(endpoint)
+    .execute(pool)
+    .await?;
+
+    #[derive(Debug, Clone, Copy)]
+    enum Row {
+        DirectSuspended,
+        KubernetesSuspended,
+        DirectStarted,
+    }
+    for case in [
+        Row::KubernetesSuspended,
+        Row::DirectStarted,
+        Row::DirectSuspended,
+    ] {
+        let sandbox_id = SandboxId::new();
+        let session_id = format!("term_{}", uuid::Uuid::now_v7());
+        crate::tests::insert_data_plane_active_sandbox(pool, sandbox_id, node_id).await?;
+        crate::tests::insert_data_plane_session(pool, &session_id, sandbox_id).await?;
+        match case {
+            Row::DirectSuspended | Row::DirectStarted => {
+                sqlx::query(sql!(
+                    "UPDATE sandboxes SET managed_by = 'space' WHERE id = $1"
+                ))
+                .bind(sandbox_id)
+                .execute(pool)
+                .await?;
+                sqlx::query(sql!(
+                    "INSERT INTO sandbox_direct_route_identities (
+                         sandbox_id, route_generation, current_node_id, substrate_kind,
+                         execution_generation, activation_attempt_id
+                     )
+                     VALUES ($1, 3, $2, 'space', 3, $3)"
+                ))
+                .bind(sandbox_id)
+                .bind(node_id)
+                .bind(uuid::Uuid::now_v7())
+                .execute(pool)
+                .await?;
+            }
+            Row::KubernetesSuspended => {
+                crate::tests::insert_active_execution(pool, sandbox_id, "10.80.0.48", 3).await?;
+            }
+        }
+        if matches!(case, Row::DirectSuspended | Row::KubernetesSuspended) {
+            rest_sandbox(pool, sandbox_id, SandboxLifecycle::Suspended, None).await?;
+        }
+
+        let owner = QueuingOwner::default();
+        let resolved = Box::pin(resolve_session_route(
+            Duration::from_secs(5),
+            Some(&owner),
+            pool,
+            Some(&authority),
+            Some(DataPlaneSessionRefreshAuthority::Granted),
+            ResolveDataPlaneSessionRouteRequest {
+                session_id,
+                protocol_session_id: None,
+                token_sha256: None,
+                required_scope: None,
+                requested_transport: None,
+            },
+        ))
+        .await;
+        let queued = owner.0.lock().unwrap().clone();
+        match case {
+            Row::DirectSuspended | Row::KubernetesSuspended => {
+                let error = resolved.expect_err(&format!("{case:?} must not be routed"));
+                assert_eq!(
+                    error.code(),
+                    Code::FailedPrecondition,
+                    "{case:?}: {error:?}"
+                );
+                assert!(
+                    error.message().contains("not assigned to a node"),
+                    "{case:?}: {error:?}"
+                );
+                assert_eq!(
+                    queued,
+                    vec![ImplicitWakeActivity::Command],
+                    "{case:?} queues its wake"
+                );
+            }
+            Row::DirectStarted => {
+                let response = resolved?;
+                let backend = response.backend.expect("a placed row has a backend");
+                assert_eq!(backend.node_id, node_id.to_string());
+                assert_eq!(backend.endpoint, endpoint);
+                assert!(queued.is_empty(), "a placed row queues no wake");
+            }
+        }
+        // The service route reads the same placement.
+        let service = fetch_sandbox_service_route_row(pool, sandbox_id).await?;
+        assert_eq!(
+            service.active_node_id,
+            matches!(case, Row::DirectStarted).then_some(node_id),
+            "{case:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A route reset coalesces onto a claimed ref without taking its retry
+/// progress, and saves the caller's trace context for the pass that applies it.
+#[tokio::test(flavor = "current_thread")]
+async fn route_reset_enqueue_keeps_a_claimed_refs_progress_and_saves_the_trace()
+-> pplx_space_test_env::TestResult {
+    use crate::tests::queued_ref::{
+        CALLER_TRACEPARENT, QueuedRefProgress, queue_claimed_retrying_ref, queued_ref_progress,
+    };
+
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let node_id = NodeId::new();
+    let sandbox_id = SandboxId::new();
+    pplx_space_db_test_fixtures::insert_ready_worker_node(&db.pool, node_id).await?;
+    let reference = ReconcileRef::sandbox_desired_state(sandbox_id);
+    let element = sandbox_id.to_string();
+    queue_claimed_retrying_ref(&db.pool, node_id, reference.facet_str(), &element).await?;
+
+    let mut tx = db.pool.begin().await?;
+    pplx_space_observability::test_trace::in_remote_parent_span(
+        CALLER_TRACEPARENT,
+        enqueue_sandbox_desired_state_reconcile_tx(&mut tx, sandbox_id, node_id),
+    )
+    .await?;
+    tx.commit().await?;
+
+    assert_eq!(
+        queued_ref_progress(&db.pool, node_id, reference.facet_str(), &element).await?,
+        (
+            QueuedRefProgress {
+                generation: 4,
+                attempts: 2,
+                last_error: "synthetic failure".to_string(),
+                claim_token: "claimant".to_string(),
+                requested_now: false,
+                due_now: false,
+            },
+            true,
+        )
+    );
+    Ok(())
+}

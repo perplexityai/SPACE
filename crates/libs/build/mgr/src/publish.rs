@@ -89,6 +89,8 @@ impl TemplatePublication {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PublishError {
+    #[error("firmware guest templates are local-only and cannot be published")]
+    LocalOnlyGuestImage,
     #[error("authorize operator system build: {0}")]
     AuthorizeSystemBuild(#[source] tonic::Status),
     #[error("invalid system publication grant returned by ClusterApi: {0}")]
@@ -151,6 +153,7 @@ impl PublishError {
         match self {
             Self::CompressedRootfsNotReady { .. } => crate::TemplateBuildErrorKind::Timeout,
             Self::AuthorizeSystemBuild(_)
+            | Self::LocalOnlyGuestImage
             | Self::InvalidSystemGrant(_)
             | Self::InvalidTemplateName(_)
             | Self::InvalidContentHash(_)
@@ -722,6 +725,9 @@ async fn load_build_execution_metadata(
             source,
         }
     })?;
+    if manifest.guest_image.is_some() {
+        return Err(PublishError::LocalOnlyGuestImage);
+    }
     let execution = execution.ok_or(PublishError::MissingExecutionMetadata {
         path: manifest_path,
     })?;

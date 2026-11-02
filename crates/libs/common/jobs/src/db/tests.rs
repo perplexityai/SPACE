@@ -534,3 +534,55 @@ fn count_failed_jobs_by_dedup_key_counts_one_failure_kind_of_one_key() {
         0
     );
 }
+
+#[test]
+fn permanent_failure_counts_group_by_kind_and_reason_and_skip_other_outcomes() {
+    let conn = mem_conn();
+    for (name, kind) in [
+        ("build-none-1", "build"),
+        ("build-none-2", "build"),
+        ("build-not-found", "build"),
+        ("build-internal", "build"),
+        ("build-exhausted", "build"),
+        ("build-completed", "build"),
+        ("build-pending", "build"),
+        ("push-none", "push"),
+    ] {
+        insert_job(
+            &conn,
+            InsertJob {
+                job_id: &fixture_job_id(name),
+                kind,
+                payload: "{}",
+                subject_id: None,
+                dedup_key: None,
+                max_attempts: 1,
+                traceparent: None,
+                priority: JobPriority::default(),
+            },
+        )
+        .unwrap();
+    }
+    for (name, reason) in [
+        ("build-none-1", None),
+        ("build-none-2", None),
+        ("build-not-found", Some(JobFailureReason::NotFound)),
+        ("build-internal", Some(JobFailureReason::Internal)),
+        ("push-none", None),
+    ] {
+        fail_job_permanent(&conn, &fixture_job_id(name), "failed", reason).unwrap();
+    }
+    fail_job_retriable_exhausted(&conn, &fixture_job_id("build-exhausted"), "failed").unwrap();
+    assert!(mark_job_running(&conn, &fixture_job_id("build-completed")).unwrap());
+    assert!(complete_job(&conn, &fixture_job_id("build-completed"), 1).unwrap());
+
+    assert_eq!(
+        count_permanent_failures_by_kind_and_reason(&conn).unwrap(),
+        vec![
+            ("build".to_owned(), None, 2),
+            ("build".to_owned(), Some(JobFailureReason::Internal), 1),
+            ("build".to_owned(), Some(JobFailureReason::NotFound), 1),
+            ("push".to_owned(), None, 1),
+        ]
+    );
+}

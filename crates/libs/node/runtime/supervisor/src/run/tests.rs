@@ -12,6 +12,7 @@ fn launcher_mode_runs_before_telemetry_is_initialized() {
     let error = run(RuntimeSupervisorRunConfig {
         socket_path: PathBuf::from("/space/run/runtime-supervisor/must-not-be-bound.sock"),
         sidecar_launcher_fd: Some(-1),
+        jailer_start_timeout: pplx_space_node_runtime_core::launch::DEFAULT_JAILER_START_TIMEOUT,
     })
     .expect_err("an invalid launcher descriptor must fail");
 

@@ -19,6 +19,7 @@ are the ones the worker image and the node layer create.
 | Value | Default | Meaning |
 | --- | --- | --- |
 | `node.role` | `worker` | `worker` or `builder`; selects the node pool and the reported role |
+| `node.substrate` | `kubernetes` | `kubernetes` reports the kube node name as `SPACE_NODE_ID`; `direct` leaves it unset, so node-api and node-ctl read the node UUID in `/space/etc/node-id` (`mount.nodeId`) and sandbox-manager reads it through its own `/space/etc` mount for its activation identity only. The other services get no node id |
 | `node.internalApiEndpoint` | `https://space-internal-api:9800` | ClusterApi |
 | `node.credmgrAuthorityEndpoint` | `https://space-credmgr-authority:9810` | credential-manager authority (agent upstream, node-manager volume DEKs, build-manager storage exchange in `exchange` mode) |
 | `node.diskAdmission.*` | 1 GiB each | Kind-sized `/space/cache` admission floor and reservation |

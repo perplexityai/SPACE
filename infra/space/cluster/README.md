@@ -88,6 +88,10 @@ The render fails, listing every gap, unless the file supplies:
 - `space-cluster-controller-local.snapshotEndpoint`,
   `space-sandbox-manager-local.snapshots.endpoint` and every node chart's
   `node.objectStore.endpoint`, none of them the Kind object store.
+- The Kubernetes substrate: `substrate` on `space-api-local` and
+  `space-cluster-controller-local`, and every enabled node chart's
+  `node.substrate`, left at `kubernetes`. The Direct substrate lane is
+  Kind-only ([Kind README](../kind/README.md#direct-substrate-lane)).
 
 `chart/values.yaml` switches the Kind-only parts off:
 

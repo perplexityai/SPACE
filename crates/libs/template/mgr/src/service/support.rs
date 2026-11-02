@@ -16,6 +16,63 @@ impl Drop for ImportGuard {
     }
 }
 
+type PoolSandboxListFn = dyn Fn(
+        pplx_space_sbx_mgr_client::GrpcRetryPolicy,
+    ) -> futures_util::future::BoxFuture<'static, Vec<sbx_proto::SandboxListElement>>
+    + Send
+    + Sync;
+
+/// Lists the node's sandboxes for the pool counts `ListTemplates` and
+/// `PoolStatus` report.
+#[derive(Clone)]
+pub(super) struct PoolSandboxLister(Arc<PoolSandboxListFn>);
+
+impl PoolSandboxLister {
+    pub(super) fn new(
+        list: impl Fn(
+            pplx_space_sbx_mgr_client::GrpcRetryPolicy,
+        )
+            -> futures_util::future::BoxFuture<'static, Vec<sbx_proto::SandboxListElement>>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self(Arc::new(list))
+    }
+
+    /// Pages through sandbox-manager. An unreachable or failing
+    /// sandbox-manager reads as no sandboxes, so the counts report zero
+    /// instead of failing the reply.
+    pub(super) fn sandbox_manager() -> Self {
+        Self::new(|retry_policy| {
+            Box::pin(async move {
+                let Ok(mut client) =
+                    pplx_space_sbx_mgr_client::connect_with_retry_policy(retry_policy).await
+                else {
+                    return Vec::new();
+                };
+                pplx_space_sbx_mgr_client::list_all_sandboxes(&mut client)
+                    .await
+                    .unwrap_or_default()
+            })
+        })
+    }
+}
+
+impl TemplateManagerService {
+    /// The sandboxes pool counts are computed from, or none when the caller
+    /// asked to omit the counts.
+    pub(super) async fn pool_count_sandboxes(
+        &self,
+        omit_sandbox_counts: bool,
+    ) -> Vec<sbx_proto::SandboxListElement> {
+        if omit_sandbox_counts {
+            return Vec::new();
+        }
+        (self.pool_sandbox_lister.0)(self.sbx_connect_retry_policy).await
+    }
+}
+
 pub(super) fn content_hash_algorithm(hash: &str) -> Result<HashAlg, Status> {
     hash.parse::<Digest>()
         .map(Digest::algorithm)

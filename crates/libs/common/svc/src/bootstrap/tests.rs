@@ -84,6 +84,48 @@ fn grpc_server_application_statuses_are_not_failures() {
         assert!(grpc_status_is_error(code));
     }
 }
+
+/// The status a handler returns and the one read back from trailers decide
+/// alike. The marker quiets only UNAVAILABLE.
+#[test]
+fn only_a_not_ready_unavailable_is_kept_out_of_failed_request_logs() {
+    let not_ready = pplx_space_common_grpc::RetryableNotReady;
+    for (name, status, logged_as_error) in [
+        (
+            "not ready",
+            not_ready.mark(Status::unavailable("dependency is being prepared")),
+            false,
+        ),
+        (
+            "unmarked unavailable",
+            Status::unavailable("dependency is being prepared"),
+            true,
+        ),
+        (
+            "marked internal",
+            not_ready.mark(Status::internal("dependency failed")),
+            true,
+        ),
+        (
+            "marked precondition",
+            not_ready.mark(Status::failed_precondition("dependency is absent")),
+            false,
+        ),
+    ] {
+        assert_eq!(
+            grpc_server_status_is_logged_as_error(&status),
+            logged_as_error,
+            "{name}"
+        );
+        let trailers = Status::from_header_map(status.into_http::<()>().headers()).unwrap();
+        assert_eq!(
+            grpc_server_status_is_logged_as_error(&trailers),
+            logged_as_error,
+            "{name} from trailers"
+        );
+    }
+}
+
 #[test]
 fn format_grpc_request_params_escapes_special_characters() {
     let formatted = format_grpc_request_params([

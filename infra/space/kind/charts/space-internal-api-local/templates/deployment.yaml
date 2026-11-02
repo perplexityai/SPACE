@@ -136,6 +136,25 @@ spec:
               value: {{ .staleCeilingSeconds | quote }}
             {{- end }}
             {{- end }}
+            {{- with .Values.runtimeDesiredState }}
+            {{- /* Rendered per key and only when set, as visibilityCache is. */}}
+            {{- if and (not (kindIs "invalid" .executionPolicyEnabled)) (not (empty (toString .executionPolicyEnabled))) }}
+            - name: SPACE_INTERNAL_API_RUNTIME_DESIRED_STATE_ENABLED
+              value: {{ .executionPolicyEnabled | quote }}
+            {{- end }}
+            {{- if and (not (kindIs "invalid" .provisioningRecipeEnabled)) (not (empty (toString .provisioningRecipeEnabled))) }}
+            - name: SPACE_INTERNAL_API_RUNTIME_PROVISIONING_RECIPE_ENABLED
+              value: {{ .provisioningRecipeEnabled | quote }}
+            {{- end }}
+            {{- with .provisioningCanaryNodes }}
+            - name: SPACE_INTERNAL_API_RUNTIME_PROVISIONING_CANARY_NODES
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- if and (not (kindIs "invalid" .provisioningPercent)) (not (empty (toString .provisioningPercent))) }}
+            - name: SPACE_INTERNAL_API_RUNTIME_PROVISIONING_PERCENT
+              value: {{ .provisioningPercent | quote }}
+            {{- end }}
+            {{- end }}
             # Datadog tracing — see datadog-agent-local chart.
             {{- include "space-kind-telemetry.env" . | nindent 12 }}
             - name: SPACE_K8S_POD_NAME

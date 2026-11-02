@@ -11,6 +11,7 @@ reap before the threshold or a replaced live pod. Those are pinned here.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import unittest
 from contextlib import nullcontext
@@ -127,7 +128,7 @@ class Registration(unittest.TestCase):
 
 
 class Choreography(unittest.TestCase):
-    def test_goes_live_before_planting_and_reaps_the_own_row_orphan_before_restoring(self) -> None:
+    def test_goes_live_before_planting_and_leaves_the_own_row_orphan_until_the_restore(self) -> None:
         fixture = mock.Mock()
         fixture.sandbox.sandbox_id = SANDBOX
         fixture.phase.side_effect = lambda _name: nullcontext()
@@ -142,9 +143,9 @@ class Choreography(unittest.TestCase):
         gc.scoped_live_gc.return_value = nullcontext()
         gc.capture_restore_pod.return_value = LivePod("space-sbx-a-g2", "uid-2", 2)
         suspended_rows = [
-            [ExecutionRow(1, "replaced", False, "g1"), ExecutionRow(2, "replaced", False, "g2")],
-            [ExecutionRow(g, "replaced", False, f"g{g}") for g in (1, 2, 3)],
-            [ExecutionRow(g, "replaced", False, f"g{g}") for g in (1, 2, 3, 4)],
+            [ExecutionRow(1, "suspended", False, "g1"), ExecutionRow(2, "suspended", False, "g2")],
+            [ExecutionRow(g, "suspended", False, f"g{g}") for g in (1, 2, 3)],
+            [ExecutionRow(g, "suspended", False, f"g{g}") for g in (1, 2, 3, 4)],
         ]
         gc.wait_until_suspended.side_effect = suspended_rows
         gc.plant.side_effect = lambda **kw: SimpleNamespace(**kw)
@@ -174,6 +175,7 @@ class Choreography(unittest.TestCase):
                 mock.call.orphaned_restore_pod_gc.plant(sandbox_id=SANDBOX, generation=1),
                 mock.call.orphaned_restore_pod_gc.plant(generation=1),
                 mock.call.orphaned_restore_pod_gc.plant(sandbox_id=SANDBOX, generation=4),
+                mock.call.orphaned_restore_pod_gc.plant(generation=1),
             ],
         )
         # The restored phase restores with the GC live, then watches the one
@@ -189,14 +191,27 @@ class Choreography(unittest.TestCase):
         self.assertEqual(calls[lives[1]].kwargs["above"], 3)
         self.assertEqual(calls[undisturbed].args[0], LivePod("space-sbx-a-g4", "uid-4", 4))
         self.assertNotIn("concurrent_restore", {n.split(".")[0] for n in names})
-        # The own-row orphan is reaped before the final restore is attempted.
         reaps = [i for i, n in enumerate(names) if n == "orphaned_restore_pod_gc.expect_reaped"]
         # The two superseded plants are watched in one call, from their own creates.
         self.assertEqual(len(reaps), 2)
         self.assertEqual(len(calls[reaps[0]].args), 2)
         self.assertLess(plants[1], reaps[0])
-        self.assertLess(plants[2], reaps[1])
-        self.assertLess(reaps[1], reconnects[-1])
+        # The row-less control beside the own-row orphan is reaped before
+        # the own-row orphan's survival window starts.
+        self.assertEqual(calls[reaps[1]].args, (SimpleNamespace(generation=1),))
+        # The own-row orphan at the suspend-retired generation is left alone
+        # through the survival window before the final restore, and is gone
+        # only after it, before the one live execution is checked.
+        left_alone = names.index("orphaned_restore_pod_gc.expect_left_alone")
+        gone = names.index("orphaned_restore_pod_gc.expect_gone")
+        own = SimpleNamespace(sandbox_id=SANDBOX, generation=4)
+        self.assertEqual(calls[left_alone].args[0], own)
+        self.assertEqual(calls[gone].args[0], own)
+        self.assertLess(plants[3], reaps[1])
+        self.assertLess(reaps[1], left_alone)
+        self.assertLess(left_alone, reconnects[-1])
+        self.assertLess(reconnects[-1], gone)
+        self.assertLess(gone, lives[-1])
         # The standing config comes back in the body's last phase, after the
         # final restore was checked, not only as the scope unwinds.
         restored = names.index("orphaned_restore_pod_gc.restore_standing")
@@ -570,6 +585,36 @@ class AssertionsContract(unittest.TestCase):
         self.control.present.add(live.name)
         with self.assertRaisesRegex(InvariantViolation, "disturbed"):
             self.assertions.expect_undisturbed(live)
+
+    def test_a_plant_kept_through_the_window_is_left_alone(self) -> None:
+        self._live()
+        orphan = self._orphan(deleted_after=None)
+        orphan = dataclasses.replace(orphan, uid=f"uid-{orphan.name}")
+        self.assertions.expect_left_alone(orphan)
+
+    def test_a_plant_deleted_inside_the_window_fails_left_alone(self) -> None:
+        self._live()
+        orphan = self._orphan(deleted_after=21.0)
+        orphan = dataclasses.replace(orphan, uid=f"uid-{orphan.name}")
+        with self.assertRaisesRegex(InvariantViolation, "would not refuse"):
+            self.assertions.expect_left_alone(orphan)
+
+    def test_a_removed_plant_is_gone_and_removes_nothing_twice(self) -> None:
+        self._live()
+        orphan = self._orphan(deleted_after=3.0)
+        self.assertions._removals[orphan.token] = self.scope.defer(
+            "remove", lambda: self.control.remove_planted_restore_pods(orphan.token)
+        )
+        self.assertions.expect_gone(orphan)
+        self.assertEqual(self.control.calls, [f"remove:{orphan.token}"])
+        self.scope.close()
+        self.assertEqual(self.control.calls, [f"remove:{orphan.token}"])
+
+    def test_a_plant_that_stays_fails_gone(self) -> None:
+        self._live()
+        orphan = self._orphan(deleted_after=None)
+        with self.assertRaisesRegex(InvariantViolation, "not removed within the budget"):
+            self.assertions.expect_gone(orphan)
 
 
 class PrivilegedNames(unittest.TestCase):

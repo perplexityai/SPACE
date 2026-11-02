@@ -23,8 +23,9 @@ pub(super) async fn refresh_sandbox_desired_state(
     node_role: Option<NodeRole>,
     scope: FacetScope,
     sync_interval: std::time::Duration,
+    sandbox_listing: &InboundSandboxListing,
 ) -> Result<InboundFacetResult, String> {
-    let sandbox_ids = resolve_sandbox_scope(scope).await?;
+    let sandbox_ids = resolve_sandbox_scope(scope, sandbox_listing).await?;
     let mut stats = ReconcileStats {
         sandboxes_seen: sandbox_ids.len() as u64,
         ..ReconcileStats::default()

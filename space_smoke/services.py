@@ -114,6 +114,10 @@ class SmokeServices:
     native: CommandSandboxFactory | None = None
     api_surface: str = ECW_API_SURFACE
     direct_node: DirectNodeConfig | None = None
+    # Reads the Kind bench's modes for the suite. Set on the kind backend
+    # whatever the fixture, unlike `kind`, which only fixtures given Kind
+    # controls receive.
+    bench: KindHarness | None = None
 
     def bootstrap(self) -> bool:
         """Prepare the selected environment once before suite dispatch.
@@ -127,29 +131,38 @@ class SmokeServices:
     def telemetry_mode(self) -> str:
         """The telemetry mode of the Kind bench, read from the cluster."""
 
-        if self.kind is None:
+        if self.bench is None:
             raise SmokeConfigurationError(
                 "the telemetry mode is only readable on the kind backend"
             )
-        return self.kind.telemetry_mode()
+        return self.bench.telemetry_mode()
 
     def storage_credentials(self) -> str:
         """The storage credentials mode of the Kind bench, read from the cluster."""
 
-        if self.kind is None:
+        if self.bench is None:
             raise SmokeConfigurationError(
                 "the storage credentials mode is only readable on the kind backend"
             )
-        return self.kind.storage_credentials_mode()
+        return self.bench.storage_credentials_mode()
 
     def rust_build(self) -> str:
         """The Rust build (`test-hooks` or `release`) the Kind bench runs."""
 
-        if self.kind is None:
+        if self.bench is None:
             raise SmokeConfigurationError(
                 "the Rust build is only readable on the kind backend"
             )
-        return self.kind.rust_build()
+        return self.bench.rust_build()
+
+    def substrate(self) -> str:
+        """The control-plane substrate (`kubernetes` or `direct`) the Kind bench runs."""
+
+        if self.bench is None:
+            raise SmokeConfigurationError(
+                "the substrate is only readable on the kind backend"
+            )
+        return self.bench.substrate()
 
     def fixture(
         self,
@@ -543,19 +556,9 @@ class SmokeServices:
             api_url = values.get("SPACE_API_URL", "http://127.0.0.1:8080")
             data_plane_url = values.get("SPACE_DATA_PLANE_URL", api_url)
             template = values.get("SPACE_TEMPLATE") or scenario.sandbox.template
-            kind = None
-            if (
-                backend == KIND_BACKEND
-                and scenario.fixture_type is CommandSandboxFixture
-            ):
-                validate_loopback_environment(api_url, False, scenario_id=scenario.id)
-                validate_loopback_environment(
-                    data_plane_url,
-                    False,
-                    scenario_id=scenario.id,
-                    endpoint_name="SPACE_DATA_PLANE_URL",
-                )
-                kind = KindHarness(
+            kind = bench = None
+            if backend == KIND_BACKEND:
+                bench = KindHarness(
                     SubprocessExecutor(base_env=values),
                     KindConfig(
                         cluster=values.get("KIND_CLUSTER", "space-local"),
@@ -566,8 +569,18 @@ class SmokeServices:
                     ),
                     environment=values,
                 )
+            if bench is not None and scenario.fixture_type is CommandSandboxFixture:
+                validate_loopback_environment(api_url, False, scenario_id=scenario.id)
+                validate_loopback_environment(
+                    data_plane_url,
+                    False,
+                    scenario_id=scenario.id,
+                    endpoint_name="SPACE_DATA_PLANE_URL",
+                )
+                kind = bench
             return cls(
                 kind=kind,
+                bench=bench,
                 ecw=None,
                 api_key="",
                 owns_api_key=False,
@@ -683,6 +696,7 @@ class SmokeServices:
             api_key=api_key,
             owns_api_key=supplied_key is None,
             template_override=template_override,
+            bench=kind,
         )
 
 

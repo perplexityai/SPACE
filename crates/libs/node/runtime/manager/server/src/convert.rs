@@ -22,7 +22,13 @@ pub(crate) fn mark_managed_store(
             ArtifactKind::Runtime(runtime) => roots.managed_releases.iter().any(|root| {
                 root.kind == runtime && artifact.path.parent() == Some(root.path.as_path())
             }),
-            ArtifactKind::Component(_) => roots.managed_kernels.as_ref().is_some_and(|root| {
+            ArtifactKind::Component(kind) => roots.managed_kernels.as_ref().is_some_and(|root| {
+                let root = match kind {
+                    pplx_space_common_core::types::ArtifactComponentKind::Firmware => {
+                        pplx_space_node_runtime_core::artifact_layout::boot_artifacts_root(root)
+                    }
+                    _ => root.clone(),
+                };
                 artifact.path.parent().and_then(Path::parent) == Some(root.as_path())
             }),
         };
@@ -68,6 +74,10 @@ pub(crate) fn component(
 
 pub(crate) fn operation(operation: &Operation) -> proto::Operation {
     let identity = match &operation.request {
+        InstallOperation::InstallBootArtifact { pin } => component_identity(pin.identity().clone()),
+        InstallOperation::UninstallBootArtifact { identity } => {
+            component_identity(identity.clone())
+        }
         InstallOperation::InstallKernel { kernel } => {
             component_identity(pplx_space_common_core::types::ComponentIdentity {
                 kind: pplx_space_common_core::types::ArtifactComponentKind::Kernel,

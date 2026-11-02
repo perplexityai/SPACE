@@ -86,6 +86,8 @@ members = [
     "crates/libs/node/runtime/manager/server",
     "crates/libs/node/runtime/supervisor",
     "crates/libs/execution/common",
+    "crates/libs/execution/catalog",
+    "crates/libs/execution/runtime-environment-catalog-store",
     "crates/libs/execution/runtime-environment-policy-store",
     "crates/libs/net/common",
     "crates/libs/net/gateway/client",
@@ -373,7 +375,9 @@ pplx-space-dependency-drain = { path = "crates/libs/dependency-drain" }
 pplx-space-ecw-credential = { path = "crates/libs/ecw-credential" }
 pplx-space-env-vars = { path = "crates/libs/env-vars" }
 pplx-space-migration-checksums = { path = "crates/libs/migration-checksums" }
+pplx-space-execution-catalog = { path = "crates/libs/execution/catalog" }
 pplx-space-execution-common = { path = "crates/libs/execution/common" }
+pplx-space-runtime-environment-catalog-store = { path = "crates/libs/execution/runtime-environment-catalog-store" }
 pplx-space-runtime-environment-policy-store = { path = "crates/libs/execution/runtime-environment-policy-store" }
 pplx-space-feature-flags = { path = "crates/libs/feature-flags" }
 pplx-space-events = { path = "crates/libs/events" }

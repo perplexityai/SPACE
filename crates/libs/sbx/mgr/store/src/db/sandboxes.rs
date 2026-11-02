@@ -37,7 +37,7 @@ pub struct RuntimeFields<'a> {
     pub slot: u32,
     pub guest_cid: u32,
     pub pid: u32,
-    pub spaced_host_pid: u32,
+    pub spaced_host_pid: Option<u32>,
     pub netgtw_pid: u32,
     pub vsock_uds_path: &'a str,
     pub api_socket_path: &'a str,
@@ -47,6 +47,7 @@ pub struct RuntimeFields<'a> {
 }
 
 pub struct InsertSandboxParams<'a> {
+    pub guest_image: pplx_space_common_core::types::guest_image::GuestImageContract,
     pub id: &'a str,
     pub uuid8: &'a SandboxRuntimeLabel,
     pub state: SandboxState,
@@ -186,6 +187,7 @@ fn initial_auto_lifecycle_state(
 
 pub fn insert_sandbox(conn: &Connection, params: InsertSandboxParams<'_>) -> Result<()> {
     let InsertSandboxParams {
+        guest_image,
         id,
         uuid8,
         state,
@@ -206,6 +208,11 @@ pub fn insert_sandbox(conn: &Connection, params: InsertSandboxParams<'_>) -> Res
         auto_lifecycle_authority,
     } = params;
 
+    let guest_image_json = (!guest_image.legacy_transport())
+        .then_some(&guest_image)
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(Error::to_sql_conversion)?;
     let ts = now()?;
     let process_env_json = serde_json::to_string(process_env)
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
@@ -219,8 +226,8 @@ pub fn insert_sandbox(conn: &Connection, params: InsertSandboxParams<'_>) -> Res
         .transpose()
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     conn.execute(
-        "INSERT INTO sandboxes (id, uuid8, state, template, template_hash, user, runtime, snapshots_enabled, rootfs_size_mb, pool_template, process_env_json, auto_lifecycle_json, auto_lifecycle_state_json, next_auto_event_at, network_policy_override_json, network_policy_generation, network_policy_authority, auto_lifecycle_authority, volume_encryption, created_at, updated_at, state_changed_at, disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec, node_execution_id, node_execution_retired)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?21, ?22, ?23, ?24, 1)",
+        "INSERT INTO sandboxes (id, uuid8, state, template, template_hash, user, runtime, snapshots_enabled, rootfs_size_mb, pool_template, process_env_json, auto_lifecycle_json, auto_lifecycle_state_json, next_auto_event_at, network_policy_override_json, network_policy_generation, network_policy_authority, auto_lifecycle_authority, volume_encryption, created_at, updated_at, state_changed_at, disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec, node_execution_id, node_execution_retired, guest_image_contract_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?21, ?22, ?23, ?24, 1, ?25)",
         params![
             id,
             uuid8.as_str(),
@@ -248,6 +255,7 @@ pub fn insert_sandbox(conn: &Connection, params: InsertSandboxParams<'_>) -> Res
             // Staging can fail before the first activation. Give its cleanup
             // a durable request identity, but not an allocated predecessor.
             SandboxActivationAttemptId::new().to_string(),
+            guest_image_json,
         ],
     )?;
     Ok(())
@@ -454,6 +462,7 @@ pub fn restore_adopt_orphan_or_insert_sandbox_in_transaction(
     restore_operation: &RemoteRestoreOperation,
 ) -> std::result::Result<(), RestoreAdoptOrphanInsertError> {
     let InsertSandboxParams {
+        guest_image,
         id,
         uuid8,
         state,
@@ -477,6 +486,11 @@ pub fn restore_adopt_orphan_or_insert_sandbox_in_transaction(
     if state != SandboxState::Restoring {
         return Err(RestoreAdoptOrphanInsertError::NonRestoringState { state });
     }
+    let guest_image_json = (!guest_image.legacy_transport())
+        .then_some(&guest_image)
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(Error::to_sql_conversion)?;
     let ts = now()?;
     let process_env_json = serde_json::to_string(process_env).map_err(Error::to_sql_conversion)?;
     let auto_lifecycle_json =
@@ -492,8 +506,8 @@ pub fn restore_adopt_orphan_or_insert_sandbox_in_transaction(
         .map_err(Error::to_sql_conversion)?;
 
     let rows_affected = conn.execute(
-        "INSERT INTO sandboxes (id, uuid8, state, template, template_hash, user, runtime, snapshots_enabled, rootfs_size_mb, pool_template, process_env_json, auto_lifecycle_json, auto_lifecycle_state_json, next_auto_event_at, network_policy_override_json, network_policy_generation, network_policy_authority, auto_lifecycle_authority, volume_encryption, created_at, updated_at, state_changed_at, restore_origin, restore_phase, restore_storage_uri, disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec, node_execution_id, node_execution_retired)
-         VALUES (?1, ?2, 'restoring', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?23, ?18, ?18, ?18, 'remote', ?24, ?25, ?26, ?27, ?28, 1)
+        "INSERT INTO sandboxes (id, uuid8, state, template, template_hash, user, runtime, snapshots_enabled, rootfs_size_mb, pool_template, process_env_json, auto_lifecycle_json, auto_lifecycle_state_json, next_auto_event_at, network_policy_override_json, network_policy_generation, network_policy_authority, auto_lifecycle_authority, volume_encryption, created_at, updated_at, state_changed_at, restore_origin, restore_phase, restore_storage_uri, disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec, node_execution_id, node_execution_retired, guest_image_contract_json)
+         VALUES (?1, ?2, 'restoring', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?23, ?18, ?18, ?18, 'remote', ?24, ?25, ?26, ?27, ?28, 1, ?29)
          ON CONFLICT(id) DO UPDATE SET
              uuid8 = excluded.uuid8,
              state = excluded.state,
@@ -527,6 +541,7 @@ pub fn restore_adopt_orphan_or_insert_sandbox_in_transaction(
              disk_io_max_bandwidth_mib_per_sec = excluded.disk_io_max_bandwidth_mib_per_sec,
              pool_template = excluded.pool_template,
              volume_encryption = excluded.volume_encryption,
+             guest_image_contract_json = excluded.guest_image_contract_json,
              guest_uptime_secs = NULL,
              process_env_json = excluded.process_env_json,
              auto_lifecycle_json = excluded.auto_lifecycle_json,
@@ -567,6 +582,7 @@ pub fn restore_adopt_orphan_or_insert_sandbox_in_transaction(
            AND sandboxes.vsock_uds_path IS NULL
            AND sandboxes.api_socket_path IS NULL
            AND sandboxes.snapshots_enabled = 0
+           AND sandboxes.guest_image_contract_json IS NULL
            AND sandboxes.pool_template IS NULL
            AND sandboxes.guest_uptime_secs IS NULL
            AND sandboxes.process_env_json = '{}'
@@ -608,6 +624,7 @@ pub fn restore_adopt_orphan_or_insert_sandbox_in_transaction(
             // New restore staging needs cleanup authority before activation;
             // the conflict branch preserves the adopted row's authority.
             SandboxActivationAttemptId::new().to_string(),
+            guest_image_json,
         ],
     )?;
 
@@ -1182,7 +1199,7 @@ db_private_outside_tests! {
 
 pub(super) const GET_SANDBOX_SQL: &str =
         "SELECT id, uuid8, state, template, template_hash, user, runtime, uid, slot, guest_cid, pid,
-         spaced_host_pid, netgtw_pid, vsock_uds_path, api_socket_path, created_at, updated_at, snapshots_enabled, rootfs_size_mb, pool_template, guest_uptime_secs, process_env_json, auto_lifecycle_json, auto_lifecycle_state_json, next_auto_event_at, failure_reason, cleanup_completion, cleanup_keep_filesystem, network_policy_override_json, network_tx_bytes, network_rx_bytes, network_policy_generation, applied_network_policy_generation, applied_network_policy_source, network_policy_authority, auto_lifecycle_authority, current_local_artifact_id, current_local_artifact_kind, current_local_artifact_origin, execution_metadata_json, volume_encryption, space_api_route_generation, space_api_route_node_id, space_api_route_execution_generation, space_api_route_pod_uid, restore_origin, restore_phase, restore_storage_uri, space_api_route_substrate_kind, space_api_route_activation_attempt_id, spaced_endpoint_proof_json, disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec, node_execution_id
+         spaced_host_pid, netgtw_pid, vsock_uds_path, api_socket_path, created_at, updated_at, snapshots_enabled, rootfs_size_mb, pool_template, guest_uptime_secs, process_env_json, auto_lifecycle_json, auto_lifecycle_state_json, next_auto_event_at, failure_reason, cleanup_completion, cleanup_keep_filesystem, network_policy_override_json, network_tx_bytes, network_rx_bytes, network_policy_generation, applied_network_policy_generation, applied_network_policy_source, network_policy_authority, auto_lifecycle_authority, current_local_artifact_id, current_local_artifact_kind, current_local_artifact_origin, execution_metadata_json, volume_encryption, space_api_route_generation, space_api_route_node_id, space_api_route_execution_generation, space_api_route_pod_uid, restore_origin, restore_phase, restore_storage_uri, space_api_route_substrate_kind, space_api_route_activation_attempt_id, spaced_endpoint_proof_json, disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec, node_execution_id, guest_image_contract_json
          FROM sandboxes WHERE id = ?1";
 
 db_private_outside_tests! {
@@ -1218,7 +1235,7 @@ db_private_outside_tests! {
 
 const LIST_SANDBOXES_SQL: &str =
     "SELECT id, uuid8, state, template, template_hash, user, runtime, uid, slot, guest_cid, pid,
-         spaced_host_pid, netgtw_pid, vsock_uds_path, api_socket_path, created_at, updated_at, snapshots_enabled, rootfs_size_mb, pool_template, guest_uptime_secs, process_env_json, auto_lifecycle_json, auto_lifecycle_state_json, next_auto_event_at, failure_reason, cleanup_completion, cleanup_keep_filesystem, network_policy_override_json, network_tx_bytes, network_rx_bytes, network_policy_generation, applied_network_policy_generation, applied_network_policy_source, network_policy_authority, auto_lifecycle_authority, current_local_artifact_id, current_local_artifact_kind, current_local_artifact_origin, execution_metadata_json, volume_encryption, space_api_route_generation, space_api_route_node_id, space_api_route_execution_generation, space_api_route_pod_uid, restore_origin, restore_phase, restore_storage_uri, space_api_route_substrate_kind, space_api_route_activation_attempt_id, spaced_endpoint_proof_json, disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec, node_execution_id
+         spaced_host_pid, netgtw_pid, vsock_uds_path, api_socket_path, created_at, updated_at, snapshots_enabled, rootfs_size_mb, pool_template, guest_uptime_secs, process_env_json, auto_lifecycle_json, auto_lifecycle_state_json, next_auto_event_at, failure_reason, cleanup_completion, cleanup_keep_filesystem, network_policy_override_json, network_tx_bytes, network_rx_bytes, network_policy_generation, applied_network_policy_generation, applied_network_policy_source, network_policy_authority, auto_lifecycle_authority, current_local_artifact_id, current_local_artifact_kind, current_local_artifact_origin, execution_metadata_json, volume_encryption, space_api_route_generation, space_api_route_node_id, space_api_route_execution_generation, space_api_route_pod_uid, restore_origin, restore_phase, restore_storage_uri, space_api_route_substrate_kind, space_api_route_activation_attempt_id, spaced_endpoint_proof_json, disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec, node_execution_id, guest_image_contract_json
          FROM sandboxes ORDER BY created_at";
 
 db_private_outside_tests! {
@@ -1381,7 +1398,7 @@ db_private_outside_tests! {
     ) -> Result<Vec<SandboxRow>> {
         let mut stmt = conn.prepare(
             "SELECT id, uuid8, state, template, template_hash, user, runtime, uid, slot, guest_cid, pid,
-         spaced_host_pid, netgtw_pid, vsock_uds_path, api_socket_path, created_at, updated_at, snapshots_enabled, rootfs_size_mb, pool_template, guest_uptime_secs, process_env_json, auto_lifecycle_json, auto_lifecycle_state_json, next_auto_event_at, failure_reason, cleanup_completion, cleanup_keep_filesystem, network_policy_override_json, network_tx_bytes, network_rx_bytes, network_policy_generation, applied_network_policy_generation, applied_network_policy_source, network_policy_authority, auto_lifecycle_authority, current_local_artifact_id, current_local_artifact_kind, current_local_artifact_origin, execution_metadata_json, volume_encryption, space_api_route_generation, space_api_route_node_id, space_api_route_execution_generation, space_api_route_pod_uid, restore_origin, restore_phase, restore_storage_uri, space_api_route_substrate_kind, space_api_route_activation_attempt_id, spaced_endpoint_proof_json, disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec, node_execution_id
+         spaced_host_pid, netgtw_pid, vsock_uds_path, api_socket_path, created_at, updated_at, snapshots_enabled, rootfs_size_mb, pool_template, guest_uptime_secs, process_env_json, auto_lifecycle_json, auto_lifecycle_state_json, next_auto_event_at, failure_reason, cleanup_completion, cleanup_keep_filesystem, network_policy_override_json, network_tx_bytes, network_rx_bytes, network_policy_generation, applied_network_policy_generation, applied_network_policy_source, network_policy_authority, auto_lifecycle_authority, current_local_artifact_id, current_local_artifact_kind, current_local_artifact_origin, execution_metadata_json, volume_encryption, space_api_route_generation, space_api_route_node_id, space_api_route_execution_generation, space_api_route_pod_uid, restore_origin, restore_phase, restore_storage_uri, space_api_route_substrate_kind, space_api_route_activation_attempt_id, spaced_endpoint_proof_json, disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec, node_execution_id, guest_image_contract_json
          FROM sandboxes
          WHERE netgtw_pid = ?1 AND uid = ?2
            AND state IN ('starting', 'started', 'stopping', 'pausing', 'paused',

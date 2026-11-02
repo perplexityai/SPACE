@@ -21,6 +21,7 @@ use pplx_space_common_svc::types::{
     SANDBOX_FAILURE_EPISODE_KEY, SANDBOX_FAILURE_EXECUTION_GENERATION_KEY,
     SANDBOX_FAILURE_POD_UID_KEY,
 };
+use pplx_space_metrics::operations::InlineAdmissionPath;
 use pplx_space_metrics::warm_pool::AdmissionClaimOutcome;
 use pplx_space_public_api::{
     ConditionStatus, CreateSandboxRequest, OperationId, OperationKind, OperationState,
@@ -48,6 +49,7 @@ use crate::{
         },
         substrate::AdmissionPoolClaim,
     },
+    inline_operations::InlineRefusal,
     middleware::auth::{AuthFederatedOwner, AuthOrg, AuthUser},
     models::{Sandbox, SandboxMetadata as ControllerSandboxMetadata, SandboxMetadataValue},
     public_operations::{
@@ -109,7 +111,7 @@ pub async fn create_sandbox(
     let pool_claims =
         native_create_pool_claim_enabled(&state.feature_flags).then(|| NativeCreatePoolClaims {
             controller: &state.sandbox_controller,
-            inline: inline_create::InlineCreate::from_env(&state.pool, &state.sandbox_controller),
+            inline: inline_create::InlineCreate::from_env(&state),
         });
     let response = create_native_sandbox_operation(
         &state.pool,
@@ -179,10 +181,10 @@ pub(crate) struct NativeCreatePoolClaims<'a> {
 /// error) records the create with a fresh ID and no claim, as the disabled
 /// path does.
 ///
-/// With inline execution on, a create that won a claim is also claimed for
-/// execution in that transaction, and runs here (see [`inline_create`])
-/// before the response, up to a short deadline. Every other create is
-/// recorded queued for the dispatcher, as before.
+/// With inline execution on, a create that won a claim and an inline permit
+/// is also claimed for execution in that transaction, and runs here (see
+/// [`inline_create`]) before the response, up to a short deadline. Every
+/// other create is recorded queued for the dispatcher, as before.
 ///
 /// `sandbox_quota` is the caller's live-sandbox limits, `None` when it has
 /// none. A new create that would exceed one is refused with a non-retryable
@@ -300,6 +302,11 @@ pub(crate) async fn create_native_sandbox_operation(
             match admission.observation().clone() {
                 ObservePublicOperationIdempotency::Existing(operation_id) => {
                     admission.finish().await?;
+                    if let Some(inline) = &inline {
+                        inline
+                            .runner
+                            .refuse(InlineAdmissionPath::WarmPoolCreate, InlineRefusal::Replay);
+                    }
                     (
                         fresh_sandbox_id,
                         AdmissionClaimOutcome::Hit,
@@ -338,14 +345,22 @@ pub(crate) async fn create_native_sandbox_operation(
                             let sandbox_id = PublicSandboxId::from(claim.sandbox_id);
                             let sandbox_id_string = sandbox_id.to_string();
                             let input = create(sandbox_id, &sandbox_id_string, Some(claim));
-                            let result = if inline.is_some() {
+                            // Without a permit the create is recorded
+                            // queued, as with the kill switch off.
+                            let permit = inline.as_ref().and_then(|inline| {
+                                inline
+                                    .runner
+                                    .try_acquire(InlineAdmissionPath::WarmPoolCreate)
+                                    .ok()
+                            });
+                            let result = if let Some(permit) = permit {
                                 match admission.create_claimed_or_roll_back(input).await? {
                                     CreateClaimedPublicOperationResult::Claimed {
                                         claim_token,
                                         operation,
                                     } => {
                                         let operation_id = operation.id;
-                                        inline_claim = Some((claim_token, operation));
+                                        inline_claim = Some((permit, claim_token, operation));
                                         CreatePublicOperationResult::Created(operation_id)
                                     }
                                     CreateClaimedPublicOperationResult::Existing(operation_id) => {
@@ -432,8 +447,10 @@ pub(crate) async fn create_native_sandbox_operation(
         CreatePublicOperationResult::AdmissionDenied => return Err(PublicApiError::internal()),
     };
 
-    if let Some((inline, (claim_token, operation))) = inline.zip(inline_claim)
-        && inline.run(store.clone(), claim_token, operation).await
+    if let Some((inline, (permit, claim_token, operation))) = inline.zip(inline_claim)
+        && inline
+            .run(permit, store.clone(), claim_token, operation)
+            .await
     {
         response.operation = finished_operation(&store, org_id, response.operation_id).await?;
     }

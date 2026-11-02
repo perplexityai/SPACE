@@ -162,6 +162,7 @@ pub trait ReleaseSource: Send + Sync {
 }
 
 /// Map the compiled Firecracker layout to the upstream archive's member names.
+#[cfg(any(test, feature = "github"))]
 pub(super) fn firecracker_payload(release: &RuntimeIdentity, architecture: Arch) -> ReleasePayload {
     use pplx_space_node_runtime_core::runtime_inventory::diagnostic::FIRECRACKER_RELEASE_LAYOUT;
     let version = release.version.as_str();

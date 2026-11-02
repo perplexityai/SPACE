@@ -6,7 +6,7 @@
 pub(crate) const TEMPLATE_DIR: &str = pplx_space_common_core::host::linux::paths::TEMPLATE_DIR;
 
 /// Fixed guest IP — same for every sandbox, isolation via namespace NAT.
-pub(crate) const GUEST_IP: &str = "169.254.0.21";
+pub(crate) const GUEST_IP: std::net::Ipv4Addr = pplx_space_net_common::guest_link::GUEST;
 
 /// Linux build guests need the exit event their VMM implements. Firecracker
 /// exits on reset; Cloud Hypervisor handles reset by rebooting the guest and

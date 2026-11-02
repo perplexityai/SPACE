@@ -51,7 +51,7 @@ Each newly pinned object was downloaded, checked against its listed byte count,
 inspected for the expected boot-image architecture and Linux release banner,
 and hashed with SHA-256. The bucket does not publish independent SHA-256
 checksums; the compiled pins identify those reviewed bytes. Pin values live in
-`crates/libs/node/runtime/core/src/catalog.rs`.
+`crates/libs/execution/catalog/src/catalog.rs`.
 
 The September snapshot's `vmlinux-5.10.260` is deliberately excluded: both
 architectures report `Linux version 5.10.255-260`, which contradicts the listed

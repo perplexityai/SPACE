@@ -274,15 +274,18 @@ impl SandboxManagerService {
                     .unwrap_or("<unhashed>"),
                 &resolved_template.arch,
             )?;
-            reject_incompatible_template_spaced_compatibility(
+            let image = resolved_template.guest_image;
+            if image.expects_agent() {
+                reject_incompatible_template_spaced_compatibility(
                 template,
                 resolved_template
                     .content_hash
                     .as_deref()
                     .unwrap_or("<unhashed>"),
                 resolved_template.spaced_version.as_deref(),
-                resolved_template.spaced_compatibility_family.as_deref(),
-            )?;
+                    resolved_template.spaced_compatibility_family.as_deref(),
+                )?;
+            }
 
             let target = super::create_support::CreateTarget {
                 snapshot_dir: resolved_template.snapshot_dir.as_deref(),
@@ -530,6 +533,7 @@ impl SandboxManagerService {
             super::validation::validate_execution_lifecycle_policy(Some(&resolved_template.execution), &auto_lifecycle)?;
 
             self.create_with_id(CreateWithIdArgs {
+                guest_image: resolved_template.guest_image,
                 req,
                 sandbox_owner: &sandbox_owner,
                 effective_mode,
@@ -1190,7 +1194,9 @@ impl SandboxManagerService {
             // Catalog reads do not materialize artifacts and must not inherit
             // GetTemplate's cold-download budget. Includes lazy connection.
             std::time::Duration::from_secs(5),
-            client.list_templates(pplx_space_template_mgr_client::proto::ListTemplatesRequest {}),
+            client.list_templates(
+                pplx_space_template_mgr_client::proto::ListTemplatesRequest::default(),
+            ),
         )
         .await
         .map_err(|_| Status::deadline_exceeded("template catalog lookup timed out"))??

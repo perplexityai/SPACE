@@ -116,7 +116,7 @@ pub(super) async fn fetch_template_default_policy(template: &str) -> Option<Auto
         exit_error(format!("cannot connect to template-manager: {error}"));
     });
     let response = client
-        .list_templates(pplx_space_template_mgr_client::proto::ListTemplatesRequest {})
+        .list_templates(pplx_space_template_mgr_client::proto::ListTemplatesRequest::default())
         .await
         .unwrap_or_else(|error| exit_error(error))
         .into_inner();

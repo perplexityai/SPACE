@@ -19,9 +19,8 @@
 use pplx_space_common_core::types::NodeId;
 
 use pplx_space_common_core::sql;
-use pplx_space_sandbox_teardown::{
-    delete_reconcile_state_for_elements, finalize_sandbox_db_delete_tx,
-};
+use pplx_space_sandbox_store::delete::delete_with_dependents;
+use pplx_space_sandbox_teardown::delete_reconcile_state_for_elements;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1176,7 +1175,7 @@ impl OrphanActionSink for SubstrateActionSink {
                 finalize_tx.rollback().await?;
                 return Ok(ClassifyOutcome::SkippedTerminal);
             };
-            finalize_sandbox_db_delete_tx(&mut finalize_tx, sandbox_id).await?;
+            delete_with_dependents(&mut finalize_tx, sandbox_id).await?;
             finalize_tx.commit().await?;
             emit_orphan_reconcile_event(
                 sandbox_id,
