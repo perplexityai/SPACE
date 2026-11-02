@@ -40,6 +40,25 @@ pub const DEFAULT_NODE_CONFIG_PATH: &str = "/space/config/nodemgr.toml";
 // Hard-coded so two instances on the same host cannot be configured to use
 // different mutex files and both acquire concurrently.
 const SERVICE_MUTEX_PATH: &str = "/space/run/node-manager/service.mutex";
+/// Streams a client may reset before node-manager accepts them, per
+/// connection, before h2's rapid-reset guard closes that connection with
+/// ENHANCE_YOUR_CALM. The socket is mode 0770, root and `space-nodeclients`:
+/// sandbox-manager, template-manager, volume-manager, runtime-manager,
+/// node-ctl, node-api and local operator accounts. Sandbox processes drop
+/// supplementary groups before they run. This listener advertises no
+/// concurrent-stream limit, so this bound is what caps a client's streams that
+/// are reset while they wait to be accepted; the rate limiter sees only
+/// accepted ones. A client that reaches it is disconnected and must reconnect
+/// to add more.
+///
+/// A trusted client resets streams when node-manager stalls and the client
+/// times its calls out. On sandbox-manager's one connection, a stall longer
+/// than the endpoint-proof retry window resets up to seven attempts per proof
+/// being validated, which concurrent callers share, plus about one periodic
+/// status poll per second. With three sandboxes starting processes through an
+/// 18 s stall, h2's default of 20 closed the connection when node-manager
+/// resumed; this bound leaves room for a few more.
+const MAX_PENDING_ACCEPT_RESET_STREAMS: usize = 64;
 const RUNTIME_SUPERVISOR_CONNECT_RETRY_HEALTH_SERVICE: &str = "runtime-supervisor-connect-retry";
 const RUNTIME_SUPERVISOR_ACTIVATOR: &str = "/opt/space/bin/node-manager-runtime-supervisor.sh";
 const RUNTIME_SUPERVISOR_RESTART_REQUIRED: &str = "/space/run/runtime-supervisor/restart-required";
@@ -873,6 +892,7 @@ pub async fn run(
         };
         let server_handle = tokio::spawn(
             pplx_space_common_svc::grpc_server_builder()
+                .http2_max_pending_accept_reset_streams(Some(MAX_PENDING_ACCEPT_RESET_STREAMS))
                 .layer(pplx_space_common_svc::conservative_uds_grpc_rate_limiter_layer(SERVICE_NAME))
                 .layer(pplx_space_common_svc::grpc_trace_layer())
                 .add_service(health_service)

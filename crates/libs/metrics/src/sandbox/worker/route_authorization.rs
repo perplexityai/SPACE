@@ -137,11 +137,14 @@ impl SpacedEndpointAttestationResult {
     }
 }
 
-pub fn spaced_endpoint_attestation(result: SpacedEndpointAttestationResult) {
+/// One endpoint attestation outcome. `code` is the gRPC code the caller is
+/// answered with (`ok` on success), so a retryable `unavailable` stays
+/// separable from a terminal `internal` within the `unavailable` result.
+pub fn spaced_endpoint_attestation(result: SpacedEndpointAttestationResult, code: &str) {
     counter(
         "sandbox.worker.spaced_endpoint.attestation",
         1,
-        &[tag("result", result.as_str())],
+        &[tag("result", result.as_str()), tag("code", code)],
     );
 }
 

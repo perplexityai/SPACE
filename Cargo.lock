@@ -7070,6 +7070,7 @@ dependencies = [
  "bytes",
  "dashmap",
  "futures-util",
+ "h2",
  "hex",
  "http 1.5.0",
  "http-body 1.1.0",

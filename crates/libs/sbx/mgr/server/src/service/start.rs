@@ -422,7 +422,7 @@ impl StartSandboxContext {
 
 /// Short, low-cardinality string for a gRPC status code, suitable as a
 /// metric tag `reason` value.
-fn short_grpc_code(code: tonic::Code) -> &'static str {
+pub(super) fn short_grpc_code(code: tonic::Code) -> &'static str {
     match code {
         tonic::Code::Ok => "ok",
         tonic::Code::Cancelled => "cancelled",
