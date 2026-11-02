@@ -10,6 +10,7 @@ use pplx_space_events::{
 };
 use pplx_space_sandbox_portability::portable_for_restore_affinity;
 use pplx_space_sandbox_store as sandbox_store;
+use pplx_space_sandbox_store::delete::{mark_deleting, restore_lifecycle_from_deleting};
 use pplx_space_sandbox_store::fork_source_lifecycle::{
     active_fork_source_operation_exists, lock_fork_source_lifecycle,
 };
@@ -185,15 +186,9 @@ async fn begin_delete_against_active_fork(
             })
     })
     .transpose()?;
-    sqlx::query(sql!(
-        "UPDATE sandboxes
-         SET lifecycle = 'deleting'
-         WHERE id = $1"
-    ))
-    .bind(sandbox_id)
-    .execute(&mut *guard)
-    .await
-    .map_err(|error| db_contention_error("failed to persist sandbox delete intent", &error))?;
+    mark_deleting(&mut guard, sandbox_id)
+        .await
+        .map_err(|error| db_contention_error("failed to persist sandbox delete intent", &error))?;
     guard
         .commit()
         .await
@@ -206,27 +201,19 @@ async fn restore_lifecycle_after_failed_delete(
     sandbox_id: SandboxId,
     lifecycle: pplx_space_common_core::types::SandboxLifecycle,
 ) -> Result<(), ControllerError> {
-    let changed = sqlx::query(sql!(
-        "UPDATE sandboxes
-         SET lifecycle = $2
-         WHERE id = $1 AND lifecycle = 'deleting'"
-    ))
-    .bind(sandbox_id)
-    .bind(lifecycle.as_str())
-    .execute(pool)
-    .await
-    // This compensating UPDATE takes a row lock on `sandboxes`, so it can lose
-    // a race with any concurrent writer of that row. Its caller uses `?`, so a
-    // failure here replaces the original delete error *and* leaves the row in
-    // `lifecycle = 'deleting'` — which denies fork admission against the
-    // sandbox and makes the "retry the DELETE" advice unachievable. Classified
-    // so the caller is at least told to retry; the residual is that a failed
-    // restore still leaves the row pinned until that retry lands.
-    .map_err(|error| {
-        db_contention_error("failed to restore sandbox after deferred deletion", &error)
-    })?
-    .rows_affected();
-    if changed == 1 {
+    let restored = restore_lifecycle_from_deleting(pool, sandbox_id, lifecycle)
+        .await
+        // This compensating UPDATE takes a row lock on `sandboxes`, so it can lose
+        // a race with any concurrent writer of that row. Its caller uses `?`, so a
+        // failure here replaces the original delete error *and* leaves the row in
+        // `lifecycle = 'deleting'` — which denies fork admission against the
+        // sandbox and makes the "retry the DELETE" advice unachievable. Classified
+        // so the caller is at least told to retry; the residual is that a failed
+        // restore still leaves the row pinned until that retry lands.
+        .map_err(|error| {
+            db_contention_error("failed to restore sandbox after deferred deletion", &error)
+        })?;
+    if restored {
         Ok(())
     } else {
         Err(ControllerError::internal(
@@ -243,30 +230,22 @@ async fn restore_lifecycle_after_failed_finalize_delete(
     let Some(previous_lifecycle) = previous_lifecycle else {
         return Ok(());
     };
-    let changed = sqlx::query(sql!(
-        "UPDATE sandboxes
-         SET lifecycle = $2
-         WHERE id = $1 AND lifecycle = 'deleting'"
-    ))
-    .bind(sandbox_id)
-    .bind(previous_lifecycle.as_str())
-    .execute(pool)
-    .await
-    // This compensating UPDATE takes a row lock on `sandboxes`, so it can lose
-    // a race with any concurrent writer of that row. Its caller uses `?`, so a
-    // failure here replaces the original delete error *and* leaves the row in
-    // `lifecycle = 'deleting'` — which denies fork admission against the
-    // sandbox and makes the "retry the DELETE" advice unachievable. Classified
-    // so the caller is at least told to retry; the residual is that a failed
-    // restore still leaves the row pinned until that retry lands.
-    .map_err(|error| {
-        db_contention_error(
-            "failed to restore sandbox after deletion finalization",
-            &error,
-        )
-    })?
-    .rows_affected();
-    if changed == 1 {
+    let restored = restore_lifecycle_from_deleting(pool, sandbox_id, previous_lifecycle)
+        .await
+        // This compensating UPDATE takes a row lock on `sandboxes`, so it can lose
+        // a race with any concurrent writer of that row. Its caller uses `?`, so a
+        // failure here replaces the original delete error *and* leaves the row in
+        // `lifecycle = 'deleting'` — which denies fork admission against the
+        // sandbox and makes the "retry the DELETE" advice unachievable. Classified
+        // so the caller is at least told to retry; the residual is that a failed
+        // restore still leaves the row pinned until that retry lands.
+        .map_err(|error| {
+            db_contention_error(
+                "failed to restore sandbox after deletion finalization",
+                &error,
+            )
+        })?;
+    if restored {
         return Ok(());
     }
 
