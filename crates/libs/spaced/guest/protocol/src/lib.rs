@@ -20,6 +20,10 @@ pub mod proto {
     }
 }
 
+/// Host and guest endpoints of the shared vsock bridge.
+pub const BRIDGE_HOST_VSOCK_PORT: u32 = 5001;
+pub const BRIDGE_GUEST_VSOCK_PORT: u32 = 5002;
+
 pub mod filesystem_limits;
 pub mod platform;
 pub mod process_limits;

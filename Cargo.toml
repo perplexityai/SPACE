@@ -41,6 +41,7 @@ members = [
     "crates/libs/spaced/common",
     "crates/libs/spaced/guest/client",
     "crates/libs/spaced/guest/server",
+    "crates/libs/spaced/guest/windows",
     "crates/libs/spaced/host/client",
     "crates/libs/spaced/host/server",
     "crates/libs/test-env",
@@ -468,6 +469,7 @@ pplx-space-spaced-guest-execution = { path = "crates/libs/spaced/guest/execution
 pplx-space-spaced-common = { path = "crates/libs/spaced/common" }
 pplx-space-spaced-guest-client = { path = "crates/libs/spaced/guest/client" }
 pplx-space-spaced-guest-server = { path = "crates/libs/spaced/guest/server" }
+pplx-space-spaced-guest-windows = { path = "crates/libs/spaced/guest/windows" }
 pplx-space-spaced-host-client = { path = "crates/libs/spaced/host/client" }
 pplx-space-spaced-host-server = { path = "crates/libs/spaced/host/server" }
 pplx-space-template-mgr = { path = "crates/libs/template/mgr" }
