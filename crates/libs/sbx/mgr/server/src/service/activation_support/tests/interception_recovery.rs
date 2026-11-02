@@ -271,7 +271,7 @@ async fn exercise_recovery(restore: bool) {
                     control.refresh_network_policy(request).await.map(Response::into_inner)
                         .map_err(super::super::super::network_runtime::NetworkPolicyRefreshAttemptError::Rpc)
                 }
-            }).await.map_err(network_policy_refresh_error_to_status)
+            }).await.map(drop).map_err(network_policy_refresh_error_to_status)
         }
     };
     let (cleanup_tx, mut cleanup_rx) = tokio::sync::oneshot::channel();

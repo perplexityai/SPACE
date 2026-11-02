@@ -53,6 +53,48 @@ impl GuestServiceUnavailable {
     }
 }
 
+/// An UNAVAILABLE its server answers by design while a dependency it owns is
+/// still being prepared, which the caller retries shortly and expects to
+/// succeed. The gRPC trace layers log it at debug rather than as a failed
+/// call. Its caller still handles it as UNAVAILABLE: the marker changes no
+/// retry decision. Only the server that refuses sets the marker. spaced-host
+/// removes it with [`Self::strip`] from every status it relays from a guest or
+/// from host control; a hop that forwards a status unchanged, such as
+/// sandbox-manager forwarding the node credential agent's answer to the
+/// gateway, keeps it. A marker on any other code is ignored, so it cannot
+/// quiet a platform failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetryableNotReady;
+
+const RETRY_CLASS_METADATA: &str = "space-retry-class";
+const RETRY_CLASS_NOT_READY: &str = "not_ready";
+
+impl RetryableNotReady {
+    pub fn from_status(status: &Status) -> Option<Self> {
+        (status.code() == Code::Unavailable
+            && status
+                .metadata()
+                .get(RETRY_CLASS_METADATA)
+                .and_then(|value| value.to_str().ok())
+                == Some(RETRY_CLASS_NOT_READY))
+        .then_some(Self)
+    }
+
+    pub fn mark(self, mut status: Status) -> Status {
+        status.metadata_mut().insert(
+            RETRY_CLASS_METADATA,
+            MetadataValue::from_static(RETRY_CLASS_NOT_READY),
+        );
+        status
+    }
+
+    /// Remove the marker from a status this hop relays rather than refuses.
+    pub fn strip(mut status: Status) -> Status {
+        status.metadata_mut().remove(RETRY_CLASS_METADATA);
+        status
+    }
+}
+
 /// Classify only errors from a TCP connect to an authenticated guest endpoint.
 /// Internal RPC socket errors must never pass through this boundary.
 pub fn guest_service_connect_status(error: &std::io::Error) -> Status {
