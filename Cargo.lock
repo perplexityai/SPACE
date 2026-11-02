@@ -7020,6 +7020,7 @@ dependencies = [
  "pplx-space-db-test-fixtures",
  "pplx-space-placement",
  "pplx-space-sandbox-portability",
+ "pplx-space-sandbox-routability",
  "pplx-space-sandbox-teardown",
  "pplx-space-test-env",
  "serde",

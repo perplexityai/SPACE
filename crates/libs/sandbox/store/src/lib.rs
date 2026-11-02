@@ -18,20 +18,23 @@
 //!   [`set_auto_lifecycle_policy`]) touch `sandboxes` only and re-check
 //!   nothing in their `WHERE` beyond the row's id.
 //! * **Column writes respect the row's triggers.** `sandboxes` carries five
-//!   `BEFORE UPDATE` triggers. `updated_at` is trigger-maintained, so no verb
-//!   here assigns it; and because two of the triggers have no change guard,
-//!   no verb may promise it touches only the columns it names. See
+//!   `BEFORE UPDATE` triggers. `updated_at` is trigger-maintained, so verbs
+//!   here leave it to the trigger, except
+//!   [`ingest::prune_census_absent_sandboxes`], whose statement moved
+//!   unchanged; and because two of the triggers have no change guard, no verb
+//!   may promise it touches only the columns it names. See
 //!   [`update_desired_state`].
 //!
 //! * **Guarded transitions and the delete are modules, not CRUD.** Statements
 //!   whose `WHERE` re-checks a lifecycle/lease/generation precondition (the
 //!   wake-completion CAS, the restore claims) are correctness mechanisms, not
 //!   row updates, and no plain `update` verb here may absorb one. Each moves
-//!   here as its own module named for its transition, as [`lost`] and
-//!   [`delete`] have; the ratchet above counts the ones still elsewhere. The
-//!   caller keeps its locks and its transaction: each function runs on the
-//!   transaction or executor its caller passes, and none begins or commits a
-//!   transaction. [`delete::delete_with_dependents`] reaches past the row:
+//!   here as its own module, named for its transition or for the path that
+//!   issues it, as [`lost`], [`delete`] and [`ingest`] have; the ratchet
+//!   above counts the ones still elsewhere. The caller keeps its locks and
+//!   its transaction: each function runs on the transaction or executor its
+//!   caller passes, and none begins or commits a transaction.
+//!   [`delete::delete_with_dependents`] reaches past the row:
 //!   some rows that do not cascade from it (observed state, reconcile state,
 //!   claimed warm-pool slots) have to be deleted, and snapshot storage
 //!   locations detached, in the same transaction. It calls
@@ -39,6 +42,9 @@
 //!   `pplx-space-cluster-pool` for the slots; the observed-state delete and
 //!   the snapshot-storage detach are written inline, although
 //!   `snapshot_storage_locations` belongs to `pplx-space-snapshot-store`.
+//!   A transition that is one statement whose CTEs also write a sibling
+//!   table, as several in [`ingest`] do, stays one statement: splitting it
+//!   would change what it does.
 //! * **Locking reads are not gets.** `SELECT ... FOR UPDATE` acquires a row
 //!   lock inside a caller's transaction; converting one to [`get`] would drop
 //!   the lock. They stay at their call sites.
@@ -96,6 +102,7 @@ use uuid::Uuid;
 mod create;
 pub mod delete;
 pub mod fork_source_lifecycle;
+pub mod ingest;
 pub mod lost;
 
 pub use create::{SandboxCreate, insert_pooled, insert_unplaced};
