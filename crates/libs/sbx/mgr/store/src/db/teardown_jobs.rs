@@ -117,12 +117,7 @@ fn fail_operation(
                 }
                 super::mark_teardown_suspend_backup_permanently_failed(&tx, id, failed_artifact)?;
             }
-            pplx_space_common_jobs::db::fail_job_permanent(
-                tx.raw(),
-                &operation.job_id,
-                reason.as_str(),
-                None,
-            )?;
+            super::store_job_failures::fail_job_permanent(&tx, &operation.job_id, reason.as_str())?;
             true
         } else {
             false
@@ -141,12 +136,7 @@ pub(super) fn fail_active(
     reason: TeardownSuspendFailure,
 ) -> Result<()> {
     if let Some(operation) = active_teardown_suspend_operation(conn, id)? {
-        pplx_space_common_jobs::db::fail_job_permanent(
-            conn.raw(),
-            &operation.job_id,
-            reason.as_str(),
-            None,
-        )?;
+        super::store_job_failures::fail_job_permanent(conn, &operation.job_id, reason.as_str())?;
     }
     Ok(())
 }
@@ -187,11 +177,10 @@ pub fn reconcile_terminal_teardown_suspend_jobs(conn: &Connection) -> Result<usi
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(statement);
     for job in &jobs {
-        pplx_space_common_jobs::db::fail_job_permanent(
-            tx.raw(),
+        super::store_job_failures::fail_job_permanent(
+            &tx,
             job,
             TeardownSuspendFailure::Reconciled.as_str(),
-            None,
         )?;
     }
     tx.commit()?;
