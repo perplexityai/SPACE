@@ -62,7 +62,7 @@ the ordinary smoke job logs.
 | Concurrency | Same-key create and command fanout, independent commands, pause/wake contention, slow-reader output integrity | Included |
 | Recovery | Queued create across controller outage/API restart; original command session across data-plane restart; work queued through an outage longer than its deadline expires, and a delete queued with it still runs | Included on Kind only |
 | Dispatcher fairness | Independent work completes while an earlier valid suspend is blocked | Included on Kind only |
-| Inline execution | A wake the API runs is re-driven by the dispatcher after every API pod is killed; a wake behind a queued suspend stays queued and runs after it; at one inline permit per API pod, concurrent creates past it queue and all succeed; creates, wakes and a suspend accepted across a controller leader handover all succeed | Included on Kind only; inconclusive where the API's inline switches are off |
+| Inline execution | A wake the API runs is re-driven by the dispatcher after every API pod is killed; a wake behind a queued suspend stays queued and runs after it; at one inline permit per API pod, concurrent creates past it queue and all succeed; creates and wakes the API runs while no controller runs are each claimed once and end once after a new controller leader is elected under them, and a suspend queued behind them succeeds | Included on Kind only; each scenario turns inline execution on for its own run |
 | Lifecycle | Stopped sandbox restarts with its retained rootfs | Included |
 
 Quarantine uses the existing `quarantined=` scenario declaration. Implicit
@@ -149,17 +149,20 @@ revalidates those identities, local Kind node inventory, deployment ownership
 and a shared mutation lease, and pins any autoscaler on a target Deployment to
 its current replica count until the Deployments are restored.
 
-The `native_recovery.inline_*` scenarios stop the controller too, so an
-operation that reaches `running` meanwhile is one the API runs inline. The
-API pod kill force-deletes every API pod, with no drain; the permit scenario
-sets `SPACE_NATIVE_INLINE_MAX_CONCURRENT=1` on the API under the public API
-mutation Lease, which records the standing value and restores it; the
-failover scenario replaces every cluster-controller pod while work is
-accepted. The two scenarios whose subject is queued work,
-`queued_create_survives_api_restart` and
-`stale_queued_work_expires_after_controller_outage`, set the API's inline
-permits to `0` the same way, so their create is queued even where the chart
-turns inline execution on.
+The `native_recovery.inline_*` scenarios are the only ones that run native
+work inline: the Kind chart leaves inline execution off, as the binary does,
+so every other scenario exercises the dispatcher. Each turns it on for its own
+run, setting `SPACE_NATIVE_INLINE_OPERATIONS_ENABLED` and
+`SPACE_NATIVE_INLINE_KINDS` (and, for the permit scenario,
+`SPACE_NATIVE_INLINE_MAX_CONCURRENT=1`) on the API under the public API
+mutation Lease, which records the standing values and restores them. Each
+also stops the controller before it acts, so an operation that reaches
+`running` meanwhile is one the API runs inline. The API pod kill then
+force-deletes every API pod, with no drain. The failover scenario runs creates
+and wakes inline with the controller stopped, queues a suspend, and restores
+the controller, so a new leader is elected while their claims may still be
+live; it requires each create and wake to have been claimed once and to end
+once.
 
 When invoking a Kind-only fault scenario directly (including zero-vCPU
 admission) rather than through the Kind shell harness, supply `SPACE_SMOKE_NATIVE_RECOVERY=1`,

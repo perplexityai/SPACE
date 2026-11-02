@@ -122,9 +122,11 @@ the same transaction that records it. It does so only when:
 - the env master `SPACE_NATIVE_INLINE_OPERATIONS_ENABLED` is on, the kind is in
   `SPACE_NATIVE_INLINE_KINDS`, and the `space-native-inline-operations` flag
   allows the organization;
-- the process has one of its `SPACE_NATIVE_INLINE_MAX_CONCURRENT` permits free
-  and is not draining;
 - nothing else for the sandbox is queued or running;
+- the process has one of its `SPACE_NATIVE_INLINE_MAX_CONCURRENT` permits free
+  and is not draining. Admission takes the permit only here, after it has
+  created the operation and found nothing ahead of it, so a request that joins
+  other work, or waits on the sandbox's locks, holds none;
 - the organization is under `SPACE_NATIVE_INLINE_ORG_LIMIT`.
 
 Anything else records the operation queued exactly as before, for the
@@ -139,7 +141,9 @@ the admission claim is sound only while both hold.
 The record, the claim and the execution are the dispatcher's. The API runs the
 same executors through the same driver, so claim renewal, retry deferral and
 the operation deadline behave the same, and every retry is requeued for the
-dispatcher. If the API process dies mid-execution, its claim stops being
+dispatcher. The claim commits in the task that runs the operation, not in
+the request, so a client that disconnects mid-commit cannot leave a claim
+that nothing runs. If the API process dies mid-execution, its claim stops being
 renewed. After the claim staleness window (60 s) the dispatcher claims the
 same operation again, so nothing is lost, though that operation finishes later
 than a queued one would have. A graceful API shutdown waits for running inline

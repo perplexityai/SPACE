@@ -2,7 +2,6 @@
 
 import time
 
-from space_smoke.native_inline import inline_permits
 from space_smoke.native_recovery import (
     RECOVERY_ENVIRONMENT,
     KindNativeHardeningFixture,
@@ -27,9 +26,7 @@ def stale_queued_work_expires_after_controller_outage(test: KindNativeHardeningF
     deadline expire without running; a delete queued with them still runs.
     """
     control = test.recovery
-    # Queued work is the subject, so inline execution is off throughout: with
-    # it on, the API would run the create itself instead of queuing it.
-    with inline_permits(test, control, 0), control.owned_faults():
+    with control.owned_faults():
         with test.context.phase("prepare a sandbox to pause and one to delete"):
             pause_target = test.create_ready(timeout=120)
             delete_target = test.create_ready(timeout=120)
