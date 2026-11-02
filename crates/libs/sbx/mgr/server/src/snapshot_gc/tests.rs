@@ -479,7 +479,9 @@ fn sweep_discovers_gc_pending_orphans_and_skips_unrelated() {
     let tmp = TempDir::new().unwrap();
     let sandbox_dir = tmp.path().join("sbx-abc/snapshot");
     std::fs::create_dir_all(&sandbox_dir).unwrap();
-    let orphan = tmp.path().join("sbx-abc/snapshot.gc-pending-deadbeef");
+    let orphan = tmp
+        .path()
+        .join(format!("sbx-abc/snapshot.gc-pending-{TEST_ART_ID}"));
     std::fs::create_dir_all(&orphan).unwrap();
     std::fs::write(orphan.join("memory"), b"stale").unwrap();
     let snapshots = tmp.path().join("sbx-abc/snapshots");
@@ -491,9 +493,12 @@ fn sweep_discovers_gc_pending_orphans_and_skips_unrelated() {
     std::fs::create_dir(unrelated.join("stray.gc-pending-held")).unwrap();
 
     // A wide first directory spans pages without growing retained discovery.
-    for index in 0..270 {
-        std::fs::create_dir(snapshots.join(format!("item.gc-pending-{index}"))).unwrap();
+    for _ in 0..270 {
+        std::fs::create_dir(snapshots.join(format!("item.gc-pending-{}", LocalArtifactId::new())))
+            .unwrap();
     }
+    // The marker without an artifact id is part of a snapshot's own name.
+    std::fs::create_dir(snapshots.join("run.gc-pending-1")).unwrap();
     let outside = TempDir::new().unwrap();
     std::fs::create_dir(outside.path().join("outside.gc-pending-held")).unwrap();
     std::os::unix::fs::symlink(outside.path(), tmp.path().join("escape")).unwrap();
@@ -937,7 +942,8 @@ async fn named_delete_failing_partway_leaves_staging_for_the_orphan_sweep() {
 /// The sweep reclaims unowned staging in both shapes: the fixed-length
 /// `.gc-pending-<id>` and `<name>.gc-pending-<id>`, which an earlier version
 /// left, beside a suspend artifact and inside `snapshots/`. Staging whose row
-/// still exists is kept.
+/// still exists is kept, and so is a snapshot whose name contains the marker
+/// with no artifact id after it.
 #[tokio::test]
 async fn orphan_sweep_reclaims_staging_in_either_shape() {
     use pplx_space_node_mgr_client::proto::{
@@ -958,7 +964,8 @@ async fn orphan_sweep_reclaims_staging_in_either_shape() {
         )),
     ];
     let owned = sandbox.join(format!("snapshots/.gc-pending-{}", ids[4]));
-    for dir in unowned.iter().chain([&owned]) {
+    let ordinary = sandbox.join("snapshots/run.gc-pending-1");
+    for dir in unowned.iter().chain([&owned, &ordinary]) {
         fs::create_dir(dir).unwrap();
         fs::write(dir.join("memory"), b"staged").unwrap();
     }
@@ -1010,6 +1017,7 @@ async fn orphan_sweep_reclaims_staging_in_either_shape() {
     assert_eq!(deleted, expected);
     assert!(unowned.iter().all(|dir| !dir.exists()));
     assert!(owned.join("memory").exists());
+    assert!(ordinary.join("memory").exists());
 }
 
 /// The reaper evicts artifacts whose names are as long as a filename can be:

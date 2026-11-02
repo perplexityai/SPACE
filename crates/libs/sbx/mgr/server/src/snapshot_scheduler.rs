@@ -499,19 +499,22 @@ async fn process_tick(
 
     // Disk snapshots publish under the artifact lock so backup selection never
     // races their creation or their retention deletion; `prune_and_capture`
-    // holds it across both.
+    // takes it for each, and deletes the pruned snapshots' staging between
+    // them with it released.
     //
     // Retention keeps a pinned, leased or unreadable snapshot and capture goes
     // on, so such snapshots can hold a tier above its `KEEP_*` count. This tick
     // may also add one snapshot per due tier above its retention count; the
-    // next successful prune removes that surplus before creating more.
+    // next successful prune removes that surplus before creating more. A
+    // failed prune, or GC staging it cannot delete, fails the tick before any
+    // capture, the full checkpoint included, so a failing node-manager delete
+    // stops growth instead of adding a snapshot and its staging every tick.
     // Deletions from completed pages remain useful progress on a retry.
-    let cache_root = pplx_space_common_core::host::linux::paths::SANDBOX_CACHE_DIR;
     prune_and_capture(
         &mut node_client,
         ctx,
         sandbox_id,
-        cache_root,
+        CACHE_DIR,
         async |node_client| {
             // Always create a 1m disk snapshot.
             let disk_1m_name = format!("d-1m-{ts}");
