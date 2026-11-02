@@ -4,8 +4,8 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
-    ClaimedPoolSlot, InvalidPoolConfigRow, PoolConfig, PoolConfigRead, PoolError, PoolSlot,
-    PoolSlotCounts, ReservedPoolSlot, Result,
+    AutoscaleRead, ClaimedPoolSlot, InvalidAutoscaleRow, InvalidPoolConfigRow, PoolConfig,
+    PoolConfigRead, PoolError, PoolSlot, PoolSlotCounts, ReservedPoolSlot, Result,
     models::{
         PoolObservedDemand, PoolPolicyRelease, parse_disk_io_limits, parse_disk_mib,
         parse_memory_mib, parse_vcpu,
@@ -86,6 +86,39 @@ pub(crate) fn decode_config_rows(rows: Vec<PoolConfigRow>) -> PoolConfigRead {
     read
 }
 
+/// A row an autoscale read decodes into a candidate input.
+pub(crate) trait AutoscaleInputRow {
+    fn template_release_id(&self) -> Uuid;
+}
+
+/// Decodes each autoscale input row on its own, as [`decode_config_rows`] does
+/// for configs: a row that does not decode goes to `invalid` instead of
+/// failing the read.
+pub(crate) fn decode_autoscale_rows<R, T>(
+    rows: Vec<R>,
+    read: AutoscaleRead,
+    invalid: &mut Vec<InvalidAutoscaleRow>,
+) -> Vec<T>
+where
+    R: AutoscaleInputRow,
+    T: TryFrom<R, Error = PoolError>,
+{
+    rows.into_iter()
+        .filter_map(|row| {
+            let template_release_id = row.template_release_id();
+            T::try_from(row)
+                .map_err(|error| {
+                    invalid.push(InvalidAutoscaleRow {
+                        read,
+                        template_release_id,
+                        error,
+                    });
+                })
+                .ok()
+        })
+        .collect()
+}
+
 #[derive(sqlx::FromRow)]
 pub(crate) struct PoolSlotCountsRow {
     warming: Option<i64>,
@@ -119,6 +152,12 @@ pub(crate) struct PoolPolicyReleaseRow {
     retained: bool,
 }
 
+impl AutoscaleInputRow for PoolPolicyReleaseRow {
+    fn template_release_id(&self) -> Uuid {
+        self.template_release_id
+    }
+}
+
 impl TryFrom<PoolPolicyReleaseRow> for PoolPolicyRelease {
     type Error = PoolError;
 
@@ -150,6 +189,12 @@ pub(crate) struct PoolObservedDemandRow {
     vcpu: i32,
     memory_mib: i32,
     observed_sandboxes: i64,
+}
+
+impl AutoscaleInputRow for PoolObservedDemandRow {
+    fn template_release_id(&self) -> Uuid {
+        self.template_release_id
+    }
 }
 
 impl TryFrom<PoolObservedDemandRow> for PoolObservedDemand {
