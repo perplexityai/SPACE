@@ -447,6 +447,8 @@ async fn resource_sample_reads_the_vm_cgroup_under_the_mounted_parent() {
                 resources.memory_max_events,
                 resources.memory_oom_kills,
             ),
+            resources.errors.count,
+            resources.errors.first,
         )
     };
 
@@ -468,6 +470,46 @@ async fn resource_sample_reads_the_vm_cgroup_under_the_mounted_parent() {
                 Some(6),
                 Some(2)
             ),
+            0,
+            None,
         )
+    );
+
+    // A file that cannot be read leaves only its own fields unset, and is
+    // reported with its path.
+    std::fs::remove_file(vm_cgroup.join("memory.pressure")).unwrap();
+    let (cpu, memory, failed, first) =
+        sample(TransitionEvidence::gather(&request, None, &paths, limits, &reads).await);
+    assert_eq!(
+        (cpu, memory, failed),
+        (
+            full.0,
+            (Some(600), Some(512), Some(2048), None, Some(6), Some(2)),
+            1
+        )
+    );
+    let first = first.expect("the failed read is reported");
+    assert!(
+        first.starts_with(&vm_cgroup.join("memory.pressure").display().to_string()),
+        "{first}"
+    );
+
+    // With no VM cgroup under the parent, every read fails and the report
+    // keeps the first failure once.
+    std::fs::remove_dir_all(&vm_cgroup).unwrap();
+    let (cpu, memory, failed, first) =
+        sample(TransitionEvidence::gather(&request, None, &paths, limits, &reads).await);
+    assert_eq!(
+        (cpu, memory, failed),
+        (
+            (None, None, None, None),
+            (None, None, None, None, None, None),
+            9
+        )
+    );
+    assert!(
+        first
+            .expect("the failed reads are reported")
+            .starts_with(&vm_cgroup.join("cpu.stat").display().to_string())
     );
 }
