@@ -118,11 +118,10 @@ use pplx_space_common_core::types::{
     SubstrateKind,
 };
 use pplx_space_sandbox_portability::{
-    SuspendedK8sFinalizationSql, SuspendedTargetNodeAssignment,
-    clear_current_local_artifact_marker_assignments, failed_repair_revert_eligibility,
+    SuspendedK8sFinalizationSql, failed_repair_revert_eligibility,
     newest_full_snapshot_unambiguous, pod_less_drain_revert_loses_no_newer_bytes,
-    suspended_k8s_finalization_sql,
 };
+use pplx_space_sandbox_store::drain;
 use sqlx::PgPool;
 
 use crate::orphaned_sandboxes::{PodPresenceStatus, classify_pod_presence};
@@ -638,7 +637,9 @@ async fn recover_pod_less_sandbox_locked(
         return Ok(PodLessRecovery::NotEligible(hold));
     }
 
-    let Some(finalization) = revert_to_suspended(&mut tx, candidate.sandbox_id).await? else {
+    let Some(finalization) =
+        drain::revert_pod_less_resident_to_suspended(&mut tx, candidate.sandbox_id).await?
+    else {
         // The guards just passed under the locks, so only a snapshot change
         // that the locks don't cover gets here.
         tx.rollback().await?;
@@ -666,52 +667,6 @@ async fn recover_pod_less_sandbox_locked(
 
     tx.commit().await?;
     Ok(PodLessRecovery::RevertedToSuspended)
-}
-
-/// The revert. Matches nothing unless a durable suspend snapshot passes
-/// [`failed_repair_revert_eligibility`] and both
-/// [`pod_less_drain_revert_loses_no_newer_bytes`] and
-/// [`newest_full_snapshot_unambiguous`] hold, all evaluated by this
-/// statement: the same predicates the precheck reads.
-async fn revert_to_suspended(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    sandbox_id: SandboxId,
-) -> Result<Option<SuspendedK8sFinalizationSql>, sqlx::Error> {
-    let eligibility = failed_repair_revert_eligibility("s");
-    let marker_assignments =
-        clear_current_local_artifact_marker_assignments("s", "pre.clear_marker");
-    let finalization = suspended_k8s_finalization_sql(
-        "s",
-        "pre",
-        &marker_assignments,
-        SuspendedTargetNodeAssignment::Clear,
-    );
-    let query = format!(
-        "WITH pre AS (
-             SELECT id,
-                    {clear_marker} AS clear_marker
-               FROM sandboxes s
-              WHERE s.id = $1
-         )
-         UPDATE sandboxes s
-            SET {assignments}
-           FROM pre
-          WHERE s.id = pre.id
-            AND {eligible}
-            AND {loses_no_newer_bytes}
-            AND {unambiguous}",
-        clear_marker = eligibility.clear_marker,
-        assignments = finalization.sandbox_assignments(),
-        eligible = eligibility.eligible,
-        loses_no_newer_bytes = pod_less_drain_revert_loses_no_newer_bytes("s"),
-        unambiguous = newest_full_snapshot_unambiguous("s"),
-    );
-    let reverted = sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .bind(sandbox_id)
-        .execute(&mut **tx)
-        .await?
-        .rows_affected();
-    Ok((reverted > 0).then_some(finalization))
 }
 
 async fn retire_executions(

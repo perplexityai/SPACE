@@ -301,10 +301,10 @@ impl KubernetesSubstrate {
     /// a retry against a pod a prior attempt already created for this
     /// generation, the two attempts can resolve different URIs if the pin
     /// advanced in between. The stopped evacuation's pin write
-    /// (`record_stopped_evacuation_artifact` in the cluster controller's node
-    /// drain) lands before its teardown and refuses to replace a pin with a
-    /// different id, so it does not advance the pin mid-evacuation; the
-    /// read-back is still not wired.
+    /// (`pplx_space_sandbox_store::drain::record_stopped_evacuation_artifact`,
+    /// which the cluster controller's node drain calls) lands before its
+    /// teardown and refuses to replace a pin with a different id, so it does
+    /// not advance the pin mid-evacuation; the read-back is still not wired.
     ///
     /// ## A stopped evacuation in flight is refused
     ///

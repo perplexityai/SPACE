@@ -3,6 +3,12 @@ use uuid::Uuid;
 
 use pplx_space_db_test_fixtures::try_pg_test_db;
 use pplx_space_sandbox_portability::fresh_ready_snapshot_exists;
+use pplx_space_sandbox_store::drain::{
+    abandon_stale_resident_sandboxes_query, adopt_remote_snapshot_for_drain_query,
+    adopt_remote_snapshot_on_gone_node_query, fail_resident_sandboxes_on_gone_node_query,
+    mark_sandbox_failed_on_node_query, mark_sandbox_lost_on_gone_node_query,
+    mark_sandbox_lost_query, redrive_stranded_suspending_query, schedule_restore_retry_query,
+};
 
 use super::*;
 

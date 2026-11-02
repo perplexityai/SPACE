@@ -149,9 +149,6 @@
 [pattern_ratchet.sandbox_writes]
 "crates/libs/api/src/controllers/sandbox/responses.rs" = 1
 "crates/libs/api/src/controllers/substrate/direct.rs" = 1
-"crates/libs/cluster/controller/server/src/drained_node_terminator/store.rs" = 1
-"crates/libs/cluster/controller/server/src/node_drain/store.rs" = 15
-"crates/libs/cluster/controller/server/src/node_drain/store/pod_less_giveup.rs" = 3
 "crates/libs/placement/machine/src/postgres.rs" = 1
 
 # sbx-mgr code outside its SQLite store uses only the store's own handle,
