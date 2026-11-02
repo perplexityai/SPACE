@@ -115,37 +115,51 @@ impl NodeManagerService {
                 "encrypted CH capture",
                 async move {
                     let _guard = guard;
-                    let result = service
-                        .capture_cloud_hypervisor_inner(request, destination)
-                        .await;
-                    let sandbox_id = id.to_string();
-                    // Stop even after a partial capture. Closing the VMM and its
-                    // mount namespace is required before the volume can be sealed.
-                    let stopped = stop_runtime_for_encrypted_seal(&service, &sandbox_id).await;
-                    let root = pplx_space_node_runtime_core::control::isolation_root(
-                        RuntimeKind::CloudHypervisor,
-                        &sandbox_id,
-                    )
-                    .map_err(|e| Status::internal(e.to_string()))?;
-                    let drained = service
-                        .off_runtime("drain CH encrypted snapshot bind", move || {
-                            super::super::cleanup_helpers::drain_stale_mounts(
-                                &root.join("state/encsnap"),
-                                |path| unmount_if_present(path),
-                            )
-                            .map_err(Status::from)?;
-                            Ok(())
-                        })
-                        .await;
-                    stopped?;
-                    drained?;
-                    result
+                    service
+                        .capture_encrypted_cloud_hypervisor_state(request, destination)
+                        .await
                 },
             )
             .await?;
         }
         self.capture_cloud_hypervisor_inner(request, destination)
             .await
+    }
+
+    /// Capture a CH VM into its encrypted volume, then stop it and drain the
+    /// volume's bind so the volume can be sealed or staged. The caller holds
+    /// the sandbox's device-stack lock.
+    pub(super) async fn capture_encrypted_cloud_hypervisor_state(
+        &self,
+        request: Request<StateCapture>,
+        destination: CaptureDestination,
+    ) -> Result<Response<CaptureVmStateResponse>, Status> {
+        let id = request.get_ref().sandbox_id.id();
+        let result = self
+            .capture_cloud_hypervisor_inner(request, destination)
+            .await;
+        let sandbox_id = id.to_string();
+        // Stop even after a partial capture. Closing the VMM and its
+        // mount namespace is required before the volume can be sealed.
+        let stopped = stop_runtime_for_encrypted_seal(self, &sandbox_id).await;
+        let root = pplx_space_node_runtime_core::control::isolation_root(
+            RuntimeKind::CloudHypervisor,
+            &sandbox_id,
+        )
+        .map_err(|e| Status::internal(e.to_string()))?;
+        let drained = self
+            .off_runtime("drain CH encrypted snapshot bind", move || {
+                super::super::cleanup_helpers::drain_stale_mounts(
+                    &root.join("state/encsnap"),
+                    |path| unmount_if_present(path),
+                )
+                .map_err(Status::from)?;
+                Ok(())
+            })
+            .await;
+        stopped?;
+        drained?;
+        result
     }
 
     async fn capture_cloud_hypervisor_inner(

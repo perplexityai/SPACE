@@ -720,6 +720,96 @@ async fn busy_close_reports_its_holders_and_recovers() {
     );
 }
 
+/// Staging an open volume: a reader holding the memory file, as a live
+/// Firecracker does, does not stop it becoming read-only; from then until the
+/// volume closes its backing is byte-for-byte fixed, which is what the staged
+/// copy carries; a writer refuses it; and a later prepare of the still-open
+/// volume makes it writable again for the next capture.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires root, loop/dm-crypt and an explicitly supplied disposable btrfs fixture directory"]
+async fn an_open_volume_made_read_only_stays_fixed_until_a_reprepare() {
+    // CI includes ignored tests; host mutation still requires explicit opt-in.
+    let Some(root) = std::env::var_os("SPACE_NODEMGR_TEST_BTRFS_DIR") else {
+        eprintln!("not opted in: set SPACE_NODEMGR_TEST_BTRFS_DIR to a disposable btrfs directory");
+        return;
+    };
+    assert!(nix::unistd::geteuid().is_root());
+    let temp = tempfile::tempdir_in(root).unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let sandbox_id = SandboxId::new();
+    let backing_path = root.join("snapshot.luks");
+    let mount_dir = root.join("snapshot-vol");
+    let dek = zeroize::Zeroizing::new(vec![42; 32]);
+    let params = |fresh| PrepareParams {
+        sandbox_id,
+        volume_name: "snapshot".to_string(),
+        backing_path: backing_path.clone(),
+        restore_source: None,
+        mount_dir: mount_dir.clone(),
+        size_bytes: 64 * 1024 * 1024,
+        dek: &dek,
+        fresh,
+    };
+    let memory = mount_dir.join("memory");
+    let point = mount_dir.to_string_lossy().into_owned();
+
+    prepare(params(true)).await.unwrap();
+    std::fs::write(&memory, b"vmstate").unwrap();
+    unmount_all_at_path(&mount_dir).await.unwrap();
+    assert!(!is_mounted(&mount_dir).await.unwrap());
+    prepare(params(true))
+        .await
+        .expect("a fresh retry remounts its already-open canonical mapper");
+    assert_eq!(std::fs::read(&memory).unwrap(), b"vmstate");
+    let reader = std::fs::File::open(&memory).unwrap();
+    make_read_only(&sandbox_id, "snapshot", &mount_dir)
+        .await
+        .expect("a reader does not block the read-only remount");
+    assert!(superblock_read_only(
+        &read_mountinfo().await.unwrap(),
+        &point
+    ));
+    let error = std::fs::write(&memory, b"changed").unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(libc::EROFS), "{error}");
+    let staged = std::fs::read(&backing_path).unwrap();
+    drop(reader);
+
+    // The next capture re-prepares the open volume and writes it again.
+    prepare(params(false)).await.unwrap();
+    assert!(!superblock_read_only(
+        &read_mountinfo().await.unwrap(),
+        &point
+    ));
+    assert_eq!(std::fs::read(&memory).unwrap(), b"vmstate");
+    std::fs::write(&memory, b"vmstate2").unwrap();
+
+    // An open writer refuses it, and the volume stays writable.
+    let (writer, _, writer_ready) = spawn_holder("private", &memory, true);
+    wait_ready(writer_ready);
+    make_read_only(&sandbox_id, "snapshot", &mount_dir)
+        .await
+        .expect_err("a writer blocks the read-only remount");
+    drop(writer);
+
+    // Made read-only again, the backing does not change through its close.
+    make_read_only(&sandbox_id, "snapshot", &mount_dir)
+        .await
+        .unwrap();
+    let staged_again = std::fs::read(&backing_path).unwrap();
+    assert_ne!(
+        staged, staged_again,
+        "the second capture reached the backing"
+    );
+    release(&sandbox_id, "snapshot", &backing_path, &mount_dir)
+        .await
+        .unwrap();
+    assert!(
+        std::fs::read(&backing_path).unwrap() == staged_again,
+        "closing a read-only volume leaves the staged bytes unchanged"
+    );
+}
+
 /// The read-only check reads the superblock options, which a plain
 /// `remount,ro` changes, and judges the visible (last) mount at the point.
 #[test]

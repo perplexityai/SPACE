@@ -158,7 +158,7 @@ pub(crate) fn record_encrypted_capture_in(
     metadata.encrypted = true;
     std::fs::remove_dir_all(&staging).unwrap();
     std::fs::create_dir_all(&staging).unwrap();
-    publication::prepare_encrypted_capture_record(&staging, &metadata).unwrap();
+    publication::prepare_encrypted_capture_record(&staging, &metadata, false).unwrap();
     if !committed {
         return (capture, staging);
     }
@@ -197,6 +197,116 @@ pub(crate) fn sealing_node_manager_builder(refusals: usize) -> FakeNodeManager {
             Ok(ReleaseEncryptedVolumeResponse::default())
         },
     )
+}
+
+/// Recovery resumes the exact prepared capture while Firecracker is live and
+/// publishes it without requiring a process exit.
+#[tokio::test]
+async fn lost_encrypted_capture_reply_resumes_the_same_capture() {
+    use crate::service::suspend_snapshot_publication as publication;
+    use pplx_space_node_mgr_client::proto::{
+        CreateEncryptedSuspendSnapshotRequest, CreateEncryptedSuspendSnapshotResponse,
+    };
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let staged_into = Arc::new(Mutex::new(None));
+    let node_manager = FakeNodeManager::default()
+        .unary("CreateEncryptedSuspendSnapshot", {
+            let requests = Arc::clone(&requests);
+            let staged_into = Arc::clone(&staged_into);
+            move |request: CreateEncryptedSuspendSnapshotRequest| {
+                // node-manager derives this dir from the local artifact id.
+                let staging: std::path::PathBuf = staged_into.lock().unwrap().clone().unwrap();
+                for name in ["snapshot.luks", "cow.luks"] {
+                    std::fs::write(staging.join(name), b"ciphertext").unwrap();
+                }
+                let intent = staging.join(
+                    pplx_space_common_core::host::linux::paths::ENCRYPTED_SUSPEND_CAPTURE_INTENT,
+                );
+                if intent.exists() {
+                    std::fs::rename(intent, staging.join(publication::ENCRYPTED_CAPTURE_RECORD))
+                        .unwrap();
+                }
+                let mut requests = requests.lock().unwrap();
+                requests.push(request);
+                if requests.len() == 1 {
+                    Err(Status::cancelled("injected lost reply"))
+                } else {
+                    Ok(CreateEncryptedSuspendSnapshotResponse {})
+                }
+            }
+        })
+        .serve();
+    let conn = crate::db::test_conn();
+    let id = SandboxId::new().to_string();
+    let cache = tempfile::tempdir().unwrap();
+    let (capture, staging) =
+        record_encrypted_capture(&conn, cache.path(), &id, std::time::Duration::ZERO, false);
+    let intent = std::fs::read_dir(&staging)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    *staged_into.lock().unwrap() = Some(staging.clone());
+    let service = SandboxManagerService::new_with_options(
+        conn,
+        SandboxManagerServiceOptions {
+            node_manager: node_manager.connector(),
+            sandbox_runtime_live: Arc::new(|_| true),
+            ..SandboxManagerServiceOptions::for_test()
+        },
+    );
+    let sandbox = service.lookup_sandbox(&id).unwrap();
+
+    service
+        .complete_recorded_encrypted_capture(&sandbox, cache.path())
+        .await
+        .expect_err("the first completion reply is lost");
+    assert_eq!(
+        service.lookup_sandbox(&id).unwrap().state,
+        SandboxState::Suspending
+    );
+    assert!(staging.join(publication::ENCRYPTED_CAPTURE_RECORD).exists());
+
+    service
+        .complete_recorded_encrypted_capture(&sandbox, cache.path())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        node_manager.calls(),
+        [
+            "CreateEncryptedSuspendSnapshot",
+            "CreateEncryptedSuspendSnapshot"
+        ]
+    );
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests[0].sandbox_id, id);
+    assert_eq!(requests[0].local_artifact_id, capture.to_string());
+    assert_eq!(
+        requests[0].base,
+        pplx_space_node_mgr_client::proto::EncryptedSuspendSnapshotBase::Existing as i32
+    );
+    assert_eq!(requests[1].local_artifact_id, capture.to_string());
+    assert_eq!(requests[1].base, requests[0].base);
+    assert!(
+        !intent.exists(),
+        "a completed retained capture keeps no retry markers"
+    );
+    assert!(!staging.join(publication::ENCRYPTED_CAPTURE_RECORD).exists());
+    let complete = publication::find_complete_suspend_snapshot_staging_dir(
+        &cache.path().join(&id),
+        &Default::default(),
+    )
+    .unwrap()
+    .expect("the staged capture is complete");
+    assert_eq!(complete.local_artifact_id, capture);
+    let sidecar: crate::snapshot_upload::SnapshotMeta = serde_json::from_slice(
+        &std::fs::read(staging.join(crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME)).unwrap(),
+    )
+    .unwrap();
+    assert!(sidecar.encrypted);
+    assert_eq!(sidecar.local_artifact_id, Some(capture));
 }
 
 /// One periodic publication-recovery pass over the row, including the seal
@@ -286,7 +396,7 @@ async fn unsealed_encrypted_capture_survives_restart_and_publishes_once_sealed()
 }
 
 #[tokio::test]
-async fn expired_encrypted_capture_is_quarantined_without_a_seal_attempt() {
+async fn an_old_confirmed_capture_is_still_completed() {
     use crate::service::suspend_snapshot_publication as publication;
     // The holder is gone: a seal attempted now would succeed.
     let node_manager = sealing_node_manager(0);
@@ -297,25 +407,18 @@ async fn expired_encrypted_capture_is_quarantined_without_a_seal_attempt() {
         &conn,
         cache.path(),
         &id,
-        publication::ENCRYPTED_SEAL_RETRY_WINDOW + std::time::Duration::from_secs(60),
+        publication::ENCRYPTED_CAPTURE_INTENT_RETRY_WINDOW + std::time::Duration::from_secs(60),
         true,
     );
     let service = service_with_node_manager(conn, node_manager.connector());
 
     recover_batch(&service, cache.path(), &id).await;
+    recover_batch(&service, cache.path(), &id).await;
 
-    assert!(
-        node_manager.calls().is_empty(),
-        "an expired capture must not be sealed"
-    );
+    assert_eq!(node_manager.calls(), ["ReleaseEncryptedVolume"]);
     let row = service.lookup_sandbox(&id).unwrap();
-    assert_eq!(row.state, SandboxState::Quarantined);
-    // This reason is what makes deletion keep the only copy.
-    assert_eq!(
-        row.failure_reason.as_deref(),
-        Some(crate::db::SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE)
-    );
-    assert!(staging.exists(), "the unsealed capture must be retained");
+    assert_eq!(row.state, SandboxState::CleanupRequired);
+    assert!(!staging.exists(), "the confirmed capture must publish");
 }
 
 #[tokio::test]
@@ -347,8 +450,8 @@ async fn complete_staged_capture_publishes_past_an_older_unsealed_record() {
 }
 
 #[tokio::test]
-async fn uncommitted_encrypted_capture_record_is_never_sealed() {
-    // The capture never finished: only the record written before it exists.
+async fn prepared_encrypted_capture_without_a_runtime_is_quarantined() {
+    // The operation never reached Firecracker: only its prepared intent exists.
     let node_manager = sealing_node_manager(0);
     let conn = crate::db::test_conn();
     let id = SandboxId::new().to_string();
@@ -361,7 +464,7 @@ async fn uncommitted_encrypted_capture_record_is_never_sealed() {
 
     assert!(
         node_manager.calls().is_empty(),
-        "an unfinished capture must not be sealed"
+        "an unstarted capture must not be completed after its runtime is gone"
     );
     let row = service.lookup_sandbox(&id).unwrap();
     assert_eq!(row.state, SandboxState::Quarantined);
