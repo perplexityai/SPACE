@@ -500,16 +500,17 @@ async fn process_tick(
 
     // Disk snapshots publish under the artifact lock so backup selection never
     // races their creation or their retention deletion; `prune_and_capture`
-    // takes it for each, and deletes the pruned snapshots' staging between
-    // them with it released.
+    // holds it across both, and deletes the pruned snapshots' staging after
+    // releasing it.
     //
     // Retention keeps a pinned, leased or unreadable snapshot and capture goes
     // on, so such snapshots can hold a tier above its `KEEP_*` count. This tick
     // may also add one snapshot per due tier above its retention count; the
-    // next successful prune removes that surplus before creating more. A
-    // failed prune, or GC staging it cannot delete, fails the tick before any
-    // capture, the full checkpoint included, so a failing node-manager delete
-    // stops growth instead of adding a snapshot and its staging every tick.
+    // next successful prune removes that surplus before creating more. A failed
+    // prune fails the tick before any capture, the full checkpoint included.
+    // A failed staging delete does not: the orphan sweep retries it every
+    // pass, so a persistently failing delete can grow staging until it
+    // succeeds. A bounded gate on that growth follows separately.
     // Deletions from completed pages remain useful progress on a retry.
     prune_and_capture(
         &mut node_client,

@@ -764,7 +764,7 @@ async fn sweep_orphans(
 }
 
 /// Whether `path` is GC staging that no row owns, so its bytes may be deleted.
-pub(crate) fn gc_pending_is_unowned(artifacts: &LocalArtifacts, path: &Path) -> bool {
+fn gc_pending_is_unowned(artifacts: &LocalArtifacts, path: &Path) -> bool {
     let Some(id) = path
         .file_name()
         .and_then(|name| name.to_str())
