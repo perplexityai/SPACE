@@ -479,8 +479,9 @@ async fn release_refreshed_trigger_claims(
 pub struct QueuedTrigger {
     pub node_id: NodeId,
     /// Distinct `state_reconciliation_reason` wire values, newest first by
-    /// first request. Kept as text so a reason written by a newer build still
-    /// reads.
+    /// first request. Kept as text so a reason a newer build added to the
+    /// array still reads. A row from before the array has only the known
+    /// reasons of its text, as a claim reads them.
     pub reasons: Vec<String>,
     pub requested_at: OffsetDateTime,
     pub next_attempt_at: OffsetDateTime,
@@ -534,14 +535,10 @@ pub async fn queued_triggers(
     Ok(rows
         .into_iter()
         .map(|row| {
-            // Rows written before the `reasons` array carry only the
-            // comma-joined diagnostic text, as `coalesced_reasons` reads them.
             let reasons = if row.reasons.is_empty() {
-                row.diagnostic_reason
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|reason| !reason.is_empty())
-                    .map(str::to_owned)
+                legacy_reasons(&row.diagnostic_reason)
+                    .into_iter()
+                    .map(|reason| reason.as_str().to_owned())
                     .collect()
             } else {
                 row.reasons
@@ -570,19 +567,27 @@ fn coalesced_reasons(
     diagnostic_reason: &str,
 ) -> Vec<ReconcileReason> {
     let mut seen = BTreeSet::new();
-    let mut reasons = raw_reasons
+    let reasons = raw_reasons
         .into_iter()
         .filter(|reason| seen.insert(*reason))
         .collect::<Vec<_>>();
     if reasons.is_empty() {
-        reasons.extend(
-            diagnostic_reason
-                .split(',')
-                .filter_map(|reason| ReconcileReason::parse(reason.trim()))
-                .filter(|reason| seen.insert(*reason)),
-        );
+        return legacy_reasons(diagnostic_reason);
     }
     reasons
+}
+
+/// The reasons of a row written before the `reasons` array, which carries only
+/// the comma-joined diagnostic text: each known reason once, in order. The
+/// text is truncated at the reason length limit, so its last token can be a
+/// fragment, and a token this build does not know is dropped with it.
+fn legacy_reasons(diagnostic_reason: &str) -> Vec<ReconcileReason> {
+    let mut seen = BTreeSet::new();
+    diagnostic_reason
+        .split(',')
+        .filter_map(|reason| ReconcileReason::parse(reason.trim()))
+        .filter(|reason| seen.insert(*reason))
+        .collect()
 }
 
 #[cfg(test)]

@@ -519,3 +519,49 @@ async fn queued_triggers_reports_each_node_until_its_trigger_drains() -> TestRes
     assert_eq!(queued.dead_reason, None);
     Ok(())
 }
+
+/// A row written before the `reasons` array reads its reasons from the
+/// comma-joined text the way a claim does: each known reason once, dropping
+/// the fragment truncation leaves at the end.
+#[tokio::test(flavor = "current_thread")]
+async fn queued_triggers_reads_a_legacy_row_as_a_claim_does() -> TestResult {
+    let db = pg_test_db().await?;
+    let node_id = NodeId::new();
+    insert_node(
+        &db.pool,
+        node_id,
+        SpaceNodeRole::Worker.as_str(),
+        "space",
+        None,
+    )
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_reconcile_triggers (node_id, reason)
+         VALUES ($1, 'node_updated,manual_node_reconcile, node_updated,manual_node_rec')"
+    ))
+    .bind(node_id)
+    .execute(&db.pool)
+    .await?;
+
+    let [queued] = queued_triggers(&db.pool, &[node_id])
+        .await?
+        .try_into()
+        .unwrap();
+    assert_eq!(
+        queued.reasons,
+        vec!["node_updated", "manual_node_reconcile"]
+    );
+    let [claimed] = claim_triggers(&db.pool, 10)
+        .await?
+        .triggers
+        .try_into()
+        .unwrap();
+    assert_eq!(
+        claimed.reasons,
+        vec![
+            ReconcileReason::NodeUpdated,
+            ReconcileReason::ManualNodeReconcile
+        ]
+    );
+    Ok(())
+}
