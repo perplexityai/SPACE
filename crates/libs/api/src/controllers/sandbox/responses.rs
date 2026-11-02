@@ -27,6 +27,7 @@ const SANDBOX_COLUMNS: &str = "
     s.managed_by,
     s.lifecycle,
     s.placement,
+    s.activating_client_id,
     COALESCE(direct_route.current_node_id, s.active_node_id) AS active_node_id,
     COALESCE(active_direct.name, active_k8s.k8s_node_name) AS active_node_name,
     active_node.role AS active_node_role,

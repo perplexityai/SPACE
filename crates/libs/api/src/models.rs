@@ -163,6 +163,9 @@ pub struct Sandbox {
     pub managed_by: String,
     pub lifecycle: String,
     pub placement: String,
+    /// The client id whose activation created the current runtime; `None`
+    /// when nothing is recorded.
+    pub activating_client_id: Option<pplx_space_common_core::types::ClientId>,
     pub active_node_id: Option<NodeId>,
     pub active_node_name: Option<String>,
     pub active_node_role: Option<NodeRole>,

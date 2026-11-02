@@ -167,6 +167,7 @@ async fn run_action(
             identity(action),
             action,
             activation,
+            crate::controllers::substrate::ActivationClient::Native,
         )
         .await
 }

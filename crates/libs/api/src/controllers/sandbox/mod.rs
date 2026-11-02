@@ -1105,6 +1105,12 @@ impl SandboxController {
         self.substrate.capabilities()
     }
 
+    /// Whether this deployment records activating clients (see
+    /// [`super::substrate::ActivationClientAttribution`]).
+    pub fn activation_client_attribution(&self) -> super::substrate::ActivationClientAttribution {
+        self.substrate.activation_client_attribution()
+    }
+
     pub async fn set_node_schedulability(
         &self,
         request: super::substrate::NodeSchedulabilityRequest<'_>,

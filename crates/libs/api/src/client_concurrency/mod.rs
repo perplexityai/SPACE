@@ -1,6 +1,6 @@
 //! Per-client concurrency limiter for control-plane-touching API operations.
 //!
-//! Caps how many sandbox *create* and *reconnect* operations a single client
+//! Caps how many sandbox create, fork, reconnect and resume operations a single client
 //! (identified by the `X-Client-ID` header) may have in flight at once. One
 //! misbehaving client — a cron reconnect storm, a runaway create loop — must
 //! not saturate the Kubernetes control-plane API and starve every other client
@@ -98,7 +98,7 @@ use uuid::Uuid;
 
 mod redis_limiter;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use redis_limiter::RedisConcurrencyStore;
 

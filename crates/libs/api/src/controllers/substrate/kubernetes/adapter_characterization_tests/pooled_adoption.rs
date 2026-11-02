@@ -92,6 +92,7 @@ impl PooledInputs {
             template_network_policy: &self.create.template_policy,
             template_network_policy_generation: 7,
             volume_encryption: false,
+            client_id: None,
         }
     }
 

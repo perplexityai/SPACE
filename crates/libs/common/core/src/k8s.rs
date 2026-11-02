@@ -81,6 +81,12 @@ pub const SANDBOX_USER_ANNOTATION: &str = "space.pplx.net/sandbox-user";
 pub const SANDBOX_VOLUME_ENCRYPTION_ANNOTATION: &str = "space.pplx.net/volume-encryption";
 pub const SANDBOX_OWNER_ID_LABEL: &str = "space.pplx.net/user-id";
 pub const SANDBOX_ORG_ID_LABEL: &str = "space.pplx.net/org-id";
+/// The [`crate::types::ClientId`] whose activation created the pod. Set when
+/// the pod is created and never changed, except that a warm-pool pod, built
+/// before it has an adopter, is labeled when it's adopted. An activation
+/// with no client id to attribute (one inheriting an empty record) leaves the
+/// pod unlabeled.
+pub const SANDBOX_CLIENT_ID_LABEL: &str = "space.pplx.net/client-id";
 pub const SANDBOX_POOL_SLOT_ID_KEY: &str = "space.pplx.net/pool-slot-id";
 pub const SANDBOX_POOL_CONFIG_ID_KEY: &str = "space.pplx.net/pool-config-id";
 pub const SANDBOX_POOL_ROLE_KEY: &str = "space.pplx.net/pool-role";
@@ -489,6 +495,8 @@ pub struct SandboxRuntimePodMetadata<'a> {
     pub sandbox_owner: &'a SandboxOwner,
     pub user_id: crate::types::UserId,
     pub org_id: crate::types::OrgId,
+    /// Rendered as [`SANDBOX_CLIENT_ID_LABEL`] when `Some`.
+    pub client_id: Option<&'a crate::types::ClientId>,
     pub auto_lifecycle_json: &'a str,
     pub auto_lifecycle_authority: PolicyAuthority,
     pub network_policy_json: &'a str,
@@ -847,6 +855,12 @@ pub fn build_sandbox_pod(config: &SandboxPodConfig<'_>, request: SandboxPodReque
             runtime.user_id.to_string(),
         );
         labels.insert(SANDBOX_ORG_ID_LABEL.to_string(), runtime.org_id.to_string());
+        if let Some(client_id) = runtime.client_id {
+            labels.insert(
+                SANDBOX_CLIENT_ID_LABEL.to_string(),
+                client_id.as_str().to_string(),
+            );
+        }
     }
     if let Some(pool) = pool {
         labels.insert(

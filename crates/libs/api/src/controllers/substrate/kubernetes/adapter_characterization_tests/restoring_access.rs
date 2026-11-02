@@ -146,7 +146,7 @@ async fn access_on_a_restoring_sandbox_joins_the_restore_before_dialing() -> Tes
             &restoring.sandbox,
             ExecutionActivityKind::Access,
             Duration::from_secs(10),
-            crate::controllers::substrate::RecoveryCharge::Exempt,
+            crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
         )
         .await;
     let lifecycle_at_return = sandbox_lifecycle(&db.pool, sandbox_id).await?;
@@ -227,7 +227,7 @@ async fn a_restore_run_that_completes_before_started_is_dialed_only_once_started
                 &suspended_view,
                 Duration::from_secs(10),
                 access_identity(),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
             )
             .await;
         let lifecycle_at_return = sandbox_lifecycle(&request_pool, sandbox_id).await;
@@ -268,7 +268,7 @@ async fn a_restore_that_finished_before_the_join_is_dialed() -> TestResult {
             sandbox_id,
             access_identity(),
             Duration::from_secs(10),
-            crate::controllers::substrate::RecoveryCharge::Exempt,
+            crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
         )
         .await;
 
@@ -296,7 +296,7 @@ async fn access_on_a_restoring_sandbox_is_refused_retryably_when_the_restore_lin
             &restoring.sandbox,
             ExecutionActivityKind::Access,
             Duration::from_secs(2),
-            crate::controllers::substrate::RecoveryCharge::Exempt,
+            crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
         )
         .await
         .expect_err("a restoring pod must not be dialed");
@@ -322,7 +322,7 @@ async fn runtime_client_on_a_restoring_sandbox_joins_the_restore_before_dialing(
         .substrate
         .runtime_client(
             sandbox_id,
-            crate::controllers::substrate::RecoveryCharge::Exempt,
+            crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
         )
         .await;
     let lifecycle_at_return = sandbox_lifecycle(&db.pool, sandbox_id).await?;
@@ -394,7 +394,7 @@ async fn access_on_an_evacuating_sandbox_waits_for_the_drain() -> TestResult {
             &restoring.sandbox,
             ExecutionActivityKind::Access,
             Duration::from_secs(10),
-            crate::controllers::substrate::RecoveryCharge::Exempt,
+            crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
         )
         .await;
     let lifecycle_at_return = sandbox_lifecycle(&db.pool, sandbox_id).await?;
@@ -468,7 +468,7 @@ async fn a_joined_restore_that_its_owner_abandons_starts_no_restore() -> TestRes
                 &restoring.sandbox,
                 ExecutionActivityKind::Access,
                 Duration::from_secs(10),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
+                crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
             )
             .await
             .expect_err("an abandoned restore serves no client");
@@ -526,7 +526,7 @@ async fn a_rolled_back_restore_discards_no_request_it_served() -> TestResult {
             &restoring.sandbox,
             ExecutionActivityKind::Access,
             Duration::from_secs(2),
-            crate::controllers::substrate::RecoveryCharge::Exempt,
+            crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
         )
         .await
         .expect_err("a restoring pod must not be dialed");
@@ -674,7 +674,7 @@ async fn a_restoring_sandbox_without_a_resolved_pod_joins_the_restore() -> TestR
                     &restoring.sandbox,
                     ExecutionActivityKind::Access,
                     Duration::from_secs(10),
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
                 )
                 .await
         } else {
@@ -682,7 +682,7 @@ async fn a_restoring_sandbox_without_a_resolved_pod_joins_the_restore() -> TestR
                 .substrate
                 .runtime_client(
                     sandbox_id,
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                    crate::controllers::substrate::RecoveryCharge::exempt_for_tests(),
                 )
                 .await
         };

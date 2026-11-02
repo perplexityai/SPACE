@@ -245,6 +245,7 @@ impl KubernetesSubstrate {
                     generation,
                     pod_uid.as_deref(),
                     pod_ip_string.as_deref(),
+                    pod.client_id().as_ref(),
                 )
                 .await
             {
