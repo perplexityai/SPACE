@@ -6,6 +6,7 @@ use pplx_space_common_core::types::{LocalArtifactId, NodeId, SubstrateKind};
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::PositiveDuration;
 use pplx_space_sandbox_portability::newest_suspend_snapshot_current;
+use pplx_space_sandbox_store::repair::unplace_suspended_after_execution_retired;
 use sqlx::PgPool;
 
 use super::{RetireOutcome, RetireSink, StaleExecutionCandidate};
@@ -201,24 +202,8 @@ impl RetireSink for ExecutionDbStore {
         .execute(&mut *tx)
         .await?;
 
-        let markerless_snapshot_current = newest_suspend_snapshot_current("s");
-        let query = format!(
-            "UPDATE sandboxes s
-                SET placement = 'unplaced',
-                    target_node_id = COALESCE(target_node_id, active_node_id),
-                    active_node_id = NULL,
-                    current_local_artifact_id = NULL,
-                    current_local_artifact_kind = NULL,
-                    current_local_artifact_origin = NULL
-              WHERE s.id = $1
-                AND ({markerless_snapshot_current})"
-        );
-        let projected = sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
-            .bind(candidate.sandbox_id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected()
-            > 0;
+        let projected =
+            unplace_suspended_after_execution_retired(&mut tx, candidate.sandbox_id).await?;
         if !projected {
             tx.rollback().await?;
             return Ok(RetireOutcome::SkippedSnapshotNotCurrent);

@@ -20,20 +20,21 @@
 //! * **Column writes respect the row's triggers.** `sandboxes` carries five
 //!   `BEFORE UPDATE` triggers. `updated_at` is trigger-maintained, so verbs
 //!   here leave it to the trigger, except
-//!   [`ingest::prune_census_absent_sandboxes`], whose statement moved
-//!   unchanged; and because two of the triggers have no change guard, no verb
-//!   may promise it touches only the columns it names. See
-//!   [`update_desired_state`].
+//!   [`ingest::prune_census_absent_sandboxes`] and
+//!   [`repair::recover_quarantined_publication_to_suspended`], whose
+//!   statements moved unchanged; and because two of the triggers have no
+//!   change guard, no verb may promise it touches only the columns it names.
+//!   See [`update_desired_state`].
 //!
 //! * **Guarded transitions and the delete are modules, not CRUD.** Statements
 //!   whose `WHERE` re-checks a lifecycle/lease/generation precondition (the
 //!   wake-completion CAS, the restore claims) are correctness mechanisms, not
 //!   row updates, and no plain `update` verb here may absorb one. Each moves
 //!   here as its own module, named for its transition or for the path that
-//!   issues it, as [`lost`], [`delete`] and [`ingest`] have; the ratchet
-//!   above counts the ones still elsewhere. The caller keeps its locks and
-//!   its transaction: each function runs on the transaction or executor its
-//!   caller passes, and none begins or commits a transaction.
+//!   issues it, as [`lost`], [`delete`], [`ingest`] and [`repair`] have; the
+//!   ratchet above counts the ones still elsewhere. The caller keeps its
+//!   locks and its transaction: each function runs on the transaction or
+//!   executor its caller passes, and none begins or commits a transaction.
 //!   [`delete::delete_with_dependents`] reaches past the row:
 //!   some rows that do not cascade from it (observed state, reconcile state,
 //!   claimed warm-pool slots) have to be deleted, and snapshot storage
@@ -104,6 +105,7 @@ pub mod delete;
 pub mod fork_source_lifecycle;
 pub mod ingest;
 pub mod lost;
+pub mod repair;
 
 pub use create::{SandboxCreate, insert_pooled, insert_unplaced};
 

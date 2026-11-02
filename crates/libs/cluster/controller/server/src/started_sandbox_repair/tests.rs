@@ -1153,6 +1153,35 @@ mod postgres_backed {
         Ok(())
     }
 
+    /// The apply re-checks the snapshot eligibility, not only the row state:
+    /// a command recorded after the listed candidate's snapshot means a
+    /// markerless restore would lose it, so the apply refuses although the
+    /// lifecycle, the execution guards and the newest generation still hold.
+    #[tokio::test(flavor = "current_thread")]
+    async fn e8_apply_rechecks_snapshot_eligibility() -> TestResult {
+        let db = pg_test_db().await?;
+        let spec = StartedSandboxSpec::repairable(SandboxId::new());
+        insert_started_sandbox(&db.pool, &spec).await?;
+        let store = RepairDbStore::new(db.pool.clone());
+        let candidate = list_all(&store).await?.remove(0);
+
+        sqlx::query("UPDATE sandboxes SET last_command_at = NOW() WHERE id = $1")
+            .bind(spec.sandbox_id)
+            .execute(&db.pool)
+            .await?;
+        let outcome = store
+            .revert_started_to_suspended(&candidate, default_min_age())
+            .await?;
+
+        assert_eq!(outcome, ApplyOutcome::SkippedRaced);
+        let lifecycle: String = sqlx::query_scalar("SELECT lifecycle FROM sandboxes WHERE id = $1")
+            .bind(spec.sandbox_id)
+            .fetch_one(&db.pool)
+            .await?;
+        assert_eq!(lifecycle, "started");
+        Ok(())
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn r13_direct_rows_are_not_bounded_listed_or_repaired() -> TestResult {
         let Some(db) = try_pg_test_db().await? else {
