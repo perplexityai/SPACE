@@ -54,6 +54,7 @@ test('ages and sizes format compactly', () => {
   assert.equal(formatAge(null, now), '—');
   assert.equal(formatBytes(2813952), '2.8 MB');
   assert.equal(formatBytes(null), '—');
+  assert.equal(formatBytes(Number('not a number')), '—');
 });
 
 test('metadata values that are not strings render as compact JSON', () => {

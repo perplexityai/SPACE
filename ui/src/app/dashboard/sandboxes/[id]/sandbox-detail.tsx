@@ -75,7 +75,7 @@ import type {
 } from '@/lib/types';
 import { tablePagination } from '@/lib/table-pagination';
 import { useAuth } from '@/lib/auth';
-import { formatAge, sectionData, sectionError, type DebugSnapshot } from '@/lib/sandbox-debug';
+import { formatAge, formatBytes, sectionData, sectionError, type DebugSnapshot } from '@/lib/sandbox-debug';
 import { OperationsCard, OrgLink, PlacementCard, ResourcesCard, TimelineCard, UserLink, type DebugView } from './sandbox-insight';
 import NetworkPolicyDesigner, {
   compactNetworkPolicyLabel,
@@ -188,14 +188,6 @@ function statusTag(status: string | null, failureReason?: string | null) {
     return <Tooltip title={failureReason}>{tag}</Tooltip>;
   }
   return tag;
-}
-
-function formatBytes(n: number | null | undefined) {
-  if (n === null || n === undefined) return '—';
-  if (n >= 1e9) return `${(n / 1e9).toFixed(1)} GB`;
-  if (n >= 1e6) return `${(n / 1e6).toFixed(1)} MB`;
-  if (n >= 1e3) return `${(n / 1e3).toFixed(1)} KB`;
-  return `${n} B`;
 }
 
 type SemVer = {
