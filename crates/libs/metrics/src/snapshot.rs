@@ -547,8 +547,9 @@ pub fn scheduler_capture_skipped(reason: SchedulerCaptureSkip) {
 }
 
 /// Unowned GC staging directories under the `snapshots/` directories of the
-/// node's scheduled sandboxes, summed over each sandbox's latest complete
-/// retention listing. Emitted once per scheduler pass, including zero.
+/// node's scheduled sandboxes: the sum of each sandbox's count after its
+/// latest complete retention pass. Emitted once per scheduler pass, including
+/// zero.
 pub fn scheduler_unowned_staging(count: usize) {
     gauge("snapshot.scheduler.unowned_staging", count as f64, &[]);
 }

@@ -847,7 +847,17 @@ enum StagingAnswer {
     Stuck,
     /// Answers `Unavailable` this many more times, then deletes.
     Unavailable(usize),
+    /// Never answers, as a delete queued behind node-manager's delete
+    /// capacity or the sandbox's artifact lock.
+    Hangs,
+    /// Deletes every GC staging under `snapshots/`, as the orphan sweep
+    /// running meanwhile would, then answers.
+    SweepsAll,
 }
+
+/// One page of a [`StagingHarness`] listing: the names under `snapshots/` it
+/// lists for a page token, and the next page's token (empty on the last).
+type StagingListing = dyn Fn(&str, &str) -> (Vec<String>, String) + Send + Sync;
 
 /// One sandbox's `snapshots/` under a tempdir, served by a node-manager fake
 /// that lists it and deletes from it, plus the scheduler state that records
@@ -876,8 +886,24 @@ struct StagingTick {
     gauges: Vec<f64>,
 }
 
+/// Every name under `snapshots`, sorted, on one page.
+fn list_snapshots_dir(snapshots: &str) -> Vec<String> {
+    let mut names: Vec<_> = std::fs::read_dir(snapshots)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
 impl StagingHarness {
     fn new() -> Self {
+        Self::with_listing(Box::new(|snapshots, _| {
+            (list_snapshots_dir(snapshots), String::new())
+        }))
+    }
+
+    fn with_listing(listing: Box<StagingListing>) -> Self {
         use pplx_space_node_mgr_client::proto::{
             BtrfsSnapshotInfo, DeleteCacheArtifactRequest, DeleteCacheArtifactResponse,
             ListBtrfsSnapshotsRequest, ListBtrfsSnapshotsResponse,
@@ -892,12 +918,8 @@ impl StagingHarness {
         let node_manager = crate::node_manager_transport::fake::FakeNodeManager::default()
             .unary("ListBtrfsSnapshots", {
                 let snapshots = snapshots.clone();
-                move |_: ListBtrfsSnapshotsRequest| {
-                    let mut names: Vec<_> = std::fs::read_dir(&snapshots)
-                        .unwrap()
-                        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-                        .collect();
-                    names.sort();
+                move |request: ListBtrfsSnapshotsRequest| {
+                    let (names, next_page_token) = listing(&snapshots, &request.page_token);
                     Ok(ListBtrfsSnapshotsResponse {
                         snapshots: names
                             .into_iter()
@@ -906,35 +928,53 @@ impl StagingHarness {
                                 ..Default::default()
                             })
                             .collect(),
-                        next_page_token: String::new(),
+                        next_page_token,
                     })
                 }
             })
-            .unary("DeleteCacheArtifact", {
-                let (answers, deletes, root) = (
+            .unary_async("DeleteCacheArtifact", {
+                let (answers, deletes, root, snapshots) = (
                     Arc::clone(&answers),
                     Arc::clone(&deletes),
                     root.path().to_owned(),
+                    snapshots.clone(),
                 );
                 move |request: DeleteCacheArtifactRequest| {
                     let path = request.local_path;
                     assert!(std::path::Path::new(&path).starts_with(&root));
                     deletes.lock().unwrap().push(path.clone());
                     let mut answers = answers.lock().unwrap();
-                    match answers.get_mut(&path) {
-                        Some(StagingAnswer::Stuck) => {
-                            return Err(tonic::Status::internal("injected stuck staging"));
-                        }
+                    let answer: futures_util::future::BoxFuture<'static, _> = match answers
+                        .get_mut(&path)
+                    {
+                        Some(StagingAnswer::Stuck) => Box::pin(std::future::ready(Err(
+                            tonic::Status::internal("injected stuck staging"),
+                        ))),
                         Some(StagingAnswer::Unavailable(remaining)) if *remaining > 0 => {
                             *remaining -= 1;
-                            return Err(tonic::Status::unavailable(
+                            Box::pin(std::future::ready(Err(tonic::Status::unavailable(
                                 "sandbox host mutation or reset is in progress; retry",
-                            ));
+                            ))))
                         }
-                        _ => {}
-                    }
-                    std::fs::remove_dir_all(&path).unwrap();
-                    Ok(DeleteCacheArtifactResponse { was_present: true })
+                        Some(StagingAnswer::Hangs) => Box::pin(std::future::pending()),
+                        Some(StagingAnswer::SweepsAll) => {
+                            for name in list_snapshots_dir(&snapshots) {
+                                if crate::local_artifacts::is_gc_staging_name(&name) {
+                                    std::fs::remove_dir_all(format!("{snapshots}/{name}")).unwrap();
+                                }
+                            }
+                            Box::pin(std::future::ready(Ok(DeleteCacheArtifactResponse {
+                                was_present: true,
+                            })))
+                        }
+                        _ => {
+                            std::fs::remove_dir_all(&path).unwrap();
+                            Box::pin(std::future::ready(Ok(DeleteCacheArtifactResponse {
+                                was_present: true,
+                            })))
+                        }
+                    };
+                    answer
                 }
             })
             .serve();
@@ -1096,13 +1136,13 @@ async fn one_stuck_leftover_does_not_stop_captures() {
     assert_eq!(gate_events(&events), Vec::new());
 }
 
-/// `UNOWNED_STAGING_LIMIT` stuck directories stop the capture, and count
-/// the skip, on every tick; the sandbox event marks only the gate closing.
-/// Once a delete brings the count below the limit, captures resume and the
-/// reopening is marked.
+/// Five stuck directories, the limit, stop the capture, and count the skip,
+/// on every tick; the sandbox event marks only the gate closing. Once a
+/// delete brings the count to four, captures resume and the reopening is
+/// marked. The counts are literal so that they pin the limit at five.
 #[tokio::test]
 async fn staging_at_the_limit_blocks_captures_until_one_is_deleted() {
-    use super::retention::UNOWNED_STAGING_LIMIT;
+    const UNOWNED_STAGING_LIMIT: usize = 5;
 
     let harness = StagingHarness::new();
     let stuck: Vec<String> = (1..=UNOWNED_STAGING_LIMIT as u128)
@@ -1219,7 +1259,128 @@ async fn retention_retries_one_leftover_per_tick_oldest_first() {
         assert!(observed.captured, "tick {tick}");
         assert_eq!(observed.deletes, retried, "tick {tick}");
         assert_eq!(observed.recorded, Some(remaining), "tick {tick}");
+        assert_eq!(observed.gauges, [remaining as f64], "tick {tick}");
     }
+}
+
+/// A staging delete that node-manager never answers is abandoned at
+/// `STAGING_DELETE_DEADLINE` and left uncounted, like a persistent
+/// `Unavailable`. The tick still captures below the limit, and returns in
+/// time for the next sandbox the scheduler loop awaits, whose tick runs as
+/// usual.
+#[tokio::test(start_paused = true)]
+async fn hung_staging_delete_is_abandoned_at_its_deadline() {
+    use super::retention::{STAGING_DELETE_DEADLINE, UNOWNED_STAGING_LIMIT};
+
+    let hung = StagingHarness::new();
+    let leftovers: Vec<String> = (1..=UNOWNED_STAGING_LIMIT as u128)
+        .map(|serial| hung.leftover(serial, None))
+        .collect();
+    hung.answer(&leftovers[0], Some(StagingAnswer::Hangs));
+    let next = StagingHarness::new();
+    let next_leftover = next.leftover(1, None);
+
+    // In turn, as the scheduler loop runs its sandboxes' ticks.
+    let (hung_tick, elapsed, next_tick) = tokio::time::timeout(TICK_INTERVAL, async {
+        let started = tokio::time::Instant::now();
+        let hung_tick = hung.tick().await;
+        let elapsed = started.elapsed();
+        (hung_tick, elapsed, next.tick().await)
+    })
+    .await
+    .expect("a hung staging delete stalls the scheduler loop");
+
+    hung_tick.result.as_ref().unwrap();
+    assert!(hung_tick.captured);
+    assert_eq!(hung_tick.deletes, [leftovers[0].clone()]);
+    assert_eq!(hung_tick.recorded, Some(UNOWNED_STAGING_LIMIT - 1));
+    assert_eq!(hung_tick.skips, Vec::<String>::new());
+    assert!(
+        elapsed >= STAGING_DELETE_DEADLINE
+            && elapsed < STAGING_DELETE_DEADLINE + Duration::from_secs(1),
+        "{elapsed:?}"
+    );
+    next_tick.result.as_ref().unwrap();
+    assert!(next_tick.captured);
+    assert_eq!(next_tick.deletes, std::slice::from_ref(&next_leftover));
+    assert_eq!(next_tick.recorded, Some(0));
+}
+
+/// The gate counts the staging still there after the deletes. Leftovers the
+/// orphan sweep removed since the listing do not count, so a listing of more
+/// than the limit does not close the gate once they are gone.
+#[tokio::test]
+async fn staging_the_sweep_removed_meanwhile_is_not_counted() {
+    let harness = StagingHarness::new();
+    let leftovers: Vec<String> = (1..=6)
+        .map(|serial| harness.leftover(serial, None))
+        .collect();
+    harness.answer(&leftovers[0], Some(StagingAnswer::SweepsAll));
+    let events = crate::service::tests::service_tests::SandboxEventCapture::default();
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let _subscriber =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(events.clone()));
+
+    let observed = harness.tick().await;
+    observed.result.as_ref().unwrap();
+    assert!(observed.captured);
+    assert_eq!(observed.deletes, [leftovers[0].clone()]);
+    assert_eq!(observed.recorded, Some(0));
+    assert_eq!(observed.skips, Vec::<String>::new());
+    assert_eq!(observed.gauges, [0.0]);
+    assert_eq!(gate_events(&events), Vec::new());
+}
+
+/// Node-manager pages a live directory read, so a later page can list the
+/// staging this prune made on an earlier one. It stays this prune's own:
+/// deleted once and counted once, not retried again as a leftover.
+#[tokio::test]
+async fn staging_a_later_page_lists_again_is_deleted_and_counted_once() {
+    use crate::local_artifacts::LocalArtifacts;
+
+    // The first page lists one 1m snapshot more than the tier keeps; the
+    // second lists the GC staging under `snapshots/` by then.
+    let names: Vec<String> = (0..=KEEP_D_1M)
+        .map(|minute| format!("d-1m-20260101T00{minute:02}00Z"))
+        .collect();
+    let harness = StagingHarness::with_listing(Box::new({
+        let names = names.clone();
+        move |snapshots, page_token| match page_token {
+            "" => (names.clone(), "2".to_owned()),
+            _ => (
+                list_snapshots_dir(snapshots)
+                    .into_iter()
+                    .filter(|name| crate::local_artifacts::is_gc_staging_name(name))
+                    .collect(),
+                String::new(),
+            ),
+        }
+    }));
+    for name in &names {
+        let path = format!("{}/{name}", harness.snapshots);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(std::path::Path::new(&path).join("memory"), "memory").unwrap();
+    }
+    // The oldest, the one the prune deletes, is catalogued, so it is staged.
+    let id = LocalArtifactId::new();
+    LocalArtifacts::new(harness.ctx.db.clone())
+        .publish_named_snapshot(
+            &harness.sandbox_id,
+            id,
+            ArtifactKind::Disk,
+            &SnapshotName::parse(names[0].clone()).unwrap(),
+            &format!("{}/{}", harness.snapshots, names[0]),
+        )
+        .unwrap();
+    let staging = format!("{}/.gc-pending-{id}", harness.snapshots);
+    harness.answer(&staging, Some(StagingAnswer::Stuck));
+
+    let observed = harness.tick().await;
+    observed.result.as_ref().unwrap();
+    assert!(observed.captured);
+    assert_eq!(observed.deletes, std::slice::from_ref(&staging));
+    assert_eq!(observed.recorded, Some(1));
+    assert!(std::path::Path::new(&staging).exists());
 }
 
 /// GC staging keeps the tier prefix of the snapshot it once was, in the earlier

@@ -34,11 +34,23 @@ pub(crate) struct FakeNodeManager {
 
 impl FakeNodeManager {
     /// Answer `method` (for example `"StopProcess"`) with `handler`.
-    pub(crate) fn unary<Req, Resp, F>(mut self, method: &'static str, handler: F) -> Self
+    pub(crate) fn unary<Req, Resp, F>(self, method: &'static str, handler: F) -> Self
     where
         Req: prost::Message + Default + Send + 'static,
         Resp: prost::Message + Send + 'static,
         F: Fn(Req) -> Result<Resp, Status> + Send + Sync + 'static,
+    {
+        self.unary_async(method, move |request| std::future::ready(handler(request)))
+    }
+
+    /// Answer `method` with the future `handler` returns, for a call that
+    /// must wait, or never answer, as a node-manager queued behind a lock.
+    pub(crate) fn unary_async<Req, Resp, F, Fut>(mut self, method: &'static str, handler: F) -> Self
+    where
+        Req: prost::Message + Default + Send + 'static,
+        Resp: prost::Message + Send + 'static,
+        F: Fn(Req) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<Resp, Status>> + Send + 'static,
     {
         let handler = Arc::new(handler);
         let route: Route = Arc::new(move |request| {
@@ -240,14 +252,16 @@ impl NodeManagerTransport for InProcess {
 
 struct Unary<F, Resp>(Arc<F>, PhantomData<fn() -> Resp>);
 
-impl<Req, Resp, F> tonic::server::UnaryService<Req> for Unary<F, Resp>
+impl<Req, Resp, F, Fut> tonic::server::UnaryService<Req> for Unary<F, Resp>
 where
-    F: Fn(Req) -> Result<Resp, Status>,
+    F: Fn(Req) -> Fut,
+    Fut: std::future::Future<Output = Result<Resp, Status>> + Send + 'static,
 {
     type Response = Resp;
-    type Future = std::future::Ready<Result<tonic::Response<Resp>, Status>>;
+    type Future = BoxFuture<'static, Result<tonic::Response<Resp>, Status>>;
 
     fn call(&mut self, request: tonic::Request<Req>) -> Self::Future {
-        std::future::ready((self.0)(request.into_inner()).map(tonic::Response::new))
+        let response = (self.0)(request.into_inner());
+        Box::pin(async move { response.await.map(tonic::Response::new) })
     }
 }

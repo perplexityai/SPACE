@@ -49,6 +49,17 @@ pub(super) const UNOWNED_STAGING_LIMIT: usize = 5;
 /// claims are usually short.
 const UNAVAILABLE_RETRY_BACKOFF: Duration = Duration::from_millis(300);
 
+/// How long retention waits for one staging delete, its `Unavailable` retry
+/// included. DeleteCacheArtifact queues for node-manager's delete capacity and
+/// then the sandbox's artifact lock, and the node's scheduler loop awaits each
+/// sandbox's tick in turn, so a delete that never answers would stall every
+/// sandbox's scheduled snapshots on the node. A healthy delete answers well
+/// within a second; this deadline keeps a usual tick's deletes (one own
+/// staging and one leftover) under half the scheduler's 60 s tick. A delete
+/// that outlives it is left like a persistent `Unavailable`: node-manager may
+/// still finish it, which is harmless because deletes are idempotent.
+pub(super) const STAGING_DELETE_DEADLINE: Duration = Duration::from_secs(15);
+
 /// Keep only the newest entries seen for each scheduled tier. A partial walk
 /// may delete an entry only after seeing enough newer entries to retain.
 pub(super) fn retention_candidate(
@@ -96,27 +107,42 @@ pub(super) fn retention_candidate(
 /// would stall the sandbox's publication, rollback, export and backup
 /// enqueue. Besides this prune's own staging, the listing shows unowned
 /// staging that an earlier delete, by any deleter, failed to remove
-/// ([`Staged::delete`] says which of it this tick retries).
+/// ([`Staged::delete`] says which of it this tick retries). The locks cover
+/// only the listing: which listed staging no row owns is looked up after
+/// they are released.
 ///
 /// A failed prune captures nothing: the listing failed, or the by-name delete
 /// of a snapshot without a row (an uncatalogued DeleteBtrfsSnapshot) failed,
 /// so that snapshot's bytes are still in place. A failed staging delete is
 /// not a failed prune: the row is already gone. The capture is gated on a
-/// bound, not on every staging delete succeeding: it is skipped, and the
-/// tick fails, only
-/// while the unowned staging left under `snapshots/` after this tick's deletes
-/// numbers at least [`UNOWNED_STAGING_LIMIT`]; below that, leftovers wait for
-/// a later tick or the orphan sweep. The count is the listing's, so it
-/// survives a restart. While deletes keep failing, the ticks below the limit
-/// each add at most what one prune moves aside, and once a prune's deletes
-/// leave the limit reached no capture adds more: later prunes can stage only
-/// snapshots that already existed. The count is stored in `unowned_staging`
-/// for the gate's metrics and events, unless the prune failed, when the
-/// listing may be partial.
+/// bound, not on every staging delete succeeding: it is skipped, and the tick
+/// fails, only while the unowned staging left under `snapshots/` after this
+/// tick's deletes numbers at least [`UNOWNED_STAGING_LIMIT`]; below that,
+/// leftovers wait for a later tick or the orphan sweep. The count is taken
+/// from disk, so it survives a restart. While deletes keep failing, the ticks
+/// below the limit each add at most what one prune moves aside, and once a
+/// prune's deletes leave the limit reached no capture adds more: later prunes
+/// can stage only snapshots that already existed. The count is stored in
+/// `unowned_staging` for the gate's metrics and events, unless the prune
+/// failed, when the listing may be partial.
+///
+/// The gate accepts two cases:
+/// - Staging another deleter is still deleting (DeleteSnapshots with
+///   `all=true`, say) has no row, so it counts as unowned until that delete
+///   ends. Enough of it can close the gate for about a tick; the count
+///   re-checks each entry after this tick's deletes, which narrows that window.
+/// - [`UNOWNED_STAGING_LIMIT`] or more directories that never delete keep
+///   the sandbox's scheduled captures and checkpoints stopped for as long as
+///   they stay. That is the growth bound working as designed. It shows as
+///   the `scheduled_snapshots_blocked` event for the sandbox, a sustained
+///   `capture_skipped{reason:staging_backlog}`, and this function's warn on
+///   every blocked tick with the `sandbox_id`. The `unowned_staging` gauge
+///   sums the node's sandboxes, so it alone does not name the sandbox.
 ///
 /// `prepare`, the guest flush and host sync, runs after the staging deletes,
 /// with the locks released as the flush always ran, so the delete time does
-/// not separate it from the capture. Its value is handed to `capture` and returned.
+/// not separate it from the capture. Its value is handed to `capture` and
+/// returned.
 pub(super) async fn prune_and_capture<T>(
     node_client: &mut NodeManagerGrpcClient,
     ctx: &CheckpointContext,
@@ -126,15 +152,17 @@ pub(super) async fn prune_and_capture<T>(
     prepare: impl AsyncFnOnce(&mut NodeManagerGrpcClient) -> Result<T, String>,
     capture: impl AsyncFnOnce(&mut NodeManagerGrpcClient, &T) -> Result<(), String>,
 ) -> Result<T, String> {
+    let artifacts = LocalArtifacts::new(ctx.db.clone());
     let mut staged = Staged::default();
     let pruned = {
         let (_wake_guard, _artifact_guard) = ctx
             .auto_lifecycle
             .artifact_publication_locks(sandbox_id, ArtifactKind::Disk)
             .await;
-        prune_scheduled_snapshots(node_client, ctx, sandbox_id, cache_root, &mut staged).await
+        prune_scheduled_snapshots(node_client, &artifacts, sandbox_id, cache_root, &mut staged)
+            .await
     };
-    let remaining = staged.delete(node_client).await;
+    let remaining = staged.delete(node_client, &artifacts).await;
     if let Err(error) = pruned {
         pplx_space_metrics::snapshot::scheduler_capture_skipped(SchedulerCaptureSkip::PruneFailed);
         return Err(error);
@@ -170,9 +198,10 @@ pub(super) async fn prune_and_capture<T>(
 struct Staged {
     /// What this prune moved aside: each snapshot name with its staging path.
     own: Vec<(String, String)>,
-    /// Unowned staging the listing showed: each with its artifact id, its
-    /// name and its path.
-    leftover: Vec<(LocalArtifactId, String, String)>,
+    /// The other GC staging the listing showed: each with its artifact id,
+    /// its name and its path. Which of it is unowned is looked up once the
+    /// locks are released.
+    listed: Vec<(LocalArtifactId, String, String)>,
 }
 
 /// How one retention staging delete ended.
@@ -182,36 +211,63 @@ enum StagingDelete {
     /// Node-manager answered `Unavailable` twice: a sandbox mutation still
     /// held its claim. Transient, so it is not counted against the gate.
     Unavailable,
+    /// No answer within [`STAGING_DELETE_DEADLINE`]. Left, and not counted,
+    /// like [`StagingDelete::Unavailable`].
+    TimedOut,
     Failed,
 }
 
 impl Staged {
-    /// Delete this prune's own staging and, of the leftovers, only the
-    /// oldest: lowest artifact id, and ids are UUIDv7, so oldest created.
-    /// The orphan sweep's own task retries the rest, so a backlog that other
-    /// deleters left cannot stall the node's scheduler loop, which awaits
-    /// each sandbox's tick in turn. Returns how many unowned staging
-    /// directories remain, leaving out each that this tick's delete found
-    /// [`StagingDelete::Unavailable`].
-    async fn delete(mut self, node_client: &mut NodeManagerGrpcClient) -> usize {
-        self.leftover.sort();
-        let mut leftover = self
-            .leftover
+    /// Delete this prune's own staging and, of the unowned leftovers, only
+    /// the oldest: the lowest artifact id (UUIDv7 for most artifacts, so
+    /// usually the oldest created). The orphan sweep's own task retries the
+    /// rest, so a backlog that other deleters left cannot stall the node's
+    /// scheduler loop, which awaits each sandbox's tick in turn.
+    ///
+    /// Returns how many unowned staging directories remain, counted after the
+    /// deletes: each directory a delete failed to remove and each leftover
+    /// not retried, if it still exists and no row owns it, so what the orphan
+    /// sweep removed meanwhile does not count. Each that this tick's delete
+    /// left [`StagingDelete::Unavailable`] or [`StagingDelete::TimedOut`] is
+    /// not counted either.
+    async fn delete(
+        mut self,
+        node_client: &mut NodeManagerGrpcClient,
+        artifacts: &LocalArtifacts,
+    ) -> usize {
+        self.listed.sort();
+        let listed: Vec<(String, String)> = self
+            .listed
             .into_iter()
-            .map(|(_, name, staging)| (name, staging));
+            .map(|(_, name, staging)| (name, staging))
+            .collect();
+        let unowned = unowned_staging(
+            artifacts,
+            listed.iter().map(|(_, staging)| staging.clone()).collect(),
+        )
+        .await;
+        let mut leftover = listed
+            .into_iter()
+            .zip(unowned)
+            .filter_map(|(entry, unowned)| unowned.then_some(entry));
         let retried = leftover.next();
-        let mut remaining = leftover.len();
+        let mut recount: Vec<String> = leftover.map(|(_, staging)| staging).collect();
         for (snapshot_name, staging) in self.own.iter().chain(&retried) {
             if delete_staging(node_client, staging, snapshot_name).await == StagingDelete::Failed {
-                remaining += 1;
+                recount.push(staging.clone());
             }
         }
-        remaining
+        unowned_staging(artifacts, recount)
+            .await
+            .into_iter()
+            .filter(|unowned| *unowned)
+            .count()
     }
 }
 
-/// Delete one staging directory, retrying once after
-/// [`UNAVAILABLE_RETRY_BACKOFF`] if node-manager answers `Unavailable`.
+/// Delete one staging directory within [`STAGING_DELETE_DEADLINE`], retrying
+/// once after [`UNAVAILABLE_RETRY_BACKOFF`] if node-manager answers
+/// `Unavailable`.
 async fn delete_staging(
     node_client: &mut NodeManagerGrpcClient,
     staging: &str,
@@ -222,11 +278,23 @@ async fn delete_staging(
             .await
     };
     let unavailable = |status: &tonic::Status| status.code() == tonic::Code::Unavailable;
-    let mut result = delete(node_client).await;
-    if result.as_ref().is_err_and(unavailable) {
+    let attempts = async {
+        let result = delete(node_client).await;
+        if !result.as_ref().is_err_and(unavailable) {
+            return result;
+        }
         tokio::time::sleep(UNAVAILABLE_RETRY_BACKOFF).await;
-        result = delete(node_client).await;
-    }
+        delete(node_client).await
+    };
+    let Ok(result) = tokio::time::timeout(STAGING_DELETE_DEADLINE, attempts).await else {
+        tracing::warn!(
+            staging,
+            deadline_secs = STAGING_DELETE_DEADLINE.as_secs(),
+            "retention stopped waiting for a GC staging delete and leaves the staging to a \
+             later tick or the orphan sweep; node-manager may still finish the delete"
+        );
+        return StagingDelete::TimedOut;
+    };
     match result {
         Ok(()) => StagingDelete::Deleted,
         Err(status) if unavailable(&status) => {
@@ -245,7 +313,10 @@ async fn delete_staging(
 /// observed it, and emit a sandbox event when the count closes or reopens the
 /// capture gate. A tick that observed none keeps the last count. The state is
 /// in memory, so after a restart or a re-registration the first count that
-/// finds the gate closed reports it again.
+/// finds the gate closed reports it again, and one that finds it open reports
+/// nothing: a gate that reopens across a restart or re-registration has its
+/// `scheduled_snapshots_blocked` without a matching
+/// `scheduled_snapshots_unblocked`.
 pub(super) async fn record_unowned_staging(
     sandboxes: &Mutex<HashMap<String, SandboxSnapshotState>>,
     sandbox_id: &str,
@@ -298,30 +369,38 @@ pub(super) async fn emit_unowned_staging_gauge(
     pplx_space_metrics::snapshot::scheduler_unowned_staging(total);
 }
 
-/// [`crate::snapshot_gc::gc_pending_is_unowned`] on the blocking pool, as the
-/// orphan sweep runs it: the ownership lookup reads SQLite.
-async fn staging_is_unowned(artifacts: &LocalArtifacts, staging: &str) -> bool {
-    let (artifacts, path) = (artifacts.clone(), std::path::PathBuf::from(staging));
+/// For each of `paths`, whether it still exists as GC staging that no row
+/// owns: a stat, then [`crate::snapshot_gc::gc_pending_is_unowned`]. It runs
+/// on the blocking pool, as the orphan sweep runs it, since the ownership
+/// lookup reads SQLite. If that task fails, no path is unowned.
+async fn unowned_staging(artifacts: &LocalArtifacts, paths: Vec<String>) -> Vec<bool> {
+    let (artifacts, count) = (artifacts.clone(), paths.len());
     match tokio::task::spawn_blocking(move || {
-        crate::snapshot_gc::gc_pending_is_unowned(&artifacts, &path)
+        paths
+            .iter()
+            .map(|path| {
+                let path = std::path::Path::new(path);
+                path.exists() && crate::snapshot_gc::gc_pending_is_unowned(&artifacts, path)
+            })
+            .collect()
     })
     .await
     {
         Ok(unowned) => unowned,
         Err(error) => {
-            tracing::warn!(staging, %error,
+            tracing::warn!(%error,
                 "retaining GC staging after ownership lookup task failed");
-            false
+            vec![false; count]
         }
     }
 }
 
 /// Delete the scheduled snapshots outside each tier's retention. Each
 /// catalogued snapshot's GC staging, with its name, goes to `staged.own`, and
-/// each unowned GC staging the listing shows to `staged.leftover`.
+/// each other GC staging the listing shows to `staged.listed`.
 async fn prune_scheduled_snapshots(
     node_client: &mut NodeManagerGrpcClient,
-    ctx: &CheckpointContext,
+    artifacts: &LocalArtifacts,
     sandbox_id: &str,
     cache_root: &str,
     staged: &mut Staged,
@@ -329,7 +408,6 @@ async fn prune_scheduled_snapshots(
     let sandbox = sandbox_id
         .parse::<SandboxId>()
         .map_err(|error| error.to_string())?;
-    let artifacts = LocalArtifacts::new(ctx.db.clone());
     let mut pages = pplx_space_node_mgr_client::SnapshotPages::new(sandbox, false);
     let mut retained = std::array::from_fn(|_| std::collections::BTreeSet::new());
     while let Some(snapshots) = pages
@@ -347,9 +425,8 @@ async fn prune_scheduled_snapshots(
                 // A later page can list what this prune staged on an earlier one.
                 if let Some(id) = crate::local_artifacts::gc_staging_id(&snapshot.name)
                     && !staged.own.iter().any(|(_, own)| *own == staging)
-                    && staging_is_unowned(&artifacts, &staging).await
                 {
-                    staged.leftover.push((id, snapshot.name, staging));
+                    staged.listed.push((id, snapshot.name, staging));
                 }
                 continue;
             }
