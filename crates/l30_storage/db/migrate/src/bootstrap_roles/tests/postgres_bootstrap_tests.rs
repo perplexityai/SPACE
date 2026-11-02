@@ -49,6 +49,17 @@ async fn role_has_table_privilege(
     )
 }
 
+/// Unlike `has_table_privilege`, this also sees column-scoped grants.
+async fn ro_reads_any_column(fixture: &PostgresFixture, table: &str) -> TestResult<bool> {
+    Ok(sqlx::query_scalar(sql!(
+        "SELECT has_any_column_privilege($1, $2::regclass, 'SELECT')"
+    ))
+    .bind(RO_ROLE)
+    .bind(table)
+    .fetch_one(&fixture.pool)
+    .await?)
+}
+
 async fn role_settings(fixture: &PostgresFixture, role: &str) -> TestResult<Vec<String>> {
     Ok(sqlx::query_scalar(sql!(
         r"
@@ -1044,6 +1055,111 @@ async fn ro_reads_tenant_publication_grant_metadata_without_authorization_id() -
         assert_eq!(
             has, expected,
             "space_ro SELECT on tenant publication grant {column}"
+        );
+    }
+    Ok(())
+}
+
+/// A browned-out view: its application-role privileges were revoked ahead of
+/// its drop, and excluding it keeps them revoked while the grant loop still
+/// converges everything else. Without the exclusion, bootstrap restores them;
+/// that regrant is what the exclusion exists to stop.
+#[tokio::test]
+async fn grant_exclusion_keeps_revoked_view_privileges_revoked() -> TestResult {
+    let Some(fixture) = postgres_fixture().await? else {
+        return Ok(());
+    };
+    run_bootstrap(&fixture).await?;
+    let mut conn = fixture.connect_as("postgres").await?;
+    assume_migrator_role(&mut conn).await?;
+    for statement in [
+        "CREATE TABLE renamed_fixture (id INT)",
+        "CREATE VIEW legacy_fixture AS SELECT id FROM renamed_fixture",
+        "REVOKE ALL ON legacy_fixture FROM space_user, space_ro, space_creds",
+        "REVOKE ALL ON renamed_fixture FROM space_user, space_ro, space_creds",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(sql!(statement)))
+            .execute(&mut conn)
+            .await?;
+    }
+    drop(conn);
+
+    let mut admin = fixture.connect_as("postgres").await?;
+    let skipped = converge_grants(&mut admin, &["legacy_fixture"]).await?;
+    assert_eq!(skipped, 0);
+    for role in [USER_ROLE, RO_ROLE, CREDS_ROLE] {
+        assert!(
+            !role_has_table_privilege(&fixture, role, "legacy_fixture", "SELECT").await?,
+            "{role} must stay revoked on the excluded view"
+        );
+        assert!(
+            role_has_table_privilege(&fixture, role, "renamed_fixture", "SELECT").await?,
+            "{role} must be granted the table behind the view"
+        );
+    }
+
+    run_bootstrap(&fixture).await?;
+    for role in [USER_ROLE, RO_ROLE, CREDS_ROLE] {
+        assert!(
+            role_has_table_privilege(&fixture, role, "legacy_fixture", "SELECT").await?,
+            "{role} must be regranted a view that is not excluded"
+        );
+    }
+    Ok(())
+}
+
+/// A listed relation in `RO_COLUMN_DENYLIST` still gets the column fence's
+/// `space_ro` revoke, without the column-scoped re-grant. A browned-out view
+/// recreated by `space_migrator` picks up table-level `space_ro` SELECT from
+/// its default privileges; without the revoke, `space_ro` could read the hash
+/// column through a view without `security_invoker` while it stays listed.
+#[tokio::test]
+async fn grant_exclusion_still_fences_denylisted_columns_from_ro() -> TestResult {
+    let Some(fixture) = postgres_fixture().await? else {
+        return Ok(());
+    };
+    run_bootstrap(&fixture).await?;
+    let mut conn = fixture.connect_as("postgres").await?;
+    assume_migrator_role(&mut conn).await?;
+    for statement in [
+        "CREATE TABLE renamed_sessions (id INT, token_hash TEXT)",
+        "CREATE VIEW sessions AS SELECT id, token_hash FROM renamed_sessions",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(sql!(statement)))
+            .execute(&mut conn)
+            .await?;
+    }
+    drop(conn);
+
+    assert!(
+        ro_reads_any_column(&fixture, "sessions").await?,
+        "space_ro must start with SELECT on the view from default privileges"
+    );
+
+    let mut admin = fixture.connect_as("postgres").await?;
+    let skipped = converge_grants(&mut admin, &["sessions"]).await?;
+    assert_eq!(skipped, 0);
+    assert!(
+        !ro_reads_any_column(&fixture, "sessions").await?,
+        "space_ro must lose every column of an excluded denylisted view"
+    );
+    assert!(
+        role_has_table_privilege(&fixture, USER_ROLE, "sessions", "SELECT").await?,
+        "space_user must keep the grants an excluded view already had"
+    );
+
+    run_bootstrap(&fixture).await?;
+    for (column, expected) in [("id", true), ("token_hash", false)] {
+        let has: bool = sqlx::query_scalar(sql!(
+            "SELECT has_column_privilege($1, 'public.sessions'::regclass, $2, 'SELECT')"
+        ))
+        .bind(RO_ROLE)
+        .bind(column)
+        .fetch_one(&fixture.pool)
+        .await?;
+        assert_eq!(
+            has, expected,
+            "space_ro SELECT on sessions {column} once the view is not excluded"
         );
     }
     Ok(())
