@@ -203,6 +203,7 @@ async fn retire(
         .retire_execution(RetireExecutionRequest {
             sandbox_id,
             fence: RetireFence::Unobserved,
+            stop_route: RetireStopRoute::Execution,
         })
         .await
 }

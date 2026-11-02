@@ -938,7 +938,8 @@ impl ExecutionTeardown {
     /// inactive, the sandbox drops out of the failed-cleanup retry scan.
     /// sbx-mgr's stop returns success for unknown and not-running sandboxes,
     /// so aborting only fires when a live runtime's stop genuinely failed, the
-    /// pod worker could not be reached, or the stopped-disk backup could not be
+    /// worker the stop route names (the pod's, or the node's node-api) could
+    /// not be resolved or reached, or the stopped-disk backup could not be
     /// enqueued.
     pub(super) fn requires_stop_success(self) -> bool {
         matches!(self, Self::Retire)
