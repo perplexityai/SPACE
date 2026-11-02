@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import json
 import random
@@ -110,6 +111,15 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(joined["a"].node, "w2")
         self.assertEqual(joined["b"].node, "w3")
         self.assertIsNone(joined["c"])
+
+    def test_merge_activations_drops_repeats_from_overlapping_polls(self):
+        a = xnode.Activation("s", "w2", "snapshot", "remote_only", True, "2", 1_000)
+        b = xnode.Activation("s", "w3", "snapshot", "remote_only", True, "3", 50_000)
+        c = xnode.Activation("t", "w1", "snapshot", "local", False, "1", 50_000)
+        seen = {}
+        self.assertEqual(xnode.merge_activations(seen, [a, b]), 2)
+        self.assertEqual(xnode.merge_activations(seen, [dataclasses.replace(b), c, c]), 1)
+        self.assertEqual(list(seen), [a, b, c])
 
 
 class FakeKube:
@@ -281,6 +291,25 @@ class FakeRunTests(unittest.TestCase):
             self.assertTrue(wakes)
             self.assertTrue(all(w["inflight_at_dispatch"] == 0 for w in wakes))
             self.assertFalse(any(r["kind"] == "probe" for r in rows))
+
+    def test_activations_polled_before_log_rotation_are_classified(self):
+        def activated(sid, node):
+            return node, json.dumps({"timestamp": xnode.now_ms() / 1000, "event_type": "runtime_activated",
+                                     "sandbox_id": sid, "boot_type": "snapshot",
+                                     "restore_provenance": "remote_only"})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            kube = FakeKube(NODES)
+            bench = xnode.XnodeBenchmark(fake_args(tmp), kube=kube, ecw=FakeEcw(kube))
+            block = xnode.Block(0, "baseline", "t-base")
+            block.start_ms = xnode.now_ms()
+            sids = [str(uuid.uuid4()), str(uuid.uuid4())]
+            block.wakes = [{"wake_id": f"w{i}", "sandbox_id": sid, "wake_start_ms": block.start_ms,
+                            "source_node": "w1"} for i, sid in enumerate(sids)]
+            kube.lines = [activated(sids[0], "w2")]
+            bench.collect_activations(block)
+            kube.lines = [activated(sids[1], "w3")]  # the log rotated and lost the first event
+            self.assertEqual(bench.classify_block(block), {"cross_node_download": 2})
 
     def test_preflight_refuses_already_cordoned_pool_node(self):
         with tempfile.TemporaryDirectory() as tmp:

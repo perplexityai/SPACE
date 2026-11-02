@@ -29,10 +29,11 @@ How one block works (one variant, one template, ``--block-minutes`` long):
 4. Each wake-up is timed on this machine's clock, from the ECW connect request
    to the first ``true`` command returning, then (untimed) the guest pattern
    is re-hashed to prove the restore is correct.
-5. At the end of the block every worker is schedulable again. The harness
-   reads the workers' sandbox-manager ``runtime_activated`` events to record
-   where each restore landed and whether it downloaded its snapshot, then
-   deletes the block's sandboxes.
+5. Throughout the block the harness polls the workers' sandbox-manager logs
+   for ``runtime_activated`` events, so log rotation cannot drop them. At the
+   end of the block every worker is schedulable again; a final poll records
+   where each restore landed and whether it downloaded its snapshot, then the
+   block's sandboxes are deleted.
 
 Cordoning is limited to the nodes named in ``--nodes``. The harness refuses to
 start if one of them is already cordoned, records the node it cordons in
@@ -70,6 +71,10 @@ SCHEMA_VERSION = 1
 SANDBOX_ID_LABEL = "space.pplx.net/sandbox-id"
 DEFAULT_SBXMGR_SELECTOR = "app.kubernetes.io/component=sandbox-manager"
 DEFAULT_SBXMGR_CONTAINER = "sandbox-manager"
+# Each activation poll re-reads this much of the previous window, to cover
+# kubectl's whole-second --since-time and clock skew; merge_activations drops
+# the repeats.
+ACTIVATION_POLL_OVERLAP_MS = 60_000
 UUID_SEARCH = re.compile(r"[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}")
 
 # The API's own restore-selection predicate (see space_smoke/adapters.py
@@ -244,6 +249,20 @@ def parse_activation(line: str, node: str) -> Activation | None:
         generation=str(merged.get("execution_generation", "")),
         ts_ms=parse_timestamp_ms(merged.get("timestamp") or event.get("ts")),
     )
+
+
+def merge_activations(seen: dict[Activation, None], new: Iterable[Activation]) -> int:
+    """Add the activations in ``new`` that ``seen`` lacks, keeping first-seen order; return how many.
+
+    Overlapping log polls return the same line more than once, and the same
+    line always parses to an equal ``Activation``.
+    """
+    added = 0
+    for activation in new:
+        if activation not in seen:
+            seen[activation] = None
+            added += 1
+    return added
 
 
 # Only `cross_node_download` samples count toward the primary metric: the
@@ -537,6 +556,8 @@ class Block:
         self.wakes: list[dict[str, Any]] = []
         self.inflight: dict[str, tuple[str, int]] = {}  # wake_id -> (sandbox_id, start_ms)
         self.start_ms = 0
+        self.activations: dict[Activation, None] = {}
+        self.activations_since_ms = 0
         self.counters: dict[str, int] = {}
 
     def bump(self, key: str, by: int = 1) -> None:
@@ -971,9 +992,31 @@ class XnodeBenchmark:
             except Exception as exc:
                 self.log(f"WARNING: wake task failed: {exc}")
 
+    def collect_activations(self, block: Block) -> None:
+        """Merge the activations logged since the last successful poll into ``block``."""
+        polled_ms = now_ms()
+        with block.lock:
+            since_ms = block.activations_since_ms
+        lines = self.kube.sbxmgr_log_lines(self.nodes, since_ms)
+        parsed = [act for node, line in lines if (act := parse_activation(line, node)) is not None]
+        with block.lock:
+            merge_activations(block.activations, parsed)
+            block.activations_since_ms = max(block.activations_since_ms, polled_ms - ACTIVATION_POLL_OVERLAP_MS)
+
+    def activation_loop(self, block: Block) -> None:
+        while not block.stop.wait(self.args.activation_interval_s):
+            try:
+                self.collect_activations(block)
+            except KubeError as exc:
+                self.log(f"WARNING: activation poll failed: {exc}")
+
     def classify_block(self, block: Block) -> dict[str, int]:
-        lines = self.kube.sbxmgr_log_lines(self.nodes, block.start_ms - 60_000)
-        activations = [act for node, line in lines if (act := parse_activation(line, node)) is not None]
+        try:
+            self.collect_activations(block)
+        except KubeError as exc:
+            self.log(f"WARNING: final activation poll failed: {exc}")
+        with block.lock:
+            activations = list(block.activations)
         with (self.output_dir / f"activations-block-{block.index}.jsonl").open("w") as f:
             for act in activations:
                 f.write(json.dumps(dataclasses.asdict(act), sort_keys=True) + "\n")
@@ -1027,7 +1070,9 @@ class XnodeBenchmark:
             if outside:
                 block.bump("sandboxes_outside_pool", outside)
             block.start_ms = now_ms()
+            block.activations_since_ms = block.start_ms - ACTIVATION_POLL_OVERLAP_MS
             threading.Thread(target=self.placement_loop, args=(block,), daemon=True).start()
+            threading.Thread(target=self.activation_loop, args=(block,), daemon=True).start()
             for s in list(block.sandboxes.values()):
                 if s.role == "bystander" and s.state == "running":
                     self.pool.submit(self.probe_loop, block, s)
@@ -1041,11 +1086,7 @@ class XnodeBenchmark:
             failed = self.guard.release_all()
             if failed:
                 self.log(f"ERROR: could not uncordon {failed}; run with --repair")
-        try:
-            counts = self.classify_block(block)
-        except KubeError as exc:
-            self.log(f"WARNING: could not read restore placement: {exc}")
-            counts = {"unclassified": len(block.wakes)}
+        counts = self.classify_block(block)
         self.emit({"kind": "block", "block": index, "variant": label, "template": block.template, "load": a.load,
                    "rate_per_min": a.rate if a.load == "loaded" else None,
                    "quiet_interval_s": a.quiet_interval_s if a.load == "quiet" else None,
@@ -1130,6 +1171,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Optional API database URL; when set, also require the API's restore-portability predicate.")
     p.add_argument("--bind-timeout-s", type=float, default=60)
     p.add_argument("--placement-interval-s", type=float, default=5)
+    p.add_argument("--activation-interval-s", type=float, default=60,
+                   help="How often to poll sandbox-manager logs for activations; keep it well under log rotation.")
     p.add_argument("--profiles", default=",".join(stage1.PROFILES))
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--pattern-mem-mb", type=int, default=256)
