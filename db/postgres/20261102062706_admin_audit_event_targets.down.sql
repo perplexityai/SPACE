@@ -6,4 +6,5 @@ SET LOCAL statement_timeout = '5s';
 ALTER TABLE admin_audit_events
     DROP COLUMN target_org_id,
     DROP COLUMN target_type,
-    DROP COLUMN target_id;
+    DROP COLUMN target_id,
+    DROP COLUMN target_user_id;
