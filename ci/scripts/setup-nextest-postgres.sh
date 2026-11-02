@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Start one migrated Postgres template for all fixture-backed tests in a
 # nextest run. Each test still clones its own isolated database from it.
+#
+# With --bare, start a second server with nothing applied, for tests that
+# provision cluster-global roles on it themselves and so cannot share the
+# first (the migrator's execution-record view pins, .config/nextest.toml).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,9 +31,19 @@ if [ -z "${NEXTEST_ENV:-}" ] || [ -z "${NEXTEST_RUN_ID:-}" ]; then
     exit 1
 fi
 
-# Migrate the template on the given server and publish it to the tests.
+bare=false
+if [ "${1:-}" = "--bare" ]; then
+    bare=true
+fi
+
+# Publish the given server to the tests, after migrating the template on it
+# unless it is bare.
 publish_postgres() {
     local admin_database_url="$1"
+    if [ "${bare}" = true ]; then
+        printf 'SPACE_TEST_BARE_POSTGRES_ADMIN_URL=%s\n' "${admin_database_url}" >>"${NEXTEST_ENV}"
+        return
+    fi
     local setup_binary="${CARGO_TARGET_DIR:-target}/debug/space-nextest-postgres-setup"
     if [ ! -x "${setup_binary}" ]; then
         echo "Nextest did not build ${setup_binary}" >&2
@@ -41,8 +55,9 @@ publish_postgres() {
 
 # The caller already runs a server for this nextest run, as GitHub CI's
 # unprivileged Rust job does (ci/scripts/ci-test-services.sh): there is no
-# Docker daemon to start one, and the caller removes it.
-if [ -n "${SPACE_NEXTEST_POSTGRES_ADDRESS:-}" ]; then
+# Docker daemon to start one, and the caller removes it. A bare server is
+# never that one, which other tests share.
+if [ "${bare}" = false ] && [ -n "${SPACE_NEXTEST_POSTGRES_ADDRESS:-}" ]; then
     publish_postgres "postgres://postgres@${SPACE_NEXTEST_POSTGRES_ADDRESS}/postgres?sslmode=disable"
     exit 0
 fi

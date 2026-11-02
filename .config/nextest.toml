@@ -14,6 +14,10 @@ path = "junit.xml"
 command = "bash ci/scripts/setup-nextest-postgres.sh"
 slow-timeout = { period = "30s", terminate-after = 4 }
 
+[scripts.setup.bare-postgres]
+command = "bash ci/scripts/setup-nextest-postgres.sh --bare"
+slow-timeout = { period = "30s", terminate-after = 4 }
+
 [scripts.setup.redis]
 command = "bash ci/scripts/setup-nextest-redis.sh"
 slow-timeout = { period = "30s", terminate-after = 4 }
@@ -43,6 +47,15 @@ or (package(pplx-space-db-migrate) and test(user_password::))
 or (package(pplx-space-db-migrate) and test(postgres_baseline_tests::))
 '''
 setup = "postgres"
+
+[[profile.default.scripts]]
+# The migrator's execution-record view pins provision the same cluster-global
+# roles as its bootstrap-role tests, but share one bare server: the first
+# bootstraps and migrates a template database on it, and each clones that.
+# Sharing is safe because every pin works in its own database and any pin
+# that converges the shared roles converges them to the same values.
+filter = "package(pplx-space-db-migrate) and test(/^bootstrap_roles::tests::execution_record_view_tests::/)"
+setup = "bare-postgres"
 
 [[profile.default.scripts]]
 # Publishes SPACE_TEST_REDIS_URL, which client_concurrency's and
@@ -100,7 +113,8 @@ test-group = "state-render"
 # and the spaced worker binaries switch between real service uids. The
 # router's descriptor reads use pidfd_getfd,
 # which Docker's default seccomp profile allows only with CAP_SYS_PTRACE. The
-# bootstrap-role tests each start a virgin Postgres container.
+# bootstrap-role tests each start a virgin Postgres container, and the
+# execution-record view pins share one.
 #
 # Root halves of split tests, whose unprivileged halves run outside the group:
 # encrypted_volumes reads the published copy as uid 65534; permission_tree
@@ -167,5 +181,6 @@ or (package(pplx-space-build-mgr) and test(/^oci::containerd::tests::real_contai
 or (package(pplx-space-net-gateway) and test(=tcp_proxy::tests::tls_interception::interception_exemptions_relay_original_tls_only_after_admission))
 or (package(pplx-space-net-gateway-client) and test(=tests::sandbox_connections_ignore_replaced_alias_and_reject_legacy_only_gateway))
 or (package(pplx-space-db-migrate) and test(/^bootstrap_roles::tests::postgres_bootstrap_tests::/))
+or (package(pplx-space-db-migrate) and test(/^bootstrap_roles::tests::execution_record_view_tests::/))
 '''
 test-group = "privileged"
