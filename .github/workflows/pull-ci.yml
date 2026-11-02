@@ -49,6 +49,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       needed: ${{ steps.select.outputs.needed }}
+      record: ${{ steps.record.outputs.name }}
     steps:
       - name: Check out SPACE
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -65,6 +66,18 @@ jobs:
           set -euo pipefail
           needed="$(bash ci/scripts/kind-pull-needed.sh "${PULL_REQUEST_HEAD}")"
           printf 'needed=%s\n' "${needed}" >>"${GITHUB_OUTPUT}"
+
+      # Named here, where the synthetic merge is checked out; space-pull-ci
+      # records it once every check passed (ci/scripts/pull-ci-reuse.py).
+      - name: Name the trees this run tests
+        id: record
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          # Assigned first: a failure inside printf's arguments would not stop
+          # the step, and would record nothing without saying so.
+          name="$(python3 -I ci/scripts/pull-ci-reuse.py name)"
+          printf 'name=%s\n' "${name}" >>"${GITHUB_OUTPUT}"
 
   # Includes same-repository PRs: no package write token. The read token
   # reaches the third-party image mirror and the main-produced layer cache;
@@ -133,3 +146,34 @@ jobs:
             false) test "${KIND_SMOKE_RESULT}" = skipped ;;
             *) echo "Kind smoke selection returned '${KIND_NEEDED}'" >&2; exit 1 ;;
           esac
+
+      # The merge queue skips its copies of rust_static and common for an
+      # entry whose base and merge trees match a record (merge-queue-ci.yml).
+      # A day covers a PR enqueued after its last push; older records expire.
+      # Only reuse depends on it, so a failed upload does not fail the check.
+      - name: Record that this run passed these trees
+        # The results the record certifies, stated here as well as implied by
+        # the gate above.
+        if: >-
+          needs.kind_paths.outputs.record != '' &&
+          needs.rust_static.result == 'success' && needs.common.result == 'success'
+        env:
+          RECORD: ${{ needs.kind_paths.outputs.record }}
+        run: printf '%s\n' "${RECORD}" >"${RUNNER_TEMP}/pull-ci-passed.txt"
+
+      - name: Publish the record
+        if: >-
+          needs.kind_paths.outputs.record != '' &&
+          needs.rust_static.result == 'success' && needs.common.result == 'success'
+        continue-on-error: true
+        # This job made no network call before; a stalled upload must not
+        # hold the required check.
+        timeout-minutes: 2
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ needs.kind_paths.outputs.record }}
+          path: ${{ runner.temp }}/pull-ci-passed.txt
+          retention-days: 1
+          if-no-files-found: error
+          # A rerun of this job records the same trees again.
+          overwrite: true

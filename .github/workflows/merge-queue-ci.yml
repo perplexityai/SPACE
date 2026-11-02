@@ -17,12 +17,51 @@ jobs:
   # pull requests that each pass Clippy can still fail it together: one
   # deprecates an item that another starts to use.
   #
+  # Unless Pull CI already passed the same trees: an entry whose base and
+  # merge-group commit have the trees of a passing Pull CI run's base and
+  # synthetic merge would rerun the same jobs on identical inputs. That is an
+  # entry queued before main moved; for a stack whose bottom PR was on main's
+  # head, each entry whose last Pull CI ran on the current head of the PR
+  # below it. Main CI still runs every check after the merge. Every other
+  # entry starts its checks after this short job, which is bounded so a slow
+  # API delays them by at most two minutes.
+  reuse:
+    if: github.repository == 'perplexityai/SPACE'
+    name: Reuse a passing Pull CI run
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      reused: ${{ steps.lookup.outputs.reused }}
+    steps:
+      - name: Check out SPACE
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: ci/scripts/pull-ci-reuse.py
+          sparse-checkout-cone-mode: false
+
+      - name: Look for a Pull CI run that passed these trees
+        id: lookup
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+        run: |
+          set -euo pipefail
+          reused="$(python3 -I ci/scripts/pull-ci-reuse.py lookup "${BASE_SHA}" "${HEAD_SHA}")"
+          printf 'reused=%s\n' "${reused}" >>"${GITHUB_OUTPUT}"
+
   # Artifact images build on main only. Any crate change recompiles every
   # image's crates from scratch, which made them the queue's slowest job, and
   # nothing consumes the images before main. A branch that changes packaging
   # can run Artifact CI by hand.
   rust_static:
-    if: github.repository == 'perplexityai/SPACE'
+    needs: reuse
+    # A failed lookup runs the checks.
+    if: ${{ !cancelled() && github.repository == 'perplexityai/SPACE' && needs.reuse.outputs.reused != 'true' }}
     uses: ./.github/workflows/rust-static-ci.yml
     # Reads the CI image from this repository's GHCR package. Callers must
     # grant the pull-requests: read the called job asks for.
@@ -32,7 +71,8 @@ jobs:
       pull-requests: read
 
   common:
-    if: github.repository == 'perplexityai/SPACE'
+    needs: reuse
+    if: ${{ !cancelled() && github.repository == 'perplexityai/SPACE' && needs.reuse.outputs.reused != 'true' }}
     uses: ./.github/workflows/common-ci.yml
     # Reads the CI image from this repository's GHCR package.
     permissions:
@@ -46,14 +86,22 @@ jobs:
     name: space-pull-ci
     runs-on: ubuntu-24.04
     needs:
+      - reuse
       - rust_static
       - common
     steps:
       - name: Require every merge-group check
         env:
+          REUSED: ${{ needs.reuse.outputs.reused }}
           RUST_STATIC_RESULT: ${{ needs.rust_static.result }}
           COMMON_RESULT: ${{ needs.common.result }}
         run: |
           set -euo pipefail
+          if [[ "${REUSED}" == true ]]; then
+            # The lookup's log names the Pull CI run that passed these trees.
+            test "${RUST_STATIC_RESULT}" = skipped
+            test "${COMMON_RESULT}" = skipped
+            exit 0
+          fi
           test "${RUST_STATIC_RESULT}" = success
           test "${COMMON_RESULT}" = success
