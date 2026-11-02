@@ -47,6 +47,7 @@ use crate::stuck_container_creating_gc;
 use crate::stuck_snapshot_reaper;
 use crate::suspended_execution_reaper;
 use crate::tombstone_retention;
+use crate::transient_lifecycle_census;
 use crate::transient_lifecycle_sweeper;
 use pplx_space_common_svc::sql::sandbox_residency::{NODE_CENSUS_RESIDENCY_ENV, ResidencyEvidence};
 
@@ -391,6 +392,15 @@ pub async fn run_reconcilers(
             shutdown_token.child_token(),
         ),
     ));
+
+    // Transient-lifecycle census: gauges of how many sandboxes sit in each
+    // transient lifecycle, by age, and the oldest one's age. Read-only and
+    // always on, for both substrates and whatever the sweeper above is set
+    // to, so a wedged lifecycle stays visible with every repair loop off.
+    handles.push(tokio::spawn(transient_lifecycle_census::run(
+        pool.clone(),
+        shutdown_token.child_token(),
+    )));
 
     match substrate.as_kubernetes() {
         None => {

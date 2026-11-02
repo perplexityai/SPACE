@@ -45,6 +45,7 @@ mod stuck_container_creating_gc;
 mod stuck_snapshot_reaper;
 mod suspended_execution_reaper;
 mod tombstone_retention;
+mod transient_lifecycle_census;
 mod transient_lifecycle_sweeper;
 mod warm_pool;
 mod warm_pool_orphan_sweep;

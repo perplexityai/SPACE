@@ -4,6 +4,7 @@ pub mod admission;
 pub mod api;
 pub mod publication;
 pub mod restore;
+pub mod transient_lifecycle;
 pub mod vm;
 pub mod worker;
 

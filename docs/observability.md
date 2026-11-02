@@ -1173,6 +1173,56 @@ or `default`. A partial request reports the fallback that filled the gap. The
 fell back to the platform default shape; those events omit `vcpu` and
 `memory_mib`. Direct creates and forks omit `shape_source`.
 
+## Sandboxes in a transient lifecycle
+
+The cluster controller's elected leader counts the `sandboxes` rows in each
+transient lifecycle (`creating`, `starting`, `restoring`, `pausing`,
+`resuming`, `suspending`, `stopping`, `deleting` and `checkpointing`) once a
+minute and emits two gauges:
+
+| Metric | Tags | Value |
+| --- | --- | --- |
+| `sandbox.transient_lifecycle.rows` | `lifecycle`, `age` | Rows in that lifecycle whose lifecycle changed within that age bucket |
+| `sandbox.transient_lifecycle.oldest_age_seconds` | `lifecycle` | Age of the oldest such row; 0 when there is none |
+
+`age` is one of `lt_1m`, `1m_10m`, `10m_1h`, `1h_6h`, `6h_1d` or `ge_1d`; a
+row aged exactly a bound is in the bucket that bound starts. The age is
+`NOW() - lifecycle_changed_at` on the database clock. The lifecycle trigger
+stamps that column only when the lifecycle changes, so a retry within a
+lifecycle (`restoring -> restoring`) or any other write to the row leaves the
+age alone. Only rows whose lifecycle is exactly the canonical lowercase value
+are counted.
+
+The age restarts on every lifecycle change, so a sandbox that keeps leaving
+and re-entering a transient lifecycle, such as a restore rolled back to
+`suspended` and then retried, reads as young on every attempt. A wake that
+fails before it changes the row, and a sandbox wedged in a settled lifecycle
+such as `started`, are not counted at all. The gauges show rows that stay in
+one transient lifecycle, not every sandbox that cannot make progress.
+
+Every `(lifecycle, age)` pair is emitted on every tick, zeros included, so a
+series without a point in a tick means the census did not report, not that
+no rows matched; evaluate monitors over more than one minute. A failed read
+logs `transient-lifecycle census read failed` at `warn` and emits neither
+gauge for that tick rather than zeros: with the default delta OTLP export the
+series has a gap, and with cumulative export it keeps its last value.
+`sandbox.transient_lifecycle.loop_latency_ms` times every tick, failed ones
+included. No sandbox, node or org is a tag.
+
+Only the lease holder runs the census, and a new leader reports on its first
+tick. With leader election off, the controller assumes a single replica and
+runs the census there. Each controller process still reports under its own
+identity, so after a leader change the previous leader's last values can be
+read beside the new leader's: a Prometheus query keeps a gauge that stopped
+reporting for its lookback window (five minutes by default), and one Datadog
+rollup interval can hold a point from each pod. Combine replicas with `max`,
+not `sum`; `max` reads one leader's value for each series, never the total
+of two.
+
+The census is independent of the loops that act on such rows. It runs on
+both substrates whether or not the transient-lifecycle sweeper or node-drain
+is enabled, and it counts `deleting`, which the sweeper never ages out.
+
 ## Reserved DNS upstream connections
 
 The net-gateway resolves guest queries to the reserved resolver addresses over
