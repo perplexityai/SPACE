@@ -2,6 +2,9 @@ name: Pull CI
 
 on:
   pull_request:
+    # The defaults, plus ready_for_review: a draft defers the Kind smoke (see
+    # kind_paths), and marking it ready runs it on the same head.
+    types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
   contents: read
@@ -42,6 +45,12 @@ jobs:
   # (ci/kind-pull-paths.txt). Selecting it here rather than with a workflow
   # `paths:` filter lets the required space-pull-ci check depend on it: a
   # filtered-out workflow reports nothing, which a required check cannot use.
+  #
+  # A draft defers it: most Kind runs were drafts' intermediate pushes, each
+  # taking a 16-core runner per shard. A draft cannot merge, and marking it
+  # ready runs the smoke on that head, so the merge gate is unchanged. The
+  # kind-smoke label opts a draft in; the label is read from the event, so it
+  # applies from the next push.
   kind_paths:
     if: github.repository == 'perplexityai/SPACE'
     name: Select Kind smoke
@@ -61,6 +70,8 @@ jobs:
         id: select
         env:
           PULL_REQUEST_HEAD: ${{ github.event.pull_request.head.sha }}
+          SPACE_KIND_PULL_DRAFT: ${{ github.event.pull_request.draft }}
+          SPACE_KIND_PULL_OPT_IN: ${{ contains(github.event.pull_request.labels.*.name, 'kind-smoke') }}
         run: |
           set -euo pipefail
           needed="$(bash ci/scripts/kind-pull-needed.sh "${PULL_REQUEST_HEAD}")"
