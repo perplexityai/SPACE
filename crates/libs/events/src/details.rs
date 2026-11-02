@@ -66,6 +66,10 @@ pub struct SandboxEventDetails {
     pub guest_ip: Option<String>,
     pub guest_gateway: Option<String>,
     pub guest_uptime_ms: Option<String>,
+    /// The `spaced` version the guest agent reported when it became ready.
+    pub spaced_version: Option<String>,
+    /// Consecutive failed probes of a component, such as the guest agent.
+    pub consecutive_failures: Option<String>,
     pub timeout_secs: Option<String>,
     pub snapshot_id: Option<String>,
     pub rows_affected: Option<String>,
@@ -203,6 +207,8 @@ impl SandboxEventDetails {
         guest_ip,
         guest_gateway,
         guest_uptime_ms,
+        spaced_version,
+        consecutive_failures,
         timeout_secs,
         snapshot_id,
         rows_affected,

@@ -1539,17 +1539,11 @@ where
                 }
             }
             mark_sandbox_dirty(&db, sandbox_id);
-            let mut details = SandboxEventDetails::default()
-                .operation(phase)
-                .elapsed_ms(ready_elapsed.as_millis().to_string());
-            if let Some(uptime) = guest_uptime_ms {
-                details = details.guest_uptime_ms(uptime.to_string());
-            }
             emit_sandbox_event(
                 sandbox_id,
                 SandboxEventType::GuestReady,
                 SandboxEventSource::SbxManager,
-                details,
+                guest_ready_event_details(phase, ready_elapsed, agent),
             );
             notify_start_succeeded();
             Ok(())
@@ -1604,6 +1598,26 @@ where
     }
 }
 
+/// Carries the `spaced` version from the readiness observation itself, so the
+/// agent a sandbox runs after a fresh boot or a Started restore is visible on
+/// its timeline without a database read.
+fn guest_ready_event_details(
+    phase: &'static str,
+    ready_elapsed: Duration,
+    agent: Option<&pplx_space_spaced_host_client::proto::WaitReadyResponse>,
+) -> SandboxEventDetails {
+    let mut details = SandboxEventDetails::default()
+        .operation(phase)
+        .elapsed_ms(ready_elapsed.as_millis().to_string());
+    if let Some(response) = agent {
+        details = details.guest_uptime_ms(wait_ready_guest_uptime_ms(response).to_string());
+        if let Some(version) = &response.guest_version {
+            details = details.spaced_version(version.version.as_str());
+        }
+    }
+    details
+}
+
 fn emit_guest_observed_specs(
     sandbox_id: &str,
     template: &str,
@@ -1649,28 +1663,59 @@ pub(super) async fn complete_restore_and_mark_final(
     final_state: SandboxState,
     cleanup_id: Option<SandboxCleanupEpisodeId>,
 ) -> Result<(), Status> {
+    // Boxed because the readiness wait and the response kept for its event
+    // would otherwise sit in every restore path's future, past the stack of
+    // an unoptimized build.
+    Box::pin(complete_restore_after_guest_ready(
+        db,
+        sandbox_id,
+        process_env,
+        final_state,
+        cleanup_id,
+        wait_ready_via_spaced_host(
+            sandbox_id,
+            Duration::from_secs(u64::from(DEFAULT_BLOCKING_READY_TIMEOUT_SECS)),
+            "restore",
+        ),
+    ))
+    .await
+}
+
+/// [`complete_restore_and_mark_final`], awaiting `wait_ready` only for a
+/// Started restore.
+async fn complete_restore_after_guest_ready(
+    db: crate::db::SharedConnection,
+    sandbox_id: &str,
+    process_env: &BTreeMap<String, String>,
+    final_state: SandboxState,
+    cleanup_id: Option<SandboxCleanupEpisodeId>,
+    wait_ready: impl std::future::Future<
+        Output = Result<pplx_space_spaced_host_client::proto::WaitReadyResponse, Status>,
+    >,
+) -> Result<(), Status> {
     tracing::info!(
         sandbox_id,
         final_state = final_state.as_str(),
         "checking snapshot restore readiness"
     );
 
-    if final_state == SandboxState::Started
-        && let Err(status) = wait_ready_via_spaced_host(
-            sandbox_id,
-            Duration::from_secs(u64::from(DEFAULT_BLOCKING_READY_TIMEOUT_SECS)),
-            "restore",
-        )
-        .await
-    {
-        return Err(activation_failure_status_if_current(
-            &db,
-            sandbox_id,
-            SandboxState::Restoring,
-            cleanup_id,
-            status,
-        ));
-    }
+    let ready = if final_state == SandboxState::Started {
+        let wait_started = tokio::time::Instant::now();
+        match wait_ready.await {
+            Ok(response) => Some((response, wait_started.elapsed())),
+            Err(status) => {
+                return Err(activation_failure_status_if_current(
+                    &db,
+                    sandbox_id,
+                    SandboxState::Restoring,
+                    cleanup_id,
+                    status,
+                ));
+            }
+        }
+    } else {
+        None
+    };
 
     if let Err(status) =
         configure_process_env_for_activation(&db, sandbox_id, process_env, "restore", cleanup_id)
@@ -1704,7 +1749,20 @@ pub(super) async fn complete_restore_and_mark_final(
             .await
             .map_err(network_policy_refresh_error_to_status)
     })
-    .await
+    .await?;
+    // A restored guest runs the agent captured in its snapshot, which may
+    // never have reported readiness under this sandbox's id: a base-snapshot
+    // create restores a template's agent. As on a fresh boot, report it only
+    // once Started is persisted.
+    if let Some((response, ready_elapsed)) = ready {
+        emit_sandbox_event(
+            sandbox_id,
+            SandboxEventType::GuestReady,
+            SandboxEventSource::SbxManager,
+            guest_ready_event_details("restore", ready_elapsed, Some(&response)),
+        );
+    }
+    Ok(())
 }
 
 async fn mark_restore_after_network_ready(

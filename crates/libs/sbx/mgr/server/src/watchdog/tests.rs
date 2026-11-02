@@ -88,6 +88,7 @@ pub(super) fn test_health() -> SandboxHealth {
         next_health_probe_at: Instant::now(),
         health_probe_sequence: 0,
         last_console_tail_at: None,
+        guest_unresponsive: None,
     }
 }
 

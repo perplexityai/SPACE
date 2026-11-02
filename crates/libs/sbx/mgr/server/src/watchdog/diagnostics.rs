@@ -22,7 +22,12 @@
 //!   [`CONSOLE_TAIL_MIN_INTERVAL`] per sandbox, bounded tails of the
 //!   Firecracker log and of the guest console file, when one exists.
 //!
-//! Sandbox IDs appear only in log lines; metrics are tagged by outcome alone.
+//! A transition that takes guest health to `Degraded` opens an unresponsive
+//! episode and emits a `guest_unresponsive` sandbox event; the next probe
+//! result that finds it `Healthy` closes the episode with `guest_recovered`.
+//!
+//! Sandbox IDs appear only in log lines and sandbox events; metrics are tagged
+//! by outcome alone.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -31,6 +36,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use pplx_space_common_core::host::linux::paths;
+use pplx_space_events::{
+    SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
+};
 use pplx_space_metrics::sandbox::worker::{
     SandboxHealthEvidenceOutcome, SandboxRawVsockCheckOutcome,
 };
@@ -155,6 +163,59 @@ impl ComponentSnapshot {
     }
 }
 
+/// A run of guest health outside `Healthy` that began with a move to
+/// `Degraded`, kept on the sandbox's health until a probe result finds guest
+/// health `Healthy`.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct GuestUnresponsiveEpisode {
+    since: Instant,
+    peak_consecutive_failures: u32,
+}
+
+/// An edge of a [`GuestUnresponsiveEpisode`], reported as a sandbox event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum GuestHealthEdge {
+    Unresponsive {
+        consecutive_failures: u32,
+    },
+    Recovered {
+        peak_consecutive_failures: u32,
+        unresponsive_for: Duration,
+    },
+}
+
+impl GuestHealthEdge {
+    /// Track the episode across one probe result. A change to `Degraded`
+    /// opens an episode when none is open. Any result that finds guest health
+    /// `Healthy` closes one, changed or not: the sidecar sweep writes
+    /// `spaced_host_alive` and `runtime_alive` between probes, so `previous`
+    /// already reflects them and a recovery can show no change at all.
+    fn observe(
+        episode: &mut Option<GuestUnresponsiveEpisode>,
+        previous: GuestHealthCategory,
+        current: GuestHealthCategory,
+        consecutive_failures: u32,
+        now: Instant,
+    ) -> Option<Self> {
+        match current {
+            GuestHealthCategory::Degraded if previous != current && episode.is_none() => {
+                *episode = Some(GuestUnresponsiveEpisode {
+                    since: now,
+                    peak_consecutive_failures: consecutive_failures,
+                });
+                Some(Self::Unresponsive {
+                    consecutive_failures,
+                })
+            }
+            GuestHealthCategory::Healthy => episode.take().map(|episode| Self::Recovered {
+                peak_consecutive_failures: episode.peak_consecutive_failures,
+                unresponsive_for: now.saturating_duration_since(episode.since),
+            }),
+            GuestHealthCategory::Degraded | GuestHealthCategory::Unreachable => None,
+        }
+    }
+}
+
 /// A composed or guest health change, with what is needed to log it.
 #[derive(Debug)]
 pub(super) struct HealthTransition {
@@ -168,13 +229,14 @@ pub(super) struct HealthTransition {
     components: Vec<ComponentSnapshot>,
     gather_evidence: bool,
     console_tails: ConsoleTails,
+    guest_edge: Option<GuestHealthEdge>,
 }
 
 impl HealthTransition {
     /// Compare the statuses before and after one probe result. Returns `None`
-    /// when neither changed, so steady states cost nothing. Records the
-    /// console-tail rate limit on `health` when this transition claims it,
-    /// even if its report is later dropped.
+    /// when neither changed and no unresponsive episode closed, so steady
+    /// states cost nothing. Records the console-tail rate limit on `health`
+    /// when this transition claims it, even if its report is later dropped.
     pub(super) fn observe(
         sandbox_id: &str,
         lifecycle: Option<crate::state::SandboxState>,
@@ -185,7 +247,19 @@ impl HealthTransition {
     ) -> Option<Self> {
         let current = health.health_status;
         let guest_current = super::classify_guest_health(super::GuestHealthProbe::from(&*health));
-        if current == previous && guest_current == guest_previous {
+        let guest_failures = health.consecutive_guest_probe_failures;
+        if let Some(episode) = &mut health.guest_unresponsive {
+            episode.peak_consecutive_failures =
+                episode.peak_consecutive_failures.max(guest_failures);
+        }
+        let guest_edge = GuestHealthEdge::observe(
+            &mut health.guest_unresponsive,
+            guest_previous,
+            guest_current,
+            guest_failures,
+            now,
+        );
+        if current == previous && guest_current == guest_previous && guest_edge.is_none() {
             return None;
         }
         let became_degraded =
@@ -218,7 +292,44 @@ impl HealthTransition {
                 .collect(),
             gather_evidence: became_degraded || guest_degraded,
             console_tails,
+            guest_edge,
         })
+    }
+
+    /// The sandbox event for this transition's guest health edge, if it has
+    /// one.
+    pub(super) fn guest_health_event(&self) -> Option<(SandboxEventType, SandboxEventDetails)> {
+        let edge = self.guest_edge?;
+        let mut details = SandboxEventDetails::default();
+        if let Some(lifecycle) = self.lifecycle {
+            details = details.lifecycle_state(lifecycle.as_str());
+        }
+        match edge {
+            GuestHealthEdge::Unresponsive {
+                consecutive_failures,
+            } => {
+                details = details.consecutive_failures(consecutive_failures.to_string());
+                if let Some(guest) = self.component(HealthComponent::SpacedGuest) {
+                    details = details.result(guest.outcome_str());
+                    if !guest.detail.is_empty() {
+                        details = details.error(guest.detail.as_str());
+                    }
+                    if let Some(age) = guest.last_success_age {
+                        details = details.age_secs(age.as_secs().to_string());
+                    }
+                }
+                Some((SandboxEventType::GuestUnresponsive, details))
+            }
+            GuestHealthEdge::Recovered {
+                peak_consecutive_failures,
+                unresponsive_for,
+            } => Some((
+                SandboxEventType::GuestRecovered,
+                details
+                    .consecutive_failures(peak_consecutive_failures.to_string())
+                    .elapsed_ms(unresponsive_for.as_millis().to_string()),
+            )),
+        }
     }
 
     /// The evidence report this transition asks for. Only degrading
@@ -275,8 +386,12 @@ impl HealthTransition {
     }
 
     /// Log the transition. `admission` is what became of its evidence
-    /// request, when it made one.
+    /// request, when it made one. A recovery that changed neither status has
+    /// only its sandbox event.
     pub(super) fn emit(&self, admission: Option<Admission>) {
+        if self.previous == self.current && self.guest_previous == self.guest_current {
+            return;
+        }
         let guest = self.component(HealthComponent::SpacedGuest);
         macro_rules! emit_transition {
             ($message:literal) => {
@@ -326,6 +441,14 @@ pub(super) fn report_transition(queue: &EvidenceQueue, transition: &HealthTransi
         admission
     });
     transition.emit(admission);
+    if let Some((event_type, details)) = transition.guest_health_event() {
+        emit_sandbox_event(
+            &transition.sandbox_id,
+            event_type,
+            SandboxEventSource::SbxManager,
+            details,
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

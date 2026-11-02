@@ -77,7 +77,8 @@ context. Keep event names domain-level: prefer `pause_requested` or
 | `runtime_activated` | Firecracker runtime and sidecars have been launched and persisted for the sandbox. | Carries PID, uid, network slot, guest CID/IP/gateway, boot type, memory, vCPU, execution generation, and restore provenance when known so investigators can see the node-local runtime became active. Restores record only that a storage URI was present, plus opaque snapshot and local-artifact identifiers when known; the URI itself is omitted because endpoint query parameters can contain credentials. |
 | `guest_bridge_ready`, `guest_bridge_failed` | The host-to-guest bridge sidecar became reachable, or failed to launch. | Separates a running VM from an actually reachable `spaced-host` bridge. |
 | `stop_guest_flush_failed` | An ordinary stop could not flush the guest's root filesystem and stopped the VM anyway. | Marks a stop after which writes the guest had not committed can be missing. |
-| `guest_ready`, `guest_ready_failed` | Guest readiness was observed through `spaced-host`, or timed out/failed. | Captures the exact usability edge with readiness latency and guest uptime. |
+| `guest_ready`, `guest_ready_failed` | Guest readiness was observed through `spaced-host`, or timed out/failed. | Captures the exact usability edge with readiness latency and guest uptime. sandbox-manager emits `guest_ready` with `operation=start` after a fresh boot and with `operation=restore` after a snapshot restore to `started`, a create from a base snapshot included; filter on `operation=start` for boot readiness latency. Both carry the `spaced_version` the guest agent reported in that readiness observation, so the agent version a sandbox runs is queryable per sandbox; a restore reports the agent captured in its snapshot. A restore to `paused` waits for no readiness and emits no `guest_ready`, so its agent version is not on the timeline. The version is absent for a guest without an agent and for a `spaced-host` that predates readiness identity. The cluster-controller's `guest_ready` (`result=healed`) never carries it. `guest_ready_failed` is emitted only with `operation=start`; a restore whose guest does not become ready surfaces as that restore's failure. |
+| `guest_unresponsive`, `guest_recovered` | A sandbox-manager watchdog probe moved guest health to `degraded` while the VM kept running, or a later probe found it `healthy` again. The watchdog only observes: neither event changes the sandbox lifecycle. | Dates a stalled guest agent on the sandbox timeline when the VM, Firecracker, and the sidecars stay up. `guest_unresponsive` carries `consecutive_failures`, which is always the watchdog's failure threshold (3) because that many failed guest probes in a row open the episode; the last guest probe outcome in `result` and its error text in `error`; seconds since the last successful guest probe in `age_secs`; and `lifecycle_state`. `guest_recovered` carries, in `consecutive_failures`, the most failed guest probes in a row the episode saw, and in `elapsed_ms` the time since its `guest_unresponsive`. The first probe that finds the guest healthy closes the episode, even when the sidecar sweep restored `spaced-host` in between and that probe changed no health status, so a recovery can be reported up to one probe interval after it happened. A stall that begins while `spaced-host` is down is not reported. A sandbox that leaves the watchdog during an episode (stop, suspend, delete), or whose sandbox-manager restarts during one, emits no `guest_recovered` for it; a guest still unresponsive after a sandbox-manager restart emits another `guest_unresponsive`. |
 | `network_path_stopped` | The sandbox network path drained and stopped. | Gives a clear teardown edge instead of relying on raw TCP/UDP proxy shutdown lines. |
 | `filesystem_removed` | Node-local sandbox filesystem/cache was removed. | Confirms the local cache tree was actually deleted during cleanup. |
 | `network_policy_update_requested`, `network_policy_update_completed`, `network_policy_update_failed` | Change the desired sandbox network policy. | Shows override vs template inheritance, desired generation, authority, conflicts, and whether live reconciliation was queued. |
@@ -111,11 +112,15 @@ context. Keep event names domain-level: prefer `pause_requested` or
   rootfs/kernel versions. Do not include the exact storage URI because endpoint
   query parameters can contain credentials.
 - For runtime and guest readiness events, include boot type, runtime PID,
-  guest CID/IP/gateway, network slot, readiness elapsed time, guest uptime, and
-  timeout/error details when available. For `runtime_activated`, include
-  `restore_provenance`; `remote_local_mismatch` is the dashboardable signal for
-  a runtime that staged one S3 snapshot while the sandbox row still pointed at a
-  different node-local artifact.
+  guest CID/IP/gateway, network slot, readiness elapsed time, guest uptime,
+  guest `spaced_version`, and timeout/error details when available. For
+  `runtime_activated`, include `restore_provenance`; `remote_local_mismatch` is
+  the dashboardable signal for a runtime that staged one S3 snapshot while the
+  sandbox row still pointed at a different node-local artifact.
+- Emit `guest_unresponsive` and `guest_recovered` once per episode, from the
+  watchdog's guest health, not per failed probe. The episode lives in
+  sandbox-manager memory, so a sandbox-manager restart ends it without a
+  `guest_recovered`.
 - For port exposure events, include the port/protocol plus the node-local facts
   an investigator needs to compare host ingress DNAT against guest namespace
   allow rules: `netns`, `vpeer_ip`, `host_port`, `guest_port`,
