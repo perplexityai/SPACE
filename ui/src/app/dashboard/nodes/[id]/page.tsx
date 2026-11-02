@@ -10,9 +10,8 @@ import { adminApi } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 import {
   UPLOAD_ACCEPTED_MEANS,
-  UPLOAD_ATTEMPTS_PER_CALL,
-  UPLOAD_LISTED_PER_CALL,
   UPLOAD_RETRY_ORDER,
+  uploadLeftOut,
   nodeActions,
   type ForceUploadResponse,
   type NodeAction,
@@ -93,7 +92,7 @@ export default function NodeDetailPage() {
   const showUploadResult = (result: ForceUploadResponse) => {
     const accepted = result.reuploaded.length;
     const failed = result.failed ?? [];
-    const notAttempted = result.deferred ?? [];
+    const leftOut = uploadLeftOut(result);
     modal.info({
       title: `Upload requests accepted for ${accepted} sandbox${accepted === 1 ? '' : 'es'}${failed.length ? `; ${failed.length} not accepted` : ''}`,
       width: 640,
@@ -104,15 +103,8 @@ export default function NodeDetailPage() {
           {failed.map((f) => (
             <Text key={f.sandbox_id} type="danger">{publicSandboxIdFromAny(f.sandbox_id)}: {f.error}</Text>
           ))}
-          {notAttempted.length ? (
-            <Text>
-              {notAttempted.length} sandbox{notAttempted.length === 1 ? '' : 'es'} not attempted in this call: one call attempts at most {UPLOAD_ATTEMPTS_PER_CALL}.
-            </Text>
-          ) : null}
-          {result.truncated ? (
-            <Text>More sandboxes are pinned to this node than one call lists ({UPLOAD_LISTED_PER_CALL}).</Text>
-          ) : null}
-          {notAttempted.length || result.truncated || failed.length ? <Text type="secondary">{UPLOAD_RETRY_ORDER}</Text> : null}
+          {leftOut.map((note) => <Text key={note}>{note}</Text>)}
+          {leftOut.length || failed.length ? <Text type="secondary">{UPLOAD_RETRY_ORDER}</Text> : null}
         </Space>
       ),
     });

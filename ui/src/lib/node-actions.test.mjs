@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { DRAIN_TERMINATES, nodeActions } from './node-actions.ts';
+import { DRAIN_TERMINATES, nodeActions, uploadLeftOut } from './node-actions.ts';
 
 const names = (node, substrate = 'kubernetes') => nodeActions(node, substrate).map((a) => a.action);
 const node = (drain_phase = null, drain_mode = null, role = 'worker') => ({ role, drain_phase, drain_mode });
@@ -37,9 +37,19 @@ test('the direct substrate keeps only undrain, and other roles get nothing', () 
   assert.deepEqual(names(node(null, null, 'control'), 'kubernetes'), []);
 });
 
-test('the upload confirmation explains both per-call limits', () => {
+test("the upload confirmation explains the per-call limits without the server's numbers", () => {
   const upload = nodeActions(node('drained', 'gentle'), 'kubernetes').find((a) => a.action === 'force-upload-local-snapshots');
-  assert.match(upload.confirm, /at most 32 uploads/);
-  assert.match(upload.confirm, /at most 256 pinned sandboxes/);
-  assert.match(upload.confirm, /not attempted in that call/);
+  assert.match(upload.confirm, /limited number of the pinned sandboxes/);
+  assert.match(upload.confirm, /not attempted/);
+  assert.doesNotMatch(upload.confirm, /\d/);
+});
+
+test('the upload result says what the call left out from its deferred and truncated fields', () => {
+  assert.deepEqual(uploadLeftOut({ deferred: [], truncated: false }), []);
+  assert.deepEqual(uploadLeftOut({}), []);
+  assert.deepEqual(uploadLeftOut({ deferred: ['sbx_a'] }), ['1 listed sandbox not attempted in this call.']);
+  assert.deepEqual(uploadLeftOut({ deferred: ['sbx_a', 'sbx_b', 'sbx_c'], truncated: true }), [
+    '3 listed sandboxes not attempted in this call.',
+    'More sandboxes are pinned to this node than this call listed.',
+  ]);
 });
