@@ -113,6 +113,7 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "ecw.filesystem_write_identity",
                 "ecw.fork_idempotency",
                 "ecw.fork_isolation",
+                "ecw.guest_mptcp_segments_dropped",
                 "ecw.guest_vlan_frames_dropped",
                 "ecw.immediate_egress",
                 "ecw.internet_access_allowed",

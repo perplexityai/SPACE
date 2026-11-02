@@ -30,6 +30,7 @@ const LEGACY_INGRESS_DNAT_COMMENT_PREFIX: &str = "dnat-";
 const PRE_TPROXY_GUARDRAILS_CHAIN: &str = "pre_tproxy_guardrails";
 const DHCP_BOOTSTRAP_COMMENT: &str = "execution-dhcp-bootstrap";
 const UDP443_COMMENT: &str = "platform-egress-pre-tproxy-guardrail-quic-udp443";
+const MPTCP_GUARD_COMMENT: &str = "drop-guest-mptcp";
 const PRE_TPROXY_GUARDRAILS_PRIO: i32 = -175;
 const PRE_TPROXY_GUARDRAILS_POLICY_PATH: &str =
     "/etc/space/nftables/sandbox-pre-tproxy-guardrails.json";
@@ -278,9 +279,12 @@ fn namespace_rules_json(
     // "inet" would require "snat ip" qualifier which the JSON API doesn't support cleanly.
     let namespace_guardrail_rules =
         platform_guardrail_drop_rules_json("ip", SANDBOX_TABLE, "guardrails", "tap0");
-    // This rule must precede the packaged policy's established/related return.
+    // These rules must precede the packaged policy's established/related return.
     // A guest can otherwise forge the reverse tuple of a gateway-owned socket,
     // inherit its conntrack state, and reach the local socket without TPROXY.
+    // The MPTCP guard drops every guest segment carrying TCP option 30, in any
+    // conntrack state, before this namespace's TCP stack parses it. No gateway
+    // listener speaks MPTCP, so guest TCP is unaffected; non-TCP never matches.
     format!(
         r#"{{ "nftables": [
   {{ "add": {{ "table": {{ "family": "ip", "name": "{SANDBOX_TABLE}" }} }} }},
@@ -293,6 +297,16 @@ fn namespace_rules_json(
                      "right": "tap0", "op": "==" }} }},
       {{ "match": {{ "left": {{ "payload": {{ "protocol": "ip", "field": "saddr" }} }},
                      "right": "{guest_ip}", "op": "!=" }} }},
+      {{ "drop": null }}
+    ] }} }} }},
+  {{ "add": {{ "rule": {{ "family": "ip", "table": "{SANDBOX_TABLE}", "chain": "{PRE_TPROXY_GUARDRAILS_CHAIN}",
+    "comment": "{MPTCP_GUARD_COMMENT}",
+    "expr": [
+      {{ "match": {{ "left": {{ "meta": {{ "key": "iifname" }} }},
+                     "right": "tap0", "op": "==" }} }},
+      {{ "match": {{ "left": {{ "tcp option": {{ "name": "mptcp" }} }},
+                     "right": true, "op": "==" }} }},
+      {{ "counter": null }},
       {{ "drop": null }}
     ] }} }} }},
 {pre_tproxy_guardrail_rules},
@@ -1034,6 +1048,23 @@ fn validate_pre_tproxy_guardrails_chain(
         }),
         serde_json::json!({ "return": null }),
     ];
+    let mptcp_guard = [
+        serde_json::json!({
+            "match": {
+                "left": { "meta": { "key": "iifname" } },
+                "right": "tap0",
+                "op": "=="
+            }
+        }),
+        serde_json::json!({
+            "match": {
+                "left": { "tcp option": { "name": "mptcp" } },
+                "right": true,
+                "op": "=="
+            }
+        }),
+        serde_json::json!({ "drop": null }),
+    ];
     let source_guard_position = nft_chain_rule_position(pre_tproxy_guardrails, &source_guard)
         .ok_or_else(|| {
             FirewallValidationError::Missing(
@@ -1051,6 +1082,17 @@ fn validate_pre_tproxy_guardrails_chain(
     if source_guard_position >= established_bypass_position {
         return Err(FirewallValidationError::Missing(
             "namespace tap0 guest source guard must precede established/related return".to_string(),
+        ));
+    }
+    let mptcp_guard_position = nft_chain_rule_position(pre_tproxy_guardrails, &mptcp_guard)
+        .ok_or_else(|| {
+            FirewallValidationError::Missing(
+                "namespace pre-TPROXY guardrails chain is missing tap0 MPTCP guard".to_string(),
+            )
+        })?;
+    if mptcp_guard_position >= established_bypass_position {
+        return Err(FirewallValidationError::Missing(
+            "namespace tap0 MPTCP guard must precede established/related return".to_string(),
         ));
     }
     let expected = packaged
