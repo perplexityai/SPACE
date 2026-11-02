@@ -75,3 +75,56 @@ export function sandboxLabelOrId(sandboxId: string): string {
   }
   return compact.slice(-SANDBOX_LABEL_LEN);
 }
+
+// The admin list returns the newest sandbox rows first, up to `limit` of
+// them (the API's default limit is 1000 and its maximum 5000), plus the
+// node-reported rows described below.
+export const DEFAULT_LIST_LIMIT = 1000;
+export const MAX_LIST_LIMIT = 5000;
+export const LIST_LIMIT_OPTIONS = [100, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT];
+
+// The admin list returns at most `limit` sandbox rows, then appends rows the
+// nodes report without a database row (rowless pool slots, observed-local
+// sandboxes). Only the sandbox rows count against the limit.
+export function sandboxRowCount(rows: { resource_type?: string }[]): number {
+  return rows.filter((row) => row.resource_type === 'sandbox').length;
+}
+
+export function listIsCapped(rows: { resource_type?: string }[], limit: number): boolean {
+  return sandboxRowCount(rows) >= limit;
+}
+
+export function parseListLimit(raw: string | null): number {
+  const value = raw === null ? NaN : Number(raw);
+  if (!Number.isInteger(value) || value < 1) return DEFAULT_LIST_LIMIT;
+  return Math.min(value, MAX_LIST_LIMIT);
+}
+
+// What the sandbox search box holds: nothing, one sandbox's full identifier
+// in any accepted form, or free text matched against IDs and names.
+export type SandboxQuery =
+  | { kind: 'empty' }
+  | { kind: 'ref'; ref: SandboxRef }
+  | { kind: 'text'; text: string; compact: string };
+
+export function sandboxQuery(input: string): SandboxQuery {
+  const text = input.trim().toLowerCase();
+  if (!text) return { kind: 'empty' };
+  const ref = parseSandboxRef(text);
+  if (ref) return { kind: 'ref', ref };
+  return { kind: 'text', text, compact: text.replaceAll('-', '') };
+}
+
+export function matchesSandboxQuery(query: SandboxQuery, sandbox: { id: string; name?: string | null }): boolean {
+  switch (query.kind) {
+    case 'empty':
+      return true;
+    case 'ref':
+      return publicSandboxIdFromAny(sandbox.id) === query.ref.publicId;
+    case 'text':
+      return (
+        sandbox.id.replaceAll('-', '').toLowerCase().includes(query.compact) ||
+        (sandbox.name || '').toLowerCase().includes(query.text)
+      );
+  }
+}
