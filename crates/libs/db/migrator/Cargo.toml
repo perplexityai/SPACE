@@ -7,6 +7,17 @@ authors.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[package.metadata.space.state]
+# The migrator applies every catalog; it owns no table.
+postgres = []
+sqlite.build-manager = []
+sqlite.node-ctl = []
+sqlite.node-manager = []
+sqlite.runtime-manager = []
+sqlite.sandbox-manager = []
+sqlite.template-manager = []
+sqlite.volume-manager = []
+
 [lints]
 workspace = true
 

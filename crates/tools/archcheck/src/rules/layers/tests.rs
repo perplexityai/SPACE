@@ -1,6 +1,7 @@
 //! The layers rule's pieces that the command-line tests reach only through
 //! whole workspaces: the layer matrix, paths below a layer directory, the
-//! items a finding names, and the lenient reading of `[rules.layers]`.
+//! items a finding names, the lenient reading of `[rules.layers]`, and the
+//! SQL the state checks read.
 
 use std::collections::BTreeMap;
 
@@ -8,17 +9,21 @@ use super::{
     and_list,
     domain::protocol_suffix,
     graph::{Member, Problem, layer_dir, list, may_depend, name_segments, use_tree, used_items},
+    sql::{self, Created},
     storage::features_of,
 };
 use crate::{
-    config::{DomainFences, Layer, LayersConfig, LayersPolicy},
-    context::{Crate, Dependency, ProductionFile, count_code_lines},
+    config::{CoWriters, DomainFences, Layer, LayersConfig, LayersPolicy},
+    context::{
+        Crate, Dependency, Dialect, ProductionFile, TextFile, count_code_lines, declared_table,
+    },
 };
 
 /// Every behaviour of `[rules.layers]`, as its key in `LayersPolicy.modes`.
-/// `LayersConfig` requires each and denies others, so this list is its
-/// list.
-const BEHAVIOURS: [&str; 25] = [
+/// `LayersConfig` requires each, but the state checks' (`state.*` and
+/// `unowned.*`), which come together, and denies others, so this list is
+/// its list.
+const BEHAVIOURS: [&str; 32] = [
     "placement",
     "layout",
     "direction.no_crossing",
@@ -39,6 +44,13 @@ const BEHAVIOURS: [&str; 25] = [
     "model_protocol.no_crossing",
     "model_protocol.no_new_entries",
     "model_protocol.stale_entries",
+    "state.owners",
+    "state.declarations",
+    "state.writes",
+    "state.pending",
+    "unowned.no_crossing",
+    "unowned.no_new_entries",
+    "unowned.stale_entries",
     "test_only",
     "clients",
     "store_edges",
@@ -154,6 +166,7 @@ fn features_with_implicit_ones() {
             ("db".to_owned(), vec![("dep:sqlx".to_owned(), 3)]),
             ("default".to_owned(), vec![("db".to_owned(), 2)]),
         ]),
+        state: None,
     };
     let member = Member {
         krate: &krate,
@@ -238,6 +251,7 @@ fn items_used_through_a_dependency() {
         lib_name_line: None,
         dependencies: Vec::new(),
         features: BTreeMap::new(),
+        state: None,
     };
     let dependency = |rename: Option<&str>| Dependency {
         package: "pplx-space-dep".to_owned(),
@@ -266,7 +280,7 @@ fn lists_for_a_sentence() {
 }
 
 /// `[rules.layers]` read for its lines: each entry, list item and mode on
-/// its own line, and the table's first header.
+/// its own line, including the state checks', and the table's first header.
 #[test]
 fn the_policy_and_its_lines() {
     let text = "[rules.file_size]\nlimit = 5\n\
@@ -278,7 +292,12 @@ fn the_policy_and_its_lines() {
                 pplx-space-p = [\n  \"pplx-space-s\",\n]\n\
                 [rules.layers.direction.no_crossing]\nmode = \"required\"\n\
                 [rules.layers.policy_changed]\nmode = \"advisory\"\n\
-                [rules.layers.retired]\nmode = \"advisory\"\n";
+                [rules.layers.retired]\nmode = \"advisory\"\n\
+                [rules.layers.state.shared_catalogs]\ncommon = [\"x\"]\n\
+                [rules.layers.state.writes]\nmode = \"required\"\n\
+                [rules.layers.unowned.no_crossing]\nmode = \"required\"\n\
+                [rules.layers.state.co_writers.postgres]\n\"public.t\" = [\"p\"]\nt = [\"r\"]\n\
+                [rules.layers.state.co_writers.sqlite.db]\nu = [\n  \"q\",\n]\n";
     let policy = LayersPolicy::parse(text)
         .expect("the table parses")
         .expect("the text has the table");
@@ -310,9 +329,42 @@ fn the_policy_and_its_lines() {
         modes,
         [
             ("direction.no_crossing", "required", 15),
-            ("policy_changed", "advisory", 17)
+            ("policy_changed", "advisory", 17),
+            ("state.writes", "required", 23),
+            ("unowned.no_crossing", "required", 25),
         ]
     );
+    let (databases, line) = &policy.shared_catalogs.entries["common"];
+    assert_eq!(
+        (policy.shared_catalogs.line, *line, databases["x"]),
+        (Some(20), 21, 21)
+    );
+    /// A granted table, its stores with their lines, and its line.
+    type Grant<'a> = (&'a str, Vec<(&'a str, usize)>, usize);
+    let grants: Vec<Grant> = policy
+        .co_writers
+        .entries
+        .iter()
+        .map(|(table, (stores, line))| {
+            let stores = stores
+                .iter()
+                .map(|(store, line)| (store.as_str(), *line))
+                .collect();
+            (table.as_str(), stores, *line)
+        })
+        .collect();
+    assert_eq!(policy.co_writers.line, Some(26));
+    assert_eq!(
+        grants,
+        [
+            // A base branch's copy may name a table twice; it is granted
+            // the stores of both.
+            ("postgres.t", vec![("p", 27), ("r", 28)], 27),
+            ("sqlite.db.u", vec![("q", 31)], 30),
+        ]
+    );
+    assert!(policy.has_check("unowned") && policy.has_check("state"));
+    assert!(!policy.has_check("dev_direction"));
 
     assert_eq!(
         LayersPolicy::parse("[rules.file_size]\nlimit = 5\n").ok(),
@@ -437,4 +489,506 @@ fn domain_fences() {
         error.contains("domain_fences lists \"tokio\" in both http and runtime"),
         "{error}"
     );
+}
+
+/// The live tables of migrations `(name, text)` applied in order to a
+/// database of `dialect`, as `table -> (file, line)`.
+fn live(dialect: Dialect, migrations: &[(&str, &str)]) -> BTreeMap<String, (String, usize)> {
+    let files: Vec<TextFile> = migrations
+        .iter()
+        .map(|(path, text)| TextFile {
+            path: (*path).to_owned(),
+            text: (*text).to_owned(),
+        })
+        .collect();
+    let mut tables = BTreeMap::new();
+    sql::replay(&files, dialect, &mut tables);
+    tables
+        .into_iter()
+        .map(|(table, Created { path, line })| (table, (path, line)))
+        .collect()
+}
+
+/// Creates, drops and renames in file order; names folded and keyed as
+/// each database kind reads them, without its default schema and with any
+/// other; temporary tables not live; DDL in comments, strings and bodies
+/// not read.
+#[test]
+fn live_tables_of_a_catalog() {
+    use Dialect::{Postgres, Sqlite};
+    /// Name, dialect, migrations as `(name, text)`, and each live table
+    /// with its line.
+    type Case<'a> = (
+        &'a str,
+        Dialect,
+        &'a [(&'a str, &'a str)],
+        &'a [(&'a str, usize)],
+    );
+    let cases: &[Case] = &[
+        (
+            "one table",
+            Postgres,
+            &[("1.sql", "CREATE TABLE a (id int);")],
+            &[("a", 1)],
+        ),
+        (
+            "Postgres: public is the default schema, quoted names keep their case",
+            Postgres,
+            &[(
+                "1.sql",
+                "create table public.a ();\nCREATE TABLE IF NOT EXISTS \"B\" ();\n\
+                 CREATE UNLOGGED TABLE C ();\nCREATE TABLE \"public\".\"d\" ();\n\
+                 CREATE TABLE other.e ();\nCREATE TABLE IF NOT EXISTS a ();\n\
+                 CREATE TABLE main.f ();\nCREATE TABLE \"Public\".g ();\n\
+                 CREATE TABLE space.public.h ();\n",
+            )],
+            &[
+                ("B", 2),
+                ("Public.g", 8),
+                ("a", 1),
+                ("c", 3),
+                ("d", 4),
+                ("h", 9),
+                ("main.f", 7),
+                ("other.e", 5),
+            ],
+        ),
+        (
+            "SQLite: main is the default schema, no name keeps its case",
+            Sqlite,
+            &[
+                (
+                    "1.sql",
+                    "CREATE TABLE \"B\" ();\nCREATE TABLE Main.c ();\nCREATE TABLE [D] ();\n\
+                     CREATE TABLE public.e ();\nCREATE TABLE `F`.g ();\n",
+                ),
+                (
+                    "2.sql",
+                    "ALTER TABLE b RENAME TO \"Bee\";\nDROP TABLE \"d\";\n",
+                ),
+            ],
+            &[("bee", 1), ("c", 2), ("f.g", 5), ("public.e", 4)],
+        ),
+        (
+            "SQLite's backtick and bracket quotes, in CREATE, DROP and RENAME",
+            Sqlite,
+            &[
+                (
+                    "1.sql",
+                    "CREATE TABLE `a` ();\nCREATE TABLE [b c] ();\nCREATE TABLE `d``e` ();\n\
+                     CREATE TABLE main.[f] ();\nCREATE TABLE \"g\" ();\nCREATE TABLE h ();\n\
+                     CREATE TABLE `-- not a comment` ();\nCREATE TABLE [i--j] ();\n\
+                     CREATE TABLE [k/*l] ();\nCREATE TABLE m (); -- */\n",
+                ),
+                (
+                    "2.sql",
+                    "DROP TABLE [a];\nALTER TABLE `b c` RENAME TO [x];\n\
+                     ALTER TABLE [g] RENAME TO `y`;\nDROP TABLE `h`;\n",
+                ),
+            ],
+            &[
+                ("-- not a comment", 7),
+                ("d`e", 3),
+                ("f", 4),
+                ("i--j", 8),
+                ("k/*l", 9),
+                ("m", 10),
+                ("x", 2),
+                ("y", 5),
+            ],
+        ),
+        (
+            "a rename keeps the table's schema",
+            Postgres,
+            &[
+                (
+                    "1.sql",
+                    "CREATE TABLE audit.a ();\nCREATE TABLE public.b ();\n",
+                ),
+                (
+                    "2.sql",
+                    "ALTER TABLE audit.a RENAME TO z;\nALTER TABLE public.b RENAME TO y;\n",
+                ),
+            ],
+            &[("audit.z", 1), ("y", 2)],
+        ),
+        (
+            "Postgres's temporary tables are not live; its temp is a schema",
+            Postgres,
+            &[(
+                "1.sql",
+                "CREATE TEMP TABLE a ();\nCREATE TEMPORARY TABLE IF NOT EXISTS b ();\n\
+                 CREATE GLOBAL TEMPORARY TABLE c ();\nCREATE LOCAL TEMP TABLE d ();\n\
+                 CREATE TABLE temp.e ();\nCREATE TABLE pg_temp.f ();\n\
+                 CREATE UNLOGGED TABLE g ();\nCREATE TABLE pg_temp_3.h ();\n",
+            )],
+            &[("g", 7), ("temp.e", 5)],
+        ),
+        (
+            "SQLite's temporary tables are not live, nor changed by DROP or RENAME",
+            Sqlite,
+            &[
+                (
+                    "1.sql",
+                    "CREATE TEMP TABLE a ();\nCREATE TABLE temp.b ();\nCREATE TABLE \"TEMP\".c ();\n\
+                     CREATE TABLE x ();\nCREATE TABLE pg_temp.d ();\n",
+                ),
+                (
+                    "2.sql",
+                    "DROP TABLE temp.x;\nALTER TABLE temp.x RENAME TO y;\n",
+                ),
+            ],
+            &[("pg_temp.d", 5), ("x", 4)],
+        ),
+        (
+            "drops, lists and IF EXISTS on a name never created",
+            Postgres,
+            &[
+                (
+                    "1.sql",
+                    "CREATE TABLE a ();\nCREATE TABLE b ();\nCREATE TABLE c ();",
+                ),
+                ("2.sql", "DROP TABLE IF EXISTS a, public.b, never CASCADE;"),
+            ],
+            &[("c", 3)],
+        ),
+        (
+            "a rename keeps where the table was created; a column rename is not one",
+            Postgres,
+            &[
+                ("1.sql", "CREATE TABLE a ();\nCREATE TABLE b ();"),
+                (
+                    "2.sql",
+                    "ALTER TABLE IF EXISTS ONLY a RENAME TO z;\n\
+                     ALTER TABLE b RENAME COLUMN x TO y;\nALTER TABLE b ADD COLUMN q int;",
+                ),
+            ],
+            &[("b", 2), ("z", 1)],
+        ),
+        (
+            "comments, strings and bodies hide DDL",
+            Postgres,
+            &[(
+                "1.sql",
+                "-- CREATE TABLE a ();\n/* CREATE TABLE b (); /* nested */ DROP TABLE c; */\n\
+                 COMMENT ON x IS 'CREATE TABLE d (); it''s';\n\
+                 CREATE FUNCTION f() AS $body$ CREATE TABLE e (); $body$;\n\
+                 CREATE FUNCTION g() AS $$ CREATE TABLE f (); $$;\n\
+                 SELECT $1; CREATE TABLE \"with \"\"quote\" ();\n\
+                 CREATE VIEW v AS SELECT 1; CREATE INDEX i ON t (x);\n\
+                 COMMENT ON y IS E'it\\'s; CREATE TABLE g ();';\n\
+                 CREATE TABLE h (tags text[] DEFAULT ARRAY['it''s', '-- x']);\n",
+            )],
+            &[("h", 9), ("with \"quote", 6)],
+        ),
+        (
+            "Postgres: a `[` is an array's, and what is in it is read as code",
+            Postgres,
+            &[(
+                "1.sql",
+                "CREATE TABLE a (x int[] DEFAULT ARRAY[1 /* ] ' */]);\n\
+                 SELECT ARRAY[1 /* CREATE TABLE b (); */];\nCREATE TABLE c ();\n",
+            )],
+            &[("a", 1), ("c", 3)],
+        ),
+        (
+            "SQLite: a `[…]` identifier runs to its first `]`, `'`s included",
+            Sqlite,
+            &[("1.sql", "CREATE TABLE [a'--b] ();\nCREATE TABLE c ();\n")],
+            &[("a'--b", 1), ("c", 2)],
+        ),
+    ];
+    for (name, dialect, migrations, expected) in cases {
+        let found = live(*dialect, migrations);
+        let found: Vec<(&str, usize)> = found
+            .iter()
+            .map(|(table, (_, line))| (table.as_str(), *line))
+            .collect();
+        assert_eq!(found, *expected, "{name}");
+    }
+    let found = live(
+        Postgres,
+        &[
+            ("1.sql", "CREATE TABLE a ();"),
+            ("2.sql", "\nCREATE TABLE b ();"),
+        ],
+    );
+    assert_eq!(found["b"], ("2.sql".to_owned(), 2));
+}
+
+/// A table named in a declaration or a grant is the name its database
+/// stores: case kept in Postgres and not in SQLite, the default schema
+/// dropped, and of three parts the last two read. Its parts are read as SQL
+/// reads them, so a `.` inside quotes is the table's.
+#[test]
+fn declared_tables() {
+    let cases = [
+        (Dialect::Postgres, "audit.\"events.v1\"", "audit.events.v1"),
+        (Dialect::Postgres, "\"public\".\"Mixed\"", "Mixed"),
+        (Dialect::Postgres, "\"a.b\"", "a.b"),
+        (Dialect::Postgres, "a-b.c", "a-b.c"),
+        (Dialect::Sqlite, "Audit.[Events.V1]", "audit.events.v1"),
+        (Dialect::Sqlite, "main.\"x.y\"", "x.y"),
+        (Dialect::Postgres, "public.a", "a"),
+        (Dialect::Postgres, "Mixed", "Mixed"),
+        (Dialect::Postgres, "main.a", "main.a"),
+        (Dialect::Postgres, "space.public.a", "a"),
+        (Dialect::Postgres, "space.audit.a", "audit.a"),
+        (Dialect::Sqlite, "Main.Mixed", "mixed"),
+        (Dialect::Sqlite, "temp.a", "a"),
+        (Dialect::Sqlite, "public.a", "public.a"),
+    ];
+    for (dialect, name, key) in cases {
+        assert_eq!(declared_table(dialect, name), key, "{dialect:?} {name}");
+    }
+}
+
+/// Two keys of one namespace's co-writers that name one table are an
+/// error, as each database kind names it; other keys are not.
+#[test]
+fn co_writer_keys_name_distinct_tables() {
+    let parse = |text: &str| toml::from_str::<CoWriters>(text).map_err(|error| error.to_string());
+    let errors = [
+        (
+            "postgres = { a = [\"x\"], \"public.a\" = [\"y\"] }",
+            "[rules.layers.state.co_writers.postgres] names the table a twice, as \"a\" and \
+             \"public.a\"; merge their stores into one key",
+        ),
+        (
+            "sqlite.db = { Items = [\"x\"], \"main.items\" = [\"y\"] }",
+            "[rules.layers.state.co_writers.sqlite.db] names the table items twice, as \"Items\" \
+             and \"main.items\"",
+        ),
+    ];
+    for (text, error) in errors {
+        let found = parse(text).expect_err(text);
+        assert!(found.contains(error), "{text}: {found}");
+    }
+    let distinct = "postgres = { a = [\"x\"], A = [\"y\"], \"main.a\" = [\"z\"] }\n\
+                    sqlite.db = { a = [\"x\"] }\nsqlite.other = { a = [\"y\"] }";
+    let grants = parse(distinct).expect("distinct tables");
+    assert_eq!(grants.grants().count(), 5);
+}
+
+/// The heads a write scan finds in SQL text read as `dialect`, as `(head,
+/// table)`, with the table keyed for a database of `dialect`.
+fn heads(text: &str, dialect: Dialect) -> Vec<(String, String)> {
+    sql::writes(&sql::blank(text, false, dialect), dialect)
+        .into_iter()
+        .map(|write| (write.head, write.table.key(dialect)))
+        .collect()
+}
+
+#[test]
+fn write_heads() {
+    use Dialect::{Postgres, Sqlite};
+    /// SQL, the dialect its tables are keyed for, and its heads.
+    type Case<'a> = (&'a str, Dialect, &'a [(&'a str, &'a str)]);
+    let cases: &[Case] = &[
+        (
+            "INSERT INTO a (x) VALUES (1)",
+            Postgres,
+            &[("INSERT INTO", "a")],
+        ),
+        ("DELETE\n  FROM\tb", Postgres, &[("DELETE FROM", "b")]),
+        ("MERGE INTO c USING d", Postgres, &[("MERGE INTO", "c")]),
+        ("UPDATE ONLY e SET", Postgres, &[("UPDATE", "e")]),
+        (
+            "TRUNCATE TABLE f, public.g ,h; TRUNCATE i",
+            Postgres,
+            &[
+                ("TRUNCATE TABLE", "f"),
+                ("TRUNCATE TABLE", "g"),
+                ("TRUNCATE TABLE", "h"),
+                ("TRUNCATE", "i"),
+            ],
+        ),
+        (
+            "INSERT OR IGNORE INTO j; REPLACE INTO k; UPDATE OR REPLACE l SET",
+            Sqlite,
+            &[
+                ("INSERT OR IGNORE INTO", "j"),
+                ("REPLACE INTO", "k"),
+                ("UPDATE OR REPLACE", "l"),
+            ],
+        ),
+        // Not heads, or heads of no table this check reads.
+        (
+            "ON CONFLICT DO UPDATE SET x = 1",
+            Postgres,
+            &[("UPDATE", "set")],
+        ),
+        ("SELECT 1 FOR UPDATE OF m", Postgres, &[("UPDATE", "of")]),
+        ("x.update n; updated_at; my_update o", Postgres, &[]),
+        ("UPDATE {table} SET", Postgres, &[]),
+        (
+            "-- UPDATE q\n/* DELETE FROM r */ SELECT '-- not a comment'",
+            Postgres,
+            &[],
+        ),
+        // Strings are values, and bodies code.
+        (
+            "SELECT 'UPDATE s', 'it''s DELETE FROM s2'; INSERT INTO log VALUES ('DELETE FROM s3')",
+            Postgres,
+            &[("INSERT INTO", "log")],
+        ),
+        (
+            "CREATE FUNCTION f() AS $$ BEGIN UPDATE t SET x = 'DELETE FROM u'; END $$; \
+             DO $body$ BEGIN DELETE FROM v; -- UPDATE w\n END $body$",
+            Postgres,
+            &[("UPDATE", "t"), ("DELETE FROM", "v")],
+        ),
+        // An escape string ends at no `\'`; a standard one at the first `'`.
+        (
+            "SELECT E'it\\'s UPDATE g'; DELETE FROM h; SELECT e'\\\\'; UPDATE i; \
+             SELECT x LIKE'a\\'; UPDATE j; SELECT type'k\\'; UPDATE l",
+            Postgres,
+            &[
+                ("DELETE FROM", "h"),
+                ("UPDATE", "i"),
+                ("UPDATE", "j"),
+                ("UPDATE", "l"),
+            ],
+        ),
+        // In SQLite, a `[…]` identifier holds no comment or string, up to
+        // its first `]`.
+        (
+            "UPDATE [a--b] SET x = 1; DELETE FROM [c/*d] WHERE 1; INSERT INTO e -- */",
+            Sqlite,
+            &[
+                ("UPDATE", "a--b"),
+                ("DELETE FROM", "c/*d"),
+                ("INSERT INTO", "e"),
+            ],
+        ),
+        (
+            "UPDATE [a'--b] SET x = 1; DELETE FROM c -- '",
+            Sqlite,
+            &[("UPDATE", "a'--b"), ("DELETE FROM", "c")],
+        ),
+        // In Postgres, `[` is an array's or a subscript's, and the comments
+        // and strings inside it are blanked.
+        (
+            "SELECT ARRAY['UPDATE d', 'x]']; DELETE FROM e; SELECT y[1] -- UPDATE f\n",
+            Postgres,
+            &[("DELETE FROM", "e")],
+        ),
+        (
+            "SELECT ARRAY[1 /* ] ' */]; UPDATE sandboxes SET id = id;",
+            Postgres,
+            &[("UPDATE", "sandboxes")],
+        ),
+        ("SELECT ARRAY[1 /* UPDATE sandboxes */];", Postgres, &[]),
+        ("UPDATE [a] SET", Postgres, &[]),
+        // Postgres: public is the default schema, any other is kept, of
+        // three parts the last two are read, and a quoted name keeps its
+        // case.
+        (
+            "UPDATE other.p SET; DELETE FROM \"Audit\" . \"Log\"; UPDATE \"public\".q; \
+             UPDATE a.b.c SET; UPDATE space.public.sandboxes SET; UPDATE main.m; \
+             insert into public.A; Update \"Mixed\" SET; UPDATE \"Public\".n",
+            Postgres,
+            &[
+                ("UPDATE", "other.p"),
+                ("DELETE FROM", "Audit.Log"),
+                ("UPDATE", "q"),
+                ("UPDATE", "b.c"),
+                ("UPDATE", "sandboxes"),
+                ("UPDATE", "main.m"),
+                ("INSERT INTO", "a"),
+                ("UPDATE", "Mixed"),
+                ("UPDATE", "Public.n"),
+            ],
+        ),
+        // SQLite: main and temp are default schemas, no name keeps its
+        // case, and its quotes.
+        (
+            "INSERT INTO `x` VALUES; UPDATE [y z] SET; DELETE FROM main.`w`; \
+             REPLACE INTO \"v\"\"u\"; UPDATE public.p; Update \"Mixed\" SET; \
+             DELETE FROM Temp.T; UPDATE [Main].[Q]",
+            Sqlite,
+            &[
+                ("INSERT INTO", "x"),
+                ("UPDATE", "y z"),
+                ("DELETE FROM", "w"),
+                ("REPLACE INTO", "v\"u"),
+                ("UPDATE", "public.p"),
+                ("UPDATE", "mixed"),
+                ("DELETE FROM", "t"),
+                ("UPDATE", "q"),
+            ],
+        ),
+    ];
+    for (text, dialect, expected) in cases {
+        let expected: Vec<(String, String)> = expected
+            .iter()
+            .map(|(head, table)| ((*head).to_owned(), (*table).to_owned()))
+            .collect();
+        assert_eq!(heads(text, *dialect), expected, "{text:?}");
+    }
+}
+
+/// Rust string literals, decoded, with each byte's offset in the source;
+/// comments, chars and lifetimes skipped.
+#[test]
+fn rust_string_literals() {
+    let source = "let a = \"x\\ny\\u{41}\\x42\\\"\";\n\
+                  let b = r#\"raw \"quoted\" \\n\"#; let c = br\"bytes\"; let d = c\"c\";\n\
+                  // \"in a comment\"\n/* \"in /* a nested */ block\" */\n\
+                  let e: &'static str = \"after a lifetime\"; let f = '\"'; let g = b'\\'';\n\
+                  let h = \"one \\\n    line\"; let i = for_r\"no\";\n\
+                  q('\\'','\"', \"after a quote char\");\n";
+    let texts: Vec<String> = sql::literals(source)
+        .into_iter()
+        .map(|literal| literal.text)
+        .collect();
+    assert_eq!(
+        texts,
+        [
+            "x\nyAB\"",
+            "raw \"quoted\" \\n",
+            "bytes",
+            "c",
+            "after a lifetime",
+            "one line",
+            "no",
+            "after a quote char",
+        ]
+    );
+    let literal = &sql::literals("x(\"ab\\ncd\")")[0];
+    assert_eq!(literal.offsets, [3, 4, 5, 7, 8]);
+}
+
+/// A head is placed on its line in the file: inside a multi-line literal,
+/// after a continuation, and in a `.sql` file.
+#[test]
+fn write_lines() {
+    let source = "fn f() {\n    q(\"SELECT 1\");\n    q(r#\"\n        UPDATE a\n           SET x = 1\"#);\n\
+                  q(\"DELETE \\\n     FROM b -- UPDATE c\");\n    // q(\"UPDATE d\")\n}\n";
+    let found: Vec<(String, usize)> = sql::rust_writes(source, Dialect::Postgres)
+        .into_iter()
+        .map(|(write, line)| (write.table.key(Dialect::Postgres), line))
+        .collect();
+    assert_eq!(found, [("a".to_owned(), 4), ("b".to_owned(), 6)]);
+    let found: Vec<(String, usize)> = sql::sql_writes(
+        "-- UPDATE x\n\nWITH y AS (\n  UPDATE z SET",
+        Dialect::Postgres,
+    )
+    .into_iter()
+    .map(|(write, line)| (write.table.key(Dialect::Postgres), line))
+    .collect();
+    assert_eq!(found, [("z".to_owned(), 4)]);
+    // Both read `[` as the dialect does: an array's in Postgres, so the
+    // comment in it ends before the `UPDATE`; an identifier in SQLite, so
+    // the `'` after it opens a string that runs to the end.
+    let sql = "SELECT ARRAY[1 /* ] ' */]; UPDATE sandboxes SET id = id;";
+    let source = format!("q(\"{sql}\");");
+    for (dialect, expected) in [(Dialect::Postgres, 1), (Dialect::Sqlite, 0)] {
+        assert_eq!(
+            sql::rust_writes(&source, dialect).len(),
+            expected,
+            "{dialect:?}"
+        );
+        assert_eq!(sql::sql_writes(sql, dialect).len(), expected, "{dialect:?}");
+    }
 }

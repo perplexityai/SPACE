@@ -13,6 +13,13 @@ use serde::Deserialize;
 use thiserror::Error;
 use toml::Spanned;
 
+mod state;
+
+pub use state::{
+    CATALOGS_DIR, Catalog, Dialect, Identifier, POSTGRES, StateDeclarations, TableName, TextFile,
+    declared_table, namespace, quoted_identifier, sqlite_namespace,
+};
+
 use crate::{
     baseline::{BASELINE_FILE, BaseBaseline, Baseline, line_of, rule_of},
     config::{ArchitectureConfig, BaseArchitecture, CONFIG_FILE, CrateNamesPolicy, LayersPolicy},
@@ -93,7 +100,8 @@ pub enum LoadError {
     /// only for a check with a baseline.
     #[error(
         "{path}: [{table}] is not a table of the layers rule: with [rules.layers] in {CONFIG_FILE}, \
-         its tables are {known}, and without it there are none; remove that table"
+         its tables are {known}, and without it there are none ([layers.unowned] \
+         also needs [rules.layers.state]); remove that table"
     )]
     UnknownLayersTable {
         path: PathBuf,
@@ -113,6 +121,33 @@ pub enum LoadError {
          Baseline::load_base"
     )]
     UnreadBaseTables { path: PathBuf, rule: &'static str },
+    #[error(
+        "[rules.layers.state] and [rules.layers.unowned] in {CONFIG_FILE} go together: the state \
+         checks need both; add the missing one or remove both"
+    )]
+    StateWithoutUnowned,
+    #[error(
+        "[rules.layers.state.shared_catalogs] {shared} in {CONFIG_FILE} names {name:?}, which is \
+         not a directory under {CATALOGS_DIR}/; fix or remove it"
+    )]
+    UnknownCatalog { shared: String, name: String },
+    #[error(
+        "[rules.layers.state.shared_catalogs] {shared} in {CONFIG_FILE} lists {name:?}, which is \
+         a shared catalog, not a database; remove it"
+    )]
+    SharedCatalogAsDatabase { shared: String, name: String },
+    /// Two names of one table would hide that the table is declared twice.
+    #[error(
+        "{path}: [package.metadata.space.state] {namespace} names the table {table} twice, as \
+         {first:?} and {second:?}; keep one"
+    )]
+    DuplicateDeclaration {
+        path: PathBuf,
+        namespace: String,
+        table: String,
+        first: String,
+        second: String,
+    },
 }
 
 /// A production Rust file, its text and its code-line count.
@@ -146,6 +181,8 @@ pub struct Crate {
     /// written on. Cargo's implicit features for optional dependencies are
     /// not among them.
     pub features: BTreeMap<String, Vec<(String, usize)>>,
+    /// Its `[package.metadata.space.state]`, if the manifest has one.
+    pub state: Option<StateDeclarations>,
 }
 
 /// A dependency a member's manifest declares, as `cargo metadata` reports
@@ -239,6 +276,12 @@ pub struct Context {
     pub files: Vec<ProductionFile>,
     /// The package of each workspace member, sorted by member path.
     pub crates: Vec<Crate>,
+    /// The catalogs under `db/`, sorted by name; read only with
+    /// `[rules.layers.state]`.
+    pub catalogs: Vec<Catalog>,
+    /// Every `.sql` file under a member's `src/`, outside `tests/`
+    /// directories, sorted by path; read only with `[rules.layers.state]`.
+    pub sql_files: Vec<TextFile>,
 }
 
 impl Context {
@@ -251,6 +294,11 @@ impl Context {
         let config_path = root.join(CONFIG_FILE);
         let (config, config_text): (ArchitectureConfig, String) =
             parse_toml_with_text(&config_path)?;
+        if let Some(layers) = &config.rules.layers
+            && layers.state.is_some() != layers.unowned.is_some()
+        {
+            return Err(LoadError::StateWithoutUnowned);
+        }
         // A table for an instance that no longer exists would never be
         // checked, so it cannot silently outlive its configuration.
         let configured = rules::tables(&config.rules);
@@ -300,6 +348,14 @@ impl Context {
             }
         }
         let files = production_files(root, &crates)?;
+        let layers = config.rules.layers.as_ref();
+        let (catalogs, sql_files) = match layers.and_then(|layers| layers.state.as_ref()) {
+            Some(state_config) => (
+                state::catalogs(root, state_config)?,
+                state::sql_files(root, &crates)?,
+            ),
+            None => (Vec::new(), Vec::new()),
+        };
         Ok(Self {
             config,
             baseline,
@@ -310,6 +366,8 @@ impl Context {
             base_architecture: BaseArchitecture::NotGiven,
             files,
             crates,
+            catalogs,
+            sql_files,
         })
     }
 
@@ -486,10 +544,16 @@ fn workspace_crates(root: &Path) -> Result<Vec<Crate>, LoadError> {
 /// the rest.
 #[derive(Deserialize)]
 struct MemberManifest {
-    package: Option<NameTable>,
+    package: Option<PackageTable>,
     lib: Option<NameTable>,
     #[serde(default)]
     features: BTreeMap<String, Vec<Spanned<String>>>,
+}
+
+#[derive(Deserialize)]
+struct PackageTable {
+    name: Option<Spanned<String>>,
+    metadata: Option<state::PackageMetadata>,
 }
 
 #[derive(Deserialize)]
@@ -522,11 +586,10 @@ fn load_crate(workspace_root: &Path, package: MetadataPackage) -> Result<Crate, 
             (feature, enables)
         })
         .collect();
-    let line = |table: Option<NameTable>| {
-        table
-            .and_then(|table| table.name)
-            .map(|name| line_of(&text, name.span().start))
-    };
+    let line = |name: Option<Spanned<String>>| name.map(|name| line_of(&text, name.span().start));
+    let (name, metadata) = parsed
+        .package
+        .map_or((None, None), |package| (package.name, package.metadata));
     let lib = package
         .targets
         .into_iter()
@@ -558,10 +621,14 @@ fn load_crate(workspace_root: &Path, package: MetadataPackage) -> Result<Crate, 
         name: package.name,
         lib,
         member,
-        name_line: line(parsed.package).unwrap_or(1),
-        lib_name_line: line(parsed.lib),
+        name_line: line(name).unwrap_or(1),
+        lib_name_line: line(parsed.lib.and_then(|lib| lib.name)),
         dependencies,
         features,
+        state: match metadata {
+            Some(metadata) => metadata.state(&manifest, &text)?,
+            None => None,
+        },
     })
 }
 
