@@ -792,7 +792,19 @@ pub fn certificate_cache_entries(entries: usize, capacity: usize) {
 /// (RFC 8446 section 6; `48` is `unknown_ca`, `42` is `bad_certificate`), or
 /// `none` when it sent none. On `client_to_netgw`, a certificate alert means the guest
 /// rejected the interception chain; a disconnect or reset carries no alert.
-pub fn tls_handshake(leg: &str, outcome: &str, reason: &str, alert: &str) {
+/// `io_kind` names the I/O error kind behind an `io` reason (`unexpected_eof`,
+/// `connection_reset`, `invalid_data`, ..., `other`), or `none`.
+/// `certificate` names why the origin's certificate failed verification on
+/// `netgw_to_origin` (`unknown_issuer`, `not_valid_for_name`, `expired`,
+/// `not_valid_yet`, `revoked`, `other`), or `none`.
+pub fn tls_handshake(
+    leg: &str,
+    outcome: &str,
+    reason: &str,
+    alert: &str,
+    io_kind: &str,
+    certificate: &str,
+) {
     counter(
         "gateway.tls.handshake",
         1,
@@ -801,6 +813,8 @@ pub fn tls_handshake(leg: &str, outcome: &str, reason: &str, alert: &str) {
             tag("outcome", outcome),
             tag("reason", reason),
             tag("alert", alert),
+            tag("io_kind", io_kind),
+            tag("certificate", certificate),
             tag("git_sha", pplx_space_observability::git_sha()),
         ],
     );
@@ -886,14 +900,18 @@ pub fn tls_handshake_queued(leg: &str, waiting: usize, capacity: usize) {
     );
 }
 
-/// One TLS-protocol error after a successful handshake.
-pub fn tls_connection_error(leg: &str, reason: &str) {
+/// One TLS-protocol error after a successful handshake. `reason` is
+/// `peer_closed_without_close_notify` when the guest closed TCP without TLS
+/// `close_notify`, which most keep-alive clients do to end a connection, and
+/// `io` for other failures. `io_kind` takes the `gateway.tls.handshake` values.
+pub fn tls_connection_error(leg: &str, reason: &str, io_kind: &str) {
     counter(
         "gateway.tls.connection_error",
         1,
         &[
             tag("leg", leg),
             tag("reason", reason),
+            tag("io_kind", io_kind),
             tag("git_sha", pplx_space_observability::git_sha()),
         ],
     );

@@ -534,8 +534,10 @@ configuration does not list is still sent but cannot be grouped or filtered
 on. That applies to tags added after the configuration was written, including
 the `reason` on `template.gc.tick` and `template.gc.tick_duration_ms` errors
 and the `error_kind` on `template.build.latency_ms`,
-`template.build.step.latency_ms` and `snapshot.restore.failed`, and the
-`fault` on `gateway.tcp.connection`. Add them to the
+`template.build.step.latency_ms` and `snapshot.restore.failed`, the
+`fault` on `gateway.tcp.connection`, the `io_kind` on
+`gateway.tls.connection_error` and `gateway.tls.handshake`, and the
+`certificate` on `gateway.tls.handshake`. Add them to the
 metric's tag configuration before relying on them; series without them are
 unaffected.
 
@@ -1149,9 +1151,14 @@ These still warn and count as before:
 
 - `reserved DNS upstream connection failed` for any failed connection,
   including a failed reconnect;
-- `reserved DNS upstream request failed` for every error Hickory receives,
-  including a failed reconnect and `Busy` from an open connection at its
-  request limit;
+- `reserved DNS upstream request failed` for each error Hickory receives,
+  including `Busy` from an open connection at its request limit, with two
+  exceptions logged at debug instead: a send whose shared reconnect failed or
+  stopped (a failed connect has already logged
+  `reserved DNS upstream connection failed` once for all of its sends), and an
+  `UnexpectedEof` on a connection that had already answered a request, which
+  Hickory may retry on another connection. The lookup logs such a close again
+  at WARN if the lookup fails, including at its deadline;
 - `reserved DNS resolver replaced after NoConnections`, now reached by real
   connection failures rather than idle closes;
 - the guest-facing `reserved DNS request failed` warning and

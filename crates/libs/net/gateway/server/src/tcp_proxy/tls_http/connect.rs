@@ -123,7 +123,7 @@ where
         }
         let origin = hyper::upgrade::on(&mut response);
         response.headers_mut().remove(header::CONTENT_LENGTH);
-        self.upgrades.spawn(
+        self.spawn_upgrade(
             upgrade::relay(
                 guest,
                 origin,

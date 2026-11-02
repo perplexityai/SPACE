@@ -1130,3 +1130,61 @@ async fn guest_http2_accepts_backpressured_small_frame_uploads() {
 async fn guest_http2_still_rejects_tiny_frame_floods() {
     assert!(!small_frame_upload(1, 1_000_000, Duration::from_secs(2)).await);
 }
+
+// The guest's TLS leg treats a close without close_notify as routine only
+// while no exchange is in flight: a response body still streaming is in
+// flight, and a keep-alive connection whose response the guest has read in
+// full is not.
+#[tokio::test]
+async fn guest_activity_spans_each_exchange_until_hyper_takes_its_last_frame() {
+    use http_body_util::BodyExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (binding, lease, _) = fixture().await;
+    let (origin, mut origin_peer) = tokio::io::duplex(1024);
+    let (finish_body, body_finished) = tokio::sync::oneshot::channel::<()>();
+    let origin_task = tokio::spawn(async move {
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            request.push(origin_peer.read_u8().await.unwrap());
+        }
+        origin_peer
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\nab")
+            .await
+            .unwrap();
+        body_finished.await.unwrap();
+        origin_peer.write_all(b"cd").await.unwrap();
+        // Hold the origin open so only the guest side ends the exchange.
+        let _ = origin_peer.read_u8().await;
+    });
+    let (guest, guest_peer) = tokio::io::duplex(1024);
+    let activity = GuestActivity::default();
+    let gateway = tokio::spawn(serve_guest(
+        guest,
+        activity.clone(),
+        binding,
+        lease,
+        move |_| async move { Ok((origin, HttpProtocol::Http1)) },
+    ));
+    let (mut sender, connection) = http1::handshake(TokioIo::new(guest_peer)).await.unwrap();
+    let client = tokio::spawn(connection);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let request = Request::get("https://allowed.test/")
+            .header(header::HOST, "allowed.test")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let mut body = sender.send_request(request).await.unwrap().into_body();
+        let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(&first[..], b"ab");
+        assert!(!activity.is_idle(), "a streaming response is in flight");
+        finish_body.send(()).unwrap();
+        let rest = body.collect().await.unwrap().to_bytes();
+        assert_eq!(&rest[..], b"cd");
+        assert!(activity.is_idle(), "a fully read response is not in flight");
+    })
+    .await
+    .unwrap();
+    client.abort();
+    gateway.abort();
+    origin_task.abort();
+}
