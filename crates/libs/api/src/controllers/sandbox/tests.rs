@@ -462,9 +462,14 @@ mod template_release_resolution_postgres_tests {
         );
         assert_eq!(template.artifact_digest(), None);
 
-        let resolved =
-            resolve_template_release(&db.pool, &template, RuntimeKind::Firecracker, OrgId::new())
-                .await?;
+        let resolved = resolve_template_release(
+            &db.pool,
+            &template,
+            RuntimeKind::Firecracker,
+            OrgId::new(),
+            ReleaseMissReport::Classified,
+        )
+        .await?;
 
         assert_eq!(resolved, (release_id, content_hash.to_string()));
         Ok(())
@@ -485,10 +490,15 @@ mod template_release_resolution_postgres_tests {
         .await?;
         let caller_org = OrgId::new();
         let missing = "custom-template:v123".parse::<TemplateReference>()?;
-        let error =
-            resolve_template_release(&db.pool, &missing, RuntimeKind::Firecracker, caller_org)
-                .await
-                .unwrap_err();
+        let error = resolve_template_release(
+            &db.pool,
+            &missing,
+            RuntimeKind::Firecracker,
+            caller_org,
+            ReleaseMissReport::Classified,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(error.status(), axum::http::StatusCode::NOT_FOUND);
 
         insert_release_with_latest_tag(&db.pool, "custom-template", release_id, content_hash, None)
@@ -500,9 +510,14 @@ mod template_release_resolution_postgres_tests {
         ] {
             let template = reference.parse::<TemplateReference>()?;
 
-            let resolved =
-                resolve_template_release(&db.pool, &template, RuntimeKind::Firecracker, caller_org)
-                    .await?;
+            let resolved = resolve_template_release(
+                &db.pool,
+                &template,
+                RuntimeKind::Firecracker,
+                caller_org,
+                ReleaseMissReport::Classified,
+            )
+            .await?;
 
             assert_eq!(resolved, (release_id, content_hash.to_string()));
         }
@@ -513,6 +528,7 @@ mod template_release_resolution_postgres_tests {
             &missing_digest,
             RuntimeKind::Firecracker,
             caller_org,
+            ReleaseMissReport::Classified,
         )
         .await
         .unwrap_err();
@@ -557,6 +573,7 @@ mod template_release_resolution_postgres_tests {
             &tagged_template,
             RuntimeKind::Firecracker,
             cross_org_caller,
+            ReleaseMissReport::Classified,
         )
         .await?;
         assert_eq!(resolved_tag, (release_id, content_hash.to_string()));
@@ -569,6 +586,7 @@ mod template_release_resolution_postgres_tests {
             &digest_template,
             RuntimeKind::Firecracker,
             cross_org_caller,
+            ReleaseMissReport::Classified,
         )
         .await?;
         assert_eq!(resolved_digest, (release_id, content_hash.to_string()));
@@ -578,6 +596,7 @@ mod template_release_resolution_postgres_tests {
             &digest_template,
             RuntimeKind::CloudHypervisor,
             cross_org_caller,
+            ReleaseMissReport::Classified,
         )
         .await
         .unwrap_err();
@@ -665,6 +684,7 @@ mod template_release_resolution_postgres_tests {
             &template,
             RuntimeKind::Firecracker,
             org(TENANT_ORG),
+            ReleaseMissReport::Classified,
         )
         .await?;
 
@@ -696,6 +716,7 @@ mod template_release_resolution_postgres_tests {
             &denied_template,
             RuntimeKind::Firecracker,
             org(OTHER_ORG),
+            ReleaseMissReport::Classified,
         )
         .await
         .unwrap_err();
@@ -710,6 +731,7 @@ mod template_release_resolution_postgres_tests {
             &absent_template,
             RuntimeKind::Firecracker,
             org(OTHER_ORG),
+            ReleaseMissReport::Classified,
         )
         .await
         .unwrap_err();
@@ -731,6 +753,7 @@ mod template_release_resolution_postgres_tests {
             &denied_digest_template,
             RuntimeKind::Firecracker,
             org(OTHER_ORG),
+            ReleaseMissReport::Classified,
         )
         .await
         .unwrap_err();
@@ -836,9 +859,15 @@ mod template_release_resolution_postgres_tests {
             ),
         ] {
             let template = reference.parse::<TemplateReference>().unwrap();
-            let error = resolve_template_release(&db.pool, &template, runtime, org(OTHER_ORG))
-                .await
-                .unwrap_err();
+            let error = resolve_template_release(
+                &db.pool,
+                &template,
+                runtime,
+                org(OTHER_ORG),
+                ReleaseMissReport::Classified,
+            )
+            .await
+            .unwrap_err();
             assert_eq!(
                 error.status(),
                 axum::http::StatusCode::NOT_FOUND,
@@ -850,6 +879,19 @@ mod template_release_resolution_postgres_tests {
                 "{reference} {runtime:?}"
             );
             let name = template.name().as_str();
+            // The auto-lifecycle update resolves with a runtime that may not
+            // be the sandbox's, so it keeps the plain not-found.
+            let unclassified = resolve_template_release(
+                &db.pool,
+                &template,
+                runtime,
+                org(OTHER_ORG),
+                ReleaseMissReport::NotFound,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(unclassified.template_release_miss(), None, "{reference}");
+            assert_eq!(unclassified.to_string(), error.to_string(), "{reference}");
             let shape = error.to_string().replace(&format!("'{name}'"), "'{name}'");
             let expected_shape = match template.artifact_digest() {
                 Some(digest) => format!(
@@ -901,6 +943,7 @@ mod template_release_resolution_postgres_tests {
                 &reference.parse()?,
                 RuntimeKind::Firecracker,
                 org(caller),
+                ReleaseMissReport::Classified,
             )
             .await
             .expect_err("inventory cannot publish a release");
@@ -983,6 +1026,7 @@ mod template_release_resolution_postgres_tests {
             &format!("{template_name}:latest").parse()?,
             RuntimeKind::Firecracker,
             org(OTHER_ORG),
+            ReleaseMissReport::Classified,
         )
         .await?;
         let latest = sqlx::query_as::<_, (Uuid, time::OffsetDateTime)>(

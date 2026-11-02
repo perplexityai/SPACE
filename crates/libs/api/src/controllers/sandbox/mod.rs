@@ -245,11 +245,23 @@ pub(crate) async fn gate_template_access(
     }
 }
 
+/// How [`resolve_template_release`] reports a reference that matched no
+/// release.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ReleaseMissReport {
+    /// Say whether the template has any release ([`classify_release_miss`]).
+    Classified,
+    /// The plain not-found, for a caller that may resolve with a runtime
+    /// other than the sandbox's, where a classification could be wrong.
+    NotFound,
+}
+
 async fn resolve_template_release(
     pool: &PgPool,
     template: &TemplateReference,
     runtime: RuntimeKind,
     caller_org: OrgId,
+    miss_report: ReleaseMissReport,
 ) -> Result<(Uuid, String), ControllerError> {
     validate_create_template_reference(template)?;
     let template_name = template.name().as_str();
@@ -276,7 +288,9 @@ async fn resolve_template_release(
 
         return match resolved {
             Some(release) => Ok(release),
-            None => Err(classify_release_miss(pool, template, runtime, caller_org, access).await?),
+            None => {
+                Err(release_miss(pool, template, runtime, caller_org, access, miss_report).await?)
+            }
         };
     }
 
@@ -311,7 +325,23 @@ async fn resolve_template_release(
         }
     }
 
-    Err(classify_release_miss(pool, template, runtime, caller_org, access).await?)
+    Err(release_miss(pool, template, runtime, caller_org, access, miss_report).await?)
+}
+
+async fn release_miss(
+    pool: &PgPool,
+    template: &TemplateReference,
+    runtime: RuntimeKind,
+    caller_org: OrgId,
+    access: TemplateAccess,
+    miss_report: ReleaseMissReport,
+) -> Result<ControllerError, ControllerError> {
+    match miss_report {
+        ReleaseMissReport::Classified => {
+            classify_release_miss(pool, template, runtime, caller_org, access).await
+        }
+        ReleaseMissReport::NotFound => Ok(template_release_not_found(template, runtime)),
+    }
 }
 
 /// The error for a template reference whose lookups matched no release.
