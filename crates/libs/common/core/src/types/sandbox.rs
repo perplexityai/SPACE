@@ -1967,6 +1967,7 @@ impl<'de> Deserialize<'de> for SandboxMetadata {
     }
 }
 
+// ui/src/lib/sandbox-lifecycle.ts mirrors these states; update it with them.
 /// Canonical sandbox lifecycle state shared across services.
 ///
 /// # Examples
