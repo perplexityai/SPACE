@@ -1187,6 +1187,14 @@ mod not_running {
     /// A process running every inline-capable kind inline, with
     /// `max_concurrent` permits.
     fn inline_runner(max_concurrent: usize) -> InlineOperations {
+        inline_runner_on(max_concurrent, tokio_util::task::TaskTracker::new())
+    }
+
+    /// [`inline_runner`], spawning its executions on `tasks`.
+    fn inline_runner_on(
+        max_concurrent: usize,
+        tasks: tokio_util::task::TaskTracker,
+    ) -> InlineOperations {
         InlineOperations::new(
             InlineOperationsConfig {
                 enabled: true,
@@ -1194,7 +1202,7 @@ mod not_running {
                 max_concurrent,
                 ..Default::default()
             },
-            tokio_util::task::TaskTracker::new(),
+            tasks,
             pplx_space_common_svc::DrainSignal::new(),
             OperationExecutionConfig::default(),
             true,
@@ -1624,7 +1632,11 @@ mod not_running {
     async fn a_request_dropped_as_its_inline_wake_commits_still_runs_it() -> TestDbResult<()> {
         let org_id = OrgId::from_uuid(SEED_ORG_ID);
         let script = ScriptedWake::new(WakeScript::Succeed);
-        let inline = script.inline();
+        let tasks = tokio_util::task::TaskTracker::new();
+        let inline = script.inline_on(inline_runner_on(
+            InlineOperationsConfig::default().max_concurrent,
+            tasks.clone(),
+        ));
         let fixture = fixture_with(Some(inline.clone())).await?;
         let sandbox_id = sandbox(&fixture, "suspended", &["command"]).await?;
         let store = PublicOperationStore::new(fixture.db.pool.clone());
@@ -1662,7 +1674,12 @@ mod not_running {
         assert!(first.is_pending(), "the request waits for the commit");
         drop(settled);
 
-        wait_for_state(&fixture, wake, "succeeded").await?;
+        // The operation is invisible until the tracker's task commits it,
+        // so wait for that task rather than poll for the row.
+        tasks.close();
+        tokio::time::timeout(std::time::Duration::from_secs(5), tasks.wait())
+            .await
+            .expect("the inline task ends");
         assert_eq!(script.executed(), vec![wake]);
         assert_eq!(state_and_attempts(&fixture, wake).await?, ("succeeded", 1));
         Ok(())
