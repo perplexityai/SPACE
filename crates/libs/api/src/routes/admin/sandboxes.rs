@@ -42,7 +42,7 @@ use crate::routes::public::error::PublicApiError;
 use crate::routes::public::hidden_operations;
 use crate::routes::public::sandboxes::parse_rollback_body;
 use crate::routes::public::sessions::{
-    create_command_session, idempotency_key as session_idempotency_key,
+    RouteIdempotency, create_command_session, idempotency_key as session_idempotency_key,
 };
 use pplx_space_public_api::routes as native_routes;
 
@@ -57,6 +57,10 @@ const ADMIN_CREATE_SANDBOX_PATH_TEMPLATE: &str = "/v1/sandboxes:admin-create";
 /// public idempotency records never collide on the same key.
 const ADMIN_UPDATE_SANDBOX_PATH_TEMPLATE: &str = "/v1/sandboxes/{sandbox_id}:admin-update";
 const ADMIN_UPDATE_ACTION_LABEL: &str = "admin-update";
+/// The idempotency scope of the admin command route, distinct from the public
+/// route's so a request with the same key and body on the other route never
+/// replays this route's session and rotates its attach token, nor the reverse.
+const ADMIN_COMMAND_PATH_TEMPLATE: &str = "/v1/sandboxes/{sandbox_id}/commands:admin";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AdminSandboxTarget {
@@ -537,9 +541,10 @@ pub async fn dispatch_sandbox_action(
 /// command endpoint rejects every sandbox the operator does not personally own
 /// with "sandbox not found". This handler resolves the sandbox without an org
 /// filter and runs the command under the sandbox's owning org, mirroring
-/// `dispatch_sandbox_action`. Managing-org admin is already enforced by the
-/// admin auth middleware, and the same middleware records an admin audit event
-/// for the request.
+/// `dispatch_sandbox_action`. Its idempotency keys are its own (see
+/// [`ADMIN_COMMAND_PATH_TEMPLATE`]). Managing-org admin is already enforced by
+/// the admin auth middleware, and the same middleware records an admin audit
+/// event for the request.
 pub async fn create_command(
     State(state): State<AppState>,
     Extension(AuthUser(actor)): Extension<AuthUser>,
@@ -574,7 +579,10 @@ pub async fn create_command(
             actor.id,
             target.public_id,
             request,
-            idempotency_key,
+            RouteIdempotency {
+                key: idempotency_key,
+                path_template: OperationPathTemplate::new(ADMIN_COMMAND_PATH_TEMPLATE),
+            },
             || Ok(()),
         )
         .await

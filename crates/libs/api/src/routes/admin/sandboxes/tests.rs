@@ -984,6 +984,80 @@ mod cross_org_routes {
         Ok(())
     }
 
+    /// The admin command route scopes its idempotency keys apart from the
+    /// public route's, as the terminal route does: the tenant sending the
+    /// operator's key and body gets a command session of its own, and the
+    /// operator's session and attach token are untouched.
+    #[tokio::test]
+    async fn admin_and_public_command_sessions_never_replay_each_other() -> TestResult {
+        let Some(harness) = admin_router_harness().await? else {
+            return Ok(());
+        };
+        let sandbox = tenant_sandbox(&harness).await?;
+        let path = format!("/sandboxes/{sandbox}/commands");
+        let key = "shared-command-key";
+        let body = json!({"command": ["true"], "cwd": null, "env": {}, "pty": null, "stdin": false, "timeout": null});
+        let (status, admin_command) = harness
+            .as_operator(
+                Method::POST,
+                &path,
+                &[("idempotency-key", key)],
+                Some(body.clone()),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{admin_command}");
+        let admin_session_id = admin_command["session_id"]
+            .as_str()
+            .expect("session id")
+            .to_owned();
+        let token_hash = |session_id: String| {
+            let pool = harness.db.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Option<String>>(sql!(
+                    "SELECT token_hash FROM data_plane_sessions WHERE session_id = $1"
+                ))
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+            }
+        };
+        let admin_token_hash = token_hash(admin_session_id.clone()).await?;
+
+        let tenant_command = crate::routes::public::sessions::create_command_session(
+            &harness.state.public_session_store(),
+            harness.tenant_org,
+            harness.tenant_admin,
+            sandbox,
+            serde_json::from_value(body.clone())?,
+            crate::routes::public::sessions::RouteIdempotency {
+                key: IdempotencyKey::parse(key.to_owned())?,
+                path_template: crate::public_operations::OperationPathTemplate::new(
+                    pplx_space_public_api::routes::CREATE_COMMAND.path(),
+                ),
+            },
+            || Ok(()),
+        )
+        .await
+        .map_err(|error| format!("public create failed: {error:?}"))?;
+        assert_ne!(tenant_command.session_id.to_string(), admin_session_id);
+        assert_eq!(
+            token_hash(admin_session_id.clone()).await?,
+            admin_token_hash,
+            "the operator's attach token was not rotated"
+        );
+
+        let (status, replay) = harness
+            .as_operator(Method::POST, &path, &[("idempotency-key", key)], Some(body))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{replay}");
+        assert_eq!(
+            replay["session_id"],
+            admin_session_id.as_str(),
+            "the admin route replays its own"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn an_operator_lists_another_organizations_snapshots_and_the_read_is_audited()
     -> TestResult {

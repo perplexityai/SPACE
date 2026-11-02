@@ -13,7 +13,10 @@ use super::{
     audit::AdminAuditTarget,
     support::{self, ContentionScope, api_error},
 };
-use crate::{api_surface::ApiSurface, auth::hash_token, routes::AppState};
+use crate::{
+    api_surface::ApiSurface, auth::hash_token, middleware::auth::AuthUser, models::User,
+    routes::AppState,
+};
 
 const API_KEY_NAME_MAX_CHARS: usize = 128;
 
@@ -23,7 +26,8 @@ pub(super) struct CreateApiKeyRequest {
     name: String,
     allowed_surfaces: Vec<ApiSurface>,
     /// The user of the organization the key acts as, recorded as its
-    /// `created_by`. Defaults to the organization's oldest user.
+    /// `created_by`. Defaults to the calling admin for the admin's own
+    /// organization, and to the organization's oldest user for another.
     #[serde(default)]
     user_id: Option<UserId>,
 }
@@ -117,15 +121,18 @@ pub(super) async fn list_api_keys(
 ///
 /// The key belongs to `org_id`, calls the APIs in `allowed_surfaces`, and acts
 /// as the user chosen here: `user_id`, which must be a user of the
-/// organization, or else the organization's oldest user. That user is stored
-/// as the key's `created_by`, the column every release's key lookup reads, so
-/// no release resolves the key to a different user or to none. An
-/// organization with no users answers 409.
+/// organization; else the calling admin, for a key of the admin's own
+/// organization, as before this route served other organizations; else the
+/// organization's oldest user. That user is stored as the key's `created_by`,
+/// the column every release's key lookup reads, so no release resolves the key
+/// to a different user or to none. An organization with no users answers 409,
+/// and so does a chosen user deleted before the key is stored.
 ///
 /// The request's audit event names the calling admin, the organization, the
 /// new key and its user; the secret appears only in this response.
 pub(super) async fn create_api_key(
     State(state): State<AppState>,
+    Extension(AuthUser(actor)): Extension<AuthUser>,
     Path(org_id): Path<OrgId>,
     Json(request): Json<CreateApiKeyRequest>,
 ) -> Response {
@@ -149,7 +156,7 @@ pub(super) async fn create_api_key(
             return (org_target, api_error(StatusCode::BAD_REQUEST, message)).into_response();
         }
     };
-    let user_id = match key_user(&state, org_id, request.user_id).await {
+    let user_id = match key_user(&state, &actor, org_id, request.user_id).await {
         Ok(user_id) => user_id,
         Err(refusal) => return (org_target, refusal.into_response()).into_response(),
     };
@@ -181,11 +188,32 @@ pub(super) async fn create_api_key(
             .into_response(),
         Err(error) => (
             Extension(AdminAuditTarget::api_key(org_id, None, Some(user_id))),
-            support::db_error(error),
+            create_error(error),
         )
             .into_response(),
     }
 }
+
+/// The answer for a failed key insert. A chosen user deleted after
+/// [`key_user`] checked it fails the `created_by` foreign key, which the
+/// operator resolves by retrying or choosing another user, so it is a 409, not
+/// an internal error.
+fn create_error(error: sqlx::Error) -> Response {
+    let deleted_user = error
+        .as_database_error()
+        .and_then(|error| error.constraint())
+        == Some(API_KEY_CREATED_BY_FKEY);
+    if deleted_user {
+        return api_error(
+            StatusCode::CONFLICT,
+            "The key's user was deleted while the key was created; retry, or choose another user",
+        )
+        .into_response();
+    }
+    support::db_error(error).into_response()
+}
+
+const API_KEY_CREATED_BY_FKEY: &str = "api_keys_created_by_fkey";
 
 /// Why no user could be chosen for a new key.
 enum KeyUserRefusal {
@@ -215,10 +243,12 @@ impl KeyUserRefusal {
 /// The user a new key of `org_id` acts as.
 async fn key_user(
     state: &AppState,
+    actor: &User,
     org_id: OrgId,
     requested: Option<UserId>,
 ) -> Result<UserId, KeyUserRefusal> {
     match requested {
+        None if org_id == actor.org_id => Ok(actor.id),
         Some(user_id) => {
             match api_key_store::user_in_organization(&state.pool, org_id, user_id).await {
                 Ok(true) => Ok(user_id),

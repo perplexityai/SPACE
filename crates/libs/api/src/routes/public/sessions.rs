@@ -212,7 +212,10 @@ pub async fn create_command(
         actor.id,
         sandbox_id,
         request,
-        idempotency_key,
+        RouteIdempotency {
+            key: idempotency_key,
+            path_template: OperationPathTemplate::new(COMMAND_PATH_TEMPLATE),
+        },
         || admit(admission, sandbox_id, lifecycle),
     )
     .await?;
@@ -468,6 +471,12 @@ pub(crate) async fn queue_implicit_wake(
     }
 }
 
+/// A request's `Idempotency-Key` and the route scope it is unique within.
+pub(crate) struct RouteIdempotency {
+    pub(crate) key: IdempotencyKey,
+    pub(crate) path_template: OperationPathTemplate,
+}
+
 /// Create a command (one-shot process) data-plane session for `sandbox_id`,
 /// scoped to `org_id` and attributed to `actor_user_id`.
 ///
@@ -478,14 +487,16 @@ pub(crate) async fn queue_implicit_wake(
 /// surface passes its own authenticated org after an ownership check, so this
 /// helper never weakens the public org boundary. The returned attach token is
 /// session-scoped (independent of `org_id`), so the data-plane stream that the
-/// caller connects to authenticates on the token alone.
+/// caller connects to authenticates on the token alone. The `idempotency`
+/// path template scopes its key, so the public and admin routes replay only
+/// their own sessions.
 pub(crate) async fn create_command_session(
     store: &PublicSessionStore,
     org_id: OrgId,
     actor_user_id: UserId,
     sandbox_id: PublicSandboxId,
     request: CreateCommandRequest,
-    idempotency_key: IdempotencyKey,
+    idempotency: RouteIdempotency,
     admit: impl FnOnce() -> Result<(), PublicApiError> + Send,
 ) -> Result<PublicCommand, PublicApiError> {
     let request = CreateProcessRequest::from(request);
@@ -516,8 +527,8 @@ pub(crate) async fn create_command_session(
                 fingerprint_payload: &fingerprint_payload,
                 idempotency: CreatePublicSessionIdempotency {
                     method: HttpOperationMethod::Post,
-                    path_template: OperationPathTemplate::new(COMMAND_PATH_TEMPLATE),
-                    key: &idempotency_key,
+                    path_template: idempotency.path_template,
+                    key: &idempotency.key,
                 },
             },
             admit,

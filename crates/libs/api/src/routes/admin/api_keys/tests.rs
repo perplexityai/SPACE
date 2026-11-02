@@ -275,6 +275,84 @@ async fn a_new_key_acts_as_its_chosen_user_under_the_released_lookup() -> TestRe
     Ok(())
 }
 
+/// Without `user_id`, a key of the caller's own organization acts as the
+/// caller, as it did before this route served other organizations, while a key
+/// of another organization acts as that organization's oldest user.
+#[tokio::test(flavor = "current_thread")]
+async fn a_key_without_user_id_acts_as_the_caller_only_in_the_callers_organization() -> TestResult {
+    let Some(harness) = admin_router_harness().await? else {
+        return Ok(());
+    };
+    let own_org = harness.operator.org_id;
+    let oldest_own_user = api_key_store::oldest_user(&harness.db.pool, own_org)
+        .await?
+        .expect("the managing org has users");
+    assert_ne!(
+        oldest_own_user, harness.operator.id,
+        "the fixture's caller is not its org's oldest user"
+    );
+    for (org, expected) in [
+        (own_org, harness.operator.id),
+        (harness.tenant_org, harness.tenant_admin),
+    ] {
+        let (status, created) = harness
+            .as_operator(
+                Method::POST,
+                &format!("/orgs/{org}/api-keys"),
+                &[],
+                Some(json!({"name": "default user", "allowed_surfaces": ["native"]})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        assert_eq!(
+            created["api_key"]["created_by"],
+            expected.to_string(),
+            "{org}"
+        );
+        let secret = created["secret"].as_str().expect("secret");
+        let actor = crate::auth::get_api_key_org(&harness.db.pool, secret, ApiSurface::Native)
+            .await?
+            .and_then(|context| context.actor)
+            .map(|actor| actor.id);
+        assert_eq!(actor, Some(expected), "{org}");
+    }
+    Ok(())
+}
+
+/// A chosen user deleted between the membership check and the insert fails the
+/// `created_by` foreign key; the operator gets a 409 to retry or choose
+/// another user, not an internal error.
+#[tokio::test(flavor = "current_thread")]
+async fn a_key_whose_user_was_deleted_answers_a_conflict() -> TestResult {
+    let Some(db) = crate::routes::admin::test_fixtures::postgres_fixture().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(uuid::Uuid::from_u128(0x1));
+    let deleted_user = UserId::new();
+    let error = api_key_store::create(
+        &db.pool,
+        CreateApiKey {
+            id: ApiKeyId::new(),
+            org_id,
+            name: "orphan",
+            key_hash: &hash_token("orphan-key"),
+            created_by: deleted_user,
+            allowed_surfaces: &[ApiSurface::Ecw],
+        },
+    )
+    .await
+    .expect_err("the insert names a user that doesn't exist");
+    let response = create_error(error);
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    let body: Value = serde_json::from_slice(&body)?;
+    assert!(
+        body["error"].as_str().unwrap_or_default().contains("retry"),
+        "{body}"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn a_key_needs_a_user_of_its_organization_to_act_as() -> TestResult {
     let Some(harness) = admin_router_harness().await? else {
