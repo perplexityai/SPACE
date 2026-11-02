@@ -26,12 +26,10 @@ use pplx_space_events::{
 use pplx_space_metrics::sandbox::api::RouteIdentityDecisionReason;
 use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_sandbox_portability::{
-    SuspendedTargetNodeAssignment, clear_current_local_artifact_marker_assignments,
-    failed_repair_revert_eligibility, fresh_ready_snapshot_exists,
-    missing_suspending_pod_revert_eligibility, no_newer_full_snapshot,
+    clear_current_local_artifact_marker_assignments, failed_repair_revert_eligibility,
+    fresh_ready_snapshot_exists, missing_suspending_pod_revert_eligibility, no_newer_full_snapshot,
     restore_retry_source_snapshot_is_current, restore_retry_suspended_revert_snapshot_exists,
     snapshot_is_current_local_artifact, started_suspend_revert_eligibility,
-    suspended_k8s_finalization_sql, write_current_local_artifact_marker_assignments,
 };
 use sqlx::{PgConnection, PgPool, Postgres, Row, Transaction, postgres::PgRow};
 use uuid::Uuid;
