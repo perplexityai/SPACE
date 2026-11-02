@@ -45,20 +45,17 @@ import {
   testSandboxName,
 } from '@/lib/system-template-rebuild';
 import { releaseViewRefreshLock, tryAcquireViewRefreshLock } from '@/lib/view-refresh';
-import { exclusiveWith } from '@/lib/exclusive';
-import type { BrowserLocks } from '@/lib/exclusive';
+import { exclusiveWith, type BrowserLocks } from '@/lib/exclusive';
 
 const { Text, Paragraph } = Typography;
 const TEMPLATES: SystemTemplate[] = ['seed', 'code-runtime'];
 const formatTime = (iso: string | number) => new Date(iso).toLocaleString();
 
-// A fallback lock is held only while `work` runs, which is synchronous; the
-// TTL frees it if a tab dies holding it.
-const FALLBACK_LOCK_TTL_MS = 2_000;
-
+// `exclusiveWith` owns the fallback lock's TTL and retry loop; this wires it to
+// the browser's Web Locks, the stored view-refresh lock and timers.
 const exclusive = <T,>(name: string, work: () => T): Promise<T> => exclusiveWith({
   locks: typeof navigator !== 'undefined' ? (navigator as Navigator & { locks?: BrowserLocks }).locks : undefined,
-  acquire: (lockName) => tryAcquireViewRefreshLock(lockName, FALLBACK_LOCK_TTL_MS),
+  acquire: (lockName, ttlMs) => tryAcquireViewRefreshLock(lockName, ttlMs),
   release: releaseViewRefreshLock,
   wait: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 }, name, work);

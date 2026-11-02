@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { exclusiveWith } from './exclusive.ts';
+import { exclusiveWith, FALLBACK_LOCK_TTL_MS } from './exclusive.ts';
 
 const env = (over = {}) => {
   const calls = { acquire: 0, release: [], wait: 0 };
@@ -52,6 +52,21 @@ test('a throw from work is not swallowed, and the lock is released', async () =>
 });
 
 test('work that throws after an unlocked fallback still propagates', async () => {
-  const { env: e } = env({ acquire: () => { throw new Error('blocked'); } });
+  const blocked = Object.assign(new Error('The operation is insecure.'), { name: 'SecurityError' });
+  const { env: e } = env({ acquire: () => { throw blocked; } });
   await assert.rejects(exclusiveWith(e, 'run:write', () => { throw new Error('boom'); }), /boom/);
+});
+
+test('an acquisition error that is not a storage refusal propagates, and work does not run', async () => {
+  const { env: e } = env({ acquire: () => { throw new TypeError('bug in the lock'); } });
+  let ran = 0;
+  await assert.rejects(exclusiveWith(e, 'run:write', () => { ran += 1; }), /bug in the lock/);
+  assert.equal(ran, 0);
+});
+
+test('the fallback asks for its lock with the fallback TTL', async () => {
+  const ttls = [];
+  const { env: e } = env({ acquire: (_name, ttlMs) => { ttls.push(ttlMs); return 'owner-1'; } });
+  await exclusiveWith(e, 'run:write', () => 'done');
+  assert.deepEqual(ttls, [FALLBACK_LOCK_TTL_MS]);
 });
