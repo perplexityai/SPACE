@@ -1,5 +1,16 @@
+// The interval only checks whether the view is stale, which is cheap; the
+// staleness window is what sets how often a list is refetched. Every refetch
+// of the sandbox, node or template list reads the whole admin list, so it
+// runs every 10 s rather than every second. Pages refresh right after an
+// operator's own action regardless.
+//
+// Freshness is per tab: each tab holds its own rows, so another tab's refresh
+// says nothing about how old these are. Every visible tab refetches on its own
+// window, so load grows with the number of visible tabs. The lock below is
+// shared across tabs only so two tabs do not fetch at the same instant (the
+// loser retries on its next check) and so one tab never overlaps its own fetch.
 export const VIEW_REFRESH_INTERVAL_MS = 1_000;
-export const VIEW_REFRESH_STALE_MS = 1_000;
+export const VIEW_REFRESH_STALE_MS = 10_000;
 export const VIEW_REFRESH_LOCK_TTL_MS = 60_000;
 
 const STORAGE_PREFIX = 'space:view-refresh:';
@@ -33,20 +44,15 @@ function readLock(storageKey: string): LockRecord | null {
   }
 }
 
+const lastRefreshed = new Map<string, number>();
+
 export function shouldRefreshView(key: string, staleMs = VIEW_REFRESH_STALE_MS, now = Date.now()) {
-  if (!hasStorage()) {
-    return true;
-  }
-  const raw = window.localStorage.getItem(`${STORAGE_PREFIX}${key}:last`);
-  const last = raw ? Number(raw) : 0;
-  return !Number.isFinite(last) || last <= 0 || now - last >= staleMs;
+  const last = lastRefreshed.get(key);
+  return last === undefined || now - last >= staleMs;
 }
 
 export function markViewRefreshed(key: string, now = Date.now()) {
-  if (!hasStorage()) {
-    return;
-  }
-  window.localStorage.setItem(`${STORAGE_PREFIX}${key}:last`, String(now));
+  lastRefreshed.set(key, now);
 }
 
 export function tryAcquireViewRefreshLock(key: string, ttlMs = VIEW_REFRESH_LOCK_TTL_MS, now = Date.now()) {
