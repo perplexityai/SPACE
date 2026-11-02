@@ -88,7 +88,11 @@ download() {
   # fixed 2 s retries last: four attempts over ~6 s have all failed. Match
   # install-fc-vendor.sh: curl's doubling backoff spreads seven attempts over
   # about a minute, and --retry-all-errors also retries a reset connection.
-  curl -fsSL --retry 6 --retry-all-errors "$1" -o "$2"
+  # A transfer that stalls is an error too: one attempt that averaged under
+  # 10 KB/s for 30 s is dropped and retried, where a hung HTTP/2 stream once
+  # held a CI shard for 39 minutes.
+  curl -fsSL --retry 6 --retry-all-errors \
+    --connect-timeout 20 --speed-limit 10240 --speed-time 30 "$1" -o "$2"
 }
 
 install_kind() {
