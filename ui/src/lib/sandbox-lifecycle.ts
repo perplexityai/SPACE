@@ -21,11 +21,18 @@ export const SANDBOX_STATUS_FILTER_STATES = [
   ...SANDBOX_LIFECYCLE_STATES, 'cleanup_required', 'cleanup_failed', 'deleted',
 ] as const;
 
-// The action that brings a sandbox in `status` back up, named for what it
-// does: a stopped sandbox starts, a paused one resumes in memory, a suspended
-// one restores from its snapshot. `null` when nothing brings it up from here.
-export function bringUpAction(status: string | null): { action: 'start' | 'resume' | 'restore'; label: string } | null {
-  switch (status) {
+
+// The action that brings a sandbox back up, named for what it does: a
+// stopped sandbox starts, a paused one resumes in memory, a suspended one
+// restores from its snapshot. It keys on the stored `lifecycle` when the row
+// has one: `status` is the node's reported state when a node reports one, so
+// a suspended sandbox whose node reports it stopped still restores. Without a
+// lifecycle it falls back to `status`. `null` when nothing brings it up from
+// here.
+export function bringUpAction(
+  row: { lifecycle?: string | null; status: string | null },
+): { action: 'start' | 'resume' | 'restore'; label: string } | null {
+  switch (row.lifecycle || row.status) {
     case 'created':
     case 'stopped':
       return { action: 'start', label: 'Start' };

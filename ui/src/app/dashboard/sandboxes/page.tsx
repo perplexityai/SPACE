@@ -378,8 +378,9 @@ function sandboxNodeDisplay(sandbox: Sandbox) {
   );
 }
 
-function SandboxActions({ status, id, resourceType, poolTemplate, onAction }: {
+function SandboxActions({ status, lifecycle, id, resourceType, poolTemplate, onAction }: {
   status: string | null;
+  lifecycle: string | null;
   id: string;
   resourceType: Sandbox['resource_type'];
   poolTemplate?: string | null;
@@ -397,7 +398,7 @@ function SandboxActions({ status, id, resourceType, poolTemplate, onAction }: {
   if (poolSlot) {
     actions.suspend = false;
   }
-  const bringUp = managedSandbox ? bringUpAction(s) : null;
+  const bringUp = managedSandbox ? bringUpAction({ lifecycle, status }) : null;
 
   const confirmStop = async () => {
     if (!actions.stop || stopPending.current) return;
@@ -1312,6 +1313,7 @@ function SandboxesPage() {
       render: (_, record) => (
         <SandboxActions
           status={record.status}
+          lifecycle={record.lifecycle}
           id={record.id}
           resourceType={record.resource_type}
           poolTemplate={record.pool_template}

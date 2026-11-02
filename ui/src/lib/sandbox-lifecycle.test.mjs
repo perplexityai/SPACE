@@ -1,17 +1,23 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { SANDBOX_LIFECYCLE_STATES, SANDBOX_STATUS_FILTER_STATES, bringUpAction } from './sandbox-lifecycle.ts';
+import {
+  SANDBOX_LIFECYCLE_STATES,
+  SANDBOX_STATUS_FILTER_STATES,
+  bringUpAction,
+} from './sandbox-lifecycle.ts';
+
+const row = (status, lifecycle = null) => ({ status, lifecycle });
 
 test('each resting state is brought up by the action that matches it', () => {
-  assert.equal(bringUpAction('stopped')?.action, 'start');
-  assert.equal(bringUpAction('created')?.action, 'start');
-  assert.equal(bringUpAction('paused')?.action, 'resume');
-  assert.equal(bringUpAction('suspended')?.action, 'restore');
+  assert.equal(bringUpAction(row('stopped'))?.action, 'start');
+  assert.equal(bringUpAction(row('created'))?.action, 'start');
+  assert.equal(bringUpAction(row('paused'))?.action, 'resume');
+  assert.equal(bringUpAction(row('suspended'))?.action, 'restore');
 });
 
 test('running, transient and terminal states have no bring-up action', () => {
   for (const status of ['started', 'pausing', 'restoring', 'deleting', 'failed', 'quarantined', null]) {
-    assert.equal(bringUpAction(status), null);
+    assert.equal(bringUpAction(row(status)), null);
   }
 });
 
@@ -25,5 +31,17 @@ test('the filter offers the states the admin list reports: node-reported ones an
 });
 
 test('a deleted tombstone has no bring-up action', () => {
-  assert.equal(bringUpAction('deleted'), null);
+  assert.equal(bringUpAction(row('deleted')), null);
 });
+
+test('the stored lifecycle decides the bring-up action over the node-reported status', () => {
+  // A suspended sandbox whose node reports it stopped restores, not starts.
+  assert.deepEqual(bringUpAction(row('stopped', 'suspended')), { action: 'restore', label: 'Restore' });
+  assert.equal(bringUpAction(row('stopped', 'paused'))?.action, 'resume');
+  assert.equal(bringUpAction(row('suspended', 'stopped'))?.action, 'start');
+  assert.equal(bringUpAction(row('stopped', 'restoring')), null);
+  // Without a lifecycle the status decides.
+  assert.equal(bringUpAction(row('stopped', null))?.action, 'start');
+  assert.equal(bringUpAction({ status: 'paused' })?.action, 'resume');
+});
+
