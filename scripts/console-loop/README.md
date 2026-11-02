@@ -84,10 +84,13 @@ generated password of the seeded users, and every object the seed creates
 and every object a `flows` step of the loop creates. `seed`, `loop` and
 `clean` refuse a state that records another prefix than `--prefix`.
 
-Each object is recorded as soon as the API answers its create. A rerun
-reuses what exists: it looks each organization, user and API key up by slug,
-email or key name, and each sandbox by its recorded ID, then by its prefixed
-name. Seeding fails (exit 2) when it cannot discover or set up a fixture. It
+Each object is recorded as soon as the API answers its create; a sandbox
+also with its create operation, since the answer names the sandbox while that
+operation can still be queued, before the sandbox exists. A rerun reuses what
+exists: it looks each organization, user and API key up by slug, email or key
+name, and each sandbox by its recorded ID, then by its prefixed name. A
+recorded sandbox that is not found yet while its create operation is still
+unfinished is waited for (up to ten minutes) and never replaced by name. Seeding fails (exit 2) when it cannot discover or set up a fixture. It
 ends by looking up every fixture the loop needs by ID: the organizations,
 users and API keys and, unless `--skip-sandboxes` was given, each sandbox in
 its resting state and the deleted one gone. The loop's `fixtures` step checks
@@ -105,7 +108,11 @@ the rest.
 
 - sandboxes, each by ID: it submits the delete, waits for its operation and
   for the sandbox to leave `deleting`, and counts one that is no longer
-  found as gone;
+  found as gone. One not found while its create operation is unfinished is
+  waited for first (up to ten minutes); if it still has not appeared, it stays
+  recorded and counts as a failure. An absent sandbox is never deleted: the
+  admin delete of an absent target records an operation in the caller's
+  organization;
 - users and API keys, by ID;
 - the organizations loop runs created (`<prefix>-run-…`).
 

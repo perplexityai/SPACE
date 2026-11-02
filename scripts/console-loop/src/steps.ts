@@ -313,10 +313,16 @@ step('sandbox-create', ['sandboxes', 'flows', 'lifecycle'], async (c) => {
   const managing = seeded(c).managingOrgId;
   const response = nextPost(c.page, (p) => p.endsWith('/v1/sandboxes'));
   await card.locator('button[type=submit]').click();
-  const accepted = await jsonOf(await response);
+  const answer = await response;
+  const accepted = await jsonOf(answer);
   if (typeof accepted?.sandbox_id === 'string') {
     c.shared.sandbox = sbxId(accepted.sandbox_id);
-    recordCreated(c.config, { kind: 'sandbox', id: c.shared.sandbox, name: c.runTag, orgId: managing });
+    // The answer can come before the sandbox exists; `clean` waits on the
+    // create operation for one it cannot find yet.
+    const createOperation = typeof accepted.operation_id === 'string'
+      ? { id: accepted.operation_id, admin: new URL(answer!.url()).pathname.startsWith('/admin/') }
+      : undefined;
+    recordCreated(c.config, { kind: 'sandbox', id: c.shared.sandbox, name: c.runTag, orgId: managing, createOperation });
   }
   const deadline = Date.now() + 120_000;
   while (Date.now() < deadline && !c.shared.sandbox) {

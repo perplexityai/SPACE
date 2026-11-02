@@ -16,7 +16,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-import { Api, ApiError, sleep } from './api.ts';
+import { Api, ApiError, TERMINAL_OPERATION_STATES, sleep, type Operation } from './api.ts';
 import { flag, guardTargets, loadConfig, option, type Config } from './config.ts';
 import { API_KEYS, ORGS, SANDBOXES, USERS, userEmail, verifyFixtures, type Get } from './fixtures.ts';
 import { proveSameStack, type StackIdentity } from './stack.ts';
@@ -31,6 +31,9 @@ export interface CreatedObject {
   id: string;
   // The org an API key belongs to; the org a sandbox or user was created in.
   orgId?: string;
+  // A sandbox create's operation, from its answer. The answer names the
+  // sandbox before the operation may have made it (see readRecordedSandbox).
+  createOperation?: { id: string; admin: boolean };
 }
 
 export interface SeedState {
@@ -111,6 +114,8 @@ interface Accepted { operation_id: string; sandbox_id?: string }
 // that a sandbox is absent.
 const LIST_LIMIT = 5000;
 const OPERATION_TIMEOUT_MS = 600_000;
+// How long a sandbox whose create was accepted may take to appear.
+const PENDING_CREATE_TIMEOUT_MS = 600_000;
 
 let label = 'seed';
 const log = (message: string) => console.log(`[${label}] ${message}`);
@@ -135,6 +140,42 @@ async function getSandbox(api: Api, id: string): Promise<AdminSandbox | null> {
     if (err instanceof ApiError && err.status === 404) return null;
     throw err;
   }
+}
+
+// The state of an operation, or null when the API no longer has it (it
+// deletes finished operations after a week).
+async function operationState(api: Api, op: { id: string; admin: boolean }): Promise<string | null> {
+  try {
+    const path = `/operations/${op.id}`;
+    return (op.admin ? await api.admin<Operation>('GET', path) : await api.public<Operation>('GET', path)).state;
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 404) return null;
+    throw err;
+  }
+}
+
+// A recorded sandbox, or null once it is known not to exist. A create's
+// answer names the sandbox while its operation can still be queued, before
+// the sandbox exists, so a 404 for a sandbox with a recorded create
+// operation waits for that operation to finish and reads again. A create
+// still unfinished after `timeoutMs` throws, and the record stays.
+export async function readRecordedSandbox(
+  api: Api,
+  entry: CreatedObject,
+  { pollMs = 2000, timeoutMs = PENDING_CREATE_TIMEOUT_MS }: { pollMs?: number; timeoutMs?: number } = {},
+): Promise<AdminSandbox | null> {
+  const current = await getSandbox(api, entry.id);
+  const op = entry.createOperation;
+  if (current || !op) return current;
+  const deadline = Date.now() + timeoutMs;
+  let state = await operationState(api, op);
+  if (state && !TERMINAL_OPERATION_STATES.includes(state)) log(`waiting for the create operation ${op.id} of ${entry.name} (${state})`);
+  while (state && !TERMINAL_OPERATION_STATES.includes(state)) {
+    if (Date.now() >= deadline) throw new Error(`${entry.id} does not exist yet, and its create operation ${op.id} is still ${state}; it stays recorded`);
+    await sleep(pollMs);
+    state = await operationState(api, op);
+  }
+  return getSandbox(api, entry.id);
 }
 
 // The live sandboxes of one org whose name is `name`, or a loud failure
@@ -266,12 +307,13 @@ class Seeder {
   }
 
   // A live sandbox named `name` in `org`: the recorded one, one found by
-  // name, or a new one.
+  // name, or a new one. A recorded create that has not made its sandbox yet
+  // is waited for, never replaced.
   private async create(name: string, org: string): Promise<string> {
     const orgId = this.state.orgs[org];
     const recorded = this.state.created.find((o) => o.kind === 'sandbox' && o.name === name);
     if (recorded) {
-      const current = await getSandbox(this.api, recorded.id);
+      const current = await readRecordedSandbox(this.api, recorded);
       if (current && isLive(current)) return recorded.id;
     }
     const existing = await findSandboxesByName(this.api, orgId, name);
@@ -284,10 +326,11 @@ class Seeder {
     const accepted = admin
       ? await this.api.admin<Accepted>('POST', '/sandboxes', { org_id: orgId, sandbox }, options)
       : await this.api.public<Accepted>('POST', '/sandboxes', sandbox, options);
-    if (accepted.sandbox_id) this.record({ kind: 'sandbox', id: publicId(accepted.sandbox_id), name, orgId });
+    const createOperation = { id: accepted.operation_id, admin };
+    if (accepted.sandbox_id) this.record({ kind: 'sandbox', id: publicId(accepted.sandbox_id), name, orgId, createOperation });
     const op = await this.api.waitForOperation(accepted.operation_id, { admin, timeoutMs: OPERATION_TIMEOUT_MS });
     const target = accepted.sandbox_id ?? op.target_id;
-    if (target) this.record({ kind: 'sandbox', id: publicId(target), name, orgId });
+    if (target) this.record({ kind: 'sandbox', id: publicId(target), name, orgId, createOperation });
     if (op.state !== 'succeeded' || !target) throw new Error(`create ${name}: operation ${op.state} ${op.progress_message ?? ''}`);
     log(`created sandbox ${name}`);
     return publicId(target);
@@ -360,9 +403,10 @@ export function orgDisplayName(prefix: string, title: string): string {
 }
 
 // Delete one recorded sandbox and wait until it is deleted or no longer
-// found by ID.
-async function cleanSandbox(api: Api, entry: CreatedObject): Promise<string> {
-  let current = await getSandbox(api, entry.id);
+// found by ID. An absent sandbox is never deleted: the admin delete of an
+// absent target records the operation in the caller's org.
+export async function cleanSandbox(api: Api, entry: CreatedObject, wait?: { pollMs?: number; timeoutMs?: number }): Promise<string> {
+  let current = await readRecordedSandbox(api, entry, wait);
   if (!current) return 'already gone';
   if (current.status !== 'deleted' && current.status !== 'deleting') {
     const accepted = await api.admin<{ operation_id: string }>('POST', `/sandboxes/${entry.id}:force-delete`, undefined, { idempotent: true });
@@ -391,8 +435,14 @@ async function cleanSandbox(api: Api, entry: CreatedObject): Promise<string> {
 // and each is refused while it holds a child org, a user, an API key, or a
 // sandbox that is not deleted. Its credentials, credential references,
 // master keys, template grants and other cascaded rows are not checked:
-// they go with the org (see README.md).
-async function clean(api: Api, config: Config, state: SeedState, { deleteOrgs }: { deleteOrgs: boolean }): Promise<number> {
+// they go with the org (see README.md). A sandbox whose create is still
+// pending after `wait` is a failure and stays recorded.
+export async function clean(
+  api: Api,
+  config: Config,
+  state: SeedState,
+  { deleteOrgs, wait }: { deleteOrgs: boolean; wait?: { pollMs?: number; timeoutMs?: number } },
+): Promise<number> {
   const failures: string[] = [];
   const gone = new Set<CreatedObject>();
   const recorded = (kind: CreatedKind) => state.created.filter((o) => o.kind === kind);
@@ -415,7 +465,7 @@ async function clean(api: Api, config: Config, state: SeedState, { deleteOrgs }:
     }
   };
 
-  for (const sandbox of recorded('sandbox')) await attempt(sandbox, () => cleanSandbox(api, sandbox));
+  for (const sandbox of recorded('sandbox')) await attempt(sandbox, () => cleanSandbox(api, sandbox, wait));
   for (const user of recorded('user')) await attempt(user, () => remove(`/users/${user.id}`));
   for (const key of recorded('apiKey')) await attempt(key, () => remove(`/orgs/${key.orgId}/api-keys/${key.id}`));
 

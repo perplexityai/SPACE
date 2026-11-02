@@ -6,11 +6,14 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 
+import { ApiError, type Api } from './api.ts';
 import { SECRET_PLACEHOLDER, carriesSecret, withoutSecret } from './browser.ts';
 import { loadConfig } from './config.ts';
 import { isSelected, parseSelection } from './loop.ts';
 import { normalizer, redact } from './recorder.ts';
-import { isSeededOrg, readSeedState, seedStatePath, upsertCreated, writeSeedState, type SeedState } from './seed.ts';
+import {
+  clean, cleanSandbox, isSeededOrg, readSeedState, seedStatePath, upsertCreated, writeSeedState, type CreatedObject, type SeedState,
+} from './seed.ts';
 import { sameStack } from './stack.ts';
 
 const STEPS = [
@@ -122,4 +125,82 @@ test('only the seeded org slugs are kept by default', () => {
   assert.equal(isSeededOrg('loop', 'loop-globex-research'), true);
   assert.equal(isSeededOrg('loop', 'loop-run-mvxd0bs8'), false);
   assert.equal(isSeededOrg('other', 'loop-acme'), false);
+});
+
+// An API whose sandbox and operation reads answer in turn from `sandbox` and
+// `operation` (null is a 404; the last answer repeats), and that logs every
+// call. A force-delete is accepted and its operation succeeds.
+function fakeApi(script: { sandbox: ({ status: string } | null)[]; operation: (string | null)[] }) {
+  const calls: string[] = [];
+  const next = <T>(answers: T[]): T => (answers.length > 1 ? answers.shift()! : answers[0]);
+  const surface = (name: string) => async (method: string, path: string) => {
+    calls.push(`${name} ${method} ${path}`);
+    if (method === 'GET' && path === '/orgs') return [];
+    if (method === 'POST' && path.endsWith(':force-delete')) return { operation_id: 'op-delete' };
+    const answer = method === 'GET' && path.startsWith('/sandboxes/') ? next(script.sandbox)
+      : method === 'GET' && path.startsWith('/operations/') ? next(script.operation)
+      : undefined;
+    if (answer === undefined) throw new Error(`unexpected ${method} ${path}`);
+    if (answer === null) throw new ApiError(404, method, path, '{}');
+    return typeof answer === 'string' ? { id: path.split('/').pop(), state: answer } : { id: 'sbx_1', name: 'loop-running', ...answer };
+  };
+  const api = {
+    admin: surface('admin'),
+    public: surface('public'),
+    waitForOperation: async (id: string) => ({ id, state: 'succeeded' }),
+  } as unknown as Api;
+  return { api, calls };
+}
+
+const pending: CreatedObject = { kind: 'sandbox', name: 'loop-running', id: 'sbx_1', createOperation: { id: 'op-create', admin: false } };
+
+test('clean waits for an accepted create to make its sandbox, then deletes it', async () => {
+  const { api, calls } = fakeApi({ sandbox: [null, { status: 'started' }, { status: 'deleted' }], operation: ['queued', 'running', 'succeeded'] });
+  assert.equal(await cleanSandbox(api, pending, { pollMs: 0 }), 'deleted');
+  assert.deepEqual(calls, [
+    'admin GET /sandboxes/sbx_1',
+    'public GET /operations/op-create',
+    'public GET /operations/op-create',
+    'public GET /operations/op-create',
+    'admin GET /sandboxes/sbx_1',
+    'admin POST /sandboxes/sbx_1:force-delete',
+    'admin GET /sandboxes/sbx_1',
+  ]);
+});
+
+test('a 404 is gone once the create operation is finished or gone, or when none is recorded', async () => {
+  const failed = fakeApi({ sandbox: [null], operation: ['failed'] });
+  assert.equal(await cleanSandbox(failed.api, pending, { pollMs: 0 }), 'already gone');
+  assert.equal(failed.calls.filter((call) => call.includes('/sandboxes/')).length, 2);
+  const collected = fakeApi({ sandbox: [null], operation: [null] });
+  assert.equal(await cleanSandbox(collected.api, pending, { pollMs: 0 }), 'already gone');
+  const unrecorded = fakeApi({ sandbox: [null], operation: ['queued'] });
+  const { createOperation: _op, ...withoutOperation } = pending;
+  assert.equal(await cleanSandbox(unrecorded.api, withoutOperation, { pollMs: 0 }), 'already gone');
+  assert.deepEqual(unrecorded.calls, ['admin GET /sandboxes/sbx_1']);
+});
+
+test('clean keeps a sandbox whose create is still pending at the bound, fails, and deletes nothing', async () => {
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), 'console-loop-test-'));
+  try {
+    const config = loadConfig(['--out', out]);
+    const state: SeedState = {
+      prefix: 'loop', stack: { clusterId: 'c1', clusterCreatedAt: 't1' }, managingOrgId: 'm', userPassword: 'p',
+      withSandboxes: true, orgs: {}, users: {}, apiKeys: {}, sandboxes: { running: 'sbx_1' }, created: [pending], notes: [],
+    };
+    writeSeedState(config, state);
+    const { api, calls } = fakeApi({ sandbox: [null], operation: ['queued'] });
+    const log = console.log;
+    console.log = () => {};
+    try {
+      assert.equal(await clean(api, config, state, { deleteOrgs: false, wait: { pollMs: 0, timeoutMs: 0 } }), 1);
+    } finally {
+      console.log = log;
+    }
+    assert.equal(calls.some((call) => call.includes('force-delete')), false);
+    assert.deepEqual(readSeedState(config)?.created, [pending]);
+    assert.deepEqual(readSeedState(config)?.sandboxes, { running: 'sbx_1' });
+  } finally {
+    fs.rmSync(out, { recursive: true, force: true });
+  }
 });
