@@ -144,17 +144,7 @@ function formatReasonLabel(reason: string) {
 }
 
 function triggerReasons(node: NodeView) {
-  const trigger = node.reconcile_trigger;
-  if (!trigger) {
-    return [];
-  }
-  if (trigger.reasons.length > 0) {
-    return trigger.reasons;
-  }
-  return trigger.diagnostic_reason
-    .split(',')
-    .map((reason) => reason.trim())
-    .filter(Boolean);
+  return node.reconcile_trigger?.reasons ?? [];
 }
 
 function latestIsoTimestamp(values: Array<string | null | undefined>) {
@@ -295,6 +285,7 @@ function renderReconciler(node: NodeView, nowMs: number) {
       `requested: ${new Date(trigger.requested_at).toLocaleString()}`,
       `next attempt: ${new Date(trigger.next_attempt_at).toLocaleString()}`,
       `attempts: ${trigger.attempts}`,
+      trigger.claimed_at ? `claimed: ${new Date(trigger.claimed_at).toLocaleString()}` : null,
       trigger.last_error ? `last error: ${trigger.last_error}` : null,
       trigger.dead_at ? `dead at: ${new Date(trigger.dead_at).toLocaleString()}` : null,
       trigger.dead_reason ? `dead reason: ${trigger.dead_reason}` : null,
@@ -449,7 +440,7 @@ export default function NodesPage() {
     deleted_at: admin.deleted_at,
     network_slots: admin.network_slots,
     status: admin.status,
-    reconcile_trigger: null,
+    reconcile_trigger: admin.reconcile_trigger ?? null,
   });
 
   const loadNodes = async ({

@@ -478,8 +478,9 @@ async fn release_refreshed_trigger_claims(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueuedTrigger {
     pub node_id: NodeId,
-    /// `state_reconciliation_reason` wire values, newest first. Kept as text
-    /// so a reason written by a newer build still reads.
+    /// Distinct `state_reconciliation_reason` wire values, newest first by
+    /// first request. Kept as text so a reason written by a newer build still
+    /// reads.
     pub reasons: Vec<String>,
     pub requested_at: OffsetDateTime,
     pub next_attempt_at: OffsetDateTime,
@@ -488,6 +489,8 @@ pub struct QueuedTrigger {
     pub dead_at: Option<OffsetDateTime>,
     /// `None` when no attempt has failed since the last request.
     pub last_error: Option<String>,
+    /// Why it was dead-lettered; `None` while it is retried.
+    pub dead_reason: Option<String>,
 }
 
 #[derive(Debug, FromRow)]
@@ -501,6 +504,7 @@ struct QueuedTriggerRow {
     claimed_at: Option<OffsetDateTime>,
     dead_at: Option<OffsetDateTime>,
     last_error: String,
+    dead_reason: String,
 }
 
 /// The queued triggers of `node_ids`, at most one per node. A node with
@@ -518,7 +522,8 @@ pub async fn queued_triggers(
                 attempts,
                 claimed_at,
                 dead_at,
-                last_error
+                last_error,
+                dead_reason
          FROM node_reconcile_triggers
          WHERE node_id = ANY($1)
          ORDER BY node_id"
@@ -550,6 +555,7 @@ pub async fn queued_triggers(
                 claimed_at: row.claimed_at,
                 dead_at: row.dead_at,
                 last_error: (!row.last_error.is_empty()).then_some(row.last_error),
+                dead_reason: (!row.dead_reason.is_empty()).then_some(row.dead_reason),
             }
         })
         .collect())

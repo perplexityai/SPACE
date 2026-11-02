@@ -489,5 +489,33 @@ async fn queued_triggers_reports_each_node_until_its_trigger_drains() -> TestRes
     let claim = claim_triggers(&db.pool, 10).await?;
     complete_claim(&db.pool, &claim.claim_token, &[queued_node], &[]).await?;
     assert!(queued_triggers(&db.pool, &nodes).await?.is_empty());
+
+    // Dead-lettered at once, as for a node whose Kubernetes Node is gone.
+    enqueue_triggers(&db.pool, [queued_node], ReconcileReason::NodeUpdated).await?;
+    let claim = claim_triggers(&db.pool, 10).await?;
+    dead_letter_claim(
+        &db.pool,
+        &claim.claim_token,
+        &[(queued_node, "node is gone".to_string())],
+    )
+    .await?;
+    let [dead] = queued_triggers(&db.pool, &nodes).await?.try_into().unwrap();
+    assert_eq!(
+        (
+            dead.attempts,
+            dead.claimed_at,
+            dead.dead_at.is_some(),
+            dead.dead_reason.as_deref(),
+            dead.last_error.as_deref(),
+        ),
+        (
+            TRIGGER_MAX_ATTEMPTS,
+            None,
+            true,
+            Some("node is gone"),
+            Some("node is gone")
+        )
+    );
+    assert_eq!(queued.dead_reason, None);
     Ok(())
 }

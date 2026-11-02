@@ -52,6 +52,7 @@ fn admin_reconcile_trigger(trigger: QueuedTrigger) -> AdminNodeReconcileTrigger 
         attempts: trigger.attempts,
         claimed_at: format_optional_time(trigger.claimed_at),
         dead_at: format_optional_time(trigger.dead_at),
+        dead_reason: trigger.dead_reason,
         last_error: trigger.last_error,
     }
 }

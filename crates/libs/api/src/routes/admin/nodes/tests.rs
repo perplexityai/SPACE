@@ -2432,44 +2432,51 @@ async fn node_reads_report_cordon_group_trigger_and_runtimes() -> TestResult {
                 )?)
             }
         };
-        let listed = read("/admin/api/v1/nodes?include_occupancy=false".to_string()).await?;
+        // Each node reads the same from the list and the detail route, with
+        // and without occupancy.
         for suffix in ["", "?include_occupancy=false"] {
+            let listed = read(format!("/admin/api/v1/nodes{suffix}")).await?;
             for (node_id, cordoned) in [(busy, busy_cordoned), (idle, idle_cordoned)] {
-                let node = read(format!("/admin/api/v1/nodes/{node_id}{suffix}")).await?;
                 let from_list = listed
                     .as_array()
                     .unwrap()
                     .iter()
                     .find(|row| row["id"] == node_id.to_string())
-                    .expect("listed node");
-                for row in [&node, from_list] {
-                    assert_eq!(row.get("cordoned").and_then(|v| v.as_bool()), cordoned);
+                    .expect("listed node")
+                    .clone();
+                let detail = read(format!("/admin/api/v1/nodes/{node_id}{suffix}")).await?;
+                for row in [from_list, detail] {
+                    assert_eq!(
+                        row.get("cordoned").and_then(|v| v.as_bool()),
+                        cordoned,
+                        "{suffix}"
+                    );
+                    let node: AdminNodeResponse = serde_json::from_value(row)?;
+                    if node_id == idle {
+                        assert_eq!(node.node_group_id, None);
+                        assert_eq!(node.reconcile_trigger, None);
+                        assert_eq!(node.runtime_installations, Some(Vec::new()));
+                        continue;
+                    }
+                    assert_eq!(node.node_group_id.map(|id| id.as_uuid()), Some(group_id));
+                    let trigger = node.reconcile_trigger.expect("queued trigger");
+                    assert_eq!(trigger.reasons, vec!["manual_node_reconcile"]);
+                    assert_eq!((trigger.attempts, trigger.claimed_at), (0, None));
+                    let installations = node.runtime_installations.expect("installations");
+                    assert_eq!(
+                        installations
+                            .iter()
+                            .map(|i| (i.runtime_version.as_str(), i.guests.clone()))
+                            .collect::<Vec<_>>(),
+                        vec![
+                            (
+                                "1.15.1",
+                                vec!["linux/aarch64".to_string(), "linux/x86_64".to_string()]
+                            ),
+                            ("1.16.0", Vec::new()),
+                        ]
+                    );
                 }
-                let node: AdminNodeResponse = serde_json::from_value(node)?;
-                if node_id == idle {
-                    assert_eq!(node.node_group_id, None);
-                    assert_eq!(node.reconcile_trigger, None);
-                    assert_eq!(node.runtime_installations, Some(Vec::new()));
-                    continue;
-                }
-                assert_eq!(node.node_group_id.map(|id| id.as_uuid()), Some(group_id));
-                let trigger = node.reconcile_trigger.expect("queued trigger");
-                assert_eq!(trigger.reasons, vec!["manual_node_reconcile"]);
-                assert_eq!((trigger.attempts, trigger.claimed_at), (0, None));
-                let installations = node.runtime_installations.expect("installations");
-                assert_eq!(
-                    installations
-                        .iter()
-                        .map(|i| (i.runtime_version.as_str(), i.guests.clone()))
-                        .collect::<Vec<_>>(),
-                    vec![
-                        (
-                            "1.15.1",
-                            vec!["linux/aarch64".to_string(), "linux/x86_64".to_string()]
-                        ),
-                        ("1.16.0", Vec::new()),
-                    ]
-                );
             }
         }
     }

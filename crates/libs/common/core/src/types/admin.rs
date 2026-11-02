@@ -120,13 +120,10 @@ pub struct AdminNodeResponse {
     /// publication, but worker/builder rows should normally carry it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<AdminNodeStatusSnapshot>,
-    /// Whether new placements are blocked on the node, read from the
-    /// Kubernetes Node's `spec.unschedulable` in this API server's Node
-    /// reflector cache. SPACE keeps no cordon state of its own: `:cordon` and
-    /// `:drain` patch that field, and so can anything else with access to the
-    /// Node. Set only on `GET /nodes` and `GET /nodes/{id}`. Absent there on
-    /// the Direct substrate, which has no cordon, before the cache's first
-    /// list, and for a node with no Kubernetes Node.
+    /// The Kubernetes Node's `spec.unschedulable`, from this API server's
+    /// Node reflector cache. Set only on `GET /nodes` and `GET /nodes/{id}`.
+    /// Absent there on the Direct substrate, before the cache's first list,
+    /// and for a node the cache does not hold.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cordoned: Option<bool>,
     /// The node group the cluster controller mirrored from the Node's
@@ -134,9 +131,9 @@ pub struct AdminNodeResponse {
     /// belongs to the default group (`is_default` in `GET /node-groups`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_group_id: Option<crate::types::NodeGroupId>,
-    /// The state-reconciliation trigger queued for this node and not yet
-    /// drained by the cluster controller. Set only on `GET /nodes` and
-    /// `GET /nodes/{id}`, where absence means no trigger is queued.
+    /// Present on `GET /nodes` and `GET /nodes/{id}` when the node has a
+    /// queued state-reconciliation trigger; per-facet work in
+    /// `node_reconcile_queue` is not shown. Action responses never carry it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reconcile_trigger: Option<AdminNodeReconcileTrigger>,
     /// Runtime installations the node last reported in its execution
@@ -156,23 +153,31 @@ pub struct AdminNodeResponse {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AdminNodeReconcileTrigger {
-    /// Why the trigger was requested, newest first, as the
+    /// Distinct reasons, newest first by first request, as the
     /// `state_reconciliation_reason` wire values (`manual_node_reconcile`,
     /// `node_registered`, ...).
     pub reasons: Vec<String>,
     /// When the trigger was last requested while unclaimed. A request that
     /// arrives while the controller holds the claim keeps the earlier time.
     pub requested_at: String,
-    /// Earliest time the controller will claim it; later than `requested_at`
-    /// while it backs off after a failed attempt.
+    /// Earliest time the controller will claim it, unless `dead_at` is set;
+    /// later than `requested_at` while it backs off after a failed attempt.
     pub next_attempt_at: String,
-    /// Failed drain attempts since it was last requested.
+    /// Failed drain attempts since the trigger was last requested while
+    /// unclaimed. Set to the retry limit when the trigger is dead-lettered at
+    /// once, as for a node whose Kubernetes Node is gone.
     pub attempts: i32,
-    /// When the controller claimed it, while a claim is held.
+    /// When the controller's current claim on it began. Cleared when that
+    /// attempt ends without draining it (a failure, a dead letter, or a new
+    /// request during the claim); a claim older than a minute counts as
+    /// abandoned and the next claim replaces it.
     pub claimed_at: Option<String>,
-    /// When it stopped being retried after too many failures. A new request
-    /// re-arms it.
+    /// When the controller stopped retrying it: at the retry limit, or at
+    /// once when the node's Kubernetes Node is gone. A dead trigger is never
+    /// claimed, and a new request re-arms it.
     pub dead_at: Option<String>,
+    /// Why it was dead-lettered, when `dead_at` is set.
+    pub dead_reason: Option<String>,
     /// The last failed attempt's error.
     pub last_error: Option<String>,
 }

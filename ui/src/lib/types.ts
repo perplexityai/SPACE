@@ -479,17 +479,22 @@ export interface AdminNodeResponse {
     max_slots: number | null;
   };
   status: NodeStatusSnapshot | null;
+  /** Present when the node has a queued state-reconciliation trigger. */
+  reconcile_trigger?: NodeReconcileTrigger;
 }
 
+/// A node's queued state-reconciliation trigger, as GET /admin/api/v1/nodes
+/// reports it (`AdminNodeReconcileTrigger`).
 export interface NodeReconcileTrigger {
+  /** Distinct reasons, newest first by first request. */
   reasons: string[];
-  diagnostic_reason: string;
   requested_at: string;
   next_attempt_at: string;
   attempts: number;
-  last_error: string;
+  claimed_at: string | null;
   dead_at: string | null;
-  dead_reason: string;
+  dead_reason: string | null;
+  last_error: string | null;
 }
 
 export interface NodeTemplateBuild {
