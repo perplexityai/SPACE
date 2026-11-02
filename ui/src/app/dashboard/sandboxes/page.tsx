@@ -5,7 +5,7 @@ import Link from 'next/link';
 import styles from './inventory.module.css';
 import { lookupScopeText, orgOptionLabels, parseOrgParam, scopedRefreshKey } from '@/lib/org-filter';
 import { usePathname, useSearchParams } from 'next/navigation';
-import { SANDBOX_STATUS_FILTER_STATES, bringUpAction } from '@/lib/sandbox-lifecycle';
+import { bringUpAction, statusFilterKey, statusFilterOptions } from '@/lib/sandbox-lifecycle';
 import {
   DEFAULT_LIST_LIMIT,
   LIST_LIMIT_OPTIONS,
@@ -127,8 +127,6 @@ const AGE_WINDOW_OPTIONS: { value: AgeWindow; label: string; ms: number | null }
   { value: '1y',  label: 'Last year',   ms: 365 * 24 * 60 * 60 * 1000 },
   { value: 'all', label: 'All time',    ms: null },
 ];
-
-const STATUS_FILTER_OPTIONS = SANDBOX_STATUS_FILTER_STATES;
 
 function formatRelativeTime(value: string | null | undefined, nowMs: number) {
   if (!value) return '—';
@@ -1067,7 +1065,7 @@ function SandboxesPage() {
         return false;
       }
 
-      if (statusFilter.length > 0 && !statusFilter.includes(s.status || '')) {
+      if (statusFilter.length > 0 && !statusFilter.includes(statusFilterKey(s.status))) {
         return false;
       }
 
@@ -1156,6 +1154,11 @@ function SandboxesPage() {
     }
     return Array.from(set).sort().map((name) => ({ value: name, label: name }));
   }, [sandboxes, templates]);
+
+  const statusFilterOptionList = useMemo(
+    () => statusFilterOptions(sandboxes.map((s) => s.status)).map((status) => ({ value: status, label: status })),
+    [sandboxes],
+  );
 
   const clearFilters = () => {
     setIdFilter('');
@@ -1425,7 +1428,7 @@ function SandboxesPage() {
             placeholder="Status"
             value={statusFilter}
             onChange={(value) => setStatusFilter(value as string[])}
-            options={STATUS_FILTER_OPTIONS.map((s) => ({ value: s, label: s }))}
+            options={statusFilterOptionList}
             allowClear
             style={{ minWidth: 180 }}
             maxTagCount="responsive"

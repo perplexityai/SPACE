@@ -10,7 +10,7 @@ export const SANDBOX_LIFECYCLE_STATES = [
 
 // What the list's status filter offers. The list shows a node's reported
 // state when a node reports one (`sandbox_to_cached_response` in
-// crates/libs/api/src/controllers/sandbox/responses.rs), so it adds the two
+// crates/libs/api/src/controllers/sandbox/responses.rs), so it adds the
 // node-only states (`SandboxLifecycleState` in
 // crates/libs/sbx/mgr/protocol/src/lifecycle.rs), and `deleted`. A delete
 // through the API removes the row (crates/libs/sandbox/teardown); a `deleted`
@@ -18,9 +18,27 @@ export const SANDBOX_LIFECYCLE_STATES = [
 // (crates/libs/internal/api/server/src/status.rs), kept for a retention
 // period, and the admin list, which does not filter by lifecycle, returns it.
 export const SANDBOX_STATUS_FILTER_STATES = [
-  ...SANDBOX_LIFECYCLE_STATES, 'cleanup_required', 'cleanup_failed', 'deleted',
+  ...SANDBOX_LIFECYCLE_STATES, 'unspecified', 'cleanup_required', 'cleanup_failed', 'deleted',
 ] as const;
 
+// A row without a status shows, and filters, as `unknown`.
+export const NO_STATUS = 'unknown';
+
+export function statusFilterKey(status: string | null | undefined): string {
+  return status || NO_STATUS;
+}
+
+// The status filter's options: the known states, then any other status the
+// loaded rows carry, so no row is reachable only with the filter cleared.
+export function statusFilterOptions(statuses: Iterable<string | null | undefined>): string[] {
+  const known = new Set<string>(SANDBOX_STATUS_FILTER_STATES);
+  const extra = new Set<string>();
+  for (const status of statuses) {
+    const key = statusFilterKey(status);
+    if (!known.has(key)) extra.add(key);
+  }
+  return [...SANDBOX_STATUS_FILTER_STATES, ...[...extra].sort()];
+}
 
 // The action that brings a sandbox back up, named for what it does: a
 // stopped sandbox starts, a paused one resumes in memory, a suspended one
