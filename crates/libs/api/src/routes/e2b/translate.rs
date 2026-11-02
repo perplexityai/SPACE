@@ -251,7 +251,7 @@ impl ParsedE2bNetworkConfig {
     }
 }
 
-fn parse_e2b_network_config(
+pub(super) fn parse_e2b_network_config(
     network: Option<&Value>,
 ) -> Result<ParsedE2bNetworkConfig, E2bApiError> {
     let Some(network) = network else {
@@ -364,7 +364,7 @@ fn ecw_egress_default(
     })
 }
 
-fn resolve_e2b_network_policy(
+pub(super) fn resolve_e2b_network_policy(
     allow_internet_access: Option<bool>,
     parsed: ParsedE2bNetworkConfig,
 ) -> Result<Option<NetworkPolicyV1>, E2bApiError> {

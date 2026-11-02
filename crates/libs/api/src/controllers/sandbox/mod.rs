@@ -1298,9 +1298,11 @@ pub(crate) mod spaced;
 pub(crate) use ingress::ingress_activation;
 mod wake_completion;
 pub use spaced::SpacedListOptions;
+mod network_policy;
 #[cfg(test)]
 mod tests;
 mod updates;
+pub use network_policy::{NetworkPolicyObservation, PolicyEnforcementState};
 
 use responses::*;
 

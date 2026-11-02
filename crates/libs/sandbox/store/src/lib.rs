@@ -105,6 +105,7 @@ pub mod delete;
 pub mod fork_source_lifecycle;
 pub mod ingest;
 pub mod lost;
+pub mod network_policy;
 pub mod repair;
 pub mod sweeper;
 

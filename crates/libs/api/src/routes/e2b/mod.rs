@@ -39,6 +39,7 @@ mod constants;
 mod fork;
 mod hosts;
 mod lifecycle;
+mod network_policy;
 mod router;
 mod template_build;
 mod translate;
