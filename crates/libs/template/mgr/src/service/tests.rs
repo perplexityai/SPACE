@@ -2451,3 +2451,43 @@ async fn firmware_template_refuses_pool_and_snapshot_intent_before_persisting() 
     assert_eq!(retained.snapshot_vcpu, original.snapshot_vcpu);
     assert_eq!(retained.snapshot_memory_mib, original.snapshot_memory_mib);
 }
+
+#[tokio::test]
+async fn legacy_guest_policy_does_not_require_a_retired_execution_environment() {
+    let root = tempfile::tempdir().unwrap();
+    let conn = crate::db::test_conn();
+    let mut manifest = pplx_space_common_core::types::TemplateManifest::default();
+    manifest.set_execution_metadata(
+        serde_json::from_value(serde_json::json!({
+            "environment": format!("sha256:{}", "a".repeat(64)),
+            "runtime": {"kind": "firecracker", "version": "1.12.0"},
+            "guest": {"os": "linux", "architecture": "x86_64"},
+            "components": [{"kind":"kernel", "role":"boot", "version":"test-1",
+                "digest": format!("sha256:{}", "b".repeat(64)), "format":"vmlinux"}]
+        }))
+        .unwrap(),
+    );
+    let hash = format!("blake3:{}", "c".repeat(64));
+    crate::db::upsert_build(
+        &conn,
+        &crate::db::BuildUpsert {
+            name: "retired-linux",
+            content_hash: &hash,
+            build_date: "2026-01-01T00:00:00Z",
+            manifest_json: &serde_json::to_string(&manifest).unwrap(),
+            runtime: "fc",
+            arch: "x86_64",
+            artifact_size_bytes: 0,
+            state: "ready",
+        },
+    )
+    .unwrap();
+    let service = TemplateManagerService::new_with_template_root(conn, root.path()).unwrap();
+    assert!(
+        service
+            .template_guest_profile("retired-linux")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}

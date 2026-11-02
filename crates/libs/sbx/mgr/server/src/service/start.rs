@@ -2043,7 +2043,11 @@ impl SandboxManagerService {
 
         self.admit_guest_image(sandbox.guest_image, sandbox.execution_metadata.as_ref())
             .await?;
-        super::guest_image::validate_policy(sandbox.guest_image, &sandbox.auto_lifecycle)?;
+        super::guest_image::validate_policy(
+            sandbox.guest_image,
+            sandbox.execution_metadata.as_ref(),
+            &sandbox.auto_lifecycle,
+        )?;
 
         if let Some(response) = self
             .try_start_from_warm_snapshot(&mut start_ctx, &sandbox)

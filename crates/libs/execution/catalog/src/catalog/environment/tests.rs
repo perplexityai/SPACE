@@ -139,6 +139,40 @@ fn firmware_environment_has_no_kernel_and_is_not_a_default_or_snapshot_loader() 
     assert!(entry.kernel().is_none());
     assert!(!entry.supports_memory_state());
     assert_eq!(execution.guest().os, GuestOperatingSystem::Windows);
+    assert_eq!(
+        entry.guest_agent_protocol(),
+        crate::guest::QualifiedGuestAgent::Absent
+    );
+    use pplx_space_common_core::types::guest_image::{
+        GuestAgent, GuestDiskLayout, GuestImageContract, GuestNetwork, GuestReadiness,
+    };
+    let image = GuestImageContract::new(
+        GuestDiskLayout::OpaqueRawDisk,
+        GuestReadiness::TcpService {
+            port: std::num::NonZeroU16::new(3389).unwrap(),
+        },
+        GuestNetwork::SlotDhcpV1,
+        GuestAgent::Absent,
+    )
+    .unwrap();
+    let profile = crate::guest::GuestProfile::resolve(&execution, image).unwrap();
+    assert!(!profile.supports_memory_lifecycle());
+    assert!(!profile.supports_process_environment());
+    let agent_image = GuestImageContract::new(
+        image.disk(),
+        GuestReadiness::Agent,
+        image.network(),
+        GuestAgent::Spaced,
+    )
+    .unwrap();
+    assert!(
+        crate::guest::GuestProfile::resolve(&execution, agent_image).is_err(),
+        "installing an agent cannot qualify an existing image contract"
+    );
+    let legacy =
+        crate::guest::GuestProfile::resolve_optional(None, GuestImageContract::default()).unwrap();
+    assert!(legacy.supports_memory_lifecycle());
+    assert!(legacy.supports_process_environment());
     assert!(execution.state_format().is_none());
     assert_eq!(execution.components().len(), 1);
     assert_eq!(

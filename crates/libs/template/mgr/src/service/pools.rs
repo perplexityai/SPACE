@@ -10,7 +10,11 @@ impl TemplateManagerService {
         let req = request.get_ref();
         validate_template_name(&req.template)?;
 
-        if self.template_guest_image(&req.template).await?.is_some() {
+        if self
+            .template_guest_profile(&req.template)
+            .await?
+            .is_some_and(|profile| !profile.supports_memory_lifecycle())
+        {
             return Err(Status::failed_precondition(
                 "firmware guests do not support warm pools",
             ));

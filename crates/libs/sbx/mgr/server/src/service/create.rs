@@ -328,15 +328,24 @@ impl SandboxManagerService {
 
         let template_hash = template_create_hash(template_dir, content_hash_resolved)?;
         self.admit_guest_image(guest_image, execution).await?;
-        super::guest_image::validate_policy(guest_image, auto_lifecycle)?;
-        if !guest_image.expects_agent()
+        super::guest_image::validate_policy(guest_image, execution, auto_lifecycle)?;
+        let guest_profile = pplx_space_execution_catalog::guest::GuestProfile::resolve_optional(
+            execution,
+            guest_image,
+        )
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        if !guest_profile.supports_memory_lifecycle()
             && (req.snapshots_enabled
                 || req.pool_template.is_some()
-                || effective_mode != BootMode::Cold
-                || !req.env.is_empty())
+                || effective_mode != BootMode::Cold)
         {
             return Err(Status::failed_precondition(
-                "firmware guests require cold boot without snapshots, pools or guest-agent configuration",
+                "guest profile requires cold boot without snapshots or pools",
+            ));
+        }
+        if !guest_profile.supports_process_environment() && !req.env.is_empty() {
+            return Err(Status::failed_precondition(
+                "guest profile does not support process environment configuration",
             ));
         }
 

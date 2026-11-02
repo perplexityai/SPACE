@@ -7067,6 +7067,7 @@ dependencies = [
  "pplx-space-credmgr",
  "pplx-space-credmgr-client",
  "pplx-space-events",
+ "pplx-space-execution-catalog",
  "pplx-space-execution-common",
  "pplx-space-feature-flags",
  "pplx-space-metrics",

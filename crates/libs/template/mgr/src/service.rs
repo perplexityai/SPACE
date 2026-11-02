@@ -2525,11 +2525,10 @@ pub(crate) fn validate_guest_documents(
 
 impl TemplateManagerService {
     /// Settings can precede a build; once present, use the persisted manifest.
-    async fn template_guest_image(
+    async fn template_guest_profile(
         &self,
         template: &str,
-    ) -> Result<Option<pplx_space_common_core::types::guest_image::GuestImageContract>, Status>
-    {
+    ) -> Result<Option<pplx_space_execution_catalog::guest::GuestProfile>, Status> {
         let db = Arc::clone(&self.db);
         let template = template.to_owned();
         tokio::task::spawn_blocking(move || {
@@ -2548,10 +2547,21 @@ impl TemplateManagerService {
                 serde_json::from_str(&build.manifest_json).map_err(|error| {
                     Status::failed_precondition(format!("invalid template manifest: {error}"))
                 })?;
-            manifest
+            // This lookup gates guest lifecycle semantics, not VMM admission.
+            // Historical Linux templates can outlive their compiled environment;
+            // exact execution qualification still occurs at launch/restore.
+            if manifest.guest_image.unwrap_or_default().legacy_transport() {
+                return Ok(None);
+            }
+            let execution = manifest
                 .execution_metadata()
                 .map_err(|error| Status::failed_precondition(error.to_string()))?;
-            Ok(manifest.guest_image)
+            let profile = pplx_space_execution_catalog::guest::GuestProfile::resolve_optional(
+                execution,
+                manifest.guest_image.unwrap_or_default(),
+            )
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            Ok(Some(profile))
         })
         .await
         .map_err(|error| Status::internal(format!("template manifest lookup: {error}")))?
