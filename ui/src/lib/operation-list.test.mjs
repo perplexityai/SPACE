@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { mergeNewest, newerFirst } from './operation-list.ts';
+import { mergeNewest, newerFirst, sandboxTargetForms } from './operation-list.ts';
 
 const op = (id, created_at) => ({ id, created_at });
 
@@ -35,4 +35,20 @@ test('merged pages hold each operation once, newest first, up to the limit', () 
     [op('x', '2026-01-02T03:04:00.2Z'), op('z', '2026-01-02T03:04:00.15Z')],
   ], 2);
   assert.deepEqual(merged.map((row) => row.id), ['x', 'z']);
+});
+
+test('a sandbox ID or UUID in any accepted form names both recorded forms', () => {
+  const uuid = '0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b';
+  const both = [`sbx_${uuid}`, uuid];
+  assert.deepEqual(sandboxTargetForms(`sbx_${uuid}`), both);
+  assert.deepEqual(sandboxTargetForms(uuid), both);
+  assert.deepEqual(sandboxTargetForms(uuid.toUpperCase()), both);
+  assert.deepEqual(sandboxTargetForms(uuid.replaceAll('-', '')), both);
+  assert.deepEqual(sandboxTargetForms(` SBX_${uuid.toUpperCase()} `), both);
+});
+
+test('a target that is not a sandbox UUID is searched as typed', () => {
+  assert.equal(sandboxTargetForms('tpl_seed'), null);
+  assert.equal(sandboxTargetForms('0190a1b2'), null);
+  assert.equal(sandboxTargetForms('sbx_0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5'), null);
 });

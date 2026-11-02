@@ -29,3 +29,17 @@ export function mergeNewest<T extends OperationRow>(pages: T[][], limit: number)
   for (const op of pages.flat()) byId.set(op.id, op);
   return [...byId.values()].sort(newerFirst).slice(0, limit);
 }
+
+const SANDBOX_UUID = /^(?:sbx_)?([0-9a-f]{8})-?([0-9a-f]{4})-?([0-9a-f]{4})-?([0-9a-f]{4})-?([0-9a-f]{12})$/i;
+
+// The target IDs one sandbox's operations are recorded under, for a typed
+// `sbx_` ID or a bare UUID, dashed or not, in either case. Target IDs match
+// exactly: every operation records a sandbox as `sbx_<uuid>` except a fork,
+// which records its source by the bare lower-case UUID. Null for anything
+// else, which is searched as typed.
+export function sandboxTargetForms(typed: string): [string, string] | null {
+  const parts = SANDBOX_UUID.exec(typed.trim());
+  if (!parts) return null;
+  const uuid = parts.slice(1).join('-').toLowerCase();
+  return [`sbx_${uuid}`, uuid];
+}

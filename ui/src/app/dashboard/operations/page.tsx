@@ -7,7 +7,7 @@ import { InfoCircleOutlined, ReloadOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 
 import { adminApi } from '@/lib/api';
-import { mergeNewest } from '@/lib/operation-list';
+import { mergeNewest, sandboxTargetForms } from '@/lib/operation-list';
 import { publicSandboxIdFromAny } from '@/lib/sandbox-id';
 import { tablePagination } from '@/lib/table-pagination';
 import type { Organization, PublicOperationRecord, User } from '@/lib/types';
@@ -25,7 +25,6 @@ interface AdminOperation extends PublicOperationRecord {
 }
 
 const ACTOR_LOOKUPS = 6;
-const SBX_TARGET = /^sbx_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
 
 const STATES = ['queued', 'running', 'succeeded', 'failed', 'canceled', 'expired'];
 const STATE_COLORS: Record<string, string> = {
@@ -37,7 +36,7 @@ function targetLink(op: AdminOperation) {
   if (op.target_type === 'sandbox') {
     const link = <Link href={`/dashboard/sandboxes/${publicSandboxIdFromAny(op.target_id)}`}><code>{op.target_id}</code></Link>;
     // A fork records its source sandbox by the bare UUID, not the sbx_ ID;
-    // filtering by the sbx_ ID also searches the bare UUID.
+    // filtering by either form searches both.
     return op.target_id.startsWith('sbx_') ? link : (
       <Tooltip title={`A fork lists its source sandbox by the bare UUID. Filter by ${publicSandboxIdFromAny(op.target_id)} to find the sandbox's operations and its forks.`}>{link}</Tooltip>
     );
@@ -114,14 +113,12 @@ export default function OperationsPage() {
       if (target) params.set('target_id', target);
       return adminApi.get<AdminOperation[]>(`/v1/operations?${params}`);
     };
-    // A fork records its source sandbox by the bare UUID, so an `sbx_` target
-    // also reads that form, and the two answers are merged.
-    // Target IDs match exactly, and forks record the lower-case UUID.
+    // A fork records its source sandbox by the bare UUID, so a sandbox ID or
+    // UUID reads both forms, and the two answers are merged.
     const typed = targetId.trim() || null;
-    const bare = typed ? SBX_TARGET.exec(typed)?.[1]?.toLowerCase() ?? null : null;
-    const target = bare ? `sbx_${bare}` : typed;
+    const forms = typed ? sandboxTargetForms(typed) : null;
     setLoading(true);
-    (bare ? Promise.all([query(target), query(bare)]).then(([a, b]) => mergeNewest([a, b], limit)) : query(target))
+    (forms ? Promise.all(forms.map(query)).then((pages) => mergeNewest(pages, limit)) : query(typed))
       .then((rows) => {
         if (current !== request.current) return;
         setOperations(rows);
@@ -238,9 +235,9 @@ export default function OperationsPage() {
         <Input
           allowClear
           placeholder="Target ID, e.g. sbx_… (Enter to apply)"
-          title="Forks are listed under their source sandbox's bare UUID; an sbx_ ID also finds them."
+          title="Forks are listed under their source sandbox's bare UUID; an sbx_ ID or a UUID finds both."
           suffix={
-            <Tooltip title="Forks are listed under their source sandbox's bare UUID. An sbx_ ID here also searches that UUID, so its forks are included.">
+            <Tooltip title="Forks are listed under their source sandbox's bare UUID. An sbx_ ID or a bare UUID, dashed or not, in either case, searches both forms, so the sandbox's own operations and its forks are included.">
               <InfoCircleOutlined style={{ color: 'rgba(0,0,0,0.45)' }} />
             </Tooltip>
           }
