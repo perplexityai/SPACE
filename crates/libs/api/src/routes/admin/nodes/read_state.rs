@@ -18,30 +18,64 @@ use crate::routes::AppState;
 /// cordon from the substrate's Node cache, and the queued reconcile trigger
 /// and runtime installations from Postgres, each looked up for the whole page
 /// at once. Action responses skip it.
+///
+/// A failed Postgres read does not fail the route, which before these fields
+/// depended only on the nodes query. Neither field is then set, and every
+/// node carries the error as `read_state_error`, so a client can tell
+/// "could not read" from "nothing queued".
 pub(super) async fn attach_node_read_state(
     state: &AppState,
     store: &AdminNodeStore,
     responses: &mut [AdminNodeResponse],
-) -> Result<(), sqlx::Error> {
+) {
     let node_ids: Vec<NodeId> = responses.iter().map(|node| node.id).collect();
-    let mut triggers: HashMap<NodeId, AdminNodeReconcileTrigger> =
-        crate::reconcile_trigger::queued_triggers(&state.pool, &node_ids)
-            .await?
-            .into_iter()
-            .map(|trigger| (trigger.node_id, admin_reconcile_trigger(trigger)))
-            .collect();
-    let mut installations =
-        runtime_installations_by_node(store.runtime_installations_for_nodes(&node_ids).await?);
     let cordon_states = state.sandbox_controller.node_cordon_states();
-    for node in responses {
-        node.reconcile_trigger = triggers.remove(&node.id);
-        node.runtime_installations = Some(installations.remove(&node.id).unwrap_or_default());
+    for node in responses.iter_mut() {
         node.cordoned = cordon_states
             .as_ref()
             .zip(node.k8s_node_name.as_deref())
             .and_then(|(states, name)| states.get(name).copied());
     }
-    Ok(())
+    match read_page_state(state, store, &node_ids).await {
+        Ok((mut triggers, mut installations)) => {
+            for node in responses {
+                node.reconcile_trigger = triggers.remove(&node.id);
+                node.runtime_installations =
+                    Some(installations.remove(&node.id).unwrap_or_default());
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                nodes = node_ids.len(),
+                "failed to read node reconcile triggers or runtime installations",
+            );
+            let error = error.to_string();
+            for node in responses {
+                node.read_state_error = Some(error.clone());
+            }
+        }
+    }
+}
+
+type PageState = (
+    HashMap<NodeId, AdminNodeReconcileTrigger>,
+    HashMap<NodeId, Vec<AdminNodeRuntimeInstallation>>,
+);
+
+async fn read_page_state(
+    state: &AppState,
+    store: &AdminNodeStore,
+    node_ids: &[NodeId],
+) -> Result<PageState, sqlx::Error> {
+    let triggers = crate::reconcile_trigger::queued_triggers(&state.pool, node_ids)
+        .await?
+        .into_iter()
+        .map(|trigger| (trigger.node_id, admin_reconcile_trigger(trigger)))
+        .collect();
+    let installations =
+        runtime_installations_by_node(store.runtime_installations_for_nodes(node_ids).await?);
+    Ok((triggers, installations))
 }
 
 fn admin_reconcile_trigger(trigger: QueuedTrigger) -> AdminNodeReconcileTrigger {

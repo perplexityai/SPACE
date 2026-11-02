@@ -2482,3 +2482,93 @@ async fn node_reads_report_cordon_group_trigger_and_runtimes() -> TestResult {
     }
     Ok(())
 }
+
+/// A failed trigger or installation read leaves the node routes up. Each node
+/// still lists, without either field and with a `read_state_error`, so a
+/// client can tell "could not read" from "nothing queued".
+#[tokio::test]
+async fn node_reads_survive_a_failed_read_state_read() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(
+            db.pool
+                .connect_options()
+                .as_ref()
+                .clone()
+                .options([("lock_timeout", "100ms")]),
+        )
+        .await?;
+    let state = AppState::from_pool(pool).await?;
+    let actor =
+        inventory_test_actor(crate::routes::authz::cluster_managing_org_id(&db.pool).await?);
+    let node_id = insert_drain_test_node(&db.pool, NodeManagedBy::Space, None).await?;
+    crate::reconcile_trigger::enqueue_triggers(
+        &db.pool,
+        [node_id],
+        pplx_space_common_svc::types::ReconcileReason::ManualNodeReconcile,
+    )
+    .await?;
+    let read_node = |response: axum::response::Response| async move {
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 100_000).await?;
+        let nodes = match serde_json::from_slice::<Vec<AdminNodeResponse>>(&body) {
+            Ok(nodes) => nodes,
+            Err(_) => vec![serde_json::from_slice::<AdminNodeResponse>(&body)?],
+        };
+        TestResult::Ok(
+            nodes
+                .into_iter()
+                .find(|node| node.id == node_id)
+                .expect("node listed"),
+        )
+    };
+    let reads = || async {
+        let mut nodes = Vec::new();
+        for include_occupancy in [Some(false), None] {
+            let response = list_admin_nodes(
+                State(state.clone()),
+                Extension(AuthUser(actor.clone())),
+                Query(ListAdminNodesFilters {
+                    include_occupancy,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .into_response();
+            nodes.push(read_node(response).await?);
+        }
+        let response = get_admin_node(
+            Query(GetAdminNodeFilters::default()),
+            State(state.clone()),
+            Extension(AuthUser(actor.clone())),
+            Path(node_id.to_string()),
+        )
+        .await;
+        nodes.push(read_node(response).await?);
+        TestResult::Ok(nodes)
+    };
+
+    let mut lock = db.pool.begin().await?;
+    sqlx::query(sql!(
+        "LOCK TABLE node_reconcile_triggers IN ACCESS EXCLUSIVE MODE"
+    ))
+    .execute(&mut *lock)
+    .await?;
+    for node in reads().await? {
+        assert_eq!(node.reconcile_trigger, None);
+        assert_eq!(node.runtime_installations, None);
+        let error = node.read_state_error.expect("read_state_error");
+        assert!(error.contains("lock timeout"), "{error}");
+    }
+    lock.rollback().await?;
+
+    for node in reads().await? {
+        assert_eq!(node.read_state_error, None);
+        assert!(node.reconcile_trigger.is_some());
+        assert_eq!(node.runtime_installations, Some(Vec::new()));
+    }
+    Ok(())
+}

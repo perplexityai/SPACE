@@ -535,6 +535,7 @@ fn admin_node_response(
         cordoned: None,
         reconcile_trigger: None,
         runtime_installations: None,
+        read_state_error: None,
     }
 }
 
@@ -571,9 +572,7 @@ pub async fn list_admin_nodes(
             .into_iter()
             .map(|node| admin_node_response(node, None, None))
             .collect();
-        if let Err(err) = attach_node_read_state(&state, &store, &mut responses).await {
-            return db_error(err).into_response();
-        }
+        attach_node_read_state(&state, &store, &mut responses).await;
         return Json(responses).into_response();
     }
     let node_ids: Vec<NodeId> = nodes.iter().map(|n| n.id).collect();
@@ -614,9 +613,7 @@ pub async fn list_admin_nodes(
     if ranking.is_some() {
         responses.sort_by_key(drainability_rank);
     }
-    if let Err(err) = attach_node_read_state(&state, &store, &mut responses).await {
-        return db_error(err).into_response();
-    }
+    attach_node_read_state(&state, &store, &mut responses).await;
     Json(responses).into_response()
 }
 
@@ -891,10 +888,8 @@ async fn single_node_read_response(
     store: &AdminNodeStore,
     mut response: AdminNodeResponse,
 ) -> axum::response::Response {
-    match attach_node_read_state(state, store, std::slice::from_mut(&mut response)).await {
-        Ok(()) => Json(response).into_response(),
-        Err(err) => db_error(err).into_response(),
-    }
+    attach_node_read_state(state, store, std::slice::from_mut(&mut response)).await;
+    Json(response).into_response()
 }
 
 /// Dispatch a `POST /v1/nodes/{spec}` where `spec` is either a bare

@@ -273,6 +273,16 @@ function renderReconciler(node: NodeView, nowMs: number) {
   const renderCell = (primary: ReactNode) => {
     const trigger = node.reconcile_trigger;
     const reasons = triggerReasons(node);
+    if (node.read_state_error) {
+      return (
+        <Space size={4} wrap>
+          {primary}
+          <Tooltip title={`could not read the reconcile trigger: ${node.read_state_error}`}>
+            <Tag>trigger unknown</Tag>
+          </Tooltip>
+        </Space>
+      );
+    }
     if (!trigger) {
       return primary;
     }
@@ -441,6 +451,7 @@ export default function NodesPage() {
     network_slots: admin.network_slots,
     status: admin.status,
     reconcile_trigger: admin.reconcile_trigger ?? null,
+    read_state_error: admin.read_state_error ?? null,
   });
 
   const loadNodes = async ({

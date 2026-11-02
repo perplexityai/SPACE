@@ -141,6 +141,12 @@ pub struct AdminNodeResponse {
     /// there means the node has reported none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_installations: Option<Vec<AdminNodeRuntimeInstallation>>,
+    /// Why `reconcile_trigger` and `runtime_installations` were not read, on
+    /// `GET /nodes` and `GET /nodes/{id}` when either read failed. Both are
+    /// then absent, so while this is set an absent trigger means unknown, not
+    /// nothing queued.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_state_error: Option<String>,
 }
 
 /// A node's queued state-reconciliation trigger, from

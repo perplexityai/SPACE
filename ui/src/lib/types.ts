@@ -440,6 +440,8 @@ export interface NodeView {
   };
   status: NodeStatusSnapshot | null;
   reconcile_trigger: NodeReconcileTrigger | null;
+  /** Set when the trigger could not be read; `reconcile_trigger` is then unknown. */
+  read_state_error: string | null;
 }
 
 /// Response shape for GET /admin/api/v1/nodes and action endpoints.
@@ -481,6 +483,9 @@ export interface AdminNodeResponse {
   status: NodeStatusSnapshot | null;
   /** Present when the node has a queued state-reconciliation trigger. */
   reconcile_trigger?: NodeReconcileTrigger;
+  /** Why the trigger and runtime installations were not read. While it is
+   * set, an absent `reconcile_trigger` means unknown, not nothing queued. */
+  read_state_error?: string;
 }
 
 /// A node's queued state-reconciliation trigger, as GET /admin/api/v1/nodes

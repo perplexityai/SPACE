@@ -74,6 +74,7 @@ fn row(id: &str) -> AdminNodeResponse {
         node_group_id: None,
         reconcile_trigger: None,
         runtime_installations: None,
+        read_state_error: None,
     }
 }
 
