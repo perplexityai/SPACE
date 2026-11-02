@@ -101,6 +101,7 @@ macro_rules! sandbox_event {
             background = detail_bool($details.background),
             cwd_present = detail_bool($details.cwd_present),
             volume_encryption = detail_bool($details.volume_encryption),
+            persistent = detail_bool($details.persistent),
             condition_set = detail_str(&$details.condition_set),
             stage_index = detail_str(&$details.stage_index),
             due_at = detail_str(&$details.due_at),

@@ -7,7 +7,8 @@ use pplx_space_common_core::kubernetes::SANDBOX_VCPU_ANNOTATION;
 
 use super::*;
 use crate::controllers::substrate::{
-    ActivationOptions, RecoveryCharge, RetireExecutionRequest, RetireFence, SubstrateAdapter,
+    ActivationOptions, RecoveryCharge, RetireExecutionRequest, RetireFence, RetireStopRoute,
+    SubstrateAdapter,
 };
 use crate::test_support::kubernetes::{
     LiveExecution, RouteIdentity, insert_kubernetes_resident, insert_live_execution, kubernetes,
@@ -109,6 +110,7 @@ async fn live_cpu_update_preserves_allocation_across_cold_restart() -> TestResul
                 .retire_execution(RetireExecutionRequest {
                     sandbox_id,
                     fence: RetireFence::Unobserved,
+                    stop_route: RetireStopRoute::Execution,
                 })
                 .await?;
             controller

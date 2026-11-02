@@ -86,6 +86,9 @@ pub struct SandboxEventDetails {
     /// cannot change over the sandbox's life, so an event that omits it is
     /// ambiguous about the code path it describes.
     pub volume_encryption: Option<bool>,
+    /// Set on a failure the emitter reports once as persisting, after which
+    /// it stops reporting the same failure until it ends.
+    pub persistent: Option<bool>,
     pub condition_set: Option<String>,
     pub stage_index: Option<String>,
     pub due_at: Option<String>,
@@ -346,6 +349,7 @@ impl SandboxEventDetails {
             SandboxEventBoolField::Background => self.background = Some(value),
             SandboxEventBoolField::CwdPresent => self.cwd_present = Some(value),
             SandboxEventBoolField::VolumeEncryption => self.volume_encryption = Some(value),
+            SandboxEventBoolField::Persistent => self.persistent = Some(value),
         }
         self
     }
@@ -363,6 +367,7 @@ pub enum SandboxEventBoolField {
     Background,
     CwdPresent,
     VolumeEncryption,
+    Persistent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

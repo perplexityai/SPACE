@@ -4307,9 +4307,12 @@ impl SubstrateAdapter for DirectSubstrate {
         &self,
         request: RetireExecutionRequest,
     ) -> Result<RetireExecutionOutcome, SubstrateError> {
+        // The stop below already goes to the node's node-api, so both stop
+        // routes are this one.
         let RetireExecutionRequest {
             sandbox_id,
             fence: _fence,
+            stop_route: _,
         } = request;
         let (_, _, mut client) = self.worker_client_for_sandbox(sandbox_id).await?;
 

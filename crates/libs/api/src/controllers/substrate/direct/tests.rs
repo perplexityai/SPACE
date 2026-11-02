@@ -3120,6 +3120,7 @@ async fn live_cpu_update_preserves_allocation_across_cold_restart() -> TestResul
                 .retire_execution(RetireExecutionRequest {
                     sandbox_id,
                     fence: super::super::RetireFence::Unobserved,
+                    stop_route: super::super::RetireStopRoute::Execution,
                 })
                 .await?;
             fixture

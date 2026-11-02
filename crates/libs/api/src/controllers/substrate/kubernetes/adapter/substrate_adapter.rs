@@ -762,10 +762,11 @@ impl SubstrateAdapter for KubernetesSubstrate {
         &self,
         request: RetireExecutionRequest,
     ) -> Result<RetireExecutionOutcome, SubstrateError> {
-        self.teardown_execution(
+        self.teardown_execution_via(
             request.sandbox_id,
             ExecutionTeardown::Retire,
             &request.fence,
+            request.stop_route,
         )
         .await
     }
