@@ -6,6 +6,10 @@ use crate::emit::{counter, distribution, elapsed_ms, tag, timing_ms};
 
 use super::sandbox_tags;
 
+mod client_id;
+
+pub use client_id::{ClientIdTag, request_client_id, scope_request_client_id};
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum SandboxApiSurface {
     Native,
@@ -69,64 +73,19 @@ impl std::fmt::Display for ClientClass {
     }
 }
 
-/// The `client_id` tag value: an allowlisted `X-Client-ID`, or `unknown`.
-///
-/// Only operator-configured IDs may be allowlisted, so the tag's cardinality is
-/// bounded by configuration, never by what a caller sent. A missing, blank, or
-/// unlisted header is [`Self::UNKNOWN`], so a caller rotating IDs can't mint
-/// new series. The variants are private: an allowlisted value exists only
-/// through [`Self::allowlisted`], whose caller owns the bound.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct ClientIdTag(ClientIdTagValue);
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum ClientIdTagValue {
-    Allowlisted(&'static str),
-    Overflow,
-    Unknown,
-}
-
-impl ClientIdTag {
-    /// Every caller the allowlist doesn't name.
-    pub const UNKNOWN: Self = Self(ClientIdTagValue::Unknown);
-    /// An allowlisted client the resolver couldn't name without unbounded
-    /// memory. It still has its own limiter bucket.
-    pub const OVERFLOW: Self = Self(ClientIdTagValue::Overflow);
-
-    /// The tag for an allowlisted client. `id` must come from operator
-    /// configuration, interned by the resolver: a caller-supplied value here
-    /// would put unbounded caller text on every series that carries the tag.
-    pub const fn allowlisted(id: &'static str) -> Self {
-        Self(ClientIdTagValue::Allowlisted(id))
-    }
-
-    pub const fn as_str(self) -> &'static str {
-        match self.0 {
-            ClientIdTagValue::Allowlisted(id) => id,
-            ClientIdTagValue::Overflow => "overflow",
-            ClientIdTagValue::Unknown => "unknown",
-        }
-    }
-
-    /// Whether the tag names a client with its own limiter bucket.
-    const fn has_own_bucket(self) -> bool {
-        !matches!(self.0, ClientIdTagValue::Unknown)
-    }
-}
-
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct SandboxApiMetricIdentity {
     pub op: &'static str,
     pub surface: SandboxApiSurface,
     /// Coarse connecting-client classification. Only the reconnect retry-storm
-    /// metric reads this; the shared [`api_identity_tags`] used by every other
-    /// API metric ignores it, so stamping it never widens their cardinality.
+    /// metric reads this; the shared [`api_identity_tags`] ignores it.
     /// Defaults to [`ClientClass::Other`]; the connect entrypoints stamp the
     /// real class from `X-Client-ID` via [`Self::with_client_class`].
     pub client_class: ClientClass,
-    /// Bounded connecting-client ID. Read by the same reconnect metrics as
-    /// `client_class` and ignored by [`api_identity_tags`]. Defaults to
-    /// [`ClientIdTag::UNKNOWN`]; the connect entrypoint stamps it via
+    /// Bounded calling-client ID, emitted as `client_id` on every API metric
+    /// built from this identity. Defaults to [`ClientIdTag::UNKNOWN`], which
+    /// falls back to the request's [`scope_request_client_id`]; the route
+    /// middleware and the connect entrypoint stamp it via
     /// [`Self::with_client_id`].
     pub client_id: ClientIdTag,
 }
@@ -773,14 +732,12 @@ pub fn api_step_error(_sandbox_id: SandboxId, sample: ApiStepError<'_>) {
 /// One sandbox returned successfully from a warm or cold create, including
 /// accepted creates whose guest readiness is still pending.
 pub fn sandbox_created(tls_interception_on: bool) {
-    counter(
-        "sandbox.api.created",
-        1,
-        &[tag(
-            "tls.interception",
-            if tls_interception_on { "on" } else { "off" },
-        )],
-    );
+    let tls_interception = if tls_interception_on { "on" } else { "off" };
+    let tags = [
+        tag("tls.interception", tls_interception),
+        tag("client_id", request_client_id().as_str()),
+    ];
+    counter("sandbox.api.created", 1, &tags);
 }
 
 /// One completed create, tagged with where its vCPU and memory came from.
@@ -1068,7 +1025,16 @@ fn api_identity_tags(identity: SandboxApiMetricIdentity) -> Vec<String> {
     vec![
         tag("op", identity.op),
         tag("surface", identity.surface.as_str()),
+        tag("client_id", identity_client_id(identity).as_str()),
     ]
+}
+
+fn identity_client_id(identity: SandboxApiMetricIdentity) -> ClientIdTag {
+    if identity.client_id == ClientIdTag::UNKNOWN {
+        request_client_id()
+    } else {
+        identity.client_id
+    }
 }
 
 fn dormant_activation_age_bucket(idle_age_secs: u64) -> Option<DormantActivationAgeBucket> {

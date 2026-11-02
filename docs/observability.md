@@ -1118,6 +1118,19 @@ a new override-only caller keeps its own limiter bucket but reports
 can disagree once the cap fills. While the limiter is off it resolves against
 the static list only. Reconnects through the data-plane entrypoint aren't
 attributed and report `unknown`.
+
+Every other `sandbox.api.*` metric built from an API metric identity also
+carries `client_id`: route latency and errors (`sandbox.api.latency_ms`,
+`sandbox.api.request_error`), step latency and errors
+(`sandbox.api.step.latency_ms`, `sandbox.api.error`), restore-claim laps,
+wake-coalescer outcomes, template selection and dormant activation, plus
+`sandbox.api.created`. The sandbox route middleware resolves the request's
+`X-Client-ID` against the static list only (never the runtime overrides, so an
+override-only caller reads `unknown` there) and scopes it over the handler, so
+these metrics need no per-call-site stamping. A value the handler stamps itself,
+such as connect's limiter-resolved ID, wins. Work a request hands to another
+task leaves the scope and reports `unknown`, as do the gRPC server metrics and
+the background reconciler, wake-completion and limiter-gauge metrics.
 Deployments that filter tags by key must keep `client_id` on these metrics.
 
 Two independent signals describe a restore:
