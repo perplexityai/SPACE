@@ -299,14 +299,19 @@ async fn admit_inline_round(
                     idempotency: Some(idempotency.clone()),
                     traceparent: None,
                 },
-                None,
+                pplx_space_api::public_operations::InlineClaimOffer {
+                    org_limit: None,
+                    acquire: || Some(()),
+                },
             )
             .await?;
         match result {
-            CreateInlinePublicOperationResult::Claimed {
-                claim_token,
-                operation,
-            } => {
+            CreateInlinePublicOperationResult::Claimed(claim) => {
+                let pplx_space_api::public_operations::InlineClaimed {
+                    claim_token,
+                    operation,
+                    ..
+                } = claim.commit().await?;
                 claimed += 1;
                 recorded.push(operation.id);
                 let executor = executor.clone();

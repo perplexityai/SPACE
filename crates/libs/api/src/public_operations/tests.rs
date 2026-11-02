@@ -795,16 +795,15 @@ async fn admission_claims_a_new_operation_only_on_an_otherwise_idle_sandbox() ->
         let recorded = store
             .begin_operation_admission(org_id, ApiProduct::Native, &idempotency)
             .await?
-            .create_claimed_if_sole_active(input(), None)
+            .create_claimed_if_sole_active(input(), offer(None))
             .await?;
         let operation_id = match (claimed, recorded) {
-            (
-                true,
-                CreateInlinePublicOperationResult::Claimed {
+            (true, CreateInlinePublicOperationResult::Claimed(claim)) => {
+                let InlineClaimed {
                     claim_token,
                     operation,
-                },
-            ) => {
+                    ..
+                } = claim.commit().await?;
                 assert!(claim_token.starts_with(ADMISSION_CLAIM_TOKEN_PREFIX));
                 assert_eq!(operation.kind, OperationKind::StopSandbox);
                 assert_eq!(
@@ -844,7 +843,7 @@ async fn admission_claims_a_new_operation_only_on_an_otherwise_idle_sandbox() ->
         let replay = store
             .begin_operation_admission(org_id, ApiProduct::Native, &idempotency)
             .await?
-            .create_claimed_if_sole_active(input(), None)
+            .create_claimed_if_sole_active(input(), offer(None))
             .await?;
         assert!(
             matches!(
@@ -903,7 +902,7 @@ async fn an_admission_claim_is_stamped_when_taken_not_when_its_transaction_began
                         idempotency: Some(idempotency.clone()),
                         traceparent: None,
                     },
-                    None,
+                    offer(None),
                 )
                 .await?;
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(recorded)
@@ -912,11 +911,12 @@ async fn an_admission_claim_is_stamped_when_taken_not_when_its_transaction_began
     wait_for_advisory_lock_waiter(&db.pool).await?;
     tokio::time::sleep(claim_stale_after + Duration::from_millis(500)).await;
     holding.rollback().await?;
-    let CreateInlinePublicOperationResult::Claimed { operation, .. } =
+    let CreateInlinePublicOperationResult::Claimed(claim) =
         admission.await?.map_err(|error| error.to_string())?
     else {
         panic!("admission claims the stop on its otherwise idle sandbox");
     };
+    let operation = claim.commit().await?.operation;
 
     let dispatched = store
         .claim_operations(ClaimPublicOperations {
@@ -949,17 +949,18 @@ async fn an_implicit_wake_is_claimed_only_when_created_on_an_idle_sandbox() -> T
             &target_id,
             serde_json::json!({"action": "wake"}),
             None,
-            None,
+            offer(None),
         )
     };
 
-    let CreateInlinePublicOperationResult::Claimed {
-        claim_token,
-        operation,
-    } = wake().await?
-    else {
+    let CreateInlinePublicOperationResult::Claimed(claim) = wake().await? else {
         panic!("a wake on an idle sandbox is claimed");
     };
+    let InlineClaimed {
+        claim_token,
+        operation,
+        ..
+    } = claim.commit().await?;
     assert_eq!(operation.actor_user_id, None);
     assert!(matches!(
         wake().await?,
@@ -1039,18 +1040,23 @@ async fn admission_holds_an_organization_to_its_inline_limit() -> TestResult {
                         idempotency: Some(idempotency.clone()),
                         traceparent: None,
                     },
-                    Some(org_limit),
+                    offer(Some(org_limit)),
                 )
                 .await?;
-            TestResult::<CreateInlinePublicOperationResult>::Ok(recorded)
+            // A claim, committed, as its token and operation.
+            TestResult::<Result<(String, OperationId), CreateInlinePublicOperationResult>>::Ok(
+                match recorded {
+                    CreateInlinePublicOperationResult::Claimed(claim) => {
+                        let committed = claim.commit().await?;
+                        Ok((committed.claim_token, committed.operation.id))
+                    }
+                    other => Err(other),
+                },
+            )
         }
     };
-    let claimed = |recorded: CreateInlinePublicOperationResult| match recorded {
-        CreateInlinePublicOperationResult::Claimed {
-            claim_token,
-            operation,
-        } => (claim_token, operation.id),
-        other => panic!("expected an inline claim, got {other:?}"),
+    let claimed = |admitted: Result<(String, OperationId), CreateInlinePublicOperationResult>| {
+        admitted.unwrap_or_else(|other| panic!("expected an inline claim, got {other:?}"))
     };
     let wake = OperationKind::WakeSandbox;
 
@@ -1085,7 +1091,7 @@ async fn admission_holds_an_organization_to_its_inline_limit() -> TestResult {
     // Two live inline claims reach the limit.
     let (first_token, first) = claimed(admit(org_id, wake).await?);
     claimed(admit(org_id, wake).await?);
-    let CreateInlinePublicOperationResult::Queued(held, InlineQueueReason::OrgLimit) =
+    let Err(CreateInlinePublicOperationResult::Queued(held, InlineQueueReason::OrgLimit)) =
         admit(org_id, wake).await?
     else {
         panic!("an organization at its limit has its operation queued");
@@ -1100,7 +1106,7 @@ async fn admission_holds_an_organization_to_its_inline_limit() -> TestResult {
             &PublicSandboxId::new().to_string(),
             serde_json::json!({"action": "wake"}),
             None,
-            Some(org_limit),
+            offer(Some(org_limit)),
         )
         .await?;
     assert!(
@@ -1127,6 +1133,14 @@ async fn admission_holds_an_organization_to_its_inline_limit() -> TestResult {
     );
     claimed(admit(org_id, wake).await?);
     Ok(())
+}
+
+/// An inline claim offer under `org_limit` whose permit is always free.
+fn offer(org_limit: Option<InlineOrgLimit>) -> InlineClaimOffer<impl FnOnce() -> Option<()>> {
+    InlineClaimOffer {
+        org_limit,
+        acquire: || Some(()),
+    }
 }
 
 /// Returns once some transaction waits for a row another one has locked.

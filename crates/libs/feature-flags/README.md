@@ -145,12 +145,16 @@ can match on beyond the subject.
 | `space-cluster-api-client-side-balancing` | boolean | `sandbox:`/`session:`/`org:` prefixed id | `cluster_id` | off |
 | `space-native-create-pool-claim` | boolean | constant `space-cluster` | none | off |
 | `space-native-hidden-operations` | boolean | SPACE org id | `operation_id` | off |
+| `space-native-inline-operations` | boolean | SPACE org id | none | on |
 | `space-snapshot-retention-config` | JSON object | cluster id | none | env-configured limits |
 | `space-template-sparse-aware-reads` | boolean | template name | none | on |
 
 Each fallback is chosen so that losing the flag backend cannot turn a
 guardrail off: the limiters fall back **on**, and the flags
-that open new operations fall back **off**. All three JSON keys fall back
+that open new operations fall back **off**. `space-native-inline-operations`
+opens nothing new: it only lets the API process that admitted a lifecycle
+operation run it, under an env master that is off by default, so it falls back
+**on** and leaves the decision to that master. All three JSON keys fall back
 to whatever their deployment configured locally rather than to a value chosen
 here, because an override that resolves nothing should leave local
 configuration standing — see `policy::override_allowed`.

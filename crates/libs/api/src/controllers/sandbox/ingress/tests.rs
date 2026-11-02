@@ -301,6 +301,7 @@ async fn stored_ingress_access_resumes_paused_execution_before_reporting_ready()
         controller: SandboxController::new(Substrate::from_direct(
             crate::controllers::substrate::direct::DirectSubstrate::new(db.pool.clone()),
         )),
+        inline: None,
     };
     for (wake_enabled, pause_after_observation, worker_allows_access) in [
         (true, false, true),

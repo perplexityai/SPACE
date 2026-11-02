@@ -49,7 +49,7 @@ use crate::{
         },
         substrate::AdmissionPoolClaim,
     },
-    inline_operations::InlineRefusal,
+    inline_operations::{InlineLifecycle, InlineRefusal},
     middleware::auth::{AuthFederatedOwner, AuthOrg, AuthUser},
     models::{Sandbox, SandboxMetadata as ControllerSandboxMetadata, SandboxMetadataValue},
     public_operations::{
@@ -273,8 +273,8 @@ pub(crate) async fn create_native_sandbox_operation(
             }
         };
 
-    // The claim on a create recorded for inline execution.
-    let mut inline_claim = None;
+    // A create recorded claimed, committed and running inline.
+    let mut inline_start = None;
     let (sandbox_id, outcome, result) = match plan {
         NativeCreatePoolPlan::Unclaimed(outcome) => {
             let sandbox_id_string = fresh_sandbox_id.to_string();
@@ -348,34 +348,26 @@ pub(crate) async fn create_native_sandbox_operation(
                             // Without a permit, or with the org at its
                             // inline limit, the create is recorded queued,
                             // as with the kill switch off.
-                            let offered = inline.as_ref().and_then(|inline| {
-                                inline
-                                    .runner
-                                    .try_acquire(InlineAdmissionPath::WarmPoolCreate)
-                                    .ok()
-                                    .map(|permit| (inline, permit))
-                            });
-                            let result = if let Some((inline, permit)) = offered {
+                            let result = if let Some(inline) = &inline {
+                                let path = InlineAdmissionPath::WarmPoolCreate;
                                 match admission
-                                    .create_claimed_or_roll_back(input, inline.runner.org_limit())
+                                    .create_claimed_or_roll_back(
+                                        input,
+                                        inline.runner.claim_offer(path),
+                                    )
                                     .await?
                                 {
-                                    CreateInlinePublicOperationResult::Claimed {
-                                        claim_token,
-                                        operation,
-                                    } => {
-                                        let operation_id = operation.id;
-                                        inline_claim = Some((permit, claim_token, operation));
+                                    CreateInlinePublicOperationResult::Claimed(claim) => {
+                                        let operation_id = claim.operation().id;
+                                        inline_start =
+                                            Some(inline.start(store.clone(), claim).await?);
                                         CreatePublicOperationResult::Created(operation_id)
                                     }
                                     CreateInlinePublicOperationResult::Queued(
                                         operation_id,
                                         reason,
                                     ) => {
-                                        inline.runner.refuse(
-                                            InlineAdmissionPath::WarmPoolCreate,
-                                            reason.into(),
-                                        );
+                                        inline.runner.refuse_queued(path, reason);
                                         CreatePublicOperationResult::Created(operation_id)
                                     }
                                     CreateInlinePublicOperationResult::NotCreated(result) => result,
@@ -450,10 +442,8 @@ pub(crate) async fn create_native_sandbox_operation(
         CreatePublicOperationResult::AdmissionDenied => return Err(PublicApiError::internal()),
     };
 
-    if let Some((inline, (permit, claim_token, operation))) = inline.zip(inline_claim)
-        && inline
-            .run(permit, store.clone(), claim_token, operation)
-            .await
+    if let Some((inline, started)) = inline.zip(inline_start)
+        && inline.wait(started).await
     {
         response.operation = finished_operation(&store, org_id, response.operation_id).await?;
     }
@@ -819,6 +809,7 @@ pub async fn apply_custom_sandbox_action(
     let rollback = rollback_request(action, &body)?;
     enqueue_lifecycle_operation(
         &state.pool,
+        Some(&state.inline_lifecycle),
         org.id,
         actor.id,
         headers,
@@ -839,6 +830,7 @@ pub async fn delete_sandbox(
 ) -> Result<(StatusCode, Json<SandboxOperationResponse>), PublicApiError> {
     enqueue_lifecycle_operation(
         &state.pool,
+        None,
         org.id,
         actor.id,
         headers,
@@ -908,8 +900,17 @@ pub(super) async fn delete_replay_in_owner_scope(
     }
 }
 
+/// Record a lifecycle action. With `inline`, a wake, resume or start that
+/// [`InlineLifecycle`] offers for inline execution, and that admission
+/// claims, runs in this process; anything else is recorded queued for the
+/// dispatcher. The response is the same 202 either way.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the lifecycle action's request-scoped inputs; bundling them only moves the list"
+)]
 async fn enqueue_lifecycle_operation(
     pool: &PgPool,
+    inline: Option<&InlineLifecycle>,
     org_id: OrgId,
     actor_user_id: UserId,
     headers: HeaderMap,
@@ -936,6 +937,13 @@ async fn enqueue_lifecycle_operation(
         ObservePublicOperationIdempotency::Existing(operation_id) => {
             let operation_id = *operation_id;
             admission.finish().await?;
+            if let Some(inline) = inline {
+                inline.refuse_replay(
+                    org_id,
+                    action.operation_kind(),
+                    InlineAdmissionPath::LifecycleAction,
+                );
+            }
             let response = sandbox_operation_response(&store, org_id, operation_id).await?;
             return Ok((StatusCode::ACCEPTED, Json(response)));
         }
@@ -979,10 +987,28 @@ async fn enqueue_lifecycle_operation(
         idempotency: Some(idempotency),
         traceparent: crate::public_operations::request_traceparent(),
     };
-    let result = if action == SandboxLifecycleAction::Wake {
-        admission.create_or_join_active_wake(input).await?
-    } else {
-        admission.create(input).await?
+    let wake = action == SandboxLifecycleAction::Wake;
+    let path = InlineAdmissionPath::LifecycleAction;
+    let offered = inline.and_then(|inline| {
+        inline
+            .offer(org_id, input.kind, path)
+            .map(|offer| (inline, offer))
+    });
+    let result = match offered {
+        None if wake => admission.create_or_join_active_wake(input).await?,
+        None => admission.create(input).await?,
+        Some((inline, offer)) => {
+            let recorded = if wake {
+                admission
+                    .create_or_join_active_wake_claimed_if_sole_active(input, offer)
+                    .await?
+            } else {
+                admission
+                    .create_claimed_if_sole_active(input, offer)
+                    .await?
+            };
+            inline.settle(path, &store, recorded).await?
+        }
     };
 
     let response = match result {
