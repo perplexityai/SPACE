@@ -356,18 +356,12 @@ pub(crate) async fn persist_optional_current_local_artifact(
     if let Some(artifact) = published_artifact {
         reject_deleting_current_local_artifact(&mut tx, sandbox_id, artifact).await?;
     }
-    sqlx::query(sql!(
-        "UPDATE sandboxes
-            SET current_local_artifact_id = $2,
-                current_local_artifact_kind = $3,
-                current_local_artifact_origin = CASE WHEN $2 IS NULL THEN NULL ELSE $4 END
-          WHERE id = $1"
-    ))
-    .bind(sandbox_id.as_uuid())
-    .bind(published_artifact.map(|artifact| artifact.id.as_uuid()))
-    .bind(published_artifact.map(|artifact| artifact.kind.as_str()))
-    .bind(origin.as_str())
-    .execute(&mut *tx)
+    pplx_space_sandbox_store::artifact_marker::set_current_local_artifact(
+        &mut *tx,
+        sandbox_id,
+        published_artifact.map(|artifact| (artifact.id, artifact.kind)),
+        origin,
+    )
     .await
     .db_context("failed to persist current local artifact identity")?;
     tx.commit()

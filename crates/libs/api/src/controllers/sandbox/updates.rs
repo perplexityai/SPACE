@@ -488,23 +488,12 @@ impl SandboxController {
         let mut tx = pool.begin().await.map_err(|err| {
             db_contention_error("failed to begin sandbox network policy update", &err)
         })?;
-        let generation = sqlx::query_scalar::<_, i64>(sql!(
-            "UPDATE sandboxes
-             SET network_policy_override_json = $1,
-                 network_policy_generation =
-                     CASE
-                         WHEN network_policy_override_json IS DISTINCT FROM $1
-                         THEN network_policy_generation + 1
-                         ELSE network_policy_generation
-                     END
-             WHERE id = $2
-               AND ($3::BIGINT IS NULL OR network_policy_generation = $3)
-             RETURNING network_policy_generation"
-        ))
-        .bind(policy_override_json)
-        .bind(sandbox.id)
-        .bind(expected_generation.map(|generation| generation as i64))
-        .fetch_optional(&mut *tx)
+        let generation = sandbox_store::intent::set_network_policy_override(
+            &mut *tx,
+            sandbox.id,
+            policy_override_json,
+            expected_generation.map(|generation| generation as i64),
+        )
         .await
         .map_err(|err| {
             let error = "failed to update sandbox network policy";
@@ -609,16 +598,9 @@ impl SandboxController {
         let mut tx = pool.begin().await.map_err(|err| {
             db_contention_error("failed to begin sandbox snapshot intent update", &err)
         })?;
-        sqlx::query(sql!(
-            "UPDATE sandboxes
-             SET snapshots_enabled_desired = $1
-             WHERE id = $2"
-        ))
-        .bind(enabled)
-        .bind(sandbox.id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|err| db_contention_error("failed to update sandbox snapshot intent", &err))?;
+        sandbox_store::intent::set_snapshots_enabled_desired(&mut *tx, sandbox.id, enabled)
+            .await
+            .map_err(|err| db_contention_error("failed to update sandbox snapshot intent", &err))?;
 
         let refs = [ReconcileRef::sandbox_desired_state(sandbox.id)];
         let reconcile_queued = enqueue_sandbox_reconcile_and_trigger_tx(

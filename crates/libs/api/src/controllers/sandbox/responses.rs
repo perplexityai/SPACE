@@ -3,6 +3,7 @@ use pplx_space_common_core::types::SandboxId;
 use super::*;
 use pplx_space_common_core::sql;
 use pplx_space_net_common::NetworkPolicy;
+use pplx_space_sandbox_store as sandbox_store;
 
 fn proto_spaced_version(value: Option<&str>) -> Option<SemVer> {
     let value = value?;
@@ -346,16 +347,7 @@ pub(super) fn network_policy_status_for(
 /// (Restore, Wake) carry their own dedicated CAS upstream of this
 /// helper.
 pub(super) async fn maybe_update_sandbox_lifecycle(pool: &PgPool, id: SandboxId, lifecycle: &str) {
-    if let Err(err) = sqlx::query(sql!(
-        "UPDATE sandboxes
-            SET lifecycle = $1
-          WHERE id = $2
-            AND lifecycle NOT IN ('failed', 'quarantined', 'deleted', 'cleanup_required')"
-    ))
-    .bind(lifecycle)
-    .bind(id)
-    .execute(pool)
-    .await
+    if let Err(err) = sandbox_store::action_stamp::stamp_action_lifecycle(pool, id, lifecycle).await
     {
         tracing::warn!(
             sandbox_id = %id,
@@ -382,29 +374,7 @@ pub(super) async fn maybe_update_sandbox_lifecycle(pool: &PgPool, id: SandboxId,
 /// kept: this write also completes a start that restored a suspended sandbox,
 /// and the node keeps that pin across a restore (`mark_restore_succeeded`).
 pub(super) async fn maybe_mark_started_after_start(pool: &PgPool, id: SandboxId) {
-    if let Err(err) = sqlx::query(sql!(
-        "UPDATE sandboxes
-            SET lifecycle = 'started',
-                placement = 'on_node',
-                current_local_artifact_id = CASE
-                    WHEN current_local_artifact_kind = 'disk' THEN NULL
-                    ELSE current_local_artifact_id
-                END,
-                current_local_artifact_kind = CASE
-                    WHEN current_local_artifact_kind = 'disk' THEN NULL
-                    ELSE current_local_artifact_kind
-                END,
-                current_local_artifact_origin = CASE
-                    WHEN current_local_artifact_kind = 'disk' THEN NULL
-                    ELSE current_local_artifact_origin
-                END
-          WHERE id = $1
-            AND lifecycle NOT IN ('failed', 'quarantined', 'deleted', 'cleanup_required')"
-    ))
-    .bind(id)
-    .execute(pool)
-    .await
-    {
+    if let Err(err) = sandbox_store::action_stamp::stamp_started_after_start(pool, id).await {
         tracing::warn!(
             sandbox_id = %id,
             error = %err,

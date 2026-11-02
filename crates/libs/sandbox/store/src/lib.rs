@@ -100,11 +100,14 @@ use sqlx::types::JsonValue;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+pub mod action_stamp;
+pub mod artifact_marker;
 pub mod create;
 pub mod delete;
 pub mod direct;
 pub mod fork_source_lifecycle;
 pub mod ingest;
+pub mod intent;
 pub mod lost;
 pub mod pod_tracking;
 pub mod repair;
