@@ -44,10 +44,9 @@ Mandatory shadow reflinks still fail instead of falling back to a byte copy.
 plain `fs::copy` calls outside the shared helper. Because it cannot infer which
 path variables contain rootfs images, it conservatively covers other copies too.
 The baseline records the existing builder/local paths, non-Linux fallbacks and
-non-rootfs copies; increasing their counts fails the check. New baseline entries
-are explicit review findings, initially advisory to seed the rule. This is a
-line-based lint, not dataflow analysis: aliases, multiline spellings and shell
-scripts still require review.
+non-rootfs copies; increasing their counts or adding an entry fails the check.
+This is a line-based lint, not dataflow analysis: aliases, multiline spellings
+and shell scripts still require review.
 
 Keep builder template-managers on `inherit` with CoW base caches in this phase.
 Build-manager still uses an elevated `cp --reflink=auto` to extract the stopped

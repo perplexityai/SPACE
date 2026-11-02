@@ -6,7 +6,8 @@
 //! count of each listed file. `no_crossing` keeps files outside the table
 //! from violating; `no_new_entries` and `no_raised_caps` report entries a pull
 //! request adds to the table and caps it raises, compared with the base
-//! branch's copy, so the table is not a way around `no_crossing`;
+//! branch's copy, so the table is not a way around `no_crossing`, except in
+//! the pull request that adds an instance, which seeds its table;
 //! `listed_no_growth` keeps every listed file's count from growing past its
 //! cap; `stale_entries` asks for an entry to be lowered or removed once its
 //! file's count shrinks, it no longer violates, or it is gone. The last two
@@ -51,6 +52,12 @@ pub trait CountRule {
 
     /// One ratchet per configured table, in reporting order.
     fn ratchets<'a>(&self, config: &'a RulesConfig) -> Vec<Box<dyn CountRatchet + 'a>>;
+
+    /// As [`Rule::other_skips`], such as for a base branch's
+    /// `ARCHITECTURE.toml` that [`CountRatchet::on_base`] can't read.
+    fn other_skips(&self, _ctx: &Context) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// One baseline table's measurement and wording.
@@ -61,6 +68,15 @@ pub trait CountRatchet {
     }
 
     fn modes(&self) -> Modes;
+
+    /// Whether the base branch's `ARCHITECTURE.toml` configures the table,
+    /// so that a base baseline without it tolerates nothing rather than
+    /// being seeded; `None` when that copy was not given. A copy the rule
+    /// can't read counts as configuring it, with a line from
+    /// [`CountRule::other_skips`].
+    fn on_base(&self, _ctx: &Context) -> Option<bool> {
+        None
+    }
 
     /// `file`'s count, if it violates the rule, such as by having code lines
     /// that match a pattern; `None` for a file the rule allows, which is never
@@ -152,6 +168,10 @@ impl<R: CountRule> Rule for R {
         skipped.chain(unconfigured).collect()
     }
 
+    fn other_skips(&self, ctx: &Context) -> Vec<String> {
+        CountRule::other_skips(self, ctx)
+    }
+
     fn base_comparisons(&self, ctx: &Context) -> Vec<String> {
         self.tables(&ctx.config.rules)
             .iter()
@@ -173,8 +193,10 @@ impl<R: CountRule> Rule for R {
     /// Keeps each listed file that still violates, at its current count,
     /// even above its cap, which `no_raised_caps` then reports. A file
     /// without an entry is not added, and a table `ctx.baseline` lacks is not
-    /// created: either takes a hand edit, which `no_new_entries` then
-    /// reports.
+    /// created: either takes a hand edit, which only the pull request that
+    /// adds the instance (or rule) to `ARCHITECTURE.toml` may make, or one
+    /// moving a listed file's entry with a rename git detects; anywhere
+    /// else, `no_new_entries` fails it.
     fn update_baseline(&self, ctx: &Context, baseline: &mut Baseline) -> Vec<NotAdded> {
         self.ratchets(&ctx.config.rules)
             .iter()
@@ -195,6 +217,34 @@ fn table_name(rule: &str, instance: Option<&str>) -> String {
 /// The behaviours of `table` that compare with the base branch's copy.
 fn base_comparisons(table: &str) -> String {
     format!("{table}.{NO_NEW_ENTRIES} and {table}.{NO_RAISED_CAPS}")
+}
+
+/// What the base branch's copy of a table is, for `no_new_entries` and
+/// `no_raised_caps`.
+#[derive(Clone, Copy)]
+enum BaseCaps<'a> {
+    Compare(&'a BTreeMap<String, usize>),
+    /// The base branch has no such table yet: every entry seeds it.
+    Seeding,
+    /// The comparisons are skipped, with a skip line.
+    Skipped,
+}
+
+/// The base branch's copy of `table`, given whether its `ARCHITECTURE.toml`
+/// configures it ([`CountRatchet::on_base`]). A base that configures it but
+/// has no table for it, as for an instance with no matches, tolerates
+/// nothing; one that does not is seeded, unless its baseline has the table.
+/// Without the base's ARCHITECTURE.toml, a base baseline without the table
+/// stands for a base without it.
+fn base_caps<'a>(ctx: &'a Context, table: &str, on_base: Option<bool>) -> BaseCaps<'a> {
+    let Ok(caps) = ctx.base_baseline.table(table) else {
+        return BaseCaps::Skipped;
+    };
+    if on_base == Some(true) || ctx.base_baseline.table_names().any(|name| name == table) {
+        BaseCaps::Compare(caps)
+    } else {
+        BaseCaps::Seeding
+    }
 }
 
 fn check(ctx: &Context, rule: &'static str, ratchet: &dyn CountRatchet) -> Vec<Finding> {
@@ -226,12 +276,15 @@ fn check(ctx: &Context, rule: &'static str, ratchet: &dyn CountRatchet) -> Vec<F
     };
     let mut findings = Vec::new();
 
-    let base = ctx.base_baseline.table(&table).ok();
+    let on_base = ratchet.on_base(ctx);
+    let base = base_caps(ctx, &table, on_base);
     // The base entry an entry is compared with: its own, or, for a file
     // renamed from a listed one, the old path's, with that path. Git renames
     // a file once, so no base entry is taken over twice.
     let base_entry = |path: &str| {
-        let base = base?;
+        let BaseCaps::Compare(base) = base else {
+            return None;
+        };
         match base.get(path) {
             Some(&cap) => Some((cap, None)),
             None => {
@@ -287,7 +340,25 @@ fn check(ctx: &Context, rule: &'static str, ratchet: &dyn CountRatchet) -> Vec<F
         measured.insert(file.path.as_str(), count);
     }
 
-    if base.is_some() {
+    if let BaseCaps::Seeding = base {
+        // Said from what was read.
+        let seeded = match on_base {
+            Some(_) => format!("the base branch's ARCHITECTURE.toml has no [rules.{table}] yet"),
+            None => format!("the base branch's copy has no [{table}] table yet"),
+        };
+        for path in caps.keys() {
+            findings.push(entry_finding(
+                NO_NEW_ENTRIES,
+                Mode::Advisory,
+                path,
+                format!(
+                    " is in {place}, and {seeded}, so this pull request seeds the table. Review \
+                     each entry."
+                ),
+            ));
+        }
+    }
+    if let BaseCaps::Compare(_) = base {
         for path in caps.keys().filter(|path| base_entry(path).is_none()) {
             findings.push(entry_finding(
                 NO_NEW_ENTRIES,
@@ -387,9 +458,16 @@ fn update_baseline(
 ) -> Vec<NotAdded> {
     let table = table_name(rule, ratchet.instance());
     let listed = ctx.baseline.table(&table);
+    let added = if ratchet.instance().is_some() {
+        "instance"
+    } else {
+        "rule"
+    };
     let advice = if listed.is_some() {
         format!(
-            "{}, or add an entry by hand if this is a deliberate exception",
+            "{}; an entry added by hand fails {table}.{NO_NEW_ENTRIES} unless this pull request \
+             adds the {added} to ARCHITECTURE.toml or git detects the file as renamed from a \
+             listed one",
             ratchet.wording().not_added_fix
         )
     } else if ratchet.instance().is_some() {

@@ -1382,7 +1382,9 @@ def path_attribute_users(repo: str, rel: str) -> str:
 
 def ratchet_hits(repo: str, results: dict) -> dict:
     """Lines matching an archcheck pattern_ratchet that a module would now hold. A ratchet
-    counts lines per file, so a moved match needs its baseline entry moved too."""
+    counts lines per file and only a whole-file rename carries an entry: a match moved into a
+    new file needs a new entry, which no_new_entries fails, so move the matches into the
+    instance's allowed paths before splitting."""
     arch = os.path.join(repo, "ARCHITECTURE.toml")
     if not os.path.exists(arch):
         return {}

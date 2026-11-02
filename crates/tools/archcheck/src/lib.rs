@@ -2,8 +2,8 @@
 //!
 //! The binary loads a [`Context`] once, runs every rule in
 //! [`rules::registered`], and reports [`Finding`]s. Each finding carries the
-//! mode of the behaviour that produced it, so a rule can report on every pull
-//! request (`advisory`) long before it is allowed to fail one (`required`).
+//! mode of the behaviour that produced it: an `advisory` finding is reported,
+//! and a `required` one also fails the check.
 
 pub mod baseline;
 pub mod config;
