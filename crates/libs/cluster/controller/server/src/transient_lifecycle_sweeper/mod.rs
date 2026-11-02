@@ -156,7 +156,7 @@
 //!
 //! After flipping a row to `'failed'` — or reverting a `restoring` row to
 //! `'suspended'` — the sweeper calls
-//! [`SubstrateAdapter::retire_execution`] to tear down any backing pod that
+//! [`SubstrateAdapter::retire_execution`](pplx_space_api::controllers::substrate::SubstrateAdapter::retire_execution) to tear down any backing pod that
 //! the wedged transition would have left behind while preserving node-local
 //! sandbox state, and (via the retire's pod-tracking cleanup) to finish the
 //! active execution row and unplace the sandbox. The call is best-effort: if
