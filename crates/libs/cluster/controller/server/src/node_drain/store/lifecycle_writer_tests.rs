@@ -907,6 +907,7 @@ fn kubernetes_sink(pool: &PgPool) -> TestResult<SubstrateSink> {
         ResidencyEvidence::NodeCensusAware,
         true,
         true,
+        true,
     ))
 }
 

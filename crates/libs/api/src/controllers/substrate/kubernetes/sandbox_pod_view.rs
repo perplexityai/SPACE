@@ -224,9 +224,12 @@ impl SandboxPodView {
     }
 
     /// Whether `spec.affinity` carries a **required** `matchFields:
-    /// metadata.name` node-selector term: the source-aware hard pin. Read from
-    /// the live pod so a retry can tell a still-pinned restore pod (must
-    /// re-drive) from one already re-driven cross-node (pin dropped).
+    /// metadata.name In` node-selector term: the source-aware hard pin. Read
+    /// from the live pod so a retry can tell a still-pinned restore pod (must
+    /// re-drive) from one already re-driven cross-node (pin dropped). A
+    /// `metadata.name NotIn` term keeps a pod off a node rather than pinning it
+    /// to one (a stopped re-placement's prior-host exclusions), so it doesn't
+    /// count.
     pub fn has_required_source_pin(&self) -> bool {
         self.required_source_pin
     }
@@ -298,9 +301,9 @@ impl From<Pod> for SandboxPodView {
             .is_some_and(|selector| {
                 selector.node_selector_terms.iter().any(|term| {
                     term.match_fields.as_ref().is_some_and(|fields| {
-                        fields
-                            .iter()
-                            .any(|field| field.key == NODE_NAME_MATCH_FIELD)
+                        fields.iter().any(|field| {
+                            field.key == NODE_NAME_MATCH_FIELD && field.operator == "In"
+                        })
                     })
                 })
             });

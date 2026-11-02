@@ -324,9 +324,12 @@ impl K8sStore {
     /// but in SQLite, in a table this query never reads; the control-plane pin
     /// is a separate value.) One cluster writer does produce a disk pin: node
     /// drain's `record_stopped_evacuation_artifact` writes `('disk', 'stop')` on
-    /// a `stopped` row it has claimed for evacuation, and leaves it in place if
-    /// the evacuation is abandoned before its teardown. Those are the only
-    /// rows this selector can return.
+    /// a `stopped` row it has claimed for evacuation. The pin stays if the
+    /// evacuation is abandoned before its teardown, and a stopped
+    /// re-placement's finalize keeps it on the row it settles; a successful
+    /// start drops it (`maybe_mark_started_after_start`). Those are the only
+    /// rows this selector can return, and the stopped restart plan consults
+    /// it only when no node is known.
     ///
     /// That is an enumeration of *current* writers, which is weaker than a
     /// schema guarantee: the artifact-identity migration has permitted
@@ -375,5 +378,108 @@ impl K8sStore {
         ));
         self.fetch_restore_storage_uri(query, sandbox.id, "stopped")
             .await
+    }
+
+    /// The disk artifact the evacuation restore sweep re-places an evacuated
+    /// `stopped` sandbox from, together with the artifact id the node checks it
+    /// against.
+    ///
+    /// Neither existing selector can serve this row. The evacuation claim has
+    /// already moved it `stopped → restoring`, so
+    /// [`Self::selected_stopped_restore_storage_uri`]'s `lifecycle = 'stopped'`
+    /// excludes it, and [`Self::selected_suspend_restore_storage_uri`] requires
+    /// a `full` snapshot, which a stopped sandbox never has.
+    ///
+    /// `evacuation_restore_target = 'stopped'` is what scopes this to the
+    /// stopped evacuation. A suspended evacuation's `restoring` row carries
+    /// `'started'` or `'paused'`, and a user restore clears the marker when it
+    /// claims, so neither can select a disk artifact here.
+    ///
+    /// The pin is required, for the reason the stopped selector gives: it is
+    /// the only thing that ties the URI to the bytes the drain published. The
+    /// drain wrote it (`record_stopped_evacuation_artifact`, which refuses to
+    /// replace a pin with a different id) before releasing the node, and the
+    /// claim leaves it alone. The id returned is the row's pin, not the
+    /// snapshot's: the shared fragment makes them equal, and the pin is the
+    /// value sandbox-manager's own row carries.
+    ///
+    /// Newest-first with the `sn.id` tiebreak, for the reason the stopped
+    /// selector's comment gives.
+    pub(in crate::controllers::substrate::kubernetes) async fn selected_stopped_evacuation_restore_source(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<Option<StoppedEvacuationRestoreSource>, SubstrateError> {
+        let pinned = snapshot_is_current_local_artifact("s", "sn");
+        let query = sql!(format!(
+            "SELECT ssl.storage_connection_string, s.current_local_artifact_id
+               FROM sandboxes s
+               JOIN snapshots sn ON sn.sandbox_id = s.id
+               JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = sn.id
+              WHERE s.id = $1
+                AND s.lifecycle = 'restoring'
+                AND s.evacuation_restore_target = 'stopped'
+                AND ssl.orphaned_at IS NULL
+                AND sn.type = 'disk'
+                AND sn.state = 'ready'
+                AND {pinned}
+              ORDER BY sn.timestamp DESC, sn.id DESC
+              LIMIT 1"
+        ));
+        let row: Option<(String, LocalArtifactId)> = sqlx::query_as(sqlx::AssertSqlSafe(query))
+            .bind(sandbox_id)
+            .fetch_optional(&self.pool)
+            .await
+            .db_context("failed to select Kubernetes stopped evacuation restore source")?;
+        let Some((storage_uri, local_artifact_id)) = row else {
+            return Ok(None);
+        };
+        StorageUri::parse(&storage_uri).map_err(|err| SubstrateError::Failed {
+            message: format!("invalid selected stopped evacuation restore storage URI: {err}"),
+        })?;
+        Ok(Some(StoppedEvacuationRestoreSource {
+            storage_uri,
+            local_artifact_id,
+        }))
+    }
+
+    /// The workers a stopped re-placement must not be placed on: every node an
+    /// execution of this sandbox ran on that is no longer the active one.
+    ///
+    /// A local `stopped` row for the sandbox can only exist where one of its
+    /// pods ran: the node it was stopped on, a drained source the
+    /// re-placement released, or a destination an earlier attempt staged on
+    /// before failing. Each of those executions is inactive by now: the
+    /// stopped-on node's was retired by the drain's teardown (a stop alone
+    /// leaves it active), and the others were replaced. So the inactive rows
+    /// name them, unless an operator has pruned old
+    /// generations (`scripts/admin/prune_cluster_artifacts.py` deletes
+    /// inactive rows below a sandbox's newest one). sandbox-manager refuses to materialize
+    /// over a row pinned to another artifact instead of discarding its bytes,
+    /// so a pod placed on one of these nodes never converges. The active
+    /// execution is the re-placement's own, and its node holds only what this
+    /// re-placement staged.
+    ///
+    /// The node name is a record of the last node the control plane saw the
+    /// execution's pod on, not a history, so it can miss one: a pod whose
+    /// binding the control plane never observed leaves it NULL, a
+    /// same-generation pod that bound elsewhere overwrites it, and a recovery
+    /// that failed with its pod gone clears it. A node missed that way, or
+    /// named only by a pruned row, can still be chosen.
+    pub(in crate::controllers::substrate::kubernetes) async fn stopped_replacement_excluded_nodes(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<Vec<String>, SubstrateError> {
+        sqlx::query_scalar(sql!(
+            "SELECT DISTINCT BTRIM(k8s_node_name)
+               FROM sandbox_k8s_executions
+              WHERE sandbox_id = $1
+                AND NOT active
+                AND NULLIF(BTRIM(k8s_node_name), '') IS NOT NULL
+              ORDER BY 1"
+        ))
+        .bind(sandbox_id)
+        .fetch_all(&self.pool)
+        .await
+        .db_context("failed to read the nodes earlier executions of the sandbox ran on")
     }
 }

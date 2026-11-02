@@ -64,6 +64,102 @@ impl K8sStore {
         .await
     }
 
+    /// Retire the execution a `stopped` sandbox's stop left active, refusing if
+    /// any active execution postdates that stop.
+    ///
+    /// On Kubernetes a stop leaves its execution row `active`: the stop sends
+    /// the in-VM stop and rewrites the lifecycle, and nothing retires the row
+    /// until the next `start` (`execution_predates_current_stop` is how that
+    /// start recognizes it). So "no active execution" is not the shape
+    /// of an ordinary stopped sandbox, and a teardown that requires it never
+    /// runs. What the teardown has to exclude is narrower: an execution a
+    /// `start` created after the stop, whose pod may be running the user's
+    /// writes. That one usually reads as created after `lifecycle_changed_at`,
+    /// or the row is no longer `stopped`. One that doesn't (a start that
+    /// reused the pre-stop execution, or whose insert's transaction began
+    /// before the stop committed) holds a live activation attempt, assigned
+    /// in the same transaction, and that refuses instead (below).
+    ///
+    /// The stopped-evacuation marker is required too, and it's what refuses a
+    /// whole start→stop cycle that lands between the drain's last read and
+    /// here. That cycle leaves the row `stopped` again with an execution that
+    /// predates the *new* stop, holding writes the published artifact doesn't
+    /// have, so the stop boundary alone would retire it. But the start moved
+    /// the lifecycle, and `sandboxes_clear_evacuation_restore_target` clears
+    /// the marker on any lifecycle change to a value other than `suspending`,
+    /// `suspended` or `restoring`, so the marker is gone and the teardown
+    /// refuses.
+    ///
+    /// A live activation attempt on the active execution refuses too. A
+    /// `start` doesn't always create an execution: one that finds no pod under
+    /// the pre-stop execution's name reuses that execution and creates a pod
+    /// under the same name, so the stop boundary still reads it as pre-stop
+    /// and the row stays `stopped` with its marker until the start succeeds.
+    /// What such a start does hold, from its claim until it finishes, is an
+    /// activation attempt (`ensure_active_execution_claim_in`) whose lease
+    /// outlives any node operation. An attempt with no expiry refuses as well,
+    /// so a row this can't read is left alone; an expired one, left by a
+    /// crashed owner, doesn't.
+    ///
+    /// The check and the retirement share one transaction under the
+    /// execution-mutation lock execution creation also takes, so a start can't
+    /// slip a new execution in between. `Ok(false)` changes nothing.
+    pub(in crate::controllers::substrate::kubernetes) async fn retire_executions_predating_current_stop(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<bool, SubstrateError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .db_context("failed to start stopped execution retirement transaction")?;
+        // No row to lock is no marker either, so it refuses like one whose
+        // marker is gone.
+        if !Self::lock_sandbox_for_execution_mutation_in(&mut tx, sandbox_id).await? {
+            return Ok(false);
+        }
+        let refuse: bool = sqlx::query_scalar(sql!(
+            "SELECT EXISTS (
+                        SELECT 1
+                          FROM sandbox_k8s_executions execution
+                          JOIN sandboxes sandbox ON sandbox.id = execution.sandbox_id
+                         WHERE execution.sandbox_id = $1
+                           AND execution.active
+                           AND NOT (
+                               sandbox.lifecycle = 'stopped'
+                               AND execution.created_at <= sandbox.lifecycle_changed_at
+                           )
+                    )
+                 OR EXISTS (
+                        SELECT 1
+                          FROM sandbox_k8s_executions execution
+                         WHERE execution.sandbox_id = $1
+                           AND execution.active
+                           AND execution.activation_attempt_id IS NOT NULL
+                           AND COALESCE(execution.activation_attempt_expires_at > NOW(), TRUE)
+                    )
+                 OR NOT EXISTS (
+                        SELECT 1
+                          FROM sandboxes
+                         WHERE id = $1
+                           AND evacuation_restore_target = 'stopped'
+                    )"
+        ))
+        .bind(sandbox_id)
+        .fetch_one(&mut *tx)
+        .await
+        .db_context("failed to check for an execution newer than the stop")?;
+        if refuse {
+            return Ok(false);
+        }
+        self.finish_active_execution_in(&mut tx, sandbox_id, SandboxLifecycle::Stopped.as_str())
+            .await?;
+        tx.commit()
+            .await
+            .db_context("failed to commit stopped execution retirement")?;
+        Ok(true)
+    }
+
     /// Clear pod tracking for a sandbox that has **no** active execution,
     /// proving that inside the same locked transaction.
     ///

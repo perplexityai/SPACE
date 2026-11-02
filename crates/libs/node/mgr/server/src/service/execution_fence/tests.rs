@@ -419,6 +419,15 @@ async fn canonical_artifact_rpcs_reject_missing_or_superseded_execution_before_h
                 .await
                 .map(|_| ()),
             service
+                .btrfs_create_sandbox_instance(request(
+                    crate::proto::BtrfsCreateSandboxInstanceRequest {
+                        sandbox_id: sandbox.clone(),
+                        target: target.clone(),
+                    },
+                ))
+                .await
+                .map(|_| ()),
+            service
                 .btrfs_delete_sandbox_instance(request(
                     crate::proto::BtrfsDeleteSandboxInstanceRequest {
                         sandbox_id: sandbox.clone(),

@@ -161,6 +161,26 @@ async fn artifact_mutation_cancellation_retains_target_until_blocking_work_exits
                 ))
                 .await
                 .map(|_| ()),
+            service
+                .btrfs_create_sandbox_instance(root_request(
+                    crate::proto::BtrfsCreateSandboxInstanceRequest {
+                        sandbox_id: id.into(),
+                        target: Some(pplx_space_node_mgr_client::execution_fence::InstanceTarget::Execution(
+                            pplx_space_node_mgr_client::execution_fence::ExecutionFence::new(id.parse().unwrap(), None),
+                        ).into()),
+                    },
+                ))
+                .await
+                .map(|_| ()),
+            service
+                .btrfs_create_sandbox_instance(root_request(
+                    crate::proto::BtrfsCreateSandboxInstanceRequest {
+                        sandbox_id: id.into(),
+                        target: Some(pplx_space_node_mgr_client::execution_fence::InstanceTarget::RestoreScope(id.parse().unwrap()).into()),
+                    },
+                ))
+                .await
+                .map(|_| ()),
         ];
         results.into_iter().for_each(busy);
         drop(capture);
