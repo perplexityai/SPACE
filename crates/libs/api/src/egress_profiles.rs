@@ -260,7 +260,7 @@ pub(crate) fn invalid_request() -> EgressProfileSelectionError {
 mod tests;
 
 pub(crate) async fn load(
-    pool: &sqlx::PgPool,
+    pool: impl sqlx::PgExecutor<'_>,
     sandbox_id: pplx_space_common_core::types::SandboxId,
 ) -> Result<EgressProfileSelection, crate::controllers::ControllerError> {
     use crate::controllers::ControllerError;

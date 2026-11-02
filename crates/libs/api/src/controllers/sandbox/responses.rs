@@ -752,7 +752,10 @@ pub fn sandbox_query(sql: &str) -> String {
         .replace("{sandbox_join_tail}", SANDBOX_JOIN_TAIL)
 }
 
-pub async fn fetch_sandbox(pool: &PgPool, id: SandboxId) -> Result<Option<Sandbox>, sqlx::Error> {
+pub async fn fetch_sandbox(
+    pool: impl sqlx::PgExecutor<'_>,
+    id: SandboxId,
+) -> Result<Option<Sandbox>, sqlx::Error> {
     sqlx::query_as::<_, Sandbox>(sqlx::AssertSqlSafe(sql!(sandbox_query(
         "SELECT {sandbox_columns} FROM {sandbox_from} WHERE s.id = $1",
     ))))

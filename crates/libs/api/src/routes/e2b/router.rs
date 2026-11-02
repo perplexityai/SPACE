@@ -263,6 +263,10 @@ fn authenticated_e2b_api_routes() -> Router<AppState> {
             axum::routing::get(get_sandbox).delete(delete_sandbox),
         )
         .route(
+            "/sandboxes/{sandboxID}/network-policy",
+            axum::routing::get(super::network_policy::get).put(super::network_policy::replace),
+        )
+        .route(
             "/sandboxes/{sandboxID}/pause",
             axum::routing::post(pause_sandbox_e2b),
         )
