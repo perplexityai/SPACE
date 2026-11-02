@@ -549,7 +549,7 @@ metric_vocabulary!(
     /// lock-free read and the sandbox row lock. Exactly one value is
     /// recorded per call, before any lock wait, so calls that later expire
     /// waiting for the lock still count. The `skipped_*` share of the total
-    /// is how often `space-api-timeout-lock-bypass` avoids the lock; the
+    /// is how often an unchanged timeout avoids the lock; the
     /// `locked_*` values say why the rest still take it.
     TimeoutUpdateLockDecision {
         /// Unchanged policy on a created, paused or suspended sandbox.
@@ -557,8 +557,6 @@ metric_vocabulary!(
         /// Unchanged policy on a started sandbox with a known execution
         /// generation.
         SkippedPresent => "skipped_present",
-        /// The flag is off for this sandbox; nothing was read unlocked.
-        LockedFlagOff => "locked_flag_off",
         /// The call changes the stored policy.
         LockedPolicyChanged => "locked_policy_changed",
         /// The caller's expected policy differs from the stored one.

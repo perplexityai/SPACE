@@ -693,16 +693,15 @@ impl SandboxController {
         Ok(())
     }
 
-    /// Persist timeout intent. With `space-api-timeout-lock-bypass` on, a call
-    /// that leaves the normalized policy unchanged and matches any
-    /// `expected_policy` is decided from one unlocked read when that read
-    /// settles runtime presence: created, paused or suspended (stored only),
-    /// or started with a known execution generation (runtime reset). Such a
-    /// call is ordered before any writer still holding the sandbox row lock.
-    /// Every other call reads under the row lock, so its absence decision
-    /// serializes with execution acquisition. The request budget includes
-    /// the transaction and any observation of an already-owned activation;
-    /// this never starts one.
+    /// Persist timeout intent. A call that leaves the normalized policy
+    /// unchanged and matches any `expected_policy` is decided from one
+    /// unlocked read when that read settles runtime presence: created, paused
+    /// or suspended (stored only), or started with a known execution
+    /// generation (runtime reset). Such a call is ordered before any writer
+    /// still holding the sandbox row lock. Every other call reads under the
+    /// row lock, so its absence decision serializes with execution
+    /// acquisition. The request budget includes the transaction and any
+    /// observation of an already-owned activation; this never starts one.
     pub(crate) async fn set_access_idle_timeout(
         &self,
         pool: &PgPool,
@@ -714,34 +713,27 @@ impl SandboxController {
     ) -> Result<AccessIdleTimeoutOutcome, ControllerError> {
         use pplx_space_metrics::sandbox::api::TimeoutUpdateLockDecision as Decision;
         tokio::time::timeout_at(deadline, async {
-            let (decision, unlocked) = if self.feature_flags.bool_value(
-                pplx_space_feature_flags::SPACE_API_TIMEOUT_LOCK_BYPASS_FLAG,
-                &sandbox.id.to_string(),
-            ) {
-                let execution = sandbox_store::auto_lifecycle_execution(pool, sandbox.id)
-                    .await
-                    .map_err(|error| db_contention_error("read timeout ownership", &error.into()))?
-                    .ok_or_else(|| ControllerError::not_found("sandbox no longer exists"))?;
-                let intent = TimeoutIntent::new(&execution, timeout_secs, expected_policy);
-                if !intent.expected_matches {
-                    (Decision::LockedExpectedMismatch, None)
-                } else if intent.next != intent.current {
-                    (Decision::LockedPolicyChanged, None)
-                } else {
-                    match RuntimePresence::unlocked(&execution) {
-                        Some(RuntimePresence::Absent) => (
-                            Decision::SkippedAbsent,
-                            Some((execution, intent, RuntimePresence::Absent)),
-                        ),
-                        Some(RuntimePresence::Present) => (
-                            Decision::SkippedPresent,
-                            Some((execution, intent, RuntimePresence::Present)),
-                        ),
-                        None => (Decision::LockedPresenceUnknown, None),
-                    }
-                }
+            let execution = sandbox_store::auto_lifecycle_execution(pool, sandbox.id)
+                .await
+                .map_err(|error| db_contention_error("read timeout ownership", &error.into()))?
+                .ok_or_else(|| ControllerError::not_found("sandbox no longer exists"))?;
+            let intent = TimeoutIntent::new(&execution, timeout_secs, expected_policy);
+            let (decision, unlocked) = if !intent.expected_matches {
+                (Decision::LockedExpectedMismatch, None)
+            } else if intent.next != intent.current {
+                (Decision::LockedPolicyChanged, None)
             } else {
-                (Decision::LockedFlagOff, None)
+                match RuntimePresence::unlocked(&execution) {
+                    Some(RuntimePresence::Absent) => (
+                        Decision::SkippedAbsent,
+                        Some((execution, intent, RuntimePresence::Absent)),
+                    ),
+                    Some(RuntimePresence::Present) => (
+                        Decision::SkippedPresent,
+                        Some((execution, intent, RuntimePresence::Present)),
+                    ),
+                    None => (Decision::LockedPresenceUnknown, None),
+                }
             };
             pplx_space_metrics::sandbox::api::timeout_update_lock_decision(decision);
             let (execution, intent, presence) = if let Some(unlocked) = unlocked {

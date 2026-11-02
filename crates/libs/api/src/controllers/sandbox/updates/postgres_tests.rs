@@ -16,7 +16,6 @@ use pplx_space_common_core::types::{OrgId, UserId};
 use super::*;
 use crate::models::{SandboxMetadata, SandboxMetadataValue, User};
 use pplx_space_db_test_fixtures::pg_test_db;
-use pplx_space_feature_flags::{FeatureFlagClient, SPACE_API_TIMEOUT_LOCK_BYPASS_FLAG};
 use pplx_space_test_env::TestResult;
 
 async fn insert_actor(pool: &PgPool) -> TestResult<User> {
@@ -218,12 +217,7 @@ async fn unchanged_timeout_does_not_wait_for_an_unrelated_row_lock() -> TestResu
     // connection.
     let db = pplx_space_db_test_fixtures::pg_test_db_with_max_connections(3).await?;
     let actor = insert_actor(&db.pool).await?;
-    let enabled =
-        FeatureFlagClient::fixed_bools([(SPACE_API_TIMEOUT_LOCK_BYPASS_FLAG.key(), true)]);
-    let disabled =
-        FeatureFlagClient::fixed_bools([(SPACE_API_TIMEOUT_LOCK_BYPASS_FLAG.key(), false)]);
-    let absent = FeatureFlagClient::disabled();
-    let controller = direct_sandbox_controller(&db.pool).with_feature_flags(enabled.clone());
+    let controller = direct_sandbox_controller(&db.pool);
     let policy = crate::e2b::auto_lifecycle_policy(90, true, false);
     let node = pplx_space_common_core::types::NodeId::new();
     let worker = pplx_space_node_api_sim::SimWorkerHarness::builder(node.to_string())
@@ -300,8 +294,7 @@ async fn unchanged_timeout_does_not_wait_for_an_unrelated_row_lock() -> TestResu
             );
         }
     }
-    // Ineligible requests retain locking even with unchanged intent. Gate
-    // rollback and missing configuration must also restore that behavior.
+    // Ineligible requests retain locking even with unchanged intent.
     // `Running` rows carry execution evidence; the others carry none, and
     // Direct proves nothing from missing evidence.
     #[derive(Clone, Copy, Debug, PartialEq)]
@@ -313,15 +306,11 @@ async fn unchanged_timeout_does_not_wait_for_an_unrelated_row_lock() -> TestResu
     #[derive(Clone, Copy, Debug)]
     enum Call {
         Unchanged,
-        FlagOff,
-        FlagAbsent,
         Changed,
         Conflicting,
     }
     let conflicting = crate::e2b::auto_lifecycle_policy(120, true, false);
     for (lifecycle, seed, call, decision) in [
-        ("created", Seed::K8s, Call::FlagOff, "locked_flag_off"),
-        ("created", Seed::K8s, Call::FlagAbsent, "locked_flag_off"),
         ("created", Seed::K8s, Call::Changed, "locked_policy_changed"),
         (
             "created",
@@ -439,17 +428,11 @@ async fn unchanged_timeout_does_not_wait_for_an_unrelated_row_lock() -> TestResu
         ),
     ] {
         let case = format!("{lifecycle} {seed:?} {call:?}");
-        let flags = match call {
-            Call::FlagOff => &disabled,
-            Call::FlagAbsent => &absent,
-            Call::Unchanged | Call::Changed | Call::Conflicting => &enabled,
-        };
         let (timeout, expected) = match call {
             Call::Changed => (120, &policy),
             Call::Conflicting => (90, &conflicting),
-            Call::Unchanged | Call::FlagOff | Call::FlagAbsent => (90, &policy),
+            Call::Unchanged => (90, &policy),
         };
-        let controller = controller.clone().with_feature_flags(flags.clone());
         let sandbox = seed_timeout_sandbox(
             &db.pool,
             &actor,

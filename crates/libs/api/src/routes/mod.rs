@@ -157,7 +157,6 @@ impl AppState {
                 substrate.clone(),
                 cluster_admission,
             )
-            .with_feature_flags(feature_flags.clone())
             .with_route_ed25519_authority(route_ed25519_authority)
             .with_federated_grant_audience(federated_identity.policy.grant_audience.clone())
             .with_egress_profiles(egress_profiles)
