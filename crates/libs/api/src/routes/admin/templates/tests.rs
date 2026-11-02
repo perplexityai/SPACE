@@ -239,6 +239,7 @@ async fn named_release_tag_moves_existing_release_into_warm_retention() -> TestR
         Path(republished_release_id),
         Json(TemplateReleaseTagRequest {
             tag: "prod".to_string(),
+            expected_current_release_id: None,
         }),
     )
     .await
@@ -255,6 +256,137 @@ async fn named_release_tag_moves_existing_release_into_warm_retention() -> TestR
         release.template_name == template.as_str() && release.content_hash == newer_hash
     }));
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_release_tag_move_honours_its_expected_current_release() -> TestResult {
+    let db = pg_test_db().await?;
+    let state = AppState::from_pool(db.pool.clone()).await?;
+    let actor = sqlx::query_as::<_, User>(sql!(
+        "SELECT u.*
+         FROM users u
+         JOIN clusters c ON c.managing_org_id = u.org_id
+         WHERE c.singleton
+           AND u.role = 'organization_admin'
+         ORDER BY u.id
+         LIMIT 1"
+    ))
+    .fetch_one(&db.pool)
+    .await?;
+    let template = TemplateName::parse("cas-retag")?;
+    let older = Uuid::now_v7();
+    let newer = Uuid::now_v7();
+    insert_template(&db.pool, &template).await?;
+    sqlx::query(sql!("UPDATE templates SET org_id = $2 WHERE name = $1"))
+        .bind(template.as_str())
+        .bind(actor.org_id)
+        .execute(&db.pool)
+        .await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_releases (id, template_name, type, hash, org_id)
+         VALUES
+             ($1, $3, 'fc', 'sha256:1616161616161616161616161616161616161616161616161616161616161616', $4),
+             ($2, $3, 'fc', 'sha256:1717171717171717171717171717171717171717171717171717171717171717', $4)"
+    ))
+    .bind(older)
+    .bind(newer)
+    .bind(template.as_str())
+    .bind(actor.org_id)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_release_tags (template_release_id, template_name, tag)
+         VALUES ($1, $2, 'prod')"
+    ))
+    .bind(newer)
+    .bind(template.as_str())
+    .execute(&db.pool)
+    .await?;
+    let tag_release = |release_id: Uuid, body: serde_json::Value| {
+        let state = state.clone();
+        let actor = actor.clone();
+        async move {
+            let request: TemplateReleaseTagRequest = serde_json::from_value(body)?;
+            let response = tag_template_release(
+                State(state),
+                Extension(AuthUser(actor)),
+                Path(release_id),
+                Json(request),
+            )
+            .await
+            .into_response();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 1_000_000).await?;
+            TestResult::Ok((status, serde_json::from_slice::<serde_json::Value>(&body)?))
+        }
+    };
+    let prod_release = || async {
+        sqlx::query_scalar::<_, Uuid>(sql!(
+            "SELECT template_release_id FROM template_release_tags
+             WHERE template_name = $1 AND tag = 'prod'"
+        ))
+        .bind(template.as_str())
+        .fetch_one(&db.pool)
+        .await
+    };
+
+    // A stale expectation, and an expectation that the tag is absent, are
+    // both refused without moving it, naming where it points now.
+    for expected in [serde_json::json!(older), serde_json::Value::Null] {
+        let (status, body) = tag_release(
+            older,
+            serde_json::json!({ "tag": "prod", "expected_current_release_id": expected }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{expected}");
+        assert_eq!(body["code"], "failed_precondition");
+        assert_eq!(
+            body["details"],
+            serde_json::json!([{ "key": "current_release_id", "value": newer.to_string() }])
+        );
+        assert_eq!(prod_release().await?, newer);
+    }
+
+    let (status, _) = tag_release(
+        older,
+        serde_json::json!({ "tag": "prod", "expected_current_release_id": newer }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(prod_release().await?, older);
+
+    // `null` creates a tag that does not exist yet, and only once.
+    let canary = serde_json::json!({ "tag": "canary", "expected_current_release_id": null });
+    let (status, _) = tag_release(newer, canary.clone()).await?;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = tag_release(older, canary).await?;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+
+    // Omitted, the move stays unconditional.
+    let (status, _) = tag_release(newer, serde_json::json!({ "tag": "prod" })).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(prod_release().await?, newer);
+
+    // A tag that other writers keep creating and removing under the move is
+    // a race lost, which the caller may retry. A trigger that discards the
+    // insert stands in for them: each attempt sees the insert do nothing and
+    // the tag still absent on the re-read.
+    sqlx::query(sql!(
+        "CREATE FUNCTION discard_tag_insert() RETURNS trigger
+         LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$"
+    ))
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "CREATE TRIGGER discard_tag_insert BEFORE INSERT ON template_release_tags
+         FOR EACH ROW WHEN (NEW.tag = 'raced') EXECUTE FUNCTION discard_tag_insert()"
+    ))
+    .execute(&db.pool)
+    .await?;
+    let (status, body) = tag_release(newer, serde_json::json!({ "tag": "raced" })).await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["retryable"], true, "{body}");
     Ok(())
 }
 

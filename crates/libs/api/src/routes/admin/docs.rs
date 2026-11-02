@@ -745,7 +745,29 @@ fn insert_template_admin_paths(paths: &mut Map<String, Value>) {
         json!({
             "put": {
                 "summary": "Move or create a template release tag",
-                "responses": { "200": { "description": "Template release" } }
+                "description": "Omit expected_current_release_id to move the tag unconditionally. Set it to a release id to move the tag only while it points at that release, or to null to create the tag only if it does not exist yet; the check and the move are one transaction. The admin audit log entry for the move names the release the tag pointed at before it (previous_release_id, empty when the move created the tag).",
+                "requestBody": {
+                    "required": true,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["tag"],
+                                "properties": {
+                                    "tag": { "type": "string" },
+                                    "expected_current_release_id": { "type": ["string", "null"], "format": "uuid", "description": "Compare-and-set precondition on the tag's current release; null requires that the tag not exist" }
+                                }
+                            }
+                        }
+                    }
+                },
+                "responses": {
+                    "200": { "description": "Template release" },
+                    "404": { "description": "Release not found or its template is not present" },
+                    "409": { "description": "The tag changed concurrently; read it again and retry" },
+                    "412": { "description": "The tag does not point at expected_current_release_id. details carries current_release_id when the tag exists" }
+                }
             }
         }),
     );

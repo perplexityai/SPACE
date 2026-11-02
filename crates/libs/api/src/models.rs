@@ -814,6 +814,12 @@ pub struct TemplateReleaseResponse {
 #[serde(deny_unknown_fields)]
 pub struct TemplateReleaseTagRequest {
     pub tag: String,
+    /// Compare-and-set precondition on the tag's current release. Omitted,
+    /// the tag moves unconditionally. `null` ([`NullablePatch::Clear`])
+    /// requires that the tag not exist yet; a release id requires that the
+    /// tag point at that release now.
+    #[serde(default, deserialize_with = "deserialize_nullable_patch")]
+    pub expected_current_release_id: Option<NullablePatch<Uuid>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

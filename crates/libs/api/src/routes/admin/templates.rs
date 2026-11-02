@@ -35,7 +35,7 @@ use crate::{
     },
     middleware::auth::AuthUser,
     models::{
-        CreatePoolApiRequest, CreateTemplateRequest, NetworkPolicyStatus,
+        CreatePoolApiRequest, CreateTemplateRequest, NetworkPolicyStatus, NullablePatch,
         SystemTemplateBuildRequest, TemplateBaseSnapshotPolicyRequest, TemplateBuildClientContext,
         TemplateBuildConfig, TemplateBuildCopyStep, TemplateBuildListEntry, TemplateBuildOrigin,
         TemplateBuildPackageManager, TemplateBuildRecipe, TemplateBuildRequest,
@@ -54,8 +54,9 @@ use crate::{
     reconcile_trigger::enqueue_triggers_tx,
     routes::{
         AppState,
-        admin::support::{
-            self, ContentionScope, IDEMPOTENCY_KEY_HEADER, parse_if_match_generation,
+        admin::{
+            audit,
+            support::{self, ContentionScope, IDEMPOTENCY_KEY_HEADER, parse_if_match_generation},
         },
         authz,
     },
@@ -2024,7 +2025,13 @@ pub async fn tag_template_release(
         Ok(tx) => tx,
         Err(response) => return response.into_response(),
     };
-    let result: Result<Option<TemplateReleaseRow>, sqlx::Error> = async {
+    let expected = request
+        .expected_current_release_id
+        .map(|expected| match expected {
+            NullablePatch::Set(release_id) => Some(release_id),
+            NullablePatch::Clear => None,
+        });
+    let result: Result<TagMove, sqlx::Error> = async {
         let row = sqlx::query_as::<_, TemplateReleaseRow>(sql!(
             "SELECT r.id, r.template_name, r.type AS runtime, r.hash AS content_hash, r.created_at
              FROM template_releases r
@@ -2038,34 +2045,72 @@ pub async fn tag_template_release(
         .fetch_optional(&mut *tx)
         .await?;
         let Some(row) = row else {
-            return Ok(None);
+            return Ok(TagMove::ReleaseMissing);
         };
-        sqlx::query(sql!(
-            "INSERT INTO template_release_tags (template_release_id, template_name, tag)
-             VALUES ($1, $2, $3)
-             ON CONFLICT (template_name, tag) DO UPDATE
-             SET template_release_id = EXCLUDED.template_release_id,
-                 modified_at = NOW()"
-        ))
-        .bind(row.id)
-        .bind(&row.template_name)
-        .bind(tag.as_str())
-        .execute(&mut *tx)
-        .await?;
-        let template_name = TemplateName::parse(&row.template_name)
-            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
-        enqueue_template_refs_tx(
-            &mut tx,
-            &[ReconcileRef::template_desired_state(template_name)],
-            pplx_space_common_svc::types::ReconcileReason::TemplateDesiredStateUpdated,
-        )
-        .await?;
-        tx.commit().await?;
-        Ok(Some(row))
+        // Not every tag writer locks the template row, so the tag row's own
+        // lock is what makes the precondition and the move one step. A tag
+        // created between this read and the insert below has committed by the
+        // time `DO NOTHING` reports it, so one more read finds and locks it.
+        let mut previous =
+            current_tag_release_for_update(&mut tx, &row.template_name, tag.as_str()).await?;
+        for _ in 0..2 {
+            if let Some(expected) = expected
+                && expected != previous
+            {
+                return Ok(TagMove::PreconditionFailed {
+                    template_name: row.template_name,
+                    current: previous,
+                });
+            }
+            let moved = match previous {
+                Some(_) => sqlx::query(sql!(
+                    "UPDATE template_release_tags
+                     SET template_release_id = $1,
+                         modified_at = NOW()
+                     WHERE template_name = $2 AND tag = $3"
+                )),
+                None => sqlx::query(sql!(
+                    "INSERT INTO template_release_tags (template_release_id, template_name, tag)
+                     VALUES ($1, $2, $3)
+                     ON CONFLICT (template_name, tag) DO NOTHING"
+                )),
+            }
+            .bind(row.id)
+            .bind(&row.template_name)
+            .bind(tag.as_str())
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+                == 1;
+            if moved {
+                let template_name = TemplateName::parse(&row.template_name)
+                    .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+                enqueue_template_refs_tx(
+                    &mut tx,
+                    &[ReconcileRef::template_desired_state(template_name)],
+                    pplx_space_common_svc::types::ReconcileReason::TemplateDesiredStateUpdated,
+                )
+                .await?;
+                tx.commit().await?;
+                return Ok(TagMove::Moved { row, previous });
+            }
+            previous =
+                current_tag_release_for_update(&mut tx, &row.template_name, tag.as_str()).await?;
+        }
+        Ok(TagMove::Raced)
     }
     .await;
     match result {
-        Ok(Some(row)) => {
+        Ok(TagMove::Moved { row, previous }) => {
+            audit::record_template_tag(audit::AdminTemplateTagAuditEntry {
+                actor: &actor,
+                template_name: &row.template_name,
+                tag: tag.as_str(),
+                release_id,
+                previous_release_id: previous,
+                success: true,
+                error: None,
+            });
             let releases = match hydrate_template_releases(&state.pool, vec![row]).await {
                 Ok(releases) => releases,
                 // Unclassified, and non-retryable, for the reason spelled
@@ -2079,7 +2124,38 @@ pub async fn tag_template_release(
             };
             Json(releases.into_iter().next().expect("one release")).into_response()
         }
-        Ok(None) => api_error(StatusCode::NOT_FOUND, "Template release not found").into_response(),
+        Ok(TagMove::PreconditionFailed {
+            template_name,
+            current,
+        }) => {
+            let message = "tag does not point at expected_current_release_id";
+            audit::record_template_tag(audit::AdminTemplateTagAuditEntry {
+                actor: &actor,
+                template_name: &template_name,
+                tag: tag.as_str(),
+                release_id,
+                previous_release_id: current,
+                success: false,
+                error: Some(message),
+            });
+            let details = current
+                .map(|id| PublicErrorDetail {
+                    key: "current_release_id".to_string(),
+                    value: id.to_string(),
+                })
+                .into_iter()
+                .collect();
+            api_error_with_details(StatusCode::PRECONDITION_FAILED, message, details)
+                .into_response()
+        }
+        Ok(TagMove::Raced) => contention_envelope(
+            StatusCode::CONFLICT,
+            "tag changed while it was being moved; read it again and retry",
+        )
+        .into_response(),
+        Ok(TagMove::ReleaseMissing) => {
+            api_error(StatusCode::NOT_FOUND, "Template release not found").into_response()
+        }
         Err(error) => contention_response(ContentionScope::Writing, &error)
             .unwrap_or_else(|| {
                 tracing::error!(%error, %release_id, "failed to tag template release");
@@ -2087,6 +2163,44 @@ pub async fn tag_template_release(
             })
             .into_response(),
     }
+}
+
+/// What `tag_template_release`'s transaction did.
+enum TagMove {
+    ReleaseMissing,
+    /// The tag now points at the release; `previous` is where it pointed
+    /// before, `None` when this created it.
+    Moved {
+        row: TemplateReleaseRow,
+        previous: Option<Uuid>,
+    },
+    /// `expected_current_release_id` did not match `current`.
+    PreconditionFailed {
+        template_name: String,
+        current: Option<Uuid>,
+    },
+    /// The tag was created and removed again by other writers between this
+    /// request's reads.
+    Raced,
+}
+
+/// The release a tag points at, locking its row for the rest of the
+/// transaction, or `None` when the tag does not exist.
+async fn current_tag_release_for_update(
+    tx: &mut sqlx::Transaction<'static, sqlx::Postgres>,
+    template_name: &str,
+    tag: &str,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    sqlx::query_scalar(sql!(
+        "SELECT template_release_id
+         FROM template_release_tags
+         WHERE template_name = $1 AND tag = $2
+         FOR UPDATE"
+    ))
+    .bind(template_name)
+    .bind(tag)
+    .fetch_optional(&mut **tx)
+    .await
 }
 
 pub async fn delete_template_release_tag(
