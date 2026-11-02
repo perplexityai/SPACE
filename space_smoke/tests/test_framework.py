@@ -203,6 +203,7 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "native_recovery.queued_create_survives_api_restart",
                 "native_recovery.slow_operation_does_not_block_later_work",
                 "native_recovery.stale_queued_work_expires_after_controller_outage",
+                "network_policy.live_update",
                 "network_policy.v1_cidr_allow",
                 "network_policy.v1_cidr_deny",
                 "network_policy.v1_deny_precedes_allow",

@@ -1212,6 +1212,20 @@ class ForkableSandbox(Protocol):
         ...
 
 
+@dataclass(frozen=True)
+class NetworkPolicyObservation:
+    revision: str
+    desired_target: str | None
+    applied_target: str | None
+    state: str
+    execution_generation: int | None
+    gateway_instance: str | None
+
+
+class NetworkPolicyConflict(RuntimeError):
+    """The expected revision or idempotency payload conflicts with stored intent."""
+
+
 class EcwSandbox(ProcessSandbox, Protocol):
     @property
     def sandbox_id(self) -> str: ...
@@ -1242,6 +1256,16 @@ class EcwSandbox(ProcessSandbox, Protocol):
     def try_get_info(self) -> EcwSandboxInfo | None: ...
 
     def set_timeout(self, timeout: int) -> None: ...
+
+    def network_policy_status(self) -> NetworkPolicyObservation: ...
+
+    def replace_network_policy(
+        self,
+        *,
+        revision: str,
+        key: str,
+        allow: Sequence[str],
+    ) -> str: ...
 
     def refresh(self) -> None: ...
 

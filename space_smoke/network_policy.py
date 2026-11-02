@@ -27,6 +27,12 @@ class NetworkPolicyAssertions:
 
     _test: Ecw
 
+    def verify_live_update(self) -> None:
+        """Exercise replacement through management HTTP and real guest traffic."""
+        from space_smoke.network_policy_update import verify_live_update
+
+        verify_live_update(self._test)
+
     def verify_egress(
         self,
         *,

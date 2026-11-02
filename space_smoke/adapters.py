@@ -66,6 +66,8 @@ from space_smoke.capabilities import (
     DrainGateBlocker,
     TerminateAttempt,
     EcwCommandResult,
+    NetworkPolicyObservation,
+    NetworkPolicyConflict,
     EcwCreateAttempt,
     EcwCreateNotDelivered,
     EcwDataPlaneNotFound,
@@ -7812,6 +7814,51 @@ class _SdkSandbox:
             expected_status=None,
             timeout=_ECW_SET_TIMEOUT_REQUEST_SECONDS,
         )
+
+    def network_policy_status(self) -> NetworkPolicyObservation:
+        value = _ecw_control_plane_json(
+            self._config,
+            "GET",
+            f"/sandboxes/{quote(self.sandbox_id, safe='')}/network-policy",
+            body=None,
+            idempotency_key=None,
+            expected_status=200,
+            timeout=15,
+        )
+        return NetworkPolicyObservation(
+            revision=value["revision"],
+            desired_target=value["desiredTarget"],
+            applied_target=value["appliedTarget"],
+            state=value["state"],
+            execution_generation=value["executionGeneration"],
+            gateway_instance=value["gatewayInstance"],
+        )
+
+    def replace_network_policy(
+        self,
+        *,
+        revision: str,
+        key: str,
+        allow: Sequence[str],
+    ) -> str:
+        try:
+            value = _ecw_control_plane_json(
+                self._config,
+                "PUT",
+                f"/sandboxes/{quote(self.sandbox_id, safe='')}/network-policy",
+                body={
+                    "expectedRevision": revision,
+                    "network": {"allowOut": list(allow)},
+                },
+                idempotency_key=key,
+                expected_status=202,
+                timeout=15,
+            )
+        except EcwControlPlaneHttpError as error:
+            if error.status == 409:
+                raise NetworkPolicyConflict(str(error)) from error
+            raise
+        return str(value["target"])
 
     def refresh(self) -> None:
         _ecw_control_plane_json(
