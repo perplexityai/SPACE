@@ -51,6 +51,15 @@ fn build_jobs_store_error(
 const TEMPLATE_BUILD_SUBMIT_ATTEMPTS: usize = 3;
 const TEMPLATE_BUILD_SUBMIT_RETRY_DELAY: Duration = Duration::from_secs(1);
 
+/// The longest the builder dispatch in [`TemplateController::submit_template_build`]
+/// can take: every attempt running to the node-RPC timeout, plus the delays
+/// between them. A caller that must outlast the dispatch sizes against it.
+pub(crate) const TEMPLATE_BUILD_SUBMIT_BUDGET: Duration = Duration::from_secs(
+    TEMPLATE_BUILD_SUBMIT_ATTEMPTS as u64
+        * crate::controllers::substrate::NODE_RPC_TIMEOUT.as_secs()
+        + (TEMPLATE_BUILD_SUBMIT_ATTEMPTS as u64 - 1) * TEMPLATE_BUILD_SUBMIT_RETRY_DELAY.as_secs(),
+);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TemplateBuildStatusTransientReason {
     Rpc,

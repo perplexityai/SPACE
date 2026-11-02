@@ -2,6 +2,7 @@ use pplx_space_common_core::types::{NodeId, OrgId};
 
 use pplx_space_common_core::sql;
 use std::collections::HashMap;
+use std::time::Duration;
 
 use axum::{
     Extension, Json,
@@ -31,7 +32,10 @@ use uuid::Uuid;
 use crate::{
     controllers::{
         substrate::BuilderClient,
-        template::{TemplateBuildSubmission, TemplateBuildTarget, template_build_status_with},
+        template::{
+            TEMPLATE_BUILD_SUBMIT_BUDGET, TemplateBuildSubmission, TemplateBuildTarget,
+            template_build_status_with,
+        },
     },
     middleware::auth::AuthUser,
     models::{
@@ -47,7 +51,7 @@ use crate::{
     public_operations::{
         ApiProduct, CreatePublicOperation, CreatePublicOperationIdempotency,
         CreatePublicOperationResult, HttpOperationMethod, OperationPathTemplate,
-        PublicOperationStore, PublicOperationStoreError,
+        PublicOperationStore, PublicOperationStoreError, ReservationId, ResponseReservation,
     },
     public_template_operations::DeleteTemplateOperationPayload,
     reconcile_queue::{ReconcileFacet, ReconcileRef, enqueue_node_reconcile_refs_for_nodes_tx},
@@ -1542,19 +1546,25 @@ pub async fn start_template_build(
     .await
 }
 
+/// The idempotency namespace for system template builds. Its records hold the
+/// build's response, not an operation, so this path must never meet
+/// `PublicOperationStore::create_operation`.
+const SYSTEM_TEMPLATE_BUILD_PATH_TEMPLATE: &str = "/admin/v1/system-templates/{template}/builds";
+
 pub async fn start_system_template_build(
     State(state): State<AppState>,
     Extension(AuthUser(actor)): Extension<AuthUser>,
     Path(template): Path<SystemTemplate>,
+    headers: HeaderMap,
     Json(request): Json<SystemTemplateBuildRequest>,
 ) -> impl IntoResponse {
     if let Err(error) = require_template_admin(&state.pool, &actor).await {
         return error.into_response();
     }
-    let template_name = template.into();
-    if let Err(error) = reject_deleted_template_build(&state.pool, &template_name).await {
-        return error.into_response();
-    }
+    let idempotency_key = match optional_idempotency_key(&headers) {
+        Ok(key) => key,
+        Err(error) => return error.into_response(),
+    };
     if let Some(base) = &request.base
         && (template != SystemTemplate::CodeRuntime || base.name().as_str() != "seed")
     {
@@ -1569,26 +1579,290 @@ pub async fn start_system_template_build(
         Err(error) => return api_error(StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     };
     let base = request.base.map(|base| base.to_string());
-    let recipe = match system_template_recipe(template, base.as_deref()) {
-        Ok(recipe) => recipe,
-        Err(error) => {
-            tracing::error!(%error, %template, "invalid bundled system template recipe");
-            return api_error(
+    let managing_org_id = match managing_org_id(
+        &state.pool,
+        "failed to load managing org for template build",
+    )
+    .await
+    {
+        Ok(org_id) => org_id,
+        Err(response) => return response.into_response(),
+    };
+    let fingerprint = match idempotency_key.as_ref() {
+        Some(_) => match system_template_build_fingerprint(
+            template,
+            base.as_deref(),
+            request.force,
+            &publish_tags,
+        ) {
+            Ok(fingerprint) => Some(fingerprint),
+            Err(error) => return error.into_response(),
+        },
+        None => None,
+    };
+    let idempotency =
+        idempotency_key
+            .as_ref()
+            .zip(fingerprint.as_ref())
+            .map(|(key, fingerprint)| CreatePublicOperationIdempotency {
+                method: HttpOperationMethod::Post,
+                path_template: OperationPathTemplate::new(SYSTEM_TEMPLATE_BUILD_PATH_TEMPLATE),
+                key,
+                request_fingerprint: fingerprint,
+            });
+    // The builder starts a new job per submission and takes no caller
+    // identity to deduplicate on, so the key is reserved, committed, before
+    // dispatch; a replay meets the reservation instead of the builder.
+    let reservation = match &idempotency {
+        Some(idempotency) => match PublicOperationStore::new(state.pool.clone())
+            .reserve_response(
+                managing_org_id,
+                ApiProduct::Admin,
+                idempotency,
+                SYSTEM_TEMPLATE_BUILD_RESERVATION,
+            )
+            .await
+        {
+            Ok(ResponseReservation::Reserved(reservation)) => Some(reservation),
+            Ok(ResponseReservation::Completed(response)) => {
+                return (StatusCode::ACCEPTED, Json(response)).into_response();
+            }
+            Ok(ResponseReservation::InProgress { reserved_at }) => {
+                return build_reservation_conflict(
+                    "a build with this Idempotency-Key is still being submitted; retry shortly"
+                        .to_string(),
+                    reserved_at,
+                    true,
+                )
+                .into_response();
+            }
+            Ok(ResponseReservation::Abandoned { reserved_at }) => {
+                return build_reservation_conflict(
+                    format!(
+                        "the build submitted with this Idempotency-Key at {} did not record \
+                         its outcome and may have started; check /template-releases for its \
+                         release before submitting again with a new key",
+                        format_time(reserved_at)
+                    ),
+                    reserved_at,
+                    false,
+                )
+                .into_response();
+            }
+            Err(error) => return response_admission_error(&error).into_response(),
+        },
+        None => None,
+    };
+    let submission = submit_system_template_build(
+        state,
+        managing_org_id,
+        template,
+        base,
+        request.force,
+        publish_tags,
+        reservation,
+    );
+    let result = match reservation {
+        None => submission.await,
+        // Spawned so that a client disconnect, which drops this handler,
+        // cannot cancel a dispatch the reservation stands for: the task
+        // records the outcome whether or not anyone is still waiting.
+        Some(_) => match tokio::spawn(submission).await {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::error!(%error, %template, "system template build submission task failed");
+                return post_commit_error("Internal server error").into_response();
+            }
+        },
+    };
+    match result {
+        Ok(started) => (StatusCode::ACCEPTED, Json(started)).into_response(),
+        Err(response) => *response,
+    }
+}
+
+/// How long a system build's idempotency reservation counts as in flight
+/// before a replay reports its outcome unknown. It outlasts the whole builder
+/// dispatch, so a replay never calls a running dispatch abandoned.
+const SYSTEM_TEMPLATE_BUILD_RESERVATION: Duration = Duration::from_secs(15 * 60);
+const _: () =
+    assert!(SYSTEM_TEMPLATE_BUILD_RESERVATION.as_secs() > TEMPLATE_BUILD_SUBMIT_BUDGET.as_secs());
+
+/// Dispatch a system build, then settle its reservation, if it has one.
+async fn submit_system_template_build(
+    state: AppState,
+    managing_org_id: OrgId,
+    template: SystemTemplate,
+    base: Option<String>,
+    force: bool,
+    publish_tags: Vec<String>,
+    reservation: Option<ReservationId>,
+) -> Result<TemplateBuildStartResponse, Box<axum::response::Response>> {
+    let started = dispatch_system_template_build(
+        &state,
+        managing_org_id,
+        template,
+        base.as_deref(),
+        force,
+        publish_tags,
+    )
+    .await;
+    let Some(reservation) = reservation else {
+        return started;
+    };
+    let store = PublicOperationStore::new(state.pool.clone());
+    match &started {
+        // The job is running, so a failure to record it is logged, not
+        // answered: an error would invite the retry that starts a second job.
+        // The reservation, still pending, answers that retry instead.
+        Ok(started) => {
+            let response = serde_json::to_value(started).expect("build start response serializes");
+            match store
+                .complete_response_reservation(reservation, response)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => tracing::error!(
+                    %template,
+                    job_id = %started.job_id,
+                    "the system template build's idempotency reservation was no longer pending"
+                ),
+                Err(error) => tracing::error!(
+                    %error,
+                    %template,
+                    job_id = %started.job_id,
+                    "failed to record the system template build's idempotency key; \
+                     replays report it in progress, then of unknown outcome"
+                ),
+            }
+        }
+        // No job started, or the controller revoked the publication grant of
+        // one an ambiguous dispatch failure may have started, which then
+        // cannot publish. Either way the key is free for a retry.
+        Err(_) => {
+            if let Err(error) = store.release_response_reservation(reservation).await {
+                tracing::warn!(
+                    %error,
+                    %template,
+                    "failed to release an undispatched system template build's idempotency \
+                     reservation; replays report it in progress, then of unknown outcome"
+                );
+            }
+        }
+    }
+    started
+}
+
+async fn dispatch_system_template_build(
+    state: &AppState,
+    managing_org_id: OrgId,
+    template: SystemTemplate,
+    base: Option<&str>,
+    force: bool,
+    publish_tags: Vec<String>,
+) -> Result<TemplateBuildStartResponse, Box<axum::response::Response>> {
+    let template_name = template.into();
+    reject_deleted_template_build(&state.pool, &template_name)
+        .await
+        .map_err(|error| Box::new(error.into_response()))?;
+    let recipe = system_template_recipe(template, base).map_err(|error| {
+        tracing::error!(%error, %template, "invalid bundled system template recipe");
+        Box::new(
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Invalid bundled system template recipe",
             )
-            .into_response();
-        }
-    };
-    submit_admin_template_build(
+            .into_response(),
+        )
+    })?;
+    dispatch_admin_template_build(
         state,
+        managing_org_id,
         TemplateBuildTarget::System(template),
         recipe,
-        request.force,
+        force,
         publish_tags,
         None,
     )
     .await
+}
+
+/// A replay that met another request's still-pending reservation.
+fn build_reservation_conflict(
+    message: String,
+    reserved_at: OffsetDateTime,
+    retryable: bool,
+) -> ApiErrorResponse {
+    let (status, Json(mut envelope)) = api_error_with_details(
+        StatusCode::CONFLICT,
+        message,
+        vec![PublicErrorDetail {
+            key: "reserved_at".to_string(),
+            value: format_time(reserved_at),
+        }],
+    );
+    envelope.retryable = retryable;
+    (status, Json(envelope))
+}
+
+/// The `Idempotency-Key` header when the caller sent one.
+fn optional_idempotency_key(
+    headers: &HeaderMap,
+) -> Result<Option<IdempotencyKey>, ApiErrorResponse> {
+    headers
+        .get(IDEMPOTENCY_KEY_HEADER)
+        .map(|value| {
+            IdempotencyKey::parse_header(value.as_bytes())
+                .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.to_string()))
+        })
+        .transpose()
+}
+
+/// What makes two system template builds the same request: the normalized
+/// body, field for field, so a replay that changes any field is refused
+/// rather than silently answered with a job built from different input.
+fn system_template_build_fingerprint(
+    template: SystemTemplate,
+    base: Option<&str>,
+    force: bool,
+    publish_tags: &[String],
+) -> Result<RequestFingerprint, ApiErrorResponse> {
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "template": template.to_string(),
+        "base": base,
+        "force": force,
+        "publish_tags": publish_tags,
+    }))
+    .map_err(|error| {
+        tracing::error!(%error, "failed to serialize system template build fingerprint");
+        api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
+    })?;
+    RequestFingerprint::parse(hex::encode(Sha256::digest(bytes))).map_err(|error| {
+        tracing::error!(%error, "failed to build system template build fingerprint");
+        api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
+    })
+}
+
+fn response_admission_error(
+    error: &crate::public_operations::ResponseAdmissionError,
+) -> ApiErrorResponse {
+    use crate::public_operations::ResponseAdmissionError;
+    let sql = match error {
+        ResponseAdmissionError::Conflict => {
+            return api_error(
+                StatusCode::CONFLICT,
+                "idempotency key was already used with a different request",
+            );
+        }
+        ResponseAdmissionError::Sql(error)
+        | ResponseAdmissionError::Store(PublicOperationStoreError::Sql(error)) => Some(error),
+        ResponseAdmissionError::Store(_) => None,
+    };
+    sql.and_then(|error| contention_response(ContentionScope::Writing, error))
+        .unwrap_or_else(|| {
+            tracing::error!(%error, "failed to admit system template build idempotency key");
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
+        })
 }
 
 fn system_template_recipe(
@@ -1639,7 +1913,6 @@ async fn submit_admin_template_build(
     publish_tags: Vec<String>,
     client: Option<TemplateBuildClientContext>,
 ) -> axum::response::Response {
-    let template_name = target.template_name();
     let managing_org_id = match managing_org_id(
         &state.pool,
         "failed to load managing org for template build",
@@ -1649,6 +1922,32 @@ async fn submit_admin_template_build(
         Ok(org_id) => org_id,
         Err(response) => return response.into_response(),
     };
+    match dispatch_admin_template_build(
+        &state,
+        managing_org_id,
+        target,
+        recipe,
+        force,
+        publish_tags,
+        client,
+    )
+    .await
+    {
+        Ok(started) => (StatusCode::ACCEPTED, Json(started)).into_response(),
+        Err(response) => *response,
+    }
+}
+
+async fn dispatch_admin_template_build(
+    state: &AppState,
+    managing_org_id: OrgId,
+    target: TemplateBuildTarget,
+    recipe: build_proto::Recipe,
+    force: bool,
+    publish_tags: Vec<String>,
+    client: Option<TemplateBuildClientContext>,
+) -> Result<TemplateBuildStartResponse, Box<axum::response::Response>> {
+    let template_name = target.template_name();
     let client = client.unwrap_or_default();
     let response = state
         .template_controller
@@ -1672,15 +1971,11 @@ async fn submit_admin_template_build(
         })
         .await;
     match response {
-        Ok(response) => (
-            StatusCode::ACCEPTED,
-            Json(TemplateBuildStartResponse {
-                job_id: response.job_id,
-                template_name: template_name.to_string(),
-            }),
-        )
-            .into_response(),
-        Err(error) => error.into_response(),
+        Ok(response) => Ok(TemplateBuildStartResponse {
+            job_id: response.job_id,
+            template_name: template_name.to_string(),
+        }),
+        Err(error) => Err(Box::new(error.into_response())),
     }
 }
 

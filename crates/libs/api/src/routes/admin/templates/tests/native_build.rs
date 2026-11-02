@@ -480,3 +480,185 @@ async fn native_build_session_ownership(
     fixture.db.pool.close().await;
     Ok(())
 }
+
+/// A replayed system build with the same `Idempotency-Key` and body returns
+/// the original job without reaching the builder again; the same key with a
+/// different body is refused. The key is committed before dispatch, so neither
+/// a failed record write nor a client that disconnects mid-dispatch lets a
+/// replay start a second job.
+#[rstest]
+#[tokio::test]
+async fn a_system_build_replay_with_its_idempotency_key_starts_one_job(
+    #[future] native_build_fixture: TestResult<NativeBuildFixture>,
+) -> TestResult {
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+    let mut fixture = native_build_fixture.await?;
+    let password_hash =
+        tokio::task::spawn_blocking(|| crate::auth::hash_password("build-password")).await??;
+    sqlx::query(sql!(
+        "INSERT INTO users (id, email, password_hash, display_name, org_id, role)
+         VALUES ($1, 'replay-builder@example.com', $2, 'Replay Builder', $3, $4)"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(password_hash)
+    .bind(fixture.org_id)
+    .bind(UserRole::OrganizationAdmin)
+    .execute(&fixture.db.pool)
+    .await?;
+    let login = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::post("/auth/v1/sessions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "email": "replay-builder@example.com", "password": "build-password"
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(login.status(), StatusCode::OK);
+    let login: serde_json::Value =
+        serde_json::from_slice(&to_bytes(login.into_body(), usize::MAX).await?)?;
+    let token = login["token"]
+        .as_str()
+        .expect("login returns a session token")
+        .to_string();
+    let build = |key: &'static str, body: serde_json::Value| {
+        let app = fixture.app.clone();
+        let token = token.clone();
+        async move {
+            let response = app
+                .oneshot(
+                    Request::post("/admin/api/v1/system-templates/seed/builds")
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header("idempotency-key", key)
+                        .body(Body::from(body.to_string()))?,
+                )
+                .await?;
+            let status = response.status();
+            let body: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await?)?;
+            TestResult::Ok((status, body))
+        }
+    };
+
+    let (status, first) = build(KEY, serde_json::json!({ "publish_tags": ["candidate"] })).await?;
+    assert_eq!(status, StatusCode::ACCEPTED, "{first}");
+    assert!(
+        fixture.builds.try_recv().is_ok(),
+        "the first build dispatches"
+    );
+    assert_eq!(first["job_id"], fixture.job_id.to_string());
+
+    let (status, replay) = build(KEY, serde_json::json!({ "publish_tags": ["candidate"] })).await?;
+    assert_eq!(status, StatusCode::ACCEPTED, "{replay}");
+    assert_eq!(replay, first);
+    assert!(
+        fixture.builds.try_recv().is_err(),
+        "a replay must not start a second build"
+    );
+
+    let (status, conflict) = build(KEY, serde_json::json!({ "force": true })).await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+    assert!(
+        fixture.builds.try_recv().is_err(),
+        "a refused replay must not reach the builder"
+    );
+
+    // The build is accepted, but recording its job fails.
+    sqlx::query(sql!(
+        "CREATE FUNCTION fail_reservation_completion() RETURNS trigger
+         LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic record write failure'; END $$"
+    ))
+    .execute(&fixture.db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "CREATE TRIGGER fail_reservation_completion
+         BEFORE UPDATE ON public_idempotency_records FOR EACH ROW
+         WHEN (NEW.idempotency_key = 'synthetic-build-key-2')
+         EXECUTE FUNCTION fail_reservation_completion()"
+    ))
+    .execute(&fixture.db.pool)
+    .await?;
+    let (status, accepted) = build(UNRECORDED, serde_json::json!({})).await?;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    assert!(fixture.builds.try_recv().is_ok(), "the build dispatches");
+    let (status, in_progress) = build(UNRECORDED, serde_json::json!({})).await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{in_progress}");
+    assert_eq!(in_progress["retryable"], true, "{in_progress}");
+    sqlx::query(sql!(
+        "ALTER TABLE public_idempotency_records DISABLE TRIGGER fail_reservation_completion"
+    ))
+    .execute(&fixture.db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE public_idempotency_records SET created_at = created_at - INTERVAL '1 hour'
+         WHERE idempotency_key = 'synthetic-build-key-2'"
+    ))
+    .execute(&fixture.db.pool)
+    .await?;
+    let (status, unknown) = build(UNRECORDED, serde_json::json!({})).await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{unknown}");
+    assert_eq!(unknown["retryable"], false, "{unknown}");
+    assert_eq!(unknown["details"][0]["key"], "reserved_at", "{unknown}");
+    assert!(
+        fixture.builds.try_recv().is_err(),
+        "a replay of an unrecorded build must not start another"
+    );
+
+    // The client disconnects while the builder is still answering. The
+    // builder's channel holds one undelivered build, so its next send waits
+    // until this test takes it.
+    let (status, held) = build(HELD, serde_json::json!({ "force": true })).await?;
+    assert_eq!(status, StatusCode::ACCEPTED, "{held}");
+    let grants = || async {
+        sqlx::query_scalar::<_, i64>(sql!(
+            "SELECT COUNT(*) FROM template_system_publication_grants"
+        ))
+        .fetch_one(&fixture.db.pool)
+        .await
+    };
+    let granted = grants().await?;
+    let request = tokio::spawn(build(DISCONNECTED, serde_json::json!({})));
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while grants().await? == granted {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Ok::<(), sqlx::Error>(())
+    })
+    .await??;
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    fixture.builds.recv().await.expect("the held build");
+    tokio::time::timeout(Duration::from_secs(30), fixture.builds.recv())
+        .await?
+        .expect("the disconnected request's dispatch reaches the builder");
+    let replay = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let (status, body) = build(DISCONNECTED, serde_json::json!({})).await?;
+            if status != StatusCode::CONFLICT {
+                return TestResult::Ok((status, body));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    assert_eq!(replay.0, StatusCode::ACCEPTED, "{}", replay.1);
+    assert_eq!(replay.1["job_id"], fixture.job_id.to_string());
+    assert!(
+        fixture.builds.try_recv().is_err(),
+        "the replay must not start a second build"
+    );
+    Ok(())
+}
+
+const KEY: &str = "synthetic-build-key-1";
+const UNRECORDED: &str = "synthetic-build-key-2";
+const HELD: &str = "synthetic-build-key-3";
+const DISCONNECTED: &str = "synthetic-build-key-4";

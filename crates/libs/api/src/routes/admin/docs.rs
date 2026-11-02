@@ -554,7 +554,8 @@ fn insert_template_admin_paths(paths: &mut Map<String, Value>) {
                 "summary": "Build seed or code-runtime using the recipe embedded in the deployed API",
                 "description": "Requires a managing-organization administrator. Publishes an immutable digest; publish_tags explicitly assigns mutable tags. For code-runtime, base defaults to seed:latest and is resolved to an exact digest before dispatch. Poll /templates/{template}/builds/{job_id} until succeeded, failed, or publish_failed.",
                 "parameters": [
-                    { "name": "template", "in": "path", "required": true, "schema": { "type": "string", "enum": ["seed", "code-runtime"] } }
+                    { "name": "template", "in": "path", "required": true, "schema": { "type": "string", "enum": ["seed", "code-runtime"] } },
+                    { "name": "Idempotency-Key", "in": "header", "required": false, "schema": { "type": "string" }, "description": "Optional. A repeat with the same key and body within 24 hours returns the original job instead of starting another; the same key with a different body answers 409. While the first request is still submitting its build, a repeat answers a retryable 409; if that request never recorded its job, a repeat answers a non-retryable 409 whose reserved_at detail names when it started, and no repeat under that key starts another build" }
                 ],
                 "requestBody": {
                     "required": true,
@@ -579,7 +580,7 @@ fn insert_template_admin_paths(paths: &mut Map<String, Value>) {
                     } },
                     "403": { "description": "Caller is not a managing-organization administrator" },
                     "404": { "description": "Seed base release unavailable" },
-                    "409": { "description": "Template belongs to another organization or is deleting or deleted" },
+                    "409": { "description": "Template belongs to another organization or is deleting or deleted, or Idempotency-Key was already used with a different body, or its first build is still being submitted (retryable), or its outcome is unknown (see Idempotency-Key)" },
                     "503": { "description": "Builder unavailable" }
                 }
             }

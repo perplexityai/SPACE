@@ -81,6 +81,8 @@ mod key_bindings;
 pub(crate) use key_bindings::{KEY_BINDING_TTL_MINUTES, bind_idempotency_key};
 mod responses;
 pub(crate) use responses::ResponseAdmissionError;
+mod response_reservations;
+pub(crate) use response_reservations::{ReservationId, ResponseReservation};
 mod sandbox_quota;
 pub use sandbox_quota::{
     SandboxQuota, SandboxQuotaOutcome, SandboxQuotaRefusal, SubjectSandboxQuota,

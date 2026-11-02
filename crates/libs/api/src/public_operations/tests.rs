@@ -2617,6 +2617,85 @@ async fn an_expired_key_binding_takes_the_next_request() -> TestResult {
     Ok(())
 }
 
+const RESERVED_BUILD: &str = "/admin/v1/system-templates/{template}/builds";
+
+/// A committed reservation answers every replay without repeating the work:
+/// in flight while young, abandoned once older than its lifetime, the
+/// recorded response once completed; a released one can be taken again, and
+/// a different request is refused throughout.
+#[tokio::test]
+async fn a_response_reservation_answers_replays_without_repeating_work() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let key = IdempotencyKey::parse("build-key")?;
+    let same = RequestFingerprint::parse("a".repeat(64))?;
+    let other = RequestFingerprint::parse("b".repeat(64))?;
+    let idempotency = |request_fingerprint| CreatePublicOperationIdempotency {
+        method: HttpOperationMethod::Post,
+        path_template: OperationPathTemplate::new(RESERVED_BUILD),
+        key: &key,
+        request_fingerprint,
+    };
+    let lifetime = Duration::from_secs(600);
+    let reserve = |request_fingerprint| {
+        let store = &store;
+        let idempotency = idempotency(request_fingerprint);
+        async move {
+            store
+                .reserve_response(org_id, ApiProduct::Admin, &idempotency, lifetime)
+                .await
+        }
+    };
+
+    let ResponseReservation::Reserved(first) = reserve(&same).await? else {
+        panic!("an unused key is reserved");
+    };
+    assert!(matches!(
+        reserve(&same).await?,
+        ResponseReservation::InProgress { .. }
+    ));
+    assert!(matches!(
+        reserve(&other).await,
+        Err(ResponseAdmissionError::Conflict)
+    ));
+    assert!(store.release_response_reservation(first).await?);
+    let ResponseReservation::Reserved(second) = reserve(&same).await? else {
+        panic!("a released key is reserved again");
+    };
+
+    sqlx::query(sql!(
+        "UPDATE public_idempotency_records SET created_at = NOW() - INTERVAL '601 seconds'
+         WHERE org_id = $1"
+    ))
+    .bind(org_id)
+    .execute(&db.pool)
+    .await?;
+    let ResponseReservation::Abandoned { reserved_at } = reserve(&same).await? else {
+        panic!("a pending reservation past its lifetime is abandoned");
+    };
+    assert!(reserved_at < OffsetDateTime::now_utc() - Duration::from_secs(600));
+
+    let response = serde_json::json!({ "job_id": "synthetic-job" });
+    assert!(
+        store
+            .complete_response_reservation(second, response.clone())
+            .await?
+    );
+    let ResponseReservation::Completed(replayed) = reserve(&same).await? else {
+        panic!("a completed reservation replays its response");
+    };
+    assert_eq!(replayed, response);
+    assert!(!store.release_response_reservation(second).await?);
+    assert!(matches!(
+        reserve(&other).await,
+        Err(ResponseAdmissionError::Conflict)
+    ));
+    Ok(())
+}
+
 const FILE_WRITE: &str = "/v1/sandboxes/{sandbox_id}/files:write";
 
 /// Hold `renew` uncommitted on an expired binding, start `sweep` so it
