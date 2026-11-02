@@ -274,3 +274,19 @@ fn an_at_rest_session_route_round_trips_its_sandbox_and_state() {
     );
     assert_eq!(session_route_at_rest(&unavailable), None);
 }
+
+#[test]
+fn stripping_the_not_ready_mark_keeps_the_rest_of_the_status() {
+    let marked = with_retry_after(
+        RetryableNotReady.mark(Status::unavailable("not ready")),
+        Duration::from_millis(250),
+    );
+    assert_eq!(
+        RetryableNotReady::from_status(&marked),
+        Some(RetryableNotReady)
+    );
+    let relayed = RetryableNotReady::strip(marked);
+    assert_eq!(relayed.code(), Code::Unavailable);
+    assert_eq!(RetryableNotReady::from_status(&relayed), None);
+    assert_eq!(retry_after(&relayed), Some(Duration::from_millis(250)));
+}

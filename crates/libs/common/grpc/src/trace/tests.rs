@@ -328,6 +328,54 @@ fn non_ingress_precondition_conventions_are_unchanged() {
     }
 }
 
+/// A server's not-ready mark keeps OnFailure from logging its UNAVAILABLE as
+/// an error, in headers and trailers alike. The call is still a failure, and
+/// an unmarked UNAVAILABLE or a marked INTERNAL is still an error.
+#[test]
+fn only_a_server_marked_not_ready_unavailable_is_not_an_error() {
+    let request = Request::builder()
+        .uri("/space.spaced.host.control.v1.HostControl/IssueGatewayIntermediateCertificate")
+        .body(())
+        .unwrap();
+    let not_ready = crate::RetryableNotReady;
+    for (name, status, is_error) in [
+        (
+            "not ready",
+            not_ready.mark(tonic::Status::unavailable("identity is incomplete")),
+            false,
+        ),
+        (
+            "unmarked unavailable",
+            tonic::Status::unavailable("identity is incomplete"),
+            true,
+        ),
+        (
+            "marked internal",
+            not_ready.mark(tonic::Status::internal("issuer failed")),
+            true,
+        ),
+    ] {
+        let response = status.into_http::<()>();
+        let ClassifiedResponse::Ready(Err(failure)) = GrpcClientMakeClassifier
+            .make_classifier(&request)
+            .classify_response(&response)
+        else {
+            panic!("{name}: status in headers must be classified as a failure");
+        };
+        assert_eq!(failure.is_error, is_error, "headers: {name}");
+        let ClassifiedResponse::RequiresEos(eos) = GrpcClientMakeClassifier
+            .make_classifier(&request)
+            .classify_response(&Response::new(()))
+        else {
+            panic!("streaming response must defer classification");
+        };
+        let failure = eos
+            .classify_eos(Some(response.headers()))
+            .expect_err("trailers must be classified as a failure");
+        assert_eq!(failure.is_error, is_error, "trailers: {name}");
+    }
+}
+
 /// A caller that marks a call's refusal as expected gets a success span for
 /// that code, in headers and trailers alike. The same call unmarked, another
 /// code, or a platform failure marked as expected all stay failures.

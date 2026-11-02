@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::timing::{ACQUIRE_TIMEOUT, AuthorityTiming, MIN_REMAINING};
+use super::timing::{ACQUIRE_TIMEOUT, AuthorityTiming, MIN_REMAINING, QUIET_NOT_READY};
 use arc_swap::ArcSwapOption;
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 use jiff::Timestamp;
@@ -514,6 +514,8 @@ impl GatewayAuthority {
         let timing = self.inner.timing;
         let mut backoff = timing.base_backoff;
         let mut blocked_epoch: Option<CancellationToken> = None;
+        // Start of the current run of not-ready answers from sandbox-manager.
+        let mut not_ready_since: Option<tokio::time::Instant> = None;
         loop {
             if self.inner.shutdown.is_cancelled() {
                 break;
@@ -533,6 +535,7 @@ impl GatewayAuthority {
                     acquisition.outcome = Outcome::Invalidated;
                 }
                 backoff = timing.base_backoff;
+                not_ready_since = None;
             }
             if blocked_epoch.as_ref().is_some_and(|e| !e.is_cancelled()) {
                 if self.pause(timing.blocked_poll).await {
@@ -608,6 +611,7 @@ impl GatewayAuthority {
                     tracing::info!("gateway CA installed");
                     candidate = None;
                     backoff = timing.base_backoff;
+                    not_ready_since = None;
                 }
                 Ok(_) => {
                     candidate = None;
@@ -666,13 +670,35 @@ impl GatewayAuthority {
                             | tonic::Code::Unknown
                     );
                     let retryable = transient || error.code() == tonic::Code::FailedPrecondition;
-                    tracing::warn!(
-                        code = ?error.code(),
-                        reason = credmgr_error_reason(&error).unwrap_or("none"),
-                        retryable,
-                        retry_backoff_ms = backoff.as_millis() as u64,
-                        "gateway CA acquisition failed"
-                    );
+                    // Sandbox-manager answers a marked UNAVAILABLE until the
+                    // activation publishes this execution's identity. That
+                    // wait is expected; report it only once it lasts.
+                    let expected_wait =
+                        if pplx_space_common_grpc::RetryableNotReady::from_status(&error).is_some()
+                        {
+                            not_ready_since
+                                .get_or_insert_with(tokio::time::Instant::now)
+                                .elapsed()
+                                < QUIET_NOT_READY
+                        } else {
+                            not_ready_since = None;
+                            false
+                        };
+                    if expected_wait {
+                        tracing::debug!(
+                            code = ?error.code(),
+                            retry_backoff_ms = backoff.as_millis() as u64,
+                            "gateway CA not issuable yet; retrying"
+                        );
+                    } else {
+                        tracing::warn!(
+                            code = ?error.code(),
+                            reason = credmgr_error_reason(&error).unwrap_or("none"),
+                            retryable,
+                            retry_backoff_ms = backoff.as_millis() as u64,
+                            "gateway CA acquisition failed"
+                        );
+                    }
                     if !transient {
                         self.clear();
                     }

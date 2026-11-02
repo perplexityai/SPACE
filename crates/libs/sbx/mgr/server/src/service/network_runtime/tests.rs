@@ -804,7 +804,9 @@ async fn unavailable_interception_dependencies_still_converge_the_start_gate() {
     )
     .await;
 
-    result.expect("unavailable interception dependencies must not fail the start gate");
+    let readiness =
+        result.expect("unavailable interception dependencies must not fail the start gate");
+    assert_eq!(readiness, InterceptionReadiness::DependenciesNotReady);
     // Not merely "eventually Ok": a gate that retried the refresh would still
     // converge, and would still have held the sandbox past its deadline.
     assert!(
@@ -821,6 +823,119 @@ async fn unavailable_interception_dependencies_still_converge_the_start_gate() {
             }),
         "denied egress is invisible unless this fires"
     );
+}
+
+// The delayed re-check speaks only for the gateway it asked, and only while
+// that gateway's sandbox is not tearing it down; a gateway that cannot answer
+// otherwise is reported rather than taken as ready.
+#[tokio::test(start_paused = true)]
+async fn interception_recheck_answers_for_the_registered_gateway_only() {
+    use super::super::tests::service_tests::insert_test_sandbox;
+    use super::InterceptionRecheck;
+    use pplx_space_common_core::types::SandboxId;
+    use pplx_space_net_gateway_client::proto::{GetNetworkStateResponse, InterceptionReadiness};
+
+    #[derive(Clone, Copy, Debug)]
+    enum During {
+        Nothing,
+        ReplaceGateway,
+        Stop,
+    }
+    #[derive(Clone, Copy, Debug)]
+    enum Answer {
+        Readiness(InterceptionReadiness),
+        Error,
+        Hang,
+    }
+    const UID: u32 = 10_000;
+    const GATEWAY: u32 = 4_242;
+    let failed = |error: &str| InterceptionRecheck::Failed(error.to_owned());
+    let cases = [
+        (
+            SandboxState::Started,
+            During::Nothing,
+            Answer::Readiness(InterceptionReadiness::Ready),
+            InterceptionRecheck::Ready,
+        ),
+        (
+            SandboxState::Started,
+            During::Nothing,
+            Answer::Readiness(InterceptionReadiness::DependenciesNotReady),
+            InterceptionRecheck::NotReady(InterceptionReadiness::DependenciesNotReady),
+        ),
+        (
+            SandboxState::Started,
+            During::Nothing,
+            Answer::Error,
+            failed("unavailable"),
+        ),
+        (
+            SandboxState::Started,
+            During::Nothing,
+            Answer::Hang,
+            failed("timed out"),
+        ),
+        (
+            SandboxState::Started,
+            During::ReplaceGateway,
+            Answer::Readiness(InterceptionReadiness::DependenciesNotReady),
+            InterceptionRecheck::GatewayGone,
+        ),
+        (
+            SandboxState::Started,
+            During::Stop,
+            Answer::Error,
+            InterceptionRecheck::GatewayGone,
+        ),
+        (
+            SandboxState::Suspending,
+            During::Nothing,
+            Answer::Error,
+            InterceptionRecheck::GatewayGone,
+        ),
+    ];
+    for (state, during, answer, expected) in cases {
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new().to_string();
+        insert_test_sandbox(&conn, &sandbox_id, state);
+        crate::db::update_netgtw_pid(&conn, &sandbox_id, UID, GATEWAY).unwrap();
+        let db = crate::db::SharedConnection::new(conn);
+
+        let recheck = super::recheck_interception_readiness(&db, &sandbox_id, GATEWAY, || async {
+            {
+                let conn = db.lock().unwrap();
+                match during {
+                    During::Nothing => {}
+                    During::ReplaceGateway => {
+                        crate::db::update_netgtw_pid(&conn, &sandbox_id, UID, GATEWAY + 1).unwrap();
+                    }
+                    During::Stop => {
+                        assert_eq!(
+                            crate::db::update_state_from_states(
+                                &conn,
+                                &sandbox_id,
+                                crate::db::StateSet::of(&[state]),
+                                SandboxState::Stopping,
+                            )
+                            .unwrap(),
+                            crate::db::StateWriteOutcome::Applied { from: state }
+                        );
+                    }
+                }
+            }
+            match answer {
+                Answer::Readiness(readiness) => Ok(GetNetworkStateResponse {
+                    interception_readiness: readiness as i32,
+                    ..Default::default()
+                }),
+                Answer::Error => Err("unavailable".to_owned()),
+                Answer::Hang => std::future::pending().await,
+            }
+        })
+        .await;
+
+        assert_eq!(recheck, expected, "{state:?}, {during:?}, {answer:?}");
+    }
 }
 
 /// An empty envelope is an answer — "no domains" — not a malformed document.

@@ -101,7 +101,12 @@ fn retry_incomplete_identity(state: SandboxState) -> bool {
 
 fn incomplete_identity_status(state: SandboxState) -> Status {
     if retry_incomplete_identity(state) {
-        return Status::unavailable("gateway CA execution identity is incomplete");
+        // The activation publishes the identity shortly; the gateway asks
+        // again and installs its CA then. UNAVAILABLE keeps that retry and
+        // the CA it holds, so only the marker says this is not a failure.
+        return pplx_space_common_grpc::RetryableNotReady.mark(Status::unavailable(
+            "gateway CA execution identity is incomplete",
+        ));
     }
     Status::failed_precondition("gateway CA execution identity is incomplete")
 }

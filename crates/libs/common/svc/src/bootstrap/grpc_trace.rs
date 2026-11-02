@@ -320,9 +320,10 @@ pub(super) fn log_grpc_server_status(
         return;
     }
 
-    if !grpc_status_is_error(status.code()) {
+    if !grpc_server_status_is_logged_as_error(status) {
         let guest_refusal =
             pplx_space_common_grpc::GuestServiceUnavailable::from_status(status).is_some();
+        let not_ready = pplx_space_common_grpc::RetryableNotReady::from_status(status).is_some();
         tracing::debug!(
             target: "grpc.server",
             parent: span,
@@ -333,7 +334,11 @@ pub(super) fn log_grpc_server_status(
             grpc_error_source = source.as_deref().unwrap_or(""),
             latency_ms,
             failure_origin = if guest_refusal { "guest" } else { "server-status" },
-            failure_reason = guest_refusal.then_some("connection_refused"),
+            failure_reason = if guest_refusal {
+                Some("connection_refused")
+            } else {
+                not_ready.then_some("not_ready")
+            },
             "gRPC server request returned application status"
         );
         return;
@@ -350,6 +355,13 @@ pub(super) fn log_grpc_server_status(
         latency_ms,
         "gRPC server request failed"
     );
+}
+
+/// Error-class codes are logged as failed requests unless the handler marked
+/// the status as a designed not-ready answer its caller retries.
+pub(super) fn grpc_server_status_is_logged_as_error(status: &Status) -> bool {
+    grpc_status_is_error(status.code())
+        && pplx_space_common_grpc::RetryableNotReady::from_status(status).is_none()
 }
 
 pub(super) fn record_grpc_status_from_headers(headers: &HeaderMap, span: &tracing::Span) {

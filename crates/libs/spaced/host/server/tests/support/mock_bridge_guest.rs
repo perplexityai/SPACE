@@ -33,6 +33,7 @@ use tonic::{Request, Response, Status};
 pub(crate) struct MockBridgeGuest {
     pub(crate) version: &'static str,
     pub(crate) ready: bool,
+    pub(crate) wait_ready_not_ready_mark: bool,
     pub(crate) interactive_process_control_calls: Option<Arc<AtomicUsize>>,
     pub(crate) input_reply_error: Option<tonic::Code>,
     pub(crate) resize_fail_once: bool,
@@ -49,6 +50,7 @@ impl Default for MockBridgeGuest {
         Self {
             version: "0.1.4",
             ready: true,
+            wait_ready_not_ready_mark: false,
             interactive_process_control_calls: None,
             input_reply_error: None,
             resize_fail_once: false,
@@ -542,6 +544,10 @@ impl Meta for MockBridgeGuest {
         &self,
         _request: Request<WaitReadyRequest>,
     ) -> Result<Response<WaitReadyResponse>, Status> {
+        if self.wait_ready_not_ready_mark {
+            return Err(pplx_space_common_grpc::RetryableNotReady
+                .mark(Status::unavailable("guest marked itself not ready")));
+        }
         Ok(Response::new(WaitReadyResponse {
             ready: self.ready,
             guest_uptime: self.ready.then_some(prost_types::Duration {

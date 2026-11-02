@@ -14,11 +14,15 @@ fn validate_guest_path_input(path: String) -> Result<String, Status> {
     Ok(path)
 }
 
+/// Tag a status this host relays from the guest or from host control. Only the
+/// server that refuses may mark a status not ready, so a relayed one loses the
+/// mark and the trace layers here and upstream still log it as a failure.
 pub(super) fn host_relay_status(
-    mut status: Status,
+    status: Status,
     command: &'static str,
     bridge: &'static str,
 ) -> Status {
+    let mut status = pplx_space_common_grpc::RetryableNotReady::strip(status);
     status
         .metadata_mut()
         .insert("spaced-relay-command", MetadataValue::from_static(command));
@@ -29,7 +33,8 @@ pub(super) fn host_relay_status(
 }
 
 /// Pull-based forwarding; dropping the consumer drops the upstream stream.
-/// Stop after the first transport or validation error.
+/// Stop after the first transport or validation error. An upstream error loses
+/// its not-ready mark, as in [`host_relay_status`].
 pub(super) fn relay_stream<In, Out, F>(
     stream: impl futures_util::Stream<Item = Result<In, Status>> + Send + 'static,
     map: F,
@@ -44,7 +49,11 @@ where
         (Some(Box::pin(stream)), map),
         |(stream, mut map)| async move {
             let mut stream = stream?;
-            let item = stream.next().await?.and_then(&mut map);
+            let item = stream
+                .next()
+                .await?
+                .map_err(pplx_space_common_grpc::RetryableNotReady::strip)
+                .and_then(&mut map);
             let stream = if item.is_err() { None } else { Some(stream) };
             Some((item, (stream, map)))
         },
