@@ -737,7 +737,7 @@ impl SandboxManagerService {
             if shutdown.is_cancelled() {
                 break;
             }
-            self.spawn_encrypted_capture_seal(cache_dir, row);
+            self.spawn_encrypted_capture_completion(cache_dir, row);
         }
         let verdicts = self
             .inspect_retained_sources_in(
@@ -766,13 +766,13 @@ impl SandboxManagerService {
         })
     }
 
-    /// Retry, in its own task, the seal of an encrypted capture that a suspend
-    /// recorded but could not seal. A refused close can take tens of seconds,
+    /// Retry, in its own task, an encrypted operation that has not completed.
+    /// Capture, staging or a refused close can take tens of seconds,
     /// so it must not hold up this periodic pass. The task keeps the row's
     /// wake, artifact and cleanup fences until it finishes, so a later pass
     /// neither starts a second seal nor classifies the row mid-seal. Once the
     /// seal succeeds, the next pass publishes the staged capture.
-    pub(super) fn spawn_encrypted_capture_seal(
+    pub(super) fn spawn_encrypted_capture_completion(
         &self,
         cache_dir: &Path,
         row: &crate::db::SandboxRow,
@@ -780,13 +780,14 @@ impl SandboxManagerService {
         if !row.volume_encryption {
             return;
         }
-        match suspend_snapshot_publication::recorded_encrypted_capture_to_seal(
+        match suspend_snapshot_publication::encrypted_capture_to_complete(
             &cache_dir.join(&row.id),
+            (self.sandbox_runtime_live)(&row.id),
         ) {
             Ok(Some(_)) => {}
             Ok(None) => return,
             Err(error) => {
-                tracing::warn!(sandbox_id = %row.id, %error, "cannot select an unsealed encrypted capture; will retry");
+                tracing::warn!(sandbox_id = %row.id, %error, "cannot select pending encrypted capture; will retry");
                 return;
             }
         }
@@ -815,7 +816,7 @@ impl SandboxManagerService {
             Ok(Some(row)) => row,
             Ok(None) => return,
             Err(error) => {
-                tracing::warn!(sandbox_id = %row.id, %error, "cannot confirm unsealed encrypted capture owner; will retry");
+                tracing::warn!(sandbox_id = %row.id, %error, "cannot confirm pending encrypted capture owner; will retry");
                 return;
             }
         };
@@ -823,7 +824,7 @@ impl SandboxManagerService {
         self.task_tracker.spawn(async move {
             let _fences = (wake, artifact, cleanup);
             match service
-                .seal_recorded_encrypted_capture(&row, &cache_dir)
+                .complete_recorded_encrypted_capture(&row, &cache_dir)
                 .await
             {
                 Ok(Some(capture)) => tracing::info!(
@@ -835,7 +836,7 @@ impl SandboxManagerService {
                 Err(error) => tracing::warn!(
                     sandbox_id = %row.id,
                     %error,
-                    "encrypted suspend capture is still unsealed; recovery will retry"
+                    "encrypted suspend capture is still incomplete; recovery will retry"
                 ),
             }
         });

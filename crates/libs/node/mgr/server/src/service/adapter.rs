@@ -333,6 +333,19 @@ impl NodeManager for NodeManagerService {
         .await
     }
 
+    async fn create_encrypted_suspend_snapshot(
+        &self,
+        request: Request<CreateEncryptedSuspendSnapshotRequest>,
+    ) -> Result<Response<CreateEncryptedSuspendSnapshotResponse>, Status> {
+        let sandbox_id = request.get_ref().sandbox_id.clone();
+        observe_rpc(
+            "CreateEncryptedSuspendSnapshot",
+            sandbox_id,
+            NodeManagerService::create_encrypted_suspend_snapshot(self, request),
+        )
+        .await
+    }
+
     async fn restore_vm_state(
         &self,
         request: Request<crate::proto::RestoreVmStateRequest>,

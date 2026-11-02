@@ -13,14 +13,16 @@ use crate::byok::CACHE_DIR;
 
 /// Volume name for the suspend snapshot capture (one of potentially
 /// several per-sandbox encrypted volumes).
-const SNAPSHOT_VOLUME_NAME: &str = "snapshot";
+const SNAPSHOT_VOLUME_NAME: &str =
+    pplx_space_common_core::host::linux::paths::ENCRYPTED_SUSPEND_VOLUME_NAME;
 
 /// Logical size of the encrypted snapshot volume. The backing file is sparse
 /// (`truncate -s`) and btrfs(zstd) only allocates what Firecracker actually
 /// writes (the guest memory dump + vmstate, compressed), so this is a generous
 /// ceiling that covers a suspend of any current sandbox shape rather than a
 /// tight fit — undersizing would ENOSPC the memory dump mid-flush.
-const SNAPSHOT_VOLUME_SIZE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const SNAPSHOT_VOLUME_SIZE_BYTES: u64 =
+    pplx_space_common_core::host::linux::paths::ENCRYPTED_SUSPEND_VOLUME_SIZE_BYTES;
 
 /// On-disk LUKS2 backing file for a sandbox's encrypted snapshot volume on the
 /// suspend (capture) path. Lives next to the rootfs `cow.luks`.
@@ -52,6 +54,56 @@ pub(crate) fn rootfs_cow_path(sandbox_id: &str) -> String {
 pub(crate) struct PreparedEncryptedSnapshot {
     /// Mounted btrfs(zstd) dir to bind into the jail for FC's vmstate+memory.
     pub mount_dir: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum EncryptedSuspendCaptureError {
+    #[error("node-manager connect for encrypted suspend capture: {0}")]
+    Connect(#[from] pplx_space_node_mgr_client::ConnectError),
+    #[error(
+        "node-manager CreateEncryptedSuspendSnapshot ({code:?}): {message}",
+        code = .0.code(),
+        message = .0.message()
+    )]
+    Rpc(#[source] tonic::Status),
+}
+
+impl EncryptedSuspendCaptureError {
+    pub(crate) fn proves_not_started(&self) -> bool {
+        matches!(self, Self::Rpc(status) if status.code() == tonic::Code::Unimplemented)
+    }
+
+    pub(crate) fn is_ambiguous(&self) -> bool {
+        matches!(self, Self::Rpc(status) if status.code() == tonic::Code::DataLoss)
+    }
+}
+
+/// Run or resume one idempotent encrypted suspend capture. The node keeps
+/// Firecracker paused and stages the ciphertext before replying; the durable
+/// capture record makes a lost reply resume staging instead of recapturing.
+pub(crate) async fn create_encrypted_suspend_snapshot(
+    sandbox_id: &str,
+    local_artifact_id: pplx_space_common_core::types::LocalArtifactId,
+    fresh: bool,
+    execution_fence: Option<pplx_space_node_mgr_client::proto::ExecutionFence>,
+    node_manager: &crate::node_manager_transport::NodeManagerConnector,
+) -> Result<(), EncryptedSuspendCaptureError> {
+    let mut node = node_manager.connect().await?;
+    node.create_encrypted_suspend_snapshot(
+        pplx_space_node_mgr_client::proto::CreateEncryptedSuspendSnapshotRequest {
+            sandbox_id: sandbox_id.to_string(),
+            local_artifact_id: local_artifact_id.to_string(),
+            base: if fresh {
+                pplx_space_node_mgr_client::proto::EncryptedSuspendSnapshotBase::Fresh as i32
+            } else {
+                pplx_space_node_mgr_client::proto::EncryptedSuspendSnapshotBase::Existing as i32
+            },
+            execution_fence,
+        },
+    )
+    .await
+    .map_err(EncryptedSuspendCaptureError::Rpc)?;
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]

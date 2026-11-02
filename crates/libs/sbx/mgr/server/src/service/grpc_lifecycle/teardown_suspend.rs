@@ -1115,11 +1115,11 @@ impl SandboxManagerService {
             return Err(Status::unavailable("sandbox cleanup is in progress"));
         };
         let sandbox = self.lookup_sandbox(sandbox_id)?;
-        self.seal_recorded_encrypted_capture(&sandbox, cache_dir)
+        self.complete_recorded_encrypted_capture(&sandbox, cache_dir)
             .await
             .map_err(|error| {
                 Status::unavailable(format!(
-                    "encrypted suspend capture is still unsealed: {error}"
+                    "encrypted suspend capture is still incomplete: {error}"
                 ))
             })?;
         // Periodic recovery skips teardown-owned rows, so a deferred
