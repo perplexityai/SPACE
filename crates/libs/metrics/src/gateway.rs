@@ -902,8 +902,12 @@ pub fn tls_handshake_queued(leg: &str, waiting: usize, capacity: usize) {
 
 /// One TLS-protocol error after a successful handshake. `reason` is
 /// `peer_closed_without_close_notify` when the guest closed TCP without TLS
-/// `close_notify`, which most keep-alive clients do to end a connection, and
-/// `io` for other failures. `io_kind` takes the `gateway.tls.handshake` values.
+/// `close_notify` while nothing was in flight, which most keep-alive clients
+/// do to end a connection. It is `peer_closed_mid_exchange` for the same
+/// close while a request (from the first byte of an HTTP/1 head, or an HTTP/2
+/// request's complete head, until its response's last frame) or an upgraded
+/// stream was in flight, and `io` for other failures. `io_kind` takes the
+/// `gateway.tls.handshake` values.
 pub fn tls_connection_error(leg: &str, reason: &str, io_kind: &str) {
     counter(
         "gateway.tls.connection_error",

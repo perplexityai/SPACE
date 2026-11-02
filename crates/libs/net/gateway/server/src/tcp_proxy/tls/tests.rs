@@ -74,7 +74,7 @@ fn upstream_protocol_requires_guest_compatibility() {
 
 /// Most keep-alive clients end a connection by closing TCP without
 /// `close_notify`. Only a read on the guest leg can see that close, and it is
-/// routine only while no exchange is in flight.
+/// routine only while no exchange is in flight; otherwise it truncated one.
 #[test]
 fn guest_close_without_close_notify_is_routine_only_when_idle() {
     use std::io::{Error, ErrorKind};
@@ -96,7 +96,7 @@ fn guest_close_without_close_notify_is_routine_only_when_idle() {
             "read",
             ErrorKind::UnexpectedEof,
             false,
-            "peer_closed_without_close_notify",
+            "peer_closed_mid_exchange",
             Level::WARN,
         ),
         (

@@ -4,7 +4,7 @@ use std::borrow::Cow;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -151,7 +151,8 @@ impl TlsFailure {
     /// A failure on an established connection. A guest that ends a connection
     /// by closing TCP without `close_notify`, as most keep-alive clients do,
     /// reads as `UnexpectedEof`. That is a routine close unless a request or
-    /// upgraded stream was in flight (see `GuestActivity`).
+    /// upgraded stream was in flight (see `GuestActivity`), when it truncated
+    /// that exchange.
     fn established(
         leg: TlsHandshakeLeg,
         operation: &'static str,
@@ -162,12 +163,14 @@ impl TlsFailure {
             && operation == "read"
             && error.kind() == io::ErrorKind::UnexpectedEof
         {
-            let level = if guest_idle {
-                tracing::Level::DEBUG
+            return if guest_idle {
+                (
+                    Self::new("peer_closed_without_close_notify"),
+                    tracing::Level::DEBUG,
+                )
             } else {
-                tracing::Level::WARN
+                (Self::new("peer_closed_mid_exchange"), tracing::Level::WARN)
             };
-            return (Self::new("peer_closed_without_close_notify"), level);
         }
         (Self::io(error), tracing::Level::WARN)
     }
@@ -575,27 +578,68 @@ impl Drop for HandshakeAttempt {
 }
 
 /// HTTP messages and upgraded streams in flight on one guest connection. The
-/// HTTP session holds an [`ActiveExchange`] for each; the guest's TLS leg
-/// reads the count to log a close at WARN only while an exchange is in flight.
+/// HTTP session holds an [`ActiveExchange`] for each once hyper has parsed its
+/// head; before that, the guest's TLS leg marks an HTTP/1 head in flight from
+/// its first byte. A close is routine only while nothing is in flight.
 #[derive(Clone, Default)]
-pub(super) struct GuestActivity(Arc<AtomicUsize>);
+pub(super) struct GuestActivity(Arc<ActivityState>);
+
+#[derive(Default)]
+struct ActivityState {
+    exchanges: AtomicUsize,
+    partial_head: AtomicBool,
+    /// HTTP/2 control frames (SETTINGS, PING, WINDOW_UPDATE, GOAWAY) arrive
+    /// between exchanges, so bytes on an HTTP/2 connection start no head.
+    multiplexed: AtomicBool,
+}
 
 impl GuestActivity {
     pub(super) fn begin(&self) -> ActiveExchange {
-        self.0.fetch_add(1, Ordering::Relaxed);
+        self.0.exchanges.fetch_add(1, Ordering::Relaxed);
+        self.0.partial_head.store(false, Ordering::Relaxed);
         ActiveExchange(self.0.clone())
     }
 
+    /// The guest speaks HTTP/2 on this connection.
+    pub(super) fn multiplexed(&self) {
+        self.0.multiplexed.store(true, Ordering::Relaxed);
+    }
+
+    /// The guest sent bytes. On HTTP/1 with nothing in flight they begin the
+    /// next request's head, which stays in flight until hyper parses it.
+    /// An HTTP/2 connection's preface counts the same until its first
+    /// request.
+    fn received(&self) {
+        if self.0.exchanges.load(Ordering::Relaxed) == 0
+            && !self.0.multiplexed.load(Ordering::Relaxed)
+        {
+            self.0.partial_head.store(true, Ordering::Relaxed);
+        }
+    }
+
     pub(super) fn is_idle(&self) -> bool {
-        self.0.load(Ordering::Relaxed) == 0
+        self.0.exchanges.load(Ordering::Relaxed) == 0
+            && !self.0.partial_head.load(Ordering::Relaxed)
     }
 }
 
-pub(super) struct ActiveExchange(Arc<AtomicUsize>);
+#[cfg(test)]
+impl GuestActivity {
+    /// The reason the guest's TLS leg would report for a close without
+    /// `close_notify` now.
+    pub(super) fn close_reason(&self) -> &'static str {
+        let eof = io::Error::from(io::ErrorKind::UnexpectedEof);
+        TlsFailure::established(TlsHandshakeLeg::ClientToNetgw, "read", &eof, self.is_idle())
+            .0
+            .reason
+    }
+}
+
+pub(super) struct ActiveExchange(Arc<ActivityState>);
 
 impl Drop for ActiveExchange {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        self.0.exchanges.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -609,7 +653,7 @@ pub(super) struct TlsIo<T> {
 }
 
 impl<T> TlsIo<T> {
-    fn new(inner: T, leg: TlsHandshakeLeg) -> Self {
+    pub(super) fn new(inner: T, leg: TlsHandshakeLeg) -> Self {
         Self {
             inner,
             leg,
@@ -665,9 +709,16 @@ impl<T: AsyncRead + Unpin> AsyncRead for TlsIo<T> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        let filled = buf.filled().len();
         let result = Pin::new(&mut self.inner).poll_read(cx, buf);
-        if let Poll::Ready(Err(error)) = &result {
-            self.record_error("read", error);
+        match &result {
+            Poll::Ready(Err(error)) => self.record_error("read", error),
+            Poll::Ready(Ok(()))
+                if self.leg == TlsHandshakeLeg::ClientToNetgw && buf.filled().len() > filled =>
+            {
+                self.activity.received();
+            }
+            _ => {}
         }
         result
     }

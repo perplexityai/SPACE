@@ -158,7 +158,8 @@ struct Session<F> {
 /// `connect` lazily opens the origin with the detected guest protocol.
 /// Each request, from its complete head until hyper takes its response's last
 /// frame or drops the response, and each upgraded stream until its relay ends,
-/// is reported in flight to `activity`.
+/// is reported in flight to `activity`, which also learns whether the guest
+/// speaks HTTP/2.
 pub(super) async fn serve_guest<C, F, Fut, U>(
     guest: C,
     activity: GuestActivity,
@@ -187,8 +188,11 @@ where
     });
     let service = service_fn(|request: Request<Incoming>| {
         let session = session.clone();
-        let active = session.activity.begin();
         let protocol = HttpProtocol::of(request.version());
+        if protocol == HttpProtocol::Http2 {
+            session.activity.multiplexed();
+        }
+        let active = session.activity.begin();
         tracing::Span::current().record("protocol", protocol.as_str());
         let request = SanitizedRequest::try_from(request);
         async move {
