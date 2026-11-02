@@ -24,9 +24,11 @@ pub(crate) struct BuildJob {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RecordedBuild {
     pub daemon_job_id: BuildRunId,
-    /// The builder that accepted the job; `None` for jobs routed without one.
+    /// The builder that accepted the job; `None` for a job routed without a
+    /// pinned builder, or whose builder's node row has since been deleted.
     pub builder_node_id: Option<NodeId>,
-    /// When the job was first recorded.
+    /// When the row was first written: at the builder's acceptance for an
+    /// admin build, at the ECW template request for an ECW build.
     pub created_at: OffsetDateTime,
 }
 

@@ -1028,9 +1028,12 @@ pub struct TemplateBuildStatusResponse {
 pub struct TemplateBuildListEntry {
     pub job_id: String,
     pub template_name: String,
-    /// When the control plane recorded the builder's acceptance of the job.
+    /// When the control plane first recorded this build: at the builder's
+    /// acceptance for an admin build, at the ECW template request for an ECW
+    /// build.
     pub created_at: String,
-    /// The builder pinned to the job; `None` when it was routed without one.
+    /// `None` when the job was routed without a pinned builder or its
+    /// builder's node row has since been deleted.
     pub builder_node_id: Option<NodeId>,
     /// `None` when the builder could not report the job; `status_error` says
     /// why.
