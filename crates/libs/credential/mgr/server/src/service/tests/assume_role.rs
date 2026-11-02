@@ -309,9 +309,14 @@ impl Case {
             }
             Self::Sdk(_) => unreachable!("answered without an endpoint"),
         };
-        let status = assume_s3_vend_role(&config, ROLE_ARN, SESSION_POLICY, 900)
-            .await
-            .expect_err("the fake STS never issues credentials");
+        let status = assume_s3_vend_role(
+            &aws_sdk_sts::Client::new(&config),
+            ROLE_ARN,
+            SESSION_POLICY,
+            900,
+        )
+        .await
+        .expect_err("the fake STS never issues credentials");
         drop(endpoint);
         status
     }

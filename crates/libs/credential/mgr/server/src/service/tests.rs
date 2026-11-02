@@ -12,6 +12,7 @@ use crate::in_memory::InMemoryKeyWrapper;
 use crate::kek_store::KekRecord;
 
 mod assume_role;
+mod sts_reuse;
 
 /// In-memory KEK-row map standing in for Postgres.
 struct TestKekStore {
