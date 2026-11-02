@@ -84,6 +84,9 @@ jobs:
     if: always() && github.repository == 'perplexityai/SPACE'
     name: space-pull-ci
     runs-on: ubuntu-24.04
+    # actions: read lets a cancelled run look for the run that replaced it.
+    permissions:
+      actions: read
     needs:
       - rust_static
       - common
@@ -97,8 +100,30 @@ jobs:
           KIND_PATHS_RESULT: ${{ needs.kind_paths.result }}
           KIND_NEEDED: ${{ needs.kind_paths.outputs.needed }}
           KIND_SMOKE_RESULT: ${{ needs.kind_smoke.result }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
+          # Two pull_request events for one head start two runs at once, and
+          # the concurrency group cancels one. This job still runs there
+          # (always()), and its failure can post after the other run's
+          # success and turn the pull request red. When every job was
+          # cancelled, pass only if another run of this workflow for the same
+          # pull request and head has already succeeded; otherwise fail as
+          # before, so a cancelled run never stands in for the checks.
+          if [ "${RUST_STATIC_RESULT}" = cancelled ] && [ "${COMMON_RESULT}" = cancelled ] &&
+            [ "${KIND_PATHS_RESULT}" = cancelled ]; then
+            passed="$(gh api "repos/${REPO}/actions/runs?head_sha=${HEAD_SHA}&event=pull_request&status=success&per_page=100" \
+              --jq "[.workflow_runs[] | select(.id != ${RUN_ID} and .path == \".github/workflows/pull-ci.yml\"
+                and any(.pull_requests[]; .number == ${PR_NUMBER}))] | first | .id // empty")"
+            if [ -n "${passed}" ]; then
+              echo "This run was cancelled; run ${passed} for the same head passed."
+              exit 0
+            fi
+          fi
           test "${RUST_STATIC_RESULT}" = success
           test "${COMMON_RESULT}" = success
           # An unknown selection fails rather than skipping Kind.
