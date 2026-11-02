@@ -70,6 +70,9 @@ locals {
     one(local.existing_mng_default_pool_names)
   ]
   cluster_addon_configuration_values = {
+    "coredns" = var.coredns_replica_count == null ? null : jsonencode({
+      replicaCount = var.coredns_replica_count
+    })
     "metrics-server" = var.metrics_server_resources == null ? null : jsonencode({
       # metrics-server's memory footprint grows with the number of pods it
       # must cache. Keep the CPU request at the addon default while allowing

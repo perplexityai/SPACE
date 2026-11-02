@@ -173,6 +173,18 @@ variable "cluster_addons" {
   }
 }
 
+variable "coredns_replica_count" {
+  description = "Optional fixed replica count for the EKS CoreDNS add-on. Null retains the add-on default."
+  type        = number
+  default     = null
+  nullable    = true
+
+  validation {
+    condition     = var.coredns_replica_count == null ? true : var.coredns_replica_count >= 1 && var.coredns_replica_count == floor(var.coredns_replica_count)
+    error_message = "coredns_replica_count must be null or a positive integer."
+  }
+}
+
 variable "metrics_server_resources" {
   description = "Optional memory request and limit override for the EKS metrics-server addon. Once applied, retain the block: roll back by setting the pinned version's reviewed defaults, then update that retained default pair with future addon version bumps. Null stops managing EKS's stored optional/computed configuration; it does not clear it."
   type = object({
