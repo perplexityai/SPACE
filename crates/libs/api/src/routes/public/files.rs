@@ -240,14 +240,8 @@ pub async fn write_file(
     // The decoded chunks are all the RPC needs; don't hold the encoded copy
     // for the rest of the request.
     drop(data_base64);
-    let mut fingerprint = RequestDigest::default();
-    fingerprint
-        .field(path.as_bytes())
-        .flag(append)
-        .flag(parents)
-        .user(user.as_ref())
-        .chunks(&chunks);
-    let fingerprint = fingerprint.finish()?;
+    let fingerprint =
+        pplx_space_native_files::write_fingerprint(&path, append, parents, user.as_ref(), &chunks)?;
     let guest_key = guest_key(WRITE_FILE, &idempotency_key, &fingerprint)?;
     bind_request_key(&state, &sandbox, WRITE_FILE, &idempotency_key, &fingerprint).await?;
     let metric = SandboxApiMetricIdentity::native("files_write");
@@ -344,18 +338,15 @@ pub async fn write_file_batch(
             append: entry.append,
         });
     }
-    let mut fingerprint = RequestDigest::default();
-    fingerprint
-        .flag(parents)
-        .user(user.as_ref())
-        .count(entries.len());
-    for entry in &entries {
-        fingerprint
-            .field(entry.path.as_bytes())
-            .flag(entry.append)
-            .field(&entry.data);
-    }
-    let fingerprint = fingerprint.finish()?;
+    let fingerprint = pplx_space_native_files::write_batch_fingerprint(
+        parents,
+        user.as_ref(),
+        entries.iter().map(|entry| BatchEntry {
+            path: &entry.path,
+            append: entry.append,
+            data: &entry.data,
+        }),
+    )?;
     let guest_key = guest_key(WRITE_FILE_BATCH, &idempotency_key, &fingerprint)?;
     bind_request_key(
         &state,
@@ -413,17 +404,12 @@ pub async fn mkdir_file(
     let sandbox = ensure_sandbox_owner(authorized, &state.pool, org.id, &sandbox_id).await?;
     let user = parse_guest_user(request.user)?;
     let path = parse_guest_path(request.path)?;
-    let mut fingerprint = RequestDigest::default();
-    fingerprint
-        .field(path.as_bytes())
-        .flag(request.parents)
-        .user(user.as_ref());
     bind_request_key(
         &state,
         &sandbox,
         CREATE_DIRECTORY,
         &idempotency_key,
-        &fingerprint.finish()?,
+        &pplx_space_native_files::mkdir_fingerprint(&path, request.parents, user.as_ref())?,
     )
     .await?;
     state
@@ -451,17 +437,12 @@ pub async fn remove_file(
     let sandbox = ensure_sandbox_owner(authorized, &state.pool, org.id, &sandbox_id).await?;
     let user = parse_guest_user(request.user)?;
     let path = parse_guest_path(request.path)?;
-    let mut fingerprint = RequestDigest::default();
-    fingerprint
-        .field(path.as_bytes())
-        .flag(request.recursive)
-        .user(user.as_ref());
     bind_request_key(
         &state,
         &sandbox,
         REMOVE_FILE,
         &idempotency_key,
-        &fingerprint.finish()?,
+        &pplx_space_native_files::remove_fingerprint(&path, request.recursive, user.as_ref())?,
     )
     .await?;
     state
@@ -498,12 +479,8 @@ pub async fn rename_file(
     let user = parse_guest_user(request.user)?;
     let old_path = parse_guest_path(request.old_path)?;
     let new_path = parse_guest_path(request.new_path)?;
-    let mut fingerprint = RequestDigest::default();
-    fingerprint
-        .field(old_path.as_bytes())
-        .field(new_path.as_bytes())
-        .user(user.as_ref());
-    let fingerprint = fingerprint.finish()?;
+    let fingerprint =
+        pplx_space_native_files::rename_fingerprint(&old_path, &new_path, user.as_ref())?;
     let guest_key = guest_key(RENAME_FILE, &idempotency_key, &fingerprint)?;
     bind_request_key(
         &state,
@@ -1092,7 +1069,8 @@ fn path_basename(path: &str) -> &str {
 }
 
 mod key_binding;
-use key_binding::{RequestDigest, bind_request_key, guest_key};
+use key_binding::bind_request_key;
+use pplx_space_native_files::{BatchEntry, guest_key};
 
 #[cfg(test)]
 mod tests;

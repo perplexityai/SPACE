@@ -101,6 +101,7 @@ members = [
     "crates/libs/placement/executor",
     "crates/libs/placement/machine",
     "crates/libs/public/api",
+    "crates/l40_api/native/files",
     "crates/libs/api",
     "crates/libs/api-route",
     "crates/libs/byte-size",
@@ -412,6 +413,7 @@ pplx-space-object-store = { path = "crates/libs/object-store" }
 pplx-space-page-cache = { path = "crates/libs/page-cache" }
 pplx-space-postgres-contention = { path = "crates/libs/postgres-contention" }
 pplx-space-public-api = { path = "crates/libs/public/api" }
+pplx-space-native-files = { path = "crates/l40_api/native/files" }
 pplx-space-metrics = { path = "crates/libs/metrics" }
 pplx-space-metrics-emit = { path = "crates/libs/metrics-emit" }
 pplx-space-grpc-metrics = { path = "crates/libs/grpc-metrics" }

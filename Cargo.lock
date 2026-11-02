@@ -4855,6 +4855,7 @@ dependencies = [
  "pplx-space-feature-flags",
  "pplx-space-internal-api-server",
  "pplx-space-metrics",
+ "pplx-space-native-files",
  "pplx-space-net-common",
  "pplx-space-node-api-client",
  "pplx-space-node-api-sim",
@@ -6158,6 +6159,17 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
+]
+
+[[package]]
+name = "pplx-space-native-files"
+version = "0.8.0"
+dependencies = [
+ "hex",
+ "pplx-space-guest-process",
+ "pplx-space-public-api",
+ "sha2 0.11.0",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
