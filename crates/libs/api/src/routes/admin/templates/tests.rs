@@ -1068,11 +1068,15 @@ fn template_delete_idempotency_key_is_header_text_within_the_cap() {
     }
 }
 
-/// Serve a builder's `GetBuildTemplateStatus` for the given jobs, counting
-/// calls. A job it does not know answers gRPC `NOT_FOUND`.
+/// The peer address of each status call a fake builder served: one entry per
+/// call, and one distinct address per client connection.
+type BuilderCalls = std::sync::Arc<std::sync::Mutex<Vec<std::net::SocketAddr>>>;
+
+/// Serve a builder's `GetBuildTemplateStatus` for the given jobs, recording
+/// each call's connection. A job it does not know answers gRPC `NOT_FOUND`.
 async fn spawn_status_builder(
     jobs: HashMap<String, build_proto::GetBuildStatusResponse>,
-    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    calls: BuilderCalls,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> TestResult<std::net::SocketAddr> {
     use axum::body::{Body, Bytes};
@@ -1083,47 +1087,55 @@ async fn spawn_status_builder(
 
     let builder = axum::Router::new().route(
         "/space.node.api.v1.BuilderApi/GetBuildTemplateStatus",
-        axum::routing::post(move |body: Bytes| {
-            let jobs = jobs.clone();
-            let calls = calls.clone();
-            async move {
-                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let request = build_proto::GetBuildStatusRequest::decode(&body[5..]).unwrap();
-                let mut trailers = HeaderMap::new();
-                let mut frames = Vec::new();
-                match jobs.get(&request.job_id) {
-                    Some(response) => {
-                        let response = response.encode_to_vec();
-                        let mut frame = vec![0];
-                        frame.extend_from_slice(
-                            &u32::try_from(response.len()).unwrap().to_be_bytes(),
-                        );
-                        frame.extend_from_slice(&response);
-                        frames.push(Ok::<_, std::convert::Infallible>(Frame::data(Bytes::from(
-                            frame,
-                        ))));
-                        trailers.insert("grpc-status", "0".parse().unwrap());
+        axum::routing::post(
+            move |axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<
+                std::net::SocketAddr,
+            >,
+                  body: Bytes| {
+                let jobs = jobs.clone();
+                let calls = calls.clone();
+                async move {
+                    calls.lock().unwrap().push(peer);
+                    let request = build_proto::GetBuildStatusRequest::decode(&body[5..]).unwrap();
+                    let mut trailers = HeaderMap::new();
+                    let mut frames = Vec::new();
+                    match jobs.get(&request.job_id) {
+                        Some(response) => {
+                            let response = response.encode_to_vec();
+                            let mut frame = vec![0];
+                            frame.extend_from_slice(
+                                &u32::try_from(response.len()).unwrap().to_be_bytes(),
+                            );
+                            frame.extend_from_slice(&response);
+                            frames.push(Ok::<_, std::convert::Infallible>(Frame::data(
+                                Bytes::from(frame),
+                            )));
+                            trailers.insert("grpc-status", "0".parse().unwrap());
+                        }
+                        None => {
+                            trailers.insert("grpc-status", "5".parse().unwrap());
+                            trailers.insert("grpc-message", "build job not found".parse().unwrap());
+                        }
                     }
-                    None => {
-                        trailers.insert("grpc-status", "5".parse().unwrap());
-                        trailers.insert("grpc-message", "build job not found".parse().unwrap());
-                    }
+                    frames.push(Ok(Frame::trailers(trailers)));
+                    (
+                        [(header::CONTENT_TYPE, "application/grpc")],
+                        Body::new(StreamBody::new(tokio_stream::iter(frames))),
+                    )
                 }
-                frames.push(Ok(Frame::trailers(trailers)));
-                (
-                    [(header::CONTENT_TYPE, "application/grpc")],
-                    Body::new(StreamBody::new(tokio_stream::iter(frames))),
-                )
-            }
-        }),
+            },
+        ),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     tokio::spawn(async move {
-        axum::serve(listener, builder)
-            .with_graceful_shutdown(shutdown.cancelled_owned())
-            .await
-            .unwrap();
+        axum::serve(
+            listener,
+            builder.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown.cancelled_owned())
+        .await
+        .unwrap();
     });
     Ok(address)
 }
@@ -1244,7 +1256,7 @@ async fn template_builds_list_reports_each_jobs_builder_status() -> TestResult {
             status(built.as_str(), build_proto::BuildState::Running, "", ""),
         ),
     ]);
-    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let calls = BuilderCalls::default();
     let shutdown = tokio_util::sync::CancellationToken::new();
     let _stop = shutdown.clone().drop_guard();
     let reachable = NodeId::new();
@@ -1357,7 +1369,15 @@ async fn template_builds_list_reports_each_jobs_builder_status() -> TestResult {
     }
     // Four jobs reached the reachable builder: three pinned to it, and the
     // unpinned one through discovery. The unreachable builder's two got none.
-    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+    // They arrived over one connection per resolved client: one for the
+    // three pinned jobs, one for discovery's.
+    let calls = calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 4);
+    assert_eq!(
+        calls.iter().collect::<std::collections::HashSet<_>>().len(),
+        2,
+        "{calls:?}"
+    );
 
     let (_, body) = read(list(&built, Some(1)).await.into_response()).await?;
     assert_eq!(body.as_array().map(Vec::len), Some(1));
