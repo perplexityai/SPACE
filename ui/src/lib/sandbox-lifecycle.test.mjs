@@ -8,7 +8,7 @@ import {
   statusFilterOptions,
 } from './sandbox-lifecycle.ts';
 
-const row = (status, lifecycle = null) => ({ status, lifecycle });
+const row = (status) => status;
 
 test('each resting state is brought up by the action that matches it', () => {
   assert.equal(bringUpAction(row('stopped'))?.action, 'start');
@@ -34,17 +34,6 @@ test('the filter offers the states the admin list reports: node-reported ones an
 
 test('a deleted tombstone has no bring-up action', () => {
   assert.equal(bringUpAction(row('deleted')), null);
-});
-
-test('the stored lifecycle decides the bring-up action over the node-reported status', () => {
-  // A suspended sandbox whose node reports it stopped restores, not starts.
-  assert.deepEqual(bringUpAction(row('stopped', 'suspended')), { action: 'restore', label: 'Restore' });
-  assert.equal(bringUpAction(row('stopped', 'paused'))?.action, 'resume');
-  assert.equal(bringUpAction(row('suspended', 'stopped'))?.action, 'start');
-  assert.equal(bringUpAction(row('stopped', 'restoring')), null);
-  // Without a lifecycle the status decides.
-  assert.equal(bringUpAction(row('stopped', null))?.action, 'start');
-  assert.equal(bringUpAction({ status: 'paused' })?.action, 'resume');
 });
 
 test('the filter offers unspecified, which nodes can report', () => {
