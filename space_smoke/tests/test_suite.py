@@ -23,6 +23,7 @@ from space_smoke.suite import (
     RESULT_PREFIX,
     ScenarioProcessResult,
     _run_one_streamed,
+    load_known_failures,
     run_scenarios,
     suite_exit_code,
 )
@@ -463,6 +464,213 @@ class SmokeSuiteTests(unittest.TestCase):
         self.assertEqual(suite_exit_code((warning, infrastructure)), 2)
         self.assertEqual(suite_exit_code((passed, infrastructure)), 2)
         self.assertEqual(suite_exit_code((infrastructure, failed)), 1)
+
+    def _run_with_known_failures(
+        self, results: tuple[ScenarioProcessResult, ...], listing: str | None
+    ) -> tuple[int, str]:
+        environment = {"SPACE_SMOKE_BACKEND": "kind", "GITHUB_ACTIONS": "true"}
+        with tempfile.TemporaryDirectory() as directory:
+            if listing is not None:
+                path = Path(directory) / "known-failures.txt"
+                path.write_text(listing, encoding="utf-8")
+                environment["SPACE_SMOKE_KNOWN_FAILURES"] = str(path)
+            return self._run_all_with(results, environment)
+
+    @staticmethod
+    def _failed_in(*phases: str) -> ScenarioProcessResult:
+        evidence = {"phases": [{"name": phase} for phase in phases]}
+        return ScenarioProcessResult(
+            "ecw.sandbox_info",
+            1,
+            "",
+            "",
+            {"verdict": "fail", "summary": "no info", "evidence": evidence},
+        )
+
+    def test_a_known_failures_list_excuses_only_a_failure_in_the_listed_phase(
+        self,
+    ) -> None:
+        listing = (
+            "# Direct lane\n"
+            "\n"
+            "ecw.sandbox_info | verify node cleanup | cleanup needs the sandbox pod\n"
+            "ecw.command_round_trip | run marker command | volume keys need a node\n"
+        )
+        warned = dataclasses.replace(
+            self.CLEANUP_FAILED,
+            returncode=42,
+            report={**self.CLEANUP_FAILED.report, "verdict": "warn"},
+        )
+        in_listed_phase = self._failed_in("create sandbox", "verify node cleanup")
+        # (results, listing, exit status, annotation levels, "not excused"
+        # lines): only a fail verdict in the listed phase is excused. Every
+        # other result of a listed scenario counts as an unlisted one would,
+        # and without the variable nothing is excused.
+        cases = {
+            "listed failure in the listed phase": (
+                (in_listed_phase, self.PASSED), listing, 0, ["::notice"], 0
+            ),
+            "listed failure in an earlier phase": (
+                (self._failed_in("create sandbox"),), listing, 1, ["::error"], 1
+            ),
+            "listed failure after the listed phase": (
+                (self._failed_in("verify node cleanup", "delete sandbox"),), listing, 1, ["::error"], 1
+            ),
+            "listed failure with no phase recorded": (
+                (self._failed_in(),), listing, 1, ["::error"], 1
+            ),
+            "listed infrastructure error in the listed phase": (
+                (self.CLEANUP_FAILED,), listing, 2, ["::error"], 1
+            ),
+            "listed warning in the listed phase": ((warned,), listing, 42, ["::warning"], 1),
+            "listed scenario passed": (
+                (dataclasses.replace(self.PASSED, scenario_id="ecw.sandbox_info"),), listing, 0, ["::warning"], 0
+            ),
+            "unlisted failure": (
+                (in_listed_phase,),
+                "ecw.command_round_trip | run marker command | x\n",
+                1,
+                ["::error"],
+                0,
+            ),
+            "unlisted infrastructure error": (
+                (in_listed_phase, self.CLEANUP_FAILED),
+                "ecw.sandbox_info | verify node cleanup | x\n",
+                2,
+                ["::notice", "::error"],
+                0,
+            ),
+            "no list": ((in_listed_phase,), None, 1, ["::error"], 0),
+        }
+        for name, (results, text, expected, levels, not_excused) in cases.items():
+            with self.subTest(name):
+                exit_code, stdout = self._run_with_known_failures(results, text)
+                self.assertEqual(exit_code, expected)
+                lines = stdout.splitlines()
+                self.assertEqual(
+                    [line.split(" ", 1)[0] for line in lines if line.startswith("::")],
+                    levels,
+                )
+                self.assertEqual(
+                    sum(line.endswith("; not excused") for line in lines), not_excused
+                )
+
+    def test_a_known_failures_list_reports_known_failures_and_unexpected_passes(
+        self,
+    ) -> None:
+        listing = (
+            "ecw.sandbox_info | verify node cleanup | cleanup needs the sandbox pod\n"
+            "ecw.command_round_trip | verify marker | volume keys need a node registration\n"
+            "ecw.sandbox_delete | delete sandbox | the delete never settles\n"
+            "ecw.filesystem_round_trip | write file | listed but not run in this pass\n"
+        )
+        exit_code, stdout = self._run_with_known_failures(
+            (
+                self._failed_in("create sandbox", "verify node cleanup"),
+                self.CLEANUP_FAILED,
+                self.PASSED,
+            ),
+            listing,
+        )
+
+        self.assertEqual(exit_code, 2)
+        lines = stdout.splitlines()
+        self.assertIn("    known failure: cleanup needs the sandbox pod", lines)
+        not_excused = lines.index("  INFRA_ERROR ecw.command_round_trip: " + (
+            "ECW command round trip passed; critical cleanup failed"
+        ))
+        self.assertTrue(
+            next(
+                line for line in lines[not_excused + 1 :] if line.startswith("    listed in ")
+            ).endswith('known-failures.txt for phase "verify marker"; not excused'),
+        )
+        header = next(index for index, line in enumerate(lines) if line.startswith("KNOWN FAILURES "))
+        self.assertTrue(
+            lines[header].endswith(
+                "known-failures.txt): 1 failed as listed, 1 failed otherwise, "
+                "1 passed unexpectedly"
+            ),
+            lines[header],
+        )
+        self.assertEqual(
+            [line for line in lines[header + 1 :] if not line.startswith("::")],
+            [
+                "  KNOWN FAILURE ecw.sandbox_info: cleanup needs the sandbox pod",
+                "  UNEXPECTED PASS ecw.sandbox_delete: listed as \"the delete never "
+                "settles\"; remove it from the list if it keeps passing",
+            ],
+        )
+        annotations = [line for line in lines if line.startswith("::")]
+        self.assertEqual(
+            [line.split(" ", 1)[0] for line in annotations],
+            ["::notice", "::error", "::warning"],
+        )
+        self.assertIn("typed smoke (ecw)%3A ecw.sandbox_delete", annotations[2])
+        self.assertIn("unexpected pass", annotations[2])
+
+    def test_a_known_failures_list_that_cannot_be_trusted_fails_before_bootstrap(
+        self,
+    ) -> None:
+        # (listing, the line the error names)
+        cases = {
+            "unknown scenario": ("ecw.no_such_scenario | create sandbox | renamed\n", 1),
+            "no phase": ("# comment\necw.sandbox_info |  | no phase\n", 2),
+            "no phase field": ("ecw.sandbox_info  cleanup needs the sandbox pod\n", 1),
+            "no reason": ("\necw.sandbox_info | create sandbox |  \n", 2),
+            "no reason field": ("ecw.sandbox_info | create sandbox\n", 1),
+            "no scenario id": (" | create sandbox | reason\n", 1),
+            "listed twice": (
+                "ecw.sandbox_info | create sandbox | one\n"
+                "ecw.sandbox_info | verify node cleanup | two\n",
+                2,
+            ),
+        }
+        for name, (listing, line) in cases.items():
+            with (
+                self.subTest(name),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                path = Path(directory) / "known-failures.txt"
+                path.write_text(listing, encoding="utf-8")
+                environment = {
+                    "SPACE_SMOKE_BACKEND": "kind",
+                    "SPACE_SMOKE_KNOWN_FAILURES": str(path),
+                }
+                with (
+                    mock.patch.dict("space_smoke.__main__.os.environ", environment, clear=True),
+                    mock.patch(
+                        "space_smoke.__main__.SmokeServices.from_environment"
+                    ) as from_environment,
+                    redirect_stdout(StringIO()),
+                    redirect_stderr(StringIO()) as stderr,
+                ):
+                    self.assertEqual(_run_all(), 2)
+                self.assertIn(f"ERROR: {path}:{line}:", stderr.getvalue())
+                from_environment.assert_not_called()
+        with (
+            mock.patch.dict(
+                "space_smoke.__main__.os.environ",
+                {"SPACE_SMOKE_KNOWN_FAILURES": "/nonexistent/known-failures.txt"},
+                clear=True,
+            ),
+            redirect_stderr(StringIO()) as stderr,
+        ):
+            self.assertEqual(_run_all(), 2)
+        self.assertIn("known-failures.txt", stderr.getvalue())
+
+    def test_the_direct_lane_lists_only_scenarios_the_direct_lane_runs(self) -> None:
+        # The lane reads this list only after a full bring-up, and a listed
+        # scenario it never runs is silently dropped, so a rename, a narrowing
+        # or a quarantine must update the list in the same change.
+        path = Path(__file__).resolve().parents[2] / "ci" / "kind-direct-known-failures.txt"
+        listed = load_known_failures(path, {scenario.id for scenario in REGISTRY})
+
+        for scenario_id in listed:
+            with self.subTest(scenario_id):
+                registered = REGISTRY.get(scenario_id)
+                self.assertIn("direct", registered.substrates)
+                self.assertIsNone(registered.quarantined)
+                self.assertIsNone(registered.ignored)
 
 
 class BenchSubstrateTests(unittest.TestCase):

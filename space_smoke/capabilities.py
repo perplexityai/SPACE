@@ -2243,6 +2243,20 @@ class ColdEvictionControl(RestoreStateRead, RestorePodRead, Protocol):
         """Execution pods, including terminal predecessors retained by Kubernetes."""
         ...
 
+    def substrate(self) -> str:
+        """The control-plane substrate (`kubernetes` or `direct`) the Kind bench runs."""
+        ...
+
+    def sandbox_node_name(self, sandbox_id: str) -> str | None:
+        """The name of the node the API places the sandbox on, None without one.
+
+        `active_node.name` of the admin sandbox read. The Direct lane registers
+        each Kind node under its Kubernetes node name
+        (infra/space/kind/scripts/register-direct-nodes.sh), so on that lane
+        the name is the Kind node the node reads take.
+        """
+        ...
+
     def cold_eviction_config(self, node_name: str) -> ColdEvictionConfig:
         """The eviction knobs of the sandbox-manager pod on the sandbox's worker."""
         ...

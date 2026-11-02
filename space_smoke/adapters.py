@@ -4993,6 +4993,14 @@ ON CONFLICT (key_hash) DO NOTHING;
         lifecycle, _, node = row.partition("|")
         return SandboxResidency(lifecycle=lifecycle.strip(), active_node_id=node.strip() or None)
 
+    def sandbox_node_name(self, sandbox_id: str) -> str | None:
+        sandbox = self._admin(
+            "GET", f"sandboxes/sbx_{quote(_sql_uuid(sandbox_id), safe='')}", expect=(200,)
+        )
+        node = sandbox.get("active_node") if isinstance(sandbox, dict) else None
+        name = node.get("name") if isinstance(node, dict) else None
+        return name if isinstance(name, str) and name else None
+
     def pin_namespace_pod_count(self) -> int:
         self._require_isolated_kind("namespace pod-count quota")
         # `kubectl get pods` over-counts: the quota charges only non-terminal

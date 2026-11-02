@@ -1229,11 +1229,22 @@ class CommandSandboxFixture:
         return None
 
     def local_cleanup_worker(self) -> str | None:
-        """Capture the fixture's worker while its execution is still running."""
+        """Capture the fixture's worker while its execution is still running.
+
+        On the Kubernetes substrate the worker is the node its execution pod is
+        bound to. The Direct substrate creates no pod, so there it is the node
+        the API places the sandbox on.
+        """
         control = self._local_cleanup_control
         if control is None:
             return None
-        placement = control.sandbox_pod_placement(self.sandbox.sandbox_id.removeprefix("sbx_"))
+        sandbox_id = self.sandbox.sandbox_id.removeprefix("sbx_")
+        if control.substrate() == "direct":
+            worker = control.sandbox_node_name(sandbox_id)
+            self.verify(worker is not None, "the API places the fixture sandbox on no node")
+            assert worker is not None
+            return worker
+        placement = control.sandbox_pod_placement(sandbox_id)
         self.verify(placement is not None, "cannot locate the fixture sandbox worker")
         assert placement is not None
         return placement.node_name
@@ -1255,6 +1266,8 @@ class CommandSandboxFixture:
             worker=worker,
             quiescence_seconds=quiescence,
         )
+        # The Direct substrate creates no execution pod, so this wait passes at
+        # once there.
         deadline = time.monotonic() + 90
         while True:
             pods = control.sandbox_pods(sandbox_id)
