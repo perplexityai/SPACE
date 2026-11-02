@@ -1061,6 +1061,7 @@ mod postgres {
                     kinds: kinds.to_vec(),
                     max_concurrent,
                     org_limit: org_limit.and_then(std::num::NonZeroU32::new),
+                    test_hold: None,
                 },
                 TaskTracker::new(),
                 DrainSignal::new(),
@@ -1210,6 +1211,70 @@ mod postgres {
                 script.open_gate();
             }
         }
+        Ok(())
+    }
+
+    /// Under the test hold, a cold create admission claims stays `running`,
+    /// renewing its claim, and starts only once the hold ends; it then runs
+    /// once.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_held_inline_create_renews_its_claim_and_starts_after_the_hold() -> TestDbResult<()> {
+        let fixture = AdmissionPoolFixture::new(1).await?;
+        let script = ScriptedCreate::new(Script::Succeed);
+        let hold = Duration::from_secs(1);
+        let inline = crate::inline_operations::InlineLifecycle::new(
+            InlineOperations::new(
+                InlineOperationsConfig {
+                    enabled: true,
+                    kinds: vec![OperationKind::CreateSandbox],
+                    max_concurrent: 1,
+                    test_hold: Some(hold),
+                    ..Default::default()
+                },
+                TaskTracker::new(),
+                DrainSignal::new(),
+                OperationExecutionConfig {
+                    claim_stale_after: Duration::from_millis(60),
+                    ..OperationExecutionConfig::default()
+                },
+                true,
+            ),
+            Arc::new(script.clone()),
+            pplx_space_feature_flags::FeatureFlagClient::disabled(),
+        );
+        let admitted = std::time::Instant::now();
+        let response = create_cold(&fixture, &inline, "held-create", None)
+            .await
+            .expect("create is recorded");
+        let claimed_at = || async {
+            sqlx::query_scalar::<_, time::OffsetDateTime>(sql!(
+                "SELECT claimed_at FROM public_operations WHERE operation_id = $1"
+            ))
+            .bind(response.operation_id.as_uuid())
+            .fetch_one(&fixture.db.pool)
+            .await
+        };
+        let first = claimed_at().await?;
+        tokio::time::sleep(hold / 3).await;
+        assert_eq!(
+            script.calls(),
+            0,
+            "the hold keeps the execution from starting"
+        );
+        let row = operation_row(&fixture, response.operation_id).await?;
+        assert_eq!((row.state.as_str(), row.attempts), ("running", 1));
+        assert!(
+            claimed_at().await? > first,
+            "the claim is renewed while the hold keeps the execution from starting"
+        );
+        started(&script).await;
+        assert!(
+            admitted.elapsed() >= hold,
+            "the execution starts after the hold"
+        );
+        let row = wait_for_state(&fixture, response.operation_id, "succeeded").await?;
+        assert_eq!((row.attempts, row.claim_generation), (1, 1));
+        assert_eq!(script.calls(), 1);
         Ok(())
     }
 

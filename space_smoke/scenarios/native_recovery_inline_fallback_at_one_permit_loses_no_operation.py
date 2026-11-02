@@ -1,0 +1,72 @@
+"""With one inline permit per API pod, concurrent creates past it are queued, not lost."""
+
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+from space_smoke.native_inline import inline_execution, operation
+from space_smoke.native_recovery import RECOVERY_ENVIRONMENT, KindNativeHardeningFixture, expect_response
+from space_smoke.registry import scenario
+from space_smoke.runtime import InconclusiveSmoke
+
+CREATES = 4
+# How long the creates are watched with no dispatcher running. Admission
+# claims a create before it answers, so this only gives a claim admission
+# should not have made time to show.
+WATCH_SECONDS = 8
+# An inline create waits this long before it starts, holding its permit, so
+# the permit is still taken when the next create is admitted. Without it a
+# fast runner ends a create, and frees its permit, before the next request
+# arrives, and that one runs inline too. It far outlasts the admissions.
+PERMIT_HOLD_SECONDS = 30
+
+
+@scenario(
+    "native_recovery.inline_fallback_at_one_permit_loses_no_operation",
+    api_surfaces=("native",),
+    required_tools=("kubectl", "kind"),
+    rerun_environment=RECOVERY_ENVIRONMENT,
+    test_hooks="SPACE_NATIVE_INLINE_TEST_HOLD_SECS, which keeps each inline create's permit taken while the rest "
+    "are admitted",
+)
+def inline_fallback_at_one_permit_loses_no_operation(fixture: KindNativeHardeningFixture) -> None:
+    """At `SPACE_NATIVE_INLINE_MAX_CONCURRENT=1`, concurrent creates with no
+    dispatcher running start inline at most once per API pod; the rest stay
+    queued, and every one succeeds once the dispatcher is back.
+    """
+
+    control = fixture.recovery
+    with (
+        inline_execution(fixture, control, ("create_sandbox",), permits=1, hold=PERMIT_HOLD_SECONDS),
+        control.owned_faults(),
+    ):
+        api_pods = control._captures["space-api"].replicas
+        if api_pods >= CREATES:
+            raise InconclusiveSmoke(f"{api_pods} API pods leave no create past their permits")
+        with fixture.context.phase("admit concurrent creates with no dispatcher running"):
+            control.stop_controller()
+            with ThreadPoolExecutor(max_workers=CREATES) as pool:
+                responses = list(pool.map(lambda _: fixture.create(), range(CREATES)))
+            accepted = [expect_response(fixture, response, 202) for response in responses]
+            operations = [body["operation_id"] for body in accepted]
+            started = set()
+            deadline = time.monotonic() + WATCH_SECONDS
+            while time.monotonic() < deadline:
+                started |= {op for op in operations if operation(fixture, op)["state"] != "queued"}
+                time.sleep(0.5)
+            fixture.context.record("inline_started_while_stopped", len(started))
+            fixture.context.verify(
+                bool(started),
+                "with a permit free on each API pod and no dispatcher running, the API must run a create",
+                inline_started=len(started),
+            )
+            fixture.context.verify(
+                len(started) <= api_pods,
+                "creates past each API pod's one permit must be queued for the dispatcher",
+                inline_started=len(started),
+                api_pods=api_pods,
+            )
+        with fixture.context.phase("restore the dispatcher and await every create"):
+            control.restore_controller()
+            for body in accepted:
+                fixture.wait_operation(body["operation_id"], timeout=300)
+                fixture.wait_sandbox(body["sandbox_id"], timeout=120)

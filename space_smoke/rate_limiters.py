@@ -44,10 +44,14 @@ if TYPE_CHECKING:
 SERVER_LIMIT_MESSAGE = "Server rate limit:"
 PER_CLIENT_LIMIT_MESSAGE = "Per-client rate limit:"
 
-# The env this scenario may write on the public API Deployment, and nothing
+# The limiter env a smoke may write on the public API Deployment, and nothing
 # else. `enable` refuses anything outside it before kubectl runs. The store's
 # URL is not among them: the chart renders it, and the fail-open half takes
-# the store itself away instead.
+# the store itself away instead. The inline switches and permit count are
+# the API's own, and the inline hold its test hook, which the
+# `native_recovery.inline_*` scenarios set for their run
+# (`native_inline.inline_execution`); they share the Lease's record and
+# repair.
 LIMITER_ENV_KEYS: tuple[str, ...] = (
     "SPACE_CLUSTER_ACTIVATION_ADMISSION_ENABLED",
     "SPACE_CLUSTER_ACTIVATION_ADMISSION_BURST",
@@ -55,6 +59,10 @@ LIMITER_ENV_KEYS: tuple[str, ...] = (
     "SPACE_API_CLIENT_CONCURRENCY_MODE",
     "SPACE_API_CLIENT_CONCURRENCY_MAX_PER_CLIENT",
     "SPACE_API_CLIENT_CONCURRENCY_KNOWN_CLIENTS",
+    "SPACE_NATIVE_INLINE_OPERATIONS_ENABLED",
+    "SPACE_NATIVE_INLINE_KINDS",
+    "SPACE_NATIVE_INLINE_MAX_CONCURRENT",
+    "SPACE_NATIVE_INLINE_TEST_HOLD_SECS",
 )
 REDIS_URL_ENV = "SPACE_REDIS_URL"
 

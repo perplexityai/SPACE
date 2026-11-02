@@ -1039,8 +1039,9 @@ _RETENTION_BOOLEAN_ENV_VALUES = {
     "TRUE",
 }
 _RETENTION_ENV_VALUE = re.compile(r"[a-z0-9]{1,16}")
-# Limiter values: booleans, small numbers, a redis:// URL, a client id.
-_LIMITER_ENV_VALUE = re.compile(r"[A-Za-z0-9._:/@-]{1,64}")
+# Limiter values: booleans, small numbers, a redis:// URL, a client id, and
+# a comma-separated list (SPACE_NATIVE_INLINE_KINDS).
+_LIMITER_ENV_VALUE = re.compile(r"[A-Za-z0-9._:/@,-]{1,64}")
 _UNSIGNED_INTEGER = re.compile(r"\+?[0-9]+")
 
 
