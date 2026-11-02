@@ -400,6 +400,11 @@ async fn worker_publishing_to(
         cluster_reconcile_trigger: ClusterReconcileTrigger::new(tx.clone(), "node-under-test"),
         resource_status_reader: NodeResourceStatusReader::new(),
         network_pool_status_reader: NetworkPoolStatusReader::new(),
+        // Not the process-wide client: its connection task would run on
+        // whichever test's runtime made it first. A paused-clock test waiting
+        // on another runtime sees its own runtime idle and auto-advances past
+        // its ticks.
+        node_manager: pplx_space_node_mgr_client::lazy_unshared(),
         orphan_inventory,
         runtime_provisioning: Arc::default(),
         node_objects: Some(Box::new(RecordingNodeObjects(passes.clone()))),

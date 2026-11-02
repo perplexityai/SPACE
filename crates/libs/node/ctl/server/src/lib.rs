@@ -35,7 +35,8 @@ use pplx_space_node_api_client::proto::{
     TriggerStateReconciliationResponse,
 };
 use pplx_space_node_mgr_client::{
-    CacheDiskSchedulingEffect, NetworkPoolStatusReader, NodeResourceStatusReader,
+    CacheDiskSchedulingEffect, NetworkPoolStatusReader, NodeManagerGrpcClient,
+    NodeResourceStatusReader,
 };
 use rusqlite::{Connection, params};
 use serde::Deserialize;
@@ -414,6 +415,10 @@ struct NodeCtlWorker {
     cluster_reconcile_trigger: ClusterReconcileTrigger,
     resource_status_reader: NodeResourceStatusReader,
     network_pool_status_reader: NetworkPoolStatusReader,
+    /// The node-manager client the readers above call: the process-wide lazy
+    /// client in production. A test gives its worker a client of its own,
+    /// whose connection task runs on the test's runtime.
+    node_manager: NodeManagerGrpcClient,
     orphan_inventory: Box<dyn OrphanInventoryObserver>,
     runtime_provisioning: Arc<facets::Provisioning>,
     /// The Kubernetes node-local controller when this node runs one.
@@ -626,6 +631,7 @@ pub async fn run(
         cluster_reconcile_trigger: cluster_reconcile_trigger.clone(),
         resource_status_reader,
         network_pool_status_reader,
+        node_manager: pplx_space_node_mgr_client::lazy(),
         orphan_inventory: Box::new(orphan_inventory::Observer::default()),
         runtime_provisioning: Arc::default(),
         #[cfg(feature = "kubernetes")]
@@ -1706,7 +1712,7 @@ impl NodeCtlWorker {
         let response = match self
             .network_pool_status_reader
             .read(
-                pplx_space_node_mgr_client::lazy(),
+                self.node_manager.clone(),
                 local_manager_request(
                     pplx_space_node_mgr_client::proto::NetworkPoolStatusRequest {},
                     false,
@@ -1802,7 +1808,7 @@ impl NodeCtlWorker {
         let status = self
             .resource_status_reader
             .read(
-                pplx_space_node_mgr_client::lazy(),
+                self.node_manager.clone(),
                 local_manager_request(
                     pplx_space_node_mgr_client::proto::NodeResourceStatusRequest {},
                     false,

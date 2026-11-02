@@ -368,17 +368,22 @@ pub async fn connect_once() -> Result<NodeManagerGrpcClient, ConnectError> {
 }
 
 /// Build a node-manager client without opening the Unix socket immediately.
+/// The client is process-wide: its channel's connection task runs on the
+/// Tokio runtime that first called this, and every caller shares it.
 pub fn lazy() -> NodeManagerGrpcClient {
     static CLIENT: std::sync::OnceLock<NodeManagerGrpcClient> = std::sync::OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
-            let channel = pplx_space_common_grpc::connect_uds_channel_lazy(
-                std::path::Path::new(SOCKET_PATH),
-                endpoint().expect("static endpoint URI is valid"),
-            );
-            proto::node_manager_client::NodeManagerClient::new(wrap_grpc_client_channel(channel))
-        })
-        .clone()
+    CLIENT.get_or_init(lazy_unshared).clone()
+}
+
+/// Build a node-manager client of its own, without opening the Unix socket
+/// immediately. Its channel's connection task runs on the calling Tokio
+/// runtime, which must outlive the client's calls.
+pub fn lazy_unshared() -> NodeManagerGrpcClient {
+    let channel = pplx_space_common_grpc::connect_uds_channel_lazy(
+        std::path::Path::new(SOCKET_PATH),
+        endpoint().expect("static endpoint URI is valid"),
+    );
+    proto::node_manager_client::NodeManagerClient::new(wrap_grpc_client_channel(channel))
 }
 
 #[cfg(test)]
