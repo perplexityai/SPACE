@@ -756,6 +756,8 @@ KIND_TELEMETRY_BACKENDS = {
 # gives space-api; MODES in infra/space/kind/scripts/telemetry_config.py sets them.
 KIND_TELEMETRY_MODES = {
     ("datadog", "datadog"): "datadog",
+    # datadog with SPACE_KIND_DATADOG_MODE=off, which deploys no trace Agent.
+    ("datadog", "off"): "datadog",
     ("otlp", "otlp"): "otel",
     ("off", "off"): "off",
 }

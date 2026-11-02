@@ -839,7 +839,9 @@ The loader accepts one flat JSON object of supported string-valued options.
 File entries override matching environment variables; it does not deep-merge
 multiple files. Copy a profile before customizing it. Do not put credentials in
 it. `otel` selects OTLP metrics/traces and local Alloy/Loki logs; `datadog`
-selects native metrics/traces and permits Agent collection of the managed Pods.
+selects native metrics/traces and permits Agent collection of the managed Pods;
+it exports traces only when `SPACE_KIND_DATADOG_MODE` deploys an Agent, so
+with the default `SPACE_KIND_DATADOG_MODE=off` it sends only DogStatsD metrics.
 `off` disables metrics and traces without changing application stdout logging.
 
 Tilt reconciles the profile before changing producer manifests.

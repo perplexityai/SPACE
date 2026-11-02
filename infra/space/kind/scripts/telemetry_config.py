@@ -209,11 +209,18 @@ def configuration(env):
     version = f"{revision}-{phase}" if revision and phase else revision
     commit = checkout_commit()
     metrics, traces = MODES[mode]
+    # Native traces go to a node-local Agent, and SPACE_KIND_DATADOG_MODE=off
+    # deploys none: every exporter would retry a refused connection and log
+    # each failure. DogStatsD metrics are fire-and-forget UDP, so they stay.
+    if mode == "datadog" and env.get("SPACE_KIND_DATADOG_MODE", "off") == "off":
+        traces = "off"
     observability = env.get("SPACE_KIND_OBSERVABILITY", "auto")
     if observability not in {"auto", "off"}:
         raise ValueError("SPACE_KIND_OBSERVABILITY must be auto or off")
     config = {
         "mode": mode,
+        "metrics_sink": metrics,
+        "trace_exporter": traces,
         "observability": observability,
         "install_observability": observability == "auto" and mode == "otel",
         "endpoints": endpoints,
@@ -295,7 +302,7 @@ def exports_otlp(config):
 
 def shim_wrapper(config, binary, fallback_version):
     version = config["version"] or config["commit"] or fallback_version
-    metrics, traces = MODES[config["mode"]]
+    metrics, traces = config["metrics_sink"], config["trace_exporter"]
     values = {
         "SPACE_CLUSTER_ID": config["cluster_id"],
         "SPACE_TRACE_EXPORTER": traces,

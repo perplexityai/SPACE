@@ -15,8 +15,9 @@ default); the telemetry selector sends the same platform ID to services and
 the node-hosted shim. Experiment environment, owner and phase do not rename it.
 
 The default `datadog` mode uses the native exporters without authorizing Agent
-installation. In the explicit `otel` profile, metrics and traces use separate
-Collector Services over plaintext OTLP/gRPC. Bootstrap and Tilt install required
+installation; it turns traces off when `SPACE_KIND_DATADOG_MODE=off` deploys no
+Agent to receive them. In the explicit `otel` profile, metrics and traces use
+separate Collector Services over plaintext OTLP/gRPC. Bootstrap and Tilt install required
 local receivers in that mode (`infra/space/kind/metrics/local.sh up` and
 `infra/space/kind/traces/local.sh up` by hand); no Datadog Agent is required.
 The same JSON profile can override `SPACE_KIND_OTLP_METRICS_ENDPOINT` and
