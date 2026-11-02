@@ -32,7 +32,7 @@
 "crates/libs/build/mgr/src/recipe.rs" = 1037
 "crates/libs/cluster/controller/server/src/node_drain/mod.rs" = 1686
 "crates/libs/cluster/controller/server/src/node_drain/store.rs" = 1893
-"crates/libs/cluster/controller/server/src/orphaned_sandboxes.rs" = 1581
+"crates/libs/cluster/controller/server/src/orphaned_sandboxes.rs" = 1418
 "crates/libs/cluster/controller/server/src/transient_lifecycle_sweeper/mod.rs" = 1843
 "crates/libs/cluster/controller/server/src/warm_pool.rs" = 2385
 "crates/libs/cluster/pool/src/store.rs" = 1700
@@ -152,9 +152,6 @@
 "crates/libs/cluster/controller/server/src/drained_node_terminator/store.rs" = 1
 "crates/libs/cluster/controller/server/src/node_drain/store.rs" = 15
 "crates/libs/cluster/controller/server/src/node_drain/store/pod_less_giveup.rs" = 3
-"crates/libs/cluster/controller/server/src/orphaned_sandboxes.rs" = 5
-"crates/libs/cluster/controller/server/src/tombstone_retention.rs" = 1
-"crates/libs/cluster/controller/server/src/transient_lifecycle_sweeper/store.rs" = 2
 "crates/libs/placement/machine/src/postgres.rs" = 1
 
 # sbx-mgr code outside its SQLite store uses only the store's own handle,

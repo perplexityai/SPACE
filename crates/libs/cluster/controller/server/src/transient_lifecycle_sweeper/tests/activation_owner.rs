@@ -17,13 +17,14 @@ use pplx_space_common_core::types::{
     PodUid, SandboxActivationAttemptId, SandboxId, SandboxLifecycle, SubstrateKind,
 };
 use pplx_space_db_test_fixtures::{pg_test_db, pg_test_db_with_max_connections};
+use pplx_space_sandbox_store::sweeper::REPAIR_FAILED_ACTIVE_EXECUTION_SQL;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 
 use super::super::lifecycle_writer_tests::{age, direct_sink};
 use super::super::store::{
     FIRST_ACTIVATION_SQL, LIST_FAILED_ACTIVE_EXECUTIONS_SQL, LOCK_SANDBOX_ROW_SQL,
-    REPAIR_FAILED_ACTIVE_EXECUTION_SQL, candidate_pod_fence_with_observation,
+    candidate_pod_fence_with_observation,
 };
 use super::super::{FailGuard, SWEEPABLE_LIFECYCLES, SubstrateSweepSink, SweepSink};
 use crate::lifecycle_writer_test_support::{

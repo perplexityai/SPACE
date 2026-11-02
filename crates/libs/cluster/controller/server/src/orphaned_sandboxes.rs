@@ -40,10 +40,9 @@ use pplx_space_events::{
 use pplx_space_metrics::sandbox::api::reconciler::{
     self as reconciler_metrics, ClassificationOutcome, ClassificationReason, PodEvidence,
 };
-use pplx_space_sandbox_portability::{
-    SuspendedTargetNodeAssignment, clear_current_local_artifact_marker_assignments,
-    quarantined_k8s_finalization_sql, started_repair_revert_eligibility,
-    suspended_k8s_finalization_sql,
+use pplx_space_sandbox_portability::started_repair_revert_eligibility;
+use pplx_space_sandbox_store::orphan::{
+    self, OrphanGuard, classify_guard_from_sql, classify_guard_lock_sql, classify_guard_sql,
 };
 use sqlx::PgPool;
 use sqlx::types::Json;
@@ -454,6 +453,24 @@ pub enum ClassifyGuard {
 }
 
 impl ClassifyGuard {
+    /// The store's form of this guard, with the values its guarded
+    /// statements bind.
+    fn store_guard(&self) -> OrphanGuard<'_> {
+        match self {
+            Self::PodName { name, uid } => OrphanGuard::PodName {
+                name,
+                uid: uid.as_ref(),
+                live_pod_required_lifecycles: LIVE_POD_REQUIRED_LIFECYCLES,
+                pending_pod_lifecycles: PENDING_POD_LIFECYCLES,
+                create_age_threshold_secs: CREATE_AGE_THRESHOLD_SECS,
+            },
+            Self::Forgotten => OrphanGuard::Forgotten {
+                active_execution_required_lifecycles: ACTIVE_EXECUTION_REQUIRED_LIFECYCLES,
+            },
+            Self::LegacyDeleting { .. } => OrphanGuard::LegacyDeleting,
+        }
+    }
+
     fn observed_pod_cleanup_name(&self) -> Option<String> {
         match self {
             Self::PodName { name, .. } => Some(name.clone()),
@@ -1193,7 +1210,13 @@ impl OrphanActionSink for SubstrateActionSink {
         }
 
         if matches!(plan.disposition, OrphanDisposition::RecoverSuspended)
-            && let Some(row) = recover_orphan_to_suspended(&mut tx, sandbox_id, &guard).await?
+            && let Some(row) = orphan::recover_orphan_to_suspended(
+                &mut tx,
+                sandbox_id,
+                ORPHAN_RECONCILER_STOP_LIFECYCLES,
+                &guard.store_guard(),
+            )
+            .await?
         {
             // Node assignment retired ⇒ no node owns this sandbox's desired
             // state until a later restore re-places it (which enqueues fresh
@@ -1231,7 +1254,13 @@ impl OrphanActionSink for SubstrateActionSink {
         }
 
         if matches!(plan.disposition, OrphanDisposition::QuarantineAmbiguous)
-            && let Some(row) = quarantine_orphan(&mut tx, sandbox_id, &guard).await?
+            && let Some(row) = orphan::quarantine_orphan(
+                &mut tx,
+                sandbox_id,
+                ORPHAN_RECONCILER_STOP_LIFECYCLES,
+                &guard.store_guard(),
+            )
+            .await?
         {
             // The quarantine retired the old node assignment, so no node
             // owns this sandbox's desired state any more. Drop the queue
@@ -1396,19 +1425,6 @@ impl SubstrateActionSink {
     }
 }
 
-#[derive(sqlx::FromRow)]
-struct OrphanResolutionRow {
-    from_lifecycle: SandboxLifecycle,
-    active_node_id: Option<NodeId>,
-    clear_marker: Option<bool>,
-}
-
-impl OrphanResolutionRow {
-    fn clear_marker(&self) -> bool {
-        self.clear_marker.unwrap_or(false)
-    }
-}
-
 fn details_for_guard(guard: &ClassifyGuard) -> SandboxEventDetails {
     match guard {
         ClassifyGuard::PodName { name, uid } => {
@@ -1488,10 +1504,11 @@ async fn plan_orphan_in_tx(
 ) -> Result<Option<OrphanPlan>, sqlx::Error> {
     let eligibility = started_repair_revert_eligibility("s");
     let recoverable = eligibility.eligible;
-    let guard_sql = classify_guard_sql(guard);
-    let guard_from_sql = classify_guard_from_sql(guard);
+    let store_guard = guard.store_guard();
+    let guard_sql = classify_guard_sql(&store_guard);
+    let guard_from_sql = classify_guard_from_sql(&store_guard);
     let lock_sql = if lock {
-        format!(" FOR UPDATE OF {}", classify_guard_lock_sql(guard))
+        format!(" FOR UPDATE OF {}", classify_guard_lock_sql(&store_guard))
     } else {
         String::new()
     };
@@ -1539,206 +1556,6 @@ async fn fetch_guarded_plan(
     guard: &ClassifyGuard,
 ) -> Result<Option<OrphanPlanRow>, sqlx::Error> {
     let query = sqlx::query_as::<_, OrphanPlanRow>(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .bind(sandbox_id)
-        .bind(ORPHAN_RECONCILER_STOP_LIFECYCLES);
-    match guard {
-        ClassifyGuard::PodName { name, uid } => {
-            query
-                .bind(name)
-                .bind(uid)
-                .bind(LIVE_POD_REQUIRED_LIFECYCLES)
-                .bind(PENDING_POD_LIFECYCLES)
-                .bind(CREATE_AGE_THRESHOLD_SECS)
-                .fetch_optional(&mut **tx)
-                .await
-        }
-        ClassifyGuard::Forgotten => {
-            query
-                .bind(ACTIVE_EXECUTION_REQUIRED_LIFECYCLES)
-                .fetch_optional(&mut **tx)
-                .await
-        }
-        ClassifyGuard::LegacyDeleting { .. } => query.fetch_optional(&mut **tx).await,
-    }
-}
-
-async fn recover_orphan_to_suspended(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    sandbox_id: SandboxId,
-    guard: &ClassifyGuard,
-) -> Result<Option<OrphanResolutionRow>, sqlx::Error> {
-    let eligibility = started_repair_revert_eligibility("s");
-    let clear_marker = eligibility.clear_marker;
-    let eligible = eligibility.eligible;
-    let artifact_marker_assignments =
-        clear_current_local_artifact_marker_assignments("s", "pre.clear_marker");
-    let finalization = suspended_k8s_finalization_sql(
-        "s",
-        "updated_sandbox",
-        &artifact_marker_assignments,
-        SuspendedTargetNodeAssignment::Clear,
-    );
-    let sandbox_assignments = finalization.sandbox_assignments();
-    let retire_active_execution_cte = finalization.retire_active_execution_cte();
-    let invalidate_open_port_exposures_cte = finalization.invalidate_open_port_exposures_cte();
-    let guard_sql = classify_guard_sql(guard);
-    let guard_from_sql = classify_guard_from_sql(guard);
-    let guard_lock_sql = classify_guard_lock_sql(guard);
-    let query = format!(
-        "WITH pre AS (
-             SELECT s.id,
-                    s.lifecycle AS from_lifecycle,
-                    s.active_node_id,
-                    {clear_marker} AS clear_marker
-               FROM {guard_from_sql}
-              WHERE s.id = $1
-                AND s.lifecycle <> ALL($2)
-                AND {guard_sql}
-                AND {eligible}
-              FOR UPDATE OF {guard_lock_sql}
-         ),
-         updated_sandbox AS (
-             UPDATE sandboxes s
-                SET {sandbox_assignments}
-               FROM pre
-              WHERE s.id = pre.id
-              RETURNING s.id,
-                        pre.from_lifecycle,
-                        pre.active_node_id,
-                        pre.clear_marker
-         ),
-         {retire_active_execution_cte},
-         {invalidate_open_port_exposures_cte}
-         SELECT from_lifecycle, active_node_id, clear_marker
-           FROM updated_sandbox"
-    );
-    fetch_guarded_resolution(tx, query, sandbox_id, guard).await
-}
-
-async fn quarantine_orphan(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    sandbox_id: SandboxId,
-    guard: &ClassifyGuard,
-) -> Result<Option<OrphanResolutionRow>, sqlx::Error> {
-    let eligibility = started_repair_revert_eligibility("s");
-    let eligible = eligibility.eligible;
-    let artifact_predicate = if matches!(guard, ClassifyGuard::LegacyDeleting { .. }) {
-        "TRUE".to_string()
-    } else {
-        format!("NOT ({eligible})")
-    };
-    // Retire the old node assignment along with the lifecycle flip: the pod
-    // is authoritatively gone, so leaving `active_node_id` in place keeps the
-    // old node eligible for the same sandbox desired state (including open
-    // port exposures against a torn-down CNI netns) forever. Open port
-    // exposure rows keep their `desired_state='open'` user intent and only
-    // have the application observation reset, so the intent re-applies if an
-    // operator later recovers the sandbox.
-    let finalization = quarantined_k8s_finalization_sql(
-        "s",
-        "updated_sandbox",
-        "",
-        SuspendedTargetNodeAssignment::Clear,
-    );
-    let sandbox_assignments = finalization.sandbox_assignments();
-    let retire_active_execution_cte = finalization.retire_active_execution_cte();
-    let invalidate_open_port_exposures_cte = finalization.invalidate_open_port_exposures_cte();
-    let guard_sql = classify_guard_sql(guard);
-    let guard_from_sql = classify_guard_from_sql(guard);
-    let guard_lock_sql = classify_guard_lock_sql(guard);
-    let query = format!(
-        "WITH pre AS (
-             SELECT s.id,
-                    s.lifecycle AS from_lifecycle,
-                    s.active_node_id
-               FROM {guard_from_sql}
-              WHERE s.id = $1
-                AND s.lifecycle <> ALL($2)
-                AND {guard_sql}
-                AND {artifact_predicate}
-              FOR UPDATE OF {guard_lock_sql}
-         ),
-         updated_sandbox AS (
-             UPDATE sandboxes s
-                SET {sandbox_assignments}
-               FROM pre
-              WHERE s.id = pre.id
-              RETURNING s.id,
-                        pre.from_lifecycle,
-                        pre.active_node_id,
-                        FALSE AS clear_marker
-         ),
-         {retire_active_execution_cte},
-         {invalidate_open_port_exposures_cte}
-         SELECT from_lifecycle, active_node_id, clear_marker
-           FROM updated_sandbox"
-    );
-    fetch_guarded_resolution(tx, query, sandbox_id, guard).await
-}
-
-fn classify_guard_sql(guard: &ClassifyGuard) -> &'static str {
-    match guard {
-        ClassifyGuard::PodName { .. } => {
-            "(
-                (
-                    s.lifecycle = ANY($5)
-                    AND (
-                        e.state NOT IN ('creating', 'recovering')
-                        OR e.updated_at <= NOW() - ($7 * INTERVAL '1 second')
-                    )
-                )
-              OR (
-                  s.lifecycle = ANY($6)
-                  AND e.updated_at <= NOW() - ($7 * INTERVAL '1 second')
-              )
-            )"
-        }
-        ClassifyGuard::Forgotten => {
-            "s.lifecycle = ANY($3)
-             AND EXISTS (
-                 SELECT 1
-                   FROM sandbox_k8s_executions f
-                  WHERE f.sandbox_id = s.id
-                    AND f.state = 'forgotten'
-                    AND f.generation = (
-                        SELECT MAX(generation)
-                          FROM sandbox_k8s_executions
-                         WHERE sandbox_id = s.id
-                    )
-             )"
-        }
-        ClassifyGuard::LegacyDeleting { .. } => "s.lifecycle = 'deleting'",
-    }
-}
-
-fn classify_guard_from_sql(guard: &ClassifyGuard) -> &'static str {
-    match guard {
-        ClassifyGuard::PodName { .. } => {
-            "sandboxes s
-             JOIN sandbox_k8s_executions e
-              ON e.sandbox_id = s.id
-              AND e.active
-              AND e.pod_name = $3
-              AND NULLIF(BTRIM(e.pod_uid), '') IS NOT DISTINCT FROM $4"
-        }
-        ClassifyGuard::Forgotten | ClassifyGuard::LegacyDeleting { .. } => "sandboxes s",
-    }
-}
-
-fn classify_guard_lock_sql(guard: &ClassifyGuard) -> &'static str {
-    match guard {
-        ClassifyGuard::PodName { .. } => "s, e",
-        ClassifyGuard::Forgotten | ClassifyGuard::LegacyDeleting { .. } => "s",
-    }
-}
-
-async fn fetch_guarded_resolution(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    query: String,
-    sandbox_id: SandboxId,
-    guard: &ClassifyGuard,
-) -> Result<Option<OrphanResolutionRow>, sqlx::Error> {
-    let query = sqlx::query_as::<_, OrphanResolutionRow>(sqlx::AssertSqlSafe(sql!(query.as_str())))
         .bind(sandbox_id)
         .bind(ORPHAN_RECONCILER_STOP_LIFECYCLES);
     match guard {

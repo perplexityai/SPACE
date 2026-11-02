@@ -220,6 +220,8 @@ mod lifecycle_writer_tests;
 mod tests;
 
 pub use classify::{ExecutionRoutability, ProbeObservation, ProbeVerdict, SweepAction};
+pub use pplx_space_sandbox_store::sweeper::FailGuard;
+pub(crate) use pplx_space_sandbox_store::sweeper::is_activation_owned;
 pub use probe::{ProbeNodeError, SweepCandidate};
 pub use store::SubstrateSweepSink;
 
@@ -246,24 +248,6 @@ pub(crate) const SWEEPABLE_LIFECYCLES: &[SandboxLifecycle] = &[
     SandboxLifecycle::Stopping,
     SandboxLifecycle::Checkpointing,
 ];
-
-/// Whether a row in `lifecycle` can be owned by a request holding an
-/// activation-attempt lease on the active execution: the create, start,
-/// resume, or wake or restore bringing the sandbox up, or a start that runs
-/// while the row is still `pausing` or `checkpointing` (start materializes an
-/// execution from either). The sweep doesn't act on such a row while that
-/// lease may still be its owner's; see "Owner check" in the module docs.
-pub(crate) const fn is_activation_owned(lifecycle: SandboxLifecycle) -> bool {
-    matches!(
-        lifecycle,
-        SandboxLifecycle::Creating
-            | SandboxLifecycle::Starting
-            | SandboxLifecycle::Resuming
-            | SandboxLifecycle::Restoring
-            | SandboxLifecycle::Pausing
-            | SandboxLifecycle::Checkpointing
-    )
-}
 
 fn emit_transient_sweep_event(
     sandbox_id: SandboxId,
@@ -1095,26 +1079,6 @@ pub struct CommandReadyPendingCandidate {
     /// pod, and a create that finally converged between probe and retire looks
     /// identical to one that never will.
     pub pod_fence: RetireFence,
-}
-
-/// What the fail CAS re-checks beyond the candidate select's guards.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FailGuard {
-    /// Only the candidate select's guards.
-    Aged,
-    /// Also that no activation-completion receipt can still finish the row:
-    /// its active execution isn't both routable and holding an attempt. The
-    /// sweep fails an alive abandoned create unless a receipt can still move
-    /// it to `started`, which takes a routable execution and the attempt the
-    /// receipt matches on. So a pod IP committed between the select and the
-    /// CAS (a read of the pod records one) makes the CAS claim nothing while
-    /// an attempt is held, and an attempt claimed in between does too while
-    /// the execution is routable. An owner that gave its activation up holds
-    /// no attempt, so a routable row it left behind still fails. The pod-IP
-    /// write doesn't take the sandbox row lock, so one that lands after the
-    /// CAS, before the retire, isn't caught: the retire's pod fence checks the
-    /// pod's identity, not its IP.
-    NoPendingReceipt,
 }
 
 /// DB-side surface the sweeper depends on. Implementations:

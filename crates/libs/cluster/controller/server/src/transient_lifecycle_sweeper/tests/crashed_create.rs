@@ -323,15 +323,14 @@ mod postgres_backed {
     // Kubernetes API for these statements. The owner check reads the
     // execution row directly, so it decides the same way for either label.
     use super::super::super::lifecycle_writer_tests::{age, direct_sink};
-    use super::super::super::store::{
-        LIST_FAILED_ACTIVE_EXECUTIONS_SQL, REPAIR_FAILED_ACTIVE_EXECUTION_SQL,
-    };
+    use super::super::super::store::LIST_FAILED_ACTIVE_EXECUTIONS_SQL;
     use super::super::super::{FailGuard, FirstActivation, SubstrateSweepSink, SweepSink};
     use crate::lifecycle_writer_test_support::{
         ExecutionSeed, SandboxSeed, bounded, insert_execution, insert_node, insert_sandbox,
         kubernetes_substrate, single_backend_pool, wait_until_blocked,
     };
     use pplx_space_api::controllers::substrate::Substrate;
+    use pplx_space_sandbox_store::sweeper::REPAIR_FAILED_ACTIVE_EXECUTION_SQL;
     use std::sync::Arc;
 
     /// The activation-attempt columns of the active execution.

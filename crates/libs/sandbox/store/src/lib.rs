@@ -109,12 +109,14 @@ pub mod fork_source_lifecycle;
 pub mod ingest;
 pub mod intent;
 pub mod lost;
+pub mod orphan;
 pub mod pod_tracking;
 pub mod quarantine;
 pub mod repair;
 pub mod restore_lease;
 pub mod suspend;
 pub mod sweeper;
+pub mod tombstone;
 pub mod wake;
 
 pub use create::{SandboxCreate, insert_pooled, insert_unplaced};
