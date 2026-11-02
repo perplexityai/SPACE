@@ -673,16 +673,29 @@ async fn cleanup_does_not_stop_a_lease_replaced_while_it_waited_for_the_gate() {
     node.stop().await;
 }
 
-/// Cleanup owns the sandbox exclusively: it refuses while startup work,
-/// cleanup or reset holds the claim, and gives the claim back when it returns.
-/// `cleanup_sandbox` also inspects the fixed cache root on its way out, so the
-/// claim is exercised through the operation it runs.
+type ClaimHolder = (
+    &'static str,
+    fn(&crate::slot_pool::NetworkPool, &str) -> Option<Arc<crate::slot_pool::SandboxMutationClaim>>,
+);
+
+/// A slot reset takes the exclusive claim, as cleanup does.
+const CLAIM_HOLDERS: [ClaimHolder; 2] = [
+    (
+        "startup work",
+        crate::slot_pool::NetworkPool::try_claim_sandbox_work,
+    ),
+    (
+        "cleanup or reset",
+        crate::slot_pool::NetworkPool::try_claim_sandbox_mutation,
+    ),
+];
+
+/// Cleanup owns the sandbox exclusively: while startup work, cleanup or reset
+/// holds the claim, cleanup waits, and when the bound expires it refuses
+/// without taking the claim. `cleanup_sandbox` also inspects the fixed cache root on
+/// its way out, so the claim is exercised through the operation it runs.
 #[tokio::test(start_paused = true)]
-async fn cleanup_refuses_a_claimed_sandbox_and_keeps_no_claim() {
-    type Claim = fn(
-        &crate::slot_pool::NetworkPool,
-        &str,
-    ) -> Option<Arc<crate::slot_pool::SandboxMutationClaim>>;
+async fn cleanup_waits_for_a_claimed_sandbox_and_keeps_no_claim_when_the_bound_expires() {
     let service = crate::service::tests::service_tests::service_for_unit_tests().await;
     let id = SandboxId::new();
     let sandbox_id = id.to_string();
@@ -693,34 +706,34 @@ async fn cleanup_refuses_a_claimed_sandbox_and_keeps_no_claim() {
         .await
         .read_owned()
         .await;
-    let holders: [(&str, Claim); 2] = [
-        (
-            "startup work",
-            crate::slot_pool::NetworkPool::try_claim_sandbox_work,
-        ),
-        (
-            "cleanup or reset",
-            crate::slot_pool::NetworkPool::try_claim_sandbox_mutation,
-        ),
-    ];
-    for (holder, claim) in holders {
+    for (holder, claim) in CLAIM_HOLDERS {
         let owner = claim(&service.pool, &sandbox_id).unwrap();
-        let error = service
-            .run_cleanup_sandbox_operation(
-                id,
-                CleanupSandboxRequest {
-                    sandbox_id: sandbox_id.clone(),
-                    ..Default::default()
-                },
-                None,
-            )
-            .await
-            .unwrap_err();
+        let mut cleanup = Box::pin(service.run_cleanup_sandbox_operation(
+            id,
+            CleanupSandboxRequest {
+                sandbox_id: sandbox_id.clone(),
+                ..Default::default()
+            },
+            None,
+        ));
+        assert!(
+            futures_util::poll!(&mut cleanup).is_pending(),
+            "{holder}: cleanup must wait rather than refuse"
+        );
+        tokio::time::advance(CLEANUP_PHASE_ACQUIRE_TIMEOUT).await;
+        let error = cleanup.await.unwrap_err();
         assert_eq!(error.code(), tonic::Code::Unavailable, "{holder}: {error}");
         assert_eq!(
             error.message(),
             "sandbox host mutation or reset is in progress; retry",
             "{holder}"
+        );
+        assert!(
+            service
+                .pool
+                .try_claim_sandbox_mutation(&sandbox_id)
+                .is_none(),
+            "{holder}: the holder keeps its claim"
         );
         drop(owner);
         drop(
@@ -729,5 +742,174 @@ async fn cleanup_refuses_a_claimed_sandbox_and_keeps_no_claim() {
                 .try_claim_sandbox_mutation(&sandbox_id)
                 .unwrap_or_else(|| panic!("{holder}: refused cleanup kept a claim")),
         );
+    }
+}
+
+/// A cleanup parked behind a claim holder holds neither the node-wide
+/// CleanupSandbox permit nor the sandbox's artifact lock, which a cache
+/// deletion would wait for while holding a global delete slot.
+#[tokio::test(start_paused = true)]
+async fn cleanup_waiting_for_the_claim_holds_no_permit_or_artifact_lock() {
+    use crate::lifecycle_limiter::LifecycleMethod;
+    let service = crate::service::tests::service_tests::service_for_unit_tests().await;
+    let id = SandboxId::new();
+    let sandbox_id = id.to_string();
+    for (holder, claim) in CLAIM_HOLDERS {
+        let owner = claim(&service.pool, &sandbox_id).unwrap();
+        let mut cleanup = Box::pin(service.run_cleanup_sandbox_operation(
+            id,
+            CleanupSandboxRequest {
+                sandbox_id: sandbox_id.clone(),
+                ..Default::default()
+            },
+            None,
+        ));
+        assert!(
+            futures_util::poll!(&mut cleanup).is_pending(),
+            "{holder}: cleanup must wait for the claim"
+        );
+        assert_eq!(
+            service
+                .lifecycle_limiter
+                .snapshot(LifecycleMethod::CleanupSandbox),
+            (0, 0),
+            "{holder}: the parked cleanup holds or queues for a permit"
+        );
+        let artifacts = service.lock_sandbox_artifacts(&sandbox_id);
+        tokio::pin!(artifacts);
+        assert!(
+            matches!(
+                futures_util::poll!(&mut artifacts),
+                std::task::Poll::Ready(Ok(_))
+            ),
+            "{holder}: the parked cleanup holds the artifact lock"
+        );
+        drop(cleanup);
+        drop(owner);
+    }
+}
+
+/// The reverse lock order: an artifact deletion that took the artifact lock
+/// ahead of cleanup only tries the claim cleanup now holds, so it refuses at
+/// once and releases the lock, and cleanup proceeds rather than deadlocking.
+#[tokio::test(start_paused = true)]
+async fn artifact_deletion_ahead_of_a_claimed_cleanup_refuses_and_lets_it_proceed() {
+    fn root<T>(message: T) -> tonic::Request<T> {
+        let mut request = tonic::Request::new(message);
+        request
+            .extensions_mut()
+            .insert(pplx_space_common_svc::PeerIdentity::new(0, 0, None));
+        request
+    }
+    type Deletion = fn(
+        NodeManagerService,
+        String,
+    ) -> futures_util::future::BoxFuture<'static, Result<(), tonic::Status>>;
+    let deletions: [(&str, Deletion); 2] = [
+        ("DeleteBtrfsSnapshot", |service, sandbox_id| {
+            Box::pin(async move {
+                service
+                    .delete_btrfs_snapshot(root(crate::proto::DeleteBtrfsSnapshotRequest {
+                        sandbox_id,
+                        snapshot_name: "d-1m-20260922T120000Z".into(),
+                    }))
+                    .await
+                    .map(drop)
+            })
+        }),
+        ("DeleteCacheArtifact", |service, sandbox_id| {
+            Box::pin(async move {
+                service
+                    .delete_cache_artifact(root(crate::proto::DeleteCacheArtifactRequest {
+                        local_path: format!(
+                            "{CACHE_DIR}/{sandbox_id}/snapshots/.suspend-gc-pending-{sandbox_id}"
+                        ),
+                    }))
+                    .await
+                    .map(drop)
+            })
+        }),
+    ];
+    for (rpc, delete) in deletions {
+        let service = crate::service::tests::service_tests::service_for_unit_tests().await;
+        let id = SandboxId::new();
+        let sandbox_id = id.to_string();
+        // Stops the admitted cleanup before any host phase.
+        let _gate = service
+            .sandbox_cgroup_gate_lock(&sandbox_id)
+            .await
+            .read_owned()
+            .await;
+        let transfer = service.lock_sandbox_artifacts(&sandbox_id).await.unwrap();
+        let mut deletion = delete(service.clone(), sandbox_id.clone());
+        assert!(futures_util::poll!(&mut deletion).is_pending(), "{rpc}");
+        let mut cleanup = Box::pin(service.run_cleanup_sandbox_operation(
+            id,
+            CleanupSandboxRequest {
+                sandbox_id: sandbox_id.clone(),
+                ..Default::default()
+            },
+            None,
+        ));
+        assert!(futures_util::poll!(&mut cleanup).is_pending(), "{rpc}");
+
+        // The deletion is next in line for the artifact lock, and cleanup
+        // holds the claim while it waits behind it.
+        drop(transfer);
+        let error = deletion.await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unavailable, "{rpc}: {error}");
+        assert_eq!(
+            error.message(),
+            "sandbox host mutation or reset is in progress; retry",
+            "{rpc}"
+        );
+        let error = cleanup.await.unwrap_err();
+        assert_eq!(
+            error.message(),
+            "timed out waiting for sandbox cleanup ownership",
+            "{rpc}: cleanup must get past the artifact lock"
+        );
+        drop(
+            service
+                .pool
+                .try_claim_sandbox_mutation(&sandbox_id)
+                .unwrap_or_else(|| panic!("{rpc}: cleanup kept its claim")),
+        );
+    }
+}
+
+/// Once the holder releases the claim, the waiting cleanup takes it and runs
+/// on to the runtime stop, which the test supervisor refuses before cleanup
+/// touches host artifacts.
+#[tokio::test(flavor = "current_thread")]
+async fn cleanup_proceeds_once_the_claim_holder_releases_it() {
+    use crate::runtime_supervisor_client::tests::{stop_failure_client, stop_supervisor_server};
+    for (holder, claim) in CLAIM_HOLDERS {
+        let mut node = CleanupNode::leased().await;
+        // A stop refusal no earlier phase returns.
+        let (_socket, client, server) = stop_failure_client(tonic::Code::Internal).await;
+        node.service.runtime_supervisor = client;
+        let sandbox_id = node.sandbox_id.to_string();
+        let before = node.lease();
+        let owner = claim(&node.service.pool, &sandbox_id).unwrap();
+        let mut cleanup = Box::pin(node.cleanup(node.request(), None));
+        assert!(
+            futures_util::poll!(&mut cleanup).is_pending(),
+            "{holder}: cleanup must wait rather than refuse"
+        );
+        drop(owner);
+
+        let error = cleanup.await.unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::Internal, "{holder}: {error}");
+        assert_eq!(node.lease(), before, "{holder}");
+        drop(
+            node.service
+                .pool
+                .try_claim_sandbox_mutation(&sandbox_id)
+                .unwrap_or_else(|| panic!("{holder}: cleanup kept its claim")),
+        );
+        stop_supervisor_server(server).await;
+        node.stop().await;
     }
 }

@@ -125,6 +125,19 @@ pub enum FirewallError {
     Apply { stderr: String, input: String },
 }
 
+impl FirewallError {
+    /// nft never ran because its network namespace's /run/netns entry was
+    /// gone or unmounted.
+    pub(crate) fn is_namespace_missing(&self) -> bool {
+        match self {
+            Self::ListStart(error) | Self::DeleteStart(error) | Self::Exec(error) => {
+                crate::net::is_namespace_missing_io_error(error)
+            }
+            _ => false,
+        }
+    }
+}
+
 pub type FirewallResult<T> = Result<T, FirewallError>;
 
 #[derive(Debug, thiserror::Error)]

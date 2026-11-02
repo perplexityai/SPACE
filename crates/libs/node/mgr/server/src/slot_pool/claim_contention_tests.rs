@@ -204,7 +204,13 @@ async fn reset_slot_defers_a_claimed_sandbox_and_requeues_itself() {
         drain(&mut wakeups);
 
         let claim = holder.claim(&pool, &sandbox_id);
-        reset_slot(pool.clone(), 0).await;
+        assert_eq!(
+            reset_slot(pool.clone(), 0).await,
+            ResetAttempt::ClaimHeld {
+                sandbox_id: sandbox_id.clone()
+            },
+            "{holder:?}"
+        );
         let deferred = slot(&pool, 0);
         assert_eq!(
             (
@@ -230,4 +236,53 @@ async fn reset_slot_defers_a_claimed_sandbox_and_requeues_itself() {
                 .expect("a deferred reset must not keep a sandbox claim"),
         );
     }
+}
+
+/// Reset, destroy, pool fill and failed-setup recovery publish a free row and
+/// only then drop their slot claim. An allocation in that window takes the
+/// next free row; it refuses only when every free row is still claimed.
+#[test]
+fn ephemeral_allocation_skips_a_free_slot_whose_claim_is_still_held() {
+    let mut config = NetworkPoolConfig::new(2);
+    config.target_ready_slots = 0;
+    config.retained_ready_slots = 0;
+    config.min_ready_slots = 0;
+    let pool = NetworkPool::open_in_memory_for_test(config);
+    pool.db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE network_slots SET state = 'ready', health = 'healthy' WHERE slot_id = 1",
+            [],
+        )
+        .unwrap();
+    // Slot 0 is 'missing', so allocation prefers it.
+    assert_eq!(slot(&pool, 0).state, SlotState::Missing);
+    let publisher = ResetClaim::acquire(&pool, 0).unwrap();
+    publisher.disarm();
+    let memory = || {
+        Some(NewLeaseMemoryReservation {
+            memory_reservation_mib: 1024,
+        })
+    };
+
+    let sandbox_id = SandboxId::new().to_string();
+    let ClaimedSlotAllocation::Ephemeral(lease) = pool
+        .claim_allocation(&sandbox_id, None, memory())
+        .expect("a second free slot must be allocated")
+    else {
+        panic!("a disabled warm pool allocates dynamically");
+    };
+    assert_eq!(lease.info.slot, 1);
+    assert_eq!(slot(&pool, 1).state, SlotState::Leasing);
+    assert_eq!(slot(&pool, 0).state, SlotState::Missing);
+
+    match pool.claim_allocation(&SandboxId::new().to_string(), None, memory()) {
+        Err(AllocateSlotError::InProgress(message)) => {
+            assert_eq!(message, "slot mutation already in progress");
+        }
+        result => panic!("every free slot is claimed: {result:?}"),
+    }
+    assert_eq!(slot(&pool, 0).state, SlotState::Missing);
+    lease.ownership.disarm();
 }

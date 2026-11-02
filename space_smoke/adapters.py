@@ -760,9 +760,10 @@ LOCAL_SANDBOX_RECLAIM_POD_POLL_SECONDS = 0.5
 # retried within the delete budget: sbx-manager's quarantine recovery
 # completing (`CleanupAdmissionError` in
 # crates/libs/sbx/mgr/server/src/service/cleanup.rs), and node-manager's
-# sandbox mutation claim held by another host mutation or reset
-# (`claim_sandbox_mutation` in crates/libs/node/mgr/server/src/service.rs),
-# which the delete's durable cleanup passes through. A pending suspend
+# sandbox mutation claim held by another host mutation or reset past
+# cleanup's bounded wait (`cleanup_sandbox_phases` in
+# crates/libs/node/mgr/server/src/service/cleanup_inspect.rs), which the
+# delete's durable cleanup passes through. A pending suspend
 # publication cannot land once the cluster row is gone, so it is reported as
 # such. Every other refusal, `RetainedFilesystemOnlyCopy` included, is reported
 # with the daemon's own message.

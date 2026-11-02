@@ -24,6 +24,10 @@ pub enum NetworkProbeError {
     Nft { detail: String },
     #[error("failed to inspect network namespace {ns}: {detail}")]
     Namespace { ns: String, detail: String },
+    /// The namespace's /run/netns entry was gone, or no longer named a
+    /// namespace, when the probe entered it.
+    #[error("failed to inspect network namespace {ns}: {detail}")]
+    NamespaceMissing { ns: String, detail: String },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -34,6 +38,16 @@ pub enum NetworkTeardownError {
     Remaining { resource: String },
     #[error("network teardown ingress cleanup failed: {0}")]
     Ingress(#[from] crate::firewall::FirewallError),
+}
+
+impl NetworkTeardownError {
+    fn is_namespace_missing(&self) -> bool {
+        match self {
+            Self::Probe(NetworkProbeError::NamespaceMissing { .. }) => true,
+            Self::Ingress(error) => error.is_namespace_missing(),
+            Self::Probe(_) | Self::Remaining { .. } => false,
+        }
+    }
 }
 
 fn require_network_absent(
@@ -123,10 +137,36 @@ pub enum NetnsEnterError {
         #[source]
         source: io::Error,
     },
+    /// The /run/netns entry exists but no longer names a namespace.
+    #[error("network namespace {path} is unmounted")]
+    TargetUnmounted { path: String },
     #[error("{detail}")]
     SetNs { detail: String },
     #[error("network namespace thread panicked for {ns}")]
     ThreadPanicked { ns: String },
+}
+
+impl NetnsEnterError {
+    /// The target's /run/netns entry no longer exists or no longer names a
+    /// namespace. Every other entry failure, including a namespace that
+    /// exists but cannot be entered, is not.
+    pub fn is_target_missing(&self) -> bool {
+        match self {
+            Self::OpenTarget { source, .. } => source.kind() == io::ErrorKind::NotFound,
+            Self::TargetUnmounted { .. } => true,
+            Self::OpenCurrent { .. } | Self::SetNs { .. } | Self::ThreadPanicked { .. } => false,
+        }
+    }
+}
+
+/// Whether a command run in a namespace failed because that namespace's
+/// /run/netns entry was gone or unmounted. Commands that never entered a
+/// namespace never match.
+pub(crate) fn is_namespace_missing_io_error(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<NetnsEnterError>())
+        .is_some_and(NetnsEnterError::is_target_missing)
 }
 
 impl From<NetnsEnterError> for String {
@@ -526,20 +566,51 @@ pub fn teardown_network(
     finish_network_teardown(
         || teardown_network_links(ns, net, pod_netns),
         || {
-            if let Some(namespace) = pod_netns
-                && !try_namespace_exists(namespace)?
-            {
-                return Ok(());
-            }
-            crate::firewall::remove_ingress_dnat_rules(
-                pod_netns,
-                crate::firewall::PortSelector::All,
-                "",
-                &net.vpeer_ip_bare(),
-            )?;
-            Ok(())
+            let remove = || {
+                crate::firewall::remove_ingress_dnat_rules(
+                    pod_netns,
+                    crate::firewall::PortSelector::All,
+                    "",
+                    &net.vpeer_ip_bare(),
+                )
+                .map_err(NetworkTeardownError::from)
+            };
+            in_pod_namespace(pod_netns, remove)
         },
     )
+}
+
+/// Finish a teardown step that runs inside the sandbox's pod namespace. CNI
+/// owns that namespace, and the sveth, host route and ingress rules SPACE adds
+/// there go with it. CNI can remove it between the existence probe and the
+/// step entering it; that leaves nothing to clean, so the step is done. Only a
+/// missing or unmounted /run/netns entry counts: a namespace that exists but
+/// cannot be entered, and every failure inside it, still fails the teardown.
+fn finish_pod_namespace_step(
+    step: impl FnOnce() -> Result<(), NetworkTeardownError>,
+) -> Result<(), NetworkTeardownError> {
+    match step() {
+        Err(error) if error.is_namespace_missing() => Ok(()),
+        result => result,
+    }
+}
+
+/// Run a teardown step in the pod namespace, or on the host without one.
+fn in_pod_namespace(
+    pod_netns: Option<&str>,
+    step: impl FnOnce() -> Result<(), NetworkTeardownError>,
+) -> Result<(), NetworkTeardownError> {
+    match pod_netns {
+        // CNI has removed this namespace; there is no remaining host-side
+        // addressable state to clean there. Only a missing /run/netns entry
+        // counts as removed, whether seen here or when the step enters the
+        // namespace, where an unmounted entry counts too
+        // (finish_pod_namespace_step); every other probe error fails the
+        // teardown.
+        Some(namespace) if !try_namespace_exists(namespace)? => Ok(()),
+        Some(_) => finish_pod_namespace_step(step),
+        None => step(),
+    }
 }
 
 fn finish_network_teardown(
@@ -630,22 +701,17 @@ fn teardown_network_links(
             try_link_exists_in(TAP_DEVICE, None),
         )?;
     }
-    if let Some(pod_ns) = pod_netns
-        && !try_namespace_exists(pod_ns)?
-    {
-        // CNI has removed this namespace; there is no remaining host-side
-        // addressable state to clean there. Never interpret a probe error so.
-        return Ok(());
-    }
-    for name in [net.sveth(), net.vpeer()] {
-        let present = try_link_exists_in(&name, pod_netns);
-        require_network_absent(format!("interface {name}"), present)?;
-    }
-    require_network_absent(
-        format!("route for {}", net.vpeer_ip_bare()),
-        try_host_route_exists_in(net, pod_netns),
-    )?;
-    Ok(())
+    let verify = || {
+        for name in [net.sveth(), net.vpeer()] {
+            let present = try_link_exists_in(&name, pod_netns);
+            require_network_absent(format!("interface {name}"), present)?;
+        }
+        require_network_absent(
+            format!("route for {}", net.vpeer_ip_bare()),
+            try_host_route_exists_in(net, pod_netns),
+        )
+    };
+    in_pod_namespace(pod_netns, verify)
 }
 
 fn log_cleanup_result(operation: &str, result: Result<(), String>) {
