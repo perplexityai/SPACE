@@ -227,7 +227,8 @@ pub fn setup_namespace_sysctls(ns: &str) -> Result<(), NetworkOpError> {
     write_sysctl(Some(ns), "net.ipv4.conf.tap0.src_valid_mark", "0")
         .map_err(NetworkOpError::transient)?;
     write_sysctl(Some(ns), "net.ipv4.conf.all.src_valid_mark", "0")
-        .map_err(NetworkOpError::transient)
+        .map_err(NetworkOpError::transient)?;
+    write_sysctl(Some(ns), "net.mptcp.enabled", "0").map_err(NetworkOpError::transient)
 }
 
 pub fn add_host_route(net: &NetId, ns: Option<&str>) -> Result<(), NetworkOpError> {

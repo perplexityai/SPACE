@@ -79,6 +79,7 @@ pub fn setup_namespace_sysctls(ns: &str) -> Result<(), NetworkOpError> {
             "net.ipv4.conf.all.rp_filter=0",
             "net.ipv4.conf.tap0.src_valid_mark=0",
             "net.ipv4.conf.all.src_valid_mark=0",
+            "net.mptcp.enabled=0",
         ],
     )
     .map_err(NetworkOpError::transient)
