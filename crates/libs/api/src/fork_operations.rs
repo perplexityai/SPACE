@@ -48,6 +48,29 @@ pub const FORK_OPERATION_PAYLOAD_SCRUB_RULES: &[PublicOperationPayloadScrubRule]
 const FORK_PATH_TEMPLATE: OperationPathTemplate =
     OperationPathTemplate::new("/sandboxes/{sandboxID}/fork");
 
+/// The switch for recording a new fork's source sandbox in `target_id` as
+/// `sbx_<uuid>`, the form every other sandbox operation records: `1`, `true`,
+/// `yes`, `on` or `enabled`, in any case, turns it on; unset or anything else
+/// keeps the bare UUID. Releases before this one match a fork's source by the
+/// bare UUID alone, in the delete guard, snapshot retention and the capture
+/// leader election, so they cannot see a fork recorded in the `sbx_` form.
+/// Turn it on only once every `space-api` and `space-cluster-controller`
+/// replica runs a release that matches both forms. Before rolling either
+/// back, turn it off on every API replica, let the admissions already in
+/// flight finish, and wait until no queued or running fork names its source
+/// in the `sbx_` form; `docs/configuration.md` gives the check.
+pub(crate) const FORK_PUBLIC_TARGET_ID_ENV: &str = "SPACE_FORK_PUBLIC_TARGET_ID_ENABLED";
+
+/// The `target_id` a new fork operation records for its source; see
+/// [`FORK_PUBLIC_TARGET_ID_ENV`].
+fn fork_operation_target_id(source: SandboxId, public_form: bool) -> String {
+    if public_form {
+        pplx_space_public_api::PublicSandboxId::from(source).to_string()
+    } else {
+        source.to_string()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ForkAvailabilityConfig {
     hard_deadline: std::time::Duration,
@@ -964,7 +987,10 @@ fn prepare_fork_operation(
         input.request,
         input.federated_owner.map(|owner| &owner.subject_id),
     )?;
-    let source_id = input.source_sandbox_id.to_string();
+    let source_id = fork_operation_target_id(
+        input.source_sandbox_id,
+        pplx_space_common_core::env::env_flag_var(FORK_PUBLIC_TARGET_ID_ENV, false),
+    );
     let payload_json = serde_json::to_value(ForkSandboxPayload::v1(payload))?;
     Ok(PreparedForkOperation {
         source_id,

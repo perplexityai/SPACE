@@ -55,6 +55,86 @@ async fn fork_operation_kind_persists_in_native_scope() -> TestResult {
         operation.target_id.as_deref(),
         Some(source_id_string.as_str())
     );
+
+    // The admin filter finds this bare-UUID fork row by either form of the
+    // source's id, as it finds the `sbx_` rows newer forks record.
+    for target_id in [
+        source_id_string.clone(),
+        pplx_space_public_api::PublicSandboxId::from(SandboxId::from_uuid(source_id)).to_string(),
+    ] {
+        let listed = store
+            .list_operations_admin(ListAdminPublicOperations {
+                limit: 10,
+                org_id: Some(OrgId::from_uuid(org_id)),
+                state: None,
+                kind: Some(OperationKind::ForkSandbox),
+                target_type: None,
+                target_id: Some(target_id.clone()),
+            })
+            .await?;
+        assert_eq!(
+            listed
+                .iter()
+                .map(|operation| operation.id)
+                .collect::<Vec<_>>(),
+            vec![operation_id],
+            "{target_id}"
+        );
+    }
+
+    // The source's lifecycle events carry this bare-UUID fork's, as they do
+    // an `sbx_` fork's, whatever form the switch had it record.
+    let events = store
+        .fetch_sandbox_operation_events(
+            OrgId::from_uuid(org_id),
+            SandboxId::from_uuid(source_id),
+            None,
+            10,
+        )
+        .await?;
+    assert!(
+        events
+            .iter()
+            .any(|event| event.operation_id == operation_id),
+        "{events:?}"
+    );
+
+    // A target that is not a sandbox is matched as typed, even when it
+    // parses as one: a template named by 32 hex digits finds its own delete.
+    let template = "0123456789abcdef0123456789abcdef";
+    let CreatePublicOperationResult::Created(template_operation_id) = store
+        .create_operation(CreatePublicOperation {
+            org_id: OrgId::from_uuid(org_id),
+            actor_user_id: Some(UserId::from_uuid(actor_id)),
+            api_product: ApiProduct::Admin,
+            kind: OperationKind::DeleteTemplate,
+            target_type: Some(OperationTargetType::Template),
+            target_id: Some(template),
+            payload_json: serde_json::json!({ "template": template }),
+            idempotency: None,
+            traceparent: None,
+        })
+        .await?
+    else {
+        return Err("template delete operation was not created".into());
+    };
+    let listed = store
+        .list_operations_admin(ListAdminPublicOperations {
+            limit: 10,
+            org_id: Some(OrgId::from_uuid(org_id)),
+            state: None,
+            kind: None,
+            target_type: None,
+            target_id: Some(template.to_string()),
+        })
+        .await?;
+    assert_eq!(
+        listed
+            .iter()
+            .map(|operation| operation.id)
+            .collect::<Vec<_>>(),
+        vec![template_operation_id]
+    );
     Ok(())
 }
 

@@ -396,3 +396,110 @@ async fn live_capture_resolves_its_published_snapshot_artifact() {
         .expect("the persisted snapshot and location must remain resolvable");
     assert_eq!(fenced, artifact);
 }
+
+/// Forks of one source elect one capture leader whichever id form each
+/// names the source by: a bare-UUID row from before the `sbx_` form and a
+/// newer `sbx_` row, in either order, are candidates for the same leader.
+#[tokio::test]
+async fn capture_leader_election_spans_both_target_id_forms() {
+    let Some(db) = try_pg_test_db().await.unwrap() else {
+        return;
+    };
+    let org_id = OrgId::from_uuid(pplx_space_db_test_fixtures::SEED_ORG_ID);
+    let frozen = |source| {
+        let mut payload = ForkSandboxPayloadV1::new(
+            source,
+            ForkRequest::from_wire(Some(60), Some(1)).unwrap(),
+            "e2b.example.test".to_string(),
+        );
+        payload.freeze_source(
+            7,
+            ForkSourceLifecycle::Started,
+            ForkTargetConfig {
+                volume_encryption: false,
+                egress_profiles: Default::default(),
+                template: "seed:latest".parse().unwrap(),
+                source_template_id: Some("seed".to_string()),
+                runtime: None,
+                env: Default::default(),
+                metadata: Default::default(),
+                vcpu: None,
+                memory_mib: None,
+                disk_mib: None,
+                auto_lifecycle: pplx_space_common_core::types::AutoLifecyclePolicy::disabled(),
+                network_policy: None,
+            },
+            None,
+        );
+        payload
+    };
+    let store = ForkOperationStore::new(db.pool.clone());
+    for earlier_is_public in [false, true] {
+        let source = SandboxId::new();
+        let bare = source.to_string();
+        let public = pplx_space_public_api::PublicSandboxId::from(source).to_string();
+        let (earlier_target, claimed_target) = if earlier_is_public {
+            (public, bare)
+        } else {
+            (bare, public)
+        };
+        let earlier = OperationId::new();
+        let claimed = OperationId::new();
+        let claim_token = format!("capture-election-{claimed}");
+        let payload_json = serde_json::to_value(ForkSandboxPayload::v1(frozen(source))).unwrap();
+        sqlx::query(sql!(
+            "INSERT INTO public_operations (
+                 operation_id, org_id, kind, target_type, target_id, state,
+                 payload_json, created_at
+             ) VALUES ($1, $2, 'fork_sandbox', 'sandbox', $3, 'queued', $4,
+                       NOW() - INTERVAL '1 minute')"
+        ))
+        .bind(earlier.as_uuid())
+        .bind(org_id)
+        .bind(&earlier_target)
+        .bind(Json(&payload_json))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query(sql!(
+            "INSERT INTO public_operations (
+                 operation_id, org_id, kind, target_type, target_id, state,
+                 payload_json, claim_token, claim_generation
+             ) VALUES ($1, $2, 'fork_sandbox', 'sandbox', $3, 'running', $4, $5, 1)"
+        ))
+        .bind(claimed.as_uuid())
+        .bind(org_id)
+        .bind(&claimed_target)
+        .bind(Json(&payload_json))
+        .bind(&claim_token)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let operation = ClaimedPublicOperation {
+            id: claimed,
+            org_id,
+            actor_user_id: None,
+            api_product: crate::public_operations::ApiProduct::Native,
+            kind: pplx_space_public_api::OperationKind::ForkSandbox,
+            target_type: Some(pplx_space_public_api::OperationTargetType::Sandbox),
+            target_id: Some(claimed_target.clone()),
+            payload: payload_json.clone(),
+            attempts: 1,
+            claim_generation: 1,
+            traceparent: None,
+            age_at_first_claim_secs: None,
+        };
+
+        let mut payload = frozen(source);
+        let leader = store
+            .select_capture_leader(&claim_token, &operation, &mut payload)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            leader, earlier,
+            "{earlier_target} must lead the fork recorded as {claimed_target}"
+        );
+        assert_eq!(payload.capture_operation_id(), Some(earlier));
+    }
+}

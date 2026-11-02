@@ -28,6 +28,10 @@ pub async fn lock_fork_source_lifecycle(
 
 /// Return whether a queued or running fork still depends on this source.
 ///
+/// A fork names its source in `target_id` by the bare UUID or, from
+/// producers that record the public form, `sbx_<uuid>`; both match, so the
+/// guard holds across the change and for rows written before it.
+///
 /// Callers that use this as a lifecycle or snapshot-deletion guard must first
 /// acquire [`lock_fork_source_lifecycle`] in the same transaction.
 pub async fn active_fork_source_operation_exists(
@@ -39,7 +43,7 @@ pub async fn active_fork_source_operation_exists(
              SELECT 1
                FROM public_operations
               WHERE kind = 'fork_sandbox'
-                AND target_id = $1
+                AND target_id IN ($1, 'sbx_' || $1)
                 AND state IN ('queued', 'running')
          )"
     ))

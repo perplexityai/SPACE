@@ -879,6 +879,45 @@ async fn durably_restorable_follows_the_marker_and_placement() -> TestResult {
     Ok(())
 }
 
+/// The fork-source guard sees a queued fork whichever form its `target_id`
+/// names the source by: the bare UUID older producers record, or `sbx_<uuid>`.
+#[tokio::test]
+async fn an_active_fork_source_is_found_by_either_target_id_form() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    for public_form in [false, true] {
+        let source = SandboxId::new();
+        let target_id = if public_form {
+            format!("sbx_{source}")
+        } else {
+            source.to_string()
+        };
+        let mut tx = db.pool.begin().await?;
+        assert!(
+            !crate::fork_source_lifecycle::active_fork_source_operation_exists(&mut tx, source)
+                .await?
+        );
+        sqlx::query(sql!(
+            "INSERT INTO public_operations
+                 (operation_id, org_id, kind, target_type, target_id, state)
+             VALUES ($1, $2, 'fork_sandbox', 'sandbox', $3, 'queued')"
+        ))
+        .bind(Uuid::now_v7())
+        .bind(pplx_space_db_test_fixtures::SEED_ORG_ID)
+        .bind(&target_id)
+        .execute(&mut *tx)
+        .await?;
+        assert!(
+            crate::fork_source_lifecycle::active_fork_source_operation_exists(&mut tx, source)
+                .await?,
+            "{target_id}"
+        );
+        tx.rollback().await?;
+    }
+    Ok(())
+}
+
 /// A user's sandbox rows hold the user until the most recently updated
 /// deleted one leaves retention, a week later; any other row holds it
 /// outright.

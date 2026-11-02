@@ -186,7 +186,7 @@ fn admin_openapi_value() -> Value {
                         { "name": "state", "in": "query", "required": false, "schema": { "type": "string" } },
                         { "name": "kind", "in": "query", "required": false, "schema": { "type": "string" } },
                         { "name": "target_type", "in": "query", "required": false, "schema": { "type": "string" } },
-                        { "name": "target_id", "in": "query", "required": false, "schema": { "type": "string" } },
+                        { "name": "target_id", "in": "query", "required": false, "schema": { "type": "string" }, "description": "Matches target_id exactly as given. When the value is also a sandbox id, as sbx_<uuid> or a bare UUID, it matches the other form too, so fork operations are found whichever form they recorded their source in." },
                         { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 250 } }
                     ],
                     "responses": {
