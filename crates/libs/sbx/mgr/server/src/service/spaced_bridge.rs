@@ -189,11 +189,17 @@ impl SandboxManagerService {
             }
         };
         let client = connect_spaced_host_live(sandbox).await?;
+        // Read once the connect has checked the peer's pid and uid. Only an
+        // evaluation at or after it ties this peer to the attested
+        // spaced-host, so the validation accepts only a node-manager answer
+        // sent at or after it; `endpoint_proof_flights` states the invariant.
+        let connected_at = tokio::time::Instant::now();
         if let Err(error) = validate_spaced_endpoint_proof(
             &self.endpoint_proof_flights,
             &node_client,
             &proof,
             &runtime,
+            connected_at,
         )
         .await
         {
@@ -351,21 +357,24 @@ async fn validate_spaced_endpoint_proof(
     node_client: &NodeManagerGrpcClient,
     proof: &crate::endpoint_proof::SpacedEndpointProof,
     runtime: &crate::endpoint_proof::SpacedEndpointRuntimeIdentity,
+    connected_at: tokio::time::Instant,
 ) -> Result<(), Status> {
     proof
         .validate_runtime(runtime)
         .map_err(endpoint_proof_error_status)?;
     flights
-        .validate(proof, || {
+        .validate(proof, connected_at, || {
             validate_spaced_endpoint_proof_with_node(node_client.clone(), proof)
         })
         .await
 }
 
+/// Validate `proof` with node-manager, answering when the successful attempt
+/// was sent: node-manager evaluated the proof no earlier than that instant.
 fn validate_spaced_endpoint_proof_with_node(
     node_client: NodeManagerGrpcClient,
     proof: &crate::endpoint_proof::SpacedEndpointProof,
-) -> impl std::future::Future<Output = Result<(), Status>> + Send + 'static {
+) -> impl std::future::Future<Output = Result<tokio::time::Instant, Status>> + Send + 'static {
     const COMMAND: &str = "validate_sandbox_endpoint_proof";
     const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
     let sandbox_id = proof.sandbox_id;
@@ -381,11 +390,14 @@ fn validate_spaced_endpoint_proof_with_node(
                     },
                 );
                 request.set_timeout(RPC_TIMEOUT);
-                node_client.validate_sandbox_endpoint_proof(request).await
+                let sent_at = tokio::time::Instant::now();
+                node_client
+                    .validate_sandbox_endpoint_proof(request)
+                    .await
+                    .map(|_| sent_at)
             }
         })
         .await
-        .map(|_| ())
         .map_err(|error| node_endpoint_proof_status(sandbox_id, COMMAND, error))
     }
 }
