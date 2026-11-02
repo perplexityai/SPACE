@@ -13,6 +13,14 @@ export type ConsoleAuthMode =
 
 export const PASSWORD_MODE: ConsoleAuthMode = { mode: 'password' };
 
+// External sign-in with no logout URL can only return to `/login`, which the
+// provider session signs straight back in. The console then has no working
+// Log out; the user must sign out of the provider. Returns its name, or `null`
+// when the console can log out itself.
+export function providerSignOutOnly(mode: ConsoleAuthMode | null): string | null {
+  return mode?.mode === 'external' && !mode.logoutUrl ? mode.providerName : null;
+}
+
 // Sent on every external-mode request. The API requires it, with a trusted
 // `Origin`, on state-changing requests: a cross-site page cannot add it
 // without a CORS preflight.
