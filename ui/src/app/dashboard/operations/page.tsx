@@ -7,6 +7,7 @@ import { InfoCircleOutlined, ReloadOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 
 import { adminApi } from '@/lib/api';
+import { mergeNewest } from '@/lib/operation-list';
 import { publicSandboxIdFromAny } from '@/lib/sandbox-id';
 import { tablePagination } from '@/lib/table-pagination';
 import type { Organization, PublicOperationRecord, User } from '@/lib/types';
@@ -25,23 +26,6 @@ interface AdminOperation extends PublicOperationRecord {
 
 const ACTOR_LOOKUPS = 6;
 const SBX_TARGET = /^sbx_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
-
-// Newer first, at the timestamps' full precision: the API's RFC 3339
-// strings have a fixed fractional width, so they sort as text (Date.parse
-// would drop the microseconds). The operation ID breaks only exact ties.
-function newerFirst(a: AdminOperation, b: AdminOperation): number {
-  if (a.created_at.length === b.created_at.length && a.created_at !== b.created_at) {
-    return a.created_at < b.created_at ? 1 : -1;
-  }
-  return Date.parse(b.created_at) - Date.parse(a.created_at) || b.id.localeCompare(a.id);
-}
-
-// Rows read under two target IDs, one per operation, newest first.
-function mergeNewest(pages: AdminOperation[][], limit: number): AdminOperation[] {
-  const byId = new Map<string, AdminOperation>();
-  for (const op of pages.flat()) byId.set(op.id, op);
-  return [...byId.values()].sort(newerFirst).slice(0, limit);
-}
 
 const STATES = ['queued', 'running', 'succeeded', 'failed', 'canceled', 'expired'];
 const STATE_COLORS: Record<string, string> = {
