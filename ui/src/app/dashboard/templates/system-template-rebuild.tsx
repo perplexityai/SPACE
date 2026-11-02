@@ -597,7 +597,7 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
           type="success"
           showIcon
           title={`Promoted ${formatTime(promotion.confirmedAt)}. As read just now, latest names ${(Object.keys(promotionView.latest) as SystemTemplate[]).map((t) => `${t} ${shortHash(promotionView.latest[t])}`).join(' and ')}.`}
-          description={rollbackText(promotion)}
+          description={<RollbackTargets promotion={promotion} expiresAt={runExpiresAt(run)} />}
         />
       );
     }
@@ -639,7 +639,7 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
                   a retry asks before overwriting it.
                 </Text>
               ))}
-              <Text>{rollbackText(promotion)}</Text>
+              <RollbackTargets promotion={promotion} expiresAt={runExpiresAt(run)} />
             </Space>
           )}
         />
@@ -746,7 +746,7 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
                 )}
               />
             ) : null}
-            {promote.mode !== 'first' && run.promotion ? <Text type="secondary">{rollbackText(run.promotion)}</Text> : null}
+            {promote.mode !== 'first' && run.promotion ? <RollbackTargets promotion={run.promotion} expiresAt={runExpiresAt(run)} /> : null}
           </Space>
         ) : null}
       </Modal>
@@ -754,13 +754,35 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
   );
 }
 
-// Where latest pointed when the promotion was confirmed, to move it back with
-// the tag dialog. A template that had no latest keeps the new release: the
-// API does not delete latest.
-function rollbackText(promotion: Promotion): string {
-  const parts = TEMPLATES.map((t) => {
-    if (promotion.previous[t] === promotion.targets[t]) return `${t}: already on the new release`;
-    return promotion.previous[t] ? `${t} ${shortHash(promotion.previous[t])}` : `${t}: none (it keeps the new release)`;
-  });
-  return `To roll back, assign latest with the tag button in Template Releases to the releases it named before: ${parts.join('; ')}.`;
+// Where latest pointed when the promotion was confirmed, in full and
+// copyable, to move it back with the tag dialog. The operator should record
+// them: the run that holds them expires and lives only in this browser. A
+// template that had no latest keeps the new release: the API does not delete
+// latest.
+function RollbackTargets({ promotion, expiresAt }: { promotion: Promotion; expiresAt: number }) {
+  return (
+    <Space orientation="vertical" size={2} style={{ width: '100%' }}>
+      <Text strong>Rollback target: the releases latest named before this promotion</Text>
+      {TEMPLATES.map((t) => {
+        const previous = promotion.previous[t];
+        return (
+          <div key={t}>
+            <Text strong>{t}</Text>{' '}
+            {previous ? (
+              <>
+                <Text code copyable={{ text: previous }}>{previous}</Text>
+                {previous === promotion.targets[t] ? <Text type="secondary"> (already the new release)</Text> : null}
+              </>
+            ) : (
+              <Text type="secondary">none: it had no latest, and keeps the new release</Text>
+            )}
+          </div>
+        );
+      })}
+      <Text type="secondary">
+        Record these digests now. This browser keeps them only until {formatTime(expiresAt)}, and no other browser has
+        them. To roll back, assign latest to them with the tag button in Template Releases.
+      </Text>
+    </Space>
+  );
 }
