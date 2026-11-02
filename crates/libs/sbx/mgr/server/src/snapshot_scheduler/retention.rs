@@ -1,8 +1,6 @@
 //! Scheduled-snapshot retention: which snapshots each tier keeps, and the
 //! prune that deletes the rest.
 
-use std::path::Path;
-
 use pplx_space_common_core::types::SandboxId;
 
 use super::CheckpointContext;
@@ -57,23 +55,19 @@ pub(super) fn retention_candidate(
 }
 
 /// Prune `sandbox_id`'s scheduled snapshots under `cache_root` (a test's own
-/// directory, or the sandbox cache), delete the staging the prune leaves, and
-/// then run `capture`. The prune and the capture each run under the sandbox's
-/// disk artifact publication locks, so backup selection never races a
-/// snapshot's creation or its retention deletion. The capture depends on
-/// nothing the prune read, so the locks are released between them.
+/// directory, or the sandbox cache) and run `capture`, both under the
+/// sandbox's disk artifact publication locks, so backup selection never races
+/// a snapshot's creation or its retention deletion. `capture` runs only after
+/// a successful prune, so a failed byte delete blocks further growth.
 ///
-/// The staging is deleted with the locks released: the pruned rows are gone,
-/// so nothing owns it, and under the locks a node-manager deletion backlog
-/// would stall the sandbox's publication, rollback, export and backup
-/// enqueue. Besides this prune's own staging, the prune hands back every
-/// unowned staging it lists, such as one an earlier delete failed to remove.
-///
-/// `capture` runs only after a successful prune whose staging is all deleted,
-/// so a failing byte delete blocks further growth. While DeleteCacheArtifact
-/// keeps failing, each tick retries the staging and captures nothing: the
-/// staging holds at most what one prune moved aside, and no tier gains a
-/// snapshot.
+/// The pruned snapshots' GC staging is deleted after the locks are released,
+/// whatever the prune or capture returned: their rows are gone, so nothing
+/// owns it, and under the locks a node-manager deletion backlog would stall
+/// the sandbox's publication, rollback, export and backup enqueue. A failed
+/// staging delete never blocks capture; the orphan sweep retries it every
+/// pass. While DeleteCacheArtifact keeps failing, each tick can therefore add
+/// staging until a delete succeeds. A bounded gate on that growth follows
+/// separately.
 pub(super) async fn prune_and_capture(
     node_client: &mut NodeManagerGrpcClient,
     ctx: &CheckpointContext,
@@ -82,40 +76,27 @@ pub(super) async fn prune_and_capture(
     capture: impl AsyncFnOnce(&mut NodeManagerGrpcClient) -> Result<(), String>,
 ) -> Result<(), String> {
     let mut staged = Vec::new();
-    let pruned = {
+    let result = {
         let (_wake_guard, _artifact_guard) = ctx
             .auto_lifecycle
             .artifact_publication_locks(sandbox_id, ArtifactKind::Disk)
             .await;
-        prune_scheduled_snapshots(node_client, ctx, sandbox_id, cache_root, &mut staged).await
-    };
-    let mut not_deleted = 0usize;
-    for (snapshot_name, staging) in &staged {
-        if crate::snapshot_gc::delete_gc_staging(node_client, staging, "retention", snapshot_name)
-            .await
-            .is_err()
+        match prune_scheduled_snapshots(node_client, ctx, sandbox_id, cache_root, &mut staged).await
         {
-            not_deleted += 1;
+            Ok(()) => capture(node_client).await,
+            Err(error) => Err(error),
         }
+    };
+    for (snapshot_name, staging) in &staged {
+        let _ =
+            crate::snapshot_gc::delete_gc_staging(node_client, staging, "retention", snapshot_name)
+                .await;
     }
-    pruned?;
-    if not_deleted > 0 {
-        return Err(format!(
-            "{not_deleted} of {} GC staging directories not deleted; \
-             capture skipped until a later tick deletes them",
-            staged.len()
-        ));
-    }
-    let (_wake_guard, _artifact_guard) = ctx
-        .auto_lifecycle
-        .artifact_publication_locks(sandbox_id, ArtifactKind::Disk)
-        .await;
-    capture(node_client).await
+    result
 }
 
 /// Delete the scheduled snapshots outside each tier's retention. Each
-/// catalogued snapshot's GC staging, with its name, goes to `staged`, and so
-/// does each unowned GC staging the listing shows.
+/// catalogued snapshot's GC staging, with its name, goes to `staged`.
 async fn prune_scheduled_snapshots(
     node_client: &mut NodeManagerGrpcClient,
     ctx: &CheckpointContext,
@@ -135,17 +116,6 @@ async fn prune_scheduled_snapshots(
         .map_err(|e| format!("list snapshots: {e}"))?
     {
         for snapshot in snapshots {
-            if crate::local_artifacts::is_gc_staging_name(&snapshot.name) {
-                let staging = pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir_in(
-                    cache_root,
-                    sandbox_id,
-                    &snapshot.name,
-                );
-                if crate::snapshot_gc::gc_pending_is_unowned(&artifacts, Path::new(&staging)) {
-                    staged.push((snapshot.name, staging));
-                }
-                continue;
-            }
             let Some(name) = retention_candidate(&mut retained, snapshot.name) else {
                 continue;
             };
