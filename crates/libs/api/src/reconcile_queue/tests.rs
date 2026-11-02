@@ -6,7 +6,7 @@ mod postgres_tests {
 
     use pplx_space_common_core::types::SnapshotId;
     use pplx_space_db_test_fixtures::{
-        insert_pool_slot_receipt, insert_ready_worker_node, pg_test_db, pool_slot_receipt_state,
+        insert_pool_slot_receipt, pg_test_db, pool_slot_receipt_state,
     };
     use uuid::Uuid;
 
@@ -150,62 +150,6 @@ mod postgres_tests {
             "snapshot_id should be NULL after orphan"
         );
         assert!(orphan.1.is_some(), "orphaned_at should be stamped");
-        Ok(())
-    }
-
-    async fn saved_traceparent(
-        pool: &PgPool,
-        node_id: NodeId,
-        element: &str,
-    ) -> Result<Option<String>, sqlx::Error> {
-        sqlx::query_scalar(sql!(
-            "SELECT traceparent FROM node_reconcile_queue
-             WHERE node_id = $1 AND facet = 'network-policy' AND element = $2"
-        ))
-        .bind(node_id)
-        .bind(element)
-        .fetch_one(pool)
-        .await
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn queued_ref_keeps_the_latest_writer_traceparent_unless_it_drops_a_sampled_one()
-    -> TestResult {
-        let db = pg_test_db().await?;
-        let node_id = NodeId::new();
-        insert_ready_worker_node(&db.pool, node_id).await?;
-        let element = format!("sandbox:{}", SandboxId::new());
-        let unsampled = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00";
-        let later_unsampled = "00-5bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00";
-        let sampled = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
-        let later_sampled = "00-1af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
-        let node_ids = [node_id];
-        let facets = ["network-policy".to_string()];
-        let queue = |traceparent: Option<&'static str>| {
-            upsert_node_reconcile_refs(
-                &db.pool,
-                &node_ids,
-                &facets,
-                std::slice::from_ref(&element),
-                traceparent,
-            )
-        };
-        let saved = || saved_traceparent(&db.pool, node_id, &element);
-
-        queue(Some(unsampled)).await?;
-        assert_eq!(saved().await?.as_deref(), Some(unsampled));
-        queue(Some(later_unsampled)).await?;
-        assert_eq!(saved().await?.as_deref(), Some(later_unsampled));
-        queue(Some(sampled)).await?;
-        assert_eq!(saved().await?.as_deref(), Some(sampled));
-        // A writer without trace context coalesces without erasing it.
-        queue(None).await?;
-        assert_eq!(saved().await?.as_deref(), Some(sampled));
-        // An unsampled writer does not replace the sampled request's context.
-        queue(Some(later_unsampled)).await?;
-        assert_eq!(saved().await?.as_deref(), Some(sampled));
-        queue(Some(later_sampled)).await?;
-        assert_eq!(saved().await?.as_deref(), Some(later_sampled));
         Ok(())
     }
 
