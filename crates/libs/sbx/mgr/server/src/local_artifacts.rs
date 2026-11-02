@@ -1006,11 +1006,15 @@ pub(crate) const GC_PENDING_MARKER: &str = ".gc-pending-";
 
 /// The artifact id a GC staging name was staged under, in either shape: the
 /// whole name is `.gc-pending-<id>`, or it ends with `.gc-pending-<id>`. The
-/// orphan sweep reclaims exactly the names this parses, so a name such as
-/// `run.gc-pending-1` stays an ordinary snapshot.
+/// id must be spelled the way [`LocalArtifactId`]'s `Display` writes it, the
+/// hyphenated lowercase UUID every staging rename and recovery probe uses.
+/// The orphan sweep reclaims exactly the names this parses, so a name such as
+/// `run.gc-pending-1`, or one whose id is uppercase or unhyphenated, stays an
+/// ordinary snapshot.
 pub(crate) fn gc_staging_id(name: &str) -> Option<LocalArtifactId> {
-    let (_, id) = name.rsplit_once(GC_PENDING_MARKER)?;
-    id.parse().ok()
+    let (_, suffix) = name.rsplit_once(GC_PENDING_MARKER)?;
+    let id: LocalArtifactId = suffix.parse().ok()?;
+    (id.to_string() == suffix).then_some(id)
 }
 
 /// Whether a directory name is GC staging, in either shape. Staging is
