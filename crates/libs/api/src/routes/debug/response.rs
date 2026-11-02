@@ -276,7 +276,9 @@ pub(super) struct Snapshot {
     pub org_id: Option<OrgId>,
     pub failure_reason: Option<String>,
     /// Filled from the snapshot catalog's storage placement after the read.
+    /// Omitted when that read failed; the section's `storage_error` says why.
     #[sqlx(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub storage: Option<SnapshotStorage>,
 }
 
