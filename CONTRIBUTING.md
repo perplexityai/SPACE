@@ -121,6 +121,14 @@ can see only this repository:
 - Before you mark the pull request ready for review, check each claim, commit,
   and result in the description against the current head.
 
+Pull CI runs the Kind/Firecracker smoke only when a pull request changes a
+path in [ci/kind-pull-paths.txt](ci/kind-pull-paths.txt). On a draft it is
+deferred, and the required `space-pull-ci` check fails until it runs. It runs
+when you mark the pull request ready for review, and on every push while it
+stays ready; converting it back to a draft defers it again. To run it on a
+draft, someone with triage access adds the `kind-smoke` label, and it runs
+from the next push.
+
 Run `cargo arch` to check the repository structure rules in
 [ARCHITECTURE.toml](ARCHITECTURE.toml); [archcheck](crates/tools/archcheck/README.md)
 explains each rule and its baseline.

@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
 # Print `true` when a pull request changes a path in ci/kind-pull-paths.txt,
-# `false` otherwise. Pull CI uses the answer to decide whether the required
-# space-pull-ci check must also see a passing Kind smoke.
+# `false` otherwise, unless the pull request is a draft that has not opted in:
+# then a changed path prints `deferred`. Pull CI uses the answer to decide
+# whether the required space-pull-ci check must also see a passing Kind smoke;
+# `deferred` runs no Kind and fails the check, so no run that skipped the
+# smoke can stand as a merge-ready head's required check.
 #
 # Usage: ci/scripts/kind-pull-needed.sh <pull-request-head-sha>
+#
+# SPACE_KIND_PULL_DRAFT=true marks a draft; SPACE_KIND_PULL_OPT_IN=true, which
+# Pull CI sets from the kind-smoke label, opts it in. Each is `true`, `false`
+# or unset, which is `false`.
 #
 # Run from GitHub's synthetic merge of the PR (the default pull_request
 # checkout) with its parents fetched. The change set is that merge against its
@@ -15,6 +22,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PATHS_FILE="${SPACE_KIND_PULL_PATHS:-${SCRIPT_DIR}/../kind-pull-paths.txt}"
 
 pull_request_head="${1:-}"
+draft="${SPACE_KIND_PULL_DRAFT:-false}"
+opt_in="${SPACE_KIND_PULL_OPT_IN:-false}"
+for flag in "SPACE_KIND_PULL_DRAFT=${draft}" "SPACE_KIND_PULL_OPT_IN=${opt_in}"; do
+    case "${flag#*=}" in
+        true | false) ;;
+        *) echo "${flag%%=*} must be true or false, not '${flag#*=}'." >&2; exit 1 ;;
+    esac
+done
 if [[ -z "${pull_request_head}" ]]; then
     echo "usage: $0 <pull-request-head-sha>" >&2
     exit 2
@@ -44,6 +59,16 @@ changed="$(git diff --name-only "${base_parent}" HEAD -- "${pathspecs[@]}")"
 if [[ -n "${changed}" ]]; then
     echo "Kind smoke required by:" >&2
     while IFS= read -r path; do printf '  %s\n' "${path}"; done <<<"${changed}" >&2
+    if [[ "${draft}" == true && "${opt_in}" != true ]]; then
+        message="This draft changes a Kind path, so space-pull-ci fails until the Kind smoke runs: when the pull request is marked ready for review, or from the next push after the kind-smoke label is added."
+        if [[ "${GITHUB_ACTIONS:-}" == true ]]; then
+            echo "::notice title=Kind smoke deferred::${message}" >&2
+        else
+            echo "${message}" >&2
+        fi
+        printf 'deferred\n'
+        exit 0
+    fi
     printf 'true\n'
 else
     echo "No Kind smoke path changed." >&2

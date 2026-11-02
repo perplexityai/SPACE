@@ -42,7 +42,7 @@ assert_needed() {
     shift
     local head actual
     head="$(synthetic_merge "$@")"
-    actual="$(cd "${fixture}" && bash "${selector}" "${head}" 2>"${tmp_dir}/stderr")"
+    actual="$(cd "${fixture}" && env -u GITHUB_ACTIONS bash "${selector}" "${head}" 2>"${tmp_dir}/stderr")"
     if [[ "${actual}" != "${expected}" ]]; then
         echo "$*: expected ${expected}, got ${actual}" >&2
         cat "${tmp_dir}/stderr" >&2
@@ -68,6 +68,18 @@ assert_needed false scripts/tests/smoke-kind-x/nested.sh
 # so these also prove base-side changes are not counted as the PR's.
 assert_needed false docs/unrelated.md
 assert_needed false crates/libs/template/mgr/src/service.rs
+
+# A draft defers the smoke unless it opted in, which Pull CI's gate fails; a
+# PR that needs no Kind stays `false` either way.
+SPACE_KIND_PULL_DRAFT=true assert_needed deferred space_smoke/adapters.py
+grep -qF "marked ready for review" "${tmp_dir}/stderr" || {
+    echo "a deferred draft must say why" >&2
+    exit 1
+}
+SPACE_KIND_PULL_DRAFT=true SPACE_KIND_PULL_OPT_IN=true assert_needed true space_smoke/adapters.py
+SPACE_KIND_PULL_DRAFT=false assert_needed true space_smoke/adapters.py
+SPACE_KIND_PULL_DRAFT=true SPACE_KIND_PULL_OPT_IN=true assert_needed false docs/unrelated.md
+SPACE_KIND_PULL_DRAFT=true assert_needed false docs/unrelated.md
 
 # Run a command in the fixture; it must fail with $1 on stderr, so an unrelated
 # crash cannot pass for a refusal.
@@ -103,5 +115,12 @@ printf '# nothing\n\n' >"${tmp_dir}/empty-paths.txt"
 head="$(synthetic_merge space_smoke/adapters.py)"
 assert_refused "lists no paths" "an empty path list" \
     env SPACE_KIND_PULL_PATHS="${tmp_dir}/empty-paths.txt" bash "${selector}" "${head}"
+
+# A flag that is neither true nor false fails rather than guessing.
+head="$(synthetic_merge space_smoke/adapters.py)"
+assert_refused "SPACE_KIND_PULL_DRAFT must be true or false" "a malformed draft flag" \
+    env SPACE_KIND_PULL_DRAFT=yes bash "${selector}" "${head}"
+assert_refused "SPACE_KIND_PULL_OPT_IN must be true or false" "a malformed opt-in flag" \
+    env SPACE_KIND_PULL_OPT_IN=1 bash "${selector}" "${head}"
 
 echo "kind-pull-needed: ok"
