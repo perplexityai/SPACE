@@ -5,8 +5,9 @@
 //! does so three times: against its sandbox's share, its org's share, and the
 //! pod's whole budget. All permits live until the handler returns, so each
 //! budget tracks bytes the pod may still be holding, not bytes already read.
-//! Spool files are unlinked in the background as the handler returns, so disk
-//! frees shortly after the permit does. An upload that can't get every permit
+//! A request's unnamed spool file is closed in the background once the handler
+//! and its last write attempt let go of it, so disk frees shortly after the
+//! permit does. An upload that can't get every permit
 //! within the admission wait is rejected with 429 and a jittered `Retry-After`.
 //!
 //! HTTP/2 uploads never wait, for admission or for the byte-rate bucket. Flow
