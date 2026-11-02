@@ -114,3 +114,102 @@ fn an_episode_reports_the_retried_facets_it_dropped() {
         );
     }
 }
+
+/// Where a pass that fails facets with ClusterApi unavailable leaves the
+/// pending retry. One that fails every facet still failing replaces it with
+/// the next step, whenever it was due. One that fails only some of them can
+/// bring it earlier but never puts it off.
+#[test]
+fn only_a_pass_that_fails_every_failing_facet_puts_the_retry_off() {
+    use FacetKind::{NodeStatus, SandboxInventory, TemplateInventory};
+    const ALL: &[FacetKind] = &[SandboxInventory, TemplateInventory, NodeStatus];
+    // The facets failing before the pass, when their retry is pending in
+    // seconds (`None`: none pending), the facets the pass fails, and when the
+    // retry is due after it: one failed pass before, so the step is 2 s.
+    type Case = (
+        &'static str,
+        &'static [FacetKind],
+        Option<f64>,
+        &'static [FacetKind],
+        (f64, f64),
+    );
+    let cases: [Case; 7] = [
+        (
+            "partial, a sooner retry pending",
+            ALL,
+            Some(0.1),
+            &[NodeStatus],
+            (0.1, 0.1),
+        ),
+        (
+            "partial, a later retry pending",
+            ALL,
+            Some(100.0),
+            &[NodeStatus],
+            (1.0, 2.0),
+        ),
+        (
+            "partial, no retry pending",
+            ALL,
+            None,
+            &[NodeStatus],
+            (1.0, 2.0),
+        ),
+        (
+            "every facet, a sooner retry pending",
+            ALL,
+            Some(0.1),
+            ALL,
+            (1.0, 2.0),
+        ),
+        (
+            "every facet, a later retry pending",
+            ALL,
+            Some(100.0),
+            ALL,
+            (1.0, 2.0),
+        ),
+        (
+            "every facet and a new one",
+            &[SandboxInventory],
+            Some(0.1),
+            &[SandboxInventory, NodeStatus],
+            (1.0, 2.0),
+        ),
+        (
+            "only a new facet",
+            &[SandboxInventory],
+            Some(0.1),
+            &[NodeStatus],
+            (0.1, 0.1),
+        ),
+    ];
+    for (name, failing, pending, fails, (low, high)) in cases {
+        let now = Instant::now();
+        let mut retry = OutboundRetry {
+            failing: failing.iter().copied().collect(),
+            failed_passes: 1,
+            due: pending.map(|secs| now + Duration::from_secs_f64(secs)),
+            ..OutboundRetry::default()
+        };
+        let mut outcome = OutboundOutcome::default();
+        for facet in fails {
+            outcome.failed(*facet, &unavailable());
+        }
+        assert_eq!(retry.record(OutboundPass::Scheduled, outcome, now), None);
+        let due = retry
+            .due
+            .map(|due| (due - now).as_secs_f64())
+            .expect("a retry is pending");
+        assert!(
+            (low - 1e-6..=high + 1e-6).contains(&due),
+            "{name}: the retry is due in {due:.3} s, outside [{low}, {high}] s"
+        );
+        let expected = failing
+            .iter()
+            .chain(fails)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(retry.failing, expected, "{name}: the facets to retry");
+    }
+}

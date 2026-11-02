@@ -23,13 +23,19 @@
 //!
 //! The worker runs one item at a time and a retry is just another pass on
 //! it, so a retry never overlaps another publish. There is only ever one
-//! pending retry. Any pass that publishes a failing facet in full replaces
-//! it: a tick that fires during backoff is that backoff's attempt, and a
-//! dirty sync of a whole facet (node-manager marks node status dirty when
-//! its slot pool changes) feeds the schedule the same way. Each publication
-//! is rebuilt from the node's current state and applies as an upsert or a
-//! full-snapshot replace on the cluster, so repeating one cannot double-apply
-//! anything.
+//! pending retry. A pass that fails every facet left to retry that way
+//! replaces it with the next step: a tick that fires during backoff is that
+//! backoff's attempt. A pass that fails only some of them keeps the sooner
+//! of the pending retry and its own next step, so it can bring the retry
+//! earlier but never puts it off. That is the common partial pass:
+//! node-manager marks node status dirty whenever its slot pool changes, and
+//! the dirty sync publishes node status alone, so during an outage a pool
+//! that changes every few seconds would otherwise keep the inventory retry
+//! from ever coming due. A pass that publishes one failing facet while
+//! another still fails, and fails nothing that way, leaves the pending retry
+//! where it was. Each publication is rebuilt from the node's current state
+//! and applies as an upsert or a full-snapshot replace on the cluster, so
+//! repeating one cannot double-apply anything.
 //!
 //! Item-scoped dirty refs, and the facets only dirty refs publish (network
 //! policy), are not retried here: they keep their persisted per-ref backoff
@@ -38,8 +44,8 @@
 //!
 //! Attempt budget: the backoff step doubles from [`FIRST_RETRY_STEP`] to
 //! [`MAX_RETRY_STEP`], and each delay, counted from the end of the pass
-//! before it, whatever started that pass, is drawn uniformly from the upper
-//! half of its step. With instant failures the shortest delays put retry
+//! that scheduled it, whatever started that pass, is drawn uniformly from
+//! the upper half of its step. With instant failures the shortest delays put retry
 //! passes at 0.5, 1.5, 3.5, 7.5, 15.5, 23.5 s and every 8 s after, so retries
 //! add up to 10 retry passes in a node's first minute of failure and at most
 //! 8 a minute once the step reaches its 16 s cap (7.5-15 s in when failures
@@ -48,14 +54,23 @@
 //! three, so during an outage in which publishes cannot reach internal-api,
 //! a fleet of N nodes adds at most 30N calls in the first minute and 24N a
 //! minute after it. An internal-api that answers, even with an error, adds
-//! none. Ticks and dirty-driven publishes run on top of
-//! that; a failing dirty sync reschedules the retry from its own end, which
-//! can bring it earlier but keeps every retry at least half a step after the
-//! pass before it.
+//! none. Ticks and dirty-driven publishes run on top of that, as they did
+//! before retries: node-manager drives the dirty passes. A pass that fails
+//! only some of the facets left to retry never moves the retry later, and
+//! the earliest it can bring it is half a step after its own end; it counts
+//! toward the backoff like any failed pass, which only makes the step grow
+//! sooner. So every retry still runs at least half of the step that the
+//! last pass to fail every facet left to retry scheduled after that pass's
+//! end. A retry pass is such a pass, which keeps the retry-pass budget
+//! above.
 //!
-//! Recovery: the scheduled delay is capped at 16 s after a pass ends, so
-//! while a facet is being retried, its next attempt is due within 16 s of
-//! the last pass that failed it without reaching internal-api. Worker
+//! Recovery: every pass that fails a facet without reaching internal-api
+//! leaves the retry due within the 16 s cap of its end, so while a facet is
+//! being retried, its next attempt is due within 16 s of the last pass that
+//! failed it that way. A pass that publishes one failing facet while
+//! another still fails leaves the retry due when it was, within the cap of
+//! the last pass that failed the other, so the cap still bounds recovery.
+//! Worker
 //! occupancy (queued work runs first), collection and RPC latency can
 //! extend recovery past that. Across a fleet the republishes are a denser
 //! burst than its ticks, which the nodes' start times spread across the
@@ -239,12 +254,15 @@ impl OutboundRetry {
             .collect()
     }
 
-    /// Update the schedule from a finished pass. A pass that failed a facet
-    /// with ClusterApi unavailable replaces any pending retry with the next
-    /// backoff step. A pass that touched no failing facet leaves the pending
-    /// retry as it was. A pass that leaves nothing to retry ends the episode
-    /// and returns the node to the tick cadence; the end says which retried
-    /// facets, if any, were dropped for failing in a way a retry cannot fix.
+    /// Update the schedule from a finished pass. A pass that failed every
+    /// facet left to retry with ClusterApi unavailable replaces any pending
+    /// retry with the next backoff step. One that failed only some of them
+    /// keeps the sooner of the pending retry and that step, so it can bring
+    /// the retry earlier but never puts it off. A pass that failed no facet
+    /// that way leaves the pending retry as it was. A pass that leaves
+    /// nothing to retry ends the episode and returns the node to the tick
+    /// cadence; the end says which retried facets, if any, were dropped for
+    /// failing in a way a retry cannot fix.
     pub(crate) fn record(
         &mut self,
         pass: OutboundPass,
@@ -264,10 +282,15 @@ impl OutboundRetry {
             for facet in &outcome.retry {
                 self.abandoned.remove(facet);
             }
+            let every_failing_facet = self.failing.is_subset(&outcome.retry);
             self.failing.extend(outcome.retry);
             self.failed_passes = self.failed_passes.saturating_add(1);
-            let delay = jittered(retry_step(self.failed_passes));
-            self.due = Some(now + delay);
+            let next = now + jittered(retry_step(self.failed_passes));
+            let due = match self.due {
+                Some(due) if !every_failing_facet => due.min(next),
+                _ => next,
+            };
+            self.due = Some(due);
             let facets = self
                 .failing
                 .iter()
@@ -276,7 +299,9 @@ impl OutboundRetry {
             tracing::info!(
                 pass = pass.as_str(),
                 failed_passes = self.failed_passes,
-                retry_in_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                retry_in_ms =
+                    u64::try_from(due.saturating_duration_since(now).as_millis())
+                        .unwrap_or(u64::MAX),
                 facets = ?facets,
                 "outbound publish failed; retry scheduled"
             );

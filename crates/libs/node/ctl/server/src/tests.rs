@@ -693,15 +693,21 @@ impl OrphanInventoryObserver for NoOrphanInventory {
 
 /// A worker publishing to `cluster`, on a paused clock from here on, with
 /// its own poll loop when `ticking`. Returns the shutdown token, the work
-/// queue and the node-object reconcile passes. Those run at the start of
-/// every scheduled pass that publishes template inventory and of no retry,
-/// so in these tests, which mark nothing dirty, they mark the ticks.
+/// queue, the node-ctl database and the node-object reconcile passes. Those
+/// run at the start of every scheduled pass that publishes template
+/// inventory and of no retry, so in tests that mark no template inventory
+/// dirty, they mark the ticks.
 async fn run_against(
     dir: &Path,
     cluster: &Arc<ScriptedCluster>,
     ticking: bool,
-) -> (CancellationToken, mpsc::Sender<WorkItem>, NodeObjectPasses) {
-    let (worker, tx, _db, passes) =
+) -> (
+    CancellationToken,
+    mpsc::Sender<WorkItem>,
+    Arc<Mutex<Connection>>,
+    NodeObjectPasses,
+) {
+    let (worker, tx, db, passes) =
         worker_publishing_to(dir, cluster.clone(), Box::new(NoOrphanInventory)).await;
     tokio::time::pause();
     cluster
@@ -717,7 +723,7 @@ async fn run_against(
             shutdown.child_token(),
         );
     }
-    (shutdown, tx, passes)
+    (shutdown, tx, db, passes)
 }
 
 /// When each tick's pass started, in seconds after the worker did.
@@ -751,7 +757,7 @@ async fn a_failed_publish_is_retried_within_the_first_backoff_step() {
     let cluster = ScriptedCluster::new(Duration::ZERO, |_, earlier, _| {
         earlier.is_empty().then(unavailable)
     });
-    let (shutdown, _tx, passes) = run_against(dir.path(), &cluster, true).await;
+    let (shutdown, _tx, _db, passes) = run_against(dir.path(), &cluster, true).await;
     advance_to(&cluster, 70.0).await;
     shutdown.cancel();
 
@@ -779,7 +785,7 @@ async fn a_failed_publish_is_retried_within_the_first_backoff_step() {
 async fn a_rejected_publish_waits_for_the_next_tick() {
     let dir = tempfile::tempdir().expect("tempdir");
     let cluster = ScriptedCluster::new(Duration::ZERO, |_, _, _| Some(rejected()));
-    let (shutdown, _tx, _passes) = run_against(dir.path(), &cluster, true).await;
+    let (shutdown, _tx, _db, _passes) = run_against(dir.path(), &cluster, true).await;
     advance_to(&cluster, 130.0).await;
     shutdown.cancel();
 
@@ -801,7 +807,7 @@ async fn only_the_failed_facet_is_retried() {
     let cluster = ScriptedCluster::new(Duration::ZERO, |facet, _, at| {
         (facet == facets::FacetKind::SandboxInventory && at < 20.0).then(unavailable)
     });
-    let (shutdown, _tx, _passes) = run_against(dir.path(), &cluster, true).await;
+    let (shutdown, _tx, _db, _passes) = run_against(dir.path(), &cluster, true).await;
     advance_to(&cluster, 70.0).await;
     shutdown.cancel();
 
@@ -850,7 +856,7 @@ async fn a_long_outage_backs_off_to_the_cap_with_one_attempt_in_flight() {
     for latency in [Duration::ZERO, Duration::from_secs(2)] {
         let dir = tempfile::tempdir().expect("tempdir");
         let cluster = ScriptedCluster::new(latency, |_, _, _| Some(unavailable()));
-        let (shutdown, _tx, passes) = run_against(dir.path(), &cluster, true).await;
+        let (shutdown, _tx, _db, passes) = run_against(dir.path(), &cluster, true).await;
         advance_to(&cluster, 300.0).await;
         shutdown.cancel();
 
@@ -928,7 +934,7 @@ async fn success_returns_the_publisher_to_the_tick_cadence() {
         (at < 20.0 || (at >= 120.0 && earlier.iter().all(|started| *started < 120.0)))
             .then(unavailable)
     });
-    let (shutdown, _tx, _passes) = run_against(dir.path(), &cluster, true).await;
+    let (shutdown, _tx, _db, _passes) = run_against(dir.path(), &cluster, true).await;
     advance_to(&cluster, 200.0).await;
     shutdown.cancel();
 
@@ -963,7 +969,7 @@ async fn success_returns_the_publisher_to_the_tick_cadence() {
 async fn a_tick_during_backoff_replaces_the_pending_retry() {
     let dir = tempfile::tempdir().expect("tempdir");
     let cluster = ScriptedCluster::new(Duration::ZERO, |_, _, _| Some(unavailable()));
-    let (shutdown, tx, _passes) = run_against(dir.path(), &cluster, false).await;
+    let (shutdown, tx, _db, _passes) = run_against(dir.path(), &cluster, false).await;
     let tick = || WorkItem::TimerTick {
         next_due_at: now_secs() + DEFAULT_POLL_INTERVAL_SECS.cast_signed(),
     };
@@ -993,5 +999,55 @@ async fn a_tick_during_backoff_replaces_the_pending_retry() {
     assert!(
         due_within(attempts[2].started - attempts[1].finished, 1.0, 2.0),
         "the retry after the tick did not wait a step from it: {attempts:?}"
+    );
+}
+
+/// Node-manager marks node status dirty whenever its slot pool changes, and
+/// during an outage each of those dirty syncs fails node status alone. Those
+/// passes do not put off the pending retry of the facets they leave out:
+/// with node status marked dirty every 2 s through an outage, sandbox
+/// inventory still gets a retry within the 16 s cap of the tick that failed
+/// it, and one at most a cap after each other until the outage ends.
+#[tokio::test]
+async fn dirty_node_status_syncs_do_not_put_off_the_inventory_retry() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cluster = ScriptedCluster::new(Duration::ZERO, |_, _, _| Some(unavailable()));
+    let (shutdown, tx, db, _passes) = run_against(dir.path(), &cluster, true).await;
+    let node_status = [dirty_state::FacetRef::new(
+        facets::FacetKind::NodeStatus.name(),
+        None::<String>,
+    )];
+    let outage_end = 130.0;
+    let mut at = 1.0;
+    while at < outage_end {
+        advance_to(&cluster, at).await;
+        dirty_state::mark_refs(&mut db.lock().expect("lock node-ctl db"), &node_status)
+            .expect("mark node status dirty");
+        tx.send(WorkItem::SyncDirty)
+            .await
+            .expect("queue a dirty sync");
+        at += 2.0;
+    }
+    advance_to(&cluster, outage_end).await;
+    shutdown.cancel();
+
+    let dirty_syncs = cluster.starts_of(facets::FacetKind::NodeStatus).len();
+    assert!(
+        dirty_syncs > 60,
+        "node status published {dirty_syncs} times, not on every dirty sync"
+    );
+    let starts = cluster.starts_of(facets::FacetKind::SandboxInventory);
+    // A retry that falls due during a dirty sync runs after it.
+    let cap = 16.0 + 2.0 * PUBLISH_LEAD;
+    for pair in starts.windows(2) {
+        assert!(
+            pair[1] - pair[0] <= cap,
+            "sandbox inventory went {:.3} s without a publish: {starts:?}",
+            pair[1] - pair[0]
+        );
+    }
+    assert!(
+        starts.last().is_some_and(|last| *last >= outage_end - cap),
+        "sandbox inventory stopped retrying before the outage ended: {starts:?}"
     );
 }
