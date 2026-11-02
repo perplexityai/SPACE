@@ -45,6 +45,7 @@ import {
   SnapshotInfo,
   Template,
 } from '@/lib/types';
+import { formatBytes } from '@/lib/sandbox-debug';
 import { tablePagination } from '@/lib/table-pagination';
 import {
   markViewRefreshed,
@@ -133,14 +134,6 @@ const STATUS_FILTER_OPTIONS = [
   'suspending', 'suspended', 'restoring',
   'deleting', 'deleted', 'failed',
 ];
-
-function formatBytes(n: number | null | undefined) {
-  if (n === null || n === undefined) return '—';
-  if (n >= 1e9) return `${(n / 1e9).toFixed(1)} GB`;
-  if (n >= 1e6) return `${(n / 1e6).toFixed(1)} MB`;
-  if (n >= 1e3) return `${(n / 1e3).toFixed(1)} KB`;
-  return `${n} B`;
-}
 
 function formatRelativeTime(value: string | null | undefined, nowMs: number) {
   if (!value) return '—';
