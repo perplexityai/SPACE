@@ -26,9 +26,9 @@ from upstream as before.
             this job had to repair or complete the copy for its inputs. Writes
             the `<kind>-save` step output; only main acts on it. Never fails.
   trim      before main saves a copy: deletes the Cargo, Go or npm packages the
-            current lockfile no longer lists, so the copy does not grow with
-            every lockfile change. uv's copies are pruned by uv itself (see
-            common-ci.yml).
+            current lockfile no longer lists (for npm, that none of the given
+            lockfiles lists), so the copy does not grow with every lockfile
+            change. uv's copies are pruned by uv itself (see common-ci.yml).
   prune     on main: deletes superseded copies. In each ecosystem, across uv
             releases, it keeps the newest copy for the inputs main's newest
             commit has, whichever run saved last, and the newest OTHERS_KEPT
@@ -76,7 +76,9 @@ KEY_PREFIX = "space-packages-v1-"
 FAMILIES = {
     "cargo": ("Cargo.lock",),
     "go": ("shim/go.mod", "shim/go.sum"),
-    "npm": ("docs/api/package-lock.json",),
+    # The SPACE Guide job installs both: the docs' Mermaid bundle and the
+    # console loop's checks.
+    "npm": ("docs/api/package-lock.json", "scripts/console-loop/package-lock.json"),
     "uv-python": ("uv.lock", "pyproject.toml", "ci/scripts/run-python-tests.sh"),
     "uv-shell": (
         "uv.lock",
@@ -385,12 +387,12 @@ def npm_urls(lockfile: Path) -> set[str]:
     }
 
 
-def trim_npm(root: Path, lockfile: Path) -> list[str]:
-    """Drop the index entries for URLs the lockfile no longer resolves.
+def trim_npm(root: Path, *lockfiles: Path) -> list[str]:
+    """Drop the index entries for URLs none of the lockfiles resolves.
 
     npm's `npm cache verify` then deletes the content no entry refers to.
     """
-    keep = npm_urls(lockfile)
+    keep = set().union(*(npm_urls(lockfile) for lockfile in lockfiles))
     prefix = "make-fetch-happen:request-cache:"
     dropped = []
     for bucket in files_under(root / "_cacache" / "index-v5"):
@@ -513,13 +515,13 @@ def report(args: argparse.Namespace) -> int:
 
 
 def run_trim(args: argparse.Namespace) -> int:
-    root, lockfile = Path(args.dir), Path(args.lockfile)
+    root, lockfiles = Path(args.dir), [Path(lockfile) for lockfile in args.lockfiles]
     before = size_of(cached_paths(args.kind, root))
     trim = {"cargo": trim_cargo, "go": trim_go, "npm": trim_npm}[args.kind]
-    removed = trim(root, lockfile)
+    removed = trim(root, *lockfiles)
     after = size_of(cached_paths(args.kind, root))
     print(
-        f"Deleted {len(removed)} {args.kind} entries {lockfile} no longer lists; "
+        f"Deleted {len(removed)} {args.kind} entries no longer listed in {', '.join(map(str, lockfiles))}; "
         f"the cache shrank from {human(before)} to {human(after)}."
     )
     return 0
@@ -693,10 +695,12 @@ def main(argv: list[str]) -> int:
     trim = commands.add_parser("trim")
     trim.add_argument("kind", choices=("cargo", "go", "npm"))
     trim.add_argument("dir")
-    trim.add_argument("lockfile")
+    trim.add_argument("lockfiles", nargs="+", metavar="lockfile", help="one for cargo and go; any number for npm")
     trim.set_defaults(run=run_trim)
 
     args = parser.parse_args(argv)
+    if getattr(args, "command", None) == "trim" and args.kind != "npm" and len(args.lockfiles) != 1:
+        parser.error(f"trim {args.kind} takes one lockfile")
     if hasattr(args, "dir") and not args.dir.rstrip("/"):
         parser.error("the cache directory must not be empty or /")
     return args.run(args)

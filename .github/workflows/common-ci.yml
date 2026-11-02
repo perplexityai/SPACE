@@ -117,12 +117,12 @@ jobs:
           python3 docs/book/test.py
 
       # The console loop drives a local Kind stack, which CI does not run;
-      # its type check and unit tests need none. Its own npm cache keeps the
-      # saved one to docs/api's lockfile.
+      # its type check and unit tests need none. Its lockfile is one of the
+      # npm cache's inputs, so this installs from the restored cache.
       - name: Check the console loop
         working-directory: scripts/console-loop
         run: |
-          npm ci --ignore-scripts --no-fund --no-audit --cache "${RUNNER_TEMP}/console-loop-npm"
+          npm ci --ignore-scripts --no-fund --no-audit
           npm run typecheck
           npm test
 
@@ -145,7 +145,9 @@ jobs:
           steps.report-npm-cache.outputs.npm-save == 'true'
         env:
           PACKAGE_CACHE: ${{ runner.temp }}/space-ci-helpers/package-cache.py
-        run: python3 -I "${PACKAGE_CACHE}" trim npm "${HOME}/.npm" docs/api/package-lock.json
+        run: >-
+          python3 -I "${PACKAGE_CACHE}" trim npm "${HOME}/.npm"
+          docs/api/package-lock.json scripts/console-loop/package-lock.json
 
       - name: Save the npm cache
         if: steps.prepare-npm-upload.outcome == 'success'

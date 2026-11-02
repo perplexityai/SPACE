@@ -302,6 +302,25 @@ class TrimTest(CacheTest):
         self.assertEqual((npm / "_cacache/index-v5/aa/mixed").read_text(), entry(kept) + "\n")
         self.assertFalse((npm / "_cacache/index-v5/bb/old").exists())
 
+    def test_npm_keeps_the_index_entries_any_of_its_lockfiles_resolves(self) -> None:
+        npm = self.tmp / "npm"
+        docs, tool, dropped = (f"https://registry.example/{name}.tgz" for name in ("docs", "tool", "old"))
+
+        def lock(name: str, url: str) -> Path:
+            return write(self.tmp / name / "package-lock.json", json.dumps({"packages": {"node_modules/x": {"resolved": url}}}))
+
+        def entry(url: str) -> str:
+            return "hash\t" + json.dumps({"key": f"make-fetch-happen:request-cache:{url}"})
+
+        write(npm / "_cacache/index-v5/aa/mixed", f"{entry(docs)}\n{entry(tool)}\n{entry(dropped)}\n")
+        with mock.patch.object(cache.subprocess, "run"):
+            run("trim", "npm", str(npm), str(lock("docs", docs)), str(lock("tool", tool)))
+        self.assertEqual((npm / "_cacache/index-v5/aa/mixed").read_text(), f"{entry(docs)}\n{entry(tool)}\n")
+
+    def test_cargo_and_go_take_one_lockfile(self) -> None:
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            run("trim", "cargo", str(self.tmp / "registry"), "Cargo.lock", "Other.lock")
+
 
 class KeyTest(CacheTest):
     def test_names_a_family_from_its_inputs_and_uv_release(self) -> None:
