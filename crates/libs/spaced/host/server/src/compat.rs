@@ -8,55 +8,8 @@ use super::*;
 use crate::bridge::BridgeGuestOperationBudget;
 use crate::protocol::{HostFileInfoStream, bridge_file_type_to_host, relay_stream};
 use pplx_space_common_core::types::{GuestPath, GuestUserName};
-use pplx_space_common_grpc::{GuestCapability, guest_capability_unsupported_status};
 
 impl SpacedHostService {
-    // SPACED_COMPAT_REMOVE_WHEN_MIN_GUEST_0_1_2: remove this gate, its three
-    // Process call sites, and the legacy-guest rejection test once the fleet
-    // floor excludes older guests, including launchable templates and restores.
-    pub(super) async fn require_interactive_process_control_support(
-        &self,
-        operation: &'static str,
-    ) -> Result<(), Status> {
-        let snapshot = match self.guest_ready_status() {
-            Some(snapshot) => snapshot,
-            None => self
-                .refresh_guest_ready_status(Duration::from_millis(1))
-                .await?
-                .ok_or_else(|| {
-                    guest_capability_unsupported_status(
-                        GuestCapability::InteractiveProcessControl,
-                        format!(
-                            "guest version is not known because the guest is not ready; call WaitReady before {operation}"
-                        ),
-                    )
-                })?,
-        };
-        let supported =
-            pplx_space_spaced_common::spaced_guest_supports_interactive_process_control(
-                &snapshot.version,
-            )
-            .map_err(|error| {
-                guest_capability_unsupported_status(
-                    GuestCapability::InteractiveProcessControl,
-                    format!(
-                        "guest reported invalid spaced version '{}': {error}",
-                        snapshot.version
-                    ),
-                )
-            })?;
-        if supported {
-            return Ok(());
-        }
-        Err(guest_capability_unsupported_status(
-            GuestCapability::InteractiveProcessControl,
-            format!(
-                "guest spaced-svc version {} does not support {operation}; rebuild or restore the sandbox with spaced guest version 0.1.2 or newer",
-                snapshot.version
-            ),
-        ))
-    }
-
     pub(super) async fn call_bridge_guest_stat(
         &self,
         mut request: StatRequest,
@@ -73,6 +26,7 @@ impl SpacedHostService {
             .map_err(invalid_argument_status)?;
         self.call_bridge_guest_filesystem(
             "bridge_guest_stat",
+            Requirement::Operations(&[GuestOperation::Files]),
             BridgeGuestOperationBudget::FilesystemMetadata,
             move |mut client| {
                 let request = request.clone();
@@ -107,6 +61,7 @@ impl SpacedHostService {
             .map_err(invalid_argument_status)?;
         self.call_bridge_guest_filesystem(
             "bridge_guest_list",
+            Requirement::Operations(&[GuestOperation::Files]),
             BridgeGuestOperationBudget::FilesystemMetadata,
             move |mut client| {
                 let request = request.clone();
@@ -133,6 +88,7 @@ pub(super) fn legacy_bridge_stat_to_host(
 ) -> Result<StatResponse, Status> {
     Ok(StatResponse {
         info: Some(FileInfo {
+            windows_metadata: None,
             path,
             name: None,
             file_type: bridge_file_type_to_host(response.file_type)?,
@@ -152,6 +108,7 @@ pub(super) fn legacy_bridge_dir_entry_to_host(
     entry: pplx_space_spaced_common::proto::bridge_guest::LegacyDirEntry,
 ) -> Result<FileInfo, Status> {
     Ok(FileInfo {
+        windows_metadata: None,
         name: Some(entry.name),
         path: entry.path,
         file_type: bridge_file_type_to_host(entry.file_type)?,

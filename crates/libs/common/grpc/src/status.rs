@@ -104,12 +104,14 @@ pub fn is_terminal_guest_process_error(status: &Status) -> bool {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GuestCapability {
+    PlatformOperations,
     InteractiveProcessControl,
 }
 
 impl GuestCapability {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::PlatformOperations => "platform_operations",
             Self::InteractiveProcessControl => "interactive_process_control",
         }
     }
@@ -126,6 +128,7 @@ impl std::str::FromStr for GuestCapability {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         Ok(match value {
+            "platform_operations" => Self::PlatformOperations,
             "interactive_process_control" => Self::InteractiveProcessControl,
             _ => {
                 return Err(GuestCapabilityParseError {

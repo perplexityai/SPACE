@@ -225,7 +225,11 @@ impl Filesystem for SpacedHostService {
             }
         };
         let client_generation = lease.generation();
-        let mut client = lease.into_client();
+        let client = lease.into_client();
+        client
+            .authorize(Requirement::Operations(&[GuestOperation::Files]))
+            .await?;
+        let mut client = client.client;
 
         let body_started_at = Instant::now();
         let input =
@@ -312,7 +316,11 @@ impl Filesystem for SpacedHostService {
             }
         };
         let client_generation = lease.generation();
-        let mut client = lease.into_client();
+        let client = lease.into_client();
+        client
+            .authorize(Requirement::Operations(&[GuestOperation::Files]))
+            .await?;
+        let mut client = client.client;
         let body_started_at = Instant::now();
         let response = client.write_batch(request).await;
         record_bridge_rpc_unbounded_outcome(
@@ -351,6 +359,7 @@ impl Filesystem for SpacedHostService {
         let guest_stream = self
             .call_bridge_guest_filesystem(
                 "bridge_guest_watch",
+                Requirement::Operations(&[GuestOperation::Files, GuestOperation::FileWatch]),
                 BridgeGuestOperationBudget::FilesystemTransfer,
                 move |mut client| {
                     let request = request.clone();
@@ -369,6 +378,7 @@ impl Filesystem for SpacedHostService {
         let response = self
             .call_bridge_guest_filesystem_once(
                 "bridge_guest_create_watcher",
+                Requirement::Operations(&[GuestOperation::Files, GuestOperation::FileWatch]),
                 BridgeGuestOperationBudget::FilesystemMutation,
                 move |mut client| {
                     let request = request.clone();
@@ -390,6 +400,7 @@ impl Filesystem for SpacedHostService {
         let response = self
             .call_bridge_guest_filesystem(
                 "bridge_guest_normalize_watch_root",
+                Requirement::Operations(&[GuestOperation::Files, GuestOperation::FileWatch]),
                 BridgeGuestOperationBudget::FilesystemMetadata,
                 move |mut client| {
                     let request = request.clone();
@@ -410,6 +421,7 @@ impl Filesystem for SpacedHostService {
         let response = self
             .call_bridge_guest_filesystem_once(
                 "bridge_guest_get_watcher_events",
+                Requirement::Operations(&[GuestOperation::Files, GuestOperation::FileWatch]),
                 BridgeGuestOperationBudget::FilesystemMetadata,
                 move |mut client| {
                     let request = request.clone();
@@ -444,6 +456,7 @@ impl Filesystem for SpacedHostService {
         let request = request.into_inner();
         self.call_bridge_guest_filesystem_once(
             "bridge_guest_remove_watcher",
+            Requirement::Operations(&[GuestOperation::Files, GuestOperation::FileWatch]),
             BridgeGuestOperationBudget::FilesystemMutation,
             move |mut client| {
                 let request = request.clone();
@@ -468,6 +481,7 @@ impl Filesystem for SpacedHostService {
         let response = self
             .call_bridge_guest_filesystem_once(
                 "bridge_guest_enable_file_changes",
+                Requirement::Operations(&[GuestOperation::Files, GuestOperation::FileWatch]),
                 BridgeGuestOperationBudget::FilesystemMutation,
                 move |mut client| {
                     let request = request.clone();
@@ -492,6 +506,7 @@ impl Filesystem for SpacedHostService {
             .map_err(invalid_argument_status)?;
         self.call_bridge_guest_filesystem_once(
             "bridge_guest_disable_file_changes",
+            Requirement::Operations(&[GuestOperation::Files, GuestOperation::FileWatch]),
             BridgeGuestOperationBudget::FilesystemMutation,
             move |mut client| {
                 let user = user.as_ref().map(|user| user.as_str().to_string());
@@ -520,6 +535,7 @@ impl Filesystem for SpacedHostService {
         let response = self
             .call_bridge_guest_filesystem(
                 "bridge_guest_get_modified_files",
+                Requirement::Operations(&[GuestOperation::Files, GuestOperation::FileWatch]),
                 BridgeGuestOperationBudget::FilesystemMetadata,
                 move |mut client| {
                     let request = request.clone();

@@ -1,0 +1,28 @@
+syntax = "proto3";
+package space.spaced.platform.v1;
+
+// Claims are intersected with trusted image policy and host implementation.
+// Empty/unknown operations grant nothing. Additive extensions preserve this
+// contract; incompatible semantics require a separately negotiated capability.
+message GuestPlatformDescriptor {
+  GuestOs os = 1;
+  repeated GuestOperation operations = 2;
+}
+enum GuestOs {
+  GUEST_OS_UNSPECIFIED = 0;
+  GUEST_OS_LINUX = 1;
+  GUEST_OS_WINDOWS = 2;
+}
+// Sub-features not implemented by an advertised operation return the typed
+// capability refusal, never Unimplemented (reserved for absent legacy RPCs).
+enum GuestOperation {
+  GUEST_OPERATION_UNSPECIFIED = 0;
+  GUEST_OPERATION_PROCESS = 1;
+  GUEST_OPERATION_PROCESS_ENVIRONMENT = 2;
+  GUEST_OPERATION_INTERACTIVE_PROCESS_CONTROL = 3;
+  GUEST_OPERATION_FILES = 4;
+  GUEST_OPERATION_FILE_WATCH = 5;
+  GUEST_OPERATION_FLUSH = 6;
+  GUEST_OPERATION_RESUME = 7;
+  GUEST_OPERATION_LOOPBACK_FORWARD = 8;
+}

@@ -7398,8 +7398,9 @@ name = "pplx-space-spaced-guest-protocol"
 version = "0.8.0"
 dependencies = [
  "anyhow",
- "pplx-space-common-core",
  "pplx-space-common-proto-build",
+ "pplx-space-guest-process",
+ "pplx-space-pii",
  "pplx-space-spaced-build",
  "prost",
  "prost-types",

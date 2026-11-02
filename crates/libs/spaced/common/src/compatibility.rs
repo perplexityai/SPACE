@@ -78,3 +78,9 @@ pub(super) fn compatibility_family(version: &semver::Version) -> String {
 
 #[cfg(test)]
 mod tests;
+
+/// Releases through 0.8.0 shipped before mandatory platform descriptors.
+/// Keep their Linux compatibility while requiring explicit claims in later releases.
+pub fn spaced_guest_requires_platform_descriptor(version: &str) -> Result<bool, semver::Error> {
+    Ok(semver::Version::parse(version)? > semver::Version::new(0, 8, 0))
+}

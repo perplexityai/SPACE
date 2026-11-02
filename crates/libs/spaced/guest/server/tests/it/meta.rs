@@ -34,6 +34,7 @@ async fn bridge_guest_wait_ready_returns_guest_readiness() {
 
     let response = client
         .wait_ready(BridgeGuestWaitReadyRequest {
+            host_contract_revision: 0,
             timeout: Some(duration_from_millis(100)),
         })
         .await

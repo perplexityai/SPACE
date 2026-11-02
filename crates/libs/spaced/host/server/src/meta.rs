@@ -83,6 +83,7 @@ impl Meta for SpacedHostService {
         let env = parse_env(request.env);
         self.call_bridge_guest_once(
             "bridge_guest_configure_process_env",
+            Requirement::Operations(&[GuestOperation::ProcessEnvironment]),
             BridgeGuestOperationBudget::RuntimeMetadata,
             |mut client| {
                 let env = proto_env(&env);
@@ -106,6 +107,7 @@ impl Meta for SpacedHostService {
         let response = self
             .call_bridge_guest_once(
                 "bridge_guest_notify_resume",
+                Requirement::Operations(&[GuestOperation::Resume]),
                 BridgeGuestOperationBudget::RuntimeMetadata,
                 |mut client| async move {
                     client
@@ -153,6 +155,7 @@ impl Meta for SpacedHostService {
             .unwrap_or(Duration::ZERO);
         self.call_bridge_guest_once(
             "bridge_guest_flush_filesystems",
+            Requirement::Operations(&[GuestOperation::Flush]),
             BridgeGuestOperationBudget::FilesystemFlush(timeout),
             |mut client| async move {
                 let mut request = Request::new(BridgeGuestFlushFilesystemsRequest {});
@@ -181,6 +184,7 @@ impl Meta for SpacedHostService {
         let flush_result = self
             .call_bridge_guest_once(
                 "bridge_guest_flush_filesystems",
+                Requirement::Operations(&[GuestOperation::Flush]),
                 BridgeGuestOperationBudget::FilesystemFlush(timeout),
                 |mut client| async move {
                     let mut request = Request::new(BridgeGuestFlushFilesystemsRequest {});

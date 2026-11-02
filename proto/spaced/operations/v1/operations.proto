@@ -38,6 +38,9 @@ message FileInfo {
   // Absent when the guest cannot report it, which is not the same as any
   // count -- a caller must handle that case rather than infer one.
   optional uint64 link_count = 10;
+  // Authoritative for negotiated platform-aware callers. Legacy POSIX scalars
+  // are not meaningful for a Windows file and must not be displayed as uid 0.
+  WindowsFileMetadata windows_metadata = 11;
 }
 
 message ListRequest {
@@ -206,6 +209,9 @@ message GetModifiedFilesResponse {
 }
 
 message StartRequest {
+  // Executable and arguments, never an implicit shell command. Windows direct
+  // executables use conventional MSVC argv quoting; batch/shell forms require
+  // separately supported semantics and must not be silently reinterpreted.
   repeated string command = 1;
   optional string cwd = 2;
   map<string, string> env = 3;
@@ -283,6 +289,7 @@ message ProcessInfo {
 }
 message SendSignalRequest {
   string process_id = 1;
+  // Linux signal numbering. Non-Linux POSIX guests translate or refuse.
   int32 signal = 2;
 }
 message SendSignalResponse {}
@@ -332,8 +339,11 @@ message ProcessExit {
     ProcessUnknown unknown = 4;
   }
 }
+// Windows native exit codes preserve their 32-bit pattern by bit-casting to i32.
 message ProcessExited { int32 exit_code = 1; }
+// Linux signal numbering. Non-Linux POSIX guests translate to this numbering.
 message ProcessSignaled { optional int32 signal = 1; }
+// Linux signal numbering; absent when timeout termination has no POSIX signal.
 message ProcessTimedOut { optional int32 signal = 1; }
 message ProcessUnknown {}
 
@@ -368,4 +378,14 @@ enum ClockSyncStatus {
   CLOCK_SYNC_STATUS_UNSPECIFIED = 0;
   CLOCK_SYNC_STATUS_SYNCED = 1;
   CLOCK_SYNC_STATUS_FAILED = 2;
+}
+
+// Windows-only metadata. Legacy mode/uid/gid scalars are not Windows ownership.
+// Presence selects Windows metadata; consumers must not interpret the legacy
+// mode/uid/gid scalars as POSIX ownership when this field is present.
+message WindowsFileMetadata {
+  optional string owner_sid = 1;
+  // Raw Windows FILE_ATTRIBUTE_* bits. Reparse-point interpretation is not
+  // qualified by this field; a future reparse tag contract is separate.
+  uint32 attributes = 2;
 }

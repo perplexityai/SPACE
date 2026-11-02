@@ -4,6 +4,7 @@ package space.spaced.bridge.guest.v1;
 import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
 import "spaced/operations/v1/operations.proto";
+import "spaced/platform/v1/platform.proto";
 // SPACED_COMPAT_REMOVE_WHEN_MIN_GUEST_0_1_4: also requires MIN_HOST 0.1.4.
 import public "spaced/bridge/guest/v1/legacy.proto";
 
@@ -83,7 +84,12 @@ message GuestDiagnosticCallsite {
   uint64 count = 5;
 }
 
-message WaitReadyRequest { google.protobuf.Duration timeout = 1; }
+message WaitReadyRequest {
+  google.protobuf.Duration timeout = 1;
+  // Non-Linux guests require at least their minimum supported host revision.
+  // Higher revisions preserve the baseline; zero is the legacy Linux handshake.
+  uint32 host_contract_revision = 2;
+}
 message WaitReadyResponse {
   bool ready = 1;
   google.protobuf.Duration guest_uptime = 2;
@@ -91,6 +97,9 @@ message WaitReadyResponse {
   string compatibility_family = 4;
   optional uint64 mem_total_bytes = 5;
   optional uint32 vcpu_count = 6;
+  // Required after guest release 0.8.0. Only historical Linux releases may
+  // omit this; absence never establishes a non-Linux guest's capabilities.
+  space.spaced.platform.v1.GuestPlatformDescriptor platform = 7;
 }
 
 message ConfigureProcessEnvRequest {

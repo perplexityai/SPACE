@@ -85,6 +85,9 @@ use tonic::{Request, Response, Status};
 mod authorization;
 mod bridge;
 mod compat;
+mod guest_connection;
+use guest_connection::OperationClient;
+use pplx_space_spaced_common::proto::platform::GuestOperation;
 mod filesystem;
 mod meta;
 mod networking;
@@ -184,6 +187,12 @@ impl std::fmt::Debug for SpacedHostService {
 }
 
 #[derive(Clone, Debug)]
+enum GuestPlatformObservation {
+    LegacyLinux { version: String },
+    Explicit(pplx_space_spaced_common::platform::GuestPlatform),
+}
+
+#[derive(Clone, Debug)]
 struct GuestReadySnapshot {
     guest_uptime: Option<prost_types::Duration>,
     version: String,
@@ -223,12 +232,14 @@ struct SpacedHostServiceInner {
     bridge_host_expected_peer: Option<pplx_space_spaced_common::ExpectedUdsPeer>,
     bridge_guest_connector: BridgeGuestConnector,
     host_control_socket_path: PathBuf,
-    bridge_guest_meta_client: LazyClient<BridgeGuestClient<tonic::transport::Channel>>,
+    bridge_guest_meta_client:
+        LazyClient<OperationClient<BridgeGuestClient<tonic::transport::Channel>>>,
     bridge_guest_filesystem_client:
-        LazyClient<BridgeGuestFilesystemClient<tonic::transport::Channel>>,
-    bridge_guest_process_client: LazyClient<BridgeGuestProcessClient<tonic::transport::Channel>>,
+        LazyClient<OperationClient<BridgeGuestFilesystemClient<tonic::transport::Channel>>>,
+    bridge_guest_process_client:
+        LazyClient<OperationClient<BridgeGuestProcessClient<tonic::transport::Channel>>>,
     bridge_guest_networking_client:
-        LazyClient<BridgeGuestNetworkingClient<tonic::transport::Channel>>,
+        LazyClient<OperationClient<BridgeGuestNetworkingClient<tonic::transport::Channel>>>,
     host_control_client: LazyClient<HostControlClient<tonic::transport::Channel>>,
     bridge_retry_policy: RetryPolicy,
     /// Payload budgets of the process and filesystem services, shared by
@@ -250,3 +261,5 @@ fn payload_admission(slots: usize) -> pplx_space_common_grpc::QueuedSlots {
             pplx_space_spaced_common::admission_queue::MAX_WAIT,
         )
 }
+
+use guest_connection::Requirement;

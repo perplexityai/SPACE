@@ -104,6 +104,7 @@ impl SpacedGuestService {
     fn current_wait_ready_response(&self) -> BridgeGuestWaitReadyResponse {
         let ready = *self.inner.ready.borrow();
         BridgeGuestWaitReadyResponse {
+            platform: Some(pplx_space_spaced_common::platform::GuestPlatform::for_target().wire()),
             ready,
             guest_uptime: ready.then(|| (self.inner.guest_uptime_source)()).flatten(),
             version: pplx_space_spaced_common::spaced_version().to_string(),
@@ -240,7 +241,12 @@ impl BridgeGuestMeta for SpacedGuestService {
         &self,
         request: Request<BridgeGuestWaitReadyRequest>,
     ) -> Result<Response<BridgeGuestWaitReadyResponse>, Status> {
-        let timeout = validate_timeout(request.into_inner().timeout)?;
+        let request = request.into_inner();
+        pplx_space_spaced_common::platform::require_host_contract(
+            pplx_space_spaced_common::platform::target_os(),
+            request.host_contract_revision,
+        )?;
+        let timeout = validate_timeout(request.timeout)?;
         let ready = self.wait_until_ready(timeout.as_duration()).await;
         let response = self.current_wait_ready_response();
         if ready {

@@ -341,6 +341,7 @@ macro_rules! define_bridge_call {
         pub(super) async fn $fn<T, F, Fut>(
             &self,
             command: &'static str,
+            required: Requirement,
             budget: BridgeGuestOperationBudget,
             call: F,
         ) -> Result<T, Status>
@@ -363,7 +364,8 @@ macro_rules! define_bridge_call {
                         let lease = self.$get_lease().await?;
                         failed_generation.set(lease.generation());
                         let client = lease.into_client();
-                        let response = call(client).await.map(Response::into_inner);
+                        client.authorize(required).await?;
+                        let response = call(client.client).await.map(Response::into_inner);
                         if response.is_ok() {
                             failed_generation.clear();
                             self.inner.$pool.set_connected();
@@ -381,6 +383,7 @@ macro_rules! define_bridge_call {
                     let failed_generation = failed_generation.clone();
                     async move {
                         failed_generation.invalidate(&self.inner.$pool).await;
+                        self.clear_guest_ready();
                     }
                 },
             )
@@ -393,6 +396,7 @@ macro_rules! define_bridge_call {
                 })
             {
                 failed_generation.invalidate(&self.inner.$pool).await;
+                self.clear_guest_ready();
             }
             record_bridge_rpc_outcome(
                 $label,
@@ -520,15 +524,11 @@ impl SpacedHostService {
         &self,
         response: BridgeGuestWaitReadyResponse,
     ) -> Result<Option<GuestReadySnapshot>, Status> {
+        GuestPlatformObservation::parse(&response)?;
+        let guest_uptime = validate_optional_duration("guest_uptime", response.guest_uptime)?;
         if !response.ready {
             return Ok(None);
         }
-        pplx_space_spaced_common::validate_spaced_guest_compatibility(
-            Some(&response.version),
-            Some(&response.compatibility_family),
-        )
-        .map_err(|error| Status::failed_precondition(error.to_string()))?;
-        let guest_uptime = validate_optional_duration("guest_uptime", response.guest_uptime)?;
         Ok(Some(GuestReadySnapshot {
             guest_uptime: guest_uptime.map(duration_to_proto).transpose()?,
             version: response.version,
@@ -538,7 +538,7 @@ impl SpacedHostService {
         }))
     }
 
-    async fn wait_bridge_guest_ready_once(
+    pub(super) async fn wait_bridge_guest_ready_once(
         &self,
         timeout: std::time::Duration,
     ) -> Result<Option<GuestReadySnapshot>, Status> {
@@ -559,6 +559,8 @@ impl SpacedHostService {
             async {
                 let response = match client
                     .wait_ready(BridgeGuestWaitReadyRequest {
+                        host_contract_revision:
+                            pplx_space_spaced_common::platform::HOST_CONTRACT_REVISION,
                         timeout: Some(duration_to_proto(timeout)?),
                     })
                     .await
@@ -745,10 +747,6 @@ impl SpacedHostService {
         }
     }
 
-    pub(super) fn guest_ready_status(&self) -> Option<GuestReadySnapshot> {
-        self.inner.guest_readiness.snapshot.borrow().clone()
-    }
-
     pub fn new(shutdown: CancellationToken) -> Self {
         Self::new_with_config(shutdown, SpacedHostServiceConfig::default())
     }
@@ -904,10 +902,15 @@ impl SpacedHostService {
         &self,
     ) -> Result<WithPinnedConnection<tonic::transport::Channel>, ConnectBridgeGuestError> {
         match &self.inner.bridge_guest_connector {
-            BridgeGuestConnector::Uds(path) => Ok((
-                pplx_space_spaced_common::connect_uds_channel("spaced bridge guest", path).await?,
-                None,
-            )),
+            BridgeGuestConnector::Uds(path) => {
+                let (channel, connection) =
+                    pplx_space_spaced_common::uds::connect_uds_channel_pinned(
+                        "spaced bridge guest",
+                        path,
+                    )
+                    .await?;
+                Ok((channel, Some(connection)))
+            }
             BridgeGuestConnector::FirecrackerVsock {
                 vsock_uds_path,
                 port,
@@ -938,31 +941,44 @@ impl SpacedHostService {
     pub(super) async fn connect_bridge_guest_filesystem(
         &self,
     ) -> Result<
-        WithPinnedConnection<BridgeGuestFilesystemClient<tonic::transport::Channel>>,
+        WithPinnedConnection<
+            OperationClient<BridgeGuestFilesystemClient<tonic::transport::Channel>>,
+        >,
         ConnectBridgeGuestError,
     > {
         let (channel, connection) = self.connect_bridge_guest_channel().await?;
-        Ok((BridgeGuestFilesystemClient::new(channel), connection))
+        Ok((
+            OperationClient::new(BridgeGuestFilesystemClient::new(channel.clone()), channel),
+            connection,
+        ))
     }
 
     pub(super) async fn connect_bridge_guest_process(
         &self,
     ) -> Result<
-        WithPinnedConnection<BridgeGuestProcessClient<tonic::transport::Channel>>,
+        WithPinnedConnection<OperationClient<BridgeGuestProcessClient<tonic::transport::Channel>>>,
         ConnectBridgeGuestError,
     > {
         let (channel, connection) = self.connect_bridge_guest_channel().await?;
-        Ok((BridgeGuestProcessClient::new(channel), connection))
+        Ok((
+            OperationClient::new(BridgeGuestProcessClient::new(channel.clone()), channel),
+            connection,
+        ))
     }
 
     pub(super) async fn connect_bridge_guest_networking(
         &self,
     ) -> Result<
-        WithPinnedConnection<BridgeGuestNetworkingClient<tonic::transport::Channel>>,
+        WithPinnedConnection<
+            OperationClient<BridgeGuestNetworkingClient<tonic::transport::Channel>>,
+        >,
         ConnectBridgeGuestError,
     > {
         let (channel, connection) = self.connect_bridge_guest_channel().await?;
-        Ok((BridgeGuestNetworkingClient::new(channel), connection))
+        Ok((
+            OperationClient::new(BridgeGuestNetworkingClient::new(channel.clone()), channel),
+            connection,
+        ))
     }
 
     pub(super) async fn connect_host_control(
@@ -987,6 +1003,7 @@ impl SpacedHostService {
         let response = self
             .call_bridge_guest_once(
                 "bridge_guest_notify_resume",
+                Requirement::Operations(&[GuestOperation::Resume]),
                 BridgeGuestOperationBudget::RuntimeMetadata,
                 |mut client| async move {
                     client
@@ -1017,6 +1034,7 @@ impl SpacedHostService {
     pub(super) async fn call_bridge_guest_ping(&self) -> Result<(), Status> {
         self.call_bridge_guest(
             "bridge_guest_ping",
+            Requirement::Probe,
             BridgeGuestOperationBudget::RuntimeMetadata,
             |client| async move {
                 client
@@ -1109,6 +1127,7 @@ impl SpacedHostService {
             .map_err(invalid_argument_status)?;
         self.call_bridge_guest_filesystem(
             "bridge_guest_read",
+            Requirement::Operations(&[GuestOperation::Files]),
             BridgeGuestOperationBudget::FilesystemTransfer,
             move |mut client| {
                 let path = path.expose().to_string();
@@ -1132,7 +1151,7 @@ impl SpacedHostService {
         &self,
     ) -> Result<
         pplx_space_spaced_common::LazyClientLease<
-            BridgeGuestFilesystemClient<tonic::transport::Channel>,
+            OperationClient<BridgeGuestFilesystemClient<tonic::transport::Channel>>,
         >,
         Status,
     > {
@@ -1160,6 +1179,7 @@ impl SpacedHostService {
             .map_err(invalid_argument_status)?;
         self.call_bridge_guest_filesystem_once(
             "bridge_guest_mkdir",
+            Requirement::Operations(&[GuestOperation::Files]),
             BridgeGuestOperationBudget::FilesystemMutation,
             move |mut client| {
                 let path = path.expose().to_string();
@@ -1194,6 +1214,7 @@ impl SpacedHostService {
             .map_err(invalid_argument_status)?;
         self.call_bridge_guest_filesystem_once(
             "bridge_guest_remove",
+            Requirement::Operations(&[GuestOperation::Files]),
             BridgeGuestOperationBudget::FilesystemMutation,
             move |mut client| {
                 let path = path.expose().to_string();
@@ -1232,6 +1253,7 @@ impl SpacedHostService {
             .map_err(invalid_argument_status)?;
         self.call_bridge_guest_filesystem(
             "bridge_guest_rename",
+            Requirement::Operations(&[GuestOperation::Files]),
             BridgeGuestOperationBudget::FilesystemMutation,
             move |mut client| {
                 let old_path = old_path.expose().to_string();
@@ -1318,15 +1340,22 @@ impl SpacedHostService {
     pub(super) async fn bridge_guest_client(
         &self,
     ) -> Result<
-        pplx_space_spaced_common::LazyClientLease<BridgeGuestClient<tonic::transport::Channel>>,
+        pplx_space_spaced_common::LazyClientLease<
+            OperationClient<BridgeGuestClient<tonic::transport::Channel>>,
+        >,
         Status,
     > {
         self.inner
             .bridge_guest_meta_client
             .get_or_connect_pinned_with_generation(|| async {
-                self.connect_bridge_guest()
+                let (channel, connection) = self
+                    .connect_bridge_guest_channel()
                     .await
-                    .map_err(|error| Status::unavailable(error.to_string()))
+                    .map_err(|error| Status::unavailable(error.to_string()))?;
+                Ok((
+                    OperationClient::new(BridgeGuestClient::new(channel.clone()), channel),
+                    connection,
+                ))
             })
             .await
     }
@@ -1335,7 +1364,7 @@ impl SpacedHostService {
         &self,
     ) -> Result<
         pplx_space_spaced_common::LazyClientLease<
-            BridgeGuestProcessClient<tonic::transport::Channel>,
+            OperationClient<BridgeGuestProcessClient<tonic::transport::Channel>>,
         >,
         Status,
     > {
@@ -1353,7 +1382,7 @@ impl SpacedHostService {
         &self,
     ) -> Result<
         pplx_space_spaced_common::LazyClientLease<
-            BridgeGuestNetworkingClient<tonic::transport::Channel>,
+            OperationClient<BridgeGuestNetworkingClient<tonic::transport::Channel>>,
         >,
         Status,
     > {
