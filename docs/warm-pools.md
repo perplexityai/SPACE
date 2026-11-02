@@ -168,6 +168,37 @@ This keeps at least 5 ready sandboxes for each of the two newest releases,
 and up to 30 when demand is higher. A new release's pool fills a short time
 after the release is published.
 
+## Delete a template that has pools
+
+`DELETE /admin/api/v1/templates/{template}` answers 409, naming what is in the
+way, while an enabled pool config, an enabled rolling policy or a pool slot
+still uses the template. Each kind clears differently:
+
+- Disable its rolling policies (`PUT /admin/api/v1/warm-pool-policies` with
+  `"enabled": false`) and pool configs (`DELETE /admin/api/v1/warm-pools/{id}`
+  or `space-admin-cli warm-pool update ... --disabled`), then wait for their
+  open slots to drain. A slot claimed by a create still in flight counts as
+  open; it settles within minutes, when the create finishes or the stale claim
+  is swept.
+- A slot held by a sandbox created from the pool clears when that sandbox's
+  pod is retired, for example when the sandbox is deleted or suspended. The
+  409 names up to five of those sandboxes.
+
+Then delete the template again. The delete removes the disabled configs and
+policies left behind.
+
+A delete can also be accepted and then fail, when a use appeared after it was
+accepted. The template then stays `deleting`.
+
+- When the operation's own check finds the use, it fails with `conflict`.
+- The warm-pool reconciler still fills a pool config enabled after the delete
+  was accepted, and its pods keep the template on their nodes. The operation
+  then waits for those nodes and fails with `internal` once its retries run
+  out.
+
+Clear the use and delete again with a new `Idempotency-Key`: replaying the
+failed delete's key returns that failed operation and starts nothing.
+
 ## Native API creates
 
 On Kubernetes, native `POST /v1/sandboxes` creates cold-boot unless

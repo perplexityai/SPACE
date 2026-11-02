@@ -278,6 +278,16 @@ space-admin-cli warm-pool create \
 Use `--disabled` to write the config without allowing the reconciler to fill
 it yet, and `--json` to print the raw API response.
 
+A template can't be deleted while one of its pool configs or rolling policies
+is enabled, or while one of its pools still has slots. Disable each config with
+`warm-pool update ... --disabled` and each policy through the Admin API, and
+wait for the open slots to drain; a slot claimed by a create still in flight
+settles within minutes. A slot held by a sandbox created from the pool clears
+only when that sandbox's pod is retired, for example when the sandbox is
+deleted or suspended. Then delete the template again, with a new
+`Idempotency-Key` if an earlier delete failed. The CLI has no template-delete
+command; see [Delete a template that has pools](../../../../docs/warm-pools.md#delete-a-template-that-has-pools).
+
 List configs:
 
 ```bash

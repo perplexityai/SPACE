@@ -627,7 +627,7 @@ fn insert_template_admin_paths(paths: &mut Map<String, Value>) {
                     "202": { "description": "Delete operation enqueued" },
                     "400": { "description": "Invalid idempotency key" },
                     "404": { "description": "Template not found" },
-                    "409": { "description": "Idempotency conflict" }
+                    "409": { "description": "Idempotency conflict, the template is still in use by warm pools, or a concurrent admin write (retry)" }
                 }
             }
         }),

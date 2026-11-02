@@ -3,12 +3,14 @@ use pplx_space_common_core::types::NodeId;
 use pplx_space_common_core::sql;
 use std::time::Duration;
 
+use pplx_space_cluster_pool::{TemplateWarmPoolUsage, WarmPoolStore};
 use pplx_space_common_core::types::{SubstrateKind, TemplateDesiredState, TemplateName};
 use pplx_space_public_api::{
-    OperationState, PublicErrorCode, PublicOperationResult, PublicTemplateOperationResult,
+    OperationState, PublicErrorCode, PublicErrorDetail, PublicOperationResult,
+    PublicTemplateOperationResult,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, Row};
+use sqlx::{PgConnection, PgPool, Row};
 use uuid::Uuid;
 
 use crate::{
@@ -113,6 +115,21 @@ impl DeleteTemplateOperationExecutor {
         };
 
         if desired_state == TemplateDesiredState::Present {
+            // Check before marking. The route commits the operation before
+            // its mark transaction, so this can see a `present` template for
+            // two reasons. If the route's mark failed and a use appeared
+            // before the caller's same-key replay, the replay gets the
+            // route's 409; this operation fails here and leaves the template
+            // `present`, as that 409 says, instead of marking it `deleting`
+            // and dropping its node copies. If the dispatcher claimed this
+            // operation before the route's mark ran and a use committed
+            // after the route's check, this operation fails here with the
+            // conflict, then the route's mark still sets `deleting` and
+            // answers 202; the template stays `deleting` until a new delete
+            // replaces the failed one.
+            if let Some(in_use) = template_in_use(&self.pool, &template).await? {
+                return Ok(in_use_failure(operation, &template, &in_use));
+            }
             mark_template_deleting(&self.pool, &template, operation).await?;
         }
 
@@ -130,7 +147,11 @@ impl DeleteTemplateOperationExecutor {
             });
         }
 
-        mark_template_deleted(&self.pool, &template, operation.id.as_uuid()).await?;
+        if let MarkTemplateDeleted::InUse(in_use) =
+            mark_template_deleted(&self.pool, &template, operation.id.as_uuid()).await?
+        {
+            return Ok(in_use_failure(operation, &template, &in_use));
+        }
         Ok(PublicOperationExecutionResult {
             state: OperationState::Succeeded,
             progress_message: "template deleted".to_string(),
@@ -149,6 +170,199 @@ impl DeleteTemplateOperationExecutor {
             requeue_reason: PublicOperationRequeueReason::TransientFailure,
         })
     }
+}
+
+/// Fail a delete for a template that is still in use. Terminal, not a
+/// retry: only an operator, or the end of the sandboxes holding its slots,
+/// clears the use. A template already `deleting` stays so, and a later
+/// delete request replaces this failed operation.
+fn in_use_failure(
+    operation: &ClaimedPublicOperation,
+    template: &TemplateName,
+    in_use: &TemplateInUse,
+) -> PublicOperationExecutionResult {
+    let mut error_json = serde_json::Map::new();
+    error_json.insert("operation_id".to_string(), operation.id.to_string().into());
+    error_json.insert("template".to_string(), template.to_string().into());
+    for detail in in_use.details() {
+        error_json.insert(detail.key, detail.value.into());
+    }
+    terminal_failure(
+        operation,
+        PublicErrorCode::Conflict,
+        in_use.message(),
+        serde_json::Value::Object(error_json),
+    )
+}
+
+/// What still uses a template and so blocks deleting it: warm-pool state on
+/// its releases or name (see [`TemplateWarmPoolUsage`]). The admin delete
+/// route refuses with this before it accepts a delete, and the delete
+/// operation checks it again before it marks a `present` template
+/// `deleting`, and inside the transaction that deletes the releases. There
+/// the release keys and the config lock catch a config or slot that commits
+/// after the check; nothing catches a policy enabled after it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemplateInUse {
+    pub pools: TemplateWarmPoolUsage,
+}
+
+impl TemplateInUse {
+    /// `None` when nothing uses the template.
+    pub async fn check(
+        conn: &mut PgConnection,
+        template: &TemplateName,
+    ) -> Result<Option<Self>, sqlx::Error> {
+        let pools = WarmPoolStore::template_usage(conn, template).await?;
+        Ok((!pools.is_empty()).then_some(Self { pools }))
+    }
+
+    /// The operator-facing refusal: names each use by id or count and says
+    /// how each kind clears.
+    pub fn message(&self) -> String {
+        let pools = &self.pools;
+        let mut uses = Vec::new();
+        if !pools.enabled_configs.is_empty() {
+            let configs = pools
+                .enabled_configs
+                .iter()
+                .map(|config| format!("{} ({})", config.id, config.managed_by))
+                .collect::<Vec<_>>()
+                .join(", ");
+            uses.push(format!("enabled warm-pool configs {configs}"));
+        }
+        if !pools.enabled_policies.is_empty() {
+            uses.push(format!(
+                "enabled warm-pool policies {}",
+                policy_shapes(pools)
+            ));
+        }
+        if pools.open_slots > 0 {
+            uses.push(count_noun(pools.open_slots, "open warm-pool slot"));
+        }
+        if pools.sandbox_held_slots > 0 {
+            let held = if pools.sandbox_held_slots == 1 {
+                "1 warm-pool slot held by a sandbox created from the pool".to_string()
+            } else {
+                format!(
+                    "{} warm-pool slots held by sandboxes created from the pool",
+                    pools.sandbox_held_slots
+                )
+            };
+            let ids = sandbox_ids(pools);
+            let named = if usize::try_from(pools.sandbox_held_slots)
+                .is_ok_and(|held| held > pools.sandbox_ids.len())
+            {
+                format!("including {ids}")
+            } else {
+                ids
+            };
+            uses.push(format!("{held} ({named})"));
+        }
+        let mut message = format!("template is still in use by {}.", uses.join("; "));
+        if !pools.enabled_configs.is_empty()
+            || !pools.enabled_policies.is_empty()
+            || pools.open_slots > 0
+        {
+            message.push_str(
+                " Disable its warm-pool configs and policies and wait for their open slots \
+                 to drain; a slot claimed by a create still in flight settles within \
+                 minutes, when the create finishes or the stale claim is swept.",
+            );
+        }
+        if pools.sandbox_held_slots > 0 {
+            message.push_str(
+                " A slot held by a sandbox clears when that sandbox's pod is retired, for \
+                 example when the sandbox is deleted or suspended.",
+            );
+        }
+        message.push_str(" Then delete the template again.");
+        message
+    }
+
+    /// The refusal as structured details, shared by the route's 409 and the
+    /// operation's terminal error. A use that is absent has no key.
+    pub fn details(&self) -> Vec<PublicErrorDetail> {
+        let pools = &self.pools;
+        let mut details = vec![detail("reason", "template_in_use")];
+        if !pools.enabled_configs.is_empty() {
+            let ids = pools
+                .enabled_configs
+                .iter()
+                .map(|config| config.id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            details.push(detail("enabled_pool_config_ids", ids));
+        }
+        if !pools.enabled_policies.is_empty() {
+            details.push(detail("enabled_pool_policies", policy_shapes(pools)));
+        }
+        if pools.open_slots > 0 {
+            details.push(detail("open_pool_slots", pools.open_slots.to_string()));
+        }
+        if pools.sandbox_held_slots > 0 {
+            details.push(detail(
+                "sandbox_held_pool_slots",
+                pools.sandbox_held_slots.to_string(),
+            ));
+            let ids = pools
+                .sandbox_ids
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            details.push(detail("pool_slot_sandbox_ids", ids));
+        }
+        details
+    }
+}
+
+fn detail(key: &str, value: impl Into<String>) -> PublicErrorDetail {
+    PublicErrorDetail {
+        key: key.to_string(),
+        value: value.into(),
+    }
+}
+
+fn policy_shapes(pools: &TemplateWarmPoolUsage) -> String {
+    pools
+        .enabled_policies
+        .iter()
+        .map(|policy| format!("{} vCPU/{} MiB", policy.vcpu, policy.memory_mib))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn sandbox_ids(pools: &TemplateWarmPoolUsage) -> String {
+    let noun = if pools.sandbox_ids.len() == 1 {
+        "sandbox"
+    } else {
+        "sandboxes"
+    };
+    let ids = pools
+        .sandbox_ids
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{noun} {ids}")
+}
+
+fn count_noun(count: i64, noun: &str) -> String {
+    if count == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{count} {noun}s")
+    }
+}
+
+/// [`TemplateInUse::check`] on a pooled connection.
+pub async fn template_in_use(
+    pool: &PgPool,
+    template: &TemplateName,
+) -> Result<Option<TemplateInUse>, sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    TemplateInUse::check(&mut conn, template).await
 }
 
 async fn fetch_template_desired_state(
@@ -226,12 +440,29 @@ async fn enqueue_template_delete_reconcile(
     Ok(())
 }
 
+enum MarkTemplateDeleted {
+    Deleted,
+    InUse(TemplateInUse),
+}
+
 async fn mark_template_deleted(
     pool: &PgPool,
     template: &TemplateName,
     operation_id: Uuid,
-) -> Result<(), sqlx::Error> {
+) -> Result<MarkTemplateDeleted, sqlx::Error> {
     let mut tx = pool.begin().await?;
+    if let Some(in_use) = TemplateInUse::check(&mut tx, template).await? {
+        return Ok(MarkTemplateDeleted::InUse(in_use));
+    }
+    let retired = WarmPoolStore::delete_disabled_for_template(&mut tx, template).await?;
+    if retired != Default::default() {
+        tracing::info!(
+            template = template.as_str(),
+            pool_configs = retired.configs,
+            pool_policies = retired.policies,
+            "template delete removed disabled warm-pool rows"
+        );
+    }
     let cleanup_refs = [
         ReconcileElementRef::network_policy(NetworkPolicyTarget::template(template.clone())),
         ReconcileElementRef::template_inventory(template.clone()),
@@ -254,12 +485,30 @@ async fn mark_template_deleted(
     .bind(template.as_str())
     .execute(&mut *tx)
     .await?;
-    sqlx::query(sql!(
+    let releases = sqlx::query(sql!(
         "DELETE FROM template_releases WHERE template_name = $1"
     ))
     .bind(template.as_str())
     .execute(&mut *tx)
-    .await?;
+    .await;
+    if let Err(error) = releases {
+        // A reference that committed after the check above. A new slot or
+        // enabled config is reported, rather than retrying a delete that
+        // cannot succeed until it clears. Anything the re-read does not
+        // count, such as a disabled config written after the cleanup's lock,
+        // is deleted by the cleanup on a retry, so the original error goes
+        // back to the dispatcher, which requeues it within its budget.
+        if error
+            .as_database_error()
+            .is_some_and(|db| db.is_foreign_key_violation())
+        {
+            tx.rollback().await?;
+            if let Some(in_use) = template_in_use(pool, template).await? {
+                return Ok(MarkTemplateDeleted::InUse(in_use));
+            }
+        }
+        return Err(error);
+    }
     sqlx::query(sql!(
         "DELETE FROM template_pool_policies WHERE template = $1"
     ))
@@ -291,7 +540,7 @@ async fn mark_template_deleted(
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(())
+    Ok(MarkTemplateDeleted::Deleted)
 }
 
 fn terminal_failure(
@@ -339,4 +588,4 @@ fn internal_failure(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

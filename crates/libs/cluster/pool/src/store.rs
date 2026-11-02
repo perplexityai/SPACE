@@ -6,16 +6,17 @@ use std::{
 
 use pplx_space_common_core::types::{
     DEFAULT_DISK_IO_MAX_BANDWIDTH_MIB_PER_SEC, DEFAULT_DISK_IO_MAX_OPERATIONS_PER_SEC, MemorySize,
-    SandboxId, VcpuCount,
+    SandboxId, TemplateName, VcpuCount,
 };
 use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::{
-    ClaimedPoolSlot, ClaimedSlotBindSource, ManualPoolConfigSpec, NewPoolSlot,
-    OpenPoolSlotDeleteLock, PoolConfigOwner, PoolConfigRead, PoolConfigWithCounts, PoolError,
-    PoolSlot, PoolSlotCounts, PoolSlotState, ProtectedTemplateRelease, ReleasePoolConfigWithCounts,
-    ReservedPoolSlot, Result,
+    ClaimedPoolSlot, ClaimedSlotBindSource, DeletedDisabledWarmPools, ManualPoolConfigSpec,
+    NewPoolSlot, OpenPoolSlotDeleteLock, PoolConfigOwner, PoolConfigRead, PoolConfigWithCounts,
+    PoolError, PoolSlot, PoolSlotCounts, PoolSlotState, ProtectedTemplateRelease,
+    ReleasePoolConfigWithCounts, ReservedPoolSlot, Result, TEMPLATE_USAGE_SANDBOX_ID_LIMIT,
+    TemplateWarmPoolUsage, WarmPoolConfigRef, WarmPoolPolicyShape,
     models::{
         PoolAutoscaleCandidate, PoolObservedDemand, PoolPolicyRelease, memory_to_mib_i32,
         vcpu_to_i32,
@@ -387,6 +388,121 @@ impl WarmPoolStore {
         .await?;
 
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Warm-pool state that still uses `template`: enabled configs and slots
+    /// on any of its releases, and enabled policies for its name. Runs on the
+    /// caller's connection so a template delete can re-check inside the
+    /// transaction that deletes the releases.
+    pub async fn template_usage(
+        conn: &mut PgConnection,
+        template: &TemplateName,
+    ) -> std::result::Result<TemplateWarmPoolUsage, sqlx::Error> {
+        let enabled_configs = sqlx::query_as::<_, WarmPoolConfigRef>(sql!(
+            "SELECT c.id, c.managed_by
+             FROM kubernetes_pool_configs c
+             JOIN template_releases r ON r.id = c.template_release_id
+             WHERE r.template_name = $1
+               AND c.enabled
+             ORDER BY c.created_at, c.id"
+        ))
+        .bind(template.as_str())
+        .fetch_all(&mut *conn)
+        .await?;
+        // Only `bound` slots belong to a sandbox; a `claimed` one has no
+        // sandbox row until its bind commits. Any other state counts as open,
+        // so a state added later is still reported rather than skipped.
+        let (open_slots, sandbox_held_slots, sandbox_ids) =
+            sqlx::query_as::<_, (i64, i64, Vec<SandboxId>)>(sql!(
+                "SELECT COUNT(*) FILTER (WHERE s.state <> $2),
+                        COUNT(*) FILTER (WHERE s.state = $2),
+                        COALESCE(
+                            (ARRAY_AGG(s.reserved_sandbox_id ORDER BY s.claimed_at, s.reserved_sandbox_id)
+                                FILTER (WHERE s.state = $2))[1:$3],
+                            '{}'
+                        )
+                 FROM kubernetes_pool_slots s
+                 JOIN template_releases r ON r.id = s.template_release_id
+                 WHERE r.template_name = $1"
+            ))
+            .bind(template.as_str())
+            .bind(PoolSlotState::Bound.as_str())
+            .bind(i32::try_from(TEMPLATE_USAGE_SANDBOX_ID_LIMIT).unwrap_or(i32::MAX))
+            .fetch_one(&mut *conn)
+            .await?;
+        let enabled_policies = sqlx::query_as::<_, WarmPoolPolicyShape>(sql!(
+            "SELECT vcpu, memory_mib
+             FROM warm_pool_policies
+             WHERE template_name = $1
+               AND enabled
+             ORDER BY vcpu, memory_mib"
+        ))
+        .bind(template.as_str())
+        .fetch_all(&mut *conn)
+        .await?;
+
+        Ok(TemplateWarmPoolUsage {
+            enabled_configs,
+            open_slots,
+            sandbox_held_slots,
+            sandbox_ids,
+            enabled_policies,
+        })
+    }
+
+    /// Delete `template`'s disabled configs that have no slots, manual or
+    /// autoscaler, and its disabled policies, inside the caller's template
+    /// delete transaction. Disabled empty configs would otherwise hold the
+    /// releases through their `ON DELETE RESTRICT` key, and a recreated
+    /// template must not inherit the old name's policies. Enabled rows and
+    /// configs that still have slots are left for [`Self::template_usage`] to
+    /// report. Takes a transaction because the lock below must be held until
+    /// the delete that follows it.
+    pub async fn delete_disabled_for_template(
+        tx: &mut Transaction<'_, Postgres>,
+        template: &TemplateName,
+    ) -> std::result::Result<DeletedDisabledWarmPools, sqlx::Error> {
+        // Lock first and look for slots in a later statement. A slot insert
+        // holds its config's key-share lock until it commits, so this waits
+        // for it, and the delete's fresh snapshot then sees the slot. One
+        // statement would judge "no slots" on its starting snapshot and
+        // cascade-delete a slot that committed while it waited.
+        let disabled = sqlx::query_scalar::<_, Uuid>(sql!(
+            "SELECT c.id
+             FROM kubernetes_pool_configs c
+             JOIN template_releases r ON r.id = c.template_release_id
+             WHERE r.template_name = $1
+               AND NOT c.enabled
+             FOR UPDATE OF c"
+        ))
+        .bind(template.as_str())
+        .fetch_all(&mut **tx)
+        .await?;
+        let configs = sqlx::query(sql!(
+            "DELETE FROM kubernetes_pool_configs c
+             WHERE c.id = ANY($1::UUID[])
+               AND NOT c.enabled
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM kubernetes_pool_slots s
+                   WHERE s.config_id = c.id
+               )"
+        ))
+        .bind(&disabled)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected();
+        let policies = sqlx::query(sql!(
+            "DELETE FROM warm_pool_policies
+             WHERE template_name = $1
+               AND NOT enabled"
+        ))
+        .bind(template.as_str())
+        .execute(&mut **tx)
+        .await?
+        .rows_affected();
+
+        Ok(DeletedDisabledWarmPools { configs, policies })
     }
 
     /// Reconcile policy-owned release pools from retained-release floors and
