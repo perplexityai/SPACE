@@ -79,7 +79,10 @@ to an exact digest by the API before dispatch.
 
 Omit `--publish-tag latest` to publish only the immutable digest release. Tags
 are assigned after successful publication; promotion of the two templates is
-not atomic. If the derived build fails, the already-published seed remains.
+not atomic. Between the two tag moves, or after one fails, `seed`'s `latest`
+can name the new release while `code-runtime`'s still names the old one; that
+pair is consistent, because each `code-runtime` release was built on a pinned
+seed digest. If the derived build fails, the already-published seed remains.
 Existing sandboxes retain their template release. New requests using `latest`
 resolve the promoted release; previously pinned warm pools remain pinned.
 
@@ -424,20 +427,14 @@ On the node after deploy:
 
 ## Spaced Version Rollout
 
-The seed template is stamped with `spaced_version` from the workspace `Cargo.toml` and
-the derived `spaced_compatibility_family`. For SemVer, `1.x.y` is compatible within
-major version `1`, `0.x.y` is compatible within `0.x`, and `0.0.y` is exact-version
-compatible. `space-sbxmgr-svc` refuses to create or restore sandboxes from templates
-whose compatibility family does not match the manager binary, or whose version metadata
-is missing.
+Each seed build's `metadata.json` is stamped with the `spaced_version` of the guest
+binaries it packages, and the `spaced_compatibility_family` derived from it. For
+SemVer, `1.x.y` belongs to family `1`, `0.x.y` to `0.x`, and `0.0.y` to `0.0.y`.
 
-Mixed-incompatible host, guest, manager, and seed-template deployments are unsupported.
-For each node, deploy the new manager and host binaries together with a seed template
-built from the same checkout. Cluster-level rolling replacement is acceptable only when
-each node is internally same-family before it starts creating or restoring sandboxes.
-
-If preflight fails with a compatibility mismatch, rebuild and redeploy the seed template
-from the same compatible source line as the node binaries, then rebuild derived recipe
-templates.
+`space-sbxmgr-svc` admits guests whose version is in `SUPPORTED_SPACED_GUEST_VERSIONS`
+(`crates/libs/spaced/common/src/compatibility.rs`) and whose family agrees with that
+version. The host's and the guest's compatibility families do not have to match. The
+[guest compatibility](../../../docs/versioning.md#guest-compatibility-in-08) section of
+the versioning policy is the full rule.
 
 Native application startup is documented in [native template startup](../../../docs/native-template-runtime.md).

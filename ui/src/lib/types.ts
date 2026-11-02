@@ -633,6 +633,24 @@ export interface WarmPoolPolicyCapabilities {
   };
 }
 
+// A template build job, as `GET /admin/api/v1/templates/{name}/builds/{job_id}`
+// reports it.
+export type TemplateBuildState = 'pending' | 'running' | 'succeeded' | 'failed' | 'publish_failed' | 'unspecified';
+
+export interface TemplateBuildStatus {
+  job_id: string;
+  template_name: string;
+  state: TemplateBuildState;
+  content_hash: string | null;
+  error: string | null;
+}
+
+// The answer to `POST /admin/api/v1/system-templates/{template}/builds`.
+export interface TemplateBuildStart {
+  job_id: string;
+  template_name: string;
+}
+
 export interface TemplateRelease {
   id: string;
   template_name: string;
