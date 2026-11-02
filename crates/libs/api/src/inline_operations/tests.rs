@@ -3,7 +3,10 @@ use super::*;
 fn runner(max_concurrent: usize, route_signing: bool) -> (InlineOperations, DrainSignal) {
     let drain_signal = DrainSignal::new();
     let runner = InlineOperations::new(
-        InlineOperationsConfig { max_concurrent },
+        InlineOperationsConfig {
+            max_concurrent,
+            ..Default::default()
+        },
         TaskTracker::new(),
         drain_signal.clone(),
         OperationExecutionConfig::default(),
@@ -21,6 +24,7 @@ fn inline_permits_read_from_the_environment() {
     let config = |env: &pplx_space_test_env::TestEnv| InlineOperationsConfig::from_environment(env);
     let mut env = pplx_space_test_env::TestEnv::default();
     assert_eq!(config(&env).max_concurrent, DEFAULT_INLINE_MAX_CONCURRENT);
+    assert_eq!(config(&env).org_limit, None);
 
     env.set(INLINE_MAX_CONCURRENT_ENV, "8");
     assert_eq!(config(&env).max_concurrent, 8);
@@ -31,6 +35,13 @@ fn inline_permits_read_from_the_environment() {
     assert_eq!(config(&env).max_concurrent, MAX_INLINE_MAX_CONCURRENT);
     env.set(INLINE_MAX_CONCURRENT_ENV, "lots");
     assert_eq!(config(&env).max_concurrent, DEFAULT_INLINE_MAX_CONCURRENT);
+
+    env.set(INLINE_ORG_LIMIT_ENV, " 3 ");
+    assert_eq!(config(&env).org_limit, NonZeroU32::new(3));
+    for no_limit in ["0", "", "lots", "-1"] {
+        env.set(INLINE_ORG_LIMIT_ENV, no_limit);
+        assert_eq!(config(&env).org_limit, None, "{no_limit:?}");
+    }
 }
 
 #[test]
