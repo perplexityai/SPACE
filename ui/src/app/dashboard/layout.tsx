@@ -17,6 +17,8 @@ import {
   ClusterOutlined,
   KeyOutlined,
   LogoutOutlined,
+  UnorderedListOutlined,
+  AuditOutlined,
   ReloadOutlined,
 } from '@ant-design/icons';
 
@@ -40,6 +42,8 @@ const menuItems: DashboardMenuItem[] = [
   { key: '/dashboard/credential-rules', icon: <KeyOutlined />, label: <Link href="/dashboard/credential-rules">Credential Rules</Link> },
   { key: '/dashboard/templates', icon: <AppstoreOutlined />, label: <Link href="/dashboard/templates">Templates</Link> },
   { key: '/dashboard/nodes', icon: <ClusterOutlined />, label: <Link href="/dashboard/nodes">Nodes</Link> },
+  { key: '/dashboard/operations', icon: <UnorderedListOutlined />, label: <Link href="/dashboard/operations">Operations</Link> },
+  { key: '/dashboard/audit', icon: <AuditOutlined />, label: <Link href="/dashboard/audit">Audit log</Link> },
 ];
 
 export default function DashboardLayout({ children }: { children: React.ReactNode }) {
