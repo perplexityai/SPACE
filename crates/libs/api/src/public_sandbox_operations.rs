@@ -1314,6 +1314,10 @@ impl CreateSandboxExecutionError {
     }
 }
 
+/// `terminal_error.reason` of a create that named a template the caller may
+/// use but that has no published release to start from.
+pub(crate) const TEMPLATE_HAS_NO_RELEASE_REASON: &str = "template_has_no_release";
+
 fn controller_error_result(
     operation: &ClaimedPublicOperation,
     error: ControllerError,
@@ -1340,6 +1344,18 @@ fn controller_error_result(
         } else {
             result
         };
+    }
+
+    if error.is_template_has_no_release() {
+        let mut terminal_error = terminal_error_json(operation, error.to_string());
+        if let Some(fields) = terminal_error.as_object_mut() {
+            fields.insert("reason".into(), TEMPLATE_HAS_NO_RELEASE_REASON.into());
+        }
+        return PublicOperationExecutionResult::failed(
+            "template has no published release",
+            PublicErrorCode::FailedPrecondition,
+            terminal_error,
+        );
     }
 
     match error.status() {

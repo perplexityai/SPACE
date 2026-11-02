@@ -56,6 +56,11 @@ enum ControllerErrorKind {
     /// which blames the sandbox fleet for a Postgres lock race and puts the
     /// wrong `origin` on the response metrics.
     LockContention,
+    /// A create named a template the caller may use that has no release to
+    /// start from, as when its only build failed. The status stays the plain
+    /// 404, so surfaces that answer synchronously are unchanged; the create
+    /// operation reads the kind to fail with a template-specific code.
+    TemplateHasNoRelease,
     /// A DELETE refused because a snapshot upload is still in flight.
     /// Carried so the native delete executor can wait for the upload to
     /// finalize instead of failing the operation.
@@ -323,6 +328,19 @@ impl ControllerError {
         let mut error = Self::conflict("sandbox already exists");
         error.kind = ControllerErrorKind::SandboxAlreadyExists;
         error
+    }
+
+    /// Mark a release-not-found error as the caller's own template having no
+    /// release. Only for a template the caller is authorized to use: an
+    /// absent or cross-org template must stay indistinguishable from one
+    /// another.
+    pub(crate) fn into_template_has_no_release(mut self) -> Self {
+        self.kind = ControllerErrorKind::TemplateHasNoRelease;
+        self
+    }
+
+    pub(crate) const fn is_template_has_no_release(&self) -> bool {
+        matches!(self.kind, ControllerErrorKind::TemplateHasNoRelease)
     }
 
     pub(crate) const fn is_sandbox_already_exists(&self) -> bool {

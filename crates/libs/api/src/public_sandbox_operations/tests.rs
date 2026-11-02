@@ -1084,6 +1084,37 @@ fn create_precondition_is_terminal_with_controller_evidence() {
     );
 }
 
+/// A template without a release fails the create with a template-specific
+/// code and reason; any other not-found keeps the generic dependency answer.
+#[test]
+fn create_from_a_template_with_no_release_fails_with_its_own_reason() {
+    let operation = claimed_create_operation();
+    let message = "no release found for template 'synthetic' runtime 'fc' tag 'latest'";
+    for (error, code, progress, reason) in [
+        (
+            ControllerError::not_found(message).into_template_has_no_release(),
+            PublicErrorCode::FailedPrecondition,
+            "template has no published release",
+            Some(TEMPLATE_HAS_NO_RELEASE_REASON),
+        ),
+        (
+            ControllerError::not_found(message),
+            PublicErrorCode::NotFound,
+            "sandbox create dependency was not found",
+            None,
+        ),
+    ] {
+        let result = controller_error_result(&operation, error);
+
+        assert_eq!(result.state, OperationState::Failed);
+        assert_eq!(result.terminal_error_code, Some(code));
+        assert_eq!(result.progress_message, progress);
+        let terminal = result.terminal_error_json.expect("terminal error");
+        assert_eq!(terminal["message"], message);
+        assert_eq!(terminal.get("reason").and_then(|r| r.as_str()), reason);
+    }
+}
+
 #[test]
 fn completed_lifecycle_target_state_rejects_active_transitions() {
     assert_eq!(

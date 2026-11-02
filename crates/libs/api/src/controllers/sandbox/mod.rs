@@ -253,7 +253,8 @@ async fn resolve_template_release(
     validate_create_template_reference(template)?;
     let template_name = template.name().as_str();
 
-    if gate_template_access(pool, template.name(), caller_org).await? == TemplateAccess::Denied {
+    let access = gate_template_access(pool, template.name(), caller_org).await?;
+    if access == TemplateAccess::Denied {
         return Err(template_release_not_found(template, runtime));
     }
 
@@ -306,7 +307,14 @@ async fn resolve_template_release(
         }
     }
 
-    Err(template_release_not_found(template, runtime))
+    let not_found = template_release_not_found(template, runtime);
+    // Same status and message either way; only the kind says the caller's own
+    // template exists without a release, so nothing distinguishes an absent
+    // template from a denied one.
+    if matches!(access, TemplateAccess::Authorized { .. }) {
+        return Err(not_found.into_template_has_no_release());
+    }
+    Err(not_found)
 }
 
 pub(crate) async fn resolve_template_release_by_tag(

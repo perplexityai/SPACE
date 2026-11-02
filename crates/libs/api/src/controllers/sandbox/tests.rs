@@ -719,6 +719,30 @@ mod template_release_resolution_postgres_tests {
             absent.to_string().replace("tenant-absent", "{name}"),
         );
 
+        // Only a template the caller may use is reported as having no release,
+        // with the same status and message as the other two.
+        insert_org_specific_template(&db.pool, "other-unreleased", Uuid::parse_str(OTHER_ORG)?)
+            .await?;
+        let unreleased_template = "other-unreleased:latest"
+            .parse::<TemplateReference>()
+            .unwrap();
+        let unreleased = resolve_template_release(
+            &db.pool,
+            &unreleased_template,
+            RuntimeKind::Firecracker,
+            org(OTHER_ORG),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(unreleased.status(), axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(
+            unreleased.to_string().replace("other-unreleased", "{name}"),
+            absent.to_string().replace("tenant-absent", "{name}"),
+        );
+        assert!(unreleased.is_template_has_no_release());
+        assert!(!denied.is_template_has_no_release());
+        assert!(!absent.is_template_has_no_release());
+
         // The digest path is gated too, with the digest-shaped message.
         let denied_digest_template = format!("tenant-secret@{content_hash}")
             .parse::<TemplateReference>()
