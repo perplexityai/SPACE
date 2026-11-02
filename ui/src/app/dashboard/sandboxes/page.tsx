@@ -5,6 +5,7 @@ import Link from 'next/link';
 import styles from './inventory.module.css';
 import { lookupScopeText, orgOptionLabels, parseOrgParam, scopedRefreshKey } from '@/lib/org-filter';
 import { usePathname, useSearchParams } from 'next/navigation';
+import { bringUpAction, statusFilterKey, statusFilterOptions } from '@/lib/sandbox-lifecycle';
 import {
   DEFAULT_LIST_LIMIT,
   LIST_LIMIT_OPTIONS,
@@ -69,7 +70,7 @@ import {
   Alert, App, Table, Button, Form, Input, Select, Typography, Space, Tag, Popconfirm, Card, Tooltip, Switch, Checkbox, Modal,
 } from 'antd';
 import {
-  PlusOutlined, StopOutlined, PauseCircleOutlined, ThunderboltOutlined,
+  PlusOutlined, StopOutlined, PauseCircleOutlined, PlayCircleOutlined,
   SaveOutlined, DeleteOutlined, CameraOutlined, RollbackOutlined, ReloadOutlined,
   CopyOutlined, ClockCircleOutlined, GlobalOutlined, LockOutlined,
 } from '@ant-design/icons';
@@ -125,13 +126,6 @@ const AGE_WINDOW_OPTIONS: { value: AgeWindow; label: string; ms: number | null }
   { value: '90d', label: 'Last 90 days',ms: 90 * 24 * 60 * 60 * 1000 },
   { value: '1y',  label: 'Last year',   ms: 365 * 24 * 60 * 60 * 1000 },
   { value: 'all', label: 'All time',    ms: null },
-];
-
-const STATUS_FILTER_OPTIONS = [
-  'created', 'creating', 'starting', 'started', 'running', 'stopping', 'stopped',
-  'pausing', 'paused', 'resuming',
-  'suspending', 'suspended', 'restoring',
-  'deleting', 'deleted', 'failed',
 ];
 
 function formatRelativeTime(value: string | null | undefined, nowMs: number) {
@@ -203,12 +197,10 @@ const STATE_ACTIONS: Record<string, Record<string, boolean>> = {
   creating:  { wake: false, stop: false, pause: false, suspend: false, delete: true },
   created:   { wake: true,  stop: false, pause: false, suspend: false, delete: true },
   started:   { wake: false, stop: true,  pause: true,  suspend: true,  delete: true },
-  running:   { wake: false, stop: true,  pause: true,  suspend: true,  delete: true },
   stopped:   { wake: true,  stop: false, pause: false, suspend: false, delete: true },
   paused:    { wake: true,  stop: false, pause: false, suspend: false, delete: true },
   suspended: { wake: true,  stop: false, pause: false, suspend: false, delete: true },
   deleting:  { wake: false, stop: false, pause: false, suspend: false, delete: false },
-  deleted:   { wake: false, stop: false, pause: false, suspend: false, delete: true },
   failed:    { wake: false, stop: false, pause: false, suspend: false, delete: true },
 };
 const TRANSIENT = { wake: false, stop: false, pause: false, suspend: false, delete: true };
@@ -403,6 +395,7 @@ function SandboxActions({ status, id, resourceType, poolTemplate, onAction }: {
   if (poolSlot) {
     actions.suspend = false;
   }
+  const bringUp = managedSandbox ? bringUpAction(status) : null;
 
   const confirmStop = async () => {
     if (!actions.stop || stopPending.current) return;
@@ -453,7 +446,8 @@ function SandboxActions({ status, id, resourceType, poolTemplate, onAction }: {
 
   return (
     <Space size={0}>
-      {actions.wake ? btn('wake', true, <ThunderboltOutlined />, 'Wake')
+      {actions.wake && bringUp
+        ? btn(bringUp.action, true, bringUp.action === 'restore' ? <RollbackOutlined /> : <PlayCircleOutlined />, bringUp.label)
         : btn('stop', actions.stop, <StopOutlined />, 'Stop', true)}
       {btn('pause', actions.pause, <PauseCircleOutlined />, 'Pause')}
       {btn('suspend', actions.suspend, <SaveOutlined />, 'Suspend')}
@@ -1070,7 +1064,7 @@ function SandboxesPage() {
         return false;
       }
 
-      if (statusFilter.length > 0 && !statusFilter.includes(s.status || '')) {
+      if (statusFilter.length > 0 && !statusFilter.includes(statusFilterKey(s.status))) {
         return false;
       }
 
@@ -1159,6 +1153,11 @@ function SandboxesPage() {
     }
     return Array.from(set).sort().map((name) => ({ value: name, label: name }));
   }, [sandboxes, templates]);
+
+  const statusFilterOptionList = useMemo(
+    () => statusFilterOptions(sandboxes.map((s) => s.status)).map((status) => ({ value: status, label: status })),
+    [sandboxes],
+  );
 
   const clearFilters = () => {
     setIdFilter('');
@@ -1427,7 +1426,7 @@ function SandboxesPage() {
             placeholder="Status"
             value={statusFilter}
             onChange={(value) => setStatusFilter(value as string[])}
-            options={STATUS_FILTER_OPTIONS.map((s) => ({ value: s, label: s }))}
+            options={statusFilterOptionList}
             allowClear
             style={{ minWidth: 180 }}
             maxTagCount="responsive"
