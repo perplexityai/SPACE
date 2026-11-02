@@ -8,13 +8,15 @@ use pplx_space_api::controllers::sandbox::SandboxController;
 use pplx_space_api::controllers::substrate::Substrate;
 use pplx_space_api::egress_profiles::EgressProfiles;
 use pplx_space_api::fork_operation_executor::ForkSandboxOperationExecutor;
+#[cfg(test)]
 use pplx_space_api::public_operation_driver::{
     DEFAULT_CLAIM_STALE_AFTER, DEFAULT_M1_MAX_AGE, DEFAULT_MAX_RETRY_ATTEMPTS, DEFAULT_RETRY_AFTER,
+    M1_MAX_AGE_ENV, RETRY_DEFERRAL_ENABLED_ENV,
+};
+use pplx_space_api::public_operation_driver::{
     OperationExecutionConfig, OperationExecutor, claim_renewal_interval,
     drive_deferrable_operation, execution_span, expire_overdue_queued_operations,
 };
-#[cfg(test)]
-use pplx_space_api::public_operation_driver::{M1_MAX_AGE_ENV, RETRY_DEFERRAL_ENABLED_ENV};
 pub use pplx_space_api::public_operation_driver::{OperationExecutionResult, TickReport};
 use pplx_space_api::public_operations::{
     ClaimLimits, ClaimPublicOperations, ClaimedPublicOperation, OrgSlotLimit, PublicOperationClaim,
@@ -106,15 +108,14 @@ pub struct ReconcilerConfig {
     /// Of the slots open to other work, how many an organization past its
     /// limit leaves free while no other organization has work waiting.
     pub org_slot_headroom: usize,
-    pub claim_stale_after: Duration,
-    pub retry_after: Duration,
-    pub max_retry_attempts: i32,
-    pub m1_max_age: Option<Duration>,
     /// Kill switch for the keyed work queue: off restores the unkeyed claim.
     pub keyed_claim_enabled: bool,
-    /// Kill switch for retry deferral, independent of the keyed claim: off
-    /// keeps every retry wait inside the execution's slot.
-    pub retry_deferral_enabled: bool,
+    /// How each claimed operation is renewed, retried and bounded: the same
+    /// settings, read from the same variables, as inline execution in the
+    /// API. Its `defer_retry_waits` is the retry-deferral kill switch,
+    /// independent of the keyed claim: off keeps every retry wait inside the
+    /// execution's slot.
+    pub execution: OperationExecutionConfig,
 }
 
 impl Default for ReconcilerConfig {
@@ -128,12 +129,8 @@ impl Default for ReconcilerConfig {
             other_reserved_slots: DEFAULT_OTHER_RESERVED_SLOTS as usize,
             org_slot_limit: NonZeroU32::new(DEFAULT_ORG_SLOT_LIMIT),
             org_slot_headroom: DEFAULT_ORG_SLOT_HEADROOM as usize,
-            claim_stale_after: DEFAULT_CLAIM_STALE_AFTER,
-            retry_after: DEFAULT_RETRY_AFTER,
-            max_retry_attempts: DEFAULT_MAX_RETRY_ATTEMPTS,
-            m1_max_age: Some(DEFAULT_M1_MAX_AGE),
             keyed_claim_enabled: true,
-            retry_deferral_enabled: true,
+            execution: OperationExecutionConfig::default(),
         }
     }
 }
@@ -146,9 +143,6 @@ impl ReconcilerConfig {
     pub(crate) fn from_environment(env: &dyn pplx_space_common_core::env::Environment) -> Self {
         let config = env_config::EnvConfig(env);
         let default = Self::default();
-        // Shared with inline execution in the API, which must renew, retry
-        // and bound an operation as this loop does.
-        let execution = OperationExecutionConfig::from_environment(env);
         Self {
             // Deliberately not a fail-closed gate: this loop is what completes
             // queued create operations, so a malformed value keeps the default
@@ -189,24 +183,12 @@ impl ReconcilerConfig {
                 DEFAULT_ORG_SLOT_HEADROOM,
                 MAX_EXECUTION_CONCURRENCY as u32,
             ) as usize,
-            claim_stale_after: execution.claim_stale_after,
-            retry_after: execution.retry_after,
-            max_retry_attempts: execution.max_retry_attempts,
             keyed_claim_enabled: config
                 .truthy_default(KEYED_CLAIM_ENABLED_ENV, default.keyed_claim_enabled),
-            retry_deferral_enabled: execution.defer_retry_waits,
-            m1_max_age: execution.m1_max_age,
+            // Shared with inline execution in the API, which must renew,
+            // retry and bound an operation as this loop does.
+            execution: OperationExecutionConfig::from_environment(env),
         }
-    }
-}
-
-fn execution_config(config: &ReconcilerConfig) -> OperationExecutionConfig {
-    OperationExecutionConfig {
-        claim_stale_after: config.claim_stale_after,
-        retry_after: config.retry_after,
-        max_retry_attempts: config.max_retry_attempts,
-        m1_max_age: config.m1_max_age,
-        defer_retry_waits: config.retry_deferral_enabled,
     }
 }
 
@@ -408,7 +390,7 @@ pub async fn run<E>(
         org_slot_limit = config.org_slot_limit.map_or(0, NonZeroU32::get),
         org_slot_headroom = config.org_slot_headroom,
         keyed_claim_enabled = config.keyed_claim_enabled,
-        retry_deferral_enabled = config.retry_deferral_enabled,
+        retry_deferral_enabled = config.execution.defer_retry_waits,
         "starting public-operation-dispatcher"
     );
 
@@ -423,7 +405,7 @@ pub async fn run<E>(
     // is handed back, beside the loop, instead of running twice. `slots`
     // splits the free slots between teardowns and other work at each claim.
     let mut claim_backoff_until: Option<Instant> = None;
-    let execution_config = execution_config(&config);
+    let execution_config = config.execution;
     let mut in_flight = JoinSet::new();
     let mut busy_keys: HashMap<String, OperationId> = HashMap::new();
     let mut task_keys: HashMap<tokio::task::Id, String> = HashMap::new();
@@ -788,7 +770,7 @@ where
             teardown_while_other_due: limit(slots.free_teardown_while_other_due, total),
             per_org_non_teardown: slots.org_slot_limit,
         },
-        claim_stale_after: config.claim_stale_after,
+        claim_stale_after: config.execution.claim_stale_after,
         claimable_kinds: executor.supported_kinds(),
     };
     if config.keyed_claim_enabled {
@@ -819,7 +801,7 @@ where
         ..TickReport::default()
     };
 
-    let execution_config = execution_config(config);
+    let execution_config = config.execution;
     let mut executions = stream::iter(claim.operations.into_iter().map(|operation| {
         let span = execution_span(&operation);
         execute_claimed_operation(
