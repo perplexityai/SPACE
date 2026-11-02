@@ -6131,7 +6131,7 @@ mod kubernetes_tests {
                    FROM pg_stat_activity
                   WHERE datname = current_database()
                     AND wait_event_type = 'Lock'
-                    AND query LIKE '%kubernetes::store%'
+                    AND query LIKE '%pplx_space_sandbox_store::restore_lease:%'
                     AND query LIKE '%WITH candidate AS (%'",
             )
             .fetch_one(&pool)

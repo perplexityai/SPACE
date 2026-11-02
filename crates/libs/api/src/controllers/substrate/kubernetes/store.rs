@@ -26,10 +26,9 @@ use pplx_space_events::{
 use pplx_space_metrics::sandbox::api::RouteIdentityDecisionReason;
 use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_sandbox_portability::{
-    clear_current_local_artifact_marker_assignments, failed_repair_revert_eligibility,
     fresh_ready_snapshot_exists, missing_suspending_pod_revert_eligibility, no_newer_full_snapshot,
     restore_retry_source_snapshot_is_current, restore_retry_suspended_revert_snapshot_exists,
-    snapshot_is_current_local_artifact, started_suspend_revert_eligibility,
+    snapshot_is_current_local_artifact,
 };
 use sqlx::{PgConnection, PgPool, Postgres, Row, Transaction, postgres::PgRow};
 use uuid::Uuid;
@@ -173,12 +172,6 @@ pub(super) enum PodTrackingCleanupCause {
 pub(super) enum PlacementClock {
     Bump,
     Preserve,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StartedSuspendRecoveryProof {
-    ExecutionRetired,
-    FailedRecovery { generation: ExecutionGeneration },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -695,12 +688,6 @@ impl RestoreClaimRevert {
             Self::NotReverted => RevertOutcome::NotReverted,
         }
     }
-}
-
-#[derive(sqlx::FromRow)]
-struct RestoreClaimRow {
-    lifecycle: String,
-    restore_lease_token: Option<Uuid>,
 }
 
 fn recovery_lease_ttl_secs() -> i64 {

@@ -2,6 +2,7 @@
 //! started-suspend recovery that runs after execution cleanup.
 
 use super::*;
+use pplx_space_sandbox_store::pod_tracking;
 
 impl K8sStore {
     pub(in crate::controllers::substrate::kubernetes) async fn forget_pod_tracking(
@@ -533,29 +534,14 @@ impl K8sStore {
         // retire keeps `placement_changed_at` so the legacy snapshot-freshness
         // gate doesn't strand a markerless row's ready snapshot. See
         // [`PlacementClock`].
-        let query = match placement_clock {
-            PlacementClock::Bump => sqlx::query(sql!(
-                "UPDATE sandboxes
-                 SET placement = 'unplaced',
-                     active_node_id = NULL,
-                     target_node_id = NULL,
-                     placement_changed_at = NOW()
-                 WHERE id = $1"
-            )),
-            PlacementClock::Preserve => sqlx::query(sql!(
-                "UPDATE sandboxes
-                 SET placement = 'unplaced',
-                     active_node_id = NULL,
-                     target_node_id = NULL
-                 WHERE id = $1"
-            )),
-        };
-        query
-            .bind(sandbox_id)
-            .execute(&mut **tx)
-            .await
-            .db_context("failed to mark sandbox unplaced")?;
-        Ok(())
+        match placement_clock {
+            PlacementClock::Bump => pod_tracking::unplace_after_pod_teardown(tx, sandbox_id).await,
+            PlacementClock::Preserve => {
+                pod_tracking::unplace_after_pod_teardown_preserving_placement_clock(tx, sandbox_id)
+                    .await
+            }
+        }
+        .db_context("failed to mark sandbox unplaced")
     }
 
     pub(super) async fn recover_markerless_restoring_after_execution_cleanup_in(
@@ -566,37 +552,9 @@ impl K8sStore {
         // Callers hold the sandbox row lock and retire the authoritative
         // execution earlier in this transaction. Execution creation takes the
         // same lock, so a successor cannot appear between this proof and commit.
-        let safe_revert_snapshot = restore_retry_suspended_revert_snapshot_exists("s");
-        let query = format!(
-            "UPDATE sandboxes s
-                SET lifecycle = 'suspended',
-                    placement = 'unplaced',
-                    active_node_id = NULL,
-                    target_node_id = NULL,
-                    placement_changed_at = NULL,
-                    current_local_artifact_id = NULL,
-                    current_local_artifact_kind = NULL,
-                    current_local_artifact_origin = NULL,
-                    command_ready_pending = FALSE,
-                    restore_lease_expires_at = NULL,
-                    restore_lease_token = NULL
-              WHERE s.id = $1
-                AND s.lifecycle = 'restoring'
-                AND s.evacuation_restore_target IS NULL
-                AND NOT EXISTS (
-                    SELECT 1
-                      FROM sandbox_k8s_executions e
-                     WHERE e.sandbox_id = s.id
-                       AND e.active
-                )
-                AND {safe_revert_snapshot}"
-        );
-        sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
-            .bind(sandbox_id)
-            .execute(&mut **tx)
+        pod_tracking::recover_markerless_restoring_after_execution_cleanup(tx, sandbox_id)
             .await
-            .db_context("failed to recover markerless restoring sandbox after execution cleanup")?;
-        Ok(())
+            .db_context("failed to recover markerless restoring sandbox after execution cleanup")
     }
 
     pub(super) async fn recover_started_after_suspend_cleanup_in(
@@ -604,12 +562,9 @@ impl K8sStore {
         tx: &mut Transaction<'_, Postgres>,
         sandbox_id: SandboxId,
     ) -> Result<bool, SubstrateError> {
-        self.recover_started_with_current_suspend_snapshot_in(
-            tx,
-            sandbox_id,
-            StartedSuspendRecoveryProof::ExecutionRetired,
-        )
-        .await
+        pod_tracking::recover_started_after_execution_retired(tx, sandbox_id)
+            .await
+            .db_context("failed to recover started sandbox with current suspend snapshot")
     }
 
     pub(super) async fn recover_started_after_failed_recovery_in(
@@ -618,102 +573,8 @@ impl K8sStore {
         sandbox_id: SandboxId,
         generation: ExecutionGeneration,
     ) -> Result<bool, SubstrateError> {
-        self.recover_started_with_current_suspend_snapshot_in(
-            tx,
-            sandbox_id,
-            StartedSuspendRecoveryProof::FailedRecovery { generation },
-        )
-        .await
-    }
-
-    async fn recover_started_with_current_suspend_snapshot_in(
-        &self,
-        tx: &mut Transaction<'_, Postgres>,
-        sandbox_id: SandboxId,
-        proof: StartedSuspendRecoveryProof,
-    ) -> Result<bool, SubstrateError> {
-        let (generation, execution_proof) = match proof {
-            StartedSuspendRecoveryProof::ExecutionRetired => (
-                None,
-                "NOT EXISTS (
-                    SELECT 1
-                      FROM sandbox_k8s_executions e
-                     WHERE e.sandbox_id = s.id
-                       AND e.active
-                 )
-                 AND NOT EXISTS (
-                    SELECT 1
-                      FROM sandbox_k8s_executions e
-                     WHERE e.sandbox_id = s.id
-                       AND e.pod_ip IS NOT NULL
-                 )",
-            ),
-            StartedSuspendRecoveryProof::FailedRecovery { generation } => (
-                Some(generation.get()),
-                "EXISTS (
-                    SELECT 1
-                      FROM sandbox_k8s_executions e
-                     WHERE e.sandbox_id = s.id
-                       AND e.generation = args.generation
-                       AND e.active
-                       AND e.state = 'recovery_failed'
-                       AND e.pod_uid IS NULL
-                       AND e.pod_ip IS NULL
-                       AND e.k8s_node_name IS NULL
-                 )
-                 AND NOT EXISTS (
-                    SELECT 1
-                      FROM sandbox_k8s_executions newer
-                     WHERE newer.sandbox_id = s.id
-                       AND newer.active
-                       AND newer.generation > args.generation
-                 )",
-            ),
-        };
-        let eligibility = match proof {
-            StartedSuspendRecoveryProof::ExecutionRetired => {
-                started_suspend_revert_eligibility("s")
-            }
-            StartedSuspendRecoveryProof::FailedRecovery { .. } => {
-                failed_repair_revert_eligibility("s")
-            }
-        };
-        let clear_marker = eligibility.clear_marker;
-        let eligible = eligibility.eligible;
-        let artifact_marker_assignments =
-            clear_current_local_artifact_marker_assignments("s", "pre.clear_marker");
-        let query = format!(
-            "WITH args AS (
-                 SELECT $2::BIGINT AS generation
-             ),
-             pre AS (
-                 SELECT id,
-                        {clear_marker} AS clear_marker
-                   FROM sandboxes s
-                  WHERE s.id = $1
-             )
-             UPDATE sandboxes s
-                SET lifecycle = 'suspended',
-                    placement = 'unplaced',
-                    active_node_id = NULL,
-                    target_node_id = NULL,
-                    placement_changed_at = NULL,
-                    command_ready_pending = FALSE,
-                    {artifact_marker_assignments}
-               FROM pre, args
-              WHERE s.id = pre.id
-                AND s.lifecycle = 'started'
-                AND s.placement = 'unplaced'
-                AND s.active_node_id IS NULL
-                AND {execution_proof}
-                AND {eligible}"
-        );
-        let result = sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
-            .bind(sandbox_id)
-            .bind(generation)
-            .execute(&mut **tx)
+        pod_tracking::recover_started_after_failed_recovery(tx, sandbox_id, generation)
             .await
-            .db_context("failed to recover started sandbox with current suspend snapshot")?;
-        Ok(result.rows_affected() > 0)
+            .db_context("failed to recover started sandbox with current suspend snapshot")
     }
 }
