@@ -12,8 +12,8 @@
 #   more JSON arrays of files (gh may merge pages).
 #
 # GitHub shows the first 10 warning annotations of a step, and archcheck
-# reports every file_size finding before the pattern_ratchet ones, so without
-# this a pull request's own findings can be pushed out by the tree's.
+# reports findings rule by rule, not by pull request, so without this a pull
+# request's own findings can be pushed out by the tree's.
 #
 # The pull request's own findings, in this order, each in report order:
 # - Findings that compare with the base branch: no_new_entries and

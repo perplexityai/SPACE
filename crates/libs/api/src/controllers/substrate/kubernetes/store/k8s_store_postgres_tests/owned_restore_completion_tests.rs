@@ -1,9 +1,9 @@
 //! Postgres behaviors for the restore owner's own `restoring -> started`
 //! commit (`K8sStore::complete_owned_user_restore`).
 //!
-//! A sibling module rather than more lines in the parent, which is already far
-//! past the repository's file-size guidance. Driven from
-//! `k8s_store_postgres_behaviors` against the parent's fixture.
+//! A sibling module rather than more lines in the parent, which is already very
+//! large. Driven from `k8s_store_postgres_behaviors` against the parent's
+//! fixture.
 
 use pplx_space_common_core::types::SandboxId;
 

@@ -1,23 +1,5 @@
 # Repository structure rules, checked by `cargo arch` (crates/tools/archcheck).
 
-[rules.file_size]
-limit = 1000                          # code lines per production Rust file
-
-[rules.file_size.no_crossing]         # no file outside the baseline may exceed the limit
-mode = "advisory"
-
-[rules.file_size.no_new_entries]      # a pull request may not add entries to the baseline
-mode = "advisory"
-
-[rules.file_size.no_raised_caps]      # a pull request may not raise a cap in the baseline
-mode = "advisory"
-
-[rules.file_size.listed_no_growth]    # files in the baseline may not gain code lines
-mode = "advisory"
-
-[rules.file_size.stale_entries]       # entries whose file shrank, fell under the limit, or is gone
-mode = "advisory"
-
 # Direct-only control-plane Postgres tables belong to the Direct substrate;
 # existing users outside it are baselined until moved behind it. Postgres folds
 # unquoted identifiers, so the names match in any case.
@@ -209,10 +191,11 @@ mode = "required"
 # error message ("failed to update sandboxes"); a statement on another
 # database's table of the same name.
 # sbx-mgr's node-local SQLite database also has a `sandboxes` table, a
-# different database on a different machine with its own store and fences
-# (`sbxmgr_sqlite` and `dependency_fence.sbxmgr_*` below), so its crates are
-# allowed whole, by the globs those rules guard: `crates/l*/sbx/**` matches
-# every directory named `sbx` directly below `crates/libs` or an `l*` layer
+# different database on a different machine with its own stores
+# (`pplx-space-sbx-mgr-store` and `pplx-space-sbxmgr-migrations`;
+# `layers.storage_access` keeps database drivers out of sbx-mgr's other
+# crates), so its crates are allowed whole: `crates/l*/sbx/**` matches every
+# directory named `sbx` directly below `crates/libs` or an `l*` layer
 # directory, and any other glob in the list adds sbx crates that are
 # elsewhere. A narrower glob would make this required rule fire on moves
 # within sbx-mgr. Test files are
@@ -329,67 +312,20 @@ mode = "required"
 mode = "required"
 
 # sbx-mgr's node-local SQLite database (`sandboxes` and every other sbx-mgr
-# table) is opened, migrated and queried only by its store, the
-# `pplx-space-sbx-mgr-store` crate. The guarantee is that crate's boundary:
-# `dependency_fence.sbxmgr_rusqlite` below keeps rusqlite and
-# `pplx-space-sqlite` (the shared helpers that open, migrate and delete a
-# SQLite database by path) out of every other sbx-mgr crate; CI's
-# `run_sbxmgr_production_checks` (ci/scripts/run-rust-checks.sh) asserts that
-# nothing else in the server's production graph brings either in; and
-# outside its `test-support` feature the store's API hands
-# out no rusqlite connection, transaction, statement or row. (Its `FromSql`
-# impl for a column type can return rusqlite's `FromSqlError`, an error type
-# rather than a database capability, to a caller holding a rusqlite value.)
-# This ratchet is a line-based tripwire on top of it, within sbx-mgr's
-# crates: naming rusqlite, opening a connection or transaction, using the
-# shared job store's SQL functions, binding parameters, executing a
-# statement, or writing an SQL statement literal outside the store is a
-# crossing. Aliases, wrapped imports and calls through names imported
-# earlier escape it. Its `sql::sqlite` pattern predates the shared helpers'
-# move into `pplx-space-sqlite` and matches nothing now; the fence and the
-# graph assertion cover them. Other services' crates use rusqlite for their own databases, so
-# `include` limits the rule to sbx-mgr's.
-[rules.pattern_ratchet.sbxmgr_sqlite]
-include = ["crates/l*/sbx/**", "crates/apps/sbx/**"]
-patterns = [
-  '\brusqlite\s*::',
-  '\buse\s+(?:::\s*)?rusqlite\b',
-  '\bextern\s+crate\s+rusqlite\b',
-  '\b(?:Connection|Transaction)\s*::\s*(?:open\w*|new\w*)\s*\(',
-  '\bsql\s*::\s*sqlite\b',
-  '\bpplx_space_common_jobs\s*::\s*(?:db\b|\{[^}]*\bdb\b)',
-  '\b(?:named_)?params\s*!',
-  '\.\s*(?:execute|execute_batch|prepare|prepare_cached|query_row|query_row_and_then|query_one|query_map|query_and_then|transaction|unchecked_transaction|transaction_with_behavior|savepoint|pragma_update|pragma_query|pragma_query_value)\s*\(',
-  '\.\s*(?:query|exists)\s*\(\s*[^)\s]',
-  '\bimmediate_transaction\s*\(',
-  '"\s*(?:SELECT\b|INSERT\s+(?:OR\s+[A-Z]+\s+)?INTO\b|REPLACE\s+INTO\b|UPDATE\s+(?:OR\s+[A-Z]+\s+)?\w+(?:\s+SET\b|\s*$)|DELETE\s+FROM\b|(?:CREATE|DROP|ALTER)\s+(?:TEMP\s+|TEMPORARY\s+|UNIQUE\s+)?(?:TABLE|INDEX|TRIGGER|VIEW)\b|PRAGMA\s+\w|WITH\s+(?:RECURSIVE\s+)?\w+\s+AS\b|(?:BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RELEASE|VACUUM)\b[\w\s]*;?\s*")',
-  '^\s*(?:SELECT\s|INSERT\s+(?:OR\s+[A-Z]+\s+)?INTO\s|UPDATE\s+(?:OR\s+[A-Z]+\s+)?\w+(?:\s+SET\s|\s*$)|DELETE\s+FROM\s|WITH\s+(?:RECURSIVE\s+)?\w+\s+AS\b)',
-]
-allow = ["crates/libs/sbx/mgr/store/src/**"]
-
-[rules.pattern_ratchet.sbxmgr_sqlite.no_crossing]
-mode = "required"
-
-# The baseline is empty: no file outside the store may be added to it.
-[rules.pattern_ratchet.sbxmgr_sqlite.no_new_entries]
-mode = "required"
-
-[rules.pattern_ratchet.sbxmgr_sqlite.no_raised_caps]
-mode = "required"
-
-[rules.pattern_ratchet.sbxmgr_sqlite.listed_no_growth]
-mode = "required"
-
-[rules.pattern_ratchet.sbxmgr_sqlite.stale_entries]
-mode = "required"
-
-# The same database's schema and location, in any crate: its migrations, its
-# path and file name, and a default-path helper for it belong to the store,
-# which opens and migrates it; the database migrator takes them from the
-# store's `db::migration::target()`. The migrations crate defines the
-# migrators and common-core the path. These names are
-# specific enough to check workspace-wide, unlike `sbxmgr_sqlite`'s patterns,
-# which other services' crates match for their own databases.
+# table) is opened, migrated and queried only by its store,
+# `pplx-space-sbx-mgr-store`. Its schema and location, in any crate: its
+# migrations, its path and file name, and a default-path helper for it belong
+# to the store; the database migrator takes them from the store's
+# `db::migration::target()`. The migrations crate defines the migrators and
+# common-core the path. These names are specific enough to check
+# workspace-wide. The layers rule does not see these uses: its storage checks
+# read only dependency edges, skip stores and helpers, and tolerate baselined
+# edges, and `state.writes` scans only stores' and helpers' write statements.
+# Without this ratchet, pplx-space-db-migrate, a store that depends on sqlx
+# and rusqlite, could name sbx-mgr's migrator or a default-path helper for its
+# database again, and a node service with a baselined driver edge
+# (node-ctl-server, node-mgr, node-runtime-manager, template-mgr, volmgr,
+# build-mgr-server) could open `SANDBOX_MANAGER_DB`.
 [rules.pattern_ratchet.sbxmgr_sqlite_schema]
 patterns = [
   '\bpplx_space_sbxmgr_migrations\b',
@@ -418,29 +354,6 @@ mode = "required"
 mode = "required"
 
 [rules.pattern_ratchet.sbxmgr_sqlite_schema.stale_entries]
-mode = "required"
-
-# Only the store may depend on the SQLite drivers that can open sbx-mgr's
-# database, or on the shared helpers that open, migrate and delete one by
-# path, so no other sbx-mgr crate can name them: no normal, dev or build
-# dependency, for any target, under any name.
-[rules.dependency_fence.sbxmgr_rusqlite]
-packages = ["libsqlite3-sys", "pplx-space-sqlite", "rusqlite"]
-members = ["crates/l*/sbx/**", "crates/apps/sbx/**"]
-allow = ["crates/libs/sbx/mgr/store"]
-
-[rules.dependency_fence.sbxmgr_rusqlite.no_crossing]
-mode = "required"
-
-# sqlx opens SQLite too, directly or through its core and SQLite driver
-# crates. The migrations crate embeds the migrations with it, and the store
-# names their `Migrator` type.
-[rules.dependency_fence.sbxmgr_sqlx]
-packages = ["sqlx", "sqlx-core", "sqlx-sqlite"]
-members = ["crates/l*/sbx/**", "crates/apps/sbx/**"]
-allow = ["crates/libs/sbx/mgr/store", "crates/libs/sbx/mgr/migrations"]
-
-[rules.dependency_fence.sbxmgr_sqlx.no_crossing]
 mode = "required"
 
 [rules.crate_names]

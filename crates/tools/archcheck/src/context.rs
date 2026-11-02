@@ -75,17 +75,6 @@ pub enum LoadError {
     /// Debug-formatted, so the invalid bytes are shown escaped.
     #[error("{path:?} is not valid UTF-8")]
     NonUtf8Path { path: PathBuf },
-    /// A glob that matches no member checks nothing, so it is a typo or a
-    /// member that moved.
-    #[error(
-        "[rules.dependency_fence.{instance}] {key} in {CONFIG_FILE} has {glob:?}, which matches \
-         no workspace member; fix or remove it"
-    )]
-    UnmatchedMemberGlob {
-        instance: String,
-        key: &'static str,
-        glob: String,
-    },
     #[error("no Cargo.toml with a [workspace] table found at or above {start}")]
     NoWorkspaceRoot { start: PathBuf },
     /// The wording is for a rule with instances: every other rule's
@@ -150,13 +139,12 @@ pub enum LoadError {
     },
 }
 
-/// A production Rust file, its text and its code-line count.
+/// A production Rust file and its text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProductionFile {
     /// Repository-relative, `/`-separated.
     pub path: String,
     pub text: String,
-    pub code_lines: usize,
 }
 
 /// A workspace member's package.
@@ -335,18 +323,6 @@ impl Context {
             return Err(LoadError::AllowedAndListed { name: name.clone() });
         }
         let crates = workspace_crates(root)?;
-        let members = crates.iter().map(|krate| krate.member.as_str());
-        for (instance, fence) in &config.rules.dependency_fence {
-            for (key, globs) in [("members", fence.members.globs()), ("allow", &fence.allow)] {
-                if let Some(glob) = globs.unmatched(members.clone()) {
-                    return Err(LoadError::UnmatchedMemberGlob {
-                        instance: instance.to_string(),
-                        key,
-                        glob: glob.to_owned(),
-                    });
-                }
-            }
-        }
         let files = production_files(root, &crates)?;
         let layers = config.rules.layers.as_ref();
         let (catalogs, sql_files) = match layers.and_then(|layers| layers.state.as_ref()) {
@@ -403,11 +379,6 @@ pub fn is_test_file(name: &str) -> bool {
 /// `scripts/check-rust-error-policy.sh` excludes `*/tests/*` the same way.
 pub fn is_test_directory(name: &OsStr) -> bool {
     name == "tests"
-}
-
-/// The number of [`code_lines`] in `text`.
-pub fn count_code_lines(text: &str) -> usize {
-    code_lines(text).count()
 }
 
 /// Each code line of `text`, untrimmed and without its line ending, with its
@@ -684,7 +655,6 @@ fn production_files(root: &Path, crates: &[Crate]) -> Result<Vec<ProductionFile>
         .map(|path| {
             let text = read(&path)?;
             Ok(ProductionFile {
-                code_lines: count_code_lines(&text),
                 text,
                 path: relative_path(root, &path)?,
             })

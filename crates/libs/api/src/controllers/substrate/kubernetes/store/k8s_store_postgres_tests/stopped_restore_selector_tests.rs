@@ -3,10 +3,10 @@
 //! (`K8sStore::selected_stopped_restore_storage_uri`).
 //!
 //! A sibling module rather than more lines in the parent: the parent is
-//! already far past the repository's file-size guidance, and these behaviors
-//! share nothing with it but the fixture. They take `&PostgresStore` and are
-//! driven from `k8s_store_postgres_behaviors`, so they run against the same
-//! database and mint no second container.
+//! already very large, and these behaviors share nothing with it but the
+//! fixture. They take `&PostgresStore` and are driven from
+//! `k8s_store_postgres_behaviors`, so they run against the same database and
+//! mint no second container.
 
 use pplx_space_common_core::types::{LocalArtifactId, SandboxId, SnapshotId};
 
