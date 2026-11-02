@@ -90,3 +90,30 @@ function destinationFromRule(rule: NetworkPolicyDraftRule): NetworkPolicyDestina
       return pattern.startsWith('*.') ? { wildcard_domain: pattern } : { domain: pattern };
   }
 }
+
+// Text for the compact network-policy tag in sandbox and template tables:
+// what the policy does, and whether the node has applied its latest version.
+export function networkPolicyTagText(
+  policyLabel: string | null | undefined,
+  desired: number,
+  applied: number | null | undefined,
+): { label: string; meaning: string; sync: string } {
+  const meaning =
+    policyLabel === 'closed'
+      ? 'Egress: deny all.'
+      : policyLabel === 'open'
+        ? 'Egress: allow all.'
+        : policyLabel === 'custom'
+          ? 'Egress: custom allow and deny rules.'
+          : 'Egress policy unknown.';
+  const sync =
+    applied === null || applied === undefined || applied === 0
+      ? `Version ${desired} is not yet reported as applied by the node.`
+      : applied < desired
+        ? `The node applies version ${applied}; version ${desired} is pending.`
+        : applied > desired
+          ? `The node reports version ${applied}, newer than the desired version ${desired}.`
+          : `Version ${desired}, applied by the node.`;
+  const label = policyLabel ? `${policyLabel} · v${desired}` : `v${desired}`;
+  return { label, meaning, sync };
+}
