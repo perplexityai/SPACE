@@ -8,8 +8,9 @@ errors, failed and slow requests, error toasts, and the step's own checks. Two
 runs can be compared, for example `main` against a branch, and the comparison
 fails when the branch has an error that `main` does not.
 
-It produces development and review evidence, not a pass/fail gate: nothing in
-CI runs it, and a clean comparison does not certify a change. Smoke tests
+It produces development and review evidence, not a pass/fail gate: CI runs
+its type check and unit tests but never the loop, and a clean comparison does
+not certify a change. Smoke tests
 against a Kind or deployed stack are typed `space_smoke` scenarios (see the
 `space-validation` skill's smoke-testing reference); typed console scenarios
 are a separate follow-up.
@@ -46,7 +47,7 @@ the loopback check.
 ## Prerequisites
 
 - The Kind stack, brought up with `infra/space/kind/scripts/up.sh`
-  ([docs/installation.md](../../../../docs/installation.md)). The loop uses the
+  ([docs/installation.md](../../docs/installation.md)). The loop uses the
   console at `http://localhost:3000` (Tilt's port-forward), the API at
   `http://localhost:8080`, and the console account `up.sh` provisions
   (`root@local`, with the password from `SPACE_CONSOLE_PASSWORD`, default
@@ -156,7 +157,9 @@ also takes `--skip-sandboxes`, and `npm run clean` takes `--delete-orgs`.
 `npm run loop` also takes `--label NAME`, `--slow-ms N` (default 1500),
 `--compare RUN`, `--headed`, and `--video`, which records the run as
 `run.webm` in its run directory. Run `npm run typecheck` and `npm test` (unit
-tests that need no stack) after changing the scripts.
+tests that need no stack) after changing the scripts; the SPACE Guide job of
+Pull CI runs both. The tool lives under `scripts/`, outside the paths that
+select the Kind smoke (`ci/kind-pull-paths.txt`) and outside `ui/`'s build.
 
 ## The fast loop: `next dev`
 
@@ -173,7 +176,7 @@ NEXT_PUBLIC_API_URL=http://localhost:8080 npx next dev --port 3001
 In development the data plane defaults to `http://localhost:8090`
 (`ui/next.config.js`); `NEXT_PUBLIC_ADMIN_API_URL` and
 `NEXT_PUBLIC_DATA_PLANE_URL` override the admin and data-plane backends (see
-[ui/README.md](../../../../ui/README.md)). An edit shows within a second. Point
+[ui/README.md](../../ui/README.md)). An edit shows within a second. Point
 the loop at it:
 
 ```bash

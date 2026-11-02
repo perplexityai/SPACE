@@ -370,7 +370,7 @@ Sign in at `http://127.0.0.1:3000` with the chosen account. Repeat with the othe
 
 To exercise the console in a browser against this stack, with seeded synthetic
 data and recorded evidence per page, see the
-[console loop](../infra/space/kind/console-loop/README.md).
+[console loop](../scripts/console-loop/README.md).
 
 <a id="shim-telemetry-selectors"></a>
 

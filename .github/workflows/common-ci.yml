@@ -116,6 +116,16 @@ jobs:
           bash scripts/build-guide-docs.sh
           python3 docs/book/test.py
 
+      # The console loop drives a local Kind stack, which CI does not run;
+      # its type check and unit tests need none. Its own npm cache keeps the
+      # saved one to docs/api's lockfile.
+      - name: Check the console loop
+        working-directory: scripts/console-loop
+        run: |
+          npm ci --ignore-scripts --no-fund --no-audit --cache "${RUNNER_TEMP}/console-loop-npm"
+          npm run typecheck
+          npm test
+
       - name: Report the npm cache
         id: report-npm-cache
         if: always()

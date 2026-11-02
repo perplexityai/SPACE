@@ -10,8 +10,8 @@ target
 ui/.next
 ui/node_modules
 # The console loop's dependencies and its runs, seed state and media (git-ignored).
-infra/space/kind/console-loop/node_modules
-infra/space/kind/console-loop/out
+scripts/console-loop/node_modules
+scripts/console-loop/out
 infra/space/packer/utm/output
 infra/space/packer/utm/output-*
 infra/space/packer/aws/output

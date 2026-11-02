@@ -1,5 +1,5 @@
 {
-  "name": "space-kind-console-loop",
+  "name": "space-console-loop",
   "private": true,
   "version": "0.0.0",
   "description": "Browser verification loop for the SPACE admin console on a local Kind stack.",
