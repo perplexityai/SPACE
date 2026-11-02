@@ -536,10 +536,7 @@ pub fn try_link_exists(name: &str, ns: Option<&str>) -> Result<bool, NetworkProb
     };
 
     if let Some(ns) = ns {
-        run_in_netns(ns, read).map_err(|detail| NetworkProbeError::Namespace {
-            ns: ns.to_string(),
-            detail,
-        })
+        probe_in_netns(ns, read)
     } else {
         read().map_err(|detail| NetworkProbeError::LinkQuery {
             name: query_name,
@@ -591,10 +588,7 @@ pub fn try_host_route_exists(net: &NetId, ns: Option<&str>) -> Result<bool, Netw
     };
 
     if let Some(ns) = ns {
-        run_in_netns(ns, read).map_err(|detail| NetworkProbeError::Namespace {
-            ns: ns.to_string(),
-            detail,
-        })
+        probe_in_netns(ns, read)
     } else {
         read().map_err(|detail| NetworkProbeError::RouteDump { detail })
     }
@@ -797,6 +791,41 @@ where
         })
 }
 
+/// Keeps a namespace-entry failure typed so a probe can report a missing or
+/// unmounted /run/netns entry apart from every other failure.
+enum NamespaceProbeError {
+    Enter(NetnsEnterError),
+    Probe(String),
+}
+
+impl From<NetnsEnterError> for NamespaceProbeError {
+    fn from(error: NetnsEnterError) -> Self {
+        Self::Enter(error)
+    }
+}
+
+fn probe_in_netns<T: Send + 'static>(
+    ns: &str,
+    read: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, NetworkProbeError> {
+    run_in_netns(ns, move || read().map_err(NamespaceProbeError::Probe)).map_err(|error| {
+        let ns = ns.to_string();
+        match error {
+            NamespaceProbeError::Enter(error) if error.is_target_missing() => {
+                NetworkProbeError::NamespaceMissing {
+                    ns,
+                    detail: error.to_string(),
+                }
+            }
+            NamespaceProbeError::Enter(error) => NetworkProbeError::Namespace {
+                ns,
+                detail: error.to_string(),
+            },
+            NamespaceProbeError::Probe(detail) => NetworkProbeError::Namespace { ns, detail },
+        }
+    })
+}
+
 fn run_in_netns<F, T, E>(ns: &str, f: F) -> Result<T, E>
 where
     F: FnOnce() -> Result<T, E> + Send + 'static,
@@ -816,7 +845,7 @@ where
             })
         })?;
 
-        setns_file(&target).map_err(|detail| E::from(NetnsEnterError::SetNs { detail }))?;
+        enter_netns_file(&target_path, &target).map_err(E::from)?;
         IN_NETNS_THREAD.with(|cell| cell.set(true));
         let result = f();
         IN_NETNS_THREAD.with(|cell| cell.set(false));
@@ -830,6 +859,28 @@ where
     })
     .join()
     .map_err(|_| E::from(NetnsEnterError::ThreadPanicked { ns }))?
+}
+
+/// Enter the namespace an opened /run/netns entry names. Removing a named
+/// namespace unmounts the entry before unlinking it; an entry opened in
+/// between is a plain file, which setns refuses. The kernel refuses it with
+/// EINVAL, but a seccomp filter can refuse setns first, so a refusal is
+/// classified by the file rather than the errno.
+pub(super) fn enter_netns_file(path: &str, target: &fs::File) -> Result<(), NetnsEnterError> {
+    match setns(target, CloneFlags::CLONE_NEWNET) {
+        Ok(()) => Ok(()),
+        Err(_)
+            if nix::sys::statfs::fstatfs(target)
+                .is_ok_and(|stat| stat.filesystem_type() != nix::sys::statfs::NSFS_MAGIC) =>
+        {
+            Err(NetnsEnterError::TargetUnmounted {
+                path: path.to_string(),
+            })
+        }
+        Err(error) => Err(NetnsEnterError::SetNs {
+            detail: format!("failed to switch network namespace: {error}"),
+        }),
+    }
 }
 
 fn setns_file(file: &fs::File) -> Result<(), String> {
