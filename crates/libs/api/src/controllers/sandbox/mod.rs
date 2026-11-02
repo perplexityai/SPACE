@@ -50,7 +50,7 @@ use crate::models::{
     CreateSandboxRequest, NetworkPolicyCondition, NetworkPolicyStatus, Sandbox,
     SandboxActivationRequest, SandboxNetworkPolicyPatch, SandboxNodeSummary, SandboxPortExposure,
     SandboxPortProtocol, SandboxPortVisibility, SandboxResourceType, SandboxResponse,
-    UpdateSandboxRequest, User,
+    SandboxStateInput, UpdateSandboxRequest, User,
 };
 use crate::reconcile_queue::{
     FinalizeSandboxDbDeleteError, ReconcileRef, delete_reconcile_state_for_elements,
