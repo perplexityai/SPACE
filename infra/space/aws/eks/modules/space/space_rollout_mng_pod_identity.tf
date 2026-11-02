@@ -19,10 +19,11 @@
 # blast radius of a compromised pod or token without being needed for
 # any documented orchestrator code path.
 #
-# Resource scoping uses the same worker-pool ASG + nodegroup ARN sets
-# the cluster-controller already computes, so new rollout cohorts
-# (`workers-1`, future `workers-2`, …) and the disposable smoke-test
-# MNGs (`test-1` / `test-2`) inherit access without touching this file.
+# Resource scoping uses the same worker nodegroup ARN set the
+# cluster-controller already computes, so rollout cohorts
+# (`workers-1` and every `workers_rollout_cohorts` target) and the
+# disposable smoke-test MNGs (`test-1` / `test-2`) inherit access without
+# touching this file.
 #
 # Why a separate role instead of attaching policies to the existing
 # `cluster-controller-db-pod-identity` role: EKS Pod Identity binds one

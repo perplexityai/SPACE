@@ -129,6 +129,18 @@ locals {
   workers_pool_enabled           = var.workers_cgnat_retired || local.workers_1_rollout_active
   workers_shared_identity_needed = local.workers_pool_enabled || length(var.worker_capacity_groups) > 0
 
+  # Node labels for workers-cgnat, workers-1 and the rollout cohorts.
+  # `workers_labels` merges last, so a key set there wins. The capacity
+  # groups (`worker_capacity.tf`) build their own map in the other order.
+  worker_rollout_labels = merge(
+    {
+      "space.pplx.net/node-pool"   = "workers"
+      "space.pplx.net/subnet-tier" = "secondary"
+      "workload"                   = "workers"
+    },
+    var.workers_labels,
+  )
+
   # The legacy `workers-cgnat` pool definition. Hoisted into its own local
   # so the `node_pools` map below can include or exclude it via a single
   # conditional merge, keyed off `var.workers_cgnat_retired`. The pool's
@@ -149,14 +161,7 @@ locals {
     # with that nodeSelector) and the `space-worker` DaemonSet still land
     # here without an API-side selector change. The `subnet-tier` label
     # distinguishes CGNAT nodes for debugging and targeted placement.
-    labels = merge(
-      {
-        "space.pplx.net/node-pool"   = "workers"
-        "space.pplx.net/subnet-tier" = "secondary"
-        "workload"                   = "workers"
-      },
-      var.workers_labels,
-    )
+    labels   = local.worker_rollout_labels
     max_size = var.workers_max_size
     min_size = var.workers_min_size
     ami_id   = local.workers_ami_id

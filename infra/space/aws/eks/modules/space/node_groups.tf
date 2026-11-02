@@ -1,7 +1,8 @@
 # Standalone launch template shared by SPACE worker MNG types. Its consumers
 # deliberately have different lifecycle contracts:
 #
-# - Rollout-managed MNGs (`workers-cgnat` and `module "workers_N"`) ignore
+# - Rollout-managed MNGs (`workers-cgnat`, `module.workers_1` and
+#   `module.workers_rollout_cohort`) ignore
 #   launch-template changes. A new template version is adopted through a new,
 #   sandbox-aware rollout MNG instead of an EKS in-place node recycle.
 # - Permanent `aws_eks_node_group.worker_capacity` MNGs reconcile the latest
@@ -22,9 +23,9 @@
 # `module.workers_1`'s `ignore_changes = [launch_template]` deliberately
 # hides LT diffs from EKS, workers-1 would continue launching from the
 # now-deleted LT id and scale-out would silently fail. The cosmetic
-# carry-over is intentional and goes away naturally on the next per-
-# rollout LT (the workers-N → workers-(N+1) rollout adds its own
-# `aws_launch_template.workers_N+1` block).
+# carry-over is intentional: later rollouts bump this template and move onto
+# a `workers_rollout_cohorts` target built from it (`rollout.tf`), so the
+# name stays.
 resource "aws_launch_template" "workers" {
   name_prefix            = "${local.name}-workers-cgnat-"
   image_id               = local.workers_ami_id

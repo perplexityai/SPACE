@@ -37,9 +37,9 @@
 locals {
   # Every pool-keyed node group: the core module's and the legacy
   # rollout-managed one. A pool lands in exactly one of them, so keys don't
-  # collide across the merge. Rollout MNGs (e.g. `module.workers_1`) aren't
-  # pool-keyed and are handled separately below via the module's
-  # `asg_names` output.
+  # collide across the merge. Rollout MNGs (`module.workers_1` and
+  # `module.workers_rollout_cohort`) aren't pool-keyed and are handled
+  # separately below via the module's outputs.
   cluster_controller_all_node_groups = merge(
     module.eks.node_groups,
     aws_eks_node_group.rollout_managed,
@@ -59,10 +59,10 @@ locals {
   #      retirement the set is empty.
   #   2. `module.workers_1[*].asg_names` — the rollout-mng module
   #      publishes its own ASG names because module-created MNGs aren't
-  #      reachable from the parent's top-level resource addresses.
-  #      Future rollouts to `workers-2`, `workers-3`, ... each add a
-  #      separate `module "workers_N"` block in `rollout.tf` and an
-  #      additional entry below.
+  #      reachable from the parent's top-level resource addresses. The
+  #      `workers_rollout_cohorts` targets aren't listed here: like the
+  #      capacity groups, they tag their ASGs by cohort name (`rollout.tf`)
+  #      and join `cluster_controller_worker_asg_arns` below directly.
   #   3. `var.additional_worker_asg_names` — worker MNGs the root declares
   #      beside this module (the rollout smoke-test pools) whose nodes the
   #      same `node_drain_reconciler` terminator path must be able to
@@ -110,13 +110,21 @@ locals {
       "${local.autoscaling_group_arn_prefix}${name}"
     ],
     local.worker_capacity_asg_arns,
+    # Rollout cohort ASGs. Without them, the drain reconciler's terminate of a
+    # target's nodes fails with AccessDenied. (Resizes go through the
+    # node-group ARNs below.)
+    [
+      for name in values(local.workers_rollout_cohort_asg_names) :
+      "${local.autoscaling_group_arn_prefix}${name}"
+    ],
   )
 
   # EKS nodegroup ARNs for the same worker pools: top-level
   # `aws_eks_node_group` resources whose pool entry carries the
   # `space.pplx.net/node-pool=workers` label, then each rollout-mng module's
-  # `node_group_arn` output (`workers_1`), the ARNs of worker MNGs the calling
-  # root declares itself (`additional_worker_node_group_arns`), and the
+  # `node_group_arn` output (`workers_1`, `workers_rollout_cohort`), the ARNs
+  # of worker MNGs the calling root declares itself
+  # (`additional_worker_node_group_arns`), and the
   # `workers-N` capacity groups. Unlike the ASG-names list, the root's MNGs
   # are safe to include directly here because this local feeds only IAM policy
   # `resources` (no for_each), so an unknown-until-apply ARN is fine. AWS EKS
@@ -130,6 +138,7 @@ locals {
       if try(local.node_pools[key].labels["space.pplx.net/node-pool"], null) == "workers"
     ],
     module.workers_1[*].node_group_arn,
+    [for cohort in module.workers_rollout_cohort : cohort.node_group_arn],
     var.additional_worker_node_group_arns,
     local.worker_capacity_nodegroup_arns,
   )
