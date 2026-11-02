@@ -65,6 +65,7 @@ use crate::{
     middleware::auth::{AuthEcwActor, AuthOrg},
     models::{
         Organization, Sandbox, SandboxMetadataValue, SandboxNetworkPolicyPatch, SandboxResponse,
+        SandboxStateInput,
     },
     routes::AppState,
 };
@@ -721,13 +722,13 @@ fn base_create_request() -> CreateSandboxRequestE2b {
 }
 
 fn native_sandbox_response(id: SandboxId) -> SandboxResponse {
-    SandboxResponse {
+    let mut response = SandboxResponse {
         id,
-        lifecycle: Some("started".to_string()),
-        status: Some("started".to_string()),
         template: Some("seed".to_string()),
         ..Default::default()
-    }
+    };
+    response.set_state(SandboxStateInput::stored("started"));
+    response
 }
 
 fn test_sandbox() -> Sandbox {
@@ -3051,11 +3052,13 @@ fn request_client_id_trims_and_treats_blank_as_absent() {
 fn connect_wakes_when_persisted_lifecycle_requires_restore() {
     let mut sandbox = test_sandbox();
     let mut native = native_sandbox_response(sandbox.id);
-    native.lifecycle = Some("started".to_string());
-    native.status = Some("started".to_string());
 
     for lifecycle in ["suspended", "restoring"] {
         sandbox.lifecycle = lifecycle.to_string();
+        native.set_state(SandboxStateInput::new(
+            Some(lifecycle.to_string()),
+            Some("started".to_string()),
+        ));
         assert!(should_wake_on_connect(&sandbox, &native), "{lifecycle}");
     }
 }
@@ -3075,16 +3078,13 @@ fn connect_ensures_usable_pod_for_every_running_shape() {
 
     assert!(should_ensure_usable_pod_on_connect(&native));
 
-    native.lifecycle = Some("restoring".to_string());
-    native.status = Some("restoring".to_string());
+    native.set_state(SandboxStateInput::stored("restoring"));
     assert!(should_ensure_usable_pod_on_connect(&native));
 
-    native.lifecycle = Some("paused".to_string());
-    native.status = Some("paused".to_string());
+    native.set_state(SandboxStateInput::stored("paused"));
     assert!(!should_ensure_usable_pod_on_connect(&native));
 
-    native.lifecycle = Some("failed".to_string());
-    native.status = Some("failed".to_string());
+    native.set_state(SandboxStateInput::stored("failed"));
     assert!(!should_ensure_usable_pod_on_connect(&native));
 }
 
@@ -3104,8 +3104,10 @@ fn connect_touch_recovery_wakes_paused_state_without_retrying() {
     let mut sandbox = test_sandbox();
     sandbox.lifecycle = "suspended".to_string();
     let mut native = native_sandbox_response(sandbox.id);
-    native.lifecycle = Some("started".to_string());
-    native.status = Some("started".to_string());
+    native.set_state(SandboxStateInput::new(
+        Some("suspended".to_string()),
+        Some("started".to_string()),
+    ));
 
     assert_eq!(
         connect_touch_recovery(
@@ -3122,6 +3124,10 @@ fn connect_touch_recovery_wakes_paused_state_without_retrying() {
     );
 
     sandbox.lifecycle = "started".to_string();
+    native.set_state(SandboxStateInput::new(
+        Some("started".to_string()),
+        Some("started".to_string()),
+    ));
     assert_eq!(
         connect_touch_recovery(
             LiveKeepaliveTouchOutcome::RuntimeUnreachable,
@@ -3140,8 +3146,7 @@ fn unreachable_connect_touch_retries_only_running_state_with_budget() {
     assert!(can_retry_unreachable_connect_touch(&native, 1));
     assert!(!can_retry_unreachable_connect_touch(&native, 0));
 
-    native.lifecycle = Some("paused".to_string());
-    native.status = Some("paused".to_string());
+    native.set_state(SandboxStateInput::stored("paused"));
     assert!(!can_retry_unreachable_connect_touch(&native, 1));
 }
 
@@ -3195,7 +3200,10 @@ fn connect_touch_recovery_joins_active_recovery_after_not_started_touch() {
         let mut sandbox = test_sandbox();
         sandbox.lifecycle = lifecycle.to_string();
         let mut native = native_sandbox_response(sandbox.id);
-        native.status = Some("stopped".to_string());
+        native.set_state(SandboxStateInput::new(
+            Some(lifecycle.to_string()),
+            Some("stopped".to_string()),
+        ));
 
         let recovery =
             connect_touch_recovery(LiveKeepaliveTouchOutcome::NotStarted, &sandbox, &native, 2);
@@ -3211,11 +3219,9 @@ fn connect_touch_recovery_joins_active_recovery_after_not_started_touch() {
 #[test]
 fn connect_touch_recovery_does_not_wake_teardown_state() {
     let mut native = native_sandbox_response(SandboxId::new());
-    native.lifecycle = Some("deleting".to_string());
-    native.status = Some("deleting".to_string());
+    native.set_state(SandboxStateInput::stored("deleting"));
     let mut paused_native = native_sandbox_response(SandboxId::new());
-    paused_native.lifecycle = Some("paused".to_string());
-    paused_native.status = Some("paused".to_string());
+    paused_native.set_state(SandboxStateInput::stored("paused"));
 
     for lifecycle in ["stopping", "deleting", "cleanup_required", "deleted"] {
         let mut sandbox = test_sandbox();
@@ -3447,11 +3453,8 @@ fn list_cursor_rejects_invalid_tokens() {
 #[test]
 fn native_state_translation_hides_terminal_sandboxes() {
     for lifecycle in ["stopped", "failed", "quarantined"] {
-        let sandbox = SandboxResponse {
-            lifecycle: Some(lifecycle.to_string()),
-            status: Some(lifecycle.to_string()),
-            ..native_sandbox_response(SandboxId::new())
-        };
+        let mut sandbox = native_sandbox_response(SandboxId::new());
+        sandbox.set_state(SandboxStateInput::stored(lifecycle));
 
         assert_eq!(translate_sandbox_state(&sandbox), None);
     }
@@ -3460,11 +3463,8 @@ fn native_state_translation_hides_terminal_sandboxes() {
 #[tokio::test]
 async fn failed_terminal_state_detail_serializes_failed_and_recover_mapper_fails_to_place() {
     let detail_sandbox = test_sandbox();
-    let sandbox = SandboxResponse {
-        lifecycle: Some("failed".to_string()),
-        status: Some("failed".to_string()),
-        ..native_sandbox_response(detail_sandbox.id)
-    };
+    let mut sandbox = native_sandbox_response(detail_sandbox.id);
+    sandbox.set_state(SandboxStateInput::stored("failed"));
 
     let detail = build_detail_sandbox(
         &test_ecw_credential_keyring(),
@@ -3486,11 +3486,8 @@ async fn failed_terminal_state_detail_serializes_failed_and_recover_mapper_fails
     )
     .await;
 
-    let quarantined = SandboxResponse {
-        lifecycle: Some("quarantined".to_string()),
-        status: Some("quarantined".to_string()),
-        ..native_sandbox_response(detail_sandbox.id)
-    };
+    let mut quarantined = native_sandbox_response(detail_sandbox.id);
+    quarantined.set_state(SandboxStateInput::stored("quarantined"));
     let response = terminal_sandbox_error(&quarantined).into_response();
     assert_e2b_error_response(
         response,
@@ -3504,11 +3501,8 @@ async fn failed_terminal_state_detail_serializes_failed_and_recover_mapper_fails
 
 #[tokio::test]
 async fn stopped_terminal_state_stays_not_found() {
-    let sandbox = SandboxResponse {
-        lifecycle: Some("stopped".to_string()),
-        status: Some("stopped".to_string()),
-        ..native_sandbox_response(SandboxId::new())
-    };
+    let mut sandbox = native_sandbox_response(SandboxId::new());
+    sandbox.set_state(SandboxStateInput::stored("stopped"));
 
     let response = terminal_sandbox_error(&sandbox).into_response();
 
@@ -3524,11 +3518,8 @@ async fn stopped_terminal_state_stays_not_found() {
 
 #[tokio::test]
 async fn unknown_terminal_state_defaults_to_not_found() {
-    let sandbox = SandboxResponse {
-        lifecycle: Some("lost".to_string()),
-        status: Some("lost".to_string()),
-        ..native_sandbox_response(SandboxId::new())
-    };
+    let mut sandbox = native_sandbox_response(SandboxId::new());
+    sandbox.set_state(SandboxStateInput::stored("lost"));
 
     let response = terminal_sandbox_error(&sandbox).into_response();
 
