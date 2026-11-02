@@ -11,7 +11,7 @@ use axum::{
     response::IntoResponse,
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use pplx_space_common_core::types::{NodeId, OrgId, SandboxId, TemplateName, UserId};
+use pplx_space_common_core::types::{OrgId, SandboxId, TemplateName, UserId};
 use pplx_space_placement::StoredSandboxLifecycle;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -19,8 +19,8 @@ use time::OffsetDateTime;
 
 use super::support::{self, ContentionScope, api_error, require_managing_org_admin};
 use crate::controllers::sandbox::SandboxPageCursor;
-use crate::controllers::sandbox::admin_list::{
-    AdminSandboxFilter, NodeAssignment, PageBudget, SandboxSearch, SpacedVersionCount,
+use crate::controllers::sandbox::list_page::admin::{
+    AdminSandboxFilter, PageBudget, SandboxSearch, SpacedVersionCount,
 };
 use crate::middleware::auth::AuthUser;
 use crate::models::{Sandbox, SandboxResponse};
@@ -33,14 +33,12 @@ const CURSOR_VERSION: &str = "v1";
 /// The list's query parameters. With `cursor` any other parameter is
 /// refused; without it, other parameters are ignored, as they were before
 /// paging existed, so callers written against that list keep working.
-const LIST_PARAMETERS: [&str; 11] = [
+const LIST_PARAMETERS: [&str; 9] = [
     "limit",
     "org_id",
     "cursor",
     "lifecycle",
     "template",
-    "node_id",
-    "assigned",
     "user_id",
     "created_after",
     "created_before",
@@ -61,8 +59,6 @@ pub struct AdminSandboxListQuery {
     /// Comma-separated stored lifecycles.
     lifecycle: Option<String>,
     template: Option<String>,
-    node_id: Option<NodeId>,
-    assigned: Option<bool>,
     user_id: Option<UserId>,
     created_after: Option<String>,
     created_before: Option<String>,
@@ -133,17 +129,6 @@ impl AdminSandboxListQuery {
             Some("") => Paging::First,
             Some(cursor) => Paging::After(decode_cursor(cursor)?),
         };
-        let node = match (self.node_id, self.assigned) {
-            (Some(_), Some(false)) => {
-                return Err(bad_request(
-                    "node_id cannot be combined with assigned=false",
-                ));
-            }
-            (Some(node_id), _) => Some(NodeAssignment::Node(node_id)),
-            (None, Some(true)) => Some(NodeAssignment::Assigned),
-            (None, Some(false)) => Some(NodeAssignment::Unassigned),
-            (None, None) => None,
-        };
         let created_after = self
             .created_after
             .as_deref()
@@ -178,7 +163,6 @@ impl AdminSandboxListQuery {
                         .map_err(|error| bad_request(format!("invalid template: {error}")))
                 })
                 .transpose()?,
-            node,
             user_id: self.user_id,
             created_after,
             created_before,

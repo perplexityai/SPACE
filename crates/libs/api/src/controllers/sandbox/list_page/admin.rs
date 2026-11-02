@@ -1,16 +1,17 @@
 //! The admin sandbox list's filters and pages, and its count of sandboxes by
 //! template and `spaced` version.
 //!
-//! A page is the ECW list's page walk ([`super::list_page`]) over the admin
-//! candidate statement below, with the same full-row select, so both lists
-//! resolve rows and stop at the byte budget the same way. The admin route's
-//! legacy unpaged array runs the same statement with no byte budget, since it
-//! has no cursor to continue from.
+//! A page is the ECW list's page walk ([`super`]) over the admin
+//! candidate statement below, composed with the same full-row select
+//! (`org::scoped_page_sql`), so both lists resolve rows and stop at the byte
+//! budget the same way. The admin route's legacy unpaged array has no cursor
+//! to continue from, so it runs a plain list statement with the same filters
+//! and no size walk.
 
 use std::sync::LazyLock;
 
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{NodeId, OrgId, SandboxId, SemVer, TemplateName, UserId};
+use pplx_space_common_core::types::{OrgId, SandboxId, SemVer, TemplateName, UserId};
 use pplx_space_placement::StoredSandboxLifecycle;
 use pplx_space_public_api::PUBLIC_SANDBOX_ID_PREFIX;
 use serde::Serialize;
@@ -18,11 +19,11 @@ use sqlx::PgPool;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use super::list_page::{
+use super::super::org::{ScopedPageRow, scoped_page_sql};
+use super::{
     ListPage, MAX_SANDBOX_LIST_PAGE_BYTES, PageWalkParams, SANDBOX_LIST_ROW_OVERHEAD_BYTES,
 };
-use super::org::{ScopedPageRow, scoped_page_sql};
-use super::{SandboxController, SandboxPageCursor};
+use crate::controllers::sandbox::{SandboxController, SandboxPageCursor, sandbox_query};
 use crate::controllers::{ControllerError, db_contention_error};
 use crate::models::{Sandbox, SandboxResourceType};
 
@@ -38,7 +39,6 @@ pub struct AdminSandboxFilter {
     /// The row's own template (`sandboxes.template_id`), not the fallbacks
     /// the response's `template` resolves when the row has none.
     pub template: Option<TemplateName>,
-    pub node: Option<NodeAssignment>,
     pub user_id: Option<UserId>,
     /// Created strictly after this instant.
     pub created_after: Option<OffsetDateTime>,
@@ -56,7 +56,6 @@ impl AdminSandboxFilter {
             org_id,
             lifecycles,
             template,
-            node,
             user_id,
             created_after,
             created_before,
@@ -65,22 +64,11 @@ impl AdminSandboxFilter {
         org_id.is_none()
             && lifecycles.is_none()
             && template.is_none()
-            && node.is_none()
             && user_id.is_none()
             && created_after.is_none()
             && created_before.is_none()
             && search.is_none()
     }
-}
-
-/// The node a sandbox is assigned to, as the list response reports it in
-/// `active_node_id`: the direct route's current node when the sandbox has
-/// one, else the row's `active_node_id`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NodeAssignment {
-    Node(NodeId),
-    Assigned,
-    Unassigned,
 }
 
 /// A name or ID prefix. A row matches when its name starts with the prefix
@@ -133,24 +121,19 @@ fn id_prefix_range(prefix: &str) -> Option<(SandboxId, SandboxId)> {
     Some((bound('0')?, bound('f')?))
 }
 
-/// The admin list's sandboxes ($1-$11) after the cursor. `active_node_id` is
-/// the response's (`SANDBOX_COLUMNS`): the direct route's current node, else
-/// the row's.
+/// The admin list's sandboxes ($1-$9) after the cursor, for the page walk.
+/// The filters are the same as [`ADMIN_LIST_SQL`]'s.
 const ADMIN_CANDIDATE_ROWS: &str = "SELECT s.id, s.created_at
     FROM sandboxes s
-    LEFT JOIN sandbox_direct_route_identities direct_route ON direct_route.sandbox_id = s.id
     WHERE ($1::UUID IS NULL OR s.org_id = $1)
       AND ($2::TEXT[] IS NULL OR s.lifecycle = ANY($2::TEXT[]))
       AND ($3::TEXT IS NULL OR s.template_id = $3)
-      AND ($4::UUID IS NULL OR COALESCE(direct_route.current_node_id, s.active_node_id) = $4)
-      AND ($5::BOOLEAN IS NULL
-           OR (COALESCE(direct_route.current_node_id, s.active_node_id) IS NOT NULL) = $5)
-      AND ($6::UUID IS NULL OR s.user_id = $6)
-      AND ($7::TIMESTAMPTZ IS NULL OR s.created_at > $7)
-      AND ($8::TIMESTAMPTZ IS NULL OR s.created_at < $8)
-      AND ($9::TEXT IS NULL
-           OR starts_with(s.name, $9)
-           OR s.id BETWEEN $10::UUID AND $11::UUID)
+      AND ($4::UUID IS NULL OR s.user_id = $4)
+      AND ($5::TIMESTAMPTZ IS NULL OR s.created_at > $5)
+      AND ($6::TIMESTAMPTZ IS NULL OR s.created_at < $6)
+      AND ($7::TEXT IS NULL
+           OR starts_with(s.name, $7)
+           OR s.id BETWEEN $8::UUID AND $9::UUID)
       AND {after_cursor}
     ORDER BY s.created_at DESC, s.id DESC
     LIMIT {max_rows}";
@@ -159,24 +142,46 @@ static ADMIN_PAGE_SQL: LazyLock<String> = LazyLock::new(|| {
     scoped_page_sql(
         ADMIN_CANDIDATE_ROWS,
         &PageWalkParams {
-            cursor_created_at: "$12",
-            cursor_id: "$13",
-            max_rows: "$14",
-            max_bytes: "$15",
-            row_overhead_bytes: "$16",
+            cursor_created_at: "$10",
+            cursor_id: "$11",
+            max_rows: "$12",
+            max_bytes: "$13",
+            row_overhead_bytes: "$14",
             // The admin response carries no `env`.
             lists_env: false,
         },
     )
 });
 
+/// The legacy unpaged list: at most $10 sandboxes matching the filters
+/// ($1-$9, as [`ADMIN_CANDIDATE_ROWS`]'s), newest first.
+static ADMIN_LIST_SQL: LazyLock<String> = LazyLock::new(|| {
+    sandbox_query(
+        "SELECT {sandbox_columns}
+         FROM {sandbox_from}
+         WHERE ($1::UUID IS NULL OR s.org_id = $1)
+           AND ($2::TEXT[] IS NULL OR s.lifecycle = ANY($2::TEXT[]))
+           AND ($3::TEXT IS NULL OR s.template_id = $3)
+           AND ($4::UUID IS NULL OR s.user_id = $4)
+           AND ($5::TIMESTAMPTZ IS NULL OR s.created_at > $5)
+           AND ($6::TIMESTAMPTZ IS NULL OR s.created_at < $6)
+           AND ($7::TEXT IS NULL
+                OR starts_with(s.name, $7)
+                OR s.id BETWEEN $8::UUID AND $9::UUID)
+         ORDER BY s.created_at DESC, s.id DESC
+         LIMIT $10",
+    )
+});
+
 /// Whether a page stops at the list byte budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageBudget {
-    /// [`MAX_SANDBOX_LIST_PAGE_BYTES`], for a page a cursor continues.
+    /// [`MAX_SANDBOX_LIST_PAGE_BYTES`], for a page a cursor continues: the
+    /// page walk.
     Bounded,
-    /// No byte budget: the legacy unpaged array, which has no cursor to
-    /// continue from and answered up to its limit before paging existed.
+    /// No byte budget and no size walk: the legacy unpaged array, which has
+    /// no cursor to continue from and answered up to its limit before paging
+    /// existed.
     Unbounded,
 }
 
@@ -208,6 +213,8 @@ struct SpacedVersionCountRow {
 impl SandboxController {
     /// One admin list page matching `filter`, newest first by `(created_at,
     /// id)`, after `cursor`: at most `limit` rows, and whether more follow.
+    /// A [`PageBudget::Unbounded`] list ignores `cursor` and never says more
+    /// follow.
     pub(crate) async fn admin_sandbox_page(
         &self,
         pool: &PgPool,
@@ -222,34 +229,44 @@ impl SandboxController {
                 .map(|lifecycle| lifecycle.as_str())
                 .collect::<Vec<_>>()
         });
-        let (node_id, assigned) = match filter.node {
-            Some(NodeAssignment::Node(node_id)) => (Some(node_id), None),
-            Some(NodeAssignment::Assigned) => (None, Some(true)),
-            Some(NodeAssignment::Unassigned) => (None, Some(false)),
-            None => (None, None),
-        };
         let id_range = filter.search.as_ref().and_then(|search| search.id_range);
-        let max_bytes = match budget {
-            PageBudget::Bounded => MAX_SANDBOX_LIST_PAGE_BYTES,
-            PageBudget::Unbounded => i64::MAX,
-        };
+        let template = filter.template.as_ref().map(TemplateName::as_str);
+        let prefix = filter.search.as_ref().map(|search| search.prefix.as_str());
+        if budget == PageBudget::Unbounded {
+            let rows =
+                sqlx::query_as::<_, Sandbox>(sqlx::AssertSqlSafe(sql!(ADMIN_LIST_SQL.as_str())))
+                    .bind(filter.org_id)
+                    .bind(lifecycles)
+                    .bind(template)
+                    .bind(filter.user_id)
+                    .bind(filter.created_after)
+                    .bind(filter.created_before)
+                    .bind(prefix)
+                    .bind(id_range.map(|(low, _)| low))
+                    .bind(id_range.map(|(_, high)| high))
+                    .bind(i64::from(limit))
+                    .fetch_all(pool)
+                    .await?;
+            return Ok(ListPage {
+                rows,
+                has_more: false,
+            });
+        }
         let rows =
             sqlx::query_as::<_, ScopedPageRow>(sqlx::AssertSqlSafe(sql!(ADMIN_PAGE_SQL.as_str())))
                 .bind(filter.org_id)
                 .bind(lifecycles)
-                .bind(filter.template.as_ref().map(TemplateName::as_str))
-                .bind(node_id)
-                .bind(assigned)
+                .bind(template)
                 .bind(filter.user_id)
                 .bind(filter.created_after)
                 .bind(filter.created_before)
-                .bind(filter.search.as_ref().map(|search| search.prefix.as_str()))
+                .bind(prefix)
                 .bind(id_range.map(|(low, _)| low))
                 .bind(id_range.map(|(_, high)| high))
                 .bind(cursor.map(|cursor| cursor.created_at))
                 .bind(cursor.map(|cursor| cursor.id))
                 .bind(i64::from(limit.saturating_add(1)))
-                .bind(max_bytes)
+                .bind(MAX_SANDBOX_LIST_PAGE_BYTES)
                 .bind(SANDBOX_LIST_ROW_OVERHEAD_BYTES)
                 .fetch_all(pool)
                 .await?;

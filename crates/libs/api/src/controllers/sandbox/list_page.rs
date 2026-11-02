@@ -16,6 +16,8 @@ pub(crate) const MAX_SANDBOX_LIST_PAGE_BYTES: i64 = 8 * 1024 * 1024;
 /// of native JSON, up to about 1.1 KB with the longest template reference.
 pub(crate) const SANDBOX_LIST_ROW_OVERHEAD_BYTES: i64 = 2 * 1024;
 
+pub(crate) mod admin;
+
 /// The placeholders of the bound values [`page_rows_cte`] reads, such as
 /// `"$11"`, and the columns it sizes. The caller binds the cursor's
 /// `created_at` and `id` (both NULL for the first page), the most rows to

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use pplx_space_common_core::types::SubstrateKind;
+use pplx_space_common_core::types::{NodeId, SubstrateKind};
 use pplx_space_db_test_fixtures::{TestDbResult, insert_ready_worker_node, pg_test_db};
 use time::Duration;
 
@@ -397,30 +397,6 @@ async fn each_filter_returns_exactly_its_rows() -> TestDbResult<()> {
             &[0, 1, 3],
         ),
         (
-            "node",
-            AdminSandboxFilter {
-                node: Some(NodeAssignment::Node(node_one)),
-                ..AdminSandboxFilter::default()
-            },
-            &[0, 4],
-        ),
-        (
-            "assigned",
-            AdminSandboxFilter {
-                node: Some(NodeAssignment::Assigned),
-                ..AdminSandboxFilter::default()
-            },
-            &[0, 1, 4, 5],
-        ),
-        (
-            "unassigned",
-            AdminSandboxFilter {
-                node: Some(NodeAssignment::Unassigned),
-                ..AdminSandboxFilter::default()
-            },
-            &[2, 3],
-        ),
-        (
             "user",
             AdminSandboxFilter {
                 user_id: Some(first_user.user_id),
@@ -507,7 +483,8 @@ async fn each_filter_returns_exactly_its_rows() -> TestDbResult<()> {
                 org_id: Some(first_org),
                 lifecycles: lifecycles(&["started", "deleted"]),
                 template: template("py"),
-                node: Some(NodeAssignment::Unassigned),
+                user_id: Some(first_user.user_id),
+                created_after: Some(at(2)),
                 ..AdminSandboxFilter::default()
             },
             &[3],
@@ -568,84 +545,6 @@ fn an_id_prefix_is_the_range_of_ids_it_starts() {
     for (prefix, expected) in cases {
         assert_eq!(id_prefix_range(prefix), expected, "{prefix:?}");
     }
-}
-
-/// The node-reported half of `node_id` and `assigned`: a sandbox whose
-/// direct route names a node is on that node, whatever its row's
-/// `active_node_id` says, exactly as the response reports it.
-#[tokio::test]
-async fn the_node_filters_follow_the_direct_route_the_response_reports() -> TestDbResult<()> {
-    let db = pg_test_db().await?;
-    let owner = seed_owner(&db.pool).await?;
-    let (row_node, route_node) = (NodeId::new(), NodeId::new());
-    let moved = seed_sandbox(
-        &db.pool,
-        owner,
-        SeedSandbox {
-            active_node_id: Some(row_node),
-            ..SeedSandbox::default()
-        },
-    )
-    .await?;
-    let routed_only = seed_sandbox(&db.pool, owner, SeedSandbox::default()).await?;
-    let unassigned = seed_sandbox(&db.pool, owner, SeedSandbox::default()).await?;
-    for sandbox_id in [moved, routed_only] {
-        sqlx::query(sql!(
-            "INSERT INTO sandbox_direct_route_identities (
-                 sandbox_id, route_generation, current_node_id, substrate_kind,
-                 execution_generation, activation_attempt_id
-             )
-             VALUES ($1, 1, $2, $3, 1, $4)"
-        ))
-        .bind(sandbox_id)
-        .bind(route_node)
-        .bind(SubstrateKind::Space)
-        .bind(Uuid::now_v7())
-        .execute(&db.pool)
-        .await?;
-    }
-    let filter = |node| AdminSandboxFilter {
-        org_id: Some(owner.org_id),
-        node: Some(node),
-        ..AdminSandboxFilter::default()
-    };
-    let on_route_node = page(
-        &db.pool,
-        &filter(NodeAssignment::Node(route_node)),
-        None,
-        100,
-    )
-    .await?;
-    assert_eq!(
-        on_route_node
-            .rows
-            .iter()
-            .map(|sandbox| sandbox.id)
-            .collect::<Vec<_>>(),
-        [routed_only, moved]
-    );
-    assert!(
-        on_route_node
-            .rows
-            .iter()
-            .all(|sandbox| sandbox.active_node_id == Some(route_node)),
-        "the filter matches the node the response reports"
-    );
-    assert!(
-        listed_ids(&db.pool, &filter(NodeAssignment::Node(row_node)))
-            .await?
-            .is_empty()
-    );
-    assert_eq!(
-        listed_ids(&db.pool, &filter(NodeAssignment::Assigned)).await?,
-        [routed_only, moved]
-    );
-    assert_eq!(
-        listed_ids(&db.pool, &filter(NodeAssignment::Unassigned)).await?,
-        [unassigned]
-    );
-    db.pool.close().await;
-    Ok(())
 }
 
 type Bucket = (
@@ -755,6 +654,9 @@ async fn the_count_is_the_tally_of_the_full_list() -> TestDbResult<()> {
             }),
         ),
         (owner, Some("py"), "deleted", None),
+        // A tombstone whose VM its node still reports: the list shows it
+        // `started`, so the console's tally counts it, and so must the count.
+        (owner, Some("py"), "deleted", Some(started(Some("1.2.0")))),
         // The node's status wins over the stored lifecycle, as in the list.
         (
             owner,

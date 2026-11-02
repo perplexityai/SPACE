@@ -2,6 +2,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request};
 use pplx_space_common_core::sql;
+use pplx_space_common_core::types::NodeId;
 use pplx_space_db_test_fixtures::{TestDbResult, insert_ready_worker_node, pg_test_db};
 use pplx_space_public_api::PublicSandboxId;
 use serde_json::{Value, json};
@@ -10,7 +11,7 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 use super::*;
-use crate::controllers::sandbox::admin_list::tests::{
+use crate::controllers::sandbox::list_page::admin::tests::{
     SeedObservation, SeedSandbox, seed_observation, seed_owner, seed_sandbox,
 };
 
@@ -214,24 +215,21 @@ async fn malformed_list_parameters_answer_400() -> TestDbResult<()> {
     let Some(harness) = harness(db.pool.clone()).await? else {
         return Ok(());
     };
-    let node = NodeId::new();
     for (query, needle) in [
         ("limit=many", "limit"),
         ("org_id=not-a-uuid", "org_id"),
-        ("node_id=not-a-uuid", "node_id"),
         ("user_id=not-a-uuid", "user_id"),
-        ("assigned=maybe", "assigned"),
         (
             "cursor=&lifecycel=started",
             "unknown query parameter \"lifecycel\"",
         ),
+        ("cursor=&node_id=x", "unknown query parameter \"node_id\""),
         ("prefix=a%00b", "NUL"),
         ("cursor=bm90LWEtY3Vyc29y", "invalid cursor"),
         ("cursor=%%%", "invalid"),
         ("lifecycle=started,napping", "unknown lifecycle"),
         ("lifecycle=", "unknown lifecycle"),
         ("template=..", "invalid template"),
-        (&format!("node_id={node}&assigned=false"), "assigned=false"),
         ("created_after=yesterday", "created_after"),
         (
             "created_after=2026-01-02T00:00:00Z&created_before=2026-01-01T00:00:00Z",
@@ -318,7 +316,7 @@ async fn the_list_and_the_count_require_a_managing_org_admin() -> TestDbResult<(
 
 /// The count is its own route, not a sandbox ID, and answers the
 /// controller's buckets for one org on request. Their contents are pinned
-/// against the list in `admin_list::tests`.
+/// against the list in `list_page::admin::tests`.
 #[tokio::test]
 async fn the_spaced_version_count_is_served() -> TestDbResult<()> {
     let db = pg_test_db().await?;

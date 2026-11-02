@@ -1358,7 +1358,6 @@ impl SandboxWakeSignal {
 #[cfg(test)]
 mod reconnect_metrics_tests;
 
-pub(crate) mod admin_list;
 mod ingress;
 pub(crate) mod lifecycle;
 pub(crate) mod list_page;
