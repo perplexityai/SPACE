@@ -1169,8 +1169,17 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
       setErrorStatus(null);
       return true;
     } catch (err: any) {
+      const status = typeof err?.status === 'number' ? err.status : null;
       setError(err.message || 'Failed to load sandbox');
-      setErrorStatus(typeof err?.status === 'number' ? err.status : null);
+      setErrorStatus(status);
+      // Deleted while the page is open: show the not-found view a page
+      // opened after the delete shows, stop the debug reads, and load the
+      // operations now so the delete is listed without waiting a tick.
+      if (status === 404 && sandboxRef.current) {
+        sandboxRef.current = null;
+        setSandbox(null);
+        void loadInsight(false);
+      }
       return false;
     } finally {
       if (showSpinner) setLoading(false);
