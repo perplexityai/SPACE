@@ -1084,18 +1084,27 @@ fn create_precondition_is_terminal_with_controller_evidence() {
     );
 }
 
-/// A template without a release fails the create with a template-specific
-/// code and reason; any other not-found keeps the generic dependency answer.
+/// A template release miss fails the create with a template-specific code and
+/// a reason per cause; any other not-found keeps the generic dependency answer.
 #[test]
 fn create_from_a_template_with_no_release_fails_with_its_own_reason() {
+    use crate::controllers::TemplateReleaseMiss;
     let operation = claimed_create_operation();
     let message = "no release found for template 'synthetic' runtime 'fc' tag 'latest'";
     for (error, code, progress, reason) in [
         (
-            ControllerError::not_found(message).into_template_has_no_release(),
+            ControllerError::not_found(message)
+                .with_template_release_miss(TemplateReleaseMiss::NoRelease),
             PublicErrorCode::FailedPrecondition,
             "template has no published release",
             Some(TEMPLATE_HAS_NO_RELEASE_REASON),
+        ),
+        (
+            ControllerError::not_found(message)
+                .with_template_release_miss(TemplateReleaseMiss::NoMatchingRelease),
+            PublicErrorCode::FailedPrecondition,
+            "no template release matches the requested tag or digest and runtime",
+            Some(TEMPLATE_RELEASE_NOT_FOUND_REASON),
         ),
         (
             ControllerError::not_found(message),

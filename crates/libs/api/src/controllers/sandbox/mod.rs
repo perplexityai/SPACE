@@ -42,7 +42,7 @@ use super::substrate::{
     NodeInventoryEntry, RuntimeClient, SandboxResources, Substrate, SubstrateAdapter,
     SubstrateError, TemplateRef, WaitReadyTimeoutPhase,
 };
-use super::{ControllerError, ControllerRetryAfterCause, db_contention_error};
+use super::{ControllerError, ControllerRetryAfterCause, TemplateReleaseMiss, db_contention_error};
 use crate::controllers::auto_lifecycle::{
     policy_from_proto, status_from_proto, validate_v1_policy,
 };
@@ -161,7 +161,8 @@ fn template_release_not_found(
     let template_name = template.name().as_str();
     if let Some(digest) = template.artifact_digest() {
         return ControllerError::not_found(format!(
-            "no release found for template '{template_name}' hash '{digest}'"
+            "no release found for template '{template_name}' runtime '{}' hash '{digest}'",
+            runtime.alias(),
         ));
     }
     match template.tag() {
@@ -273,7 +274,10 @@ async fn resolve_template_release(
         .await
         .map_err(|err| db_contention_error("failed to resolve template release by hash", &err))?;
 
-        return resolved.ok_or_else(|| template_release_not_found(template, runtime));
+        return match resolved {
+            Some(release) => Ok(release),
+            None => Err(classify_release_miss(pool, template, runtime, caller_org, access).await?),
+        };
     }
 
     let tag = template
@@ -307,14 +311,39 @@ async fn resolve_template_release(
         }
     }
 
+    Err(classify_release_miss(pool, template, runtime, caller_org, access).await?)
+}
+
+/// The error for a template reference whose lookups matched no release.
+///
+/// Status and message are the same whatever the cause, so a synchronous
+/// surface cannot tell the cases apart. Only for a template the gate
+/// authorized does the kind say whether the template has any release at all;
+/// an absent or denied template stays the plain not-found, and the existence
+/// check that tells the two apart runs only then, on the failure path.
+async fn classify_release_miss(
+    pool: &PgPool,
+    template: &TemplateReference,
+    runtime: RuntimeKind,
+    caller_org: OrgId,
+    access: TemplateAccess,
+) -> Result<ControllerError, ControllerError> {
     let not_found = template_release_not_found(template, runtime);
-    // Same status and message either way; only the kind says the caller's own
-    // template exists without a release, so nothing distinguishes an absent
-    // template from a denied one.
-    if matches!(access, TemplateAccess::Authorized { .. }) {
-        return Err(not_found.into_template_has_no_release());
+    if !matches!(access, TemplateAccess::Authorized { .. }) {
+        return Ok(not_found);
     }
-    Err(not_found)
+    let has_release = crate::template_releases_store::template_has_visible_release(
+        pool,
+        template.name(),
+        caller_org,
+    )
+    .await
+    .map_err(|err| db_contention_error("failed to check template releases", &err))?;
+    Ok(not_found.with_template_release_miss(if has_release {
+        TemplateReleaseMiss::NoMatchingRelease
+    } else {
+        TemplateReleaseMiss::NoRelease
+    }))
 }
 
 pub(crate) async fn resolve_template_release_by_tag(

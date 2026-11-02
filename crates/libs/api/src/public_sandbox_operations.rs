@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tracing::Instrument;
 
+use crate::controllers::TemplateReleaseMiss;
 use crate::controllers::sandbox::FederatedSandboxCreateContext;
 use crate::controllers::sandbox::lifecycle::SandboxAction;
 use crate::controllers::sandbox::{SandboxController, fetch_sandbox};
@@ -1314,9 +1315,14 @@ impl CreateSandboxExecutionError {
     }
 }
 
-/// `terminal_error.reason` of a create that named a template the caller may
-/// use but that has no published release to start from.
+/// `terminal_error.reason` of an operation that named a template the caller
+/// may use but that has no published release at all.
 pub(crate) const TEMPLATE_HAS_NO_RELEASE_REASON: &str = "template_has_no_release";
+
+/// `terminal_error.reason` of an operation that named a template the caller
+/// may use, with releases, none of which matches the requested tag or digest
+/// and runtime. `terminal_error.message` names what matched nothing.
+pub(crate) const TEMPLATE_RELEASE_NOT_FOUND_REASON: &str = "template_release_not_found";
 
 fn controller_error_result(
     operation: &ClaimedPublicOperation,
@@ -1346,13 +1352,23 @@ fn controller_error_result(
         };
     }
 
-    if error.is_template_has_no_release() {
+    if let Some(miss) = error.template_release_miss() {
+        let (progress, reason) = match miss {
+            TemplateReleaseMiss::NoRelease => (
+                "template has no published release",
+                TEMPLATE_HAS_NO_RELEASE_REASON,
+            ),
+            TemplateReleaseMiss::NoMatchingRelease => (
+                "no template release matches the requested tag or digest and runtime",
+                TEMPLATE_RELEASE_NOT_FOUND_REASON,
+            ),
+        };
         let mut terminal_error = terminal_error_json(operation, error.to_string());
         if let Some(fields) = terminal_error.as_object_mut() {
-            fields.insert("reason".into(), TEMPLATE_HAS_NO_RELEASE_REASON.into());
+            fields.insert("reason".into(), reason.into());
         }
         return PublicOperationExecutionResult::failed(
-            "template has no published release",
+            progress,
             PublicErrorCode::FailedPrecondition,
             terminal_error,
         );

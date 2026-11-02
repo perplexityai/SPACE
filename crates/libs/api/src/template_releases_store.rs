@@ -71,6 +71,31 @@ pub(crate) async fn resolve_template_release_by_digest(
     Ok(release_id.map(|id| (id, hash)))
 }
 
+/// Whether the template has any release the caller may resolve, whatever its
+/// runtime and tags. Same visibility predicate as the lookups above.
+pub(crate) async fn template_has_visible_release(
+    executor: impl PgExecutor<'_>,
+    template_name: &TemplateName,
+    caller_org: OrgId,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(sql!(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM template_releases r
+             JOIN templates tpl ON tpl.name = r.template_name
+             WHERE r.template_name = $1
+               AND (tpl.visibility = $2 OR tpl.org_id = $3)
+               AND tpl.desired_state = $4
+         )"
+    ))
+    .bind(template_name.as_str())
+    .bind(TemplateVisibility::Generic.as_str())
+    .bind(caller_org.as_uuid())
+    .bind(TemplateDesiredState::Present.as_str())
+    .fetch_one(executor)
+    .await
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ResolveBaseError {
     #[error("base template not found")]
