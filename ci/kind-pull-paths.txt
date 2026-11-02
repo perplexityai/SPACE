@@ -1,6 +1,8 @@
 # Paths whose change runs the Kind smoke in Pull CI, one git glob pathspec per
 # line (`*` stays within a directory, `**` crosses directories). When a PR
-# changes any of them, the required space-pull-ci check also requires Kind.
+# changes any of them, the required space-pull-ci check also requires Kind,
+# unless the PR is a draft that has not opted in: then the check fails until
+# the smoke runs (ci/scripts/kind-pull-needed.sh).
 # Read by ci/scripts/kind-pull-needed.sh; blank lines and comments are ignored.
 .github/workflows/kind-ci.yml
 .github/workflows/pull-ci.yml
