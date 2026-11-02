@@ -50,7 +50,6 @@ mod runtime_environments;
 // `pub(in crate::routes)`: the debug route takes the same sandbox ID forms.
 pub(in crate::routes) mod sandbox_id;
 mod sandbox_list;
-mod sandbox_store;
 mod sandboxes;
 // `pub(in crate::routes)` rather than private: `routes::debug` is mounted
 // inside this router (`debug::admin_v1_debug_router`, merged by `v1_router`

@@ -331,7 +331,7 @@ fn admin_openapi_value() -> Value {
                 "post": {
                     "summary": "Enqueue an audited break-glass sandbox lifecycle operation",
                     "parameters": [
-                        { "name": "sandbox_id", "in": "path", "required": true, "description": "sbx_<uuid>, a dashed or undashed UUID in either case, or the sandbox pod name (space-sbx-<undashed uuid>, optionally with its -g<generation> suffix)", "schema": { "type": "string" } },
+                        { "name": "sandbox_id", "in": "path", "required": true, "description": "sbx_<uuid>, a dashed or undashed UUID in either case, or the sandbox pod name (space-sbx-<undashed uuid>, optionally with its -g<generation> suffix); surrounding whitespace is ignored", "schema": { "type": "string" } },
                         { "name": "action", "in": "path", "required": true, "schema": { "type": "string", "enum": ["start", "stop", "pause", "resume", "suspend", "restore", "wake", "kill", "delete"] } },
                         { "name": "Idempotency-Key", "in": "header", "required": true, "schema": { "type": "string" } }
                     ],
@@ -790,13 +790,13 @@ fn insert_admin_sandbox_create_paths(paths: &mut Map<String, Value>) {
         json!({
             "get": {
                 "summary": "List sandboxes across every organization",
-                "description": "Newest first by created_at, then id. Without cursor the response is a bare array of at most limit sandboxes; with no filter, it is followed by the sandboxes nodes report that have no sandbox row. Pass cursor, empty for the first page, to page: the response is then {sandboxes, next_cursor}, next_cursor is null on the last page, and the node-reported rows come on the first page only. Rows created while paging sort before the cursor and do not appear on later pages. Filters, org_id included, combine and leave out the node-reported rows. Unknown parameters are ignored.",
+                "description": "Newest first by created_at, then id. Without cursor the response is a bare array of at most limit sandboxes; with no filter, it is followed by the sandboxes nodes report that have no sandbox row. Unknown parameters are then ignored, as before paging existed. Pass cursor, empty for the first page, to page: the response is then {sandboxes, next_cursor}, with next_cursor null on the last page. A page holds at most limit sandboxes and stops early at the list byte budget. The node-reported rows come on the first page only, and an unknown parameter answers 400. Each page reads the current matching rows strictly below the supplied (created_at, id) position. Paging is not a snapshot: concurrent changes can affect membership. Keep the filters unchanged between pages. Filters, org_id included, combine and leave out the node-reported rows. A malformed parameter answers 400 with an error message.",
                 "parameters": [
                     { "name": "limit", "in": "query", "required": false, "description": "1 to 5000, default 1000", "schema": { "type": "integer" } },
                     { "name": "cursor", "in": "query", "required": false, "description": "Opaque; empty for the first page, then the previous page's next_cursor", "schema": { "type": "string" } },
                     { "name": "org_id", "in": "query", "required": false, "schema": { "type": "string" } },
-                    { "name": "lifecycle", "in": "query", "required": false, "description": "Comma-separated stored lifecycles, including deleted and cleanup_required. A row's reported lifecycle can differ while its node's observation lags.", "schema": { "type": "string" } },
-                    { "name": "template", "in": "query", "required": false, "description": "The sandbox row's template", "schema": { "type": "string" } },
+                    { "name": "lifecycle", "in": "query", "required": false, "description": "Comma-separated values of the stored lifecycle, including deleted and cleanup_required. No response field shows the stored lifecycle: lifecycle and status report the node's observed status when there is one, so a row can show another value.", "schema": { "type": "string" } },
+                    { "name": "template", "in": "query", "required": false, "description": "The sandbox row's own template. A row without one does not match, although the response's template, like the spaced-version count, falls back to the template its node reports.", "schema": { "type": "string" } },
                     { "name": "node_id", "in": "query", "required": false, "description": "The node reported as active_node_id", "schema": { "type": "string" } },
                     { "name": "assigned", "in": "query", "required": false, "description": "true for sandboxes with an active node, false for those without; false cannot be combined with node_id", "schema": { "type": "boolean" } },
                     { "name": "user_id", "in": "query", "required": false, "schema": { "type": "string" } },
@@ -827,13 +827,14 @@ fn insert_admin_sandbox_create_paths(paths: &mut Map<String, Value>) {
         "/sandboxes/spaced-versions".to_string(),
         json!({
             "get": {
-                "summary": "Count sandboxes by template, spaced version and lifecycle",
-                "description": "Every sandbox that is not deleted, grouped by its template (else the one its node reports), the spaced version its node last reported (null before any report) and its stored lifecycle.",
+                "summary": "Count sandboxes by template, spaced version and status",
+                "description": "The tally of the full sandbox list. Every row whose status is not deleted is grouped by the fields the list response shows for it: template, spaced_version (null before its node reports one), status (the node's observed status, else the stored lifecycle) and resource_type. Without org_id this includes the rows nodes report with no sandbox row, such as warm-pool slots, as the unscoped list does. Unknown parameters answer 400.",
                 "parameters": [
                     { "name": "org_id", "in": "query", "required": false, "schema": { "type": "string" } }
                 ],
                 "responses": {
-                    "200": { "description": "Object with counts (template, spaced_version, lifecycle, count)" }
+                    "200": { "description": "Object with counts (template, spaced_version, status, resource_type, count)" },
+                    "400": { "description": "Invalid org_id or unknown parameter" }
                 }
             }
         }),
@@ -844,7 +845,7 @@ fn insert_admin_sandbox_create_paths(paths: &mut Map<String, Value>) {
             "get": {
                 "summary": "Get a sandbox in any organization",
                 "parameters": [
-                    { "name": "sandbox_id", "in": "path", "required": true, "description": "sbx_<uuid>, a dashed or undashed UUID in either case, or the sandbox pod name (space-sbx-<undashed uuid>, optionally with its -g<generation> suffix)", "schema": { "type": "string" } }
+                    { "name": "sandbox_id", "in": "path", "required": true, "description": "sbx_<uuid>, a dashed or undashed UUID in either case, or the sandbox pod name (space-sbx-<undashed uuid>, optionally with its -g<generation> suffix); surrounding whitespace is ignored", "schema": { "type": "string" } }
                 ],
                 "responses": {
                     "200": { "description": "Sandbox" },
@@ -855,7 +856,7 @@ fn insert_admin_sandbox_create_paths(paths: &mut Map<String, Value>) {
             "patch": {
                 "summary": "Enqueue a sandbox update (network policy, auto-lifecycle, metadata) under the sandbox's owning organization",
                 "parameters": [
-                    { "name": "sandbox_id", "in": "path", "required": true, "description": "sbx_<uuid>, a dashed or undashed UUID in either case, or the sandbox pod name (space-sbx-<undashed uuid>, optionally with its -g<generation> suffix)", "schema": { "type": "string" } },
+                    { "name": "sandbox_id", "in": "path", "required": true, "description": "sbx_<uuid>, a dashed or undashed UUID in either case, or the sandbox pod name (space-sbx-<undashed uuid>, optionally with its -g<generation> suffix); surrounding whitespace is ignored", "schema": { "type": "string" } },
                     { "name": "Idempotency-Key", "in": "header", "required": true, "schema": { "type": "string" } }
                 ],
                 "responses": {

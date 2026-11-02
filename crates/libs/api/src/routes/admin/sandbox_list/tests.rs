@@ -10,8 +10,8 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 use super::*;
-use crate::routes::admin::sandbox_store::tests::{
-    SeedSandbox, seed_observation, seed_owner, seed_sandbox,
+use crate::controllers::sandbox::admin_list::tests::{
+    SeedObservation, SeedSandbox, seed_observation, seed_owner, seed_sandbox,
 };
 
 const SEED_ORG: Uuid = pplx_space_db_test_fixtures::SEED_ORG_ID;
@@ -51,17 +51,27 @@ async fn insert_session_user(pool: &PgPool, role: &str) -> TestDbResult<String> 
     Ok(token)
 }
 
-async fn harness(pool: PgPool) -> TestDbResult<Harness> {
+/// `None` when this test process cannot pin the environment
+/// `AppState::from_pool` reads.
+async fn harness(pool: PgPool) -> TestDbResult<Option<Harness>> {
+    // `AppState::from_pool` picks its substrate from the environment; keep it
+    // Direct so construction never reaches a cluster.
+    if !pplx_space_test_env::enter_test_process(&[(
+        "SPACE_K8S_CONTROL_PLANE",
+        Some(std::ffi::OsStr::new("false")),
+    )]) {
+        return Ok(None);
+    }
     let admin_token = insert_session_user(&pool, "organization_admin").await?;
     let member_token = insert_session_user(&pool, "member").await?;
     let state = AppState::from_pool(pool.clone()).await?;
     let app = crate::routes::admin::shared_host_router(state.clone()).with_state(state);
-    Ok(Harness {
+    Ok(Some(Harness {
         pool,
         app,
         admin_token,
         member_token,
-    })
+    }))
 }
 
 impl Harness {
@@ -112,7 +122,9 @@ fn ids(rows: &Value) -> Vec<String> {
 #[tokio::test]
 async fn the_list_pages_by_cursor_and_keeps_the_unpaged_array() -> TestDbResult<()> {
     let db = pg_test_db().await?;
-    let harness = harness(db.pool.clone()).await?;
+    let Some(harness) = harness(db.pool.clone()).await? else {
+        return Ok(());
+    };
     let owner = seed_owner(&harness.pool).await?;
     let mut seeded = Vec::new();
     for _ in 0..5 {
@@ -127,8 +139,12 @@ async fn the_list_pages_by_cursor_and_keeps_the_unpaged_array() -> TestDbResult<
         &harness.pool,
         node_only.parse().expect("sandbox id"),
         node_id,
-        Some("py"),
-        Some("1.0.0"),
+        SeedObservation {
+            status: Some("started"),
+            pool_template: Some("py"),
+            spaced_version: Some("1.0.0"),
+            ..SeedObservation::default()
+        },
     )
     .await?;
     let with_node_only = |rows: &[String]| {
@@ -171,9 +187,11 @@ async fn the_list_pages_by_cursor_and_keeps_the_unpaged_array() -> TestDbResult<
             }
             walked.extend(rows);
             pages += 1;
-            match page["next_cursor"].as_str() {
-                Some(next) => cursor = next.to_string(),
-                None => break,
+            match page.get("next_cursor") {
+                Some(Value::String(next)) => cursor = next.clone(),
+                // `null`, never absent, on the last page.
+                Some(Value::Null) => break,
+                other => panic!("{scope}: next_cursor {other:?}"),
             }
         }
         assert_eq!(pages, 3, "{scope}");
@@ -188,12 +206,26 @@ async fn the_list_pages_by_cursor_and_keeps_the_unpaged_array() -> TestDbResult<
     Ok(())
 }
 
+/// Every malformed parameter, typed ones included, answers 400 with the
+/// admin JSON `error`; with `cursor`, so does an unknown parameter.
 #[tokio::test]
 async fn malformed_list_parameters_answer_400() -> TestDbResult<()> {
     let db = pg_test_db().await?;
-    let harness = harness(db.pool.clone()).await?;
+    let Some(harness) = harness(db.pool.clone()).await? else {
+        return Ok(());
+    };
     let node = NodeId::new();
     for (query, needle) in [
+        ("limit=many", "limit"),
+        ("org_id=not-a-uuid", "org_id"),
+        ("node_id=not-a-uuid", "node_id"),
+        ("user_id=not-a-uuid", "user_id"),
+        ("assigned=maybe", "assigned"),
+        (
+            "cursor=&lifecycel=started",
+            "unknown query parameter \"lifecycel\"",
+        ),
+        ("prefix=a%00b", "NUL"),
         ("cursor=bm90LWEtY3Vyc29y", "invalid cursor"),
         ("cursor=%%%", "invalid"),
         ("lifecycle=started,napping", "unknown lifecycle"),
@@ -208,10 +240,57 @@ async fn malformed_list_parameters_answer_400() -> TestDbResult<()> {
     ] {
         let (status, body) = harness.get(&format!("/sandboxes?{query}")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
-        let message = body["error"]
-            .as_str()
-            .unwrap_or(body.as_str().unwrap_or_default());
+        let message = body["error"].as_str().unwrap_or_default();
         assert!(message.contains(needle), "{query}: {body}");
+    }
+    for query in ["org_id=not-a-uuid", "template=py"] {
+        let (status, body) = harness
+            .get(&format!("/sandboxes/spaced-versions?{query}"))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+        assert!(body["error"].is_string(), "{query}: {body}");
+    }
+    // Without `cursor`, an unknown parameter is ignored, as before paging.
+    let (status, body) = harness.get("/sandboxes?lifecycel=started").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.is_array(), "{body}");
+    db.pool.close().await;
+    Ok(())
+}
+
+/// Postgres keeps microseconds, so a `created_before` inside a microsecond
+/// still includes a row created at its start.
+#[tokio::test]
+async fn created_before_keeps_a_row_inside_its_microsecond() -> TestDbResult<()> {
+    let db = pg_test_db().await?;
+    let Some(harness) = harness(db.pool.clone()).await? else {
+        return Ok(());
+    };
+    let owner = seed_owner(&harness.pool).await?;
+    let created_at = OffsetDateTime::from_unix_timestamp(1_790_000_000).expect("timestamp");
+    let sandbox_id = seed_sandbox(
+        &harness.pool,
+        owner,
+        SeedSandbox {
+            created_at: Some(created_at),
+            ..SeedSandbox::default()
+        },
+    )
+    .await?;
+    let org = owner.org_id.as_uuid();
+    for (before, expected) in [
+        (
+            "2026-09-21T14:13:20.000000500Z",
+            vec![sandbox_id.to_string()],
+        ),
+        ("2026-09-21T14:13:20.000001Z", vec![sandbox_id.to_string()]),
+        ("2026-09-21T14:13:20Z", vec![]),
+    ] {
+        let (status, body) = harness
+            .get(&format!("/sandboxes?org_id={org}&created_before={before}"))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{before}: {body}");
+        assert_eq!(ids(&body), expected, "{before}");
     }
     db.pool.close().await;
     Ok(())
@@ -220,7 +299,9 @@ async fn malformed_list_parameters_answer_400() -> TestDbResult<()> {
 #[tokio::test]
 async fn the_list_and_the_count_require_a_managing_org_admin() -> TestDbResult<()> {
     let db = pg_test_db().await?;
-    let harness = harness(db.pool.clone()).await?;
+    let Some(harness) = harness(db.pool.clone()).await? else {
+        return Ok(());
+    };
     for path in [
         "/sandboxes",
         "/sandboxes?cursor=",
@@ -235,12 +316,15 @@ async fn the_list_and_the_count_require_a_managing_org_admin() -> TestDbResult<(
     Ok(())
 }
 
-/// The count is its own route, not a sandbox ID, and answers the store's
-/// rows for one org on request.
+/// The count is its own route, not a sandbox ID, and answers the
+/// controller's buckets for one org on request. Their contents are pinned
+/// against the list in `admin_list::tests`.
 #[tokio::test]
 async fn the_spaced_version_count_is_served() -> TestDbResult<()> {
     let db = pg_test_db().await?;
-    let harness = harness(db.pool.clone()).await?;
+    let Some(harness) = harness(db.pool.clone()).await? else {
+        return Ok(());
+    };
     let owner = seed_owner(&harness.pool).await?;
     let node_id = NodeId::new();
     insert_ready_worker_node(&harness.pool, node_id).await?;
@@ -253,7 +337,17 @@ async fn the_spaced_version_count_is_served() -> TestDbResult<()> {
         },
     )
     .await?;
-    seed_observation(&harness.pool, sandbox_id, node_id, None, Some("1.4.0")).await?;
+    seed_observation(
+        &harness.pool,
+        sandbox_id,
+        node_id,
+        SeedObservation {
+            status: Some("started"),
+            spaced_version: Some("1.4.0"),
+            ..SeedObservation::default()
+        },
+    )
+    .await?;
     let (status, body) = harness
         .get(&format!(
             "/sandboxes/spaced-versions?org_id={}",
@@ -264,7 +358,13 @@ async fn the_spaced_version_count_is_served() -> TestDbResult<()> {
     assert_eq!(
         body,
         json!({"counts": [
-            {"template": "py", "spaced_version": "1.4.0", "lifecycle": "started", "count": 1}
+            {
+                "template": "py",
+                "spaced_version": "1.4.0",
+                "status": "started",
+                "resource_type": "sandbox",
+                "count": 1
+            }
         ]})
     );
     let (status, body) = harness.get("/sandboxes/spaced-versions?template=py").await;
@@ -278,7 +378,9 @@ async fn the_spaced_version_count_is_served() -> TestDbResult<()> {
 #[tokio::test]
 async fn every_admin_sandbox_route_takes_every_id_form() -> TestDbResult<()> {
     let db = pg_test_db().await?;
-    let harness = harness(db.pool.clone()).await?;
+    let Some(harness) = harness(db.pool.clone()).await? else {
+        return Ok(());
+    };
     let owner = seed_owner(&harness.pool).await?;
     let sandbox_id = seed_sandbox(&harness.pool, owner, SeedSandbox::default()).await?;
     let public_id = PublicSandboxId::from(sandbox_id).to_string();

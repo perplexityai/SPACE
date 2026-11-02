@@ -24,6 +24,8 @@ fn every_accepted_form_names_the_same_sandbox() {
         format!("space-sbx-{undashed}-g0"),
         format!("space-sbx-{undashed}-g17"),
         format!("space-sbx-{undashed}"),
+        format!(" {UUID}\t"),
+        format!("\nsbx_{UUID} "),
     ];
     for form in accepted {
         assert_eq!(
@@ -55,8 +57,6 @@ fn unknown_forms_are_refused() {
         format!("{{{UUID}}}"),
         format!("urn:uuid:{UUID}"),
         format!("sbx_{{{UUID}}}"),
-        format!(" {UUID}"),
-        format!("{UUID} "),
         format!("sandbox:{UUID}"),
         UUID.chars().take(35).collect(),
         undashed.chars().take(31).collect(),

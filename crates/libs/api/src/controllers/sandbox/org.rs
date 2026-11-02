@@ -39,12 +39,13 @@ pub enum SandboxAccessScope {
     },
 }
 
-/// A sandbox on an ECW list page and whether another sandbox follows it.
+/// A sandbox on an ECW or admin list page and whether another sandbox
+/// follows it.
 #[derive(sqlx::FromRow)]
-struct ScopedPageRow {
+pub(super) struct ScopedPageRow {
     #[sqlx(flatten)]
-    sandbox: Sandbox,
-    has_next: bool,
+    pub(super) sandbox: Sandbox,
+    pub(super) has_next: bool,
 }
 
 /// The local org's sandboxes ($1) after the cursor, matching the metadata
@@ -120,9 +121,9 @@ static FEDERATED_SUBJECT_PAGE_SQL: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
-/// An ECW list page statement: the page walk over `candidate_rows`, then the
-/// full sandbox row of each page row.
-fn scoped_page_sql(candidate_rows: &str, params: &PageWalkParams) -> String {
+/// A list page statement, ECW or admin: the page walk over `candidate_rows`,
+/// then the full sandbox row of each page row.
+pub(super) fn scoped_page_sql(candidate_rows: &str, params: &PageWalkParams) -> String {
     let page_rows = page_rows_cte(candidate_rows, params);
     sandbox_query(&format!(
         "{page_rows}

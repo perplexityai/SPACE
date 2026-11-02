@@ -1,18 +1,21 @@
+use std::collections::BTreeMap;
+
 use pplx_space_common_core::types::SubstrateKind;
 use pplx_space_db_test_fixtures::{TestDbResult, insert_ready_worker_node, pg_test_db};
-use sqlx::PgPool;
 use time::Duration;
 
 use super::*;
+use crate::controllers::sandbox::SandboxController;
+use crate::models::SandboxResponse;
 
 /// An org and one of its users, for seeded sandboxes to belong to.
 #[derive(Debug, Clone, Copy)]
-pub(in crate::routes::admin) struct Owner {
-    pub(in crate::routes::admin) org_id: OrgId,
-    pub(in crate::routes::admin) user_id: UserId,
+pub(crate) struct Owner {
+    pub(crate) org_id: OrgId,
+    pub(crate) user_id: UserId,
 }
 
-pub(in crate::routes::admin) async fn seed_org(pool: &PgPool) -> TestDbResult<OrgId> {
+pub(crate) async fn seed_org(pool: &PgPool) -> TestDbResult<OrgId> {
     let id = Uuid::now_v7();
     sqlx::query(sql!(
         "INSERT INTO organizations (id, name, slug, byok_enabled)
@@ -26,10 +29,7 @@ pub(in crate::routes::admin) async fn seed_org(pool: &PgPool) -> TestDbResult<Or
     Ok(OrgId::from_uuid(id))
 }
 
-pub(in crate::routes::admin) async fn seed_user(
-    pool: &PgPool,
-    org_id: OrgId,
-) -> TestDbResult<Owner> {
+pub(crate) async fn seed_user(pool: &PgPool, org_id: OrgId) -> TestDbResult<Owner> {
     let user_id = UserId::new();
     sqlx::query(sql!(
         "INSERT INTO users (id, email, password_hash, display_name, org_id, role)
@@ -43,23 +43,23 @@ pub(in crate::routes::admin) async fn seed_user(
     Ok(Owner { org_id, user_id })
 }
 
-pub(in crate::routes::admin) async fn seed_owner(pool: &PgPool) -> TestDbResult<Owner> {
+pub(crate) async fn seed_owner(pool: &PgPool) -> TestDbResult<Owner> {
     let org_id = seed_org(pool).await?;
     seed_user(pool, org_id).await
 }
 
 /// A sandbox row to seed; unset fields take the column defaults.
 #[derive(Debug, Clone, Default)]
-pub(in crate::routes::admin) struct SeedSandbox {
-    pub(in crate::routes::admin) id: Option<SandboxId>,
-    pub(in crate::routes::admin) name: Option<&'static str>,
-    pub(in crate::routes::admin) lifecycle: Option<&'static str>,
-    pub(in crate::routes::admin) template: Option<&'static str>,
-    pub(in crate::routes::admin) active_node_id: Option<NodeId>,
-    pub(in crate::routes::admin) created_at: Option<OffsetDateTime>,
+pub(crate) struct SeedSandbox {
+    pub(crate) id: Option<SandboxId>,
+    pub(crate) name: Option<&'static str>,
+    pub(crate) lifecycle: Option<&'static str>,
+    pub(crate) template: Option<&'static str>,
+    pub(crate) active_node_id: Option<NodeId>,
+    pub(crate) created_at: Option<OffsetDateTime>,
 }
 
-pub(in crate::routes::admin) async fn seed_sandbox(
+pub(crate) async fn seed_sandbox(
     pool: &PgPool,
     owner: Owner,
     seed: SeedSandbox,
@@ -87,25 +87,59 @@ pub(in crate::routes::admin) async fn seed_sandbox(
     Ok(id)
 }
 
-/// What a node reports for `sandbox_id`, which need not have a sandbox row.
-pub(in crate::routes::admin) async fn seed_observation(
+/// What a node reports for a sandbox, which need not have a sandbox row.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SeedObservation {
+    pub(crate) status: Option<&'static str>,
+    pub(crate) template: Option<&'static str>,
+    pub(crate) pool_template: Option<&'static str>,
+    pub(crate) image_hash: Option<&'static str>,
+    pub(crate) spaced_version: Option<&'static str>,
+}
+
+pub(crate) async fn seed_observation(
     pool: &PgPool,
     sandbox_id: SandboxId,
     node_id: NodeId,
-    template: Option<&str>,
-    spaced_version: Option<&str>,
+    seed: SeedObservation,
 ) -> TestDbResult<()> {
     sqlx::query(sql!(
-        "INSERT INTO sandbox_observed_states (sandbox_id, node_id, status, template, spaced_version)
-         VALUES ($1, $2, 'started', $3, $4)"
+        "INSERT INTO sandbox_observed_states (
+             sandbox_id, node_id, status, template, pool_template, image_hash, spaced_version
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7)"
     ))
     .bind(sandbox_id)
     .bind(node_id)
-    .bind(template)
-    .bind(spaced_version)
+    .bind(seed.status)
+    .bind(seed.template)
+    .bind(seed.pool_template)
+    .bind(seed.image_hash)
+    .bind(seed.spaced_version)
     .execute(pool)
     .await?;
     Ok(())
+}
+
+fn controller(pool: &PgPool) -> SandboxController {
+    SandboxController::new(crate::test_support::direct_substrate(pool))
+}
+
+/// One page of the list, with no byte budget unless `budget` says so.
+async fn page(
+    pool: &PgPool,
+    filter: &AdminSandboxFilter,
+    after: Option<SandboxPageCursor>,
+    limit: u32,
+) -> Result<ListPage<Sandbox>, sqlx::Error> {
+    controller(pool)
+        .admin_sandbox_page(pool, filter, after, limit, PageBudget::Bounded)
+        .await
+}
+
+async fn listed_ids(pool: &PgPool, filter: &AdminSandboxFilter) -> TestDbResult<Vec<SandboxId>> {
+    let page = page(pool, filter, None, 100).await?;
+    Ok(page.rows.iter().map(|sandbox| sandbox.id).collect())
 }
 
 fn base_time() -> OffsetDateTime {
@@ -121,10 +155,11 @@ fn cursor_after(sandbox: &Sandbox) -> SandboxPageCursor {
 
 /// Walking the list a page at a time returns every row that existed when the
 /// walk began exactly once, in list order, although rows sharing a
-/// `created_at` straddle page boundaries and new rows land between pages.
+/// `created_at` straddle page boundaries and rows created later land between
+/// pages.
 #[tokio::test]
 async fn pages_return_every_row_once_while_rows_are_inserted() -> TestDbResult<()> {
-    const PAGE: usize = 2;
+    const PAGE: u32 = 2;
     let db = pg_test_db().await?;
     let owner = seed_owner(&db.pool).await?;
     let mut existing = Vec::new();
@@ -151,15 +186,14 @@ async fn pages_return_every_row_once_while_rows_are_inserted() -> TestDbResult<(
     let mut seen = Vec::new();
     let mut after = None;
     loop {
-        let mut page = list_sandboxes(&db.pool, &filter, after, PAGE as i64 + 1).await?;
+        let page = page(&db.pool, &filter, after, PAGE).await?;
         seed_sandbox(&db.pool, owner, SeedSandbox::default()).await?;
-        let more = page.len() > PAGE;
-        page.truncate(PAGE);
-        seen.extend(page.iter().map(|sandbox| sandbox.id));
-        if !more {
+        assert!(page.rows.len() <= PAGE as usize);
+        seen.extend(page.rows.iter().map(|sandbox| sandbox.id));
+        if !page.has_more {
             break;
         }
-        after = page.last().map(cursor_after);
+        after = page.rows.last().map(cursor_after);
     }
     let expected = existing.iter().map(|(_, id)| *id).collect::<Vec<_>>();
     assert_eq!(seen, expected);
@@ -197,7 +231,7 @@ async fn the_first_page_is_the_list_from_before_paging() -> TestDbResult<()> {
                  ORDER BY s.created_at DESC, s.id DESC
                  LIMIT $1"
             ))
-            .bind(limit)
+            .bind(i64::from(limit))
             .bind(org_id)
             .fetch_all(&db.pool)
             .await?;
@@ -205,8 +239,14 @@ async fn the_first_page_is_the_list_from_before_paging() -> TestDbResult<()> {
                 org_id,
                 ..AdminSandboxFilter::default()
             };
-            let listed = list_sandboxes(&db.pool, &filter, None, limit).await?;
-            let listed = listed.iter().map(|sandbox| sandbox.id).collect::<Vec<_>>();
+            let listed = controller(&db.pool)
+                .admin_sandbox_page(&db.pool, &filter, None, limit, PageBudget::Unbounded)
+                .await?;
+            let listed = listed
+                .rows
+                .iter()
+                .map(|sandbox| sandbox.id)
+                .collect::<Vec<_>>();
             assert_eq!(listed, legacy, "org {org_id:?}, limit {limit}");
         }
     }
@@ -474,8 +514,7 @@ async fn each_filter_returns_exactly_its_rows() -> TestDbResult<()> {
         ),
     ];
     for (case, filter, expected) in cases {
-        let listed = list_sandboxes(&db.pool, &filter, None, 100).await?;
-        let listed = listed.iter().map(|sandbox| sandbox.id).collect::<Vec<_>>();
+        let listed = listed_ids(&db.pool, &filter).await?;
         // Newest first, so the expected rows in reverse seed order.
         let expected = expected
             .iter()
@@ -531,30 +570,208 @@ fn an_id_prefix_is_the_range_of_ids_it_starts() {
     }
 }
 
-/// A node report seeded with a row: its template and `spaced` version.
-type SeedObservation = (Option<&'static str>, &'static str);
-
-/// The count groups every sandbox that is not deleted by template, reported
-/// `spaced` version and stored lifecycle, and narrows to one org on request.
+/// The node-reported half of `node_id` and `assigned`: a sandbox whose
+/// direct route names a node is on that node, whatever its row's
+/// `active_node_id` says, exactly as the response reports it.
 #[tokio::test]
-async fn sandboxes_count_by_template_version_and_lifecycle() -> TestDbResult<()> {
+async fn the_node_filters_follow_the_direct_route_the_response_reports() -> TestDbResult<()> {
+    let db = pg_test_db().await?;
+    let owner = seed_owner(&db.pool).await?;
+    let (row_node, route_node) = (NodeId::new(), NodeId::new());
+    let moved = seed_sandbox(
+        &db.pool,
+        owner,
+        SeedSandbox {
+            active_node_id: Some(row_node),
+            ..SeedSandbox::default()
+        },
+    )
+    .await?;
+    let routed_only = seed_sandbox(&db.pool, owner, SeedSandbox::default()).await?;
+    let unassigned = seed_sandbox(&db.pool, owner, SeedSandbox::default()).await?;
+    for sandbox_id in [moved, routed_only] {
+        sqlx::query(sql!(
+            "INSERT INTO sandbox_direct_route_identities (
+                 sandbox_id, route_generation, current_node_id, substrate_kind,
+                 execution_generation, activation_attempt_id
+             )
+             VALUES ($1, 1, $2, $3, 1, $4)"
+        ))
+        .bind(sandbox_id)
+        .bind(route_node)
+        .bind(SubstrateKind::Space)
+        .bind(Uuid::now_v7())
+        .execute(&db.pool)
+        .await?;
+    }
+    let filter = |node| AdminSandboxFilter {
+        org_id: Some(owner.org_id),
+        node: Some(node),
+        ..AdminSandboxFilter::default()
+    };
+    let on_route_node = page(
+        &db.pool,
+        &filter(NodeAssignment::Node(route_node)),
+        None,
+        100,
+    )
+    .await?;
+    assert_eq!(
+        on_route_node
+            .rows
+            .iter()
+            .map(|sandbox| sandbox.id)
+            .collect::<Vec<_>>(),
+        [routed_only, moved]
+    );
+    assert!(
+        on_route_node
+            .rows
+            .iter()
+            .all(|sandbox| sandbox.active_node_id == Some(route_node)),
+        "the filter matches the node the response reports"
+    );
+    assert!(
+        listed_ids(&db.pool, &filter(NodeAssignment::Node(row_node)))
+            .await?
+            .is_empty()
+    );
+    assert_eq!(
+        listed_ids(&db.pool, &filter(NodeAssignment::Assigned)).await?,
+        [routed_only, moved]
+    );
+    assert_eq!(
+        listed_ids(&db.pool, &filter(NodeAssignment::Unassigned)).await?,
+        [unassigned]
+    );
+    db.pool.close().await;
+    Ok(())
+}
+
+type Bucket = (
+    Option<String>,
+    Option<SemVer>,
+    Option<String>,
+    SandboxResourceType,
+);
+
+/// The tally the console draws from the list: every row whose status (else
+/// lifecycle) is not `deleted`, by the fields the list response shows.
+fn tally(responses: &[SandboxResponse]) -> BTreeMap<String, i64> {
+    let mut buckets = BTreeMap::new();
+    for response in responses {
+        if response.status.as_deref().or(response.lifecycle.as_deref()) == Some("deleted") {
+            continue;
+        }
+        let bucket: Bucket = (
+            response.template.clone(),
+            response.spaced_version.clone(),
+            response.status.clone(),
+            response.resource_type,
+        );
+        *buckets.entry(format!("{bucket:?}")).or_insert(0) += 1;
+    }
+    buckets
+}
+
+fn counted(counts: &[SpacedVersionCount]) -> BTreeMap<String, i64> {
+    counts
+        .iter()
+        .map(|count| {
+            let bucket: Bucket = (
+                count.template.clone(),
+                count.spaced_version.clone(),
+                count.status.clone(),
+                count.resource_type,
+            );
+            (format!("{bucket:?}"), count.count)
+        })
+        .collect()
+}
+
+/// The count is the console's tally of the full list: the same template
+/// (including the node inventory's), version, status and resource type the
+/// list response shows, the node-reported rows with no sandbox row in the
+/// unscoped count only, and nothing whose status is `deleted`. The oracle is
+/// the list's own projection (`list_responses`) over every listed row.
+#[tokio::test]
+async fn the_count_is_the_tally_of_the_full_list() -> TestDbResult<()> {
     let db = pg_test_db().await?;
     let owner = seed_owner(&db.pool).await?;
     let other = seed_owner(&db.pool).await?;
     let node_id = NodeId::new();
     insert_ready_worker_node(&db.pool, node_id).await?;
-    let rows: [(Owner, Option<&str>, &str, Option<SeedObservation>); 6] = [
-        (owner, Some("py"), "started", Some((None, "1.2.0"))),
+    sqlx::query(sql!(
+        "INSERT INTO templates (id, name) VALUES ($1, 'inventoried')"
+    ))
+    .bind(Uuid::now_v7())
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_template_inventory (node_id, template_name, content_hash)
+         VALUES ($1, 'inventoried', 'sha256:inventoried')"
+    ))
+    .bind(node_id)
+    .execute(&db.pool)
+    .await?;
+    let started = |spaced_version| SeedObservation {
+        status: Some("started"),
+        spaced_version,
+        ..SeedObservation::default()
+    };
+    let rows: Vec<(
+        Owner,
+        Option<&'static str>,
+        &'static str,
+        Option<SeedObservation>,
+    )> = vec![
+        (owner, Some("py"), "started", Some(started(Some("1.2.0")))),
         (
             owner,
             Some("py"),
             "started",
-            Some((Some("ignored"), "1.2.0")),
+            Some(SeedObservation {
+                template: Some("ignored"),
+                ..started(Some("1.2.0"))
+            }),
         ),
         (owner, Some("py"), "suspended", None),
-        (owner, None, "started", Some((Some("observed"), "1.3.0"))),
-        (owner, Some("py"), "deleted", Some((None, "1.2.0"))),
-        (other, Some("py"), "started", Some((None, "1.2.0"))),
+        (
+            owner,
+            None,
+            "started",
+            Some(SeedObservation {
+                image_hash: Some("sha256:inventoried"),
+                ..started(Some("1.3.0"))
+            }),
+        ),
+        (
+            owner,
+            None,
+            "started",
+            Some(SeedObservation {
+                template: Some("reported"),
+                ..started(None)
+            }),
+        ),
+        (owner, Some("py"), "deleted", None),
+        // The node's status wins over the stored lifecycle, as in the list.
+        (
+            owner,
+            Some("py"),
+            "cleanup_required",
+            Some(started(Some("1.2.0"))),
+        ),
+        (
+            owner,
+            Some("py"),
+            "deleted",
+            Some(SeedObservation {
+                status: Some("deleted"),
+                ..SeedObservation::default()
+            }),
+        ),
+        (other, Some("py"), "started", Some(started(Some("1.2.0")))),
     ];
     for (row_owner, template, lifecycle, observed) in rows {
         let id = seed_sandbox(
@@ -567,30 +784,64 @@ async fn sandboxes_count_by_template_version_and_lifecycle() -> TestDbResult<()>
             },
         )
         .await?;
-        if let Some((observed_template, version)) = observed {
-            seed_observation(&db.pool, id, node_id, observed_template, Some(version)).await?;
+        if let Some(observed) = observed {
+            seed_observation(&db.pool, id, node_id, observed).await?;
         }
     }
-    let count =
-        |template: &str, version: Option<&str>, lifecycle: &str, count| SpacedVersionCount {
-            template: Some(template.to_string()),
-            spaced_version: version.map(str::to_string),
-            lifecycle: lifecycle.to_string(),
-            count,
+    // Rowless: a warm-pool slot and an observed-local sandbox.
+    seed_observation(
+        &db.pool,
+        SandboxId::new(),
+        node_id,
+        SeedObservation {
+            pool_template: Some("pooled"),
+            ..started(Some("1.2.0"))
+        },
+    )
+    .await?;
+    seed_observation(
+        &db.pool,
+        SandboxId::new(),
+        node_id,
+        SeedObservation::default(),
+    )
+    .await?;
+
+    let controller = controller(&db.pool);
+    for org_id in [None, Some(owner.org_id), Some(other.org_id)] {
+        let filter = AdminSandboxFilter {
+            org_id,
+            ..AdminSandboxFilter::default()
         };
-    let everywhere = count_by_spaced_version(&db.pool, None).await?;
-    assert_eq!(
-        everywhere,
-        [
-            count("observed", Some("1.3.0"), "started", 1),
-            count("py", Some("1.2.0"), "started", 3),
-            count("py", None, "suspended", 1),
-        ]
+        let listed = controller
+            .admin_sandbox_page(&db.pool, &filter, None, 1000, PageBudget::Unbounded)
+            .await?;
+        let responses = controller
+            .list_responses(&db.pool, &listed.rows, filter.is_unfiltered())
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        let counts = controller
+            .admin_spaced_version_counts(&db.pool, org_id)
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        assert_eq!(counted(&counts), tally(&responses), "org {org_id:?}");
+    }
+    let everywhere = controller
+        .admin_spaced_version_counts(&db.pool, None)
+        .await
+        .map_err(|error| format!("{error:?}"))?;
+    let has = |template: &str, resource_type| {
+        everywhere.iter().any(|count| {
+            count.template.as_deref() == Some(template) && count.resource_type == resource_type
+        })
+    };
+    assert!(has("inventoried", SandboxResourceType::Sandbox));
+    assert!(has("pooled", SandboxResourceType::PoolSlot));
+    assert!(
+        everywhere
+            .iter()
+            .any(|count| count.resource_type == SandboxResourceType::ObservedLocal)
     );
-    let in_other = count_by_spaced_version(&db.pool, Some(other.org_id)).await?;
-    assert_eq!(in_other, [count("py", Some("1.2.0"), "started", 1)]);
-    let none_seen = count_by_spaced_version(&db.pool, Some(seed_org(&db.pool).await?)).await?;
-    assert!(none_seen.is_empty());
     db.pool.close().await;
     Ok(())
 }

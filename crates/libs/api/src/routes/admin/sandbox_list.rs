@@ -7,20 +7,21 @@ use std::str::FromStr;
 use axum::{
     Extension, Json,
     extract::{Query, State},
-    http::StatusCode,
+    http::{StatusCode, Uri},
     response::IntoResponse,
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use pplx_space_common_core::types::{NodeId, OrgId, SandboxId, TemplateName, UserId};
 use pplx_space_placement::StoredSandboxLifecycle;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use super::sandbox_store::{
-    self, AdminSandboxFilter, NodeAssignment, SandboxSearch, SpacedVersionCount,
-};
 use super::support::{self, ContentionScope, api_error, require_managing_org_admin};
 use crate::controllers::sandbox::SandboxPageCursor;
+use crate::controllers::sandbox::admin_list::{
+    AdminSandboxFilter, NodeAssignment, PageBudget, SandboxSearch, SpacedVersionCount,
+};
 use crate::middleware::auth::AuthUser;
 use crate::models::{Sandbox, SandboxResponse};
 use crate::routes::AppState;
@@ -29,11 +30,27 @@ const DEFAULT_ADMIN_SANDBOX_LIMIT: u32 = 1000;
 const MAX_ADMIN_SANDBOX_LIMIT: u32 = 5000;
 const CURSOR_VERSION: &str = "v1";
 
+/// The list's query parameters. With `cursor` any other parameter is
+/// refused; without it, other parameters are ignored, as they were before
+/// paging existed, so callers written against that list keep working.
+const LIST_PARAMETERS: [&str; 11] = [
+    "limit",
+    "org_id",
+    "cursor",
+    "lifecycle",
+    "template",
+    "node_id",
+    "assigned",
+    "user_id",
+    "created_after",
+    "created_before",
+    "prefix",
+];
+const NANOSECONDS_PER_MICROSECOND: i128 = 1_000;
+
 type QueryError = (StatusCode, Json<serde_json::Value>);
 
-/// The list's query string. Unknown parameters are ignored, as they were
-/// before the filters existed, so a console that sends a filter this server
-/// predates gets the unfiltered list rather than an error.
+/// The list's query string; see [`LIST_PARAMETERS`] for unknown parameters.
 #[derive(Debug, Default, Deserialize)]
 pub struct AdminSandboxListQuery {
     limit: Option<u32>,
@@ -90,6 +107,22 @@ struct ListRequest {
 }
 
 impl AdminSandboxListQuery {
+    /// Parses the list's query string, answering a malformed one with the
+    /// admin JSON error rather than axum's plain-text rejection.
+    fn from_uri(uri: &Uri) -> Result<Self, QueryError> {
+        let query: Self = parse_query(uri)?;
+        if query.cursor.is_some() {
+            let pairs: Vec<(String, String)> = parse_query(uri)?;
+            if let Some((name, _)) = pairs
+                .iter()
+                .find(|(name, _)| !LIST_PARAMETERS.contains(&name.as_str()))
+            {
+                return Err(bad_request(format!("unknown query parameter {name:?}")));
+            }
+        }
+        Ok(query)
+    }
+
     fn into_request(self) -> Result<ListRequest, QueryError> {
         let limit = self
             .limit
@@ -116,10 +149,13 @@ impl AdminSandboxListQuery {
             .as_deref()
             .map(|value| parse_timestamp("created_after", value))
             .transpose()?;
+        // Postgres keeps microseconds and the bound value is truncated to
+        // them, so a bound inside a microsecond rounds up: a row created
+        // earlier in that microsecond is still before it.
         let created_before = self
             .created_before
             .as_deref()
-            .map(|value| parse_timestamp("created_before", value))
+            .map(|value| parse_timestamp("created_before", value).and_then(round_up_to_microsecond))
             .transpose()?;
         if let (Some(after), Some(before)) = (created_after, created_before)
             && after >= before
@@ -146,10 +182,13 @@ impl AdminSandboxListQuery {
             user_id: self.user_id,
             created_after,
             created_before,
-            search: self
-                .prefix
-                .filter(|prefix| !prefix.is_empty())
-                .map(SandboxSearch::new),
+            search: match self.prefix {
+                Some(prefix) if prefix.contains('\0') => {
+                    return Err(bad_request("prefix must not contain a NUL character"));
+                }
+                Some(prefix) if !prefix.is_empty() => Some(SandboxSearch::new(prefix)),
+                _ => None,
+            },
         };
         Ok(ListRequest {
             limit,
@@ -161,6 +200,12 @@ impl AdminSandboxListQuery {
 
 fn bad_request(message: impl Into<String>) -> QueryError {
     api_error(StatusCode::BAD_REQUEST, message)
+}
+
+fn parse_query<T: DeserializeOwned>(uri: &Uri) -> Result<T, QueryError> {
+    Query::<T>::try_from_uri(uri)
+        .map(|Query(query)| query)
+        .map_err(|rejection| bad_request(rejection.body_text()))
 }
 
 fn parse_lifecycles(value: &str) -> Result<Vec<StoredSandboxLifecycle>, QueryError> {
@@ -179,6 +224,16 @@ fn parse_timestamp(name: &str, value: &str) -> Result<OffsetDateTime, QueryError
     let invalid = || bad_request(format!("{name} must be an RFC 3339 timestamp"));
     let timestamp = jiff::Timestamp::from_str(value).map_err(|_| invalid())?;
     OffsetDateTime::from_unix_timestamp_nanos(timestamp.as_nanosecond()).map_err(|_| invalid())
+}
+
+fn round_up_to_microsecond(value: OffsetDateTime) -> Result<OffsetDateTime, QueryError> {
+    let nanos = value.unix_timestamp_nanos();
+    let rounded = match nanos.rem_euclid(NANOSECONDS_PER_MICROSECOND) {
+        0 => nanos,
+        within => nanos + NANOSECONDS_PER_MICROSECOND - within,
+    };
+    OffsetDateTime::from_unix_timestamp_nanos(rounded)
+        .map_err(|_| bad_request("created_before must be an RFC 3339 timestamp"))
 }
 
 /// `v1:<created_at unix nanoseconds>:<id>`, base64url without padding. Not
@@ -213,26 +268,33 @@ fn decode_cursor(cursor: &str) -> Result<SandboxPageCursor, QueryError> {
 pub async fn list_sandboxes(
     State(state): State<AppState>,
     Extension(AuthUser(actor)): Extension<AuthUser>,
-    Query(query): Query<AdminSandboxListQuery>,
+    uri: Uri,
 ) -> axum::response::Response {
     if let Err(err) = require_managing_org_admin(&state.pool, &actor).await {
         return err.into_response();
     }
-    let request = match query.into_request() {
+    let request = match AdminSandboxListQuery::from_uri(&uri).and_then(|query| query.into_request())
+    {
         Ok(request) => request,
         Err(err) => return err.into_response(),
     };
-    // One lookahead row tells a paged request whether another page follows.
-    let max_rows = i64::from(request.limit) + i64::from(request.paging.is_paged());
-    let mut sandboxes = match sandbox_store::list_sandboxes(
-        &state.pool,
-        &request.filter,
-        request.paging.after(),
-        max_rows,
-    )
-    .await
+    let budget = if request.paging.is_paged() {
+        PageBudget::Bounded
+    } else {
+        PageBudget::Unbounded
+    };
+    let page = match state
+        .sandbox_controller
+        .admin_sandbox_page(
+            &state.pool,
+            &request.filter,
+            request.paging.after(),
+            request.limit,
+            budget,
+        )
+        .await
     {
-        Ok(sandboxes) => sandboxes,
+        Ok(page) => page,
         // `ReadOnly`: the busiest admin read on this surface, and a plain
         // `SELECT` over `sandboxes`, so it blocks behind DDL on the hottest
         // table in the schema. It wrote nothing, so every contention SQLSTATE
@@ -249,12 +311,11 @@ pub async fn list_sandboxes(
                 .into_response();
         }
     };
-    let next_cursor = match usize::try_from(request.limit) {
-        Ok(limit) if sandboxes.len() > limit => {
-            sandboxes.truncate(limit);
-            sandboxes.last().map(encode_cursor)
-        }
-        _ => None,
+    let sandboxes = page.rows;
+    let next_cursor = if page.has_more {
+        sandboxes.last().map(encode_cursor)
+    } else {
+        None
     };
     // The node-reported rows with no sandbox row are not in the keyset order
     // and belong to no org, so they come once, on the first page of the
@@ -297,7 +358,7 @@ pub async fn list_sandboxes(
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SpacedVersionCountQuery {
+struct SpacedVersionCountQuery {
     org_id: Option<OrgId>,
 }
 
@@ -306,19 +367,30 @@ struct SpacedVersionCounts {
     counts: Vec<SpacedVersionCount>,
 }
 
-/// Every sandbox that is not deleted, counted by template, the `spaced`
-/// version its node last reported, and stored lifecycle.
+/// The listed sandboxes whose status is not `deleted`, counted by the
+/// template, `spaced` version, status and resource type the list shows; see
+/// `SandboxController::admin_spaced_version_counts`.
 pub async fn count_spaced_versions(
     State(state): State<AppState>,
     Extension(AuthUser(actor)): Extension<AuthUser>,
-    Query(query): Query<SpacedVersionCountQuery>,
+    uri: Uri,
 ) -> axum::response::Response {
     if let Err(err) = require_managing_org_admin(&state.pool, &actor).await {
         return err.into_response();
     }
-    match sandbox_store::count_by_spaced_version(&state.pool, query.org_id).await {
+    let query: SpacedVersionCountQuery = match parse_query(&uri) {
+        Ok(query) => query,
+        Err(err) => return err.into_response(),
+    };
+    match state
+        .sandbox_controller
+        .admin_spaced_version_counts(&state.pool, query.org_id)
+        .await
+    {
         Ok(counts) => Json(SpacedVersionCounts { counts }).into_response(),
-        Err(error) => support::read_db_error(error),
+        Err(error) => support::controller_read_error(&error, || {
+            tracing::warn!(%error, "admin spaced version count failed");
+        }),
     }
 }
 

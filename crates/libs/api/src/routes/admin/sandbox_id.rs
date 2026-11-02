@@ -30,11 +30,13 @@ pub(in crate::routes) struct AdminSandboxIdError;
 ///
 /// Accepts `sbx_<uuid>`, a bare UUID, and either UUID with its dashes removed,
 /// with hex digits in either case, and the sandbox's pod name with or without
-/// its generation suffix. Nothing is trimmed, and other UUID spellings (braced,
-/// `urn:uuid:`) are refused, so the route answers 400 rather than guessing.
+/// its generation suffix, ignoring surrounding whitespace. Other UUID
+/// spellings (braced, `urn:uuid:`) and prefixes (`SBX_`, `sandbox:`) are
+/// refused, so the route answers 400 rather than guessing.
 pub(in crate::routes) fn parse_admin_sandbox_id(
     value: &str,
 ) -> Result<SandboxId, AdminSandboxIdError> {
+    let value = value.trim();
     let uuid = if let Some(uuid) = value.strip_prefix(PUBLIC_SANDBOX_ID_PREFIX) {
         parse_uuid(uuid)?
     } else if let Some(name) = value.strip_prefix(SANDBOX_POD_NAME_PREFIX) {
