@@ -87,8 +87,8 @@ printf '%s\n' "$@" >"$DOCKER_ARGS"
 EOF
 chmod +x "${fake_bin}/docker" "${fake_bin}/objdump"
 
-# Exercise both build profiles without compiling Linux. Only the compiler and
-# binutils boundary is substituted; main still selects/merges/verifies config.
+# Exercise both build profiles without compiling Linux. The Linux build-tool
+# boundary is substituted; main still selects/merges/verifies config.
 mkdir -p "${tmp_dir}/linux/scripts/kconfig"
 printf '1234567890\n' >"${tmp_dir}/source-date-epoch"
 cat >"${fake_bin}/make" <<'EOF'
@@ -106,7 +106,13 @@ cat >"${tmp_dir}/linux/scripts/kconfig/merge_config.sh" <<'EOF'
 #!/usr/bin/env bash
 cp "$3" .config
 EOF
-chmod +x "${fake_bin}/make" "${fake_bin}/objcopy" "${tmp_dir}/linux/scripts/kconfig/merge_config.sh"
+cat >"${tmp_dir}/linux/scripts/config" <<'EOF'
+#!/usr/bin/env bash
+[[ "$1" == --enable ]] || exit 1
+printf 'CONFIG_%s=y\n' "$2" >>.config
+EOF
+chmod +x "${fake_bin}/make" "${fake_bin}/objcopy" "${tmp_dir}/linux/scripts/kconfig/merge_config.sh" \
+  "${tmp_dir}/linux/scripts/config"
 printf 'CONFIG_BASE_ONLY=y\n' >"${tmp_dir}/base.config"
 for fragment in '' "$valid_config" "$unsigned_modules"; do
   if env PATH="${fake_bin}:${PATH}" SOURCE_DIR="${tmp_dir}/linux" \
@@ -116,7 +122,9 @@ for fragment in '' "$valid_config" "$unsigned_modules"; do
     [[ "$fragment" != "$unsigned_modules" ]] || {
       echo 'fragment build accepted missing module-signing enforcement' >&2; exit 1;
     }
-    cmp "${fragment:-${tmp_dir}/base.config}" "${tmp_dir}/compiled/config"
+    while IFS= read -r setting; do
+      grep -Fxq "$setting" "${tmp_dir}/compiled/config"
+    done <"${fragment:-${tmp_dir}/base.config}"
   else
     [[ "$fragment" == "$unsigned_modules" ]] || { cat "${tmp_dir}/build.log" >&2; exit 1; }
   fi
