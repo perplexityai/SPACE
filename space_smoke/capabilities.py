@@ -715,11 +715,13 @@ class ReconcileQueueGcControl(Protocol):
         live: tuple[str, str],
         gone: tuple[str, str],
         marker: str,
-    ) -> None:
+    ) -> list[ReconcileQueueRef]:
         """Insert two (node id, Kubernetes name) rows, non-ready, with their backdated refs.
 
         Each gets a 25 h-old live `node-status` ref; the live node also gets a
-        25 h-old and a 1 h-old dead letter. One transaction.
+        25 h-old and a 1 h-old dead letter. One transaction, which returns both
+        nodes' queue rows as it leaves them, read before it commits: a GC tick
+        after the commit may already prune some.
         """
         ...
 
@@ -2530,6 +2532,13 @@ class LeaderElectionControl(TelemetryBackendControl, Protocol):
 
     def controller_leader_election_enabled(self) -> bool:
         """The Deployment's leader-election kill switch is on."""
+        ...
+
+    def controller_reconciler_tick_env(self) -> dict[str, str | None]:
+        """The literals of the settings that tick the histogram-recording reconcilers.
+
+        Keyed by `leader_election.RECONCILER_TICK_ENV`; None when unset.
+        """
         ...
 
     def controller_liveness_budget_env(self, *, refused_contender: bool = False) -> str | None:

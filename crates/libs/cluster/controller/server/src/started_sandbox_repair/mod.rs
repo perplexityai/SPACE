@@ -62,11 +62,17 @@ pub struct ReconcilerConfig {
     /// Master enable gate. Enabled by default; operators can disable it with
     /// `SPACE_STARTED_SANDBOX_REPAIR_ENABLED=false`.
     pub enabled: bool,
+    /// Interval between scans: [`DEFAULT_TICK`], or the `SPACE_STARTED_SANDBOX_REPAIR_TICK_SECS` test
+    /// hook, which Kind sets so its smoke waits fewer seconds for a tick.
+    pub tick: Duration,
 }
 
 impl Default for ReconcilerConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            tick: DEFAULT_TICK,
+        }
     }
 }
 
@@ -83,6 +89,8 @@ impl ReconcilerConfig {
             // rather than leave it running.
             enabled: env_config::EnvConfig(env)
                 .destructive_gate("SPACE_STARTED_SANDBOX_REPAIR_ENABLED"),
+            tick: env_config::EnvConfig(env)
+                .test_duration_secs("SPACE_STARTED_SANDBOX_REPAIR_TICK_SECS", DEFAULT_TICK),
         }
     }
 }
@@ -415,7 +423,7 @@ pub async fn run(
     }
 
     tracing::info!(
-        tick_secs = DEFAULT_TICK.as_secs(),
+        tick_secs = config.tick.as_secs(),
         min_age_secs = DEFAULT_MIN_AGE_SECS,
         batch_size = DEFAULT_BATCH_SIZE,
         "starting started_sandbox_repair"
@@ -425,7 +433,7 @@ pub async fn run(
     let sink = RepairDbStore::new(pool);
     let mut reconciler = Reconciler::new(presence, sink);
 
-    let mut interval = tokio::time::interval(DEFAULT_TICK);
+    let mut interval = tokio::time::interval(config.tick);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     interval.tick().await;
     loop {

@@ -114,7 +114,9 @@ snapshotRegion: us-east-1
 snapshotEndpoint: http://object-store:8333
 snapshotCredentialsSecretName: space-object-store
 
-# Per-reconciler env overrides. Empty defaults keep prod-equivalent intervals.
+# Per-reconciler env overrides. Empty defaults keep prod-equivalent intervals;
+# the Kind bring-up shortens some in values-kind.yaml, which the
+# caller-provided-cluster chart does not inherit.
 reconcilers:
   # publicOperationDispatcher claims `state=queued` rows in public_operations
   # and executes them — this is what materializes per-sandbox K8s pods when
@@ -264,6 +266,12 @@ reconcilers:
       SPACE_RECONCILE_QUEUE_GC_ENABLED: "true"
       SPACE_GONE_NODE_QUEUE_GC_ENABLED: "true"
       SPACE_GONE_NODE_QUEUE_GC_DRY_RUN: "true"
+
+# Controller test hooks (`EnvConfig::test_*` readers, which release binaries
+# ignore), rendered only for the `test-hooks` Rust build (`rustBuild`,
+# infra/space/kind/lib/rust-build.sh); the release lane renders none. Empty
+# here; the Kind bring-up sets them in values-kind.yaml.
+testHookEnv: {}
 
 # EC2 for the reconcile-queue GC's Ec2Detector, and for every other EC2 client
 # in this process (all off on Kind): the Kind-only fake EC2 endpoint

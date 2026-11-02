@@ -2,8 +2,9 @@
 
 The cluster-controller reconciler `reconcile_queue_gc`
 (crates/libs/cluster/controller/server/src/reconcile_queue_gc/) runs on Kind
-at the binary's fixed timers: a 300 s tick, and 24 h before a dead letter, or
-a live ref of a non-ready `managed_by='k8s'` node, can be pruned. For each
+at a 10 s tick (the `SPACE_RECONCILE_QUEUE_GC_TICK_SECS` test hook; the binary
+ticks every 300 s) and the binary's fixed retention: 24 h before a dead letter,
+or a live ref of a non-ready `managed_by='k8s'` node, can be pruned. For each
 such node its `Ec2Detector` calls `DescribeInstances` by the node's
 Kubernetes name, which Kind's fake EC2 endpoint (`space-kind-fake-ec2`)
 answers from the Node of that name: a Ready Node is `running`, which keeps
@@ -40,16 +41,36 @@ if TYPE_CHECKING:
 
 GC_ENABLED_ENV = "SPACE_RECONCILE_QUEUE_GC_ENABLED"
 EC2_ENDPOINT_ENV = "AWS_ENDPOINT_URL_EC2"
-GC_ENV_KEYS: tuple[str, ...] = (GC_ENABLED_ENV, EC2_ENDPOINT_ENV)
+GC_TICK_ENV = "SPACE_RECONCILE_QUEUE_GC_TICK_SECS"
+GC_ENV_KEYS: tuple[str, ...] = (GC_ENABLED_ENV, EC2_ENDPOINT_ENV, GC_TICK_ENV)
 
-# `DEFAULT_TICK` in reconcile_queue_gc/mod.rs. The loop consumes its first
-# tick at start, so a controller that restarts just before the seed takes a
-# full tick too.
+# `DEFAULT_TICK` in reconcile_queue_gc/mod.rs, the tick when the Deployment
+# sets no positive whole-second GC_TICK_ENV, as the binary reads it. The loop
+# consumes its first tick at start, so a controller that restarts just before
+# the seed takes a full tick too.
 GC_TICK_SECONDS = 300
+
+
+def gc_tick_seconds(env: dict[str, str | None]) -> int:
+    """The tick the controller Deployment's env gives the GC."""
+
+    raw = env.get(GC_TICK_ENV) or ""
+    return int(raw) if raw.isdigit() and int(raw) > 0 else GC_TICK_SECONDS
 
 LIVE_REF_FACET = "node-status"
 OLD_DEAD_FACET = "sandbox-inventory"
 FRESH_DEAD_FACET = "template-inventory"
+
+
+def seeded_refs(live_id: str, gone_id: str) -> set[tuple[str, str, bool]]:
+    """The four (node, facet, dead) queue rows the seed inserts."""
+
+    return {
+        (live_id, LIVE_REF_FACET, False),
+        (gone_id, LIVE_REF_FACET, False),
+        (live_id, OLD_DEAD_FACET, True),
+        (live_id, FRESH_DEAD_FACET, True),
+    }
 
 MARKER_PREFIX = "space-smoke-reconcile-queue-gc-"
 _MARKER = re.compile(re.escape(MARKER_PREFIX) + r"[a-f0-9]{8}")
@@ -83,12 +104,14 @@ class ReconcileQueueGcAssertions:
         self.gone_id = str(uuid.uuid4())
         self.live_name = ""
         self.gone_name = validate_node_name(f"space-smoke-gone-{self._token}")
+        self.tick_seconds = GC_TICK_SECONDS
 
     def expect_gc_on_against_the_fake(self) -> None:
         """The applied controller runs the GC live and points EC2 at an endpoint override."""
 
         env = self._control.reconcile_queue_gc_env()
         self._fixture.record("controller_gc_env", env)
+        self.tick_seconds = gc_tick_seconds(env)
         self._fixture.verify(
             env.get(GC_ENABLED_ENV) == "true" and bool(env.get(EC2_ENDPOINT_ENV)),
             "the cluster-controller does not run the reconcile-queue GC against the fake EC2 endpoint; "
@@ -117,15 +140,17 @@ class ReconcileQueueGcAssertions:
                 raise RuntimeError(f"{remaining} seeded node rows remain after cleanup")
 
         self._scope.defer("delete the seeded reconcile-queue GC nodes", remove, critical=True)
-        self._control.seed_reconcile_queue_gc_nodes(
+        rows = self._control.seed_reconcile_queue_gc_nodes(
             live=(self.live_id, self.live_name),
             gone=(self.gone_id, self.gone_name),
             marker=self.marker,
         )
-        seeded = sorted(self._refs())
+        # Counted inside the seed's transaction: a read after its commit races
+        # the GC's next tick, which may already have pruned two of them.
+        seeded = sorted((row.node_id, row.facet, row.dead) for row in rows)
         self._fixture.record("seeded_refs", seeded)
         self._fixture.verify(
-            len(seeded) == 4,
+            set(seeded) == seeded_refs(self.live_id, self.gone_id),
             "the seed did not leave the four queue rows it inserted",
             seeded_refs=seeded,
         )
@@ -138,7 +163,7 @@ class ReconcileQueueGcAssertions:
             (self.live_id, FRESH_DEAD_FACET, True),
         }
         started = time.monotonic()
-        deadline = started + GC_TICK_SECONDS + margin
+        deadline = started + self.tick_seconds + margin
         while True:
             refs = self._refs()
             if refs == kept:

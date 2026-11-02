@@ -257,7 +257,7 @@ either (see [Service identities](#service-identities)).
 
 ## CI smoke partitions
 
-Kind CI produces one Rust artifact image per run and hands it to eight isolated
+Kind CI produces one Rust artifact image per run and hands it to twelve isolated
 runners. Main builds it from its commit; a PR reuses main's image when its Rust
 inputs are the same (see [Smoke test](#smoke-test)). Each runner boots its own Kind stack, proves the baseline,
 and runs its assigned typed scenarios serially. Cluster-wide fault injection
@@ -273,8 +273,8 @@ successful producer from the same run, with the same source verification. A
 failed producer, expired artifact, or mismatched identity fails closed instead
 of compiling separately on each shard.
 
-Overlap needs runner capacity for the producer and eight prepared shards: nine
-concurrent 16-core runners per run, and a tenth on a main push for Main CI's
+Overlap needs runner capacity for the producer and twelve prepared shards:
+thirteen concurrent 16-core runners per run, and a fourteenth on a main push for Main CI's
 `kind_rust_state` (below). This
 does not add shard jobs or enlarge the cross-run cache, but runners start
 earlier. Verify both producer queue time and main CI completion time after a
@@ -305,8 +305,8 @@ for each API surface across all shards of several successful runs, and take
 each scenario's median. They are scheduling
 hints only: new or renamed scenarios receive a 30-second estimate and still run;
 obsolete hints do not add scenarios. No assertion, timeout, or scenario is removed.
-Eight shards shorten the serial critical path but duplicate cluster startup and
-consume eight concurrent runners; queue time remains a separate constraint.
+Twelve shards shorten the serial critical path but duplicate cluster startup and
+consume twelve concurrent runners; queue time remains a separate constraint.
 
 ## Release-build lane
 
@@ -337,8 +337,8 @@ the Kind services with no crate's `test-hooks` feature enabled:
   `SPACE_SBX_GC_IDLE_SECS`, template-manager's `SPACE_TEMPLATE_GC_INTERVAL_SECS`,
   `SPACE_TEMPLATE_GC_GRACE_SECS` and `SPACE_TEMPLATE_PREFETCH_LATEST_N`, and
   `SPACE_NODE_DISK_ADMISSION_ALLOCATION_RESERVATION_BYTES` on the services that
-  admit cache allocations, as well as node-manager's `SPACE_LOOP_DEVICE_TARGET`
-  when the bring-up passes one. The release-read settings beside them stay.
+  admit cache allocations, the cluster-controller's `testHookEnv`, as well as
+  node-manager's `SPACE_LOOP_DEVICE_TARGET` when the bring-up passes one. The release-read settings beside them stay.
   Every Rust workload's pods (the API, admin API, internal API, credential
   authority, key broker, data plane, cluster controller, each node service and
   the operator shell) carry the `space.pplx.net/kind-rust-build` label of the
@@ -383,7 +383,7 @@ SPACE_KIND_RUST_BUILD=release SPACE_KIND_TELEMETRY_MODE=otel SKIP_BOOTSTRAP=1 \
 
 On demand, `Kind Release-Build CI` (`.github/workflows/kind-release-ci.yml`,
 `workflow_dispatch` only) runs `kind-ci.yml` with `rust_build: release`: its
-producer builds the release image in Docker mode, and the eight shards check its
+producer builds the release image in Docker mode, and the twelve shards check its
 label and run the baseline and their partitions. No required check depends on
 it and nothing schedules it.
 
@@ -1700,7 +1700,10 @@ too. Each chart's values cite the code behind its numbers.
   transient lifecycles effectively off, failed-sandbox cleanup on), the
   stuck-snapshot reaper, the started-sandbox and failed-restorable repairs
   (live), the gone-node queue GC (dry-run) and the orphaned-restore-pod GC
-  (dry-run). At these ages a row a scenario holds mid-transition is not old
+  (dry-run). The two repairs, the sweeper and the orphaned-restore-pod GC tick
+  every 10 s instead of 60 s (`charts/space-cluster-controller-local/values-kind.yaml`,
+  which the caller-provided-cluster chart does not inherit); their ages and
+  thresholds are the ones above. At these ages a row a scenario holds mid-transition is not old
   enough to touch; a row one of them acts on during a run was stuck past what
   a deployment tolerates. The reconcile-queue GC runs live at the binary's
   unchanged retention (24 h for dead letters and for a non-ready node's live
@@ -2091,7 +2094,7 @@ asks of the hosting deployment.
 | `/space/cache` is btrfs on instance-store NVMe, reformatted on every boot | btrfs on a sparse loopback image at `/var/lib/space-cache.img` on the kind node (40 GiB, same code paths, less I/O headroom), mounted `nosuid,noatime` on the node's `/space/cache` by `space-cache.service`, which reformats it on every start of the node container, so like the NVMe it outlives pod restarts but not node restarts |
 | The node bootstrap installs a checksum-verified `containerd-shim-space-v2` before containerd starts, and registers the `space` runtime under `io.containerd.cri.v1.runtime` with a `CniConfDir` option | the node image registers the same runtime with the same options (in kind's version 2 config format, which containerd migrates to that plugin), so containerd loads it on its first start; the binary arrives after the cluster exists, copied onto each running sandbox worker by `install-shim.sh`, which checks its SHA-256 on the node. Installing it at boot would need the shim built and staged on a host path before `kind create` |
 | Every node group's bootstrap sets kubelet `eventRecordQPS: 0` and `--fail-swap-on=false` | the same settings on sandbox workers and builders, baked into the node image as a kubelet `--config-dir` drop-in (`node/kubelet/50-space.conf`); the infra node runs the unmodified base image, so its kubelet keeps kind's event rate limit (`failSwapOn` is already `false` there). No sandbox pod runs on it, so none of their events pass through that limit |
-| Release binaries read no test hooks | by default every binary is built with `test-hooks`, and the charts set these hooks on every run: sandbox-manager's on-node snapshot reaper at target fraction 0, interval 15 s, grace 60 s and idle 60 s, against release values of 0.40, 300 s, 1800 s and 86400 s (`charts/space-sandbox-manager-local/values.yaml`, `snapshot_gc.rs`); template-manager's cache GC at interval 15 s and grace 60 s, against 300 s and 1800 s, and its prefetch latest-N at 1, against 5 (`charts/space-template-manager-local/values.yaml`, `eviction.rs`, `prefetch.rs`); and the disk-admission reservation below. Scenarios shorten further hooks, such as the snapshot-retention sweeper's minimum age and the activation-admission burst, for their own run and restore them. The public-operation dispatcher's tick, claim limit and claim staleness stay at their release values. The release lane (`SPACE_KIND_RUST_BUILD=release`) builds every Kind service with no crate's `test-hooks` feature, renders none of these chart hooks, and skips the scenarios that need one ([Release-build lane](#release-build-lane)) |
+| Release binaries read no test hooks | by default every binary is built with `test-hooks`, and the charts set these hooks on every run: sandbox-manager's on-node snapshot reaper at target fraction 0, interval 15 s, grace 60 s and idle 60 s, against release values of 0.40, 300 s, 1800 s and 86400 s (`charts/space-sandbox-manager-local/values.yaml`, `snapshot_gc.rs`); template-manager's cache GC at interval 15 s and grace 60 s, against 300 s and 1800 s, and its prefetch latest-N at 1, against 5 (`charts/space-template-manager-local/values.yaml`, `eviction.rs`, `prefetch.rs`); the cluster-controller's started-sandbox and failed-restorable repair ticks and its reconcile-queue GC tick at 10 s, against 60 s, 60 s and 300 s (`SPACE_STARTED_SANDBOX_REPAIR_TICK_SECS`, `SPACE_FAILED_RESTORABLE_REPAIR_TICK_SECS`, `SPACE_RECONCILE_QUEUE_GC_TICK_SECS`, in `testHookEnv` of `charts/space-cluster-controller-local/values-kind.yaml`); and the disk-admission reservation below. Scenarios shorten further hooks, such as the snapshot-retention sweeper's minimum age and the activation-admission burst, for their own run and restore them. The public-operation dispatcher's tick, claim limit and claim staleness stay at their release values. The release lane (`SPACE_KIND_RUST_BUILD=release`) builds every Kind service with no crate's `test-hooks` feature, renders none of these chart hooks, and skips the scenarios that need one ([Release-build lane](#release-build-lane)) |
 | space-api waits up to 120 s for a new sandbox pod's IP and proxy (`SPACE_CREATE_DATA_PLANE_READY_TIMEOUT_SECS`, binary default) | 45 s, set only by the Kind bring-up (`charts/space-api-local/values-kind.yaml`, which the Tiltfile passes and the caller-provided-cluster chart does not). A restore that cannot complete keeps its pod retrying, so the two btrfs-send failure scenarios wait the whole timeout; healthy creates and restores on Kind take a few seconds |
 | Services export OTLP metrics every 10 s (the SDK default) | in `otel` mode the Rust services in Pods export every 2 s (`telemetry.otlpMetricExportIntervalMillis`, `scripts/telemetry_config.py`) to the bench's own Prometheus, and Tempo search withholds the newest 5 s instead of 30 s (`tempo.queryEndCutoff` in the traces chart's Kind profile); the shim and runtime-supervisor keep 10 s |
 | 8 GiB disk-admission reservation per cache allocation (release default) | 1 GiB through the `SPACE_NODE_DISK_ADMISSION_ALLOCATION_RESERVATION_BYTES` test hook, with the 1 GiB `MIN_AVAILABLE_BYTES` floor, so allocations fit the 40 GiB cache (`charts/space-node-service/values.yaml`); the release lane renders only the floor, and the cache admits its binaries' release 8 GiB reservation too ([Release-build lane](#release-build-lane)) |
@@ -2118,7 +2121,7 @@ asks of the hosting deployment.
 | preStop delays on api, admin-api, data-plane and internal-api sized for the load balancer's deregistration | the same hooks at 5 s: kube-proxy removes a terminating pod from the NodePort entry and ClusterIP Services in about a second, so a deployment-sized delay would only slow every rollout |
 | Control-plane replicas spread across nodes | no anti-affinity or topology spread: every control-plane pod runs on the one infra node, where a spread constraint has nothing to spread over and a required anti-affinity would leave second replicas Pending |
 | space-admin-api under a PodDisruptionBudget like the public API | one replica (operator traffic only) under the same `maxUnavailable: 1` budget, so it never holds a drain and does not keep the admin surface up during one; it rolls by `Recreate`, so a rollout leaves the admin surface down while the old pod drains and the new one starts |
-| Reconcile-queue GC (`SPACE_RECONCILE_QUEUE_GC_*`) prunes dead letters and asks EC2 whether a non-ready node's instance is gone | the same GC, on at the binary's fixed timers (a 300 s tick; 24 h before a dead letter, or a non-ready node's live ref, can be pruned), asking the Kind-only fake EC2 endpoint (`space-kind-fake-ec2`) instead of EC2. The controller reaches it through `AWS_ENDPOINT_URL_EC2` over TLS from the internal RPC CA, and its pod resolves `ec2.<region>.amazonaws.com` to loopback, so a lost override fails closed (the GC reads the error as unknown and keeps the refs) rather than calling AWS. The fake answers `DescribeInstances` by private DNS name from the Node of that name: Ready is `running` and NotReady `stopped`, which keep the refs, and no Node is no instance, which reads as gone. It checks that a request is signed for EC2 in the region, not the signature, which the controller makes with the object store's keys rather than a workload identity. No public path makes a row 24 h old, so `local.reconcile_queue_gc_prunes_only_gone_nodes` seeds two synthetic non-ready node rows with 25 h-old refs and waits out one tick: a 25 h-old dead letter and the ref of the node no Node names are pruned, while a 1 h-old dead letter and the ref of the node named after a Ready Node are kept. Otherwise a cluster younger than 24 h holds no candidate, and the fake is not called. The gone-node queue GC runs, dry-run |
+| Reconcile-queue GC (`SPACE_RECONCILE_QUEUE_GC_*`) prunes dead letters and asks EC2 whether a non-ready node's instance is gone | the same GC, on at a 10 s tick instead of the binary's 300 s (the `SPACE_RECONCILE_QUEUE_GC_TICK_SECS` test hook, so the release lane ticks at 300 s) and at the binary's fixed retention (24 h before a dead letter, or a non-ready node's live ref, can be pruned), asking the Kind-only fake EC2 endpoint (`space-kind-fake-ec2`) instead of EC2. The controller reaches it through `AWS_ENDPOINT_URL_EC2` over TLS from the internal RPC CA, and its pod resolves `ec2.<region>.amazonaws.com` to loopback, so a lost override fails closed (the GC reads the error as unknown and keeps the refs) rather than calling AWS. The fake answers `DescribeInstances` by private DNS name from the Node of that name: Ready is `running` and NotReady `stopped`, which keep the refs, and no Node is no instance, which reads as gone. It checks that a request is signed for EC2 in the region, not the signature, which the controller makes with the object store's keys rather than a workload identity. No public path makes a row 24 h old, so `local.reconcile_queue_gc_prunes_only_gone_nodes` seeds two synthetic non-ready node rows with 25 h-old refs and waits out one tick: a 25 h-old dead letter and the ref of the node no Node names are pruned, while a 1 h-old dead letter and the ref of the node named after a Ready Node are kept. Otherwise a cluster younger than 24 h holds no candidate, and the fake is not called. The gone-node queue GC runs, dry-run |
 | The runtime manager installs releases and kernels, which node-manager publishes into the root-owned store `/space/vendor/artifacts` | the same: each sandbox worker and builder has its own root-owned `/space/vendor`, copied from the read-only host vendor tree on the node's first boot, and the runtime manager runs without `--list-only`. Until a managed E0 is installed, execution reads the baked release from `/space/bin/runtime/firecracker` (node-manager's `SPACE_FIRECRACKER_VENDOR_DIR`), the node layer's copy, rather than from `/space/vendor/firecracker`. node-manager seals execution copies with fs-verity on the execution cache `/space/cache/firecracker`, not on the store (`require_verity_api` in `stage_release_at`, `stage_sealed_kernel_at`); that cache is the node's btrfs loop image on the host's kernel, and where that kernel gives it no fs-verity node-manager logs `fs-verity unavailable` and keeps its verified legacy execution protection. No suite runs an install |
 | Operators run node-local CLIs from the node host's shell   | the same CLIs run in the Kind-only `space-node-debug` root shell DaemonSet     |
 | Release images record the CI commit as their build SHA (`ci/scripts/run-space-bundle-builds.py`) | the same from a clean worktree, as its 12-digit short form; an image the worktree's changes reach records `<commit>-dirty-<content>` instead, computed when it is built. `service.version` stays the commit read when Tilt or bootstrap started. The smoke bring-up refuses a SPACE container that does not run the latest build of its image; under `SKIP_BOOTSTRAP=1` only once Tilt has nothing pending, and it warns instead while Tilt is updating ([Build identity and provenance](#build-identity-and-provenance)) |
@@ -2316,8 +2319,8 @@ published templates.
 ## Smoke test
 
 Kind CI produces the Kind Rust artifact image once per run and hands that exact
-image to eight isolated runners. Each runner brings up its own Kind/Firecracker stack,
-runs the baseline smoke, then runs one of eight duration-balanced partitions of
+image to twelve isolated runners. Each runner brings up its own Kind/Firecracker stack,
+runs the baseline smoke, then runs one of twelve duration-balanced partitions of
 the eligible ECW and native inventories. Scenarios remain serial within each
 shard because some mutate cluster-wide state. Every shard must pass for
 `space-ci` to pass.
@@ -2382,13 +2385,13 @@ key inputs, so up to four states (about 0.8 GB each) can exist while a push
 saves. Setting the repository variable `SPACE_KIND_RUST_STATE` to `off` turns
 both the save and the restore off.
 
-To reproduce a shard, use `scripts/tests/smoke-kind-typed.sh all 1/8` (through
-`8/8`) with the same admin-token setup as a full `all` run, on a bench brought
+To reproduce a shard, use `scripts/tests/smoke-kind-typed.sh all 1/12` (through
+`12/12`) with the same admin-token setup as a full `all` run, on a bench brought
 up with `SPACE_KIND_TELEMETRY_MODE=otel` and that variable still set, as CI
 does. With the variable set, a bench in another mode fails any shard holding a
 scenario that declares a telemetry mode, the brownout's included; without it,
 each such shard skips those scenarios and can pass. The direct CLI equivalent
-is `python -m space_smoke run --all --shard 1/8` for the selected API surface.
+is `python -m space_smoke run --all --shard 1/12` for the selected API surface.
 Shards partition the eligible scenarios by duration hint, as described above;
 run every shard from the same checkout. Never run shards concurrently against
 the same cluster. Without a shard argument, the full inventory and its existing

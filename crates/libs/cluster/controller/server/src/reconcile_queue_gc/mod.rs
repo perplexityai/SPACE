@@ -79,7 +79,9 @@ impl ReconcilerConfig {
         Self {
             enabled: config.truthy_default("SPACE_RECONCILE_QUEUE_GC_ENABLED", false),
             dry_run: false,
-            tick: DEFAULT_TICK,
+            // A test hook: Kind shortens the tick so its smoke waits seconds,
+            // not up to five minutes, for one.
+            tick: config.test_duration_secs("SPACE_RECONCILE_QUEUE_GC_TICK_SECS", DEFAULT_TICK),
             dead_retention: DEFAULT_DEAD_RETENTION,
             gone_live_retention: DEFAULT_GONE_LIVE_RETENTION,
             dead_max_per_tick: DEFAULT_DEAD_MAX_PER_TICK,

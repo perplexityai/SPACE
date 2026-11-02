@@ -108,6 +108,7 @@ from space_smoke.capabilities import (
     WarmPoolSelection,
 )
 from space_smoke.credmgr_socket import exchange_token, relay_argv
+from space_smoke.leader_election import RECONCILER_TICK_ENV
 from space_smoke.reconcile_queue_gc import (
     GC_ENV_KEYS as RECONCILE_QUEUE_GC_ENV_KEYS,
     validate_marker,
@@ -415,9 +416,28 @@ VALUES ('{live_id}', 'node-status', '', NOW() - INTERVAL '25 hours', NOW() - INT
         NOW() - INTERVAL '25 hours', '{marker}'),
        ('{live_id}', 'template-inventory', '', NOW() - INTERVAL '1 hour', NOW() - INTERVAL '1 hour',
         NOW() - INTERVAL '1 hour', '{marker}');
+-- Read inside the transaction: once it commits, a GC tick may prune the rows
+-- the scenario seeded for it to prune before a later read could count them.
+SELECT node_id, facet, dead_at IS NOT NULL FROM node_reconcile_queue
+ WHERE node_id IN ('{live_id}', '{gone_id}') ORDER BY 1, 2;
 COMMIT;
 """
 
+
+
+def _reconcile_queue_refs(out: str) -> list[ReconcileQueueRef]:
+    """`node_id|facet|dead` rows from tuples-only psql output.
+
+    Only three-field lines are rows; psql also prints each statement's command
+    tag (`BEGIN`, `INSERT 0 2`, `COMMIT`) in a transaction.
+    """
+
+    refs = []
+    for line in out.splitlines():
+        fields = line.strip().split("|")
+        if len(fields) == 3 and fields[0]:
+            refs.append(ReconcileQueueRef(node_id=fields[0], facet=fields[1], dead=fields[2] == "t"))
+    return refs
 
 # Oldest-first so [0] is the pin target the retention scenario manufactures.
 READY_FULL_SNAPSHOTS_SQL = """\
@@ -5158,9 +5178,9 @@ ON CONFLICT (key_hash) DO NOTHING;
         live: tuple[str, str],
         gone: tuple[str, str],
         marker: str,
-    ) -> None:
+    ) -> list[ReconcileQueueRef]:
         self._require_isolated_kind("reconcile-queue GC seeding")
-        self._psql(
+        out = self._psql(
             RECONCILE_QUEUE_GC_SEED_SQL.format(
                 live_id=_sql_uuid(live[0]),
                 live_name=validate_node_name(live[1]),
@@ -5170,6 +5190,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             ),
             action="seed the reconcile-queue GC's synthetic nodes",
         )
+        return _reconcile_queue_refs(out)
 
     def reconcile_queue_refs(self, node_ids: Sequence[str]) -> list[ReconcileQueueRef]:
         out = self._psql(
@@ -5177,13 +5198,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             f"WHERE node_id IN ({_sql_uuid_list(node_ids)}) ORDER BY 1, 2;\n",
             action="read the seeded nodes' reconcile queue",
         )
-        refs = []
-        for line in out.splitlines():
-            node_id, _, rest = line.strip().partition("|")
-            facet, _, dead = rest.partition("|")
-            if node_id:
-                refs.append(ReconcileQueueRef(node_id=node_id, facet=facet, dead=dead == "t"))
-        return refs
+        return _reconcile_queue_refs(out)
 
     def delete_seeded_reconcile_queue_nodes(self, node_ids: Sequence[str], *, marker: str) -> int:
         ids = _sql_uuid_list(node_ids)
@@ -5703,6 +5718,9 @@ ON CONFLICT (key_hash) DO NOTHING;
             self._controller_deployment(), (LEADER_ELECTION_ENV,)
         )[LEADER_ELECTION_ENV]
         return value is None or value not in LEADER_ELECTION_FALSE_VALUES
+
+    def controller_reconciler_tick_env(self) -> dict[str, str | None]:
+        return self._deployment_env_literals(self._controller_deployment(), tuple(RECONCILER_TICK_ENV))
 
     def controller_liveness_budget_env(self, *, refused_contender: bool = False) -> str | None:
         if not refused_contender:

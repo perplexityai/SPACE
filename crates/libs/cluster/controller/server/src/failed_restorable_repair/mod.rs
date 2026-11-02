@@ -75,11 +75,17 @@ pub struct ReconcilerConfig {
     /// Master enable gate. Enabled by default; operators can disable it with
     /// `SPACE_FAILED_RESTORABLE_REPAIR_ENABLED=false`.
     pub enabled: bool,
+    /// Interval between scans: [`TICK`], or the `SPACE_FAILED_RESTORABLE_REPAIR_TICK_SECS` test
+    /// hook, which Kind sets so its smoke waits fewer seconds for a tick.
+    pub tick: Duration,
 }
 
 impl Default for ReconcilerConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            tick: TICK,
+        }
     }
 }
 
@@ -96,6 +102,8 @@ impl ReconcilerConfig {
             // rather than leave it running.
             enabled: env_config::EnvConfig(env)
                 .destructive_gate("SPACE_FAILED_RESTORABLE_REPAIR_ENABLED"),
+            tick: env_config::EnvConfig(env)
+                .test_duration_secs("SPACE_FAILED_RESTORABLE_REPAIR_TICK_SECS", TICK),
         }
     }
 }
@@ -274,14 +282,14 @@ pub async fn run(pool: PgPool, config: ReconcilerConfig, shutdown_token: Cancell
     }
 
     tracing::info!(
-        tick_secs = TICK.as_secs(),
+        tick_secs = config.tick.as_secs(),
         min_age_secs = MIN_AGE_SECS,
         batch_size = BATCH_SIZE,
         "starting failed_restorable_repair"
     );
 
     let mut reconciler = Reconciler::new(RepairDbStore::new(pool));
-    let mut interval = tokio::time::interval(TICK);
+    let mut interval = tokio::time::interval(config.tick);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     interval.tick().await;
     loop {

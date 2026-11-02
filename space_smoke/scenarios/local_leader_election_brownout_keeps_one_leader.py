@@ -38,7 +38,7 @@ def leader_election_brownout_keeps_one_leader(test: smoke.KindEcw) -> None:
     reconciler tick count in Prometheus, both replicas are Ready, and the
     contender stays NotReady and is not restarted for a full liveness budget
     while the pair keeps its holder. The standing budget is put back last.
-    Expected wall time about 7 minutes."""
+    Expected wall time about 5 minutes."""
 
     election = test.leader_election
 

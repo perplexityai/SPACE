@@ -233,6 +233,12 @@ spec:
               value: {{ $value | quote }}
             {{- end }}
             {{- end }}
+            {{- if ne (.Values.rustBuild | default "test-hooks") "release" }}
+            {{- range $key, $value := (default (dict) .Values.testHookEnv) }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+            {{- end }}
           # Ready once the process has reached the Lease (won it, or been validly
           # denied by a peer), which it signals by touching this file.
           #
