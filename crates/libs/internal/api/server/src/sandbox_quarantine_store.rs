@@ -511,27 +511,16 @@ pub(super) async fn apply_activation_rollback_candidates(
         .execute(&mut *conn)
         .await
         .map_err(|error| Status::internal(format!("invalidate rollback port state: {error}")))?;
-        let converged = sqlx::query(sql!(
-            "UPDATE sandboxes
-                SET lifecycle = $3,
-                    placement = 'unplaced',
-                    target_node_id = COALESCE(target_node_id, active_node_id),
-                    active_node_id = NULL,
-                    command_ready_pending = FALSE,
-                    lifecycle_changed_at = NOW(),
-                    placement_changed_at = CASE WHEN $4 THEN NULL ELSE placement_changed_at END
-              WHERE id = $1
-                AND active_node_id = $2
-                AND lifecycle NOT IN ('quarantined', 'deleted', 'deleting', 'cleanup_required')"
-        ))
-        .bind(candidate.sandbox_id)
-        .bind(node_id)
-        .bind(candidate.target_state.as_str())
-        .bind(retires_restore)
-        .execute(&mut *conn)
+        let converged = pplx_space_sandbox_store::quarantine::converge_activation_rollback(
+            &mut *conn,
+            node_id,
+            candidate.sandbox_id,
+            candidate.target_state,
+            retires_restore,
+        )
         .await
         .map_err(|error| Status::internal(format!("converge activation rollback: {error}")))?;
-        if converged.rows_affected() != 1 {
+        if !converged {
             return Err(Status::aborted(format!(
                 "activation rollback receipt {} lost sandbox ownership",
                 candidate.receipt_id

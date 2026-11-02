@@ -2,7 +2,6 @@ use pplx_space_common_core::types::{NodeId, SnapshotId, SubstrateKind};
 
 use pplx_space_common_core::sql;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::LazyLock;
 
 use sqlx::types::Json;
 use time::format_description::well_known::Rfc3339;
@@ -39,8 +38,7 @@ use pplx_space_events::{
 };
 use pplx_space_net_common::proto::NetworkPolicySource;
 use pplx_space_sandbox_portability::{
-    started_suspend_revert_eligibility, stopped_artifact_durable,
-    suspended_projection_lifecycle_eligible,
+    started_suspend_revert_eligibility, suspended_projection_lifecycle_eligible,
 };
 use pplx_space_sbx_mgr_client::proto::{
     QuarantineRecoveryObservedOwner, SnapshotDetail, SnapshotType,
@@ -1423,57 +1421,6 @@ fn failure_episode_input(
     })
 }
 
-/// Deletes the stopped Direct sandboxes a node reported absent, and detaches
-/// their snapshots' storage locations.
-///
-/// The delete reads the node's absence as proof that its local rootfs, a
-/// stopped sandbox's only copy, is gone. That doesn't hold for a stopped
-/// sandbox released from the node once its pinned artifact was durable, so
-/// [`stopped_artifact_durable`] exempts it, the same term that keeps the
-/// census prune's `marked_deleted` arm off it.
-///
-/// The candidates are locked (`FOR UPDATE`) before anything is detached or
-/// deleted. Without the lock, a row a concurrent writer moved out of `stopped`
-/// after this statement's snapshot was still selected, and the `DELETE`, which
-/// rechecks only its join to the CTE after waiting on the row, deleted it.
-/// Locking makes Postgres re-evaluate the whole condition against the row that
-/// writer committed; only the durability `EXISTS`'s own table scans keep the
-/// statement's snapshot.
-///
-/// Built once: every input is bound.
-static DELETE_ABSENT_STOPPED_SANDBOXES: LazyLock<String> = LazyLock::new(|| {
-    let released_with_durable_artifact = stopped_artifact_durable("s");
-    sql!(
-        format!(
-            "WITH deleted AS MATERIALIZED (
-                 SELECT s.id
-                 FROM sandboxes s
-                 WHERE s.active_node_id = $1
-                   AND s.managed_by = $3
-                   AND s.lifecycle = 'stopped'
-                   AND s.id = ANY($2)
-                   AND NOT {released_with_durable_artifact}
-                 FOR UPDATE OF s
-             ),
-             detached_storage AS (
-                 UPDATE snapshot_storage_locations ssl
-                 SET snapshot_id = NULL, orphaned_at = NOW()
-                 WHERE ssl.snapshot_id IN (
-                     SELECT snapshots.id
-                     FROM snapshots
-                     JOIN deleted ON deleted.id = snapshots.sandbox_id
-                 )
-                 RETURNING 1
-             )
-             DELETE FROM sandboxes s
-             USING deleted
-             WHERE s.id = deleted.id
-             RETURNING s.id"
-        )
-        .as_str()
-    )
-});
-
 /// [`publish_sandbox_states_with_retirement`] with abandoned-restore
 /// retirement disabled, the setting every replica runs until it's turned on.
 pub async fn publish_sandbox_states(
@@ -1968,13 +1915,11 @@ pub async fn publish_sandbox_states_with_retirement(
             Status::internal(format!("clear absent sandbox facet observations: {err}"))
         })?;
 
-        let deleted_ids = sqlx::query_scalar::<_, SandboxId>(sqlx::AssertSqlSafe(
-            DELETE_ABSENT_STOPPED_SANDBOXES.as_str(),
-        ))
-        .bind(node_id)
-        .bind(&absent_ids)
-        .bind(SubstrateKind::Space)
-        .fetch_all(&mut *conn)
+        let deleted_ids = pplx_space_sandbox_store::ingest::delete_published_absent_stopped(
+            &mut *conn,
+            node_id,
+            &absent_ids,
+        )
         .await
         .map_err(|err| {
             Status::internal(format!(
@@ -3578,84 +3523,11 @@ async fn update_activity_timestamps(
     let activity_rows = Json(serde_json::to_value(activity_rows).map_err(|error| {
         Status::internal(format!("serialize published activity timestamps: {error}"))
     })?);
-    // PostgreSQL GREATEST ignores absent clocks and yields NULL if all are absent.
-    // Keep publisher ownership on the updated row, avoiding a redundant self-join.
-    sqlx::query(sql!(
-        "WITH input AS (
-         SELECT *
-         FROM jsonb_to_recordset($2::jsonb) AS input(
-             sandbox_id UUID,
-             last_used_at TIMESTAMPTZ,
-             last_access_at TIMESTAMPTZ,
-             last_command_at TIMESTAMPTZ
-         )
-     ),
-     activity AS (
-         SELECT input.sandbox_id,
-                input.last_access_at,
-                input.last_command_at,
-                GREATEST(input.last_used_at, input.last_access_at, input.last_command_at) AS last_used_at
-         FROM input
-     )
-     UPDATE sandboxes s
-     SET last_access_at = CASE
-             WHEN activity.last_access_at IS NOT NULL
-              AND (
-                  s.last_access_at IS NULL
-                  OR s.last_access_at < activity.last_access_at - INTERVAL '1 minute'
-              )
-             THEN activity.last_access_at
-             ELSE s.last_access_at
-         END,
-         last_command_at = CASE
-             WHEN activity.last_command_at IS NOT NULL
-              AND (
-                  s.last_command_at IS NULL
-                  OR s.last_command_at < activity.last_command_at - INTERVAL '1 minute'
-              )
-             THEN activity.last_command_at
-             ELSE s.last_command_at
-         END,
-         last_used_at = CASE
-             WHEN activity.last_used_at IS NOT NULL
-              AND (
-                  s.last_used_at IS NULL
-                  OR s.last_used_at < activity.last_used_at - INTERVAL '1 minute'
-              )
-             THEN activity.last_used_at
-             ELSE s.last_used_at
-         END
-     FROM activity
-     WHERE s.id = activity.sandbox_id
-       AND s.active_node_id = $1
-       AND activity.last_used_at IS NOT NULL
-       AND (
-           (
-               activity.last_access_at IS NOT NULL
-               AND (
-                   s.last_access_at IS NULL
-                   OR s.last_access_at < activity.last_access_at - INTERVAL '1 minute'
-               )
-           )
-           OR (
-               activity.last_command_at IS NOT NULL
-               AND (
-                   s.last_command_at IS NULL
-                   OR s.last_command_at < activity.last_command_at - INTERVAL '1 minute'
-               )
-           )
-           OR (
-               activity.last_used_at IS NOT NULL
-               AND (
-                   s.last_used_at IS NULL
-                   OR s.last_used_at < activity.last_used_at - INTERVAL '1 minute'
-               )
-           )
-       )"
-    ))
-    .bind(node_id)
-    .bind(activity_rows)
-    .execute(&mut *conn)
+    pplx_space_sandbox_store::ingest::advance_published_activity(
+        &mut *conn,
+        node_id,
+        activity_rows,
+    )
     .await
     .map_err(|err| Status::internal(format!("update sandbox last_used_at from publish: {err}")))?;
     Ok(())
@@ -3708,46 +3580,11 @@ async fn converge_stopped_sandboxes(
         let stopped_rows = Json(serde_json::to_value(stopped_rows).map_err(|error| {
             Status::internal(format!("serialize stopped publication rows: {error}"))
         })?);
-        sqlx::query_scalar::<_, SandboxId>(sql!(
-            "WITH input AS (
-             SELECT *
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 sandbox_id UUID,
-                 status TEXT
-             )
-         )
-         UPDATE sandboxes s
-         SET lifecycle = 'stopped'
-         FROM input
-         WHERE s.id = input.sandbox_id
-           AND s.active_node_id = $1
-           AND LOWER(TRIM(input.status)) = 'stopped'
-           AND LOWER(TRIM(s.lifecycle)) IN (
-               'started',
-               'paused',
-               'suspended',
-               'stopping',
-               'restoring'
-           )
-           -- A `restoring` row marked for a stopped re-placement is the
-           -- drain's restore in flight (the `restoring -> started`
-           -- convergence above exempts every marked row for the same
-           -- reason). Its node reports `stopped` as soon as the shim has
-           -- staged the disk, before the drain has confirmed it; promoting
-           -- it here would take the row out from under the drain's
-           -- finalize, which then misses its CAS and never releases the
-           -- materialization pod. A row marked `started` or `paused` still
-           -- converges: a node reporting `stopped` for it means the restore
-           -- ended in a stopped VM, which the drain's re-drive can't recover.
-           AND NOT (
-               LOWER(TRIM(s.lifecycle)) = 'restoring'
-               AND s.evacuation_restore_target IS NOT DISTINCT FROM 'stopped'
-           )
-         RETURNING s.id"
-        ))
-        .bind(node_id)
-        .bind(stopped_rows)
-        .fetch_all(&mut *conn)
+        pplx_space_sandbox_store::ingest::converge_published_stopped(
+            &mut *conn,
+            node_id,
+            stopped_rows,
+        )
         .await
         .map_err(|err| Status::internal(format!("promote stopped sandbox lifecycle: {err}")))?
     };
