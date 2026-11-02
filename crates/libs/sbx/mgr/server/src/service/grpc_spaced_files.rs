@@ -131,12 +131,14 @@ impl SandboxManagerService {
             }
         };
 
-        // CPU time comes from the cgroup inspect reads `cpu_max` from. Only
-        // node-manager can read it: sandbox-manager runs in its own cgroup
-        // namespace, without the host cgroup tree. A sandbox without a cgroup
-        // has no running VM to account for. An inspected cgroup without a
-        // usage line is logged: a silent zero is how a wrong cgroup path once
-        // went unnoticed.
+        // CPU time comes from the cgroup inspect reads `cpu_max` from. Stats
+        // reads it through node-manager's inspect, which sees the host cgroup
+        // tree on every install. Sandbox-manager sees that tree only when it
+        // runs on the host or its deployment mounts the sandbox cgroup parent;
+        // the watchdog's evidence sample reads the VM cgroup directly in those
+        // cases. A sandbox without a cgroup has no running VM to account for.
+        // An inspected cgroup without a usage line is logged: a silent zero is
+        // how a wrong cgroup path once went unnoticed.
         let cpu_usage_usec = if inspect.cgroup_exists {
             cpu_stat_usage_usec(&inspect.cgroup_cpu_stat).unwrap_or_else(|| {
                 tracing::warn!(sandbox_id = %id, "inspected cgroup has no cpu.stat usage_usec");

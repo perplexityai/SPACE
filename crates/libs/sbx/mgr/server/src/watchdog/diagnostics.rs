@@ -71,9 +71,10 @@ const SMALL_FILE_MAX_BYTES: u64 = 16 * 1024;
 const HOST_READS_IN_FLIGHT: usize = admission::EVIDENCE_COLLECTORS;
 const GUEST_CONSOLE_LOG_FILE: &str = "guest-console.log";
 /// Where sandbox-manager sees the node's sandbox cgroup parent,
-/// `/sys/fs/cgroup/space`. Its container has its own cgroup namespace, so its
-/// `/sys/fs/cgroup` is only the container's cgroup; the sandbox-manager chart
-/// mounts the parent here read-only.
+/// `/sys/fs/cgroup/space`, when it runs in a container. The container has its
+/// own cgroup namespace, so its `/sys/fs/cgroup` is only the container's
+/// cgroup; the sandbox-manager chart mounts the parent here read-only. A
+/// sandbox-manager on the host reads the parent where it is.
 const SANDBOX_CGROUP_PARENT: &str = "/space/cgroup";
 const MIB: u64 = 1024 * 1024;
 
@@ -877,6 +878,7 @@ impl TransitionEvidence {
 pub(super) async fn run_evidence_collector(
     queue: Arc<EvidenceQueue>,
     sidecars: Arc<Mutex<HashMap<String, SidecarInfo>>>,
+    cgroup_parent: Arc<Path>,
     reads: HostReads,
     shutdown_token: CancellationToken,
 ) {
@@ -892,8 +894,7 @@ pub(super) async fn run_evidence_collector(
             .await
             .get(&request.sandbox_id)
             .map(EvidenceTarget::of);
-        let paths =
-            EvidencePaths::for_sandbox(Path::new(SANDBOX_CGROUP_PARENT), &request.sandbox_id);
+        let paths = EvidencePaths::for_sandbox(&cgroup_parent, &request.sandbox_id);
         let evidence = tokio::select! {
             biased;
             _ = shutdown_token.cancelled() => return,
@@ -918,6 +919,30 @@ pub(super) async fn run_evidence_collector(
 
 pub(super) fn host_reads() -> HostReads {
     HostReads::new(HOST_READS_IN_FLIGHT)
+}
+
+/// Where the collectors find the VMs' jailer cgroups, chosen once when they
+/// start and logged: [`SANDBOX_CGROUP_PARENT`] when the deployment mounts it,
+/// otherwise the host path.
+pub(super) async fn sandbox_cgroup_parent() -> Arc<Path> {
+    let parent = choose_cgroup_parent(Path::new(SANDBOX_CGROUP_PARENT)).await;
+    tracing::info!(
+        target: super::LOG_TARGET,
+        cgroup_parent = %parent.display(),
+        "guest-health evidence samples VM jailer cgroups under this parent"
+    );
+    parent.into()
+}
+
+/// `mounted` when it is a directory, as in a container whose deployment
+/// mounts the node's sandbox cgroup parent there; otherwise the parent's host
+/// path, which a sandbox-manager on the host sees. A container without the
+/// mount then reports the host path's read failures.
+async fn choose_cgroup_parent(mounted: &Path) -> PathBuf {
+    match tokio::fs::metadata(mounted).await {
+        Ok(metadata) if metadata.is_dir() => mounted.to_path_buf(),
+        _ => PathBuf::from(pplx_space_node_runtime_core::cgroup_paths::CGROUP_BASE),
+    }
 }
 
 const FIRECRACKER_LOG_TAIL: TailWindow = TailWindow {

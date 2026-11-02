@@ -821,8 +821,8 @@ message InspectSandboxResponse {
   string cgroup_pids_max = 34;
   string cgroup_pids_current = 35;
   // The cgroup's raw cpu.stat; empty when the cgroup does not exist.
-  // Sandbox-manager reports CPU time from it: it has no view of the host
-  // cgroup tree.
+  // Sandbox-manager reports CPU time from it, since it may have no view of
+  // the host cgroup tree.
   string cgroup_cpu_stat = 36;
 
   // Filesystem

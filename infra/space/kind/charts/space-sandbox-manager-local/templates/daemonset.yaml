@@ -200,7 +200,9 @@ spec:
           hostPath:
             path: /space/etc
             type: DirectoryOrCreate
-        # Created before kubelet starts, by space-cgroup.service on the node.
+        # Created at boot by space-cgroup.service (the Kind node image orders
+        # it before kubelet); node-manager also requires it. Until it exists,
+        # kubelet retries the mount and the pod waits in ContainerCreating.
         - name: sandbox-cgroups
           hostPath:
             path: /sys/fs/cgroup/space

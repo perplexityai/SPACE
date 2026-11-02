@@ -513,3 +513,20 @@ async fn resource_sample_reads_the_vm_cgroup_under_the_mounted_parent() {
             .starts_with(&vm_cgroup.join("cpu.stat").display().to_string())
     );
 }
+
+#[tokio::test]
+async fn cgroup_parent_is_the_mount_when_present_and_the_host_path_otherwise() {
+    use pplx_space_node_runtime_core::cgroup_paths::{jailer_cgroup_path, jailer_cgroup_path_in};
+
+    let sandbox_id = pplx_space_common_core::types::SandboxId::new().to_string();
+    let mounted = tempfile::tempdir().unwrap();
+    assert_eq!(choose_cgroup_parent(mounted.path()).await, mounted.path());
+
+    // Without the mount, as for a sandbox-manager on the host, the VM cgroup
+    // is the one the node runtime places the VM in.
+    let parent = choose_cgroup_parent(&mounted.path().join("absent")).await;
+    assert_eq!(
+        jailer_cgroup_path_in(&parent, &sandbox_id),
+        jailer_cgroup_path(&sandbox_id)
+    );
+}

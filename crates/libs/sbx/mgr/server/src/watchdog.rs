@@ -2161,11 +2161,13 @@ async fn composed_health_loop(
         diagnostics::admission::EVIDENCE_QUEUE_CAPACITY,
     ));
     let host_reads = diagnostics::host_reads();
+    let cgroup_parent = diagnostics::sandbox_cgroup_parent().await;
     let mut evidence_collectors = tokio::task::JoinSet::new();
     for _ in 0..diagnostics::admission::EVIDENCE_COLLECTORS {
         evidence_collectors.spawn(diagnostics::run_evidence_collector(
             Arc::clone(&evidence_queue),
             Arc::clone(&sidecars),
+            Arc::clone(&cgroup_parent),
             host_reads.clone(),
             shutdown_token.clone(),
         ));
