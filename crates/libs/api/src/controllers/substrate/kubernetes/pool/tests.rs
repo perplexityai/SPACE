@@ -445,6 +445,18 @@ async fn postgres_claim_and_bind_pool_slot() -> TestResult {
         materialized,
         "an execution born with its slot's pod records that it materialized one"
     );
+    let (tracked, requested): (bool, bool) = sqlx::query_as(sql!(
+        "SELECT pod_create_intent_tracked, pod_create_requested_at IS NOT NULL
+           FROM sandbox_k8s_executions
+          WHERE sandbox_id = $1"
+    ))
+    .bind(slot.sandbox_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(
+        tracked && requested,
+        "an execution born with its slot's pod records a pod-create intent"
+    );
 
     Ok(())
 }

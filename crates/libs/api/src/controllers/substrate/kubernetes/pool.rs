@@ -539,14 +539,18 @@ pub(super) async fn persist_pooled_execution_claim(
             ControllerError::internal("claimed pool slot missing during execution bind")
         })?;
 
+    // The slot's pod already exists, so the row records its pod-create
+    // intent as it's inserted.
     sqlx::query(sql!(
         "INSERT INTO sandbox_k8s_executions (
              sandbox_id, generation, pod_name, pod_namespace, pod_uid, pod_ip,
-             k8s_node_name, state, active, route_activation_id, pod_materialized_at
+             k8s_node_name, state, active, route_activation_id, pod_materialized_at,
+             pod_create_intent_tracked, pod_create_requested_at
          )
          VALUES (
              $1, 1, $2, $3, $4, $5::inet, $6, 'running', TRUE, $7,
-             CASE WHEN NULLIF(BTRIM($4::TEXT), '') IS NOT NULL THEN NOW() END
+             CASE WHEN NULLIF(BTRIM($4::TEXT), '') IS NOT NULL THEN NOW() END,
+             TRUE, NOW()
          )"
     ))
     .bind(claim.sandbox_id)

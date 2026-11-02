@@ -560,7 +560,7 @@ impl KubernetesSubstrate {
         //     reopen the orphan gap, so fail retryably before creating one.
         //   * `Ok(false)`: a concurrent winner already materialized the row, or
         //     this attempt lost the restore-lease fence — step aside.
-        match self
+        let pod_create_intent = match self
             .store
             .reset_active_execution_to_creating_if_generation(
                 sandbox.id,
@@ -570,8 +570,8 @@ impl KubernetesSubstrate {
             )
             .await
         {
-            Ok(true) => {}
-            Ok(false) => {
+            Ok(Some(intent)) => intent,
+            Ok(None) => {
                 tracing::info!(
                     sandbox_id = %sandbox.id,
                     pod_name = %pod_name,
@@ -582,7 +582,7 @@ impl KubernetesSubstrate {
                 return Ok(RedriveOutcome::OwnershipLost);
             }
             Err(err) => return Err(err),
-        }
+        };
 
         // Everything past the confirmed delete + reset runs under one failure
         // handler: the pinned pod is gone and the row is `creating`, so an error
@@ -645,6 +645,7 @@ impl KubernetesSubstrate {
 
             let cross_node_pod = match create_sandbox_pod(
                 &self.k8s,
+                pod_create_intent,
                 self.sandbox_pod_request(
                     sandbox,
                     &claim.row,

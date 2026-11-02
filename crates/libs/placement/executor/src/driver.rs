@@ -15,6 +15,12 @@ use pplx_space_placement::PodRef;
 pub trait PodDriver: Send + Sync {
     /// Materialize the pod for a claimed attempt. An existing pod for the
     /// same attempt is adopted, not duplicated.
+    ///
+    /// The placement store inserts the attempt's execution row as tracking
+    /// pod-create intent, so a real driver must stamp the row's
+    /// `pod_create_requested_at` before it creates the pod, as the api
+    /// substrate's creates do. Node drain's pod-less give-up reads a tracked
+    /// row with no stamp as proof that no pod was ever created for it.
     fn create_pod(
         &self,
         request: CreatePodRequest,

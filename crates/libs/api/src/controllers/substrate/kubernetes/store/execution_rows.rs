@@ -23,6 +23,10 @@ impl K8sStore {
     /// pod's name, route identity, and readiness identity. The row is
     /// inactive, so nothing routes to it. A no-op when the sandbox already
     /// has execution rows.
+    ///
+    /// The row stays untracked for pod-create intent: the slot's pod was
+    /// created under its name without any stamp, so its row can't claim that
+    /// no pod was ever requested.
     pub(in crate::controllers::substrate::kubernetes) async fn retire_pool_reserved_generation(
         &self,
         sandbox_id: SandboxId,
@@ -88,9 +92,10 @@ impl K8sStore {
 
         let row = sqlx::query_as::<_, SandboxExecutionRow>(sql!(
             "INSERT INTO sandbox_k8s_executions (
-                 sandbox_id, generation, pod_name, pod_namespace, state, active
+                 sandbox_id, generation, pod_name, pod_namespace, state, active,
+                 pod_create_intent_tracked
              )
-             VALUES ($1, $2, $3, $4, 'creating', TRUE)
+             VALUES ($1, $2, $3, $4, 'creating', TRUE, TRUE)
              ON CONFLICT DO NOTHING
              RETURNING generation, pod_name, FALSE AS pod_materialized, state,
                        FALSE AS create_age_expired, activation_attempt_id,
@@ -1078,13 +1083,16 @@ impl K8sStore {
     /// [`Self::abandon_unmaterialized_create_claim_by_generation`]) and scoped
     /// to a not-yet-routable row (`pod_ip IS NULL`), so a successor another
     /// attempt already materialized to a running pod is never clobbered.
+    ///
+    /// Returns the pod-create intent the re-drive's create needs, or `None`
+    /// when the reset matched no row.
     pub(in crate::controllers::substrate::kubernetes) async fn reset_active_execution_to_creating_if_generation(
         &self,
         sandbox_id: SandboxId,
         generation: i64,
         restore_lease_token: Option<Uuid>,
         activation_attempt_id: Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
-    ) -> Result<bool, SubstrateError> {
+    ) -> Result<Option<PodCreateIntent>, SubstrateError> {
         let mut tx = self
             .pool
             .begin()
@@ -1094,10 +1102,11 @@ impl K8sStore {
             tx.commit()
                 .await
                 .db_context("failed to commit create claim reset transaction")?;
-            return Ok(false);
+            return Ok(None);
         }
         // Clearing the pod UID stamps `pod_materialized_at` first if the row
-        // held one, so the record that a pod ran outlives the UID.
+        // held one, so the record that a pod ran outlives the UID. The
+        // re-drive's create follows, so the pod-create intent is stamped too.
         let reset = sqlx::query(sql!(
             "UPDATE sandbox_k8s_executions
              SET pod_uid = NULL,
@@ -1106,6 +1115,7 @@ impl K8sStore {
                      pod_materialized_at,
                      CASE WHEN NULLIF(BTRIM(pod_uid), '') IS NOT NULL THEN NOW() END
                  ),
+                 pod_create_requested_at = COALESCE(pod_create_requested_at, NOW()),
                  state = 'creating',
                  updated_at = NOW()
              WHERE sandbox_id = $1
@@ -1126,7 +1136,7 @@ impl K8sStore {
         tx.commit()
             .await
             .db_context("failed to commit create claim reset transaction")?;
-        Ok(reset)
+        Ok(PodCreateIntent::stamped(sandbox_id, generation, reset))
     }
 
     pub(in crate::controllers::substrate::kubernetes) async fn active_execution_is_generation(

@@ -297,7 +297,9 @@ pub fn sandbox_failed_on_node(node_id: &str, pre_lifecycle: &str) {
 /// gained an evacuation marker or is gone, or the node stopped
 /// force-draining), `no_pod_name` (the execution rows changed between
 /// reads), `generation_changed` (a newer generation appeared since the
-/// reads), `snapshot_changed`, and `lock_contended`.
+/// reads), `pod_create_requested` (a generation the node's answer stepped
+/// past, as one that never requested a pod, recorded a pod-create intent
+/// before the revert), `snapshot_changed`, and `lock_contended`.
 ///
 /// Can keep the drain parked indefinitely, so each also WARNs, paced per node
 /// and reason; the give-up never fails these rows, so they wait for the
@@ -311,9 +313,9 @@ pub fn sandbox_failed_on_node(node_id: &str, pre_lifecycle: &str) {
 /// than the newest ready snapshot, a newer full snapshot in another state,
 /// or two ready snapshots tied as newest). And the node: `no_execution_row`
 /// (no generation to ask it about), `node_pending` (no delete receipt covers
-/// the newest generation: the node never learned it, still holds a row for
-/// it without a durable artifact, or has no row and no receipt for the
-/// sandbox), `node_suspended` (it holds a suspended local row),
+/// the newest generation that may have run: the node never learned it, still
+/// holds a row for it without a durable artifact, or has no row and no
+/// receipt for the sandbox), `node_suspended` (it holds a suspended local row),
 /// `node_superseded` (a newer execution owns the local state, or a
 /// generation-fenced stop or activation rollback retired this one),
 /// `node_refused` (it refused the generation: a quarantined row, a job with

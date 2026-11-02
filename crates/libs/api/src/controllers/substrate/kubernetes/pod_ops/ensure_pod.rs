@@ -985,7 +985,7 @@ impl KubernetesSubstrate {
             return Err(error);
         }
 
-        if !self
+        let Some(pod_create_intent) = self
             .store
             .claim_active_execution_pod_materialization(
                 sandbox.id,
@@ -993,7 +993,7 @@ impl KubernetesSubstrate {
                 claim_lifecycle,
             )
             .await?
-        {
+        else {
             tracing::debug!(
                 sandbox_id = %sandbox.id,
                 pod_name = %claim.row.pod_name,
@@ -1001,10 +1001,11 @@ impl KubernetesSubstrate {
                 "skipping Kubernetes sandbox pod create for replaced execution generation"
             );
             return Ok(());
-        }
+        };
 
         let pod_result = create_sandbox_pod(
             &self.k8s,
+            pod_create_intent,
             self.sandbox_pod_request(
                 &sandbox,
                 &claim.row,

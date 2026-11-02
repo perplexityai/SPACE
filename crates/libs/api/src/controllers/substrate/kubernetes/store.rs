@@ -377,6 +377,45 @@ pub(super) fn classify_activation_route_publication(
     })
 }
 
+/// Proof that an execution row's `pod_create_requested_at` was stamped, so a
+/// pod may now be created for it.
+///
+/// Node drain's pod-less give-up reads a tracked row with no stamp as proof
+/// that no pod was ever requested for that generation, so a create that skipped
+/// the stamp would make that proof false. `create_sandbox_pod` takes this
+/// token, and only the store writes that stamp the column construct one (the
+/// field is private to this module and its children), so a pod create path
+/// that forgets the stamp doesn't compile. It's neither `Copy` nor `Clone`,
+/// and `create_sandbox_pod` takes it by value, so one stamp authorizes one
+/// create.
+#[derive(Debug, PartialEq, Eq)]
+#[must_use = "a recorded pod-create intent exists to authorize a pod create"]
+pub(super) struct PodCreateIntent {
+    sandbox_id: SandboxId,
+    generation: i64,
+}
+
+impl PodCreateIntent {
+    /// The token for a stamp write, when it applied. Private to the store
+    /// module, so the writes that stamp the column are the only minters.
+    fn stamped(sandbox_id: SandboxId, generation: i64, applied: bool) -> Option<Self> {
+        applied.then_some(Self {
+            sandbox_id,
+            generation,
+        })
+    }
+
+    /// The sandbox whose execution row carries the stamp.
+    pub(super) fn sandbox_id(&self) -> SandboxId {
+        self.sandbox_id
+    }
+
+    /// The generation whose execution row carries the stamp.
+    pub(super) fn generation(&self) -> i64 {
+        self.generation
+    }
+}
+
 fn normalize_pod_uid(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }

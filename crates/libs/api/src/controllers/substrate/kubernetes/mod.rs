@@ -70,7 +70,7 @@ use cancel_rate_tracker::CancelRateTracker;
 use restore_waiters::RestoreWaiters;
 use store::{
     ActiveExecutionState, K8sStore, NodeLifecycleState, NodeStateWrite, PlacementClock,
-    PreparedWakeSandbox, RestoreClaim, RestoreClaimRevert, SandboxExecutionRow,
+    PodCreateIntent, PreparedWakeSandbox, RestoreClaim, RestoreClaimRevert, SandboxExecutionRow,
     StartedRecoveryClaim, StartedRecoveryCompletion, StartedRecoveryObservation,
     UserRestoreObservation,
 };
@@ -615,8 +615,13 @@ fn is_wake_recovery_lifecycle(lifecycle: &str) -> bool {
     )
 }
 
+/// Create a sandbox pod. `intent` is the store's record that this execution's
+/// `pod_create_requested_at` is stamped, which every create must carry: node
+/// drain's pod-less give-up reads a tracked execution without the stamp as
+/// proof that no pod was ever created for it.
 async fn create_sandbox_pod(
     k8s: &KubernetesState,
+    intent: PodCreateIntent,
     mut request: SandboxPodRequest<'_>,
 ) -> Result<SandboxPodView, KubeError> {
     let common = match &mut request {
@@ -624,6 +629,11 @@ async fn create_sandbox_pod(
         | SandboxPodRequest::Restore { common, .. }
         | SandboxPodRequest::Pooled { common, .. } => common,
     };
+    debug_assert_eq!(
+        (intent.sandbox_id(), intent.generation()),
+        (common.sandbox_id, common.execution_generation),
+        "a pod create must carry the intent recorded for its own execution"
+    );
     let span = tracing::info_span!(
         "substrate.k8s.materialize_pod",
         otel.kind = "producer",

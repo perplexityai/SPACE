@@ -94,12 +94,15 @@ impl K8sStore {
         Ok(result.is_some())
     }
 
+    /// Claim the active execution's pod materialization, and record the
+    /// pod-create intent the create that follows needs. `None` when the
+    /// generation is no longer active.
     pub(in crate::controllers::substrate::kubernetes) async fn claim_active_execution_pod_materialization(
         &self,
         sandbox_id: SandboxId,
         generation: i64,
         expected_lifecycle: SandboxLifecycle,
-    ) -> Result<bool, SubstrateError> {
+    ) -> Result<Option<PodCreateIntent>, SubstrateError> {
         let mut tx = self
             .pool
             .begin()
@@ -110,7 +113,8 @@ impl K8sStore {
             .await?;
 
         // Clearing the pod UID stamps `pod_materialized_at` first if the row
-        // held one, so the record that a pod ran outlives the UID.
+        // held one, so the record that a pod ran outlives the UID. The
+        // pod-create intent is stamped here, before the create, and kept.
         let claimed = sqlx::query(sql!(
             "UPDATE sandbox_k8s_executions
              SET state = CASE WHEN state = 'recovering' THEN state ELSE 'creating' END,
@@ -120,6 +124,7 @@ impl K8sStore {
                      pod_materialized_at,
                      CASE WHEN NULLIF(BTRIM(pod_uid), '') IS NOT NULL THEN NOW() END
                  ),
+                 pod_create_requested_at = COALESCE(pod_create_requested_at, NOW()),
                  updated_at = NOW()
              WHERE sandbox_id = $1 AND generation = $2 AND active
              RETURNING 1"
@@ -134,7 +139,30 @@ impl K8sStore {
         tx.commit()
             .await
             .db_context("failed to commit pod materialization transaction")?;
-        Ok(claimed)
+        Ok(PodCreateIntent::stamped(sandbox_id, generation, claimed))
+    }
+
+    /// Stamp the active generation's pod-create intent before a cold create
+    /// sends its pod. `None` when the generation is no longer active, so no
+    /// pod may be created for it.
+    pub(in crate::controllers::substrate::kubernetes) async fn record_pod_create_intent(
+        &self,
+        sandbox_id: SandboxId,
+        generation: i64,
+    ) -> Result<Option<PodCreateIntent>, SubstrateError> {
+        let recorded = sqlx::query(sql!(
+            "UPDATE sandbox_k8s_executions
+             SET pod_create_requested_at = COALESCE(pod_create_requested_at, NOW())
+             WHERE sandbox_id = $1 AND generation = $2 AND active
+             RETURNING 1"
+        ))
+        .bind(sandbox_id)
+        .bind(generation)
+        .fetch_optional(&self.pool)
+        .await
+        .db_context("failed to record pod-create intent")?
+        .is_some();
+        Ok(PodCreateIntent::stamped(sandbox_id, generation, recorded))
     }
 
     pub(in crate::controllers::substrate::kubernetes) async fn persist_materialized_pod_metadata(

@@ -252,10 +252,23 @@ impl SubstrateAdapter for KubernetesSubstrate {
         // failure gives the claim back before the error is returned.
         let prepared = async {
             let mut setup = PerSandboxSetup::from_create_request(&request);
-            setup.auto_lifecycle = self
-                .store
-                .auto_lifecycle_policy_after_claim(sandbox_id)
-                .await?;
+            // The stamp and the policy read are independent, so they share one
+            // round trip of latency. A stamp whose create never follows only
+            // makes node drain hold the row; the release below retires it.
+            let (auto_lifecycle, pod_create_intent) = tokio::try_join!(
+                self.store.auto_lifecycle_policy_after_claim(sandbox_id),
+                self.store
+                    .record_pod_create_intent(sandbox_id, execution.generation),
+            )?;
+            setup.auto_lifecycle = auto_lifecycle;
+            let pod_create_intent =
+                pod_create_intent.ok_or_else(|| SubstrateError::Unavailable {
+                    message: format!(
+                        "sandbox {sandbox_id} execution generation {} was retired before its \
+                         pod create",
+                        execution.generation
+                    ),
+                })?;
             let cold_metadata = setup.into_cold_pod_metadata(cold_network_policy_generation)?;
             let fork_restore = request
                 .restore_from
@@ -270,10 +283,10 @@ impl SubstrateAdapter for KubernetesSubstrate {
                         })
                 })
                 .transpose()?;
-            Ok::<_, SubstrateError>((cold_metadata, fork_restore))
+            Ok::<_, SubstrateError>((cold_metadata, fork_restore, pod_create_intent))
         }
         .await;
-        let (cold_metadata, fork_restore) = match prepared {
+        let (cold_metadata, fork_restore, pod_create_intent) = match prepared {
             Ok(prepared) => prepared,
             Err(err) => {
                 cancel_guard.release_claim().await;
@@ -333,7 +346,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
         // From here until the response, the apiserver may accept a pod this
         // call never learns, so the guard keeps the claim that names it.
         cancel_guard.begin_pod_create();
-        let pod = match create_sandbox_pod(&self.k8s, pod_request)
+        let pod = match create_sandbox_pod(&self.k8s, pod_create_intent, pod_request)
             .instrument(tracing::info_span!(
                 "substrate.k8s.create_pod",
                 sandbox_id = %sandbox_id,

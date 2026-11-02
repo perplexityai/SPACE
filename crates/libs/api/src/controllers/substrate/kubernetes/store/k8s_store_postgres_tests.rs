@@ -14,6 +14,7 @@ mod cleanup_recovery_lifecycle_matrix_tests;
 mod lifecycle_writer_tests;
 mod materialization_record_tests;
 mod owned_restore_completion_tests;
+mod pod_create_intent_tests;
 mod restore_revert_tests;
 mod runtime_upgrade_evidence_tests;
 mod started_recovery_observation_tests;
@@ -2300,7 +2301,8 @@ async fn pod_materialization_claim_publishes_fresh_lease(fixture: &PostgresStore
                 claim.row.generation,
                 SandboxLifecycle::Started,
             )
-            .await?,
+            .await?
+            .is_some(),
         "active execution should claim pod materialization"
     );
 
@@ -3793,6 +3795,7 @@ async fn reset_active_execution_to_creating_reopens_a_scheduled_pinned_claim(
             .store
             .reset_active_execution_to_creating_if_generation(sandbox_id, generation, None, None,)
             .await?
+            .is_some()
     );
     assert!(
         fixture
@@ -3833,7 +3836,7 @@ async fn reset_active_execution_to_creating_reopens_a_scheduled_pinned_claim(
         .persist_pod_metadata(fenced_id, fenced_generation, Some("pinned-pod-uid"), None)
         .await?;
     assert!(
-        !fixture
+        fixture
             .store
             .reset_active_execution_to_creating_if_generation(
                 fenced_id,
@@ -3841,7 +3844,8 @@ async fn reset_active_execution_to_creating_reopens_a_scheduled_pinned_claim(
                 Some(foreign_token),
                 None,
             )
-            .await?,
+            .await?
+            .is_none(),
         "a foreign lease token must not reset another owner's claim"
     );
     let fenced_state: String = sqlx::query_scalar(sql!(
@@ -3863,7 +3867,8 @@ async fn reset_active_execution_to_creating_reopens_a_scheduled_pinned_claim(
                 Some(owner_token),
                 None,
             )
-            .await?,
+            .await?
+            .is_some(),
         "the current lease owner can reset its own claim"
     );
 

@@ -202,11 +202,14 @@ impl PostgresPlacementStore {
                 .fetch_one(&mut **tx)
                 .await?;
                 let pod_name = format!("space-sbx-{}-g{}", sandbox.as_uuid().simple(), generation);
+                // Tracked: the api substrate creates this row's pod, and every
+                // create there stamps `pod_create_requested_at` first.
                 let inserted = sqlx::query_scalar::<_, i64>(sql!(
                     "INSERT INTO sandbox_k8s_executions (
-                         sandbox_id, generation, pod_name, pod_namespace, state, active
+                         sandbox_id, generation, pod_name, pod_namespace, state, active,
+                         pod_create_intent_tracked
                      )
-                     VALUES ($1, $2, $3, $4, 'creating', TRUE)
+                     VALUES ($1, $2, $3, $4, 'creating', TRUE, TRUE)
                      ON CONFLICT DO NOTHING
                      RETURNING generation"
                 ))

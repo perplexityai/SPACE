@@ -8,8 +8,8 @@
 //! and revert stamps `sandboxes.lifecycle_changed_at` each time, so the repair
 //! loops that age rows on that clock never see this one age.
 //!
-//! The give-up reverts such a row to `suspended`, off the node, once four
-//! things are proven and a durable suspend snapshot can restore it:
+//! The give-up reverts such a row to `suspended`, off the node, once the
+//! following are proven and a durable suspend snapshot can restore it:
 //!
 //! - **No pod, by an authoritative read.** Every pod name the sandbox has had
 //!   is read uncached from the apiserver, each in the namespace its execution
@@ -61,14 +61,32 @@
 //!   quarantined row), a durable suspend (the node holds a suspended local
 //!   row; a node publishing normally also reports it as a `suspended`
 //!   observed record, which the VM guard refuses first), or an unreadable
-//!   node. Older generations aren't asked: their receipt can't cover a newer
-//!   one, and missing pod history doesn't prove the newer one never ran,
-//!   since `pod_materialized_at` and `pod_uid` are written only once the pod
-//!   watcher records a pod, and nothing is recorded before a pod is created.
+//!   node.
+//! - **A generation that never requested a pod is stepped past.** Missing pod
+//!   history isn't proof a generation never ran: `pod_materialized_at` and
+//!   `pod_uid` are written only once the pod watcher records a pod. What is
+//!   proof is the pod-create intent: the substrate stamps
+//!   `pod_create_requested_at` before every pod create for a row it inserted
+//!   with `pod_create_intent_tracked` (its pod create takes the stamp's token,
+//!   so a create path without one doesn't compile). A tracked row with no stamp
+//!   and no pod evidence never had a pod created, so the node can't have run
+//!   it. When the node answers pending for such a generation, the next older
+//!   one is asked, and a delete receipt covering it releases the row. Any other
+//!   generation stops the walk: an untracked row (one from before the stamp
+//!   existed, or the warm-pool-reserved generation 1, whose pod was created
+//!   under its name unstamped) is unknown, as is a stamped one, so its pending
+//!   answer parks, and an older generation's receipt never covers it. The
+//!   transaction re-checks, under the row locks, that every generation it
+//!   stepped past is still unstamped.
 //!
-//! Liveness gives way to that. A newest generation that never reached the
-//! node answers pending, and no receipt can cover it, so a started recovery
-//! that stalled before materializing its pod parks and isn't released.
+//! Liveness gives way to that. A newest generation that reached the node, or
+//! may have, answers pending until the node deletes it, so a started recovery
+//! that stalled after its pod-create stamp parks and isn't released; one that
+//! stalled before it releases on the older generation's receipt. A tracked row
+//! is trusted only if every writer that can create its pod stamps first, so
+//! enable the give-up only once every API replica runs a release that does,
+//! and turn it off before rolling the API back past one: an older replica
+//! re-materializing a tracked row would leave it unstamped.
 //! A node that can't be reached never vouches, so a forced drain of a dead
 //! node parks on its pod-less residents. A delete receipt is kept on the
 //! node for a week, and one that never had a generation is never written;
@@ -176,6 +194,9 @@ pub enum PodLessHold {
     NoPodName,
     /// A newer generation appeared after the pod reads and the node's answer.
     GenerationChanged,
+    /// A generation the node's answer stepped past, as one that never
+    /// requested a pod, recorded a pod-create intent before the revert.
+    PodCreateRequested,
     /// The snapshot state changed between the guards and the revert.
     SnapshotChanged,
     /// A row lock wasn't granted inside the bound, or the transaction lost a
@@ -200,9 +221,9 @@ pub enum PodLessHold {
     HeldForDataSafety,
     /// No execution row, so no generation to ask the node about.
     NoExecutionRow,
-    /// No delete receipt covers the newest generation: the node never
-    /// learned it, still holds a row for it without a durable artifact, or
-    /// has no row and no receipt for the sandbox.
+    /// No delete receipt covers the newest generation that may have run: the
+    /// node never learned it, still holds a row for it without a durable
+    /// artifact, or has no row and no receipt for the sandbox.
     NodePending,
     /// The node holds a suspended local row.
     NodeSuspended,
@@ -228,6 +249,7 @@ impl PodLessHold {
             Self::PodPresent => "pod_present",
             Self::PodUnreadable => "pod_unreadable",
             Self::GenerationChanged => "generation_changed",
+            Self::PodCreateRequested => "pod_create_requested",
             Self::SnapshotChanged => "snapshot_changed",
             Self::LockContended => "lock_contended",
             Self::NoRestoreSource => "no_restore_source",
@@ -249,6 +271,7 @@ impl PodLessHold {
             | Self::RowDrifted
             | Self::NoPodName
             | Self::GenerationChanged
+            | Self::PodCreateRequested
             | Self::SnapshotChanged
             | Self::LockContended => true,
             Self::VmObserved
@@ -276,6 +299,10 @@ pub(crate) struct PodRef {
     pub(crate) generation: ExecutionGeneration,
     pub(crate) pod_namespace: String,
     pub(crate) pod_name: String,
+    /// The row tracks pod-create intent and records none, and no pod UID,
+    /// pod IP or materialization: no pod was ever created for this
+    /// generation, so the node can't have run it.
+    pub(crate) pod_never_requested: bool,
 }
 
 /// Uncached pod reads, behind a seam so the absence decision can be tested
@@ -358,7 +385,14 @@ pub(crate) async fn pod_refs(
     sandbox_id: SandboxId,
 ) -> Result<Vec<PodRef>, sqlx::Error> {
     sqlx::query_as(sql!(
-        "SELECT generation, pod_namespace, pod_name
+        "SELECT generation, pod_namespace, pod_name,
+                (
+                    pod_create_intent_tracked
+                    AND pod_create_requested_at IS NULL
+                    AND pod_materialized_at IS NULL
+                    AND NULLIF(BTRIM(pod_uid), '') IS NULL
+                    AND pod_ip IS NULL
+                ) AS pod_never_requested
            FROM sandbox_k8s_executions
           WHERE sandbox_id = $1
           ORDER BY generation DESC"
@@ -531,35 +565,52 @@ pub(crate) trait GenerationTeardownObserver: Sync {
     ) -> impl Future<Output = Result<GenerationTeardownEvidence, SubstrateError>> + Send;
 }
 
-/// `Ok(())` when the node vouches that the sandbox's local state is gone: a
-/// local delete receipt covers `newest`, the newest generation the database
-/// knows. Anything else is the hold.
+/// The generation whose local delete receipt vouches that the sandbox's
+/// local state is gone, when the node has one. Anything else is the hold.
 ///
-/// Only the newest generation is asked. A receipt covers the generation it
-/// names and every older one, so a delete of the newest answers for all of
-/// them, while a delete of an older one says nothing about a newer
-/// generation that may have run without the database recording its pod.
+/// `refs` is [`pod_refs`]' newest-first list, whose head must be `newest`,
+/// the newest generation the guards saw. The node is asked about the newest
+/// generation first. A receipt covers the generation it names and every
+/// older one, so a delete answers for all of them. A pending answer for a
+/// generation that never requested a pod ([`PodRef::pod_never_requested`]) is
+/// what the node says of a generation it never ran, so the next older one is
+/// asked. A pending answer for any other generation parks: an older
+/// generation's receipt says nothing about a newer one that may have run
+/// without the database recording its pod.
 pub(crate) async fn node_vouches<O: GenerationTeardownObserver>(
     observer: &O,
     newest: ExecutionGeneration,
-) -> Result<(), PodLessHold> {
-    match observer.observe(newest).await {
-        Ok(GenerationTeardownEvidence::Deleted) => Ok(()),
-        Ok(GenerationTeardownEvidence::Pending) => Err(PodLessHold::NodePending),
-        Ok(GenerationTeardownEvidence::Durable) => Err(PodLessHold::NodeSuspended),
-        Ok(GenerationTeardownEvidence::Superseded) => Err(PodLessHold::NodeSuperseded),
-        Ok(GenerationTeardownEvidence::Refused) => Err(PodLessHold::NodeRefused),
-        Err(_) => Err(PodLessHold::NodeUnreadable),
+    refs: &[PodRef],
+) -> Result<ExecutionGeneration, PodLessHold> {
+    if refs.first().map(|pod| pod.generation) != Some(newest) {
+        return Err(PodLessHold::GenerationChanged);
     }
+    for pod in refs {
+        match observer.observe(pod.generation).await {
+            Ok(GenerationTeardownEvidence::Deleted) => return Ok(pod.generation),
+            Ok(GenerationTeardownEvidence::Pending) if pod.pod_never_requested => {}
+            Ok(GenerationTeardownEvidence::Pending) => return Err(PodLessHold::NodePending),
+            Ok(GenerationTeardownEvidence::Durable) => return Err(PodLessHold::NodeSuspended),
+            Ok(GenerationTeardownEvidence::Superseded) => {
+                return Err(PodLessHold::NodeSuperseded);
+            }
+            Ok(GenerationTeardownEvidence::Refused) => return Err(PodLessHold::NodeRefused),
+            Err(_) => return Err(PodLessHold::NodeUnreadable),
+        }
+    }
+    // Every generation is one that never requested a pod and the node never
+    // ran. Nothing should be on the node, but no receipt says so.
+    Err(PodLessHold::NodePending)
 }
 
 /// The give-up's write: re-check every guard under the row locks, then revert
 /// the row and retire its executions.
 ///
 /// Call only once [`node_vouches`] has. `expected` is the newest generation
-/// seen before the pod reads, the one the node vouched for. A newer one
-/// means a pod may have been created since, unread, that the node didn't
-/// vouch for, so the transaction backs out.
+/// seen before the pod reads. A newer one means a pod may have been created
+/// since, unread, that the node didn't vouch for, so the transaction backs
+/// out. `vouched` is the generation whose receipt the node holds; every
+/// generation newer than it must still be one that never requested a pod.
 ///
 /// Locks the node row (shared), then the sandbox row, then every execution
 /// row. Node before sandbox is the order pod placement and the drained-node
@@ -571,8 +622,9 @@ pub(crate) async fn recover_pod_less_sandbox_tx(
     pool: &PgPool,
     candidate: PodLessCandidate,
     expected: ExecutionGeneration,
+    vouched: ExecutionGeneration,
 ) -> Result<PodLessRecovery, sqlx::Error> {
-    match recover_pod_less_sandbox_locked(pool, candidate, expected).await {
+    match recover_pod_less_sandbox_locked(pool, candidate, expected, vouched).await {
         // A lock wait past the bound is contention, not a fault: the next tick
         // retries without a warning.
         // So is losing a deadlock. A node's publish can lock the observed row
@@ -590,6 +642,7 @@ async fn recover_pod_less_sandbox_locked(
     pool: &PgPool,
     candidate: PodLessCandidate,
     expected: ExecutionGeneration,
+    vouched: ExecutionGeneration,
 ) -> Result<PodLessRecovery, sqlx::Error> {
     let mut tx = pool.begin().await?;
     // Each lock wait is bounded like drain completion's lock on the same row.
@@ -615,24 +668,40 @@ async fn recover_pod_less_sandbox_locked(
         .bind(candidate.sandbox_id)
         .execute(&mut *tx)
         .await?;
-    sqlx::query(sql!(
-        "SELECT 1
+    // The lock also re-reads [`pod_refs`]' columns, for the re-check of the
+    // generations the node's answer stepped past.
+    let locked_refs: Vec<PodRef> = sqlx::query_as(sql!(
+        "SELECT generation, pod_namespace, pod_name,
+                (
+                    pod_create_intent_tracked
+                    AND pod_create_requested_at IS NULL
+                    AND pod_materialized_at IS NULL
+                    AND NULLIF(BTRIM(pod_uid), '') IS NULL
+                    AND pod_ip IS NULL
+                ) AS pod_never_requested
            FROM sandbox_k8s_executions
           WHERE sandbox_id = $1
           ORDER BY generation
             FOR UPDATE"
     ))
     .bind(candidate.sandbox_id)
-    .execute(&mut *tx)
+    .fetch_all(&mut *tx)
     .await?;
 
-    let eligible = precheck(&mut *tx, candidate).await?.and_then(|generation| {
-        if generation == expected {
-            Ok(())
-        } else {
-            Err(PodLessHold::GenerationChanged)
-        }
-    });
+    // The generations the node's answer stepped past were read lock-free. A
+    // pod-create stamp locks the execution row, so under these locks it either
+    // committed first and shows in `locked_refs`, or waits and finds its row
+    // retired.
+    let eligible = precheck(&mut *tx, candidate)
+        .await?
+        .and_then(|generation| {
+            if generation == expected {
+                Ok(())
+            } else {
+                Err(PodLessHold::GenerationChanged)
+            }
+        })
+        .and_then(|()| stepped_past_still_unrequested(&locked_refs, vouched));
     if let Err(hold) = eligible {
         tx.rollback().await?;
         return Ok(PodLessRecovery::NotEligible(hold));
@@ -731,6 +800,23 @@ async fn retire_executions(
         .execute(&mut **tx)
         .await?;
     Ok(())
+}
+
+/// `Ok(())` when every generation newer than `vouched` still never requested
+/// a pod.
+pub(crate) fn stepped_past_still_unrequested(
+    refs: &[PodRef],
+    vouched: ExecutionGeneration,
+) -> Result<(), PodLessHold> {
+    if refs
+        .iter()
+        .filter(|pod| pod.generation > vouched)
+        .all(|pod| pod.pod_never_requested)
+    {
+        Ok(())
+    } else {
+        Err(PodLessHold::PodCreateRequested)
+    }
 }
 
 /// Postgres `40P01` (`deadlock_detected`).

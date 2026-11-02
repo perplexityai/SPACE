@@ -42,15 +42,22 @@ async fn user_claim_mints_a_generation_and_lease_fence() -> TestResult {
         Some(attempt.fence.lease.as_uuid()),
         "the row must carry the fence's lease token"
     );
-    let (pod_name, pod_namespace, state, active): (String, String, String, bool) =
-        sqlx::query_as(sql!(
-            "SELECT pod_name, pod_namespace, state, active
+    let (pod_name, pod_namespace, state, active, intent_tracked, pod_create_requested): (
+        String,
+        String,
+        String,
+        bool,
+        bool,
+        bool,
+    ) = sqlx::query_as(sql!(
+        "SELECT pod_name, pod_namespace, state, active, pod_create_intent_tracked,
+                    pod_create_requested_at IS NOT NULL
              FROM sandbox_k8s_executions
              WHERE sandbox_id = $1 AND generation = 1"
-        ))
-        .bind(sandbox)
-        .fetch_one(pool)
-        .await?;
+    ))
+    .bind(sandbox)
+    .fetch_one(pool)
+    .await?;
     assert_eq!(
         pod_name,
         format!("space-sbx-{}-g1", sandbox.as_uuid().simple())
@@ -58,6 +65,10 @@ async fn user_claim_mints_a_generation_and_lease_fence() -> TestResult {
     assert_eq!(pod_namespace, NAMESPACE);
     assert_eq!(state, "creating");
     assert!(active);
+    assert!(
+        intent_tracked && !pod_create_requested,
+        "the allocated execution tracks pod-create intent and no pod is requested yet"
+    );
     Ok(())
 }
 

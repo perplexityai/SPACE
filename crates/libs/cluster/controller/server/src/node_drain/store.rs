@@ -4727,8 +4727,9 @@ impl NodeDrainSink for SubstrateSink {
     }
 
     /// The order is cheapest first: a lock-free guard read, then one uncached
-    /// apiserver read per pod name, then one node-api read of the newest
-    /// generation's local state, then the locked transaction. A row still inside its staleness window, or one nothing
+    /// apiserver read per pod name, then node-api reads of the generations'
+    /// local state, newest first (one, unless a newer generation never
+    /// requested a pod), then the locked transaction. A row still inside its staleness window, or one nothing
     /// can restore, costs one guard query per tick on top of the failed
     /// suspend's own claim and revert. A row parked on a pod or on the node's
     /// answer pays its pod reads, and its node reads, every tick.
@@ -4760,11 +4761,14 @@ impl NodeDrainSink for SubstrateSink {
             sandbox_id,
             source_node_id,
         };
-        if let Err(hold) = pod_less_giveup::node_vouches(&observer, generation).await {
-            return Ok(PodLessRecovery::NotEligible(hold));
-        }
-        let outcome =
-            pod_less_giveup::recover_pod_less_sandbox_tx(&self.pool, candidate, generation).await?;
+        let vouched = match pod_less_giveup::node_vouches(&observer, generation, &refs).await {
+            Ok(vouched) => vouched,
+            Err(hold) => return Ok(PodLessRecovery::NotEligible(hold)),
+        };
+        let outcome = pod_less_giveup::recover_pod_less_sandbox_tx(
+            &self.pool, candidate, generation, vouched,
+        )
+        .await?;
         emit_pod_less_recovery_events(candidate, outcome);
         Ok(outcome)
     }

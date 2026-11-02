@@ -286,9 +286,12 @@ Recover in this order:
    restore the sandbox without losing newer bytes, the controller reverts it
    to `suspended` off the node and logs `node_drain: sandbox has no pod and
    recovery has stopped; reverted it to suspended off the node so drain can
-   proceed`. Every other case parks. That includes a started recovery whose
-   newest generation never got a pod (`reason=node_pending`), which the node
-   never learned and so can't vouch for.
+   proceed`. A started recovery that stalled before requesting its pod
+   releases on the older generation's delete receipt: its execution row
+   records that no pod create was ever requested, so the node can't have run
+   it. Every other case parks. That includes a started recovery that stalled
+   after requesting its pod, or whose execution row predates that record
+   (`reason=node_pending`).
 3. **Delete it, as a last resort.** Only with the sandbox owner's agreement:
    `POST /admin/api/v1/sandboxes/sbx_<uuid>:force-delete` with an
    `Idempotency-Key` header, as a managing-organization admin. It returns 202

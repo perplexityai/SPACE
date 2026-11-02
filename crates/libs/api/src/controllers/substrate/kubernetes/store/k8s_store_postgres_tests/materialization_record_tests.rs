@@ -246,6 +246,7 @@ async fn every_clearing_writer_stamps_the_pod_it_clears() -> TestResult {
                 SandboxLifecycle::Started,
             )
             .await?
+            .is_some()
     );
     assert!(
         materialized_at(&fixture.pool, rematerialized, generation)
@@ -277,7 +278,7 @@ async fn every_clearing_writer_stamps_the_pod_it_clears() -> TestResult {
     .await?;
     record_unstamped_pod_uid(&fixture.pool, reset, generation, "pinned-pod", "created").await?;
     assert!(
-        !fixture
+        fixture
             .store
             .reset_active_execution_to_creating_if_generation(
                 reset,
@@ -286,6 +287,7 @@ async fn every_clearing_writer_stamps_the_pod_it_clears() -> TestResult {
                 None,
             )
             .await?
+            .is_none()
     );
     assert_eq!(
         materialized_at(&fixture.pool, reset, generation).await?,
@@ -297,6 +299,7 @@ async fn every_clearing_writer_stamps_the_pod_it_clears() -> TestResult {
             .store
             .reset_active_execution_to_creating_if_generation(reset, generation, Some(owner), None)
             .await?
+            .is_some()
     );
     assert!(
         materialized_at(&fixture.pool, reset, generation)

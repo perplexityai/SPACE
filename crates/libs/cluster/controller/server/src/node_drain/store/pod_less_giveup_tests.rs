@@ -17,6 +17,7 @@ use sqlx::PgPool;
 use super::pod_less_giveup::{
     GenerationTeardownObserver, POD_READ_CONCURRENCY, PodAbsenceProber, PodLessCandidate, PodRef,
     is_deadlock, node_vouches, pod_refs, pods_proven_absent, precheck, recover_pod_less_sandbox_tx,
+    stepped_past_still_unrequested,
 };
 use super::*;
 use crate::lifecycle_writer_test_support::{
@@ -37,6 +38,20 @@ struct Execution {
     pod_uid: bool,
     /// Seconds since `updated_at` last advanced.
     idle_secs: i64,
+    /// What the row records about pod-create intent.
+    intent: Intent,
+}
+
+/// The pod-create intent an execution row records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Intent {
+    /// Inserted by a writer that doesn't track intent, or before tracking
+    /// existed: unknown.
+    Untracked,
+    /// Tracked, and no pod create was ever requested.
+    Unrequested,
+    /// Tracked, and a pod create was requested.
+    Requested,
 }
 
 impl Execution {
@@ -48,6 +63,21 @@ impl Execution {
         active: true,
         pod_uid: false,
         idle_secs: 3600,
+        intent: Intent::Untracked,
+    };
+    /// A generation between the two, replaced with no recorded pod: it may
+    /// have run before its history was recorded.
+    const REPLACED_WITHOUT_POD: Self = Self {
+        generation: 2,
+        pod_uid: false,
+        idle_secs: 5400,
+        ..Self::REPLACED
+    };
+    /// The same stalled recovery, from a writer that records pod-create
+    /// intent, stalled before its pod create was requested.
+    const UNREQUESTED_RECOVERY: Self = Self {
+        intent: Intent::Unrequested,
+        ..Self::STALLED_RECOVERY
     };
     /// The generation before it, retired when recovery replaced it.
     const REPLACED: Self = Self {
@@ -56,6 +86,7 @@ impl Execution {
         active: false,
         pod_uid: true,
         idle_secs: 7200,
+        intent: Intent::Untracked,
     };
 }
 
@@ -67,10 +98,13 @@ async fn insert_pod_less_execution(
     sqlx::query(sql!(
         "INSERT INTO sandbox_k8s_executions
             (sandbox_id, generation, pod_name, pod_namespace, pod_uid,
-             state, active, created_at, updated_at)
+             state, active, created_at, updated_at,
+             pod_create_intent_tracked, pod_create_requested_at)
          VALUES ($1, $2, $3, 'sandboxes', $4, $5, $6,
                  NOW() - make_interval(secs => $7::BIGINT + 60),
-                 NOW() - make_interval(secs => $7::BIGINT))"
+                 NOW() - make_interval(secs => $7::BIGINT),
+                 $8,
+                 CASE WHEN $9 THEN NOW() - make_interval(secs => $7::BIGINT) END)"
     ))
     .bind(sandbox_id)
     .bind(row.generation)
@@ -79,6 +113,8 @@ async fn insert_pod_less_execution(
     .bind(row.state)
     .bind(row.active)
     .bind(row.idle_secs)
+    .bind(row.intent != Intent::Untracked)
+    .bind(row.intent == Intent::Requested)
     .execute(pool)
     .await?;
     Ok(())
@@ -152,8 +188,9 @@ async fn give_up_asking<O: GenerationTeardownObserver>(
         Ok(generation) => generation,
         Err(hold) => return Ok(PodLessRecovery::NotEligible(hold)),
     };
-    Ok(match node_vouches(node, generation).await {
-        Ok(()) => recover_pod_less_sandbox_tx(pool, candidate, generation).await?,
+    let refs = pod_refs(pool, candidate.sandbox_id).await?;
+    Ok(match node_vouches(node, generation, &refs).await {
+        Ok(vouched) => recover_pod_less_sandbox_tx(pool, candidate, generation, vouched).await?,
         Err(hold) => PodLessRecovery::NotEligible(hold),
     })
 }
@@ -588,7 +625,7 @@ async fn undrain_racing_the_transaction_is_seen() -> TestResult {
 
     let (give_up_pool, give_up_pid) = single_backend_pool(&db).await?;
     let give_up = tokio::spawn(async move {
-        recover_pod_less_sandbox_tx(&give_up_pool, candidate, generation).await
+        recover_pod_less_sandbox_tx(&give_up_pool, candidate, generation, generation).await
     });
     bounded(wait_until_blocked(pool, give_up_pid, undrain_pid)).await?;
     undrain.commit().await?;
@@ -621,8 +658,10 @@ async fn a_held_sandbox_lock_backs_out_as_contention() -> TestResult {
         .await?;
 
     assert_eq!(
-        bounded(async { Ok(recover_pod_less_sandbox_tx(pool, candidate, generation).await?,) })
-            .await?,
+        bounded(async {
+            Ok(recover_pod_less_sandbox_tx(pool, candidate, generation, generation).await?)
+        })
+        .await?,
         PodLessRecovery::NotEligible(PodLessHold::LockContended)
     );
     holder.rollback().await?;
@@ -859,7 +898,7 @@ async fn generation_created_after_the_pod_reads_backs_out() -> TestResult {
     .await?;
 
     assert_eq!(
-        recover_pod_less_sandbox_tx(&pool, candidate, generation).await?,
+        recover_pod_less_sandbox_tx(&pool, candidate, generation, generation).await?,
         PodLessRecovery::NotEligible(PodLessHold::GenerationChanged)
     );
     assert_eq!(sandbox_row(&pool, sandbox_id).await?, resident(node_id));
@@ -989,6 +1028,7 @@ fn pod(name: &str) -> PodRef {
         generation: ExecutionGeneration::new(1).expect("a valid generation"),
         pod_namespace: "sandboxes".to_owned(),
         pod_name: name.to_owned(),
+        pod_never_requested: false,
     }
 }
 
@@ -1099,11 +1139,13 @@ async fn pod_refs_name_every_generation_in_its_recorded_namespace() -> TestResul
                 generation: ExecutionGeneration::new(2)?,
                 pod_namespace: "sandboxes".to_owned(),
                 pod_name: pod_name(sandbox_id, 2),
+                pod_never_requested: false,
             },
             PodRef {
                 generation: ExecutionGeneration::new(1)?,
                 pod_namespace: "sandboxes-previous".to_owned(),
                 pod_name: pod_name(sandbox_id, 1),
+                pod_never_requested: false,
             },
         ]
     );
@@ -1184,13 +1226,7 @@ async fn an_older_generations_delete_does_not_cover_a_newer_pending_one() -> Tes
         &pool,
         &[
             Execution::REPLACED,
-            Execution {
-                generation: 2,
-                state: "replaced",
-                active: false,
-                pod_uid: false,
-                idle_secs: 5400,
-            },
+            Execution::REPLACED_WITHOUT_POD,
             Execution {
                 generation: 3,
                 ..Execution::STALLED_RECOVERY
@@ -1209,8 +1245,204 @@ async fn an_older_generations_delete_does_not_cover_a_newer_pending_one() -> Tes
     Ok(())
 }
 
-/// Only a delete covering the newest generation vouches. Every other answer
-/// is its hold, and only the newest generation is asked.
+/// The livelock's own shape, from a writer that records pod-create intent:
+/// the stalled recovery's generation 2 is tracked and never requested a pod,
+/// so the node's pending answer for it proves it never ran there, and the
+/// node's delete receipt for generation 1 releases the resident.
+#[tokio::test]
+async fn a_stalled_recovery_that_never_requested_a_pod_releases_on_the_older_receipt() -> TestResult
+{
+    let db = pg_test_db().await?;
+    let pool = db.pool.clone();
+    let (node_id, sandbox_id) = resident_with(
+        &pool,
+        &[Execution::REPLACED, Execution::UNREQUESTED_RECOVERY],
+    )
+    .await?;
+    insert_snapshot(&pool, sandbox_id, "ready", -60).await?;
+    let node = ScriptedNode::new(vec![(1, Ok(GenerationTeardownEvidence::Deleted))]);
+
+    assert_eq!(
+        give_up_asking(&pool, candidate(sandbox_id, node_id), &node).await?,
+        PodLessRecovery::RevertedToSuspended
+    );
+    assert_eq!(node.asked(), vec![2, 1]);
+    assert_eq!(sandbox_row(&pool, sandbox_id).await?, unplaced("suspended"));
+    Ok(())
+}
+
+/// A stalled recovery that recorded its pod-create intent may have had a pod
+/// created, so it parks like an untracked one.
+#[tokio::test]
+async fn a_stalled_recovery_that_requested_a_pod_parks() -> TestResult {
+    let db = pg_test_db().await?;
+    let pool = db.pool.clone();
+    let (node_id, sandbox_id) = resident_with(
+        &pool,
+        &[
+            Execution::REPLACED,
+            Execution {
+                intent: Intent::Requested,
+                ..Execution::STALLED_RECOVERY
+            },
+        ],
+    )
+    .await?;
+    insert_snapshot(&pool, sandbox_id, "ready", -60).await?;
+    let node = ScriptedNode::new(vec![(1, Ok(GenerationTeardownEvidence::Deleted))]);
+
+    assert_eq!(
+        give_up_asking(&pool, candidate(sandbox_id, node_id), &node).await?,
+        PodLessRecovery::NotEligible(PodLessHold::NodePending)
+    );
+    assert_eq!(node.asked(), vec![2]);
+    assert_eq!(sandbox_row(&pool, sandbox_id).await?, resident(node_id));
+    Ok(())
+}
+
+/// Stepping past stops at a generation that may have run: an untracked
+/// generation 2 between the unrequested generation 3 and generation 1's
+/// receipt parks the resident.
+#[tokio::test]
+async fn an_untracked_generation_stops_the_step_past() -> TestResult {
+    let db = pg_test_db().await?;
+    let pool = db.pool.clone();
+    let (node_id, sandbox_id) = resident_with(
+        &pool,
+        &[
+            Execution::REPLACED,
+            Execution::REPLACED_WITHOUT_POD,
+            Execution {
+                generation: 3,
+                ..Execution::UNREQUESTED_RECOVERY
+            },
+        ],
+    )
+    .await?;
+    insert_snapshot(&pool, sandbox_id, "ready", -60).await?;
+    let node = ScriptedNode::new(vec![(1, Ok(GenerationTeardownEvidence::Deleted))]);
+
+    assert_eq!(
+        give_up_asking(&pool, candidate(sandbox_id, node_id), &node).await?,
+        PodLessRecovery::NotEligible(PodLessHold::NodePending)
+    );
+    assert_eq!(node.asked(), vec![3, 2]);
+    assert_eq!(sandbox_row(&pool, sandbox_id).await?, resident(node_id));
+    Ok(())
+}
+
+/// A pod-create stamp that lands on a stepped-past generation after the
+/// node's answer means a pod may now exist for it; the transaction re-reads
+/// the stamps under the row locks and backs out.
+#[tokio::test]
+async fn a_pod_create_requested_after_the_node_answered_backs_out() -> TestResult {
+    let db = pg_test_db().await?;
+    let pool = db.pool.clone();
+    let (node_id, sandbox_id) = resident_with(
+        &pool,
+        &[Execution::REPLACED, Execution::UNREQUESTED_RECOVERY],
+    )
+    .await?;
+    insert_snapshot(&pool, sandbox_id, "ready", -60).await?;
+    let candidate = candidate(sandbox_id, node_id);
+    let Ok(generation) = precheck(&pool, candidate).await? else {
+        panic!("the wedged resident passes the pre-check");
+    };
+    let node = ScriptedNode::new(vec![(1, Ok(GenerationTeardownEvidence::Deleted))]);
+    let vouched = node_vouches(&node, generation, &pod_refs(&pool, sandbox_id).await?)
+        .await
+        .expect("generation 1's receipt vouches");
+    assert_eq!(vouched.get(), 1);
+    // The stamp the substrate writes before a pod create, without moving
+    // `updated_at`.
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions SET pod_create_requested_at = NOW()
+          WHERE sandbox_id = $1 AND generation = 2"
+    ))
+    .bind(sandbox_id)
+    .execute(&pool)
+    .await?;
+
+    assert_eq!(
+        recover_pod_less_sandbox_tx(&pool, candidate, generation, vouched).await?,
+        PodLessRecovery::NotEligible(PodLessHold::PodCreateRequested)
+    );
+    assert_eq!(sandbox_row(&pool, sandbox_id).await?, resident(node_id));
+    Ok(())
+}
+
+/// Only a tracked row with no stamp and no pod evidence at all reads as
+/// never requesting a pod. A UID, an IP or a materialization record shows a
+/// pod existed, whatever the stamp says.
+#[tokio::test]
+async fn only_an_unstamped_tracked_row_with_no_pod_evidence_never_requested_a_pod() -> TestResult {
+    let db = pg_test_db().await?;
+    let pool = db.pool.clone();
+    let unrequested = |generation| Execution {
+        generation,
+        intent: Intent::Unrequested,
+        ..Execution::REPLACED_WITHOUT_POD
+    };
+    let (_node_id, sandbox_id) = resident_with(
+        &pool,
+        &[
+            // Untracked.
+            Execution {
+                intent: Intent::Untracked,
+                ..unrequested(1)
+            },
+            // Stamped.
+            Execution {
+                intent: Intent::Requested,
+                ..unrequested(2)
+            },
+            // A pod UID.
+            Execution {
+                pod_uid: true,
+                ..unrequested(3)
+            },
+            // A pod IP, then a materialization record, set below.
+            unrequested(4),
+            unrequested(5),
+            // Never requested.
+            Execution {
+                generation: 6,
+                ..Execution::UNREQUESTED_RECOVERY
+            },
+        ],
+    )
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions
+            SET pod_ip = CASE WHEN generation = 4 THEN '10.0.0.4'::INET END,
+                pod_materialized_at = CASE WHEN generation = 5 THEN NOW() END
+          WHERE sandbox_id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(&pool)
+    .await?;
+
+    let never_requested: Vec<(i64, bool)> = pod_refs(&pool, sandbox_id)
+        .await?
+        .into_iter()
+        .map(|pod| (pod.generation.get(), pod.pod_never_requested))
+        .collect();
+    assert_eq!(
+        never_requested,
+        vec![
+            (6, true),
+            (5, false),
+            (4, false),
+            (3, false),
+            (2, false),
+            (1, false)
+        ]
+    );
+    Ok(())
+}
+
+/// When the newest generation may have run, only a delete covering it
+/// vouches. Every other answer is its hold, and no older generation is asked.
 #[tokio::test]
 async fn only_a_delete_covering_the_newest_generation_vouches() {
     let newest = ExecutionGeneration::new(3).expect("a valid generation");
@@ -1239,11 +1471,138 @@ async fn only_a_delete_covering_the_newest_generation_vouches() {
         ),
         (unreachable(), Err(PodLessHold::NodeUnreadable)),
     ];
+    // Generation 2 may have run, so only generation 3's answer counts.
+    let refs = [generation_ref(3, false), generation_ref(2, false)];
     for (answer, expected) in cases {
-        let node = ScriptedNode::new(vec![(3, answer)]);
-        assert_eq!(node_vouches(&node, newest).await, expected);
+        let node = ScriptedNode::new(vec![
+            (3, answer),
+            (2, Ok(GenerationTeardownEvidence::Deleted)),
+        ]);
+        assert_eq!(
+            node_vouches(&node, newest, &refs).await,
+            expected.map(|()| newest)
+        );
         assert_eq!(node.asked(), vec![3]);
     }
+}
+
+/// A [`PodRef`] for `generation`, never requesting a pod or not.
+fn generation_ref(generation: i64, pod_never_requested: bool) -> PodRef {
+    PodRef {
+        generation: ExecutionGeneration::new(generation).expect("a valid generation"),
+        pod_namespace: "sandboxes".to_owned(),
+        pod_name: format!("g{generation}"),
+        pod_never_requested,
+    }
+}
+
+/// A pending answer for a generation that never requested a pod steps to
+/// the next older one, as many times as it takes; the first generation that
+/// may have run decides. Any answer but pending for a stepped generation
+/// still parks, and so does running out of generations with no receipt.
+#[tokio::test]
+async fn a_generation_that_never_requested_a_pod_is_stepped_past_only_on_pending() {
+    let generation = |generation| ExecutionGeneration::new(generation).expect("valid");
+    let pending = || Ok(GenerationTeardownEvidence::Pending);
+    let deleted = || Ok(GenerationTeardownEvidence::Deleted);
+    let refs = [
+        generation_ref(4, true),
+        generation_ref(3, true),
+        generation_ref(2, false),
+        generation_ref(1, false),
+    ];
+
+    // Two unrequested generations, then a delete of the one that ran.
+    let node = ScriptedNode::new(vec![(4, pending()), (3, pending()), (2, deleted())]);
+    assert_eq!(
+        node_vouches(&node, generation(4), &refs).await,
+        Ok(generation(2))
+    );
+    assert_eq!(node.asked(), vec![4, 3, 2]);
+
+    // The walk stops at the first generation that may have run, even when
+    // an older one has a receipt.
+    let node = ScriptedNode::new(vec![(1, deleted())]);
+    assert_eq!(
+        node_vouches(&node, generation(4), &refs).await,
+        Err(PodLessHold::NodePending)
+    );
+    assert_eq!(node.asked(), vec![4, 3, 2]);
+
+    // A delete of the unrequested newest generation still covers everything.
+    let node = ScriptedNode::new(vec![(4, deleted())]);
+    assert_eq!(
+        node_vouches(&node, generation(4), &refs).await,
+        Ok(generation(4))
+    );
+    assert_eq!(node.asked(), vec![4]);
+
+    // Only pending is stepped past: a node that holds state for a generation
+    // the database says never requested a pod parks on its answer.
+    for (answer, hold) in [
+        (
+            Ok(GenerationTeardownEvidence::Durable),
+            PodLessHold::NodeSuspended,
+        ),
+        (
+            Ok(GenerationTeardownEvidence::Superseded),
+            PodLessHold::NodeSuperseded,
+        ),
+        (
+            Ok(GenerationTeardownEvidence::Refused),
+            PodLessHold::NodeRefused,
+        ),
+        (
+            Err(SubstrateError::Unavailable {
+                message: "node-api unreachable".to_owned(),
+            }),
+            PodLessHold::NodeUnreadable,
+        ),
+    ] {
+        let node = ScriptedNode::new(vec![(4, answer), (3, deleted())]);
+        assert_eq!(node_vouches(&node, generation(4), &refs).await, Err(hold));
+        assert_eq!(node.asked(), vec![4]);
+    }
+
+    // No generation ever requested a pod and none has a receipt.
+    let unrequested = [generation_ref(2, true), generation_ref(1, true)];
+    let node = ScriptedNode::new(vec![]);
+    assert_eq!(
+        node_vouches(&node, generation(2), &unrequested).await,
+        Err(PodLessHold::NodePending)
+    );
+    assert_eq!(node.asked(), vec![2, 1]);
+
+    // Refs that don't start at the newest generation the guards saw are
+    // stale, and the node isn't asked.
+    let node = ScriptedNode::new(vec![]);
+    assert_eq!(
+        node_vouches(&node, generation(5), &refs).await,
+        Err(PodLessHold::GenerationChanged)
+    );
+    assert_eq!(
+        node_vouches(&node, generation(4), &[]).await,
+        Err(PodLessHold::GenerationChanged)
+    );
+    assert!(node.asked().is_empty());
+}
+
+/// The transaction's re-check: every generation newer than the vouched one
+/// must still be one that never requested a pod.
+#[test]
+fn the_stepped_past_generations_must_still_be_unrequested() {
+    let generation = |generation| ExecutionGeneration::new(generation).expect("valid");
+    let refs = [
+        generation_ref(3, true),
+        generation_ref(2, false),
+        generation_ref(1, false),
+    ];
+    assert_eq!(stepped_past_still_unrequested(&refs, generation(2)), Ok(()));
+    assert_eq!(stepped_past_still_unrequested(&refs, generation(3)), Ok(()));
+    assert_eq!(
+        stepped_past_still_unrequested(&refs, generation(1)),
+        Err(PodLessHold::PodCreateRequested)
+    );
 }
 
 /// Each hold's classification, variant by variant: a row aging in, leaving
@@ -1256,10 +1615,10 @@ fn each_hold_is_classified_by_whether_it_clears_on_its_own() {
     // it's added to the table below.
     fn listed(hold: PodLessHold) {
         match hold {
-            RecentProgress | RowDrifted | NoPodName | GenerationChanged | SnapshotChanged
-            | LockContended | VmObserved | PodBound | PodPresent | PodUnreadable
-            | NoRestoreSource | HeldForDataSafety | NoExecutionRow | NodePending
-            | NodeSuspended | NodeSuperseded | NodeRefused | NodeUnreadable => {}
+            RecentProgress | RowDrifted | NoPodName | GenerationChanged | PodCreateRequested
+            | SnapshotChanged | LockContended | VmObserved | PodBound | PodPresent
+            | PodUnreadable | NoRestoreSource | HeldForDataSafety | NoExecutionRow
+            | NodePending | NodeSuspended | NodeSuperseded | NodeRefused | NodeUnreadable => {}
         }
     }
     let holds = [
@@ -1267,6 +1626,7 @@ fn each_hold_is_classified_by_whether_it_clears_on_its_own() {
         (RowDrifted, true),
         (NoPodName, true),
         (GenerationChanged, true),
+        (PodCreateRequested, true),
         (SnapshotChanged, true),
         (LockContended, true),
         (VmObserved, false),
@@ -1284,7 +1644,7 @@ fn each_hold_is_classified_by_whether_it_clears_on_its_own() {
     ];
     let tags: std::collections::HashSet<&str> = holds.iter().map(|(hold, _)| hold.tag()).collect();
     assert_eq!(tags.len(), holds.len(), "tags must be distinct");
-    assert_eq!(holds.len(), 18, "every variant is in the table");
+    assert_eq!(holds.len(), 19, "every variant is in the table");
     for (hold, clears) in holds {
         listed(hold);
         assert_eq!(hold.clears_on_its_own(), clears, "{hold:?}");
