@@ -82,23 +82,6 @@ interface BaseSnapshotPolicy {
   ensure_base_snapshot: boolean;
 }
 
-interface SnapshotPolicyFanoutResponse {
-  fanout_queued: boolean;
-  nodes: {
-    skipped: boolean;
-    ok: boolean;
-    reconciled: boolean;
-    snapshot_built: boolean;
-    snapshot_deleted: boolean;
-    error: string | null;
-  }[];
-}
-
-interface TemplateNetworkPolicyUpdateResponse {
-  ok: boolean;
-  network_policy_generation: number | null;
-}
-
 interface RefreshOptions {
   showLoading?: boolean;
   reconcile?: boolean;
@@ -354,10 +337,6 @@ function warmPoolTooltip(pool: TemplateReleaseWarmPool, diskCapacityEnabled: boo
   );
 }
 
-function positiveOrDefault(value: number | null | undefined, fallback: number) {
-  return value && value > 0 ? value : fallback;
-}
-
 function baseSnapshotTooltip(template: Template, desired: boolean) {
   return (
     <Space direction="vertical" size={0}>
@@ -365,25 +344,6 @@ function baseSnapshotTooltip(template: Template, desired: boolean) {
       <span>Observed: {template.has_base_snapshot ? 'ready' : 'not ready'}</span>
     </Space>
   );
-}
-
-function pluralize(count: number, singular: string, plural = `${singular}s`) {
-  return `${count} ${count === 1 ? singular : plural}`;
-}
-
-function snapshotPolicyFanoutMessage(
-  template: string,
-  enabled: boolean,
-  response?: SnapshotPolicyFanoutResponse,
-) {
-  if (!response?.fanout_queued) {
-    return `Base snapshot policy ${enabled ? 'enabled' : 'disabled'} for ${template}`;
-  }
-  const failures = response.nodes.filter((node) => node.error || (!node.skipped && !node.ok)).length;
-  if (failures > 0) {
-    return `Base snapshot policy saved for ${template}; ${pluralize(failures, 'node')} reported an error`;
-  }
-  return `Base snapshot policy ${enabled ? 'enabled' : 'disabled'} for ${template}; reconcile queued`;
 }
 
 function hasAutoLifecyclePolicy(policy: Template['default_auto_lifecycle']) {
@@ -1299,22 +1259,6 @@ export default function TemplatesPage() {
     }
     return Array.from(nodes.values()).sort((a, b) => nodeLabel(a).localeCompare(nodeLabel(b)));
   }, [inventory]);
-
-  const reconcileTemplateInventory = async (nodeIds: string[], templateName: string) => {
-    if (!canAdminTemplates || nodeIds.length === 0) return false;
-    try {
-      await adminApi.post('/v1/nodes:reconcile', {
-        node_ids: nodeIds,
-        refs: [{ facet: 'template-inventory', element: templateName }],
-      });
-      await refreshInventory({ showLoading: false });
-      message.success('Template inventory reconcile queued');
-      return true;
-    } catch (err: unknown) {
-      message.error(errorMessage(err) || 'Failed to queue template inventory reconcile');
-      return false;
-    }
-  };
 
   const openPullModal = (template: TemplateAvailabilityRow) => {
     const existingNodeIds = new Set(template.nodes.map((availability) => availability.node.id));

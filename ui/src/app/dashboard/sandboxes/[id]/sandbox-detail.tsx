@@ -8,7 +8,6 @@ import {
   Button,
   Card,
   Descriptions,
-  Form,
   Input,
   App,
   Popconfirm,
@@ -80,7 +79,6 @@ import { OperationsCard, OrgLink, PlacementCard, ResourcesCard, TimelineCard, Us
 import NetworkPolicyDesigner, {
   compactNetworkPolicyLabel,
   NetworkPolicyDetails,
-  networkPoliciesEqual,
   summarizeNetworkPolicy,
 } from '@/components/network-policy-designer';
 import NetworkPolicyGenerationTag from '@/components/network-policy-generation-tag';
