@@ -763,12 +763,12 @@ async fn sweep_orphans(
     }
 }
 
-fn gc_pending_is_unowned(artifacts: &LocalArtifacts, path: &Path) -> bool {
+/// Whether `path` is GC staging that no row owns, so its bytes may be deleted.
+pub(crate) fn gc_pending_is_unowned(artifacts: &LocalArtifacts, path: &Path) -> bool {
     let Some(id) = path
         .file_name()
         .and_then(|name| name.to_str())
-        .and_then(|name| name.rsplit_once(crate::local_artifacts::GC_PENDING_MARKER))
-        .and_then(|(_, id)| id.parse::<LocalArtifactId>().ok())
+        .and_then(crate::local_artifacts::gc_staging_id)
     else {
         warn!(path = %path.display(), "retaining GC staging with invalid artifact identity");
         return false;

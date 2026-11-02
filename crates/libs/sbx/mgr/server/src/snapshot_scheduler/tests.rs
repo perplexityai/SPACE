@@ -517,10 +517,11 @@ fn checkpoint_sidecar_execution_metadata_records_the_capturing_host_cpu() {
 /// path, without stopping the rest of the prune: it runs before every
 /// scheduled capture. A catalogued snapshot is renamed to its GC staging
 /// sibling, which DeleteCacheArtifact deletes once the artifact lock is
-/// released; one whose delete fails partway there is still pruned, because its
-/// row and `local_path` are gone and the reaper's orphan sweep owns the
-/// staging. A failed byte delete of a snapshot without a row stops the prune
-/// at that snapshot, and the capture with it.
+/// released, and the capture then retakes the lock. One whose staging delete
+/// fails partway is still pruned, because its row and `local_path` are gone,
+/// but the tick captures nothing, so a failing delete cannot add a snapshot
+/// and its staging every tick. A failed byte delete of a snapshot without a
+/// row stops the prune at that snapshot, and the capture with it.
 #[tokio::test]
 async fn retention_prune_skips_pinned_and_leased_snapshot_artifacts() {
     use crate::db::OptionalExtension as _;
@@ -560,8 +561,9 @@ async fn retention_prune_skips_pinned_and_leased_snapshot_artifacts() {
     let names: Vec<String> = (0..11)
         .map(|minute| format!("d-1m-20260101T00{minute:02}00Z"))
         .collect();
-    // (the uncatalogued byte delete fails, how a staging delete ends, prune
-    // fails, snapshots deleted by name, whether the deletable one is staged)
+    // (the uncatalogued byte delete fails, how a staging delete ends, the
+    // tick fails before capturing, snapshots deleted by name, whether the
+    // deletable one is staged)
     for (uncatalogued_fails, staging_delete, fails, by_name, staged) in [
         (
             false,
@@ -573,7 +575,7 @@ async fn retention_prune_skips_pinned_and_leased_snapshot_artifacts() {
         (
             false,
             StagingDelete::FailsPartway,
-            false,
+            true,
             vec![names[4].clone()],
             true,
         ),
@@ -734,8 +736,11 @@ async fn retention_prune_skips_pinned_and_leased_snapshot_artifacts() {
         .await;
 
         assert_eq!(result.is_err(), fails, "{case}");
-        // A failed prune skips the capture; a successful one captures under
-        // the lock. The staging is deleted after the lock is released.
+        if staging_delete == StagingDelete::FailsPartway {
+            assert!(result.unwrap_err().contains("capture skipped"), "{case}");
+        }
+        // A failed prune or staging delete skips the capture; otherwise the
+        // capture retakes the lock. The staging is deleted with it released.
         assert_eq!(
             *captured_under_lock.lock().unwrap(),
             (!fails).then_some(true),
@@ -791,6 +796,137 @@ async fn retention_prune_skips_pinned_and_leased_snapshot_artifacts() {
     }
 }
 
+/// Staging that an earlier delete could not remove has no row, so no prune
+/// stages it again. Retention lists it, retries its delete with the artifact
+/// lock released, and captures nothing until it is gone: a failing
+/// node-manager delete holds the sandbox at what it already staged, tick after
+/// tick. Staging a row still owns is left to its owner and does not hold up
+/// the capture.
+#[tokio::test]
+async fn retention_captures_only_once_leftover_staging_is_deleted() {
+    use crate::local_artifacts::LocalArtifacts;
+    use pplx_space_node_mgr_client::proto::{
+        BtrfsSnapshotInfo, DeleteCacheArtifactRequest, DeleteCacheArtifactResponse,
+        ListBtrfsSnapshotsRequest, ListBtrfsSnapshotsResponse,
+    };
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let root = tempfile::TempDir::new().unwrap();
+    let cache_root = root.path().to_str().unwrap().to_owned();
+    let (ctx, sandbox_id) = checkpoint_context(SandboxState::Started);
+    let snapshots = format!("{cache_root}/{sandbox_id}/snapshots");
+    let (unowned, owned) = (LocalArtifactId::new(), LocalArtifactId::new());
+    LocalArtifacts::new(ctx.db.clone())
+        .publish_named_snapshot(
+            &sandbox_id,
+            owned,
+            ArtifactKind::Disk,
+            &SnapshotName::parse("d-1m-20260101T000000Z".to_owned()).unwrap(),
+            &format!("{snapshots}/d-1m-20260101T000000Z"),
+        )
+        .unwrap();
+    let unowned_staging = format!("{snapshots}/.gc-pending-{unowned}");
+    let owned_staging = format!("{snapshots}/.gc-pending-{owned}");
+    for staging in [&unowned_staging, &owned_staging] {
+        std::fs::create_dir_all(staging).unwrap();
+        std::fs::write(Path::new(staging).join("memory"), "memory").unwrap();
+    }
+
+    let fails = Arc::new(AtomicBool::new(true));
+    let deletions = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let coordinator = ctx.auto_lifecycle.clone();
+    let node_manager = crate::node_manager_transport::fake::FakeNodeManager::default()
+        .unary("ListBtrfsSnapshots", {
+            let snapshots = snapshots.clone();
+            move |_: ListBtrfsSnapshotsRequest| {
+                let mut names: Vec<_> = std::fs::read_dir(&snapshots)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                    .collect();
+                names.sort();
+                Ok(ListBtrfsSnapshotsResponse {
+                    snapshots: names
+                        .into_iter()
+                        .map(|name| BtrfsSnapshotInfo {
+                            name,
+                            ..Default::default()
+                        })
+                        .collect(),
+                    next_page_token: String::new(),
+                })
+            }
+        })
+        .unary("DeleteCacheArtifact", {
+            let (fails, deletions, root) = (
+                Arc::clone(&fails),
+                Arc::clone(&deletions),
+                root.path().to_owned(),
+            );
+            let (coordinator, sandbox_id) = (coordinator.clone(), sandbox_id.clone());
+            move |request: DeleteCacheArtifactRequest| {
+                let path = Path::new(&request.local_path);
+                assert!(path.starts_with(&root));
+                let lock_free = coordinator
+                    .artifact_lock(&sandbox_id)
+                    .try_lock_owned()
+                    .is_ok();
+                deletions
+                    .lock()
+                    .unwrap()
+                    .push((request.local_path.clone(), lock_free));
+                if fails.load(Ordering::SeqCst) {
+                    return Err(tonic::Status::internal("injected staging delete failure"));
+                }
+                std::fs::remove_dir_all(path).unwrap();
+                Ok(DeleteCacheArtifactResponse { was_present: true })
+            }
+        })
+        .serve();
+
+    // Two failing ticks, then one whose delete succeeds.
+    for (tick, delete_fails) in [(1, true), (2, true), (3, false)] {
+        fails.store(delete_fails, Ordering::SeqCst);
+        deletions.lock().unwrap().clear();
+        let captured_under_lock = std::sync::Mutex::new(None);
+        let result = super::retention::prune_and_capture(
+            &mut node_manager.connector().lazy(),
+            &ctx,
+            &sandbox_id,
+            &cache_root,
+            async |_| {
+                let held = coordinator
+                    .artifact_lock(&sandbox_id)
+                    .try_lock_owned()
+                    .is_err();
+                *captured_under_lock.lock().unwrap() = Some(held);
+                Ok(())
+            },
+        )
+        .await;
+
+        assert_eq!(
+            *deletions.lock().unwrap(),
+            [(unowned_staging.clone(), true)],
+            "tick {tick}"
+        );
+        if delete_fails {
+            let error = result.unwrap_err();
+            assert!(error.contains("capture skipped"), "tick {tick}: {error}");
+            assert_eq!(*captured_under_lock.lock().unwrap(), None, "tick {tick}");
+            assert!(Path::new(&unowned_staging).exists(), "tick {tick}");
+        } else {
+            result.unwrap();
+            assert_eq!(*captured_under_lock.lock().unwrap(), Some(true));
+            assert!(!Path::new(&unowned_staging).exists());
+        }
+        assert!(
+            Path::new(&owned_staging).join("memory").exists(),
+            "tick {tick}"
+        );
+    }
+}
+
 /// GC staging keeps the tier prefix of the snapshot it once was, in the earlier
 /// `<name>.gc-pending-<id>` shape. It takes no retained slot, so it cannot
 /// push a real snapshot out early, and is never a candidate itself.
@@ -811,4 +947,11 @@ fn retention_ignores_gc_staging() {
             "{name}"
         );
     }
+    // A name with the marker but no artifact id is an ordinary snapshot: the
+    // oldest 1m one here, so it is pruned.
+    let ordinary = "d-1m-20260101T000000Z.gc-pending-note".to_owned();
+    assert_eq!(
+        retention_candidate(&mut retained, ordinary.clone()),
+        Some(ordinary)
+    );
 }

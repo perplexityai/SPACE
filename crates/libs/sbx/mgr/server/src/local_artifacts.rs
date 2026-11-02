@@ -991,8 +991,8 @@ impl Drop for RestoreLease {
 /// `local_path`. The name has a fixed length, so a rename can stage a
 /// `local_path` whose own name is as long as the filesystem allows. Startup
 /// recovery and the reaper's orphan sweep recognize this shape and the
-/// [`legacy_gc_pending_staging_path`] one; every name containing
-/// `.gc-pending-` is internal, never a snapshot.
+/// [`legacy_gc_pending_staging_path`] one; a name of either shape is internal,
+/// never a snapshot ([`gc_staging_id`]).
 pub(crate) fn gc_pending_staging_path(local_path: &str, id: impl std::fmt::Display) -> String {
     match local_path.trim_end_matches('/').rsplit_once('/') {
         Some((parent, _)) => format!("{parent}/{GC_PENDING_MARKER}{id}"),
@@ -1004,11 +1004,21 @@ pub(crate) fn gc_pending_staging_path(local_path: &str, id: impl std::fmt::Displ
 /// artifact id.
 pub(crate) const GC_PENDING_MARKER: &str = ".gc-pending-";
 
+/// The artifact id a GC staging name was staged under, in either shape: the
+/// whole name is `.gc-pending-<id>`, or it ends with `.gc-pending-<id>`. The
+/// orphan sweep reclaims exactly the names this parses, so a name such as
+/// `run.gc-pending-1` stays an ordinary snapshot.
+pub(crate) fn gc_staging_id(name: &str) -> Option<LocalArtifactId> {
+    let (_, id) = name.rsplit_once(GC_PENDING_MARKER)?;
+    id.parse().ok()
+}
+
 /// Whether a directory name is GC staging, in either shape. Staging is
-/// logically deleted bytes that only the orphan sweep may touch, so callers
-/// that list a sandbox's snapshots treat such a name as internal.
+/// logically deleted bytes that only its deleter or the orphan sweep may
+/// touch, so callers that list a sandbox's snapshots treat such a name as
+/// internal.
 pub(crate) fn is_gc_staging_name(name: &str) -> bool {
-    name.contains(GC_PENDING_MARKER)
+    gc_staging_id(name).is_some()
 }
 
 /// Whether `<local_path>.gc-pending-<id>` exists. That shape is 48 bytes longer

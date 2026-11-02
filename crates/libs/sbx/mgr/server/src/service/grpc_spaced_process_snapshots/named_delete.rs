@@ -153,9 +153,10 @@ impl SandboxManagerService {
             // Both disk and full snapshots may be btrfs subvolumes —
             // delete via node-manager (root). DeleteCacheArtifact
             // handles both the subvolume case (privileged
-            // `btrfs subvolume delete`) and the plain-directory case
-            // (of GC staging, for a catalogued snapshot, after the lock is
-            // released), and is idempotent on a missing path.
+            // `btrfs subvolume delete`) and the plain-directory case,
+            // and is idempotent on a missing path. A catalogued snapshot
+            // is renamed to its GC staging here instead; the caller
+            // deletes that staging once the lock is released.
             let names = (sandbox.id.as_str(), snapshot_name);
             match delete_cached_snapshot(self, names, local_path, node_client).await {
                 NamedSnapshotDelete::Deleted { staging } => {

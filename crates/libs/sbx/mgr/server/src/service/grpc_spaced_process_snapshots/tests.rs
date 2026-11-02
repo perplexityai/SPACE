@@ -730,8 +730,13 @@ fn gc_staging_names() -> [String; 2] {
     ]
 }
 
+/// Names that contain the staging marker without an artifact id after it, so
+/// they are ordinary snapshots.
+const MARKER_IN_ORDINARY_NAMES: [&str; 2] = ["d-x.gc-pending-note", "run.gc-pending-1"];
+
 /// Node-manager lists GC staging among a sandbox's snapshots, and ListSnapshots
 /// leaves it out, from that listing and from its own scan for full snapshots.
+/// A name that merely contains the marker is listed.
 #[test]
 fn snapshot_inventory_omits_gc_staging() {
     let root = tempfile::tempdir().unwrap();
@@ -743,6 +748,7 @@ fn snapshot_inventory_omits_gc_staging() {
     )
     .unwrap();
     let btrfs = std::iter::once("d-user-keep".to_string())
+        .chain(MARKER_IN_ORDINARY_NAMES.map(str::to_owned))
         .chain(gc_staging_names())
         .map(|name| {
             std::fs::create_dir(root.path().join(&name)).unwrap();
@@ -759,13 +765,22 @@ fn snapshot_inventory_omits_gc_staging() {
         .iter()
         .map(|snapshot| snapshot.id.as_str())
         .collect();
-    assert_eq!(listed, ["d-user-keep"]);
+    let mut expected = ["d-user-keep"]
+        .into_iter()
+        .chain(MARKER_IN_ORDINARY_NAMES)
+        .collect::<Vec<_>>();
+    let mut listed = listed;
+    listed.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(listed, expected);
 }
 
 /// GC staging is logically deleted bytes that only the orphan sweep removes, so
 /// no snapshot RPC treats it as a snapshot. Deleting it by name, rolling back to
 /// it and exporting it are refused, and delete-all passes over it. None reaches
-/// node-manager's delete, and the staging stays for the sweep.
+/// node-manager's delete, and the staging stays for the sweep. A name that
+/// merely contains the marker is an ordinary snapshot, deleted by name and by
+/// delete-all.
 #[tokio::test]
 async fn snapshot_rpcs_refuse_gc_staging() {
     use pplx_space_node_mgr_client::proto::{
@@ -775,7 +790,11 @@ async fn snapshot_rpcs_refuse_gc_staging() {
 
     let staging = gc_staging_names();
     let deletions = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let listed = staging.clone();
+    let listed: Vec<String> = staging
+        .iter()
+        .cloned()
+        .chain(MARKER_IN_ORDINARY_NAMES.map(str::to_owned))
+        .collect();
     let node_manager = crate::node_manager_transport::fake::FakeNodeManager::default()
         .unary("ListBtrfsSnapshots", move |_: ListBtrfsSnapshotsRequest| {
             Ok(ListBtrfsSnapshotsResponse {
@@ -867,6 +886,27 @@ async fn snapshot_rpcs_refuse_gc_staging() {
             "cannot export an internal snapshot artifact",
         );
     }
+    assert!(deletions.lock().unwrap().is_empty());
+    let ordinary_path = |name: &str| {
+        format!(
+            "{}/{sandbox}/snapshots/{name}",
+            service.cache_root().display()
+        )
+    };
+    for name in MARKER_IN_ORDINARY_NAMES {
+        let deleted = service
+            .delete_snapshots(crate::service::activation_support::internal_request(
+                DeleteSnapshotsRequest {
+                    sandbox_id: sandbox.clone(),
+                    all: false,
+                    snapshot_name: Some(name.to_owned()),
+                },
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(deleted.deleted, [name]);
+    }
     let all = service
         .delete_snapshots(crate::service::activation_support::internal_request(
             DeleteSnapshotsRequest {
@@ -878,6 +918,11 @@ async fn snapshot_rpcs_refuse_gc_staging() {
         .await
         .unwrap()
         .into_inner();
-    assert!(all.deleted.is_empty(), "{:?}", all.deleted);
-    assert!(deletions.lock().unwrap().is_empty());
+    assert_eq!(all.deleted, MARKER_IN_ORDINARY_NAMES);
+    let by_name_then_all: Vec<_> = MARKER_IN_ORDINARY_NAMES
+        .iter()
+        .chain(&MARKER_IN_ORDINARY_NAMES)
+        .map(|name| ordinary_path(name))
+        .collect();
+    assert_eq!(*deletions.lock().unwrap(), by_name_then_all);
 }

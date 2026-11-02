@@ -4,8 +4,8 @@ use super::*;
 
 /// The name an import publishes its snapshot under: the client's
 /// `target_name`, which must be a valid name of the snapshot's type, or a
-/// generated one. `.gc-pending-` is reserved for GC staging, which no snapshot
-/// RPC treats as a snapshot, so a name containing it is refused rather than
+/// generated one. A name ending in `.gc-pending-<artifact id>` is GC staging's,
+/// which no snapshot RPC treats as a snapshot, so it is refused rather than
 /// imported and then hidden.
 fn import_target_name(target_name: Option<&str>, prefix: &str) -> Result<String, Status> {
     let Some(name) = target_name.filter(|name| !name.is_empty()) else {
@@ -19,7 +19,7 @@ fn import_target_name(target_name: Option<&str>, prefix: &str) -> Result<String,
     }
     if crate::local_artifacts::is_gc_staging_name(name) {
         return Err(Status::invalid_argument(format!(
-            "invalid snapshot_name: {name}: `{}` is reserved",
+            "invalid snapshot_name: {name}: a name ending in `{}<artifact id>` is reserved",
             crate::local_artifacts::GC_PENDING_MARKER
         )));
     }
