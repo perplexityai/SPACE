@@ -23,8 +23,8 @@
 //! A claim is committed in the task that runs it ([`InlineOperations::start`]),
 //! so a request dropped mid-commit cannot leave a claim that nothing runs.
 //!
-//! [`InlineLifecycle`] offers the lifecycle operations callers wait on
-//! (wakes, resumes and starts) to the runner, under the env switches and the
+//! [`InlineLifecycle`] offers the operations callers wait on (cold creates,
+//! wakes, resumes and starts) to the runner, under the env switches and the
 //! per-organization `space-native-inline-operations` flag.
 
 use std::future::Future;
@@ -38,7 +38,7 @@ use pplx_space_common_core::types::OrgId;
 use pplx_space_common_svc::DrainSignal;
 use pplx_space_feature_flags::{FeatureFlagClient, SPACE_NATIVE_INLINE_OPERATIONS_FLAG};
 use pplx_space_metrics::operations::{InlineAdmissionPath, InlineAdmissionReason};
-use pplx_space_public_api::{OperationId, OperationKind};
+use pplx_space_public_api::{OperationId, OperationKind, OperationState};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -51,7 +51,7 @@ use crate::public_operation_driver::{
 use crate::public_operations::{
     ClaimedPublicOperation, CreateInlinePublicOperationResult, CreatePublicOperationResult,
     InlineClaim, InlineClaimOffer, InlineClaimed, InlineOrgLimit, InlineQueueReason,
-    PublicOperationStore, PublicOperationStoreError,
+    PublicOperationRequeueReason, PublicOperationStore, PublicOperationStoreError,
 };
 use crate::public_sandbox_operations::{
     CreateSandboxOperationExecutor, SandboxLifecycleOperationExecutor,
@@ -505,9 +505,79 @@ impl InlineExecutor for SandboxLifecycleOperationExecutor {
     }
 }
 
-/// Inline execution of the lifecycle operations callers wait on: a caller's
-/// `:wake`, `:resume` or `:start`, and the wake the system queues for a
-/// command, process session or attach. Each runs inline only when the env
+/// The dispatcher's executors for the kinds [`InlineLifecycle`] offers,
+/// chosen by kind as the dispatcher chooses them.
+struct NativeInlineExecutor {
+    create: CreateSandboxOperationExecutor,
+    lifecycle: SandboxLifecycleOperationExecutor,
+}
+
+/// Which of [`NativeInlineExecutor`]'s executors runs a kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeExecutorKind {
+    Create,
+    Lifecycle,
+}
+
+impl NativeExecutorKind {
+    /// The executor the dispatcher runs `kind` with, for the kinds that can
+    /// run inline; `None` for every other kind.
+    const fn for_kind(kind: OperationKind) -> Option<Self> {
+        match kind {
+            OperationKind::CreateSandbox => Some(Self::Create),
+            OperationKind::WakeSandbox
+            | OperationKind::ResumeSandbox
+            | OperationKind::StartSandbox => Some(Self::Lifecycle),
+            _ => None,
+        }
+    }
+
+    /// Whether every kind in `kinds` has an executor.
+    const fn cover(kinds: &[OperationKind]) -> bool {
+        match kinds {
+            [] => true,
+            [kind, rest @ ..] => Self::for_kind(*kind).is_some() && Self::cover(rest),
+        }
+    }
+}
+
+// Every kind in `INLINE_CAPABLE_KINDS` has an executor: a kind added there
+// without one in `NativeExecutorKind::for_kind` fails the build.
+const _: () = assert!(
+    NativeExecutorKind::cover(INLINE_CAPABLE_KINDS),
+    "a kind in INLINE_CAPABLE_KINDS has no inline executor"
+);
+
+impl InlineExecutor for NativeInlineExecutor {
+    fn execute(&self, operation: ClaimedPublicOperation) -> InlineExecution {
+        match NativeExecutorKind::for_kind(operation.kind) {
+            Some(NativeExecutorKind::Create) => InlineExecutor::execute(&self.create, operation),
+            Some(NativeExecutorKind::Lifecycle) => {
+                InlineExecutor::execute(&self.lifecycle, operation)
+            }
+            // Only kinds in `INLINE_CAPABLE_KINDS` are offered, so this is not
+            // reached; if it were, the operation goes back to the dispatcher,
+            // which chooses its own executor, rather than to the wrong one.
+            None => Box::pin(std::future::ready(OperationExecutionResult {
+                state: OperationState::Queued,
+                progress_message: format!(
+                    "operation kind {} has no inline executor; left to the dispatcher",
+                    operation.kind
+                ),
+                result_json: None,
+                terminal_error_code: None,
+                terminal_error_json: None,
+                retry_after: Some(Duration::ZERO),
+                requeue_reason: PublicOperationRequeueReason::TransientFailure,
+            })),
+        }
+    }
+}
+
+/// Inline execution of the lifecycle operations callers wait on: a native
+/// create that takes no warm-pool slot, a caller's `:wake`, `:resume` or
+/// `:start`, and the wake the system queues for a command, process session
+/// or attach. Each runs inline only when the env
 /// master is on, its kind is in `SPACE_NATIVE_INLINE_KINDS`, the
 /// `space-native-inline-operations` flag allows its organization, and the
 /// process has a permit free; admission then claims it only on an otherwise
@@ -533,13 +603,18 @@ impl InlineLifecycle {
         }
     }
 
-    /// The dispatcher's lifecycle executor, run by `runner`.
-    pub(crate) fn with_lifecycle_executor(
+    /// The dispatcher's create and lifecycle executors, run by `runner`.
+    pub(crate) fn with_native_executors(
         runner: InlineOperations,
-        executor: SandboxLifecycleOperationExecutor,
+        create: CreateSandboxOperationExecutor,
+        lifecycle: SandboxLifecycleOperationExecutor,
         feature_flags: FeatureFlagClient,
     ) -> Self {
-        Self::new(runner, Arc::new(executor), feature_flags)
+        Self::new(
+            runner,
+            Arc::new(NativeInlineExecutor { create, lifecycle }),
+            feature_flags,
+        )
     }
 
     /// Whether operations of `kind` for `org_id` are offered for inline
