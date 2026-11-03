@@ -786,13 +786,12 @@ function SandboxesPage() {
   // The error of the last load; a load of another scope that failed clears
   // the rows rather than show them under the new label.
   const [listError, setListError] = useState<string | null>(null);
-  // Only bare arrays answered paged requests, the list's or the prefix
-  // search's, for a minute of retries (`STOP_AFTER_MISMATCH_MS`) and at
-  // least twenty times in a row (`STOP_AFTER_MISMATCHES`): the API went back
-  // to a version without paging, and the list reads nothing more until the
-  // page is reloaded. Until then each is a failed refresh, and any page
-  // between them starts both over. A hidden tab sends nothing, and the first
-  // bare array after it starts the minute over (`MISMATCH_RUN_GAP_MS`).
+  // Twenty bare arrays in a row answered paged requests, the list's or the
+  // prefix search's (`STOP_AFTER_MISMATCHES`): the API went back to a
+  // version without paging, and the list reads nothing more until the page
+  // is reloaded. Until then each is a failed refresh. A page between them
+  // starts the count over; a failed or superseded request neither counts
+  // nor starts it over.
   const [listStopped, setListStopped] = useState(false);
   // The list's last answer was a bare array to a paged request, as during a
   // rolling deploy; the rows on screen are kept while the list retries. A
@@ -1363,13 +1362,12 @@ function SandboxesPage() {
     // list load refreshes it again.
     const timer = setTimeout(() => {
       const ticket = prefixRequests.begin(scope.key);
-      const sentAt = selection.now();
       getConsoleSandboxList(listRequestQuery(scope, Date.now()), ticket.signal)
         .then((response) => {
           if (!prefixRequests.applies(ticket, fragmentTargetRef.current)) return;
           // A bare array counts toward stopping the list, as one answering
           // the list does, and fails this refresh of the section.
-          const note = selection.noteAnswer('paged', response.mode, sentAt);
+          const note = selection.noteAnswer('paged', response.mode);
           if (note.kind === 'stopped') return stopList(note.kept);
           // Not sent before then; should it answer first, it fails this refresh.
           if (note.kind === 'undecided') throw new Error('the list has not loaded yet; retrying');
