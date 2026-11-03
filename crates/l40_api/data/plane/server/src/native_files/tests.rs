@@ -2,6 +2,7 @@
 //! Every expected answer is the one the API's own route gives; the rows of
 //! [`each_failure_answers_as_the_api_answers_it`] say where it comes from.
 
+mod drain;
 mod fakes;
 mod mutations;
 mod write;
