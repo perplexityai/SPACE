@@ -1959,10 +1959,11 @@ function SandboxesPage() {
         </div>
       ) : null}
 
-      {paged && !listStopped && search.kind === 'fragment' ? (
+      {/* Left out once an answer leaves nothing to show beyond the main table. */}
+      {paged && !listStopped && search.kind === 'fragment' && !(fragmentAnswer && !fragmentAnswer.error && fragmentRows.length === 0) ? (
         <div style={{ marginTop: 24 }}>
           <Title level={5} style={{ marginTop: 0 }}>
-            More matches beyond this page{fragmentAnswer ? ` (${fragmentRows.length}${fragmentAnswer.more ? '+' : ''})` : ''}
+            More matches beyond this page{fragmentAnswer ? ` (${fragmentRows.length}${fragmentAnswer.more && fragmentRows.length > 0 ? '+' : ''})` : ''}
           </Title>
           <Text type="secondary" style={{ display: 'block', fontSize: 12, marginBottom: 8 }}>
             {`Names and IDs starting with "${search.prefix}", not already listed above. Searched on the server with the filters above: names that start with it, case-sensitively, and IDs that start with it. Names and IDs that contain it elsewhere, such as an ID ending in the ID column's label, match on the page above only.${fragmentAnswer?.more ? ` Showing the first ${pageSize}, newest first; type more of the name or ID to narrow them.` : ''}`}
