@@ -428,7 +428,11 @@ fn admin_create_fingerprint(
 /// gate: it refuses unless rollback is enabled for the sandbox's organization
 /// (`SPACE_NATIVE_HIDDEN_OPERATIONS_ORGS`, or the
 /// `space-native-hidden-operations` flag). Turning the gate off for an org
-/// closes both routes.
+/// closes both routes. It is the only hidden action this surface gates:
+/// `:force-checkpoint` and `:force-enable_snapshots`, hidden on the public API
+/// too, already ran ungated here and only add snapshots, while rollback, which
+/// this route could not run until it carried the `:rollback` body, rolls the
+/// sandbox back to a snapshot.
 ///
 /// The sandbox resolves before the request is validated, so every refusal after
 /// that names the sandbox and its organization in the audit event.
