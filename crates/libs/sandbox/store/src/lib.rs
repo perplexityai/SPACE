@@ -106,6 +106,7 @@ pub mod fork_source_lifecycle;
 pub mod ingest;
 pub mod lost;
 pub mod repair;
+pub mod suspend;
 pub mod sweeper;
 pub mod wake;
 

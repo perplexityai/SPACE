@@ -88,14 +88,14 @@ impl K8sStore {
         }
 
         if pending_finalization {
-            Self::finalize_suspended_sandbox_in(
-                &mut tx,
+            pplx_space_sandbox_store::suspend::finalize_with_committed_artifact(
+                &mut *tx,
                 sandbox_id,
-                artifact_id,
-                artifact_kind,
-                artifact_origin,
+                published_artifact.id,
+                published_artifact.kind,
             )
-            .await?;
+            .await
+            .db_context("failed to mark suspended sandbox unplaced")?;
         }
 
         // The claimed pod is gone once the suspend finalizes; drop the slot
@@ -116,48 +116,6 @@ impl K8sStore {
         tx.commit()
             .await
             .db_context("failed to commit suspended pod transaction")?;
-        Ok(())
-    }
-
-    async fn finalize_suspended_sandbox_in(
-        tx: &mut Transaction<'_, Postgres>,
-        sandbox_id: SandboxId,
-        artifact_id: Uuid,
-        artifact_kind: &str,
-        artifact_origin: &str,
-    ) -> Result<(), SubstrateError> {
-        let marker_assignments = write_current_local_artifact_marker_assignments("$2", "$3", "$4");
-        let finalization = suspended_k8s_finalization_sql(
-            "s",
-            "candidate",
-            &marker_assignments,
-            SuspendedTargetNodeAssignment::Preserve,
-        );
-        let query = format!(
-            "WITH candidate AS MATERIALIZED (
-                 SELECT id
-                   FROM sandboxes
-                  WHERE id = $1
-             ),
-             {retire_active_execution_cte},
-             {invalidate_open_port_exposures_cte}
-             UPDATE sandboxes s
-                SET {sandbox_assignments}
-               FROM candidate
-              WHERE s.id = candidate.id",
-            retire_active_execution_cte = finalization.retire_active_execution_cte(),
-            invalidate_open_port_exposures_cte = finalization.invalidate_open_port_exposures_cte(),
-            sandbox_assignments = finalization.sandbox_assignments(),
-        );
-
-        sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
-            .bind(sandbox_id)
-            .bind(artifact_id)
-            .bind(artifact_kind)
-            .bind(artifact_origin)
-            .execute(&mut **tx)
-            .await
-            .db_context("failed to mark suspended sandbox unplaced")?;
         Ok(())
     }
 
@@ -242,14 +200,14 @@ impl K8sStore {
             .await
             .db_context("failed to commit suspend after terminal Kubernetes pod cleanup")?;
             if forgotten_execution_committed.rows_affected() == 1 {
-                Self::finalize_suspended_sandbox_in(
-                    &mut tx,
+                pplx_space_sandbox_store::suspend::finalize_with_committed_artifact(
+                    &mut *tx,
                     sandbox_id,
-                    artifact_id,
-                    artifact_kind,
-                    ArtifactOrigin::Suspend.as_str(),
+                    published_artifact.id,
+                    published_artifact.kind,
                 )
-                .await?;
+                .await
+                .db_context("failed to mark suspended sandbox unplaced")?;
                 tx.commit().await.db_context(
                     "failed to commit finalized Kubernetes suspend after pod cleanup",
                 )?;
@@ -301,22 +259,15 @@ impl K8sStore {
                         .to_string(),
             });
         }
-        let updated = sqlx::query(sql!(
-            "UPDATE sandboxes
-                SET lifecycle = 'suspending',
-                    current_local_artifact_id = $2,
-                    current_local_artifact_kind = $3,
-                    current_local_artifact_origin = 'suspend'
-              WHERE id = $1
-                AND lifecycle = 'suspending'"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .bind(artifact_id)
-        .bind(artifact_kind)
-        .execute(&mut *tx)
+        let updated = pplx_space_sandbox_store::suspend::record_committed_artifact(
+            &mut *tx,
+            sandbox_id,
+            published_artifact.id,
+            published_artifact.kind,
+        )
         .await
         .db_context("failed to persist Kubernetes suspend commit")?;
-        if updated.rows_affected() != 1 {
+        if !updated {
             return Err(SubstrateError::Unavailable {
                 message: "sandbox execution changed before its suspend commit was persisted"
                     .to_string(),
@@ -335,26 +286,16 @@ impl K8sStore {
         expected_pod_uid: &PodUid,
     ) -> Result<SuspendExecutionClaim, SubstrateError> {
         for previous in [SandboxLifecycle::Started, SandboxLifecycle::Paused] {
-            let claimed = sqlx::query(sql!(
-                "UPDATE sandboxes s
-                    SET lifecycle = 'suspending'
-                   FROM sandbox_k8s_executions e
-                  WHERE s.id = $1
-                    AND s.lifecycle = $4
-                    AND e.sandbox_id = s.id
-                    AND e.generation = $2
-                    AND e.active
-                    AND e.pod_uid = $3
-                    AND e.state = 'running'"
-            ))
-            .bind(sandbox_id.as_uuid())
-            .bind(generation.get())
-            .bind(expected_pod_uid.as_str())
-            .bind(previous.as_str())
-            .execute(&self.pool)
+            let claimed = pplx_space_sandbox_store::suspend::claim(
+                &self.pool,
+                sandbox_id,
+                generation,
+                expected_pod_uid,
+                previous,
+            )
             .await
             .db_context("failed to claim Kubernetes suspend execution")?;
-            if claimed.rows_affected() == 1 {
+            if claimed {
                 return Ok(SuspendExecutionClaim::Claimed);
             }
         }
@@ -668,21 +609,13 @@ impl K8sStore {
         self.finish_active_execution_in(&mut tx, sandbox_id, SandboxLifecycle::Suspended.as_str())
             .await?;
 
-        let marker_assignments = clear_current_local_artifact_marker_assignments("s", "$2");
-        let sandbox_assignments = suspended_k8s_finalization_sql(
-            "s",
-            "candidate",
-            &marker_assignments,
-            SuspendedTargetNodeAssignment::Preserve,
+        pplx_space_sandbox_store::suspend::finalize_missing_pod_from_current_snapshot(
+            &mut *tx,
+            sandbox_id,
+            clear_marker,
         )
-        .sandbox_assignments();
-        let query = format!("UPDATE sandboxes s SET {sandbox_assignments} WHERE s.id = $1");
-        sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
-            .bind(sandbox_id)
-            .bind(clear_marker)
-            .execute(&mut *tx)
-            .await
-            .db_context("failed to finalize missing suspended pod")?;
+        .await
+        .db_context("failed to finalize missing suspended pod")?;
         WarmPoolStore::delete_claimed_slot_for_retired_execution(&mut tx, sandbox_id)
             .await
             .db_context("failed to delete claimed pool slot")?;
