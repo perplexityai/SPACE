@@ -414,11 +414,16 @@ def test_harness_end_to_end_with_fake_worker(tmp_path, monkeypatch, capsys):
     assert "broken           FAIL" in report and "8 correctness failures" in report
 
 
+QUEUED_CREATE_SECS = 3
+
+
 def _fake_space_api(root: pathlib.Path):
     """In-process stand-in for the SPACE API and data plane used by API mode.
 
     Suspend writes the snapshot, holds it briefly, then tears the local state
     down the way an EKS suspend does, so the harness must sample sizes live.
+    A "t-queued" create stays queued for ``QUEUED_CREATE_SECS`` and ignores any
+    delete issued before it ends, then comes up.
     """
     import base64
     import http.server
@@ -447,6 +452,17 @@ def _fake_space_api(root: pathlib.Path):
     mem_mib = {"t-base": 8, "t-small": 4, "t-elsewhere": 4}
     sessions: dict[str, tuple[int, bytes]] = {}
     seen_tokens: set[str] = set()
+    # Queued creates: operation ID -> sandbox ID, and sandbox ID -> monotonic end time.
+    queued_ops: dict[str, str] = {}
+    queued_until: dict[str, float] = {}
+
+    def create_ended(sid):
+        """Bring a queued create up once its time passes; return whether it has ended."""
+        if time.monotonic() < queued_until.get(sid, 0):
+            return False
+        if queued_until.pop(sid, None) is not None:
+            states[sid] = "running"
+        return True
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *args):  # keep pytest output clean
@@ -468,7 +484,8 @@ def _fake_space_api(root: pathlib.Path):
             seen_tokens.add(self.headers.get("Authorization", ""))
             path = self.path.split("?")[0]
             if path.startswith("/v1/operations/"):
-                return self.reply({"state": "succeeded"})
+                ended = create_ended(queued_ops.get(path.rsplit("/", 1)[1], ""))
+                return self.reply({"state": "succeeded" if ended else "running"})
             if m := re.fullmatch(r"/v1/sessions/(proc_[0-9a-f-]+)/events", path):
                 code, out = sessions.pop(m.group(1))
                 self.send_response(200)
@@ -479,6 +496,9 @@ def _fake_space_api(root: pathlib.Path):
                     self.wfile.write(b"data: " + json.dumps(frame).encode() + b"\n\n")
                 return None
             if m := re.fullmatch(r"/v1/sandboxes/sbx_([0-9a-f-]+)(/processes)?", path):
+                create_ended(m.group(1))
+                if states.get(m.group(1), "deleted") == "deleted":
+                    return self.reply({"error": "sandbox not found"}, 404)
                 return self.reply({"state": states[m.group(1)]} if not m.group(2) else {"processes": []})
             return self.reply({"error": path}, 404)
 
@@ -489,6 +509,11 @@ def _fake_space_api(root: pathlib.Path):
                 assert body["resources"] == {"vcpu": 2, "memory_mib": 8192}
                 sid = str(uuid.uuid4())
                 templates[sid] = body["template"]
+                if body["template"] == "t-queued":
+                    op = f"op_{uuid.uuid4()}"
+                    queued_ops[op] = sid
+                    queued_until[sid] = time.monotonic() + QUEUED_CREATE_SECS
+                    return self.reply({"sandbox_id": f"sbx_{sid}", "operation_id": op}, 202)
                 (run / sid).mkdir(parents=True)
                 os.symlink(f"/proc/{os.getpid()}", run / sid / "fc.pid")
                 states[sid] = "running"
@@ -522,13 +547,14 @@ def _fake_space_api(root: pathlib.Path):
 
         def do_DELETE(self):
             sid = self.path.rsplit("sbx_", 1)[1]
-            states[sid] = "deleted"
+            if create_ended(sid):
+                states[sid] = "deleted"
             subprocess.run(["pkill", "-f", str(guest / sid)], check=False)
             return self.reply({"sandbox_id": f"sbx_{sid}", "operation_id": f"op_{uuid.uuid4()}"}, 202)
 
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    return server, seen_tokens
+    return server, seen_tokens, states
 
 
 def test_harness_api_mode_with_fake_space_api(tmp_path, monkeypatch, capsys):
@@ -538,7 +564,7 @@ def test_harness_api_mode_with_fake_space_api(tmp_path, monkeypatch, capsys):
     for tool in ("sh", "dd", "sha256sum", "pkill"):
         if not shutil.which(tool):
             pytest.skip(f"{tool} not available")
-    server, seen_tokens = _fake_space_api(tmp_path)
+    server, seen_tokens, _ = _fake_space_api(tmp_path)
     url = f"http://127.0.0.1:{server.server_address[1]}"
     token = tmp_path / "token"
     token.write_text("mgmt-token\n")
@@ -599,6 +625,32 @@ def test_harness_api_mode_with_fake_space_api(tmp_path, monkeypatch, capsys):
         [r for r in rows if r["variant"] != "moved"], baseline="baseline", min_reduction_bytes=1 * MIB, min_sample_stable_ms=60_000
     )
     assert not strict[0].passed and strict[0].missing_cycles == 4
+
+
+def test_api_mode_deletes_a_create_that_comes_up_after_its_wait_times_out(tmp_path):
+    server, _, states = _fake_space_api(tmp_path)
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+    token = tmp_path / "token"
+    token.write_text("mgmt-token\n")
+    out_dir = tmp_path / "out"
+    args = bench.build_parser().parse_args(
+        [
+            "--variant", "queued=t-queued", "--sandboxes", "1", "--cycles", "3", "--no-sudo",
+            "--op-timeout-secs", "2", "--sbxmgr", str(tmp_path / "missing-sbxmgr"),
+            "--api-url", url, "--data-plane-url", url, "--api-token-file", str(token),
+            "--sandbox-run-dir", str(tmp_path / "run"), "--output-dir", str(out_dir),
+        ]
+    )
+    try:
+        bench.BalloonBenchmark(args).run()
+    finally:
+        server.shutdown()
+
+    [result] = summary.load_rows([out_dir / "results.jsonl"])
+    assert result["cycle"] == 0 and result["error"].startswith("create failed for sbx_")
+    [tracked] = (out_dir / "tracked-sandboxes.txt").read_text().split()
+    # The create came up after the harness gave up waiting, and was still deleted.
+    assert states == {bench.local_id(tracked): "deleted"}
 
 
 def test_api_mode_sudo_prefix(tmp_path):

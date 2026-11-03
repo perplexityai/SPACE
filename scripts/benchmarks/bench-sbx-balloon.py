@@ -331,7 +331,9 @@ _SANDBOX_GONE = {"failed", "deleted", "deleting", "stopped"}
 
 
 class ApiError(RuntimeError):
-    pass
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 class SpaceApi:
@@ -365,7 +367,7 @@ class SpaceApi:
         except urllib.error.HTTPError as error:
             with error:
                 detail = error.read(2048).decode("utf-8", errors="replace")
-            raise ApiError(f"{method} {path}: HTTP {error.code}: {detail}") from error
+            raise ApiError(f"{method} {path}: HTTP {error.code}: {detail}", error.code) from error
         except (urllib.error.URLError, OSError) as error:
             raise ApiError(f"{method} {path}: {error}") from error
         if not raw.strip():
@@ -427,6 +429,45 @@ class SpaceApi:
         operation_id = result.get("operation_id")
         if isinstance(operation_id, str):
             self.wait_operation(operation_id, timeout)
+
+    def sandbox_state(self, sandbox_id: str) -> str | None:
+        """Return the sandbox state, or None when the API does not find it."""
+        try:
+            return self.request("GET", f"/v1/sandboxes/{sandbox_id}").get("state")
+        except ApiError as error:
+            if error.status == 404:
+                return None
+            raise
+
+    def delete_after_create(self, sandbox_id: str, create_operation_id: str, timeout: float) -> None:
+        """Delete a sandbox whose create may still be in flight, until the API no longer finds it.
+
+        A delete issued while the create is queued may not take effect, so the
+        sandbox can come up afterwards. The API also cannot find a sandbox before
+        its create records it, so a miss only proves it gone once the create ends.
+        """
+        deadline = time.monotonic() + timeout
+        last = ""
+        try:
+            # Issue one delete now so a create that has not started can be canceled;
+            # don't wait on it, since its operation can queue behind the create.
+            self.request("DELETE", f"/v1/sandboxes/{sandbox_id}", idempotent=True)
+        except ApiError as error:
+            last = str(error)
+        while True:
+            try:
+                created = self.request("GET", f"/v1/operations/{create_operation_id}").get("state")
+                if created == "succeeded" or created in _TERMINAL_FAILED:
+                    state = self.sandbox_state(sandbox_id)
+                    if state in (None, "deleted"):
+                        return
+                    if state != "deleting":
+                        self.delete(sandbox_id, max(1.0, deadline - time.monotonic()))
+            except ApiError as error:
+                last = str(error)
+            if time.monotonic() >= deadline:
+                raise ApiError(f"sandbox {sandbox_id} still present after {timeout:.0f}s: {last}")
+            time.sleep(self.poll_secs)
 
     def events_url(self, attach: dict[str, Any]) -> str:
         url = str(attach.get("events_url") or "")
@@ -890,7 +931,10 @@ class BalloonBenchmark:
             try:
                 self.api.wait_created(sandbox_id, operation_id, a.op_timeout_secs)
             except ApiError as error:
-                self.delete(cli, sandbox_id)
+                try:
+                    self.api.delete_after_create(sandbox_id, operation_id, a.op_timeout_secs)
+                except ApiError as cleanup_error:
+                    print(f"WARNING: cleanup failed for {sandbox_id}: {sanitize_error(str(cleanup_error))}", file=sys.stderr)
                 return None, f"create failed for {sandbox_id}: {sanitize_error(str(error))}"
             deadline = time.monotonic() + a.local_wait_secs
             while self.probe.fc_pid(sandbox_id) is None:
