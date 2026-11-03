@@ -204,8 +204,10 @@ policy from the recorded execution and image contract. Guest claims cannot
 widen that policy. Deploy the matching node-manager and spaced-host before
 starting this image; older peers refuse it.
 
-This backend currently advertises **no process, file, watch, flush, resume or
-forwarding operations**. Readiness is not their qualification. The image still
+The native backend implements volume flush and UTC clock synchronization for
+component qualification. It advertises those two operations, but the trusted
+host policy still permits readiness only. It implements **no process, file,
+watch or forwarding operations**. Readiness is not their qualification. The image still
 uses ACPI shutdown, and base snapshots, warm pools and automatic memory
 lifecycle remain refused. Do not publish an evaluation disk or embedded test
 credentials with this source.
@@ -218,3 +220,18 @@ It uses the same explicit standalone-worker opt-in
 as `node.windows_sandbox_lifecycle`. It passed on an x86-64 Linux/KVM worker
 with Cloud Hypervisor 54 and a Windows Server 2025 evaluation image. This is
 readiness and cold-lifecycle evidence, not process/file or memory-restore evidence.
+
+The lifecycle candidate uses `FlushFileBuffers` through volume handles, with a
+single flush worker retaining its permit even if the RPC is cancelled. Resume
+validates the host timestamp and uses `SetSystemTime` in the SYSTEM service.
+Native tests and direct component RPCs passed on the evaluation guest.
+
+Memory lifecycle remains unqualified. Direct CH snapshot/restore preserved a
+synthetic process's PID, in-memory random marker and advancing counter, but
+repeated vsock reconnects stalled after restore. The failure also reproduced
+with raw `CONNECT` handshakes, without gRPC or clock synchronization: two
+connections succeeded and the next timed out. VMM tracing showed the connection
+request delivered to the guest without a matching response. This does not yet
+locate the defect between the guest listener and the VirtIO socket driver.
+Do not enable base snapshots or warm pools, or substitute restarting the agent,
+until repeated restored connections pass without intervention.
