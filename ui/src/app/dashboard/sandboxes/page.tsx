@@ -1406,6 +1406,9 @@ function SandboxesPage() {
     })),
     [fragmentAnswer, nodeFilter, shownRows.sandboxes],
   );
+  // The matches the answer returned, which can be fewer than the page size
+  // when the server's byte budget ends the page early.
+  const fragmentMatched = fragmentAnswer?.sandboxes.length ?? 0;
 
   // The window and the "older than" bound must leave a range between them;
   // a window that would not drops the bound.
@@ -1999,7 +2002,7 @@ function SandboxesPage() {
             More matches beyond this page{fragmentAnswer && fragmentRows.length > 0 ? ` (${fragmentRows.length}${fragmentAnswer.more ? '+' : ''})` : ''}
           </Title>
           <Text type="secondary" style={{ display: 'block', fontSize: 12, marginBottom: 8 }}>
-            {`Names and IDs starting with "${search.prefix}", not already listed above. Searched on the server with the filters above: names that start with it, case-sensitively, and IDs that start with it. Names and IDs that contain it elsewhere, such as an ID ending in the ID column's label, match on the page above only.${fragmentAnswer?.more && fragmentRows.length > 0 ? ` Showing the first ${pageSize}, newest first; type more of the name or ID to narrow them.` : ''}`}
+            {`Names and IDs starting with "${search.prefix}", not already listed above. Searched on the server with the filters above: names that start with it, case-sensitively, and IDs that start with it. Names and IDs that contain it elsewhere, such as an ID ending in the ID column's label, match on the page above only.${fragmentAnswer?.more && fragmentRows.length > 0 ? ` Showing the first ${fragmentMatched}, newest first; type more of the name or ID to narrow them.` : ''}`}
           </Text>
           {fragmentAnswer?.error ? (
             <Alert type="warning" showIcon style={{ marginBottom: 8 }} title={`Could not search names and IDs starting with "${search.prefix}": ${fragmentAnswer.error}`} />
@@ -2007,8 +2010,8 @@ function SandboxesPage() {
           {fragmentAnswer && fragmentAnswer.more && fragmentRows.length === 0 ? (
             <Text style={{ display: 'block' }}>
               {supplementalMatches(fragmentAnswer.sandboxes, shownRows.sandboxes).length === 0
-                ? `All of the first ${pageSize} matches are on this page; type more of the name or ID to find older ones.`
-                : `The first ${pageSize} matches are on this page or left out by the node filter; type more of the name or ID to find older ones.`}
+                ? `${fragmentMatched === 1 ? 'The first match is' : `All of the first ${fragmentMatched} matches are`} on this page; type more of the name or ID to find older ones.`
+                : `${fragmentMatched === 1 ? 'The first match is' : `The first ${fragmentMatched} matches are`} on this page or left out by the node filter; type more of the name or ID to find older ones.`}
             </Text>
           ) : (
             <Table
