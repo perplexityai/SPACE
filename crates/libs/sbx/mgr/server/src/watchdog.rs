@@ -157,6 +157,14 @@ enum SpacedHostRestartError {
     AuthorityChanged,
     #[error("sandbox database mutex poisoned")]
     DatabaseMutexPoisoned,
+    #[error("load sandbox for spaced-host restart: {0}")]
+    LoadSandbox(#[source] crate::db::Error),
+    #[error("sandbox missing during spaced-host restart")]
+    MissingSandbox,
+    #[error("resolve guest profile for spaced-host restart: {0}")]
+    GuestProfile(#[from] pplx_space_execution_catalog::guest::GuestProfileError),
+    #[error("guest profile does not support stored process environment configuration")]
+    UnsupportedProcessEnvironment,
     #[error("persist spaced-host replacement pid: {0}")]
     Persist(#[source] crate::db::Error),
 }
@@ -2915,6 +2923,29 @@ async fn restart_spaced_host(
     sidecars: Arc<Mutex<HashMap<String, SidecarInfo>>>,
     node_manager: &NodeManagerConnector,
 ) -> Result<(), SpacedHostRestartError> {
+    let agent = {
+        let conn = db
+            .lock()
+            .map_err(|_| SpacedHostRestartError::DatabaseMutexPoisoned)?;
+        let sandbox = crate::db::read::sandbox(&conn, &info.sandbox_id)
+            .map_err(SpacedHostRestartError::LoadSandbox)?
+            .ok_or(SpacedHostRestartError::MissingSandbox)?;
+        if sandbox.node_execution_id != info.node_execution_id
+            || sandbox.guest_image != info.guest_image
+            || sandbox.process_env != info.process_env
+            || sandbox.uid != info.uid
+        {
+            return Err(SpacedHostRestartError::AuthorityChanged);
+        }
+        pplx_space_execution_catalog::guest::GuestProfile::for_existing(
+            sandbox.execution_metadata.as_ref(),
+            sandbox.guest_image,
+        )?
+        .agent_protocol()
+    };
+    if !agent.supports_process_environment() && !info.process_env.is_empty() {
+        return Err(SpacedHostRestartError::UnsupportedProcessEnvironment);
+    }
     let mut node_client = node_manager.connect().await?;
 
     let id = &info.sandbox_id;
@@ -2931,7 +2962,7 @@ async fn restart_spaced_host(
             }),
             sandbox_id: id.clone(),
             program: pplx_space_common_core::host::linux::paths::SPACED_HOST_SVC_BIN.to_string(),
-            args: spaced_host_restart_args(id, vsock_uds_path),
+            args: spaced_host_restart_args(id, vsock_uds_path, agent),
             uid,
             gid: uid,
             env: crate::sidecar_env::telemetry_env_for_service("space-spaced-host"),
@@ -2955,10 +2986,12 @@ async fn restart_spaced_host(
         )
         .await
         .map_err(SpacedHostRestartError::SpacedHostConnect)?;
-    spaced_host
-        .configure_process_env(info.process_env.clone().into_iter().collect())
-        .await
-        .map_err(SpacedHostRestartError::Configure)?;
+    if agent.supports_process_environment() {
+        spaced_host
+            .configure_process_env(info.process_env.clone().into_iter().collect())
+            .await
+            .map_err(SpacedHostRestartError::Configure)?;
+    }
 
     {
         let mut sidecars = sidecars.lock().await;
@@ -2966,6 +2999,8 @@ async fn restart_spaced_host(
             .get_mut(id)
             .ok_or(SpacedHostRestartError::SandboxLeftWatchdog)?;
         if current.uid != Some(uid)
+            || current.node_execution_id != info.node_execution_id
+            || current.guest_image != info.guest_image
             || (current.spaced_host_pid != info.spaced_host_pid
                 && current.spaced_host_pid != Some(pid))
         {
@@ -2992,7 +3027,11 @@ async fn restart_spaced_host(
     Ok(())
 }
 
-fn spaced_host_restart_args(sandbox_id: &str, vsock_uds_path: String) -> Vec<String> {
+fn spaced_host_restart_args(
+    sandbox_id: &str,
+    vsock_uds_path: String,
+    agent: pplx_space_common_core::types::guest_image::QualifiedGuestAgent,
+) -> Vec<String> {
     vec![
         "--socket".to_string(),
         pplx_space_common_core::host::linux::paths::spaced_host_socket(sandbox_id),
@@ -3003,7 +3042,12 @@ fn spaced_host_restart_args(sandbox_id: &str, vsock_uds_path: String) -> Vec<Str
         "--host-control-socket".to_string(),
         pplx_space_common_core::host::linux::paths::SANDBOX_HOST_CONTROL_SOCKET.to_string(),
         "--boot-type".to_string(),
-        "resume".to_string(),
+        if agent.supports_memory_lifecycle() {
+            "resume"
+        } else {
+            "fresh"
+        }
+        .to_string(),
     ]
 }
 

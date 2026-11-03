@@ -208,3 +208,97 @@ async fn unpersisted_stop_and_delete_clean_up_through_node_manager_and_report_th
         }
     }
 }
+
+#[tokio::test]
+async fn unpersisted_admission_preserves_flush_qualification_after_row_loss() {
+    use crate::db::cleanup_jobs::GuestFlush;
+    use crate::db::test_fixtures::state_write_fixtures::with_sandbox_params;
+    use pplx_space_common_core::types::guest_image::{
+        GuestAgent, GuestDiskLayout, GuestImageContract, GuestNetwork, GuestReadiness,
+    };
+    let windows = GuestImageContract::new(
+        GuestDiskLayout::OpaqueRawDisk,
+        GuestReadiness::Agent,
+        GuestNetwork::SlotDhcpV1,
+        GuestAgent::Spaced,
+    )
+    .unwrap();
+    for (image, runtime, expected) in [
+        (
+            GuestImageContract::default(),
+            "fc",
+            GuestFlush::BeforeTermination,
+        ),
+        (windows, "ch", GuestFlush::Forbidden),
+    ] {
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new();
+        let id = sandbox_id.to_string();
+        with_sandbox_params(
+            &id,
+            SandboxState::Started,
+            |params| {
+                params.guest_image = image;
+                params.runtime = runtime;
+            },
+            |params| crate::db::insert_sandbox(&conn, params).unwrap(),
+        );
+        if image == windows {
+            let environments =
+                pplx_space_execution_catalog::catalog::CompiledEnvironment::for_architecture(
+                    pplx_space_common_core::types::Arch::X86_64,
+                )
+                .unwrap();
+            let execution = environments
+                .iter()
+                .find(|entry| entry.name() == "ch-54.0-windows-uefi")
+                .unwrap()
+                .definition()
+                .execution_requirements()
+                .unwrap();
+            crate::db::upsert_sandbox_execution_metadata(&conn, &id, &execution).unwrap();
+        }
+        refuse_lifecycle_claims(&conn);
+        let scratch = tempfile::tempdir().unwrap();
+        let service = SandboxManagerService::new_with_options(
+            conn,
+            SandboxManagerServiceOptions::for_test_in(scratch.path()),
+        );
+        service.shutdown_token.cancel();
+        service.task_tracker.close();
+        service.task_tracker.wait().await;
+        let admission = service
+            .admit_selected_cleanup(
+                sandbox_id,
+                CleanupCompletion::MarkStopped,
+                false,
+                true,
+                None,
+                false,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("cleanup admission: {}", error.into_status()));
+        assert!(admission.is_unpersisted_for_sandbox(sandbox_id).unwrap());
+        crate::db::delete_sandbox(&service.db_conn().unwrap(), &id).unwrap();
+        assert_eq!(
+            service
+                .lookup_sandbox(&id)
+                .err()
+                .expect("row was removed")
+                .code(),
+            tonic::Code::NotFound
+        );
+        assert_eq!(
+            admission.fallback_guest_flush(GuestFlush::BeforeTermination),
+            expected
+        );
+        assert_eq!(
+            admission.fallback_guest_flush(GuestFlush::Forbidden),
+            GuestFlush::Forbidden
+        );
+        assert_eq!(
+            admission.fallback_guest_flush(GuestFlush::Unrequested),
+            GuestFlush::Unrequested
+        );
+    }
+}

@@ -17,37 +17,46 @@ fn image() -> GuestImageContract {
     .unwrap()
 }
 
+fn insert_firmware_sandbox(
+    conn: &crate::db::Connection,
+    id: &str,
+    state: SandboxState,
+    image: GuestImageContract,
+) {
+    crate::db::insert_sandbox(
+        conn,
+        crate::db::InsertSandboxParams {
+            id,
+            uuid8: &SandboxRuntimeLabel::parse("01234567").unwrap(),
+            state,
+            template: "firmware-test",
+            template_hash: None,
+            user: &SandboxOwner::parse("test-owner").unwrap(),
+            runtime: "ch",
+            guest_image: image,
+            snapshots_enabled: false,
+            rootfs_size_mb: None,
+            disk_io_limits: Default::default(),
+            pool_template: None,
+            volume_encryption: false,
+            process_env: &Default::default(),
+            auto_lifecycle: &AutoLifecyclePolicy::disabled(),
+            network_policy_override: None,
+            network_policy_generation: 0,
+            network_policy_authority: PolicyAuthority::Local,
+            auto_lifecycle_authority: PolicyAuthority::Local,
+        },
+    )
+    .unwrap();
+}
+
 #[tokio::test]
 async fn agentless_activity_and_environment_updates_refuse_without_waking_or_persisting() {
     for state in [SandboxState::Stopped, SandboxState::Started] {
         let conn = crate::db::test_conn();
         let id = SandboxId::new().to_string();
         let image = image();
-        crate::db::insert_sandbox(
-            &conn,
-            crate::db::InsertSandboxParams {
-                id: &id,
-                uuid8: &SandboxRuntimeLabel::parse("01234567").unwrap(),
-                state,
-                template: "firmware-test",
-                template_hash: None,
-                user: &SandboxOwner::parse("test-owner").unwrap(),
-                runtime: "ch",
-                guest_image: image,
-                snapshots_enabled: false,
-                rootfs_size_mb: None,
-                disk_io_limits: Default::default(),
-                pool_template: None,
-                volume_encryption: false,
-                process_env: &Default::default(),
-                auto_lifecycle: &AutoLifecyclePolicy::disabled(),
-                network_policy_override: None,
-                network_policy_generation: 0,
-                network_policy_authority: PolicyAuthority::Local,
-                auto_lifecycle_authority: PolicyAuthority::Local,
-            },
-        )
-        .unwrap();
+        insert_firmware_sandbox(&conn, &id, state, image);
         let node = FakeNodeManager::default().serve();
         let service = SandboxManagerService::new_with_options(
             conn,
@@ -291,4 +300,66 @@ async fn shutdown_wait_finishes_on_exit_but_not_on_missing_process_evidence() {
             assert!(tokio::time::Instant::now() < deadline);
         }
     }
+}
+
+#[tokio::test]
+async fn windows_environment_update_refuses_before_persistence_but_allows_clearing() {
+    use pplx_space_common_core::types::guest_image::GuestAgent;
+    let conn = crate::db::test_conn();
+    let id = SandboxId::new().to_string();
+    let image = GuestImageContract::new(
+        image().disk(),
+        GuestReadiness::Agent,
+        image().network(),
+        GuestAgent::Spaced,
+    )
+    .unwrap();
+    insert_firmware_sandbox(&conn, &id, SandboxState::Started, image);
+    let catalog = pplx_space_execution_catalog::catalog::CompiledEnvironment::for_architecture(
+        pplx_space_common_core::types::Arch::X86_64,
+    )
+    .unwrap();
+    let execution = catalog
+        .iter()
+        .find(|entry| entry.name() == "ch-54.0-windows-uefi")
+        .unwrap()
+        .definition()
+        .execution_requirements()
+        .unwrap();
+    crate::db::upsert_sandbox_execution_metadata(&conn, &id, &execution).unwrap();
+    let node = FakeNodeManager::default().serve();
+    let service = SandboxManagerService::new_with_options(
+        conn,
+        SandboxManagerServiceOptions {
+            node_manager: node.connector(),
+            ..SandboxManagerServiceOptions::for_test()
+        },
+    );
+    let request = |env| {
+        super::super::activation_support::internal_request(UpdateRequest {
+            sandbox_id: id.clone(),
+            replace_process_env: true,
+            process_env: env,
+            ..Default::default()
+        })
+    };
+    let error = service
+        .update(request(std::collections::HashMap::from([(
+            "KEY".into(),
+            "value".into(),
+        )])))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(service.lookup_sandbox(&id).unwrap().process_env.is_empty());
+    // A stale setting must remain clearable without an unsupported guest RPC.
+    crate::db::update_process_env(
+        &service.db_conn().unwrap(),
+        &id,
+        &std::collections::BTreeMap::from([("STALE".into(), "value".into())]),
+    )
+    .unwrap();
+    service.update(request(Default::default())).await.unwrap();
+    assert!(service.lookup_sandbox(&id).unwrap().process_env.is_empty());
+    assert!(node.calls().is_empty());
 }

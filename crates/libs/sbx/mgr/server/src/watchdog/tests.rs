@@ -1389,27 +1389,33 @@ fn inapplicable_guest_components_do_not_block_composed_health() {
 }
 
 #[test]
-fn spaced_host_restart_args_include_required_host_control_socket() {
+fn spaced_host_restart_args_preserve_control_socket_and_only_notify_qualified_guests() {
+    use pplx_space_common_core::types::guest_image::QualifiedGuestAgent;
     let sandbox_id = "sbx-123";
     let vsock_uds_path = format!("{RUN_DIR}/{sandbox_id}/root/v.sock");
 
-    let args = spaced_host_restart_args(sandbox_id, vsock_uds_path);
+    for (agent, boot_type) in [
+        (QualifiedGuestAgent::LinuxV1, "resume"),
+        (QualifiedGuestAgent::WindowsV1, "fresh"),
+    ] {
+        let args = spaced_host_restart_args(sandbox_id, vsock_uds_path.clone(), agent);
 
-    assert_eq!(
-        args,
-        vec![
-            "--socket".to_string(),
-            pplx_space_common_core::host::linux::paths::spaced_host_socket(sandbox_id),
-            "--sandbox-id".to_string(),
-            sandbox_id.to_string(),
-            "--vsock-uds".to_string(),
-            format!("{RUN_DIR}/{sandbox_id}/root/v.sock"),
-            "--host-control-socket".to_string(),
-            pplx_space_common_core::host::linux::paths::SANDBOX_HOST_CONTROL_SOCKET.to_string(),
-            "--boot-type".to_string(),
-            "resume".to_string(),
-        ]
-    );
+        assert_eq!(
+            args,
+            vec![
+                "--socket".to_string(),
+                pplx_space_common_core::host::linux::paths::spaced_host_socket(sandbox_id),
+                "--sandbox-id".to_string(),
+                sandbox_id.to_string(),
+                "--vsock-uds".to_string(),
+                format!("{RUN_DIR}/{sandbox_id}/root/v.sock"),
+                "--host-control-socket".to_string(),
+                pplx_space_common_core::host::linux::paths::SANDBOX_HOST_CONTROL_SOCKET.to_string(),
+                "--boot-type".to_string(),
+                boot_type.to_string(),
+            ]
+        );
+    }
 }
 
 #[tokio::test]

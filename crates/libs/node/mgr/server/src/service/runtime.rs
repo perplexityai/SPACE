@@ -511,8 +511,13 @@ impl NodeManagerService {
             let expected_spaced_host_peer = (req.program
                 == pplx_space_common_core::host::linux::paths::SPACED_HOST_SVC_BIN)
                 .then(|| {
-                    registered_firecracker_pid(Path::new(RUN_DIR), &req.sandbox_id)
-                        .map(|pid| ExpectedSpacedHostPeer::new(pid, sandbox_uid))
+                    registered_firecracker_pid(Path::new(RUN_DIR), &req.sandbox_id).map(|pid| {
+                        ExpectedSpacedHostPeer::new(
+                            pid,
+                            sandbox_uid,
+                            pplx_space_common_core::types::guest_image::QualifiedGuestAgent::Absent,
+                        )
+                    })
                 })
                 .transpose()
                 .inspect_err(|error| {
@@ -535,7 +540,18 @@ impl NodeManagerService {
                         pplx_space_common_core::types::RuntimeKind::Firecracker,
                         |e| e.runtime().kind,
                     );
-                Some(peer.for_runtime(runtime))
+                let guest_agent = self
+                    .recorded_guest_profile(req.sandbox_id.clone())
+                    .await
+                    .inspect_err(|error| {
+                        emit_launch_failed(typed_sandbox_id, &req.program, error.message())
+                    })?
+                    .map_or(
+                        // Missing records belong to pre-contract Linux sandboxes.
+                        pplx_space_common_core::types::guest_image::QualifiedGuestAgent::LinuxV1,
+                        |profile| profile.agent_protocol(),
+                    );
+                Some(peer.for_runtime(runtime).for_guest_agent(guest_agent))
             }
             None => None,
         };

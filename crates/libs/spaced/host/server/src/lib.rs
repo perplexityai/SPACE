@@ -95,6 +95,7 @@ mod process;
 mod protocol;
 mod run;
 
+pub use pplx_space_common_core::types::guest_image::QualifiedGuestAgent;
 pub use run::{RunSpacedHostError, SERVICE_NAME, SpacedHostBootType, SpacedHostRunConfig, run};
 
 const SPACE_SBXMGR_ACCOUNT: &str = user_names::SPACE_SBXMGR;
@@ -150,6 +151,7 @@ pub enum ConnectBridgeGuestError {
 
 #[derive(Clone, Debug)]
 pub struct SpacedHostServiceConfig {
+    pub guest_agent: pplx_space_common_core::types::guest_image::QualifiedGuestAgent,
     pub socket_path: PathBuf,
     pub bridge_host_socket_path: PathBuf,
     pub bridge_guest_connector: BridgeGuestConnector,
@@ -164,6 +166,8 @@ impl Default for SpacedHostServiceConfig {
                 pplx_space_common_core::host::linux::paths::SPACED_HOST_SOCKET_FILE,
             ),
             bridge_host_socket_path: pplx_space_spaced_common::default_bridge_host_uds_path(),
+            // Legacy Linux service configuration; new runtime policy comes from node-manager.
+            guest_agent: pplx_space_common_core::types::guest_image::QualifiedGuestAgent::LinuxV1,
             bridge_guest_connector: BridgeGuestConnector::default(),
             host_control_socket_path: PathBuf::from(
                 pplx_space_common_core::host::linux::paths::SANDBOX_HOST_CONTROL_SOCKET,
@@ -226,6 +230,7 @@ impl GuestReadinessCoordinator {
 }
 
 struct SpacedHostServiceInner {
+    guest_agent: pplx_space_common_core::types::guest_image::QualifiedGuestAgent,
     shutdown: CancellationToken,
     socket_path: PathBuf,
     bridge_host_socket_path: PathBuf,

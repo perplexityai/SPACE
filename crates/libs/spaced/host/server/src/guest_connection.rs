@@ -1,5 +1,6 @@
 //! Capabilities belong to the transport used for dispatch, not a readiness cache.
 use super::*;
+use pplx_space_common_core::types::guest_image::QualifiedGuestAgent;
 use pplx_space_common_grpc::{GuestCapability, guest_capability_unsupported_status};
 use pplx_space_spaced_common::proto::platform::GuestOs;
 
@@ -14,14 +15,20 @@ pub(super) enum Requirement {
 #[derive(Clone)]
 pub(super) struct OperationClient<C> {
     pub(super) client: C,
+    policy: QualifiedGuestAgent,
     meta: BridgeGuestClient<tonic::transport::Channel>,
     platform: Arc<tokio::sync::OnceCell<GuestPlatformObservation>>,
 }
 
 impl<C> OperationClient<C> {
-    pub(super) fn new(client: C, channel: tonic::transport::Channel) -> Self {
+    pub(super) fn new(
+        client: C,
+        channel: tonic::transport::Channel,
+        policy: QualifiedGuestAgent,
+    ) -> Self {
         Self {
             client,
+            policy,
             meta: BridgeGuestClient::new(channel),
             platform: Arc::new(tokio::sync::OnceCell::new()),
         }
@@ -39,6 +46,15 @@ impl<C> OperationClient<C> {
                 Some(rpc),
             ),
         };
+        match self.policy {
+            QualifiedGuestAgent::LinuxV1 => {}
+            QualifiedGuestAgent::Absent | QualifiedGuestAgent::WindowsV1 => {
+                return Err(guest_capability_unsupported_status(
+                    GuestCapability::PlatformOperations,
+                    "image has no qualified guest operations",
+                ));
+            }
+        }
         let platform = self
             .platform
             .get_or_try_init(|| async {
@@ -53,7 +69,7 @@ impl<C> OperationClient<C> {
                 let response = negotiation_response(self.meta.clone().wait_ready(request))
                     .await?
                     .into_inner();
-                GuestPlatformObservation::parse(&response)
+                GuestPlatformObservation::parse(&response, self.policy)
             })
             .await?;
         for &operation in required {
@@ -99,20 +115,33 @@ async fn negotiation_response(
 }
 
 impl GuestPlatformObservation {
-    pub(super) fn parse(response: &BridgeGuestWaitReadyResponse) -> Result<Self, Status> {
+    pub(super) fn parse(
+        response: &BridgeGuestWaitReadyResponse,
+        policy: QualifiedGuestAgent,
+    ) -> Result<Self, Status> {
         pplx_space_spaced_common::validate_spaced_guest_compatibility(
             Some(&response.version),
             Some(&response.compatibility_family),
         )
         .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        let expected = match policy {
+            QualifiedGuestAgent::LinuxV1 => GuestOs::Linux,
+            QualifiedGuestAgent::WindowsV1 => GuestOs::Windows,
+            QualifiedGuestAgent::Absent => {
+                return Err(Status::failed_precondition(
+                    "image has no qualified guest agent",
+                ));
+            }
+        };
         let mut interactive_upgrade_version = None;
-        let wire = match &response.platform {
+        let mut wire = match &response.platform {
             Some(wire) => wire.clone(),
             // SPACED_COMPAT_REMOVE_WHEN_MIN_GUEST_0_8_1: Linux through 0.8.0 may omit the descriptor.
-            None if !pplx_space_spaced_common::spaced_guest_requires_platform_descriptor(
-                &response.version,
-            )
-            .map_err(|error| Status::failed_precondition(error.to_string()))? =>
+            None if expected == GuestOs::Linux
+                && !pplx_space_spaced_common::spaced_guest_requires_platform_descriptor(
+                    &response.version,
+                )
+                .map_err(|error| Status::failed_precondition(error.to_string()))? =>
             {
                 let mut wire = historical_linux_capabilities();
                 // SPACED_COMPAT_REMOVE_WHEN_MIN_GUEST_0_1_2: preserve the operation-specific upgrade advice.
@@ -134,11 +163,13 @@ impl GuestPlatformObservation {
                 ));
             }
         };
+        // Peer claims cannot widen the trusted image's qualification.
+        match policy {
+            QualifiedGuestAgent::LinuxV1 => {}
+            QualifiedGuestAgent::WindowsV1 | QualifiedGuestAgent::Absent => wire.operations.clear(),
+        }
         Ok(Self {
-            platform: pplx_space_spaced_common::platform::GuestPlatform::parse(
-                wire,
-                GuestOs::Linux,
-            )?,
+            platform: pplx_space_spaced_common::platform::GuestPlatform::parse(wire, expected)?,
             interactive_upgrade_version,
         })
     }
