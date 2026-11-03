@@ -316,13 +316,14 @@ pub fn snapshot_has_durable_copy(snapshot_alias: &str) -> String {
 /// as `sandbox_alias` is still attached to the node named by `node_id`.
 ///
 /// Attachment is `active_node_id` **or** `target_node_id`, which is what the
-/// node drain already means by "attached to this node"
-/// (`node_drain/store.rs:1197`'s `(active_node_id = $1 OR target_node_id = $1)`
-/// is the executable one; `node_drain/mod.rs:876` restates it in prose).
-/// That spells it with `=`; this
-/// uses `IS NOT DISTINCT FROM`, which agrees for every non-NULL `node_id`
-/// and additionally gives a total answer rather than NULL, so a caller may
-/// safely negate it.
+/// node drain already means by "attached to this node" (the
+/// `(active_node_id = $1 OR target_node_id = $1)` of
+/// `pplx_space_sandbox_store::drain::abandon_stale_resident_sandboxes_query`
+/// is the executable one; the cluster controller's
+/// `NodeDrainSink::abandon_stale_resident_sandboxes` docs restate it in
+/// prose). That spells it with `=`; this uses `IS NOT DISTINCT FROM`, which
+/// agrees for every non-NULL `node_id` and additionally gives a total answer
+/// rather than NULL, so a caller may safely negate it.
 ///
 /// **Only safe as a filter on an already-joined row.** `orphaned_nodes`
 /// deliberately does *not* use this shape: its comment
@@ -2107,7 +2108,7 @@ pub fn stopped_artifact_durable(sandbox_alias: &str) -> String {
 /// `snapshots.timestamp` is *registration* time, the pin is reused rather than
 /// re-minted, and an already-`ready` backup produces no new row at all, so no
 /// timestamp the cluster holds is a proxy for when the snapshot was taken.
-/// `node_drain::store`'s `claim_stopped_evacuation` instead establishes
+/// `pplx_space_sandbox_store::drain::claim_stopped_evacuation` instead establishes
 /// **provenance**: it will only open an evacuation on a row with no pin, so the
 /// artifact it goes on to publish is one it caused to be minted from the
 /// current rootfs.

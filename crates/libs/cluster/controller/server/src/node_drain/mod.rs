@@ -1247,7 +1247,7 @@ pub trait NodeDrainSink: Send + Sync + 'static {
     /// KubeNodeGone variant of
     /// [`Self::make_sandbox_durable_from_remote_snapshot`]: the same
     /// adopt-the-remote-snapshot CAS, plus two guards the gone-node trigger
-    /// requires (see `adopt_remote_snapshot_on_gone_node_query` in `store`):
+    /// requires (see [`pplx_space_sandbox_store::drain::adopt_remote_snapshot_on_gone_node_query`]):
     ///
     /// - the node-identity guards shared with
     ///   [`Self::mark_sandbox_lost_on_gone_node`] (`expected_uid` +
@@ -1535,9 +1535,10 @@ pub trait NodeDrainSink: Send + Sync + 'static {
     /// with retiring the active execution and clearing placement. That same gate
     /// rules out a live in-flight suspend (which holds `active_node_id` set until
     /// just before its own `suspended` commit), so no in-memory coordination is
-    /// needed. See [`store::redrive_stranded_suspending_query`] for the full
-    /// rationale, including the narrow crash-before-finish case it deliberately
-    /// leaves to wedge (visibly) rather than restore unsafely.
+    /// needed. See
+    /// [`pplx_space_sandbox_store::drain::redrive_stranded_suspending_query`]
+    /// for the full rationale, including the narrow crash-before-finish case it
+    /// deliberately leaves to wedge (visibly) rather than restore unsafely.
     fn redrive_stranded_suspending_evacuations(
         &self,
     ) -> impl std::future::Future<Output = Result<Vec<SandboxId>, sqlx::Error>> + Send;
@@ -1641,8 +1642,8 @@ pub trait NodeDrainSink: Send + Sync + 'static {
     /// `restoring` row (re-driven from S3 by the cluster-wide restore
     /// sweep) and a marked `suspending` row whose current cycle still has
     /// recoverable snapshot evidence. See
-    /// [`store::fail_resident_sandboxes_on_gone_node_query`]. Returns the
-    /// number of rows flipped.
+    /// [`pplx_space_sandbox_store::drain::fail_resident_sandboxes_on_gone_node_query`].
+    /// Returns the number of rows flipped.
     fn fail_resident_sandboxes_on_gone_node(
         &self,
         node_id: NodeId,

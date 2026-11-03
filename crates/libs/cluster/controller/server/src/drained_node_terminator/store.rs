@@ -9,9 +9,9 @@ use pplx_space_common_core::types::SandboxId;
 use pplx_space_common_svc::sql::sandbox_residency::{self, ResidencyEvidence};
 use pplx_space_events::{SandboxEventDetails, SandboxEventTrigger};
 use pplx_space_sandbox_portability::{
-    drain_gate_blockers_for_node, inflight_suspend_upload_from_other_node_exists,
-    snapshot_durable_for_source_release,
+    drain_gate_blockers_for_node, snapshot_durable_for_source_release,
 };
+use pplx_space_sandbox_store::lost;
 use sqlx::PgPool;
 
 use crate::gone_node_write_off::{
@@ -230,7 +230,7 @@ pub(crate) const DEAD_UPLOAD_SETTLE: Duration = Duration::from_mins(10);
 /// lock-discipline test must not have.
 ///
 /// It claims only rows without a durable copy because those are the only rows
-/// [`mark_unrecoverable_sandboxes_lost_query`] can flip: the flip re-checks
+/// [`lost::mark_unrecoverable_sandboxes_lost_query`] can flip: the flip re-checks
 /// `AND NOT {durable}` on the claimed ids. Every pinned `suspended` row with
 /// a durable copy is one the flip can't touch, so locking it buys nothing;
 /// this filter drops those rows from the lock set.
@@ -269,102 +269,6 @@ pub(crate) fn gone_node_giveup_claim_query() -> String {
             AND NOT (SELECT {durable})
           ORDER BY s.id
           FOR UPDATE"
-    )
-}
-
-/// `$1` = node id, `$2` = the kube uid observed at the EC2 cross-check,
-/// `$3` = the candidate ids the caller has already `FOR UPDATE`-claimed in
-/// the same transaction (only those may flip — see the inline comment),
-/// `$4` = the [`DEAD_UPLOAD_SETTLE`] quiet seconds for same-node `creating`
-/// rows, `$5` = [`SubstrateKind::Kubernetes`]. Mark-lost give-up for the
-/// KubeNodeGone recovery: flips every `suspended` sandbox pinned to the node
-/// via `target_node_id` that has no recoverable copy anywhere to
-/// `lifecycle = 'failed'`, returning the flipped ids.
-///
-/// The caller has already confirmed the node's backing EC2 instance is
-/// **terminated**. That premise drives the two deliberate differences from
-/// `node_drain`'s per-sandbox `mark_sandbox_lost_query`:
-///
-/// * No on-node `ArtifactMissing` probe precedes the flip — none is possible
-///   (there is no node to ask) and none is needed: the local artifact died
-///   with the instance, so "no durable snapshot" alone proves
-///   unrecoverability.
-/// * The in-flight-upload veto is scoped to uploads from **other** nodes
-///   ([`inflight_suspend_upload_from_other_node_exists`]) instead of the
-///   node-agnostic check: an upload still `creating` from the terminated
-///   node can never finalize (the upload worker and its staged copies died
-///   with the box), and letting that dead row veto the flip would re-create
-///   the permanent park this give-up exists to break. An upload from any
-///   still-live node may yet finalize `ready`, so it still vetoes.
-///
-/// The portability test is the same marker-aware
-/// [`snapshot_durable_for_source_release`] the snapshot guard and
-/// `mark_sandbox_lost_query` use, so "blocks the reap" and "eligible for
-/// give-up" can't drift: a durably-portable suspended sandbox neither blocks
-/// nor is flipped; a local-only one both blocks and (here) is flipped.
-/// Mid-flight rows (`suspending` / `restoring`) are deliberately out of
-/// scope — they keep blocking and stay parked for their own sweepers.
-///
-/// The `EXISTS` guards re-check the node's `drained` + Kubernetes-managed
-/// phase and the `node_k8s.k8s_node_uid` identity (`IS NOT DISTINCT FROM
-/// $2`) **inside the UPDATE**, mirroring [`delete_drained_node_if_orphan_query`]:
-/// a same-name kube replacement or an admin undrain that lands after the EC2
-/// cross-check makes this match nothing, so the terminal flip can never
-/// outlive the observation that justified it.
-///
-/// **These guards alone are snapshot reads, not serialization.** Unlike the
-/// hard-DELETE — which modifies the `nodes` row itself and therefore
-/// serializes on its row lock — this UPDATE only reads `nodes` / `node_k8s`,
-/// so an undrain or uid bump committing concurrently would be invisible to
-/// the statement snapshot. The caller
-/// ([`NodeDbStore::mark_unrecoverable_sandboxes_lost`]) closes that hole by
-/// `FOR SHARE`-locking and re-checking both guard rows in the same
-/// transaction before running this statement; run it only under that
-/// protocol.
-pub(crate) fn mark_unrecoverable_sandboxes_lost_query() -> String {
-    let durable = snapshot_durable_for_source_release("sandboxes");
-    let inflight_from_other_node =
-        inflight_suspend_upload_from_other_node_exists("sandboxes", "$1");
-    format!(
-        "UPDATE sandboxes
-            SET lifecycle = 'failed'
-          WHERE lifecycle = 'suspended'
-            AND target_node_id = $1
-            -- Settle guard on same-node creating uploads ($4 = quiet
-            -- seconds, see DEAD_UPLOAD_SETTLE): EC2 'terminated' proves the
-            -- worker is dead but not that a READY finalize for already-
-            -- durable bytes isn't still in the API path. A row heartbeated
-            -- (or created) inside the window defers the flip; the sandbox
-            -- keeps blocking the reap and later ticks re-check.
-            AND NOT EXISTS (
-                SELECT 1 FROM snapshots sn
-                 WHERE sn.sandbox_id = sandboxes.id
-                   AND sn.source_node_id = $1
-                   AND sn.type = 'full'
-                   AND sn.state = 'creating'
-                   AND COALESCE(sn.last_attempt_at, sn.timestamp)
-                       >= NOW() - make_interval(secs => $4::BIGINT)
-            )
-            -- Only rows the caller FOR UPDATE-claimed may flip. Under READ
-            -- COMMITTED the claim only fences rows that matched at its own
-            -- snapshot; without this restriction a row entering the
-            -- candidate set between the claim and this statement would flip
-            -- un-fenced, re-opening the FK-lock race with a concurrent
-            -- BeginArtifactBackup insert. Late arrivals wait for the next
-            -- tick's claim instead.
-            AND id = ANY($3)
-            AND NOT {durable}
-            AND NOT {inflight_from_other_node}
-            AND EXISTS (
-                SELECT 1 FROM nodes
-                WHERE id = $1 AND drain_phase = 'drained' AND managed_by = $5
-            )
-            AND EXISTS (
-                SELECT 1 FROM node_k8s
-                WHERE node_id = $1
-                  AND k8s_node_uid IS NOT DISTINCT FROM $2
-            )
-          RETURNING id"
     )
 }
 
@@ -638,15 +542,14 @@ impl DrainedNodeTerminatorSink for NodeDbStore {
         // rows that matched at its own snapshot, so a row entering the
         // candidate set after it must wait for the next tick's claim rather
         // than flip un-fenced.
-        let query = mark_unrecoverable_sandboxes_lost_query();
-        let ids: Vec<SandboxId> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(query.as_str())))
-            .bind(node_id)
-            .bind(expected_uid)
-            .bind(&claimed)
-            .bind(DEAD_UPLOAD_SETTLE.as_secs().cast_signed())
-            .bind(SubstrateKind::Kubernetes)
-            .fetch_all(&mut *tx)
-            .await?;
+        let ids = lost::mark_unrecoverable_sandboxes_lost(
+            &mut tx,
+            node_id,
+            expected_uid.as_deref(),
+            &claimed,
+            DEAD_UPLOAD_SETTLE,
+        )
+        .await?;
         if !ids.is_empty() {
             write_off_lost_sandboxes(&mut tx, node_id, &ids, DEAD_UPLOAD_SETTLE).await?;
         }

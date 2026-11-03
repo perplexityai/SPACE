@@ -9,8 +9,8 @@ use super::{
     DEAD_UPLOAD_SETTLE, DrainedNodeTerminatorSink, NodeDbStore, OrphanDeleteOutcome,
     OrphanDeleteRefusal, PHASE_DRAINED, PHASE_TERMINATING, ResidencyEvidence,
     delete_drained_node_if_orphan_query, local_snapshots_count_query, mark_terminating_query,
-    mark_unrecoverable_sandboxes_lost_query,
 };
+use pplx_space_sandbox_store::lost::mark_unrecoverable_sandboxes_lost_query;
 
 use pplx_space_test_env::TestResult;
 
