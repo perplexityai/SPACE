@@ -5,7 +5,7 @@ import { adminApi } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 import { publicSandboxIdFromAny, sandboxLabelOrId } from '@/lib/sandbox-id';
 import { isManagingOrgAdmin } from '@/lib/userRoles';
-import { idempotencyKey, waitForPublicOperation } from '@/lib/public-api';
+import { getSpacedVersionCounts, idempotencyKey, waitForPublicOperation } from '@/lib/public-api';
 import {
   NetworkPolicyV1,
   Template,
@@ -23,7 +23,7 @@ import {
 } from '@/lib/types';
 import { tablePagination } from '@/lib/table-pagination';
 import { LATEST_TAG as DEFAULT_TEMPLATE_TAG, errorMessage, shortHash } from '@/lib/template-format';
-import { SPACED_SAMPLE_LIMIT, SpacedCounts, spacedCounts as countSpaced, spacedCoverage } from '@/lib/spaced-counts';
+import { SPACED_SAMPLE_LIMIT, SpacedCounts, loadSpacedCounts, spacedCoverage } from '@/lib/spaced-counts';
 import SystemTemplateRebuild from './system-template-rebuild';
 import {
   markViewRefreshed,
@@ -552,15 +552,17 @@ export default function TemplatesPage() {
     }
   };
 
-  // The spaced versions of running sandboxes, per template, from the admin
-  // list's newest rows. Read on load and on Refresh only, not on the periodic
-  // refresh: the list is large. A failed read keeps the last counts, with the
-  // error shown.
+  // The spaced versions of running sandboxes, per template, counted by the
+  // server, or from the admin list's newest rows on a server without the
+  // count. Read on load and on Refresh only, not on the periodic refresh: the
+  // sample is large. A failed read keeps the last counts, with the error shown.
   const refreshSpacedCounts = async () => {
     if (!canAdminTemplates) return;
     try {
-      const rows = await adminApi.get<Sandbox[]>(`/v1/sandboxes?limit=${SPACED_SAMPLE_LIMIT}`);
-      setSpacedCounts(countSpaced(rows));
+      setSpacedCounts(await loadSpacedCounts(
+        getSpacedVersionCounts,
+        () => adminApi.get<Sandbox[]>(`/v1/sandboxes?limit=${SPACED_SAMPLE_LIMIT}`),
+      ));
       setSpacedCountsError(null);
     } catch (err: unknown) {
       setSpacedCountsError(errorMessage(err));
@@ -2055,7 +2057,7 @@ export default function TemplatesPage() {
               type="warning"
               showIcon
               style={{ marginBottom: 8, maxWidth: 720 }}
-              title={`Could not refresh the sandbox list: ${spacedCountsError}${spacedCounts ? '. The counts below are from the previous read.' : ''}`}
+              title={`Could not refresh the sandbox counts: ${spacedCountsError}${spacedCounts ? '. The counts below are from the previous read.' : ''}`}
             />
           ) : null}
           <Table
@@ -2065,7 +2067,7 @@ export default function TemplatesPage() {
             size="small"
             pagination={false}
             loading={!spacedCounts && !spacedCountsError}
-            locale={{ emptyText: spacedCounts ? 'No running sandboxes among the listed ones' : 'Not loaded' }}
+            locale={{ emptyText: spacedCounts ? (spacedCounts.source === 'server' ? 'No running sandboxes' : 'No running sandboxes among the listed ones') : 'Not loaded' }}
             style={{ maxWidth: 720 }}
           />
         </>

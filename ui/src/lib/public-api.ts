@@ -51,6 +51,12 @@ export async function getConsoleSandboxList(query: string): Promise<SandboxListR
   return { ...response, sandboxes: response.sandboxes.map(adminSandboxToConsoleSandbox) };
 }
 
+// `GET /sandboxes/spaced-versions`; see `loadSpacedCounts` for what a server
+// without it answers.
+export function getSpacedVersionCounts(): Promise<unknown> {
+  return adminApi.get<unknown>('/v1/sandboxes/spaced-versions');
+}
+
 // `id` may be any form `parseSandboxRef` accepts; the admin route takes only
 // the `sbx_` form.
 export async function getConsoleSandbox(id: string): Promise<Sandbox> {

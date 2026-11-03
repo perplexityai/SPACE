@@ -3,18 +3,19 @@
 import { useEffect, useState } from 'react';
 import { adminApi } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
-import { getConsoleSandboxes } from '@/lib/public-api';
-import { DEFAULT_LIST_LIMIT, sandboxRowCount } from '@/lib/sandbox-id';
+import { getConsoleSandboxes, getSpacedVersionCounts } from '@/lib/public-api';
+import { DEFAULT_LIST_LIMIT } from '@/lib/sandbox-id';
+import { loadSpacedCounts, type SpacedCounts } from '@/lib/spaced-counts';
 import { Organization } from '@/lib/types';
 import { Alert, Card, Col, Row, Statistic, Typography } from 'antd';
 import { TeamOutlined, CloudServerOutlined } from '@ant-design/icons';
 
-const { Title } = Typography;
+const { Title, Text } = Typography;
 
 export default function DashboardPage() {
   const { user } = useAuth();
   const [orgCount, setOrgCount] = useState<number | null>(null);
-  const [sandboxCount, setSandboxCount] = useState<number | null>(null);
+  const [sandboxCounts, setSandboxCounts] = useState<SpacedCounts | null>(null);
   const [errors, setErrors] = useState<string[]>([]);
 
   useEffect(() => {
@@ -24,8 +25,10 @@ export default function DashboardPage() {
       if (active) setErrors((current) => [...current, `${what}: ${err instanceof Error ? err.message : 'request failed'}`]);
     };
     adminApi.get<Organization[]>('/v1/orgs').then((orgs) => { if (active) setOrgCount(orgs.length); }).catch(failed('Organizations'));
-    getConsoleSandboxes()
-      .then((sbx) => { if (active) setSandboxCount(sandboxRowCount(sbx)); })
+    // The server's count of every sandbox; a server without the count route
+    // gets today's tally of the newest list rows.
+    loadSpacedCounts(getSpacedVersionCounts, () => getConsoleSandboxes(DEFAULT_LIST_LIMIT), DEFAULT_LIST_LIMIT)
+      .then((counts) => { if (active) setSandboxCounts(counts); })
       .catch(failed('Sandboxes'));
     return () => {
       active = false;
@@ -49,9 +52,16 @@ export default function DashboardPage() {
           <Card>
             <Statistic
               title="Sandboxes"
-              value={sandboxCount === null ? '—' : sandboxCount >= DEFAULT_LIST_LIMIT ? `${DEFAULT_LIST_LIMIT}+` : sandboxCount}
+              value={sandboxCounts === null ? '—' : `${sandboxCounts.listed}${sandboxCounts.truncated ? '+' : ''}`}
               prefix={<CloudServerOutlined />}
             />
+            {sandboxCounts ? (
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                {sandboxCounts.source === 'server'
+                  ? 'Not deleted, in every organization'
+                  : `Not deleted, among the newest ${DEFAULT_LIST_LIMIT.toLocaleString('en-US')} listed`}
+              </Text>
+            ) : null}
           </Card>
         </Col>
       </Row>
