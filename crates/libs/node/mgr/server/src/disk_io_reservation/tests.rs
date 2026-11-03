@@ -46,6 +46,7 @@ fn enabled_config() -> DiskIoReservationConfig {
 #[tokio::test]
 async fn enabled_reservation_derives_capacity_profile_from_instance_type() {
     for (instance_type, expected_profile) in [
+        ("i4i.metal", "aws-i4i-metal"),
         ("m5d.metal", "aws-m5d-metal"),
         ("r6id.metal", "aws-r6id-metal"),
     ] {
@@ -236,6 +237,47 @@ fn aggregate_budget_is_divided_without_exceeding_requested_limit() {
             write_iops: 375_664,
             read_bandwidth_mib_per_sec: 2_932,
             write_bandwidth_mib_per_sec: 1_464,
+        }
+    );
+}
+
+#[test]
+fn i4i_metal_profile_divides_budget_across_eight_devices() {
+    let config = DiskIoReservationConfig {
+        capacity_profile: Some("aws-i4i-metal".into()),
+        ..enabled_config()
+    };
+    let i4i_devices: Vec<BlockDevice> = (0..8)
+        .map(|minor| BlockDevice { major: 259, minor })
+        .collect();
+    let mut writer = RecordingWriter::default();
+
+    let reservation = apply_to_devices(&config, i4i_devices.clone(), &mut writer).unwrap();
+
+    assert_eq!(
+        writer.writes,
+        i4i_devices
+            .into_iter()
+            .map(|device| (
+                device,
+                "rbps=572522496 wbps=314572800 riops=140000 wiops=77000".to_string()
+            ))
+            .collect::<Vec<_>>()
+    );
+    let ParentDiskIoReservation::Enabled {
+        effective_aggregate_limits,
+        ..
+    } = reservation
+    else {
+        panic!("expected enabled reservation");
+    };
+    assert_eq!(
+        effective_aggregate_limits,
+        DiskIoLimits {
+            read_iops: 1_120_000,
+            write_iops: 616_000,
+            read_bandwidth_mib_per_sec: 4_368,
+            write_bandwidth_mib_per_sec: 2_400,
         }
     );
 }

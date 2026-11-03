@@ -59,6 +59,7 @@ impl DiskIoCapacityProfile {
         // instance-store shapes. Bandwidth is the corresponding conservative
         // 4 KiB throughput, rounded down to whole MiB/s.
         // https://docs.aws.amazon.com/ec2/latest/instancetypes/mo.html
+        // https://docs.aws.amazon.com/ec2/latest/instancetypes/so.html
         match name {
             "aws-r6id-metal" => Ok(Self {
                 name: "aws-r6id-metal",
@@ -68,6 +69,16 @@ impl DiskIoCapacityProfile {
                     write_iops: 1_073_336,
                     read_bandwidth_mib_per_sec: 8_385,
                     write_bandwidth_mib_per_sec: 4_192,
+                },
+            }),
+            "aws-i4i-metal" => Ok(Self {
+                name: "aws-i4i-metal",
+                expected_device_count: 8,
+                capacity: DiskIoLimits {
+                    read_iops: 3_200_000,
+                    write_iops: 1_760_000,
+                    read_bandwidth_mib_per_sec: 12_500,
+                    write_bandwidth_mib_per_sec: 6_875,
                 },
             }),
             "aws-m5d-metal" => Ok(Self {
@@ -88,6 +99,7 @@ impl DiskIoCapacityProfile {
 
     fn for_aws_instance_type(instance_type: &str) -> Result<Self, String> {
         match instance_type {
+            "i4i.metal" => Self::named("aws-i4i-metal"),
             "m5d.metal" => Self::named("aws-m5d-metal"),
             "r6id.metal" => Self::named("aws-r6id-metal"),
             _ => Err(format!(
