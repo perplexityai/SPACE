@@ -71,3 +71,4 @@ aws-lc-rs = { workspace = true }
 insta = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 hyper = { workspace = true, features = ["client", "http1", "http2"] }
+tonic-prost = { workspace = true }

@@ -1672,7 +1672,7 @@ fn raw_file_read_error(status: tonic::Status) -> EcwProxyError {
     error
 }
 
-fn raw_file_write_error(status: tonic::Status) -> EcwProxyError {
+pub(super) fn raw_file_write_error(status: tonic::Status) -> EcwProxyError {
     raw_file_read_error(status)
 }
 

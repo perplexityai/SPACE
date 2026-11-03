@@ -878,8 +878,11 @@ async fn native_route_sweep_bounds_both_cache_indexes() {
 
 /// A gRPC health listener lets the production `cluster::connect` path complete
 /// its handshake. Route RPCs return Unimplemented to exercise resolution
-/// failures; cached-route tests need only the handshake.
-async fn spawn_cluster_api_stub() -> std::net::SocketAddr {
+/// failures; cached-route tests need only the handshake. With `runtime_access`,
+/// `GetSandboxRuntimeAccess` answers with it.
+async fn spawn_cluster_api_stub(
+    runtime_access: Option<SandboxRuntimeAccess>,
+) -> std::net::SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind cluster-api stub");
@@ -888,10 +891,55 @@ async fn spawn_cluster_api_stub() -> std::net::SocketAddr {
     tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
             .add_service(health)
+            .add_optional_service(runtime_access.map(RuntimeAccessStub))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await;
     });
     addr
+}
+
+#[derive(Clone)]
+struct RuntimeAccessStub(SandboxRuntimeAccess);
+
+impl tonic::server::NamedService for RuntimeAccessStub {
+    const NAME: &'static str = "space.node.api.v1.ClusterApi";
+}
+
+impl tonic::server::UnaryService<GetSandboxRuntimeAccessRequest> for RuntimeAccessStub {
+    type Response = pplx_space_node_api_client::proto::GetSandboxRuntimeAccessResponse;
+    type Future = std::future::Ready<Result<tonic::Response<Self::Response>, tonic::Status>>;
+
+    fn call(&mut self, _request: tonic::Request<GetSandboxRuntimeAccessRequest>) -> Self::Future {
+        std::future::ready(Ok(tonic::Response::new(Self::Response {
+            access: Some(self.0),
+        })))
+    }
+}
+
+impl<B> tower::Service<axum::http::Request<B>> for RuntimeAccessStub
+where
+    B: http_body::Body + Send + 'static,
+    B::Error: Into<tonic::codegen::StdError> + Send + 'static,
+{
+    type Response = axum::http::Response<tonic::body::Body>;
+    type Error = std::convert::Infallible;
+    type Future = futures_util::future::BoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: axum::http::Request<B>) -> Self::Future {
+        assert!(request.uri().path().ends_with("/GetSandboxRuntimeAccess"));
+        let service = self.clone();
+        Box::pin(async move {
+            let mut grpc = tonic::server::Grpc::new(tonic_prost::ProstCodec::default());
+            Ok(grpc.unary(service, request).await)
+        })
+    }
 }
 
 #[tokio::test]
@@ -925,7 +973,13 @@ async fn accepted_connections_detect_dead_peers() {
 }
 
 pub(crate) async fn test_data_plane_state() -> DataPlaneState {
-    let addr = spawn_cluster_api_stub().await;
+    test_data_plane_state_with_runtime_access(None).await
+}
+
+async fn test_data_plane_state_with_runtime_access(
+    runtime_access: Option<SandboxRuntimeAccess>,
+) -> DataPlaneState {
+    let addr = spawn_cluster_api_stub(runtime_access).await;
     let cluster_api =
         pplx_space_node_api_client::cluster::connect(format!("http://{addr}"), "test")
             .await
@@ -3117,6 +3171,180 @@ fn ecw_runtime_access_ready_preserves_original_proxy_error() {
 
     assert_eq!(error.status, StatusCode::BAD_GATEWAY);
     assert_eq!(error.message, "Sandbox service is not reachable");
+}
+
+/// An unanswered backend call is answered as "runtime did not respond", with no
+/// retry instruction, only when the control plane reports the sandbox `Ready`;
+/// every other decision, and every other backend failure, keeps the shape it
+/// had.
+#[tokio::test]
+async fn ecw_unanswered_backend_call_says_so_only_while_the_sandbox_is_ready() {
+    if !pplx_space_test_env::enter_test_process(&[(
+        "SPACE_INTERNAL_RPC_INSECURE_DEV",
+        Some(std::ffi::OsStr::new("true")),
+    )]) {
+        return;
+    }
+
+    #[derive(Clone, Copy)]
+    enum Backend {
+        Status(fn() -> tonic::Status),
+        MissesDataPlaneDeadline,
+    }
+    const NO_RESPONSE: &str = "Sandbox runtime did not respond";
+    const NOT_RUNNING: &str = "Sandbox is not running";
+    let deadline_exceeded = || tonic::Status::deadline_exceeded("guest call timed out");
+    let process: fn(tonic::Status) -> EcwProxyError = ecw_connect::tonic_status_to_ecw_error;
+    let file: fn(tonic::Status) -> EcwProxyError = ecw_files::raw_file_write_error;
+    let ready = SandboxRuntimeAccessDecision::Ready;
+    for (index, (decision, backend, map_status, status, message, retry_after)) in [
+        (
+            ready,
+            Backend::Status(deadline_exceeded),
+            process,
+            502,
+            NO_RESPONSE,
+            Some("5"),
+        ),
+        (
+            ready,
+            Backend::Status(deadline_exceeded),
+            file,
+            502,
+            NO_RESPONSE,
+            Some("5"),
+        ),
+        (
+            ready,
+            Backend::Status(|| tonic::Status::cancelled("request cancelled")),
+            process,
+            502,
+            NO_RESPONSE,
+            Some("5"),
+        ),
+        (
+            ready,
+            Backend::MissesDataPlaneDeadline,
+            process,
+            502,
+            NO_RESPONSE,
+            Some("5"),
+        ),
+        (
+            ready,
+            Backend::MissesDataPlaneDeadline,
+            file,
+            502,
+            NO_RESPONSE,
+            Some("5"),
+        ),
+        (
+            ready,
+            Backend::Status(|| tonic::Status::failed_precondition("sandbox is not running")),
+            process,
+            502,
+            NOT_RUNNING,
+            None,
+        ),
+        (
+            ready,
+            Backend::Status(|| {
+                pplx_space_common_grpc::refused_before_start(
+                    tonic::Status::resource_exhausted("sandbox is at capacity"),
+                    Duration::from_secs(3),
+                )
+            }),
+            process,
+            429,
+            "sandbox is at capacity",
+            Some("3"),
+        ),
+        (
+            SandboxRuntimeAccessDecision::TerminalUnavailable,
+            Backend::Status(deadline_exceeded),
+            process,
+            502,
+            NOT_RUNNING,
+            None,
+        ),
+        (
+            SandboxRuntimeAccessDecision::TerminalUnavailable,
+            Backend::MissesDataPlaneDeadline,
+            file,
+            502,
+            NOT_RUNNING,
+            None,
+        ),
+        (
+            SandboxRuntimeAccessDecision::RetryableConverging,
+            Backend::Status(deadline_exceeded),
+            process,
+            502,
+            "Sandbox is waking; retry",
+            Some("2"),
+        ),
+        (
+            SandboxRuntimeAccessDecision::Unknown,
+            Backend::Status(deadline_exceeded),
+            process,
+            502,
+            NOT_RUNNING,
+            None,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let case = format!("case {index}: {decision:?}");
+        let state = test_data_plane_state_with_runtime_access(Some(SandboxRuntimeAccess {
+            decision: decision as i32,
+            retry_after_ms: 2_000,
+        }))
+        .await;
+        let route = ecw_resolved_route(SandboxId::new(), 1, backend_endpoint("10.0.0.1:9800"));
+        // A status case gets a budget it can't miss; the deadline case a backend
+        // that never answers.
+        let budget = match backend {
+            Backend::Status(_) => Duration::from_secs(5),
+            Backend::MissesDataPlaneDeadline => Duration::from_millis(1),
+        };
+        let error = runtime_route::bounded_ecw_route_call_with_timeout_observer(
+            &state,
+            route,
+            "test_backend_call",
+            budget,
+            None,
+            |_route, _remaining| async move {
+                match backend {
+                    Backend::Status(status) => Err::<(), _>(status()),
+                    Backend::MissesDataPlaneDeadline => {
+                        std::future::pending::<()>().await;
+                        Ok(())
+                    }
+                }
+            },
+            map_status,
+        )
+        .await
+        .expect_err("the backend call fails");
+
+        let response = error.into_response();
+        assert_eq!(response.status().as_u16(), status, "{case}");
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .map(|value| value.to_str().unwrap()),
+            retry_after,
+            "{case}"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({ "code": status, "message": message }),
+            "{case}"
+        );
+    }
 }
 
 #[test]

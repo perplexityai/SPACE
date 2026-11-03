@@ -277,6 +277,42 @@ return an explicit E2B-shaped `501`; unsupported methods on implemented envd
 routes return `405`. Service-port traffic is intercepted before envd routing,
 so these paths remain available to applications on user sandbox ports.
 
+When a process or file call's backend request times out or is cancelled
+before the sandbox answers, the data plane asks the control plane for the
+sandbox's state before answering. A call whose route lookup runs out of time
+instead gets `502` `Sandbox service route is not ready` with `Retry-After`,
+without that check. If the control plane reports no blocker (the sandbox is
+running, created, creating, stopping, deleting or checkpointing), the answer is
+`502` `Sandbox runtime did not respond` with `Retry-After`. A sandbox that is
+starting, pausing, paused, suspending, suspended, resuming or restoring, or
+that became running less than 150 seconds ago, gets `502`
+`Sandbox is waking; retry` with `Retry-After`. A stopped, failed or quarantined
+sandbox, or one whose state the control plane cannot report (an error, an
+unknown state, or no answer within 2 seconds), gets `502`
+`Sandbox is not running`, so that message alone does not prove the sandbox
+stopped. A `Process.Start` stream that was already running and has to reconnect
+reports the failure as an error at the end of the stream, not as a `502` and
+without `Retry-After`. When the control plane reports the sandbox stopped,
+failed, quarantined or waking, that error is `unavailable` with the matching
+message above. Otherwise it is the status the backend call failed with, or
+`unavailable` with the matching message above when the data plane's own time
+limit ran out first. All three are `502` because the pinned E2B SDK raises the
+same `TimeoutException` for a `502` from a process or file call, while a `503`
+from the `/files` upload and download routes would become a generic
+`SandboxException`. The SDK ignores `Retry-After` and appends its own hint to
+the message, so match the start of the message. A call that timed out or was
+cancelled may still have taken effect. File reads, listings, stats, directory
+creation and whole-file uploads can be resent. A resent remove or move whose
+first attempt took effect fails, or acts on whatever is at that path by then,
+and a resent watcher-events poll can miss events that the unanswered poll had
+already taken. Resend a command start only with the same `Idempotency-Key`,
+described in
+[Retrying an ambiguous command start](#retrying-an-ambiguous-command-start), and
+within its limits; the pinned SDK's `commands.run` cannot set one per call.
+Stdin input and signals have no such protection, and resending them can
+deliver them twice. A sandbox at capacity still refuses before starting
+anything with `429` and `Retry-After`.
+
 `POST /files` accepts `multipart/form-data` and `application/octet-stream`
 uploads of up to 256 MiB per request, which the data plane streams to a spool
 file rather than holding in memory. For multipart, the 256 MiB includes part
