@@ -362,3 +362,26 @@ export function parseListLink(params: { get(name: string): string | null }): Lis
 
   return { template, statuses, user, node, age, older, pageSize, ignored };
 }
+
+// Whether a paged request sends any filter. The server lists the rows nodes
+// report with no database row (warm-pool slots, observed-local sandboxes),
+// which belong to no org and carry none of the filtered fields, once: on the
+// first page of the list with no filter (`is_unfiltered` on the admin list).
+export function sendsListFilter(filters: SandboxListFilters): boolean {
+  return listScope('paged', filters, { limit: 1, cursor: '' }).key
+    !== listScope('paged', NO_FILTERS, { limit: 1, cursor: '' }).key;
+}
+
+// Where the node-reported rows of a paged list are: on this page, after its
+// sandboxes; left out by a filter; or on the first page.
+export function nodeReportedPlacement(scope: ListScope): 'here' | 'filtered' | 'first-page' {
+  if (sendsListFilter(scope.filters)) return 'filtered';
+  return scope.cursor === '' ? 'here' : 'first-page';
+}
+
+export function splitNodeReported<T extends { resource_type?: string }>(rows: T[]): { sandboxes: T[]; nodeReported: T[] } {
+  return {
+    sandboxes: rows.filter((row) => row.resource_type === 'sandbox'),
+    nodeReported: rows.filter((row) => row.resource_type !== 'sandbox'),
+  };
+}

@@ -13,6 +13,7 @@ import {
   loadedRowFilter,
   nextCursorFor,
   nextPage,
+  nodeReportedPlacement,
   pageCursor,
   parseListLink,
   parsePageSize,
@@ -21,6 +22,7 @@ import {
   sameScope,
   sandboxListQuery,
   scopeChangePlan,
+  splitNodeReported,
 } from './sandbox-list.ts';
 
 const sandbox = { id: 'sbx_01a19089-216f-751e-9f56-1906865f5c23', resource_type: 'sandbox' };
@@ -320,4 +322,27 @@ test('a link\'s filters the list cannot apply are left out and listed', () => {
 test('template names follow the server\'s rules', () => {
   for (const name of ['seed', 'Python-3.12', 'a_b', 'x'.repeat(255)]) assert.equal(isTemplateName(name), true, name);
   for (const name of ['', '.', '..', 'a b', 'a/b', 'x'.repeat(256), 'é']) assert.equal(isTemplateName(name), false, name);
+});
+
+test('the node-reported rows are on the first page of the list with no filter', () => {
+  assert.equal(nodeReportedPlacement(listScope('paged', NO_FILTERS, { limit: 50, cursor: '' })), 'here');
+  assert.equal(nodeReportedPlacement(listScope('paged', NO_FILTERS, { limit: 50, cursor: 'c1' })), 'first-page');
+  // A blank prefix is not sent, so it is no filter.
+  assert.equal(nodeReportedPlacement(listScope('paged', { ...NO_FILTERS, prefix: '  ' }, { limit: 50, cursor: '' })), 'here');
+  for (const filter of [
+    { org: '0193a000-0000-7000-8000-000000000001' }, { lifecycles: ['started'] }, { template: 'seed' },
+    { userId: '0193a000-0000-7000-8000-000000000002' }, { createdWithin: '1h' }, { olderThan: '1h' }, { prefix: 'build' },
+  ]) {
+    assert.equal(nodeReportedPlacement(listScope('paged', { ...NO_FILTERS, ...filter }, { limit: 50, cursor: '' })), 'filtered', JSON.stringify(filter));
+  }
+});
+
+test('node-reported rows are split from the page\'s sandboxes, in order', () => {
+  const rows = [
+    { id: 'a', resource_type: 'sandbox' }, { id: 'p', resource_type: 'pool_slot' },
+    { id: 'b', resource_type: 'sandbox' }, { id: 'o', resource_type: 'observed_local' },
+  ];
+  const { sandboxes, nodeReported } = splitNodeReported(rows);
+  assert.deepEqual(sandboxes.map((row) => row.id), ['a', 'b']);
+  assert.deepEqual(nodeReported.map((row) => row.id), ['p', 'o']);
 });

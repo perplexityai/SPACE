@@ -50,12 +50,14 @@ import {
   loadedRowFilter,
   nextCursorFor,
   nextPage,
+  nodeReportedPlacement,
   pageCursor,
   parseListLink,
   parsePageSize,
   previousPage,
   sameScope,
   scopeChangePlan,
+  splitNodeReported,
   type Continuation,
   type AgeWindow,
   type CreatedAge,
@@ -430,8 +432,8 @@ function sandboxNodeDisplay(sandbox: Sandbox) {
     </Tag>
   );
 
-  // The node page lists every sandbox on the node, which the list's node
-  // filter cannot: the server has no node filter.
+  // The node page lists the sandboxes placed on the node, which the list's
+  // node filter cannot: the server has no node filter.
   return (
     <Tooltip title={sandboxNodeTooltip(sandboxNodeTooltipRows(node, 'active'))}>
       <Link href={`/dashboard/nodes/${node.id}`} onClick={(event) => event.stopPropagation()}>
@@ -1267,6 +1269,18 @@ function SandboxesPage() {
     }));
   }, [sandboxes, query, search, lookup, listMode, templateFilter, statusSplit, userFilter, nodeFilter, ageWindow, olderThan]);
 
+  // A page lists its sandboxes, and the first page of the unfiltered list
+  // then the rows nodes report without a database row, apart from them.
+  const shownRows = useMemo(
+    () => (paged ? splitNodeReported(filteredSandboxes) : { sandboxes: filteredSandboxes, nodeReported: [] }),
+    [paged, filteredSandboxes],
+  );
+  const loadedRows = useMemo(
+    () => (paged ? splitNodeReported(sandboxes) : { sandboxes, nodeReported: [] }),
+    [paged, sandboxes],
+  );
+  const nodeReportedAt = nodeReportedPlacement(selectedScope);
+
   const lookupNeeded =
     query.kind === 'ref' && !loading && !sandboxes.some((s) => matchesSandboxQuery(query, s));
   const lookupId = lookupNeeded && query.kind === 'ref' ? query.ref.publicId : null;
@@ -1670,7 +1684,7 @@ function SandboxesPage() {
               User: {userFilterLabel}
             </Tag>
           ) : null}
-          <Tooltip title={paged ? 'The server has no node filter yet, so this filters the page loaded below. A node\'s page, linked from the Node column, lists every sandbox on it.' : undefined}>
+          <Tooltip title={paged ? 'The server has no node filter yet, so this filters the page loaded below. A node\'s page, linked from the Node column, lists the sandboxes placed on it; the warm-pool slots and other rows it reports without a database row are listed on the first page of this list with no filter set.' : undefined}>
             <Select
               size="small"
               value={nodeFilter}
@@ -1732,7 +1746,7 @@ function SandboxesPage() {
           )}
           <Text type="secondary" style={{ fontSize: 12 }}>
             {paged
-              ? `${filteredSandboxes.length === sandboxes.length ? '' : `${filteredSandboxes.length} / `}${sandboxes.length} on page ${position.index + 1}`
+              ? `${shownRows.sandboxes.length === loadedRows.sandboxes.length ? '' : `${shownRows.sandboxes.length} / `}${loadedRows.sandboxes.length} on page ${position.index + 1}`
               : `${filteredSandboxes.length} / ${sandboxes.length}${listTruncated ? '+' : ''}`}
           </Text>
           {filtersActive ? (
@@ -1797,7 +1811,7 @@ function SandboxesPage() {
         // when it gains one, so a switch to sampling mounts a new table.
         key={listMode}
         columns={columns}
-        dataSource={filteredSandboxes}
+        dataSource={shownRows.sandboxes}
         rowKey="id"
         loading={loading || lookupPending}
         size="small"
@@ -1841,6 +1855,32 @@ function SandboxesPage() {
             aria-label="Sandboxes per page"
           />
         </div>
+      ) : null}
+
+      {paged && nodeReportedAt === 'here' && loadedRows.nodeReported.length > 0 ? (
+        <div style={{ marginTop: 24 }}>
+          <Title level={5} style={{ marginTop: 0 }}>
+            Reported by nodes, with no database row ({shownRows.nodeReported.length === loadedRows.nodeReported.length ? '' : `${shownRows.nodeReported.length} / `}{loadedRows.nodeReported.length})
+          </Title>
+          <Text type="secondary" style={{ display: 'block', fontSize: 12, marginBottom: 8 }}>
+            Warm-pool slots and observed-local sandboxes. They belong to no organization and are listed here, on the first page of the list with no filter set; any filter but the node filter leaves them out.
+          </Text>
+          <Table
+            columns={columns}
+            dataSource={shownRows.nodeReported}
+            rowKey="id"
+            loading={loading}
+            size="small"
+            pagination={tablePagination('node-reported rows')}
+            scroll={{ x: 1280 }}
+          />
+        </div>
+      ) : paged && nodeReportedAt !== 'here' ? (
+        <Text type="secondary" style={{ display: 'block', fontSize: 12, marginTop: 8 }}>
+          {nodeReportedAt === 'filtered'
+            ? 'Filters leave out the warm-pool slots and other rows nodes report without a database row; they are listed on the first page with no filter set.'
+            : 'The warm-pool slots and other rows nodes report without a database row are listed on the first page.'}
+        </Text>
       ) : null}
 
       <Modal
