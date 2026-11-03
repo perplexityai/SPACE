@@ -1,5 +1,7 @@
 # Paths whose change selects the admin console scenarios (local.console_*) in
-# Pull CI's Kind smoke, and so also runs that smoke. Same format and reader as
+# Pull CI's Kind smoke, and so also runs that smoke. Read only while
+# SPACE_KIND_CONSOLE_SMOKE is `on` in .github/workflows/pull-ci.yml (off by
+# default): off, nothing here selects anything. Same format and reader as
 # ci/kind-pull-paths.txt: ci/scripts/kind-pull-needed.sh, given this file in
 # SPACE_KIND_PULL_PATHS. A pull request that changes none of them withholds
 # the scenarios (SPACE_SMOKE_BROWSER_SCENARIOS=withhold), visibly.

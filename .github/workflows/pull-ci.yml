@@ -74,17 +74,29 @@ jobs:
           PULL_REQUEST_HEAD: ${{ github.event.pull_request.head.sha }}
           SPACE_KIND_PULL_DRAFT: ${{ github.event.pull_request.draft }}
           SPACE_KIND_PULL_OPT_IN: ${{ contains(github.event.pull_request.labels.*.name, 'kind-smoke') }}
+          # The admin console smoke: off until the Kind runners carry
+          # Playwright (`uv sync --group console`) and its Chromium. Off, the
+          # console paths are not read, select nothing, and run no Kind smoke;
+          # `on` selects the local.console_* scenarios when a path in
+          # ci/kind-console-paths.txt changes, and runs the Kind smoke for it.
+          SPACE_KIND_CONSOLE_SMOKE: 'off'
         run: |
           set -euo pipefail
           needed="$(bash ci/scripts/kind-pull-needed.sh "${PULL_REQUEST_HEAD}")"
-          # The admin console scenarios run only when a console path changes
-          # (ci/kind-console-paths.txt). Such a change needs the Kind smoke as
-          # any Kind path does, deferred on a draft alike.
-          console="$(SPACE_KIND_PULL_PATHS=ci/kind-console-paths.txt \
-            bash ci/scripts/kind-pull-needed.sh "${PULL_REQUEST_HEAD}")"
-          if [[ "${needed}" == false ]]; then
-            needed="${console}"
-          fi
+          console=false
+          case "${SPACE_KIND_CONSOLE_SMOKE}" in
+            on)
+              # A console change needs the Kind smoke as any Kind path does,
+              # deferred on a draft alike.
+              console="$(SPACE_KIND_PULL_PATHS=ci/kind-console-paths.txt \
+                bash ci/scripts/kind-pull-needed.sh "${PULL_REQUEST_HEAD}")"
+              if [[ "${needed}" == false ]]; then
+                needed="${console}"
+              fi
+              ;;
+            off) ;;
+            *) echo "SPACE_KIND_CONSOLE_SMOKE must be on or off, not '${SPACE_KIND_CONSOLE_SMOKE}'." >&2; exit 1 ;;
+          esac
           printf 'needed=%s\nconsole=%s\n' "${needed}" "${console}" >>"${GITHUB_OUTPUT}"
 
       # Named here, where the synthetic merge is checked out; space-pull-ci

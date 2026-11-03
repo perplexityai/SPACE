@@ -16,10 +16,11 @@ on:
       substrate:
         type: string
         default: kubernetes
-      # true, from pull-ci.yml, when the pull request changes a console path
+      # true, from pull-ci.yml, when its SPACE_KIND_CONSOLE_SMOKE switch is
+      # on and the pull request changes a console path
       # (ci/kind-console-paths.txt): the typed smoke then runs the admin
-      # console scenarios, which skip, visibly, where Playwright's Chromium
-      # cannot launch. Every other run withholds them, visibly.
+      # console scenarios, which skip, visibly, where Playwright or its
+      # Chromium is missing. Every other run withholds them, visibly.
       console_scenarios:
         type: boolean
         default: false
