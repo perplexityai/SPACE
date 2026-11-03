@@ -326,6 +326,15 @@ async fn an_empty_filter_parameter_is_unset() -> TestDbResult<()> {
         seed_sandbox(&harness.pool, owner, SeedSandbox::default()).await?;
     }
     let org = owner.org_id.as_uuid();
+    // A body's `age` counts whole seconds on the wall clock, so two requests'
+    // bodies can differ by a tick; the IDs and the cursor are the list.
+    let listed = |body: &Value, paging: &str| {
+        if paging.is_empty() {
+            (ids(body), Value::Null)
+        } else {
+            (ids(&body["sandboxes"]), body["next_cursor"].clone())
+        }
+    };
     for name in [
         "lifecycle",
         "template",
@@ -345,7 +354,11 @@ async fn an_empty_filter_parameter_is_unset() -> TestDbResult<()> {
                 .get(&format!("/sandboxes?org_id={org}&{name}={paging}"))
                 .await;
             assert_eq!(status, StatusCode::OK, "{name}{paging}: empty");
-            assert_eq!(empty, unset, "{name}{paging}: empty is unset");
+            assert_eq!(
+                listed(&empty, paging),
+                listed(&unset, paging),
+                "{name}{paging}: empty is unset"
+            );
         }
     }
     db.pool.close().await;

@@ -693,6 +693,17 @@ async fn the_node_filters_match_the_node_the_response_reports() -> TestDbResult<
         let unpaged = unpaged_ids(&db.pool, &filter(node)).await?;
         assert_eq!(unpaged, expected, "{label}: unpaged list");
     }
+    // Never NULL, so negated it keeps the sandboxes on no node (4 and 5).
+    let off_route_node: Vec<SandboxId> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(format!(
+        "SELECT s.id FROM sandboxes s WHERE s.org_id = $1 AND NOT {}
+         ORDER BY s.created_at DESC",
+        reported_on_node("s", "$2")
+    ))))
+    .bind(owner.org_id)
+    .bind(route_node)
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(off_route_node, newest_first(&[0, 3, 4, 5, 6]));
     db.pool.close().await;
     Ok(())
 }
