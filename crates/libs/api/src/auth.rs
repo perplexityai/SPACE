@@ -198,7 +198,8 @@ pub async fn get_api_key_org(
 /// The value the lookup just read decides whether to write at all, so most
 /// requests issue no statement. The `UPDATE` repeats the check against the
 /// database clock and skips a row another request is already updating, so
-/// concurrent uses of one key neither wait on each other nor write twice.
+/// concurrent uses of one key neither wait on each other nor write twice. It
+/// also skips a key revoked since the lookup read it.
 async fn record_api_key_use(pool: &PgPool, api_key: &ApiKey) {
     let fresh = api_key.last_used_at.is_some_and(|last_used_at| {
         OffsetDateTime::now_utc() - last_used_at < API_KEY_LAST_USED_GRANULARITY
@@ -213,6 +214,7 @@ async fn record_api_key_use(pool: &PgPool, api_key: &ApiKey) {
               SELECT id
               FROM api_keys
               WHERE id = $1
+                AND revoked_at IS NULL
                 AND (last_used_at IS NULL
                      OR last_used_at < NOW() - make_interval(secs => $2))
               FOR UPDATE SKIP LOCKED

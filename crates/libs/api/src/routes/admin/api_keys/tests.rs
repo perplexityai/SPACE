@@ -338,28 +338,53 @@ async fn a_key_without_user_id_acts_as_the_caller_only_in_the_callers_organizati
 /// another user, not an internal error.
 #[tokio::test(flavor = "current_thread")]
 async fn a_key_whose_user_was_deleted_answers_a_conflict() -> TestResult {
-    let Some(db) = crate::routes::admin::test_fixtures::postgres_fixture().await? else {
+    let Some(harness) = admin_router_harness().await? else {
         return Ok(());
     };
-    let org_id = OrgId::from_uuid(uuid::Uuid::from_u128(0x1));
-    let deleted_user = UserId::new();
-    let error = api_key_store::create(
-        &db.pool,
-        CreateApiKey {
-            id: ApiKeyId::new(),
-            org_id,
-            name: "orphan",
-            key_hash: &hash_token("orphan-key"),
-            created_by: deleted_user,
-            allowed_surfaces: &[ApiSurface::Ecw],
-        },
-    )
-    .await
-    .expect_err("the insert names a user that doesn't exist");
-    let response = create_error(error);
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
-    let body: Value = serde_json::from_slice(&body)?;
+    let member = UserId::new();
+    sqlx::query(sql!(
+        "INSERT INTO users (id, email, password_hash, display_name, org_id, role)
+         VALUES ($1, $2, 'synthetic-password-hash', 'Member', $3, 'member')"
+    ))
+    .bind(member)
+    .bind(format!("{member}@example.invalid"))
+    .bind(harness.tenant_org)
+    .execute(&harness.db.pool)
+    .await?;
+    // The user passes the membership check, then is deleted as the key row is
+    // inserted, so the insert's foreign-key check finds no user.
+    sqlx::query(sql!(
+        "CREATE FUNCTION test_delete_api_key_user() RETURNS trigger
+         LANGUAGE plpgsql AS $$
+         BEGIN
+             DELETE FROM users WHERE id = NEW.created_by;
+             RETURN NEW;
+         END $$"
+    ))
+    .execute(&harness.db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "CREATE TRIGGER test_delete_api_key_user
+         BEFORE INSERT ON api_keys
+         FOR EACH ROW EXECUTE FUNCTION test_delete_api_key_user()"
+    ))
+    .execute(&harness.db.pool)
+    .await?;
+
+    let keys_path = format!("/orgs/{}/api-keys", harness.tenant_org);
+    let (status, body) = harness
+        .as_operator(
+            Method::POST,
+            &keys_path,
+            &[],
+            Some(json!({
+                "name": "orphan",
+                "allowed_surfaces": ["ecw"],
+                "user_id": member,
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(
         body["error"].as_str().unwrap_or_default().contains("retry"),
         "{body}"

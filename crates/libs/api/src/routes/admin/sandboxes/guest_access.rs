@@ -41,6 +41,10 @@ const ADMIN_COMMAND_PATH_TEMPLATE: &str = "/v1/sandboxes/{sandbox_id}/commands:a
 /// [`ADMIN_COMMAND_PATH_TEMPLATE`]). Managing-org admin is already enforced by
 /// the admin auth middleware, and the same middleware records an admin audit
 /// event for the request.
+///
+/// It does not apply the public route's lifecycle admission or implicit wake,
+/// so a stopped or suspended sandbox gets a session for a guest that isn't
+/// running, and nothing here wakes it.
 pub async fn create_command(
     State(state): State<AppState>,
     Extension(AuthUser(actor)): Extension<AuthUser>,

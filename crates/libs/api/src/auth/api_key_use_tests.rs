@@ -11,7 +11,8 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::api_surface::ApiSurface;
-use crate::auth::{API_KEY_LAST_USED_GRANULARITY, get_api_key_org, hash_token};
+use crate::auth::{API_KEY_LAST_USED_GRANULARITY, get_api_key_org, hash_token, record_api_key_use};
+use crate::models::ApiKey;
 
 const SEED_ORG_ID: &str = "00000000-0000-0000-0000-000000000002";
 
@@ -92,5 +93,40 @@ async fn a_use_records_last_used_at_once_per_window() -> TestResult {
             .await?
             .is_none()
     );
+    Ok(())
+}
+
+/// A key revoked between its lookup and the recording of its use keeps its
+/// `last_used_at`, so a revoked key never shows a use after its revocation.
+#[tokio::test]
+async fn a_key_revoked_after_its_lookup_keeps_its_last_used_at() -> TestResult {
+    let db = pg_test_db().await?;
+    let pool = &db.pool;
+    let id = seed_key(
+        pool,
+        OrgId::from_uuid(Uuid::parse_str(SEED_ORG_ID)?),
+        None,
+        "key_revoked_after_lookup",
+    )
+    .await?;
+    // The key as its lookup read it: never used, so a use would be recorded.
+    let looked_up = sqlx::query_as::<_, ApiKey>(sql!("SELECT * FROM api_keys WHERE id = $1"))
+        .bind(id)
+        .fetch_one(pool)
+        .await?;
+    // Revoked as the admin key store revokes, before the use is recorded.
+    sqlx::query(sql!(
+        "UPDATE api_keys
+            SET revoked_at = NOW(),
+                updated_at = NOW(),
+                key_hash = 'revoked:' || id::text
+          WHERE id = $1"
+    ))
+    .bind(id)
+    .execute(pool)
+    .await?;
+
+    record_api_key_use(pool, &looked_up).await;
+    assert_eq!(last_used_at(pool, id).await?, None);
     Ok(())
 }
