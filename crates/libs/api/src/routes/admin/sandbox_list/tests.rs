@@ -209,10 +209,11 @@ async fn the_list_pages_by_cursor_and_keeps_the_unpaged_array() -> TestDbResult<
     assert_eq!(ids(&filtered["sandboxes"]), seeded);
     assert_eq!(filtered["next_cursor"], Value::Null);
 
-    // The node filters reach the list, and leave out the node-reported row
-    // as every filter does.
+    // The node filters reach the list, and they and `prefix` leave out the
+    // node-reported row as every filter does, even its own ID's prefix.
     for (label, query, expected) in [
         ("node_id", format!("node_id={node_id}"), Vec::new()),
+        ("prefix", format!("prefix={node_only}"), Vec::new()),
         ("assigned", "assigned=true".to_string(), Vec::new()),
         ("unassigned", "assigned=false".to_string(), seeded.clone()),
     ] {

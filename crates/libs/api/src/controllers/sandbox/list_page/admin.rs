@@ -88,6 +88,8 @@ pub struct AdminSandboxFilter {
     pub created_after: Option<OffsetDateTime>,
     /// Created strictly before this instant.
     pub created_before: Option<OffsetDateTime>,
+    /// Sandbox rows only: a prefix can start a node-reported row's ID, but
+    /// like every filter it leaves those rows out.
     pub search: Option<SandboxSearch>,
 }
 
@@ -133,9 +135,10 @@ pub enum NodeAssignment {
     Unassigned,
 }
 
-/// A name or ID prefix. A row matches when its name starts with the prefix
-/// as given, or when the prefix, with an optional `sbx_` and dashes where a
-/// UUID has them, is the start of its ID.
+/// A name or ID prefix. A sandbox row matches when its name starts with the
+/// prefix as given, or when the prefix, with an optional `sbx_` and dashes
+/// where a UUID has them, is the start of its ID. The node-reported rows
+/// never match (see [`AdminSandboxFilter::is_unfiltered`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxSearch {
     prefix: String,

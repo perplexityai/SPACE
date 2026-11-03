@@ -802,7 +802,7 @@ fn insert_admin_sandbox_create_paths(paths: &mut Map<String, Value>) {
                     { "name": "user_id", "in": "query", "required": false, "schema": { "type": "string" } },
                     { "name": "created_after", "in": "query", "required": false, "description": "RFC 3339; exclusive", "schema": { "type": "string" } },
                     { "name": "created_before", "in": "query", "required": false, "description": "RFC 3339; exclusive, later than created_after", "schema": { "type": "string" } },
-                    { "name": "prefix", "in": "query", "required": false, "description": "Case-sensitive name prefix, or an ID prefix with optional sbx_ and dashes where a UUID has them", "schema": { "type": "string" } }
+                    { "name": "prefix", "in": "query", "required": false, "description": "Case-sensitive name prefix, or an ID prefix with optional sbx_ and dashes where a UUID has them. Like every filter, it searches sandbox rows only: the node-reported pool slots and observed-local sandboxes never match, whatever their ID", "schema": { "type": "string" } }
                 ],
                 "responses": {
                     "200": { "description": "Sandbox array, or {sandboxes, next_cursor} when cursor is set" },
