@@ -72,7 +72,6 @@ import {
 import { PrefixRequests, supplementalMatches } from '@/lib/prefix-search';
 import { useAuth } from '@/lib/auth';
 import { isOwnOrg } from '@/lib/own-org';
-import { RollbackButton, RollbackRefusalNote, useSnapshotRollback } from '@/components/snapshot-rollback';
 import {
   AutoLifecyclePolicy,
   NetworkPolicyV1,
@@ -547,20 +546,19 @@ function SandboxActions({ status, id, resourceType, poolTemplate, onAction }: {
 }
 
 // The operator's own organization's snapshots list through the public routes;
-// another organization's through the admin list, rolled back through
-// `:force-rollback` (see `listSnapshots`). The panel lists when the row
-// expands, on its Refresh, and once a rollback it sent settles; a release
-// without the admin list lists no other organization's, until a Refresh
-// finds one that has it.
-function SnapshotsPanel({ sandboxId, orgId, ownOrg }: { sandboxId: string; orgId: string | null; ownOrg: boolean }) {
+// another organization's through the admin list (see `listSnapshots`). The
+// list is display-only: rollback restores a snapshot the sandbox's node keeps,
+// which only the sandbox page shows (`rollbackTargets`). The panel lists when
+// the row expands and on its Refresh; a release without the admin list lists
+// no other organization's, until a Refresh finds one that has it.
+function SnapshotsPanel({ sandboxId, ownOrg }: { sandboxId: string; ownOrg: boolean }) {
   const { message } = App.useApp();
   const [snapshots, setSnapshots] = useState<SnapshotInfo[]>([]);
   const [more, setMore] = useState(false);
   const [loading, setLoading] = useState(true);
   const [snapshotsOff, setSnapshotsOff] = useState<string | null>(null);
-  const [rollbackVia, setRollbackVia] = useState<'admin' | 'public' | null>(null);
   // Only the newest listing may write: the row's sandbox or organization can
-  // change while a listing is in flight, and a rollback lists again.
+  // change while a listing is in flight.
   const listingRequest = useRef(0);
 
   const list = () => {
@@ -574,7 +572,6 @@ function SnapshotsPanel({ sandboxId, orgId, ownOrg }: { sandboxId: string; orgId
           return;
         }
         setSnapshotsOff(null);
-        setRollbackVia(listing.via);
         setSnapshots(listing.rows);
         setMore(listing.via === 'admin' && listing.more);
       })
@@ -600,8 +597,6 @@ function SnapshotsPanel({ sandboxId, orgId, ownOrg }: { sandboxId: string; orgId
   const refreshButton = (
     <Button size="small" icon={<ReloadOutlined />} loading={loading} onClick={relist}>Refresh</Button>
   );
-
-  const rollback = useSnapshotRollback({ sandboxId, orgId, via: rollbackVia, onSettled: list });
 
   const formatSnapshotBytes = (n: number) => {
     if (n >= 1e9) return `${(n / 1e9).toFixed(1)} GB`;
@@ -639,12 +634,6 @@ function SnapshotsPanel({ sandboxId, orgId, ownOrg }: { sandboxId: string; orgId
     },
     { title: 'Size', dataIndex: 'size_bytes', width: 100, render: (v: number) => v ? formatSnapshotBytes(v) : '0' },
   ];
-  const rollbackColumns: ColumnsType<SnapshotInfo> = [
-    {
-      title: 'Action', width: 120,
-      render: (_, record) => <RollbackButton snapshotName={record.id} state={rollback} />,
-    },
-  ];
 
   if (snapshotsOff) {
     return (
@@ -665,10 +654,12 @@ function SnapshotsPanel({ sandboxId, orgId, ownOrg }: { sandboxId: string; orgId
       <Space size={12} wrap>
         <Text strong><CameraOutlined /> Snapshots</Text>
         {refreshButton}
-        <RollbackRefusalNote state={rollback} />
+        <Link href={`/dashboard/sandboxes/${sandboxId}`}>
+          <Text type="secondary" style={{ fontSize: 12 }}>Roll back from the sandbox page</Text>
+        </Link>
       </Space>
       <Table
-        columns={[...snapshotColumns, ...rollbackColumns]}
+        columns={snapshotColumns}
         dataSource={snapshots}
         rowKey="id"
         loading={loading}
@@ -1958,9 +1949,9 @@ function SandboxesPage() {
           showExpandColumn: false,
           expandRowByClick: true,
           // The table keeps a collapsed row's content mounted; unmounting the
-          // panel stops its reads and the rollbacks it follows.
+          // panel stops its reads.
           expandedRowRender: (record, _index, _indent, expanded) => (expanded
-            ? <SnapshotsPanel sandboxId={record.id} orgId={record.org_id ?? null} ownOrg={isOwnOrg(authOrg?.id, record.org_id)} />
+            ? <SnapshotsPanel sandboxId={record.id} ownOrg={isOwnOrg(authOrg?.id, record.org_id)} />
             : null),
           rowExpandable: snapshotsPanelAvailable,
         }}

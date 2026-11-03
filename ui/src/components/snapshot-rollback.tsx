@@ -7,6 +7,7 @@ import { RollbackOutlined } from '@ant-design/icons';
 import { followRollback } from '@/lib/accepted-create';
 import { rollbackGateRefusal, rollbackRefusals } from '@/lib/hidden-operations';
 import { rollbackConsoleSandbox } from '@/lib/public-api';
+import { FULL_SNAPSHOT_RESTORE_NOTE, isFullSnapshotName } from '@/lib/rollback-targets';
 
 const { Text } = Typography;
 
@@ -21,12 +22,12 @@ export interface SnapshotRollback {
 }
 
 // Roll a sandbox back and report how its operation ended, not only that it
-// was queued. `via` is the route its snapshots were listed from (null while
-// none is known); `onSettled` runs once the outcome is known. A refusal is
+// was queued. `via` is the route the rollback goes to (`rollbackRoute`; null
+// while none is offered); `onSettled` runs once the outcome is known. A refusal is
 // shared with every panel of the organization (`rollbackRefusals`). The
 // rollback is followed only while this view shows the sandbox: unmounting,
 // or showing another sandbox, stops following it, so its outcome cannot
-// re-read a listing that is no longer shown.
+// reload a view that is no longer shown.
 export function useSnapshotRollback({
   sandboxId,
   orgId,
@@ -100,17 +101,34 @@ export function useSnapshotRollback({
   return { refusal, rollingBack, rollback, tryAgain };
 }
 
-export function RollbackButton({ snapshotName, state }: { snapshotName: string; state: SnapshotRollback }) {
-  if (state.refusal) {
+// Rollback for one of the node's snapshots (`rollbackTargets`). `unavailable`
+// is why it is not offered for this row (`RollbackTarget.unavailable`, or the
+// route's reason, `rollbackRoute`); a remembered gate refusal applies to every
+// row.
+export function RollbackButton({
+  snapshotName,
+  unavailable,
+  state,
+}: {
+  snapshotName: string;
+  unavailable: string | null;
+  state: SnapshotRollback;
+}) {
+  const reason = state.refusal ?? unavailable;
+  if (reason) {
     return (
-      <Tooltip title={state.refusal}>
+      <Tooltip title={reason}>
         <Button type="link" size="small" icon={<RollbackOutlined />} disabled>Rollback</Button>
       </Tooltip>
     );
   }
   return (
     <Tooltip title="Roll back sandbox to this snapshot">
-      <Popconfirm title={`Roll back to ${snapshotName}?`} onConfirm={() => state.rollback(snapshotName)}>
+      <Popconfirm
+        title={`Roll back to ${snapshotName}?`}
+        description={isFullSnapshotName(snapshotName) ? FULL_SNAPSHOT_RESTORE_NOTE : undefined}
+        onConfirm={() => state.rollback(snapshotName)}
+      >
         <Button
           type="link"
           size="small"

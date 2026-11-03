@@ -3,6 +3,7 @@ import { adminApi, api, ApiError } from './api';
 import { ADMIN_SNAPSHOT_PAGE_LIMIT, listSnapshots, pageRows, type SnapshotListing } from './admin-fallback';
 import { DEFAULT_LIST_LIMIT, parseSandboxRef, publicSandboxIdFromAny } from './sandbox-id';
 import { mergeOperationPages, type SandboxDebug } from './sandbox-debug';
+import { rollbackBody } from './rollback-targets';
 import { parseSandboxListResponse, type SandboxListResponse } from './sandbox-list';
 import {
   PublicOperationRecord,
@@ -247,8 +248,7 @@ export function publicSnapshotToConsoleSnapshot(snapshot: PublicSnapshot): Snaps
 }
 
 
-// A sandbox's snapshots, and the route its rollback must use; see
-// `listSnapshots`. `ownOrg` (`isOwnOrg`) picks the public routes, which
+// A sandbox's catalog snapshots, for display; see `listSnapshots`. `ownOrg` (`isOwnOrg`) picks the public routes, which
 // serve only the signed-in operator's organization and write no audit event;
 // another organization's sandbox reads the newest `ADMIN_SNAPSHOT_PAGE_LIMIT`
 // through the admin list, and each of those reads is audited.
@@ -273,7 +273,8 @@ export async function getConsoleSnapshots(
 // rollback restores the snapshot and, with `auto_restart`, starts the sandbox.
 export const ROLLBACK_FOLLOW_TIMEOUT_MS = 120_000;
 
-// Roll back through the route the snapshots were listed from. The 202 only
+// Roll back to `snapshotName`, a directory the sandbox's node keeps (see
+// `rollbackTargets`), through `via` (`rollbackRoute`). The 202 only
 // says the rollback was queued: `follow` reads its operation to the end, or
 // until its signal aborts.
 // During a rolling deploy, an older API pod can accept the admin
@@ -285,7 +286,7 @@ export async function rollbackConsoleSandbox(
   snapshotName: string,
   via: 'admin' | 'public',
 ): Promise<{ operationId: string; follow: (signal?: AbortSignal) => Promise<PublicOperationRecord> }> {
-  const body = { snapshot_name: snapshotName, auto_restart: true };
+  const body = rollbackBody(snapshotName);
   if (via === 'public') {
     const accepted = await postPublicOperation(`/sandboxes/${sandboxId}:rollback`, body);
     return {

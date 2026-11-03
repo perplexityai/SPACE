@@ -112,18 +112,19 @@ export function tagMoveFailureMessage(err: unknown): string {
   return `The tag moved since it was read${holder ? ` (it now names release ${holder})` : ''}; nothing was changed. Refresh and try again.`;
 }
 
-// Where a sandbox's snapshots, and so its rollback, come from.
+// Where a sandbox's catalog snapshots come from. The views list them for
+// display only: rollback targets are the node's own snapshot names, from the
+// debug view (`rollbackTargets`).
 // - The operator's own organization: the public routes, as before the admin
 //   list existed. Their reads write no admin audit event, so a page may list
-//   them again on every refresh, and the rollback gate answers there as a
-//   hidden operation (`isHiddenOperationError`).
-// - Another organization: the admin list, rolled back through the admin
-//   `:force-rollback`. Every read of the admin list writes an admin audit
-//   event, so callers read it when the view opens and on an explicit Refresh,
-//   never on a timer. The page holds at most `ADMIN_SNAPSHOT_PAGE_LIMIT` rows;
-//   `more` says that older ones were not read. A release without the admin
-//   list leaves another organization's sandbox with none (`via: 'none'`): its
-//   `:force-rollback` accepts the request but drops the snapshot name.
+//   them again on every refresh.
+// - Another organization: the admin list. Every read of it writes an admin
+//   audit event, so callers read it when the view opens and on an explicit
+//   Refresh, never on a timer. The page holds at most
+//   `ADMIN_SNAPSHOT_PAGE_LIMIT` rows; `more` says that older ones were not
+//   read. A release without the admin list leaves another organization's
+//   sandbox with none (`via: 'none'`); its `:force-rollback` also predates
+//   the rollback body (`rollbackRoute`).
 export type SnapshotListing<T> =
   | { via: 'admin'; rows: T[]; more: boolean }
   | { via: 'public'; rows: T[] }
@@ -132,11 +133,12 @@ export type SnapshotListing<T> =
 export const ADMIN_SNAPSHOT_PAGE_LIMIT = 1000;
 
 // What makes a snapshot view list: it opens (or shows another sandbox), its
-// own Refresh or Retry, a rollback it sent settles, or the page reloads (on a
-// timer, the page's Refresh, and after each action). Every view lists on the
-// first three. Another organization's snapshots come from the audited admin
-// list, so its view never lists on the page's reloads, which include a timer.
-export type SnapshotListingTrigger = 'open' | 'refresh' | 'rollback-settled' | 'page-reload';
+// own Refresh or Retry, or the page reloads (on a timer, the page's Refresh,
+// and after each action, a rollback that settled included). Every view lists
+// on the first two. Another organization's snapshots come from the audited
+// admin list, so its view never lists on the page's reloads, which include a
+// timer.
+export type SnapshotListingTrigger = 'open' | 'refresh' | 'page-reload';
 
 export function listsSnapshotsOn(trigger: SnapshotListingTrigger, ownOrg: boolean): boolean {
   return ownOrg || trigger !== 'page-reload';
