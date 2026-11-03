@@ -35,3 +35,16 @@ test = [
     "pyyaml==6.0.3",
     "requests==2.34.2",
 ]
+# The local.console_* scenarios drive the admin console through Playwright
+# (space_smoke/console.py). Kind-only, so kept out of the dependencies the
+# in-cluster smoke image installs (`uv export` takes only the default groups).
+# Install with `uv sync --frozen --python 3.11 --group console`, then the
+# browser, which is not a Python dependency:
+# `uv run --frozen --python 3.11 python -m playwright install --with-deps chromium`.
+# Without either, the scenarios skip, or fail a run that requires them.
+console = [
+    "playwright==1.64.1",
+    # Playwright's event emitter, pinned so the lock holds one release for
+    # every supported Python: pyee 14 needs Python 3.12.
+    "pyee==13.0.1",
+]

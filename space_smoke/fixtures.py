@@ -20,6 +20,7 @@ from urllib.request import Request, urlopen
 
 from space_smoke.capabilities import (
     ConcurrentRestoreControl,
+    ConsoleControl,
     DrainGateControl,
     NodeDrainControl,
     NodeGroupControl,
@@ -110,6 +111,7 @@ from space_smoke.pending_backup import PendingBackupAssertions
 from space_smoke.teardown_restart import TeardownRestartAssertions
 from space_smoke.reconcile_queue_gc import ReconcileQueueGcAssertions
 from space_smoke.template_build import TemplateBuildAssertions
+from space_smoke.console import ConsoleAssertions
 from space_smoke.drain_gate import DrainGateAssertions
 from space_smoke.rate_limiters import RateLimiterAssertions
 from space_smoke.sandbox_network_isolation import SandboxNetworkIsolationAssertions
@@ -3129,6 +3131,23 @@ class KindEcw(Ecw):
                 self, self._drain_gate_control, self._context.scope
             )
         return self._drain_gate_assertions
+
+    _console_control: ConsoleControl | None = None
+    _console_assertions: ConsoleAssertions | None = None
+
+    @property
+    def console(self) -> ConsoleAssertions:
+        """The admin console, driven through a browser and judged against the admin API."""
+
+        if self._console_control is None:
+            raise SmokeConfigurationError(
+                "admin console control is only available on the kind backend"
+            )
+        if self._console_assertions is None:
+            self._console_assertions = ConsoleAssertions(
+                self, self._console_control, self._context.scope
+            )
+        return self._console_assertions
 
     _startup_recovery_control: StartupRecoveryControl | None = None
     _startup_recovery_assertions: StartupRecoveryAssertions | None = None

@@ -46,6 +46,7 @@ def _describe(scenario_id: str) -> int:
         "telemetry_mode": scenario.telemetry_mode,
         "storage_credentials": scenario.storage_credentials,
         "test_hooks": scenario.test_hooks,
+        "browser": scenario.browser,
         "selected_api_surface": os.environ.get("SPACE_SMOKE_API_SURFACE", "ecw"),
         "sandbox": {
             "count": scenario.sandbox_count,
@@ -404,6 +405,22 @@ def _run_all(
         if skipped not in scenarios:
             backends = ", ".join(sorted(skipped.backends))
             print(f"SKIPPED {skipped.id}: runs only on backend(s) {backends}")
+    browser_selection = os.environ.get(BROWSER_SCENARIOS_ENV) or "run"
+    if browser_selection not in BROWSER_SELECTIONS:
+        print(
+            f"ERROR: {BROWSER_SCENARIOS_ENV} must be one of "
+            f"{', '.join(BROWSER_SELECTIONS)}, not {browser_selection!r}",
+            file=sys.stderr,
+        )
+        return 2
+    # Withheld before the shard partition, from every surface's inventory
+    # alike: a run that withholds them partitions only what it can run, as
+    # if they did not exist.
+    if browser_selection == "withhold":
+        for withheld in scenarios:
+            if withheld.browser is not None:
+                print(f"SKIPPED {withheld.id}: withheld from this run ({BROWSER_SCENARIOS_ENV}=withhold)")
+        scenarios = tuple(scenario for scenario in scenarios if scenario.browser is None)
     # A misspelt substrate is refused before the bootstrap; on Kind the bench's
     # own substrate is read once it has run (_apply_substrate).
     for variable, substrate in _substrate_requests(backend).items():
@@ -427,7 +444,9 @@ def _run_all(
                 surface: tuple(
                     scenario
                     for scenario in REGISTRY.select(category=None, template=template)
-                    if surface in scenario.api_surfaces and backend in scenario.backends
+                    if surface in scenario.api_surfaces
+                    and backend in scenario.backends
+                    and (browser_selection != "withhold" or scenario.browser is None)
                 )
                 for surface in JOINT_SURFACES
             }
@@ -514,6 +533,10 @@ def _run_all(
     telemetry_error = telemetry_error or rust_build_error
     if not scenarios:
         return _mode_emptied(selection, "Rust build", shard, telemetry_error)
+    scenarios, browser_error = _apply_browser(scenarios, browser_selection, services)
+    telemetry_error = telemetry_error or browser_error
+    if not scenarios:
+        return _mode_emptied(selection, "browser state", shard, telemetry_error)
 
     environment = dict(os.environ)
     if environment.get("SPACE_SMOKE_BACKEND", "kind") == "kind":
@@ -726,6 +749,48 @@ def _apply_rust_build(
             "the bench runs release binaries"
         )
     return tuple(scenario for scenario in scenarios if scenario.test_hooks is None), None
+
+
+BROWSER_SCENARIOS_ENV = "SPACE_SMOKE_BROWSER_SCENARIOS"
+BROWSER_SELECTIONS = ("run", "require", "withhold")
+
+
+def _apply_browser(
+    scenarios: tuple[Scenario, ...], selection: str, services: SmokeServices
+) -> tuple[tuple[Scenario, ...], str | None]:
+    """Hold back the scenarios that drive a browser this run cannot launch.
+
+    SPACE_SMOKE_BROWSER_SCENARIOS=withhold has already left them out, before
+    the shard partition, as Kind CI does unless Pull CI selected them
+    (ci/kind-console-paths.txt). Otherwise each browser they declare is probed
+    once. Unset or `run`, a scenario whose browser cannot launch, or whose
+    Playwright is not installed, is skipped, visibly, with the reason: a skip
+    is not a pass. `require`, as CI sets when it selected them, relies on
+    them to run; a browser that cannot launch is then an error, never a
+    skip, like a mode the bench does not run. Returns the scenarios to run
+    and that error.
+    """
+
+    declared = tuple(scenario for scenario in scenarios if scenario.browser is not None)
+    if not declared:
+        return scenarios, None
+    reasons = {
+        browser: services.browser_unavailable(browser)
+        for browser in sorted({str(scenario.browser) for scenario in declared})
+    }
+    unavailable = tuple(scenario for scenario in declared if reasons[str(scenario.browser)] is not None)
+    runnable = tuple(scenario for scenario in scenarios if scenario not in unavailable)
+    if selection == "require" and unavailable:
+        missing = "; ".join(
+            f"{browser}: {reason}" for browser, reason in reasons.items() if reason is not None
+        )
+        names = ", ".join(scenario.id for scenario in unavailable)
+        return runnable, (
+            f"{BROWSER_SCENARIOS_ENV}=require, but {names} cannot run here ({missing})"
+        )
+    for skipped in unavailable:
+        print(f"SKIPPED {skipped.id}: needs a {skipped.browser} browser; {reasons[str(skipped.browser)]}")
+    return runnable, None
 
 
 def _substrate_requests(backend: str) -> dict[str, str]:

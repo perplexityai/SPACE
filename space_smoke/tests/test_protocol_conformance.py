@@ -34,6 +34,7 @@ PAIRS: tuple[tuple[str, type], ...] = tuple(
         ("TemplateBuildControl", adapters.KindHarness),
         ("SandboxNetworkIsolationControl", adapters.KindHarness),
         ("ConcurrentRestoreControl", adapters.KindHarness),
+        ("ConsoleControl", adapters.KindHarness),
     )
     if hasattr(capabilities, name)
 )

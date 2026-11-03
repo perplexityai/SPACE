@@ -16,6 +16,15 @@ on:
       substrate:
         type: string
         default: kubernetes
+      # true, from pull-ci.yml, when its SPACE_KIND_CONSOLE_SMOKE switch is
+      # on and the pull request changes a console path
+      # (ci/kind-console-paths.txt): the typed smoke then requires the admin
+      # console scenarios, and fails where Playwright or its Chromium is
+      # missing. Every other run withholds them, visibly, before the shard
+      # partition, so its shards are those of a registry without them.
+      console_scenarios:
+        type: boolean
+        default: false
 
 # The caller owns permissions: pull-ci.yml grants contents:read and
 # packages:read and actions:read; main-ci.yml grants packages:write to this call.
@@ -278,6 +287,7 @@ jobs:
       # rather than inherited so a default change cannot alter the shards
       # silently.
       SPACE_KIND_TELEMETRY_MODE: otel
+      SPACE_SMOKE_BROWSER_SCENARIOS: ${{ inputs.console_scenarios && 'require' || 'withhold' }}
     runs-on: ubuntu-24.04-16core
     timeout-minutes: 180
     steps:
