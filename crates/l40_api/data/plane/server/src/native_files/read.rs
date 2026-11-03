@@ -20,7 +20,7 @@ use pplx_space_public_api::{
 use pplx_space_public_api_http::PublicApiError;
 
 use super::call::{CallFailure, Reconnect, SandboxCall, WorkerCallError};
-use super::{FileRequest, Refusal, json_body};
+use super::{FileRequest, Refusal, json_body, rejected};
 use crate::DataPlaneState;
 
 pub(super) async fn stat_file(
@@ -148,9 +148,4 @@ async fn read(state: &DataPlaneState, request: Request<Body>) -> Result<Response
         Body::from_stream(stream),
     )
         .into_response())
-}
-
-/// A field check's refusal, as the API answers it.
-fn rejected(error: impl Into<PublicApiError>) -> Refusal {
-    error.into().into()
 }

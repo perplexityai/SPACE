@@ -11,6 +11,7 @@ use pplx_space_common_svc::bootstrap::{GrpcClientTrace, wrap_grpc_client_channel
 use pplx_space_common_svc::space_api_route_ed25519::{
     SpaceApiRouteEd25519Token, insert_space_api_route_ed25519_token,
 };
+use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_native_files::{
     FileCallFailure, FileOperation, WorkerFailure, file_call_error, unprotected_mutation_error,
 };
@@ -35,6 +36,9 @@ pub(crate) struct Grant {
     /// The runtime the API reached for this request.
     endpoint: BackendEndpoint,
     route_token: Option<SpaceApiRouteEd25519Token>,
+    /// The key the sandbox replays the request by, for an operation it
+    /// replays by key.
+    guest_key: Option<IdempotencyKey>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -45,6 +49,8 @@ pub(crate) enum GrantError {
     Endpoint,
     #[error("route token is invalid")]
     RouteToken,
+    #[error("guest idempotency key is invalid")]
+    GuestKey,
 }
 
 impl Grant {
@@ -64,10 +70,25 @@ impl Grant {
             .map(|token| SpaceApiRouteEd25519Token::parse(token.token))
             .transpose()
             .map_err(|_| GrantError::RouteToken)?;
+        let guest_key = grant
+            .guest_idempotency_key
+            .map(IdempotencyKey::parse)
+            .transpose()
+            .map_err(|_| GrantError::GuestKey)?;
         Ok(Self {
             sandbox_id,
             endpoint,
             route_token,
+            guest_key,
+        })
+    }
+
+    /// The key the sandbox replays this request by. The API grants one for
+    /// every operation it replays by key, so its absence is a server fault.
+    pub(super) fn guest_key(&self) -> Result<IdempotencyKey, Refusal> {
+        self.guest_key.clone().ok_or_else(|| {
+            tracing::warn!(sandbox_id = %self.sandbox_id, "granted without a guest key");
+            PublicApiError::internal().into()
         })
     }
 

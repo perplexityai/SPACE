@@ -3,6 +3,7 @@
 //! [`each_failure_answers_as_the_api_answers_it`] say where it comes from.
 
 mod fakes;
+mod mutations;
 
 use std::sync::{
     Arc,
@@ -75,6 +76,16 @@ impl Harness {
         Request::post(self.path(action))
             .header(header::AUTHORIZATION, CLIENT_KEY)
             .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    /// A POST under `Idempotency-Key: key`.
+    fn post_keyed(&self, action: &str, key: &str, body: Value) -> Request<Body> {
+        Request::post(self.path(action))
+            .header(header::AUTHORIZATION, CLIENT_KEY)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("idempotency-key", key)
             .body(Body::from(body.to_string()))
             .unwrap()
     }
@@ -710,6 +721,112 @@ async fn each_failure_answers_as_the_api_answers_it() {
                 400,
                 "file list returned too many entries; use a smaller depth",
             ),
+            allow: None,
+        },
+        Row {
+            name: "mutation without its key",
+            request: |harness| harness.post("mkdir", json!({"path": "/d"})),
+            reply: None,
+            expected: invalid(400, "Idempotency-Key header is required"),
+            allow: None,
+        },
+        Row {
+            name: "key checked after the body",
+            request: |harness| harness.post("rename", json!({"old_path": "/a"})),
+            reply: None,
+            expected: invalid(422, "invalid request"),
+            allow: None,
+        },
+        Row {
+            name: "key with a byte outside ASCII",
+            request: |harness| {
+                Request::post(harness.path("remove"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        "idempotency-key",
+                        axum::http::HeaderValue::from_bytes(b"k\xff").unwrap(),
+                    )
+                    .body(Body::from(r#"{"path": "/r"}"#))
+                    .unwrap()
+            },
+            reply: None,
+            expected: invalid(
+                400,
+                "Idempotency-Key must contain only printable ASCII characters, spaces and tabs",
+            ),
+            allow: None,
+        },
+        Row {
+            name: "tracking enable that disables",
+            request: |harness| harness.post_keyed("changes_enable", "k", json!({"enabled": false})),
+            reply: None,
+            expected: invalid(
+                400,
+                "file change tracking enable request must set enabled=true",
+            ),
+            allow: None,
+        },
+        Row {
+            name: "modified with two filters",
+            request: |harness| {
+                harness.post("modified", json!({"window_seconds": 1, "cursor": "c"}))
+            },
+            reply: None,
+            expected: invalid(
+                400,
+                "window_seconds, since, and cursor are mutually exclusive",
+            ),
+            allow: None,
+        },
+        Row {
+            name: "modified since a non-timestamp",
+            request: |harness| harness.post("modified", json!({"since": "yesterday"})),
+            reply: None,
+            expected: invalid(400, "since must be an RFC3339 timestamp"),
+            allow: None,
+        },
+        Row {
+            name: "mkdir that may have happened",
+            request: |harness| {
+                harness.post_keyed("mkdir", "k-mkdir-internal", json!({"path": "/d"}))
+            },
+            reply: Some(|| Reply::Mkdir(Err(Status::internal("guest failed")))),
+            expected: answered(500, "internal", "internal server error", false),
+            allow: None,
+        },
+        Row {
+            name: "mkdir refused before start",
+            request: |harness| {
+                harness.post_keyed("mkdir", "k-mkdir-refused", json!({"path": "/d"}))
+            },
+            reply: Some(|| {
+                Reply::Mkdir(Err(pplx_space_common_grpc::refused_before_start(
+                    Status::unavailable("too many concurrent filesystem file operations"),
+                    std::time::Duration::from_millis(1500),
+                )))
+            }),
+            expected: Expected {
+                retry_after: Some("2"),
+                ..answered(
+                    503,
+                    "service_unavailable",
+                    "too many concurrent filesystem file operations",
+                    true,
+                )
+            },
+            allow: None,
+        },
+        Row {
+            name: "rename the sandbox replays by key",
+            request: |harness| {
+                harness.post_keyed(
+                    "rename",
+                    "k-rename-internal",
+                    json!({"old_path": "/a", "new_path": "/b"}),
+                )
+            },
+            reply: Some(|| Reply::Rename(Err(Status::internal("guest failed")))),
+            expected: answered(500, "internal", "internal server error", true),
             allow: None,
         },
         Row {
