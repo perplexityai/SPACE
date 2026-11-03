@@ -261,6 +261,12 @@ async fn malformed_list_parameters_answer_400() -> TestDbResult<()> {
             "created_after=2026-01-02T00:00:00Z&created_before=2026-01-01T00:00:00Z",
             "earlier",
         ),
+        // Inverted inside one microsecond, which rounding `created_before`
+        // up would otherwise hide.
+        (
+            "created_after=2026-01-01T00:00:00.0000006Z&created_before=2026-01-01T00:00:00.0000003Z",
+            "earlier",
+        ),
     ] {
         let (status, body) = harness.get(&format!("/sandboxes?{query}")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");

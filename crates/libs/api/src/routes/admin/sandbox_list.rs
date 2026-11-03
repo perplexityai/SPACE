@@ -152,14 +152,13 @@ impl AdminSandboxListQuery {
             .as_deref()
             .map(|value| parse_timestamp("created_after", value))
             .transpose()?;
-        // Postgres keeps microseconds and the bound value is truncated to
-        // them, so a bound inside a microsecond rounds up: a row created
-        // earlier in that microsecond is still before it.
         let created_before = self
             .created_before
             .as_deref()
-            .map(|value| parse_timestamp("created_before", value).and_then(round_up_to_microsecond))
+            .map(|value| parse_timestamp("created_before", value))
             .transpose()?;
+        // Compared as given, before the rounding below can lift a bound past
+        // a later `created_after` in the same microsecond.
         if let (Some(after), Some(before)) = (created_after, created_before)
             && after >= before
         {
@@ -167,6 +166,10 @@ impl AdminSandboxListQuery {
                 "created_after must be earlier than created_before",
             ));
         }
+        // Postgres keeps microseconds and the bound value is truncated to
+        // them, so a bound inside a microsecond rounds up: a row created
+        // earlier in that microsecond is still before it.
+        let created_before = created_before.map(round_up_to_microsecond).transpose()?;
         let filter = AdminSandboxFilter {
             org_id: self.org_id,
             lifecycles: self
