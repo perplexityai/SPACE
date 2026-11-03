@@ -10,6 +10,7 @@ import {
   listAnswerPlan,
   listRequestQuery,
   listScope,
+  listSections,
   loadedRowFilter,
   nextCursorFor,
   nextPage,
@@ -251,6 +252,24 @@ test('Next takes the cursor only while the page that returned it is selected', (
   assert.equal(continuationFor(page2, null), null);
 });
 
+test('a full ID shows the row it finds in the main table, whatever its kind', () => {
+  const slot = { id: 'sbx_0193a000-0000-7000-8000-00000000000a', resource_type: 'pool_slot' };
+  const observed = { id: 'sbx_0193a000-0000-7000-8000-00000000000b', resource_type: 'observed_local' };
+  for (const scope of [scopeOf({ template: 'alpha' }), scopeOf({}, 'c1'), scopeOf({})]) {
+    for (const row of [slot, observed, sandbox]) {
+      assert.deepEqual(listSections('paged', [row], true), { sandboxes: [row], nodeReported: [] }, scope.key);
+    }
+    assert.equal(nodeReportedPlacement(scope, true), 'looked-up', scope.key);
+  }
+  // Without the lookup a page splits its rows, and a filtered page or a
+  // later one does not show the node-reported section.
+  assert.deepEqual(listSections('paged', [sandbox, slot], false), { sandboxes: [sandbox], nodeReported: [slot] });
+  assert.equal(nodeReportedPlacement(scopeOf({ template: 'alpha' }), false), 'filtered');
+  assert.equal(nodeReportedPlacement(scopeOf({}, 'c1'), false), 'first-page');
+  // A sample is one table.
+  assert.deepEqual(listSections('sampled', [sandbox, slot], false), { sandboxes: [sandbox, slot], nodeReported: [] });
+});
+
 test('pages are walked forward by next_cursor and back by the visited cursors', () => {
   assert.equal(pageCursor(FIRST_PAGE), '');
   assert.equal(previousPage(FIRST_PAGE), null);
@@ -333,15 +352,15 @@ test('template names follow the server\'s rules', () => {
 });
 
 test('the node-reported rows are on the first page of the list with no filter', () => {
-  assert.equal(nodeReportedPlacement(listScope('paged', NO_FILTERS, { limit: 50, cursor: '' })), 'here');
-  assert.equal(nodeReportedPlacement(listScope('paged', NO_FILTERS, { limit: 50, cursor: 'c1' })), 'first-page');
+  assert.equal(nodeReportedPlacement(listScope('paged', NO_FILTERS, { limit: 50, cursor: '' }), false), 'here');
+  assert.equal(nodeReportedPlacement(listScope('paged', NO_FILTERS, { limit: 50, cursor: 'c1' }), false), 'first-page');
   // A blank prefix is not sent, so it is no filter.
-  assert.equal(nodeReportedPlacement(listScope('paged', { ...NO_FILTERS, prefix: '  ' }, { limit: 50, cursor: '' })), 'here');
+  assert.equal(nodeReportedPlacement(listScope('paged', { ...NO_FILTERS, prefix: '  ' }, { limit: 50, cursor: '' }), false), 'here');
   for (const filter of [
     { org: '0193a000-0000-7000-8000-000000000001' }, { lifecycles: ['started'] }, { template: 'seed' },
     { userId: '0193a000-0000-7000-8000-000000000002' }, { createdWithin: '1h' }, { olderThan: '1h' }, { prefix: 'build' },
   ]) {
-    assert.equal(nodeReportedPlacement(listScope('paged', { ...NO_FILTERS, ...filter }, { limit: 50, cursor: '' })), 'filtered', JSON.stringify(filter));
+    assert.equal(nodeReportedPlacement(listScope('paged', { ...NO_FILTERS, ...filter }, { limit: 50, cursor: '' }), false), 'filtered', JSON.stringify(filter));
   }
 });
 

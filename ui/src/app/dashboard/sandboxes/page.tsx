@@ -47,6 +47,7 @@ import {
   listAnswerPlan,
   listRequestQuery,
   listScope,
+  listSections,
   loadedRowFilter,
   nextCursorFor,
   nextPage,
@@ -57,7 +58,6 @@ import {
   previousPage,
   sameScope,
   scopeChangePlan,
-  splitNodeReported,
   templateFilterOptions,
   type Continuation,
   type AgeWindow,
@@ -1278,16 +1278,15 @@ function SandboxesPage() {
   }, [sandboxes, query, search, lookup, listMode, templateFilter, statusSplit, userFilter, nodeFilter, ageWindow, olderThan]);
 
   // A page lists its sandboxes, and the first page of the unfiltered list
-  // then the rows nodes report without a database row, apart from them.
+  // then the rows nodes report without a database row, apart from them. A
+  // full ID shows the row it names in the main table, whatever its kind.
+  const exactLookup = query.kind === 'ref';
   const shownRows = useMemo(
-    () => (paged ? splitNodeReported(filteredSandboxes) : { sandboxes: filteredSandboxes, nodeReported: [] }),
-    [paged, filteredSandboxes],
+    () => listSections(listMode, filteredSandboxes, exactLookup),
+    [listMode, filteredSandboxes, exactLookup],
   );
-  const loadedRows = useMemo(
-    () => (paged ? splitNodeReported(sandboxes) : { sandboxes, nodeReported: [] }),
-    [paged, sandboxes],
-  );
-  const nodeReportedAt = nodeReportedPlacement(selectedScope);
+  const loadedRows = useMemo(() => listSections(listMode, sandboxes, false), [listMode, sandboxes]);
+  const nodeReportedAt = nodeReportedPlacement(selectedScope, exactLookup);
 
   const lookupNeeded =
     query.kind === 'ref' && !loading && !sandboxes.some((s) => matchesSandboxQuery(query, s));
@@ -1900,7 +1899,7 @@ function SandboxesPage() {
             scroll={{ x: 1280 }}
           />
         </div>
-      ) : paged && nodeReportedAt !== 'here' ? (
+      ) : paged && (nodeReportedAt === 'filtered' || nodeReportedAt === 'first-page') ? (
         <Text type="secondary" style={{ display: 'block', fontSize: 12, marginTop: 8 }}>
           {nodeReportedAt === 'filtered'
             ? 'Filters leave out the warm-pool slots and other rows nodes report without a database row; they are listed on the first page with no filter set.'

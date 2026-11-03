@@ -373,8 +373,14 @@ export function sendsListFilter(filters: SandboxListFilters): boolean {
 }
 
 // Where the node-reported rows of a paged list are: on this page, after its
-// sandboxes; left out by a filter; or on the first page.
-export function nodeReportedPlacement(scope: ListScope): 'here' | 'filtered' | 'first-page' {
+// sandboxes; left out by a filter; or on the first page. A full ID in the
+// search box shows the row it names on its own, of either kind, and the
+// list's sections are not shown (`looked-up`).
+export function nodeReportedPlacement(
+  scope: ListScope,
+  exactLookup: boolean,
+): 'here' | 'filtered' | 'first-page' | 'looked-up' {
+  if (exactLookup) return 'looked-up';
   if (sendsListFilter(scope.filters)) return 'filtered';
   return scope.cursor === '' ? 'here' : 'first-page';
 }
@@ -384,6 +390,18 @@ export function splitNodeReported<T extends { resource_type?: string }>(rows: T[
     sandboxes: rows.filter((row) => row.resource_type === 'sandbox'),
     nodeReported: rows.filter((row) => row.resource_type !== 'sandbox'),
   };
+}
+
+// The rows of the main table and of the node-reported section. A page
+// splits them; a sample, and the row a full ID found, whatever its kind,
+// are all in the main table.
+export function listSections<T extends { resource_type?: string }>(
+  mode: ListMode,
+  rows: T[],
+  exactLookup: boolean,
+): { sandboxes: T[]; nodeReported: T[] } {
+  if (mode === 'sampled' || exactLookup) return { sandboxes: rows, nodeReported: [] };
+  return splitNodeReported(rows);
 }
 
 // The template filter's options. `admin` is the admin template list, every
