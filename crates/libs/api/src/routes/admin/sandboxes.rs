@@ -88,10 +88,8 @@ pub async fn get_sandbox(
         Ok(None) => {
             return api_error(StatusCode::NOT_FOUND, "Sandbox not found").into_response();
         }
-        // Not classified, for the reason spelled out on
-        // `sandbox_list::list_sandboxes`'s projection arm: this flattens a
-        // `ControllerError` rather than honouring the status it carries, and
-        // the reads behind it do not classify yet either.
+        // Contention answers a retryable 503 and anything else a 500, as on
+        // `sandbox_list::list_sandboxes`'s projection arm.
         Err(error) => {
             return super::support::controller_read_error(&error, || {
                 tracing::warn!(

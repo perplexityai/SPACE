@@ -13,7 +13,8 @@ use std::sync::LazyLock;
 
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{
-    OrgId, SandboxId, SandboxLifecycle, SandboxLifecycleParseError, SemVer, TemplateName, UserId,
+    NodeId, OrgId, SandboxId, SandboxLifecycle, SandboxLifecycleParseError, SemVer, TemplateName,
+    UserId,
 };
 use pplx_space_public_api::PUBLIC_SANDBOX_ID_PREFIX;
 use serde::Serialize;
@@ -26,6 +27,7 @@ use super::{
     ListPage, MAX_SANDBOX_LIST_PAGE_BYTES, PageWalkParams, SANDBOX_LIST_ROW_OVERHEAD_BYTES,
 };
 use crate::controllers::sandbox::{SandboxController, SandboxPageCursor, sandbox_query};
+use crate::controllers::substrate::direct::reported_node::{reported_on_a_node, reported_on_node};
 use crate::controllers::{ControllerError, db_contention_error};
 use crate::models::{Sandbox, SandboxResourceType};
 
@@ -80,23 +82,31 @@ pub struct AdminSandboxFilter {
     /// The row's own template (`sandboxes.template_id`), not the fallbacks
     /// the response's `template` resolves when the row has none.
     pub template: Option<TemplateName>,
+    pub node: Option<NodeAssignment>,
     pub user_id: Option<UserId>,
     /// Created strictly after this instant.
     pub created_after: Option<OffsetDateTime>,
     /// Created strictly before this instant.
     pub created_before: Option<OffsetDateTime>,
+    /// Sandbox rows only: a prefix can start a node-reported row's ID, but
+    /// like every filter it leaves those rows out.
     pub search: Option<SandboxSearch>,
 }
 
 impl AdminSandboxFilter {
-    /// Whether no filter is set. Only the unfiltered list carries the
-    /// node-reported rows with no sandbox row: they belong to no org, and
-    /// none of the other filters can be applied to them.
+    /// Whether no filter is set. Only then does the list carry the
+    /// node-reported rows with no sandbox row (pool slots and observed-local
+    /// sandboxes). They are not in the keyset order the cursor walks, and the
+    /// filters are written against sandbox rows, so every filter leaves them
+    /// out, even one that could describe them: `template`, or
+    /// [`NodeAssignment::Unassigned`], since their response reports no
+    /// `active_node_id`.
     pub fn is_unfiltered(&self) -> bool {
         let Self {
             org_id,
             lifecycles,
             template,
+            node,
             user_id,
             created_after,
             created_before,
@@ -105,6 +115,7 @@ impl AdminSandboxFilter {
         org_id.is_none()
             && lifecycles.is_none()
             && template.is_none()
+            && node.is_none()
             && user_id.is_none()
             && created_after.is_none()
             && created_before.is_none()
@@ -112,9 +123,22 @@ impl AdminSandboxFilter {
     }
 }
 
-/// A name or ID prefix. A row matches when its name starts with the prefix
-/// as given, or when the prefix, with an optional `sbx_` and dashes where a
-/// UUID has them, is the start of its ID.
+/// The node a sandbox is assigned to, as the list response reports it in
+/// `active_node_id`: its Direct route's current node when it has a route,
+/// else its row's `active_node_id`. Like every filter, it lists sandbox rows
+/// only, so [`Self::Unassigned`] leaves out the node-reported rows that the
+/// unfiltered list appends (see [`AdminSandboxFilter::is_unfiltered`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeAssignment {
+    Node(NodeId),
+    Assigned,
+    Unassigned,
+}
+
+/// A name or ID prefix. A sandbox row matches when its name starts with the
+/// prefix as given, or when the prefix, with an optional `sbx_` and dashes
+/// where a UUID has them, is the start of its ID. The node-reported rows
+/// never match (see [`AdminSandboxFilter::is_unfiltered`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxSearch {
     prefix: String,
@@ -162,44 +186,17 @@ fn id_prefix_range(prefix: &str) -> Option<(SandboxId, SandboxId)> {
     Some((bound('0')?, bound('f')?))
 }
 
-/// The admin list's sandboxes ($1-$9) after the cursor, for the page walk.
-/// The filters are the same as [`ADMIN_LIST_SQL`]'s.
-const ADMIN_CANDIDATE_ROWS: &str = "SELECT s.id, s.created_at
-    FROM sandboxes s
-    WHERE ($1::UUID IS NULL OR s.org_id = $1)
-      AND ($2::TEXT[] IS NULL OR s.lifecycle = ANY($2::TEXT[]))
-      AND ($3::TEXT IS NULL OR s.template_id = $3)
-      AND ($4::UUID IS NULL OR s.user_id = $4)
-      AND ($5::TIMESTAMPTZ IS NULL OR s.created_at > $5)
-      AND ($6::TIMESTAMPTZ IS NULL OR s.created_at < $6)
-      AND ($7::TEXT IS NULL
-           OR starts_with(s.name, $7)
-           OR s.id BETWEEN $8::UUID AND $9::UUID)
-      AND {after_cursor}
-    ORDER BY s.created_at DESC, s.id DESC
-    LIMIT {max_rows}";
-
-static ADMIN_PAGE_SQL: LazyLock<String> = LazyLock::new(|| {
-    scoped_page_sql(
-        ADMIN_CANDIDATE_ROWS,
-        &PageWalkParams {
-            cursor_created_at: "$10",
-            cursor_id: "$11",
-            max_rows: "$12",
-            max_bytes: "$13",
-            row_overhead_bytes: "$14",
-            // The admin response carries no `env`.
-            lists_env: false,
-        },
-    )
-});
-
-/// The legacy unpaged list: at most $10 sandboxes matching the filters
-/// ($1-$9, as [`ADMIN_CANDIDATE_ROWS`]'s), newest first.
-static ADMIN_LIST_SQL: LazyLock<String> = LazyLock::new(|| {
-    sandbox_query(
-        "SELECT {sandbox_columns}
-         FROM {sandbox_from}
+/// The admin list's sandboxes ($1-$11) after the cursor, for the page walk.
+/// The filters are the same as [`ADMIN_LIST_SQL`]'s. This statement reads
+/// `sandboxes` alone, so the node filters ($10, $11) take Direct's predicates
+/// for the node the response reports. Built once: every input is a literal or
+/// a bind placeholder.
+static ADMIN_CANDIDATE_ROWS: LazyLock<String> = LazyLock::new(|| {
+    let on_node = reported_on_node("s", "$10");
+    let on_a_node = reported_on_a_node("s");
+    format!(
+        "SELECT s.id, s.created_at
+         FROM sandboxes s
          WHERE ($1::UUID IS NULL OR s.org_id = $1)
            AND ($2::TEXT[] IS NULL OR s.lifecycle = ANY($2::TEXT[]))
            AND ($3::TEXT IS NULL OR s.template_id = $3)
@@ -209,9 +206,55 @@ static ADMIN_LIST_SQL: LazyLock<String> = LazyLock::new(|| {
            AND ($7::TEXT IS NULL
                 OR starts_with(s.name, $7)
                 OR s.id BETWEEN $8::UUID AND $9::UUID)
+           AND ($10::UUID IS NULL OR {on_node})
+           AND ($11::BOOLEAN IS NULL OR {on_a_node} = $11)
+           AND {{after_cursor}}
          ORDER BY s.created_at DESC, s.id DESC
-         LIMIT $10",
+         LIMIT {{max_rows}}"
     )
+});
+
+static ADMIN_PAGE_SQL: LazyLock<String> = LazyLock::new(|| {
+    scoped_page_sql(
+        &ADMIN_CANDIDATE_ROWS,
+        &PageWalkParams {
+            cursor_created_at: "$12",
+            cursor_id: "$13",
+            max_rows: "$14",
+            max_bytes: "$15",
+            row_overhead_bytes: "$16",
+            // The admin response carries no `env`.
+            lists_env: false,
+        },
+    )
+});
+
+/// The legacy unpaged list: at most $12 sandboxes matching the filters
+/// ($1-$11, as [`ADMIN_CANDIDATE_ROWS`]'s), newest first. `{sandbox_from}`
+/// joins the Direct route, so `assigned` ($11) tests the response's own
+/// `active_node_id` expression; `node_id` ($10) takes Direct's predicate,
+/// whose narrowing conjunct reaches a node's few sandboxes by index where the
+/// joined expression tests every row. Built once, as above.
+static ADMIN_LIST_SQL: LazyLock<String> = LazyLock::new(|| {
+    let on_node = reported_on_node("s", "$10");
+    sandbox_query(&format!(
+        "SELECT {{sandbox_columns}}
+         FROM {{sandbox_from}}
+         WHERE ($1::UUID IS NULL OR s.org_id = $1)
+           AND ($2::TEXT[] IS NULL OR s.lifecycle = ANY($2::TEXT[]))
+           AND ($3::TEXT IS NULL OR s.template_id = $3)
+           AND ($4::UUID IS NULL OR s.user_id = $4)
+           AND ($5::TIMESTAMPTZ IS NULL OR s.created_at > $5)
+           AND ($6::TIMESTAMPTZ IS NULL OR s.created_at < $6)
+           AND ($7::TEXT IS NULL
+                OR starts_with(s.name, $7)
+                OR s.id BETWEEN $8::UUID AND $9::UUID)
+           AND ($10::UUID IS NULL OR {on_node})
+           AND ($11::BOOLEAN IS NULL
+                OR (COALESCE(direct_route.current_node_id, s.active_node_id) IS NOT NULL) = $11)
+         ORDER BY s.created_at DESC, s.id DESC
+         LIMIT $12"
+    ))
 });
 
 /// Whether a page stops at the list byte budget.
@@ -273,6 +316,12 @@ impl SandboxController {
         let id_range = filter.search.as_ref().and_then(|search| search.id_range);
         let template = filter.template.as_ref().map(TemplateName::as_str);
         let prefix = filter.search.as_ref().map(|search| search.prefix.as_str());
+        let (node_id, assigned) = match filter.node {
+            Some(NodeAssignment::Node(node_id)) => (Some(node_id), None),
+            Some(NodeAssignment::Assigned) => (None, Some(true)),
+            Some(NodeAssignment::Unassigned) => (None, Some(false)),
+            None => (None, None),
+        };
         if budget == PageBudget::Unbounded {
             let rows =
                 sqlx::query_as::<_, Sandbox>(sqlx::AssertSqlSafe(sql!(ADMIN_LIST_SQL.as_str())))
@@ -285,6 +334,8 @@ impl SandboxController {
                     .bind(prefix)
                     .bind(id_range.map(|(low, _)| low))
                     .bind(id_range.map(|(_, high)| high))
+                    .bind(node_id)
+                    .bind(assigned)
                     .bind(i64::from(limit))
                     .fetch_all(pool)
                     .await?;
@@ -304,6 +355,8 @@ impl SandboxController {
                 .bind(prefix)
                 .bind(id_range.map(|(low, _)| low))
                 .bind(id_range.map(|(_, high)| high))
+                .bind(node_id)
+                .bind(assigned)
                 .bind(cursor.map(|cursor| cursor.created_at))
                 .bind(cursor.map(|cursor| cursor.id))
                 .bind(i64::from(limit.saturating_add(1)))
@@ -328,6 +381,12 @@ impl SandboxController {
     /// `fetch_sandbox_observed_states`): the row's template, else the node's,
     /// else the template the node's inventory holds for the image it runs,
     /// else the pool's; the node's status, else the stored lifecycle.
+    ///
+    /// Postgres applies the `deleted` filter at the `FULL JOIN`, below the
+    /// inventory lookup, so the many stored `deleted` rows no node reports
+    /// cost a hash probe each. Dropping them from `sandboxes` first measured
+    /// slower as an `EXISTS`, and a hashed `IN` turns into a per-row subplan
+    /// once the observed rows outgrow `hash_mem`.
     pub async fn admin_spaced_version_counts(
         &self,
         pool: &PgPool,

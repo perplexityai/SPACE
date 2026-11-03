@@ -208,6 +208,22 @@ async fn the_list_pages_by_cursor_and_keeps_the_unpaged_array() -> TestDbResult<
     assert_eq!(status, StatusCode::OK, "{filtered}");
     assert_eq!(ids(&filtered["sandboxes"]), seeded);
     assert_eq!(filtered["next_cursor"], Value::Null);
+
+    // The node filters reach the list, and they and `prefix` leave out the
+    // node-reported row as every filter does, even its own ID's prefix.
+    for (label, query, expected) in [
+        ("node_id", format!("node_id={node_id}"), Vec::new()),
+        ("prefix", format!("prefix={node_only}"), Vec::new()),
+        ("assigned", "assigned=true".to_string(), Vec::new()),
+        ("unassigned", "assigned=false".to_string(), seeded.clone()),
+    ] {
+        let (status, unpaged) = harness.get(&format!("/sandboxes?{query}")).await;
+        assert_eq!(status, StatusCode::OK, "{label}: unpaged list status");
+        assert_eq!(ids(&unpaged), expected, "{label}: unpaged list");
+        let (status, paged) = harness.get(&format!("/sandboxes?{query}&cursor=")).await;
+        assert_eq!(status, StatusCode::OK, "{label}: page status");
+        assert_eq!(ids(&paged["sandboxes"]), expected, "{label}: page");
+    }
     db.pool.close().await;
     Ok(())
 }
@@ -220,31 +236,67 @@ async fn malformed_list_parameters_answer_400() -> TestDbResult<()> {
     let Some(harness) = harness(db.pool.clone()).await? else {
         return Ok(());
     };
-    for (query, needle) in [
+    // A well-formed cursor from around 5000 BC, before Postgres's range.
+    let out_of_range_cursor = format!(
+        "cursor={}",
+        URL_SAFE_NO_PAD.encode(format!(
+            "{CURSOR_VERSION}:-220000000000000000000:{}",
+            SandboxId::new()
+        ))
+    );
+    for (case, (query, needle)) in [
         ("limit=many", "limit"),
         ("org_id=not-a-uuid", "org_id"),
+        ("node_id=not-a-uuid", "node_id"),
         ("user_id=not-a-uuid", "user_id"),
+        ("assigned=maybe", "assigned"),
         (
             "cursor=&lifecycel=started",
             "unknown query parameter \"lifecycel\"",
         ),
-        ("cursor=&node_id=x", "unknown query parameter \"node_id\""),
+        ("cursor=&node=x", "unknown query parameter \"node\""),
         ("prefix=a%00b", "NUL"),
         ("cursor=bm90LWEtY3Vyc29y", "invalid cursor"),
         ("cursor=%%%", "invalid"),
+        (&out_of_range_cursor, "invalid cursor"),
         ("lifecycle=started,napping", "unknown lifecycle"),
-        ("lifecycle=", "unknown lifecycle"),
+        // An empty parameter is unset, but an empty item in a list is not.
+        ("lifecycle=started,", "unknown lifecycle"),
         ("template=..", "invalid template"),
+        (
+            "node_id=00000000-0000-7000-8000-000000000001&assigned=false",
+            "assigned=false",
+        ),
         ("created_after=yesterday", "created_after"),
+        // Valid RFC 3339, but before the earliest timestamp Postgres stores.
+        ("created_after=-005000-01-01T00:00:00Z", "outside"),
+        ("created_before=-005000-01-01T00:00:00Z", "outside"),
         (
             "created_after=2026-01-02T00:00:00Z&created_before=2026-01-01T00:00:00Z",
             "earlier",
         ),
-    ] {
+        // Inverted inside one microsecond, which rounding `created_before`
+        // up would otherwise hide.
+        (
+            "created_after=2026-01-01T00:00:00.0000006Z&created_before=2026-01-01T00:00:00.0000003Z",
+            "earlier",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // Labelled by position and needle: a query can carry an ID.
         let (status, body) = harness.get(&format!("/sandboxes?{query}")).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "case {case} ({needle}): status"
+        );
         let message = body["error"].as_str().unwrap_or_default();
-        assert!(message.contains(needle), "{query}: {body}");
+        assert!(
+            message.contains(needle),
+            "case {case} ({needle}): error message"
+        );
     }
     for query in ["org_id=not-a-uuid", "template=py"] {
         let (status, body) = harness
@@ -257,6 +309,58 @@ async fn malformed_list_parameters_answer_400() -> TestDbResult<()> {
     let (status, body) = harness.get("/sandboxes?lifecycel=started").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body.is_array(), "{body}");
+    db.pool.close().await;
+    Ok(())
+}
+
+/// An empty filter parameter is unset, paged or not: the unpaged list ignored
+/// these names before they were filters.
+#[tokio::test]
+async fn an_empty_filter_parameter_is_unset() -> TestDbResult<()> {
+    let db = pg_test_db().await?;
+    let Some(harness) = harness(db.pool.clone()).await? else {
+        return Ok(());
+    };
+    let owner = seed_owner(&harness.pool).await?;
+    for _ in 0..2 {
+        seed_sandbox(&harness.pool, owner, SeedSandbox::default()).await?;
+    }
+    let org = owner.org_id.as_uuid();
+    // A body's `age` counts whole seconds on the wall clock, so two requests'
+    // bodies can differ by a tick; the IDs and the cursor are the list.
+    let listed = |body: &Value, paging: &str| {
+        if paging.is_empty() {
+            (ids(body), Value::Null)
+        } else {
+            (ids(&body["sandboxes"]), body["next_cursor"].clone())
+        }
+    };
+    for name in [
+        "lifecycle",
+        "template",
+        "node_id",
+        "assigned",
+        "user_id",
+        "created_after",
+        "created_before",
+        "prefix",
+    ] {
+        for paging in ["", "&cursor="] {
+            let (status, unset) = harness
+                .get(&format!("/sandboxes?org_id={org}{paging}"))
+                .await;
+            assert_eq!(status, StatusCode::OK, "{name}{paging}: without it");
+            let (status, empty) = harness
+                .get(&format!("/sandboxes?org_id={org}&{name}={paging}"))
+                .await;
+            assert_eq!(status, StatusCode::OK, "{name}{paging}: empty");
+            assert_eq!(
+                listed(&empty, paging),
+                listed(&unset, paging),
+                "{name}{paging}: empty is unset"
+            );
+        }
+    }
     db.pool.close().await;
     Ok(())
 }

@@ -2,6 +2,8 @@
 //! surface: the cross-org sandbox list, its cursor and filters, and the count
 //! of sandboxes by template and `spaced` version.
 
+use std::fmt;
+use std::ops::RangeInclusive;
 use std::str::FromStr;
 
 use axum::{
@@ -11,15 +13,16 @@ use axum::{
     response::IntoResponse,
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use pplx_space_common_core::types::{OrgId, SandboxId, TemplateName, UserId};
-use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use pplx_space_common_core::types::{NodeId, OrgId, SandboxId, TemplateName, UserId};
+use serde::de::{self, DeserializeOwned};
+use serde::{Deserialize, Deserializer, Serialize};
 use time::OffsetDateTime;
 
 use super::support::{self, ContentionScope, api_error, require_managing_org_admin};
 use crate::controllers::sandbox::SandboxPageCursor;
 use crate::controllers::sandbox::list_page::admin::{
-    AdminSandboxFilter, AdminStoredLifecycle, PageBudget, SandboxSearch, SpacedVersionCount,
+    AdminSandboxFilter, AdminStoredLifecycle, NodeAssignment, PageBudget, SandboxSearch,
+    SpacedVersionCount,
 };
 use crate::middleware::auth::AuthUser;
 use crate::models::{Sandbox, SandboxResponse};
@@ -32,18 +35,26 @@ const CURSOR_VERSION: &str = "v1";
 /// The list's query parameters. With `cursor` any other parameter is
 /// refused; without it, other parameters are ignored, as they were before
 /// paging existed, so callers written against that list keep working.
-const LIST_PARAMETERS: [&str; 9] = [
+const LIST_PARAMETERS: [&str; 11] = [
     "limit",
     "org_id",
     "cursor",
     "lifecycle",
     "template",
+    "node_id",
+    "assigned",
     "user_id",
     "created_after",
     "created_before",
     "prefix",
 ];
 const NANOSECONDS_PER_MICROSECOND: i128 = 1_000;
+/// The Unix nanoseconds Postgres's `timestamptz` holds, at its microsecond
+/// precision: from 4714-11-24 BC (Julian day 0) through the last microsecond
+/// of 294276. A bound outside them fails the statement instead of matching
+/// nothing, so it is refused when parsed.
+const POSTGRES_TIMESTAMP_NANOS: RangeInclusive<i128> =
+    -210_866_803_200_000_000_000..=9_224_318_015_999_999_999_000;
 
 type QueryError = (StatusCode, Json<serde_json::Value>);
 
@@ -56,10 +67,19 @@ pub struct AdminSandboxListQuery {
     /// response is then `{sandboxes, next_cursor}` instead of a bare array.
     cursor: Option<String>,
     /// Comma-separated stored lifecycles.
+    #[serde(default, deserialize_with = "empty_as_unset")]
     lifecycle: Option<String>,
+    #[serde(default, deserialize_with = "empty_as_unset")]
     template: Option<String>,
+    #[serde(default, deserialize_with = "empty_as_unset")]
+    node_id: Option<NodeId>,
+    #[serde(default, deserialize_with = "empty_as_unset")]
+    assigned: Option<bool>,
+    #[serde(default, deserialize_with = "empty_as_unset")]
     user_id: Option<UserId>,
+    #[serde(default, deserialize_with = "empty_as_unset")]
     created_after: Option<String>,
+    #[serde(default, deserialize_with = "empty_as_unset")]
     created_before: Option<String>,
     prefix: Option<String>,
 }
@@ -128,19 +148,29 @@ impl AdminSandboxListQuery {
             Some("") => Paging::First,
             Some(cursor) => Paging::After(decode_cursor(cursor)?),
         };
+        let node = match (self.node_id, self.assigned) {
+            (Some(_), Some(false)) => {
+                return Err(bad_request(
+                    "node_id cannot be combined with assigned=false",
+                ));
+            }
+            (Some(node_id), _) => Some(NodeAssignment::Node(node_id)),
+            (None, Some(true)) => Some(NodeAssignment::Assigned),
+            (None, Some(false)) => Some(NodeAssignment::Unassigned),
+            (None, None) => None,
+        };
         let created_after = self
             .created_after
             .as_deref()
             .map(|value| parse_timestamp("created_after", value))
             .transpose()?;
-        // Postgres keeps microseconds and the bound value is truncated to
-        // them, so a bound inside a microsecond rounds up: a row created
-        // earlier in that microsecond is still before it.
         let created_before = self
             .created_before
             .as_deref()
-            .map(|value| parse_timestamp("created_before", value).and_then(round_up_to_microsecond))
+            .map(|value| parse_timestamp("created_before", value))
             .transpose()?;
+        // Compared as given, before the rounding below can lift a bound past
+        // a later `created_after` in the same microsecond.
         if let (Some(after), Some(before)) = (created_after, created_before)
             && after >= before
         {
@@ -148,6 +178,10 @@ impl AdminSandboxListQuery {
                 "created_after must be earlier than created_before",
             ));
         }
+        // Postgres keeps microseconds and the bound value is truncated to
+        // them, so a bound inside a microsecond rounds up: a row created
+        // earlier in that microsecond is still before it.
+        let created_before = created_before.map(round_up_to_microsecond).transpose()?;
         let filter = AdminSandboxFilter {
             org_id: self.org_id,
             lifecycles: self
@@ -162,6 +196,7 @@ impl AdminSandboxListQuery {
                         .map_err(|error| bad_request(format!("invalid template: {error}")))
                 })
                 .transpose()?,
+            node,
             user_id: self.user_id,
             created_after,
             created_before,
@@ -191,6 +226,22 @@ fn parse_query<T: DeserializeOwned>(uri: &Uri) -> Result<T, QueryError> {
         .map_err(|rejection| bad_request(rejection.body_text()))
 }
 
+/// A filter parameter whose empty value (`name=`) is unset, as leaving the
+/// name out is: the unpaged list ignored these names before they were
+/// filters, so a caller that sends one empty keeps its list. `org_id`, which
+/// that list already parsed, still refuses an empty value.
+fn empty_as_unset<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: FromStr,
+    T::Err: fmt::Display,
+{
+    match Option::<String>::deserialize(deserializer)?.as_deref() {
+        None | Some("") => Ok(None),
+        Some(value) => value.parse().map(Some).map_err(de::Error::custom),
+    }
+}
+
 fn parse_lifecycles(value: &str) -> Result<Vec<AdminStoredLifecycle>, QueryError> {
     let mut lifecycles = Vec::new();
     for part in value.split(',') {
@@ -206,7 +257,13 @@ fn parse_lifecycles(value: &str) -> Result<Vec<AdminStoredLifecycle>, QueryError
 fn parse_timestamp(name: &str, value: &str) -> Result<OffsetDateTime, QueryError> {
     let invalid = || bad_request(format!("{name} must be an RFC 3339 timestamp"));
     let timestamp = jiff::Timestamp::from_str(value).map_err(|_| invalid())?;
-    OffsetDateTime::from_unix_timestamp_nanos(timestamp.as_nanosecond()).map_err(|_| invalid())
+    let nanos = timestamp.as_nanosecond();
+    if !POSTGRES_TIMESTAMP_NANOS.contains(&nanos) {
+        return Err(bad_request(format!(
+            "{name} is outside the timestamps Postgres stores"
+        )));
+    }
+    OffsetDateTime::from_unix_timestamp_nanos(nanos).map_err(|_| invalid())
 }
 
 fn round_up_to_microsecond(value: OffsetDateTime) -> Result<OffsetDateTime, QueryError> {
@@ -242,6 +299,7 @@ fn decode_cursor(cursor: &str) -> Result<SandboxPageCursor, QueryError> {
     let created_at = nanos
         .parse::<i128>()
         .ok()
+        .filter(|nanos| POSTGRES_TIMESTAMP_NANOS.contains(nanos))
         .and_then(|nanos| OffsetDateTime::from_unix_timestamp_nanos(nanos).ok())
         .ok_or_else(invalid)?;
     let id = SandboxId::from_str(id).map_err(|_| invalid())?;
@@ -316,23 +374,11 @@ pub async fn list_sandboxes(
             next_cursor,
         })
         .into_response(),
-        // A known remainder, in two halves, neither of which is useful
-        // without the other.
-        //
-        // `list_responses` reaches `responses::fetch_sandbox_observed_states`
-        // and `fetch_observed_only_sandboxes`, both of which erase the
-        // SQLSTATE into `ControllerError::internal` — so no contention
-        // identity exists to honour here yet. And this arm flattens the
-        // `ControllerError` to a 500 regardless of the status it carried, so
-        // classifying those reads alone would not surface it either.
-        //
-        // Adding an `is_lock_contention()` check here today would be a guard
-        // for a state nothing produces. Projection needs to preserve the
-        // database error identity, and this handler must also preserve the
-        // resulting status. These are independent fixes: classification
-        // recovers contention identity, while flattening discards every status,
-        // not just contention. Neither alone makes this path retryable.
-        // Same shape on `sandboxes::get_sandbox`.
+        // The projection reads (`responses::fetch_sandbox_observed_states`
+        // and `fetch_observed_only_sandboxes`) keep a contention SQLSTATE
+        // through `db_contention_error`, and `controller_read_error` answers
+        // it as a retryable 503; anything else is a 500. Same shape on
+        // `sandboxes::get_sandbox`.
         Err(error) => support::controller_read_error(&error, || {
             tracing::warn!(%error, "admin sandbox response projection failed");
         }),

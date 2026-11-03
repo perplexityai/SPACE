@@ -142,6 +142,32 @@ async fn listed_ids(pool: &PgPool, filter: &AdminSandboxFilter) -> TestDbResult<
     Ok(page.rows.iter().map(|sandbox| sandbox.id).collect())
 }
 
+/// The legacy unpaged list's IDs, which run their own statement.
+async fn unpaged_ids(pool: &PgPool, filter: &AdminSandboxFilter) -> TestDbResult<Vec<SandboxId>> {
+    let page = controller(pool)
+        .admin_sandbox_page(pool, filter, None, 100, PageBudget::Unbounded)
+        .await?;
+    Ok(page.rows.iter().map(|sandbox| sandbox.id).collect())
+}
+
+/// A current Direct route for `sandbox_id`, on `node_id`.
+async fn seed_route(pool: &PgPool, sandbox_id: SandboxId, node_id: NodeId) -> TestDbResult<()> {
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_direct_route_identities (
+             sandbox_id, route_generation, current_node_id, substrate_kind,
+             execution_generation, activation_attempt_id
+         )
+         VALUES ($1, 1, $2, $3, 1, $4)"
+    ))
+    .bind(sandbox_id)
+    .bind(node_id)
+    .bind(SubstrateKind::Space)
+    .bind(Uuid::now_v7())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 fn base_time() -> OffsetDateTime {
     OffsetDateTime::from_unix_timestamp(1_790_000_000).expect("fixture timestamp")
 }
@@ -397,6 +423,30 @@ async fn each_filter_returns_exactly_its_rows() -> TestDbResult<()> {
             &[0, 1, 3],
         ),
         (
+            "node",
+            AdminSandboxFilter {
+                node: Some(NodeAssignment::Node(node_one)),
+                ..AdminSandboxFilter::default()
+            },
+            &[0, 4],
+        ),
+        (
+            "assigned",
+            AdminSandboxFilter {
+                node: Some(NodeAssignment::Assigned),
+                ..AdminSandboxFilter::default()
+            },
+            &[0, 1, 4, 5],
+        ),
+        (
+            "unassigned",
+            AdminSandboxFilter {
+                node: Some(NodeAssignment::Unassigned),
+                ..AdminSandboxFilter::default()
+            },
+            &[2, 3],
+        ),
+        (
             "user",
             AdminSandboxFilter {
                 user_id: Some(first_user.user_id),
@@ -477,29 +527,183 @@ async fn each_filter_returns_exactly_its_rows() -> TestDbResult<()> {
             },
             &[],
         ),
+        // Without its node filter each combined case lists rows 0 and 3, so
+        // the node filter decides the result.
         (
-            "combined",
+            "combined, unassigned",
             AdminSandboxFilter {
                 org_id: Some(first_org),
                 lifecycles: lifecycles(&["started", "deleted"]),
                 template: template("py"),
+                node: Some(NodeAssignment::Unassigned),
                 user_id: Some(first_user.user_id),
-                created_after: Some(at(2)),
                 ..AdminSandboxFilter::default()
             },
             &[3],
         ),
+        (
+            "combined, on a node",
+            AdminSandboxFilter {
+                org_id: Some(first_org),
+                lifecycles: lifecycles(&["started", "deleted"]),
+                template: template("py"),
+                node: Some(NodeAssignment::Node(node_one)),
+                user_id: Some(first_user.user_id),
+                ..AdminSandboxFilter::default()
+            },
+            &[0],
+        ),
     ];
     for (case, filter, expected) in cases {
-        let listed = listed_ids(&db.pool, &filter).await?;
         // Newest first, so the expected rows in reverse seed order.
         let expected = expected
             .iter()
             .rev()
             .map(|index| ids[*index])
             .collect::<Vec<_>>();
-        assert_eq!(listed, expected, "{case}");
+        let listed = listed_ids(&db.pool, &filter).await?;
+        assert_eq!(listed, expected, "{case}: page");
+        let unpaged = unpaged_ids(&db.pool, &filter).await?;
+        assert_eq!(unpaged, expected, "{case}: unpaged list");
     }
+    db.pool.close().await;
+    Ok(())
+}
+
+/// The node filters match the node the response reports: a sandbox with a
+/// current Direct route is on its route's node, whatever its row's
+/// `active_node_id` says, and any other sandbox is on its row's node. Paging
+/// keeps them, cursor and all.
+#[tokio::test]
+async fn the_node_filters_match_the_node_the_response_reports() -> TestDbResult<()> {
+    let db = pg_test_db().await?;
+    let owner = seed_owner(&db.pool).await?;
+    let (row_node, route_node) = (NodeId::new(), NodeId::new());
+    let at = |minutes: i64| base_time() + Duration::minutes(minutes);
+    // (substrate, row's active node, route's node), oldest first.
+    let rows = [
+        (SubstrateKind::Kubernetes, Some(row_node), None),
+        (SubstrateKind::Space, Some(row_node), Some(route_node)),
+        (SubstrateKind::Space, None, Some(route_node)),
+        (SubstrateKind::Space, Some(row_node), None),
+        (SubstrateKind::Space, None, None),
+        (SubstrateKind::Kubernetes, None, None),
+        (SubstrateKind::Space, Some(route_node), Some(row_node)),
+    ];
+    let mut ids = Vec::new();
+    for (minutes, (substrate, active_node_id, route)) in (0..).zip(rows) {
+        let sandbox_id = seed_sandbox(
+            &db.pool,
+            owner,
+            SeedSandbox {
+                active_node_id,
+                created_at: Some(at(minutes)),
+                ..SeedSandbox::default()
+            },
+        )
+        .await?;
+        sqlx::query(sql!("UPDATE sandboxes SET managed_by = $2 WHERE id = $1"))
+            .bind(sandbox_id)
+            .bind(substrate)
+            .execute(&db.pool)
+            .await?;
+        if let Some(route_node) = route {
+            seed_route(&db.pool, sandbox_id, route_node).await?;
+        }
+        ids.push(sandbox_id);
+    }
+    let newest_first =
+        |indexes: &[usize]| indexes.iter().rev().map(|i| ids[*i]).collect::<Vec<_>>();
+    let filter = |node| AdminSandboxFilter {
+        org_id: Some(owner.org_id),
+        node: Some(node),
+        ..AdminSandboxFilter::default()
+    };
+    let cases = [
+        (
+            "route node",
+            NodeAssignment::Node(route_node),
+            newest_first(&[1, 2]),
+        ),
+        (
+            "row node",
+            NodeAssignment::Node(row_node),
+            newest_first(&[0, 3, 6]),
+        ),
+        (
+            "assigned",
+            NodeAssignment::Assigned,
+            newest_first(&[0, 1, 2, 3, 6]),
+        ),
+        (
+            "unassigned",
+            NodeAssignment::Unassigned,
+            newest_first(&[4, 5]),
+        ),
+    ];
+    let everything = page(
+        &db.pool,
+        &AdminSandboxFilter {
+            org_id: Some(owner.org_id),
+            ..AdminSandboxFilter::default()
+        },
+        None,
+        100,
+    )
+    .await?;
+    for (label, node, expected) in cases {
+        let listed = page(&db.pool, &filter(node), None, 100).await?;
+        assert_eq!(
+            listed
+                .rows
+                .iter()
+                .map(|sandbox| sandbox.id)
+                .collect::<Vec<_>>(),
+            expected,
+            "{label}"
+        );
+        if let NodeAssignment::Node(node_id) = node {
+            // The independent oracle: the response's own `active_node_id`.
+            let reported = everything
+                .rows
+                .iter()
+                .filter(|sandbox| sandbox.active_node_id == Some(node_id))
+                .map(|sandbox| sandbox.id)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                reported, expected,
+                "{label}: the response reports that node"
+            );
+        }
+
+        // One row a page, the cursor carrying the filter's position.
+        let mut walked = Vec::new();
+        let mut after = None;
+        loop {
+            let one = page(&db.pool, &filter(node), after, 1).await?;
+            walked.extend(one.rows.iter().map(|sandbox| sandbox.id));
+            match (one.has_more, one.rows.last()) {
+                (true, Some(last)) => after = Some(cursor_after(last)),
+                _ => break,
+            }
+        }
+        assert_eq!(walked, expected, "{label}: walked a row at a time");
+
+        // The unpaged list runs its own statement with the same filters.
+        let unpaged = unpaged_ids(&db.pool, &filter(node)).await?;
+        assert_eq!(unpaged, expected, "{label}: unpaged list");
+    }
+    // Never NULL, so negated it keeps the sandboxes on no node (4 and 5).
+    let off_route_node: Vec<SandboxId> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(format!(
+        "SELECT s.id FROM sandboxes s WHERE s.org_id = $1 AND NOT {}
+         ORDER BY s.created_at DESC",
+        reported_on_node("s", "$2")
+    ))))
+    .bind(owner.org_id)
+    .bind(route_node)
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(off_route_node, newest_first(&[0, 3, 4, 5, 6]));
     db.pool.close().await;
     Ok(())
 }
