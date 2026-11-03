@@ -731,13 +731,31 @@ export default function NodesPage() {
       render: (_, record) => {
         if (record.role === 'cluster') return <Text type="secondary">—</Text>;
         const counts = occupancyOf(record);
-        if (counts.sandboxes_active === null || counts.sandboxes_active === undefined) {
-          return <Text type="secondary">{occupancyFailed ? 'could not count' : 'not computed'}</Text>;
-        }
+        // Slots come with every node read, so their warning does not wait on
+        // the separate sandbox count.
         const slots = record.network_slots;
         const slot = (value: number | null | undefined) => value ?? '—';
-        const stale = occupancyFailed || occupancyAtMs === null || nodeAgeReferenceMs - occupancyAtMs > 2 * OCCUPANCY_REFRESH_MS;
         const unhealthySlots = (slots?.degraded ?? 0) + (slots?.quarantined ?? 0);
+        const slotLines = slots
+          ? [
+              `network slots leased: ${slot(slots.leased)} of ${slot(slots.total)} (max ${slot(slots.max_slots)})`,
+              `ready ${slot(slots.ready)}, degraded ${slot(slots.degraded)}, quarantined ${slot(slots.quarantined)}`,
+            ]
+          : [];
+        const slotWarning = unhealthySlots > 0 ? <Tag color="orange">{unhealthySlots} slots unhealthy</Tag> : null;
+        if (counts.sandboxes_active === null || counts.sandboxes_active === undefined) {
+          const label = <Text type="secondary">{occupancyFailed ? 'could not count' : 'not computed'}</Text>;
+          if (!slotWarning) return label;
+          return (
+            <Tooltip title={<span style={{ whiteSpace: 'pre-line' }}>{slotLines.join('\n')}</span>}>
+              <Space size={4} wrap>
+                {label}
+                {slotWarning}
+              </Space>
+            </Tooltip>
+          );
+        }
+        const stale = occupancyFailed || occupancyAtMs === null || nodeAgeReferenceMs - occupancyAtMs > 2 * OCCUPANCY_REFRESH_MS;
         return (
           <Tooltip
             title={
@@ -745,10 +763,9 @@ export default function NodesPage() {
                 {[
                   `active sandboxes: ${counts.sandboxes_active}`,
                   `local snapshots: ${counts.sandboxes_local_snapshots ?? 'not computed'}`,
-                  slots ? `network slots leased: ${slot(slots.leased)} of ${slot(slots.total)} (max ${slot(slots.max_slots)})` : null,
-                  slots ? `ready ${slot(slots.ready)}, degraded ${slot(slots.degraded)}, quarantined ${slot(slots.quarantined)}` : null,
+                  ...slotLines,
                   occupancyAtMs ? `counted ${formatUnixAge(Math.floor(occupancyAtMs / 1000), nodeAgeReferenceMs)}` : null,
-                  stale ? (occupancyFailed ? 'the last count failed; these counts are stale' : 'these counts are stale') : null,
+                  stale ? (occupancyFailed ? 'the last count failed; sandbox counts are stale' : 'sandbox counts are stale') : null,
                 ].filter(Boolean).join('\n')}
               </span>
             }
@@ -759,7 +776,7 @@ export default function NodesPage() {
               </Button>
               {stale ? <Tag>stale</Tag> : null}
               {counts.sandboxes_local_snapshots ? <Tag>{counts.sandboxes_local_snapshots} local snaps</Tag> : null}
-              {unhealthySlots > 0 ? <Tag color="orange">{unhealthySlots} slots unhealthy</Tag> : null}
+              {slotWarning}
             </Space>
           </Tooltip>
         );
