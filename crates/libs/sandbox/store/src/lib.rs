@@ -65,6 +65,9 @@
 //!   the caller keeps the domain logic that decides which ids to ask about.
 //!   A predicate that is neither shared nor latency-bound is still better off
 //!   as a `get` plus a filter.
+//! * **Aggregate reads are modules too.** [`stuck`] counts the rows in each
+//!   transient lifecycle by age for a gauge; it reads the row's own clock and
+//!   writes nothing.
 //!
 //! # Fact kinds
 //!
@@ -115,6 +118,7 @@ pub mod pod_tracking;
 pub mod quarantine;
 pub mod repair;
 pub mod restore_lease;
+pub mod stuck;
 pub mod suspend;
 pub mod sweeper;
 pub mod tombstone;
