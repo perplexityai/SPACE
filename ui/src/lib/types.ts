@@ -49,6 +49,11 @@ export interface ApiKeyMetadata {
   allowed_surfaces: ApiSurface[];
   created_at: string;
   updated_at: string;
+  // Absent on releases before key usage and revocation records. `last_used_at`
+  // counts API authentications only; `revoked_at` is set only on revoked keys,
+  // which the list includes with `include_revoked=true`.
+  last_used_at?: string | null;
+  revoked_at?: string | null;
 }
 
 export interface CreatedApiKey {
@@ -442,6 +447,10 @@ export interface NodeView {
   reconcile_trigger: NodeReconcileTrigger | null;
   /** Set when the trigger could not be read; `reconcile_trigger` is then unknown. */
   read_state_error: string | null;
+  /** As `AdminNodeResponse` reports them; absent means not reported. */
+  cordoned?: boolean;
+  node_group_id?: string;
+  runtime_installations?: NodeRuntimeInstallation[];
 }
 
 /// Response shape for GET /admin/api/v1/nodes and action endpoints.
@@ -486,6 +495,23 @@ export interface AdminNodeResponse {
   /** Why the trigger and runtime installations were not read. While it is
    * set, an absent `reconcile_trigger` means unknown, not nothing queued. */
   read_state_error?: string;
+  /** The Kubernetes node's `spec.unschedulable`. Absent on Direct, before the
+   * API's node cache has listed, and on releases that do not report it. */
+  cordoned?: boolean;
+  /** Absent for a node in the default group, and on releases that do not
+   * report it. */
+  node_group_id?: string;
+  /** What the node reported installed; `[]` when it reported none. Absent
+   * when `read_state_error` is set, and on releases that do not report it. */
+  runtime_installations?: NodeRuntimeInstallation[];
+}
+
+export interface NodeRuntimeInstallation {
+  runtime: string;
+  runtime_version: string;
+  /** `os/arch` of each guest, e.g. `linux/x86_64`. */
+  guests: string[];
+  observed_at: string;
 }
 
 /// A node's queued state-reconciliation trigger, as GET /admin/api/v1/nodes
@@ -683,4 +709,17 @@ export interface MeResponse {
   user: User;
   org: Organization;
   substrate: Substrate;
+}
+
+// One entry of `GET /admin/api/v1/templates/{name}/builds`, newest first.
+// `state` is null when the builder could not be asked; `status_error` says why.
+export interface TemplateBuildListEntry {
+  job_id: string;
+  template_name: string;
+  created_at: string;
+  builder_node_id: string | null;
+  state: TemplateBuildState | null;
+  content_hash: string | null;
+  error: string | null;
+  status_error: string | null;
 }

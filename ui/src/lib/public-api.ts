@@ -1,5 +1,6 @@
-import { OperationFailedError, OperationTimeoutError } from './accepted-create';
+import { OperationFailedError, OperationTimeoutError, terminalErrorParts } from './accepted-create';
 import { adminApi, api, ApiError } from './api';
+import { listSnapshotsWithFallback, pageRows, type SnapshotListing } from './admin-fallback';
 import { DEFAULT_LIST_LIMIT, parseSandboxRef, publicSandboxIdFromAny } from './sandbox-id';
 import { mergeOperationPages, type SandboxDebug } from './sandbox-debug';
 import { parseSandboxListResponse, type SandboxListResponse } from './sandbox-list';
@@ -70,6 +71,8 @@ export async function getConsoleSandbox(id: string): Promise<Sandbox> {
 export interface AdminOperationRecord extends PublicOperationRecord {
   org_id: string | null;
   actor_user_id: string | null;
+  // Absent on releases that do not report it.
+  actor_email?: string | null;
   api_product: string | null;
   target_type: string | null;
   target_id: string | null;
@@ -127,7 +130,8 @@ export async function waitForPublicOperation(
       if (last.state === 'succeeded') {
         return last;
       }
-      throw new OperationFailedError(last.state, last.progress_message || `operation ${last.state}`);
+      const { reason, detail } = terminalErrorParts(last.terminal_error);
+      throw new OperationFailedError(last.state, last.progress_message || `operation ${last.state}`, reason, detail);
     }
     await new Promise((resolve) => setTimeout(resolve, OPERATION_POLL_INTERVAL_MS));
   }
@@ -148,7 +152,8 @@ export async function waitForAdminOperation(
       if (last.state === 'succeeded') {
         return last;
       }
-      throw new OperationFailedError(last.state, last.progress_message || `operation ${last.state}`);
+      const { reason, detail } = terminalErrorParts(last.terminal_error);
+      throw new OperationFailedError(last.state, last.progress_message || `operation ${last.state}`, reason, detail);
     }
     await new Promise((resolve) => setTimeout(resolve, OPERATION_POLL_INTERVAL_MS));
   }
@@ -261,3 +266,46 @@ export function publicSnapshotToConsoleSnapshot(snapshot: PublicSnapshot): Snaps
   };
 }
 
+
+const ADMIN_SNAPSHOT_PAGE_LIMIT = 1000;
+
+// Any sandbox's snapshots through the admin route, newest page first, up to
+// one full page.
+async function getAdminSnapshots(sandboxId: string): Promise<SnapshotInfo[]> {
+  const body = await adminApi.get<unknown>(
+    `/v1/sandboxes/${publicSandboxIdFromAny(sandboxId)}/snapshots?limit=${ADMIN_SNAPSHOT_PAGE_LIMIT}`,
+  );
+  return pageRows<PublicSnapshot>(body).rows.map(publicSnapshotToConsoleSnapshot);
+}
+
+// A sandbox's snapshots, and the route its rollback must use; see
+// `listSnapshotsWithFallback`. `ownOrg` says whether the public route may
+// serve this sandbox on releases without the admin list.
+export async function getConsoleSnapshots(
+  sandboxId: string,
+  { ownOrg }: { ownOrg: boolean },
+): Promise<SnapshotListing<SnapshotInfo>> {
+  return listSnapshotsWithFallback(
+    () => getAdminSnapshots(sandboxId),
+    ownOrg
+      ? async () => (await getPublicPage<PublicSnapshot>(`/sandboxes/${sandboxId}/snapshots`)).map(publicSnapshotToConsoleSnapshot)
+      : null,
+  );
+}
+
+// Roll back through the route the snapshots were listed from. The admin route
+// refuses unless snapshot rollback is enabled for the sandbox's organization,
+// with a 404 that says so.
+export async function rollbackConsoleSandbox(
+  sandboxId: string,
+  snapshotName: string,
+  via: 'admin' | 'public',
+): Promise<SandboxOperationResponse> {
+  const body = { snapshot_name: snapshotName, auto_restart: true };
+  if (via === 'public') return postPublicOperation(`/sandboxes/${sandboxId}:rollback`, body);
+  return adminApi.post<SandboxOperationResponse>(
+    `/v1/sandboxes/${publicSandboxIdFromAny(sandboxId)}:force-rollback`,
+    body,
+    { 'Idempotency-Key': idempotencyKey() },
+  );
+}

@@ -13,12 +13,41 @@ export class OperationTimeoutError extends Error {
 /** The operation reached a terminal state other than `succeeded`. */
 export class OperationFailedError extends Error {
   state: string;
+  // `terminal_error.reason` and `terminal_error.message`, when the record has them.
+  reason: string | null;
+  detail: string | null;
 
-  constructor(state: string, message: string) {
+  constructor(state: string, message: string, reason: string | null = null, detail: string | null = null) {
     super(message);
     this.name = 'OperationFailedError';
     this.state = state;
+    this.reason = reason;
+    this.detail = detail;
   }
+}
+
+// The create reasons the operation record names for a template the caller may
+// use but that cannot be resolved to a release. Releases without them report
+// the generic progress message, which this keeps.
+const CREATE_FAILURE_REASONS: Record<string, string> = {
+  template_has_no_release: 'the template has no published release; build it, or publish a release, first',
+  template_release_not_found: 'no release of the template matches the requested tag or digest and runtime',
+};
+
+export function createFailureText(err: OperationFailedError): string {
+  const reason = err.reason ? CREATE_FAILURE_REASONS[err.reason] : undefined;
+  if (!reason) return `Sandbox create ${err.state}: ${err.message}`;
+  return `Sandbox create ${err.state}: ${reason}${err.detail ? ` (${err.detail})` : ''}`;
+}
+
+// The reason and message of a failed operation record's `terminal_error`.
+export function terminalErrorParts(terminalError: unknown): { reason: string | null; detail: string | null } {
+  if (!terminalError || typeof terminalError !== 'object') return { reason: null, detail: null };
+  const { reason, message } = terminalError as { reason?: unknown; message?: unknown };
+  return {
+    reason: typeof reason === 'string' && reason ? reason : null,
+    detail: typeof message === 'string' && message ? message : null,
+  };
 }
 
 export type CreateOutcome = { type: 'success' | 'warning' | 'error'; text: string };
@@ -38,7 +67,7 @@ export async function settleAcceptedCreate(steps: {
       await steps.waitForCreate();
     } catch (err: any) {
       if (err instanceof OperationFailedError) {
-        return { type: 'error', text: `Sandbox create ${err.state}: ${err.message}` };
+        return { type: 'error', text: createFailureText(err) };
       }
       // Timed out, or polling itself failed: the create may still finish.
       return {

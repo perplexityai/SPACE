@@ -7,7 +7,8 @@ import { Alert, App, Button, Checkbox, Modal, Space, Table, Typography } from 'a
 import { ApiError, adminApi } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 import { idempotencyKey, postPublicOperation } from '@/lib/public-api';
-import { LATEST_TAG, errorMessage, shortHash } from '@/lib/template-format';
+import { LATEST_TAG, TAG_PRECONDITION_UNCHECKED, currentTagHolder, errorMessage, shortHash, tagMoveFailureMessage } from '@/lib/template-format';
+import { sendWithOptionalField } from '@/lib/admin-fallback';
 import type { TemplateBuildStart, TemplateBuildStatus, TemplateRelease } from '@/lib/types';
 import {
   BuildJob,
@@ -40,6 +41,7 @@ import {
   sandboxOutcomeNotice,
   storageKey,
   submitFailureText,
+  systemBuildIdempotencyKey,
   systemBuildRequest,
   testSandboxFailureText,
   testSandboxName,
@@ -329,7 +331,11 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
     if (!current || !canBuild(current, template)) return;
     const seedHash = template === 'code-runtime' && buildSucceeded(current.seed) ? current.seed.content_hash : undefined;
     try {
-      const accepted = await adminApi.post<TemplateBuildStart>(`/v1/system-templates/${template}/builds`, systemBuildRequest(template, seedHash));
+      const accepted = await adminApi.post<TemplateBuildStart>(
+        `/v1/system-templates/${template}/builds`,
+        systemBuildRequest(template, seedHash),
+        { 'Idempotency-Key': systemBuildIdempotencyKey(current.runId, template) },
+      );
       const job: BuildJob = { job_id: accepted.job_id, state: 'pending', content_hash: null, error: null, lost: false };
       const recorded = await exclusive(lockName, () => {
         const answer = acceptJob(live(current.runId), current.runId, template, job);
@@ -428,6 +434,7 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
     }
     const confirmed = saved.run;
     let requestError: string | null = null;
+    let preconditionUnchecked = false;
     for (const row of plan) {
       if (!live(confirmed.runId)) {
         requestError = 'the rebuild was dismissed in another tab';
@@ -439,13 +446,21 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
         break;
       }
       try {
-        await adminApi.put(`/v1/template-releases/${release.id}/tag`, { tag: LATEST_TAG });
+        // Moved only while `latest` still points where the plan read it.
+        const { fieldAccepted } = await sendWithOptionalField(
+          (body) => adminApi.put(`/v1/template-releases/${release.id}/tag`, body),
+          { tag: LATEST_TAG },
+          'expected_current_release_id',
+          currentTagHolder(fresh, row.template, LATEST_TAG),
+        );
+        if (!fieldAccepted) preconditionUnchecked = true;
       } catch (err) {
         // The tag route can commit and still answer an error: the read below decides.
-        requestError = `the ${row.template} tag request answered: ${errorMessage(err)}`;
+        requestError = `the ${row.template} tag request answered: ${tagMoveFailureMessage(err)}`;
         break;
       }
     }
+    if (preconditionUnchecked) message.warning(TAG_PRECONDITION_UNCHECKED);
     setPromote(null);
     // What moved is read back, not taken from the answers; the panel shows
     // it from the releases this refresh reads.

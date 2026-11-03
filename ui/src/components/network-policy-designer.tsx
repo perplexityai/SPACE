@@ -346,7 +346,7 @@ export function NetworkPolicyDetails({ policy }: { policy?: NetworkPolicyV1 | nu
   }
 
   return (
-    <Space direction="vertical" size={4} style={{ width: '100%' }}>
+    <Space orientation="vertical" size={4} style={{ width: '100%' }}>
       <Space size={4} wrap>
         <Text type="secondary">default</Text>
         <Tag color={decisionColor(policy.egress.default_action)}>
@@ -554,7 +554,7 @@ export default function NetworkPolicyDesigner({
       title: 'Match',
       width: 220,
       render: (_, rule) => (
-        <Space direction="vertical" size={0}>
+        <Space orientation="vertical" size={0}>
           <Text>{rule.pattern}</Text>
           <Text type="secondary" style={{ fontSize: 12 }}>{rule.matchKind}</Text>
         </Space>
@@ -585,7 +585,7 @@ export default function NetworkPolicyDesigner({
       open={open}
       onCancel={onClose}
       width={1040}
-      destroyOnClose
+      destroyOnHidden
       footer={[
         targetKind === 'sandbox' && !inherited ? (
           <Button key="clear" danger onClick={async () => {
@@ -611,7 +611,7 @@ export default function NetworkPolicyDesigner({
         </Button>,
       ]}
     >
-      <Space direction="vertical" size={16} style={{ width: '100%' }}>
+      <Space orientation="vertical" size={16} style={{ width: '100%' }}>
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
           <Tag icon={<BranchesOutlined />}>source: {source}</Tag>
           <Tag color={networkPolicyColor(effectivePolicy)}>
@@ -628,7 +628,7 @@ export default function NetworkPolicyDesigner({
             background: 'var(--ant-color-fill-tertiary)',
           }}
         >
-          <Space direction="vertical" size={6} style={{ width: '100%' }}>
+          <Space orientation="vertical" size={6} style={{ width: '100%' }}>
             <Text strong>
               <SafetyCertificateOutlined /> Platform guardrails
             </Text>
@@ -654,7 +654,7 @@ export default function NetworkPolicyDesigner({
           <div style={{ border: '1px solid var(--ant-color-border)', borderRadius: 8, padding: 16 }}>
             <Space align="start">
               {mode === 'open' ? <UnlockOutlined style={{ fontSize: 22 }} /> : mode === 'closed' ? <LockOutlined style={{ fontSize: 22 }} /> : <BranchesOutlined style={{ fontSize: 22 }} />}
-              <Space direction="vertical" size={4}>
+              <Space orientation="vertical" size={4}>
                 <Text strong>
                   {mode === 'inherit'
                     ? `Follow ${templateName || 'template'} network policy`
@@ -671,18 +671,18 @@ export default function NetworkPolicyDesigner({
             </Space>
           </div>
         ) : (
-          <Space direction="vertical" size={16} style={{ width: '100%' }}>
+          <Space orientation="vertical" size={16} style={{ width: '100%' }}>
             <Alert
               type="info"
               showIcon
-              message="Detailed policy"
+              title="Detailed policy"
               description="Allow and deny rules are enforced by SPACE. Ask-user decisions and scripts remain preview-only and are not saved in v1."
             />
             {validationErrors.length > 0 ? (
               <Alert
                 type="error"
                 showIcon
-                message="Invalid detailed policy"
+                title="Invalid detailed policy"
                 description={(
                   <ul style={{ margin: 0, paddingLeft: 18 }}>
                     {validationErrors.map((error) => (
@@ -695,7 +695,7 @@ export default function NetworkPolicyDesigner({
 
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
               <div style={{ border: '1px solid var(--ant-color-border)', borderRadius: 8, padding: 12 }}>
-                <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                <Space orientation="vertical" size={8} style={{ width: '100%' }}>
                   <Text strong><SafetyCertificateOutlined /> Default decision</Text>
                   <Select
                     value={defaultAction}
@@ -712,7 +712,7 @@ export default function NetworkPolicyDesigner({
               </div>
 
               <div style={{ border: '1px solid var(--ant-color-border)', borderRadius: 8, padding: 12 }}>
-                <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                <Space orientation="vertical" size={8} style={{ width: '100%' }}>
                   <Space style={{ justifyContent: 'space-between', width: '100%' }}>
                     <Text strong><ApiOutlined /> DNS resolver</Text>
                     <Switch
@@ -728,7 +728,7 @@ export default function NetworkPolicyDesigner({
             </div>
 
             <div style={{ border: '1px solid var(--ant-color-border)', borderRadius: 8, padding: 12 }}>
-              <Space direction="vertical" size={8} style={{ width: '100%' }}>
+              <Space orientation="vertical" size={8} style={{ width: '100%' }}>
                 <Text strong><ExperimentOutlined /> Policy test</Text>
                 <Input
                   value={probe}
@@ -769,7 +769,7 @@ export default function NetworkPolicyDesigner({
                   }}
                   locale={{
                     emptyText: (
-                      <Space direction="vertical" size={8}>
+                      <Space orientation="vertical" size={8}>
                         <Text type="secondary">No custom rules</Text>
                         <Button size="small" icon={<PlusOutlined />} onClick={addRule}>
                           Add rule
@@ -782,7 +782,7 @@ export default function NetworkPolicyDesigner({
 
               <div style={{ border: '1px solid var(--ant-color-border)', borderRadius: 8, padding: 12 }}>
                 {selectedRule ? (
-                  <Space direction="vertical" size={10} style={{ width: '100%' }}>
+                  <Space orientation="vertical" size={10} style={{ width: '100%' }}>
                     <Space style={{ justifyContent: 'space-between', width: '100%' }}>
                       <Text strong>Rule editor</Text>
                       <Tooltip title="Delete rule">
@@ -835,7 +835,7 @@ export default function NetworkPolicyDesigner({
                     />
                   </Space>
                 ) : (
-                  <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                  <Space orientation="vertical" size={8} style={{ width: '100%' }}>
                     <Text type="secondary">Add a rule to edit match criteria.</Text>
                     <Button icon={<PlusOutlined />} onClick={addRule}>Add rule</Button>
                   </Space>
@@ -847,7 +847,7 @@ export default function NetworkPolicyDesigner({
 
             <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 320px', gap: 12 }}>
               <div style={{ border: '1px solid var(--ant-color-border)', borderRadius: 8, padding: 12 }}>
-                <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                <Space orientation="vertical" size={8} style={{ width: '100%' }}>
                   <Text strong><CodeOutlined /> WASM decision script</Text>
                   <TextArea
                     value={DEFAULT_PREVIEW_CODE}
@@ -860,7 +860,7 @@ export default function NetworkPolicyDesigner({
               </div>
 
               <div style={{ border: '1px solid var(--ant-color-border)', borderRadius: 8, padding: 12 }}>
-                <Space direction="vertical" size={10} style={{ width: '100%' }}>
+                <Space orientation="vertical" size={10} style={{ width: '100%' }}>
                   <Text strong><QuestionCircleOutlined /> Ask-user prompt</Text>
                   <Text>75588b18 wants to connect to wallet.bitcoin.com:443</Text>
                   <Tag>rule: *.bitcoin.com</Tag>

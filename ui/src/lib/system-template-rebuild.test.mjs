@@ -20,6 +20,7 @@ import {
   sandboxOutcomeNotice,
   storageKey,
   submitFailureText,
+  systemBuildIdempotencyKey,
   systemBuildRequest,
   testSandboxFailureText,
   withJob,
@@ -234,4 +235,26 @@ test('a stored value in any shape this page does not write is ignored', () => {
     JSON.stringify({ ...run, submitUnknown: { other: 'x' } }),
   ];
   for (const raw of variants) assert.equal(parseStoredRun(raw, ids, at), null, raw);
+});
+
+test("a build's Idempotency-Key is the same for the run and template, and differs otherwise", () => {
+  assert.equal(systemBuildIdempotencyKey('run-1', 'seed'), systemBuildIdempotencyKey('run-1', 'seed'));
+  assert.notEqual(systemBuildIdempotencyKey('run-1', 'seed'), systemBuildIdempotencyKey('run-1', 'code-runtime'));
+  assert.notEqual(systemBuildIdempotencyKey('run-1', 'seed'), systemBuildIdempotencyKey('run-2', 'seed'));
+});
+
+test('a 409 about an earlier request with the same key is not a refusal: the build may be running', () => {
+  const pending = Object.assign(new Error('a build with this Idempotency-Key may still be being submitted; retry shortly'), {
+    status: 409,
+    body: { code: 'conflict', message: 'x', retryable: true, details: [{ key: 'reserved_at', value: '2026-11-03T05:00:00Z' }] },
+  });
+  const outcome = submitFailureText('seed', pending);
+  assert.equal(outcome.known, false);
+  assert.match(outcome.text, /may already be running: a build with this Idempotency-Key/);
+  // The same key with another body is a refusal.
+  const reused = Object.assign(new Error('idempotency key was already used with a different request'), {
+    status: 409,
+    body: { code: 'conflict', message: 'x', retryable: false, details: [] },
+  });
+  assert.equal(submitFailureText('seed', reused).known, true);
 });

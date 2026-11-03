@@ -11,7 +11,15 @@ const AUTH_BASE = '/auth/v1';
 const ADMIN_BASE = '/admin/api';
 
 export class ApiError extends Error {
-  constructor(public status: number, message: string) {
+  // `body` is the parsed JSON error body, or null when it was not JSON;
+  // `text` is the raw body. Axum answers a body it cannot deserialize (an
+  // unknown field, for one) with a 422 in plain text.
+  constructor(
+    public status: number,
+    message: string,
+    public body: Record<string, unknown> | null = null,
+    public text: string = '',
+  ) {
     super(message);
   }
 }
@@ -78,11 +86,23 @@ async function responseOnce(
   }
 
   if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
+    const text = await res.text().catch(() => '');
+    let parsed: unknown = null;
+    try {
+      parsed = text ? JSON.parse(text) : null;
+    } catch {
+      parsed = null;
+    }
+    const body = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
     // Admin handlers return `{ error }`; the public API envelope returns
     // `{ message }`. Prefer whichever is present so the real cause surfaces
     // instead of a generic "Request failed".
-    throw new ApiError(res.status, body.error || body.message || 'Request failed');
+    const message = (typeof body?.error === 'string' && body.error)
+      || (typeof body?.message === 'string' && body.message)
+      || 'Request failed';
+    throw new ApiError(res.status, message, body, text);
   }
 
   return res;

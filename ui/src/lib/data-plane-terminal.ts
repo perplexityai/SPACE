@@ -1,4 +1,6 @@
-import { api } from '@/lib/api';
+import { adminApi, api } from '@/lib/api';
+import { isMissingRoute } from '@/lib/admin-fallback';
+import { publicSandboxIdFromAny } from '@/lib/sandbox-id';
 
 type DataPlaneAttachInfo = {
   url: string;
@@ -45,7 +47,14 @@ export type TerminalConnection = {
 type TerminalOptions = {
   cols: number;
   rows: number;
+  // The sandbox belongs to the signed-in operator's organization, which the
+  // public route serves; any other organization's goes through the admin
+  // route, which opens the session under the sandbox's own organization.
+  ownOrg: boolean;
 };
+
+export const TERMINAL_OTHER_ORG_UNSUPPORTED =
+  "This API release opens terminals only in your organization's sandboxes; another organization's needs a newer API release.";
 
 function idempotencyKey(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -87,16 +96,29 @@ export async function openSandboxTerminal(
   onEvent: (event: TerminalSessionEvent) => void,
   options: TerminalOptions,
 ): Promise<TerminalConnection> {
-  const session = await api.post<PublicSession>(
-    `/sandboxes/${sandboxId}/terminal-sessions`,
-    {
-      command: [],
-      cwd: null,
-      env: {},
-      size: { cols: options.cols, rows: options.rows },
-    },
-    { 'Idempotency-Key': idempotencyKey() },
-  );
+  const body = {
+    command: [],
+    cwd: null,
+    env: {},
+    size: { cols: options.cols, rows: options.rows },
+  };
+  const headers = { 'Idempotency-Key': idempotencyKey() };
+  let session: PublicSession;
+  if (options.ownOrg) {
+    session = await api.post<PublicSession>(`/sandboxes/${sandboxId}/terminal-sessions`, body, headers);
+  } else {
+    try {
+      session = await adminApi.post<PublicSession>(
+        `/v1/sandboxes/${publicSandboxIdFromAny(sandboxId)}/terminal-sessions`,
+        body,
+        headers,
+      );
+    } catch (err) {
+      // Releases without the admin terminal route.
+      if (isMissingRoute(err)) throw new Error(TERMINAL_OTHER_ORG_UNSUPPORTED);
+      throw err;
+    }
+  }
 
   const attach = session.attach;
   if (!attach?.url || !attach.token) {

@@ -19,10 +19,12 @@ import {
   TemplateRelease,
   TemplateReleaseWarmPool,
   TemplateOperationResponse,
+  TemplateBuildListEntry,
   Sandbox,
 } from '@/lib/types';
 import { tablePagination } from '@/lib/table-pagination';
-import { LATEST_TAG as DEFAULT_TEMPLATE_TAG, errorMessage, shortHash } from '@/lib/template-format';
+import { LATEST_TAG as DEFAULT_TEMPLATE_TAG, TAG_PRECONDITION_UNCHECKED, currentTagHolder, errorMessage, shortHash, tagMoveFailureMessage } from '@/lib/template-format';
+import { isMissingRoute, pageRows, sendWithOptionalField } from '@/lib/admin-fallback';
 import { SPACED_SAMPLE_LIMIT, SpacedCounts, loadSpacedCounts, spacedCoverage } from '@/lib/spaced-counts';
 import SystemTemplateRebuild from './system-template-rebuild';
 import {
@@ -153,7 +155,7 @@ function sizeTooltipLines(values: {
   artifact_size_bytes?: number | null;
 }) {
   return (
-    <Space direction="vertical" size={0}>
+    <Space orientation="vertical" size={0}>
       <span>Sandbox disk: {formatDiskSize(values.disk_size_mb)}</span>
       {values.cache_size_bytes !== null && values.cache_size_bytes !== undefined ? (
         <span>Rootfs allocated: {formatBytes(values.cache_size_bytes)}</span>
@@ -315,7 +317,7 @@ function matchesWarmPoolFilter(pools: TemplateReleaseWarmPool[], filter: string)
 
 function warmPoolTooltip(pool: TemplateReleaseWarmPool, diskCapacityEnabled: boolean) {
   return (
-    <Space direction="vertical" size={0}>
+    <Space orientation="vertical" size={0}>
       <span>Owner: {pool.managed_by}</span>
       <span>Shape: {pool.vcpu}c / {pool.memory_mib} MiB</span>
       {diskCapacityEnabled ? (
@@ -333,7 +335,7 @@ function warmPoolTooltip(pool: TemplateReleaseWarmPool, diskCapacityEnabled: boo
 
 function baseSnapshotTooltip(template: Template, desired: boolean) {
   return (
-    <Space direction="vertical" size={0}>
+    <Space orientation="vertical" size={0}>
       <span>Desired: {desired ? 'enabled' : 'disabled'}</span>
       <span>Observed: {template.has_base_snapshot ? 'ready' : 'not ready'}</span>
     </Space>
@@ -343,6 +345,115 @@ function baseSnapshotTooltip(template: Template, desired: boolean) {
 function hasAutoLifecyclePolicy(policy: Template['default_auto_lifecycle']) {
   return JSON.stringify(policy ?? disabledAutoLifecycle()) !== JSON.stringify(disabledAutoLifecycle());
 }
+
+const TEMPLATE_BUILDS_LIMIT = 20;
+
+// The template's newest builds, from `GET /templates/{name}/builds`. Releases
+// that predate the route answer 405 (the path is POST-only there).
+function TemplateBuildsPanel({ templateName }: { templateName: string }) {
+  const { token } = theme.useToken();
+  const [builds, setBuilds] = useState<TemplateBuildListEntry[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [unsupported, setUnsupported] = useState(false);
+
+  const load = () => {
+    setBuilds(null);
+    setError(null);
+    adminApi
+      .get<unknown>(`/v1/templates/${encodedPathSegment(templateName)}/builds?limit=${TEMPLATE_BUILDS_LIMIT}`)
+      .then((body) => setBuilds(pageRows<TemplateBuildListEntry>(body).rows))
+      .catch((err: unknown) => {
+        if (isMissingRoute(err)) setUnsupported(true);
+        else setError(errorMessage(err));
+        setBuilds([]);
+      });
+  };
+
+  useEffect(load, [templateName]);
+
+  if (unsupported) {
+    return <Text type="secondary">This API release does not list a template&apos;s builds.</Text>;
+  }
+
+  return (
+    <div>
+      <Text strong>Builds</Text>
+      {error ? (
+        <Alert
+          type="error"
+          showIcon
+          title={`Could not load builds: ${error}`}
+          action={<Button size="small" onClick={load}>Retry</Button>}
+          style={{ margin: '8px 0' }}
+        />
+      ) : null}
+      <Table<TemplateBuildListEntry>
+        size="small"
+        rowKey="job_id"
+        loading={builds === null}
+        dataSource={builds ?? []}
+        pagination={false}
+        style={{ marginTop: 8 }}
+        locale={{ emptyText: error ? 'Not loaded' : 'No builds recorded' }}
+        columns={[
+          {
+            title: 'Created',
+            dataIndex: 'created_at',
+            width: 190,
+            render: (value: string) => new Date(value).toLocaleString(),
+          },
+          {
+            title: 'State',
+            dataIndex: 'state',
+            width: 130,
+            render: (state: TemplateBuildListEntry['state'], row) => state
+              ? <Tag color={TEMPLATE_BUILD_STATE_COLORS[state] ?? 'default'}>{state.replace(/_/g, ' ')}</Tag>
+              : (
+                <Tooltip title={row.status_error ?? undefined}>
+                  <Tag>unknown</Tag>
+                </Tooltip>
+              ),
+          },
+          {
+            title: 'Content hash',
+            dataIndex: 'content_hash',
+            width: 140,
+            render: (hash: string | null) => hash
+              ? <Tooltip title={hash}><Text code>{shortHash(hash)}</Text></Tooltip>
+              : <Text type="secondary">—</Text>,
+          },
+          {
+            title: 'Error',
+            render: (_, row) => (
+              <Space orientation="vertical" size={0}>
+                {row.error ? <Text type="danger">{row.error}</Text> : null}
+                {row.status_error ? (
+                  <Text style={{ color: token.colorTextTertiary }}>Status not read: {row.status_error}</Text>
+                ) : null}
+                {!row.error && !row.status_error ? <Text type="secondary">—</Text> : null}
+              </Space>
+            ),
+          },
+          {
+            title: 'Job',
+            dataIndex: 'job_id',
+            width: 140,
+            render: (jobId: string) => <Text code copyable={{ text: jobId }}>{jobId.slice(0, 8)}</Text>,
+          },
+        ]}
+      />
+    </div>
+  );
+}
+
+const TEMPLATE_BUILD_STATE_COLORS: Record<string, string> = {
+  pending: 'default',
+  running: 'processing',
+  succeeded: 'success',
+  failed: 'error',
+  publish_failed: 'error',
+  unspecified: 'default',
+};
 
 function PoolSandboxesPanel({ templateName }: { templateName: string }) {
   const { message } = App.useApp();
@@ -824,15 +935,21 @@ export default function TemplatesPage() {
     const release = retagModal.release;
     if (!release || !canManageTemplateReleases) return;
 
+    const tag = values.tag.trim();
     try {
-      await adminApi.put(`/v1/template-releases/${release.id}/tag`, {
-        tag: values.tag.trim(),
-      });
+      // Moved only while the tag still points where this page read it.
+      const { fieldAccepted } = await sendWithOptionalField(
+        (body) => adminApi.put(`/v1/template-releases/${release.id}/tag`, body),
+        { tag },
+        'expected_current_release_id',
+        currentTagHolder(templateReleases, release.template_name, tag),
+      );
       closeRetagModal();
       await refreshTemplateReleases({ showLoading: false });
-      message.success('Template release tag updated');
+      if (fieldAccepted) message.success('Template release tag updated');
+      else message.warning(`Template release tag updated. ${TAG_PRECONDITION_UNCHECKED}`);
     } catch (err: unknown) {
-      message.error(errorMessage(err));
+      message.error(tagMoveFailureMessage(err));
     }
   };
 
@@ -1626,7 +1743,7 @@ export default function TemplatesPage() {
       title: 'Shape',
       width: 135,
       render: (_, record) => (
-        <Space direction="vertical" size={0}>
+        <Space orientation="vertical" size={0}>
           <span>{record.vcpu}c / {record.memory_mib} MiB</span>
           {warmPoolPolicyCapabilities.disk_capacity ? (
             <Text type="secondary">
@@ -1997,32 +2114,34 @@ export default function TemplatesPage() {
         loading={loadingTemplates}
         size="small"
         pagination={tablePagination('templates')}
-        scroll={{ x: isDirectSubstrate ? 1180 : 1000 }}
-        expandable={isDirectSubstrate ? {
+        scroll={{ x: isDirectSubstrate ? 1180 : 1034 }}
+        expandable={{
           expandedRowKeys: expandedTemplateRows,
           onExpandedRowsChange: (keys) => setExpandedTemplateRows(keys.map(String)),
-          expandedRowRender: (record) => <PoolSandboxesPanel templateName={record.name} />,
-          rowExpandable: hasObservedPoolSandboxes,
+          expandedRowRender: (record) => (
+            <Space orientation="vertical" size={12} style={{ width: '100%' }}>
+              <TemplateBuildsPanel templateName={record.name} />
+              {isDirectSubstrate && hasObservedPoolSandboxes(record) ? <PoolSandboxesPanel templateName={record.name} /> : null}
+            </Space>
+          ),
           columnWidth: 34,
           fixed: 'left',
-          expandIcon: ({ expanded, expandable, onExpand, record }) => {
-            if (!expandable) {
-              return <span style={{ display: 'inline-block', width: 22 }} />;
-            }
+          expandIcon: ({ expanded, onExpand, record }) => {
+            const what = isDirectSubstrate && hasObservedPoolSandboxes(record) ? 'builds and pool sandboxes' : 'builds';
             return (
-              <Tooltip title={expanded ? 'Hide pool sandboxes' : 'Show pool sandboxes'}>
+              <Tooltip title={expanded ? `Hide ${what}` : `Show ${what}`}>
                 <Button
                   type="text"
                   size="small"
                   icon={expanded ? <DownOutlined /> : <RightOutlined />}
-                  aria-label={expanded ? 'Collapse pool sandboxes' : 'Expand pool sandboxes'}
+                  aria-label={expanded ? `Collapse ${what}` : `Expand ${what}`}
                   onClick={(event) => onExpand(record, event)}
                   style={{ width: 22, height: 22, minWidth: 22, padding: 0 }}
                 />
               </Tooltip>
             );
           },
-        } : undefined}
+        }}
       />
 
       {canAdminTemplates ? (
@@ -2237,7 +2356,7 @@ export default function TemplatesPage() {
           <Form.Item name="enabled" label="Enabled" valuePropName="checked">
             <Switch />
           </Form.Item>
-          <Space direction="vertical" size={4}>
+          <Space orientation="vertical" size={4}>
             <Text type="secondary">
               Each retained release receives the configured minimum ready slots before demand.
             </Text>
@@ -2265,7 +2384,7 @@ export default function TemplatesPage() {
           >
             <Input placeholder={DEFAULT_TEMPLATE_TAG} />
           </Form.Item>
-          <Space direction="vertical" size={4}>
+          <Space orientation="vertical" size={4}>
             <Text type="secondary">
               If this tag already exists for the template, it will move to this release.
             </Text>

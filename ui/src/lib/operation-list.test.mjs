@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { mergeNewest, newerFirst, sandboxTargetForms } from './operation-list.ts';
+import { actorsToLookUp, mergeNewest, newerFirst, sandboxTargetForms } from './operation-list.ts';
 
 const op = (id, created_at) => ({ id, created_at });
 
@@ -51,4 +51,18 @@ test('a target that is not a sandbox UUID is searched as typed', () => {
   assert.equal(sandboxTargetForms('tpl_seed'), null);
   assert.equal(sandboxTargetForms('0190a1b2'), null);
   assert.equal(sandboxTargetForms('sbx_0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5'), null);
+});
+
+test("an actor is looked up only on rows from a release that does not report the actor's email", () => {
+  assert.deepEqual(
+    actorsToLookUp([
+      { actor_user_id: 'u1' },
+      { actor_user_id: 'u1' },
+      { actor_user_id: 'u2', actor_email: 'two@example.test' },
+      // The field present as null: the user is gone, and a lookup would fail too.
+      { actor_user_id: 'u3', actor_email: null },
+      { actor_user_id: null },
+    ]),
+    ['u1'],
+  );
 });

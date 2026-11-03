@@ -14,3 +14,8 @@ export function isHiddenOperationError(err: unknown): boolean {
     (status === 400 && message === 'invalid sandbox action')
   );
 }
+
+// An API release without the admin snapshot list serves snapshots only for
+// the signed-in operator's own organization.
+export const SNAPSHOTS_OTHER_ORG_UNSUPPORTED =
+  "This API release lists snapshots only for your organization's sandboxes.";

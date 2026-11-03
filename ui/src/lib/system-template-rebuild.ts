@@ -224,14 +224,35 @@ function failure(err: unknown): { status: number | null; message: string } {
 }
 const refused = (status: number | null) => status !== null && status >= 400 && status < 500;
 
+// The build's Idempotency-Key: one per run and template, so building again
+// after an unknown outcome resends the same key. A release that honours it
+// answers with the first build instead of starting a second; older releases
+// ignore the header.
+export function systemBuildIdempotencyKey(runId: string, template: SystemTemplate): string {
+  return `system-build:${runId}:${template}`;
+}
+
+// A 409 that names `reserved_at` is about an earlier request with the same
+// Idempotency-Key whose build may be running (still being submitted, or its
+// outcome unknown), not a refusal.
+function sameKeyStillOpen(err: unknown): boolean {
+  const body = (err as { body?: unknown })?.body;
+  const details = body && typeof body === 'object' ? (body as { details?: unknown }).details : null;
+  return Array.isArray(details) && details.some((detail) => (detail as { key?: unknown })?.key === 'reserved_at');
+}
+
 export function submitFailureText(template: SystemTemplate, err: unknown): { known: boolean; text: string } {
   const { status, message } = failure(err);
+  if (status === 409 && sameKeyStillOpen(err)) {
+    return { known: false, text: `The ${template} build may already be running: ${message}` };
+  }
   if (refused(status)) return { known: true, text: `The ${template} build was not started: ${message}` };
   return {
     known: false,
     text: `The ${template} build request failed (${message}), and the builder may have accepted it. An accepted build ` +
-      'appears in Template Releases only when it finishes, and building again starts a second job: wait, refresh ' +
-      'Template Releases, and build again only if no new release appears.',
+      'appears in Template Releases only when it finishes. Building again resends this request, which an API release ' +
+      'that honours its Idempotency-Key answers with the first build; an older release starts a second job: wait, ' +
+      'refresh Template Releases, and build again only if no new release appears.',
   };
 }
 

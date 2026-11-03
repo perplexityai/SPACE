@@ -54,19 +54,18 @@ import {
   forceConsoleSandboxAction,
   forceDeleteConsoleSandbox,
   getConsoleSandbox,
+  getConsoleSnapshots,
   getPublicPage,
   getSandboxDebug,
   getSandboxOperations,
   type AdminOperationRecord,
-  publicSnapshotToConsoleSnapshot,
   publicTemplateToConsoleTemplate,
-  postPublicOperation,
+  rollbackConsoleSandbox,
   updateConsoleSandbox,
   waitForAdminOperation,
 } from '@/lib/public-api';
 import type {
   NetworkPolicyV1,
-  PublicSnapshot,
   PublicTemplate,
   Sandbox,
   SnapshotInfo,
@@ -74,8 +73,8 @@ import type {
 } from '@/lib/types';
 import { tablePagination } from '@/lib/table-pagination';
 import { useAuth } from '@/lib/auth';
-import { formatAge, formatBytes, sectionData, sectionError, type DebugSnapshot } from '@/lib/sandbox-debug';
-import { OperationsCard, OrgLink, PlacementCard, ResourcesCard, TimelineCard, UserLink, type DebugView } from './sandbox-insight';
+import { formatAge, formatBytes, sectionData, sectionError, snapshotKey, snapshotStorageById, snapshotStorageLabel, type DebugSnapshot } from '@/lib/sandbox-debug';
+import { OperationsCard, OrgLink, PlacementCard, QuarantineCard, ResourcesCard, TimelineCard, UserLink, type DebugView } from './sandbox-insight';
 import NetworkPolicyDesigner, {
   compactNetworkPolicyLabel,
   NetworkPolicyDetails,
@@ -321,7 +320,7 @@ function templateDisplay(sandbox: Sandbox) {
   if (!sandbox.template) return '—';
   const contentHash = sandboxTemplateHash(sandbox);
   return (
-    <Space direction="vertical" size={0} style={{ maxWidth: '100%' }}>
+    <Space orientation="vertical" size={0} style={{ maxWidth: '100%' }}>
       <span>{sandbox.template}</span>
       {contentHash ? (
         <Text
@@ -383,9 +382,10 @@ function snapshotCodec(type: string): { label: string; color: string } {
   return { label: type || '—', color: 'default' };
 }
 
-// The public snapshot routes are org-scoped hidden operations; when they are
-// unavailable (another org's sandbox, or not enabled), list the snapshots the
-// admin debug route reports, without rollback.
+// When no snapshot API serves the sandbox (snapshot operations not enabled for
+// the operator's organization, or another organization's sandbox on a release
+// without the admin snapshot list), list the snapshots the admin debug route
+// reports, without rollback.
 function AdminSnapshotsTable({
   snapshots,
   error,
@@ -412,6 +412,7 @@ function AdminSnapshotsTable({
     { title: 'Age', dataIndex: 'timestamp', width: 90, render: (v: string) => <Tooltip title={v}>{formatAge(v, nowMs)}</Tooltip> },
     { title: 'Size', dataIndex: 'size_bytes', width: 100, render: (v: number | null) => formatBytes(v) },
     { title: 'Tier', dataIndex: 'retention_tier', width: 90, render: (v: string | null) => v || '—' },
+    { title: 'Storage', dataIndex: 'storage', width: 200, render: (v: DebugSnapshot['storage']) => snapshotStorageLabel(v) ?? '' },
     { title: 'Failure', dataIndex: 'failure_reason', render: (v: string | null) => (v ? <Text type="danger">{v}</Text> : '—') },
   ];
   return (
@@ -458,7 +459,9 @@ function SnapshotsCard({
   const { token } = theme.useToken();
   const [snapshots, setSnapshots] = useState<SnapshotInfo[]>([]);
   const [loading, setLoading] = useState(true);
-  const [snapshotsOff, setSnapshotsOff] = useState(foreignOrg);
+  const [snapshotsOff, setSnapshotsOff] = useState(false);
+  // The route the shown listing came from, which its rollback must use.
+  const [rollbackVia, setRollbackVia] = useState<'admin' | 'public' | null>(null);
   const [listingError, setListingError] = useState<string | null>(null);
   // When the shown listing loaded, while a later listing has failed.
   const [staleSince, setStaleSince] = useState<number | null>(null);
@@ -470,20 +473,25 @@ function SnapshotsCard({
   const listedAt = useRef<number | null>(null);
   const refresh = (background = false) => {
     const request = ++listingRequest.current;
-    if (foreignOrg) {
-      setSnapshotsOff(true);
-      setLoading(false);
-      return;
-    }
     if (!background) setLoading(true);
-    getPublicPage<PublicSnapshot>(`/sandboxes/${sandboxId}/snapshots`)
-      .then((items) => {
+    getConsoleSnapshots(sandboxId, { ownOrg: !foreignOrg })
+      .then((listing) => {
         if (request !== listingRequest.current) return;
+        // Another organization's sandbox on a release without the admin
+        // list: the admin view below lists its snapshots, without rollback.
+        if (listing.via === 'none') {
+          listedAt.current = null;
+          setSnapshotsOff(true);
+          setListingError(null);
+          setStaleSince(null);
+          return;
+        }
         listedAt.current = Date.now();
         setSnapshotsOff(false);
         setListingError(null);
         setStaleSince(null);
-        setSnapshots(items.map(publicSnapshotToConsoleSnapshot));
+        setRollbackVia(listing.via);
+        setSnapshots(listing.rows);
       })
       .catch((err: any) => {
         if (request !== listingRequest.current) return;
@@ -525,21 +533,23 @@ function SnapshotsCard({
   }, [reloadKey]);
 
   const handleRollback = async (snapshotName: string) => {
+    if (!rollbackVia) return;
     try {
-      await postPublicOperation(`/sandboxes/${sandboxId}:rollback`, {
-        snapshot_name: snapshotName,
-        auto_restart: true,
-      });
+      await rollbackConsoleSandbox(sandboxId, snapshotName, rollbackVia);
       message.success('Snapshot rollback queued');
     } catch (err: any) {
-      if (isHiddenOperationError(err)) {
+      if (rollbackVia === 'public' && isHiddenOperationError(err)) {
         setRollbackOff(true);
         message.info(ROLLBACK_NOT_ENABLED);
         return;
       }
+      // The admin route's refusal names its cause ("rollback is not enabled
+      // for the sandbox's organization"); show it as it is.
       message.error(err.message || 'failed to queue rollback');
     }
   };
+
+  const storageById = snapshotStorageById(sectionData(debug?.snapshots)?.snapshots ?? []);
 
   const totalBytes = snapshots.reduce((acc, s) => acc + (s.size_bytes || 0), 0);
 
@@ -554,6 +564,10 @@ function SnapshotsCard({
     },
     { title: 'Timestamp', dataIndex: 'timestamp', width: 200, render: (v: string | null) => v ?? '—' },
     { title: 'Size', dataIndex: 'size_bytes', width: 100, render: (v: number) => formatBytes(v) },
+    {
+      title: 'Storage', width: 220,
+      render: (_, record) => snapshotStorageLabel(storageById.get(snapshotKey(record.id))) ?? '',
+    },
   ];
   const rollbackColumns: ColumnsType<SnapshotInfo> = rollbackOff ? [] : [
     {
@@ -582,7 +596,7 @@ function SnapshotsCard({
           listingError ? null : (
             <Text type="secondary" style={{ fontSize: 12 }}>
               {foreignOrg
-                ? 'Rollback unavailable: this sandbox belongs to another organization'
+                ? "Rollback unavailable: this API release rolls back only your organization's sandboxes"
                 : 'Rollback unavailable: snapshot operations are not enabled for this organization'}
             </Text>
           )
@@ -677,7 +691,7 @@ function ExecCard({ sandbox }: { sandbox: Sandbox }) {
         </Text>
       )}
     >
-      <Space direction="vertical" style={{ width: '100%' }} size={8}>
+      <Space orientation="vertical" style={{ width: '100%' }} size={8}>
         <Input.TextArea
           value={command}
           onChange={(e) => setCommand(e.target.value)}
@@ -756,7 +770,7 @@ type TerminalLine = {
   text: string;
 };
 
-function TerminalCard({ sandbox }: { sandbox: Sandbox }) {
+function TerminalCard({ sandbox, ownOrg }: { sandbox: Sandbox; ownOrg: boolean }) {
   const { token } = theme.useToken();
   const [status, setStatus] = useState<TerminalStatus>('disconnected');
   const [input, setInput] = useState('');
@@ -834,6 +848,7 @@ function TerminalCard({ sandbox }: { sandbox: Sandbox }) {
       const connection = await openSandboxTerminal(sandbox.id, handleTerminalEvent, {
         cols: 100,
         rows: 30,
+        ownOrg,
       });
       connectionRef.current = connection;
       setSessionId(connection.sessionId);
@@ -903,7 +918,7 @@ function TerminalCard({ sandbox }: { sandbox: Sandbox }) {
       )}
     >
       <div style={{ position: 'relative' }}>
-        <Space direction="vertical" style={{ width: '100%' }} size={8}>
+        <Space orientation="vertical" style={{ width: '100%' }} size={8}>
           <pre
             ref={outputRef}
             style={{
@@ -936,27 +951,29 @@ function TerminalCard({ sandbox }: { sandbox: Sandbox }) {
               </span>
             ))}
           </pre>
-          <Input
-            value={input}
-            onChange={(event) => setInput(event.target.value)}
-            onPressEnter={(event) => {
-              event.preventDefault();
-              sendInput();
-            }}
-            disabled={!attached || !terminalEnabled}
-            placeholder="Type shell input and press Enter"
-            addonBefore="$"
-            suffix={(
-              <Button
-                type="text"
-                size="small"
-                icon={<SendOutlined />}
-                disabled={!attached || !terminalEnabled || !input}
-                onClick={sendInput}
-                aria-label="Send terminal input"
-              />
-            )}
-          />
+          <Space.Compact block>
+            <Space.Addon>$</Space.Addon>
+            <Input
+              value={input}
+              onChange={(event) => setInput(event.target.value)}
+              onPressEnter={(event) => {
+                event.preventDefault();
+                sendInput();
+              }}
+              disabled={!attached || !terminalEnabled}
+              placeholder="Type shell input and press Enter"
+              suffix={(
+                <Button
+                  type="text"
+                  size="small"
+                  icon={<SendOutlined />}
+                  disabled={!attached || !terminalEnabled || !input}
+                  onClick={sendInput}
+                  aria-label="Send terminal input"
+                />
+              )}
+            />
+          </Space.Compact>
         </Space>
         {!versionStatus.supported ? (
           <div
@@ -1368,7 +1385,7 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
 
   return (
     <div>
-      <Space direction="vertical" size={16} style={{ width: '100%' }}>
+      <Space orientation="vertical" size={16} style={{ width: '100%' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
           <Link href="/dashboard/sandboxes"><ArrowLeftOutlined /> Sandboxes</Link>
           <Title level={3} style={{ margin: 0 }}>
@@ -1459,6 +1476,8 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
 
         <PlacementCard view={debugView} nowMs={nowMs} />
 
+        <QuarantineCard view={debugView} nowMs={nowMs} />
+
         <TimelineCard view={debugView} nowMs={nowMs} />
 
         <OperationsCard
@@ -1546,7 +1565,7 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
 
         <ExecCard sandbox={sandbox} />
 
-        <TerminalCard sandbox={sandbox} />
+        <TerminalCard sandbox={sandbox} ownOrg={!authOrg || !sandbox.org_id || sandbox.org_id === authOrg.id} />
 
       </Space>
 

@@ -13,6 +13,8 @@ import Link from 'next/link';
 import { Alert, Card, Table, Typography, Form, Input, Button, App, Descriptions, Space, Switch, Tag } from 'antd';
 import { LockOutlined, SaveOutlined } from '@ant-design/icons';
 import { roleLabels } from '@/lib/userRoles';
+import { brandingRefusal } from '@/lib/org-branding';
+import { apiKeyColumns } from '@/components/api-key-columns';
 import type { ColumnsType } from 'antd/es/table';
 
 const { Title } = Typography;
@@ -53,7 +55,11 @@ export default function OrgDetailPage() {
   const [loadError, setLoadError] = useState<LoadFailure | null>(null);
   const [attempt, setAttempt] = useState(0);
   const [saving, setSaving] = useState(false);
+  const [brandingError, setBrandingError] = useState<string | null>(null);
   const [form] = Form.useForm();
+  // The swatches follow the typed values.
+  const themePrimary = Form.useWatch('theme_primary', form);
+  const themeSecondary = Form.useWatch('theme_secondary', form);
 
   const errorText = (err: unknown, fallback: string) => (err instanceof Error && err.message ? err.message : fallback);
 
@@ -120,9 +126,17 @@ export default function OrgDetailPage() {
       if (authOrg && updated.id === authOrg.id) {
         refreshOrg(updated);
       }
+      setBrandingError(null);
       message.success('Branding saved');
     } catch (err) {
-      message.error(err instanceof Error ? err.message : 'Failed to save branding');
+      // Releases that validate branding answer a 400 naming the field.
+      const refusal = brandingRefusal(err);
+      if (refusal) {
+        setBrandingError(refusal.message);
+        if (refusal.field) form.setFields([{ name: refusal.field, errors: [refusal.message] }]);
+      } else {
+        message.error(err instanceof Error ? err.message : 'Failed to save branding');
+      }
     } finally {
       setSaving(false);
     }
@@ -275,37 +289,50 @@ export default function OrgDetailPage() {
           loading={apiKeys === null && !apiKeysError}
           pagination={false}
           locale={{ emptyText: apiKeysError ? 'Not loaded' : 'No API keys' }}
-          columns={[
-            { title: 'Name', dataIndex: 'name' },
-            { title: 'Key ID', dataIndex: 'id', render: (v: string) => <Typography.Text code copyable>{v}</Typography.Text> },
-            { title: 'Allowed APIs', dataIndex: 'allowed_surfaces', render: (v: string[]) => v.map((surface) => <Tag key={surface}>{surface === 'native' ? 'SPACE' : 'E2B-compatible'}</Tag>) },
-            { title: 'Creator', dataIndex: 'created_by_email', render: (v: string | null) => v || '—' },
-            { title: 'Created', dataIndex: 'created_at', width: 200, render: (v: string) => new Date(v).toLocaleString() },
-          ]}
+          columns={apiKeyColumns()}
         />
       </Card>
 
       <Card title="Branding" size="small">
+        {brandingError ? (
+          <Alert
+            type="error"
+            showIcon
+            closable={{ onClose: () => setBrandingError(null) }}
+            title={`Branding not saved: ${brandingError}`}
+            style={{ marginBottom: 12, maxWidth: 500 }}
+          />
+        ) : null}
         <Form form={form} layout="vertical" onFinish={handleSave} style={{ maxWidth: 500 }}>
-          <Form.Item label="Primary Color" name="theme_primary">
-            <Input placeholder={defaultPrimaryColor} addonBefore={
-              <input
-                type="color"
-                value={form.getFieldValue('theme_primary') || defaultPrimaryColor}
-                onChange={(e) => form.setFieldsValue({ theme_primary: e.target.value })}
-                style={{ width: 24, height: 24, border: 'none', padding: 0, cursor: 'pointer' }}
-              />
-            } />
+          <Form.Item label="Primary Color">
+            <Space.Compact block>
+              <Space.Addon>
+                <input
+                  type="color"
+                  value={themePrimary || defaultPrimaryColor}
+                  onChange={(e) => form.setFieldsValue({ theme_primary: e.target.value })}
+                  style={{ width: 24, height: 24, border: 'none', padding: 0, cursor: 'pointer' }}
+                />
+              </Space.Addon>
+              <Form.Item name="theme_primary" noStyle>
+                <Input placeholder={defaultPrimaryColor} />
+              </Form.Item>
+            </Space.Compact>
           </Form.Item>
-          <Form.Item label="Secondary Color" name="theme_secondary">
-            <Input placeholder="#f5f5f5" addonBefore={
-              <input
-                type="color"
-                value={form.getFieldValue('theme_secondary') || '#f5f5f5'}
-                onChange={(e) => form.setFieldsValue({ theme_secondary: e.target.value })}
-                style={{ width: 24, height: 24, border: 'none', padding: 0, cursor: 'pointer' }}
-              />
-            } />
+          <Form.Item label="Secondary Color">
+            <Space.Compact block>
+              <Space.Addon>
+                <input
+                  type="color"
+                  value={themeSecondary || '#f5f5f5'}
+                  onChange={(e) => form.setFieldsValue({ theme_secondary: e.target.value })}
+                  style={{ width: 24, height: 24, border: 'none', padding: 0, cursor: 'pointer' }}
+                />
+              </Space.Addon>
+              <Form.Item name="theme_secondary" noStyle>
+                <Input placeholder="#f5f5f5" />
+              </Form.Item>
+            </Space.Compact>
           </Form.Item>
           <Form.Item label="Logo URL" name="logo_url">
             <Input placeholder="https://example.com/logo.png" />
@@ -337,7 +364,7 @@ export default function OrgDetailPage() {
         size="small"
         style={{ marginTop: 24 }}
       >
-        <Space direction="vertical" size={16} style={{ width: '100%' }}>
+        <Space orientation="vertical" size={16} style={{ width: '100%' }}>
           <Space size={12}>
             <Switch
               checked={org.byok_enabled}

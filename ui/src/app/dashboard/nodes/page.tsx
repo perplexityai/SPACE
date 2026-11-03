@@ -38,6 +38,7 @@ import {
   Tooltip,
 } from 'antd';
 import { DeleteOutlined, PauseCircleOutlined, PlayCircleOutlined, PlusOutlined, ReloadOutlined, SyncOutlined } from '@ant-design/icons';
+import { runtimeInstallationLines } from '@/lib/node-state';
 import type { ColumnsType } from 'antd/es/table';
 
 const { Title, Text } = Typography;
@@ -473,6 +474,9 @@ export default function NodesPage() {
     status: admin.status,
     reconcile_trigger: admin.reconcile_trigger ?? null,
     read_state_error: admin.read_state_error ?? null,
+    cordoned: admin.cordoned,
+    node_group_id: admin.node_group_id,
+    runtime_installations: admin.runtime_installations,
   });
 
   const loadOccupancy = async () => {
@@ -667,7 +671,14 @@ export default function NodesPage() {
       dataIndex: 'name',
       width: 180,
       render: (name: string | null, record) => (
-        <Link href={`/dashboard/nodes/${record.id}`}>{name || record.id.slice(0, 8)}</Link>
+        <Space orientation="vertical" size={0}>
+          <Link href={`/dashboard/nodes/${record.id}`}>{name || record.id.slice(0, 8)}</Link>
+          {record.node_group_id ? (
+            <Tooltip title={`Node group ${record.node_group_id}`}>
+              <Text type="secondary" style={{ fontSize: 12 }}>group {record.node_group_id.slice(0, 8)}</Text>
+            </Tooltip>
+          ) : null}
+        </Space>
       ),
     },
     {
@@ -688,7 +699,35 @@ export default function NodesPage() {
       render: (value: string | null) => (value ? <code>{value}</code> : <Text type="secondary">—</Text>),
     },
     { title: 'Address', dataIndex: 'address', width: 140, render: (value: string | null) => value || '—' },
-    { title: 'State', dataIndex: 'state', width: 120, render: (value: string | null) => value || 'registered' },
+    {
+      title: 'State',
+      dataIndex: 'state',
+      width: 130,
+      render: (value: string | null, record) => (
+        <Space size={4} wrap>
+          <span>{value || 'registered'}</span>
+          {record.cordoned ? (
+            <Tooltip title="The Kubernetes node is unschedulable">
+              <Tag color="orange">cordoned</Tag>
+            </Tooltip>
+          ) : null}
+        </Space>
+      ),
+    },
+    {
+      title: 'Runtimes',
+      width: 170,
+      render: (_, record) => {
+        const lines = runtimeInstallationLines(record.runtime_installations);
+        if (lines === null) return null;
+        if (lines.length === 0) return <Text type="secondary">none reported</Text>;
+        return (
+          <Space orientation="vertical" size={0}>
+            {lines.map((line) => <Text key={line} style={{ fontSize: 12 }}>{line}</Text>)}
+          </Space>
+        );
+      },
+    },
     {
       title: 'Drain',
       width: 170,

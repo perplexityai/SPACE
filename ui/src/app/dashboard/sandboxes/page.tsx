@@ -29,10 +29,11 @@ import {
   forceConsoleSandboxAction,
   getConsoleSandbox,
   getConsoleSandboxList,
+  getConsoleSnapshots,
   getPublicPage,
   postPublicOperation,
-  publicSnapshotToConsoleSnapshot,
   publicTemplateToConsoleTemplate,
+  rollbackConsoleSandbox,
   updateConsoleSandbox,
   waitForAdminOperation,
   waitForPublicOperation,
@@ -63,10 +64,11 @@ import {
   type PagePosition,
   type SandboxListFilters,
 } from '@/lib/sandbox-list';
-import { settleAcceptedCreate } from '@/lib/accepted-create';
+import { OperationFailedError, createFailureText, settleAcceptedCreate } from '@/lib/accepted-create';
 import {
   ROLLBACK_NOT_ENABLED,
   SNAPSHOTS_NOT_ENABLED,
+  SNAPSHOTS_OTHER_ORG_UNSUPPORTED,
   isHiddenOperationError,
 } from '@/lib/hidden-operations';
 import { PrefixRequests, supplementalMatches } from '@/lib/prefix-search';
@@ -75,7 +77,6 @@ import {
   AutoLifecyclePolicy,
   NetworkPolicyV1,
   Organization,
-  PublicSnapshot,
   PublicTemplate,
   Sandbox,
   SnapshotInfo,
@@ -240,7 +241,7 @@ function activityTimeCell(record: Sandbox, nowMs: number) {
   return (
     <Tooltip
       title={
-        <Space direction="vertical" size={0}>
+        <Space orientation="vertical" size={0}>
           <span>{`Last ${sourceLabel}: ${new Date(timestamp).toLocaleString()}`}</span>
           {record.updated_at ? (
             <span>{`Row updated: ${formatRelativeTime(record.updated_at, nowMs)}`}</span>
@@ -545,39 +546,50 @@ function SandboxActions({ status, id, resourceType, poolTemplate, onAction }: {
   );
 }
 
-function SnapshotsPanel({ sandboxId }: { sandboxId: string }) {
+// Listed through the admin route and rolled back through `:force-rollback`
+// for every sandbox; on releases without the admin list, through the public
+// routes, which serve only the operator's own organization.
+function SnapshotsPanel({ sandboxId, ownOrg }: { sandboxId: string; ownOrg: boolean }) {
   const { message } = App.useApp();
   const [snapshots, setSnapshots] = useState<SnapshotInfo[]>([]);
   const [loading, setLoading] = useState(true);
-  const [snapshotsOff, setSnapshotsOff] = useState(false);
+  const [snapshotsOff, setSnapshotsOff] = useState<string | null>(null);
+  const [rollbackVia, setRollbackVia] = useState<'admin' | 'public' | null>(null);
   const [rollbackOff, setRollbackOff] = useState(false);
 
   useEffect(() => {
-    getPublicPage<PublicSnapshot>(`/sandboxes/${sandboxId}/snapshots`)
-      .then((items) => setSnapshots(items.map(publicSnapshotToConsoleSnapshot)))
+    getConsoleSnapshots(sandboxId, { ownOrg })
+      .then((listing) => {
+        if (listing.via === 'none') {
+          setSnapshotsOff(SNAPSHOTS_OTHER_ORG_UNSUPPORTED);
+          return;
+        }
+        setRollbackVia(listing.via);
+        setSnapshots(listing.rows);
+      })
       .catch((err: any) => {
         if (isHiddenOperationError(err)) {
-          setSnapshotsOff(true);
+          setSnapshotsOff(SNAPSHOTS_NOT_ENABLED);
           return;
         }
         message.error(err.message || 'failed to load snapshots');
       })
       .finally(() => setLoading(false));
-  }, [sandboxId]);
+  }, [sandboxId, ownOrg]);
 
   const handleRollback = async (snapshotName: string) => {
+    if (!rollbackVia) return;
     try {
-      await postPublicOperation(`/sandboxes/${sandboxId}:rollback`, {
-        snapshot_name: snapshotName,
-        auto_restart: true,
-      });
+      await rollbackConsoleSandbox(sandboxId, snapshotName, rollbackVia);
       message.success('Snapshot rollback queued');
     } catch (err: any) {
-      if (isHiddenOperationError(err)) {
+      if (rollbackVia === 'public' && isHiddenOperationError(err)) {
         setRollbackOff(true);
         message.info(ROLLBACK_NOT_ENABLED);
         return;
       }
+      // The admin route's refusal names its cause ("rollback is not enabled
+      // for the sandbox's organization"); show it as it is.
       message.error(err.message || 'failed to queue rollback');
     }
   };
@@ -639,7 +651,7 @@ function SnapshotsPanel({ sandboxId }: { sandboxId: string }) {
       <div style={{ padding: '8px 0' }}>
         <Text strong><CameraOutlined /> Snapshots</Text>
         <div style={{ marginTop: 8 }}>
-          <Text type="secondary">{SNAPSHOTS_NOT_ENABLED}</Text>
+          <Text type="secondary">{snapshotsOff}</Text>
         </div>
       </div>
     );
@@ -1052,7 +1064,10 @@ function SandboxesPage() {
       // refresh above read the finished state.
       if (!values.snapshots) {
         void (targetOrgId ? waitForAdminOperation : waitForPublicOperation)(sandbox.operation_id)
-          .then(() => refreshAndReport(), () => refreshAndReport());
+          .then(() => refreshAndReport(), (err: unknown) => {
+            if (err instanceof OperationFailedError) message.error(createFailureText(err), 10);
+            refreshAndReport();
+          });
       }
       const sandboxId = sandbox.sandbox_id;
       const copyId = () => {
@@ -1934,7 +1949,7 @@ function SandboxesPage() {
         expandable={{
           showExpandColumn: false,
           expandRowByClick: true,
-          expandedRowRender: (record) => <SnapshotsPanel sandboxId={record.id} />,
+          expandedRowRender: (record) => <SnapshotsPanel sandboxId={record.id} ownOrg={!authOrg || !record.org_id || record.org_id === authOrg.id} />,
           rowExpandable: snapshotsPanelAvailable,
         }}
       />

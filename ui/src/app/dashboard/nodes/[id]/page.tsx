@@ -19,6 +19,7 @@ import {
 import { countLabel, nodeReadFailure, type NodeCounts } from '@/lib/node-detail';
 import { publicSandboxIdFromAny } from '@/lib/sandbox-id';
 import type { AdminNodeResponse, NodeHealthStatus } from '@/lib/types';
+import { cordonedText, runtimeInstallationLines } from '@/lib/node-state';
 
 const { Title, Text } = Typography;
 
@@ -139,7 +140,7 @@ export default function NodeDetailPage() {
       title: `Upload requests accepted for ${accepted} sandbox${accepted === 1 ? '' : 'es'}${failed.length ? `; ${failed.length} not accepted` : ''}`,
       width: 640,
       content: (
-        <Space direction="vertical" size={4} style={{ width: '100%' }}>
+        <Space orientation="vertical" size={4} style={{ width: '100%' }}>
           <Text>{UPLOAD_ACCEPTED_MEANS}</Text>
           {failed.length ? <Text strong>Requests that failed:</Text> : null}
           {failed.map((f) => (
@@ -158,7 +159,7 @@ export default function NodeDetailPage() {
       content: item.confirm,
       okText: item.label,
       okButtonProps: { danger: item.dangerous },
-      autoFocusButton: item.dangerous ? 'cancel' : 'ok',
+      focusable: { autoFocusButton: item.dangerous ? 'cancel' : 'ok' },
       onOk: async () => {
         setBusy(item.label);
         // Earlier reads describe the node before this action: drop them.
@@ -206,15 +207,18 @@ export default function NodeDetailPage() {
   const status = node.status;
   const health: NodeHealthStatus | null = status?.health ?? null;
   const hasHealth = node.role === 'worker' || node.role === 'builder';
+  const cordoned = cordonedText(node.cordoned);
+  const runtimeLines = runtimeInstallationLines(node.runtime_installations);
 
   return (
-    <Space direction="vertical" size={16} style={{ width: '100%' }}>
+    <Space orientation="vertical" size={16} style={{ width: '100%' }}>
       <Space align="center" style={{ width: '100%', justifyContent: 'space-between' }} wrap>
         <Space align="center">
           <Link href="/dashboard/nodes"><ArrowLeftOutlined /> Nodes</Link>
           <Title level={3} style={{ margin: 0 }}>{node.name || node.address || node.id}</Title>
           <Tag>{node.role}</Tag>
           {node.drain_phase ? <Tag color="orange">{node.drain_phase} · {node.drain_mode ?? 'gentle'}</Tag> : null}
+          {node.cordoned ? <Tag color="orange">cordoned</Tag> : null}
           <Tag color={node.scheduling_status === 'ready' ? 'green' : 'default'}>{node.scheduling_status ?? 'unknown'}</Tag>
         </Space>
         <Space wrap>
@@ -250,6 +254,19 @@ export default function NodeDetailPage() {
             {status ? `${new Date(status.observed_at).toLocaleString()}${status.stale ? ' (stale)' : ''}` : '—'}
           </Descriptions.Item>
           <Descriptions.Item label="Drain error">{node.drain_last_error ? <Text type="danger">{node.drain_last_error}</Text> : '—'}</Descriptions.Item>
+          {cordoned !== null ? <Descriptions.Item label="Cordoned">{cordoned}</Descriptions.Item> : null}
+          {node.node_group_id ? (
+            <Descriptions.Item label="Node group"><Text code copyable>{node.node_group_id}</Text></Descriptions.Item>
+          ) : null}
+          {runtimeLines !== null ? (
+            <Descriptions.Item label="Runtime installations" span="filled">
+              {runtimeLines.length ? (
+                <Space orientation="vertical" size={0}>
+                  {runtimeLines.map((line) => <Text key={line}>{line}</Text>)}
+                </Space>
+              ) : <Text type="secondary">none reported</Text>}
+            </Descriptions.Item>
+          ) : null}
         </Descriptions>
       </Card>
 

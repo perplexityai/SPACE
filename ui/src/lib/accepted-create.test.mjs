@@ -4,6 +4,7 @@ import {
   OperationFailedError,
   OperationTimeoutError,
   settleAcceptedCreate,
+  terminalErrorParts,
 } from './accepted-create.ts';
 import { isHiddenOperationError } from './hidden-operations.ts';
 
@@ -36,6 +37,38 @@ for (const [name, steps, expected] of [
     { type: 'error', text: 'Sandbox create failed: template not found' },
   ],
   [
+    'the template has no published release',
+    {
+      waitForCreate: fail(new OperationFailedError(
+        'failed',
+        'template has no published release',
+        'template_has_no_release',
+        "no release found for template 'synthetic' runtime 'fc' tag 'latest'",
+      )),
+    },
+    {
+      type: 'error',
+      text: "Sandbox create failed: the template has no published release; build it, or publish a release, first (no release found for template 'synthetic' runtime 'fc' tag 'latest')",
+    },
+  ],
+  [
+    'no release matches the requested tag or digest',
+    {
+      waitForCreate: fail(new OperationFailedError(
+        'failed',
+        'no template release matches the requested tag or digest and runtime',
+        'template_release_not_found',
+        null,
+      )),
+    },
+    { type: 'error', text: 'Sandbox create failed: no release of the template matches the requested tag or digest and runtime' },
+  ],
+  [
+    'a reason this console does not know keeps the progress message',
+    { waitForCreate: fail(new OperationFailedError('failed', 'sandbox create dependency was not found', 'something_new', 'x')) },
+    { type: 'error', text: 'Sandbox create failed: sandbox create dependency was not found' },
+  ],
+  [
     'snapshots are hidden for the org',
     { waitForCreate: ok, enableSnapshots: fail(apiError(400, 'invalid sandbox action')) },
     { type: 'warning', text: 'Sandbox created; snapshots are not enabled for your organization' },
@@ -63,4 +96,15 @@ test('settleAcceptedCreate: a failed create does not try to enable snapshots', a
     snapshotsOff: isHiddenOperationError,
   });
   assert.equal(enabled, false);
+});
+
+test("a failed record's terminal error gives the reason and message, when it has them", () => {
+  assert.deepEqual(
+    terminalErrorParts({ operation_id: 'op', kind: 'create_sandbox', message: 'detail', reason: 'template_release_not_found' }),
+    { reason: 'template_release_not_found', detail: 'detail' },
+  );
+  // Releases without reasons, and records without a terminal error.
+  assert.deepEqual(terminalErrorParts({ message: 'detail' }), { reason: null, detail: 'detail' });
+  assert.deepEqual(terminalErrorParts(null), { reason: null, detail: null });
+  assert.deepEqual(terminalErrorParts('text'), { reason: null, detail: null });
 });

@@ -43,3 +43,16 @@ export function sandboxTargetForms(typed: string): [string, string] | null {
   const uuid = parts.slice(1).join('-').toLowerCase();
   return [`sbx_${uuid}`, uuid];
 }
+
+// The actors whose email the console must look up. Releases that report it
+// send `actor_email` on each admin operation; a row that carries the field,
+// even as null (the user is gone), needs no `GET /users/{id}`.
+export function actorsToLookUp(
+  operations: { actor_user_id: string | null; actor_email?: string | null }[],
+): string[] {
+  const ids = new Set<string>();
+  for (const op of operations) {
+    if (op.actor_user_id && op.actor_email === undefined) ids.add(op.actor_user_id);
+  }
+  return [...ids];
+}
