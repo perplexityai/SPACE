@@ -11,14 +11,18 @@
 //! Every metric here carries a `codec:` tag whose vocabulary mirrors the
 //! suspend-snapshot rootfs codec used for the operation:
 //!
+//! - `codec:btrfs_send_v1` — the btrfs-send codec, and the default: rootfs
+//!   is uploaded as an incremental `btrfs send -p` stream against the
+//!   pinned template subvolume. A suspend request that leaves the format
+//!   unspecified, as the API substrate's SuspendSandbox path does, gets
+//!   this codec unless the worker sets `SPACE_SUSPEND_DEFAULT_FORMAT=full`.
 //! - `codec:full` — the historical Full codec; rootfs uploaded/downloaded
-//!   as a complete `rootfs.ext4` image. Used unconditionally by the API
-//!   substrate's SuspendSandbox path; selectable via
-//!   `--format=full` on `space-sbxmgr suspend`.
-//! - `codec:btrfs_send_v1` — the btrfs-send codec; rootfs is uploaded as
-//!   an incremental `btrfs send -p` stream against the pinned template
-//!   subvolume. Per-request opt-in via `--format=btrfs-send`; not yet
-//!   emitted by the substrate.
+//!   as a complete `rootfs.ext4` image. Used when a request asks for it
+//!   (`space-sbxmgr suspend` does unless given `--format=btrfs-send`), when
+//!   the worker's default is set to `full`, and when a defaulted btrfs-send
+//!   suspend finds the sandbox ineligible and falls back, which is counted
+//!   as `snapshot.create.failed` with `step:btrfs_send` and
+//!   `reason:fallback_to_full`.
 //!
 //! ## Encryption dimension
 //!
