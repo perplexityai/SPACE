@@ -8,6 +8,7 @@ fn main() -> anyhow::Result<()> {
     let builder_file = proto_root.join("node/api/v1/builder.proto");
     let activation_file = proto_root.join("node/api/v1/activation.proto");
     let cluster_file = proto_root.join("node/api/v1/cluster.proto");
+    let native_file_access_file = proto_root.join("node/api/v1/native_file_access.proto");
 
     let raw_descriptor_path = out_dir.join("node_api_descriptor_raw.bin");
 
@@ -44,6 +45,7 @@ fn main() -> anyhow::Result<()> {
             builder_file,
             cluster_file,
             activation_file,
+            native_file_access_file,
         ],
         &[proto_root],
     )?;

@@ -94,13 +94,17 @@ async fn remote_activation_authenticates_and_preserves_terminal_status() {
                 activation: backend.clone(),
                 shutdown: shutdown.clone(),
             },
+            crate::native_file_access::NativeFileAccessService::new(
+                axum::Router::new(),
+                shutdown.clone(),
+            ),
             listener,
             layer,
             shutdown.clone(),
         )
         .unwrap(),
     );
-    let mut client = pplx_space_node_api_client::proto::ingress_activation_api_client::IngressActivationApiClient::connect(endpoint).await.unwrap();
+    let mut client = pplx_space_node_api_client::proto::ingress_activation_api_client::IngressActivationApiClient::connect(endpoint.clone()).await.unwrap();
     let request = || {
         Request::new(PrepareIngressRequest {
             sandbox_id: SandboxId::new().to_string(),
@@ -128,6 +132,39 @@ async fn remote_activation_authenticates_and_preserves_terminal_status() {
         );
     }
     assert_eq!(backend.0.load(Ordering::SeqCst), 1);
+
+    // The native file access RPCs share the listener and its bearer check: an
+    // unauthenticated call is refused before the service sees it, and an
+    // authenticated empty one reaches it.
+    let mut files = pplx_space_node_api_client::proto::native_file_access_api_client::NativeFileAccessApiClient::connect(
+        endpoint.clone(),
+    )
+    .await
+    .unwrap();
+    for token in [
+        None,
+        Some("Bearer wrong"),
+        Some("Bearer synthetic-activation-token"),
+    ] {
+        let mut req = Request::new(
+            pplx_space_node_api_client::proto::AuthorizeNativeFileRequestRequest { request: None },
+        );
+        req.set_timeout(Duration::from_millis(200));
+        if let Some(token) = token {
+            req.metadata_mut()
+                .insert("authorization", token.parse().unwrap());
+        }
+        let error = files.authorize_native_file_request(req).await.unwrap_err();
+        assert_eq!(
+            error.code(),
+            if token == Some("Bearer synthetic-activation-token") {
+                Code::InvalidArgument
+            } else {
+                Code::Unauthenticated
+            },
+            "{error}"
+        );
+    }
     shutdown.cancel();
     task.await.unwrap().unwrap();
 }

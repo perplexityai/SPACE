@@ -75,15 +75,16 @@ impl WorkerChannels {
 
     /// A runtime client for the worker at `addr`, on its kept channel.
     pub(super) async fn client(&self, addr: &str) -> Result<RuntimeClient, ControllerError> {
+        let endpoint = pplx_space_common_grpc::internal_transport::qualify_endpoint(addr);
         let Some(dial) = self.entry(addr, Instant::now()) else {
-            return Ok(RuntimeClient::new(self.dial(addr).await?));
+            return Ok(RuntimeClient::new(self.dial(addr).await?, endpoint));
         };
         // A caller that joins a dial late waits only for its remainder.
         let result = dial.clone().await;
         if result.is_err() {
             self.forget(addr, &dial);
         }
-        Ok(RuntimeClient::new(result?))
+        Ok(RuntimeClient::new(result?, endpoint))
     }
 
     /// Dial `addr` within one dial's budget: every attempt its retry policy

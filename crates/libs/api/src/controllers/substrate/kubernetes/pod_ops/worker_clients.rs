@@ -21,9 +21,7 @@ impl KubernetesSubstrate {
         port: u16,
         connect_timeout: Duration,
     ) -> Option<crate::controllers::substrate::RuntimeClient> {
-        Self::pod_worker_channel(pod_ip, port, connect_timeout)
-            .await
-            .map(crate::controllers::substrate::RuntimeClient::new)
+        Self::worker_client_at(&pod_ip.socket_addr(port).to_string(), connect_timeout).await
     }
 
     /// [`Self::pod_worker_client`] for a node-api address resolved some other
@@ -32,9 +30,10 @@ impl KubernetesSubstrate {
         addr: &str,
         connect_timeout: Duration,
     ) -> Option<crate::controllers::substrate::RuntimeClient> {
+        let endpoint = pplx_space_common_grpc::internal_transport::qualify_endpoint(addr);
         Self::worker_channel_at(addr, connect_timeout)
             .await
-            .map(crate::controllers::substrate::RuntimeClient::new)
+            .map(|channel| crate::controllers::substrate::RuntimeClient::new(channel, endpoint))
     }
 
     pub(in crate::controllers::substrate::kubernetes) async fn pod_worker_channel(

@@ -70,6 +70,7 @@ pub(super) struct PodWorkerChannels {
 
 struct Entry {
     channel: Channel,
+    endpoint: std::sync::Arc<str>,
     watch: ConnectionWatch,
     created_at: Instant,
     last_used: Instant,
@@ -83,7 +84,11 @@ impl Entry {
     }
 
     fn client(&self) -> RuntimeClient {
-        RuntimeClient::kept(self.channel.clone(), self.watch.clone())
+        RuntimeClient::kept(
+            self.channel.clone(),
+            std::sync::Arc::clone(&self.endpoint),
+            self.watch.clone(),
+        )
     }
 }
 
@@ -185,6 +190,10 @@ impl PodWorkerChannels {
         entries.retain(|_, entry| entry.is_live(now));
         let entry = Entry {
             channel,
+            endpoint: pplx_space_common_grpc::internal_transport::qualify_endpoint(
+                &key.addr.to_string(),
+            )
+            .into(),
             watch,
             created_at: now,
             last_used: now,

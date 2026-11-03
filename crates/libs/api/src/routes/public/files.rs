@@ -572,6 +572,7 @@ impl FileCallFailure for ControllerError {
     }
 }
 
+pub(crate) mod access;
 mod key_binding;
 use key_binding::bind_request_key;
 

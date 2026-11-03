@@ -30,6 +30,7 @@ pub mod native_sandbox_limits;
 // lives behind common-core's `kubernetes` feature.
 mod credential_injection;
 mod ingress_activation;
+mod native_file_access;
 #[cfg(feature = "kubernetes")]
 pub mod node_group_placement;
 pub mod public_operation_driver;

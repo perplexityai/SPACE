@@ -118,26 +118,19 @@ impl SandboxController {
         metric_identity: SandboxApiMetricIdentity,
         activity: Option<ExecutionActivityKind>,
     ) -> Result<SpacedSandboxClient, ControllerError> {
-        let client = connect_spaced_runtime_client(
-            &self.substrate,
-            self.cluster_admission.as_ref(),
-            true, // initial connect → charge the dormant entrypoint wake
-            pool,
+        let SpacedRuntimeGrant {
+            client,
             sandbox,
-            metric_identity,
-            activity,
-        )
-        .await?;
-        let authoritative_sandbox = fetch_authoritative_route_sandbox(pool, sandbox).await?;
+            space_api_route_token,
+        } = self
+            .spaced_runtime_grant(pool, sandbox, metric_identity, activity)
+            .await?;
         Ok(SpacedSandboxClient {
             client,
             substrate: self.substrate.clone(),
             pool: pool.clone(),
-            sandbox: authoritative_sandbox.clone(),
-            space_api_route_token: space_api_bridge_route_token(
-                self.route_ed25519_authority.as_deref(),
-                &authoritative_sandbox,
-            )?,
+            sandbox,
+            space_api_route_token,
             route_ed25519_authority: self.route_ed25519_authority.clone(),
             metric_identity,
             activity,
@@ -629,6 +622,9 @@ impl SandboxController {
     }
 }
 
+mod runtime_grant;
+use runtime_grant::{SpacedRuntimeGrant, spaced_runtime_grant};
+
 pub(crate) async fn connect_spaced_runtime_client(
     substrate: &Substrate,
     admission: Option<&std::sync::Arc<crate::cluster_admission::ClusterSandboxAdmission>>,
@@ -1045,7 +1041,11 @@ impl SpacedSandboxClient {
         // so a cached channel to the same pod must not be handed back: retire
         // it and dial afresh, as a reconnect always has.
         self.client.retire_kept_connection();
-        self.client = connect_spaced_runtime_client(
+        let SpacedRuntimeGrant {
+            client,
+            sandbox,
+            space_api_route_token,
+        } = spaced_runtime_grant(
             &self.substrate,
             self.cluster_admission.as_ref(),
             // Mid-stream reconnect: the initial wake was already charged, and
@@ -1053,15 +1053,16 @@ impl SpacedSandboxClient {
             // dormant entrypoint charge. Recovery (lost-pod recreate) still
             // charges via the recovery policy derived by the helper.
             false,
+            self.route_ed25519_authority.as_deref(),
             &self.pool,
             &self.sandbox,
             self.metric_identity,
             self.activity,
         )
         .await?;
-        self.sandbox = fetch_authoritative_route_sandbox(&self.pool, &self.sandbox).await?;
-        self.space_api_route_token =
-            space_api_bridge_route_token(self.route_ed25519_authority.as_deref(), &self.sandbox)?;
+        self.client = client;
+        self.sandbox = sandbox;
+        self.space_api_route_token = space_api_route_token;
         Ok(())
     }
 
