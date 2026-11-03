@@ -1,20 +1,22 @@
 //! Writes of `sandboxes` that project what a node reports. From a
-//! `PublishNodeState` publication: the restoring-to-started convergence,
-//! the failed and quarantined projections, activation-completion receipts,
-//! pause-failed recovery, and the census prune, which forgets the node's
-//! observations of every sandbox its complete census omits and tombstones
-//! absent Direct rows. The suspended finalization runs for a publication and
-//! for a ready suspend backup (`FinalizeArtifactBackup`).
+//! `PublishNodeState` publication: the activity clocks, the
+//! restoring-to-started and stopped convergences, the failed and quarantined
+//! projections, activation-completion receipts, pause-failed recovery, the
+//! delete of stopped Direct rows the node reported absent, and the census
+//! prune, which forgets the node's observations of every sandbox its complete
+//! census omits and tombstones absent Direct rows. The suspended finalization
+//! runs for a publication and for a ready suspend backup
+//! (`FinalizeArtifactBackup`).
 //!
 //! Stored and published lifecycle text is compared either with
 //! `LOWER(TRIM(..))` or exactly, as each statement is written; which one
 //! decides how a statement treats non-canonical text. Several are single
 //! statements whose CTEs also write other tables (`sandbox_k8s_executions`,
 //! `sandbox_port_exposures`, `sandbox_observed_states`, the quarantine and
-//! node-facet tables, `sandbox_snapshot_inventory`): splitting one would
-//! change what it does. The caller owns the transaction, the locking reads
-//! that select candidates, the other tables' own statements, and the events
-//! it emits.
+//! node-facet tables, `sandbox_snapshot_inventory`,
+//! `snapshot_storage_locations`): splitting one would change what it does.
+//! The caller owns the transaction, the locking reads that select candidates,
+//! the other tables' own statements, and the events it emits.
 //!
 //! A new lifecycle write here from a node report follows the rule for such
 //! writes in `crates/libs/internal/api/server/AGENTS.md`, which also lists
@@ -402,6 +404,168 @@ pub async fn converge_published_restoring_to_started(
     .await
 }
 
+/// Advance the publisher's activity clocks (`last_access_at`,
+/// `last_command_at`, `last_used_at`) on its rows. The statement sets no
+/// other column, and the `updated_at` trigger ignores these three; the row's
+/// other `BEFORE UPDATE` triggers still run (see the crate docs on triggers).
+/// **Observed projection**: the node reported when each sandbox was last
+/// accessed or commanded.
+///
+/// `rows` is a recordset of `{sandbox_id, last_used_at, last_access_at,
+/// last_command_at}`. A clock moves only forward and only when the published
+/// value is more than a minute past the stored one, so a publish that
+/// advances nothing writes nothing. The write re-checks only that the row is
+/// on `node_id`; it has no lifecycle or substrate predicate.
+pub async fn advance_published_activity(
+    executor: impl sqlx::PgExecutor<'_>,
+    node_id: NodeId,
+    rows: Json<JsonValue>,
+) -> Result<(), sqlx::Error> {
+    // PostgreSQL GREATEST ignores absent clocks and yields NULL if all are absent.
+    // Keep publisher ownership on the updated row, avoiding a redundant self-join.
+    sqlx::query(sql!(
+        "WITH input AS (
+         SELECT *
+         FROM jsonb_to_recordset($2::jsonb) AS input(
+             sandbox_id UUID,
+             last_used_at TIMESTAMPTZ,
+             last_access_at TIMESTAMPTZ,
+             last_command_at TIMESTAMPTZ
+         )
+     ),
+     activity AS (
+         SELECT input.sandbox_id,
+                input.last_access_at,
+                input.last_command_at,
+                GREATEST(input.last_used_at, input.last_access_at, input.last_command_at) AS last_used_at
+         FROM input
+     )
+     UPDATE sandboxes s
+     SET last_access_at = CASE
+             WHEN activity.last_access_at IS NOT NULL
+              AND (
+                  s.last_access_at IS NULL
+                  OR s.last_access_at < activity.last_access_at - INTERVAL '1 minute'
+              )
+             THEN activity.last_access_at
+             ELSE s.last_access_at
+         END,
+         last_command_at = CASE
+             WHEN activity.last_command_at IS NOT NULL
+              AND (
+                  s.last_command_at IS NULL
+                  OR s.last_command_at < activity.last_command_at - INTERVAL '1 minute'
+              )
+             THEN activity.last_command_at
+             ELSE s.last_command_at
+         END,
+         last_used_at = CASE
+             WHEN activity.last_used_at IS NOT NULL
+              AND (
+                  s.last_used_at IS NULL
+                  OR s.last_used_at < activity.last_used_at - INTERVAL '1 minute'
+              )
+             THEN activity.last_used_at
+             ELSE s.last_used_at
+         END
+     FROM activity
+     WHERE s.id = activity.sandbox_id
+       AND s.active_node_id = $1
+       AND activity.last_used_at IS NOT NULL
+       AND (
+           (
+               activity.last_access_at IS NOT NULL
+               AND (
+                   s.last_access_at IS NULL
+                   OR s.last_access_at < activity.last_access_at - INTERVAL '1 minute'
+               )
+           )
+           OR (
+               activity.last_command_at IS NOT NULL
+               AND (
+                   s.last_command_at IS NULL
+                   OR s.last_command_at < activity.last_command_at - INTERVAL '1 minute'
+               )
+           )
+           OR (
+               activity.last_used_at IS NOT NULL
+               AND (
+                   s.last_used_at IS NULL
+                   OR s.last_used_at < activity.last_used_at - INTERVAL '1 minute'
+               )
+           )
+       )"
+    ))
+    .bind(node_id)
+    .bind(rows)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// Converge the publisher's rows it published `stopped` to
+/// `lifecycle = 'stopped'`, returning the ids that converged. **Observed
+/// projection**: the node reported the runtime stopped.
+///
+/// `rows` is a recordset of `{sandbox_id, status}`. The write re-checks that
+/// the row is on `node_id` and that its lifecycle, compared with
+/// `LOWER(TRIM(..))`, is `started`, `paused`, `suspended`, `stopping` or
+/// `restoring`. No locking read selects its rows first: the `UPDATE` locks
+/// each row it writes, and under the caller's READ COMMITTED transaction a row
+/// a concurrent writer holds is re-checked against its latest committed
+/// version once that writer ends. It has no substrate predicate. Unlike
+/// [`converge_published_restoring_to_started`], which exempts every row marked
+/// for the node-drain redrive (`evacuation_restore_target`), it exempts only a
+/// `restoring` row marked for a stopped re-placement, the drain's restore in
+/// flight; the statement's comment says why.
+pub async fn converge_published_stopped(
+    executor: impl sqlx::PgExecutor<'_>,
+    node_id: NodeId,
+    rows: Json<JsonValue>,
+) -> Result<Vec<SandboxId>, sqlx::Error> {
+    sqlx::query_scalar::<_, SandboxId>(sql!(
+        "WITH input AS (
+             SELECT *
+             FROM jsonb_to_recordset($2::jsonb) AS input(
+                 sandbox_id UUID,
+                 status TEXT
+             )
+         )
+         UPDATE sandboxes s
+         SET lifecycle = 'stopped'
+         FROM input
+         WHERE s.id = input.sandbox_id
+           AND s.active_node_id = $1
+           AND LOWER(TRIM(input.status)) = 'stopped'
+           AND LOWER(TRIM(s.lifecycle)) IN (
+               'started',
+               'paused',
+               'suspended',
+               'stopping',
+               'restoring'
+           )
+           -- A `restoring` row marked for a stopped re-placement is the
+           -- drain's restore in flight (the `restoring -> started`
+           -- convergence above exempts every marked row for the same
+           -- reason). Its node reports `stopped` as soon as the shim has
+           -- staged the disk, before the drain has confirmed it; promoting
+           -- it here would take the row out from under the drain's
+           -- finalize, which then misses its CAS and never releases the
+           -- materialization pod. A row marked `started` or `paused` still
+           -- converges: a node reporting `stopped` for it means the restore
+           -- ended in a stopped VM, which the drain's re-drive can't recover.
+           AND NOT (
+               LOWER(TRIM(s.lifecycle)) = 'restoring'
+               AND s.evacuation_restore_target IS NOT DISTINCT FROM 'stopped'
+           )
+         RETURNING s.id"
+    ))
+    .bind(node_id)
+    .bind(rows)
+    .fetch_all(executor)
+    .await
+}
+
 /// Release the exact activation attempts that published activation-completed
 /// receipts, and project each receipt's target lifecycle onto its sandbox,
 /// returning the ids projected. **Operation step**: ends the in-flight
@@ -675,4 +839,90 @@ pub async fn prune_census_absent_sandboxes(
     .execute(executor)
     .await?;
     Ok(())
+}
+
+/// Deletes the stopped Direct sandboxes a node reported absent, and detaches
+/// their snapshots' storage locations.
+///
+/// The delete reads the node's absence as proof that its local rootfs, a
+/// stopped sandbox's only copy, is gone. That doesn't hold for a stopped
+/// sandbox released from the node once its pinned artifact was durable, so
+/// [`pplx_space_sandbox_portability::stopped_artifact_durable`] exempts it,
+/// the same term that keeps [`prune_census_absent_sandboxes`]'s
+/// `marked_deleted` arm off it.
+///
+/// The candidates are locked (`FOR UPDATE`) before anything is detached or
+/// deleted. Without the lock, a row a concurrent writer moved out of `stopped`
+/// after this statement's snapshot was still selected, and the `DELETE`, which
+/// rechecks only its join to the CTE after waiting on the row, deleted it.
+/// Locking makes Postgres re-evaluate the whole condition against the row that
+/// writer committed; only the durability `EXISTS`'s own table scans keep the
+/// statement's snapshot.
+///
+/// Built once: every input is bound.
+static DELETE_ABSENT_STOPPED_SANDBOXES: LazyLock<String> = LazyLock::new(|| {
+    let released_with_durable_artifact =
+        pplx_space_sandbox_portability::stopped_artifact_durable("s");
+    sql!(
+        format!(
+            "WITH deleted AS MATERIALIZED (
+                 SELECT s.id
+                 FROM sandboxes s
+                 WHERE s.active_node_id = $1
+                   AND s.managed_by = $3
+                   AND s.lifecycle = 'stopped'
+                   AND s.id = ANY($2)
+                   AND NOT {released_with_durable_artifact}
+                 FOR UPDATE OF s
+             ),
+             detached_storage AS (
+                 UPDATE snapshot_storage_locations ssl
+                 SET snapshot_id = NULL, orphaned_at = NOW()
+                 WHERE ssl.snapshot_id IN (
+                     SELECT snapshots.id
+                     FROM snapshots
+                     JOIN deleted ON deleted.id = snapshots.sandbox_id
+                 )
+                 RETURNING 1
+             )
+             DELETE FROM sandboxes s
+             USING deleted
+             WHERE s.id = deleted.id
+             RETURNING s.id"
+        )
+        .as_str()
+    )
+});
+
+/// Delete the stopped Direct rows on `node_id` among `absent_sandbox_ids`, the
+/// sandboxes its publication reported absent, detaching their snapshots'
+/// storage locations, and return the ids deleted. It keeps a row whose
+/// `'stop'`-origin pinned artifact is durable
+/// ([`pplx_space_sandbox_portability::stopped_artifact_durable`]) and compares
+/// the lifecycle exactly (`lifecycle = 'stopped'`). **Inference**: the control
+/// plane reads a node's report that a stopped sandbox is absent as proof its
+/// only copy is gone.
+///
+/// The statement takes its own row locks (`FOR UPDATE OF s` in its `deleted`
+/// CTE), so they are part of the statement rather than the caller's. Rows
+/// with a foreign key to `sandboxes` cascade with the row. Unlike
+/// [`crate::delete::delete_with_dependents`] it deletes no row that does not
+/// cascade. In the same transaction the caller forgets the node's
+/// observations of the absent sandboxes and retires the deleted ones' claimed
+/// warm-pool slots. The caller does not run that helper's reconcile-state
+/// cleanup either, so their `node_reconcile_queue` and `node_facet_conditions`
+/// rows are not deleted here.
+pub async fn delete_published_absent_stopped(
+    executor: impl sqlx::PgExecutor<'_>,
+    node_id: NodeId,
+    absent_sandbox_ids: &[SandboxId],
+) -> Result<Vec<SandboxId>, sqlx::Error> {
+    sqlx::query_scalar::<_, SandboxId>(sqlx::AssertSqlSafe(
+        DELETE_ABSENT_STOPPED_SANDBOXES.as_str(),
+    ))
+    .bind(node_id)
+    .bind(absent_sandbox_ids)
+    .bind(SubstrateKind::Space)
+    .fetch_all(executor)
+    .await
 }
