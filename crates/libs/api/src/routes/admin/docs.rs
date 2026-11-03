@@ -180,7 +180,7 @@ fn admin_openapi_value() -> Value {
             "/operations": {
                 "get": {
                     "summary": "List public operations across tenants for operator diagnostics",
-                    "description": "actor_user_id is the user an operation runs as; for an admin sandbox create that is the sandbox owner. requested_by_user_id is set only on create_sandbox operations an administrator submitted on the owner's behalf while SPACE_ADMIN_CREATE_REQUESTED_BY_ENABLED was on, naming that administrator; it is null on every other operation. actor_email is the current email of actor_user_id's user, the field admin audit events call actor_email, and is null when the operation has no actor or that user no longer exists.",
+                    "description": "actor_user_id is the user an operation runs as; for an admin sandbox create that is the sandbox owner. requested_by_user_id is set only on create_sandbox operations an administrator submitted on the owner's behalf while SPACE_ADMIN_CREATE_REQUESTED_BY_ENABLED was on, naming that administrator; it is null on every other operation. actor_email is the email actor_user_id's user has when the operation is read, so it follows a change of email; it is null when the operation has no actor, which includes once that user is deleted, since the delete also clears actor_user_id. It is not the actor_email of an admin audit event, which is a never-null copy of the actor's email taken when the request ran.",
                     "parameters": [
                         { "name": "org_id", "in": "query", "required": false, "schema": { "type": "string", "format": "uuid" } },
                         { "name": "state", "in": "query", "required": false, "schema": { "type": "string" } },

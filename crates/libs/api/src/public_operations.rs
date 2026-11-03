@@ -33,8 +33,9 @@ const DEFAULT_OPERATION_GC_DAYS: i64 = 7;
 /// needs is selected here and decoded in [`PublicOperationRow`]; a record
 /// that exposes it also needs the field and its line in that record's
 /// `TryFrom`. The two admin reads (`fetch_operation_admin`,
-/// `list_operations_admin`) select one more expression, so they spell this
-/// list out and need the new column added there too.
+/// `list_operations_admin`) also select the payload's `requested_by_user_id`
+/// and the joined actor's email, with every column qualified by its table, so
+/// they spell this list out and need the new column added there too.
 const PUBLIC_OPERATION_COLUMNS: &str = "operation_id,
        org_id,
        actor_user_id,
@@ -3822,10 +3823,11 @@ pub struct AdminPublicOperationRecord {
     pub id: OperationId,
     pub org_id: OrgId,
     pub actor_user_id: Option<UserId>,
-    /// The email of `actor_user_id`'s user, as `actor_email` is on an admin
-    /// audit event. Read with the operation, so it is the user's current
-    /// email. `None` when the operation has no actor or the user no longer
-    /// exists.
+    /// The email `actor_user_id`'s user has when the operation is read, so it
+    /// follows a change of email. `None` when the operation has no actor,
+    /// which includes once the user is deleted: that clears `actor_user_id`.
+    /// Unlike an admin audit event's `actor_email`, a never-null copy taken
+    /// when the request ran, it does not record who the actor was.
     pub actor_email: Option<String>,
     pub api_product: ApiProduct,
     pub kind: OperationKind,
@@ -3949,7 +3951,8 @@ fn sandbox_target_id_forms(sandbox_id: SandboxId) -> [String; 2] {
     ]
 }
 
-/// [`PublicOperationRow`] plus the admin record's payload-derived columns.
+/// [`PublicOperationRow`] plus the columns only the admin record has: the
+/// payload's `requested_by_user_id` and the joined actor's email.
 #[derive(Debug, FromRow)]
 struct AdminPublicOperationRow {
     #[sqlx(flatten)]

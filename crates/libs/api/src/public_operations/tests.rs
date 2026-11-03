@@ -1876,8 +1876,9 @@ async fn admin_operation_listing_can_filter_across_tenants() -> TestResult {
     Ok(())
 }
 
-/// The admin reads name each operation's actor by the user's current email,
-/// and by `None` when there is no actor or the actor's user is gone.
+/// The admin reads name each operation's actor by the email the user has
+/// now. Deleting the user clears the operation's actor, so it reads as an
+/// operation without one: no actor id and no email.
 #[tokio::test]
 async fn admin_operations_name_the_actor_by_email() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
@@ -1888,11 +1889,11 @@ async fn admin_operations_name_the_actor_by_email() -> TestResult {
     let gone = UserId::from_uuid(seed_user(&db.pool, org_id).await?);
     let store = PublicOperationStore::new(db.pool.clone());
     let mut operations = Vec::new();
-    for actor_user_id in [Some(kept), Some(gone), None] {
+    for actor_user_id in [kept, gone] {
         let operation = store
             .create_operation(CreatePublicOperation {
                 org_id,
-                actor_user_id,
+                actor_user_id: Some(actor_user_id),
                 api_product: ApiProduct::Native,
                 kind: OperationKind::WakeSandbox,
                 target_type: Some(OperationTargetType::Sandbox),
@@ -1925,18 +1926,23 @@ async fn admin_operations_name_the_actor_by_email() -> TestResult {
             target_id: None,
         })
         .await?;
-    let expected = [Some("renamed-actor@example.test"), None, None];
-    for (operation_id, expected) in operations.iter().zip(expected) {
+    let expected = [
+        (Some(kept), Some("renamed-actor@example.test")),
+        (None, None),
+    ];
+    for (operation_id, (actor_user_id, actor_email)) in operations.iter().zip(expected) {
         let listed = listed
             .iter()
             .find(|operation| operation.id == *operation_id)
             .expect("the operation is listed");
-        assert_eq!(listed.actor_email.as_deref(), expected, "listed");
+        assert_eq!(listed.actor_user_id, actor_user_id, "listed actor");
+        assert_eq!(listed.actor_email.as_deref(), actor_email, "listed");
         let fetched = store
             .fetch_operation_admin(*operation_id)
             .await?
             .expect("the operation exists");
-        assert_eq!(fetched.actor_email.as_deref(), expected, "fetched");
+        assert_eq!(fetched.actor_user_id, actor_user_id, "fetched actor");
+        assert_eq!(fetched.actor_email.as_deref(), actor_email, "fetched");
     }
     Ok(())
 }
