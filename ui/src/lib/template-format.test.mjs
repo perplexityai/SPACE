@@ -104,6 +104,9 @@ test('the retag dialog advances only the warned tag, so another tag that moved w
   assert.deepEqual(retagStep(canary.baseline, now, 'prod'), { kind: 'move', expected: 'rel-c' });
 });
 
+// The dialog still shows the tag OK was pressed for.
+const shown = () => true;
+
 test('OK reads the releases again first, so a tag that moved since the page last refreshed warns instead of sending', async () => {
   // The page's list still shows prod on A (read under 10 s ago); the fresh
   // read says it moved to C.
@@ -113,18 +116,18 @@ test('OK reads the releases again first, so a tag that moved since the page last
     { id: 'rel-a', template_name: 'seed', tags: [] },
     { id: 'rel-c', template_name: 'seed', tags: ['prod'] },
     { id: 'rel-x', template_name: 'other', tags: ['prod'] },
-  ]), 'seed', 'prod');
+  ]), 'seed', 'prod', shown);
   assert.equal(moved.kind, 'warn');
   assert.deepEqual(moved.baseline.change, { tag: 'prod', from: 'rel-a', to: 'rel-c' });
   // Unmoved: sent with the holder the dialog opened with.
   assert.deepEqual(
-    await retagStepNow(opened({ prod: 'rel-a' }), fresh([{ id: 'rel-a', template_name: 'seed', tags: ['prod'] }]), 'seed', 'prod'),
+    await retagStepNow(opened({ prod: 'rel-a' }), fresh([{ id: 'rel-a', template_name: 'seed', tags: ['prod'] }]), 'seed', 'prod', shown),
     { kind: 'move', expected: 'rel-a' },
   );
   assert.equal(reads, 2);
   // A failed read sends nothing: the caller gets the failure.
   const failure = new Error('failed to refresh template releases');
-  await assert.rejects(retagStepNow(opened({ prod: 'rel-a' }), async () => { throw failure; }, 'seed', 'prod'), (thrown) => thrown === failure);
+  await assert.rejects(retagStepNow(opened({ prod: 'rel-a' }), async () => { throw failure; }, 'seed', 'prod', shown), (thrown) => thrown === failure);
 });
 
 test('a reconfirmed tag moves only from the holder the dialog showed; a further move warns again', () => {
@@ -139,6 +142,33 @@ test('a reconfirmed tag moves only from the holder the dialog showed; a further 
   assert.deepEqual(retagStep(deleted.baseline, new Map(), 'prod'), { kind: 'move', expected: null });
   // A tag that did not move is sent with the holder the dialog opened with.
   assert.deepEqual(retagStep(opened({ prod: 'rel-a' }), holdersOf({ prod: 'rel-a' }), 'prod'), { kind: 'move', expected: 'rel-a' });
+});
+
+test("a re-read that answers after the dialog stopped showing its tag neither sends nor advances that tag's precondition", async () => {
+  // OK on prod; while the read is pending the tag input reads canary.
+  let answer;
+  let input = 'prod';
+  const atOpen = opened({ prod: 'rel-a', canary: 'rel-b' });
+  const pending = retagStepNow(atOpen, () => new Promise((resolve) => { answer = resolve; }), 'seed', 'prod', (tag) => input === tag);
+  input = 'canary';
+  answer([
+    { id: 'rel-a', template_name: 'seed', tags: [] },
+    { id: 'rel-b', template_name: 'seed', tags: ['canary'] },
+    { id: 'rel-c', template_name: 'seed', tags: ['prod'] },
+  ]);
+  // The prod warning would not be seen, so its precondition stays at rel-a:
+  // OK on prod later warns rather than moving it from rel-c unseen.
+  assert.deepEqual(await pending, { kind: 'stale' });
+  assert.deepEqual(atOpen.holders, holdersOf({ prod: 'rel-a', canary: 'rel-b' }));
+  const later = retagStep(atOpen, holdersOf({ prod: 'rel-c', canary: 'rel-b' }), 'prod');
+  assert.equal(later.kind, 'warn');
+  // Still shown when it answers: the warning is shown and the tag advances.
+  input = 'prod';
+  const kept = retagStepNow(atOpen, () => new Promise((resolve) => { answer = resolve; }), 'seed', 'prod', (tag) => input === tag);
+  answer([{ id: 'rel-c', template_name: 'seed', tags: ['prod'] }]);
+  const warned = await kept;
+  assert.equal(warned.kind, 'warn');
+  assert.deepEqual(warned.baseline.change, { tag: 'prod', from: 'rel-a', to: 'rel-c' });
 });
 
 test('a second OK while the tag move is in flight sends nothing', async () => {

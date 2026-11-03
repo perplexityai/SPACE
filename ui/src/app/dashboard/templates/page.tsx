@@ -636,7 +636,8 @@ export default function TemplatesPage() {
   const retagFlight = useRef(singleFlight()).current;
   const [retagSubmitting, setRetagSubmitting] = useState(false);
   // Bumped when the dialog opens or closes, so a submit whose re-read
-  // outlived its dialog sends nothing.
+  // outlived its dialog sends nothing. The tag input and OK are disabled
+  // while a submit is in flight, so its answer is for the tag still shown.
   const retagSession = useRef(0);
   const retagTagInput = Form.useWatch('tag', retagForm) as string | undefined;
   const [expandedTemplateRows, setExpandedTemplateRows] = useState<string[]>([]);
@@ -997,13 +998,15 @@ export default function TemplatesPage() {
           () => refreshTemplateReleases({ showLoading: false }),
           release.template_name,
           tag,
+          // Closed, or opened for another release, while the releases were
+          // read; or showing another tag, whose warning would not be seen.
+          (shown) => session === retagSession.current && String(retagForm.getFieldValue('tag') ?? '').trim() === shown,
         );
       } catch {
         message.error("Could not read the template's tags again before moving the tag; nothing was changed. Try again.");
         return;
       }
-      // Closed, or opened for another release, while the releases were read.
-      if (session !== retagSession.current) return;
+      if (step.kind === 'stale') return;
       if (step.kind === 'warn') {
         setRetagModal((current) => ({ ...current, ...step.baseline }));
         return;
@@ -2449,6 +2452,7 @@ export default function TemplatesPage() {
         onCancel={closeRetagModal}
         onOk={() => retagForm.submit()}
         confirmLoading={retagSubmitting}
+        okButtonProps={{ disabled: retagSubmitting }}
         destroyOnHidden
       >
         {retagModal.change && retagTagInput?.trim() === retagModal.change.tag ? (
@@ -2465,7 +2469,7 @@ export default function TemplatesPage() {
             label="Tag"
             rules={[{ required: true, message: 'Tag is required' }]}
           >
-            <Input placeholder={DEFAULT_TEMPLATE_TAG} />
+            <Input placeholder={DEFAULT_TEMPLATE_TAG} disabled={retagSubmitting} />
           </Form.Item>
           <Space orientation="vertical" size={4}>
             <Text type="secondary">

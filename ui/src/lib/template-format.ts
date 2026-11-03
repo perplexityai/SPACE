@@ -90,14 +90,20 @@ export function retagStep(
 // What OK does, from a fresh read of the releases (`readReleases`) rather
 // than the page's list, which can be up to one refresh old: a tag that moved
 // since the dialog showed it warns before anything is sent. A failed read
-// throws, and nothing is sent.
+// throws, and nothing is sent. `shows(tag)` says whether the dialog, once the
+// read answers, still shows `tag`, so a warning would be seen: when it does
+// not (the dialog closed, or the tag was changed meanwhile), the answer is
+// `stale`, and neither a move nor a baseline advance follows from it.
 export async function retagStepNow(
   baseline: RetagBaseline,
   readReleases: () => Promise<{ id: string; template_name: string; tags: string[] }[]>,
   templateName: string,
   tag: string,
-): Promise<ReturnType<typeof retagStep>> {
-  return retagStep(baseline, tagHolders(await readReleases(), templateName), tag);
+  shows: (tag: string) => boolean,
+): Promise<ReturnType<typeof retagStep> | { kind: 'stale' }> {
+  const releases = await readReleases();
+  if (!shows(tag)) return { kind: 'stale' };
+  return retagStep(baseline, tagHolders(releases, templateName), tag);
 }
 
 // What a template row's builds panel shows: the template, whether the row is
