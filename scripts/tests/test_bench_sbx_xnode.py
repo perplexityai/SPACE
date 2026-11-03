@@ -296,7 +296,7 @@ class FakeRunTests(unittest.TestCase):
         def activated(sid, node):
             return node, json.dumps({"timestamp": xnode.now_ms() / 1000, "event_type": "runtime_activated",
                                      "sandbox_id": sid, "boot_type": "snapshot",
-                                     "restore_provenance": "remote_only"})
+                                     "restore_provenance": "remote_only", "restore_storage_uri_present": True})
 
         with tempfile.TemporaryDirectory() as tmp:
             kube = FakeKube(NODES)
