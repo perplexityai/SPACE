@@ -449,8 +449,9 @@ class SpaceApi:
         deadline = time.monotonic() + timeout
         last = ""
         try:
-            # Issue one delete now so a create that has not started can be canceled.
-            self.delete(sandbox_id, timeout)
+            # Issue one delete now so a create that has not started can be canceled;
+            # don't wait on it, since its operation can queue behind the create.
+            self.request("DELETE", f"/v1/sandboxes/{sandbox_id}", idempotent=True)
         except ApiError as error:
             last = str(error)
         while True:
