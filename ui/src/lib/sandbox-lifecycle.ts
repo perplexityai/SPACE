@@ -32,9 +32,20 @@ export const STORED_LIFECYCLE_FILTER_STATES = [...SANDBOX_LIFECYCLE_STATES, 'del
 const STORED_LIFECYCLES: ReadonlySet<string> = new Set(STORED_LIFECYCLE_FILTER_STATES);
 
 // The selected values the paged list can send; a status chosen on a sampled
-// list, such as `unknown`, is dropped rather than answered with a 400.
+// list, such as `unknown`, is not sent rather than answered with a 400.
 export function storedLifecycles(values: Iterable<string>): string[] {
   return [...values].filter((value) => STORED_LIFECYCLES.has(value));
+}
+
+// Which selected statuses a list applies. A paged list sends the stored
+// lifecycles and cannot apply the rest, such as `unknown` from a link or a
+// status chosen while the list was sampled; the console shows those apart,
+// as not applied, rather than as filter chips. A sampled list matches every
+// status against its rows.
+export function splitStatusFilter(paged: boolean, values: string[]): { applied: string[]; notApplied: string[] } {
+  if (!paged) return { applied: values, notApplied: [] };
+  const applied = storedLifecycles(values);
+  return { applied, notApplied: values.filter((value) => !STORED_LIFECYCLES.has(value)) };
 }
 
 // A row without a status shows, and filters, as `unknown`.

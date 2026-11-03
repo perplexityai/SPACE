@@ -8,6 +8,7 @@ import { usePathname, useSearchParams } from 'next/navigation';
 import {
   STORED_LIFECYCLE_FILTER_STATES,
   bringUpAction,
+  splitStatusFilter,
   statusFilterKey,
   statusFilterOptions,
   storedLifecycles,
@@ -50,14 +51,18 @@ import {
   nextCursorFor,
   nextPage,
   pageCursor,
+  parseListLink,
   parsePageSize,
   previousPage,
   sameScope,
   scopeChangePlan,
   type Continuation,
+  type AgeWindow,
   type CreatedAge,
   type ListMode,
   type ListScope,
+  type NodeFilter,
+  type OlderThan,
   type PagePosition,
   type SandboxListFilters,
 } from '@/lib/sandbox-list';
@@ -131,28 +136,10 @@ class ShownListError extends Error {}
 const alreadyReported = (err: unknown) => err instanceof RefreshSkipped || err instanceof ShownListError;
 const REFRESH_CLICK_COOLDOWN_MS = 3000;
 
-type AgeWindow = CreatedAge | 'all';
-type NodeFilter = 'any' | 'assigned' | 'unassigned';
-
-const VALID_AGE_WINDOWS: readonly AgeWindow[] = ['1h', '24h', '7d', '30d', '90d', '1y', 'all'];
-const VALID_NODE_FILTERS: readonly NodeFilter[] = ['any', 'assigned', 'unassigned'];
 // No age limit by default: long-running sandboxes are the ones support
 // cases tend to be about.
 const DEFAULT_AGE_WINDOW: AgeWindow = 'all';
 const DEFAULT_NODE_FILTER: NodeFilter = 'any';
-
-const parseAgeParam = (raw: string | null): AgeWindow =>
-  VALID_AGE_WINDOWS.includes(raw as AgeWindow) ? (raw as AgeWindow) : DEFAULT_AGE_WINDOW;
-const parseNodeParam = (raw: string | null): NodeFilter =>
-  VALID_NODE_FILTERS.includes(raw as NodeFilter) ? (raw as NodeFilter) : DEFAULT_NODE_FILTER;
-const parseCsvParam = (raw: string | null): string[] =>
-  raw ? raw.split(',').map((s) => s.trim()).filter(Boolean) : [];
-// The template filter takes one template, which is what the server filters
-// on; an older link may list several, and the first is kept.
-const parseTemplateParam = (raw: string | null): string | null => parseCsvParam(raw)[0] ?? null;
-const UUID_PARAM = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const parseUserParam = (raw: string | null): string | null =>
-  raw && UUID_PARAM.test(raw.trim()) ? raw.trim().toLowerCase() : null;
 
 const AGE_WINDOW_OPTIONS: { value: AgeWindow; label: string; ms: number | null }[] = [
   { value: '1h',  label: 'Last 1h',     ms: CREATED_AGES['1h'] },
@@ -165,7 +152,6 @@ const AGE_WINDOW_OPTIONS: { value: AgeWindow; label: string; ms: number | null }
 ];
 
 // "Created more than ... ago", the other end of the creation-time range.
-type OlderThan = CreatedAge | 'any';
 const OLDER_THAN_OPTIONS: { value: OlderThan; label: string; ms: number | null }[] = [
   { value: 'any', label: 'Older than: any', ms: null },
   ...AGE_WINDOW_OPTIONS.filter((opt) => opt.ms !== null).map((opt) => ({
@@ -174,8 +160,6 @@ const OLDER_THAN_OPTIONS: { value: OlderThan; label: string; ms: number | null }
     ms: opt.ms,
   })),
 ];
-const parseOlderParam = (raw: string | null): OlderThan =>
-  OLDER_THAN_OPTIONS.some((opt) => opt.value === raw) ? (raw as OlderThan) : 'any';
 const ageWindowAge = (value: AgeWindow): CreatedAge | null => (value === 'all' ? null : value);
 const olderThanAge = (value: OlderThan): CreatedAge | null => (value === 'any' ? null : value);
 const ageWindowMs = (value: AgeWindow) => createdAgeMs(ageWindowAge(value));
@@ -722,17 +706,26 @@ function SandboxesPage() {
   const searchParams = useSearchParams();
   const pathname = usePathname();
 
+  // Only what the list can apply is taken from the link; the rest is listed
+  // in a notice, and the rewritten URL drops it.
+  const [link] = useState(() => {
+    const parsed = parseListLink(searchParams);
+    const rawOrg = searchParams.get('org')?.trim();
+    if (rawOrg && !parseOrgParam(rawOrg)) parsed.ignored.push({ param: 'org', value: rawOrg, reason: 'not an organization ID' });
+    return parsed;
+  });
+  const [linkNoticeOpen, setLinkNoticeOpen] = useState(link.ignored.length > 0);
   const [idFilter, setIdFilter] = useState(() => searchParams.get('id') ?? '');
-  const [templateFilter, setTemplateFilter] = useState<string | null>(() => parseTemplateParam(searchParams.get('template')));
-  const [statusFilter, setStatusFilter] = useState<string[]>(() => parseCsvParam(searchParams.get('status')));
-  const [userFilter, setUserFilter] = useState<string | null>(() => parseUserParam(searchParams.get('user')));
-  const [nodeFilter, setNodeFilter] = useState<NodeFilter>(() => parseNodeParam(searchParams.get('node')));
-  const [ageWindow, setAgeWindow] = useState<AgeWindow>(() => parseAgeParam(searchParams.get('age')));
-  const [olderThan, setOlderThan] = useState<OlderThan>(() => parseOlderParam(searchParams.get('older')));
+  const [templateFilter, setTemplateFilter] = useState<string | null>(link.template);
+  const [statusFilter, setStatusFilter] = useState<string[]>(link.statuses);
+  const [userFilter, setUserFilter] = useState<string | null>(link.user);
+  const [nodeFilter, setNodeFilter] = useState<NodeFilter>(link.node);
+  const [ageWindow, setAgeWindow] = useState<AgeWindow>(link.age);
+  const [olderThan, setOlderThan] = useState<OlderThan>(link.older);
   // The sample size of a server that does not page.
   const [listLimit, setListLimit] = useState(() => parseListLimit(searchParams.get('limit')));
   const listLimitRef = useRef(listLimit);
-  const [pageSize, setPageSize] = useState(() => parsePageSize(searchParams.get('page_size')));
+  const [pageSize, setPageSize] = useState(link.pageSize);
   const pageSizeRef = useRef(pageSize);
   // Paged until a bare array shows the server does not page, and again once
   // a page shows that it does; see `listAnswerPlan`.
@@ -747,12 +740,14 @@ function SandboxesPage() {
   // Applied by the admin API (`org_id`) on either list shape.
   const [orgFilter, setOrgFilter] = useState<string | null>(() => parseOrgParam(searchParams.get('org')));
   const query = useMemo(() => sandboxQuery(idFilter), [idFilter]);
+  // The selected statuses this list applies, and those it cannot.
+  const statusSplit = useMemo(() => splitStatusFilter(listMode === 'paged', statusFilter), [listMode, statusFilter]);
   // What the search box does on this list's shape: a direct lookup, a prefix
   // the server matches, or a match within the loaded rows.
   const search = useMemo(() => sandboxSearch(idFilter, listMode), [idFilter, listMode]);
   const filterInputs: FilterInputs = {
     org: orgFilter,
-    statuses: statusFilter,
+    statuses: statusSplit.applied,
     template: templateFilter,
     user: userFilter,
     age: ageWindow,
@@ -1262,7 +1257,7 @@ function SandboxesPage() {
     return sandboxes.filter(loadedRowFilter(listMode, {
       matchesSearch: search.kind === 'page' ? (s) => matchesSandboxQuery(search.query, s) : null,
       template: templateFilter,
-      statuses: statusFilter,
+      statuses: statusSplit.applied,
       statusKey: statusFilterKey,
       userId: userFilter,
       node: nodeFilter,
@@ -1270,7 +1265,7 @@ function SandboxesPage() {
       olderThan: olderThanAge(olderThan),
       now: Date.now(),
     }));
-  }, [sandboxes, query, search, lookup, listMode, templateFilter, statusFilter, userFilter, nodeFilter, ageWindow, olderThan]);
+  }, [sandboxes, query, search, lookup, listMode, templateFilter, statusSplit, userFilter, nodeFilter, ageWindow, olderThan]);
 
   const lookupNeeded =
     query.kind === 'ref' && !loading && !sandboxes.some((s) => matchesSandboxQuery(query, s));
@@ -1649,7 +1644,7 @@ function SandboxesPage() {
               mode="multiple"
               size="small"
               placeholder={paged ? 'Stored lifecycle' : 'Status'}
-              value={statusFilter}
+              value={statusSplit.applied}
               onChange={(value) => setStatusFilter(value as string[])}
               options={statusFilterOptionList}
               allowClear
@@ -1663,6 +1658,13 @@ function SandboxesPage() {
               </Tooltip>
             ) : null}
           </Space>
+          {statusSplit.notApplied.length ? (
+            <Tooltip title="The list filters on the lifecycle the control plane stores, and these are not stored lifecycles, so they are not applied.">
+              <Tag color="warning" closable onClose={() => setStatusFilter(statusSplit.applied)} style={{ marginInlineEnd: 0 }}>
+                Not applied: {statusSplit.notApplied.join(', ')}
+              </Tag>
+            </Tooltip>
+          ) : null}
           {userFilter ? (
             <Tag closable onClose={() => setUserFilter(null)} style={{ marginInlineEnd: 0 }}>
               User: {userFilterLabel}
@@ -1757,6 +1759,17 @@ function SandboxesPage() {
           showIcon
           style={{ marginBottom: 12 }}
           title={`Showing the newest ${listLimit} sandboxes${orgFilter ? ` of ${orgNames.get(orgFilter) ?? orgFilter}` : ''}. Filters apply to these rows only; enter a full sandbox ID or pod name to look up any sandbox.`}
+        />
+      ) : null}
+
+      {linkNoticeOpen ? (
+        <Alert
+          type="warning"
+          showIcon
+          closable
+          onClose={() => setLinkNoticeOpen(false)}
+          style={{ marginBottom: 12 }}
+          title={`Left out of this link's filters: ${link.ignored.map((entry) => `${entry.param}=${entry.value} (${entry.reason})`).join('; ')}.`}
         />
       ) : null}
 

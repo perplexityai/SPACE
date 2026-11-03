@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import {
   FIRST_PAGE,
   ListRequests,
+  isTemplateName,
   NO_FILTERS,
   continuationFor,
   createdBounds,
@@ -13,6 +14,7 @@ import {
   nextCursorFor,
   nextPage,
   pageCursor,
+  parseListLink,
   parsePageSize,
   parseSandboxListResponse,
   previousPage,
@@ -272,4 +274,50 @@ test('created bounds are fixed at one instant, and an empty range keeps only the
   assert.deepEqual(createdBounds(null, 7 * 24 * hour, now), { createdAfter: null, createdBefore: '2026-10-27T12:00:00.000Z' });
   assert.deepEqual(createdBounds(hour, 24 * hour, now), { createdAfter: '2026-11-03T11:00:00.000Z', createdBefore: null });
   assert.deepEqual(createdBounds(hour, hour, now), { createdAfter: '2026-11-03T11:00:00.000Z', createdBefore: null });
+});
+
+const link = (query) => parseListLink(new URLSearchParams(query));
+
+test('a link sets each filter the list can apply', () => {
+  assert.deepEqual(link('template=seed&status=Started,deleted,started&user=0193A000-0000-7000-8000-000000000002&node=assigned&age=24h&older=1h&page_size=100'), {
+    template: 'seed',
+    statuses: ['started', 'deleted'],
+    user: '0193a000-0000-7000-8000-000000000002',
+    node: 'assigned',
+    age: '24h',
+    older: '1h',
+    pageSize: 100,
+    ignored: [],
+  });
+  assert.deepEqual(link(''), {
+    template: null, statuses: [], user: null, node: 'any', age: 'all', older: 'any', pageSize: 50, ignored: [],
+  });
+  // `older` is kept with no window, and an explicit default is no notice.
+  assert.equal(link('older=7d').older, '7d');
+  assert.deepEqual(link('age=all&older=any&node=any').ignored, []);
+});
+
+test('a link\'s filters the list cannot apply are left out and listed', () => {
+  const { older, age, ignored } = link('age=1h&older=24h');
+  // Shown as set, "older than 24h" within the last hour would have been
+  // dropped from the request; it is not shown at all.
+  assert.equal(age, '1h');
+  assert.equal(older, 'any');
+  assert.deepEqual(ignored, [{ param: 'older', value: '24h', reason: 'leaves no time inside the 1h window' }]);
+  assert.deepEqual(link('age=1h&older=1h').older, 'any');
+  const bad = link('template=Bad name,seed&user=someone&node=nearby&age=2h&older=2d&page_size=7');
+  assert.equal(bad.template, null);
+  assert.equal(bad.user, null);
+  assert.equal(bad.node, 'any');
+  assert.equal(bad.age, 'all');
+  assert.equal(bad.older, 'any');
+  assert.equal(bad.pageSize, 50);
+  assert.deepEqual(bad.ignored.map((entry) => entry.param), ['template', 'template', 'user', 'node', 'age', 'older', 'page_size']);
+  // A template the server would refuse is never sent.
+  assert.equal(link('template=../etc').template, null);
+});
+
+test('template names follow the server\'s rules', () => {
+  for (const name of ['seed', 'Python-3.12', 'a_b', 'x'.repeat(255)]) assert.equal(isTemplateName(name), true, name);
+  for (const name of ['', '.', '..', 'a b', 'a/b', 'x'.repeat(256), 'é']) assert.equal(isTemplateName(name), false, name);
 });

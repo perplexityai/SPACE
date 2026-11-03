@@ -280,3 +280,85 @@ export function continuationFor(answered: ListScope, nextCursor: string | null):
 export function nextCursorFor(continuation: Continuation | null, selected: ListScope): string | null {
   return continuation && continuation.scopeKey === selected.key ? continuation.cursor : null;
 }
+
+// A template name as the server parses one (`TemplateName` in
+// crates/libs/common/core/src/types/template/identity.rs); it refuses any
+// other `template` with a 400.
+export function isTemplateName(value: string): boolean {
+  return value.length <= 255 && value !== '.' && value !== '..' && /^[A-Za-z0-9._-]+$/.test(value);
+}
+
+export type AgeWindow = CreatedAge | 'all';
+export type OlderThan = CreatedAge | 'any';
+export type NodeFilter = 'any' | 'assigned' | 'unassigned';
+
+const isCreatedAge = (value: string): value is CreatedAge => Object.prototype.hasOwnProperty.call(CREATED_AGES, value);
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// The filters a list link sets, each one the list can apply, and the
+// parameters left out because the list could not: a value no control offers,
+// a template or user ID the server would refuse, or an "older than" bound
+// that leaves no time inside the window. The status values are kept as
+// given; which of them a list applies depends on its shape (see
+// `splitStatusFilter`). `org` is parsed by `parseOrgParam`.
+export interface ListLink {
+  template: string | null;
+  statuses: string[];
+  user: string | null;
+  node: NodeFilter;
+  age: AgeWindow;
+  older: OlderThan;
+  pageSize: number;
+  ignored: { param: string; value: string; reason: string }[];
+}
+
+export function parseListLink(params: { get(name: string): string | null }): ListLink {
+  const ignored: ListLink['ignored'] = [];
+  const raw = (param: string) => {
+    const value = params.get(param)?.trim() ?? '';
+    return value || null;
+  };
+  const ignore = (param: string, value: string, reason: string) => ignored.push({ param, value, reason });
+
+  // One template, which is what the server filters on; an older link may
+  // list several, and the first is kept.
+  let template: string | null = null;
+  const templates = raw('template')?.split(',').map((part) => part.trim()).filter(Boolean) ?? [];
+  if (templates.length) {
+    if (isTemplateName(templates[0])) template = templates[0];
+    else ignore('template', templates[0], 'not a template name');
+    if (templates.length > 1) ignore('template', templates.slice(1).join(','), 'the list filters on one template');
+  }
+
+  const statuses = [...new Set(raw('status')?.split(',').map((part) => part.trim().toLowerCase()).filter(Boolean) ?? [])];
+
+  let user: string | null = null;
+  const rawUser = raw('user');
+  if (rawUser && UUID.test(rawUser)) user = rawUser.toLowerCase();
+  else if (rawUser) ignore('user', rawUser, 'not a user ID');
+
+  let node: NodeFilter = 'any';
+  const rawNode = raw('node');
+  if (rawNode === 'any' || rawNode === 'assigned' || rawNode === 'unassigned') node = rawNode;
+  else if (rawNode) ignore('node', rawNode, 'not a node filter');
+
+  let age: AgeWindow = 'all';
+  const rawAge = raw('age');
+  if (rawAge && (rawAge === 'all' || isCreatedAge(rawAge))) age = rawAge;
+  else if (rawAge) ignore('age', rawAge, 'not a creation window');
+
+  let older: OlderThan = 'any';
+  const rawOlder = raw('older');
+  if (rawOlder && isCreatedAge(rawOlder)) {
+    if (age === 'all' || CREATED_AGES[rawOlder] < CREATED_AGES[age]) older = rawOlder;
+    else ignore('older', rawOlder, `leaves no time inside the ${age} window`);
+  } else if (rawOlder && rawOlder !== 'any') {
+    ignore('older', rawOlder, 'not an age');
+  }
+
+  const rawPageSize = raw('page_size');
+  const pageSize = parsePageSize(rawPageSize);
+  if (rawPageSize && String(pageSize) !== rawPageSize) ignore('page_size', rawPageSize, 'not an offered page size');
+
+  return { template, statuses, user, node, age, older, pageSize, ignored };
+}
