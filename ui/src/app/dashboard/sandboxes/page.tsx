@@ -38,18 +38,23 @@ import { adminApi } from '@/lib/api';
 import {
   CREATED_AGES,
   FIRST_PAGE,
+  ListRequests,
   PAGE_SIZE_OPTIONS,
   clientFilters,
+  continuationFor,
   createdAgeMs,
   createdBounds,
   listAnswerPlan,
   listRequestQuery,
   listScope,
+  nextCursorFor,
   nextPage,
   pageCursor,
   parsePageSize,
   previousPage,
   sameScope,
+  scopeChangePlan,
+  type Continuation,
   type CreatedAge,
   type ListMode,
   type ListScope,
@@ -735,7 +740,8 @@ function SandboxesPage() {
   const listModeRef = useRef<ListMode>('paged');
   const [position, setPosition] = useState<PagePosition>(FIRST_PAGE);
   const positionRef = useRef<PagePosition>(FIRST_PAGE);
-  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  // The next page's cursor, tied to the scope of the page that returned it.
+  const [continuation, setContinuation] = useState<Continuation | null>(null);
   // Bumped after every list load, so a direct lookup refreshes with the list.
   const [listGeneration, setListGeneration] = useState(0);
   // Applied by the admin API (`org_id`) on either list shape.
@@ -757,10 +763,14 @@ function SandboxesPage() {
   const [initialFilters] = useState(() => serverFilters(filterInputs));
   const serverFiltersRef = useRef<SandboxListFilters>(initialFilters);
   const appliedInputsRef = useRef({ key: filterInputsKey, prefix: filterInputs.prefix });
-  // Every list request takes the next number; only the newest one applies its
-  // rows, its error and the end of `loading`, so an older answer (even for
-  // the same org and size, after a change away and back) never wins.
-  const listRequestRef = useRef(0);
+  // Every list request takes a ticket with its scope; a change of scope
+  // invalidates every outstanding one. Only an answer whose ticket is the
+  // newest and whose scope is still selected applies its rows, its error and
+  // the end of `loading`; see `ListRequests`.
+  const requestsRef = useRef(new ListRequests());
+  // The selected scope, for rendering; the refs above are what requests read.
+  const [selectedScope, setSelectedScope] = useState<ListScope>(() =>
+    listScope('paged', initialFilters, { limit: pageSize, cursor: '' }));
   // The scope of the rows on screen, and the error of a load of another scope
   // that failed (its rows are cleared rather than shown under the new label).
   const shownScopeRef = useRef<ListScope | null>(null);
@@ -822,31 +832,38 @@ function SandboxesPage() {
     return listScope(mode, filters, { limit, cursor: pageCursor(positionRef.current) });
   };
 
+  // Called after any ref above that makes up the scope changes.
+  const scopeChanged = () => {
+    requestsRef.current.invalidate();
+    setSelectedScope(currentScope());
+  };
+
   const refresh = async ({
     showLoading = true,
     reconcile = false,
     scope = currentScope(),
   }: { showLoading?: boolean; reconcile?: boolean; scope?: ListScope } = {}) => {
     // A poll or Refresh captures its scope before its lock callback runs; if
-    // the selection changed meanwhile, it must not take a newer number than
-    // the load for the new selection.
-    if (!sameScope(currentScope(), scope)) throw new RefreshSkipped('the selected page, filters or size changed');
-    const request = ++listRequestRef.current;
-    const newest = () => request === listRequestRef.current;
+    // the selection changed meanwhile, it must not invalidate the load for
+    // the new selection.
+    const skipped = () => new RefreshSkipped('the selected page, filters or size changed');
+    if (!sameScope(currentScope(), scope)) throw skipped();
+    const ticket = requestsRef.current.begin(scope);
+    const applies = () => requestsRef.current.applies(ticket, currentScope());
     if (showLoading) setLoading(true);
     let reloadSample = false;
     try {
       const response = await getConsoleSandboxList(listRequestQuery(scope, Date.now()));
-      if (!newest()) return;
-      const plan = listAnswerPlan(scope.mode, response, {
-        pageSize: pageSizeRef.current,
-        sampleLimit: listLimitRef.current,
-      });
+      // An answer for a scope no longer selected, even one selected again
+      // since, is dropped.
+      if (!applies()) throw skipped();
+      const plan = listAnswerPlan(scope.mode, response);
       if (plan.mode !== listModeRef.current) {
         listModeRef.current = plan.mode;
         setListMode(plan.mode);
         positionRef.current = FIRST_PAGE;
         setPosition(FIRST_PAGE);
+        scopeChanged();
       }
       // A bare array answering a paged request is the newest rows of a
       // server that does not page; the sample is read below instead.
@@ -859,14 +876,16 @@ function SandboxesPage() {
           data.sort((a, b) => parseUptime(b.uptime) - parseUptime(a.uptime) || a.id.localeCompare(b.id));
         }
         setSandboxes(data);
-        setNextCursor(response.mode === 'paged' ? response.nextCursor : null);
+        setContinuation(continuationFor(scope, response.mode === 'paged' ? response.nextCursor : null));
         shownScopeRef.current = scope;
         setListError(null);
         setListGeneration((n) => n + 1);
         markViewRefreshed(sandboxesRefreshKey(scope));
       }
     } catch (err: any) {
-      if (!newest()) return;
+      if (err instanceof RefreshSkipped || !applies()) throw skipped();
+      // Next continues from the page shown, not from the one that failed.
+      setContinuation(null);
       const text = err.message || 'failed to refresh sandboxes';
       if (!sameScope(shownScopeRef.current, scope)) {
         // The rows on screen belong to another org or size; do not show them
@@ -881,8 +900,9 @@ function SandboxesPage() {
       // Keep the last rendered view when a node-local manager is briefly unavailable.
       throw new Error(text);
     } finally {
-      // Only the newest request ends `loading`, whichever request started it.
-      if (newest() && !reloadSample) setLoading(false);
+      // Only an answer that applies ends `loading`, whichever request started
+      // it; a change of scope that keeps the rows on screen ends it itself.
+      if (applies() && !reloadSample) setLoading(false);
     }
     if (reloadSample) await refresh({ showLoading, reconcile, scope: currentScope() });
   };
@@ -1205,7 +1225,13 @@ function SandboxesPage() {
       listLimitRef.current = listLimit;
       positionRef.current = FIRST_PAGE;
       setPosition(FIRST_PAGE);
-      if (sameScope(shownScopeRef.current, currentScope())) return;
+      scopeChanged();
+      // A change undone before its answer arrived: that answer is dropped and
+      // the rows on screen are the selected scope's already.
+      if (scopeChangePlan(shownScopeRef.current, currentScope()) === 'keep') {
+        setLoading(false);
+        return;
+      }
       // An error belongs to the request that failed.
       setListError(null);
       refreshAndReport();
@@ -1217,6 +1243,7 @@ function SandboxesPage() {
     if (!next) return;
     positionRef.current = next;
     setPosition(next);
+    scopeChanged();
     setListError(null);
     refreshAndReport();
   };
@@ -1792,8 +1819,8 @@ function SandboxesPage() {
             size="small"
             icon={<RightOutlined />}
             iconPlacement="end"
-            disabled={loading || !nextCursor}
-            onClick={() => goToPage(nextPage(positionRef.current, nextCursor))}
+            disabled={loading || !nextCursorFor(continuation, selectedScope)}
+            onClick={() => goToPage(nextPage(positionRef.current, nextCursorFor(continuation, currentScope())))}
           >
             Next
           </Button>

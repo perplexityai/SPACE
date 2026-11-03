@@ -145,15 +145,14 @@ export function clientFilters(mode: ListMode): ClientFilters {
 }
 
 // What to do with a list answer. A bare array answering a paged request
-// means the server does not page: the console switches to sampling, and
-// reads the sample size it wanted unless this answer already holds it.
+// means the server does not page: the console switches to sampling and
+// reads the sample, a new scope, rather than show rows it asked for as a page.
 export function listAnswerPlan(
   sent: ListMode,
   response: SandboxListResponse,
-  { pageSize, sampleLimit }: { pageSize: number; sampleLimit: number },
 ): { mode: ListMode; reloadSample: boolean } {
   if (response.mode === 'paged') return { mode: 'paged', reloadSample: false };
-  return { mode: 'sampled', reloadSample: sent === 'paged' && pageSize !== sampleLimit };
+  return { mode: 'sampled', reloadSample: sent === 'paged' };
 }
 
 export const PAGE_SIZE_OPTIONS = [25, 50, 100, 200, 500];
@@ -200,4 +199,49 @@ export function createdBounds(
   const createdAfter = withinMs === null ? null : new Date(now - withinMs).toISOString();
   const usable = olderThanMs !== null && (withinMs === null || olderThanMs < withinMs);
   return { createdAfter, createdBefore: usable ? new Date(now - olderThanMs).toISOString() : null };
+}
+
+// The list requests in flight. Each takes a ticket naming its scope; any
+// change of scope invalidates every outstanding ticket. An answer applies
+// only when its ticket is the newest and its scope is still the selected
+// one, so an answer for a filter that was chosen and then undone before it
+// arrived is never shown under the filter now selected.
+export class ListRequests {
+  private latest = 0;
+
+  begin(scope: ListScope): { id: number; scope: ListScope } {
+    this.latest += 1;
+    return { id: this.latest, scope };
+  }
+
+  invalidate(): void {
+    this.latest += 1;
+  }
+
+  applies(ticket: { id: number; scope: ListScope }, selected: ListScope): boolean {
+    return ticket.id === this.latest && sameScope(ticket.scope, selected);
+  }
+}
+
+// After the selection changes: the rows on screen are kept when they are the
+// selected scope's (a change undone before its answer arrived), and
+// otherwise the selected scope is loaded.
+export function scopeChangePlan(shown: ListScope | null, selected: ListScope): 'keep' | 'load' {
+  return sameScope(shown, selected) ? 'keep' : 'load';
+}
+
+// The cursor of the page after the one shown, with the scope (filters,
+// size and page position) of the request that returned it. Next uses it
+// only while that scope is still selected; a failed load clears it.
+export interface Continuation {
+  scopeKey: string;
+  cursor: string;
+}
+
+export function continuationFor(answered: ListScope, nextCursor: string | null): Continuation | null {
+  return nextCursor ? { scopeKey: answered.key, cursor: nextCursor } : null;
+}
+
+export function nextCursorFor(continuation: Continuation | null, selected: ListScope): string | null {
+  return continuation && continuation.scopeKey === selected.key ? continuation.cursor : null;
 }

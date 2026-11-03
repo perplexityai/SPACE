@@ -2,12 +2,15 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   FIRST_PAGE,
+  ListRequests,
   NO_FILTERS,
   clientFilters,
+  continuationFor,
   createdBounds,
   listAnswerPlan,
   listRequestQuery,
   listScope,
+  nextCursorFor,
   nextPage,
   pageCursor,
   parsePageSize,
@@ -15,6 +18,7 @@ import {
   previousPage,
   sameScope,
   sandboxListQuery,
+  scopeChangePlan,
 } from './sandbox-list.ts';
 
 const sandbox = { id: 'sbx_01a19089-216f-751e-9f56-1906865f5c23', resource_type: 'sandbox' };
@@ -111,16 +115,70 @@ test('a paged list leaves only the node filter to the console; a sampled one fil
   assert.deepEqual(clientFilters('sampled'), { text: true, template: true, status: true, user: true, created: true, node: true });
 });
 
-test('a bare array answering a paged request switches to sampling and reads the sample size', () => {
+test('a bare array answering a paged request switches to sampling and reads the sample', () => {
   const sampled = { mode: 'sampled', sandboxes: [] };
   const paged = { mode: 'paged', sandboxes: [], nextCursor: null };
-  const sizes = { pageSize: 50, sampleLimit: 1000 };
-  assert.deepEqual(listAnswerPlan('paged', sampled, sizes), { mode: 'sampled', reloadSample: true });
-  // The answer already holds the sample the console wanted.
-  assert.deepEqual(listAnswerPlan('paged', sampled, { pageSize: 100, sampleLimit: 100 }), { mode: 'sampled', reloadSample: false });
+  // Its rows were asked for as a page; the sample is another scope.
+  assert.deepEqual(listAnswerPlan('paged', sampled), { mode: 'sampled', reloadSample: true });
   // A sampled request was already the sample.
-  assert.deepEqual(listAnswerPlan('sampled', sampled, sizes), { mode: 'sampled', reloadSample: false });
-  assert.deepEqual(listAnswerPlan('paged', paged, sizes), { mode: 'paged', reloadSample: false });
+  assert.deepEqual(listAnswerPlan('sampled', sampled), { mode: 'sampled', reloadSample: false });
+  assert.deepEqual(listAnswerPlan('paged', paged), { mode: 'paged', reloadSample: false });
+});
+
+const scopeOf = (filters, cursor = '') => listScope('paged', { ...NO_FILTERS, ...filters }, { limit: 50, cursor });
+
+test('an answer for a filter undone before it arrived is dropped, and the rows on screen are kept', () => {
+  const requests = new ListRequests();
+  const a = scopeOf({ template: 'alpha' });
+  const b = scopeOf({ template: 'beta' });
+  // A is on screen.
+  let shown = a;
+  // B is selected and requested.
+  requests.invalidate();
+  assert.equal(scopeChangePlan(shown, b), 'load');
+  const forB = requests.begin(b);
+  // A is selected again before B answers: nothing is reloaded...
+  requests.invalidate();
+  assert.equal(scopeChangePlan(shown, a), 'keep');
+  // ...and B's answer, still the newest request, does not apply under A.
+  assert.equal(requests.applies(forB, a), false);
+  // Nor would it if B were selected again: it was sent before the change.
+  assert.equal(requests.applies(forB, b), false);
+  // A poll of A begun before the change is dropped too; the next one applies.
+  const pollA = requests.begin(a);
+  requests.invalidate();
+  assert.equal(requests.applies(pollA, a), false);
+  const nextPoll = requests.begin(a);
+  assert.equal(requests.applies(nextPoll, a), true);
+  shown = null;
+  assert.equal(scopeChangePlan(shown, a), 'load');
+});
+
+test('a newer request for the same scope supersedes an older one', () => {
+  const requests = new ListRequests();
+  const a = scopeOf({});
+  const first = requests.begin(a);
+  const second = requests.begin(a);
+  assert.equal(requests.applies(first, a), false);
+  assert.equal(requests.applies(second, a), true);
+});
+
+test('Next takes the cursor only while the page that returned it is selected', () => {
+  const page1 = scopeOf({ template: 'alpha' });
+  const fromPage1 = continuationFor(page1, 'c1');
+  assert.equal(nextCursorFor(fromPage1, page1), 'c1');
+  // Next was clicked: page 2 is selected and loading, so page 1's cursor
+  // does not lead anywhere from it.
+  const page2 = scopeOf({ template: 'alpha' }, 'c1');
+  assert.equal(nextCursorFor(fromPage1, page2), null);
+  // Page 2 failed: the console clears the continuation, and Next stays off
+  // until a page answers.
+  assert.equal(nextCursorFor(null, page2), null);
+  assert.equal(nextCursorFor(continuationFor(page2, 'c2'), page2), 'c2');
+  // Another filter on the same page position is another scope.
+  assert.equal(nextCursorFor(fromPage1, scopeOf({ template: 'beta' })), null);
+  // The last page has no continuation.
+  assert.equal(continuationFor(page2, null), null);
 });
 
 test('pages are walked forward by next_cursor and back by the visited cursors', () => {
