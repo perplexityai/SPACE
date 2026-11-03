@@ -228,13 +228,13 @@ static ADMIN_PAGE_SQL: LazyLock<String> = LazyLock::new(|| {
 });
 
 /// The legacy unpaged list: at most $12 sandboxes matching the filters
-/// ($1-$11, as [`ADMIN_CANDIDATE_ROWS`]'s), newest first. `{sandbox_from}`
-/// joins the Direct route, so `assigned` ($11) tests the response's own
-/// `active_node_id` expression; `node_id` ($10) takes Direct's predicate,
-/// whose narrowing conjunct reaches a node's few sandboxes by index where the
-/// joined expression tests every row. Built once, as above.
+/// ($1-$11, as [`ADMIN_CANDIDATE_ROWS`]'s, with the same Direct predicates),
+/// newest first. `{sandbox_from}` joins the Direct route for the response, so
+/// the predicates look a filtered row's route up again, by its primary key.
+/// Built once, as above.
 static ADMIN_LIST_SQL: LazyLock<String> = LazyLock::new(|| {
     let on_node = reported_on_node("s", "$10");
+    let on_a_node = reported_on_a_node("s");
     sandbox_query(&format!(
         "SELECT {{sandbox_columns}}
          FROM {{sandbox_from}}
@@ -248,8 +248,7 @@ static ADMIN_LIST_SQL: LazyLock<String> = LazyLock::new(|| {
                 OR starts_with(s.name, $7)
                 OR s.id BETWEEN $8::UUID AND $9::UUID)
            AND ($10::UUID IS NULL OR {on_node})
-           AND ($11::BOOLEAN IS NULL
-                OR (COALESCE(direct_route.current_node_id, s.active_node_id) IS NOT NULL) = $11)
+           AND ($11::BOOLEAN IS NULL OR {on_a_node} = $11)
          ORDER BY s.created_at DESC, s.id DESC
          LIMIT $12"
     ))
