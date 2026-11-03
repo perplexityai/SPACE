@@ -1142,6 +1142,13 @@ NATIVE_OPERATION_READY_ENVS = (
     "SPACE_CREATE_DATA_PLANE_READY_TIMEOUT_SECS",
     "SPACE_CREATE_COMMAND_READY_TIMEOUT_SECS",
 )
+# The data plane's Native upload admission (NativeUploadAdmissionArgs,
+# crates/l40_api/data/plane/server/src/native_files/admission.rs).
+NATIVE_FILE_UPLOAD_ADMISSION_ENVS = (
+    "SPACE_DATA_PLANE_NATIVE_UPLOAD_ADMISSION",
+    "SPACE_DATA_PLANE_MAX_CONCURRENT_NATIVE_UPLOADS_PER_SANDBOX",
+    "SPACE_DATA_PLANE_NATIVE_UPLOAD_ADMISSION_WAIT_MS",
+)
 
 
 class KindHarness:
@@ -3498,31 +3505,68 @@ ON CONFLICT (key_hash) DO NOTHING;
 
     def set_native_operation_probe_budgets(self, expected: list[dict], desired: list[dict], *, expected_uid: str, remove: bool = False) -> None:
         """Change only the three native invalid-create probe budget literals."""
+        self._patch_owned_deployment_env(
+            "space-cluster-controller",
+            {NATIVE_OPERATION_AGE_ENV, *NATIVE_OPERATION_READY_ENVS},
+            expected,
+            desired,
+            expected_uid=expected_uid,
+            remove=remove,
+            what="controller budget",
+        )
+
+    def set_native_file_upload_admission_env(self, expected: list[dict], desired: list[dict], *, expected_uid: str, remove: bool = False) -> None:
+        """Change only the data plane's upload admission literals."""
+        self._patch_owned_deployment_env(
+            "space-data-plane",
+            set(NATIVE_FILE_UPLOAD_ADMISSION_ENVS),
+            expected,
+            desired,
+            expected_uid=expected_uid,
+            remove=remove,
+            what="data-plane upload admission",
+        )
+
+    def _patch_owned_deployment_env(
+        self,
+        name: str,
+        allowed: set[str],
+        expected: list[dict],
+        desired: list[dict],
+        *,
+        expected_uid: str,
+        remove: bool,
+        what: str,
+    ) -> None:
+        """Move `name`'s first container env from `expected` to `desired`, touching only `allowed` names.
+
+        Only on owned local Kind control, and only while the Deployment and its
+        env are still the ones the caller read: a replaced Deployment or a
+        concurrent env change is refused rather than overwritten.
+        """
         if (
             self._retention_lease_ownership is None
             or not self.config.context.startswith("kind-")
             or urlsplit(self.config.api_url).hostname not in {"localhost", "127.0.0.1", "::1"}
         ):
-            raise SmokeConfigurationError("native probe budgets require owned local Kind control")
+            raise SmokeConfigurationError(f"the {what} env requires owned local Kind control")
         self._assert_retention_lease_owned()
-        name = "space-cluster-controller"
         observed = self.kubectl("get", "deployment", name, "-o", "json", timeout=15)
         if observed.returncode:
-            raise SmokeConfigurationError("could not inspect native probe controller")
+            raise SmokeConfigurationError(f"could not inspect {name}")
         deployment = json.loads(observed.stdout)
         if deployment["metadata"]["uid"] != expected_uid:
-            raise SmokeConfigurationError("refusing replaced native probe controller")
+            raise SmokeConfigurationError(f"refusing replaced {name}")
         containers = deployment["spec"]["template"]["spec"]["containers"]
         if len(containers) != 1 or containers[0].get("env", []) != expected:
-            raise SmokeConfigurationError("controller environment changed concurrently; refusing overwrite")
+            raise SmokeConfigurationError(f"{name} environment changed concurrently; refusing overwrite")
         path = "/spec/template/spec/containers/0/env"
         patch = [
             {"op": "test", "path": "/metadata/resourceVersion", "value": deployment["metadata"]["resourceVersion"]},
         ]
-        allowed = {NATIVE_OPERATION_AGE_ENV, *NATIVE_OPERATION_READY_ENVS}
         if remove:
             if desired or any(entry.get("name") not in allowed for entry in expected):
-                raise SmokeConfigurationError("refusing to remove unrelated controller environment")
+                raise SmokeConfigurationError(f"refusing to remove unrelated {name} environment")
             patch.append({"op": "remove", "path": path})
         else:
             if "env" not in containers[0]:
@@ -3532,22 +3576,21 @@ ON CONFLICT (key_hash) DO NOTHING;
                     continue
                 if (expected[index].get("name") not in allowed
                         or desired[index].get("name") != expected[index].get("name")):
-                    raise SmokeConfigurationError("refusing unrelated controller environment changes")
+                    raise SmokeConfigurationError(f"refusing unrelated {name} environment changes")
                 patch.append({"op": "replace", "path": f"{path}/{index}", "value": desired[index]})
             for index in range(len(expected) - 1, len(desired) - 1, -1):
                 if expected[index].get("name") not in allowed:
-                    raise SmokeConfigurationError("refusing to remove unrelated controller environment")
+                    raise SmokeConfigurationError(f"refusing to remove unrelated {name} environment")
                 patch.append({"op": "remove", "path": f"{path}/{index}"})
             for entry in desired[len(expected):]:
                 if entry.get("name") not in allowed:
-                    raise SmokeConfigurationError("refusing to add unrelated controller environment")
+                    raise SmokeConfigurationError(f"refusing to add unrelated {name} environment")
                 patch.append({"op": "add", "path": f"{path}/-", "value": entry})
         result = self.kubectl(
             "patch", "deployment", name, "--type=json", "--patch", json.dumps(patch), timeout=15
         )
         if result.returncode:
-            raise SmokeConfigurationError("controller budget patch failed; concurrent changes were not overwritten")
-
+            raise SmokeConfigurationError(f"{what} patch failed; concurrent changes were not overwritten")
 
     def _deployment_env_literals(self, name: str, keys: Sequence[str]) -> dict[str, str | None]:
         result = self.kubectl(

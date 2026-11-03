@@ -145,7 +145,16 @@ _DURATION_SECONDS = {
         "native_contract.command_validation": 3,
         "native_contract.command_wakes_idle_suspended_sandbox": 70,
         "native_contract.completed_delete_replay": 3,
+        # Not in the measured runs; an estimate.
+        "native_contract.file_idempotency_across_origins": 5,
         "native_contract.file_idempotency_conflict": 3,
+        # Not in the measured runs. Estimates until a bench run refreshes
+        # them: an idle suspend and an inline wake; two 16 MiB writes; a data
+        # plane rollout there and back.
+        "native_contract.file_op_wakes_idle_suspended_sandbox": 100,
+        "native_contract.file_operations_match_on_the_data_plane": 10,
+        "native_contract.file_upload_admission_429": 60,
+        "native_contract.file_write_size_boundary_on_the_data_plane": 15,
         "native_contract.idempotency_conflict": 3,
         "native_contract.permanent_command_error": 3,
         "native_contract.process_session_wakes_idle_suspended_sandbox": 70,
