@@ -256,11 +256,10 @@ def parse_activation(line: str, node: str) -> Activation | None:
 
 
 # Only `cross_node_download` samples count toward the primary metric: the
-# restore landed off the source worker and had no local copy, so it downloaded
-# its snapshot (sandbox.restore.placement with local_snapshot_present:false).
+# restore landed off the source worker and restored its snapshot from object
+# storage (a `remote_*` provenance with the storage URI present).
 CLASSIFICATIONS = (
     "cross_node_download",
-    "cross_node_local_copy",
     "cross_node_no_remote",
     "same_node",
     "outside_pool",
@@ -279,10 +278,8 @@ def classify(source_node: str | None, activation: Activation | None,
         return "same_node"
     if pool is not None and activation.node not in pool:
         return "outside_pool"
-    if activation.provenance == "remote_only":
+    if activation.provenance.startswith("remote_") and activation.storage_uri_present:
         return "cross_node_download"
-    if activation.provenance.startswith("remote_"):
-        return "cross_node_local_copy"
     return "cross_node_no_remote"
 
 

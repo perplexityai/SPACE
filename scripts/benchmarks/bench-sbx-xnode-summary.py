@@ -40,7 +40,10 @@ from typing import Any, Iterable, Sequence
 
 MIN_SAMPLES = {"loaded": 2000, "quiet": 400}
 MIN_BLOCKS = {"loaded": 4, "quiet": 1}
-NOT_ELIGIBLE = {"same_node", "outside_pool", "not_snapshot", "cross_node_local_copy", "cross_node_no_remote"}
+NOT_ELIGIBLE = {"same_node", "outside_pool", "not_snapshot", "cross_node_no_remote"}
+# Result files written before every remote restore counted as a download label
+# the non-`remote_only` ones `cross_node_local_copy`; they downloaded too.
+LEGACY_LABELS = {"cross_node_local_copy": "cross_node_download"}
 
 
 def percentile(sorted_values: Sequence[float], q: float) -> float | None:
@@ -118,6 +121,7 @@ def collect(rows: Sequence[dict[str, Any]], *, wake_timeout_ms: float) -> dict[s
                 g["excluded_warmup"] += 1
                 continue
             label = (placement.get((row["run_id"], row["wake_id"])) or {}).get("classification", "unclassified")
+            label = LEGACY_LABELS.get(label, label)
             g["classification"][label] += 1
             if row["outcome"] == "ok":
                 if row.get("correctness_ok") is False:
