@@ -7,20 +7,31 @@ use tonic::Request;
 use tonic_health::pb::health_client::HealthClient;
 
 async fn serve_health(socket_path: &Path) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
-    let listener = tokio::net::UnixListener::bind(socket_path).expect("bind test socket");
     let (reporter, service) = tonic_health::server::health_reporter();
     reporter
         .set_service_status("", tonic_health::ServingStatus::Serving)
         .await;
+    serve_uds(
+        socket_path,
+        tonic::transport::Server::builder().add_service(service),
+    )
+}
+
+/// Serves `router` on a Unix socket bound at `socket_path` until the returned
+/// sender fires.
+fn serve_uds(
+    socket_path: &Path,
+    router: tonic::transport::server::Router,
+) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::UnixListener::bind(socket_path).expect("bind test socket");
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(service)
+        router
             .serve_with_incoming_shutdown(UnixListenerStream::new(listener), async move {
                 let _ = shutdown_rx.await;
             })
             .await
-            .expect("serve test health service");
+            .expect("serve test service");
     });
     (shutdown_tx, task)
 }
@@ -820,6 +831,61 @@ async fn a_refused_dial_is_a_client_connect_failure_through_either_connector() {
             "{connector}: {status:?}"
         );
     }
+}
+
+// Over a Unix socket only a peer that is not listening is a connect failure:
+// an absent socket or one whose listener has gone, as while a node-local
+// server restarts. A server that answers `UNAVAILABLE` itself was reached.
+#[tokio::test]
+async fn a_unix_socket_dial_is_a_client_connect_failure_only_when_nothing_listens() {
+    let sockets = tempfile::tempdir().unwrap();
+    let absent = sockets.path().join("absent.sock");
+    let refused = sockets.path().join("refused.sock");
+    drop(std::os::unix::net::UnixListener::bind(&refused).unwrap());
+    let answering = sockets.path().join("answering.sock");
+    // Only the server's own answer carries this exact message, so the row
+    // proves the server was reached rather than a dial failing unrecognised.
+    let answered = "connection refused";
+    let (shutdown_tx, server) = serve_uds(
+        &answering,
+        tonic::transport::Server::builder().add_service(
+            tonic_health::pb::health_server::HealthServer::new(UnavailableHealth(answered)),
+        ),
+    );
+    let endpoint =
+        tonic::transport::Endpoint::try_from("http://[::]:50051").expect("static test endpoint");
+
+    for (socket, cause, message) in [
+        (
+            &absent,
+            Some(crate::ClientConnectFailureCause::NotFound),
+            None,
+        ),
+        (
+            &refused,
+            Some(crate::ClientConnectFailureCause::Refused),
+            None,
+        ),
+        (&answering, None, Some(answered)),
+    ] {
+        let status =
+            health_check_status(super::connect_uds_channel_lazy(socket, endpoint.clone())).await;
+        assert_eq!(
+            status.code(),
+            tonic::Code::Unavailable,
+            "{socket:?}: {status:?}"
+        );
+        assert_eq!(
+            crate::client_connect_failure_cause(&status),
+            cause,
+            "{socket:?}: {status:?}"
+        );
+        if let Some(message) = message {
+            assert_eq!(status.message(), message, "{socket:?}: {status:?}");
+        }
+    }
+    shutdown_tx.send(()).unwrap();
+    server.await.unwrap();
 }
 
 // A kept channel whose redial never connects fails the RPC that waited for it
