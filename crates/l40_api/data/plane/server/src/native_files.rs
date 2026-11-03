@@ -11,31 +11,40 @@
 //! server. The API keeps those handlers, and serves whatever reaches it.
 
 mod access;
+mod admission;
 mod call;
 mod mutations;
 mod read;
+mod write;
 
 use std::sync::Arc;
 
 use axum::{
     Router,
     body::Body,
-    extract::FromRequest,
-    http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header},
+    extract::{DefaultBodyLimit, FromRequest, FromRequestParts, Path},
+    http::{Extensions, HeaderMap, HeaderValue, Method, Request, StatusCode, Version, header},
     middleware,
     response::{IntoResponse, Response},
     routing::any,
 };
+use pplx_space_common_core::types::{OrgId, SandboxId};
 use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_native_files::FileOperation;
+use pplx_space_native_files::limits::{
+    WRITE_FILE_BATCH_BODY_LIMIT_BYTES, WRITE_FILE_BODY_LIMIT_BYTES,
+};
+use pplx_space_public_api::PublicSandboxId;
 use pplx_space_public_api_http::{PublicApiError, normalize_public_error};
 use serde::de::DeserializeOwned;
 
 pub(crate) use access::NativeFileAccessClient;
 pub use access::NativeFileAccessConfigError;
+pub use admission::{NativeUploadAdmissionArgs, NativeUploadAdmissionConfig};
 use call::Grant;
 
 use super::DataPlaneState;
+use crate::upload_admission::UploadAdmission;
 
 const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 
@@ -52,11 +61,30 @@ pub enum NativeFilesMode {
 /// What the files routes need beyond the rest of the data plane.
 pub(crate) struct NativeFiles {
     access: NativeFileAccessClient,
+    /// Admission for writes ([`admission`]), apart from ECW's uploads.
+    /// `None` admits every write.
+    uploads: Option<UploadAdmission>,
 }
 
 impl NativeFiles {
-    pub(crate) fn new(access: NativeFileAccessClient) -> Self {
-        Self { access }
+    pub(crate) fn new(
+        access: NativeFileAccessClient,
+        upload_admission: Option<&NativeUploadAdmissionConfig>,
+    ) -> Self {
+        Self {
+            access,
+            uploads: upload_admission.map(|config| UploadAdmission::new(&config.budgets())),
+        }
+    }
+}
+
+/// The request body limit `operation`'s route has on the API.
+fn body_limit(operation: FileOperation) -> usize {
+    match operation {
+        FileOperation::Write => WRITE_FILE_BODY_LIMIT_BYTES,
+        FileOperation::WriteBatch => WRITE_FILE_BATCH_BODY_LIMIT_BYTES,
+        // The framework's default.
+        _ => 2 * 1024 * 1024,
     }
 }
 
@@ -65,11 +93,12 @@ pub(super) fn router() -> Router<DataPlaneState> {
     let mut router = Router::new();
     for prefix in ["/v1", "/api/v1"] {
         for operation in FileOperation::ALL {
-            let Some(handler) = handler(operation) else {
-                continue;
-            };
+            let handler = handler(operation);
             let path = format!("{prefix}{}", operation.route().relative_runtime_path());
-            router = router.route(&path, handler);
+            router = router.route(
+                &path,
+                handler.layer(DefaultBodyLimit::max(body_limit(operation))),
+            );
         }
     }
     router.layer(middleware::from_fn(
@@ -77,10 +106,10 @@ pub(super) fn router() -> Router<DataPlaneState> {
     ))
 }
 
-fn handler(operation: FileOperation) -> Option<axum::routing::MethodRouter<DataPlaneState>> {
+fn handler(operation: FileOperation) -> axum::routing::MethodRouter<DataPlaneState> {
     // Every method reaches the handler: the API answers a wrong method only
     // after it has authorized the request, so the 405 waits until then too.
-    Some(match operation {
+    match operation {
         FileOperation::Stat => any(read::stat_file),
         FileOperation::List => any(read::list_files),
         FileOperation::Read => any(read::read_file),
@@ -90,8 +119,9 @@ fn handler(operation: FileOperation) -> Option<axum::routing::MethodRouter<DataP
         FileOperation::ChangesEnable => any(mutations::enable_file_change_tracking),
         FileOperation::ChangesDisable => any(mutations::disable_file_change_tracking),
         FileOperation::Modified => any(mutations::modified_files),
-        _ => return None,
-    })
+        FileOperation::Write => any(write::write_file),
+        FileOperation::WriteBatch => any(write::write_file_batch),
+    }
 }
 
 /// A request the API has authorized, with its body still unread.
@@ -100,6 +130,13 @@ pub(super) struct FileRequest {
     /// What the API was asked to authorize; preparing asks it again.
     access: pplx_space_node_api_client::proto::NativeFileRequest,
     pub(super) headers: HeaderMap,
+    /// The route's, such as its body limit, for reading the body.
+    extensions: Extensions,
+    pub(super) version: Version,
+    /// The sandbox the path names, as the API parsed it.
+    pub(super) sandbox_id: SandboxId,
+    /// The org the request acts for.
+    pub(super) org_id: OrgId,
 }
 
 impl FileRequest {
@@ -115,17 +152,32 @@ impl FileRequest {
             // The routes are mounted only with a client to the API.
             return Err(PublicApiError::internal().into());
         };
-        let (parts, body) = request.into_parts();
+        let (mut parts, body) = request.into_parts();
         let access = access::file_request(operation, &parts);
-        files.access.authorize(access.clone()).await?;
+        let authorization = files.access.authorize(access.clone()).await?;
         if parts.method != Method::POST {
             return Err(method_not_allowed().into());
         }
+        // The API parsed the same segment and org, so failing to here is a
+        // server fault, not the client's.
+        let sandbox_id = Path::<String>::from_request_parts(&mut parts, &())
+            .await
+            .ok()
+            .and_then(|Path(segment)| segment.parse::<PublicSandboxId>().ok())
+            .ok_or_else(PublicApiError::internal)?;
+        let org_id = authorization
+            .org_id
+            .parse()
+            .map_err(|_| PublicApiError::internal())?;
         Ok((
             Self {
                 files,
                 access,
                 headers: parts.headers,
+                extensions: parts.extensions,
+                version: parts.version,
+                sandbox_id: sandbox_id.into(),
+                org_id,
             },
             body,
         ))
@@ -134,6 +186,15 @@ impl FileRequest {
     /// Have the API prepare the sandbox call: everything its handler does
     /// before calling the sandbox, with `fingerprint` the body's for an
     /// operation whose key is bound.
+    /// The request again, around `body`.
+    fn with_body(&self, body: Body) -> Request<Body> {
+        let mut request = Request::new(body);
+        *request.headers_mut() = self.headers.clone();
+        *request.extensions_mut() = self.extensions.clone();
+        *request.version_mut() = self.version;
+        request
+    }
+
     pub(super) async fn prepare(
         &self,
         fingerprint: Option<&pplx_space_public_api::RequestFingerprint>,
@@ -148,10 +209,10 @@ impl FileRequest {
 /// The body as `T`, rejected as the API's `Json` extractor rejects it: the
 /// same body limit, `Content-Type` check and statuses, in the same envelope.
 pub(super) async fn json_body<T: DeserializeOwned>(
-    headers: &HeaderMap,
+    request: &FileRequest,
     body: Body,
 ) -> Result<T, Refusal> {
-    axum::Json::<T>::from_request(request_with(headers, body), &())
+    axum::Json::<T>::from_request(request.with_body(body), &())
         .await
         .map(|axum::Json(value)| value)
         .map_err(|rejection| normalize_public_error(rejection.into_response()).into())
@@ -183,11 +244,11 @@ impl IntoResponse for Refusal {
 /// The body as `T` if it says it is JSON, as the API's `Option<Json<T>>`
 /// extractor reads it: no `Content-Type` is no body.
 pub(super) async fn optional_json_body<T: DeserializeOwned>(
-    headers: &HeaderMap,
+    request: &FileRequest,
     body: Body,
 ) -> Result<Option<T>, Refusal> {
     <axum::Json<T> as axum::extract::OptionalFromRequest<()>>::from_request(
-        request_with(headers, body),
+        request.with_body(body),
         &(),
     )
     .await
@@ -208,12 +269,6 @@ pub(super) fn idempotency_key(headers: &HeaderMap) -> Result<IdempotencyKey, Ref
 /// A field check's refusal, as the API answers it.
 pub(super) fn rejected(error: impl Into<PublicApiError>) -> Refusal {
     error.into().into()
-}
-
-fn request_with(headers: &HeaderMap, body: Body) -> Request<Body> {
-    let mut request = Request::new(body);
-    *request.headers_mut() = headers.clone();
-    request
 }
 
 /// The API's answer to a files route called with another method than POST:

@@ -89,12 +89,12 @@ fn done() -> Response {
 async fn mkdir(state: &DataPlaneState, request: Request<Body>) -> Result<Response, Refusal> {
     const OPERATION: FileOperation = FileOperation::Mkdir;
     let (request, body) = FileRequest::authorize(state, OPERATION, request).await?;
-    let body: FileMkdirRequest = json_body(&request.headers, body).await?;
+    let body: FileMkdirRequest = json_body(&request, body).await?;
     idempotency_key(&request.headers)?;
     let user = parse_guest_user(body.user).map_err(rejected)?;
     let path = parse_guest_path(body.path).map_err(rejected)?;
     let fingerprint = mkdir_fingerprint(&path, body.parents, user.as_ref()).map_err(rejected)?;
-    let mut call = SandboxCall::prepare(state, &request, Some(fingerprint)).await?;
+    let call = SandboxCall::prepare(state, &request, Some(fingerprint)).await?;
     let message = spaced_mkdir_request(call.grant().sandbox_id, path, body.parents, user.as_ref());
     call.call(
         "spaced_mkdir",
@@ -111,12 +111,12 @@ async fn mkdir(state: &DataPlaneState, request: Request<Body>) -> Result<Respons
 async fn remove(state: &DataPlaneState, request: Request<Body>) -> Result<Response, Refusal> {
     const OPERATION: FileOperation = FileOperation::Remove;
     let (request, body) = FileRequest::authorize(state, OPERATION, request).await?;
-    let body: FileRemoveRequest = json_body(&request.headers, body).await?;
+    let body: FileRemoveRequest = json_body(&request, body).await?;
     idempotency_key(&request.headers)?;
     let user = parse_guest_user(body.user).map_err(rejected)?;
     let path = parse_guest_path(body.path).map_err(rejected)?;
     let fingerprint = remove_fingerprint(&path, body.recursive, user.as_ref()).map_err(rejected)?;
-    let mut call = SandboxCall::prepare(state, &request, Some(fingerprint)).await?;
+    let call = SandboxCall::prepare(state, &request, Some(fingerprint)).await?;
     let message = remove_request(call.grant().sandbox_id, path, body.recursive, user.as_ref());
     call.call(
         "spaced_remove",
@@ -133,13 +133,13 @@ async fn remove(state: &DataPlaneState, request: Request<Body>) -> Result<Respon
 async fn rename(state: &DataPlaneState, request: Request<Body>) -> Result<Response, Refusal> {
     const OPERATION: FileOperation = FileOperation::Rename;
     let (request, body) = FileRequest::authorize(state, OPERATION, request).await?;
-    let body: FileRenameRequest = json_body(&request.headers, body).await?;
+    let body: FileRenameRequest = json_body(&request, body).await?;
     idempotency_key(&request.headers)?;
     let user = parse_guest_user(body.user).map_err(rejected)?;
     let old_path = parse_guest_path(body.old_path).map_err(rejected)?;
     let new_path = parse_guest_path(body.new_path).map_err(rejected)?;
     let fingerprint = rename_fingerprint(&old_path, &new_path, user.as_ref()).map_err(rejected)?;
-    let mut call = SandboxCall::prepare(state, &request, Some(fingerprint)).await?;
+    let call = SandboxCall::prepare(state, &request, Some(fingerprint)).await?;
     // The API derives the key the sandbox replays the rename by, from the
     // key it bound and the fingerprint.
     let guest_key = call.grant().guest_key()?;
@@ -168,8 +168,7 @@ async fn enable_tracking(
 ) -> Result<Response, Refusal> {
     const OPERATION: FileOperation = FileOperation::ChangesEnable;
     let (request, body) = FileRequest::authorize(state, OPERATION, request).await?;
-    let body: Option<FileChangeTrackingRequest> =
-        optional_json_body(&request.headers, body).await?;
+    let body: Option<FileChangeTrackingRequest> = optional_json_body(&request, body).await?;
     // Required, and neither bound nor sent to the sandbox.
     idempotency_key(&request.headers)?;
     let body = body.unwrap_or_default();
@@ -181,7 +180,7 @@ async fn enable_tracking(
         .map(parse_guest_path)
         .collect::<Result<Vec<_>, _>>()
         .map_err(rejected)?;
-    let mut call = SandboxCall::prepare(state, &request, None).await?;
+    let call = SandboxCall::prepare(state, &request, None).await?;
     let message = enable_file_changes_request(
         call.grant().sandbox_id,
         roots,
@@ -213,11 +212,10 @@ async fn disable_tracking(
 ) -> Result<Response, Refusal> {
     const OPERATION: FileOperation = FileOperation::ChangesDisable;
     let (request, body) = FileRequest::authorize(state, OPERATION, request).await?;
-    let body: Option<FileChangeTrackingRequest> =
-        optional_json_body(&request.headers, body).await?;
+    let body: Option<FileChangeTrackingRequest> = optional_json_body(&request, body).await?;
     idempotency_key(&request.headers)?;
     let user = parse_guest_user(body.unwrap_or_default().user).map_err(rejected)?;
-    let mut call = SandboxCall::prepare(state, &request, None).await?;
+    let call = SandboxCall::prepare(state, &request, None).await?;
     let message = disable_file_changes_request(call.grant().sandbox_id, user.as_ref());
     call.call(
         "spaced_disable_file_changes",
@@ -234,7 +232,7 @@ async fn disable_tracking(
 async fn modified(state: &DataPlaneState, request: Request<Body>) -> Result<Response, Refusal> {
     const OPERATION: FileOperation = FileOperation::Modified;
     let (request, body) = FileRequest::authorize(state, OPERATION, request).await?;
-    let body: FileModifiedRequest = json_body(&request.headers, body).await?;
+    let body: FileModifiedRequest = json_body(&request, body).await?;
     validate_modified_filters(&body).map_err(rejected)?;
     let user = parse_guest_user(body.user).map_err(rejected)?;
     // Built before the sandbox is reached, as the API builds it, so a filter
@@ -247,7 +245,7 @@ async fn modified(state: &DataPlaneState, request: Request<Body>) -> Result<Resp
         user.as_ref(),
     )
     .map_err(rejected)?;
-    let mut call = SandboxCall::prepare(state, &request, None).await?;
+    let call = SandboxCall::prepare(state, &request, None).await?;
     message.sandbox_id = call.grant().sandbox_id.to_string();
     let response = call
         .call(

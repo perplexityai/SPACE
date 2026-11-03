@@ -6,7 +6,8 @@ use pplx_space_data_plane_server::{
     DEFAULT_MAX_ATTACHED_STREAMS, DEFAULT_MAX_ATTACHED_STREAMS_PER_ORG,
     DEFAULT_MAX_ATTACHED_STREAMS_PER_SANDBOX, DEFAULT_REVOCATION_CHECK_INTERVAL_MS,
     DEFAULT_ROUTE_CACHE_TTL_MS, DEFAULT_UNAUTHENTICATED_UPGRADE_CAP_PER_IP, DataPlaneConfig,
-    MAX_REVOCATION_CHECK_INTERVAL_MS, MIN_SHUTDOWN_GRACE, NativeFilesMode, UploadAdmissionArgs,
+    MAX_REVOCATION_CHECK_INTERVAL_MS, MIN_SHUTDOWN_GRACE, NativeFilesMode,
+    NativeUploadAdmissionArgs, UploadAdmissionArgs,
 };
 
 // Same allocator choice as space-api-svc: glibc arenas keep the peak of an
@@ -113,6 +114,9 @@ struct Cli {
         default_value_t = NativeFilesMode::Off
     )]
     native_files: NativeFilesMode,
+
+    #[command(flatten)]
+    native_upload: NativeUploadAdmissionArgs,
 }
 
 impl From<Cli> for DataPlaneConfig {
@@ -132,6 +136,7 @@ impl From<Cli> for DataPlaneConfig {
             upload_admission: cli.upload.config(),
             shutdown_grace: cli.shutdown_grace_secs.map(Duration::from_secs),
             native_files: cli.native_files,
+            native_upload_admission: cli.native_upload.config(),
         }
     }
 }

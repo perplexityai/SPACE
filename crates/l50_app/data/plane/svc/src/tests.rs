@@ -16,6 +16,56 @@ fn upload_admission_flags_reach_the_data_plane_config() {
     assert_eq!(admission.per_org.max_concurrent_uploads.get(), 8);
 }
 
+/// ECW's upload admission, by flag or environment, leaves Native writes
+/// unadmitted: they have a switch of their own.
+#[test]
+fn ecw_upload_admission_alone_leaves_native_writes_unadmitted() {
+    if !pplx_space_test_env::enter_test_process(&[
+        (
+            "SPACE_DATA_PLANE_UPLOAD_ADMISSION",
+            Some(std::ffi::OsStr::new("true")),
+        ),
+        ("SPACE_DATA_PLANE_NATIVE_UPLOAD_ADMISSION", None),
+    ]) {
+        return;
+    }
+    for args in [&[][..], &["--upload-admission"][..]] {
+        let config = config(args);
+        assert!(config.upload_admission.is_some(), "{args:?}");
+        assert!(config.native_upload_admission.is_none(), "{args:?}");
+    }
+}
+
+/// The Native switch, from the environment, turns on Native admission alone,
+/// at the guest's 8 operations per sandbox and a wait over every protocol.
+#[test]
+fn native_upload_admission_is_its_own_switch() {
+    if !pplx_space_test_env::enter_test_process(&[
+        (
+            "SPACE_DATA_PLANE_NATIVE_UPLOAD_ADMISSION",
+            Some(std::ffi::OsStr::new("true")),
+        ),
+        ("SPACE_DATA_PLANE_UPLOAD_ADMISSION", None),
+        (
+            "SPACE_DATA_PLANE_MAX_CONCURRENT_NATIVE_UPLOADS_PER_SANDBOX",
+            None,
+        ),
+        ("SPACE_DATA_PLANE_NATIVE_UPLOAD_ADMISSION_WAIT_MS", None),
+    ]) {
+        return;
+    }
+    let on = config(&[]);
+    assert!(on.upload_admission.is_none());
+    let native = on.native_upload_admission.unwrap();
+    assert_eq!(native.per_sandbox.max_concurrent_uploads.get(), 8);
+    assert_eq!(native.wait, Duration::from_secs(2));
+    assert!(
+        config(&["--native-upload-admission=false"])
+            .native_upload_admission
+            .is_none()
+    );
+}
+
 #[test]
 fn shutdown_grace_parses_from_flag_and_environment() {
     if !pplx_space_test_env::enter_test_process(&[(
