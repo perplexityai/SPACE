@@ -1782,11 +1782,17 @@ async fn optional_e2b_body_distinguishes_empty_from_untyped_nonempty() {
 
 #[test]
 fn create_translation_applies_resource_overrides() {
-    for (raw, cpu, memory) in [
-        (r#"{"vcpu":4,"memory_mib":8192}"#, Some(4), Some(8192)),
-        (r#"{"vcpu":4}"#, Some(4), None),
-        (r#"{"memory_mib":8192}"#, None, Some(8192)),
-        ("{}", None, None),
+    for (raw, cpu, memory, disk) in [
+        (
+            r#"{"vcpu":4,"memory_mib":8192,"disk_mib":20480}"#,
+            Some(4),
+            Some(8192),
+            Some(20480),
+        ),
+        (r#"{"vcpu":4}"#, Some(4), None, None),
+        (r#"{"memory_mib":8192}"#, None, Some(8192), None),
+        (r#"{"disk_mib":20480}"#, None, None, Some(20480)),
+        ("{}", None, None, None),
     ] {
         let mut request = base_create_request();
         request
@@ -1796,6 +1802,7 @@ fn create_translation_applies_resource_overrides() {
         let translated = translate_create_request(request).unwrap();
         assert_eq!(translated.native.vcpu, cpu);
         assert_eq!(translated.native.memory_mib, memory);
+        assert_eq!(translated.native.disk_mib, disk);
         assert!(!translated.native.metadata.contains_key("space.resources"));
         assert!(translated.native.metadata.contains_key("purpose"));
     }
@@ -1816,6 +1823,7 @@ fn create_translation_rejects_invalid_resource_overrides() {
         r#"{"vcpu":"4"}"#,
         r#"{"vcpu":2147483648}"#,
         r#"{"memory_mib":2147483648}"#,
+        r#"{"disk_mib":0}"#,
         r#"{"memory_mb":8192}"#,
     ] {
         let mut request = base_create_request();

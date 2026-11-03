@@ -33,6 +33,7 @@ const RESOURCES_METADATA_KEY: &str = "space.resources";
 struct CreateResources {
     vcpu: Option<u32>,
     memory_mib: Option<u32>,
+    disk_mib: Option<u32>,
 }
 
 pub(super) fn translate_create_request(
@@ -49,6 +50,7 @@ pub(super) fn translate_create_request(
     for (field, value) in [
         ("vcpu", resources.vcpu),
         ("memory_mib", resources.memory_mib),
+        ("disk_mib", resources.disk_mib),
     ] {
         // Resource columns are signed 32-bit integers; reject before admission.
         if let Some(value) = value
@@ -149,7 +151,7 @@ pub(super) fn translate_create_request(
             metadata,
             vcpu: resources.vcpu,
             memory_mib: resources.memory_mib,
-            disk_mib: None,
+            disk_mib: resources.disk_mib,
             file_changes: None,
             auto_lifecycle: Some(auto_lifecycle),
             // The E2B SDK assumes `Sandbox.create` returns a usable sandbox —
