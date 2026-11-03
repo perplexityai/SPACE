@@ -128,9 +128,10 @@ usually publish and select a purpose-built runtime template instead.
 ## Sizing at create
 
 SPACE extends ECW create with the reserved metadata key `space.resources`. Its
-value is a JSON object with optional `vcpu` (CPU count) and `memory_mib` (MiB)
-fields. This lets an unmodified E2B SDK request resources for each new sandbox,
-independently of the template's build defaults:
+value is a JSON object with optional `vcpu` (CPU count), `memory_mib` (MiB),
+and `disk_mib` (writable rootfs MiB) fields. This lets an unmodified E2B SDK
+request resources for each new sandbox, independently of the template's build
+defaults:
 
 ```python
 import json
@@ -145,18 +146,20 @@ sandbox = Sandbox.create(
 Use the SPACE domain and API key configured above. This is a SPACE extension,
 not an upstream E2B create option. ECW already uses reserved metadata for
 [full network policies](ecw-network-policy.md). The current upstream E2B create
-schema and Python SDK 2.62.0 do not expose CPU or memory overrides.
+schema and Python SDK 2.62.0 do not expose CPU, memory, or disk overrides.
 
 Provided values must be positive integers no larger than 2,147,483,647; actual
-allocation remains subject to runtime and available capacity. Malformed JSON,
-unknown fields, and invalid values return HTTP 400. Omitted fields retain the
-normal create defaults. ECW consumes `space.resources`, so it does not appear in
-the sandbox's stored metadata; other metadata is preserved.
+allocation remains subject to runtime and available capacity. `disk_mib`
+overrides the template's disk size; it must be at least the template rootfs
+size, and a value above 128 GiB returns HTTP 400. Malformed JSON, unknown
+fields, and invalid values return HTTP 400. Omitted fields retain the normal
+create defaults. ECW consumes `space.resources`, so it does not appear in the
+sandbox's stored metadata; other metadata is preserved.
 
-An explicit CPU or memory override selects a cold boot, bypassing warm-pool
-and base-snapshot creation. The extension does not resize an existing sandbox,
-change a template, or alter fork, connect, or resume behavior. Requests without
-the extension retain their existing behavior.
+An explicit CPU, memory, or disk override selects a cold boot, bypassing
+warm-pool and base-snapshot creation. The extension does not resize an existing
+sandbox, change a template, or alter fork, connect, or resume behavior. Requests
+without the extension retain their existing behavior.
 
 Deploy an API version supporting this extension before enabling callers. Older
 versions accept the key as ordinary metadata and do not apply its sizing.
