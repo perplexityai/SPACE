@@ -706,7 +706,6 @@ async fn an_admin_create_reports_its_requester_apart_from_the_owner() -> TestRes
             request,
             &IdempotencyKey::parse_header(key.as_bytes())?,
             requested_by,
-            false,
         )
         .await
         .map_err(|error| error.message)?;
@@ -731,4 +730,738 @@ async fn an_admin_create_reports_its_requester_apart_from_the_owner() -> TestRes
     }
     db.pool.close().await;
     Ok(())
+}
+
+/// A replay of an action sent before rollbacks carried a body must match the
+/// operation that request created, so only a rollback body changes the
+/// fingerprint.
+#[test]
+fn only_a_rollback_body_changes_the_lifecycle_fingerprint() -> TestResult {
+    let public_id = PublicSandboxId::from_uuid(Uuid::from_u128(7));
+    let target = AdminSandboxTarget::from_public_id(public_id);
+    let earlier = |action: SandboxLifecycleAction| -> TestResult<RequestFingerprint> {
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "sandbox_id": public_id.to_string(),
+            "action": action.as_str(),
+            "admin": true,
+        }))?;
+        Ok(RequestFingerprint::parse(hex::encode(Sha256::digest(
+            bytes,
+        )))?)
+    };
+    for action in [
+        SandboxLifecycleAction::Stop,
+        SandboxLifecycleAction::Rollback,
+    ] {
+        assert_eq!(
+            lifecycle_request_fingerprint(target, action, None).map_err(|err| err.message)?,
+            earlier(action)?,
+            "{action:?} without a body"
+        );
+    }
+    let rollback = |snapshot_name: &str| RollbackSandboxRequest {
+        snapshot_name: snapshot_name.to_owned(),
+        auto_restart: false,
+    };
+    let first = lifecycle_request_fingerprint(
+        target,
+        SandboxLifecycleAction::Rollback,
+        Some(&rollback("checkpoint-1")),
+    )
+    .map_err(|err| err.message)?;
+    assert_ne!(first, earlier(SandboxLifecycleAction::Rollback)?);
+    assert_ne!(
+        first,
+        lifecycle_request_fingerprint(
+            target,
+            SandboxLifecycleAction::Rollback,
+            Some(&rollback("checkpoint-2")),
+        )
+        .map_err(|err| err.message)?
+    );
+    Ok(())
+}
+
+mod cross_org_routes {
+    use axum::http::Method;
+    use serde_json::json;
+
+    use super::*;
+    use crate::routes::admin::test_fixtures::{
+        AdminRouterHarness, admin_router_harness, admin_router_harness_with,
+    };
+    use crate::routes::public::hidden_operations::HiddenOperationsGate;
+
+    async fn tenant_sandbox(harness: &AdminRouterHarness) -> TestResult<PublicSandboxId> {
+        let id = seed_sandbox(&harness.db.pool, harness.tenant_org, harness.tenant_admin).await?;
+        Ok(PublicSandboxId::from_uuid(id))
+    }
+
+    #[track_caller]
+    fn assert_names_sandbox(
+        event: &serde_json::Value,
+        harness: &AdminRouterHarness,
+        sandbox: PublicSandboxId,
+    ) {
+        assert_eq!(
+            event["actor_user_id"],
+            harness.operator.id.to_string(),
+            "{event}"
+        );
+        assert_eq!(
+            event["target_org_id"],
+            harness.tenant_org.to_string(),
+            "{event}"
+        );
+        assert_eq!(event["target_type"], "sandbox", "{event}");
+        assert_eq!(event["target_id"], sandbox.to_string(), "{event}");
+    }
+
+    /// The session belongs to the sandbox's organization, is attributed to the
+    /// operator, and its attach token is the public route's: it connects to
+    /// this one terminal session and expires within the attach window.
+    #[tokio::test]
+    async fn an_operator_opens_a_terminal_in_another_organizations_sandbox() -> TestResult {
+        let Some(harness) = admin_router_harness().await? else {
+            return Ok(());
+        };
+        let sandbox = tenant_sandbox(&harness).await?;
+        let path = format!("/sandboxes/{sandbox}/terminal-sessions");
+        let body = json!({"size": {"rows": 24, "cols": 80}});
+        harness
+            .assert_refused_to_non_operators(Method::POST, &path, Some(body.clone()))
+            .await;
+
+        let (status, session) = harness
+            .as_operator(
+                Method::POST,
+                &path,
+                &[("idempotency-key", "terminal-1")],
+                Some(body),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{session}");
+        assert_eq!(session["sandbox_id"], sandbox.to_string());
+        assert_eq!(session["kind"], "terminal");
+        assert_eq!(session["scopes"], json!(["terminal:connect"]));
+        let token = session["attach"]["token"].as_str().expect("attach token");
+        let rows: Vec<(String, Uuid, Option<Uuid>, String, bool)> = sqlx::query_as(sql!(
+            "SELECT session_id, org_id, actor_user_id, kind,
+                    token_expires_at <= NOW() + INTERVAL '5 minutes'
+             FROM data_plane_sessions
+             WHERE token_hash = $1"
+        ))
+        .bind(crate::auth::hash_token(token))
+        .fetch_all(&harness.db.pool)
+        .await?;
+        assert_eq!(
+            rows,
+            vec![(
+                session["id"].as_str().expect("session id").to_owned(),
+                harness.tenant_org.as_uuid(),
+                Some(harness.operator.id.as_uuid()),
+                "terminal".to_owned(),
+                true,
+            )],
+            "the token opens only this session, under the sandbox's org"
+        );
+
+        let events = harness.audit_events(&path).await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["status_code"], 201);
+        assert_names_sandbox(&events[0], &harness, sandbox);
+
+        let (status, error) = harness
+            .as_operator(
+                Method::POST,
+                &path,
+                &[("idempotency-key", "terminal-2")],
+                Some(json!({"size": {"rows": 0, "cols": 80}})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        let missing = PublicSandboxId::from_uuid(Uuid::now_v7());
+        let (status, _) = harness
+            .as_operator(
+                Method::POST,
+                &format!("/sandboxes/{missing}/terminal-sessions"),
+                &[("idempotency-key", "terminal-3")],
+                Some(json!({})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = harness
+            .as_operator(Method::POST, &path, &[], Some(json!({})))
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "Idempotency-Key is required"
+        );
+
+        // The two refusals came after the sandbox resolved, so they name it too.
+        let events = harness.audit_events(&path).await;
+        let statuses: Vec<_> = events
+            .iter()
+            .map(|event| event["status_code"].clone())
+            .collect();
+        assert_eq!(statuses, vec![json!(400), json!(400), json!(201)]);
+        for event in &events {
+            assert_names_sandbox(event, &harness, sandbox);
+        }
+        let missing_events = harness
+            .audit_events(&format!("/sandboxes/{missing}/terminal-sessions"))
+            .await;
+        assert_eq!(missing_events.len(), 1);
+        assert_eq!(missing_events[0]["target_id"], serde_json::Value::Null);
+        Ok(())
+    }
+
+    /// The admin route scopes its idempotency keys apart from the public
+    /// route's: the tenant sending the operator's key and body gets a session
+    /// of its own, and the operator's session and attach token are untouched.
+    #[tokio::test]
+    async fn admin_and_public_terminal_sessions_never_replay_each_other() -> TestResult {
+        let Some(harness) = admin_router_harness().await? else {
+            return Ok(());
+        };
+        let sandbox = tenant_sandbox(&harness).await?;
+        let path = format!("/sandboxes/{sandbox}/terminal-sessions");
+        let key = "shared-terminal-key";
+        let body = json!({"size": {"rows": 24, "cols": 80}});
+        let (status, admin_session) = harness
+            .as_operator(
+                Method::POST,
+                &path,
+                &[("idempotency-key", key)],
+                Some(body.clone()),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{admin_session}");
+        let admin_session_id = admin_session["id"].as_str().expect("session id").to_owned();
+        let token_hash = |session_id: String| {
+            let pool = harness.db.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Option<String>>(sql!(
+                    "SELECT token_hash FROM data_plane_sessions WHERE session_id = $1"
+                ))
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+            }
+        };
+        let admin_token_hash = token_hash(admin_session_id.clone()).await?;
+
+        let tenant_session = crate::routes::public::sessions::create_terminal_session_for_sandbox(
+            &harness.state,
+            harness.tenant_org,
+            harness.tenant_admin,
+            sandbox,
+            serde_json::from_value(body.clone())?,
+            IdempotencyKey::parse(key.to_owned())?,
+            crate::public_operations::OperationPathTemplate::new(
+                pplx_space_public_api::routes::CREATE_TERMINAL_SESSION.path(),
+            ),
+        )
+        .await
+        .map_err(|error| format!("public create failed: {error:?}"))?;
+        assert_ne!(tenant_session.id.to_string(), admin_session_id);
+        assert_eq!(
+            token_hash(admin_session_id.clone()).await?,
+            admin_token_hash,
+            "the operator's attach token was not rotated"
+        );
+
+        let (status, replay) = harness
+            .as_operator(Method::POST, &path, &[("idempotency-key", key)], Some(body))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{replay}");
+        assert_eq!(
+            replay["id"],
+            admin_session_id.as_str(),
+            "the admin route replays its own"
+        );
+        Ok(())
+    }
+
+    /// The admin command route scopes its idempotency keys apart from the
+    /// public route's, as the terminal route does: the tenant sending the
+    /// operator's key and body gets a command session of its own, and the
+    /// operator's session and attach token are untouched.
+    #[tokio::test]
+    async fn admin_and_public_command_sessions_never_replay_each_other() -> TestResult {
+        let Some(harness) = admin_router_harness().await? else {
+            return Ok(());
+        };
+        let sandbox = tenant_sandbox(&harness).await?;
+        let path = format!("/sandboxes/{sandbox}/commands");
+        let key = "shared-command-key";
+        let body = json!({"command": ["true"], "cwd": null, "env": {}, "pty": null, "stdin": false, "timeout": null});
+        let (status, admin_command) = harness
+            .as_operator(
+                Method::POST,
+                &path,
+                &[("idempotency-key", key)],
+                Some(body.clone()),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{admin_command}");
+        let admin_session_id = admin_command["session_id"]
+            .as_str()
+            .expect("session id")
+            .to_owned();
+        let token_hash = |session_id: String| {
+            let pool = harness.db.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Option<String>>(sql!(
+                    "SELECT token_hash FROM data_plane_sessions WHERE session_id = $1"
+                ))
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+            }
+        };
+        let admin_token_hash = token_hash(admin_session_id.clone()).await?;
+
+        let tenant_command = crate::routes::public::sessions::create_command_session(
+            &harness.state.public_session_store(),
+            harness.tenant_org,
+            harness.tenant_admin,
+            sandbox,
+            serde_json::from_value(body.clone())?,
+            crate::routes::public::sessions::RouteIdempotency {
+                key: IdempotencyKey::parse(key.to_owned())?,
+                path_template: crate::public_operations::OperationPathTemplate::new(
+                    pplx_space_public_api::routes::CREATE_COMMAND.path(),
+                ),
+            },
+            || Ok(()),
+        )
+        .await
+        .map_err(|error| format!("public create failed: {error:?}"))?;
+        assert_ne!(tenant_command.session_id.to_string(), admin_session_id);
+        assert_eq!(
+            token_hash(admin_session_id.clone()).await?,
+            admin_token_hash,
+            "the operator's attach token was not rotated"
+        );
+
+        let (status, replay) = harness
+            .as_operator(Method::POST, &path, &[("idempotency-key", key)], Some(body))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{replay}");
+        assert_eq!(
+            replay["session_id"],
+            admin_session_id.as_str(),
+            "the admin route replays its own"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_operator_lists_another_organizations_snapshots_and_the_read_is_audited()
+    -> TestResult {
+        let Some(harness) = admin_router_harness().await? else {
+            return Ok(());
+        };
+        let sandbox = tenant_sandbox(&harness).await?;
+        let snapshot_id = Uuid::now_v7();
+        sqlx::query(sql!(
+            "INSERT INTO snapshots (
+                 id, sandbox_id, type, state, local_artifact_id,
+                 artifact_kind, artifact_origin, artifact_snapshot_name, label
+             ) VALUES ($1, $2, 'disk', 'ready', $3, 'disk', 'snapshot', 'checkpoint', 'before-upgrade')"
+        ))
+        .bind(snapshot_id)
+        .bind(sandbox.as_uuid())
+        .bind(Uuid::now_v7())
+        .execute(&harness.db.pool)
+        .await?;
+        let path = format!("/sandboxes/{sandbox}/snapshots");
+        harness
+            .assert_refused_to_non_operators(Method::GET, &path, None)
+            .await;
+
+        let (status, page) = harness.as_operator(Method::GET, &path, &[], None).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        let data = page["data"].as_array().expect("snapshot page");
+        assert_eq!(data.len(), 1, "{page}");
+        assert_eq!(
+            data[0]["id"],
+            pplx_space_public_api::PublicSnapshotId::from(
+                pplx_space_common_core::types::SnapshotId::from_uuid(snapshot_id)
+            )
+            .to_string()
+        );
+        assert_eq!(data[0]["label"], "before-upgrade");
+        assert_eq!(page["next_cursor"], serde_json::Value::Null);
+
+        let events = harness.audit_events(&path).await;
+        assert_eq!(
+            events.len(),
+            1,
+            "a read of another org's snapshots is audited"
+        );
+        assert_eq!(events[0]["method"], "GET");
+        assert_names_sandbox(&events[0], &harness, sandbox);
+
+        for query in ["cursor=not-a-cursor", "limit=many"] {
+            let (status, _) = harness
+                .as_operator(Method::GET, &format!("{path}?{query}"), &[], None)
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
+            let events = harness.audit_events(&format!("{path}?{query}")).await;
+            assert!(events.is_empty(), "the path is recorded without its query");
+        }
+        let events = harness.audit_events(&path).await;
+        let statuses: Vec<_> = events
+            .iter()
+            .map(|event| event["status_code"].clone())
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![json!(400), json!(400), json!(200)],
+            "a refused read of a resolved sandbox is audited"
+        );
+        for event in &events {
+            assert_names_sandbox(event, &harness, sandbox);
+        }
+        let missing = PublicSandboxId::from_uuid(Uuid::now_v7());
+        let (status, _) = harness
+            .as_operator(
+                Method::GET,
+                &format!("/sandboxes/{missing}/snapshots"),
+                &[],
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    /// With rollback enabled for the sandbox's organization, `:force-rollback`
+    /// carries the public `:rollback` body to the operation, under that
+    /// organization, and the body is part of the request's idempotency
+    /// fingerprint.
+    #[tokio::test]
+    async fn an_operator_rolls_back_another_organizations_sandbox() -> TestResult {
+        let Some(harness) = admin_router_harness_with(|state| {
+            state.native_hidden_operations = HiddenOperationsGate::all_orgs();
+        })
+        .await?
+        else {
+            return Ok(());
+        };
+        let sandbox = tenant_sandbox(&harness).await?;
+        let path = format!("/sandboxes/{sandbox}:force-rollback");
+        let body = json!({"snapshot_name": "checkpoint-1", "auto_restart": true});
+        harness
+            .assert_refused_to_non_operators(Method::POST, &path, Some(body.clone()))
+            .await;
+
+        let key = [("idempotency-key", "rollback-1")];
+        let (status, accepted) = harness
+            .as_operator(Method::POST, &path, &key, Some(body.clone()))
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+        let operation_id = accepted["operation_id"]
+            .as_str()
+            .expect("operation id")
+            .to_owned();
+        let (org_id, actor, kind, payload): (Uuid, Option<Uuid>, String, serde_json::Value) =
+            sqlx::query_as(sql!(
+                "SELECT org_id, actor_user_id, kind, payload_json
+                 FROM public_operations
+                 WHERE operation_id = $1"
+            ))
+            .bind(OperationId::from_str(&operation_id)?.as_uuid())
+            .fetch_one(&harness.db.pool)
+            .await?;
+        assert_eq!(org_id, harness.tenant_org.as_uuid());
+        assert_eq!(actor, Some(harness.operator.id.as_uuid()));
+        assert_eq!(kind, OperationKind::RollbackSandbox.as_str());
+        assert_eq!(payload["rollback"], body, "{payload}");
+
+        let (status, replay) = harness
+            .as_operator(Method::POST, &path, &key, Some(body))
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{replay}");
+        assert_eq!(replay["operation_id"], operation_id.as_str());
+        let (status, conflict) = harness
+            .as_operator(
+                Method::POST,
+                &path,
+                &key,
+                Some(json!({"snapshot_name": "checkpoint-2"})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+
+        for missing_body in [None, Some(json!({"auto_restart": true}))] {
+            let (status, error) = harness
+                .as_operator(
+                    Method::POST,
+                    &path,
+                    &[("idempotency-key", "rollback-2")],
+                    missing_body,
+                )
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        }
+        let events = harness.audit_events(&path).await;
+        assert_eq!(events.len(), 5, "{events:?}");
+        for event in &events {
+            assert_names_sandbox(event, &harness, sandbox);
+        }
+        Ok(())
+    }
+
+    /// Rollback stays behind the public `:rollback`'s hidden-operation gate:
+    /// with it closed for the sandbox's organization, `:force-rollback` enqueues
+    /// nothing, and the refusal is audited against the sandbox.
+    #[tokio::test]
+    async fn rollback_is_refused_while_its_gate_is_closed() -> TestResult {
+        let Some(harness) = admin_router_harness_with(|state| {
+            state.native_hidden_operations = HiddenOperationsGate::default();
+        })
+        .await?
+        else {
+            return Ok(());
+        };
+        let sandbox = tenant_sandbox(&harness).await?;
+        let path = format!("/sandboxes/{sandbox}:force-rollback");
+        let (status, error) = harness
+            .as_operator(
+                Method::POST,
+                &path,
+                &[("idempotency-key", "rollback-closed")],
+                Some(json!({"snapshot_name": "checkpoint-1"})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{error}");
+        assert!(
+            error["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("rollback is not enabled"),
+            "{error}"
+        );
+        let operations: i64 = sqlx::query_scalar(sql!(
+            "SELECT count(*) FROM public_operations WHERE target_id = $1"
+        ))
+        .bind(sandbox.to_string())
+        .fetch_one(&harness.db.pool)
+        .await?;
+        assert_eq!(operations, 0);
+        let events = harness.audit_events(&path).await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_names_sandbox(&events[0], &harness, sandbox);
+
+        let (status, accepted) = harness
+            .as_operator(
+                Method::POST,
+                &format!("/sandboxes/{sandbox}:force-stop"),
+                &[("idempotency-key", "stop-open")],
+                None,
+            )
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "other actions are ungated: {accepted}"
+        );
+        Ok(())
+    }
+
+    /// Once the sandbox or organization resolves, a refused admin sandbox write
+    /// names it in the audit event, as a successful one does.
+    #[tokio::test]
+    async fn refused_sandbox_writes_name_the_resolved_target() -> TestResult {
+        let Some(harness) = admin_router_harness().await? else {
+            return Ok(());
+        };
+        let sandbox = tenant_sandbox(&harness).await?;
+        let command = json!({"command": ["true"], "cwd": null, "env": {}, "pty": null, "stdin": false, "timeout": null});
+        let refusals = [
+            (
+                Method::POST,
+                format!("/sandboxes/{sandbox}/commands"),
+                Some(command),
+            ),
+            (
+                Method::POST,
+                format!("/sandboxes/{sandbox}:force-stop"),
+                None,
+            ),
+            (
+                Method::PATCH,
+                format!("/sandboxes/{sandbox}"),
+                Some(json!({"resources": {"disk_mib": 2048}})),
+            ),
+        ];
+        for (method, path, body) in refusals {
+            // No Idempotency-Key, or an immutable field: refused after lookup.
+            let (status, error) = harness.as_operator(method.clone(), &path, &[], body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {path}: {error}");
+            let events = harness.audit_events(&path).await;
+            assert_eq!(events.len(), 1, "{method} {path}: {events:?}");
+            assert_names_sandbox(&events[0], &harness, sandbox);
+        }
+
+        let create = |user_id: Option<UserId>| {
+            json!({
+                "org_id": harness.tenant_org,
+                "user_id": user_id,
+                "sandbox": {"name": null, "template": "seed", "runtime": "fc", "env": {}, "metadata": {}, "resources": null},
+            })
+        };
+        let (status, error) = harness
+            .as_operator(
+                Method::POST,
+                "/sandboxes",
+                &[("idempotency-key", "create-foreign-owner")],
+                Some(create(Some(harness.operator.id))),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        let (status, accepted) = harness
+            .as_operator(
+                Method::POST,
+                "/sandboxes",
+                &[("idempotency-key", "create-tenant-owner")],
+                Some(create(None)),
+            )
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+        let events = harness.audit_events("/sandboxes").await;
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0]["target_id"], accepted["sandbox_id"]);
+        assert_eq!(events[1]["target_id"], serde_json::Value::Null);
+        for event in &events {
+            assert_eq!(event["target_org_id"], harness.tenant_org.to_string());
+            assert_eq!(event["target_type"], "sandbox");
+        }
+        Ok(())
+    }
+
+    /// The routes this module mirrors take every sandbox ID form the other
+    /// admin sandbox routes take, and record the canonical `sbx_` ID: one
+    /// idempotency key sent under different forms replays one request, the
+    /// operation targets the canonical ID, and so does every audit event.
+    #[tokio::test]
+    async fn the_mirror_routes_accept_every_admin_sandbox_id_form() -> TestResult {
+        let Some(harness) = admin_router_harness_with(|state| {
+            state.native_hidden_operations = HiddenOperationsGate::all_orgs();
+        })
+        .await?
+        else {
+            return Ok(());
+        };
+        let sandbox = tenant_sandbox(&harness).await?;
+        // One snapshot of the sandbox, so every form's snapshot page must name
+        // it: an empty page would match under any form.
+        let snapshot_id = Uuid::now_v7();
+        sqlx::query(sql!(
+            "INSERT INTO snapshots (
+                 id, sandbox_id, type, state, local_artifact_id,
+                 artifact_kind, artifact_origin, artifact_snapshot_name, label
+             ) VALUES ($1, $2, 'disk', 'ready', $3, 'disk', 'snapshot', 'checkpoint', 'id-forms')"
+        ))
+        .bind(snapshot_id)
+        .bind(sandbox.as_uuid())
+        .bind(Uuid::now_v7())
+        .execute(&harness.db.pool)
+        .await?;
+        let dashed = sandbox.as_uuid().to_string();
+        let undashed = sandbox.as_uuid().simple().to_string();
+        let forms = [
+            sandbox.to_string(),
+            dashed.clone(),
+            undashed.to_uppercase(),
+            format!("space-sbx-{undashed}-g3"),
+            format!("%20{dashed}%09"),
+        ];
+        let command = json!({"command": ["true"], "cwd": null, "env": {}, "pty": null, "stdin": false, "timeout": null});
+        let routes = [
+            (
+                Method::POST,
+                "/terminal-sessions",
+                Some(json!({"size": {"rows": 24, "cols": 80}})),
+                "/id",
+            ),
+            (Method::POST, "/commands", Some(command), "/session_id"),
+            (
+                Method::POST,
+                ":force-rollback",
+                Some(json!({"snapshot_name": "checkpoint-1"})),
+                "/operation_id",
+            ),
+            (Method::GET, "/snapshots", None, "/data/0/id"),
+        ];
+        for (method, suffix, body, replayed) in routes.clone() {
+            let key = [("idempotency-key", suffix)];
+            let mut answers = Vec::new();
+            for form in &forms {
+                let path = format!("/sandboxes/{form}{suffix}");
+                let (status, answer) = harness
+                    .as_operator(method.clone(), &path, &key, body.clone())
+                    .await;
+                assert!(status.is_success(), "{method} {path}: {status} {answer}");
+                let replayed = answer.pointer(replayed).cloned();
+                assert!(replayed.is_some(), "{method} {path}: {answer}");
+                answers.push(replayed);
+                let events = harness.audit_events(&path).await;
+                assert_eq!(events.len(), 1, "{method} {path}: {events:?}");
+                assert_names_sandbox(&events[0], &harness, sandbox);
+            }
+            assert!(
+                answers.iter().all(|answer| *answer == answers[0]),
+                "{method} {suffix}: every form answers as the first, replaying its request or naming its snapshot: {answers:?}"
+            );
+        }
+        let (_, page) = harness
+            .as_operator(
+                Method::GET,
+                &format!("/sandboxes/{sandbox}/snapshots"),
+                &[],
+                None,
+            )
+            .await;
+        assert_eq!(
+            page["data"][0]["id"],
+            pplx_space_public_api::PublicSnapshotId::from(
+                pplx_space_common_core::types::SnapshotId::from_uuid(snapshot_id)
+            )
+            .to_string(),
+            "every form's page names the seeded snapshot"
+        );
+        let targets: Vec<Option<String>> = sqlx::query_scalar(sql!(
+            "SELECT target_id FROM public_operations WHERE org_id = $1 AND kind = $2"
+        ))
+        .bind(harness.tenant_org.as_uuid())
+        .bind(OperationKind::RollbackSandbox.as_str())
+        .fetch_all(&harness.db.pool)
+        .await?;
+        assert_eq!(targets, vec![Some(sandbox.to_string())]);
+
+        for form in [
+            format!("SBX_{dashed}"),
+            format!("%7B{dashed}%7D"),
+            format!("sandbox-{dashed}"),
+            format!("space-sbx-{dashed}"),
+        ] {
+            for (method, suffix, body, _) in routes.clone() {
+                let path = format!("/sandboxes/{form}{suffix}");
+                let (status, error) = harness
+                    .as_operator(method, &path, &[("idempotency-key", "refused")], body)
+                    .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {error}");
+                assert!(
+                    error.to_string().contains("sandbox id must be sbx_<uuid>"),
+                    "{path}: {error}"
+                );
+            }
+        }
+        Ok(())
+    }
 }

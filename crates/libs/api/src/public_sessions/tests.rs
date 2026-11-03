@@ -967,7 +967,12 @@ async fn command_session_persists_the_requested_guest_user() -> TestResult {
             UserId::from_uuid(user),
             public_sandbox_id,
             request(guest_user.clone()),
-            IdempotencyKey::parse(key)?,
+            crate::routes::public::sessions::RouteIdempotency {
+                key: IdempotencyKey::parse(key)?,
+                path_template: OperationPathTemplate::new(
+                    pplx_space_public_api::routes::CREATE_COMMAND.path(),
+                ),
+            },
             || Ok(()),
         )
         .await
@@ -1044,7 +1049,12 @@ async fn command_session_runs_under_sandbox_org_for_cross_org_caller() -> TestRe
         UserId::from_uuid(managing_admin),
         public_sandbox_id,
         request,
-        key,
+        crate::routes::public::sessions::RouteIdempotency {
+            key,
+            path_template: OperationPathTemplate::new(
+                pplx_space_public_api::routes::CREATE_COMMAND.path(),
+            ),
+        },
         || Ok(()),
     )
     .await

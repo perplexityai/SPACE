@@ -6,6 +6,8 @@ use axum::{
 use pplx_space_runtime_environment_policy_store::PolicyChangeReason;
 use serde_json::{Map, Value, json};
 
+mod cross_org;
+
 const ADMIN_LLMS_TXT: &str = "SPACE Admin API\n\n\
 - Admin OpenAPI: /openapi.json on admin.api.space hosts, /admin/api/openapi.json on shared hosts\n\
 - Admin API base path: /v1 on admin.api.space hosts, /admin/api/v1 on shared hosts\n\
@@ -260,8 +262,10 @@ fn admin_openapi_value() -> Value {
                 },
                 "post": {
                     "summary": "Create an organization",
+                    "description": "theme_primary and theme_secondary must be #rgb or #rrggbb hex colors, and logo_url an absolute https URL without credentials (http only on localhost, 127.0.0.1 or [::1]).",
                     "responses": {
                         "201": { "description": "Organization" },
+                        "400": { "description": "Invalid branding value; field names the request field" },
                         "403": { "description": "Caller is not a managing organization admin" }
                     }
                 }
@@ -276,8 +280,10 @@ fn admin_openapi_value() -> Value {
                 },
                 "patch": {
                     "summary": "Update an organization",
+                    "description": "theme_primary and theme_secondary must be #rgb or #rrggbb hex colors, and logo_url an absolute https URL without credentials (http only on localhost, 127.0.0.1 or [::1]). Only a value that differs from the stored one is checked; null clears a field.",
                     "responses": {
                         "200": { "description": "Organization" },
+                        "400": { "description": "Invalid branding value; field names the request field" },
                         "403": { "description": "Caller cannot manage the organization" }
                     }
                 },
@@ -330,22 +336,6 @@ fn admin_openapi_value() -> Value {
                         "409": { "description": "Caller attempted to change its own role" }
                     }
                 }
-            },
-            "/sandboxes/{sandbox_id}:force-{action}": {
-                "post": {
-                    "summary": "Enqueue an audited break-glass sandbox lifecycle operation",
-                    "parameters": [
-                        { "name": "sandbox_id", "in": "path", "required": true, "description": "sbx_<uuid>, a dashed or undashed UUID in either case, or the sandbox pod name (space-sbx-<undashed uuid>, optionally with its -g<generation> suffix); surrounding whitespace is ignored", "schema": { "type": "string" } },
-                        { "name": "action", "in": "path", "required": true, "schema": { "type": "string", "enum": ["start", "stop", "pause", "resume", "suspend", "restore", "wake", "kill", "delete"] } },
-                        { "name": "Idempotency-Key", "in": "header", "required": true, "schema": { "type": "string" } }
-                    ],
-                    "responses": {
-                        "202": { "description": "Operation enqueued" },
-                        "400": { "description": "Invalid sandbox id, action or idempotency key" },
-                        "404": { "description": "Sandbox not found" },
-                        "409": { "description": "Idempotency conflict" }
-                    }
-                }
             }
         },
         "components": {
@@ -367,11 +357,36 @@ fn admin_openapi_value() -> Value {
     insert_org_master_key_paths(paths);
     insert_api_key_paths(paths);
     insert_admin_sandbox_create_paths(paths);
+    insert_admin_sandbox_action_paths(paths);
     insert_identity_profile_paths(paths);
     insert_audit_event_paths(paths);
     insert_debug_paths(paths);
     insert_runtime_environment_paths(paths);
+    cross_org::insert_admin_sandbox_session_paths(paths);
     spec
+}
+
+fn insert_admin_sandbox_action_paths(paths: &mut Map<String, Value>) {
+    paths.insert(
+        "/sandboxes/{sandbox_id}:force-{action}".to_string(),
+        json!({
+            "post": {
+                "summary": "Enqueue an audited break-glass sandbox lifecycle operation",
+                "description": "Runs under the sandbox's owning organization. rollback takes the public :rollback body ({snapshot_name, auto_restart?}), part of the idempotency fingerprint, and refuses with 404 unless the rollback hidden operation is enabled for that organization; other actions ignore the body.",
+                "parameters": [
+                    { "name": "sandbox_id", "in": "path", "required": true, "description": "sbx_<uuid>, a dashed or undashed UUID in either case, or the sandbox pod name (space-sbx-<undashed uuid>, optionally with its -g<generation> suffix); surrounding whitespace is ignored", "schema": { "type": "string" } },
+                    { "name": "action", "in": "path", "required": true, "schema": { "type": "string", "enum": ["start", "stop", "pause", "resume", "suspend", "restore", "wake", "kill", "rollback", "delete"] } },
+                    { "name": "Idempotency-Key", "in": "header", "required": true, "schema": { "type": "string" } }
+                ],
+                "responses": {
+                    "202": { "description": "Operation enqueued" },
+                    "400": { "description": "Invalid sandbox id, action, rollback body or idempotency key" },
+                    "404": { "description": "Sandbox not found, or rollback not enabled for its organization" },
+                    "409": { "description": "Idempotency conflict" }
+                }
+            }
+        }),
+    );
 }
 
 fn insert_api_key_paths(paths: &mut Map<String, Value>) {
@@ -380,6 +395,10 @@ fn insert_api_key_paths(paths: &mut Map<String, Value>) {
         json!({
             "get": {
                 "summary": "List organization API keys without secret material",
+                "description": "Any organization's keys, newest first. Revoked keys are listed, with revoked_at, only with include_revoked=true. last_used_at is when the key last authenticated through the API, recorded at most once every five minutes; data-plane uses are not recorded.",
+                "parameters": [
+                    { "name": "include_revoked", "in": "query", "required": false, "schema": { "type": "boolean", "default": false } }
+                ],
                 "responses": {
                     "200": { "description": "API key metadata list" },
                     "404": { "description": "Organization not found" }
@@ -387,11 +406,13 @@ fn insert_api_key_paths(paths: &mut Map<String, Value>) {
             },
             "post": {
                 "summary": "Create an organization API key",
-                "description": "Returns the raw secret exactly once. The key is attributed to the calling admin and can only be created for that admin's organization.",
+                "description": "Creates a key for any organization and returns the raw secret exactly once. The key calls only the allowed_surfaces APIs and acts as user_id, a user of the organization; user_id may be omitted only for the admin's own organization, whose key then acts as the calling admin. That user is stored as created_by. The audit event names the calling admin, the organization, the key and its user, never the secret.",
                 "responses": {
                     "201": { "description": "API key metadata and one-time secret" },
-                    "400": { "description": "Invalid name or API surfaces" },
-                    "403": { "description": "Cannot create API keys for another organization" }
+                    "400": { "description": "Invalid name or API surfaces, user_id missing for another organization's key, or user_id is not a user of the organization" },
+                    "403": { "description": "Caller is not a managing organization admin" },
+                    "404": { "description": "Organization not found" },
+                    "409": { "description": "The chosen user was deleted while the key was created" }
                 }
             }
         }),
@@ -401,6 +422,7 @@ fn insert_api_key_paths(paths: &mut Map<String, Value>) {
         json!({
             "delete": {
                 "summary": "Revoke an organization API key",
+                "description": "The key stops authenticating at once and is listed with revoked_at when include_revoked=true. Revoking a revoked key succeeds and keeps its first revocation time.",
                 "responses": {
                     "204": { "description": "Revoked" },
                     "404": { "description": "API key not found" }
@@ -959,6 +981,7 @@ fn insert_audit_event_paths(paths: &mut Map<String, Value>) {
         json!({
             "get": {
                 "summary": "List persisted admin request audit events",
+                "description": "Every admin write, and the reads that name a target (the sandbox snapshot list). target_org_id, target_type (api_key or sandbox), target_id and target_user_id name what the request acted on once it resolved; they are null otherwise.",
                 "parameters": [
                     { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 250 } }
                 ],

@@ -68,6 +68,35 @@ pub async fn create_terminal_session(
     validate_terminal_size(request.size.as_ref())?;
     let sandbox_id = parse_public_sandbox_id(&sandbox_id)?;
     let _sandbox = ensure_sandbox_owner(authorized, &state.pool, org.id, sandbox_id).await?;
+    let session = create_terminal_session_for_sandbox(
+        &state,
+        org.id,
+        actor.id,
+        sandbox_id,
+        request,
+        idempotency_key(&headers)?,
+        OperationPathTemplate::new(TERMINAL_SESSION_PATH_TEMPLATE),
+    )
+    .await?;
+
+    Ok((StatusCode::CREATED, Json(session)))
+}
+
+/// Create a terminal session in a sandbox `org_id` owns, after the caller has
+/// established that it does. Shared with the admin route, which resolves the
+/// owning organization itself; both mint the same session-scoped attach token.
+/// `path_template` scopes `idempotency_key`, so each route replays only its own
+/// sessions.
+pub(crate) async fn create_terminal_session_for_sandbox(
+    state: &AppState,
+    org_id: OrgId,
+    actor_user_id: UserId,
+    sandbox_id: PublicSandboxId,
+    request: CreateTerminalSessionRequest,
+    idempotency_key: IdempotencyKey,
+    path_template: OperationPathTemplate,
+) -> Result<PublicSession, PublicApiError> {
+    validate_terminal_size(request.size.as_ref())?;
     let request_json = serde_json::to_value(&request).map_err(|error| {
         tracing::error!(error = %error, "failed to serialize terminal session request");
         PublicApiError::internal()
@@ -80,11 +109,11 @@ pub async fn create_terminal_session(
         None,
         &request_json,
     );
-    let session = create_session(
-        &state,
+    create_session(
+        state,
         RouteSessionCreate {
-            org_id: org.id,
-            actor_user_id: actor.id,
+            org_id,
+            actor_user_id,
             sandbox_id,
             kind: SessionKind::Terminal,
             target_port: None,
@@ -92,14 +121,12 @@ pub async fn create_terminal_session(
             target_path: None,
             request_json,
             fingerprint_payload,
-            idempotency_key: idempotency_key(&headers)?,
-            path_template: OperationPathTemplate::new(TERMINAL_SESSION_PATH_TEMPLATE),
+            idempotency_key,
+            path_template,
         },
         || Ok(()),
     )
-    .await?;
-
-    Ok((StatusCode::CREATED, Json(session)))
+    .await
 }
 
 pub async fn create_process_session(
@@ -185,7 +212,10 @@ pub async fn create_command(
         actor.id,
         sandbox_id,
         request,
-        idempotency_key,
+        RouteIdempotency {
+            key: idempotency_key,
+            path_template: OperationPathTemplate::new(COMMAND_PATH_TEMPLATE),
+        },
         || admit(admission, sandbox_id, lifecycle),
     )
     .await?;
@@ -441,6 +471,12 @@ pub(crate) async fn queue_implicit_wake(
     }
 }
 
+/// A request's `Idempotency-Key` and the route scope it is unique within.
+pub(crate) struct RouteIdempotency {
+    pub(crate) key: IdempotencyKey,
+    pub(crate) path_template: OperationPathTemplate,
+}
+
 /// Create a command (one-shot process) data-plane session for `sandbox_id`,
 /// scoped to `org_id` and attributed to `actor_user_id`.
 ///
@@ -451,14 +487,16 @@ pub(crate) async fn queue_implicit_wake(
 /// surface passes its own authenticated org after an ownership check, so this
 /// helper never weakens the public org boundary. The returned attach token is
 /// session-scoped (independent of `org_id`), so the data-plane stream that the
-/// caller connects to authenticates on the token alone.
+/// caller connects to authenticates on the token alone. The `idempotency`
+/// path template scopes its key, so the public and admin routes replay only
+/// their own sessions.
 pub(crate) async fn create_command_session(
     store: &PublicSessionStore,
     org_id: OrgId,
     actor_user_id: UserId,
     sandbox_id: PublicSandboxId,
     request: CreateCommandRequest,
-    idempotency_key: IdempotencyKey,
+    idempotency: RouteIdempotency,
     admit: impl FnOnce() -> Result<(), PublicApiError> + Send,
 ) -> Result<PublicCommand, PublicApiError> {
     let request = CreateProcessRequest::from(request);
@@ -489,8 +527,8 @@ pub(crate) async fn create_command_session(
                 fingerprint_payload: &fingerprint_payload,
                 idempotency: CreatePublicSessionIdempotency {
                     method: HttpOperationMethod::Post,
-                    path_template: OperationPathTemplate::new(COMMAND_PATH_TEMPLATE),
-                    key: &idempotency_key,
+                    path_template: idempotency.path_template,
+                    key: &idempotency.key,
                 },
             },
             admit,

@@ -50,6 +50,12 @@ pub(super) enum IdentityAdminError {
     EmailInUse,
     #[error("{0}")]
     InvalidRequest(&'static str),
+    /// A request field failed validation; the body names the field.
+    #[error("{message}")]
+    InvalidField {
+        field: &'static str,
+        message: &'static str,
+    },
     #[error("internal server error")]
     Internal(#[source] sqlx::Error),
     #[error("internal server error")]
@@ -98,7 +104,7 @@ impl IdentityAdminError {
             Self::SelfMutation | Self::StillOwns(_) | Self::OrgNotEmpty(_) | Self::EmailInUse => {
                 StatusCode::CONFLICT
             }
-            Self::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+            Self::InvalidRequest(_) | Self::InvalidField { .. } => StatusCode::BAD_REQUEST,
             Self::Internal(_) | Self::Password(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Contended { status, .. } => *status,
         }
@@ -106,7 +112,8 @@ impl IdentityAdminError {
 
     /// A stable machine-readable reason for the 409s callers must tell
     /// apart. It is not `code`, which elsewhere in `/admin/api/v1` is the
-    /// status category. The other variants keep the message-only body.
+    /// status category. The other variants have none; only
+    /// [`Self::InvalidField`] adds a `field` to the message.
     const fn reason(&self) -> Option<&'static str> {
         match self {
             Self::SelfMutation => Some("self_mutation"),
@@ -116,6 +123,7 @@ impl IdentityAdminError {
             Self::Forbidden
             | Self::NotFound
             | Self::InvalidRequest(_)
+            | Self::InvalidField { .. }
             | Self::Internal(_)
             | Self::Password(_)
             | Self::Contended { .. } => None,
@@ -143,6 +151,9 @@ impl IntoResponse for IdentityAdminError {
         body.insert("error".to_string(), self.to_string().into());
         if let Some(reason) = self.reason() {
             body.insert("reason".to_string(), reason.into());
+        }
+        if let Self::InvalidField { field, .. } = &self {
+            body.insert("field".to_string(), (*field).into());
         }
         let retained_until = match &self {
             Self::StillOwns(UserDeleteBlocker::DeletedSandboxes { retained_until }) => {
@@ -450,6 +461,11 @@ pub(super) async fn create_org(
     Json(request): Json<CreateOrgRequest>,
 ) -> Result<(StatusCode, Json<Organization>), IdentityAdminError> {
     require_managing_org_admin(&state, &actor).await?;
+    validate_branding(
+        request.theme_primary.as_deref(),
+        request.theme_secondary.as_deref(),
+        request.logo_url.as_deref(),
+    )?;
     let org = sqlx::query_as::<_, Organization>(sql!(
         "INSERT INTO organizations (
              id, name, slug, parent_id, theme_primary, theme_secondary, logo_url
@@ -510,6 +526,37 @@ pub(super) async fn update_org(
         )?;
     }
     let mut tx = state.pool.begin().await?;
+    // Branding is validated only where the patch changes it: the console
+    // re-sends every branding field on save, and a value stored before
+    // validation existed must not block an edit to another field. Locked so
+    // the comparison holds until the update.
+    let stored = sqlx::query_as::<_, StoredBranding>(sql!(
+        "SELECT theme_primary, theme_secondary, logo_url
+         FROM organizations
+         WHERE id = $1
+         FOR UPDATE"
+    ))
+    .bind(org_id)
+    .fetch_optional(tx.as_mut())
+    .await?
+    .ok_or(IdentityAdminError::NotFound)?;
+    validate_branding(
+        changed_value(
+            theme_primary_present,
+            theme_primary.as_deref(),
+            stored.theme_primary.as_deref(),
+        ),
+        changed_value(
+            theme_secondary_present,
+            theme_secondary.as_deref(),
+            stored.theme_secondary.as_deref(),
+        ),
+        changed_value(
+            logo_url_present,
+            logo_url.as_deref(),
+            stored.logo_url.as_deref(),
+        ),
+    )?;
     let org = sqlx::query_as::<_, Organization>(sql!(
         "UPDATE organizations
          SET name = COALESCE($2, name),
@@ -895,6 +942,75 @@ async fn require_managing_org_admin(
 
 async fn is_managing_org_admin(state: &AppState, actor: &User) -> Result<bool, IdentityAdminError> {
     Ok(authz::is_managing_org_admin(&state.pool, actor).await?)
+}
+
+/// Check an organization's branding before it is stored: the console renders
+/// the colors as CSS and the logo as an image source.
+fn validate_branding(
+    theme_primary: Option<&str>,
+    theme_secondary: Option<&str>,
+    logo_url: Option<&str>,
+) -> Result<(), IdentityAdminError> {
+    for (field, value) in [
+        ("theme_primary", theme_primary),
+        ("theme_secondary", theme_secondary),
+    ] {
+        if value.is_some_and(|value| !is_hex_color(value)) {
+            return Err(IdentityAdminError::InvalidField {
+                field,
+                message: "theme colors must be #rgb or #rrggbb hex colors",
+            });
+        }
+    }
+    if logo_url.is_some_and(|value| !is_logo_url(value)) {
+        return Err(IdentityAdminError::InvalidField {
+            field: "logo_url",
+            message: "logo_url must be an absolute https URL; http is allowed only for localhost",
+        });
+    }
+    Ok(())
+}
+
+fn is_hex_color(value: &str) -> bool {
+    value.strip_prefix('#').is_some_and(|digits| {
+        matches!(digits.len(), 3 | 6) && digits.chars().all(|c| c.is_ascii_hexdigit())
+    })
+}
+
+/// An absolute `https` URL with a host and no credentials, or `http` on a
+/// loopback host for local development.
+fn is_logo_url(value: &str) -> bool {
+    let Ok(uri) = value.parse::<axum::http::Uri>() else {
+        return false;
+    };
+    let Some(authority) = uri.authority() else {
+        return false;
+    };
+    if authority.as_str().contains('@') || authority.host().is_empty() {
+        return false;
+    }
+    match uri.scheme_str() {
+        Some("https") => true,
+        Some("http") => matches!(authority.host(), "localhost" | "127.0.0.1" | "[::1]"),
+        _ => false,
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct StoredBranding {
+    theme_primary: Option<String>,
+    theme_secondary: Option<String>,
+    logo_url: Option<String>,
+}
+
+/// The value a patch field sets, when it sets one other than the stored
+/// value; clearing and leaving a field alone need no validation.
+fn changed_value<'a>(
+    present: bool,
+    patched: Option<&'a str>,
+    stored: Option<&str>,
+) -> Option<&'a str> {
+    patched.filter(|value| present && Some(*value) != stored)
 }
 
 fn nullable_patch_bind<T>(patch: Option<crate::models::NullablePatch<T>>) -> (bool, Option<T>) {

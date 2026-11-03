@@ -13,8 +13,11 @@ use crate::user_role::UserRole;
 pub struct ApiKeyAuthContext {
     pub api_key: ApiKey,
     pub org: Organization,
-    /// Resolved actor for the key. `None` if the key has `created_by` set but
-    /// the user no longer exists, or if the org has no users at all.
+    /// The user the key acts as: its `created_by`, which must be a user of the
+    /// key's org, or the org's oldest user when `created_by` is NULL (the
+    /// recorded user was deleted, or the key predates recording one). `None`
+    /// when `created_by` names a user outside the key's org, or the org has no
+    /// users.
     pub actor: Option<User>,
 }
 
@@ -105,6 +108,13 @@ pub async fn get_external_console_user(
     Ok(Some((user, org)))
 }
 
+/// How stale `api_keys.last_used_at` may get before a use of the key records
+/// a new time. A use within this window of the recorded one writes nothing,
+/// so an active key costs at most one `UPDATE` per window, not one per
+/// request.
+pub(crate) const API_KEY_LAST_USED_GRANULARITY: std::time::Duration =
+    std::time::Duration::from_secs(5 * 60);
+
 /// Resolve a service credential for one surface.
 ///
 /// The surface is part of the lookup rather than a check the caller applies
@@ -112,6 +122,8 @@ pub async fn get_external_console_user(
 /// another even if a future caller forgets to ask. A key that exists but is
 /// not scoped to `surface` is indistinguishable from no key at all, which is
 /// the right answer for an auth boundary.
+///
+/// A successful lookup records the key's use; see [`record_api_key_use`].
 pub async fn get_api_key_org(
     pool: &PgPool,
     raw_api_key: &str,
@@ -168,7 +180,53 @@ pub async fn get_api_key_org(
     .fetch_optional(pool)
     .await?;
 
-    Ok(row.map(ApiKeyAuthRow::into_context))
+    let Some(context) = row.map(ApiKeyAuthRow::into_context) else {
+        return Ok(None);
+    };
+    record_api_key_use(pool, &context.api_key).await;
+    Ok(Some(context))
+}
+
+/// Advance the key's `last_used_at` when it is older than
+/// [`API_KEY_LAST_USED_GRANULARITY`], best effort: a failure is logged and
+/// never fails the request it is recording.
+///
+/// Only lookups through this API record a use. The ECW data-plane route
+/// resolver checks a key's hash on its own and records nothing, so a key used
+/// only for guest traffic keeps its last API use.
+///
+/// The value the lookup just read decides whether to write at all, so most
+/// requests issue no statement. The `UPDATE` repeats the check against the
+/// database clock and skips a row another request is already updating, so
+/// concurrent uses of one key neither wait on each other nor write twice. It
+/// also skips a key revoked since the lookup read it.
+async fn record_api_key_use(pool: &PgPool, api_key: &ApiKey) {
+    let fresh = api_key.last_used_at.is_some_and(|last_used_at| {
+        OffsetDateTime::now_utc() - last_used_at < API_KEY_LAST_USED_GRANULARITY
+    });
+    if fresh {
+        return;
+    }
+    let result = sqlx::query(sql!(
+        "UPDATE api_keys
+            SET last_used_at = NOW()
+          WHERE id = (
+              SELECT id
+              FROM api_keys
+              WHERE id = $1
+                AND revoked_at IS NULL
+                AND (last_used_at IS NULL
+                     OR last_used_at < NOW() - make_interval(secs => $2))
+              FOR UPDATE SKIP LOCKED
+          )"
+    ))
+    .bind(api_key.id)
+    .bind(API_KEY_LAST_USED_GRANULARITY.as_secs_f64())
+    .execute(pool)
+    .await;
+    if let Err(error) = result {
+        tracing::warn!(%error, api_key_id = %api_key.id, "failed to record api key use");
+    }
 }
 
 pub(crate) async fn org_has_local_owner(pool: &PgPool, org_id: OrgId) -> Result<bool, sqlx::Error> {
@@ -296,3 +354,7 @@ pub async fn api_key_belongs_to_org(
 #[cfg(test)]
 #[path = "auth/surface_scope_tests.rs"]
 mod surface_scope_tests;
+
+#[cfg(test)]
+#[path = "auth/api_key_use_tests.rs"]
+mod api_key_use_tests;

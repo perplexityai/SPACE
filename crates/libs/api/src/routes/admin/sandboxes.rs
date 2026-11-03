@@ -1,9 +1,9 @@
-use crate::routes::public::error::database_error;
 use pplx_space_common_core::sql;
 use std::str::FromStr;
 
 use axum::{
     Extension, Json,
+    body::Bytes,
     extract::{FromRequest, Path, Request, State, rejection::JsonRejection},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
@@ -13,15 +13,15 @@ use pplx_space_common_core::env::{
 };
 use pplx_space_common_core::types::{IdempotencyKey, NodePoolName, OrgId, SandboxId, UserId};
 use pplx_space_public_api::{
-    CreateCommandRequest, CreateSandboxRequest as PublicCreateSandboxRequest, OperationId,
-    OperationKind, OperationTargetType, PublicCommand, PublicSandboxId, RequestFingerprint,
+    CreateSandboxRequest as PublicCreateSandboxRequest, OperationId, OperationKind,
+    OperationTargetType, PublicSandboxId, RequestFingerprint, RollbackSandboxRequest,
     SandboxLifecycleAction, SandboxOperationResponse,
     UpdateSandboxRequest as PublicUpdateSandboxRequest,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use super::audit::{self, AdminSandboxAuditEntry};
+use super::audit::{self, AdminAuditTarget, AdminSandboxAuditEntry};
 use super::sandbox_id::{AdminSandboxIdError, parse_admin_sandbox_id};
 use crate::middleware::auth::AuthUser;
 use crate::models::{Sandbox, SandboxResponse, User};
@@ -37,10 +37,12 @@ use crate::routes::AppState;
 use crate::routes::admin::support::{
     self, ContentionScope, IDEMPOTENCY_KEY_HEADER, require_managing_org_admin,
 };
-use crate::routes::public::error::PublicApiError;
-use crate::routes::public::sessions::{
-    create_command_session, idempotency_key as session_idempotency_key,
-};
+use crate::routes::public::hidden_operations;
+use crate::routes::public::sandboxes::parse_rollback_body;
+use pplx_space_public_api::routes as native_routes;
+
+mod guest_access;
+pub use guest_access::{create_command, create_terminal_session, list_snapshots};
 
 const ADMIN_SANDBOX_ACTION_PREFIX: &str = "force-";
 /// Distinct from the public `/v1/sandboxes` template so admin and public
@@ -172,11 +174,9 @@ pub async fn create_sandbox(
     let org_id = request.org_id;
     let requested_by =
         crate::public_sandbox_operations::admin_create_requested_by_enabled().then_some(actor.id);
-    match create_sandbox_for_org(
+    if let Err(err) = admin_create_precheck(
         &state.pool,
-        request,
-        &idempotency_key,
-        requested_by,
+        &request,
         state
             .sandbox_controller
             .substrate_capabilities()
@@ -184,6 +184,11 @@ pub async fn create_sandbox(
     )
     .await
     {
+        tracing::warn!(%org_id, error = %err.message, "admin sandbox create failed");
+        return err.into_response();
+    }
+    // The organization resolved; every answer from here names it.
+    match create_sandbox_for_org(&state.pool, request, &idempotency_key, requested_by).await {
         Ok(response) => {
             audit::record_sandbox(AdminSandboxAuditEntry {
                 actor: &actor,
@@ -194,28 +199,32 @@ pub async fn create_sandbox(
                 success: true,
                 error: None,
             });
-            (StatusCode::ACCEPTED, Json(response)).into_response()
+            (
+                StatusCode::ACCEPTED,
+                Extension(AdminAuditTarget::sandbox(org_id, response.sandbox_id)),
+                Json(response),
+            )
+                .into_response()
         }
         Err(err) => {
             tracing::warn!(%org_id, error = %err.message, "admin sandbox create failed");
-            err.into_response()
+            (
+                Extension(AdminAuditTarget::sandbox_create(org_id)),
+                err.into_response(),
+            )
+                .into_response()
         }
     }
 }
 
-async fn create_sandbox_for_org(
+/// The checks that precede the target organization resolving: the placement
+/// gate and the organization's existence.
+async fn admin_create_precheck(
     pool: &sqlx::PgPool,
-    request: AdminCreateSandboxRequest,
-    idempotency_key: &IdempotencyKey,
-    requested_by: Option<UserId>,
+    request: &AdminCreateSandboxRequest,
     substrate_supports_node_pool_placement: bool,
-) -> Result<SandboxOperationResponse, AdminSandboxActionError> {
+) -> Result<(), AdminSandboxActionError> {
     let org_id = request.org_id;
-    let internal = |error: &dyn std::fmt::Display| {
-        tracing::warn!(org_id = %org_id.as_uuid(), %error, "admin sandbox create failed");
-        AdminSandboxActionError::new(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
-    };
-
     // Placement is off by default; a pin issued while the gate is off is
     // rejected outright (no persisted intent, no deferred replay).
     validate_admin_node_pool(
@@ -237,6 +246,21 @@ async fn create_sandbox_for_org(
             "Organization not found",
         ));
     }
+    Ok(())
+}
+
+/// Enqueue the create once [`admin_create_precheck`] has passed.
+async fn create_sandbox_for_org(
+    pool: &sqlx::PgPool,
+    request: AdminCreateSandboxRequest,
+    idempotency_key: &IdempotencyKey,
+    requested_by: Option<UserId>,
+) -> Result<SandboxOperationResponse, AdminSandboxActionError> {
+    let org_id = request.org_id;
+    let internal = |error: &dyn std::fmt::Display| {
+        tracing::warn!(org_id = %org_id.as_uuid(), %error, "admin sandbox create failed");
+        AdminSandboxActionError::new(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
+    };
 
     // The create executor resolves the operation's actor as a user of the
     // operation's org, so the owner must genuinely belong to the target org.
@@ -386,11 +410,29 @@ fn admin_create_fingerprint(
     })
 }
 
+/// Enqueue a lifecycle operation on any organization's sandbox, under the
+/// sandbox's owning organization. `:force-rollback` takes the public
+/// `:rollback` body, `{"snapshot_name", "auto_restart"?}`; every other action
+/// ignores the body.
+///
+/// `:force-rollback` stays behind the public `:rollback`'s hidden-operation
+/// gate: it refuses unless rollback is enabled for the sandbox's organization
+/// (`SPACE_NATIVE_HIDDEN_OPERATIONS_ORGS`, or the
+/// `space-native-hidden-operations` flag). Turning the gate off for an org
+/// closes both routes. It is the only hidden action this surface gates:
+/// `:force-checkpoint` and `:force-enable_snapshots`, hidden on the public API
+/// too, already ran ungated here and only add snapshots, while rollback, which
+/// this route could not run until it carried the `:rollback` body, rolls the
+/// sandbox back to a snapshot.
+///
+/// The sandbox resolves before the request is validated, so every refusal after
+/// that names the sandbox and its organization in the audit event.
 pub async fn dispatch_sandbox_action(
     State(state): State<AppState>,
     Extension(AuthUser(actor)): Extension<AuthUser>,
     headers: HeaderMap,
     Path(spec): Path<String>,
+    body: Bytes,
 ) -> axum::response::Response {
     if let Err(err) = require_managing_org_admin(&state.pool, &actor).await {
         return err.into_response();
@@ -398,13 +440,6 @@ pub async fn dispatch_sandbox_action(
     let (target, action) = match parse_spec(&spec) {
         Ok(value) => value,
         Err(err) => return err.into_response(),
-    };
-    let idempotency_key = match idempotency_key(&headers) {
-        Ok(value) => value,
-        Err(err) => {
-            audit_failure(&actor, target, action, None, err.message.as_str());
-            return err.into_response();
-        }
     };
     let sandbox = match fetch_admin_sandbox(&state.pool, target).await {
         Ok(Some(sandbox)) => Some(sandbox),
@@ -432,17 +467,41 @@ pub async fn dispatch_sandbox_action(
         .as_ref()
         .map(|sandbox| sandbox.org_id)
         .unwrap_or_else(|| actor.org_id);
-    let actor_user_id = actor.id;
-    match enqueue_admin_lifecycle_operation(
-        &state.pool,
-        operation_org_id,
-        actor_user_id,
-        target,
-        action,
-        &idempotency_key,
-    )
-    .await
-    {
+    // Only a sandbox that exists names its organization; a delete of one
+    // already gone is recorded by its path alone.
+    let audit_target = sandbox
+        .as_ref()
+        .map(|sandbox| Extension(AdminAuditTarget::sandbox(sandbox.org_id, target.public_id)));
+    let result = async {
+        if action == SandboxLifecycleAction::Rollback
+            && !hidden_operations::visible(
+                &state,
+                operation_org_id,
+                native_routes::ROLLBACK_SANDBOX,
+            )
+        {
+            return Err(AdminSandboxActionError::new(
+                StatusCode::NOT_FOUND,
+                "rollback is not enabled for the sandbox's organization",
+            ));
+        }
+        let rollback = parse_rollback_body(action, &body).map_err(|error| {
+            AdminSandboxActionError::new(StatusCode::BAD_REQUEST, error.to_string())
+        })?;
+        let idempotency_key = idempotency_key(&headers)?;
+        enqueue_admin_lifecycle_operation(
+            &state.pool,
+            operation_org_id,
+            actor.id,
+            target,
+            action,
+            rollback,
+            &idempotency_key,
+        )
+        .await
+    }
+    .await;
+    let response = match result {
         Ok(response) => {
             audit::record_sandbox(AdminSandboxAuditEntry {
                 actor: &actor,
@@ -467,51 +526,8 @@ pub async fn dispatch_sandbox_action(
             });
             err.into_response()
         }
-    }
-}
-
-/// Run a one-shot command in a sandbox from the operator surface.
-///
-/// The admin console lists sandboxes across every org, so the org-scoped public
-/// command endpoint rejects every sandbox the operator does not personally own
-/// with "sandbox not found". This handler resolves the sandbox without an org
-/// filter and runs the command under the sandbox's owning org, mirroring
-/// `dispatch_sandbox_action`. Managing-org admin is already enforced by the
-/// admin auth middleware, and the same middleware records an admin audit event
-/// for the request.
-pub async fn create_command(
-    State(state): State<AppState>,
-    Extension(AuthUser(actor)): Extension<AuthUser>,
-    headers: HeaderMap,
-    Path(spec): Path<String>,
-    Json(request): Json<CreateCommandRequest>,
-) -> Result<(StatusCode, Json<PublicCommand>), PublicApiError> {
-    let target = AdminSandboxTarget::parse(&spec)
-        .map_err(|error| PublicApiError::bad_request(error.to_string()))?;
-    let sandbox = fetch_admin_sandbox(&state.pool, target)
-        .await
-        // `database_error` classifies contention (and attaches
-        // `Retry-After`), so this lookup answers the same 503 the list handler
-        // does rather than a flat 500. It logs both cases itself — a
-        // lost race at `warn` under "public api statement lost a lock race",
-        // a real failure at `error` under "public api database error" — so
-        // there is no hand-rolled log here. The `sandbox_id` is recoverable
-        // from the `http.server` span's `url.path`, which carries it.
-        .map_err(database_error)?
-        .ok_or_else(|| PublicApiError::not_found("sandbox not found"))?;
-    let idempotency_key = session_idempotency_key(&headers)?;
-    let command = create_command_session(
-        &state.public_session_store(),
-        sandbox.org_id,
-        actor.id,
-        target.public_id,
-        request,
-        idempotency_key,
-        || Ok(()),
-    )
-    .await?;
-
-    Ok((StatusCode::CREATED, Json(command)))
+    };
+    (audit_target, response).into_response()
 }
 
 /// Update a sandbox (network policy, auto-lifecycle, metadata) from the
@@ -539,25 +555,6 @@ pub async fn update_sandbox(
                 .into_response();
         }
     };
-    if request
-        .resources
-        .as_ref()
-        .and_then(|resources| resources.disk_mib)
-        .is_some()
-    {
-        return AdminSandboxActionError::new(
-            StatusCode::BAD_REQUEST,
-            "disk_mib is not mutable in place; recreate or restore the sandbox with the new disk size",
-        )
-        .into_response();
-    }
-    let idempotency_key = match idempotency_key(&headers) {
-        Ok(value) => value,
-        Err(err) => {
-            audit_update_failure(&actor, target, None, err.message.as_str());
-            return err.into_response();
-        }
-    };
     let sandbox = match fetch_admin_sandbox(&state.pool, target).await {
         Ok(Some(sandbox)) => sandbox,
         Ok(None) => {
@@ -576,18 +573,37 @@ pub async fn update_sandbox(
         }
     };
 
+    // The sandbox resolved, so every answer from here names it.
     let operation_org_id = sandbox.org_id;
-    let actor_user_id = actor.id;
-    match enqueue_admin_update_operation(
-        &state.pool,
+    let audit_target = Extension(AdminAuditTarget::sandbox(
         operation_org_id,
-        actor_user_id,
-        target,
-        request,
-        &idempotency_key,
-    )
-    .await
-    {
+        target.public_id,
+    ));
+    let result = async {
+        if request
+            .resources
+            .as_ref()
+            .and_then(|resources| resources.disk_mib)
+            .is_some()
+        {
+            return Err(AdminSandboxActionError::new(
+                StatusCode::BAD_REQUEST,
+                "disk_mib is not mutable in place; recreate or restore the sandbox with the new disk size",
+            ));
+        }
+        let idempotency_key = idempotency_key(&headers)?;
+        enqueue_admin_update_operation(
+            &state.pool,
+            operation_org_id,
+            actor.id,
+            target,
+            request,
+            &idempotency_key,
+        )
+        .await
+    }
+    .await;
+    let response = match result {
         Ok(response) => {
             audit::record_sandbox(AdminSandboxAuditEntry {
                 actor: &actor,
@@ -612,7 +628,8 @@ pub async fn update_sandbox(
             });
             err.into_response()
         }
-    }
+    };
+    (audit_target, response).into_response()
 }
 
 async fn enqueue_admin_update_operation(
@@ -725,14 +742,15 @@ async fn enqueue_admin_lifecycle_operation(
     actor_user_id: UserId,
     target: AdminSandboxTarget,
     action: SandboxLifecycleAction,
+    rollback: Option<RollbackSandboxRequest>,
     idempotency_key: &IdempotencyKey,
 ) -> Result<SandboxOperationResponse, AdminSandboxActionError> {
     let sandbox_id_string = target.public_id.to_string();
-    let fingerprint = lifecycle_request_fingerprint(target, action)?;
+    let fingerprint = lifecycle_request_fingerprint(target, action, rollback.as_ref())?;
     let payload_json = SandboxLifecycleOperationPayload {
         sandbox_id: target.public_id,
         action,
-        rollback: None,
+        rollback,
         wake_activity: None,
     }
     .into_json();
@@ -895,13 +913,22 @@ fn idempotency_key(headers: &HeaderMap) -> Result<IdempotencyKey, AdminSandboxAc
 fn lifecycle_request_fingerprint(
     target: AdminSandboxTarget,
     action: SandboxLifecycleAction,
+    rollback: Option<&RollbackSandboxRequest>,
 ) -> Result<RequestFingerprint, AdminSandboxActionError> {
-    let bytes = serde_json::to_vec(&serde_json::json!({
-        "sandbox_id": target.public_id.to_string(),
-        "action": action.as_str(),
-        "admin": true,
-    }))
-    .map_err(|error| {
+    let mut fingerprint = serde_json::Map::new();
+    fingerprint.insert(
+        "sandbox_id".to_string(),
+        target.public_id.to_string().into(),
+    );
+    fingerprint.insert("action".to_string(), action.as_str().into());
+    fingerprint.insert("admin".to_string(), true.into());
+    // Only a rollback carries a body, so every other action keeps the
+    // fingerprint it had before rollbacks did, and a replay across releases
+    // still matches.
+    if let Some(rollback) = rollback {
+        fingerprint.insert("rollback".to_string(), serde_json::json!(rollback));
+    }
+    let bytes = serde_json::to_vec(&fingerprint).map_err(|error| {
         tracing::error!(%error, "failed to serialize admin lifecycle request fingerprint");
         AdminSandboxActionError::new(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
     })?;

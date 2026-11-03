@@ -1129,17 +1129,34 @@ fn rollback_request(
     action: SandboxLifecycleAction,
     body: &[u8],
 ) -> Result<Option<RollbackSandboxRequest>, PublicApiError> {
+    parse_rollback_body(action, body)
+        .map_err(|error| PublicApiError::bad_request(error.to_string()))
+}
+
+/// Why a lifecycle action's body is not a valid `:rollback` body.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RollbackBodyError {
+    #[error("rollback requires snapshot_name")]
+    Missing,
+    #[error("invalid rollback request: {0}")]
+    Invalid(#[source] serde_json::Error),
+}
+
+/// The `:rollback` body for a rollback, `None` for any other action, whose
+/// body is ignored. Shared with the admin `:force-rollback`.
+pub(crate) fn parse_rollback_body(
+    action: SandboxLifecycleAction,
+    body: &[u8],
+) -> Result<Option<RollbackSandboxRequest>, RollbackBodyError> {
     if action != SandboxLifecycleAction::Rollback {
         return Ok(None);
     }
     if body.is_empty() {
-        return Err(PublicApiError::bad_request(
-            "rollback requires snapshot_name",
-        ));
+        return Err(RollbackBodyError::Missing);
     }
     serde_json::from_slice::<RollbackSandboxRequest>(body)
         .map(Some)
-        .map_err(|error| PublicApiError::bad_request(format!("invalid rollback request: {error}")))
+        .map_err(RollbackBodyError::Invalid)
 }
 
 async fn ensure_sandbox_owner(
