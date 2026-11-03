@@ -57,18 +57,15 @@ _DURATION_SECONDS = {
         "local.btrfs_send_restore_rejects_corrupted_stream": 56,
         "local.cold_sandbox_eviction_wake_round_trip": 137,
         "local.concurrent_restore_converges_to_one_execution": 62,
-        # One local Kind run each, with Playwright's Chromium on the host,
+        # Three local Kind runs each, with Playwright's Chromium on the host,
         # until CI runs them: CI withholds them unless a console path changes.
-        # Estimates for two, until a Kind run refreshes them: the detail
-        # scenario's 16 s predates its restore and second suspend, so it adds
-        # one suspend/restore round trip (11 s, as
-        # local.suspend_restore_cross_node_from_object_storage); the lookup
-        # scenario's 14 s predates its second sandbox, so it adds the 4 s of
-        # one create and delete (as ecw.sandbox_info).
+        # The median of each, summing the phase durations, bootstrap included.
+        # The detail scenario's restore and second suspend and the lookup
+        # scenario's second sandbox are in them.
         "local.console_destructive_actions_require_confirmation": 23,
         "local.console_links_resolve": 15,
         "local.console_operator_suspends_another_orgs_sandbox": 19,
-        "local.console_sandbox_detail_complete_in_every_state": 27,
+        "local.console_sandbox_detail_complete_in_every_state": 22,
         "local.console_sandbox_lookup_accepts_every_id_form": 18,
         "local.console_turns_away_non_operators": 15,
         "local.deferred_btrfs_send_capture_restores_cross_node": 13,
