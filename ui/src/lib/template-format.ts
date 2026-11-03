@@ -84,6 +84,19 @@ export function retagStep(
   return { kind: 'warn', baseline: { holders, change: { tag, ...change } } };
 }
 
+// What OK does, from a fresh read of the releases (`readReleases`) rather
+// than the page's list, which can be up to one refresh old: a tag that moved
+// since the dialog showed it warns before anything is sent. A failed read
+// throws, and nothing is sent.
+export async function retagStepNow(
+  baseline: RetagBaseline,
+  readReleases: () => Promise<{ id: string; template_name: string; tags: string[] }[]>,
+  templateName: string,
+  tag: string,
+): Promise<ReturnType<typeof retagStep>> {
+  return retagStep(baseline, tagHolders(await readReleases(), templateName), tag);
+}
+
 // What a template row's builds panel shows: the template, whether the row is
 // expanded, and the page refresh it last saw.
 export interface BuildsView {

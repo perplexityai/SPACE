@@ -23,7 +23,7 @@ import {
   Sandbox,
 } from '@/lib/types';
 import { tablePagination } from '@/lib/table-pagination';
-import { LATEST_TAG as DEFAULT_TEMPLATE_TAG, buildsRead, errorMessage, retagStep, shortHash, tagHolders, type BuildsView, type RetagBaseline } from '@/lib/template-format';
+import { LATEST_TAG as DEFAULT_TEMPLATE_TAG, buildsRead, errorMessage, retagStepNow, shortHash, tagHolders, type BuildsView, type RetagBaseline } from '@/lib/template-format';
 import { singleFlight } from '@/lib/single-flight';
 import { TAG_PRECONDITION_UNCHECKED, isMissingRoute, moveReleaseTag, pageRows, tagMoveFailureMessage } from '@/lib/admin-fallback';
 import { SPACED_SAMPLE_LIMIT, SpacedCounts, loadSpacedCounts, spacedCoverage } from '@/lib/spaced-counts';
@@ -635,6 +635,9 @@ export default function TemplatesPage() {
   // again and read as a 412 "tag moved" (the first press moved it).
   const retagFlight = useRef(singleFlight()).current;
   const [retagSubmitting, setRetagSubmitting] = useState(false);
+  // Bumped when the dialog opens or closes, so a submit whose re-read
+  // outlived its dialog sends nothing.
+  const retagSession = useRef(0);
   const retagTagInput = Form.useWatch('tag', retagForm) as string | undefined;
   const [expandedTemplateRows, setExpandedTemplateRows] = useState<string[]>([]);
   const [templateOperations, setTemplateOperations] = useState<Set<string>>(() => new Set());
@@ -959,12 +962,14 @@ export default function TemplatesPage() {
 
   const openRetagModal = (release: TemplateRelease) => {
     if (!canManageTemplateReleases) return;
+    retagSession.current += 1;
     const visibleTags = visibleTemplateTags(release.tags, release.content_hash);
     retagForm.setFieldsValue({ tag: visibleTags[0] ?? DEFAULT_TEMPLATE_TAG });
     setRetagModal({ open: true, release, holders: tagHolders(templateReleases, release.template_name), change: null });
   };
 
   const closeRetagModal = () => {
+    retagSession.current += 1;
     setRetagModal({ open: false, release: null, holders: {}, change: null });
     retagForm.resetFields();
   };
@@ -980,15 +985,29 @@ export default function TemplatesPage() {
     if (!release || !canManageTemplateReleases) return;
 
     const tag = values.tag.trim();
-    // The releases refreshed while the dialog was open: if the tag moved
-    // meanwhile, show where it is now and ask again before moving it.
-    const step = retagStep(retagModal, tagHolders(templateReleases, release.template_name), tag);
-    if (step.kind === 'warn') {
-      setRetagModal((current) => ({ ...current, ...step.baseline }));
-      return;
-    }
+    const session = retagSession.current;
     setRetagSubmitting(true);
     try {
+      // The releases are read again first: if the tag moved since the dialog
+      // showed it, show where it is now and ask again before moving it.
+      let step: Awaited<ReturnType<typeof retagStepNow>>;
+      try {
+        step = await retagStepNow(
+          retagModal,
+          () => refreshTemplateReleases({ showLoading: false }),
+          release.template_name,
+          tag,
+        );
+      } catch {
+        message.error("Could not read the template's tags again before moving the tag; nothing was changed. Try again.");
+        return;
+      }
+      // Closed, or opened for another release, while the releases were read.
+      if (session !== retagSession.current) return;
+      if (step.kind === 'warn') {
+        setRetagModal((current) => ({ ...current, ...step.baseline }));
+        return;
+      }
       // Moved only while the tag still points where the operator saw it.
       const { checked } = await moveReleaseTag(
         (path, body) => adminApi.put(path, body),

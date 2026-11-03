@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { LATEST_TAG, buildsRead, currentTagHolder, retagStep, shortHash, tagHolder, tagHolderChange, tagHolders } from './template-format.ts';
+import { LATEST_TAG, buildsRead, currentTagHolder, retagStep, retagStepNow, shortHash, tagHolder, tagHolderChange, tagHolders } from './template-format.ts';
 import { singleFlight } from './single-flight.ts';
 
 const HEX = '0123456789abcdef'.repeat(4);
@@ -76,6 +76,29 @@ test('the retag dialog advances only the warned tag, so another tag that moved w
   // reconfirmation still holds.
   assert.deepEqual(retagStep(canary.baseline, now, 'canary'), { kind: 'move', expected: 'rel-d' });
   assert.deepEqual(retagStep(canary.baseline, now, 'prod'), { kind: 'move', expected: 'rel-c' });
+});
+
+test('OK reads the releases again first, so a tag that moved since the page last refreshed warns instead of sending', async () => {
+  // The page's list still shows prod on A (read under 10 s ago); the fresh
+  // read says it moved to C.
+  let reads = 0;
+  const fresh = (releases) => async () => { reads += 1; return releases; };
+  const moved = await retagStepNow(opened({ prod: 'rel-a' }), fresh([
+    { id: 'rel-a', template_name: 'seed', tags: [] },
+    { id: 'rel-c', template_name: 'seed', tags: ['prod'] },
+    { id: 'rel-x', template_name: 'other', tags: ['prod'] },
+  ]), 'seed', 'prod');
+  assert.equal(moved.kind, 'warn');
+  assert.deepEqual(moved.baseline.change, { tag: 'prod', from: 'rel-a', to: 'rel-c' });
+  // Unmoved: sent with the holder the dialog opened with.
+  assert.deepEqual(
+    await retagStepNow(opened({ prod: 'rel-a' }), fresh([{ id: 'rel-a', template_name: 'seed', tags: ['prod'] }]), 'seed', 'prod'),
+    { kind: 'move', expected: 'rel-a' },
+  );
+  assert.equal(reads, 2);
+  // A failed read sends nothing: the caller gets the failure.
+  const failure = new Error('failed to refresh template releases');
+  await assert.rejects(retagStepNow(opened({ prod: 'rel-a' }), async () => { throw failure; }, 'seed', 'prod'), (thrown) => thrown === failure);
 });
 
 test('a reconfirmed tag moves only from the holder the dialog showed; a further move warns again', () => {
