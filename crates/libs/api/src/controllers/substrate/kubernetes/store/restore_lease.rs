@@ -2,6 +2,7 @@
 //! rollback reverts, and preparing a sandbox for wake.
 
 use super::*;
+use pplx_space_sandbox_store::restore_lease;
 
 impl K8sStore {
     /// Post-CAS-loss snapshot of the restore gate. Fresh execution work keeps
@@ -354,24 +355,16 @@ impl K8sStore {
                 // `target_node_id` and the artifact marker name the wake
                 // source and stay; the lifecycle triggers keep the marker on
                 // `suspended`. `placement_changed_at` is cleared, as the
-                // markerless restoring recovery in `pod_tracking.rs` does for
-                // its rows: a
+                // markerless restoring recovery
+                // (`pplx_space_sandbox_store::pod_tracking`) does for its
+                // rows: a
                 // restore whose pod bound moved it past the proven
                 // pre-restore source, and both the suspended selector and
                 // `durably_restorable` take a markerless snapshot only when
                 // it is newer than the last placement.
-                sqlx::query(sql!(
-                    "UPDATE sandboxes
-                        SET lifecycle = 'suspended',
-                            placement = 'unplaced',
-                            active_node_id = NULL,
-                            placement_changed_at = NULL
-                      WHERE id = $1"
-                ))
-                .bind(sandbox_id)
-                .execute(&mut *tx)
-                .await
-                .db_context("failed to revert sandbox lifecycle to suspended")?;
+                restore_lease::revert_restore_claim_retiring_placement(&mut tx, sandbox_id)
+                    .await
+                    .db_context("failed to revert sandbox lifecycle to suspended")?;
                 RestoreClaimRevert::ExecutionRetired { pod_name }
             }
             (None, true) if !any_active => {
@@ -379,26 +372,15 @@ impl K8sStore {
                 // clear as above. An execution the claim reused rather than
                 // created keeps the clock, since nothing proves its pod
                 // holds no state of its own.
-                sqlx::query(sql!(
-                    "UPDATE sandboxes
-                        SET lifecycle = 'suspended',
-                            placement_changed_at = NULL
-                      WHERE id = $1"
-                ))
-                .bind(sandbox_id)
-                .execute(&mut *tx)
-                .await
-                .db_context("failed to revert sandbox lifecycle to suspended")?;
+                restore_lease::revert_restore_claim_clearing_placement_clock(&mut tx, sandbox_id)
+                    .await
+                    .db_context("failed to revert sandbox lifecycle to suspended")?;
                 RestoreClaimRevert::LifecycleOnly
             }
             (claimed, _) => {
-                sqlx::query(sql!(
-                    "UPDATE sandboxes SET lifecycle = 'suspended' WHERE id = $1"
-                ))
-                .bind(sandbox_id)
-                .execute(&mut *tx)
-                .await
-                .db_context("failed to revert sandbox lifecycle to suspended")?;
+                restore_lease::revert_restore_claim_lifecycle(&mut tx, sandbox_id)
+                    .await
+                    .db_context("failed to revert sandbox lifecycle to suspended")?;
                 if claimed.is_some() || any_active {
                     RestoreClaimRevert::ExecutionLeftActive
                 } else {
@@ -471,97 +453,26 @@ impl K8sStore {
         // `stopped` sandbox is user-owned, and one still on its node would get
         // two homes. It claims to `restoring` like the suspend path; see
         // `RestoreClaim::FreshFromStopped`.
-        let restore_lease_token = (!require_evacuation_marker).then(Uuid::now_v7);
         let restore_claim = if require_evacuation_marker {
-            sqlx::query_as::<_, RestoreClaimRow>(sql!(
-                "WITH candidate AS (
-                     SELECT id, lifecycle
-                       FROM sandboxes
-                      WHERE id = $1
-                        AND (
-                          LOWER(TRIM(lifecycle)) IN ('suspended', 'restoring')
-                          OR (
-                            LOWER(TRIM(lifecycle)) = 'stopped'
-                            AND evacuation_restore_target = 'stopped'
-                            AND active_node_id IS NULL
-                            AND $5::text = 'stopped'
-                          )
-                        )
-                        AND evacuation_restore_target IS NOT NULL
-                      FOR UPDATE
-                 ),
-                 updated AS (
-                     UPDATE sandboxes s
-                        SET lifecycle = 'restoring'
-                       FROM candidate c
-                     WHERE s.id = c.id
-                      RETURNING c.lifecycle
-                 )
-                 SELECT u.lifecycle, args.restore_lease_token
-                   FROM updated u
-                   CROSS JOIN (
-                     SELECT $2::bigint AS ttl_secs, $3::uuid AS restore_lease_token
-                   ) args
-                  WHERE args.ttl_secs >= 0"
-            ))
+            restore_lease::claim_evacuation_restore(
+                &self.pool,
+                sandbox_id,
+                recovery_lease_ttl_secs(),
+                super::super::RESTORE_EXECUTION_OWNERSHIP_TTL_SECS,
+                evacuation_target,
+            )
+            .await
         } else {
-            // Preserve `lifecycle_changed_at` across `restoring -> restoring`
-            // re-drives: restore selection uses it as the immutable boundary
-            // between the original source window and artifacts published by a
-            // failed restore branch. The lifecycle trigger still sets it for a
-            // fresh `suspended -> restoring` claim. The restore lease protects
-            // an active re-drive from the transient-lifecycle sweeper.
-            sqlx::query_as::<_, RestoreClaimRow>(sql!(
-                "WITH candidate AS (
-                     SELECT id, lifecycle
-                       FROM sandboxes
-                      WHERE id = $1
-                        AND (
-                          LOWER(TRIM(lifecycle)) = 'suspended'
-                          OR (
-                            LOWER(TRIM(lifecycle)) = 'restoring'
-                            AND evacuation_restore_target IS NULL
-                            AND (
-                              restore_lease_expires_at IS NULL
-                              OR restore_lease_expires_at <= NOW()
-                            )
-                          )
-                        )
-                        AND (
-                          restore_lease_expires_at IS NULL
-                          OR restore_lease_expires_at <= NOW()
-                        )
-                        AND NOT EXISTS (
-                          SELECT 1
-                            FROM sandbox_k8s_executions e
-                           WHERE e.sandbox_id = sandboxes.id
-                             AND e.active
-                             AND e.state IN ('creating', 'created', 'recovering', 'running')
-                             AND e.updated_at >
-                                 NOW() - make_interval(secs => $4)
-                        )
-                      FOR UPDATE
-                 ),
-                 updated AS (
-                     UPDATE sandboxes s
-                        SET lifecycle = 'restoring',
-                            evacuation_restore_target = NULL,
-                            restore_lease_expires_at = NOW() + ($2::bigint * INTERVAL '1 second'),
-                            restore_lease_token = $3
-                       FROM candidate c
-                      WHERE s.id = c.id
-                      RETURNING c.lifecycle
-                 )
-                 SELECT lifecycle, $3::uuid AS restore_lease_token FROM updated"
-            ))
+            restore_lease::claim_user_restore(
+                &self.pool,
+                sandbox_id,
+                recovery_lease_ttl_secs(),
+                Uuid::now_v7(),
+                super::super::RESTORE_EXECUTION_OWNERSHIP_TTL_SECS,
+                evacuation_target,
+            )
+            .await
         }
-        .bind(sandbox_id.as_uuid())
-        .bind(recovery_lease_ttl_secs())
-        .bind(restore_lease_token)
-        .bind(super::super::RESTORE_EXECUTION_OWNERSHIP_TTL_SECS)
-        .bind(evacuation_target.map(SandboxLifecycle::as_str))
-        .fetch_optional(&self.pool)
-        .await
         .db_context("failed to begin sandbox restore")?;
 
         let Some(restore_claim) = restore_claim else {
@@ -643,43 +554,13 @@ impl K8sStore {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<Option<RestoreClaim>, SubstrateError> {
-        let restore_lease_token = Uuid::now_v7();
-        let restore_claim = sqlx::query_as::<_, RestoreClaimRow>(sql!(
-            "WITH candidate AS (
-                 SELECT id, lifecycle
-                   FROM sandboxes
-                  WHERE id = $1
-                    AND LOWER(TRIM(lifecycle)) = 'restoring'
-                    AND evacuation_restore_target IS NULL
-                    AND (
-                      restore_lease_expires_at IS NULL
-                      OR restore_lease_expires_at <= NOW()
-                    )
-                    AND NOT EXISTS (
-                      SELECT 1
-                        FROM sandbox_k8s_executions e
-                       WHERE e.sandbox_id = sandboxes.id
-                         AND e.active
-                         AND e.state IN ('creating', 'created', 'recovering', 'running')
-                         AND e.updated_at > NOW() - make_interval(secs => $4)
-                    )
-                  FOR UPDATE
-             ),
-             updated AS (
-                 UPDATE sandboxes s
-                    SET restore_lease_expires_at = NOW() + ($2::bigint * INTERVAL '1 second'),
-                        restore_lease_token = $3
-                   FROM candidate c
-                  WHERE s.id = c.id
-                  RETURNING c.lifecycle
-             )
-             SELECT lifecycle, $3::uuid AS restore_lease_token FROM updated"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .bind(recovery_lease_ttl_secs())
-        .bind(restore_lease_token)
-        .bind(super::super::RESTORE_EXECUTION_OWNERSHIP_TTL_SECS)
-        .fetch_optional(&self.pool)
+        let restore_claim = restore_lease::claim_markerless_restoring_lease(
+            &self.pool,
+            sandbox_id,
+            recovery_lease_ttl_secs(),
+            Uuid::now_v7(),
+            super::super::RESTORE_EXECUTION_OWNERSHIP_TTL_SECS,
+        )
         .await
         .db_context("failed to claim restoring sandbox restore lease")?;
 
@@ -743,28 +624,9 @@ impl K8sStore {
         sandbox_id: SandboxId,
         restore_lease_token: Uuid,
     ) -> Result<bool, SubstrateError> {
-        let routable =
-            pplx_space_common_svc::sql::sandbox_routability::routable_execution_or_non_k8s(
-                "sandboxes",
-                "$3",
-            );
-        let query = format!(
-            "UPDATE sandboxes
-                SET lifecycle = 'started', placement = 'on_node'
-              WHERE id = $1
-                AND lifecycle = 'restoring'
-                AND restore_lease_token = $2
-                AND {routable}"
-        );
-        let completed = sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
-            .bind(sandbox_id.as_uuid())
-            .bind(restore_lease_token)
-            .bind(pplx_space_common_core::types::SubstrateKind::Kubernetes)
-            .execute(&self.pool)
+        restore_lease::complete_owned_user_restore(&self.pool, sandbox_id, restore_lease_token)
             .await
-            .db_context("failed to complete owned sandbox restore")?
-            .rows_affected();
-        Ok(completed == 1)
+            .db_context("failed to complete owned sandbox restore")
     }
 
     pub(in crate::controllers::substrate::kubernetes) async fn release_user_restore_lease(
@@ -776,18 +638,9 @@ impl K8sStore {
         // but retain the paired token and attempt clock at NOW(). The transient
         // sweeper requires a full quiet window after that clock before changing
         // `restoring`, while the next retry atomically replaces the stale pair.
-        sqlx::query(sql!(
-            "UPDATE sandboxes
-                SET restore_lease_expires_at = NOW()
-              WHERE id = $1
-                AND restore_lease_token = $2"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .bind(restore_lease_token)
-        .execute(&self.pool)
-        .await
-        .db_context("failed to release sandbox restore lease")?;
-        Ok(())
+        restore_lease::release_user_restore_lease(&self.pool, sandbox_id, restore_lease_token)
+            .await
+            .db_context("failed to release sandbox restore lease")
     }
 
     pub(in crate::controllers::substrate::kubernetes) async fn prepare_wake_sandbox(
