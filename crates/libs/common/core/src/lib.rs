@@ -207,3 +207,4 @@ pub mod kubernetes;
 mod runtime_contract_tests;
 
 // Disposable producer-timing probe: never merge.
+// A second line, so this run rebuilds what the saved state built.
