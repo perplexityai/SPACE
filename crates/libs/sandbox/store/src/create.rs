@@ -132,3 +132,155 @@ pub async fn insert_pooled(
     .await?;
     Ok(())
 }
+
+/// Finish a create (or a create that restores from a snapshot) by moving the
+/// row to the `lifecycle`, `placement` and `active_node_id` the substrate
+/// reported. An **operation step**: it ends the create's in-flight work.
+/// Returns whether the row matched; `false` is a lost compare-and-set, not an
+/// error.
+///
+/// The `WHERE` is the guard, and it accepts three rows:
+///
+/// * a plain create (`restore_operation_id` is `None`) still `creating`;
+/// * a restoring create still `restoring` under that operation's
+///   `restore_lease_token`, finishing as `started` or `failed`;
+/// * a row already `started` at this placement and node, which a matching
+///   activation-completion receipt may have converged while the create waited
+///   for command readiness. The write is then idempotent.
+///
+/// In the third case the row already has the reported lifecycle, placement
+/// and node, so a create whose row is already `started` on a different node
+/// or placement loses the compare-and-set. When a restoring create matches
+/// that case and reports `on_node` with a node, the write also sets
+/// `placement_changed_at` to `NOW()` if it is still null; no other case
+/// changes that column. `command_ready_pending` is set to `!command_ready`
+/// only while the row is `creating` (a row trigger clears it again when the
+/// write moves the row to a lifecycle other than `started`). The `WHERE`
+/// alone guards the write: it needs no row lock from its caller.
+pub async fn finalize_created(
+    executor: impl sqlx::PgExecutor<'_>,
+    sandbox_id: SandboxId,
+    lifecycle: &str,
+    placement: &str,
+    active_node_id: Option<NodeId>,
+    command_ready: bool,
+    restore_operation_id: Option<Uuid>,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(sql!(
+        "UPDATE sandboxes
+         SET lifecycle = CASE
+                 WHEN $6::uuid IS NOT NULL
+                      AND lifecycle = 'started'
+                      AND placement = 'on_node'
+                      AND active_node_id IS NOT NULL
+                 THEN lifecycle
+                 ELSE $1
+             END,
+             placement = CASE
+                 WHEN $6::uuid IS NOT NULL
+                      AND lifecycle = 'started'
+                      AND placement = 'on_node'
+                      AND active_node_id IS NOT NULL
+                 THEN placement
+                 ELSE $2
+             END,
+             active_node_id = CASE
+                 WHEN $6::uuid IS NOT NULL
+                      AND lifecycle = 'started'
+                      AND placement = 'on_node'
+                      AND active_node_id IS NOT NULL
+                 THEN active_node_id
+                 ELSE $3
+             END,
+             placement_changed_at = CASE
+                 WHEN $6::uuid IS NOT NULL
+                      AND $1 = 'started'
+                      AND $2 = 'on_node'
+                      AND $3 IS NOT NULL
+                      AND lifecycle = 'started'
+                      AND placement = 'on_node'
+                      AND active_node_id IS NOT DISTINCT FROM $3
+                 THEN COALESCE(placement_changed_at, NOW())
+                 ELSE placement_changed_at
+             END,
+             command_ready_pending = CASE
+                 WHEN lifecycle = 'creating' THEN $5
+                 ELSE command_ready_pending
+             END,
+             preserve_local_artifact_on_restore_failure = CASE
+                 WHEN lifecycle = 'restoring' AND $1 IN ('started', 'failed') THEN FALSE
+                 ELSE preserve_local_artifact_on_restore_failure
+             END
+         WHERE id = $4
+           AND (
+               ($6::uuid IS NULL AND lifecycle = 'creating')
+               OR (
+                   $6::uuid IS NOT NULL
+                   AND lifecycle = 'restoring'
+                   AND restore_lease_token = $6
+                   AND $1 IN ('started', 'failed')
+               )
+               OR (
+                   $1 = 'started'
+                   AND lifecycle = 'started'
+                   AND placement = $2
+                   AND active_node_id IS NOT DISTINCT FROM $3
+               )
+           )"
+    ))
+    .bind(lifecycle)
+    .bind(placement)
+    .bind(active_node_id)
+    .bind(sandbox_id.as_uuid())
+    .bind(!command_ready)
+    .bind(restore_operation_id)
+    .execute(executor)
+    .await?;
+
+    Ok(result.rows_affected() == 1)
+}
+
+/// Record the node a just-created sandbox landed on and stamp
+/// `placement_changed_at`. An **observed projection** of the substrate's
+/// create outcome.
+///
+/// No lifecycle predicate of its own: the `WHERE` checks only the id. It
+/// relies on running between a create's substrate call and
+/// [`finalize_created`], on the row that create inserted.
+pub async fn record_created_placement(
+    executor: impl sqlx::PgExecutor<'_>,
+    sandbox_id: SandboxId,
+    active_node_id: NodeId,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+                 SET active_node_id = $1,
+                     placement_changed_at = NOW()
+                 WHERE id = $2"
+    ))
+    .bind(active_node_id)
+    .bind(sandbox_id)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// Delete the row of a create that failed or was rolled back. An
+/// **operation step**: the create's compensation.
+///
+/// No lifecycle predicate: it deletes the row whatever its lifecycle, relying
+/// on the caller to pass only the id its own create inserted. Unlike
+/// [`crate::delete::delete_with_dependents`] it clears no dependents beyond
+/// what cascades from the row; reconcile state, which does not cascade, is left
+/// to the caller. The statement carries no `sql!` locator,
+/// as at the call sites it moved from.
+pub async fn delete_failed_create(
+    executor: impl sqlx::PgExecutor<'_>,
+    sandbox_id: SandboxId,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM sandboxes WHERE id = $1")
+        .bind(sandbox_id.as_uuid())
+        .execute(executor)
+        .await?;
+    Ok(())
+}

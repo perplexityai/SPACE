@@ -19,7 +19,7 @@ use pplx_space_events::{
 };
 use pplx_space_net_common::TlsInterception;
 use pplx_space_public_api::OperationId;
-use pplx_space_sandbox_store::delete::delete_with_dependents;
+use pplx_space_sandbox_store::{self as sandbox_store, delete::delete_with_dependents};
 use std::collections::BTreeMap;
 use std::sync::{
     Arc,
@@ -55,78 +55,16 @@ async fn finalize_created_sandbox(
     command_ready: bool,
     restore_operation_id: Option<OperationId>,
 ) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query(sql!(
-        "UPDATE sandboxes
-         SET lifecycle = CASE
-                 WHEN $6::uuid IS NOT NULL
-                      AND lifecycle = 'started'
-                      AND placement = 'on_node'
-                      AND active_node_id IS NOT NULL
-                 THEN lifecycle
-                 ELSE $1
-             END,
-             placement = CASE
-                 WHEN $6::uuid IS NOT NULL
-                      AND lifecycle = 'started'
-                      AND placement = 'on_node'
-                      AND active_node_id IS NOT NULL
-                 THEN placement
-                 ELSE $2
-             END,
-             active_node_id = CASE
-                 WHEN $6::uuid IS NOT NULL
-                      AND lifecycle = 'started'
-                      AND placement = 'on_node'
-                      AND active_node_id IS NOT NULL
-                 THEN active_node_id
-                 ELSE $3
-             END,
-             placement_changed_at = CASE
-                 WHEN $6::uuid IS NOT NULL
-                      AND $1 = 'started'
-                      AND $2 = 'on_node'
-                      AND $3 IS NOT NULL
-                      AND lifecycle = 'started'
-                      AND placement = 'on_node'
-                      AND active_node_id IS NOT DISTINCT FROM $3
-                 THEN COALESCE(placement_changed_at, NOW())
-                 ELSE placement_changed_at
-             END,
-             command_ready_pending = CASE
-                 WHEN lifecycle = 'creating' THEN $5
-                 ELSE command_ready_pending
-             END,
-             preserve_local_artifact_on_restore_failure = CASE
-                 WHEN lifecycle = 'restoring' AND $1 IN ('started', 'failed') THEN FALSE
-                 ELSE preserve_local_artifact_on_restore_failure
-             END
-         WHERE id = $4
-           AND (
-               ($6::uuid IS NULL AND lifecycle = 'creating')
-               OR (
-                   $6::uuid IS NOT NULL
-                   AND lifecycle = 'restoring'
-                   AND restore_lease_token = $6
-                   AND $1 IN ('started', 'failed')
-               )
-               OR (
-                   $1 = 'started'
-                   AND lifecycle = 'started'
-                   AND placement = $2
-                   AND active_node_id IS NOT DISTINCT FROM $3
-               )
-           )"
-    ))
-    .bind(lifecycle)
-    .bind(placement)
-    .bind(active_node_id)
-    .bind(sandbox_id.as_uuid())
-    .bind(!command_ready)
-    .bind(restore_operation_id.map(|operation_id| operation_id.as_uuid()))
-    .execute(pool)
-    .await?;
-
-    Ok(result.rows_affected() == 1)
+    sandbox_store::create::finalize_created(
+        pool,
+        sandbox_id,
+        lifecycle,
+        placement,
+        active_node_id,
+        command_ready,
+        restore_operation_id.map(|operation_id| operation_id.as_uuid()),
+    )
+    .await
 }
 
 struct PooledCreateInput<'a> {
@@ -1507,10 +1445,8 @@ impl SandboxController {
         {
             // Nothing has been created yet; remove the row so a retry starts
             // clean rather than allocating the slot pod's generation.
-            if let Err(delete_err) = sqlx::query("DELETE FROM sandboxes WHERE id = $1")
-                .bind(sandbox_uuid)
-                .execute(pool)
-                .await
+            if let Err(delete_err) =
+                sandbox_store::create::delete_failed_create(pool, sandbox_uuid).await
             {
                 tracing::warn!(
                     sandbox_id = %sandbox_id,
@@ -1584,21 +1520,18 @@ impl SandboxController {
                     SandboxEventType::CreateFailed,
                     create_event_details().error(err.to_string()),
                 );
-                let row_removal_confirmed = match sqlx::query("DELETE FROM sandboxes WHERE id = $1")
-                    .bind(sandbox_uuid)
-                    .execute(pool)
-                    .await
-                {
-                    Ok(_) => true,
-                    Err(delete_err) => {
-                        tracing::warn!(
-                            sandbox_id = %sandbox_id,
-                            error = %delete_err,
-                            "failed to delete sandbox row after substrate create failure"
-                        );
-                        false
-                    }
-                };
+                let row_removal_confirmed =
+                    match sandbox_store::create::delete_failed_create(pool, sandbox_uuid).await {
+                        Ok(_) => true,
+                        Err(delete_err) => {
+                            tracing::warn!(
+                                sandbox_id = %sandbox_id,
+                                error = %delete_err,
+                                "failed to delete sandbox row after substrate create failure"
+                            );
+                            false
+                        }
+                    };
                 // With the row gone, this create did NOT leave node work
                 // converging (a timeout here failed the substrate's preserve
                 // check, e.g. the pod never scheduled), so strip any retry
@@ -1624,15 +1557,11 @@ impl SandboxController {
         if restore_operation_id.is_none()
             && let Some(active_node_id) = outcome.active_node_id
         {
-            sqlx::query(sql!(
-                "UPDATE sandboxes
-                 SET active_node_id = $1,
-                     placement_changed_at = NOW()
-                 WHERE id = $2"
-            ))
-            .bind(active_node_id)
-            .bind(outcome_sandbox_uuid)
-            .execute(pool)
+            sandbox_store::create::record_created_placement(
+                pool,
+                outcome_sandbox_uuid,
+                active_node_id,
+            )
             .await
             .map_err(|err| {
                 // Not classified, deliberately: the sandbox is already

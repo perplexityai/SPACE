@@ -12,6 +12,7 @@ use super::{
     update_desired_state,
 };
 
+mod create_finish_tests;
 mod insert_unplaced_tests;
 
 /// The three desired-state columns, read back raw.
