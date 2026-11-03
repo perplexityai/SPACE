@@ -3,9 +3,11 @@ import { test } from 'node:test';
 import {
   isMissingRoute,
   isUnknownFieldRejection,
-  listSnapshotsWithFallback,
+  listSnapshots,
+  moveReleaseTag,
   pageRows,
   sendWithOptionalField,
+  tagMoveFailureMessage,
 } from './admin-fallback.ts';
 
 // The shape `ApiError` gives the console: status, message, parsed JSON body
@@ -20,12 +22,11 @@ const unknownField = (field, expected) => apiError(
   `Failed to deserialize the JSON body into the target type: ${field}: unknown field \`${field}\`, expected ${expected} at line 1 column 40`,
 );
 
-test('a route the release does not have is the fallback 404, an empty 404 or a 405', () => {
+test('a route the release does not have is the admin fallback 404, an empty 404 or a 405', () => {
   for (const err of [
     apiError(404, { code: 404, message: 'Endpoint not found' }),
     apiError(404, null),
     apiError(405, null),
-    apiError(404, { code: 'not_found', message: 'route not found' }),
   ]) {
     assert.equal(isMissingRoute(err), true, JSON.stringify(err.body));
   }
@@ -36,6 +37,8 @@ test("a handler's own 404 is not a missing route", () => {
     apiError(404, { error: 'Sandbox not found' }),
     apiError(404, { code: 'not_found', message: 'sandbox not found', request_id: null, retryable: false, details: [] }),
     apiError(404, { error: "rollback is not enabled for the sandbox's organization", operation_id: null, retryable: false }),
+    // The public API's hidden-operation answer, which no admin route sends.
+    apiError(404, { code: 'not_found', message: 'route not found' }),
     apiError(400, null),
     new TypeError('Failed to fetch'),
   ]) {
@@ -52,11 +55,41 @@ test('an unknown-field 422 is recognized only for the field it names', () => {
   assert.equal(isUnknownFieldRejection(apiError(400, { error: 'user_id must name a user of the organization' }), 'user_id'), false);
 });
 
-test('a list reads as rows from a page object or from a bare array', () => {
+test('a list reads as rows from a page object, keeping its cursor, or from a bare array', () => {
   assert.deepEqual(pageRows([{ id: 'a' }]), { rows: [{ id: 'a' }], nextCursor: null });
   assert.deepEqual(pageRows({ data: [{ id: 'a' }], next_cursor: 'c1' }), { rows: [{ id: 'a' }], nextCursor: 'c1' });
   assert.deepEqual(pageRows({ data: [], next_cursor: null }), { rows: [], nextCursor: null });
-  assert.throws(() => pageRows({ sandboxes: [] }), /Unrecognized list response/);
+  assert.deepEqual(pageRows({ data: [], next_cursor: '' }), { rows: [], nextCursor: null });
+  // No route this reads answers another page shape: it is refused, not read as empty.
+  assert.throws(() => pageRows({ sandboxes: [], next_cursor: 'c1' }), /Unrecognized list response/);
+  assert.throws(() => pageRows(null), /Unrecognized list response/);
+});
+
+test('a tag move sends the precondition once, to the release tag route', async () => {
+  const calls = [];
+  const put = async (path, body) => { calls.push([path, body]); };
+  assert.deepEqual(await moveReleaseTag(put, 'rel-new', 'prod', 'rel-old'), { checked: true });
+  assert.deepEqual(calls, [['/v1/template-releases/rel-new/tag', { tag: 'prod', expected_current_release_id: 'rel-old' }]]);
+  // A release that refuses the field moves it unchecked, and says so.
+  calls.length = 0;
+  const old = async (path, body) => {
+    calls.push([path, body]);
+    if ('expected_current_release_id' in body) throw unknownField('expected_current_release_id', '`tag`');
+  };
+  assert.deepEqual(await moveReleaseTag(old, 'rel-new', 'prod', null), { checked: false });
+  assert.deepEqual(calls.map(([, body]) => body), [{ tag: 'prod', expected_current_release_id: null }, { tag: 'prod' }]);
+});
+
+test("a refused precondition says the tag moved and names where it is now; other failures keep the API message", () => {
+  const moved = apiError(412, {
+    code: 'failed_precondition',
+    message: 'tag does not point at expected_current_release_id',
+    details: [{ key: 'current_release_id', value: 'rel-other' }],
+  });
+  assert.match(tagMoveFailureMessage(moved), /moved since it was read \(it now names release rel-other\); nothing was changed/);
+  // A tag deleted meanwhile has no current release.
+  assert.match(tagMoveFailureMessage(apiError(412, { message: 'x', details: [] })), /moved since it was read; nothing was changed/);
+  assert.equal(tagMoveFailureMessage(apiError(404, { error: 'Template release not found' })), 'Template release not found');
 });
 
 test('the tag precondition is sent, and kept when the release accepts it', async () => {
@@ -107,30 +140,46 @@ test('any other failure of the tag move is not retried', async () => {
   assert.equal(calls, 2);
 });
 
-test('snapshots come from the admin list whenever the release has it', async () => {
-  let publicReads = 0;
-  const listing = await listSnapshotsWithFallback(async () => [{ id: 'snap_1' }], async () => { publicReads += 1; return []; });
-  assert.deepEqual(listing, { via: 'admin', rows: [{ id: 'snap_1' }] });
-  assert.equal(publicReads, 0);
-  // Another organization's sandbox too: no public reader is needed.
-  assert.deepEqual(await listSnapshotsWithFallback(async () => [], null), { via: 'admin', rows: [] });
-});
+const reader = (rows, nextCursor = null) => {
+  const calls = { count: 0 };
+  const read = async () => { calls.count += 1; return nextCursor === undefined ? rows : { rows, nextCursor }; };
+  return { read, calls };
+};
 
-test('without the admin list, the own organization falls back to the public routes and another has none', async () => {
-  const missing = async () => { throw apiError(404, { code: 404, message: 'Endpoint not found' }); };
-  assert.deepEqual(await listSnapshotsWithFallback(missing, async () => [{ id: 'snap_2' }]), { via: 'public', rows: [{ id: 'snap_2' }] });
-  assert.deepEqual(await listSnapshotsWithFallback(missing, null), { via: 'none' });
-  // The public route's own failure (snapshots not enabled) reaches the caller.
+test("the own organization's snapshots come from the public routes only, never the audited admin list", async () => {
+  const admin = reader([{ id: 'snap_admin' }]);
+  const listing = await listSnapshots({ ownOrg: true, readPublic: async () => [{ id: 'snap_1' }], readAdmin: admin.read });
+  assert.deepEqual(listing, { via: 'public', rows: [{ id: 'snap_1' }] });
+  assert.equal(admin.calls.count, 0);
+  // Its failures, the hidden-operation gate included, reach the caller.
   const hidden = apiError(404, { code: 'not_found', message: 'route not found' });
-  await assert.rejects(listSnapshotsWithFallback(missing, async () => { throw hidden; }), (thrown) => thrown === hidden);
+  await assert.rejects(
+    listSnapshots({ ownOrg: true, readPublic: async () => { throw hidden; }, readAdmin: admin.read }),
+    (thrown) => thrown === hidden,
+  );
+  assert.equal(admin.calls.count, 0);
 });
 
-test('a real failure of the admin list does not fall back', async () => {
-  const notFound = apiError(404, { code: 'not_found', message: 'sandbox not found' });
+test("another organization's snapshots come from the admin list, which says when older ones were not read", async () => {
   let publicReads = 0;
-  await assert.rejects(
-    listSnapshotsWithFallback(async () => { throw notFound; }, async () => { publicReads += 1; return []; }),
-    (thrown) => thrown === notFound,
+  const readPublic = async () => { publicReads += 1; return []; };
+  assert.deepEqual(
+    await listSnapshots({ ownOrg: false, readPublic, readAdmin: reader([{ id: 'snap_2' }]).read }),
+    { via: 'admin', rows: [{ id: 'snap_2' }], more: false },
+  );
+  assert.deepEqual(
+    await listSnapshots({ ownOrg: false, readPublic, readAdmin: reader([{ id: 'snap_3' }], 'cursor-1').read }),
+    { via: 'admin', rows: [{ id: 'snap_3' }], more: true },
   );
   assert.equal(publicReads, 0);
+});
+
+test("without the admin list, another organization's sandbox has no listing; a real failure is thrown", async () => {
+  const missing = async () => { throw apiError(404, { code: 404, message: 'Endpoint not found' }); };
+  assert.deepEqual(await listSnapshots({ ownOrg: false, readPublic: async () => [], readAdmin: missing }), { via: 'none' });
+  const notFound = apiError(404, { code: 'not_found', message: 'sandbox not found' });
+  await assert.rejects(
+    listSnapshots({ ownOrg: false, readPublic: async () => [], readAdmin: async () => { throw notFound; } }),
+    (thrown) => thrown === notFound,
+  );
 });

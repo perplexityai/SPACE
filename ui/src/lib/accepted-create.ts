@@ -1,6 +1,8 @@
-// What the console reports once `POST /sandboxes` has been accepted. The
-// sandbox exists from that point on, so nothing after it may land in the
-// create form's error path, where resubmitting creates a second sandbox.
+// What the console reports once an operation has been accepted: a 202 says
+// only that it was queued, so its outcome is read from the operation record.
+// For `POST /sandboxes`, the sandbox exists from that point on, so nothing
+// after it may land in the create form's error path, where resubmitting
+// creates a second sandbox.
 
 /** The operation was still running when the console stopped polling. */
 export class OperationTimeoutError extends Error {
@@ -47,6 +49,56 @@ export function terminalErrorParts(terminalError: unknown): { reason: string | n
   return {
     reason: typeof reason === 'string' && reason ? reason : null,
     detail: typeof message === 'string' && message ? message : null,
+  };
+}
+
+const TERMINAL_STATES = ['succeeded', 'failed', 'canceled', 'expired'];
+
+type OperationRecordLike = { state: string; progress_message: string; terminal_error?: unknown };
+
+// Read an operation until it ends: its record when it succeeded,
+// `OperationFailedError` when it ended otherwise, `OperationTimeoutError`
+// when it is still running at `timeoutMs`. A failed read is thrown as it is.
+export async function pollOperation<T extends OperationRecordLike>(
+  read: () => Promise<T>,
+  {
+    timeoutMs,
+    intervalMs,
+    now = Date.now,
+    sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
+  }: { timeoutMs: number; intervalMs: number; now?: () => number; sleep?: (ms: number) => Promise<void> },
+): Promise<T> {
+  const deadline = now() + timeoutMs;
+  let last: T | null = null;
+  while (now() < deadline) {
+    last = await read();
+    if (TERMINAL_STATES.includes(last.state)) {
+      if (last.state === 'succeeded') return last;
+      const { reason, detail } = terminalErrorParts(last.terminal_error);
+      throw new OperationFailedError(last.state, last.progress_message || `operation ${last.state}`, reason, detail);
+    }
+    await sleep(intervalMs);
+  }
+  throw new OperationTimeoutError(last?.progress_message || 'operation still running');
+}
+
+// What a rollback that was accepted came to, once its operation was followed.
+export function rollbackOutcome(snapshotName: string, err: unknown | null): CreateOutcome {
+  if (err === null) return { type: 'success', text: `Rolled back to ${snapshotName}` };
+  if (err instanceof OperationFailedError) {
+    const why = err.detail ?? err.message;
+    return { type: 'error', text: `Rollback to ${snapshotName} ${err.state}: ${why}${err.reason ? ` (${err.reason})` : ''}` };
+  }
+  if (err instanceof OperationTimeoutError) {
+    return {
+      type: 'warning',
+      text: `Rollback to ${snapshotName} is still running (${err.message}); the sandbox page's Operations card shows how it ends.`,
+    };
+  }
+  const detail = err instanceof Error && err.message ? err.message : 'request failed';
+  return {
+    type: 'warning',
+    text: `Rollback to ${snapshotName} was queued, but its progress could not be read (${detail}); the sandbox page's Operations card shows how it ends.`,
   };
 }
 

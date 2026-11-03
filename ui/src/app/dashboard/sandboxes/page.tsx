@@ -33,7 +33,6 @@ import {
   getPublicPage,
   postPublicOperation,
   publicTemplateToConsoleTemplate,
-  rollbackConsoleSandbox,
   updateConsoleSandbox,
   waitForAdminOperation,
   waitForPublicOperation,
@@ -66,13 +65,14 @@ import {
 } from '@/lib/sandbox-list';
 import { OperationFailedError, createFailureText, settleAcceptedCreate } from '@/lib/accepted-create';
 import {
-  ROLLBACK_NOT_ENABLED,
   SNAPSHOTS_NOT_ENABLED,
   SNAPSHOTS_OTHER_ORG_UNSUPPORTED,
   isHiddenOperationError,
 } from '@/lib/hidden-operations';
 import { PrefixRequests, supplementalMatches } from '@/lib/prefix-search';
 import { useAuth } from '@/lib/auth';
+import { isOwnOrg } from '@/lib/own-org';
+import { RollbackButton, RollbackRefusalNote, useSnapshotRollback } from '@/components/snapshot-rollback';
 import {
   AutoLifecyclePolicy,
   NetworkPolicyV1,
@@ -546,53 +546,52 @@ function SandboxActions({ status, id, resourceType, poolTemplate, onAction }: {
   );
 }
 
-// Listed through the admin route and rolled back through `:force-rollback`
-// for every sandbox; on releases without the admin list, through the public
-// routes, which serve only the operator's own organization.
-function SnapshotsPanel({ sandboxId, ownOrg }: { sandboxId: string; ownOrg: boolean }) {
+// The operator's own organization's snapshots list through the public routes;
+// another organization's through the admin list, rolled back through
+// `:force-rollback` (see `listSnapshots`). The panel lists once, when the row
+// expands; a release without the admin list lists no other organization's.
+function SnapshotsPanel({ sandboxId, orgId, ownOrg }: { sandboxId: string; orgId: string | null; ownOrg: boolean }) {
   const { message } = App.useApp();
   const [snapshots, setSnapshots] = useState<SnapshotInfo[]>([]);
+  const [more, setMore] = useState(false);
   const [loading, setLoading] = useState(true);
   const [snapshotsOff, setSnapshotsOff] = useState<string | null>(null);
   const [rollbackVia, setRollbackVia] = useState<'admin' | 'public' | null>(null);
-  const [rollbackOff, setRollbackOff] = useState(false);
+  // Only the newest listing may write: the row's sandbox or organization can
+  // change while a listing is in flight, and a rollback lists again.
+  const listingRequest = useRef(0);
 
-  useEffect(() => {
+  const list = () => {
+    const request = ++listingRequest.current;
+    setLoading(true);
     getConsoleSnapshots(sandboxId, { ownOrg })
       .then((listing) => {
+        if (request !== listingRequest.current) return;
         if (listing.via === 'none') {
           setSnapshotsOff(SNAPSHOTS_OTHER_ORG_UNSUPPORTED);
           return;
         }
+        setSnapshotsOff(null);
         setRollbackVia(listing.via);
         setSnapshots(listing.rows);
+        setMore(listing.via === 'admin' && listing.more);
       })
       .catch((err: any) => {
-        if (isHiddenOperationError(err)) {
+        if (request !== listingRequest.current) return;
+        if (ownOrg && isHiddenOperationError(err)) {
           setSnapshotsOff(SNAPSHOTS_NOT_ENABLED);
           return;
         }
         message.error(err.message || 'failed to load snapshots');
       })
-      .finally(() => setLoading(false));
-  }, [sandboxId, ownOrg]);
-
-  const handleRollback = async (snapshotName: string) => {
-    if (!rollbackVia) return;
-    try {
-      await rollbackConsoleSandbox(sandboxId, snapshotName, rollbackVia);
-      message.success('Snapshot rollback queued');
-    } catch (err: any) {
-      if (rollbackVia === 'public' && isHiddenOperationError(err)) {
-        setRollbackOff(true);
-        message.info(ROLLBACK_NOT_ENABLED);
-        return;
-      }
-      // The admin route's refusal names its cause ("rollback is not enabled
-      // for the sandbox's organization"); show it as it is.
-      message.error(err.message || 'failed to queue rollback');
-    }
+      .finally(() => {
+        if (request === listingRequest.current) setLoading(false);
+      });
   };
+
+  useEffect(list, [sandboxId, ownOrg]);
+
+  const rollback = useSnapshotRollback({ sandboxId, orgId, via: rollbackVia, onSettled: list });
 
   const formatSnapshotBytes = (n: number) => {
     if (n >= 1e9) return `${(n / 1e9).toFixed(1)} GB`;
@@ -630,19 +629,10 @@ function SnapshotsPanel({ sandboxId, ownOrg }: { sandboxId: string; ownOrg: bool
     },
     { title: 'Size', dataIndex: 'size_bytes', width: 100, render: (v: number) => v ? formatSnapshotBytes(v) : '0' },
   ];
-  const rollbackColumns: ColumnsType<SnapshotInfo> = rollbackOff ? [] : [
+  const rollbackColumns: ColumnsType<SnapshotInfo> = [
     {
       title: 'Action', width: 120,
-      render: (_, record) => (
-        <Tooltip title="Roll back sandbox to this snapshot">
-          <Popconfirm
-            title={`Roll back to ${record.id}?`}
-            onConfirm={() => handleRollback(record.id)}
-          >
-            <Button type="link" size="small" icon={<RollbackOutlined />}>Rollback</Button>
-          </Popconfirm>
-        </Tooltip>
-      ),
+      render: (_, record) => <RollbackButton snapshotName={record.id} state={rollback} />,
     },
   ];
 
@@ -659,7 +649,10 @@ function SnapshotsPanel({ sandboxId, ownOrg }: { sandboxId: string; ownOrg: bool
 
   return (
     <div style={{ padding: '8px 0' }}>
-      <Text strong><CameraOutlined /> Snapshots</Text>
+      <Space size={12} wrap>
+        <Text strong><CameraOutlined /> Snapshots</Text>
+        <RollbackRefusalNote state={rollback} />
+      </Space>
       <Table
         columns={[...snapshotColumns, ...rollbackColumns]}
         dataSource={snapshots}
@@ -669,6 +662,7 @@ function SnapshotsPanel({ sandboxId, ownOrg }: { sandboxId: string; ownOrg: bool
         pagination={tablePagination('snapshots', 10)}
         style={{ marginTop: 8 }}
         locale={{ emptyText: 'No snapshots' }}
+        footer={more ? () => <Text type="secondary" style={{ fontSize: 12 }}>The newest {snapshots.length} snapshots; older ones are not listed.</Text> : undefined}
       />
     </div>
   );
@@ -1949,7 +1943,7 @@ function SandboxesPage() {
         expandable={{
           showExpandColumn: false,
           expandRowByClick: true,
-          expandedRowRender: (record) => <SnapshotsPanel sandboxId={record.id} ownOrg={!authOrg || !record.org_id || record.org_id === authOrg.id} />,
+          expandedRowRender: (record) => <SnapshotsPanel sandboxId={record.id} orgId={record.org_id ?? null} ownOrg={isOwnOrg(authOrg?.id, record.org_id)} />,
           rowExpandable: snapshotsPanelAvailable,
         }}
       />

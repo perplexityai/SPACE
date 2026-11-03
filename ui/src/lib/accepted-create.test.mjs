@@ -3,6 +3,8 @@ import { test } from 'node:test';
 import {
   OperationFailedError,
   OperationTimeoutError,
+  pollOperation,
+  rollbackOutcome,
   settleAcceptedCreate,
   terminalErrorParts,
 } from './accepted-create.ts';
@@ -107,4 +109,53 @@ test("a failed record's terminal error gives the reason and message, when it has
   assert.deepEqual(terminalErrorParts({ message: 'detail' }), { reason: null, detail: 'detail' });
   assert.deepEqual(terminalErrorParts(null), { reason: null, detail: null });
   assert.deepEqual(terminalErrorParts('text'), { reason: null, detail: null });
+});
+
+// A clock that advances only when the poll sleeps.
+const fakeClock = () => {
+  let at = 0;
+  return { now: () => at, sleep: async (ms) => { at += ms; } };
+};
+const records = (...states) => {
+  let i = 0;
+  return async () => states[Math.min(i++, states.length - 1)];
+};
+const record = (state, extra = {}) => ({ state, progress_message: `synthetic ${state}`, terminal_error: null, ...extra });
+
+test('a followed operation ends with its record once it succeeds', async () => {
+  const done = record('succeeded');
+  const result = await pollOperation(records(record('queued'), record('running'), done), { timeoutMs: 10_000, intervalMs: 800, ...fakeClock() });
+  assert.equal(result, done);
+});
+
+test('a followed operation that fails reports its reason, not that it was queued', async () => {
+  // As when an older API pod accepted `:force-rollback` and dropped its body.
+  const failed = record('failed', { terminal_error: { reason: 'invalid_request', message: 'snapshot_name is required' } });
+  await assert.rejects(
+    pollOperation(records(record('queued'), failed), { timeoutMs: 10_000, intervalMs: 800, ...fakeClock() }),
+    (err) => err instanceof OperationFailedError && err.state === 'failed' && err.reason === 'invalid_request' && err.detail === 'snapshot_name is required',
+  );
+});
+
+test('a followed operation still running at the timeout is reported as running', async () => {
+  let reads = 0;
+  await assert.rejects(
+    pollOperation(async () => { reads += 1; return record('running'); }, { timeoutMs: 4_000, intervalMs: 1_000, ...fakeClock() }),
+    (err) => err instanceof OperationTimeoutError && err.message === 'synthetic running',
+  );
+  assert.equal(reads, 4);
+});
+
+test('a rollback outcome says done, failed with its reason, or still running', () => {
+  assert.deepEqual(rollbackOutcome('checkpoint-1', null), { type: 'success', text: 'Rolled back to checkpoint-1' });
+  const failed = rollbackOutcome('checkpoint-1', new OperationFailedError('failed', 'synthetic failed', 'invalid_request', 'snapshot_name is required'));
+  assert.deepEqual(failed, { type: 'error', text: 'Rollback to checkpoint-1 failed: snapshot_name is required (invalid_request)' });
+  assert.equal(rollbackOutcome('checkpoint-1', new OperationFailedError('canceled', 'operation canceled')).text, 'Rollback to checkpoint-1 canceled: operation canceled');
+  const running = rollbackOutcome('checkpoint-1', new OperationTimeoutError('restoring'));
+  assert.equal(running.type, 'warning');
+  assert.match(running.text, /still running \(restoring\)/);
+  const unread = rollbackOutcome('checkpoint-1', new TypeError('Failed to fetch'));
+  assert.equal(unread.type, 'warning');
+  assert.match(unread.text, /was queued, but its progress could not be read \(Failed to fetch\)/);
+  for (const outcome of [failed, running, unread]) assert.doesNotMatch(outcome.text, /^Snapshot rollback queued$/);
 });
