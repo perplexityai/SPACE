@@ -787,12 +787,12 @@ function SandboxesPage() {
   // the rows rather than show them under the new label.
   const [listError, setListError] = useState<string | null>(null);
   // Only bare arrays answered paged requests, the list's or the prefix
-  // search's, for a minute (`STOP_AFTER_MISMATCH_MS`) and at least twenty
-  // times in a row (`STOP_AFTER_MISMATCHES`): the API went back to a version
-  // without paging, and the list reads nothing more until the page is
-  // reloaded. Until then each is a failed refresh (`olderFormat`), and any
-  // page between them starts both over. A hidden tab sends nothing, so its
-  // time alone does not stop the list.
+  // search's, for a minute of retries (`STOP_AFTER_MISMATCH_MS`) and at
+  // least twenty times in a row (`STOP_AFTER_MISMATCHES`): the API went back
+  // to a version without paging, and the list reads nothing more until the
+  // page is reloaded. Until then each is a failed refresh, and any page
+  // between them starts both over. A hidden tab sends nothing, and the first
+  // bare array after it starts the minute over (`MISMATCH_RUN_GAP_MS`).
   const [listStopped, setListStopped] = useState(false);
   // The last answers included a bare array to a paged request, as during a
   // rolling deploy; the rows on screen are kept while the list retries.
@@ -1360,12 +1360,13 @@ function SandboxesPage() {
     // list load refreshes it again.
     const timer = setTimeout(() => {
       const ticket = prefixRequests.begin(scope.key);
+      const sentAt = selection.now();
       getConsoleSandboxList(listRequestQuery(scope, Date.now()), ticket.signal)
         .then((response) => {
           if (!prefixRequests.applies(ticket, fragmentTargetRef.current)) return;
           // A bare array counts toward stopping the list, as one answering
           // the list does, and fails this refresh of the section.
-          const note = selection.noteAnswer('paged', response.mode);
+          const note = selection.noteAnswer('paged', response.mode, sentAt);
           setOlderFormat(selection.mismatches > 0);
           if (note.kind === 'stopped') return stopList(note.kept);
           // Not sent before then; should it answer first, it fails this refresh.
