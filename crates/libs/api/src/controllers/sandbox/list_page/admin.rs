@@ -8,11 +8,13 @@
 //! to continue from, so it runs a plain list statement with the same filters
 //! and no size walk.
 
+use std::str::FromStr;
 use std::sync::LazyLock;
 
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{OrgId, SandboxId, SemVer, TemplateName, UserId};
-use pplx_space_placement::StoredSandboxLifecycle;
+use pplx_space_common_core::types::{
+    OrgId, SandboxId, SandboxLifecycle, SandboxLifecycleParseError, SemVer, TemplateName, UserId,
+};
 use pplx_space_public_api::PUBLIC_SANDBOX_ID_PREFIX;
 use serde::Serialize;
 use sqlx::PgPool;
@@ -27,6 +29,45 @@ use crate::controllers::sandbox::{SandboxController, SandboxPageCursor, sandbox_
 use crate::controllers::{ControllerError, db_contention_error};
 use crate::models::{Sandbox, SandboxResourceType};
 
+const DELETED_LIFECYCLE: &str = "deleted";
+
+/// The `sandboxes.lifecycle` values outside [`SandboxLifecycle`].
+const TOMBSTONE_LIFECYCLES: [&str; 2] = [DELETED_LIFECYCLE, "cleanup_required"];
+
+/// A stored lifecycle (`sandboxes.lifecycle`) the admin list filters on: a
+/// [`SandboxLifecycle`] state or a tombstone, in the column's form.
+///
+/// `pplx-space-placement`'s `StoredSandboxLifecycle` names the same values,
+/// but this crate is not one of that store's users; the tests pin this parse
+/// to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdminStoredLifecycle(&'static str);
+
+impl AdminStoredLifecycle {
+    pub const fn as_str(self) -> &'static str {
+        self.0
+    }
+}
+
+impl FromStr for AdminStoredLifecycle {
+    type Err = SandboxLifecycleParseError;
+
+    /// Normalizes case and surrounding whitespace, as `StoredSandboxLifecycle`
+    /// does.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let normalized = value.trim().to_ascii_lowercase();
+        if let Some(tombstone) = TOMBSTONE_LIFECYCLES
+            .into_iter()
+            .find(|tombstone| *tombstone == normalized)
+        {
+            return Ok(Self(tombstone));
+        }
+        normalized
+            .parse::<SandboxLifecycle>()
+            .map(|lifecycle| Self(lifecycle.as_str()))
+    }
+}
+
 /// What the admin sandbox list narrows to. Every field that is set must
 /// match; an unset field matches every row.
 #[derive(Debug, Clone, Default)]
@@ -35,7 +76,7 @@ pub struct AdminSandboxFilter {
     /// The stored lifecycle (`sandboxes.lifecycle`), any of these. No
     /// response field shows it: `lifecycle` and `status` report the node's
     /// observed status when there is one. Never empty.
-    pub lifecycles: Option<Vec<StoredSandboxLifecycle>>,
+    pub lifecycles: Option<Vec<AdminStoredLifecycle>>,
     /// The row's own template (`sandboxes.template_id`), not the fallbacks
     /// the response's `template` resolves when the row has none.
     pub template: Option<TemplateName>,
@@ -324,7 +365,7 @@ impl SandboxController {
              ORDER BY 1 NULLS LAST, 2 NULLS LAST, 3 NULLS LAST, 4 DESC, 5"
         ))
         .bind(org_id)
-        .bind(StoredSandboxLifecycle::Deleted.as_str())
+        .bind(DELETED_LIFECYCLE)
         .fetch_all(pool)
         .await
         .map_err(|err| db_contention_error("count sandboxes by spaced version", &err))?;

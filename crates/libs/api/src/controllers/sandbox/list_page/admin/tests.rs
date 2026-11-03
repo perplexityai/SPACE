@@ -504,6 +504,44 @@ async fn each_filter_returns_exactly_its_rows() -> TestDbResult<()> {
     Ok(())
 }
 
+/// The filter takes every value `sandboxes.lifecycle` holds, as the stored
+/// vocabulary normalizes it, and nothing else.
+#[test]
+fn the_lifecycle_filter_takes_exactly_the_stored_lifecycles() {
+    for stored in pplx_space_placement::StoredSandboxLifecycle::all() {
+        let value = stored.as_str();
+        for spelling in [
+            value.to_string(),
+            format!(" {} ", value.to_ascii_uppercase()),
+        ] {
+            assert_eq!(
+                spelling
+                    .parse::<AdminStoredLifecycle>()
+                    .map(AdminStoredLifecycle::as_str),
+                Ok(value),
+                "{spelling:?}"
+            );
+            assert_eq!(
+                spelling.parse::<pplx_space_placement::StoredSandboxLifecycle>(),
+                Ok(*stored),
+                "{spelling:?}"
+            );
+        }
+    }
+    for unknown in ["", "delete", "cleanup-required", "live"] {
+        assert!(
+            unknown.parse::<AdminStoredLifecycle>().is_err(),
+            "{unknown:?}"
+        );
+        assert!(
+            unknown
+                .parse::<pplx_space_placement::StoredSandboxLifecycle>()
+                .is_err(),
+            "{unknown:?}"
+        );
+    }
+}
+
 #[test]
 fn an_id_prefix_is_the_range_of_ids_it_starts() {
     let range = |low: &str, high: &str| Some((fixed_id(low), fixed_id(high)));
