@@ -5,9 +5,9 @@ import type { Sandbox } from './types';
 // and applies the filters below. A server from before paging ignores
 // `cursor` and every filter except `org_id` and answers a bare array of the
 // newest `limit` rows; the console then samples, as it did before paging.
-// A bare array is the older answer only for that request: during a rolling
-// deploy the next request may reach a server that pages, so a sampled tab
-// asks for its sample in the paged form and switches back on a page answer.
+// The first answer of a page view decides which (`ListSelection.load`); an
+// answer in the other shape after it means the API changed version while the
+// page was open, and the list stops until the page is reloaded.
 export type ListMode = 'paged' | 'sampled';
 
 export type SandboxListResponse =
@@ -176,21 +176,6 @@ export function loadedRowFilter<T extends LoadedRow>(mode: ListMode, criteria: L
   };
 }
 
-// What to do with a list answer: the list shape to use from now on, and
-// whether to show the answer or read the selected scope in that shape. A
-// bare array answering a paged request means the server does not page: the
-// console switches to sampling and reads the sample. A page answering a
-// sampled request means it pages now: the console switches back and reads
-// the first page with the filters it did not send. Either way the answer
-// was asked for in the other shape and is not shown. `ListSelection.load`
-// rereads at most once per load.
-export function listAnswerPlan(
-  sent: ListMode,
-  response: SandboxListResponse,
-): { mode: ListMode; reread: boolean } {
-  return { mode: response.mode, reread: response.mode !== sent };
-}
-
 export const PAGE_SIZE_OPTIONS = [25, 50, 100, 200, 500];
 export const DEFAULT_PAGE_SIZE = 50;
 
@@ -286,28 +271,30 @@ export function nextCursorFor(continuation: Continuation | null, selected: ListS
 // - `shown`: the answer is the selected scope's, in the shape asked for.
 // - `skipped`: the selection changed while it was in flight, or a newer load
 //   started; nothing is shown and `loading` is left to that load.
-// - `settled`: the answer was in the other shape twice, as when requests
-//   alternate between servers with and without paging during a rolling
-//   deploy. Two switches lead back to the shape the load started in, so the
-//   selection is left as the load found it and nothing is shown; the next
-//   load reads it again.
+// - `stopped`: the API answered in the other shape from the list's mode, as
+//   during a rolling deploy, now or in an earlier load; nothing more is read
+//   until the page is reloaded. `kept` says whether the rows on screen are
+//   the selected scope's; when they are not they must be cleared.
 // - `failed`: the request failed. `kept` says whether the rows on screen are
 //   the failed scope's; when they are not they must be cleared rather than
 //   shown under its label.
 export type ListLoad =
   | { kind: 'shown'; scope: ListScope; response: SandboxListResponse }
   | { kind: 'skipped' }
-  | { kind: 'settled' }
+  | { kind: 'stopped'; kept: boolean }
   | { kind: 'failed'; scope: ListScope; error: unknown; kept: boolean };
 
 // The sandbox list's selection and its loads. The list shape, the filters,
 // the page and sample sizes and the page position make up the selected
 // scope; `shown` is the scope of the rows on screen, and the continuation
-// is the cursor of the page after it.
+// is the cursor of the page after it. The list shape is the first answer's;
+// `stopped` is set once a later answer comes in the other shape.
 export class ListSelection {
   mode: ListMode = 'paged';
   position: PagePosition = FIRST_PAGE;
   shown: ListScope | null = null;
+  stopped = false;
+  private decided = false;
   private filters: SandboxListFilters;
   private pageSize: number;
   private sampleSize: number;
@@ -325,18 +312,18 @@ export class ListSelection {
     return listScope(this.mode, this.filters, { limit, cursor: pageCursor(this.position) });
   }
 
-  // A change of the filters or sizes. One the selected request does not
-  // send (a sampled list sends only the org and the sample size) changes
-  // nothing. Any other restarts at the first page and invalidates the loads
-  // in flight; the rows on screen are kept when they are the new scope's (a
-  // change undone before its answer arrived), and otherwise it is loaded.
+  // A change of the filters or sizes. It restarts at the first page. When
+  // the selected request is the same (a sampled list sends only the org and
+  // the sample size) nothing else changes. Otherwise the loads in flight are
+  // invalidated; the rows on screen are kept when they are the new scope's
+  // (a change undone before its answer arrived), and otherwise it is loaded.
   select(next: { filters: SandboxListFilters; pageSize: number; sampleSize: number }): 'unchanged' | 'keep' | 'load' {
     const before = this.selected;
     this.filters = next.filters;
     this.pageSize = next.pageSize;
     this.sampleSize = next.sampleSize;
-    if (sameScope(before, this.selected)) return 'unchanged';
     this.position = FIRST_PAGE;
+    if (sameScope(before, this.selected)) return 'unchanged';
     this.requests.invalidate();
     return scopeChangePlan(this.shown, this.selected);
   }
@@ -362,15 +349,15 @@ export class ListSelection {
   }
 
   // Load `scope` with `read`. A load whose scope is no longer selected when
-  // it starts or answers is skipped. An answer in the other list shape
-  // switches the shape and rereads the selected scope in it, with every
-  // filter that shape sends, once; a second answer in the other shape
-  // settles the load (see `ListLoad`).
+  // it starts or answers is skipped. The first answer decides the list shape:
+  // a page keeps paging, and a bare array, the answer of a server without
+  // paging, switches to sampling and reads the sample. A later answer in the
+  // other shape stops the list (see `ListLoad`), and so does every load
+  // after it.
   async load(scope: ListScope, read: (scope: ListScope) => Promise<SandboxListResponse>): Promise<ListLoad> {
+    if (this.stopped) return this.stop();
     if (!sameScope(this.selected, scope)) return { kind: 'skipped' };
-    const start = this.position;
     let ticket = this.requests.begin(scope);
-    let switched = false;
     for (;;) {
       let response: SandboxListResponse;
       try {
@@ -384,23 +371,29 @@ export class ListSelection {
         return { kind: 'failed', scope: ticket.scope, error, kept };
       }
       if (!this.requests.applies(ticket, this.selected)) return { kind: 'skipped' };
-      const plan = listAnswerPlan(ticket.scope.mode, response);
-      if (!plan.reread) {
+      const decided = this.decided;
+      this.decided = true;
+      if (response.mode === ticket.scope.mode) {
         this.shown = ticket.scope;
         this.continuation = continuationFor(ticket.scope, response.mode === 'paged' ? response.nextCursor : null);
         return { kind: 'shown', scope: ticket.scope, response };
       }
-      this.requests.invalidate();
-      if (switched) {
-        this.mode = scope.mode;
-        this.position = start;
-        return { kind: 'settled' };
+      if (decided) {
+        this.stopped = true;
+        return this.stop();
       }
-      this.mode = plan.mode;
-      this.position = FIRST_PAGE;
-      switched = true;
+      // The first answer is a bare array; its rows are the newest at the
+      // page size, not the sample.
+      this.mode = response.mode;
       ticket = this.requests.begin(this.selected);
     }
+  }
+
+  private stop(): ListLoad {
+    this.continuation = null;
+    const kept = sameScope(this.shown, this.selected);
+    if (!kept) this.shown = null;
+    return { kind: 'stopped', kept };
   }
 }
 

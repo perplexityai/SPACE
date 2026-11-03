@@ -123,12 +123,11 @@ function sandboxesRefreshKey(scope: ListScope): string {
 }
 
 // A refresh that loaded nothing, and did not mark the view's key fresh: its
-// page, org, size or filter is no longer selected, or the server answered in
-// the other list shape twice (`ListSelection.load`).
+// page, org, size or filter is no longer selected.
 class RefreshSkipped extends Error {}
 const SCOPE_CHANGED = 'the selected page, filters or size changed';
-const SHAPE_UNSETTLED = 'the API answered with and without paging; the next refresh reads the list again';
-// A load error the page already shows above the table.
+const VERSION_CHANGED = 'the API changed version while this page was open';
+// A load error, or a stopped list, the page already shows above the table.
 class ShownListError extends Error {}
 const alreadyReported = (err: unknown) => err instanceof RefreshSkipped || err instanceof ShownListError;
 const REFRESH_CLICK_COOLDOWN_MS = 3000;
@@ -728,8 +727,8 @@ function SandboxesPage() {
   const [listLimit, setListLimit] = useState(() => parseListLimit(searchParams.get('limit')));
   const [pageSize, setPageSize] = useState(link.pageSize);
   // The list shape and page position of the rows on screen. Requests read
-  // the selection's (`selection` below), which a load switches to the other
-  // shape before its rows arrive; see `listAnswerPlan`.
+  // the selection's (`selection` below), which the first answer can switch
+  // to sampling before the sample arrives; see `ListSelection.load`.
   const [listMode, setListMode] = useState<ListMode>('paged');
   const [position, setPosition] = useState<PagePosition>(FIRST_PAGE);
   // Bumped after every list load, so a direct lookup refreshes with the list.
@@ -742,8 +741,8 @@ function SandboxesPage() {
   // What the search box does on this list's shape: a direct lookup, a prefix
   // the server matches, or a match within the loaded rows.
   const search = useMemo(() => sandboxSearch(idFilter, listMode), [idFilter, listMode]);
-  // The filters are those of a paged request whatever the shape on screen,
-  // so a load that switches to paging sends the search as well.
+  // The filters are those of a paged request whatever the shape on screen;
+  // a sampled request sends only the org (`listScope`).
   const pagedSearch = useMemo(() => sandboxSearch(idFilter, 'paged'), [idFilter]);
   const filterInputs: FilterInputs = {
     org: orgFilter,
@@ -768,6 +767,9 @@ function SandboxesPage() {
   // The error of the last load; a load of another scope that failed clears
   // the rows rather than show them under the new label.
   const [listError, setListError] = useState<string | null>(null);
+  // An answer came in the other list shape from the first; the list reads
+  // nothing more until the page is reloaded.
+  const [listStopped, setListStopped] = useState(false);
   // A full identifier that matches no loaded row is looked up directly, so a
   // sandbox outside the loaded rows can still be found.
   const [lookup, setLookup] = useState<
@@ -833,14 +835,18 @@ function SandboxesPage() {
     // the new selection.
     if (!sameScope(selection.selected, scope)) throw new RefreshSkipped(SCOPE_CHANGED);
     if (showLoading) setLoading(true);
-    // A sampled request also probes for paging; see `listAnswerPlan`.
     const result = await selection.load(scope, (sent) => getConsoleSandboxList(listRequestQuery(sent, Date.now())));
     // Only a load that applies ends `loading`, whichever request started it;
     // a change of scope that keeps the rows on screen ends it itself.
     if (result.kind === 'skipped') throw new RefreshSkipped(SCOPE_CHANGED);
     setLoading(false);
-    if (result.kind === 'settled') throw new RefreshSkipped(SHAPE_UNSETTLED);
     selectionChanged();
+    if (result.kind === 'stopped') {
+      setListStopped(true);
+      // Rows of another org, page or filter are not shown under this one's label.
+      if (!result.kept) setSandboxes([]);
+      throw new ShownListError(VERSION_CHANGED);
+    }
     // The shape and the page position on screen change with the rows.
     setListMode(result.scope.mode);
     setPosition(selection.position);
@@ -881,7 +887,7 @@ function SandboxesPage() {
     if (loadingRef.current) {
       return;
     }
-    if (document.hidden) {
+    if (selection.stopped || document.hidden) {
       return;
     }
     const scope = selection.selected;
@@ -1529,7 +1535,7 @@ function SandboxesPage() {
         <Button
           icon={<ReloadOutlined />}
           loading={manualRefreshing}
-          disabled={refreshCooldown}
+          disabled={refreshCooldown || listStopped}
           onClick={handleManualRefresh}
         >
           Refresh
@@ -1779,7 +1785,16 @@ function SandboxesPage() {
         />
       ) : null}
 
-      {listError ? (
+      {listStopped ? (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 12 }}
+          title="The API changed version while this page was open. Reload to continue."
+          // A fresh page view; the URL keeps the filters.
+          action={<Button size="small" onClick={() => window.location.reload()}>Reload</Button>}
+        />
+      ) : listError ? (
         <Alert
           type="error"
           showIcon
@@ -1815,7 +1830,7 @@ function SandboxesPage() {
           <Button
             size="small"
             icon={<LeftOutlined />}
-            disabled={loading || position.index === 0}
+            disabled={loading || listStopped || position.index === 0}
             onClick={() => goToPage(selection.previousPosition())}
           >
             Previous
@@ -1824,7 +1839,7 @@ function SandboxesPage() {
             size="small"
             icon={<RightOutlined />}
             iconPlacement="end"
-            disabled={loading || !nextCursor}
+            disabled={loading || listStopped || !nextCursor}
             onClick={() => goToPage(selection.nextPosition())}
           >
             Next
