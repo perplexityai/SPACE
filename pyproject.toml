@@ -6,15 +6,6 @@ dependencies = [
     "e2b==2.21.1",
     "opentelemetry-exporter-otlp-proto-grpc==1.44.0",
     "opentelemetry-sdk==1.44.0",
-    # Drives the admin console in the local.console_* scenarios
-    # (space_smoke/console.py). The browser is not a Python dependency: the
-    # scenarios skip without Playwright's Chromium (`playwright install chromium`).
-    "playwright==1.64.1",
-    # Playwright's event emitter, at the newest release Python 3.11 takes:
-    # the in-cluster smoke image installs the lock as one environment
-    # (scripts/smoke-image-requirements.py), so it cannot hold the 3.12-only
-    # release beside this one.
-    "pyee==13.0.1",
     # The runtime dependencies of the SDK native.m1_generated_sdk_conformance
     # generates (space_smoke/m1_conformance.py), within the generator's bounds.
     "pydantic==2.14.1",
@@ -43,4 +34,17 @@ test = [
     "python-hcl2==8.1.4",
     "pyyaml==6.0.3",
     "requests==2.34.2",
+]
+# The local.console_* scenarios drive the admin console through Playwright
+# (space_smoke/console.py). Kind-only, so kept out of the dependencies the
+# in-cluster smoke image installs (`uv export` takes only the default groups).
+# Install with `uv sync --frozen --python 3.11 --group console`, then the
+# browser, which is not a Python dependency:
+# `uv run --frozen --python 3.11 python -m playwright install --with-deps chromium`.
+# Without either, the scenarios skip.
+console = [
+    "playwright==1.64.1",
+    # Playwright's event emitter, pinned so the lock holds one release for
+    # every supported Python: pyee 14 needs Python 3.12.
+    "pyee==13.0.1",
 ]

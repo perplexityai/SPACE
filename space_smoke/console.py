@@ -5,10 +5,12 @@ the pages an operator uses, and judges the outcome twice: by what the page
 shows and by what the admin API answers afterwards. The API is the oracle;
 the console only renders it.
 
-A browser that cannot launch is a capability the bench lacks, not a failure:
-the suite runner asks `browser_unavailable` once and skips every scenario that
-declares a browser, visibly, naming why. A scenario run by name without one is
-refused the same way, as a configuration error.
+Playwright is the optional `console` dependency group, imported only here,
+when a scenario runs or the runner probes for it. Without it, or without a
+browser it can launch, the bench lacks a capability; that is not a failure.
+The suite runner asks `browser_unavailable` once and skips every scenario
+that declares a browser, visibly, naming why. A scenario run by name without
+one is refused the same way, as a configuration error.
 
 Every page a scenario opens records the browser's console errors, uncaught
 page errors, failed requests and HTTP error answers. `BASELINE` names the ones
@@ -45,9 +47,12 @@ if TYPE_CHECKING:
 BROWSER_CHROMIUM = "chromium"
 BROWSERS = frozenset({BROWSER_CHROMIUM})
 
-# The installation the skip reason points at: Playwright's own Chromium build,
-# with the system libraries it links against.
+# The installations the skip reasons point at: Playwright for Python, an
+# optional dependency group the in-cluster smoke image leaves out, and
+# Playwright's own Chromium build with the system libraries it links against.
+PLAYWRIGHT_INSTALL = "uv sync --frozen --python 3.11 --group console"
 CHROMIUM_INSTALL = "uv run --frozen --python 3.11 python -m playwright install --with-deps chromium"
+PLAYWRIGHT_MISSING = f"Playwright for Python is not installed ({PLAYWRIGHT_INSTALL})"
 
 # How long one page interaction may take before it counts as not happening.
 # The console polls its sandbox views every 4 s; this covers two polls and a
@@ -83,7 +88,7 @@ def browser_unavailable(browser: str) -> str | None:
     try:
         from playwright.sync_api import Error, sync_playwright
     except ImportError:
-        return "Playwright for Python is not importable in this environment"
+        return PLAYWRIGHT_MISSING
     try:
         with sync_playwright() as playwright:
             playwright.chromium.launch(headless=True).close()
@@ -227,9 +232,7 @@ class ConsoleAssertions:
         try:
             from playwright.sync_api import Error, sync_playwright
         except ImportError:
-            raise SmokeConfigurationError(
-                "the console scenarios need a browser: Playwright for Python is not importable"
-            ) from None
+            raise SmokeConfigurationError(f"the console scenarios need a browser: {PLAYWRIGHT_MISSING}") from None
         playwright = sync_playwright().start()
         self._scope.defer("stop Playwright", playwright.stop)
         try:

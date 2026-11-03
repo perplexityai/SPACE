@@ -145,20 +145,27 @@ HTTP error answer outside the allowlisted `BASELINE` in `console.py` and the
 scenario's own expected probes; every baseline entry states why it is
 expected.
 
-They need Playwright's Chromium, which is not a Python dependency. Install
-it outside the checkout, with the system libraries it loads:
+They need Playwright for Python, the optional `console` dependency group,
+which the in-cluster smoke image does not install, and Playwright's
+Chromium, which is not a Python dependency. Install both, the browser with
+the system libraries it loads:
 
 ```sh
+uv sync --frozen --python 3.11 --group console
 uv run --frozen --python 3.11 python -m playwright install --with-deps chromium
 ```
 
-Without it, a suite run prints each one `SKIPPED ...: needs a chromium
-browser` with the reason, and a run by name ends inconclusive.
-`SPACE_SMOKE_CONSOLE_URL` overrides the console origin (default
-`http://127.0.0.1:3000`, Tilt's `space-ui` forward), and
-`SPACE_SMOKE_BROWSER_SCENARIOS=withhold` leaves them out, visibly. Pull CI
-runs them only when a pull request changes a path in
-`ci/kind-console-paths.txt`; every other Kind run withholds them.
+A later `uv run --frozen` keeps the group. Without either, a suite run
+prints each scenario `SKIPPED ...: needs a chromium browser` with the
+reason, and a run by name ends inconclusive. `SPACE_SMOKE_CONSOLE_URL`
+overrides the console origin (default `http://127.0.0.1:3000`, Tilt's
+`space-ui` forward), and `SPACE_SMOKE_BROWSER_SCENARIOS=withhold` leaves them
+out, visibly.
+
+Kind CI withholds them. Pull CI's selector can run them when a pull request
+changes a path in `ci/kind-console-paths.txt`, behind the
+`SPACE_KIND_CONSOLE_SMOKE` switch in `.github/workflows/pull-ci.yml`, which
+is off until the Kind runners carry the group and the browser.
 
 ## Temporarily omitted lifecycle cases
 

@@ -1426,9 +1426,7 @@ dependencies = [
     { name = "e2b" },
     { name = "opentelemetry-exporter-otlp-proto-grpc" },
     { name = "opentelemetry-sdk" },
-    { name = "playwright" },
     { name = "pydantic" },
-    { name = "pyee" },
     { name = "python-dateutil" },
     { name = "typing-extensions" },
     { name = "urllib3" },
@@ -1436,6 +1434,10 @@ dependencies = [
 ]
 
 [package.dev-dependencies]
+console = [
+    { name = "playwright" },
+    { name = "pyee" },
+]
 test = [
     { name = "boto3" },
     { name = "cel-python" },
@@ -1452,9 +1454,7 @@ requires-dist = [
     { name = "e2b", specifier = "==2.21.1" },
     { name = "opentelemetry-exporter-otlp-proto-grpc", specifier = "==1.44.0" },
     { name = "opentelemetry-sdk", specifier = "==1.44.0" },
-    { name = "playwright", specifier = "==1.64.1" },
     { name = "pydantic", specifier = "==2.14.1" },
-    { name = "pyee", specifier = "==13.0.1" },
     { name = "python-dateutil", specifier = "==2.9.0.post0" },
     { name = "typing-extensions", specifier = "==4.16.0" },
     { name = "urllib3", specifier = "==2.8.0" },
@@ -1462,6 +1462,10 @@ requires-dist = [
 ]
 
 [package.metadata.requires-dev]
+console = [
+    { name = "playwright", specifier = "==1.64.1" },
+    { name = "pyee", specifier = "==13.0.1" },
+]
 test = [
     { name = "boto3", specifier = "==1.43.113" },
     { name = "cel-python", specifier = "==0.5.0" },
