@@ -514,6 +514,7 @@ pub(super) async fn delete_sandbox(
     Extension(AuthOrg(org)): Extension<AuthOrg>,
     federated: Option<Extension<crate::middleware::auth::AuthFederatedOwner>>,
     Path(sandbox_id): Path<String>,
+    headers: HeaderMap,
 ) -> Result<StatusCode, E2bApiError> {
     let scope = ecw_access_scope(&org, &federated);
     let sandbox = fetch_scoped_sandbox(&state, &scope, &sandbox_id).await?;
@@ -566,6 +567,9 @@ pub(super) async fn delete_sandbox(
             return Err(E2bApiError::internal("Internal server error"));
         }
     };
+    if prefers_respond_async(&headers) {
+        return Ok(StatusCode::ACCEPTED);
+    }
     wait_for_delete_operation(
         &store,
         sandbox.org_id,
@@ -574,6 +578,18 @@ pub(super) async fn delete_sandbox(
         DELETE_OPERATION_WAIT,
     )
     .await
+}
+
+/// Whether the caller sent `Prefer: respond-async` (RFC 7240), asking for the
+/// recorded operation to be accepted without waiting for it to finish.
+fn prefers_respond_async(headers: &HeaderMap) -> bool {
+    headers
+        .get_all("prefer")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|preference| preference.split([';', '=']).next())
+        .any(|token| token.trim().eq_ignore_ascii_case("respond-async"))
 }
 
 /// Admission joins any active delete for the target, so a retried DELETE

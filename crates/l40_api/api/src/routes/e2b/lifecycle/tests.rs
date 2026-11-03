@@ -487,6 +487,23 @@ mod delete {
     }
 
     #[test]
+    fn respond_async_preference_skips_the_wait() {
+        let prefers = |values: &[&str]| {
+            let mut headers = HeaderMap::new();
+            for value in values {
+                headers.append("prefer", HeaderValue::from_str(value).unwrap());
+            }
+            prefers_respond_async(&headers)
+        };
+        assert!(prefers(&["respond-async"]));
+        assert!(prefers(&["wait=5, Respond-Async"]));
+        assert!(prefers(&["return=minimal", "respond-async; foo=bar"]));
+        assert!(!prefers(&[]));
+        assert!(!prefers(&["wait=0"]));
+        assert!(!prefers(&["respond-asynchronously"]));
+    }
+
+    #[test]
     fn failed_delete_reports_unavailability_as_retryable() {
         assert_eq!(
             retry_after(e2b_operation_failure(

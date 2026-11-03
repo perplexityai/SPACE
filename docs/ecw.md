@@ -253,7 +253,9 @@ The following compatibility limits are important:
   or restarting. Both are SDK success responses; repeated deletes join the same
   queued operation, so a `202` needs no retry. The sandbox can remain visible
   until the queued delete finishes. If the delete cannot be recorded, the
-  response is a retryable `503` with `Retry-After`.
+  response is a retryable `503` with `Retry-After`. A request with
+  `Prefer: respond-async` returns `202` as soon as the delete is recorded,
+  without waiting.
 
 ECW routes are not included in the SPACE OpenAPI document. Treat the pinned SDK
 tests and the behavior documented here as the compatibility baseline. When
