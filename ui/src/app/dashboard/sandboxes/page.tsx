@@ -68,6 +68,7 @@ import {
   SNAPSHOTS_NOT_ENABLED,
   isHiddenOperationError,
 } from '@/lib/hidden-operations';
+import { PrefixRequests, supplementalMatches } from '@/lib/prefix-search';
 import { useAuth } from '@/lib/auth';
 import {
   AutoLifecyclePolicy,
@@ -788,6 +789,9 @@ function SandboxesPage() {
     { key: string; sandboxes: Sandbox[]; more: boolean; error: string | null } | null
   >(null);
   const fragmentTargetRef = useRef<string | null>(null);
+  const prefixRequestsRef = useRef<PrefixRequests | null>(null);
+  if (!prefixRequestsRef.current) prefixRequestsRef.current = new PrefixRequests();
+  const prefixRequests = prefixRequestsRef.current;
 
   useEffect(() => {
     const params = new URLSearchParams();
@@ -1315,27 +1319,32 @@ function SandboxesPage() {
     // Typing waits for a pause, as a prefix the list sends does; the next
     // list load refreshes it again.
     const timer = setTimeout(() => {
-      getConsoleSandboxList(listRequestQuery(scope, Date.now()))
+      const ticket = prefixRequests.begin(scope.key);
+      getConsoleSandboxList(listRequestQuery(scope, Date.now()), ticket.signal)
         .then((response) => {
-          if (fragmentTargetRef.current !== scope.key) return;
+          if (!prefixRequests.applies(ticket, fragmentTargetRef.current)) return;
           if (response.mode !== 'paged') throw new Error(VERSION_CHANGED);
           setFragmentMatches({ key: scope.key, sandboxes: response.sandboxes, more: response.nextCursor !== null, error: null });
         })
         .catch((err: any) => {
-          if (fragmentTargetRef.current !== scope.key) return;
+          if (!prefixRequests.applies(ticket, fragmentTargetRef.current)) return;
           const message = err?.message || 'search failed';
           // A failed refresh keeps the last answer for the same search.
           setFragmentMatches((prev) =>
             prev?.key === scope.key ? { ...prev, error: message } : { key: scope.key, sandboxes: [], more: false, error: message });
         });
     }, 300);
-    return () => clearTimeout(timer);
+    return () => {
+      clearTimeout(timer);
+      prefixRequests.cancel();
+    };
   }, [fragmentScope?.key, listGeneration, listStopped]);
 
   const fragmentAnswer = fragmentScope && fragmentMatches?.key === fragmentScope.key ? fragmentMatches : null;
   // The server applied every filter but the node filter.
+  // Matches the main table already shows are left out of it.
   const fragmentRows = useMemo(
-    () => (fragmentAnswer?.sandboxes ?? []).filter(loadedRowFilter('paged', {
+    () => supplementalMatches(fragmentAnswer?.sandboxes ?? [], shownRows.sandboxes).filter(loadedRowFilter('paged', {
       matchesSearch: null,
       template: null,
       statuses: [],
@@ -1346,7 +1355,7 @@ function SandboxesPage() {
       olderThan: null,
       now: Date.now(),
     })),
-    [fragmentAnswer, nodeFilter],
+    [fragmentAnswer, nodeFilter, shownRows.sandboxes],
   );
 
   // The window and the "older than" bound must leave a range between them;
@@ -1922,10 +1931,10 @@ function SandboxesPage() {
       {paged && !listStopped && search.kind === 'fragment' ? (
         <div style={{ marginTop: 24 }}>
           <Title level={5} style={{ marginTop: 0 }}>
-            Names and IDs starting with &ldquo;{search.prefix}&rdquo;, across the list{fragmentAnswer ? ` (${fragmentRows.length}${fragmentAnswer.more ? '+' : ''})` : ''}
+            More matches beyond this page{fragmentAnswer ? ` (${fragmentRows.length}${fragmentAnswer.more ? '+' : ''})` : ''}
           </Title>
           <Text type="secondary" style={{ display: 'block', fontSize: 12, marginBottom: 8 }}>
-            {`Searched on the server with the filters above: names that start with it, case-sensitively, and IDs that start with it. Names and IDs that contain it elsewhere, such as an ID ending in the ID column's label, match on the page above only.${fragmentAnswer?.more ? ` Showing the first ${pageSize}, newest first; type more of the name or ID to narrow them.` : ''}`}
+            {`Names and IDs starting with "${search.prefix}", not already listed above. Searched on the server with the filters above: names that start with it, case-sensitively, and IDs that start with it. Names and IDs that contain it elsewhere, such as an ID ending in the ID column's label, match on the page above only.${fragmentAnswer?.more ? ` Showing the first ${pageSize}, newest first; type more of the name or ID to narrow them.` : ''}`}
           </Text>
           {fragmentAnswer?.error ? (
             <Alert type="warning" showIcon style={{ marginBottom: 8 }} title={`Could not search names and IDs starting with "${search.prefix}": ${fragmentAnswer.error}`} />
