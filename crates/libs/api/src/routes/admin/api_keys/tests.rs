@@ -230,8 +230,8 @@ async fn a_new_key_acts_as_its_chosen_user_under_the_released_lookup() -> TestRe
     };
     let pool = &harness.db.pool;
     let org = harness.tenant_org;
-    // A member older than the harness's tenant admin, so choosing either is
-    // not the same as picking the organization's first user.
+    // A member older than the harness's tenant admin: a key that chooses the
+    // tenant admin acts as that admin, not as the organization's oldest user.
     let member = UserId::new();
     sqlx::query(sql!(
         "INSERT INTO users (id, email, password_hash, display_name, org_id, role, created_at)

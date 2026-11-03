@@ -1358,6 +1358,20 @@ mod cross_org_routes {
             return Ok(());
         };
         let sandbox = tenant_sandbox(&harness).await?;
+        // One snapshot of the sandbox, so every form's snapshot page must name
+        // it: an empty page would match under any form.
+        let snapshot_id = Uuid::now_v7();
+        sqlx::query(sql!(
+            "INSERT INTO snapshots (
+                 id, sandbox_id, type, state, local_artifact_id,
+                 artifact_kind, artifact_origin, artifact_snapshot_name, label
+             ) VALUES ($1, $2, 'disk', 'ready', $3, 'disk', 'snapshot', 'checkpoint', 'id-forms')"
+        ))
+        .bind(snapshot_id)
+        .bind(sandbox.as_uuid())
+        .bind(Uuid::now_v7())
+        .execute(&harness.db.pool)
+        .await?;
         let dashed = sandbox.as_uuid().to_string();
         let undashed = sandbox.as_uuid().simple().to_string();
         let forms = [
@@ -1373,16 +1387,16 @@ mod cross_org_routes {
                 Method::POST,
                 "/terminal-sessions",
                 Some(json!({"size": {"rows": 24, "cols": 80}})),
-                "id",
+                "/id",
             ),
-            (Method::POST, "/commands", Some(command), "session_id"),
+            (Method::POST, "/commands", Some(command), "/session_id"),
             (
                 Method::POST,
                 ":force-rollback",
                 Some(json!({"snapshot_name": "checkpoint-1"})),
-                "operation_id",
+                "/operation_id",
             ),
-            (Method::GET, "/snapshots", None, "data"),
+            (Method::GET, "/snapshots", None, "/data/0/id"),
         ];
         for (method, suffix, body, replayed) in routes.clone() {
             let key = [("idempotency-key", suffix)];
@@ -1393,16 +1407,34 @@ mod cross_org_routes {
                     .as_operator(method.clone(), &path, &key, body.clone())
                     .await;
                 assert!(status.is_success(), "{method} {path}: {status} {answer}");
-                answers.push(answer[replayed].clone());
+                let replayed = answer.pointer(replayed).cloned();
+                assert!(replayed.is_some(), "{method} {path}: {answer}");
+                answers.push(replayed);
                 let events = harness.audit_events(&path).await;
                 assert_eq!(events.len(), 1, "{method} {path}: {events:?}");
                 assert_names_sandbox(&events[0], &harness, sandbox);
             }
             assert!(
                 answers.iter().all(|answer| *answer == answers[0]),
-                "{method} {suffix}: every form replays the first request: {answers:?}"
+                "{method} {suffix}: every form answers as the first, replaying its request or naming its snapshot: {answers:?}"
             );
         }
+        let (_, page) = harness
+            .as_operator(
+                Method::GET,
+                &format!("/sandboxes/{sandbox}/snapshots"),
+                &[],
+                None,
+            )
+            .await;
+        assert_eq!(
+            page["data"][0]["id"],
+            pplx_space_public_api::PublicSnapshotId::from(
+                pplx_space_common_core::types::SnapshotId::from_uuid(snapshot_id)
+            )
+            .to_string(),
+            "every form's page names the seeded snapshot"
+        );
         let targets: Vec<Option<String>> = sqlx::query_scalar(sql!(
             "SELECT target_id FROM public_operations WHERE org_id = $1 AND kind = $2"
         ))
