@@ -2457,6 +2457,24 @@ fn create_translation_maps_tls_interception_metadata() {
 }
 
 #[test]
+fn create_translation_validates_zero_data_retention() {
+    for (value, expected) in [("true", Some(true)), ("false", Some(false)), ("TRUE", None)] {
+        let mut request = base_create_request();
+        request
+            .metadata
+            .insert("zdr".to_string(), value.to_string());
+        match (translate_create_request(request), expected) {
+            (Ok(t), Some(b)) => assert_eq!(
+                t.native.metadata.get("zdr"),
+                Some(&SandboxMetadataValue::Bool(b))
+            ),
+            (Err(e), None) => assert_eq!(e.status, StatusCode::BAD_REQUEST),
+            (result, _) => panic!("{value}: {result:?}"),
+        }
+    }
+}
+
+#[test]
 fn e2b_full_network_policy_translation() {
     use pplx_space_net_common::NetworkPolicyV1;
     let raw = serde_json::json!({

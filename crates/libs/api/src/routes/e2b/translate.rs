@@ -1,5 +1,7 @@
 use super::*;
-use pplx_space_common_core::types::{SandboxId, TemplateReference, TemplateSelector};
+use pplx_space_common_core::types::{
+    SandboxId, TemplateReference, TemplateSelector, ZERO_DATA_RETENTION_METADATA_KEY,
+};
 use pplx_space_metrics::response::{ResponseKind, ResponseOrigin};
 use pplx_space_metrics::sandbox::api::{
     SandboxApiMetricIdentity, TemplateSelectorKind, TemplateSelectorRequest, TemplateTagShape,
@@ -113,6 +115,7 @@ pub(super) fn translate_create_request(
     }
 
     reject_nul("metadata", &req.metadata)?;
+    validate_e2b_zero_data_retention(&req.metadata)?;
     reject_nul("envVars", &req.env_vars)?;
 
     let ignored_metadata = req
@@ -180,6 +183,19 @@ fn reject_nul(field: &str, entries: &StringMap) -> Result<(), E2bApiError> {
         )));
     }
     Ok(())
+}
+
+/// A misspelled value would silently retain data, so reject it.
+fn validate_e2b_zero_data_retention(metadata: &StringMap) -> Result<(), E2bApiError> {
+    match metadata
+        .get(ZERO_DATA_RETENTION_METADATA_KEY)
+        .map(String::as_str)
+    {
+        None | Some("true" | "false") => Ok(()),
+        Some(_) => Err(E2bApiError::bad_request(format!(
+            "{ZERO_DATA_RETENTION_METADATA_KEY} must be true or false"
+        ))),
+    }
 }
 
 fn parse_e2b_tls_interception(metadata: &StringMap) -> Result<TlsInterception, E2bApiError> {

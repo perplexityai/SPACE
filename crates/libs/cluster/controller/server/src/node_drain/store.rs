@@ -25,6 +25,7 @@ use pplx_space_common_core::node_drain_signals::{
 use pplx_space_common_core::types::{
     ArtifactKind, ArtifactOrigin, BackupSource, ExecutionGeneration, LocalArtifactId,
     NodeDrainMode, NodeId, NodeManagedBy, NodeRole, PositiveDuration, SandboxId, SubstrateKind,
+    ZERO_DATA_RETENTION_METADATA_KEY,
 };
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
@@ -732,6 +733,7 @@ async fn revert_evacuation_suspend_claim(
 /// as plaintext, the way the API's sandbox projection reads it.
 fn evacuatable_sandbox_rows_query(residency: ResidencyEvidence) -> String {
     let occupies = occupies_node_predicate("s", "$1", residency);
+    let zdr = zero_data_retention_predicate("s");
     format!(
         "SELECT s.id,
                 CASE
@@ -755,6 +757,7 @@ fn evacuatable_sandbox_rows_query(residency: ResidencyEvidence) -> String {
                 s.lifecycle = 'stopped'
                 AND COALESCE(s.volume_encryption, FALSE)
             )
+            AND NOT ({zdr} AND s.evacuation_restore_target IS NULL)
             AND {occupies}
           ORDER BY CASE WHEN s.lifecycle = 'stopped' THEN 1 ELSE 0 END,
                    s.lifecycle_changed_at,
@@ -2161,6 +2164,27 @@ pub(crate) fn adopt_remote_snapshot_on_gone_node_query() -> String {
             AND {latest_ready}
             AND {current_cycle_ready}
             {identity_guards}"
+    )
+}
+
+/// False rather than NULL without the key, so callers can negate it.
+fn zero_data_retention_predicate(alias: &str) -> String {
+    format!(
+        "COALESCE({alias}.metadata -> '{ZERO_DATA_RETENTION_METADATA_KEY}' \
+         IN ('true'::jsonb, '\"true\"'::jsonb), FALSE)"
+    )
+}
+
+/// `$1` = node id, `$2` = [`mark_sandbox_failed_on_node_lifecycles`]. Rows
+/// already carrying an evacuation marker finish that evacuation instead.
+pub(crate) fn zero_data_retention_residents_query() -> String {
+    let zdr = zero_data_retention_predicate("sandboxes");
+    format!(
+        "SELECT id FROM sandboxes
+          WHERE active_node_id = $1
+            AND lifecycle = ANY($2)
+            AND evacuation_restore_target IS NULL
+            AND {zdr}"
     )
 }
 
@@ -4800,6 +4824,26 @@ impl NodeDrainSink for SubstrateSink {
     /// kube cascade on node termination eventually sweeps it), surfaced via a
     /// `CleanupFailed` event + warn log. Mirrors the abandon-stale sweep's
     /// claim-then-clean ordering.
+    async fn fail_zero_data_retention_residents(
+        &self,
+        node_id: NodeId,
+    ) -> Result<u64, sqlx::Error> {
+        let query = zero_data_retention_residents_query();
+        let candidates: Vec<SandboxId> =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(query.as_str())))
+                .bind(node_id)
+                .bind(mark_sandbox_failed_on_node_lifecycles())
+                .fetch_all(&self.pool)
+                .await?;
+        let mut failed = 0;
+        for sandbox_id in candidates {
+            failed += self
+                .mark_sandbox_failed_on_node(sandbox_id, node_id)
+                .await?;
+        }
+        Ok(failed)
+    }
+
     async fn mark_sandbox_failed_on_node(
         &self,
         sandbox_id: SandboxId,

@@ -1794,6 +1794,56 @@ async fn mark_failed_on_node_flips_evacuable_active_rows_only() -> TestResult {
     Ok(())
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn zero_data_retention_residents_are_failed_not_evacuated() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let node = NodeId::new();
+    insert_draining_node(pool, node).await?;
+    let resident = |lifecycle: &'static str, marker: Option<&'static str>, zdr: &'static str| async move {
+        let sandbox = SandboxId::new();
+        insert_sandbox(pool, sandbox, lifecycle, Some(node)).await?;
+        pin_active_and_age(pool, sandbox, node, marker, 0).await?;
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET metadata = jsonb_build_object('zdr', $2::jsonb) WHERE id = $1"
+        ))
+        .bind(sandbox)
+        .bind(zdr)
+        .execute(pool)
+        .await?;
+        TestResult::Ok(sandbox)
+    };
+    let zdr = resident("started", None, "true").await?;
+    let zdr_string = resident("paused", None, r#""true""#).await?;
+    let mid_evacuation = resident("suspending", Some("started"), "true").await?;
+    let plain = resident("started", None, "false").await?;
+
+    let query = zero_data_retention_residents_query();
+    let mut failed: Vec<SandboxId> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(query.as_str())))
+        .bind(node)
+        .bind(mark_sandbox_failed_on_node_lifecycles())
+        .fetch_all(pool)
+        .await?;
+    failed.sort();
+    let mut expected = vec![zdr, zdr_string];
+    expected.sort();
+    assert_eq!(failed, expected);
+
+    let mut listed: Vec<SandboxId> =
+        list_evacuatable_sandbox_rows(pool, node, ResidencyEvidence::LifecycleOnly, false)
+            .await?
+            .into_iter()
+            .map(|(sandbox, _)| sandbox)
+            .collect();
+    listed.sort();
+    let mut expected = vec![mid_evacuation, plain];
+    expected.sort();
+    assert_eq!(listed, expected);
+    Ok(())
+}
+
 // -----------------------------------------------------------------
 // Cohort-restore retry backoff: the pending query's
 // `next_restore_attempt_at` gate + attempt-count ordering, the

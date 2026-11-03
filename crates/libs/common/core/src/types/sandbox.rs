@@ -32,6 +32,9 @@ const SANDBOX_RUNTIME_LABEL_MAX_LEN: usize =
     max_usize(SANDBOX_LABEL_HEX_LEN, LINUX_NETWORK_SLOT_LABEL_WIDTH);
 const MAX_SANDBOX_METADATA_TOTAL_BYTES: usize = 64 * 1024;
 
+/// Metadata key; `true` makes a forced drain fail the sandbox instead of snapshotting it.
+pub const ZERO_DATA_RETENTION_METADATA_KEY: &str = "zdr";
+
 /// Maximum number of desired-open TCP port exposures admitted for one sandbox.
 /// Already-open rows are grandfathered so rollout cannot disable a legacy
 /// sandbox whose durable desired state predates this limit.

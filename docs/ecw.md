@@ -166,6 +166,12 @@ versions accept the key as ordinary metadata and do not apply its sizing.
 Callers should verify the allocation returned by `get_info()` and reject an
 undersized sandbox.
 
+## Zero data retention
+
+Create with metadata `{"zdr": "true"}` to keep a sandbox's memory and disk out of
+snapshot storage: a forced node drain fails and tears down the sandbox instead of
+evacuating it. Pausing still suspends it to snapshot storage.
+
 ## Compatibility contract
 
 ECW supports the E2B-shaped sandbox create, list, inspect, delete, connect,

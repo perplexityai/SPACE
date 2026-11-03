@@ -352,6 +352,7 @@ struct FakeSink {
     // Recorded `(node_id, age)` per call so tests can assert the
     // reconciler propagates the configured timeout.
     abandon_stale_calls: StdMutex<Vec<(NodeId, PositiveDuration)>>,
+    zero_data_retention_calls: StdMutex<Vec<NodeId>>,
     // One-shot DB-error injection for `abandon_stale_resident_sandboxes`.
     fail_abandon_stale: StdMutex<Option<String>>,
 
@@ -792,6 +793,10 @@ impl FakeSink {
         self.abandon_stale_calls.lock().unwrap().clone()
     }
 
+    fn zero_data_retention_calls(&self) -> Vec<NodeId> {
+        self.zero_data_retention_calls.lock().unwrap().clone()
+    }
+
     fn inject_fail_abandon_stale(&self, msg: &str) {
         *self.fail_abandon_stale.lock().unwrap() = Some(msg.into());
     }
@@ -962,6 +967,14 @@ impl NodeDrainSink for FakeSink {
             .into_iter()
             .map(|id| (id, SandboxLifecycle::Started))
             .collect())
+    }
+
+    async fn fail_zero_data_retention_residents(
+        &self,
+        node_id: NodeId,
+    ) -> Result<u64, sqlx::Error> {
+        self.zero_data_retention_calls.lock().unwrap().push(node_id);
+        Ok(0)
     }
 
     async fn list_pinned_local_only_sandboxes_on_node(
@@ -1920,6 +1933,9 @@ impl NodeDrainSink for ArcSink {
         n: NodeId,
     ) -> Result<Vec<(SandboxId, SandboxLifecycle)>, sqlx::Error> {
         self.0.list_evacuatable_sandboxes_on_node(n).await
+    }
+    async fn fail_zero_data_retention_residents(&self, n: NodeId) -> Result<u64, sqlx::Error> {
+        self.0.fail_zero_data_retention_residents(n).await
     }
     async fn list_pinned_local_only_sandboxes_on_node(
         &self,
@@ -3177,6 +3193,24 @@ async fn ac1_sweep_runs_with_configured_age_each_tick() {
         )],
         "abandon-stuck-transient sweep must run once per tick with the configured timeout"
     );
+}
+
+#[tokio::test]
+async fn zero_data_retention_residents_are_failed_only_by_a_forced_drain() {
+    let forced = NodeId::new();
+    let gentle = NodeId::new();
+    let sink = FakeSink::new();
+    sink.set_initial_state(forced, PHASE_DRAINING);
+    sink.set_initial_state(gentle, PHASE_DRAINING);
+    sink.set_draining_list_forced(vec![forced]);
+
+    let reconciler = Reconciler::new(config_enabled(4, 8), sink, FakeTerminator::default());
+    let _ = reconciler.tick().await;
+    assert_eq!(reconciler.sink.zero_data_retention_calls(), vec![forced]);
+
+    reconciler.sink.set_draining_list(vec![gentle]);
+    let _ = reconciler.tick().await;
+    assert_eq!(reconciler.sink.zero_data_retention_calls(), vec![forced]);
 }
 
 /// When the sweep reports rows flipped, the next tick's reconciler

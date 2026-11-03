@@ -1068,6 +1068,12 @@ pub trait NodeDrainSink: Send + Sync + 'static {
         &self,
         node_id: NodeId,
     ) -> impl std::future::Future<Output = Result<Vec<(SandboxId, SandboxLifecycle)>, sqlx::Error>> + Send;
+    /// Fail and tear down `started`/`paused` zero data retention residents
+    /// instead of evacuating them. Returns the number flipped.
+    fn fail_zero_data_retention_residents(
+        &self,
+        node_id: NodeId,
+    ) -> impl std::future::Future<Output = Result<u64, sqlx::Error>> + Send;
     /// Suspended sandboxes still pinned to this node whose current local
     /// artifact has no ready backup yet. For new rows, portability requires a
     /// ready backup of the exact `current_local_artifact_id`; nullable
@@ -2520,6 +2526,18 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
                     );
                 }
             }
+        }
+
+        // Evacuation would persist a zero data retention sandbox's memory and disk.
+        if gone_recovery.is_none()
+            && mode.evacuates_residents()
+            && let Err(err) = self.sink.fail_zero_data_retention_residents(node_id).await
+        {
+            tracing::warn!(
+                node_id = %node_id,
+                error = %err,
+                "node_drain: fail_zero_data_retention_residents failed; will retry"
+            );
         }
 
         // Two-set model:
