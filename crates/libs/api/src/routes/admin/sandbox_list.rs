@@ -67,14 +67,19 @@ pub struct AdminSandboxListQuery {
     /// response is then `{sandboxes, next_cursor}` instead of a bare array.
     cursor: Option<String>,
     /// Comma-separated stored lifecycles.
+    #[serde(default, deserialize_with = "empty_as_unset")]
     lifecycle: Option<String>,
+    #[serde(default, deserialize_with = "empty_as_unset")]
     template: Option<String>,
     #[serde(default, deserialize_with = "empty_as_unset")]
     node_id: Option<NodeId>,
     #[serde(default, deserialize_with = "empty_as_unset")]
     assigned: Option<bool>,
+    #[serde(default, deserialize_with = "empty_as_unset")]
     user_id: Option<UserId>,
+    #[serde(default, deserialize_with = "empty_as_unset")]
     created_after: Option<String>,
+    #[serde(default, deserialize_with = "empty_as_unset")]
     created_before: Option<String>,
     prefix: Option<String>,
 }
@@ -221,9 +226,10 @@ fn parse_query<T: DeserializeOwned>(uri: &Uri) -> Result<T, QueryError> {
         .map_err(|rejection| bad_request(rejection.body_text()))
 }
 
-/// A typed parameter whose empty value (`name=`) is unset, as leaving the
+/// A filter parameter whose empty value (`name=`) is unset, as leaving the
 /// name out is: the unpaged list ignored these names before they were
-/// filters, so a caller that sends one empty keeps its list.
+/// filters, so a caller that sends one empty keeps its list. `org_id`, which
+/// that list already parsed, still refuses an empty value.
 fn empty_as_unset<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: Deserializer<'de>,

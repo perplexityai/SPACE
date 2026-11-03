@@ -259,7 +259,8 @@ async fn malformed_list_parameters_answer_400() -> TestDbResult<()> {
         ("cursor=%%%", "invalid"),
         (&out_of_range_cursor, "invalid cursor"),
         ("lifecycle=started,napping", "unknown lifecycle"),
-        ("lifecycle=", "unknown lifecycle"),
+        // An empty parameter is unset, but an empty item in a list is not.
+        ("lifecycle=started,", "unknown lifecycle"),
         ("template=..", "invalid template"),
         (
             "node_id=00000000-0000-7000-8000-000000000001&assigned=false",
@@ -324,7 +325,16 @@ async fn an_empty_filter_parameter_is_unset() -> TestDbResult<()> {
         seed_sandbox(&harness.pool, owner, SeedSandbox::default()).await?;
     }
     let org = owner.org_id.as_uuid();
-    for name in ["node_id", "assigned"] {
+    for name in [
+        "lifecycle",
+        "template",
+        "node_id",
+        "assigned",
+        "user_id",
+        "created_after",
+        "created_before",
+        "prefix",
+    ] {
         for paging in ["", "&cursor="] {
             let (status, unset) = harness
                 .get(&format!("/sandboxes?org_id={org}{paging}"))
