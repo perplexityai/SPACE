@@ -572,7 +572,10 @@ SPACE_KIND_CLUSTER={cluster} bash infra/space/kind/scripts/internal-rpc-tls.sh
 )
 
 # containerd-shim-space-v2 on each sandbox worker, so per-sandbox pause pods
-# are hijacked into real Firecracker sandboxes.
+# are hijacked into real Firecracker sandboxes. Parallel: run serially, Tilt
+# held every other resource for its 19 s (2026-11-03 Kind CI timelines), and
+# only the first sandbox create needs it, which space-api's dependency on it
+# still orders.
 local_resource(
     "install-space-shim",
     cmd = "SPACE_KIND_CLUSTER={} SPACE_KIND_TELEMETRY_MODE={} bash infra/space/kind/scripts/install-shim.sh".format(
@@ -580,6 +583,7 @@ local_resource(
         TELEMETRY_MODE,
     ),
     deps = [TELEMETRY_SCRIPT, "infra/space/kind/scripts/install-shim.sh"] + ([OBSERVABILITY_CONFIG] if OBSERVABILITY_CONFIG else []),
+    allow_parallel = True,
     labels = ["bootstrap"],
 )
 
@@ -611,9 +615,10 @@ local_resource(
 # find its lock held and wait, or find the build up to date. allow_parallel is
 # required: Tilt runs nothing else beside a serial local resource, and this one
 # runs for minutes. It waits for the serial bootstrap resources because Tilt
-# holds those while anything else is building.
+# holds those while anything else is building; install-space-shim runs in
+# parallel, so it is not one of them.
 RUST_ARTIFACTS_AFTER = ["label-kind-workers", "label-kind-infra", "sandbox-ssh-secret",
-                        "internal-rpc-tls", "check-kind-node-image", "install-space-shim"]
+                        "internal-rpc-tls", "check-kind-node-image"]
 local_resource(
     "rust-artifacts",
     cmd = RUST_ARTIFACT_BUILD,
@@ -939,6 +944,29 @@ k8s_resource(
     resource_deps = ["check-kind-node-image", "label-kind-workers", "label-kind-infra"],
 )
 
+# The seed's artifacts, built as soon as the Rust artifacts exist. Tilt holds a
+# resource's image build until its resource_deps are ready, so as part of
+# space-seed-publish's image the build started only once the internal API was
+# up and took 50-60 s after it, the last minute of a CI bring-up (2026-11-03
+# Kind CI timelines). That image runs build-seed.sh again, which finds its
+# inputs unchanged and skips the rootfs build.
+local_resource(
+    "space-seed-build",
+    cmd = " && ".join([
+        RUST_ARTIFACT_BUILD,
+        'seed_dir="${SPACE_SEED_OUTPUT_DIR:-$HOME/.space-devbox/kind/seed/build}"',
+        'SPACE_SEED_OUTPUT_DIR="$seed_dir" SPACE_RUST_BUILD_IMAGE={} bash infra/space/kind/scripts/build-seed.sh'.format(
+            RUST_ARTIFACT_IMAGE),
+    ]),
+    deps = RUST_ARTIFACT_DEPS + [
+            "templates/firecracker/seed",
+            "templates/firecracker/recipes/seed.toml",
+            "infra/space/kind/scripts/build-seed.sh"],
+    allow_parallel = True,
+    resource_deps = ["rust-artifacts"],
+    labels = ["build"],
+)
+
 # seed publish: uploads the locally built production seed to the object store and
 # registers the release through the real ClusterApi RPCs. Workers then pull
 # it via template-manager prefetch → volume-manager — the production path.
@@ -946,7 +974,7 @@ deploy_yaml(helm_release("space", "infra/space/kind/charts/space-seed-publish"))
 k8s_resource(
     "space-seed-publish",
     labels = ["bootstrap"],
-    resource_deps = ["space-internal-api", "space-object-store-bucket-init"],
+    resource_deps = ["space-internal-api", "space-object-store-bucket-init", "space-seed-build"],
 )
 
 # ── Image delivery ───────────────────────────────────────────────────────────
