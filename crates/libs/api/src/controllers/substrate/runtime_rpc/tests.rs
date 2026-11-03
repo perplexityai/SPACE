@@ -10,7 +10,7 @@ async fn fixture() -> (RuntimeClient, Substrate) {
     // These cases must not resolve another worker or access the database.
     pool.close().await;
     (
-        RuntimeClient::new(channel),
+        RuntimeClient::new(channel, "http://127.0.0.1:1"),
         Substrate::from_direct(DirectSubstrate::new(pool)),
     )
 }

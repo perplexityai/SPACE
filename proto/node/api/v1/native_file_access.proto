@@ -1,0 +1,111 @@
+syntax = "proto3";
+package space.node.api.v1;
+
+import "node/api/v1/cluster.proto";
+
+// Served by the lifecycle API on its activation listener, beside
+// IngressActivationApi. Only the data-plane edge calls it, for a Native
+// `files:*` request whose bytes the edge carries: the API makes every decision
+// its own handler makes before the sandbox sees the request (credentials,
+// owner scope, the federated service grant, the idempotency binding, drain,
+// admission and wake), unchanged. Nothing is cached between calls, so a
+// revoked credential is refused on its next request.
+service NativeFileAccessApi {
+  // Authenticate and authorize a request from its headers alone, before its
+  // body is read.
+  rpc AuthorizeNativeFileRequest(AuthorizeNativeFileRequestRequest)
+      returns (AuthorizeNativeFileRequestResponse);
+  // Authorize the request again and, for an operation whose
+  // `Idempotency-Key` is bound, bind it to the request's fingerprint. Then
+  // wake the sandbox if its policy allows and route to its runtime.
+  rpc PrepareNativeFileCall(PrepareNativeFileCallRequest) returns (PrepareNativeFileCallResponse);
+}
+
+// A Native `files:*` operation, one per route.
+enum NativeFileOperation {
+  NATIVE_FILE_OPERATION_UNSPECIFIED = 0;
+  NATIVE_FILE_OPERATION_STAT = 1;
+  NATIVE_FILE_OPERATION_LIST = 2;
+  NATIVE_FILE_OPERATION_READ = 3;
+  NATIVE_FILE_OPERATION_WRITE = 4;
+  NATIVE_FILE_OPERATION_WRITE_BATCH = 5;
+  NATIVE_FILE_OPERATION_MKDIR = 6;
+  NATIVE_FILE_OPERATION_REMOVE = 7;
+  NATIVE_FILE_OPERATION_RENAME = 8;
+  NATIVE_FILE_OPERATION_CHANGES_ENABLE = 9;
+  NATIVE_FILE_OPERATION_CHANGES_DISABLE = 10;
+  NATIVE_FILE_OPERATION_MODIFIED = 11;
+}
+
+message NativeHttpHeader {
+  string name = 1;
+  bytes value = 2;
+}
+
+// What the edge knows of a request before reading its body.
+message NativeFileRequest {
+  NativeFileOperation operation = 1;
+  // The route's `{sandbox_id}` segment as it appears in the request's path,
+  // still percent-encoded.
+  string sandbox_id = 2;
+  // The request's headers as the client sent them, less hop-by-hop headers.
+  repeated NativeHttpHeader headers = 3;
+  // The request id the edge answers with; an error rendered here carries it.
+  string request_id = 4;
+}
+
+// A response the API rendered for a refused request. The edge answers with it
+// unchanged.
+message NativeHttpResponse {
+  uint32 status = 1;
+  repeated NativeHttpHeader headers = 2;
+  bytes body = 3;
+}
+
+// Who an admitted request acts for.
+message NativeFileAuthorization {
+  // The effective org: for a credential asserting a federated owner, the org
+  // materialized for that owner.
+  string org_id = 1;
+  // The effective owner, absent for a service credential acting for none.
+  optional string owner_user_id = 2;
+}
+
+message AuthorizeNativeFileRequestRequest {
+  NativeFileRequest request = 1;
+}
+
+message AuthorizeNativeFileRequestResponse {
+  oneof outcome {
+    NativeFileAuthorization authorized = 1;
+    NativeHttpResponse refused = 2;
+  }
+}
+
+message PrepareNativeFileCallRequest {
+  NativeFileRequest request = 1;
+  // The request's fingerprint (pplx-space-native-files), required for the
+  // operations whose key is bound: write, write_batch, mkdir, remove and
+  // rename.
+  optional string request_fingerprint = 2;
+}
+
+// Where and how to send the request's worker call.
+message NativeFileRouteGrant {
+  NativeFileAuthorization authorization = 1;
+  // The sandbox's canonical id.
+  string sandbox_id = 2;
+  // The runtime the API connected to for this request.
+  DataPlaneBackendEndpoint backend = 3;
+  // The route token the worker call carries.
+  optional SpaceApiRouteToken space_api_route_token = 4;
+  // The key the sandbox sees: set for write, write_batch and rename.
+  optional string guest_idempotency_key = 5;
+}
+
+message PrepareNativeFileCallResponse {
+  oneof outcome {
+    NativeFileRouteGrant granted = 1;
+    NativeHttpResponse refused = 2;
+  }
+}

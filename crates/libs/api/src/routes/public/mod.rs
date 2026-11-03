@@ -16,6 +16,9 @@ mod cursors;
 pub(crate) mod error;
 mod files;
 pub(crate) mod hidden_operations;
+pub(crate) use files::access::{
+    FileAccessAuthorization, FileAccessCall, FileAccessDecision, FileAccessGrant, FileAccessStep,
+};
 pub(crate) use files::{
     MAX_FILE_WRITE_BATCH_BYTES, WRITE_FILE_BATCH_BODY_LIMIT_BYTES, WRITE_FILE_BODY_LIMIT_BYTES,
 };
@@ -261,6 +264,29 @@ async fn native_data_plane(
 }
 
 pub fn v1_router(state: AppState) -> Router<AppState> {
+    native_router(state, mounted_operations())
+}
+
+/// The `files:*` operations with [`files::access::decide`] in place of their
+/// handlers, nested at `/v1` like the public router: the native file access
+/// RPCs run a request's headers through it, so the request meets exactly the
+/// credentials, owner scope and error envelope its public route applies.
+pub(crate) fn native_file_access_router(state: AppState) -> Router {
+    let operations: Vec<(NativeOperation, MethodRouter<AppState>)> =
+        pplx_space_native_files::FileOperation::ALL
+            .iter()
+            .map(|operation| mount(operation.route(), files::access::decide))
+            .collect();
+    Router::new()
+        .nest("/v1", native_router(state.clone(), operations))
+        .with_state(state)
+}
+
+/// `operations` behind every layer a Native operation runs behind.
+fn native_router(
+    state: AppState,
+    operations: Vec<(NativeOperation, MethodRouter<AppState>)>,
+) -> Router<AppState> {
     // Each `(path, method)` mount: the operation whose entry installed the
     // handler, the handler, and every operation the mount serves, which
     // includes that one and its `:action` siblings.
@@ -269,7 +295,7 @@ pub fn v1_router(state: AppState) -> Router<AppState> {
         MethodRouter<AppState>,
         Vec<NativeOperation>,
     )> = Vec::new();
-    for (operation, method_router) in mounted_operations() {
+    for (operation, method_router) in operations {
         let mount = (operation.relative_runtime_path(), operation.method());
         match mounts
             .iter_mut()

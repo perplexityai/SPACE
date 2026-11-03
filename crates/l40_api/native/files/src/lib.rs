@@ -11,6 +11,7 @@
 
 mod failure;
 pub mod limits;
+mod operation;
 mod parents;
 mod public_error;
 mod request;
@@ -20,6 +21,7 @@ pub use failure::{
     FileCallError, FileCallErrorKind, FileCallFailure, WorkerFailure, file_call_error,
     unprotected_mutation_error,
 };
+pub use operation::FileOperation;
 pub use parents::{deepest_parent_directories, write_creating_parents, write_parent_directory};
 pub use request::{
     FileRequestError, admit_list_entry, decode_write_batch_entries, decode_write_chunks,

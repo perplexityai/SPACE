@@ -10,6 +10,8 @@ pub(super) type RuntimeTransport =
 pub struct RuntimeClient {
     pub(super) worker: WorkerApiClient<RuntimeTransport>,
     pub(super) channel: Channel,
+    /// The URI `channel` was dialed at.
+    endpoint: std::sync::Arc<str>,
     /// Set when `channel` is a cached channel that other callers share.
     pub(super) kept: Option<pplx_space_common_grpc::ConnectionWatch>,
     /// Set for a Native data-plane request's client; see [`KeptCallReport`].
@@ -88,11 +90,13 @@ impl Drop for KeptCallReport {
 }
 
 impl RuntimeClient {
-    pub(super) fn new(channel: Channel) -> Self {
+    /// A client on `channel`, which was dialed at `endpoint`.
+    pub(super) fn new(channel: Channel, endpoint: impl Into<std::sync::Arc<str>>) -> Self {
         let transport = node_api_channel(channel.clone(), SpaceBearerToken::NodeApi);
         Self {
             worker: WorkerApiClient::new(transport),
             channel,
+            endpoint: endpoint.into(),
             kept: None,
             #[cfg(feature = "kubernetes")]
             report: None,
@@ -101,10 +105,14 @@ impl RuntimeClient {
 
     /// A client on a channel a cache keeps while `watch` is open.
     #[cfg(feature = "kubernetes")]
-    pub(super) fn kept(channel: Channel, watch: pplx_space_common_grpc::ConnectionWatch) -> Self {
+    pub(super) fn kept(
+        channel: Channel,
+        endpoint: std::sync::Arc<str>,
+        watch: pplx_space_common_grpc::ConnectionWatch,
+    ) -> Self {
         Self {
             kept: Some(watch),
-            ..Self::new(channel)
+            ..Self::new(channel, endpoint)
         }
     }
 
@@ -133,6 +141,11 @@ impl RuntimeClient {
     /// next one dials afresh. Call it when the peer showed that new calls
     /// should reach a new connection, such as a draining node-api; this
     /// client and its clones keep working. A no-op for an uncached channel.
+    /// The URI this client's worker was dialed at.
+    pub(crate) fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
     pub(crate) fn retire_kept_connection(&self) {
         if let Some(watch) = &self.kept {
             watch.close();
@@ -363,6 +376,7 @@ pub(in crate::controllers) async fn require_activation_policy_support(
 }
 
 pub async fn connect_worker(endpoint: Endpoint) -> Result<RuntimeClient, ControllerError> {
+    let uri = endpoint.uri().to_string();
     let channel = node_api_connect_endpoint(endpoint)
         .await?
         .connect_with_retry(
@@ -374,7 +388,7 @@ pub async fn connect_worker(endpoint: Endpoint) -> Result<RuntimeClient, Control
         .map_err(|err| {
             ControllerError::service_unavailable(format!("node-api not reachable: {err}"))
         })?;
-    Ok(RuntimeClient::new(channel))
+    Ok(RuntimeClient::new(channel, uri))
 }
 
 /// [`connect_worker`] for a channel a cache keeps: the same dial, plus the

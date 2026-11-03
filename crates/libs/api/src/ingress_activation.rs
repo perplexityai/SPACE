@@ -1,4 +1,6 @@
-//! Internal activation RPC hosted beside the API's existing lifecycle owner.
+//! Internal activation RPCs hosted beside the API's existing lifecycle owner:
+//! ingress activation, and the native file access RPCs
+//! ([`crate::native_file_access`]).
 use pplx_space_common_core::types::{SandboxId, parse_grpc_timeout};
 use pplx_space_common_svc::{
     auth,
@@ -113,12 +115,17 @@ pub(crate) async fn server(
         ),
         shutdown: shutdown.clone(),
     };
+    let files = crate::native_file_access::NativeFileAccessService::new(
+        crate::routes::public::native_file_access_router(state.clone()),
+        shutdown.clone(),
+    );
     tracing::info!(listen = %address, "ingress activation listener configured");
-    serve(service, listener, auth_layer, shutdown)
+    serve(service, files, listener, auth_layer, shutdown)
 }
 
 fn serve(
     service: ActivationService,
+    files: crate::native_file_access::NativeFileAccessService,
     listener: tokio::net::TcpListener,
     auth_layer: auth::NodeApiAuthLayer,
     shutdown: CancellationToken,
@@ -134,6 +141,7 @@ fn serve(
                     .max_decoding_message_size(1024)
                     .max_encoding_message_size(1024),
             )
+            .add_service(files.into_server())
             .serve_with_incoming_shutdown(
                 pplx_space_common_grpc::internal_transport::Incoming::new(
                     tonic::transport::server::TcpIncoming::from(listener).with_nodelay(Some(true)),
