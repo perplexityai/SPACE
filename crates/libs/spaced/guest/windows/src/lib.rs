@@ -1,6 +1,7 @@
 //! Native Windows guest implementation of the shared spaced bridge protocol.
 #![cfg(windows)]
 
+mod lifecycle;
 mod meta;
 mod service;
 mod transport;
