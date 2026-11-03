@@ -410,9 +410,10 @@ export class ListSelection {
   // - A bare array answering a paged list fails the load (`noteAnswer`); the
   //   rows and the Next of the page on screen are kept.
   // - A page answering a sampled list reads the first page with every filter,
-  //   since the sample request sent only the org. Only when that page answers
-  //   does the list switch to paging, and the page replaces the sample; until
-  //   then the sample stays, and the load fails.
+  //   since the sample request sent only the org. Only when that page answers,
+  //   for the filters chosen by then, does the list switch to paging, and the
+  //   page replaces the sample; until then the sample stays, and the load
+  //   fails.
   async load(scope: ListScope, read: (scope: ListScope) => Promise<SandboxListResponse>): Promise<ListLoad> {
     if (this.stopped) return this.stop();
     if (!sameScope(this.selected, scope)) return { kind: 'skipped' };
@@ -435,16 +436,26 @@ export class ListSelection {
     if (note.kind === 'mismatched') return this.fail(scope, new OlderFormatAnswer());
     if (response.mode === scope.mode) return this.show(scope, response);
     // A page answering a sampled list. The sample's ticket keeps the read
-    // valid only while the sample is still selected.
-    const firstPage = listScope('paged', this.filters, { limit: this.pageSize, cursor: '' });
-    const reread = await this.read(ticket, firstPage, read);
-    if (reread.kind !== 'answered') return reread;
-    const upgrade = this.noteAnswer('paged', reread.response.mode);
-    if (upgrade.kind === 'stopped') return upgrade;
-    if (upgrade.kind === 'mismatched') return this.fail(scope, new OlderFormatAnswer());
-    this.mode = 'paged';
-    this.position = FIRST_PAGE;
-    return this.show(firstPage, reread.response);
+    // valid only while the sample is still selected. That ticket survives a
+    // change of a filter the sample does not send, so a first page read for
+    // filters changed meanwhile is read again for the filters now chosen.
+    for (;;) {
+      const firstPage = this.firstPage();
+      const reread = await this.read(ticket, firstPage, read);
+      if (reread.kind !== 'answered') return reread;
+      const upgrade = this.noteAnswer('paged', reread.response.mode);
+      if (upgrade.kind === 'stopped') return upgrade;
+      if (upgrade.kind === 'mismatched') return this.fail(scope, new OlderFormatAnswer());
+      if (!sameScope(firstPage, this.firstPage())) continue;
+      this.mode = 'paged';
+      this.position = FIRST_PAGE;
+      return this.show(firstPage, reread.response);
+    }
+  }
+
+  // The first page with every filter, at the page size.
+  private firstPage(): ListScope {
+    return listScope('paged', this.filters, { limit: this.pageSize, cursor: '' });
   }
 
   // One read for `ticket`: its answer, or a failed or skipped load. A failure

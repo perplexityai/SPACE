@@ -503,6 +503,39 @@ test('a sampled list keeps its sample until a first page answers, through interl
   assert.equal(selection.nextCursor(), 'c1');
 });
 
+test('a filter changed while a sampled list reads its first page is read again before it switches', async () => {
+  const sizes = { pageSize: 50, sampleSize: 1000 };
+  const selection = newSelection({ template: 'alpha' });
+  await selection.load(selection.selected, reads(sampledAnswer, sample()).read);
+  const sampleScope = selection.selected;
+  // A poll of the sample answers a page, and the first page with alpha is
+  // read. Beta is chosen before it answers; the sample does not send the
+  // template, so the selected request is the same.
+  const alphaRow = { ...sandbox, id: 'sbx_01a19089-216f-751e-9f56-1906865f5c24', template: 'alpha' };
+  const betaRow = { ...sandbox, template: 'beta' };
+  const forAlpha = pendingRead();
+  const sent = [];
+  const answers = [page(null, []), forAlpha.read, page('c1', [betaRow])];
+  const inFlight = selection.load(sampleScope, async (scope) => {
+    sent.push(scope);
+    const answer = answers.shift();
+    return typeof answer === 'function' ? answer() : answer;
+  });
+  await new Promise((done) => setImmediate(done));
+  assert.equal(sent.length, 2);
+  assert.equal(selection.select({ filters: { ...NO_FILTERS, template: 'beta' }, ...sizes }), 'unchanged');
+  forAlpha.answer(page(null, [alphaRow]));
+  // Alpha's page is not shown under beta; beta's first page is read and shown.
+  const result = await inFlight;
+  assert.equal(result.kind, 'shown');
+  assert.deepEqual(sent.map((scope) => scope.filters.template), [null, 'alpha', 'beta']);
+  assert.equal(result.scope.filters.template, 'beta');
+  assert.deepEqual(result.response.sandboxes, [betaRow]);
+  assert.equal(selection.mode, 'paged');
+  assert.equal(sameScope(selection.shown, selection.selected), true);
+  assert.equal(selection.nextCursor(), 'c1');
+});
+
 test('a bare array after a filter change fails the load and clears the other scope\'s rows', async () => {
   const sizes = { pageSize: 50, sampleSize: 1000 };
   const orgA = { ...NO_FILTERS, org: '0193a000-0000-7000-8000-000000000001' };
