@@ -91,6 +91,28 @@ pub fn is_template_policy_dependency(status: &tonic::Status) -> bool {
         .is_some_and(|value| value == "true")
 }
 
+const MEMORY_POLICY_REFUSAL_METADATA: &str = "x-space-memory-policy-refusal";
+
+/// A declared cold-start memory size cannot be honored by this node's policy.
+pub fn memory_policy_refusal_status(requested_mib: u32, allowed_mib: u32) -> tonic::Status {
+    let mut status = tonic::Status::failed_precondition(format!(
+        "requested memory_mib {requested_mib} exceeds this node's allowed {allowed_mib} MiB"
+    ));
+    status.metadata_mut().insert(
+        MEMORY_POLICY_REFUSAL_METADATA,
+        tonic::metadata::MetadataValue::from_static("true"),
+    );
+    status
+}
+
+pub fn is_memory_policy_refusal(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::FailedPrecondition
+        && status
+            .metadata()
+            .get(MEMORY_POLICY_REFUSAL_METADATA)
+            .is_some_and(|value| value == "true")
+}
+
 pub const CLEANUP_REFUSAL_REASON_METADATA: &str = "x-space-cleanup-refusal-reason";
 pub const AUTHORITATIVE_ROUTE_IDENTITY_REQUIRED_METADATA: &str =
     "x-space-authoritative-route-identity-required";

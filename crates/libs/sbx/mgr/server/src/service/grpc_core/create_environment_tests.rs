@@ -1021,3 +1021,97 @@ async fn pool_adoption_moves_past_a_donor_taken_concurrently() {
         created.shutdown().await;
     }
 }
+
+/// A declared cold-start shape must fit both node and service memory policy.
+/// Omitted memory still uses the template/default policy, including clamping.
+#[tokio::test]
+async fn cold_start_refuses_oversized_memory_before_allocation() {
+    if !enter_isolated_test_process() {
+        return;
+    }
+    use pplx_space_node_mgr_client::proto::{
+        AllocateRequest, AllocateResponse, CleanupSandboxRequest, CleanupSandboxResponse,
+    };
+    for (requested, service_cap, rejected) in [
+        (Some(513), None, true),
+        (Some(512), None, false),
+        (Some(257), Some(256), true),
+        (Some(256), Some(256), false),
+        (Some(128), Some(256), false),
+        (None, None, false),
+        (Some(0), None, false),
+    ] {
+        let build = bound_template(&bound(&definition("e0")));
+        let node = node_manager(&definition("e0"), Node::Executes)
+            .unary("GetNetworkPoolStatus", |_: NetworkPoolStatusRequest| {
+                Ok(NetworkPoolStatusResponse {
+                    sandbox_cgroup_memory_mib: 640,
+                    sandbox_guest_memory_max_mib: 512,
+                    sandbox_memory_headroom_mib: 128,
+                    ..Default::default()
+                })
+            })
+            .unary("Allocate", |_: AllocateRequest| {
+                Err::<AllocateResponse, _>(Status::aborted("allocation sentinel"))
+            })
+            .unary("CleanupSandbox", |_: CleanupSandboxRequest| {
+                Ok(CleanupSandboxResponse::default())
+            });
+        let mut created = Created::new(crate::db::test_conn(), build.resolver(BUILD), node);
+        created.fixture.service.config.max_memory_mib = service_cap;
+        let sandbox_id = created
+            .fixture
+            .create(cold_request(CLUSTER_OWNED.1, None))
+            .await
+            .unwrap()
+            .sandbox_id;
+        let error = tokio::time::timeout(
+            CREATE_WAIT,
+            created.fixture.service.start_sandbox(
+                crate::proto::StartRequest {
+                    sandbox_id: sandbox_id.clone(),
+                    memory_mib: requested,
+                    ..Default::default()
+                },
+                false,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        let expected_code = if rejected {
+            tonic::Code::FailedPrecondition
+        } else if requested == Some(0) {
+            tonic::Code::InvalidArgument
+        } else {
+            tonic::Code::Aborted
+        };
+        assert_eq!(
+            error.code(),
+            expected_code,
+            "request={requested:?} cap={service_cap:?}: {error}"
+        );
+        let calls = created.fixture.node_manager.calls();
+        assert_eq!(
+            calls.iter().any(|call| call == "Allocate"),
+            !rejected && requested != Some(0)
+        );
+        assert!(!calls.iter().any(|call| call == "Launch"));
+        tokio::time::timeout(CREATE_WAIT, async {
+            while created
+                .fixture
+                .service
+                .activation_admission_limiter
+                .in_flight()
+                != 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed activation must release its admission permit");
+        let row = created.fixture.row(&sandbox_id).unwrap();
+        assert_ne!(row.state, SandboxState::Starting);
+        created.shutdown().await;
+    }
+}
