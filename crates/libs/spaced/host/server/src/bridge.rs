@@ -456,28 +456,38 @@ impl SpacedHostService {
         Ok(())
     }
 
-    fn log_guest_ready_snapshot(&self, snapshot: &GuestReadySnapshot, source: &'static str) {
-        tracing::debug!(
-            guest_uptime_secs = snapshot
-                .guest_uptime
-                .as_ref()
-                .map(|duration| duration.seconds),
-            guest_version = %snapshot.version,
-            guest_compatibility_family = %snapshot.compatibility_family,
-            source,
-            "spaced guest reported ready"
-        );
-    }
-
     fn record_lifecycle_ready_snapshot(&self, snapshot: GuestReadySnapshot) {
-        self.log_guest_ready_snapshot(&snapshot, "wait_ready");
         let previous = self
             .inner
             .guest_readiness
             .snapshot
             .send_replace(Some(snapshot.clone()));
+        let guest_uptime_secs = snapshot
+            .guest_uptime
+            .as_ref()
+            .map(|duration| duration.seconds);
+        // The first readiness after this spaced-host started or after its
+        // cached snapshot was cleared (a failed readiness probe, NotifyResume,
+        // PrepareSuspend) logs at info, naming the agent version under the
+        // sandbox id the log context carries and no metric may; revalidations
+        // of a cached snapshot stay at debug.
         if previous.is_none() {
+            tracing::info!(
+                guest_uptime_secs,
+                guest_version = %snapshot.version,
+                guest_compatibility_family = %snapshot.compatibility_family,
+                source = "wait_ready",
+                "spaced guest reported ready"
+            );
             worker_metrics::spaced_guest_ready(&snapshot.version);
+        } else {
+            tracing::debug!(
+                guest_uptime_secs,
+                guest_version = %snapshot.version,
+                guest_compatibility_family = %snapshot.compatibility_family,
+                source = "wait_ready",
+                "spaced guest reported ready"
+            );
         }
     }
 

@@ -228,6 +228,13 @@ pub enum SandboxEventType {
     GuestBridgeFailed,
     GuestReady,
     GuestReadyFailed,
+    /// The sandbox-manager watchdog's guest health became `degraded` while the
+    /// VM kept running, typically after consecutive failed guest probes. The
+    /// watchdog only observes; the sandbox lifecycle is unchanged.
+    GuestUnresponsive,
+    /// The watchdog's guest health returned to `healthy` after a
+    /// [`Self::GuestUnresponsive`].
+    GuestRecovered,
     NetworkPathStopped,
     FilesystemRemoved,
     NetworkAllocationCompleted,
@@ -358,6 +365,8 @@ pub const SANDBOX_EVENT_TYPES: &[SandboxEventType] = &[
     SandboxEventType::GuestBridgeFailed,
     SandboxEventType::GuestReady,
     SandboxEventType::GuestReadyFailed,
+    SandboxEventType::GuestUnresponsive,
+    SandboxEventType::GuestRecovered,
     SandboxEventType::NetworkPathStopped,
     SandboxEventType::FilesystemRemoved,
     SandboxEventType::NetworkAllocationCompleted,
@@ -490,6 +499,8 @@ impl SandboxEventType {
             Self::GuestBridgeFailed => "guest_bridge_failed",
             Self::GuestReady => "guest_ready",
             Self::GuestReadyFailed => "guest_ready_failed",
+            Self::GuestUnresponsive => "guest_unresponsive",
+            Self::GuestRecovered => "guest_recovered",
             Self::NetworkPathStopped => "network_path_stopped",
             Self::FilesystemRemoved => "filesystem_removed",
             Self::NetworkAllocationCompleted => "network_allocation_completed",
@@ -585,6 +596,7 @@ impl SandboxEventType {
             | Self::RuntimeActivated
             | Self::GuestBridgeReady
             | Self::GuestReady
+            | Self::GuestRecovered
             | Self::NetworkPathStopped
             | Self::FilesystemRemoved
             | Self::NetworkAllocationCompleted
@@ -629,6 +641,7 @@ impl SandboxEventType {
             | Self::MemoryAdmissionFailed
             | Self::GuestBridgeFailed
             | Self::GuestReadyFailed
+            | Self::GuestUnresponsive
             | Self::NetworkAllocationFailed
             | Self::NetworkReleaseFailed
             | Self::SandboxProcessLaunchFailed

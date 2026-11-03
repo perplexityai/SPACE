@@ -86,6 +86,8 @@ macro_rules! sandbox_event {
             guest_ip = detail_str(&$details.guest_ip),
             guest_gateway = detail_str(&$details.guest_gateway),
             guest_uptime_ms = detail_str(&$details.guest_uptime_ms),
+            spaced_version = detail_str(&$details.spaced_version),
+            consecutive_failures = detail_str(&$details.consecutive_failures),
             timeout_secs = detail_str(&$details.timeout_secs),
             snapshot_id = detail_str(&$details.snapshot_id),
             rows_affected = detail_str(&$details.rows_affected),

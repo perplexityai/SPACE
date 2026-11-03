@@ -212,6 +212,25 @@ fn net_gateway_cycle_events_have_domain_names_and_phases() {
 }
 
 #[test]
+fn guest_health_events_have_domain_names_and_phases() {
+    // The watchdog observes the guest agent; the names describe the guest, not
+    // the watchdog, whose identity lives in `source`.
+    assert_eq!(
+        SandboxEventType::GuestUnresponsive.as_str(),
+        "guest_unresponsive"
+    );
+    assert_eq!(
+        SandboxEventType::GuestUnresponsive.phase(),
+        SandboxEventPhase::Failed
+    );
+    assert_eq!(SandboxEventType::GuestRecovered.as_str(), "guest_recovered");
+    assert_eq!(
+        SandboxEventType::GuestRecovered.phase(),
+        SandboxEventPhase::Completed
+    );
+}
+
+#[test]
 fn sandbox_event_details_store_suspend_after_wake_delta() {
     let details = SandboxEventDetails::default().ms_since_wake("312");
 
@@ -347,11 +366,12 @@ fn sandbox_event_details_project_execution_metadata() {
     );
 }
 
-/// A detail reaches the event stream only if `emit_with` lists it. Setting it
-/// on the builder and reading it back exercises the setter and stops there, so
-/// capture what a subscriber is actually handed.
-#[test]
-fn network_policy_refresh_readiness_reaches_the_emitted_event() {
+/// The fields a subscriber is handed when `event_type` is emitted with
+/// `details`.
+fn emitted_fields(
+    event_type: SandboxEventType,
+    details: SandboxEventDetails,
+) -> Vec<(String, String)> {
     use pplx_space_common_core::types::SandboxId;
     use std::sync::{Arc, Mutex};
     use tracing_subscriber::layer::SubscriberExt;
@@ -384,26 +404,64 @@ fn network_policy_refresh_readiness_reaches_the_emitted_event() {
     let fields: Fields = Arc::new(Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::registry().with(CaptureLayer(Arc::clone(&fields)));
     tracing::subscriber::with_default(subscriber, || {
-        SandboxEvent::new(
-            SandboxId::new(),
-            SandboxEventType::NetworkPolicyRefreshCompleted,
-            SandboxEventSource::SbxManager,
-        )
-        .emit_with(
-            SandboxEventDetails::default()
-                .network_state("ready")
-                .interception_readiness("dependencies_not_ready"),
-        );
+        SandboxEvent::new(SandboxId::new(), event_type, SandboxEventSource::SbxManager)
+            .emit_with(details);
     });
+    fields.lock().unwrap().clone()
+}
 
-    let captured = fields.lock().unwrap();
-    let readiness = captured
+fn emitted_field(captured: &[(String, String)], name: &str) -> String {
+    captured
         .iter()
-        .find(|(name, _)| name == "interception_readiness")
-        .unwrap_or_else(|| panic!("no interception_readiness field in {captured:?}"));
+        .find(|(field, _)| field == name)
+        .unwrap_or_else(|| panic!("no {name} field in {captured:?}"))
+        .1
+        .clone()
+}
+
+/// A detail reaches the event stream only if `emit_with` lists it. Setting it
+/// on the builder and reading it back exercises the setter and stops there, so
+/// capture what a subscriber is actually handed.
+#[test]
+fn network_policy_refresh_readiness_reaches_the_emitted_event() {
+    let captured = emitted_fields(
+        SandboxEventType::NetworkPolicyRefreshCompleted,
+        SandboxEventDetails::default()
+            .network_state("ready")
+            .interception_readiness("dependencies_not_ready"),
+    );
+
+    let readiness = emitted_field(&captured, "interception_readiness");
     assert!(
-        readiness.1.contains("dependencies_not_ready"),
-        "interception_readiness carried {:?}",
-        readiness.1
+        readiness.contains("dependencies_not_ready"),
+        "interception_readiness carried {readiness:?}"
+    );
+}
+
+#[test]
+fn guest_ready_spaced_version_reaches_the_emitted_event() {
+    let captured = emitted_fields(
+        SandboxEventType::GuestReady,
+        SandboxEventDetails::default().spaced_version("0.1.2"),
+    );
+
+    let version = emitted_field(&captured, "spaced_version");
+    assert!(
+        version.contains("0.1.2"),
+        "spaced_version carried {version:?}"
+    );
+}
+
+#[test]
+fn guest_health_failure_count_reaches_the_emitted_event() {
+    let captured = emitted_fields(
+        SandboxEventType::GuestUnresponsive,
+        SandboxEventDetails::default().consecutive_failures("3"),
+    );
+
+    let failures = emitted_field(&captured, "consecutive_failures");
+    assert!(
+        failures.contains('3'),
+        "consecutive_failures carried {failures:?}"
     );
 }
