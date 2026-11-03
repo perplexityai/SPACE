@@ -9,15 +9,21 @@ Playwright is the optional `console` dependency group, imported only here,
 when a scenario runs or the runner probes for it. Without it, or without a
 browser it can launch, the bench lacks a capability; that is not a failure.
 The suite runner asks `browser_unavailable` once and skips every scenario
-that declares a browser, visibly, naming why. A scenario run by name without
-one is refused the same way, as a configuration error.
+that declares a browser, visibly, naming why, or fails the suite when the run
+requires them (SPACE_SMOKE_BROWSER_SCENARIOS=require). A scenario run by name
+without one is refused the same way, as a configuration error, before its
+fixture creates anything.
 
 Every page a scenario opens records the browser's console errors, uncaught
 page errors, failed requests and HTTP error answers. `BASELINE` names the ones
-the console produces by design, each with its reason; a scenario allows the
-failures its own probes cause (a lookup of a sandbox that does not exist
-answers 404) through `allow`; `expect_no_new_browser_errors` fails on
-anything else.
+the console produces by design, each with its reason; a probe expects the
+failures it causes itself (a lookup of a sandbox that does not exist answers
+404) only while it runs (`_expecting_missing`); `expect_no_new_browser_errors`
+fails on anything else.
+
+Playwright's sync API delivers those events only while one of its own calls
+runs, so every wait with a page open is the page's `wait_for_timeout`
+(`_wait`), never `time.sleep`.
 
 The scenarios create their own organizations, users and foreign-org
 sandboxes, under names unique to the run, and remove them in cleanup: the
@@ -30,7 +36,8 @@ from __future__ import annotations
 import re
 import time
 import uuid
-from collections.abc import Callable, Iterator, Mapping
+from collections import Counter
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -63,6 +70,11 @@ PAGE_TIMEOUT_MS = 20_000
 LIFECYCLE_TIMEOUT_SECONDS = 240.0
 # How long a cancelled confirmation is watched for a request it should never send.
 CANCEL_SETTLE_SECONDS = 3.0
+# How long the browser is given to report what it has seen before a judgement
+# that reads its events: an answer already on its way is then counted.
+BROWSER_SETTLE_SECONDS = 1.0
+# The rows the Operations card shows on its first page.
+OPERATIONS_PAGE_SIZE = 10
 
 # What the console shows when the page it was asked for did not resolve: a
 # detail page's not-found or load-failure state, Next.js's own 404 page, and
@@ -136,6 +148,31 @@ class Allowed:
         return event.kind == self.kind and re.search(self.pattern, f"{event.text} {event.url}") is not None
 
 
+@dataclass
+class Expected:
+    """A browser error a probe expects while it runs: events `start` up to `end`.
+
+    The indexes are into `ConsoleAssertions.events`; `end` is None until the
+    probe has finished, so the window is open while it runs.
+    """
+
+    allowed: Allowed
+    start: int
+    end: int | None = None
+
+    def covers(self, index: int, event: BrowserEvent) -> bool:
+        return self.start <= index and (self.end is None or index < self.end) and self.allowed.matches(event)
+
+
+@dataclass(frozen=True)
+class RecordedOperation:
+    """One row of a sandbox's Operations card: what the admin API records, or what the page shows."""
+
+    id: str
+    kind: str
+    state: str
+
+
 # The errors the console produces by design, each observed on a Kind run of
 # these scenarios. Anything else a page reports fails the scenario that
 # opened it.
@@ -198,6 +235,11 @@ class ConsoleSession:
     def open(self, path: str) -> None:
         self.page.goto(self._console.url + path, wait_until="domcontentloaded")
 
+    def leave(self) -> None:
+        """Navigate to a blank page, so the console's page stops polling the API."""
+
+        self.page.goto("about:blank")
+
     @property
     def path(self) -> str:
         return urlsplit(self.page.url).path
@@ -221,7 +263,8 @@ class ConsoleAssertions:
         self._browser: Browser | None = None
         self._operator: ConsoleSession | None = None
         self.events: list[BrowserEvent] = []
-        self._allowed: list[Allowed] = list(BASELINE)
+        self._expected: list[Expected] = []
+        self._sessions: list[ConsoleSession] = []
         self._names = 0
 
     # --- browser ----------------------------------------------------------
@@ -248,7 +291,15 @@ class ConsoleAssertions:
     def _new_session(self, label: str) -> ConsoleSession:
         context = self._launch().new_context(viewport={"width": 1600, "height": 1000})
         context.set_default_timeout(PAGE_TIMEOUT_MS)
-        self._scope.defer(f"close the {label} browser context", context.close)
+        opened: list[ConsoleSession] = []
+
+        def close() -> None:
+            # Cleanup's own waits (a foreign sandbox's deletion) outlive the pages.
+            for session in opened:
+                self._sessions.remove(session)
+            context.close()
+
+        self._scope.defer(f"close the {label} browser context", close)
         page = context.new_page()
         where = lambda: urlsplit(page.url).path or page.url  # noqa: E731 - evaluated per event
 
@@ -271,34 +322,75 @@ class ConsoleAssertions:
         page.on("pageerror", on_page_error)
         page.on("requestfailed", on_request_failed)
         page.on("response", on_response)
-        return ConsoleSession(self, page, label)
+        session = ConsoleSession(self, page, label)
+        opened.append(session)
+        self._sessions.append(session)
+        return session
 
-    def allow(self, kind: str, pattern: str, reason: str) -> None:
-        """Expect a browser error this scenario's own probe causes."""
+    def _wait(self, seconds: float) -> None:
+        """Wait `seconds`, delivering the browser's events meanwhile.
 
-        self._allowed.append(Allowed(kind, pattern, reason))
+        Playwright's sync API dispatches page events only inside its own
+        calls, and every page shares one connection: a page's
+        `wait_for_timeout` delivers the events of all of them, where
+        `time.sleep` would hold every console error, failed request and write
+        back until the next call. With no page open there is nothing to
+        deliver.
+        """
 
-    def allow_missing(self, path: str, reason: str) -> None:
-        """Expect the 404 a read of `path` answers, and Chromium's log line for it."""
+        pages = [session.page for session in self._sessions if not session.page.is_closed()]
+        if pages:
+            pages[-1].wait_for_timeout(seconds * 1000)
+        else:
+            time.sleep(seconds)
+
+    @contextmanager
+    def _expecting_missing(self, session: ConsoleSession, path: str, reason: str) -> Iterator[None]:
+        """Expect the 404 a read of `path` answers, and Chromium's log line for it, inside the block.
+
+        The block is one probe, within one phase. It starts once the
+        browser has reported what came before, and it ends by leaving the
+        page, whose polls would otherwise carry the 404 on into a later
+        phase. The same 404 outside the block still fails the scenario.
+        """
 
         escaped = re.escape(path)
-        self.allow("http", rf"^404 {escaped}(?:\?|$)", reason)
-        self.allow(
-            "console",
-            rf"^Failed to load resource: the server responded with a status of 404 .*{escaped}(?:\?|$)",
-            reason,
+        allowed = (
+            Allowed("http", rf"^404 {escaped}(?:\?|$)", reason),
+            Allowed(
+                "console",
+                rf"^Failed to load resource: the server responded with a status of 404 .*{escaped}(?:\?|$)",
+                reason,
+            ),
         )
+        self._wait(BROWSER_SETTLE_SECONDS)
+        expected = [Expected(entry, len(self.events)) for entry in allowed]
+        self._expected.extend(expected)
+        yield
+        session.leave()
+        for entry in expected:
+            entry.end = len(self.events)
+
+    def _excuse(self, index: int, event: BrowserEvent) -> str | None:
+        """Why the event is expected, or None when it is not."""
+
+        for allowed in BASELINE:
+            if allowed.matches(event):
+                return allowed.reason
+        for expected in self._expected:
+            if expected.covers(index, event):
+                return expected.allowed.reason
+        return None
 
     def unexpected_events(self) -> list[BrowserEvent]:
-        return [event for event in self.events if not any(allowed.matches(event) for allowed in self._allowed)]
+        return [event for index, event in enumerate(self.events) if self._excuse(index, event) is None]
 
     def _allowed_counts(self) -> dict[str, int]:
         counts: dict[str, int] = {}
-        for event in self.events:
-            for allowed in self._allowed:
-                if allowed.matches(event):
-                    counts[allowed.reason] = counts.get(allowed.reason, 0) + 1
-                    break
+        for index, event in enumerate(self.events):
+            reason = self._excuse(index, event)
+            if reason is not None:
+                counts[reason] = counts.get(reason, 0) + 1
         return counts
 
     def _evidence(self, session: ConsoleSession | None = None) -> Callable[[], Mapping[str, object]]:
@@ -484,7 +576,7 @@ class ConsoleAssertions:
                 return observed
             if observed is not None and observed.get("status") == "failed":
                 break
-            time.sleep(1)
+            self._wait(1)
         self._fixture.verify(
             False,
             f"the sandbox did not reach {status} in the admin API",
@@ -500,7 +592,7 @@ class ConsoleAssertions:
             observed = self.admin_sandbox(sandbox_id)
             if observed is None or observed.get("status") == "deleted":
                 return True
-            time.sleep(1)
+            self._wait(1)
         return False
 
     def _force_delete(self, sandbox_id: str) -> None:
@@ -608,7 +700,7 @@ class ConsoleAssertions:
             hrefs = [row.locator("a").first.get_attribute("href") for row in rows.all()]
             if hrefs == [target]:
                 break
-            time.sleep(0.5)
+            self._wait(0.5)
         self._fixture.verify(
             hrefs == [target],
             f"the sandbox list's search did not find exactly the sandbox by its {form}",
@@ -622,30 +714,32 @@ class ConsoleAssertions:
         """Control: a well-formed ID of no sandbox is not found, by both routes."""
 
         missing = f"sbx_{uuid.uuid4()}"
-        self.allow_missing(f"/admin/api/v1/sandboxes/{missing}", "the control looks up a sandbox that does not exist")
-        session.open(f"/dashboard/sandboxes/{missing}")
-        shown = self._visible(session.page.get_by_text("Sandbox not found", exact=True).first)
-        self._fixture.verify(
-            shown,
-            "the detail route did not report a sandbox ID that names no sandbox as not found",
-            console_missing_id=missing,
-            failure_evidence=self._evidence(session),
-        )
-        session.open("/dashboard/sandboxes")
-        session.page.get_by_placeholder("ID, pod name or name").fill(missing)
-        warned = self._visible(session.page.get_by_text(f"{missing}:", exact=False).first)
-        rows = session.page.locator(".ant-table-tbody tr.ant-table-row").count()
-        self._fixture.verify(
-            warned and rows == 0,
-            "the sandbox list's search did not report a sandbox ID that names no sandbox",
-            console_missing_id=missing,
-            console_search_rows=rows,
-            failure_evidence=self._evidence(session),
-        )
+        with self._expecting_missing(
+            session, f"/admin/api/v1/sandboxes/{missing}", "the control looks up a sandbox that does not exist"
+        ):
+            session.open(f"/dashboard/sandboxes/{missing}")
+            shown = self._visible(session.page.get_by_text("Sandbox not found", exact=True).first)
+            self._fixture.verify(
+                shown,
+                "the detail route did not report a sandbox ID that names no sandbox as not found",
+                console_missing_id=missing,
+                failure_evidence=self._evidence(session),
+            )
+            session.open("/dashboard/sandboxes")
+            session.page.get_by_placeholder("ID, pod name or name").fill(missing)
+            warned = self._visible(session.page.get_by_text(f"{missing}:", exact=False).first)
+            rows = session.page.locator(".ant-table-tbody tr.ant-table-row").count()
+            self._fixture.verify(
+                warned and rows == 0,
+                "the sandbox list's search did not report a sandbox ID that names no sandbox",
+                console_missing_id=missing,
+                console_search_rows=rows,
+                failure_evidence=self._evidence(session),
+            )
 
     # --- detail completeness ---------------------------------------------------
 
-    def expect_detail_complete(self, session: ConsoleSession, sandbox_id: str, state: str) -> None:
+    def expect_detail_complete(self, session: ConsoleSession, sandbox_id: str, state: str) -> list[RecordedOperation]:
         """The detail page shows what the admin API knows of the sandbox in `state`.
 
         `state` is the admin API's lifecycle state: a running sandbox is `started`.
@@ -654,7 +748,9 @@ class ConsoleAssertions:
         node (or `unassigned` without one), organization by name and owner by
         email, each linking to its page; the Controls card enables exactly the
         lifecycle moves valid from that state; the Operations card lists every
-        operation the admin API records against it.
+        operation the admin API records against it. Returns those operations.
+        The page is left at the end: its polls would otherwise read the
+        sandbox while the next phase changes it.
         """
 
         public_id = public_sandbox_id(sandbox_id)
@@ -689,7 +785,7 @@ class ConsoleAssertions:
                 text = cell.inner_text() if cell.count() else ""
                 if expected in text:
                     break
-                time.sleep(0.5)
+                self._wait(0.5)
             shown_fields[label] = text
         links = {
             "Org": self._description(session, "Org").locator("a").first.get_attribute("href"),
@@ -720,35 +816,66 @@ class ConsoleAssertions:
             console_expected_moves=expected_moves,
             failure_evidence=self._evidence(session),
         )
-        self.expect_operations_listed(session, public_id, record.get("org_id"))
+        operations = self.expect_operations_listed(session, public_id, record.get("org_id"))
+        session.leave()
+        return operations
 
-    def expect_operations_listed(self, session: ConsoleSession, public_id: str, org_id: object) -> list[str]:
-        """The page's Operations card lists every operation the admin API records for the sandbox."""
+    def recorded_operations(self, public_id: str, org_id: object) -> list[RecordedOperation]:
+        """Every operation the admin API records against the sandbox, as its page reads them.
 
-        query = f"target_type=sandbox&target_id={public_id}&limit=50"
-        if isinstance(org_id, str):
-            query += f"&org_id={org_id}"
-        recorded = self._api("GET", f"/admin/api/v1/operations?{query}")
-        kinds = sorted({str(op["kind"]) for op in recorded if isinstance(op, dict)}) if isinstance(recorded, list) else []
+        By its `sbx_` ID and by its bare UUID, which a fork names its source by.
+        """
+
+        operations: list[RecordedOperation] = []
+        for target in (public_id, public_id.removeprefix("sbx_")):
+            query = f"target_type=sandbox&target_id={target}&limit=50"
+            if isinstance(org_id, str):
+                query += f"&org_id={org_id}"
+            recorded = self._api("GET", f"/admin/api/v1/operations?{query}")
+            if not isinstance(recorded, list):
+                raise SmokeConfigurationError("the admin operations read answered no list")
+            operations.extend(
+                RecordedOperation(str(op["id"]), str(op["kind"]), str(op["state"]))
+                for op in recorded
+                if isinstance(op, dict)
+            )
+        if len(operations) > OPERATIONS_PAGE_SIZE:
+            raise SmokeConfigurationError(
+                f"the sandbox has {len(operations)} operations, more than the Operations card's first page shows"
+            )
+        return operations
+
+    def expect_operations_listed(self, session: ConsoleSession, public_id: str, org_id: object) -> list[RecordedOperation]:
+        """The page's Operations card shows each operation the admin API records for the sandbox, once.
+
+        Row by row: its ID (the row key), kind and state, as many times as
+        the API records it, so a page that drops or repeats one record of a
+        kind it shows again fails. Both are read until they agree, since an
+        operation can finish between the reads. Returns the API's records.
+        """
+
         card = session.page.locator(".ant-card", has=session.page.locator(".ant-card-head-title", has_text="Operations"))
-        shown: list[str] = []
+        recorded: list[RecordedOperation] = []
+        shown: list[RecordedOperation] = []
         empty = False
         deadline = time.monotonic() + PAGE_TIMEOUT_MS / 1000
-        while time.monotonic() < deadline:
-            shown = sorted(set(card.locator("td code").all_inner_texts()))
+        while True:
+            recorded = self.recorded_operations(public_id, org_id)
+            shown = _shown_operations(card)
             empty = card.get_by_text("No operations recorded", exact=True).count() > 0
-            if (kinds and all(kind in shown for kind in kinds)) or (not kinds and empty):
+            listed = operations_match(recorded, shown) and (bool(recorded) or empty)
+            if listed or time.monotonic() >= deadline:
                 break
-            time.sleep(0.5)
+            self._wait(0.5)
         self._fixture.verify(
-            all(kind in shown for kind in kinds) if kinds else empty,
+            listed,
             "the sandbox's page does not list the operations the admin API records for it",
-            console_recorded_operation_kinds=kinds,
-            console_shown_operation_kinds=shown,
+            console_recorded_operations=[vars(op) for op in recorded],
+            console_shown_operations=[vars(op) for op in shown],
             console_operations_empty_state=empty,
             failure_evidence=self._evidence(session),
         )
-        return kinds
+        return recorded
 
     def force_action(self, sandbox_id: str, action: str, state: str) -> None:
         """An operator's admin force action, awaited until the sandbox is in `state`.
@@ -778,28 +905,30 @@ class ConsoleAssertions:
         )
         record = self.admin_sandbox(public_id)
         if record is None:
-            self.allow_missing(f"/admin/api/v1/sandboxes/{public_id}", "the page reads the deleted sandbox's row, which is gone")
-            session.open(f"/dashboard/sandboxes/{public_id}")
-            gone = self._visible(session.page.get_by_text("Sandbox not found", exact=True).first)
-            history = self._visible(session.page.get_by_text("lifecycle operations are still recorded", exact=False).first)
-            self._fixture.verify(
-                gone and history,
-                "the deleted sandbox's page does not say it is gone and keep its history",
-                console_gone_shown=gone,
-                console_history_shown=history,
-                failure_evidence=self._evidence(session),
-            )
-            kinds = self.expect_operations_listed(session, public_id, None)
+            with self._expecting_missing(
+                session, f"/admin/api/v1/sandboxes/{public_id}", "the page reads the deleted sandbox's row, which is gone"
+            ):
+                session.open(f"/dashboard/sandboxes/{public_id}")
+                gone = self._visible(session.page.get_by_text("Sandbox not found", exact=True).first)
+                history = self._visible(session.page.get_by_text("lifecycle operations are still recorded", exact=False).first)
+                self._fixture.verify(
+                    gone and history,
+                    "the deleted sandbox's page does not say it is gone and keep its history",
+                    console_gone_shown=gone,
+                    console_history_shown=history,
+                    failure_evidence=self._evidence(session),
+                )
+                operations = self.expect_operations_listed(session, public_id, None)
         else:
             session.open(f"/dashboard/sandboxes/{public_id}")
             self.expect_page_resolved(session, f"/dashboard/sandboxes/{public_id}", shows=public_id, what="the deleted sandbox's page")
             shown = self._visible(session.page.locator(".ant-tag", has_text=re.compile(r"^deleted$")).first)
             self._fixture.verify(shown, "the deleted sandbox's page does not show it deleted", failure_evidence=self._evidence(session))
-            kinds = self.expect_operations_listed(session, public_id, record.get("org_id"))
+            operations = self.expect_operations_listed(session, public_id, record.get("org_id"))
         self._fixture.verify(
-            bool(kinds),
+            bool(operations),
             "the admin API records no operation for the deleted sandbox, so its page has no history to show",
-            console_recorded_operation_kinds=kinds,
+            console_recorded_operations=[vars(op) for op in operations],
         )
 
     # --- cross-org action ---------------------------------------------------------
@@ -856,7 +985,7 @@ class ConsoleAssertions:
         )
         cancel.click()
         closed = self._hidden(dialog)
-        time.sleep(CANCEL_SETTLE_SECONDS)
+        self._wait(CANCEL_SETTLE_SECONDS)
         sent = session.writes[before:]
         self._fixture.verify(
             closed and not sent,
@@ -929,7 +1058,7 @@ class ConsoleAssertions:
             current = self._api("GET", f"/admin/api/v1/users/{account.user_id}")
             if current.get("role") == role:
                 break
-            time.sleep(0.5)
+            self._wait(0.5)
         self._fixture.verify(
             current.get("role") == role,
             "the confirmed role change did not change the role",
@@ -1078,6 +1207,9 @@ class ConsoleAssertions:
     def expect_no_new_browser_errors(self) -> None:
         """No page reported an error outside the baseline and this scenario's own probes."""
 
+        # The last write's answer may still be on its way to the page.
+        if self._sessions:
+            self._wait(BROWSER_SETTLE_SECONDS)
         unexpected = self.unexpected_events()
         self._fixture.record("console_browser_errors_allowed", self._allowed_counts())
         self._fixture.verify(
@@ -1109,6 +1241,25 @@ def _button(scope: Locator, label: str) -> Locator:
     """The button whose text is `label`; its accessible name also carries its icon's."""
 
     return scope.locator("button", has_text=re.compile(rf"^\s*{re.escape(label)}\s*$")).first
+
+
+def _shown_operations(card: Locator) -> list[RecordedOperation]:
+    """The Operations card's rows: each row's key is its operation's ID."""
+
+    rows = card.locator(".ant-table-tbody tr.ant-table-row").evaluate_all(
+        """rows => rows.map(row => [
+            row.getAttribute('data-row-key') || '',
+            (row.cells[1] && row.cells[1].innerText || '').trim(),
+            (row.cells[2] && row.cells[2].innerText || '').trim(),
+        ])"""
+    )
+    return [RecordedOperation(str(key), str(kind), str(state)) for key, kind, state in rows]
+
+
+def operations_match(recorded: Sequence[RecordedOperation], shown: Sequence[RecordedOperation]) -> bool:
+    """The page shows exactly the recorded operations, each as often as recorded."""
+
+    return Counter(recorded) == Counter(shown)
 
 
 def public_sandbox_id(sandbox_id: str) -> str:

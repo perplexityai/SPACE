@@ -1,4 +1,4 @@
-"""The runner's selection of the scenarios that drive a browser."""
+"""The runner's browser selection and the console adapter's own judgement rules."""
 
 from __future__ import annotations
 
@@ -8,7 +8,15 @@ from unittest import mock
 
 import pytest
 
+from space_smoke import console as console_module
 from space_smoke.__main__ import _run_all
+from space_smoke.console import (
+    BrowserEvent,
+    ConsoleAssertions,
+    ConsoleSession,
+    RecordedOperation,
+    operations_match,
+)
 from space_smoke.registry import ScenarioRegistry
 from space_smoke.runtime import ResourceScope, ScenarioContext, SmokeConfigurationError
 from space_smoke.scenarios import REGISTRY
@@ -149,3 +157,98 @@ def test_a_scenario_run_by_name_without_its_browser_creates_no_fixture():
     with pytest.raises(SmokeConfigurationError, match="needs a chromium browser"):
         scenario.run(ScenarioContext(ResourceScope(), {}), services)
     services.fixture.assert_not_called()
+
+
+# --- console.py ---------------------------------------------------------------
+
+
+class _Page:
+    def __init__(self) -> None:
+        self.url = "about:blank"
+        self.waits: list[float] = []
+        self.visits: list[str] = []
+        self.handlers: dict[str, object] = {}
+
+    def on(self, event: str, handler: object) -> None:
+        self.handlers[event] = handler
+
+    def is_closed(self) -> bool:
+        return False
+
+    def wait_for_timeout(self, milliseconds: float) -> None:
+        self.waits.append(milliseconds)
+
+    def goto(self, url: str, **_: object) -> None:
+        self.visits.append(url)
+
+
+def _console() -> tuple[ConsoleAssertions, ConsoleSession, _Page]:
+    control = mock.Mock()
+    control.console_url.return_value = "http://127.0.0.1:3000"
+    console = ConsoleAssertions(mock.Mock(), control, ResourceScope())
+    page = _Page()
+    session = ConsoleSession(console, page, "operator")  # type: ignore[arg-type]
+    console._sessions.append(session)
+    return console, session, page
+
+
+def _not_found(path: str) -> BrowserEvent:
+    return BrowserEvent("http", "404", path, path)
+
+
+def test_an_expected_404_is_excused_only_inside_its_probe():
+    console, session, page = _console()
+    path = "/admin/api/v1/sandboxes/sbx_00000000-0000-4000-8000-000000000001"
+    before, during, after = _not_found(path), _not_found(path), _not_found(path)
+    console.events.append(before)
+    with console._expecting_missing(session, path, "the probe reads a sandbox that is gone"):
+        console.events.append(during)
+    # Leaving the page ends the probe, so its polls cannot outlive it.
+    assert page.visits == ["about:blank"]
+    console.events.append(after)
+    assert console.unexpected_events() == [before, after]
+    assert console._allowed_counts() == {"the probe reads a sandbox that is gone": 1}
+
+
+def test_the_baseline_is_excused_in_every_phase():
+    console, _, _ = _console()
+    snapshots = _not_found("/api/v1/sandboxes/sbx_00000000-0000-4000-8000-000000000001/snapshots")
+    console.events.append(snapshots)
+    assert console.unexpected_events() == []
+
+
+def test_waits_with_a_page_open_deliver_the_browsers_events():
+    console, _, page = _console()
+    with mock.patch.object(console_module.time, "sleep") as sleep:
+        console._wait(console_module.CANCEL_SETTLE_SECONDS)
+    sleep.assert_not_called()
+    assert page.waits == [console_module.CANCEL_SETTLE_SECONDS * 1000]
+
+
+def test_waits_without_an_open_page_sleep():
+    console, _, _ = _console()
+    console._sessions.clear()
+    with mock.patch.object(console_module.time, "sleep") as sleep:
+        console._wait(0.5)
+    sleep.assert_called_once_with(0.5)
+
+
+def _operation(identifier: str, kind: str, state: str = "succeeded") -> RecordedOperation:
+    return RecordedOperation(identifier, kind, state)
+
+
+def test_operations_match_each_record_by_id_and_rendered_fields():
+    recorded = [
+        _operation("op-1", "create_sandbox"),
+        _operation("op-2", "suspend_sandbox"),
+        _operation("op-3", "restore_sandbox"),
+        _operation("op-4", "suspend_sandbox"),
+    ]
+    assert operations_match(recorded, list(reversed(recorded)))
+    # One of two records of a kind dropped: every kind is still shown.
+    assert not operations_match(recorded, recorded[:-1])
+    # One record shown twice in place of another of its kind.
+    assert not operations_match(recorded, [*recorded[:-1], recorded[1]])
+    # A record shown in a state the API no longer reports.
+    assert not operations_match(recorded, [*recorded[:-1], _operation("op-4", "suspend_sandbox", "running")])
+    assert operations_match([], [])
