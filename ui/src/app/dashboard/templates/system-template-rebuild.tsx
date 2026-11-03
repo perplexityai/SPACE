@@ -71,30 +71,15 @@ const exclusive = <T,>(name: string, work: () => T): Promise<T> => exclusiveWith
 const digest = (hash: string | null | undefined) => <code>{shortHash(hash, 'none')}</code>;
 
 // A build attempt "Start a new build" replaced, which may still publish a
-// release of its own.
+// release of its own. Later answers of its key are listed, never read as its
+// outcome.
 function RetiredAttempt({ template, attempt }: { template: SystemTemplate; attempt: RetiredBuild }) {
-  const job = attempt.jobId ? <> job <Text code copyable>{attempt.jobId}</Text></> : null;
-  const where = (
-    <>
-      see <a href="#template-releases">Template Releases</a> below, and the {template} row&apos;s builds in the Templates
-      table above.
-    </>
-  );
-  const label = `Earlier attempt ${attempt.generation + 1}`;
-  if (attempt.outcome === 'not-started') {
-    return <Text type="secondary">{label} was not started{attempt.detail ? `: ${attempt.detail}` : ''}.</Text>;
-  }
-  if (attempt.outcome === 'started') {
-    return (
-      <Text type="warning">
-        {label} started{job}, which publishes a release of its own when it finishes: {where}
-      </Text>
-    );
-  }
   return (
     <Text type="warning">
-      {label}{job ? <>,{job},</> : null} has an unknown outcome{attempt.detail ? ` (${attempt.detail})` : ''}: it may still be
-      running and publish a release of its own; {where}
+      Earlier attempt {attempt.generation + 1}{attempt.jobId ? <>, job <Text code copyable>{attempt.jobId}</Text>,</> : null} has an
+      unknown outcome: it may still be running and publish a release of its own; see{' '}
+      <a href="#template-releases">Template Releases</a> below, and the {template} row&apos;s builds in the Templates table
+      above.{attempt.notes.length ? ` Since then, ${attempt.notes.join('; ')}.` : ''}
     </Text>
   );
 }

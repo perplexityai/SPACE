@@ -37,19 +37,18 @@ export interface Promotion {
   confirmedAt: string;
 }
 
-// A build attempt "Start a new build" replaced: the key generation it sent,
-// the job the API named for it, if any, and what is known of its outcome. It
-// may still be running and publish a release of its own, so the panel keeps
-// showing it. A request of that generation that answers later is recorded
-// here, not as the run's build (`acceptJob`, `applySubmitFailure`).
+// A build attempt "Start a new build" replaced, which is offered only while
+// its outcome is unknown: the key generation it sent and the job the API
+// named for it, if any. It may still be running and publish a release of its
+// own, so the panel keeps showing it, and nothing changes that: a request of
+// that generation that answers later (`acceptJob`, `applySubmitFailure`) is
+// only noted. A later refusal says nothing about the first request, since the
+// API checks authorization and the request before it replays the key.
 export interface RetiredBuild {
   generation: number;
   jobId: string | null;
-  // `unknown`: it may have started; `started`: a late answer named its job;
-  // `not-started`: a late answer refused it.
-  outcome: 'unknown' | 'started' | 'not-started';
-  // The API's message for a late refusal or failure.
-  detail: string | null;
+  // What later answers of this generation said, oldest first.
+  notes: string[];
 }
 
 export interface TestSandbox {
@@ -182,9 +181,12 @@ export function acceptJob(
 ): AcceptedJob {
   if (!stored || stored.runId !== runId) return { kind: 'gone' };
   if (generation !== buildKeyGeneration(stored, template)) {
-    return { kind: 'obsolete', run: withRetiredOutcome(stored, template, generation, { outcome: 'started', jobId: job.job_id, detail: null }) };
+    return { kind: 'obsolete', run: withRetiredNote(stored, template, generation, `a later request of this attempt answered with job ${job.job_id}`) };
   }
   const existing = jobOf(stored, template);
+  // The same job is a replay of the key (another tab sent this generation
+  // too): the build this run already follows.
+  if (existing?.job_id === job.job_id) return { kind: 'recorded', run: stored };
   if (existing) return { kind: 'extra', existing };
   const { [template]: _dropped, ...submitUnknown } = stored.submitUnknown;
   const { [template]: _closed, ...keyClosed } = stored.keyClosed ?? {};
@@ -296,7 +298,6 @@ export function withNewBuildKey(run: RebuildRun, template: SystemTemplate): Rebu
   const { [template]: closed, ...keyClosed } = run.keyClosed ?? {};
   const { [template]: _unknown, ...submitUnknown } = run.submitUnknown;
   const generation = buildKeyGeneration(run, template);
-  const retired = retiredBuilds(run, template).filter((attempt) => attempt.generation !== generation);
   return {
     ...run,
     submitUnknown,
@@ -304,52 +305,35 @@ export function withNewBuildKey(run: RebuildRun, template: SystemTemplate): Rebu
     keyGeneration: { ...run.keyGeneration, [template]: generation + 1 },
     retiredBuilds: {
       ...run.retiredBuilds,
-      [template]: [...retired, { generation, jobId: closed?.jobId ?? null, outcome: 'unknown', detail: null }],
+      [template]: [...retiredBuilds(run, template), { generation, jobId: closed?.jobId ?? null, notes: [] }],
     },
   };
 }
 
-// A late answer for a retired attempt. A started job is never downgraded: a
-// later answer of the same key cannot undo it.
-function withRetiredOutcome(
-  run: RebuildRun,
-  template: SystemTemplate,
-  generation: number,
-  answer: Omit<RetiredBuild, 'generation'>,
-): RebuildRun {
-  const attempts = retiredBuilds(run, template);
-  const earlier = attempts.find((attempt) => attempt.generation === generation);
-  const next: RetiredBuild = earlier?.outcome === 'started'
-    ? earlier
-    : { generation, jobId: answer.jobId ?? earlier?.jobId ?? null, outcome: answer.outcome, detail: answer.detail };
-  const others = attempts.filter((attempt) => attempt.generation !== generation);
-  return {
-    ...run,
-    retiredBuilds: { ...run.retiredBuilds, [template]: [...others, next].sort((a, b) => a.generation - b.generation) },
-  };
+// A late answer for a retired attempt, noted once on it. An answer of a
+// generation that was never retired here is dropped.
+function withRetiredNote(run: RebuildRun, template: SystemTemplate, generation: number, note: string): RebuildRun {
+  const attempts = retiredBuilds(run, template).map((attempt) => (attempt.generation === generation && !attempt.notes.includes(note)
+    ? { ...attempt, notes: [...attempt.notes, note] }
+    : attempt));
+  return { ...run, retiredBuilds: { ...run.retiredBuilds, [template]: attempts } };
 }
 
 // A build request that failed, sent with key `generation`. For the current
 // generation it records the unknown outcome and a closed key, unless the run
 // already has a job; a refusal (`known`) records nothing and `current` says
-// the tab should show it. For a retired generation it updates that attempt.
+// the tab should show it. For a retired generation it is noted on that
+// attempt (`lateNote`).
 export function applySubmitFailure(
   stored: RebuildRun | null,
   runId: string,
   template: SystemTemplate,
   generation: number,
-  failure: { known: boolean; text: string; closed?: { jobId: string | null }; detail: string },
+  failure: { known: boolean; text: string; closed?: { jobId: string | null }; lateNote: string },
 ): { run: RebuildRun | null; current: boolean } {
   if (!stored || stored.runId !== runId) return { run: null, current: true };
   if (generation !== buildKeyGeneration(stored, template)) {
-    return {
-      run: withRetiredOutcome(stored, template, generation, {
-        outcome: failure.known ? 'not-started' : 'unknown',
-        jobId: failure.closed?.jobId ?? null,
-        detail: failure.detail,
-      }),
-      current: false,
-    };
+    return { run: withRetiredNote(stored, template, generation, failure.lateNote), current: false };
   }
   if (failure.known || jobOf(stored, template)) return { run: null, current: true };
   return {
@@ -379,30 +363,32 @@ function sameKeyConflict(err: unknown): { retryable: boolean; jobId: string | nu
   return { retryable: retryable !== false, jobId: value('job_id') };
 }
 
-// `detail` is the API's message alone, for a retired attempt's row.
+// `lateNote` is what a retired attempt's row notes when this answers a
+// request of its generation.
 export function submitFailureText(
   template: SystemTemplate,
   err: unknown,
-): { known: boolean; text: string; detail: string; closed?: { jobId: string | null } } {
+): { known: boolean; text: string; lateNote: string; closed?: { jobId: string | null } } {
   const { status, message } = failure(err);
-    const conflict = status === 409 ? sameKeyConflict(err) : null;
+  const conflict = status === 409 ? sameKeyConflict(err) : null;
+  const answered = `a later request of this attempt ${refused(status) && !conflict ? 'was refused' : 'failed'} (${status ?? 'no response'}): ${message}`;
   if (conflict && conflict.retryable) {
-    return { known: false, detail: message, text: `The ${template} build may still be being submitted; build again shortly: ${message}` };
+    return { known: false, lateNote: answered, text: `The ${template} build may still be being submitted; build again shortly: ${message}` };
   }
   if (conflict) {
     return {
       known: false,
-      detail: message,
+      lateNote: `a later request of this attempt answered that its outcome is unknown${conflict.jobId ? ` (job ${conflict.jobId})` : ''}: ${message}`,
       closed: { jobId: conflict.jobId },
       text: `The ${template} build sent earlier has an unknown outcome: it may have started and may still be running` +
         `${conflict.jobId ? ` as job ${conflict.jobId}` : ''}. Building again with the same request answers the same. ` +
         'Check Template Releases and the template\'s builds; start a new build only if neither shows it.',
     };
   }
-  if (refused(status)) return { known: true, detail: message, text: `The ${template} build was not started: ${message}` };
+  if (refused(status)) return { known: true, lateNote: answered, text: `The ${template} build was not started: ${message}` };
   return {
     known: false,
-    detail: message,
+    lateNote: answered,
     text: `The ${template} build request failed (${message}), and the builder may have accepted it. An accepted build ` +
       'appears in Template Releases only when it finishes. Building again resends the same Idempotency-Key: an API ' +
       'release that recorded the first build answers with it, one that could not tell whether the builder took it ' +
@@ -558,8 +544,7 @@ function isRetiredBuild(v: unknown): v is RetiredBuild {
   return isObject(v)
     && Number.isInteger(v.generation) && (v.generation as number) >= 0
     && (v.jobId === null || (typeof v.jobId === 'string' && v.jobId.length > 0))
-    && (v.outcome === 'unknown' || v.outcome === 'started' || v.outcome === 'not-started')
-    && (v.detail === null || typeof v.detail === 'string');
+    && Array.isArray(v.notes) && v.notes.every((note) => typeof note === 'string');
 }
 
 function isPromotion(v: unknown): v is Promotion {
