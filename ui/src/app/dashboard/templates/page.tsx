@@ -628,7 +628,7 @@ export default function TemplatesPage() {
   const [retagModal, setRetagModal] = useState<{ open: boolean; release: TemplateRelease | null } & RetagBaseline>({
     open: false,
     release: null,
-    holders: {},
+    holders: new Map(),
     change: null,
   });
   // A second OK while the move is in flight would send the same precondition
@@ -970,7 +970,7 @@ export default function TemplatesPage() {
 
   const closeRetagModal = () => {
     retagSession.current += 1;
-    setRetagModal({ open: false, release: null, holders: {}, change: null });
+    setRetagModal({ open: false, release: null, holders: new Map(), change: null });
     retagForm.resetFields();
   };
 

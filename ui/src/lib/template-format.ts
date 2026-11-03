@@ -17,16 +17,19 @@ export function errorMessage(err: unknown): string {
 // Which release holds each of a template's tags, from one read of the
 // releases: tags are per template, across runtimes. A tag dialog keeps this
 // from when it opened, so a background refresh cannot change the precondition
-// the operator confirmed (see `moveReleaseTag`).
+// the operator confirmed (see `moveReleaseTag`). A `Map`, because any string
+// is a valid tag: on a plain object, `__proto__` would set the prototype.
+export type TagHolders = ReadonlyMap<string, string>;
+
 export function tagHolders(
   releases: { id: string; template_name: string; tags: string[] }[],
   templateName: string,
-): Record<string, string> {
-  const holders: Record<string, string> = {};
+): TagHolders {
+  const holders = new Map<string, string>();
   for (const release of releases) {
     if (release.template_name !== templateName) continue;
     for (const tag of release.tags) {
-      if (!Object.hasOwn(holders, tag)) holders[tag] = release.id;
+      if (!holders.has(tag)) holders.set(tag, release.id);
     }
   }
   return holders;
@@ -34,8 +37,8 @@ export function tagHolders(
 
 // The release `holders` names for `tag`; `null` when none held it, which, as
 // the tag route's `expected_current_release_id`, asks that the tag not exist.
-export function tagHolder(holders: Record<string, string>, tag: string): string | null {
-  return Object.hasOwn(holders, tag) ? holders[tag] : null;
+export function tagHolder(holders: TagHolders, tag: string): string | null {
+  return holders.get(tag) ?? null;
 }
 
 export function currentTagHolder(
@@ -48,8 +51,8 @@ export function currentTagHolder(
 
 // How `tag` moved between two reads, or null when it did not.
 export function tagHolderChange(
-  before: Record<string, string>,
-  after: Record<string, string>,
+  before: TagHolders,
+  after: TagHolders,
   tag: string,
 ): { from: string | null; to: string | null } | null {
   const from = tagHolder(before, tag);
@@ -60,7 +63,7 @@ export function tagHolderChange(
 // The tag holders a retag dialog sends as preconditions: those it opened
 // with, except a tag whose move it has shown (`change`).
 export interface RetagBaseline {
-  holders: Record<string, string>;
+  holders: TagHolders;
   change: { tag: string; from: string | null; to: string | null } | null;
 }
 
@@ -73,14 +76,14 @@ export interface RetagBaseline {
 // overwriting that move.
 export function retagStep(
   baseline: RetagBaseline,
-  holdersNow: Record<string, string>,
+  holdersNow: TagHolders,
   tag: string,
 ): { kind: 'warn'; baseline: RetagBaseline } | { kind: 'move'; expected: string | null } {
   const change = tagHolderChange(baseline.holders, holdersNow, tag);
   if (!change) return { kind: 'move', expected: tagHolder(baseline.holders, tag) };
-  const holders = { ...baseline.holders };
-  if (change.to === null) delete holders[tag];
-  else holders[tag] = change.to;
+  const holders = new Map(baseline.holders);
+  if (change.to === null) holders.delete(tag);
+  else holders.set(tag, change.to);
   return { kind: 'warn', baseline: { holders, change: { tag, ...change } } };
 }
 

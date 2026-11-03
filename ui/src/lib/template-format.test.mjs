@@ -4,6 +4,7 @@ import { LATEST_TAG, buildsRead, currentTagHolder, retagStep, retagStepNow, shor
 import { singleFlight } from './single-flight.ts';
 
 const HEX = '0123456789abcdef'.repeat(4);
+const holdersOf = (holders) => new Map(Object.entries(holders));
 
 test('shortHash keeps 12 hex characters whatever the algorithm prefix', () => {
   assert.equal(shortHash(`blake3:${HEX}`), '0123456789ab');
@@ -39,7 +40,7 @@ test("a template's tag holders are read per template; a later read shows how a t
     { id: 'r2', template_name: 'seed', tags: ['canary'] },
     { id: 'r3', template_name: 'other', tags: ['prod'] },
   ], 'seed');
-  assert.deepEqual(opened, { latest: 'r1', prod: 'r1', canary: 'r2' });
+  assert.deepEqual(opened, holdersOf({ latest: 'r1', prod: 'r1', canary: 'r2' }));
   // The precondition is what the operator saw, not what a refresh read later.
   assert.equal(tagHolder(opened, 'prod'), 'r1');
   assert.equal(tagHolder(opened, 'staging'), null);
@@ -55,19 +56,44 @@ test("a template's tag holders are read per template; a later read shows how a t
   assert.equal(tagHolderChange(opened, refreshed, 'latest'), null);
   assert.equal(tagHolderChange(opened, refreshed, 'unused'), null);
   // A tag deleted meanwhile moved to nowhere.
-  assert.deepEqual(tagHolderChange(refreshed, {}, 'staging'), { from: 'r4', to: null });
+  assert.deepEqual(tagHolderChange(refreshed, new Map(), 'staging'), { from: 'r4', to: null });
 });
 
-const opened = (holders) => ({ holders, change: null });
+test('a template that already has the tag __proto__ keeps its holder, and its move is seen', () => {
+  const releases = [
+    { id: 'r1', template_name: 'seed', tags: ['latest', '__proto__'] },
+    { id: 'r2', template_name: 'seed', tags: ['__proto__'] },
+  ];
+  const opened = tagHolders(releases, 'seed');
+  assert.equal(tagHolder(opened, '__proto__'), 'r1');
+  assert.deepEqual([...opened.keys()], ['latest', '__proto__']);
+  assert.equal(currentTagHolder(releases, 'seed', '__proto__'), 'r1');
+  const moved = tagHolders([
+    { id: 'r1', template_name: 'seed', tags: ['latest'] },
+    { id: 'r2', template_name: 'seed', tags: ['__proto__'] },
+  ], 'seed');
+  assert.deepEqual(tagHolderChange(opened, moved, '__proto__'), { from: 'r1', to: 'r2' });
+  // The dialog warns, advances the precondition to r2, and then moves from there.
+  const warned = retagStep({ holders: opened, change: null }, moved, '__proto__');
+  assert.equal(warned.kind, 'warn');
+  assert.equal(tagHolder(warned.baseline.holders, '__proto__'), 'r2');
+  assert.deepEqual(retagStep(warned.baseline, moved, '__proto__'), { kind: 'move', expected: 'r2' });
+  // Deleted meanwhile: the precondition becomes "does not exist".
+  const deleted = retagStep({ holders: opened, change: null }, new Map(), '__proto__');
+  assert.equal(deleted.baseline.holders.has('__proto__'), false);
+  assert.deepEqual(retagStep(deleted.baseline, new Map(), '__proto__'), { kind: 'move', expected: null });
+});
+
+const opened = (holders) => ({ holders: holdersOf(holders), change: null });
 
 test('the retag dialog advances only the warned tag, so another tag that moved warns again instead of being overwritten', () => {
   // Opened with prod on A and canary on B; both moved while it was open.
   const atOpen = opened({ prod: 'rel-a', canary: 'rel-b' });
-  const now = { prod: 'rel-c', canary: 'rel-d' };
+  const now = holdersOf({ prod: 'rel-c', canary: 'rel-d' });
   const warned = retagStep(atOpen, now, 'prod');
   assert.equal(warned.kind, 'warn');
   assert.deepEqual(warned.baseline.change, { tag: 'prod', from: 'rel-a', to: 'rel-c' });
-  assert.deepEqual(warned.baseline.holders, { prod: 'rel-c', canary: 'rel-b' });
+  assert.deepEqual(warned.baseline.holders, holdersOf({ prod: 'rel-c', canary: 'rel-b' }));
   // Switched to canary: its move is shown first, not sent over.
   const canary = retagStep(warned.baseline, now, 'canary');
   assert.equal(canary.kind, 'warn');
@@ -102,17 +128,17 @@ test('OK reads the releases again first, so a tag that moved since the page last
 });
 
 test('a reconfirmed tag moves only from the holder the dialog showed; a further move warns again', () => {
-  const warned = retagStep(opened({ prod: 'rel-a' }), { prod: 'rel-c' }, 'prod');
-  assert.deepEqual(retagStep(warned.baseline, { prod: 'rel-c' }, 'prod'), { kind: 'move', expected: 'rel-c' });
-  const again = retagStep(warned.baseline, { prod: 'rel-e' }, 'prod');
+  const warned = retagStep(opened({ prod: 'rel-a' }), holdersOf({ prod: 'rel-c' }), 'prod');
+  assert.deepEqual(retagStep(warned.baseline, holdersOf({ prod: 'rel-c' }), 'prod'), { kind: 'move', expected: 'rel-c' });
+  const again = retagStep(warned.baseline, holdersOf({ prod: 'rel-e' }), 'prod');
   assert.equal(again.kind, 'warn');
   assert.deepEqual(again.baseline.change, { tag: 'prod', from: 'rel-c', to: 'rel-e' });
   // A tag deleted meanwhile is moved only while it still does not exist.
-  const deleted = retagStep(opened({ prod: 'rel-a' }), {}, 'prod');
-  assert.deepEqual(deleted.baseline.holders, {});
-  assert.deepEqual(retagStep(deleted.baseline, {}, 'prod'), { kind: 'move', expected: null });
+  const deleted = retagStep(opened({ prod: 'rel-a' }), new Map(), 'prod');
+  assert.deepEqual(deleted.baseline.holders, new Map());
+  assert.deepEqual(retagStep(deleted.baseline, new Map(), 'prod'), { kind: 'move', expected: null });
   // A tag that did not move is sent with the holder the dialog opened with.
-  assert.deepEqual(retagStep(opened({ prod: 'rel-a' }), { prod: 'rel-a' }, 'prod'), { kind: 'move', expected: 'rel-a' });
+  assert.deepEqual(retagStep(opened({ prod: 'rel-a' }), holdersOf({ prod: 'rel-a' }), 'prod'), { kind: 'move', expected: 'rel-a' });
 });
 
 test('a second OK while the tag move is in flight sends nothing', async () => {
