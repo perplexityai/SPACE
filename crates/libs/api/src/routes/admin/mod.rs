@@ -61,7 +61,7 @@ mod sandboxes;
 // `{"error": …}` with no retry field. `Retry-After` comes only from the two
 // paths that answer through `PublicApiError` — this layer, and
 // `create_command`, which has two — its sandbox lookup through
-// `From<sqlx::Error>` and its session write through
+// `database_error` and its session write through
 // `From<PublicSessionStoreError>`, both landing on `lock_contention()`.
 pub(in crate::routes) mod support;
 mod template_store;

@@ -165,7 +165,8 @@ pub(crate) const GATEWAY_RETRY_AFTER: Duration = Duration::from_secs(5);
 /// caller wait longer than the bound it hit. Note this does *not* claim the
 /// peer has released by then — the bound and the hint are independent, and a
 /// second collision is answered by another 503 rather than by a longer wait.
-pub(crate) const LOCK_CONTENTION_RETRY_AFTER: Duration = Duration::from_secs(1);
+pub(crate) const LOCK_CONTENTION_RETRY_AFTER: Duration =
+    pplx_space_public_api_http::LOCK_CONTENTION_RETRY_AFTER;
 /// Lower bound for the lease-derived `Retry-After` on restore-lease
 /// collisions. Even a nearly-expired lease must not advertise an immediate
 /// retry, or hot-retrying clients collapse into a busy loop against the

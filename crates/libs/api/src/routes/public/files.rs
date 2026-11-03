@@ -11,14 +11,13 @@ use axum::{
 };
 use futures_util::{StreamExt, stream};
 use pplx_space_common_core::types::IdempotencyKey;
-use pplx_space_metrics::response::{ResponseKind, ResponseOrigin};
 use pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity;
 use pplx_space_native_files::{
-    BatchEntry, FileCallError, FileCallErrorKind, FileCallFailure, FileRequestError,
-    admit_list_entry, decode_write_batch_entries, decode_write_chunks, guest_key, list_depth,
-    parse_guest_path, parse_guest_user, public_file_info, shared_spaced_write_requests,
-    spaced_write_requests, validate_modified_filters, validate_read_length,
-    validate_tracking_enabled, validate_write_batch_shape, write_creating_parents,
+    BatchEntry, FileCallFailure, admit_list_entry, decode_write_batch_entries, decode_write_chunks,
+    guest_key, list_depth, parse_guest_path, parse_guest_user, public_file_info,
+    shared_spaced_write_requests, spaced_write_requests, validate_modified_filters,
+    validate_read_length, validate_tracking_enabled, validate_write_batch_shape,
+    write_creating_parents,
 };
 use pplx_space_public_api::routes::{
     CREATE_DIRECTORY, REMOVE_FILE, RENAME_FILE, WRITE_FILE, WRITE_FILE_BATCH,
@@ -36,7 +35,7 @@ use crate::{
 };
 
 use super::{
-    error::{PublicApiError, with_retry_after_hint},
+    error::PublicApiError,
     owner_scope::{AuthorizedSandbox, authorized_sandbox},
     sandboxes::{idempotency_key, parse_public_sandbox_id},
 };
@@ -570,55 +569,6 @@ impl FileCallFailure for ControllerError {
 
     fn is_lock_contention(&self) -> bool {
         ControllerError::is_lock_contention(self)
-    }
-}
-
-impl From<FileRequestError> for PublicApiError {
-    fn from(error: FileRequestError) -> Self {
-        Self::bad_request(error.to_string())
-    }
-}
-
-impl From<FileCallError> for PublicApiError {
-    fn from(error: FileCallError) -> Self {
-        let public = match error.kind {
-            FileCallErrorKind::InvalidRequest(message) => Self::bad_request(message),
-            FileCallErrorKind::Forbidden(message) => Self::forbidden(message),
-            FileCallErrorKind::PathNotFound(message) => Self::path_not_found(message),
-            FileCallErrorKind::NotFound(message) => Self::not_found(message),
-            FileCallErrorKind::Conflict(message) => Self::conflict(message),
-            FileCallErrorKind::FailedPrecondition(message) => Self::failed_precondition(message),
-            FileCallErrorKind::RateLimited {
-                message,
-                retry_after,
-            } => with_retry_after_hint(
-                Self::rate_limited(message)
-                    .with_classification(ResponseOrigin::Node, ResponseKind::Admission),
-                retry_after,
-            ),
-            FileCallErrorKind::Unavailable {
-                message,
-                retry_after,
-            } => with_retry_after_hint(
-                Self::service_unavailable(message)
-                    .with_classification(ResponseOrigin::Node, ResponseKind::BackendStatus),
-                retry_after,
-            ),
-            FileCallErrorKind::TimedOut { retry_after } => with_retry_after_hint(
-                Self::service_unavailable("sandbox did not answer in time")
-                    .with_classification(ResponseOrigin::Node, ResponseKind::Timeout),
-                retry_after,
-            ),
-            FileCallErrorKind::BackendFailed => Self::internal()
-                .with_classification(ResponseOrigin::Node, ResponseKind::BackendStatus),
-            FileCallErrorKind::LockContention => Self::lock_contention(),
-            FileCallErrorKind::Internal => Self::internal(),
-        };
-        if error.not_retryable {
-            public.not_retryable()
-        } else {
-            public
-        }
     }
 }
 

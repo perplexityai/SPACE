@@ -1,3 +1,4 @@
+use crate::routes::public::error::database_error;
 use pplx_space_common_core::types::{OrgId, SandboxId, SnapshotId};
 
 use pplx_space_common_core::sql;
@@ -35,7 +36,9 @@ pub async fn list_snapshots(
     let sandbox_id = parse_public_sandbox_id(&sandbox_id)?;
     let limit = query.limit();
     let cursor = query.cursor_parts()?;
-    let rows = fetch_snapshot_rows(&state.pool, org.id, sandbox_id, cursor, limit).await?;
+    let rows = fetch_snapshot_rows(&state.pool, org.id, sandbox_id, cursor, limit)
+        .await
+        .map_err(database_error)?;
     let (rows, next_cursor) = snapshot_page_rows(rows, limit)?;
     let data = rows
         .into_iter()
@@ -52,7 +55,9 @@ pub async fn get_snapshot(
 ) -> Result<Json<PublicSnapshot>, PublicApiError> {
     let sandbox_id = parse_public_sandbox_id(&sandbox_id)?;
     let snapshot_id = parse_public_snapshot_id(&snapshot_id)?;
-    let Some(row) = fetch_snapshot_row(&state.pool, org.id, sandbox_id, snapshot_id.into()).await?
+    let Some(row) = fetch_snapshot_row(&state.pool, org.id, sandbox_id, snapshot_id.into())
+        .await
+        .map_err(database_error)?
     else {
         return Err(PublicApiError::not_found("snapshot not found"));
     };

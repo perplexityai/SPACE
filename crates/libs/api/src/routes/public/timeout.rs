@@ -1,3 +1,4 @@
+use crate::routes::public::error::database_error;
 use axum::{Json, http::HeaderMap};
 use pplx_space_common_core::types::OrgId;
 use pplx_space_public_api::{
@@ -51,7 +52,8 @@ pub(super) async fn set_timeout(
         .begin_response_admission(org_id, &idempotency)
         .await?;
     let sandbox = fetch_sandbox(&state.pool, sandbox_id.into())
-        .await?
+        .await
+        .map_err(database_error)?
         .filter(|sandbox| sandbox.org_id == org_id)
         .ok_or_else(|| PublicApiError::not_found("sandbox not found"))?;
     if let Some(response) = admission.response() {

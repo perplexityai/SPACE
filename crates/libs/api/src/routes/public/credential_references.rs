@@ -1,4 +1,5 @@
 use super::error::PublicApiError;
+use crate::routes::public::error::database_error;
 use crate::{
     credential_injection::references::{self as admission, ReferenceError},
     middleware::auth::AuthOrg,
@@ -47,7 +48,7 @@ fn reference_error(error: ReferenceError) -> PublicApiError {
             PublicApiError::idempotency_conflict(error.to_string())
         }
         ReferenceError::Invalid(_) => PublicApiError::bad_request(error.to_string()),
-        ReferenceError::Database(error) => error.into(),
+        ReferenceError::Database(error) => database_error(error),
     }
 }
 

@@ -565,16 +565,7 @@ impl IntoResponse for ControllerError {
     }
 }
 
-pub(crate) fn retry_after_header_value(retry_after: Duration) -> Option<header::HeaderValue> {
-    header::HeaderValue::from_str(
-        &retry_after
-            .as_secs()
-            .saturating_add(u64::from(retry_after.subsec_nanos() > 0))
-            .max(1)
-            .to_string(),
-    )
-    .ok()
-}
+pub(crate) use pplx_space_public_api_http::retry_after_header_value;
 
 impl From<crate::federated_identity::MaterializeOwnerError> for ControllerError {
     fn from(error: crate::federated_identity::MaterializeOwnerError) -> Self {

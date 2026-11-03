@@ -5,6 +5,7 @@
 //! mutations use sandbox create/update instead of a separate resource-specific
 //! write contract.
 
+use crate::routes::public::error::database_error;
 use pplx_space_common_core::types::OrgId;
 
 use pplx_space_common_core::sql;
@@ -56,19 +57,19 @@ mod document {
         state: &AppState,
         sandbox_id: PublicSandboxId,
     ) -> Result<Option<DesiredPolicy>, PublicApiError> {
-        // `From<sqlx::Error>` rather than a bare `internal()`: this read takes
+        // `database_error` rather than a bare `internal()`: this read takes
         // no lock, but it still waits on DDL holding `ACCESS EXCLUSIVE` on
         // `sandboxes`, so under the role-level `lock_timeout` it can abort with
-        // `55P03` and the caller can just retry. The `From` impl classifies
+        // `55P03` and the caller can just retry. `database_error` classifies
         // that and logs the rest. This `GET` is the one survivor of the
         // NetworkPolicyV2 removal, which took with it the classified
         // translator this handler used to reach.
         let sandbox = crate::controllers::sandbox::fetch_sandbox(&state.pool, sandbox_id.into())
             .await
             .map_err(|error| {
-                // Adds the `sandbox_id`, which `From<sqlx::Error>`'s generic
+                // Adds the `sandbox_id`, which `database_error`'s generic
                 // "public api database error" does not carry. At `debug`,
-                // deliberately: the `From` already logs a real failure at
+                // deliberately: `database_error` already logs a real failure at
                 // `error` and a contention abort at `warn`, so this is context
                 // for someone who turned debug on, not the production record.
                 // Do not read it as replacing that log.
@@ -77,7 +78,7 @@ mod document {
                     sandbox_id = %pplx_space_common_core::types::SandboxId::from(sandbox_id),
                     "failed to load sandbox for network policy"
                 );
-                PublicApiError::from(error)
+                database_error(error)
             })?
             .ok_or_else(|| PublicApiError::not_found("sandbox not found"))?;
         let (policy, inherited) = match (
@@ -155,7 +156,8 @@ async fn ensure_sandbox_owner(
     .bind(sandbox_id.as_uuid())
     .bind(org_id)
     .fetch_one(pool)
-    .await?;
+    .await
+    .map_err(database_error)?;
     if !found {
         return Err(PublicApiError::not_found("sandbox not found"));
     }

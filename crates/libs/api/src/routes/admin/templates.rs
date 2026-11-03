@@ -58,7 +58,6 @@ use crate::{
             self, ContentionScope, IDEMPOTENCY_KEY_HEADER, parse_if_match_generation,
         },
         authz,
-        public::request_context,
     },
     template_build_jobs_store::RecordedBuild,
 };
@@ -305,7 +304,7 @@ fn api_error_with_details(
         Json(PublicErrorEnvelope {
             code: public_error_code(status),
             message: message.into(),
-            request_id: request_context::current_request_id(),
+            request_id: pplx_space_public_api_http::current_request_id(),
             retryable: matches!(
                 status,
                 StatusCode::TOO_MANY_REQUESTS

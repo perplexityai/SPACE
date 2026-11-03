@@ -24,7 +24,6 @@ mod operations;
 mod owner_scope;
 mod ports;
 mod processes;
-pub(crate) mod request_context;
 pub(crate) mod sandboxes;
 pub(crate) mod sessions;
 mod snapshots;
@@ -324,7 +323,9 @@ pub fn v1_router(state: AppState) -> Router<AppState> {
         .fallback(error::public_route_not_found)
         .layer(middleware::from_fn_with_state(state, require_native_auth))
         .layer(middleware::from_fn(error::normalize_public_error_response))
-        .layer(middleware::from_fn(request_context::with_public_request_id))
+        .layer(middleware::from_fn(
+            pplx_space_public_api_http::with_public_request_id,
+        ))
 }
 
 /// `method_router` behind the same credentials and error envelope as
@@ -339,7 +340,9 @@ pub(crate) fn with_native_auth(
         .layer(middleware::from_fn_with_state(state, require_native_auth))
         .layer(middleware::from_fn(owner_not_required))
         .layer(middleware::from_fn(error::normalize_public_error_response))
-        .layer(middleware::from_fn(request_context::with_public_request_id))
+        .layer(middleware::from_fn(
+            pplx_space_public_api_http::with_public_request_id,
+        ))
 }
 
 #[cfg(test)]

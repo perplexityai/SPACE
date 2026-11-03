@@ -4863,6 +4863,7 @@ dependencies = [
  "pplx-space-observability",
  "pplx-space-placement",
  "pplx-space-public-api",
+ "pplx-space-public-api-http",
  "pplx-space-runtime-environment-policy-store",
  "pplx-space-sandbox-portability",
  "pplx-space-sandbox-store",
@@ -6171,7 +6172,9 @@ dependencies = [
  "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-guest-process",
+ "pplx-space-metrics",
  "pplx-space-public-api",
+ "pplx-space-public-api-http",
  "pplx-space-sbx-mgr-protocol",
  "prost-types",
  "sha2 0.11.0",
@@ -6911,6 +6914,23 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "time",
+ "uuid",
+]
+
+[[package]]
+name = "pplx-space-public-api-http"
+version = "0.8.0"
+dependencies = [
+ "axum",
+ "http-body-util",
+ "pplx-space-metrics",
+ "pplx-space-public-api",
+ "pplx-space-request-id",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tracing",
  "uuid",
 ]
 

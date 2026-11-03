@@ -1,3 +1,4 @@
+use crate::routes::public::error::database_error;
 use pplx_space_common_core::sql;
 use std::str::FromStr;
 
@@ -484,14 +485,14 @@ pub async fn create_command(
         .map_err(|error| PublicApiError::bad_request(error.to_string()))?;
     let sandbox = fetch_admin_sandbox(&state.pool, target)
         .await
-        // `From<sqlx::Error> for PublicApiError` classifies contention (and
-        // attaches `Retry-After`), so this lookup answers the same 503 the list
-        // handler does rather than a flat 500. It logs both cases itself — a
+        // `database_error` classifies contention (and attaches
+        // `Retry-After`), so this lookup answers the same 503 the list handler
+        // does rather than a flat 500. It logs both cases itself — a
         // lost race at `warn` under "public api statement lost a lock race",
         // a real failure at `error` under "public api database error" — so
         // there is no hand-rolled log here. The `sandbox_id` is recoverable
         // from the `http.server` span's `url.path`, which carries it.
-        .map_err(PublicApiError::from)?
+        .map_err(database_error)?
         .ok_or_else(|| PublicApiError::not_found("sandbox not found"))?;
     let idempotency_key = session_idempotency_key(&headers)?;
     let command = create_command_session(

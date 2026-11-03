@@ -166,7 +166,7 @@ fn every_public_translator_keeps_contention_attributed_to_this_service() {
     for (name, translate, fleet_fallthrough_status, fleet_origin) in translators {
         let mut contended = crate::controllers::ControllerError::service_unavailable("contended");
         contended.mark_lock_contention_for_test();
-        let (status, origin, kind) = translate(contended).classification_for_test();
+        let (status, origin, kind) = translate(contended).classification();
 
         assert_eq!(
             status,
@@ -186,7 +186,7 @@ fn every_public_translator_keeps_contention_attributed_to_this_service() {
         // and re-attribute it, `network_policy` turns it into a 500 — so the
         // expectation is per-row rather than a shared "untouched".
         let fleet = crate::controllers::ControllerError::service_unavailable("node is gone");
-        let (fleet_status, origin, _) = translate(fleet).classification_for_test();
+        let (fleet_status, origin, _) = translate(fleet).classification();
         assert_eq!(
             (fleet_status, origin),
             (fleet_fallthrough_status, fleet_origin),
