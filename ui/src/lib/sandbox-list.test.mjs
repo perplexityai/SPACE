@@ -6,11 +6,14 @@ import {
   clientFilters,
   createdBounds,
   listAnswerPlan,
+  listRequestQuery,
+  listScope,
   nextPage,
   pageCursor,
   parsePageSize,
   parseSandboxListResponse,
   previousPage,
+  sameScope,
   sandboxListQuery,
 } from './sandbox-list.ts';
 
@@ -38,6 +41,8 @@ test('any other answer is refused rather than shown as an empty list', () => {
 });
 
 const parse = (query) => Object.fromEntries(new URLSearchParams(query));
+const NOW = Date.parse('2026-11-03T12:00:00.000Z');
+const HOUR = 60 * 60 * 1000;
 
 test('every set filter maps to its list parameter on a paged request', () => {
   const query = sandboxListQuery('paged', {
@@ -45,10 +50,10 @@ test('every set filter maps to its list parameter on a paged request', () => {
     lifecycles: ['started', 'deleted'],
     template: 'seed',
     userId: '0193a000-0000-7000-8000-000000000002',
-    createdAfter: '2026-10-01T00:00:00.000Z',
-    createdBefore: '2026-11-01T00:00:00.000Z',
+    createdWithin: '30d',
+    olderThan: '24h',
     prefix: '  Build-  ',
-  }, { limit: 50, cursor: 'djE6MTo' });
+  }, { limit: 50, cursor: 'djE6MTo', now: NOW });
   assert.deepEqual(parse(query), {
     limit: '50',
     cursor: 'djE6MTo',
@@ -56,24 +61,49 @@ test('every set filter maps to its list parameter on a paged request', () => {
     lifecycle: 'started,deleted',
     template: 'seed',
     user_id: '0193a000-0000-7000-8000-000000000002',
-    created_after: '2026-10-01T00:00:00.000Z',
-    created_before: '2026-11-01T00:00:00.000Z',
+    created_after: '2026-10-04T12:00:00.000Z',
+    created_before: '2026-11-02T12:00:00.000Z',
     // Trimmed, case kept: a name prefix is case-sensitive.
     prefix: 'Build-',
   });
 });
 
 test('the first page sends an empty cursor, and unset filters send nothing', () => {
-  assert.equal(sandboxListQuery('paged', NO_FILTERS, { limit: 25 }), 'limit=25&cursor=');
-  assert.deepEqual(parse(sandboxListQuery('paged', { ...NO_FILTERS, prefix: ' \0 ' }, { limit: 25 })), { limit: '25', cursor: '' });
+  assert.equal(sandboxListQuery('paged', NO_FILTERS, { limit: 25, now: NOW }), 'limit=25&cursor=');
+  assert.deepEqual(parse(sandboxListQuery('paged', { ...NO_FILTERS, prefix: ' \0 ' }, { limit: 25, now: NOW })), { limit: '25', cursor: '' });
 });
 
 test('a sampled request sends what the list took before paging: the size and the org only', () => {
   const filters = { ...NO_FILTERS, org: '0193a000-0000-7000-8000-000000000001', template: 'seed', lifecycles: ['started'], prefix: 'a' };
-  assert.deepEqual(parse(sandboxListQuery('sampled', filters, { limit: 1000, cursor: 'ignored' })), {
+  assert.deepEqual(parse(sandboxListQuery('sampled', filters, { limit: 1000, cursor: 'ignored', now: NOW })), {
     limit: '1000',
     org_id: '0193a000-0000-7000-8000-000000000001',
   });
+});
+
+test('a relative created bound is computed when each request is sent, and does not change the scope', () => {
+  const filters = { ...NO_FILTERS, createdWithin: '1h' };
+  const scope = listScope('paged', filters, { limit: 50, cursor: '' });
+  // The same view a tab's age later: a poll rereads it rather than starting
+  // a new view on page 1.
+  assert.ok(sameScope(scope, listScope('paged', { ...filters }, { limit: 50, cursor: '' })));
+  assert.equal(parse(listRequestQuery(scope, NOW)).created_after, '2026-11-03T11:00:00.000Z');
+  assert.equal(parse(listRequestQuery(scope, NOW + 3 * HOUR)).created_after, '2026-11-03T14:00:00.000Z');
+  const older = listScope('paged', { ...NO_FILTERS, olderThan: '24h' }, { limit: 50, cursor: '' });
+  assert.equal(parse(listRequestQuery(older, NOW + 24 * HOUR)).created_before, '2026-11-03T12:00:00.000Z');
+  // Another window, page or size is another scope.
+  assert.ok(!sameScope(scope, listScope('paged', { ...NO_FILTERS, createdWithin: '24h' }, { limit: 50, cursor: '' })));
+  assert.ok(!sameScope(scope, listScope('paged', filters, { limit: 50, cursor: 'c1' })));
+  assert.ok(!sameScope(scope, listScope('paged', filters, { limit: 25, cursor: '' })));
+});
+
+test('a sampled scope is its size and org: the filters it does not send do not change it', () => {
+  const org = '0193a000-0000-7000-8000-000000000001';
+  const a = listScope('sampled', { ...NO_FILTERS, org }, { limit: 1000, cursor: '' });
+  const b = listScope('sampled', { ...NO_FILTERS, org, template: 'seed', createdWithin: '1h' }, { limit: 1000, cursor: 'c1' });
+  assert.ok(sameScope(a, b));
+  assert.ok(!sameScope(a, listScope('paged', { ...NO_FILTERS, org }, { limit: 1000, cursor: '' })));
+  assert.ok(!sameScope(a, null));
 });
 
 test('a paged list leaves only the node filter to the console; a sampled one filters everything but the org', () => {

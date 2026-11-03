@@ -36,17 +36,23 @@ import {
 } from '@/lib/public-api';
 import { adminApi } from '@/lib/api';
 import {
+  CREATED_AGES,
   FIRST_PAGE,
   PAGE_SIZE_OPTIONS,
   clientFilters,
+  createdAgeMs,
   createdBounds,
   listAnswerPlan,
+  listRequestQuery,
+  listScope,
   nextPage,
   pageCursor,
   parsePageSize,
   previousPage,
-  sandboxListQuery,
+  sameScope,
+  type CreatedAge,
   type ListMode,
+  type ListScope,
   type PagePosition,
   type SandboxListFilters,
 } from '@/lib/sandbox-list';
@@ -104,22 +110,13 @@ const LARGE_LIST_STALE_MS = 15_000;
 
 // See `scopedRefreshKey`: each org and load size of a sampled list keeps its
 // own timestamp, and so does each page of a paged list, with its filters.
+// The key holds relative creation-time bounds as chosen, so it does not
+// change from one poll to the next.
 function sandboxesRefreshKey(scope: ListScope): string {
   return scope.mode === 'sampled'
-    ? scopedRefreshKey(SANDBOXES_VIEW_REFRESH_KEY, scope.limit, DEFAULT_LIST_LIMIT, scope.org)
-    : `${SANDBOXES_VIEW_REFRESH_KEY}:paged:${scope.query}`;
+    ? scopedRefreshKey(SANDBOXES_VIEW_REFRESH_KEY, scope.limit, DEFAULT_LIST_LIMIT, scope.filters.org)
+    : `${SANDBOXES_VIEW_REFRESH_KEY}:paged:${scope.key}`;
 }
-
-// What one list request asked for: its query string (the page position, the
-// size and the filters the server applies) and the list shape it expected.
-interface ListScope {
-  mode: ListMode;
-  query: string;
-  limit: number;
-  org: string | null;
-}
-
-const sameScope = (a: ListScope | null, b: ListScope) => a !== null && a.mode === b.mode && a.query === b.query;
 
 // A refresh for a page, org, size or filter that is no longer selected: it
 // loaded nothing, and the view's key is not marked fresh.
@@ -129,7 +126,7 @@ class ShownListError extends Error {}
 const alreadyReported = (err: unknown) => err instanceof RefreshSkipped || err instanceof ShownListError;
 const REFRESH_CLICK_COOLDOWN_MS = 3000;
 
-type AgeWindow = '1h' | '24h' | '7d' | '30d' | '90d' | '1y' | 'all';
+type AgeWindow = CreatedAge | 'all';
 type NodeFilter = 'any' | 'assigned' | 'unassigned';
 
 const VALID_AGE_WINDOWS: readonly AgeWindow[] = ['1h', '24h', '7d', '30d', '90d', '1y', 'all'];
@@ -153,17 +150,17 @@ const parseUserParam = (raw: string | null): string | null =>
   raw && UUID_PARAM.test(raw.trim()) ? raw.trim().toLowerCase() : null;
 
 const AGE_WINDOW_OPTIONS: { value: AgeWindow; label: string; ms: number | null }[] = [
-  { value: '1h',  label: 'Last 1h',     ms: 1 * 60 * 60 * 1000 },
-  { value: '24h', label: 'Last 24h',    ms: 24 * 60 * 60 * 1000 },
-  { value: '7d',  label: 'Last 7 days', ms: 7 * 24 * 60 * 60 * 1000 },
-  { value: '30d', label: 'Last 30 days',ms: 30 * 24 * 60 * 60 * 1000 },
-  { value: '90d', label: 'Last 90 days',ms: 90 * 24 * 60 * 60 * 1000 },
-  { value: '1y',  label: 'Last year',   ms: 365 * 24 * 60 * 60 * 1000 },
+  { value: '1h',  label: 'Last 1h',     ms: CREATED_AGES['1h'] },
+  { value: '24h', label: 'Last 24h',    ms: CREATED_AGES['24h'] },
+  { value: '7d',  label: 'Last 7 days', ms: CREATED_AGES['7d'] },
+  { value: '30d', label: 'Last 30 days',ms: CREATED_AGES['30d'] },
+  { value: '90d', label: 'Last 90 days',ms: CREATED_AGES['90d'] },
+  { value: '1y',  label: 'Last year',   ms: CREATED_AGES['1y'] },
   { value: 'all', label: 'All time',    ms: null },
 ];
 
 // "Created more than ... ago", the other end of the creation-time range.
-type OlderThan = 'any' | '1h' | '24h' | '7d' | '30d' | '90d' | '1y';
+type OlderThan = CreatedAge | 'any';
 const OLDER_THAN_OPTIONS: { value: OlderThan; label: string; ms: number | null }[] = [
   { value: 'any', label: 'Older than: any', ms: null },
   ...AGE_WINDOW_OPTIONS.filter((opt) => opt.ms !== null).map((opt) => ({
@@ -174,8 +171,10 @@ const OLDER_THAN_OPTIONS: { value: OlderThan; label: string; ms: number | null }
 ];
 const parseOlderParam = (raw: string | null): OlderThan =>
   OLDER_THAN_OPTIONS.some((opt) => opt.value === raw) ? (raw as OlderThan) : 'any';
-const ageWindowMs = (value: AgeWindow) => AGE_WINDOW_OPTIONS.find((opt) => opt.value === value)?.ms ?? null;
-const olderThanMs = (value: OlderThan) => OLDER_THAN_OPTIONS.find((opt) => opt.value === value)?.ms ?? null;
+const ageWindowAge = (value: AgeWindow): CreatedAge | null => (value === 'all' ? null : value);
+const olderThanAge = (value: OlderThan): CreatedAge | null => (value === 'any' ? null : value);
+const ageWindowMs = (value: AgeWindow) => createdAgeMs(ageWindowAge(value));
+const olderThanMs = (value: OlderThan) => createdAgeMs(olderThanAge(value));
 
 // What the server-side filters are built from.
 interface FilterInputs {
@@ -190,13 +189,14 @@ interface FilterInputs {
   prefix: string;
 }
 
-function serverFilters(inputs: FilterInputs, now: number): SandboxListFilters {
+function serverFilters(inputs: FilterInputs): SandboxListFilters {
   return {
     org: inputs.org,
     lifecycles: storedLifecycles(inputs.statuses),
     template: inputs.template,
     userId: inputs.user,
-    ...createdBounds(ageWindowMs(inputs.age), olderThanMs(inputs.older), now),
+    createdWithin: ageWindowAge(inputs.age),
+    olderThan: olderThanAge(inputs.older),
     prefix: inputs.prefix,
   };
 }
@@ -752,9 +752,9 @@ function SandboxesPage() {
   };
   const filterInputsKey = JSON.stringify(filterInputs);
   // The filters every request sends until a filter changes. The creation-time
-  // bounds are fixed when they are chosen, so later pages and refreshes ask
-  // for the same rows.
-  const [initialFilters] = useState(() => serverFilters(filterInputs, Date.now()));
+  // bounds stay relative ("the last hour") and are computed as each request
+  // is sent, so a refresh an hour later still shows the last hour.
+  const [initialFilters] = useState(() => serverFilters(filterInputs));
   const serverFiltersRef = useRef<SandboxListFilters>(initialFilters);
   const appliedInputsRef = useRef({ key: filterInputsKey, prefix: filterInputs.prefix });
   // Every list request takes the next number; only the newest one applies its
@@ -819,12 +819,7 @@ function SandboxesPage() {
     const mode = listModeRef.current;
     const filters = serverFiltersRef.current;
     const limit = mode === 'paged' ? pageSizeRef.current : listLimitRef.current;
-    return {
-      mode,
-      limit,
-      org: filters.org,
-      query: sandboxListQuery(mode, filters, { limit, cursor: pageCursor(positionRef.current) }),
-    };
+    return listScope(mode, filters, { limit, cursor: pageCursor(positionRef.current) });
   };
 
   const refresh = async ({
@@ -841,7 +836,7 @@ function SandboxesPage() {
     if (showLoading) setLoading(true);
     let reloadSample = false;
     try {
-      const response = await getConsoleSandboxList(scope.query);
+      const response = await getConsoleSandboxList(listRequestQuery(scope, Date.now()));
       if (!newest()) return;
       const plan = listAnswerPlan(scope.mode, response, {
         pageSize: pageSizeRef.current,
@@ -1205,12 +1200,12 @@ function SandboxesPage() {
     const delay = appliedInputsRef.current.prefix !== filterInputs.prefix ? 300 : 0;
     const timer = setTimeout(() => {
       appliedInputsRef.current = { key: filterInputsKey, prefix: filterInputs.prefix };
-      serverFiltersRef.current = serverFilters(filterInputs, Date.now());
+      serverFiltersRef.current = serverFilters(filterInputs);
       pageSizeRef.current = pageSize;
       listLimitRef.current = listLimit;
       positionRef.current = FIRST_PAGE;
       setPosition(FIRST_PAGE);
-      if (shownScopeRef.current?.query === currentScope().query) return;
+      if (sameScope(shownScopeRef.current, currentScope())) return;
       // An error belongs to the request that failed.
       setListError(null);
       refreshAndReport();

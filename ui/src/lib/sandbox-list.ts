@@ -23,6 +23,20 @@ export function parseSandboxListResponse(body: unknown): SandboxListResponse {
   throw new Error('unrecognized sandbox list response');
 }
 
+// A creation-time bound relative to now: "created within the last ..." or
+// "created more than ... ago".
+export const CREATED_AGES = {
+  '1h': 60 * 60 * 1000,
+  '24h': 24 * 60 * 60 * 1000,
+  '7d': 7 * 24 * 60 * 60 * 1000,
+  '30d': 30 * 24 * 60 * 60 * 1000,
+  '90d': 90 * 24 * 60 * 60 * 1000,
+  '1y': 365 * 24 * 60 * 60 * 1000,
+} as const;
+export type CreatedAge = keyof typeof CREATED_AGES;
+
+export const createdAgeMs = (age: CreatedAge | null): number | null => (age === null ? null : CREATED_AGES[age]);
+
 export interface SandboxListFilters {
   org: string | null;
   // Stored lifecycles; see `STORED_LIFECYCLE_FILTER_STATES`.
@@ -31,26 +45,28 @@ export interface SandboxListFilters {
   // Template column may show the one its node reports.
   template: string | null;
   userId: string | null;
-  // RFC 3339, both exclusive.
-  createdAfter: string | null;
-  createdBefore: string | null;
+  // Relative bounds, kept as chosen; each request turns them into
+  // timestamps when it is sent (see `createdBounds`).
+  createdWithin: CreatedAge | null;
+  olderThan: CreatedAge | null;
   // A name prefix (case-sensitive) or ID prefix, as typed.
   prefix: string;
 }
 
 export const NO_FILTERS: SandboxListFilters = {
-  org: null, lifecycles: [], template: null, userId: null, createdAfter: null, createdBefore: null, prefix: '',
+  org: null, lifecycles: [], template: null, userId: null, createdWithin: null, olderThan: null, prefix: '',
 };
 
 // The query string of one list request. A sampled list sends exactly what
 // the console sent before paging: the sample size and the org, the one
 // filter such a server applies. A paged request sends the page position, the
 // page size and every set filter; the server refuses an unknown parameter
-// once `cursor` is present, so nothing else is added.
+// once `cursor` is present, so nothing else is added. The creation-time
+// bounds are computed from `now`, the time the request is sent.
 export function sandboxListQuery(
   mode: ListMode,
   filters: SandboxListFilters,
-  { limit, cursor = '' }: { limit: number; cursor?: string },
+  { limit, cursor = '', now }: { limit: number; cursor?: string; now: number },
 ): string {
   const params = new URLSearchParams({ limit: String(limit) });
   if (mode === 'paged') params.set('cursor', cursor);
@@ -59,12 +75,56 @@ export function sandboxListQuery(
   if (filters.lifecycles.length) params.set('lifecycle', filters.lifecycles.join(','));
   if (filters.template) params.set('template', filters.template);
   if (filters.userId) params.set('user_id', filters.userId);
-  if (filters.createdAfter) params.set('created_after', filters.createdAfter);
-  if (filters.createdBefore) params.set('created_before', filters.createdBefore);
+  const { createdAfter, createdBefore } = createdBounds(createdAgeMs(filters.createdWithin), createdAgeMs(filters.olderThan), now);
+  if (createdAfter) params.set('created_after', createdAfter);
+  if (createdBefore) params.set('created_before', createdBefore);
   // The server refuses a NUL, which no typed prefix needs.
   const prefix = filters.prefix.trim().replaceAll('\0', '');
   if (prefix) params.set('prefix', prefix);
   return params.toString();
+}
+
+// What one list request asks for: the list shape, the page size or sample
+// size, the page position and the filters, with the creation-time bounds
+// still relative. `key` names it: two scopes with the same key ask for the
+// same rows, whenever they are sent, so a refresh of "Last 1h" an hour
+// later is the same view, not a new one.
+export interface ListScope {
+  mode: ListMode;
+  limit: number;
+  cursor: string;
+  filters: SandboxListFilters;
+  key: string;
+}
+
+export function listScope(
+  mode: ListMode,
+  filters: SandboxListFilters,
+  { limit, cursor }: { limit: number; cursor: string },
+): ListScope {
+  // A sampled request sends only the size and the org.
+  const sent = mode === 'paged' ? filters : { ...NO_FILTERS, org: filters.org };
+  const at = mode === 'paged' ? cursor : '';
+  const key = new URLSearchParams({
+    mode,
+    limit: String(limit),
+    cursor: at,
+    org: sent.org ?? '',
+    lifecycle: sent.lifecycles.join(','),
+    template: sent.template ?? '',
+    user: sent.userId ?? '',
+    within: sent.createdWithin ?? '',
+    older: sent.olderThan ?? '',
+    prefix: sent.prefix.trim().replaceAll('\0', ''),
+  }).toString();
+  return { mode, limit, cursor: at, filters: sent, key };
+}
+
+export const sameScope = (a: ListScope | null, b: ListScope | null) => a !== null && b !== null && a.key === b.key;
+
+// The query string of a request for `scope`, sent at `now`.
+export function listRequestQuery(scope: ListScope, now: number): string {
+  return sandboxListQuery(scope.mode, scope.filters, { limit: scope.limit, cursor: scope.cursor, now });
 }
 
 // Which filters the console applies to the rows it loaded. A paged server
@@ -128,10 +188,10 @@ export function pageCursor(position: PagePosition): string {
 }
 
 // The creation-time bounds of "created within the last `withinMs`" and
-// "created more than `olderThanMs` ago", fixed at `now` so that they stay the
-// same from page to page. The server refuses bounds that leave no instant
-// between them, which the console's own controls never offer; one taken from
-// a URL keeps the window and drops the "older than" bound.
+// "created more than `olderThanMs` ago", at `now`. The server refuses
+// bounds that leave no instant between them, which the console's own
+// controls never offer; such a pair keeps the window and drops the "older
+// than" bound.
 export function createdBounds(
   withinMs: number | null,
   olderThanMs: number | null,
