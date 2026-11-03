@@ -406,13 +406,13 @@ fn insert_api_key_paths(paths: &mut Map<String, Value>) {
             },
             "post": {
                 "summary": "Create an organization API key",
-                "description": "Creates a key for any organization and returns the raw secret exactly once. The key calls only the allowed_surfaces APIs and acts as user_id, a user of the organization; when it is omitted, as the calling admin for the admin's own organization, or as the organization's oldest user for another. That user is stored as created_by. The audit event names the calling admin, the organization, the key and its user, never the secret.",
+                "description": "Creates a key for any organization and returns the raw secret exactly once. The key calls only the allowed_surfaces APIs and acts as user_id, a user of the organization; user_id may be omitted only for the admin's own organization, whose key then acts as the calling admin. That user is stored as created_by. The audit event names the calling admin, the organization, the key and its user, never the secret.",
                 "responses": {
                     "201": { "description": "API key metadata and one-time secret" },
-                    "400": { "description": "Invalid name or API surfaces, or user_id is not a user of the organization" },
+                    "400": { "description": "Invalid name or API surfaces, user_id missing for another organization's key, or user_id is not a user of the organization" },
                     "403": { "description": "Caller is not a managing organization admin" },
                     "404": { "description": "Organization not found" },
-                    "409": { "description": "The organization has no users, or the chosen user was deleted while the key was created" }
+                    "409": { "description": "The chosen user was deleted while the key was created" }
                 }
             }
         }),

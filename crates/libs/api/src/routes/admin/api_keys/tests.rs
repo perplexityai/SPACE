@@ -43,7 +43,11 @@ async fn an_operator_creates_uses_and_revokes_a_key_for_another_organization() -
             Method::POST,
             &keys_path,
             &[],
-            Some(json!({"name": "tenant key", "allowed_surfaces": ["native"]})),
+            Some(json!({
+                "name": "tenant key",
+                "allowed_surfaces": ["native"],
+                "user_id": harness.tenant_admin,
+            })),
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
@@ -57,7 +61,7 @@ async fn an_operator_creates_uses_and_revokes_a_key_for_another_organization() -
     assert_eq!(
         key["created_by"],
         harness.tenant_admin.to_string(),
-        "the key acts as the organization's oldest user, recorded at creation"
+        "the key acts as its chosen user, recorded at creation"
     );
     assert_eq!(
         key["created_by_email"],
@@ -226,33 +230,26 @@ async fn a_new_key_acts_as_its_chosen_user_under_the_released_lookup() -> TestRe
     };
     let pool = &harness.db.pool;
     let org = harness.tenant_org;
-    // Two users older than the harness's tenant admin, created at the same
-    // instant, so the default must break the tie by id.
-    let mut tied = Vec::new();
-    for _ in 0..2 {
-        let user_id = UserId::new();
-        sqlx::query(sql!(
-            "INSERT INTO users (id, email, password_hash, display_name, org_id, role, created_at)
-             VALUES ($1, $2, '!', 'Tied', $3, 'member', '2020-01-01T00:00:00Z')"
-        ))
-        .bind(user_id)
-        .bind(format!("{user_id}@example.invalid"))
-        .bind(org)
-        .execute(pool)
-        .await?;
-        tied.push(user_id);
-    }
-    let oldest = *tied.iter().min().expect("two users");
+    // A member older than the harness's tenant admin, so choosing either is
+    // not the same as picking the organization's first user.
+    let member = UserId::new();
+    sqlx::query(sql!(
+        "INSERT INTO users (id, email, password_hash, display_name, org_id, role, created_at)
+         VALUES ($1, $2, '!', 'Member', $3, 'member', '2020-01-01T00:00:00Z')"
+    ))
+    .bind(member)
+    .bind(format!("{member}@example.invalid"))
+    .bind(org)
+    .execute(pool)
+    .await?;
     let keys_path = format!("/orgs/{org}/api-keys");
 
-    for (requested, expected) in [
-        (None, oldest),
-        (Some(harness.tenant_admin), harness.tenant_admin),
-    ] {
-        let mut body = json!({"name": "chosen user", "allowed_surfaces": ["native", "ecw"]});
-        if let Some(user_id) = requested {
-            body["user_id"] = json!(user_id);
-        }
+    for expected in [member, harness.tenant_admin] {
+        let body = json!({
+            "name": "chosen user",
+            "allowed_surfaces": ["native", "ecw"],
+            "user_id": expected,
+        });
         let (status, created) = harness
             .as_operator(Method::POST, &keys_path, &[], Some(body))
             .await;
@@ -266,7 +263,7 @@ async fn a_new_key_acts_as_its_chosen_user_under_the_released_lookup() -> TestRe
             assert_eq!(
                 context.actor.map(|actor| (actor.id, actor.org_id)),
                 Some((expected, org)),
-                "{requested:?} on {surface}"
+                "{expected} on {surface}"
             );
         }
         let created_events = harness.audit_events(&keys_path).await;
@@ -277,45 +274,62 @@ async fn a_new_key_acts_as_its_chosen_user_under_the_released_lookup() -> TestRe
 
 /// Without `user_id`, a key of the caller's own organization acts as the
 /// caller, as it did before this route served other organizations, while a key
-/// of another organization acts as that organization's oldest user.
+/// of another organization is refused: the route never picks that
+/// organization's user for the operator.
 #[tokio::test(flavor = "current_thread")]
 async fn a_key_without_user_id_acts_as_the_caller_only_in_the_callers_organization() -> TestResult {
     let Some(harness) = admin_router_harness().await? else {
         return Ok(());
     };
     let own_org = harness.operator.org_id;
-    let oldest_own_user = api_key_store::oldest_user(&harness.db.pool, own_org)
-        .await?
-        .expect("the managing org has users");
+    let oldest_own_user: UserId = sqlx::query_scalar(sql!(
+        "SELECT id FROM users WHERE org_id = $1 ORDER BY created_at, id LIMIT 1"
+    ))
+    .bind(own_org)
+    .fetch_one(&harness.db.pool)
+    .await?;
     assert_ne!(
         oldest_own_user, harness.operator.id,
         "the fixture's caller is not its org's oldest user"
     );
-    for (org, expected) in [
-        (own_org, harness.operator.id),
-        (harness.tenant_org, harness.tenant_admin),
-    ] {
-        let (status, created) = harness
-            .as_operator(
-                Method::POST,
-                &format!("/orgs/{org}/api-keys"),
-                &[],
-                Some(json!({"name": "default user", "allowed_surfaces": ["native"]})),
-            )
-            .await;
-        assert_eq!(status, StatusCode::CREATED, "{created}");
-        assert_eq!(
-            created["api_key"]["created_by"],
-            expected.to_string(),
-            "{org}"
-        );
-        let secret = created["secret"].as_str().expect("secret");
-        let actor = crate::auth::get_api_key_org(&harness.db.pool, secret, ApiSurface::Native)
-            .await?
-            .and_then(|context| context.actor)
-            .map(|actor| actor.id);
-        assert_eq!(actor, Some(expected), "{org}");
-    }
+    let body = json!({"name": "default user", "allowed_surfaces": ["native"]});
+    let (status, created) = harness
+        .as_operator(
+            Method::POST,
+            &format!("/orgs/{own_org}/api-keys"),
+            &[],
+            Some(body.clone()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(
+        created["api_key"]["created_by"],
+        harness.operator.id.to_string()
+    );
+    let secret = created["secret"].as_str().expect("secret");
+    let actor = crate::auth::get_api_key_org(&harness.db.pool, secret, ApiSurface::Native)
+        .await?
+        .and_then(|context| context.actor)
+        .map(|actor| actor.id);
+    assert_eq!(actor, Some(harness.operator.id));
+
+    let tenant_keys = format!("/orgs/{}/api-keys", harness.tenant_org);
+    let (status, error) = harness
+        .as_operator(Method::POST, &tenant_keys, &[], Some(body))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+    assert_eq!(
+        error["error"],
+        "user_id is required for another organization's key"
+    );
+    let events = harness.audit_events(&tenant_keys).await;
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["target_org_id"], harness.tenant_org.to_string());
+    assert_eq!(events[0]["target_user_id"], Value::Null);
+    let (_, listed) = harness
+        .as_operator(Method::GET, &tenant_keys, &[], None)
+        .await;
+    assert_eq!(listed, json!([]), "the refused request created no key");
     Ok(())
 }
 
@@ -375,36 +389,6 @@ async fn a_key_needs_a_user_of_its_organization_to_act_as() -> TestResult {
     let event = &harness.audit_events(&keys_path).await[0];
     assert_eq!(event["target_org_id"], harness.tenant_org.to_string());
     assert_eq!(event["target_user_id"], Value::Null);
-
-    let empty_org = OrgId::new();
-    sqlx::query(sql!(
-        "INSERT INTO organizations (id, name, slug) VALUES ($1, 'Empty', $2)"
-    ))
-    .bind(empty_org)
-    .bind(format!("empty-{empty_org}"))
-    .execute(&harness.db.pool)
-    .await?;
-    let empty_keys = format!("/orgs/{empty_org}/api-keys");
-    let (status, error) = harness
-        .as_operator(
-            Method::POST,
-            &empty_keys,
-            &[],
-            Some(json!({"name": "nobody", "allowed_surfaces": ["ecw"]})),
-        )
-        .await;
-    assert_eq!(status, StatusCode::CONFLICT, "{error}");
-    assert!(
-        error["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("create a user first"),
-        "{error}"
-    );
-    let (_, listed) = harness
-        .as_operator(Method::GET, &empty_keys, &[], None)
-        .await;
-    assert_eq!(listed, json!([]));
     Ok(())
 }
 
@@ -430,7 +414,11 @@ async fn key_audit_targets_name_only_what_resolved() -> TestResult {
             Method::POST,
             &format!("/orgs/{}/api-keys", harness.tenant_org),
             &[],
-            Some(json!({"name": "tenant key", "allowed_surfaces": ["ecw"]})),
+            Some(json!({
+                "name": "tenant key",
+                "allowed_surfaces": ["ecw"],
+                "user_id": harness.tenant_admin,
+            })),
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "{created}");

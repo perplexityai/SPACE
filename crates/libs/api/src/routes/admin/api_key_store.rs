@@ -179,19 +179,5 @@ pub(super) async fn user_in_organization(
     .await
 }
 
-/// The organization's oldest user, ties broken by id; `None` when it has no
-/// users.
-pub(super) async fn oldest_user(
-    executor: impl PgExecutor<'_>,
-    org_id: OrgId,
-) -> Result<Option<UserId>, sqlx::Error> {
-    sqlx::query_scalar::<_, UserId>(sql!(
-        "SELECT id FROM users WHERE org_id = $1 ORDER BY created_at, id LIMIT 1"
-    ))
-    .bind(org_id)
-    .fetch_optional(executor)
-    .await
-}
-
 #[cfg(test)]
 mod tests;

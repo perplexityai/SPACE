@@ -27,7 +27,7 @@ pub(super) struct CreateApiKeyRequest {
     allowed_surfaces: Vec<ApiSurface>,
     /// The user of the organization the key acts as, recorded as its
     /// `created_by`. Defaults to the calling admin for the admin's own
-    /// organization, and to the organization's oldest user for another.
+    /// organization; required for another.
     #[serde(default)]
     user_id: Option<UserId>,
 }
@@ -122,11 +122,12 @@ pub(super) async fn list_api_keys(
 /// The key belongs to `org_id`, calls the APIs in `allowed_surfaces`, and acts
 /// as the user chosen here: `user_id`, which must be a user of the
 /// organization; else the calling admin, for a key of the admin's own
-/// organization, as before this route served other organizations; else the
-/// organization's oldest user. That user is stored as the key's `created_by`,
-/// the column every release's key lookup reads, so no release resolves the key
-/// to a different user or to none. An organization with no users answers 409,
-/// and so does a chosen user deleted before the key is stored.
+/// organization, as before this route served other organizations. A key of
+/// another organization without `user_id` answers 400: the route does not pick
+/// a user for the operator. That user is stored as the key's `created_by`, the
+/// column every release's key lookup reads, so no release resolves the key to a
+/// different user or to none. A chosen user deleted before the key is stored
+/// answers 409.
 ///
 /// The request's audit event names the calling admin, the organization, the
 /// new key and its user; the secret appears only in this response.
@@ -217,22 +218,22 @@ const API_KEY_CREATED_BY_FKEY: &str = "api_keys_created_by_fkey";
 
 /// Why no user could be chosen for a new key.
 enum KeyUserRefusal {
+    Required,
     NotInOrganization,
-    NoUsers,
     Read(sqlx::Error),
 }
 
 impl KeyUserRefusal {
     fn into_response(self) -> Response {
         match self {
+            Self::Required => api_error(
+                StatusCode::BAD_REQUEST,
+                "user_id is required for another organization's key",
+            )
+            .into_response(),
             Self::NotInOrganization => api_error(
                 StatusCode::BAD_REQUEST,
                 "user_id must name a user of the organization",
-            )
-            .into_response(),
-            Self::NoUsers => api_error(
-                StatusCode::CONFLICT,
-                "The organization has no users for the key to act as; create a user first",
             )
             .into_response(),
             Self::Read(error) => read_error(error),
@@ -256,11 +257,7 @@ async fn key_user(
                 Err(error) => Err(KeyUserRefusal::Read(error)),
             }
         }
-        None => match api_key_store::oldest_user(&state.pool, org_id).await {
-            Ok(Some(user_id)) => Ok(user_id),
-            Ok(None) => Err(KeyUserRefusal::NoUsers),
-            Err(error) => Err(KeyUserRefusal::Read(error)),
-        },
+        None => Err(KeyUserRefusal::Required),
     }
 }
 
