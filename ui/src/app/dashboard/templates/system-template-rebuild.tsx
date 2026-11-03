@@ -18,6 +18,7 @@ import {
   SystemTemplate,
   acceptJob,
   acceptTestSandbox,
+  applySubmitFailure,
   applyLost,
   applyStatus,
   buildFailureText,
@@ -43,6 +44,8 @@ import {
   submitFailureText,
   buildKeyClosed,
   buildKeyGeneration,
+  retiredBuilds,
+  type RetiredBuild,
   systemBuildIdempotencyKey,
   withNewBuildKey,
   systemBuildRequest,
@@ -66,6 +69,36 @@ const exclusive = <T,>(name: string, work: () => T): Promise<T> => exclusiveWith
 }, name, work);
 
 const digest = (hash: string | null | undefined) => <code>{shortHash(hash, 'none')}</code>;
+
+// A build attempt "Start a new build" replaced, which may still publish a
+// release of its own.
+function RetiredAttempt({ template, attempt }: { template: SystemTemplate; attempt: RetiredBuild }) {
+  const job = attempt.jobId ? <> job <Text code copyable>{attempt.jobId}</Text></> : null;
+  const where = (
+    <>
+      see <a href="#template-releases">Template Releases</a> below, and the {template} row&apos;s builds in the Templates
+      table above.
+    </>
+  );
+  const label = `Earlier attempt ${attempt.generation + 1}`;
+  if (attempt.outcome === 'not-started') {
+    return <Text type="secondary">{label} was not started{attempt.detail ? `: ${attempt.detail}` : ''}.</Text>;
+  }
+  if (attempt.outcome === 'started') {
+    return (
+      <Text type="warning">
+        {label} started{job}, which publishes a release of its own when it finishes: {where}
+      </Text>
+    );
+  }
+  return (
+    <Text type="warning">
+      {label}{job ? <>,{job},</> : null} has an unknown outcome{attempt.detail ? ` (${attempt.detail})` : ''}: it may still be
+      running and publish a release of its own; {where}
+    </Text>
+  );
+}
+
 // The digests a promotion of this run would move latest to.
 const targetsKey = (run: RebuildRun | null) => (run ? `${run.runId}:${run.seed?.content_hash ?? ''}:${run.codeRuntime?.content_hash ?? ''}` : '');
 
@@ -333,27 +366,31 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
     // Another tab may have started this build since this one rendered.
     if (!current || !canBuild(current, template)) return;
     const seedHash = template === 'code-runtime' && buildSucceeded(current.seed) ? current.seed.content_hash : undefined;
+    // The key generation this request sends. Another tab can start a new
+    // build while it is in flight; its answer then belongs to the retired
+    // attempt, never to the newer generation.
+    const generation = buildKeyGeneration(current, template);
     try {
       const accepted = await adminApi.post<TemplateBuildStart>(
         `/v1/system-templates/${template}/builds`,
         systemBuildRequest(template, seedHash),
-        { 'Idempotency-Key': systemBuildIdempotencyKey(current.runId, template, buildKeyGeneration(current, template)) },
+        { 'Idempotency-Key': systemBuildIdempotencyKey(current.runId, template, generation) },
       );
       const job: BuildJob = { job_id: accepted.job_id, state: 'pending', content_hash: null, error: null, lost: false };
       const recorded = await exclusive(lockName, () => {
-        const answer = acceptJob(live(current.runId), current.runId, template, job);
-        if (answer.kind === 'recorded' && !store(answer.run)) unsaved();
+        const answer = acceptJob(live(current.runId), current.runId, template, job, generation);
+        if ((answer.kind === 'recorded' || answer.kind === 'obsolete') && !store(answer.run)) unsaved();
         return answer;
       });
       outcome(jobOutcomeNotice(template, accepted.job_id, recorded));
     } catch (err) {
       const failure = submitFailureText(template, err);
-      if (failure.known) message.error(failure.text);
-      else await update(current.runId, (latest) => (jobOf(latest, template) ? null : {
-        ...latest,
-        submitUnknown: { ...latest.submitUnknown, [template]: failure.text },
-        keyClosed: failure.closed ? { ...latest.keyClosed, [template]: failure.closed } : latest.keyClosed,
-      }));
+      const applied = await exclusive(lockName, () => {
+        const answer = applySubmitFailure(live(current.runId), current.runId, template, generation, failure);
+        if (answer.run && !store(answer.run)) unsaved();
+        return answer;
+      });
+      if (failure.known && applied.current) message.error(failure.text);
     }
   });
 
@@ -597,6 +634,7 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
               Templates table above.
             </Text>
           ) : null}
+          {retiredBuilds(run, template).map((attempt) => <RetiredAttempt key={attempt.generation} template={template} attempt={attempt} />)}
           {trouble[template] ? <Text type="warning">{trouble[template]!.text.replace(/\.$/, '')}. Retrying in {Math.round(pollDelayMs(trouble[template]!.failures) / 1000)} s.</Text> : null}
           {test ? (
             <Text>

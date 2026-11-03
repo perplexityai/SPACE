@@ -37,6 +37,21 @@ export interface Promotion {
   confirmedAt: string;
 }
 
+// A build attempt "Start a new build" replaced: the key generation it sent,
+// the job the API named for it, if any, and what is known of its outcome. It
+// may still be running and publish a release of its own, so the panel keeps
+// showing it. A request of that generation that answers later is recorded
+// here, not as the run's build (`acceptJob`, `applySubmitFailure`).
+export interface RetiredBuild {
+  generation: number;
+  jobId: string | null;
+  // `unknown`: it may have started; `started`: a late answer named its job;
+  // `not-started`: a late answer refused it.
+  outcome: 'unknown' | 'started' | 'not-started';
+  // The API's message for a late refusal or failure.
+  detail: string | null;
+}
+
 export interface TestSandbox {
   id: string;
   createdAt: string;
@@ -61,6 +76,8 @@ export interface RebuildRun {
   // job it named, if any: building again with it can only answer the same.
   keyGeneration?: Partial<Record<SystemTemplate, number>>;
   keyClosed?: Partial<Record<SystemTemplate, { jobId: string | null }>>;
+  // The attempts "Start a new build" retired, oldest first (`RetiredBuild`).
+  retiredBuilds?: Partial<Record<SystemTemplate, RetiredBuild[]>>;
   testSandboxes: Partial<Record<SystemTemplate, TestSandbox>>;
   promotion: Promotion | null;
 }
@@ -150,8 +167,23 @@ export type Accepted<T> =
   | { kind: 'extra'; existing: T }
   | { kind: 'gone' };
 
-export function acceptJob(stored: RebuildRun | null, runId: string, template: SystemTemplate, job: BuildJob): Accepted<BuildJob> {
+// A build answer of a key generation "Start a new build" has since retired:
+// recorded on that retired attempt, not as the run's build.
+export type AcceptedJob = Accepted<BuildJob> | { kind: 'obsolete'; run: RebuildRun };
+
+// `generation` is the key generation the request sent, captured when it
+// started; only an answer of the current generation becomes the run's build.
+export function acceptJob(
+  stored: RebuildRun | null,
+  runId: string,
+  template: SystemTemplate,
+  job: BuildJob,
+  generation: number,
+): AcceptedJob {
   if (!stored || stored.runId !== runId) return { kind: 'gone' };
+  if (generation !== buildKeyGeneration(stored, template)) {
+    return { kind: 'obsolete', run: withRetiredOutcome(stored, template, generation, { outcome: 'started', jobId: job.job_id, detail: null }) };
+  }
   const existing = jobOf(stored, template);
   if (existing) return { kind: 'extra', existing };
   const { [template]: _dropped, ...submitUnknown } = stored.submitUnknown;
@@ -161,9 +193,10 @@ export function acceptJob(stored: RebuildRun | null, runId: string, template: Sy
 
 // What the tab that sent a build says about its answer: nothing when the
 // run recorded it.
-export function jobOutcomeNotice(template: SystemTemplate, jobId: string, outcome: Accepted<BuildJob>): string | null {
+export function jobOutcomeNotice(template: SystemTemplate, jobId: string, outcome: AcceptedJob): string | null {
   switch (outcome.kind) {
     case 'recorded':
+    case 'obsolete':
       return null;
     case 'extra':
       return `Another click also started ${template} job ${jobId}; this run follows job ${outcome.existing.job_id}. The extra job publishes a release of its own.`;
@@ -251,17 +284,81 @@ export function buildKeyClosed(run: RebuildRun, template: SystemTemplate): { job
   return run.keyClosed?.[template] ?? null;
 }
 
-// "Start a new build": the next build of `template` sends a new key, and the
-// closed key's notice is cleared. The earlier build may still be running and
+export function retiredBuilds(run: RebuildRun, template: SystemTemplate): RetiredBuild[] {
+  return run.retiredBuilds?.[template] ?? [];
+}
+
+// "Start a new build": the next build of `template` sends a new key. Only the
+// notice that blocked building is cleared; the attempt it was about is kept
+// as retired, with the job the 409 named, since it may still be running and
 // publish a release of its own.
 export function withNewBuildKey(run: RebuildRun, template: SystemTemplate): RebuildRun {
-  const { [template]: _closed, ...keyClosed } = run.keyClosed ?? {};
+  const { [template]: closed, ...keyClosed } = run.keyClosed ?? {};
   const { [template]: _unknown, ...submitUnknown } = run.submitUnknown;
+  const generation = buildKeyGeneration(run, template);
+  const retired = retiredBuilds(run, template).filter((attempt) => attempt.generation !== generation);
   return {
     ...run,
     submitUnknown,
     keyClosed,
-    keyGeneration: { ...run.keyGeneration, [template]: buildKeyGeneration(run, template) + 1 },
+    keyGeneration: { ...run.keyGeneration, [template]: generation + 1 },
+    retiredBuilds: {
+      ...run.retiredBuilds,
+      [template]: [...retired, { generation, jobId: closed?.jobId ?? null, outcome: 'unknown', detail: null }],
+    },
+  };
+}
+
+// A late answer for a retired attempt. A started job is never downgraded: a
+// later answer of the same key cannot undo it.
+function withRetiredOutcome(
+  run: RebuildRun,
+  template: SystemTemplate,
+  generation: number,
+  answer: Omit<RetiredBuild, 'generation'>,
+): RebuildRun {
+  const attempts = retiredBuilds(run, template);
+  const earlier = attempts.find((attempt) => attempt.generation === generation);
+  const next: RetiredBuild = earlier?.outcome === 'started'
+    ? earlier
+    : { generation, jobId: answer.jobId ?? earlier?.jobId ?? null, outcome: answer.outcome, detail: answer.detail };
+  const others = attempts.filter((attempt) => attempt.generation !== generation);
+  return {
+    ...run,
+    retiredBuilds: { ...run.retiredBuilds, [template]: [...others, next].sort((a, b) => a.generation - b.generation) },
+  };
+}
+
+// A build request that failed, sent with key `generation`. For the current
+// generation it records the unknown outcome and a closed key, unless the run
+// already has a job; a refusal (`known`) records nothing and `current` says
+// the tab should show it. For a retired generation it updates that attempt.
+export function applySubmitFailure(
+  stored: RebuildRun | null,
+  runId: string,
+  template: SystemTemplate,
+  generation: number,
+  failure: { known: boolean; text: string; closed?: { jobId: string | null }; detail: string },
+): { run: RebuildRun | null; current: boolean } {
+  if (!stored || stored.runId !== runId) return { run: null, current: true };
+  if (generation !== buildKeyGeneration(stored, template)) {
+    return {
+      run: withRetiredOutcome(stored, template, generation, {
+        outcome: failure.known ? 'not-started' : 'unknown',
+        jobId: failure.closed?.jobId ?? null,
+        detail: failure.detail,
+      }),
+      current: false,
+    };
+  }
+  if (failure.known || jobOf(stored, template)) return { run: null, current: true };
+  return {
+    run: {
+      ...stored,
+      submitUnknown: { ...stored.submitUnknown, [template]: failure.text },
+      keyClosed: failure.closed ? { ...stored.keyClosed, [template]: failure.closed } : stored.keyClosed,
+    },
+    current: true,
   };
 }
 
@@ -282,27 +379,30 @@ function sameKeyConflict(err: unknown): { retryable: boolean; jobId: string | nu
   return { retryable: retryable !== false, jobId: value('job_id') };
 }
 
+// `detail` is the API's message alone, for a retired attempt's row.
 export function submitFailureText(
   template: SystemTemplate,
   err: unknown,
-): { known: boolean; text: string; closed?: { jobId: string | null } } {
+): { known: boolean; text: string; detail: string; closed?: { jobId: string | null } } {
   const { status, message } = failure(err);
-  const conflict = status === 409 ? sameKeyConflict(err) : null;
+    const conflict = status === 409 ? sameKeyConflict(err) : null;
   if (conflict && conflict.retryable) {
-    return { known: false, text: `The ${template} build may still be being submitted; build again shortly: ${message}` };
+    return { known: false, detail: message, text: `The ${template} build may still be being submitted; build again shortly: ${message}` };
   }
   if (conflict) {
     return {
       known: false,
+      detail: message,
       closed: { jobId: conflict.jobId },
       text: `The ${template} build sent earlier has an unknown outcome: it may have started and may still be running` +
         `${conflict.jobId ? ` as job ${conflict.jobId}` : ''}. Building again with the same request answers the same. ` +
         'Check Template Releases and the template\'s builds; start a new build only if neither shows it.',
     };
   }
-  if (refused(status)) return { known: true, text: `The ${template} build was not started: ${message}` };
+  if (refused(status)) return { known: true, detail: message, text: `The ${template} build was not started: ${message}` };
   return {
     known: false,
+    detail: message,
     text: `The ${template} build request failed (${message}), and the builder may have accepted it. An accepted build ` +
       'appears in Template Releases only when it finishes. Building again resends the same Idempotency-Key: an API ' +
       'release that recorded the first build answers with it, one that could not tell whether the builder took it ' +
@@ -454,6 +554,14 @@ function isJob(v: unknown): v is BuildJob {
     && typeof v.lost === 'boolean';
 }
 
+function isRetiredBuild(v: unknown): v is RetiredBuild {
+  return isObject(v)
+    && Number.isInteger(v.generation) && (v.generation as number) >= 0
+    && (v.jobId === null || (typeof v.jobId === 'string' && v.jobId.length > 0))
+    && (v.outcome === 'unknown' || v.outcome === 'started' || v.outcome === 'not-started')
+    && (v.detail === null || typeof v.detail === 'string');
+}
+
 function isPromotion(v: unknown): v is Promotion {
   return isObject(v)
     && Object.keys(v).every((k) => k === 'previous' || k === 'targets' || k === 'confirmedAt')
@@ -479,6 +587,8 @@ function isRun(v: unknown): v is RebuildRun {
       .every(([k, n]) => (k === 'seed' || k === 'code-runtime') && Number.isInteger(n) && (n as number) >= 0)))
     && (v.keyClosed === undefined || (isObject(v.keyClosed) && Object.entries(v.keyClosed)
       .every(([k, c]) => (k === 'seed' || k === 'code-runtime') && isObject(c) && (c.jobId === null || typeof c.jobId === 'string'))))
+    && (v.retiredBuilds === undefined || (isObject(v.retiredBuilds) && Object.entries(v.retiredBuilds)
+      .every(([k, attempts]) => (k === 'seed' || k === 'code-runtime') && Array.isArray(attempts) && attempts.every(isRetiredBuild))))
     && isObject(v.testSandboxes) && Object.entries(v.testSandboxes).every(([k, t]) => (k === 'seed' || k === 'code-runtime')
       && isObject(t) && typeof t.id === 'string' && t.id.length > 0 && typeof t.createdAt === 'string')
     && (v.promotion === null || isPromotion(v.promotion));

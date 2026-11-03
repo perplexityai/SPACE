@@ -5,6 +5,7 @@ import {
   acceptJob,
   acceptTestSandbox,
   applyLost,
+  applySubmitFailure,
   buildKeyClosed,
   buildKeyGeneration,
   applyStatus,
@@ -18,6 +19,7 @@ import {
   pollDelayMs,
   promotionPlan,
   promotionState,
+  retiredBuilds,
   samePlan,
   sandboxOutcomeNotice,
   storageKey,
@@ -62,14 +64,14 @@ test('each step is offered once: a build only while its step has no job', () => 
 
 test('an answer is recorded only into the still-empty step it was sent for', () => {
   const run = start();
-  const first = acceptJob(run, 'run-1', 'seed', job('pending', null, 'job-a'));
+  const first = acceptJob(run, 'run-1', 'seed', job('pending', null, 'job-a'), 0);
   assert.equal(first.kind, 'recorded');
   // Another tab's click got there first: its job is reported, not recorded.
-  const second = acceptJob(first.run, 'run-1', 'seed', job('pending', null, 'job-b'));
+  const second = acceptJob(first.run, 'run-1', 'seed', job('pending', null, 'job-b'), 0);
   assert.equal(second.kind, 'extra');
   assert.equal(second.existing.job_id, 'job-a');
-  assert.equal(acceptJob(null, 'run-1', 'seed', job('pending')).kind, 'gone');
-  assert.equal(acceptJob(run, 'run-0', 'seed', job('pending')).kind, 'gone');
+  assert.equal(acceptJob(null, 'run-1', 'seed', job('pending'), 0).kind, 'gone');
+  assert.equal(acceptJob(run, 'run-0', 'seed', job('pending'), 0).kind, 'gone');
   const seeded = withJob(run, 'seed', job('succeeded', SEED));
   const sandbox = acceptTestSandbox(seeded, 'run-1', 'seed', { id: 'sbx_a', createdAt: '2026-11-01T00:00:00Z' });
   assert.equal(sandbox.kind, 'recorded');
@@ -286,28 +288,94 @@ test('the unknown-outcome text says what building again with the same key can an
   assert.doesNotMatch(text, /a retry returns the first build/);
 });
 
-test('"Start a new build" sends a new key for that template only, and a recorded job clears the closed key', () => {
+test('"Start a new build" sends a new key for that template only, and keeps the attempt it replaced', () => {
   const closed = { ...start(), submitUnknown: { seed: 'unknown outcome' }, keyClosed: { seed: { jobId: 'job-x' } } };
   assert.equal(buildKeyGeneration(closed, 'seed'), 0);
   assert.deepEqual(buildKeyClosed(closed, 'seed'), { jobId: 'job-x' });
   const renewed = withNewBuildKey(closed, 'seed');
   assert.equal(buildKeyGeneration(renewed, 'seed'), 1);
   assert.equal(buildKeyGeneration(renewed, 'code-runtime'), 0);
+  // Only the notice that blocked building is cleared.
   assert.equal(buildKeyClosed(renewed, 'seed'), null);
   assert.deepEqual(renewed.submitUnknown, {});
+  // The attempt, and the job the 409 named, stay shown as unresolved.
+  assert.deepEqual(retiredBuilds(renewed, 'seed'), [{ generation: 0, jobId: 'job-x', outcome: 'unknown', detail: null }]);
+  assert.deepEqual(retiredBuilds(renewed, 'code-runtime'), []);
   const first = systemBuildIdempotencyKey(ids.runId, 'seed', buildKeyGeneration(closed, 'seed'));
   const second = systemBuildIdempotencyKey(ids.runId, 'seed', buildKeyGeneration(renewed, 'seed'));
   assert.notEqual(first, second);
   // Generation 0 is the key runs stored before generations used.
   assert.equal(first, systemBuildIdempotencyKey(ids.runId, 'seed'));
-  assert.equal(buildKeyGeneration(withNewBuildKey(renewed, 'seed'), 'seed'), 2);
-  const recorded = acceptJob(closed, ids.runId, 'seed', job('pending', null, 'job-y'));
+  // A second new build keeps both earlier attempts, oldest first.
+  const third = withNewBuildKey({ ...renewed, keyClosed: { seed: { jobId: null } } }, 'seed');
+  assert.equal(buildKeyGeneration(third, 'seed'), 2);
+  assert.deepEqual(retiredBuilds(third, 'seed').map((attempt) => [attempt.generation, attempt.jobId]), [[0, 'job-x'], [1, null]]);
+  // The new generation's job is the run's build; the retired attempt stays.
+  const recorded = acceptJob(renewed, ids.runId, 'seed', job('pending', null, 'job-y'), 1);
   assert.equal(recorded.kind, 'recorded');
-  assert.equal(buildKeyClosed(recorded.run, 'seed'), null);
+  assert.equal(recorded.run.seed.job_id, 'job-y');
+  assert.equal(retiredBuilds(recorded.run, 'seed').length, 1);
+});
+
+const serverError = (message) => Object.assign(new Error(message), { status: 500 });
+
+test("two interleaved generations: an old request's answer never closes or fills the newer one", () => {
+  // Generation 0's request is in flight when another tab starts a new build.
+  const closedGen0 = { ...start(), submitUnknown: { seed: 'unknown outcome' }, keyClosed: { seed: { jobId: 'job-x' } } };
+  const gen1 = withNewBuildKey(closedGen0, 'seed');
+  // Generation 0 answers the closed-key 409 after generation 1 was sent: the
+  // newer generation is not closed, and the old attempt keeps the job.
+  const late409 = submitFailureText('seed', conflict('unknown outcome', false, [
+    { key: 'reserved_at', value: '2026-11-03T05:00:00Z' },
+    { key: 'job_id', value: 'job-x' },
+  ]));
+  const afterLate409 = applySubmitFailure(gen1, ids.runId, 'seed', 0, late409);
+  assert.equal(afterLate409.current, false);
+  assert.equal(buildKeyClosed(afterLate409.run, 'seed'), null);
+  assert.deepEqual(afterLate409.run.submitUnknown, {});
+  assert.equal(canBuild(afterLate409.run, 'seed'), true);
+  // Generation 1 fails with an unknown outcome: that one is the run's.
+  const gen1Unknown = applySubmitFailure(afterLate409.run, ids.runId, 'seed', 1, submitFailureText('seed', serverError('synthetic 502')));
+  assert.equal(gen1Unknown.current, true);
+  assert.match(gen1Unknown.run.submitUnknown.seed, /synthetic 502/);
+  // Generation 0 then answers with its job: kept on the retired attempt,
+  // not recorded as the run's build, and generation 1 stays open to retry.
+  const late = acceptJob(gen1Unknown.run, ids.runId, 'seed', job('pending', null, 'job-old'), 0);
+  assert.equal(late.kind, 'obsolete');
+  assert.equal(late.run.seed, null);
+  assert.match(late.run.submitUnknown.seed, /synthetic 502/);
+  assert.deepEqual(retiredBuilds(late.run, 'seed'), [{ generation: 0, jobId: 'job-old', outcome: 'started', detail: null }]);
+  assert.equal(jobOutcomeNotice('seed', 'job-old', late), null);
+  // A later refusal of that key does not undo the job it started.
+  const refusedLater = applySubmitFailure(late.run, ids.runId, 'seed', 0, submitFailureText('seed', Object.assign(new Error('synthetic refusal'), { status: 400 })));
+  assert.deepEqual(retiredBuilds(refusedLater.run, 'seed')[0].outcome, 'started');
+  // Generation 1's own job is the run's build.
+  const current = acceptJob(late.run, ids.runId, 'seed', job('pending', null, 'job-new'), 1);
+  assert.equal(current.kind, 'recorded');
+  assert.equal(current.run.seed.job_id, 'job-new');
+  assert.equal(current.run.submitUnknown.seed, undefined);
+});
+
+test('a late refusal or failure of a retired attempt says what it came to; one of the current attempt is shown', () => {
+  const gen1 = withNewBuildKey({ ...start(), keyClosed: { seed: { jobId: null } } }, 'seed');
+  const refused = applySubmitFailure(gen1, ids.runId, 'seed', 0, submitFailureText('seed', Object.assign(new Error('synthetic refusal'), { status: 400 })));
+  assert.equal(refused.current, false);
+  assert.deepEqual(retiredBuilds(refused.run, 'seed'), [{ generation: 0, jobId: null, outcome: 'not-started', detail: 'synthetic refusal' }]);
+  const unknown = applySubmitFailure(gen1, ids.runId, 'seed', 0, submitFailureText('seed', serverError('synthetic 503')));
+  assert.deepEqual(retiredBuilds(unknown.run, 'seed'), [{ generation: 0, jobId: null, outcome: 'unknown', detail: 'synthetic 503' }]);
+  // The current attempt's refusal records nothing; the tab shows it.
+  assert.deepEqual(applySubmitFailure(gen1, ids.runId, 'seed', 1, submitFailureText('seed', Object.assign(new Error('x'), { status: 400 }))), { run: null, current: true });
+  // A dismissed run takes nothing.
+  assert.deepEqual(applySubmitFailure(gen1, 'run-0', 'seed', 0, submitFailureText('seed', serverError('x'))), { run: null, current: true });
 });
 
 test('a stored run keeps its key generations and closed keys, and runs stored before them still load', () => {
-  const run = { ...start(), keyGeneration: { seed: 2 }, keyClosed: { 'code-runtime': { jobId: null } } };
+  const run = {
+    ...start(),
+    keyGeneration: { seed: 2 },
+    keyClosed: { 'code-runtime': { jobId: null } },
+    retiredBuilds: { seed: [{ generation: 0, jobId: 'job-x', outcome: 'unknown', detail: null }, { generation: 1, jobId: null, outcome: 'not-started', detail: 'synthetic' }] },
+  };
   const at = Date.parse(run.startedAt);
   assert.deepEqual(parseStoredRun(JSON.stringify(run), ids, at + 1000), run);
   assert.deepEqual(parseStoredRun(JSON.stringify(start()), ids, at + 1000), start());
@@ -316,6 +384,9 @@ test('a stored run keeps its key generations and closed keys, and runs stored be
     { ...start(), keyGeneration: { other: 1 } },
     { ...start(), keyClosed: { seed: { jobId: 7 } } },
     { ...start(), keyClosed: { seed: 'job-x' } },
+    { ...start(), retiredBuilds: { seed: { generation: 0 } } },
+    { ...start(), retiredBuilds: { seed: [{ generation: 0, jobId: '', outcome: 'unknown', detail: null }] } },
+    { ...start(), retiredBuilds: { seed: [{ generation: 0, jobId: null, outcome: 'lost', detail: null }] } },
   ]) {
     assert.equal(parseStoredRun(JSON.stringify(bad), ids, at + 1000), null, JSON.stringify(bad));
   }
