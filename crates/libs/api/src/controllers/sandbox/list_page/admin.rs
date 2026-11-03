@@ -94,9 +94,13 @@ pub struct AdminSandboxFilter {
 }
 
 impl AdminSandboxFilter {
-    /// Whether no filter is set. Only the unfiltered list carries the
-    /// node-reported rows with no sandbox row: they belong to no org, and
-    /// none of the other filters can be applied to them.
+    /// Whether no filter is set. Only then does the list carry the
+    /// node-reported rows with no sandbox row (pool slots and observed-local
+    /// sandboxes). They are not in the keyset order the cursor walks, and the
+    /// filters are written against sandbox rows, so every filter leaves them
+    /// out, even one that could describe them: `template`, or
+    /// [`NodeAssignment::Unassigned`], since their response reports no
+    /// `active_node_id`.
     pub fn is_unfiltered(&self) -> bool {
         let Self {
             org_id,
@@ -121,7 +125,9 @@ impl AdminSandboxFilter {
 
 /// The node a sandbox is assigned to, as the list response reports it in
 /// `active_node_id`: its Direct route's current node when it has a route,
-/// else its row's `active_node_id`.
+/// else its row's `active_node_id`. Like every filter, it lists sandbox rows
+/// only, so [`Self::Unassigned`] leaves out the node-reported rows that the
+/// unfiltered list appends (see [`AdminSandboxFilter::is_unfiltered`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeAssignment {
     Node(NodeId),
