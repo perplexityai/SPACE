@@ -1,6 +1,7 @@
 fn main() {
-    // sqlx::migrate! tracks existing files, but a newly added migration must
-    // also invalidate the embedded schema.
+    // Template manager: sqlx::migrate! embeds db/template-manager and
+    // db/common into pplx-space-template-mgr. It tracks existing files, but a
+    // newly added migration must also invalidate the embedded schema.
     watch("../../../../db/template-manager");
     watch("../../../../db/common");
 }

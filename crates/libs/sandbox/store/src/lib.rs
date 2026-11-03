@@ -49,7 +49,7 @@
 //! * **Locking reads are not gets.** `SELECT ... FOR UPDATE` acquires a row
 //!   lock inside a caller's transaction; converting one to [`get`] would drop
 //!   the lock. They stay at their call sites.
-//! * **The node-local SQLite `sandboxes` table** (`crates/libs/sbx/`) is a
+//! * **The node-local SQLite `sandboxes` table** (`crates/libs/sbx/mgr/store`) is a
 //!   different database on a different machine and is out of scope.
 //!
 //! * **Composed predicates are in scope, on terms.** Most verbs here are row

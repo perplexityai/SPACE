@@ -1078,11 +1078,11 @@ fn otlp_names_stay_unique_across_the_catalog() {
         }
     }
 
-    let crates = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("crates/libs");
     let mut names = Vec::new();
-    names_in(&crates.join("metrics/src"), &mut names);
+    names_in(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("../metrics/src"),
+        &mut names,
+    );
     names_in(
         &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
         &mut names,

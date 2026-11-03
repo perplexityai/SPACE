@@ -80,8 +80,9 @@ Use focused unit tests for component logic and the [Kind smoke suites](infra/spa
 ## Repository layout
 
 ```text
-crates/apps/            CLI tools and service binaries
-crates/libs/            Shared Rust libraries
+crates/<layer>/         Rust crates by layer: l10_foundation, l20_domain, l30_storage,
+                        l40_api, l50_app, test_support, tools (crates/<layer>/AGENTS.md)
+crates/apps/, crates/libs/  Crates that predate the layer directories, until they move
 docs/                   Architecture, setup, API walkthrough, and troubleshooting
 examples/               Runnable API examples without an SDK dependency
 proto/                  gRPC protobuf definitions

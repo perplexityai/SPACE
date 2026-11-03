@@ -6161,20 +6161,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pplx-space-mock-llm-svc"
-version = "0.8.0"
-dependencies = [
- "anyhow",
- "axum",
- "clap",
- "pplx-space-common-svc",
- "serde_json",
- "time",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "pplx-space-net-common"
 version = "0.8.0"
 dependencies = [

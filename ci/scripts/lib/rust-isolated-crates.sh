@@ -17,8 +17,8 @@
 # library, other than common-core and common-svc, that reaches common-core at
 # most directly. No other workspace member in its normal dependency graph may
 # reach common-core or common-svc. A crate split out of the two is linted once
-# it depends on nothing else that reaches them, and a new crate under
-# crates/libs/ joins without a CI edit. A crate that reaches common-core
+# it depends on nothing else that reaches them, and a new library joins
+# without a CI edit, wherever it lives. A crate that reaches common-core
 # through another crate builds that crate's graph too, so linting all of them
 # would take several times as long; the workspace clippy still lints them.
 #

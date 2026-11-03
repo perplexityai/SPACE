@@ -118,7 +118,7 @@
 //!
 //! Per the repo-wide rule against background work in API servers (see
 //! AGENTS.md), this loop runs in the cluster-singleton controller binary
-//! (`space-cluster-controller`, in `crates/apps/cluster-controller/`).
+//! (`space-cluster-controller`, in `crates/apps/cluster/controller/svc`).
 //!
 //! The reconciler is intentionally testable through two seams: a
 //! [`NodeDrainSink`] for DB + suspend/restore + sandbox-listing and an

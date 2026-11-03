@@ -1,6 +1,7 @@
 fn main() {
-    // sqlx::migrate! tracks existing files, but a newly added migration must
-    // also invalidate the embedded schema.
+    // Volume manager: sqlx::migrate! embeds db/volume-manager and
+    // db/common into pplx-space-volmgr. It tracks existing files, but a
+    // newly added migration must also invalidate the embedded schema.
     watch("../../../../../db/volume-manager");
     watch("../../../../../db/common");
 }

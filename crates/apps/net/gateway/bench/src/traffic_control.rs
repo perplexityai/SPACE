@@ -36,6 +36,7 @@ const ATTEMPT: &str = "01990000-0000-7000-8000-000000000003";
 const NETWORK_CREDENTIAL_REFERENCE: &str = "01990000-0000-7000-8000-000000000004";
 
 #[derive(Parser)]
+#[command(name = "netgtw-traffic-control")]
 struct Cli {
     #[command(subcommand)]
     command: Command,

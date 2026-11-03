@@ -33,7 +33,7 @@ docker/Dockerfile.kind-sts-bridge
 docker/Dockerfile.kind-fake-ec2
 templates/firecracker/seed/**
 templates/firecracker/recipes/seed.toml
-# The cluster-controller's binary, and its library after crates/libs/build:
+# The cluster-controller's binary and library:
 # leader election, the retention sweeper, the orphaned-restore-pod GC and
 # node groups each have Kind scenarios.
 crates/apps/cluster/controller/**

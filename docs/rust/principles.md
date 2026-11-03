@@ -151,7 +151,7 @@ Three rules that follow from this:
 2. **In SPACE, leave error enums exhaustive** (no `#[non_exhaustive]`) — every callsite gets a compile error when a variant is added, which is the point. `#[non_exhaustive]` is only for crates that ship as an external SDK; SPACE's first stability boundary is proto.
 3. **The `std::io::Error` pattern is the gold standard for vocabulary errors:** an opaque struct with a small `Kind` enum exposed for programmatic handling and a boxed `source: Box<dyn Error + Send + Sync>` for the underlying cause. Reach for this shape when an error must be *both* inspectable and future-proof — typically only for crate-level errors that cross many boundaries.
 
-**`anyhow` belongs in `main` and bin crates only.** Library crates in `crates/libs/` must return typed errors. `anyhow::Error` in a public lib signature erases the caller's ability to handle anything.
+**`anyhow` belongs in `main` and bin crates only.** Library crates (in `crates/libs/` and the `l10`–`l40` layer directories) must return typed errors. `anyhow::Error` in a public lib signature erases the caller's ability to handle anything.
 
 **Sources:**
 - Sabrina Jewson, https://sabrinajewson.org/blog/errors

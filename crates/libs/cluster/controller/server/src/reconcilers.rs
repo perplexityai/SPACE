@@ -4,7 +4,7 @@
 //! `tokio::time::interval` (with `MissedTickBehavior::Delay`) and listens on a
 //! child `CancellationToken` for graceful shutdown. To add a reconciler:
 //!
-//! 1. Implement the loop (e.g. in `crates/libs/...`) with a `Config::from_env()`
+//! 1. Implement the loop (in the API crate that owns it) with a `Config::from_env()`
 //!    helper for deploy-time knobs and a `run(pool, substrate, shutdown)` entry.
 //! 2. Spawn it from `run_reconcilers` below as a `tokio::spawn(...)` line.
 //! 3. Wire its env vars into the owning deployment configuration.

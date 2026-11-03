@@ -19,6 +19,12 @@ Some documents predate current code. Treat divergence as a finding to resolve,
 not automatic proof that the document is stale. Localized `AGENTS.md` files add
 constraints for their subtrees.
 
+Every workspace crate has a layer. A new or moved crate lives in its layer's
+directory under `crates/`, whose `AGENTS.md` says what belongs there; crates
+that predate those directories are listed in `[rules.layers.unmoved]` until
+they move. archcheck's `layers` rule (`crates/tools/archcheck/README.md`)
+enforces placement and dependency direction.
+
 Repository skills live under `.agents/plugins/pplx-space/skills/` and are
 exposed through `.agents/skills/` and `.claude/skills/`. Load a skill only when
 its description matches the task.

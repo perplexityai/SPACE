@@ -1,15 +1,17 @@
-# `crates/libs/spaced`
+# The spaced host and guest crates
 
 The spaced crates share one wire contract, `proto/spaced`. A guest from an
 older release keeps running against newer hosts; the guest-compatibility
-section of `docs/versioning.md` is the policy.
+section of `docs/versioning.md` is the policy, and
+`crates/libs/spaced/common/AGENTS.md` says how to change the supported-guest
+floor.
 
 ## Changes
 
 - Host changes must keep accepting every guest in
-  `SUPPORTED_SPACED_GUEST_VERSIONS` (`common/src/compatibility.rs`), including
-  guests in templates and dormant snapshots. Raising the floor is its own
-  change with a migration plan.
+  `SUPPORTED_SPACED_GUEST_VERSIONS`
+  (`crates/libs/spaced/common/src/compatibility.rs`), including guests in
+  templates and dormant snapshots.
 - Change `proto/spaced` additively. Keep field numbers, types and RPCs until
   every version that uses them is retired. A guest-side legacy endpoint also
   needs the minimum host version, and its marker says so, as
@@ -21,7 +23,7 @@ section of `docs/versioning.md` is the policy.
   `guest_capability_unsupported_status` (`crates/libs/common/grpc`).
 - Host fallbacks to legacy guest RPCs fall back only on `Unimplemented`; a
   transport failure never switches protocol or repeats a started stream
-  (`host/server/src/compat.rs`). Mark each legacy path with
+  (`crates/libs/spaced/host/server/src/compat.rs`). Mark each legacy path with
   `SPACED_COMPAT_REMOVE_WHEN_MIN_GUEST_<version>`.
 - New spaced-host RPCs on the host listener are authorized by UDS peer (root
   or the sbx-mgr account) in `HostAuthorizationLayer`. New bridge-host RPCs,

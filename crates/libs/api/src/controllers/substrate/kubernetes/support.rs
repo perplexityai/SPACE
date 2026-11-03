@@ -1038,7 +1038,7 @@ pub(super) enum CancelCause {
     /// node-manager — defer to the reconciler GC instead. Cleanup of both
     /// the K8s pod and the `pod_tracking` DB row is the orphaned-sandbox
     /// reconciler's `OrphanKind::Normal` path
-    /// (`libs/cluster/controller/server/src/orphaned_sandboxes.rs`), which
+    /// (`crates/libs/cluster/controller/server/src/orphaned_sandboxes.rs`), which
     /// fires for `lifecycle='creating'` rows whose pod is missing past
     /// `CREATE_AGE_THRESHOLD_SECS`.
     NodeMgrUnreachable,

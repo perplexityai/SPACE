@@ -268,6 +268,8 @@ fn sbxmgr_sqlite_counts_opens_through_imported_names() {
 fn sbxmgr_sqlite_schema_matches_the_migrators_sandbox_manager_database() {
     let crossings = [
         "use pplx_space_sbxmgr_migrations::SANDBOX_MANAGER_MIGRATOR;",
+        // The migrations crate's name alone, so that its pattern is what matches.
+        "use pplx_space_sbxmgr_migrations as migrations;",
         "default_path: paths::SANDBOX_MANAGER_DB,",
         "Database::SandboxManager(args) => run_sqlite(sqlite_sandbox_manager(), args).await,",
         "fn sqlite_sandbox_manager() -> SqliteDatabase {",

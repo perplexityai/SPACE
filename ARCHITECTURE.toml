@@ -158,7 +158,8 @@ patterns = [
 allow = [
   "**/*_tests/**",
   "**/test_support.rs",
-  "**/test_support/**",
+  # a crate's test-support modules, not the whole test_support layer
+  "crates/*/**/test_support/**",
   "**/*_test_support.rs",
   "**/test_fixtures.rs",
   "**/*_test_fixture.rs",
@@ -210,12 +211,11 @@ mode = "required"
 # sbx-mgr's node-local SQLite database also has a `sandboxes` table, a
 # different database on a different machine with its own store and fences
 # (`sbxmgr_sqlite` and `dependency_fence.sbxmgr_*` below), so its crates are
-# allowed whole, by the globs those rules guard: `crates/l*/{sbx,sbxmgr}/**`
-# and `crates/apps/sbx/**`. Today they match all of `crates/libs/sbx` and
-# `crates/apps/sbx`; as the crates move, they match the layer directories'
-# `sbx` crates and the `sbxmgr` paths of `pplx-space-sbxmgr-svc` and
-# `pplx-space-sbxmgr-migrations` until those are renamed. A narrower glob
-# would make this required rule fire on moves within sbx-mgr. Test files are
+# allowed whole, by the globs those rules guard: `crates/l*/sbx/**` matches
+# every directory named `sbx` directly below `crates/libs` or an `l*` layer
+# directory, and any other glob in the list adds sbx crates that are
+# elsewhere. A narrower glob would make this required rule fire on moves
+# within sbx-mgr. Test files are
 # filename-based, so `allow` adds the `#[cfg(test)]` support modules and
 # fixtures, which write rows to set up their cases; `#[cfg(test)]` code inline
 # in a production file counts, so test-only writes go in a `*_tests` file.
@@ -237,11 +237,12 @@ patterns = [
 allow = [
   "crates/libs/sandbox/store/**",
   # node-local sbx-mgr SQLite `sandboxes`: a different database
-  "crates/l*/{sbx,sbxmgr}/**",
+  "crates/l*/sbx/**",
   "crates/apps/sbx/**",
   "**/*_tests/**",
   "**/test_support.rs",
-  "**/test_support/**",
+  # a crate's test-support modules, not the whole test_support layer
+  "crates/*/**/test_support/**",
   "**/*_test_support.rs",
   "**/test_fixtures.rs",
   "**/*_test_fixture.rs",
@@ -349,7 +350,7 @@ mode = "required"
 # graph assertion cover them. Other services' crates use rusqlite for their own databases, so
 # `include` limits the rule to sbx-mgr's.
 [rules.pattern_ratchet.sbxmgr_sqlite]
-include = ["crates/l*/{sbx,sbxmgr}/**", "crates/apps/sbx/**"]
+include = ["crates/l*/sbx/**", "crates/apps/sbx/**"]
 patterns = [
   '\brusqlite\s*::',
   '\buse\s+(?:::\s*)?rusqlite\b',
@@ -425,7 +426,7 @@ mode = "required"
 # dependency, for any target, under any name.
 [rules.dependency_fence.sbxmgr_rusqlite]
 packages = ["libsqlite3-sys", "pplx-space-sqlite", "rusqlite"]
-members = ["crates/l*/{sbx,sbxmgr}/**", "crates/apps/sbx/**"]
+members = ["crates/l*/sbx/**", "crates/apps/sbx/**"]
 allow = ["crates/libs/sbx/mgr/store"]
 
 [rules.dependency_fence.sbxmgr_rusqlite.no_crossing]
@@ -436,7 +437,7 @@ mode = "required"
 # names their `Migrator` type.
 [rules.dependency_fence.sbxmgr_sqlx]
 packages = ["sqlx", "sqlx-core", "sqlx-sqlite"]
-members = ["crates/l*/{sbx,sbxmgr}/**", "crates/apps/sbx/**"]
+members = ["crates/l*/sbx/**", "crates/apps/sbx/**"]
 allow = ["crates/libs/sbx/mgr/store", "crates/libs/sbx/mgr/migrations"]
 
 [rules.dependency_fence.sbxmgr_sqlx.no_crossing]
@@ -642,7 +643,6 @@ l50_app = [
 test_support = [
   "pplx-space-db-test-fixtures",
   "pplx-space-mock-branching-key-provider-svc",
-  "pplx-space-mock-llm-svc",
   "pplx-space-node-api-sim",
   "pplx-space-test-env",
 ]

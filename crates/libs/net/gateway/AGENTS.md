@@ -23,7 +23,7 @@
   reconciles DNS work, attribution caches, and established TCP connections
   before publishing a policy. Egress decision rules belong in `egress`.
 - A new control RPC authorizes its peer first, with `ALLOW_NET_SERVICE`
-  unless read-only (`ALLOW_NET_OBSERVER`) (`server/src/control.rs`).
+  unless read-only (`ALLOW_NET_OBSERVER`) (`crates/libs/net/gateway/server/src/control.rs`).
 
 ## Tests
 
