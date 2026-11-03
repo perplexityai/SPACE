@@ -41,7 +41,7 @@ test = [
 # Install with `uv sync --frozen --python 3.11 --group console`, then the
 # browser, which is not a Python dependency:
 # `uv run --frozen --python 3.11 python -m playwright install --with-deps chromium`.
-# Without either, the scenarios skip.
+# Without either, the scenarios skip, or fail a run that requires them.
 console = [
     "playwright==1.64.1",
     # Playwright's event emitter, pinned so the lock holds one release for

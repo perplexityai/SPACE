@@ -15,7 +15,7 @@ from space_smoke.direct_node import DirectNodeRecoveryFixture
 from space_smoke.fixtures import CommandSandboxFixture, Ecw, KindEcw
 from space_smoke.native_hardening import NativeHardeningFixture
 from space_smoke.native_recovery import KindNativeHardeningFixture
-from space_smoke.runtime import ScenarioContext
+from space_smoke.runtime import ScenarioContext, SmokeConfigurationError
 from space_smoke.services import SmokeServices
 
 # The fixture type is the scenario's capability declaration; requesting a
@@ -79,6 +79,12 @@ class Scenario(Generic[Fixture]):
 
     def run(self, context: ScenarioContext, services: SmokeServices) -> None:
         context.record("scenario_id", self.id)
+        # Before the fixture creates anything: a scenario run by name that
+        # cannot launch its browser ends inconclusive, having created nothing.
+        if self.browser is not None:
+            reason = services.browser_unavailable(self.browser)
+            if reason is not None:
+                raise SmokeConfigurationError(f"{self.id} needs a {self.browser} browser; {reason}")
         self.verify(
             services.fixture(
                 self.fixture_type,
@@ -136,8 +142,9 @@ def scenario(
     whose own waits outlast it; it never lowers it.
     `browser` names the browser the scenario drives a web UI through
     (`space_smoke.console`); implicit selection skips it, visibly, where that
-    browser cannot launch, and withholds it, visibly, when the runner sets
-    SPACE_SMOKE_BROWSER_SCENARIOS=withhold.
+    browser cannot launch, fails the suite there when the runner sets
+    SPACE_SMOKE_BROWSER_SCENARIOS=require, and withholds it, visibly, when the
+    runner sets SPACE_SMOKE_BROWSER_SCENARIOS=withhold.
     `substrates` narrows the control-plane substrates the fixture serves
     (`FIXTURE_SUBSTRATES`) for what a substrate does not support by contract,
     such as sandbox pods on Direct. A Direct-only defect is not a narrowing:

@@ -157,13 +157,21 @@ uv run --frozen --python 3.11 python -m playwright install --with-deps chromium
 
 A later `uv run --frozen` keeps the group. Without either, a suite run
 prints each scenario `SKIPPED ...: needs a chromium browser` with the
-reason, and a run by name ends inconclusive. `SPACE_SMOKE_CONSOLE_URL`
-overrides the console origin (default `http://127.0.0.1:3000`, Tilt's
-`space-ui` forward), and `SPACE_SMOKE_BROWSER_SCENARIOS=withhold` leaves them
-out, visibly.
+reason, and a run by name ends inconclusive before its fixture creates
+anything. `SPACE_SMOKE_BROWSER_SCENARIOS` selects them:
 
-Kind CI withholds them. Pull CI's selector can run them when a pull request
-changes a path in `ci/kind-console-paths.txt`, behind the
+- unset or `run`: run them where the browser launches, and skip them,
+  visibly, where it does not;
+- `require`: run them, and fail the suite (exit 2) where the browser does not
+  launch, as CI does when it selected them;
+- `withhold`: leave them out, visibly, before the shard partition, so the
+  shards are those of a registry without them.
+
+`SPACE_SMOKE_CONSOLE_URL` overrides the console origin (default
+`http://127.0.0.1:3000`, Tilt's `space-ui` forward).
+
+Kind CI withholds them. Pull CI's selector can require them when a pull
+request changes a path in `ci/kind-console-paths.txt`, behind the
 `SPACE_KIND_CONSOLE_SMOKE` switch in `.github/workflows/pull-ci.yml`, which
 is off until the Kind runners carry the group and the browser.
 
