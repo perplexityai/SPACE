@@ -136,9 +136,11 @@ key() {
   local family hard lock
   cd "${REPO_ROOT}"
   family="space-target-v2-${RUNNER_OS:-Linux}-${RUNNER_ARCH:-X64}-kind-test-hooks"
-  hard="$(for path in "${HARD_INPUTS[@]}"; do
+  # Whether rustc keeps incremental data changes what the target directory
+  # holds, so a state built one way is never restored for the other.
+  hard="$({ for path in "${HARD_INPUTS[@]}"; do
     printf '%s %s\n' "${path}" "$(sha256sum "${path}" | cut -d' ' -f1)"
-  done | sha256sum | cut -c1-16)"
+  done; printf 'incremental-codegen %s\n' "${SPACE_KIND_RUST_INCREMENTAL_CODEGEN:-0}"; } | sha256sum | cut -c1-16)"
   lock="$(sha256sum Cargo.lock | cut -c1-16)"
   output hard "${family}-${hard}-"
   output lock "${family}-${hard}-${lock}-"

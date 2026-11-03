@@ -112,9 +112,14 @@ jobs:
       # and main-ci.yml's kind_rust_state save alike. Main never restores: its
       # state is built cold. Setting the repository variable
       # SPACE_KIND_RUST_STATE to `off` turns both off.
+      # The state keeps rustc's incremental data, so a crate rebuilt because a
+      # dependency changed recompiles only the code that did. The key and the
+      # build must agree, here and in main-ci.yml's kind_rust_state.
       - name: Name the Kind Rust build state
         id: state-key
         if: steps.reuse.outputs.reused != 'true' && inputs.rust_build != 'release' && vars.SPACE_KIND_RUST_STATE != 'off'
+        env:
+          SPACE_KIND_RUST_INCREMENTAL_CODEGEN: "1"
         run: bash infra/space/kind/scripts/rust-state-cache.sh key
 
       - name: Restore main's Kind Rust build state
@@ -139,6 +144,7 @@ jobs:
         env:
           SPACE_CI_IMAGE_MIRROR: ghcr
           SPACE_KIND_RUST_ARTIFACTS: ${{ steps.state.outputs.restored == 'true' && 'incremental' || 'docker' }}
+          SPACE_KIND_RUST_INCREMENTAL_CODEGEN: "1"
           SPACE_KIND_RUST_BUILD: ${{ inputs.rust_build == 'release' && 'release' || '' }}
           SPACE_KIND_BUILD_CACHE_REPOSITORY: ghcr.io/perplexityai/space-kind-build-cache
           SPACE_KIND_BUILD_CACHE_WRITE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && '1' || '0' }}
