@@ -12,7 +12,8 @@
 # SPACE node a sparse btrfs cache image (/var/lib/space-cache.img, up to 40 GiB)
 # that grows with sandboxes and suspends, and on the infra node the object
 # store's data. When that disk fills, btrfs on every SPACE node goes read-only
-# and sandbox creates fail with "Read-only file system" until a teardown. So
+# and sandbox creates fail with "Read-only file system" until the node restarts
+# (docker restart reformats its cache) or the cluster is torn down. So
 # its default minimum adds SPACE_NODE_GIB for each SPACE node in the cluster
 # template to the bring-up's own.
 #
@@ -65,8 +66,8 @@ if [[ -n "$docker_root" && -e "$docker_root" ]] && low "the Docker data root" "$
   say "It also holds each node's /var: the btrfs cache image of each of the"
   say "$space_nodes SPACE nodes (sparse, up to 40 GiB each), which grows with sandboxes and"
   say "suspends, and the object store's data. If it fills, btrfs on every SPACE node"
-  say "goes read-only, sandbox creates fail with \"Read-only file system\", and only a"
-  say "teardown recovers: give the Docker data root more space."
+  say "goes read-only and sandbox creates fail with \"Read-only file system\" until"
+  say "the node restarts (its cache is reformatted) or a teardown: give the Docker data root more space."
   say "Image builds may fail part-way. Safe to run:"
   say "  python3 $kind_dir/scripts/prune-superseded-images.py --host --cluster $cluster"
   say "      with the cluster up, removes superseded builds of SPACE's own images but"
