@@ -32,6 +32,8 @@ def test_chart_and_executed_shim_share_isolated_identity(mode, global_overlay, t
     settings = config.configuration(
         {
             "SPACE_KIND_TELEMETRY_MODE": mode,
+            # An Agent to send native traces to; without one they are off.
+            "SPACE_KIND_DATADOG_MODE": "fakeintake",
             "SPACE_KIND_ENV": "local-kind-owner-box",
             "SPACE_KIND_VERSION": "abc123",
             "SPACE_KIND_PHASE": "after-datadog",
@@ -268,6 +270,7 @@ def test_chart_otlp_endpoints_can_be_overridden_independently(chart, role):
         },
         {"SPACE_KIND_TELEMETRY_MODE": "otel", "SPACE_KIND_SHIM_OTLP_ENDPOINT": LOCAL_ENDPOINT},
         {"SPACE_KIND_TELEMETRY_MODE": "datadog"},
+        {"SPACE_KIND_TELEMETRY_MODE": "datadog", "SPACE_KIND_DATADOG_MODE": "fakeintake"},
         {"SPACE_KIND_TELEMETRY_MODE": "off"},
     ],
 )
@@ -284,7 +287,7 @@ def test_profile_reaches_runtime_supervisor_node_environment(environment, role):
         if container["name"] == "kind-node-env"
     )
     env = {entry["name"]: entry.get("value") for entry in init["env"]}
-    metrics, traces = config.MODES[settings["mode"]]
+    metrics, traces = settings["metrics_sink"], settings["trace_exporter"]
     assert env["SPACE_METRICS_SINK"] == metrics
     assert env["SPACE_TRACE_EXPORTER"] == traces
     if settings["mode"] == "otel":
@@ -541,6 +544,34 @@ def test_kind_defaults_to_datadog_without_authorizing_backend_install():
     settings = config.configuration({})
     assert settings["mode"] == "datadog"
     assert settings["install_observability"] is False
+
+
+@pytest.mark.parametrize(
+    "backend,traces",
+    [(None, "off"), ("off", "off"), ("fakeintake", "datadog"), ("saas", "datadog")],
+)
+def test_native_traces_need_a_deployed_agent(backend, traces):
+    """With no Agent, native trace export would only log refused connections."""
+    environment = {"SPACE_KIND_TELEMETRY_MODE": "datadog"}
+    if backend is not None:
+        environment["SPACE_KIND_DATADOG_MODE"] = backend
+    settings = config.configuration(environment)
+    assert f"telemetry.traceExporter={traces}" in settings["helm_set"]
+    # DogStatsD is fire-and-forget, so metrics keep the native sink.
+    assert "telemetry.metricsSink=datadog" in settings["helm_set"]
+    wrapper = config.shim_wrapper(settings, "/usr/bin/env", "local")
+    assert f"export SPACE_TRACE_EXPORTER={traces}\n" in wrapper
+    assert "export SPACE_METRICS_SINK=datadog\n" in wrapper
+    assert ("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT" in wrapper) == (traces != "off")
+
+
+@pytest.mark.parametrize("backend", ["Off", "none", "datadog"])
+def test_unknown_datadog_backend_is_rejected_not_read_as_an_agent(backend):
+    """A typo must not leave native traces pointed at an Agent that was never deployed."""
+    environment = {"SPACE_KIND_TELEMETRY_MODE": "datadog", "SPACE_KIND_DATADOG_MODE": backend}
+    with pytest.raises(ValueError, match="SPACE_KIND_DATADOG_MODE"):
+        config.configuration(environment)
+    assert config.datadog_backend({}) == "off"
 
 
 @pytest.mark.parametrize(

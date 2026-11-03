@@ -143,6 +143,18 @@ def token(value, name, *, empty=False):
     return value
 
 
+
+DATADOG_BACKENDS = ("off", "fakeintake", "saas")
+
+
+def datadog_backend(env):
+    """The Datadog backend Kind deploys. Both the deploy plan and trace export read it here."""
+    backend = env.get("SPACE_KIND_DATADOG_MODE", "off")
+    if backend not in DATADOG_BACKENDS:
+        raise ValueError("SPACE_KIND_DATADOG_MODE must be off, fakeintake, or saas")
+    return backend
+
+
 def configuration(env):
     kind_cluster = env.get("SPACE_KIND_CLUSTER", "space-local")
     if not re.fullmatch(r"(?:space-local(?:-[a-z0-9]+(?:-[a-z0-9]+)*)?|space-oss-[0-9a-f]{10})", kind_cluster):
@@ -209,11 +221,18 @@ def configuration(env):
     version = f"{revision}-{phase}" if revision and phase else revision
     commit = checkout_commit()
     metrics, traces = MODES[mode]
+    # Native traces go to a node-local Agent, and SPACE_KIND_DATADOG_MODE=off
+    # deploys none: every exporter would retry a refused connection and log
+    # each failure. DogStatsD metrics are fire-and-forget UDP, so they stay.
+    if mode == "datadog" and datadog_backend(env) == "off":
+        traces = "off"
     observability = env.get("SPACE_KIND_OBSERVABILITY", "auto")
     if observability not in {"auto", "off"}:
         raise ValueError("SPACE_KIND_OBSERVABILITY must be auto or off")
     config = {
         "mode": mode,
+        "metrics_sink": metrics,
+        "trace_exporter": traces,
         "observability": observability,
         "install_observability": observability == "auto" and mode == "otel",
         "endpoints": endpoints,
@@ -295,7 +314,7 @@ def exports_otlp(config):
 
 def shim_wrapper(config, binary, fallback_version):
     version = config["version"] or config["commit"] or fallback_version
-    metrics, traces = MODES[config["mode"]]
+    metrics, traces = config["metrics_sink"], config["trace_exporter"]
     values = {
         "SPACE_CLUSTER_ID": config["cluster_id"],
         "SPACE_TRACE_EXPORTER": traces,

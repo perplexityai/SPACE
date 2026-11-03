@@ -12,7 +12,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from telemetry_config import configuration, options
+from telemetry_config import configuration, datadog_backend, options
 
 ROOT = Path(__file__).resolve().parents[4]
 CHART = ROOT / "infra/space/kind/charts/datadog-agent-local"
@@ -52,9 +52,7 @@ SITES = {
 
 def plan(env):
     result = configuration(env)
-    mode = env.get("SPACE_KIND_DATADOG_MODE", "off")
-    if mode not in {"off", "fakeintake", "saas"}:
-        raise ValueError("SPACE_KIND_DATADOG_MODE must be off, fakeintake, or saas")
+    mode = datadog_backend(env)
     result.update(
         backend=mode,
         context="kind-" + result["kind_cluster"],
