@@ -1,4 +1,3 @@
-use crate::routes::public::error::database_error;
 use pplx_space_common_core::sql;
 use std::str::FromStr;
 
@@ -14,9 +13,9 @@ use pplx_space_common_core::env::{
 };
 use pplx_space_common_core::types::{IdempotencyKey, NodePoolName, OrgId, SandboxId, UserId};
 use pplx_space_public_api::{
-    CreateCommandRequest, CreateSandboxRequest as PublicCreateSandboxRequest, OperationId,
-    OperationKind, OperationTargetType, PublicSandboxId, RequestFingerprint,
-    RollbackSandboxRequest, SandboxLifecycleAction, SandboxOperationResponse,
+    CreateSandboxRequest as PublicCreateSandboxRequest, OperationId, OperationKind,
+    OperationTargetType, PublicSandboxId, RequestFingerprint, RollbackSandboxRequest,
+    SandboxLifecycleAction, SandboxOperationResponse,
     UpdateSandboxRequest as PublicUpdateSandboxRequest,
 };
 use serde::Deserialize;
@@ -38,16 +37,12 @@ use crate::routes::AppState;
 use crate::routes::admin::support::{
     self, ContentionScope, IDEMPOTENCY_KEY_HEADER, require_managing_org_admin,
 };
-use crate::routes::public::error::PublicApiError;
 use crate::routes::public::hidden_operations;
 use crate::routes::public::sandboxes::parse_rollback_body;
-use crate::routes::public::sessions::{
-    RouteIdempotency, create_command_session, idempotency_key as session_idempotency_key,
-};
 use pplx_space_public_api::routes as native_routes;
 
 mod guest_access;
-pub use guest_access::{create_terminal_session, list_snapshots};
+pub use guest_access::{create_command, create_terminal_session, list_snapshots};
 
 const ADMIN_SANDBOX_ACTION_PREFIX: &str = "force-";
 /// Distinct from the public `/v1/sandboxes` template so admin and public
@@ -57,10 +52,6 @@ const ADMIN_CREATE_SANDBOX_PATH_TEMPLATE: &str = "/v1/sandboxes:admin-create";
 /// public idempotency records never collide on the same key.
 const ADMIN_UPDATE_SANDBOX_PATH_TEMPLATE: &str = "/v1/sandboxes/{sandbox_id}:admin-update";
 const ADMIN_UPDATE_ACTION_LABEL: &str = "admin-update";
-/// The idempotency scope of the admin command route, distinct from the public
-/// route's so a request with the same key and body on the other route never
-/// replays this route's session and rotates its attach token, nor the reverse.
-const ADMIN_COMMAND_PATH_TEMPLATE: &str = "/v1/sandboxes/{sandbox_id}/commands:admin";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AdminSandboxTarget {
@@ -537,66 +528,6 @@ pub async fn dispatch_sandbox_action(
         }
     };
     (audit_target, response).into_response()
-}
-
-/// Run a one-shot command in a sandbox from the operator surface.
-///
-/// The admin console lists sandboxes across every org, so the org-scoped public
-/// command endpoint rejects every sandbox the operator does not personally own
-/// with "sandbox not found". This handler resolves the sandbox without an org
-/// filter and runs the command under the sandbox's owning org, mirroring
-/// `dispatch_sandbox_action`. Its idempotency keys are its own (see
-/// [`ADMIN_COMMAND_PATH_TEMPLATE`]). Managing-org admin is already enforced by
-/// the admin auth middleware, and the same middleware records an admin audit
-/// event for the request.
-pub async fn create_command(
-    State(state): State<AppState>,
-    Extension(AuthUser(actor)): Extension<AuthUser>,
-    headers: HeaderMap,
-    Path(spec): Path<String>,
-    Json(request): Json<CreateCommandRequest>,
-) -> axum::response::Response {
-    let target = match AdminSandboxTarget::parse(&spec) {
-        Ok(target) => target,
-        Err(error) => return PublicApiError::bad_request(error.to_string()).into_response(),
-    };
-    let sandbox = match fetch_admin_sandbox(&state.pool, target)
-        .await
-        // `database_error` classifies contention (and attaches
-        // `Retry-After`), so this lookup answers the same 503 the list handler
-        // does rather than a flat 500. It logs both cases itself — a
-        // lost race at `warn` under "public api statement lost a lock race",
-        // a real failure at `error` under "public api database error" — so
-        // there is no hand-rolled log here. The `sandbox_id` is recoverable
-        // from the `http.server` span's `url.path`, which carries it.
-        .map_err(database_error)
-        .and_then(|sandbox| sandbox.ok_or_else(|| PublicApiError::not_found("sandbox not found")))
-    {
-        Ok(sandbox) => sandbox,
-        Err(error) => return error.into_response(),
-    };
-    let result = async {
-        let idempotency_key = session_idempotency_key(&headers)?;
-        create_command_session(
-            &state.public_session_store(),
-            sandbox.org_id,
-            actor.id,
-            target.public_id,
-            request,
-            RouteIdempotency {
-                key: idempotency_key,
-                path_template: OperationPathTemplate::new(ADMIN_COMMAND_PATH_TEMPLATE),
-            },
-            || Ok(()),
-        )
-        .await
-    }
-    .await
-    .map(|command| (StatusCode::CREATED, Json(command)));
-    guest_access::with_target(
-        AdminAuditTarget::sandbox(sandbox.org_id, target.public_id),
-        result,
-    )
 }
 
 /// Update a sandbox (network policy, auto-lifecycle, metadata) from the

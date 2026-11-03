@@ -55,19 +55,20 @@ mod sandboxes;
 // inside this router (`debug::admin_v1_debug_router`, merged by `v1_router`
 // below) and takes `support::contention_disposition` from here, so the whole
 // `/admin/api/v1` tree agrees on the *status* a lost lock race gets. The body
-// still differs by module: this layer, `templates`, and `sandboxes`'
-// `create_command` render a `PublicErrorEnvelope`; `sandboxes`' action
-// handlers render `{"error", "operation_id", "retryable"}`; `identity` a
-// `{"error": …}` that every 409 extends with a `reason` (a user or
-// organization delete's blocker, an email in use, or a self-mutation; and,
-// for a user held only by deleted sandboxes or an organization held only by
-// deleted templates whose retention end is known, `retained_until`), never
-// named `code`, which in the envelope is the status category; the rest a bare
-// `{"error": …}` with no retry field. `Retry-After` comes only from the two
-// paths that answer through `PublicApiError` — this layer, and
-// `create_command`, which has two — its sandbox lookup through
-// `database_error` and its session write through
-// `From<PublicSessionStoreError>`, both landing on `lock_contention()`.
+// still differs by module: this layer, `templates`, and the routes in
+// `sandboxes::guest_access` that mirror public ones render a
+// `PublicErrorEnvelope`; `sandboxes`' action handlers render
+// `{"error", "operation_id", "retryable"}`; `identity` a `{"error": …}` that
+// every 409 extends with a `reason` (a user or organization delete's blocker,
+// an email in use, or a self-mutation; and, for a user held only by deleted
+// sandboxes or an organization held only by deleted templates whose retention
+// end is known, `retained_until`), never named `code`, which in the envelope
+// is the status category, and that a 400 for one invalid field extends with
+// its `field`; the rest a bare `{"error": …}` with no retry field.
+// `Retry-After` comes only from the paths that answer through
+// `PublicApiError` — this layer, and the mirror routes, through their sandbox
+// lookup's `database_error` and the command and terminal session writes'
+// `From<PublicSessionStoreError>`, all landing on `lock_contention()`.
 pub(in crate::routes) mod support;
 mod template_store;
 mod template_visibility;

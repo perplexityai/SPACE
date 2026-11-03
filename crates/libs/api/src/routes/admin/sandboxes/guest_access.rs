@@ -1,5 +1,5 @@
 //! Operator access to any organization's sandbox through routes that mirror
-//! public, org-scoped ones: terminal sessions and the snapshot list.
+//! public, org-scoped ones: commands, terminal sessions and the snapshot list.
 
 use axum::{
     Extension, Json,
@@ -7,7 +7,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use pplx_space_public_api::{CreateTerminalSessionRequest, PublicSandboxId};
+use pplx_space_public_api::{CreateCommandRequest, CreateTerminalSessionRequest, PublicSandboxId};
 
 use super::{AdminSandboxTarget, fetch_admin_sandbox};
 use crate::middleware::auth::AuthUser;
@@ -17,7 +17,8 @@ use crate::routes::AppState;
 use crate::routes::admin::audit::AdminAuditTarget;
 use crate::routes::public::error::{PublicApiError, database_error};
 use crate::routes::public::sessions::{
-    create_terminal_session_for_sandbox, idempotency_key as session_idempotency_key,
+    RouteIdempotency, create_command_session, create_terminal_session_for_sandbox,
+    idempotency_key as session_idempotency_key,
 };
 use crate::routes::public::snapshots::{ListSnapshotsQuery, snapshot_page};
 
@@ -26,13 +27,58 @@ use crate::routes::public::snapshots::{ListSnapshotsQuery, snapshot_page};
 /// replays this route's session and rotates its attach token, nor the reverse.
 const ADMIN_TERMINAL_SESSION_PATH_TEMPLATE: &str =
     "/v1/sandboxes/{sandbox_id}/terminal-sessions:admin";
+/// The idempotency scope of the admin command route, apart from the public
+/// route's for the same reason as [`ADMIN_TERMINAL_SESSION_PATH_TEMPLATE`].
+const ADMIN_COMMAND_PATH_TEMPLATE: &str = "/v1/sandboxes/{sandbox_id}/commands:admin";
+
+/// Run a one-shot command in a sandbox from the operator surface.
+///
+/// The admin console lists sandboxes across every org, so the org-scoped public
+/// command endpoint rejects every sandbox the operator does not personally own
+/// with "sandbox not found". This handler resolves the sandbox without an org
+/// filter and runs the command under the sandbox's owning org, mirroring
+/// `dispatch_sandbox_action`. Its idempotency keys are its own (see
+/// [`ADMIN_COMMAND_PATH_TEMPLATE`]). Managing-org admin is already enforced by
+/// the admin auth middleware, and the same middleware records an admin audit
+/// event for the request.
+pub async fn create_command(
+    State(state): State<AppState>,
+    Extension(AuthUser(actor)): Extension<AuthUser>,
+    headers: HeaderMap,
+    Path(spec): Path<String>,
+    Json(request): Json<CreateCommandRequest>,
+) -> Response {
+    let (public_id, sandbox) = match resolve_sandbox(&state, &spec).await {
+        Ok(resolved) => resolved,
+        Err(error) => return error.into_response(),
+    };
+    let result = async {
+        let idempotency_key = session_idempotency_key(&headers)?;
+        create_command_session(
+            &state.public_session_store(),
+            sandbox.org_id,
+            actor.id,
+            public_id,
+            request,
+            RouteIdempotency {
+                key: idempotency_key,
+                path_template: OperationPathTemplate::new(ADMIN_COMMAND_PATH_TEMPLATE),
+            },
+            || Ok(()),
+        )
+        .await
+    }
+    .await
+    .map(|command| (StatusCode::CREATED, Json(command)));
+    with_target(AdminAuditTarget::sandbox(sandbox.org_id, public_id), result)
+}
 
 /// Open a terminal session in any organization's sandbox from the operator
 /// surface.
 ///
 /// The admin equivalent of the public `POST /v1/sandboxes/{id}/terminal-sessions`,
 /// which answers "sandbox not found" for a sandbox outside the caller's org.
-/// Like [`super::create_command`], it resolves the sandbox without an org
+/// Like [`create_command`], it resolves the sandbox without an org
 /// filter and creates the session under the sandbox's owning org through the
 /// public route's session store: its attach token connects to this one session
 /// only and expires on the same schedule. Its idempotency keys are its own (see
@@ -102,7 +148,13 @@ async fn resolve_sandbox(
 ) -> Result<(PublicSandboxId, Sandbox), PublicApiError> {
     let target = AdminSandboxTarget::parse(spec)
         .map_err(|error| PublicApiError::bad_request(error.to_string()))?;
-    // Contention on this lookup is classified as on `create_command`.
+    // `database_error` classifies contention (and attaches `Retry-After`), so
+    // this lookup answers the same 503 the list handler does rather than a
+    // flat 500. It logs both cases itself — a lost race at `warn` under
+    // "public api statement lost a lock race", a real failure at `error` under
+    // "public api database error" — so there is no hand-rolled log here. The
+    // `sandbox_id` is recoverable from the `http.server` span's `url.path`,
+    // which carries it.
     let sandbox = fetch_admin_sandbox(&state.pool, target)
         .await
         .map_err(database_error)?
@@ -112,7 +164,7 @@ async fn resolve_sandbox(
 
 /// A handler's answer, success or refusal, carrying the resolved `target` for
 /// the audit event.
-pub(super) fn with_target(
+fn with_target(
     target: AdminAuditTarget,
     result: Result<impl IntoResponse, PublicApiError>,
 ) -> Response {
