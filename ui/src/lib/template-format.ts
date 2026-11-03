@@ -56,3 +56,50 @@ export function tagHolderChange(
   const to = tagHolder(after, tag);
   return from === to ? null : { from, to };
 }
+
+// The tag holders a retag dialog sends as preconditions: those it opened
+// with, except a tag whose move it has shown (`change`).
+export interface RetagBaseline {
+  holders: Record<string, string>;
+  change: { tag: string; from: string | null; to: string | null } | null;
+}
+
+// What OK does in the retag dialog for `tag`, given the page's releases now.
+// When the tag moved since the dialog last showed it, nothing is sent: the
+// dialog shows the move, and only that tag's precondition advances to where
+// it is now, so OK again moves it from there, and only while it is still
+// there. Every other tag keeps the holder the dialog opened with, so
+// switching to another tag that also moved warns again rather than
+// overwriting that move.
+export function retagStep(
+  baseline: RetagBaseline,
+  holdersNow: Record<string, string>,
+  tag: string,
+): { kind: 'warn'; baseline: RetagBaseline } | { kind: 'move'; expected: string | null } {
+  const change = tagHolderChange(baseline.holders, holdersNow, tag);
+  if (!change) return { kind: 'move', expected: tagHolder(baseline.holders, tag) };
+  const holders = { ...baseline.holders };
+  if (change.to === null) delete holders[tag];
+  else holders[tag] = change.to;
+  return { kind: 'warn', baseline: { holders, change: { tag, ...change } } };
+}
+
+// What a template row's builds panel shows: the template, whether the row is
+// expanded, and the page refresh it last saw.
+export interface BuildsView {
+  templateName: string;
+  open: boolean;
+  reloadKey: number;
+}
+
+// Whether the builds panel reads its builds as its view changes: `load` (no
+// rows to keep) when it first opens or shows another template, `background`
+// (keeping the rows it shows) when it opens again or the page refreshes while
+// it is open, and never while it is collapsed. The table keeps a collapsed
+// row's panel mounted, so the page's refreshes still reach it.
+export function buildsRead(previous: BuildsView | null, next: BuildsView): 'load' | 'background' | null {
+  if (!next.open) return null;
+  if (!previous || previous.templateName !== next.templateName) return 'load';
+  if (!previous.open || previous.reloadKey !== next.reloadKey) return 'background';
+  return null;
+}

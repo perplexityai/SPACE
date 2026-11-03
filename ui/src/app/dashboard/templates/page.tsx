@@ -23,7 +23,8 @@ import {
   Sandbox,
 } from '@/lib/types';
 import { tablePagination } from '@/lib/table-pagination';
-import { LATEST_TAG as DEFAULT_TEMPLATE_TAG, errorMessage, shortHash, tagHolder, tagHolderChange, tagHolders } from '@/lib/template-format';
+import { LATEST_TAG as DEFAULT_TEMPLATE_TAG, buildsRead, errorMessage, retagStep, shortHash, tagHolders, type BuildsView, type RetagBaseline } from '@/lib/template-format';
+import { singleFlight } from '@/lib/single-flight';
 import { TAG_PRECONDITION_UNCHECKED, isMissingRoute, moveReleaseTag, pageRows, tagMoveFailureMessage } from '@/lib/admin-fallback';
 import { SPACED_SAMPLE_LIMIT, SpacedCounts, loadSpacedCounts, spacedCoverage } from '@/lib/spaced-counts';
 import SystemTemplateRebuild from './system-template-rebuild';
@@ -349,11 +350,12 @@ function hasAutoLifecyclePolicy(policy: Template['default_auto_lifecycle']) {
 const TEMPLATE_BUILDS_LIMIT = 20;
 
 // The template's newest builds, from `GET /templates/{name}/builds`. Releases
-// that predate the route answer 405 (the path is POST-only there). The panel
-// reads them again on each of the page's refreshes (`reloadKey`), keeping the
-// rows it shows until the new answer arrives; each answer decides afresh
-// whether the route exists.
-function TemplateBuildsPanel({ templateName, reloadKey }: { templateName: string; reloadKey: number }) {
+// that predate the route answer 405 (the path is POST-only there). While its
+// row is expanded (`open`), the panel reads them again on each of the page's
+// refreshes (`reloadKey`), keeping the rows it shows until the new answer
+// arrives; collapsed, it reads nothing (`buildsRead`). Each answer decides
+// afresh whether the route exists.
+function TemplateBuildsPanel({ templateName, open, reloadKey }: { templateName: string; open: boolean; reloadKey: number }) {
   const { token } = theme.useToken();
   const [builds, setBuilds] = useState<TemplateBuildListEntry[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -384,15 +386,13 @@ function TemplateBuildsPanel({ templateName, reloadKey }: { templateName: string
       });
   };
 
-  useEffect(() => load(), [templateName]);
-  const firstReload = useRef(true);
+  const shown = useRef<BuildsView | null>(null);
   useEffect(() => {
-    if (firstReload.current) {
-      firstReload.current = false;
-      return;
-    }
-    load(true);
-  }, [reloadKey]);
+    const view = { templateName, open, reloadKey };
+    const read = buildsRead(shown.current, view);
+    shown.current = view;
+    if (read) load(read === 'background');
+  }, [templateName, open, reloadKey]);
 
   if (unsupported) {
     return <Text type="secondary">This API release does not list a template&apos;s builds.</Text>;
@@ -622,19 +622,20 @@ export default function TemplatesPage() {
   });
   const [retagForm] = Form.useForm();
   // `holders` is which release held each of the template's tags when the
-  // dialog opened, or when the operator last saw `change`: the precondition
-  // the move sends. A refresh while the dialog is open does not change it.
-  const [retagModal, setRetagModal] = useState<{
-    open: boolean;
-    release: TemplateRelease | null;
-    holders: Record<string, string>;
-    change: { tag: string; from: string | null; to: string | null } | null;
-  }>({
+  // dialog opened, except a tag whose move `change` showed (`retagStep`):
+  // the precondition the move sends. A refresh while the dialog is open does
+  // not change it.
+  const [retagModal, setRetagModal] = useState<{ open: boolean; release: TemplateRelease | null } & RetagBaseline>({
     open: false,
     release: null,
     holders: {},
     change: null,
   });
+  // A second OK while the move is in flight would send the same precondition
+  // again and read as a 412 "tag moved" (the first press moved it).
+  const retagFlight = useRef(singleFlight()).current;
+  const [retagSubmitting, setRetagSubmitting] = useState(false);
+  const retagTagInput = Form.useWatch('tag', retagForm) as string | undefined;
   const [expandedTemplateRows, setExpandedTemplateRows] = useState<string[]>([]);
   const [templateOperations, setTemplateOperations] = useState<Set<string>>(() => new Set());
   const [buildingSnapshot, setBuildingSnapshot] = useState<string | null>(null);
@@ -974,26 +975,26 @@ export default function TemplatesPage() {
     return holder ? `${holder.template_name}@${shortHash(holder.content_hash)}` : `release ${releaseId}`;
   };
 
-  const handleRetagRelease = async (values: { tag: string }) => {
+  const handleRetagRelease = (values: { tag: string }) => retagFlight.run(async () => {
     const release = retagModal.release;
     if (!release || !canManageTemplateReleases) return;
 
     const tag = values.tag.trim();
     // The releases refreshed while the dialog was open: if the tag moved
     // meanwhile, show where it is now and ask again before moving it.
-    const holdersNow = tagHolders(templateReleases, release.template_name);
-    const change = tagHolderChange(retagModal.holders, holdersNow, tag);
-    if (change) {
-      setRetagModal((current) => ({ ...current, holders: holdersNow, change: { tag, ...change } }));
+    const step = retagStep(retagModal, tagHolders(templateReleases, release.template_name), tag);
+    if (step.kind === 'warn') {
+      setRetagModal((current) => ({ ...current, ...step.baseline }));
       return;
     }
+    setRetagSubmitting(true);
     try {
       // Moved only while the tag still points where the operator saw it.
       const { checked } = await moveReleaseTag(
         (path, body) => adminApi.put(path, body),
         release.id,
         tag,
-        tagHolder(retagModal.holders, tag),
+        step.expected,
       );
       closeRetagModal();
       await refreshTemplateReleases({ showLoading: false });
@@ -1001,8 +1002,10 @@ export default function TemplatesPage() {
       else message.warning(`Template release tag updated. ${TAG_PRECONDITION_UNCHECKED}`);
     } catch (err: unknown) {
       message.error(tagMoveFailureMessage(err));
+    } finally {
+      setRetagSubmitting(false);
     }
-  };
+  });
 
   const handleDeleteReleaseTag = async (release: TemplateRelease, tag: string) => {
     if (!canManageTemplateReleases || !canDeleteVisibleTemplateTag(tag)) return;
@@ -2169,9 +2172,9 @@ export default function TemplatesPage() {
         expandable={{
           expandedRowKeys: expandedTemplateRows,
           onExpandedRowsChange: (keys) => setExpandedTemplateRows(keys.map(String)),
-          expandedRowRender: (record) => (
+          expandedRowRender: (record, _index, _indent, expanded) => (
             <Space orientation="vertical" size={12} style={{ width: '100%' }}>
-              <TemplateBuildsPanel templateName={record.name} reloadKey={refreshGeneration} />
+              <TemplateBuildsPanel templateName={record.name} open={expanded} reloadKey={refreshGeneration} />
               {isDirectSubstrate && hasObservedPoolSandboxes(record) ? <PoolSandboxesPanel templateName={record.name} /> : null}
             </Space>
           ),
@@ -2426,9 +2429,10 @@ export default function TemplatesPage() {
         open={retagModal.open}
         onCancel={closeRetagModal}
         onOk={() => retagForm.submit()}
+        confirmLoading={retagSubmitting}
         destroyOnHidden
       >
-        {retagModal.change ? (
+        {retagModal.change && retagTagInput?.trim() === retagModal.change.tag ? (
           <Alert
             type="warning"
             showIcon
