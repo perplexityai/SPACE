@@ -487,7 +487,7 @@ impl HickoryResolverSet {
 
 impl ResolverBackend for HickoryResolverSet {
     fn lookup<'a>(&'a self, resolver: ReservedResolver, question: Query) -> ResolverFuture<'a> {
-        Box::pin(async move {
+        let lookup = async move {
             // The deadline covers both the original lookup and its one
             // recovery attempt, under the same lookup slot. Policy
             // cancellation is applied per waiter by the coalescing layer;
@@ -519,6 +519,15 @@ impl ResolverBackend for HickoryResolverSet {
                 answers: lookup.answers().to_vec(),
                 valid_until: lookup.valid_until(),
             })
+        };
+        Box::pin(async move {
+            let (result, closes) = upstream::collect_reused_closes(lookup).await;
+            if result.is_err() {
+                for close in &closes {
+                    close.report();
+                }
+            }
+            result
         })
     }
 }

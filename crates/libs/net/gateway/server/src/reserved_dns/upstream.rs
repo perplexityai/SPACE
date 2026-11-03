@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
@@ -16,6 +17,7 @@ use hickory_resolver::net::NetError;
 use hickory_resolver::net::runtime::{RuntimeProvider, Spawn};
 use hickory_resolver::net::xfer::{DnsExchange, DnsHandle};
 use hickory_resolver::proto::op::{DnsRequest, DnsResponse};
+use hickory_resolver::proto::rr::RecordType;
 use hickory_resolver::{ConnectionProvider, PoolContext, TlsConfig};
 use parking_lot::Mutex;
 use pplx_space_metrics::gateway::ReservedDnsUpstreamClosedOutcome as ClosedOutcome;
@@ -126,17 +128,19 @@ impl Connector {
                 exchange,
                 exited,
                 failed: AtomicBool::new(false),
+                answered: AtomicBool::new(false),
             })
         }))
     }
 }
 
-/// One upstream connection: whether Hickory's task serving it has exited, and
-/// whether a request on it failed in transport.
+/// One upstream connection: whether Hickory's task serving it has exited,
+/// whether a request on it failed in transport, and whether it has answered.
 struct Exchange {
     exchange: DnsExchange<TrackedRuntime>,
     exited: Arc<AtomicBool>,
     failed: AtomicBool,
+    answered: AtomicBool,
 }
 
 impl Exchange {
@@ -147,13 +151,19 @@ impl Exchange {
     fn send(
         self: Arc<Self>,
         request: DnsRequest,
-    ) -> BoxStream<'static, Result<DnsResponse, NetError>> {
+    ) -> BoxStream<'static, Result<DnsResponse, Failed>> {
+        let path = SendPath::Exchange {
+            reused: self.answered.load(Ordering::Acquire),
+        };
         let mut responses = self.exchange.send(request).boxed();
         let mut answered = false;
         stream::poll_fn(move |cx| {
             let response = ready!(responses.poll_next_unpin(cx));
             match &response {
-                Some(Ok(_)) => answered = true,
+                Some(Ok(_)) => {
+                    answered = true;
+                    self.answered.store(true, Ordering::Release);
+                }
                 // An open connection's request limit.
                 Some(Err(NetError::Busy)) => {}
                 // A reset or abandoned request, or a timeout, which Hickory
@@ -164,10 +174,86 @@ impl Exchange {
                 None if !answered => self.failed.store(true, Ordering::Release),
                 None => {}
             }
-            Poll::Ready(response)
+            Poll::Ready(response.map(|response| response.map_err(|error| Failed { error, path })))
         })
         .boxed()
     }
+}
+
+/// A send's failure and where it arose, which decides how it is reported.
+struct Failed {
+    error: NetError,
+    path: SendPath,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SendPath {
+    /// On a connection; `reused` if it had answered an earlier request.
+    Exchange { reused: bool },
+    /// The reconnect this send shared with every other send on a closed or
+    /// failed connection.
+    SharedReconnect,
+}
+
+/// The level a send's failure is logged at.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Report {
+    Warn,
+    Debug,
+    /// Debug, and WARN once the lookup it belongs to has failed.
+    UnlessLookupFails,
+}
+
+impl Report {
+    /// "reserved DNS upstream connection failed" already reports a failed
+    /// shared reconnect once for every send waiting on it. Public
+    /// DNS-over-TLS upstreams close idle connections without `close_notify`,
+    /// so a request on a reused connection can meet the close; Hickory
+    /// retries that request on another connection.
+    fn of(error: &NetError, path: SendPath) -> Self {
+        match (path, error) {
+            (SendPath::SharedReconnect, _) => Self::Debug,
+            (SendPath::Exchange { reused: true }, NetError::Io(error))
+                if error.kind() == io::ErrorKind::UnexpectedEof =>
+            {
+                Self::UnlessLookupFails
+            }
+            (SendPath::Exchange { .. }, _) => Self::Warn,
+        }
+    }
+}
+
+tokio::task_local! {
+    static REUSED_CLOSES: RefCell<Vec<ReusedClose>>;
+}
+
+/// A request that met an upstream's close of a reused connection.
+pub(super) struct ReusedClose {
+    upstream_addr: SocketAddr,
+    query_type: Option<RecordType>,
+    error: NetError,
+}
+
+impl ReusedClose {
+    pub(super) fn report(&self) {
+        tracing::warn!(
+            upstream_addr = %self.upstream_addr,
+            query_type = ?self.query_type,
+            error = ?self.error,
+            "reserved DNS upstream request failed"
+        );
+    }
+}
+
+/// Run one lookup, collecting the reused-connection closes its requests met
+/// for the caller to report if the lookup fails.
+pub(super) async fn collect_reused_closes<F: Future>(lookup: F) -> (F::Output, Vec<ReusedClose>) {
+    REUSED_CLOSES
+        .scope(RefCell::default(), async {
+            let output = lookup.await;
+            (output, REUSED_CLOSES.with(RefCell::take))
+        })
+        .await
 }
 
 /// Pooled connections whose connection closed or failed move to the newest
@@ -309,7 +395,11 @@ impl DnsHandle for LoggingDnsHandle {
             stream::once(async move {
                 match connection.replace(&exchange).await {
                     Ok(exchange) => exchange.send(request),
-                    Err(error) => stream::iter([Err(error)]).boxed(),
+                    Err(error) => stream::iter([Err(Failed {
+                        error,
+                        path: SendPath::SharedReconnect,
+                    })])
+                    .boxed(),
                 }
             })
             .flatten()
@@ -319,14 +409,20 @@ impl DnsHandle for LoggingDnsHandle {
             let response = ready!(responses.poll_next_unpin(cx));
             timing.record(match &response {
                 Some(Ok(_)) => ResponseOutcome::Answered,
-                Some(Err(NetError::Timeout)) => ResponseOutcome::Timeout,
-                Some(Err(NetError::Busy)) => ResponseOutcome::Busy,
+                Some(Err(Failed {
+                    error: NetError::Timeout,
+                    ..
+                })) => ResponseOutcome::Timeout,
+                Some(Err(Failed {
+                    error: NetError::Busy,
+                    ..
+                })) => ResponseOutcome::Busy,
                 Some(Err(_)) => ResponseOutcome::Error,
                 None => ResponseOutcome::NoResponse,
             });
             Poll::Ready(response)
         })
-        .inspect_err(move |error| {
+        .map_err(move |Failed { error, path }| {
             if matches!(error, NetError::Busy) {
                 let space_lookups_in_flight = record_busy(&lookup_slots);
                 tracing::warn!(
@@ -336,14 +432,37 @@ impl DnsHandle for LoggingDnsHandle {
                     space_lookups_in_flight,
                     "reserved DNS upstream request failed"
                 );
-                return;
+                return error;
             }
-            tracing::warn!(
-                %upstream_addr,
-                ?query_type,
-                ?error,
-                "reserved DNS upstream request failed"
-            );
+            let report = match Report::of(&error, path) {
+                // Outside a collecting lookup, nothing would report it later.
+                Report::UnlessLookupFails => REUSED_CLOSES
+                    .try_with(|closes| {
+                        closes.borrow_mut().push(ReusedClose {
+                            upstream_addr,
+                            query_type,
+                            error: error.clone(),
+                        });
+                    })
+                    .map_or(Report::Warn, |()| Report::Debug),
+                report => report,
+            };
+            if report == Report::Debug {
+                tracing::debug!(
+                    %upstream_addr,
+                    ?query_type,
+                    ?error,
+                    "reserved DNS upstream request failed"
+                );
+            } else {
+                tracing::warn!(
+                    %upstream_addr,
+                    ?query_type,
+                    ?error,
+                    "reserved DNS upstream request failed"
+                );
+            }
+            error
         })
         .boxed()
     }
@@ -453,3 +572,6 @@ fn record_busy(lookup_slots: &Semaphore) -> usize {
     pplx_space_metrics::gateway::reserved_dns_upstream_busy_lookup_in_flight(active);
     active
 }
+
+#[cfg(test)]
+mod tests;

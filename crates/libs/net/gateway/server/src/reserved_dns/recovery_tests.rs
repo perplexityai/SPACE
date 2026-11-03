@@ -14,7 +14,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 
-use super::upstream::LoggingConnectionProvider;
+use super::upstream::{LoggingConnectionProvider, collect_reused_closes};
 use super::*;
 
 const UPSTREAM_NAME: &str = "dns.example.test";
@@ -232,9 +232,36 @@ async fn idle_closed_connections_keep_the_resolver_and_outages_replace_it_once()
     .unwrap();
 }
 
+// Public DNS-over-TLS upstreams close idle connections without close_notify,
+// which a request can meet. Hickory retries it on another connection, so the
+// close is left for the lookup to report only if the lookup fails.
+#[tokio::test]
+async fn unclean_close_of_a_reused_connection_is_left_to_the_lookup() {
+    let mut upstream = TestUpstream::start(true).await;
+    let resolver = upstream.tls_resolver();
+    let lookup = |name| resolver.lookup(name, RecordType::A);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        lookup("warm.example.").await.unwrap();
+        upstream.drop_on_next_query();
+        let (result, closes) = collect_reused_closes(lookup("retried.example.")).await;
+        result.unwrap();
+        assert_eq!(closes.len(), 1, "the retried close is left to the lookup");
+        assert_eq!(upstream.connections().accepted, 2);
+
+        upstream.drop_on_next_query();
+        upstream.stop_accepting().await;
+        let (result, closes) = collect_reused_closes(lookup("failed.example.")).await;
+        result.unwrap_err();
+        assert_eq!(closes.len(), 1, "the failed lookup has the close to report");
+    })
+    .await
+    .unwrap();
+}
+
 /// A DNS-over-TCP or DNS-over-TLS upstream that answers every query. On
 /// request it closes connections like an idle timeout, stops answering on them
-/// without closing, holds TLS handshakes, or refuses connections.
+/// without closing, drops them without TLS close_notify when the next query
+/// arrives, holds TLS handshakes, or refuses connections.
 struct TestUpstream {
     addr: SocketAddr,
     acceptor: Option<TlsAcceptor>,
@@ -258,6 +285,7 @@ struct UpstreamState {
 struct ConnectionControl {
     close: CancellationToken,
     stall: AtomicBool,
+    drop_on_query: AtomicBool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -353,6 +381,24 @@ impl TestUpstream {
         .unwrap()
     }
 
+    // A bare Hickory resolver on this upstream's provider, with only the
+    // self-signed root trusted.
+    fn tls_resolver(&self) -> hickory_resolver::Resolver<LoggingConnectionProvider> {
+        let mut server = NameServerConfig::tcp(self.addr.ip());
+        server.connections = vec![self.connection_config()];
+        let mut options = ResolverOpts::default();
+        options.attempts = 1;
+        options.use_hosts_file = ResolveHosts::Never;
+        hickory_resolver::Resolver::builder_with_config(
+            ResolverConfig::from_parts(None, Vec::new(), vec![server]),
+            self.provider.clone(),
+        )
+        .with_options(options)
+        .with_tls_config(self.client_tls.clone())
+        .build()
+        .unwrap()
+    }
+
     fn connections(&self) -> Connections {
         *self.state.connections.borrow()
     }
@@ -394,6 +440,16 @@ impl TestUpstream {
         for control in self.state.controls.lock().iter() {
             control
                 .stall
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Drops every current connection, without TLS close_notify, when its
+    /// next query arrives.
+    fn drop_on_next_query(&self) {
+        for control in self.state.controls.lock().iter() {
+            control
+                .drop_on_query
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
@@ -472,6 +528,12 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         };
         let mut wire = vec![0; usize::from(length)];
         stream.read_exact(&mut wire).await.unwrap();
+        if control
+            .drop_on_query
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
         let mut response = Message::from_vec(&wire).unwrap().into_response();
         let name = response.queries[0].name.clone();
         *state.queries.lock().entry(name.clone()).or_default() += 1;

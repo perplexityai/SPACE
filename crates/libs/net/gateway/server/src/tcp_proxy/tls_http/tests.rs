@@ -1130,3 +1130,198 @@ async fn guest_http2_accepts_backpressured_small_frame_uploads() {
 async fn guest_http2_still_rejects_tiny_frame_floods() {
     assert!(!small_frame_upload(1, 1_000_000, Duration::from_secs(2)).await);
 }
+
+// The guest's TLS leg reports a close without close_notify as routine only
+// while nothing is in flight on the connection it shares with the HTTP
+// session. A request awaiting its response, a response body still streaming
+// and an HTTP/1 head from its first byte are in flight; a keep-alive
+// connection whose response the guest has read in full is not.
+#[tokio::test]
+async fn guest_close_reason_follows_each_exchange_through_the_tls_leg() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::super::tls::TlsIo;
+    use crate::tls_interception::TlsHandshakeLeg;
+
+    const ROUTINE: &str = "peer_closed_without_close_notify";
+    const TRUNCATED: &str = "peer_closed_mid_exchange";
+
+    async fn read_until(stream: &mut (impl AsyncRead + Unpin), end: &[u8]) {
+        let mut received = Vec::new();
+        while !received.ends_with(end) {
+            received.push(stream.read_u8().await.unwrap());
+        }
+    }
+
+    let (binding, lease, _) = fixture().await;
+    let (origin, mut origin_peer) = tokio::io::duplex(1024);
+    let (forwarded, request_forwarded) = tokio::sync::oneshot::channel::<()>();
+    let (respond, response_due) = tokio::sync::oneshot::channel::<()>();
+    let (finish_body, body_finished) = tokio::sync::oneshot::channel::<()>();
+    let origin_task = tokio::spawn(async move {
+        read_until(&mut origin_peer, b"\r\n\r\n").await;
+        forwarded.send(()).unwrap();
+        response_due.await.unwrap();
+        origin_peer
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\nab")
+            .await
+            .unwrap();
+        body_finished.await.unwrap();
+        origin_peer.write_all(b"cd").await.unwrap();
+        // Hold the origin open so only the guest side ends the exchange.
+        let _ = origin_peer.read_u8().await;
+    });
+    let (guest, mut guest_peer) = tokio::io::duplex(1024);
+    let guest = TlsIo::new(guest, TlsHandshakeLeg::ClientToNetgw);
+    let activity = guest.activity();
+    let gateway = tokio::spawn(serve_guest(
+        guest,
+        activity.clone(),
+        binding,
+        lease,
+        move |_| async move { Ok((origin, HttpProtocol::Http1)) },
+    ));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        guest_peer
+            .write_all(b"GET / HTTP/1.1\r\nhost: allowed.test\r\n\r\n")
+            .await
+            .unwrap();
+        request_forwarded.await.unwrap();
+        assert_eq!(
+            activity.close_reason(),
+            TRUNCATED,
+            "a request awaiting its response"
+        );
+        respond.send(()).unwrap();
+        read_until(&mut guest_peer, b"\r\n\r\nab").await;
+        assert_eq!(activity.close_reason(), TRUNCATED, "a streaming response");
+        finish_body.send(()).unwrap();
+        read_until(&mut guest_peer, b"cd").await;
+        assert_eq!(activity.close_reason(), ROUTINE, "a fully read response");
+        guest_peer
+            .write_all(b"GET / HTTP/1.1\r\nhost: allo")
+            .await
+            .unwrap();
+    })
+    .await
+    .unwrap();
+    // The gateway reads the partial head without telling the test.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while activity.close_reason() == ROUTINE {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a partial request head is in flight");
+    assert_eq!(activity.close_reason(), TRUNCATED);
+    gateway.abort();
+    origin_task.abort();
+}
+
+// HTTP/2 control frames, such as a keep-alive client's PINGs, arrive between
+// exchanges, so they do not start a request head on the guest's TLS leg.
+#[tokio::test]
+async fn guest_http2_control_frames_between_exchanges_leave_the_connection_idle() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use http_body_util::BodyExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, ReadBuf};
+
+    use super::super::tls::TlsIo;
+    use crate::tls_interception::TlsHandshakeLeg;
+
+    /// The guest's end, counting the bytes the gateway has sent it.
+    struct Counted(DuplexStream, Arc<AtomicUsize>);
+
+    impl AsyncRead for Counted {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let filled = buf.filled().len();
+            let result = Pin::new(&mut self.0).poll_read(context, buf);
+            self.1
+                .fetch_add(buf.filled().len() - filled, Ordering::Relaxed);
+            result
+        }
+    }
+
+    impl AsyncWrite for Counted {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.0).poll_write(context, buf)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_flush(context)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_shutdown(context)
+        }
+    }
+
+    /// A PING ACK: a 9-byte frame header and 8 bytes of opaque data.
+    const PING_ACK_BYTES: usize = 17;
+
+    let (binding, lease, _) = fixture().await;
+    let (origin, mut origin_peer) = tokio::io::duplex(1024);
+    let origin_task = tokio::spawn(async move {
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            request.push(origin_peer.read_u8().await.unwrap());
+        }
+        origin_peer
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+            .await
+            .unwrap();
+        let _ = origin_peer.read_u8().await;
+    });
+    let (guest, guest_peer) = tokio::io::duplex(4096);
+    let guest = TlsIo::new(guest, TlsHandshakeLeg::ClientToNetgw);
+    let activity = guest.activity();
+    let gateway = tokio::spawn(serve_guest(
+        guest,
+        activity.clone(),
+        binding,
+        lease,
+        move |_| async move { Ok((origin, HttpProtocol::Http1)) },
+    ));
+    let received = Arc::new(AtomicUsize::new(0));
+    let (mut sender, connection) = http2::Builder::new(TokioExecutor::new())
+        .timer(TokioTimer::new())
+        .keep_alive_interval(Duration::from_millis(10))
+        .keep_alive_while_idle(true)
+        .handshake(TokioIo::new(Counted(guest_peer, received.clone())))
+        .await
+        .unwrap();
+    let client = tokio::spawn(connection);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let request = Request::get("https://allowed.test/")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let body = sender.send_request(request).await.unwrap().into_body();
+        assert_eq!(&body.collect().await.unwrap().to_bytes()[..], b"ok");
+        // The gateway acknowledges a PING only after reading it.
+        let answered = received.load(Ordering::Relaxed) + PING_ACK_BYTES;
+        while received.load(Ordering::Relaxed) < answered {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the gateway acknowledges the guest's PINGs");
+    assert_eq!(activity.close_reason(), "peer_closed_without_close_notify");
+    client.abort();
+    gateway.abort();
+    origin_task.abort();
+}

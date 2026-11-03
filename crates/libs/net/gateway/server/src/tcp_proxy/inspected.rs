@@ -49,7 +49,7 @@ impl TcpProxy {
             }
             let accounting = WireAccounting::new(self.stats.clone());
             let operation = async {
-                // ALPN is telemetry here. `tls_http::serve` detects the
+                // ALPN is telemetry here. `tls_http::serve_guest` detects the
                 // version from the guest's first bytes and records `protocol`
                 // once the first request arrives.
                 let (downstream, negotiated) =
@@ -76,7 +76,8 @@ impl TcpProxy {
                         .map(|(io, alpn)| (io, alpn.into()))
                         .map_err(Into::into)
                 };
-                tls_http::serve(downstream, binding, lease.clone(), connect).await
+                let activity = downstream.activity();
+                tls_http::serve_guest(downstream, activity, binding, lease.clone(), connect).await
             };
             let result = tokio::select! {
                 biased;
