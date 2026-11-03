@@ -55,9 +55,33 @@ nodeApiTokenExpirationSeconds: 600
 shutdownGraceSeconds: 175
 
 # Native `files:*` (SPACE_DATA_PLANE_NATIVE_FILES); off leaves the routes
-# unmounted.
+# unmounted. On in Kind, where the smoke sends files calls to this origin
+# directly (127.0.0.1:8090, the entry NodePort below) as well as to the API's;
+# a deployment routes them here with its load balancer instead.
 nativeFiles:
-  enabled: false
+  enabled: true
+  # The API's activation listener, which decides each request
+  # (SPACE_INGRESS_ACTIVATION_ENDPOINT): the space-api Service's port 9801,
+  # whose TLS identity names that Service (space-api-local's deployment.yaml).
+  # The listener admits this release's ServiceAccount
+  # (ingressActivation.allowedServiceAccounts in space-api-local) with the
+  # projected space-cluster-api token below.
+  accessEndpoint: https://space-api:9801
+  # Native upload admission (SPACE_DATA_PLANE_NATIVE_UPLOAD_ADMISSION), sized
+  # for this pod's 512 MiB memory limit (resources below). A write's peak
+  # memory is about twice the bytes it reserves, its declared length
+  # (docs/configuration.md), so the replica's 128 MiB budget bounds Native
+  # writes at about 256 MiB and leaves the other half to the process, its ECW
+  # traffic and its streams. Unbounded, or at the binary's 1 GiB default, a
+  # dozen writes near the 22 MiB body limit at once would pass the pod's limit
+  # and restart it. An org's and a sandbox's shares are the whole budget: Kind runs
+  # few orgs, and 128 MiB still takes five full-size writes to one sandbox at
+  # once. Slots and the wait keep the binary's defaults.
+  uploadAdmission:
+    enabled: true
+    maxInFlightBytes: 134217728
+    maxInFlightBytesPerOrg: 134217728
+    maxInFlightBytesPerSandbox: 134217728
   # A files request taken just before SIGTERM runs in three steps, and the
   # drain deadline cuts whatever it has not finished, so with nativeFiles
   # enabled the template refuses a shutdownGraceSeconds under

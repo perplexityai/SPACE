@@ -2,8 +2,8 @@
 
 The API creates sandbox pods in their own namespace, which the
 `space-sandbox-network-policy` chart confines: a default-deny for every pod,
-and an allow policy giving sandbox pods ingress on TCP 9800 from space-api and
-cluster-controller only, egress to the IPv4 internet outside the private,
+and an allow policy giving sandbox pods ingress on TCP 9800 from space-api,
+cluster-controller and the data plane only, egress to the IPv4 internet outside the private,
 carrier-grade NAT and link-local ranges, and DNS to the cluster DNS pods.
 
 Inside the VM, the per-sandbox net-gateway applies the tenant's egress policy
@@ -146,8 +146,9 @@ class SandboxNetworkIsolationAssertions:
         )
 
     def expect_sandbox_port_closed_to_other_namespaces(self) -> None:
-        """A pod in the control-plane namespace that is neither space-api nor
-        cluster-controller cannot open the sandbox pod's 9800."""
+        """A pod in the control-plane namespace that is none of space-api,
+        cluster-controller and the data plane cannot open the sandbox pod's
+        9800."""
 
         sandbox, _ = self._located()
         target = TcpTarget(name="sandbox-proxy", host=sandbox.pod_ip, port=SANDBOX_PROXY_PORT)

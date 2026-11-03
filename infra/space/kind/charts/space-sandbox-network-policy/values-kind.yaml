@@ -1,0 +1,7 @@
+# Kind bench values: the Tiltfile passes this file after values.yaml. The
+# caller-provided-cluster chart (infra/space/cluster/chart) does not, so
+# nothing here reaches a real cluster's install.
+
+# Kind's data plane serves Native files (space-data-plane-local's
+# nativeFiles), so it calls the sandbox runtime the API grants.
+allowDataPlane: true

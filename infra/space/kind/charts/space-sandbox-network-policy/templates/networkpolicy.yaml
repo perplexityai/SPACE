@@ -56,6 +56,23 @@ spec:
       ports:
         - protocol: TCP
           port: 9800
+    {{- if .Values.allowDataPlane }}
+    # The data plane's Native files routes send the sandbox call to the
+    # runtime the API grants, which on Kubernetes is the same <pod IP>:9800
+    # the API dialed (NativeFileRouteGrant, proto/node/api/v1/native_file_access.proto;
+    # crates/l40_api/data/plane/server/src/native_files/call.rs). Only where it
+    # serves them (values.yaml).
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Release.Namespace }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: space-data-plane
+      ports:
+        - protocol: TCP
+          port: 9800
+    {{- end }}
     # cluster-controller probes warm slots at <pod IP>:9800
     # (warm_slot_runtime_endpoint in
     # crates/l40_api/cluster/controller/server/src/warm_pool.rs) and runs the same
@@ -77,7 +94,8 @@ spec:
     # crates/l40_api/api/src/routes/admin/sandboxes.rs), which the elected
     # cluster-controller's dispatcher executes, and its reads come from the
     # database (tracked_response, crates/l40_api/api/src/controllers/sandbox/queries.rs).
-    # Nothing else dials a sandbox pod. internal-api and the data plane reach
+    # Nothing else dials a sandbox pod. internal-api and the data plane's ECW
+    # and session routes reach
     # the node's host-network node-api at the node's address
     # (node_api_backend_endpoint in
     # crates/l40_api/internal/api/server/src/data_plane_sessions/route_rows.rs,
