@@ -313,7 +313,7 @@ async fn each_filter_returns_exactly_its_rows() -> TestDbResult<()> {
                 name: Some("alpha-two"),
                 lifecycle: Some("paused"),
                 template: Some("py"),
-                active_node_id: Some(node_two),
+                active_node_id: Some(node_one),
                 created_at: Some(at(1)),
             },
         ),
@@ -428,7 +428,7 @@ async fn each_filter_returns_exactly_its_rows() -> TestDbResult<()> {
                 node: Some(NodeAssignment::Node(node_one)),
                 ..AdminSandboxFilter::default()
             },
-            &[0, 4],
+            &[0, 1, 4],
         ),
         (
             "assigned",
@@ -527,13 +527,16 @@ async fn each_filter_returns_exactly_its_rows() -> TestDbResult<()> {
             },
             &[],
         ),
-        // Without its node filter each combined case lists rows 0 and 3, so
-        // the node filter decides the result.
+        // Without its node filter the unassigned case lists rows 0, 1 and 3,
+        // and the on-a-node case rows 1 and 3, so the node filter decides each
+        // result. On a node `created_after` decides it too (rows 0 and 1
+        // without it), so a statement that binds it in another timestamp's
+        // place lists other rows.
         (
             "combined, unassigned",
             AdminSandboxFilter {
                 org_id: Some(first_org),
-                lifecycles: lifecycles(&["started", "deleted"]),
+                lifecycles: lifecycles(&["started", "paused", "deleted"]),
                 template: template("py"),
                 node: Some(NodeAssignment::Unassigned),
                 user_id: Some(first_user.user_id),
@@ -545,13 +548,14 @@ async fn each_filter_returns_exactly_its_rows() -> TestDbResult<()> {
             "combined, on a node",
             AdminSandboxFilter {
                 org_id: Some(first_org),
-                lifecycles: lifecycles(&["started", "deleted"]),
+                lifecycles: lifecycles(&["started", "paused", "deleted"]),
                 template: template("py"),
                 node: Some(NodeAssignment::Node(node_one)),
                 user_id: Some(first_user.user_id),
+                created_after: Some(at(0)),
                 ..AdminSandboxFilter::default()
             },
-            &[0],
+            &[1],
         ),
     ];
     for (case, filter, expected) in cases {
