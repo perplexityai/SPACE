@@ -167,6 +167,84 @@ async fn data_plane_identity_cannot_reuse_guest_authority_for_control_or_transfe
     }
 }
 
+/// The data-plane edge may ask the lifecycle API to decide a Native file
+/// request, and nothing else on the activation listener: the ingress
+/// activation RPCs and any later method stay refused.
+#[tokio::test]
+async fn data_plane_identity_may_ask_the_api_to_decide_native_file_requests() {
+    let username = "system:serviceaccount:space:space-data-plane";
+    let mut config = test_k8s_config();
+    config
+        .cluster_api_allowed_usernames
+        .insert(username.to_owned());
+    let (reviewer, _) =
+        reviewer_returning_status(config, token_review_status("space-cluster-api", username));
+    let policy = reviewer
+        .config
+        .policy(NodeRole::Cluster, AuthSurface::Normal)
+        .unwrap();
+    for (method, allowed) in [
+        (
+            "/space.node.api.v1.NativeFileAccessApi/AuthorizeNativeFileRequest",
+            true,
+        ),
+        (
+            "/space.node.api.v1.NativeFileAccessApi/PrepareNativeFileCall",
+            true,
+        ),
+        (
+            "/space.node.api.v1.NativeFileAccessApi/FutureNativeFileMethod",
+            false,
+        ),
+        (
+            "/space.node.api.v1.IngressActivationApi/PrepareIngress",
+            false,
+        ),
+        (
+            "/space.node.api.v1.IngressActivationApi/QueueImplicitWake",
+            false,
+        ),
+    ] {
+        let result =
+            reviewer.authorize_username(&policy, AuthSurface::Normal, method, username, false);
+        if allowed {
+            result.unwrap();
+        } else {
+            assert_eq!(
+                result.unwrap_err().code(),
+                tonic::Code::PermissionDenied,
+                "{method}"
+            );
+        }
+    }
+    // A worker never serves them, so the edge gets no such method there.
+    let mut worker_config = test_k8s_config();
+    worker_config
+        .node_api_allowed_usernames
+        .insert(username.to_owned());
+    let (worker_reviewer, _) = reviewer_returning_status(
+        worker_config,
+        token_review_status("space-node-api", username),
+    );
+    let worker_policy = worker_reviewer
+        .config
+        .policy(NodeRole::Worker, AuthSurface::Normal)
+        .unwrap();
+    assert_eq!(
+        worker_reviewer
+            .authorize_username(
+                &worker_policy,
+                AuthSurface::Normal,
+                "/space.node.api.v1.NativeFileAccessApi/PrepareNativeFileCall",
+                username,
+                false,
+            )
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+}
+
 fn cache_key(token: &str, audience: &str) -> TokenCacheKey {
     TokenCacheKey::new(token, audience)
 }

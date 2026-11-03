@@ -673,6 +673,14 @@ fn guest_bridge_method(role: NodeRole, path: &str) -> bool {
         return true;
     }
     if role == NodeRole::Cluster {
+        // The edge carries a Native `files:*` request's bytes and has the
+        // lifecycle API decide it, on that API's activation listener.
+        if let Some(method) = path.strip_prefix("/space.node.api.v1.NativeFileAccessApi/") {
+            return matches!(
+                method,
+                "AuthorizeNativeFileRequest" | "PrepareNativeFileCall"
+            );
+        }
         let Some(method) = path.strip_prefix("/space.node.api.v1.ClusterApi/") else {
             return false;
         };
