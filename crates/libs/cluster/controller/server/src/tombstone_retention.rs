@@ -4,10 +4,10 @@ use pplx_space_common_core::{
 };
 use std::time::{Duration, Instant};
 
+use pplx_space_sandbox_store::tombstone;
 use sqlx::PgPool;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 const DEFAULT_TICK: Duration = Duration::from_secs(300);
 const DEFAULT_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -154,26 +154,8 @@ impl RetentionSink for TombstoneRetentionStore {
         .await?
         .len() as u64;
 
-        let deleted_sandbox_ids = sqlx::query_scalar::<_, Uuid>(sql!(
-            "WITH candidates AS (
-                 SELECT s.id
-                   FROM sandboxes s
-                  WHERE s.lifecycle = 'deleted'
-                    AND COALESCE(s.updated_at, s.created_at)
-                        < NOW() - ($1::BIGINT * INTERVAL '1 second')
-                  ORDER BY COALESCE(s.updated_at, s.created_at) ASC,
-                           s.id ASC
-                  LIMIT $2
-             )
-             DELETE FROM sandboxes s
-              USING candidates c
-              WHERE s.id = c.id
-              RETURNING s.id"
-        ))
-        .bind(retention_secs)
-        .bind(max_records)
-        .fetch_all(&mut *tx)
-        .await?;
+        let deleted_sandbox_ids =
+            tombstone::prune_deleted_sandboxes(&mut *tx, retention_secs, max_records).await?;
         // Same rationale as the sandbox store's delete_with_dependents (this
         // reaper predates it): receipts are not foreign-keyed to `sandboxes`,
         // and an orphaned receipt is unreachable by the suspended-fossil drain.
