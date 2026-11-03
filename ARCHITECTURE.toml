@@ -15,26 +15,26 @@ allow = [
 ]
 
 [rules.pattern_ratchet.direct_tables.no_crossing]       # only allowed and listed files may match
-mode = "advisory"
+mode = "required"
 
 [rules.pattern_ratchet.direct_tables.no_new_entries]    # a pull request may not add entries to the baseline
-mode = "advisory"
+mode = "required"
 
 [rules.pattern_ratchet.direct_tables.no_raised_caps]    # a pull request may not raise a cap in the baseline
-mode = "advisory"
+mode = "required"
 
 [rules.pattern_ratchet.direct_tables.listed_no_growth]  # listed files may not gain matching lines
-mode = "advisory"
+mode = "required"
 
 [rules.pattern_ratchet.direct_tables.stale_entries]     # entries with fewer matches, none, or gone
-mode = "advisory"
+mode = "required"
 
 # Shared code reaches Kubernetes-only state through `Substrate::as_kubernetes()`,
 # binding and using the payload. A presence test on it, in any form, only asks
 # which substrate is running, which belongs in a `SubstrateCapabilities` field
 # (crates/libs/api/src/controllers/substrate/AGENTS.md). A line matcher cannot
-# tell the two apart, so every call outside the substrate module counts, and a
-# new caller needs a reviewed baseline entry.
+# tell the two apart, so every call outside the substrate module counts; the
+# baseline lists today's callers, and a new one fails.
 [rules.pattern_ratchet.kubernetes_access]
 patterns = ['\bas_kubernetes\s*\(']
 allow = ["crates/libs/api/src/controllers/substrate/**"]
@@ -43,10 +43,10 @@ allow = ["crates/libs/api/src/controllers/substrate/**"]
 mode = "required"
 
 [rules.pattern_ratchet.kubernetes_access.no_new_entries]
-mode = "advisory"
+mode = "required"
 
 [rules.pattern_ratchet.kubernetes_access.no_raised_caps]
-mode = "advisory"
+mode = "required"
 
 [rules.pattern_ratchet.kubernetes_access.listed_no_growth]
 mode = "required"
@@ -69,10 +69,10 @@ allow = [
 mode = "required"
 
 [rules.pattern_ratchet.capability_identity.no_new_entries]
-mode = "advisory"
+mode = "required"
 
 [rules.pattern_ratchet.capability_identity.no_raised_caps]
-mode = "advisory"
+mode = "required"
 
 [rules.pattern_ratchet.capability_identity.listed_no_growth]
 mode = "required"
@@ -114,8 +114,8 @@ mode = "required"
 # `Option<SubstrateKind>`/`Option<NodeManagedBy>` named `substrate_kind` or
 # `*managed_by`. Test files are filename-based, so `allow` adds the
 # `#[cfg(test)]` support modules and fixtures, which may write literal rows.
-# Production code has no matches, so there is no baseline table; a deliberate
-# exception is a reviewed baseline entry, which `no_new_entries` reports.
+# Production code has no matches, so there is no baseline table, and an entry
+# added to one fails `no_new_entries`.
 [rules.pattern_ratchet.substrate_literals]
 patterns = [
   # SQL
@@ -153,10 +153,10 @@ allow = [
 mode = "required"
 
 [rules.pattern_ratchet.substrate_literals.no_new_entries]    # a pull request may not add entries to the baseline
-mode = "advisory"
+mode = "required"
 
 [rules.pattern_ratchet.substrate_literals.no_raised_caps]    # a pull request may not raise a cap in the baseline
-mode = "advisory"
+mode = "required"
 
 [rules.pattern_ratchet.substrate_literals.listed_no_growth]  # listed files may not gain matching lines
 mode = "required"
@@ -202,13 +202,11 @@ mode = "required"
 # filename-based, so `allow` adds the `#[cfg(test)]` support modules and
 # fixtures, which write rows to set up their cases; `#[cfg(test)]` code inline
 # in a production file counts, so test-only writes go in a `*_tests` file.
-# Exception paths, each a reviewed baseline edit: a new writer outside the
-# store is a new entry (`no_new_entries`); another write in a listed file is a
-# raised cap (`no_raised_caps`); splitting a listed file into modules needs
-# entries for the new files and a lower cap on the old one, since `--renames`
-# pairs only whole-file renames. Portability calls its private
-# `sandbox_assignments` helper bare; a path-qualified call to it there
-# (`Self::...`, `super::...`) matches and needs a reviewed entry.
+# A new writer outside the store fails, as does another write in a listed
+# file; so does splitting a listed file into modules, since `--renames` pairs
+# only whole-file renames and the new files' entries are new. Portability
+# calls its private `sandbox_assignments` helper bare; a path-qualified call to
+# it there (`Self::...`, `super::...`) matches and fails.
 [rules.pattern_ratchet.sandbox_writes]
 patterns = [
   # A statement head on the row's table
@@ -237,10 +235,10 @@ allow = [
 mode = "required"
 
 [rules.pattern_ratchet.sandbox_writes.no_new_entries]    # a pull request may not add entries to the baseline
-mode = "advisory"
+mode = "required"
 
 [rules.pattern_ratchet.sandbox_writes.no_raised_caps]    # a pull request may not raise a cap in the baseline
-mode = "advisory"
+mode = "required"
 
 [rules.pattern_ratchet.sandbox_writes.listed_no_growth]  # listed files may not gain matching lines
 mode = "required"
@@ -265,10 +263,8 @@ allow = ["crates/libs/common/io/src/reflink.rs"]
 [rules.pattern_ratchet.rootfs_copy.no_crossing]
 mode = "required"
 
-# Seeding a new ratchet reports these initial exceptions against the base.
-# Subsequent additions remain explicit review findings; ordinary new uses fail.
 [rules.pattern_ratchet.rootfs_copy.no_new_entries]
-mode = "advisory"
+mode = "required"
 
 [rules.pattern_ratchet.rootfs_copy.no_raised_caps]
 mode = "required"
@@ -298,9 +294,8 @@ allow = []
 [rules.pattern_ratchet.node_manager_commands.no_crossing]
 mode = "required"
 
-# Seeded exceptions are review findings; new matches and cap growth fail.
 [rules.pattern_ratchet.node_manager_commands.no_new_entries]
-mode = "advisory"
+mode = "required"
 
 [rules.pattern_ratchet.node_manager_commands.no_raised_caps]
 mode = "required"
@@ -366,7 +361,7 @@ allow = []                            # exact package names exempt from the rule
 mode = "required"
 
 [rules.crate_names.stale_entries]     # entries and allow names that no longer apply
-mode = "advisory"
+mode = "required"
 
 [rules.crate_names.policy_changed]    # changes to this table, compared with the base branch
 mode = "advisory"

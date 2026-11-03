@@ -179,90 +179,57 @@ jobs:
           docker run "${docker_args[@]}" "space-ci:${GITHUB_SHA}" \
             bash -c 'git config --global --add safe.directory /workspace && exec bash -c "$SPACE_CI_COMMAND"'
 
-      # Pull requests only: archcheck writes its findings as rdjson, offline
-      # from the clippy step's caches, even when clippy failed. Exit 1 means
-      # required findings, which reviewdog decides on; anything else fails.
-      # The base is the first parent of the synthetic merge (fetch-depth 0
-      # above), once resolve-migration-base.sh has checked the second is this
-      # pull request. no_new_entries, no_raised_caps and crate_names.no_new
-      # compare with its architecture-baseline.toml, and
-      # crate_names.policy_changed, layers.policy_changed and layers.placement's
-      # check for new or changed unmoved entries with its ARCHITECTURE.toml; an
-      # empty file stands in for one the base lacks. The files git detects as
-      # renamed since the base are passed too, so that a baseline entry moved
-      # with its file is not a new one; without them, it is. If the base can't
-      # be resolved, a warning: the first two and the ARCHITECTURE.toml
-      # comparisons are skipped, and no_new allows only the crates listed when
-      # it was added.
+      # Pull requests and merge groups: archcheck runs offline from the clippy
+      # step's caches, even when clippy failed, against a base commit (see
+      # run-archcheck.sh). For a pull request, the base is the first parent of
+      # the synthetic merge (fetch-depth 0 above), once resolve-migration-base.sh
+      # has checked the second is this pull request, and the findings go to
+      # rdjson: exit 1 means required findings, which reviewdog decides on, and
+      # anything else fails. For a merge group, the base is its base_sha, so
+      # the queue repeats the comparison for the group as it will merge: exit 1
+      # fails the step, without reviewdog. no_new_entries, no_raised_caps and
+      # crate_names.no_new compare with the base's architecture-baseline.toml,
+      # and crate_names.policy_changed, layers.policy_changed, layers.placement's
+      # check for new or changed unmoved entries and pattern_ratchet's seeding of
+      # a new instance's table with its ARCHITECTURE.toml; an empty file stands
+      # in for one the base lacks. The files git detects as renamed since the
+      # base are passed too, so that a baseline entry moved with its file is not
+      # a new one; without them, it is. If the base can't be resolved, a
+      # warning: the first two and the ARCHITECTURE.toml comparisons are
+      # skipped, and no_new allows only the crates listed when it was added.
       - name: Check repository structure
         id: archcheck
         if: >-
           ${{ !cancelled() && steps.ci-image.outcome == 'success' && matrix.archcheck == true &&
-          github.event_name == 'pull_request' }}
+          (github.event_name == 'pull_request' || github.event_name == 'merge_group') }}
         env:
           CARGO_DIR: ${{ runner.temp }}/cargo-home
           SCCACHE_DIR: ${{ runner.temp }}/space-sccache
           SCCACHE_SIZE: ${{ matrix.rust_cache_size }}
+          EVENT_NAME: ${{ github.event_name }}
           PULL_REQUEST_HEAD: ${{ github.event.pull_request.head.sha }}
+          MERGE_GROUP_BASE: ${{ github.event.merge_group.base_sha }}
         run: |
           status=0
           docker run --rm --volume "${GITHUB_WORKSPACE}:/workspace" --workdir /workspace \
             --volume "${CARGO_DIR}/registry:/usr/local/cargo/registry" --volume "${CARGO_DIR}/git:/usr/local/cargo/git" \
             --volume "${SCCACHE_DIR}:/sccache" --env SCCACHE_DIR=/sccache --env SCCACHE_CACHE_SIZE="${SCCACHE_SIZE}" \
             --env SCCACHE_BASEDIRS=/workspace --env CARGO_INCREMENTAL=0 --env CARGO_NET_OFFLINE=true \
-            --env CARGO_TARGET_DIR=target/buildkite-lint --env PULL_REQUEST_HEAD "space-ci:${GITHUB_SHA}" bash -c '
+            --env CARGO_TARGET_DIR=target/buildkite-lint --env EVENT_NAME --env PULL_REQUEST_HEAD --env MERGE_GROUP_BASE \
+            "space-ci:${GITHUB_SHA}" bash -c '
               sccache --start-server >/dev/null 2>&1 && export RUSTC_WRAPPER=sccache
-              mkdir -p target && git config --global --add safe.directory /workspace
-              base_args=() missing=()
-              # Passes the base copy of a file, or an empty file if the base has none.
-              base_copy() {
-                local file="target/archcheck-base-$2"
-                if ! git cat-file -e "${base}:$2" 2>/dev/null; then
-                  echo "archcheck: ${base} has no $2; comparing with an empty one"
-                  : >"${file}" && base_args+=("--$1" "${file}")
-                elif git show "${base}:$2" >"${file}"; then
-                  echo "archcheck: comparing with $2 from ${base}"
-                  base_args+=("--$1" "${file}")
-                else
-                  missing+=("$2")
-                fi
-              }
-              if base="$(bash ci/scripts/resolve-migration-base.sh "" "${PULL_REQUEST_HEAD}")"; then
-                base_copy base-baseline architecture-baseline.toml
-                # --renames needs --base-baseline, which a missing copy leaves out.
-                if ((${#missing[@]} == 0)); then
-                  # Past -l files (diff.renameLimit by default), git skips inexact
-                  # rename detection with only a warning on stderr: allow 20000,
-                  # about 20 s for as many unrelated small files added and
-                  # deleted, and make a skip visible.
-                  if git diff -z --name-status --find-renames -l20000 --diff-filter=R "${base}" HEAD \
-                    >target/archcheck-renames 2>target/archcheck-renames.stderr; then
-                    cat target/archcheck-renames.stderr >&2
-                    base_args+=(--renames target/archcheck-renames)
-                    if grep -q "rename detection was skipped" target/archcheck-renames.stderr; then
-                      echo "::warning title=archcheck::git skipped rename detection since ${base} for too many files; no_new_entries counts an entry moved with its file as new."
-                    fi
-                  else
-                    cat target/archcheck-renames.stderr >&2
-                    echo "::warning title=archcheck::Could not list the renames since ${base}; no_new_entries counts an entry moved with its file as new."
-                  fi
-                fi
-                base_copy base-architecture ARCHITECTURE.toml
-              else
-                missing=(architecture-baseline.toml ARCHITECTURE.toml)
+              git config --global --add safe.directory /workspace
+              if [[ "${EVENT_NAME}" == pull_request ]]; then
+                exec bash ci/scripts/run-archcheck.sh "" "${PULL_REQUEST_HEAD}" target/archcheck.rdjson
               fi
-              for file in "${missing[@]}"; do
-                case "${file}" in
-                  architecture-baseline.toml) skipped="no_new_entries and no_raised_caps are skipped, and crate_names.no_new allows only the crates listed when it was added" ;;
-                  ARCHITECTURE.toml) skipped="crate_names.policy_changed, layers.policy_changed and the layers.placement check for new or changed unmoved entries are skipped" ;;
-                esac
-                echo "::warning title=archcheck::Could not read the base ${file}; ${skipped}."
-              done
-              exec cargo arch --format rdjson "${base_args[@]}" >target/archcheck.rdjson' || status=$?
+              exec bash ci/scripts/run-archcheck.sh "${MERGE_GROUP_BASE}" ""' || status=$?
+          if ((status == 1)) && [[ "${EVENT_NAME}" == merge_group ]]; then
+            echo "::error title=archcheck::Required findings against the merge group's base; see above."; exit 1
+          fi
           if ((status > 1)); then echo "::error title=archcheck::cargo arch exited ${status}; see above."; exit 1; fi
 
       - name: Set up reviewdog
-        if: ${{ !cancelled() && steps.archcheck.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.archcheck.outcome == 'success' && github.event_name == 'pull_request' }}
         uses: reviewdog/action-setup@d8a7baabd7f3e8544ee4dbde3ee41d0011c3a93f # v1.5.0
         with:
           reviewdog_version: v0.21.2
@@ -279,7 +246,7 @@ jobs:
       # shows a step's first 10 warnings, so that run puts the pull request's
       # own findings first (see order-archcheck-findings.sh).
       - name: Annotate repository structure findings
-        if: ${{ !cancelled() && steps.archcheck.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.archcheck.outcome == 'success' && github.event_name == 'pull_request' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REVIEWDOG_GITHUB_API_TOKEN: ${{ github.token }}

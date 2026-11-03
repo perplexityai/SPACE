@@ -48,7 +48,7 @@ include = ["crates/x/src/**"]    # optional: the files checked; all when absent
 allow = ["crates/x/src/owner.rs", "crates/x/src/owner/**"]
 
 [rules.pattern_ratchet.<instance>.no_crossing]
-mode = "advisory"
+mode = "required"
 # ...and no_new_entries, no_raised_caps, listed_no_growth and stale_entries
 ```
 
@@ -79,7 +79,14 @@ check nothing and exits 2; omit it to check every production file. An empty
   table has a matching line;
 - `no_new_entries`: the instance's table has an entry that the base branch's
   copy of that table lacks (a renamed file counts as added, unless
-  `--renames` pairs it with its old path; see [Renamed files](#renamed-files));
+  `--renames` pairs it with its old path; see [Renamed files](#renamed-files)).
+  If the base branch has no such instance (with `--base-architecture`, no
+  `[rules.pattern_ratchet.<instance>]` in its `ARCHITECTURE.toml`; without
+  it, no `[pattern_ratchet.<instance>]` table in its baseline), every entry
+  is reported as advisory instead, as the pull request seeding the table. A
+  base that configures the instance but has no table for it, as for one with
+  no matches, tolerates nothing; so does any base, with a warning, whose
+  `[rules.pattern_ratchet]` doesn't parse;
 - `no_raised_caps`: an entry's cap is higher than in the base branch's copy
   of the table;
 - `listed_no_growth`: a listed file has more matching lines than its cap;
@@ -96,14 +103,18 @@ instance that is not configured, such as one this pull request renamed or
 removed, is ignored, with a line after the summary (`base baseline has
 [pattern_ratchet.<instance>], which is not configured; skipped`) so that the
 removal shows in the log; a missing table has no entries, so every entry of the
-instance's own table is new. If the instance's table, or `pattern_ratchet`
-itself, isn't a table of integers, that instance's two behaviours are skipped
-with a warning, and the other tables are still compared. If the copy isn't TOML
+instance's own table is new, or seeds the table (see `no_new_entries`). If the
+instance's table, or `pattern_ratchet` itself, isn't a table of integers, that
+instance's two behaviours are skipped with a warning, and the other tables are
+still compared. If the copy isn't TOML
 at all, one warning line names every comparison skipped. Without
 `--base-baseline` (the local default), they are skipped, one line per instance
 after the summary line: on stdout for `human`, on stderr for `rdjson`.
-Loosening an instance in `ARCHITECTURE.toml`, by widening `allow` or narrowing
-`patterns`, is not reported by any behaviour: review such changes.
+An instance's name, `patterns`, `include`, `allow` and modes in
+`ARCHITECTURE.toml` are policy, changed only in review: widening `allow` or
+narrowing `patterns` loosens the instance, renaming it seeds a new table, and
+lowering a mode turns a check off. archcheck does not report such edits for
+pattern ratchets yet.
 
 An instance name is lowercase ASCII letters, digits and underscores, starting
 with a letter. Adding an instance takes configuration and a baseline table, no
@@ -117,9 +128,11 @@ code changes:
 3. Add the table to `architecture-baseline.toml` by hand: paste the listed
    entries, or, if no file matches, add an empty `[pattern_ratchet.<instance>]`
    or none at all. Review each entry.
-4. Commit both files. On the pull request, `no_new_entries` reports each
-   entry, since the base branch's copy has no table for the instance: that is
-   expected for a deliberate new instance.
+4. Commit both files. The instance's behaviours are required from this pull
+   request on. The base branch has no such instance, so the pull request
+   seeds the table: `no_new_entries` reports each entry as advisory, whatever
+   its mode. After that, a pull request can only remove entries and lower
+   caps, short of editing the instance itself, which is policy (see above).
 
 ### Renamed files
 
@@ -129,6 +142,11 @@ branch's copy lacks is compared with the entry of the path it was renamed
 from, so moving the entry to the new path is not a new entry, and at or
 below the old cap not a raised one. Above it, `no_raised_caps` reports
 `<new>: renamed from <old>, with cap raised from <old cap> to <cap> …`.
+
+Only a whole-file rename carries an entry. Moving matching lines into a new
+file, or into another listed file, fails: the new file needs a new entry, and
+the other file's cap would have to rise. So splitting a listed file means
+moving its matches into the allowed paths first.
 
 The renames are git's, given with `--renames <path>`: the output of `git
 diff -z --name-status --find-renames <base> HEAD`, which CI passes (see
@@ -145,9 +163,14 @@ moved without `git mv` or `git add` is untracked, and not seen):
 
 ```sh
 git show main:architecture-baseline.toml >/tmp/base-baseline.toml
+git show main:ARCHITECTURE.toml >/tmp/base-architecture.toml
 git diff -z --name-status --find-renames -l20000 main >/tmp/renames
-cargo arch --base-baseline /tmp/base-baseline.toml --renames /tmp/renames
+cargo arch --base-baseline /tmp/base-baseline.toml --renames /tmp/renames \
+  --base-architecture /tmp/base-architecture.toml
 ```
+
+Without `--base-architecture`, an instance the base configures but has no
+table for reads as a new one, and its entries as seeding the table.
 
 `-l20000` raises git's limit on inexact rename detection from
 `diff.renameLimit`; past it, git skips the detection with only a warning on
@@ -209,7 +232,7 @@ crate's name can't be reused elsewhere.
   the rule was added (`BOOTSTRAP` in `src/rules/crate_names.rs`) may be
   listed. A table that doesn't parse counts as empty, with a warning, as does
   a copy that isn't TOML at all, under the one warning for that copy.
-- `stale_entries` (advisory): an entry whose crate is gone or renamed, or no
+- `stale_entries` (required): an entry whose crate is gone or renamed, or no
   longer matches; an `allow` name that no workspace member has, or that
   doesn't match.
 - `policy_changed` (advisory): every difference in `[rules.crate_names]` from
@@ -838,24 +861,26 @@ so a new table is declared by its owner before its migration lands (see
 ## Configuration and modes
 
 Each behaviour has a `mode`: `advisory` findings are reported, `required` ones
-also fail the check, so behaviours can graduate one at a time. Unknown keys,
-sections or modes, a missing file, bad TOML, an invalid regex, glob or instance
-name, an empty `patterns` or `include` list, a layer name that is not one of
-the seven, a package listed twice in `unmoved` or in
-one `store_users` or `allowed_edges` list or in a `[rules.layers.storage]` list,
-a package listed twice in `protocols` or in two `[rules.layers.domain_fences]`
-families, an empty `drivers`, a baseline table for an instance or layers check
-that is not configured, a state configuration or declaration that can't be
-read (see [State ownership](#state-ownership)), and a failing `cargo metadata`
-exit 2. So does a `--base-baseline`, `--renames` or `--base-architecture` that
-can't be read, or one combined with `--write-baseline`, and `--renames` input
-that is not git's (see [Renamed files](#renamed-files)).
+also fail the check. Unknown keys, sections or modes, a missing file, bad TOML,
+an invalid regex, glob or instance name, an empty `patterns` or `include`
+list, a layer name that is not one of the seven, a package listed twice in
+`unmoved` or in one `store_users` or `allowed_edges` list or in a
+`[rules.layers.storage]` list, a package listed twice in `protocols` or in two
+`[rules.layers.domain_fences]` families, an empty `drivers`, a baseline table
+for an instance or layers check that is not configured, a state configuration
+or declaration that can't be read (see [State ownership](#state-ownership)),
+and a failing `cargo metadata` exit 2. So does a `--base-baseline`,
+`--renames` or `--base-architecture` that can't be read, or one combined with
+`--write-baseline`, and `--renames` input that is not git's (see [Renamed
+files](#renamed-files)).
 
 A behaviour is required from the day it lands, and a baseline only shrinks: a
 pull request adds no entry and raises no cap, and stale entries are removed. A
-rule that can't meet that is removed rather than left advisory. Some base
-comparisons predate this policy and are still advisory; they are being made
-required.
+rule that can't meet that is removed rather than left advisory. Three
+behaviours stay advisory because they are notices, not checks:
+`crate_names.policy_changed` and `layers.policy_changed` report a policy edit
+for review, and `layers.state.pending` is how a new table lands, declared
+before its migration (see [State ownership](#state-ownership)).
 
 ## Baseline
 
@@ -887,11 +912,13 @@ For a table the file has, the block has no header and its comment says to add
 the entries inside that table, below its header: pasted at the end of the file,
 they would land in whichever table comes last. For a table the file lacks, the
 block starts with the table's header and goes at the end of the file. Fix the
-file, or, for a deliberate exception, add the entry by hand, inside its table,
-which `no_new_entries` then reports. Raised
-caps are written too, and `no_raised_caps` reports each of them. It reads the
-existing file with the strict parser, so a missing or invalid baseline exits 2:
-it can't create one from scratch.
+file: move the code into the allowed paths. Entries added by hand belong only
+in the pull request that adds their instance to `ARCHITECTURE.toml` (see
+adding an instance, above), or move a listed file's entry with a rename git
+detects (see [Renamed files](#renamed-files)); anywhere else, `no_new_entries`
+fails them. Raised caps are written too, and `no_raised_caps` reports each of
+them. It reads the existing file with the strict parser, so a missing or
+invalid baseline exits 2: it can't create one from scratch.
 
 `cargo arch --write-baseline=<table>`, with `<table>` `crate_names`,
 `pattern_ratchet.<instance>` for a configured instance or
@@ -916,32 +943,49 @@ counted too: check `git status` before `--write-baseline`.
 
 ## In CI
 
-On pull requests, the Rust clippy job in
+On pull requests and in the merge queue, the Rust clippy job in
 [`rust-static-ci.yml`](../../../.github/workflows/rust-static-ci.yml) runs
-`cargo arch --format rdjson --base-baseline <file> --renames <file>
---base-architecture <file>` and passes the findings to
-[reviewdog](https://github.com/reviewdog/reviewdog) with
-`-reporter=github-pr-annotations`. The files are the baseline and
-`ARCHITECTURE.toml` of the synthetic merge's first parent, the base branch, or
-an empty file for one the base lacks, and the renames git detects from that
-base to the merge (`git diff -z --name-status --find-renames -l20000
---diff-filter=R`). If git can't list them, the step warns and runs without
-`--renames`, so a moved entry counts as new; so does a rename git does not
-detect. If git skips rename detection because more files were added and
-deleted than `-l` allows, the step turns git's warning into a workflow
-warning, and moved entries count as new too. If the base can't be resolved,
-the step warns and runs without any of the flags: the `no_new_entries` and
-`no_raised_caps` behaviours, `crate_names.policy_changed`,
-`layers.policy_changed` and `layers.placement`'s check for new or changed
-`unmoved` entries are skipped, and `crate_names.no_new` allows only the
-bootstrap entries. Each finding is a
+[`run-archcheck.sh`](../../../ci/scripts/run-archcheck.sh), which runs `cargo
+arch --base-baseline <file> --renames <file> --base-architecture <file>`. The
+files are the baseline and `ARCHITECTURE.toml` of a base commit, or an empty
+file for one the base lacks, and the renames git detects from that base to
+`HEAD` (`git diff -z --name-status --find-renames -l20000 --diff-filter=R`).
+
+- On a pull request, the base is the synthetic merge's first parent, the base
+  branch. The report is rdjson (`--format rdjson`), passed to
+  [reviewdog](https://github.com/reviewdog/reviewdog) with
+  `-reporter=github-pr-annotations`, as below.
+- In a merge group, the base is the group's `base_sha`, so a pull request
+  whose last pull request run compared with an older base is compared again
+  as it will merge. The report is text in the job's log, without reviewdog,
+  and a required finding fails the job. A merge group whose trees a passing
+  pull request run already checked reuses that run (see
+  [`merge-queue-ci.yml`](../../../.github/workflows/merge-queue-ci.yml)).
+
+To run it locally, as the merge queue does, commit your changes and run `bash
+ci/scripts/run-archcheck.sh "$(git merge-base main HEAD)" ""` from the
+repository root, passing the commit your branch is based on: it takes the
+renames from that commit to `HEAD`, so uncommitted ones are not seen. A base
+that is not an ancestor of `HEAD` skips the base comparisons, with a warning.
+The recipe in [Renamed files](#renamed-files) compares the tip of `main` with
+the working tree instead.
+
+If git can't list the renames, the step warns and runs without `--renames`, so
+a moved entry counts as new; so does a rename git does not detect. If git skips
+rename detection because more files were added and deleted than `-l` allows,
+the step turns git's warning into a workflow warning, and moved entries count
+as new too. If the base can't be resolved, the step warns and runs without any
+of the flags: the `no_new_entries` and `no_raised_caps` behaviours,
+`crate_names.policy_changed`, `layers.policy_changed` and `layers.placement`'s
+check for new or changed `unmoved` entries are skipped, and
+`crate_names.no_new` allows only the bootstrap entries. Each finding is a
 diagnostic with code `<rule>.<behaviour>`, or `<rule>.<instance>.<behaviour>`
 for a rule with instances, with the path exactly as it is. A new catch-all
 crate points at the `name =` line of its `Cargo.toml`, and a new entry, a
 raised cap, a stale entry for a deleted file and a stale `[crate_names]` entry
-at the entry's line in the baseline. `layers` findings point at a crate's
-`name =` line (`placement`, `layout`), the manifest line declaring a dependency
-(an edge), the entry's line in `ARCHITECTURE.toml` (a new or changed `unmoved`
+at the entry's line in the baseline. `layers` findings point at a crate's `name
+=` line (`placement`, `layout`), the manifest line declaring a dependency (an
+edge), the entry's line in `ARCHITECTURE.toml` (a new or changed `unmoved`
 entry, `stale_entries`, `policy_changed`) or the edge's line in the baseline.
 `pattern_ratchet`'s `no_crossing`, `listed_no_growth` and shrank
 `stale_entries` findings point at the file's first matching line; one for a

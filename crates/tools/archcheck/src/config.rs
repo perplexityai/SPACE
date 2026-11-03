@@ -334,6 +334,8 @@ pub enum BaseArchitecture {
 pub struct BasePolicies {
     pub crate_names: BasePolicy<CrateNamesPolicy>,
     pub layers: BasePolicy<LayersPolicy>,
+    /// The instances `[rules.pattern_ratchet]` configures, by name.
+    pub pattern_ratchet: BasePolicy<BTreeSet<String>>,
 }
 
 /// One rule's table of the base branch's copy: `Ok(None)` when the copy has
@@ -355,8 +357,28 @@ impl BaseArchitecture {
         Ok(Self::Loaded(Box::new(BasePolicies {
             crate_names: CrateNamesPolicy::parse(&text).map_err(unusable),
             layers: LayersPolicy::parse(&text).map_err(unusable),
+            pattern_ratchet: pattern_ratchet_instances(&text).map_err(unusable),
         })))
     }
+}
+
+/// The instances `[rules.pattern_ratchet]` of `text` configures, or `None`
+/// without one. Only their names are read.
+fn pattern_ratchet_instances(text: &str) -> Result<Option<BTreeSet<String>>, toml::de::Error> {
+    #[derive(Deserialize)]
+    struct File {
+        #[serde(default)]
+        rules: Rules,
+    }
+    #[derive(Default, Deserialize)]
+    struct Rules {
+        pattern_ratchet: Option<BTreeMap<String, toml::Table>>,
+    }
+    let file: File = toml::from_str(text)?;
+    Ok(file
+        .rules
+        .pattern_ratchet
+        .map(|instances| instances.into_keys().collect()))
 }
 
 /// `flatten` and `untagged` would lose the spans, so each behaviour is a

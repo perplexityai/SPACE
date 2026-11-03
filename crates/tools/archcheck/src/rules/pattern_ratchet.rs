@@ -10,9 +10,9 @@
 //! its own configuration and tables.
 
 use crate::{
-    baseline::BASELINE_FILE,
-    config::{InstanceName, PatternRatchetConfig, RulesConfig},
-    context::{ProductionFile, code_lines},
+    baseline::{BASELINE_FILE, BaseSkip},
+    config::{BaseArchitecture, InstanceName, PatternRatchetConfig, RulesConfig},
+    context::{Context, ProductionFile, code_lines},
     rules::ratchet::{Count, CountRatchet, CountRule, Modes, Wording},
 };
 
@@ -31,6 +31,21 @@ impl CountRule for PatternRatchet {
                 Box::new(Instance { instance, config }) as Box<dyn CountRatchet + 'a>
             })
             .collect()
+    }
+
+    fn other_skips(&self, ctx: &Context) -> Vec<String> {
+        match &ctx.base_architecture {
+            BaseArchitecture::Loaded(base) if !ctx.config.rules.pattern_ratchet.is_empty() => {
+                match &base.pattern_ratchet {
+                    Err(unusable) => vec![BaseSkip::Unusable(unusable).message(&format!(
+                        "{RULE}'s seeding of new instances skipped, and a table the base \
+                         baseline lacks tolerates nothing"
+                    ))],
+                    Ok(_) => Vec::new(),
+                }
+            }
+            _ => Vec::new(),
+        }
     }
 }
 
@@ -57,6 +72,17 @@ impl Instance<'_> {
 impl CountRatchet for Instance<'_> {
     fn instance(&self) -> Option<&str> {
         Some(self.instance.as_str())
+    }
+
+    fn on_base(&self, ctx: &Context) -> Option<bool> {
+        let BaseArchitecture::Loaded(base) = &ctx.base_architecture else {
+            return None;
+        };
+        Some(base.pattern_ratchet.as_ref().map_or(true, |instances| {
+            instances
+                .as_ref()
+                .is_some_and(|instances| instances.contains(self.instance.as_str()))
+        }))
     }
 
     fn modes(&self) -> Modes {

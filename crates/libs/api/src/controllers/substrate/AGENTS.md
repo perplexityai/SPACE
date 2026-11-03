@@ -92,9 +92,9 @@ For new work:
   `as_kubernetes()` only to bind and use the payload. A presence test on it,
   or comparing `capabilities()` with either const, asks which substrate is
   running: add a capability. archcheck's `pattern_ratchet.kubernetes_access`
-  counts `as_kubernetes(` calls in production code outside this module, so a
-  new caller needs a reviewed baseline entry. It cannot tell a presence test
-  from a use; review catches that. `pattern_ratchet.capability_identity`
+  counts `as_kubernetes(` calls in production code outside this module, and
+  a new caller fails it: the baseline only shrinks. It cannot tell a presence
+  test from a use; review catches that. `pattern_ratchet.capability_identity`
   flags either const named in production code outside the two
   `capabilities()` implementations.
 - `managed_by()` names the running substrate for SQL row scope and wire
@@ -119,7 +119,8 @@ For new work:
   `sandbox_direct_route_provenance` are Direct's tables. Outside tests, write
   them only from `direct.rs` and the Direct node registry, and read them
   through an existing query that joins them (archcheck's
-  `pattern_ratchet.direct_tables`, advisory today).
+  `pattern_ratchet.direct_tables` fails a new use outside `direct.rs` and
+  `direct/`; its baseline lists today's).
 - Direct-table joins in shared code, `Unsupported` trait defaults
   (`list_pool_configs`, `upsert_pool_config`, `disable_pool_config`) and
   `supports_node_drain`, a capability for a missing feature, are debt, not

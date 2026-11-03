@@ -42,7 +42,8 @@ const CRATE_NAMES_SKIPPED: [&str; 2] = [
     "crate_names.policy_changed skipped (no --base-architecture given)",
 ];
 
-/// `[rules.crate_names]` as in the repository's `ARCHITECTURE.toml`.
+/// `[rules.crate_names]` with the repository's tokens, `no_new` required and
+/// the other two behaviours advisory.
 const CRATE_NAMES: &str = "[rules.crate_names]\n\
                            banned_tokens = [\"common\", \"shared\", \"util\", \"utils\", \
                            \"helper\", \"helpers\", \"misc\", \"core\"]\n\
@@ -2251,8 +2252,9 @@ fn write_output(stdout: &str) -> WriteOutput<'_> {
         Some(heading) => {
             assert_eq!(
                 heading,
-                "archcheck: the entries not added, for a deliberate exception added by hand \
-                 (no_new_entries reports it):"
+                "archcheck: the entries not added, for the pull request that adds their instance \
+                 to ARCHITECTURE.toml or for a file git detects as renamed from a listed one \
+                 (anywhere else, no_new_entries fails them):"
             );
             lines.map(|line| format!("{line}\n")).collect()
         }
@@ -2861,6 +2863,132 @@ fn pattern_ratchet_base_baseline() {
     );
 }
 
+/// A pull request that adds an instance seeds its table: when the base
+/// branch has no such instance, in its `ARCHITECTURE.toml` or, without one,
+/// in its baseline, each entry is an advisory `no_new_entries` finding, even
+/// with the behaviour required, saying which copy lacked it. A base that
+/// configures the instance but has no table for it, or whose baseline has
+/// the table, tolerates nothing; so does one whose `[rules.pattern_ratchet]`
+/// can't be read, with a warning.
+#[test]
+fn pattern_ratchet_seeds_a_new_instance() {
+    const REQUIRED: [&str; 5] = ["required"; 5];
+    let seeds = |lacks: &str| {
+        format!(
+            "pattern_ratchet.old.no_new_entries (advisory):\n  crates/a/src/listed.rs is in \
+             [pattern_ratchet.old] in architecture-baseline.toml, and {lacks} yet, so this pull \
+             request seeds the table. Review each entry.\n"
+        )
+    };
+    let new = "pattern_ratchet.old.no_new_entries (required):\n  crates/a/src/listed.rs is in \
+               [pattern_ratchet.old] in architecture-baseline.toml but not in the base branch's \
+               copy;"
+        .to_owned();
+    let no_table = tables(&[]);
+    let other_entry = ratchet_baseline(&[("old", &[("crates/a/src/other.rs", 1)])]);
+    let unreadable = format!("{CRATE_NAMES}[rules.pattern_ratchet]\nold = 3\n");
+    // Name, the base's baseline and ARCHITECTURE.toml, the report's start,
+    // the exit status, and a warning after the summary.
+    type Case<'a> = (
+        &'a str,
+        &'a str,
+        Option<String>,
+        String,
+        i32,
+        Option<&'a str>,
+    );
+    let cases: &[Case] = &[
+        (
+            "the base has no such instance",
+            &no_table,
+            Some(CRATE_NAMES.to_owned()),
+            seeds("the base branch's ARCHITECTURE.toml has no [rules.pattern_ratchet.old]"),
+            0,
+            None,
+        ),
+        (
+            "no --base-architecture",
+            &no_table,
+            None,
+            seeds("the base branch's copy has no [pattern_ratchet.old] table"),
+            0,
+            None,
+        ),
+        (
+            "the base has the instance but no table",
+            &no_table,
+            Some(old_tables_config(REQUIRED)),
+            new.clone(),
+            1,
+            None,
+        ),
+        (
+            "the base's baseline has the table, but not the instance",
+            &other_entry,
+            Some(CRATE_NAMES.to_owned()),
+            new.clone(),
+            1,
+            None,
+        ),
+        (
+            "the base's [rules.pattern_ratchet] can't be read",
+            &no_table,
+            Some(unreadable),
+            new.clone(),
+            1,
+            Some(
+                "pattern_ratchet's seeding of new instances skipped, and a table the base \
+                 baseline lacks tolerates nothing",
+            ),
+        ),
+    ];
+    for (name, base, architecture, report, code, warning) in cases {
+        let ws = workspace(&[
+            ("ARCHITECTURE.toml", old_tables_config(REQUIRED)),
+            (
+                "architecture-baseline.toml",
+                ratchet_baseline(&[("old", &[("crates/a/src/listed.rs", 1)])]),
+            ),
+            ("crates/a/src/listed.rs", "old_table\n".to_owned()),
+            ("base-baseline.toml", base.to_string()),
+        ]);
+        let base = ws.path().join("base-baseline.toml");
+        let base_architecture = ws.path().join("base-architecture.toml");
+        let mut args = vec!["--base-baseline", base.to_str().unwrap()];
+        if let Some(text) = architecture {
+            fs::write(&base_architecture, text).unwrap();
+            args.extend(["--base-architecture", base_architecture.to_str().unwrap()]);
+        }
+        let run = run(ws.path(), &args);
+        assert_eq!(run.code, *code, "{name}: {}{}", run.stdout, run.stderr);
+        assert!(
+            run.stdout.starts_with(report.as_str()),
+            "{name}: {}",
+            run.stdout
+        );
+        assert!(
+            run.stdout.contains("archcheck: 1 finding "),
+            "{name}: {}",
+            run.stdout
+        );
+        let warned = run
+            .stdout
+            .lines()
+            .find(|line| line.starts_with("archcheck: warning: "));
+        match warning {
+            Some(warning) => assert!(
+                warned.is_some_and(|line| line.starts_with(&format!(
+                    "archcheck: warning: could not parse {} at line ",
+                    base_architecture.display()
+                )) && line.ends_with(warning)),
+                "{name}: {}",
+                run.stdout
+            ),
+            None => assert_eq!(warned, None, "{name}"),
+        }
+    }
+}
+
 /// `ARCHITECTURE.toml` with [`CRATE_NAMES`] and instances restricting
 /// `<instance>_table`, with no allowed paths.
 fn instances_config(instances: &[&str]) -> String {
@@ -3417,7 +3545,9 @@ fn pattern_ratchet_write_baseline() {
         output.not_added,
         [
             "not added: crates/a/src/new.rs (2 code lines matching the old patterns); move them \
-          behind an allowed path, or add an entry by hand if this is a deliberate exception"
+          behind an allowed path; an entry added by hand fails \
+          pattern_ratchet.old.no_new_entries unless this pull request adds \
+          the instance to ARCHITECTURE.toml or git detects the file as renamed from a listed one"
         ]
     );
     assert!(
@@ -3703,7 +3833,9 @@ fn pattern_ratchet_scoped_write_baseline() {
         output.not_added,
         [
             "not added: crates/b/src/sub/new.rs (1 code line matching the old patterns); move \
-          them behind an allowed path, or add an entry by hand if this is a deliberate exception"
+          them behind an allowed path; an entry added by hand fails \
+          pattern_ratchet.old.no_new_entries unless this pull request adds \
+          the instance to ARCHITECTURE.toml or git detects the file as renamed from a listed one"
         ]
     );
     assert!(
@@ -3753,7 +3885,9 @@ fn pattern_ratchet_scoped_write_baseline() {
         output.not_added,
         [
             "not added: crates/a/src/p.rs (1 code line matching the other patterns); move them \
-          behind an allowed path, or add an entry by hand if this is a deliberate exception"
+          behind an allowed path; an entry added by hand fails \
+          pattern_ratchet.other.no_new_entries unless this pull request adds \
+          the instance to ARCHITECTURE.toml or git detects the file as renamed from a listed one"
         ]
     );
     assert!(
@@ -3851,7 +3985,9 @@ fn pattern_ratchet_scoped_write_keeps_an_empty_table() {
         output.not_added,
         [
             "not added: crates/a/src/n.rs (1 code line matching the old patterns); move them \
-          behind an allowed path, or add an entry by hand if this is a deliberate exception"
+          behind an allowed path; an entry added by hand fails \
+          pattern_ratchet.old.no_new_entries unless this pull request adds \
+          the instance to ARCHITECTURE.toml or git detects the file as renamed from a listed one"
         ]
     );
     assert!(

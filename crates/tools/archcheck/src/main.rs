@@ -45,15 +45,19 @@ usage: archcheck [--root <path>] [--format human|rdjson]
                       the base branch's ARCHITECTURE.toml, which
                       crate_names.policy_changed, layers.policy_changed and
                       layers.placement's new or changed unmoved entries
-                      compare with (skipped without it)
+                      compare with (skipped without it), and which decides
+                      whether pattern_ratchet seeds an instance's table
+                      (without it, a base baseline without the table counts
+                      as a new instance)
   --write-baseline[=<table>]
                       update or remove the entries of architecture-baseline.toml
                       to match the current tree, or with =<table>
                       (crate_names, pattern_ratchet.<instance> or
                       layers.<check>) only that
                       table's, keeping the others. It lists each violation
-                      without an entry, with the entries to add by hand, and
-                      never adds one";
+                      without an entry, with the entries to paste in the
+                      pull request that adds their instance to
+                      ARCHITECTURE.toml, and never adds one";
 
 const EXIT_REQUIRED_FINDINGS: u8 = 1;
 const EXIT_ERROR: u8 = 2;
@@ -167,14 +171,17 @@ fn run(options: Options) -> Result<ExitCode, RunError> {
                 path.display()
             ),
         };
-        // Pasted inside its table, an entry is a deliberate exception, which
-        // no_new_entries reports on the pull request.
+        // Pasted inside its table, an entry belongs only in the pull request
+        // that adds its instance to ARCHITECTURE.toml, or moves a listed
+        // file's entry with a rename git detects; anywhere else,
+        // no_new_entries fails it.
         let entries = if written.not_added_entries.is_empty() {
             String::new()
         } else {
             format!(
-                "archcheck: the entries not added, for a deliberate exception added by hand \
-                 (no_new_entries reports it):\n{}",
+                "archcheck: the entries not added, for the pull request that adds their instance \
+                 to ARCHITECTURE.toml or for a file git detects as renamed from a listed one \
+                 (anywhere else, no_new_entries fails them):\n{}",
                 written.not_added_toml()?
             )
         };
