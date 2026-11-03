@@ -8,6 +8,7 @@ import { usePathname, useSearchParams } from 'next/navigation';
 import {
   STORED_LIFECYCLE_FILTER_STATES,
   bringUpAction,
+  chooseAppliedStatuses,
   splitStatusFilter,
   statusFilterKey,
   statusFilterOptions,
@@ -43,6 +44,7 @@ import {
   ListSelection,
   PAGE_SIZE_OPTIONS,
   createdAgeMs,
+  fragmentSearchScope,
   listRequestQuery,
   listSections,
   loadedRowFilter,
@@ -739,7 +741,8 @@ function SandboxesPage() {
   // The selected statuses this list applies, and those it cannot.
   const statusSplit = useMemo(() => splitStatusFilter(listMode === 'paged', statusFilter), [listMode, statusFilter]);
   // What the search box does on this list's shape: a direct lookup, a prefix
-  // the server matches, or a match within the loaded rows.
+  // the server matches, a match within the loaded rows, or both of the last
+  // two for hex digits and dashes.
   const search = useMemo(() => sandboxSearch(idFilter, listMode), [idFilter, listMode]);
   // The filters are those of a paged request whatever the shape on screen;
   // a sampled request sends only the org (`listScope`).
@@ -779,6 +782,12 @@ function SandboxesPage() {
   >(null);
   const lookupInFlightRef = useRef<string | null>(null);
   const lookupTargetRef = useRef<string | null>(null);
+  // The names and IDs that start with a `fragment` search, from a request of
+  // its own (`fragmentSearchScope`), keyed by that request's scope.
+  const [fragmentMatches, setFragmentMatches] = useState<
+    { key: string; sandboxes: Sandbox[]; more: boolean; error: string | null } | null
+  >(null);
+  const fragmentTargetRef = useRef<string | null>(null);
 
   useEffect(() => {
     const params = new URLSearchParams();
@@ -1230,7 +1239,7 @@ function SandboxesPage() {
 
     // The server applied the rest on a paged list; see `loadedRowFilter`.
     return sandboxes.filter(loadedRowFilter(listMode, {
-      matchesSearch: search.kind === 'page' ? (s) => matchesSandboxQuery(search.query, s) : null,
+      matchesSearch: search.kind === 'page' || search.kind === 'fragment' ? (s) => matchesSandboxQuery(search.query, s) : null,
       template: templateFilter,
       statuses: statusSplit.applied,
       statusKey: statusFilterKey,
@@ -1292,6 +1301,53 @@ function SandboxesPage() {
   }, [lookupId, listGeneration]);
 
   const lookupPending = lookupId !== null && !(lookup?.publicId === lookupId && lookup.answered);
+
+  const fragmentScope = useMemo(
+    () => (search.kind === 'fragment' ? fragmentSearchScope(selectedScope, search.prefix) : null),
+    [search, selectedScope],
+  );
+  // The request the search box names now; an answer for any other is dropped.
+  fragmentTargetRef.current = fragmentScope?.key ?? null;
+
+  useEffect(() => {
+    if (!fragmentScope || listStopped) return;
+    const scope = fragmentScope;
+    // Typing waits for a pause, as a prefix the list sends does; the next
+    // list load refreshes it again.
+    const timer = setTimeout(() => {
+      getConsoleSandboxList(listRequestQuery(scope, Date.now()))
+        .then((response) => {
+          if (fragmentTargetRef.current !== scope.key) return;
+          if (response.mode !== 'paged') throw new Error(VERSION_CHANGED);
+          setFragmentMatches({ key: scope.key, sandboxes: response.sandboxes, more: response.nextCursor !== null, error: null });
+        })
+        .catch((err: any) => {
+          if (fragmentTargetRef.current !== scope.key) return;
+          const message = err?.message || 'search failed';
+          // A failed refresh keeps the last answer for the same search.
+          setFragmentMatches((prev) =>
+            prev?.key === scope.key ? { ...prev, error: message } : { key: scope.key, sandboxes: [], more: false, error: message });
+        });
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [fragmentScope?.key, listGeneration, listStopped]);
+
+  const fragmentAnswer = fragmentScope && fragmentMatches?.key === fragmentScope.key ? fragmentMatches : null;
+  // The server applied every filter but the node filter.
+  const fragmentRows = useMemo(
+    () => (fragmentAnswer?.sandboxes ?? []).filter(loadedRowFilter('paged', {
+      matchesSearch: null,
+      template: null,
+      statuses: [],
+      statusKey: statusFilterKey,
+      userId: null,
+      node: nodeFilter,
+      createdWithin: null,
+      olderThan: null,
+      now: Date.now(),
+    })),
+    [fragmentAnswer, nodeFilter],
+  );
 
   // The window and the "older than" bound must leave a range between them;
   // a window that would not drops the bound.
@@ -1616,7 +1672,7 @@ function SandboxesPage() {
               aria-label="Search sandboxes"
             />
             {paged ? (
-              <Tooltip title="A name or ID prefix is searched on the server as typed. Names match case-sensitively; an ID prefix starts with sbx_ or is a dashed UUID start, and its hex matches in either case. Hex alone, such as the ID column's label, matches IDs and names within this page, ignoring case. A full ID or pod name is looked up directly.">
+              <Tooltip title="A name or ID prefix is searched on the server as typed. Names match case-sensitively; an ID prefix starts with sbx_ or is a dashed UUID start, and its hex matches in either case. Hex digits and dashes alone, such as the ID column's label or a name like e2e-1, are matched two ways: anywhere in the IDs and names of this page, ignoring case, and on the server as the start of any name or ID, listed after this page. A full ID or pod name is looked up directly.">
                 <QuestionCircleOutlined aria-label="About the search" style={{ color: 'rgba(0, 0, 0, 0.45)' }} />
               </Tooltip>
             ) : null}
@@ -1648,7 +1704,8 @@ function SandboxesPage() {
               size="small"
               placeholder={paged ? 'Stored lifecycle' : 'Status'}
               value={statusSplit.applied}
-              onChange={(value) => setStatusFilter(value as string[])}
+              // The control shows the applied statuses; the rest stay under "Not applied".
+              onChange={(value) => setStatusFilter((current) => chooseAppliedStatuses(paged, current, value as string[]))}
               options={statusFilterOptionList}
               allowClear
               style={{ minWidth: 180 }}
@@ -1776,7 +1833,14 @@ function SandboxesPage() {
         />
       ) : null}
 
-      {paged && search.kind === 'page' ? (
+      {paged && search.kind === 'fragment' ? (
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 12 }}
+          title={`"${idFilter.trim()}" matches IDs and names anywhere within page ${position.index + 1}, ignoring case, in the table below. Names and IDs that start with it are searched across the whole list and listed after this page; paste the full ID to look it up.`}
+        />
+      ) : paged && search.kind === 'page' ? (
         <Alert
           type="info"
           showIcon
@@ -1851,6 +1915,29 @@ function SandboxesPage() {
             options={PAGE_SIZE_OPTIONS.map((value) => ({ value, label: `${value} / page` }))}
             style={{ width: 110 }}
             aria-label="Sandboxes per page"
+          />
+        </div>
+      ) : null}
+
+      {paged && !listStopped && search.kind === 'fragment' ? (
+        <div style={{ marginTop: 24 }}>
+          <Title level={5} style={{ marginTop: 0 }}>
+            Names and IDs starting with &ldquo;{search.prefix}&rdquo;, across the list{fragmentAnswer ? ` (${fragmentRows.length}${fragmentAnswer.more ? '+' : ''})` : ''}
+          </Title>
+          <Text type="secondary" style={{ display: 'block', fontSize: 12, marginBottom: 8 }}>
+            {`Searched on the server with the filters above: names that start with it, case-sensitively, and IDs that start with it. Names and IDs that contain it elsewhere, such as an ID ending in the ID column's label, match on the page above only.${fragmentAnswer?.more ? ` Showing the first ${pageSize}, newest first; type more of the name or ID to narrow them.` : ''}`}
+          </Text>
+          {fragmentAnswer?.error ? (
+            <Alert type="warning" showIcon style={{ marginBottom: 8 }} title={`Could not search names and IDs starting with "${search.prefix}": ${fragmentAnswer.error}`} />
+          ) : null}
+          <Table
+            columns={columns}
+            dataSource={fragmentRows}
+            rowKey="id"
+            loading={!fragmentAnswer}
+            size="small"
+            pagination={false}
+            scroll={{ x: 1280 }}
           />
         </div>
       ) : null}

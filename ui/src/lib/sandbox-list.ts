@@ -5,9 +5,11 @@ import type { Sandbox } from './types';
 // and applies the filters below. A server from before paging ignores
 // `cursor` and every filter except `org_id` and answers a bare array of the
 // newest `limit` rows; the console then samples, as it did before paging.
-// The first answer of a page view decides which (`ListSelection.load`); an
-// answer in the other shape after it means the API changed version while the
-// page was open, and the list stops until the page is reloaded.
+// The first answer of a page view decides which (`ListSelection.load`). A
+// later page answering a sampled view means the API now pages, and the list
+// switches to paging; a bare array answering a paged view means the API went
+// back to a version without paging, and the list stops until the page is
+// reloaded.
 export type ListMode = 'paged' | 'sampled';
 
 export type SandboxListResponse =
@@ -133,9 +135,9 @@ export function listRequestQuery(scope: ListScope, now: number): string {
 
 // The filters the console applies to the rows it loaded. A paged server
 // applies every filter it was sent; it has no node filter yet, so that one
-// always narrows the loaded rows only, and a search the server cannot answer
-// (see `sandboxSearch`) is matched here too. A sampled list was sent only
-// `org_id`, so every other filter applies here.
+// always narrows the loaded rows only, and a search the list does not send
+// (`page` and `fragment` in `sandboxSearch`) is matched here too. A sampled
+// list was sent only `org_id`, so every other filter applies here.
 type LoadedRow = Pick<Sandbox, 'template' | 'status' | 'user_id' | 'active_node_id' | 'created_at'>;
 
 export interface LoadedRowCriteria<T extends LoadedRow> {
@@ -244,6 +246,16 @@ export class ListRequests {
   }
 }
 
+// The request of a `fragment` search (`sandboxSearch`): the selected page's
+// filters with the search as `prefix`, read from the first page at the page
+// size. The list itself is read without it, so the search still matches ID
+// suffixes, such as the ID column's label, within the page on screen. Null on
+// a sampled list, which sends no prefix.
+export function fragmentSearchScope(selected: ListScope, prefix: string): ListScope | null {
+  if (selected.mode !== 'paged') return null;
+  return listScope('paged', { ...selected.filters, prefix }, { limit: selected.limit, cursor: '' });
+}
+
 // After the selection changes: the rows on screen are kept when they are the
 // selected scope's (a change undone before its answer arrived), and
 // otherwise the selected scope is loaded.
@@ -253,7 +265,8 @@ export function scopeChangePlan(shown: ListScope | null, selected: ListScope): '
 
 // The cursor of the page after the one shown, with the scope (filters,
 // size and page position) of the request that returned it. Next uses it
-// only while that scope is still selected; a failed load clears it.
+// only while that scope is still selected, and loses it with the rows it was
+// returned with: a failed refresh of the page on screen keeps both.
 export interface Continuation {
   scopeKey: string;
   cursor: string;
@@ -271,10 +284,10 @@ export function nextCursorFor(continuation: Continuation | null, selected: ListS
 // - `shown`: the answer is the selected scope's, in the shape asked for.
 // - `skipped`: the selection changed while it was in flight, or a newer load
 //   started; nothing is shown and `loading` is left to that load.
-// - `stopped`: the API answered in the other shape from the list's mode, as
-//   during a rolling deploy, now or in an earlier load; nothing more is read
-//   until the page is reloaded. `kept` says whether the rows on screen are
-//   the selected scope's; when they are not they must be cleared.
+// - `stopped`: the API answered a paged list with a bare array, as during a
+//   rolling deploy or its rollback, now or in an earlier load; nothing more
+//   is read until the page is reloaded. `kept` says whether the rows on
+//   screen are the selected scope's; when they are not they must be cleared.
 // - `failed`: the request failed. `kept` says whether the rows on screen are
 //   the failed scope's; when they are not they must be cleared rather than
 //   shown under its label.
@@ -287,8 +300,9 @@ export type ListLoad =
 // The sandbox list's selection and its loads. The list shape, the filters,
 // the page and sample sizes and the page position make up the selected
 // scope; `shown` is the scope of the rows on screen, and the continuation
-// is the cursor of the page after it. The list shape is the first answer's;
-// `stopped` is set once a later answer comes in the other shape.
+// is the cursor of the page after it. The list shape is the first answer's,
+// until a page answers a sampled list; `stopped` is set once a bare array
+// answers a paged list after the first answer.
 export class ListSelection {
   mode: ListMode = 'paged';
   position: PagePosition = FIRST_PAGE;
@@ -351,9 +365,11 @@ export class ListSelection {
   // Load `scope` with `read`. A load whose scope is no longer selected when
   // it starts or answers is skipped. The first answer decides the list shape:
   // a page keeps paging, and a bare array, the answer of a server without
-  // paging, switches to sampling and reads the sample. A later answer in the
-  // other shape stops the list (see `ListLoad`), and so does every load
-  // after it.
+  // paging, switches to sampling and reads the sample. A page answering a
+  // sampled list later switches it to paging and reads the first page with
+  // every filter, since the sample request sent only the org. A bare array
+  // answering a paged list later stops the list (see `ListLoad`), and so
+  // does every load after it, so no page joins rows of both shapes.
   async load(scope: ListScope, read: (scope: ListScope) => Promise<SandboxListResponse>): Promise<ListLoad> {
     if (this.stopped) return this.stop();
     if (!sameScope(this.selected, scope)) return { kind: 'skipped' };
@@ -364,10 +380,12 @@ export class ListSelection {
         response = await read(ticket.scope);
       } catch (error) {
         if (!this.requests.applies(ticket, this.selected)) return { kind: 'skipped' };
-        // Next continues from a page that answered, not from one that failed.
-        this.continuation = null;
         const kept = sameScope(this.shown, ticket.scope);
-        if (!kept) this.shown = null;
+        if (!kept) {
+          // The rows on screen are another scope's; they go, and their Next with them.
+          this.shown = null;
+          this.continuation = null;
+        }
         return { kind: 'failed', scope: ticket.scope, error, kept };
       }
       if (!this.requests.applies(ticket, this.selected)) return { kind: 'skipped' };
@@ -378,13 +396,16 @@ export class ListSelection {
         this.continuation = continuationFor(ticket.scope, response.mode === 'paged' ? response.nextCursor : null);
         return { kind: 'shown', scope: ticket.scope, response };
       }
-      if (decided) {
+      if (decided && response.mode === 'sampled') {
         this.stopped = true;
         return this.stop();
       }
-      // The first answer is a bare array; its rows are the newest at the
-      // page size, not the sample.
+      // The first answer is a bare array, whose rows are the newest at the
+      // page size, not the sample; or a page answers a sampled list, whose
+      // request sent no filter but the org. Either way the selected scope's
+      // first page in the answer's shape is read.
       this.mode = response.mode;
+      this.position = FIRST_PAGE;
       ticket = this.requests.begin(this.selected);
     }
   }

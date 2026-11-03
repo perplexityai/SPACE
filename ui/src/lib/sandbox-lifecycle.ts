@@ -48,6 +48,15 @@ export function splitStatusFilter(paged: boolean, values: string[]): { applied: 
   return { applied, notApplied: values.filter((value) => !STORED_LIFECYCLES.has(value)) };
 }
 
+// The status filter after the operator sets the status control to `chosen`.
+// The control holds only the applied statuses, so the ones a paged list does
+// not apply are kept rather than dropped from the filter and its link; their
+// own tag removes them.
+export function chooseAppliedStatuses(paged: boolean, current: string[], chosen: string[]): string[] {
+  const { notApplied } = splitStatusFilter(paged, current);
+  return [...chosen, ...notApplied.filter((value) => !chosen.includes(value))];
+}
+
 // A row without a status shows, and filters, as `unknown`.
 export const NO_STATUS = 'unknown';
 

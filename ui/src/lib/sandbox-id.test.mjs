@@ -93,13 +93,31 @@ test('on a paging server, the ID column\'s label is matched within the page, ign
   assert.equal(label, '9b10b406');
   for (const input of [label, label.toUpperCase(), 'ae1d-72e0', 'AE1D72E0', '1906']) {
     const search = sandboxSearch(input, 'paged');
-    assert.equal(search.kind, 'page', input);
+    assert.equal(search.kind, 'fragment', input);
     assert.equal(matchesSandboxQuery(search.query, sandbox), input !== '1906', input);
   }
   // Names that contain the text match too, as they did before paging.
   const cafe = sandboxSearch('CAFE', 'paged');
-  assert.equal(cafe.kind, 'page');
+  assert.equal(cafe.kind, 'fragment');
   assert.equal(matchesSandboxQuery(cafe.query, { id: other.id, name: 'my-cafe' }), true);
+});
+
+test('on a paging server, hex digits and dashes are also sent as a prefix, so such names are found beyond the page', () => {
+  // Names made of hex digits and dashes, which the server matches by prefix
+  // as typed; it reads the same text as the start of an ID too.
+  for (const name of ['e2e-1', 'cafe', '1234', 'CAFE', 'ae1d-72e0']) {
+    const search = sandboxSearch(` ${name} `, 'paged');
+    assert.equal(search.kind, 'fragment', name);
+    assert.equal(search.prefix, name, name);
+    // A row so named on the loaded page matches there as well.
+    assert.equal(matchesSandboxQuery(search.query, { id: other.id, name }), true, name);
+  }
+  // A dashed ID start is a prefix alone, as before.
+  assert.deepEqual(sandboxSearch('01a19089-394a', 'paged'), { kind: 'prefix', prefix: '01a19089-394a' });
+  // Hex longer than any name is matched within the page only.
+  assert.equal(sandboxSearch('a'.repeat(257), 'paged').kind, 'page');
+  // A sampled list sends no prefix.
+  assert.equal(sandboxSearch('e2e-1', 'sampled').kind, 'page');
 });
 
 test('on a paging server, a name or ID prefix goes to the server, case kept for names', () => {

@@ -157,15 +157,20 @@ function startsUuid(value: string): boolean {
 //   takes `SBX_` too, so an ID prefix behind it is sent behind `sbx_`, the
 //   rest as typed. A name that starts with `SBX_` and then hex is then not
 //   matched.
+// - `fragment`: hex digits and dashes on a paging server, other than a
+//   dashed ID start: the ID column's label, which is the end of the ID and
+//   not its start, or a name such as `e2e-1`, `cafe` or `1234`. `query` is
+//   matched within the loaded page as `page` is, so the label finds its row;
+//   `prefix` is sent to the server as typed in a request of its own, which
+//   finds the names and IDs that start with it beyond the page.
 // - `page`: matched within the loaded rows, ignoring case, anywhere in the ID
-//   or name. On a paging server this is undashed hex or a hex run with
-//   dashes elsewhere, such as the ID column's label, which is the end of
-//   the ID and not its start, and text no name can start with. A sampled
-//   list matches all free text this way, as it did before paging.
+//   or name. On a paging server this is only text no name can start with. A
+//   sampled list matches all free text this way, as it did before paging.
 export type SandboxSearch =
   | { kind: 'empty' }
   | { kind: 'ref'; ref: SandboxRef }
   | { kind: 'prefix'; prefix: string }
+  | { kind: 'fragment'; prefix: string; query: Extract<SandboxQuery, { kind: 'text' }> }
   | { kind: 'page'; query: Extract<SandboxQuery, { kind: 'text' }> };
 
 export function sandboxSearch(input: string, mode: ListMode): SandboxSearch {
@@ -183,6 +188,7 @@ export function sandboxSearch(input: string, mode: ListMode): SandboxSearch {
   if (lower.includes('-') && startsUuid(lower)) return { kind: 'prefix', prefix: typed };
   const idFragment = /^[0-9a-f-]+$/.test(lower) && /[0-9a-f]/.test(lower);
   const namePrefix = !typed.includes('\0') && new TextEncoder().encode(typed).length <= MAX_SANDBOX_NAME_BYTES;
-  if (idFragment || !namePrefix) return { kind: 'page', query };
+  if (!namePrefix) return { kind: 'page', query };
+  if (idFragment) return { kind: 'fragment', prefix: typed, query };
   return { kind: 'prefix', prefix: typed };
 }
