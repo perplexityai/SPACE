@@ -73,12 +73,7 @@ pub struct GuestProfile {
     agent_protocol: QualifiedGuestAgent,
 }
 
-/// Agent presence alone does not qualify any operations or memory lifecycle.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum QualifiedGuestAgent {
-    Absent,
-    LinuxV1,
-}
+pub use pplx_space_common_core::types::guest_image::QualifiedGuestAgent;
 impl GuestProfile {
     pub fn resolve_optional(
         execution: Option<&ExecutionMetadata>,
@@ -121,7 +116,7 @@ impl GuestProfile {
             None => GuestShutdown::AgentFlush,
         };
         let agent_protocol = match environment {
-            Some(environment) => environment.guest_agent_protocol(),
+            Some(environment) => environment.guest_agent_protocol(image),
             None => QualifiedGuestAgent::LinuxV1,
         };
         Ok(Self {
@@ -133,17 +128,15 @@ impl GuestProfile {
     /// Guest-side lifecycle support; the VMM's memory-state qualification is
     /// an additional independent requirement at capture/restore admission.
     pub fn supports_memory_lifecycle(self) -> bool {
-        match self.agent_protocol {
-            QualifiedGuestAgent::Absent => false,
-            QualifiedGuestAgent::LinuxV1 => true,
-        }
+        self.agent_protocol.supports_memory_lifecycle()
     }
 
     pub fn supports_process_environment(self) -> bool {
-        match self.agent_protocol {
-            QualifiedGuestAgent::Absent => false,
-            QualifiedGuestAgent::LinuxV1 => true,
-        }
+        self.agent_protocol.supports_process_environment()
+    }
+
+    pub fn agent_protocol(self) -> QualifiedGuestAgent {
+        self.agent_protocol
     }
 
     pub fn shutdown(self) -> GuestShutdown {

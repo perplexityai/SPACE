@@ -208,6 +208,7 @@ impl BridgeHostFixture {
                 bridge_guest_connector,
                 host_control_socket_path,
                 host_peer_authorization: SpacedHostPeerAuthorization::Disabled,
+                guest_agent: pplx_space_spaced_host_server::QualifiedGuestAgent::LinuxV1,
             },
         );
         let service_task = tokio::spawn(service.run());

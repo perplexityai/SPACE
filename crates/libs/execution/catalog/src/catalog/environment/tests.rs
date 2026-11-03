@@ -139,10 +139,6 @@ fn firmware_environment_has_no_kernel_and_is_not_a_default_or_snapshot_loader() 
     assert!(entry.kernel().is_none());
     assert!(!entry.supports_memory_state());
     assert_eq!(execution.guest().os, GuestOperatingSystem::Windows);
-    assert_eq!(
-        entry.guest_agent_protocol(),
-        crate::guest::QualifiedGuestAgent::Absent
-    );
     use pplx_space_common_core::types::guest_image::{
         GuestAgent, GuestDiskLayout, GuestImageContract, GuestNetwork, GuestReadiness,
     };
@@ -165,10 +161,14 @@ fn firmware_environment_has_no_kernel_and_is_not_a_default_or_snapshot_loader() 
         GuestAgent::Spaced,
     )
     .unwrap();
-    assert!(
-        crate::guest::GuestProfile::resolve(&execution, agent_image).is_err(),
-        "installing an agent cannot qualify an existing image contract"
+    let native = crate::guest::GuestProfile::resolve(&execution, agent_image).unwrap();
+    assert_eq!(
+        native.agent_protocol(),
+        crate::guest::QualifiedGuestAgent::WindowsV1
     );
+    assert!(!native.supports_memory_lifecycle());
+    assert!(!native.supports_process_environment());
+    assert_eq!(native.shutdown(), crate::guest::GuestShutdown::Acpi);
     let legacy =
         crate::guest::GuestProfile::resolve_optional(None, GuestImageContract::default()).unwrap();
     assert!(legacy.supports_memory_lifecycle());

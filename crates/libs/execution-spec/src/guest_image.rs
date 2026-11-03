@@ -148,3 +148,51 @@ impl From<GuestImageContract> for ImageDocument {
 
 #[cfg(all(test, feature = "serde"))]
 mod tests;
+
+/// Agent protocol qualified by the image environment, never by guest claims.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum QualifiedGuestAgent {
+    #[default]
+    Absent,
+    LinuxV1,
+    /// Native Windows readiness; operations require separate qualification.
+    WindowsV1,
+}
+impl QualifiedGuestAgent {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::LinuxV1 => "linux-v1",
+            Self::WindowsV1 => "windows-v1",
+        }
+    }
+}
+impl std::fmt::Display for QualifiedGuestAgent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("unsupported qualified guest agent '{0}'")]
+pub struct QualifiedGuestAgentParseError(String);
+impl std::str::FromStr for QualifiedGuestAgent {
+    type Err = QualifiedGuestAgentParseError;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "absent" => Ok(Self::Absent),
+            "linux-v1" => Ok(Self::LinuxV1),
+            "windows-v1" => Ok(Self::WindowsV1),
+            _ => Err(QualifiedGuestAgentParseError(value.into())),
+        }
+    }
+}
+
+impl QualifiedGuestAgent {
+    pub fn supports_memory_lifecycle(self) -> bool {
+        matches!(self, Self::LinuxV1)
+    }
+
+    pub fn supports_process_environment(self) -> bool {
+        matches!(self, Self::LinuxV1)
+    }
+}

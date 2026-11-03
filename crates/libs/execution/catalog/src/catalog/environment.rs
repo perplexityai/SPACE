@@ -185,21 +185,31 @@ pub struct CompiledEnvironment {
 #[derive(Clone, Copy, Debug)]
 enum QualifiedGuestImage {
     LinuxDirect,
-    AgentlessDhcpDisk,
+    WindowsDhcpDisk,
 }
 
 impl CompiledEnvironment {
-    pub fn guest_agent_protocol(&self) -> crate::guest::QualifiedGuestAgent {
+    pub fn guest_agent_protocol(
+        &self,
+        image: pplx_space_common_core::types::guest_image::GuestImageContract,
+    ) -> crate::guest::QualifiedGuestAgent {
         match self.guest_image {
             QualifiedGuestImage::LinuxDirect => crate::guest::QualifiedGuestAgent::LinuxV1,
-            QualifiedGuestImage::AgentlessDhcpDisk => crate::guest::QualifiedGuestAgent::Absent,
+            QualifiedGuestImage::WindowsDhcpDisk => match image.agent() {
+                pplx_space_common_core::types::guest_image::GuestAgent::Absent => {
+                    crate::guest::QualifiedGuestAgent::Absent
+                }
+                pplx_space_common_core::types::guest_image::GuestAgent::Spaced => {
+                    crate::guest::QualifiedGuestAgent::WindowsV1
+                }
+            },
         }
     }
 
     pub fn guest_shutdown(&self) -> crate::guest::GuestShutdown {
         match self.guest_image {
             QualifiedGuestImage::LinuxDirect => crate::guest::GuestShutdown::AgentFlush,
-            QualifiedGuestImage::AgentlessDhcpDisk => crate::guest::GuestShutdown::Acpi,
+            QualifiedGuestImage::WindowsDhcpDisk => crate::guest::GuestShutdown::Acpi,
         }
     }
 
@@ -210,15 +220,18 @@ impl CompiledEnvironment {
         image: pplx_space_common_core::types::guest_image::GuestImageContract,
     ) -> bool {
         use pplx_space_common_core::types::guest_image::{
-            GuestDiskLayout, GuestNetwork, GuestReadiness,
+            GuestAgent, GuestDiskLayout, GuestNetwork, GuestReadiness,
         };
         match self.guest_image {
             QualifiedGuestImage::LinuxDirect => image.legacy_transport(),
-            QualifiedGuestImage::AgentlessDhcpDisk => {
+            QualifiedGuestImage::WindowsDhcpDisk => {
                 image.disk() == GuestDiskLayout::OpaqueRawDisk
                     && image.network() == GuestNetwork::SlotDhcpV1
-                    && !image.expects_agent()
-                    && matches!(image.readiness(), GuestReadiness::TcpService { .. })
+                    && matches!(
+                        (image.agent(), image.readiness()),
+                        (GuestAgent::Absent, GuestReadiness::TcpService { .. })
+                            | (GuestAgent::Spaced, GuestReadiness::Agent)
+                    )
             }
         }
     }
@@ -425,7 +438,7 @@ impl CompiledEnvironment {
             boot_artifacts: vec![firmware],
             definition,
             memory_state: false,
-            guest_image: QualifiedGuestImage::AgentlessDhcpDisk,
+            guest_image: QualifiedGuestImage::WindowsDhcpDisk,
             name: "ch-54.0-windows-uefi",
             upgrade_targets: Vec::new(),
         })

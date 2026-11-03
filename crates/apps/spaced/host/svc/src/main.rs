@@ -12,6 +12,9 @@ struct Cli {
 
     #[arg(long)]
     socket: Option<PathBuf>,
+    // Older node-managers omit this flag for Linux; Windows always requires it.
+    #[arg(long, default_value = "linux-v1")]
+    guest_agent: pplx_space_spaced_host_server::QualifiedGuestAgent,
     #[arg(long)]
     host_control_socket: Option<PathBuf>,
     #[arg(long)]
@@ -60,6 +63,7 @@ impl From<Cli> for SpacedHostRunConfig {
     fn from(cli: Cli) -> Self {
         Self {
             socket: cli.socket,
+            guest_agent: cli.guest_agent,
             host_control_socket: cli.host_control_socket,
             vsock_uds: cli.vsock_uds,
             firecracker_pid: cli.firecracker_pid,

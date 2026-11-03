@@ -1,5 +1,6 @@
 //! Capabilities belong to the transport used for dispatch, not a readiness cache.
 use super::*;
+use pplx_space_common_core::types::guest_image::QualifiedGuestAgent;
 use pplx_space_common_grpc::{GuestCapability, guest_capability_unsupported_status};
 use pplx_space_spaced_common::proto::platform::GuestOs;
 
@@ -14,14 +15,20 @@ pub(super) enum Requirement {
 #[derive(Clone)]
 pub(super) struct OperationClient<C> {
     pub(super) client: C,
+    policy: QualifiedGuestAgent,
     meta: BridgeGuestClient<tonic::transport::Channel>,
     platform: Arc<tokio::sync::OnceCell<GuestPlatformObservation>>,
 }
 
 impl<C> OperationClient<C> {
-    pub(super) fn new(client: C, channel: tonic::transport::Channel) -> Self {
+    pub(super) fn new(
+        client: C,
+        channel: tonic::transport::Channel,
+        policy: QualifiedGuestAgent,
+    ) -> Self {
         Self {
             client,
+            policy,
             meta: BridgeGuestClient::new(channel),
             platform: Arc::new(tokio::sync::OnceCell::new()),
         }
@@ -39,6 +46,15 @@ impl<C> OperationClient<C> {
                 Some(rpc),
             ),
         };
+        match self.policy {
+            QualifiedGuestAgent::LinuxV1 => {}
+            QualifiedGuestAgent::Absent | QualifiedGuestAgent::WindowsV1 => {
+                return Err(guest_capability_unsupported_status(
+                    GuestCapability::PlatformOperations,
+                    "image has no qualified guest operations",
+                ));
+            }
+        }
         let platform = self
             .platform
             .get_or_try_init(|| async {
@@ -52,7 +68,7 @@ impl<C> OperationClient<C> {
                 });
                 request.set_timeout(Duration::from_secs(1));
                 let response = self.meta.clone().wait_ready(request).await?.into_inner();
-                GuestPlatformObservation::parse(&response)
+                GuestPlatformObservation::parse(&response, self.policy)
             })
             .await?;
         for &operation in required {
@@ -63,22 +79,42 @@ impl<C> OperationClient<C> {
 }
 
 impl GuestPlatformObservation {
-    pub(super) fn parse(response: &BridgeGuestWaitReadyResponse) -> Result<Self, Status> {
+    pub(super) fn parse(
+        response: &BridgeGuestWaitReadyResponse,
+        policy: QualifiedGuestAgent,
+    ) -> Result<Self, Status> {
         pplx_space_spaced_common::validate_spaced_guest_compatibility(
             Some(&response.version),
             Some(&response.compatibility_family),
         )
         .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        let expected = match policy {
+            QualifiedGuestAgent::LinuxV1 => GuestOs::Linux,
+            QualifiedGuestAgent::WindowsV1 => GuestOs::Windows,
+            QualifiedGuestAgent::Absent => {
+                return Err(Status::failed_precondition(
+                    "image has no qualified guest agent",
+                ));
+            }
+        };
         match &response.platform {
-            Some(wire) => pplx_space_spaced_common::platform::GuestPlatform::parse(
-                wire.clone(),
-                GuestOs::Linux,
-            )
-            .map(Self::Explicit),
-            None if !pplx_space_spaced_common::spaced_guest_requires_platform_descriptor(
-                &response.version,
-            )
-            .map_err(|error| Status::failed_precondition(error.to_string()))? =>
+            Some(wire) => {
+                let mut wire = wire.clone();
+                // Peer claims cannot widen the trusted image's qualification.
+                match policy {
+                    QualifiedGuestAgent::LinuxV1 => {}
+                    QualifiedGuestAgent::WindowsV1 | QualifiedGuestAgent::Absent => {
+                        wire.operations.clear()
+                    }
+                }
+                pplx_space_spaced_common::platform::GuestPlatform::parse(wire, expected)
+                    .map(Self::Explicit)
+            }
+            None if expected == GuestOs::Linux
+                && !pplx_space_spaced_common::spaced_guest_requires_platform_descriptor(
+                    &response.version,
+                )
+                .map_err(|error| Status::failed_precondition(error.to_string()))? =>
             {
                 Ok(Self::LegacyLinux {
                     version: response.version.clone(),

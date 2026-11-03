@@ -535,7 +535,14 @@ impl NodeManagerService {
                         pplx_space_common_core::types::RuntimeKind::Firecracker,
                         |e| e.runtime().kind,
                     );
-                Some(peer.for_runtime(runtime))
+                let guest_agent = self
+                    .recorded_guest_profile(req.sandbox_id.clone())
+                    .await?
+                    .map_or(
+                        pplx_space_common_core::types::guest_image::QualifiedGuestAgent::LinuxV1,
+                        |profile| profile.agent_protocol(),
+                    );
+                Some(peer.for_runtime(runtime).for_guest_agent(guest_agent))
             }
             None => None,
         };

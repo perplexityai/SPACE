@@ -66,6 +66,8 @@ impl SpacedHostBootType {
 /// that sets nothing gets production behavior.
 #[derive(Clone, Debug, Default)]
 pub struct SpacedHostRunConfig {
+    /// Trusted agent qualification supplied by node-manager.
+    pub guest_agent: pplx_space_common_core::types::guest_image::QualifiedGuestAgent,
     /// spaced-host's own gRPC Unix socket.
     pub socket: Option<PathBuf>,
     /// The sandbox host-control Unix socket spaced-host calls out on.
@@ -131,7 +133,10 @@ pub enum RunSpacedHostError {
 fn resolve_service_config(
     config: SpacedHostRunConfig,
 ) -> Result<SpacedHostServiceConfig, RunSpacedHostError> {
-    let mut service_config = SpacedHostServiceConfig::default();
+    let mut service_config = SpacedHostServiceConfig {
+        guest_agent: config.guest_agent,
+        ..Default::default()
+    };
     if let Some(socket) = config.socket {
         service_config.socket_path = socket;
     }
