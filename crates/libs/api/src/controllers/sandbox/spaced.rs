@@ -8,18 +8,11 @@ use pplx_space_common_svc::space_api_route_ed25519::{
     SpaceApiRouteEd25519Authority, SpaceApiRouteEd25519Token, insert_space_api_route_ed25519_token,
 };
 use pplx_space_node_api_client::NodeApiOperationBudget;
-use regex::Regex;
-use std::{future::Future, sync::LazyLock};
+use std::future::Future;
 use tonic::Code;
 
 const RUNTIME_OPERATION_TIMEOUT_EVENT: &str = "sandbox_runtime_operation_timed_out";
 const PROCESS_STREAM_OPEN_TIMEOUT_EVENT: &str = "sandbox_runtime_process_stream_open_timed_out";
-static STREAM_OPEN_TRANSPORT_CLOSE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?i)connection (closed|reset)|goaway|h2 protocol error|http2 error|rst_stream|socket closed|transport error|transport is closing",
-    )
-    .expect("stream-open transport close regex compiles")
-});
 
 pub struct SpacedListOptions {
     pub path: String,
@@ -973,8 +966,7 @@ macro_rules! spaced_stream_open_call {
 }
 
 fn should_retry_node_api_stream_open(status: &tonic::Status) -> bool {
-    pplx_space_node_api_client::is_node_api_draining_status(status)
-        || is_tonic_transport_close_status(status)
+    pplx_space_node_api_client::should_reconnect_stream_open(status)
 }
 
 /// A failure after which later calls should reach the pod over a new
@@ -983,17 +975,6 @@ fn should_retry_node_api_stream_open(status: &tonic::Status) -> bool {
 fn should_retire_kept_connection(status: &tonic::Status) -> bool {
     should_retry_node_api_stream_open(status)
         || matches!(status.code(), Code::DeadlineExceeded | Code::Cancelled)
-}
-
-fn is_tonic_transport_close_status(status: &tonic::Status) -> bool {
-    if !matches!(
-        status.code(),
-        Code::Unavailable | Code::Unknown | Code::Internal
-    ) {
-        return false;
-    }
-
-    STREAM_OPEN_TRANSPORT_CLOSE_RE.is_match(status.message())
 }
 
 impl SpacedSandboxClient {

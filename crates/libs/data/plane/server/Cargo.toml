@@ -57,10 +57,13 @@ pplx-space-common-core = { workspace = true }
 pplx-space-common-grpc = { workspace = true, features = ["internal-tls"] }
 pplx-space-common-svc = { workspace = true }
 pplx-space-feature-flags = { workspace = true }
+pplx-space-guest-process = { workspace = true }
 pplx-space-metrics = { workspace = true }
+pplx-space-native-files = { workspace = true }
 pplx-space-net-gateway-client = { workspace = true }
 pplx-space-node-api-client = { workspace = true }
 pplx-space-public-api = { workspace = true, features = ["serde"] }
+pplx-space-public-api-http = { workspace = true }
 pplx-space-sbx-mgr-client = { workspace = true }
 
 [dev-dependencies]

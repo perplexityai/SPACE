@@ -92,7 +92,9 @@ mod ecw_process;
 mod http_traffic;
 mod ingress_lifetime;
 mod native;
+mod native_files;
 use ingress_lifetime::{Completion, IngressIo, Progress};
+pub use native_files::{NativeFileAccessConfigError, NativeFilesMode};
 mod runtime_route;
 mod state;
 mod upload_admission;
@@ -239,6 +241,9 @@ pub struct DataPlaneConfig {
     /// outlives the drain. `None` sets no deadline: streams run until they end
     /// or the pod's termination grace period kills the process.
     pub shutdown_grace: Option<Duration>,
+    /// Whether to answer Native `files:*`, deciding each request through the
+    /// lifecycle API at `SPACE_INGRESS_ACTIVATION_ENDPOINT`.
+    pub native_files: NativeFilesMode,
 }
 
 impl Default for DataPlaneConfig {
@@ -255,6 +260,7 @@ impl Default for DataPlaneConfig {
             route_cache_ttl: Duration::from_millis(DEFAULT_ROUTE_CACHE_TTL_MS),
             upload_admission: None,
             shutdown_grace: None,
+            native_files: NativeFilesMode::Off,
         }
     }
 }
@@ -267,6 +273,8 @@ struct DataPlaneState {
     attached_streams: Arc<AttachedStreamLimiter>,
     uploads: Option<Arc<UploadAdmission>>,
     upload_tracker: Arc<http_traffic::UploadTracker>,
+    /// Set when the Native files routes are served.
+    native_files: Option<Arc<native_files::NativeFiles>>,
     native_sessions: Arc<NativeSessionAttachLimiter>,
     backend_channels: Arc<BackendChannelPool>,
     revocation_cache: Arc<RevocationCache>,
@@ -408,6 +416,8 @@ pub enum RunDataPlaneError {
     RevocationCheckIntervalTooLong { interval_ms: u128 },
     #[error("failed to connect to SPACE internal ClusterApi: {0}")]
     ConnectClusterApi(#[source] ConnectClusterApiError),
+    #[error("cannot serve Native files: {0}")]
+    NativeFiles(#[source] native_files::NativeFileAccessConfigError),
     #[error("failed to bind data-plane listener at {listen}: {source}")]
     Bind {
         listen: String,
@@ -434,6 +444,14 @@ pub async fn run(
     let drain_started = shutdown_token.child_token();
     let stream_shutdown_token = CancellationToken::new();
 
+    let native_files = match config.native_files {
+        NativeFilesMode::Off => None,
+        NativeFilesMode::Serve => Some(Arc::new(native_files::NativeFiles::new(
+            native_files::NativeFileAccessClient::from_env()
+                .await
+                .map_err(RunDataPlaneError::NativeFiles)?,
+        ))),
+    };
     let cluster_api = connect_cluster_api_clients_for_startup(&shutdown_token)
         .await
         .map_err(RunDataPlaneError::ConnectClusterApi)?;
@@ -454,6 +472,7 @@ pub async fn run(
             .as_ref()
             .map(|upload_admission| Arc::new(UploadAdmission::new(upload_admission))),
         upload_tracker: Arc::default(),
+        native_files,
         native_sessions: Arc::new(NativeSessionAttachLimiter::default()),
         backend_channels: Arc::new(BackendChannelPool::new(config.backend_channel_pool_size)),
         revocation_cache: Arc::new(RevocationCache::default()),
@@ -638,6 +657,10 @@ fn native_method_filter(method: NativeHttpMethod) -> MethodFilter {
 
 fn router(state: DataPlaneState) -> Router {
     let http_span_metadata = DataPlaneHttpSpanMetadata::new(Arc::clone(&state.ecw_hosts));
+    let native_files = match state.native_files {
+        Some(_) => native_files::router(),
+        None => Router::new(),
+    };
 
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
@@ -745,6 +768,7 @@ fn router(state: DataPlaneState) -> Router {
         .route("/metrics", any(unsupported_ecw_envd_endpoint))
         .route("/envs", any(unsupported_ecw_envd_endpoint))
         .route("/files/compose", any(unsupported_ecw_envd_endpoint))
+        .merge(native_files)
         // Matched routes only: service-port requests are forwarded before
         // routing, and the fallback proxy carries no data-plane API route.
         .route_layer(middleware::from_fn(record_request_latency))
