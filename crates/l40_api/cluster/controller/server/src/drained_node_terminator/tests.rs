@@ -46,6 +46,7 @@
 //! ## W — Refusal-warn rate limiting
 //! - W1 `w1_refusal_warn_rate_limited_per_node`
 //! - W2 `w2_refusal_warn_state_pruned_when_node_leaves_drained_list`
+//! - W3 `w3_snapshot_hold_warn_is_paced_per_node`
 
 use pplx_space_common_core::types::NodeId;
 use pplx_space_common_core::types::SandboxId;
@@ -1297,7 +1298,7 @@ async fn w2_refusal_warn_state_pruned_when_node_leaves_drained_list() {
     let reconciler = new_reconciler_with_ec2(StdArc::clone(&sink));
     reconciler.tick().await;
     assert_eq!(
-        reconciler.refusal_warn_pacer.tracked(),
+        reconciler.warn_pacer.tracked(),
         1,
         "a refused node must hold a warn slot"
     );
@@ -1305,7 +1306,31 @@ async fn w2_refusal_warn_state_pruned_when_node_leaves_drained_list() {
     sink.set_drained_list(vec![]);
     reconciler.tick().await;
     assert!(
-        reconciler.refusal_warn_pacer.tracked() == 0,
+        reconciler.warn_pacer.tracked() == 0,
         "a node that left the drained set must be pruned"
+    );
+}
+
+/// The snapshot hold is paced too: a held node takes a pacer slot under its
+/// own reason (window timing is `warn_pacer::tests`').
+#[tokio::test]
+async fn w3_snapshot_hold_warn_is_paced_per_node() {
+    let node = NodeId::new();
+    let sink = FakeSink::new();
+    sink.set_drained_list(vec![node]);
+    sink.set_phase(node, PHASE_DRAINED);
+    sink.set_keep_absent(node);
+    sink.set_local_snapshots(node, 3);
+    let reconciler = new_reconciler(StdArc::clone(&sink));
+
+    assert_eq!(reconciler.tick().await.snapshot_holds, 1);
+    assert_eq!(
+        reconciler.warn_pacer.tracked(),
+        1,
+        "a held node must hold a warn slot"
+    );
+    assert!(
+        !reconciler.warn_pacer.due(node, "snapshot_hold"),
+        "the hold already opened this node's window"
     );
 }

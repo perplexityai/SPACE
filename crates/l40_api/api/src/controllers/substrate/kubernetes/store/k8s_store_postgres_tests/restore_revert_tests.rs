@@ -69,13 +69,15 @@ struct RevertedRow {
     current_local_artifact_id: Option<LocalArtifactId>,
     execution_active: Option<bool>,
     execution_state: Option<String>,
+    activation_attempt_id: Option<SandboxActivationAttemptId>,
 }
 
 async fn reverted_row(pool: &PgPool, sandbox_id: SandboxId) -> TestResult<RevertedRow> {
     Ok(sqlx::query_as(sql!(
         "SELECT s.lifecycle, s.placement, s.active_node_id, s.target_node_id,
                 s.current_local_artifact_id,
-                e.active AS execution_active, e.state AS execution_state
+                e.active AS execution_active, e.state AS execution_state,
+                e.activation_attempt_id
            FROM sandboxes s
            LEFT JOIN sandbox_k8s_executions e ON e.sandbox_id = s.id
           WHERE s.id = $1"
@@ -385,17 +387,15 @@ pub(super) async fn failed_restore_revert_retires_only_its_own_proven_execution(
     Ok(())
 }
 
-/// With abandoned-restore retirement disabled (the default until every
-/// routing replica refuses to route to a `restoring` sandbox), a failed
-/// fresh restore claim's rollback moves only the lifecycle, even with a
-/// proven source: the execution the claim created stays active and the row
-/// stays placed with its placement clock, so its pod isn't deleted under a
-/// request an older replica may have routed to it.
-pub(super) async fn without_retirement_a_failed_restore_revert_moves_only_the_lifecycle(
+/// A suspended sandbox with a ready, stored pre-restore snapshot, claimed by
+/// a fresh user restore whose execution's pod bound on a ready node: the row
+/// is `restoring`, placed on that node as of now. Returns the claim's restore
+/// lease token and the attempt its execution carries.
+async fn claimed_restore_on_node(
     fixture: &PostgresStore,
-) -> TestResult {
-    let sandbox_id = SandboxId::new();
-    let node_id = NodeId::new();
+    sandbox_id: SandboxId,
+    node_id: NodeId,
+) -> TestResult<(Uuid, SandboxActivationAttemptId)> {
     insert_sandbox(&fixture.pool, sandbox_id, "suspended").await?;
     sqlx::query(sql!(
         "INSERT INTO nodes (id, address, role, managed_by, state)
@@ -425,13 +425,8 @@ pub(super) async fn without_retirement_a_failed_restore_revert_moves_only_the_li
             .begin_restore_lifecycle(sandbox_id, false)
             .await?,
     );
-    insert_execution(
-        &fixture.pool,
-        sandbox_id,
-        "0 seconds",
-        SandboxActivationAttemptId::new(),
-    )
-    .await?;
+    let attempt = SandboxActivationAttemptId::new();
+    insert_execution(&fixture.pool, sandbox_id, "0 seconds", attempt).await?;
     sqlx::query(sql!(
         "UPDATE sandboxes
             SET placement = 'on_node',
@@ -443,6 +438,20 @@ pub(super) async fn without_retirement_a_failed_restore_revert_moves_only_the_li
     .bind(node_id)
     .execute(&fixture.pool)
     .await?;
+    Ok((token, attempt))
+}
+
+/// With abandoned-restore retirement disabled (the default until every
+/// routing replica refuses to route to a `restoring` sandbox), a failed
+/// fresh restore claim's rollback moves only the lifecycle, even with a
+/// proven source: the execution the claim created stays active and the row
+/// stays placed with its placement clock, so its pod isn't deleted under a
+/// request an older replica may have routed to it.
+pub(super) async fn without_retirement_a_failed_restore_revert_moves_only_the_lifecycle(
+    fixture: &PostgresStore,
+) -> TestResult {
+    let sandbox_id = SandboxId::new();
+    let (token, _) = claimed_restore_on_node(fixture, sandbox_id, NodeId::new()).await?;
     let before = reverted_row(&fixture.pool, sandbox_id).await?;
     let clock = || async {
         sqlx::query_scalar::<_, Option<OffsetDateTime>>(sql!(
@@ -473,5 +482,101 @@ pub(super) async fn without_retirement_a_failed_restore_revert_moves_only_the_li
         }
     );
     assert_eq!(clock().await?, clock_before);
+    Ok(())
+}
+
+/// A rollback that loses the race to its activation converges: the restore
+/// pod's IP is recorded, the restore fails before any Wake, and the node then
+/// reports the activation complete. With retirement off the receipt takes the
+/// row back to `started`; with it on, the retired execution matches nothing.
+pub(super) async fn a_revert_leaving_its_execution_active_takes_the_activation_its_node_completed(
+    fixture: &PostgresStore,
+) -> TestResult {
+    use crate::controllers::substrate::AbandonedRestoreRetirement;
+    use pplx_space_sandbox_store::ingest::{ProjectedActivation, release_completed_activations};
+
+    let mut mismatches = Vec::new();
+    for retirement in [
+        AbandonedRestoreRetirement::Disabled,
+        AbandonedRestoreRetirement::Enabled,
+    ] {
+        let sandbox_id = SandboxId::new();
+        let node_id = NodeId::new();
+        let (token, attempt) = claimed_restore_on_node(fixture, sandbox_id, node_id).await?;
+        sqlx::query(sql!(
+            "UPDATE sandbox_k8s_executions SET route_activation_id = activation_attempt_id
+              WHERE sandbox_id = $1"
+        ))
+        .bind(sandbox_id)
+        .execute(&fixture.pool)
+        .await?;
+        // The API records the pod's IP before it would dial the node.
+        fixture
+            .store
+            .persist_pod_metadata(sandbox_id, 1, Some("uid-revert-g1"), Some("100.64.0.13"))
+            .await?;
+        let before = reverted_row(&fixture.pool, sandbox_id).await?;
+
+        let revert = fixture
+            .store
+            .revert_restore_claim_to_suspended(
+                sandbox_id,
+                Some(token),
+                Some((attempt, 1)),
+                retirement,
+            )
+            .await?;
+
+        let receipt = serde_json::json!([{
+            "sandbox_id": sandbox_id.to_string(),
+            "status": "started",
+            "transition_receipt_id": Uuid::now_v7().to_string(),
+            "transition_receipt_kind": "activation_completed",
+            "transition_receipt_target_state": "started",
+            "transition_receipt_execution_generation": 1,
+            "transition_receipt_activation_attempt_id": attempt.to_string(),
+        }]);
+        let projected =
+            release_completed_activations(&fixture.pool, node_id, sqlx::types::Json(receipt))
+                .await?;
+
+        let converged = reverted_row(&fixture.pool, sandbox_id).await?;
+
+        let (expected_revert, expected_projected, expected_row) = match retirement {
+            AbandonedRestoreRetirement::Disabled => (
+                RestoreClaimRevert::ExecutionLeftActive,
+                vec![ProjectedActivation {
+                    sandbox_id,
+                    from_suspended: true,
+                }],
+                RevertedRow {
+                    lifecycle: "started".to_string(),
+                    activation_attempt_id: None,
+                    ..before
+                },
+            ),
+            AbandonedRestoreRetirement::Enabled => (
+                RestoreClaimRevert::ExecutionRetired {
+                    pod_name: execution_pod_name(sandbox_id),
+                },
+                Vec::new(),
+                RevertedRow {
+                    lifecycle: "suspended".to_string(),
+                    placement: "unplaced".to_string(),
+                    active_node_id: None,
+                    execution_active: Some(false),
+                    execution_state: Some("replaced".to_string()),
+                    ..before
+                },
+            ),
+        };
+        if revert != expected_revert || projected != expected_projected || converged != expected_row
+        {
+            mismatches.push(format!(
+                "{retirement:?}: {revert:?}, {projected:?}, {converged:?}"
+            ));
+        }
+    }
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
     Ok(())
 }

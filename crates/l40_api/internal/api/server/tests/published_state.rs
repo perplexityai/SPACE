@@ -4294,6 +4294,11 @@ async fn activation_completion_receipt_converges_and_releases_only_its_attempt()
     Ok(())
 }
 
+/// An immediate pause can claim `suspending` after a wake's activation
+/// finishes but before its completion receipt is consumed. The receipt still
+/// releases its exact attempt but leaves the suspend claim's lifecycle alone.
+/// (A `suspended` row holding the receipt's execution is a lifecycle-only
+/// restore rollback instead; see `release_completed_activations`.)
 #[tokio::test(flavor = "current_thread")]
 async fn activation_completion_receipt_cannot_overwrite_a_newer_suspend_claim() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
@@ -4301,53 +4306,51 @@ async fn activation_completion_receipt_cannot_overwrite_a_newer_suspend_claim() 
     };
     let node_id = NodeId::new();
     insert_ready_worker_node(&db.pool, node_id).await?;
-    for suspend_lifecycle in ["suspending", "suspended"] {
-        let sandbox_id = SandboxId::new();
-        let activation_attempt_id = Uuid::now_v7();
-        insert_active_sandbox(&db.pool, sandbox_id, node_id, suspend_lifecycle).await?;
-        insert_k8s_execution(&db.pool, sandbox_id, 7, "running", Some("100.64.0.8")).await?;
-        sqlx::query(sql!(
-            "UPDATE sandbox_k8s_executions
-                SET activation_attempt_id = $2,
-                    route_activation_id = $2,
-                    activation_attempt_expires_at = NOW() + INTERVAL '5 minutes',
-                    activation_attempt_target_state = 'started'
-              WHERE sandbox_id = $1 AND generation = 7"
-        ))
-        .bind(sandbox_id)
-        .bind(activation_attempt_id)
-        .execute(&db.pool)
-        .await?;
+    let sandbox_id = SandboxId::new();
+    let activation_attempt_id = Uuid::now_v7();
+    insert_active_sandbox(&db.pool, sandbox_id, node_id, "suspending").await?;
+    insert_k8s_execution(&db.pool, sandbox_id, 7, "running", Some("100.64.0.8")).await?;
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions
+            SET activation_attempt_id = $2,
+                route_activation_id = $2,
+                activation_attempt_expires_at = NOW() + INTERVAL '5 minutes',
+                activation_attempt_target_state = 'started'
+          WHERE sandbox_id = $1 AND generation = 7"
+    ))
+    .bind(sandbox_id)
+    .bind(activation_attempt_id)
+    .execute(&db.pool)
+    .await?;
 
-        let receipt = activation_completed_state(
-            sandbox_id,
-            Uuid::now_v7(),
-            "started",
-            7,
-            activation_attempt_id,
-        );
-        let mut conn = db.pool.acquire().await?;
-        publish_sandbox_states(&mut conn, node_id, &[receipt]).await?;
-        drop(conn);
+    let receipt = activation_completed_state(
+        sandbox_id,
+        Uuid::now_v7(),
+        "started",
+        7,
+        activation_attempt_id,
+    );
+    let mut conn = db.pool.acquire().await?;
+    publish_sandbox_states(&mut conn, node_id, &[receipt]).await?;
+    drop(conn);
 
-        assert_eq!(
-            sandbox_lifecycle(&db.pool, sandbox_id).await?,
-            suspend_lifecycle,
-            "the node's stale activation completion must defer to suspend ownership"
-        );
-        let remaining_attempt = sqlx::query_scalar::<_, Option<Uuid>>(sql!(
-            "SELECT activation_attempt_id
-               FROM sandbox_k8s_executions
-              WHERE sandbox_id = $1 AND generation = 7"
-        ))
-        .bind(sandbox_id)
-        .fetch_one(&db.pool)
-        .await?;
-        assert_eq!(
-            remaining_attempt, None,
-            "the exact completed attempt should still be released instead of being republished forever"
-        );
-    }
+    assert_eq!(
+        sandbox_lifecycle(&db.pool, sandbox_id).await?,
+        "suspending",
+        "the node's stale activation completion must defer to suspend ownership"
+    );
+    let remaining_attempt = sqlx::query_scalar::<_, Option<Uuid>>(sql!(
+        "SELECT activation_attempt_id
+           FROM sandbox_k8s_executions
+          WHERE sandbox_id = $1 AND generation = 7"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        remaining_attempt, None,
+        "the exact completed attempt should still be released instead of being republished forever"
+    );
     Ok(())
 }
 

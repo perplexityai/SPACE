@@ -23,6 +23,7 @@ mod substrate_scope_tests;
 mod suspend_lifecycle_matrix_tests;
 use owned_restore_completion_tests::owned_restore_completion_requires_its_lease_and_a_routable_execution;
 use restore_revert_tests::{
+    a_revert_leaving_its_execution_active_takes_the_activation_its_node_completed,
     failed_restore_revert_retires_only_its_own_proven_execution,
     without_retirement_a_failed_restore_revert_moves_only_the_lifecycle,
 };
@@ -1457,6 +1458,7 @@ mod k8s_store_postgres_behaviors {
         restore_rollback_requires_fresh_claim_and_clean_failure,
         failed_restore_revert_retires_only_its_own_proven_execution,
         without_retirement_a_failed_restore_revert_moves_only_the_lifecycle,
+        a_revert_leaving_its_execution_active_takes_the_activation_its_node_completed,
         owned_restore_completion_requires_its_lease_and_a_routable_execution,
         started_recovery_followers_succeed_only_on_a_started_sandbox,
         prepare_wake_preserves_restore_source_boundary,

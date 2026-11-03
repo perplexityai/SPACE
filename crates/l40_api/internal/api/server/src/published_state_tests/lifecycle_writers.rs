@@ -75,12 +75,17 @@ async fn row(pool: &PgPool, sandbox_id: SandboxId) -> TestResult<Row> {
     .await?)
 }
 
-/// Publish `state` from `node_id` in one transaction and commit it.
-async fn publish(pool: &PgPool, node_id: NodeId, state: PublishedSandboxState) -> TestResult {
+/// Publish `state` from `node_id` in one transaction and commit it,
+/// returning the `suspended` rows an activation-completed receipt repaired.
+async fn publish(
+    pool: &PgPool,
+    node_id: NodeId,
+    state: PublishedSandboxState,
+) -> TestResult<Vec<SandboxId>> {
     let mut tx = pool.begin().await?;
-    publish_sandbox_states(&mut tx, node_id, &[state]).await?;
+    let outcome = publish_sandbox_states(&mut tx, node_id, &[state]).await?;
     tx.commit().await?;
-    Ok(())
+    Ok(outcome.post_commit_suspended_activation_repairs)
 }
 
 fn with_receipt(
@@ -346,18 +351,21 @@ async fn quarantined_report_moves_every_unquarantined_lifecycle_and_records_it(
 /// generation and attempt releases that attempt whatever the row's
 /// lifecycle, and moves the row to the receipt's `started` or `paused`
 /// target, placed `on_node` (the fixture starts it unplaced), out of every
-/// lifecycle but the suspend window (`suspending`, `suspended`),
-/// `quarantined`, `deleting` and the stored non-variants. A `created` target
-/// releases the attempt and keeps the row only when it is still `created`.
-/// Both guards compare the lifecycle trimmed and lower-cased: a padded
-/// `created` counts as `created` and a padded `suspended` as the suspend
-/// window, while an unknown value is projected like any other lifecycle.
+/// lifecycle but `suspending`, `quarantined`, `deleting` and the stored
+/// non-variants. That includes `suspended` (a lifecycle-only restore
+/// rollback; see `release_completed_activations`), unless the row is marked
+/// for evacuation, which is released but not moved. A suspend's own row,
+/// whose execution it moved out of `running` or retired, is neither. A `created`
+/// target releases the attempt and keeps the row only when it is still
+/// `created`. Both guards compare the lifecycle trimmed and lower-cased: a
+/// padded `created` counts as `created` and a padded `suspended` as
+/// `suspended`, while an unknown value is projected like any other lifecycle.
 #[rstest::rstest]
 #[case::started("started")]
 #[case::paused("paused")]
 #[case::created("created")]
 #[tokio::test(flavor = "current_thread")]
-async fn activation_completion_receipt_projects_its_target_outside_the_suspend_window(
+async fn activation_completion_receipt_projects_its_target_outside_a_suspend_claim(
     #[case] target: &str,
 ) -> TestResult {
     let db = pg_test_db().await?;
@@ -386,9 +394,10 @@ async fn activation_completion_receipt_projects_its_target_outside_the_suspend_w
             Some(attempt),
             "",
         );
-        publish(pool, node_id, report).await?;
+        let repairs = publish(pool, node_id, report).await?;
 
         let mut expected = before.clone();
+        let mut expected_repairs = Vec::new();
         if target == "created" {
             if matches!(stored, "created" | " Created ") {
                 // The release writes the receipt's target, so a padded
@@ -400,25 +409,100 @@ async fn activation_completion_receipt_projects_its_target_outside_the_suspend_w
             expected.activation_attempt_id = None;
             let projects = !matches!(
                 stored,
-                "suspending"
-                    | "suspended"
-                    | "quarantined"
-                    | "deleting"
-                    | "deleted"
-                    | "cleanup_required"
-                    | " Suspended "
+                "suspending" | "quarantined" | "deleting" | "deleted" | "cleanup_required"
             );
             if projects {
                 expected.lifecycle = target.to_owned();
                 expected.placement = "on_node".to_owned();
             }
+            if matches!(stored, "suspended" | " Suspended ") {
+                expected_repairs.push(sandbox_id);
+            }
         }
         let actual = row(pool, sandbox_id).await?;
-        if actual != expected {
-            mismatches.push(format!("target {target}, stored {stored}: {actual:?}"));
+        if actual != expected || repairs != expected_repairs {
+            mismatches.push(format!(
+                "target {target}, stored {stored}: {actual:?}, repairs {repairs:?}"
+            ));
         }
     }
     assert!(mismatches.is_empty(), "{mismatches:#?}");
+
+    // A `suspended` row marked for evacuation is released but stays put.
+    if target != "created" {
+        let (sandbox_id, _) = insert_running(pool, node_id, "suspended").await?;
+        sqlx::query(sql!(
+            "UPDATE sandboxes
+                SET placement = 'unplaced', evacuation_restore_target = 'started'
+              WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .execute(pool)
+        .await?;
+        let attempt = Uuid::now_v7();
+        set_activation_attempt(pool, sandbox_id, attempt, target).await?;
+        let before = row(pool, sandbox_id).await?;
+        let report = with_receipt(
+            published_sandbox_state(sandbox_id, target),
+            "activation_completed",
+            target,
+            7,
+            Some(attempt),
+            "",
+        );
+        let repairs = publish(pool, node_id, report).await?;
+        assert_eq!(
+            row(pool, sandbox_id).await?,
+            Row {
+                activation_attempt_id: None,
+                ..before
+            },
+            "evacuation-marked suspended row, target {target}"
+        );
+        assert!(
+            repairs.is_empty(),
+            "evacuation-marked row reported: {repairs:?}"
+        );
+    }
+
+    // A `suspended` row whose execution a suspend took: still active but
+    // reading `suspended`, or retired (here still reading `running`, so only
+    // the `active` fence refuses it). The receipt matches nothing there.
+    if target == "started" {
+        for (execution_state, execution_active) in [("suspended", true), ("running", false)] {
+            let (sandbox_id, _) = insert_running(pool, node_id, "suspended").await?;
+            let attempt = Uuid::now_v7();
+            set_activation_attempt(pool, sandbox_id, attempt, "started").await?;
+            sqlx::query(sql!(
+                "UPDATE sandbox_k8s_executions SET state = $2, active = $3
+                  WHERE sandbox_id = $1"
+            ))
+            .bind(sandbox_id)
+            .bind(execution_state)
+            .bind(execution_active)
+            .execute(pool)
+            .await?;
+            let before = row(pool, sandbox_id).await?;
+            let report = with_receipt(
+                published_sandbox_state(sandbox_id, "started"),
+                "activation_completed",
+                "started",
+                7,
+                Some(attempt),
+                "",
+            );
+            let repairs = publish(pool, node_id, report).await?;
+            assert_eq!(
+                row(pool, sandbox_id).await?,
+                before,
+                "suspend-owned row, execution {execution_state}, active: {execution_active}"
+            );
+            assert!(
+                repairs.is_empty(),
+                "suspend-owned row reported: {repairs:?}"
+            );
+        }
+    }
 
     // A receipt for another attempt or generation, or from another node,
     // neither releases the attempt nor moves the row.

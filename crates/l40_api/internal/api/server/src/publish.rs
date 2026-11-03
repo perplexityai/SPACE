@@ -221,6 +221,14 @@ impl ClusterApiService {
         for event in sandbox_publication.post_commit_events {
             event.emit(origin.id);
         }
+        for sandbox_id in &sandbox_publication.post_commit_suspended_activation_repairs {
+            tracing::warn!(
+                node_id = %origin.id,
+                %sandbox_id,
+                "moved a sandbox that read suspended to the activation its node completed; a \
+                 restore revert had left its execution active"
+            );
+        }
         for deleted in &delete_consumption.deleted_sandboxes {
             SandboxEvent::new(
                 deleted.sandbox_id,

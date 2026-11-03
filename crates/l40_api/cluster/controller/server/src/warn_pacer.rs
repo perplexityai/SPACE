@@ -8,8 +8,9 @@
 //!
 //! Several conditions need exactly this, across two reconcilers and on largely
 //! the same nodes: node-drain's hold on a node the terminator would refuse, its
-//! three KubeNodeGone verdicts, and the terminator's refusal of a node it was
-//! handed anyway. The terminator's was written first and inline; this is that
+//! three KubeNodeGone verdicts, the terminator's refusal of a node it was
+//! handed anyway, and its hold on a node its snapshot guard blocks.
+//! The terminator's refusal was written first and inline; this is that
 //! mechanism, extracted so the others did not each grow their own.
 //!
 //! # One window per (node, reason), not per node

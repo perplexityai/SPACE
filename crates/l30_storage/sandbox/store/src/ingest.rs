@@ -566,9 +566,21 @@ pub async fn converge_published_stopped(
     .await
 }
 
+/// A sandbox whose lifecycle [`release_completed_activations`] projected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]
+pub struct ProjectedActivation {
+    pub sandbox_id: SandboxId,
+    /// The row read `suspended` as of the statement's snapshot, so a lifecycle
+    /// write that commits after the snapshot, including while the update
+    /// waits for the row lock, can mislabel it either way: a revert to
+    /// `suspended` is projected but not flagged, and a new restore claim out
+    /// of `suspended` is flagged.
+    pub from_suspended: bool,
+}
+
 /// Release the exact activation attempts that published activation-completed
 /// receipts, and project each receipt's target lifecycle onto its sandbox,
-/// returning the ids projected. **Operation step**: ends the in-flight
+/// returning the rows projected. **Operation step**: ends the in-flight
 /// activation the receipt names.
 ///
 /// `rows` is a recordset of [`TRANSITION_RECEIPT_RECORD_COLUMNS`]. The
@@ -579,15 +591,37 @@ pub async fn converge_published_stopped(
 /// running execution with a pod IP (for `started` and `paused`). It checks
 /// `active_node_id` only through an unlocked join, as of the statement's
 /// snapshot, and the `sandboxes` update does not re-check it, so a change to
-/// `active_node_id` committed after that snapshot is not seen. The lifecycle
-/// projection re-checks only that the row is outside the suspend, hold and
-/// delete lifecycles: if a newer suspend owns the row, the attempt is still
-/// released but its stale target is not projected.
+/// `active_node_id` committed after that snapshot is not seen.
+///
+/// The lifecycle projection re-checks only that the row is outside the
+/// suspend, hold and delete lifecycles: if a newer suspend owns the row, the
+/// attempt is still released but its stale target is not projected.
+///
+/// A `suspended` row not marked for evacuation is the one exception (the
+/// release lets it through only for a `started` or `paused` target). A
+/// suspend that owns the row moves the execution out of `running` and
+/// retires it as it writes `suspended`, as the API's suspend finish and the
+/// node's suspended projection both do. So a `suspended` row that still
+/// holds the receipt's exact active, running execution got there through a
+/// write that moved only the lifecycle: the API's restore rollback that left
+/// the execution active (abandoned-restore retirement off, an unproven
+/// source, or an execution that can't be shown to be the claim's) while
+/// the shim restored the VM from the restore pod anyway. (The
+/// transient-lifecycle sweeper's lifecycle-only revert usually puts
+/// `restoring` back when its cleanup finds the pod up; the paths where its
+/// cleanup leaves the row `suspended` instead are covered the same way. On
+/// one of them the cleanup already stopped the VM, so a publication the node
+/// built before that stop can still project `started`, until the node's
+/// next report moves the row on to `stopped`.) The node now reports that VM
+/// in the receipt's target, so the row takes it. Left `suspended`, the row
+/// would keep a running VM that nothing routes to (the suspended-execution
+/// reaper skips a present pod). An evacuation-marked row stays with the
+/// node-drain redrive.
 pub async fn release_completed_activations(
     executor: impl sqlx::PgExecutor<'_>,
     node_id: NodeId,
     rows: Json<JsonValue>,
-) -> Result<Vec<SandboxId>, sqlx::Error> {
+) -> Result<Vec<ProjectedActivation>, sqlx::Error> {
     let query = format!(
         "WITH input AS (
              SELECT *
@@ -620,7 +654,9 @@ pub async fn release_completed_activations(
                         AND execution.pod_ip IS NOT NULL
                     )
                 )
-              RETURNING execution.sandbox_id, input.transition_receipt_target_state
+              RETURNING execution.sandbox_id,
+                        input.transition_receipt_target_state,
+                        LOWER(TRIM(sandbox.lifecycle)) = 'suspended' AS from_suspended
          )
          UPDATE sandboxes sandbox
             SET lifecycle = released.transition_receipt_target_state,
@@ -632,11 +668,15 @@ pub async fn release_completed_activations(
            FROM released
           WHERE sandbox.id = released.sandbox_id
             AND LOWER(TRIM(sandbox.lifecycle)) NOT IN (
-                'suspending', 'suspended', 'quarantined', 'deleting', 'deleted', 'cleanup_required'
+                'suspending', 'quarantined', 'deleting', 'deleted', 'cleanup_required'
             )
-         RETURNING sandbox.id"
+            AND (
+                LOWER(TRIM(sandbox.lifecycle)) <> 'suspended'
+                OR sandbox.evacuation_restore_target IS NULL
+            )
+         RETURNING sandbox.id AS sandbox_id, released.from_suspended"
     );
-    sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(query.as_str())))
+    sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
         .bind(node_id)
         .bind(rows)
         .bind(SandboxTransitionReceiptKind::ActivationCompleted.as_str())

@@ -18,7 +18,7 @@ use pplx_space_sandbox_portability::{
     quarantine_recovery_suspend_snapshot_current, restore_retry_suspended_revert_snapshot_exists,
     started_suspend_revert_eligibility, suspended_projection_lifecycle_eligible_with_node_evidence,
 };
-use pplx_space_sandbox_store::ingest::TRANSITION_RECEIPT_RECORD_COLUMNS;
+use pplx_space_sandbox_store::ingest::{ProjectedActivation, TRANSITION_RECEIPT_RECORD_COLUMNS};
 use sqlx::types::Json;
 use sqlx::{FromRow, PgPool};
 use time::OffsetDateTime;
@@ -315,14 +315,17 @@ pub(super) async fn get_quarantine_recovery_plan(
 /// execution attempt that produced the receipt. This is the durable counterpart
 /// to the API handler's best-effort fast-path release. If a newer suspend owns
 /// the lifecycle, the exact activation attempt is still released, but its stale
-/// target lifecycle is not projected onto the sandbox.
+/// target lifecycle is not projected onto the sandbox. A `suspended` row that
+/// still holds the receipt's execution and isn't marked for evacuation is
+/// projected: a restore rollback moved only its lifecycle while the VM came up (see
+/// `pplx_space_sandbox_store::ingest::release_completed_activations`).
 /// Route-less legacy residents retain ownership until post-ack route publication:
 /// clearing it earlier would make that publication CAS permanently lose its fence.
 pub(super) async fn consume_activation_completion_receipts(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
     rows_json: Json<serde_json::Value>,
-) -> Result<Vec<SandboxId>, Status> {
+) -> Result<Vec<ProjectedActivation>, Status> {
     pplx_space_sandbox_store::ingest::release_completed_activations(conn, node_id, rows_json)
         .await
         .map_err(|error| {

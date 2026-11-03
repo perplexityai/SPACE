@@ -1314,6 +1314,15 @@ pub struct SandboxPublicationOutcome {
     /// Emit only after the node-publication transaction commits successfully.
     pub post_commit_events: Vec<PostCommitSandboxEvent>,
     pub post_commit_state_convergence: Vec<StateConvergenceSample>,
+    /// Sandboxes that read `suspended` and that this publication moved to the
+    /// target of an activation-completed receipt: a restore revert had left
+    /// their execution active. Read as of the statement's snapshot (see
+    /// `ProjectedActivation::from_suspended`), so a restore claim that commits
+    /// after that snapshot is still listed although the publication moved it
+    /// from `restoring`, and a revert that commits after it is moved but not
+    /// listed.
+    /// Logged only after commit.
+    pub post_commit_suspended_activation_repairs: Vec<SandboxId>,
     /// Sandboxes this publication could take only as lifecycle state, from
     /// either shape: the node set `state_degraded`, or an optional field
     /// failed to parse and the richer observation was dropped to keep the
@@ -1501,6 +1510,7 @@ pub async fn publish_sandbox_states_with_retirement(
     let mut quarantine_inputs = Vec::new();
     let mut post_commit_events = Vec::new();
     let mut post_commit_state_convergence = Vec::new();
+    let mut post_commit_suspended_activation_repairs = Vec::new();
     let mut publishes_network_policy = false;
 
     for (sandbox_id, state) in states_by_id {
@@ -2089,6 +2099,7 @@ pub async fn publish_sandbox_states_with_retirement(
             accepted,
             post_commit_events,
             post_commit_state_convergence,
+            post_commit_suspended_activation_repairs,
             state_only_sandbox_ids: state_only.keys().copied().collect(),
         });
     }
@@ -2193,7 +2204,9 @@ pub async fn publish_sandbox_states_with_retirement(
         "started",
     );
 
-    post_commit_events.extend(apply_activation_receipts(conn, node_id, &rows, retirement).await?);
+    let receipts = apply_activation_receipts(conn, node_id, &rows, retirement).await?;
+    post_commit_events.extend(receipts.events);
+    post_commit_suspended_activation_repairs = receipts.suspended_repairs;
 
     let suspended_projection =
         project_node_published_suspended_sandboxes(conn, node_id, &rows).await?;
@@ -2580,6 +2593,7 @@ pub async fn publish_sandbox_states_with_retirement(
         accepted,
         post_commit_events,
         post_commit_state_convergence,
+        post_commit_suspended_activation_repairs,
         state_only_sandbox_ids: state_only.into_keys().collect(),
     })
 }
@@ -3399,14 +3413,22 @@ async fn write_observed_states(
     Ok(accepted_rows)
 }
 
+/// What [`apply_activation_receipts`] leaves for its caller to report after
+/// the publication commits.
+struct ActivationReceiptOutcome {
+    events: Vec<PostCommitSandboxEvent>,
+    /// `suspended` rows a completion receipt projected.
+    suspended_repairs: Vec<SandboxId>,
+}
+
 /// Consume matching activation receipts within the publication transaction.
-/// Return only the events that become publishable after its caller commits.
+/// Return only what becomes reportable after its caller commits.
 async fn apply_activation_receipts(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
     rows: &[PublishedSandboxRow],
     retirement: pplx_space_common_core::types::AbandonedRestoreRetirement,
-) -> Result<Vec<PostCommitSandboxEvent>, Status> {
+) -> Result<ActivationReceiptOutcome, Status> {
     // These statements require an exact receipt kind. Empty receipt batches
     // cannot release or lock an execution, so ordinary reports need neither query.
     let activation_completions = rows
@@ -3416,18 +3438,24 @@ async fn apply_activation_receipts(
                 == Some(SandboxTransitionReceiptKind::ActivationCompleted.as_str())
         })
         .collect::<Vec<_>>();
+    let mut suspended_repairs = Vec::new();
     if !activation_completions.is_empty() {
         let receipt_rows = Json(
             serde_json::to_value(activation_completions).map_err(|error| {
                 Status::internal(format!("serialize activation completion receipts: {error}"))
             })?,
         );
-        crate::sandbox_quarantine_store::consume_activation_completion_receipts(
-            conn,
-            node_id,
-            receipt_rows,
-        )
-        .await?;
+        suspended_repairs =
+            crate::sandbox_quarantine_store::consume_activation_completion_receipts(
+                conn,
+                node_id,
+                receipt_rows,
+            )
+            .await?
+            .into_iter()
+            .filter(|activation| activation.from_suspended)
+            .map(|activation| activation.sandbox_id)
+            .collect();
     }
 
     let activation_rollbacks = rows
@@ -3457,7 +3485,7 @@ async fn apply_activation_receipts(
         retirement,
     )
     .await?;
-    Ok(applied_rollbacks
+    let events = applied_rollbacks
         .into_iter()
         .map(|rollback| PostCommitSandboxEvent {
             sandbox_id: rollback.sandbox_id,
@@ -3467,7 +3495,11 @@ async fn apply_activation_receipts(
             reason_code: rollback.reason_code,
             error: rollback.failure_message,
         })
-        .collect())
+        .collect();
+    Ok(ActivationReceiptOutcome {
+        events,
+        suspended_repairs,
+    })
 }
 
 /// Recover node-owned pause failures from definitive healthy observations.

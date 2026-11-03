@@ -72,13 +72,13 @@ pub const DRAIN_KEEP_ANNOTATION: &str = "space.pplx.net/drain-keep";
 
 pub(crate) const DEFAULT_TICK: Duration = Duration::from_secs(60);
 
-/// Minimum spacing between successive WARN-level "delete refused" logs for
-/// the same parked node. The refusal re-fires every tick (default 60 s) for
-/// as long as the node stays parked, and a single permanently-parked node
-/// has dominated an environment's warn volume before; between warns the
-/// per-tick record is kept at info level, and the
-/// `node_drain.kube_node_gone_delete_refused` counter is emitted every tick
-/// regardless, so dashboards never lose resolution.
+/// Minimum spacing between successive WARN-level "delete refused" logs, and
+/// between "holding drained node" logs, for the same parked node. Both
+/// re-fire every tick (default 60 s) for as long as the node stays parked,
+/// and a single permanently-parked node has dominated an environment's warn
+/// volume before. Between warns the per-tick record is kept at info level,
+/// and the refusal's `node_drain.kube_node_gone_delete_refused` counter is
+/// emitted every tick regardless, so dashboards never lose resolution.
 pub(crate) const REFUSAL_WARN_INTERVAL: Duration = Duration::from_secs(3600);
 
 #[derive(Debug, Clone)]
@@ -408,10 +408,13 @@ pub struct Reconciler<S: DrainedNodeTerminatorSink, A: DrainKeepAnnotationLookup
     /// Gate for the KubeNodeGone mark-lost give-up. See
     /// [`ReconcilerConfig::mark_lost_enabled`].
     mark_lost_enabled: bool,
-    /// Paces the per-node "delete refused" WARN at [`REFUSAL_WARN_INTERVAL`].
+    /// Paces the per-node "delete refused" and "holding drained node" WARNs at
+    /// [`REFUSAL_WARN_INTERVAL`], each under its own reason. A snapshot hold
+    /// re-fires every tick too, for as long as the snapshot guard blocks the
+    /// node, which may be until an operator acts.
     /// Pruned every tick down to the nodes still listed as `drained`, so a
     /// converged or undrained node can't leak its slot.
-    refusal_warn_pacer: PerNodeWarnPacer,
+    warn_pacer: PerNodeWarnPacer,
 }
 
 impl<S: DrainedNodeTerminatorSink, A: DrainKeepAnnotationLookup> Reconciler<S, A> {
@@ -434,7 +437,7 @@ impl<S: DrainedNodeTerminatorSink, A: DrainKeepAnnotationLookup> Reconciler<S, A
             annotation_lookup: Arc::new(annotation_lookup),
             instance_lookup,
             mark_lost_enabled,
-            refusal_warn_pacer: PerNodeWarnPacer::new(REFUSAL_WARN_INTERVAL),
+            warn_pacer: PerNodeWarnPacer::new(REFUSAL_WARN_INTERVAL),
         }
     }
 
@@ -451,7 +454,7 @@ impl<S: DrainedNodeTerminatorSink, A: DrainKeepAnnotationLookup> Reconciler<S, A
         // Prune warn-rate-limit slots for nodes that left the drained set
         // (converged, undrained, or reaped) so the map stays bounded by the
         // live drained-node cardinality.
-        self.refusal_warn_pacer.retain_live(&nodes);
+        self.warn_pacer.retain_live(&nodes);
 
         for node_id in nodes {
             match self.annotation_lookup.lookup_drain_keep(node_id).await {
@@ -534,13 +537,24 @@ impl<S: DrainedNodeTerminatorSink, A: DrainKeepAnnotationLookup> Reconciler<S, A
         match self.sink.count_local_snapshots(node_id).await {
             Ok(0) => {}
             Ok(n) => {
-                tracing::warn!(
-                    node_id = %node_id,
-                    local_snapshots = n,
-                    "drained_node_terminator: holding drained node — \
-                     still has suspended sandboxes pinned to local disk; \
-                     terminating would strand their snapshots"
-                );
+                if self.warn_pacer.due(node_id, "snapshot_hold") {
+                    tracing::warn!(
+                        node_id = %node_id,
+                        local_snapshots = n,
+                        "drained_node_terminator: holding drained node — \
+                         still has suspended sandboxes pinned to local disk; \
+                         terminating would strand their snapshots (further holds \
+                         for this node log at info for the next hour)"
+                    );
+                } else {
+                    tracing::info!(
+                        node_id = %node_id,
+                        local_snapshots = n,
+                        "drained_node_terminator: holding drained node — \
+                         still has suspended sandboxes pinned to local disk \
+                         (warn rate-limited)"
+                    );
+                }
                 report.snapshot_holds += 1;
                 return;
             }
@@ -822,7 +836,7 @@ impl<S: DrainedNodeTerminatorSink, A: DrainKeepAnnotationLookup> Reconciler<S, A
     /// records the firing. The window walk itself is
     /// [`PerNodeWarnPacer`]'s and tested there.
     fn refusal_warn_due(&self, node_id: NodeId) -> bool {
-        self.refusal_warn_pacer.due(node_id, "delete_refused")
+        self.warn_pacer.due(node_id, "delete_refused")
     }
 }
 
