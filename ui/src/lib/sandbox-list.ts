@@ -5,11 +5,13 @@ import type { Sandbox } from './types';
 // and applies the filters below. A server from before paging ignores
 // `cursor` and every filter except `org_id` and answers a bare array of the
 // newest `limit` rows; the console then samples, as it did before paging.
-// The first answer of a page view decides which (`ListSelection.load`). A
-// later page answering a sampled view means the API now pages, and the list
-// switches to paging; a bare array answering a paged view means the API went
-// back to a version without paging, and the list stops until the page is
-// reloaded.
+// The first answer of a page view decides which (`ListSelection.load`).
+// During a rolling deploy, or its rollback, replicas of both versions answer
+// in turn. A list never joins rows of two shapes and keeps the rows on screen
+// through a mismatch: a bare array answering a paged request is a failed
+// refresh, and a sampled view switches to paging only once a page 1 read
+// with every filter answers. Only after `STOP_AFTER_MISMATCHES` such bare
+// arrays in a row does the list stop until the page is reloaded.
 export type ListMode = 'paged' | 'sampled';
 
 export type SandboxListResponse =
@@ -280,34 +282,55 @@ export function nextCursorFor(continuation: Continuation | null, selected: ListS
   return continuation && continuation.scopeKey === selected.key ? continuation.cursor : null;
 }
 
+// A bare array answering a paged request: an older API version answered,
+// as during a rolling deploy or its rollback. The load counts as failed.
+export class OlderFormatAnswer extends Error {
+  constructor() {
+    super('the API answered in an older format; retrying');
+  }
+}
+
+// Bare arrays answering paged requests in a row, with no other answer in
+// between, that show the API went back to a version without paging.
+export const STOP_AFTER_MISMATCHES = 3;
+
 // The outcome of `ListSelection.load`.
 // - `shown`: the answer is the selected scope's, in the shape asked for.
 // - `skipped`: the selection changed while it was in flight, or a newer load
 //   started; nothing is shown and `loading` is left to that load.
-// - `stopped`: the API answered a paged list with a bare array, as during a
-//   rolling deploy or its rollback, now or in an earlier load; nothing more
-//   is read until the page is reloaded. `kept` says whether the rows on
-//   screen are the selected scope's; when they are not they must be cleared.
-// - `failed`: the request failed. `kept` says whether the rows on screen are
-//   the failed scope's; when they are not they must be cleared rather than
-//   shown under its label.
+// - `stopped`: `STOP_AFTER_MISMATCHES` bare arrays in a row answered paged
+//   requests, in this load or earlier; nothing more is read until the page
+//   is reloaded. `kept` says whether the rows on screen are the selected
+//   scope's; when they are not they must be cleared.
+// - `failed`: the request failed, or a bare array answered a paged request
+//   (`OlderFormatAnswer`). `scope` is the selected scope, which a sampled
+//   view keeps when its switch to paging failed. `kept` says whether the
+//   rows on screen are that scope's; when they are not they must be cleared
+//   rather than shown under its label.
 export type ListLoad =
   | { kind: 'shown'; scope: ListScope; response: SandboxListResponse }
   | { kind: 'skipped' }
   | { kind: 'stopped'; kept: boolean }
   | { kind: 'failed'; scope: ListScope; error: unknown; kept: boolean };
 
+// What an answer in `answered` shape to a request in `asked` shape does to
+// the list (`ListSelection.noteAnswer`).
+export type AnswerNote = { kind: 'counted' } | { kind: 'mismatched' } | { kind: 'stopped'; kept: boolean };
+
 // The sandbox list's selection and its loads. The list shape, the filters,
 // the page and sample sizes and the page position make up the selected
 // scope; `shown` is the scope of the rows on screen, and the continuation
 // is the cursor of the page after it. The list shape is the first answer's,
-// until a page answers a sampled list; `stopped` is set once a bare array
-// answers a paged list after the first answer.
+// until a page 1 read with every filter answers a sampled view.
+// `mismatches` counts the bare arrays in a row that answered paged requests,
+// the list's and the prefix search's; `stopped` is set when it reaches
+// `STOP_AFTER_MISMATCHES`.
 export class ListSelection {
   mode: ListMode = 'paged';
   position: PagePosition = FIRST_PAGE;
   shown: ListScope | null = null;
   stopped = false;
+  mismatches = 0;
   private decided = false;
   private filters: SandboxListFilters;
   private pageSize: number;
@@ -362,55 +385,103 @@ export class ListSelection {
     return nextPage(this.position, this.nextCursor());
   }
 
+  // Counts an answer, of the list or of a request made alongside it (the
+  // prefix search), once the first answer decided the shape. A bare array
+  // answering a paged request is a mismatch, and the list stops at
+  // `STOP_AFTER_MISMATCHES` of them in a row. Any other answer resets the
+  // count: a page shows that a version that pages answered, and a bare
+  // array is what a sampled request asks for.
+  noteAnswer(asked: ListMode, answered: ListMode): AnswerNote {
+    if (this.stopped) return this.stop();
+    if (asked === 'sampled' || answered === 'paged') {
+      this.mismatches = 0;
+      return { kind: 'counted' };
+    }
+    this.mismatches += 1;
+    if (this.mismatches < STOP_AFTER_MISMATCHES) return { kind: 'mismatched' };
+    this.stopped = true;
+    return this.stop();
+  }
+
   // Load `scope` with `read`. A load whose scope is no longer selected when
   // it starts or answers is skipped. The first answer decides the list shape:
   // a page keeps paging, and a bare array, the answer of a server without
-  // paging, switches to sampling and reads the sample. A page answering a
-  // sampled list later switches it to paging and reads the first page with
-  // every filter, since the sample request sent only the org. A bare array
-  // answering a paged list later stops the list (see `ListLoad`), and so
-  // does every load after it, so no page joins rows of both shapes.
+  // paging, switches to sampling and reads the sample. Later:
+  // - A bare array answering a paged list fails the load (`noteAnswer`); the
+  //   rows and the Next of the page on screen are kept.
+  // - A page answering a sampled list reads the first page with every filter,
+  //   since the sample request sent only the org. Only when that page answers
+  //   does the list switch to paging, and the page replaces the sample; until
+  //   then the sample stays, and the load fails.
   async load(scope: ListScope, read: (scope: ListScope) => Promise<SandboxListResponse>): Promise<ListLoad> {
     if (this.stopped) return this.stop();
     if (!sameScope(this.selected, scope)) return { kind: 'skipped' };
-    let ticket = this.requests.begin(scope);
-    for (;;) {
-      let response: SandboxListResponse;
-      try {
-        response = await read(ticket.scope);
-      } catch (error) {
-        if (!this.requests.applies(ticket, this.selected)) return { kind: 'skipped' };
-        const kept = sameScope(this.shown, ticket.scope);
-        if (!kept) {
-          // The rows on screen are another scope's; they go, and their Next with them.
-          this.shown = null;
-          this.continuation = null;
-        }
-        return { kind: 'failed', scope: ticket.scope, error, kept };
-      }
-      if (!this.requests.applies(ticket, this.selected)) return { kind: 'skipped' };
-      const decided = this.decided;
+    const ticket = this.requests.begin(scope);
+    const answer = await this.read(ticket, scope, read);
+    if (answer.kind !== 'answered') return answer;
+    const { response } = answer;
+    if (!this.decided) {
       this.decided = true;
-      if (response.mode === ticket.scope.mode) {
-        this.shown = ticket.scope;
-        this.continuation = continuationFor(ticket.scope, response.mode === 'paged' ? response.nextCursor : null);
-        return { kind: 'shown', scope: ticket.scope, response };
+      if (response.mode !== scope.mode) {
+        // The first answer is a bare array, whose rows are the newest at the
+        // page size, not the sample.
+        this.mode = response.mode;
+        this.position = FIRST_PAGE;
+        return this.load(this.selected, read);
       }
-      if (decided && response.mode === 'sampled') {
-        this.stopped = true;
-        return this.stop();
-      }
-      // The first answer is a bare array, whose rows are the newest at the
-      // page size, not the sample; or a page answers a sampled list, whose
-      // request sent no filter but the org. Either way the selected scope's
-      // first page in the answer's shape is read.
-      this.mode = response.mode;
-      this.position = FIRST_PAGE;
-      ticket = this.requests.begin(this.selected);
     }
+    const note = this.noteAnswer(scope.mode, response.mode);
+    if (note.kind === 'stopped') return note;
+    if (note.kind === 'mismatched') return this.fail(scope, new OlderFormatAnswer());
+    if (response.mode === scope.mode) return this.show(scope, response);
+    // A page answering a sampled list. The sample's ticket keeps the read
+    // valid only while the sample is still selected.
+    const firstPage = listScope('paged', this.filters, { limit: this.pageSize, cursor: '' });
+    const reread = await this.read(ticket, firstPage, read);
+    if (reread.kind !== 'answered') return reread;
+    const upgrade = this.noteAnswer('paged', reread.response.mode);
+    if (upgrade.kind === 'stopped') return upgrade;
+    if (upgrade.kind === 'mismatched') return this.fail(scope, new OlderFormatAnswer());
+    this.mode = 'paged';
+    this.position = FIRST_PAGE;
+    return this.show(firstPage, reread.response);
   }
 
-  private stop(): ListLoad {
+  // One read for `ticket`: its answer, or a failed or skipped load. A failure
+  // is the failure of the ticket's scope, the one selected.
+  private async read(
+    ticket: { id: number; scope: ListScope },
+    scope: ListScope,
+    read: (scope: ListScope) => Promise<SandboxListResponse>,
+  ): Promise<{ kind: 'answered'; response: SandboxListResponse } | ListLoad> {
+    let response: SandboxListResponse;
+    try {
+      response = await read(scope);
+    } catch (error) {
+      if (!this.requests.applies(ticket, this.selected)) return { kind: 'skipped' };
+      return this.fail(ticket.scope, error);
+    }
+    if (!this.requests.applies(ticket, this.selected)) return { kind: 'skipped' };
+    return { kind: 'answered', response };
+  }
+
+  private show(scope: ListScope, response: SandboxListResponse): ListLoad {
+    this.shown = scope;
+    this.continuation = continuationFor(scope, response.mode === 'paged' ? response.nextCursor : null);
+    return { kind: 'shown', scope, response };
+  }
+
+  private fail(scope: ListScope, error: unknown): ListLoad {
+    const kept = sameScope(this.shown, scope);
+    if (!kept) {
+      // The rows on screen are another scope's; they go, and their Next with them.
+      this.shown = null;
+      this.continuation = null;
+    }
+    return { kind: 'failed', scope, error, kept };
+  }
+
+  private stop(): { kind: 'stopped'; kept: boolean } {
     this.continuation = null;
     const kept = sameScope(this.shown, this.selected);
     if (!kept) this.shown = null;

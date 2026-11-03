@@ -42,6 +42,7 @@ import {
   CREATED_AGES,
   FIRST_PAGE,
   ListSelection,
+  OlderFormatAnswer,
   PAGE_SIZE_OPTIONS,
   createdAgeMs,
   fragmentSearchScope,
@@ -130,7 +131,8 @@ function sandboxesRefreshKey(scope: ListScope): string {
 class RefreshSkipped extends Error {}
 const SCOPE_CHANGED = 'the selected page, filters or size changed';
 const VERSION_CHANGED = 'the API changed version while this page was open';
-// A load error, or a stopped list, the page already shows above the table.
+// A load error, a stopped list or an older-format answer, which the page
+// already shows above the table.
 class ShownListError extends Error {}
 const alreadyReported = (err: unknown) => err instanceof RefreshSkipped || err instanceof ShownListError;
 const REFRESH_CLICK_COOLDOWN_MS = 3000;
@@ -771,9 +773,14 @@ function SandboxesPage() {
   // The error of the last load; a load of another scope that failed clears
   // the rows rather than show them under the new label.
   const [listError, setListError] = useState<string | null>(null);
-  // An answer came in the other list shape from the first; the list reads
-  // nothing more until the page is reloaded.
+  // Bare arrays answered paged requests, the list's or the prefix search's,
+  // several times in a row (`STOP_AFTER_MISMATCHES`): the API went back to a
+  // version without paging, and the list reads nothing more until the page
+  // is reloaded. Fewer than that are failed refreshes (`olderFormat`).
   const [listStopped, setListStopped] = useState(false);
+  // The last answers included a bare array to a paged request, as during a
+  // rolling deploy; the rows on screen are kept while the list retries.
+  const [olderFormat, setOlderFormat] = useState(false);
   // A full identifier that matches no loaded row is looked up directly, so a
   // sandbox outside the loaded rows can still be found.
   const [lookup, setLookup] = useState<
@@ -839,6 +846,15 @@ function SandboxesPage() {
     setNextCursor(selection.nextCursor());
   };
 
+  // The list stopped (`ListSelection.noteAnswer`), on a load or on the prefix
+  // search's answer.
+  const stopList = (kept: boolean) => {
+    setListStopped(true);
+    selectionChanged();
+    // Rows of another org, page or filter are not shown under this one's label.
+    if (!kept) setSandboxes([]);
+  };
+
   const refresh = async ({
     showLoading = true,
     scope = selection.selected,
@@ -854,10 +870,9 @@ function SandboxesPage() {
     if (result.kind === 'skipped') throw new RefreshSkipped(SCOPE_CHANGED);
     setLoading(false);
     selectionChanged();
+    setOlderFormat(selection.mismatches > 0);
     if (result.kind === 'stopped') {
-      setListStopped(true);
-      // Rows of another org, page or filter are not shown under this one's label.
-      if (!result.kept) setSandboxes([]);
+      stopList(result.kept);
       throw new ShownListError(VERSION_CHANGED);
     }
     // The shape and the page position on screen change with the rows.
@@ -875,6 +890,8 @@ function SandboxesPage() {
         // toast, reports it.
         throw new ShownListError(text);
       }
+      // The notice above the table reports an older format.
+      if (result.error instanceof OlderFormatAnswer) throw new ShownListError(text);
       // Keep the last rendered view when a node-local manager is briefly unavailable.
       throw new Error(text);
     }
@@ -1323,7 +1340,12 @@ function SandboxesPage() {
       getConsoleSandboxList(listRequestQuery(scope, Date.now()), ticket.signal)
         .then((response) => {
           if (!prefixRequests.applies(ticket, fragmentTargetRef.current)) return;
-          if (response.mode !== 'paged') throw new Error(VERSION_CHANGED);
+          // A bare array counts toward stopping the list, as one answering
+          // the list does, and fails this refresh of the section.
+          const note = selection.noteAnswer('paged', response.mode);
+          setOlderFormat(selection.mismatches > 0);
+          if (note.kind === 'stopped') return stopList(note.kept);
+          if (response.mode !== 'paged') throw new OlderFormatAnswer();
           setFragmentMatches({ key: scope.key, sandboxes: response.sandboxes, more: response.nextCursor !== null, error: null });
         })
         .catch((err: any) => {
@@ -1874,6 +1896,15 @@ function SandboxesPage() {
           style={{ marginBottom: 12 }}
           title={`${paged ? `Could not load page ${position.index + 1} of the sandboxes` : `Could not load the newest ${listLimit} sandboxes`}${orgFilter ? ` of ${orgNames.get(orgFilter) ?? orgFilter}` : ''}: ${listError}`}
           action={<Button size="small" onClick={refreshAndReport}>Retry</Button>}
+        />
+      ) : olderFormat ? (
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 12 }}
+          title={paged
+            ? 'The API answered in an older format; retrying, and keeping the rows on screen.'
+            : 'The API answered in an older format; retrying the switch to pages, and keeping the sample on screen.'}
         />
       ) : null}
 
