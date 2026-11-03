@@ -84,6 +84,7 @@ use pplx_space_net_common::{NetworkPolicyV1, proto::NetworkPolicyV1 as NetworkPo
 use pplx_space_sandbox_portability::{
     no_newer_full_snapshot, restore_retry_source_snapshot_is_current,
 };
+use pplx_space_sandbox_store::direct as direct_store;
 use pplx_space_sbx_mgr_client::proto::{
     BootMode, StartRequest, SuspendRequest, WakeResponse, WakeTransition,
 };
@@ -1133,22 +1134,15 @@ impl DirectSubstrate {
                 message: format!("refused stale direct restore receipt for sandbox {sandbox_id}"),
             });
         }
-        let placed = sqlx::query(sql!(
-            "UPDATE sandboxes
-                SET active_node_id = $2,
-                    target_node_id = $2,
-                    placement = 'on_node',
-                    placement_changed_at = NOW()
-              WHERE id = $1
-                AND restore_lease_token = $3"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .bind(expected_node_id.as_uuid())
-        .bind(lease.token)
-        .execute(&mut *transaction)
+        let placed = direct_store::place_owned_restore_receipt(
+            &mut *transaction,
+            sandbox_id,
+            expected_node_id,
+            lease.token,
+        )
         .await
         .db_context("failed to persist owned direct restore placement")?;
-        if placed.rows_affected() != 1 {
+        if !placed {
             return Err(SubstrateError::restore_in_flight(format!(
                 "direct restore ownership changed for sandbox {sandbox_id}"
             )));
@@ -2717,31 +2711,19 @@ impl DirectSubstrate {
         sandbox_id: SandboxId,
     ) -> Result<DirectRestoreLease, SubstrateError> {
         let token = Uuid::now_v7();
-        let claimed = sqlx::query_as::<_, (Uuid, bool)>(sql!(
-            "WITH candidate AS (
-                 SELECT id,
-                        LOWER(TRIM(lifecycle)) = 'restoring' AS restore_retry
-                   FROM sandboxes
-                  WHERE id = $1
-                    AND LOWER(TRIM(lifecycle)) IN ('suspended', 'restoring')
-                    AND (restore_lease_expires_at IS NULL OR restore_lease_expires_at <= NOW())
-                  FOR UPDATE
-             )
-             UPDATE sandboxes s
-                SET lifecycle = 'restoring',
-                    restore_lease_expires_at = NOW() + ($2::bigint * INTERVAL '1 second'),
-                    restore_lease_token = $3
-               FROM candidate c
-              WHERE s.id = c.id
-          RETURNING $3::UUID, c.restore_retry"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .bind(i64::try_from(DIRECT_NODE_RPC_TIMEOUT.as_secs()).expect("node timeout fits i64"))
-        .bind(token)
-        .fetch_optional(&self.pool)
+        let claimed = direct_store::claim_restore_lease(
+            &self.pool,
+            sandbox_id,
+            i64::try_from(DIRECT_NODE_RPC_TIMEOUT.as_secs()).expect("node timeout fits i64"),
+            token,
+        )
         .await
         .db_context("failed to claim direct restore lease")?;
-        if let Some((claimed_token, restore_retry)) = claimed {
+        if let Some(direct_store::ClaimedRestoreLease {
+            token: claimed_token,
+            restore_retry,
+        }) = claimed
+        {
             debug_assert_eq!(claimed_token, token);
             return Ok(DirectRestoreLease {
                 token,
@@ -2792,28 +2774,15 @@ impl DirectSubstrate {
         sandbox_id: SandboxId,
         lease: DirectRestoreLease,
     ) -> Result<(), SubstrateError> {
-        let released = sqlx::query(sql!(
-            "UPDATE sandboxes
-                SET lifecycle = CASE WHEN $3 THEN lifecycle ELSE 'suspended' END,
-                    restore_lease_expires_at = CASE
-                        WHEN $3 THEN restore_lease_expires_at
-                        ELSE NULL
-                    END,
-                    restore_lease_token = CASE
-                        WHEN $3 THEN restore_lease_token
-                        ELSE NULL
-                    END
-              WHERE id = $1
-                AND restore_lease_token = $2
-                AND lifecycle = 'restoring'"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .bind(lease.token)
-        .bind(lease.restore_retry)
-        .execute(&self.pool)
+        let released = direct_store::release_restore_lease(
+            &self.pool,
+            sandbox_id,
+            lease.token,
+            lease.restore_retry,
+        )
         .await
         .db_context("failed to release direct restore lease")?;
-        if released.rows_affected() != 1 {
+        if !released {
             return Err(SubstrateError::restore_in_flight(format!(
                 "direct restore ownership changed before release for sandbox {sandbox_id}"
             )));
@@ -2842,22 +2811,16 @@ impl DirectSubstrate {
         sandbox_id: SandboxId,
         lease: DirectRestoreLease,
     ) -> Result<(), SubstrateError> {
-        let renewed = sqlx::query(sql!(
-            "UPDATE sandboxes
-                SET restore_lease_expires_at = NOW() + ($3::bigint * INTERVAL '1 second')
-              WHERE id = $1
-                AND restore_lease_token = $2"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .bind(lease.token)
-        .bind(
+        let renewed = direct_store::renew_restore_lease(
+            &self.pool,
+            sandbox_id,
+            lease.token,
             i64::try_from(DIRECT_NODE_RPC_TIMEOUT.as_secs() * 2)
                 .expect("renewed node timeout fits i64"),
         )
-        .execute(&self.pool)
         .await
         .db_context("failed to renew direct restore lease")?;
-        if renewed.rows_affected() != 1 {
+        if !renewed {
             return Err(SubstrateError::restore_in_flight(format!(
                 "direct restore ownership changed for sandbox {sandbox_id}"
             )));
@@ -2870,19 +2833,10 @@ impl DirectSubstrate {
         sandbox_id: SandboxId,
         lease: DirectRestoreLease,
     ) -> Result<(), SubstrateError> {
-        let completed = sqlx::query(sql!(
-            "UPDATE sandboxes
-                SET lifecycle = 'started',
-                    placement = 'on_node'
-              WHERE id = $1
-                AND restore_lease_token = $2"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .bind(lease.token)
-        .execute(&self.pool)
-        .await
-        .db_context("failed to complete direct restore lease")?;
-        if completed.rows_affected() != 1 {
+        let completed = direct_store::complete_restore_lease(&self.pool, sandbox_id, lease.token)
+            .await
+            .db_context("failed to complete direct restore lease")?;
+        if !completed {
             return Err(SubstrateError::restore_in_flight(format!(
                 "direct restore ownership changed before completion for sandbox {sandbox_id}"
             )));

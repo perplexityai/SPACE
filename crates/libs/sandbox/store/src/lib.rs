@@ -102,6 +102,7 @@ use uuid::Uuid;
 
 pub mod create;
 pub mod delete;
+pub mod direct;
 pub mod fork_source_lifecycle;
 pub mod ingest;
 pub mod lost;

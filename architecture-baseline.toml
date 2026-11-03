@@ -149,7 +149,7 @@
 [pattern_ratchet.sandbox_writes]
 "crates/libs/api/src/controllers/sandbox/responses.rs" = 3
 "crates/libs/api/src/controllers/sandbox/updates.rs" = 2
-"crates/libs/api/src/controllers/substrate/direct.rs" = 6
+"crates/libs/api/src/controllers/substrate/direct.rs" = 1
 "crates/libs/api/src/controllers/substrate/mod.rs" = 1
 "crates/libs/cluster/controller/server/src/drained_node_terminator/store.rs" = 1
 "crates/libs/cluster/controller/server/src/node_drain/store.rs" = 15
