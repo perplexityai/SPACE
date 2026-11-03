@@ -11,6 +11,9 @@
 # The space namespace. An empty value falls back to the release namespace.
 namespaceOverride: space
 
+# Select the API version served by the installed External Secrets Operator.
+externalSecretsApiVersion: external-secrets.io/v1beta1
+
 serviceAccount:
   name: space-secrets-store
   # IRSA role the SecretStore assumes to read Secrets Manager.
@@ -36,6 +39,11 @@ secretStore:
 #   space-postgres:
 #     targetSecretName: space-postgres
 #     refreshInterval: 5m
+#     # Optional ESO v2 target template. Expressions are evaluated by ESO, not Helm.
+#     template:
+#       engineVersion: v2
+#       data:
+#         DATABASE_URL: '{{ .POSTGRES_CONNECTION_STRING }}'
 #     data:
 #       POSTGRES_CONNECTION_STRING:
 #         remoteRef:
