@@ -3,7 +3,12 @@
 //!
 //! Only ERROR lines are re-logged. Firecracker warns on every snapshot restore,
 //! so WARN lines stay in the file, where the watchdog's failure-time tail of it
-//! still reads them. Reading a regular file never affects the VMM; each poll
+//! still reads them. One ERROR is expected and logged at DEBUG instead: the
+//! "Device not found" answer to `GET /balloon` on a VM without a balloon
+//! device, which node-manager probes before every snapshot pause. Firecracker
+//! gives missing drives and network interfaces the same message, so it is
+//! expected only when the API request before it, which Firecracker logs at
+//! INFO, was that read. Reading a regular file never affects the VMM; each poll
 //! reads at most [`MAX_READ_BYTES`]. Polls block: they run on the shared log
 //! poll's blocking job, never on the runtime.
 //!
@@ -26,6 +31,11 @@ const MAX_READ_BYTES: u64 = 64 * 1024;
 /// A partial line longer than this is not Firecracker's and is dropped.
 const MAX_LINE_BYTES: usize = 8 * 1024;
 const MAX_MESSAGE_BYTES: usize = 512;
+/// How Firecracker's INFO line for each API request it receives starts.
+const API_REQUEST_PREFIX: &str = "The API server received a ";
+const BALLOON_READ: &str = "Get request on \"/balloon\".";
+/// Firecracker's ERROR for a request on a device the running VM does not have.
+const DEVICE_NOT_FOUND: &str = "Received Error. Status code: 400 Bad Request. Message: Internal VMM error: Failed perform action on device: Device not found";
 
 /// Bytes one poll read from a log, not yet accepted.
 pub(super) struct LogRead {
@@ -41,6 +51,8 @@ pub(super) struct LogTail {
     /// Where the next read starts; `None` until the file is first seen.
     offset: Option<u64>,
     partial: Vec<u8>,
+    /// The last API request the log shows is `GET /balloon`.
+    after_balloon_read: bool,
 }
 
 impl LogTail {
@@ -50,6 +62,7 @@ impl LogTail {
             readers_started_at,
             offset: None,
             partial: Vec::new(),
+            after_balloon_read: false,
         }
     }
 
@@ -96,6 +109,7 @@ impl LogTail {
     pub(super) fn accept_read(&mut self, read: LogRead, sandbox_id: &str, budget: &mut LogBudget) {
         if read.restarted {
             self.partial.clear();
+            self.after_balloon_read = false;
         }
         self.offset = Some(read.start + read.chunk.len() as u64);
         self.accept(sandbox_id, &read.chunk, budget);
@@ -107,12 +121,32 @@ impl LogTail {
             bytes = rest.get(1..).unwrap_or_default();
             self.partial.extend_from_slice(head);
             let line = std::mem::take(&mut self.partial);
-            forward_line(sandbox_id, &String::from_utf8_lossy(&line), budget);
+            self.forward_line(sandbox_id, &String::from_utf8_lossy(&line), budget);
         }
         self.partial.extend_from_slice(bytes);
         if self.partial.len() > MAX_LINE_BYTES {
             self.partial.clear();
         }
+    }
+
+    fn forward_line(&mut self, sandbox_id: &str, line: &str, budget: &mut LogBudget) {
+        let Some((level, message)) = level_and_message(line) else {
+            return;
+        };
+        if level == "INFO"
+            && let Some(request) = message.strip_prefix(API_REQUEST_PREFIX)
+        {
+            self.after_balloon_read = request == BALLOON_READ;
+            return;
+        }
+        if level != "ERROR" {
+            return;
+        }
+        if self.after_balloon_read && message == DEVICE_NOT_FOUND {
+            tracing::debug!(sandbox_id, "firecracker reports no balloon device");
+            return;
+        }
+        forward_error(sandbox_id, message, budget);
     }
 }
 
@@ -123,10 +157,7 @@ fn created_since(metadata: &std::fs::Metadata, instant: SystemTime) -> bool {
         .is_ok_and(|created| created >= instant)
 }
 
-fn forward_line(sandbox_id: &str, line: &str, budget: &mut LogBudget) {
-    let Some(message) = error_message(line) else {
-        return;
-    };
+fn forward_error(sandbox_id: &str, message: &str, budget: &mut LogBudget) {
     let Some(suppressed) = budget.admit() else {
         pplx_space_metrics::sandbox::vm::vm_diagnostics(
             VmDiagnosticSource::Firecracker,
@@ -151,9 +182,9 @@ fn forward_line(sandbox_id: &str, line: &str, budget: &mut LogBudget) {
     );
 }
 
-/// The message of an ERROR line; `None` for every other line.
-fn error_message(line: &str) -> Option<&str> {
+/// The level and message of a line; `None` for a line without the header.
+fn level_and_message(line: &str) -> Option<(&str, &str)> {
     let (_, header_and_message) = line.split_once(" [")?;
     let (header, message) = header_and_message.split_once("] ")?;
-    (header.rsplit(':').next()? == "ERROR").then(|| message.trim_end())
+    Some((header.rsplit(':').next()?, message.trim_end()))
 }

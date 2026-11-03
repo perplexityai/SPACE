@@ -37,6 +37,10 @@ fn attach(
 }
 
 fn append_error(jail: &Path, message: &str) {
+    append_line(jail, "ERROR", message);
+}
+
+fn append_line(jail: &Path, level: &str, message: &str) {
     let mut log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -44,7 +48,7 @@ fn append_error(jail: &Path, message: &str) {
         .unwrap();
     writeln!(
         log,
-        "2026-10-19T00:00:00 [anonymous-instance:main:ERROR] {message}"
+        "2026-10-19T00:00:00 [anonymous-instance:main:{level}] {message}"
     )
     .unwrap();
 }
@@ -125,6 +129,38 @@ fn one_poll_tails_every_attached_sandbox_until_detached() {
     assert_eq!(
         poll(&readers),
         logged(&[("sbx-0", "second 0"), ("sbx-2", "second 2")])
+    );
+}
+
+/// Firecracker's "Device not found" answer to `GET /balloon` on a VM without a
+/// balloon device is expected, so it is not re-logged as an error. The same
+/// answer to any other request, and any other answer to that read, still is.
+#[test]
+fn a_balloon_read_finding_no_device_is_not_an_error() {
+    const NOT_FOUND: &str = "Received Error. Status code: 400 Bad Request. Message: \
+                             Internal VMM error: Failed perform action on device: Device not found";
+    const OTHER: &str = "Received Error. Status code: 400 Bad Request. Message: something else";
+    let (runtime, readers) = readers();
+    let jail = tempfile::tempdir().unwrap();
+    attach(&runtime, &readers, "sbx", 1, jail.path());
+    let request = |request: &str| {
+        append_line(
+            jail.path(),
+            "INFO",
+            &format!("The API server received a {request}."),
+        );
+    };
+
+    request(r#"Get request on "/balloon""#);
+    append_error(jail.path(), NOT_FOUND);
+    request(r#"Patch request on "/drives/scratch" with body "{}""#);
+    append_error(jail.path(), NOT_FOUND);
+    request(r#"Get request on "/balloon""#);
+    append_error(jail.path(), OTHER);
+
+    assert_eq!(
+        poll(&readers),
+        logged(&[("sbx", NOT_FOUND), ("sbx", OTHER)])
     );
 }
 
