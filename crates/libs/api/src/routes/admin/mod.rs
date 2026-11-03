@@ -58,10 +58,11 @@ mod sandboxes;
 // still differs by module: this layer, `templates`, and `sandboxes`'
 // `create_command` render a `PublicErrorEnvelope`; `sandboxes`' action
 // handlers render `{"error", "operation_id", "retryable"}`; `identity` a
-// `{"error": …}` that its 409s extend with a `reason` (and, for a user held
-// only by deleted sandboxes, `retained_until`), never named `code`, which in
-// the envelope is the status category; the rest a bare `{"error": …}` with no
-// retry field. `Retry-After` comes only from the two
+// `{"error": …}` that every 409 extends with a `reason` (a user or
+// organization delete's blocker, an email in use, or a self-mutation; and,
+// for a user held only by deleted sandboxes, `retained_until`), never named
+// `code`, which in the envelope is the status category; the rest a bare
+// `{"error": …}` with no retry field. `Retry-After` comes only from the two
 // paths that answer through `PublicApiError` — this layer, and
 // `create_command`, which has two — its sandbox lookup through
 // `database_error` and its session write through

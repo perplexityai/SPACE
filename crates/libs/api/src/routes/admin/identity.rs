@@ -41,6 +41,12 @@ pub(super) enum IdentityAdminError {
     /// first.
     #[error("{}", .0.message())]
     StillOwns(UserDeleteBlocker),
+    /// The organization still has rows whose foreign key refuses its delete.
+    #[error("{}", .0.message())]
+    OrgNotEmpty(OrgDeleteBlocker),
+    /// Another user already has the email (`users_email_key`).
+    #[error("email already in use")]
+    EmailInUse,
     #[error("{0}")]
     InvalidRequest(&'static str),
     #[error("internal server error")]
@@ -88,7 +94,9 @@ impl IdentityAdminError {
         match self {
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::NotFound => StatusCode::NOT_FOUND,
-            Self::SelfMutation | Self::StillOwns(_) => StatusCode::CONFLICT,
+            Self::SelfMutation | Self::StillOwns(_) | Self::OrgNotEmpty(_) | Self::EmailInUse => {
+                StatusCode::CONFLICT
+            }
             Self::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             Self::Internal(_) | Self::Password(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Contended { status, .. } => *status,
@@ -102,6 +110,8 @@ impl IdentityAdminError {
         match self {
             Self::SelfMutation => Some("self_mutation"),
             Self::StillOwns(blocker) => Some(blocker.reason()),
+            Self::OrgNotEmpty(blocker) => Some(blocker.reason()),
+            Self::EmailInUse => Some("email_in_use"),
             Self::Forbidden
             | Self::NotFound
             | Self::InvalidRequest(_)
@@ -109,6 +119,19 @@ impl IdentityAdminError {
             | Self::Password(_)
             | Self::Contended { .. } => None,
         }
+    }
+
+    /// A failed `users` insert or update: a unique violation on
+    /// `users_email_key` is [`Self::EmailInUse`], anything else converts as
+    /// usual.
+    fn from_user_write(error: sqlx::Error) -> Self {
+        if let sqlx::Error::Database(db) = &error
+            && db.is_unique_violation()
+            && db.constraint() == Some("users_email_key")
+        {
+            return Self::EmailInUse;
+        }
+        Self::from(error)
     }
 }
 
@@ -205,6 +228,105 @@ impl UserDeleteBlocker {
             Self::ArchivedSandboxes => "user still owns archived sandboxes; they must be purged \
                                         before the user can be deleted"
                 .to_string(),
+        }
+    }
+}
+
+/// A row kind whose foreign key refuses an organization's delete: one that
+/// references `organizations` with no `ON DELETE` action or `RESTRICT`, or
+/// that restricts the delete of a row the organization's delete cascades to.
+/// API keys, credentials, operations and the other rows that reference
+/// `organizations` with `ON DELETE CASCADE` go with the organization.
+///
+/// When several kinds remain, the error names the first one the database
+/// checks; the next delete names the next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum OrgDeleteBlocker {
+    /// `users.org_id`.
+    Users,
+    /// `sandboxes.org_id`, which includes deleted sandboxes kept for
+    /// retention. The encrypted-field and volume-encryption rows of the
+    /// organization's sandboxes and snapshots also restrict the delete of the
+    /// master key the organization's delete cascades to.
+    Sandboxes,
+    /// `sandbox_archives.org_id` (`ON DELETE RESTRICT`).
+    ArchivedSandboxes,
+    /// `templates.org_id`, and the encrypted-field rows of the organization's
+    /// templates and template releases through its master key.
+    Templates,
+    /// `node_groups.org_id`.
+    NodeGroups,
+    /// `clusters.managing_org_id` (`ON DELETE RESTRICT`). The handler refuses
+    /// the managing organization before deleting; this is the managing
+    /// organization changing between that check and the delete.
+    ManagesCluster,
+}
+
+impl OrgDeleteBlocker {
+    /// The blocker named by a foreign-key violation from
+    /// `DELETE FROM organizations`, or `None` for any other database error.
+    fn from_delete_error(error: &sqlx::Error) -> Option<Self> {
+        let sqlx::Error::Database(db) = error else {
+            return None;
+        };
+        if !db.is_foreign_key_violation() {
+            return None;
+        }
+        match db.constraint()? {
+            "users_org_id_fkey" => Some(Self::Users),
+            "sandboxes_org_id_fkey"
+            | "sandbox_encrypted_fields_master_key_id_org_id_fkey"
+            | "sandbox_volume_encryption_master_key_id_org_id_fkey"
+            | "snapshot_storage_location_encrypted_fields_kek_fkey" => Some(Self::Sandboxes),
+            "sandbox_archives_org_id_fkey" => Some(Self::ArchivedSandboxes),
+            "templates_org_id_fkey"
+            | "template_encrypted_fields_master_key_id_org_id_fkey"
+            | "template_release_storage_location_encrypted_fields_kek_fkey" => {
+                Some(Self::Templates)
+            }
+            "node_groups_org_id_fkey" => Some(Self::NodeGroups),
+            "clusters_managing_org_id_fkey" => Some(Self::ManagesCluster),
+            _ => None,
+        }
+    }
+
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::Users => "org_has_users",
+            Self::Sandboxes => "org_has_sandboxes",
+            Self::ArchivedSandboxes => "org_has_archived_sandboxes",
+            Self::Templates => "org_has_templates",
+            Self::NodeGroups => "org_has_node_groups",
+            Self::ManagesCluster => "org_manages_cluster",
+        }
+    }
+
+    const fn message(self) -> &'static str {
+        match self {
+            Self::Users => {
+                "organization still has users; delete them or move them to another \
+                 organization before deleting the organization"
+            }
+            Self::Sandboxes => {
+                "organization still has sandboxes, including deleted ones whose records are \
+                 kept for retention; delete them, or wait out retention, before deleting the \
+                 organization"
+            }
+            Self::ArchivedSandboxes => {
+                "organization still has archived sandboxes; they must be purged before the \
+                 organization can be deleted"
+            }
+            Self::Templates => {
+                "organization still owns templates; delete them before deleting the organization"
+            }
+            Self::NodeGroups => {
+                "organization still owns node groups; delete them before deleting the \
+                 organization"
+            }
+            Self::ManagesCluster => {
+                "organization manages the cluster; make another organization the managing \
+                 organization before deleting it"
+            }
         }
     }
 }
@@ -426,7 +548,11 @@ pub(super) async fn delete_org(
     let result = sqlx::query(sql!("DELETE FROM organizations WHERE id = $1"))
         .bind(org_id)
         .execute(&state.pool)
-        .await?;
+        .await
+        .map_err(|error| match OrgDeleteBlocker::from_delete_error(&error) {
+            Some(blocker) => IdentityAdminError::OrgNotEmpty(blocker),
+            None => IdentityAdminError::from(error),
+        })?;
     if result.rows_affected() == 0 {
         return Err(IdentityAdminError::NotFound);
     }
@@ -469,7 +595,8 @@ pub(super) async fn create_user_for_org(
     .bind(org_id)
     .bind(request.role)
     .fetch_one(&state.pool)
-    .await?;
+    .await
+    .map_err(IdentityAdminError::from_user_write)?;
 
     Ok((StatusCode::CREATED, Json(user.into())))
 }
@@ -519,7 +646,8 @@ pub(super) async fn update_user(
     .bind(password_hash)
     .bind(request.display_name)
     .fetch_optional(tx.as_mut())
-    .await?
+    .await
+    .map_err(IdentityAdminError::from_user_write)?
     .ok_or(IdentityAdminError::NotFound)?;
     if password_changed {
         sqlx::query(sql!("DELETE FROM sessions WHERE user_id = $1"))

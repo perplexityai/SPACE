@@ -403,3 +403,350 @@ async fn delete_user_answers_conflict_while_the_user_owns_sandboxes()
     assert_eq!(error.reason(), Some("self_mutation"));
     Ok(())
 }
+
+async fn managing_org_admin(pool: &sqlx::PgPool) -> Result<User, sqlx::Error> {
+    sqlx::query_as::<_, User>(sql!(
+        "SELECT u.*
+         FROM users u
+         JOIN clusters c ON c.managing_org_id = u.org_id
+         WHERE c.singleton
+           AND u.role = 'organization_admin'
+         ORDER BY u.id
+         LIMIT 1"
+    ))
+    .fetch_one(pool)
+    .await
+}
+
+async fn insert_org(pool: &sqlx::PgPool) -> Result<OrgId, sqlx::Error> {
+    let org_id = OrgId::new();
+    sqlx::query(sql!(
+        "INSERT INTO organizations (id, name, slug) VALUES ($1, $2, $3)"
+    ))
+    .bind(org_id)
+    .bind(format!("Delete Test Org {org_id}"))
+    .bind(format!("delete-test-{org_id}"))
+    .execute(pool)
+    .await?;
+    Ok(org_id)
+}
+
+/// Each row kind that refuses an organization's delete answers a 409 naming
+/// it, and the delete succeeds once it is gone. Rows whose foreign key
+/// cascades, such as API keys, do not block it.
+#[tokio::test(flavor = "current_thread")]
+async fn delete_org_answers_conflict_naming_what_still_references_it()
+-> pplx_space_test_env::TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let state = AppState::from_pool(db.pool.clone()).await?;
+    let actor = managing_org_admin(&db.pool).await?;
+    let org_id = insert_org(&db.pool).await?;
+    let delete = || {
+        delete_org(
+            State(state.clone()),
+            Extension(AuthUser(actor.clone())),
+            Path(org_id),
+        )
+    };
+    let refused_with = |reason: &'static str| {
+        let delete = delete();
+        async move {
+            let error = delete.await.expect_err(reason);
+            assert_eq!(error.status(), StatusCode::CONFLICT, "{reason}");
+            let body = to_bytes(error.into_response().into_body(), usize::MAX).await?;
+            let body: serde_json::Value = serde_json::from_slice(&body)?;
+            assert_eq!(body["reason"], reason);
+            pplx_space_test_env::TestResult::Ok(())
+        }
+    };
+
+    // Each blocker is inserted alone and removed after its refusal. The
+    // sandbox rows belong to the actor, a user outside the org, so the org's
+    // own users never stand in for them.
+    let member_id = UserId::new();
+    sqlx::query(sql!(
+        "INSERT INTO users (id, email, password_hash, display_name, org_id, role)
+         VALUES ($1, $2, 'unused', 'Org Member', $3, 'member')"
+    ))
+    .bind(member_id)
+    .bind(format!("member-{member_id}@example.invalid"))
+    .bind(org_id)
+    .execute(&db.pool)
+    .await?;
+    refused_with("org_has_users").await?;
+    sqlx::query(sql!("DELETE FROM users WHERE id = $1"))
+        .bind(member_id)
+        .execute(&db.pool)
+        .await?;
+
+    // A deleted sandbox's row is kept for retention and still blocks.
+    let sandbox_id =
+        pplx_space_db_test_fixtures::insert_suspended_sandbox(&db.pool, org_id, actor.id).await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET lifecycle = 'deleted' WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(&db.pool)
+    .await?;
+    refused_with("org_has_sandboxes").await?;
+    sqlx::query(sql!("DELETE FROM sandboxes WHERE id = $1"))
+        .bind(sandbox_id)
+        .execute(&db.pool)
+        .await?;
+
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_archives (
+             sandbox_id, org_id, user_id, sandbox_created_at, manifest_id,
+             manifest_sha256, stored_bytes
+         ) VALUES ($1, $2, $3, NOW(), $4, '\\x00', 0)"
+    ))
+    .bind(sandbox_id)
+    .bind(org_id)
+    .bind(actor.id)
+    .bind(Uuid::now_v7())
+    .execute(&db.pool)
+    .await?;
+    refused_with("org_has_archived_sandboxes").await?;
+    sqlx::query(sql!("DELETE FROM sandbox_archives WHERE sandbox_id = $1"))
+        .bind(sandbox_id)
+        .execute(&db.pool)
+        .await?;
+
+    sqlx::query(sql!(
+        "INSERT INTO templates (id, name, org_id, visibility)
+         VALUES ($1, $2, $3, 'org_specific')"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(format!("delete-test-{org_id}"))
+    .bind(org_id)
+    .execute(&db.pool)
+    .await?;
+    refused_with("org_has_templates").await?;
+    sqlx::query(sql!("DELETE FROM templates WHERE org_id = $1"))
+        .bind(org_id)
+        .execute(&db.pool)
+        .await?;
+
+    sqlx::query(sql!(
+        "INSERT INTO node_groups (id, name, org_id) VALUES ($1, 'delete-test-group', $2)"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(org_id)
+    .execute(&db.pool)
+    .await?;
+    refused_with("org_has_node_groups").await?;
+    sqlx::query(sql!("DELETE FROM node_groups WHERE org_id = $1"))
+        .bind(org_id)
+        .execute(&db.pool)
+        .await?;
+
+    sqlx::query(sql!(
+        "INSERT INTO api_keys (org_id, name, key_hash) VALUES ($1, 'cascades', $2)"
+    ))
+    .bind(org_id)
+    .bind(format!("delete-test-{org_id}"))
+    .execute(&db.pool)
+    .await?;
+    assert_eq!(delete().await?, StatusCode::NO_CONTENT);
+    let api_keys: i64 = sqlx::query_scalar(sql!("SELECT COUNT(*) FROM api_keys WHERE org_id = $1"))
+        .bind(org_id)
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(api_keys, 0, "the org's API keys go with it");
+    Ok(())
+}
+
+/// The blockers the handler does not reach in one request: the managing
+/// organization, which it refuses first, and the encrypted rows that restrict
+/// the delete of the master key an organization's delete cascades to, which
+/// the database reports only if it checks them before the sandbox or template
+/// row itself. Each is classified from the database's own error.
+#[tokio::test(flavor = "current_thread")]
+async fn org_delete_blockers_classify_the_database_constraint() -> pplx_space_test_env::TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let actor = managing_org_admin(&db.pool).await?;
+    let org_id = insert_org(&db.pool).await?;
+    let master_key_id = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO org_master_keys (id, org_id, provider, key_identifier)
+         VALUES ($1, $2, 'in_memory', 'delete-test')"
+    ))
+    .bind(master_key_id)
+    .bind(org_id)
+    .execute(&db.pool)
+    .await?;
+    let sandbox_id =
+        pplx_space_db_test_fixtures::insert_suspended_sandbox(&db.pool, org_id, actor.id).await?;
+    let template_name = format!("delete-test-{org_id}");
+    sqlx::query(sql!(
+        "INSERT INTO templates (id, name, org_id, visibility)
+         VALUES ($1, $2, $3, 'org_specific')"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(&template_name)
+    .bind(org_id)
+    .execute(&db.pool)
+    .await?;
+    let delete_master_key = sql!("DELETE FROM org_master_keys WHERE id = $1");
+
+    let mut tx = db.pool.begin().await?;
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_encrypted_fields (
+             sandbox_id, org_id, master_key_id, wrapped_dek, env, metadata
+         ) VALUES ($1, $2, $3, '\\x00', '\\x00', '\\x00')"
+    ))
+    .bind(sandbox_id)
+    .bind(org_id)
+    .bind(master_key_id)
+    .execute(tx.as_mut())
+    .await?;
+    let error = sqlx::query(delete_master_key)
+        .bind(master_key_id)
+        .execute(tx.as_mut())
+        .await
+        .expect_err("encrypted fields restrict their master key's delete");
+    assert_eq!(
+        OrgDeleteBlocker::from_delete_error(&error),
+        Some(OrgDeleteBlocker::Sandboxes)
+    );
+    tx.rollback().await?;
+
+    let mut tx = db.pool.begin().await?;
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_volume_encryption (sandbox_id, org_id, master_key_id, wrapped_dek)
+         VALUES ($1, $2, $3, '\\x00')"
+    ))
+    .bind(sandbox_id)
+    .bind(org_id)
+    .bind(master_key_id)
+    .execute(tx.as_mut())
+    .await?;
+    let error = sqlx::query(delete_master_key)
+        .bind(master_key_id)
+        .execute(tx.as_mut())
+        .await
+        .expect_err("volume encryption restricts its master key's delete");
+    assert_eq!(
+        OrgDeleteBlocker::from_delete_error(&error),
+        Some(OrgDeleteBlocker::Sandboxes)
+    );
+    tx.rollback().await?;
+
+    let mut tx = db.pool.begin().await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_encrypted_fields (
+             template_name, org_id, master_key_id, wrapped_dek, network_policy_json
+         ) VALUES ($1, $2, $3, '\\x00', '\\x00')"
+    ))
+    .bind(&template_name)
+    .bind(org_id)
+    .bind(master_key_id)
+    .execute(tx.as_mut())
+    .await?;
+    let error = sqlx::query(delete_master_key)
+        .bind(master_key_id)
+        .execute(tx.as_mut())
+        .await
+        .expect_err("template encrypted fields restrict their master key's delete");
+    assert_eq!(
+        OrgDeleteBlocker::from_delete_error(&error),
+        Some(OrgDeleteBlocker::Templates)
+    );
+    tx.rollback().await?;
+
+    let mut tx = db.pool.begin().await?;
+    sqlx::query(sql!("DELETE FROM sandboxes WHERE org_id = $1"))
+        .bind(org_id)
+        .execute(tx.as_mut())
+        .await?;
+    sqlx::query(sql!("DELETE FROM templates WHERE org_id = $1"))
+        .bind(org_id)
+        .execute(tx.as_mut())
+        .await?;
+    sqlx::query(sql!(
+        "UPDATE clusters SET managing_org_id = $1 WHERE singleton"
+    ))
+    .bind(org_id)
+    .execute(tx.as_mut())
+    .await?;
+    let error = sqlx::query(sql!("DELETE FROM organizations WHERE id = $1"))
+        .bind(org_id)
+        .execute(tx.as_mut())
+        .await
+        .expect_err("the managing organization cannot be deleted");
+    assert_eq!(
+        OrgDeleteBlocker::from_delete_error(&error),
+        Some(OrgDeleteBlocker::ManagesCluster)
+    );
+    tx.rollback().await?;
+    Ok(())
+}
+
+/// Creating a user with, or changing a user to, an email another user has
+/// answers a 409 rather than surfacing the unique violation as internal.
+#[tokio::test(flavor = "current_thread")]
+async fn an_email_in_use_answers_conflict_on_create_and_update() -> pplx_space_test_env::TestResult
+{
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let state = AppState::from_pool(db.pool.clone()).await?;
+    let actor = managing_org_admin(&db.pool).await?;
+    let create = |email: String| {
+        create_user_for_org(
+            State(state.clone()),
+            Extension(AuthUser(actor.clone())),
+            Path(actor.org_id),
+            Json(CreateUserRequest {
+                email,
+                password: Uuid::now_v7().to_string(),
+                display_name: "Email Test User".to_string(),
+                role: UserRole::Member,
+            }),
+        )
+    };
+    let suffix = Uuid::now_v7();
+    let (status, Json(first)) = create(format!("first-{suffix}@example.invalid")).await?;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, Json(second)) = create(format!("second-{suffix}@example.invalid")).await?;
+
+    let error = create(format!("first-{suffix}@example.invalid"))
+        .await
+        .expect_err("a second user cannot take the email");
+    assert_eq!(error.status(), StatusCode::CONFLICT);
+    assert_eq!(error.reason(), Some("email_in_use"));
+    let body = to_bytes(error.into_response().into_body(), usize::MAX).await?;
+    let body: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        body,
+        serde_json::json!({"error": "email already in use", "reason": "email_in_use"})
+    );
+
+    let error = update_user(
+        State(state.clone()),
+        Extension(AuthUser(actor.clone())),
+        Path(second.user.id),
+        Json(UpdateUserRequest {
+            email: Some(first.user.email.clone()),
+            password: None,
+            display_name: None,
+        }),
+    )
+    .await
+    .expect_err("an update cannot take another user's email");
+    assert_eq!(error.status(), StatusCode::CONFLICT);
+    assert_eq!(error.reason(), Some("email_in_use"));
+    let email: String = sqlx::query_scalar(sql!("SELECT email FROM users WHERE id = $1"))
+        .bind(second.user.id)
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(
+        email, second.user.email,
+        "the refused update changes nothing"
+    );
+    Ok(())
+}

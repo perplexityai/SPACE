@@ -284,7 +284,8 @@ fn admin_openapi_value() -> Value {
                     "summary": "Delete an organization",
                     "responses": {
                         "204": { "description": "Deleted" },
-                        "403": { "description": "Caller is not a managing organization admin" }
+                        "403": { "description": "Caller is not a managing organization admin, or the organization is the managing organization" },
+                        "409": { "description": "Not deleted: rows still reference the organization. reason is org_has_users while it has users (delete them or move them to another organization), org_has_sandboxes while it has sandboxes, including deleted ones whose records are kept for retention, org_has_archived_sandboxes while it has archived sandboxes, org_has_templates while it owns templates, org_has_node_groups while it owns node groups, or org_manages_cluster when it became the managing organization during the request. When several remain, the next delete names the next. API keys, credentials and operations are deleted with the organization" }
                     }
                 }
             },
@@ -299,7 +300,8 @@ fn admin_openapi_value() -> Value {
                     "summary": "Create a user in an organization",
                     "responses": {
                         "201": { "description": "User" },
-                        "403": { "description": "Caller cannot manage the organization" }
+                        "403": { "description": "Caller cannot manage the organization" },
+                        "409": { "description": "Another user has the email; reason is email_in_use" }
                     }
                 }
             },
@@ -922,7 +924,8 @@ fn insert_identity_profile_paths(paths: &mut Map<String, Value>) {
                 "responses": {
                     "200": { "description": "User" },
                     "403": { "description": "Caller cannot update this user" },
-                    "404": { "description": "User not found" }
+                    "404": { "description": "User not found" },
+                    "409": { "description": "Another user has the email; reason is email_in_use" }
                 }
             }),
         );
