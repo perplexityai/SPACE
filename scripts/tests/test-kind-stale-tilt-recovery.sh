@@ -64,6 +64,9 @@
 #      bucket-init Jobs it applied are checked again, so an old completed seed
 #      Job with a pending replacement is not success; and a migration that
 #      fails during the seed wait is diagnosed in seconds, not at its timeout.
+#      A failed provision-local-console ends the bring-up with its log before
+#      the node-publication wait, which signs in through it and would take
+#      the rejected login for an unpublished node until its timeout.
 #  15. Teardown stops only the :10350 listener, never another `tilt up` on the
 #      host, and signals a pid from the scripted bring-up's port-forward
 #      pidfile only while it is still a supervisor of this context.
@@ -604,7 +607,8 @@ printf '#!/usr/bin/env bash\necho "[stub] every SPACE node is published"\n' \
 work="$(mktemp -d)"
 if run_bring_up "$work" TEST_REPO_ROOT="$shadow_root" TEST_TILT_EPOCH=3000 TEST_CLUSTER_EPOCH=2000 \
         TEST_API_REACHABLE=0 SEED_PUBLISH_COMPLETE_TIMEOUT=4 \
-        TEST_SEED_JOBS='uid-old Complete |uid-new ' TEST_UIRESOURCES='space-seed-publish ok\nspace-api ok\n'; then
+        TEST_SEED_JOBS='uid-old Complete |uid-new ' \
+        TEST_UIRESOURCES='space-seed-publish ok\nspace-api ok\nprovision-local-console ok\n'; then
     fail "a pending replacement seed Job must not be reported as up" "$(cat "$work/result")"
 else
     grep -q "space-seed-publish Job did not complete" "$work/result" \
@@ -616,7 +620,8 @@ rm -rf "$work"
 work="$(mktemp -d)"
 run_bring_up "$work" TEST_REPO_ROOT="$shadow_root" TEST_TILT_EPOCH=3000 TEST_CLUSTER_EPOCH=2000 \
         TEST_API_REACHABLE=0 SEED_PUBLISH_COMPLETE_TIMEOUT=4 \
-        TEST_SEED_JOBS='uid-old Complete |uid-new Complete ' TEST_UIRESOURCES='space-seed-publish ok\n' \
+        TEST_SEED_JOBS='uid-old Complete |uid-new Complete ' \
+        TEST_UIRESOURCES='space-seed-publish ok\nprovision-local-console ok\n' \
     || fail "a settled stack with its current Jobs complete must be up" "$(cat "$work/result")"
 [[ -e "$work/provenance-checked" ]] \
     || fail "the bring-up must still check which build each pod runs" "$(cat "$work/result")"
@@ -635,6 +640,24 @@ grep -q "space-db-migrate Job failed" "$work/result" && grep -q "fake migration 
     || fail "a migration failing during the seed wait must be diagnosed as such" "$(cat "$work/result")"
 (( SECONDS - started_at < 15 )) \
     || fail "the migration failure must end the seed wait in seconds, not at its timeout" "$(cat "$work/result")"
+rm -rf "$work"
+
+# Case 14c: the seed Job completes and provision-local-console has failed.
+# The bring-up must end on it, with its log, before the node-publication wait.
+work="$(mktemp -d)"
+started_at=$SECONDS
+if run_bring_up "$work" TEST_REPO_ROOT="$shadow_root" TEST_TILT_EPOCH=3000 TEST_CLUSTER_EPOCH=2000 \
+        TEST_API_REACHABLE=0 SEED_PUBLISH_COMPLETE_TIMEOUT=4 TEST_SEED_JOBS='uid-seed Complete ' \
+        TEST_UIRESOURCES='space-seed-publish ok\nspace-api ok\nprovision-local-console error\n'; then
+    fail "a failed provision-local-console must fail the bring-up" "$(cat "$work/result")"
+else
+    grep -q "fake build log for provision-local-console" "$work/result" \
+        || fail "the console's failure must be reported with its log" "$(cat "$work/result")"
+    ! grep -q "\[stub\] every SPACE node is published" "$work/result" \
+        || fail "the console's failure must end the bring-up before the node-publication wait" "$(cat "$work/result")"
+    (( SECONDS - started_at < 15 )) \
+        || fail "the console's failure must end the bring-up in seconds" "$(cat "$work/result")"
+fi
 rm -rf "$work"
 rm -rf "$shadow_root"
 
