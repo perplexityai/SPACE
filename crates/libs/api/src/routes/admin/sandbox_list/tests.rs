@@ -235,7 +235,15 @@ async fn malformed_list_parameters_answer_400() -> TestDbResult<()> {
     let Some(harness) = harness(db.pool.clone()).await? else {
         return Ok(());
     };
-    for (query, needle) in [
+    // A well-formed cursor from around 5000 BC, before Postgres's range.
+    let out_of_range_cursor = format!(
+        "cursor={}",
+        URL_SAFE_NO_PAD.encode(format!(
+            "{CURSOR_VERSION}:-220000000000000000000:{}",
+            SandboxId::new()
+        ))
+    );
+    for (case, (query, needle)) in [
         ("limit=many", "limit"),
         ("org_id=not-a-uuid", "org_id"),
         ("node_id=not-a-uuid", "node_id"),
@@ -249,6 +257,7 @@ async fn malformed_list_parameters_answer_400() -> TestDbResult<()> {
         ("prefix=a%00b", "NUL"),
         ("cursor=bm90LWEtY3Vyc29y", "invalid cursor"),
         ("cursor=%%%", "invalid"),
+        (&out_of_range_cursor, "invalid cursor"),
         ("lifecycle=started,napping", "unknown lifecycle"),
         ("lifecycle=", "unknown lifecycle"),
         ("template=..", "invalid template"),
@@ -257,6 +266,9 @@ async fn malformed_list_parameters_answer_400() -> TestDbResult<()> {
             "assigned=false",
         ),
         ("created_after=yesterday", "created_after"),
+        // Valid RFC 3339, but before the earliest timestamp Postgres stores.
+        ("created_after=-005000-01-01T00:00:00Z", "outside"),
+        ("created_before=-005000-01-01T00:00:00Z", "outside"),
         (
             "created_after=2026-01-02T00:00:00Z&created_before=2026-01-01T00:00:00Z",
             "earlier",
@@ -267,11 +279,22 @@ async fn malformed_list_parameters_answer_400() -> TestDbResult<()> {
             "created_after=2026-01-01T00:00:00.0000006Z&created_before=2026-01-01T00:00:00.0000003Z",
             "earlier",
         ),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // Labelled by position and needle: a query can carry an ID.
         let (status, body) = harness.get(&format!("/sandboxes?{query}")).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "case {case} ({needle}): status"
+        );
         let message = body["error"].as_str().unwrap_or_default();
-        assert!(message.contains(needle), "{query}: {body}");
+        assert!(
+            message.contains(needle),
+            "case {case} ({needle}): error message"
+        );
     }
     for query in ["org_id=not-a-uuid", "template=py"] {
         let (status, body) = harness

@@ -3,6 +3,7 @@
 //! of sandboxes by template and `spaced` version.
 
 use std::fmt;
+use std::ops::RangeInclusive;
 use std::str::FromStr;
 
 use axum::{
@@ -48,6 +49,12 @@ const LIST_PARAMETERS: [&str; 11] = [
     "prefix",
 ];
 const NANOSECONDS_PER_MICROSECOND: i128 = 1_000;
+/// The Unix nanoseconds Postgres's `timestamptz` holds, at its microsecond
+/// precision: from 4714-11-24 BC (Julian day 0) through the last microsecond
+/// of 294276. A bound outside them fails the statement instead of matching
+/// nothing, so it is refused when parsed.
+const POSTGRES_TIMESTAMP_NANOS: RangeInclusive<i128> =
+    -210_866_803_200_000_000_000..=9_224_318_015_999_999_999_000;
 
 type QueryError = (StatusCode, Json<serde_json::Value>);
 
@@ -244,7 +251,13 @@ fn parse_lifecycles(value: &str) -> Result<Vec<AdminStoredLifecycle>, QueryError
 fn parse_timestamp(name: &str, value: &str) -> Result<OffsetDateTime, QueryError> {
     let invalid = || bad_request(format!("{name} must be an RFC 3339 timestamp"));
     let timestamp = jiff::Timestamp::from_str(value).map_err(|_| invalid())?;
-    OffsetDateTime::from_unix_timestamp_nanos(timestamp.as_nanosecond()).map_err(|_| invalid())
+    let nanos = timestamp.as_nanosecond();
+    if !POSTGRES_TIMESTAMP_NANOS.contains(&nanos) {
+        return Err(bad_request(format!(
+            "{name} is outside the timestamps Postgres stores"
+        )));
+    }
+    OffsetDateTime::from_unix_timestamp_nanos(nanos).map_err(|_| invalid())
 }
 
 fn round_up_to_microsecond(value: OffsetDateTime) -> Result<OffsetDateTime, QueryError> {
@@ -280,6 +293,7 @@ fn decode_cursor(cursor: &str) -> Result<SandboxPageCursor, QueryError> {
     let created_at = nanos
         .parse::<i128>()
         .ok()
+        .filter(|nanos| POSTGRES_TIMESTAMP_NANOS.contains(nanos))
         .and_then(|nanos| OffsetDateTime::from_unix_timestamp_nanos(nanos).ok())
         .ok_or_else(invalid)?;
     let id = SandboxId::from_str(id).map_err(|_| invalid())?;
