@@ -115,6 +115,51 @@ Fork calls retain the normal response wait rather than a short client-side
 timeout: the server owns the operation deadline, and cleanup replays the same
 idempotency key if a response is lost.
 
+## Admin console
+
+The `local.console_*` scenarios drive the bench's admin console (`ui/`)
+through Playwright's Chromium and judge each page against the admin API it
+renders (`space_smoke/console.py`):
+
+- `local.console_sandbox_lookup_accepts_every_id_form`: the `sbx_` ID, bare
+  and undashed UUID, and pod name each open the sandbox's page and narrow the
+  list's search to it; an ID of no sandbox is not found.
+- `local.console_sandbox_detail_complete_in_every_state`: running, suspended
+  and deleted, the page shows the record, the valid lifecycle moves, and the
+  recorded operations.
+- `local.console_operator_suspends_another_orgs_sandbox`: the operator's
+  Suspend on another organization's sandbox suspends it, ownership unchanged.
+- `local.console_destructive_actions_require_confirmation`: sandbox delete and
+  role change ask first, and a cancelled confirmation sends nothing.
+- `local.console_turns_away_non_operators`: another organization's admin and a
+  managing-organization member get the "not for you" notice; the operator
+  does not.
+- `local.console_links_resolve`: list, sandbox, organization, owner and node
+  pages link to each other and resolve. Main has no template page, so the
+  templates list is only checked to carry the sandbox's template.
+
+Each one creates its own organizations, users and foreign-organization
+sandboxes under a run-unique slug, and deletes them in cleanup. Each also
+fails on any browser console error, uncaught page error, failed request or
+HTTP error answer outside the allowlisted `BASELINE` in `console.py` and the
+scenario's own expected probes; every baseline entry states why it is
+expected.
+
+They need Playwright's Chromium, which is not a Python dependency. Install
+it outside the checkout, with the system libraries it loads:
+
+```sh
+uv run --frozen --python 3.11 python -m playwright install --with-deps chromium
+```
+
+Without it, a suite run prints each one `SKIPPED ...: needs a chromium
+browser` with the reason, and a run by name ends inconclusive.
+`SPACE_SMOKE_CONSOLE_URL` overrides the console origin (default
+`http://127.0.0.1:3000`, Tilt's `space-ui` forward), and
+`SPACE_SMOKE_BROWSER_SCENARIOS=withhold` leaves them out, visibly. Pull CI
+runs them only when a pull request changes a path in
+`ci/kind-console-paths.txt`; every other Kind run withholds them.
+
 ## Temporarily omitted lifecycle cases
 
 Auto-kill (both the omitted/default lifecycle and explicit

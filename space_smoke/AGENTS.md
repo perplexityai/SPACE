@@ -24,3 +24,7 @@ Decide pass/fail from state the system exposes, not from what it logs.
 - Logs are evidence: attach them to the failure output.
 - Exception: scenarios whose subject is telemetry delivery itself (for
   example `local.telemetry_reaches_local_backends`) assert on the telemetry.
+- The admin console scenarios (`space_smoke/console.py`) fail on browser
+  console errors outside an allowlisted baseline. The browser's console is
+  the console's own client-side output, read directly from the page, not a
+  service log.

@@ -64,6 +64,7 @@ from space_smoke.capabilities import (
     SandboxPodView,
     ColdCreatePod,
     ColdCreateSelection,
+    ConsoleApiResponse,
     DrainGateBlocker,
     TerminateAttempt,
     EcwCommandResult,
@@ -1165,6 +1166,8 @@ class KindHarness:
         # The public API autoscaler's bounds before `scale_public_api` pinned
         # them: (name, uid, minReplicas, maxReplicas).
         self._public_api_autoscaler_bounds: tuple[str, str, int, int] | None = None
+        # The operator session the console scenarios' API reads and writes use.
+        self._console_token: str | None = None
 
     def kubectl(
         self,
@@ -4899,6 +4902,62 @@ ON CONFLICT (key_hash) DO NOTHING;
             ),
             "await the Redis rollout",
         )
+
+    # --- admin console ---------------------------------------------------------
+    #
+    # The admin console scenarios (`space_smoke.console`) read and write
+    # through the API the bench's console proxies, as its seeded operator.
+
+    def console_url(self) -> str:
+        self._require_isolated_kind("admin console scenarios")
+        url = self.environment.get("SPACE_SMOKE_CONSOLE_URL") or "http://127.0.0.1:3000"
+        if urlsplit(url).hostname not in {"localhost", "127.0.0.1"}:
+            raise SmokeConfigurationError("the admin console scenarios drive only the bench's own console")
+        return url
+
+    def console_operator_login(self) -> tuple[str, str]:
+        return "root@local", self.environment.get("SPACE_CONSOLE_PASSWORD") or "password"
+
+    def console_api(
+        self,
+        method: str,
+        path: str,
+        body: Mapping[str, object] | None = None,
+        *,
+        idempotency_key: str | None = None,
+    ) -> ConsoleApiResponse:
+        self._require_isolated_kind("admin console scenarios")
+        if not path.startswith(("/admin/api/v1/", "/auth/v1/")):
+            raise ValueError(f"the console API is /admin/api/v1 and /auth/v1, not {path}")
+        token = self._console_token
+        if token is None:
+            token = self._admin_token()
+            self._console_token = token
+        headers = {"Authorization": "Bearer " + token}
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+        if idempotency_key is not None:
+            headers["Idempotency-Key"] = idempotency_key
+        request = Request(
+            self.config.api_url.rstrip("/") + path,
+            method=method,
+            headers=headers,
+            data=None if body is None else json.dumps(body).encode(),
+        )
+        try:
+            with urlopen(request, timeout=30) as response:
+                status, raw = int(response.status), response.read()
+        except HTTPError as error:
+            with error:
+                status, raw = error.code, error.read()
+        except (OSError, HTTPException):
+            # Authentication and transport exceptions may contain the token.
+            raise SmokeConfigurationError(f"console API {method} {path.split('?', 1)[0]} failed") from None
+        try:
+            parsed: Any = json.loads(raw) if raw else None
+        except ValueError:
+            parsed = raw.decode(errors="replace")[:500]
+        return ConsoleApiResponse(status, parsed)
 
     # --- node drain ----------------------------------------------------------
 

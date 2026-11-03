@@ -2898,3 +2898,54 @@ class DrainGateControl(Protocol):
     def attempt_terminate(self, node_id: str) -> TerminateAttempt:
         """POST `:terminate` for that node as an administrator."""
         ...
+
+
+@dataclass(frozen=True)
+class ConsoleApiResponse:
+    """One answer of the API the admin console reads, as its operator sees it."""
+
+    status: int
+    body: Any
+
+
+class ConsoleControl(Protocol):
+    """Operations behind the admin console scenarios (`space_smoke/console.py`).
+
+    Kind-only. The console under test is the bench's own (`space-ui` on its
+    port-forward), and every read and write here goes to the API that console
+    proxies, as the seeded operator: the scenarios' oracle is what that API
+    answers, not what the page shows.
+    """
+
+    def console_url(self) -> str:
+        """The console's origin on this bench."""
+        ...
+
+    def console_operator_login(self) -> tuple[str, str]:
+        """Email and password of the bench's seeded console operator."""
+        ...
+
+    def console_api(
+        self,
+        method: str,
+        path: str,
+        body: Mapping[str, object] | None = None,
+        *,
+        idempotency_key: str | None = None,
+    ) -> ConsoleApiResponse:
+        """One request to `/admin/api/v1/...` or `/auth/v1/...` as the operator.
+
+        An HTTP error status is returned, not raised, so a scenario judges a
+        404 itself; a transport failure raises without the credential. The
+        admin sandbox writes require an `Idempotency-Key`; replaying one
+        answers the operation it first created.
+        """
+        ...
+
+    def sandbox_pods(self, sandbox_id: str) -> list[SandboxPodView]:
+        """The sandbox's execution pods, by its sandbox-id label."""
+        ...
+
+    def reclaim_local_sandbox_everywhere(self, sandbox_id: str) -> None:
+        """Remove a deleted sandbox's node-local rows, which SPACE would reclaim later."""
+        ...

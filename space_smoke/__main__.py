@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from space_smoke.console import browser_unavailable
 from space_smoke.registry import SUBSTRATES, Scenario
 from space_smoke.runtime import SmokeConfigurationError, execute_scenario
 from space_smoke.scenarios import REGISTRY
@@ -46,6 +47,7 @@ def _describe(scenario_id: str) -> int:
         "telemetry_mode": scenario.telemetry_mode,
         "storage_credentials": scenario.storage_credentials,
         "test_hooks": scenario.test_hooks,
+        "browser": scenario.browser,
         "selected_api_surface": os.environ.get("SPACE_SMOKE_API_SURFACE", "ecw"),
         "sandbox": {
             "count": scenario.sandbox_count,
@@ -404,6 +406,14 @@ def _run_all(
         if skipped not in scenarios:
             backends = ", ".join(sorted(skipped.backends))
             print(f"SKIPPED {skipped.id}: runs only on backend(s) {backends}")
+    browser_selection = os.environ.get(BROWSER_SCENARIOS_ENV) or "run"
+    if browser_selection not in BROWSER_SELECTIONS:
+        print(
+            f"ERROR: {BROWSER_SCENARIOS_ENV} must be one of "
+            f"{', '.join(BROWSER_SELECTIONS)}, not {browser_selection!r}",
+            file=sys.stderr,
+        )
+        return 2
     # A misspelt substrate is refused before the bootstrap; on Kind the bench's
     # own substrate is read once it has run (_apply_substrate).
     for variable, substrate in _substrate_requests(backend).items():
@@ -514,6 +524,9 @@ def _run_all(
     telemetry_error = telemetry_error or rust_build_error
     if not scenarios:
         return _mode_emptied(selection, "Rust build", shard, telemetry_error)
+    scenarios = _apply_browser(scenarios, browser_selection)
+    if not scenarios:
+        return _mode_emptied(selection, "browser state", shard, telemetry_error)
 
     environment = dict(os.environ)
     if environment.get("SPACE_SMOKE_BACKEND", "kind") == "kind":
@@ -726,6 +739,42 @@ def _apply_rust_build(
             "the bench runs release binaries"
         )
     return tuple(scenario for scenario in scenarios if scenario.test_hooks is None), None
+
+
+BROWSER_SCENARIOS_ENV = "SPACE_SMOKE_BROWSER_SCENARIOS"
+BROWSER_SELECTIONS = ("run", "withhold")
+
+
+def _apply_browser(scenarios: tuple[Scenario, ...], selection: str) -> tuple[Scenario, ...]:
+    """Skip the scenarios that drive a browser this run cannot or will not launch.
+
+    SPACE_SMOKE_BROWSER_SCENARIOS=withhold leaves them out, as Kind CI does
+    for a pull request that changes no console path
+    (ci/kind-console-paths.txt). Unset or `run`, each browser they declare is
+    launched once, and a scenario whose browser cannot launch is skipped with
+    the reason. Each is printed SKIPPED either way: a skip is not a pass.
+    """
+
+    declared = tuple(scenario for scenario in scenarios if scenario.browser is not None)
+    if not declared:
+        return scenarios
+    if selection == "withhold":
+        for skipped in declared:
+            print(f"SKIPPED {skipped.id}: withheld from this run ({BROWSER_SCENARIOS_ENV}=withhold)")
+        return tuple(scenario for scenario in scenarios if scenario.browser is None)
+    reasons = {
+        browser: browser_unavailable(browser)
+        for browser in sorted({str(scenario.browser) for scenario in declared})
+    }
+    for skipped in declared:
+        reason = reasons[str(skipped.browser)]
+        if reason is not None:
+            print(f"SKIPPED {skipped.id}: needs a {skipped.browser} browser; {reason}")
+    return tuple(
+        scenario
+        for scenario in scenarios
+        if scenario.browser is None or reasons[scenario.browser] is None
+    )
 
 
 def _substrate_requests(backend: str) -> dict[str, str]:

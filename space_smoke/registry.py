@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Generic, TypeVar, cast, get_type_hints
 
 from space_smoke.config import SandboxConfig
+from space_smoke.console import BROWSERS
 from space_smoke.direct_node import DirectNodeRecoveryFixture
 from space_smoke.fixtures import CommandSandboxFixture, Ecw, KindEcw
 from space_smoke.native_hardening import NativeHardeningFixture
@@ -72,6 +73,7 @@ class Scenario(Generic[Fixture]):
     telemetry_mode: str | None
     storage_credentials: str | None
     test_hooks: str | None
+    browser: str | None
     verify: Callable[[Fixture], None]
     source_module: str
 
@@ -111,6 +113,7 @@ def scenario(
     storage_credentials: str | None = None,
     test_hooks: str | None = None,
     substrates: Iterable[str] | None = None,
+    browser: str | None = None,
 ) -> Callable[[Callable[[Fixture], None]], Scenario[Fixture]]:
     """Declare a smoke; its typed parameter selects the prepared fixture.
 
@@ -131,6 +134,10 @@ def scenario(
     none.
     `timeout_minutes` raises the fixture's wall-clock budget for a scenario
     whose own waits outlast it; it never lowers it.
+    `browser` names the browser the scenario drives a web UI through
+    (`space_smoke.console`); implicit selection skips it, visibly, where that
+    browser cannot launch, and withholds it, visibly, when the runner sets
+    SPACE_SMOKE_BROWSER_SCENARIOS=withhold.
     `substrates` narrows the control-plane substrates the fixture serves
     (`FIXTURE_SUBSTRATES`) for what a substrate does not support by contract,
     such as sandbox pods on Direct. A Direct-only defect is not a narrowing:
@@ -190,6 +197,8 @@ def scenario(
         )
     if test_hooks is not None and not test_hooks.strip():
         raise ValueError("smoke test hooks must name the hooks the scenario needs")
+    if browser is not None and browser not in BROWSERS:
+        raise ValueError(f"smoke browser must be one of {', '.join(sorted(BROWSERS))}")
     supported_surfaces = frozenset(api_surfaces)
     if not supported_surfaces or not supported_surfaces <= {"ecw", "native", "node"}:
         raise ValueError("smoke API surfaces must contain ecw, native or node")
@@ -248,6 +257,8 @@ def scenario(
             )
         if storage_credentials is not None and fixture_type is not KindEcw:
             raise TypeError("a storage credentials mode requires the KindEcw fixture")
+        if browser is not None and fixture_type is not KindEcw:
+            raise TypeError("a browser requires the KindEcw fixture")
         fixture_substrates = FIXTURE_SUBSTRATES[fixture_type]
         if narrowed_substrates is not None and not narrowed_substrates < fixture_substrates:
             raise ValueError(
@@ -275,6 +286,7 @@ def scenario(
             telemetry_mode=telemetry_mode,
             storage_credentials=storage_credentials,
             test_hooks=test_hooks,
+            browser=browser,
             verify=verify,
             source_module=verify.__module__,
         )
