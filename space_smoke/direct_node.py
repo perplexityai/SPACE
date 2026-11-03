@@ -242,6 +242,24 @@ class DirectNodeRecoveryFixture:
             raise RuntimeError("no owned recovery sandbox")
         return self.selector
 
+    def verify_agent_template(self) -> None:
+        """Check the pinned input so blocking start proves agent readiness."""
+        output = self.command([
+            "space-tmplmgr", "get", "--template", self.config.template,
+            "--content-hash", self.config.content_hash,
+        ])
+        directory = re.search(r"^template_dir:\s+(\S+)$", output, re.MULTILINE)
+        if directory is None:
+            raise RuntimeError("template lookup did not return its artifact directory")
+        metadata = json.loads(self.command(["sudo", "-n", "cat", directory[1] + "/metadata.json"]))
+        contract = metadata.get("guest_image", {})
+        self.context.verify(
+            contract.get("agent") == "spaced"
+            and contract.get("readiness") == {"kind": "agent"}
+            and contract.get("disk") == "opaque_raw_disk",
+            "native-agent smoke requires an opaque disk with spaced readiness",
+        )
+
     def start(self, *, memory_mib: int | None = None) -> ExecutionObservation:
         arguments = ["space-sbxmgr", "start", self.owned_selector(), "--blocking"]
         if memory_mib is not None:
@@ -522,3 +540,26 @@ class DirectNodeRecoveryFixture:
         """)
         result = json.loads(self.command(["python3", "-c", script, self.owned_selector(), self.config.client_env]))
         self.context.record("rdp_negotiation", result)
+
+    def verify_ssh_banner(self) -> None:
+        """Prove DHCP and the fenced TCP channel without guest credentials."""
+        script = textwrap.dedent("""\
+            import os, select, subprocess, sys, time
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                args = ['sudo', '-n', '/space/bin/space-nodemgr', 'guest-channel', sys.argv[1], '--port', '22']
+                with subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as channel:
+                    try:
+                        ready = select.select([channel.stdout], [], [], min(3, max(0, deadline-time.monotonic())))[0]
+                        if ready and os.read(channel.stdout.fileno(), 255).startswith(b'SSH-2.0-'):
+                            print('SSH banner received through fenced guest channel')
+                            sys.exit(0)
+                    finally:
+                        channel.terminate()
+                        try: channel.wait(timeout=1)
+                        except subprocess.TimeoutExpired: channel.kill(); channel.wait()
+                time.sleep(min(1, max(0, deadline-time.monotonic())))
+            raise RuntimeError('guest SSH banner was not reachable within 30 seconds')
+        """)
+        self.command(["python3", "-c", script, self.owned_selector()], timeout=40)
+        self.context.record("guest_network", "SSH banner through fenced node channel")

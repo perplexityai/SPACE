@@ -2454,8 +2454,18 @@ impl SandboxManagerService {
                 ))
                 .await
         };
-        // Net-gateway only needs the allocated network namespace and sandbox
-        // UID. Start it while node-manager clones/prepares the rootfs, but do
+        // Kernel-configured guests need only the allocated namespace and UID.
+        // DHCP guests also need the persisted image contract so the gateway's
+        // atomic ruleset includes the DHCP exception on its first launch.
+        let (network_contract_ready, wait_for_network_contract) = if sandbox.guest_image.network()
+            == pplx_space_common_core::types::guest_image::GuestNetwork::SlotDhcpV1
+        {
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            (Some(sender), Some(receiver))
+        } else {
+            (None, None)
+        };
+        // Start it while node-manager clones/prepares the rootfs otherwise, but do
         // not wait on gateway process readiness before launching Firecracker.
         // The namespace is fail-closed before TPROXY exists. Pool members do
         // not receive policy until adoption assigns tenant identity. The
@@ -2476,6 +2486,11 @@ impl SandboxManagerService {
             net_gateway_launch_config(&self.feature_flags, &netgtw_sandbox_id);
         let netgtw_task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
             async move {
+                if let Some(ready) = wait_for_network_contract {
+                    ready.await.map_err(|_| {
+                        Status::failed_precondition("guest network contract preparation failed")
+                    })?;
+                }
                 register_net_gateway_launch(
                     &netgtw_db,
                     &netgtw_sandbox_id,
@@ -2495,7 +2510,14 @@ impl SandboxManagerService {
             .in_current_span(),
         ));
 
-        let prepare_response = match prepare_sandbox.await {
+        let prepare_result = prepare_sandbox.await;
+        if let Some(ready) = network_contract_ready
+            && prepare_result.is_ok()
+            && ready.send(()).is_err()
+        {
+            tracing::warn!(sandbox_id = %id, "gateway stopped before network contract was prepared");
+        }
+        let prepare_response = match prepare_result {
             Ok(response) => response.into_inner(),
             Err(e) => {
                 settle_net_gateway_launch_task(netgtw_task, id, "prepare-failed").await;
