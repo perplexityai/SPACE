@@ -23,6 +23,7 @@ import {
   sandboxListQuery,
   scopeChangePlan,
   splitNodeReported,
+  templateFilterOptions,
 } from './sandbox-list.ts';
 
 const sandbox = { id: 'sbx_01a19089-216f-751e-9f56-1906865f5c23', resource_type: 'sandbox' };
@@ -345,4 +346,19 @@ test('node-reported rows are split from the page\'s sandboxes, in order', () => 
   const { sandboxes, nodeReported } = splitNodeReported(rows);
   assert.deepEqual(sandboxes.map((row) => row.id), ['a', 'b']);
   assert.deepEqual(nodeReported.map((row) => row.id), ['p', 'o']);
+});
+
+test('template options are the admin template list, with the loaded and selected ones', () => {
+  const options = templateFilterOptions({
+    admin: ['seed', 'python'], loaded: ['seed', 'retired', null], own: ['mine'], selected: 'linked', typed: '',
+  });
+  assert.deepEqual(options, { names: ['linked', 'python', 'retired', 'seed'], typed: null, partial: false });
+});
+
+test('without the admin template list the options are partial, and a typed name can be chosen', () => {
+  const options = templateFilterOptions({ admin: null, loaded: ['seed'], own: ['mine'], selected: null, typed: ' other-org-template ' });
+  assert.deepEqual(options, { names: ['mine', 'seed'], typed: 'other-org-template', partial: true });
+  // Not one the server would refuse, nor one already listed.
+  assert.equal(templateFilterOptions({ admin: null, loaded: [], own: [], selected: null, typed: 'two words' }).typed, null);
+  assert.equal(templateFilterOptions({ admin: null, loaded: ['seed'], own: [], selected: null, typed: 'seed' }).typed, null);
 });

@@ -58,6 +58,7 @@ import {
   sameScope,
   scopeChangePlan,
   splitNodeReported,
+  templateFilterOptions,
   type Continuation,
   type AgeWindow,
   type CreatedAge,
@@ -680,6 +681,10 @@ function SandboxesPage() {
   const { message } = App.useApp();
   const [sandboxes, setSandboxes] = useState<Sandbox[]>([]);
   const [templates, setTemplates] = useState<Template[]>([]);
+  // The admin template list's names, for the template filter: undefined
+  // while loading, null when it could not be read.
+  const [adminTemplateNames, setAdminTemplateNames] = useState<string[] | null | undefined>(undefined);
+  const [templateSearch, setTemplateSearch] = useState('');
   const { org: authOrg } = useAuth();
   const [orgs, setOrgs] = useState<Organization[]>([]);
   const [loading, setLoading] = useState(true);
@@ -936,6 +941,9 @@ function SandboxesPage() {
 
   useEffect(() => {
     adminApi.get<Organization[]>('/v1/orgs').then(setOrgs).catch(() => setOrgs([]));
+    adminApi.get<Template[]>('/v1/templates')
+      .then((items) => setAdminTemplateNames(items.map((t) => t.name)))
+      .catch(() => setAdminTemplateNames(null));
   }, []);
 
   useEffect(() => {
@@ -1334,16 +1342,23 @@ function SandboxesPage() {
   // notices never read "It belongs to Acme, not Acme".
   const orgNames = useMemo(() => new Map(orgOptionLabels(orgs).map((option) => [option.value, option.label])), [orgs]);
 
-  const templateFilterOptions = useMemo(() => {
-    const set = new Set<string>();
-    for (const s of sandboxes) {
-      if (s.template) set.add(s.template);
-    }
-    for (const t of templates) {
-      set.add(t.name);
-    }
-    return Array.from(set).sort().map((name) => ({ value: name, label: name }));
-  }, [sandboxes, templates]);
+  const templateOptions = useMemo(() => {
+    const options = templateFilterOptions({
+      // Until the admin list answers, the loaded and own templates.
+      admin: adminTemplateNames ?? null,
+      loaded: sandboxes.map((s) => s.template),
+      own: templates.map((t) => t.name),
+      selected: templateFilter,
+      typed: templateSearch,
+    });
+    return {
+      partial: options.partial && adminTemplateNames === null,
+      options: [
+        ...(options.typed ? [{ value: options.typed, label: `Filter on "${options.typed}"` }] : []),
+        ...options.names.map((name) => ({ value: name, label: name })),
+      ],
+    };
+  }, [adminTemplateNames, sandboxes, templates, templateFilter, templateSearch]);
 
   // A paged list filters on the stored lifecycle; a sampled one on the
   // State column, with any other status its rows carry.
@@ -1642,17 +1657,27 @@ function SandboxesPage() {
               </Tooltip>
             ) : null}
           </Space>
-          <Select
-            size="small"
-            placeholder="Template"
-            value={templateFilter ?? undefined}
-            onChange={(value) => setTemplateFilter((value as string | undefined) ?? null)}
-            options={templateFilterOptions}
-            allowClear
-            showSearch={{ optionFilterProp: 'label' }}
-            style={{ minWidth: 160 }}
-            aria-label="Template"
-          />
+          <Space size={2}>
+            <Select
+              size="small"
+              placeholder={templateOptions.partial ? 'Template (partial list)' : 'Template'}
+              value={templateFilter ?? undefined}
+              onChange={(value) => {
+                setTemplateFilter((value as string | undefined) ?? null);
+                setTemplateSearch('');
+              }}
+              options={templateOptions.options}
+              allowClear
+              showSearch={{ optionFilterProp: 'label', onSearch: setTemplateSearch }}
+              style={{ minWidth: 160 }}
+              aria-label="Template"
+            />
+            {templateOptions.partial ? (
+              <Tooltip title="The admin template list could not be read, so these are only the templates of the loaded rows and of your organization. Type a template name to filter on another.">
+                <QuestionCircleOutlined aria-label="About the template list" style={{ color: 'rgba(0, 0, 0, 0.45)' }} />
+              </Tooltip>
+            ) : null}
+          </Space>
           <Space size={2}>
             <Select
               mode="multiple"

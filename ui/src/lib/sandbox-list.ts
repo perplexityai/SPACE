@@ -385,3 +385,33 @@ export function splitNodeReported<T extends { resource_type?: string }>(rows: T[
     nodeReported: rows.filter((row) => row.resource_type !== 'sandbox'),
   };
 }
+
+// The template filter's options. `admin` is the admin template list, every
+// template the server knows, or null when it could not be read; the options
+// are then only the templates of the loaded rows and of the operator's own
+// organization, and `partial` says so. Either way the loaded rows' templates
+// are included, since a row may name a template since deleted, and so is the
+// selected one, and a template name typed into the search can be chosen.
+export function templateFilterOptions({
+  admin,
+  loaded,
+  own,
+  selected,
+  typed,
+}: {
+  admin: string[] | null;
+  loaded: (string | null | undefined)[];
+  own: string[];
+  selected: string | null;
+  typed: string;
+}): { names: string[]; typed: string | null; partial: boolean } {
+  const names = new Set<string>([...(admin ?? own)]);
+  for (const name of loaded) if (name) names.add(name);
+  if (selected) names.add(selected);
+  const search = typed.trim();
+  return {
+    names: [...names].sort(),
+    typed: search && isTemplateName(search) && !names.has(search) ? search : null,
+    partial: admin === null,
+  };
+}
