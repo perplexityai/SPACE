@@ -155,6 +155,27 @@ fn snapshot_pruned_has_domain_name_and_completed_phase() {
 }
 
 #[test]
+fn scheduled_snapshot_gate_events_have_domain_names_and_phases() {
+    // The scheduler's capture gate closing is a failure of the sandbox's
+    // scheduled snapshots; its reopening completes their recovery.
+    for (event_type, name, phase) in [
+        (
+            SandboxEventType::ScheduledSnapshotsBlocked,
+            "scheduled_snapshots_blocked",
+            SandboxEventPhase::Failed,
+        ),
+        (
+            SandboxEventType::ScheduledSnapshotsUnblocked,
+            "scheduled_snapshots_unblocked",
+            SandboxEventPhase::Completed,
+        ),
+    ] {
+        assert_eq!(event_type.as_str(), name);
+        assert_eq!(event_type.phase(), phase);
+    }
+}
+
+#[test]
 fn fork_events_have_domain_names_and_phases() {
     assert_eq!(SandboxEventType::ForkRequested.as_str(), "fork_requested");
     assert_eq!(

@@ -217,6 +217,10 @@ struct SandboxSnapshotState {
     tick_count: u64,
     pending_checkpoint: Option<CheckpointTier>,
     template: String,
+    /// The unowned GC staging under the sandbox's `snapshots/` after its last
+    /// complete retention pass (`retention::prune_and_capture`), or `None`
+    /// before the first.
+    unowned_staging: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -331,6 +335,7 @@ impl SnapshotScheduler {
             tick_count: 0,
             pending_checkpoint: None,
             template,
+            unowned_staging: None,
         });
     }
 
@@ -390,8 +395,10 @@ async fn scheduler_loop(
                 // leave work for the next tick without advancing its cadence.
                 break;
             };
+            let (mut ticked, mut unowned_staging) = (None, None);
             if let Err(e) = run_scheduled_tick(&sandboxes, &id, async |tick, checkpoint| {
-                process_tick(&id, &template, tick, checkpoint, &ctx).await
+                ticked = Some(tick);
+                process_tick(&id, &template, tick, checkpoint, &ctx, &mut unowned_staging).await
             })
             .await
             {
@@ -401,7 +408,11 @@ async fn scheduler_loop(
                     "snapshot scheduler tick failed"
                 );
             }
+            if let Some(tick) = ticked {
+                retention::record_unowned_staging(&sandboxes, &id, tick, unowned_staging).await;
+            }
         }
+        retention::emit_unowned_staging_gauge(&sandboxes).await;
     }
 }
 
@@ -444,6 +455,7 @@ async fn process_tick(
     tick: u64,
     checkpoint_tier: Option<CheckpointTier>,
     ctx: &CheckpointContext,
+    unowned_staging: &mut Option<usize>,
 ) -> Result<CheckpointCompletion, String> {
     let mut node_client = ctx
         .node_manager
@@ -458,21 +470,6 @@ async fn process_tick(
             .map_err(|error| error.to_string())?
             .map(Into::into)
     };
-
-    // This flush belongs to the disk-only snapshots below. A full checkpoint
-    // scheduled later on the same tick performs its own pre-memory preparation.
-    flush_guest_filesystems_via_spaced_host(sandbox_id)
-        .await
-        .map_err(|error| error.to_string())?;
-
-    node_client
-        .sync_guest(SyncGuestRequest {
-            sandbox_id: sandbox_id.to_string(),
-        })
-        .await
-        .map_err(|e| format!("host rootfs sync failed: {e}"))?;
-
-    let ts = snapshot_timestamp(jiff::Timestamp::now());
 
     // Helper: create btrfs disk snapshot + write sidecar
     async fn create_disk_snapshot(
@@ -500,24 +497,41 @@ async fn process_tick(
 
     // Disk snapshots publish under the artifact lock so backup selection never
     // races their creation or their retention deletion; `prune_and_capture`
-    // holds it across both, and deletes the pruned snapshots' staging after
-    // releasing it.
+    // takes it for each, and between them, with it released, deletes the
+    // pruned snapshots' staging and flushes the guest.
     //
     // Retention keeps a pinned, leased or unreadable snapshot and capture goes
     // on, so such snapshots can hold a tier above its `KEEP_*` count. This tick
     // may also add one snapshot per due tier above its retention count; the
-    // next successful prune removes that surplus before creating more. A failed
-    // prune fails the tick before any capture, the full checkpoint included.
-    // A failed staging delete does not: the orphan sweep retries it every
-    // pass, so a persistently failing delete can grow staging until it
-    // succeeds. A bounded gate on that growth follows separately.
-    // Deletions from completed pages remain useful progress on a retry.
-    prune_and_capture(
+    // next successful prune removes that surplus before creating more. A
+    // failed prune, or unowned GC staging at `UNOWNED_STAGING_LIMIT`, fails the
+    // tick before any capture, the full checkpoint included, so a failing
+    // node-manager delete stops growth at a bound instead of adding a snapshot
+    // and its staging every tick. Deletions from completed pages remain useful
+    // progress on a retry.
+    let ts = prune_and_capture(
         &mut node_client,
         ctx,
         sandbox_id,
         CACHE_DIR,
+        tick,
+        unowned_staging,
         async |node_client| {
+            // This flush belongs to the disk-only snapshots below. A full
+            // checkpoint scheduled later on the same tick performs its own
+            // pre-memory preparation.
+            flush_guest_filesystems_via_spaced_host(sandbox_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            node_client
+                .sync_guest(SyncGuestRequest {
+                    sandbox_id: sandbox_id.to_string(),
+                })
+                .await
+                .map_err(|e| format!("host rootfs sync failed: {e}"))?;
+            Ok(snapshot_timestamp(jiff::Timestamp::now()))
+        },
+        async |node_client, ts| {
             // Always create a 1m disk snapshot.
             let disk_1m_name = format!("d-1m-{ts}");
             create_disk_snapshot(

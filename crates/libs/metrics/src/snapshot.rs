@@ -2,6 +2,9 @@
 //!
 //! Names are emitted under
 //! `snapshot.create.*`, `snapshot.restore.*`, and `snapshot.fork_copy.*`.
+//! The on-node snapshot reaper's metrics are under `snapshot.gc.*`, and the
+//! scheduled-snapshot retention gate's under `snapshot.scheduler.*`; neither
+//! carries the codec or encryption dimension below.
 //!
 //! ## Codec dimension
 //!
@@ -515,4 +518,38 @@ pub fn gc_deleted(origin: &str, kind: &str) {
 ///   The artifact stays on disk for the next tick.
 pub fn gc_skipped(reason: &str) {
     counter("snapshot.gc.skipped", 1, &[tag("reason", reason)]);
+}
+
+// ── On-node scheduled snapshots (sandbox-manager's 1-minute scheduler) ──
+
+metric_vocabulary! {
+    /// Why a scheduled tick's retention skipped the disk capture, and the full
+    /// checkpoint due with it.
+    SchedulerCaptureSkip {
+        /// The sandbox's unowned GC staging under `snapshots/` reached the
+        /// scheduler's limit, so captures wait until deletes bring it below.
+        StagingBacklog => "staging_backlog",
+        /// The retention prune failed, so the tick captured nothing.
+        PruneFailed => "prune_failed",
+    }
+}
+
+/// One per scheduled tick whose retention skipped the capture, tagged by
+/// `reason`. The sandbox id is not a tag (unbounded cardinality); the
+/// sandbox-manager log and the `scheduled_snapshots_blocked` sandbox event
+/// carry it.
+pub fn scheduler_capture_skipped(reason: SchedulerCaptureSkip) {
+    counter(
+        "snapshot.scheduler.capture_skipped",
+        1,
+        &[tag("reason", reason)],
+    );
+}
+
+/// Unowned GC staging directories under the `snapshots/` directories of the
+/// node's scheduled sandboxes: the sum of each sandbox's count after its
+/// latest complete retention pass. Emitted once per scheduler pass, including
+/// zero.
+pub fn scheduler_unowned_staging(count: usize) {
+    gauge("snapshot.scheduler.unowned_staging", count as f64, &[]);
 }
