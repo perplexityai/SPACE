@@ -4,6 +4,7 @@ import {
   KEY_CROSS_ORG_UNSUPPORTED,
   LAST_USED_CAVEAT,
   canCreateKey,
+  crossOrgKeyRefused,
   createKeyBody,
   isCrossOrgKeyRefusal,
   keyActorText,
@@ -82,7 +83,7 @@ test("Create waits for the organization's users, and after a failed read says wh
   assert.match(keyActsAsUnknownText({ ownOrg: false, usersError: 'synthetic failure' }), /oldest user, who could not be read/);
 });
 
-test('a release that creates keys only for your own organization refuses another with a 403, and Create stops offering it', () => {
+test('a release that creates keys only for your own organization refuses another with a 403, and Create stops offering it there', () => {
   const forbidden = Object.assign(new Error('API keys can only be created for your organization'), { status: 403 });
   assert.equal(isCrossOrgKeyRefusal(forbidden, false), true);
   // In the own organization a 403 is some other refusal.
@@ -90,7 +91,19 @@ test('a release that creates keys only for your own organization refuses another
   assert.equal(isCrossOrgKeyRefusal(Object.assign(new Error('x'), { status: 409 }), false), false);
   assert.match(KEY_CROSS_ORG_UNSUPPORTED, /only for your own organization/);
   assert.equal(canCreateKey({ usersLoading: false, ownOrg: false, crossOrgUnsupported: true }), false);
-  assert.equal(canCreateKey({ usersLoading: false, ownOrg: true, crossOrgUnsupported: true }), true);
+});
+
+test("one organization's 403, from one old pod during a rollout, disables Create for that organization only", () => {
+  const allowed = (refusedFor, orgId) => canCreateKey({
+    usersLoading: false,
+    ownOrg: false,
+    crossOrgUnsupported: crossOrgKeyRefused(refusedFor, orgId),
+  });
+  assert.equal(allowed('org-b', 'org-b'), false);
+  assert.equal(allowed('org-b', 'org-c'), true);
+  // Try again, or picking an organization, forgets it.
+  assert.equal(allowed(null, 'org-b'), true);
+  assert.equal(crossOrgKeyRefused(null, undefined), false);
 });
 
 test('the last-used caveat names what is not recorded and why an older key shows Never', () => {

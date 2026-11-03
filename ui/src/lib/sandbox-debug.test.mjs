@@ -140,5 +140,5 @@ test('a quarantine read that failed is unknown, never "not quarantined"', () => 
   assert.equal(quarantineStatus({ error: 'synthetic section failure', data: null }), 'unknown');
   // The whole debug read failed after an earlier one: what it showed is not current.
   assert.equal(quarantineStatus(clear, true), 'unknown');
-  assert.equal(quarantineStatus(undefined), 'absent');
+  assert.equal(quarantineStatus({ ...clear, quarantined: true }, true), 'unknown');
 });

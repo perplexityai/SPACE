@@ -29,6 +29,7 @@ import {
   KEY_USER_CHOICE_UNSUPPORTED,
   canCreateKey,
   createKeyBody,
+  crossOrgKeyRefused,
   isCrossOrgKeyRefusal,
   keyActorText,
   keyActsAs,
@@ -80,9 +81,11 @@ function ApiKeysPageContent() {
   // The created key with the organization and user it was created for, as
   // the dialog that shows its secret names them.
   const [created, setCreated] = useState<{ key: CreatedApiKey; orgName: string; actsAs: string } | null>(null);
-  // This API release refused a key for another organization (403): it
-  // creates keys only for the operator's own.
-  const [crossOrgUnsupported, setCrossOrgUnsupported] = useState(false);
+  // The organization a create was refused for with the 403 a release that
+  // creates keys only for the operator's own answers (`crossOrgKeyRefused`).
+  const [crossOrgRefusedFor, setCrossOrgRefusedFor] = useState<string | null>(null);
+  // Picking an organization asks the API afresh, also for the refused one.
+  useEffect(() => setCrossOrgRefusedFor(null), [orgId]);
   const [reloadUsers, setReloadUsers] = useState(0);
   const [form] = Form.useForm<CreateApiKeyValues>();
   const chosenUserId = Form.useWatch('user_id', form);
@@ -164,6 +167,7 @@ function ApiKeysPageContent() {
     ? keyActsAs({ orgId, caller: signedInUser, users: orgUsers, chosenUserId })
     : null;
   const usersLoading = !!orgId && orgUsers === null && orgUsersError === null;
+  const crossOrgUnsupported = crossOrgKeyRefused(crossOrgRefusedFor, orgId);
   const createAllowed = canCreateKey({ usersLoading, ownOrg, crossOrgUnsupported });
   const actsAsExtra = !ownOrg && crossOrgUnsupported
     ? KEY_CROSS_ORG_UNSUPPORTED
@@ -195,7 +199,7 @@ function ApiKeysPageContent() {
       message.success('API key created');
     } catch (error) {
       if (isCrossOrgKeyRefusal(error, ownOrg)) {
-        setCrossOrgUnsupported(true);
+        setCrossOrgRefusedFor(orgId);
         message.error(KEY_CROSS_ORG_UNSUPPORTED);
       } else if (isUnknownFieldRejection(error, 'user_id')) {
         message.error(KEY_USER_CHOICE_UNSUPPORTED);
@@ -333,6 +337,11 @@ function ApiKeysPageContent() {
                 {orgUsersError ? (
                   <Button type="link" size="small" style={{ padding: 0 }} onClick={() => setReloadUsers((value) => value + 1)}>
                     Retry
+                  </Button>
+                ) : null}
+                {crossOrgUnsupported ? (
+                  <Button type="link" size="small" style={{ padding: 0 }} onClick={() => setCrossOrgRefusedFor(null)}>
+                    Try again
                   </Button>
                 ) : null}
               </Space>

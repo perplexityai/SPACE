@@ -112,6 +112,14 @@ export function isCrossOrgKeyRefusal(err: unknown, ownOrg: boolean): boolean {
 
 export const KEY_CROSS_ORG_UNSUPPORTED = 'This API version creates keys only for your own organization.';
 
+// Whether that 403 holds for `orgId`. It is one API pod's answer for one
+// organization: during a rollout another pod may create the key. So it
+// disables Create for the organization it was answered for only, and the page
+// forgets it when the operator tries again or picks an organization.
+export function crossOrgKeyRefused(refusedFor: string | null, orgId: string | null | undefined): boolean {
+  return Boolean(orgId) && refusedFor === orgId;
+}
+
 // Who an existing key acts as, from its `created_by`: that user, or, once the
 // user was deleted (`created_by` is set to NULL), the organization's oldest
 // user, whom every release resolves such a key to.
