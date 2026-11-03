@@ -794,8 +794,10 @@ function SandboxesPage() {
   // between them starts both over. A hidden tab sends nothing, and the first
   // bare array after it starts the minute over (`MISMATCH_RUN_GAP_MS`).
   const [listStopped, setListStopped] = useState(false);
-  // The last answers included a bare array to a paged request, as during a
-  // rolling deploy; the rows on screen are kept while the list retries.
+  // The list's last answer was a bare array to a paged request, as during a
+  // rolling deploy; the rows on screen are kept while the list retries. A
+  // failed request leaves it as it was, and the prefix search's answers,
+  // which its section reports, do not change it.
   const [olderFormat, setOlderFormat] = useState(false);
   // A full identifier that matches no loaded row is looked up directly, so a
   // sandbox outside the loaded rows can still be found.
@@ -887,7 +889,8 @@ function SandboxesPage() {
     if (result.kind === 'skipped') throw new RefreshSkipped(SCOPE_CHANGED);
     setLoading(false);
     selectionChanged();
-    setOlderFormat(selection.mismatches > 0);
+    if (result.kind === 'shown') setOlderFormat(false);
+    else if (result.kind === 'failed' && result.error instanceof OlderFormatAnswer) setOlderFormat(true);
     if (result.kind === 'stopped') {
       stopList(result.kept);
       throw new ShownListError(VERSION_CHANGED);
@@ -1367,7 +1370,6 @@ function SandboxesPage() {
           // A bare array counts toward stopping the list, as one answering
           // the list does, and fails this refresh of the section.
           const note = selection.noteAnswer('paged', response.mode, sentAt);
-          setOlderFormat(selection.mismatches > 0);
           if (note.kind === 'stopped') return stopList(note.kept);
           // Not sent before then; should it answer first, it fails this refresh.
           if (note.kind === 'undecided') throw new Error('the list has not loaded yet; retrying');
