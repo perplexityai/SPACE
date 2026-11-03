@@ -160,10 +160,12 @@ Each block runs one variant, with one template, for `--block-minutes`:
    command returning, timed on the operator machine. The guest pattern is then
    re-hashed (`verify_ms`, untimed). Bystanders run `true` every
    `--probe-interval-s` (foreground metric F1).
-5. After the block, every worker is schedulable again. The harness reads the
-   sandbox-manager `runtime_activated` events and records where each restore
-   landed and whether it downloaded its snapshot (`wake_placement` rows). Then
-   it deletes the block's sandboxes.
+5. During the block, the harness polls the sandbox-manager logs for
+   `runtime_activated` events every `--activation-interval-s`, so log rotation
+   in long blocks cannot drop them. After the block, every worker is
+   schedulable again. A final poll completes the set, and the harness records
+   where each restore landed and whether it downloaded its snapshot
+   (`wake_placement` rows). Then it deletes the block's sandboxes.
 
 The harness only cordons nodes listed in `--nodes`. It refuses to start if one
 of them is already cordoned. It writes `cordon.state` before cordoning a node,
