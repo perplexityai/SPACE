@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
+import { mock, test } from 'node:test';
 import {
   FIRST_PAGE,
   ListRequests,
@@ -95,10 +95,17 @@ test('a sampled request is the first page at the sample size, with the org only'
 
 test('a relative created bound is computed when each request is sent, and does not change the scope', () => {
   const filters = { ...NO_FILTERS, createdWithin: '1h' };
-  const scope = listScope('paged', filters, { limit: 50, cursor: '' });
-  // The same view a tab's age later: a poll rereads it rather than starting
-  // a new view on page 1.
-  assert.ok(sameScope(scope, listScope('paged', { ...filters }, { limit: 50, cursor: '' })));
+  mock.timers.enable({ apis: ['Date'], now: NOW });
+  let scope;
+  try {
+    scope = listScope('paged', filters, { limit: 50, cursor: '' });
+    // The same view a tab's age later: a poll rereads it rather than
+    // starting a new view on page 1.
+    mock.timers.tick(3 * HOUR);
+    assert.ok(sameScope(scope, listScope('paged', { ...filters }, { limit: 50, cursor: '' })));
+  } finally {
+    mock.timers.reset();
+  }
   assert.equal(parse(listRequestQuery(scope, NOW)).created_after, '2026-11-03T11:00:00.000Z');
   assert.equal(parse(listRequestQuery(scope, NOW + 3 * HOUR)).created_after, '2026-11-03T14:00:00.000Z');
   const older = listScope('paged', { ...NO_FILTERS, olderThan: '24h' }, { limit: 50, cursor: '' });
