@@ -754,8 +754,8 @@ class XnodeBenchmark:
                 try:
                     out = self.retry_connect(block, lambda: self.ecw.run(handle, setup, timeout=a.guest_timeout_s))
                 except Exception as exc:
-                    if not is_connect_error(exc):
-                        raise
+                    # One sandbox's setup failing must not end the run; block cleanup
+                    # deletes it, as for a failed create.
                     block.bump("setup_failures")
                     sbx.state = "failed"
                     self.log(f"WARNING: setup failed: {exc}")

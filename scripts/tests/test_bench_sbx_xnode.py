@@ -233,10 +233,10 @@ class ConnectError(Exception):
 class FlakyEcw(FakeEcw):
     """Refuses the first connection of each kind, then behaves."""
 
-    def __init__(self, kube, *, create_error=None):
+    def __init__(self, kube, *, create_error=None, setup_error=None):
         super().__init__(kube)
         self.create_errors = [create_error or ConnectError("connection refused")]
-        self.setup_errors = [ConnectError("connection reset")]
+        self.setup_errors = [setup_error or ConnectError("connection reset")]
 
     def create(self, template, metadata):
         with self.lock:
@@ -325,6 +325,13 @@ class FakeRunTests(unittest.TestCase):
             block = xnode.Block(1, "baseline", "t-base")
             self.assertEqual(len(bench.create_sandboxes(block, 0, 2, seed=1)), 1)
             self.assertEqual(block.counters, {"create_failures": 1})
+
+            # Any other setup error fails that sandbox instead of ending the run.
+            bench.ecw = FlakyEcw(kube, create_error=ConnectError("refused"), setup_error=TimeoutError("guest timed out"))
+            block = xnode.Block(2, "baseline", "t-base")
+            created = bench.create_sandboxes(block, 2, 0, seed=1)
+            self.assertEqual(sorted(s.state for s in created), ["failed", "running"])
+            self.assertEqual(block.counters, {"connect_retries": 1, "setup_failures": 1})
 
     def test_preflight_refuses_already_cordoned_pool_node(self):
         with tempfile.TemporaryDirectory() as tmp:
