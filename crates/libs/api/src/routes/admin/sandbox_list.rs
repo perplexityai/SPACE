@@ -368,23 +368,11 @@ pub async fn list_sandboxes(
             next_cursor,
         })
         .into_response(),
-        // A known remainder, in two halves, neither of which is useful
-        // without the other.
-        //
-        // `list_responses` reaches `responses::fetch_sandbox_observed_states`
-        // and `fetch_observed_only_sandboxes`, both of which erase the
-        // SQLSTATE into `ControllerError::internal` — so no contention
-        // identity exists to honour here yet. And this arm flattens the
-        // `ControllerError` to a 500 regardless of the status it carried, so
-        // classifying those reads alone would not surface it either.
-        //
-        // Adding an `is_lock_contention()` check here today would be a guard
-        // for a state nothing produces. Projection needs to preserve the
-        // database error identity, and this handler must also preserve the
-        // resulting status. These are independent fixes: classification
-        // recovers contention identity, while flattening discards every status,
-        // not just contention. Neither alone makes this path retryable.
-        // Same shape on `sandboxes::get_sandbox`.
+        // The projection reads (`responses::fetch_sandbox_observed_states`
+        // and `fetch_observed_only_sandboxes`) keep a contention SQLSTATE
+        // through `db_contention_error`, and `controller_read_error` answers
+        // it as a retryable 503; anything else is a 500. Same shape on
+        // `sandboxes::get_sandbox`.
         Err(error) => support::controller_read_error(&error, || {
             tracing::warn!(%error, "admin sandbox response projection failed");
         }),
