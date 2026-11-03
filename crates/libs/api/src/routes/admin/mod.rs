@@ -60,8 +60,9 @@ mod sandboxes;
 // handlers render `{"error", "operation_id", "retryable"}`; `identity` a
 // `{"error": …}` that every 409 extends with a `reason` (a user or
 // organization delete's blocker, an email in use, or a self-mutation; and,
-// for a user held only by deleted sandboxes, `retained_until`), never named
-// `code`, which in the envelope is the status category; the rest a bare
+// for a user held only by deleted sandboxes or an organization held only by
+// deleted templates whose retention end is known, `retained_until`), never
+// named `code`, which in the envelope is the status category; the rest a bare
 // `{"error": …}` with no retry field. `Retry-After` comes only from the two
 // paths that answer through `PublicApiError` — this layer, and
 // `create_command`, which has two — its sandbox lookup through

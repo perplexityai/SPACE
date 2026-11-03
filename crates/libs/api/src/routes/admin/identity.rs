@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 use super::super::authz;
 use super::support;
+use super::template_store::OrgTemplateRows;
 use crate::{
     auth::hash_password,
     middleware::auth::AuthUser,
@@ -143,10 +144,19 @@ impl IntoResponse for IdentityAdminError {
         if let Some(reason) = self.reason() {
             body.insert("reason".to_string(), reason.into());
         }
-        if let Self::StillOwns(UserDeleteBlocker::DeletedSandboxes { retained_until }) = &self {
+        let retained_until = match &self {
+            Self::StillOwns(UserDeleteBlocker::DeletedSandboxes { retained_until }) => {
+                Some(*retained_until)
+            }
+            Self::OrgNotEmpty(OrgDeleteBlocker::DeletedTemplates { retained_until }) => {
+                *retained_until
+            }
+            _ => None,
+        };
+        if let Some(retained_until) = retained_until {
             body.insert(
                 "retained_until".to_string(),
-                format_rfc3339(*retained_until).into(),
+                format_rfc3339(retained_until).into(),
             );
         }
         (status, Json(body)).into_response()
@@ -236,7 +246,8 @@ impl UserDeleteBlocker {
 /// references `organizations` with no `ON DELETE` action or `RESTRICT`, or
 /// that restricts the delete of a row the organization's delete cascades to.
 /// API keys, credentials, operations and the other rows that reference
-/// `organizations` with `ON DELETE CASCADE` go with the organization.
+/// `organizations` with `ON DELETE CASCADE` go with the organization, and its
+/// child organizations are detached (`parent_id` is set to `NULL`).
 ///
 /// When several kinds remain, the error names the first one the database
 /// checks; the next delete names the next.
@@ -252,8 +263,22 @@ pub(super) enum OrgDeleteBlocker {
     /// `sandbox_archives.org_id` (`ON DELETE RESTRICT`).
     ArchivedSandboxes,
     /// `templates.org_id`, and the encrypted-field rows of the organization's
-    /// templates and template releases through its master key.
+    /// templates and template releases through its master key, while at least
+    /// one of its templates is not deleted.
     Templates,
+    /// The same rows when every template is deleted: tombstone retention
+    /// keeps a deleted template's row, which the template routes no longer
+    /// show, until about `retained_until`, or with no time to name while a
+    /// node still caches it.
+    DeletedTemplates {
+        retained_until: Option<OffsetDateTime>,
+    },
+    /// `snapshot_storage_location_encrypted_fields_kek_fkey` once the
+    /// organization has no sandbox rows left: a snapshot storage location its
+    /// deleted snapshots left behind, still encrypted under its master key.
+    /// The snapshot storage sweeper does not remove encrypted locations, so
+    /// neither deleting sandboxes nor waiting clears it.
+    OrphanedSnapshotStorage,
     /// `node_groups.org_id`.
     NodeGroups,
     /// `clusters.managing_org_id` (`ON DELETE RESTRICT`). The handler refuses
@@ -265,6 +290,8 @@ pub(super) enum OrgDeleteBlocker {
 impl OrgDeleteBlocker {
     /// The blocker named by a foreign-key violation from
     /// `DELETE FROM organizations`, or `None` for any other database error.
+    /// [`Self::refine`] then tells apart the cases the constraint alone does
+    /// not.
     fn from_delete_error(error: &sqlx::Error) -> Option<Self> {
         let sqlx::Error::Database(db) = error else {
             return None;
@@ -276,8 +303,10 @@ impl OrgDeleteBlocker {
             "users_org_id_fkey" => Some(Self::Users),
             "sandboxes_org_id_fkey"
             | "sandbox_encrypted_fields_master_key_id_org_id_fkey"
-            | "sandbox_volume_encryption_master_key_id_org_id_fkey"
-            | "snapshot_storage_location_encrypted_fields_kek_fkey" => Some(Self::Sandboxes),
+            | "sandbox_volume_encryption_master_key_id_org_id_fkey" => Some(Self::Sandboxes),
+            "snapshot_storage_location_encrypted_fields_kek_fkey" => {
+                Some(Self::OrphanedSnapshotStorage)
+            }
             "sandbox_archives_org_id_fkey" => Some(Self::ArchivedSandboxes),
             "templates_org_id_fkey"
             | "template_encrypted_fields_master_key_id_org_id_fkey"
@@ -290,43 +319,99 @@ impl OrgDeleteBlocker {
         }
     }
 
+    /// Refine [`Self::Templates`] to [`Self::DeletedTemplates`] when every
+    /// template row still holding the organization is deleted, so the
+    /// operator is told to wait out retention rather than delete templates
+    /// the template routes no longer show. Refine
+    /// [`Self::OrphanedSnapshotStorage`] to [`Self::Sandboxes`] while the
+    /// organization still has sandbox rows: the location may belong to one
+    /// of their snapshots, and they have to go first in any case.
+    async fn refine(self, state: &AppState, org_id: OrgId) -> Result<Self, IdentityAdminError> {
+        match self {
+            Self::Templates => Ok(
+                match super::template_store::org_template_rows(&state.pool, org_id).await? {
+                    OrgTemplateRows::DeletedOnly { retained_until } => {
+                        Self::DeletedTemplates { retained_until }
+                    }
+                    // `None`: the rows went between the delete and this read;
+                    // the operator's retry then succeeds or names the next.
+                    OrgTemplateRows::Live | OrgTemplateRows::None => Self::Templates,
+                },
+            ),
+            Self::OrphanedSnapshotStorage => {
+                let has_sandboxes =
+                    pplx_space_sandbox_store::org_has_sandbox_rows(&state.pool, org_id)
+                        .await
+                        .map_err(
+                            |pplx_space_sandbox_store::SandboxStoreError::Database(error)| {
+                                IdentityAdminError::from(error)
+                            },
+                        )?;
+                Ok(if has_sandboxes { Self::Sandboxes } else { self })
+            }
+            Self::Users
+            | Self::Sandboxes
+            | Self::ArchivedSandboxes
+            | Self::DeletedTemplates { .. }
+            | Self::NodeGroups
+            | Self::ManagesCluster => Ok(self),
+        }
+    }
+
     const fn reason(self) -> &'static str {
         match self {
             Self::Users => "org_has_users",
             Self::Sandboxes => "org_has_sandboxes",
             Self::ArchivedSandboxes => "org_has_archived_sandboxes",
             Self::Templates => "org_has_templates",
+            Self::DeletedTemplates { .. } => "org_has_retained_deleted_templates",
+            Self::OrphanedSnapshotStorage => "org_has_orphaned_snapshot_storage",
             Self::NodeGroups => "org_has_node_groups",
             Self::ManagesCluster => "org_manages_cluster",
         }
     }
 
-    const fn message(self) -> &'static str {
+    fn message(self) -> String {
         match self {
-            Self::Users => {
-                "organization still has users; delete them or move them to another \
-                 organization before deleting the organization"
-            }
-            Self::Sandboxes => {
-                "organization still has sandboxes, including deleted ones whose records are \
-                 kept for retention; delete them, or wait out retention, before deleting the \
-                 organization"
-            }
-            Self::ArchivedSandboxes => {
-                "organization still has archived sandboxes; they must be purged before the \
-                 organization can be deleted"
-            }
-            Self::Templates => {
-                "organization still owns templates; delete them before deleting the organization"
-            }
-            Self::NodeGroups => {
-                "organization still owns node groups; delete them before deleting the \
-                 organization"
-            }
-            Self::ManagesCluster => {
-                "organization manages the cluster; make another organization the managing \
-                 organization before deleting it"
-            }
+            Self::Users => "organization still has users; delete them or move them to another \
+                            organization before deleting the organization"
+                .to_string(),
+            Self::Sandboxes => "organization still has sandboxes, including deleted ones whose \
+                                records are kept for retention; delete them, or wait out \
+                                retention, before deleting the organization"
+                .to_string(),
+            Self::ArchivedSandboxes => "organization still has archived sandboxes; they must be \
+                                        purged before the organization can be deleted"
+                .to_string(),
+            Self::Templates => "organization still owns templates; delete them before deleting \
+                                the organization"
+                .to_string(),
+            Self::DeletedTemplates {
+                retained_until: Some(retained_until),
+            } => format!(
+                "organization's templates are all deleted, but their records are kept for \
+                 retention until about {}; retry the delete after that",
+                format_rfc3339(retained_until)
+            ),
+            Self::DeletedTemplates {
+                retained_until: None,
+            } => "organization's templates are all deleted, but their records are kept until \
+                  retention ends and no node still caches them; retry the delete later"
+                .to_string(),
+            Self::OrphanedSnapshotStorage => "organization has no sandboxes left, but its master \
+                                              key still encrypts snapshot storage locations its \
+                                              deleted snapshots left behind, which the snapshot \
+                                              storage sweeper does not remove; they must be \
+                                              purged before the organization can be deleted"
+                .to_string(),
+            Self::NodeGroups => "organization still owns node groups; release each one with \
+                                 :assign-org and a null org_id, or delete it once it has no \
+                                 nodes (relabel or retire them first), before deleting the \
+                                 organization"
+                .to_string(),
+            Self::ManagesCluster => "organization manages the cluster; make another \
+                                     organization the managing organization before deleting it"
+                .to_string(),
         }
     }
 }
@@ -548,11 +633,18 @@ pub(super) async fn delete_org(
     let result = sqlx::query(sql!("DELETE FROM organizations WHERE id = $1"))
         .bind(org_id)
         .execute(&state.pool)
-        .await
-        .map_err(|error| match OrgDeleteBlocker::from_delete_error(&error) {
-            Some(blocker) => IdentityAdminError::OrgNotEmpty(blocker),
-            None => IdentityAdminError::from(error),
-        })?;
+        .await;
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            return Err(match OrgDeleteBlocker::from_delete_error(&error) {
+                Some(blocker) => {
+                    IdentityAdminError::OrgNotEmpty(blocker.refine(&state, org_id).await?)
+                }
+                None => IdentityAdminError::from(error),
+            });
+        }
+    };
     if result.rows_affected() == 0 {
         return Err(IdentityAdminError::NotFound);
     }
