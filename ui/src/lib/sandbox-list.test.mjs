@@ -6,6 +6,7 @@ import {
   ListSelection,
   OlderFormatAnswer,
   STOP_AFTER_MISMATCHES,
+  STOP_AFTER_MISMATCH_MS,
   isTemplateName,
   NO_FILTERS,
   continuationFor,
@@ -255,8 +256,13 @@ function pendingRead() {
 }
 
 const page = (nextCursor, rows = [sandbox]) => ({ mode: 'paged', sandboxes: rows, nextCursor });
-const newSelection = (filters = {}) =>
-  new ListSelection({ filters: { ...NO_FILTERS, ...filters }, pageSize: 50, sampleSize: 1000 });
+// A clock the test moves; a selection made without one reads a fixed time.
+function testClock() {
+  let at = 0;
+  return { now: () => at, advance: (ms) => { at += ms; } };
+}
+const newSelection = (filters = {}, clock = testClock()) =>
+  new ListSelection({ filters: { ...NO_FILTERS, ...filters }, pageSize: 50, sampleSize: 1000, now: clock.now });
 
 test('Next follows the page shown, and a failed load of another page leaves it off until a page answers', async () => {
   const selection = newSelection({ template: 'alpha' });
@@ -401,35 +407,81 @@ test('a bare array on a refresh of a paged list fails it, keeping its rows and N
   assert.equal(paged.mismatches, 0);
 });
 
-test(`${STOP_AFTER_MISMATCHES} bare arrays in a row stop a paged list, and any page between them resets the count`, async () => {
-  const selection = newSelection({ template: 'alpha' });
+// The refresh after a bare array comes on the next one-second check, and
+// the one after a page when the view is stale again.
+const RETRY_MS = 1_000;
+const POLL_MS = 10_000;
+
+test('a paged list stops only once bare arrays alone have answered for the window', async () => {
+  const clock = testClock();
+  const selection = newSelection({ template: 'alpha' }, clock);
   await selection.load(selection.selected, reads(page('c1')).read);
   const pageOne = selection.selected;
-  // Replicas of both versions answer in turn.
-  for (const answer of [sampledAnswer, page('c1'), sampledAnswer, sampledAnswer, page('c1'), sampledAnswer, sampledAnswer]) {
-    const result = await selection.load(pageOne, reads(answer).read);
-    if (answer.mode === 'paged') assert.equal(result.kind, 'shown');
-    else assertOlderFormat(result, true);
+  // Every replica is old: each refresh is retried a second later.
+  const firstMismatch = clock.now();
+  while (clock.now() - firstMismatch < STOP_AFTER_MISMATCH_MS) {
+    assertOlderFormat(await selection.load(pageOne, reads(sampledAnswer).read), true);
     assert.equal(selection.stopped, false);
-    assert.equal(sameScope(selection.shown, pageOne), true);
+    assert.equal(selection.nextCursor(), 'c1');
+    clock.advance(RETRY_MS);
   }
-  assert.equal(selection.mismatches, STOP_AFTER_MISMATCHES - 1);
-  // A third in a row: the API no longer pages. The rows stay, without Next.
+  // The answer a full window after the first: the API no longer pages. The
+  // rows stay, without Next.
   assert.deepEqual(await selection.load(pageOne, reads(sampledAnswer).read), { kind: 'stopped', kept: true });
   assert.equal(sameScope(selection.shown, pageOne), true);
   await assertStaysStopped(selection, true);
+
+  // A window with fewer than `STOP_AFTER_MISMATCHES` answers in it does not
+  // stop the list; the next one does.
+  const sparse = newSelection({ template: 'alpha' }, clock);
+  await sparse.load(sparse.selected, reads(page(null)).read);
+  for (let i = 1; i < STOP_AFTER_MISMATCHES; i += 1) {
+    assertOlderFormat(await sparse.load(sparse.selected, reads(sampledAnswer).read), true);
+    clock.advance(STOP_AFTER_MISMATCH_MS);
+  }
+  assert.equal(sparse.stopped, false);
+  assert.deepEqual(await sparse.load(sparse.selected, reads(sampledAnswer).read), { kind: 'stopped', kept: true });
+});
+
+test('interleaved old and new answers over several minutes never stop a paged list', async () => {
+  // Each pattern repeats for ten minutes: old and new in turn, and runs of
+  // bare arrays that last just under the window before a page answers.
+  const almostWindow = [...Array(STOP_AFTER_MISMATCH_MS / RETRY_MS).fill(sampledAnswer), page('c1')];
+  for (const pattern of [[sampledAnswer, page('c1')], [sampledAnswer, sampledAnswer, sampledAnswer, page('c1')], almostWindow]) {
+    const clock = testClock();
+    const selection = newSelection({ template: 'alpha' }, clock);
+    await selection.load(selection.selected, reads(page('c1')).read);
+    const pageOne = selection.selected;
+    let answers = 0;
+    while (clock.now() < 10 * 60_000) {
+      const answer = pattern[answers % pattern.length];
+      answers += 1;
+      const result = await selection.load(pageOne, reads(answer).read);
+      if (answer.mode === 'paged') assert.equal(result.kind, 'shown');
+      else assertOlderFormat(result, true);
+      assert.equal(selection.stopped, false);
+      assert.equal(sameScope(selection.shown, pageOne), true);
+      assert.equal(selection.nextCursor(), 'c1');
+      clock.advance(answer.mode === 'paged' ? POLL_MS : RETRY_MS);
+    }
+    assert.ok(answers > 100);
+  }
 });
 
 test('a bare array answering the prefix search counts toward stopping the list', async () => {
-  const selection = newSelection();
+  const clock = testClock();
+  const selection = newSelection({}, clock);
   await selection.load(selection.selected, reads(page('c1')).read);
   assertOlderFormat(await selection.load(selection.selected, reads(sampledAnswer).read), true);
+  clock.advance(STOP_AFTER_MISMATCH_MS);
   assert.deepEqual(selection.noteAnswer('paged', 'sampled'), { kind: 'mismatched' });
-  // A page for the prefix search resets the count, as one for the list does.
+  // A page for the prefix search starts the window over, as one for the list does.
   assert.deepEqual(selection.noteAnswer('paged', 'paged'), { kind: 'counted' });
   assert.equal(selection.mismatches, 0);
   assertOlderFormat(await selection.load(selection.selected, reads(sampledAnswer).read), true);
   assert.deepEqual(selection.noteAnswer('paged', 'sampled'), { kind: 'mismatched' });
+  clock.advance(STOP_AFTER_MISMATCH_MS);
+  // The prefix search's answer a window after the list's first bare array.
   assert.deepEqual(selection.noteAnswer('paged', 'sampled'), { kind: 'stopped', kept: true });
   await assertStaysStopped(selection, true);
 });
