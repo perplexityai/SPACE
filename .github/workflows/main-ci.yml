@@ -324,8 +324,11 @@ jobs:
             echo "::warning::Could not log in to GHCR; its reads fall back to their sources"
           fi
 
+      # Keeps rustc's incremental data, as kind-ci.yml's restore expects.
       - name: Name the Kind Rust build state
         id: state-key
+        env:
+          SPACE_KIND_RUST_INCREMENTAL_CODEGEN: "1"
         run: bash infra/space/kind/scripts/rust-state-cache.sh key
 
       - name: Build the Rust artifacts cold in incremental mode
@@ -334,6 +337,7 @@ jobs:
         env:
           SPACE_CI_IMAGE_MIRROR: ghcr
           SPACE_KIND_RUST_ARTIFACTS: incremental
+          SPACE_KIND_RUST_INCREMENTAL_CODEGEN: "1"
           SPACE_KIND_BUILD_CACHE_REPOSITORY: ghcr.io/perplexityai/space-kind-build-cache
           SPACE_KIND_RUST_TARGET_DIR: ${{ runner.temp }}/kind-rust-state/target
           SPACE_KIND_RUST_SRC_DIR: ${{ runner.temp }}/kind-rust-state/src
