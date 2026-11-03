@@ -37,4 +37,7 @@ test('the lookup notice says whose sandbox it is under an org filter', () => {
   assert.equal(lookupScopeText({ org_id: 'b' }, 'a', name, 1000), 'It belongs to Globex, not Acme.');
   assert.equal(lookupScopeText({ org_id: 'c' }, 'a', name, 1000), 'It belongs to another organization, not Acme.');
   assert.equal(lookupScopeText({ org_id: null }, 'a', name, 1000), 'It belongs to no organization, not Acme.');
+  assert.equal(lookupScopeText({ org_id: 'a' }, null, name, null), 'It is not on the page of sandboxes loaded below.');
+  assert.equal(lookupScopeText({ org_id: 'a' }, 'a', name, null), 'It is not on the page of sandboxes of Acme loaded below.');
+  assert.equal(lookupScopeText({ org_id: 'b' }, 'a', name, null), 'It belongs to Globex, not Acme.');
 });

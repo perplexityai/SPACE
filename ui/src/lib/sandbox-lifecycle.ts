@@ -21,6 +21,22 @@ export const SANDBOX_STATUS_FILTER_STATES = [
   ...SANDBOX_LIFECYCLE_STATES, 'unspecified', 'cleanup_required', 'cleanup_failed', 'deleted',
 ] as const;
 
+// What the paged list's lifecycle filter offers and sends: the stored
+// lifecycle (`sandboxes.lifecycle`), every `SandboxLifecycle` state and the
+// two tombstones. It is not the State column, which shows the node's reported
+// state when there is one, so a row can match one lifecycle and show another
+// state. The node-only states above are never stored, and the server refuses
+// them.
+export const STORED_LIFECYCLE_FILTER_STATES = [...SANDBOX_LIFECYCLE_STATES, 'deleted', 'cleanup_required'] as const;
+
+const STORED_LIFECYCLES: ReadonlySet<string> = new Set(STORED_LIFECYCLE_FILTER_STATES);
+
+// The selected values the paged list can send; a status chosen on a sampled
+// list, such as `unknown`, is dropped rather than answered with a 400.
+export function storedLifecycles(values: Iterable<string>): string[] {
+  return [...values].filter((value) => STORED_LIFECYCLES.has(value));
+}
+
 // A row without a status shows, and filters, as `unknown`.
 export const NO_STATUS = 'unknown';
 

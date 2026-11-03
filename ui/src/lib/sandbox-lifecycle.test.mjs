@@ -3,9 +3,11 @@ import { test } from 'node:test';
 import {
   SANDBOX_LIFECYCLE_STATES,
   SANDBOX_STATUS_FILTER_STATES,
+  STORED_LIFECYCLE_FILTER_STATES,
   bringUpAction,
   statusFilterKey,
   statusFilterOptions,
+  storedLifecycles,
 } from './sandbox-lifecycle.ts';
 
 const row = (status) => status;
@@ -48,4 +50,12 @@ test('the filter also offers every other status the loaded rows carry', () => {
   // A row without a status filters under the option it is offered as.
   assert.equal(statusFilterKey(null), 'unknown');
   assert.equal(statusFilterKey('started'), 'started');
+});
+
+test('the paged list sends only stored lifecycles', () => {
+  assert.deepEqual(STORED_LIFECYCLE_FILTER_STATES, [...SANDBOX_LIFECYCLE_STATES, 'deleted', 'cleanup_required']);
+  // Node-only states and the no-status key are never stored.
+  assert.deepEqual(storedLifecycles(['started', 'unknown', 'cleanup_failed', 'unspecified', 'deleted', 'cleanup_required']), [
+    'started', 'deleted', 'cleanup_required',
+  ]);
 });
