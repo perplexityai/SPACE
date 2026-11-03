@@ -360,3 +360,36 @@ jobs:
         with:
           path: ${{ runner.temp }}/space-sccache
           key: ${{ steps.rust-cache-key.outputs.key }}
+
+  windows_guest:
+    if: github.repository == 'perplexityai/SPACE'
+    name: Windows guest checks
+    runs-on: windows-2025
+    timeout-minutes: 25
+    steps:
+      - name: Check out SPACE
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install protobuf compiler
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "protoc.zip"
+          $destination = Join-Path $env:RUNNER_TEMP "protoc"
+          Invoke-WebRequest https://github.com/protocolbuffers/protobuf/releases/download/v35.0/protoc-35.0-win64.zip -OutFile $archive
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne "d1cede9e308cc3eb072392af1c02ccae4bdd3d2f374ec2970dbd8cdfdaa91363") {
+            throw "protoc archive checksum mismatch"
+          }
+          Expand-Archive $archive -DestinationPath $destination
+          "PROTOC=$destination\bin\protoc.exe" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PROTOC_INCLUDE=$destination\include" | Out-File -FilePath $env:GITHUB_ENV -Append
+          & "$destination\bin\protoc.exe" --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Compile and lint native Windows code and tests
+        run: >-
+          cargo clippy --locked --target x86_64-pc-windows-msvc --all-targets
+          -p pplx-space-spaced-guest-windows -p pplx-space-spaced-guest-svc
+          -- -D warnings
+      - name: Run native Windows unit tests
+        run: >-
+          cargo test --locked --target x86_64-pc-windows-msvc
+          -p pplx-space-spaced-guest-windows --lib

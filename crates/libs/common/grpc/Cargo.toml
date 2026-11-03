@@ -16,6 +16,7 @@ internal-tls = ["tonic/tls-aws-lc", "tokio/fs", "dep:tokio-util"]
 test-support = []
 
 [dependencies]
+pplx-space-guest-capability = { workspace = true }
 futures-core = { workspace = true }
 tokio-util = { workspace = true, optional = true }
 http = { workspace = true }

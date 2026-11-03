@@ -72,7 +72,6 @@ fn service_main(_: Vec<OsString>) {
             })
         });
     if let Err(error) = &result {
-        report_failure(error);
         tracing::error!(%error, "Windows guest service failed");
     }
     if let Err(error) = status(handle, ServiceState::Stopped, result.is_err()) {
@@ -80,23 +79,32 @@ fn service_main(_: Vec<OsString>) {
     }
 }
 
-/// SCM reports only the numeric exit code; retain the cause in Application events.
-fn report_failure(error: &super::RunError) {
-    use windows_sys::Win32::System::EventLog::{
-        DeregisterEventSource, EVENTLOG_ERROR_TYPE, RegisterEventSourceW, ReportEventW,
-    };
-    let source: Vec<u16> = SERVICE_NAME.encode_utf16().chain(Some(0)).collect();
-    let message: Vec<u16> = error.to_string().encode_utf16().chain(Some(0)).collect();
-    // SAFETY: the source is terminated and retained for this synchronous call.
-    let handle = unsafe { RegisterEventSourceW(std::ptr::null(), source.as_ptr()) };
-    if !handle.is_null() {
+/// Bounded synchronous writer for the service application's tracing subscriber.
+/// SCM has no stderr; warnings and errors belong in the Application event log.
+pub struct EventLogWriter;
+impl std::io::Write for EventLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        use windows_sys::Win32::System::EventLog::{
+            DeregisterEventSource, EVENTLOG_WARNING_TYPE, RegisterEventSourceW, ReportEventW,
+        };
+        let source: Vec<u16> = SERVICE_NAME.encode_utf16().chain(Some(0)).collect();
+        let message: Vec<u16> = String::from_utf8_lossy(bytes)
+            .encode_utf16()
+            .take(8192)
+            .map(|c| if c == 0 { 32 } else { c })
+            .chain(Some(0))
+            .collect();
+        // SAFETY: the terminated source lives for this synchronous call.
+        let handle = unsafe { RegisterEventSourceW(std::ptr::null(), source.as_ptr()) };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
         let strings = [message.as_ptr()];
-        // SAFETY: the live event handle and terminated string remain valid for
-        // the call. One string, no SID and no binary payload match the lengths.
-        let _ = unsafe {
+        // SAFETY: one terminated string, no SID or binary data, and a live handle.
+        let result = unsafe {
             ReportEventW(
                 handle,
-                EVENTLOG_ERROR_TYPE,
+                EVENTLOG_WARNING_TYPE,
                 0,
                 1,
                 std::ptr::null_mut(),
@@ -106,7 +114,15 @@ fn report_failure(error: &super::RunError) {
                 std::ptr::null(),
             )
         };
-        // SAFETY: this is the unique event handle returned above; no subsequent use.
-        let _ = unsafe { DeregisterEventSource(handle) };
+        let error = (result == 0).then(std::io::Error::last_os_error);
+        // SAFETY: this writer uniquely owns the event-source handle.
+        unsafe { DeregisterEventSource(handle) };
+        match error {
+            Some(error) => Err(error),
+            None => Ok(bytes.len()),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }

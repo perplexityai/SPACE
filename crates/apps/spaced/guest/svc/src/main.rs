@@ -61,6 +61,12 @@ fn main() -> anyhow::Result<()> {
             tracing_subscriber::fmt()
                 .with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG)
                 .init();
+        } else {
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
+                .with_writer(|| pplx_space_spaced_guest_windows::EventLogWriter)
+                .init();
         }
         Ok(pplx_space_spaced_guest_windows::run(cli.console)?)
     }

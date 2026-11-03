@@ -14,6 +14,7 @@
 pub mod env;
 pub mod path;
 pub mod process;
+pub mod status;
 pub mod time;
 
 pub use env::*;
