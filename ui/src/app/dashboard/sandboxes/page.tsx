@@ -442,9 +442,13 @@ function sandboxNodeDisplay(sandbox: Sandbox) {
     </Tag>
   );
 
+  // The node page lists every sandbox on the node, which the list's node
+  // filter cannot: the server has no node filter.
   return (
     <Tooltip title={sandboxNodeTooltip(sandboxNodeTooltipRows(node, 'active'))}>
-      {tag}
+      <Link href={`/dashboard/nodes/${node.id}`} onClick={(event) => event.stopPropagation()}>
+        {tag}
+      </Link>
     </Tooltip>
   );
 }
