@@ -10,7 +10,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from space_smoke.console import browser_unavailable
 from space_smoke.registry import SUBSTRATES, Scenario
 from space_smoke.runtime import SmokeConfigurationError, execute_scenario
 from space_smoke.scenarios import REGISTRY
@@ -524,7 +523,7 @@ def _run_all(
     telemetry_error = telemetry_error or rust_build_error
     if not scenarios:
         return _mode_emptied(selection, "Rust build", shard, telemetry_error)
-    scenarios = _apply_browser(scenarios, browser_selection)
+    scenarios = _apply_browser(scenarios, browser_selection, services)
     if not scenarios:
         return _mode_emptied(selection, "browser state", shard, telemetry_error)
 
@@ -745,14 +744,16 @@ BROWSER_SCENARIOS_ENV = "SPACE_SMOKE_BROWSER_SCENARIOS"
 BROWSER_SELECTIONS = ("run", "withhold")
 
 
-def _apply_browser(scenarios: tuple[Scenario, ...], selection: str) -> tuple[Scenario, ...]:
+def _apply_browser(
+    scenarios: tuple[Scenario, ...], selection: str, services: SmokeServices
+) -> tuple[Scenario, ...]:
     """Skip the scenarios that drive a browser this run cannot or will not launch.
 
     SPACE_SMOKE_BROWSER_SCENARIOS=withhold leaves them out, as Kind CI does
-    for a pull request that changes no console path
-    (ci/kind-console-paths.txt). Unset or `run`, each browser they declare is
-    launched once, and a scenario whose browser cannot launch is skipped with
-    the reason. Each is printed SKIPPED either way: a skip is not a pass.
+    unless Pull CI selected them (ci/kind-console-paths.txt). Unset or `run`,
+    each browser they declare is probed once, and a scenario whose browser
+    cannot launch, or whose Playwright is not installed, is skipped with the
+    reason. Each is printed SKIPPED either way: a skip is not a pass.
     """
 
     declared = tuple(scenario for scenario in scenarios if scenario.browser is not None)
@@ -763,7 +764,7 @@ def _apply_browser(scenarios: tuple[Scenario, ...], selection: str) -> tuple[Sce
             print(f"SKIPPED {skipped.id}: withheld from this run ({BROWSER_SCENARIOS_ENV}=withhold)")
         return tuple(scenario for scenario in scenarios if scenario.browser is None)
     reasons = {
-        browser: browser_unavailable(browser)
+        browser: services.browser_unavailable(browser)
         for browser in sorted({str(scenario.browser) for scenario in declared})
     }
     for skipped in declared:

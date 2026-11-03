@@ -58,6 +58,7 @@ class SmokeSuiteTests(unittest.TestCase):
         services.telemetry_mode.return_value = "otel"
         services.storage_credentials.return_value = "exchange"
         services.substrate.return_value = "kubernetes"
+        services.browser_unavailable.return_value = None
         selected = tuple(
             scenario
             for scenario in REGISTRY
@@ -114,6 +115,7 @@ class SmokeSuiteTests(unittest.TestCase):
         services.telemetry_mode.return_value = "otel"
         services.storage_credentials.return_value = "exchange"
         services.substrate.return_value = "kubernetes"
+        services.browser_unavailable.return_value = None
         live = tuple(
             scenario
             for scenario in REGISTRY

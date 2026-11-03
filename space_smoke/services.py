@@ -165,6 +165,17 @@ class SmokeServices:
             )
         return self.bench.substrate()
 
+    def browser_unavailable(self, browser: str) -> str | None:
+        """Why this runner cannot launch `browser` for a web UI scenario, or None.
+
+        A property of the runner's host, not of the bench: the scenario's
+        browser runs beside the suite and reaches the bench's UI forward.
+        """
+
+        from space_smoke.console import browser_unavailable
+
+        return browser_unavailable(browser)
+
     def fixture(
         self,
         fixture_type: type[Fixture],
