@@ -321,8 +321,13 @@ export type ListLoad =
   | { kind: 'failed'; scope: ListScope; error: unknown; kept: boolean };
 
 // What an answer in `answered` shape to a request in `asked` shape does to
-// the list (`ListSelection.noteAnswer`).
-export type AnswerNote = { kind: 'counted' } | { kind: 'mismatched' } | { kind: 'stopped'; kept: boolean };
+// the list (`ListSelection.noteAnswer`). `undecided`: it came before the
+// first answer of the list decided its shape, and says nothing.
+export type AnswerNote =
+  | { kind: 'counted' }
+  | { kind: 'mismatched' }
+  | { kind: 'stopped'; kept: boolean }
+  | { kind: 'undecided' };
 
 // The sandbox list's selection and its loads. The list shape, the filters,
 // the page and sample sizes and the page position make up the selected
@@ -389,6 +394,13 @@ export class ListSelection {
     return true;
   }
 
+  // Whether the first answer decided the list shape. Until then the page
+  // assumes paging only to make its first request, so a request made
+  // alongside the list (the prefix search) waits for it.
+  get shapeDecided(): boolean {
+    return this.decided;
+  }
+
   previousPosition(): PagePosition | null {
     return previousPage(this.position);
   }
@@ -402,7 +414,8 @@ export class ListSelection {
   }
 
   // Counts an answer, of the list or of a request made alongside it (the
-  // prefix search), once the first answer decided the shape. A bare array
+  // prefix search), once the first answer decided the shape; an answer
+  // before then neither counts nor starts over (`undecided`). A bare array
   // answering a paged request is a mismatch. The list stops when mismatches
   // alone have answered for `STOP_AFTER_MISMATCH_MS` since the first of
   // them, and there were at least `STOP_AFTER_MISMATCHES`. Any other answer
@@ -411,6 +424,7 @@ export class ListSelection {
   // count nor start over.
   noteAnswer(asked: ListMode, answered: ListMode): AnswerNote {
     if (this.stopped) return this.stop();
+    if (!this.decided) return { kind: 'undecided' };
     if (asked === 'sampled' || answered === 'paged') {
       this.mismatches = 0;
       return { kind: 'counted' };

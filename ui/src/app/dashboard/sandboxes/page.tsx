@@ -769,6 +769,8 @@ function SandboxesPage() {
   const [selection] = useState(() => new ListSelection({ filters: serverFilters(filterInputs), pageSize, sampleSize: listLimit }));
   // The selected scope and the next page's cursor, for rendering.
   const [selectedScope, setSelectedScope] = useState<ListScope>(() => selection.selected);
+  // Whether the first answer decided the list shape (`ListSelection.shapeDecided`).
+  const [shapeDecided, setShapeDecided] = useState(false);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   // The error of the last load; a load of another scope that failed clears
   // the rows rather than show them under the new label.
@@ -845,6 +847,7 @@ function SandboxesPage() {
   const selectionChanged = () => {
     setSelectedScope(selection.selected);
     setNextCursor(selection.nextCursor());
+    setShapeDecided(selection.shapeDecided);
   };
 
   // The list stopped (`ListSelection.noteAnswer`), on a load or on the prefix
@@ -1324,9 +1327,12 @@ function SandboxesPage() {
 
   const lookupPending = lookupId !== null && !(lookup?.publicId === lookupId && lookup.answered);
 
+  // Sent only once the first answer has decided the list shape: before then
+  // the page only assumes paging, and a server without it would answer this
+  // request with a bare array too.
   const fragmentScope = useMemo(
-    () => (search.kind === 'fragment' ? fragmentSearchScope(selectedScope, search.prefix) : null),
-    [search, selectedScope],
+    () => (search.kind === 'fragment' && shapeDecided ? fragmentSearchScope(selectedScope, search.prefix) : null),
+    [search, selectedScope, shapeDecided],
   );
   // The request the search box names now; an answer for any other is dropped.
   fragmentTargetRef.current = fragmentScope?.key ?? null;
@@ -1346,6 +1352,8 @@ function SandboxesPage() {
           const note = selection.noteAnswer('paged', response.mode);
           setOlderFormat(selection.mismatches > 0);
           if (note.kind === 'stopped') return stopList(note.kept);
+          // Not sent before then; should it answer first, it fails this refresh.
+          if (note.kind === 'undecided') throw new Error('the list has not loaded yet; retrying');
           if (response.mode !== 'paged') throw new OlderFormatAnswer();
           setFragmentMatches({ key: scope.key, sandboxes: response.sandboxes, more: response.nextCursor !== null, error: null });
         })

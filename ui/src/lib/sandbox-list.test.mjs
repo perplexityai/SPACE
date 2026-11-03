@@ -486,6 +486,46 @@ test('a bare array answering the prefix search counts toward stopping the list',
   await assertStaysStopped(selection, true);
 });
 
+test('a prefix answer before the first answer of the list neither counts nor starts over', async () => {
+  const clock = testClock();
+  // A server without paging, whose first list answer is slow.
+  const slow = newSelection({}, clock);
+  assert.equal(slow.shapeDecided, false);
+  const first = pendingRead();
+  const sent = [];
+  const answers = [first.read, async () => sample()];
+  const loading = slow.load(slow.selected, (scope) => {
+    sent.push(scope);
+    return answers.shift()();
+  });
+  // Prefix answers arrive first, for a whole window: they say nothing, so
+  // no older-format notice shows and the list does not stop.
+  for (let i = 0; i <= STOP_AFTER_MISMATCHES; i += 1) {
+    assert.deepEqual(slow.noteAnswer('paged', 'sampled'), { kind: 'undecided' });
+    assert.equal(slow.mismatches, 0);
+    clock.advance(STOP_AFTER_MISMATCH_MS);
+  }
+  assert.equal(slow.shapeDecided, false);
+  first.answer(sampledAnswer);
+  // The first answer decides, and the sample loads.
+  const result = await loading;
+  assert.equal(result.kind, 'shown');
+  assert.equal(result.scope.mode, 'sampled');
+  assert.equal(sent.length, 2);
+  assert.equal(slow.shapeDecided, true);
+  assert.equal(slow.stopped, false);
+
+  // A page answering before the list's first answer says nothing either.
+  const paged = newSelection({}, clock);
+  const pending = pendingRead();
+  const pagedLoad = paged.load(paged.selected, pending.read);
+  assert.deepEqual(paged.noteAnswer('paged', 'paged'), { kind: 'undecided' });
+  pending.answer(page(null));
+  assert.equal((await pagedLoad).kind, 'shown');
+  assert.equal(paged.shapeDecided, true);
+  assert.deepEqual(paged.noteAnswer('paged', 'paged'), { kind: 'counted' });
+});
+
 test('a page answering a sampled list switches it to paging at the first page, with every filter', async () => {
   const org = '0193a000-0000-7000-8000-000000000001';
   const selection = newSelection({ org, template: 'alpha', lifecycles: ['started'] });
