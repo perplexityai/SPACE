@@ -30,6 +30,21 @@ pub(crate) fn is_subvolume(directory: &File) -> io::Result<bool> {
     }
 }
 
+/// Whether `file` is on a btrfs filesystem, where [`create`] makes a subvolume
+/// rather than a plain directory.
+pub(crate) fn is_on_btrfs(file: &File) -> io::Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        Ok(nix::sys::statfs::fstatfs(file)?.filesystem_type()
+            == nix::sys::statfs::BTRFS_SUPER_MAGIC)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = file;
+        Ok(false)
+    }
+}
+
 pub(crate) fn create(parent: &File, name: &OsStr) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     if nix::sys::statfs::fstatfs(parent)?.filesystem_type() == nix::sys::statfs::BTRFS_SUPER_MAGIC {

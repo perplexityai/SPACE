@@ -52,17 +52,6 @@ fn crossing(
     dependency: &Dependency,
 ) -> Finding {
     let manifest = krate.manifest();
-    let mut declared = Vec::new();
-    if let Some(rename) = &dependency.rename {
-        declared.push(format!("renamed {rename}"));
-    }
-    declared.push(match dependency.kind.as_deref() {
-        None => "a normal dependency".to_owned(),
-        Some(kind) => format!("a {kind}-dependency"),
-    });
-    if let Some(target) = &dependency.target {
-        declared.push(format!("for target {target}"));
-    }
     Finding {
         rule: RULE,
         instance: Some(instance.to_string()),
@@ -73,7 +62,7 @@ fn crossing(
              an allowed member.",
             krate.name,
             dependency.package,
-            declared.join(", "),
+            dependency.describe(),
         ),
         path: manifest.clone(),
         mode: config.no_crossing.mode,

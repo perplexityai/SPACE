@@ -1,6 +1,7 @@
 //! Everything a rule may inspect, loaded once before any rule runs.
 
 use std::{
+    collections::BTreeMap,
     env,
     ffi::OsStr,
     io,
@@ -12,11 +13,18 @@ use serde::Deserialize;
 use thiserror::Error;
 use toml::Spanned;
 
+mod state;
+
+pub use state::{
+    CATALOGS_DIR, Catalog, Dialect, Identifier, POSTGRES, StateDeclarations, TableName, TextFile,
+    declared_table, namespace, quoted_identifier, sqlite_namespace,
+};
+
 use crate::{
-    baseline::{BASELINE_FILE, BaseBaseline, Baseline, line_of},
-    config::{ArchitectureConfig, BaseArchitecture, CONFIG_FILE, CrateNamesPolicy},
+    baseline::{BASELINE_FILE, BaseBaseline, Baseline, line_of, rule_of},
+    config::{ArchitectureConfig, BaseArchitecture, CONFIG_FILE, CrateNamesPolicy, LayersPolicy},
     renames::{Renames, RenamesError},
-    rules,
+    rules::{self, Layers},
 };
 
 /// The root manifest, the workspace `cargo metadata` reads.
@@ -88,6 +96,18 @@ pub enum LoadError {
          the instance was renamed"
     )]
     UnknownBaselineTable { path: PathBuf, table: String },
+    /// A `[layers.<check>]` table is checked only with `[rules.layers]`, and
+    /// only for a check with a baseline.
+    #[error(
+        "{path}: [{table}] is not a table of the layers rule: with [rules.layers] in {CONFIG_FILE}, \
+         its tables are {known}, and without it there are none ([layers.unowned] \
+         also needs [rules.layers.state]); remove that table"
+    )]
+    UnknownLayersTable {
+        path: PathBuf,
+        table: String,
+        known: String,
+    },
     #[error("could not read {path} as renames: {source}")]
     Renames {
         path: PathBuf,
@@ -101,6 +121,33 @@ pub enum LoadError {
          Baseline::load_base"
     )]
     UnreadBaseTables { path: PathBuf, rule: &'static str },
+    #[error(
+        "[rules.layers.state] and [rules.layers.unowned] in {CONFIG_FILE} go together: the state \
+         checks need both; add the missing one or remove both"
+    )]
+    StateWithoutUnowned,
+    #[error(
+        "[rules.layers.state.shared_catalogs] {shared} in {CONFIG_FILE} names {name:?}, which is \
+         not a directory under {CATALOGS_DIR}/; fix or remove it"
+    )]
+    UnknownCatalog { shared: String, name: String },
+    #[error(
+        "[rules.layers.state.shared_catalogs] {shared} in {CONFIG_FILE} lists {name:?}, which is \
+         a shared catalog, not a database; remove it"
+    )]
+    SharedCatalogAsDatabase { shared: String, name: String },
+    /// Two names of one table would hide that the table is declared twice.
+    #[error(
+        "{path}: [package.metadata.space.state] {namespace} names the table {table} twice, as \
+         {first:?} and {second:?}; keep one"
+    )]
+    DuplicateDeclaration {
+        path: PathBuf,
+        namespace: String,
+        table: String,
+        first: String,
+        second: String,
+    },
 }
 
 /// A production Rust file, its text and its code-line count.
@@ -129,6 +176,13 @@ pub struct Crate {
     pub lib_name_line: Option<usize>,
     /// Every dependency its manifest declares, of any kind and target.
     pub dependencies: Vec<Dependency>,
+    /// Its manifest's `[features]`: each feature to what it enables, such
+    /// as `dep:sqlx` or `other/sqlx`, each with the 1-based line it is
+    /// written on. Cargo's implicit features for optional dependencies are
+    /// not among them.
+    pub features: BTreeMap<String, Vec<(String, usize)>>,
+    /// Its `[package.metadata.space.state]`, if the manifest has one.
+    pub state: Option<StateDeclarations>,
 }
 
 /// A dependency a member's manifest declares, as `cargo metadata` reports
@@ -145,6 +199,45 @@ pub struct Dependency {
     pub target: Option<String>,
     /// The 1-based line that names it in the manifest, or 1 if none does.
     pub line: usize,
+    /// Whether it is `optional = true`, built only when a feature enables
+    /// it.
+    pub optional: bool,
+    /// The features it enables on the depended-on package, `features =
+    /// […]`, including those the workspace's entry adds.
+    pub features: Vec<String>,
+    /// Whether it enables the depended-on package's `default` feature.
+    pub uses_default_features: bool,
+}
+
+impl Dependency {
+    /// How the manifest declares it, such as `a normal dependency` or
+    /// `renamed sqlite, a dev-dependency, for target cfg(unix)`.
+    pub fn describe(&self) -> String {
+        let mut declared = Vec::new();
+        if let Some(rename) = &self.rename {
+            declared.push(format!("renamed {rename}"));
+        }
+        declared.push(match self.kind.as_deref() {
+            None => "a normal dependency".to_owned(),
+            Some(kind) => format!("a {kind}-dependency"),
+        });
+        if let Some(target) = &self.target {
+            declared.push(format!("for target {target}"));
+        }
+        declared.join(", ")
+    }
+
+    /// Whether it is a `[dev-dependencies]` entry, which only tests,
+    /// examples and benchmarks build with.
+    pub fn is_dev(&self) -> bool {
+        self.kind.as_deref() == Some("dev")
+    }
+
+    /// The name the manifest and its `[features]` call it by: its
+    /// `package = "…"` rename, or the package name.
+    pub fn key(&self) -> &str {
+        self.rename.as_deref().unwrap_or(&self.package)
+    }
 }
 
 impl Crate {
@@ -173,13 +266,22 @@ pub struct Context {
     /// `[rules.crate_names]` of `ARCHITECTURE.toml`, with the line of each
     /// part.
     pub crate_names_policy: CrateNamesPolicy,
-    /// The same table of the base branch's `ARCHITECTURE.toml`, given with
+    /// `[rules.layers]` of `ARCHITECTURE.toml`, with the line of each entry;
+    /// empty without one.
+    pub layers_policy: LayersPolicy,
+    /// The base branch's `ARCHITECTURE.toml`, given with
     /// `--base-architecture`.
     pub base_architecture: BaseArchitecture,
     /// Every production Rust file of the workspace members, sorted by path.
     pub files: Vec<ProductionFile>,
     /// The package of each workspace member, sorted by member path.
     pub crates: Vec<Crate>,
+    /// The catalogs under `db/`, sorted by name; read only with
+    /// `[rules.layers.state]`.
+    pub catalogs: Vec<Catalog>,
+    /// Every `.sql` file under a member's `src/`, outside `tests/`
+    /// directories, sorted by path; read only with `[rules.layers.state]`.
+    pub sql_files: Vec<TextFile>,
 }
 
 impl Context {
@@ -192,6 +294,11 @@ impl Context {
         let config_path = root.join(CONFIG_FILE);
         let (config, config_text): (ArchitectureConfig, String) =
             parse_toml_with_text(&config_path)?;
+        if let Some(layers) = &config.rules.layers
+            && layers.state.is_some() != layers.unowned.is_some()
+        {
+            return Err(LoadError::StateWithoutUnowned);
+        }
         // A table for an instance that no longer exists would never be
         // checked, so it cannot silently outlive its configuration.
         let configured = rules::tables(&config.rules);
@@ -200,16 +307,25 @@ impl Context {
             .into_iter()
             .find(|table| !configured.contains(table))
         {
-            return Err(LoadError::UnknownBaselineTable {
-                path: root.join(BASELINE_FILE),
-                table,
-            });
+            let path = root.join(BASELINE_FILE);
+            if rule_of(&table) == Layers::NAME {
+                return Err(LoadError::UnknownLayersTable {
+                    path,
+                    table,
+                    known: Layers::table_list(),
+                });
+            }
+            return Err(LoadError::UnknownBaselineTable { path, table });
         }
+        let parse_error = |source| LoadError::Parse {
+            path: config_path.clone(),
+            source,
+        };
         let crate_names_policy = CrateNamesPolicy::parse(&config_text)
-            .map_err(|source| LoadError::Parse {
-                path: config_path,
-                source,
-            })?
+            .map_err(parse_error)?
+            .unwrap_or_default();
+        let layers_policy = LayersPolicy::parse(&config_text)
+            .map_err(parse_error)?
             .unwrap_or_default();
         if let Some(name) = baseline
             .crate_names
@@ -232,15 +348,26 @@ impl Context {
             }
         }
         let files = production_files(root, &crates)?;
+        let layers = config.rules.layers.as_ref();
+        let (catalogs, sql_files) = match layers.and_then(|layers| layers.state.as_ref()) {
+            Some(state_config) => (
+                state::catalogs(root, state_config)?,
+                state::sql_files(root, &crates)?,
+            ),
+            None => (Vec::new(), Vec::new()),
+        };
         Ok(Self {
             config,
             baseline,
             base_baseline: BaseBaseline::default(),
             renames: None,
             crate_names_policy,
+            layers_policy,
             base_architecture: BaseArchitecture::NotGiven,
             files,
             crates,
+            catalogs,
+            sql_files,
         })
     }
 
@@ -349,6 +476,17 @@ struct MetadataDependency {
     rename: Option<String>,
     kind: Option<String>,
     target: Option<String>,
+    #[serde(default)]
+    optional: bool,
+    #[serde(default)]
+    features: Vec<String>,
+    #[serde(default = "enabled")]
+    uses_default_features: bool,
+}
+
+/// Cargo's default for `default-features`.
+fn enabled() -> bool {
+    true
 }
 
 #[derive(Deserialize)]
@@ -401,12 +539,21 @@ fn workspace_crates(root: &Path) -> Result<Vec<Crate>, LoadError> {
     Ok(crates)
 }
 
-/// Only the names of a member's manifest, for their lines; Cargo has read
+/// Only the names of a member's manifest, for their lines, and its
+/// `[features]`, whose lines `cargo metadata` does not give; Cargo has read
 /// the rest.
 #[derive(Deserialize)]
 struct MemberManifest {
-    package: Option<NameTable>,
+    package: Option<PackageTable>,
     lib: Option<NameTable>,
+    #[serde(default)]
+    features: BTreeMap<String, Vec<Spanned<String>>>,
+}
+
+#[derive(Deserialize)]
+struct PackageTable {
+    name: Option<Spanned<String>>,
+    metadata: Option<state::PackageMetadata>,
 }
 
 #[derive(Deserialize)]
@@ -425,11 +572,24 @@ fn load_crate(workspace_root: &Path, package: MetadataPackage) -> Result<Crate, 
     };
     let member = relative_path(Path::new(""), member)?;
     let (parsed, text): (MemberManifest, String) = parse_toml_with_text(&manifest)?;
-    let line = |table: Option<NameTable>| {
-        table
-            .and_then(|table| table.name)
-            .map(|name| line_of(&text, name.span().start))
-    };
+    let features = parsed
+        .features
+        .into_iter()
+        .map(|(feature, enables)| {
+            let enables = enables
+                .into_iter()
+                .map(|item| {
+                    let at = line_of(&text, item.span().start);
+                    (item.into_inner(), at)
+                })
+                .collect();
+            (feature, enables)
+        })
+        .collect();
+    let line = |name: Option<Spanned<String>>| name.map(|name| line_of(&text, name.span().start));
+    let (name, metadata) = parsed
+        .package
+        .map_or((None, None), |package| (package.name, package.metadata));
     let lib = package
         .targets
         .into_iter()
@@ -452,22 +612,32 @@ fn load_crate(workspace_root: &Path, package: MetadataPackage) -> Result<Crate, 
             rename: dependency.rename,
             kind: dependency.kind,
             target: dependency.target,
+            optional: dependency.optional,
+            features: dependency.features,
+            uses_default_features: dependency.uses_default_features,
         })
         .collect();
     Ok(Crate {
         name: package.name,
         lib,
         member,
-        name_line: line(parsed.package).unwrap_or(1),
-        lib_name_line: line(parsed.lib),
+        name_line: line(name).unwrap_or(1),
+        lib_name_line: line(parsed.lib.and_then(|lib| lib.name)),
         dependencies,
+        features,
+        state: match metadata {
+            Some(metadata) => metadata.state(&manifest, &text)?,
+            None => None,
+        },
     })
 }
 
 /// The first line of `manifest` that declares a dependency called `key`:
-/// `key = …`, `key.workspace = …` or a `[….dependencies.key]` header, with
-/// the key bare or quoted. 1 if none does, since the line only places the
-/// finding.
+/// `key = …` or `key.workspace = …` in a dependency table, or a
+/// `[….dependencies.key]` header, with the key bare or quoted. Other tables,
+/// such as `[features]`, whose keys may share the name, and the root
+/// manifest's `[workspace.dependencies]` are skipped. 1 if none does, since
+/// the line only places the finding.
 fn dependency_line(manifest: &str, key: &str) -> usize {
     let quoted = format!("\"{key}\"");
     let names_key = |rest: &str| {
@@ -476,17 +646,27 @@ fn dependency_line(manifest: &str, key: &str) -> usize {
                 .is_some_and(|after| after.trim_start().starts_with(['=', '.', ']']))
         })
     };
-    manifest
-        .lines()
-        .position(|line| {
-            let line = line.trim_start();
-            names_key(line)
-                || line.starts_with('[')
-                    && line
-                        .split_once("dependencies.")
-                        .is_some_and(|(_, rest)| names_key(rest))
-        })
-        .map_or(1, |index| index + 1)
+    let mut in_dependencies = false;
+    for (index, line) in manifest.lines().enumerate() {
+        let line = line.trim_start();
+        if let Some(header) = line.strip_prefix('[') {
+            let header = header.split(']').next().unwrap_or_default().trim();
+            if header.starts_with("workspace") {
+                in_dependencies = false;
+                continue;
+            }
+            in_dependencies = header.ends_with("dependencies");
+            if header
+                .split_once("dependencies.")
+                .is_some_and(|(_, rest)| names_key(&format!("{rest}]")))
+            {
+                return index + 1;
+            }
+        } else if in_dependencies && names_key(line) {
+            return index + 1;
+        }
+    }
+    1
 }
 
 fn production_files(root: &Path, crates: &[Crate]) -> Result<Vec<ProductionFile>, LoadError> {

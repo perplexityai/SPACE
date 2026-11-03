@@ -739,6 +739,9 @@ fn router(state: DataPlaneState) -> Router {
         .route("/metrics", any(unsupported_ecw_envd_endpoint))
         .route("/envs", any(unsupported_ecw_envd_endpoint))
         .route("/files/compose", any(unsupported_ecw_envd_endpoint))
+        // Matched routes only: service-port requests are forwarded before
+        // routing, and the fallback proxy carries no data-plane API route.
+        .route_layer(middleware::from_fn(record_request_latency))
         .fallback(any(ecw_service_proxy))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -754,6 +757,35 @@ fn router(state: DataPlaneState) -> Router {
             HttpServerMakeSpan::new(http_span_metadata),
         ))
         .layer(CorsLayer::permissive())
+}
+
+/// Times each routed request to its response head. The HTTP trace span cannot
+/// serve this: it closes when a streaming body ends, so its duration for
+/// process `Start` is the process lifetime.
+async fn record_request_latency(
+    matched_path: axum::extract::MatchedPath,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let method = match *request.method() {
+        axum::http::Method::GET => "GET",
+        axum::http::Method::POST => "POST",
+        axum::http::Method::PUT => "PUT",
+        axum::http::Method::PATCH => "PATCH",
+        axum::http::Method::DELETE => "DELETE",
+        axum::http::Method::HEAD => "HEAD",
+        axum::http::Method::OPTIONS => "OPTIONS",
+        _ => "other",
+    };
+    let started_at = std::time::Instant::now();
+    let response = next.run(request).await;
+    pplx_space_metrics::data_plane::request_latency(
+        method,
+        matched_path.as_str(),
+        response.status().as_u16(),
+        started_at,
+    );
+    response
 }
 
 async fn unsupported_ecw_envd_endpoint() -> Response {

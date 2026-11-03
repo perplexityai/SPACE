@@ -1,0 +1,784 @@
+//! `[rules.layers]`: the layer of each workspace member that is not yet in its
+//! layer's directory, which crates may use each store, the declared
+//! exceptions to the layer order, and the mode of each of the layers rule's
+//! checks.
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
+
+use serde::Deserialize;
+use thiserror::Error;
+use toml::Spanned;
+
+use super::BehaviourConfig;
+use crate::{
+    baseline::line_of,
+    context::{Dialect, POSTGRES, declared_table, sqlite_namespace},
+};
+
+/// A layer of the stack, bottom-up, or one of the two sets of crates beside
+/// it. Its name is its directory under `crates/`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+#[serde(try_from = "String")]
+pub enum Layer {
+    Foundation,
+    Domain,
+    Storage,
+    Api,
+    App,
+    /// Test doubles and fixtures, reachable only through dev-dependencies.
+    TestSupport,
+    /// Never shipped, and nothing depends on them.
+    Tools,
+}
+
+#[derive(Debug, Error)]
+#[error(
+    "unknown layer {0:?}; expected one of l10_foundation, l20_domain, l30_storage, l40_api, \
+     l50_app, test_support, tools"
+)]
+pub struct UnknownLayerError(String);
+
+impl Layer {
+    pub const ALL: [Self; 7] = [
+        Self::Foundation,
+        Self::Domain,
+        Self::Storage,
+        Self::Api,
+        Self::App,
+        Self::TestSupport,
+        Self::Tools,
+    ];
+
+    /// The directory under `crates/`, which is also the layer's name in
+    /// `ARCHITECTURE.toml`.
+    pub fn dir(self) -> &'static str {
+        match self {
+            Self::Foundation => "l10_foundation",
+            Self::Domain => "l20_domain",
+            Self::Storage => "l30_storage",
+            Self::Api => "l40_api",
+            Self::App => "l50_app",
+            Self::TestSupport => "test_support",
+            Self::Tools => "tools",
+        }
+    }
+
+    /// The layer whose directory is `dir`.
+    pub fn from_dir(dir: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|layer| layer.dir() == dir)
+    }
+
+    /// The position in the stack, bottom-up; `None` for `test_support` and
+    /// `tools`, which are outside it.
+    pub fn rank(self) -> Option<u8> {
+        match self {
+            Self::Foundation => Some(10),
+            Self::Domain => Some(20),
+            Self::Storage => Some(30),
+            Self::Api => Some(40),
+            Self::App => Some(50),
+            Self::TestSupport | Self::Tools => None,
+        }
+    }
+}
+
+impl TryFrom<String> for Layer {
+    type Error = UnknownLayerError;
+
+    fn try_from(name: String) -> Result<Self, Self::Error> {
+        Self::from_dir(&name).ok_or(UnknownLayerError(name))
+    }
+}
+
+impl fmt::Display for Layer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.dir())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LayersConfig {
+    /// Package name to its layer, for each crate not yet in its layer's
+    /// directory, written as each layer's list of packages. Only shrinks: a
+    /// new crate goes in a layer directory.
+    #[serde(default)]
+    pub unmoved: Unmoved,
+    /// Each store's package name to the packages that may depend on it.
+    #[serde(default)]
+    pub store_users: BTreeMap<String, PackageSet>,
+    /// Package name to the packages it may depend on although the layer
+    /// order forbids it.
+    #[serde(default)]
+    pub allowed_edges: BTreeMap<String, PackageSet>,
+    /// What `storage_access` and `codec_features` treat as storage.
+    pub storage: StorageConfig,
+    /// Crates that predate the layers and are being dissolved. Every check
+    /// covers legacy crates, with today's edges baselined; a store user that
+    /// reaches a store only through one, as through a re-export, still uses
+    /// it. A legacy Foundation crate is no storage helper even with a
+    /// required driver dependency.
+    #[serde(default)]
+    pub legacy: PackageSet,
+    /// Domain crates that are protocols although their names don't end in
+    /// `-protocol` or `-proto`; every other Domain crate is a model.
+    #[serde(default)]
+    pub protocols: PackageSet,
+    /// The packages no Domain crate may depend on, by family.
+    #[serde(default)]
+    pub domain_fences: DomainFences,
+    pub placement: BehaviourConfig,
+    pub layout: BehaviourConfig,
+    pub direction: EdgeBehaviours,
+    pub dev_direction: EdgeBehaviours,
+    pub storage_access: EdgeBehaviours,
+    pub codec_features: EdgeBehaviours,
+    pub domain_dependencies: EdgeBehaviours,
+    pub model_protocol: EdgeBehaviours,
+    pub test_only: BehaviourConfig,
+    pub clients: BehaviourConfig,
+    pub store_edges: BehaviourConfig,
+    pub stale_entries: BehaviourConfig,
+    pub policy_changed: BehaviourConfig,
+    /// `[rules.layers.state]`, which store owns each table; the state checks
+    /// run only with it, and need `unowned` too.
+    #[serde(default)]
+    pub state: Option<StateConfig>,
+    /// `[rules.layers.unowned]`: the behaviours of the check that every live
+    /// table has an owner or a baseline entry.
+    #[serde(default)]
+    pub unowned: Option<EdgeBehaviours>,
+}
+
+/// `[rules.layers.state]`: the shared catalogs under `db/`, and the mode of
+/// each state check without a baseline table.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateConfig {
+    /// Each catalog under `db/` that is not a database of its own, to the
+    /// databases it is applied to, before their own catalog.
+    #[serde(default)]
+    pub shared_catalogs: BTreeMap<String, PackageSet>,
+    /// The approved exceptions to `state.writes`.
+    #[serde(default)]
+    pub co_writers: CoWriters,
+    pub owners: BehaviourConfig,
+    pub declarations: BehaviourConfig,
+    pub writes: BehaviourConfig,
+    pub pending: BehaviourConfig,
+}
+
+/// `[rules.layers.state.co_writers]`: by database namespace (`postgres`,
+/// or `sqlite.<database>`), each table a store owns to the other stores that
+/// may write it too. Here and not in the stores' manifests, so that
+/// `layers.policy_changed` reports each grant added or removed. Two keys of
+/// a namespace that name one table, such as `sandboxes` and
+/// `public.sandboxes`, are an error: `policy_changed` keys grants by table,
+/// so one would hide the other's stores.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(try_from = "CoWriterTables")]
+pub struct CoWriters {
+    pub postgres: BTreeMap<String, PackageSet>,
+    /// Database to its tables.
+    pub sqlite: BTreeMap<String, BTreeMap<String, PackageSet>>,
+}
+
+/// `[rules.layers.state.co_writers]` as written.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CoWriterTables {
+    #[serde(default)]
+    postgres: BTreeMap<String, PackageSet>,
+    #[serde(default)]
+    sqlite: BTreeMap<String, BTreeMap<String, PackageSet>>,
+}
+
+#[derive(Debug, Error)]
+#[error(
+    "[rules.layers.state.co_writers.{namespace}] names the table {table} twice, as {first:?} \
+     and {second:?}; merge their stores into one key"
+)]
+pub struct DuplicateGrantError {
+    namespace: String,
+    table: String,
+    first: String,
+    second: String,
+}
+
+impl TryFrom<CoWriterTables> for CoWriters {
+    type Error = DuplicateGrantError;
+
+    fn try_from(tables: CoWriterTables) -> Result<Self, Self::Error> {
+        let grants = Self {
+            postgres: tables.postgres,
+            sqlite: tables.sqlite,
+        };
+        let mut written: BTreeMap<(String, String), &String> = BTreeMap::new();
+        for (namespace, table, _) in grants.grants() {
+            let key = declared_table(Dialect::of(&namespace), table);
+            if let Some(first) = written.get(&(namespace.clone(), key.clone())) {
+                return Err(DuplicateGrantError {
+                    namespace,
+                    table: key,
+                    first: (*first).clone(),
+                    second: table.clone(),
+                });
+            }
+            written.insert((namespace, key), table);
+        }
+        Ok(grants)
+    }
+}
+
+impl CoWriters {
+    /// Each grant's namespace, table as written, and stores.
+    pub fn grants(&self) -> impl Iterator<Item = (String, &String, &PackageSet)> {
+        let postgres = self
+            .postgres
+            .iter()
+            .map(|(table, stores)| (POSTGRES.to_owned(), table, stores));
+        let sqlite = self.sqlite.iter().flat_map(|(database, tables)| {
+            tables
+                .iter()
+                .map(|(table, stores)| (sqlite_namespace(database), table, stores))
+        });
+        postgres.chain(sqlite)
+    }
+}
+
+/// `[rules.layers.unmoved]`: each layer's packages, read as package to
+/// layer, each package in one layer.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(try_from = "BTreeMap<Layer, PackageSet>")]
+pub struct Unmoved(BTreeMap<String, Layer>);
+
+#[derive(Debug, Error)]
+#[error("unmoved lists {package:?} in both {first} and {second}")]
+pub struct UnmovedError {
+    package: String,
+    first: Layer,
+    second: Layer,
+}
+
+impl Unmoved {
+    pub fn get(&self, package: &str) -> Option<Layer> {
+        self.0.get(package).copied()
+    }
+
+    /// Every package, sorted.
+    pub fn packages(&self) -> impl Iterator<Item = &String> {
+        self.0.keys()
+    }
+}
+
+impl TryFrom<BTreeMap<Layer, PackageSet>> for Unmoved {
+    type Error = UnmovedError;
+
+    fn try_from(layers: BTreeMap<Layer, PackageSet>) -> Result<Self, Self::Error> {
+        let mut unmoved = BTreeMap::new();
+        for (layer, packages) in layers {
+            for package in packages.0 {
+                if let Some(first) = unmoved.insert(package.clone(), layer) {
+                    return Err(UnmovedError {
+                        package,
+                        first,
+                        second: layer,
+                    });
+                }
+            }
+        }
+        Ok(Self(unmoved))
+    }
+}
+
+/// `[rules.layers.domain_fences]`: each family's packages, such as
+/// `runtime = ["tokio"]`, read as package to family, each package in one
+/// family.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(try_from = "BTreeMap<String, PackageSet>")]
+pub struct DomainFences(BTreeMap<String, String>);
+
+#[derive(Debug, Error)]
+#[error("domain_fences lists {package:?} in both {first} and {second}")]
+pub struct DomainFencesError {
+    package: String,
+    first: String,
+    second: String,
+}
+
+impl DomainFences {
+    /// The family that fences `package`, if one does.
+    pub fn family(&self, package: &str) -> Option<&str> {
+        self.0.get(package).map(String::as_str)
+    }
+
+    /// Every package, sorted.
+    pub fn packages(&self) -> impl Iterator<Item = &String> {
+        self.0.keys()
+    }
+
+    /// Every package with its family, sorted by package.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.0
+            .iter()
+            .map(|(package, family)| (package.as_str(), family.as_str()))
+    }
+}
+
+impl TryFrom<BTreeMap<String, PackageSet>> for DomainFences {
+    type Error = DomainFencesError;
+
+    fn try_from(families: BTreeMap<String, PackageSet>) -> Result<Self, Self::Error> {
+        let mut fences = BTreeMap::new();
+        for (family, packages) in families {
+            for package in packages.0 {
+                if let Some(first) = fences.insert(package.clone(), family.clone()) {
+                    return Err(DomainFencesError {
+                        package,
+                        first,
+                        second: family,
+                    });
+                }
+            }
+        }
+        Ok(Self(fences))
+    }
+}
+
+/// `[rules.layers.storage]`: the packages that reach a database or object
+/// storage, and every storage helper.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageConfig {
+    /// Packages outside the workspace that talk to a database or object
+    /// storage, such as `sqlx`.
+    pub drivers: Drivers,
+    /// The Foundation crates that are storage helpers, all of them: one with
+    /// a required dependency on a driver must be listed.
+    #[serde(default)]
+    pub helpers: PackageSet,
+}
+
+/// A [`PackageSet`] with at least one package, since without a driver the
+/// storage checks would check nothing.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(try_from = "Vec<String>")]
+pub struct Drivers(PackageSet);
+
+#[derive(Debug, Error)]
+pub enum DriversError {
+    #[error("drivers must list at least one package")]
+    Empty,
+    #[error(transparent)]
+    Duplicate(#[from] DuplicatePackageError),
+}
+
+impl Drivers {
+    pub fn contains(&self, package: &str) -> bool {
+        self.0.contains(package)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &String> {
+        self.0.iter()
+    }
+}
+
+impl TryFrom<Vec<String>> for Drivers {
+    type Error = DriversError;
+
+    fn try_from(packages: Vec<String>) -> Result<Self, Self::Error> {
+        if packages.is_empty() {
+            return Err(DriversError::Empty);
+        }
+        Ok(Self(PackageSet::try_from(packages)?))
+    }
+}
+
+/// The behaviours of a layers check with a baseline table: of edges, or of
+/// each database's tables for `unowned`.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EdgeBehaviours {
+    pub no_crossing: BehaviourConfig,
+    pub no_new_entries: BehaviourConfig,
+    pub stale_entries: BehaviourConfig,
+}
+
+/// Package names, or database names in `shared_catalogs`, each listed once.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(try_from = "Vec<String>")]
+pub struct PackageSet(BTreeSet<String>);
+
+#[derive(Debug, Error)]
+#[error("{0:?} is listed twice")]
+pub struct DuplicatePackageError(String);
+
+impl PackageSet {
+    pub fn contains(&self, package: &str) -> bool {
+        self.0.contains(package)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &String> {
+        self.0.iter()
+    }
+}
+
+impl TryFrom<Vec<String>> for PackageSet {
+    type Error = DuplicatePackageError;
+
+    fn try_from(packages: Vec<String>) -> Result<Self, Self::Error> {
+        let mut set = BTreeSet::new();
+        for package in packages {
+            if set.contains(&package) {
+                return Err(DuplicatePackageError(package));
+            }
+            set.insert(package);
+        }
+        Ok(Self(set))
+    }
+}
+
+/// `[rules.layers]` as `layers.policy_changed` compares it and
+/// `layers.stale_entries` places its findings: each entry with the 1-based
+/// line it is written on. Read leniently, so that the base branch's copy can
+/// have another schema.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LayersPolicy {
+    /// The line of the first `[rules.layers…]` header.
+    pub line: usize,
+    /// Package name to its layer as written.
+    pub unmoved: Entries<String>,
+    pub store_users: Entries<BTreeMap<String, usize>>,
+    pub allowed_edges: Entries<BTreeMap<String, usize>>,
+    pub storage: StoragePolicy,
+    /// `legacy`, each package with the line it is written on.
+    pub legacy: BTreeMap<String, usize>,
+    /// The line of the `legacy` key, or without one, of the
+    /// `[rules.layers]` header, if there is one.
+    pub legacy_line: Option<usize>,
+    /// `protocols`, each package with the line it is written on.
+    pub protocols: BTreeMap<String, usize>,
+    /// The line of the `protocols` key, or without one, of the
+    /// `[rules.layers]` header, if there is one.
+    pub protocols_line: Option<usize>,
+    /// `[rules.layers.domain_fences]`: each package to its family and the
+    /// line it is written on.
+    pub domain_fences: Entries<String>,
+    /// Shared catalog to the databases it is applied to.
+    pub shared_catalogs: Entries<BTreeMap<String, usize>>,
+    /// `[rules.layers.state.co_writers]`: each granted table, as
+    /// `<namespace>.<table>`, to the stores that may write it.
+    pub co_writers: Entries<BTreeMap<String, usize>>,
+    /// Behaviour name, such as `placement` or `direction.no_crossing`, to
+    /// its mode as written and the mode's line.
+    pub modes: BTreeMap<String, (String, usize)>,
+}
+
+/// `[rules.layers.storage]`'s lists, each package with the line it is
+/// written on.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoragePolicy {
+    /// The line of the table's header, if it has one.
+    pub line: Option<usize>,
+    pub drivers: BTreeMap<String, usize>,
+    pub helpers: BTreeMap<String, usize>,
+}
+
+impl LayersPolicy {
+    /// Whether the policy sets a mode of `check`, such as `unowned`, which
+    /// the checks configured as a whole always do.
+    pub fn has_check(&self, check: &str) -> bool {
+        let prefix = format!("{check}.");
+        self.modes
+            .keys()
+            .any(|behaviour| behaviour.starts_with(&prefix))
+    }
+}
+
+/// One table of `[rules.layers]` keyed by package name.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Entries<V> {
+    /// The line of the table's header, if it has one.
+    pub line: Option<usize>,
+    /// Package name to its value and the line of its key.
+    pub entries: BTreeMap<String, (V, usize)>,
+}
+
+#[derive(Deserialize)]
+struct PolicyFile {
+    #[serde(default)]
+    rules: PolicyRules,
+}
+
+#[derive(Default, Deserialize)]
+struct PolicyRules {
+    layers: Option<PolicyTable>,
+}
+
+/// `flatten` and `untagged` would lose the spans, so each behaviour is a
+/// field.
+#[derive(Deserialize)]
+struct PolicyTable {
+    unmoved: Option<BTreeMap<String, Vec<Spanned<String>>>>,
+    store_users: Option<BTreeMap<Spanned<String>, Vec<Spanned<String>>>>,
+    allowed_edges: Option<BTreeMap<Spanned<String>, Vec<Spanned<String>>>>,
+    storage: Option<PolicyStorage>,
+    legacy: Option<Spanned<Vec<Spanned<String>>>>,
+    protocols: Option<Spanned<Vec<Spanned<String>>>>,
+    domain_fences: Option<BTreeMap<String, Vec<Spanned<String>>>>,
+    placement: Option<PolicyBehaviour>,
+    layout: Option<PolicyBehaviour>,
+    direction: Option<PolicyEdgeBehaviours>,
+    dev_direction: Option<PolicyEdgeBehaviours>,
+    storage_access: Option<PolicyEdgeBehaviours>,
+    codec_features: Option<PolicyEdgeBehaviours>,
+    domain_dependencies: Option<PolicyEdgeBehaviours>,
+    model_protocol: Option<PolicyEdgeBehaviours>,
+    test_only: Option<PolicyBehaviour>,
+    clients: Option<PolicyBehaviour>,
+    store_edges: Option<PolicyBehaviour>,
+    stale_entries: Option<PolicyBehaviour>,
+    policy_changed: Option<PolicyBehaviour>,
+    state: Option<PolicyState>,
+    unowned: Option<PolicyEdgeBehaviours>,
+}
+
+/// Each table to the packages listed for it.
+type PolicyLists = BTreeMap<Spanned<String>, Vec<Spanned<String>>>;
+
+#[derive(Deserialize)]
+struct PolicyState {
+    shared_catalogs: Option<PolicyLists>,
+    co_writers: Option<PolicyCoWriters>,
+    owners: Option<PolicyBehaviour>,
+    declarations: Option<PolicyBehaviour>,
+    writes: Option<PolicyBehaviour>,
+    pending: Option<PolicyBehaviour>,
+}
+
+#[derive(Deserialize)]
+struct PolicyCoWriters {
+    postgres: Option<PolicyLists>,
+    sqlite: Option<BTreeMap<String, PolicyLists>>,
+}
+
+#[derive(Deserialize)]
+struct PolicyStorage {
+    drivers: Option<Vec<Spanned<String>>>,
+    helpers: Option<Vec<Spanned<String>>>,
+}
+
+#[derive(Deserialize)]
+struct PolicyEdgeBehaviours {
+    no_crossing: Option<PolicyBehaviour>,
+    no_new_entries: Option<PolicyBehaviour>,
+    stale_entries: Option<PolicyBehaviour>,
+}
+
+#[derive(Deserialize)]
+struct PolicyBehaviour {
+    mode: Option<Spanned<String>>,
+}
+
+impl LayersPolicy {
+    /// `[rules.layers]` of `text`, or `None` without one. Other tables and
+    /// unknown keys are ignored.
+    pub fn parse(text: &str) -> Result<Option<Self>, toml::de::Error> {
+        let file: PolicyFile = toml::from_str(text)?;
+        let Some(table) = file.rules.layers else {
+            return Ok(None);
+        };
+        let line = |span: std::ops::Range<usize>| line_of(text, span.start);
+        let header = |name: &str| header_line(text, &format!("[rules.layers.{name}]"));
+        let grouped =
+            |name: &str, groups: Option<BTreeMap<String, Vec<Spanned<String>>>>| Entries {
+                line: header(name),
+                entries: groups
+                    .unwrap_or_default()
+                    .into_iter()
+                    .flat_map(|(group, packages)| {
+                        packages.into_iter().map(move |package| {
+                            let at = line(package.span());
+                            (package.into_inner(), (group.clone(), at))
+                        })
+                    })
+                    .collect(),
+            };
+        let unmoved = grouped("unmoved", table.unmoved);
+        let domain_fences = grouped("domain_fences", table.domain_fences);
+        let lists =
+            |name: &str, lists: Option<BTreeMap<Spanned<String>, Vec<Spanned<String>>>>| Entries {
+                line: header(name),
+                entries: lists
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(package, listed)| {
+                        let at = line(package.span());
+                        let listed = listed
+                            .into_iter()
+                            .map(|item| {
+                                let at = line(item.span());
+                                (item.into_inner(), at)
+                            })
+                            .collect();
+                        (package.into_inner(), (listed, at))
+                    })
+                    .collect(),
+            };
+        let store_users = lists("store_users", table.store_users);
+        let allowed_edges = lists("allowed_edges", table.allowed_edges);
+        let packages = |list: Option<Vec<Spanned<String>>>| {
+            list.unwrap_or_default()
+                .into_iter()
+                .map(|item| {
+                    let at = line(item.span());
+                    (item.into_inner(), at)
+                })
+                .collect()
+        };
+        let storage = match table.storage {
+            None => StoragePolicy::default(),
+            Some(storage) => StoragePolicy {
+                line: header("storage"),
+                drivers: packages(storage.drivers),
+                helpers: packages(storage.helpers),
+            },
+        };
+        let legacy_line = match &table.legacy {
+            Some(legacy) => Some(line(legacy.span())),
+            None => header_line(text, "[rules.layers]"),
+        };
+        let legacy = packages(table.legacy.map(Spanned::into_inner));
+        let protocols_line = match &table.protocols {
+            Some(protocols) => Some(line(protocols.span())),
+            None => header_line(text, "[rules.layers]"),
+        };
+        let protocols = packages(table.protocols.map(Spanned::into_inner));
+        let (shared_catalogs, co_writers, state) = match table.state {
+            Some(state) => (
+                lists("state.shared_catalogs", state.shared_catalogs),
+                co_writers(text, state.co_writers),
+                vec![
+                    ("owners", state.owners),
+                    ("declarations", state.declarations),
+                    ("writes", state.writes),
+                    ("pending", state.pending),
+                ],
+            ),
+            None => (
+                lists("state.shared_catalogs", None),
+                co_writers(text, None),
+                Vec::new(),
+            ),
+        };
+        let mut modes = BTreeMap::new();
+        let mut mode = |behaviour: String, entry: Option<PolicyBehaviour>| {
+            if let Some(mode) = entry.and_then(|entry| entry.mode) {
+                modes.insert(behaviour, (mode.get_ref().clone(), line(mode.span())));
+            }
+        };
+        for (behaviour, entry) in [
+            ("placement", table.placement),
+            ("layout", table.layout),
+            ("test_only", table.test_only),
+            ("clients", table.clients),
+            ("store_edges", table.store_edges),
+            ("stale_entries", table.stale_entries),
+            ("policy_changed", table.policy_changed),
+        ] {
+            mode(behaviour.to_owned(), entry);
+        }
+        for (behaviour, entry) in state {
+            mode(format!("state.{behaviour}"), entry);
+        }
+        for (check, entry) in [
+            ("direction", table.direction),
+            ("dev_direction", table.dev_direction),
+            ("storage_access", table.storage_access),
+            ("codec_features", table.codec_features),
+            ("domain_dependencies", table.domain_dependencies),
+            ("model_protocol", table.model_protocol),
+            ("unowned", table.unowned),
+        ] {
+            let Some(entry) = entry else { continue };
+            for (behaviour, entry) in [
+                ("no_crossing", entry.no_crossing),
+                ("no_new_entries", entry.no_new_entries),
+                ("stale_entries", entry.stale_entries),
+            ] {
+                mode(format!("{check}.{behaviour}"), entry);
+            }
+        }
+        let line = text
+            .lines()
+            .position(|line| {
+                let line = line.trim_start();
+                line.starts_with("[rules.layers]") || line.starts_with("[rules.layers.")
+            })
+            .map_or(1, |index| index + 1);
+        Ok(Some(Self {
+            line,
+            unmoved,
+            store_users,
+            allowed_edges,
+            storage,
+            legacy,
+            legacy_line,
+            protocols,
+            protocols_line,
+            domain_fences,
+            shared_catalogs,
+            co_writers,
+            modes,
+        }))
+    }
+}
+
+/// `[rules.layers.state.co_writers]` of `text`, keyed by
+/// `<namespace>.<table>`, with the table named as the state checks key it
+/// and the stores of two keys that name it merged.
+fn co_writers(text: &str, table: Option<PolicyCoWriters>) -> Entries<BTreeMap<String, usize>> {
+    let line = |span: std::ops::Range<usize>| line_of(text, span.start);
+    let (postgres, sqlite) = table.map_or((None, None), |table| (table.postgres, table.sqlite));
+    let namespaces = postgres
+        .map(|tables| (POSTGRES.to_owned(), tables))
+        .into_iter()
+        .chain(
+            sqlite
+                .into_iter()
+                .flatten()
+                .map(|(database, tables)| (sqlite_namespace(&database), tables)),
+        );
+    let mut entries = BTreeMap::new();
+    for (namespace, tables) in namespaces {
+        for (table, stores) in tables {
+            let at = line(table.span());
+            let stores = stores.into_iter().map(|store| {
+                let at = line(store.span());
+                (store.into_inner(), at)
+            });
+            let table = declared_table(Dialect::of(&namespace), table.get_ref());
+            // A base branch's copy may name a table twice, which grants it
+            // the stores of both.
+            let (granted, _) = entries
+                .entry(format!("{namespace}.{table}"))
+                .or_insert_with(|| (BTreeMap::new(), at));
+            granted.extend(stores);
+        }
+    }
+    Entries {
+        line: header_line(text, "[rules.layers.state.co_writers"),
+        entries,
+    }
+}
+
+/// The 1-based line of the first line of `text` that starts with `header`,
+/// after leading whitespace.
+fn header_line(text: &str, header: &str) -> Option<usize> {
+    text.lines()
+        .position(|line| line.trim_start().starts_with(header))
+        .map(|index| index + 1)
+}

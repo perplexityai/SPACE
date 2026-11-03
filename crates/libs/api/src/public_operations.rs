@@ -1459,6 +1459,25 @@ pub struct InlineOrgLimit {
     pub claim_stale_after: Duration,
 }
 
+/// Cost: the organization's running operations, however claimed, through
+/// `idx_public_operations_org_state`, which has none of the other columns, so
+/// the claim-token, claim-time and kind filters apply after the read. Without
+/// that index this read every running row in the fleet through
+/// `idx_public_operations_state_next_attempt`, or, under a generic plan,
+/// intersected that with every operation the organization retains through
+/// `idx_public_operations_tenant_created`. A constant rather than a literal at
+/// its query site so `inline_org_limit_plan_tests` can `EXPLAIN` the text this
+/// runs.
+const INLINE_ORG_AT_LIMIT: &str = sql!(
+    "SELECT COUNT(*) >= $2
+       FROM public_operations
+      WHERE state = $3
+        AND org_id = $1
+        AND starts_with(claim_token, $4)
+        AND claimed_at > NOW() - make_interval(secs => $5::BIGINT)
+        AND kind <> ALL($6)"
+);
+
 /// Whether `org_id` already has `limit` operations other than teardowns
 /// running under a live admission claim, the claims processes take to
 /// execute what they admit (warm-pool creates included). The dispatcher's
@@ -1470,12 +1489,7 @@ pub struct InlineOrgLimit {
 /// one. Each such admission holds an inline permit in its process, so the
 /// overshoot is bounded by the permits free across the API processes.
 ///
-/// No index leads with the organization and the state, so this reads more
-/// than the organization's running rows: every running row in the fleet
-/// through `(state, next_attempt_at)`, or, under a generic plan, every
-/// operation the organization retains through `(org_id, created_at)`. An
-/// `(org_id, state, claimed_at)` index bounds it to the organization's
-/// running rows.
+/// Counted with [`INLINE_ORG_AT_LIMIT`]; see there for what it reads.
 async fn inline_org_at_limit_tx(
     tx: &mut Transaction<'_, Postgres>,
     org_id: OrgId,
@@ -1485,23 +1499,15 @@ async fn inline_org_at_limit_tx(
         .iter()
         .map(|kind| kind.as_str().to_string())
         .collect::<Vec<_>>();
-    sqlx::query_scalar::<_, bool>(sql!(
-        "SELECT COUNT(*) >= $2
-           FROM public_operations
-          WHERE state = $3
-            AND org_id = $1
-            AND starts_with(claim_token, $4)
-            AND claimed_at > NOW() - make_interval(secs => $5::BIGINT)
-            AND kind <> ALL($6)"
-    ))
-    .bind(org_id)
-    .bind(i64::from(org_limit.limit.get()))
-    .bind(OperationState::Running.as_str())
-    .bind(ADMISSION_CLAIM_TOKEN_PREFIX)
-    .bind(duration_secs_i64(org_limit.claim_stale_after))
-    .bind(&teardown_labels)
-    .fetch_one(&mut **tx)
-    .await
+    sqlx::query_scalar::<_, bool>(INLINE_ORG_AT_LIMIT)
+        .bind(org_id)
+        .bind(i64::from(org_limit.limit.get()))
+        .bind(OperationState::Running.as_str())
+        .bind(ADMISSION_CLAIM_TOKEN_PREFIX)
+        .bind(duration_secs_i64(org_limit.claim_stale_after))
+        .bind(&teardown_labels)
+        .fetch_one(&mut **tx)
+        .await
 }
 
 /// Why admission left an operation it created queued instead of claiming it
@@ -3982,5 +3988,9 @@ fn duration_secs_i64(duration: Duration) -> i64 {
     i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
 }
 
+#[cfg(test)]
+mod inline_org_limit_plan_tests;
+#[cfg(test)]
+mod plan_explain;
 #[cfg(test)]
 mod tests;

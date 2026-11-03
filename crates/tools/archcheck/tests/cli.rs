@@ -2,12 +2,13 @@
 //! inventory, findings and the baseline; the binary for modes, exit codes,
 //! formats and arguments.
 
-use std::{fs, path::Path, process::Command};
+use std::{collections::BTreeMap, fs, path::Path, process::Command};
 
 use pplx_space_archcheck::{
     BaseBaseline, Baseline, Context, Renames, check,
-    config::CrateNamesPolicy,
+    config::BaseArchitecture,
     context::count_code_lines,
+    finding::Finding,
     report::{Format, render},
     skipped, write_baseline,
 };
@@ -172,7 +173,7 @@ fn load_with(root: &Path, base: Option<&str>, architecture: Option<&str>) -> Con
         let path = root.join("base-architecture.toml");
         fs::write(&path, text).expect("write the base architecture");
         ctx.base_architecture =
-            CrateNamesPolicy::load_base(&path).expect("the base architecture is readable");
+            BaseArchitecture::load(&path).expect("the base architecture is readable");
     }
     ctx
 }
@@ -1524,12 +1525,18 @@ fn crate_names_policy_changed() {
         "archcheck: warning: could not parse {} at line 1: ",
         base.display()
     );
-    let last = run_unusable.stdout.lines().last().unwrap();
-    assert!(
-        last.starts_with(&warning) && last.ends_with("; crate_names.policy_changed skipped"),
-        "{}",
-        run_unusable.stdout
-    );
+    // Without [rules.layers] here, whether the base has it is unknown too.
+    let last: Vec<&str> = run_unusable.stdout.lines().rev().take(2).collect();
+    for (line, skipped) in last.iter().rev().zip([
+        "; crate_names.policy_changed skipped",
+        "; layers.policy_changed's check for the rule's removal skipped",
+    ]) {
+        assert!(
+            line.starts_with(&warning) && line.ends_with(skipped),
+            "{}",
+            run_unusable.stdout
+        );
+    }
     assert!(run(ws.path(), &[]).stdout.ends_with(POLICY_SKIPPED));
     let missing = ws.path().join("missing.toml");
     let run_missing = run(
@@ -4910,4 +4917,5142 @@ fn pattern_ratchet_errors_point_at_the_line() {
         );
         assert!(error.contains(problem), "{key}: {error}");
     }
+}
+
+/// Every behaviour of the layers rule, as `[rules.layers.<behaviour>]`.
+const LAYERS_BEHAVIOURS: [&str; 25] = [
+    "placement",
+    "layout",
+    "direction.no_crossing",
+    "direction.no_new_entries",
+    "direction.stale_entries",
+    "dev_direction.no_crossing",
+    "dev_direction.no_new_entries",
+    "dev_direction.stale_entries",
+    "storage_access.no_crossing",
+    "storage_access.no_new_entries",
+    "storage_access.stale_entries",
+    "codec_features.no_crossing",
+    "codec_features.no_new_entries",
+    "codec_features.stale_entries",
+    "domain_dependencies.no_crossing",
+    "domain_dependencies.no_new_entries",
+    "domain_dependencies.stale_entries",
+    "model_protocol.no_crossing",
+    "model_protocol.no_new_entries",
+    "model_protocol.stale_entries",
+    "test_only",
+    "clients",
+    "store_edges",
+    "stale_entries",
+    "policy_changed",
+];
+
+/// The workspace members of a layered workspace, as `(member, package)`: one
+/// or two per layer, a service with a server and a client, and two stores.
+const LAYERED: [(&str, &str); 12] = [
+    ("crates/l10_foundation/f", "pplx-space-f"),
+    ("crates/l10_foundation/g", "pplx-space-g"),
+    ("crates/l20_domain/d", "pplx-space-d"),
+    ("crates/l30_storage/s/store", "pplx-space-s-store"),
+    ("crates/l30_storage/t/store", "pplx-space-t-store"),
+    ("crates/l40_api/a/server", "pplx-space-a"),
+    ("crates/l40_api/a/client", "pplx-space-a-client"),
+    ("crates/l40_api/b/client", "pplx-space-b-client"),
+    ("crates/l50_app/p", "pplx-space-p"),
+    ("crates/l50_app/q", "pplx-space-q"),
+    ("crates/test_support/fixtures", "pplx-space-fixtures"),
+    ("crates/tools/bench", "pplx-space-bench"),
+];
+
+/// The `[rules.layers.storage]` [`layers_config`] adds when its tables lack
+/// one.
+const STORAGE: &str = "[rules.layers.storage]\ndrivers = [\"redis\", \"sqlx\"]\n";
+
+/// [`config`] with file_size's behaviours advisory, followed by
+/// `[rules.layers]`: its `tables` (`unmoved`, `store_users`,
+/// `allowed_edges` and `storage`, as TOML; [`STORAGE`] without `storage`)
+/// and every check in `mode`, except `policy_changed`, which is advisory.
+fn layers_config(tables: &str, mode: &str) -> String {
+    let mut text = format!("{}{tables}", config(ADVISORY));
+    if !tables.contains("[rules.layers.storage]") {
+        text.push_str(STORAGE);
+    }
+    for behaviour in LAYERS_BEHAVIOURS {
+        let mode = if behaviour == "policy_changed" {
+            "advisory"
+        } else {
+            mode
+        };
+        text.push_str(&format!("[rules.layers.{behaviour}]\nmode = \"{mode}\"\n"));
+    }
+    text
+}
+
+/// A baseline with an empty `[file_size]`, the two layers tables with these
+/// edges as `(from, to)`, and an empty `[crate_names]`.
+fn layers_baseline(direction: &[(&str, &str)], dev_direction: &[(&str, &str)]) -> String {
+    let table = |name: &str, edges: &[(&str, &str)]| {
+        let mut text = format!("[layers.{name}]\n");
+        for (from, to) in edges {
+            text.push_str(&format!("{from:?} = [{to:?}]\n"));
+        }
+        text
+    };
+    format!(
+        "[file_size]\n{}{}[crate_names]\n",
+        table("dev_direction", dev_direction),
+        table("direction", direction)
+    )
+}
+
+/// A workspace of [`LAYERED`]'s members and `extra` ones, as `(member,
+/// package)`, where each `(from, section, to)` of `dependencies` is a path
+/// dependency of `from` on `to` in the manifest `section`, such as
+/// `dev-dependencies`, under `to`'s name or, as `<key>=<package>`, renamed
+/// `<key>`. `ARCHITECTURE.toml` is [`layers_config`] of `tables` with every
+/// check required, the baseline [`layers_baseline`] without edges, and
+/// `files` are written over all of that.
+#[derive(Default)]
+struct Layered<'a> {
+    extra: &'a [(&'a str, &'a str)],
+    dependencies: &'a [(&'a str, &'a str, &'a str)],
+    tables: &'a str,
+    files: Vec<(&'a str, String)>,
+}
+
+impl Layered<'_> {
+    fn members(&self) -> Vec<(&str, &str)> {
+        LAYERED.iter().chain(self.extra).copied().collect()
+    }
+
+    /// The manifest of member `member`, package `name`.
+    fn manifest(&self, member: &str, name: &str) -> String {
+        let mut sections: BTreeMap<&str, String> = BTreeMap::new();
+        let up = "../".repeat(member.split('/').count());
+        for (from, section, to) in self.dependencies {
+            if *from != name {
+                continue;
+            }
+            let (key, to) = to.split_once('=').unwrap_or((to, to));
+            let (target, _) = self
+                .members()
+                .into_iter()
+                .find(|(_, package)| *package == to)
+                .expect("a dependency on a member");
+            let rename = if key == to {
+                String::new()
+            } else {
+                format!(", package = {to:?}")
+            };
+            sections
+                .entry(section)
+                .or_default()
+                .push_str(&format!("{key} = {{ path = \"{up}{target}\"{rename} }}\n"));
+        }
+        let mut text = package(name);
+        for (section, entries) in sections {
+            text.push_str(&format!("[{section}]\n{entries}"));
+        }
+        text
+    }
+
+    fn build(&self) -> TempDir {
+        let members = self.members();
+        let names: Vec<&str> = members.iter().map(|(member, _)| *member).collect();
+        let mut files: Vec<(String, String)> = vec![
+            (
+                "Cargo.toml".to_owned(),
+                format!("[workspace]\nmembers = {names:?}\n"),
+            ),
+            (
+                "ARCHITECTURE.toml".to_owned(),
+                layers_config(self.tables, "required"),
+            ),
+            (
+                "architecture-baseline.toml".to_owned(),
+                layers_baseline(&[], &[]),
+            ),
+        ];
+        files.extend(
+            members.iter().map(|(member, name)| {
+                (format!("{member}/Cargo.toml"), self.manifest(member, name))
+            }),
+        );
+        files.extend(
+            self.files
+                .iter()
+                .map(|(path, text)| ((*path).to_owned(), text.clone())),
+        );
+        let files: Vec<(&str, String)> = files
+            .iter()
+            .map(|(path, text)| (path.as_str(), text.clone()))
+            .collect();
+        workspace(&files)
+    }
+}
+
+/// `(code, message, location)` of each layers finding, in reporting order.
+fn layer_findings(ctx: &Context) -> Vec<(String, String, String)> {
+    check(ctx)
+        .into_iter()
+        .filter(|finding| finding.rule == "layers")
+        .map(|finding| {
+            let at = format!("{}:{}", finding.location.path, finding.location.line);
+            (finding.code(), finding.message(), at)
+        })
+        .collect()
+}
+
+/// Asserts that `found` has one finding per `(code, start of message,
+/// location)` of `expected`, in order.
+fn assert_layer_findings(
+    name: &str,
+    found: &[(String, String, String)],
+    expected: &[(&str, &str, &str)],
+) {
+    assert_eq!(found.len(), expected.len(), "{name}: {found:#?}");
+    for ((code, message, at), (want_code, want_message, want_at)) in found.iter().zip(expected) {
+        assert_eq!(code, want_code, "{name}: {message}");
+        assert!(message.starts_with(want_message), "{name}: {message}");
+        assert_eq!(at, want_at, "{name}: {message}");
+    }
+}
+
+/// The 1-based line of the first line of `text` containing `needle`.
+fn line_with(text: &str, needle: &str) -> usize {
+    text.lines()
+        .position(|line| line.contains(needle))
+        .expect("the text has the line")
+        + 1
+}
+
+/// A member takes its layer from its directory, or else from its `unmoved`
+/// entry; one with neither is reported on its `name =` line. An `unmoved`
+/// entry the base branch's `[rules.layers]` lacks, or lists in another
+/// layer, is reported on its line, but not when the base has no such table,
+/// and without `--base-architecture` the check is skipped with a line saying
+/// so.
+#[test]
+fn layers_placement() {
+    const OLD: [(&str, &str); 1] = [("crates/libs/old", "pplx-space-old")];
+    let unresolved = Layered {
+        extra: &OLD,
+        ..Layered::default()
+    }
+    .build();
+    assert_layer_findings(
+        "unresolved",
+        &layer_findings(&load(unresolved.path(), None)),
+        &[(
+            "layers.placement",
+            "crates/libs/old/Cargo.toml: pplx-space-old is at crates/libs/old, outside the layer \
+             directories, and [rules.layers] unmoved in ARCHITECTURE.toml has no entry for it. \
+             Put the crate in its layer's directory, crates/<layer>/old,",
+            "crates/libs/old/Cargo.toml:2",
+        )],
+    );
+
+    // The entry gives the crate its layer, which its edges are checked by.
+    let unmoved = "[rules.layers.unmoved]\nl20_domain = [\"pplx-space-old\"]\n";
+    let ws = Layered {
+        extra: &OLD,
+        dependencies: &[("pplx-space-old", "dependencies", "pplx-space-a")],
+        tables: unmoved,
+        ..Layered::default()
+    }
+    .build();
+    assert_layer_findings(
+        "unmoved",
+        &layer_findings(&load(ws.path(), None)),
+        &[(
+            "layers.direction.no_crossing",
+            "crates/libs/old/Cargo.toml: pplx-space-old (l20_domain) depends on pplx-space-a \
+             (l40_api)",
+            "crates/libs/old/Cargo.toml:6",
+        )],
+    );
+    let skip = "layers.policy_changed and layers.placement's check for new or changed unmoved \
+                entries skipped (no --base-architecture given)";
+    assert!(
+        skipped(&load(ws.path(), None))
+            .iter()
+            .any(|line| line == skip),
+        "{:?}",
+        skipped(&load(ws.path(), None))
+    );
+
+    // Against a base whose [rules.layers] lacks the entry, it is new; against
+    // one without the rule, the pull request seeds the table.
+    let architecture = layers_config(unmoved, "required");
+    let entry = format!(
+        "ARCHITECTURE.toml:{}",
+        line_with(&architecture, "\"pplx-space-old\"")
+    );
+    type Case<'a> = (&'a str, String, &'a [(&'a str, &'a str, &'a str)]);
+    let cases: &[Case] = &[
+        (
+            "a base with the rule",
+            layers_config("", "required"),
+            &[(
+                "layers.placement",
+                "pplx-space-old: was added to [rules.layers] unmoved in ARCHITECTURE.toml, which \
+                 lists only crates that predate the layer directories and is not to grow. Put the \
+                 crate in crates/l20_domain/old instead.",
+                &entry,
+            )],
+        ),
+        (
+            "a base with the entry in another layer",
+            layers_config(
+                "[rules.layers.unmoved]\nl40_api = [\"pplx-space-old\"]\n",
+                "required",
+            ),
+            &[(
+                "layers.placement",
+                "pplx-space-old: moved from l40_api to l20_domain in [rules.layers] unmoved in \
+                 ARCHITECTURE.toml, but an entry keeps the layer its crate had when the layer \
+                 directories were added. A crate changes layer by moving into that layer's \
+                 directory: put it in crates/l20_domain/old and remove the entry.",
+                &entry,
+            )],
+        ),
+        ("a base with the entry", architecture.clone(), &[]),
+        ("a base without the rule", config(ADVISORY), &[]),
+    ];
+    let ws = Layered {
+        extra: &OLD,
+        tables: unmoved,
+        ..Layered::default()
+    }
+    .build();
+    for (name, base, expected) in cases {
+        let ctx = load_with(ws.path(), None, Some(base));
+        let found: Vec<_> = layer_findings(&ctx)
+            .into_iter()
+            .filter(|(code, _, _)| code != "layers.policy_changed")
+            .collect();
+        assert_layer_findings(name, &found, expected);
+        assert!(
+            !skipped(&ctx).iter().any(|line| line.contains("placement")),
+            "{name}: {:?}",
+            skipped(&ctx)
+        );
+    }
+
+    // The layer change is reported to review as well.
+    let base = layers_config(
+        "[rules.layers.unmoved]\nl40_api = [\"pplx-space-old\"]\n",
+        "required",
+    );
+    let changed: Vec<_> = layer_findings(&load_with(ws.path(), None, Some(&base)))
+        .into_iter()
+        .filter(|(code, _, _)| code == "layers.policy_changed")
+        .collect();
+    assert_layer_findings(
+        "policy_changed",
+        &changed,
+        &[(
+            "layers.policy_changed",
+            "ARCHITECTURE.toml: `pplx-space-old` moved from l40_api to l20_domain in \
+             [rules.layers] unmoved.",
+            &entry,
+        )],
+    );
+}
+
+/// Below its layer directory, a crate's path is its package name without
+/// `pplx-space-`, split on `-`, optionally with one more directory without
+/// `-`; and no crate is inside another, which is reported on the outer one.
+#[test]
+fn layers_layout() {
+    type Case<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [(&'a str, &'a str)]);
+    let cases: &[Case] = &[
+        (
+            "the exact path",
+            &[("crates/l20_domain/x/y", "pplx-space-x-y")],
+            &[],
+        ),
+        (
+            "the path and a leaf",
+            &[("crates/l20_domain/x/y/server", "pplx-space-x-y")],
+            &[],
+        ),
+        (
+            "a wrong path",
+            &[("crates/l20_domain/x/z", "pplx-space-x-y")],
+            &[(
+                "crates/l20_domain/x/z/Cargo.toml: pplx-space-x-y is at crates/l20_domain/x/z, but \
+                 below crates/l20_domain a crate's directory is its package name without \
+                 `pplx-space-`, split on `-`: crates/l20_domain/x/y, or one directory below that",
+                "crates/l20_domain/x/z/Cargo.toml:2",
+            )],
+        ),
+        (
+            "a directory with a `-`",
+            &[("crates/l20_domain/x-y", "pplx-space-x-y")],
+            &[(
+                "crates/l20_domain/x-y/Cargo.toml: pplx-space-x-y is at crates/l20_domain/x-y",
+                "crates/l20_domain/x-y/Cargo.toml:2",
+            )],
+        ),
+        (
+            "a leaf with a `-`",
+            &[("crates/l20_domain/x/y/grpc-server", "pplx-space-x-y")],
+            &[(
+                "crates/l20_domain/x/y/grpc-server/Cargo.toml: pplx-space-x-y is at",
+                "crates/l20_domain/x/y/grpc-server/Cargo.toml:2",
+            )],
+        ),
+        (
+            "a crate inside another",
+            &[
+                ("crates/l20_domain/x", "pplx-space-x"),
+                ("crates/l20_domain/x/y", "pplx-space-x-y"),
+            ],
+            &[(
+                "crates/l20_domain/x/Cargo.toml: pplx-space-x at crates/l20_domain/x contains the \
+                 crate pplx-space-x-y at crates/l20_domain/x/y, but no crate goes inside another \
+                 crate's directory. Move pplx-space-x one directory down, to \
+                 crates/l20_domain/x/<leaf>",
+                "crates/l20_domain/x/Cargo.toml:2",
+            )],
+        ),
+        (
+            "a crate inside one that already has a leaf",
+            &[
+                ("crates/l20_domain/x/server", "pplx-space-x"),
+                ("crates/l20_domain/x/server/y", "pplx-space-x-server-y"),
+            ],
+            &[(
+                "crates/l20_domain/x/server/Cargo.toml: pplx-space-x at crates/l20_domain/x/server \
+                 contains the crate pplx-space-x-server-y at crates/l20_domain/x/server/y, but no \
+                 crate goes inside another crate's directory. pplx-space-x already sits in a leaf \
+                 directory, so move one of them: pplx-space-x to another leaf, \
+                 crates/l20_domain/x/<leaf>, or pplx-space-x-server-y out. See \
+                 crates/tools/archcheck/README.md#layers.",
+                "crates/l20_domain/x/server/Cargo.toml:2",
+            )],
+        ),
+    ];
+    for (name, extra, expected) in cases {
+        let ws = Layered {
+            extra,
+            ..Layered::default()
+        }
+        .build();
+        let expected: Vec<(&str, &str, &str)> = expected
+            .iter()
+            .map(|(message, at)| ("layers.layout", *message, *at))
+            .collect();
+        assert_layer_findings(name, &layer_findings(&load(ws.path(), None)), &expected);
+    }
+}
+
+/// Normal and build edges follow the layer matrix, whatever the manifest
+/// calls the dependency and for whatever target; a dev-dependency that
+/// duplicates a normal one is not counted again. The message names the
+/// items the source uses through the edge and the dependents that keep its
+/// crate from moving up.
+#[test]
+fn layers_direction() {
+    type Case<'a> = (
+        &'a str,
+        &'a [(&'a str, &'a str, &'a str)],
+        &'a str,
+        Vec<(&'a str, String)>,
+        &'a [(&'a str, &'a str, &'a str)],
+    );
+    let crossing = "layers.direction.no_crossing";
+    let cases: &[Case] = &[
+        (
+            "Foundation to Domain",
+            &[("pplx-space-f", "dependencies", "pplx-space-d")],
+            "",
+            vec![],
+            &[(
+                crossing,
+                "crates/l10_foundation/f/Cargo.toml: pplx-space-f (l10_foundation) depends on \
+                 pplx-space-d (l20_domain), a normal dependency, but l10_foundation may depend \
+                 only on l10_foundation. Fix one of: move the items it uses down into \
+                 l10_foundation or below; move pplx-space-f up into crates/l20_domain/f; no \
+                 dependent's layer blocks that; or invert the edge, with a trait that \
+                 pplx-space-f defines and pplx-space-d implements. See \
+                 crates/tools/archcheck/README.md#layers.",
+                "crates/l10_foundation/f/Cargo.toml:6",
+            )],
+        ),
+        (
+            "Foundation to Foundation",
+            &[("pplx-space-f", "dependencies", "pplx-space-g")],
+            "",
+            vec![],
+            &[],
+        ),
+        (
+            "Storage to API",
+            &[("pplx-space-s-store", "dependencies", "pplx-space-a")],
+            "",
+            vec![],
+            &[(
+                crossing,
+                "crates/l30_storage/s/store/Cargo.toml: pplx-space-s-store (l30_storage) depends \
+                 on pplx-space-a (l40_api), a normal dependency, but l30_storage may depend only \
+                 on the stores that list it, l20_domain and l10_foundation.",
+                "crates/l30_storage/s/store/Cargo.toml:6",
+            )],
+        ),
+        (
+            "API to Domain",
+            &[("pplx-space-a", "dependencies", "pplx-space-d")],
+            "",
+            vec![],
+            &[],
+        ),
+        (
+            "App to App, naming what it uses",
+            &[("pplx-space-p", "dependencies", "pplx-space-q")],
+            "",
+            vec![(
+                "crates/l50_app/p/src/lib.rs",
+                "use pplx_space_q::{\n    config::{Config, self},\n    Run as Start,\n    \
+                 serve,\n};\nfn f() { pplx_space_q::util::helper::<u8>(); other::pplx_space_q::x(); }\n"
+                    .to_owned(),
+            )],
+            &[(
+                crossing,
+                "crates/l50_app/p/Cargo.toml: pplx-space-p (l50_app) depends on pplx-space-q \
+                 (l50_app), a normal dependency, but l50_app may depend only on l40_api, \
+                 l20_domain and l10_foundation. An app composes API crates but never another \
+                 app: move what pplx-space-p uses from pplx-space-q (pplx_space_q::Run, \
+                 pplx_space_q::config, pplx_space_q::config::Config, pplx_space_q::serve, \
+                 pplx_space_q::util::helper) into an l40_api crate both can depend on.",
+                "crates/l50_app/p/Cargo.toml:6",
+            )],
+        ),
+        (
+            "App to Storage",
+            &[("pplx-space-p", "dependencies", "pplx-space-s-store")],
+            "",
+            vec![],
+            &[(
+                crossing,
+                "crates/l50_app/p/Cargo.toml: pplx-space-p (l50_app) depends on \
+                 pplx-space-s-store (l30_storage), a normal dependency, but l50_app may depend \
+                 only on l40_api, l20_domain and l10_foundation. An app reaches state only \
+                 through API crates",
+                "crates/l50_app/p/Cargo.toml:6",
+            )],
+        ),
+        (
+            "App to Storage, allowed by name",
+            &[("pplx-space-p", "dependencies", "pplx-space-s-store")],
+            "[rules.layers.allowed_edges]\npplx-space-p = [\"pplx-space-s-store\"]\n",
+            vec![],
+            &[],
+        ),
+        (
+            "a build-dependency",
+            &[("pplx-space-f", "build-dependencies", "pplx-space-d")],
+            "",
+            vec![],
+            &[(
+                crossing,
+                "crates/l10_foundation/f/Cargo.toml: pplx-space-f (l10_foundation) depends on \
+                 pplx-space-d (l20_domain), a build-dependency,",
+                "crates/l10_foundation/f/Cargo.toml:6",
+            )],
+        ),
+        (
+            "a renamed dependency",
+            &[("pplx-space-f", "dependencies", "dom=pplx-space-d")],
+            "",
+            vec![(
+                "crates/l10_foundation/f/src/lib.rs",
+                "use dom::Id;\nuse pplx_space_d::Unseen;\n".to_owned(),
+            )],
+            &[(
+                crossing,
+                "crates/l10_foundation/f/Cargo.toml: pplx-space-f (l10_foundation) depends on \
+                 pplx-space-d (l20_domain), renamed dom, a normal dependency, but l10_foundation \
+                 may depend only on l10_foundation. Fix one of: move the items it uses (dom::Id) \
+                 down",
+                "crates/l10_foundation/f/Cargo.toml:6",
+            )],
+        ),
+        (
+            "a target's dependency",
+            &[("pplx-space-f", "target.'cfg(unix)'.dependencies", "pplx-space-d")],
+            "",
+            vec![],
+            &[(
+                crossing,
+                "crates/l10_foundation/f/Cargo.toml: pplx-space-f (l10_foundation) depends on \
+                 pplx-space-d (l20_domain), a normal dependency, for target cfg(unix),",
+                "crates/l10_foundation/f/Cargo.toml:6",
+            )],
+        ),
+        (
+            "a dev-dependency duplicating a normal one",
+            &[
+                ("pplx-space-f", "dependencies", "pplx-space-d"),
+                ("pplx-space-f", "dev-dependencies", "pplx-space-d"),
+            ],
+            "",
+            vec![],
+            &[(
+                crossing,
+                "crates/l10_foundation/f/Cargo.toml: pplx-space-f (l10_foundation) depends on \
+                 pplx-space-d (l20_domain), a normal dependency,",
+                "crates/l10_foundation/f/Cargo.toml:6",
+            )],
+        ),
+        (
+            "blocking dependents",
+            &[
+                ("pplx-space-f", "dependencies", "pplx-space-d"),
+                ("pplx-space-g", "dependencies", "pplx-space-f"),
+                ("pplx-space-d", "dependencies", "pplx-space-f"),
+                ("pplx-space-a", "dev-dependencies", "pplx-space-f"),
+            ],
+            "",
+            vec![],
+            &[(
+                crossing,
+                "crates/l10_foundation/f/Cargo.toml: pplx-space-f (l10_foundation) depends on \
+                 pplx-space-d (l20_domain), a normal dependency, but l10_foundation may depend \
+                 only on l10_foundation. Fix one of: move the items it uses down into \
+                 l10_foundation or below; move pplx-space-f up into crates/l20_domain/f, once its \
+                 dependents whose layer can't depend on l20_domain have moved too \
+                 (pplx-space-g); or invert the edge",
+                "crates/l10_foundation/f/Cargo.toml:6",
+            )],
+        ),
+        (
+            "a dev dependent below the target's layer",
+            &[
+                ("pplx-space-f", "dependencies", "pplx-space-d"),
+                ("pplx-space-g", "dev-dependencies", "pplx-space-f"),
+            ],
+            "",
+            vec![],
+            &[(
+                crossing,
+                "crates/l10_foundation/f/Cargo.toml: pplx-space-f (l10_foundation) depends on \
+                 pplx-space-d (l20_domain), a normal dependency, but l10_foundation may depend \
+                 only on l10_foundation. Fix one of: move the items it uses down into \
+                 l10_foundation or below; move pplx-space-f up into crates/l20_domain/f, once its \
+                 dependents whose layer can't depend on l20_domain have moved too \
+                 (pplx-space-g); or invert the edge",
+                "crates/l10_foundation/f/Cargo.toml:6",
+            )],
+        ),
+        (
+            "Domain to Storage, where moving up makes it a store's user",
+            &[("pplx-space-d", "dependencies", "pplx-space-s-store")],
+            "",
+            vec![],
+            &[(
+                crossing,
+                "crates/l20_domain/d/Cargo.toml: pplx-space-d (l20_domain) depends on \
+                 pplx-space-s-store (l30_storage), a normal dependency, but l20_domain may depend \
+                 only on l20_domain and l10_foundation. Fix one of: move the items it uses down \
+                 into l20_domain or below; move pplx-space-d up into crates/l30_storage/d; no \
+                 dependent's layer blocks that, and as a store, each store it uses must then \
+                 list it in [rules.layers] store_users; or invert the edge",
+                "crates/l20_domain/d/Cargo.toml:6",
+            )],
+        ),
+        (
+            "Domain to App, where moving up can't help",
+            &[("pplx-space-d", "dependencies", "pplx-space-p")],
+            "",
+            vec![],
+            &[(
+                crossing,
+                "crates/l20_domain/d/Cargo.toml: pplx-space-d (l20_domain) depends on \
+                 pplx-space-p (l50_app), a normal dependency, but l20_domain may depend only on \
+                 l20_domain and l10_foundation. Fix one of: move the items it uses down into \
+                 l20_domain or below; or invert the edge, with a trait that pplx-space-d defines \
+                 and pplx-space-p implements. See crates/tools/archcheck/README.md#layers.",
+                "crates/l20_domain/d/Cargo.toml:6",
+            )],
+        ),
+    ];
+    for (name, dependencies, tables, files, expected) in cases {
+        let ws = Layered {
+            dependencies,
+            tables,
+            files: files.clone(),
+            ..Layered::default()
+        }
+        .build();
+        assert_layer_findings(name, &layer_findings(&load(ws.path(), None)), expected);
+    }
+}
+
+/// `[layers.direction]`'s edges are tolerated while they cross, reported once
+/// they don't, and compared with the base branch's copy: an entry its table
+/// lacks is new, unless the base has no layers rule yet, when the pull
+/// request seeds the table and each entry is advisory. A base whose
+/// `ARCHITECTURE.toml` has the rule, even one this branch can't read, but
+/// whose baseline has no layers tables tolerates nothing.
+#[test]
+fn layers_baselined_checks() {
+    const FD: (&str, &str) = ("pplx-space-f", "pplx-space-d");
+    const CROSSING: [(&str, &str, &str); 1] = [("pplx-space-f", "dependencies", "pplx-space-d")];
+    let with_rule = layers_config("", "required");
+    let without_rule = config(ADVISORY);
+    // Another schema of the rule, as a pull request that changes it sees the
+    // base's: the rule is there, so it does not seed the tables.
+    let other_shape = format!("{without_rule}[rules.layers]\nunmoved = 5\n");
+    let no_tables = baseline(&[]);
+    let empty_tables = layers_baseline(&[], &[]);
+    let dev_only = "[file_size]\n[layers.dev_direction]\n[crate_names]\n".to_owned();
+    let listed = layers_baseline(&[FD], &[]);
+    let entry_line = "architecture-baseline.toml:4";
+    let new = "pplx-space-f -> pplx-space-d: is in [layers.direction] in architecture-baseline.toml \
+               but not in the base branch's copy, and layer violations can't be added to the \
+               baseline.";
+    let seeds = "pplx-space-f -> pplx-space-d: is in [layers.direction] in \
+                 architecture-baseline.toml, and the base branch has no layers rule yet, so this \
+                 pull request seeds the table. Review each entry.";
+    let stale = |to: &str, reason: &str| {
+        format!(
+            "pplx-space-f -> {to}: is in [layers.direction] in architecture-baseline.toml, but \
+             {reason}. Remove the entry (cargo arch --write-baseline=layers.direction)."
+        )
+    };
+    /// Name, baseline edges, dependencies, base baseline, base architecture,
+    /// and `(code, start of message, required)` of each finding, all at the
+    /// entry's line.
+    type Case<'a> = (
+        &'a str,
+        &'a [(&'a str, &'a str)],
+        &'a [(&'a str, &'a str, &'a str)],
+        Option<&'a str>,
+        Option<&'a str>,
+        Vec<(&'a str, String, bool)>,
+    );
+    let cases: Vec<Case> = vec![
+        ("a listed edge", &[FD], &CROSSING, None, None, vec![]),
+        (
+            "a listed edge whose dependency is gone",
+            &[FD],
+            &[],
+            None,
+            None,
+            vec![(
+                "layers.direction.stale_entries",
+                stale(
+                    "pplx-space-d",
+                    "pplx-space-f has no normal or build dependency on pplx-space-d",
+                ),
+                true,
+            )],
+        ),
+        (
+            "a listed edge the layer order allows",
+            &[("pplx-space-f", "pplx-space-g")],
+            &[("pplx-space-f", "dependencies", "pplx-space-g")],
+            None,
+            None,
+            vec![(
+                "layers.direction.stale_entries",
+                stale(
+                    "pplx-space-g",
+                    "the layer order allows that edge now, or another layers check reports it",
+                ),
+                true,
+            )],
+        ),
+        (
+            "a listed edge of a deleted package",
+            &[("pplx-space-gone", "pplx-space-d")],
+            &[],
+            None,
+            None,
+            vec![(
+                "layers.direction.stale_entries",
+                "pplx-space-gone -> pplx-space-d: is in [layers.direction] in \
+                 architecture-baseline.toml, but no workspace member is named pplx-space-gone."
+                    .to_owned(),
+                true,
+            )],
+        ),
+        (
+            "an entry the base's table has",
+            &[FD],
+            &CROSSING,
+            Some(&listed),
+            Some(&with_rule),
+            vec![],
+        ),
+        (
+            "an entry the base's table lacks",
+            &[FD],
+            &CROSSING,
+            Some(&empty_tables),
+            Some(&with_rule),
+            vec![("layers.direction.no_new_entries", new.to_owned(), true)],
+        ),
+        (
+            "a base without the table but with another layers table",
+            &[FD],
+            &CROSSING,
+            Some(&dev_only),
+            None,
+            vec![("layers.direction.no_new_entries", new.to_owned(), true)],
+        ),
+        (
+            "a base without the rule seeds the table",
+            &[FD],
+            &CROSSING,
+            Some(&no_tables),
+            Some(&without_rule),
+            vec![("layers.direction.no_new_entries", seeds.to_owned(), false)],
+        ),
+        (
+            "a base baseline without the rule, and no base architecture",
+            &[FD],
+            &CROSSING,
+            Some(&no_tables),
+            None,
+            vec![("layers.direction.no_new_entries", seeds.to_owned(), false)],
+        ),
+        (
+            "a base with the rule but no layers tables",
+            &[FD],
+            &CROSSING,
+            Some(&no_tables),
+            Some(&with_rule),
+            vec![("layers.direction.no_new_entries", new.to_owned(), true)],
+        ),
+        (
+            "a base whose rule can't be read, and no layers tables",
+            &[FD],
+            &CROSSING,
+            Some(&no_tables),
+            Some(&other_shape),
+            vec![("layers.direction.no_new_entries", new.to_owned(), true)],
+        ),
+        (
+            "a base architecture that is not TOML, and no layers tables",
+            &[FD],
+            &CROSSING,
+            Some(&no_tables),
+            Some("[rules\n"),
+            vec![("layers.direction.no_new_entries", new.to_owned(), true)],
+        ),
+    ];
+    for (name, edges, dependencies, base, architecture, expected) in cases {
+        let ws = Layered {
+            dependencies,
+            files: vec![("architecture-baseline.toml", layers_baseline(edges, &[]))],
+            ..Layered::default()
+        }
+        .build();
+        let ctx = load_with(ws.path(), base, architecture);
+        let found: Vec<_> = check(&ctx)
+            .into_iter()
+            .filter(|finding| finding.rule == "layers" && finding.behaviour != "policy_changed")
+            .collect();
+        assert_eq!(found.len(), expected.len(), "{name}: {found:#?}");
+        for (finding, (code, message, required)) in found.iter().zip(&expected) {
+            assert_eq!(finding.code(), *code, "{name}");
+            assert!(
+                finding.message().starts_with(message.as_str()),
+                "{name}: {}",
+                finding.message()
+            );
+            assert_eq!(finding.mode.is_required(), *required, "{name}");
+            let at = format!("{}:{}", finding.location.path, finding.location.line);
+            assert_eq!(at, entry_line, "{name}");
+        }
+        let skips = skipped(&ctx);
+        assert_eq!(
+            skips
+                .iter()
+                .any(|line| line.contains("layers.direction.no_new_entries")),
+            base.is_none(),
+            "{name}: {skips:?}"
+        );
+    }
+}
+
+/// A crate that moves into its layer directory leaves its `unmoved` entry
+/// stale, and its baseline entries, keyed by package name, keep matching.
+#[test]
+fn layers_a_crate_moving_into_its_layer_directory() {
+    let unmoved = "[rules.layers.unmoved]\nl10_foundation = [\"pplx-space-old\"]\n";
+    let edges = [("pplx-space-old", "pplx-space-d")];
+    let baseline = layers_baseline(&edges, &[]);
+    let base_architecture = layers_config(unmoved, "required");
+    for (member, expected) in [
+        ("crates/libs/old", &[][..]),
+        (
+            "crates/l10_foundation/old",
+            &[(
+                "layers.stale_entries",
+                "pplx-space-old: is in [rules.layers] unmoved in ARCHITECTURE.toml, but the crate \
+                 is at crates/l10_foundation/old, whose directory gives its layer. Remove the \
+                 entry.",
+                "ARCHITECTURE.toml:",
+            )][..],
+        ),
+    ] {
+        let extra = [(member, "pplx-space-old")];
+        let ws = Layered {
+            extra: &extra,
+            dependencies: &[("pplx-space-old", "dependencies", "pplx-space-d")],
+            tables: unmoved,
+            files: vec![("architecture-baseline.toml", baseline.clone())],
+        }
+        .build();
+        let ctx = load_with(ws.path(), Some(&baseline), Some(&base_architecture));
+        let found = layer_findings(&ctx);
+        let line = format!(
+            "ARCHITECTURE.toml:{}",
+            line_with(&base_architecture, "\"pplx-space-old\"")
+        );
+        let expected: Vec<(&str, &str, &str)> = expected
+            .iter()
+            .map(|(code, message, _)| (*code, *message, line.as_str()))
+            .collect();
+        assert_layer_findings(member, &found, &expected);
+    }
+}
+
+/// One row per edge: the dependencies, `[rules.layers]`' tables, the baseline's
+/// `[layers.dev_direction]` edges, and each layers finding. Dev edges point
+/// at the crate's own layer or a lower one, or at test support; normal and
+/// build edges into test support, and any edge into tools, are `test_only`;
+/// a client depends only on Domain, Foundation and other clients; an API or
+/// Storage crate depends on a store only if the store lists it.
+#[test]
+fn layers_edge_checks() {
+    const S: &str = "crates/l30_storage/s/store/Cargo.toml";
+    const D: &str = "crates/l20_domain/d/Cargo.toml";
+    const A: &str = "crates/l40_api/a/server/Cargo.toml";
+    const CLIENT: &str = "crates/l40_api/a/client/Cargo.toml";
+    type Case<'a> = (
+        &'a str,
+        &'a [(&'a str, &'a str, &'a str)],
+        &'a str,
+        &'a [(&'a str, &'a str)],
+        &'a [(&'a str, &'a str, &'a str)],
+    );
+    let at = |manifest: &str| format!("{manifest}:6");
+    let (s, d, a, client) = (at(S), at(D), at(A), at(CLIENT));
+    fn dev<'a>(from: &'a str, to: &'a str) -> [(&'a str, &'a str, &'a str); 1] {
+        [(from, "dev-dependencies", to)]
+    }
+    fn normal<'a>(from: &'a str, to: &'a str) -> [(&'a str, &'a str, &'a str); 1] {
+        [(from, "dependencies", to)]
+    }
+    let s_dev_a = dev("pplx-space-s-store", "pplx-space-a");
+    let s_dev_fixtures = dev("pplx-space-s-store", "pplx-space-fixtures");
+    let f_dev_g = dev("pplx-space-f", "pplx-space-g");
+    let a_dev_d = dev("pplx-space-a", "pplx-space-d");
+    let d_fixtures = normal("pplx-space-d", "pplx-space-fixtures");
+    let d_dev_fixtures = dev("pplx-space-d", "pplx-space-fixtures");
+    let d_bench = normal("pplx-space-d", "pplx-space-bench");
+    let d_dev_bench = dev("pplx-space-d", "pplx-space-bench");
+    let bench_fixtures = normal("pplx-space-bench", "pplx-space-fixtures");
+    let fixtures_a = normal("pplx-space-fixtures", "pplx-space-a");
+    let client_a = normal("pplx-space-a-client", "pplx-space-a");
+    let client_store = normal("pplx-space-a-client", "pplx-space-s-store");
+    let client_client = normal("pplx-space-a-client", "pplx-space-b-client");
+    let client_d = normal("pplx-space-a-client", "pplx-space-d");
+    let a_store = normal("pplx-space-a", "pplx-space-s-store");
+    let s_store = normal("pplx-space-s-store", "pplx-space-t-store");
+    // Each lists only the user its case depends on: a user without the edge
+    // is stale.
+    let a_users = "[rules.layers.store_users]\npplx-space-s-store = [\"pplx-space-a\"]\n";
+    let s_users = "[rules.layers.store_users]\npplx-space-t-store = [\"pplx-space-s-store\"]\n";
+    let dev_crossing = "crates/l30_storage/s/store/Cargo.toml: pplx-space-s-store (l30_storage) \
+                        dev-depends on pplx-space-a (l40_api), a dev-dependency, but a \
+                        dev-dependency may point only at the crate's own or a lower layer, or at \
+                        test_support.";
+    let fixtures = "crates/l20_domain/d/Cargo.toml: pplx-space-d (l20_domain) depends on \
+                    pplx-space-fixtures, a test_support crate, a normal dependency, but test \
+                    support is reachable only through [dev-dependencies].";
+    let tools = "crates/l20_domain/d/Cargo.toml: pplx-space-d depends on pplx-space-bench, a \
+                 tools crate,";
+    let store = |from: &str, layer: &str, to: &str| {
+        format!(
+            "{}: {from} ({layer}) depends on the store {to}, a normal dependency, but {to} does \
+             not list it in [rules.layers] store_users in ARCHITECTURE.toml.",
+            if from == "pplx-space-a" { A } else { S }
+        )
+    };
+    let a_unlisted = format!(
+        "{} A store is private to the crates that own its state: reach the state through its \
+         owner's API (the crate root or its client), or, if pplx-space-a owns this state, add it \
+         to pplx-space-s-store's users, which layers.policy_changed reports. See \
+         crates/tools/archcheck/README.md#layers.",
+        store("pplx-space-a", "l40_api", "pplx-space-s-store")
+    );
+    // A store can't go through an API crate.
+    let s_unlisted = format!(
+        "{} A store reads another only as one of its users: if pplx-space-s-store owns this \
+         state, add it to pplx-space-t-store's users, which layers.policy_changed reports; \
+         otherwise move the read into pplx-space-t-store, the store that owns the state. See \
+         crates/tools/archcheck/README.md#layers.",
+        store("pplx-space-s-store", "l30_storage", "pplx-space-t-store")
+    );
+    let clients = |to: &str| {
+        format!(
+            "crates/l40_api/a/client/Cargo.toml: pplx-space-a-client is a client (an l40_api crate \
+             named *-client), which depends only on l20_domain, l10_foundation and other \
+             clients, but it depends on {to},"
+        )
+    };
+    let (client_api, client_storage) = (
+        clients("pplx-space-a (l40_api)"),
+        clients("pplx-space-s-store (l30_storage)"),
+    );
+    let dev_stale = "pplx-space-s-store -> pplx-space-a: is in [layers.dev_direction] in \
+                     architecture-baseline.toml, but pplx-space-s-store has no dev-dependency on \
+                     pplx-space-a.";
+    let s_a_normal = normal("pplx-space-s-store", "pplx-space-a");
+    let both: Vec<_> = s_a_normal.iter().chain(&s_dev_a).copied().collect();
+    let duplicate = "pplx-space-s-store -> pplx-space-a: is in [layers.dev_direction] in \
+                     architecture-baseline.toml, but pplx-space-s-store's dev-dependency on \
+                     pplx-space-a duplicates a normal or build one, which [layers.direction] \
+                     covers.";
+    let listed = [("pplx-space-s-store", "pplx-space-a")];
+    let dev_entry = "architecture-baseline.toml:3";
+    let cases: &[Case] = &[
+        (
+            "Storage dev to API",
+            &s_dev_a,
+            "",
+            &[],
+            &[("layers.dev_direction.no_crossing", dev_crossing, &s)],
+        ),
+        ("Storage dev to API, listed", &s_dev_a, "", &listed, &[]),
+        (
+            "Storage dev to API, listed but gone",
+            &[],
+            "",
+            &listed,
+            &[("layers.dev_direction.stale_entries", dev_stale, dev_entry)],
+        ),
+        (
+            "listed dev edge duplicating a normal one",
+            &both,
+            "",
+            &listed,
+            &[
+                (
+                    "layers.direction.no_crossing",
+                    "crates/l30_storage/s/store/Cargo.toml: pplx-space-s-store (l30_storage) \
+                     depends on pplx-space-a (l40_api), a normal dependency,",
+                    &s,
+                ),
+                ("layers.dev_direction.stale_entries", duplicate, dev_entry),
+            ],
+        ),
+        ("dev to test support", &s_dev_fixtures, "", &[], &[]),
+        ("dev within a layer", &f_dev_g, "", &[], &[]),
+        ("dev to a lower layer", &a_dev_d, "", &[], &[]),
+        (
+            "normal into test support",
+            &d_fixtures,
+            "",
+            &[],
+            &[("layers.test_only", fixtures, &d)],
+        ),
+        ("dev into test support", &d_dev_fixtures, "", &[], &[]),
+        (
+            "normal into tools",
+            &d_bench,
+            "",
+            &[],
+            &[("layers.test_only", tools, &d)],
+        ),
+        (
+            "dev into tools",
+            &d_dev_bench,
+            "",
+            &[],
+            &[("layers.test_only", tools, &d)],
+        ),
+        ("tools into test support", &bench_fixtures, "", &[], &[]),
+        ("test support into API", &fixtures_a, "", &[], &[]),
+        (
+            "a client to an API crate",
+            &client_a,
+            "",
+            &[],
+            &[("layers.clients", &client_api, &client)],
+        ),
+        (
+            "a client to a store",
+            &client_store,
+            "",
+            &[],
+            &[("layers.clients", &client_storage, &client)],
+        ),
+        ("a client to a client", &client_client, "", &[], &[]),
+        ("a client to Domain", &client_d, "", &[], &[]),
+        (
+            "API to an unlisted store",
+            &a_store,
+            "",
+            &[],
+            &[("layers.store_edges", &a_unlisted, &a)],
+        ),
+        ("API to a store listing it", &a_store, a_users, &[], &[]),
+        (
+            "Storage to an unlisted store",
+            &s_store,
+            "",
+            &[],
+            &[("layers.store_edges", &s_unlisted, &s)],
+        ),
+        ("Storage to a store listing it", &s_store, s_users, &[], &[]),
+    ];
+    for (name, dependencies, tables, edges, expected) in cases {
+        let ws = Layered {
+            dependencies,
+            tables,
+            files: vec![("architecture-baseline.toml", layers_baseline(&[], edges))],
+            ..Layered::default()
+        }
+        .build();
+        assert_layer_findings(name, &layer_findings(&load(ws.path(), None)), expected);
+    }
+}
+
+/// `[rules.layers]` entries that no longer apply are stale, each shown on its
+/// line in `ARCHITECTURE.toml`: an `unmoved` crate that is gone or in a layer
+/// directory, a `legacy` crate that is gone, a `store_users` store that is not
+/// a Storage member or a user that can't use a store by its list or doesn't
+/// use it, and an `allowed_edges` edge that does not exist or needs no
+/// exception. A user reaching its store through a legacy crate uses it.
+#[test]
+fn layers_stale_config_entries() {
+    /// Name, the text of the finding's line, `[rules.layers]`' tables, the
+    /// dependencies, extra members, and the finding's message.
+    type Case<'a> = (
+        &'a str,
+        &'a str,
+        &'a str,
+        &'a [(&'a str, &'a str, &'a str)],
+        &'a [(&'a str, &'a str)],
+        &'a str,
+    );
+    let d_fixtures = [("pplx-space-d", "dependencies", "pplx-space-fixtures")];
+    let p_a = [("pplx-space-p", "dependencies", "pplx-space-a")];
+    let a_s = [("pplx-space-a", "dependencies", "pplx-space-s-store")];
+    let a_dev_s = [("pplx-space-a", "dev-dependencies", "pplx-space-s-store")];
+    let cases: &[Case] = &[
+        (
+            "an unmoved entry for no member",
+            "\"pplx-space-nobody\"",
+            "[rules.layers.unmoved]\nl20_domain = [\"pplx-space-nobody\"]\n",
+            &[],
+            &[],
+            "pplx-space-nobody: is in [rules.layers] unmoved in ARCHITECTURE.toml, but no \
+             workspace member has this name. Remove the entry.",
+        ),
+        (
+            "an unmoved entry for a crate in a layer directory",
+            "\"pplx-space-f\"",
+            "[rules.layers.unmoved]\nl20_domain = [\"pplx-space-f\"]\n",
+            &[],
+            &[],
+            "pplx-space-f: is in [rules.layers] unmoved in ARCHITECTURE.toml, but the crate is \
+             at crates/l10_foundation/f, whose directory gives its layer.",
+        ),
+        (
+            "a legacy entry for no member",
+            "legacy = ",
+            "[rules.layers]\nlegacy = [\"pplx-space-nobody\"]\n",
+            &[],
+            &[],
+            "pplx-space-nobody: is in [rules.layers] legacy in ARCHITECTURE.toml, but no \
+             workspace member has this name. Remove it.",
+        ),
+        (
+            "a store that is no member",
+            "pplx-space-nobody = ",
+            "[rules.layers.store_users]\npplx-space-nobody = [\"pplx-space-a\"]\n",
+            &[],
+            &[],
+            "pplx-space-nobody: is in [rules.layers] store_users in ARCHITECTURE.toml, but no \
+             workspace member has this name.",
+        ),
+        (
+            "a store that is not a Storage crate",
+            "pplx-space-d = ",
+            "[rules.layers.store_users]\npplx-space-d = [\"pplx-space-a\"]\n",
+            &[],
+            &[],
+            "pplx-space-d: is in [rules.layers] store_users in ARCHITECTURE.toml, but it is not \
+             a store: its layer is l20_domain, not l30_storage.",
+        ),
+        (
+            "a user that is no member",
+            "\"pplx-space-nobody\",",
+            "[rules.layers.store_users]\npplx-space-s-store = [\n  \"pplx-space-a\",\n  \
+             \"pplx-space-nobody\",\n]\n",
+            &a_s,
+            &[],
+            "pplx-space-s-store: lists pplx-space-nobody in [rules.layers] store_users in \
+             ARCHITECTURE.toml, but no workspace member has this name, so the entry allows \
+             nothing.",
+        ),
+        (
+            "a user that is an app",
+            "[\"pplx-space-p\"]",
+            "[rules.layers.store_users]\npplx-space-s-store = [\"pplx-space-p\"]\n",
+            &[],
+            &[],
+            "pplx-space-s-store: lists pplx-space-p in [rules.layers] store_users in \
+             ARCHITECTURE.toml, but only l40_api and l30_storage crates use stores by their \
+             users lists, and its layer is l50_app,",
+        ),
+        (
+            "a user that is a client",
+            "[\"pplx-space-a-client\"]",
+            "[rules.layers.store_users]\npplx-space-s-store = [\"pplx-space-a-client\"]\n",
+            &[],
+            &[],
+            "pplx-space-s-store: lists pplx-space-a-client in [rules.layers] store_users in \
+             ARCHITECTURE.toml, but it is a client, which never depends on a store,",
+        ),
+        (
+            "a user without a dependency on its store",
+            "[\"pplx-space-a\"]",
+            "[rules.layers.store_users]\npplx-space-s-store = [\"pplx-space-a\"]\n",
+            &[],
+            &[],
+            "pplx-space-s-store: lists pplx-space-a in [rules.layers] store_users in \
+             ARCHITECTURE.toml, but pplx-space-a has no normal or build dependency on \
+             pplx-space-s-store, directly or through a [rules.layers] legacy crate that depends \
+             on it, and the list says who uses the store today. Remove it from the list.",
+        ),
+        (
+            "a user with only a dev-dependency on its store",
+            "[\"pplx-space-a\"]",
+            "[rules.layers.store_users]\npplx-space-s-store = [\"pplx-space-a\"]\n",
+            &a_dev_s,
+            &[],
+            "pplx-space-s-store: lists pplx-space-a in [rules.layers] store_users in \
+             ARCHITECTURE.toml, but pplx-space-a has no normal or build dependency on \
+             pplx-space-s-store,",
+        ),
+        (
+            "an allowed edge that does not exist",
+            "pplx-space-p = ",
+            "[rules.layers.allowed_edges]\npplx-space-p = [\"pplx-space-s-store\"]\n",
+            &[],
+            &[],
+            "pplx-space-p: [rules.layers] allowed_edges in ARCHITECTURE.toml lets it depend on \
+             pplx-space-s-store, but pplx-space-p has no normal or build dependency on \
+             pplx-space-s-store. Remove pplx-space-s-store from the list.",
+        ),
+        (
+            "an allowed edge the layer order allows",
+            "pplx-space-p = ",
+            "[rules.layers.allowed_edges]\npplx-space-p = [\"pplx-space-a\"]\n",
+            &p_a,
+            &[],
+            "pplx-space-p: [rules.layers] allowed_edges in ARCHITECTURE.toml lets it depend on \
+             pplx-space-a, but the layer order already allows that edge.",
+        ),
+        (
+            "an allowed edge into test support",
+            "pplx-space-d = ",
+            "[rules.layers.allowed_edges]\npplx-space-d = [\"pplx-space-fixtures\"]\n",
+            &d_fixtures,
+            &[],
+            "pplx-space-d: [rules.layers] allowed_edges in ARCHITECTURE.toml lets it depend on \
+             pplx-space-fixtures, but allowed_edges does not exempt an edge from \
+             layers.test_only, which reports it.",
+        ),
+    ];
+    for (name, at, tables, dependencies, extra, expected) in cases {
+        let ws = Layered {
+            extra,
+            dependencies,
+            tables,
+            ..Layered::default()
+        }
+        .build();
+        let line = line_with(&layers_config(tables, "required"), at);
+        let found: Vec<_> = layer_findings(&load(ws.path(), None))
+            .into_iter()
+            .filter(|(code, _, _)| code == "layers.stale_entries")
+            .collect();
+        assert_layer_findings(
+            name,
+            &found,
+            &[(
+                "layers.stale_entries",
+                expected,
+                &format!("ARCHITECTURE.toml:{line}"),
+            )],
+        );
+    }
+
+    // A user reaching its store through a legacy crate, as through
+    // common-svc's re-exports, uses it; through another crate it doesn't.
+    let tables = "[rules.layers.unmoved]\nl10_foundation = [\"pplx-space-legacy\"]\n\
+                  [rules.layers.store_users]\npplx-space-s-store = [\"pplx-space-a\"]\n\
+                  pplx-space-t-store = [\"pplx-space-a\"]\n\
+                  [rules.layers]\nlegacy = [\"pplx-space-legacy\"]\n";
+    let ws = Layered {
+        extra: &[("crates/libs/legacy", "pplx-space-legacy")],
+        dependencies: &[
+            ("pplx-space-a", "dependencies", "pplx-space-legacy"),
+            ("pplx-space-legacy", "dependencies", "pplx-space-s-store"),
+            ("pplx-space-a", "dependencies", "pplx-space-f"),
+            ("pplx-space-f", "dependencies", "pplx-space-t-store"),
+        ],
+        tables,
+        ..Layered::default()
+    }
+    .build();
+    let stale: Vec<String> = layer_findings(&load(ws.path(), None))
+        .into_iter()
+        .filter(|(code, _, _)| code == "layers.stale_entries")
+        .map(|(_, message, _)| message)
+        .collect();
+    assert_eq!(stale.len(), 1, "{stale:#?}");
+    assert!(
+        stale[0].starts_with(
+            "pplx-space-t-store: lists pplx-space-a in [rules.layers] store_users in \
+             ARCHITECTURE.toml, but pplx-space-a has no normal or build dependency on \
+             pplx-space-t-store,"
+        ),
+        "{stale:#?}"
+    );
+
+    // An entry naming a crate without a layer is not stale: the crate's
+    // placement finding covers it.
+    let tables = "[rules.layers.store_users]\npplx-space-old = [\"pplx-space-a\"]\n\
+                  pplx-space-s-store = [\"pplx-space-old\"]\n\
+                  [rules.layers.allowed_edges]\npplx-space-old = [\"pplx-space-d\"]\n\
+                  pplx-space-p = [\"pplx-space-old\"]\n";
+    let ws = Layered {
+        extra: &[("crates/libs/old", "pplx-space-old")],
+        dependencies: &[
+            ("pplx-space-old", "dependencies", "pplx-space-d"),
+            ("pplx-space-p", "dependencies", "pplx-space-old"),
+        ],
+        tables,
+        ..Layered::default()
+    }
+    .build();
+    let codes: Vec<String> = layer_findings(&load(ws.path(), None))
+        .into_iter()
+        .map(|(code, _, _)| code)
+        .collect();
+    assert_eq!(codes, ["layers.placement"]);
+}
+
+/// Every change to `[rules.layers]` from the base branch's copy is shown on
+/// its line, except a removed `unmoved` entry. A base table of another shape
+/// skips the comparison with a warning, and `crate_names.policy_changed`
+/// still compares its own table.
+#[test]
+fn layers_policy_changed() {
+    let unmoved =
+        |layer: &str, packages: &str| format!("[rules.layers.unmoved]\n{layer} = [\n{packages}]\n");
+    let old = "  \"pplx-space-old\",\n";
+    let new = "  \"pplx-space-new\",\n";
+    let users =
+        |list: &str| format!("[rules.layers.store_users]\npplx-space-s-store = [\n{list}]\n");
+    let a = "  \"pplx-space-a\",\n";
+    let t = "  \"pplx-space-t-store\",\n";
+    let edges = |list: &str| format!("[rules.layers.allowed_edges]\npplx-space-p = [\n{list}]\n");
+    let storage = |drivers: &str, helpers: &str| {
+        format!("[rules.layers.storage]\ndrivers = [\n  {drivers},\n]\nhelpers = [{helpers}]\n")
+    };
+    let legacy = |list: &str| {
+        format!("[rules.layers.unmoved]\nl20_domain = []\n[rules.layers]\nlegacy = [{list}]\n")
+    };
+    // After another `[rules.layers…]` header, as in the repository's copy.
+    let protocols = |list: &str| {
+        format!("[rules.layers.unmoved]\nl20_domain = []\n[rules.layers]\nprotocols = [{list}]\n")
+    };
+    let fences = |runtime: &str, http: &str, kube: &str| {
+        format!(
+            "[rules.layers.domain_fences]\nruntime = [{runtime}]\nhttp = [\n  {http},\n]\n\
+             kube = [{kube}]\n"
+        )
+    };
+    let required = layers_config("", "required");
+    let advisory_crossing = required.replace(
+        "[rules.layers.direction.no_crossing]\nmode = \"required\"",
+        "[rules.layers.direction.no_crossing]\nmode = \"advisory\"",
+    );
+    /// Name, the base's `ARCHITECTURE.toml`, this branch's, and each finding
+    /// as the text of its line and its message.
+    type Case<'a> = (&'a str, String, String, &'a [(&'a str, &'a str)]);
+    let both = format!("{old}{new}");
+    let cases: Vec<Case> = vec![
+        ("unchanged", required.clone(), required.clone(), &[]),
+        (
+            "the whole table new",
+            config(ADVISORY),
+            required.clone(),
+            &[(
+                "[rules.layers.storage]",
+                "ARCHITECTURE.toml: [rules.layers] is not in the base branch's copy; the whole \
+                 policy is new.",
+            )],
+        ),
+        (
+            "an unmoved entry added",
+            layers_config(&unmoved("l20_domain", old), "required"),
+            layers_config(&unmoved("l20_domain", &both), "required"),
+            &[(
+                "\"pplx-space-new\"",
+                "ARCHITECTURE.toml: `pplx-space-new` was added to [rules.layers] unmoved, in \
+                 l20_domain.",
+            )],
+        ),
+        (
+            "an unmoved entry's layer changed",
+            layers_config(&unmoved("l20_domain", old), "required"),
+            layers_config(&unmoved("l10_foundation", old), "required"),
+            &[(
+                "\"pplx-space-old\"",
+                "ARCHITECTURE.toml: `pplx-space-old` moved from l20_domain to l10_foundation in \
+                 [rules.layers] unmoved.",
+            )],
+        ),
+        (
+            "an unmoved entry removed",
+            layers_config(&unmoved("l20_domain", &both), "required"),
+            layers_config(&unmoved("l20_domain", old), "required"),
+            &[],
+        ),
+        (
+            "a store user added",
+            layers_config(&users(a), "required"),
+            layers_config(&users(&format!("{a}{t}")), "required"),
+            &[(
+                "\"pplx-space-t-store\"",
+                "ARCHITECTURE.toml: `pplx-space-t-store` was added to the users of \
+                 `pplx-space-s-store` in [rules.layers] store_users.",
+            )],
+        ),
+        (
+            "a store user removed",
+            layers_config(&users(&format!("{a}{t}")), "required"),
+            layers_config(&users(a), "required"),
+            &[(
+                "pplx-space-s-store = [",
+                "ARCHITECTURE.toml: `pplx-space-t-store` was removed from the users of \
+                 `pplx-space-s-store` in [rules.layers] store_users.",
+            )],
+        ),
+        (
+            "an allowed edge added",
+            required.clone(),
+            layers_config(&edges("  \"pplx-space-s-store\",\n"), "required"),
+            &[(
+                "\"pplx-space-s-store\"",
+                "ARCHITECTURE.toml: `pplx-space-s-store` was added to the allowed edges of \
+                 `pplx-space-p` in [rules.layers] allowed_edges.",
+            )],
+        ),
+        (
+            "storage lists changed",
+            layers_config(&storage("\"sqlx\"", "\"pplx-space-g\""), "required"),
+            layers_config(&storage("\"sqlx\",\n  \"redis\"", ""), "required"),
+            &[
+                (
+                    "  \"redis\"",
+                    "ARCHITECTURE.toml: `redis` was added to [rules.layers.storage] drivers.",
+                ),
+                (
+                    "[rules.layers.storage]",
+                    "ARCHITECTURE.toml: `pplx-space-g` was removed from [rules.layers.storage] \
+                     helpers.",
+                ),
+            ],
+        ),
+        (
+            "legacy changed",
+            layers_config(&legacy("\"pplx-space-old\""), "required"),
+            layers_config(&legacy("\"pplx-space-new\""), "required"),
+            &[
+                (
+                    "legacy = ",
+                    "ARCHITECTURE.toml: `pplx-space-new` was added to [rules.layers] legacy.",
+                ),
+                (
+                    "legacy = ",
+                    "ARCHITECTURE.toml: `pplx-space-old` was removed from [rules.layers] legacy.",
+                ),
+            ],
+        ),
+        (
+            "legacy removed",
+            layers_config(&legacy("\"pplx-space-old\""), "required"),
+            layers_config(
+                "[rules.layers.unmoved]\nl20_domain = []\n[rules.layers]\n",
+                "required",
+            ),
+            &[(
+                "[rules.layers]",
+                "ARCHITECTURE.toml: `pplx-space-old` was removed from [rules.layers] legacy.",
+            )],
+        ),
+        (
+            "protocols changed",
+            layers_config(&protocols("\"pplx-space-old\""), "required"),
+            layers_config(&protocols("\"pplx-space-new\""), "required"),
+            &[
+                (
+                    "protocols = ",
+                    "ARCHITECTURE.toml: `pplx-space-new` was added to [rules.layers] protocols.",
+                ),
+                (
+                    "protocols = ",
+                    "ARCHITECTURE.toml: `pplx-space-old` was removed from [rules.layers] \
+                     protocols.",
+                ),
+            ],
+        ),
+        (
+            "protocols removed",
+            layers_config(&protocols("\"pplx-space-old\""), "required"),
+            layers_config(
+                "[rules.layers.unmoved]\nl20_domain = []\n[rules.layers]\n",
+                "required",
+            ),
+            &[(
+                "[rules.layers]",
+                "ARCHITECTURE.toml: `pplx-space-old` was removed from [rules.layers] protocols.",
+            )],
+        ),
+        (
+            "domain_fences changed",
+            layers_config(
+                &fences("\"async-std\", \"smol\", \"tokio\"", "\"hyper\"", ""),
+                "required",
+            ),
+            layers_config(
+                &fences("\"tokio\"", "\"hyper\",\n  \"reqwest\"", "\"smol\""),
+                "required",
+            ),
+            &[
+                (
+                    "  \"reqwest\"",
+                    "ARCHITECTURE.toml: `reqwest` was added to [rules.layers.domain_fences], in \
+                     http.",
+                ),
+                (
+                    "kube = ",
+                    "ARCHITECTURE.toml: `smol` moved from runtime to kube in \
+                     [rules.layers.domain_fences].",
+                ),
+                (
+                    "[rules.layers.domain_fences]",
+                    "ARCHITECTURE.toml: `async-std` was removed from [rules.layers.domain_fences], \
+                     where it was in runtime.",
+                ),
+            ],
+        ),
+        (
+            "a Domain check's mode changed",
+            required.clone(),
+            required.replace(
+                "[rules.layers.model_protocol.no_crossing]\nmode = \"required\"",
+                "[rules.layers.model_protocol.no_crossing]\nmode = \"advisory\"",
+            ),
+            &[(
+                "[rules.layers.model_protocol.no_crossing]",
+                "ARCHITECTURE.toml: layers.model_protocol.no_crossing mode changed from \
+                 required to advisory.",
+            )],
+        ),
+        (
+            "a storage check's mode changed",
+            required.clone(),
+            required.replace(
+                "[rules.layers.codec_features.stale_entries]\nmode = \"required\"",
+                "[rules.layers.codec_features.stale_entries]\nmode = \"advisory\"",
+            ),
+            &[(
+                "[rules.layers.codec_features.stale_entries]",
+                "ARCHITECTURE.toml: layers.codec_features.stale_entries mode changed from \
+                 required to advisory.",
+            )],
+        ),
+        (
+            "a mode changed",
+            required.clone(),
+            advisory_crossing.clone(),
+            &[(
+                "[rules.layers.direction.no_crossing]",
+                "ARCHITECTURE.toml: layers.direction.no_crossing mode changed from required to \
+                 advisory.",
+            )],
+        ),
+    ];
+    for (name, base, policy, expected) in &cases {
+        let ws = Layered {
+            files: vec![("ARCHITECTURE.toml", policy.clone())],
+            ..Layered::default()
+        }
+        .build();
+        let ctx = load_with(ws.path(), None, Some(base));
+        let found: Vec<_> = check(&ctx)
+            .into_iter()
+            .filter(|finding| finding.code() == "layers.policy_changed")
+            .collect();
+        assert_eq!(found.len(), expected.len(), "{name}: {found:#?}");
+        for (finding, (line, message)) in found.iter().zip(*expected) {
+            // A mode is on the line after its table's header.
+            let mut want = line_with(policy, line);
+            if line.starts_with("[rules.layers.direction")
+                || line.starts_with("[rules.layers.codec_features")
+                || line.starts_with("[rules.layers.model_protocol")
+            {
+                want += 1;
+            }
+            assert_eq!(finding.message(), *message, "{name}");
+            assert_eq!(finding.location.path, "ARCHITECTURE.toml", "{name}");
+            assert_eq!(finding.location.line, want, "{name}");
+            assert!(!finding.mode.is_required(), "{name}");
+        }
+        assert!(
+            !skipped(&ctx)
+                .iter()
+                .any(|line| line.contains("layers.policy_changed")),
+            "{name}: {:?}",
+            skipped(&ctx)
+        );
+    }
+
+    // A crate whose unmoved entry is removed as it moves into another
+    // layer's directory changes layer; one moving into its entry's layer
+    // doesn't.
+    let base = layers_config(&unmoved("l30_storage", old), "required");
+    for (member, expected) in [
+        (
+            "crates/l40_api/old",
+            &[
+                "ARCHITECTURE.toml: `pplx-space-old` moved from l30_storage ([rules.layers] \
+               unmoved) to l40_api, at crates/l40_api/old.",
+            ][..],
+        ),
+        ("crates/l30_storage/old", &[][..]),
+    ] {
+        let extra = [(member, "pplx-space-old")];
+        let ws = Layered {
+            extra: &extra,
+            ..Layered::default()
+        }
+        .build();
+        let found: Vec<Finding> = check(&load_with(ws.path(), None, Some(&base)))
+            .into_iter()
+            .filter(|finding| finding.code() == "layers.policy_changed")
+            .collect();
+        let messages: Vec<String> = found.iter().map(Finding::message).collect();
+        assert_eq!(messages, expected, "{member}");
+        for finding in found {
+            assert_eq!(
+                finding.location.line,
+                line_with(&required, "[rules.layers.storage]")
+            );
+            assert!(!finding.mode.is_required());
+        }
+    }
+
+    // Removing the whole table is advisory, on the file's first line.
+    let ws = Layered {
+        files: vec![
+            ("ARCHITECTURE.toml", config(ADVISORY)),
+            (
+                "architecture-baseline.toml",
+                "[file_size]\n[crate_names]\n".to_owned(),
+            ),
+        ],
+        ..Layered::default()
+    }
+    .build();
+    let found: Vec<Finding> = check(&load_with(ws.path(), None, Some(&required)))
+        .into_iter()
+        .filter(|finding| finding.rule == "layers")
+        .collect();
+    assert_eq!(found.len(), 1, "{found:#?}");
+    assert_eq!(found[0].code(), "layers.policy_changed");
+    assert_eq!(
+        found[0].message(),
+        "ARCHITECTURE.toml: the base branch's copy has [rules.layers] and this one doesn't: the \
+         whole layers rule was removed and no longer runs."
+    );
+    assert_eq!(
+        (found[0].location.path.as_str(), found[0].location.line),
+        ("ARCHITECTURE.toml", 1)
+    );
+    assert!(!found[0].mode.is_required());
+    // Without the base, or against one without the rule, nothing is said.
+    for base in [None, Some(config(ADVISORY))] {
+        let ctx = load_with(ws.path(), None, base.as_deref());
+        assert!(
+            !check(&ctx).iter().any(|finding| finding.rule == "layers"),
+            "{base:?}"
+        );
+        assert!(
+            !skipped(&ctx).iter().any(|line| line.contains("layers.")),
+            "{base:?}"
+        );
+    }
+    // Against a base whose [rules.layers] can't be read, no finding says
+    // whether the rule was removed, and a skip line says so.
+    let base = format!("{}[rules.layers]\nunmoved = 5\n", config(ADVISORY));
+    let ctx = load_with(ws.path(), None, Some(&base));
+    assert!(!check(&ctx).iter().any(|finding| finding.rule == "layers"));
+    let skips: Vec<String> = skipped(&ctx)
+        .into_iter()
+        .filter(|line| line.contains("layers."))
+        .collect();
+    assert_eq!(skips.len(), 1, "{skips:?}");
+    assert!(
+        skips[0].starts_with("warning: could not parse ")
+            && skips[0].ends_with("; layers.policy_changed's check for the rule's removal skipped"),
+        "{skips:?}"
+    );
+
+    // A base [rules.layers] of another shape: the layers comparisons are
+    // skipped with a warning, and crate_names still compares its table.
+    let ws = Layered::default().build();
+    let base = format!(
+        "{}[rules.layers]\nunmoved = 5\n",
+        config(ADVISORY).replace(", \"misc\"", "")
+    );
+    let ctx = load_with(ws.path(), None, Some(&base));
+    let codes: Vec<String> = check(&ctx)
+        .iter()
+        .filter(|finding| finding.behaviour == "policy_changed")
+        .map(|finding| format!("{}: {}", finding.code(), finding.message()))
+        .collect();
+    assert_eq!(
+        codes,
+        [
+            "crate_names.policy_changed: ARCHITECTURE.toml: `misc` was added to [rules.crate_names] \
+          banned_tokens."
+        ]
+    );
+    let skips = skipped(&ctx);
+    let warning = skips
+        .iter()
+        .find(|line| line.contains("layers.policy_changed"))
+        .expect("a skip line for the layers comparisons");
+    assert!(
+        warning.starts_with("warning: could not parse ")
+            && warning.ends_with(
+                "; layers.policy_changed and layers.placement's check for new or changed unmoved \
+                 entries skipped"
+            ),
+        "{warning}"
+    );
+    assert!(
+        !skips
+            .iter()
+            .any(|line| line.contains("crate_names.policy_changed")),
+        "{skips:?}"
+    );
+}
+
+/// A `[rules.layers]` that can't be read as one layer per package, and a
+/// baseline layers table that no layers check has, exit 2.
+#[test]
+fn layers_configuration_errors() {
+    let tables = |text: &str| layers_config(text, "required");
+    let unknown_table = "is not a table of the layers rule: with [rules.layers] in \
+                         ARCHITECTURE.toml, its tables are layers.direction, \
+                         layers.dev_direction, layers.storage_access, layers.codec_features, \
+                         layers.domain_dependencies and layers.model_protocol, and without it \
+                         there are none";
+    let cases: &[(&str, &str, String, &str)] = &[
+        (
+            "an unknown layer",
+            "ARCHITECTURE.toml",
+            tables("[rules.layers.unmoved]\nl60_ui = [\"pplx-space-x\"]\n"),
+            "unknown layer \"l60_ui\"; expected one of l10_foundation, l20_domain",
+        ),
+        (
+            "a package in two layers",
+            "ARCHITECTURE.toml",
+            tables(
+                "[rules.layers.unmoved]\nl10_foundation = [\"pplx-space-x\"]\n\
+                 l20_domain = [\"pplx-space-x\"]\n",
+            ),
+            "unmoved lists \"pplx-space-x\" in both l10_foundation and l20_domain",
+        ),
+        (
+            "a package twice in one layer",
+            "ARCHITECTURE.toml",
+            tables(
+                "[rules.layers.unmoved]\nl10_foundation = [\"pplx-space-x\", \"pplx-space-x\"]\n",
+            ),
+            "\"pplx-space-x\" is listed twice",
+        ),
+        (
+            "a package in two domain_fences families",
+            "ARCHITECTURE.toml",
+            tables("[rules.layers.domain_fences]\nhttp = [\"hyper\"]\nruntime = [\"hyper\"]\n"),
+            "domain_fences lists \"hyper\" in both http and runtime",
+        ),
+        (
+            "a package twice in one domain_fences family",
+            "ARCHITECTURE.toml",
+            tables("[rules.layers.domain_fences]\nhttp = [\"hyper\", \"hyper\"]\n"),
+            "\"hyper\" is listed twice",
+        ),
+        (
+            "a protocol listed twice",
+            "ARCHITECTURE.toml",
+            tables("[rules.layers]\nprotocols = [\"pplx-space-d\", \"pplx-space-d\"]\n"),
+            "\"pplx-space-d\" is listed twice",
+        ),
+        (
+            "a store user listed twice",
+            "ARCHITECTURE.toml",
+            tables(
+                "[rules.layers.store_users]\npplx-space-s-store = [\"pplx-space-a\", \
+                 \"pplx-space-a\"]\n",
+            ),
+            "\"pplx-space-a\" is listed twice",
+        ),
+        (
+            "an unknown layers behaviour",
+            "ARCHITECTURE.toml",
+            format!(
+                "{}[rules.layers.module_names]\nmode = \"required\"\n",
+                tables("")
+            ),
+            "could not parse",
+        ),
+        (
+            "a baseline table of no check",
+            "architecture-baseline.toml",
+            format!("{}[layers.foo]\n", layers_baseline(&[], &[])),
+            unknown_table,
+        ),
+        (
+            "a baseline table without the rule",
+            "ARCHITECTURE.toml",
+            config(ADVISORY),
+            unknown_table,
+        ),
+        (
+            "a baseline table of edges that is not a list",
+            "architecture-baseline.toml",
+            "[file_size]\n[layers.direction]\npplx-space-f = \"pplx-space-d\"\n[crate_names]\n"
+                .to_owned(),
+            "could not parse",
+        ),
+    ];
+    for (name, path, text, error) in cases {
+        let ws = Layered {
+            files: vec![(path, text.clone())],
+            ..Layered::default()
+        }
+        .build();
+        let checked = run(ws.path(), &[]);
+        assert_eq!(checked.code, 2, "{name}: {}", checked.stdout);
+        assert!(checked.stderr.contains(error), "{name}: {}", checked.stderr);
+        let write = run(ws.path(), &["--write-baseline"]);
+        assert_eq!(write.code, 2, "{name}: {}", write.stdout);
+        assert_eq!(
+            fs::read_to_string(ws.path().join("architecture-baseline.toml")).unwrap(),
+            if *path == "architecture-baseline.toml" {
+                text.clone()
+            } else {
+                layers_baseline(&[], &[])
+            },
+            "{name}: the baseline is left alone"
+        );
+    }
+}
+
+/// The `[<name>]` table of a generated baseline, up to the blank line
+/// after it.
+fn generated_table(text: &str, name: &str) -> String {
+    let section = table_section(text, name);
+    match section.split_once("\n\n") {
+        Some((table, _)) => format!("{table}\n"),
+        None => section,
+    }
+}
+
+/// `--write-baseline` keeps each layers entry whose edge still has its
+/// check's problem, removes the others, adds none, listing each as `not
+/// added`, and writes both layers tables, even when empty; with
+/// `=layers.direction`, it updates that table alone. The generated form is
+/// written back byte-identical.
+#[test]
+fn layers_write_baseline() {
+    const BASELINE: &str = "architecture-baseline.toml";
+    let dependencies = [
+        ("pplx-space-f", "dependencies", "pplx-space-d"),
+        ("pplx-space-s-store", "dependencies", "pplx-space-a"),
+        ("pplx-space-s-store", "dev-dependencies", "pplx-space-p"),
+    ];
+    let hand_written = "[file_size]\n\"crates/gone.rs\" = 9\n\
+                        [layers.direction]\n\"pplx-space-f\" = [\"pplx-space-d\", \
+                        \"pplx-space-g\"]\npplx-space-gone = [\"pplx-space-d\"]\n\
+                        [crate_names]\n";
+    let ws = Layered {
+        dependencies: &dependencies,
+        files: vec![(BASELINE, hand_written.to_owned())],
+        ..Layered::default()
+    }
+    .build();
+
+    // Scoped: only [layers.direction] changes, and the stale file_size entry
+    // stays; the table the file lacks is not created.
+    let scoped = run(ws.path(), &["--write-baseline=layers.direction"]);
+    assert_eq!(scoped.code, 0, "{}", scoped.stderr);
+    assert_eq!(
+        scoped.stdout.lines().next(),
+        Some(
+            "not added: pplx-space-s-store (l30_storage) -> pplx-space-a (l40_api) in \
+             [layers.direction]; fix the dependency (cargo arch says how): an entry added by \
+             hand fails layers.direction.no_new_entries, and a reviewed, permanent exception \
+             goes in [rules.layers] allowed_edges in ARCHITECTURE.toml, which \
+             layers.policy_changed reports"
+        ),
+        "{}",
+        scoped.stdout
+    );
+    assert!(
+        !scoped.stdout.contains("dev_direction"),
+        "{}",
+        scoped.stdout
+    );
+    assert!(
+        scoped
+            .stdout
+            .contains("archcheck: wrote 1 layers.direction entries to "),
+        "{}",
+        scoped.stdout
+    );
+    let text = fs::read_to_string(ws.path().join(BASELINE)).unwrap();
+    assert!(text.contains("\"crates/gone.rs\" = 9"), "{text}");
+    assert_eq!(
+        generated_table(&text, "layers.direction"),
+        "[layers.direction]\npplx-space-f = [\n  \"pplx-space-d\",\n]\n",
+        "{text}"
+    );
+    assert!(!text.contains("[layers.dev_direction]"), "{text}");
+
+    // Unscoped: both tables, the dev one empty although its edge is not
+    // added.
+    let all = run(ws.path(), &["--write-baseline"]);
+    assert_eq!(all.code, 0, "{}", all.stderr);
+    let mut not_added: Vec<&str> = all
+        .stdout
+        .lines()
+        .filter(|line| line.starts_with("not added: "))
+        .collect();
+    not_added.sort_unstable();
+    assert_eq!(not_added.len(), 2, "{}", all.stdout);
+    assert!(
+        not_added[0].starts_with(
+            "not added: pplx-space-s-store (l30_storage) -> pplx-space-a (l40_api) in \
+             [layers.direction];"
+        ) && not_added[1]
+            == "not added: pplx-space-s-store (l30_storage) -> pplx-space-p (l50_app) in \
+                [layers.dev_direction]; fix the dependency (cargo arch says how): an entry added \
+                by hand fails layers.dev_direction.no_new_entries, and \
+                layers.dev_direction has no exceptions",
+        "{not_added:?}"
+    );
+    assert!(
+        all.stdout
+            .contains("0 layers.dev_direction, 1 layers.direction"),
+        "{}",
+        all.stdout
+    );
+    assert!(
+        !all.stdout.contains("the entries not added"),
+        "no entries to paste: {}",
+        all.stdout
+    );
+    let generated = fs::read_to_string(ws.path().join(BASELINE)).unwrap();
+    assert!(!generated.contains("crates/gone.rs"), "{generated}");
+    assert_eq!(
+        generated_table(&generated, "layers.dev_direction"),
+        "[layers.dev_direction]\n",
+        "{generated}"
+    );
+    assert!(
+        generated.contains(
+            "\n# [layers.<check>] maps each workspace package to what it depends on against\n"
+        ),
+        "{generated}"
+    );
+    let layers_at = generated.find("[layers.dev_direction]").unwrap();
+    assert!(
+        generated.find("[file_size]").unwrap() < layers_at
+            && layers_at < generated.find("[crate_names]").unwrap(),
+        "{generated}"
+    );
+
+    // The generated form loads and is written back byte-identical, by
+    // either form of the write; and it checks clean of stale entries.
+    for args in [
+        &["--write-baseline"][..],
+        &["--write-baseline=layers.direction"],
+    ] {
+        assert_eq!(run(ws.path(), args).code, 0);
+        assert_eq!(
+            fs::read_to_string(ws.path().join(BASELINE)).unwrap(),
+            generated,
+            "{args:?}"
+        );
+    }
+    let codes: Vec<String> = layer_findings(&load(ws.path(), None))
+        .into_iter()
+        .map(|(code, _, _)| code)
+        .collect();
+    assert_eq!(
+        codes,
+        [
+            "layers.direction.no_crossing",
+            "layers.dev_direction.no_crossing"
+        ]
+    );
+
+    // A scoped write creates its table when the baseline lacks it, and only
+    // that one.
+    fs::write(ws.path().join(BASELINE), "[file_size]\n[crate_names]\n").unwrap();
+    let created = run(ws.path(), &["--write-baseline=layers.direction"]);
+    assert_eq!(created.code, 0, "{}", created.stderr);
+    let text = fs::read_to_string(ws.path().join(BASELINE)).unwrap();
+    assert_eq!(
+        generated_table(&text, "layers.direction"),
+        "[layers.direction]\n",
+        "{text}"
+    );
+    assert!(!text.contains("[layers.dev_direction]"), "{text}");
+}
+
+/// A required crossing is an `ERROR` at the manifest line that declares the
+/// dependency and exits 1; advisory findings alone exit 0. Without the base
+/// flags, a line after the summary says what is skipped; with them, nothing
+/// is, and a base baseline that is not TOML gets one warning line naming
+/// the layers comparisons with the others.
+#[test]
+fn layers_rdjson_and_exit_codes() {
+    const MANIFEST: &str = "crates/l10_foundation/f/Cargo.toml";
+    let dependencies = [("pplx-space-f", "dependencies", "pplx-space-d")];
+    let skips = [
+        "archcheck: layers.direction.no_new_entries, layers.dev_direction.no_new_entries, \
+         layers.storage_access.no_new_entries, layers.codec_features.no_new_entries, \
+         layers.domain_dependencies.no_new_entries and layers.model_protocol.no_new_entries \
+         skipped (no --base-baseline given)",
+        "archcheck: layers.policy_changed and layers.placement's check for new or changed \
+         unmoved entries skipped (no --base-architecture given)",
+    ];
+    for (mode, code, severity) in [("required", 1, "ERROR"), ("advisory", 0, "WARNING")] {
+        let ws = Layered {
+            dependencies: &dependencies,
+            files: vec![("ARCHITECTURE.toml", layers_config("", mode))],
+            ..Layered::default()
+        }
+        .build();
+
+        let found = run(ws.path(), &["--format", "rdjson"]);
+
+        assert_eq!(found.code, code, "{mode}: {}", found.stderr);
+        let document: Value = serde_json::from_str(&found.stdout).unwrap();
+        let diagnostics: Vec<Value> = document["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| {
+                json!([
+                    d["code"]["value"],
+                    d["severity"],
+                    d["location"]["path"],
+                    d["location"]["range"]["start"]["line"],
+                ])
+            })
+            .collect();
+        assert_eq!(
+            diagnostics,
+            [json!([
+                "layers.direction.no_crossing",
+                severity,
+                MANIFEST,
+                6
+            ])],
+            "{mode}"
+        );
+        for skip in skips {
+            assert!(
+                found.stderr.lines().any(|line| line == skip),
+                "{mode}: {}",
+                found.stderr
+            );
+        }
+    }
+
+    // With both bases, nothing of the rule is skipped.
+    let ws = Layered {
+        dependencies: &dependencies,
+        files: vec![
+            (
+                "architecture-baseline.toml",
+                layers_baseline(&[("pplx-space-f", "pplx-space-d")], &[]),
+            ),
+            (
+                "base-baseline.toml",
+                layers_baseline(&[("pplx-space-f", "pplx-space-d")], &[]),
+            ),
+            ("base-architecture.toml", layers_config("", "required")),
+            ("not-toml.toml", "[file_size\n".to_owned()),
+            (
+                "layers-not-a-table.toml",
+                "layers = 5\n[file_size]\n".to_owned(),
+            ),
+        ],
+        ..Layered::default()
+    }
+    .build();
+    let path = |name: &str| ws.path().join(name).to_str().unwrap().to_owned();
+    let base_architecture = path("base-architecture.toml");
+    let both = run(
+        ws.path(),
+        &[
+            "--base-baseline",
+            &path("base-baseline.toml"),
+            "--base-architecture",
+            &base_architecture,
+        ],
+    );
+    assert_eq!(both.code, 0, "{}{}", both.stdout, both.stderr);
+    assert!(
+        !both.stdout.contains("archcheck: layers"),
+        "{}",
+        both.stdout
+    );
+
+    // A base baseline that is not TOML: one warning, naming every comparison.
+    let not_toml = run(
+        ws.path(),
+        &[
+            "--base-baseline",
+            &path("not-toml.toml"),
+            "--base-architecture",
+            &base_architecture,
+        ],
+    );
+    assert_eq!(not_toml.code, 0, "{}", not_toml.stderr);
+    let warnings: Vec<&str> = not_toml
+        .stdout
+        .lines()
+        .filter(|line| line.starts_with("archcheck: warning:"))
+        .collect();
+    assert_eq!(warnings.len(), 1, "{}", not_toml.stdout);
+    assert!(
+        warnings[0].starts_with(&format!(
+            "archcheck: warning: could not parse {} at line 1: ",
+            path("not-toml.toml")
+        )) && warnings[0].ends_with(
+            "file_size.no_new_entries and file_size.no_raised_caps, \
+             layers.direction.no_new_entries, layers.dev_direction.no_new_entries, \
+             layers.storage_access.no_new_entries, layers.codec_features.no_new_entries, \
+             layers.domain_dependencies.no_new_entries and \
+             layers.model_protocol.no_new_entries skipped"
+        ),
+        "{}",
+        warnings[0]
+    );
+
+    // A base `layers` that is not a table of tables skips each check's
+    // comparison, with a warning.
+    let not_a_table = run(
+        ws.path(),
+        &[
+            "--base-baseline",
+            &path("layers-not-a-table.toml"),
+            "--base-architecture",
+            &base_architecture,
+        ],
+    );
+    assert_eq!(not_a_table.code, 0, "{}", not_a_table.stdout);
+    for check in [
+        "direction",
+        "dev_direction",
+        "storage_access",
+        "codec_features",
+    ] {
+        assert!(
+            not_a_table.stdout.lines().any(|line| line
+                .starts_with("archcheck: warning: could not parse ")
+                && line.ends_with(&format!("; layers.{check}.no_new_entries skipped"))),
+            "{check}: {}",
+            not_a_table.stdout
+        );
+    }
+}
+
+/// The members, beyond [`LAYERED`]'s, of [`storage_workspace`]: a helper
+/// that `helpers` lists, a codec crate whose default feature is a driver
+/// feature, one that reaches drivers only through another codec crate, and
+/// a legacy crate.
+const STORAGE_EXTRA: [(&str, &str); 4] = [
+    ("crates/l10_foundation/conn", "pplx-space-conn"),
+    ("crates/l10_foundation/h", "pplx-space-h"),
+    ("crates/l10_foundation/k", "pplx-space-k"),
+    ("crates/libs/legacy", "pplx-space-legacy"),
+];
+
+/// `[rules.layers]` tables for [`storage_workspace`].
+const STORAGE_TABLES: &str = "[rules.layers.unmoved]\nl10_foundation = [\"pplx-space-legacy\"]\n\
+                              [rules.layers.storage]\ndrivers = [\"redis\", \"sqlx\"]\n\
+                              helpers = [\"pplx-space-conn\", \"pplx-space-f\"]\n\
+                              [rules.layers]\nlegacy = [\"pplx-space-legacy\"]\n";
+
+/// A layered workspace whose manifests reach drivers in every way the
+/// storage checks tell apart, with `tables` as `[rules.layers]`'s and
+/// `files` written over the rest:
+///
+/// - `f` and `conn` are the helpers `helpers` lists, `f` with a required
+///   `sqlx` and `conn` without a driver dependency;
+/// - `g` and `h` are Foundation codec crates: optional `sqlx` behind a
+///   `sqlx` feature (`h`'s default), and `g`'s optional `redis` behind
+///   Cargo's implicit feature;
+/// - `k`, a Foundation codec crate too, reaches drivers only through `g`:
+///   its implicit `kv` turns on an optional dependency on `g` that requests
+///   `redis`, its `pg` forwards to `kv/sqlx`, and its `json` forwards to
+///   `kv/serde`, no driver feature, which reaches `redis` only by turning
+///   on that dependency;
+/// - the legacy crate (Foundation) has a required `sqlx`, but `legacy` lists
+///   it, which keeps it from being a helper, and it forwards its `codec`
+///   feature to `g`'s `sqlx`;
+/// - `d` (Domain) has an optional `sqlx`, enables `g`'s `sqlx`, and its
+///   `hdb` turns on an optional dependency on `h` that requests `sqlx`;
+/// - `a` (API) depends on `sqlx`, `f`, `conn` and the legacy crate, enables
+///   the legacy crate's `codec`, and forwards its own `pg` to `g?/sqlx`;
+/// - `p` (App) depends on `redis` and enables `a`'s `pg`, `q` takes `h`'s
+///   default features and enables `d`'s `hdb`, and `b-client` depends on
+///   `f` and enables `g`'s implicit `redis` and `k`'s `kv` and `json`;
+/// - the store, test support and tool depend on drivers and helpers freely,
+///   and dev-dependencies are not checked.
+fn storage_workspace(tables: &str, files: Vec<(&str, String)>) -> TempDir {
+    let manifest = |name: &str, body: &str| format!("{}{body}", package(name));
+    let mut all: Vec<(&str, String)> = vec![
+        ("ARCHITECTURE.toml", layers_config(tables, "required")),
+        (
+            "crates/l10_foundation/f/Cargo.toml",
+            manifest("pplx-space-f", "[dependencies]\nsqlx = \"1\"\n"),
+        ),
+        (
+            "crates/l10_foundation/g/Cargo.toml",
+            manifest(
+                "pplx-space-g",
+                "[features]\nserde = []\nsqlx = [\"dep:sqlx\"]\n[dependencies]\n\
+                 sqlx = { version = \"1\", optional = true }\n\
+                 redis = { version = \"1\", optional = true }\n",
+            ),
+        ),
+        (
+            "crates/l10_foundation/h/Cargo.toml",
+            manifest(
+                "pplx-space-h",
+                "[features]\ndefault = [\"sqlx\"]\nsqlx = [\"dep:sqlx\"]\n[dependencies]\n\
+                 sqlx = { version = \"1\", optional = true }\n",
+            ),
+        ),
+        (
+            "crates/l10_foundation/k/Cargo.toml",
+            manifest(
+                "pplx-space-k",
+                "[features]\njson = [\"kv/serde\"]\npg = [\"kv/sqlx\"]\n[dependencies]\n\
+                 kv = { package = \"pplx-space-g\", path = \"../g\", optional = true, \
+                 features = [\"redis\"] }\n",
+            ),
+        ),
+        (
+            "crates/libs/legacy/Cargo.toml",
+            manifest(
+                "pplx-space-legacy",
+                "[features]\ncodec = [\"pplx-space-g/sqlx\"]\n[dependencies]\nsqlx = \"1\"\n\
+                 pplx-space-g = { path = \"../../l10_foundation/g\" }\n",
+            ),
+        ),
+        (
+            "crates/l20_domain/d/Cargo.toml",
+            manifest(
+                "pplx-space-d",
+                "[features]\nsqlx = [\"dep:sqlx\"]\nhdb = [\"dep:pplx-space-h\"]\n\
+                 [dependencies]\nsqlx = { version = \"1\", optional = true }\n\
+                 pplx-space-g = { path = \"../../l10_foundation/g\", features = [\"sqlx\"] }\n\
+                 pplx-space-h = { path = \"../../l10_foundation/h\", optional = true, \
+                 default-features = false, features = [\"sqlx\"] }\n\
+                 [dev-dependencies]\nredis = \"1\"\n",
+            ),
+        ),
+        (
+            "crates/l30_storage/s/store/Cargo.toml",
+            manifest(
+                "pplx-space-s-store",
+                "[features]\nkubernetes = [\"dep:redis\"]\ndefault = [\"kubernetes\"]\n\
+                 [dependencies]\nsqlx = \"1\"\nredis = { version = \"1\", optional = true }\n\
+                 pplx-space-f = { path = \"../../../l10_foundation/f\" }\n\
+                 pplx-space-g = { path = \"../../../l10_foundation/g\", features = [\"sqlx\"] }\n",
+            ),
+        ),
+        (
+            "crates/l40_api/a/server/Cargo.toml",
+            manifest(
+                "pplx-space-a",
+                "[features]\npg = [\"pplx-space-g?/sqlx\"]\n[dependencies]\nsqlx = \"1\"\n\
+                 pplx-space-f = { path = \"../../../l10_foundation/f\" }\n\
+                 pplx-space-conn = { path = \"../../../l10_foundation/conn\" }\n\
+                 pplx-space-g = { path = \"../../../l10_foundation/g\", optional = true }\n\
+                 pplx-space-legacy = { path = \"../../../libs/legacy\", features = [\"codec\"] }\n\
+                 [dev-dependencies]\n\
+                 pplx-space-h = { path = \"../../../l10_foundation/h\" }\n",
+            ),
+        ),
+        (
+            "crates/l40_api/a/server/src/lib.rs",
+            "use sqlx::PgPool;\n".to_owned(),
+        ),
+        (
+            "crates/l40_api/b/client/Cargo.toml",
+            manifest(
+                "pplx-space-b-client",
+                "[dependencies]\n\
+                 pplx-space-f = { path = \"../../../l10_foundation/f\" }\n\
+                 pplx-space-g = { path = \"../../../l10_foundation/g\", features = [\"redis\"] }\n\
+                 pplx-space-k = { path = \"../../../l10_foundation/k\", features = [\"kv\", \
+                 \"json\"] }\n",
+            ),
+        ),
+        (
+            "crates/l50_app/p/Cargo.toml",
+            manifest(
+                "pplx-space-p",
+                "[dependencies]\nredis = \"1\"\n\
+                 pplx-space-a = { path = \"../../l40_api/a/server\", features = [\"pg\"] }\n",
+            ),
+        ),
+        (
+            "crates/l50_app/q/Cargo.toml",
+            manifest(
+                "pplx-space-q",
+                "[dependencies]\npplx-space-h = { path = \"../../l10_foundation/h\" }\n\
+                 pplx-space-d = { path = \"../../l20_domain/d\", features = [\"hdb\"] }\n",
+            ),
+        ),
+        (
+            "crates/test_support/fixtures/Cargo.toml",
+            manifest("pplx-space-fixtures", "[dependencies]\nsqlx = \"1\"\n"),
+        ),
+        (
+            "crates/tools/bench/Cargo.toml",
+            manifest(
+                "pplx-space-bench",
+                "[dependencies]\nredis = \"1\"\n\
+                 pplx-space-h = { path = \"../../l10_foundation/h\" }\n",
+            ),
+        ),
+    ];
+    all.extend(files);
+    Layered {
+        extra: &STORAGE_EXTRA,
+        tables,
+        files: all,
+        ..Layered::default()
+    }
+    .build()
+}
+
+/// A baseline of [`layers_baseline`] without edges, plus the storage
+/// checks' tables with these `(from, to)` entries, each package's on one
+/// line.
+fn storage_baseline(access: &[(&str, &str)], codecs: &[(&str, &str)]) -> String {
+    let table = |name: &str, edges: &[(&str, &str)]| {
+        let mut grouped: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+        for (from, to) in edges {
+            grouped.entry(from).or_default().push(format!("{to:?}"));
+        }
+        let mut text = format!("[layers.{name}]\n");
+        for (from, to) in grouped {
+            text.push_str(&format!("{from:?} = [{}]\n", to.join(", ")));
+        }
+        text
+    };
+    layers_baseline(&[], &[]).replace(
+        "[crate_names]\n",
+        &format!(
+            "{}{}[crate_names]\n",
+            table("storage_access", access),
+            table("codec_features", codecs)
+        ),
+    )
+}
+
+/// The `storage_access` and `codec_features` findings, as `(code, message,
+/// location)`.
+fn storage_findings(ctx: &Context) -> Vec<(String, String, String)> {
+    layer_findings(ctx)
+        .into_iter()
+        .filter(|(code, _, _)| {
+            code.starts_with("layers.storage_access.") || code.starts_with("layers.codec_features.")
+        })
+        .collect()
+}
+
+/// Only stores and storage helpers depend on a driver or helper, or turn on
+/// a driver feature; each finding is on the manifest line that declares it,
+/// says what it reaches and how to fix it.
+#[test]
+fn layers_storage_checks() {
+    let ws = storage_workspace(STORAGE_TABLES, Vec::new());
+    let ctx = load(ws.path(), None);
+    let a = "crates/l40_api/a/server/Cargo.toml";
+    let manifest = |path: &str| fs::read_to_string(ws.path().join(path)).unwrap();
+    let at = |path: &str, needle: &str| format!("{path}:{}", line_with(&manifest(path), needle));
+    let d = "crates/l20_domain/d/Cargo.toml";
+    let b = "crates/l40_api/b/client/Cargo.toml";
+    let p = "crates/l50_app/p/Cargo.toml";
+    let q = "crates/l50_app/q/Cargo.toml";
+    let legacy = "crates/libs/legacy/Cargo.toml";
+    let expected = [
+        (
+            "layers.storage_access.no_crossing",
+            format!(
+                "{a}: pplx-space-a (l40_api) depends on pplx-space-conn, a storage helper \
+                 ([rules.layers.storage] helpers lists it), a normal dependency, but only \
+                 l30_storage crates and storage helpers may"
+            ),
+            at(a, "pplx-space-conn ="),
+        ),
+        (
+            "layers.storage_access.no_crossing",
+            format!(
+                "{a}: pplx-space-a (l40_api) depends on pplx-space-f, a storage helper (it has a \
+                 required dependency on sqlx), a normal dependency"
+            ),
+            at(a, "pplx-space-f ="),
+        ),
+        (
+            "layers.storage_access.no_crossing",
+            format!(
+                "{a}: pplx-space-a (l40_api) depends on sqlx, a driver ([rules.layers.storage] \
+                 drivers lists it), a normal dependency, but only l30_storage crates and storage \
+                 helpers may: nothing above l30_storage reaches a database or object storage \
+                 directly, l20_domain never does, and l10_foundation does only in a helper that \
+                 names nothing SPACE-specific. Fix one of: move the code that uses it \
+                 (sqlx::PgPool) into a store in l30_storage that lists pplx-space-a in \
+                 [rules.layers] store_users, and call the store; or, for a generic mechanism \
+                 that names nothing SPACE-specific, into a storage helper in l10_foundation that \
+                 such a store calls. Moving it into a new storage helper does not let \
+                 pplx-space-a depend on that helper: layers.storage_access checks that edge too. \
+                 See crates/tools/archcheck/README.md#layers."
+            ),
+            at(a, "sqlx = \"1\""),
+        ),
+        // A client never depends on a store, so it is not told to use one.
+        (
+            "layers.storage_access.no_crossing",
+            format!(
+                "{b}: pplx-space-b-client (l40_api) depends on pplx-space-f, a storage helper (it \
+                 has a required dependency on sqlx), a normal dependency, but only l30_storage \
+                 crates and storage helpers may: nothing above l30_storage reaches a database or \
+                 object storage directly, l20_domain never does, and l10_foundation does only in \
+                 a helper that names nothing SPACE-specific. Fix: a client reaches state only \
+                 through its server's protocol, and never depends on a store: move the code that \
+                 uses it into the server, behind a store, and add a call for it to the protocol. \
+                 Moving it into a new storage helper does not let pplx-space-b-client depend on \
+                 that helper: layers.storage_access checks that edge too. See \
+                 crates/tools/archcheck/README.md#layers."
+            ),
+            at(b, "pplx-space-f ="),
+        ),
+        (
+            "layers.storage_access.no_crossing",
+            format!(
+                "{d}: pplx-space-d (l20_domain) depends on sqlx, a driver ([rules.layers.storage] \
+                 drivers lists it), a normal dependency (optional, so a feature turns it on), but \
+                 only l30_storage crates and storage helpers may: nothing above l30_storage \
+                 reaches a database or object storage directly, l20_domain never does, and \
+                 l10_foundation does only in a helper that names nothing SPACE-specific. Fix: \
+                 move the code that uses it, such as a codec's impls, into the store that \
+                 persists these types"
+            ),
+            at(d, "sqlx = {"),
+        ),
+        (
+            "layers.storage_access.no_crossing",
+            format!(
+                "{legacy}: pplx-space-legacy (l10_foundation) depends on sqlx, a driver \
+                 ([rules.layers.storage] drivers lists it), a normal dependency, but only \
+                 l30_storage crates and storage helpers may: nothing above l30_storage reaches \
+                 a database or object storage directly, l20_domain never does, and \
+                 l10_foundation does only in a helper that names nothing SPACE-specific. Fix: \
+                 move the code that uses it into a store or a storage helper, as splitting \
+                 pplx-space-legacy up would: [rules.layers] legacy lists it, so it is \
+                 no storage helper itself. See crates/tools/archcheck/README.md#layers."
+            ),
+            at(legacy, "sqlx = \"1\""),
+        ),
+        // Nor does an app, which goes through an API crate.
+        (
+            "layers.storage_access.no_crossing",
+            format!(
+                "{p}: pplx-space-p (l50_app) depends on redis, a driver ([rules.layers.storage] \
+                 drivers lists it), a normal dependency, but only l30_storage crates and storage \
+                 helpers may: nothing above l30_storage reaches a database or object storage \
+                 directly, l20_domain never does, and l10_foundation does only in a helper that \
+                 names nothing SPACE-specific. Fix: an app reaches state only through the \
+                 l40_api crate that owns it: move the code that uses it into that crate, or a \
+                 store it uses, and call the API crate. Moving it into a new storage helper does \
+                 not let pplx-space-p depend on that helper: layers.storage_access checks that \
+                 edge too. See crates/tools/archcheck/README.md#layers."
+            ),
+            at(p, "redis = \"1\""),
+        ),
+        (
+            "layers.codec_features.no_crossing",
+            format!(
+                "{a}: pplx-space-a (l40_api) enables the `sqlx` feature of pplx-space-g, by \
+                 forwarding \"pplx-space-g?/sqlx\" from its own feature `pg`, which turns on its \
+                 optional dependency on sqlx, but only l30_storage crates and storage helpers may \
+                 turn on a driver feature. Fix: drop the feature, move the code that needs it, \
+                 such as a codec or a client, into a store in l30_storage (which may enable the \
+                 feature itself) or a storage helper, and reach the data through that. See \
+                 crates/tools/archcheck/README.md#layers."
+            ),
+            at(a, "pg = ["),
+        ),
+        (
+            "layers.codec_features.no_crossing",
+            format!(
+                "{a}: pplx-space-a (l40_api) enables the `codec` feature of pplx-space-legacy, \
+                 with features = [\"codec\"] on a normal dependency, which reaches sqlx through \
+                 pplx-space-g/sqlx"
+            ),
+            at(a, "pplx-space-legacy ="),
+        ),
+        (
+            "layers.codec_features.no_crossing",
+            format!(
+                "{b}: pplx-space-b-client (l40_api) enables the `redis` feature of pplx-space-g, \
+                 with features = [\"redis\"] on a normal dependency, which turns on its optional \
+                 dependency on redis"
+            ),
+            at(b, "pplx-space-g ="),
+        ),
+        // `json` is a driver feature only because turning on `kv` turns on
+        // the `redis` it requests.
+        (
+            "layers.codec_features.no_crossing",
+            format!(
+                "{b}: pplx-space-b-client (l40_api) enables the `json` feature of pplx-space-k, \
+                 with features = [\"json\"] on a normal dependency, which reaches redis through \
+                 pplx-space-g/redis"
+            ),
+            at(b, "pplx-space-k ="),
+        ),
+        (
+            "layers.codec_features.no_crossing",
+            format!(
+                "{b}: pplx-space-b-client (l40_api) enables the `kv` feature of pplx-space-k, \
+                 with features = [\"kv\"] on a normal dependency, which reaches redis through \
+                 pplx-space-g/redis"
+            ),
+            at(b, "pplx-space-k ="),
+        ),
+        (
+            "layers.codec_features.no_crossing",
+            format!(
+                "{d}: pplx-space-d (l20_domain) enables the `sqlx` feature of pplx-space-g, with \
+                 features = [\"sqlx\"]"
+            ),
+            at(d, "pplx-space-g ="),
+        ),
+        (
+            "layers.codec_features.no_crossing",
+            format!(
+                "{d}: pplx-space-d (l20_domain) enables the `sqlx` feature of pplx-space-h, with \
+                 features = [\"sqlx\"] on a normal dependency, which turns on its optional \
+                 dependency on sqlx"
+            ),
+            at(d, "pplx-space-h ="),
+        ),
+        (
+            "layers.codec_features.no_crossing",
+            format!(
+                "{p}: pplx-space-p (l50_app) enables the `pg` feature of pplx-space-a, with \
+                 features = [\"pg\"] on a normal dependency, which reaches sqlx through \
+                 pplx-space-g/sqlx"
+            ),
+            at(p, "pplx-space-a ="),
+        ),
+        (
+            "layers.codec_features.no_crossing",
+            format!(
+                "{q}: pplx-space-q (l50_app) enables the `hdb` feature of pplx-space-d, with \
+                 features = [\"hdb\"] on a normal dependency, which reaches sqlx through \
+                 pplx-space-h/sqlx"
+            ),
+            at(q, "pplx-space-d ="),
+        ),
+        (
+            "layers.codec_features.no_crossing",
+            format!(
+                "{q}: pplx-space-q (l50_app) enables the `default` feature of pplx-space-h, \
+                 through the default features of a normal dependency, which reaches sqlx through \
+                 pplx-space-h/sqlx"
+            ),
+            at(q, "pplx-space-h ="),
+        ),
+    ];
+    let found = storage_findings(&ctx);
+    let expected: Vec<(&str, &str, &str)> = expected
+        .iter()
+        .map(|(code, message, at)| (*code, message.as_str(), at.as_str()))
+        .collect();
+    assert_layer_findings("storage", &found, &expected);
+    assert!(
+        layer_findings(&ctx)
+            .iter()
+            .all(|(code, _, _)| !code.ends_with("stale_entries")),
+        "{:#?}",
+        layer_findings(&ctx)
+    );
+
+    // Listed, they are tolerated.
+    let access = [
+        ("pplx-space-a", "pplx-space-conn"),
+        ("pplx-space-a", "pplx-space-f"),
+        ("pplx-space-a", "sqlx"),
+        ("pplx-space-b-client", "pplx-space-f"),
+        ("pplx-space-d", "sqlx"),
+        ("pplx-space-legacy", "sqlx"),
+        ("pplx-space-p", "redis"),
+    ];
+    let codecs = [
+        ("pplx-space-a", "pplx-space-g/sqlx"),
+        ("pplx-space-a", "pplx-space-legacy/codec"),
+        ("pplx-space-b-client", "pplx-space-g/redis"),
+        ("pplx-space-b-client", "pplx-space-k/json"),
+        ("pplx-space-b-client", "pplx-space-k/kv"),
+        ("pplx-space-d", "pplx-space-g/sqlx"),
+        ("pplx-space-d", "pplx-space-h/sqlx"),
+        ("pplx-space-p", "pplx-space-a/pg"),
+        ("pplx-space-q", "pplx-space-d/hdb"),
+        ("pplx-space-q", "pplx-space-h/default"),
+    ];
+    let ws = storage_workspace(
+        STORAGE_TABLES,
+        vec![(
+            "architecture-baseline.toml",
+            storage_baseline(&access, &codecs),
+        )],
+    );
+    let found = storage_findings(&load(ws.path(), None));
+    assert!(found.is_empty(), "{found:#?}");
+
+    // Without `default-features` and `hdb`, `q` enables nothing; `d`'s
+    // optional dependency on `h` requests no driver feature without
+    // `features`, so `hdb` is none. Test support and tools are left out.
+    let kept: Vec<(&str, &str)> = codecs
+        .iter()
+        .copied()
+        .filter(|&(from, to)| from != "pplx-space-q" && to != "pplx-space-h/sqlx")
+        .collect();
+    let ws = storage_workspace(
+        STORAGE_TABLES,
+        vec![
+            (
+                "architecture-baseline.toml",
+                storage_baseline(&access, &kept),
+            ),
+            (
+                "crates/l50_app/q/Cargo.toml",
+                format!(
+                    "{}[dependencies]\npplx-space-h = {{ path = \"../../l10_foundation/h\", \
+                     default-features = false }}\n\
+                     pplx-space-d = {{ path = \"../../l20_domain/d\", features = [\"hdb\"] }}\n",
+                    package("pplx-space-q")
+                ),
+            ),
+            (
+                "crates/l20_domain/d/Cargo.toml",
+                format!(
+                    "{}[features]\nsqlx = [\"dep:sqlx\"]\nhdb = [\"dep:pplx-space-h\"]\n\
+                     [dependencies]\nsqlx = {{ version = \"1\", optional = true }}\n\
+                     pplx-space-g = {{ path = \"../../l10_foundation/g\", features = \
+                     [\"sqlx\"] }}\n\
+                     pplx-space-h = {{ path = \"../../l10_foundation/h\", optional = true, \
+                     default-features = false }}\n",
+                    package("pplx-space-d")
+                ),
+            ),
+        ],
+    );
+    let found = storage_findings(&load(ws.path(), None));
+    assert!(found.is_empty(), "{found:#?}");
+
+    // `helpers` is the full list: with `f` left out, its required `sqlx`
+    // makes it a helper the list lacks, and it is no helper, so depending on
+    // it reaches no storage.
+    let unlisted = STORAGE_TABLES.replace(", \"pplx-space-f\"", "");
+    let without_f: Vec<(&str, &str)> = access
+        .iter()
+        .copied()
+        .filter(|&(_, to)| to != "pplx-space-f")
+        .collect();
+    let ws = storage_workspace(
+        &unlisted,
+        vec![(
+            "architecture-baseline.toml",
+            storage_baseline(&without_f, &codecs),
+        )],
+    );
+    let f = "crates/l10_foundation/f/Cargo.toml";
+    let message = format!(
+        "{f}: pplx-space-f (l10_foundation) depends on sqlx, a driver ([rules.layers.storage] \
+         drivers lists it), a normal dependency, but only l30_storage crates and storage helpers \
+         may: nothing above l30_storage reaches a database or object storage directly, \
+         l20_domain never does, and l10_foundation does only in a helper that names nothing \
+         SPACE-specific. Fix one of: [rules.layers.storage] helpers in ARCHITECTURE.toml lists \
+         every storage helper, and a required driver dependency makes pplx-space-f one, but the \
+         list lacks it: if pplx-space-f names nothing SPACE-specific, add it to helpers; \
+         layers.policy_changed reports the change for review. Otherwise move the code that uses \
+         it into a store or a storage helper. See crates/tools/archcheck/README.md#layers."
+    );
+    let ctx = load(ws.path(), None);
+    let found = storage_findings(&ctx);
+    assert_layer_findings(
+        "an unlisted helper",
+        &found,
+        &[(
+            "layers.storage_access.no_crossing",
+            &message,
+            &format!("{f}:{}", line_with(&manifest(f), "sqlx = \"1\"")),
+        )],
+    );
+    let finding = check(&ctx)
+        .into_iter()
+        .find(|finding| finding.code() == "layers.storage_access.no_crossing")
+        .expect("the finding");
+    assert!(finding.mode.is_required());
+}
+
+/// An entry that no longer applies is stale, with the reason; so is a
+/// `helpers` entry of `[rules.layers.storage]` that does nothing, and a
+/// `[rules.layers] legacy` entry for a crate that is gone, but not one
+/// outside `l10_foundation`. Neither is for a crate without a layer, which
+/// `placement` reports.
+#[test]
+fn layers_storage_stale_entries() {
+    let tables = "[rules.layers.unmoved]\nl10_foundation = [\"pplx-space-legacy\"]\n\
+                  [rules.layers.storage]\ndrivers = [\"redis\", \"sqlx\"]\n\
+                  helpers = [\n  \"pplx-space-conn\",\n  \"pplx-space-d\",\n  \"pplx-space-f\",\n  \
+                  \"pplx-space-gone\",\n  \"pplx-space-legacy\",\n]\n\
+                  [rules.layers]\n\
+                  legacy = [\n  \"pplx-space-d\",\n  \"pplx-space-legacy\",\n  \"pplx-space-old\",\n]\n";
+    let access = [
+        ("pplx-space-a", "pplx-space-conn"),
+        ("pplx-space-a", "pplx-space-f"),
+        ("pplx-space-a", "pplx-space-x"),
+        ("pplx-space-a", "redis"),
+        ("pplx-space-a", "sqlx"),
+        ("pplx-space-b-client", "pplx-space-f"),
+        ("pplx-space-d", "sqlx"),
+        ("pplx-space-g", "sqlx"),
+        ("pplx-space-gone", "sqlx"),
+        ("pplx-space-legacy", "sqlx"),
+        ("pplx-space-p", "redis"),
+        ("pplx-space-s-store", "sqlx"),
+    ];
+    let codecs = [
+        ("pplx-space-a", "nofeature"),
+        ("pplx-space-a", "pplx-space-g/sqlx"),
+        ("pplx-space-a", "pplx-space-legacy/codec"),
+        ("pplx-space-a", "pplx-space-s-store/kubernetes"),
+        ("pplx-space-b-client", "pplx-space-g/redis"),
+        ("pplx-space-b-client", "pplx-space-k/json"),
+        ("pplx-space-b-client", "pplx-space-k/kv"),
+        ("pplx-space-d", "pplx-space-g/serde"),
+        ("pplx-space-d", "pplx-space-g/sqlx"),
+        ("pplx-space-d", "pplx-space-h/sqlx"),
+        ("pplx-space-k", "pplx-space-g/redis"),
+        ("pplx-space-p", "pplx-space-a/pg"),
+        ("pplx-space-p", "pplx-space-g/sqlx"),
+        ("pplx-space-q", "pplx-space-d/hdb"),
+        ("pplx-space-q", "pplx-space-h/default"),
+    ];
+    let baseline = storage_baseline(&access, &codecs);
+    let ws = storage_workspace(
+        tables,
+        vec![("architecture-baseline.toml", baseline.clone())],
+    );
+    let ctx = load(ws.path(), None);
+    let config = fs::read_to_string(ws.path().join("ARCHITECTURE.toml")).unwrap();
+    let entry = |from: &str, to: &str| {
+        let line = baseline
+            .lines()
+            .position(|line| {
+                line.starts_with(&format!("{from:?} = ")) && line.contains(&format!("{to:?}"))
+            })
+            .expect("the entry is in the baseline");
+        format!("architecture-baseline.toml:{}", line + 1)
+    };
+    let stale = |table: &str, from: &str, to: &str, reason: &str| {
+        (
+            format!("layers.{table}.stale_entries"),
+            format!(
+                "{from} -> {to}: is in [layers.{table}] in architecture-baseline.toml, but \
+                 {reason}. Remove the entry (cargo arch --write-baseline=layers.{table})."
+            ),
+            entry(from, to),
+        )
+    };
+    let config_at = |needle: &str| format!("ARCHITECTURE.toml:{}", line_with(&config, needle));
+    let expected = vec![
+        stale(
+            "storage_access",
+            "pplx-space-a",
+            "pplx-space-x",
+            "pplx-space-x is neither a driver in [rules.layers.storage] nor a storage helper",
+        ),
+        stale(
+            "storage_access",
+            "pplx-space-a",
+            "redis",
+            "pplx-space-a has no normal or build dependency on redis",
+        ),
+        stale(
+            "storage_access",
+            "pplx-space-g",
+            "sqlx",
+            "pplx-space-g's dependency on sqlx is optional in an l10_foundation crate, a codec \
+             behind a feature, whose enabling layers.codec_features checks",
+        ),
+        stale(
+            "storage_access",
+            "pplx-space-gone",
+            "sqlx",
+            "no workspace member is named pplx-space-gone",
+        ),
+        stale(
+            "storage_access",
+            "pplx-space-s-store",
+            "sqlx",
+            "pplx-space-s-store is a store, which may reach storage",
+        ),
+        stale(
+            "codec_features",
+            "pplx-space-a",
+            "nofeature",
+            "nofeature is not <package>/<feature>",
+        ),
+        stale(
+            "codec_features",
+            "pplx-space-a",
+            "pplx-space-s-store/kubernetes",
+            "pplx-space-s-store is a store, whose features are not checked",
+        ),
+        stale(
+            "codec_features",
+            "pplx-space-d",
+            "pplx-space-g/serde",
+            "`serde` of pplx-space-g does not turn on a driver or storage helper",
+        ),
+        stale(
+            "codec_features",
+            "pplx-space-k",
+            "pplx-space-g/redis",
+            "pplx-space-k enables it only behind a feature of its own in an l10_foundation \
+             crate, a codec, whose enabling layers.codec_features checks",
+        ),
+        stale(
+            "codec_features",
+            "pplx-space-p",
+            "pplx-space-g/sqlx",
+            "pplx-space-p does not enable it",
+        ),
+    ];
+    let expected: Vec<(&str, &str, &str)> = expected
+        .iter()
+        .map(|(code, message, at)| (code.as_str(), message.as_str(), at.as_str()))
+        .collect();
+    assert_layer_findings("stale", &storage_findings(&ctx), &expected);
+
+    let config_stale: Vec<(String, String, String)> = layer_findings(&ctx)
+        .into_iter()
+        .filter(|(code, _, _)| code == "layers.stale_entries")
+        .collect();
+    let helper = |package: &str, reason: &str| {
+        (
+            format!(
+                "{package}: is in [rules.layers.storage] helpers in ARCHITECTURE.toml, but \
+                 {reason}. Remove it."
+            ),
+            config_at(&format!("  \"{package}\",")),
+        )
+    };
+    // The second line naming a package in the config is its `legacy` entry.
+    let legacy = |package: &str, reason: &str| {
+        let line = config
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| *line == format!("  \"{package}\","))
+            .map(|(index, _)| index + 1)
+            .last()
+            .expect("the package is in legacy");
+        (
+            format!(
+                "{package}: is in [rules.layers] legacy in ARCHITECTURE.toml, but {reason}. \
+                 Remove it."
+            ),
+            format!("ARCHITECTURE.toml:{line}"),
+        )
+    };
+    // `legacy` is [rules.layers]'s own, whose entries are checked first.
+    let expected = [
+        legacy("pplx-space-old", "no workspace member has this name"),
+        helper(
+            "pplx-space-d",
+            "a storage helper is an l10_foundation crate, and its layer is l20_domain",
+        ),
+        helper("pplx-space-gone", "no workspace member has this name"),
+        helper(
+            "pplx-space-legacy",
+            "[rules.layers] legacy lists it too, which keeps a crate from being a storage helper",
+        ),
+    ];
+    let found: Vec<(&str, &str)> = config_stale
+        .iter()
+        .map(|(_, message, at)| (message.as_str(), at.as_str()))
+        .collect();
+    let expected: Vec<(&str, &str)> = expected
+        .iter()
+        .map(|(message, at)| (message.as_str(), at.as_str()))
+        .collect();
+    assert_eq!(found, expected);
+
+    // Without its `unmoved` entry the legacy crate has no layer: its
+    // `helpers` and `legacy` entries are left to `placement`.
+    let tables = "[rules.layers.storage]\ndrivers = [\"sqlx\"]\n\
+                  helpers = [\"pplx-space-legacy\"]\n\
+                  [rules.layers]\nlegacy = [\"pplx-space-legacy\"]\n";
+    let ctx = load(storage_workspace(tables, Vec::new()).path(), None);
+    let codes: Vec<String> = layer_findings(&ctx)
+        .into_iter()
+        .filter(|(code, _, _)| code == "layers.placement" || code == "layers.stale_entries")
+        .map(|(code, _, _)| code)
+        .collect();
+    assert_eq!(codes, ["layers.placement"], "{:#?}", layer_findings(&ctx));
+}
+
+/// The storage tables compare with the base branch's: a base whose layers
+/// rule lacks the check is seeded, with advisory findings; one with the
+/// check but without the table tolerates nothing; and an entry in the base's
+/// table is no new one. `--write-baseline` keeps the entries still in
+/// violation and lists the others.
+#[test]
+fn layers_storage_base_comparison_and_write_baseline() {
+    let access = [("pplx-space-a", "sqlx"), ("pplx-space-d", "sqlx")];
+    let ws = storage_workspace(
+        STORAGE_TABLES,
+        vec![("architecture-baseline.toml", storage_baseline(&access, &[]))],
+    );
+    let config = fs::read_to_string(ws.path().join("ARCHITECTURE.toml")).unwrap();
+    let without_storage: String = {
+        let mut kept = String::new();
+        let mut skipping = false;
+        for line in config.lines() {
+            if line.starts_with('[') {
+                skipping = line.starts_with("[rules.layers.storage")
+                    || line.starts_with("[rules.layers.codec_features");
+            }
+            if !skipping {
+                kept.push_str(line);
+                kept.push('\n');
+            }
+        }
+        kept
+    };
+    let base = layers_baseline(&[], &[]);
+    let new_entries = |architecture: &str, base: &str| {
+        let ctx = load_with(ws.path(), Some(base), Some(architecture));
+        layer_findings(&ctx)
+            .into_iter()
+            .filter(|(code, _, _)| code == "layers.storage_access.no_new_entries")
+            .map(|(_, message, _)| message)
+            .zip(
+                check(&ctx)
+                    .into_iter()
+                    .filter(|finding| finding.code() == "layers.storage_access.no_new_entries")
+                    .map(|finding| finding.mode.is_required()),
+            )
+            .collect::<Vec<_>>()
+    };
+
+    let seeded = new_entries(&without_storage, &base);
+    assert_eq!(seeded.len(), 2, "{seeded:#?}");
+    assert_eq!(
+        seeded[0].0,
+        "pplx-space-a -> sqlx: is in [layers.storage_access] in architecture-baseline.toml, and \
+         the base branch's layers rule has no storage_access check yet, so this pull request \
+         seeds the table. Review each entry."
+    );
+    assert!(seeded.iter().all(|(_, required)| !required));
+
+    let compared = new_entries(&config, &base);
+    assert_eq!(compared.len(), 2, "{compared:#?}");
+    assert!(
+        compared[0].0.starts_with(
+            "pplx-space-a -> sqlx: is in [layers.storage_access] in architecture-baseline.toml \
+             but not in the base branch's copy"
+        ),
+        "{compared:#?}"
+    );
+    assert!(compared.iter().all(|(_, required)| *required));
+
+    let listed = new_entries(&config, &storage_baseline(&access[..1], &[]));
+    assert_eq!(listed.len(), 1, "{listed:#?}");
+    assert!(
+        listed[0].0.starts_with("pplx-space-d -> sqlx: "),
+        "{listed:#?}"
+    );
+
+    let write = run(ws.path(), &["--write-baseline=layers.storage_access"]);
+    assert_eq!(write.code, 0, "{}", write.stderr);
+    let not_added: Vec<&str> = write
+        .stdout
+        .lines()
+        .filter(|line| line.starts_with("not added: "))
+        .collect();
+    let line = |edge: &str| {
+        format!(
+            "not added: {edge} in [layers.storage_access]; fix the dependency (cargo arch says \
+             how): an entry added by hand fails layers.storage_access.no_new_entries, and a \
+             crate that has to reach storage for good becomes a store or a storage helper; \
+             [rules.layers.storage] helpers lists every helper, and adding one is a policy \
+             change, which layers.policy_changed reports"
+        )
+    };
+    assert_eq!(
+        not_added,
+        [
+            line("pplx-space-a (l40_api) -> pplx-space-conn"),
+            line("pplx-space-a (l40_api) -> pplx-space-f"),
+            line("pplx-space-b-client (l40_api) -> pplx-space-f"),
+            line("pplx-space-legacy (l10_foundation) -> sqlx"),
+            line("pplx-space-p (l50_app) -> redis"),
+        ],
+        "{}",
+        write.stdout
+    );
+    let text = fs::read_to_string(ws.path().join("architecture-baseline.toml")).unwrap();
+    assert_eq!(
+        generated_table(&text, "layers.storage_access"),
+        "[layers.storage_access]\npplx-space-a = [\n  \"sqlx\",\n]\npplx-space-d = [\n  \
+         \"sqlx\",\n]\n",
+        "{text}"
+    );
+    assert_eq!(
+        generated_table(&text, "layers.codec_features"),
+        "[layers.codec_features]\n",
+        "{text}"
+    );
+
+    // A helper the list lacks is to be listed, not baselined; until it is,
+    // depending on it reaches no storage.
+    let ws = storage_workspace(
+        &STORAGE_TABLES.replace(", \"pplx-space-f\"", ""),
+        vec![("architecture-baseline.toml", storage_baseline(&access, &[]))],
+    );
+    let write = run(ws.path(), &["--write-baseline=layers.storage_access"]);
+    assert_eq!(write.code, 0, "{}", write.stderr);
+    let not_added: Vec<&str> = write
+        .stdout
+        .lines()
+        .filter(|line| line.starts_with("not added: "))
+        .collect();
+    assert_eq!(
+        not_added,
+        [
+            line("pplx-space-a (l40_api) -> pplx-space-conn").as_str(),
+            "not added: pplx-space-f (l10_foundation) -> sqlx in [layers.storage_access]; \
+             [rules.layers.storage] helpers lists every storage helper, and this required driver \
+             dependency makes pplx-space-f one: if it names nothing SPACE-specific, add it to \
+             helpers, which layers.policy_changed reports for review; otherwise fix the \
+             dependency (cargo arch says how). An entry added by hand fails \
+             layers.storage_access.no_new_entries",
+            &line("pplx-space-legacy (l10_foundation) -> sqlx"),
+            &line("pplx-space-p (l50_app) -> redis"),
+        ],
+        "{}",
+        write.stdout
+    );
+}
+
+/// `[rules.layers.storage]` needs at least one driver, and lists each
+/// package once.
+#[test]
+fn layers_storage_configuration_errors() {
+    for (storage, error) in [
+        (
+            "[rules.layers.storage]\ndrivers = []\n",
+            "drivers must list at least one package",
+        ),
+        (
+            "[rules.layers.storage]\ndrivers = [\"sqlx\", \"sqlx\"]\n",
+            "\"sqlx\" is listed twice",
+        ),
+        (
+            "[rules.layers.storage]\ndrivers = [\"sqlx\"]\nhelpers = [\"x\", \"x\"]\n",
+            "\"x\" is listed twice",
+        ),
+        (
+            "[rules.layers.storage]\ndrivers = [\"sqlx\"]\nowners = []\n",
+            "unknown field `owners`",
+        ),
+    ] {
+        let ws = Layered {
+            files: vec![("ARCHITECTURE.toml", layers_config(storage, "required"))],
+            ..Layered::default()
+        }
+        .build();
+        let checked = run(ws.path(), &[]);
+        assert_eq!(checked.code, 2, "{storage}: {}", checked.stdout);
+        assert!(
+            checked.stderr.contains(error),
+            "{storage}: {}",
+            checked.stderr
+        );
+    }
+    // Without the table, the layers rule's configuration is incomplete.
+    let ws = Layered {
+        files: vec![(
+            "ARCHITECTURE.toml",
+            layers_config("", "required").replace(STORAGE, ""),
+        )],
+        ..Layered::default()
+    }
+    .build();
+    let checked = run(ws.path(), &[]);
+    assert_eq!(checked.code, 2, "{}", checked.stdout);
+    assert!(
+        checked.stderr.contains("missing field `storage`"),
+        "{}",
+        checked.stderr
+    );
+}
+
+const DOMAIN_EXTRA: [(&str, &str); 4] = [
+    ("crates/l20_domain/m", "pplx-space-m"),
+    ("crates/l20_domain/w/protocol", "pplx-space-w-protocol"),
+    ("crates/l20_domain/wire", "pplx-space-wire"),
+    ("crates/libs/legacy", "pplx-space-legacy"),
+];
+
+/// `[rules.layers]` tables for [`domain_workspace`].
+const DOMAIN_TABLES: &str = "[rules.layers]\nlegacy = [\"pplx-space-legacy\"]\n\
+                             protocols = [\"pplx-space-wire\"]\n\
+                             [rules.layers.unmoved]\nl20_domain = [\"pplx-space-legacy\"]\n\
+                             [rules.layers.storage]\ndrivers = [\"redis\", \"sqlx\"]\n\
+                             [rules.layers.domain_fences]\nruntime = [\"tokio\"]\n\
+                             http = [\"hyper\", \"reqwest\"]\nkube = [\"kube\"]\n";
+
+/// A layered workspace whose Domain manifests reach fenced packages and
+/// protocols in every way the Domain checks tell apart, with `tables` as
+/// `[rules.layers]`'s and `files` written over the rest:
+///
+/// - `d`, a model, depends on `tokio`, on `hyper` (optional) and `reqwest`
+///   (a build-dependency), and on `sqlx`, a driver, and `aws-lc-rs`, which
+///   no family lists; and on the protocols `w-protocol`, by its name, and
+///   `wire` (a build-dependency), which `protocols` lists;
+/// - `m`, a model, dev-depends on `tokio` and `w-protocol`, and depends on
+///   the model `d`;
+/// - `w-protocol` depends on `tokio` for one target, and on `d` and `wire`;
+/// - the legacy crate, a model, depends on `kube` (optional) and `wire`;
+/// - `a` (API) depends on `tokio` and `w-protocol`.
+fn domain_workspace(tables: &str, files: Vec<(&str, String)>) -> TempDir {
+    let manifest = |name: &str, body: &str| format!("{}{body}", package(name));
+    let mut all: Vec<(&str, String)> = vec![
+        ("ARCHITECTURE.toml", layers_config(tables, "required")),
+        (
+            "crates/l20_domain/d/Cargo.toml",
+            manifest(
+                "pplx-space-d",
+                "[dependencies]\ntokio = \"1\"\nhyper = { version = \"1\", optional = true }\n\
+                 sqlx = \"1\"\naws-lc-rs = \"1\"\n\
+                 pplx-space-w-protocol = { path = \"../w/protocol\" }\n\
+                 [build-dependencies]\nreqwest = \"1\"\n\
+                 pplx-space-wire = { path = \"../wire\" }\n",
+            ),
+        ),
+        (
+            "crates/l20_domain/d/src/lib.rs",
+            "use tokio::sync::Mutex;\nuse pplx_space_w_protocol::v1::Thing;\n".to_owned(),
+        ),
+        (
+            "crates/l20_domain/m/Cargo.toml",
+            manifest(
+                "pplx-space-m",
+                "[dependencies]\npplx-space-d = { path = \"../d\" }\n\
+                 [dev-dependencies]\ntokio = \"1\"\n\
+                 pplx-space-w-protocol = { path = \"../w/protocol\" }\n",
+            ),
+        ),
+        (
+            "crates/l20_domain/w/protocol/Cargo.toml",
+            manifest(
+                "pplx-space-w-protocol",
+                "[dependencies]\npplx-space-d = { path = \"../../d\" }\n\
+                 pplx-space-wire = { path = \"../../wire\" }\n\
+                 [target.'cfg(unix)'.dependencies]\ntokio = \"1\"\n",
+            ),
+        ),
+        (
+            "crates/libs/legacy/Cargo.toml",
+            manifest(
+                "pplx-space-legacy",
+                "[dependencies]\nkube = { version = \"1\", optional = true }\n\
+                 pplx-space-wire = { path = \"../../l20_domain/wire\" }\n",
+            ),
+        ),
+        (
+            "crates/l40_api/a/server/Cargo.toml",
+            manifest(
+                "pplx-space-a",
+                "[dependencies]\ntokio = \"1\"\n\
+                 pplx-space-w-protocol = { path = \"../../../l20_domain/w/protocol\" }\n",
+            ),
+        ),
+    ];
+    all.extend(files);
+    Layered {
+        extra: &DOMAIN_EXTRA,
+        tables,
+        files: all,
+        ..Layered::default()
+    }
+    .build()
+}
+
+/// A baseline of [`layers_baseline`] without edges, plus the Domain checks'
+/// tables with these `(from, to)` entries, each package's on one line.
+fn domain_baseline(dependencies: &[(&str, &str)], model_protocol: &[(&str, &str)]) -> String {
+    let table = |name: &str, edges: &[(&str, &str)]| {
+        let mut grouped: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+        for (from, to) in edges {
+            grouped.entry(from).or_default().push(format!("{to:?}"));
+        }
+        let mut text = format!("[layers.{name}]\n");
+        for (from, to) in grouped {
+            text.push_str(&format!("{from:?} = [{}]\n", to.join(", ")));
+        }
+        text
+    };
+    layers_baseline(&[], &[]).replace(
+        "[crate_names]\n",
+        &format!(
+            "{}{}[crate_names]\n",
+            table("domain_dependencies", dependencies),
+            table("model_protocol", model_protocol)
+        ),
+    )
+}
+
+/// The `domain_dependencies` and `model_protocol` findings, as `(code,
+/// message, location)`.
+fn domain_findings(ctx: &Context) -> Vec<(String, String, String)> {
+    layer_findings(ctx)
+        .into_iter()
+        .filter(|(code, _, _)| {
+            code.starts_with("layers.domain_dependencies.")
+                || code.starts_with("layers.model_protocol.")
+        })
+        .collect()
+}
+
+/// The edges [`domain_workspace`] has against the Domain checks.
+const DOMAIN_DEPENDENCIES: [(&str, &str); 5] = [
+    ("pplx-space-d", "hyper"),
+    ("pplx-space-d", "reqwest"),
+    ("pplx-space-d", "tokio"),
+    ("pplx-space-legacy", "kube"),
+    ("pplx-space-w-protocol", "tokio"),
+];
+const MODEL_PROTOCOL: [(&str, &str); 3] = [
+    ("pplx-space-d", "pplx-space-w-protocol"),
+    ("pplx-space-d", "pplx-space-wire"),
+    ("pplx-space-legacy", "pplx-space-wire"),
+];
+
+/// No Domain crate has a normal or build dependency on a fenced package,
+/// and no model one on a protocol; each finding is on the manifest line
+/// that declares it, says why and how to fix it. Drivers are left to
+/// storage_access, legacy crates are checked, and dev-dependencies and
+/// crates outside Domain are not.
+#[test]
+fn layers_domain_checks() {
+    let ws = domain_workspace(DOMAIN_TABLES, Vec::new());
+    let ctx = load(ws.path(), None);
+    let manifest = |path: &str| fs::read_to_string(ws.path().join(path)).unwrap();
+    let at = |path: &str, needle: &str| format!("{path}:{}", line_with(&manifest(path), needle));
+    let d = "crates/l20_domain/d/Cargo.toml";
+    let legacy = "crates/libs/legacy/Cargo.toml";
+    let w = "crates/l20_domain/w/protocol/Cargo.toml";
+    let expected = [
+        (
+            "layers.domain_dependencies.no_crossing",
+            format!(
+                "{d}: pplx-space-d (l20_domain) depends on hyper, which \
+                 [rules.layers.domain_fences] http lists, a normal dependency (optional, so a \
+                 feature turns it on), but l20_domain crates do no I/O"
+            ),
+            at(d, "hyper ="),
+        ),
+        (
+            "layers.domain_dependencies.no_crossing",
+            format!(
+                "{d}: pplx-space-d (l20_domain) depends on reqwest, which \
+                 [rules.layers.domain_fences] http lists, a build-dependency, but"
+            ),
+            at(d, "reqwest ="),
+        ),
+        (
+            "layers.domain_dependencies.no_crossing",
+            format!(
+                "{d}: pplx-space-d (l20_domain) depends on tokio, which \
+                 [rules.layers.domain_fences] runtime lists, a normal dependency, but l20_domain \
+                 crates do no I/O, and domain_fences lists the packages that do it, such as async \
+                 runtimes, HTTP clients, cloud SDKs and Kubernetes clients. Fix one of: move the \
+                 code that uses it (tokio::sync::Mutex) into the l40_api crate that does the \
+                 I/O, or into an l10_foundation mechanism that names nothing SPACE-specific, and \
+                 have pplx-space-d take plain values or define a trait for it; or, if \
+                 pplx-space-d is not Domain code, move it to its layer. See \
+                 crates/tools/archcheck/README.md#layers."
+            ),
+            at(d, "tokio ="),
+        ),
+        (
+            "layers.domain_dependencies.no_crossing",
+            format!(
+                "{legacy}: pplx-space-legacy (l20_domain) depends on kube, which \
+                 [rules.layers.domain_fences] kube lists, a normal dependency (optional"
+            ),
+            at(legacy, "kube ="),
+        ),
+        (
+            "layers.domain_dependencies.no_crossing",
+            format!(
+                "{w}: pplx-space-w-protocol (l20_domain) depends on tokio, which \
+                 [rules.layers.domain_fences] runtime lists, a normal dependency, for target \
+                 cfg(unix), but"
+            ),
+            at(w, "tokio ="),
+        ),
+        (
+            "layers.model_protocol.no_crossing",
+            format!(
+                "{d}: pplx-space-d (a model in l20_domain) depends on pplx-space-w-protocol (a \
+                 protocol: its name ends in -protocol), a normal dependency, but a model never \
+                 depends on a protocol: protocols hold wire schemas and convert between them and \
+                 the models, so the edge goes the other way. Fix one of: move what pplx-space-d \
+                 uses (pplx_space_w_protocol::v1::Thing) into a model, and have \
+                 pplx-space-w-protocol convert to it; or, if pplx-space-d holds wire code too, \
+                 split that into a protocol crate (named *-protocol), which may depend on both. \
+                 See crates/tools/archcheck/README.md#layers."
+            ),
+            at(d, "pplx-space-w-protocol ="),
+        ),
+        (
+            "layers.model_protocol.no_crossing",
+            format!(
+                "{d}: pplx-space-d (a model in l20_domain) depends on pplx-space-wire (a \
+                 protocol: [rules.layers] protocols lists it), a build-dependency, but"
+            ),
+            at(d, "pplx-space-wire ="),
+        ),
+        (
+            "layers.model_protocol.no_crossing",
+            format!(
+                "{legacy}: pplx-space-legacy (a model in l20_domain) depends on pplx-space-wire"
+            ),
+            at(legacy, "pplx-space-wire ="),
+        ),
+    ];
+    let expected: Vec<(&str, &str, &str)> = expected
+        .iter()
+        .map(|(code, message, at)| (*code, message.as_str(), at.as_str()))
+        .collect();
+    assert_layer_findings("domain", &domain_findings(&ctx), &expected);
+    // The driver is storage_access's, not domain_dependencies'.
+    assert!(
+        layer_findings(&ctx).iter().any(|(code, message, _)| {
+            code == "layers.storage_access.no_crossing" && message.contains("depends on sqlx")
+        }),
+        "{:#?}",
+        layer_findings(&ctx)
+    );
+
+    // Listed, they are tolerated.
+    let ws = domain_workspace(
+        DOMAIN_TABLES,
+        vec![(
+            "architecture-baseline.toml",
+            domain_baseline(&DOMAIN_DEPENDENCIES, &MODEL_PROTOCOL),
+        )],
+    );
+    let found = domain_findings(&load(ws.path(), None));
+    assert!(found.is_empty(), "{found:#?}");
+
+    // Without its `protocols` entry, `wire` is a model, and depending on it
+    // is no finding.
+    let ws = domain_workspace(
+        &DOMAIN_TABLES.replace("[\"pplx-space-wire\"]", "[]"),
+        vec![(
+            "architecture-baseline.toml",
+            domain_baseline(&DOMAIN_DEPENDENCIES, &[]),
+        )],
+    );
+    let found: Vec<String> = domain_findings(&load(ws.path(), None))
+        .into_iter()
+        .map(|(code, _, _)| code)
+        .collect();
+    assert_eq!(found, ["layers.model_protocol.no_crossing"], "{found:#?}");
+}
+
+/// A crate whose name ends in `-proto` is a protocol.
+#[test]
+fn layers_domain_proto_names() {
+    let extra = [
+        ("crates/l20_domain/m", "pplx-space-m"),
+        ("crates/l20_domain/x/proto", "pplx-space-x-proto"),
+    ];
+    let dependencies = [
+        ("pplx-space-m", "dependencies", "pplx-space-x-proto"),
+        ("pplx-space-x-proto", "dependencies", "pplx-space-d"),
+    ];
+    let ws = Layered {
+        extra: &extra,
+        dependencies: &dependencies,
+        ..Layered::default()
+    }
+    .build();
+    let found = domain_findings(&load(ws.path(), None));
+    assert_layer_findings(
+        "proto",
+        &found,
+        &[(
+            "layers.model_protocol.no_crossing",
+            "crates/l20_domain/m/Cargo.toml: pplx-space-m (a model in l20_domain) depends on \
+             pplx-space-x-proto (a protocol: its name ends in -proto), a normal dependency",
+            "crates/l20_domain/m/Cargo.toml:6",
+        )],
+    );
+}
+
+/// An entry that no longer applies is stale, with the reason; so is a
+/// `protocols` entry that is no Domain crate or a protocol by its name, and
+/// a `domain_fences` package that storage_access checks.
+#[test]
+fn layers_domain_stale_entries() {
+    let tables = "[rules.layers]\nlegacy = [\"pplx-space-legacy\"]\n\
+                  protocols = [\n  \"pplx-space-a\",\n  \"pplx-space-gone\",\n  \
+                  \"pplx-space-w-protocol\",\n  \"pplx-space-wire\",\n]\n\
+                  [rules.layers.unmoved]\nl20_domain = [\"pplx-space-legacy\"]\n\
+                  [rules.layers.storage]\ndrivers = [\"redis\", \"sqlx\"]\n\
+                  [rules.layers.domain_fences]\nruntime = [\"tokio\"]\n\
+                  http = [\"hyper\", \"reqwest\"]\nkube = [\"kube\"]\ndb = [\"sqlx\"]\n";
+    let dependencies = [
+        ("pplx-space-a", "tokio"),
+        ("pplx-space-d", "aws-lc-rs"),
+        ("pplx-space-d", "sqlx"),
+        ("pplx-space-gone", "tokio"),
+        ("pplx-space-m", "tokio"),
+    ];
+    let model_protocol = [
+        ("pplx-space-m", "pplx-space-d"),
+        ("pplx-space-m", "pplx-space-gone"),
+        ("pplx-space-m", "pplx-space-w-protocol"),
+        ("pplx-space-w-protocol", "pplx-space-wire"),
+    ];
+    let baseline = domain_baseline(&dependencies, &model_protocol);
+    let ws = domain_workspace(
+        tables,
+        vec![("architecture-baseline.toml", baseline.clone())],
+    );
+    let ctx = load(ws.path(), None);
+    let config = fs::read_to_string(ws.path().join("ARCHITECTURE.toml")).unwrap();
+    let entry = |from: &str, to: &str| {
+        let line = baseline
+            .lines()
+            .position(|line| {
+                line.starts_with(&format!("{from:?} = ")) && line.contains(&format!("{to:?}"))
+            })
+            .expect("the entry is in the baseline");
+        format!("architecture-baseline.toml:{}", line + 1)
+    };
+    let stale = |table: &str, from: &str, to: &str, reason: &str| {
+        (
+            format!("layers.{table}.stale_entries"),
+            format!(
+                "{from} -> {to}: is in [layers.{table}] in architecture-baseline.toml, but \
+                 {reason}. Remove the entry (cargo arch --write-baseline=layers.{table})."
+            ),
+            entry(from, to),
+        )
+    };
+    let expected = vec![
+        stale(
+            "domain_dependencies",
+            "pplx-space-a",
+            "tokio",
+            "pplx-space-a is not in l20_domain",
+        ),
+        stale(
+            "domain_dependencies",
+            "pplx-space-d",
+            "aws-lc-rs",
+            "aws-lc-rs is not fenced: no [rules.layers.domain_fences] family lists it, and it \
+             is no l10_foundation crate with a required dependency on a fenced package",
+        ),
+        stale(
+            "domain_dependencies",
+            "pplx-space-d",
+            "sqlx",
+            "sqlx is a driver or a storage helper, which layers.storage_access checks instead",
+        ),
+        stale(
+            "domain_dependencies",
+            "pplx-space-gone",
+            "tokio",
+            "no workspace member is named pplx-space-gone",
+        ),
+        stale(
+            "domain_dependencies",
+            "pplx-space-m",
+            "tokio",
+            "pplx-space-m has no normal or build dependency on tokio",
+        ),
+        stale(
+            "model_protocol",
+            "pplx-space-m",
+            "pplx-space-d",
+            "pplx-space-d is not a protocol",
+        ),
+        stale(
+            "model_protocol",
+            "pplx-space-m",
+            "pplx-space-gone",
+            "no workspace member is named pplx-space-gone",
+        ),
+        stale(
+            "model_protocol",
+            "pplx-space-m",
+            "pplx-space-w-protocol",
+            "pplx-space-m has no normal or build dependency on pplx-space-w-protocol",
+        ),
+        stale(
+            "model_protocol",
+            "pplx-space-w-protocol",
+            "pplx-space-wire",
+            "pplx-space-w-protocol is a protocol, which may depend on protocols",
+        ),
+    ];
+    let found: Vec<_> = domain_findings(&ctx)
+        .into_iter()
+        .filter(|(code, _, _)| code.ends_with(".stale_entries"))
+        .collect();
+    let expected: Vec<(&str, &str, &str)> = expected
+        .iter()
+        .map(|(code, message, at)| (code.as_str(), message.as_str(), at.as_str()))
+        .collect();
+    assert_layer_findings("stale", &found, &expected);
+
+    let config_at = |needle: &str| format!("ARCHITECTURE.toml:{}", line_with(&config, needle));
+    let protocol = |package: &str, reason: &str| {
+        (
+            format!(
+                "{package}: is in [rules.layers] protocols in ARCHITECTURE.toml, but {reason}. \
+                 Remove it."
+            ),
+            config_at(&format!("  \"{package}\",")),
+        )
+    };
+    let expected = [
+        protocol(
+            "pplx-space-a",
+            "a protocol is an l20_domain crate, and its layer is l40_api",
+        ),
+        protocol("pplx-space-gone", "no workspace member has this name"),
+        protocol(
+            "pplx-space-w-protocol",
+            "its name ends in -protocol, which makes it a protocol",
+        ),
+        (
+            "sqlx: is in [rules.layers.domain_fences] in ARCHITECTURE.toml, but it is a driver \
+             or a storage helper, whose dependents in l20_domain layers.storage_access reports. \
+             Remove it."
+                .to_owned(),
+            config_at("db = "),
+        ),
+    ];
+    let found: Vec<(String, String)> = layer_findings(&ctx)
+        .into_iter()
+        .filter(|(code, _, _)| code == "layers.stale_entries")
+        .map(|(_, message, at)| (message, at))
+        .collect();
+    assert_eq!(found, expected);
+}
+
+/// An l10_foundation crate with a required dependency on a fenced package,
+/// legacy or not, is fenced under its family, to a fixpoint, and the
+/// finding names the dependency; one with an optional dependency only is
+/// not, but can be listed. A listed crate that its dependencies fence is a
+/// stale entry; a `protocols` entry for a crate without a layer is not,
+/// since placement reports the crate.
+#[test]
+fn layers_domain_fences_derive_foundation_crates() {
+    let extra = [
+        ("crates/l10_foundation/o", "pplx-space-o"),
+        ("crates/libs/old", "pplx-space-old"),
+        ("crates/libs/stray", "pplx-space-stray"),
+    ];
+    let tables = "[rules.layers]\nlegacy = [\"pplx-space-old\"]\n\
+                  protocols = [\"pplx-space-stray\"]\n\
+                  [rules.layers.unmoved]\nl10_foundation = [\"pplx-space-old\"]\n\
+                  [rules.layers.storage]\ndrivers = [\"sqlx\"]\n\
+                  [rules.layers.domain_fences]\nruntime = [\"tokio\"]\n\
+                  http = [\"hyper\", \"pplx-space-g\", \"pplx-space-o\", \"reqwest\"]\n";
+    let manifest = |name: &str, body: &str| format!("{}{body}", package(name));
+    let ws = Layered {
+        extra: &extra,
+        tables,
+        files: vec![
+            (
+                "crates/l10_foundation/f/Cargo.toml",
+                manifest(
+                    "pplx-space-f",
+                    "[dependencies]\ntokio = \"1\"\nhyper = \"1\"\n",
+                ),
+            ),
+            (
+                "crates/l10_foundation/g/Cargo.toml",
+                manifest(
+                    "pplx-space-g",
+                    "[dependencies]\nreqwest = { version = \"1\", optional = true }\n\
+                     pplx-space-f = { path = \"../f\" }\n",
+                ),
+            ),
+            (
+                "crates/l10_foundation/o/Cargo.toml",
+                manifest(
+                    "pplx-space-o",
+                    "[dependencies]\ntokio = { version = \"1\", optional = true }\n",
+                ),
+            ),
+            (
+                "crates/libs/old/Cargo.toml",
+                manifest("pplx-space-old", "[dependencies]\ntokio = \"1\"\n"),
+            ),
+            (
+                "crates/l20_domain/d/Cargo.toml",
+                manifest(
+                    "pplx-space-d",
+                    "[dependencies]\npplx-space-f = { path = \"../../l10_foundation/f\" }\n\
+                     pplx-space-g = { path = \"../../l10_foundation/g\" }\n\
+                     pplx-space-o = { path = \"../../l10_foundation/o\" }\n\
+                     pplx-space-old = { path = \"../../libs/old\" }\n",
+                ),
+            ),
+            (
+                "crates/l20_domain/d/src/lib.rs",
+                "use pplx_space_g::Pool;\n".to_owned(),
+            ),
+        ],
+        ..Layered::default()
+    }
+    .build();
+    let ctx = load(ws.path(), None);
+    let d = "crates/l20_domain/d/Cargo.toml";
+    let text = fs::read_to_string(ws.path().join(d)).unwrap();
+    let at = |needle: &str| format!("{d}:{}", line_with(&text, needle));
+    let fenced = |to: &str, why: &str| {
+        (
+            "layers.domain_dependencies.no_crossing",
+            format!(
+                "{d}: pplx-space-d (l20_domain) depends on {to}, {why}, a normal dependency, but"
+            ),
+            at(&format!("{to} =")),
+        )
+    };
+    let expected = [
+        fenced(
+            "pplx-space-f",
+            "an l10_foundation crate whose required dependency on tokio fences it under \
+             [rules.layers.domain_fences] runtime",
+        ),
+        fenced(
+            "pplx-space-g",
+            "an l10_foundation crate whose required dependency on pplx-space-f fences it under \
+             [rules.layers.domain_fences] runtime",
+        ),
+        fenced(
+            "pplx-space-o",
+            "which [rules.layers.domain_fences] http lists",
+        ),
+        fenced(
+            "pplx-space-old",
+            "an l10_foundation crate whose required dependency on tokio fences it under \
+             [rules.layers.domain_fences] runtime",
+        ),
+    ];
+    let expected: Vec<(&str, &str, &str)> = expected
+        .iter()
+        .map(|(code, message, at)| (*code, message.as_str(), at.as_str()))
+        .collect();
+    let found = domain_findings(&ctx);
+    assert_layer_findings("derived", &found, &expected);
+    assert!(found[1].1.contains("(pplx_space_g::Pool)"), "{found:#?}");
+
+    let config = fs::read_to_string(ws.path().join("ARCHITECTURE.toml")).unwrap();
+    let stale: Vec<(String, String)> = layer_findings(&ctx)
+        .into_iter()
+        .filter(|(code, _, _)| code == "layers.stale_entries")
+        .map(|(_, message, at)| (message, at))
+        .collect();
+    assert_eq!(
+        stale,
+        [(
+            "pplx-space-g: is in [rules.layers.domain_fences] in ARCHITECTURE.toml, but its \
+             required dependency on pplx-space-f fences it already, under runtime. Remove it."
+                .to_owned(),
+            format!("ARCHITECTURE.toml:{}", line_with(&config, "http = ")),
+        )]
+    );
+    assert!(
+        layer_findings(&ctx).iter().any(|(code, message, _)| {
+            code == "layers.placement" && message.contains("pplx-space-stray")
+        }),
+        "{:#?}",
+        layer_findings(&ctx)
+    );
+}
+
+/// The Domain tables compare with the base branch's: a base whose layers
+/// rule lacks the check is seeded, with advisory findings, and one with the
+/// check but without the table tolerates nothing. `--write-baseline` keeps
+/// the entries still in violation and lists the others.
+#[test]
+fn layers_domain_base_comparison_and_write_baseline() {
+    let listed = [("pplx-space-d", "tokio"), ("pplx-space-m", "tokio")];
+    let ws = domain_workspace(
+        DOMAIN_TABLES,
+        vec![(
+            "architecture-baseline.toml",
+            domain_baseline(&listed, &MODEL_PROTOCOL[..1]),
+        )],
+    );
+    let config = fs::read_to_string(ws.path().join("ARCHITECTURE.toml")).unwrap();
+    let mut without_domain = String::new();
+    let mut skipping = false;
+    for line in config.lines() {
+        if line.starts_with('[') {
+            skipping = line.starts_with("[rules.layers.domain_dependencies")
+                || line.starts_with("[rules.layers.model_protocol");
+        }
+        if !skipping {
+            without_domain.push_str(line);
+            without_domain.push('\n');
+        }
+    }
+    let base = layers_baseline(&[], &[]);
+    let new_entries = |architecture: &str| {
+        let ctx = load_with(ws.path(), Some(&base), Some(architecture));
+        check(&ctx)
+            .into_iter()
+            .filter(|finding| finding.behaviour == "no_new_entries")
+            .map(|finding| (finding.message(), finding.mode.is_required()))
+            .collect::<Vec<_>>()
+    };
+
+    let seeded = new_entries(&without_domain);
+    assert_eq!(seeded.len(), 3, "{seeded:#?}");
+    assert_eq!(
+        seeded[0].0,
+        "pplx-space-d -> tokio: is in [layers.domain_dependencies] in \
+         architecture-baseline.toml, and the base branch's layers rule has no \
+         domain_dependencies check yet, so this pull request seeds the table. Review each entry."
+    );
+    assert!(
+        seeded[2].0.starts_with(
+            "pplx-space-d -> pplx-space-w-protocol: is in [layers.model_protocol] in \
+             architecture-baseline.toml, and the base branch's layers rule has no model_protocol \
+             check yet"
+        ),
+        "{seeded:#?}"
+    );
+    assert!(seeded.iter().all(|(_, required)| !required));
+
+    let compared = new_entries(&config);
+    assert_eq!(compared.len(), 3, "{compared:#?}");
+    assert!(
+        compared[0].0.starts_with(
+            "pplx-space-d -> tokio: is in [layers.domain_dependencies] in \
+             architecture-baseline.toml but not in the base branch's copy"
+        ),
+        "{compared:#?}"
+    );
+    assert!(compared.iter().all(|(_, required)| *required));
+
+    let write = run(ws.path(), &["--write-baseline=layers.domain_dependencies"]);
+    assert_eq!(write.code, 0, "{}", write.stderr);
+    let not_added: Vec<&str> = write
+        .stdout
+        .lines()
+        .filter(|line| line.starts_with("not added: "))
+        .collect();
+    assert_eq!(
+        not_added,
+        [
+            "not added: pplx-space-d (l20_domain) -> hyper (http) in \
+             [layers.domain_dependencies]; fix the dependency (cargo arch says how): an entry \
+             added by hand fails layers.domain_dependencies.no_new_entries, and a Domain crate \
+             that needs the package for good is not Domain code and moves to its layer's \
+             directory, a move reviewed in the diff",
+            "not added: pplx-space-d (l20_domain) -> reqwest (http) in \
+             [layers.domain_dependencies]; fix the dependency (cargo arch says how): an entry \
+             added by hand fails layers.domain_dependencies.no_new_entries, and a Domain crate \
+             that needs the package for good is not Domain code and moves to its layer's \
+             directory, a move reviewed in the diff",
+            "not added: pplx-space-legacy (l20_domain) -> kube (kube) in \
+             [layers.domain_dependencies]; fix the dependency (cargo arch says how): an entry \
+             added by hand fails layers.domain_dependencies.no_new_entries, and a Domain crate \
+             that needs the package for good is not Domain code and moves to its layer's \
+             directory, a move reviewed in the diff",
+            "not added: pplx-space-w-protocol (l20_domain) -> tokio (runtime) in \
+             [layers.domain_dependencies]; fix the dependency (cargo arch says how): an entry \
+             added by hand fails layers.domain_dependencies.no_new_entries, and a Domain crate \
+             that needs the package for good is not Domain code and moves to its layer's \
+             directory, a move reviewed in the diff",
+        ],
+        "{}",
+        write.stdout
+    );
+    let text = fs::read_to_string(ws.path().join("architecture-baseline.toml")).unwrap();
+    assert_eq!(
+        generated_table(&text, "layers.domain_dependencies"),
+        "[layers.domain_dependencies]\npplx-space-d = [\n  \"tokio\",\n]\n",
+        "{text}"
+    );
+    assert_eq!(
+        generated_table(&text, "layers.model_protocol"),
+        "[layers.model_protocol]\npplx-space-d = [\n  \"pplx-space-w-protocol\",\n]\n",
+        "{text}"
+    );
+}
+
+/// `[rules.layers.state]` and `[rules.layers.unowned]`: `db/common` applied
+/// to `svc`, every check required except `pending`, which is advisory.
+const STATE: &str = "[rules.layers.state.shared_catalogs]\ncommon = [\"svc\"]\n\
+                     [rules.layers.state.declarations]\nmode = \"required\"\n\
+                     [rules.layers.state.owners]\nmode = \"required\"\n\
+                     [rules.layers.state.writes]\nmode = \"required\"\n\
+                     [rules.layers.state.pending]\nmode = \"advisory\"\n\
+                     [rules.layers.unowned.no_crossing]\nmode = \"required\"\n\
+                     [rules.layers.unowned.no_new_entries]\nmode = \"required\"\n\
+                     [rules.layers.unowned.stale_entries]\nmode = \"required\"\n";
+
+/// The catalogs of a workspace with the state checks: `postgres` leaves `a`
+/// and `b`, and `svc` `items` and, from `common`, `jobs`. Down files and
+/// `history/` are not read.
+const CATALOGS: [(&str, &str); 6] = [
+    (
+        "db/postgres/1_baseline.up.sql",
+        "CREATE TABLE public.a (id int);\nCREATE TABLE b ();\nCREATE TABLE gone ();\n",
+    ),
+    ("db/postgres/1_baseline.down.sql", "CREATE TABLE down ();\n"),
+    ("db/postgres/2_drop.up.sql", "DROP TABLE gone;\n"),
+    ("db/postgres/history/0_old.up.sql", "CREATE TABLE old ();\n"),
+    ("db/svc/1_baseline.up.sql", "\nCREATE TABLE items ();\n"),
+    ("db/common/1_baseline.up.sql", "CREATE TABLE \"jobs\" ();\n"),
+];
+
+/// The manifests of the two stores of [`LAYERED`].
+const S_STORE: &str = "crates/l30_storage/s/store/Cargo.toml";
+const T_STORE: &str = "crates/l30_storage/t/store/Cargo.toml";
+
+/// A baseline with an empty `[file_size]`, these `(namespace, table)`
+/// entries in `[layers.unowned]`, each table on its own line from line 6,
+/// the other layers tables empty, and an empty `[crate_names]`.
+fn state_baseline(unowned: &[(&str, &str)]) -> String {
+    let mut namespaces: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (namespace, table) in unowned {
+        namespaces.entry(namespace).or_default().push(table);
+    }
+    let mut text =
+        "[file_size]\n[layers.dev_direction]\n[layers.direction]\n[layers.unowned]\n".to_owned();
+    for (namespace, tables) in namespaces {
+        text.push_str(&format!("{namespace:?} = [\n"));
+        for table in tables {
+            text.push_str(&format!("  {table:?},\n"));
+        }
+        text.push_str("]\n");
+    }
+    text.push_str(
+        "[layers.codec_features]\n[layers.domain_dependencies]\n\
+         [layers.model_protocol]\n[layers.storage_access]\n[crate_names]\n",
+    );
+    text
+}
+
+/// `name`'s manifest with `state` as its `[package.metadata.space.state]`,
+/// whose first entry is on line 6.
+fn stated_manifest(name: &str, state: &str) -> String {
+    format!("{}[package.metadata.space.state]\n{state}", package(name))
+}
+
+/// A workspace of [`LAYERED`]'s members with the state checks and
+/// [`CATALOGS`]: `pplx-space-s-store` owns `postgres.a` and
+/// `pplx-space-t-store` `sqlite.svc.items`, the other two live tables are in
+/// `[layers.unowned]`, and `files` are written over that.
+fn stated(files: Vec<(&str, String)>) -> TempDir {
+    let mut all = vec![
+        ("ARCHITECTURE.toml", layers_config(STATE, "required")),
+        (
+            "architecture-baseline.toml",
+            state_baseline(&[("postgres", "b"), ("sqlite.svc", "jobs")]),
+        ),
+        (
+            S_STORE,
+            stated_manifest("pplx-space-s-store", "postgres = [\"a\"]\n"),
+        ),
+        (
+            T_STORE,
+            stated_manifest("pplx-space-t-store", "sqlite.svc = [\"items\"]\n"),
+        ),
+    ];
+    all.extend(
+        CATALOGS
+            .iter()
+            .map(|(path, text)| (*path, (*text).to_owned())),
+    );
+    all.extend(files);
+    Layered {
+        files: all,
+        ..Layered::default()
+    }
+    .build()
+}
+
+/// `(code, message, location)` of each state finding, in reporting order.
+fn state_findings(ctx: &Context) -> Vec<(String, String, String)> {
+    layer_findings(ctx)
+        .into_iter()
+        .filter(|(code, _, _)| {
+            code.starts_with("layers.state.") || code.starts_with("layers.unowned.")
+        })
+        .collect()
+}
+
+/// Name, files written over [`stated`]'s, and `(code, start of message,
+/// location)` of each state finding.
+type StateCase<'a> = (
+    &'a str,
+    Vec<(&'a str, String)>,
+    Vec<(&'a str, &'a str, &'a str)>,
+);
+
+/// Every store declares its databases and only stores declare state; each
+/// live table has one owner or a baseline entry; a declared table no
+/// migration creates yet is advisory.
+#[test]
+fn layers_state_declarations_and_owners() {
+    const API: &str = "crates/l40_api/a/server/Cargo.toml";
+    let declarations = "layers.state.declarations";
+    let cases: Vec<StateCase> = vec![
+        ("declared and baselined", vec![], vec![]),
+        (
+            "a live table neither declared nor listed",
+            vec![(
+                "architecture-baseline.toml",
+                state_baseline(&[("postgres", "b")]),
+            )],
+            vec![(
+                "layers.unowned.no_crossing",
+                "sqlite.svc.jobs: is created by db/common/1_baseline.up.sql, but no store \
+                 declares it in [package.metadata.space.state], and [layers.unowned] in \
+                 architecture-baseline.toml doesn't list it. Declare it in the l30_storage crate \
+                 that owns it, as `sqlite.svc = [\"jobs\"]` in that store's state table.",
+                "db/common/1_baseline.up.sql:1",
+            )],
+        ),
+        (
+            "a store without a state table",
+            vec![(S_STORE, package("pplx-space-s-store"))],
+            vec![
+                (
+                    declarations,
+                    "crates/l30_storage/s/store/Cargo.toml: pplx-space-s-store is a store \
+                     (l30_storage), but its Cargo.toml has no [package.metadata.space.state].",
+                    "crates/l30_storage/s/store/Cargo.toml:2",
+                ),
+                (
+                    "layers.unowned.no_crossing",
+                    "postgres.a: is created by db/postgres/1_baseline.up.sql",
+                    "db/postgres/1_baseline.up.sql:1",
+                ),
+            ],
+        ),
+        (
+            "an empty state table, for a store without a database",
+            vec![(S_STORE, stated_manifest("pplx-space-s-store", "# S3\n"))],
+            vec![(
+                "layers.unowned.no_crossing",
+                "postgres.a: is created by",
+                "db/postgres/1_baseline.up.sql:1",
+            )],
+        ),
+        (
+            "a crate outside Storage with a state table",
+            vec![(API, stated_manifest("pplx-space-a", "postgres = []\n"))],
+            vec![(
+                declarations,
+                "crates/l40_api/a/server/Cargo.toml: pplx-space-a (l40_api) has a \
+                 [package.metadata.space.state], but only l30_storage crates own tables.",
+                "crates/l40_api/a/server/Cargo.toml:5",
+            )],
+        ),
+        (
+            "namespaces that are no database",
+            vec![(
+                T_STORE,
+                stated_manifest(
+                    "pplx-space-t-store",
+                    "sqlite.svc = [\"items\"]\nsqlite.common = []\nsqlite.nope = []\n",
+                ),
+            )],
+            vec![
+                (
+                    declarations,
+                    "crates/l30_storage/t/store/Cargo.toml: pplx-space-t-store declares \
+                     `sqlite.common`, which is no database. The namespaces are postgres, \
+                     sqlite.svc:",
+                    "crates/l30_storage/t/store/Cargo.toml:7",
+                ),
+                (
+                    declarations,
+                    "crates/l30_storage/t/store/Cargo.toml: pplx-space-t-store declares \
+                     `sqlite.nope`, which is no database.",
+                    "crates/l30_storage/t/store/Cargo.toml:8",
+                ),
+            ],
+        ),
+        (
+            "two owners",
+            vec![(
+                T_STORE,
+                stated_manifest(
+                    "pplx-space-t-store",
+                    "sqlite.svc = [\"items\"]\npostgres = [\n  \"a\",\n]\n",
+                ),
+            )],
+            vec![
+                (
+                    "layers.state.owners",
+                    "crates/l30_storage/s/store/Cargo.toml: pplx-space-s-store declares \
+                     postgres.a, which pplx-space-t-store also declares, but a table has one \
+                     owner.",
+                    "crates/l30_storage/s/store/Cargo.toml:6",
+                ),
+                (
+                    "layers.state.owners",
+                    "crates/l30_storage/t/store/Cargo.toml: pplx-space-t-store declares \
+                     postgres.a, which pplx-space-s-store also declares",
+                    "crates/l30_storage/t/store/Cargo.toml:8",
+                ),
+            ],
+        ),
+        (
+            "declared names keyed as live ones: public. dropped, other schemas kept",
+            vec![
+                (
+                    "db/postgres/3_audit.up.sql",
+                    "CREATE TABLE audit.events ();\n".to_owned(),
+                ),
+                (
+                    S_STORE,
+                    stated_manifest(
+                        "pplx-space-s-store",
+                        "postgres = [\"public.a\", \"audit.events\"]\n",
+                    ),
+                ),
+            ],
+            vec![],
+        ),
+        (
+            "declared names as each database stores them: Postgres keeps case, and its \
+             default schema is public, not main",
+            vec![
+                (
+                    S_STORE,
+                    stated_manifest("pplx-space-s-store", "postgres = [\"A\", \"main.b\"]\n"),
+                ),
+                (
+                    T_STORE,
+                    stated_manifest("pplx-space-t-store", "sqlite.svc = [\"Main.ITEMS\"]\n"),
+                ),
+            ],
+            vec![
+                (
+                    "layers.state.pending",
+                    "postgres.A: pplx-space-s-store declares it",
+                    "crates/l30_storage/s/store/Cargo.toml:6",
+                ),
+                (
+                    "layers.state.pending",
+                    "postgres.main.b: pplx-space-s-store declares it",
+                    "crates/l30_storage/s/store/Cargo.toml:6",
+                ),
+                (
+                    "layers.unowned.no_crossing",
+                    "postgres.a: is created by db/postgres/1_baseline.up.sql",
+                    "db/postgres/1_baseline.up.sql:1",
+                ),
+            ],
+        ),
+        (
+            "a declared table no migration creates yet",
+            vec![(
+                S_STORE,
+                stated_manifest(
+                    "pplx-space-s-store",
+                    "postgres = [\"a\", \"later\"]\nsqlite.nope = [\"x\"]\n",
+                ),
+            )],
+            vec![
+                (
+                    declarations,
+                    "crates/l30_storage/s/store/Cargo.toml: pplx-space-s-store declares \
+                     `sqlite.nope`",
+                    "crates/l30_storage/s/store/Cargo.toml:7",
+                ),
+                (
+                    "layers.state.pending",
+                    "postgres.later: pplx-space-s-store declares it in \
+                     [package.metadata.space.state], but no migration in db/postgres creates it \
+                     yet. A new table lands that way: the declaration first, then the migration \
+                     in a pull request of its own.",
+                    "crates/l30_storage/s/store/Cargo.toml:6",
+                ),
+            ],
+        ),
+    ];
+    for (name, files, expected) in cases {
+        let ws = stated(files);
+        let ctx = load(ws.path(), None);
+        let found = state_findings(&ctx);
+        assert_layer_findings(name, &found, &expected);
+        let pending = check(&ctx)
+            .into_iter()
+            .filter(|finding| finding.behaviour == "pending")
+            .all(|finding| !finding.mode.is_required());
+        assert!(pending, "{name}: pending is advisory");
+    }
+}
+
+/// `[rules.layers.state.co_writers]` with `grants`, as TOML, after
+/// [`STATE`].
+fn granted(grants: &str) -> (&'static str, String) {
+    (
+        "ARCHITECTURE.toml",
+        layers_config(&format!("{STATE}{grants}"), "required"),
+    )
+}
+
+/// Among the stores, only a table's owner and its co-writers have a write
+/// head naming it, in a Rust string literal or a `.sql` file under `src/`:
+/// a store is checked against every database, so one that doesn't declare
+/// a table's database is too. Test files and crates outside Storage are not
+/// read.
+#[test]
+fn layers_state_writes() {
+    const LIB: &str = "crates/l30_storage/t/store/src/lib.rs";
+    let writes = "fn f() {\n    q(\"UPDATE a SET x = 1\");\n    q(r#\"\n        delete from \
+                  b\"#);\n    q(\"UPDATE items SET y = 2\");\n}\n";
+    let t_store = |state: &str| (T_STORE, stated_manifest("pplx-space-t-store", state));
+    let in_both = "sqlite.svc = [\"items\"]\npostgres = []\n";
+    let finding = "crates/l30_storage/t/store/src/lib.rs: pplx-space-t-store writes postgres.a \
+                   here (UPDATE a), but pplx-space-s-store owns that table, and \
+                   pplx-space-t-store is neither its owner nor a co-writer. Move the statement \
+                   into pplx-space-s-store and call it from there; or, for an approved \
+                   co-writer, add \"pplx-space-t-store\" to a in \
+                   [rules.layers.state.co_writers.postgres] in ARCHITECTURE.toml, a policy \
+                   change that layers.policy_changed reports for review.";
+    let undeclared = "crates/l30_storage/t/store/src/lib.rs: pplx-space-t-store writes \
+                      postgres.a here (UPDATE a), a table pplx-space-s-store owns in a database \
+                      pplx-space-t-store doesn't declare, and pplx-space-t-store is not its \
+                      co-writer. Move the statement into pplx-space-s-store";
+    let cases: Vec<StateCase> = vec![
+        (
+            "a write to another store's table",
+            vec![
+                t_store(in_both),
+                (LIB, writes.to_owned()),
+                (
+                    "crates/l30_storage/t/store/src/claim.sql",
+                    "-- UPDATE a\nINSERT INTO public.a VALUES (1);\n".to_owned(),
+                ),
+                (
+                    "crates/l30_storage/t/store/src/tests.rs",
+                    "q(\"UPDATE a\");\n".to_owned(),
+                ),
+                (
+                    "crates/l30_storage/t/store/src/tests/x.sql",
+                    "UPDATE a;\n".to_owned(),
+                ),
+            ],
+            vec![
+                (
+                    "layers.state.writes",
+                    finding,
+                    "crates/l30_storage/t/store/src/lib.rs:2",
+                ),
+                (
+                    "layers.state.writes",
+                    "crates/l30_storage/t/store/src/claim.sql: pplx-space-t-store writes \
+                     postgres.a here (INSERT INTO a)",
+                    "crates/l30_storage/t/store/src/claim.sql:2",
+                ),
+            ],
+        ),
+        (
+            "a co-writer",
+            vec![
+                granted("[rules.layers.state.co_writers.postgres]\na = [\"pplx-space-t-store\"]\n"),
+                t_store(in_both),
+                (LIB, writes.to_owned()),
+            ],
+            vec![],
+        ),
+        (
+            "a store that does not declare the database",
+            vec![
+                t_store("sqlite.svc = [\"items\"]\n"),
+                (LIB, writes.to_owned()),
+            ],
+            vec![(
+                "layers.state.writes",
+                undeclared,
+                "crates/l30_storage/t/store/src/lib.rs:2",
+            )],
+        ),
+        (
+            "a store without a database",
+            vec![
+                (
+                    S_STORE,
+                    stated_manifest(
+                        "pplx-space-s-store",
+                        "postgres = [\"a\"]\nsqlite.svc = [\"items\"]\n",
+                    ),
+                ),
+                t_store("# S3\n"),
+                (LIB, writes.to_owned()),
+            ],
+            vec![
+                (
+                    "layers.state.writes",
+                    undeclared,
+                    "crates/l30_storage/t/store/src/lib.rs:2",
+                ),
+                (
+                    "layers.state.writes",
+                    "crates/l30_storage/t/store/src/lib.rs: pplx-space-t-store writes \
+                     sqlite.svc.items here (UPDATE items), a table pplx-space-s-store owns in a \
+                     database pplx-space-t-store doesn't declare",
+                    "crates/l30_storage/t/store/src/lib.rs:5",
+                ),
+            ],
+        ),
+        (
+            "a granted store that does not declare the database",
+            vec![
+                granted("[rules.layers.state.co_writers.postgres]\na = [\"pplx-space-t-store\"]\n"),
+                t_store("sqlite.svc = [\"items\"]\n"),
+                (LIB, writes.to_owned()),
+            ],
+            vec![],
+        ),
+        (
+            "a crate outside Storage",
+            vec![("crates/l40_api/a/server/src/lib.rs", writes.to_owned())],
+            vec![],
+        ),
+        (
+            "a name in two of the store's databases, one of them its own",
+            vec![
+                (
+                    "db/postgres/3_items.up.sql",
+                    "CREATE TABLE items ();\n".to_owned(),
+                ),
+                (
+                    S_STORE,
+                    stated_manifest("pplx-space-s-store", "postgres = [\"a\", \"items\"]\n"),
+                ),
+                t_store(in_both),
+                (LIB, "q(\"UPDATE items SET y = 2\");\n".to_owned()),
+            ],
+            vec![],
+        ),
+        (
+            "a name in two of the store's databases, owned in one and unowned in the other",
+            vec![
+                (
+                    "db/postgres/3_jobs.up.sql",
+                    "CREATE TABLE jobs ();\n".to_owned(),
+                ),
+                (
+                    "architecture-baseline.toml",
+                    state_baseline(&[("postgres", "b"), ("postgres", "jobs")]),
+                ),
+                t_store("sqlite.svc = [\"items\", \"jobs\"]\n"),
+                (
+                    S_STORE,
+                    stated_manifest(
+                        "pplx-space-s-store",
+                        "postgres = [\"a\"]\nsqlite.svc = []\n",
+                    ),
+                ),
+                (
+                    "crates/l30_storage/s/store/src/lib.rs",
+                    "q(\"DELETE FROM jobs\");\nq(\"DELETE FROM items\");\n".to_owned(),
+                ),
+            ],
+            vec![(
+                "layers.state.writes",
+                "crates/l30_storage/s/store/src/lib.rs: pplx-space-s-store writes \
+                 sqlite.svc.items here (DELETE FROM items), but pplx-space-t-store owns that \
+                 table",
+                "crates/l30_storage/s/store/src/lib.rs:2",
+            )],
+        ),
+        (
+            "names keyed as each database reads them",
+            vec![
+                t_store(in_both),
+                (
+                    S_STORE,
+                    stated_manifest(
+                        "pplx-space-s-store",
+                        "postgres = [\"a\"]\nsqlite.svc = []\n",
+                    ),
+                ),
+                (
+                    "crates/l30_storage/s/store/src/lib.rs",
+                    "q(\"UPDATE \\\"ITEMS\\\" SET y = 2\");\n".to_owned(),
+                ),
+                (
+                    LIB,
+                    r#"q("UPDATE \"A\" SET x = 1");
+q("UPDATE A SET x = 1");
+q("UPDATE space.public.a SET x = 1");
+q("UPDATE main.a SET x = 1");
+"#
+                    .to_owned(),
+                ),
+            ],
+            vec![
+                (
+                    "layers.state.writes",
+                    "crates/l30_storage/s/store/src/lib.rs: pplx-space-s-store writes \
+                     sqlite.svc.items here (UPDATE items), but pplx-space-t-store owns that \
+                     table",
+                    "crates/l30_storage/s/store/src/lib.rs:1",
+                ),
+                (
+                    "layers.state.writes",
+                    finding,
+                    "crates/l30_storage/t/store/src/lib.rs:2",
+                ),
+                (
+                    "layers.state.writes",
+                    finding,
+                    "crates/l30_storage/t/store/src/lib.rs:3",
+                ),
+            ],
+        ),
+        (
+            "a quoted name with a dot, declared and written",
+            vec![
+                (
+                    "db/postgres/3_audit.up.sql",
+                    "CREATE TABLE audit.\"events.v1\" ();\n".to_owned(),
+                ),
+                (
+                    S_STORE,
+                    stated_manifest(
+                        "pplx-space-s-store",
+                        "postgres = [\"a\", 'audit.\"events.v1\"']\n",
+                    ),
+                ),
+                t_store(in_both),
+                (
+                    LIB,
+                    "q(\"INSERT INTO audit.\\\"events.v1\\\" VALUES (1)\");\n".to_owned(),
+                ),
+            ],
+            vec![(
+                "layers.state.writes",
+                "crates/l30_storage/t/store/src/lib.rs: pplx-space-t-store writes \
+                 postgres.audit.events.v1 here (INSERT INTO audit.events.v1), but \
+                 pplx-space-s-store owns that table",
+                "crates/l30_storage/t/store/src/lib.rs:1",
+            )],
+        ),
+        (
+            "a quoted name with a dot, granted",
+            vec![
+                granted(
+                    "[rules.layers.state.co_writers.postgres]\n\
+                     'audit.\"events.v1\"' = [\"pplx-space-t-store\"]\n",
+                ),
+                (
+                    "db/postgres/3_audit.up.sql",
+                    "CREATE TABLE audit.\"events.v1\" ();\n".to_owned(),
+                ),
+                (
+                    S_STORE,
+                    stated_manifest(
+                        "pplx-space-s-store",
+                        "postgres = [\"a\", 'audit.\"events.v1\"']\n",
+                    ),
+                ),
+                t_store(in_both),
+                (
+                    LIB,
+                    "q(\"INSERT INTO audit.\\\"events.v1\\\" VALUES (1)\");\n".to_owned(),
+                ),
+            ],
+            vec![],
+        ),
+        (
+            "schema-qualified writes, and strings that are values",
+            vec![
+                (
+                    "db/postgres/3_audit.up.sql",
+                    "CREATE TABLE audit.events ();\n".to_owned(),
+                ),
+                (
+                    S_STORE,
+                    stated_manifest(
+                        "pplx-space-s-store",
+                        "postgres = [\"a\", \"audit.events\"]\n",
+                    ),
+                ),
+                t_store(in_both),
+                (
+                    LIB,
+                    "q(\"INSERT INTO audit.events VALUES (1)\");\n\
+                     q(\"INSERT INTO items (note) VALUES ('UPDATE a SET x = 1')\");\n\
+                     q(\"UPDATE events SET x = 1\");\n"
+                        .to_owned(),
+                ),
+            ],
+            vec![(
+                "layers.state.writes",
+                "crates/l30_storage/t/store/src/lib.rs: pplx-space-t-store writes \
+                 postgres.audit.events here (INSERT INTO audit.events), but \
+                 pplx-space-s-store owns that table",
+                "crates/l30_storage/t/store/src/lib.rs:1",
+            )],
+        ),
+    ];
+    for (name, files, expected) in cases {
+        let ws = stated(files);
+        let found = state_findings(&load(ws.path(), None));
+        assert_layer_findings(name, &found, &expected);
+    }
+}
+
+/// A storage helper's SQL is scanned too: it may write a declared table only
+/// where a shared catalog creates it, acting for the store that declares it,
+/// and an undeclared table freely. A Foundation crate `helpers` doesn't list
+/// is not scanned.
+#[test]
+fn layers_state_helper_writes() {
+    const LIB: &str = "crates/l10_foundation/f/src/lib.rs";
+    let architecture = (
+        "ARCHITECTURE.toml",
+        layers_config(
+            &format!(
+                "{STATE}[rules.layers.storage]\ndrivers = [\"sqlx\"]\n\
+                 helpers = [\"pplx-space-f\"]\n"
+            ),
+            "required",
+        ),
+    );
+    let writes = "q(\"UPDATE a SET x = 1\");\nq(\"DELETE FROM jobs\");\nq(\"UPDATE b SET y = 2\");\n\
+                  q(\"INSERT INTO items VALUES (1)\");\n";
+    let owns_jobs = (
+        T_STORE,
+        stated_manifest("pplx-space-t-store", "sqlite.svc = [\"items\", \"jobs\"]\n"),
+    );
+    let baseline = (
+        "architecture-baseline.toml",
+        state_baseline(&[("postgres", "b")]),
+    );
+    let finding = |table: &str, head: &str, owner: &str| {
+        format!(
+            "{LIB}: pplx-space-f writes {table} here ({head}), but {owner} owns that table, and \
+             pplx-space-f is a storage helper, which may write a declared table only where a \
+             shared catalog ([rules.layers.state] shared_catalogs in ARCHITECTURE.toml) creates \
+             it, acting there for the store that declares it. Move the statement into {owner} \
+             and call it from there. See crates/tools/archcheck/README.md#layers."
+        )
+    };
+    let a = finding("postgres.a", "UPDATE a", "pplx-space-s-store");
+    let items = finding(
+        "sqlite.svc.items",
+        "INSERT INTO items",
+        "pplx-space-t-store",
+    );
+    let jobs = finding("postgres.jobs", "DELETE FROM jobs", "pplx-space-s-store");
+    let cases: Vec<StateCase> = vec![
+        (
+            "a helper's writes",
+            vec![
+                architecture.clone(),
+                owns_jobs.clone(),
+                baseline.clone(),
+                (LIB, writes.to_owned()),
+            ],
+            vec![
+                (
+                    "layers.state.writes",
+                    &a,
+                    "crates/l10_foundation/f/src/lib.rs:1",
+                ),
+                (
+                    "layers.state.writes",
+                    &items,
+                    "crates/l10_foundation/f/src/lib.rs:4",
+                ),
+            ],
+        ),
+        (
+            "a Foundation crate helpers doesn't list",
+            vec![
+                architecture.clone(),
+                owns_jobs.clone(),
+                baseline.clone(),
+                ("crates/l10_foundation/g/src/lib.rs", writes.to_owned()),
+            ],
+            vec![],
+        ),
+        // Only the shared catalog's table is the helper's to write: a
+        // `jobs` a database creates itself is its store's.
+        (
+            "a table of the same name that no shared catalog creates",
+            vec![
+                architecture.clone(),
+                (
+                    "db/postgres/3_jobs.up.sql",
+                    "CREATE TABLE jobs ();\n".to_owned(),
+                ),
+                (
+                    S_STORE,
+                    stated_manifest("pplx-space-s-store", "postgres = [\"a\", \"jobs\"]\n"),
+                ),
+                (LIB, "q(\"DELETE FROM jobs\");\n".to_owned()),
+            ],
+            vec![(
+                "layers.state.writes",
+                &jobs,
+                "crates/l10_foundation/f/src/lib.rs:1",
+            )],
+        ),
+    ];
+    for (name, files, expected) in cases {
+        let ws = stated(files);
+        let found = state_findings(&load(ws.path(), None));
+        assert_layer_findings(name, &found, &expected);
+    }
+}
+
+/// A `[rules.layers.state.co_writers]` grant that allows nothing is a
+/// `layers.stale_entries` finding on its line.
+#[test]
+fn layers_state_co_writer_grants() {
+    let grants = "[rules.layers.state.co_writers.postgres]\n\
+                  a = [\"pplx-space-t-store\", \"pplx-space-a\", \"pplx-space-nope\"]\n\
+                  \"public.b\" = [\"pplx-space-t-store\"]\n\
+                  [rules.layers.state.co_writers.sqlite.svc]\nitems = [\"pplx-space-t-store\"]\n\
+                  [rules.layers.state.co_writers.sqlite.nope]\nx = [\"pplx-space-t-store\"]\n";
+    let ws = stated(vec![granted(grants)]);
+    let architecture = fs::read_to_string(ws.path().join("ARCHITECTURE.toml")).unwrap();
+    let at = |needle: &str| format!("ARCHITECTURE.toml:{}", line_with(&architecture, needle));
+    let found: Vec<(String, String, String)> = layer_findings(&load(ws.path(), None))
+        .into_iter()
+        .filter(|(code, _, _)| code == "layers.stale_entries" || code.starts_with("layers.state."))
+        .collect();
+    let a = at("a = [\"pplx-space-t-store\"");
+    let expected = [
+        (
+            "postgres.a: lists pplx-space-a in [rules.layers.state.co_writers.postgres] in \
+             ARCHITECTURE.toml, but it is not a store: its layer is l40_api, not l30_storage, so \
+             the grant allows nothing. Remove it from the list.",
+            a.clone(),
+        ),
+        (
+            "postgres.a: lists pplx-space-nope in [rules.layers.state.co_writers.postgres] in \
+             ARCHITECTURE.toml, but no workspace member has this name",
+            a.clone(),
+        ),
+        (
+            "postgres.a: lists pplx-space-t-store in [rules.layers.state.co_writers.postgres] in \
+             ARCHITECTURE.toml, but no write statement in its production code names a, so it \
+             needs no grant",
+            a,
+        ),
+        (
+            "postgres.b: lists pplx-space-t-store in [rules.layers.state.co_writers.postgres] in \
+             ARCHITECTURE.toml, but no store owns postgres.b",
+            at("\"public.b\""),
+        ),
+        (
+            "sqlite.nope.x: lists pplx-space-t-store in \
+             [rules.layers.state.co_writers.sqlite.nope] in ARCHITECTURE.toml, but sqlite.nope \
+             is no database; the namespaces are postgres, sqlite.svc",
+            at("x = [\"pplx-space-t-store\"]"),
+        ),
+        (
+            "sqlite.svc.items: lists pplx-space-t-store in \
+             [rules.layers.state.co_writers.sqlite.svc] in ARCHITECTURE.toml, but \
+             pplx-space-t-store owns that table",
+            at("items = [\"pplx-space-t-store\"]"),
+        ),
+    ];
+    let expected: Vec<(&str, &str, &str)> = expected
+        .iter()
+        .map(|(message, at)| ("layers.stale_entries", *message, at.as_str()))
+        .collect();
+    assert_layer_findings("stale grants", &found, &expected);
+}
+
+/// `[layers.unowned]`'s entries are compared with the base branch's copy,
+/// which seeds the table while the base has no state checks, and are stale
+/// once their table is declared, dropped or in no database.
+#[test]
+fn layers_unowned_baseline() {
+    const ENTRIES: [(&str, &str); 2] = [("postgres", "b"), ("sqlite.svc", "jobs")];
+    let with_state = layers_config(STATE, "required");
+    let without_state = layers_config("", "required");
+    let listed = state_baseline(&ENTRIES);
+    let empty = state_baseline(&[]);
+    let edges_only = layers_baseline(&[], &[]);
+    let new = "postgres.b: is in [layers.unowned] in architecture-baseline.toml but not in the \
+               base branch's copy, and a table can't be added to it.";
+    let seeds = "postgres.b: is in [layers.unowned] in architecture-baseline.toml, and the base \
+                 branch has no state checks yet, so this pull request seeds the table.";
+    let at_b = "architecture-baseline.toml:6";
+    let at_jobs = "architecture-baseline.toml:9";
+    /// Name, base baseline, base architecture, and `(code, start of
+    /// message, location, required)` of each finding.
+    type Case<'a> = (
+        &'a str,
+        Option<&'a str>,
+        Option<&'a str>,
+        Vec<(&'a str, &'a str, &'a str, bool)>,
+    );
+    let jobs_new = "sqlite.svc.jobs: is in [layers.unowned]";
+    let cases: Vec<Case> = vec![
+        ("no base", None, None, vec![]),
+        (
+            "the base lists them",
+            Some(&listed),
+            Some(&with_state),
+            vec![],
+        ),
+        (
+            "the base's table lacks them",
+            Some(&empty),
+            None,
+            vec![
+                ("layers.unowned.no_new_entries", new, at_b, true),
+                ("layers.unowned.no_new_entries", jobs_new, at_jobs, true),
+            ],
+        ),
+        (
+            "a base with the state checks but without the table",
+            Some(&edges_only),
+            Some(&with_state),
+            vec![
+                ("layers.unowned.no_new_entries", new, at_b, true),
+                ("layers.unowned.no_new_entries", jobs_new, at_jobs, true),
+            ],
+        ),
+        (
+            "a base without the state checks seeds the table",
+            Some(&edges_only),
+            Some(&without_state),
+            vec![
+                ("layers.unowned.no_new_entries", seeds, at_b, false),
+                ("layers.unowned.no_new_entries", jobs_new, at_jobs, false),
+            ],
+        ),
+        (
+            "a base baseline without the table, and no base architecture",
+            Some(&edges_only),
+            None,
+            vec![
+                ("layers.unowned.no_new_entries", seeds, at_b, false),
+                ("layers.unowned.no_new_entries", jobs_new, at_jobs, false),
+            ],
+        ),
+        (
+            "a base without any layers table",
+            Some("[file_size]\n"),
+            None,
+            vec![
+                ("layers.unowned.no_new_entries", seeds, at_b, false),
+                ("layers.unowned.no_new_entries", jobs_new, at_jobs, false),
+            ],
+        ),
+    ];
+    for (name, base, architecture, expected) in cases {
+        let ws = stated(vec![]);
+        let ctx = load_with(ws.path(), base, architecture);
+        let found: Vec<_> = check(&ctx)
+            .into_iter()
+            .filter(|finding| finding.instance.as_deref() == Some("unowned"))
+            .collect();
+        assert_eq!(found.len(), expected.len(), "{name}: {found:#?}");
+        for (finding, (code, message, at, required)) in found.iter().zip(&expected) {
+            assert_eq!(finding.code(), *code, "{name}");
+            assert!(
+                finding.message().starts_with(message),
+                "{name}: {}",
+                finding.message()
+            );
+            let location = format!("{}:{}", finding.location.path, finding.location.line);
+            assert_eq!(location, *at, "{name}");
+            assert_eq!(finding.mode.is_required(), *required, "{name}");
+        }
+        let skips = skipped(&ctx);
+        assert_eq!(
+            skips
+                .iter()
+                .any(|line| line.contains("layers.unowned.no_new_entries")),
+            base.is_none(),
+            "{name}: {skips:?}"
+        );
+    }
+
+    let stale = |table: &str, reason: &str| {
+        format!(
+            "{table}: is in [layers.unowned] in architecture-baseline.toml, but {reason}. Remove \
+             the entry (cargo arch --write-baseline=layers.unowned)."
+        )
+    };
+    let ws = stated(vec![(
+        "architecture-baseline.toml",
+        state_baseline(&[
+            ("postgres", "a"),
+            ("postgres", "b"),
+            ("postgres", "gone"),
+            ("sqlite.nope", "x"),
+            ("sqlite.svc", "jobs"),
+        ]),
+    )]);
+    let found = state_findings(&load(ws.path(), None));
+    let expected = [
+        stale("postgres.a", "pplx-space-s-store declares it now"),
+        stale(
+            "postgres.gone",
+            "no migration in db/postgres leaves a table gone",
+        ),
+        stale(
+            "sqlite.nope.x",
+            "sqlite.nope is no database; the namespaces are postgres, sqlite.svc",
+        ),
+    ];
+    let lines = ["6", "8", "11"].map(|line| format!("architecture-baseline.toml:{line}"));
+    let expected: Vec<(&str, &str, &str)> = expected
+        .iter()
+        .zip(&lines)
+        .map(|(message, at)| {
+            (
+                "layers.unowned.stale_entries",
+                message.as_str(),
+                at.as_str(),
+            )
+        })
+        .collect();
+    assert_layer_findings("stale entries", &found, &expected);
+}
+
+/// `--write-baseline=layers.unowned` keeps each entry whose table is still
+/// live without an owner, removes the others, and lists each such table
+/// without an entry as `not added`.
+#[test]
+fn layers_unowned_write_baseline() {
+    let ws = stated(vec![(
+        "architecture-baseline.toml",
+        state_baseline(&[("postgres", "b"), ("postgres", "gone")]),
+    )]);
+    let written = run(ws.path(), &["--write-baseline=layers.unowned"]);
+    assert_eq!(written.code, 0, "{}", written.stderr);
+    assert!(
+        written.stdout.contains(
+            "not added: sqlite.svc.jobs (created by db/common/1_baseline.up.sql) in \
+             [layers.unowned], which only shrinks (layers.unowned.no_new_entries); declare it in \
+             the store that owns it, before its migration lands (layers.state.pending), as cargo \
+             arch says"
+        ),
+        "{}",
+        written.stdout
+    );
+    let text = fs::read_to_string(ws.path().join("architecture-baseline.toml")).unwrap();
+    assert_eq!(
+        generated_table(&text, "layers.unowned"),
+        "[layers.unowned]\npostgres = [\n  \"b\",\n]\n"
+    );
+    assert!(text.contains("[layers.direction]"), "{text}");
+    // The generated form is written back byte-identical.
+    let again = run(ws.path(), &["--write-baseline"]);
+    assert_eq!(again.code, 0, "{}", again.stderr);
+    let rewritten = fs::read_to_string(ws.path().join("architecture-baseline.toml")).unwrap();
+    assert_eq!(rewritten, text);
+
+    // Without the state checks, the unscoped write has no such table.
+    let ws = Layered::default().build();
+    assert_eq!(run(ws.path(), &["--write-baseline"]).code, 0);
+    let text = fs::read_to_string(ws.path().join("architecture-baseline.toml")).unwrap();
+    assert!(
+        !text.lines().any(|line| line == "[layers.unowned]"),
+        "{text}"
+    );
+}
+
+/// The state checks' configuration and declarations, read strictly, exit 2.
+#[test]
+fn layers_state_configuration_errors() {
+    let state = |text: &str| layers_config(&STATE.replace("common = [\"svc\"]", text), "required");
+    let cases: Vec<(&str, &str, String, &str)> = vec![
+        (
+            "state without unowned",
+            "ARCHITECTURE.toml",
+            layers_config(
+                STATE.split("[rules.layers.unowned").next().unwrap(),
+                "required",
+            ),
+            "[rules.layers.state] and [rules.layers.unowned] in ARCHITECTURE.toml go together",
+        ),
+        (
+            "unowned without state",
+            "ARCHITECTURE.toml",
+            layers_config(
+                &format!(
+                    "[rules.layers.unowned{}",
+                    STATE.split_once("[rules.layers.unowned").unwrap().1
+                ),
+                "required",
+            ),
+            "[rules.layers.state] and [rules.layers.unowned] in ARCHITECTURE.toml go together",
+        ),
+        (
+            "an unknown shared catalog",
+            "ARCHITECTURE.toml",
+            state("commons = [\"svc\"]"),
+            "[rules.layers.state.shared_catalogs] commons in ARCHITECTURE.toml names \
+             \"commons\", which is not a directory under db/",
+        ),
+        (
+            "an unknown database",
+            "ARCHITECTURE.toml",
+            state("common = [\"svc\", \"nope\"]"),
+            "names \"nope\", which is not a directory under db/",
+        ),
+        (
+            "a shared catalog as a database",
+            "ARCHITECTURE.toml",
+            state("common = [\"svc\"]\npostgres = [\"common\"]"),
+            "[rules.layers.state.shared_catalogs] postgres in ARCHITECTURE.toml lists \"common\", \
+             which is a shared catalog, not a database",
+        ),
+        (
+            "a database listed twice",
+            "ARCHITECTURE.toml",
+            state("common = [\"svc\", \"svc\"]"),
+            "\"svc\" is listed twice",
+        ),
+        (
+            "an unowned table without the state checks",
+            "ARCHITECTURE.toml",
+            layers_config("", "required"),
+            "[layers.unowned] is not a table of the layers rule",
+        ),
+        (
+            "a misspelled namespace",
+            S_STORE,
+            stated_manifest("pplx-space-s-store", "postgress = [\"a\"]\n"),
+            "unknown field `postgress`",
+        ),
+        (
+            "tables that are not a list",
+            T_STORE,
+            stated_manifest("pplx-space-t-store", "sqlite.svc = \"items\"\n"),
+            "invalid type: string \"items\", expected a sequence",
+        ),
+        (
+            "a co-writer granted in a manifest",
+            T_STORE,
+            stated_manifest(
+                "pplx-space-t-store",
+                "sqlite.svc = [\"items\"]\nco_writer.postgres = [\"a\"]\n",
+            ),
+            "unknown field `co_writer`, expected `postgres` or `sqlite`",
+        ),
+        (
+            "a grant in a misspelled namespace",
+            "ARCHITECTURE.toml",
+            layers_config(
+                &format!("{STATE}[rules.layers.state.co_writers.postgress]\na = [\"x\"]\n"),
+                "required",
+            ),
+            "unknown field `postgress`",
+        ),
+        (
+            "a store granted a table twice",
+            "ARCHITECTURE.toml",
+            layers_config(
+                &format!("{STATE}[rules.layers.state.co_writers.postgres]\na = [\"x\", \"x\"]\n"),
+                "required",
+            ),
+            "\"x\" is listed twice",
+        ),
+        (
+            "two grant keys that name one table",
+            "ARCHITECTURE.toml",
+            layers_config(
+                &format!(
+                    "{STATE}[rules.layers.state.co_writers.postgres]\n\
+                     a = [\"pplx-space-t-store\"]\n\"public.a\" = [\"pplx-space-x\"]\n"
+                ),
+                "required",
+            ),
+            "[rules.layers.state.co_writers.postgres] names the table a twice, as \"a\" and \
+             \"public.a\"; merge their stores into one key",
+        ),
+        (
+            "two SQLite grant keys that differ in case",
+            "ARCHITECTURE.toml",
+            layers_config(
+                &format!(
+                    "{STATE}[rules.layers.state.co_writers.sqlite.svc]\n\
+                     items = [\"pplx-space-s-store\"]\nITEMS = [\"pplx-space-x\"]\n"
+                ),
+                "required",
+            ),
+            "[rules.layers.state.co_writers.sqlite.svc] names the table items twice, as \
+             \"ITEMS\" and \"items\"",
+        ),
+        (
+            "two declarations that name one table",
+            S_STORE,
+            stated_manifest("pplx-space-s-store", "postgres = [\"a\", \"public.a\"]\n"),
+            "[package.metadata.space.state] postgres names the table a twice, as \"a\" and \
+             \"public.a\"; keep one",
+        ),
+        (
+            "two SQLite declarations that differ in case",
+            T_STORE,
+            stated_manifest(
+                "pplx-space-t-store",
+                "sqlite.svc = [\"items\", \"main.ITEMS\"]\n",
+            ),
+            "[package.metadata.space.state] sqlite.svc names the table items twice, as \
+             \"items\" and \"main.ITEMS\"",
+        ),
+        (
+            "a table declared twice",
+            S_STORE,
+            stated_manifest("pplx-space-s-store", "postgres = [\"a\", \"a\"]\n"),
+            "postgres names the table a twice, as \"a\" and \"a\"",
+        ),
+    ];
+    for (name, path, text, error) in cases {
+        let ws = stated(vec![(path, text)]);
+        let checked = run(ws.path(), &[]);
+        assert_eq!(checked.code, 2, "{name}: {}", checked.stdout);
+        assert!(checked.stderr.contains(error), "{name}: {}", checked.stderr);
+    }
+}
+
+/// Changes to the shared catalogs, including one added or removed without
+/// databases, the co-writer grants and the state checks' modes are policy
+/// changes; a required state finding fails the run.
+#[test]
+fn layers_state_policy_changed_and_exit_codes() {
+    let grants = |grants: &str| format!("[rules.layers.state.co_writers.postgres]\n{grants}");
+    let ws = stated(vec![
+        granted(&grants("a = [\"pplx-space-t-store\"]\n")),
+        (
+            "base-architecture.toml",
+            layers_config(
+                &format!(
+                    "{}{}",
+                    STATE
+                        .replace("common = [\"svc\"]", "common = [\"old\"]")
+                        .replace(
+                            "[rules.layers.state.pending]\nmode = \"advisory\"",
+                            "[rules.layers.state.pending]\nmode = \"required\"",
+                        ),
+                    grants("a = [\"pplx-space-old\"]\nb = [\"pplx-space-t-store\"]\n"),
+                ),
+                "required",
+            ),
+        ),
+    ]);
+    let architecture = fs::read_to_string(ws.path().join("ARCHITECTURE.toml")).unwrap();
+    let base = fs::read_to_string(ws.path().join("base-architecture.toml")).unwrap();
+    let ctx = load_with(ws.path(), None, Some(&base));
+    let changed: Vec<(String, usize)> = check(&ctx)
+        .into_iter()
+        .filter(|finding| finding.behaviour == "policy_changed")
+        .map(|finding| (finding.message(), finding.location.line))
+        .collect();
+    let catalogs = line_with(&architecture, "common = [\"svc\"]");
+    let pending = line_with(&architecture, "[rules.layers.state.pending]") + 1;
+    let granted = line_with(&architecture, "a = [\"pplx-space-t-store\"]");
+    let grants_header = line_with(&architecture, "[rules.layers.state.co_writers.postgres]");
+    assert_eq!(
+        changed,
+        [
+            (
+                "ARCHITECTURE.toml: `svc` was added to the databases of `common` in \
+                 [rules.layers] state.shared_catalogs."
+                    .to_owned(),
+                catalogs
+            ),
+            (
+                "ARCHITECTURE.toml: `old` was removed from the databases of `common` in \
+                 [rules.layers] state.shared_catalogs."
+                    .to_owned(),
+                catalogs
+            ),
+            (
+                "ARCHITECTURE.toml: `pplx-space-t-store` was added to the co-writers of \
+                 `postgres.a` in [rules.layers] state.co_writers."
+                    .to_owned(),
+                granted
+            ),
+            (
+                "ARCHITECTURE.toml: `pplx-space-old` was removed from the co-writers of \
+                 `postgres.a` in [rules.layers] state.co_writers."
+                    .to_owned(),
+                granted
+            ),
+            (
+                "ARCHITECTURE.toml: `pplx-space-t-store` was removed from the co-writers of \
+                 `postgres.b` in [rules.layers] state.co_writers."
+                    .to_owned(),
+                grants_header
+            ),
+            (
+                "ARCHITECTURE.toml: layers.state.pending mode changed from required to \
+                 advisory."
+                    .to_owned(),
+                pending
+            ),
+        ]
+    );
+    let without = layers_config("", "required");
+    let ctx = load_with(ws.path(), None, Some(&without));
+    let modes = check(&ctx)
+        .into_iter()
+        .filter(|finding| {
+            finding.behaviour == "policy_changed" && finding.message().contains("from unset to")
+        })
+        .count();
+    assert_eq!(modes, 7, "each state check's mode is new");
+
+    // A shared catalog with no database is still no database of its own.
+    let catalogs = |extra: &str| {
+        layers_config(
+            &STATE.replace(
+                "common = [\"svc\"]",
+                &format!("common = [\"svc\"]\n{extra}"),
+            ),
+            "required",
+        )
+    };
+    let ws = stated(vec![
+        ("db/scratch/1_baseline.up.sql", String::new()),
+        ("db/retired/1_baseline.up.sql", String::new()),
+        ("ARCHITECTURE.toml", catalogs("scratch = []")),
+    ]);
+    let architecture = fs::read_to_string(ws.path().join("ARCHITECTURE.toml")).unwrap();
+    let ctx = load_with(ws.path(), None, Some(&catalogs("retired = []")));
+    let changed: Vec<(String, usize)> = check(&ctx)
+        .into_iter()
+        .filter(|finding| finding.behaviour == "policy_changed")
+        .map(|finding| (finding.message(), finding.location.line))
+        .collect();
+    assert_eq!(
+        changed,
+        [
+            (
+                "ARCHITECTURE.toml: `retired` was removed from [rules.layers] \
+                 state.shared_catalogs, so db/retired is a database of its own."
+                    .to_owned(),
+                line_with(&architecture, "[rules.layers.state.shared_catalogs]")
+            ),
+            (
+                "ARCHITECTURE.toml: `scratch` was added to [rules.layers] state.shared_catalogs, \
+                 so db/scratch is no database of its own."
+                    .to_owned(),
+                line_with(&architecture, "scratch = []")
+            ),
+        ]
+    );
+
+    let failing = stated(vec![(S_STORE, package("pplx-space-s-store"))]);
+    let found = run(failing.path(), &["--format", "rdjson"]);
+    assert_eq!(found.code, 1, "{}", found.stderr);
+    let document: Value = serde_json::from_str(&found.stdout).unwrap();
+    let codes: Vec<&str> = document["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|d| d["code"]["value"].as_str())
+        .collect();
+    assert_eq!(
+        codes,
+        ["layers.state.declarations", "layers.unowned.no_crossing"]
+    );
+    assert!(
+        found.stderr.contains(
+            "archcheck: layers.direction.no_new_entries, layers.dev_direction.no_new_entries, \
+             layers.storage_access.no_new_entries, layers.codec_features.no_new_entries, \
+             layers.domain_dependencies.no_new_entries, layers.model_protocol.no_new_entries \
+             and layers.unowned.no_new_entries skipped (no --base-baseline given)"
+        ),
+        "{}",
+        found.stderr
+    );
 }

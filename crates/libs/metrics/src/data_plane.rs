@@ -416,6 +416,21 @@ pub fn backend_channel_reset(kind: &str, reason: &str) {
     );
 }
 
+/// Latency of one data-plane API request, from routing to the response head,
+/// tagged by the matched route template. A streaming response such as process
+/// `Start` reports the time to open its stream, not the stream's lifetime.
+pub fn request_latency(method: &str, route: &str, status_code: u16, started_at: Instant) {
+    timing_ms(
+        "data_plane.request.latency_ms",
+        elapsed_ms(started_at),
+        &[
+            tag("method", method),
+            tag("route", route),
+            tag("status_code", status_code),
+        ],
+    );
+}
+
 pub fn backend_rpc_latency(
     surface: BackendRpcSurface,
     operation: &str,

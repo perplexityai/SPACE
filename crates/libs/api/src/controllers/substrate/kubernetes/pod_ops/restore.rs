@@ -6,6 +6,10 @@ use super::*;
 pub(in crate::controllers::substrate::kubernetes) struct SuspendRestorePlan {
     pub source_node_name: Option<String>,
     pub storage_uri: Option<String>,
+    /// The artifact `storage_uri` holds, which sandbox-manager compares its
+    /// local row against. Only the stopped re-placement plan sets it; the
+    /// node refuses it with any other wake target.
+    pub expected_local_artifact_id: Option<pplx_space_common_core::types::LocalArtifactId>,
 }
 
 /// Outcome of [`KubernetesSubstrate::hydrate_restored_execution`]: the
@@ -210,6 +214,7 @@ impl KubernetesSubstrate {
         Ok(Some(SuspendRestorePlan {
             source_node_name,
             storage_uri,
+            expected_local_artifact_id: None,
         }))
     }
 
@@ -239,6 +244,7 @@ impl KubernetesSubstrate {
                 .map(|storage_uri| SuspendRestorePlan {
                     source_node_name: None,
                     storage_uri: Some(storage_uri),
+                    expected_local_artifact_id: None,
                 })
                 .ok_or_else(|| SubstrateError::Conflict {
                     message: "cannot evacuate suspended sandbox without a ready remote snapshot"
@@ -259,27 +265,28 @@ impl KubernetesSubstrate {
         Ok(SuspendRestorePlan {
             source_node_name,
             storage_uri,
+            expected_local_artifact_id: None,
         })
     }
 
     /// Resolve where a `stopped` sandbox is restarted from: its source node,
-    /// its evacuated disk artifact in S3, or both.
+    /// or, when no node is known, its evacuated disk artifact in S3.
     ///
-    /// **The two are deliberately not mutually exclusive.** The pair is what
-    /// selects [`parse_pod_create_context`]'s third placement shape — the
-    /// source node as a preference or a required shortlist rather than a
-    /// binding, with S3 as the fallback — and that shape is the one worth
-    /// having, so neither source is dropped when the other is present.
-    /// See that function's docs for the `restore_source_node_hard_pin` case
-    /// where the pair still renders a required pin.
-    /// Suppressing the node once a URI exists would strip that preference from
-    /// every stopped restart, including the same-node retry between the
-    /// artifact becoming durable and the local row being deleted, when the
-    /// rootfs is still on the node. Suppressing the URI once a node is known
-    /// would keep the pre-bound `spec.nodeName` shape, whose failure mode is
-    /// exactly what evacuating a stopped sandbox exists to remove: the pod
-    /// cannot land anywhere else, and a source node that can no longer run it
-    /// ends the restore instead of re-driving it cross-node.
+    /// **With the node known, the artifact is dropped**, which selects
+    /// [`parse_pod_create_context`]'s node-only shape: the pod is pre-bound to
+    /// that node (`spec.nodeName`) and can't land anywhere else. That's the only
+    /// node the start can complete on. The artifact is a disk artifact (the
+    /// selector reads only `type = 'disk'`), and sandbox-manager boots a disk
+    /// artifact only where its rootfs already is (see below), so the
+    /// preference-plus-fallback shape a node and a URI together would select
+    /// buys no fallback. What it costs is a start the scheduler sends to
+    /// another node that still holds a `stopped` row for the sandbox, such as
+    /// a source a stopped evacuation released and an operator then undrained:
+    /// the shim cold-starts that row, which is older than the sandbox's
+    /// current disk, and the writes since are silently gone. A portable
+    /// artifact would keep the fallback; a stopped sandbox has none today, and
+    /// a suspended one restores through [`Self::suspend_restore_plan`], which
+    /// keeps both.
     ///
     /// Both absent stays [`SubstrateError::Timeout`] -> 503 + `Retry-After`. A
     /// `start` racing the evacuation window is asked to retry, not told the
@@ -313,17 +320,16 @@ impl KubernetesSubstrate {
     ///   finalize accepts only a full artifact
     ///   (`transition_restored_sandbox_to_suspended_parts`), so a disk
     ///   artifact stages and then fails, and the readiness wait re-drives a
-    ///   pod that never comes up. That qualifies the S3 fallback described
-    ///   above too: until sandbox-manager can boot a same-id disk artifact,
-    ///   it cannot complete on a node other than the source.
+    ///   pod that never comes up. That's why the plan above drops the
+    ///   artifact once the node is known: until sandbox-manager can boot a
+    ///   same-id disk artifact, a start cannot complete on a node other than
+    ///   the source.
     ///
     /// So the plan answers [`SubstrateError::Timeout`] — 503 with
     /// `Retry-After` — for as long as the evacuation leaves the sandbox
-    /// unplaced. The drain's restore sweep is meant to place it again, after
-    /// which the row has a node and this refusal no longer applies; until the
-    /// restore claim admits a `stopped` row and sandbox-manager can
-    /// materialize one back to `stopped`, that sweep cannot, and the refusal
-    /// stands.
+    /// unplaced. The drain's restore sweep places it again
+    /// ([`Self::stopped_evacuation_restore_plan`]), after which the row has a
+    /// node and this refusal no longer applies.
     pub(super) async fn stopped_restore_plan(
         &self,
         sandbox: &Sandbox,
@@ -338,10 +344,14 @@ impl KubernetesSubstrate {
             });
         }
         let source_node_name = source.node_name;
-        let storage_uri = self
-            .store
-            .selected_stopped_restore_storage_uri(sandbox)
-            .await?;
+        let storage_uri = match source_node_name {
+            Some(_) => None,
+            None => {
+                self.store
+                    .selected_stopped_restore_storage_uri(sandbox)
+                    .await?
+            }
+        };
         if source_node_name.is_none() && storage_uri.is_none() {
             return Err(SubstrateError::Timeout {
                 message: "cannot restart stopped sandbox before its source node or evacuated \
@@ -353,6 +363,48 @@ impl KubernetesSubstrate {
         Ok(SuspendRestorePlan {
             source_node_name,
             storage_uri,
+            expected_local_artifact_id: None,
+        })
+    }
+
+    /// The plan the drain's restore sweep re-places an evacuated `stopped`
+    /// sandbox with: the exact URI of its durable disk artifact and the
+    /// artifact id it holds, and no source node.
+    ///
+    /// No source node because the drain released it: the teardown cleared the
+    /// placement, and the node is cordoned and on its way out with whatever
+    /// rootfs it still holds, so the pod is placed the way any evacuation pod
+    /// is, from the URI alone.
+    ///
+    /// No pod-annotation reuse, unlike [`Self::suspend_restore_plan`]: the
+    /// annotation carries only the URI, and the node needs the artifact id too.
+    /// Reading both from one Postgres row keeps them describing the same
+    /// artifact. The pin they come from does not move during an evacuation
+    /// (see [`Self::stopped_restore_plan`]'s asymmetry note), so a retry against
+    /// a pod an earlier attempt created resolves the same pair.
+    ///
+    /// A row with no ready, pinned disk artifact answers
+    /// [`SubstrateError::Conflict`], the same refusal a suspended evacuation
+    /// without a ready remote snapshot gets. The sweep only lists a stopped
+    /// evacuation once that artifact is ready, so reaching this is drift
+    /// rather than a wait.
+    pub(in crate::controllers::substrate::kubernetes) async fn stopped_evacuation_restore_plan(
+        &self,
+        sandbox: &Sandbox,
+    ) -> Result<SuspendRestorePlan, SubstrateError> {
+        let source = self
+            .store
+            .selected_stopped_evacuation_restore_source(sandbox.id)
+            .await?
+            .ok_or_else(|| SubstrateError::Conflict {
+                message: "cannot re-place an evacuated stopped sandbox without a ready, pinned \
+                          disk artifact"
+                    .to_string(),
+            })?;
+        Ok(SuspendRestorePlan {
+            source_node_name: None,
+            storage_uri: Some(source.storage_uri),
+            expected_local_artifact_id: Some(source.local_artifact_id),
         })
     }
 }

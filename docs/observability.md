@@ -736,6 +736,9 @@ are replaced. WARN, INFO and DEBUG lines are not forwarded; Firecracker warns
 on every snapshot restore. `sandbox.vm.diagnostics` is therefore not emitted
 with `source:firecracker` and `level:warn`. The watchdog's failure-time
 evidence still includes the tail of Firecracker's log, WARN lines included.
+The ERROR Firecracker logs when `GET /balloon` finds no balloon device is
+expected, because node-manager reads the balloon before every snapshot pause,
+so it is logged at DEBUG and not counted.
 
 spaced records its own WARN and ERROR callsites (level, target, source file and
 line, and a count), never message text or field values, which can carry a

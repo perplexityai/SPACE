@@ -30,6 +30,7 @@ fn inline_switches_default_off_and_read_from_the_environment() {
             kinds: Vec::new(),
             max_concurrent: DEFAULT_INLINE_MAX_CONCURRENT,
             org_limit: None,
+            test_hold: None,
         }
     );
 
@@ -48,6 +49,7 @@ fn inline_switches_default_off_and_read_from_the_environment() {
             kinds: vec![OperationKind::WakeSandbox, OperationKind::CreateSandbox],
             max_concurrent: 8,
             org_limit: None,
+            test_hold: None,
         }
     );
 
@@ -63,6 +65,17 @@ fn inline_switches_default_off_and_read_from_the_environment() {
     for no_limit in ["0", "", "lots", "-1"] {
         env.set(INLINE_ORG_LIMIT_ENV, no_limit);
         assert_eq!(config(&env).org_limit, None, "{no_limit:?}");
+    }
+
+    // The test hold, read here because this crate's tests build with
+    // `test-hooks`, is capped; `0` or a malformed value sets none.
+    env.set(INLINE_TEST_HOLD_SECS_ENV, " 30 ");
+    assert_eq!(config(&env).test_hold, Some(Duration::from_secs(30)));
+    env.set(INLINE_TEST_HOLD_SECS_ENV, "100000");
+    assert_eq!(config(&env).test_hold, Some(MAX_INLINE_TEST_HOLD));
+    for no_hold in ["0", "", "soon", "-1"] {
+        env.set(INLINE_TEST_HOLD_SECS_ENV, no_hold);
+        assert_eq!(config(&env).test_hold, None, "{no_hold:?}");
     }
 }
 

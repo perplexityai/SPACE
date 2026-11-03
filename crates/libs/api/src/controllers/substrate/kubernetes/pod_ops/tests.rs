@@ -287,6 +287,7 @@ fn restore_placement_sample_reflects_pin_shape() {
 
     // Evacuation always drops the pin -> cross-node.
     let evac = PodCreateContext::Restore(RestoreContext::Evacuation {
+        stopped_materialization: None,
         suspend_restore_storage_uri: Some("s3://bucket/key"),
         extra_tolerations: &[],
         extra_required_affinity: None,
@@ -490,6 +491,7 @@ fn pre_bound_node_and_metric_path_are_reported_per_context() {
     );
 
     let evacuation = PodCreateContext::Restore(RestoreContext::Evacuation {
+        stopped_materialization: None,
         suspend_restore_storage_uri: Some("s3://bucket/key"),
         extra_tolerations: &[],
         extra_required_affinity: None,
@@ -829,8 +831,8 @@ mod stopped_restore_plan_tests {
     /// must refuse. The operator-visible properties:
     ///
     /// * a stopped sandbox whose node still holds it restarts there;
-    /// * once its rootfs is durable in S3 it can restart anywhere, and still
-    ///   prefers the node that has the bytes locally;
+    /// * once its rootfs is durable in S3 it still restarts only there, since
+    ///   no other node can boot a disk artifact;
     /// * with the node gone but the bytes durable it restarts elsewhere;
     /// * with neither, `start` is told to retry — not that the sandbox failed.
     ///
@@ -894,7 +896,10 @@ mod stopped_restore_plan_tests {
             "with no published disk artifact the plan must not invent a remote source"
         );
 
-        // Both: the node preference survives the artifact becoming durable.
+        // Both: the node still holds the rootfs, and the disk artifact can't
+        // boot anywhere else, so the plan keeps the node alone. Planning the URI
+        // too would make the node a preference the scheduler may pass over, onto
+        // another node that holds an older `stopped` row for the sandbox.
         publish_ready_disk_artifact(&pool, node_only, LocalArtifactId::new(), uri).await?;
         let sandbox = fetch_sandbox(&pool, node_only)
             .await?
@@ -903,12 +908,11 @@ mod stopped_restore_plan_tests {
         assert_eq!(
             plan.source_node_name.as_deref(),
             Some("holder-node"),
-            "a durable artifact must not suppress the source-node preference"
+            "a durable artifact must not take the start off the node holding the rootfs"
         );
         assert_eq!(
-            plan.storage_uri.as_deref(),
-            Some(uri),
-            "the durable artifact must reach the plan so a fallback node can restore from it"
+            plan.storage_uri, None,
+            "with the node known the disk artifact must not reach the plan"
         );
 
         // Artifact only. Reaching this shape takes a sandbox with *no*
@@ -940,9 +944,10 @@ mod stopped_restore_plan_tests {
         // sandbox actually presents: placement pointers cleared, but the
         // execution row still names the node it last ran on. Because that
         // fallback filters on nothing but `k8s_node_name IS NOT NULL`, the plan
-        // resolves *both* — and the node it names may already be terminated.
-        // Asserting it here so the shape is on record rather than discovered
-        // by whichever change makes the URI half live.
+        // resolves that node — which may already be terminated — and, a node
+        // being known, drops the artifact. Asserting it here so the shape is on
+        // record. (An evacuation still in flight is refused before this; see
+        // the next test.)
         let evacuated = SandboxId::new();
         insert_stopped_sandbox(&pool, evacuated).await?;
         // Build the execution row through the store rather than by hand, so it
@@ -984,12 +989,89 @@ mod stopped_restore_plan_tests {
              source node — a dead one"
         );
         assert_eq!(
-            plan.storage_uri.as_deref(),
-            Some(uri),
-            "and it must carry the artifact too, so a node that is not the dead one has \
-             something to restore from"
+            plan.storage_uri, None,
+            "and, a node being known, not the artifact: another node couldn't boot it"
         );
 
+        Ok(())
+    }
+
+    /// **A stopped start can't land on another node holding an older copy; a
+    /// portable restore still schedules freely.** The stopped sandbox was
+    /// re-placed: it now lives on `destination-node`, with its disk durable in
+    /// S3, and the source it left still holds the pre-evacuation rootfs after
+    /// an operator undrained it. Its start is pre-bound to the destination, so
+    /// the source is never a candidate. A suspended sandbox with a portable
+    /// snapshot keeps the scheduler's choice: its source node is only a
+    /// preference, with the snapshot as the fallback.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stopped_start_is_bound_to_its_node_and_a_portable_restore_is_not() -> TestResult {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let substrate = substrate_with_store_and_client(
+            pool.clone(),
+            mock_kubernetes_client(Arc::new(Mutex::new(Vec::new()))),
+        );
+        let uri = "s3://space-test/re-placed-stopped-disk?region=us-east-1";
+        let sandbox_id = SandboxId::new();
+        insert_stopped_sandbox(&pool, sandbox_id).await?;
+        place_on_node(&pool, sandbox_id, "destination-node").await?;
+        publish_ready_disk_artifact(&pool, sandbox_id, LocalArtifactId::new(), uri).await?;
+        let sandbox = fetch_sandbox(&pool, sandbox_id)
+            .await?
+            .expect("the fixture just inserted this sandbox");
+
+        let plan = substrate.stopped_restore_plan(&sandbox).await?;
+        match parse_pod_create_context(
+            sandbox_id,
+            3,
+            "stopped",
+            true,
+            None,
+            plan.source_node_name.as_deref(),
+            plan.storage_uri.as_deref(),
+        )? {
+            PodCreateContext::Restore(RestoreContext::UserRestore {
+                direct_node_name,
+                preferred_node_name,
+                suspend_restore_storage_uri,
+                ..
+            }) => {
+                assert_eq!(
+                    (
+                        direct_node_name,
+                        preferred_node_name,
+                        suspend_restore_storage_uri
+                    ),
+                    (Some("destination-node"), None, None),
+                    "a stopped start must be pre-bound to the node holding its rootfs"
+                );
+            }
+            _ => panic!("a stopped start must be a restore placement"),
+        }
+
+        match parse_pod_create_context(
+            SandboxId::new(),
+            3,
+            "suspended",
+            true,
+            None,
+            Some("source-node"),
+            Some("s3://space-test/portable-full?region=us-east-1"),
+        )? {
+            PodCreateContext::Restore(RestoreContext::UserRestore {
+                direct_node_name,
+                preferred_node_name,
+                ..
+            }) => {
+                assert_eq!(
+                    (direct_node_name, preferred_node_name),
+                    (None, Some("source-node")),
+                    "a portable restore keeps its source node as a preference only"
+                );
+            }
+            _ => panic!("a portable restore must be a restore placement"),
+        }
         Ok(())
     }
 
@@ -1106,7 +1188,7 @@ mod stopped_restore_plan_tests {
             "the 503 must come from the evacuation arm, got {message:?}"
         );
 
-        // Same row, marker cleared: both sources resolve.
+        // Same row, marker cleared: the node resolves.
         sqlx::query("UPDATE sandboxes SET evacuation_restore_target = NULL WHERE id = $1")
             .bind(sandbox_id)
             .execute(&pool)
@@ -1120,11 +1202,128 @@ mod stopped_restore_plan_tests {
                 plan.source_node_name.as_deref(),
                 plan.storage_uri.as_deref()
             ),
-            (Some("drained-node"), Some(uri)),
-            "without the marker the same row plans both sources, so the marker is what \
-             refused above"
+            (Some("drained-node"), None),
+            "without the marker the same row plans its node, so the marker is what refused \
+             above"
         );
 
+        Ok(())
+    }
+
+    /// Mark `sandbox_id` as an evacuation restore in flight toward `target`:
+    /// the shape the evacuation claim leaves, `restoring` with the marker kept.
+    async fn claim_for_evacuation_restore(
+        pool: &PgPool,
+        sandbox_id: SandboxId,
+        target: &str,
+    ) -> TestResult {
+        sqlx::query(
+            "UPDATE sandboxes
+                SET lifecycle = 'restoring', evacuation_restore_target = $2
+              WHERE id = $1",
+        )
+        .bind(sandbox_id)
+        .bind(target)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The plan the drain's restore sweep re-places an evacuated stopped
+    /// sandbox with. The properties sandbox-manager's stopped wake depends on:
+    ///
+    /// * it names the drain's pinned disk artifact by URI **and** by id, and
+    ///   the two describe the same artifact;
+    /// * a newer ready disk row for a *different* artifact never displaces the
+    ///   pinned one, and a newer row for the pinned artifact (a retried
+    ///   backup) does;
+    /// * it never names a source node, because the drain released it;
+    /// * only a claimed stopped evacuation resolves one: a suspended
+    ///   evacuation's `restoring` row, or a stopped row the claim hasn't taken,
+    ///   is refused even with the same pinned disk artifact in the catalog.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_stopped_re_placement_plan_names_the_pinned_disk_artifact_and_no_node() -> TestResult
+    {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let substrate = substrate_with_store_and_client(
+            pool.clone(),
+            mock_kubernetes_client(Arc::new(Mutex::new(Vec::new()))),
+        );
+        let pinned_uri = "s3://space-test/re-place-pinned?region=us-east-1";
+        let decoy_uri = "s3://space-test/re-place-decoy?region=us-east-1";
+        let retried_uri = "s3://space-test/re-place-retried?region=us-east-1";
+
+        let sandbox_id = SandboxId::new();
+        insert_stopped_sandbox(&pool, sandbox_id).await?;
+        place_on_node(&pool, sandbox_id, "drained-node").await?;
+        let pin = LocalArtifactId::new();
+        publish_ready_disk_artifact(&pool, sandbox_id, pin, pinned_uri).await?;
+        // A newer ready disk row for another artifact, then the pin put back:
+        // a selector that ignored the pin would take this one.
+        publish_ready_disk_artifact(&pool, sandbox_id, LocalArtifactId::new(), decoy_uri).await?;
+        sqlx::query("UPDATE sandboxes SET current_local_artifact_id = $2 WHERE id = $1")
+            .bind(sandbox_id)
+            .bind(pin)
+            .execute(&pool)
+            .await?;
+        // The teardown's release, then the evacuation claim.
+        sqlx::query(
+            "UPDATE sandboxes
+                SET active_node_id = NULL, target_node_id = NULL, placement = 'unplaced'
+              WHERE id = $1",
+        )
+        .bind(sandbox_id)
+        .execute(&pool)
+        .await?;
+        claim_for_evacuation_restore(&pool, sandbox_id, "stopped").await?;
+
+        let sandbox = fetch_sandbox(&pool, sandbox_id)
+            .await?
+            .expect("the fixture just inserted this sandbox");
+        let plan = substrate.stopped_evacuation_restore_plan(&sandbox).await?;
+        assert_eq!(
+            (
+                plan.source_node_name.as_deref(),
+                plan.storage_uri.as_deref(),
+                plan.expected_local_artifact_id,
+            ),
+            (None, Some(pinned_uri), Some(pin)),
+            "the plan must name the pinned artifact by URI and id, and no node"
+        );
+
+        publish_ready_disk_artifact(&pool, sandbox_id, pin, retried_uri).await?;
+        let plan = substrate.stopped_evacuation_restore_plan(&sandbox).await?;
+        assert_eq!(
+            (plan.storage_uri.as_deref(), plan.expected_local_artifact_id),
+            (Some(retried_uri), Some(pin)),
+            "a retried backup of the pinned artifact is the newest copy to load"
+        );
+
+        // The same catalog, but the row isn't a claimed stopped evacuation.
+        for (lifecycle, marker) in [("restoring", "paused"), ("stopped", "stopped")] {
+            sqlx::query(
+                "UPDATE sandboxes
+                    SET lifecycle = $2, evacuation_restore_target = $3
+                  WHERE id = $1",
+            )
+            .bind(sandbox_id)
+            .bind(lifecycle)
+            .bind(marker)
+            .execute(&pool)
+            .await?;
+            let error = match substrate.stopped_evacuation_restore_plan(&sandbox).await {
+                Err(error) => error,
+                Ok(plan) => panic!(
+                    "{lifecycle}/{marker} must not resolve a stopped re-placement, got {:?}",
+                    plan.storage_uri
+                ),
+            };
+            assert!(
+                matches!(error, SubstrateError::Conflict { .. }),
+                "{lifecycle}/{marker}: got {error:?}"
+            );
+        }
         Ok(())
     }
 }

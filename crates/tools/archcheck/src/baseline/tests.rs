@@ -3,8 +3,9 @@ use std::fs;
 use super::*;
 use crate::{config::ArchitectureConfig, rules};
 
-/// `file_size`, two `pattern_ratchet` instances and `crate_names`, every
-/// behaviour advisory: a table of every registered rule with a baseline.
+/// `file_size`, two `pattern_ratchet` instances, `crate_names` and
+/// `layers` with its state checks, every behaviour advisory: a table of every registered rule with
+/// a baseline.
 fn config() -> ArchitectureConfig {
     let behaviours = |table: &str| -> String {
         [
@@ -28,9 +29,47 @@ fn config() -> ArchitectureConfig {
         .iter()
         .map(|behaviour| format!("[rules.crate_names.{behaviour}]\nmode = \"advisory\"\n"))
         .collect();
+    let layers: String = [
+        "placement",
+        "layout",
+        "direction.no_crossing",
+        "direction.no_new_entries",
+        "direction.stale_entries",
+        "dev_direction.no_crossing",
+        "dev_direction.no_new_entries",
+        "dev_direction.stale_entries",
+        "storage_access.no_crossing",
+        "storage_access.no_new_entries",
+        "storage_access.stale_entries",
+        "codec_features.no_crossing",
+        "codec_features.no_new_entries",
+        "codec_features.stale_entries",
+        "domain_dependencies.no_crossing",
+        "domain_dependencies.no_new_entries",
+        "domain_dependencies.stale_entries",
+        "model_protocol.no_crossing",
+        "model_protocol.no_new_entries",
+        "model_protocol.stale_entries",
+        "test_only",
+        "clients",
+        "store_edges",
+        "stale_entries",
+        "policy_changed",
+        "state.owners",
+        "state.declarations",
+        "state.writes",
+        "state.pending",
+        "unowned.no_crossing",
+        "unowned.no_new_entries",
+        "unowned.stale_entries",
+    ]
+    .iter()
+    .map(|behaviour| format!("[rules.layers.{behaviour}]\nmode = \"advisory\"\n"))
+    .chain(["[rules.layers.storage]\ndrivers = [\"sqlx\"]\n".to_owned()])
+    .collect();
     let text = format!(
         "[rules.file_size]\nlimit = 5\n{}{}{}\
-         [rules.crate_names]\nbanned_tokens = [\"common\"]\nallow = []\n{crate_names}",
+         [rules.crate_names]\nbanned_tokens = [\"common\"]\nallow = []\n{crate_names}{layers}",
         behaviours("file_size"),
         instance("alpha"),
         instance("beta"),
@@ -52,11 +91,15 @@ fn every_configured_table_is_read_from_a_base_copy() {
             "configure {rule} in this test: {tables:?}"
         );
     }
-    // Each table with an entry of its own.
+    // Each table with an entry of its own; a `[layers.<check>]` entry is an
+    // edge.
     let text: String = tables
         .iter()
         .enumerate()
-        .map(|(cap, table)| format!("[{table}]\n\"{table}.rs\" = {cap}\n"))
+        .map(|(cap, table)| match layers_check(table) {
+            Some(_) => format!("[{table}]\nfrom = [\"{table}\"]\n"),
+            None => format!("[{table}]\n\"{table}.rs\" = {cap}\n"),
+        })
         .collect();
     let dir = tempfile::tempdir().expect("create a temporary directory");
     let path = dir.path().join("base.toml");
@@ -68,6 +111,15 @@ fn every_configured_table_is_read_from_a_base_copy() {
         if table == CrateNames::NAME {
             let names = BTreeSet::from([format!("{table}.rs")]);
             assert_eq!(base.crate_names().ok(), Some(Some(&names)), "{table}");
+            continue;
+        }
+        if let Some(check) = layers_check(table) {
+            let edges = BTreeMap::from([("from".to_owned(), BTreeSet::from([table.clone()]))]);
+            let found = match base.layers_table(check) {
+                Ok(BaseLayersTable::Table(found)) => Some(found),
+                _ => None,
+            };
+            assert_eq!(found, Some(&edges), "{table}");
             continue;
         }
         let entries = base.table(table).ok();

@@ -103,6 +103,20 @@ pub(super) struct UnplacedRestoreSource {
     pub(super) stopped_evacuation_unplaced: bool,
 }
 
+/// Where an evacuated `stopped` sandbox is re-placed from: the exact storage
+/// URI of its durable disk artifact and the artifact id that URI holds.
+///
+/// sandbox-manager needs both for a `WAKE_TARGET_STATE_STOPPED` wake. The URI
+/// says what to stage; the id is what the node compares its local row against,
+/// so a `stopped` row left over from an earlier life on that node is refused
+/// instead of being reported as this placement. They come from one row of one
+/// statement so they can't describe different artifacts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct StoppedEvacuationRestoreSource {
+    pub(super) storage_uri: String,
+    pub(super) local_artifact_id: LocalArtifactId,
+}
+
 struct CommittedSuspendArtifactRow {
     execution_state: ActiveExecutionState,
     artifact_id: Option<LocalArtifactId>,
@@ -319,6 +333,15 @@ impl ReconciledActivationFence {
         match self.ownership {
             ActivationFenceOwnership::Owned(id) => Some(id),
             ActivationFenceOwnership::Joined(_) | ActivationFenceOwnership::Completed => None,
+        }
+    }
+
+    /// The attempt this wake ran under, whether it took it or joined one still
+    /// inside its lease; `None` when the execution had already completed.
+    pub(super) const fn driving_attempt_id(&self) -> Option<SandboxActivationAttemptId> {
+        match self.ownership {
+            ActivationFenceOwnership::Owned(id) | ActivationFenceOwnership::Joined(id) => Some(id),
+            ActivationFenceOwnership::Completed => None,
         }
     }
 }
@@ -619,9 +642,9 @@ pub(super) enum RestoreClaim {
     /// marker, it stays inside that window, and the claim's next call takes it
     /// as `RedroveRestoring`; the drain's restore sweep lists such a row
     /// (the stopped arm of `restore_pending_evacuations_query` admits
-    /// `restoring`). Re-placing it also needs its restore plan to resolve the
-    /// disk artifact for a `restoring` row, which nothing does yet:
-    /// `selected_stopped_restore_storage_uri` serves only `lifecycle =
+    /// `restoring`). Its restore plan resolves the disk artifact for that
+    /// `restoring` row through `selected_stopped_evacuation_restore_source`,
+    /// since `selected_stopped_restore_storage_uri` serves only `lifecycle =
     /// 'stopped'`.
     FreshFromStopped,
     RedroveRestoring {

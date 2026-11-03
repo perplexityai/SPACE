@@ -242,6 +242,7 @@ fn cluster_controller_built_restore_drops_source_node_pin_and_omits_tolerations(
     let pod = build_sandbox_pod(
         &pool_pod_config().for_namespace("space"),
         SandboxPodRequest::Restore {
+            stopped_materialization: None,
             artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
             common: evacuation_common("space-sbx-evac-1", &env),
             runtime,
@@ -306,6 +307,7 @@ fn cluster_controller_built_restore_renders_configured_placement() {
     let pod = build_sandbox_pod(
         &pool_pod_config().for_namespace("space"),
         SandboxPodRequest::Restore {
+            stopped_materialization: None,
             artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
             common: evacuation_common("space-sbx-evac-2", &env),
             runtime,
@@ -548,6 +550,7 @@ fn node_group_labeler_selector_matches_the_rendered_pod_node_selector() {
     let pod = build_sandbox_pod(
         &values.for_namespace("space"),
         SandboxPodRequest::Restore {
+            stopped_materialization: None,
             artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
             common: evacuation_common("space-sbx-selector-diff", &env),
             runtime,

@@ -153,6 +153,15 @@ _DURATION_SECONDS = {
         "native_contract.zero_vcpu_admission": 30,
         "native_recovery.attached_stream_drains_through_data_plane_restart": 16,
         "native_recovery.command_survives_data_plane_restart": 15,
+        # Estimates until a bench run refreshes them. Each inline scenario
+        # rolls the API out twice (about 30 s each on Kind) to turn inline
+        # execution on and back off: four concurrent creates; five VMs and a
+        # controller outage; a wake re-driven after the 60 s claim staleness;
+        # a suspend and a wake.
+        "native_recovery.inline_fallback_at_one_permit_loses_no_operation": 120,
+        "native_recovery.inline_load_survives_leader_failover": 210,
+        "native_recovery.inline_wake_survives_api_pod_kill": 215,
+        "native_recovery.inline_wake_waits_behind_queued_suspend": 125,
         "native_recovery.queued_create_survives_api_restart": 19,
         "native_recovery.slow_operation_does_not_block_later_work": 20,
         "native_recovery.stale_queued_work_expires_after_controller_outage": 68,

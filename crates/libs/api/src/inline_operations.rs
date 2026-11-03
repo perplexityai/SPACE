@@ -73,6 +73,12 @@ const SLOT_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 /// Inline executions one organization may hold at once across every API
 /// process; unset or `0` sets no limit.
 pub const INLINE_ORG_LIMIT_ENV: &str = "SPACE_NATIVE_INLINE_ORG_LIMIT";
+/// Test hook: seconds each execution [`InlineLifecycle`] claims waits, with
+/// its claim renewed, before it starts. Read only with `test-hooks`, so a
+/// smoke can hold a claimed operation in `running` while it kills the API
+/// process or crowds its permits.
+pub const INLINE_TEST_HOLD_SECS_ENV: &str = "SPACE_NATIVE_INLINE_TEST_HOLD_SECS";
+const MAX_INLINE_TEST_HOLD: Duration = Duration::from_secs(600);
 
 /// The kinds `SPACE_NATIVE_INLINE_KINDS` may name: wakes, which callers wait
 /// on, and creates. Everything else stays on the dispatcher.
@@ -94,6 +100,8 @@ pub struct InlineOperationsConfig {
     pub max_concurrent: usize,
     /// `SPACE_NATIVE_INLINE_ORG_LIMIT`, `None` (no limit) by default.
     pub org_limit: Option<NonZeroU32>,
+    /// [`INLINE_TEST_HOLD_SECS_ENV`], `None` unless a test build sets it.
+    pub test_hold: Option<Duration>,
 }
 
 impl Default for InlineOperationsConfig {
@@ -103,6 +111,7 @@ impl Default for InlineOperationsConfig {
             kinds: Vec::new(),
             max_concurrent: DEFAULT_INLINE_MAX_CONCURRENT,
             org_limit: None,
+            test_hold: None,
         }
     }
 }
@@ -115,7 +124,8 @@ impl InlineOperationsConfig {
     /// A kind outside [`INLINE_CAPABLE_KINDS`], or not a kind at all, is
     /// left out with a warning. A malformed limit keeps the default, and one
     /// above 1024 is capped. A malformed organization limit sets none, with
-    /// a warning.
+    /// a warning. The test hold is capped at 600 s; `0` or a malformed value
+    /// sets none.
     pub fn from_environment(env: &dyn pplx_space_common_core::env::Environment) -> Self {
         let default = Self::default();
         let mut kinds = Vec::new();
@@ -167,6 +177,10 @@ impl InlineOperationsConfig {
                     }
                 }
             }),
+            test_hold: pplx_space_common_core::env::test_hook(env, INLINE_TEST_HOLD_SECS_ENV)
+                .and_then(|raw| raw.trim().parse::<u64>().ok())
+                .filter(|secs| *secs > 0)
+                .map(|secs| Duration::from_secs(secs).min(MAX_INLINE_TEST_HOLD)),
         }
     }
 }
@@ -671,6 +685,13 @@ impl InlineLifecycle {
             CreateInlinePublicOperationResult::Claimed(claim) => {
                 let operation_id = claim.operation().id;
                 let execution = self.executor.execute(claim.operation().clone());
+                let hold = self.runner.inner.config.test_hold;
+                let execution = async move {
+                    if let Some(hold) = hold {
+                        tokio::time::sleep(hold).await;
+                    }
+                    execution.await
+                };
                 self.runner
                     .start(store.clone(), claim, execution)
                     .committed()

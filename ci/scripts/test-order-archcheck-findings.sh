@@ -194,6 +194,28 @@ expect "crate_names policy" \
     "ARCHITECTURE.toml:80 own.rs:1 crates/new-utils/Cargo.toml:2 ARCHITECTURE.toml:81" \
     --own=nofilter policy.rdjson policy.json
 
+# layers.policy_changed compares ARCHITECTURE.toml with the base's too, so it
+# leads although archcheck reports it last, and even when the pull request
+# leaves ARCHITECTURE.toml alone, as when the base copy predates the rule; the
+# layers rule's other findings there are the pull request's only when it
+# changes the file.
+{
+    tree_findings
+    diagnostic own.rs 1 file_size.listed_no_growth
+    diagnostic ARCHITECTURE.toml 460 layers.placement
+    diagnostic ARCHITECTURE.toml 470 layers.stale_entries
+    diagnostic ARCHITECTURE.toml 457 layers.policy_changed
+} | report >layers.rdjson
+pages own.rs >layers.json
+expect "layers policy, file mode" "own.rs:1" --own=file layers.rdjson layers.json
+expect "layers policy" \
+    "ARCHITECTURE.toml:457 own.rs:1 $(numbered tree 11) ARCHITECTURE.toml:460 ARCHITECTURE.toml:470" \
+    layers.rdjson layers.json
+pages ARCHITECTURE.toml own.rs >layers-config.json
+expect "layers policy, ARCHITECTURE.toml changed" \
+    "ARCHITECTURE.toml:457 own.rs:1 ARCHITECTURE.toml:460 ARCHITECTURE.toml:470" \
+    --own=nofilter layers.rdjson layers-config.json
+
 # A stale [crate_names] entry is the pull request's when it changes the
 # Cargo.toml of the member path the entry maps to (old or new name), however
 # the key and path are written; an empty path is the root package.

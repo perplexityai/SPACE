@@ -180,6 +180,303 @@
 # database migrator takes them from the store.
 [pattern_ratchet.sbxmgr_sqlite_schema]
 
+# [layers.<check>] maps each workspace package to what it depends on against
+# the layers rule's <check>: workspace packages, drivers, storage helpers and
+# packages Domain may not depend on, or, for codec_features, the
+# <package>/<feature> it enables; [layers.unowned] maps each database
+# namespace to its live tables that no store declares. Only remove entries:
+# a pull request that adds one is reported.
+[layers.codec_features]
+pplx-space-api = [
+  "pplx-space-common-core/sqlx",
+]
+pplx-space-cluster-controller-server = [
+  "pplx-space-common-core/sqlx",
+]
+pplx-space-common-core = [
+  "pplx-space-accounts/rusqlite",
+  "pplx-space-accounts/sqlx",
+  "pplx-space-k8s-ids/sqlx",
+  "pplx-space-semver/sqlx",
+]
+pplx-space-common-svc = [
+  "pplx-space-common-core/sqlx",
+]
+pplx-space-credmgr = [
+  "pplx-space-common-core/sqlx",
+]
+pplx-space-internal-api-server = [
+  "pplx-space-common-core/sqlx",
+]
+pplx-space-node-runtime-manager = [
+  "pplx-space-common-core/rusqlite",
+]
+pplx-space-runtime-manager-svc = [
+  "pplx-space-node-runtime-manager/s3",
+]
+pplx-space-snapshot-retention = [
+  "pplx-space-common-core/sqlx",
+]
+pplx-space-volmgr = [
+  "pplx-space-common-core/rusqlite",
+]
+
+[layers.dev_direction]
+pplx-space-sbx-mgr-store = [
+  "pplx-space-node-runtime-core",
+]
+
+[layers.direction]
+pplx-space-common-grpc = [
+  "pplx-space-common-core",
+]
+pplx-space-common-jobs = [
+  "pplx-space-common-core",
+]
+pplx-space-common-svc = [
+  "pplx-space-api-route",
+  "pplx-space-auto-lifecycle-receipt",
+  "pplx-space-common-core",
+  "pplx-space-ecw-credential",
+  "pplx-space-federated-grant-store",
+  "pplx-space-federated-identity",
+  "pplx-space-ingress-admission",
+  "pplx-space-k8s-node-id",
+  "pplx-space-node-registration-store",
+  "pplx-space-sandbox-quarantine-store",
+  "pplx-space-sandbox-routability",
+  "pplx-space-state-reconciliation",
+]
+pplx-space-metrics = [
+  "pplx-space-common-core",
+]
+pplx-space-object-store = [
+  "pplx-space-common-core",
+]
+pplx-space-observability = [
+  "pplx-space-cluster-id",
+  "pplx-space-common-core",
+]
+pplx-space-uds-peer-auth = [
+  "pplx-space-common-core",
+]
+
+[layers.domain_dependencies]
+pplx-space-common-core = [
+  "k8s-openapi",
+]
+pplx-space-net-common = [
+  "tokio",
+]
+pplx-space-spaced-common = [
+  "hyper-util",
+  "tokio",
+  "tokio-stream",
+  "tokio-util",
+  "tokio-vsock",
+]
+pplx-space-spaced-guest-protocol = [
+  "tokio",
+]
+
+[layers.model_protocol]
+pplx-space-common-core = [
+  "pplx-space-rpc-contracts",
+]
+pplx-space-spaced-common = [
+  "pplx-space-spaced-guest-protocol",
+]
+
+[layers.storage_access]
+pplx-space-accounts = [
+  "rusqlite",
+  "sqlx",
+]
+pplx-space-api = [
+  "deadpool-redis",
+  "redis",
+  "sqlx",
+]
+pplx-space-build-mgr = [
+  "pplx-space-object-store",
+]
+pplx-space-build-mgr-server = [
+  "pplx-space-common-jobs",
+  "rusqlite",
+]
+pplx-space-cluster-controller-server = [
+  "sqlx",
+]
+pplx-space-cluster-reconciler = [
+  "sqlx",
+]
+pplx-space-common-core = [
+  "rusqlite",
+  "sqlx",
+]
+pplx-space-common-svc = [
+  "pplx-space-postgres-contention",
+  "pplx-space-valkey",
+  "sqlx",
+]
+pplx-space-credmgr = [
+  "sqlx",
+]
+pplx-space-internal-api-server = [
+  "sqlx",
+]
+pplx-space-node-ctl-server = [
+  "pplx-space-sqlite",
+  "rusqlite",
+  "sqlx",
+]
+pplx-space-node-mgr = [
+  "pplx-space-sqlite",
+  "rusqlite",
+  "sqlx",
+]
+pplx-space-node-runtime-manager = [
+  "aws-sdk-s3",
+  "pplx-space-common-jobs",
+  "pplx-space-s3-http-client",
+  "pplx-space-sqlite",
+  "rusqlite",
+  "sqlx",
+]
+pplx-space-sbx-mgr = [
+  "pplx-space-common-jobs",
+]
+pplx-space-snapshot-retention = [
+  "sqlx",
+]
+pplx-space-state-reconciliation = [
+  "sqlx",
+]
+pplx-space-template-mgr = [
+  "pplx-space-common-jobs",
+  "pplx-space-sqlite",
+  "rusqlite",
+  "sqlx",
+]
+pplx-space-template-publisher = [
+  "pplx-space-object-store",
+]
+pplx-space-volmgr = [
+  "pplx-space-common-jobs",
+  "pplx-space-object-store",
+  "pplx-space-sqlite",
+  "rusqlite",
+  "sqlx",
+]
+
+[layers.unowned]
+postgres = [
+  "admin_audit_events",
+  "api_keys",
+  "clusters",
+  "data_plane_org_revocation_epochs",
+  "data_plane_session_output_events",
+  "data_plane_sessions",
+  "node_artifact_components",
+  "node_direct",
+  "node_facet_conditions",
+  "node_facet_observed_status",
+  "node_group_template_compat",
+  "node_groups",
+  "node_k8s",
+  "node_k8s_tombstones",
+  "node_local_backup_pending",
+  "node_reconcile_queue",
+  "node_runtime_guests",
+  "node_runtime_installations",
+  "node_runtime_state_formats",
+  "node_status_snapshots",
+  "node_template_components",
+  "node_template_inventory",
+  "nodes",
+  "org_branching_keys",
+  "org_credentials",
+  "org_master_keys",
+  "org_storage_vend_identities",
+  "organizations",
+  "public_idempotency_records",
+  "public_operation_events",
+  "public_operations",
+  "runtime_environments",
+  "runtime_upgrade_campaigns",
+  "runtime_upgrade_items",
+  "sandbox_archives",
+  "sandbox_direct_route_identities",
+  "sandbox_direct_route_provenance",
+  "sandbox_ecw_credential_epochs",
+  "sandbox_encrypted_fields",
+  "sandbox_k8s_executions",
+  "sandbox_observed_states",
+  "sandbox_port_exposures",
+  "sandbox_quarantine_history",
+  "sandbox_quarantine_state",
+  "sandbox_snapshot_inventory",
+  "sandbox_volume_encryption",
+  "sessions",
+  "snapshot_storage_location_encrypted_fields",
+  "template_base_snapshot_policies",
+  "template_build_base_grants",
+  "template_build_blobs",
+  "template_build_jobs",
+  "template_default_auto_lifecycle_policies",
+  "template_encrypted_fields",
+  "template_pool_policies",
+  "template_release_storage_location_encrypted_fields",
+  "template_release_storage_locations",
+  "template_release_tags",
+  "template_releases",
+  "template_system_publication_grants",
+  "template_tenant_publication_grants",
+  "templates",
+  "user_credentials",
+  "users",
+  "warm_pool_policies",
+]
+"sqlite.build-manager" = [
+  "build_job_results",
+  "jobs",
+]
+"sqlite.node-ctl" = [
+  "dirty_facets",
+  "dirty_node_state",
+  "facet_sync_overrides",
+  "reconciliation_status",
+]
+"sqlite.node-manager" = [
+  "network_pool_meta",
+  "network_slots",
+  "sandbox_executions",
+]
+"sqlite.runtime-manager" = [
+  "jobs",
+  "operation_results",
+]
+"sqlite.sandbox-manager" = [
+  "network_policy_reconcile_queue",
+]
+"sqlite.template-manager" = [
+  "jobs",
+  "node_dirty_refs",
+  "pools",
+  "template_build_components",
+  "template_builds",
+  "template_local_policy_sequence",
+  "template_network_policy_notifications",
+  "template_pinned_releases",
+  "template_pinned_tags",
+  "template_settings",
+  "template_snapshots",
+]
+"sqlite.volume-manager" = [
+  "jobs",
+  "volume_attachments",
+]
+
 # [crate_names] maps each workspace package with a catch-all name (a part such
 # as `common`, `utils` or `core`) to its member path. Only remove entries: a pull
 # request that adds one is reported, and fails the check.

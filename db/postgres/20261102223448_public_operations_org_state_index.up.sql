@@ -1,0 +1,37 @@
+-- no-transaction
+-- squawk-disable-assume-in-transaction
+-- An org's in-flight operations, for two org-scoped counts. The native sandbox
+-- quota counts the org's queued or running creates; the inline organization
+-- limit counts the org's running operations under a live admission claim. Both
+-- read the org's rows in those states through this index and apply their other
+-- filters (kind, product, claim token, claim time) after the read. No existing
+-- index has both org_id and state: through
+-- idx_public_operations_state_next_attempt the quota count reads every
+-- in-flight operation in the cluster and the inline count every running one,
+-- and through idx_public_operations_tenant_created either reads the org's whole
+-- retained history. claimed_at is not a key column: claim renewals set only
+-- claimed_at and updated_at, which no index covers, so they stay HOT updates.
+-- Not partial on the in-flight states: the migration guard forbids partial
+-- indexes (see db/README.md).
+--
+-- CONCURRENTLY because public_operations takes a write on every API mutation:
+-- a plain build holds SHARE on the table and would stall them for its
+-- duration. That makes this a single-statement `-- no-transaction` migration,
+-- which the migrator does not retry. A failed build can leave an INVALID index
+-- behind with no history row. There is no IF NOT EXISTS so that a rerun fails
+-- on that index instead of skipping it and recording the migration as applied.
+-- To recover, run this migration's down statement by hand and rerun; the
+-- migrator's `down` would roll back the previous migration, since this one has
+-- no history row.
+--
+-- The statement must be the file's only one, so it cannot set its own lock or
+-- statement timeout and runs under the session's (see db/README.md). Building
+-- concurrently takes SHARE UPDATE EXCLUSIVE, which does not block writers. It
+-- waits for every transaction in the database whose snapshot is older than its
+-- second scan, whatever tables that transaction reads, so a long-running one
+-- can hold the build past the session's lock timeout and leave an INVALID
+-- index.
+-- prefer-robust-stmts asks for the IF NOT EXISTS left out above.
+-- squawk-ignore require-lock-timeout, require-statement-timeout, prefer-robust-stmts
+CREATE INDEX CONCURRENTLY idx_public_operations_org_state
+    ON public.public_operations USING btree (org_id, state);
