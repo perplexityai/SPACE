@@ -92,25 +92,27 @@ def browser_unavailable(browser: str) -> str | None:
     """Why this environment cannot launch `browser` headless, or None when it can.
 
     The probe launches the browser rather than looking for its files: a build
-    that is present but cannot load its system libraries skips the same way.
+    that is present but cannot load its system libraries skips the same way,
+    and so does a Playwright driver that fails to start (an `OSError`, not
+    only Playwright's own `Error`).
     """
 
     if browser not in BROWSERS:
         return f"unknown browser {browser!r}"
     try:
-        from playwright.sync_api import Error, sync_playwright
+        from playwright.sync_api import sync_playwright
     except ImportError:
         return PLAYWRIGHT_MISSING
     try:
         with sync_playwright() as playwright:
             playwright.chromium.launch(headless=True).close()
-    except Error as error:
+    except Exception as error:  # noqa: BLE001 - any failure to launch is the bench lacking a browser
         return _launch_failure(error)
     return None
 
 
 def _launch_failure(error: Exception) -> str:
-    message = str(error)
+    message = str(error) or type(error).__name__
     if "Executable doesn't exist" in message:
         return f"Playwright's Chromium is not installed ({CHROMIUM_INSTALL})"
     if "error while loading shared libraries" in message:
@@ -684,27 +686,53 @@ class ConsoleAssertions:
             session, f"/dashboard/sandboxes/{public_id}", shows=public_id, what=f"the detail route for the {form}"
         )
 
-    def expect_search_finds(self, session: ConsoleSession, form: str, value: str, public_id: str) -> None:
-        """The sandbox list's search box narrows to exactly this sandbox."""
+    def _list_hrefs(self, session: ConsoleSession) -> list[str | None]:
+        rows = session.page.locator(".ant-table-tbody tr.ant-table-row")
+        return [row.locator("a").first.get_attribute("href") for row in rows.all()]
+
+    def expect_search_finds(
+        self, session: ConsoleSession, form: str, value: str, public_id: str, other_public_id: str
+    ) -> None:
+        """The sandbox list's search box narrows a list of both sandboxes to this one.
+
+        Each lookup starts from the cleared list showing `public_id` and
+        `other_public_id` together, so a list that ignores the typed value
+        fails here and one lookup's rows cannot stand in for the next's.
+        """
 
         page = session.page
         if session.path != "/dashboard/sandboxes":
             session.open("/dashboard/sandboxes")
         search = page.get_by_placeholder("ID, pod name or name")
-        search.fill(value)
-        rows = page.locator(".ant-table-tbody tr.ant-table-row")
+        search.fill("")
         target = f"/dashboard/sandboxes/{public_id}"
+        other = f"/dashboard/sandboxes/{other_public_id}"
+        before: list[str | None] = []
+        deadline = time.monotonic() + PAGE_TIMEOUT_MS / 1000
+        while time.monotonic() < deadline:
+            before = self._list_hrefs(session)
+            if target in before and other in before:
+                break
+            self._wait(0.5)
+        self._fixture.verify(
+            target in before and other in before,
+            f"the sandbox list did not show both sandboxes before searching by their {form}",
+            console_search_rows_before=before,
+            failure_evidence=self._evidence(session),
+        )
+        search.fill(value)
         hrefs: list[str | None] = []
         deadline = time.monotonic() + PAGE_TIMEOUT_MS / 1000
         while time.monotonic() < deadline:
-            hrefs = [row.locator("a").first.get_attribute("href") for row in rows.all()]
+            hrefs = self._list_hrefs(session)
             if hrefs == [target]:
                 break
             self._wait(0.5)
         self._fixture.verify(
             hrefs == [target],
-            f"the sandbox list's search did not find exactly the sandbox by its {form}",
+            f"the sandbox list's search did not narrow both sandboxes to exactly the one named by its {form}",
             console_search=value,
+            console_search_rows_before=before,
             console_search_rows=hrefs,
             failure_evidence=self._evidence(session),
         )

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from contextlib import redirect_stderr, redirect_stdout
+import sys
+import types
+from contextlib import AbstractContextManager, redirect_stderr, redirect_stdout
 from io import StringIO
 from unittest import mock
 
@@ -110,6 +112,75 @@ def test_require_fails_a_selection_of_only_browser_scenarios():
     assert status == 2
     assert ran == ()
     assert "SPACE_SMOKE_BROWSER_SCENARIOS=require, but" in stderr
+
+
+class _PlaywrightError(Exception):
+    pass
+
+
+def _playwright(*, start: Exception | None = None, launch: Exception | None = None) -> AbstractContextManager[object]:
+    """A stand-in for `playwright.sync_api` whose driver start or browser launch fails."""
+
+    module = types.ModuleType("playwright.sync_api")
+    driver = mock.MagicMock()
+    driver.chromium.launch.side_effect = launch
+    manager = mock.MagicMock()
+    manager.__enter__.side_effect = start
+    manager.__enter__.return_value = driver
+    module.Error = _PlaywrightError  # type: ignore[attr-defined]
+    module.sync_playwright = mock.Mock(return_value=manager)  # type: ignore[attr-defined]
+    package = types.ModuleType("playwright")
+    package.sync_api = module  # type: ignore[attr-defined]
+    return mock.patch.dict(sys.modules, {"playwright": package, "playwright.sync_api": module})
+
+
+DRIVER_FAILURES = {
+    "the driver cannot start": {"start": OSError("[Errno 2] No such file or directory: 'node'")},
+    "the launch raises OSError": {"launch": OSError("[Errno 24] Too many open files")},
+    "the launch raises Playwright's error": {"launch": _PlaywrightError("Executable doesn't exist at /x")},
+}
+
+
+@pytest.mark.parametrize("failure", DRIVER_FAILURES.values(), ids=DRIVER_FAILURES.keys())
+def test_a_browser_that_fails_to_launch_is_unavailable_with_a_reason(failure):
+    with _playwright(**failure):
+        reason = console_module.browser_unavailable("chromium")
+    assert reason is not None
+    assert reason.startswith("Playwright's Chromium ")
+
+
+def test_a_browser_that_launches_is_available():
+    with _playwright():
+        assert console_module.browser_unavailable("chromium") is None
+
+
+@pytest.mark.parametrize("failure", DRIVER_FAILURES.values(), ids=DRIVER_FAILURES.keys())
+@pytest.mark.parametrize("selection", [None, "run"])
+def test_run_skips_them_when_the_browser_fails_to_launch(failure, selection):
+    services = _services(None)
+    services.browser_unavailable.side_effect = console_module.browser_unavailable
+    environment = {} if selection is None else {"SPACE_SMOKE_BROWSER_SCENARIOS": selection}
+    with _playwright(**failure):
+        status, ran, stdout, stderr = _run(environment, services)
+    assert status == 0
+    assert ran and not BROWSER_IDS & set(ran)
+    for scenario_id in BROWSER_IDS:
+        assert f"SKIPPED {scenario_id}: needs a chromium browser; Playwright's Chromium " in stdout
+    assert "ERROR" not in stderr
+
+
+@pytest.mark.parametrize("failure", DRIVER_FAILURES.values(), ids=DRIVER_FAILURES.keys())
+def test_require_fails_the_suite_when_the_browser_fails_to_launch(failure):
+    services = _services(None)
+    services.browser_unavailable.side_effect = console_module.browser_unavailable
+    with _playwright(**failure):
+        status, ran, stdout, stderr = _run({"SPACE_SMOKE_BROWSER_SCENARIOS": "require"}, services)
+    assert status == 2
+    assert ran and not BROWSER_IDS & set(ran)
+    assert "SKIPPED local.console_" not in stdout
+    assert "SPACE_SMOKE_BROWSER_SCENARIOS=require, but" in stderr
+    for scenario_id in BROWSER_IDS:
+        assert scenario_id in stderr
 
 
 def test_require_runs_them_where_the_browser_launches():
@@ -252,3 +323,102 @@ def test_operations_match_each_record_by_id_and_rendered_fields():
     # A record shown in a state the API no longer reports.
     assert not operations_match(recorded, [*recorded[:-1], _operation("op-4", "suspend_sandbox", "running")])
     assert operations_match([], [])
+
+
+class _Row:
+    def __init__(self, href: str) -> None:
+        self.href = href
+
+    @property
+    def first(self) -> _Row:
+        return self
+
+    def locator(self, _selector: str) -> _Row:
+        return self
+
+    def get_attribute(self, _name: str) -> str:
+        return self.href
+
+
+class _Search:
+    def __init__(self, listing: _Listing) -> None:
+        self.listing = listing
+
+    def fill(self, value: str) -> None:
+        self.listing.typed = value
+
+
+class _Rows:
+    def __init__(self, listing: _Listing) -> None:
+        self.listing = listing
+
+    def all(self) -> list[_Row]:
+        return [_Row(href) for href in self.listing.shown()]
+
+
+class _Listing(_Page):
+    """The sandbox list: the sandboxes it holds, narrowed by the typed text unless it ignores it."""
+
+    def __init__(self, held: dict[str, str], *, filters: bool) -> None:
+        super().__init__()
+        self.held = held
+        self.filters = filters
+        self.typed = ""
+
+    def shown(self) -> list[str]:
+        return [
+            f"/dashboard/sandboxes/{public_id}"
+            for public_id, name in self.held.items()
+            if not self.filters or not self.typed or self.typed in (public_id, name)
+        ]
+
+    def get_by_placeholder(self, _text: str) -> _Search:
+        return _Search(self)
+
+    def locator(self, _selector: str) -> _Rows:
+        return _Rows(self)
+
+
+def _search_console(listing: _Listing) -> tuple[ConsoleAssertions, ConsoleSession]:
+    control = mock.Mock()
+    control.console_url.return_value = "http://127.0.0.1:3000"
+    fixture = mock.Mock()
+
+    def verify(condition: bool, message: str, **_: object) -> None:
+        if not condition:
+            raise AssertionError(message)
+
+    fixture.verify.side_effect = verify
+    console = ConsoleAssertions(fixture, control, ResourceScope())
+    listing.url = "http://127.0.0.1:3000/dashboard/sandboxes"
+    session = ConsoleSession(console, listing, "operator")  # type: ignore[arg-type]
+    console._sessions.append(session)
+    return console, session
+
+
+TARGET, OTHER = "sbx_00000000-0000-4000-8000-000000000001", "sbx_00000000-0000-4000-8000-000000000002"
+
+
+def test_a_search_that_narrows_the_list_to_the_target_passes():
+    listing = _Listing({TARGET: "target", OTHER: "other"}, filters=True)
+    console, session = _search_console(listing)
+    with mock.patch.object(console_module, "PAGE_TIMEOUT_MS", 50):
+        console.expect_search_finds(session, "public id", TARGET, TARGET, OTHER)
+        console.expect_search_finds(session, "name", "target", TARGET, OTHER)
+    assert listing.typed == ""
+
+
+def test_a_list_that_ignores_the_typed_id_fails_the_search():
+    listing = _Listing({TARGET: "target", OTHER: "other"}, filters=False)
+    console, session = _search_console(listing)
+    with mock.patch.object(console_module, "PAGE_TIMEOUT_MS", 50):
+        with pytest.raises(AssertionError, match="did not narrow both sandboxes"):
+            console.expect_search_finds(session, "public id", TARGET, TARGET, OTHER)
+
+
+def test_a_search_cannot_start_from_a_list_that_lacks_the_other_sandbox():
+    listing = _Listing({TARGET: "target"}, filters=False)
+    console, session = _search_console(listing)
+    with mock.patch.object(console_module, "PAGE_TIMEOUT_MS", 50):
+        with pytest.raises(AssertionError, match="did not show both sandboxes"):
+            console.expect_search_finds(session, "public id", TARGET, TARGET, OTHER)

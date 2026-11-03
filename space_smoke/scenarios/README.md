@@ -122,8 +122,8 @@ through Playwright's Chromium and judge each page against the admin API it
 renders (`space_smoke/console.py`):
 
 - `local.console_sandbox_lookup_accepts_every_id_form`: the `sbx_` ID, bare
-  and undashed UUID, and pod name each open the sandbox's page and narrow the
-  list's search to it; an ID of no sandbox is not found.
+  and undashed UUID, and pod name each open the sandbox's page and narrow a
+  list of it and a second sandbox to it; an ID of no sandbox is not found.
 - `local.console_sandbox_detail_complete_in_every_state`: running, suspended
   and deleted, the page shows the record, the valid lifecycle moves, and the
   recorded operations.
