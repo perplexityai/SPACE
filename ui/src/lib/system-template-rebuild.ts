@@ -54,6 +54,13 @@ export interface RebuildRun {
   codeRuntime: BuildJob | null;
   // A build request whose outcome is unknown (it may have been accepted).
   submitUnknown: Partial<Record<SystemTemplate, string>>;
+  // Absent in runs stored before these were recorded, and read as empty.
+  // `keyGeneration` counts each "Start a new build", which sends a new
+  // Idempotency-Key (`systemBuildIdempotencyKey`). `keyClosed` is a key the
+  // API answers only with a non-retryable 409 (`submitFailureText`), with the
+  // job it named, if any: building again with it can only answer the same.
+  keyGeneration?: Partial<Record<SystemTemplate, number>>;
+  keyClosed?: Partial<Record<SystemTemplate, { jobId: string | null }>>;
   testSandboxes: Partial<Record<SystemTemplate, TestSandbox>>;
   promotion: Promotion | null;
 }
@@ -148,7 +155,8 @@ export function acceptJob(stored: RebuildRun | null, runId: string, template: Sy
   const existing = jobOf(stored, template);
   if (existing) return { kind: 'extra', existing };
   const { [template]: _dropped, ...submitUnknown } = stored.submitUnknown;
-  return { kind: 'recorded', run: withJob({ ...stored, submitUnknown }, template, job) };
+  const { [template]: _closed, ...keyClosed } = stored.keyClosed ?? {};
+  return { kind: 'recorded', run: withJob({ ...stored, submitUnknown, keyClosed }, template, job) };
 }
 
 // What the tab that sent a build says about its answer: nothing when the
@@ -224,35 +232,82 @@ function failure(err: unknown): { status: number | null; message: string } {
 }
 const refused = (status: number | null) => status !== null && status >= 400 && status < 500;
 
-// The build's Idempotency-Key: one per run and template, so building again
-// after an unknown outcome resends the same key. A release that honours it
-// answers with the first build instead of starting a second; older releases
-// ignore the header.
-export function systemBuildIdempotencyKey(runId: string, template: SystemTemplate): string {
-  return `system-build:${runId}:${template}`;
+// The build's Idempotency-Key: one per run, template and generation, so
+// building again after an unknown outcome resends the same key. A release
+// that honours it answers with the first build when it recorded one, a
+// retryable 409 while the first request may still be being submitted, and a
+// non-retryable 409 once that request's outcome is unknown, from then on.
+// Older releases ignore the header. Generation 0 keeps the key runs used
+// before generations existed.
+export function systemBuildIdempotencyKey(runId: string, template: SystemTemplate, generation = 0): string {
+  return generation > 0 ? `system-build:${runId}:${template}:${generation}` : `system-build:${runId}:${template}`;
 }
 
-// A 409 that names `reserved_at` is about an earlier request with the same
-// Idempotency-Key whose build may be running (still being submitted, or its
-// outcome unknown), not a refusal.
-function sameKeyStillOpen(err: unknown): boolean {
+export function buildKeyGeneration(run: RebuildRun, template: SystemTemplate): number {
+  return run.keyGeneration?.[template] ?? 0;
+}
+
+export function buildKeyClosed(run: RebuildRun, template: SystemTemplate): { jobId: string | null } | null {
+  return run.keyClosed?.[template] ?? null;
+}
+
+// "Start a new build": the next build of `template` sends a new key, and the
+// closed key's notice is cleared. The earlier build may still be running and
+// publish a release of its own.
+export function withNewBuildKey(run: RebuildRun, template: SystemTemplate): RebuildRun {
+  const { [template]: _closed, ...keyClosed } = run.keyClosed ?? {};
+  const { [template]: _unknown, ...submitUnknown } = run.submitUnknown;
+  return {
+    ...run,
+    submitUnknown,
+    keyClosed,
+    keyGeneration: { ...run.keyGeneration, [template]: buildKeyGeneration(run, template) + 1 },
+  };
+}
+
+// The 409 a release that honours the key answers when an earlier request
+// with the same key is not settled: its `details` name `reserved_at`, and
+// `job_id` when the builder named a job. `retryable` is true while that
+// request may still be being submitted, and false once its outcome is unknown.
+function sameKeyConflict(err: unknown): { retryable: boolean; jobId: string | null } | null {
   const body = (err as { body?: unknown })?.body;
-  const details = body && typeof body === 'object' ? (body as { details?: unknown }).details : null;
-  return Array.isArray(details) && details.some((detail) => (detail as { key?: unknown })?.key === 'reserved_at');
+  if (!body || typeof body !== 'object') return null;
+  const { details, retryable } = body as { details?: unknown; retryable?: unknown };
+  if (!Array.isArray(details)) return null;
+  const value = (key: string) => {
+    const detail = details.find((candidate) => (candidate as { key?: unknown })?.key === key) as { value?: unknown } | undefined;
+    return typeof detail?.value === 'string' && detail.value ? detail.value : null;
+  };
+  if (value('reserved_at') === null) return null;
+  return { retryable: retryable !== false, jobId: value('job_id') };
 }
 
-export function submitFailureText(template: SystemTemplate, err: unknown): { known: boolean; text: string } {
+export function submitFailureText(
+  template: SystemTemplate,
+  err: unknown,
+): { known: boolean; text: string; closed?: { jobId: string | null } } {
   const { status, message } = failure(err);
-  if (status === 409 && sameKeyStillOpen(err)) {
-    return { known: false, text: `The ${template} build may already be running: ${message}` };
+  const conflict = status === 409 ? sameKeyConflict(err) : null;
+  if (conflict && conflict.retryable) {
+    return { known: false, text: `The ${template} build may still be being submitted; build again shortly: ${message}` };
+  }
+  if (conflict) {
+    return {
+      known: false,
+      closed: { jobId: conflict.jobId },
+      text: `The ${template} build sent earlier has an unknown outcome: it may have started and may still be running` +
+        `${conflict.jobId ? ` as job ${conflict.jobId}` : ''}. Building again with the same request answers the same. ` +
+        'Check Template Releases and the template\'s builds; start a new build only if neither shows it.',
+    };
   }
   if (refused(status)) return { known: true, text: `The ${template} build was not started: ${message}` };
   return {
     known: false,
     text: `The ${template} build request failed (${message}), and the builder may have accepted it. An accepted build ` +
-      'appears in Template Releases only when it finishes. Building again resends this request, which an API release ' +
-      'that honours its Idempotency-Key answers with the first build; an older release starts a second job: wait, ' +
-      'refresh Template Releases, and build again only if no new release appears.',
+      'appears in Template Releases only when it finishes. Building again resends the same Idempotency-Key: an API ' +
+      'release that recorded the first build answers with it, one that could not tell whether the builder took it ' +
+      'says so (and offers a new build), and an older release starts a second job. Wait, refresh Template Releases, ' +
+      'and build again only if no new release appears.',
   };
 }
 
@@ -420,6 +475,10 @@ function isRun(v: unknown): v is RebuildRun {
     // A code-runtime job only ever follows a seed that succeeded.
     && (v.codeRuntime === null || buildSucceeded(v.seed as BuildJob | null))
     && isObject(v.submitUnknown) && Object.entries(v.submitUnknown).every(([k, t]) => (k === 'seed' || k === 'code-runtime') && typeof t === 'string')
+    && (v.keyGeneration === undefined || (isObject(v.keyGeneration) && Object.entries(v.keyGeneration)
+      .every(([k, n]) => (k === 'seed' || k === 'code-runtime') && Number.isInteger(n) && (n as number) >= 0)))
+    && (v.keyClosed === undefined || (isObject(v.keyClosed) && Object.entries(v.keyClosed)
+      .every(([k, c]) => (k === 'seed' || k === 'code-runtime') && isObject(c) && (c.jobId === null || typeof c.jobId === 'string'))))
     && isObject(v.testSandboxes) && Object.entries(v.testSandboxes).every(([k, t]) => (k === 'seed' || k === 'code-runtime')
       && isObject(t) && typeof t.id === 'string' && t.id.length > 0 && typeof t.createdAt === 'string')
     && (v.promotion === null || isPromotion(v.promotion));

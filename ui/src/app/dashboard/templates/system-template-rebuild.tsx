@@ -3,12 +3,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import Link from 'next/link';
-import { Alert, App, Button, Checkbox, Modal, Space, Table, Typography } from 'antd';
+import { Alert, App, Button, Checkbox, Modal, Popconfirm, Space, Table, Typography } from 'antd';
 import { ApiError, adminApi } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 import { idempotencyKey, postPublicOperation } from '@/lib/public-api';
-import { LATEST_TAG, TAG_PRECONDITION_UNCHECKED, currentTagHolder, errorMessage, shortHash, tagMoveFailureMessage } from '@/lib/template-format';
-import { sendWithOptionalField } from '@/lib/admin-fallback';
+import { LATEST_TAG, currentTagHolder, errorMessage, shortHash } from '@/lib/template-format';
+import { TAG_PRECONDITION_UNCHECKED, moveReleaseTag, tagMoveFailureMessage } from '@/lib/admin-fallback';
 import type { TemplateBuildStart, TemplateBuildStatus, TemplateRelease } from '@/lib/types';
 import {
   BuildJob,
@@ -41,7 +41,10 @@ import {
   sandboxOutcomeNotice,
   storageKey,
   submitFailureText,
+  buildKeyClosed,
+  buildKeyGeneration,
   systemBuildIdempotencyKey,
+  withNewBuildKey,
   systemBuildRequest,
   testSandboxFailureText,
   testSandboxName,
@@ -334,7 +337,7 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
       const accepted = await adminApi.post<TemplateBuildStart>(
         `/v1/system-templates/${template}/builds`,
         systemBuildRequest(template, seedHash),
-        { 'Idempotency-Key': systemBuildIdempotencyKey(current.runId, template) },
+        { 'Idempotency-Key': systemBuildIdempotencyKey(current.runId, template, buildKeyGeneration(current, template)) },
       );
       const job: BuildJob = { job_id: accepted.job_id, state: 'pending', content_hash: null, error: null, lost: false };
       const recorded = await exclusive(lockName, () => {
@@ -346,8 +349,24 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
     } catch (err) {
       const failure = submitFailureText(template, err);
       if (failure.known) message.error(failure.text);
-      else await update(current.runId, (latest) => (jobOf(latest, template) ? null : { ...latest, submitUnknown: { ...latest.submitUnknown, [template]: failure.text } }));
+      else await update(current.runId, (latest) => (jobOf(latest, template) ? null : {
+        ...latest,
+        submitUnknown: { ...latest.submitUnknown, [template]: failure.text },
+        keyClosed: failure.closed ? { ...latest.keyClosed, [template]: failure.closed } : latest.keyClosed,
+      }));
     }
+  });
+
+  // A key the API answers only with "outcome unknown": the next build sends a
+  // new one. The first build may still be running and publish a release.
+  const startNewBuild = (template: SystemTemplate) => withBusy(`new-build:${template}`, async () => {
+    const runId = runRef.current?.runId;
+    if (!runId) return;
+    await update(runId, (latest) => (jobOf(latest, template) || !buildKeyClosed(latest, template) ? null : withNewBuildKey(latest, template)));
+    // Built only once the new key is saved, so the request cannot resend the
+    // closed one.
+    const saved = live(runId);
+    if (saved && !buildKeyClosed(saved, template)) await build(template);
   });
 
   const createTestSandbox = (template: SystemTemplate) => withBusy(`test:${template}`, async () => {
@@ -447,13 +466,13 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
       }
       try {
         // Moved only while `latest` still points where the plan read it.
-        const { fieldAccepted } = await sendWithOptionalField(
-          (body) => adminApi.put(`/v1/template-releases/${release.id}/tag`, body),
-          { tag: LATEST_TAG },
-          'expected_current_release_id',
+        const { checked } = await moveReleaseTag(
+          (path, body) => adminApi.put(path, body),
+          release.id,
+          LATEST_TAG,
           currentTagHolder(fresh, row.template, LATEST_TAG),
         );
-        if (!fieldAccepted) preconditionUnchecked = true;
+        if (!checked) preconditionUnchecked = true;
       } catch (err) {
         // The tag route can commit and still answer an error: the read below decides.
         requestError = `the ${row.template} tag request answered: ${tagMoveFailureMessage(err)}`;
@@ -523,6 +542,7 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
   const buildRow = (template: SystemTemplate) => {
     const job = jobOf(run, template);
     const unknown = run.submitUnknown[template];
+    const closed = buildKeyClosed(run, template);
     const test = run.testSandboxes[template];
     let state: ReactNode;
     if (!job) {
@@ -535,7 +555,20 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
       state = <>{job.state === 'pending' ? 'Queued' : 'Building'} <Text type="secondary">(job {job.job_id})</Text></>;
     }
     const actions: ReactNode[] = [];
-    if (canBuild(run, template)) {
+    if (canBuild(run, template) && closed) {
+      actions.push(
+        <Popconfirm
+          key="new-build"
+          title={`Start a new ${template} build?`}
+          description="It sends a new request. If the earlier build is still running, both publish a release."
+          onConfirm={() => void startNewBuild(template)}
+        >
+          <Button type="primary" size="small" loading={busy.has(`new-build:${template}`) || busy.has(`build:${template}`)}>
+            Start a new build
+          </Button>
+        </Popconfirm>,
+      );
+    } else if (canBuild(run, template)) {
       actions.push(
         <Button key="build" type="primary" size="small" loading={busy.has(`build:${template}`)} onClick={() => void build(template)}>
           {template === 'seed' ? 'Build seed' : `Build code-runtime on seed@${shortHash(run.seed?.content_hash, '')}`}
@@ -557,6 +590,13 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
         <Space orientation="vertical" size={2}>
           {state}
           {unknown ? <Text type="warning">{unknown}</Text> : null}
+          {closed ? (
+            <Text type="secondary">
+              {closed.jobId ? <>Job <Text code copyable>{closed.jobId}</Text>: </> : null}
+              see <a href="#template-releases">Template Releases</a> below, and the {template} row&apos;s builds in the
+              Templates table above.
+            </Text>
+          ) : null}
           {trouble[template] ? <Text type="warning">{trouble[template]!.text.replace(/\.$/, '')}. Retrying in {Math.round(pollDelayMs(trouble[template]!.failures) / 1000)} s.</Text> : null}
           {test ? (
             <Text>
