@@ -381,6 +381,12 @@ impl SandboxController {
     /// `fetch_sandbox_observed_states`): the row's template, else the node's,
     /// else the template the node's inventory holds for the image it runs,
     /// else the pool's; the node's status, else the stored lifecycle.
+    ///
+    /// Postgres applies the `deleted` filter at the `FULL JOIN`, below the
+    /// inventory lookup, so the many stored `deleted` rows no node reports
+    /// cost a hash probe each. Dropping them from `sandboxes` first measured
+    /// slower as an `EXISTS`, and a hashed `IN` turns into a per-row subplan
+    /// once the observed rows outgrow `hash_mem`.
     pub async fn admin_spaced_version_counts(
         &self,
         pool: &PgPool,
