@@ -1,11 +1,38 @@
-//! What a Native `files:*` request means to its idempotency key, for every
-//! server that answers one: the fingerprint a mutation's key is bound to, and
-//! the key the sandbox sees for it.
+//! Native `files:*` request handling for every server that answers it: the
+//! size limits and field checks, the worker requests each operation sends,
+//! how a failed sandbox call reads to the client, and what a request means to
+//! its idempotency key.
 //!
-//! Both are persisted or replayed by key: the binding lives in the control
-//! plane's idempotency records, and the sandbox remembers the guest key. A
-//! retry that lands on another server must derive the same values, so the
-//! encodings here change only together with every reader of the old ones.
+//! The key's meaning is persisted or replayed by key: the binding lives in
+//! the control plane's idempotency records, and the sandbox remembers the
+//! guest key. A retry that lands on another server must derive the same
+//! values, so the encodings here change only together with every reader of
+//! the old ones.
+
+mod failure;
+pub mod limits;
+mod parents;
+mod request;
+mod worker;
+
+pub use failure::{
+    FileCallError, FileCallErrorKind, FileCallFailure, WorkerFailure, file_call_error,
+    unprotected_mutation_error,
+};
+pub use parents::{deepest_parent_directories, write_creating_parents, write_parent_directory};
+pub use request::{
+    FileRequestError, admit_list_entry, decode_write_batch_entries, decode_write_chunks,
+    decode_write_payload, list_depth, parse_guest_path, parse_guest_user,
+    validate_modified_filters, validate_read_length, validate_tracking_enabled,
+    validate_write_batch_shape,
+};
+pub use worker::{
+    disable_file_changes_request, enable_file_changes_request, list_request,
+    modified_files_request, modified_files_response, public_file_event_kind, public_file_info,
+    public_file_type, read_request, remove_request, rename_request, shared_spaced_write_requests,
+    spaced_mkdir_request, spaced_write_requests, stat_request, timestamp_to_rfc3339,
+    write_batch_request,
+};
 
 use pplx_space_guest_process::{GuestUserName, IdempotencyKey, ProcessParseError};
 use pplx_space_public_api::{PublicApiParseError, RequestFingerprint, routes::NativeOperation};

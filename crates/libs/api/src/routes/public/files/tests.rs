@@ -1,5 +1,14 @@
-use pplx_space_common_core::types::SandboxId;
-use pplx_space_public_api::PublicSandboxId;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use pplx_space_common_core::types::{GuestUserName, SandboxId};
+use pplx_space_native_files::limits::{
+    FILE_WRITE_CHUNK_BYTES, MAX_FILE_READ_BYTES, MAX_FILE_WRITE_BYTES,
+};
+use pplx_space_native_files::{
+    decode_write_payload, deepest_parent_directories, public_file_event_kind, public_file_type,
+    spaced_mkdir_request, write_parent_directory,
+};
+use pplx_space_public_api::{FileEventKind, FileType, PublicSandboxId};
+use pplx_space_sbx_mgr_client::proto::{SpacedFileInfo, SpacedFileType, spaced_write_request};
 
 use super::*;
 
@@ -1021,7 +1030,8 @@ mod write_creating_parents {
             },
             SandboxId::new(),
         )
-        .await;
+        .await
+        .map_err(controller_error);
         (result, guest)
     }
 

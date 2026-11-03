@@ -219,13 +219,11 @@ impl SandboxController {
             )
             .await?;
         client
-            .spaced_stat(SpacedStatRequest {
-                sandbox_id: id.to_string(),
-                operation: Some(spaced_ops::StatRequest {
-                    path,
-                    user: user.map(|user| user.as_str().to_string()),
-                }),
-            })
+            .spaced_stat(pplx_space_native_files::stat_request(
+                id,
+                path,
+                user.as_ref(),
+            ))
             .await
     }
 
@@ -246,14 +244,12 @@ impl SandboxController {
             )
             .await?;
         client
-            .spaced_list(SpacedListRequest {
-                sandbox_id: id.to_string(),
-                operation: Some(spaced_ops::ListRequest {
-                    path: options.path,
-                    depth: options.depth,
-                    user: options.user.map(|user| user.as_str().to_string()),
-                }),
-            })
+            .spaced_list(pplx_space_native_files::list_request(
+                id,
+                options.path,
+                options.depth,
+                options.user.as_ref(),
+            ))
             .await
     }
 

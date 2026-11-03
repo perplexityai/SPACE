@@ -522,41 +522,20 @@ pub(crate) fn pool_store_error(
 
 impl From<tonic::Status> for ControllerError {
     fn from(status: tonic::Status) -> Self {
-        if is_guest_storage_full(&status) {
-            // Retrying cannot succeed until something frees space in the
-            // sandbox, so this must not surface as a retryable rate limit.
-            return Self::new(
-                StatusCode::PRECONDITION_FAILED,
-                format!("sandbox storage is full: {}", status.message()),
-            );
-        }
-        // The backend's own message, not tonic's `code: …, message: …`
-        // rendering, and its retry hint (a refusal made before anything
-        // started carries one) as `Retry-After`.
-        let mut error = Self::new(
-            http_status_for_grpc_code(status.code()),
-            status.message().to_owned(),
-        );
-        error.refused_before_start = pplx_space_common_grpc::is_refused_before_start(&status);
-        error.guest_path_not_found = pplx_space_common_grpc::is_guest_path_not_found(&status);
-        match pplx_space_common_grpc::retry_after(&status) {
-            Some(try_again) => error.with_retry_after_header(
-                try_again.clamp(Duration::from_secs(1), Duration::from_secs(60)),
-            ),
+        use pplx_space_native_files::FileCallFailure as _;
+        let failure = pplx_space_native_files::WorkerFailure::from_status(&status);
+        let http_status = failure.status();
+        let retry_after = failure.retry_after();
+        let refused_before_start = failure.is_refused_before_start();
+        let guest_path_not_found = failure.is_guest_path_not_found();
+        let mut error = Self::new(http_status, failure.into_message());
+        error.refused_before_start = refused_before_start;
+        error.guest_path_not_found = guest_path_not_found;
+        match retry_after {
+            Some(try_again) => error.with_retry_after_header(try_again),
             None => error,
         }
     }
-}
-
-/// Whether a guest filesystem call failed because the sandbox's disk or quota
-/// is full, as the guest marks it.
-fn is_guest_storage_full(status: &tonic::Status) -> bool {
-    status.code() == tonic::Code::ResourceExhausted
-        && status
-            .metadata()
-            .get(pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY)
-            .and_then(|reason| reason.to_str().ok())
-            == Some(pplx_space_common_core::spaced::GUEST_STORAGE_FULL)
 }
 
 impl IntoResponse for ControllerError {
@@ -595,28 +574,6 @@ pub(crate) fn retry_after_header_value(retry_after: Duration) -> Option<header::
             .to_string(),
     )
     .ok()
-}
-
-fn http_status_for_grpc_code(code: tonic::Code) -> StatusCode {
-    match code {
-        tonic::Code::Ok => StatusCode::INTERNAL_SERVER_ERROR,
-        tonic::Code::Cancelled => StatusCode::REQUEST_TIMEOUT,
-        tonic::Code::Unknown => StatusCode::INTERNAL_SERVER_ERROR,
-        tonic::Code::InvalidArgument => StatusCode::BAD_REQUEST,
-        tonic::Code::DeadlineExceeded => StatusCode::GATEWAY_TIMEOUT,
-        tonic::Code::NotFound => StatusCode::NOT_FOUND,
-        tonic::Code::AlreadyExists => StatusCode::CONFLICT,
-        tonic::Code::PermissionDenied => StatusCode::FORBIDDEN,
-        tonic::Code::ResourceExhausted => StatusCode::TOO_MANY_REQUESTS,
-        tonic::Code::FailedPrecondition => StatusCode::PRECONDITION_FAILED,
-        tonic::Code::Aborted => StatusCode::CONFLICT,
-        tonic::Code::OutOfRange => StatusCode::BAD_REQUEST,
-        tonic::Code::Unimplemented => StatusCode::NOT_IMPLEMENTED,
-        tonic::Code::Internal => StatusCode::INTERNAL_SERVER_ERROR,
-        tonic::Code::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
-        tonic::Code::DataLoss => StatusCode::INTERNAL_SERVER_ERROR,
-        tonic::Code::Unauthenticated => StatusCode::UNAUTHORIZED,
-    }
 }
 
 impl From<crate::federated_identity::MaterializeOwnerError> for ControllerError {
