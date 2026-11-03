@@ -1876,6 +1876,77 @@ async fn admin_operation_listing_can_filter_across_tenants() -> TestResult {
     Ok(())
 }
 
+/// The admin reads name each operation's actor by the email the user has
+/// now. Deleting the user clears the operation's actor, so it reads as an
+/// operation without one: no actor id and no email.
+#[tokio::test]
+async fn admin_operations_name_the_actor_by_email() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let kept = UserId::from_uuid(seed_user(&db.pool, org_id).await?);
+    let gone = UserId::from_uuid(seed_user(&db.pool, org_id).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let mut operations = Vec::new();
+    for actor_user_id in [kept, gone] {
+        let operation = store
+            .create_operation(CreatePublicOperation {
+                org_id,
+                actor_user_id: Some(actor_user_id),
+                api_product: ApiProduct::Native,
+                kind: OperationKind::WakeSandbox,
+                target_type: Some(OperationTargetType::Sandbox),
+                target_id: Some("sbx_demo"),
+                payload_json: serde_json::json!({}),
+                idempotency: None,
+                traceparent: None,
+            })
+            .await?
+            .expect_created();
+        operations.push(operation);
+    }
+    sqlx::query(sql!("UPDATE users SET email = $2 WHERE id = $1"))
+        .bind(kept)
+        .bind("renamed-actor@example.test")
+        .execute(&db.pool)
+        .await?;
+    sqlx::query(sql!("DELETE FROM users WHERE id = $1"))
+        .bind(gone)
+        .execute(&db.pool)
+        .await?;
+
+    let listed = store
+        .list_operations_admin(ListAdminPublicOperations {
+            limit: 10,
+            org_id: Some(org_id),
+            state: None,
+            kind: None,
+            target_type: None,
+            target_id: None,
+        })
+        .await?;
+    let expected = [
+        (Some(kept), Some("renamed-actor@example.test")),
+        (None, None),
+    ];
+    for (operation_id, (actor_user_id, actor_email)) in operations.iter().zip(expected) {
+        let listed = listed
+            .iter()
+            .find(|operation| operation.id == *operation_id)
+            .expect("the operation is listed");
+        assert_eq!(listed.actor_user_id, actor_user_id, "listed actor");
+        assert_eq!(listed.actor_email.as_deref(), actor_email, "listed");
+        let fetched = store
+            .fetch_operation_admin(*operation_id)
+            .await?
+            .expect("the operation exists");
+        assert_eq!(fetched.actor_user_id, actor_user_id, "fetched actor");
+        assert_eq!(fetched.actor_email.as_deref(), actor_email, "fetched");
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn gc_expired_removes_terminal_operations_and_idempotency_records() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {

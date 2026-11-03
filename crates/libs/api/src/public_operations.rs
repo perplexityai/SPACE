@@ -33,8 +33,9 @@ const DEFAULT_OPERATION_GC_DAYS: i64 = 7;
 /// needs is selected here and decoded in [`PublicOperationRow`]; a record
 /// that exposes it also needs the field and its line in that record's
 /// `TryFrom`. The two admin reads (`fetch_operation_admin`,
-/// `list_operations_admin`) select one more expression, so they spell this
-/// list out and need the new column added there too.
+/// `list_operations_admin`) also select the payload's `requested_by_user_id`
+/// and the joined actor's email, with every column qualified by its table, so
+/// they spell this list out and need the new column added there too.
 const PUBLIC_OPERATION_COLUMNS: &str = "operation_id,
        org_id,
        actor_user_id,
@@ -461,7 +462,8 @@ impl PublicOperationStore {
     /// The admin reads list every [`PublicOperationRow`] column and, for a
     /// sandbox create, the payload's `requested_by_user_id`, which only the
     /// admin record exposes. No other kind's payload defines that key, so
-    /// they never read it.
+    /// they never read it. They also join the actor's current email, so a
+    /// page of operations names its actors without a read per row.
     ///
     /// They spell the column list out rather than take
     /// [`PUBLIC_OPERATION_COLUMNS`], whose fragment may only be a statement's
@@ -471,30 +473,32 @@ impl PublicOperationStore {
         operation_id: OperationId,
     ) -> Result<Option<AdminPublicOperationRecord>, PublicOperationStoreError> {
         let row = sqlx::query_as::<_, AdminPublicOperationRow>(sql!(
-            "SELECT operation_id,
-                        org_id,
-                        actor_user_id,
-                        api_product,
-                        kind,
-                        target_type,
-                        target_id,
-                        state,
-                        progress_message,
-                        terminal_error_code,
-                        terminal_error_json,
-                        result_json,
-                        attempts,
-                        requested_at,
-                        next_attempt_at,
-                        created_at,
-                        started_at,
-                        completed_at,
-                        updated_at,
-                        CASE WHEN kind = $2
-                             THEN payload_json ->> 'requested_by_user_id'
-                        END AS requested_by_user_id
-               FROM public_operations
-              WHERE operation_id = $1"
+            "SELECT op.operation_id,
+                        op.org_id,
+                        op.actor_user_id,
+                        op.api_product,
+                        op.kind,
+                        op.target_type,
+                        op.target_id,
+                        op.state,
+                        op.progress_message,
+                        op.terminal_error_code,
+                        op.terminal_error_json,
+                        op.result_json,
+                        op.attempts,
+                        op.requested_at,
+                        op.next_attempt_at,
+                        op.created_at,
+                        op.started_at,
+                        op.completed_at,
+                        op.updated_at,
+                        CASE WHEN op.kind = $2
+                             THEN op.payload_json ->> 'requested_by_user_id'
+                        END AS requested_by_user_id,
+                        actor.email AS actor_email
+               FROM public_operations op
+               LEFT JOIN users actor ON actor.id = op.actor_user_id
+              WHERE op.operation_id = $1"
         ))
         .bind(operation_id.as_uuid())
         .bind(OperationKind::CreateSandbox.as_str())
@@ -512,35 +516,37 @@ impl PublicOperationStore {
         let kind = input.kind.map(OperationKind::as_str);
         let target_type = input.target_type.as_ref().map(OperationTargetType::as_str);
         let rows = sqlx::query_as::<_, AdminPublicOperationRow>(sql!(
-            "SELECT operation_id,
-                        org_id,
-                        actor_user_id,
-                        api_product,
-                        kind,
-                        target_type,
-                        target_id,
-                        state,
-                        progress_message,
-                        terminal_error_code,
-                        terminal_error_json,
-                        result_json,
-                        attempts,
-                        requested_at,
-                        next_attempt_at,
-                        created_at,
-                        started_at,
-                        completed_at,
-                        updated_at,
-                        CASE WHEN kind = $7
-                             THEN payload_json ->> 'requested_by_user_id'
-                        END AS requested_by_user_id
-               FROM public_operations
-              WHERE ($1::UUID IS NULL OR org_id = $1)
-                AND ($2::TEXT IS NULL OR state = $2)
-                AND ($3::TEXT IS NULL OR kind = $3)
-                AND ($4::TEXT IS NULL OR target_type = $4)
-                AND ($5::TEXT[] IS NULL OR target_id = ANY($5))
-              ORDER BY created_at DESC, operation_id DESC
+            "SELECT op.operation_id,
+                        op.org_id,
+                        op.actor_user_id,
+                        op.api_product,
+                        op.kind,
+                        op.target_type,
+                        op.target_id,
+                        op.state,
+                        op.progress_message,
+                        op.terminal_error_code,
+                        op.terminal_error_json,
+                        op.result_json,
+                        op.attempts,
+                        op.requested_at,
+                        op.next_attempt_at,
+                        op.created_at,
+                        op.started_at,
+                        op.completed_at,
+                        op.updated_at,
+                        CASE WHEN op.kind = $7
+                             THEN op.payload_json ->> 'requested_by_user_id'
+                        END AS requested_by_user_id,
+                        actor.email AS actor_email
+               FROM public_operations op
+               LEFT JOIN users actor ON actor.id = op.actor_user_id
+              WHERE ($1::UUID IS NULL OR op.org_id = $1)
+                AND ($2::TEXT IS NULL OR op.state = $2)
+                AND ($3::TEXT IS NULL OR op.kind = $3)
+                AND ($4::TEXT IS NULL OR op.target_type = $4)
+                AND ($5::TEXT[] IS NULL OR op.target_id = ANY($5))
+              ORDER BY op.created_at DESC, op.operation_id DESC
               LIMIT $6"
         ))
         .bind(input.org_id)
@@ -3817,6 +3823,12 @@ pub struct AdminPublicOperationRecord {
     pub id: OperationId,
     pub org_id: OrgId,
     pub actor_user_id: Option<UserId>,
+    /// The email `actor_user_id`'s user has when the operation is read, so it
+    /// follows a change of email. `None` when the operation has no actor,
+    /// which includes once the user is deleted: that clears `actor_user_id`.
+    /// Unlike an admin audit event's `actor_email`, a never-null copy taken
+    /// when the request ran, it does not record who the actor was.
+    pub actor_email: Option<String>,
     pub api_product: ApiProduct,
     pub kind: OperationKind,
     pub state: OperationState,
@@ -3939,12 +3951,14 @@ fn sandbox_target_id_forms(sandbox_id: SandboxId) -> [String; 2] {
     ]
 }
 
-/// [`PublicOperationRow`] plus the admin record's payload-derived columns.
+/// [`PublicOperationRow`] plus the columns only the admin record has: the
+/// payload's `requested_by_user_id` and the joined actor's email.
 #[derive(Debug, FromRow)]
 struct AdminPublicOperationRow {
     #[sqlx(flatten)]
     operation: PublicOperationRow,
     requested_by_user_id: Option<String>,
+    actor_email: Option<String>,
 }
 
 #[derive(Debug, FromRow)]
@@ -4011,11 +4025,13 @@ impl TryFrom<AdminPublicOperationRow> for AdminPublicOperationRecord {
                     })
             })
             .transpose()?;
+        let actor_email = row.actor_email;
         let row = row.operation;
         Ok(Self {
             id: OperationId::from_uuid(row.operation_id),
             org_id: row.org_id,
             actor_user_id: row.actor_user_id,
+            actor_email,
             api_product: parse_stored_enum("api_product", &row.api_product)?,
             kind: parse_stored_enum("kind", &row.kind)?,
             state: parse_stored_enum("state", &row.state)?,

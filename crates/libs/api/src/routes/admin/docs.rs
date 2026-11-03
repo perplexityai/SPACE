@@ -180,7 +180,7 @@ fn admin_openapi_value() -> Value {
             "/operations": {
                 "get": {
                     "summary": "List public operations across tenants for operator diagnostics",
-                    "description": "actor_user_id is the user an operation runs as; for an admin sandbox create that is the sandbox owner. requested_by_user_id is set only on create_sandbox operations an administrator submitted on the owner's behalf while SPACE_ADMIN_CREATE_REQUESTED_BY_ENABLED was on, naming that administrator; it is null on every other operation.",
+                    "description": "actor_user_id is the user an operation runs as; for an admin sandbox create that is the sandbox owner. requested_by_user_id is set only on create_sandbox operations an administrator submitted on the owner's behalf while SPACE_ADMIN_CREATE_REQUESTED_BY_ENABLED was on, naming that administrator; it is null on every other operation. actor_email is the email actor_user_id's user has when the operation is read, so it follows a change of email; it is null when the operation has no actor, which includes once that user is deleted, since the delete also clears actor_user_id. It is not the actor_email of an admin audit event, which is a never-null copy of the actor's email taken when the request ran.",
                     "parameters": [
                         { "name": "org_id", "in": "query", "required": false, "schema": { "type": "string", "format": "uuid" } },
                         { "name": "state", "in": "query", "required": false, "schema": { "type": "string" } },
@@ -198,6 +198,7 @@ fn admin_openapi_value() -> Value {
             "/operations/{operation_id}": {
                 "get": {
                     "summary": "Get one public operation by id",
+                    "description": "Returns the same operation shape as the list, including actor_email.",
                     "parameters": [
                         { "name": "operation_id", "in": "path", "required": true, "schema": { "type": "string" } }
                     ],
@@ -284,7 +285,8 @@ fn admin_openapi_value() -> Value {
                     "summary": "Delete an organization",
                     "responses": {
                         "204": { "description": "Deleted" },
-                        "403": { "description": "Caller is not a managing organization admin" }
+                        "403": { "description": "Caller is not a managing organization admin, or the organization is the managing organization" },
+                        "409": { "description": "Not deleted: rows still reference the organization. reason is org_has_users while it has users (delete them or move them to another organization); org_has_sandboxes while it has sandboxes, including deleted ones whose records are kept for retention; org_has_archived_sandboxes while it has archived sandboxes; org_has_templates while it owns a template that is not deleted; org_has_retained_deleted_templates when every template it owns is deleted but retention still keeps the records, with retained_until naming about when the last goes, omitted while a node still caches one (retry later); org_has_orphaned_snapshot_storage when it has no sandboxes but its master key still encrypts snapshot storage locations its deleted snapshots left behind, which the snapshot storage sweeper does not remove; org_has_node_groups while it owns node groups (release each with :assign-org and a null org_id, or delete it once its nodes are relabeled or retired); or org_manages_cluster when it became the managing organization during the request. When several remain, the next delete names the next. API keys, credentials and operations are deleted with the organization, and its child organizations are detached (their parent_id becomes null)" }
                     }
                 }
             },
@@ -299,7 +301,8 @@ fn admin_openapi_value() -> Value {
                     "summary": "Create a user in an organization",
                     "responses": {
                         "201": { "description": "User" },
-                        "403": { "description": "Caller cannot manage the organization" }
+                        "403": { "description": "Caller cannot manage the organization" },
+                        "409": { "description": "Another user has the email; reason is email_in_use" }
                     }
                 }
             },
@@ -922,7 +925,8 @@ fn insert_identity_profile_paths(paths: &mut Map<String, Value>) {
                 "responses": {
                     "200": { "description": "User" },
                     "403": { "description": "Caller cannot update this user" },
-                    "404": { "description": "User not found" }
+                    "404": { "description": "User not found" },
+                    "409": { "description": "Another user has the email; reason is email_in_use" }
                 }
             }),
         );

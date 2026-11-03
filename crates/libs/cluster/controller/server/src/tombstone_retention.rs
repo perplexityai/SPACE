@@ -11,7 +11,9 @@ use tokio_util::sync::CancellationToken;
 
 const DEFAULT_TICK: Duration = Duration::from_secs(300);
 // One retention for every tombstone kind. The sandbox store owns the value
-// because the API's user delete reports when a deleted sandbox's row leaves.
+// because the API's user delete reports when a deleted sandbox's row leaves;
+// its organization delete reports when a deleted template's does from the
+// same value.
 const DEFAULT_RETENTION: Duration = pplx_space_sandbox_store::DELETED_SANDBOX_RETENTION;
 const DEFAULT_MAX_RECORDS_PER_TICK: u32 = 1_000;
 

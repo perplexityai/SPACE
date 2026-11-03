@@ -5,8 +5,8 @@
 //! following the per-table store convention: executor-generic free functions,
 //! a typed record, `sql!` locators, and a small error enum. Verbs
 //! so far: [`get`], [`update_desired_state`], [`user_sandbox_rows`],
-//! [`any_undescribed_artifact_owner`], [`network_policy_inputs_placed_on`],
-//! [`snapshot_storage_placed_on`].
+//! [`org_has_sandbox_rows`], [`any_undescribed_artifact_owner`],
+//! [`network_policy_inputs_placed_on`], [`snapshot_storage_placed_on`].
 //!
 //! # Boundaries
 //!
@@ -214,6 +214,7 @@ pub async fn get(
 /// How long a deleted sandbox's row is kept, measured from its last update,
 /// before the cluster-controller's tombstone retention removes it. Until then
 /// the row still holds `sandboxes`' foreign keys, such as the one to its user.
+/// The same retention applies to deleted templates' rows.
 pub const DELETED_SANDBOX_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// What `user_id`'s `sandboxes` rows are, as far as deleting the user goes.
@@ -247,6 +248,21 @@ pub async fn user_sandbox_rows(
         (Some(false), Some(retained_until)) => UserSandboxRows::DeletedOnly { retained_until },
         _ => UserSandboxRows::None,
     })
+}
+
+/// Whether `org_id` has any `sandboxes` row, deleted ones kept for retention
+/// included: the rows `sandboxes_org_id_fkey` holds the organization by.
+pub async fn org_has_sandbox_rows(
+    executor: impl sqlx::PgExecutor<'_>,
+    org_id: OrgId,
+) -> Result<bool, SandboxStoreError> {
+    let exists = sqlx::query_scalar(sql!(
+        "SELECT EXISTS (SELECT 1 FROM sandboxes WHERE org_id = $1)"
+    ))
+    .bind(org_id)
+    .fetch_one(executor)
+    .await?;
+    Ok(exists)
 }
 
 /// The network-policy inputs of one sandbox placed on a node: its own

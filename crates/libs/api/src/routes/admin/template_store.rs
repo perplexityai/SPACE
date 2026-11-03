@@ -1,5 +1,5 @@
 //! Postgres-side queries that back the `/admin/v1/templates/{name}:visibility`
-//! admin endpoint.
+//! admin endpoint, and the template reads other admin routes need.
 //!
 //! The handler in [`super::templates`] stays focused on HTTP, auth, the flip
 //! guards, and audit logging; the SQL strings and transaction-bound helpers
@@ -12,6 +12,7 @@ use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{TemplateDesiredState, TemplateName, TemplateVisibility};
 use pplx_space_sandbox_portability::failed_repair_revert_eligibility;
 use sqlx::{FromRow, Postgres, Transaction};
+use time::OffsetDateTime;
 
 /// Whether a template row named `template_name` exists and is not deleted:
 /// the rows the template read routes list.
@@ -26,6 +27,65 @@ pub(super) async fn template_exists(
     .bind(TemplateDesiredState::Deleted.as_str())
     .fetch_one(executor)
     .await
+}
+
+/// What an organization's `templates` rows are, as far as deleting the
+/// organization goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum OrgTemplateRows {
+    /// The organization owns no template rows.
+    None,
+    /// At least one of them is not deleted.
+    Live,
+    /// Every one is deleted, and tombstone retention keeps the rows. It
+    /// removes a deleted template a retention period after its delete was
+    /// requested, once no template release and no node's inventory names it.
+    /// `retained_until` is about when the last goes: `None` while a release
+    /// or an inventory row still holds one, which no fixed time bounds.
+    DeletedOnly {
+        retained_until: Option<OffsetDateTime>,
+    },
+}
+
+/// Classify `org_id`'s template rows; see [`OrgTemplateRows`]. The
+/// conditions are the cluster-controller's tombstone retention's, which uses
+/// [`pplx_space_sandbox_store::DELETED_SANDBOX_RETENTION`] for every tombstone
+/// kind.
+pub(super) async fn org_template_rows(
+    executor: impl sqlx::PgExecutor<'_>,
+    org_id: OrgId,
+) -> Result<OrgTemplateRows, sqlx::Error> {
+    let (live, held, retained_until) =
+        sqlx::query_as::<_, (Option<bool>, Option<bool>, Option<OffsetDateTime>)>(sql!(
+            "SELECT bool_or(t.desired_state <> $2),
+                    bool_or(
+                        EXISTS (
+                            SELECT 1 FROM template_releases r WHERE r.template_name = t.name
+                        )
+                        OR EXISTS (
+                            SELECT 1
+                              FROM node_template_inventory i
+                             WHERE i.template_name = t.name
+                        )
+                    ),
+                    MAX(COALESCE(t.delete_requested_at, t.updated_at, t.created_at))
+                        + make_interval(secs => $3)
+               FROM templates t
+              WHERE t.org_id = $1"
+        ))
+        .bind(org_id)
+        .bind(TemplateDesiredState::Deleted.as_str())
+        .bind(pplx_space_sandbox_store::DELETED_SANDBOX_RETENTION.as_secs_f64())
+        .fetch_one(executor)
+        .await?;
+    Ok(match (live, held, retained_until) {
+        (Some(true), _, _) => OrgTemplateRows::Live,
+        (Some(false), Some(true), _) => OrgTemplateRows::DeletedOnly {
+            retained_until: None,
+        },
+        (Some(false), _, retained_until) => OrgTemplateRows::DeletedOnly { retained_until },
+        (None, _, _) => OrgTemplateRows::None,
+    })
 }
 
 #[derive(Debug, Clone, FromRow)]
