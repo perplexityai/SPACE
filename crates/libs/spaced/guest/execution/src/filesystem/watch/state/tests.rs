@@ -98,6 +98,9 @@ fn expired_pull_watcher_reaper_removes_consumer_and_root() {
             consumers,
             directory_count: 1,
             discovering: false,
+            unwatched: Default::default(),
+            unwatched_truncated: false,
+            unlisted: Default::default(),
             shutdown: shutdown.clone(),
         },
     );
@@ -127,6 +130,9 @@ fn dynamic_directories_consume_the_shared_watch_budget() {
             consumers: HashMap::new(),
             directory_count: MAX_WATCHED_DIRECTORIES - 1,
             discovering: false,
+            unwatched: Default::default(),
+            unwatched_truncated: false,
+            unlisted: Default::default(),
             shutdown: CancellationToken::new(),
         },
     );
@@ -181,6 +187,9 @@ fn stale_backend_generation_cannot_mutate_or_remove_recreated_root() {
             consumers: HashMap::new(),
             directory_count: 7,
             discovering: false,
+            unwatched: Default::default(),
+            unwatched_truncated: false,
+            unlisted: Default::default(),
             shutdown: CancellationToken::new(),
         },
     );

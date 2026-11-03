@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -42,7 +42,23 @@ pub(super) struct WatchRoot {
     pub(super) consumers: HashMap<u64, WatchConsumer>,
     pub(super) directory_count: usize,
     pub(super) discovering: bool,
+    /// Directories the backend skipped and reports as not covered.
+    pub(super) unwatched: BTreeSet<PathBuf>,
+    /// The backend couldn't report every skip, or the root turned
+    /// unreadable; cleared once a clean, complete walk of the root lists
+    /// every skip again.
+    pub(super) unwatched_truncated: bool,
+    /// Skips the wire can't name. While any remain, `unwatched` is
+    /// incomplete, whatever the backend reports.
+    pub(super) unlisted: BTreeSet<PathBuf>,
     pub(super) shutdown: CancellationToken,
+}
+
+impl WatchRoot {
+    /// Whether `unwatched` may be missing skips.
+    pub(super) fn coverage_incomplete(&self) -> bool {
+        self.unwatched_truncated || !self.unlisted.is_empty()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

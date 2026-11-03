@@ -170,6 +170,8 @@ impl Ledger {
             cursor: Some(self.wall_time_high_watermark.to_string()),
             monitoring_enabled: true,
             overflowed,
+            // The manager fills in coverage, which roots own.
+            ..Default::default()
         })
     }
 

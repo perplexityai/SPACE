@@ -12,6 +12,7 @@ const MAX_GUEST_FILE_LIST_ENTRIES: usize = 10_000;
 const MAX_GUEST_FILE_LIST_METADATA_BYTES: usize = 4 * 1024 * 1024;
 const MAX_GUEST_MODIFIED_FILES: usize = 16_384;
 const MAX_GUEST_MODIFIED_FILE_KINDS: usize = 5;
+const MAX_GUEST_UNWATCHED_PATHS: usize = 256;
 const MAX_GUEST_WATCHER_EVENTS: usize = 4_096;
 
 impl SpacedHostService {
@@ -517,7 +518,7 @@ impl Filesystem for SpacedHostService {
             .map(pplx_space_common_core::types::GuestUserName::parse)
             .transpose()
             .map_err(invalid_argument_status)?;
-        let response = self
+        let mut response = self
             .call_bridge_guest_filesystem(
                 "bridge_guest_get_modified_files",
                 BridgeGuestOperationBudget::FilesystemMetadata,
@@ -551,6 +552,27 @@ impl Filesystem for SpacedHostService {
                 "guest modified file has too many event kinds",
             ));
         }
+        // The truncation flag says a path's absence proves nothing, so a path
+        // past the cap, or one that isn't an absolute guest path, is left out
+        // rather than failing the caller's query.
+        // A list far past the cap is cut before it's sorted, so a guest can't
+        // make each query sort and parse an arbitrarily long one.
+        if response.unwatched_paths.len() > 4 * MAX_GUEST_UNWATCHED_PATHS {
+            response
+                .unwatched_paths
+                .truncate(4 * MAX_GUEST_UNWATCHED_PATHS);
+            response.unwatched_paths_truncated = true;
+        }
+        response.unwatched_paths.sort();
+        response.unwatched_paths.dedup();
+        let listed = response.unwatched_paths.len();
+        response.unwatched_paths.retain(|path| {
+            path.starts_with('/') && pplx_space_common_core::types::GuestPath::parse(path).is_ok()
+        });
+        response.unwatched_paths.truncate(MAX_GUEST_UNWATCHED_PATHS);
+        response.unwatched_paths_truncated |= response.unwatched_paths.len() < listed;
+        // Guest data is untrusted, so each field is listed: a new one doesn't
+        // compile until it is checked here.
         Ok(Response::new(GetModifiedFilesResponse {
             files: response
                 .files
@@ -562,6 +584,8 @@ impl Filesystem for SpacedHostService {
             cursor: response.cursor,
             monitoring_enabled: response.monitoring_enabled,
             overflowed: response.overflowed,
+            unwatched_paths: response.unwatched_paths,
+            unwatched_paths_truncated: response.unwatched_paths_truncated,
         }))
     }
 }

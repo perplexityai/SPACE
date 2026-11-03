@@ -187,6 +187,8 @@ pub(crate) fn file_event_kind(kind: i32) -> FileEventKind {
         SpacedFileEventKind::Removed => FileEventKind::Removed,
         SpacedFileEventKind::Renamed => FileEventKind::Renamed,
         SpacedFileEventKind::Chmod => FileEventKind::Chmod,
+        SpacedFileEventKind::Unwatched => FileEventKind::Unwatched,
+        SpacedFileEventKind::Rewatched => FileEventKind::Rewatched,
         SpacedFileEventKind::Unspecified => FileEventKind::Unknown,
     }
 }

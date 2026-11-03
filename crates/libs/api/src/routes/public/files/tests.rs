@@ -38,6 +38,31 @@ fn public_file_info_maps_native_shape() {
 }
 
 #[test]
+fn coverage_event_kinds_map_to_public_kinds() {
+    assert_eq!(
+        public_file_event_kind(SpacedFileEventKind::Unwatched as i32),
+        FileEventKind::Unwatched
+    );
+    assert_eq!(
+        public_file_event_kind(SpacedFileEventKind::Rewatched as i32),
+        FileEventKind::Rewatched
+    );
+}
+
+#[test]
+fn modified_files_carry_unwatched_paths() {
+    let public = public_modified_files(SpacedGetModifiedFilesResponse {
+        monitoring_enabled: true,
+        unwatched_paths: vec!["/workspace/a".to_string(), "/workspace/b".to_string()],
+        unwatched_paths_truncated: true,
+        ..Default::default()
+    });
+    assert_eq!(public.unwatched_paths, ["/workspace/a", "/workspace/b"]);
+    assert!(public.unwatched_paths_truncated);
+    assert!(!public.overflowed);
+}
+
+#[test]
 fn guest_path_and_user_are_validated_at_boundary() {
     assert_eq!(
         parse_guest_path("/workspace".to_string()).unwrap(),
