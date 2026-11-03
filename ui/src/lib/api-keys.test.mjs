@@ -11,7 +11,6 @@ import {
   keyActsAs,
   keyActsAsText,
   keyActsAsUnknownText,
-  oldestUser,
 } from './api-keys.ts';
 
 const OWN_ORG = 'org-own';
@@ -38,12 +37,19 @@ test("without a choice, a key for the caller's own organization acts as the call
   assert.match(keyActsAsText(actsAs), /act as you \(operator@example\.test\)/);
 });
 
-test("without a choice, a key for another organization acts as that organization's oldest user", () => {
+test('without a choice, a key for another organization acts as nobody until a user is chosen', () => {
   const actsAs = keyActsAs({ orgId: OTHER_ORG, caller, users: otherUsers, chosenUserId: null });
-  assert.deepEqual(actsAs, { kind: 'oldest', user: otherUsers[0] });
-  assert.match(keyActsAsText(actsAs), /b@example\.test, the organization's oldest user/);
+  assert.deepEqual(actsAs, { kind: 'unchosen' });
+  assert.equal(keyActsAsText(actsAs), 'Choose the user the key acts as.');
+  assert.doesNotMatch(keyActsAsText(actsAs), /oldest|default/);
   // A choice that names nobody in the organization is no choice.
-  assert.equal(keyActsAs({ orgId: OTHER_ORG, caller, users: otherUsers, chosenUserId: 'u-gone' }).kind, 'oldest');
+  assert.equal(keyActsAs({ orgId: OTHER_ORG, caller, users: otherUsers, chosenUserId: 'u-gone' }).kind, 'unchosen');
+});
+
+test("Create for another organization's key waits for a chosen user; the own organization's needs none", () => {
+  assert.equal(canCreateKey({ usersLoading: false, ownOrg: false, userChosen: false, crossOrgUnsupported: false }), false);
+  assert.equal(canCreateKey({ usersLoading: false, ownOrg: false, userChosen: true, crossOrgUnsupported: false }), true);
+  assert.equal(canCreateKey({ usersLoading: false, ownOrg: true, userChosen: false, crossOrgUnsupported: false }), true);
 });
 
 test('an organization without users has no one for the key to act as', () => {
@@ -52,16 +58,7 @@ test('an organization without users has no one for the key to act as', () => {
   assert.match(keyActsAsText(actsAs), /no users/);
 });
 
-test('the oldest user is ordered by creation time, then ID, as the API orders them', () => {
-  const at = '2026-01-01T00:00:00Z';
-  assert.equal(oldestUser([{ id: 'b', created_at: at }, { id: 'a', created_at: at }]).id, 'a');
-  // Microseconds order, below the millisecond `Date.parse` keeps.
-  assert.equal(oldestUser([{ id: 'a', created_at: '2026-01-01T00:00:00.167376Z' }, { id: 'b', created_at: '2026-01-01T00:00:00.167375Z' }]).id, 'b');
-  assert.equal(oldestUser([{ id: 'a', created_at: '2026-01-01T00:00:00.5Z' }, { id: 'b', created_at: '2026-01-01T00:00:00.45Z' }]).id, 'b');
-  assert.equal(oldestUser([]), null);
-});
-
-test('user_id is sent only when the operator picked a user', () => {
+test("user_id is sent only when the operator picked a user, so an own-organization key without one sends none", () => {
   assert.deepEqual(createKeyBody({ name: 'ci', allowed_surfaces: ['ecw'] }), { name: 'ci', allowed_surfaces: ['ecw'] });
   assert.deepEqual(createKeyBody({ name: 'ci', allowed_surfaces: ['ecw'], user_id: null }), { name: 'ci', allowed_surfaces: ['ecw'] });
   assert.deepEqual(createKeyBody({ name: 'ci', allowed_surfaces: ['native'], user_id: 'u-a' }), { name: 'ci', allowed_surfaces: ['native'], user_id: 'u-a' });
@@ -76,11 +73,13 @@ test("a key whose user was deleted says it acts as the organization's oldest use
 });
 
 test("Create waits for the organization's users, and after a failed read says who the key acts as", () => {
-  assert.equal(canCreateKey({ usersLoading: true, ownOrg: true, crossOrgUnsupported: false }), false);
-  assert.equal(canCreateKey({ usersLoading: false, ownOrg: false, crossOrgUnsupported: false }), true);
+  assert.equal(canCreateKey({ usersLoading: true, ownOrg: true, userChosen: false, crossOrgUnsupported: false }), false);
   assert.match(keyActsAsUnknownText({ ownOrg: false, usersError: null }), /Loading/);
   assert.match(keyActsAsUnknownText({ ownOrg: true, usersError: 'synthetic failure' }), /\(synthetic failure\).*act as you\./);
-  assert.match(keyActsAsUnknownText({ ownOrg: false, usersError: 'synthetic failure' }), /oldest user, who could not be read/);
+  // Another organization's key needs a chosen user, which only a retry offers.
+  const unread = keyActsAsUnknownText({ ownOrg: false, usersError: 'synthetic failure' });
+  assert.match(unread, /\(synthetic failure\).*Retry to choose the user the key acts as\./);
+  assert.doesNotMatch(unread, /oldest/);
 });
 
 test('a release that creates keys only for your own organization refuses another with a 403, and Create stops offering it there', () => {
@@ -90,13 +89,25 @@ test('a release that creates keys only for your own organization refuses another
   assert.equal(isCrossOrgKeyRefusal(forbidden, true), false);
   assert.equal(isCrossOrgKeyRefusal(Object.assign(new Error('x'), { status: 409 }), false), false);
   assert.match(KEY_CROSS_ORG_UNSUPPORTED, /only for your own organization/);
-  assert.equal(canCreateKey({ usersLoading: false, ownOrg: false, crossOrgUnsupported: true }), false);
+  assert.equal(canCreateKey({ usersLoading: false, ownOrg: false, userChosen: true, crossOrgUnsupported: true }), false);
+});
+
+test("that release refuses another organization's key, which carries user_id, as a 422 first; the own organization's 422 is the user choice", () => {
+  const unknownField = Object.assign(new Error('unknown field `user_id`'), { status: 422 });
+  assert.equal(isCrossOrgKeyRefusal(unknownField, false, true), true);
+  assert.equal(isCrossOrgKeyRefusal(unknownField, true, true), false);
+});
+
+test("a release that requires user_id answers its 400 as a message, not as a cross-organization refusal", () => {
+  const required = Object.assign(new Error("user_id is required for another organization's key"), { status: 400 });
+  assert.equal(isCrossOrgKeyRefusal(required, false, false), false);
 });
 
 test("one organization's 403, from one old pod during a rollout, disables Create for that organization only", () => {
   const allowed = (refusedFor, orgId) => canCreateKey({
     usersLoading: false,
     ownOrg: false,
+    userChosen: true,
     crossOrgUnsupported: crossOrgKeyRefused(refusedFor, orgId),
   });
   assert.equal(allowed('org-b', 'org-b'), false);

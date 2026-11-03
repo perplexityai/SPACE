@@ -168,7 +168,7 @@ function ApiKeysPageContent() {
     : null;
   const usersLoading = !!orgId && orgUsers === null && orgUsersError === null;
   const crossOrgUnsupported = crossOrgKeyRefused(crossOrgRefusedFor, orgId);
-  const createAllowed = canCreateKey({ usersLoading, ownOrg, crossOrgUnsupported });
+  const createAllowed = canCreateKey({ usersLoading, ownOrg, userChosen: actsAs?.kind === 'chosen', crossOrgUnsupported });
   const actsAsExtra = !ownOrg && crossOrgUnsupported
     ? KEY_CROSS_ORG_UNSUPPORTED
     : actsAs
@@ -194,14 +194,15 @@ function ApiKeysPageContent() {
       setCreated({
         key: result,
         orgName,
-        actsAs: stored.recorded ? stored.text : actsAs && actsAs.kind !== 'no-users' ? actsAs.user.email : stored.text,
+        actsAs: stored.recorded ? stored.text : actsAs && 'user' in actsAs ? actsAs.user.email : stored.text,
       });
       message.success('API key created');
     } catch (error) {
-      if (isCrossOrgKeyRefusal(error, ownOrg)) {
+      const userIdRefused = isUnknownFieldRejection(error, 'user_id');
+      if (isCrossOrgKeyRefusal(error, ownOrg, userIdRefused)) {
         setCrossOrgRefusedFor(orgId);
         message.error(KEY_CROSS_ORG_UNSUPPORTED);
-      } else if (isUnknownFieldRejection(error, 'user_id')) {
+      } else if (userIdRefused) {
         message.error(KEY_USER_CHOICE_UNSUPPORTED);
       } else {
         message.error(error instanceof Error ? error.message : 'Failed to create API key');
@@ -331,6 +332,8 @@ function ApiKeysPageContent() {
           <Form.Item
             name="user_id"
             label="Acts as"
+            // The API picks no user for another organization's key.
+            rules={ownOrg ? [] : [{ required: true, message: 'Choose the user the key acts as' }]}
             extra={(
               <Space size={4} wrap>
                 <span>{actsAsExtra}</span>
@@ -352,9 +355,7 @@ function ApiKeysPageContent() {
               showSearch
               optionFilterProp="label"
               loading={usersLoading}
-              placeholder={
-                orgId === signedInOrg?.id ? 'You (default)' : "The organization's oldest user (default)"
-              }
+              placeholder={ownOrg ? 'You (default)' : 'Choose a user'}
               options={(orgUsers ?? []).map((user) => ({
                 label: user.display_name ? `${user.email} (${user.display_name})` : user.email,
                 value: user.id,
