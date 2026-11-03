@@ -107,7 +107,7 @@ async fn the_debug_handler_answers_a_contended_read_with_a_503()
         let response = get_sandbox_debug(
             State(state.clone()),
             axum::Extension(crate::middleware::auth::AuthUser(actor.clone())),
-            Path(SandboxId::new()),
+            Path(SandboxId::new().to_string()),
         )
         .await;
 
@@ -235,7 +235,7 @@ async fn the_debug_read_reports_quarantine_and_snapshot_storage()
             let response = get_sandbox_debug(
                 State(state),
                 axum::Extension(crate::middleware::auth::AuthUser(actor)),
-                Path(sandbox_id),
+                Path(pplx_space_public_api::PublicSandboxId::from(sandbox_id).to_string()),
             )
             .await;
             assert_eq!(response.status(), StatusCode::OK);

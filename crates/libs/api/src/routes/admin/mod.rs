@@ -47,6 +47,9 @@ pub mod nodes;
 mod operations;
 mod runtime_environment_store;
 mod runtime_environments;
+// `pub(in crate::routes)`: the debug route takes the same sandbox ID forms.
+pub(in crate::routes) mod sandbox_id;
+mod sandbox_list;
 mod sandboxes;
 // `pub(in crate::routes)` rather than private: `routes::debug` is mounted
 // inside this router (`debug::admin_v1_debug_router`, merged by `v1_router`
@@ -277,7 +280,11 @@ pub fn v1_router(state: AppState) -> Router<AppState> {
         )
         .route(
             "/sandboxes",
-            get(sandboxes::list_sandboxes).post(sandboxes::create_sandbox),
+            get(sandbox_list::list_sandboxes).post(sandboxes::create_sandbox),
+        )
+        .route(
+            "/sandboxes/spaced-versions",
+            get(sandbox_list::count_spaced_versions),
         )
         .route(
             "/sandboxes/{spec}",

@@ -24,7 +24,6 @@
 "crates/libs/api/src/public_operations.rs" = 1787
 "crates/libs/api/src/public_sandbox_operations.rs" = 1023
 "crates/libs/api/src/routes/admin/node_maintenance.rs" = 1783
-"crates/libs/api/src/routes/admin/sandboxes.rs" = 1011
 "crates/libs/api/src/routes/admin/templates.rs" = 2262
 "crates/libs/api/src/routes/e2b/lifecycle.rs" = 1236
 "crates/libs/api/src/routes/public/sandboxes.rs" = 1245
