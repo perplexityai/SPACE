@@ -9,16 +9,27 @@ readonly KERNEL_VERSION="${KERNEL_VERSION:-6.1.155}"
 readonly OUTPUT_DIR="${OUTPUT_DIR:-/output/vmlinux-${KERNEL_VERSION}${CONFIG_FRAGMENT:+-bpf-modsig}}"
 
 # Modern iptables uses nf_tables even when a container only requests NET_ADMIN.
-# Keep its IPv4/IPv6 filtering, conntrack and reject expressions built in.
+# Keep filtering and NAT built in for both frontends, including inet-family
+# nft rules and the legacy raw tables and matches used by firewall tools.
 readonly -a REQUIRED_NETFILTER_CONFIGS=(
   CONFIG_NF_TABLES
   CONFIG_NF_TABLES_IPV4
   CONFIG_NF_TABLES_IPV6
+  CONFIG_NF_TABLES_INET
   CONFIG_NFT_CT
   CONFIG_NFT_COMPAT
   CONFIG_NFT_REJECT
   CONFIG_NFT_REJECT_IPV4
   CONFIG_NFT_REJECT_IPV6
+  CONFIG_NFT_NAT
+  CONFIG_NFT_MASQ
+  CONFIG_NFT_REDIR
+  CONFIG_IP_NF_RAW
+  CONFIG_IP6_NF_RAW
+  CONFIG_NETFILTER_XT_MATCH_COMMENT
+  CONFIG_NETFILTER_XT_MATCH_MULTIPORT
+  CONFIG_NETFILTER_XT_MATCH_OWNER
+  CONFIG_NETFILTER_XT_MATCH_MARK
 )
 
 readonly -a REQUIRED_ENABLED_CONFIGS=(
