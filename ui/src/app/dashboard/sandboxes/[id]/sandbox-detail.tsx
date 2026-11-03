@@ -70,6 +70,7 @@ import type {
 import { tablePagination } from '@/lib/table-pagination';
 import { useAuth } from '@/lib/auth';
 import { isOwnOrg } from '@/lib/own-org';
+import { listsSnapshotsOn } from '@/lib/admin-fallback';
 import { RollbackButton, RollbackRefusalNote, useSnapshotRollback } from '@/components/snapshot-rollback';
 import { formatAge, formatBytes, sectionData, sectionError, snapshotKey, snapshotStorageById, snapshotStorageLabel, type DebugSnapshot } from '@/lib/sandbox-debug';
 import { OperationsCard, OrgLink, PlacementCard, QuarantineCard, ResourcesCard, TimelineCard, UserLink, type DebugView } from './sandbox-insight';
@@ -534,12 +535,20 @@ function SnapshotsCard({
       firstReload.current = false;
       return;
     }
-    if (ownOrg) refresh(true);
+    if (listsSnapshotsOn('page-reload', ownOrg)) refresh(true);
   }, [reloadKey]);
 
   // The listing is read again once the rollback's outcome is known: one
   // explicit read, also for another organization.
   const rollback = useSnapshotRollback({ sandboxId, orgId, via: rollbackVia, onSettled: () => refresh(true) });
+  // Refresh and Retry. In a view that showed the control plane's records
+  // instead (no listing yet, or a release without the admin list), the
+  // snapshot API is asked again from the start: an API rolled out since
+  // can answer it.
+  const relist = () => {
+    setSnapshotsOff(false);
+    refresh();
+  };
 
   const storageById = snapshotStorageById(sectionData(debug?.snapshots)?.snapshots ?? []);
 
@@ -577,11 +586,16 @@ function SnapshotsCard({
         title={<Space><CameraOutlined /> Snapshots</Space>}
         extra={
           listingError ? null : (
-            <Text type="secondary" style={{ fontSize: 12 }}>
-              {!ownOrg
-                ? "Rollback unavailable: this API release rolls back only your organization's sandboxes"
-                : 'Rollback unavailable: snapshot operations are not enabled for this organization'}
-            </Text>
+            <Space size={8} wrap>
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                {!ownOrg
+                  ? "Rollback unavailable: this API release rolls back only your organization's sandboxes"
+                  : 'Rollback unavailable: snapshot operations are not enabled for this organization'}
+              </Text>
+              {!ownOrg ? (
+                <Button size="small" icon={<ReloadOutlined />} loading={loading} onClick={relist}>Refresh</Button>
+              ) : null}
+            </Space>
           )
         }
       >
@@ -591,7 +605,7 @@ function SnapshotsCard({
             showIcon
             style={{ marginBottom: 8 }}
             title={`Could not load snapshots from the snapshot API: ${listingError}. Showing the snapshots the control plane records; rollback is unavailable until it loads.`}
-            action={<Button size="small" onClick={() => refresh()}>Retry</Button>}
+            action={<Button size="small" loading={loading} onClick={relist}>Retry</Button>}
           />
         ) : null}
         {adminError ? (
@@ -614,7 +628,7 @@ function SnapshotsCard({
               <Text type="secondary" style={{ fontSize: 12 }}>Listed {new Date(listedAt.current).toLocaleTimeString()}</Text>
             </Tooltip>
           ) : null}
-          <Button size="small" icon={<ReloadOutlined />} onClick={() => refresh()}>Refresh</Button>
+          <Button size="small" icon={<ReloadOutlined />} onClick={relist}>Refresh</Button>
         </Space>
       )}
     >
@@ -624,7 +638,7 @@ function SnapshotsCard({
           showIcon
           style={{ marginBottom: 8 }}
           title={`Could not refresh snapshots from the snapshot API: ${listingError}. Showing the listing loaded at ${new Date(staleSince).toLocaleTimeString()}; ${ownOrg ? 'the card retries every 20 s' : 'Retry to read them again'}.`}
-          action={<Button size="small" onClick={() => refresh()}>Retry</Button>}
+          action={<Button size="small" onClick={relist}>Retry</Button>}
         />
       ) : null}
       <Table

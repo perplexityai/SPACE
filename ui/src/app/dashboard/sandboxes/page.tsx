@@ -548,8 +548,10 @@ function SandboxActions({ status, id, resourceType, poolTemplate, onAction }: {
 
 // The operator's own organization's snapshots list through the public routes;
 // another organization's through the admin list, rolled back through
-// `:force-rollback` (see `listSnapshots`). The panel lists once, when the row
-// expands; a release without the admin list lists no other organization's.
+// `:force-rollback` (see `listSnapshots`). The panel lists when the row
+// expands, on its Refresh, and once a rollback it sent settles; a release
+// without the admin list lists no other organization's, until a Refresh
+// finds one that has it.
 function SnapshotsPanel({ sandboxId, orgId, ownOrg }: { sandboxId: string; orgId: string | null; ownOrg: boolean }) {
   const { message } = App.useApp();
   const [snapshots, setSnapshots] = useState<SnapshotInfo[]>([]);
@@ -590,6 +592,14 @@ function SnapshotsPanel({ sandboxId, orgId, ownOrg }: { sandboxId: string; orgId
   };
 
   useEffect(list, [sandboxId, ownOrg]);
+  // Refresh: a panel that showed why it has no listing asks again.
+  const relist = () => {
+    setSnapshotsOff(null);
+    list();
+  };
+  const refreshButton = (
+    <Button size="small" icon={<ReloadOutlined />} loading={loading} onClick={relist}>Refresh</Button>
+  );
 
   const rollback = useSnapshotRollback({ sandboxId, orgId, via: rollbackVia, onSettled: list });
 
@@ -639,7 +649,10 @@ function SnapshotsPanel({ sandboxId, orgId, ownOrg }: { sandboxId: string; orgId
   if (snapshotsOff) {
     return (
       <div style={{ padding: '8px 0' }}>
-        <Text strong><CameraOutlined /> Snapshots</Text>
+        <Space size={12} wrap>
+          <Text strong><CameraOutlined /> Snapshots</Text>
+          {refreshButton}
+        </Space>
         <div style={{ marginTop: 8 }}>
           <Text type="secondary">{snapshotsOff}</Text>
         </div>
@@ -651,6 +664,7 @@ function SnapshotsPanel({ sandboxId, orgId, ownOrg }: { sandboxId: string; orgId
     <div style={{ padding: '8px 0' }}>
       <Space size={12} wrap>
         <Text strong><CameraOutlined /> Snapshots</Text>
+        {refreshButton}
         <RollbackRefusalNote state={rollback} />
       </Space>
       <Table

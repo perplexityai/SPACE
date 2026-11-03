@@ -4,6 +4,7 @@ import {
   isMissingRoute,
   isUnknownFieldRejection,
   listSnapshots,
+  listsSnapshotsOn,
   moveReleaseTag,
   pageRows,
   sendWithOptionalField,
@@ -182,4 +183,24 @@ test("without the admin list, another organization's sandbox has no listing; a r
     listSnapshots({ ownOrg: false, readPublic: async () => [], readAdmin: async () => { throw notFound; } }),
     (thrown) => thrown === notFound,
   );
+});
+
+test("another organization's snapshot card has no timed read: the page's reloads never read the admin list", async () => {
+  // What the sandbox page sends the card: it opens, the page reloads every
+  // 20 s (and on its Refresh and each action), the operator presses the
+  // card's Refresh, and a rollback it sent settles. The card asks
+  // `listsSnapshotsOn` on each reload.
+  const triggers = ['open', 'page-reload', 'page-reload', 'page-reload', 'refresh', 'page-reload', 'rollback-settled', 'page-reload'];
+  const reads = async (ownOrg) => {
+    const admin = reader([{ id: 'snap_admin' }]);
+    let publicReads = 0;
+    for (const trigger of triggers) {
+      if (!listsSnapshotsOn(trigger, ownOrg)) continue;
+      await listSnapshots({ ownOrg, readPublic: async () => { publicReads += 1; return []; }, readAdmin: admin.read });
+    }
+    return { admin: admin.calls.count, public: publicReads };
+  };
+  assert.deepEqual(await reads(false), { admin: 3, public: 0 });
+  // The own organization's card lists through the public routes on every reload.
+  assert.deepEqual(await reads(true), { admin: 0, public: triggers.length });
 });

@@ -1,16 +1,11 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { App, Button, Popconfirm, Space, Tooltip, Typography } from 'antd';
 import { RollbackOutlined } from '@ant-design/icons';
 
-import { rollbackOutcome } from '@/lib/accepted-create';
-import {
-  forgetRollbackRefusal,
-  rememberRollbackRefusal,
-  rememberedRollbackRefusal,
-  rollbackGateRefusal,
-} from '@/lib/hidden-operations';
+import { followRollback } from '@/lib/accepted-create';
+import { rollbackGateRefusal, rollbackRefusals } from '@/lib/hidden-operations';
 import { rollbackConsoleSandbox } from '@/lib/public-api';
 
 const { Text } = Typography;
@@ -27,7 +22,11 @@ export interface SnapshotRollback {
 
 // Roll a sandbox back and report how its operation ended, not only that it
 // was queued. `via` is the route its snapshots were listed from (null while
-// none is known); `onSettled` runs once the outcome is known.
+// none is known); `onSettled` runs once the outcome is known. A refusal is
+// shared with every panel of the organization (`rollbackRefusals`). The
+// rollback is followed only while this view shows the sandbox: unmounting,
+// or showing another sandbox, stops following it, so its outcome cannot
+// re-read a listing that is no longer shown.
 export function useSnapshotRollback({
   sandboxId,
   orgId,
@@ -40,48 +39,63 @@ export function useSnapshotRollback({
   onSettled?: () => void;
 }): SnapshotRollback {
   const { message } = App.useApp();
-  const [refusal, setRefusal] = useState<string | null>(() => rememberedRollbackRefusal(orgId));
+  const refusals = rollbackRefusals();
+  const subscribe = useCallback((listener: () => void) => refusals.subscribe(orgId, listener), [refusals, orgId]);
+  const refusal = useSyncExternalStore(subscribe, () => refusals.get(orgId), () => null);
   const [rollingBack, setRollingBack] = useState<string | null>(null);
-  useEffect(() => setRefusal(rememberedRollbackRefusal(orgId)), [orgId]);
+  // The rollbacks this view follows, each stopped when the view stops
+  // showing its sandbox.
+  const following = useRef(new Set<AbortController>());
+  useEffect(() => {
+    const followers = following.current;
+    return () => {
+      for (const follower of followers) follower.abort();
+      followers.clear();
+      setRollingBack(null);
+    };
+  }, [sandboxId]);
 
   const rollback = async (snapshotName: string) => {
-    if (!via || rollingBack || refusal) return;
-    const key = `rollback:${sandboxId}`;
+    // Checked right before sending: another panel may have been refused since
+    // this one rendered.
+    if (!via || rollingBack || refusals.get(orgId)) return;
+    const follower = new AbortController();
+    following.current.add(follower);
     setRollingBack(snapshotName);
     try {
-      let follow: () => Promise<unknown>;
+      let accepted: Awaited<ReturnType<typeof rollbackConsoleSandbox>>;
       try {
-        ({ follow } = await rollbackConsoleSandbox(sandboxId, snapshotName, via));
+        accepted = await rollbackConsoleSandbox(sandboxId, snapshotName, via);
       } catch (err: any) {
         const reason = rollbackGateRefusal(err, via);
         if (reason) {
-          rememberRollbackRefusal(orgId, reason);
-          setRefusal(reason);
+          refusals.remember(orgId, reason);
           message.info(reason);
           return;
         }
         message.error(err?.message || 'failed to queue rollback');
         return;
       }
-      message.open({ key, type: 'loading', content: `Rollback to ${snapshotName} queued; following it`, duration: 0 });
-      let failure: unknown | null = null;
-      try {
-        await follow();
-      } catch (err) {
-        failure = err;
-      }
-      const outcome = rollbackOutcome(snapshotName, failure);
-      message.open({ key, type: outcome.type, content: outcome.text, duration: outcome.type === 'success' ? 4 : 12 });
-      onSettled?.();
+      await followRollback({
+        snapshotName,
+        operationId: accepted.operationId,
+        follow: accepted.follow,
+        signal: follower.signal,
+        show: ({ key, type, text }) => message.open({
+          key,
+          type,
+          content: text,
+          duration: type === 'loading' ? 0 : type === 'success' ? 4 : type === 'info' ? 8 : 12,
+        }),
+        onSettled,
+      });
     } finally {
-      setRollingBack(null);
+      following.current.delete(follower);
+      if (!follower.signal.aborted) setRollingBack(null);
     }
   };
 
-  const tryAgain = () => {
-    forgetRollbackRefusal(orgId);
-    setRefusal(null);
-  };
+  const tryAgain = () => refusals.forget(orgId);
 
   return { refusal, rollingBack, rollback, tryAgain };
 }

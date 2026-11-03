@@ -131,6 +131,17 @@ export type SnapshotListing<T> =
 
 export const ADMIN_SNAPSHOT_PAGE_LIMIT = 1000;
 
+// What makes a snapshot view list: it opens (or shows another sandbox), its
+// own Refresh or Retry, a rollback it sent settles, or the page reloads (on a
+// timer, the page's Refresh, and after each action). Every view lists on the
+// first three. Another organization's snapshots come from the audited admin
+// list, so its view never lists on the page's reloads, which include a timer.
+export type SnapshotListingTrigger = 'open' | 'refresh' | 'rollback-settled' | 'page-reload';
+
+export function listsSnapshotsOn(trigger: SnapshotListingTrigger, ownOrg: boolean): boolean {
+  return ownOrg || trigger !== 'page-reload';
+}
+
 export async function listSnapshots<T>({
   ownOrg,
   readPublic,

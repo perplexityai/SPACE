@@ -2,8 +2,11 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   OperationFailedError,
+  OperationFollowStoppedError,
   OperationTimeoutError,
+  followRollback,
   pollOperation,
+  rollbackNoticeKey,
   rollbackOutcome,
   settleAcceptedCreate,
   terminalErrorParts,
@@ -158,4 +161,76 @@ test('a rollback outcome says done, failed with its reason, or still running', (
   assert.equal(unread.type, 'warning');
   assert.match(unread.text, /was queued, but its progress could not be read \(Failed to fetch\)/);
   for (const outcome of [failed, running, unread]) assert.doesNotMatch(outcome.text, /^Snapshot rollback queued$/);
+});
+
+test('a followed operation stops being read once its view stops following it', async () => {
+  const follower = new AbortController();
+  let reads = 0;
+  const following = pollOperation(async () => {
+    reads += 1;
+    if (reads === 2) follower.abort();
+    return record('running');
+  }, { timeoutMs: 60_000, intervalMs: 1_000, ...fakeClock(), signal: follower.signal });
+  await assert.rejects(following, (err) => err instanceof OperationFollowStoppedError);
+  assert.equal(reads, 2);
+  // Already stopped: nothing is read.
+  reads = 0;
+  await assert.rejects(
+    pollOperation(async () => { reads += 1; return record('running'); }, { timeoutMs: 60_000, intervalMs: 1_000, ...fakeClock(), signal: follower.signal }),
+    (err) => err instanceof OperationFollowStoppedError,
+  );
+  assert.equal(reads, 0);
+});
+
+// A rollback followed as `followRollback` follows it, with what it shows and
+// whether it read the snapshots again.
+const followed = (operationId, snapshotName, signal, follow) => {
+  const shown = [];
+  const result = { shown, settled: 0 };
+  result.done = followRollback({
+    snapshotName,
+    operationId,
+    follow,
+    signal,
+    show: (notice) => shown.push(notice),
+    onSettled: () => { result.settled += 1; },
+  });
+  return result;
+};
+
+test("each rollback's notification is its operation's, so an earlier one cannot replace a later one's", async () => {
+  let finishFirst;
+  const first = followed('op-1', 'checkpoint-1', new AbortController().signal, () => new Promise((resolve) => { finishFirst = resolve; }));
+  const second = followed('op-2', 'checkpoint-2', new AbortController().signal, async () => record('succeeded'));
+  await second.done;
+  finishFirst(record('succeeded'));
+  await first.done;
+  assert.deepEqual(first.shown.map((notice) => notice.key), [rollbackNoticeKey('op-1'), rollbackNoticeKey('op-1')]);
+  assert.deepEqual(second.shown.map((notice) => notice.key), [rollbackNoticeKey('op-2'), rollbackNoticeKey('op-2')]);
+  assert.notEqual(rollbackNoticeKey('op-1'), rollbackNoticeKey('op-2'));
+  assert.deepEqual(first.shown.map((notice) => notice.type), ['loading', 'success']);
+  assert.equal(first.settled, 1);
+  assert.equal(second.settled, 1);
+});
+
+test('a rollback whose view closed says the console stopped following it, and does not read the snapshots again', async () => {
+  const follower = new AbortController();
+  let reads = 0;
+  const closed = followed('op-3', 'checkpoint-3', follower.signal, (signal) => pollOperation(async () => {
+    reads += 1;
+    return record('running');
+  }, { timeoutMs: 60_000, intervalMs: 1_000, ...fakeClock(), signal }));
+  follower.abort();
+  await closed.done;
+  assert.equal(closed.settled, 0);
+  // The read in flight when the view closed, and none after it.
+  assert.equal(reads, 1);
+  assert.deepEqual(closed.shown.map((notice) => [notice.key, notice.type]), [['rollback:op-3', 'loading'], ['rollback:op-3', 'info']]);
+  assert.match(closed.shown[1].text, /was queued; the console stopped following it when its view closed/);
+  // Closed after its operation ended, before the view heard: still no read.
+  const late = new AbortController();
+  const ended = followed('op-4', 'checkpoint-4', late.signal, async () => { late.abort(); return record('failed'); });
+  await ended.done;
+  assert.equal(ended.settled, 0);
+  assert.equal(ended.shown.at(-1).type, 'info');
 });
