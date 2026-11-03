@@ -46,8 +46,8 @@ export async function getConsoleSandboxes(
 
 // One admin list request, built by `sandboxListQuery`: a page when the
 // server pages, or the bare array of a server that does not.
-export async function getConsoleSandboxList(query: string): Promise<SandboxListResponse> {
-  const response = parseSandboxListResponse(await adminApi.get<unknown>(`/v1/sandboxes?${query}`));
+export async function getConsoleSandboxList(query: string, signal?: AbortSignal): Promise<SandboxListResponse> {
+  const response = parseSandboxListResponse(await adminApi.get<unknown>(`/v1/sandboxes?${query}`, { signal }));
   return { ...response, sandboxes: response.sandboxes.map(adminSandboxToConsoleSandbox) };
 }
 

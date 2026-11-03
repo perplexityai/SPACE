@@ -4,6 +4,7 @@ import {
   SANDBOX_LIFECYCLE_STATES,
   SANDBOX_STATUS_FILTER_STATES,
   bringUpAction,
+  chooseAppliedStatuses,
   splitStatusFilter,
   statusFilterKey,
   statusFilterOptions,
@@ -70,4 +71,15 @@ test('a status a paged list cannot send is shown as not applied, not as a filter
   });
   // A sampled list matches each against its rows' statuses.
   assert.deepEqual(splitStatusFilter(false, ['unknown', 'started']), { applied: ['unknown', 'started'], notApplied: [] });
+});
+
+test('changing the lifecycle control keeps the statuses a paged list does not apply', () => {
+  const current = ['started', 'unknown', 'cleanup_failed'];
+  // Adding, removing and clearing lifecycles leaves the not-applied ones.
+  assert.deepEqual(chooseAppliedStatuses(true, current, ['started', 'paused']), ['started', 'paused', 'unknown', 'cleanup_failed']);
+  assert.deepEqual(chooseAppliedStatuses(true, current, []), ['unknown', 'cleanup_failed']);
+  const kept = chooseAppliedStatuses(true, current, ['suspended']);
+  assert.deepEqual(splitStatusFilter(true, kept), { applied: ['suspended'], notApplied: ['unknown', 'cleanup_failed'] });
+  // A sampled list applies every status, so the control holds them all.
+  assert.deepEqual(chooseAppliedStatuses(false, current, ['unknown']), ['unknown']);
 });

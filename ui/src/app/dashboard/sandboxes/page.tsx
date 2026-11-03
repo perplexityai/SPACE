@@ -8,6 +8,7 @@ import { usePathname, useSearchParams } from 'next/navigation';
 import {
   STORED_LIFECYCLE_FILTER_STATES,
   bringUpAction,
+  chooseAppliedStatuses,
   splitStatusFilter,
   statusFilterKey,
   statusFilterOptions,
@@ -41,8 +42,10 @@ import {
   CREATED_AGES,
   FIRST_PAGE,
   ListSelection,
+  OlderFormatAnswer,
   PAGE_SIZE_OPTIONS,
   createdAgeMs,
+  fragmentSearchScope,
   listRequestQuery,
   listSections,
   loadedRowFilter,
@@ -66,6 +69,7 @@ import {
   SNAPSHOTS_NOT_ENABLED,
   isHiddenOperationError,
 } from '@/lib/hidden-operations';
+import { PrefixRequests, supplementalMatches } from '@/lib/prefix-search';
 import { useAuth } from '@/lib/auth';
 import {
   AutoLifecyclePolicy,
@@ -127,7 +131,8 @@ function sandboxesRefreshKey(scope: ListScope): string {
 class RefreshSkipped extends Error {}
 const SCOPE_CHANGED = 'the selected page, filters or size changed';
 const VERSION_CHANGED = 'the API changed version while this page was open';
-// A load error, or a stopped list, the page already shows above the table.
+// A load error, a stopped list or an older-format answer, which the page
+// already shows above the table.
 class ShownListError extends Error {}
 const alreadyReported = (err: unknown) => err instanceof RefreshSkipped || err instanceof ShownListError;
 const REFRESH_CLICK_COOLDOWN_MS = 3000;
@@ -739,7 +744,8 @@ function SandboxesPage() {
   // The selected statuses this list applies, and those it cannot.
   const statusSplit = useMemo(() => splitStatusFilter(listMode === 'paged', statusFilter), [listMode, statusFilter]);
   // What the search box does on this list's shape: a direct lookup, a prefix
-  // the server matches, or a match within the loaded rows.
+  // the server matches, a match within the loaded rows, or both of the last
+  // two for hex digits and dashes.
   const search = useMemo(() => sandboxSearch(idFilter, listMode), [idFilter, listMode]);
   // The filters are those of a paged request whatever the shape on screen;
   // a sampled request sends only the org (`listScope`).
@@ -763,13 +769,23 @@ function SandboxesPage() {
   const [selection] = useState(() => new ListSelection({ filters: serverFilters(filterInputs), pageSize, sampleSize: listLimit }));
   // The selected scope and the next page's cursor, for rendering.
   const [selectedScope, setSelectedScope] = useState<ListScope>(() => selection.selected);
+  // Whether the first answer decided the list shape (`ListSelection.shapeDecided`).
+  const [shapeDecided, setShapeDecided] = useState(false);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   // The error of the last load; a load of another scope that failed clears
   // the rows rather than show them under the new label.
   const [listError, setListError] = useState<string | null>(null);
-  // An answer came in the other list shape from the first; the list reads
-  // nothing more until the page is reloaded.
+  // Only bare arrays answered paged requests, the list's or the prefix
+  // search's, for a minute (`STOP_AFTER_MISMATCH_MS`) and at least twenty
+  // times in a row (`STOP_AFTER_MISMATCHES`): the API went back to a version
+  // without paging, and the list reads nothing more until the page is
+  // reloaded. Until then each is a failed refresh (`olderFormat`), and any
+  // page between them starts both over. A hidden tab sends nothing, so its
+  // time alone does not stop the list.
   const [listStopped, setListStopped] = useState(false);
+  // The last answers included a bare array to a paged request, as during a
+  // rolling deploy; the rows on screen are kept while the list retries.
+  const [olderFormat, setOlderFormat] = useState(false);
   // A full identifier that matches no loaded row is looked up directly, so a
   // sandbox outside the loaded rows can still be found.
   const [lookup, setLookup] = useState<
@@ -779,6 +795,15 @@ function SandboxesPage() {
   >(null);
   const lookupInFlightRef = useRef<string | null>(null);
   const lookupTargetRef = useRef<string | null>(null);
+  // The names and IDs that start with a `fragment` search, from a request of
+  // its own (`fragmentSearchScope`), keyed by that request's scope.
+  const [fragmentMatches, setFragmentMatches] = useState<
+    { key: string; sandboxes: Sandbox[]; more: boolean; error: string | null } | null
+  >(null);
+  const fragmentTargetRef = useRef<string | null>(null);
+  const prefixRequestsRef = useRef<PrefixRequests | null>(null);
+  if (!prefixRequestsRef.current) prefixRequestsRef.current = new PrefixRequests();
+  const prefixRequests = prefixRequestsRef.current;
 
   useEffect(() => {
     const params = new URLSearchParams();
@@ -824,6 +849,16 @@ function SandboxesPage() {
   const selectionChanged = () => {
     setSelectedScope(selection.selected);
     setNextCursor(selection.nextCursor());
+    setShapeDecided(selection.shapeDecided);
+  };
+
+  // The list stopped (`ListSelection.noteAnswer`), on a load or on the prefix
+  // search's answer.
+  const stopList = (kept: boolean) => {
+    setListStopped(true);
+    selectionChanged();
+    // Rows of another org, page or filter are not shown under this one's label.
+    if (!kept) setSandboxes([]);
   };
 
   const refresh = async ({
@@ -841,10 +876,9 @@ function SandboxesPage() {
     if (result.kind === 'skipped') throw new RefreshSkipped(SCOPE_CHANGED);
     setLoading(false);
     selectionChanged();
+    setOlderFormat(selection.mismatches > 0);
     if (result.kind === 'stopped') {
-      setListStopped(true);
-      // Rows of another org, page or filter are not shown under this one's label.
-      if (!result.kept) setSandboxes([]);
+      stopList(result.kept);
       throw new ShownListError(VERSION_CHANGED);
     }
     // The shape and the page position on screen change with the rows.
@@ -862,6 +896,8 @@ function SandboxesPage() {
         // toast, reports it.
         throw new ShownListError(text);
       }
+      // The notice above the table reports an older format.
+      if (result.error instanceof OlderFormatAnswer) throw new ShownListError(text);
       // Keep the last rendered view when a node-local manager is briefly unavailable.
       throw new Error(text);
     }
@@ -1230,7 +1266,7 @@ function SandboxesPage() {
 
     // The server applied the rest on a paged list; see `loadedRowFilter`.
     return sandboxes.filter(loadedRowFilter(listMode, {
-      matchesSearch: search.kind === 'page' ? (s) => matchesSandboxQuery(search.query, s) : null,
+      matchesSearch: search.kind === 'page' || search.kind === 'fragment' ? (s) => matchesSandboxQuery(search.query, s) : null,
       template: templateFilter,
       statuses: statusSplit.applied,
       statusKey: statusFilterKey,
@@ -1292,6 +1328,68 @@ function SandboxesPage() {
   }, [lookupId, listGeneration]);
 
   const lookupPending = lookupId !== null && !(lookup?.publicId === lookupId && lookup.answered);
+
+  // Sent only once the first answer has decided the list shape: before then
+  // the page only assumes paging, and a server without it would answer this
+  // request with a bare array too.
+  const fragmentScope = useMemo(
+    () => (search.kind === 'fragment' && shapeDecided ? fragmentSearchScope(selectedScope, search.prefix) : null),
+    [search, selectedScope, shapeDecided],
+  );
+  // The request the search box names now; an answer for any other is dropped.
+  fragmentTargetRef.current = fragmentScope?.key ?? null;
+
+  useEffect(() => {
+    if (!fragmentScope || listStopped) return;
+    const scope = fragmentScope;
+    // Typing waits for a pause, as a prefix the list sends does; the next
+    // list load refreshes it again.
+    const timer = setTimeout(() => {
+      const ticket = prefixRequests.begin(scope.key);
+      getConsoleSandboxList(listRequestQuery(scope, Date.now()), ticket.signal)
+        .then((response) => {
+          if (!prefixRequests.applies(ticket, fragmentTargetRef.current)) return;
+          // A bare array counts toward stopping the list, as one answering
+          // the list does, and fails this refresh of the section.
+          const note = selection.noteAnswer('paged', response.mode);
+          setOlderFormat(selection.mismatches > 0);
+          if (note.kind === 'stopped') return stopList(note.kept);
+          // Not sent before then; should it answer first, it fails this refresh.
+          if (note.kind === 'undecided') throw new Error('the list has not loaded yet; retrying');
+          if (response.mode !== 'paged') throw new OlderFormatAnswer();
+          setFragmentMatches({ key: scope.key, sandboxes: response.sandboxes, more: response.nextCursor !== null, error: null });
+        })
+        .catch((err: any) => {
+          if (!prefixRequests.applies(ticket, fragmentTargetRef.current)) return;
+          const message = err?.message || 'search failed';
+          // A failed refresh keeps the last answer for the same search.
+          setFragmentMatches((prev) =>
+            prev?.key === scope.key ? { ...prev, error: message } : { key: scope.key, sandboxes: [], more: false, error: message });
+        });
+    }, 300);
+    return () => {
+      clearTimeout(timer);
+      prefixRequests.cancel();
+    };
+  }, [fragmentScope?.key, listGeneration, listStopped]);
+
+  const fragmentAnswer = fragmentScope && fragmentMatches?.key === fragmentScope.key ? fragmentMatches : null;
+  // The server applied every filter but the node filter.
+  // Matches the main table already shows are left out of it.
+  const fragmentRows = useMemo(
+    () => supplementalMatches(fragmentAnswer?.sandboxes ?? [], shownRows.sandboxes).filter(loadedRowFilter('paged', {
+      matchesSearch: null,
+      template: null,
+      statuses: [],
+      statusKey: statusFilterKey,
+      userId: null,
+      node: nodeFilter,
+      createdWithin: null,
+      olderThan: null,
+      now: Date.now(),
+    })),
+    [fragmentAnswer, nodeFilter, shownRows.sandboxes],
+  );
 
   // The window and the "older than" bound must leave a range between them;
   // a window that would not drops the bound.
@@ -1616,7 +1714,7 @@ function SandboxesPage() {
               aria-label="Search sandboxes"
             />
             {paged ? (
-              <Tooltip title="A name or ID prefix is searched on the server as typed. Names match case-sensitively; an ID prefix starts with sbx_ or is a dashed UUID start, and its hex matches in either case. Hex alone, such as the ID column's label, matches IDs and names within this page, ignoring case. A full ID or pod name is looked up directly.">
+              <Tooltip title="A name or ID prefix is searched on the server as typed. Names match case-sensitively; an ID prefix starts with sbx_ or is a dashed UUID start, and its hex matches in either case. Hex digits and dashes alone, such as the ID column's label or a name like e2e-1, are matched two ways: anywhere in the IDs and names of this page, ignoring case, and on the server as the start of any name or ID, listed after this page. A full ID or pod name is looked up directly.">
                 <QuestionCircleOutlined aria-label="About the search" style={{ color: 'rgba(0, 0, 0, 0.45)' }} />
               </Tooltip>
             ) : null}
@@ -1648,7 +1746,8 @@ function SandboxesPage() {
               size="small"
               placeholder={paged ? 'Stored lifecycle' : 'Status'}
               value={statusSplit.applied}
-              onChange={(value) => setStatusFilter(value as string[])}
+              // The control shows the applied statuses; the rest stay under "Not applied".
+              onChange={(value) => setStatusFilter((current) => chooseAppliedStatuses(paged, current, value as string[]))}
               options={statusFilterOptionList}
               allowClear
               style={{ minWidth: 180 }}
@@ -1776,7 +1875,14 @@ function SandboxesPage() {
         />
       ) : null}
 
-      {paged && search.kind === 'page' ? (
+      {paged && search.kind === 'fragment' ? (
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 12 }}
+          title={`"${idFilter.trim()}" matches IDs and names anywhere within page ${position.index + 1}, ignoring case, in the table below. Names and IDs that start with it are searched across the whole list and listed after this page; paste the full ID to look it up.`}
+        />
+      ) : paged && search.kind === 'page' ? (
         <Alert
           type="info"
           showIcon
@@ -1801,6 +1907,15 @@ function SandboxesPage() {
           style={{ marginBottom: 12 }}
           title={`${paged ? `Could not load page ${position.index + 1} of the sandboxes` : `Could not load the newest ${listLimit} sandboxes`}${orgFilter ? ` of ${orgNames.get(orgFilter) ?? orgFilter}` : ''}: ${listError}`}
           action={<Button size="small" onClick={refreshAndReport}>Retry</Button>}
+        />
+      ) : olderFormat ? (
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 12 }}
+          title={paged
+            ? 'The API answered in an older format; retrying, and keeping the rows on screen.'
+            : 'The API answered in an older format; retrying the switch to pages, and keeping the sample on screen.'}
         />
       ) : null}
 
@@ -1851,6 +1966,30 @@ function SandboxesPage() {
             options={PAGE_SIZE_OPTIONS.map((value) => ({ value, label: `${value} / page` }))}
             style={{ width: 110 }}
             aria-label="Sandboxes per page"
+          />
+        </div>
+      ) : null}
+
+      {/* Left out once an answer leaves nothing to show beyond the main table. */}
+      {paged && !listStopped && search.kind === 'fragment' && !(fragmentAnswer && !fragmentAnswer.error && fragmentRows.length === 0) ? (
+        <div style={{ marginTop: 24 }}>
+          <Title level={5} style={{ marginTop: 0 }}>
+            More matches beyond this page{fragmentAnswer ? ` (${fragmentRows.length}${fragmentAnswer.more && fragmentRows.length > 0 ? '+' : ''})` : ''}
+          </Title>
+          <Text type="secondary" style={{ display: 'block', fontSize: 12, marginBottom: 8 }}>
+            {`Names and IDs starting with "${search.prefix}", not already listed above. Searched on the server with the filters above: names that start with it, case-sensitively, and IDs that start with it. Names and IDs that contain it elsewhere, such as an ID ending in the ID column's label, match on the page above only.${fragmentAnswer?.more ? ` Showing the first ${pageSize}, newest first; type more of the name or ID to narrow them.` : ''}`}
+          </Text>
+          {fragmentAnswer?.error ? (
+            <Alert type="warning" showIcon style={{ marginBottom: 8 }} title={`Could not search names and IDs starting with "${search.prefix}": ${fragmentAnswer.error}`} />
+          ) : null}
+          <Table
+            columns={columns}
+            dataSource={fragmentRows}
+            rowKey="id"
+            loading={!fragmentAnswer}
+            size="small"
+            pagination={false}
+            scroll={{ x: 1280 }}
           />
         </div>
       ) : null}

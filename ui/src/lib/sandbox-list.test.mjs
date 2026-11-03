@@ -4,10 +4,14 @@ import {
   FIRST_PAGE,
   ListRequests,
   ListSelection,
+  OlderFormatAnswer,
+  STOP_AFTER_MISMATCHES,
+  STOP_AFTER_MISMATCH_MS,
   isTemplateName,
   NO_FILTERS,
   continuationFor,
   createdBounds,
+  fragmentSearchScope,
   listRequestQuery,
   listScope,
   listSections,
@@ -167,6 +171,17 @@ test('a sampled list filters every loaded row on everything but the org', () => 
 
 const scopeOf = (filters, cursor = '') => listScope('paged', { ...NO_FILTERS, ...filters }, { limit: 50, cursor });
 
+test('a fragment search reads the first page of the selected filters with it as the prefix', () => {
+  const selected = scopeOf({ template: 'alpha', lifecycles: ['started'] }, 'c3');
+  const scope = fragmentSearchScope(selected, 'e2e-1');
+  assert.deepEqual(parse(listRequestQuery(scope, NOW)), {
+    limit: '50', cursor: '', lifecycle: 'started', template: 'alpha', prefix: 'e2e-1',
+  });
+  // The list itself is read without it.
+  assert.equal(parse(listRequestQuery(selected, NOW)).prefix, undefined);
+  assert.equal(fragmentSearchScope(listScope('sampled', NO_FILTERS, { limit: 1000, cursor: '' }), 'e2e-1'), null);
+});
+
 test('an answer for a filter undone before it arrived is dropped, and the rows on screen are kept', () => {
   const requests = new ListRequests();
   const a = scopeOf({ template: 'alpha' });
@@ -241,10 +256,15 @@ function pendingRead() {
 }
 
 const page = (nextCursor, rows = [sandbox]) => ({ mode: 'paged', sandboxes: rows, nextCursor });
-const newSelection = (filters = {}) =>
-  new ListSelection({ filters: { ...NO_FILTERS, ...filters }, pageSize: 50, sampleSize: 1000 });
+// A clock the test moves; a selection made without one reads a fixed time.
+function testClock() {
+  let at = 0;
+  return { now: () => at, advance: (ms) => { at += ms; } };
+}
+const newSelection = (filters = {}, clock = testClock()) =>
+  new ListSelection({ filters: { ...NO_FILTERS, ...filters }, pageSize: 50, sampleSize: 1000, now: clock.now });
 
-test('Next follows the page shown, and a failed load leaves it off until a page answers', async () => {
+test('Next follows the page shown, and a failed load of another page leaves it off until a page answers', async () => {
   const selection = newSelection({ template: 'alpha' });
   assert.equal((await selection.load(selection.selected, reads(page('c1')).read)).kind, 'shown');
   assert.equal(selection.nextCursor(), 'c1');
@@ -262,17 +282,38 @@ test('Next follows the page shown, and a failed load leaves it off until a page 
   // The retry answers, with a page after it.
   assert.equal((await selection.load(selection.selected, reads(page('c2')).read)).kind, 'shown');
   assert.equal(selection.nextCursor(), 'c2');
-  // A refresh of page 2 fails: its rows stay on screen, and Next is off
-  // until a page answers again.
-  const refreshFailed = await selection.load(selection.selected, reads(new Error('unavailable')).read);
-  assert.equal(refreshFailed.kind, 'failed');
-  assert.equal(refreshFailed.kept, true);
-  assert.equal(selection.nextCursor(), null);
-  assert.equal(selection.nextPosition(), null);
   // Previous goes back by the visited cursor.
   assert.equal(selection.goTo(selection.previousPosition()), true);
   assert.equal(selection.selected.cursor, '');
   assert.equal(selection.goTo(selection.previousPosition()), false);
+});
+
+test('a failed refresh of the page on screen keeps its rows and its Next', async () => {
+  const selection = newSelection({ template: 'alpha' });
+  await selection.load(selection.selected, reads(page('c1')).read);
+  const pageOne = selection.selected;
+  // A background poll of the same page answers a retryable error.
+  const unavailable = Object.assign(new Error('service unavailable'), { status: 503 });
+  const failed = await selection.load(pageOne, reads(unavailable).read);
+  assert.equal(failed.kind, 'failed');
+  assert.equal(failed.kept, true);
+  assert.equal(sameScope(selection.shown, pageOne), true);
+  // The rows on screen and their next_cursor are still valid.
+  assert.equal(selection.nextCursor(), 'c1');
+  assert.equal(selection.goTo(selection.nextPosition()), true);
+  assert.equal(selection.selected.cursor, 'c1');
+  // A page that answers later replaces the continuation as before.
+  assert.equal((await selection.load(selection.selected, reads(page(null)).read)).kind, 'shown');
+  assert.equal(selection.nextCursor(), null);
+
+  // A failure after a filter change drops the rows shown, and their Next.
+  const other = newSelection({ template: 'alpha' });
+  await other.load(other.selected, reads(page('c1')).read);
+  other.select({ filters: { ...NO_FILTERS, template: 'beta' }, pageSize: 50, sampleSize: 1000 });
+  assert.equal((await other.load(other.selected, reads(unavailable).read)).kept, false);
+  other.select({ filters: { ...NO_FILTERS, template: 'alpha' }, pageSize: 50, sampleSize: 1000 });
+  assert.equal(other.shown, null);
+  assert.equal(other.nextCursor(), null);
 });
 
 test('an answer begun before Previous or Next is dropped, even when its page is selected again', async () => {
@@ -338,32 +379,281 @@ async function assertStaysStopped(selection, kept) {
   assert.deepEqual(await selection.load(selection.selected, reads().read), { kind: 'stopped', kept });
 }
 
-test('a shape change on a refresh of the shown scope stops the list and keeps its rows', async () => {
-  // A page view that pages, then a refresh answered by a server without paging.
+// A failed load answered by a bare array to a paged request.
+function assertOlderFormat(result, kept) {
+  assert.equal(result.kind, 'failed');
+  assert.ok(result.error instanceof OlderFormatAnswer);
+  assert.equal(result.kept, kept);
+}
+
+test('a bare array on a refresh of a paged list fails it, keeping its rows and Next', async () => {
+  // A page view that pages, then a refresh answered by an older replica.
   const paged = newSelection({ template: 'alpha' });
   await paged.load(paged.selected, reads(page('c1')).read);
   const pageOne = paged.selected;
   const refresh = reads(sampledAnswer);
-  assert.deepEqual(await paged.load(pageOne, refresh.read), { kind: 'stopped', kept: true });
-  // No sample is read, and the list stays as it was, without Next.
+  const result = await paged.load(pageOne, refresh.read);
+  assertOlderFormat(result, true);
+  assert.equal(sameScope(result.scope, pageOne), true);
+  // No sample is read; the page stays on screen with its Next, and is retried.
   assert.equal(refresh.sent.length, 1);
   assert.equal(paged.mode, 'paged');
+  assert.equal(paged.stopped, false);
+  assert.equal(paged.mismatches, 1);
   assert.equal(sameScope(paged.shown, pageOne), true);
-  await assertStaysStopped(paged, true);
-
-  // A page view that samples, then a refresh answered by a server that pages.
-  const sampled = newSelection();
-  await sampled.load(sampled.selected, reads(sampledAnswer, sample()).read);
-  const sampleScope = sampled.selected;
-  const probe = reads(page('c1'));
-  assert.deepEqual(await sampled.load(sampleScope, probe.read), { kind: 'stopped', kept: true });
-  assert.equal(probe.sent.length, 1);
-  assert.equal(sampled.mode, 'sampled');
-  assert.equal(sameScope(sampled.shown, sampleScope), true);
-  await assertStaysStopped(sampled, true);
+  assert.equal(paged.nextCursor(), 'c1');
+  // The retry reaches a replica that pages, and the count starts over.
+  assert.equal((await paged.load(pageOne, reads(page('c1')).read)).kind, 'shown');
+  assert.equal(paged.mismatches, 0);
 });
 
-test('a shape change after a filter change stops the list and clears the other scope\'s rows', async () => {
+// The refresh after a bare array comes on the next one-second check, and
+// the one after a page when the view is stale again.
+const RETRY_MS = 1_000;
+const POLL_MS = 10_000;
+
+test('a paged list stops only once bare arrays alone have answered for the window', async () => {
+  const clock = testClock();
+  const selection = newSelection({ template: 'alpha' }, clock);
+  await selection.load(selection.selected, reads(page('c1')).read);
+  const pageOne = selection.selected;
+  // Every replica is old: each refresh is retried a second later.
+  const firstMismatch = clock.now();
+  while (clock.now() - firstMismatch < STOP_AFTER_MISMATCH_MS) {
+    assertOlderFormat(await selection.load(pageOne, reads(sampledAnswer).read), true);
+    assert.equal(selection.stopped, false);
+    assert.equal(selection.nextCursor(), 'c1');
+    clock.advance(RETRY_MS);
+  }
+  // The answer a full window after the first: the API no longer pages. The
+  // rows stay, without Next.
+  assert.deepEqual(await selection.load(pageOne, reads(sampledAnswer).read), { kind: 'stopped', kept: true });
+  assert.equal(sameScope(selection.shown, pageOne), true);
+  await assertStaysStopped(selection, true);
+
+  // Bare arrays that span the window but are fewer than
+  // `STOP_AFTER_MISMATCHES` do not stop the list; the one that makes the
+  // count does.
+  const sparse = newSelection({ template: 'alpha' }, clock);
+  await sparse.load(sparse.selected, reads(page(null)).read);
+  assertOlderFormat(await sparse.load(sparse.selected, reads(sampledAnswer).read), true);
+  clock.advance(STOP_AFTER_MISMATCH_MS);
+  for (let i = 2; i < STOP_AFTER_MISMATCHES; i += 1) {
+    assertOlderFormat(await sparse.load(sparse.selected, reads(sampledAnswer).read), true);
+    assert.equal(sparse.stopped, false);
+    clock.advance(RETRY_MS);
+  }
+  assert.equal(sparse.mismatches, STOP_AFTER_MISMATCHES - 1);
+  assert.deepEqual(await sparse.load(sparse.selected, reads(sampledAnswer).read), { kind: 'stopped', kept: true });
+});
+
+test('a pause after a bare array, as in a hidden tab, does not count toward stopping the list', async () => {
+  const clock = testClock();
+  const selection = newSelection({ template: 'alpha' }, clock);
+  await selection.load(selection.selected, reads(page('c1')).read);
+  const pageOne = selection.selected;
+  assertOlderFormat(await selection.load(pageOne, reads(sampledAnswer).read), true);
+  // Nothing is sent while the tab is hidden or the laptop sleeps.
+  clock.advance(10 * STOP_AFTER_MISMATCH_MS);
+  for (let i = 0; i < 2; i += 1) {
+    assertOlderFormat(await selection.load(pageOne, reads(sampledAnswer).read), true);
+    clock.advance(RETRY_MS);
+  }
+  assert.equal(selection.stopped, false);
+  assert.equal(selection.mismatches, 3);
+  assert.equal(sameScope(selection.shown, pageOne), true);
+  assert.equal(selection.nextCursor(), 'c1');
+});
+
+test('interleaved old and new answers over several minutes never stop a paged list', async () => {
+  // Each pattern repeats for ten minutes: old and new in turn, and runs of
+  // bare arrays that last just under the window before a page answers.
+  const almostWindow = [...Array(STOP_AFTER_MISMATCH_MS / RETRY_MS).fill(sampledAnswer), page('c1')];
+  for (const pattern of [[sampledAnswer, page('c1')], [sampledAnswer, sampledAnswer, sampledAnswer, page('c1')], almostWindow]) {
+    const clock = testClock();
+    const selection = newSelection({ template: 'alpha' }, clock);
+    await selection.load(selection.selected, reads(page('c1')).read);
+    const pageOne = selection.selected;
+    let answers = 0;
+    while (clock.now() < 10 * 60_000) {
+      const answer = pattern[answers % pattern.length];
+      answers += 1;
+      const result = await selection.load(pageOne, reads(answer).read);
+      if (answer.mode === 'paged') assert.equal(result.kind, 'shown');
+      else assertOlderFormat(result, true);
+      assert.equal(selection.stopped, false);
+      assert.equal(sameScope(selection.shown, pageOne), true);
+      assert.equal(selection.nextCursor(), 'c1');
+      clock.advance(answer.mode === 'paged' ? POLL_MS : RETRY_MS);
+    }
+    assert.ok(answers > 100);
+  }
+});
+
+test('a bare array answering the prefix search counts toward stopping the list', async () => {
+  const clock = testClock();
+  const selection = newSelection({}, clock);
+  await selection.load(selection.selected, reads(page('c1')).read);
+  assertOlderFormat(await selection.load(selection.selected, reads(sampledAnswer).read), true);
+  clock.advance(STOP_AFTER_MISMATCH_MS);
+  assert.deepEqual(selection.noteAnswer('paged', 'sampled'), { kind: 'mismatched' });
+  // A page for the prefix search starts the window over, as one for the list does.
+  assert.deepEqual(selection.noteAnswer('paged', 'paged'), { kind: 'counted' });
+  assert.equal(selection.mismatches, 0);
+  assertOlderFormat(await selection.load(selection.selected, reads(sampledAnswer).read), true);
+  for (let i = 2; i < STOP_AFTER_MISMATCHES; i += 1) {
+    assert.deepEqual(selection.noteAnswer('paged', 'sampled'), { kind: 'mismatched' });
+  }
+  clock.advance(STOP_AFTER_MISMATCH_MS);
+  // The prefix search's answer that makes the count, a window after the
+  // list's first bare array.
+  assert.deepEqual(selection.noteAnswer('paged', 'sampled'), { kind: 'stopped', kept: true });
+  await assertStaysStopped(selection, true);
+});
+
+test('a prefix answer before the first answer of the list neither counts nor starts over', async () => {
+  const clock = testClock();
+  // A server without paging, whose first list answer is slow.
+  const slow = newSelection({}, clock);
+  assert.equal(slow.shapeDecided, false);
+  const first = pendingRead();
+  const sent = [];
+  const answers = [first.read, async () => sample()];
+  const loading = slow.load(slow.selected, (scope) => {
+    sent.push(scope);
+    return answers.shift()();
+  });
+  // Prefix answers arrive first, for a whole window: they say nothing, so
+  // no older-format notice shows and the list does not stop.
+  for (let i = 0; i <= STOP_AFTER_MISMATCHES; i += 1) {
+    assert.deepEqual(slow.noteAnswer('paged', 'sampled'), { kind: 'undecided' });
+    assert.equal(slow.mismatches, 0);
+    clock.advance(STOP_AFTER_MISMATCH_MS);
+  }
+  assert.equal(slow.shapeDecided, false);
+  first.answer(sampledAnswer);
+  // The first answer decides, and the sample loads.
+  const result = await loading;
+  assert.equal(result.kind, 'shown');
+  assert.equal(result.scope.mode, 'sampled');
+  assert.equal(sent.length, 2);
+  assert.equal(slow.shapeDecided, true);
+  assert.equal(slow.stopped, false);
+
+  // A page answering before the list's first answer says nothing either.
+  const paged = newSelection({}, clock);
+  const pending = pendingRead();
+  const pagedLoad = paged.load(paged.selected, pending.read);
+  assert.deepEqual(paged.noteAnswer('paged', 'paged'), { kind: 'undecided' });
+  pending.answer(page(null));
+  assert.equal((await pagedLoad).kind, 'shown');
+  assert.equal(paged.shapeDecided, true);
+  assert.deepEqual(paged.noteAnswer('paged', 'paged'), { kind: 'counted' });
+});
+
+test('a page answering a sampled list switches it to paging at the first page, with every filter', async () => {
+  const org = '0193a000-0000-7000-8000-000000000001';
+  const selection = newSelection({ org, template: 'alpha', lifecycles: ['started'] });
+  await selection.load(selection.selected, reads(sampledAnswer, sample()).read);
+  assert.equal(selection.mode, 'sampled');
+  const sampleScope = selection.selected;
+  // A poll of the sample, answered by a server that now pages: its page was
+  // filtered by the org only, so the first page is read with every filter.
+  const poll = reads(page('ignored', []), page('c1'));
+  const result = await selection.load(sampleScope, poll.read);
+  assert.equal(result.kind, 'shown');
+  assert.equal(result.scope.mode, 'paged');
+  assert.equal(selection.mode, 'paged');
+  assert.equal(selection.stopped, false);
+  assert.deepEqual(selection.position, FIRST_PAGE);
+  assert.deepEqual(poll.sent.map((scope) => Object.fromEntries(new URLSearchParams(listRequestQuery(scope, 0)))), [
+    { limit: '1000', cursor: '', org_id: org },
+    { limit: '50', cursor: '', org_id: org, lifecycle: 'started', template: 'alpha' },
+  ]);
+  assert.equal(sameScope(selection.shown, selection.selected), true);
+  assert.equal(selection.nextCursor(), 'c1');
+  // It pages from then on; a bare array after it is a failed refresh.
+  assert.equal(selection.goTo(selection.nextPosition()), true);
+  assert.equal((await selection.load(selection.selected, reads(page(null)).read)).kind, 'shown');
+  assertOlderFormat(await selection.load(selection.selected, reads(sampledAnswer).read), true);
+  assert.equal(selection.mode, 'paged');
+});
+
+test('a sampled list keeps its sample until a first page answers, through interleaved shapes', async () => {
+  const selection = newSelection({ template: 'alpha' });
+  await selection.load(selection.selected, reads(sampledAnswer, sample()).read);
+  const sampleScope = selection.selected;
+  const keepsSample = () => {
+    assert.equal(selection.mode, 'sampled');
+    assert.equal(sameScope(selection.shown, sampleScope), true);
+    assert.equal(selection.stopped, false);
+  };
+  // The poll reaches a replica that pages and the reread one that does not.
+  let poll = reads(page(null), sampledAnswer);
+  const flapped = await selection.load(sampleScope, poll.read);
+  assertOlderFormat(flapped, true);
+  assert.equal(sameScope(flapped.scope, sampleScope), true);
+  assert.equal(poll.sent.length, 2);
+  keepsSample();
+  // The reread fails outright.
+  const failed = await selection.load(sampleScope, reads(page(null), new Error('unavailable')).read);
+  assert.equal(failed.kind, 'failed');
+  assert.equal(failed.kept, true);
+  keepsSample();
+  // Another flap: the rereads' bare arrays are not in a row, since each poll
+  // was answered by a page first, so the list does not stop.
+  for (let i = 0; i < STOP_AFTER_MISMATCHES; i += 1) {
+    assertOlderFormat(await selection.load(sampleScope, reads(page(null), sampledAnswer).read), true);
+    keepsSample();
+  }
+  // An older replica answers the sample, which refreshes it.
+  assert.equal((await selection.load(sampleScope, reads(sample()).read)).kind, 'shown');
+  keepsSample();
+  // The reread answers a page: only now does the list switch, to that page.
+  poll = reads(page(null), page('c1', [sandbox]));
+  const switched = await selection.load(sampleScope, poll.read);
+  assert.equal(switched.kind, 'shown');
+  assert.equal(switched.scope.mode, 'paged');
+  assert.equal(switched.response.mode, 'paged');
+  assert.equal(selection.mode, 'paged');
+  assert.equal(sameScope(selection.shown, selection.selected), true);
+  assert.equal(selection.nextCursor(), 'c1');
+});
+
+test('a filter changed while a sampled list reads its first page is read again before it switches', async () => {
+  const sizes = { pageSize: 50, sampleSize: 1000 };
+  const selection = newSelection({ template: 'alpha' });
+  await selection.load(selection.selected, reads(sampledAnswer, sample()).read);
+  const sampleScope = selection.selected;
+  // A poll of the sample answers a page, and the first page with alpha is
+  // read. Beta is chosen before it answers; the sample does not send the
+  // template, so the selected request is the same.
+  const alphaRow = { ...sandbox, id: 'sbx_01a19089-216f-751e-9f56-1906865f5c24', template: 'alpha' };
+  const betaRow = { ...sandbox, template: 'beta' };
+  const forAlpha = pendingRead();
+  const sent = [];
+  const answers = [page(null, []), forAlpha.read, page('c1', [betaRow])];
+  const inFlight = selection.load(sampleScope, async (scope) => {
+    sent.push(scope);
+    const answer = answers.shift();
+    return typeof answer === 'function' ? answer() : answer;
+  });
+  await new Promise((done) => setImmediate(done));
+  assert.equal(sent.length, 2);
+  assert.equal(selection.select({ filters: { ...NO_FILTERS, template: 'beta' }, ...sizes }), 'unchanged');
+  forAlpha.answer(page(null, [alphaRow]));
+  // Alpha's page is not shown under beta; beta's first page is read and shown.
+  const result = await inFlight;
+  assert.equal(result.kind, 'shown');
+  assert.deepEqual(sent.map((scope) => scope.filters.template), [null, 'alpha', 'beta']);
+  assert.equal(result.scope.filters.template, 'beta');
+  assert.deepEqual(result.response.sandboxes, [betaRow]);
+  assert.equal(selection.mode, 'paged');
+  assert.equal(sameScope(selection.shown, selection.selected), true);
+  assert.equal(selection.nextCursor(), 'c1');
+});
+
+test('a bare array after a filter change fails the load and clears the other scope\'s rows', async () => {
   const sizes = { pageSize: 50, sampleSize: 1000 };
   const orgA = { ...NO_FILTERS, org: '0193a000-0000-7000-8000-000000000001' };
   const orgB = { ...NO_FILTERS, org: '0193a000-0000-7000-8000-000000000003' };
@@ -372,36 +662,35 @@ test('a shape change after a filter change stops the list and clears the other s
   // B is selected while A's page is shown, and answered by a bare array.
   assert.equal(selection.select({ filters: orgB, ...sizes }), 'load');
   const forB = reads(sampledAnswer);
-  assert.deepEqual(await selection.load(selection.selected, forB.read), { kind: 'stopped', kept: false });
+  assertOlderFormat(await selection.load(selection.selected, forB.read), false);
   assert.equal(forB.sent.length, 1);
   assert.equal(selection.shown, null);
-  await assertStaysStopped(selection, false);
-  // A again: its rows were cleared, so there is nothing to keep, and nothing is read.
-  assert.equal(selection.select({ filters: orgA, ...sizes }), 'load');
-  await assertStaysStopped(selection, false);
+  assert.equal(selection.mode, 'paged');
+  // The retry answers B's page.
+  assert.equal((await selection.load(selection.selected, reads(page(null)).read)).kind, 'shown');
 
   // A sampled list, whose sample request a server that pages answers after
-  // an org change.
+  // an org change: it switches to paging and reads B's first page.
   const sampled = newSelection(orgA);
   await sampled.load(sampled.selected, reads(sampledAnswer, sample()).read);
   assert.equal(sampled.select({ filters: orgB, ...sizes }), 'load');
-  assert.deepEqual(await sampled.load(sampled.selected, reads(page(null)).read), { kind: 'stopped', kept: false });
-  await assertStaysStopped(sampled, false);
+  const upgraded = await sampled.load(sampled.selected, reads(page(null), page(null)).read);
+  assert.equal(upgraded.kind, 'shown');
+  assert.equal(upgraded.scope.mode, 'paged');
+  assert.equal(upgraded.scope.filters.org, orgB.org);
 });
 
-test('a shape change after Next stops the list and clears the previous page', async () => {
+test('a bare array answering Next fails it and clears the previous page', async () => {
   const selection = newSelection({ template: 'alpha' });
   await selection.load(selection.selected, reads(page('c1')).read);
   assert.equal(selection.goTo(selection.nextPosition()), true);
   const pageTwo = reads(sampledAnswer);
-  assert.deepEqual(await selection.load(selection.selected, pageTwo.read), { kind: 'stopped', kept: false });
+  assertOlderFormat(await selection.load(selection.selected, pageTwo.read), false);
   assert.equal(pageTwo.sent.length, 1);
+  // Page 1's rows are not shown under page 2's label.
   assert.equal(selection.shown, null);
   assert.equal(selection.mode, 'paged');
-  await assertStaysStopped(selection, false);
-  // Previous does not bring page 1's rows back without a read.
-  assert.equal(selection.goTo(selection.previousPosition()), true);
-  await assertStaysStopped(selection, false);
+  assert.equal((await selection.load(selection.selected, reads(page(null)).read)).kind, 'shown');
 });
 
 test('a filter change always restarts paging at the first page', async () => {
