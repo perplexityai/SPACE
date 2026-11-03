@@ -27,11 +27,11 @@ fn every_accepted_form_names_the_same_sandbox() {
         format!(" {UUID}\t"),
         format!("\nsbx_{UUID} "),
     ];
-    for form in accepted {
+    for (case, form) in accepted.iter().enumerate() {
         assert_eq!(
-            parse_admin_sandbox_id(&form),
+            parse_admin_sandbox_id(form),
             Ok(sandbox()),
-            "{form} should resolve"
+            "accepted form #{case} should resolve"
         );
     }
 }

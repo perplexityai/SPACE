@@ -167,9 +167,14 @@ async fn the_list_pages_by_cursor_and_keeps_the_unpaged_array() -> TestDbResult<
             walk
         }),
     ] {
+        let label = if scope.is_empty() {
+            "unscoped"
+        } else {
+            "org-scoped"
+        };
         let (status, unpaged) = harness.get(&format!("/sandboxes?{scope}limit=2")).await;
-        assert_eq!(status, StatusCode::OK, "{scope}: {unpaged}");
-        assert_eq!(ids(&unpaged), first_page, "{scope}");
+        assert_eq!(status, StatusCode::OK, "{label}: unpaged list status");
+        assert_eq!(ids(&unpaged), first_page, "{label}");
 
         let mut walked = Vec::new();
         let mut cursor = String::new();
@@ -178,12 +183,12 @@ async fn the_list_pages_by_cursor_and_keeps_the_unpaged_array() -> TestDbResult<
             let (status, page) = harness
                 .get(&format!("/sandboxes?{scope}limit=2&cursor={cursor}"))
                 .await;
-            assert_eq!(status, StatusCode::OK, "{scope}: {page}");
+            assert_eq!(status, StatusCode::OK, "{label}: page status");
             let rows = ids(&page["sandboxes"]);
             if pages == 0 {
                 assert_eq!(
                     rows, first_page,
-                    "{scope}: the first page is the unpaged list"
+                    "{label}: the first page is the unpaged list"
                 );
             }
             walked.extend(rows);
@@ -192,11 +197,11 @@ async fn the_list_pages_by_cursor_and_keeps_the_unpaged_array() -> TestDbResult<
                 Some(Value::String(next)) => cursor = next.clone(),
                 // `null`, never absent, on the last page.
                 Some(Value::Null) => break,
-                other => panic!("{scope}: next_cursor {other:?}"),
+                _ => panic!("{label}: unexpected next_cursor"),
             }
         }
-        assert_eq!(pages, 3, "{scope}");
-        assert_eq!(walked, walk, "{scope}");
+        assert_eq!(pages, 3, "{label}");
+        assert_eq!(walked, walk, "{label}");
     }
 
     let (status, filtered) = harness.get("/sandboxes?lifecycle=started&cursor=").await;
@@ -392,13 +397,13 @@ async fn every_admin_sandbox_route_takes_every_id_form() -> TestDbResult<()> {
         format!("space-sbx-{undashed}-g1"),
         format!("space-sbx-{undashed}"),
     ];
-    for form in &forms {
+    for (case, form) in forms.iter().enumerate() {
         let (status, body) = harness.get(&format!("/sandboxes/{form}")).await;
-        assert_eq!(status, StatusCode::OK, "GET {form}: {body}");
-        assert_eq!(body["id"], sandbox_id.to_string(), "GET {form}");
+        assert_eq!(status, StatusCode::OK, "GET form #{case}");
+        assert_eq!(body["id"], sandbox_id.to_string(), "GET form #{case}");
 
-        let (status, body) = harness.get(&format!("/debug/sandbox/{form}")).await;
-        assert_eq!(status, StatusCode::OK, "debug {form}: {body}");
+        let (status, _) = harness.get(&format!("/debug/sandbox/{form}")).await;
+        assert_eq!(status, StatusCode::OK, "debug form #{case}");
 
         let (status, body) = harness
             .request(
@@ -408,8 +413,8 @@ async fn every_admin_sandbox_route_takes_every_id_form() -> TestDbResult<()> {
                 None,
             )
             .await;
-        assert_eq!(status, StatusCode::ACCEPTED, "force-stop {form}: {body}");
-        assert_eq!(body["sandbox_id"], public_id, "force-stop {form}");
+        assert_eq!(status, StatusCode::ACCEPTED, "force-stop form #{case}");
+        assert_eq!(body["sandbox_id"], public_id, "force-stop form #{case}");
 
         let (status, body) = harness
             .request(
@@ -419,10 +424,10 @@ async fn every_admin_sandbox_route_takes_every_id_form() -> TestDbResult<()> {
                 Some(json!({"metadata": {"listed": "yes"}})),
             )
             .await;
-        assert_eq!(status, StatusCode::ACCEPTED, "PATCH {form}: {body}");
-        assert_eq!(body["sandbox_id"], public_id, "PATCH {form}");
+        assert_eq!(status, StatusCode::ACCEPTED, "PATCH form #{case}");
+        assert_eq!(body["sandbox_id"], public_id, "PATCH form #{case}");
 
-        let (status, body) = harness
+        let (status, _) = harness
             .request(
                 &harness.admin_token,
                 Method::POST,
@@ -430,8 +435,8 @@ async fn every_admin_sandbox_route_takes_every_id_form() -> TestDbResult<()> {
                 Some(json!({"command": ["true"]})),
             )
             .await;
-        assert_ne!(status, StatusCode::BAD_REQUEST, "commands {form}: {body}");
-        assert_ne!(status, StatusCode::NOT_FOUND, "commands {form}: {body}");
+        assert_ne!(status, StatusCode::BAD_REQUEST, "commands form #{case}");
+        assert_ne!(status, StatusCode::NOT_FOUND, "commands form #{case}");
     }
 
     let unknown = format!("{{{sandbox_id}}}");
