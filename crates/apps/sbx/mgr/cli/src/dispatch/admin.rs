@@ -135,6 +135,7 @@ pub(super) async fn handle(
             let short_id = sandbox_label(sandbox_id.as_str());
             let current_generation = client
                 .get_network_policy(GetNetworkPolicyRequest {
+                    observe_gateway: false,
                     sandbox_ids: vec![sandbox_id.to_string()],
                 })
                 .await
@@ -176,6 +177,7 @@ pub(super) async fn handle(
             } else {
                 let response = client
                     .get_network_policy(GetNetworkPolicyRequest {
+                        observe_gateway: false,
                         sandbox_ids: vec![sandbox_id.to_string()],
                     })
                     .await

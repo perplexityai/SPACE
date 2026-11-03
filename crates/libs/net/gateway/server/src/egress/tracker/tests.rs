@@ -417,3 +417,21 @@ fn exempt_tls_survives_dns_expiry_but_rechecks_current_policy() {
         }
     }
 }
+
+#[test]
+fn revocation_observation_waits_for_the_relay_lifetime() {
+    let tracker = DnsAttributedTcpTracker::default();
+    let cache = DnsAllowCache::default();
+    let guard = tracker.register(
+        "93.184.216.34:443".parse().unwrap(),
+        ClientHelloScan::NotTls,
+        &v1_allow_all(),
+        &cache,
+        CancellationToken::new(),
+    );
+    assert_eq!(tracker.pending_revocations(), 0);
+    tracker.cancel_denied(&v1_deny_all(), &cache);
+    assert_eq!(tracker.pending_revocations(), 1);
+    drop(guard);
+    assert_eq!(tracker.pending_revocations(), 0);
+}

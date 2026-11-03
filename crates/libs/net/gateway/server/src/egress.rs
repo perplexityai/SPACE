@@ -13,6 +13,7 @@ mod tcp;
 mod tracker;
 pub(crate) use tcp::{AdmittedTcp, TcpAdmissionDenial, admit_tcp, missing_client_hello};
 pub use tracker::DnsAttributedTcpTracker;
+pub(crate) use tracker::TcpConnectionGuard;
 
 /// Transport an egress decision applies to.
 ///

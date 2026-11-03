@@ -670,8 +670,10 @@ type GetNetworkStateResponse struct {
 	// Live readiness of the TLS-interception dependencies. Informational for
 	// sandbox-manager and operators; never an input to the sandbox start gate.
 	InterceptionReadiness InterceptionReadiness `protobuf:"varint,18,opt,name=interception_readiness,json=interceptionReadiness,proto3,enum=space.net.gateway.v1.InterceptionReadiness" json:"interception_readiness,omitempty"`
-	unknownFields         protoimpl.UnknownFields
-	sizeCache             protoimpl.SizeCache
+	// Present only on gateways supporting live policy observations.
+	PolicyObservation *PolicyObservation `protobuf:"bytes,19,opt,name=policy_observation,json=policyObservation,proto3" json:"policy_observation,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *GetNetworkStateResponse) Reset() {
@@ -802,6 +804,67 @@ func (x *GetNetworkStateResponse) GetInterceptionReadiness() InterceptionReadine
 	return InterceptionReadiness_INTERCEPTION_READINESS_UNSPECIFIED
 }
 
+func (x *GetNetworkStateResponse) GetPolicyObservation() *PolicyObservation {
+	if x != nil {
+		return x.PolicyObservation
+	}
+	return nil
+}
+
+type PolicyObservation struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Changes on every gateway process start.
+	GatewayInstance string `protobuf:"bytes,1,opt,name=gateway_instance,json=gatewayInstance,proto3" json:"gateway_instance,omitempty"`
+	// Cancelled relays still holding their connection lifetime guard.
+	PendingTcpRevocations uint64 `protobuf:"varint,2,opt,name=pending_tcp_revocations,json=pendingTcpRevocations,proto3" json:"pending_tcp_revocations,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
+}
+
+func (x *PolicyObservation) Reset() {
+	*x = PolicyObservation{}
+	mi := &file_net_gateway_v1_gateway_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PolicyObservation) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PolicyObservation) ProtoMessage() {}
+
+func (x *PolicyObservation) ProtoReflect() protoreflect.Message {
+	mi := &file_net_gateway_v1_gateway_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PolicyObservation.ProtoReflect.Descriptor instead.
+func (*PolicyObservation) Descriptor() ([]byte, []int) {
+	return file_net_gateway_v1_gateway_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *PolicyObservation) GetGatewayInstance() string {
+	if x != nil {
+		return x.GatewayInstance
+	}
+	return ""
+}
+
+func (x *PolicyObservation) GetPendingTcpRevocations() uint64 {
+	if x != nil {
+		return x.PendingTcpRevocations
+	}
+	return 0
+}
+
 type RefreshNetworkPolicyRequest struct {
 	state             protoimpl.MessageState `protogen:"open.v1"`
 	ExpectedPolicyRef string                 `protobuf:"bytes,1,opt,name=expected_policy_ref,json=expectedPolicyRef,proto3" json:"expected_policy_ref,omitempty"`
@@ -812,7 +875,7 @@ type RefreshNetworkPolicyRequest struct {
 
 func (x *RefreshNetworkPolicyRequest) Reset() {
 	*x = RefreshNetworkPolicyRequest{}
-	mi := &file_net_gateway_v1_gateway_proto_msgTypes[6]
+	mi := &file_net_gateway_v1_gateway_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -824,7 +887,7 @@ func (x *RefreshNetworkPolicyRequest) String() string {
 func (*RefreshNetworkPolicyRequest) ProtoMessage() {}
 
 func (x *RefreshNetworkPolicyRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_net_gateway_v1_gateway_proto_msgTypes[6]
+	mi := &file_net_gateway_v1_gateway_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -837,7 +900,7 @@ func (x *RefreshNetworkPolicyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RefreshNetworkPolicyRequest.ProtoReflect.Descriptor instead.
 func (*RefreshNetworkPolicyRequest) Descriptor() ([]byte, []int) {
-	return file_net_gateway_v1_gateway_proto_rawDescGZIP(), []int{6}
+	return file_net_gateway_v1_gateway_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *RefreshNetworkPolicyRequest) GetExpectedPolicyRef() string {
@@ -871,7 +934,7 @@ type RefreshNetworkPolicyResponse struct {
 
 func (x *RefreshNetworkPolicyResponse) Reset() {
 	*x = RefreshNetworkPolicyResponse{}
-	mi := &file_net_gateway_v1_gateway_proto_msgTypes[7]
+	mi := &file_net_gateway_v1_gateway_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -883,7 +946,7 @@ func (x *RefreshNetworkPolicyResponse) String() string {
 func (*RefreshNetworkPolicyResponse) ProtoMessage() {}
 
 func (x *RefreshNetworkPolicyResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_net_gateway_v1_gateway_proto_msgTypes[7]
+	mi := &file_net_gateway_v1_gateway_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -896,7 +959,7 @@ func (x *RefreshNetworkPolicyResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RefreshNetworkPolicyResponse.ProtoReflect.Descriptor instead.
 func (*RefreshNetworkPolicyResponse) Descriptor() ([]byte, []int) {
-	return file_net_gateway_v1_gateway_proto_rawDescGZIP(), []int{7}
+	return file_net_gateway_v1_gateway_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *RefreshNetworkPolicyResponse) GetState() NetworkState {
@@ -950,7 +1013,7 @@ type SetNoIdentityRequest struct {
 
 func (x *SetNoIdentityRequest) Reset() {
 	*x = SetNoIdentityRequest{}
-	mi := &file_net_gateway_v1_gateway_proto_msgTypes[8]
+	mi := &file_net_gateway_v1_gateway_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -962,7 +1025,7 @@ func (x *SetNoIdentityRequest) String() string {
 func (*SetNoIdentityRequest) ProtoMessage() {}
 
 func (x *SetNoIdentityRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_net_gateway_v1_gateway_proto_msgTypes[8]
+	mi := &file_net_gateway_v1_gateway_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -975,7 +1038,7 @@ func (x *SetNoIdentityRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetNoIdentityRequest.ProtoReflect.Descriptor instead.
 func (*SetNoIdentityRequest) Descriptor() ([]byte, []int) {
-	return file_net_gateway_v1_gateway_proto_rawDescGZIP(), []int{8}
+	return file_net_gateway_v1_gateway_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *SetNoIdentityRequest) GetReason() string {
@@ -998,7 +1061,7 @@ type SetNoIdentityResponse struct {
 
 func (x *SetNoIdentityResponse) Reset() {
 	*x = SetNoIdentityResponse{}
-	mi := &file_net_gateway_v1_gateway_proto_msgTypes[9]
+	mi := &file_net_gateway_v1_gateway_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1010,7 +1073,7 @@ func (x *SetNoIdentityResponse) String() string {
 func (*SetNoIdentityResponse) ProtoMessage() {}
 
 func (x *SetNoIdentityResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_net_gateway_v1_gateway_proto_msgTypes[9]
+	mi := &file_net_gateway_v1_gateway_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1023,7 +1086,7 @@ func (x *SetNoIdentityResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetNoIdentityResponse.ProtoReflect.Descriptor instead.
 func (*SetNoIdentityResponse) Descriptor() ([]byte, []int) {
-	return file_net_gateway_v1_gateway_proto_rawDescGZIP(), []int{9}
+	return file_net_gateway_v1_gateway_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *SetNoIdentityResponse) GetState() NetworkState {
@@ -1069,7 +1132,7 @@ type GetNetworkPolicyRequest struct {
 
 func (x *GetNetworkPolicyRequest) Reset() {
 	*x = GetNetworkPolicyRequest{}
-	mi := &file_net_gateway_v1_gateway_proto_msgTypes[10]
+	mi := &file_net_gateway_v1_gateway_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1081,7 +1144,7 @@ func (x *GetNetworkPolicyRequest) String() string {
 func (*GetNetworkPolicyRequest) ProtoMessage() {}
 
 func (x *GetNetworkPolicyRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_net_gateway_v1_gateway_proto_msgTypes[10]
+	mi := &file_net_gateway_v1_gateway_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1094,7 +1157,7 @@ func (x *GetNetworkPolicyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetNetworkPolicyRequest.ProtoReflect.Descriptor instead.
 func (*GetNetworkPolicyRequest) Descriptor() ([]byte, []int) {
-	return file_net_gateway_v1_gateway_proto_rawDescGZIP(), []int{10}
+	return file_net_gateway_v1_gateway_proto_rawDescGZIP(), []int{11}
 }
 
 type GetNetworkPolicyResponse struct {
@@ -1107,7 +1170,7 @@ type GetNetworkPolicyResponse struct {
 
 func (x *GetNetworkPolicyResponse) Reset() {
 	*x = GetNetworkPolicyResponse{}
-	mi := &file_net_gateway_v1_gateway_proto_msgTypes[11]
+	mi := &file_net_gateway_v1_gateway_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1119,7 +1182,7 @@ func (x *GetNetworkPolicyResponse) String() string {
 func (*GetNetworkPolicyResponse) ProtoMessage() {}
 
 func (x *GetNetworkPolicyResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_net_gateway_v1_gateway_proto_msgTypes[11]
+	mi := &file_net_gateway_v1_gateway_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1132,7 +1195,7 @@ func (x *GetNetworkPolicyResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetNetworkPolicyResponse.ProtoReflect.Descriptor instead.
 func (*GetNetworkPolicyResponse) Descriptor() ([]byte, []int) {
-	return file_net_gateway_v1_gateway_proto_rawDescGZIP(), []int{11}
+	return file_net_gateway_v1_gateway_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *GetNetworkPolicyResponse) GetPolicy() *v1.NetworkPolicyV1 {
@@ -1161,7 +1224,7 @@ type EnableDebugRequest struct {
 
 func (x *EnableDebugRequest) Reset() {
 	*x = EnableDebugRequest{}
-	mi := &file_net_gateway_v1_gateway_proto_msgTypes[12]
+	mi := &file_net_gateway_v1_gateway_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1173,7 +1236,7 @@ func (x *EnableDebugRequest) String() string {
 func (*EnableDebugRequest) ProtoMessage() {}
 
 func (x *EnableDebugRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_net_gateway_v1_gateway_proto_msgTypes[12]
+	mi := &file_net_gateway_v1_gateway_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1186,7 +1249,7 @@ func (x *EnableDebugRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EnableDebugRequest.ProtoReflect.Descriptor instead.
 func (*EnableDebugRequest) Descriptor() ([]byte, []int) {
-	return file_net_gateway_v1_gateway_proto_rawDescGZIP(), []int{12}
+	return file_net_gateway_v1_gateway_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *EnableDebugRequest) GetDebugUntilUnixMs() uint64 {
@@ -1207,7 +1270,7 @@ type EnableDebugResponse struct {
 
 func (x *EnableDebugResponse) Reset() {
 	*x = EnableDebugResponse{}
-	mi := &file_net_gateway_v1_gateway_proto_msgTypes[13]
+	mi := &file_net_gateway_v1_gateway_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1219,7 +1282,7 @@ func (x *EnableDebugResponse) String() string {
 func (*EnableDebugResponse) ProtoMessage() {}
 
 func (x *EnableDebugResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_net_gateway_v1_gateway_proto_msgTypes[13]
+	mi := &file_net_gateway_v1_gateway_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1232,7 +1295,7 @@ func (x *EnableDebugResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EnableDebugResponse.ProtoReflect.Descriptor instead.
 func (*EnableDebugResponse) Descriptor() ([]byte, []int) {
-	return file_net_gateway_v1_gateway_proto_rawDescGZIP(), []int{13}
+	return file_net_gateway_v1_gateway_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *EnableDebugResponse) GetEnabled() bool {
@@ -1259,7 +1322,7 @@ type ServicePortIngressStart struct {
 
 func (x *ServicePortIngressStart) Reset() {
 	*x = ServicePortIngressStart{}
-	mi := &file_net_gateway_v1_gateway_proto_msgTypes[14]
+	mi := &file_net_gateway_v1_gateway_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1271,7 +1334,7 @@ func (x *ServicePortIngressStart) String() string {
 func (*ServicePortIngressStart) ProtoMessage() {}
 
 func (x *ServicePortIngressStart) ProtoReflect() protoreflect.Message {
-	mi := &file_net_gateway_v1_gateway_proto_msgTypes[14]
+	mi := &file_net_gateway_v1_gateway_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1284,7 +1347,7 @@ func (x *ServicePortIngressStart) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ServicePortIngressStart.ProtoReflect.Descriptor instead.
 func (*ServicePortIngressStart) Descriptor() ([]byte, []int) {
-	return file_net_gateway_v1_gateway_proto_rawDescGZIP(), []int{14}
+	return file_net_gateway_v1_gateway_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *ServicePortIngressStart) GetSandboxId() string {
@@ -1316,7 +1379,7 @@ type ServicePortIngressFrame struct {
 
 func (x *ServicePortIngressFrame) Reset() {
 	*x = ServicePortIngressFrame{}
-	mi := &file_net_gateway_v1_gateway_proto_msgTypes[15]
+	mi := &file_net_gateway_v1_gateway_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1328,7 +1391,7 @@ func (x *ServicePortIngressFrame) String() string {
 func (*ServicePortIngressFrame) ProtoMessage() {}
 
 func (x *ServicePortIngressFrame) ProtoReflect() protoreflect.Message {
-	mi := &file_net_gateway_v1_gateway_proto_msgTypes[15]
+	mi := &file_net_gateway_v1_gateway_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1341,7 +1404,7 @@ func (x *ServicePortIngressFrame) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ServicePortIngressFrame.ProtoReflect.Descriptor instead.
 func (*ServicePortIngressFrame) Descriptor() ([]byte, []int) {
-	return file_net_gateway_v1_gateway_proto_rawDescGZIP(), []int{15}
+	return file_net_gateway_v1_gateway_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *ServicePortIngressFrame) GetMessage() isServicePortIngressFrame_Message {
@@ -1435,7 +1498,7 @@ type SpaceApiRouteIdentity struct {
 
 func (x *SpaceApiRouteIdentity) Reset() {
 	*x = SpaceApiRouteIdentity{}
-	mi := &file_net_gateway_v1_gateway_proto_msgTypes[16]
+	mi := &file_net_gateway_v1_gateway_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1447,7 +1510,7 @@ func (x *SpaceApiRouteIdentity) String() string {
 func (*SpaceApiRouteIdentity) ProtoMessage() {}
 
 func (x *SpaceApiRouteIdentity) ProtoReflect() protoreflect.Message {
-	mi := &file_net_gateway_v1_gateway_proto_msgTypes[16]
+	mi := &file_net_gateway_v1_gateway_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1460,7 +1523,7 @@ func (x *SpaceApiRouteIdentity) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SpaceApiRouteIdentity.ProtoReflect.Descriptor instead.
 func (*SpaceApiRouteIdentity) Descriptor() ([]byte, []int) {
-	return file_net_gateway_v1_gateway_proto_rawDescGZIP(), []int{16}
+	return file_net_gateway_v1_gateway_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *SpaceApiRouteIdentity) GetRouteGeneration() uint64 {
@@ -1521,7 +1584,7 @@ type SetRouteIdentityRequest struct {
 
 func (x *SetRouteIdentityRequest) Reset() {
 	*x = SetRouteIdentityRequest{}
-	mi := &file_net_gateway_v1_gateway_proto_msgTypes[17]
+	mi := &file_net_gateway_v1_gateway_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1533,7 +1596,7 @@ func (x *SetRouteIdentityRequest) String() string {
 func (*SetRouteIdentityRequest) ProtoMessage() {}
 
 func (x *SetRouteIdentityRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_net_gateway_v1_gateway_proto_msgTypes[17]
+	mi := &file_net_gateway_v1_gateway_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1546,7 +1609,7 @@ func (x *SetRouteIdentityRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetRouteIdentityRequest.ProtoReflect.Descriptor instead.
 func (*SetRouteIdentityRequest) Descriptor() ([]byte, []int) {
-	return file_net_gateway_v1_gateway_proto_rawDescGZIP(), []int{17}
+	return file_net_gateway_v1_gateway_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *SetRouteIdentityRequest) GetIdentity() *SpaceApiRouteIdentity {
@@ -1565,7 +1628,7 @@ type SetRouteIdentityResponse struct {
 
 func (x *SetRouteIdentityResponse) Reset() {
 	*x = SetRouteIdentityResponse{}
-	mi := &file_net_gateway_v1_gateway_proto_msgTypes[18]
+	mi := &file_net_gateway_v1_gateway_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1577,7 +1640,7 @@ func (x *SetRouteIdentityResponse) String() string {
 func (*SetRouteIdentityResponse) ProtoMessage() {}
 
 func (x *SetRouteIdentityResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_net_gateway_v1_gateway_proto_msgTypes[18]
+	mi := &file_net_gateway_v1_gateway_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1590,7 +1653,7 @@ func (x *SetRouteIdentityResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetRouteIdentityResponse.ProtoReflect.Descriptor instead.
 func (*SetRouteIdentityResponse) Descriptor() ([]byte, []int) {
-	return file_net_gateway_v1_gateway_proto_rawDescGZIP(), []int{18}
+	return file_net_gateway_v1_gateway_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *SetRouteIdentityResponse) GetIdentityProfileVersion() uint32 {
@@ -1610,7 +1673,7 @@ type RouteVerificationKey struct {
 
 func (x *RouteVerificationKey) Reset() {
 	*x = RouteVerificationKey{}
-	mi := &file_net_gateway_v1_gateway_proto_msgTypes[19]
+	mi := &file_net_gateway_v1_gateway_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1622,7 +1685,7 @@ func (x *RouteVerificationKey) String() string {
 func (*RouteVerificationKey) ProtoMessage() {}
 
 func (x *RouteVerificationKey) ProtoReflect() protoreflect.Message {
-	mi := &file_net_gateway_v1_gateway_proto_msgTypes[19]
+	mi := &file_net_gateway_v1_gateway_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1635,7 +1698,7 @@ func (x *RouteVerificationKey) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RouteVerificationKey.ProtoReflect.Descriptor instead.
 func (*RouteVerificationKey) Descriptor() ([]byte, []int) {
-	return file_net_gateway_v1_gateway_proto_rawDescGZIP(), []int{19}
+	return file_net_gateway_v1_gateway_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *RouteVerificationKey) GetKeyId() string {
@@ -1664,7 +1727,7 @@ type SetRouteVerificationKeysRequest struct {
 
 func (x *SetRouteVerificationKeysRequest) Reset() {
 	*x = SetRouteVerificationKeysRequest{}
-	mi := &file_net_gateway_v1_gateway_proto_msgTypes[20]
+	mi := &file_net_gateway_v1_gateway_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1676,7 +1739,7 @@ func (x *SetRouteVerificationKeysRequest) String() string {
 func (*SetRouteVerificationKeysRequest) ProtoMessage() {}
 
 func (x *SetRouteVerificationKeysRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_net_gateway_v1_gateway_proto_msgTypes[20]
+	mi := &file_net_gateway_v1_gateway_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1689,7 +1752,7 @@ func (x *SetRouteVerificationKeysRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetRouteVerificationKeysRequest.ProtoReflect.Descriptor instead.
 func (*SetRouteVerificationKeysRequest) Descriptor() ([]byte, []int) {
-	return file_net_gateway_v1_gateway_proto_rawDescGZIP(), []int{20}
+	return file_net_gateway_v1_gateway_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *SetRouteVerificationKeysRequest) GetGeneration() uint64 {
@@ -1730,7 +1793,7 @@ type SetRouteVerificationKeysResponse struct {
 
 func (x *SetRouteVerificationKeysResponse) Reset() {
 	*x = SetRouteVerificationKeysResponse{}
-	mi := &file_net_gateway_v1_gateway_proto_msgTypes[21]
+	mi := &file_net_gateway_v1_gateway_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1742,7 +1805,7 @@ func (x *SetRouteVerificationKeysResponse) String() string {
 func (*SetRouteVerificationKeysResponse) ProtoMessage() {}
 
 func (x *SetRouteVerificationKeysResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_net_gateway_v1_gateway_proto_msgTypes[21]
+	mi := &file_net_gateway_v1_gateway_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1755,7 +1818,7 @@ func (x *SetRouteVerificationKeysResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetRouteVerificationKeysResponse.ProtoReflect.Descriptor instead.
 func (*SetRouteVerificationKeysResponse) Descriptor() ([]byte, []int) {
-	return file_net_gateway_v1_gateway_proto_rawDescGZIP(), []int{21}
+	return file_net_gateway_v1_gateway_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *SetRouteVerificationKeysResponse) GetGeneration() uint64 {
@@ -1807,7 +1870,7 @@ const file_net_gateway_v1_gateway_proto_rawDesc = "" +
 	"!route_verification_key_generation\x18\x17 \x01(\x04R\x1erouteVerificationKeyGeneration\x12X\n" +
 	"\x15tls_interception_mode\x18\x18 \x01(\x0e2$.space.net.policy.v1.TlsInterceptionR\x13tlsInterceptionMode\x12b\n" +
 	"\x16interception_readiness\x18\x19 \x01(\x0e2+.space.net.gateway.v1.InterceptionReadinessR\x15interceptionReadinessJ\x04\b\x13\x10\x14R\x14sni_sniffing_enabled\"\x18\n" +
-	"\x16GetNetworkStateRequest\"\xac\a\n" +
+	"\x16GetNetworkStateRequest\"\x84\b\n" +
 	"\x17GetNetworkStateResponse\x128\n" +
 	"\x05state\x18\x01 \x01(\x0e2\".space.net.gateway.v1.NetworkStateR\x05state\x120\n" +
 	"\x14installed_policy_ref\x18\x02 \x01(\tR\x12installedPolicyRef\x12\x1d\n" +
@@ -1824,7 +1887,11 @@ const file_net_gateway_v1_gateway_proto_rawDesc = "" +
 	"\x1econsecutive_hydration_failures\x18\v \x01(\x04R\x1cconsecutiveHydrationFailures\x12#\n" +
 	"\rdebug_enabled\x18\f \x01(\bR\fdebugEnabled\x12\"\n" +
 	"\rbuild_git_sha\x18\x10 \x01(\tR\vbuildGitSha\x12b\n" +
-	"\x16interception_readiness\x18\x12 \x01(\x0e2+.space.net.gateway.v1.InterceptionReadinessR\x15interceptionReadinessJ\x04\b\r\x10\x0eJ\x04\b\x0e\x10\x0fJ\x04\b\x0f\x10\x10J\x04\b\x11\x10\x12R\x1dinstalled_compiled_policy_refR\x1finstalled_compiled_policy_countR\x13runtime_policy_modeR\rtraffic_ready\"\x89\x01\n" +
+	"\x16interception_readiness\x18\x12 \x01(\x0e2+.space.net.gateway.v1.InterceptionReadinessR\x15interceptionReadiness\x12V\n" +
+	"\x12policy_observation\x18\x13 \x01(\v2'.space.net.gateway.v1.PolicyObservationR\x11policyObservationJ\x04\b\r\x10\x0eJ\x04\b\x0e\x10\x0fJ\x04\b\x0f\x10\x10J\x04\b\x11\x10\x12R\x1dinstalled_compiled_policy_refR\x1finstalled_compiled_policy_countR\x13runtime_policy_modeR\rtraffic_ready\"v\n" +
+	"\x11PolicyObservation\x12)\n" +
+	"\x10gateway_instance\x18\x01 \x01(\tR\x0fgatewayInstance\x126\n" +
+	"\x17pending_tcp_revocations\x18\x02 \x01(\x04R\x15pendingTcpRevocations\"\x89\x01\n" +
 	"\x1bRefreshNetworkPolicyRequest\x12.\n" +
 	"\x13expected_policy_ref\x18\x01 \x01(\tR\x11expectedPolicyRef\x12\x16\n" +
 	"\x06reason\x18\x02 \x01(\tR\x06reasonJ\x04\b\x03\x10\x04R\x1cexpected_compiled_policy_ref\"\xe3\x03\n" +
@@ -1948,7 +2015,7 @@ func file_net_gateway_v1_gateway_proto_rawDescGZIP() []byte {
 }
 
 var file_net_gateway_v1_gateway_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
-var file_net_gateway_v1_gateway_proto_msgTypes = make([]protoimpl.MessageInfo, 22)
+var file_net_gateway_v1_gateway_proto_msgTypes = make([]protoimpl.MessageInfo, 23)
 var file_net_gateway_v1_gateway_proto_goTypes = []any{
 	(NetworkState)(0),                        // 0: space.net.gateway.v1.NetworkState
 	(InterceptionReadiness)(0),               // 1: space.net.gateway.v1.InterceptionReadiness
@@ -1960,71 +2027,73 @@ var file_net_gateway_v1_gateway_proto_goTypes = []any{
 	(*GetStatsResponse)(nil),                 // 7: space.net.gateway.v1.GetStatsResponse
 	(*GetNetworkStateRequest)(nil),           // 8: space.net.gateway.v1.GetNetworkStateRequest
 	(*GetNetworkStateResponse)(nil),          // 9: space.net.gateway.v1.GetNetworkStateResponse
-	(*RefreshNetworkPolicyRequest)(nil),      // 10: space.net.gateway.v1.RefreshNetworkPolicyRequest
-	(*RefreshNetworkPolicyResponse)(nil),     // 11: space.net.gateway.v1.RefreshNetworkPolicyResponse
-	(*SetNoIdentityRequest)(nil),             // 12: space.net.gateway.v1.SetNoIdentityRequest
-	(*SetNoIdentityResponse)(nil),            // 13: space.net.gateway.v1.SetNoIdentityResponse
-	(*GetNetworkPolicyRequest)(nil),          // 14: space.net.gateway.v1.GetNetworkPolicyRequest
-	(*GetNetworkPolicyResponse)(nil),         // 15: space.net.gateway.v1.GetNetworkPolicyResponse
-	(*EnableDebugRequest)(nil),               // 16: space.net.gateway.v1.EnableDebugRequest
-	(*EnableDebugResponse)(nil),              // 17: space.net.gateway.v1.EnableDebugResponse
-	(*ServicePortIngressStart)(nil),          // 18: space.net.gateway.v1.ServicePortIngressStart
-	(*ServicePortIngressFrame)(nil),          // 19: space.net.gateway.v1.ServicePortIngressFrame
-	(*SpaceApiRouteIdentity)(nil),            // 20: space.net.gateway.v1.SpaceApiRouteIdentity
-	(*SetRouteIdentityRequest)(nil),          // 21: space.net.gateway.v1.SetRouteIdentityRequest
-	(*SetRouteIdentityResponse)(nil),         // 22: space.net.gateway.v1.SetRouteIdentityResponse
-	(*RouteVerificationKey)(nil),             // 23: space.net.gateway.v1.RouteVerificationKey
-	(*SetRouteVerificationKeysRequest)(nil),  // 24: space.net.gateway.v1.SetRouteVerificationKeysRequest
-	(*SetRouteVerificationKeysResponse)(nil), // 25: space.net.gateway.v1.SetRouteVerificationKeysResponse
-	(v1.TlsInterception)(0),                  // 26: space.net.policy.v1.TlsInterception
-	(*v1.NetworkPolicyV1)(nil),               // 27: space.net.policy.v1.NetworkPolicyV1
-	(*emptypb.Empty)(nil),                    // 28: google.protobuf.Empty
+	(*PolicyObservation)(nil),                // 10: space.net.gateway.v1.PolicyObservation
+	(*RefreshNetworkPolicyRequest)(nil),      // 11: space.net.gateway.v1.RefreshNetworkPolicyRequest
+	(*RefreshNetworkPolicyResponse)(nil),     // 12: space.net.gateway.v1.RefreshNetworkPolicyResponse
+	(*SetNoIdentityRequest)(nil),             // 13: space.net.gateway.v1.SetNoIdentityRequest
+	(*SetNoIdentityResponse)(nil),            // 14: space.net.gateway.v1.SetNoIdentityResponse
+	(*GetNetworkPolicyRequest)(nil),          // 15: space.net.gateway.v1.GetNetworkPolicyRequest
+	(*GetNetworkPolicyResponse)(nil),         // 16: space.net.gateway.v1.GetNetworkPolicyResponse
+	(*EnableDebugRequest)(nil),               // 17: space.net.gateway.v1.EnableDebugRequest
+	(*EnableDebugResponse)(nil),              // 18: space.net.gateway.v1.EnableDebugResponse
+	(*ServicePortIngressStart)(nil),          // 19: space.net.gateway.v1.ServicePortIngressStart
+	(*ServicePortIngressFrame)(nil),          // 20: space.net.gateway.v1.ServicePortIngressFrame
+	(*SpaceApiRouteIdentity)(nil),            // 21: space.net.gateway.v1.SpaceApiRouteIdentity
+	(*SetRouteIdentityRequest)(nil),          // 22: space.net.gateway.v1.SetRouteIdentityRequest
+	(*SetRouteIdentityResponse)(nil),         // 23: space.net.gateway.v1.SetRouteIdentityResponse
+	(*RouteVerificationKey)(nil),             // 24: space.net.gateway.v1.RouteVerificationKey
+	(*SetRouteVerificationKeysRequest)(nil),  // 25: space.net.gateway.v1.SetRouteVerificationKeysRequest
+	(*SetRouteVerificationKeysResponse)(nil), // 26: space.net.gateway.v1.SetRouteVerificationKeysResponse
+	(v1.TlsInterception)(0),                  // 27: space.net.policy.v1.TlsInterception
+	(*v1.NetworkPolicyV1)(nil),               // 28: space.net.policy.v1.NetworkPolicyV1
+	(*emptypb.Empty)(nil),                    // 29: google.protobuf.Empty
 }
 var file_net_gateway_v1_gateway_proto_depIdxs = []int32{
 	0,  // 0: space.net.gateway.v1.GetStatsResponse.network_state:type_name -> space.net.gateway.v1.NetworkState
 	2,  // 1: space.net.gateway.v1.GetStatsResponse.last_network_error_kind:type_name -> space.net.gateway.v1.NetworkPolicyErrorKind
-	26, // 2: space.net.gateway.v1.GetStatsResponse.tls_interception_mode:type_name -> space.net.policy.v1.TlsInterception
+	27, // 2: space.net.gateway.v1.GetStatsResponse.tls_interception_mode:type_name -> space.net.policy.v1.TlsInterception
 	1,  // 3: space.net.gateway.v1.GetStatsResponse.interception_readiness:type_name -> space.net.gateway.v1.InterceptionReadiness
 	0,  // 4: space.net.gateway.v1.GetNetworkStateResponse.state:type_name -> space.net.gateway.v1.NetworkState
 	2,  // 5: space.net.gateway.v1.GetNetworkStateResponse.last_error_kind:type_name -> space.net.gateway.v1.NetworkPolicyErrorKind
 	1,  // 6: space.net.gateway.v1.GetNetworkStateResponse.interception_readiness:type_name -> space.net.gateway.v1.InterceptionReadiness
-	0,  // 7: space.net.gateway.v1.RefreshNetworkPolicyResponse.state:type_name -> space.net.gateway.v1.NetworkState
-	2,  // 8: space.net.gateway.v1.RefreshNetworkPolicyResponse.last_error_kind:type_name -> space.net.gateway.v1.NetworkPolicyErrorKind
-	1,  // 9: space.net.gateway.v1.RefreshNetworkPolicyResponse.interception_readiness:type_name -> space.net.gateway.v1.InterceptionReadiness
-	0,  // 10: space.net.gateway.v1.SetNoIdentityResponse.state:type_name -> space.net.gateway.v1.NetworkState
-	2,  // 11: space.net.gateway.v1.SetNoIdentityResponse.last_error_kind:type_name -> space.net.gateway.v1.NetworkPolicyErrorKind
-	27, // 12: space.net.gateway.v1.GetNetworkPolicyResponse.policy:type_name -> space.net.policy.v1.NetworkPolicyV1
-	18, // 13: space.net.gateway.v1.ServicePortIngressFrame.start:type_name -> space.net.gateway.v1.ServicePortIngressStart
-	28, // 14: space.net.gateway.v1.ServicePortIngressFrame.eof:type_name -> google.protobuf.Empty
-	28, // 15: space.net.gateway.v1.ServicePortIngressFrame.complete:type_name -> google.protobuf.Empty
-	3,  // 16: space.net.gateway.v1.SpaceApiRouteIdentity.substrate_kind:type_name -> space.net.gateway.v1.SandboxSubstrateKind
-	20, // 17: space.net.gateway.v1.SetRouteIdentityRequest.identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
-	23, // 18: space.net.gateway.v1.SetRouteVerificationKeysRequest.keys:type_name -> space.net.gateway.v1.RouteVerificationKey
-	4,  // 19: space.net.gateway.v1.NetGatewayControl.Ping:input_type -> space.net.gateway.v1.GatewayPingRequest
-	6,  // 20: space.net.gateway.v1.NetGatewayControl.GetStats:input_type -> space.net.gateway.v1.GetStatsRequest
-	8,  // 21: space.net.gateway.v1.NetGatewayControl.GetNetworkState:input_type -> space.net.gateway.v1.GetNetworkStateRequest
-	10, // 22: space.net.gateway.v1.NetGatewayControl.RefreshNetworkPolicy:input_type -> space.net.gateway.v1.RefreshNetworkPolicyRequest
-	12, // 23: space.net.gateway.v1.NetGatewayControl.SetNoIdentity:input_type -> space.net.gateway.v1.SetNoIdentityRequest
-	14, // 24: space.net.gateway.v1.NetGatewayControl.GetNetworkPolicy:input_type -> space.net.gateway.v1.GetNetworkPolicyRequest
-	16, // 25: space.net.gateway.v1.NetGatewayControl.EnableDebug:input_type -> space.net.gateway.v1.EnableDebugRequest
-	19, // 26: space.net.gateway.v1.NetGatewayControl.ServicePortIngress:input_type -> space.net.gateway.v1.ServicePortIngressFrame
-	21, // 27: space.net.gateway.v1.NetGatewayControl.SetRouteIdentity:input_type -> space.net.gateway.v1.SetRouteIdentityRequest
-	24, // 28: space.net.gateway.v1.NetGatewayControl.SetRouteVerificationKeys:input_type -> space.net.gateway.v1.SetRouteVerificationKeysRequest
-	5,  // 29: space.net.gateway.v1.NetGatewayControl.Ping:output_type -> space.net.gateway.v1.GatewayPingResponse
-	7,  // 30: space.net.gateway.v1.NetGatewayControl.GetStats:output_type -> space.net.gateway.v1.GetStatsResponse
-	9,  // 31: space.net.gateway.v1.NetGatewayControl.GetNetworkState:output_type -> space.net.gateway.v1.GetNetworkStateResponse
-	11, // 32: space.net.gateway.v1.NetGatewayControl.RefreshNetworkPolicy:output_type -> space.net.gateway.v1.RefreshNetworkPolicyResponse
-	13, // 33: space.net.gateway.v1.NetGatewayControl.SetNoIdentity:output_type -> space.net.gateway.v1.SetNoIdentityResponse
-	15, // 34: space.net.gateway.v1.NetGatewayControl.GetNetworkPolicy:output_type -> space.net.gateway.v1.GetNetworkPolicyResponse
-	17, // 35: space.net.gateway.v1.NetGatewayControl.EnableDebug:output_type -> space.net.gateway.v1.EnableDebugResponse
-	19, // 36: space.net.gateway.v1.NetGatewayControl.ServicePortIngress:output_type -> space.net.gateway.v1.ServicePortIngressFrame
-	22, // 37: space.net.gateway.v1.NetGatewayControl.SetRouteIdentity:output_type -> space.net.gateway.v1.SetRouteIdentityResponse
-	25, // 38: space.net.gateway.v1.NetGatewayControl.SetRouteVerificationKeys:output_type -> space.net.gateway.v1.SetRouteVerificationKeysResponse
-	29, // [29:39] is the sub-list for method output_type
-	19, // [19:29] is the sub-list for method input_type
-	19, // [19:19] is the sub-list for extension type_name
-	19, // [19:19] is the sub-list for extension extendee
-	0,  // [0:19] is the sub-list for field type_name
+	10, // 7: space.net.gateway.v1.GetNetworkStateResponse.policy_observation:type_name -> space.net.gateway.v1.PolicyObservation
+	0,  // 8: space.net.gateway.v1.RefreshNetworkPolicyResponse.state:type_name -> space.net.gateway.v1.NetworkState
+	2,  // 9: space.net.gateway.v1.RefreshNetworkPolicyResponse.last_error_kind:type_name -> space.net.gateway.v1.NetworkPolicyErrorKind
+	1,  // 10: space.net.gateway.v1.RefreshNetworkPolicyResponse.interception_readiness:type_name -> space.net.gateway.v1.InterceptionReadiness
+	0,  // 11: space.net.gateway.v1.SetNoIdentityResponse.state:type_name -> space.net.gateway.v1.NetworkState
+	2,  // 12: space.net.gateway.v1.SetNoIdentityResponse.last_error_kind:type_name -> space.net.gateway.v1.NetworkPolicyErrorKind
+	28, // 13: space.net.gateway.v1.GetNetworkPolicyResponse.policy:type_name -> space.net.policy.v1.NetworkPolicyV1
+	19, // 14: space.net.gateway.v1.ServicePortIngressFrame.start:type_name -> space.net.gateway.v1.ServicePortIngressStart
+	29, // 15: space.net.gateway.v1.ServicePortIngressFrame.eof:type_name -> google.protobuf.Empty
+	29, // 16: space.net.gateway.v1.ServicePortIngressFrame.complete:type_name -> google.protobuf.Empty
+	3,  // 17: space.net.gateway.v1.SpaceApiRouteIdentity.substrate_kind:type_name -> space.net.gateway.v1.SandboxSubstrateKind
+	21, // 18: space.net.gateway.v1.SetRouteIdentityRequest.identity:type_name -> space.net.gateway.v1.SpaceApiRouteIdentity
+	24, // 19: space.net.gateway.v1.SetRouteVerificationKeysRequest.keys:type_name -> space.net.gateway.v1.RouteVerificationKey
+	4,  // 20: space.net.gateway.v1.NetGatewayControl.Ping:input_type -> space.net.gateway.v1.GatewayPingRequest
+	6,  // 21: space.net.gateway.v1.NetGatewayControl.GetStats:input_type -> space.net.gateway.v1.GetStatsRequest
+	8,  // 22: space.net.gateway.v1.NetGatewayControl.GetNetworkState:input_type -> space.net.gateway.v1.GetNetworkStateRequest
+	11, // 23: space.net.gateway.v1.NetGatewayControl.RefreshNetworkPolicy:input_type -> space.net.gateway.v1.RefreshNetworkPolicyRequest
+	13, // 24: space.net.gateway.v1.NetGatewayControl.SetNoIdentity:input_type -> space.net.gateway.v1.SetNoIdentityRequest
+	15, // 25: space.net.gateway.v1.NetGatewayControl.GetNetworkPolicy:input_type -> space.net.gateway.v1.GetNetworkPolicyRequest
+	17, // 26: space.net.gateway.v1.NetGatewayControl.EnableDebug:input_type -> space.net.gateway.v1.EnableDebugRequest
+	20, // 27: space.net.gateway.v1.NetGatewayControl.ServicePortIngress:input_type -> space.net.gateway.v1.ServicePortIngressFrame
+	22, // 28: space.net.gateway.v1.NetGatewayControl.SetRouteIdentity:input_type -> space.net.gateway.v1.SetRouteIdentityRequest
+	25, // 29: space.net.gateway.v1.NetGatewayControl.SetRouteVerificationKeys:input_type -> space.net.gateway.v1.SetRouteVerificationKeysRequest
+	5,  // 30: space.net.gateway.v1.NetGatewayControl.Ping:output_type -> space.net.gateway.v1.GatewayPingResponse
+	7,  // 31: space.net.gateway.v1.NetGatewayControl.GetStats:output_type -> space.net.gateway.v1.GetStatsResponse
+	9,  // 32: space.net.gateway.v1.NetGatewayControl.GetNetworkState:output_type -> space.net.gateway.v1.GetNetworkStateResponse
+	12, // 33: space.net.gateway.v1.NetGatewayControl.RefreshNetworkPolicy:output_type -> space.net.gateway.v1.RefreshNetworkPolicyResponse
+	14, // 34: space.net.gateway.v1.NetGatewayControl.SetNoIdentity:output_type -> space.net.gateway.v1.SetNoIdentityResponse
+	16, // 35: space.net.gateway.v1.NetGatewayControl.GetNetworkPolicy:output_type -> space.net.gateway.v1.GetNetworkPolicyResponse
+	18, // 36: space.net.gateway.v1.NetGatewayControl.EnableDebug:output_type -> space.net.gateway.v1.EnableDebugResponse
+	20, // 37: space.net.gateway.v1.NetGatewayControl.ServicePortIngress:output_type -> space.net.gateway.v1.ServicePortIngressFrame
+	23, // 38: space.net.gateway.v1.NetGatewayControl.SetRouteIdentity:output_type -> space.net.gateway.v1.SetRouteIdentityResponse
+	26, // 39: space.net.gateway.v1.NetGatewayControl.SetRouteVerificationKeys:output_type -> space.net.gateway.v1.SetRouteVerificationKeysResponse
+	30, // [30:40] is the sub-list for method output_type
+	20, // [20:30] is the sub-list for method input_type
+	20, // [20:20] is the sub-list for extension type_name
+	20, // [20:20] is the sub-list for extension extendee
+	0,  // [0:20] is the sub-list for field type_name
 }
 
 func init() { file_net_gateway_v1_gateway_proto_init() }
@@ -2032,20 +2101,20 @@ func file_net_gateway_v1_gateway_proto_init() {
 	if File_net_gateway_v1_gateway_proto != nil {
 		return
 	}
-	file_net_gateway_v1_gateway_proto_msgTypes[15].OneofWrappers = []any{
+	file_net_gateway_v1_gateway_proto_msgTypes[16].OneofWrappers = []any{
 		(*ServicePortIngressFrame_Start)(nil),
 		(*ServicePortIngressFrame_Data)(nil),
 		(*ServicePortIngressFrame_Eof)(nil),
 		(*ServicePortIngressFrame_Complete)(nil),
 	}
-	file_net_gateway_v1_gateway_proto_msgTypes[16].OneofWrappers = []any{}
+	file_net_gateway_v1_gateway_proto_msgTypes[17].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_net_gateway_v1_gateway_proto_rawDesc), len(file_net_gateway_v1_gateway_proto_rawDesc)),
 			NumEnums:      4,
-			NumMessages:   22,
+			NumMessages:   23,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

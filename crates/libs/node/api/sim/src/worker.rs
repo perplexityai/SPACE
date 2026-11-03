@@ -647,6 +647,13 @@ impl WorkerApi for SimWorkerApiService {
         Ok(Response::new(sbx::DeleteResponse { deleted_ids: ids }))
     }
 
+    async fn sandbox_network_policy(
+        &self,
+        _r: Request<sbx::GetNetworkPolicyRequest>,
+    ) -> Result<Response<sbx::GetNetworkPolicyResponse>, Status> {
+        Err(Status::unimplemented("live network policy observation"))
+    }
+
     async fn sandbox_state(
         &self,
         request: Request<sbx::StateRequest>,

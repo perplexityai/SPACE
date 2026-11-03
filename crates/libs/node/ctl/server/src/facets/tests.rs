@@ -423,6 +423,7 @@ fn local_sandbox_policy(
     generation: u64,
 ) -> NetworkPolicyDetail {
     NetworkPolicyDetail {
+        observation: None,
         sandbox_id: TEST_SANDBOX_ID.to_string(),
         effective_policy: Some(policy),
         inherited,

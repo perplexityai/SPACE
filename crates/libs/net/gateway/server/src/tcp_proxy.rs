@@ -40,12 +40,15 @@ mod reserved_dns;
 mod routing_headers;
 pub(crate) mod tls;
 mod tls_http;
+mod tracked_io;
 mod transport;
 mod upstream;
 
+use crate::egress::TcpConnectionGuard;
 use crate::egress::{AdmittedTcp, TcpAdmissionDenial};
 pub use pplx_space_net_gateway_client::TcpDomainAuthorizationMode;
 pub(crate) use relay::{RelayFault, Side as RelaySide};
+use tracked_io::TrackedIo;
 
 pub struct TcpProxyConfig {
     pub sandbox_id: &'static str,
@@ -517,13 +520,13 @@ impl TcpProxy {
         };
         // Register before the final current-policy check so a concurrent
         // update either rejects this handoff or sees the flow in its resweep.
-        let connection = self.network_state.tcp_connections().register(
+        let connection = Arc::new(self.network_state.tcp_connections().register(
             admitted.destination(),
             scan.clone(),
             &policy,
             self.network_state.dns_allow_cache(),
             shutdown.clone(),
-        );
+        ));
         let interception_mode = connection.interception_mode;
         if let Err(reason) = self.validate_admission_policy(&policy) {
             inspection.finish(accounting::Outcome::Cancelled, reason.label());
@@ -561,12 +564,12 @@ impl TcpProxy {
                     pplx_space_net_common::TlsInterception::On => "plaintext",
                 };
                 inspection.finish(accounting::Outcome::Skipped, reason);
-                self.relay(client, admitted).await
+                self.relay(client, admitted, connection.clone()).await
             }
             crate::tls_interception::InterceptionAction::Terminate(lease) => {
                 inspection.finish(accounting::Outcome::Success, "admitted");
                 match self
-                    .terminate_tls(client, admitted, lease, client_alpn)
+                    .terminate_tls(client, admitted, lease, client_alpn, connection.clone())
                     .await
                 {
                     Ok(()) => FlowOutcome::InspectedTls,
@@ -602,11 +605,16 @@ impl TcpProxy {
         }
     }
 
-    async fn relay(&self, client: TcpStream, admitted: AdmittedTcp) -> FlowOutcome {
+    async fn relay(
+        &self,
+        client: TcpStream,
+        admitted: AdmittedTcp,
+        connection: Arc<TcpConnectionGuard>,
+    ) -> FlowOutcome {
         match admitted {
             AdmittedTcp::Tunnel(destination) => self.pass_through(client, destination).await,
             AdmittedTcp::HostBoundHttp(destination) => {
-                self.host_bound_http(client, destination, transport::connect)
+                self.host_bound_http(client, destination, connection, transport::connect)
                     .await
             }
         }
@@ -635,6 +643,7 @@ impl TcpProxy {
         &self,
         client: TcpStream,
         dst: SocketAddr,
+        connection: Arc<TcpConnectionGuard>,
         connect: F,
     ) -> FlowOutcome
     where
@@ -643,6 +652,12 @@ impl TcpProxy {
         U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let binding = http_host::HostBinding::new(self.sandbox_id, dst, self.network_state.clone());
+        let client = TrackedIo::new(client, connection.clone());
+        let connect = move |destination| async move {
+            connect(destination)
+                .await
+                .map(|io| TrackedIo::new(io, connection))
+        };
         match http_host::serve(client, binding, connect).await {
             Ok(served) => FlowOutcome::Relayed(Relay::HostBoundHttp {
                 requests: served.requests,

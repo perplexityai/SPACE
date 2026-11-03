@@ -158,6 +158,15 @@ message GetNetworkStateResponse {
   // Live readiness of the TLS-interception dependencies. Informational for
   // sandbox-manager and operators; never an input to the sandbox start gate.
   InterceptionReadiness interception_readiness = 18;
+  // Present only on gateways supporting live policy observations.
+  PolicyObservation policy_observation = 19;
+}
+
+message PolicyObservation {
+  // Changes on every gateway process start.
+  string gateway_instance = 1;
+  // Cancelled relays still holding their connection lifetime guard.
+  uint64 pending_tcp_revocations = 2;
 }
 
 message RefreshNetworkPolicyRequest {

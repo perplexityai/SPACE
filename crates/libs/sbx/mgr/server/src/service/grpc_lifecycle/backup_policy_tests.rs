@@ -1025,6 +1025,7 @@ async fn get_network_policy_reports_each_sandbox_policy_source() {
 
     let response = service
         .get_network_policy(internal_request(crate::proto::GetNetworkPolicyRequest {
+            observe_gateway: false,
             sandbox_ids: vec![
                 overridden.clone(),
                 format!(" {inherited} "),
@@ -1092,6 +1093,7 @@ async fn get_network_policy_reports_each_sandbox_policy_source() {
 
     let error = service
         .get_network_policy(internal_request(crate::proto::GetNetworkPolicyRequest {
+            observe_gateway: false,
             sandbox_ids: vec![overridden.clone(), SandboxId::new().to_string()],
         }))
         .await
