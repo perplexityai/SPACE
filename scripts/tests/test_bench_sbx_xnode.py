@@ -325,6 +325,19 @@ def decision(rows):
 
 
 class SummaryTests(unittest.TestCase):
+    def test_legacy_local_copy_label_counts_as_a_download(self):
+        rows = [{"kind": "block", "run_id": "r", "block": 1, "variant": "baseline", "load": "quiet",
+                 "start_ms": 0, "end_ms": 10_000, "warmup_ms": 0}]
+        for wid, outcome in (("ok", "ok"), ("bad", "timeout")):
+            rows.append({"kind": "wake", "run_id": "r", "block": 1, "variant": "baseline", "wake_id": wid,
+                         "sandbox_id": wid, "wake_start_ms": 5_000, "reconnect_ms": 1_000, "outcome": outcome})
+            rows.append({"kind": "wake_placement", "run_id": "r", "block": 1, "wake_id": wid,
+                         "classification": "cross_node_local_copy"})
+        g = summary.collect(rows, wake_timeout_ms=120_000)["groups"][("quiet", "baseline")]
+        self.assertEqual(g["successes"], 1)
+        self.assertEqual(g["failures"], 1)
+        self.assertEqual(g["latency"], [1_000])
+
     def test_percentile_matches_linear_interpolation(self):
         self.assertEqual(summary.percentile([1, 2, 3, 4], 50), 2.5)
         self.assertEqual(summary.percentile([10], 95), 10.0)
