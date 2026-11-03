@@ -205,3 +205,5 @@ pub mod kubernetes;
 
 #[cfg(test)]
 mod runtime_contract_tests;
+
+// Disposable producer-timing probe: never merge.

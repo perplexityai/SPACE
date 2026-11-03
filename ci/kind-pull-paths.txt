@@ -92,3 +92,5 @@ crates/apps/data/plane/svc/**
 crates/libs/spaced/**
 crates/apps/spaced/**
 crates/libs/common/grpc/**
+
+# Disposable producer-timing probe: never merge.
