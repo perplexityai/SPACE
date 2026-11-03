@@ -77,8 +77,9 @@ jobs:
           # The admin console smoke: off until the Kind runners carry
           # Playwright (`uv sync --group console`) and its Chromium. Off, the
           # console paths are not read, select nothing, and run no Kind smoke;
-          # `on` selects the local.console_* scenarios when a path in
-          # ci/kind-console-paths.txt changes, and runs the Kind smoke for it.
+          # `on` requires the local.console_* scenarios when a path in
+          # ci/kind-console-paths.txt changes, and runs the Kind smoke for it:
+          # a runner without the browser then fails the smoke, never skips.
           SPACE_KIND_CONSOLE_SMOKE: 'off'
         run: |
           set -euo pipefail
