@@ -4,12 +4,12 @@ import {
   FIRST_PAGE,
   ListRequests,
   NO_FILTERS,
-  clientFilters,
   continuationFor,
   createdBounds,
   listAnswerPlan,
   listRequestQuery,
   listScope,
+  loadedRowFilter,
   nextCursorFor,
   nextPage,
   pageCursor,
@@ -113,9 +113,43 @@ test('a sampled scope is its size and org: the filters it does not send do not c
   assert.ok(!sameScope(a, null));
 });
 
-test('a paged list leaves only the node filter to the console; a sampled one filters everything but the org', () => {
-  assert.deepEqual(clientFilters('paged'), { text: false, template: false, status: false, user: false, created: false, node: true });
-  assert.deepEqual(clientFilters('sampled'), { text: true, template: true, status: true, user: true, created: true, node: true });
+const USER = '0193a000-0000-7000-8000-000000000002';
+const row = (fields) => ({
+  template: 'seed', status: 'started', user_id: USER, active_node_id: 'node-a', created_at: '2026-11-03T11:30:00.000Z', name: 'build-a', ...fields,
+});
+const criteria = (fields) => ({
+  matchesSearch: null, template: null, statuses: [], statusKey: (status) => status || 'unknown', userId: null,
+  node: 'any', createdWithin: null, olderThan: null, now: NOW, ...fields,
+});
+
+test('a paged list does not refilter what the server applied, but filters the node and a page search', () => {
+  // Every row of a page matched the filters the server was sent; a row with
+  // another template shows the one its node reports, and stays.
+  const applied = criteria({ template: 'other', statuses: ['stopped'], userId: '0193a000-0000-7000-8000-000000000003', createdWithin: '1h', olderThan: '1h' });
+  assert.equal(loadedRowFilter('paged', applied)(row({ created_at: null })), true);
+  // The server has no node filter.
+  assert.equal(loadedRowFilter('paged', criteria({ node: 'unassigned' }))(row({})), false);
+  assert.equal(loadedRowFilter('paged', criteria({ node: 'assigned' }))(row({ active_node_id: null })), false);
+  // A search the server could not answer.
+  const search = criteria({ matchesSearch: (r) => r.name.includes('cache') });
+  assert.equal(loadedRowFilter('paged', search)(row({})), false);
+  assert.equal(loadedRowFilter('paged', search)(row({ name: 'build-cache' })), true);
+});
+
+test('a sampled list filters every loaded row on everything but the org', () => {
+  const keep = (fields, rowFields = {}) => loadedRowFilter('sampled', criteria(fields))(row(rowFields));
+  assert.equal(keep({}), true);
+  assert.equal(keep({ template: 'other' }), false);
+  assert.equal(keep({ statuses: ['stopped'] }), false);
+  assert.equal(keep({ statuses: ['unknown'] }, { status: null }), true);
+  assert.equal(keep({ userId: '0193a000-0000-7000-8000-000000000003' }), false);
+  assert.equal(keep({ node: 'unassigned' }), false);
+  // Within the last hour: 11:30 at 12:00 is, and a row with no time is not.
+  assert.equal(keep({ createdWithin: '1h' }), true);
+  assert.equal(keep({ createdWithin: '1h' }, { created_at: '2026-11-03T10:59:00.000Z' }), false);
+  assert.equal(keep({ createdWithin: '1h' }, { created_at: null }), false);
+  assert.equal(keep({ olderThan: '1h' }), false);
+  assert.equal(keep({ olderThan: '1h' }, { created_at: '2026-11-03T10:00:00.000Z' }), true);
 });
 
 const sampledAnswer = { mode: 'sampled', sandboxes: [] };

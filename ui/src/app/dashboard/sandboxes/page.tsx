@@ -20,6 +20,7 @@ import {
   parseListLimit,
   sandboxLabelOrId,
   sandboxQuery,
+  sandboxSearch,
 } from '@/lib/sandbox-id';
 import {
   createConsoleSandboxForOrg,
@@ -40,13 +41,12 @@ import {
   FIRST_PAGE,
   ListRequests,
   PAGE_SIZE_OPTIONS,
-  clientFilters,
   continuationFor,
   createdAgeMs,
-  createdBounds,
   listAnswerPlan,
   listRequestQuery,
   listScope,
+  loadedRowFilter,
   nextCursorFor,
   nextPage,
   pageCursor,
@@ -189,8 +189,7 @@ interface FilterInputs {
   user: string | null;
   age: AgeWindow;
   older: OlderThan;
-  // The search box as a prefix: free text only, since a full identifier is
-  // looked up directly.
+  // The search box as a server prefix; see `sandboxSearch`.
   prefix: string;
 }
 
@@ -748,6 +747,9 @@ function SandboxesPage() {
   // Applied by the admin API (`org_id`) on either list shape.
   const [orgFilter, setOrgFilter] = useState<string | null>(() => parseOrgParam(searchParams.get('org')));
   const query = useMemo(() => sandboxQuery(idFilter), [idFilter]);
+  // What the search box does on this list's shape: a direct lookup, a prefix
+  // the server matches, or a match within the loaded rows.
+  const search = useMemo(() => sandboxSearch(idFilter, listMode), [idFilter, listMode]);
   const filterInputs: FilterInputs = {
     org: orgFilter,
     statuses: statusFilter,
@@ -755,7 +757,7 @@ function SandboxesPage() {
     user: userFilter,
     age: ageWindow,
     older: olderThan,
-    prefix: query.kind === 'text' ? idFilter.trim() : '',
+    prefix: search.kind === 'prefix' ? search.prefix : '',
   };
   const filterInputsKey = JSON.stringify(filterInputs);
   // The filters every request sends until a filter changes. The creation-time
@@ -1256,42 +1258,19 @@ function SandboxesPage() {
       return lookup?.publicId === query.ref.publicId && lookup.sandbox ? [lookup.sandbox] : [];
     }
 
-    // The server applied the rest on a paged list; see `clientFilters`.
-    const client = clientFilters(listMode);
-    const bounds = createdBounds(ageWindowMs(ageWindow), olderThanMs(olderThan), Date.now());
-    const after = bounds.createdAfter === null ? null : Date.parse(bounds.createdAfter);
-    const before = bounds.createdBefore === null ? null : Date.parse(bounds.createdBefore);
-
-    return sandboxes.filter((s) => {
-      if (client.text && !matchesSandboxQuery(query, s)) return false;
-
-      if (client.template && templateFilter && s.template !== templateFilter) {
-        return false;
-      }
-
-      if (client.status && statusFilter.length > 0 && !statusFilter.includes(statusFilterKey(s.status))) {
-        return false;
-      }
-
-      if (client.user && userFilter && s.user_id !== userFilter) return false;
-
-      if (client.node && nodeFilter !== 'any') {
-        const hasNode = !!s.active_node_id;
-        if (nodeFilter === 'assigned' && !hasNode) return false;
-        if (nodeFilter === 'unassigned' && hasNode) return false;
-      }
-
-      if (client.created && (after !== null || before !== null)) {
-        if (!s.created_at) return false;
-        const created = Date.parse(s.created_at);
-        if (Number.isNaN(created)) return false;
-        if (after !== null && created <= after) return false;
-        if (before !== null && created >= before) return false;
-      }
-
-      return true;
-    });
-  }, [sandboxes, query, lookup, listMode, templateFilter, statusFilter, userFilter, nodeFilter, ageWindow, olderThan]);
+    // The server applied the rest on a paged list; see `loadedRowFilter`.
+    return sandboxes.filter(loadedRowFilter(listMode, {
+      matchesSearch: search.kind === 'page' ? (s) => matchesSandboxQuery(search.query, s) : null,
+      template: templateFilter,
+      statuses: statusFilter,
+      statusKey: statusFilterKey,
+      userId: userFilter,
+      node: nodeFilter,
+      createdWithin: ageWindowAge(ageWindow),
+      olderThan: olderThanAge(olderThan),
+      now: Date.now(),
+    }));
+  }, [sandboxes, query, search, lookup, listMode, templateFilter, statusFilter, userFilter, nodeFilter, ageWindow, olderThan]);
 
   const lookupNeeded =
     query.kind === 'ref' && !loading && !sandboxes.some((s) => matchesSandboxQuery(query, s));
@@ -1638,15 +1617,22 @@ function SandboxesPage() {
       <Card size="small" style={{ marginBottom: 12 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
           <Text strong>Filters</Text>
-          <Input
-            allowClear
-            size="small"
-            placeholder={paged ? 'Name or ID prefix, full ID or pod name' : 'ID, pod name or name'}
-            value={idFilter}
-            onChange={(e) => setIdFilter(e.target.value)}
-            style={{ width: 260 }}
-            aria-label="Search sandboxes"
-          />
+          <Space size={2}>
+            <Input
+              allowClear
+              size="small"
+              placeholder={paged ? 'Case-sensitive name or ID prefix, or full ID' : 'ID, pod name or name'}
+              value={idFilter}
+              onChange={(e) => setIdFilter(e.target.value)}
+              style={{ width: 290 }}
+              aria-label="Search sandboxes"
+            />
+            {paged ? (
+              <Tooltip title="A name or ID prefix is searched on the server and is case-sensitive; an ID prefix starts with sbx_ or is a dashed UUID start. Hex alone, such as the ID column's label, matches IDs and names within this page, ignoring case. A full ID or pod name is looked up directly.">
+                <QuestionCircleOutlined aria-label="About the search" style={{ color: 'rgba(0, 0, 0, 0.45)' }} />
+              </Tooltip>
+            ) : null}
+          </Space>
           <Select
             size="small"
             placeholder="Template"
@@ -1771,6 +1757,15 @@ function SandboxesPage() {
           showIcon
           style={{ marginBottom: 12 }}
           title={`Showing the newest ${listLimit} sandboxes${orgFilter ? ` of ${orgNames.get(orgFilter) ?? orgFilter}` : ''}. Filters apply to these rows only; enter a full sandbox ID or pod name to look up any sandbox.`}
+        />
+      ) : null}
+
+      {paged && search.kind === 'page' ? (
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 12 }}
+          title={`"${idFilter.trim()}" matches IDs and names within this page, ignoring case; paste the full ID to look it up.`}
         />
       ) : null}
 

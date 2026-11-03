@@ -131,21 +131,49 @@ export function listRequestQuery(scope: ListScope, now: number): string {
   return sandboxListQuery(scope.mode, scope.filters, { limit: scope.limit, cursor: scope.cursor, now });
 }
 
-// Which filters the console applies to the rows it loaded. A paged server
+// The filters the console applies to the rows it loaded. A paged server
 // applies every filter it was sent; it has no node filter yet, so that one
-// always narrows the loaded page only. A sampled list applies only `org_id`.
-export interface ClientFilters {
-  text: boolean;
-  template: boolean;
-  status: boolean;
-  user: boolean;
-  created: boolean;
-  node: boolean;
+// always narrows the loaded rows only, and a search the server cannot answer
+// (see `sandboxSearch`) is matched here too. A sampled list was sent only
+// `org_id`, so every other filter applies here.
+type LoadedRow = Pick<Sandbox, 'template' | 'status' | 'user_id' | 'active_node_id' | 'created_at'>;
+
+export interface LoadedRowCriteria<T extends LoadedRow> {
+  // The search as matched within the loaded rows, or null when the server
+  // applied it or there is none.
+  matchesSearch: ((row: T) => boolean) | null;
+  template: string | null;
+  statuses: string[];
+  // The key a row's status filters under (`statusFilterKey`).
+  statusKey: (status: string | null | undefined) => string;
+  userId: string | null;
+  node: 'any' | 'assigned' | 'unassigned';
+  createdWithin: CreatedAge | null;
+  olderThan: CreatedAge | null;
+  now: number;
 }
 
-export function clientFilters(mode: ListMode): ClientFilters {
+export function loadedRowFilter<T extends LoadedRow>(mode: ListMode, criteria: LoadedRowCriteria<T>): (row: T) => boolean {
   const sampled = mode === 'sampled';
-  return { text: sampled, template: sampled, status: sampled, user: sampled, created: sampled, node: true };
+  const { createdAfter, createdBefore } = createdBounds(
+    createdAgeMs(criteria.createdWithin), createdAgeMs(criteria.olderThan), criteria.now);
+  const after = createdAfter === null ? null : Date.parse(createdAfter);
+  const before = createdBefore === null ? null : Date.parse(createdBefore);
+  return (row) => {
+    if (criteria.matchesSearch && !criteria.matchesSearch(row)) return false;
+    if (criteria.node !== 'any' && (criteria.node === 'assigned') !== !!row.active_node_id) return false;
+    if (!sampled) return true;
+    if (criteria.template && row.template !== criteria.template) return false;
+    if (criteria.statuses.length > 0 && !criteria.statuses.includes(criteria.statusKey(row.status))) return false;
+    if (criteria.userId && row.user_id !== criteria.userId) return false;
+    if (after !== null || before !== null) {
+      const created = row.created_at ? Date.parse(row.created_at) : NaN;
+      if (Number.isNaN(created)) return false;
+      if (after !== null && created <= after) return false;
+      if (before !== null && created >= before) return false;
+    }
+    return true;
+  };
 }
 
 // What to do with a list answer: the list shape to use from now on, and
