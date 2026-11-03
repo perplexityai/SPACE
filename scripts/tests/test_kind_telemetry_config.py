@@ -565,6 +565,15 @@ def test_native_traces_need_a_deployed_agent(backend, traces):
     assert ("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT" in wrapper) == (traces != "off")
 
 
+@pytest.mark.parametrize("backend", ["Off", "none", "datadog"])
+def test_unknown_datadog_backend_is_rejected_not_read_as_an_agent(backend):
+    """A typo must not leave native traces pointed at an Agent that was never deployed."""
+    environment = {"SPACE_KIND_TELEMETRY_MODE": "datadog", "SPACE_KIND_DATADOG_MODE": backend}
+    with pytest.raises(ValueError, match="SPACE_KIND_DATADOG_MODE"):
+        config.configuration(environment)
+    assert config.datadog_backend({}) == "off"
+
+
 @pytest.mark.parametrize(
     "env,mode,installs",
     [

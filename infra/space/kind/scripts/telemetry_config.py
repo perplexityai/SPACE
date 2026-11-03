@@ -143,6 +143,18 @@ def token(value, name, *, empty=False):
     return value
 
 
+
+DATADOG_BACKENDS = ("off", "fakeintake", "saas")
+
+
+def datadog_backend(env):
+    """The Datadog backend Kind deploys. Both the deploy plan and trace export read it here."""
+    backend = env.get("SPACE_KIND_DATADOG_MODE", "off")
+    if backend not in DATADOG_BACKENDS:
+        raise ValueError("SPACE_KIND_DATADOG_MODE must be off, fakeintake, or saas")
+    return backend
+
+
 def configuration(env):
     kind_cluster = env.get("SPACE_KIND_CLUSTER", "space-local")
     if not re.fullmatch(r"(?:space-local(?:-[a-z0-9]+(?:-[a-z0-9]+)*)?|space-oss-[0-9a-f]{10})", kind_cluster):
@@ -212,7 +224,7 @@ def configuration(env):
     # Native traces go to a node-local Agent, and SPACE_KIND_DATADOG_MODE=off
     # deploys none: every exporter would retry a refused connection and log
     # each failure. DogStatsD metrics are fire-and-forget UDP, so they stay.
-    if mode == "datadog" and env.get("SPACE_KIND_DATADOG_MODE", "off") == "off":
+    if mode == "datadog" and datadog_backend(env) == "off":
         traces = "off"
     observability = env.get("SPACE_KIND_OBSERVABILITY", "auto")
     if observability not in {"auto", "off"}:
