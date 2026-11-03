@@ -813,13 +813,20 @@ impl K8sStore {
 
         if sandbox.lifecycle.trim().eq_ignore_ascii_case("restoring") {
             // Markerless user restores must acquire the lease before a retry
-            // can re-drive. Marker-set evacuation restores keep the preexisting
-            // bounded takeover behavior; the marker owner still controls them.
+            // can re-drive. A suspended evacuation's marker keeps the
+            // preexisting bounded takeover behavior, with the marker owner
+            // still in control; a stopped re-placement's refuses the wake.
             let restore_claim = match preclaimed_restore_claim {
                 Some(restore_claim) => Some(restore_claim),
                 None => {
-                    self.claim_markerless_restoring_restore_lease(sandbox_id)
-                        .await?
+                    let restore_claim = self
+                        .claim_markerless_restoring_restore_lease(sandbox_id)
+                        .await?;
+                    if restore_claim.is_none() {
+                        self.refuse_user_wake_of_stopped_re_placement(sandbox_id)
+                            .await?;
+                    }
+                    restore_claim
                 }
             };
             return Ok(PreparedWakeSandbox {
@@ -834,5 +841,33 @@ impl K8sStore {
             restore_started: false,
             restore_claim: None,
         })
+    }
+
+    /// Refuse a user start or wake of a `restoring` row that a stopped
+    /// evacuation's re-placement owns, with the retryable 503
+    /// [`stopped_evacuation_pending`](super::stopped_evacuation_pending) that
+    /// `stopped_restore_plan` gives the same sandbox before the claim.
+    ///
+    /// Such a row has no plan a user wake can follow (see
+    /// `stopped_restore_plan`'s "A stopped evacuation in flight is refused").
+    /// The suspend-restore plan it would otherwise get can resolve its source
+    /// node from the newest execution that named one, which can be the drained
+    /// node, cordoned and on its way out, and with no storage URI the pod is
+    /// pre-bound there. The row stays `restoring` with the marker until the
+    /// drain settles it, including the whole backoff after a failed attempt.
+    ///
+    /// Only the `'stopped'` marker refuses. A `restoring` row with another
+    /// marker is a suspended evacuation, whose snapshot a user wake can
+    /// restore from, and it keeps its takeover path. The marker comes from the
+    /// row, not the caller's `Sandbox`, which may predate the missed claim.
+    async fn refuse_user_wake_of_stopped_re_placement(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<(), SubstrateError> {
+        let (_, marker, _) = self.fetch_restore_ownership_snapshot(sandbox_id).await?;
+        if marker.as_deref() == Some("stopped") {
+            return Err(super::stopped_evacuation_pending());
+        }
+        Ok(())
     }
 }
