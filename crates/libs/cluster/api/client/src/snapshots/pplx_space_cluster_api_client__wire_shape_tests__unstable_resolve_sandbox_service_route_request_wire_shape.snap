@@ -1,0 +1,12 @@
+---
+source: crates/libs/cluster/api/client/src/lib.rs
+assertion_line: 190
+expression: "UnstableResolveSandboxServiceRouteRequest\n{\n    sandbox_id: \"019e6370-cfc9-7a43-9337-399c7b51a1d1\".to_string(), port:\n    8080, route_kind: SandboxServiceRouteKind::Agent as i32,\n    credential_proofs: vec![], transport: SandboxServiceRouteTransport::Direct\n    as i32,\n}"
+---
+UnstableResolveSandboxServiceRouteRequest {
+    sandbox_id: "019e6370-cfc9-7a43-9337-399c7b51a1d1",
+    port: 8080,
+    route_kind: Agent,
+    credential_proofs: [],
+    transport: Direct,
+}

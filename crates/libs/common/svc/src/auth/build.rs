@@ -12,7 +12,7 @@ use tower::{Layer, Service};
 
 use super::{
     AuthConfigError, BoxError, SPACE_K8S_TOKEN_AUTH_STATIC_FALLBACK_ENABLED_ENV, bearer_token,
-    constant_time_eq, env_bool_default,
+    cluster_api_method, constant_time_eq, env_bool_default,
 };
 
 mod direct;
@@ -42,10 +42,12 @@ impl BuildSurface {
             Self::Manager => path.starts_with("/build.manager.v1.BuildManager/"),
             Self::NodeApi => path == "/space.node.api.v1.BuilderApi/BuildTemplate",
             Self::Publication => matches!(
-                path,
-                "/space.node.api.v1.ClusterApi/RegisterTemplate"
-                    | "/space.node.api.v1.ClusterApi/RegisterTemplateRelease"
-                    | "/space.node.api.v1.ClusterApi/CreateSystemTemplatePublicationGrant"
+                cluster_api_method(path),
+                Some(
+                    "RegisterTemplate"
+                        | "RegisterTemplateRelease"
+                        | "CreateSystemTemplatePublicationGrant"
+                )
             ),
         }
     }

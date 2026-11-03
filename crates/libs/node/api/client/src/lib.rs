@@ -3,6 +3,14 @@ pub mod cluster;
 pub mod node_status_freshness;
 
 pub mod proto {
+    // Re-export the common.proto messages and enums from
+    // pplx-space-node-api-types, so pplx_space_node_api_client::proto::NodeRole,
+    // FacetRef, NodeCtlStatus and the rest are the same Rust types that
+    // pplx-space-cluster-api-client uses. The worker, builder and cluster
+    // protos, and the NodeInfo/NodeCtl services from common.proto, are still
+    // generated here.
+    pub use pplx_space_node_api_types::proto::*;
+
     tonic::include_proto!("space.node.api.v1");
 
     pub const WORKER_FILE_DESCRIPTOR_SET: &[u8] =

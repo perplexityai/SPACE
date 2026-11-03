@@ -1,0 +1,25 @@
+---
+source: crates/libs/cluster/api/client/src/lib.rs
+assertion_line: 170
+expression: "GetNodeSandboxDesiredStateResponse\n{\n    sandboxes:\n    vec![SandboxDesiredState\n    {\n        sandbox_id: \"019e6370-cfc9-7a43-9337-399c7b51a1d1\".to_string(),\n        snapshots_enabled_desired: true, port_exposures:\n        vec![SandboxPortExposureDesiredState\n        {\n            protocol: SandboxPortProtocol::Tcp as i32, guest_port: 9012,\n            desired_state:\n            SandboxPortDesiredStateKind::SandboxPortDesiredStateOpen as i32,\n        }], auto_lifecycle: None,\n    }], deleted_sandbox_ids:\n    vec![\"019e6370-cfc9-7a43-9337-399c7b51a1d2\".to_string(),\n    \"019e6370-cfc9-7a43-9337-399c7b51a1d3\".to_string(),],\n}"
+---
+GetNodeSandboxDesiredStateResponse {
+    sandboxes: [
+        SandboxDesiredState {
+            sandbox_id: "019e6370-cfc9-7a43-9337-399c7b51a1d1",
+            snapshots_enabled_desired: true,
+            port_exposures: [
+                SandboxPortExposureDesiredState {
+                    protocol: Tcp,
+                    guest_port: 9012,
+                    desired_state: SandboxPortDesiredStateOpen,
+                },
+            ],
+            auto_lifecycle: None,
+        },
+    ],
+    deleted_sandbox_ids: [
+        "019e6370-cfc9-7a43-9337-399c7b51a1d2",
+        "019e6370-cfc9-7a43-9337-399c7b51a1d3",
+    ],
+}

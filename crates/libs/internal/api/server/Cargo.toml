@@ -27,6 +27,7 @@ datadog-otel = ["otel", "datadog"]
 futures-util = { workspace = true }
 k8s-openapi = { workspace = true, features = ["v1_32"], optional = true }
 kube = { workspace = true, default-features = false, features = ["aws-lc-rs", "client", "config", "rustls-tls"], optional = true }
+prost = { workspace = true }
 prost-types = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -43,6 +44,7 @@ tracing = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 
 # internal
+pplx-space-cluster-api-client = { workspace = true }
 pplx-space-cluster-pool = { workspace = true }
 pplx-space-cluster-trigger-queue = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["serde", "sqlx"] }

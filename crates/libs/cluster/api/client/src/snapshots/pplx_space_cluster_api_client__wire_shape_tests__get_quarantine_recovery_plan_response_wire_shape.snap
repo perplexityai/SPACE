@@ -1,0 +1,19 @@
+---
+source: crates/libs/cluster/api/client/src/lib.rs
+assertion_line: 201
+expression: "GetQuarantineRecoveryPlanResponse\n{\n    recovery_id: \"rec-001\".to_string(), execution_generation: 7, reason_code:\n    \"sandbox_unreachable\".to_string(), target_state:\n    QuarantineRecoveryTargetState::Suspended as i32, suspend_snapshot:\n    Some(QuarantineRecoverySuspendSnapshot\n    {\n        snapshot_id: \"snap-001\".to_string(), local_artifact_id:\n        \"art-abc\".to_string(), storage_uri:\n        \"s3://bucket/key?region=us-east-1\".to_string(), bytes_uploaded: 1024,\n    }),\n}"
+---
+GetQuarantineRecoveryPlanResponse {
+    recovery_id: "rec-001",
+    execution_generation: 7,
+    reason_code: "sandbox_unreachable",
+    target_state: Suspended,
+    suspend_snapshot: Some(
+        QuarantineRecoverySuspendSnapshot {
+            snapshot_id: "snap-001",
+            local_artifact_id: "art-abc",
+            storage_uri: "s3://bucket/key?region=us-east-1",
+            bytes_uploaded: 1024,
+        },
+    ),
+}
