@@ -18,7 +18,7 @@ use pplx_space_common_core::types::{
 };
 use pplx_space_public_api::PUBLIC_SANDBOX_ID_PREFIX;
 use serde::Serialize;
-use sqlx::{PgConnection, PgPool, Postgres, Transaction};
+use sqlx::PgPool;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -27,9 +27,7 @@ use super::{
     ListPage, MAX_SANDBOX_LIST_PAGE_BYTES, PageWalkParams, SANDBOX_LIST_ROW_OVERHEAD_BYTES,
 };
 use crate::controllers::sandbox::{SandboxController, SandboxPageCursor, sandbox_query};
-use crate::controllers::substrate::direct::route_overrides::{
-    OverrideScope, RouteOverrides, route_overrides,
-};
+use crate::controllers::substrate::direct::reported_node::{reported_on_a_node, reported_on_node};
 use crate::controllers::{ControllerError, db_contention_error};
 use crate::models::{Sandbox, SandboxResourceType};
 
@@ -185,54 +183,17 @@ fn id_prefix_range(prefix: &str) -> Option<(SandboxId, SandboxId)> {
     Some((bound('0')?, bound('f')?))
 }
 
-/// The admin list's sandboxes ($1-$13) after the cursor, for the page walk.
-/// The filters are the same as [`ADMIN_LIST_SQL`]'s. The node filters ($10,
-/// $13) match the node the response reports, from a [`RouteOverrides`] read
-/// in the statement's snapshot: $11 holds the sandboxes whose Direct route's
-/// node differs from their row's `active_node_id`, and $12 those of them
-/// routed to $10. Every other sandbox has no route or one on its row's node,
-/// so its row decides.
-const ADMIN_CANDIDATE_ROWS: &str = "SELECT s.id, s.created_at
-    FROM sandboxes s
-    WHERE ($1::UUID IS NULL OR s.org_id = $1)
-      AND ($2::TEXT[] IS NULL OR s.lifecycle = ANY($2::TEXT[]))
-      AND ($3::TEXT IS NULL OR s.template_id = $3)
-      AND ($4::UUID IS NULL OR s.user_id = $4)
-      AND ($5::TIMESTAMPTZ IS NULL OR s.created_at > $5)
-      AND ($6::TIMESTAMPTZ IS NULL OR s.created_at < $6)
-      AND ($7::TEXT IS NULL
-           OR starts_with(s.name, $7)
-           OR s.id BETWEEN $8::UUID AND $9::UUID)
-      AND ($10::UUID IS NULL
-           OR s.id = ANY($12::UUID[])
-           OR (s.active_node_id = $10 AND s.id <> ALL($11::UUID[])))
-      AND ($13::BOOLEAN IS NULL
-           OR (s.id = ANY($11::UUID[]) OR s.active_node_id IS NOT NULL) = $13)
-      AND {after_cursor}
-    ORDER BY s.created_at DESC, s.id DESC
-    LIMIT {max_rows}";
-
-static ADMIN_PAGE_SQL: LazyLock<String> = LazyLock::new(|| {
-    scoped_page_sql(
-        ADMIN_CANDIDATE_ROWS,
-        &PageWalkParams {
-            cursor_created_at: "$14",
-            cursor_id: "$15",
-            max_rows: "$16",
-            max_bytes: "$17",
-            row_overhead_bytes: "$18",
-            // The admin response carries no `env`.
-            lists_env: false,
-        },
-    )
-});
-
-/// The legacy unpaged list: at most $14 sandboxes matching the filters
-/// ($1-$13, as [`ADMIN_CANDIDATE_ROWS`]'s), newest first.
-static ADMIN_LIST_SQL: LazyLock<String> = LazyLock::new(|| {
-    sandbox_query(
-        "SELECT {sandbox_columns}
-         FROM {sandbox_from}
+/// The admin list's sandboxes ($1-$11) after the cursor, for the page walk.
+/// The filters are the same as [`ADMIN_LIST_SQL`]'s. This statement reads
+/// `sandboxes` alone, so the node filters ($10, $11) take Direct's predicates
+/// for the node the response reports. Built once: every input is a literal or
+/// a bind placeholder.
+static ADMIN_CANDIDATE_ROWS: LazyLock<String> = LazyLock::new(|| {
+    let on_node = reported_on_node("s", "$10");
+    let on_a_node = reported_on_a_node("s");
+    format!(
+        "SELECT s.id, s.created_at
+         FROM sandboxes s
          WHERE ($1::UUID IS NULL OR s.org_id = $1)
            AND ($2::TEXT[] IS NULL OR s.lifecycle = ANY($2::TEXT[]))
            AND ($3::TEXT IS NULL OR s.template_id = $3)
@@ -242,14 +203,55 @@ static ADMIN_LIST_SQL: LazyLock<String> = LazyLock::new(|| {
            AND ($7::TEXT IS NULL
                 OR starts_with(s.name, $7)
                 OR s.id BETWEEN $8::UUID AND $9::UUID)
-           AND ($10::UUID IS NULL
-                OR s.id = ANY($12::UUID[])
-                OR (s.active_node_id = $10 AND s.id <> ALL($11::UUID[])))
-           AND ($13::BOOLEAN IS NULL
-                OR (s.id = ANY($11::UUID[]) OR s.active_node_id IS NOT NULL) = $13)
+           AND ($10::UUID IS NULL OR {on_node})
+           AND ($11::BOOLEAN IS NULL OR {on_a_node} = $11)
+           AND {{after_cursor}}
          ORDER BY s.created_at DESC, s.id DESC
-         LIMIT $14",
+         LIMIT {{max_rows}}"
     )
+});
+
+static ADMIN_PAGE_SQL: LazyLock<String> = LazyLock::new(|| {
+    scoped_page_sql(
+        &ADMIN_CANDIDATE_ROWS,
+        &PageWalkParams {
+            cursor_created_at: "$12",
+            cursor_id: "$13",
+            max_rows: "$14",
+            max_bytes: "$15",
+            row_overhead_bytes: "$16",
+            // The admin response carries no `env`.
+            lists_env: false,
+        },
+    )
+});
+
+/// The legacy unpaged list: at most $12 sandboxes matching the filters
+/// ($1-$11, as [`ADMIN_CANDIDATE_ROWS`]'s), newest first. `{sandbox_from}`
+/// joins the Direct route, so `assigned` ($11) tests the response's own
+/// `active_node_id` expression; `node_id` ($10) takes Direct's predicate,
+/// whose narrowing conjunct reaches a node's few sandboxes by index where the
+/// joined expression tests every row. Built once, as above.
+static ADMIN_LIST_SQL: LazyLock<String> = LazyLock::new(|| {
+    let on_node = reported_on_node("s", "$10");
+    sandbox_query(&format!(
+        "SELECT {{sandbox_columns}}
+         FROM {{sandbox_from}}
+         WHERE ($1::UUID IS NULL OR s.org_id = $1)
+           AND ($2::TEXT[] IS NULL OR s.lifecycle = ANY($2::TEXT[]))
+           AND ($3::TEXT IS NULL OR s.template_id = $3)
+           AND ($4::UUID IS NULL OR s.user_id = $4)
+           AND ($5::TIMESTAMPTZ IS NULL OR s.created_at > $5)
+           AND ($6::TIMESTAMPTZ IS NULL OR s.created_at < $6)
+           AND ($7::TEXT IS NULL
+                OR starts_with(s.name, $7)
+                OR s.id BETWEEN $8::UUID AND $9::UUID)
+           AND ($10::UUID IS NULL OR {on_node})
+           AND ($11::BOOLEAN IS NULL
+                OR (COALESCE(direct_route.current_node_id, s.active_node_id) IS NOT NULL) = $11)
+         ORDER BY s.created_at DESC, s.id DESC
+         LIMIT $12"
+    ))
 });
 
 /// Whether a page stops at the list byte budget.
@@ -294,10 +296,6 @@ impl SandboxController {
     /// id)`, after `cursor`: at most `limit` rows, and whether more follow.
     /// A [`PageBudget::Unbounded`] list ignores `cursor` and never says more
     /// follow.
-    ///
-    /// A node filter reads the Direct routes it needs and runs the page in
-    /// one snapshot, so a route that moves between the two reads cannot list
-    /// a sandbox under one node while its response reports another.
     pub(crate) async fn admin_sandbox_page(
         &self,
         pool: &PgPool,
@@ -306,23 +304,68 @@ impl SandboxController {
         limit: u32,
         budget: PageBudget,
     ) -> Result<ListPage<Sandbox>, sqlx::Error> {
-        let Some(node) = filter.node else {
-            return admin_page_statement(
-                pool,
-                filter,
-                &RouteOverrides::default(),
-                cursor,
-                limit,
-                budget,
-            )
-            .await;
+        let lifecycles = filter.lifecycles.as_ref().map(|lifecycles| {
+            lifecycles
+                .iter()
+                .map(|lifecycle| lifecycle.as_str())
+                .collect::<Vec<_>>()
+        });
+        let id_range = filter.search.as_ref().and_then(|search| search.id_range);
+        let template = filter.template.as_ref().map(TemplateName::as_str);
+        let prefix = filter.search.as_ref().map(|search| search.prefix.as_str());
+        let (node_id, assigned) = match filter.node {
+            Some(NodeAssignment::Node(node_id)) => (Some(node_id), None),
+            Some(NodeAssignment::Assigned) => (None, Some(true)),
+            Some(NodeAssignment::Unassigned) => (None, Some(false)),
+            None => (None, None),
         };
-        let mut snapshot = begin_node_snapshot(pool).await?;
-        let overrides = node_route_overrides(&mut snapshot, node).await?;
-        let page =
-            admin_page_statement(&mut *snapshot, filter, &overrides, cursor, limit, budget).await?;
-        snapshot.commit().await?;
-        Ok(page)
+        if budget == PageBudget::Unbounded {
+            let rows =
+                sqlx::query_as::<_, Sandbox>(sqlx::AssertSqlSafe(sql!(ADMIN_LIST_SQL.as_str())))
+                    .bind(filter.org_id)
+                    .bind(lifecycles)
+                    .bind(template)
+                    .bind(filter.user_id)
+                    .bind(filter.created_after)
+                    .bind(filter.created_before)
+                    .bind(prefix)
+                    .bind(id_range.map(|(low, _)| low))
+                    .bind(id_range.map(|(_, high)| high))
+                    .bind(node_id)
+                    .bind(assigned)
+                    .bind(i64::from(limit))
+                    .fetch_all(pool)
+                    .await?;
+            return Ok(ListPage {
+                rows,
+                has_more: false,
+            });
+        }
+        let rows =
+            sqlx::query_as::<_, ScopedPageRow>(sqlx::AssertSqlSafe(sql!(ADMIN_PAGE_SQL.as_str())))
+                .bind(filter.org_id)
+                .bind(lifecycles)
+                .bind(template)
+                .bind(filter.user_id)
+                .bind(filter.created_after)
+                .bind(filter.created_before)
+                .bind(prefix)
+                .bind(id_range.map(|(low, _)| low))
+                .bind(id_range.map(|(_, high)| high))
+                .bind(node_id)
+                .bind(assigned)
+                .bind(cursor.map(|cursor| cursor.created_at))
+                .bind(cursor.map(|cursor| cursor.id))
+                .bind(i64::from(limit.saturating_add(1)))
+                .bind(MAX_SANDBOX_LIST_PAGE_BYTES)
+                .bind(SANDBOX_LIST_ROW_OVERHEAD_BYTES)
+                .fetch_all(pool)
+                .await?;
+        let page = ListPage::from_rows(rows, limit as usize, |row| row.has_next);
+        Ok(ListPage {
+            rows: page.rows.into_iter().map(|row| row.sandbox).collect(),
+            has_more: page.has_more,
+        })
     }
 
     /// Every listed sandbox whose status is not `deleted`, counted by the
@@ -391,103 +434,6 @@ impl SandboxController {
             })
             .collect())
     }
-}
-
-/// The read-only transaction a node-filtered page runs in. `REPEATABLE READ`
-/// so the route read and the page statement see one snapshot.
-async fn begin_node_snapshot(pool: &PgPool) -> Result<Transaction<'_, Postgres>, sqlx::Error> {
-    pool.begin_with(sql!("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"))
-        .await
-}
-
-/// The routes `node` needs: the ones that put a sandbox on another node than
-/// its row's.
-async fn node_route_overrides(
-    snapshot: &mut PgConnection,
-    node: NodeAssignment,
-) -> Result<RouteOverrides, sqlx::Error> {
-    let scope = match node {
-        NodeAssignment::Node(node_id) => OverrideScope::Node(node_id),
-        NodeAssignment::Assigned | NodeAssignment::Unassigned => OverrideScope::Assignment,
-    };
-    route_overrides(snapshot, scope).await
-}
-
-/// The page statement, with the route overrides a node filter needs; a
-/// filter without one ignores them.
-async fn admin_page_statement(
-    executor: impl sqlx::PgExecutor<'_>,
-    filter: &AdminSandboxFilter,
-    overrides: &RouteOverrides,
-    cursor: Option<SandboxPageCursor>,
-    limit: u32,
-    budget: PageBudget,
-) -> Result<ListPage<Sandbox>, sqlx::Error> {
-    let lifecycles = filter.lifecycles.as_ref().map(|lifecycles| {
-        lifecycles
-            .iter()
-            .map(|lifecycle| lifecycle.as_str())
-            .collect::<Vec<_>>()
-    });
-    let id_range = filter.search.as_ref().and_then(|search| search.id_range);
-    let template = filter.template.as_ref().map(TemplateName::as_str);
-    let prefix = filter.search.as_ref().map(|search| search.prefix.as_str());
-    let (node_id, assigned) = match filter.node {
-        Some(NodeAssignment::Node(node_id)) => (Some(node_id), None),
-        Some(NodeAssignment::Assigned) => (None, Some(true)),
-        Some(NodeAssignment::Unassigned) => (None, Some(false)),
-        None => (None, None),
-    };
-    if budget == PageBudget::Unbounded {
-        let rows = sqlx::query_as::<_, Sandbox>(sqlx::AssertSqlSafe(sql!(ADMIN_LIST_SQL.as_str())))
-            .bind(filter.org_id)
-            .bind(lifecycles)
-            .bind(template)
-            .bind(filter.user_id)
-            .bind(filter.created_after)
-            .bind(filter.created_before)
-            .bind(prefix)
-            .bind(id_range.map(|(low, _)| low))
-            .bind(id_range.map(|(_, high)| high))
-            .bind(node_id)
-            .bind(&overrides.overridden)
-            .bind(&overrides.on_node)
-            .bind(assigned)
-            .bind(i64::from(limit))
-            .fetch_all(executor)
-            .await?;
-        return Ok(ListPage {
-            rows,
-            has_more: false,
-        });
-    }
-    let rows =
-        sqlx::query_as::<_, ScopedPageRow>(sqlx::AssertSqlSafe(sql!(ADMIN_PAGE_SQL.as_str())))
-            .bind(filter.org_id)
-            .bind(lifecycles)
-            .bind(template)
-            .bind(filter.user_id)
-            .bind(filter.created_after)
-            .bind(filter.created_before)
-            .bind(prefix)
-            .bind(id_range.map(|(low, _)| low))
-            .bind(id_range.map(|(_, high)| high))
-            .bind(node_id)
-            .bind(&overrides.overridden)
-            .bind(&overrides.on_node)
-            .bind(assigned)
-            .bind(cursor.map(|cursor| cursor.created_at))
-            .bind(cursor.map(|cursor| cursor.id))
-            .bind(i64::from(limit.saturating_add(1)))
-            .bind(MAX_SANDBOX_LIST_PAGE_BYTES)
-            .bind(SANDBOX_LIST_ROW_OVERHEAD_BYTES)
-            .fetch_all(executor)
-            .await?;
-    let page = ListPage::from_rows(rows, limit as usize, |row| row.has_next);
-    Ok(ListPage {
-        rows: page.rows.into_iter().map(|row| row.sandbox).collect(),
-        has_more: page.has_more,
-    })
 }
 
 #[cfg(test)]

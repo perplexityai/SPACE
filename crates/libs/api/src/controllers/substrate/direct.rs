@@ -5024,7 +5024,7 @@ fn ensure_direct_create_supported(fork_disk_restore: bool) -> Result<(), Substra
     Ok(())
 }
 
-pub(crate) mod route_overrides;
+pub(crate) mod reported_node;
 
 #[cfg(test)]
 mod cluster_admission_tests;
