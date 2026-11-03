@@ -28,18 +28,19 @@ export function scopedRefreshKey(base: string, limit: number, defaultLimit: numb
 }
 
 // What the direct-lookup notice says about a sandbox found outside the loaded
-// rows, under the selected org filter.
+// rows, under the selected org filter. `limit` is the size of a sampled list,
+// or null for one page of a paged list.
 export function lookupScopeText(
   sandbox: { org_id: string | null },
   selectedOrg: string | null,
   orgName: (id: string) => string | undefined,
-  limit: number,
+  limit: number | null,
 ): string {
-  if (!selectedOrg) return `It is not among the newest ${limit} sandboxes loaded below.`;
+  const loaded = (of: string) =>
+    limit === null ? `It is not on the page of sandboxes${of} loaded below.` : `It is not among the newest ${limit} sandboxes${of} loaded below.`;
+  if (!selectedOrg) return loaded('');
   const selected = orgName(selectedOrg) ?? selectedOrg;
-  if (sandbox.org_id === selectedOrg) {
-    return `It is not among the newest ${limit} sandboxes of ${selected} loaded below.`;
-  }
+  if (sandbox.org_id === selectedOrg) return loaded(` of ${selected}`);
   const owner = sandbox.org_id ? orgName(sandbox.org_id) ?? 'another organization' : 'no organization';
   return `It belongs to ${owner}, not ${selected}.`;
 }

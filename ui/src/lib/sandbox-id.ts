@@ -1,3 +1,5 @@
+import type { ListMode } from './sandbox-list';
+
 const SANDBOX_LABEL_LEN = 8;
 const PUBLIC_SANDBOX_ID_PREFIX = 'sbx_';
 
@@ -128,4 +130,59 @@ export function matchesSandboxQuery(query: SandboxQuery, sandbox: { id: string; 
         (sandbox.name || '').toLowerCase().includes(query.text)
       );
   }
+}
+
+// The longest sandbox name (`MAX_SANDBOX_NAME_BYTES` in
+// crates/libs/public/api/src/limits.rs): a longer prefix starts no name.
+const MAX_SANDBOX_NAME_BYTES = 256;
+const UUID_DASH_POSITIONS = [8, 13, 18, 23];
+
+// Whether `value` is the start of a sandbox ID as a paging server reads
+// a `prefix`: hex digits, with dashes exactly where a dashed UUID has them
+// if it has any.
+function startsUuid(value: string): boolean {
+  if (!value || value.length > 36) return false;
+  const dashed = value.includes('-');
+  if (!dashed && value.length > 32) return false;
+  return [...value].every((character, position) =>
+    dashed && UUID_DASH_POSITIONS.includes(position) ? character === '-' : /^[0-9a-f]$/.test(character));
+}
+
+// What the search box does on each list shape.
+// - `ref`: a full identifier in any accepted form, looked up directly.
+// - `prefix`: sent to a paging server as typed. It matches the start of
+//   names case-sensitively, and the start of IDs: an `sbx_` ID prefix, or a
+//   dashed one in the UUID's layout, with hex digits in either case. The
+//   server reads only a lowercase `sbx_` as the ID's; `parseSandboxRef`
+//   takes `SBX_` too, so an ID prefix behind it is sent behind `sbx_`, the
+//   rest as typed. A name that starts with `SBX_` and then hex is then not
+//   matched.
+// - `page`: matched within the loaded rows, ignoring case, anywhere in the ID
+//   or name. On a paging server this is undashed hex or a hex run with
+//   dashes elsewhere, such as the ID column's label, which is the end of
+//   the ID and not its start, and text no name can start with. A sampled
+//   list matches all free text this way, as it did before paging.
+export type SandboxSearch =
+  | { kind: 'empty' }
+  | { kind: 'ref'; ref: SandboxRef }
+  | { kind: 'prefix'; prefix: string }
+  | { kind: 'page'; query: Extract<SandboxQuery, { kind: 'text' }> };
+
+export function sandboxSearch(input: string, mode: ListMode): SandboxSearch {
+  const query = sandboxQuery(input);
+  if (query.kind === 'empty') return query;
+  if (query.kind === 'ref') return query;
+  if (mode === 'sampled') return { kind: 'page', query };
+  const typed = input.trim();
+  const lower = typed.toLowerCase();
+  // As typed: lowercasing would lose a name such as `sbx_AB-worker`.
+  const afterMarker = typed.slice(PUBLIC_SANDBOX_ID_PREFIX.length);
+  if (lower.startsWith(PUBLIC_SANDBOX_ID_PREFIX) && startsUuid(afterMarker.toLowerCase())) {
+    return { kind: 'prefix', prefix: `${PUBLIC_SANDBOX_ID_PREFIX}${afterMarker}` };
+  }
+  if (lower.includes('-') && startsUuid(lower)) return { kind: 'prefix', prefix: typed };
+  const idFragment = /^[0-9a-f-]+$/.test(lower) && /[0-9a-f]/.test(lower);
+  const namePrefix = !typed.includes('\0') && new TextEncoder().encode(typed).length <= MAX_SANDBOX_NAME_BYTES;
+  if (idFragment || !namePrefix) return { kind: 'page', query };
+  return { kind: 'prefix', prefix: typed };
 }

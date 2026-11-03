@@ -2,6 +2,7 @@ import { OperationFailedError, OperationTimeoutError } from './accepted-create';
 import { adminApi, api, ApiError } from './api';
 import { DEFAULT_LIST_LIMIT, parseSandboxRef, publicSandboxIdFromAny } from './sandbox-id';
 import { mergeOperationPages, type SandboxDebug } from './sandbox-debug';
+import { parseSandboxListResponse, type SandboxListResponse } from './sandbox-list';
 import {
   PublicOperationRecord,
   PublicPage,
@@ -41,6 +42,19 @@ export async function getConsoleSandboxes(
   if (orgId) params.set('org_id', orgId);
   const sandboxes = await adminApi.get<Sandbox[]>(`/v1/sandboxes?${params}`);
   return sandboxes.map(adminSandboxToConsoleSandbox);
+}
+
+// One admin list request, built by `sandboxListQuery`: a page when the
+// server pages, or the bare array of a server that does not.
+export async function getConsoleSandboxList(query: string): Promise<SandboxListResponse> {
+  const response = parseSandboxListResponse(await adminApi.get<unknown>(`/v1/sandboxes?${query}`));
+  return { ...response, sandboxes: response.sandboxes.map(adminSandboxToConsoleSandbox) };
+}
+
+// `GET /sandboxes/spaced-versions`; see `loadSpacedCounts` for what a server
+// without it answers.
+export function getSpacedVersionCounts(): Promise<unknown> {
+  return adminApi.get<unknown>('/v1/sandboxes/spaced-versions');
 }
 
 // `id` may be any form `parseSandboxRef` accepts; the admin route takes only

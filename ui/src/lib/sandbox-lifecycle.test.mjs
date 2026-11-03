@@ -4,8 +4,10 @@ import {
   SANDBOX_LIFECYCLE_STATES,
   SANDBOX_STATUS_FILTER_STATES,
   bringUpAction,
+  splitStatusFilter,
   statusFilterKey,
   statusFilterOptions,
+  storedLifecycles,
 } from './sandbox-lifecycle.ts';
 
 const row = (status) => status;
@@ -48,4 +50,24 @@ test('the filter also offers every other status the loaded rows carry', () => {
   // A row without a status filters under the option it is offered as.
   assert.equal(statusFilterKey(null), 'unknown');
   assert.equal(statusFilterKey('started'), 'started');
+});
+
+test('the paged list sends only stored lifecycles', () => {
+  // Every lifecycle and both tombstones; node-only states and the no-status
+  // key are never stored.
+  assert.deepEqual(storedLifecycles([...SANDBOX_LIFECYCLE_STATES]), [...SANDBOX_LIFECYCLE_STATES]);
+  assert.deepEqual(storedLifecycles(['started', 'unknown', 'cleanup_failed', 'unspecified', 'deleted', 'cleanup_required']), [
+    'started', 'deleted', 'cleanup_required',
+  ]);
+});
+
+test('a status a paged list cannot send is shown as not applied, not as a filter', () => {
+  // An older `?status=unknown` link, or statuses chosen while the list was
+  // sampled.
+  assert.deepEqual(splitStatusFilter(true, ['unknown']), { applied: [], notApplied: ['unknown'] });
+  assert.deepEqual(splitStatusFilter(true, ['started', 'cleanup_failed', 'deleted']), {
+    applied: ['started', 'deleted'], notApplied: ['cleanup_failed'],
+  });
+  // A sampled list matches each against its rows' statuses.
+  assert.deepEqual(splitStatusFilter(false, ['unknown', 'started']), { applied: ['unknown', 'started'], notApplied: [] });
 });

@@ -5,7 +5,14 @@ import Link from 'next/link';
 import styles from './inventory.module.css';
 import { lookupScopeText, orgOptionLabels, parseOrgParam, scopedRefreshKey } from '@/lib/org-filter';
 import { usePathname, useSearchParams } from 'next/navigation';
-import { bringUpAction, statusFilterKey, statusFilterOptions } from '@/lib/sandbox-lifecycle';
+import {
+  STORED_LIFECYCLE_FILTER_STATES,
+  bringUpAction,
+  splitStatusFilter,
+  statusFilterKey,
+  statusFilterOptions,
+  storedLifecycles,
+} from '@/lib/sandbox-lifecycle';
 import {
   DEFAULT_LIST_LIMIT,
   LIST_LIMIT_OPTIONS,
@@ -14,12 +21,13 @@ import {
   parseListLimit,
   sandboxLabelOrId,
   sandboxQuery,
+  sandboxSearch,
 } from '@/lib/sandbox-id';
 import {
   createConsoleSandboxForOrg,
   forceConsoleSandboxAction,
   getConsoleSandbox,
-  getConsoleSandboxes,
+  getConsoleSandboxList,
   getPublicPage,
   postPublicOperation,
   publicSnapshotToConsoleSnapshot,
@@ -29,6 +37,29 @@ import {
   waitForPublicOperation,
 } from '@/lib/public-api';
 import { adminApi } from '@/lib/api';
+import {
+  CREATED_AGES,
+  FIRST_PAGE,
+  ListSelection,
+  PAGE_SIZE_OPTIONS,
+  createdAgeMs,
+  listRequestQuery,
+  listSections,
+  loadedRowFilter,
+  nodeReportedPlacement,
+  parseListLink,
+  parsePageSize,
+  sameScope,
+  templateFilterOptions,
+  type AgeWindow,
+  type CreatedAge,
+  type ListMode,
+  type ListScope,
+  type NodeFilter,
+  type OlderThan,
+  type PagePosition,
+  type SandboxListFilters,
+} from '@/lib/sandbox-list';
 import { settleAcceptedCreate } from '@/lib/accepted-create';
 import {
   ROLLBACK_NOT_ENABLED,
@@ -72,7 +103,8 @@ import {
 import {
   PlusOutlined, StopOutlined, PauseCircleOutlined, PlayCircleOutlined,
   SaveOutlined, DeleteOutlined, CameraOutlined, RollbackOutlined, ReloadOutlined,
-  CopyOutlined, ClockCircleOutlined, GlobalOutlined, LockOutlined,
+  CopyOutlined, ClockCircleOutlined, GlobalOutlined, LockOutlined, LeftOutlined, RightOutlined,
+  QuestionCircleOutlined,
 } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 
@@ -80,53 +112,79 @@ const { Title, Text } = Typography;
 const SANDBOXES_VIEW_REFRESH_KEY = 'dashboard:sandboxes';
 const LARGE_LIST_STALE_MS = 15_000;
 
-// See `scopedRefreshKey`: each org and load size keeps its own timestamp.
+// See `scopedRefreshKey`: each org and load size of a sampled list keeps its
+// own timestamp, and so does each page of a paged list, with its filters.
+// The key holds relative creation-time bounds as chosen, so it does not
+// change from one poll to the next.
 function sandboxesRefreshKey(scope: ListScope): string {
-  return scopedRefreshKey(SANDBOXES_VIEW_REFRESH_KEY, scope.limit, DEFAULT_LIST_LIMIT, scope.org);
+  return scope.mode === 'sampled'
+    ? scopedRefreshKey(SANDBOXES_VIEW_REFRESH_KEY, scope.limit, DEFAULT_LIST_LIMIT, scope.filters.org)
+    : `${SANDBOXES_VIEW_REFRESH_KEY}:paged:${scope.key}`;
 }
 
-// The org and load size one list request asked for.
-interface ListScope {
-  limit: number;
-  org: string | null;
-}
-
-const sameScope = (a: ListScope | null, b: ListScope) => a !== null && a.limit === b.limit && a.org === b.org;
-
-// A refresh for an org or size that is no longer selected: it loaded
-// nothing, and the view's key is not marked fresh.
+// A refresh that loaded nothing, and did not mark the view's key fresh: its
+// page, org, size or filter is no longer selected.
 class RefreshSkipped extends Error {}
-// A load error the page already shows above the table.
+const SCOPE_CHANGED = 'the selected page, filters or size changed';
+const VERSION_CHANGED = 'the API changed version while this page was open';
+// A load error, or a stopped list, the page already shows above the table.
 class ShownListError extends Error {}
 const alreadyReported = (err: unknown) => err instanceof RefreshSkipped || err instanceof ShownListError;
 const REFRESH_CLICK_COOLDOWN_MS = 3000;
 
-type AgeWindow = '1h' | '24h' | '7d' | '30d' | '90d' | '1y' | 'all';
-type NodeFilter = 'any' | 'assigned' | 'unassigned';
-
-const VALID_AGE_WINDOWS: readonly AgeWindow[] = ['1h', '24h', '7d', '30d', '90d', '1y', 'all'];
-const VALID_NODE_FILTERS: readonly NodeFilter[] = ['any', 'assigned', 'unassigned'];
 // No age limit by default: long-running sandboxes are the ones support
 // cases tend to be about.
 const DEFAULT_AGE_WINDOW: AgeWindow = 'all';
 const DEFAULT_NODE_FILTER: NodeFilter = 'any';
 
-const parseAgeParam = (raw: string | null): AgeWindow =>
-  VALID_AGE_WINDOWS.includes(raw as AgeWindow) ? (raw as AgeWindow) : DEFAULT_AGE_WINDOW;
-const parseNodeParam = (raw: string | null): NodeFilter =>
-  VALID_NODE_FILTERS.includes(raw as NodeFilter) ? (raw as NodeFilter) : DEFAULT_NODE_FILTER;
-const parseCsvParam = (raw: string | null): string[] =>
-  raw ? raw.split(',').map((s) => s.trim()).filter(Boolean) : [];
-
 const AGE_WINDOW_OPTIONS: { value: AgeWindow; label: string; ms: number | null }[] = [
-  { value: '1h',  label: 'Last 1h',     ms: 1 * 60 * 60 * 1000 },
-  { value: '24h', label: 'Last 24h',    ms: 24 * 60 * 60 * 1000 },
-  { value: '7d',  label: 'Last 7 days', ms: 7 * 24 * 60 * 60 * 1000 },
-  { value: '30d', label: 'Last 30 days',ms: 30 * 24 * 60 * 60 * 1000 },
-  { value: '90d', label: 'Last 90 days',ms: 90 * 24 * 60 * 60 * 1000 },
-  { value: '1y',  label: 'Last year',   ms: 365 * 24 * 60 * 60 * 1000 },
+  { value: '1h',  label: 'Last 1h',     ms: CREATED_AGES['1h'] },
+  { value: '24h', label: 'Last 24h',    ms: CREATED_AGES['24h'] },
+  { value: '7d',  label: 'Last 7 days', ms: CREATED_AGES['7d'] },
+  { value: '30d', label: 'Last 30 days',ms: CREATED_AGES['30d'] },
+  { value: '90d', label: 'Last 90 days',ms: CREATED_AGES['90d'] },
+  { value: '1y',  label: 'Last year',   ms: CREATED_AGES['1y'] },
   { value: 'all', label: 'All time',    ms: null },
 ];
+
+// "Created more than ... ago", the other end of the creation-time range.
+const OLDER_THAN_OPTIONS: { value: OlderThan; label: string; ms: number | null }[] = [
+  { value: 'any', label: 'Older than: any', ms: null },
+  ...AGE_WINDOW_OPTIONS.filter((opt) => opt.ms !== null).map((opt) => ({
+    value: opt.value as OlderThan,
+    label: `Older than ${opt.label.replace(/^Last /, '')}`,
+    ms: opt.ms,
+  })),
+];
+const ageWindowAge = (value: AgeWindow): CreatedAge | null => (value === 'all' ? null : value);
+const olderThanAge = (value: OlderThan): CreatedAge | null => (value === 'any' ? null : value);
+const ageWindowMs = (value: AgeWindow) => createdAgeMs(ageWindowAge(value));
+const olderThanMs = (value: OlderThan) => createdAgeMs(olderThanAge(value));
+
+// What the server-side filters are built from.
+interface FilterInputs {
+  org: string | null;
+  statuses: string[];
+  template: string | null;
+  user: string | null;
+  age: AgeWindow;
+  older: OlderThan;
+  // The search box as a paging server's prefix; see `sandboxSearch`. A
+  // sampled request does not send it.
+  prefix: string;
+}
+
+function serverFilters(inputs: FilterInputs): SandboxListFilters {
+  return {
+    org: inputs.org,
+    lifecycles: storedLifecycles(inputs.statuses),
+    template: inputs.template,
+    userId: inputs.user,
+    createdWithin: ageWindowAge(inputs.age),
+    olderThan: olderThanAge(inputs.older),
+    prefix: inputs.prefix,
+  };
+}
 
 function formatRelativeTime(value: string | null | undefined, nowMs: number) {
   if (!value) return '—';
@@ -369,9 +427,13 @@ function sandboxNodeDisplay(sandbox: Sandbox) {
     </Tag>
   );
 
+  // The node page lists the sandboxes placed on the node, which the list's
+  // node filter cannot: the server has no node filter.
   return (
     <Tooltip title={sandboxNodeTooltip(sandboxNodeTooltipRows(node, 'active'))}>
-      {tag}
+      <Link href={`/dashboard/nodes/${node.id}`} onClick={(event) => event.stopPropagation()}>
+        {tag}
+      </Link>
     </Tooltip>
   );
 }
@@ -613,6 +675,10 @@ function SandboxesPage() {
   const { message } = App.useApp();
   const [sandboxes, setSandboxes] = useState<Sandbox[]>([]);
   const [templates, setTemplates] = useState<Template[]>([]);
+  // The admin template list's names, for the template filter: undefined
+  // while loading, null when it could not be read.
+  const [adminTemplateNames, setAdminTemplateNames] = useState<string[] | null | undefined>(undefined);
+  const [templateSearch, setTemplateSearch] = useState('');
   const { org: authOrg } = useAuth();
   const [orgs, setOrgs] = useState<Organization[]>([]);
   const [loading, setLoading] = useState(true);
@@ -641,26 +707,69 @@ function SandboxesPage() {
   const searchParams = useSearchParams();
   const pathname = usePathname();
 
+  // Only what the list can apply is taken from the link; the rest is listed
+  // in a notice, and the rewritten URL drops it.
+  const [link] = useState(() => {
+    const parsed = parseListLink(searchParams);
+    const rawOrg = searchParams.get('org')?.trim();
+    if (rawOrg && !parseOrgParam(rawOrg)) parsed.ignored.push({ param: 'org', value: rawOrg, reason: 'not an organization ID' });
+    return parsed;
+  });
+  const [linkNoticeOpen, setLinkNoticeOpen] = useState(link.ignored.length > 0);
   const [idFilter, setIdFilter] = useState(() => searchParams.get('id') ?? '');
-  const [templateFilter, setTemplateFilter] = useState<string[]>(() => parseCsvParam(searchParams.get('template')));
-  const [statusFilter, setStatusFilter] = useState<string[]>(() => parseCsvParam(searchParams.get('status')));
-  const [nodeFilter, setNodeFilter] = useState<NodeFilter>(() => parseNodeParam(searchParams.get('node')));
-  const [ageWindow, setAgeWindow] = useState<AgeWindow>(() => parseAgeParam(searchParams.get('age')));
+  const [templateFilter, setTemplateFilter] = useState<string | null>(link.template);
+  const [statusFilter, setStatusFilter] = useState<string[]>(link.statuses);
+  const [userFilter, setUserFilter] = useState<string | null>(link.user);
+  const [nodeFilter, setNodeFilter] = useState<NodeFilter>(link.node);
+  const [ageWindow, setAgeWindow] = useState<AgeWindow>(link.age);
+  const [olderThan, setOlderThan] = useState<OlderThan>(link.older);
+  // The sample size of a server that does not page.
   const [listLimit, setListLimit] = useState(() => parseListLimit(searchParams.get('limit')));
-  const listLimitRef = useRef(listLimit);
+  const [pageSize, setPageSize] = useState(link.pageSize);
+  // The list shape and page position of the rows on screen. Requests read
+  // the selection's (`selection` below), which the first answer can switch
+  // to sampling before the sample arrives; see `ListSelection.load`.
+  const [listMode, setListMode] = useState<ListMode>('paged');
+  const [position, setPosition] = useState<PagePosition>(FIRST_PAGE);
   // Bumped after every list load, so a direct lookup refreshes with the list.
   const [listGeneration, setListGeneration] = useState(0);
-  // Applied by the admin API (`org_id`), so the newest rows are that org's.
+  // Applied by the admin API (`org_id`) on either list shape.
   const [orgFilter, setOrgFilter] = useState<string | null>(() => parseOrgParam(searchParams.get('org')));
-  const orgFilterRef = useRef(orgFilter);
-  // Every list request takes the next number; only the newest one applies its
-  // rows, its error and the end of `loading`, so an older answer (even for
-  // the same org and size, after a change away and back) never wins.
-  const listRequestRef = useRef(0);
-  // The scope of the rows on screen, and the error of a load of another scope
-  // that failed (its rows are cleared rather than shown under the new label).
-  const shownScopeRef = useRef<ListScope | null>(null);
+  const query = useMemo(() => sandboxQuery(idFilter), [idFilter]);
+  // The selected statuses this list applies, and those it cannot.
+  const statusSplit = useMemo(() => splitStatusFilter(listMode === 'paged', statusFilter), [listMode, statusFilter]);
+  // What the search box does on this list's shape: a direct lookup, a prefix
+  // the server matches, or a match within the loaded rows.
+  const search = useMemo(() => sandboxSearch(idFilter, listMode), [idFilter, listMode]);
+  // The filters are those of a paged request whatever the shape on screen;
+  // a sampled request sends only the org (`listScope`).
+  const pagedSearch = useMemo(() => sandboxSearch(idFilter, 'paged'), [idFilter]);
+  const filterInputs: FilterInputs = {
+    org: orgFilter,
+    statuses: splitStatusFilter(true, statusFilter).applied,
+    template: templateFilter,
+    user: userFilter,
+    age: ageWindow,
+    older: olderThan,
+    prefix: pagedSearch.kind === 'prefix' ? pagedSearch.prefix : '',
+  };
+  const filterInputsKey = JSON.stringify(filterInputs);
+  const appliedInputsRef = useRef({ key: filterInputsKey, prefix: filterInputs.prefix });
+  // The selected scope, the rows' scope and the next page's cursor, and the
+  // loads in flight; see `ListSelection`. The filters change only once a
+  // filter does. The creation-time bounds stay relative ("the last hour")
+  // and are computed as each request is sent, so a refresh an hour later
+  // still shows the last hour.
+  const [selection] = useState(() => new ListSelection({ filters: serverFilters(filterInputs), pageSize, sampleSize: listLimit }));
+  // The selected scope and the next page's cursor, for rendering.
+  const [selectedScope, setSelectedScope] = useState<ListScope>(() => selection.selected);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  // The error of the last load; a load of another scope that failed clears
+  // the rows rather than show them under the new label.
   const [listError, setListError] = useState<string | null>(null);
+  // An answer came in the other list shape from the first; the list reads
+  // nothing more until the page is reloaded.
+  const [listStopped, setListStopped] = useState(false);
   // A full identifier that matches no loaded row is looked up directly, so a
   // sandbox outside the loaded rows can still be found.
   const [lookup, setLookup] = useState<
@@ -674,16 +783,19 @@ function SandboxesPage() {
   useEffect(() => {
     const params = new URLSearchParams();
     if (idFilter.trim()) params.set('id', idFilter.trim());
-    if (templateFilter.length) params.set('template', templateFilter.join(','));
+    if (templateFilter) params.set('template', templateFilter);
     if (statusFilter.length) params.set('status', statusFilter.join(','));
+    if (userFilter) params.set('user', userFilter);
     if (nodeFilter !== DEFAULT_NODE_FILTER) params.set('node', nodeFilter);
     if (ageWindow !== DEFAULT_AGE_WINDOW) params.set('age', ageWindow);
+    if (olderThan !== 'any') params.set('older', olderThan);
     if (listLimit !== DEFAULT_LIST_LIMIT) params.set('limit', String(listLimit));
+    if (pageSize !== parsePageSize(null)) params.set('page_size', String(pageSize));
     if (orgFilter) params.set('org', orgFilter);
     const qs = params.toString();
     const next = qs ? `${pathname}?${qs}` : pathname;
     window.history.replaceState(null, '', next);
-  }, [idFilter, templateFilter, statusFilter, nodeFilter, ageWindow, listLimit, orgFilter, pathname]);
+  }, [idFilter, templateFilter, statusFilter, userFilter, nodeFilter, ageWindow, olderThan, listLimit, pageSize, orgFilter, pathname]);
 
   const startRefreshCooldown = () => {
     refreshCooldownRef.current = true;
@@ -708,37 +820,43 @@ function SandboxesPage() {
     return secs;
   };
 
-  const currentScope = (): ListScope => ({ limit: listLimitRef.current, org: orgFilterRef.current });
+  // After the selection changes, for rendering.
+  const selectionChanged = () => {
+    setSelectedScope(selection.selected);
+    setNextCursor(selection.nextCursor());
+  };
 
   const refresh = async ({
     showLoading = true,
-    reconcile = false,
-    scope = currentScope(),
+    scope = selection.selected,
   }: { showLoading?: boolean; reconcile?: boolean; scope?: ListScope } = {}) => {
     // A poll or Refresh captures its scope before its lock callback runs; if
-    // the selection changed meanwhile, it must not take a newer number than
-    // the load for the new selection.
-    if (!sameScope(currentScope(), scope)) throw new RefreshSkipped('the selected org or size changed');
-    const request = ++listRequestRef.current;
-    const newest = () => request === listRequestRef.current;
+    // the selection changed meanwhile, it must not invalidate the load for
+    // the new selection.
+    if (!sameScope(selection.selected, scope)) throw new RefreshSkipped(SCOPE_CHANGED);
     if (showLoading) setLoading(true);
-    try {
-      const data = await getConsoleSandboxes(scope.limit, scope.org);
-      if (!newest()) return;
-      data.sort((a, b) => parseUptime(b.uptime) - parseUptime(a.uptime) || a.id.localeCompare(b.id));
-      setSandboxes(data);
-      shownScopeRef.current = scope;
-      setListError(null);
-      setListGeneration((n) => n + 1);
-      markViewRefreshed(sandboxesRefreshKey(scope));
-    } catch (err: any) {
-      if (!newest()) return;
-      const text = err.message || 'failed to refresh sandboxes';
-      if (!sameScope(shownScopeRef.current, scope)) {
+    const result = await selection.load(scope, (sent) => getConsoleSandboxList(listRequestQuery(sent, Date.now())));
+    // Only a load that applies ends `loading`, whichever request started it;
+    // a change of scope that keeps the rows on screen ends it itself.
+    if (result.kind === 'skipped') throw new RefreshSkipped(SCOPE_CHANGED);
+    setLoading(false);
+    selectionChanged();
+    if (result.kind === 'stopped') {
+      setListStopped(true);
+      // Rows of another org, page or filter are not shown under this one's label.
+      if (!result.kept) setSandboxes([]);
+      throw new ShownListError(VERSION_CHANGED);
+    }
+    // The shape and the page position on screen change with the rows.
+    setListMode(result.scope.mode);
+    setPosition(selection.position);
+    if (result.kind === 'failed') {
+      const err = result.error as { message?: string } | null;
+      const text = err?.message || 'failed to refresh sandboxes';
+      if (!result.kept) {
         // The rows on screen belong to another org or size; do not show them
         // under this one's label.
         setSandboxes([]);
-        shownScopeRef.current = null;
         setListError(text);
         // A failure all the same: the key stays stale, and the alert, not a
         // toast, reports it.
@@ -746,10 +864,17 @@ function SandboxesPage() {
       }
       // Keep the last rendered view when a node-local manager is briefly unavailable.
       throw new Error(text);
-    } finally {
-      // Only the newest request ends `loading`, whichever request started it.
-      if (newest()) setLoading(false);
     }
+    const data = result.response.sandboxes;
+    // A page keeps the server's order, newest first, so that the pages join
+    // up; a sample is sorted as it was before paging.
+    if (result.response.mode === 'sampled') {
+      data.sort((a, b) => parseUptime(b.uptime) - parseUptime(a.uptime) || a.id.localeCompare(b.id));
+    }
+    setSandboxes(data);
+    setListError(null);
+    setListGeneration((n) => n + 1);
+    markViewRefreshed(sandboxesRefreshKey(result.scope));
   };
 
   const refreshAndReport = () => {
@@ -762,10 +887,10 @@ function SandboxesPage() {
     if (loadingRef.current) {
       return;
     }
-    if (document.hidden) {
+    if (selection.stopped || document.hidden) {
       return;
     }
-    const scope = currentScope();
+    const scope = selection.selected;
     void runLockedViewRefresh(
       sandboxesRefreshKey(scope),
       () => refresh({ showLoading: false, scope }),
@@ -782,6 +907,9 @@ function SandboxesPage() {
 
   useEffect(() => {
     adminApi.get<Organization[]>('/v1/orgs').then(setOrgs).catch(() => setOrgs([]));
+    adminApi.get<Template[]>('/v1/templates')
+      .then((items) => setAdminTemplateNames(items.map((t) => t.name)))
+      .catch(() => setAdminTemplateNames(null));
   }, []);
 
   useEffect(() => {
@@ -812,7 +940,7 @@ function SandboxesPage() {
     if (refreshCooldownRef.current || manualRefreshing) return;
     startRefreshCooldown();
     setManualRefreshing(true);
-    const scope = currentScope();
+    const scope = selection.selected;
     void runLockedViewRefresh(
       sandboxesRefreshKey(scope),
       () => refresh({ showLoading: false, reconcile: true, scope }),
@@ -824,7 +952,7 @@ function SandboxesPage() {
       }
       message.success('Sandboxes refreshed');
     }).catch((err: any) => {
-      if (err instanceof RefreshSkipped) message.info('Refresh skipped: the selected organization or size changed');
+      if (err instanceof RefreshSkipped) message.info(`Refresh skipped: ${err.message}`);
       else if (!(err instanceof ShownListError)) message.error(err.message);
     }).finally(() => {
       setManualRefreshing(false);
@@ -1051,8 +1179,46 @@ function SandboxesPage() {
     }
   };
 
-  const query = useMemo(() => sandboxQuery(idFilter), [idFilter]);
-  const listTruncated = listIsCapped(sandboxes, listLimit);
+  const paged = listMode === 'paged';
+  const listTruncated = !paged && listIsCapped(sandboxes, listLimit);
+
+  // A changed filter, page size or sample size restarts paging from the
+  // first page, and reloads when the request it makes has changed: on a
+  // sampled list only the org and the sample size reach the server. Typing in
+  // the search box waits for a pause.
+  const appliedSizesRef = useRef({ pageSize, listLimit });
+  useEffect(() => {
+    if (appliedInputsRef.current.key === filterInputsKey && appliedSizesRef.current.pageSize === pageSize && appliedSizesRef.current.listLimit === listLimit) {
+      return;
+    }
+    const delay = appliedInputsRef.current.prefix !== filterInputs.prefix ? 300 : 0;
+    const timer = setTimeout(() => {
+      appliedInputsRef.current = { key: filterInputsKey, prefix: filterInputs.prefix };
+      appliedSizesRef.current = { pageSize, listLimit };
+      const plan = selection.select({ filters: serverFilters(filterInputs), pageSize, sampleSize: listLimit });
+      if (plan === 'unchanged') return;
+      setPosition(selection.position);
+      selectionChanged();
+      // A change undone before its answer arrived: that answer is dropped and
+      // the rows on screen are the selected scope's already.
+      if (plan === 'keep') {
+        setLoading(false);
+        return;
+      }
+      // An error belongs to the request that failed.
+      setListError(null);
+      refreshAndReport();
+    }, delay);
+    return () => clearTimeout(timer);
+  }, [filterInputsKey, pageSize, listLimit]);
+
+  const goToPage = (next: PagePosition | null) => {
+    if (!selection.goTo(next)) return;
+    setPosition(selection.position);
+    selectionChanged();
+    setListError(null);
+    refreshAndReport();
+  };
 
   const filteredSandboxes = useMemo(() => {
     // A full identifier names one sandbox; the other filters do not hide it.
@@ -1062,35 +1228,30 @@ function SandboxesPage() {
       return lookup?.publicId === query.ref.publicId && lookup.sandbox ? [lookup.sandbox] : [];
     }
 
-    const ageMs = AGE_WINDOW_OPTIONS.find((opt) => opt.value === ageWindow)?.ms ?? null;
-    const cutoff = ageMs === null ? null : Date.now() - ageMs;
+    // The server applied the rest on a paged list; see `loadedRowFilter`.
+    return sandboxes.filter(loadedRowFilter(listMode, {
+      matchesSearch: search.kind === 'page' ? (s) => matchesSandboxQuery(search.query, s) : null,
+      template: templateFilter,
+      statuses: statusSplit.applied,
+      statusKey: statusFilterKey,
+      userId: userFilter,
+      node: nodeFilter,
+      createdWithin: ageWindowAge(ageWindow),
+      olderThan: olderThanAge(olderThan),
+      now: Date.now(),
+    }));
+  }, [sandboxes, query, search, lookup, listMode, templateFilter, statusSplit, userFilter, nodeFilter, ageWindow, olderThan]);
 
-    return sandboxes.filter((s) => {
-      if (!matchesSandboxQuery(query, s)) return false;
-
-      if (templateFilter.length > 0 && !templateFilter.includes(s.template || '')) {
-        return false;
-      }
-
-      if (statusFilter.length > 0 && !statusFilter.includes(statusFilterKey(s.status))) {
-        return false;
-      }
-
-      if (nodeFilter !== 'any') {
-        const hasNode = !!s.active_node_id;
-        if (nodeFilter === 'assigned' && !hasNode) return false;
-        if (nodeFilter === 'unassigned' && hasNode) return false;
-      }
-
-      if (cutoff !== null) {
-        if (!s.created_at) return false;
-        const created = Date.parse(s.created_at);
-        if (Number.isNaN(created) || created < cutoff) return false;
-      }
-
-      return true;
-    });
-  }, [sandboxes, query, lookup, templateFilter, statusFilter, nodeFilter, ageWindow]);
+  // A page lists its sandboxes, and the first page of the unfiltered list
+  // then the rows nodes report without a database row, apart from them. A
+  // full ID shows the row it names in the main table, whatever its kind.
+  const exactLookup = query.kind === 'ref';
+  const shownRows = useMemo(
+    () => listSections(listMode, filteredSandboxes, exactLookup),
+    [listMode, filteredSandboxes, exactLookup],
+  );
+  const loadedRows = useMemo(() => listSections(listMode, sandboxes, false), [listMode, sandboxes]);
+  const nodeReportedAt = nodeReportedPlacement(selectedScope, exactLookup);
 
   const lookupNeeded =
     query.kind === 'ref' && !loading && !sandboxes.some((s) => matchesSandboxQuery(query, s));
@@ -1132,58 +1293,69 @@ function SandboxesPage() {
 
   const lookupPending = lookupId !== null && !(lookup?.publicId === lookupId && lookup.answered);
 
-  const changeListLimit = (value: number) => {
-    // An error belongs to the scope that failed.
-    setListError(null);
-    listLimitRef.current = value;
-    setListLimit(value);
-    refreshAndReport();
-  };
-
-  const changeOrgFilter = (value: string | null) => {
-    setListError(null);
-    orgFilterRef.current = value;
-    setOrgFilter(value);
-    refreshAndReport();
+  // The window and the "older than" bound must leave a range between them;
+  // a window that would not drops the bound.
+  const changeAgeWindow = (value: AgeWindow) => {
+    setAgeWindow(value);
+    const within = ageWindowMs(value);
+    const older = olderThanMs(olderThan);
+    if (within !== null && older !== null && older >= within) setOlderThan('any');
   };
 
   // The selector's labels, which add the slug where a name repeats, so the
   // notices never read "It belongs to Acme, not Acme".
   const orgNames = useMemo(() => new Map(orgOptionLabels(orgs).map((option) => [option.value, option.label])), [orgs]);
 
-  const templateFilterOptions = useMemo(() => {
-    const set = new Set<string>();
-    for (const s of sandboxes) {
-      if (s.template) set.add(s.template);
-    }
-    for (const t of templates) {
-      set.add(t.name);
-    }
-    return Array.from(set).sort().map((name) => ({ value: name, label: name }));
-  }, [sandboxes, templates]);
+  const templateOptions = useMemo(() => {
+    const options = templateFilterOptions({
+      // Until the admin list answers, the loaded and own templates.
+      admin: adminTemplateNames ?? null,
+      loaded: sandboxes.map((s) => s.template),
+      own: templates.map((t) => t.name),
+      selected: templateFilter,
+      typed: templateSearch,
+    });
+    return {
+      partial: options.partial && adminTemplateNames === null,
+      options: [
+        ...(options.typed ? [{ value: options.typed, label: `Filter on "${options.typed}"` }] : []),
+        ...options.names.map((name) => ({ value: name, label: name })),
+      ],
+    };
+  }, [adminTemplateNames, sandboxes, templates, templateFilter, templateSearch]);
 
+  // A paged list filters on the stored lifecycle; a sampled one on the
+  // State column, with any other status its rows carry.
   const statusFilterOptionList = useMemo(
-    () => statusFilterOptions(sandboxes.map((s) => s.status)).map((status) => ({ value: status, label: status })),
-    [sandboxes],
+    () => (paged ? [...STORED_LIFECYCLE_FILTER_STATES] : statusFilterOptions(sandboxes.map((s) => s.status)))
+      .map((status) => ({ value: status, label: status })),
+    [paged, sandboxes],
   );
+
+  const userFilterLabel = useMemo(() => {
+    if (!userFilter) return null;
+    return sandboxes.find((s) => s.user_id === userFilter)?.user || userFilter.slice(0, 8);
+  }, [sandboxes, userFilter]);
 
   const clearFilters = () => {
     setIdFilter('');
-    setTemplateFilter([]);
+    setTemplateFilter(null);
     setStatusFilter([]);
+    setUserFilter(null);
     setNodeFilter('any');
     setAgeWindow(DEFAULT_AGE_WINDOW);
-    // The org filter is applied by the API: clear it the way the selector
-    // does, so the next load (and every poll) asks for all orgs again.
-    if (orgFilterRef.current) changeOrgFilter(null);
+    setOlderThan('any');
+    setOrgFilter(null);
   };
 
   const filtersActive =
     !!idFilter ||
-    templateFilter.length > 0 ||
+    !!templateFilter ||
     statusFilter.length > 0 ||
+    !!userFilter ||
     nodeFilter !== 'any' ||
     ageWindow !== DEFAULT_AGE_WINDOW ||
+    olderThan !== 'any' ||
     !!orgFilter;
 
   const columns: ColumnsType<Sandbox> = [
@@ -1299,7 +1471,31 @@ function SandboxesPage() {
       ellipsis: true,
       render: (orgId: string | null) => (orgId ? <Link href={`/dashboard/orgs/${orgId}`}>{orgNames.get(orgId) ?? orgId}</Link> : '—'),
     },
-    { title: 'User', dataIndex: 'user', width: 95, ellipsis: true, render: (v: string) => v || '—' },
+    {
+      title: 'User',
+      dataIndex: 'user',
+      width: 95,
+      ellipsis: true,
+      render: (v: string, record) => {
+        if (!record.user_id) return v || '—';
+        const userId = record.user_id;
+        return (
+          <Tooltip title={`Show only ${v || 'this user'}'s sandboxes`}>
+            <Button
+              type="link"
+              size="small"
+              style={{ padding: 0, height: 'auto' }}
+              onClick={(event) => {
+                event.stopPropagation();
+                setUserFilter(userId);
+              }}
+            >
+              {v || userId.slice(0, 8)}
+            </Button>
+          </Tooltip>
+        );
+      },
+    },
     {
       title: 'Snaps',
       width: 70,
@@ -1339,7 +1535,7 @@ function SandboxesPage() {
         <Button
           icon={<ReloadOutlined />}
           loading={manualRefreshing}
-          disabled={refreshCooldown}
+          disabled={refreshCooldown || listStopped}
           onClick={handleManualRefresh}
         >
           Refresh
@@ -1409,77 +1605,138 @@ function SandboxesPage() {
       <Card size="small" style={{ marginBottom: 12 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
           <Text strong>Filters</Text>
-          <Input
-            allowClear
-            size="small"
-            placeholder="ID, pod name or name"
-            value={idFilter}
-            onChange={(e) => setIdFilter(e.target.value)}
-            style={{ width: 260 }}
-          />
-          <Select
-            mode="multiple"
-            size="small"
-            placeholder="Template"
-            value={templateFilter}
-            onChange={(value) => setTemplateFilter(value as string[])}
-            options={templateFilterOptions}
-            allowClear
-            style={{ minWidth: 180 }}
-            maxTagCount="responsive"
-          />
-          <Select
-            mode="multiple"
-            size="small"
-            placeholder="Status"
-            value={statusFilter}
-            onChange={(value) => setStatusFilter(value as string[])}
-            options={statusFilterOptionList}
-            allowClear
-            style={{ minWidth: 180 }}
-            maxTagCount="responsive"
-          />
-          <Select
-            size="small"
-            value={nodeFilter}
-            onChange={(value) => setNodeFilter(value as NodeFilter)}
-            options={[
-              { value: 'any', label: 'Node: any' },
-              { value: 'assigned', label: 'Node: assigned' },
-              { value: 'unassigned', label: 'Node: unassigned' },
-            ]}
-            style={{ width: 170 }}
-          />
+          <Space size={2}>
+            <Input
+              allowClear
+              size="small"
+              placeholder={paged ? 'Case-sensitive name prefix, ID prefix or full ID' : 'ID, pod name or name'}
+              value={idFilter}
+              onChange={(e) => setIdFilter(e.target.value)}
+              style={{ width: 290 }}
+              aria-label="Search sandboxes"
+            />
+            {paged ? (
+              <Tooltip title="A name or ID prefix is searched on the server as typed. Names match case-sensitively; an ID prefix starts with sbx_ or is a dashed UUID start, and its hex matches in either case. Hex alone, such as the ID column's label, matches IDs and names within this page, ignoring case. A full ID or pod name is looked up directly.">
+                <QuestionCircleOutlined aria-label="About the search" style={{ color: 'rgba(0, 0, 0, 0.45)' }} />
+              </Tooltip>
+            ) : null}
+          </Space>
+          <Space size={2}>
+            <Select
+              size="small"
+              placeholder={templateOptions.partial ? 'Template (partial list)' : 'Template'}
+              value={templateFilter ?? undefined}
+              onChange={(value) => {
+                setTemplateFilter((value as string | undefined) ?? null);
+                setTemplateSearch('');
+              }}
+              options={templateOptions.options}
+              allowClear
+              showSearch={{ optionFilterProp: 'label', onSearch: setTemplateSearch }}
+              style={{ minWidth: 160 }}
+              aria-label="Template"
+            />
+            {templateOptions.partial ? (
+              <Tooltip title="The admin template list could not be read, so these are only the templates of the loaded rows and of your organization. Type a template name to filter on another.">
+                <QuestionCircleOutlined aria-label="About the template list" style={{ color: 'rgba(0, 0, 0, 0.45)' }} />
+              </Tooltip>
+            ) : null}
+          </Space>
+          <Space size={2}>
+            <Select
+              mode="multiple"
+              size="small"
+              placeholder={paged ? 'Stored lifecycle' : 'Status'}
+              value={statusSplit.applied}
+              onChange={(value) => setStatusFilter(value as string[])}
+              options={statusFilterOptionList}
+              allowClear
+              style={{ minWidth: 180 }}
+              maxTagCount="responsive"
+              aria-label={paged ? 'Stored lifecycle' : 'Status'}
+            />
+            {paged ? (
+              <Tooltip title="Matches the lifecycle the control plane stores for each sandbox, not the State column, which shows what the sandbox's node reports. A sandbox can match one lifecycle and show another state.">
+                <QuestionCircleOutlined aria-label="About the lifecycle filter" style={{ color: 'rgba(0, 0, 0, 0.45)' }} />
+              </Tooltip>
+            ) : null}
+          </Space>
+          {statusSplit.notApplied.length ? (
+            <Tooltip title="The list filters on the lifecycle the control plane stores, and these are not stored lifecycles, so they are not applied.">
+              <Tag color="warning" closable onClose={() => setStatusFilter(statusSplit.applied)} style={{ marginInlineEnd: 0 }}>
+                Not applied: {statusSplit.notApplied.join(', ')}
+              </Tag>
+            </Tooltip>
+          ) : null}
+          {userFilter ? (
+            <Tag closable onClose={() => setUserFilter(null)} style={{ marginInlineEnd: 0 }}>
+              User: {userFilterLabel}
+            </Tag>
+          ) : null}
+          <Tooltip title={paged ? 'The server has no node filter yet, so this filters the page loaded below. A node\'s page, linked from the Node column, lists the sandboxes placed on it; the warm-pool slots and other rows it reports without a database row are listed on the first page of this list with no filter set.' : undefined}>
+            <Select
+              size="small"
+              value={nodeFilter}
+              onChange={(value) => setNodeFilter(value as NodeFilter)}
+              options={[
+                { value: 'any', label: paged ? 'Node (this page): any' : 'Node: any' },
+                { value: 'assigned', label: paged ? 'Node (this page): assigned' : 'Node: assigned' },
+                { value: 'unassigned', label: paged ? 'Node (this page): unassigned' : 'Node: unassigned' },
+              ]}
+              style={{ width: paged ? 230 : 170 }}
+              aria-label="Node"
+            />
+          </Tooltip>
           <Select
             size="small"
             value={ageWindow}
-            onChange={(value) => setAgeWindow(value as AgeWindow)}
+            onChange={(value) => changeAgeWindow(value as AgeWindow)}
             options={AGE_WINDOW_OPTIONS.map((opt) => ({ value: opt.value, label: opt.label }))}
             style={{ width: 150 }}
+            aria-label="Created within"
+          />
+          <Select
+            size="small"
+            value={olderThan}
+            onChange={(value) => setOlderThan(value as OlderThan)}
+            options={OLDER_THAN_OPTIONS.map((opt) => {
+              const within = ageWindowMs(ageWindow);
+              return {
+                value: opt.value,
+                label: opt.label,
+                disabled: opt.ms !== null && within !== null && opt.ms >= within,
+              };
+            })}
+            style={{ width: 170 }}
+            aria-label="Created before"
           />
           <Select
             size="small"
             allowClear
             placeholder="Org: any"
             value={orgFilter ?? undefined}
-            onChange={(value) => changeOrgFilter(value ?? null)}
+            onChange={(value) => setOrgFilter(value ?? null)}
             options={orgOptionLabels(orgs)}
             showSearch={{ optionFilterProp: 'label' }}
             style={{ width: 200 }}
             aria-label="Organization"
           />
-          <Select
-            size="small"
-            value={listLimit}
-            onChange={changeListLimit}
-            options={Array.from(new Set([...LIST_LIMIT_OPTIONS, listLimit]))
-              .sort((a, b) => a - b)
-              .map((value) => ({ value, label: `Load newest ${value}` }))}
-            style={{ width: 170 }}
-            aria-label="Number of sandboxes to load"
-          />
+          {paged ? null : (
+            <Select
+              size="small"
+              value={listLimit}
+              onChange={setListLimit}
+              options={Array.from(new Set([...LIST_LIMIT_OPTIONS, listLimit]))
+                .sort((a, b) => a - b)
+                .map((value) => ({ value, label: `Load newest ${value}` }))}
+              style={{ width: 170 }}
+              aria-label="Number of sandboxes to load"
+            />
+          )}
           <Text type="secondary" style={{ fontSize: 12 }}>
-            {filteredSandboxes.length} / {sandboxes.length}{listTruncated ? '+' : ''}
+            {paged
+              ? `${shownRows.sandboxes.length === loadedRows.sandboxes.length ? '' : `${shownRows.sandboxes.length} / `}${loadedRows.sandboxes.length} on page ${position.index + 1}`
+              : `${filteredSandboxes.length} / ${sandboxes.length}${listTruncated ? '+' : ''}`}
           </Text>
           {filtersActive ? (
             <Button size="small" type="link" onClick={clearFilters}>Reset</Button>
@@ -1493,7 +1750,7 @@ function SandboxesPage() {
             type="info"
             showIcon
             style={{ marginBottom: 12 }}
-            title={`Found ${query.ref.publicId} by direct lookup. ${lookupScopeText(lookup.sandbox, orgFilter, (id) => orgNames.get(id), listLimit)}`}
+            title={`Found ${query.ref.publicId} by direct lookup. ${lookupScopeText(lookup.sandbox, orgFilter, (id) => orgNames.get(id), paged ? null : listLimit)}`}
             description={lookup.error ? `The last refresh of this row failed: ${lookup.error}` : undefined}
           />
         ) : lookup.error ? (
@@ -1508,23 +1765,56 @@ function SandboxesPage() {
         />
       ) : null}
 
-      {listError ? (
+      {linkNoticeOpen ? (
+        <Alert
+          type="warning"
+          showIcon
+          closable
+          onClose={() => setLinkNoticeOpen(false)}
+          style={{ marginBottom: 12 }}
+          title={`Left out of this link's filters: ${link.ignored.map((entry) => `${entry.param}=${entry.value} (${entry.reason})`).join('; ')}.`}
+        />
+      ) : null}
+
+      {paged && search.kind === 'page' ? (
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 12 }}
+          title={`"${idFilter.trim()}" matches IDs and names within this page, ignoring case; paste the full ID to look it up.`}
+        />
+      ) : null}
+
+      {listStopped ? (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 12 }}
+          title="The API changed version while this page was open. Reload to continue."
+          // A fresh page view; the URL keeps the filters.
+          action={<Button size="small" onClick={() => window.location.reload()}>Reload</Button>}
+        />
+      ) : listError ? (
         <Alert
           type="error"
           showIcon
           style={{ marginBottom: 12 }}
-          title={`Could not load the newest ${listLimit} sandboxes${orgFilter ? ` of ${orgNames.get(orgFilter) ?? orgFilter}` : ''}: ${listError}`}
+          title={`${paged ? `Could not load page ${position.index + 1} of the sandboxes` : `Could not load the newest ${listLimit} sandboxes`}${orgFilter ? ` of ${orgNames.get(orgFilter) ?? orgFilter}` : ''}: ${listError}`}
           action={<Button size="small" onClick={refreshAndReport}>Retry</Button>}
         />
       ) : null}
 
       <Table
+        // A table that mounted without pagination ignores `defaultPageSize`
+        // when it gains one, so a switch to sampling mounts a new table.
+        key={listMode}
         columns={columns}
-        dataSource={filteredSandboxes}
+        dataSource={shownRows.sandboxes}
         rowKey="id"
         loading={loading || lookupPending}
         size="small"
-        pagination={tablePagination('sandboxes')}
+        // A page is the server's; a sample is paged here.
+        pagination={paged ? false : tablePagination('sandboxes')}
         scroll={{ x: 1280 }}
         expandable={{
           showExpandColumn: false,
@@ -1533,6 +1823,63 @@ function SandboxesPage() {
           rowExpandable: snapshotsPanelAvailable,
         }}
       />
+
+      {paged ? (
+        <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 8, marginTop: 12 }}>
+          <Text type="secondary" style={{ fontSize: 12 }}>Page {position.index + 1}, newest first</Text>
+          <Button
+            size="small"
+            icon={<LeftOutlined />}
+            disabled={loading || listStopped || position.index === 0}
+            onClick={() => goToPage(selection.previousPosition())}
+          >
+            Previous
+          </Button>
+          <Button
+            size="small"
+            icon={<RightOutlined />}
+            iconPlacement="end"
+            disabled={loading || listStopped || !nextCursor}
+            onClick={() => goToPage(selection.nextPosition())}
+          >
+            Next
+          </Button>
+          <Select
+            size="small"
+            value={pageSize}
+            onChange={setPageSize}
+            options={PAGE_SIZE_OPTIONS.map((value) => ({ value, label: `${value} / page` }))}
+            style={{ width: 110 }}
+            aria-label="Sandboxes per page"
+          />
+        </div>
+      ) : null}
+
+      {paged && nodeReportedAt === 'here' && loadedRows.nodeReported.length > 0 ? (
+        <div style={{ marginTop: 24 }}>
+          <Title level={5} style={{ marginTop: 0 }}>
+            Reported by nodes, with no database row ({shownRows.nodeReported.length === loadedRows.nodeReported.length ? '' : `${shownRows.nodeReported.length} / `}{loadedRows.nodeReported.length})
+          </Title>
+          <Text type="secondary" style={{ display: 'block', fontSize: 12, marginBottom: 8 }}>
+            Warm-pool slots and observed-local sandboxes. They belong to no organization and are listed here, on the first page of the list with no filter set; any filter but the node filter leaves them out.
+          </Text>
+          <Table
+            columns={columns}
+            dataSource={shownRows.nodeReported}
+            rowKey="id"
+            loading={loading}
+            size="small"
+            pagination={tablePagination('node-reported rows')}
+            scroll={{ x: 1280 }}
+          />
+        </div>
+      ) : paged && (nodeReportedAt === 'filtered' || nodeReportedAt === 'first-page') ? (
+        <Text type="secondary" style={{ display: 'block', fontSize: 12, marginTop: 8 }}>
+          {nodeReportedAt === 'filtered'
+            ? 'Filters leave out the warm-pool slots and other rows nodes report without a database row; they are listed on the first page with no filter set.'
+            : 'The warm-pool slots and other rows nodes report without a database row are listed on the first page.'}
+        </Text>
+      ) : null}
 
       <Modal
         title="Custom Auto Lifecycle"

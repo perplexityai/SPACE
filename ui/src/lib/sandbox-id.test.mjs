@@ -9,8 +9,10 @@ import {
   parseSandboxRef,
   publicSandboxIdFromAny,
   safeDecodeURIComponent,
+  sandboxLabelOrId,
   sandboxQuery,
   sandboxRowCount,
+  sandboxSearch,
 } from './sandbox-id.ts';
 
 const uuid = '01a19089-216f-751e-9f56-1906865f5c23';
@@ -84,6 +86,67 @@ test('partial text matches ID fragments and names', () => {
   assert.equal(matchesSandboxQuery(sandboxQuery('ae1d-72e0'), sandbox), true);
   assert.equal(matchesSandboxQuery(sandboxQuery('Build'), sandbox), true);
   assert.equal(matchesSandboxQuery(sandboxQuery('cache'), other), false);
+});
+
+test('on a paging server, the ID column\'s label is matched within the page, ignoring case', () => {
+  const label = sandboxLabelOrId(sandbox.id);
+  assert.equal(label, '9b10b406');
+  for (const input of [label, label.toUpperCase(), 'ae1d-72e0', 'AE1D72E0', '1906']) {
+    const search = sandboxSearch(input, 'paged');
+    assert.equal(search.kind, 'page', input);
+    assert.equal(matchesSandboxQuery(search.query, sandbox), input !== '1906', input);
+  }
+  // Names that contain the text match too, as they did before paging.
+  const cafe = sandboxSearch('CAFE', 'paged');
+  assert.equal(cafe.kind, 'page');
+  assert.equal(matchesSandboxQuery(cafe.query, { id: other.id, name: 'my-cafe' }), true);
+});
+
+test('on a paging server, a name or ID prefix goes to the server, case kept for names', () => {
+  assert.deepEqual(sandboxSearch('  Build-  ', 'paged'), { kind: 'prefix', prefix: 'Build-' });
+  assert.deepEqual(sandboxSearch('build cache', 'paged'), { kind: 'prefix', prefix: 'build cache' });
+  // The start of an ID the server reads: `sbx_` and hex, or the UUID's
+  // dashes where it has them. Hex digits match the server in either case.
+  assert.deepEqual(sandboxSearch('01a19089-394a', 'paged'), { kind: 'prefix', prefix: '01a19089-394a' });
+  assert.deepEqual(sandboxSearch('01A19089-394A', 'paged'), { kind: 'prefix', prefix: '01A19089-394A' });
+  assert.deepEqual(sandboxSearch('sbx_01a19089-394a-70', 'paged'), { kind: 'prefix', prefix: 'sbx_01a19089-394a-70' });
+  // `sbx_` alone, or with what no ID starts with, is a name prefix.
+  assert.deepEqual(sandboxSearch('sbx_', 'paged'), { kind: 'prefix', prefix: 'sbx_' });
+  assert.deepEqual(sandboxSearch('sbx_x1', 'paged'), { kind: 'prefix', prefix: 'sbx_x1' });
+});
+
+test('a mixed-case name that looks like an ID prefix is sent as typed', () => {
+  // The server matches names case-sensitively and folds the hex of the ID
+  // range itself, so lowercasing would lose `sbx_AB-worker`.
+  for (const typed of ['sbx_AB', 'sbx_Ab12', 'sbx_AB-worker', 'sbx_01A19089-394A', 'AbCd1234-Ef']) {
+    assert.deepEqual(sandboxSearch(typed, 'paged'), { kind: 'prefix', prefix: typed }, typed);
+  }
+  // `SBX_` is the console's alias for the ID's `sbx_` (see `parseSandboxRef`),
+  // which the server reads only in lower case; the rest keeps its case.
+  assert.deepEqual(sandboxSearch('SBX_01A19089', 'paged'), { kind: 'prefix', prefix: 'sbx_01A19089' });
+  assert.deepEqual(sandboxSearch('Sbx_ab', 'paged'), { kind: 'prefix', prefix: 'sbx_ab' });
+  // Behind it, what no ID starts with is a name prefix, as typed.
+  assert.deepEqual(sandboxSearch('SBX_AB-worker', 'paged'), { kind: 'prefix', prefix: 'SBX_AB-worker' });
+});
+
+test('on a paging server, text no name can start with is matched within the page', () => {
+  assert.equal(sandboxSearch('n'.repeat(257), 'paged').kind, 'page');
+  assert.equal(sandboxSearch('é'.repeat(129), 'paged').kind, 'page');
+  assert.equal(sandboxSearch('n'.repeat(256), 'paged').kind, 'prefix');
+  assert.equal(sandboxSearch('build\0', 'paged').kind, 'page');
+});
+
+test('a full identifier is a lookup on either list, and a sampled list matches all other text within it', () => {
+  for (const mode of ['paged', 'sampled']) {
+    assert.equal(sandboxSearch(sandbox.id, mode).kind, 'ref');
+    assert.equal(sandboxSearch(` ${searchUuid.toUpperCase()} `, mode).kind, 'ref');
+    assert.equal(sandboxSearch('  ', mode).kind, 'empty');
+  }
+  for (const input of ['Build', 'sbx_01a19089', '01a19089-394a', '9b10b406']) {
+    const search = sandboxSearch(input, 'sampled');
+    assert.equal(search.kind, 'page', input);
+    assert.equal(matchesSandboxQuery(search.query, sandbox), true, input);
+  }
 });
 
 test('an empty query matches everything', () => {
