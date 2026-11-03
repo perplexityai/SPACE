@@ -1,4 +1,4 @@
-//! The shared ratchet's paths that neither registered rule reaches: a rule
+//! The shared ratchet's paths that `pattern_ratchet` does not reach: a rule
 //! without instances whose table is missing, a base copy that does not read
 //! a rule's tables, and entries without a recorded line.
 
@@ -8,7 +8,7 @@ use super::*;
 use crate::{
     baseline::BaseBaseline,
     config::{BaseArchitecture, CrateNamesPolicy, LayersPolicy},
-    context::{code_lines, count_code_lines},
+    context::code_lines,
 };
 
 /// A rule without instances that counts the code lines reading `hit`.
@@ -69,13 +69,7 @@ impl CountRatchet for Hits {
 }
 
 fn context(baseline: Baseline, files: &[(&str, &str)]) -> Context {
-    let config = "[rules.file_size]\nlimit = 5\n\
-                  [rules.file_size.no_crossing]\nmode = \"advisory\"\n\
-                  [rules.file_size.no_new_entries]\nmode = \"advisory\"\n\
-                  [rules.file_size.no_raised_caps]\nmode = \"advisory\"\n\
-                  [rules.file_size.listed_no_growth]\nmode = \"advisory\"\n\
-                  [rules.file_size.stale_entries]\nmode = \"advisory\"\n\
-                  [rules.crate_names]\nbanned_tokens = [\"common\"]\nallow = []\n\
+    let config = "[rules.crate_names]\nbanned_tokens = [\"common\"]\nallow = []\n\
                   [rules.crate_names.no_new]\nmode = \"advisory\"\n\
                   [rules.crate_names.stale_entries]\nmode = \"advisory\"\n\
                   [rules.crate_names.policy_changed]\nmode = \"advisory\"\n";
@@ -84,7 +78,6 @@ fn context(baseline: Baseline, files: &[(&str, &str)]) -> Context {
         .map(|(path, text)| ProductionFile {
             path: (*path).to_owned(),
             text: (*text).to_owned(),
-            code_lines: count_code_lines(text),
         })
         .collect();
     files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -184,7 +177,7 @@ fn a_base_copy_that_does_not_read_the_rule() {
     let mut ctx = context(baseline, &[("a.rs", "hit\n")]);
     let dir = tempfile::tempdir().expect("create a temporary directory");
     let path = dir.path().join("base.toml");
-    fs::write(&path, "[file_size]\n").expect("write the base copy");
+    fs::write(&path, "[crate_names]\n").expect("write the base copy");
     ctx.base_baseline = Baseline::load_base(&path).expect("the base copy loads");
 
     assert_eq!(findings(&ctx), []);
@@ -208,7 +201,7 @@ fn every_rule_s_tables_are_written() {
     baseline.insert_table("zz.one".to_owned(), caps("b.rs"));
     assert_eq!(
         toml::to_string(&baseline).expect("the baseline serializes"),
-        "[file_size]\n\n[hits]\n\"a.rs\" = 1\n\n[zz.one]\n\"b.rs\" = 1\n\n[zz.two]\n\"c.rs\" = 1\n"
+        "[hits]\n\"a.rs\" = 1\n\n[zz.one]\n\"b.rs\" = 1\n\n[zz.two]\n\"c.rs\" = 1\n"
     );
 
     baseline.insert_table("hits.three".to_owned(), caps("d.rs"));

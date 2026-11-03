@@ -2,8 +2,8 @@
 //! (`K8sStore::begin_evacuation_restore_lifecycle`).
 //!
 //! A sibling module for the same reason as `stopped_restore_selector_tests`:
-//! the parent is far past the file-size guidance. These take
-//! `&PostgresStore` and run from `k8s_store_postgres_behaviors`.
+//! the parent is already very large. These take `&PostgresStore` and run from
+//! `k8s_store_postgres_behaviors`.
 
 use pplx_space_common_core::types::{NodeId, SandboxId, SandboxLifecycle};
 

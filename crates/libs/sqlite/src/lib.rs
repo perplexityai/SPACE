@@ -4,8 +4,10 @@
 //! They live apart from `pplx-space-common-svc` so that a crate that must not
 //! touch a service's database can leave them out of its dependencies; Cargo
 //! feature unification would otherwise expose them to every crate that
-//! depends on common-svc. `cargo arch`'s `dependency_fence` keeps this crate
-//! out of sbx-mgr's crates other than its store.
+//! depends on common-svc. `cargo arch`'s `layers.storage_access` lets only
+//! stores, storage helpers and the crates its `[layers.storage_access]`
+//! baseline lists have a normal or build dependency on this crate, and that
+//! baseline only shrinks.
 
 pub mod baselines;
 pub mod runtime_manager;

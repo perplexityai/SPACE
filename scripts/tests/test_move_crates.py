@@ -378,11 +378,6 @@ def test_apply_names_each_crate_of_a_family_another_crate_joins(repo: Path) -> N
     assert "docs/notes.md:2: crates/libs/gadget splits into" in result.stderr
 
 
-def break_a_fence(repo: Path) -> None:
-    text = (repo / "ARCHITECTURE.toml").read_text()
-    write(repo, "ARCHITECTURE.toml", text + '\n[rules.dependency_fence.f]\nmembers = ["crates/libs/*"]\n')
-
-
 def widen_a_ratchet(repo: Path) -> None:
     text = (repo / "ARCHITECTURE.toml").read_text()
     write(repo, "ARCHITECTURE.toml", text + '\n[rules.pattern_ratchet.w]\ninclude = ["crates/l20_domain/**"]\n')
@@ -423,13 +418,6 @@ def drop_a_row(repo: Path) -> None:
 REFUSALS: list[tuple[str, Callable[[Path], None], bool, str]] = [
     ("dirty tree", dirty_the_tree, False, "the tree has uncommitted changes"),
     ("stale mapping", drop_a_row, False, "the mapping is out of date"),
-    (
-        "fence",
-        break_a_fence,
-        True,
-        "[rules.dependency_fence.f] members no longer matches 1 member directories, "
-        "such as crates/l40_api/gadgets/svc",
-    ),
     ("widened glob", widen_a_ratchet, True, "[rules.pattern_ratchet.w] include now also matches"),
     (
         "climb reaching nothing",

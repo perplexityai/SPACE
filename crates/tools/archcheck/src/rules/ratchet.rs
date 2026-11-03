@@ -62,22 +62,25 @@ pub trait CountRatchet {
 
     fn modes(&self) -> Modes;
 
-    /// `file`'s count, if it violates the rule, such as by being over a
-    /// limit; `None` for a file the rule allows, which is never counted.
+    /// `file`'s count, if it violates the rule, such as by having code lines
+    /// that match a pattern; `None` for a file the rule allows, which is never
+    /// counted.
     fn measure(&self, file: &ProductionFile) -> Option<Count>;
 
     fn wording(&self) -> Wording;
 
-    /// The `no_crossing` detail for a file outside the table, such as `": 1200
-    /// code lines, over the 1,000-line limit…"`. It ends with a full
+    /// The `no_crossing` detail for a file outside the table, such as `": 2
+    /// code lines match the <instance> patterns…"`. It ends with a full
     /// sentence, which advice about a renamed file may follow.
     fn crossing(&self, count: Count) -> String;
 
-    /// Why a listed file that no longer violates is fine, such as `" is down
-    /// to 900 code lines, within the 1,000-line limit"`.
+    /// Why a listed file that no longer violates is fine, such as `" has no
+    /// code lines left matching the <instance> patterns outside its allowed
+    /// paths"`.
     fn cleared(&self, file: &ProductionFile) -> String;
 
-    /// A count in a `not added` line, such as `1200 code lines`.
+    /// A count in a `not added` line, such as `2 code lines matching the
+    /// <instance> patterns`.
     fn counted(&self, count: usize) -> String;
 }
 
@@ -102,20 +105,23 @@ pub struct Modes {
 /// The phrases the findings and `not added` lines of a table are built
 /// from.
 pub struct Wording {
-    /// Where the table is, such as `architecture-baseline.toml`.
+    /// Where the table is, such as `[pattern_ratchet.<instance>] in
+    /// architecture-baseline.toml`.
     pub place: String,
-    /// The files the table is no way around, such as `files over the
-    /// 1,000-line limit`.
+    /// The files the table is no way around, such as `files outside the
+    /// paths [rules.pattern_ratchet.<instance>] in ARCHITECTURE.toml allows`.
     pub violators: String,
     /// What to do instead of adding an entry or raising a cap, such as
-    /// `Split the file`.
+    /// `Move that code behind an allowed path`.
     pub fix: String,
-    /// What a count counts, such as `code lines`.
+    /// What a count counts, such as `code lines matching the <instance>
+    /// patterns`.
     pub unit: String,
-    /// What to do instead of growing, such as `split the file before adding
-    /// to it`.
+    /// What to do instead of growing, such as `move new matches behind an
+    /// allowed path`.
     pub growth_fix: String,
-    /// What to do instead of adding an entry, such as `split it`.
+    /// What to do instead of adding an entry, such as `move them behind an
+    /// allowed path`.
     pub not_added_fix: String,
 }
 

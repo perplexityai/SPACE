@@ -20,7 +20,7 @@ fn repository_config_and_baseline_pass_every_required_rule() {
 
 #[test]
 fn node_manager_commands_reject_direct_spawns_without_restricting_other_services() {
-    use pplx_space_archcheck::context::{ProductionFile, count_code_lines};
+    use pplx_space_archcheck::context::ProductionFile;
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
     let mut ctx = Context::load(&root).unwrap();
     let cases = [
@@ -64,7 +64,6 @@ fn node_manager_commands_reject_direct_spawns_without_restricting_other_services
         ctx.files.push(ProductionFile {
             path: path.to_owned(),
             text: text.to_owned(),
-            code_lines: count_code_lines(text),
         });
         let found = check(&ctx).iter().any(|finding| {
             finding.path == path
@@ -85,24 +84,12 @@ fn node_manager_commands_reject_direct_spawns_without_restricting_other_services
         && finding.code() == "pattern_ratchet.node_manager_commands.listed_no_growth"));
 }
 
-/// Repository-relative path of the one crate the `sbxmgr_sqlite` workspace
-/// below has: inside the instance's `include`, outside its `allow`.
-const SBXMGR_SRC: &str = "crates/libs/sbx/mgr/server/src";
-
 /// The database migrator's sources, outside `sbxmgr_sqlite_schema`'s `allow`.
 const MIGRATOR_SRC: &str = "crates/libs/db/migrator/src";
 
-/// [`ratchet_findings`] for `sbxmgr_sqlite` and a crate at [`SBXMGR_SRC`].
-fn sbxmgr_sqlite_findings(
-    entries: &[(&str, usize)],
-    files: &[(&str, &str)],
-) -> Vec<(&'static str, String)> {
-    ratchet_findings("sbxmgr_sqlite", SBXMGR_SRC, entries, files)
-}
-
 /// A workspace with one crate whose sources are at `src`, checked by the
-/// repository's own `[rules.pattern_ratchet.<instance>]`, its
-/// `[rules.file_size]` and `[rules.crate_names]`, `entries` as the instance's
+/// repository's own `[rules.pattern_ratchet.<instance>]` and
+/// `[rules.crate_names]`, `entries` as the instance's
 /// baseline, and `files` under `src`. Returns the instance's findings as
 /// `(behaviour, message)`.
 fn ratchet_findings(
@@ -121,12 +108,6 @@ fn ratchet_findings(
         .and_then(toml::Value::as_table_mut)
         .expect("ARCHITECTURE.toml has [rules.pattern_ratchet]")
         .retain(|name, _| name == instance);
-    // The fences name members this one-crate workspace does not have.
-    config
-        .get_mut("rules")
-        .and_then(toml::Value::as_table_mut)
-        .expect("ARCHITECTURE.toml has [rules]")
-        .remove("dependency_fence");
     // The state checks' shared catalogs are directories it does not have.
     if let Some(layers) = config
         .get_mut("rules")
@@ -139,7 +120,7 @@ fn ratchet_findings(
 
     let dir = tempfile::tempdir().expect("create a temporary workspace");
     let member = src.trim_end_matches("/src");
-    let mut baseline = format!("[file_size]\n[crate_names]\n[pattern_ratchet.{instance}]\n");
+    let mut baseline = format!("[crate_names]\n[pattern_ratchet.{instance}]\n");
     for (path, cap) in entries {
         baseline.push_str(&format!("\"{src}/{path}\" = {cap}\n"));
     }
@@ -174,91 +155,6 @@ fn ratchet_findings(
         .filter(|finding| finding.instance.as_deref() == Some(instance))
         .map(|finding| (finding.behaviour, finding.message()))
         .collect()
-}
-
-/// Every way sbx-mgr code can reach its SQLite database outside the store is
-/// a matching line, and ordinary code that shares a word with one is not.
-#[test]
-fn sbxmgr_sqlite_patterns_match_database_access_only() {
-    let crossings = [
-        "use rusqlite::Connection;",
-        "use ::rusqlite::Connection;",
-        "use rusqlite as sqlite;",
-        "extern crate rusqlite;",
-        "let conn = Connection::open(path)?;",
-        "let conn = Connection::open_in_memory()?;",
-        "let tx = Transaction::new_unchecked(&conn, behavior)?;",
-        "let conn = pplx_space_common_svc::sql::sqlite::open_rusqlite(path, options)?;",
-        "use pplx_space_common_jobs::db as jobs;",
-        "use pplx_space_common_jobs::{JobStatus, db as jobs};",
-        "let bound = params![id];",
-        "let bound = named_params! { \":id\": id };",
-        "conn.execute(sql, bound)?;",
-        "let n: i64 = conn.query_one(sql, [], |row| row.get(0))?;",
-        "conn.query_row_and_then(sql, [], decode)?;",
-        "let mut rows = statement.query([id])?;",
-        "let present = statement.exists([id])?;",
-        "let tx = conn.unchecked_transaction()?;",
-        "let tx = crate::db::immediate_transaction(&conn)?;",
-        "let sql = \"SELECT state FROM sandboxes WHERE id = ?1\";",
-        "let sql = \"UPDATE sandboxes",
-        "    DELETE FROM sandboxes WHERE id = ?1",
-    ];
-    for line in crossings {
-        let found = sbxmgr_sqlite_findings(&[], &[("lib.rs", &format!("{line}\n"))]);
-        assert_eq!(found.len(), 1, "{line}: {found:#?}");
-        assert_eq!(found[0].0, "no_crossing", "{line}");
-    }
-
-    let ordinary = [
-        "use pplx_space_common_jobs::{JobPriority, JobStatus};",
-        "let db = crate::db::SharedConnection::new(conn);",
-        "if path.exists() {",
-        "let query = uri.query();",
-        "let worker = executor.execute_one(job);",
-        "let method = \"DELETE\";",
-        "let message = format!(\"select a sandbox: {id}\");",
-        "tracing::warn!(%error, \"update failed\");",
-    ];
-    let text: String = ordinary.iter().map(|line| format!("{line}\n")).collect();
-    let found = sbxmgr_sqlite_findings(&[], &[("lib.rs", &text)]);
-    assert!(found.is_empty(), "{found:#?}");
-}
-
-/// A listed file grows when it opens a connection through a type it already
-/// imported, as does a child module through its parent's import.
-#[test]
-fn sbxmgr_sqlite_counts_opens_through_imported_names() {
-    let found = sbxmgr_sqlite_findings(
-        &[("lib.rs", 1)],
-        &[(
-            "lib.rs",
-            "use rusqlite::Connection;\nfn open() { let conn = Connection::open_in_memory(); }\n",
-        )],
-    );
-    assert_eq!(found.len(), 1, "{found:#?}");
-    assert_eq!(found[0].0, "listed_no_growth");
-    assert!(found[0].1.contains("grew from 1 to 2"), "{}", found[0].1);
-
-    let found = sbxmgr_sqlite_findings(
-        &[("parent.rs", 1)],
-        &[
-            ("parent.rs", "use rusqlite::Connection;\nmod child;\n"),
-            (
-                "parent/child.rs",
-                "use super::Connection;\nfn open(path: &str) { let conn = Connection::open(path); }\n",
-            ),
-        ],
-    );
-    assert_eq!(found.len(), 1, "{found:#?}");
-    assert_eq!(found[0].0, "no_crossing");
-    assert!(
-        found[0]
-            .1
-            .starts_with(&format!("{SBXMGR_SRC}/parent/child.rs: 1 code line")),
-        "{}",
-        found[0].1
-    );
 }
 
 /// Outside the store, the migrator may not name sbx-mgr's database: its

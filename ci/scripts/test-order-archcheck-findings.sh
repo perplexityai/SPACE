@@ -51,7 +51,7 @@ numbered() {
 }
 
 tree_findings() {
-    for i in $(seq 1 11); do diagnostic "tree${i}.rs" 1 file_size.listed_no_growth; done
+    for i in $(seq 1 11); do diagnostic "tree${i}.rs" 1 pattern_ratchet.tables.listed_no_growth; done
 }
 
 B=architecture-baseline.toml
@@ -59,16 +59,16 @@ B=architecture-baseline.toml
 # A pull request touching only source files (-filter-mode=file): its files'
 # findings come first in report order, which is all reviewdog shows.
 cat >"${B}" <<'EOF'
-[file_size]
-"a.rs" = 1100
-"b.rs" = 1200
-"gone.rs" = 1300
+[pattern_ratchet.tables]
+"a.rs" = 1
+"b.rs" = 2
+"gone.rs" = 3
 EOF
 {
-    diagnostic a.rs 1 file_size.listed_no_growth
-    diagnostic big.rs 1 file_size.no_crossing
-    diagnostic "${B}" 4 file_size.stale_entries
-    diagnostic c.rs 1 file_size.listed_no_growth
+    diagnostic a.rs 1 pattern_ratchet.tables.listed_no_growth
+    diagnostic big.rs 1 pattern_ratchet.tables.no_crossing
+    diagnostic "${B}" 4 pattern_ratchet.tables.stale_entries
+    diagnostic c.rs 1 pattern_ratchet.tables.listed_no_growth
     diagnostic b.rs 7 pattern_ratchet.tables.listed_no_growth
     diagnostic c.rs 9 pattern_ratchet.tables.no_crossing ERROR
 } | report >source.rdjson
@@ -84,11 +84,11 @@ pages README.md >unrelated.json
 # A pull request changing the baseline (-filter-mode=nofilter) adds an entry
 # and raises a cap: those come first, not the stale entry it left alone.
 {
-    diagnostic a.rs 1 file_size.listed_no_growth
-    diagnostic "${B}" 3 file_size.no_raised_caps
-    diagnostic "${B}" 4 file_size.stale_entries
-    diagnostic "${B}" 5 file_size.no_new_entries
-    diagnostic c.rs 1 file_size.listed_no_growth
+    diagnostic a.rs 1 pattern_ratchet.tables.listed_no_growth
+    diagnostic "${B}" 3 pattern_ratchet.tables.no_raised_caps
+    diagnostic "${B}" 4 pattern_ratchet.tables.stale_entries
+    diagnostic "${B}" 5 pattern_ratchet.tables.no_new_entries
+    diagnostic c.rs 1 pattern_ratchet.tables.listed_no_growth
 } | report >baseline.rdjson
 pages "${B}" >baseline.json
 expect "baseline" "${B}:3 ${B}:5 a.rs:1 ${B}:4 c.rs:1" baseline.rdjson baseline.json
@@ -115,11 +115,11 @@ expect "split table" "${B}:5 ${B}:6" --own=nofilter split.rdjson rules.json
 
 # Base-comparison findings lead the pull request's own, so 10 or more own
 # findings elsewhere can't push them out.
-printf '[file_size]\n"own.rs" = 1200\n' >"${B}"
+printf '[pattern_ratchet.tables]\n"own.rs" = 2\n' >"${B}"
 {
-    for i in $(seq 1 5); do diagnostic "tree${i}.rs" 1 file_size.listed_no_growth; done
+    for i in $(seq 1 5); do diagnostic "tree${i}.rs" 1 pattern_ratchet.tables.listed_no_growth; done
     for i in $(seq 1 12); do diagnostic "own${i}.rs" 1 pattern_ratchet.tables.no_crossing; done
-    diagnostic "${B}" 2 file_size.no_raised_caps
+    diagnostic "${B}" 2 pattern_ratchet.tables.no_raised_caps
 } | report >many.rdjson
 many=()
 for i in $(seq 1 12); do many+=("own${i}.rs"); done
@@ -132,16 +132,16 @@ count="$(bash "${SCRIPT}" --own=nofilter many.rdjson many.json | jq '.diagnostic
 # the key is written. Without editing the baseline (-filter-mode=file),
 # reviewdog shows none of them.
 cat >"${B}" <<'EOF'
-[file_size]
-  "indented.rs" = 1300
-'literal.rs' = 1300
-"quote\"d.rs"=1300
+[pattern_ratchet.tables]
+  "indented.rs" = 3
+'literal.rs' = 3
+"quote\"d.rs"=3
 EOF
 # A \u escape, written so that nothing on the way here decodes it.
-printf '"uni%su0063ode.rs" = 1300\n"kept.rs" = 1300\n' "\\" >>"${B}"
+printf '"uni%su0063ode.rs" = 3\n"kept.rs" = 3\n' "\\" >>"${B}"
 {
     tree_findings
-    for line in 2 3 4 5 6; do diagnostic "${B}" "${line}" file_size.stale_entries; done
+    for line in 2 3 4 5 6; do diagnostic "${B}" "${line}" pattern_ratchet.tables.stale_entries; done
 } | report >deleted.rdjson
 pages indented.rs literal.rs 'quote"d.rs' unicode.rs >deleted.json
 expect "deleted files" "${B}:2 ${B}:3 ${B}:4 ${B}:5" --own=nofilter deleted.rdjson deleted.json
@@ -149,13 +149,13 @@ expect "deleted files, file mode" "" --own=file deleted.rdjson deleted.json
 
 # The API's file list: renamed files under both names, names with spaces,
 # and one array per page, with or without a separator.
-printf '[file_size]\n"old name.rs" = 1300\n' >"${B}"
+printf '[pattern_ratchet.tables]\n"old name.rs" = 3\n' >"${B}"
 {
     tree_findings
-    diagnostic "new name.rs" 1 file_size.listed_no_growth
-    diagnostic "${B}" 2 file_size.stale_entries
-    diagnostic second.rs 1 file_size.listed_no_growth
-    diagnostic third.rs 1 file_size.listed_no_growth
+    diagnostic "new name.rs" 1 pattern_ratchet.tables.listed_no_growth
+    diagnostic "${B}" 2 pattern_ratchet.tables.stale_entries
+    diagnostic second.rs 1 pattern_ratchet.tables.listed_no_growth
+    diagnostic third.rs 1 pattern_ratchet.tables.listed_no_growth
 } | report >listed.rdjson
 {
     printf '[{"filename": "new name.rs", "previous_filename": "old name.rs", "status": "renamed", "changes": 2}]'
@@ -168,8 +168,8 @@ expect "file list" "new name.rs:1 ${B}:2 second.rs:1 third.rs:1 $(numbered tree 
 # are the pull request's, but not shown.
 {
     tree_findings
-    diagnostic moved.rs 1 file_size.listed_no_growth
-    diagnostic edited.rs 1 file_size.listed_no_growth
+    diagnostic moved.rs 1 pattern_ratchet.tables.listed_no_growth
+    diagnostic edited.rs 1 pattern_ratchet.tables.listed_no_growth
 } | report >moved.rdjson
 {
     printf '[{"filename": "moved.rs", "previous_filename": "kept.rs", "status": "renamed", "changes": 0}]'
@@ -181,10 +181,10 @@ expect "pure rename, file mode" "edited.rs:1" --own=file moved.rdjson moved.json
 # crate_names.policy_changed compares ARCHITECTURE.toml with the base's, so
 # it leads with the other base comparisons; a required no_new finding on a new
 # crate's Cargo.toml is the pull request's, and kept.
-printf '[file_size]\n' >"${B}"
+printf '[pattern_ratchet.tables]\n' >"${B}"
 {
     tree_findings
-    diagnostic own.rs 1 file_size.listed_no_growth
+    diagnostic own.rs 1 pattern_ratchet.tables.listed_no_growth
     diagnostic crates/new-utils/Cargo.toml 2 crate_names.no_new ERROR
     diagnostic ARCHITECTURE.toml 80 crate_names.policy_changed
     diagnostic ARCHITECTURE.toml 81 crate_names.stale_entries
@@ -201,7 +201,7 @@ expect "crate_names policy" \
 # changes the file.
 {
     tree_findings
-    diagnostic own.rs 1 file_size.listed_no_growth
+    diagnostic own.rs 1 pattern_ratchet.tables.listed_no_growth
     diagnostic ARCHITECTURE.toml 460 layers.placement
     diagnostic ARCHITECTURE.toml 470 layers.stale_entries
     diagnostic ARCHITECTURE.toml 457 layers.policy_changed
@@ -220,8 +220,8 @@ expect "layers policy, ARCHITECTURE.toml changed" \
 # Cargo.toml of the member path the entry maps to (old or new name), however
 # the key and path are written; an empty path is the root package.
 cat >"${B}" <<'EOF'
-[file_size]
-"crates/z/src/lib.rs" = 1300
+[pattern_ratchet.tables]
+"crates/z/src/lib.rs" = 3
 
 [crate_names]
 pplx-space-x-common = "crates/x"

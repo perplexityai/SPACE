@@ -245,9 +245,11 @@ run_fmt_check() {
 
 # The direct dependents of package $1 in the normal dependency graph of
 # sbx-mgr's server and service, built with the feature arguments that follow
-# up to `--`, must all be among the packages after `--`. `dependency_fence`
-# checks only sbx-mgr's own manifests; this catches a crate elsewhere in the
-# graph that starts depending on the package and re-exports it.
+# up to `--`, must all be among the packages after `--`. `cargo arch`'s
+# `layers.storage_access` checks each crate's own dependencies and lets any
+# store, storage helper or baselined edge have one; this catches a crate
+# elsewhere in the graph that starts depending on the package and re-exports
+# it.
 sbxmgr_assert_direct_dependents() {
     local package="$1"
     shift

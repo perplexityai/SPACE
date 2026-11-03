@@ -62,11 +62,10 @@ different paths from the file and the manifest directory, a climb in a file
 that moves after any other shell expansion (`"$CRATE_DIR/../x"`), a climb
 after a literal directory that, read from the file's directory, reaches a path
 the move changes, a binary or non-UTF-8 file that names a moved path or
-renamed package, and an
-`ARCHITECTURE.toml` glob list whose matches the move changes (files for a
-ratchet, member directories for a dependency fence). It leaves, and lists,
-references to `crates/apps` or `crates/libs` themselves (`crates/libs/**`),
-which still hold the crates that stay. It also leaves an unquoted bare `..`
+renamed package, and an `ARCHITECTURE.toml` glob list whose matched files the
+move changes. It leaves, and lists, references to `crates/apps` or
+`crates/libs` themselves (`crates/libs/**`), which still hold the crates that
+stay. It also leaves an unquoted bare `..`
 (Rust's `..Default::default()`, prose), a climb after a format string's other
 `{...}` (`format!("{base}/../x")`, which says nothing about what it holds), a
 path that names nothing tracked and no moved crate, such as a test's synthetic
@@ -895,7 +894,7 @@ def glob_regex(glob: str) -> re.Pattern:
     return re.compile(out + r"\Z")
 
 
-GLOB_LIST = re.compile(r"^(?P<key>include|allow|members)\s*=\s*\[(?P<body>[^\]]*)\]", re.M | re.S)
+GLOB_LIST = re.compile(r"^(?P<key>include|allow)\s*=\s*\[(?P<body>[^\]]*)\]", re.M | re.S)
 UNMOVED = re.compile(r"^\[rules\.layers\.unmoved\]\n(?P<body>.*?)(?=^\[|\Z)", re.M | re.S)
 
 
@@ -996,9 +995,8 @@ def sort_body(body: str) -> str:
 
 
 def glob_changes(text: str, before: str, plan: Plan, files_after: set[str]) -> list[str]:
-    """ARCHITECTURE.toml glob lists whose matches are not their old matches,
-    moved: tracked files for a ratchet's lists, workspace member directories
-    for a dependency fence's `members` and `allow`, as archcheck matches each."""
+    """ARCHITECTURE.toml glob lists whose matched tracked files are not their
+    old matches, moved."""
     def lists(t: str) -> list[tuple[str, str, list[str]]]:
         found = []
         for m in GLOB_LIST.finditer(t):
@@ -1011,27 +1009,19 @@ def glob_changes(text: str, before: str, plan: Plan, files_after: set[str]) -> l
         rxs = [glob_regex(g) for g in globs]
         return {p for p in paths if any(rx.match(p) for rx in rxs)}
 
-    members_before = set(plan.crate_dirs)
-    members_after = {plan.moved.get(d, d) for d in plan.crate_dirs}
     problems = []
     old_lists, new_lists = lists(before), lists(text)
     if [(h, k) for h, k, _ in old_lists] != [(h, k) for h, k, _ in new_lists]:
         return ["ARCHITECTURE.toml: its glob lists changed shape"]
     for (header, key, old), (_, _, new) in zip(old_lists, new_lists):
-        if header.startswith("rules.dependency_fence."):
-            was = {plan.moved.get(d, d) for d in union(old, members_before)}
-            now = union(new, members_after)
-            what = "member directories"
-        else:
-            was = {plan.new_path(f) for f in union(old, plan.old_files)}
-            now = union(new, files_after)
-            what = "files"
+        was = {plan.new_path(f) for f in union(old, plan.old_files)}
+        now = union(new, files_after)
         if was != now:
             detail = []
             if now - was:
-                detail.append(f"now also matches {len(now - was)} {what}, such as {min(now - was)}")
+                detail.append(f"now also matches {len(now - was)} files, such as {min(now - was)}")
             if was - now:
-                detail.append(f"no longer matches {len(was - now)} {what}, such as {min(was - now)}")
+                detail.append(f"no longer matches {len(was - now)} files, such as {min(was - now)}")
             problems.append(f"ARCHITECTURE.toml: [{header}] {key} {'; '.join(detail)}")
     return problems
 

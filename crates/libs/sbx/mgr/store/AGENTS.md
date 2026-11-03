@@ -2,10 +2,15 @@
 
 sbx-mgr's node-local SQLite store: `sandboxes` and every other sbx-mgr table,
 not the control-plane Postgres. Only this crate opens, migrates or queries that
-database. `dependency_fence.sbxmgr_rusqlite` in `ARCHITECTURE.toml` keeps
-rusqlite and the shared path-taking helpers in `pplx-space-sqlite` out of
-every other sbx-mgr crate, and CI's `run_sbxmgr_production_checks` asserts
-that nothing else in the server's production graph brings them in.
+database. `layers.storage_access` in `ARCHITECTURE.toml` keeps rusqlite and
+the shared path-taking helpers in `pplx-space-sqlite` out of the normal and
+build dependencies of every sbx-mgr crate but its stores, this one and
+`pplx-space-sbxmgr-migrations`; dev-dependencies are not checked. As an
+`l30_storage` crate, the migrations crate may take rusqlite,
+`libsqlite3-sys` and `pplx-space-sqlite`: CI's `run_sbxmgr_production_checks`,
+which asserts which crates bring rusqlite and `pplx-space-sqlite` into the
+server's normal production graph, rejects a normal dependency on either
+there, but not a build or dev dependency, nor `libsqlite3-sys`.
 
 ## Changes
 
