@@ -277,3 +277,64 @@ async fn the_debug_read_reports_quarantine_and_snapshot_storage()
     );
     Ok(())
 }
+
+/// The debug read reports which environment variables a sandbox has without
+/// their values, in the `{ "NAME": null }` shape that replaced
+/// `{ "NAME": "value" }`.
+#[tokio::test]
+async fn the_debug_response_lists_env_names_without_values()
+-> pplx_space_db_test_fixtures::TestDbResult<()> {
+    use axum::extract::{Path, State};
+    use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID};
+
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let state = crate::routes::AppState::from_pool(db.pool.clone())
+        .await
+        .expect("app state from the test pool");
+    let sandbox_id = SandboxId::new();
+    sqlx::query(pplx_space_common_core::sql!(
+        "INSERT INTO sandboxes (
+             id, user_id, org_id, lifecycle, placement, managed_by,
+             network_policy_generation, env
+         )
+         VALUES ($1, $2, $3, 'started', 'unplaced', 'k8s', 1, $4)"
+    ))
+    .bind(sandbox_id)
+    .bind(SEED_USER_ID)
+    .bind(SEED_ORG_ID)
+    .bind(sqlx::types::Json(serde_json::json!({
+        "SYNTHETIC_TOKEN": "synthetic-value-1",
+        "EMPTY": "",
+    })))
+    .execute(&db.pool)
+    .await?;
+    let actor = User {
+        id: UserId::new(),
+        email: "debug-reader@example.test".to_string(),
+        password_hash: String::new(),
+        display_name: "debug reader".to_string(),
+        org_id: OrgId::from_uuid(SEED_ORG_ID),
+        role: crate::user_role::UserRole::OrganizationAdmin,
+        owner_source: pplx_space_common_core::types::SandboxOwnerSource::Local,
+        created_at: OffsetDateTime::now_utc(),
+        updated_at: OffsetDateTime::now_utc(),
+    };
+
+    let response = get_sandbox_debug(
+        State(state),
+        axum::Extension(crate::middleware::auth::AuthUser(actor)),
+        Path(sandbox_id.to_string()),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1_000_000).await?;
+    let body: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        body["resources"]["env"],
+        serde_json::json!({ "SYNTHETIC_TOKEN": null, "EMPTY": null })
+    );
+    assert!(!body.to_string().contains("synthetic-value-1"));
+    db.pool.close().await;
+    Ok(())
+}

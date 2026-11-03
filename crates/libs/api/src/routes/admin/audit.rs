@@ -383,6 +383,41 @@ pub fn record_template(entry: AdminTemplateAuditEntry<'_>) {
     );
 }
 
+/// Parameters for a template release tag move's audit entry.
+pub(super) struct AdminTemplateTagAuditEntry<'a> {
+    pub actor: &'a User,
+    pub template_name: &'a str,
+    pub tag: &'a str,
+    pub release_id: uuid::Uuid,
+    /// The release the tag pointed at when the request ran, or `None` when
+    /// the tag did not exist: on success, the release the move replaced; on
+    /// a refused precondition, the release the tag still points at.
+    pub previous_release_id: Option<uuid::Uuid>,
+    pub success: bool,
+    pub error: Option<&'a str>,
+}
+
+/// Emit the audit entry for a tag move, naming the release it replaced so
+/// the move can be rolled back.
+pub(super) fn record_template_tag(entry: AdminTemplateTagAuditEntry<'_>) {
+    tracing::info!(
+        target: "space.admin.audit",
+        event = "admin_audit",
+        actor_user_id = %entry.actor.id,
+        actor_email = %entry.actor.email,
+        action = "template_release_tag",
+        template_name = entry.template_name,
+        tag = entry.tag,
+        release_id = %entry.release_id,
+        previous_release_id = entry
+            .previous_release_id
+            .map(|id| id.to_string())
+            .unwrap_or_default(),
+        success = entry.success,
+        error = entry.error.unwrap_or(""),
+    );
+}
+
 /// Parameters for a runtime environment policy write's audit entry.
 pub(super) struct AdminRuntimeEnvironmentAuditEntry<'a> {
     pub actor: &'a User,

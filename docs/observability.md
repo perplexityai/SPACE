@@ -783,9 +783,10 @@ prefix:
 | Native API ids, public operations' `target_id` | `sbx_<uuid>` | drop `sbx_` |
 | Volume-manager `subject_id`, `job.subject_id` | `sandbox:<uuid>` | drop `sandbox:` |
 
-A fork operation's `target_id` is already the source sandbox's bare UUID. The
-reverse conversion prefixes `sbx_`; in a shell, `${id#sbx_}` gives the
-canonical value.
+A fork operation's `target_id` names the source sandbox by its bare UUID, or
+by `sbx_<uuid>` once `SPACE_FORK_PUBLIC_TARGET_ID_ENABLED` is on; dropping a
+leading `sbx_` gives the canonical value either way. The reverse conversion
+prefixes `sbx_`; in a shell, `${id#sbx_}` gives the canonical value.
 
 ## Request identity
 

@@ -180,12 +180,13 @@ fn admin_openapi_value() -> Value {
             "/operations": {
                 "get": {
                     "summary": "List public operations across tenants for operator diagnostics",
+                    "description": "actor_user_id is the user an operation runs as; for an admin sandbox create that is the sandbox owner. requested_by_user_id is set only on create_sandbox operations an administrator submitted on the owner's behalf while SPACE_ADMIN_CREATE_REQUESTED_BY_ENABLED was on, naming that administrator; it is null on every other operation.",
                     "parameters": [
                         { "name": "org_id", "in": "query", "required": false, "schema": { "type": "string", "format": "uuid" } },
                         { "name": "state", "in": "query", "required": false, "schema": { "type": "string" } },
                         { "name": "kind", "in": "query", "required": false, "schema": { "type": "string" } },
                         { "name": "target_type", "in": "query", "required": false, "schema": { "type": "string" } },
-                        { "name": "target_id", "in": "query", "required": false, "schema": { "type": "string" } },
+                        { "name": "target_id", "in": "query", "required": false, "schema": { "type": "string" }, "description": "Matches target_id exactly as given. When the value is also a sandbox id, as sbx_<uuid> or a bare UUID, it matches the other form too, so fork operations are found whichever form they recorded their source in." },
                         { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 250 } }
                     ],
                     "responses": {
@@ -314,7 +315,7 @@ fn admin_openapi_value() -> Value {
                     "summary": "Delete a user",
                     "responses": {
                         "204": { "description": "Deleted" },
-                        "409": { "description": "Caller attempted to delete itself" }
+                        "409": { "description": "Not deleted. reason is self_mutation when the caller targeted itself, user_owns_sandboxes when the user still owns sandboxes, user_owns_retained_deleted_sandboxes when its only sandboxes are deleted ones whose records are kept for retention until retained_until (retry after that), or user_owns_archived_sandboxes when it still owns archived sandboxes" }
                     }
                 }
             },
@@ -365,6 +366,7 @@ fn admin_openapi_value() -> Value {
     insert_admin_sandbox_create_paths(paths);
     insert_identity_profile_paths(paths);
     insert_audit_event_paths(paths);
+    insert_debug_paths(paths);
     insert_runtime_environment_paths(paths);
     spec
 }
@@ -553,7 +555,8 @@ fn insert_template_admin_paths(paths: &mut Map<String, Value>) {
                 "summary": "Build seed or code-runtime using the recipe embedded in the deployed API",
                 "description": "Requires a managing-organization administrator. Publishes an immutable digest; publish_tags explicitly assigns mutable tags. For code-runtime, base defaults to seed:latest and is resolved to an exact digest before dispatch. Poll /templates/{template}/builds/{job_id} until succeeded, failed, or publish_failed.",
                 "parameters": [
-                    { "name": "template", "in": "path", "required": true, "schema": { "type": "string", "enum": ["seed", "code-runtime"] } }
+                    { "name": "template", "in": "path", "required": true, "schema": { "type": "string", "enum": ["seed", "code-runtime"] } },
+                    { "name": "Idempotency-Key", "in": "header", "required": false, "schema": { "type": "string" }, "description": "Optional. A repeat with the same key and body within 24 hours returns the original job instead of starting another; the same key with a different body answers 409. A repeat answers a retryable 409 while the first request may still be submitting. It answers a non-retryable 409 once the API has recorded that the first request failed without proof that the builder did not take the build, and in any case 15 minutes after the key was reserved; its reserved_at detail names when the key was reserved, and job_id the job when the builder named one. The build may have started and may still be running, so check Template Releases (/template-releases) or the build's status before submitting again with a new key. The key is freed for a retry only when the builder certainly did not take the build. Send the header only once every API replica runs a release that honours it: older ones ignore it" }
                 ],
                 "requestBody": {
                     "required": true,
@@ -578,7 +581,7 @@ fn insert_template_admin_paths(paths: &mut Map<String, Value>) {
                     } },
                     "403": { "description": "Caller is not a managing-organization administrator" },
                     "404": { "description": "Seed base release unavailable" },
-                    "409": { "description": "Template belongs to another organization or is deleting or deleted" },
+                    "409": { "description": "Template belongs to another organization or is deleting or deleted, or Idempotency-Key was already used with a different body, or its first build is still being submitted (retryable), or its outcome is unknown (see Idempotency-Key)" },
                     "503": { "description": "Builder unavailable" }
                 }
             }
@@ -744,7 +747,29 @@ fn insert_template_admin_paths(paths: &mut Map<String, Value>) {
         json!({
             "put": {
                 "summary": "Move or create a template release tag",
-                "responses": { "200": { "description": "Template release" } }
+                "description": "Omit expected_current_release_id to move the tag unconditionally. Set it to a release id to move the tag only while it points at that release, or to null to create the tag only if it does not exist yet; the check and the move are one transaction. The admin audit log entry for the move names the release the tag pointed at before it (previous_release_id, empty when the move created the tag).",
+                "requestBody": {
+                    "required": true,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["tag"],
+                                "properties": {
+                                    "tag": { "type": "string" },
+                                    "expected_current_release_id": { "type": ["string", "null"], "format": "uuid", "description": "Compare-and-set precondition on the tag's current release; null requires that the tag not exist" }
+                                }
+                            }
+                        }
+                    }
+                },
+                "responses": {
+                    "200": { "description": "Template release" },
+                    "404": { "description": "Release not found or its template is not present" },
+                    "409": { "description": "The tag changed concurrently; read it again and retry" },
+                    "412": { "description": "The tag does not point at expected_current_release_id. details carries current_release_id when the tag exists" }
+                }
             }
         }),
     );
@@ -902,6 +927,26 @@ fn insert_identity_profile_paths(paths: &mut Map<String, Value>) {
             }),
         );
     }
+}
+
+fn insert_debug_paths(paths: &mut Map<String, Value>) {
+    paths.insert(
+        "/debug/sandbox/{sandbox_id}".to_string(),
+        json!({
+                "get": {
+                    "summary": "Read one sandbox's control-plane diagnostics",
+                    "description": "Requires a managing-organization administrator. Every section is present; a section whose source failed is { error, data: null }. resources.env lists the sandbox's environment variable names, not values: each name maps to null.",
+                    "parameters": [
+                        { "name": "sandbox_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
+                    ],
+                    "responses": {
+                        "200": { "description": "Sandbox diagnostics" },
+                        "403": { "description": "Caller is not a managing-organization administrator" },
+                        "404": { "description": "Sandbox not found" }
+                    }
+                }
+            }),
+    );
 }
 
 fn insert_audit_event_paths(paths: &mut Map<String, Value>) {

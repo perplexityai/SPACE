@@ -10,6 +10,9 @@ expression: paths_by_method
     "get",
     "patch"
   ],
+  "/debug/sandbox/{sandbox_id}": [
+    "get"
+  ],
   "/nodes": [
     "get",
     "post"

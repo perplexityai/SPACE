@@ -296,9 +296,11 @@ impl ForkSandboxOperationExecutor {
                     )));
                 }
                 pplx_space_metrics::sandbox_fork::completed(outcome);
-                if let Some(source_id) = operation.target_id.as_deref() {
+                // `sandbox_id()` reads either form of the source's id, while
+                // the event parser takes only the bare UUID.
+                if let Some(source_id) = operation.sandbox_id() {
                     emit_sandbox_event(
-                        source_id,
+                        &source_id,
                         SandboxEventType::ForkFailed,
                         SandboxEventSource::ClusterController,
                         SandboxEventDetails::default()

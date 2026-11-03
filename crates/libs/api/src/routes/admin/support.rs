@@ -18,7 +18,8 @@ use crate::routes::authz::is_managing_org_admin;
 ///
 /// Read by the two `/admin` modules whose writes honour it — `sandboxes`'
 /// `create_sandbox`, `dispatch_sandbox_action` and `update_sandbox`, and
-/// `templates::delete_template` — so those two share one definition rather
+/// `templates::delete_template` and `templates::start_system_template_build`
+/// (where the key is optional) — so those two share one definition rather
 /// than each carrying a copy. (The `public` and `e2b` surfaces keep their own;
 /// this is not a crate-wide constant.)
 ///

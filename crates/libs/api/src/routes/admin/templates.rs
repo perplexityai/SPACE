@@ -2,6 +2,7 @@ use pplx_space_common_core::types::{NodeId, OrgId};
 
 use pplx_space_common_core::sql;
 use std::collections::HashMap;
+use std::time::Duration;
 
 use axum::{
     Extension, Json,
@@ -14,8 +15,8 @@ use futures_util::StreamExt as _;
 use pplx_space_build_mgr_client::proto as build_proto;
 use pplx_space_cluster_pool::WarmPoolStore;
 use pplx_space_common_core::types::{
-    IdempotencyKey, SubstrateKind, SystemTemplate, TemplateDesiredState, TemplateId, TemplateName,
-    TemplateTag,
+    BuildRunId, IdempotencyKey, SubstrateKind, SystemTemplate, TemplateDesiredState, TemplateId,
+    TemplateName, TemplateTag,
 };
 use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_public_api::{
@@ -28,14 +29,20 @@ use sqlx::{FromRow, types::Json as SqlxJson};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use tracing::Instrument as _;
+
 use crate::{
     controllers::{
+        ControllerError,
         substrate::BuilderClient,
-        template::{TemplateBuildSubmission, TemplateBuildTarget, template_build_status_with},
+        template::{
+            TEMPLATE_BUILD_SUBMIT_BUDGET, TemplateBuildSubmission, TemplateBuildSubmitError,
+            TemplateBuildTarget, template_build_status_with,
+        },
     },
     middleware::auth::AuthUser,
     models::{
-        CreatePoolApiRequest, CreateTemplateRequest, NetworkPolicyStatus,
+        CreatePoolApiRequest, CreateTemplateRequest, NetworkPolicyStatus, NullablePatch,
         SystemTemplateBuildRequest, TemplateBaseSnapshotPolicyRequest, TemplateBuildClientContext,
         TemplateBuildConfig, TemplateBuildCopyStep, TemplateBuildListEntry, TemplateBuildOrigin,
         TemplateBuildPackageManager, TemplateBuildRecipe, TemplateBuildRequest,
@@ -47,15 +54,16 @@ use crate::{
     public_operations::{
         ApiProduct, CreatePublicOperation, CreatePublicOperationIdempotency,
         CreatePublicOperationResult, HttpOperationMethod, OperationPathTemplate,
-        PublicOperationStore, PublicOperationStoreError,
+        PublicOperationStore, PublicOperationStoreError, ResponseReservation,
     },
     public_template_operations::DeleteTemplateOperationPayload,
     reconcile_queue::{ReconcileFacet, ReconcileRef, enqueue_node_reconcile_refs_for_nodes_tx},
     reconcile_trigger::enqueue_triggers_tx,
     routes::{
         AppState,
-        admin::support::{
-            self, ContentionScope, IDEMPOTENCY_KEY_HEADER, parse_if_match_generation,
+        admin::{
+            audit,
+            support::{self, ContentionScope, IDEMPOTENCY_KEY_HEADER, parse_if_match_generation},
         },
         authz,
     },
@@ -1541,19 +1549,25 @@ pub async fn start_template_build(
     .await
 }
 
+/// The idempotency namespace for system template builds. Its records hold the
+/// build's response, not an operation, so this path must never meet
+/// `PublicOperationStore::create_operation`.
+const SYSTEM_TEMPLATE_BUILD_PATH_TEMPLATE: &str = "/admin/v1/system-templates/{template}/builds";
+
 pub async fn start_system_template_build(
     State(state): State<AppState>,
     Extension(AuthUser(actor)): Extension<AuthUser>,
     Path(template): Path<SystemTemplate>,
+    headers: HeaderMap,
     Json(request): Json<SystemTemplateBuildRequest>,
 ) -> impl IntoResponse {
     if let Err(error) = require_template_admin(&state.pool, &actor).await {
         return error.into_response();
     }
-    let template_name = template.into();
-    if let Err(error) = reject_deleted_template_build(&state.pool, &template_name).await {
-        return error.into_response();
-    }
+    let idempotency_key = match optional_idempotency_key(&headers) {
+        Ok(key) => key,
+        Err(error) => return error.into_response(),
+    };
     if let Some(base) = &request.base
         && (template != SystemTemplate::CodeRuntime || base.name().as_str() != "seed")
     {
@@ -1568,26 +1582,335 @@ pub async fn start_system_template_build(
         Err(error) => return api_error(StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     };
     let base = request.base.map(|base| base.to_string());
-    let recipe = match system_template_recipe(template, base.as_deref()) {
-        Ok(recipe) => recipe,
-        Err(error) => {
-            tracing::error!(%error, %template, "invalid bundled system template recipe");
-            return api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Invalid bundled system template recipe",
-            )
-            .into_response();
-        }
-    };
-    submit_admin_template_build(
-        state,
-        TemplateBuildTarget::System(template),
-        recipe,
-        request.force,
-        publish_tags,
-        None,
+    let managing_org_id = match managing_org_id(
+        &state.pool,
+        "failed to load managing org for template build",
     )
     .await
+    {
+        Ok(org_id) => org_id,
+        Err(response) => return response.into_response(),
+    };
+    let build = SystemTemplateBuild {
+        managing_org_id,
+        template,
+        base,
+        force: request.force,
+        publish_tags,
+    };
+    let Some(key) = idempotency_key else {
+        return match build.dispatch(&state).await {
+            Ok(started) => (StatusCode::ACCEPTED, Json(started)).into_response(),
+            Err(failure) => *failure.response,
+        };
+    };
+    let fingerprint = match system_template_build_fingerprint(
+        template,
+        build.base.as_deref(),
+        build.force,
+        &build.publish_tags,
+    ) {
+        Ok(fingerprint) => fingerprint,
+        Err(error) => return error.into_response(),
+    };
+    // Spawned so that a client disconnect, which drops this handler, cannot
+    // cancel the reservation or the dispatch it stands for halfway: the task
+    // reserves, dispatches and records the outcome whether or not anyone is
+    // still waiting.
+    match tokio::spawn(build.submit_once(state, key, fingerprint).in_current_span()).await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::error!(%error, %template, "system template build submission task failed");
+            post_commit_error("Internal server error").into_response()
+        }
+    }
+}
+
+/// How long a system build's idempotency reservation counts as in flight
+/// before a replay reports its outcome unknown. It outlasts the builder RPC
+/// attempts, the one part of the submission with a known bound; the
+/// database work and builder discovery around them have none, so a
+/// submission can still be running past it.
+const SYSTEM_TEMPLATE_BUILD_RESERVATION: Duration = Duration::from_secs(15 * 60);
+const _: () =
+    assert!(SYSTEM_TEMPLATE_BUILD_RESERVATION.as_secs() > TEMPLATE_BUILD_SUBMIT_BUDGET.as_secs());
+
+/// A validated system template build request.
+struct SystemTemplateBuild {
+    managing_org_id: OrgId,
+    template: SystemTemplate,
+    base: Option<String>,
+    force: bool,
+    publish_tags: Vec<String>,
+}
+
+impl SystemTemplateBuild {
+    /// Submit this build at most once under `key`, answering a replay from
+    /// the key's record.
+    ///
+    /// The builder starts a new job per submission and takes no caller
+    /// identity to deduplicate on, so the key is reserved, committed, before
+    /// dispatch, and a replay meets the reservation instead of the builder.
+    /// The reservation is released only when the builder certainly did not
+    /// take the build; on any other failure it stays pending, so the key
+    /// never starts a second job while its record lives.
+    async fn submit_once(
+        self,
+        state: AppState,
+        key: IdempotencyKey,
+        fingerprint: RequestFingerprint,
+    ) -> axum::response::Response {
+        let idempotency = CreatePublicOperationIdempotency {
+            method: HttpOperationMethod::Post,
+            path_template: OperationPathTemplate::new(SYSTEM_TEMPLATE_BUILD_PATH_TEMPLATE),
+            key: &key,
+            request_fingerprint: &fingerprint,
+        };
+        let store = PublicOperationStore::new(state.pool.clone());
+        let reservation = match store
+            .reserve_response(
+                self.managing_org_id,
+                ApiProduct::Admin,
+                &idempotency,
+                SYSTEM_TEMPLATE_BUILD_RESERVATION,
+            )
+            .await
+        {
+            Ok(ResponseReservation::Reserved(reservation)) => reservation,
+            Ok(ResponseReservation::Completed(response)) => {
+                return (StatusCode::ACCEPTED, Json(response)).into_response();
+            }
+            Ok(ResponseReservation::InProgress { reserved_at }) => {
+                return build_reservation_conflict(
+                    "a build with this Idempotency-Key may still be being submitted; retry shortly"
+                        .to_string(),
+                    reserved_at,
+                    None,
+                    true,
+                )
+                .into_response();
+            }
+            Ok(ResponseReservation::OutcomeUnknown { reserved_at, known }) => {
+                return build_reservation_conflict(
+                    format!(
+                        "the build submitted with this Idempotency-Key at {} has an unknown \
+                         outcome: it failed without proof that the builder did not take it, or \
+                         recorded nothing within 15 minutes. It may have started and may still \
+                         be running. Check Template Releases (/template-releases), or the \
+                         build's status when job_id is given, before submitting again with a \
+                         new key",
+                        format_time(reserved_at)
+                    ),
+                    reserved_at,
+                    known.as_ref(),
+                    false,
+                )
+                .into_response();
+            }
+            Err(error) => return response_admission_error(&error).into_response(),
+        };
+        let template = self.template;
+        match self.dispatch(&state).await {
+            // The job is running, so a failure to record it is logged, not
+            // answered: an error would invite the retry that starts a second
+            // job. The reservation, still pending, answers that retry instead.
+            Ok(started) => {
+                let response =
+                    serde_json::to_value(&started).expect("build start response serializes");
+                match store
+                    .complete_response_reservation(reservation, response)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => tracing::error!(
+                        %template,
+                        job_id = %started.job_id,
+                        "the system template build's idempotency reservation was no longer pending"
+                    ),
+                    Err(error) => tracing::error!(
+                        %error,
+                        %template,
+                        job_id = %started.job_id,
+                        "failed to record the system template build's idempotency key; \
+                         replays report it in progress, then of unknown outcome"
+                    ),
+                }
+                (StatusCode::ACCEPTED, Json(started)).into_response()
+            }
+            Err(failure) => {
+                match failure.outcome {
+                    BuildDispatchOutcome::NotAccepted => {
+                        if let Err(error) = store.release_response_reservation(reservation).await {
+                            tracing::warn!(
+                                %error,
+                                %template,
+                                "failed to release an undispatched system template build's \
+                                 idempotency reservation; replays report it in progress, then \
+                                 of unknown outcome"
+                            );
+                        }
+                    }
+                    // Nothing will complete the record now, so it is noted
+                    // unresolved and replays say so at once instead of
+                    // asking for a retry that cannot succeed.
+                    BuildDispatchOutcome::MaybeAccepted { job_id } => {
+                        let known = match job_id {
+                            Some(job_id) => serde_json::json!({ "job_id": job_id.to_string() }),
+                            None => serde_json::json!({}),
+                        };
+                        if let Err(error) = store.note_unresolved_response(reservation, known).await
+                        {
+                            tracing::warn!(
+                                %error,
+                                %template,
+                                ?job_id,
+                                "failed to note a system template build the builder may have \
+                                 taken; replays report it in progress, then of unknown outcome"
+                            );
+                        }
+                    }
+                }
+                *failure.response
+            }
+        }
+    }
+
+    async fn dispatch(
+        &self,
+        state: &AppState,
+    ) -> Result<TemplateBuildStartResponse, BuildDispatchFailure> {
+        let template_name = self.template.into();
+        let not_accepted = |response: axum::response::Response| BuildDispatchFailure {
+            response: Box::new(response),
+            outcome: BuildDispatchOutcome::NotAccepted,
+        };
+        reject_deleted_template_build(&state.pool, &template_name)
+            .await
+            .map_err(|error| not_accepted(error.into_response()))?;
+        let recipe = system_template_recipe(self.template, self.base.as_deref()).map_err(
+            |error| {
+                tracing::error!(%error, template = %self.template, "invalid bundled system template recipe");
+                not_accepted(
+                    api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Invalid bundled system template recipe",
+                    )
+                    .into_response(),
+                )
+            },
+        )?;
+        dispatch_admin_template_build(
+            state,
+            self.managing_org_id,
+            TemplateBuildTarget::System(self.template),
+            recipe,
+            self.force,
+            self.publish_tags.clone(),
+            None,
+        )
+        .await
+    }
+}
+
+/// A failed admin build dispatch: the response for the caller, and whether
+/// the builder may have taken the build.
+struct BuildDispatchFailure {
+    response: Box<axum::response::Response>,
+    outcome: BuildDispatchOutcome,
+}
+
+enum BuildDispatchOutcome {
+    /// Nothing was dispatched, or the builder provably refused it.
+    NotAccepted,
+    /// The builder may have taken it; `job_id` is the job it named, if any.
+    MaybeAccepted { job_id: Option<BuildRunId> },
+}
+
+/// A replay that met another request's still-pending reservation, with the
+/// job that request learned of, if any.
+fn build_reservation_conflict(
+    message: String,
+    reserved_at: OffsetDateTime,
+    known: Option<&serde_json::Value>,
+    retryable: bool,
+) -> ApiErrorResponse {
+    let mut details = vec![PublicErrorDetail {
+        key: "reserved_at".to_string(),
+        value: format_time(reserved_at),
+    }];
+    if let Some(job_id) = known
+        .and_then(|known| known.get("job_id"))
+        .and_then(serde_json::Value::as_str)
+    {
+        details.push(PublicErrorDetail {
+            key: "job_id".to_string(),
+            value: job_id.to_string(),
+        });
+    }
+    let (status, Json(mut envelope)) =
+        api_error_with_details(StatusCode::CONFLICT, message, details);
+    envelope.retryable = retryable;
+    (status, Json(envelope))
+}
+
+/// The `Idempotency-Key` header when the caller sent one.
+fn optional_idempotency_key(
+    headers: &HeaderMap,
+) -> Result<Option<IdempotencyKey>, ApiErrorResponse> {
+    headers
+        .get(IDEMPOTENCY_KEY_HEADER)
+        .map(|value| {
+            IdempotencyKey::parse_header(value.as_bytes())
+                .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.to_string()))
+        })
+        .transpose()
+}
+
+/// What makes two system template builds the same request: the normalized
+/// body, field for field, so a replay that changes any field is refused
+/// rather than silently answered with a job built from different input.
+fn system_template_build_fingerprint(
+    template: SystemTemplate,
+    base: Option<&str>,
+    force: bool,
+    publish_tags: &[String],
+) -> Result<RequestFingerprint, ApiErrorResponse> {
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "template": template.to_string(),
+        "base": base,
+        "force": force,
+        "publish_tags": publish_tags,
+    }))
+    .map_err(|error| {
+        tracing::error!(%error, "failed to serialize system template build fingerprint");
+        api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
+    })?;
+    RequestFingerprint::parse(hex::encode(Sha256::digest(bytes))).map_err(|error| {
+        tracing::error!(%error, "failed to build system template build fingerprint");
+        api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
+    })
+}
+
+fn response_admission_error(
+    error: &crate::public_operations::ResponseAdmissionError,
+) -> ApiErrorResponse {
+    use crate::public_operations::ResponseAdmissionError;
+    let sql = match error {
+        ResponseAdmissionError::Conflict => {
+            return api_error(
+                StatusCode::CONFLICT,
+                "idempotency key was already used with a different request",
+            );
+        }
+        ResponseAdmissionError::Sql(error)
+        | ResponseAdmissionError::Store(PublicOperationStoreError::Sql(error)) => Some(error),
+        ResponseAdmissionError::Store(_) => None,
+    };
+    sql.and_then(|error| contention_response(ContentionScope::Writing, error))
+        .unwrap_or_else(|| {
+            tracing::error!(%error, "failed to admit system template build idempotency key");
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
+        })
 }
 
 fn system_template_recipe(
@@ -1638,7 +1961,6 @@ async fn submit_admin_template_build(
     publish_tags: Vec<String>,
     client: Option<TemplateBuildClientContext>,
 ) -> axum::response::Response {
-    let template_name = target.template_name();
     let managing_org_id = match managing_org_id(
         &state.pool,
         "failed to load managing org for template build",
@@ -1648,6 +1970,32 @@ async fn submit_admin_template_build(
         Ok(org_id) => org_id,
         Err(response) => return response.into_response(),
     };
+    match dispatch_admin_template_build(
+        &state,
+        managing_org_id,
+        target,
+        recipe,
+        force,
+        publish_tags,
+        client,
+    )
+    .await
+    {
+        Ok(started) => (StatusCode::ACCEPTED, Json(started)).into_response(),
+        Err(failure) => *failure.response,
+    }
+}
+
+async fn dispatch_admin_template_build(
+    state: &AppState,
+    managing_org_id: OrgId,
+    target: TemplateBuildTarget,
+    recipe: build_proto::Recipe,
+    force: bool,
+    publish_tags: Vec<String>,
+    client: Option<TemplateBuildClientContext>,
+) -> Result<TemplateBuildStartResponse, BuildDispatchFailure> {
+    let template_name = target.template_name();
     let client = client.unwrap_or_default();
     let response = state
         .template_controller
@@ -1671,15 +2019,22 @@ async fn submit_admin_template_build(
         })
         .await;
     match response {
-        Ok(response) => (
-            StatusCode::ACCEPTED,
-            Json(TemplateBuildStartResponse {
-                job_id: response.job_id,
-                template_name: template_name.to_string(),
-            }),
-        )
-            .into_response(),
-        Err(error) => error.into_response(),
+        Ok(response) => Ok(TemplateBuildStartResponse {
+            job_id: response.job_id,
+            template_name: template_name.to_string(),
+        }),
+        Err(error) => {
+            let outcome = match &error {
+                TemplateBuildSubmitError::NotAccepted(_) => BuildDispatchOutcome::NotAccepted,
+                TemplateBuildSubmitError::MaybeAccepted { job_id, .. } => {
+                    BuildDispatchOutcome::MaybeAccepted { job_id: *job_id }
+                }
+            };
+            Err(BuildDispatchFailure {
+                response: Box::new(ControllerError::from(error).into_response()),
+                outcome,
+            })
+        }
     }
 }
 
@@ -2024,7 +2379,13 @@ pub async fn tag_template_release(
         Ok(tx) => tx,
         Err(response) => return response.into_response(),
     };
-    let result: Result<Option<TemplateReleaseRow>, sqlx::Error> = async {
+    let expected = request
+        .expected_current_release_id
+        .map(|expected| match expected {
+            NullablePatch::Set(release_id) => Some(release_id),
+            NullablePatch::Clear => None,
+        });
+    let result: Result<TagMove, sqlx::Error> = async {
         let row = sqlx::query_as::<_, TemplateReleaseRow>(sql!(
             "SELECT r.id, r.template_name, r.type AS runtime, r.hash AS content_hash, r.created_at
              FROM template_releases r
@@ -2038,34 +2399,72 @@ pub async fn tag_template_release(
         .fetch_optional(&mut *tx)
         .await?;
         let Some(row) = row else {
-            return Ok(None);
+            return Ok(TagMove::ReleaseMissing);
         };
-        sqlx::query(sql!(
-            "INSERT INTO template_release_tags (template_release_id, template_name, tag)
-             VALUES ($1, $2, $3)
-             ON CONFLICT (template_name, tag) DO UPDATE
-             SET template_release_id = EXCLUDED.template_release_id,
-                 modified_at = NOW()"
-        ))
-        .bind(row.id)
-        .bind(&row.template_name)
-        .bind(tag.as_str())
-        .execute(&mut *tx)
-        .await?;
-        let template_name = TemplateName::parse(&row.template_name)
-            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
-        enqueue_template_refs_tx(
-            &mut tx,
-            &[ReconcileRef::template_desired_state(template_name)],
-            pplx_space_common_svc::types::ReconcileReason::TemplateDesiredStateUpdated,
-        )
-        .await?;
-        tx.commit().await?;
-        Ok(Some(row))
+        // Not every tag writer locks the template row, so the tag row's own
+        // lock is what makes the precondition and the move one step. A tag
+        // created between this read and the insert below has committed by the
+        // time `DO NOTHING` reports it, so one more read finds and locks it.
+        let mut previous =
+            current_tag_release_for_update(&mut tx, &row.template_name, tag.as_str()).await?;
+        for _ in 0..2 {
+            if let Some(expected) = expected
+                && expected != previous
+            {
+                return Ok(TagMove::PreconditionFailed {
+                    template_name: row.template_name,
+                    current: previous,
+                });
+            }
+            let moved = match previous {
+                Some(_) => sqlx::query(sql!(
+                    "UPDATE template_release_tags
+                     SET template_release_id = $1,
+                         modified_at = NOW()
+                     WHERE template_name = $2 AND tag = $3"
+                )),
+                None => sqlx::query(sql!(
+                    "INSERT INTO template_release_tags (template_release_id, template_name, tag)
+                     VALUES ($1, $2, $3)
+                     ON CONFLICT (template_name, tag) DO NOTHING"
+                )),
+            }
+            .bind(row.id)
+            .bind(&row.template_name)
+            .bind(tag.as_str())
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+                == 1;
+            if moved {
+                let template_name = TemplateName::parse(&row.template_name)
+                    .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+                enqueue_template_refs_tx(
+                    &mut tx,
+                    &[ReconcileRef::template_desired_state(template_name)],
+                    pplx_space_common_svc::types::ReconcileReason::TemplateDesiredStateUpdated,
+                )
+                .await?;
+                tx.commit().await?;
+                return Ok(TagMove::Moved { row, previous });
+            }
+            previous =
+                current_tag_release_for_update(&mut tx, &row.template_name, tag.as_str()).await?;
+        }
+        Ok(TagMove::Raced)
     }
     .await;
     match result {
-        Ok(Some(row)) => {
+        Ok(TagMove::Moved { row, previous }) => {
+            audit::record_template_tag(audit::AdminTemplateTagAuditEntry {
+                actor: &actor,
+                template_name: &row.template_name,
+                tag: tag.as_str(),
+                release_id,
+                previous_release_id: previous,
+                success: true,
+                error: None,
+            });
             let releases = match hydrate_template_releases(&state.pool, vec![row]).await {
                 Ok(releases) => releases,
                 // Unclassified, and non-retryable, for the reason spelled
@@ -2079,7 +2478,38 @@ pub async fn tag_template_release(
             };
             Json(releases.into_iter().next().expect("one release")).into_response()
         }
-        Ok(None) => api_error(StatusCode::NOT_FOUND, "Template release not found").into_response(),
+        Ok(TagMove::PreconditionFailed {
+            template_name,
+            current,
+        }) => {
+            let message = "tag does not point at expected_current_release_id";
+            audit::record_template_tag(audit::AdminTemplateTagAuditEntry {
+                actor: &actor,
+                template_name: &template_name,
+                tag: tag.as_str(),
+                release_id,
+                previous_release_id: current,
+                success: false,
+                error: Some(message),
+            });
+            let details = current
+                .map(|id| PublicErrorDetail {
+                    key: "current_release_id".to_string(),
+                    value: id.to_string(),
+                })
+                .into_iter()
+                .collect();
+            api_error_with_details(StatusCode::PRECONDITION_FAILED, message, details)
+                .into_response()
+        }
+        Ok(TagMove::Raced) => contention_envelope(
+            StatusCode::CONFLICT,
+            "tag changed while it was being moved; read it again and retry",
+        )
+        .into_response(),
+        Ok(TagMove::ReleaseMissing) => {
+            api_error(StatusCode::NOT_FOUND, "Template release not found").into_response()
+        }
         Err(error) => contention_response(ContentionScope::Writing, &error)
             .unwrap_or_else(|| {
                 tracing::error!(%error, %release_id, "failed to tag template release");
@@ -2087,6 +2517,44 @@ pub async fn tag_template_release(
             })
             .into_response(),
     }
+}
+
+/// What `tag_template_release`'s transaction did.
+enum TagMove {
+    ReleaseMissing,
+    /// The tag now points at the release; `previous` is where it pointed
+    /// before, `None` when this created it.
+    Moved {
+        row: TemplateReleaseRow,
+        previous: Option<Uuid>,
+    },
+    /// `expected_current_release_id` did not match `current`.
+    PreconditionFailed {
+        template_name: String,
+        current: Option<Uuid>,
+    },
+    /// The tag was created and removed again by other writers between this
+    /// request's reads.
+    Raced,
+}
+
+/// The release a tag points at, locking its row for the rest of the
+/// transaction, or `None` when the tag does not exist.
+async fn current_tag_release_for_update(
+    tx: &mut sqlx::Transaction<'static, sqlx::Postgres>,
+    template_name: &str,
+    tag: &str,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    sqlx::query_scalar(sql!(
+        "SELECT template_release_id
+         FROM template_release_tags
+         WHERE template_name = $1 AND tag = $2
+         FOR UPDATE"
+    ))
+    .bind(template_name)
+    .bind(tag)
+    .fetch_optional(&mut **tx)
+    .await
 }
 
 pub async fn delete_template_release_tag(

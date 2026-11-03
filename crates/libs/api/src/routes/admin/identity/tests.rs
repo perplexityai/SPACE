@@ -1,4 +1,5 @@
 use super::*;
+use axum::body::to_bytes;
 use pplx_space_common_core::types::OrgId;
 
 #[tokio::test(flavor = "current_thread")]
@@ -286,5 +287,119 @@ async fn identity_handlers_take_the_admin_surface_contention_disposition()
         pplx_space_db_test_fixtures::raise_sqlstate(&db.pool, "40P01").await,
     );
     assert_eq!(via_db_error, StatusCode::CONFLICT);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn delete_user_answers_conflict_while_the_user_owns_sandboxes()
+-> pplx_space_test_env::TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let state = AppState::from_pool(db.pool.clone()).await?;
+    let actor = sqlx::query_as::<_, User>(sql!(
+        "SELECT u.*
+         FROM users u
+         JOIN clusters c ON c.managing_org_id = u.org_id
+         WHERE c.singleton
+           AND u.role = 'organization_admin'
+         ORDER BY u.id
+         LIMIT 1"
+    ))
+    .fetch_one(&db.pool)
+    .await?;
+    let user_id = UserId::new();
+    sqlx::query(sql!(
+        "INSERT INTO users (id, email, password_hash, display_name, org_id, role)
+         VALUES ($1, $2, 'unused', 'Sandbox Owner', $3, 'member')"
+    ))
+    .bind(user_id)
+    .bind(format!("owner-{user_id}@example.invalid"))
+    .bind(actor.org_id)
+    .execute(&db.pool)
+    .await?;
+    let delete = || {
+        delete_user(
+            State(state.clone()),
+            Extension(AuthUser(actor.clone())),
+            Path(user_id),
+        )
+    };
+
+    let sandbox_id =
+        pplx_space_db_test_fixtures::insert_suspended_sandbox(&db.pool, actor.org_id, user_id)
+            .await?;
+    let error = delete()
+        .await
+        .expect_err("an owned sandbox must block the delete");
+    assert_eq!(error.status(), StatusCode::CONFLICT);
+    assert_eq!(error.reason(), Some("user_owns_sandboxes"));
+
+    sqlx::query(sql!("DELETE FROM sandboxes WHERE id = $1"))
+        .bind(sandbox_id)
+        .execute(&db.pool)
+        .await?;
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_archives (
+             sandbox_id, org_id, user_id, sandbox_created_at, manifest_id,
+             manifest_sha256, stored_bytes
+         ) VALUES ($1, $2, $3, NOW(), $4, '\\x00', 0)"
+    ))
+    .bind(sandbox_id)
+    .bind(actor.org_id)
+    .bind(user_id)
+    .bind(Uuid::now_v7())
+    .execute(&db.pool)
+    .await?;
+    let error = delete()
+        .await
+        .expect_err("an archived sandbox must block the delete");
+    assert_eq!(error.status(), StatusCode::CONFLICT);
+    assert_eq!(error.reason(), Some("user_owns_archived_sandboxes"));
+
+    sqlx::query(sql!("DELETE FROM sandbox_archives WHERE sandbox_id = $1"))
+        .bind(sandbox_id)
+        .execute(&db.pool)
+        .await?;
+
+    // A deleted sandbox's row is kept for retention and still holds the user.
+    let tombstone =
+        pplx_space_db_test_fixtures::insert_suspended_sandbox(&db.pool, actor.org_id, user_id)
+            .await?;
+    let deleted_at: time::OffsetDateTime = sqlx::query_scalar(sql!(
+        "UPDATE sandboxes SET lifecycle = 'deleted' WHERE id = $1 RETURNING updated_at"
+    ))
+    .bind(tombstone)
+    .fetch_one(&db.pool)
+    .await?;
+    let error = delete()
+        .await
+        .expect_err("a retained deleted sandbox must block the delete");
+    assert_eq!(error.status(), StatusCode::CONFLICT);
+    assert_eq!(error.reason(), Some("user_owns_retained_deleted_sandboxes"));
+    let body = to_bytes(error.into_response().into_body(), usize::MAX).await?;
+    let body: serde_json::Value = serde_json::from_slice(&body)?;
+    let retained_until = time::OffsetDateTime::parse(
+        body["retained_until"].as_str().expect("retained_until"),
+        &time::format_description::well_known::Rfc3339,
+    )?;
+    assert_eq!(retained_until, deleted_at + time::Duration::days(7));
+
+    sqlx::query(sql!("DELETE FROM sandboxes WHERE id = $1"))
+        .bind(tombstone)
+        .execute(&db.pool)
+        .await?;
+    assert_eq!(delete().await?, StatusCode::NO_CONTENT);
+
+    // The self-target 409 stays distinguishable from the ownership 409s.
+    let error = delete_user(
+        State(state),
+        Extension(AuthUser(actor.clone())),
+        Path(actor.id),
+    )
+    .await
+    .expect_err("self-delete must be refused");
+    assert_eq!(error.status(), StatusCode::CONFLICT);
+    assert_eq!(error.reason(), Some("self_mutation"));
     Ok(())
 }

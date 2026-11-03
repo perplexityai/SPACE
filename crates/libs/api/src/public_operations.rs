@@ -30,9 +30,11 @@ const DEFAULT_OPERATION_GC_DAYS: i64 = 7;
 /// column changes what `SELECT *` returns, and every pooled connection that
 /// already ran one then fails it with `0A000` ("cached plan must not change
 /// result type") until the pool recycles that connection. A new column a read
-/// needs is selected here and decoded in [`PublicOperationRow`], once for all
-/// three reads; a record that exposes it also needs the field and its line in
-/// that record's `TryFrom<PublicOperationRow>`.
+/// needs is selected here and decoded in [`PublicOperationRow`]; a record
+/// that exposes it also needs the field and its line in that record's
+/// `TryFrom`. The two admin reads (`fetch_operation_admin`,
+/// `list_operations_admin`) select one more expression, so they spell this
+/// list out and need the new column added there too.
 const PUBLIC_OPERATION_COLUMNS: &str = "operation_id,
        org_id,
        actor_user_id,
@@ -81,6 +83,8 @@ mod key_bindings;
 pub(crate) use key_bindings::{KEY_BINDING_TTL_MINUTES, bind_idempotency_key};
 mod responses;
 pub(crate) use responses::ResponseAdmissionError;
+mod response_reservations;
+pub(crate) use response_reservations::ResponseReservation;
 mod sandbox_quota;
 pub use sandbox_quota::{
     SandboxQuota, SandboxQuotaOutcome, SandboxQuotaRefusal, SubjectSandboxQuota,
@@ -454,21 +458,46 @@ impl PublicOperationStore {
             .transpose()
     }
 
+    /// The admin reads list every [`PublicOperationRow`] column and, for a
+    /// sandbox create, the payload's `requested_by_user_id`, which only the
+    /// admin record exposes. No other kind's payload defines that key, so
+    /// they never read it.
+    ///
+    /// They spell the column list out rather than take
+    /// [`PUBLIC_OPERATION_COLUMNS`], whose fragment may only be a statement's
+    /// whole `SELECT` list.
     pub async fn fetch_operation_admin(
         &self,
         operation_id: OperationId,
     ) -> Result<Option<AdminPublicOperationRecord>, PublicOperationStoreError> {
-        static FETCH_OPERATION_ADMIN_SQL: LazyLock<String> = LazyLock::new(|| {
-            sql!(public_operation_query(
-                "SELECT {public_operation_columns}
-                 FROM public_operations
-                 WHERE operation_id = $1"
-            ))
-        });
-        let row = sqlx::query_as::<_, PublicOperationRow>(sqlx::AssertSqlSafe(
-            FETCH_OPERATION_ADMIN_SQL.as_str(),
+        let row = sqlx::query_as::<_, AdminPublicOperationRow>(sql!(
+            "SELECT operation_id,
+                        org_id,
+                        actor_user_id,
+                        api_product,
+                        kind,
+                        target_type,
+                        target_id,
+                        state,
+                        progress_message,
+                        terminal_error_code,
+                        terminal_error_json,
+                        result_json,
+                        attempts,
+                        requested_at,
+                        next_attempt_at,
+                        created_at,
+                        started_at,
+                        completed_at,
+                        updated_at,
+                        CASE WHEN kind = $2
+                             THEN payload_json ->> 'requested_by_user_id'
+                        END AS requested_by_user_id
+               FROM public_operations
+              WHERE operation_id = $1"
         ))
         .bind(operation_id.as_uuid())
+        .bind(OperationKind::CreateSandbox.as_str())
         .fetch_optional(&self.pool)
         .await?;
 
@@ -482,28 +511,45 @@ impl PublicOperationStore {
         let state = input.state.as_ref().map(OperationState::as_str);
         let kind = input.kind.map(OperationKind::as_str);
         let target_type = input.target_type.as_ref().map(OperationTargetType::as_str);
-        static LIST_OPERATIONS_ADMIN_SQL: LazyLock<String> = LazyLock::new(|| {
-            sql!(public_operation_query(
-                "SELECT {public_operation_columns}
-                 FROM public_operations
-                 WHERE ($1::UUID IS NULL OR org_id = $1)
-                   AND ($2::TEXT IS NULL OR state = $2)
-                   AND ($3::TEXT IS NULL OR kind = $3)
-                   AND ($4::TEXT IS NULL OR target_type = $4)
-                   AND ($5::TEXT IS NULL OR target_id = $5)
-                 ORDER BY created_at DESC, operation_id DESC
-                 LIMIT $6"
-            ))
-        });
-        let rows = sqlx::query_as::<_, PublicOperationRow>(sqlx::AssertSqlSafe(
-            LIST_OPERATIONS_ADMIN_SQL.as_str(),
+        let rows = sqlx::query_as::<_, AdminPublicOperationRow>(sql!(
+            "SELECT operation_id,
+                        org_id,
+                        actor_user_id,
+                        api_product,
+                        kind,
+                        target_type,
+                        target_id,
+                        state,
+                        progress_message,
+                        terminal_error_code,
+                        terminal_error_json,
+                        result_json,
+                        attempts,
+                        requested_at,
+                        next_attempt_at,
+                        created_at,
+                        started_at,
+                        completed_at,
+                        updated_at,
+                        CASE WHEN kind = $7
+                             THEN payload_json ->> 'requested_by_user_id'
+                        END AS requested_by_user_id
+               FROM public_operations
+              WHERE ($1::UUID IS NULL OR org_id = $1)
+                AND ($2::TEXT IS NULL OR state = $2)
+                AND ($3::TEXT IS NULL OR kind = $3)
+                AND ($4::TEXT IS NULL OR target_type = $4)
+                AND ($5::TEXT[] IS NULL OR target_id = ANY($5))
+              ORDER BY created_at DESC, operation_id DESC
+              LIMIT $6"
         ))
         .bind(input.org_id)
         .bind(state)
         .bind(kind)
         .bind(target_type)
-        .bind(input.target_id.as_deref())
+        .bind(input.target_id.as_deref().map(admin_target_id_forms))
         .bind(i64::from(input.limit))
+        .bind(OperationKind::CreateSandbox.as_str())
         .fetch_all(&self.pool)
         .await?;
 
@@ -554,13 +600,16 @@ impl PublicOperationStore {
             .map(Some)
     }
 
+    /// Events of the operations that target `sandbox_id`, forks of it
+    /// included, which name it by either form; see [`sandbox_target_id_forms`].
     pub async fn fetch_sandbox_operation_events(
         &self,
         org_id: OrgId,
-        sandbox_id: &str,
+        sandbox_id: SandboxId,
         after: Option<&SandboxOperationEventCursor>,
         limit: i64,
     ) -> Result<Vec<PublicOperationEvent>, PublicOperationStoreError> {
+        let target_ids = sandbox_target_id_forms(sandbox_id);
         let rows = if let Some(after) = after {
             sqlx::query_as::<_, PublicOperationEventRow>(sql!(
                 "SELECT e.operation_id, e.sequence, e.event_type, e.event_json, e.created_at
@@ -568,13 +617,13 @@ impl PublicOperationStore {
                  JOIN public_operations o ON o.operation_id = e.operation_id
                  WHERE o.org_id = $1
                    AND o.target_type = 'sandbox'
-                   AND o.target_id = $2
+                   AND o.target_id = ANY($2)
                    AND (e.created_at, e.operation_id, e.sequence) > ($3, $4, $5)
                  ORDER BY e.created_at ASC, e.operation_id ASC, e.sequence ASC
                  LIMIT $6"
             ))
             .bind(org_id)
-            .bind(sandbox_id)
+            .bind(&target_ids[..])
             .bind(after.created_at)
             .bind(after.operation_id.as_uuid())
             .bind(after.sequence)
@@ -590,14 +639,14 @@ impl PublicOperationStore {
                      JOIN public_operations o ON o.operation_id = e.operation_id
                      WHERE o.org_id = $1
                        AND o.target_type = 'sandbox'
-                       AND o.target_id = $2
+                       AND o.target_id = ANY($2)
                      ORDER BY e.created_at DESC, e.operation_id DESC, e.sequence DESC
                      LIMIT $3
                  ) recent
                  ORDER BY created_at ASC, operation_id ASC, sequence ASC"
             ))
             .bind(org_id)
-            .bind(sandbox_id)
+            .bind(&target_ids[..])
             .bind(limit)
             .fetch_all(&self.pool)
             .await?
@@ -1997,9 +2046,9 @@ pub struct ClaimedPublicOperation {
 impl ClaimedPublicOperation {
     /// The canonical `sandbox_id` telemetry value, the bare UUID, of the
     /// sandbox the operation targets. Public operations name it by its
-    /// `sbx_<uuid>` target id and a fork by its source's bare UUID; a target
-    /// that names no sandbox yields `None`, which leaves the field off the
-    /// span or log line.
+    /// `sbx_<uuid>` target id and a fork by its source's id in either form;
+    /// a target that names no sandbox yields `None`, which leaves the field
+    /// off the span or log line.
     pub fn sandbox_id(&self) -> Option<String> {
         let target_id = self.target_id.as_deref()?;
         let sandbox_id = match target_id.parse::<pplx_space_public_api::PublicSandboxId>() {
@@ -2573,8 +2622,10 @@ pub(crate) async fn lock_active_sandbox_operation(
 }
 
 /// Kinds that name a sandbox as their target but are not in its queue. A
-/// fork names its source by a different id form (the bare UUID) and is
-/// ordered by the source's lifecycle lock instead.
+/// fork names its source sandbox by the bare UUID, or, while
+/// `SPACE_FORK_PUBLIC_TARGET_ID_ENABLED` is on, by the same `sbx_<uuid>` the
+/// sandbox's queue uses, so only its kind keeps it out; it is ordered by the
+/// source's lifecycle lock instead.
 ///
 /// This is the one definition of a sandbox's queue: every operation that
 /// targets a sandbox and is not of one of these kinds. [`sandbox_queue_key`]
@@ -2656,7 +2707,8 @@ struct JoinableOperation {
 
 /// The queued or running `kind` operation on a sandbox that a new request
 /// joins, under [`lock_active_sandbox_operation`]. Only one that nothing else
-/// for the sandbox is queued behind, in the dispatcher's order: a wake ahead
+/// in the sandbox's queue is queued behind, in the dispatcher's order (a fork
+/// of the sandbox is outside its queue and does not count): a wake ahead
 /// of a `:suspend` leaves the sandbox at rest, so the new wake is queued after
 /// that instead. Only committed operations are seen: other kinds never take
 /// this lock, so a `:suspend` still uncommitted here is missed, the new
@@ -2691,6 +2743,7 @@ async fn joinable_active_sandbox_operation(
                    AND later.target_type = 'sandbox'
                    AND later.target_id = active.target_id
                    AND later.kind <> active.kind
+                   AND later.kind <> ALL($5)
                    AND later.state IN ('queued', 'running')
                    AND (later.requested_at, later.operation_id)
                        > (active.requested_at, active.operation_id)
@@ -2702,6 +2755,7 @@ async fn joinable_active_sandbox_operation(
     .bind(target_id)
     .bind(kind.as_str())
     .bind(joiner)
+    .bind(outside_sandbox_queue_labels())
     .fetch_optional(&mut **tx)
     .await?;
     Ok(joinable.map(|(operation_id, system)| JoinableOperation {
@@ -3768,6 +3822,11 @@ pub struct AdminPublicOperationRecord {
     pub state: OperationState,
     pub target_type: Option<OperationTargetType>,
     pub target_id: Option<String>,
+    /// For a sandbox create, the administrator who submitted it on behalf of
+    /// `actor_user_id`, when the create recorded one. `None` for every other
+    /// kind, for a create the owner requested, and for a create recorded
+    /// while `SPACE_ADMIN_CREATE_REQUESTED_BY_ENABLED` was off.
+    pub requested_by_user_id: Option<UserId>,
     pub progress_message: String,
     pub terminal_error_code: Option<PublicErrorCode>,
     pub terminal_error: Option<serde_json::Value>,
@@ -3842,6 +3901,52 @@ struct PublicOperationRow {
     updated_at: OffsetDateTime,
 }
 
+/// The `target_id` values an admin filter on `target_id` matches: the typed
+/// string itself, and, when it parses as a sandbox id in either form, both
+/// forms (see [`sandbox_target_id_forms`]).
+/// The typed string stays even when it parses: a target that is not a
+/// sandbox, such as a template whose name is 32 hex digits, is recorded as
+/// typed, not in either canonical form.
+fn admin_target_id_forms(target_id: &str) -> Vec<String> {
+    let mut forms = vec![target_id.to_string()];
+    let sandbox_id = target_id
+        .parse::<pplx_space_public_api::PublicSandboxId>()
+        .map(SandboxId::from)
+        .or_else(|_| target_id.parse::<SandboxId>());
+    if let Ok(sandbox_id) = sandbox_id {
+        for form in sandbox_target_id_forms(sandbox_id) {
+            if !forms.contains(&form) {
+                forms.push(form);
+            }
+        }
+    }
+    forms
+}
+
+/// Both `target_id` forms an operation on `sandbox_id` may have recorded:
+/// `sbx_<uuid>`, and the bare UUID a fork records while
+/// `SPACE_FORK_PUBLIC_TARGET_ID_ENABLED` is off.
+///
+/// Matching the bare form can go one release after
+/// `SPACE_FORK_PUBLIC_TARGET_ID_ENABLED` is on everywhere, plus the 7 days a
+/// finished operation is kept: by then no row holds it. The fork readers in
+/// `fork_operation_store`, `pplx_space_sandbox_store::fork_source_lifecycle`
+/// and `fork_operation_executor` drop it at the same time.
+fn sandbox_target_id_forms(sandbox_id: SandboxId) -> [String; 2] {
+    [
+        pplx_space_public_api::PublicSandboxId::from(sandbox_id).to_string(),
+        sandbox_id.to_string(),
+    ]
+}
+
+/// [`PublicOperationRow`] plus the admin record's payload-derived columns.
+#[derive(Debug, FromRow)]
+struct AdminPublicOperationRow {
+    #[sqlx(flatten)]
+    operation: PublicOperationRow,
+    requested_by_user_id: Option<String>,
+}
+
 #[derive(Debug, FromRow)]
 struct PublicOperationEventRow {
     operation_id: Uuid,
@@ -3891,10 +3996,22 @@ impl TryFrom<PublicOperationRow> for PublicOperationRecord {
     }
 }
 
-impl TryFrom<PublicOperationRow> for AdminPublicOperationRecord {
+impl TryFrom<AdminPublicOperationRow> for AdminPublicOperationRecord {
     type Error = PublicOperationStoreError;
 
-    fn try_from(row: PublicOperationRow) -> Result<Self, Self::Error> {
+    fn try_from(row: AdminPublicOperationRow) -> Result<Self, Self::Error> {
+        let requested_by_user_id = row
+            .requested_by_user_id
+            .map(|value| {
+                value
+                    .parse::<UserId>()
+                    .map_err(|_| PublicOperationStoreError::InvalidStoredEnum {
+                        field: "requested_by_user_id",
+                        value,
+                    })
+            })
+            .transpose()?;
+        let row = row.operation;
         Ok(Self {
             id: OperationId::from_uuid(row.operation_id),
             org_id: row.org_id,
@@ -3908,6 +4025,7 @@ impl TryFrom<PublicOperationRow> for AdminPublicOperationRecord {
                 .map(|value| parse_stored_enum("target_type", value))
                 .transpose()?,
             target_id: row.target_id,
+            requested_by_user_id,
             progress_message: row.progress_message,
             terminal_error_code: row
                 .terminal_error_code

@@ -195,7 +195,7 @@ impl ForkOperationStore {
              FROM public_operations
              WHERE org_id = $1
                AND kind = 'fork_sandbox'
-               AND target_id = $2
+               AND target_id IN ($2, $5)
                AND state IN ($3, $4)
              ORDER BY created_at, operation_id"
         ))
@@ -203,6 +203,9 @@ impl ForkOperationStore {
         .bind(payload.source_sandbox_id().to_string())
         .bind(OperationState::Queued.as_str())
         .bind(OperationState::Running.as_str())
+        // Forks of one source name it by either id form; see
+        // `fork_operations::fork_operation_target_id`.
+        .bind(pplx_space_public_api::PublicSandboxId::from(payload.source_sandbox_id()).to_string())
         .fetch_all(&mut *tx)
         .await?;
         let mut candidates = Vec::new();

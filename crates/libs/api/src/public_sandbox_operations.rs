@@ -87,6 +87,17 @@ pub struct CreateSandboxOperationPayload {
     /// release before any producer sets it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_claim: Option<CreateSandboxPoolClaim>,
+    /// The administrator who submitted this create on the owner's behalf,
+    /// for the admin operations API. The operation's `actor_user_id` stays
+    /// the owner, which the executor creates the sandbox as; the executor
+    /// does not read this field.
+    ///
+    /// Same mixed-version rule as `node_pool`: absent payloads serialize
+    /// byte-identically and old payloads parse unchanged, while a present key
+    /// is rejected by an older executor's `deny_unknown_fields`. The admin
+    /// create sets it only while [`ADMIN_CREATE_REQUESTED_BY_ENV`] is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_by_user_id: Option<UserId>,
 }
 
 /// Identifies the warm-pool slot claim recorded on an admitted native create.
@@ -122,6 +133,7 @@ impl std::fmt::Debug for CreateSandboxOperationPayload {
             .field("node_pool", &self.node_pool)
             .field("federated", &self.federated_create.is_some())
             .field("pool_claim", &self.pool_claim)
+            .field("requested_by_user_id", &self.requested_by_user_id)
             .finish_non_exhaustive()
     }
 }
@@ -195,6 +207,22 @@ pub(crate) const IMPLICIT_WAKE_ACTIVITY_ENV: &str = "SPACE_IMPLICIT_WAKE_ACTIVIT
 /// [`IMPLICIT_WAKE_ACTIVITY_ENV`].
 pub(crate) fn implicit_wake_activity_enabled() -> bool {
     pplx_space_common_core::env::env_flag_var(IMPLICIT_WAKE_ACTIVITY_ENV, false)
+}
+
+/// The switch for recording
+/// [`CreateSandboxOperationPayload::requested_by_user_id`] on admin creates:
+/// `1`, `true`, `yes`, `on` or `enabled`, in any case, turns it on; unset or
+/// anything else keeps it off. Off, admin creates go in without it, as before
+/// the field, and the admin operations API reports no requester. Turn it on
+/// only once every `space-cluster-controller` replica runs this release or a
+/// later one, which accept the field without reading it, and off again,
+/// letting the creates queued with it drain, before rolling one back.
+pub(crate) const ADMIN_CREATE_REQUESTED_BY_ENV: &str = "SPACE_ADMIN_CREATE_REQUESTED_BY_ENABLED";
+
+/// Whether admin creates record their requester; see
+/// [`ADMIN_CREATE_REQUESTED_BY_ENV`].
+pub(crate) fn admin_create_requested_by_enabled() -> bool {
+    pplx_space_common_core::env::env_flag_var(ADMIN_CREATE_REQUESTED_BY_ENV, false)
 }
 
 impl SandboxLifecycleOperationPayload {

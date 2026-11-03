@@ -391,7 +391,7 @@ pub async fn start_build(
             org_id: actor.org_id,
         })
         .await
-        .map_err(template_build_submit_error)?;
+        .map_err(|error| template_build_submit_error(error.into()))?;
 
     Ok((StatusCode::ACCEPTED, Json(serde_json::json!({}))))
 }

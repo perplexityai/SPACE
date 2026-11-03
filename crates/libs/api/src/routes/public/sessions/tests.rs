@@ -569,6 +569,31 @@ mod not_running {
         Ok(())
     }
 
+    /// A fork of the sandbox, which names it by the same `sbx_` id as its
+    /// queue, is outside that queue, so a fork requested after a wake does
+    /// not stop a later wake joining it.
+    #[tokio::test]
+    async fn a_wake_joins_an_earlier_wake_past_a_later_fork() -> TestDbResult<()> {
+        let fixture = fixture().await?;
+        let sandbox_id = sandbox(&fixture, "suspended", &["command"]).await?;
+        let wake = lifecycle(&fixture, sandbox_id, "wake", &Uuid::now_v7().to_string()).await?;
+        sqlx::query(sql!(
+            "INSERT INTO public_operations
+                 (operation_id, org_id, kind, target_type, target_id, state)
+             VALUES ($1, $2, 'fork_sandbox', 'sandbox', $3, 'queued')"
+        ))
+        .bind(Uuid::now_v7())
+        .bind(SEED_ORG_ID)
+        .bind(sandbox_id.to_string())
+        .execute(&fixture.db.pool)
+        .await?;
+
+        let again = lifecycle(&fixture, sandbox_id, "wake", &Uuid::now_v7().to_string()).await?;
+        assert_eq!(again, wake);
+        assert_eq!(wake_ids(&fixture, sandbox_id).await?.len(), 1);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn a_wake_after_the_wake_it_would_join_finished_queues_its_own() -> TestDbResult<()> {
         let fixture = fixture().await?;
