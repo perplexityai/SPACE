@@ -123,7 +123,7 @@ export async function waitForPublicOperation(
   timeoutMs: number = OPERATION_POLL_TIMEOUT_MS,
   signal?: AbortSignal,
 ): Promise<PublicOperationRecord> {
-  return pollOperation(() => api.get<PublicOperationRecord>(`/operations/${operationId}`), {
+  return pollOperation((read) => api.get<PublicOperationRecord>(`/operations/${operationId}`, { signal: read }), {
     timeoutMs,
     intervalMs: OPERATION_POLL_INTERVAL_MS,
     signal,
@@ -135,7 +135,7 @@ export async function waitForAdminOperation(
   timeoutMs: number = OPERATION_POLL_TIMEOUT_MS,
   signal?: AbortSignal,
 ): Promise<PublicOperationRecord> {
-  return pollOperation(() => adminApi.get<PublicOperationRecord>(`/v1/operations/${operationId}`), {
+  return pollOperation((read) => adminApi.get<PublicOperationRecord>(`/v1/operations/${operationId}`, { signal: read }), {
     timeoutMs,
     intervalMs: OPERATION_POLL_INTERVAL_MS,
     signal,

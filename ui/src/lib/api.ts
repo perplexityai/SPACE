@@ -132,7 +132,8 @@ async function request<T>(
 }
 
 export const api = {
-  get: <T>(path: string) => request<T>(path),
+  // `signal` lets a caller cancel a read it no longer needs.
+  get: <T>(path: string, init?: { signal?: AbortSignal }) => request<T>(path, init ?? {}),
   post: <T>(path: string, body?: unknown, headers?: Record<string, string>) =>
     request<T>(path, { method: 'POST', body: body ? JSON.stringify(body) : undefined, headers }),
   patch: <T>(path: string, body?: unknown, headers?: Record<string, string>) =>

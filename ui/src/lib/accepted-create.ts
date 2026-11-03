@@ -67,20 +67,26 @@ type OperationRecordLike = { state: string; progress_message: string; terminal_e
 // Read an operation until it ends: its record when it succeeded,
 // `OperationFailedError` when it ended otherwise, `OperationTimeoutError`
 // when it is still running at `timeoutMs`, `OperationFollowStoppedError` once
-// `signal` aborts. A failed read is thrown as it is.
+// `signal` aborts. A failed read is thrown as it is. A read still unanswered
+// at the deadline or when `signal` aborts is given up, and the signal `read`
+// was given aborts, so a status request that never answers cannot hold the
+// follower.
 export async function pollOperation<T extends OperationRecordLike>(
-  read: () => Promise<T>,
+  read: (signal: AbortSignal) => Promise<T>,
   {
     timeoutMs,
     intervalMs,
     now = Date.now,
     sleep = abortableSleep,
+    timer = startTimer,
     signal,
   }: {
     timeoutMs: number;
     intervalMs: number;
     now?: () => number;
     sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
+    // Calls `fire` after `ms`, unless the function it returns is called first.
+    timer?: (ms: number, fire: () => void) => () => void;
     signal?: AbortSignal;
   },
 ): Promise<T> {
@@ -91,8 +97,10 @@ export async function pollOperation<T extends OperationRecordLike>(
   let last: T | null = null;
   while (now() < deadline) {
     stopped();
-    last = await read();
+    const answer = await readWithin(read, deadline - now(), timer, signal);
     stopped();
+    if (answer === GIVEN_UP) break;
+    last = answer;
     if (TERMINAL_STATES.includes(last.state)) {
       if (last.state === 'succeeded') return last;
       const { reason, detail } = terminalErrorParts(last.terminal_error);
@@ -102,6 +110,38 @@ export async function pollOperation<T extends OperationRecordLike>(
   }
   stopped();
   throw new OperationTimeoutError(last?.progress_message || 'operation still running');
+}
+
+const GIVEN_UP = Symbol('given up');
+
+// One read, or `GIVEN_UP` once `ms` pass or `signal` aborts first. The read's
+// own signal aborts once this settles, which cancels a request still open.
+async function readWithin<T>(
+  read: (signal: AbortSignal) => Promise<T>,
+  ms: number,
+  timer: (ms: number, fire: () => void) => () => void,
+  signal?: AbortSignal,
+): Promise<T | typeof GIVEN_UP> {
+  const request = new AbortController();
+  let cancelTimer = () => {};
+  let giveUp = () => {};
+  const givenUp = new Promise<typeof GIVEN_UP>((resolve) => {
+    giveUp = () => resolve(GIVEN_UP);
+    cancelTimer = timer(ms, giveUp);
+    signal?.addEventListener('abort', giveUp);
+  });
+  try {
+    return await Promise.race([read(request.signal), givenUp]);
+  } finally {
+    cancelTimer();
+    signal?.removeEventListener('abort', giveUp);
+    request.abort();
+  }
+}
+
+function startTimer(ms: number, fire: () => void): () => void {
+  const handle = setTimeout(fire, ms);
+  return () => clearTimeout(handle);
 }
 
 // Waits `ms`, or less once `signal` aborts.

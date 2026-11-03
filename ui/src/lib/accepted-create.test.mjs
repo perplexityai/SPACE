@@ -234,3 +234,60 @@ test('a rollback whose view closed says the console stopped following it, and do
   assert.equal(ended.settled, 0);
   assert.equal(ended.shown.at(-1).type, 'info');
 });
+
+// A status request that never answers, as a stalled connection does, until
+// its signal aborts.
+const unanswered = () => {
+  const seen = { reads: 0, signals: [] };
+  seen.read = (signal) => {
+    seen.reads += 1;
+    seen.signals.push(signal);
+    return new Promise((_, reject) => {
+      signal.addEventListener('abort', () => reject(Object.assign(new Error('synthetic abort'), { name: 'AbortError' })));
+    });
+  };
+  return seen;
+};
+
+test('an unanswered status read is given up and cancelled at the deadline', async () => {
+  const status = unanswered();
+  await assert.rejects(
+    pollOperation(status.read, { timeoutMs: 20, intervalMs: 1_000 }),
+    (err) => err instanceof OperationTimeoutError && err.message === 'operation still running',
+  );
+  assert.equal(status.reads, 1);
+  assert.equal(status.signals[0].aborted, true);
+});
+
+test('an unanswered status read is given up and cancelled once its view stops following it', async () => {
+  const status = unanswered();
+  const follower = new AbortController();
+  // No deadline fires during the test: only the abort can settle it.
+  const following = pollOperation(status.read, { timeoutMs: 60_000, intervalMs: 1_000, timer: () => () => {}, signal: follower.signal });
+  await Promise.resolve();
+  assert.equal(status.signals[0].aborted, false);
+  follower.abort();
+  await assert.rejects(following, (err) => err instanceof OperationFollowStoppedError);
+  assert.equal(status.signals[0].aborted, true);
+});
+
+test('a followed rollback whose status read never answers settles when its view closes or at its deadline', async () => {
+  const closedStatus = unanswered();
+  const follower = new AbortController();
+  const closed = followed('op-5', 'checkpoint-5', follower.signal, (signal) =>
+    pollOperation(closedStatus.read, { timeoutMs: 60_000, intervalMs: 1_000, timer: () => () => {}, signal }));
+  follower.abort();
+  await closed.done;
+  assert.equal(closed.settled, 0);
+  assert.equal(closed.shown.at(-1).type, 'info');
+  assert.equal(closedStatus.signals[0].aborted, true);
+
+  const stalledStatus = unanswered();
+  const stalled = followed('op-6', 'checkpoint-6', new AbortController().signal, (signal) =>
+    pollOperation(stalledStatus.read, { timeoutMs: 20, intervalMs: 1_000, signal }));
+  await stalled.done;
+  assert.equal(stalled.settled, 1);
+  assert.equal(stalled.shown.at(-1).type, 'warning');
+  assert.match(stalled.shown.at(-1).text, /is still running \(operation still running\)/);
+  assert.equal(stalledStatus.signals[0].aborted, true);
+});
