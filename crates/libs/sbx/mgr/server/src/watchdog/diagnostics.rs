@@ -17,7 +17,8 @@
 //!   agent RPC points at the agent; `timeout` means the kernel did not answer;
 //! - a resource sample of the VM's jailer cgroup (CPU use and throttling over
 //!   a short window, CPU and memory pressure, memory use, OOM kills), to tell
-//!   a starved or memory-exhausted guest from one that stalled while idle;
+//!   a starved or memory-exhausted guest from one that stalled while idle,
+//!   and the first of its reads that failed;
 //! - when the composed status became `Degraded`, at most once per
 //!   [`CONSOLE_TAIL_MIN_INTERVAL`] per sandbox, bounded tails of the
 //!   Firecracker log and of the guest console file, when one exists.
@@ -69,6 +70,12 @@ const SMALL_FILE_MAX_BYTES: u64 = 16 * 1024;
 /// caps how many such threads collectors can strand.
 const HOST_READS_IN_FLIGHT: usize = admission::EVIDENCE_COLLECTORS;
 const GUEST_CONSOLE_LOG_FILE: &str = "guest-console.log";
+/// Where sandbox-manager sees the node's sandbox cgroup parent,
+/// `/sys/fs/cgroup/space`, when it runs in a container. The container has its
+/// own cgroup namespace, so its `/sys/fs/cgroup` is only the container's
+/// cgroup; the sandbox-manager chart mounts the parent here read-only. A
+/// sandbox-manager on the host reads the parent where it is.
+const SANDBOX_CGROUP_PARENT: &str = "/space/cgroup";
 const MIB: u64 = 1024 * 1024;
 
 /// Correlates a transition line with its evidence line.
@@ -474,9 +481,14 @@ pub(super) struct EvidencePaths {
 }
 
 impl EvidencePaths {
-    fn for_sandbox(sandbox_id: &str) -> Self {
+    /// `cgroup_parent` is where this process sees the node's sandbox cgroup
+    /// parent.
+    fn for_sandbox(cgroup_parent: &Path, sandbox_id: &str) -> Self {
         Self {
-            cgroup: pplx_space_node_runtime_core::cgroup_paths::jailer_cgroup_path(sandbox_id),
+            cgroup: pplx_space_node_runtime_core::cgroup_paths::jailer_cgroup_path_in(
+                cgroup_parent,
+                sandbox_id,
+            ),
             // The launch configures Firecracker's own log inside the jail.
             firecracker_log: paths::jail_root(sandbox_id).join(paths::FIRECRACKER_LOG_FILE),
             // Created only when `SPACE_ENABLE_GUEST_CONSOLE_LOGS` is set, as
@@ -534,21 +546,18 @@ impl HostReads {
         .ok()
     }
 
-    /// A small cgroup or proc file, up to [`SMALL_FILE_MAX_BYTES`]; absent or
-    /// unreadable reads as `None`.
-    async fn small(&self, path: PathBuf) -> Option<String> {
+    /// A small cgroup or proc file, up to [`SMALL_FILE_MAX_BYTES`].
+    async fn small(&self, path: PathBuf) -> std::io::Result<String> {
         self.blocking(move || {
             use std::io::Read as _;
             let mut content = String::new();
-            std::fs::File::open(path)
-                .ok()?
+            std::fs::File::open(path)?
                 .take(SMALL_FILE_MAX_BYTES)
-                .read_to_string(&mut content)
-                .ok()?;
-            Some(content)
+                .read_to_string(&mut content)?;
+            Ok(content)
         })
         .await
-        .flatten()
+        .unwrap_or_else(|| Err(std::io::Error::other("the read did not complete")))
     }
 
     /// The newest lines of a log file within `window`. `None` when the file
@@ -602,8 +611,9 @@ impl EvidenceStage {
 }
 
 /// One sample of the VM's jailer cgroup, which holds only the Firecracker
-/// process and its vCPU threads. Every field is best effort: a missing file
-/// (for example PSI disabled on the host) leaves it unset.
+/// process and its vCPU threads. Every field is best effort: a file that
+/// cannot be read (for example PSI disabled on the host) leaves its fields
+/// unset and is counted in `errors`.
 #[derive(Debug, Default)]
 struct ResourceSample {
     window: Option<Duration>,
@@ -622,6 +632,39 @@ struct ResourceSample {
     /// Times usage hit `memory.max`, and OOM kills, over the cgroup's life.
     memory_max_events: Option<u64>,
     memory_oom_kills: Option<u64>,
+    errors: SampleErrors,
+}
+
+/// The sample's failed reads. When the cgroup is not where it is looked for,
+/// every read fails the same way, so a report carries the first failure once
+/// rather than one per field.
+#[derive(Debug, Default)]
+struct SampleErrors {
+    first: Option<String>,
+    count: u32,
+}
+
+impl SampleErrors {
+    /// Read a small cgroup file, recording a failure.
+    async fn read(&mut self, reads: &HostReads, path: PathBuf) -> Option<String> {
+        match reads.small(path.clone()).await {
+            Ok(content) => Some(content),
+            Err(error) => {
+                self.count += 1;
+                self.first
+                    .get_or_insert_with(|| format!("{}: {error}", path.display()));
+                None
+            }
+        }
+    }
+
+    fn summary(&self) -> Option<String> {
+        let first = self.first.as_deref()?;
+        Some(match self.count {
+            0 | 1 => first.to_string(),
+            count => format!("{first} (and {} more failed reads)", count - 1),
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -631,8 +674,8 @@ struct CpuCounters {
 }
 
 impl CpuCounters {
-    async fn read(reads: &HostReads, cgroup: &Path) -> Self {
-        let content = reads.small(cgroup.join("cpu.stat")).await;
+    async fn read(reads: &HostReads, cgroup: &Path, errors: &mut SampleErrors) -> Self {
+        let content = errors.read(reads, cgroup.join("cpu.stat")).await;
         let content = content.as_deref().unwrap_or_default();
         Self {
             usage_usec: keyed_u64(content, "usage_usec"),
@@ -657,29 +700,33 @@ impl ResourceSample {
     /// arrives so a deadline keeps what was read.
     async fn read_files(&mut self, reads: &HostReads, cgroup: &Path) {
         let mib = |value: String| value.trim().parse::<u64>().ok().map(|bytes| bytes / MIB);
-        self.cpu_max = reads
-            .small(cgroup.join("cpu.max"))
+        let errors = &mut self.errors;
+        self.cpu_max = errors
+            .read(reads, cgroup.join("cpu.max"))
             .await
             .map(|value| value.trim().to_string());
-        if let Some(content) = reads.small(cgroup.join("cpu.pressure")).await {
+        if let Some(content) = errors.read(reads, cgroup.join("cpu.pressure")).await {
             self.cpu_pressure_some_avg10 = psi_average(&content, "some", "avg10");
             self.cpu_pressure_some_avg60 = psi_average(&content, "some", "avg60");
         }
-        self.memory_current_mib = reads
-            .small(cgroup.join("memory.current"))
+        self.memory_current_mib = errors
+            .read(reads, cgroup.join("memory.current"))
             .await
             .and_then(mib);
-        self.memory_anon_mib = reads
-            .small(cgroup.join("memory.stat"))
+        self.memory_anon_mib = errors
+            .read(reads, cgroup.join("memory.stat"))
             .await
             .and_then(|content| keyed_u64(&content, "anon"))
             .map(|bytes| bytes / MIB);
-        self.memory_max_mib = reads.small(cgroup.join("memory.max")).await.and_then(mib);
-        self.memory_pressure_some_avg10 = reads
-            .small(cgroup.join("memory.pressure"))
+        self.memory_max_mib = errors
+            .read(reads, cgroup.join("memory.max"))
+            .await
+            .and_then(mib);
+        self.memory_pressure_some_avg10 = errors
+            .read(reads, cgroup.join("memory.pressure"))
             .await
             .and_then(|content| psi_average(&content, "some", "avg10"));
-        if let Some(content) = reads.small(cgroup.join("memory.events")).await {
+        if let Some(content) = errors.read(reads, cgroup.join("memory.events")).await {
             self.memory_max_events = keyed_u64(&content, "max");
             self.memory_oom_kills = keyed_u64(&content, "oom_kill");
         }
@@ -737,7 +784,7 @@ impl TransitionEvidence {
         reads: &HostReads,
     ) {
         self.stage = EvidenceStage::CpuBefore;
-        let before = CpuCounters::read(reads, &paths.cgroup).await;
+        let before = CpuCounters::read(reads, &paths.cgroup, &mut self.resources.errors).await;
         let window_started = Instant::now();
         self.stage = EvidenceStage::RawVsock;
         let raw_vsock = match target.and_then(|target| target.vsock_uds_path.as_deref()) {
@@ -763,7 +810,7 @@ impl TransitionEvidence {
         self.stage = EvidenceStage::SampleWindow;
         tokio::time::sleep_until((window_started + limits.sample_window).into()).await;
         self.stage = EvidenceStage::CpuAfter;
-        let after = CpuCounters::read(reads, &paths.cgroup).await;
+        let after = CpuCounters::read(reads, &paths.cgroup, &mut self.resources.errors).await;
         self.resources
             .record_cpu_window(before, after, window_started.elapsed());
         self.stage = EvidenceStage::ResourceFiles;
@@ -789,6 +836,7 @@ impl TransitionEvidence {
         let raw = self.raw_vsock.as_ref();
         let resources = &self.resources;
         let tails = self.console_tails.as_ref();
+        let sample_error = resources.errors.summary();
         tracing::info!(
             target: super::LOG_TARGET,
             sandbox_id = %request.sandbox_id,
@@ -813,6 +861,7 @@ impl TransitionEvidence {
             vm_memory_pressure_some_avg10 = resources.memory_pressure_some_avg10,
             vm_memory_max_events = resources.memory_max_events,
             vm_memory_oom_kills = resources.memory_oom_kills,
+            vm_sample_error = sample_error.as_deref(),
             resource_window_ms = resources.window.map(duration_ms),
             console_tails = request.console_tails.as_str(),
             fc_log_tail = tails.and_then(|tails| tails.firecracker_log.as_deref()),
@@ -829,6 +878,7 @@ impl TransitionEvidence {
 pub(super) async fn run_evidence_collector(
     queue: Arc<EvidenceQueue>,
     sidecars: Arc<Mutex<HashMap<String, SidecarInfo>>>,
+    cgroup_parent: Arc<Path>,
     reads: HostReads,
     shutdown_token: CancellationToken,
 ) {
@@ -844,7 +894,7 @@ pub(super) async fn run_evidence_collector(
             .await
             .get(&request.sandbox_id)
             .map(EvidenceTarget::of);
-        let paths = EvidencePaths::for_sandbox(&request.sandbox_id);
+        let paths = EvidencePaths::for_sandbox(&cgroup_parent, &request.sandbox_id);
         let evidence = tokio::select! {
             biased;
             _ = shutdown_token.cancelled() => return,
@@ -869,6 +919,30 @@ pub(super) async fn run_evidence_collector(
 
 pub(super) fn host_reads() -> HostReads {
     HostReads::new(HOST_READS_IN_FLIGHT)
+}
+
+/// Where the collectors find the VMs' jailer cgroups, chosen once when they
+/// start and logged: [`SANDBOX_CGROUP_PARENT`] when the deployment mounts it,
+/// otherwise the host path.
+pub(super) async fn sandbox_cgroup_parent() -> Arc<Path> {
+    let parent = choose_cgroup_parent(Path::new(SANDBOX_CGROUP_PARENT)).await;
+    tracing::info!(
+        target: super::LOG_TARGET,
+        cgroup_parent = %parent.display(),
+        "guest-health evidence samples VM jailer cgroups under this parent"
+    );
+    parent.into()
+}
+
+/// `mounted` when it is a directory, as in a container whose deployment
+/// mounts the node's sandbox cgroup parent there; otherwise the parent's host
+/// path, which a sandbox-manager on the host sees. A container without the
+/// mount then reports the host path's read failures.
+async fn choose_cgroup_parent(mounted: &Path) -> PathBuf {
+    match tokio::fs::metadata(mounted).await {
+        Ok(metadata) if metadata.is_dir() => mounted.to_path_buf(),
+        _ => PathBuf::from(pplx_space_node_runtime_core::cgroup_paths::CGROUP_BASE),
+    }
 }
 
 const FIRECRACKER_LOG_TAIL: TailWindow = TailWindow {

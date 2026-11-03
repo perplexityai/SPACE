@@ -176,6 +176,15 @@ spec:
             - name: space-etc
               mountPath: /space/etc
               readOnly: true
+            # The node's sandbox cgroup parent, whose per-VM jailer cgroups the
+            # watchdog samples for a health transition's evidence
+            # (SANDBOX_CGROUP_PARENT in
+            # crates/libs/sbx/mgr/server/src/watchdog/diagnostics.rs). The
+            # container's own /sys/fs/cgroup is its private cgroup namespace,
+            # which holds only this pod's cgroup.
+            - name: sandbox-cgroups
+              mountPath: /space/cgroup
+              readOnly: true
             {{- include "space-node-service.mount.routeVerification" . | nindent 12 }}
             {{- include "space-node-service.mount.clusterApiToken" . | nindent 12 }}
             {{- include "space-node-service.mount.rpcCa" . | nindent 12 }}
@@ -191,6 +200,13 @@ spec:
           hostPath:
             path: /space/etc
             type: DirectoryOrCreate
+        # Created at boot by space-cgroup.service (the Kind node image orders
+        # it before kubelet); node-manager also requires it. Until it exists,
+        # kubelet retries the mount and the pod waits in ContainerCreating.
+        - name: sandbox-cgroups
+          hostPath:
+            path: /sys/fs/cgroup/space
+            type: Directory
         {{- include "space-node-service.volume.routeVerification" . | nindent 8 }}
         {{- include "space-node-service.volume.clusterApiToken" . | nindent 8 }}
         {{- include "space-node-service.volume.rpcCa" . | nindent 8 }}

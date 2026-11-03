@@ -360,3 +360,173 @@ async fn evidence_deadline_keeps_what_was_collected_and_caps_stuck_host_reads() 
     assert_eq!(complete.stage, EvidenceStage::Done);
     assert_eq!(complete.resources.cpu_pressure_some_avg10, Some(1.5));
 }
+
+/// Write one cgroup's sample files, scaled by `scale` so the VM cgroup, its
+/// sidecar sibling and the parent each read differently.
+fn write_cgroup(dir: &Path, scale: u64) {
+    std::fs::create_dir_all(dir).unwrap();
+    for (file, content) in [
+        (
+            "cpu.stat",
+            format!(
+                "usage_usec {}\nuser_usec 1\nthrottled_usec 0\n",
+                1000 * scale
+            ),
+        ),
+        ("cpu.max", format!("{} 100000\n", 100_000 * scale)),
+        (
+            "cpu.pressure",
+            format!(
+                "some avg10={scale}.25 avg60={scale}.50 avg300=0.00 total=1\n\
+                 full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
+            ),
+        ),
+        ("memory.current", format!("{}\n", 300 * MIB * scale)),
+        (
+            "memory.stat",
+            format!("anon {}\nfile 4096\n", 256 * MIB * scale),
+        ),
+        ("memory.max", format!("{}\n", 1024 * MIB * scale)),
+        (
+            "memory.pressure",
+            format!(
+                "some avg10={scale}.75 avg60=0.00 avg300=0.00 total=1\n\
+                 full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
+            ),
+        ),
+        (
+            "memory.events",
+            format!(
+                "low 0\nhigh 0\nmax {}\noom 1\noom_kill {scale}\n",
+                3 * scale
+            ),
+        ),
+    ] {
+        std::fs::write(dir.join(file), content).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn resource_sample_reads_the_vm_cgroup_under_the_mounted_parent() {
+    // The node's sandbox cgroup parent as sandbox-manager's chart mounts it:
+    // the parent's own files, a sidecar cgroup and the VM's jailer cgroup.
+    let parent = tempfile::tempdir().unwrap();
+    let sandbox_id = pplx_space_common_core::types::SandboxId::new().to_string();
+    write_cgroup(parent.path(), 4);
+    write_cgroup(&parent.path().join(format!("sbx-{sandbox_id}")), 3);
+    let vm_cgroup = parent.path().join(&sandbox_id);
+    write_cgroup(&vm_cgroup, 2);
+    let mut paths = EvidencePaths::for_sandbox(parent.path(), &sandbox_id);
+    paths.firecracker_log = parent.path().join("absent-fc.log");
+    paths.guest_console = parent.path().join("absent-console.log");
+    let limits = EvidenceLimits {
+        deadline: Duration::from_secs(5),
+        raw_vsock_timeout: Duration::from_millis(100),
+        sample_window: Duration::from_millis(20),
+    };
+    let reads = HostReads::new(1);
+    let request = EvidenceRequest {
+        console_tails: ConsoleTails::NotRequested,
+        ..evidence_request(&sandbox_id)
+    };
+    let sample = |evidence: TransitionEvidence| {
+        assert!(!evidence.is_partial());
+        let resources = evidence.resources;
+        (
+            (
+                resources.cpu_util_pct,
+                resources.cpu_max,
+                resources.cpu_pressure_some_avg10,
+                resources.cpu_pressure_some_avg60,
+            ),
+            (
+                resources.memory_current_mib,
+                resources.memory_anon_mib,
+                resources.memory_max_mib,
+                resources.memory_pressure_some_avg10,
+                resources.memory_max_events,
+                resources.memory_oom_kills,
+            ),
+            resources.errors.count,
+            resources.errors.first,
+        )
+    };
+
+    let full = sample(TransitionEvidence::gather(&request, None, &paths, limits, &reads).await);
+    assert_eq!(
+        full,
+        (
+            (
+                Some(0.0),
+                Some("200000 100000".to_string()),
+                Some(2.25),
+                Some(2.5)
+            ),
+            (
+                Some(600),
+                Some(512),
+                Some(2048),
+                Some(2.75),
+                Some(6),
+                Some(2)
+            ),
+            0,
+            None,
+        )
+    );
+
+    // A file that cannot be read leaves only its own fields unset, and is
+    // reported with its path.
+    std::fs::remove_file(vm_cgroup.join("memory.pressure")).unwrap();
+    let (cpu, memory, failed, first) =
+        sample(TransitionEvidence::gather(&request, None, &paths, limits, &reads).await);
+    assert_eq!(
+        (cpu, memory, failed),
+        (
+            full.0,
+            (Some(600), Some(512), Some(2048), None, Some(6), Some(2)),
+            1
+        )
+    );
+    let first = first.expect("the failed read is reported");
+    assert!(
+        first.starts_with(&vm_cgroup.join("memory.pressure").display().to_string()),
+        "{first}"
+    );
+
+    // With no VM cgroup under the parent, every read fails and the report
+    // keeps the first failure once.
+    std::fs::remove_dir_all(&vm_cgroup).unwrap();
+    let (cpu, memory, failed, first) =
+        sample(TransitionEvidence::gather(&request, None, &paths, limits, &reads).await);
+    assert_eq!(
+        (cpu, memory, failed),
+        (
+            (None, None, None, None),
+            (None, None, None, None, None, None),
+            9
+        )
+    );
+    assert!(
+        first
+            .expect("the failed reads are reported")
+            .starts_with(&vm_cgroup.join("cpu.stat").display().to_string())
+    );
+}
+
+#[tokio::test]
+async fn cgroup_parent_is_the_mount_when_present_and_the_host_path_otherwise() {
+    use pplx_space_node_runtime_core::cgroup_paths::{jailer_cgroup_path, jailer_cgroup_path_in};
+
+    let sandbox_id = pplx_space_common_core::types::SandboxId::new().to_string();
+    let mounted = tempfile::tempdir().unwrap();
+    assert_eq!(choose_cgroup_parent(mounted.path()).await, mounted.path());
+
+    // Without the mount, as for a sandbox-manager on the host, the VM cgroup
+    // is the one the node runtime places the VM in.
+    let parent = choose_cgroup_parent(&mounted.path().join("absent")).await;
+    assert_eq!(
+        jailer_cgroup_path_in(&parent, &sandbox_id),
+        jailer_cgroup_path(&sandbox_id)
+    );
+}
