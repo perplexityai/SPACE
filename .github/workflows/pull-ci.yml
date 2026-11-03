@@ -58,6 +58,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       needed: ${{ steps.select.outputs.needed }}
+      console: ${{ steps.select.outputs.console }}
       record: ${{ steps.record.outputs.name }}
     steps:
       - name: Check out SPACE
@@ -76,7 +77,15 @@ jobs:
         run: |
           set -euo pipefail
           needed="$(bash ci/scripts/kind-pull-needed.sh "${PULL_REQUEST_HEAD}")"
-          printf 'needed=%s\n' "${needed}" >>"${GITHUB_OUTPUT}"
+          # The admin console scenarios run only when a console path changes
+          # (ci/kind-console-paths.txt). Such a change needs the Kind smoke as
+          # any Kind path does, deferred on a draft alike.
+          console="$(SPACE_KIND_PULL_PATHS=ci/kind-console-paths.txt \
+            bash ci/scripts/kind-pull-needed.sh "${PULL_REQUEST_HEAD}")"
+          if [[ "${needed}" == false ]]; then
+            needed="${console}"
+          fi
+          printf 'needed=%s\nconsole=%s\n' "${needed}" "${console}" >>"${GITHUB_OUTPUT}"
 
       # Named here, where the synthetic merge is checked out; space-pull-ci
       # records it once every check passed (ci/scripts/pull-ci-reuse.py).
@@ -103,6 +112,8 @@ jobs:
       actions: read
       contents: read
       packages: read
+    with:
+      console_scenarios: ${{ needs.kind_paths.outputs.console == 'true' }}
 
   space-pull-ci:
     if: always() && github.repository == 'perplexityai/SPACE'

@@ -16,6 +16,13 @@ on:
       substrate:
         type: string
         default: kubernetes
+      # true, from pull-ci.yml, when the pull request changes a console path
+      # (ci/kind-console-paths.txt): the typed smoke then runs the admin
+      # console scenarios, which skip, visibly, where Playwright's Chromium
+      # cannot launch. Every other run withholds them, visibly.
+      console_scenarios:
+        type: boolean
+        default: false
 
 # The caller owns permissions: pull-ci.yml grants contents:read and
 # packages:read and actions:read; main-ci.yml grants packages:write to this call.
@@ -278,6 +285,7 @@ jobs:
       # rather than inherited so a default change cannot alter the shards
       # silently.
       SPACE_KIND_TELEMETRY_MODE: otel
+      SPACE_SMOKE_BROWSER_SCENARIOS: ${{ inputs.console_scenarios && 'run' || 'withhold' }}
     runs-on: ubuntu-24.04-16core
     timeout-minutes: 180
     steps:
