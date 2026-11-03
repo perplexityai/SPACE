@@ -205,3 +205,8 @@ pub mod kubernetes;
 
 #[cfg(test)]
 mod runtime_contract_tests;
+
+/// Disposable trial: a public item, so every dependent re-checks. Never merge.
+pub fn trial_combined_ci_marker() -> u32 {
+    7
+}
