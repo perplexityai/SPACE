@@ -32,7 +32,7 @@ jobs:
   rust_artifacts:
     if: github.repository == 'perplexityai/SPACE'
     name: Build shared Kind Rust artifacts
-    runs-on: ubuntu-24.04-16core
+    runs-on: ubuntu-24.04-32core
     timeout-minutes: 60
     steps:
       - name: Check out SPACE
