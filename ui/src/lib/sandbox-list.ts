@@ -320,6 +320,14 @@ export type ListLoad =
   | { kind: 'stopped'; kept: boolean }
   | { kind: 'failed'; scope: ListScope; error: unknown; kept: boolean };
 
+// Whether the older-format notice shows after a load that was not skipped.
+// It follows the list's last outcome: a bare array answering a paged
+// request shows it, and anything else clears it, so a failed request is
+// reported as any failed refresh is.
+export function showsOlderFormat(result: ListLoad): boolean {
+  return result.kind === 'failed' && result.error instanceof OlderFormatAnswer;
+}
+
 // What an answer in `answered` shape to a request in `asked` shape does to
 // the list (`ListSelection.noteAnswer`). `undecided`: it came before the
 // first answer of the list decided its shape, and says nothing.

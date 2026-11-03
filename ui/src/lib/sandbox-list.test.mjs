@@ -26,6 +26,7 @@ import {
   sameScope,
   sandboxListQuery,
   scopeChangePlan,
+  showsOlderFormat,
   splitNodeReported,
   templateFilterOptions,
 } from './sandbox-list.ts';
@@ -523,6 +524,15 @@ test('ten minutes of interleaved old and new answers, half of them old, never st
     }
     assert.ok(answers > 50);
   }
+});
+
+test('the older-format notice follows the list\'s last outcome', async () => {
+  const { selection, pageOne } = await pagedList();
+  assert.equal(showsOlderFormat(await selection.load(pageOne, reads(sampledAnswer).read)), true);
+  // A failed request replaces it, and is reported as any failed refresh is.
+  assert.equal(showsOlderFormat(await selection.load(pageOne, reads(unavailable()).read)), false);
+  assert.equal(showsOlderFormat(await selection.load(pageOne, reads(sampledAnswer).read)), true);
+  assert.equal(showsOlderFormat(await selection.load(pageOne, reads(page('c1')).read)), false);
 });
 
 test('a bare array answering the prefix search counts toward stopping the list', async () => {

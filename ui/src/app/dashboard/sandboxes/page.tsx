@@ -53,6 +53,7 @@ import {
   parseListLink,
   parsePageSize,
   sameScope,
+  showsOlderFormat,
   templateFilterOptions,
   type AgeWindow,
   type CreatedAge,
@@ -793,10 +794,11 @@ function SandboxesPage() {
   // starts the count over; a failed or superseded request neither counts
   // nor starts it over.
   const [listStopped, setListStopped] = useState(false);
-  // The list's last answer was a bare array to a paged request, as during a
+  // The list's last outcome was a bare array to a paged request, as during a
   // rolling deploy; the rows on screen are kept while the list retries. A
-  // failed request leaves it as it was, and the prefix search's answers,
-  // which its section reports, do not change it.
+  // failed request clears it and is reported as any failed refresh is
+  // (`showsOlderFormat`). The prefix search's answers, which its section
+  // reports, do not change it.
   const [olderFormat, setOlderFormat] = useState(false);
   // A full identifier that matches no loaded row is looked up directly, so a
   // sandbox outside the loaded rows can still be found.
@@ -888,8 +890,7 @@ function SandboxesPage() {
     if (result.kind === 'skipped') throw new RefreshSkipped(SCOPE_CHANGED);
     setLoading(false);
     selectionChanged();
-    if (result.kind === 'shown') setOlderFormat(false);
-    else if (result.kind === 'failed' && result.error instanceof OlderFormatAnswer) setOlderFormat(true);
+    setOlderFormat(showsOlderFormat(result));
     if (result.kind === 'stopped') {
       stopList(result.kept);
       throw new ShownListError(VERSION_CHANGED);
