@@ -6,8 +6,22 @@
 # SPACE_KIND_PULL_PATHS. A pull request that changes none of them withholds
 # the scenarios (SPACE_SMOKE_BROWSER_SCENARIOS=withhold), visibly.
 ci/kind-console-paths.txt
+# The console, its image and the chart Kind deploys it with.
 ui/**
 docker/Dockerfile.ui
+infra/space/kind/charts/space-ui-local/**
+# The admin API the console renders, which the scenarios use as the oracle.
 crates/libs/api/src/routes/admin/**
+# The scenarios, their Playwright pin, and the code that drives them: the
+# browser adapter, the runner's browser selection, the operator API the Kind
+# harness exposes, and the fixture and services that wire it.
+pyproject.toml
+uv.lock
 space_smoke/console.py
 space_smoke/scenarios/local_console_*.py
+space_smoke/__main__.py
+space_smoke/registry.py
+space_smoke/services.py
+space_smoke/adapters.py
+space_smoke/capabilities.py
+space_smoke/fixtures.py
