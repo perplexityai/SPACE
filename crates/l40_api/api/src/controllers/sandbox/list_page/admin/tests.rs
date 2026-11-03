@@ -142,11 +142,16 @@ async fn listed_ids(pool: &PgPool, filter: &AdminSandboxFilter) -> TestDbResult<
     Ok(page.rows.iter().map(|sandbox| sandbox.id).collect())
 }
 
-/// The legacy unpaged list's IDs, which run their own statement.
-async fn unpaged_ids(pool: &PgPool, filter: &AdminSandboxFilter) -> TestDbResult<Vec<SandboxId>> {
-    let page = controller(pool)
+/// The legacy unpaged list, which runs its own statement.
+async fn unpaged(pool: &PgPool, filter: &AdminSandboxFilter) -> TestDbResult<ListPage<Sandbox>> {
+    Ok(controller(pool)
         .admin_sandbox_page(pool, filter, None, 100, PageBudget::Unbounded)
-        .await?;
+        .await?)
+}
+
+/// The legacy unpaged list's IDs.
+async fn unpaged_ids(pool: &PgPool, filter: &AdminSandboxFilter) -> TestDbResult<Vec<SandboxId>> {
+    let page = unpaged(pool, filter).await?;
     Ok(page.rows.iter().map(|sandbox| sandbox.id).collect())
 }
 
@@ -645,16 +650,12 @@ async fn the_node_filters_match_the_node_the_response_reports() -> TestDbResult<
             newest_first(&[4, 5]),
         ),
     ];
-    let everything = page(
-        &db.pool,
-        &AdminSandboxFilter {
-            org_id: Some(owner.org_id),
-            ..AdminSandboxFilter::default()
-        },
-        None,
-        100,
-    )
-    .await?;
+    let org = AdminSandboxFilter {
+        org_id: Some(owner.org_id),
+        ..AdminSandboxFilter::default()
+    };
+    let everything = page(&db.pool, &org, None, 100).await?;
+    let everything_unpaged = unpaged(&db.pool, &org).await?;
     for (label, node, expected) in cases {
         let listed = page(&db.pool, &filter(node), None, 100).await?;
         assert_eq!(
@@ -666,17 +667,33 @@ async fn the_node_filters_match_the_node_the_response_reports() -> TestDbResult<
             expected,
             "{label}"
         );
-        if let NodeAssignment::Node(node_id) = node {
-            // The independent oracle: the response's own `active_node_id`.
+
+        // The independent oracle: the response's own `active_node_id`. Each
+        // statement's listed rows report what the filter asks for, and no
+        // other seeded row does.
+        let reports = |sandbox: &Sandbox| match node {
+            NodeAssignment::Node(node_id) => sandbox.active_node_id == Some(node_id),
+            NodeAssignment::Assigned => sandbox.active_node_id.is_some(),
+            NodeAssignment::Unassigned => sandbox.active_node_id.is_none(),
+        };
+        let unpaged_listed = unpaged(&db.pool, &filter(node)).await?;
+        for (statement, listed, everything) in [
+            ("page", &listed, &everything),
+            ("unpaged list", &unpaged_listed, &everything_unpaged),
+        ] {
+            assert!(
+                listed.rows.iter().all(reports),
+                "{label}: every {statement} row's response reports it"
+            );
             let reported = everything
                 .rows
                 .iter()
-                .filter(|sandbox| sandbox.active_node_id == Some(node_id))
+                .filter(|sandbox| reports(sandbox))
                 .map(|sandbox| sandbox.id)
                 .collect::<Vec<_>>();
             assert_eq!(
                 reported, expected,
-                "{label}: the response reports that node"
+                "{label}: the {statement} response reports it of no other row"
             );
         }
 
@@ -694,7 +711,11 @@ async fn the_node_filters_match_the_node_the_response_reports() -> TestDbResult<
         assert_eq!(walked, expected, "{label}: walked a row at a time");
 
         // The unpaged list runs its own statement with the same filters.
-        let unpaged = unpaged_ids(&db.pool, &filter(node)).await?;
+        let unpaged = unpaged_listed
+            .rows
+            .iter()
+            .map(|sandbox| sandbox.id)
+            .collect::<Vec<_>>();
         assert_eq!(unpaged, expected, "{label}: unpaged list");
     }
     // Never NULL, so negated it keeps the sandboxes on no node (4 and 5).
