@@ -40,26 +40,17 @@ import { adminApi } from '@/lib/api';
 import {
   CREATED_AGES,
   FIRST_PAGE,
-  ListRequests,
+  ListSelection,
   PAGE_SIZE_OPTIONS,
-  continuationFor,
   createdAgeMs,
-  listAnswerPlan,
   listRequestQuery,
-  listScope,
   listSections,
   loadedRowFilter,
-  nextCursorFor,
-  nextPage,
   nodeReportedPlacement,
-  pageCursor,
   parseListLink,
   parsePageSize,
-  previousPage,
   sameScope,
-  scopeChangePlan,
   templateFilterOptions,
-  type Continuation,
   type AgeWindow,
   type CreatedAge,
   type ListMode,
@@ -131,9 +122,12 @@ function sandboxesRefreshKey(scope: ListScope): string {
     : `${SANDBOXES_VIEW_REFRESH_KEY}:paged:${scope.key}`;
 }
 
-// A refresh for a page, org, size or filter that is no longer selected: it
-// loaded nothing, and the view's key is not marked fresh.
+// A refresh that loaded nothing, and did not mark the view's key fresh: its
+// page, org, size or filter is no longer selected, or the server answered in
+// the other list shape twice (`ListSelection.load`).
 class RefreshSkipped extends Error {}
+const SCOPE_CHANGED = 'the selected page, filters or size changed';
+const SHAPE_UNSETTLED = 'the API answered with and without paging; the next refresh reads the list again';
 // A load error the page already shows above the table.
 class ShownListError extends Error {}
 const alreadyReported = (err: unknown) => err instanceof RefreshSkipped || err instanceof ShownListError;
@@ -176,7 +170,8 @@ interface FilterInputs {
   user: string | null;
   age: AgeWindow;
   older: OlderThan;
-  // The search box as a server prefix; see `sandboxSearch`.
+  // The search box as a paging server's prefix; see `sandboxSearch`. A
+  // sampled request does not send it.
   prefix: string;
 }
 
@@ -731,17 +726,12 @@ function SandboxesPage() {
   const [olderThan, setOlderThan] = useState<OlderThan>(link.older);
   // The sample size of a server that does not page.
   const [listLimit, setListLimit] = useState(() => parseListLimit(searchParams.get('limit')));
-  const listLimitRef = useRef(listLimit);
   const [pageSize, setPageSize] = useState(link.pageSize);
-  const pageSizeRef = useRef(pageSize);
-  // Paged until a bare array shows the server does not page, and again once
-  // a page shows that it does; see `listAnswerPlan`.
+  // The list shape and page position of the rows on screen. Requests read
+  // the selection's (`selection` below), which a load switches to the other
+  // shape before its rows arrive; see `listAnswerPlan`.
   const [listMode, setListMode] = useState<ListMode>('paged');
-  const listModeRef = useRef<ListMode>('paged');
   const [position, setPosition] = useState<PagePosition>(FIRST_PAGE);
-  const positionRef = useRef<PagePosition>(FIRST_PAGE);
-  // The next page's cursor, tied to the scope of the page that returned it.
-  const [continuation, setContinuation] = useState<Continuation | null>(null);
   // Bumped after every list load, so a direct lookup refreshes with the list.
   const [listGeneration, setListGeneration] = useState(0);
   // Applied by the admin API (`org_id`) on either list shape.
@@ -752,33 +742,31 @@ function SandboxesPage() {
   // What the search box does on this list's shape: a direct lookup, a prefix
   // the server matches, or a match within the loaded rows.
   const search = useMemo(() => sandboxSearch(idFilter, listMode), [idFilter, listMode]);
+  // The filters are those of a paged request whatever the shape on screen,
+  // so a load that switches to paging sends the search as well.
+  const pagedSearch = useMemo(() => sandboxSearch(idFilter, 'paged'), [idFilter]);
   const filterInputs: FilterInputs = {
     org: orgFilter,
-    statuses: statusSplit.applied,
+    statuses: splitStatusFilter(true, statusFilter).applied,
     template: templateFilter,
     user: userFilter,
     age: ageWindow,
     older: olderThan,
-    prefix: search.kind === 'prefix' ? search.prefix : '',
+    prefix: pagedSearch.kind === 'prefix' ? pagedSearch.prefix : '',
   };
   const filterInputsKey = JSON.stringify(filterInputs);
-  // The filters every request sends until a filter changes. The creation-time
-  // bounds stay relative ("the last hour") and are computed as each request
-  // is sent, so a refresh an hour later still shows the last hour.
-  const [initialFilters] = useState(() => serverFilters(filterInputs));
-  const serverFiltersRef = useRef<SandboxListFilters>(initialFilters);
   const appliedInputsRef = useRef({ key: filterInputsKey, prefix: filterInputs.prefix });
-  // Every list request takes a ticket with its scope; a change of scope
-  // invalidates every outstanding one. Only an answer whose ticket is the
-  // newest and whose scope is still selected applies its rows, its error and
-  // the end of `loading`; see `ListRequests`.
-  const requestsRef = useRef(new ListRequests());
-  // The selected scope, for rendering; the refs above are what requests read.
-  const [selectedScope, setSelectedScope] = useState<ListScope>(() =>
-    listScope('paged', initialFilters, { limit: pageSize, cursor: '' }));
-  // The scope of the rows on screen, and the error of a load of another scope
-  // that failed (its rows are cleared rather than shown under the new label).
-  const shownScopeRef = useRef<ListScope | null>(null);
+  // The selected scope, the rows' scope and the next page's cursor, and the
+  // loads in flight; see `ListSelection`. The filters change only once a
+  // filter does. The creation-time bounds stay relative ("the last hour")
+  // and are computed as each request is sent, so a refresh an hour later
+  // still shows the last hour.
+  const [selection] = useState(() => new ListSelection({ filters: serverFilters(filterInputs), pageSize, sampleSize: listLimit }));
+  // The selected scope and the next page's cursor, for rendering.
+  const [selectedScope, setSelectedScope] = useState<ListScope>(() => selection.selected);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  // The error of the last load; a load of another scope that failed clears
+  // the rows rather than show them under the new label.
   const [listError, setListError] = useState<string | null>(null);
   // A full identifier that matches no loaded row is looked up directly, so a
   // sandbox outside the loaded rows can still be found.
@@ -830,72 +818,39 @@ function SandboxesPage() {
     return secs;
   };
 
-  const currentScope = (): ListScope => {
-    const mode = listModeRef.current;
-    const filters = serverFiltersRef.current;
-    const limit = mode === 'paged' ? pageSizeRef.current : listLimitRef.current;
-    return listScope(mode, filters, { limit, cursor: pageCursor(positionRef.current) });
-  };
-
-  // Called after any ref above that makes up the scope changes.
-  const scopeChanged = () => {
-    requestsRef.current.invalidate();
-    setSelectedScope(currentScope());
+  // After the selection changes, for rendering.
+  const selectionChanged = () => {
+    setSelectedScope(selection.selected);
+    setNextCursor(selection.nextCursor());
   };
 
   const refresh = async ({
     showLoading = true,
-    reconcile = false,
-    scope = currentScope(),
+    scope = selection.selected,
   }: { showLoading?: boolean; reconcile?: boolean; scope?: ListScope } = {}) => {
     // A poll or Refresh captures its scope before its lock callback runs; if
     // the selection changed meanwhile, it must not invalidate the load for
     // the new selection.
-    const skipped = () => new RefreshSkipped('the selected page, filters or size changed');
-    if (!sameScope(currentScope(), scope)) throw skipped();
-    const ticket = requestsRef.current.begin(scope);
-    const applies = () => requestsRef.current.applies(ticket, currentScope());
+    if (!sameScope(selection.selected, scope)) throw new RefreshSkipped(SCOPE_CHANGED);
     if (showLoading) setLoading(true);
-    let reread = false;
-    try {
-      const response = await getConsoleSandboxList(listRequestQuery(scope, Date.now()));
-      // An answer for a scope no longer selected, even one selected again
-      // since, is dropped.
-      if (!applies()) throw skipped();
-      // A sampled request also probes for paging; see `listAnswerPlan`.
-      const plan = listAnswerPlan(scope.mode, response);
-      if (plan.mode !== listModeRef.current) {
-        listModeRef.current = plan.mode;
-        setListMode(plan.mode);
-        positionRef.current = FIRST_PAGE;
-        setPosition(FIRST_PAGE);
-        scopeChanged();
-      }
-      reread = plan.reread;
-      if (!reread) {
-        const data = response.sandboxes;
-        // A page keeps the server's order, newest first, so that the pages
-        // join up; a sample is sorted as it was before paging.
-        if (response.mode === 'sampled') {
-          data.sort((a, b) => parseUptime(b.uptime) - parseUptime(a.uptime) || a.id.localeCompare(b.id));
-        }
-        setSandboxes(data);
-        setContinuation(continuationFor(scope, response.mode === 'paged' ? response.nextCursor : null));
-        shownScopeRef.current = scope;
-        setListError(null);
-        setListGeneration((n) => n + 1);
-        markViewRefreshed(sandboxesRefreshKey(scope));
-      }
-    } catch (err: any) {
-      if (err instanceof RefreshSkipped || !applies()) throw skipped();
-      // Next continues from the page shown, not from the one that failed.
-      setContinuation(null);
-      const text = err.message || 'failed to refresh sandboxes';
-      if (!sameScope(shownScopeRef.current, scope)) {
+    // A sampled request also probes for paging; see `listAnswerPlan`.
+    const result = await selection.load(scope, (sent) => getConsoleSandboxList(listRequestQuery(sent, Date.now())));
+    // Only a load that applies ends `loading`, whichever request started it;
+    // a change of scope that keeps the rows on screen ends it itself.
+    if (result.kind === 'skipped') throw new RefreshSkipped(SCOPE_CHANGED);
+    setLoading(false);
+    if (result.kind === 'settled') throw new RefreshSkipped(SHAPE_UNSETTLED);
+    selectionChanged();
+    // The shape and the page position on screen change with the rows.
+    setListMode(result.scope.mode);
+    setPosition(selection.position);
+    if (result.kind === 'failed') {
+      const err = result.error as { message?: string } | null;
+      const text = err?.message || 'failed to refresh sandboxes';
+      if (!result.kept) {
         // The rows on screen belong to another org or size; do not show them
         // under this one's label.
         setSandboxes([]);
-        shownScopeRef.current = null;
         setListError(text);
         // A failure all the same: the key stays stale, and the alert, not a
         // toast, reports it.
@@ -903,12 +858,17 @@ function SandboxesPage() {
       }
       // Keep the last rendered view when a node-local manager is briefly unavailable.
       throw new Error(text);
-    } finally {
-      // Only an answer that applies ends `loading`, whichever request started
-      // it; a change of scope that keeps the rows on screen ends it itself.
-      if (applies() && !reread) setLoading(false);
     }
-    if (reread) await refresh({ showLoading, reconcile, scope: currentScope() });
+    const data = result.response.sandboxes;
+    // A page keeps the server's order, newest first, so that the pages join
+    // up; a sample is sorted as it was before paging.
+    if (result.response.mode === 'sampled') {
+      data.sort((a, b) => parseUptime(b.uptime) - parseUptime(a.uptime) || a.id.localeCompare(b.id));
+    }
+    setSandboxes(data);
+    setListError(null);
+    setListGeneration((n) => n + 1);
+    markViewRefreshed(sandboxesRefreshKey(result.scope));
   };
 
   const refreshAndReport = () => {
@@ -924,7 +884,7 @@ function SandboxesPage() {
     if (document.hidden) {
       return;
     }
-    const scope = currentScope();
+    const scope = selection.selected;
     void runLockedViewRefresh(
       sandboxesRefreshKey(scope),
       () => refresh({ showLoading: false, scope }),
@@ -974,7 +934,7 @@ function SandboxesPage() {
     if (refreshCooldownRef.current || manualRefreshing) return;
     startRefreshCooldown();
     setManualRefreshing(true);
-    const scope = currentScope();
+    const scope = selection.selected;
     void runLockedViewRefresh(
       sandboxesRefreshKey(scope),
       () => refresh({ showLoading: false, reconcile: true, scope }),
@@ -986,7 +946,7 @@ function SandboxesPage() {
       }
       message.success('Sandboxes refreshed');
     }).catch((err: any) => {
-      if (err instanceof RefreshSkipped) message.info('Refresh skipped: the selected page, filters or size changed');
+      if (err instanceof RefreshSkipped) message.info(`Refresh skipped: ${err.message}`);
       else if (!(err instanceof ShownListError)) message.error(err.message);
     }).finally(() => {
       setManualRefreshing(false);
@@ -1220,22 +1180,22 @@ function SandboxesPage() {
   // first page, and reloads when the request it makes has changed: on a
   // sampled list only the org and the sample size reach the server. Typing in
   // the search box waits for a pause.
+  const appliedSizesRef = useRef({ pageSize, listLimit });
   useEffect(() => {
-    if (appliedInputsRef.current.key === filterInputsKey && pageSizeRef.current === pageSize && listLimitRef.current === listLimit) {
+    if (appliedInputsRef.current.key === filterInputsKey && appliedSizesRef.current.pageSize === pageSize && appliedSizesRef.current.listLimit === listLimit) {
       return;
     }
     const delay = appliedInputsRef.current.prefix !== filterInputs.prefix ? 300 : 0;
     const timer = setTimeout(() => {
       appliedInputsRef.current = { key: filterInputsKey, prefix: filterInputs.prefix };
-      serverFiltersRef.current = serverFilters(filterInputs);
-      pageSizeRef.current = pageSize;
-      listLimitRef.current = listLimit;
-      positionRef.current = FIRST_PAGE;
-      setPosition(FIRST_PAGE);
-      scopeChanged();
+      appliedSizesRef.current = { pageSize, listLimit };
+      const plan = selection.select({ filters: serverFilters(filterInputs), pageSize, sampleSize: listLimit });
+      if (plan === 'unchanged') return;
+      setPosition(selection.position);
+      selectionChanged();
       // A change undone before its answer arrived: that answer is dropped and
       // the rows on screen are the selected scope's already.
-      if (scopeChangePlan(shownScopeRef.current, currentScope()) === 'keep') {
+      if (plan === 'keep') {
         setLoading(false);
         return;
       }
@@ -1247,10 +1207,9 @@ function SandboxesPage() {
   }, [filterInputsKey, pageSize, listLimit]);
 
   const goToPage = (next: PagePosition | null) => {
-    if (!next) return;
-    positionRef.current = next;
-    setPosition(next);
-    scopeChanged();
+    if (!selection.goTo(next)) return;
+    setPosition(selection.position);
+    selectionChanged();
     setListError(null);
     refreshAndReport();
   };
@@ -1857,7 +1816,7 @@ function SandboxesPage() {
             size="small"
             icon={<LeftOutlined />}
             disabled={loading || position.index === 0}
-            onClick={() => goToPage(previousPage(positionRef.current))}
+            onClick={() => goToPage(selection.previousPosition())}
           >
             Previous
           </Button>
@@ -1865,8 +1824,8 @@ function SandboxesPage() {
             size="small"
             icon={<RightOutlined />}
             iconPlacement="end"
-            disabled={loading || !nextCursorFor(continuation, selectedScope)}
-            onClick={() => goToPage(nextPage(positionRef.current, nextCursorFor(continuation, currentScope())))}
+            disabled={loading || !nextCursor}
+            onClick={() => goToPage(selection.nextPosition())}
           >
             Next
           </Button>

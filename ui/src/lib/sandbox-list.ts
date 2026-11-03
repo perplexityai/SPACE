@@ -182,7 +182,8 @@ export function loadedRowFilter<T extends LoadedRow>(mode: ListMode, criteria: L
 // console switches to sampling and reads the sample. A page answering a
 // sampled request means it pages now: the console switches back and reads
 // the first page with the filters it did not send. Either way the answer
-// was asked for in the other shape and is not shown.
+// was asked for in the other shape and is not shown. `ListSelection.load`
+// rereads at most once per load.
 export function listAnswerPlan(
   sent: ListMode,
   response: SandboxListResponse,
@@ -279,6 +280,128 @@ export function continuationFor(answered: ListScope, nextCursor: string | null):
 
 export function nextCursorFor(continuation: Continuation | null, selected: ListScope): string | null {
   return continuation && continuation.scopeKey === selected.key ? continuation.cursor : null;
+}
+
+// The outcome of `ListSelection.load`.
+// - `shown`: the answer is the selected scope's, in the shape asked for.
+// - `skipped`: the selection changed while it was in flight, or a newer load
+//   started; nothing is shown and `loading` is left to that load.
+// - `settled`: the answer was in the other shape twice, as when requests
+//   alternate between servers with and without paging during a rolling
+//   deploy. Two switches lead back to the shape the load started in, so the
+//   selection is left as the load found it and nothing is shown; the next
+//   load reads it again.
+// - `failed`: the request failed. `kept` says whether the rows on screen are
+//   the failed scope's; when they are not they must be cleared rather than
+//   shown under its label.
+export type ListLoad =
+  | { kind: 'shown'; scope: ListScope; response: SandboxListResponse }
+  | { kind: 'skipped' }
+  | { kind: 'settled' }
+  | { kind: 'failed'; scope: ListScope; error: unknown; kept: boolean };
+
+// The sandbox list's selection and its loads. The list shape, the filters,
+// the page and sample sizes and the page position make up the selected
+// scope; `shown` is the scope of the rows on screen, and the continuation
+// is the cursor of the page after it.
+export class ListSelection {
+  mode: ListMode = 'paged';
+  position: PagePosition = FIRST_PAGE;
+  shown: ListScope | null = null;
+  private filters: SandboxListFilters;
+  private pageSize: number;
+  private sampleSize: number;
+  private continuation: Continuation | null = null;
+  private readonly requests = new ListRequests();
+
+  constructor({ filters, pageSize, sampleSize }: { filters: SandboxListFilters; pageSize: number; sampleSize: number }) {
+    this.filters = filters;
+    this.pageSize = pageSize;
+    this.sampleSize = sampleSize;
+  }
+
+  get selected(): ListScope {
+    const limit = this.mode === 'paged' ? this.pageSize : this.sampleSize;
+    return listScope(this.mode, this.filters, { limit, cursor: pageCursor(this.position) });
+  }
+
+  // A change of the filters or sizes. One the selected request does not
+  // send (a sampled list sends only the org and the sample size) changes
+  // nothing. Any other restarts at the first page and invalidates the loads
+  // in flight; the rows on screen are kept when they are the new scope's (a
+  // change undone before its answer arrived), and otherwise it is loaded.
+  select(next: { filters: SandboxListFilters; pageSize: number; sampleSize: number }): 'unchanged' | 'keep' | 'load' {
+    const before = this.selected;
+    this.filters = next.filters;
+    this.pageSize = next.pageSize;
+    this.sampleSize = next.sampleSize;
+    if (sameScope(before, this.selected)) return 'unchanged';
+    this.position = FIRST_PAGE;
+    this.requests.invalidate();
+    return scopeChangePlan(this.shown, this.selected);
+  }
+
+  // Previous or Next; the caller loads the page.
+  goTo(position: PagePosition | null): boolean {
+    if (!position) return false;
+    this.position = position;
+    this.requests.invalidate();
+    return true;
+  }
+
+  previousPosition(): PagePosition | null {
+    return previousPage(this.position);
+  }
+
+  nextCursor(): string | null {
+    return nextCursorFor(this.continuation, this.selected);
+  }
+
+  nextPosition(): PagePosition | null {
+    return nextPage(this.position, this.nextCursor());
+  }
+
+  // Load `scope` with `read`. A load whose scope is no longer selected when
+  // it starts or answers is skipped. An answer in the other list shape
+  // switches the shape and rereads the selected scope in it, with every
+  // filter that shape sends, once; a second answer in the other shape
+  // settles the load (see `ListLoad`).
+  async load(scope: ListScope, read: (scope: ListScope) => Promise<SandboxListResponse>): Promise<ListLoad> {
+    if (!sameScope(this.selected, scope)) return { kind: 'skipped' };
+    const start = this.position;
+    let ticket = this.requests.begin(scope);
+    let switched = false;
+    for (;;) {
+      let response: SandboxListResponse;
+      try {
+        response = await read(ticket.scope);
+      } catch (error) {
+        if (!this.requests.applies(ticket, this.selected)) return { kind: 'skipped' };
+        // Next continues from a page that answered, not from one that failed.
+        this.continuation = null;
+        const kept = sameScope(this.shown, ticket.scope);
+        if (!kept) this.shown = null;
+        return { kind: 'failed', scope: ticket.scope, error, kept };
+      }
+      if (!this.requests.applies(ticket, this.selected)) return { kind: 'skipped' };
+      const plan = listAnswerPlan(ticket.scope.mode, response);
+      if (!plan.reread) {
+        this.shown = ticket.scope;
+        this.continuation = continuationFor(ticket.scope, response.mode === 'paged' ? response.nextCursor : null);
+        return { kind: 'shown', scope: ticket.scope, response };
+      }
+      this.requests.invalidate();
+      if (switched) {
+        this.mode = scope.mode;
+        this.position = start;
+        return { kind: 'settled' };
+      }
+      this.mode = plan.mode;
+      this.position = FIRST_PAGE;
+      switched = true;
+      ticket = this.requests.begin(this.selected);
+    }
+  }
 }
 
 // A template name as the server parses one (`TemplateName` in

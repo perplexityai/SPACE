@@ -3,6 +3,7 @@ import { mock, test } from 'node:test';
 import {
   FIRST_PAGE,
   ListRequests,
+  ListSelection,
   isTemplateName,
   NO_FILTERS,
   continuationFor,
@@ -242,14 +243,151 @@ test('Next takes the cursor only while the page that returned it is selected', (
   // does not lead anywhere from it.
   const page2 = scopeOf({ template: 'alpha' }, 'c1');
   assert.equal(nextCursorFor(fromPage1, page2), null);
-  // Page 2 failed: the console clears the continuation, and Next stays off
-  // until a page answers.
-  assert.equal(nextCursorFor(null, page2), null);
+  // A failed load is in 'Next follows the page shown, ...' below.
   assert.equal(nextCursorFor(continuationFor(page2, 'c2'), page2), 'c2');
   // Another filter on the same page position is another scope.
   assert.equal(nextCursorFor(fromPage1, scopeOf({ template: 'beta' })), null);
   // The last page has no continuation.
   assert.equal(continuationFor(page2, null), null);
+});
+
+// A list read that answers `answers` in turn, and records the scopes sent.
+// An Error answer is thrown; a request past the last answer fails the test.
+function reads(...answers) {
+  const sent = [];
+  const read = async (scope) => {
+    sent.push(scope);
+    if (!answers.length) throw new Error(`unexpected request ${sent.length}`);
+    const answer = answers.shift();
+    if (answer instanceof Error) throw answer;
+    return answer;
+  };
+  return { sent, read };
+}
+
+// A read that answers when `answer` is called.
+function pendingRead() {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  return { read: () => promise, answer: (value) => resolve(value) };
+}
+
+const page = (nextCursor, rows = [sandbox]) => ({ mode: 'paged', sandboxes: rows, nextCursor });
+const newSelection = (filters = {}) =>
+  new ListSelection({ filters: { ...NO_FILTERS, ...filters }, pageSize: 50, sampleSize: 1000 });
+
+test('Next follows the page shown, and a failed load leaves it off until a page answers', async () => {
+  const selection = newSelection({ template: 'alpha' });
+  assert.equal((await selection.load(selection.selected, reads(page('c1')).read)).kind, 'shown');
+  assert.equal(selection.nextCursor(), 'c1');
+  // Next selects page 2, and page 1's cursor does not lead on from it.
+  assert.equal(selection.goTo(selection.nextPosition()), true);
+  assert.equal(selection.selected.cursor, 'c1');
+  assert.equal(selection.nextCursor(), null);
+  // Page 2 fails. The rows on screen are page 1's, so they are cleared, and
+  // Next stays off.
+  const failed = await selection.load(selection.selected, reads(new Error('unavailable')).read);
+  assert.equal(failed.kind, 'failed');
+  assert.equal(failed.kept, false);
+  assert.equal(selection.shown, null);
+  assert.equal(selection.nextPosition(), null);
+  // The retry answers, with a page after it.
+  assert.equal((await selection.load(selection.selected, reads(page('c2')).read)).kind, 'shown');
+  assert.equal(selection.nextCursor(), 'c2');
+  // A refresh of page 2 fails: its rows stay on screen, and Next is off
+  // until a page answers again.
+  const refreshFailed = await selection.load(selection.selected, reads(new Error('unavailable')).read);
+  assert.equal(refreshFailed.kind, 'failed');
+  assert.equal(refreshFailed.kept, true);
+  assert.equal(selection.nextCursor(), null);
+  assert.equal(selection.nextPosition(), null);
+  // Previous goes back by the visited cursor.
+  assert.equal(selection.goTo(selection.previousPosition()), true);
+  assert.equal(selection.selected.cursor, '');
+  assert.equal(selection.goTo(selection.previousPosition()), false);
+});
+
+test('an answer begun before Previous or Next is dropped, even when its page is selected again', async () => {
+  const selection = newSelection();
+  await selection.load(selection.selected, reads(page('c1')).read);
+  selection.goTo(selection.nextPosition());
+  const pageTwo = selection.selected;
+  const slow = pendingRead();
+  const inFlight = selection.load(pageTwo, slow.read);
+  // Previous, then page 2 again, before page 2 answered.
+  selection.goTo(selection.previousPosition());
+  selection.goTo({ cursors: ['', 'c1'], index: 1 });
+  assert.equal(sameScope(selection.selected, pageTwo), true);
+  slow.answer(page(null));
+  assert.deepEqual(await inFlight, { kind: 'skipped' });
+  // A load the selection moved away from before it started is skipped too.
+  selection.goTo(selection.previousPosition());
+  assert.deepEqual(await selection.load(pageTwo, reads().read), { kind: 'skipped' });
+});
+
+test('a filter undone before its answer arrived keeps the rows on screen and drops the answer', async () => {
+  const selection = newSelection({ template: 'alpha' });
+  await selection.load(selection.selected, reads(page(null)).read);
+  const sizes = { pageSize: 50, sampleSize: 1000 };
+  assert.equal(selection.select({ filters: { ...NO_FILTERS, template: 'beta' }, ...sizes }), 'load');
+  const slow = pendingRead();
+  const forBeta = selection.load(selection.selected, slow.read);
+  assert.equal(selection.select({ filters: { ...NO_FILTERS, template: 'alpha' }, ...sizes }), 'keep');
+  // Beta again, before its first answer arrived: that answer was sent
+  // before the change and is dropped.
+  assert.equal(selection.select({ filters: { ...NO_FILTERS, template: 'beta' }, ...sizes }), 'load');
+  slow.answer(page(null));
+  assert.deepEqual(await forBeta, { kind: 'skipped' });
+  // A change the request does not carry changes nothing.
+  assert.equal(selection.select({ filters: { ...NO_FILTERS, template: 'beta' }, ...sizes, sampleSize: 100 }), 'unchanged');
+});
+
+test('answers that alternate between list shapes reread once per load, then settle', async () => {
+  // A rolling deploy: requests alternate between a server without paging
+  // and one with it, so each answer is in the other shape from the request.
+  let requests = 0;
+  const alternating = async () => {
+    requests += 1;
+    if (requests > 8) throw new Error('unbounded rereads');
+    return requests % 2 === 1 ? sampledAnswer : page(null);
+  };
+  const selection = newSelection();
+  await selection.load(selection.selected, reads(page('c1')).read);
+  selection.goTo(selection.nextPosition());
+  await selection.load(selection.selected, reads(page('c2')).read);
+  const pageTwo = selection.selected;
+  for (const load of [1, 2, 3]) {
+    // The page asked for, answered by a bare array, then the sample, answered
+    // by a page: two requests, and nothing shown.
+    assert.deepEqual(await selection.load(selection.selected, alternating), { kind: 'settled' }, `load ${load}`);
+    assert.equal(requests, 2 * load);
+    // The selection is page 2 again, with its rows and its Next.
+    assert.equal(sameScope(selection.selected, pageTwo), true);
+    assert.equal(sameScope(selection.shown, pageTwo), true);
+    assert.equal(selection.nextCursor(), 'c2');
+  }
+});
+
+test('a sampled tab that reaches a paging server rereads the first page with every filter', async () => {
+  const filters = { template: 'alpha', userId: '0193a000-0000-7000-8000-000000000002', prefix: 'build' };
+  const selection = newSelection(filters);
+  // The first load reaches a server without paging, and reads the sample.
+  const first = reads(sampledAnswer, { mode: 'sampled', sandboxes: [sandbox] });
+  assert.equal((await selection.load(selection.selected, first.read)).kind, 'shown');
+  assert.deepEqual(first.sent.map((scope) => scope.mode), ['paged', 'sampled']);
+  assert.equal(selection.mode, 'sampled');
+  // A later refresh reaches one that pages: its answer, a page of the
+  // unfiltered list at the sample size, is not shown, and the first page is
+  // read with the page size and every filter.
+  const second = reads(page('s1'), page('c1'));
+  const result = await selection.load(selection.selected, second.read);
+  assert.equal(result.kind, 'shown');
+  assert.equal(result.scope.mode, 'paged');
+  const sent = new URLSearchParams(listRequestQuery(second.sent[1], 0));
+  assert.deepEqual(Object.fromEntries(sent), {
+    limit: '50', cursor: '', template: 'alpha', user_id: filters.userId, prefix: 'build',
+  });
+  assert.equal(selection.nextCursor(), 'c1');
 });
 
 test('a full ID shows the row it finds in the main table, whatever its kind', () => {
