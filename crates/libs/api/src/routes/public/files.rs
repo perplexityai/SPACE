@@ -12,9 +12,7 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures_util::{StreamExt, stream};
 use pplx_space_common_core::spaced::{MAX_MESSAGE_BYTES, MAX_WRITE_BATCH_ENTRIES};
-use pplx_space_common_core::types::{
-    GuestUserName, IdempotencyKey, validate_linux_guest_path_input,
-};
+use pplx_space_common_core::types::{GuestUserName, IdempotencyKey, validate_guest_path_input};
 use pplx_space_metrics::response::{ResponseKind, ResponseOrigin};
 use pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity;
 use pplx_space_public_api::routes::{
@@ -677,7 +675,7 @@ async fn ensure_sandbox_owner(
 }
 
 fn parse_guest_path(path: String) -> Result<String, PublicApiError> {
-    validate_linux_guest_path_input(&path)
+    validate_guest_path_input(&path)
         .map_err(|error| PublicApiError::bad_request(error.to_string()))?;
     Ok(path)
 }
@@ -1024,17 +1022,32 @@ fn unprotected_mutation_error(error: ControllerError) -> PublicApiError {
 }
 
 fn public_file_info(info: SpacedFileInfo) -> FileInfo {
+    let posix = info.windows_metadata.is_none();
     FileInfo {
         path: info.path.clone(),
-        name: info
-            .name
-            .unwrap_or_else(|| path_basename(&info.path).to_string()),
+        name: info.name.unwrap_or_else(|| {
+            if posix {
+                path_basename(&info.path).to_string()
+            } else {
+                info.path
+                    .rsplit(['/', '\\'])
+                    .find(|s| !s.is_empty())
+                    .unwrap_or(&info.path)
+                    .to_owned()
+            }
+        }),
         file_type: public_file_type(info.file_type),
         size_bytes: info.size_bytes,
-        mode: info.mode,
+        mode: posix.then_some(info.mode),
         modified_at: info.modified_at.and_then(timestamp_to_rfc3339),
-        owner_uid: info.owner_uid,
-        owner_gid: info.owner_gid,
+        owner_uid: posix.then_some(info.owner_uid),
+        owner_gid: posix.then_some(info.owner_gid),
+        windows_metadata: info.windows_metadata.map(|m| {
+            pplx_space_public_api::WindowsFileMetadata {
+                owner_sid: m.owner_sid,
+                attributes: m.attributes,
+            }
+        }),
         symlink_target: info.symlink_target,
         link_count: info.link_count,
     }

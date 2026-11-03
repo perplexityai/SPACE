@@ -70,12 +70,12 @@ fn e2b_paths_pass_valid_wire_paths_through() {
 }
 
 #[test]
-fn e2b_paths_reject_control_and_windows_paths() {
+fn e2b_paths_validate_transport_shape_before_guest_platform_checks() {
     e2b_request_root("/tmp/\nfile", None).unwrap_err();
-    e2b_request_root("C:\\Users\\user\\file.txt", None).unwrap_err();
-    e2b_request_root("C:/Users/user/file.txt", None).unwrap_err();
-    e2b_request_root("\\\\server\\share\\file.txt", None).unwrap_err();
-    e2b_request_root("//server/share/file.txt", None).unwrap_err();
+    e2b_request_root("C:\\Users\\user\\file.txt", None).unwrap();
+    e2b_request_root("C:/Users/user/file.txt", None).unwrap();
+    e2b_request_root("\\\\server\\share\\file.txt", None).unwrap();
+    e2b_request_root("//server/share/file.txt", None).unwrap();
 }
 
 #[tokio::test]
@@ -1066,15 +1066,8 @@ async fn write_completes_when_the_spool_was_read_to_the_end() {
 #[tokio::test]
 async fn invalid_multipart_filename_is_rejected_before_spooling() {
     let dir = tempfile::tempdir().unwrap();
-    // Both pass multipart header parsing and fail only guest-path validation:
-    // a tab is a control character httparse allows in header values.
-    for (filename, message) in [
-        (
-            "C:\\Users\\a.txt",
-            "windows-style guest paths are not supported for linux sandboxes",
-        ),
-        ("a\tb.txt", "guest path must be bounded and control-free"),
-    ] {
+    // A tab passes multipart header parsing but fails guest-path validation.
+    for (filename, message) in [("a\tb.txt", "guest path must be bounded and control-free")] {
         let body = multipart_body(&[("file", Some(filename), b"content")]);
         let mut spool = SpoolFiles::in_dir(dir.path().to_path_buf());
         let error = spool_multipart_uploads(Body::from(body), MULTIPART_BOUNDARY, true, &mut spool)
@@ -1201,4 +1194,20 @@ async fn watch_stream_ends_unavailable_when_the_drain_deadline_passes() {
     assert!(stream.next().await.is_none());
     drop(stream);
     assert_eq!(limiter.active_total(), 0);
+}
+
+#[test]
+fn windows_metadata_is_not_reported_as_posix_mode() {
+    let entry = file_info_to_connect_entry(SpacedFileInfo {
+        path: r"C:\Users\user\note.txt".into(),
+        windows_metadata: Some(spaced_ops::WindowsFileMetadata {
+            owner_sid: None,
+            attributes: 32,
+        }),
+        ..Default::default()
+    });
+    let value = serde_json::to_value(entry).unwrap();
+    assert_eq!(value["name"], "note.txt");
+    assert!(value.get("mode").is_none());
+    assert!(value.get("windowsMetadata").is_none());
 }

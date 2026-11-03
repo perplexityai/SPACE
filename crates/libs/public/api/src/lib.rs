@@ -1921,10 +1921,28 @@ pub struct FileInfo {
     pub name: String,
     pub file_type: FileType,
     pub size_bytes: u64,
-    pub mode: u32,
+    /// POSIX permissions; absent for Windows files.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub mode: Option<u32>,
     pub modified_at: Option<String>,
-    pub owner_uid: u32,
-    pub owner_gid: u32,
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub owner_uid: Option<u32>,
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub owner_gid: Option<u32>,
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub windows_metadata: Option<WindowsFileMetadata>,
     pub symlink_target: Option<String>,
     /// Hard links to this inode. `Some(1)` for an ordinary file.
     ///
@@ -1939,6 +1957,13 @@ pub struct FileInfo {
     /// an ordinary file. Such a caller must reject it.
     #[cfg_attr(feature = "serde", serde(default))]
     pub link_count: Option<u64>,
+}
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WindowsFileMetadata {
+    pub owner_sid: Option<String>,
+    /// Raw Windows FILE_ATTRIBUTE_* bits, not POSIX mode bits.
+    pub attributes: u32,
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]

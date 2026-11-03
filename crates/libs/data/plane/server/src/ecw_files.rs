@@ -14,7 +14,7 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::{Stream, StreamExt, stream};
 use http_body_util::BodyExt;
-use pplx_space_common_core::types::{GuestUserName, SandboxId, validate_linux_guest_path_input};
+use pplx_space_common_core::types::{GuestUserName, SandboxId, validate_guest_path_input};
 use pplx_space_common_svc::bootstrap::wrap_grpc_client_channel;
 use pplx_space_node_api_client::{
     NodeApiOperationBudget, proto::worker_api_client::WorkerApiClient,
@@ -105,7 +105,8 @@ pub(super) struct FilesystemEntryInfoE2b {
     file_type: i32,
     path: String,
     size: i64,
-    mode: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<u32>,
     #[serde(rename = "modifiedTime", skip_serializing_if = "Option::is_none")]
     modified_time: Option<String>,
     #[serde(rename = "symlinkTarget", skip_serializing_if = "Option::is_none")]
@@ -1282,14 +1283,23 @@ fn is_octet_stream_content_type(content_type: &str) -> bool {
 }
 
 fn file_info_to_connect_entry(info: SpacedFileInfo) -> FilesystemEntryInfoE2b {
+    let windows = info.windows_metadata.is_some();
     FilesystemEntryInfoE2b {
-        name: info
-            .name
-            .unwrap_or_else(|| path_basename(&info.path).to_string()),
+        name: info.name.unwrap_or_else(|| {
+            if windows {
+                info.path
+                    .rsplit(['/', '\\'])
+                    .find(|part| !part.is_empty())
+                    .unwrap_or(&info.path)
+                    .to_owned()
+            } else {
+                path_basename(&info.path).to_string()
+            }
+        }),
         file_type: native_file_type_to_e2b(info.file_type),
         path: info.path,
         size: info.size_bytes.min(i64::MAX as u64) as i64,
-        mode: info.mode,
+        mode: info.windows_metadata.is_none().then_some(info.mode),
         modified_time: info.modified_at.and_then(timestamp_to_rfc3339),
         symlink_target: info.symlink_target,
     }
@@ -1700,7 +1710,7 @@ pub(super) async fn e2b_remove_watcher(
 }
 
 fn e2b_request_root(path: &str, _user: Option<&GuestUserName>) -> Result<String, EcwProxyError> {
-    validate_linux_guest_path_input(path)
+    validate_guest_path_input(path)
         .map_err(|error| EcwProxyError::bad_request(error.to_string()))?;
     Ok(path.to_string())
 }

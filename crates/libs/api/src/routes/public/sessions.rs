@@ -8,7 +8,7 @@ use axum::{
 };
 use pplx_space_common_core::types::{
     AutoLifecyclePolicy, GuestUserName, IdempotencyKey, ProcessCommand, SandboxLifecycle,
-    validate_linux_guest_path_input,
+    validate_guest_path_input,
 };
 use pplx_space_metrics::response::{ResponseKind, ResponseOrigin};
 use pplx_space_public_api::{
@@ -843,7 +843,7 @@ fn validate_process_request(request: &CreateProcessRequest) -> Result<(), Public
         if cwd.is_empty() {
             return Err(PublicApiError::bad_request("guest path must be non-empty"));
         }
-        validate_linux_guest_path_input(cwd)
+        validate_guest_path_input(cwd)
             .map_err(|error| PublicApiError::bad_request(error.to_string()))?;
     }
     if let Some(user) = request.user.clone() {

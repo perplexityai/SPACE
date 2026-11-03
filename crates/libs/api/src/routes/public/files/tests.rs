@@ -31,7 +31,7 @@ fn public_file_info_maps_native_shape() {
     assert_eq!(public.name, "main.rs");
     assert_eq!(public.file_type, FileType::File);
     assert_eq!(public.size_bytes, 42);
-    assert_eq!(public.owner_uid, 1000);
+    assert_eq!(public.owner_uid, Some(1000));
     // Carried rather than defaulted: a client that refuses hard-linked
     // files needs the real count, and an assumed 1 would pass that check.
     assert_eq!(public.link_count, Some(2));
@@ -49,7 +49,7 @@ fn guest_path_and_user_are_validated_at_boundary() {
         "workspace"
     );
     parse_guest_path("bad\npath".to_string()).unwrap_err();
-    parse_guest_path("C:\\Users\\user\\file.txt".to_string()).unwrap_err();
+    parse_guest_path("C:\\Users\\user\\file.txt".to_string()).unwrap();
     parse_guest_user(Some(String::new())).unwrap_err();
 }
 
@@ -1141,4 +1141,21 @@ mod write_creating_parents {
         assert_eq!(status_of(result), StatusCode::NOT_FOUND);
         assert_eq!(guest.writes.borrow().len(), 2, "retried once only");
     }
+}
+
+#[test]
+fn windows_file_metadata_does_not_invent_posix_permissions() {
+    let public = public_file_info(SpacedFileInfo {
+        path: r"C:\Users\user\note.txt".into(),
+        windows_metadata: Some(spaced_ops::WindowsFileMetadata {
+            owner_sid: None,
+            attributes: 32,
+        }),
+        ..Default::default()
+    });
+    assert_eq!(public.name, "note.txt");
+    assert_eq!(public.mode, None);
+    assert_eq!(public.owner_uid, None);
+    assert_eq!(public.owner_gid, None);
+    assert_eq!(public.windows_metadata.unwrap().attributes, 32);
 }

@@ -57,13 +57,17 @@ fn terminal_size_validation_rejects_zero_dimensions() {
 }
 
 #[test]
-fn process_request_cwd_requires_a_nonempty_linux_guest_path() {
+fn process_request_cwd_carries_guest_syntax_without_host_interpretation() {
     validate_process_request(&process_request_with_cwd(LINUX_CWD))
         .expect("Linux guest path accepted");
 
-    for cwd in ["", WINDOWS_DRIVE_CWD, WINDOWS_UNC_CWD] {
+    for cwd in [WINDOWS_DRIVE_CWD, WINDOWS_UNC_CWD] {
+        validate_process_request(&process_request_with_cwd(cwd))
+            .expect("guest syntax deferred to guest");
+    }
+    for cwd in ["", "bad\npath"] {
         let error = validate_process_request(&process_request_with_cwd(cwd))
-            .expect_err("non-Linux guest path rejected");
+            .expect_err("invalid guest path rejected");
         assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
     }
 }
