@@ -1,6 +1,7 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { Suspense, useEffect, useState } from 'react';
+import { useSearchParams } from 'next/navigation';
 import {
   Alert,
   Button,
@@ -40,7 +41,18 @@ function formatDate(value: string | null): string {
   return value ? new Date(value).toLocaleString() : 'Never';
 }
 
+// `useSearchParams` needs a Suspense boundary in the app router.
 export default function ApiKeysPage() {
+  return (
+    <Suspense fallback={null}>
+      <ApiKeysPageContent />
+    </Suspense>
+  );
+}
+
+function ApiKeysPageContent() {
+  // `?org=<id>` opens a given organization's keys (linked from its page).
+  const requestedOrgId = useSearchParams().get('org');
   const { message } = App.useApp();
   const { org: signedInOrg } = useAuth();
   const [organizations, setOrganizations] = useState<Organization[]>([]);
@@ -59,7 +71,10 @@ export default function ApiKeysPage() {
       .then((loaded) => {
         if (!active) return;
         setOrganizations(loaded);
-        const preferred = loaded.find((candidate) => candidate.id === signedInOrg?.id) || loaded[0];
+        const preferred =
+          loaded.find((candidate) => candidate.id === requestedOrgId)
+          || loaded.find((candidate) => candidate.id === signedInOrg?.id)
+          || loaded[0];
         setOrgId(preferred?.id);
       })
       .catch((error) => {
@@ -70,7 +85,7 @@ export default function ApiKeysPage() {
     return () => {
       active = false;
     };
-  }, [signedInOrg?.id]);
+  }, [signedInOrg?.id, requestedOrgId]);
 
   useEffect(() => {
     if (!orgId) {
