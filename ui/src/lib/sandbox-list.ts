@@ -293,22 +293,27 @@ export class OlderFormatAnswer extends Error {
 }
 
 // How long bare arrays answering paged requests must go on, with no other
-// answer in between and at least `STOP_AFTER_MISMATCHES` of them, to show
-// that the API went back to a version without paging. A failed refresh is
-// retried on the next one-second check, so a count alone would be reached
-// within seconds while some replicas are old. A minute of nothing else, at
-// that rate, means no replica that pages is answering.
+// answer in between, and how many of them there must be, to show that the
+// API went back to a version without paging. A failed refresh is retried on
+// the next one-second check, so a count alone would be reached within
+// seconds while some replicas are old; a minute of nothing else, at that
+// rate, means no replica that pages is answering. Time alone also passes
+// while nothing is sent: a hidden tab does not refresh, and a sleeping
+// laptop or a clock jump skips ahead. The count, about a third of the
+// retries a minute sends, keeps such a pause from standing in for retries,
+// and a downgrade still stops the list after about a minute of them.
 export const STOP_AFTER_MISMATCH_MS = 60_000;
-export const STOP_AFTER_MISMATCHES = 3;
+export const STOP_AFTER_MISMATCHES = 20;
 
 // The outcome of `ListSelection.load`.
 // - `shown`: the answer is the selected scope's, in the shape asked for.
 // - `skipped`: the selection changed while it was in flight, or a newer load
 //   started; nothing is shown and `loading` is left to that load.
 // - `stopped`: only bare arrays answered paged requests for
-//   `STOP_AFTER_MISMATCH_MS`, in this load or earlier; nothing more is read
-//   until the page is reloaded. `kept` says whether the rows on screen are
-//   the selected scope's; when they are not they must be cleared.
+//   `STOP_AFTER_MISMATCH_MS`, at least `STOP_AFTER_MISMATCHES` of them, in
+//   this load or earlier; nothing more is read until the page is reloaded.
+//   `kept` says whether the rows on screen are the selected scope's; when
+//   they are not they must be cleared.
 // - `failed`: the request failed, or a bare array answered a paged request
 //   (`OlderFormatAnswer`). `scope` is the selected scope, which a sampled
 //   view keeps when its switch to paging failed. `kept` says whether the
@@ -418,10 +423,12 @@ export class ListSelection {
   // before then neither counts nor starts over (`undecided`). A bare array
   // answering a paged request is a mismatch. The list stops when mismatches
   // alone have answered for `STOP_AFTER_MISMATCH_MS` since the first of
-  // them, and there were at least `STOP_AFTER_MISMATCHES`. Any other answer
-  // starts over: a page shows that a version that pages answered, and a
-  // bare array is what a sampled request asks for. Failed requests neither
-  // count nor start over.
+  // them, and there were at least `STOP_AFTER_MISMATCHES`. A pause in which
+  // nothing is sent, such as a hidden tab or a sleeping laptop, adds time
+  // but no mismatches, so it cannot stop the list on its own. Any other
+  // answer starts over: a page shows that a version that pages answered,
+  // and a bare array is what a sampled request asks for. Failed requests
+  // neither count nor start over.
   noteAnswer(asked: ListMode, answered: ListMode): AnswerNote {
     if (this.stopped) return this.stop();
     if (!this.decided) return { kind: 'undecided' };

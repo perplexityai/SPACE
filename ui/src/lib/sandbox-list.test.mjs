@@ -431,16 +431,38 @@ test('a paged list stops only once bare arrays alone have answered for the windo
   assert.equal(sameScope(selection.shown, pageOne), true);
   await assertStaysStopped(selection, true);
 
-  // A window with fewer than `STOP_AFTER_MISMATCHES` answers in it does not
-  // stop the list; the next one does.
+  // Bare arrays that span the window but are fewer than
+  // `STOP_AFTER_MISMATCHES` do not stop the list; the one that makes the
+  // count does.
   const sparse = newSelection({ template: 'alpha' }, clock);
   await sparse.load(sparse.selected, reads(page(null)).read);
-  for (let i = 1; i < STOP_AFTER_MISMATCHES; i += 1) {
+  assertOlderFormat(await sparse.load(sparse.selected, reads(sampledAnswer).read), true);
+  clock.advance(STOP_AFTER_MISMATCH_MS);
+  for (let i = 2; i < STOP_AFTER_MISMATCHES; i += 1) {
     assertOlderFormat(await sparse.load(sparse.selected, reads(sampledAnswer).read), true);
-    clock.advance(STOP_AFTER_MISMATCH_MS);
+    assert.equal(sparse.stopped, false);
+    clock.advance(RETRY_MS);
   }
-  assert.equal(sparse.stopped, false);
+  assert.equal(sparse.mismatches, STOP_AFTER_MISMATCHES - 1);
   assert.deepEqual(await sparse.load(sparse.selected, reads(sampledAnswer).read), { kind: 'stopped', kept: true });
+});
+
+test('a pause after a bare array, as in a hidden tab, does not count toward stopping the list', async () => {
+  const clock = testClock();
+  const selection = newSelection({ template: 'alpha' }, clock);
+  await selection.load(selection.selected, reads(page('c1')).read);
+  const pageOne = selection.selected;
+  assertOlderFormat(await selection.load(pageOne, reads(sampledAnswer).read), true);
+  // Nothing is sent while the tab is hidden or the laptop sleeps.
+  clock.advance(10 * STOP_AFTER_MISMATCH_MS);
+  for (let i = 0; i < 2; i += 1) {
+    assertOlderFormat(await selection.load(pageOne, reads(sampledAnswer).read), true);
+    clock.advance(RETRY_MS);
+  }
+  assert.equal(selection.stopped, false);
+  assert.equal(selection.mismatches, 3);
+  assert.equal(sameScope(selection.shown, pageOne), true);
+  assert.equal(selection.nextCursor(), 'c1');
 });
 
 test('interleaved old and new answers over several minutes never stop a paged list', async () => {
@@ -479,9 +501,12 @@ test('a bare array answering the prefix search counts toward stopping the list',
   assert.deepEqual(selection.noteAnswer('paged', 'paged'), { kind: 'counted' });
   assert.equal(selection.mismatches, 0);
   assertOlderFormat(await selection.load(selection.selected, reads(sampledAnswer).read), true);
-  assert.deepEqual(selection.noteAnswer('paged', 'sampled'), { kind: 'mismatched' });
+  for (let i = 2; i < STOP_AFTER_MISMATCHES; i += 1) {
+    assert.deepEqual(selection.noteAnswer('paged', 'sampled'), { kind: 'mismatched' });
+  }
   clock.advance(STOP_AFTER_MISMATCH_MS);
-  // The prefix search's answer a window after the list's first bare array.
+  // The prefix search's answer that makes the count, a window after the
+  // list's first bare array.
   assert.deepEqual(selection.noteAnswer('paged', 'sampled'), { kind: 'stopped', kept: true });
   await assertStaysStopped(selection, true);
 });

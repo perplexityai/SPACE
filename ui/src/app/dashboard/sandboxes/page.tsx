@@ -776,10 +776,12 @@ function SandboxesPage() {
   // the rows rather than show them under the new label.
   const [listError, setListError] = useState<string | null>(null);
   // Only bare arrays answered paged requests, the list's or the prefix
-  // search's, for a minute (`STOP_AFTER_MISMATCH_MS`): the API went back to
-  // a version without paging, and the list reads nothing more until the page
-  // is reloaded. Until then each is a failed refresh (`olderFormat`), and any
-  // page between them starts the minute over.
+  // search's, for a minute (`STOP_AFTER_MISMATCH_MS`) and at least twenty
+  // times in a row (`STOP_AFTER_MISMATCHES`): the API went back to a version
+  // without paging, and the list reads nothing more until the page is
+  // reloaded. Until then each is a failed refresh (`olderFormat`), and any
+  // page between them starts both over. A hidden tab sends nothing, so its
+  // time alone does not stop the list.
   const [listStopped, setListStopped] = useState(false);
   // The last answers included a bare array to a paged request, as during a
   // rolling deploy; the rows on screen are kept while the list retries.
