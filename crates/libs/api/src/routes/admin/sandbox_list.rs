@@ -2,6 +2,7 @@
 //! surface: the cross-org sandbox list, its cursor and filters, and the count
 //! of sandboxes by template and `spaced` version.
 
+use std::fmt;
 use std::str::FromStr;
 
 use axum::{
@@ -12,8 +13,8 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use pplx_space_common_core::types::{NodeId, OrgId, SandboxId, TemplateName, UserId};
-use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use serde::de::{self, DeserializeOwned};
+use serde::{Deserialize, Deserializer, Serialize};
 use time::OffsetDateTime;
 
 use super::support::{self, ContentionScope, api_error, require_managing_org_admin};
@@ -61,7 +62,9 @@ pub struct AdminSandboxListQuery {
     /// Comma-separated stored lifecycles.
     lifecycle: Option<String>,
     template: Option<String>,
+    #[serde(default, deserialize_with = "empty_as_unset")]
     node_id: Option<NodeId>,
+    #[serde(default, deserialize_with = "empty_as_unset")]
     assigned: Option<bool>,
     user_id: Option<UserId>,
     created_after: Option<String>,
@@ -206,6 +209,21 @@ fn parse_query<T: DeserializeOwned>(uri: &Uri) -> Result<T, QueryError> {
     Query::<T>::try_from_uri(uri)
         .map(|Query(query)| query)
         .map_err(|rejection| bad_request(rejection.body_text()))
+}
+
+/// A typed parameter whose empty value (`name=`) is unset, as leaving the
+/// name out is: the unpaged list ignored these names before they were
+/// filters, so a caller that sends one empty keeps its list.
+fn empty_as_unset<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: FromStr,
+    T::Err: fmt::Display,
+{
+    match Option::<String>::deserialize(deserializer)?.as_deref() {
+        None | Some("") => Ok(None),
+        Some(value) => value.parse().map(Some).map_err(de::Error::custom),
+    }
 }
 
 fn parse_lifecycles(value: &str) -> Result<Vec<AdminStoredLifecycle>, QueryError> {

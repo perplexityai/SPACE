@@ -282,6 +282,36 @@ async fn malformed_list_parameters_answer_400() -> TestDbResult<()> {
     Ok(())
 }
 
+/// An empty filter parameter is unset, paged or not: the unpaged list ignored
+/// these names before they were filters.
+#[tokio::test]
+async fn an_empty_filter_parameter_is_unset() -> TestDbResult<()> {
+    let db = pg_test_db().await?;
+    let Some(harness) = harness(db.pool.clone()).await? else {
+        return Ok(());
+    };
+    let owner = seed_owner(&harness.pool).await?;
+    for _ in 0..2 {
+        seed_sandbox(&harness.pool, owner, SeedSandbox::default()).await?;
+    }
+    let org = owner.org_id.as_uuid();
+    for name in ["node_id", "assigned"] {
+        for paging in ["", "&cursor="] {
+            let (status, unset) = harness
+                .get(&format!("/sandboxes?org_id={org}{paging}"))
+                .await;
+            assert_eq!(status, StatusCode::OK, "{name}{paging}: without it");
+            let (status, empty) = harness
+                .get(&format!("/sandboxes?org_id={org}&{name}={paging}"))
+                .await;
+            assert_eq!(status, StatusCode::OK, "{name}{paging}: empty");
+            assert_eq!(empty, unset, "{name}{paging}: empty is unset");
+        }
+    }
+    db.pool.close().await;
+    Ok(())
+}
+
 /// Postgres keeps microseconds, so a `created_before` inside a microsecond
 /// still includes a row created at its start.
 #[tokio::test]
