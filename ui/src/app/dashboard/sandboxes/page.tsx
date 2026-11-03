@@ -1957,7 +1957,11 @@ function SandboxesPage() {
         expandable={{
           showExpandColumn: false,
           expandRowByClick: true,
-          expandedRowRender: (record) => <SnapshotsPanel sandboxId={record.id} orgId={record.org_id ?? null} ownOrg={isOwnOrg(authOrg?.id, record.org_id)} />,
+          // The table keeps a collapsed row's content mounted; unmounting the
+          // panel stops its reads and the rollbacks it follows.
+          expandedRowRender: (record, _index, _indent, expanded) => (expanded
+            ? <SnapshotsPanel sandboxId={record.id} orgId={record.org_id ?? null} ownOrg={isOwnOrg(authOrg?.id, record.org_id)} />
+            : null),
           rowExpandable: snapshotsPanelAvailable,
         }}
       />
