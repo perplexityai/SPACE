@@ -142,6 +142,32 @@ async fn listed_ids(pool: &PgPool, filter: &AdminSandboxFilter) -> TestDbResult<
     Ok(page.rows.iter().map(|sandbox| sandbox.id).collect())
 }
 
+/// The legacy unpaged list's IDs, which run their own statement.
+async fn unpaged_ids(pool: &PgPool, filter: &AdminSandboxFilter) -> TestDbResult<Vec<SandboxId>> {
+    let page = controller(pool)
+        .admin_sandbox_page(pool, filter, None, 100, PageBudget::Unbounded)
+        .await?;
+    Ok(page.rows.iter().map(|sandbox| sandbox.id).collect())
+}
+
+/// A current Direct route for `sandbox_id`, on `node_id`.
+async fn seed_route(pool: &PgPool, sandbox_id: SandboxId, node_id: NodeId) -> TestDbResult<()> {
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_direct_route_identities (
+             sandbox_id, route_generation, current_node_id, substrate_kind,
+             execution_generation, activation_attempt_id
+         )
+         VALUES ($1, 1, $2, $3, 1, $4)"
+    ))
+    .bind(sandbox_id)
+    .bind(node_id)
+    .bind(SubstrateKind::Space)
+    .bind(Uuid::now_v7())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 fn base_time() -> OffsetDateTime {
     OffsetDateTime::from_unix_timestamp(1_790_000_000).expect("fixture timestamp")
 }
@@ -501,29 +527,44 @@ async fn each_filter_returns_exactly_its_rows() -> TestDbResult<()> {
             },
             &[],
         ),
+        // Without its node filter each combined case lists rows 0 and 3, so
+        // the node filter decides the result.
         (
-            "combined",
+            "combined, unassigned",
             AdminSandboxFilter {
                 org_id: Some(first_org),
                 lifecycles: lifecycles(&["started", "deleted"]),
                 template: template("py"),
                 node: Some(NodeAssignment::Unassigned),
                 user_id: Some(first_user.user_id),
-                created_after: Some(at(2)),
                 ..AdminSandboxFilter::default()
             },
             &[3],
         ),
+        (
+            "combined, on a node",
+            AdminSandboxFilter {
+                org_id: Some(first_org),
+                lifecycles: lifecycles(&["started", "deleted"]),
+                template: template("py"),
+                node: Some(NodeAssignment::Node(node_one)),
+                user_id: Some(first_user.user_id),
+                ..AdminSandboxFilter::default()
+            },
+            &[0],
+        ),
     ];
     for (case, filter, expected) in cases {
-        let listed = listed_ids(&db.pool, &filter).await?;
         // Newest first, so the expected rows in reverse seed order.
         let expected = expected
             .iter()
             .rev()
             .map(|index| ids[*index])
             .collect::<Vec<_>>();
-        assert_eq!(listed, expected, "{case}");
+        let listed = listed_ids(&db.pool, &filter).await?;
+        assert_eq!(listed, expected, "{case}: page");
+        let unpaged = unpaged_ids(&db.pool, &filter).await?;
+        assert_eq!(unpaged, expected, "{case}: unpaged list");
     }
     db.pool.close().await;
     Ok(())
@@ -567,19 +608,7 @@ async fn the_node_filters_match_the_node_the_response_reports() -> TestDbResult<
             .execute(&db.pool)
             .await?;
         if let Some(route_node) = route {
-            sqlx::query(sql!(
-                "INSERT INTO sandbox_direct_route_identities (
-                     sandbox_id, route_generation, current_node_id, substrate_kind,
-                     execution_generation, activation_attempt_id
-                 )
-                 VALUES ($1, 1, $2, $3, 1, $4)"
-            ))
-            .bind(sandbox_id)
-            .bind(route_node)
-            .bind(SubstrateKind::Space)
-            .bind(Uuid::now_v7())
-            .execute(&db.pool)
-            .await?;
+            seed_route(&db.pool, sandbox_id, route_node).await?;
         }
         ids.push(sandbox_id);
     }
@@ -659,26 +688,112 @@ async fn the_node_filters_match_the_node_the_response_reports() -> TestDbResult<
             }
         }
         assert_eq!(walked, expected, "{label}: walked a row at a time");
-    }
 
-    // The unpaged list applies the same filters.
-    let unpaged = controller(&db.pool)
-        .admin_sandbox_page(
-            &db.pool,
-            &filter(NodeAssignment::Node(row_node)),
+        // The unpaged list runs its own statement with the same filters.
+        let unpaged = unpaged_ids(&db.pool, &filter(node)).await?;
+        assert_eq!(unpaged, expected, "{label}: unpaged list");
+    }
+    db.pool.close().await;
+    Ok(())
+}
+
+/// A route change committed between a node-filtered page's two reads.
+#[derive(Debug, Clone, Copy)]
+enum RouteChange {
+    Move(NodeId),
+    Delete,
+}
+
+impl RouteChange {
+    async fn apply(self, pool: &PgPool, sandbox_id: SandboxId) -> TestDbResult<()> {
+        match self {
+            Self::Move(node_id) => {
+                sqlx::query(sql!(
+                    "UPDATE sandbox_direct_route_identities SET current_node_id = $2
+                     WHERE sandbox_id = $1"
+                ))
+                .bind(sandbox_id)
+                .bind(node_id)
+                .execute(pool)
+                .await?;
+            }
+            Self::Delete => {
+                sqlx::query(sql!(
+                    "DELETE FROM sandbox_direct_route_identities WHERE sandbox_id = $1"
+                ))
+                .bind(sandbox_id)
+                .execute(pool)
+                .await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A node-filtered page reads its routes and runs its statement in one
+/// snapshot, so a route that moves or goes between the two reads leaves the
+/// page agreeing with the node its own responses report. The test runs the
+/// steps `admin_sandbox_page` runs and commits the change between them.
+#[tokio::test]
+async fn a_route_change_between_the_reads_leaves_the_page_consistent() -> TestDbResult<()> {
+    let db = pg_test_db().await?;
+    let (first_node, second_node) = (NodeId::new(), NodeId::new());
+    let cases = [
+        // Routed to its row's node, so the route read leaves it to its row,
+        // and the route then moves away.
+        (
+            "route moves off the filtered node",
+            Some(first_node),
+            NodeAssignment::Node(first_node),
+            RouteChange::Move(second_node),
+        ),
+        // No node on its row, so the route read returns it, and the route
+        // then goes.
+        (
+            "route goes from an assigned sandbox",
             None,
-            100,
-            PageBudget::Unbounded,
-        )
-        .await?;
-    assert_eq!(
-        unpaged
-            .rows
-            .iter()
-            .map(|sandbox| sandbox.id)
-            .collect::<Vec<_>>(),
-        newest_first(&[0, 3, 6])
-    );
+            NodeAssignment::Assigned,
+            RouteChange::Delete,
+        ),
+    ];
+    for (label, row_node, node, change) in cases {
+        for budget in [PageBudget::Bounded, PageBudget::Unbounded] {
+            let owner = seed_owner(&db.pool).await?;
+            let sandbox_id = seed_sandbox(
+                &db.pool,
+                owner,
+                SeedSandbox {
+                    active_node_id: row_node,
+                    ..SeedSandbox::default()
+                },
+            )
+            .await?;
+            seed_route(&db.pool, sandbox_id, first_node).await?;
+            let filter = AdminSandboxFilter {
+                org_id: Some(owner.org_id),
+                node: Some(node),
+                ..AdminSandboxFilter::default()
+            };
+
+            let mut snapshot = begin_node_snapshot(&db.pool).await?;
+            let overrides = node_route_overrides(&mut snapshot, node).await?;
+            change.apply(&db.pool, sandbox_id).await?;
+            let page = admin_page_statement(&mut *snapshot, &filter, &overrides, None, 100, budget)
+                .await?;
+            snapshot.commit().await?;
+
+            let reported = page
+                .rows
+                .iter()
+                .map(|sandbox| (sandbox.id == sandbox_id, sandbox.active_node_id))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                reported,
+                [(true, Some(first_node))],
+                "{label} ({budget:?}): listed, reporting the node it was filtered by"
+            );
+        }
+    }
     db.pool.close().await;
     Ok(())
 }

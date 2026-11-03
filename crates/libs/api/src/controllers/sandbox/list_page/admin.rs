@@ -18,7 +18,7 @@ use pplx_space_common_core::types::{
 };
 use pplx_space_public_api::PUBLIC_SANDBOX_ID_PREFIX;
 use serde::Serialize;
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -27,7 +27,9 @@ use super::{
     ListPage, MAX_SANDBOX_LIST_PAGE_BYTES, PageWalkParams, SANDBOX_LIST_ROW_OVERHEAD_BYTES,
 };
 use crate::controllers::sandbox::{SandboxController, SandboxPageCursor, sandbox_query};
-use crate::controllers::substrate::direct::current_routes::{CurrentRoutes, current_routes};
+use crate::controllers::substrate::direct::route_overrides::{
+    OverrideScope, RouteOverrides, route_overrides,
+};
 use crate::controllers::{ControllerError, db_contention_error};
 use crate::models::{Sandbox, SandboxResourceType};
 
@@ -179,9 +181,11 @@ fn id_prefix_range(prefix: &str) -> Option<(SandboxId, SandboxId)> {
 
 /// The admin list's sandboxes ($1-$13) after the cursor, for the page walk.
 /// The filters are the same as [`ADMIN_LIST_SQL`]'s. The node filters ($10,
-/// $13) match the node the response reports: $11 holds every sandbox with a
-/// current Direct route, whose row's `active_node_id` the response ignores,
-/// and $12 those routed to $10.
+/// $13) match the node the response reports, from a [`RouteOverrides`] read
+/// in the statement's snapshot: $11 holds the sandboxes whose Direct route's
+/// node differs from their row's `active_node_id`, and $12 those of them
+/// routed to $10. Every other sandbox has no route or one on its row's node,
+/// so its row decides.
 const ADMIN_CANDIDATE_ROWS: &str = "SELECT s.id, s.created_at
     FROM sandboxes s
     WHERE ($1::UUID IS NULL OR s.org_id = $1)
@@ -284,6 +288,10 @@ impl SandboxController {
     /// id)`, after `cursor`: at most `limit` rows, and whether more follow.
     /// A [`PageBudget::Unbounded`] list ignores `cursor` and never says more
     /// follow.
+    ///
+    /// A node filter reads the Direct routes it needs and runs the page in
+    /// one snapshot, so a route that moves between the two reads cannot list
+    /// a sandbox under one node while its response reports another.
     pub(crate) async fn admin_sandbox_page(
         &self,
         pool: &PgPool,
@@ -292,78 +300,23 @@ impl SandboxController {
         limit: u32,
         budget: PageBudget,
     ) -> Result<ListPage<Sandbox>, sqlx::Error> {
-        let lifecycles = filter.lifecycles.as_ref().map(|lifecycles| {
-            lifecycles
-                .iter()
-                .map(|lifecycle| lifecycle.as_str())
-                .collect::<Vec<_>>()
-        });
-        let id_range = filter.search.as_ref().and_then(|search| search.id_range);
-        let template = filter.template.as_ref().map(TemplateName::as_str);
-        let prefix = filter.search.as_ref().map(|search| search.prefix.as_str());
-        let (node_id, assigned) = match filter.node {
-            Some(NodeAssignment::Node(node_id)) => (Some(node_id), None),
-            Some(NodeAssignment::Assigned) => (None, Some(true)),
-            Some(NodeAssignment::Unassigned) => (None, Some(false)),
-            None => (None, None),
+        let Some(node) = filter.node else {
+            return admin_page_statement(
+                pool,
+                filter,
+                &RouteOverrides::default(),
+                cursor,
+                limit,
+                budget,
+            )
+            .await;
         };
-        // Only the node filters read the routes; without them the arrays are
-        // never consulted.
-        let routes = match filter.node {
-            Some(_) => current_routes(pool, node_id).await?,
-            None => CurrentRoutes::default(),
-        };
-        if budget == PageBudget::Unbounded {
-            let rows =
-                sqlx::query_as::<_, Sandbox>(sqlx::AssertSqlSafe(sql!(ADMIN_LIST_SQL.as_str())))
-                    .bind(filter.org_id)
-                    .bind(lifecycles)
-                    .bind(template)
-                    .bind(filter.user_id)
-                    .bind(filter.created_after)
-                    .bind(filter.created_before)
-                    .bind(prefix)
-                    .bind(id_range.map(|(low, _)| low))
-                    .bind(id_range.map(|(_, high)| high))
-                    .bind(node_id)
-                    .bind(&routes.routed)
-                    .bind(&routes.on_node)
-                    .bind(assigned)
-                    .bind(i64::from(limit))
-                    .fetch_all(pool)
-                    .await?;
-            return Ok(ListPage {
-                rows,
-                has_more: false,
-            });
-        }
-        let rows =
-            sqlx::query_as::<_, ScopedPageRow>(sqlx::AssertSqlSafe(sql!(ADMIN_PAGE_SQL.as_str())))
-                .bind(filter.org_id)
-                .bind(lifecycles)
-                .bind(template)
-                .bind(filter.user_id)
-                .bind(filter.created_after)
-                .bind(filter.created_before)
-                .bind(prefix)
-                .bind(id_range.map(|(low, _)| low))
-                .bind(id_range.map(|(_, high)| high))
-                .bind(node_id)
-                .bind(&routes.routed)
-                .bind(&routes.on_node)
-                .bind(assigned)
-                .bind(cursor.map(|cursor| cursor.created_at))
-                .bind(cursor.map(|cursor| cursor.id))
-                .bind(i64::from(limit.saturating_add(1)))
-                .bind(MAX_SANDBOX_LIST_PAGE_BYTES)
-                .bind(SANDBOX_LIST_ROW_OVERHEAD_BYTES)
-                .fetch_all(pool)
-                .await?;
-        let page = ListPage::from_rows(rows, limit as usize, |row| row.has_next);
-        Ok(ListPage {
-            rows: page.rows.into_iter().map(|row| row.sandbox).collect(),
-            has_more: page.has_more,
-        })
+        let mut snapshot = begin_node_snapshot(pool).await?;
+        let overrides = node_route_overrides(&mut snapshot, node).await?;
+        let page =
+            admin_page_statement(&mut *snapshot, filter, &overrides, cursor, limit, budget).await?;
+        snapshot.commit().await?;
+        Ok(page)
     }
 
     /// Every listed sandbox whose status is not `deleted`, counted by the
@@ -432,6 +385,103 @@ impl SandboxController {
             })
             .collect())
     }
+}
+
+/// The read-only transaction a node-filtered page runs in. `REPEATABLE READ`
+/// so the route read and the page statement see one snapshot.
+async fn begin_node_snapshot(pool: &PgPool) -> Result<Transaction<'_, Postgres>, sqlx::Error> {
+    pool.begin_with(sql!("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+        .await
+}
+
+/// The routes `node` needs: the ones that put a sandbox on another node than
+/// its row's.
+async fn node_route_overrides(
+    snapshot: &mut PgConnection,
+    node: NodeAssignment,
+) -> Result<RouteOverrides, sqlx::Error> {
+    let scope = match node {
+        NodeAssignment::Node(node_id) => OverrideScope::Node(node_id),
+        NodeAssignment::Assigned | NodeAssignment::Unassigned => OverrideScope::Assignment,
+    };
+    route_overrides(snapshot, scope).await
+}
+
+/// The page statement, with the route overrides a node filter needs; a
+/// filter without one ignores them.
+async fn admin_page_statement(
+    executor: impl sqlx::PgExecutor<'_>,
+    filter: &AdminSandboxFilter,
+    overrides: &RouteOverrides,
+    cursor: Option<SandboxPageCursor>,
+    limit: u32,
+    budget: PageBudget,
+) -> Result<ListPage<Sandbox>, sqlx::Error> {
+    let lifecycles = filter.lifecycles.as_ref().map(|lifecycles| {
+        lifecycles
+            .iter()
+            .map(|lifecycle| lifecycle.as_str())
+            .collect::<Vec<_>>()
+    });
+    let id_range = filter.search.as_ref().and_then(|search| search.id_range);
+    let template = filter.template.as_ref().map(TemplateName::as_str);
+    let prefix = filter.search.as_ref().map(|search| search.prefix.as_str());
+    let (node_id, assigned) = match filter.node {
+        Some(NodeAssignment::Node(node_id)) => (Some(node_id), None),
+        Some(NodeAssignment::Assigned) => (None, Some(true)),
+        Some(NodeAssignment::Unassigned) => (None, Some(false)),
+        None => (None, None),
+    };
+    if budget == PageBudget::Unbounded {
+        let rows = sqlx::query_as::<_, Sandbox>(sqlx::AssertSqlSafe(sql!(ADMIN_LIST_SQL.as_str())))
+            .bind(filter.org_id)
+            .bind(lifecycles)
+            .bind(template)
+            .bind(filter.user_id)
+            .bind(filter.created_after)
+            .bind(filter.created_before)
+            .bind(prefix)
+            .bind(id_range.map(|(low, _)| low))
+            .bind(id_range.map(|(_, high)| high))
+            .bind(node_id)
+            .bind(&overrides.overridden)
+            .bind(&overrides.on_node)
+            .bind(assigned)
+            .bind(i64::from(limit))
+            .fetch_all(executor)
+            .await?;
+        return Ok(ListPage {
+            rows,
+            has_more: false,
+        });
+    }
+    let rows =
+        sqlx::query_as::<_, ScopedPageRow>(sqlx::AssertSqlSafe(sql!(ADMIN_PAGE_SQL.as_str())))
+            .bind(filter.org_id)
+            .bind(lifecycles)
+            .bind(template)
+            .bind(filter.user_id)
+            .bind(filter.created_after)
+            .bind(filter.created_before)
+            .bind(prefix)
+            .bind(id_range.map(|(low, _)| low))
+            .bind(id_range.map(|(_, high)| high))
+            .bind(node_id)
+            .bind(&overrides.overridden)
+            .bind(&overrides.on_node)
+            .bind(assigned)
+            .bind(cursor.map(|cursor| cursor.created_at))
+            .bind(cursor.map(|cursor| cursor.id))
+            .bind(i64::from(limit.saturating_add(1)))
+            .bind(MAX_SANDBOX_LIST_PAGE_BYTES)
+            .bind(SANDBOX_LIST_ROW_OVERHEAD_BYTES)
+            .fetch_all(executor)
+            .await?;
+    let page = ListPage::from_rows(rows, limit as usize, |row| row.has_next);
+    Ok(ListPage {
+        rows: page.rows.into_iter().map(|row| row.sandbox).collect(),
+        has_more: page.has_more,
+    })
 }
 
 #[cfg(test)]
