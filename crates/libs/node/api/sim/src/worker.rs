@@ -155,6 +155,7 @@ async fn file_info_from_metadata(
         .and_then(|s| s.to_str())
         .map(str::to_string);
     sbx::SpacedFileInfo {
+        windows_metadata: None,
         path: guest_path.to_string(),
         name,
         file_type,

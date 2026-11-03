@@ -249,6 +249,7 @@ impl WorkerFilesystem for FilesystemWorkerService {
         );
         Ok(Response::new(StatResponse {
             info: Some(FileInfo {
+                windows_metadata: None,
                 path: response_path,
                 name: None,
                 file_type: classify_file_type(file_type).into(),

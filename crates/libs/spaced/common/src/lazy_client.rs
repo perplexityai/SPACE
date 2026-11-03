@@ -89,6 +89,10 @@ impl<T> LazyClientLease<T> {
         self.generation
     }
 
+    pub fn client(&self) -> &T {
+        &self.client
+    }
+
     pub fn into_client(self) -> T {
         self.client
     }

@@ -19,6 +19,7 @@ fn public_file_info_maps_native_shape() {
         assert_eq!(public_file_event_kind(value), FileEventKind::Unknown);
     }
     let info = SpacedFileInfo {
+        windows_metadata: None,
         path: "/workspace/main.rs".to_string(),
         name: None,
         file_type: SpacedFileType::File as i32,

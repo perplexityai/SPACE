@@ -42,6 +42,18 @@ Prereleases are not admitted. Build metadata does not change compatibility.
 The supported range is declared in `pplx-space-spaced-common`; changing the host
 release number does not change that range implicitly.
 
+From 0.8.1, guests report their OS and supported operations in the readiness
+response. The host intersects these claims with trusted image policy. Linux
+guests through 0.8.0 may omit the descriptor; the host derives their supported
+operations from their release. Newer guests must provide it. An empty explicit
+operation list grants nothing. The host's supported guest range is unchanged,
+including 0.1.4 and 0.8.0.
+
+Hosts that understand the descriptor send readiness contract revision 1 or
+higher. Windows guests refuse readiness to hosts that send zero, including an
+older host relaunched against a resident Windows VM after node rollback. This
+is a readiness compatibility check, not authorization of later RPCs.
+
 Guests and templates retain their actual release version and derived
 compatibility family (`0.1.x` reports `0.1`; `0.8.x` reports `0.8`). The family
 must agree with the guest version, but need not match the host's family.

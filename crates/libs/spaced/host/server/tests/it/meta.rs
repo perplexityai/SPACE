@@ -83,6 +83,7 @@ impl BridgeGuestMeta for ReadyWaitGuest {
         }
         let ready = self.ready.load(Ordering::SeqCst);
         Ok(Response::new(BridgeGuestWaitReadyResponse {
+            platform: None,
             ready,
             guest_uptime: ready.then(|| duration_from_millis(42)),
             version: self.version.to_string(),
@@ -959,7 +960,7 @@ async fn failed_environment_dispatch_invalidates_channel_without_replaying() {
         assert_eq!(
             connections.load(Ordering::SeqCst),
             2,
-            "next caller must use a new guest channel"
+            "one dispatch connection per attempt; invalidation forces fresh negotiation"
         );
         server.abort();
     }

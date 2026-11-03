@@ -16,7 +16,7 @@ pub mod proto {
         pub use super::activity::*;
     }
 
-    pub use pplx_space_spaced_guest_protocol::proto::{bridge_guest, operations, worker};
+    pub use pplx_space_spaced_guest_protocol::proto::{bridge_guest, operations, platform, worker};
 
     pub mod activity {
         tonic::include_proto!("space.spaced.activity.v1");
@@ -54,10 +54,11 @@ pub const BULK_HTTP2_MAX_FRAME_SIZE: u32 = 256 * 1024;
 
 pub use pplx_space_spaced_guest_protocol::admission_queue;
 mod compatibility;
+pub use compatibility::spaced_guest_requires_platform_descriptor;
 mod error;
 pub use pplx_space_spaced_guest_protocol::filesystem_limits;
 pub mod lazy_client;
-pub use pplx_space_spaced_guest_protocol::process_limits;
+pub use pplx_space_spaced_guest_protocol::{platform, process_limits};
 pub mod retry_policy;
 pub mod server;
 pub mod uds;

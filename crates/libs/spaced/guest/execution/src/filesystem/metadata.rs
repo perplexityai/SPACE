@@ -91,6 +91,7 @@ pub(super) async fn file_info_from_path(path: &Path) -> Result<FileInfo, Status>
         .ok_or_else(|| Status::invalid_argument("entry has no file name"))?;
     let symlink_target = symlink_target(path, &metadata).await?;
     Ok(FileInfo {
+        windows_metadata: None,
         name: Some(name),
         path: path_to_string(path)?,
         file_type: classify_file_type(metadata.file_type()).into(),

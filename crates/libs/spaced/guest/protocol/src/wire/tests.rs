@@ -66,14 +66,14 @@ fn parse_env_drops_invalid_entries() {
 #[test]
 fn parse_env_caps_aggregate_overflow() {
     let env = parse_env(
-        (0..=pplx_space_common_core::types::MAX_ENV_ENTRIES)
+        (0..=pplx_space_guest_process::MAX_ENV_ENTRIES)
             .map(|idx| (format!("KEY_{idx}"), "value".to_string()))
             .collect(),
     );
 
     assert_eq!(
         proto_env(&env).len(),
-        pplx_space_common_core::types::MAX_ENV_ENTRIES
+        pplx_space_guest_process::MAX_ENV_ENTRIES
     );
 }
 

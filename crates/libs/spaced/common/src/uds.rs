@@ -174,7 +174,9 @@ pub async fn connect_uds_channel(
     service_name: &'static str,
     socket_path: &Path,
 ) -> Result<tonic::transport::Channel, UdsConnectError> {
-    connect_uds_channel_inner(service_name, socket_path, None).await
+    connect_uds_channel_inner(service_name, socket_path, None, false)
+        .await
+        .map(|(channel, _)| channel)
 }
 
 /// Connect to one authenticated UDS peer without allowing transparent channel
@@ -185,14 +187,26 @@ pub async fn connect_uds_channel_with_expected_peer(
     socket_path: &Path,
     expected_peer: ExpectedUdsPeer,
 ) -> Result<tonic::transport::Channel, UdsConnectError> {
-    connect_uds_channel_inner(service_name, socket_path, Some(expected_peer)).await
+    connect_uds_channel_inner(service_name, socket_path, Some(expected_peer), true)
+        .await
+        .map(|(channel, _)| channel)
+}
+
+/// One physical channel for connection-scoped protocol negotiation. Reconnects
+/// require a new channel and a fresh negotiation before dispatch.
+pub async fn connect_uds_channel_pinned(
+    service_name: &'static str,
+    socket_path: &Path,
+) -> Result<(tonic::transport::Channel, PinnedConnection), UdsConnectError> {
+    connect_uds_channel_inner(service_name, socket_path, None, true).await
 }
 
 async fn connect_uds_channel_inner(
     service_name: &'static str,
     socket_path: &Path,
     expected_peer: Option<ExpectedUdsPeer>,
-) -> Result<tonic::transport::Channel, UdsConnectError> {
+    pin_connection: bool,
+) -> Result<(tonic::transport::Channel, PinnedConnection), UdsConnectError> {
     let path = socket_path.to_path_buf();
     let endpoint = tonic::transport::Endpoint::try_from("http://[::]:50051")
         .map(|endpoint| endpoint.max_frame_size(crate::BULK_HTTP2_MAX_FRAME_SIZE))
@@ -201,13 +215,15 @@ async fn connect_uds_channel_inner(
     // the PID can be reused after the original peer exits. The caller can
     // validate stronger activation evidence after this initial connection;
     // any later reconnect has to restart that entire attestation sequence.
-    let connection_claimed = expected_peer
-        .is_some()
+    let connection_claimed = (expected_peer.is_some() || pin_connection)
         .then(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    let connection = PinnedConnection::new();
+    let observed_connection = connection.clone();
     endpoint
         .connect_with_connector(tower::service_fn(move |_| {
             let socket_path = path.clone();
             let connection_claimed = connection_claimed.clone();
+            let connection = connection.clone();
             async move {
                 if let Some(claimed) = connection_claimed {
                     claim_single_connection(&claimed)?;
@@ -216,10 +232,14 @@ async fn connect_uds_channel_inner(
                 if let Some(expected_peer) = expected_peer {
                     validate_expected_uds_peer(&stream, expected_peer)?;
                 }
-                Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+                Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(PinnedIo::new(
+                    stream,
+                    &connection,
+                )))
             }
         }))
         .await
+        .map(|channel| (channel, observed_connection))
         .map_err(|source| UdsConnectError::Transport {
             service_name,
             path: socket_path.to_path_buf(),

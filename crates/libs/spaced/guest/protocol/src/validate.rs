@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use pplx_space_common_core::types::ReadyTimeout;
+use pplx_space_guest_process::ReadyTimeout;
 use tonic::Status;
 
 use crate::invalid_argument_status;

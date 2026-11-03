@@ -4,6 +4,7 @@ package space.spaced.bridge.guest.v1;
 import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
 import "spaced/operations/v1/operations.proto";
+import "spaced/platform/v1/platform.proto";
 // SPACED_COMPAT_REMOVE_WHEN_MIN_GUEST_0_1_4: also requires MIN_HOST 0.1.4.
 import public "spaced/bridge/guest/v1/legacy.proto";
 
@@ -83,7 +84,13 @@ message GuestDiagnosticCallsite {
   uint64 count = 5;
 }
 
-message WaitReadyRequest { google.protobuf.Duration timeout = 1; }
+message WaitReadyRequest {
+  google.protobuf.Duration timeout = 1;
+  // Hosts that understand the platform descriptor send at least 1. Zero
+  // identifies a host that can drive only Linux guests; Windows refuses
+  // readiness. This checks readiness compatibility, not later RPC authorization.
+  uint32 host_contract_revision = 2;
+}
 message WaitReadyResponse {
   bool ready = 1;
   google.protobuf.Duration guest_uptime = 2;
@@ -91,6 +98,10 @@ message WaitReadyResponse {
   string compatibility_family = 4;
   optional uint64 mem_total_bytes = 5;
   optional uint32 vcpu_count = 6;
+  // Required from guest release 0.8.1. Omission is accepted only for Linux
+  // guests through 0.8.0 under trusted Linux policy, using their release's
+  // supported operations. An explicit empty operation list grants nothing.
+  space.spaced.platform.v1.GuestPlatformDescriptor platform = 7;
 }
 
 message ConfigureProcessEnvRequest {

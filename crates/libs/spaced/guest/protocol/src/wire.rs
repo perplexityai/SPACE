@@ -1,4 +1,4 @@
-//! Shared conversions between generated protobuf structs and common/core
+//! Shared conversions between generated protobuf structs and guest-process
 //! domain types.
 //!
 //! Keep service methods focused on transport behavior by putting repeated
@@ -10,9 +10,10 @@
 
 use std::collections::HashMap;
 
-use pplx_space_common_core::types::{
-    EnvMap, EnvSanitizationIssue, IdempotencyKey, Pii, ReadyTimeout, RelativeGlobPattern,
+use pplx_space_guest_process::{
+    EnvMap, EnvSanitizationIssue, IdempotencyKey, ReadyTimeout, RelativeGlobPattern,
 };
+use pplx_space_pii::Pii;
 use tonic::Status;
 
 use crate::invalid_argument_status;

@@ -62,6 +62,7 @@ impl Process for SpacedHostService {
         let guest_stream = self
             .call_bridge_guest_process(
                 "bridge_guest_process_start",
+                Requirement::Operations(&[GuestOperation::Process]),
                 BridgeGuestOperationBudget::ProcessStreamOpen,
                 move |mut client| {
                     let request = request.clone();
@@ -86,6 +87,7 @@ impl Process for SpacedHostService {
         let guest_stream = self
             .call_bridge_guest_process(
                 "bridge_guest_process_connect",
+                Requirement::Operations(&[GuestOperation::Process]),
                 BridgeGuestOperationBudget::ProcessStreamOpen,
                 move |mut client| {
                     let request = request.clone();
@@ -112,6 +114,7 @@ impl Process for SpacedHostService {
         let guest_stream = self
             .call_bridge_guest_process(
                 "bridge_guest_process_list",
+            Requirement::Operations(&[GuestOperation::Process]),
                 BridgeGuestOperationBudget::ProcessMetadata,
                 |mut client| {
                     let process_id = process_id.clone();
@@ -151,6 +154,7 @@ impl Process for SpacedHostService {
         let request = bridge_process_send_signal_request(request.into_inner())?;
         self.call_bridge_guest_process_once(
             "bridge_guest_process_send_signal",
+            Requirement::Operations(&[GuestOperation::Process]),
             BridgeGuestOperationBudget::ProcessControl,
             |mut client| {
                 let request = request.clone();
@@ -165,12 +169,10 @@ impl Process for SpacedHostService {
         &self,
         request: Request<SendInputRequest>,
     ) -> Result<Response<SendInputResponse>, Status> {
-        // SPACED_COMPAT_REMOVE_WHEN_MIN_GUEST_0_1_2: remove only this gate call.
-        self.require_interactive_process_control_support("SendInput")
-            .await?;
         let request = bridge_process_send_input_request(request.into_inner())?;
         self.call_bridge_guest_process_once(
             "bridge_guest_process_send_input",
+            Requirement::InteractiveProcessControl("SendInput"),
             BridgeGuestOperationBudget::ProcessControl,
             |mut client| {
                 let request = request.clone();
@@ -185,12 +187,10 @@ impl Process for SpacedHostService {
         &self,
         request: Request<CloseStdinRequest>,
     ) -> Result<Response<CloseStdinResponse>, Status> {
-        // SPACED_COMPAT_REMOVE_WHEN_MIN_GUEST_0_1_2: remove only this gate call.
-        self.require_interactive_process_control_support("CloseStdin")
-            .await?;
         let request = bridge_process_close_stdin_request(request.into_inner())?;
         self.call_bridge_guest_process_once(
             "bridge_guest_process_close_stdin",
+            Requirement::InteractiveProcessControl("CloseStdin"),
             BridgeGuestOperationBudget::ProcessControl,
             |mut client| {
                 let request = request.clone();
@@ -205,12 +205,10 @@ impl Process for SpacedHostService {
         &self,
         request: Request<ResizePtyRequest>,
     ) -> Result<Response<ResizePtyResponse>, Status> {
-        // SPACED_COMPAT_REMOVE_WHEN_MIN_GUEST_0_1_2: remove only this gate call.
-        self.require_interactive_process_control_support("ResizePty")
-            .await?;
         let request = bridge_process_resize_pty_request(request.into_inner())?;
         self.call_bridge_guest_process_once(
             "bridge_guest_process_resize_pty",
+            Requirement::InteractiveProcessControl("ResizePty"),
             BridgeGuestOperationBudget::ProcessControl,
             |mut client| {
                 let request = request.clone();
@@ -225,6 +223,7 @@ impl Process for SpacedHostService {
         let request = bridge_process_kill_request(request.into_inner())?;
         self.call_bridge_guest_process_once(
             "bridge_guest_process_kill",
+            Requirement::Operations(&[GuestOperation::Process]),
             BridgeGuestOperationBudget::ProcessControl,
             |mut client| {
                 let request = request.clone();

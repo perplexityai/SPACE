@@ -31,6 +31,8 @@ use tonic::{Request, Response, Status};
 
 #[derive(Clone)]
 pub(crate) struct MockBridgeGuest {
+    pub(crate) platform: Option<pplx_space_spaced_common::proto::platform::GuestPlatformDescriptor>,
+    pub(crate) platform_withdrawn: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub(crate) version: &'static str,
     pub(crate) ready: bool,
     pub(crate) wait_ready_not_ready_mark: bool,
@@ -48,6 +50,8 @@ pub(crate) struct MockBridgeGuest {
 impl Default for MockBridgeGuest {
     fn default() -> Self {
         Self {
+            platform: None,
+            platform_withdrawn: None,
             version: "0.1.4",
             ready: true,
             wait_ready_not_ready_mark: false,
@@ -549,6 +553,16 @@ impl Meta for MockBridgeGuest {
                 .mark(Status::unavailable("guest marked itself not ready")));
         }
         Ok(Response::new(WaitReadyResponse {
+            platform: self.platform.clone().map(|mut platform| {
+                if self
+                    .platform_withdrawn
+                    .as_ref()
+                    .is_some_and(|withdrawn| withdrawn.load(Ordering::SeqCst))
+                {
+                    platform.operations.clear();
+                }
+                platform
+            }),
             ready: self.ready,
             guest_uptime: self.ready.then_some(prost_types::Duration {
                 seconds: 1,
