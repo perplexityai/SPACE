@@ -208,3 +208,9 @@ mod runtime_contract_tests;
 
 // Disposable producer-timing probe: never merge.
 // A second line, so this run rebuilds what the saved state built.
+
+/// Disposable producer-timing probe: a public item, so every dependent
+/// re-checks against new metadata. Never merge.
+pub fn probe_incremental_codegen_marker() -> u32 {
+    7
+}
