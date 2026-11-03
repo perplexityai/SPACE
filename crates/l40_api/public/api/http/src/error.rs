@@ -355,7 +355,14 @@ impl PublicApiError {
 }
 
 pub async fn normalize_public_error_response(request: Request, next: Next) -> Response {
-    let response = next.run(request).await;
+    normalize_public_error(next.run(request).await)
+}
+
+/// What [`normalize_public_error_response`] does to one response, for a
+/// server that cannot run it as a layer: a framework rejection or another
+/// error status that is not already a Native envelope becomes one, keeping
+/// its status and its `Allow`, `Retry-After` and `WWW-Authenticate` headers.
+pub fn normalize_public_error(response: Response) -> Response {
     let status = response.status();
     if !(status.is_client_error() || status.is_server_error())
         || response.extensions().get::<PublicErrorResponse>().is_some()

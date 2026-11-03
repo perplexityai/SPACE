@@ -6,7 +6,7 @@ use pplx_space_data_plane_server::{
     DEFAULT_MAX_ATTACHED_STREAMS, DEFAULT_MAX_ATTACHED_STREAMS_PER_ORG,
     DEFAULT_MAX_ATTACHED_STREAMS_PER_SANDBOX, DEFAULT_REVOCATION_CHECK_INTERVAL_MS,
     DEFAULT_ROUTE_CACHE_TTL_MS, DEFAULT_UNAUTHENTICATED_UPGRADE_CAP_PER_IP, DataPlaneConfig,
-    MAX_REVOCATION_CHECK_INTERVAL_MS, MIN_SHUTDOWN_GRACE, UploadAdmissionArgs,
+    MAX_REVOCATION_CHECK_INTERVAL_MS, MIN_SHUTDOWN_GRACE, NativeFilesMode, UploadAdmissionArgs,
 };
 
 // Same allocator choice as space-api-svc: glibc arenas keep the peak of an
@@ -102,6 +102,17 @@ struct Cli {
         value_parser = clap::value_parser!(u64).range(MIN_SHUTDOWN_GRACE.as_secs()..)
     )]
     shutdown_grace_secs: Option<u64>,
+
+    /// `serve` to answer Native `files:*` under `/v1` and `/api/v1`, with
+    /// each request decided by the lifecycle API's activation listener at
+    /// `SPACE_INGRESS_ACTIVATION_ENDPOINT`; `off` leaves the routes unmounted.
+    #[arg(
+        long,
+        env = "SPACE_DATA_PLANE_NATIVE_FILES",
+        value_enum,
+        default_value_t = NativeFilesMode::Off
+    )]
+    native_files: NativeFilesMode,
 }
 
 impl From<Cli> for DataPlaneConfig {
@@ -120,6 +131,7 @@ impl From<Cli> for DataPlaneConfig {
             route_cache_ttl: Duration::from_millis(cli.route_cache_ttl_ms.max(1)),
             upload_admission: cli.upload.config(),
             shutdown_grace: cli.shutdown_grace_secs.map(Duration::from_secs),
+            native_files: cli.native_files,
         }
     }
 }

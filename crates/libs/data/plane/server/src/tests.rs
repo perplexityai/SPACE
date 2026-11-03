@@ -991,6 +991,7 @@ async fn test_data_plane_state_with_runtime_access(
         attached_streams: Arc::new(AttachedStreamLimiter::new(4, 4, 4)),
         uploads: None,
         upload_tracker: Arc::default(),
+        native_files: None,
         native_sessions: Arc::new(NativeSessionAttachLimiter::default()),
         backend_channels: Arc::new(BackendChannelPool::new(1)),
         revocation_cache: Arc::new(RevocationCache::default()),

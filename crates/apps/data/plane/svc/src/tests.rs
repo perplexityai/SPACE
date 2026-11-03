@@ -71,3 +71,27 @@ fn revocation_check_interval_above_the_maximum_is_rejected() {
         .is_err()
     );
 }
+
+#[test]
+fn native_files_are_off_unless_served() {
+    if !pplx_space_test_env::enter_test_process(&[("SPACE_DATA_PLANE_NATIVE_FILES", None)]) {
+        return;
+    }
+    assert_eq!(config(&[]).native_files, NativeFilesMode::Off);
+    assert_eq!(
+        config(&["--native-files", "serve"]).native_files,
+        NativeFilesMode::Serve
+    );
+    assert!(Cli::try_parse_from(["space-data-plane-svc", "--native-files", "on"]).is_err());
+}
+
+#[test]
+fn native_files_are_served_from_the_environment() {
+    if !pplx_space_test_env::enter_test_process(&[(
+        "SPACE_DATA_PLANE_NATIVE_FILES",
+        Some(std::ffi::OsStr::new("serve")),
+    )]) {
+        return;
+    }
+    assert_eq!(config(&[]).native_files, NativeFilesMode::Serve);
+}

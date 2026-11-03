@@ -129,6 +129,31 @@ pub fn is_node_api_draining_status(status: &tonic::Status) -> bool {
     status.code() == tonic::Code::Unavailable && status.message() == NODE_API_DRAINING_MESSAGE
 }
 
+static TRANSPORT_CLOSE_MESSAGE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(
+    || {
+        regex::Regex::new(
+        r"(?i)connection (closed|reset)|goaway|h2 protocol error|http2 error|rst_stream|socket closed|transport error|transport is closing",
+    )
+    .expect("stream-open transport close regex compiles")
+    },
+);
+
+/// Whether a node-api stream that failed to open may be opened again over a
+/// new connection: the node-api is draining, or the connection closed under
+/// the call. Either way the request never reached a handler.
+pub fn should_reconnect_stream_open(status: &tonic::Status) -> bool {
+    is_node_api_draining_status(status) || is_transport_close_status(status)
+}
+
+/// Whether `status` reports the call's connection closing, as tonic and
+/// hyper word it.
+pub fn is_transport_close_status(status: &tonic::Status) -> bool {
+    matches!(
+        status.code(),
+        tonic::Code::Unavailable | tonic::Code::Unknown | tonic::Code::Internal
+    ) && TRANSPORT_CLOSE_MESSAGE.is_match(status.message())
+}
+
 macro_rules! node_api_unary_methods {
     ($(
         $method:ident, $client_new:path, $request:ty, $response:ty;
