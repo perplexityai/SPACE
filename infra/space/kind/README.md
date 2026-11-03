@@ -1436,8 +1436,13 @@ or debug pod on that node is restarting. The next pod that needs one fails with
 
 Before it creates anything, `up.sh` warns, without refusing, when the
 Docker data root or `$SPACE_KIND_DATA_ROOT` has less than
-`SPACE_KIND_MIN_FREE_GIB` (default 30) GiB free, and names the cleanups that
-cannot remove anything a bring-up needs. To inspect a node:
+`SPACE_KIND_MIN_FREE_GIB` GiB free, and names the cleanups that cannot remove
+anything a bring-up needs. The default is 30, plus 10 per SPACE node for the
+Docker data root: it also holds each node's `/var`, with every SPACE node's
+sparse btrfs cache image (up to 40 GiB each) and the object store's data. If
+that disk fills, btrfs on every SPACE node goes read-only and sandbox creates
+fail with "Read-only file system" until that node restarts (`docker restart
+<node>` reformats its cache) or the cluster is torn down. To inspect a node:
 
 ```bash
 docker exec space-local-worker df -h /var/lib/containerd

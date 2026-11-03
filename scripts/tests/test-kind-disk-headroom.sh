@@ -3,12 +3,15 @@
 # host's disks or daemon.
 #   1. Both disks with room: silent.
 #   2. A low Docker data root warns with its safe cleanups, the host image
-#      prune among them, and only that.
+#      prune among them, and names the read-only btrfs it leads to, and only
+#      that.
 #   3. A low data root that does not exist yet is measured at its nearest
 #      existing ancestor and warns with the superseded-image prune, never
 #      recommending `crictl rmi --prune`.
 #   4. A Docker data root this host cannot see, or a failing df, is not a
 #      warning. Every case exits 0: the check never refuses a bring-up.
+#   5. With no explicit minimum, the Docker data root, which holds every SPACE
+#      node's cache image, needs more free than the data root's default 30 GiB.
 set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 script="$repo_root/infra/space/kind/scripts/check-disk-headroom.sh"
@@ -58,6 +61,7 @@ STUB_DOCKER_FREE_KIB=$short STUB_DATA_FREE_KIB=$plenty run
 has "the Docker data root ($work/docker-root) has 12.0 GiB free, under 30 GiB."
 has "docker image prune -f"
 has "prune-superseded-images.py --host --cluster space-local"
+has "Read-only file system"
 lacks "SPACE_KIND_DATA_ROOT ("
 
 # Case 3.
@@ -73,5 +77,13 @@ STUB_DOCKER_ROOT=/nonexistent/docker STUB_DOCKER_FREE_KIB=$short STUB_DATA_FREE_
 [[ ! -s "$work/output" ]] || fail "an invisible Docker data root was reported"
 STUB_DF_FAILS=1 STUB_DOCKER_FREE_KIB=$short STUB_DATA_FREE_KIB=$short run
 [[ ! -s "$work/output" ]] || fail "a failing df was reported as low"
+
+# Case 5.
+SPACE_KIND_MIN_FREE_GIB='' STUB_DOCKER_FREE_KIB=$plenty STUB_DATA_FREE_KIB=$plenty run
+has "the Docker data root ($work/docker-root) has 40.0 GiB free, under "
+has "btrfs on every SPACE node"
+lacks "SPACE_KIND_DATA_ROOT ("
+SPACE_KIND_MIN_FREE_GIB='' STUB_DOCKER_FREE_KIB=$((200 * 1024 * 1024)) STUB_DATA_FREE_KIB=$plenty run
+[[ ! -s "$work/output" ]] || fail "200 GiB free on the Docker data root still warned by default"
 
 exit "$status"
