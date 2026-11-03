@@ -122,11 +122,16 @@ export function spacedCountsFromServer(groups: ServerSpacedCount[]): SpacedCount
   };
 }
 
-// A server without the count route answers 400 (it reads `spaced-versions`
-// as a sandbox ID) or 404; any other failure is reported, not sampled.
+// Whether the server has no count route. As for any route the server lacks,
+// a 404 from the API's fallback or a 405 (the path known without GET) means
+// it is missing. On this path an older server's `GET /sandboxes/{id}` also
+// answers: 400 (`spaced-versions` is not a sandbox ID) or that handler's own
+// 404, which here can only mean the route is missing too. Any other failure
+// is reported, not sampled. A body other than `{counts}`, such as a bare
+// array, is the older answer as well (see `loadSpacedCounts`).
 export function spacedCountRouteMissing(err: unknown): boolean {
   const status = (err as { status?: unknown } | null)?.status;
-  return status === 400 || status === 404;
+  return status === 400 || status === 404 || status === 405;
 }
 
 // The server's count when it has the route, else the tally of a sample.

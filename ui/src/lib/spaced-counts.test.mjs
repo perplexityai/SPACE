@@ -112,7 +112,7 @@ test('a server group with status deleted is not counted', () => {
 
 test('the server count is used when the route answers, and the sample only when it is missing', async () => {
   const sampleRows = Array.from({ length: 3 }, () => row('seed', '0.8.3'));
-  const routeError = (status) => async () => { throw Object.assign(new Error(`status ${status}`), { status }); };
+  const routeError = (status, body = null) => async () => { throw Object.assign(new Error(`status ${status}`), { status, body }); };
   let sampled = 0;
   const readSample = async () => { sampled += 1; return sampleRows; };
 
@@ -121,22 +121,27 @@ test('the server count is used when the route answers, and the sample only when 
   assert.equal(server.running, 9);
   assert.equal(sampled, 0);
 
-  // A server without the route reads `spaced-versions` as a sandbox ID (400)
-  // or has no such path (404).
-  for (const status of [400, 404]) {
-    const counts = await loadSpacedCounts(routeError(status), readSample, 1000);
-    assert.equal(counts.source, 'sample', String(status));
+  // A server without the route reads `spaced-versions` as a sandbox ID (400,
+  // or the sandbox handler's 404), has no such path (the fallback's 404), or
+  // knows the path without GET (405).
+  const missing = [
+    routeError(400), routeError(404, { error: 'Sandbox not found' }), routeError(404, { code: 404, message: 'Endpoint not found' }),
+    routeError(404), routeError(405),
+  ];
+  for (const readServer of missing) {
+    const counts = await loadSpacedCounts(readServer, readSample, 1000);
+    assert.equal(counts.source, 'sample');
     assert.equal(counts.running, 3);
     assert.equal(counts.sampleLimit, 1000);
   }
   // A body of another shape is not a count either.
   assert.equal((await loadSpacedCounts(async () => [], readSample)).source, 'sample');
   assert.equal((await loadSpacedCounts(async () => ({ counts: [{ template: 'seed' }] }), readSample)).source, 'sample');
-  assert.equal(sampled, 4);
+  assert.equal(sampled, 7);
 
   // Any other failure is the server's answer, not a reason to sample.
   for (const status of [403, 500, 503]) {
     await assert.rejects(loadSpacedCounts(routeError(status), readSample), new RegExp(`status ${status}`));
   }
-  assert.equal(sampled, 4);
+  assert.equal(sampled, 7);
 });
