@@ -738,6 +738,7 @@ async fn retention_prune_skips_pinned_and_leased_snapshot_artifacts() {
             &ctx,
             &sandbox_id,
             &cache_root,
+            1,
             &mut recorded,
             async |_| {
                 let free = coordinator
@@ -1061,28 +1062,42 @@ impl StagingHarness {
         };
     }
 
-    /// One scheduled tick's retention, recorded and gauged as the scheduler
-    /// loop does it.
+    /// One scheduled tick's retention, advanced, recorded and gauged as the
+    /// scheduler loop does it.
     async fn tick(&self) -> StagingTick {
         self.deletes.lock().unwrap().clear();
         let counters = pplx_space_metrics::test_capture::capture_counters_guard();
         let values = pplx_space_metrics::test_capture::capture_values_guard();
-        let mut recorded = None;
+        let (mut ticked, mut recorded) = (None, None);
         let mut captured = false;
-        let result = super::retention::prune_and_capture(
-            &mut self.node_manager.connector().lazy(),
-            &self.ctx,
-            &self.sandbox_id,
-            &self.cache_root,
-            &mut recorded,
-            async |_| Ok(()),
-            async |_, ()| {
-                captured = true;
-                Ok(())
-            },
-        )
+        let result = run_scheduled_tick(&self.states, &self.sandbox_id, async |tick, _| {
+            ticked = Some(tick);
+            super::retention::prune_and_capture(
+                &mut self.node_manager.connector().lazy(),
+                &self.ctx,
+                &self.sandbox_id,
+                &self.cache_root,
+                tick,
+                &mut recorded,
+                async |_| Ok(()),
+                async |_, ()| {
+                    captured = true;
+                    Ok(())
+                },
+            )
+            .await?;
+            Ok(CheckpointCompletion::Complete)
+        })
         .await;
-        super::retention::record_unowned_staging(&self.states, &self.sandbox_id, recorded).await;
+        if let Some(tick) = ticked {
+            super::retention::record_unowned_staging(
+                &self.states,
+                &self.sandbox_id,
+                tick,
+                recorded,
+            )
+            .await;
+        }
         super::retention::emit_unowned_staging_gauge(&self.states).await;
         StagingTick {
             result,
@@ -1199,7 +1214,8 @@ async fn staging_at_the_limit_blocks_captures_until_one_is_deleted() {
         let error = observed.result.as_ref().unwrap_err();
         assert!(error.contains("capture blocked"), "tick {tick}: {error}");
         assert!(!observed.captured, "tick {tick}");
-        assert_eq!(observed.deletes, [stuck[0].clone()], "tick {tick}");
+        assert_eq!(observed.deletes.len(), 1, "tick {tick}");
+        assert!(stuck.contains(&observed.deletes[0]), "tick {tick}");
         assert_eq!(
             observed.recorded,
             Some(UNOWNED_STAGING_LIMIT),
@@ -1218,12 +1234,17 @@ async fn staging_at_the_limit_blocks_captures_until_one_is_deleted() {
     );
     assert_eq!(gate_events(&events), std::slice::from_ref(&blocked));
 
-    harness.answer(&stuck[0], None);
+    for path in &stuck {
+        harness.answer(path, None);
+    }
     let observed = harness.tick().await;
     observed.result.as_ref().unwrap();
     assert!(observed.captured);
-    assert_eq!(observed.deletes, [stuck[0].clone()]);
-    assert!(!std::path::Path::new(&stuck[0]).exists());
+    let [deleted] = observed.deletes.as_slice() else {
+        panic!("one leftover retried: {:?}", observed.deletes);
+    };
+    assert!(stuck.contains(deleted));
+    assert!(!std::path::Path::new(deleted).exists());
     assert_eq!(observed.recorded, Some(UNOWNED_STAGING_LIMIT - 1));
     assert_eq!(observed.skips, Vec::<String>::new());
     assert_eq!(observed.gauges, [(UNOWNED_STAGING_LIMIT - 1) as f64]);
@@ -1236,6 +1257,68 @@ async fn staging_at_the_limit_blocks_captures_until_one_is_deleted() {
                 harness.sandbox_id.clone()
             )
         ]
+    );
+}
+
+/// A stop/start that replaces the sandbox's registration while a tick's
+/// retention runs gets neither that tick's count nor its gate event, as
+/// `run_scheduled_tick` leaves the replacement's checkpoint alone. Its own
+/// first tick records its own count and reports the gate it finds closed.
+#[tokio::test(start_paused = true)]
+async fn a_replacement_registration_gets_no_count_from_the_old_tick() {
+    use super::retention::UNOWNED_STAGING_LIMIT;
+
+    let harness = StagingHarness::new();
+    // Each tick's retry deletes one: the limit and one more remain after the
+    // first, the limit after the second.
+    let leftovers: Vec<String> = (0..=UNOWNED_STAGING_LIMIT as u128 + 1)
+        .map(|serial| harness.leftover(serial, None))
+        .collect();
+    for leftover in &leftovers {
+        harness.answer(leftover, Some(StagingAnswer::Takes(Duration::from_secs(2))));
+    }
+    let events = crate::service::tests::service_tests::SandboxEventCapture::default();
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let _subscriber =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(events.clone()));
+
+    let (observed, ()) = tokio::join!(harness.tick(), async {
+        // While the tick's retry is still deleting.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        harness.states.lock().await.insert(
+            harness.sandbox_id.clone(),
+            SandboxSnapshotState {
+                tick_count: 0,
+                pending_checkpoint: None,
+                template: "seed".into(),
+                unowned_staging: None,
+            },
+        );
+    });
+    let error = observed.result.as_ref().unwrap_err();
+    assert!(error.contains("capture blocked"), "{error}");
+    assert_eq!(observed.recorded, Some(UNOWNED_STAGING_LIMIT + 1));
+    {
+        let states = harness.states.lock().await;
+        let replacement = &states[&harness.sandbox_id];
+        assert_eq!(replacement.tick_count, 0);
+        assert_eq!(replacement.unowned_staging, None);
+    }
+    assert_eq!(gate_events(&events), Vec::new());
+
+    let observed = harness.tick().await;
+    observed.result.as_ref().unwrap_err();
+    assert_eq!(observed.recorded, Some(UNOWNED_STAGING_LIMIT));
+    assert_eq!(
+        harness.states.lock().await[&harness.sandbox_id].unowned_staging,
+        Some(UNOWNED_STAGING_LIMIT)
+    );
+    assert_eq!(
+        gate_events(&events),
+        [(
+            "scheduled_snapshots_blocked".to_owned(),
+            harness.sandbox_id.clone()
+        )]
     );
 }
 
@@ -1259,38 +1342,65 @@ async fn unavailable_staging_delete_is_retried_once_and_not_counted() {
     assert!(!std::path::Path::new(&transient).exists());
     assert_eq!(observed.recorded, Some(0));
 
-    // Unavailable twice, as the oldest of the limit's worth of leftovers.
+    // Unavailable twice, as the one retried of the limit's worth of leftovers.
     let harness = StagingHarness::new();
     let leftovers: Vec<String> = (1..=UNOWNED_STAGING_LIMIT as u128)
         .map(|serial| harness.leftover(serial, None))
         .collect();
-    harness.answer(&leftovers[0], Some(StagingAnswer::Unavailable(2)));
+    for leftover in &leftovers {
+        harness.answer(leftover, Some(StagingAnswer::Unavailable(2)));
+    }
     let observed = harness.tick().await;
     observed.result.as_ref().unwrap();
     assert!(observed.captured);
-    assert_eq!(
-        observed.deletes,
-        [leftovers[0].clone(), leftovers[0].clone()]
-    );
-    assert!(std::path::Path::new(&leftovers[0]).exists());
+    let [retried, retried_again] = observed.deletes.as_slice() else {
+        panic!("one leftover retried once: {:?}", observed.deletes);
+    };
+    assert_eq!(retried, retried_again);
+    assert!(leftovers.contains(retried));
+    assert!(std::path::Path::new(retried).exists());
     assert_eq!(observed.recorded, Some(UNOWNED_STAGING_LIMIT - 1));
     assert_eq!(observed.skips, Vec::<String>::new());
 }
 
-/// Retention retries at most one leftover per tick, oldest artifact first
-/// whatever its name's shape or listing position; the orphan sweep owns the
-/// rest, so a backlog cannot stretch the node's scheduler loop.
+/// Retention retries at most one leftover per tick, the orphan sweep owning
+/// the rest, so a backlog cannot stretch the node's scheduler loop. The ticks
+/// take the leftovers in turn, in artifact-id order whatever their names'
+/// shape or listing position, so leftovers that never delete each take the
+/// retry on their own tick and none of them keeps it from the others.
 #[tokio::test]
-async fn retention_retries_one_leftover_per_tick_oldest_first() {
+async fn retention_retries_one_leftover_per_tick_in_turn() {
     let harness = StagingHarness::new();
     // The earlier `<name>.gc-pending-<id>` shape lists after `.gc-pending-*`.
-    let oldest = harness.leftover(1, Some("d-1m-20260101T000000Z"));
-    let (second, third) = (harness.leftover(2, None), harness.leftover(3, None));
+    let stuck = [
+        harness.leftover(1, Some("d-1m-20260101T000000Z")),
+        harness.leftover(2, None),
+        harness.leftover(3, None),
+    ];
+    for path in &stuck {
+        harness.answer(path, Some(StagingAnswer::Stuck));
+    }
+    for (tick, retried) in [(1, 1), (2, 2), (3, 0), (4, 1), (5, 2), (6, 0)] {
+        let observed = harness.tick().await;
+        observed.result.as_ref().unwrap();
+        assert!(observed.captured, "tick {tick}");
+        assert_eq!(
+            observed.deletes,
+            std::slice::from_ref(&stuck[retried]),
+            "tick {tick}"
+        );
+        assert_eq!(observed.recorded, Some(stuck.len()), "tick {tick}");
+    }
+
+    // Once they delete, each tick removes the one on its turn.
+    for path in &stuck {
+        harness.answer(path, None);
+    }
     for (tick, retried, remaining) in [
-        (1, vec![oldest.clone()], 2),
-        (2, vec![second.clone()], 1),
-        (3, vec![third.clone()], 0),
-        (4, vec![], 0),
+        (7, vec![stuck[1].clone()], 2),
+        (8, vec![stuck[0].clone()], 1),
+        (9, vec![stuck[2].clone()], 0),
+        (10, vec![], 0),
     ] {
         let observed = harness.tick().await;
         observed.result.as_ref().unwrap();
@@ -1398,7 +1508,9 @@ async fn staging_the_sweep_removed_meanwhile_is_not_counted() {
     let leftovers: Vec<String> = (1..=6)
         .map(|serial| harness.leftover(serial, None))
         .collect();
-    harness.answer(&leftovers[0], Some(StagingAnswer::SweepsAll));
+    for leftover in &leftovers {
+        harness.answer(leftover, Some(StagingAnswer::SweepsAll));
+    }
     let events = crate::service::tests::service_tests::SandboxEventCapture::default();
     use tracing_subscriber::layer::SubscriberExt as _;
     let _subscriber =
@@ -1407,7 +1519,8 @@ async fn staging_the_sweep_removed_meanwhile_is_not_counted() {
     let observed = harness.tick().await;
     observed.result.as_ref().unwrap();
     assert!(observed.captured);
-    assert_eq!(observed.deletes, [leftovers[0].clone()]);
+    assert_eq!(observed.deletes.len(), 1);
+    assert!(leftovers.contains(&observed.deletes[0]));
     assert_eq!(observed.recorded, Some(0));
     assert_eq!(observed.skips, Vec::<String>::new());
     assert_eq!(observed.gauges, [0.0]);

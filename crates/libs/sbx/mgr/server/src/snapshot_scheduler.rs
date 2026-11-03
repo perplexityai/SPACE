@@ -395,8 +395,9 @@ async fn scheduler_loop(
                 // leave work for the next tick without advancing its cadence.
                 break;
             };
-            let mut unowned_staging = None;
+            let (mut ticked, mut unowned_staging) = (None, None);
             if let Err(e) = run_scheduled_tick(&sandboxes, &id, async |tick, checkpoint| {
+                ticked = Some(tick);
                 process_tick(&id, &template, tick, checkpoint, &ctx, &mut unowned_staging).await
             })
             .await
@@ -407,7 +408,9 @@ async fn scheduler_loop(
                     "snapshot scheduler tick failed"
                 );
             }
-            retention::record_unowned_staging(&sandboxes, &id, unowned_staging).await;
+            if let Some(tick) = ticked {
+                retention::record_unowned_staging(&sandboxes, &id, tick, unowned_staging).await;
+            }
         }
         retention::emit_unowned_staging_gauge(&sandboxes).await;
     }
@@ -511,6 +514,7 @@ async fn process_tick(
         ctx,
         sandbox_id,
         CACHE_DIR,
+        tick,
         unowned_staging,
         async |node_client| {
             // This flush belongs to the disk-only snapshots below. A full

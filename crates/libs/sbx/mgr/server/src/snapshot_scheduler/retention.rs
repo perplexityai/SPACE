@@ -36,10 +36,12 @@ pub(super) const KEEP_F_6H: usize = 4;
 /// surplus a later prune moves aside, so while DeleteCacheArtifact keeps
 /// failing more captures would only add staging. Five is more than a healthy
 /// tick adds for the next prune to stage (its d-1m, its d-5m and one full
-/// checkpoint), so one stuck directory, or one tick's failed deletes, never
-/// blocks a capture. It is also no more than the 1m tier retains
-/// ([`KEEP_D_1M`]), so stuck staging stops growing from captures at about one
-/// disk tier's worth of snapshots.
+/// checkpoint), so one stuck directory, or one healthy tick's failed deletes,
+/// never blocks a capture. A prune that stages a released pinned or leased
+/// pile at once (see [`STAGING_DELETE_BUDGET`]) can close the gate by itself.
+/// Five is also no more than the 1m tier retains ([`KEEP_D_1M`]), so stuck
+/// staging stops growing from captures at about one disk tier's worth of
+/// snapshots.
 pub(super) const UNOWNED_STAGING_LIMIT: usize = 5;
 
 /// How long retention waits before retrying a staging delete that
@@ -59,10 +61,22 @@ const UNAVAILABLE_RETRY_BACKOFF: Duration = Duration::from_millis(300);
 /// ones pile up past their tier's keep while retention skips them, and one
 /// prune stages them all once released), so the bound is per tick, not per
 /// delete: a tick's deletes hold the loop for at most this long, a quarter of
-/// the scheduler's 60 s tick, however many there are. The delete running when
-/// it is spent is left like a persistent `Unavailable`: node-manager may still
-/// finish it, which is harmless because deletes are idempotent. The deletes
-/// not reached are deferred to later ticks and the orphan sweep.
+/// the scheduler's 60 s tick, however many there are.
+///
+/// The budget bounds one sandbox's tick, not the scheduler's pass over the
+/// node's sandboxes. Node-manager bounds deletes with one node-wide capacity,
+/// so a node-wide delete stall can still cost each scheduled sandbox one
+/// budget per pass; a follow-up bounds the pass.
+///
+/// The delete running when the budget is spent is left like a persistent
+/// `Unavailable`: node-manager may still finish it, which is harmless because
+/// deletes are idempotent. Until its filesystem work ends, though, it holds
+/// the sandbox's artifact lock and mutation claim in node-manager, so if the
+/// budget ran out after the delete started rather than while it was queued,
+/// this tick's CreateBtrfsSnapshot can fail `Unavailable` ("sandbox artifact
+/// work is in progress; retry"). The tick then fails as a capture error,
+/// which `capture_skipped` does not count. The deletes not reached are
+/// deferred to later ticks and the orphan sweep.
 pub(super) const STAGING_DELETE_BUDGET: Duration = Duration::from_secs(15);
 
 /// Keep only the newest entries seen for each scheduled tier. A partial walk
@@ -100,12 +114,14 @@ pub(super) fn retention_candidate(
 
 /// Prune `sandbox_id`'s scheduled snapshots under `cache_root` (a test's own
 /// directory, or the sandbox cache), delete the staging the prune leaves, and
-/// then, unless too much unowned staging remains, `prepare` and `capture`. The
-/// prune and the capture each run under the sandbox's disk artifact
-/// publication locks, so backup selection never races a snapshot's creation
-/// or its retention deletion. The capture depends on nothing the prune read,
-/// so the locks are released between them, which lets the gate below count
-/// the staging left after this tick's unlocked deletes.
+/// then, unless too much unowned staging remains, `prepare` and `capture`.
+/// `tick` is the sandbox's scheduler tick, which picks the leftover retried
+/// ([`Staged::delete`]). The prune and the capture each run under the
+/// sandbox's disk artifact publication locks, so backup selection never races
+/// a snapshot's creation or its retention deletion. The capture depends on
+/// nothing the prune read, so the locks are released between them, which
+/// lets the gate below count the staging left after this tick's unlocked
+/// deletes.
 ///
 /// The staging is deleted with the locks released: the pruned rows are gone,
 /// so nothing owns it, and under the locks a node-manager deletion backlog
@@ -151,11 +167,13 @@ pub(super) fn retention_candidate(
 /// with the locks released as the flush always ran, so the delete time does
 /// not separate it from the capture. Its value is handed to `capture` and
 /// returned.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn prune_and_capture<T>(
     node_client: &mut NodeManagerGrpcClient,
     ctx: &CheckpointContext,
     sandbox_id: &str,
     cache_root: &str,
+    tick: u64,
     unowned_staging: &mut Option<usize>,
     prepare: impl AsyncFnOnce(&mut NodeManagerGrpcClient) -> Result<T, String>,
     capture: impl AsyncFnOnce(&mut NodeManagerGrpcClient, &T) -> Result<(), String>,
@@ -170,7 +188,7 @@ pub(super) async fn prune_and_capture<T>(
         prune_scheduled_snapshots(node_client, &artifacts, sandbox_id, cache_root, &mut staged)
             .await
     };
-    let remaining = staged.delete(node_client, &artifacts).await;
+    let remaining = staged.delete(node_client, &artifacts, tick).await;
     if let Err(error) = pruned {
         pplx_space_metrics::snapshot::scheduler_capture_skipped(SchedulerCaptureSkip::PruneFailed);
         return Err(error);
@@ -220,17 +238,22 @@ enum StagingDelete {
     /// held its claim. Transient, so it is not counted against the gate.
     Unavailable,
     /// No answer before the tick's [`STAGING_DELETE_BUDGET`] was spent.
-    /// Left, and not counted, like [`StagingDelete::Unavailable`].
+    /// Left, and not counted, like [`StagingDelete::Unavailable`]. A delete
+    /// node-manager had started still holds the sandbox's artifact lock, so
+    /// this tick's capture can then fail `Unavailable` (see the budget).
     TimedOut,
     Failed,
 }
 
 impl Staged {
-    /// Delete this prune's own staging and, of the unowned leftovers, only
-    /// the oldest: the lowest artifact id (UUIDv7 for most artifacts, so
-    /// usually the oldest created). The orphan sweep's own task retries the
-    /// rest, so a backlog that other deleters left cannot stall the node's
-    /// scheduler loop, which awaits each sandbox's tick in turn.
+    /// Delete this prune's own staging and at most one of the unowned
+    /// leftovers. The orphan sweep's own task retries the rest, so a backlog
+    /// that other deleters left cannot stall the node's scheduler loop, which
+    /// awaits each sandbox's tick in turn. The leftovers are sorted by artifact
+    /// id and `tick` rotates through them, so one that never deletes takes
+    /// the retry only on its turn rather than on every tick, and the rest of
+    /// the backlog keeps being retried. The rotation needs no state of its
+    /// own: consecutive ticks pick consecutive leftovers.
     ///
     /// The deletes run in turn within one [`STAGING_DELETE_BUDGET`]. The
     /// first that times out has spent it, so the deletes after it are not
@@ -247,6 +270,7 @@ impl Staged {
         mut self,
         node_client: &mut NodeManagerGrpcClient,
         artifacts: &LocalArtifacts,
+        tick: u64,
     ) -> usize {
         self.listed.sort();
         let listed: Vec<(String, String)> = self
@@ -259,12 +283,14 @@ impl Staged {
             listed.iter().map(|(_, staging)| staging.clone()).collect(),
         )
         .await;
-        let mut leftover = listed
+        let mut leftovers: Vec<(String, String)> = listed
             .into_iter()
             .zip(unowned)
-            .filter_map(|(entry, unowned)| unowned.then_some(entry));
-        let retried = leftover.next();
-        let mut recount: Vec<String> = leftover.map(|(_, staging)| staging).collect();
+            .filter_map(|(entry, unowned)| unowned.then_some(entry))
+            .collect();
+        let retried = (!leftovers.is_empty())
+            .then(|| leftovers.remove((tick % leftovers.len() as u64) as usize));
+        let mut recount: Vec<String> = leftovers.into_iter().map(|(_, staging)| staging).collect();
         let budget = tokio::time::Instant::now() + STAGING_DELETE_BUDGET;
         let mut deletes = self.own.iter().chain(&retried);
         for (snapshot_name, staging) in deletes.by_ref() {
@@ -329,9 +355,12 @@ async fn delete_staging(
     }
 }
 
-/// Record a tick's unowned staging count for `sandbox_id`, as retention
+/// Record tick `tick`'s unowned staging count for `sandbox_id`, as retention
 /// observed it, and emit a sandbox event when the count closes or reopens the
-/// capture gate. A tick that observed none keeps the last count. The state is
+/// capture gate. A tick that observed none keeps the last count. As
+/// `run_scheduled_tick` does, it leaves a replacement stop/start registration
+/// alone: a count, or its event, from a tick that began under the old
+/// registration does not belong to one that has not run its own. The state is
 /// in memory, so after a restart or a re-registration the first count that
 /// finds the gate closed reports it again, and one that finds it open reports
 /// nothing: a gate that reopens across a restart or re-registration has its
@@ -340,6 +369,7 @@ async fn delete_staging(
 pub(super) async fn record_unowned_staging(
     sandboxes: &Mutex<HashMap<String, SandboxSnapshotState>>,
     sandbox_id: &str,
+    tick: u64,
     observed: Option<usize>,
 ) {
     let Some(count) = observed else {
@@ -350,6 +380,9 @@ pub(super) async fn record_unowned_staging(
         let Some(state) = map.get_mut(sandbox_id) else {
             return;
         };
+        if state.tick_count != tick {
+            return;
+        }
         state.unowned_staging.replace(count)
     };
     let blocks = |count: usize| count >= UNOWNED_STAGING_LIMIT;
