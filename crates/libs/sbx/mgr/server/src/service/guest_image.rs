@@ -14,11 +14,14 @@ pub(super) fn require_agent(sandbox: &crate::db::SandboxRow) -> Result<(), Statu
 
 pub(super) fn validate_policy(
     image: GuestImageContract,
+    execution: Option<&pplx_space_common_core::types::ExecutionMetadata>,
     policy: &AutoLifecyclePolicy,
 ) -> Result<(), Status> {
-    if !image.supports_auto_memory_lifecycle() && policy.requires_memory_lifecycle() {
+    let profile = pplx_space_execution_catalog::guest::GuestProfile::for_existing(execution, image)
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    if !profile.supports_memory_lifecycle() && policy.requires_memory_lifecycle() {
         return Err(Status::failed_precondition(
-            "agentless firmware guests do not support automatic pause or suspend",
+            "guest profile is not qualified for automatic pause or suspend",
         ));
     }
     Ok(())
