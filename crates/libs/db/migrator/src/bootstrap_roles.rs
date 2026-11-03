@@ -7,9 +7,11 @@
 //!
 //! Provisioned roles:
 //!
-//! - `space_superadmin` — break-glass operator login: `CREATEDB CREATEROLE`,
-//!   plus `rds_superuser` membership on RDS (or `SUPERUSER` on self-managed
-//!   Postgres), plus `space_migrator` membership for application objects.
+//! - `space_superadmin` — operator login with `space_migrator` membership
+//!   for application objects. The default `instance` admin scope also grants
+//!   `CREATEDB CREATEROLE` and `rds_superuser` membership on RDS (or
+//!   `SUPERUSER` on self-managed Postgres). Use `database` scope when other
+//!   applications share the PostgreSQL instance.
 //! - `space_migrator` — the DDL identity schema migrations run as:
 //!   `control-plane up`/`down` connect as it directly or assume it via
 //!   `SET ROLE` (see [`assume_migrator_role`]). It owns every application
@@ -53,7 +55,7 @@
 use pplx_space_common_svc::sql;
 use std::collections::BTreeSet;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use sqlx::{Connection as _, PgConnection};
 
 use crate::sqlstate;
@@ -115,12 +117,62 @@ const RO_COLUMN_DENYLIST: &[(&str, &[&str])] = &[
     ("template_tenant_publication_grants", &["id"]),
 ];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum AdminScope {
+    /// The operator role administers the whole PostgreSQL instance.
+    Instance,
+    /// The operator role only inherits the SPACE schema migration role.
+    Database,
+}
+
+impl AdminScope {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Instance => "instance",
+            Self::Database => "database",
+        }
+    }
+
+    const fn allows_instance_privileges(self) -> bool {
+        match self {
+            Self::Instance => true,
+            Self::Database => false,
+        }
+    }
+}
+
+impl std::fmt::Display for AdminScope {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("unsupported administrator scope {0:?}: expected instance or database")]
+pub struct ParseAdminScopeError(String);
+
+impl std::str::FromStr for AdminScope {
+    type Err = ParseAdminScopeError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "instance" => Ok(Self::Instance),
+            "database" => Ok(Self::Database),
+            _ => Err(ParseAdminScopeError(value.to_owned())),
+        }
+    }
+}
+
 #[derive(Parser)]
 pub struct BootstrapRolesArgs {
     /// Control-plane Postgres connection URI. Must authenticate as a role
     /// that can create roles: the RDS master user or a local superuser.
     #[arg(long)]
     pub database_url: String,
+
+    /// Scope of space_superadmin. Use database when PostgreSQL hosts other services.
+    #[arg(long, env = "SPACE_DB_ADMIN_SCOPE", default_value = "instance")]
+    pub admin_scope: AdminScope,
 
     /// `statement_timeout` applied to `space_user`, `space_ro`, and
     /// `space_creds` sessions.
@@ -637,7 +689,7 @@ pub(crate) async fn run(args: BootstrapRolesArgs) -> Result<(), BootstrapRolesEr
         migrator_statement: &args.migrator_statement_timeout,
         migrator_lock: &args.migrator_lock_timeout,
     };
-    let skipped = bootstrap(&mut conn, &passwords, &timeouts).await?;
+    let skipped = bootstrap(&mut conn, &passwords, &timeouts, args.admin_scope).await?;
 
     if skipped != 0 {
         // Fail loudly so supervised rollouts retry instead of accepting a
@@ -656,13 +708,14 @@ async fn bootstrap(
     conn: &mut PgConnection,
     passwords: &BootstrapPasswords,
     timeouts: &SessionTimeouts<'_>,
+    admin_scope: AdminScope,
 ) -> Result<usize, BootstrapRolesError> {
     ensure_no_session_collision(conn).await?;
     prepare_session(conn, passwords.any_present()).await?;
     ensure_roles(conn, passwords).await?;
-    converge_superadmin_attributes(conn).await?;
+    converge_superadmin_attributes(conn, admin_scope).await?;
     converge_session_timeouts(conn, timeouts).await?;
-    converge_memberships(conn).await?;
+    converge_memberships(conn, admin_scope).await?;
     // Schema privileges must precede ownership adoption: ALTER ... OWNER TO
     // requires the new owner to hold CREATE on the relation's schema, which
     // locked-down (PG15+) public schemas do not grant by default.
@@ -879,7 +932,13 @@ async fn ensure_role_exists(
 
 async fn converge_superadmin_attributes(
     conn: &mut PgConnection,
+    admin_scope: AdminScope,
 ) -> Result<(), BootstrapRolesError> {
+    // ensure_roles already removes elevated attributes; membership convergence
+    // also removes prior RDS or unrelated role grants for database-scoped admins.
+    if !admin_scope.allows_instance_privileges() {
+        return Ok(());
+    }
     execute(
         conn,
         &format!("ALTER ROLE {SUPERADMIN_ROLE} WITH CREATEDB CREATEROLE"),
@@ -1017,7 +1076,10 @@ async fn set_role_parameter(
         })
 }
 
-async fn converge_memberships(conn: &mut PgConnection) -> Result<(), BootstrapRolesError> {
+async fn converge_memberships(
+    conn: &mut PgConnection,
+    admin_scope: AdminScope,
+) -> Result<(), BootstrapRolesError> {
     let session_user: String = sqlx::query_scalar(sql!("SELECT current_user"))
         .fetch_one(&mut *conn)
         .await
@@ -1053,24 +1115,24 @@ async fn converge_memberships(conn: &mut PgConnection) -> Result<(), BootstrapRo
         member: CREDS_ROLE.to_owned(),
         source,
     })?;
-    revoke_unexpected_memberships(conn, &session_user).await?;
+    revoke_unexpected_memberships(conn, &session_user, admin_scope).await?;
     Ok(())
 }
 
 /// Strip managed roles of privileged memberships outside the intended
 /// matrix, so a pre-existing `space_user` that was granted `space_migrator`
 /// (or `rds_superuser`, or any superuser role) cannot `SET ROLE` past the
-/// fences after a successful bootstrap. Scoped to memberships in the roles
-/// this tool reasons about plus superuser-flagged roles — unrelated
-/// organizational group memberships are left alone. The connecting session
-/// user's own memberships are never touched.
+/// fences after a successful bootstrap. Instance scope preserves unrelated
+/// organizational groups. Database scope removes them too, since they can
+/// grant access to other applications' data. The connecting session user's
+/// own memberships are never touched.
 async fn revoke_unexpected_memberships(
     conn: &mut PgConnection,
     session_user: &str,
+    admin_scope: AdminScope,
 ) -> Result<(), BootstrapRolesError> {
     let expected: &[(&str, &str)] = &[
         (SUPERADMIN_ROLE, MIGRATOR_ROLE),
-        (SUPERADMIN_ROLE, RDS_SUPERUSER_ROLE),
         (CREDS_ROLE, CREDMGR_CAPABILITY_ROLE),
     ];
     let managed = [
@@ -1089,19 +1151,25 @@ async fn revoke_unexpected_memberships(
         JOIN pg_roles member ON member.oid = m.member
         JOIN pg_roles granted ON granted.oid = m.roleid
         WHERE member.rolname = ANY($1)
-          AND (granted.rolname = ANY($2) OR granted.rolname = $3 OR granted.rolsuper)
+          AND ($4 OR granted.rolname = ANY($2) OR granted.rolname = $3 OR granted.rolsuper)
         ORDER BY member.rolname, granted.rolname
         "
     ))
     .bind(&managed[..])
     .bind(&managed[..])
     .bind(RDS_SUPERUSER_ROLE)
+    .bind(!admin_scope.allows_instance_privileges())
     .fetch_all(&mut *conn)
     .await
     .map_err(BootstrapRolesError::EnumerateMemberships)?;
 
     for (member, granted) in &memberships {
-        if member == session_user || expected.iter().any(|(m, g)| m == member && g == granted) {
+        if member == session_user
+            || expected.iter().any(|(m, g)| m == member && g == granted)
+            || (admin_scope.allows_instance_privileges()
+                && member == SUPERADMIN_ROLE
+                && granted == RDS_SUPERUSER_ROLE)
+        {
             continue;
         }
         tracing::warn!(%member, %granted, "revoking unexpected privileged membership");

@@ -65,7 +65,13 @@ async fn role_settings(fixture: &PostgresFixture, role: &str) -> TestResult<Vec<
 
 async fn run_bootstrap(fixture: &PostgresFixture) -> TestResult {
     let mut conn = fixture.connect_as("postgres").await?;
-    bootstrap(&mut conn, &test_passwords(), &TEST_TIMEOUTS).await?;
+    bootstrap(
+        &mut conn,
+        &test_passwords(),
+        &TEST_TIMEOUTS,
+        AdminScope::Instance,
+    )
+    .await?;
     Ok(())
 }
 
@@ -88,6 +94,86 @@ async fn create_lock_test_table(fixture: &PostgresFixture, table: &str) -> TestR
 fn assert_sqlstate(error: &sqlx::Error, expected: &str) {
     let code = sqlstate(error);
     assert_eq!(code.as_deref(), Some(expected), "unexpected error: {error}");
+}
+
+#[tokio::test]
+async fn database_scope_removes_instance_and_cross_database_privileges() -> TestResult {
+    let Some(fixture) = postgres_fixture().await? else {
+        return Ok(());
+    };
+    let mut admin = fixture.connect_as("postgres").await?;
+    sqlx::query(sql!("CREATE ROLE rds_superuser NOLOGIN"))
+        .execute(&mut admin)
+        .await?;
+    run_bootstrap(&fixture).await?;
+    sqlx::query(sql!("CREATE ROLE other_service_reader NOLOGIN"))
+        .execute(&mut admin)
+        .await?;
+    sqlx::query(sql!("CREATE DATABASE other_service"))
+        .execute(&mut admin)
+        .await?;
+    let other_options = fixture
+        .database_url("postgres")
+        .parse::<sqlx::postgres::PgConnectOptions>()?
+        .database("other_service");
+    let mut other_admin = PgConnection::connect_with(&other_options).await?;
+    sqlx::query(sql!("CREATE TABLE other_data (id INT)"))
+        .execute(&mut other_admin)
+        .await?;
+    sqlx::query(sql!("GRANT SELECT ON other_data TO other_service_reader"))
+        .execute(&mut other_admin)
+        .await?;
+    sqlx::query(sql!(
+        "GRANT other_service_reader TO space_superadmin, space_user, space_ro, space_creds, space_migrator"
+    ))
+    .execute(&mut admin)
+    .await?;
+
+    for _ in 0..2 {
+        bootstrap(
+            &mut admin,
+            &test_passwords(),
+            &TEST_TIMEOUTS,
+            AdminScope::Database,
+        )
+        .await?;
+    }
+
+    for role in BootstrapRole::ALL {
+        let mut conn = fixture.connect_as(role.role_name()).await?;
+        for statement in [
+            "CREATE DATABASE unexpected_database",
+            "CREATE ROLE unexpected_role",
+            "SET ROLE rds_superuser",
+        ] {
+            let error = sqlx::query(sqlx::AssertSqlSafe(sql!(statement)))
+                .execute(&mut conn)
+                .await
+                .expect_err("database-scoped roles must not administer the instance");
+            assert_sqlstate(&error, "42501");
+        }
+        let mut other_conn =
+            PgConnection::connect_with(&other_options.clone().username(role.role_name())).await?;
+        let error = sqlx::query(sql!("SELECT * FROM other_data"))
+            .fetch_all(&mut other_conn)
+            .await
+            .expect_err("bootstrap must remove cross-database group membership");
+        assert_sqlstate(&error, "42501");
+    }
+
+    let mut migrator = fixture.connect_as(MIGRATOR_ROLE).await?;
+    sqlx::query(sql!("CREATE TABLE own_data (id INT)"))
+        .execute(&mut migrator)
+        .await?;
+    let mut user = fixture.connect_as(USER_ROLE).await?;
+    sqlx::query(sql!("INSERT INTO own_data VALUES (42)"))
+        .execute(&mut user)
+        .await?;
+    let stored: i32 = sqlx::query_scalar(sql!("SELECT id FROM own_data"))
+        .fetch_one(&mut user)
+        .await?;
+    assert_eq!(stored, 42);
+    Ok(())
 }
 
 #[tokio::test]
@@ -140,9 +226,14 @@ async fn fresh_database_bootstraps_migrates_as_migrator_and_fences() -> TestResu
     // collide with the session user, and running the tool while
     // connected as a managed role is refused outright.
     let mut as_migrator = fixture.connect_as(MIGRATOR_ROLE).await?;
-    let collision = bootstrap(&mut as_migrator, &test_passwords(), &TEST_TIMEOUTS)
-        .await
-        .expect_err("bootstrap must refuse to run as a managed role");
+    let collision = bootstrap(
+        &mut as_migrator,
+        &test_passwords(),
+        &TEST_TIMEOUTS,
+        AdminScope::Instance,
+    )
+    .await
+    .expect_err("bootstrap must refuse to run as a managed role");
     assert!(
         collision.to_string().contains("refusing to touch"),
         "unexpected error: {collision}"
@@ -413,7 +504,13 @@ async fn first_bootstrap_adopts_admin_owned_tables_routines_and_types() -> TestR
         .execute(&mut admin)
         .await?;
 
-    bootstrap(&mut admin, &test_passwords(), &TEST_TIMEOUTS).await?;
+    bootstrap(
+        &mut admin,
+        &test_passwords(),
+        &TEST_TIMEOUTS,
+        AdminScope::Instance,
+    )
+    .await?;
 
     let owner: String = sqlx::query_scalar(sql!(
         "SELECT pg_get_userbyid(relowner) FROM pg_class WHERE relname = 'legacy_probe'"
@@ -490,7 +587,13 @@ async fn bootstrap_adopts_routines_behind_admin_run_migrations() -> TestResult {
     );
 
     let mut admin = fixture.connect_as("postgres").await?;
-    bootstrap(&mut admin, &test_passwords(), &TEST_TIMEOUTS).await?;
+    bootstrap(
+        &mut admin,
+        &test_passwords(),
+        &TEST_TIMEOUTS,
+        AdminScope::Instance,
+    )
+    .await?;
 
     let straggler_routines: i64 = sqlx::query_scalar(sql!(
         r"
@@ -581,7 +684,13 @@ async fn bootstrap_strips_preexisting_privileges() -> TestResult {
         .execute(&mut admin)
         .await?;
 
-    bootstrap(&mut admin, &test_passwords(), &TEST_TIMEOUTS).await?;
+    bootstrap(
+        &mut admin,
+        &test_passwords(),
+        &TEST_TIMEOUTS,
+        AdminScope::Instance,
+    )
+    .await?;
 
     let (createdb, createrole): (bool, bool) = sqlx::query_as(sql!(
         "SELECT rolcreatedb, rolcreaterole FROM pg_roles WHERE rolname = $1"
@@ -629,9 +738,21 @@ async fn missing_passwords_provision_nologin_roles() -> TestResult {
     };
     let mut conn = fixture.connect_as("postgres").await?;
     let no_passwords = BootstrapPasswords::default();
-    bootstrap(&mut conn, &no_passwords, &TEST_TIMEOUTS).await?;
+    bootstrap(
+        &mut conn,
+        &no_passwords,
+        &TEST_TIMEOUTS,
+        AdminScope::Instance,
+    )
+    .await?;
     // Idempotent re-run.
-    bootstrap(&mut conn, &no_passwords, &TEST_TIMEOUTS).await?;
+    bootstrap(
+        &mut conn,
+        &no_passwords,
+        &TEST_TIMEOUTS,
+        AdminScope::Instance,
+    )
+    .await?;
 
     for role in [
         SUPERADMIN_ROLE,
@@ -694,7 +815,13 @@ async fn app_lock_timeout_converges_across_its_provisioning_lifecycle() -> TestR
     // Fresh database, no `lock_timeout` asked for: the bound is opt-in per
     // environment, so a first bootstrap must not invent one.
     let mut conn = fixture.connect_as("postgres").await?;
-    bootstrap(&mut conn, &test_passwords(), &APP_LOCK_UNSET_TIMEOUTS).await?;
+    bootstrap(
+        &mut conn,
+        &test_passwords(),
+        &APP_LOCK_UNSET_TIMEOUTS,
+        AdminScope::Instance,
+    )
+    .await?;
     drop(conn);
     for role in [USER_ROLE, RO_ROLE, CREDS_ROLE] {
         let settings = role_settings(&fixture, role).await?;
@@ -757,7 +884,13 @@ async fn app_lock_timeout_converges_across_its_provisioning_lifecycle() -> TestR
     // A config-less re-provision over the enabled environment leaves it
     // enabled.
     let mut conn = fixture.connect_as("postgres").await?;
-    bootstrap(&mut conn, &test_passwords(), &APP_LOCK_UNSET_TIMEOUTS).await?;
+    bootstrap(
+        &mut conn,
+        &test_passwords(),
+        &APP_LOCK_UNSET_TIMEOUTS,
+        AdminScope::Instance,
+    )
+    .await?;
     drop(conn);
     for role in [USER_ROLE, RO_ROLE] {
         let settings = role_settings(&fixture, role).await?;
@@ -786,7 +919,13 @@ async fn app_lock_timeout_converges_across_its_provisioning_lifecycle() -> TestR
 
     // An explicit `"0"` rolls the environment back to unbounded waits.
     let mut conn = fixture.connect_as("postgres").await?;
-    bootstrap(&mut conn, &test_passwords(), &APP_LOCK_DISABLED_TIMEOUTS).await?;
+    bootstrap(
+        &mut conn,
+        &test_passwords(),
+        &APP_LOCK_DISABLED_TIMEOUTS,
+        AdminScope::Instance,
+    )
+    .await?;
     drop(conn);
     for role in [USER_ROLE, RO_ROLE] {
         let settings = role_settings(&fixture, role).await?;
