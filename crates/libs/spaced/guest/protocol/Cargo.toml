@@ -11,6 +11,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+semver = { workspace = true }
 pplx-space-guest-process = { workspace = true }
 pplx-space-pii = { workspace = true }
 prost = { workspace = true }

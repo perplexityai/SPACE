@@ -1,4 +1,5 @@
 use clap::{ArgAction, Parser};
+#[cfg(unix)]
 use pplx_space_spaced_guest_server::SpacedGuestRunConfig;
 
 #[derive(Parser)]
@@ -21,10 +22,17 @@ struct Cli {
     /// Hold the calling unit's cgroup open and do nothing else, for
     /// `space-workloads.service`: systemd removes an empty cgroup, and this
     /// binary is in every guest, where `sleep` may not be.
+    #[cfg(unix)]
     #[arg(long = "hold-cgroup", hide = true)]
     hold_cgroup: bool,
+
+    /// Run the Windows service in the foreground for diagnostics.
+    #[cfg(windows)]
+    #[arg(long)]
+    console: bool,
 }
 
+#[cfg(unix)]
 impl From<Cli> for SpacedGuestRunConfig {
     fn from(_cli: Cli) -> Self {
         // The guest daemon takes no flags: the microVM's environment is its
@@ -35,6 +43,7 @@ impl From<Cli> for SpacedGuestRunConfig {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    #[cfg(unix)]
     if cli.hold_cgroup {
         // No runtime, telemetry or cgroup setup: SIGTERM from the unit's stop
         // ends the process with the default disposition.
@@ -42,5 +51,23 @@ fn main() -> anyhow::Result<()> {
             std::thread::park();
         }
     }
-    Ok(pplx_space_spaced_guest_server::run(cli.into())?)
+    #[cfg(unix)]
+    {
+        Ok(pplx_space_spaced_guest_server::run(cli.into())?)
+    }
+    #[cfg(windows)]
+    {
+        if cli.console {
+            tracing_subscriber::fmt()
+                .with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG)
+                .init();
+        } else {
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
+                .with_writer(|| pplx_space_spaced_guest_windows::EventLogWriter)
+                .init();
+        }
+        Ok(pplx_space_spaced_guest_windows::run(cli.console)?)
+    }
 }
