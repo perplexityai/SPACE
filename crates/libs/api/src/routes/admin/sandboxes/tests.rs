@@ -1343,4 +1343,93 @@ mod cross_org_routes {
         }
         Ok(())
     }
+
+    /// The routes this module mirrors take every sandbox ID form the other
+    /// admin sandbox routes take, and record the canonical `sbx_` ID: one
+    /// idempotency key sent under different forms replays one request, the
+    /// operation targets the canonical ID, and so does every audit event.
+    #[tokio::test]
+    async fn the_mirror_routes_accept_every_admin_sandbox_id_form() -> TestResult {
+        let Some(harness) = admin_router_harness_with(|state| {
+            state.native_hidden_operations = HiddenOperationsGate::all_orgs();
+        })
+        .await?
+        else {
+            return Ok(());
+        };
+        let sandbox = tenant_sandbox(&harness).await?;
+        let dashed = sandbox.as_uuid().to_string();
+        let undashed = sandbox.as_uuid().simple().to_string();
+        let forms = [
+            sandbox.to_string(),
+            dashed.clone(),
+            undashed.to_uppercase(),
+            format!("space-sbx-{undashed}-g3"),
+            format!("%20{dashed}%09"),
+        ];
+        let command = json!({"command": ["true"], "cwd": null, "env": {}, "pty": null, "stdin": false, "timeout": null});
+        let routes = [
+            (
+                Method::POST,
+                "/terminal-sessions",
+                Some(json!({"size": {"rows": 24, "cols": 80}})),
+                "id",
+            ),
+            (Method::POST, "/commands", Some(command), "session_id"),
+            (
+                Method::POST,
+                ":force-rollback",
+                Some(json!({"snapshot_name": "checkpoint-1"})),
+                "operation_id",
+            ),
+            (Method::GET, "/snapshots", None, "data"),
+        ];
+        for (method, suffix, body, replayed) in routes.clone() {
+            let key = [("idempotency-key", suffix)];
+            let mut answers = Vec::new();
+            for form in &forms {
+                let path = format!("/sandboxes/{form}{suffix}");
+                let (status, answer) = harness
+                    .as_operator(method.clone(), &path, &key, body.clone())
+                    .await;
+                assert!(status.is_success(), "{method} {path}: {status} {answer}");
+                answers.push(answer[replayed].clone());
+                let events = harness.audit_events(&path).await;
+                assert_eq!(events.len(), 1, "{method} {path}: {events:?}");
+                assert_names_sandbox(&events[0], &harness, sandbox);
+            }
+            assert!(
+                answers.iter().all(|answer| *answer == answers[0]),
+                "{method} {suffix}: every form replays the first request: {answers:?}"
+            );
+        }
+        let targets: Vec<Option<String>> = sqlx::query_scalar(sql!(
+            "SELECT target_id FROM public_operations WHERE org_id = $1 AND kind = $2"
+        ))
+        .bind(harness.tenant_org.as_uuid())
+        .bind(OperationKind::RollbackSandbox.as_str())
+        .fetch_all(&harness.db.pool)
+        .await?;
+        assert_eq!(targets, vec![Some(sandbox.to_string())]);
+
+        for form in [
+            format!("SBX_{dashed}"),
+            format!("%7B{dashed}%7D"),
+            format!("sandbox-{dashed}"),
+            format!("space-sbx-{dashed}"),
+        ] {
+            for (method, suffix, body, _) in routes.clone() {
+                let path = format!("/sandboxes/{form}{suffix}");
+                let (status, error) = harness
+                    .as_operator(method, &path, &[("idempotency-key", "refused")], body)
+                    .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {error}");
+                assert!(
+                    error.to_string().contains("sandbox id must be sbx_<uuid>"),
+                    "{path}: {error}"
+                );
+            }
+        }
+        Ok(())
+    }
 }

@@ -4,7 +4,7 @@
 use serde_json::{Map, Value, json};
 
 pub(super) fn insert_admin_sandbox_session_paths(paths: &mut Map<String, Value>) {
-    let sandbox_id = json!({ "name": "sandbox_id", "in": "path", "required": true, "schema": { "type": "string", "pattern": "^sbx_" } });
+    let sandbox_id = json!({ "name": "sandbox_id", "in": "path", "required": true, "description": "sbx_<uuid>, a dashed or undashed UUID in either case, or the sandbox pod name (space-sbx-<undashed uuid>, optionally with its -g<generation> suffix); surrounding whitespace is ignored", "schema": { "type": "string" } });
     paths.insert(
         "/sandboxes/{sandbox_id}/terminal-sessions".to_string(),
         json!({

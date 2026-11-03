@@ -1,8 +1,6 @@
 //! Operator access to any organization's sandbox through routes that mirror
 //! public, org-scoped ones: terminal sessions and the snapshot list.
 
-use std::str::FromStr;
-
 use axum::{
     Extension, Json,
     extract::{Path, Query, State, rejection::QueryRejection},
@@ -96,19 +94,20 @@ pub async fn list_snapshots(
     with_target(AdminAuditTarget::sandbox(sandbox.org_id, public_id), result)
 }
 
-/// The sandbox `spec` names, in any organization.
+/// The sandbox `spec` names, in any organization and any form
+/// [`AdminSandboxTarget::parse`] accepts, with its canonical `sbx_` ID.
 async fn resolve_sandbox(
     state: &AppState,
     spec: &str,
 ) -> Result<(PublicSandboxId, Sandbox), PublicApiError> {
-    let public_id = PublicSandboxId::from_str(spec)
-        .map_err(|_| PublicApiError::bad_request("sandbox id must be an sbx_ prefixed UUID"))?;
+    let target = AdminSandboxTarget::parse(spec)
+        .map_err(|error| PublicApiError::bad_request(error.to_string()))?;
     // Contention on this lookup is classified as on `create_command`.
-    let sandbox = fetch_admin_sandbox(&state.pool, AdminSandboxTarget::from_public_id(public_id))
+    let sandbox = fetch_admin_sandbox(&state.pool, target)
         .await
         .map_err(database_error)?
         .ok_or_else(|| PublicApiError::not_found("sandbox not found"))?;
-    Ok((public_id, sandbox))
+    Ok((target.public_id, sandbox))
 }
 
 /// A handler's answer, success or refusal, carrying the resolved `target` for
