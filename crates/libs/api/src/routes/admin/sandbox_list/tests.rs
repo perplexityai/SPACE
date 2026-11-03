@@ -208,6 +208,21 @@ async fn the_list_pages_by_cursor_and_keeps_the_unpaged_array() -> TestDbResult<
     assert_eq!(status, StatusCode::OK, "{filtered}");
     assert_eq!(ids(&filtered["sandboxes"]), seeded);
     assert_eq!(filtered["next_cursor"], Value::Null);
+
+    // The node filters reach the list, and leave out the node-reported row
+    // as every filter does.
+    for (label, query, expected) in [
+        ("node_id", format!("node_id={node_id}"), Vec::new()),
+        ("assigned", "assigned=true".to_string(), Vec::new()),
+        ("unassigned", "assigned=false".to_string(), seeded.clone()),
+    ] {
+        let (status, unpaged) = harness.get(&format!("/sandboxes?{query}")).await;
+        assert_eq!(status, StatusCode::OK, "{label}: unpaged list status");
+        assert_eq!(ids(&unpaged), expected, "{label}: unpaged list");
+        let (status, paged) = harness.get(&format!("/sandboxes?{query}&cursor=")).await;
+        assert_eq!(status, StatusCode::OK, "{label}: page status");
+        assert_eq!(ids(&paged["sandboxes"]), expected, "{label}: page");
+    }
     db.pool.close().await;
     Ok(())
 }
@@ -223,18 +238,24 @@ async fn malformed_list_parameters_answer_400() -> TestDbResult<()> {
     for (query, needle) in [
         ("limit=many", "limit"),
         ("org_id=not-a-uuid", "org_id"),
+        ("node_id=not-a-uuid", "node_id"),
         ("user_id=not-a-uuid", "user_id"),
+        ("assigned=maybe", "assigned"),
         (
             "cursor=&lifecycel=started",
             "unknown query parameter \"lifecycel\"",
         ),
-        ("cursor=&node_id=x", "unknown query parameter \"node_id\""),
+        ("cursor=&node=x", "unknown query parameter \"node\""),
         ("prefix=a%00b", "NUL"),
         ("cursor=bm90LWEtY3Vyc29y", "invalid cursor"),
         ("cursor=%%%", "invalid"),
         ("lifecycle=started,napping", "unknown lifecycle"),
         ("lifecycle=", "unknown lifecycle"),
         ("template=..", "invalid template"),
+        (
+            "node_id=00000000-0000-7000-8000-000000000001&assigned=false",
+            "assigned=false",
+        ),
         ("created_after=yesterday", "created_after"),
         (
             "created_after=2026-01-02T00:00:00Z&created_before=2026-01-01T00:00:00Z",

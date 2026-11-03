@@ -72,8 +72,7 @@
 
 use pplx_space_common_core::sql;
 use pplx_space_common_svc::sql::contention;
-use std::fmt;
-use std::time::Duration;
+use std::{fmt, time::Duration};
 
 use pplx_space_common_core::types::{
     ArtifactOrigin, AutoLifecyclePolicy, ExecutionGeneration, ExecutionGenerationParseError,
@@ -5024,6 +5023,8 @@ fn ensure_direct_create_supported(fork_disk_restore: bool) -> Result<(), Substra
     }
     Ok(())
 }
+
+pub(crate) mod current_routes;
 
 #[cfg(test)]
 mod cluster_admission_tests;

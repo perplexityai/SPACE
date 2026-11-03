@@ -13,7 +13,8 @@ use std::sync::LazyLock;
 
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{
-    OrgId, SandboxId, SandboxLifecycle, SandboxLifecycleParseError, SemVer, TemplateName, UserId,
+    NodeId, OrgId, SandboxId, SandboxLifecycle, SandboxLifecycleParseError, SemVer, TemplateName,
+    UserId,
 };
 use pplx_space_public_api::PUBLIC_SANDBOX_ID_PREFIX;
 use serde::Serialize;
@@ -26,6 +27,7 @@ use super::{
     ListPage, MAX_SANDBOX_LIST_PAGE_BYTES, PageWalkParams, SANDBOX_LIST_ROW_OVERHEAD_BYTES,
 };
 use crate::controllers::sandbox::{SandboxController, SandboxPageCursor, sandbox_query};
+use crate::controllers::substrate::direct::current_routes::{CurrentRoutes, current_routes};
 use crate::controllers::{ControllerError, db_contention_error};
 use crate::models::{Sandbox, SandboxResourceType};
 
@@ -80,6 +82,7 @@ pub struct AdminSandboxFilter {
     /// The row's own template (`sandboxes.template_id`), not the fallbacks
     /// the response's `template` resolves when the row has none.
     pub template: Option<TemplateName>,
+    pub node: Option<NodeAssignment>,
     pub user_id: Option<UserId>,
     /// Created strictly after this instant.
     pub created_after: Option<OffsetDateTime>,
@@ -97,6 +100,7 @@ impl AdminSandboxFilter {
             org_id,
             lifecycles,
             template,
+            node,
             user_id,
             created_after,
             created_before,
@@ -105,11 +109,22 @@ impl AdminSandboxFilter {
         org_id.is_none()
             && lifecycles.is_none()
             && template.is_none()
+            && node.is_none()
             && user_id.is_none()
             && created_after.is_none()
             && created_before.is_none()
             && search.is_none()
     }
+}
+
+/// The node a sandbox is assigned to, as the list response reports it in
+/// `active_node_id`: its Direct route's current node when it has a route,
+/// else its row's `active_node_id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeAssignment {
+    Node(NodeId),
+    Assigned,
+    Unassigned,
 }
 
 /// A name or ID prefix. A row matches when its name starts with the prefix
@@ -162,8 +177,11 @@ fn id_prefix_range(prefix: &str) -> Option<(SandboxId, SandboxId)> {
     Some((bound('0')?, bound('f')?))
 }
 
-/// The admin list's sandboxes ($1-$9) after the cursor, for the page walk.
-/// The filters are the same as [`ADMIN_LIST_SQL`]'s.
+/// The admin list's sandboxes ($1-$13) after the cursor, for the page walk.
+/// The filters are the same as [`ADMIN_LIST_SQL`]'s. The node filters ($10,
+/// $13) match the node the response reports: $11 holds every sandbox with a
+/// current Direct route, whose row's `active_node_id` the response ignores,
+/// and $12 those routed to $10.
 const ADMIN_CANDIDATE_ROWS: &str = "SELECT s.id, s.created_at
     FROM sandboxes s
     WHERE ($1::UUID IS NULL OR s.org_id = $1)
@@ -175,6 +193,11 @@ const ADMIN_CANDIDATE_ROWS: &str = "SELECT s.id, s.created_at
       AND ($7::TEXT IS NULL
            OR starts_with(s.name, $7)
            OR s.id BETWEEN $8::UUID AND $9::UUID)
+      AND ($10::UUID IS NULL
+           OR s.id = ANY($12::UUID[])
+           OR (s.active_node_id = $10 AND s.id <> ALL($11::UUID[])))
+      AND ($13::BOOLEAN IS NULL
+           OR (s.id = ANY($11::UUID[]) OR s.active_node_id IS NOT NULL) = $13)
       AND {after_cursor}
     ORDER BY s.created_at DESC, s.id DESC
     LIMIT {max_rows}";
@@ -183,19 +206,19 @@ static ADMIN_PAGE_SQL: LazyLock<String> = LazyLock::new(|| {
     scoped_page_sql(
         ADMIN_CANDIDATE_ROWS,
         &PageWalkParams {
-            cursor_created_at: "$10",
-            cursor_id: "$11",
-            max_rows: "$12",
-            max_bytes: "$13",
-            row_overhead_bytes: "$14",
+            cursor_created_at: "$14",
+            cursor_id: "$15",
+            max_rows: "$16",
+            max_bytes: "$17",
+            row_overhead_bytes: "$18",
             // The admin response carries no `env`.
             lists_env: false,
         },
     )
 });
 
-/// The legacy unpaged list: at most $10 sandboxes matching the filters
-/// ($1-$9, as [`ADMIN_CANDIDATE_ROWS`]'s), newest first.
+/// The legacy unpaged list: at most $14 sandboxes matching the filters
+/// ($1-$13, as [`ADMIN_CANDIDATE_ROWS`]'s), newest first.
 static ADMIN_LIST_SQL: LazyLock<String> = LazyLock::new(|| {
     sandbox_query(
         "SELECT {sandbox_columns}
@@ -209,8 +232,13 @@ static ADMIN_LIST_SQL: LazyLock<String> = LazyLock::new(|| {
            AND ($7::TEXT IS NULL
                 OR starts_with(s.name, $7)
                 OR s.id BETWEEN $8::UUID AND $9::UUID)
+           AND ($10::UUID IS NULL
+                OR s.id = ANY($12::UUID[])
+                OR (s.active_node_id = $10 AND s.id <> ALL($11::UUID[])))
+           AND ($13::BOOLEAN IS NULL
+                OR (s.id = ANY($11::UUID[]) OR s.active_node_id IS NOT NULL) = $13)
          ORDER BY s.created_at DESC, s.id DESC
-         LIMIT $10",
+         LIMIT $14",
     )
 });
 
@@ -273,6 +301,18 @@ impl SandboxController {
         let id_range = filter.search.as_ref().and_then(|search| search.id_range);
         let template = filter.template.as_ref().map(TemplateName::as_str);
         let prefix = filter.search.as_ref().map(|search| search.prefix.as_str());
+        let (node_id, assigned) = match filter.node {
+            Some(NodeAssignment::Node(node_id)) => (Some(node_id), None),
+            Some(NodeAssignment::Assigned) => (None, Some(true)),
+            Some(NodeAssignment::Unassigned) => (None, Some(false)),
+            None => (None, None),
+        };
+        // Only the node filters read the routes; without them the arrays are
+        // never consulted.
+        let routes = match filter.node {
+            Some(_) => current_routes(pool, node_id).await?,
+            None => CurrentRoutes::default(),
+        };
         if budget == PageBudget::Unbounded {
             let rows =
                 sqlx::query_as::<_, Sandbox>(sqlx::AssertSqlSafe(sql!(ADMIN_LIST_SQL.as_str())))
@@ -285,6 +325,10 @@ impl SandboxController {
                     .bind(prefix)
                     .bind(id_range.map(|(low, _)| low))
                     .bind(id_range.map(|(_, high)| high))
+                    .bind(node_id)
+                    .bind(&routes.routed)
+                    .bind(&routes.on_node)
+                    .bind(assigned)
                     .bind(i64::from(limit))
                     .fetch_all(pool)
                     .await?;
@@ -304,6 +348,10 @@ impl SandboxController {
                 .bind(prefix)
                 .bind(id_range.map(|(low, _)| low))
                 .bind(id_range.map(|(_, high)| high))
+                .bind(node_id)
+                .bind(&routes.routed)
+                .bind(&routes.on_node)
+                .bind(assigned)
                 .bind(cursor.map(|cursor| cursor.created_at))
                 .bind(cursor.map(|cursor| cursor.id))
                 .bind(i64::from(limit.saturating_add(1)))
