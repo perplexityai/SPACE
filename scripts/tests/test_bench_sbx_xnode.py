@@ -226,6 +226,34 @@ class FakeEcw:
             self.kube.pods.pop(xnode.canonical_id(sid), None)
 
 
+class ConnectError(Exception):
+    """Stands in for httpx/httpcore.ConnectError, which the harness matches by name."""
+
+
+class FlakyEcw(FakeEcw):
+    """Refuses the first connection of each kind, then behaves."""
+
+    def __init__(self, kube, *, create_error=None, setup_error=None):
+        super().__init__(kube)
+        self.create_errors = [create_error or ConnectError("connection refused")]
+        self.setup_errors = [setup_error or ConnectError("connection reset")]
+
+    def create(self, template, metadata):
+        with self.lock:
+            error = self.create_errors.pop() if self.create_errors else None
+        if error:
+            raise error
+        return super().create(template, metadata)
+
+    def run(self, handle, command, timeout):
+        if "mem_mb=$1" in command:
+            with self.lock:
+                error = self.setup_errors.pop() if self.setup_errors else None
+            if error:
+                raise error
+        return super().run(handle, command, timeout)
+
+
 def fake_args(tmp, **overrides):
     argv = ["--nodes", ",".join(NODES), "--variant", "baseline=t-base", "--variant", "reporting=t-rep",
             "--blocks-per-variant", "1", "--block-minutes", "0.05", "--warmup-minutes", "0",
@@ -281,6 +309,29 @@ class FakeRunTests(unittest.TestCase):
             self.assertTrue(wakes)
             self.assertTrue(all(w["inflight_at_dispatch"] == 0 for w in wakes))
             self.assertFalse(any(r["kind"] == "probe" for r in rows))
+
+    def test_create_retries_connection_errors_but_not_api_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            kube = FakeKube(NODES)
+            bench = xnode.XnodeBenchmark(fake_args(tmp, create_concurrency=1), kube=kube, ecw=FlakyEcw(kube),
+                                         sleep=lambda _: None)
+            block = xnode.Block(0, "baseline", "t-base")
+            created = bench.create_sandboxes(block, 2, 1, seed=1)
+            self.assertEqual(len(created), 3)
+            self.assertTrue(all(s.state == "running" and (s.expected or s.role == "bystander") for s in created))
+            self.assertEqual(block.counters, {"connect_retries": 2})
+
+            bench.ecw = FlakyEcw(kube, create_error=RuntimeError("400: bad template"))
+            block = xnode.Block(1, "baseline", "t-base")
+            self.assertEqual(len(bench.create_sandboxes(block, 0, 2, seed=1)), 1)
+            self.assertEqual(block.counters, {"create_failures": 1})
+
+            # Any other setup error fails that sandbox instead of ending the run.
+            bench.ecw = FlakyEcw(kube, create_error=ConnectError("refused"), setup_error=TimeoutError("guest timed out"))
+            block = xnode.Block(2, "baseline", "t-base")
+            created = bench.create_sandboxes(block, 2, 0, seed=1)
+            self.assertEqual(sorted(s.state for s in created), ["failed", "running"])
+            self.assertEqual(block.counters, {"connect_retries": 1, "setup_failures": 1})
 
     def test_preflight_refuses_already_cordoned_pool_node(self):
         with tempfile.TemporaryDirectory() as tmp:

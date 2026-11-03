@@ -120,6 +120,15 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def is_connect_error(exc: BaseException) -> bool:
+    """A connection refused or reset while connecting, so the request was never sent.
+
+    httpx (the API client) and httpcore (the envd command transport) both raise
+    a class named ``ConnectError``; matching by name keeps the SDK import lazy.
+    """
+    return any(c.__name__ == "ConnectError" for c in type(exc).__mro__)
+
+
 def canonical_id(value: str) -> str:
     """Canonical UUID for an ECW sandbox ID; the pod label and events use it."""
     match = UUID_SEARCH.search(value or "")
@@ -706,6 +715,19 @@ class XnodeBenchmark:
 
     # -- Block phases
 
+    def retry_connect(self, block: Block, call: Callable[[], Any], attempts: int = 3) -> Any:
+        """Retry ``call`` on a connection error with a short backoff; anything else raises at once."""
+        for attempt in range(1, attempts):
+            try:
+                return call()
+            except Exception as exc:
+                if not is_connect_error(exc):
+                    raise
+                block.bump("connect_retries")
+                self.log(f"WARNING: connection error, retry {attempt}/{attempts - 1}: {exc}")
+                self.sleep(attempt)
+        return call()
+
     def create_sandboxes(self, block: Block, load_count: int, bystander_count: int, seed: int) -> list[Sbx]:
         a = self.args
         created: list[Sbx] = []
@@ -715,7 +737,7 @@ class XnodeBenchmark:
 
         def create(role: str, profile: str) -> None:
             try:
-                handle = self.ecw.create(block.template, metadata)
+                handle = self.retry_connect(block, lambda: self.ecw.create(block.template, metadata))
             except Exception as exc:
                 block.bump("create_failures")
                 self.log(f"WARNING: create failed: {exc}")
@@ -727,9 +749,17 @@ class XnodeBenchmark:
             with self.emit_lock, (self.output_dir / f"sandboxes-block-{block.index}.txt").open("a") as ids:
                 ids.write(sbx.sandbox_id + "\n")
             if role == "load":
-                out = self.ecw.run(handle, guest_command(stage1.GUEST_SETUP, a.pattern_mem_mb, a.pattern_file_mb,
-                                                         a.anon_check_mb, stage1.GUEST_ANON_HOLDER),
-                                   timeout=a.guest_timeout_s)
+                setup = guest_command(stage1.GUEST_SETUP, a.pattern_mem_mb, a.pattern_file_mb, a.anon_check_mb,
+                                      stage1.GUEST_ANON_HOLDER)
+                try:
+                    out = self.retry_connect(block, lambda: self.ecw.run(handle, setup, timeout=a.guest_timeout_s))
+                except Exception as exc:
+                    # One sandbox's setup failing must not end the run; block cleanup
+                    # deletes it, as for a failed create.
+                    block.bump("setup_failures")
+                    sbx.state = "failed"
+                    self.log(f"WARNING: setup failed: {exc}")
+                    return
                 kv = stage1.parse_kv(out.stdout)
                 if out.exit_code != 0 or "mem_sha" not in kv:
                     block.bump("setup_failures")
