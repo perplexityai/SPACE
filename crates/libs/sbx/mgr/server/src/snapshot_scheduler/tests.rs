@@ -850,6 +850,8 @@ enum StagingAnswer {
     /// Never answers, as a delete queued behind node-manager's delete
     /// capacity or the sandbox's artifact lock.
     Hangs,
+    /// Deletes after this long.
+    Takes(Duration),
     /// Deletes every GC staging under `snapshots/`, as the orphan sweep
     /// running meanwhile would, then answers.
     SweepsAll,
@@ -957,6 +959,14 @@ impl StagingHarness {
                             ))))
                         }
                         Some(StagingAnswer::Hangs) => Box::pin(std::future::pending()),
+                        Some(StagingAnswer::Takes(duration)) => {
+                            let (duration, path) = (*duration, path.clone());
+                            Box::pin(async move {
+                                tokio::time::sleep(duration).await;
+                                std::fs::remove_dir_all(&path).unwrap();
+                                Ok(DeleteCacheArtifactResponse { was_present: true })
+                            })
+                        }
                         Some(StagingAnswer::SweepsAll) => {
                             for name in list_snapshots_dir(&snapshots) {
                                 if crate::local_artifacts::is_gc_staging_name(&name) {
@@ -1013,6 +1023,34 @@ impl StagingHarness {
         std::fs::create_dir_all(&path).unwrap();
         std::fs::write(std::path::Path::new(&path).join("memory"), "memory").unwrap();
         path
+    }
+
+    /// Catalogue `count` more 1m snapshots than the tier keeps, so the next
+    /// prune stages the `count` oldest as its own. Returns their staging
+    /// paths, in the order the prune stages them.
+    fn surplus(&self, count: usize) -> Vec<String> {
+        let artifacts = crate::local_artifacts::LocalArtifacts::new(self.ctx.db.clone());
+        let mut stagings: Vec<String> = (0..KEEP_D_1M + count)
+            .map(|minute| {
+                let name = format!("d-1m-20260101T00{minute:02}00Z");
+                let path = format!("{}/{name}", self.snapshots);
+                std::fs::create_dir_all(&path).unwrap();
+                std::fs::write(std::path::Path::new(&path).join("memory"), "memory").unwrap();
+                let id = LocalArtifactId::new();
+                artifacts
+                    .publish_named_snapshot(
+                        &self.sandbox_id,
+                        id,
+                        ArtifactKind::Disk,
+                        &SnapshotName::parse(name).unwrap(),
+                        &path,
+                    )
+                    .unwrap();
+                format!("{}/.gc-pending-{id}", self.snapshots)
+            })
+            .collect();
+        stagings.truncate(count);
+        stagings
     }
 
     fn answer(&self, path: &str, answer: Option<StagingAnswer>) {
@@ -1263,20 +1301,22 @@ async fn retention_retries_one_leftover_per_tick_oldest_first() {
     }
 }
 
-/// A staging delete that node-manager never answers is abandoned at
-/// `STAGING_DELETE_DEADLINE` and left uncounted, like a persistent
-/// `Unavailable`. The tick still captures below the limit, and returns in
-/// time for the next sandbox the scheduler loop awaits, whose tick runs as
-/// usual.
+/// A tick's staging deletes share one `STAGING_DELETE_BUDGET`, and the
+/// first delete that times out ends them. A prune that stages 20 snapshots
+/// at once (pinned or leased ones piled up past the tier's keep), whose
+/// deletes all hang, attempts only the first and returns when the budget is
+/// spent, in time for the next sandbox the scheduler loop awaits. The rest
+/// are deferred, left on disk and counted, so they close the gate; the
+/// timed-out delete is not counted.
 #[tokio::test(start_paused = true)]
-async fn hung_staging_delete_is_abandoned_at_its_deadline() {
-    use super::retention::{STAGING_DELETE_DEADLINE, UNOWNED_STAGING_LIMIT};
+async fn hung_staging_deletes_share_one_budget_per_tick() {
+    use super::retention::STAGING_DELETE_BUDGET;
 
     let hung = StagingHarness::new();
-    let leftovers: Vec<String> = (1..=UNOWNED_STAGING_LIMIT as u128)
-        .map(|serial| hung.leftover(serial, None))
-        .collect();
-    hung.answer(&leftovers[0], Some(StagingAnswer::Hangs));
+    let own = hung.surplus(20);
+    for staging in &own {
+        hung.answer(staging, Some(StagingAnswer::Hangs));
+    }
     let next = StagingHarness::new();
     let next_leftover = next.leftover(1, None);
 
@@ -1288,22 +1328,65 @@ async fn hung_staging_delete_is_abandoned_at_its_deadline() {
         (hung_tick, elapsed, next.tick().await)
     })
     .await
-    .expect("a hung staging delete stalls the scheduler loop");
+    .expect("hung staging deletes stall the scheduler loop");
 
-    hung_tick.result.as_ref().unwrap();
-    assert!(hung_tick.captured);
-    assert_eq!(hung_tick.deletes, [leftovers[0].clone()]);
-    assert_eq!(hung_tick.recorded, Some(UNOWNED_STAGING_LIMIT - 1));
-    assert_eq!(hung_tick.skips, Vec::<String>::new());
+    let error = hung_tick.result.as_ref().unwrap_err();
+    assert!(error.contains("capture blocked"), "{error}");
+    assert!(!hung_tick.captured);
+    assert_eq!(hung_tick.deletes, [own[0].clone()]);
+    assert_eq!(hung_tick.recorded, Some(19));
+    assert_eq!(hung_tick.skips, ["reason:staging_backlog"]);
     assert!(
-        elapsed >= STAGING_DELETE_DEADLINE
-            && elapsed < STAGING_DELETE_DEADLINE + Duration::from_secs(1),
+        elapsed >= STAGING_DELETE_BUDGET
+            && elapsed < STAGING_DELETE_BUDGET + Duration::from_secs(1),
         "{elapsed:?}"
+    );
+    assert!(
+        own.iter()
+            .all(|staging| std::path::Path::new(staging).exists())
     );
     next_tick.result.as_ref().unwrap();
     assert!(next_tick.captured);
     assert_eq!(next_tick.deletes, std::slice::from_ref(&next_leftover));
     assert_eq!(next_tick.recorded, Some(0));
+}
+
+/// The budget also runs out on deletes that each answer, but slowly: at 4 s
+/// apiece, three of six own stagings are deleted, the fourth is cut off when
+/// the 15 s budget is spent and not counted, and the last two and the
+/// leftover retry are deferred and counted. Below the limit, the tick still
+/// captures.
+#[tokio::test(start_paused = true)]
+async fn staging_deletes_past_the_budget_are_deferred_and_counted() {
+    use super::retention::STAGING_DELETE_BUDGET;
+
+    let harness = StagingHarness::new();
+    let leftover = harness.leftover(1, None);
+    let own = harness.surplus(6);
+    for staging in &own {
+        harness.answer(staging, Some(StagingAnswer::Takes(Duration::from_secs(4))));
+    }
+
+    let started = tokio::time::Instant::now();
+    let observed = harness.tick().await;
+    let elapsed = started.elapsed();
+
+    observed.result.as_ref().unwrap();
+    assert!(observed.captured);
+    assert_eq!(observed.deletes, own[..4]);
+    assert_eq!(observed.recorded, Some(3));
+    assert_eq!(observed.skips, Vec::<String>::new());
+    assert!(
+        elapsed >= STAGING_DELETE_BUDGET
+            && elapsed < STAGING_DELETE_BUDGET + Duration::from_secs(1),
+        "{elapsed:?}"
+    );
+    for (index, staging) in own.iter().enumerate().take(3) {
+        assert!(!std::path::Path::new(staging).exists(), "own {index}");
+    }
+    for staging in own[4..].iter().chain([&leftover]) {
+        assert!(std::path::Path::new(staging).exists(), "{staging}");
+    }
 }
 
 /// The gate counts the staging still there after the deletes. Leftovers the

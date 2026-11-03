@@ -49,16 +49,21 @@ pub(super) const UNOWNED_STAGING_LIMIT: usize = 5;
 /// claims are usually short.
 const UNAVAILABLE_RETRY_BACKOFF: Duration = Duration::from_millis(300);
 
-/// How long retention waits for one staging delete, its `Unavailable` retry
-/// included. DeleteCacheArtifact queues for node-manager's delete capacity and
-/// then the sandbox's artifact lock, and the node's scheduler loop awaits each
-/// sandbox's tick in turn, so a delete that never answers would stall every
+/// How long one tick's staging deletes may take in total: this prune's own
+/// staging, the one leftover retried and each `Unavailable` retry share it.
+/// DeleteCacheArtifact queues for node-manager's delete capacity and then the
+/// sandbox's artifact lock, and the node's scheduler loop awaits each
+/// sandbox's tick in turn, so deletes that never answer would stall every
 /// sandbox's scheduled snapshots on the node. A healthy delete answers well
-/// within a second; this deadline keeps a usual tick's deletes (one own
-/// staging and one leftover) under half the scheduler's 60 s tick. A delete
-/// that outlives it is left like a persistent `Unavailable`: node-manager may
-/// still finish it, which is harmless because deletes are idempotent.
-pub(super) const STAGING_DELETE_DEADLINE: Duration = Duration::from_secs(15);
+/// within a second. A prune can stage many snapshots at once (pinned or leased
+/// ones pile up past their tier's keep while retention skips them, and one
+/// prune stages them all once released), so the bound is per tick, not per
+/// delete: a tick's deletes hold the loop for at most this long, a quarter of
+/// the scheduler's 60 s tick, however many there are. The delete running when
+/// it is spent is left like a persistent `Unavailable`: node-manager may still
+/// finish it, which is harmless because deletes are idempotent. The deletes
+/// not reached are deferred to later ticks and the orphan sweep.
+pub(super) const STAGING_DELETE_BUDGET: Duration = Duration::from_secs(15);
 
 /// Keep only the newest entries seen for each scheduled tier. A partial walk
 /// may delete an entry only after seeing enough newer entries to retain.
@@ -107,9 +112,12 @@ pub(super) fn retention_candidate(
 /// would stall the sandbox's publication, rollback, export and backup
 /// enqueue. Besides this prune's own staging, the listing shows unowned
 /// staging that an earlier delete, by any deleter, failed to remove
-/// ([`Staged::delete`] says which of it this tick retries). The locks cover
-/// only the listing: which listed staging no row owns is looked up after
-/// they are released.
+/// ([`Staged::delete`] says which of it this tick retries). All of a tick's
+/// deletes share one [`STAGING_DELETE_BUDGET`], so however much staging a
+/// prune leaves, they hold the node's scheduler loop for at most that long;
+/// the staging they do not reach is deferred, and counted below. The locks
+/// cover only the listing: which listed staging no row owns is looked up
+/// after they are released.
 ///
 /// A failed prune captures nothing: the listing failed, or the by-name delete
 /// of a snapshot without a row (an uncatalogued DeleteBtrfsSnapshot) failed,
@@ -211,8 +219,8 @@ enum StagingDelete {
     /// Node-manager answered `Unavailable` twice: a sandbox mutation still
     /// held its claim. Transient, so it is not counted against the gate.
     Unavailable,
-    /// No answer within [`STAGING_DELETE_DEADLINE`]. Left, and not counted,
-    /// like [`StagingDelete::Unavailable`].
+    /// No answer before the tick's [`STAGING_DELETE_BUDGET`] was spent.
+    /// Left, and not counted, like [`StagingDelete::Unavailable`].
     TimedOut,
     Failed,
 }
@@ -224,12 +232,17 @@ impl Staged {
     /// rest, so a backlog that other deleters left cannot stall the node's
     /// scheduler loop, which awaits each sandbox's tick in turn.
     ///
+    /// The deletes run in turn within one [`STAGING_DELETE_BUDGET`]. The
+    /// first that times out has spent it, so the deletes after it are not
+    /// attempted this tick: they are deferred, left on disk for a later tick
+    /// or the orphan sweep.
+    ///
     /// Returns how many unowned staging directories remain, counted after the
-    /// deletes: each directory a delete failed to remove and each leftover
-    /// not retried, if it still exists and no row owns it, so what the orphan
-    /// sweep removed meanwhile does not count. Each that this tick's delete
-    /// left [`StagingDelete::Unavailable`] or [`StagingDelete::TimedOut`] is
-    /// not counted either.
+    /// deletes: each directory a delete failed to remove, each deferred one
+    /// and each leftover not retried, if it still exists and no row owns it,
+    /// so what the orphan sweep removed meanwhile does not count. Each that
+    /// this tick's delete left [`StagingDelete::Unavailable`] or
+    /// [`StagingDelete::TimedOut`] is not counted.
     async fn delete(
         mut self,
         node_client: &mut NodeManagerGrpcClient,
@@ -252,11 +265,16 @@ impl Staged {
             .filter_map(|(entry, unowned)| unowned.then_some(entry));
         let retried = leftover.next();
         let mut recount: Vec<String> = leftover.map(|(_, staging)| staging).collect();
-        for (snapshot_name, staging) in self.own.iter().chain(&retried) {
-            if delete_staging(node_client, staging, snapshot_name).await == StagingDelete::Failed {
-                recount.push(staging.clone());
+        let budget = tokio::time::Instant::now() + STAGING_DELETE_BUDGET;
+        let mut deletes = self.own.iter().chain(&retried);
+        for (snapshot_name, staging) in deletes.by_ref() {
+            match delete_staging(node_client, staging, snapshot_name, budget).await {
+                StagingDelete::Failed => recount.push(staging.clone()),
+                StagingDelete::TimedOut => break,
+                StagingDelete::Deleted | StagingDelete::Unavailable => {}
             }
         }
+        recount.extend(deletes.map(|(_, staging)| staging.clone()));
         unowned_staging(artifacts, recount)
             .await
             .into_iter()
@@ -265,13 +283,14 @@ impl Staged {
     }
 }
 
-/// Delete one staging directory within [`STAGING_DELETE_DEADLINE`], retrying
-/// once after [`UNAVAILABLE_RETRY_BACKOFF`] if node-manager answers
-/// `Unavailable`.
+/// Delete one staging directory by `budget`, the end of the tick's
+/// [`STAGING_DELETE_BUDGET`], retrying once after
+/// [`UNAVAILABLE_RETRY_BACKOFF`] if node-manager answers `Unavailable`.
 async fn delete_staging(
     node_client: &mut NodeManagerGrpcClient,
     staging: &str,
     snapshot_name: &str,
+    budget: tokio::time::Instant,
 ) -> StagingDelete {
     let delete = async |node_client: &mut NodeManagerGrpcClient| {
         crate::snapshot_gc::delete_gc_staging(node_client, staging, "retention", snapshot_name)
@@ -286,12 +305,13 @@ async fn delete_staging(
         tokio::time::sleep(UNAVAILABLE_RETRY_BACKOFF).await;
         delete(node_client).await
     };
-    let Ok(result) = tokio::time::timeout(STAGING_DELETE_DEADLINE, attempts).await else {
+    let Ok(result) = tokio::time::timeout_at(budget, attempts).await else {
         tracing::warn!(
             staging,
-            deadline_secs = STAGING_DELETE_DEADLINE.as_secs(),
-            "retention stopped waiting for a GC staging delete and leaves the staging to a \
-             later tick or the orphan sweep; node-manager may still finish the delete"
+            budget_secs = STAGING_DELETE_BUDGET.as_secs(),
+            "retention spent its GC staging delete budget: it leaves this staging, and the \
+             tick's deletes after it, to a later tick or the orphan sweep; node-manager may \
+             still finish this delete"
         );
         return StagingDelete::TimedOut;
     };
