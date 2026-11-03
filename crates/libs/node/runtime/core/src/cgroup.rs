@@ -13,7 +13,9 @@ use pplx_space_common_core::types::{SandboxId, VcpuCount};
 use crate::cgroup_paths::{CGROUP_BASE, jailer_cgroup_path};
 pub const DEFAULT_VCPU_COUNT: u32 = 2;
 pub const DEFAULT_SANDBOX_GUEST_MEMORY_MAX_MIB: u64 = 8192;
-pub const DEFAULT_SANDBOX_MEMORY_HEADROOM_MIB: u64 = 128;
+// Host page tables, VMM allocations, and buffered block-device IO are charged
+// alongside guest RAM. Keep their allowance separate from the guest budget.
+pub const DEFAULT_SANDBOX_MEMORY_HEADROOM_MIB: u64 = 256;
 pub const DEFAULT_MEMORY_MAX_MIB: u64 =
     DEFAULT_SANDBOX_GUEST_MEMORY_MAX_MIB + DEFAULT_SANDBOX_MEMORY_HEADROOM_MIB;
 pub const DEFAULT_PARENT_CPU_RESERVED_COUNT: u32 = 2;
