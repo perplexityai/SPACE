@@ -6,6 +6,7 @@ import {
   formatBytes,
   formatMetadataValue,
   mergeOperationPages,
+  quarantineStatus,
   sectionData,
   sectionError,
   snapshotKey,
@@ -129,4 +130,15 @@ test('the environment shows names whether the release sends values or only names
   assert.deepEqual(envNames({ SYNTHETIC_TOKEN: null, EMPTY: null }), ['EMPTY', 'SYNTHETIC_TOKEN']);
   assert.deepEqual(envNames({ SYNTHETIC_TOKEN: 'synthetic-value' }), ['SYNTHETIC_TOKEN']);
   for (const env of [null, undefined, [], 'text', 3]) assert.deepEqual(envNames(env), []);
+});
+
+test('a quarantine read that failed is unknown, never "not quarantined"', () => {
+  const clear = { quarantined: false, active: null, history: [] };
+  assert.equal(quarantineStatus(clear), 'not-quarantined');
+  assert.equal(quarantineStatus({ ...clear, quarantined: true }), 'quarantined');
+  assert.equal(quarantineStatus({ quarantined: false, active: { quarantine_id: 'q-1' }, history: [] }), 'quarantined');
+  assert.equal(quarantineStatus({ error: 'synthetic section failure', data: null }), 'unknown');
+  // The whole debug read failed after an earlier one: what it showed is not current.
+  assert.equal(quarantineStatus(clear, true), 'unknown');
+  assert.equal(quarantineStatus(undefined), 'absent');
 });

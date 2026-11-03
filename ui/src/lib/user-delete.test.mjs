@@ -40,10 +40,21 @@ test('another 409 keeps the API message', () => {
   assert.equal(userDeleteFailureMessage(new ApiError(409, refusal, { error: refusal })), refusal);
 });
 
-test('a 500 from a release without the refusal reads as a short generic message', () => {
-  const message = userDeleteFailureMessage(new ApiError(500, 'internal server error', { error: 'internal server error' }));
-  assert.match(message, /could not be deleted/);
-  assert.doesNotMatch(message, /internal server error/);
+test('a generic 500 from a release without the refusal reads as a short hint', () => {
+  for (const err of [
+    new ApiError(500, 'Internal server error', { error: 'Internal server error' }),
+    new ApiError(500, 'internal server error', { error: 'internal server error' }),
+    new ApiError(500, 'Request failed'),
+  ]) {
+    const message = userDeleteFailureMessage(err);
+    assert.match(message, /could not be deleted\. If they own sandboxes/);
+    assert.doesNotMatch(message, /internal server error/i);
+  }
+});
+
+test('a 500 that says what failed shows the API message', () => {
+  const real = 'database connection pool timed out';
+  assert.equal(userDeleteFailureMessage(new ApiError(500, real, { error: real })), real);
 });
 
 test('other failures, including a retryable 503, keep the API message', () => {

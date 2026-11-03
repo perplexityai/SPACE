@@ -11,9 +11,15 @@ export const USER_OWNS_SANDBOXES =
   'This user owns sandboxes. Delete them, or wait for them to be deleted, before deleting the user.';
 
 // Releases that report the ownership refusal answer a 409 with a `reason`;
-// older ones answer it with a 500 that does not say why.
+// older ones answer it with a 500 whose message is the generic "Internal
+// server error" (or no message, which the console reads as "Request failed").
+// A 500 with any other message is a real failure, shown as the API words it.
 const OLD_RELEASE_REFUSAL =
   'The user could not be deleted. If they own sandboxes or archived sandboxes, delete those first.';
+
+function isGenericServerError(message: string | null): boolean {
+  return message === null || /^(internal server error|request failed)\.?$/i.test(message.trim());
+}
 
 function formatRetainedUntil(value: unknown): string | null {
   if (typeof value !== 'string') return null;
@@ -39,9 +45,9 @@ export function userDeleteFailureMessage(err: unknown): string {
         return 'The user still owns archived sandboxes. They must be purged before the user can be deleted.';
     }
   }
-  if (status === 500) return OLD_RELEASE_REFUSAL;
+  if (status === 500 && isGenericServerError(apiMessage)) return OLD_RELEASE_REFUSAL;
   // Anything else keeps the API's message: another 409 (deleting yourself),
-  // a retryable 503.
+  // a retryable 503, a 500 that says what failed.
   return apiMessage ?? 'The user could not be deleted.';
 }
 

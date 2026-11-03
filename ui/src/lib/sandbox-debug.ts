@@ -178,6 +178,24 @@ export interface DebugQuarantine {
   history: DebugQuarantineEvent[];
 }
 
+// Whether the sandbox is quarantined, as far as its debug read says:
+// `unknown` whenever the quarantine section, or the whole read, failed, so a
+// failed read never reads as "not quarantined"; `absent` on releases that do
+// not report quarantine.
+export type QuarantineStatus = 'quarantined' | 'not-quarantined' | 'unknown' | 'absent';
+
+export function quarantineStatus(
+  section: DebugSection<DebugQuarantine> | undefined,
+  readFailed = false,
+): QuarantineStatus {
+  if (readFailed) return 'unknown';
+  if (section === undefined) return 'absent';
+  if (sectionError(section) !== null) return 'unknown';
+  const quarantine = sectionData(section);
+  if (!quarantine) return 'unknown';
+  return quarantine.quarantined || quarantine.active ? 'quarantined' : 'not-quarantined';
+}
+
 export interface SandboxDebug {
   sandbox_id: string;
   fetched_at: string;

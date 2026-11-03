@@ -4,7 +4,7 @@ import { Space, Tag, Tooltip, Typography } from 'antd';
 import { InfoCircleOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 
-import { LAST_USED_CAVEAT } from '@/lib/api-keys';
+import { LAST_USED_CAVEAT, keyActorText } from '@/lib/api-keys';
 import type { ApiKeyMetadata, ApiSurface } from '@/lib/types';
 
 const { Text } = Typography;
@@ -53,7 +53,10 @@ export function apiKeyColumns(): ColumnsType<ApiKeyMetadata> {
     {
       title: 'Acts as',
       dataIndex: 'created_by_email',
-      render: (email: string | null) => email || <Text type="secondary">Unassigned</Text>,
+      render: (_: string | null, key) => {
+        const actor = keyActorText(key);
+        return actor.recorded ? actor.text : <Text type="secondary">{actor.text}</Text>;
+      },
     },
     { title: 'Created', dataIndex: 'created_at', render: formatDate },
     {

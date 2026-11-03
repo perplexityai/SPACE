@@ -1,6 +1,17 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { createKeyBody, keyActsAs, keyActsAsText, oldestUser } from './api-keys.ts';
+import {
+  KEY_CROSS_ORG_UNSUPPORTED,
+  LAST_USED_CAVEAT,
+  canCreateKey,
+  createKeyBody,
+  isCrossOrgKeyRefusal,
+  keyActorText,
+  keyActsAs,
+  keyActsAsText,
+  keyActsAsUnknownText,
+  oldestUser,
+} from './api-keys.ts';
 
 const OWN_ORG = 'org-own';
 const OTHER_ORG = 'org-other';
@@ -53,4 +64,37 @@ test('user_id is sent only when the operator picked a user', () => {
   assert.deepEqual(createKeyBody({ name: 'ci', allowed_surfaces: ['ecw'] }), { name: 'ci', allowed_surfaces: ['ecw'] });
   assert.deepEqual(createKeyBody({ name: 'ci', allowed_surfaces: ['ecw'], user_id: null }), { name: 'ci', allowed_surfaces: ['ecw'] });
   assert.deepEqual(createKeyBody({ name: 'ci', allowed_surfaces: ['native'], user_id: 'u-a' }), { name: 'ci', allowed_surfaces: ['native'], user_id: 'u-a' });
+});
+
+test("a key whose user was deleted says it acts as the organization's oldest user, not that it is unassigned", () => {
+  assert.deepEqual(keyActorText({ created_by: 'u-a', created_by_email: 'a@example.test' }), { text: 'a@example.test', recorded: true });
+  const orphan = keyActorText({ created_by: null, created_by_email: null });
+  assert.equal(orphan.recorded, false);
+  assert.equal(orphan.text, "No recorded user; acts as the organization's oldest user");
+  assert.doesNotMatch(orphan.text, /Unassigned/);
+});
+
+test("Create waits for the organization's users, and after a failed read says who the key acts as", () => {
+  assert.equal(canCreateKey({ usersLoading: true, ownOrg: true, crossOrgUnsupported: false }), false);
+  assert.equal(canCreateKey({ usersLoading: false, ownOrg: false, crossOrgUnsupported: false }), true);
+  assert.match(keyActsAsUnknownText({ ownOrg: false, usersError: null }), /Loading/);
+  assert.match(keyActsAsUnknownText({ ownOrg: true, usersError: 'synthetic failure' }), /\(synthetic failure\).*act as you\./);
+  assert.match(keyActsAsUnknownText({ ownOrg: false, usersError: 'synthetic failure' }), /oldest user, who could not be read/);
+});
+
+test('a release that creates keys only for your own organization refuses another with a 403, and Create stops offering it', () => {
+  const forbidden = Object.assign(new Error('API keys can only be created for your organization'), { status: 403 });
+  assert.equal(isCrossOrgKeyRefusal(forbidden, false), true);
+  // In the own organization a 403 is some other refusal.
+  assert.equal(isCrossOrgKeyRefusal(forbidden, true), false);
+  assert.equal(isCrossOrgKeyRefusal(Object.assign(new Error('x'), { status: 409 }), false), false);
+  assert.match(KEY_CROSS_ORG_UNSUPPORTED, /only for your own organization/);
+  assert.equal(canCreateKey({ usersLoading: false, ownOrg: false, crossOrgUnsupported: true }), false);
+  assert.equal(canCreateKey({ usersLoading: false, ownOrg: true, crossOrgUnsupported: true }), true);
+});
+
+test('the last-used caveat names what is not recorded and why an older key shows Never', () => {
+  assert.match(LAST_USED_CAVEAT, /at most once every five minutes/);
+  assert.match(LAST_USED_CAVEAT, /Data-plane calls \(ECW envd/);
+  assert.match(LAST_USED_CAVEAT, /shows "Never", even if it was used before/);
 });

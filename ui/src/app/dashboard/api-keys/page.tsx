@@ -24,7 +24,17 @@ import type { ColumnsType } from 'antd/es/table';
 import { adminApi } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 import { isUnknownFieldRejection } from '@/lib/admin-fallback';
-import { KEY_USER_CHOICE_UNSUPPORTED, createKeyBody, keyActsAs, keyActsAsText } from '@/lib/api-keys';
+import {
+  KEY_CROSS_ORG_UNSUPPORTED,
+  KEY_USER_CHOICE_UNSUPPORTED,
+  canCreateKey,
+  createKeyBody,
+  isCrossOrgKeyRefusal,
+  keyActorText,
+  keyActsAs,
+  keyActsAsText,
+  keyActsAsUnknownText,
+} from '@/lib/api-keys';
 import { apiKeyColumns } from '@/components/api-key-columns';
 import type {
   AdminUser,
@@ -67,7 +77,13 @@ function ApiKeysPageContent() {
   const [orgUsersError, setOrgUsersError] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [creating, setCreating] = useState(false);
-  const [created, setCreated] = useState<CreatedApiKey | null>(null);
+  // The created key with the organization and user it was created for, as
+  // the dialog that shows its secret names them.
+  const [created, setCreated] = useState<{ key: CreatedApiKey; orgName: string; actsAs: string } | null>(null);
+  // This API release refused a key for another organization (403): it
+  // creates keys only for the operator's own.
+  const [crossOrgUnsupported, setCrossOrgUnsupported] = useState(false);
+  const [reloadUsers, setReloadUsers] = useState(0);
   const [form] = Form.useForm<CreateApiKeyValues>();
   const chosenUserId = Form.useWatch('user_id', form);
 
@@ -140,11 +156,20 @@ function ApiKeysPageContent() {
     return () => {
       active = false;
     };
-  }, [orgId]);
+  }, [orgId, reloadUsers]);
 
+  const ownOrg = !!orgId && orgId === signedInOrg?.id;
+  const orgName = organizations.find((organization) => organization.id === orgId)?.name ?? 'this organization';
   const actsAs = orgId && signedInUser && orgUsers
     ? keyActsAs({ orgId, caller: signedInUser, users: orgUsers, chosenUserId })
     : null;
+  const usersLoading = !!orgId && orgUsers === null && orgUsersError === null;
+  const createAllowed = canCreateKey({ usersLoading, ownOrg, crossOrgUnsupported });
+  const actsAsExtra = !ownOrg && crossOrgUnsupported
+    ? KEY_CROSS_ORG_UNSUPPORTED
+    : actsAs
+      ? keyActsAsText(actsAs)
+      : keyActsAsUnknownText({ ownOrg, usersError: orgUsersError });
 
   const openCreate = () => {
     form.resetFields();
@@ -159,10 +184,20 @@ function ApiKeysPageContent() {
       const result = await adminApi.post<CreatedApiKey>(`/v1/orgs/${orgId}/api-keys`, createKeyBody(values));
       setKeys((current) => [result.api_key, ...current]);
       setCreateOpen(false);
-      setCreated(result);
+      // The key's user as the API stored it; the preview only when an older
+      // release does not say.
+      const stored = keyActorText(result.api_key);
+      setCreated({
+        key: result,
+        orgName,
+        actsAs: stored.recorded ? stored.text : actsAs && actsAs.kind !== 'no-users' ? actsAs.user.email : stored.text,
+      });
       message.success('API key created');
     } catch (error) {
-      if (isUnknownFieldRejection(error, 'user_id')) {
+      if (isCrossOrgKeyRefusal(error, ownOrg)) {
+        setCrossOrgUnsupported(true);
+        message.error(KEY_CROSS_ORG_UNSUPPORTED);
+      } else if (isUnknownFieldRejection(error, 'user_id')) {
         message.error(KEY_USER_CHOICE_UNSUPPORTED);
       } else {
         message.error(error instanceof Error ? error.message : 'Failed to create API key');
@@ -187,7 +222,7 @@ function ApiKeysPageContent() {
   const copySecret = async () => {
     if (!created) return;
     try {
-      await navigator.clipboard.writeText(created.secret);
+      await navigator.clipboard.writeText(created.key.secret);
       message.success('API key copied');
     } catch {
       message.error('Could not copy the API key');
@@ -260,9 +295,10 @@ function ApiKeysPageContent() {
       </Card>
 
       <Modal
-        title={`Create an API key for ${organizations.find((organization) => organization.id === orgId)?.name ?? 'this organization'}`}
+        title={`Create an API key for ${orgName}`}
         open={createOpen}
         okText="Create"
+        okButtonProps={{ disabled: !createAllowed }}
         confirmLoading={creating}
         onOk={() => form.submit()}
         onCancel={() => setCreateOpen(false)}
@@ -291,13 +327,22 @@ function ApiKeysPageContent() {
           <Form.Item
             name="user_id"
             label="Acts as"
-            extra={actsAs ? keyActsAsText(actsAs) : orgUsersError ? `Could not load the organization's users: ${orgUsersError}` : null}
+            extra={(
+              <Space size={4} wrap>
+                <span>{actsAsExtra}</span>
+                {orgUsersError ? (
+                  <Button type="link" size="small" style={{ padding: 0 }} onClick={() => setReloadUsers((value) => value + 1)}>
+                    Retry
+                  </Button>
+                ) : null}
+              </Space>
+            )}
           >
             <Select
               allowClear
               showSearch
               optionFilterProp="label"
-              loading={orgUsers === null && !orgUsersError}
+              loading={usersLoading}
               placeholder={
                 orgId === signedInOrg?.id ? 'You (default)' : "The organization's oldest user (default)"
               }
@@ -311,7 +356,7 @@ function ApiKeysPageContent() {
       </Modal>
 
       <Modal
-        title="API key created"
+        title={created ? `API key created for ${created.orgName}` : 'API key created'}
         open={created !== null}
         okText="Done"
         cancelButtonProps={{ style: { display: 'none' } }}
@@ -327,8 +372,11 @@ function ApiKeysPageContent() {
           description="SPACE stores only its hash. The key cannot be displayed again after this dialog closes."
           style={{ marginBottom: 16 }}
         />
+        <Paragraph>
+          <Text strong>{created?.key.api_key.name}</Text> acts as {created?.actsAs} in {created?.orgName}.
+        </Paragraph>
         <Paragraph code style={{ wordBreak: 'break-all' }}>
-          {created?.secret}
+          {created?.key.secret}
         </Paragraph>
         <Button icon={<CopyOutlined />} onClick={copySecret}>Copy API key</Button>
       </Modal>

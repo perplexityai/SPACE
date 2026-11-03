@@ -495,14 +495,18 @@ export interface AdminNodeResponse {
   /** Why the trigger and runtime installations were not read. While it is
    * set, an absent `reconcile_trigger` means unknown, not nothing queued. */
   read_state_error?: string;
-  /** The Kubernetes node's `spec.unschedulable`. Absent on Direct, before the
-   * API's node cache has listed, and on releases that do not report it. */
-  cordoned?: boolean;
-  /** Absent for a node in the default group, and on releases that do not
+  /** The Kubernetes node's `spec.unschedulable`, on `GET /nodes` and
+   * `GET /nodes/{id}` only. Absent on Direct, before the API's node cache has
+   * listed, for a node the cache does not hold, and on releases that do not
    * report it. */
+  cordoned?: boolean;
+  /** The group mirrored from the node's `space-node-group` label. Absent for
+   * an unlabeled node (a worker then belongs to the default group, which is
+   * not necessarily unlabeled), and on releases that do not report it. */
   node_group_id?: string;
-  /** What the node reported installed; `[]` when it reported none. Absent
-   * when `read_state_error` is set, and on releases that do not report it. */
+  /** What the node reported installed, on `GET /nodes` and `GET /nodes/{id}`
+   * only; `[]` when it reported none. Absent when `read_state_error` is set,
+   * and on releases that do not report it. */
   runtime_installations?: NodeRuntimeInstallation[];
 }
 
@@ -711,8 +715,11 @@ export interface MeResponse {
   substrate: Substrate;
 }
 
-// One entry of `GET /admin/api/v1/templates/{name}/builds`, newest first.
-// `state` is null when the builder could not be asked; `status_error` says why.
+// One entry of `GET /admin/api/v1/templates/{name}/builds` (a bare array),
+// newest first. `state` is null when the builder cannot report the job (it
+// could not be resolved or reached, timed out, or reported the job for another
+// template); `status_error` says why. `content_hash` is set on success and
+// `error` on failure.
 export interface TemplateBuildListEntry {
   job_id: string;
   template_name: string;

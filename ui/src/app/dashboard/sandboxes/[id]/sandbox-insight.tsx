@@ -22,6 +22,7 @@ import {
   formatAge,
   formatBytes,
   formatMetadataValue,
+  quarantineStatus,
   sectionData,
   sectionError,
   sortedTimeline,
@@ -268,7 +269,8 @@ export function QuarantineCard({ view, nowMs }: { view: DebugView; nowMs: number
   const state = sectionState(view, debug?.quarantine);
   const active = quarantine?.active ?? null;
   const history = (quarantine?.history ?? []).slice(0, QUARANTINE_EVENTS_SHOWN);
-  if (quarantine && !quarantine.quarantined && !active && history.length === 0) return null;
+  const status = quarantineStatus(debug.quarantine, view.error !== null);
+  if (status === 'not-quarantined' && history.length === 0) return null;
   const columns: ColumnsType<DebugQuarantineEvent> = [
     { title: 'When', dataIndex: 'occurred_at', width: 90, render: (v: string) => <When value={v} nowMs={nowMs} /> },
     { title: 'Action', dataIndex: 'action', width: 170, render: (v: string) => <Tag>{v.replace(/_/g, ' ')}</Tag> },
@@ -289,7 +291,14 @@ export function QuarantineCard({ view, nowMs }: { view: DebugView; nowMs: number
   return (
     <Card
       size="small"
-      title={<Space><WarningOutlined /> Quarantine {active ? <Tag color="red">quarantined</Tag> : <Tag>not quarantined</Tag>}</Space>}
+      title={(
+        <Space>
+          <WarningOutlined /> Quarantine
+          {status === 'quarantined' ? <Tag color="red">quarantined</Tag> : null}
+          {status === 'not-quarantined' ? <Tag>not quarantined</Tag> : null}
+          {status === 'unknown' ? <Tag color="warning">unknown: not read</Tag> : null}
+        </Space>
+      )}
     >
       <SectionError what="quarantine" error={state.error} />
       {active ? (

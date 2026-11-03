@@ -78,6 +78,52 @@ export function keyActsAsText(actsAs: KeyActsAs): string {
   }
 }
 
+// What the create dialog says about the key's user while the organization's
+// users are not known. Create waits while they load; after a failed read it
+// is allowed without a choice, and the key acts as the default user.
+export function keyActsAsUnknownText({ ownOrg, usersError }: { ownOrg: boolean; usersError: string | null }): string {
+  if (usersError === null) return "Loading the organization's users…";
+  return `Could not load the organization's users (${usersError}), so none can be chosen. ` + (ownOrg
+    ? 'The key will act as you.'
+    : "The key will act as the organization's oldest user, who could not be read; retry to see who that is.");
+}
+
+// Whether Create may be pressed: not while the users a key could act as are
+// still loading, and not for another organization once this API release has
+// refused that (`isCrossOrgKeyRefusal`).
+export function canCreateKey({
+  usersLoading,
+  ownOrg,
+  crossOrgUnsupported,
+}: {
+  usersLoading: boolean;
+  ownOrg: boolean;
+  crossOrgUnsupported: boolean;
+}): boolean {
+  return !usersLoading && (ownOrg || !crossOrgUnsupported);
+}
+
+// Releases before cross-organization keys answer a create for any other
+// organization with a 403 ("API keys can only be created for your
+// organization").
+export function isCrossOrgKeyRefusal(err: unknown, ownOrg: boolean): boolean {
+  return !ownOrg && typeof err === 'object' && err !== null && (err as { status?: unknown }).status === 403;
+}
+
+export const KEY_CROSS_ORG_UNSUPPORTED = 'This API version creates keys only for your own organization.';
+
+// Who an existing key acts as, from its `created_by`: that user, or, once the
+// user was deleted (`created_by` is set to NULL), the organization's oldest
+// user, whom every release resolves such a key to.
+export function keyActorText(key: { created_by: string | null; created_by_email: string | null }): {
+  text: string;
+  recorded: boolean;
+} {
+  if (key.created_by_email) return { text: key.created_by_email, recorded: true };
+  if (key.created_by) return { text: key.created_by, recorded: true };
+  return { text: "No recorded user; acts as the organization's oldest user", recorded: false };
+}
+
 export interface CreateKeyValues {
   name: string;
   allowed_surfaces: string[];
@@ -101,4 +147,6 @@ export const KEY_USER_CHOICE_UNSUPPORTED =
   "This API release cannot choose the key's user. Clear the user to create a key that acts as you, in your own organization.";
 
 export const LAST_USED_CAVEAT =
-  'Recorded when the key authenticates an API request, at most once every five minutes. Data-plane use (terminals, command streams) is not recorded.';
+  'Recorded when the key authenticates a SPACE or E2B-compatible API request, at most once every five minutes. ' +
+  'Data-plane calls (ECW envd: terminals, commands and files inside the sandbox) are not recorded. A key not used ' +
+  'since the API began recording use shows "Never", even if it was used before.';
