@@ -357,11 +357,31 @@ space-db-migrator bootstrap-roles --database-url "$ADMIN_URL"
 master user or a local superuser). `$MIGRATOR_URL` authenticates as
 `space_migrator`; migrations are expected to run as that role.
 
+For a PostgreSQL instance shared with other applications, set
+`SPACE_DB_ADMIN_SCOPE=database` on **every** bootstrap invocation, or pass
+`--admin-scope database` explicitly.
+This retains SPACE's schema-owner and application roles while removing
+`CREATEDB`, `CREATEROLE`, superuser attributes and `rds_superuser` membership
+from `space_superadmin`.
+It also removes unrelated group memberships from SPACE's managed roles so
+they cannot inherit another application's privileges.
+The connecting instance administrator and other applications' roles are not
+modified.
+Use a dedicated logical database: ownership adoption operates on that
+database's `public` schema.
+This mode does not change other databases' existing `PUBLIC` grants, so review
+those grants separately when enforcing cross-application isolation.
+
+The default remains `instance` for existing installations.
+An upgrade, rollback or bootstrap job that omits the database scope will restore
+the instance-wide administrator policy; keep the scope in the installation's
+versioned configuration.
+
 Provisioned roles:
 
 | Role | Purpose |
 | --- | --- |
-| `space_superadmin` | Break-glass operator login. `CREATEDB CREATEROLE` plus `rds_superuser` on RDS (a true `SUPERUSER` only on self-managed Postgres) plus `space_migrator` membership. Distinct from the unmanaged RDS master user. |
+| `space_superadmin` | Operator login with `space_migrator` membership. The default `instance` scope also grants `CREATEDB CREATEROLE` and `rds_superuser` on RDS (a true `SUPERUSER` on self-managed Postgres); `database` scope removes those privileges. Distinct from the unmanaged RDS master user. |
 | `space_migrator` | DDL login for migrations. Owns every application relation in `public`; pre-existing relations are adopted on each run. Its new tables are auto-granted to the other logins via default privileges. Minutes-scale role-level `statement_timeout` (default `10min`) and `lock_timeout` (default `5min`), tunable via `--migrator-statement-timeout` / `--migrator-lock-timeout`. |
 | `space_user` | Application login: read/write DML on every table except credential tables. |
 | `space_ro` | Read-only query login for humans and dashboards; same credential fence as `space_user`. |
