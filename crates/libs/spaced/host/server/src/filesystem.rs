@@ -226,9 +226,22 @@ impl Filesystem for SpacedHostService {
         };
         let client_generation = lease.generation();
         let client = lease.into_client();
-        client
+        if let Err(status) = client
             .authorize(Requirement::Operations(&[GuestOperation::Files]))
-            .await?;
+            .await
+        {
+            record_bridge_rpc_unbounded_outcome(
+                "bridge_guest_filesystem",
+                "bridge_guest_write",
+                Instant::now(),
+                BridgeRpcOutcome::from_status(&status),
+            );
+            return Err(host_relay_status(
+                status,
+                "bridge_guest_write",
+                "bridge_guest_filesystem",
+            ));
+        }
         let mut client = client.client;
 
         let body_started_at = Instant::now();
@@ -317,9 +330,22 @@ impl Filesystem for SpacedHostService {
         };
         let client_generation = lease.generation();
         let client = lease.into_client();
-        client
+        if let Err(status) = client
             .authorize(Requirement::Operations(&[GuestOperation::Files]))
-            .await?;
+            .await
+        {
+            record_bridge_rpc_unbounded_outcome(
+                "bridge_guest_filesystem",
+                "bridge_guest_write_batch",
+                Instant::now(),
+                BridgeRpcOutcome::from_status(&status),
+            );
+            return Err(host_relay_status(
+                status,
+                "bridge_guest_write_batch",
+                "bridge_guest_filesystem",
+            ));
+        }
         let mut client = client.client;
         let body_started_at = Instant::now();
         let response = client.write_batch(request).await;

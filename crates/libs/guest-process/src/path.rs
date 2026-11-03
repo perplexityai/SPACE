@@ -208,14 +208,21 @@ pub fn normalize_linux_guest_path(
 /// Empty paths are accepted here because callers can normalize them to an
 /// effective guest home directory later.
 pub fn validate_linux_guest_path_input(path: &str) -> Result<(), PathParseError> {
-    if path.len() > MAX_GUEST_PATH_BYTES || path.chars().any(char::is_control) {
-        return Err(PathParseError(
-            "guest path must be bounded and control-free",
-        ));
-    }
+    validate_guest_path_input(path)?;
     if is_windows_guest_path(path) {
         return Err(PathParseError(
             "windows-style guest paths are not supported for linux sandboxes",
+        ));
+    }
+    Ok(())
+}
+
+/// Transport-level bounds only. The guest platform validates filesystem syntax
+/// before resolving or opening a path; a relay must not interpret it on its host.
+pub fn validate_guest_path_input(path: &str) -> Result<(), PathParseError> {
+    if path.len() > MAX_GUEST_PATH_BYTES || path.chars().any(char::is_control) {
+        return Err(PathParseError(
+            "guest path must be bounded and control-free",
         ));
     }
     Ok(())

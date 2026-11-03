@@ -29,6 +29,7 @@ class DirectNodeConfig:
     environment: str
     crash_owned_runtime: bool = False
     firmware_lifecycle: bool = False
+    windows_operations_probe: str | None = None
 
     @classmethod
     def from_environment(cls, values: Mapping[str, str]) -> DirectNodeConfig:
@@ -77,6 +78,7 @@ class DirectNodeConfig:
             environment,
             fault == "crash-owned-runtime",
             values.get("SPACE_SMOKE_NODE_RECOVERY") == "firmware-lifecycle",
+            values.get("SPACE_SMOKE_WINDOWS_OPERATIONS_PROBE"),
         )
 
 
@@ -360,6 +362,15 @@ class DirectNodeRecoveryFixture:
                 return
             self.context.wait(min(2, max(0, deadline - time.monotonic())))
         self.context.verify(False, f"owned sandbox did not reach {expected or 'deleted'}")
+
+    def verify_windows_agent_operations(self) -> None:
+        """Call the host API as the operator, only for this fixture's execution."""
+        probe = self.config.windows_operations_probe
+        if not probe or not probe.startswith("/"):
+            raise SmokeConfigurationError("set SPACE_SMOKE_WINDOWS_OPERATIONS_PROBE to the built windows_operations example on the worker")
+        before = self.observe()
+        self.command(["sudo", "-n", probe, "--sandbox", before.sandbox_id], timeout=150)
+        self.context.verify(self.observe() == before, "execution changed during Windows operations")
 
     def crash_runtime(self, execution: ExecutionObservation) -> None:
         self.require_crash_opt_in()

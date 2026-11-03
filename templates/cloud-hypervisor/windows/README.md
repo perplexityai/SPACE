@@ -202,13 +202,47 @@ For this development stage, the version-4 image contract may declare
 disk and slot DHCP settings. Node-manager derives the host's Windows agent
 policy from the recorded execution and image contract. Guest claims cannot
 widen that policy. Deploy the matching node-manager and spaced-host before
-starting this image; older peers refuse it.
+starting this image; older peers refuse it. Before exposing process/file-enabled
+images to tenant APIs, also deploy the API and data-plane path/metadata changes:
+older relays reject Windows paths or present legacy POSIX metadata. Keep these
+images standalone and operator-only until that rollout is complete.
 
-This backend currently advertises **no process, file, watch, flush, resume or
-forwarding operations**. Readiness is not their qualification. The image still
-uses ACPI shutdown, and base snapshots, warm pools and automatic memory
-lifecycle remain refused. Do not publish an evaluation disk or embedded test
-credentials with this source.
+The native backend supports process and file operations when image preparation
+runs `install-spaced.ps1 -Executable <binary> -EnableOperations`. This provisions
+a regular local `user` account with a random credential in the SYSTEM/admin-only
+service directory. Existing accounts are never silently adopted. Without this
+configuration the guest advertises no process or file capabilities. The trusted
+host policy intersects the guest's operation list with the Windows image policy.
+
+Processes run in session 0 with that account's loaded profile and environment,
+not as SYSTEM or in the RDP desktop. Direct `.exe` argv uses MSVC quoting;
+`.bat`/`.cmd`, PTYs and signals other than SIGKILL are refused. Standard input,
+EOF, stdout/stderr, exit codes, timeout and SIGKILL are supported. Malformed
+signal numbers return invalid argument; valid unsupported signals return the
+typed capability refusal.
+A suspended child joins a non-breakaway, kill-on-close Job Object before running.
+Termination covers processes in that job, not work delegated to other services.
+Output retention is budgeted from guest RAM (1/64, clamped to 16–64 MiB),
+including event storage and allocation headroom, across at most 512 records.
+The primary reader applies backpressure; disconnecting it releases the
+producer and leaves bounded replay. A valid reattachment can reclaim backpressure. After process exit, output drains for up to
+one second so a stalled reader cannot hold cleanup indefinitely. Completed records
+expire after 15 minutes or earlier under the 512-record bound. Lost Start replies
+reattach by idempotency key while the record is retained.
+
+Files use Windows local-drive paths and the same account's ACLs. Relative paths
+start at its profile directory. UNC/device namespaces, alternate data streams,
+and DOS device aliases are refused. Read, write, append, stat, list, mkdir,
+rename and remove are supported; watches are not. Writes replace through a
+same-directory temporary file; append requires an idempotency key. Mutation
+outcomes are retained for 15 minutes with a 1,024-record bound; unresolved
+outcomes are never automatically replayed. Limits are 16 MiB per write/batch,
+eight active filesystem workers and four uploads. Native JSON responses omit
+POSIX ownership/permissions for Windows and expose Windows attributes instead.
+
+Volume flush and UTC synchronization are deferred to separate qualification work. The image still uses ACPI shutdown; base snapshots,
+warm pools and automatic memory lifecycle remain refused. Do not publish an
+evaluation disk or its provisioned credentials with this source.
 
 The `node.windows_agent_readiness` typed smoke checks the pinned image contract,
 then creates a sandbox, waits for agent readiness, stops it, cold-starts a new
@@ -218,3 +252,24 @@ It uses the same explicit standalone-worker opt-in
 as `node.windows_sandbox_lifecycle`. It passed on an x86-64 Linux/KVM worker
 with Cloud Hypervisor 54 and a Windows Server 2025 evaluation image. This is
 readiness and cold-lifecycle evidence, not process/file or memory-restore evidence.
+
+Memory lifecycle remains unqualified: repeated VirtIO-socket reconnects stalled
+after a direct Cloud Hypervisor restore. Base snapshots and warm pools remain
+refused until restored connections pass without intervention.
+
+The `windows_operations` Rust example exercises the guest bridge directly or
+spaced-host (`--host` / `--sandbox`): regular identity, separate output streams,
+stdin/EOF, exit status, replay, job timeout/descendant cleanup, file CRUD,
+Windows metadata, append retries and denial of the service credential path.
+`node.windows_agent_operations` runs it against a managed sandbox before and
+after cold restart, then deletes the sandbox. Set
+`SPACE_SMOKE_WINDOWS_OPERATIONS_PROBE` to the built example's absolute path on
+the worker. This is an operator-only host API check; it does not bypass the
+API route-token requirement on sandbox-manager's tenant process endpoints.
+Public and ECW Windows path/metadata changes are deferred to managed Windows
+admission and its end-to-end tests.
+Live public-API coverage also requires a managed-Windows admission and routing
+path: current guest-image admission refuses these images on control-plane-managed
+nodes. The standalone operator probe does not qualify that path. Retain it until
+a public-API scenario has passed against an authorized Windows test deployment;
+do not remove the admission restriction merely to run the scenario.

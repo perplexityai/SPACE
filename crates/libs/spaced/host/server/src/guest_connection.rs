@@ -4,6 +4,7 @@ use pplx_space_common_core::types::guest_image::QualifiedGuestAgent;
 use pplx_space_common_grpc::{GuestCapability, guest_capability_unsupported_status};
 use pplx_space_spaced_common::proto::platform::GuestOs;
 
+/// Readiness probes and teardown must work before operation negotiation.
 #[derive(Clone, Copy)]
 pub(super) enum Requirement {
     Probe,
@@ -47,8 +48,8 @@ impl<C> OperationClient<C> {
             ),
         };
         match self.policy {
-            QualifiedGuestAgent::LinuxV1 => {}
-            QualifiedGuestAgent::Absent | QualifiedGuestAgent::WindowsV1 => {
+            QualifiedGuestAgent::LinuxV1 | QualifiedGuestAgent::WindowsV1 => {}
+            QualifiedGuestAgent::Absent => {
                 return Err(guest_capability_unsupported_status(
                     GuestCapability::PlatformOperations,
                     "image has no qualified guest operations",
@@ -101,15 +102,16 @@ impl GuestPlatformObservation {
             Some(wire) => {
                 let mut wire = wire.clone();
                 // Peer claims cannot widen the trusted image's qualification.
-                match policy {
-                    QualifiedGuestAgent::LinuxV1 => {}
-                    QualifiedGuestAgent::WindowsV1 | QualifiedGuestAgent::Absent => {
-                        wire.operations.clear()
-                    }
-                }
+                wire.operations.retain(|raw| {
+                    GuestOperation::try_from(*raw).is_ok_and(|operation| {
+                        pplx_space_spaced_common::allowed_guest_operations(policy)
+                            .contains(&operation)
+                    })
+                });
                 pplx_space_spaced_common::platform::GuestPlatform::parse(wire, expected)
                     .map(Self::Explicit)
             }
+            // SPACED_COMPAT_REMOVE_WHEN_MIN_GUEST_0_8_1: historical Linux omission.
             None if expected == GuestOs::Linux
                 && !pplx_space_spaced_common::spaced_guest_requires_platform_descriptor(
                     &response.version,
@@ -135,6 +137,7 @@ impl GuestPlatformObservation {
             Self::Explicit(platform) => platform.supports(operation),
             Self::LegacyLinux { version } => match operation {
                 GuestOperation::Unspecified => false,
+                // SPACED_COMPAT_REMOVE_WHEN_MIN_GUEST_0_1_2: historical feature floor.
                 GuestOperation::InteractiveProcessControl => {
                     let supported = pplx_space_spaced_common::spaced_guest_supports_interactive_process_control(version)
                         .map_err(|error| Status::failed_precondition(error.to_string()))?;

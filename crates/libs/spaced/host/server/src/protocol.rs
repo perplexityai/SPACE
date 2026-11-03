@@ -1,7 +1,7 @@
 use super::*;
 use pplx_space_common_core::types::{
     GuestUserName, IdempotencyKey, Pii, ProcessCommand, ProcessId, ProcessSignal,
-    validate_linux_guest_path_input,
+    validate_guest_path_input as validate_path_text,
 };
 
 pub(super) type HostFileInfoStream =
@@ -10,7 +10,7 @@ pub(super) type HostFileChunkStream =
     std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<FileChunk, Status>> + Send>>;
 
 fn validate_guest_path_input(path: String) -> Result<String, Status> {
-    validate_linux_guest_path_input(&path).map_err(invalid_argument_status)?;
+    validate_path_text(&path).map_err(invalid_argument_status)?;
     Ok(path)
 }
 
@@ -54,7 +54,7 @@ where
 pub(super) fn map_write_request(request: WriteRequest) -> Result<WriteRequest, Status> {
     match &request.message {
         Some(proto::write_request::Message::Open(open)) => {
-            validate_linux_guest_path_input(&open.path).map_err(invalid_argument_status)?;
+            validate_path_text(&open.path).map_err(invalid_argument_status)?;
             open.idempotency_key
                 .as_ref()
                 .map(IdempotencyKey::parse)
@@ -96,7 +96,7 @@ pub(super) fn bridge_write_batch_request(
         .transpose()
         .map_err(invalid_argument_status)?;
     for entry in &request.entries {
-        validate_linux_guest_path_input(&entry.path).map_err(invalid_argument_status)?;
+        validate_path_text(&entry.path).map_err(invalid_argument_status)?;
     }
     Ok(request)
 }
