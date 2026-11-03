@@ -150,9 +150,13 @@ function startsUuid(value: string): boolean {
 
 // What the search box does on each list shape.
 // - `ref`: a full identifier in any accepted form, looked up directly.
-// - `prefix`: sent to a paging server, which matches it case-sensitively
-//   against the start of names, and against the start of IDs: an `sbx_` ID
-//   prefix, or a dashed one in the UUID's layout.
+// - `prefix`: sent to a paging server as typed. It matches the start of
+//   names case-sensitively, and the start of IDs: an `sbx_` ID prefix, or a
+//   dashed one in the UUID's layout, with hex digits in either case. The
+//   server reads only a lowercase `sbx_` as the ID's; `parseSandboxRef`
+//   takes `SBX_` too, so an ID prefix behind it is sent behind `sbx_`, the
+//   rest as typed. A name that starts with `SBX_` and then hex is then not
+//   matched.
 // - `page`: matched within the loaded rows, ignoring case, anywhere in the ID
 //   or name. On a paging server this is undashed hex or a hex run with
 //   dashes elsewhere, such as the ID column's label, which is the end of
@@ -171,10 +175,12 @@ export function sandboxSearch(input: string, mode: ListMode): SandboxSearch {
   if (mode === 'sampled') return { kind: 'page', query };
   const typed = input.trim();
   const lower = typed.toLowerCase();
-  if (lower.startsWith(PUBLIC_SANDBOX_ID_PREFIX) && startsUuid(lower.slice(PUBLIC_SANDBOX_ID_PREFIX.length))) {
-    return { kind: 'prefix', prefix: lower };
+  // As typed: lowercasing would lose a name such as `sbx_AB-worker`.
+  const afterMarker = typed.slice(PUBLIC_SANDBOX_ID_PREFIX.length);
+  if (lower.startsWith(PUBLIC_SANDBOX_ID_PREFIX) && startsUuid(afterMarker.toLowerCase())) {
+    return { kind: 'prefix', prefix: `${PUBLIC_SANDBOX_ID_PREFIX}${afterMarker}` };
   }
-  if (lower.includes('-') && startsUuid(lower)) return { kind: 'prefix', prefix: lower };
+  if (lower.includes('-') && startsUuid(lower)) return { kind: 'prefix', prefix: typed };
   const idFragment = /^[0-9a-f-]+$/.test(lower) && /[0-9a-f]/.test(lower);
   const namePrefix = !typed.includes('\0') && new TextEncoder().encode(typed).length <= MAX_SANDBOX_NAME_BYTES;
   if (idFragment || !namePrefix) return { kind: 'page', query };

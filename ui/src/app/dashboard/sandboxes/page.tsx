@@ -1645,14 +1645,14 @@ function SandboxesPage() {
             <Input
               allowClear
               size="small"
-              placeholder={paged ? 'Case-sensitive name or ID prefix, or full ID' : 'ID, pod name or name'}
+              placeholder={paged ? 'Case-sensitive name prefix, ID prefix or full ID' : 'ID, pod name or name'}
               value={idFilter}
               onChange={(e) => setIdFilter(e.target.value)}
               style={{ width: 290 }}
               aria-label="Search sandboxes"
             />
             {paged ? (
-              <Tooltip title="A name or ID prefix is searched on the server and is case-sensitive; an ID prefix starts with sbx_ or is a dashed UUID start. Hex alone, such as the ID column's label, matches IDs and names within this page, ignoring case. A full ID or pod name is looked up directly.">
+              <Tooltip title="A name or ID prefix is searched on the server as typed. Names match case-sensitively; an ID prefix starts with sbx_ or is a dashed UUID start, and its hex matches in either case. Hex alone, such as the ID column's label, matches IDs and names within this page, ignoring case. A full ID or pod name is looked up directly.">
                 <QuestionCircleOutlined aria-label="About the search" style={{ color: 'rgba(0, 0, 0, 0.45)' }} />
               </Tooltip>
             ) : null}
