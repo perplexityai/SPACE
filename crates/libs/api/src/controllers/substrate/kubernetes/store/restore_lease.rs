@@ -724,15 +724,15 @@ impl K8sStore {
     /// its wake has succeeded. Returns whether the row moved.
     ///
     /// This is the cancelled-wake redrive's fenced completion CAS
-    /// (`wake_completion.rs`): the row must still be `restoring` with a
-    /// routable active execution behind it. Where the redrive waits for the
-    /// lease to expire, so that no live attempt is overridden, this requires
-    /// the lease to be the caller's own: the owner is that live attempt. A
-    /// row a rollback, the sweeper, a suspend or a delete has moved on matches
-    /// nothing (leaving `restoring` also clears the token, through the
-    /// `sandboxes_clear_restore_lease` trigger), and once it is `started`
-    /// neither the API rollback nor the sweeper's revert (both
-    /// `restoring`-guarded) can move it back.
+    /// (`pplx_space_sandbox_store::wake::complete_redriven_wake`): the row
+    /// must still be `restoring` with a routable active execution behind it.
+    /// Where the redrive waits for the lease to expire, so that no live
+    /// attempt is overridden, this requires the lease to be the caller's own:
+    /// the owner is that live attempt. A row a rollback, the sweeper, a
+    /// suspend or a delete has moved on matches nothing (leaving `restoring`
+    /// also clears the token, through the `sandboxes_clear_restore_lease`
+    /// trigger), and once it is `started` neither the API rollback nor the
+    /// sweeper's revert (both `restoring`-guarded) can move it back.
     ///
     /// Without this, a Kubernetes restore driven from an access path, which
     /// runs no lifecycle-controller completion, stays `restoring` until the

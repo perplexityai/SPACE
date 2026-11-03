@@ -376,37 +376,20 @@ impl PublishedSuspendFence {
 /// worker-local wake leaves its pre-wake lifecycle (`suspended`, or
 /// `restoring` kept by an earlier lease restore) for this CAS to advance, and
 /// its lease restore writes `started` before returning.
-/// Other CAS losses retain the existing error behavior.
+/// Other CAS losses retain the existing error behavior. The CAS itself is
+/// [`sandbox_store::wake::complete_wake`].
 async fn complete_wake_lifecycle(
     pool: &PgPool,
     sandbox_id: SandboxId,
     published_suspend_fence: PublishedSuspendFence,
 ) -> Result<WakeLifecycleCompletion, sqlx::Error> {
-    let completed = sqlx::query_scalar::<_, bool>(sql!(
-        "UPDATE sandboxes
-            SET lifecycle = 'started', placement = 'on_node'
-          WHERE id = $1
-            AND LOWER(TRIM(lifecycle)) NOT IN (
-                'failed',
-                'quarantined',
-                'stopped',
-                'stopping',
-                'suspending',
-                'deleting',
-                'deleted',
-                'cleanup_required'
-            )
-            AND (
-                LOWER(TRIM(lifecycle)) <> 'suspended'
-                OR $2 = FALSE
-            )
-        RETURNING TRUE"
-    ))
-    .bind(sandbox_id)
-    .bind(published_suspend_fence == PublishedSuspendFence::Enforced)
-    .fetch_optional(pool)
+    let completed = sandbox_store::wake::complete_wake(
+        pool,
+        sandbox_id,
+        published_suspend_fence == PublishedSuspendFence::Enforced,
+    )
     .await?;
-    if completed.is_some() {
+    if completed {
         return Ok(WakeLifecycleCompletion::Completed);
     }
 

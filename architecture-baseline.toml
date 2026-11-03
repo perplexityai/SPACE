@@ -9,7 +9,7 @@
 # that adds an entry or raises a cap is reported.
 
 [file_size]
-"crates/libs/api/src/controllers/sandbox/lifecycle.rs" = 1793
+"crates/libs/api/src/controllers/sandbox/lifecycle.rs" = 1777
 "crates/libs/api/src/controllers/sandbox/mod.rs" = 1086
 "crates/libs/api/src/controllers/sandbox/queries.rs" = 2546
 "crates/libs/api/src/controllers/sandbox/spaced.rs" = 1103
@@ -147,14 +147,9 @@
 # and their calls to sandbox-portability's assignment renderers. They move into
 # the store; lower each cap as they go.
 [pattern_ratchet.sandbox_writes]
-"crates/libs/api/src/controllers/sandbox/lifecycle.rs" = 1
 "crates/libs/api/src/controllers/sandbox/responses.rs" = 3
 "crates/libs/api/src/controllers/sandbox/updates.rs" = 2
-"crates/libs/api/src/controllers/sandbox/wake_completion.rs" = 1
 "crates/libs/api/src/controllers/substrate/direct.rs" = 6
-"crates/libs/api/src/controllers/substrate/kubernetes/store/activation_fence.rs" = 1
-"crates/libs/api/src/controllers/substrate/kubernetes/store/execution_rows.rs" = 1
-"crates/libs/api/src/controllers/substrate/kubernetes/store/pod_placement.rs" = 1
 "crates/libs/api/src/controllers/substrate/kubernetes/store/pod_tracking.rs" = 5
 "crates/libs/api/src/controllers/substrate/kubernetes/store/restore_lease.rs" = 8
 "crates/libs/api/src/controllers/substrate/kubernetes/store/suspend.rs" = 8
@@ -165,7 +160,6 @@
 "crates/libs/cluster/controller/server/src/orphaned_sandboxes.rs" = 5
 "crates/libs/cluster/controller/server/src/tombstone_retention.rs" = 1
 "crates/libs/cluster/controller/server/src/transient_lifecycle_sweeper/store.rs" = 2
-"crates/libs/internal/api/server/src/data_plane_sessions/service_route.rs" = 1
 "crates/libs/internal/api/server/src/published_state.rs" = 3
 "crates/libs/internal/api/server/src/sandbox_quarantine_store.rs" = 1
 "crates/libs/placement/machine/src/postgres.rs" = 1
