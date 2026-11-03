@@ -1326,6 +1326,175 @@ mod stopped_restore_plan_tests {
         }
         Ok(())
     }
+
+    /// The row a stopped evacuation leaves while it waits out a failed
+    /// re-placement attempt: `restoring` with the `'stopped'` marker, both
+    /// placement columns NULL (the evacuation claim writes only `lifecycle`),
+    /// an inactive execution that still names the drained node, and the
+    /// pinned disk artifact durable in S3.
+    async fn stopped_re_placement_backoff_row(
+        pool: &PgPool,
+        substrate: &KubernetesSubstrate,
+        uri: &str,
+    ) -> Result<SandboxId, Box<dyn std::error::Error + Send + Sync>> {
+        let sandbox_id = SandboxId::new();
+        insert_stopped_sandbox(pool, sandbox_id).await?;
+        let node_id = NodeId::new();
+        insert_ready_worker_node(pool, node_id).await?;
+        substrate
+            .store
+            .ensure_active_execution_row(sandbox_id)
+            .await?;
+        substrate
+            .store
+            .persist_pod_node_placement(
+                sandbox_id,
+                "drained-node",
+                "drained-node-uid",
+                node_id,
+                NodeRole::Worker,
+                None,
+            )
+            .await?;
+        sqlx::query("UPDATE sandbox_k8s_executions SET active = FALSE WHERE sandbox_id = $1")
+            .bind(sandbox_id)
+            .execute(pool)
+            .await?;
+        publish_ready_disk_artifact(pool, sandbox_id, LocalArtifactId::new(), uri).await?;
+        sqlx::query(
+            "UPDATE sandboxes
+                SET active_node_id = NULL, target_node_id = NULL, placement = 'unplaced'
+              WHERE id = $1",
+        )
+        .bind(sandbox_id)
+        .execute(pool)
+        .await?;
+        claim_for_evacuation_restore(pool, sandbox_id, "stopped").await?;
+        Ok(sandbox_id)
+    }
+
+    const BLOCKING_START: ActivationOptions = ActivationOptions {
+        blocking: true,
+        ready_timeout: std::time::Duration::from_secs(1),
+    };
+
+    /// A user `start` on a stopped evacuation that is waiting out a failed
+    /// re-placement is told to retry, and places nothing: no pod pre-bound to
+    /// the drained node (see `refuse_user_wake_of_stopped_re_placement`).
+    ///
+    /// The row is left exactly as the drain owns it, so its next re-placement
+    /// attempt still claims it.
+    ///
+    /// Kubernetes only: Direct has no drain, so no row there carries the
+    /// marker (the "Drain and evacuation" gap row in `direct.rs`).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_user_start_is_refused_while_a_stopped_re_placement_backs_off() -> TestResult {
+        use crate::controllers::substrate::SubstrateAdapter;
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let captured_pod_creates = Arc::new(Mutex::new(Vec::new()));
+        let substrate = substrate_with_store_and_client(
+            pool.clone(),
+            mock_kubernetes_client(Arc::clone(&captured_pod_creates)),
+        );
+        let uri = "s3://space-test/backoff-stopped-disk?region=us-east-1";
+        let sandbox_id = stopped_re_placement_backoff_row(&pool, &substrate, uri).await?;
+
+        let result = substrate
+            .start_execution(
+                pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native("start"),
+                sandbox_id,
+                BLOCKING_START,
+                crate::controllers::substrate::RecoveryCharge::Exempt,
+            )
+            .await;
+
+        let pods = captured_pod_creates.lock().unwrap().clone();
+        assert!(
+            pods.is_empty(),
+            "a start must not place a pod while the drain owns the re-placement, but it \
+             created {pods:?} (result: {:?})",
+            result.as_ref().err()
+        );
+        // No phase: the refusal comes before any readiness wait.
+        assert!(
+            matches!(
+                &result,
+                Err(SubstrateError::Timeout { message, phase: None })
+                    if message.contains("being migrated off a")
+            ),
+            "the refusal must be the evacuation's retryable 503, got {:?}",
+            result.as_ref().err()
+        );
+
+        let (lifecycle, marker, lease_token): (String, Option<String>, Option<Uuid>) =
+            sqlx::query_as(
+                "SELECT lifecycle, evacuation_restore_target, restore_lease_token
+                   FROM sandboxes WHERE id = $1",
+            )
+            .bind(sandbox_id)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(
+            (lifecycle.as_str(), marker.as_deref(), lease_token),
+            ("restoring", Some("stopped"), None),
+            "the refusal must leave the drain's row untouched"
+        );
+        Ok(())
+    }
+
+    /// The drain's own re-placement of the same row still goes through: it
+    /// claims the row and creates a pod the scheduler places from the pinned
+    /// disk artifact, with no node pre-bound. A guard that the refusal stays
+    /// on the user path; it passes without the refusal too.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_drains_re_placement_of_a_backed_off_stopped_evacuation_still_places_a_pod()
+    -> TestResult {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let captured_pod_creates = Arc::new(Mutex::new(Vec::new()));
+        let substrate = substrate_with_store_and_client(
+            pool.clone(),
+            mock_kubernetes_client(Arc::clone(&captured_pod_creates)),
+        );
+        let uri = "s3://space-test/re-placed-backoff-disk?region=us-east-1";
+        let sandbox_id = stopped_re_placement_backoff_row(&pool, &substrate, uri).await?;
+
+        // The mock never runs the pod, so the restore can't complete; what
+        // matters is that it got past the claim and planned the pod.
+        let result = substrate
+            .restore_evacuated_execution(
+                pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::ecw("evacuation"),
+                sandbox_id,
+                BLOCKING_START,
+                None,
+                SandboxLifecycle::Stopped,
+            )
+            .await;
+
+        let pods = captured_pod_creates.lock().unwrap().clone();
+        let [pod] = pods.as_slice() else {
+            panic!(
+                "the re-placement must create exactly one pod, created {} (result: {result:?})",
+                pods.len()
+            );
+        };
+        assert_eq!(
+            pod.pointer("/spec/nodeName"),
+            None,
+            "a re-placement pod is placed by the scheduler, not pre-bound"
+        );
+        assert_eq!(
+            pod.pointer("/metadata/annotations")
+                .and_then(|annotations| {
+                    annotations.get(SandboxPodKey::SuspendRestoreStorageUri.as_str())
+                })
+                .and_then(serde_json::Value::as_str),
+            Some(uri),
+            "the re-placement pod restores from the pinned disk artifact"
+        );
+        Ok(())
+    }
 }
 
 #[tokio::test]

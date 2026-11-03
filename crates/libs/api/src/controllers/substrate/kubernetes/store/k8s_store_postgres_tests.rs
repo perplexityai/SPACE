@@ -8689,6 +8689,43 @@ async fn prepare_wake_preserves_restore_source_boundary(fixture: &PostgresStore)
         "marker-set evacuation restoring boundary must be left alone"
     );
 
+    // A stopped re-placement the drain claimed: a user wake has no plan to
+    // follow and is told to retry, while the drain's own preclaimed wake of
+    // the same row goes through.
+    let re_placing = SandboxId::new();
+    insert_sandbox(&fixture.pool, re_placing, "restoring").await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET evacuation_restore_target = 'stopped' WHERE id = $1"
+    ))
+    .bind(re_placing)
+    .execute(&fixture.pool)
+    .await?;
+    let sandbox = fixture.store.require_sandbox(re_placing).await?;
+    let err = match fixture
+        .store
+        .prepare_wake_sandbox(&sandbox, re_placing, None)
+        .await
+    {
+        Ok(prepared) => panic!(
+            "a user wake must not drive a stopped re-placement, got claim {:?}",
+            prepared.restore_claim
+        ),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, SubstrateError::Timeout { phase: None, .. }),
+        "the refusal must be the retryable 503, got {err:?}"
+    );
+    // The drain's evacuation claim of an already-`restoring` row.
+    let drain_redrive = RestoreClaim::RedroveRestoring {
+        restore_lease_token: None,
+    };
+    let prepared = fixture
+        .store
+        .prepare_wake_sandbox(&sandbox, re_placing, Some(drain_redrive))
+        .await?;
+    assert_eq!(prepared.restore_claim, Some(drain_redrive));
+
     Ok(())
 }
 

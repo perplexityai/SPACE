@@ -336,12 +336,7 @@ impl KubernetesSubstrate {
     ) -> Result<SuspendRestorePlan, SubstrateError> {
         let source = self.store.restore_source_plan(sandbox.id).await?;
         if source.stopped_evacuation_unplaced {
-            return Err(SubstrateError::Timeout {
-                message: "cannot restart stopped sandbox while it is being migrated off a \
-                          draining node; its disk is durable and re-placement is pending"
-                    .to_string(),
-                phase: None,
-            });
+            return Err(stopped_evacuation_pending());
         }
         let source_node_name = source.node_name;
         let storage_uri = match source_node_name {

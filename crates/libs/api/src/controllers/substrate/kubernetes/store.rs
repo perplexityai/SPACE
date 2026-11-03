@@ -91,6 +91,18 @@ pub(super) enum PlacementRetryDisposition {
     RetryConverges,
 }
 
+/// The retryable 503 a user `start` or wake gets while a stopped evacuation
+/// owns the sandbox, before or during its re-placement. Unphased: no
+/// readiness wait ran.
+pub(super) fn stopped_evacuation_pending() -> SubstrateError {
+    SubstrateError::Timeout {
+        message: "cannot restart stopped sandbox while it is being migrated off a draining \
+                  node; its disk is durable and re-placement is pending"
+            .to_string(),
+        phase: None,
+    }
+}
+
 /// The restore source for a stopped sandbox: the node name a pod would be
 /// pinned to, and whether a stopped evacuation is why the row has no placement.
 ///
