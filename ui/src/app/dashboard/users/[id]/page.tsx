@@ -178,7 +178,7 @@ export default function UserDetailPage() {
       message.success('User deleted');
       router.push('/dashboard/users');
     } catch (err: unknown) {
-      message.error(userDeleteFailureMessage(err, { ownsSandboxes }));
+      message.error(userDeleteFailureMessage(err));
     }
   };
 
@@ -226,7 +226,7 @@ export default function UserDetailPage() {
           type="warning"
           showIcon
           style={{ marginBottom: 16 }}
-          message={`Saved; the page could not reload the user: ${reloadError}`}
+          title={`Saved; the page could not reload the user: ${reloadError}`}
           action={<Button size="small" icon={<ReloadOutlined />} onClick={() => void reloadUser()}>Retry</Button>}
         />
       ) : null}

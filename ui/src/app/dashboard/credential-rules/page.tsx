@@ -290,7 +290,7 @@ export default function CredentialRulesPage() {
         showIcon
         icon={<SafetyCertificateOutlined />}
         style={{ marginBottom: 16 }}
-        message="Evaluation order"
+        title="Evaluation order"
         description={
           <Space orientation="vertical" size={2}>
             <Text>1. Platform and explicit network denies are evaluated before allows.</Text>
@@ -305,7 +305,7 @@ export default function CredentialRulesPage() {
       <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
         <Col xs={24} sm={8}><Card size="small"><Statistic title="Credential rules" value={rows.length} /></Card></Col>
         <Col xs={24} sm={8}><Card size="small"><Statistic title="Sandboxes" value={sandboxCount} /></Card></Col>
-        <Col xs={24} sm={8}><Card size="small"><Statistic title="Host matches denied" value={blockedCount} valueStyle={blockedCount ? { color: token.colorError } : undefined} /></Card></Col>
+        <Col xs={24} sm={8}><Card size="small"><Statistic title="Host matches denied" value={blockedCount} styles={blockedCount ? { content: { color: token.colorError } } : undefined} /></Card></Col>
       </Row>
 
       <Card size="small">

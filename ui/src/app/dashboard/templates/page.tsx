@@ -19,10 +19,13 @@ import {
   TemplateRelease,
   TemplateReleaseWarmPool,
   TemplateOperationResponse,
+  TemplateBuildListEntry,
   Sandbox,
 } from '@/lib/types';
 import { tablePagination } from '@/lib/table-pagination';
-import { LATEST_TAG as DEFAULT_TEMPLATE_TAG, errorMessage, shortHash } from '@/lib/template-format';
+import { LATEST_TAG as DEFAULT_TEMPLATE_TAG, buildsRead, errorMessage, retagStepNow, shortHash, tagHolders, type BuildsView, type RetagBaseline } from '@/lib/template-format';
+import { singleFlight } from '@/lib/single-flight';
+import { TAG_PRECONDITION_UNCHECKED, isMissingRoute, moveReleaseTag, pageRows, tagMoveFailureMessage } from '@/lib/admin-fallback';
 import { SPACED_SAMPLE_LIMIT, SpacedCounts, loadSpacedCounts, spacedCoverage } from '@/lib/spaced-counts';
 import SystemTemplateRebuild from './system-template-rebuild';
 import {
@@ -153,7 +156,7 @@ function sizeTooltipLines(values: {
   artifact_size_bytes?: number | null;
 }) {
   return (
-    <Space direction="vertical" size={0}>
+    <Space orientation="vertical" size={0}>
       <span>Sandbox disk: {formatDiskSize(values.disk_size_mb)}</span>
       {values.cache_size_bytes !== null && values.cache_size_bytes !== undefined ? (
         <span>Rootfs allocated: {formatBytes(values.cache_size_bytes)}</span>
@@ -315,7 +318,7 @@ function matchesWarmPoolFilter(pools: TemplateReleaseWarmPool[], filter: string)
 
 function warmPoolTooltip(pool: TemplateReleaseWarmPool, diskCapacityEnabled: boolean) {
   return (
-    <Space direction="vertical" size={0}>
+    <Space orientation="vertical" size={0}>
       <span>Owner: {pool.managed_by}</span>
       <span>Shape: {pool.vcpu}c / {pool.memory_mib} MiB</span>
       {diskCapacityEnabled ? (
@@ -333,7 +336,7 @@ function warmPoolTooltip(pool: TemplateReleaseWarmPool, diskCapacityEnabled: boo
 
 function baseSnapshotTooltip(template: Template, desired: boolean) {
   return (
-    <Space direction="vertical" size={0}>
+    <Space orientation="vertical" size={0}>
       <span>Desired: {desired ? 'enabled' : 'disabled'}</span>
       <span>Observed: {template.has_base_snapshot ? 'ready' : 'not ready'}</span>
     </Space>
@@ -343,6 +346,137 @@ function baseSnapshotTooltip(template: Template, desired: boolean) {
 function hasAutoLifecyclePolicy(policy: Template['default_auto_lifecycle']) {
   return JSON.stringify(policy ?? disabledAutoLifecycle()) !== JSON.stringify(disabledAutoLifecycle());
 }
+
+const TEMPLATE_BUILDS_LIMIT = 20;
+
+// The template's newest builds, from `GET /templates/{name}/builds`. Releases
+// that predate the route answer 405 (the path is POST-only there). While its
+// row is expanded (`open`), the panel reads them again on each of the page's
+// refreshes (`reloadKey`), keeping the rows it shows until the new answer
+// arrives; collapsed, it reads nothing (`buildsRead`). Each answer decides
+// afresh whether the route exists.
+function TemplateBuildsPanel({ templateName, open, reloadKey }: { templateName: string; open: boolean; reloadKey: number }) {
+  const { token } = theme.useToken();
+  const [builds, setBuilds] = useState<TemplateBuildListEntry[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [unsupported, setUnsupported] = useState(false);
+  // Only the newest read may write: a page refresh can overlap a Retry.
+  const request = useRef(0);
+
+  const load = (background = false) => {
+    const current = ++request.current;
+    if (!background) {
+      setBuilds(null);
+      setError(null);
+    }
+    adminApi
+      .get<unknown>(`/v1/templates/${encodedPathSegment(templateName)}/builds?limit=${TEMPLATE_BUILDS_LIMIT}`)
+      .then((body) => {
+        if (current !== request.current) return;
+        setBuilds(pageRows<TemplateBuildListEntry>(body).rows);
+        setError(null);
+        setUnsupported(false);
+      })
+      .catch((err: unknown) => {
+        if (current !== request.current) return;
+        const missing = isMissingRoute(err);
+        setUnsupported(missing);
+        setError(missing ? null : errorMessage(err));
+        setBuilds((shown) => (background && shown ? shown : []));
+      });
+  };
+
+  const shown = useRef<BuildsView | null>(null);
+  useEffect(() => {
+    const view = { templateName, open, reloadKey };
+    const read = buildsRead(shown.current, view);
+    shown.current = view;
+    if (read) load(read === 'background');
+  }, [templateName, open, reloadKey]);
+
+  if (unsupported) {
+    return <Text type="secondary">This API release does not list a template&apos;s builds.</Text>;
+  }
+
+  return (
+    <div>
+      <Text strong>Builds</Text>
+      {error ? (
+        <Alert
+          type="error"
+          showIcon
+          title={`Could not load builds: ${error}`}
+          action={<Button size="small" onClick={() => load()}>Retry</Button>}
+          style={{ margin: '8px 0' }}
+        />
+      ) : null}
+      <Table<TemplateBuildListEntry>
+        size="small"
+        rowKey="job_id"
+        loading={builds === null}
+        dataSource={builds ?? []}
+        pagination={false}
+        style={{ marginTop: 8 }}
+        locale={{ emptyText: error ? 'Not loaded' : 'No builds recorded' }}
+        columns={[
+          {
+            title: 'Created',
+            dataIndex: 'created_at',
+            width: 190,
+            render: (value: string) => new Date(value).toLocaleString(),
+          },
+          {
+            title: 'State',
+            dataIndex: 'state',
+            width: 130,
+            render: (state: TemplateBuildListEntry['state'], row) => state
+              ? <Tag color={TEMPLATE_BUILD_STATE_COLORS[state] ?? 'default'}>{state.replace(/_/g, ' ')}</Tag>
+              : (
+                <Tooltip title={row.status_error ?? undefined}>
+                  <Tag>unknown</Tag>
+                </Tooltip>
+              ),
+          },
+          {
+            title: 'Content hash',
+            dataIndex: 'content_hash',
+            width: 140,
+            render: (hash: string | null) => hash
+              ? <Tooltip title={hash}><Text code>{shortHash(hash)}</Text></Tooltip>
+              : <Text type="secondary">—</Text>,
+          },
+          {
+            title: 'Error',
+            render: (_, row) => (
+              <Space orientation="vertical" size={0}>
+                {row.error ? <Text type="danger">{row.error}</Text> : null}
+                {row.status_error ? (
+                  <Text style={{ color: token.colorTextTertiary }}>Status not read: {row.status_error}</Text>
+                ) : null}
+                {!row.error && !row.status_error ? <Text type="secondary">—</Text> : null}
+              </Space>
+            ),
+          },
+          {
+            title: 'Job',
+            dataIndex: 'job_id',
+            width: 140,
+            render: (jobId: string) => <Text code copyable={{ text: jobId }}>{jobId.slice(0, 8)}</Text>,
+          },
+        ]}
+      />
+    </div>
+  );
+}
+
+const TEMPLATE_BUILD_STATE_COLORS: Record<string, string> = {
+  pending: 'default',
+  running: 'processing',
+  succeeded: 'success',
+  failed: 'error',
+  publish_failed: 'error',
+  unspecified: 'default',
+};
 
 function PoolSandboxesPanel({ templateName }: { templateName: string }) {
   const { message } = App.useApp();
@@ -487,10 +621,25 @@ export default function TemplatesPage() {
     template: null,
   });
   const [retagForm] = Form.useForm();
-  const [retagModal, setRetagModal] = useState<{ open: boolean; release: TemplateRelease | null }>({
+  // `holders` is which release held each of the template's tags when the
+  // dialog opened, except a tag whose move `change` showed (`retagStep`):
+  // the precondition the move sends. A refresh while the dialog is open does
+  // not change it.
+  const [retagModal, setRetagModal] = useState<{ open: boolean; release: TemplateRelease | null } & RetagBaseline>({
     open: false,
     release: null,
+    holders: new Map(),
+    change: null,
   });
+  // A second OK while the move is in flight would send the same precondition
+  // again and read as a 412 "tag moved" (the first press moved it).
+  const retagFlight = useRef(singleFlight()).current;
+  const [retagSubmitting, setRetagSubmitting] = useState(false);
+  // Bumped when the dialog opens or closes, so a submit whose re-read
+  // outlived its dialog sends nothing. The tag input and OK are disabled
+  // while a submit is in flight, so its answer is for the tag still shown.
+  const retagSession = useRef(0);
+  const retagTagInput = Form.useWatch('tag', retagForm) as string | undefined;
   const [expandedTemplateRows, setExpandedTemplateRows] = useState<string[]>([]);
   const [templateOperations, setTemplateOperations] = useState<Set<string>>(() => new Set());
   const [buildingSnapshot, setBuildingSnapshot] = useState<string | null>(null);
@@ -498,6 +647,8 @@ export default function TemplatesPage() {
   const [editingTemplateLifecycle, setEditingTemplateLifecycle] = useState<Template | null>(null);
   const [editingTemplateNetwork, setEditingTemplateNetwork] = useState<Template | null>(null);
   const [manualRefreshing, setManualRefreshing] = useState(false);
+  // Counts the page's completed refreshes; expanded rows read again on each.
+  const [refreshGeneration, setRefreshGeneration] = useState(0);
   const [refreshCooldown, setRefreshCooldown] = useState(false);
   const refreshCooldownRef = useRef(false);
   const refreshCooldownTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -706,6 +857,7 @@ export default function TemplatesPage() {
       refreshWarmPoolPolicyCapabilities(),
     ]);
     markViewRefreshed(TEMPLATES_VIEW_REFRESH_KEY);
+    setRefreshGeneration((generation) => generation + 1);
   };
 
   const refresh = async ({
@@ -723,6 +875,7 @@ export default function TemplatesPage() {
       refreshWarmPoolPolicyCapabilities(),
     ]);
     markViewRefreshed(TEMPLATES_VIEW_REFRESH_KEY);
+    setRefreshGeneration((generation) => generation + 1);
   };
 
   const maybeRefresh = () => {
@@ -810,31 +963,71 @@ export default function TemplatesPage() {
 
   const openRetagModal = (release: TemplateRelease) => {
     if (!canManageTemplateReleases) return;
+    retagSession.current += 1;
     const visibleTags = visibleTemplateTags(release.tags, release.content_hash);
     retagForm.setFieldsValue({ tag: visibleTags[0] ?? DEFAULT_TEMPLATE_TAG });
-    setRetagModal({ open: true, release });
+    setRetagModal({ open: true, release, holders: tagHolders(templateReleases, release.template_name), change: null });
   };
 
   const closeRetagModal = () => {
-    setRetagModal({ open: false, release: null });
+    retagSession.current += 1;
+    setRetagModal({ open: false, release: null, holders: new Map(), change: null });
     retagForm.resetFields();
   };
 
-  const handleRetagRelease = async (values: { tag: string }) => {
+  const releaseLabel = (releaseId: string | null) => {
+    if (releaseId === null) return 'no release (the tag did not exist)';
+    const holder = templateReleases.find((candidate) => candidate.id === releaseId);
+    return holder ? `${holder.template_name}@${shortHash(holder.content_hash)}` : `release ${releaseId}`;
+  };
+
+  const handleRetagRelease = (values: { tag: string }) => retagFlight.run(async () => {
     const release = retagModal.release;
     if (!release || !canManageTemplateReleases) return;
 
+    const tag = values.tag.trim();
+    const session = retagSession.current;
+    setRetagSubmitting(true);
     try {
-      await adminApi.put(`/v1/template-releases/${release.id}/tag`, {
-        tag: values.tag.trim(),
-      });
+      // The releases are read again first: if the tag moved since the dialog
+      // showed it, show where it is now and ask again before moving it.
+      let step: Awaited<ReturnType<typeof retagStepNow>>;
+      try {
+        step = await retagStepNow(
+          retagModal,
+          () => refreshTemplateReleases({ showLoading: false }),
+          release.template_name,
+          tag,
+          // Closed, or opened for another release, while the releases were
+          // read; or showing another tag, whose warning would not be seen.
+          (shown) => session === retagSession.current && String(retagForm.getFieldValue('tag') ?? '').trim() === shown,
+        );
+      } catch {
+        message.error("Could not read the template's tags again before moving the tag; nothing was changed. Try again.");
+        return;
+      }
+      if (step.kind === 'stale') return;
+      if (step.kind === 'warn') {
+        setRetagModal((current) => ({ ...current, ...step.baseline }));
+        return;
+      }
+      // Moved only while the tag still points where the operator saw it.
+      const { checked } = await moveReleaseTag(
+        (path, body) => adminApi.put(path, body),
+        release.id,
+        tag,
+        step.expected,
+      );
       closeRetagModal();
       await refreshTemplateReleases({ showLoading: false });
-      message.success('Template release tag updated');
+      if (checked) message.success('Template release tag updated');
+      else message.warning(`Template release tag updated. ${TAG_PRECONDITION_UNCHECKED}`);
     } catch (err: unknown) {
-      message.error(errorMessage(err));
+      message.error(tagMoveFailureMessage(err));
+    } finally {
+      setRetagSubmitting(false);
     }
-  };
+  });
 
   const handleDeleteReleaseTag = async (release: TemplateRelease, tag: string) => {
     if (!canManageTemplateReleases || !canDeleteVisibleTemplateTag(tag)) return;
@@ -1626,7 +1819,7 @@ export default function TemplatesPage() {
       title: 'Shape',
       width: 135,
       render: (_, record) => (
-        <Space direction="vertical" size={0}>
+        <Space orientation="vertical" size={0}>
           <span>{record.vcpu}c / {record.memory_mib} MiB</span>
           {warmPoolPolicyCapabilities.disk_capacity ? (
             <Text type="secondary">
@@ -1997,32 +2190,34 @@ export default function TemplatesPage() {
         loading={loadingTemplates}
         size="small"
         pagination={tablePagination('templates')}
-        scroll={{ x: isDirectSubstrate ? 1180 : 1000 }}
-        expandable={isDirectSubstrate ? {
+        scroll={{ x: isDirectSubstrate ? 1180 : 1034 }}
+        expandable={{
           expandedRowKeys: expandedTemplateRows,
           onExpandedRowsChange: (keys) => setExpandedTemplateRows(keys.map(String)),
-          expandedRowRender: (record) => <PoolSandboxesPanel templateName={record.name} />,
-          rowExpandable: hasObservedPoolSandboxes,
+          expandedRowRender: (record, _index, _indent, expanded) => (
+            <Space orientation="vertical" size={12} style={{ width: '100%' }}>
+              <TemplateBuildsPanel templateName={record.name} open={expanded} reloadKey={refreshGeneration} />
+              {isDirectSubstrate && hasObservedPoolSandboxes(record) ? <PoolSandboxesPanel templateName={record.name} /> : null}
+            </Space>
+          ),
           columnWidth: 34,
           fixed: 'left',
-          expandIcon: ({ expanded, expandable, onExpand, record }) => {
-            if (!expandable) {
-              return <span style={{ display: 'inline-block', width: 22 }} />;
-            }
+          expandIcon: ({ expanded, onExpand, record }) => {
+            const what = isDirectSubstrate && hasObservedPoolSandboxes(record) ? 'builds and pool sandboxes' : 'builds';
             return (
-              <Tooltip title={expanded ? 'Hide pool sandboxes' : 'Show pool sandboxes'}>
+              <Tooltip title={expanded ? `Hide ${what}` : `Show ${what}`}>
                 <Button
                   type="text"
                   size="small"
                   icon={expanded ? <DownOutlined /> : <RightOutlined />}
-                  aria-label={expanded ? 'Collapse pool sandboxes' : 'Expand pool sandboxes'}
+                  aria-label={expanded ? `Collapse ${what}` : `Expand ${what}`}
                   onClick={(event) => onExpand(record, event)}
                   style={{ width: 22, height: 22, minWidth: 22, padding: 0 }}
                 />
               </Tooltip>
             );
           },
-        } : undefined}
+        }}
       />
 
       {canAdminTemplates ? (
@@ -2036,6 +2231,7 @@ export default function TemplatesPage() {
         <Title level={4} style={{ marginTop: 24 }}>Template Releases</Title>
       )}
 
+      <div id="template-releases" />
       <Table
         columns={releaseColumns}
         dataSource={templateReleases}
@@ -2237,7 +2433,7 @@ export default function TemplatesPage() {
           <Form.Item name="enabled" label="Enabled" valuePropName="checked">
             <Switch />
           </Form.Item>
-          <Space direction="vertical" size={4}>
+          <Space orientation="vertical" size={4}>
             <Text type="secondary">
               Each retained release receives the configured minimum ready slots before demand.
             </Text>
@@ -2255,17 +2451,27 @@ export default function TemplatesPage() {
         open={retagModal.open}
         onCancel={closeRetagModal}
         onOk={() => retagForm.submit()}
+        confirmLoading={retagSubmitting}
+        okButtonProps={{ disabled: retagSubmitting }}
         destroyOnHidden
       >
+        {retagModal.change && retagTagInput?.trim() === retagModal.change.tag ? (
+          <Alert
+            type="warning"
+            showIcon
+            style={{ marginBottom: 12 }}
+            title={`While this dialog was open, ${retagModal.change.tag} moved from ${releaseLabel(retagModal.change.from)} to ${releaseLabel(retagModal.change.to)}. Nothing was changed; press OK again to move it from where it is now.`}
+          />
+        ) : null}
         <Form form={retagForm} layout="vertical" onFinish={handleRetagRelease}>
           <Form.Item
             name="tag"
             label="Tag"
             rules={[{ required: true, message: 'Tag is required' }]}
           >
-            <Input placeholder={DEFAULT_TEMPLATE_TAG} />
+            <Input placeholder={DEFAULT_TEMPLATE_TAG} disabled={retagSubmitting} />
           </Form.Item>
-          <Space direction="vertical" size={4}>
+          <Space orientation="vertical" size={4}>
             <Text type="secondary">
               If this tag already exists for the template, it will move to this release.
             </Text>

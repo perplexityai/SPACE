@@ -79,7 +79,7 @@ export default function LoginPage() {
         <Alert
           type="error"
           showIcon
-          message="Could not load sign-in settings"
+          title="Could not load sign-in settings"
           description="The console could not reach the SPACE API."
           style={{ marginBottom: 16 }}
         />
@@ -105,7 +105,7 @@ export default function LoginPage() {
           <Alert
             type={accessProblem === 'forbidden' ? 'warning' : 'error'}
             showIcon
-            message={problem.message}
+            title={problem.message}
             description={problem.description}
             style={{ marginBottom: 16 }}
             data-testid={`access-problem-${accessProblem}`}
@@ -135,10 +135,10 @@ export default function LoginPage() {
     body = (
       <>
         {notice && (
-          <Alert message={notice} type="info" showIcon closable style={{ marginBottom: 16 }} onClose={() => setNotice(null)} />
+          <Alert title={notice} type="info" showIcon closable style={{ marginBottom: 16 }} onClose={() => setNotice(null)} />
         )}
         {error && (
-          <Alert message={error} type="error" showIcon closable style={{ marginBottom: 16 }} onClose={() => setError('')} />
+          <Alert title={error} type="error" showIcon closable style={{ marginBottom: 16 }} onClose={() => setError('')} />
         )}
         <Form layout="vertical" onFinish={handleSubmit} autoComplete="off">
           <Form.Item label="Email" name="email" rules={[{ required: true }]}>

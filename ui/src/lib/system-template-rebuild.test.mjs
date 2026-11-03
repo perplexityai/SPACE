@@ -5,6 +5,9 @@ import {
   acceptJob,
   acceptTestSandbox,
   applyLost,
+  applySubmitFailure,
+  buildKeyClosed,
+  buildKeyGeneration,
   applyStatus,
   canBuild,
   canPromote,
@@ -16,13 +19,16 @@ import {
   pollDelayMs,
   promotionPlan,
   promotionState,
+  retiredBuilds,
   samePlan,
   sandboxOutcomeNotice,
   storageKey,
   submitFailureText,
+  systemBuildIdempotencyKey,
   systemBuildRequest,
   testSandboxFailureText,
   withJob,
+  withNewBuildKey,
 } from './system-template-rebuild.ts';
 
 const SEED = 'blake3:' + 'a'.repeat(64);
@@ -58,14 +64,20 @@ test('each step is offered once: a build only while its step has no job', () => 
 
 test('an answer is recorded only into the still-empty step it was sent for', () => {
   const run = start();
-  const first = acceptJob(run, 'run-1', 'seed', job('pending', null, 'job-a'));
+  const first = acceptJob(run, 'run-1', 'seed', job('pending', null, 'job-a'), 0);
   assert.equal(first.kind, 'recorded');
   // Another tab's click got there first: its job is reported, not recorded.
-  const second = acceptJob(first.run, 'run-1', 'seed', job('pending', null, 'job-b'));
+  const second = acceptJob(first.run, 'run-1', 'seed', job('pending', null, 'job-b'), 0);
   assert.equal(second.kind, 'extra');
   assert.equal(second.existing.job_id, 'job-a');
-  assert.equal(acceptJob(null, 'run-1', 'seed', job('pending')).kind, 'gone');
-  assert.equal(acceptJob(run, 'run-0', 'seed', job('pending')).kind, 'gone');
+  assert.match(jobOutcomeNotice('seed', 'job-b', second), /Another click also started seed job job-b/);
+  // Another tab sent the same key and the API replayed it: the same job is
+  // the build the run already follows, not an extra one.
+  const replay = acceptJob(first.run, 'run-1', 'seed', job('pending', null, 'job-a'), 0);
+  assert.deepEqual(replay, { kind: 'recorded', run: first.run });
+  assert.equal(jobOutcomeNotice('seed', 'job-a', replay), null);
+  assert.equal(acceptJob(null, 'run-1', 'seed', job('pending'), 0).kind, 'gone');
+  assert.equal(acceptJob(run, 'run-0', 'seed', job('pending'), 0).kind, 'gone');
   const seeded = withJob(run, 'seed', job('succeeded', SEED));
   const sandbox = acceptTestSandbox(seeded, 'run-1', 'seed', { id: 'sbx_a', createdAt: '2026-11-01T00:00:00Z' });
   assert.equal(sandbox.kind, 'recorded');
@@ -234,4 +246,177 @@ test('a stored value in any shape this page does not write is ignored', () => {
     JSON.stringify({ ...run, submitUnknown: { other: 'x' } }),
   ];
   for (const raw of variants) assert.equal(parseStoredRun(raw, ids, at), null, raw);
+});
+
+test("a build's Idempotency-Key is the same for the run and template, and differs otherwise", () => {
+  assert.equal(systemBuildIdempotencyKey('run-1', 'seed'), systemBuildIdempotencyKey('run-1', 'seed'));
+  assert.notEqual(systemBuildIdempotencyKey('run-1', 'seed'), systemBuildIdempotencyKey('run-1', 'code-runtime'));
+  assert.notEqual(systemBuildIdempotencyKey('run-1', 'seed'), systemBuildIdempotencyKey('run-2', 'seed'));
+});
+
+const conflict = (message, retryable, details) => Object.assign(new Error(message), {
+  status: 409,
+  body: { code: 'conflict', message, request_id: null, retryable, details },
+});
+
+test('a 409 while the earlier request with the same key may still be being submitted asks to build again shortly', () => {
+  const pending = conflict('a build with this Idempotency-Key may still be being submitted; retry shortly', true, [
+    { key: 'reserved_at', value: '2026-11-03T05:00:00Z' },
+  ]);
+  const outcome = submitFailureText('seed', pending);
+  assert.equal(outcome.known, false);
+  assert.equal(outcome.closed, undefined);
+  assert.match(outcome.text, /may still be being submitted; build again shortly/);
+  // The same key with another body is a refusal.
+  assert.equal(submitFailureText('seed', conflict('idempotency key was already used with a different request', false, [])).known, true);
+});
+
+test("a non-retryable 409 closes the key: it names the job when known and does not promise the first build", () => {
+  const unknown = conflict('the build submitted with this Idempotency-Key at 2026-11-03T05:00:00Z has an unknown outcome', false, [
+    { key: 'reserved_at', value: '2026-11-03T05:00:00Z' },
+    { key: 'job_id', value: 'job-synthetic' },
+  ]);
+  const outcome = submitFailureText('code-runtime', unknown);
+  assert.equal(outcome.known, false);
+  assert.deepEqual(outcome.closed, { jobId: 'job-synthetic' });
+  assert.match(outcome.text, /unknown outcome: it may have started and may still be running as job job-synthetic/);
+  assert.match(outcome.text, /answers the same/);
+  assert.doesNotMatch(outcome.text, /returns the first build|answers with the first build/);
+  const noJob = submitFailureText('seed', conflict('x', false, [{ key: 'reserved_at', value: '2026-11-03T05:00:00Z' }]));
+  assert.deepEqual(noJob.closed, { jobId: null });
+  assert.doesNotMatch(noJob.text, / as job /);
+});
+
+test('the unknown-outcome text says what building again with the same key can answer', () => {
+  const { text } = submitFailureText('seed', Object.assign(new Error('Internal server error'), { status: 500 }));
+  assert.match(text, /resends the same Idempotency-Key/);
+  assert.match(text, /could not tell whether the builder took it says so/);
+  assert.doesNotMatch(text, /a retry returns the first build/);
+});
+
+test('"Start a new build" sends a new key for that template only, and keeps the attempt it replaced', () => {
+  const closed = { ...start(), submitUnknown: { seed: 'unknown outcome' }, keyClosed: { seed: { jobId: 'job-x' } } };
+  assert.equal(buildKeyGeneration(closed, 'seed'), 0);
+  assert.deepEqual(buildKeyClosed(closed, 'seed'), { jobId: 'job-x' });
+  const renewed = withNewBuildKey(closed, 'seed');
+  assert.equal(buildKeyGeneration(renewed, 'seed'), 1);
+  assert.equal(buildKeyGeneration(renewed, 'code-runtime'), 0);
+  // Only the notice that blocked building is cleared.
+  assert.equal(buildKeyClosed(renewed, 'seed'), null);
+  assert.deepEqual(renewed.submitUnknown, {});
+  // The attempt, and the job the 409 named, stay shown as unresolved.
+  assert.deepEqual(retiredBuilds(renewed, 'seed'), [{ generation: 0, jobId: 'job-x', notes: [] }]);
+  assert.deepEqual(retiredBuilds(renewed, 'code-runtime'), []);
+  const first = systemBuildIdempotencyKey(ids.runId, 'seed', buildKeyGeneration(closed, 'seed'));
+  const second = systemBuildIdempotencyKey(ids.runId, 'seed', buildKeyGeneration(renewed, 'seed'));
+  assert.notEqual(first, second);
+  // Generation 0 is the key runs stored before generations used.
+  assert.equal(first, systemBuildIdempotencyKey(ids.runId, 'seed'));
+  // A second new build keeps both earlier attempts, oldest first.
+  const third = withNewBuildKey({ ...renewed, keyClosed: { seed: { jobId: null } } }, 'seed');
+  assert.equal(buildKeyGeneration(third, 'seed'), 2);
+  assert.deepEqual(retiredBuilds(third, 'seed').map((attempt) => [attempt.generation, attempt.jobId]), [[0, 'job-x'], [1, null]]);
+  // The new generation's job is the run's build; the retired attempt stays.
+  const recorded = acceptJob(renewed, ids.runId, 'seed', job('pending', null, 'job-y'), 1);
+  assert.equal(recorded.kind, 'recorded');
+  assert.equal(recorded.run.seed.job_id, 'job-y');
+  assert.equal(retiredBuilds(recorded.run, 'seed').length, 1);
+});
+
+const serverError = (message) => Object.assign(new Error(message), { status: 500 });
+
+test("two interleaved generations: an old request's answer never closes or fills the newer one", () => {
+  // Generation 0's request is in flight when another tab starts a new build.
+  const closedGen0 = { ...start(), submitUnknown: { seed: 'unknown outcome' }, keyClosed: { seed: { jobId: 'job-x' } } };
+  const gen1 = withNewBuildKey(closedGen0, 'seed');
+  // Generation 0 answers the closed-key 409 after generation 1 was sent: the
+  // newer generation is not closed, and the answer is a note on the old attempt.
+  const late409 = submitFailureText('seed', conflict('unknown outcome', false, [
+    { key: 'reserved_at', value: '2026-11-03T05:00:00Z' },
+    { key: 'job_id', value: 'job-x' },
+  ]));
+  const afterLate409 = applySubmitFailure(gen1, ids.runId, 'seed', 0, late409);
+  assert.equal(afterLate409.current, false);
+  assert.equal(buildKeyClosed(afterLate409.run, 'seed'), null);
+  assert.deepEqual(afterLate409.run.submitUnknown, {});
+  assert.equal(canBuild(afterLate409.run, 'seed'), true);
+  assert.deepEqual(retiredBuilds(afterLate409.run, 'seed'), [{ generation: 0, jobId: 'job-x', notes: [late409.lateNote] }]);
+  assert.match(late409.lateNote, /answered that its outcome is unknown \(job job-x\)/);
+  // Generation 1 fails with an unknown outcome: that one is the run's.
+  const gen1Unknown = applySubmitFailure(afterLate409.run, ids.runId, 'seed', 1, submitFailureText('seed', serverError('synthetic 502')));
+  assert.equal(gen1Unknown.current, true);
+  assert.match(gen1Unknown.run.submitUnknown.seed, /synthetic 502/);
+  // Generation 0 then answers with a job: noted on the retired attempt, not
+  // recorded as the run's build, and generation 1 stays open to retry.
+  const late = acceptJob(gen1Unknown.run, ids.runId, 'seed', job('pending', null, 'job-old'), 0);
+  assert.equal(late.kind, 'obsolete');
+  assert.equal(late.run.seed, null);
+  assert.match(late.run.submitUnknown.seed, /synthetic 502/);
+  const [attempt] = retiredBuilds(late.run, 'seed');
+  assert.equal(attempt.jobId, 'job-x');
+  assert.match(attempt.notes.at(-1), /answered with job job-old/);
+  assert.equal(jobOutcomeNotice('seed', 'job-old', late), null);
+  // Generation 1's own job is the run's build.
+  const current = acceptJob(late.run, ids.runId, 'seed', job('pending', null, 'job-new'), 1);
+  assert.equal(current.kind, 'recorded');
+  assert.equal(current.run.seed.job_id, 'job-new');
+  assert.equal(current.run.submitUnknown.seed, undefined);
+});
+
+test('a retired attempt keeps its unknown outcome and job: later answers of its key are only noted', () => {
+  // Generation 0's request may have started; another tab got the
+  // non-retryable 409 naming its job and started generation 1.
+  const gen1 = withNewBuildKey({ ...start(), keyClosed: { seed: { jobId: 'job-x' } } }, 'seed');
+  const before = retiredBuilds(gen1, 'seed')[0];
+  // A pending generation-0 retry is then refused after an authorization
+  // change. The API checks that before it replays the key, so this says
+  // nothing about the first request.
+  const forbidden = submitFailureText('seed', Object.assign(new Error('synthetic forbidden'), { status: 403 }));
+  const refused = applySubmitFailure(gen1, ids.runId, 'seed', 0, forbidden);
+  assert.equal(refused.current, false);
+  assert.deepEqual(retiredBuilds(refused.run, 'seed'), [{ ...before, notes: ['a later request of this attempt was refused (403): synthetic forbidden'] }]);
+  // Further answers add notes, once each, and never change the job.
+  const failed = submitFailureText('seed', new TypeError('synthetic network error'));
+  const again = applySubmitFailure(applySubmitFailure(refused.run, ids.runId, 'seed', 0, failed).run, ids.runId, 'seed', 0, failed);
+  const named = acceptJob(again.run, ids.runId, 'seed', job('pending', null, 'job-x'), 0);
+  assert.deepEqual(retiredBuilds(named.run, 'seed'), [{
+    generation: 0,
+    jobId: 'job-x',
+    notes: [
+      'a later request of this attempt was refused (403): synthetic forbidden',
+      'a later request of this attempt failed (no response): synthetic network error',
+      'a later request of this attempt answered with job job-x',
+    ],
+  }]);
+  // A generation that was never retired here takes nothing.
+  assert.deepEqual(retiredBuilds(applySubmitFailure(named.run, ids.runId, 'seed', 5, forbidden).run, 'seed'), retiredBuilds(named.run, 'seed'));
+  // The current attempt's refusal records nothing; the tab shows it.
+  assert.deepEqual(applySubmitFailure(gen1, ids.runId, 'seed', 1, submitFailureText('seed', Object.assign(new Error('x'), { status: 400 }))), { run: null, current: true });
+  // A dismissed run takes nothing.
+  assert.deepEqual(applySubmitFailure(gen1, 'run-0', 'seed', 0, submitFailureText('seed', serverError('x'))), { run: null, current: true });
+});
+
+test('a stored run keeps its key generations and closed keys, and runs stored before them still load', () => {
+  const run = {
+    ...start(),
+    keyGeneration: { seed: 2 },
+    keyClosed: { 'code-runtime': { jobId: null } },
+    retiredBuilds: { seed: [{ generation: 0, jobId: 'job-x', notes: [] }, { generation: 1, jobId: null, notes: ['synthetic note'] }] },
+  };
+  const at = Date.parse(run.startedAt);
+  assert.deepEqual(parseStoredRun(JSON.stringify(run), ids, at + 1000), run);
+  assert.deepEqual(parseStoredRun(JSON.stringify(start()), ids, at + 1000), start());
+  for (const bad of [
+    { ...start(), keyGeneration: { seed: -1 } },
+    { ...start(), keyGeneration: { other: 1 } },
+    { ...start(), keyClosed: { seed: { jobId: 7 } } },
+    { ...start(), keyClosed: { seed: 'job-x' } },
+    { ...start(), retiredBuilds: { seed: { generation: 0 } } },
+    { ...start(), retiredBuilds: { seed: [{ generation: 0, jobId: '', notes: [] }] } },
+    { ...start(), retiredBuilds: { seed: [{ generation: 0, jobId: null, notes: [7] }] } },
+    // The shape before retired attempts were immutable.
+    { ...start(), retiredBuilds: { seed: [{ generation: 0, jobId: null, outcome: 'not-started', detail: null }] } },
+  ]) {
+    assert.equal(parseStoredRun(JSON.stringify(bad), ids, at + 1000), null, JSON.stringify(bad));
+  }
 });

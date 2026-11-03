@@ -1,7 +1,9 @@
-import { OperationFailedError, OperationTimeoutError } from './accepted-create';
+import { pollOperation } from './accepted-create';
 import { adminApi, api, ApiError } from './api';
+import { ADMIN_SNAPSHOT_PAGE_LIMIT, listSnapshots, pageRows, type SnapshotListing } from './admin-fallback';
 import { DEFAULT_LIST_LIMIT, parseSandboxRef, publicSandboxIdFromAny } from './sandbox-id';
 import { mergeOperationPages, type SandboxDebug } from './sandbox-debug';
+import { rollbackBody } from './rollback-targets';
 import { parseSandboxListResponse, type SandboxListResponse } from './sandbox-list';
 import {
   PublicOperationRecord,
@@ -70,6 +72,8 @@ export async function getConsoleSandbox(id: string): Promise<Sandbox> {
 export interface AdminOperationRecord extends PublicOperationRecord {
   org_id: string | null;
   actor_user_id: string | null;
+  // Absent on releases that do not report it.
+  actor_email?: string | null;
   api_product: string | null;
   target_type: string | null;
   target_id: string | null;
@@ -117,43 +121,25 @@ export async function postPublicOperation(
 export async function waitForPublicOperation(
   operationId: string,
   timeoutMs: number = OPERATION_POLL_TIMEOUT_MS,
+  signal?: AbortSignal,
 ): Promise<PublicOperationRecord> {
-  const deadline = Date.now() + timeoutMs;
-  let last: PublicOperationRecord | null = null;
-
-  while (Date.now() < deadline) {
-    last = await api.get<PublicOperationRecord>(`/operations/${operationId}`);
-    if (['succeeded', 'failed', 'canceled', 'expired'].includes(last.state)) {
-      if (last.state === 'succeeded') {
-        return last;
-      }
-      throw new OperationFailedError(last.state, last.progress_message || `operation ${last.state}`);
-    }
-    await new Promise((resolve) => setTimeout(resolve, OPERATION_POLL_INTERVAL_MS));
-  }
-
-  throw new OperationTimeoutError(last?.progress_message || 'operation still running');
+  return pollOperation((read) => api.get<PublicOperationRecord>(`/operations/${operationId}`, { signal: read }), {
+    timeoutMs,
+    intervalMs: OPERATION_POLL_INTERVAL_MS,
+    signal,
+  });
 }
 
 export async function waitForAdminOperation(
   operationId: string,
   timeoutMs: number = OPERATION_POLL_TIMEOUT_MS,
+  signal?: AbortSignal,
 ): Promise<PublicOperationRecord> {
-  const deadline = Date.now() + timeoutMs;
-  let last: PublicOperationRecord | null = null;
-
-  while (Date.now() < deadline) {
-    last = await adminApi.get<PublicOperationRecord>(`/v1/operations/${operationId}`);
-    if (['succeeded', 'failed', 'canceled', 'expired'].includes(last.state)) {
-      if (last.state === 'succeeded') {
-        return last;
-      }
-      throw new OperationFailedError(last.state, last.progress_message || `operation ${last.state}`);
-    }
-    await new Promise((resolve) => setTimeout(resolve, OPERATION_POLL_INTERVAL_MS));
-  }
-
-  throw new OperationTimeoutError(last?.progress_message || 'operation still running');
+  return pollOperation((read) => adminApi.get<PublicOperationRecord>(`/v1/operations/${operationId}`, { signal: read }), {
+    timeoutMs,
+    intervalMs: OPERATION_POLL_INTERVAL_MS,
+    signal,
+  });
 }
 
 // Cross-org admin lifecycle action. The console lists sandboxes across every
@@ -261,3 +247,60 @@ export function publicSnapshotToConsoleSnapshot(snapshot: PublicSnapshot): Snaps
   };
 }
 
+
+// A sandbox's catalog snapshots, for display; see `listSnapshots`. `ownOrg` (`isOwnOrg`) picks the public routes, which
+// serve only the signed-in operator's organization and write no audit event;
+// another organization's sandbox reads the newest `ADMIN_SNAPSHOT_PAGE_LIMIT`
+// through the admin list, and each of those reads is audited.
+export async function getConsoleSnapshots(
+  sandboxId: string,
+  { ownOrg }: { ownOrg: boolean },
+): Promise<SnapshotListing<SnapshotInfo>> {
+  return listSnapshots({
+    ownOrg,
+    readPublic: async () =>
+      (await getPublicPage<PublicSnapshot>(`/sandboxes/${sandboxId}/snapshots`)).map(publicSnapshotToConsoleSnapshot),
+    readAdmin: async () => {
+      const page = pageRows<PublicSnapshot>(await adminApi.get<unknown>(
+        `/v1/sandboxes/${publicSandboxIdFromAny(sandboxId)}/snapshots?limit=${ADMIN_SNAPSHOT_PAGE_LIMIT}`,
+      ));
+      return { rows: page.rows.map(publicSnapshotToConsoleSnapshot), nextCursor: page.nextCursor };
+    },
+  });
+}
+
+// How long the console follows a rollback before it stops waiting: the
+// rollback restores the snapshot and, with `auto_restart`, starts the sandbox.
+export const ROLLBACK_FOLLOW_TIMEOUT_MS = 120_000;
+
+// Roll back to `snapshotName`, a directory the sandbox's node keeps (see
+// `rollbackTargets`), through `via` (`rollbackRoute`). The 202 only
+// says the rollback was queued: `follow` reads its operation to the end, or
+// until its signal aborts.
+// During a rolling deploy, an older API pod can accept the admin
+// `:force-rollback` and drop its body, and the operation then fails; `follow`
+// reports that failure. The admin route refuses unless snapshot rollback is
+// enabled for the sandbox's organization (`rollbackGateRefusal`).
+export async function rollbackConsoleSandbox(
+  sandboxId: string,
+  snapshotName: string,
+  via: 'admin' | 'public',
+): Promise<{ operationId: string; follow: (signal?: AbortSignal) => Promise<PublicOperationRecord> }> {
+  const body = rollbackBody(snapshotName);
+  if (via === 'public') {
+    const accepted = await postPublicOperation(`/sandboxes/${sandboxId}:rollback`, body);
+    return {
+      operationId: accepted.operation_id,
+      follow: (signal) => waitForPublicOperation(accepted.operation_id, ROLLBACK_FOLLOW_TIMEOUT_MS, signal),
+    };
+  }
+  const accepted = await adminApi.post<SandboxOperationResponse>(
+    `/v1/sandboxes/${publicSandboxIdFromAny(sandboxId)}:force-rollback`,
+    body,
+    { 'Idempotency-Key': idempotencyKey() },
+  );
+  return {
+    operationId: accepted.operation_id,
+    follow: (signal) => waitForAdminOperation(accepted.operation_id, ROLLBACK_FOLLOW_TIMEOUT_MS, signal),
+  };
+}

@@ -7,7 +7,7 @@ import { InfoCircleOutlined, ReloadOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 
 import { adminApi } from '@/lib/api';
-import { mergeNewest, sandboxTargetForms } from '@/lib/operation-list';
+import { actorsToLookUp, mergeNewest, sandboxTargetForms } from '@/lib/operation-list';
 import { publicSandboxIdFromAny } from '@/lib/sandbox-id';
 import { tablePagination } from '@/lib/table-pagination';
 import type { Organization, PublicOperationRecord, User } from '@/lib/types';
@@ -18,6 +18,8 @@ const { Title, Text } = Typography;
 interface AdminOperation extends PublicOperationRecord {
   org_id: string | null;
   actor_user_id: string | null;
+  // Absent on releases that do not report it.
+  actor_email?: string | null;
   api_product: string | null;
   target_type: string | null;
   target_id: string | null;
@@ -170,7 +172,7 @@ export default function OperationsPage() {
     }
   };
   useEffect(() => {
-    const missing = [...new Set(operations.map((op) => op.actor_user_id).filter((v): v is string => !!v))]
+    const missing = actorsToLookUp(operations)
       .filter((userId) => !(userId in actorEmails) && !actorPending.current.has(userId));
     for (const userId of missing) {
       actorPending.current.add(userId);
@@ -195,7 +197,7 @@ export default function OperationsPage() {
     {
       title: <Tooltip title="The user the operation was recorded for. Creates through the admin API record the sandbox owner.">Recorded for</Tooltip>,
       dataIndex: 'actor_user_id', width: 220,
-      render: (v: string | null) => (v ? <Link href={`/dashboard/users/${v}`}>{actorEmails[v] ?? v}</Link> : '—'),
+      render: (v: string | null, op) => (v ? <Link href={`/dashboard/users/${v}`}>{op.actor_email ?? actorEmails[v] ?? v}</Link> : '—'),
     },
     { title: 'Attempts', dataIndex: 'attempts', width: 85 },
     { title: 'Result', render: (_, op) => resultCell(op) },

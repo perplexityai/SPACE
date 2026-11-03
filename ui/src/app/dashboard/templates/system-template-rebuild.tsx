@@ -3,11 +3,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import Link from 'next/link';
-import { Alert, App, Button, Checkbox, Modal, Space, Table, Typography } from 'antd';
+import { Alert, App, Button, Checkbox, Modal, Popconfirm, Space, Table, Typography } from 'antd';
 import { ApiError, adminApi } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 import { idempotencyKey, postPublicOperation } from '@/lib/public-api';
-import { LATEST_TAG, errorMessage, shortHash } from '@/lib/template-format';
+import { LATEST_TAG, currentTagHolder, errorMessage, shortHash } from '@/lib/template-format';
+import { TAG_PRECONDITION_UNCHECKED, moveReleaseTag, tagMoveFailureMessage } from '@/lib/admin-fallback';
 import type { TemplateBuildStart, TemplateBuildStatus, TemplateRelease } from '@/lib/types';
 import {
   BuildJob,
@@ -17,6 +18,7 @@ import {
   SystemTemplate,
   acceptJob,
   acceptTestSandbox,
+  applySubmitFailure,
   applyLost,
   applyStatus,
   buildFailureText,
@@ -40,6 +42,12 @@ import {
   sandboxOutcomeNotice,
   storageKey,
   submitFailureText,
+  buildKeyClosed,
+  buildKeyGeneration,
+  retiredBuilds,
+  type RetiredBuild,
+  systemBuildIdempotencyKey,
+  withNewBuildKey,
   systemBuildRequest,
   testSandboxFailureText,
   testSandboxName,
@@ -61,6 +69,21 @@ const exclusive = <T,>(name: string, work: () => T): Promise<T> => exclusiveWith
 }, name, work);
 
 const digest = (hash: string | null | undefined) => <code>{shortHash(hash, 'none')}</code>;
+
+// A build attempt "Start a new build" replaced, which may still publish a
+// release of its own. Later answers of its key are listed, never read as its
+// outcome.
+function RetiredAttempt({ template, attempt }: { template: SystemTemplate; attempt: RetiredBuild }) {
+  return (
+    <Text type="warning">
+      Earlier attempt {attempt.generation + 1}{attempt.jobId ? <>, job <Text code copyable>{attempt.jobId}</Text>,</> : null} has an
+      unknown outcome: it may still be running and publish a release of its own; see{' '}
+      <a href="#template-releases">Template Releases</a> below, and the {template} row&apos;s builds in the Templates table
+      above.{attempt.notes.length ? ` Since then, ${attempt.notes.join('; ')}.` : ''}
+    </Text>
+  );
+}
+
 // The digests a promotion of this run would move latest to.
 const targetsKey = (run: RebuildRun | null) => (run ? `${run.runId}:${run.seed?.content_hash ?? ''}:${run.codeRuntime?.content_hash ?? ''}` : '');
 
@@ -328,20 +351,44 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
     // Another tab may have started this build since this one rendered.
     if (!current || !canBuild(current, template)) return;
     const seedHash = template === 'code-runtime' && buildSucceeded(current.seed) ? current.seed.content_hash : undefined;
+    // The key generation this request sends. Another tab can start a new
+    // build while it is in flight; its answer then belongs to the retired
+    // attempt, never to the newer generation.
+    const generation = buildKeyGeneration(current, template);
     try {
-      const accepted = await adminApi.post<TemplateBuildStart>(`/v1/system-templates/${template}/builds`, systemBuildRequest(template, seedHash));
+      const accepted = await adminApi.post<TemplateBuildStart>(
+        `/v1/system-templates/${template}/builds`,
+        systemBuildRequest(template, seedHash),
+        { 'Idempotency-Key': systemBuildIdempotencyKey(current.runId, template, generation) },
+      );
       const job: BuildJob = { job_id: accepted.job_id, state: 'pending', content_hash: null, error: null, lost: false };
       const recorded = await exclusive(lockName, () => {
-        const answer = acceptJob(live(current.runId), current.runId, template, job);
-        if (answer.kind === 'recorded' && !store(answer.run)) unsaved();
+        const answer = acceptJob(live(current.runId), current.runId, template, job, generation);
+        if ((answer.kind === 'recorded' || answer.kind === 'obsolete') && !store(answer.run)) unsaved();
         return answer;
       });
       outcome(jobOutcomeNotice(template, accepted.job_id, recorded));
     } catch (err) {
       const failure = submitFailureText(template, err);
-      if (failure.known) message.error(failure.text);
-      else await update(current.runId, (latest) => (jobOf(latest, template) ? null : { ...latest, submitUnknown: { ...latest.submitUnknown, [template]: failure.text } }));
+      const applied = await exclusive(lockName, () => {
+        const answer = applySubmitFailure(live(current.runId), current.runId, template, generation, failure);
+        if (answer.run && !store(answer.run)) unsaved();
+        return answer;
+      });
+      if (failure.known && applied.current) message.error(failure.text);
     }
+  });
+
+  // A key the API answers only with "outcome unknown": the next build sends a
+  // new one. The first build may still be running and publish a release.
+  const startNewBuild = (template: SystemTemplate) => withBusy(`new-build:${template}`, async () => {
+    const runId = runRef.current?.runId;
+    if (!runId) return;
+    await update(runId, (latest) => (jobOf(latest, template) || !buildKeyClosed(latest, template) ? null : withNewBuildKey(latest, template)));
+    // Built only once the new key is saved, so the request cannot resend the
+    // closed one.
+    const saved = live(runId);
+    if (saved && !buildKeyClosed(saved, template)) await build(template);
   });
 
   const createTestSandbox = (template: SystemTemplate) => withBusy(`test:${template}`, async () => {
@@ -428,6 +475,7 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
     }
     const confirmed = saved.run;
     let requestError: string | null = null;
+    let preconditionUnchecked = false;
     for (const row of plan) {
       if (!live(confirmed.runId)) {
         requestError = 'the rebuild was dismissed in another tab';
@@ -439,13 +487,21 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
         break;
       }
       try {
-        await adminApi.put(`/v1/template-releases/${release.id}/tag`, { tag: LATEST_TAG });
+        // Moved only while `latest` still points where the plan read it.
+        const { checked } = await moveReleaseTag(
+          (path, body) => adminApi.put(path, body),
+          release.id,
+          LATEST_TAG,
+          currentTagHolder(fresh, row.template, LATEST_TAG),
+        );
+        if (!checked) preconditionUnchecked = true;
       } catch (err) {
         // The tag route can commit and still answer an error: the read below decides.
-        requestError = `the ${row.template} tag request answered: ${errorMessage(err)}`;
+        requestError = `the ${row.template} tag request answered: ${tagMoveFailureMessage(err)}`;
         break;
       }
     }
+    if (preconditionUnchecked) message.warning(TAG_PRECONDITION_UNCHECKED);
     setPromote(null);
     // What moved is read back, not taken from the answers; the panel shows
     // it from the releases this refresh reads.
@@ -508,6 +564,7 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
   const buildRow = (template: SystemTemplate) => {
     const job = jobOf(run, template);
     const unknown = run.submitUnknown[template];
+    const closed = buildKeyClosed(run, template);
     const test = run.testSandboxes[template];
     let state: ReactNode;
     if (!job) {
@@ -520,7 +577,20 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
       state = <>{job.state === 'pending' ? 'Queued' : 'Building'} <Text type="secondary">(job {job.job_id})</Text></>;
     }
     const actions: ReactNode[] = [];
-    if (canBuild(run, template)) {
+    if (canBuild(run, template) && closed) {
+      actions.push(
+        <Popconfirm
+          key="new-build"
+          title={`Start a new ${template} build?`}
+          description="It sends a new request. If the earlier build is still running, both publish a release."
+          onConfirm={() => void startNewBuild(template)}
+        >
+          <Button type="primary" size="small" loading={busy.has(`new-build:${template}`) || busy.has(`build:${template}`)}>
+            Start a new build
+          </Button>
+        </Popconfirm>,
+      );
+    } else if (canBuild(run, template)) {
       actions.push(
         <Button key="build" type="primary" size="small" loading={busy.has(`build:${template}`)} onClick={() => void build(template)}>
           {template === 'seed' ? 'Build seed' : `Build code-runtime on seed@${shortHash(run.seed?.content_hash, '')}`}
@@ -542,6 +612,14 @@ export default function SystemTemplateRebuild({ refreshReleases, releases, relea
         <Space orientation="vertical" size={2}>
           {state}
           {unknown ? <Text type="warning">{unknown}</Text> : null}
+          {closed ? (
+            <Text type="secondary">
+              {closed.jobId ? <>Job <Text code copyable>{closed.jobId}</Text>: </> : null}
+              see <a href="#template-releases">Template Releases</a> below, and the {template} row&apos;s builds in the
+              Templates table above.
+            </Text>
+          ) : null}
+          {retiredBuilds(run, template).map((attempt) => <RetiredAttempt key={attempt.generation} template={template} attempt={attempt} />)}
           {trouble[template] ? <Text type="warning">{trouble[template]!.text.replace(/\.$/, '')}. Retrying in {Math.round(pollDelayMs(trouble[template]!.failures) / 1000)} s.</Text> : null}
           {test ? (
             <Text>

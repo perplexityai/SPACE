@@ -49,6 +49,11 @@ export interface ApiKeyMetadata {
   allowed_surfaces: ApiSurface[];
   created_at: string;
   updated_at: string;
+  // Absent on releases before key usage and revocation records. `last_used_at`
+  // counts API authentications only; `revoked_at` is set only on revoked keys,
+  // which the list includes with `include_revoked=true`.
+  last_used_at?: string | null;
+  revoked_at?: string | null;
 }
 
 export interface CreatedApiKey {
@@ -442,6 +447,10 @@ export interface NodeView {
   reconcile_trigger: NodeReconcileTrigger | null;
   /** Set when the trigger could not be read; `reconcile_trigger` is then unknown. */
   read_state_error: string | null;
+  /** As `AdminNodeResponse` reports them; absent means not reported. */
+  cordoned?: boolean;
+  node_group_id?: string;
+  runtime_installations?: NodeRuntimeInstallation[];
 }
 
 /// Response shape for GET /admin/api/v1/nodes and action endpoints.
@@ -486,6 +495,27 @@ export interface AdminNodeResponse {
   /** Why the trigger and runtime installations were not read. While it is
    * set, an absent `reconcile_trigger` means unknown, not nothing queued. */
   read_state_error?: string;
+  /** The Kubernetes node's `spec.unschedulable`, on `GET /nodes` and
+   * `GET /nodes/{id}` only. Absent on Direct, before the API's node cache has
+   * listed, for a node the cache does not hold, and on releases that do not
+   * report it. */
+  cordoned?: boolean;
+  /** The group mirrored from the node's `space-node-group` label. Absent for
+   * an unlabeled node (a worker then belongs to the default group, which is
+   * not necessarily unlabeled), and on releases that do not report it. */
+  node_group_id?: string;
+  /** What the node reported installed, on `GET /nodes` and `GET /nodes/{id}`
+   * only; `[]` when it reported none. Absent when `read_state_error` is set,
+   * and on releases that do not report it. */
+  runtime_installations?: NodeRuntimeInstallation[];
+}
+
+export interface NodeRuntimeInstallation {
+  runtime: string;
+  runtime_version: string;
+  /** `os/arch` of each guest, e.g. `linux/x86_64`. */
+  guests: string[];
+  observed_at: string;
 }
 
 /// A node's queued state-reconciliation trigger, as GET /admin/api/v1/nodes
@@ -683,4 +713,20 @@ export interface MeResponse {
   user: User;
   org: Organization;
   substrate: Substrate;
+}
+
+// One entry of `GET /admin/api/v1/templates/{name}/builds` (a bare array),
+// newest first. `state` is null when the builder cannot report the job (it
+// could not be resolved or reached, timed out, or reported the job for another
+// template); `status_error` says why. `content_hash` is set on success and
+// `error` on failure.
+export interface TemplateBuildListEntry {
+  job_id: string;
+  template_name: string;
+  created_at: string;
+  builder_node_id: string | null;
+  state: TemplateBuildState | null;
+  content_hash: string | null;
+  error: string | null;
+  status_error: string | null;
 }

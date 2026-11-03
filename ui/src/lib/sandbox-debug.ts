@@ -90,7 +90,19 @@ export interface DebugPod {
   terminated_at: string | null;
 }
 
+// Where a snapshot's data is held, from the placement read. `node_id` is set
+// while a node holds a local copy (`node_local`, `both`).
+export type DebugSnapshotLocation = 'node_local' | 'object_store' | 'both' | 'none';
+
+export interface DebugSnapshotStorage {
+  location: DebugSnapshotLocation;
+  node_id: string | null;
+}
+
 export interface DebugSnapshot {
+  // Absent when the placement read failed (see `storage_error`), when no
+  // placement matches the snapshot, or on releases that do not report it.
+  storage?: DebugSnapshotStorage;
   id: string;
   type: string;
   state: string;
@@ -132,6 +144,54 @@ export interface DebugTimelineEvent {
   detail: Record<string, unknown>;
 }
 
+export interface DebugActiveQuarantine {
+  quarantine_id: string;
+  entered_at: string;
+  updated_at: string;
+  entered_from_lifecycle: string | null;
+  source: string;
+  reason_code: string;
+  reason_message: string | null;
+  next_action: string;
+  next_action_after: string | null;
+  attempt_count: number;
+  last_error: string | null;
+  last_observed_node_id: string | null;
+}
+
+export interface DebugQuarantineEvent {
+  id: string;
+  quarantine_id: string;
+  occurred_at: string;
+  source: string;
+  action: string;
+  reason_code: string | null;
+  message: string | null;
+  next_action: string | null;
+  error: string | null;
+}
+
+// `history` is newest first, across episodes, capped by the API.
+export interface DebugQuarantine {
+  quarantined: boolean;
+  active: DebugActiveQuarantine | null;
+  history: DebugQuarantineEvent[];
+}
+
+// Whether the sandbox is quarantined, as far as its debug read says:
+// `unknown` whenever the quarantine section, or the whole read, failed, so a
+// failed read never reads as "not quarantined". Releases that do not report
+// quarantine send no section, and the card is not shown.
+export type QuarantineStatus = 'quarantined' | 'not-quarantined' | 'unknown';
+
+export function quarantineStatus(section: DebugSection<DebugQuarantine>, readFailed = false): QuarantineStatus {
+  if (readFailed) return 'unknown';
+  if (sectionError(section) !== null) return 'unknown';
+  const quarantine = sectionData(section);
+  if (!quarantine) return 'unknown';
+  return quarantine.quarantined || quarantine.active ? 'quarantined' : 'not-quarantined';
+}
+
 export interface SandboxDebug {
   sandbox_id: string;
   fetched_at: string;
@@ -139,7 +199,9 @@ export interface SandboxDebug {
   placement: DebugSection<DebugPlacement>;
   resources: DebugSection<DebugResources>;
   pods: DebugSection<DebugPod[]>;
-  snapshots: DebugSection<{ snapshots: DebugSnapshot[]; inventory: DebugSnapshotInventory[] }>;
+  snapshots: DebugSection<{ snapshots: DebugSnapshot[]; inventory: DebugSnapshotInventory[]; storage_error?: string }>;
+  // Absent on releases that do not report quarantine.
+  quarantine?: DebugSection<DebugQuarantine>;
   ports: DebugSection<DebugPort[]>;
   timeline: DebugSection<DebugTimelineEvent[]>;
 }
@@ -219,4 +281,41 @@ export function mergeOperationPages<T extends { id: string; created_at: string }
     operations: merged.slice(0, limit),
     more: merged.length > limit || pages.some((page) => page.length > limit),
   };
+}
+
+const SNAPSHOT_LOCATION_LABELS: Record<DebugSnapshotLocation, string> = {
+  node_local: 'node-local',
+  object_store: 'object store',
+  both: 'node-local and object store',
+  none: 'none',
+};
+
+export function snapshotStorageLabel(storage: DebugSnapshotStorage | undefined): string | null {
+  if (!storage) return null;
+  const label = SNAPSHOT_LOCATION_LABELS[storage.location] ?? storage.location;
+  return storage.node_id && (storage.location === 'node_local' || storage.location === 'both')
+    ? `${label} (node ${storage.node_id})`
+    : label;
+}
+
+// The debug route names a snapshot by its bare UUID; the snapshot APIs by
+// `snap_<uuid>`. Both reduce to the same key.
+export function snapshotKey(id: string): string {
+  return id.replace(/^[a-z]+_/, '').replace(/-/g, '').toLowerCase();
+}
+
+export function snapshotStorageById(snapshots: DebugSnapshot[]): Map<string, DebugSnapshotStorage> {
+  const byId = new Map<string, DebugSnapshotStorage>();
+  for (const snapshot of snapshots) {
+    if (snapshot.storage) byId.set(snapshotKey(snapshot.id), snapshot.storage);
+  }
+  return byId;
+}
+
+// The variable names of a sandbox's environment, the only part the console
+// shows: values can hold credentials. Older releases send `{ NAME: "value" }`,
+// newer ones `{ NAME: null }`; anything but an object has no names.
+export function envNames(env: unknown): string[] {
+  if (!env || typeof env !== 'object' || Array.isArray(env)) return [];
+  return Object.keys(env).sort();
 }

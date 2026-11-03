@@ -46,27 +46,22 @@ import {
   type TerminalConnection,
   type TerminalSessionEvent,
 } from '@/lib/data-plane-terminal';
-import {
-  ROLLBACK_NOT_ENABLED,
-  isHiddenOperationError,
-} from '@/lib/hidden-operations';
+import { isHiddenOperationError } from '@/lib/hidden-operations';
 import {
   forceConsoleSandboxAction,
   forceDeleteConsoleSandbox,
   getConsoleSandbox,
+  getConsoleSnapshots,
   getPublicPage,
   getSandboxDebug,
   getSandboxOperations,
   type AdminOperationRecord,
-  publicSnapshotToConsoleSnapshot,
   publicTemplateToConsoleTemplate,
-  postPublicOperation,
   updateConsoleSandbox,
   waitForAdminOperation,
 } from '@/lib/public-api';
 import type {
   NetworkPolicyV1,
-  PublicSnapshot,
   PublicTemplate,
   Sandbox,
   SnapshotInfo,
@@ -74,8 +69,12 @@ import type {
 } from '@/lib/types';
 import { tablePagination } from '@/lib/table-pagination';
 import { useAuth } from '@/lib/auth';
-import { formatAge, formatBytes, sectionData, sectionError, type DebugSnapshot } from '@/lib/sandbox-debug';
-import { OperationsCard, OrgLink, PlacementCard, ResourcesCard, TimelineCard, UserLink, type DebugView } from './sandbox-insight';
+import { isOwnOrg } from '@/lib/own-org';
+import { listsSnapshotsOn } from '@/lib/admin-fallback';
+import { RollbackButton, RollbackRefusalNote, useSnapshotRollback, type SnapshotRollback } from '@/components/snapshot-rollback';
+import { rollbackRoute, rollbackTargets, snapshotTimeMs, type RollbackTarget } from '@/lib/rollback-targets';
+import { formatAge, formatBytes, sectionData, sectionError, snapshotKey, snapshotStorageById, snapshotStorageLabel, type DebugSnapshot } from '@/lib/sandbox-debug';
+import { OperationsCard, OrgLink, PlacementCard, QuarantineCard, ResourcesCard, TimelineCard, UserLink, type DebugView } from './sandbox-insight';
 import NetworkPolicyDesigner, {
   compactNetworkPolicyLabel,
   NetworkPolicyDetails,
@@ -321,7 +320,7 @@ function templateDisplay(sandbox: Sandbox) {
   if (!sandbox.template) return '—';
   const contentHash = sandboxTemplateHash(sandbox);
   return (
-    <Space direction="vertical" size={0} style={{ maxWidth: '100%' }}>
+    <Space orientation="vertical" size={0} style={{ maxWidth: '100%' }}>
       <span>{sandbox.template}</span>
       {contentHash ? (
         <Text
@@ -383,9 +382,10 @@ function snapshotCodec(type: string): { label: string; color: string } {
   return { label: type || '—', color: 'default' };
 }
 
-// The public snapshot routes are org-scoped hidden operations; when they are
-// unavailable (another org's sandbox, or not enabled), list the snapshots the
-// admin debug route reports, without rollback.
+// When no snapshot API serves the sandbox (snapshot operations not enabled for
+// the operator's organization, or another organization's sandbox on a release
+// without the admin snapshot list), list the catalog snapshots the admin debug
+// route reports.
 function AdminSnapshotsTable({
   snapshots,
   error,
@@ -412,6 +412,7 @@ function AdminSnapshotsTable({
     { title: 'Age', dataIndex: 'timestamp', width: 90, render: (v: string) => <Tooltip title={v}>{formatAge(v, nowMs)}</Tooltip> },
     { title: 'Size', dataIndex: 'size_bytes', width: 100, render: (v: number | null) => formatBytes(v) },
     { title: 'Tier', dataIndex: 'retention_tier', width: 90, render: (v: string | null) => v || '—' },
+    { title: 'Storage', dataIndex: 'storage', width: 200, render: (v: DebugSnapshot['storage']) => snapshotStorageLabel(v) ?? '' },
     { title: 'Failure', dataIndex: 'failure_reason', render: (v: string | null) => (v ? <Text type="danger">{v}</Text> : '—') },
   ];
   return (
@@ -435,34 +436,121 @@ function AdminSnapshotsTable({
   );
 }
 
+// The snapshots the sandbox's node keeps, from the debug view the page
+// already reads on its cadence (no read of its own, and no audit event), with
+// Rollback: the node rolls back only to one of these names
+// (`rollbackTargets`). Each catalog row above is a `snap_` ID the node does
+// not know.
+function NodeSnapshotsTable({
+  debugView,
+  sandboxStatus,
+  route,
+  rollback,
+  nowMs,
+}: {
+  debugView: DebugView;
+  sandboxStatus: string | null;
+  route: ReturnType<typeof rollbackRoute>;
+  rollback: SnapshotRollback;
+  nowMs: number;
+}) {
+  const debug = debugView.debug;
+  const section = sectionData(debug?.snapshots);
+  const error = debugView.error ?? (debug ? sectionError(debug.snapshots) : null);
+  const targets = rollbackTargets(section?.inventory ?? [], sandboxStatus);
+  const columns: ColumnsType<RollbackTarget> = [
+    { title: 'Name', key: 'name', ellipsis: true, render: (_, target) => <Text code copyable={{ text: target.snapshotName }}>{target.snapshotName}</Text> },
+    {
+      title: 'Codec', key: 'type', width: 110,
+      render: (_, target) => {
+        const codec = snapshotCodec(target.row.type);
+        return <Tag color={codec.color}>{codec.label}</Tag>;
+      },
+    },
+    { title: 'State', key: 'state', width: 100, render: (_, target) => <Tag color={target.row.state === 'ready' ? 'green' : 'default'}>{target.row.state}</Tag> },
+    {
+      title: 'Age', key: 'age', width: 90,
+      render: (_, target) => {
+        const at = snapshotTimeMs(target.row.timestamp);
+        return <Tooltip title={target.row.timestamp}>{at === null ? '—' : formatAge(new Date(at).toISOString(), nowMs)}</Tooltip>;
+      },
+    },
+    { title: 'Size', key: 'size', width: 100, render: (_, target) => formatBytes(target.row.size_bytes) },
+    {
+      title: 'Action', key: 'action', width: 130,
+      render: (_, target) => (
+        <RollbackButton snapshotName={target.snapshotName} unavailable={route.reason ?? target.unavailable} state={rollback} />
+      ),
+    },
+  ];
+  return (
+    <div style={{ marginTop: 16 }}>
+      <Space size={8} wrap style={{ marginBottom: 8 }}>
+        <Text strong>On the node</Text>
+        <Text type="secondary" style={{ fontSize: 12 }}>
+          Rollback restores one of the snapshots the sandbox&apos;s node keeps.
+        </Text>
+        <RollbackRefusalNote state={rollback} />
+      </Space>
+      {error ? (
+        <Alert type="warning" showIcon style={{ marginBottom: 8 }} title={`Could not load the node's snapshots: ${error}`} />
+      ) : null}
+      <Table
+        columns={columns}
+        dataSource={targets}
+        rowKey="snapshotName"
+        size="small"
+        pagination={tablePagination('node-snapshots', 10)}
+        loading={!debug && !debugView.error}
+        locale={{ emptyText: error ? "Could not load the node's snapshots" : 'The node keeps no snapshots for this sandbox' }}
+      />
+    </div>
+  );
+}
+
 function SnapshotsCard({
   sandboxId,
-  foreignOrg,
+  orgId,
+  sandboxStatus,
+  ownOrg,
   debugView,
+  onRollbackSettled,
   reloadKey,
   nowMs,
 }: {
   sandboxId: string;
-  // The public snapshot routes are scoped to the signed-in user's org.
-  foreignOrg: boolean;
+  orgId: string | null;
+  sandboxStatus: string | null;
+  // `isOwnOrg`: the operator's own organization lists through the public
+  // routes; another lists through the admin list (see `listSnapshots`).
+  ownOrg: boolean;
   debugView: DebugView;
+  // Runs once a rollback's outcome is known: the page reloads, as after any
+  // action.
+  onRollbackSettled: () => void;
   // Changes on every insight load (the page's Refresh, each action, and every
-  // 20 s), and the card lists its snapshots again each time. A failed listing
-  // after a good one keeps the last good one, with a warning; a card whose
-  // first listing failed recovers at the next listing that succeeds.
+  // 20 s). The own organization's card lists its snapshots again each time;
+  // another organization's does not, because each admin list read writes an
+  // admin audit event: it lists when it opens and on its Refresh button. A
+  // failed listing after a good one keeps the last good one, with a warning;
+  // a card whose first listing failed recovers at the next listing that
+  // succeeds.
   reloadKey: number;
   nowMs: number;
 }) {
   const debug = debugView.debug;
-  const { message } = App.useApp();
   const { token } = theme.useToken();
   const [snapshots, setSnapshots] = useState<SnapshotInfo[]>([]);
+  // The admin page held `ADMIN_SNAPSHOT_PAGE_LIMIT` rows and older ones exist.
+  const [more, setMore] = useState(false);
   const [loading, setLoading] = useState(true);
-  const [snapshotsOff, setSnapshotsOff] = useState(foreignOrg);
+  const [snapshotsOff, setSnapshotsOff] = useState(false);
+  // What the admin list last answered for this sandbox, which decides
+  // whether another organization's rollback is offered (`rollbackRoute`).
+  const [adminList, setAdminList] = useState<'listed' | 'none' | 'unknown'>('unknown');
   const [listingError, setListingError] = useState<string | null>(null);
   // When the shown listing loaded, while a later listing has failed.
   const [staleSince, setStaleSince] = useState<number | null>(null);
-  const [rollbackOff, setRollbackOff] = useState(false);
 
   // Retries and Refresh can overlap; only the newest listing may write.
   const listingRequest = useRef(0);
@@ -470,26 +558,33 @@ function SnapshotsCard({
   const listedAt = useRef<number | null>(null);
   const refresh = (background = false) => {
     const request = ++listingRequest.current;
-    if (foreignOrg) {
-      setSnapshotsOff(true);
-      setLoading(false);
-      return;
-    }
     if (!background) setLoading(true);
-    getPublicPage<PublicSnapshot>(`/sandboxes/${sandboxId}/snapshots`)
-      .then((items) => {
+    getConsoleSnapshots(sandboxId, { ownOrg })
+      .then((listing) => {
         if (request !== listingRequest.current) return;
+        // Another organization's sandbox on a release without the admin
+        // list: the admin view below lists its snapshots.
+        if (listing.via === 'none') {
+          listedAt.current = null;
+          setAdminList('none');
+          setSnapshotsOff(true);
+          setListingError(null);
+          setStaleSince(null);
+          return;
+        }
         listedAt.current = Date.now();
         setSnapshotsOff(false);
         setListingError(null);
         setStaleSince(null);
-        setSnapshots(items.map(publicSnapshotToConsoleSnapshot));
+        if (listing.via === 'admin') setAdminList('listed');
+        setSnapshots(listing.rows);
+        setMore(listing.via === 'admin' && listing.more);
       })
       .catch((err: any) => {
         if (request !== listingRequest.current) return;
         // A hidden operation means snapshots are not enabled: the admin view
-        // below lists them, without rollback.
-        if (isHiddenOperationError(err)) {
+        // below lists them.
+        if (ownOrg && isHiddenOperationError(err)) {
           listedAt.current = null;
           setSnapshotsOff(true);
           setListingError(null);
@@ -497,8 +592,8 @@ function SnapshotsCard({
           return;
         }
         setListingError(err.message || 'failed to load snapshots');
-        // Any other failure after a good listing keeps that listing and its
-        // rollback; without one, the admin view lists the snapshots.
+        // Any other failure after a good listing keeps that listing; without
+        // one, the admin view lists the snapshots.
         if (listedAt.current === null) {
           setSnapshotsOff(true);
         } else {
@@ -513,33 +608,35 @@ function SnapshotsCard({
   useEffect(() => {
     listedAt.current = null;
     setStaleSince(null);
+    setAdminList('unknown');
     refresh();
-  }, [sandboxId, foreignOrg]);
+  }, [sandboxId, ownOrg]);
   const firstReload = useRef(true);
   useEffect(() => {
     if (firstReload.current) {
       firstReload.current = false;
       return;
     }
-    refresh(true);
+    if (listsSnapshotsOn('page-reload', ownOrg)) refresh(true);
   }, [reloadKey]);
 
-  const handleRollback = async (snapshotName: string) => {
-    try {
-      await postPublicOperation(`/sandboxes/${sandboxId}:rollback`, {
-        snapshot_name: snapshotName,
-        auto_restart: true,
-      });
-      message.success('Snapshot rollback queued');
-    } catch (err: any) {
-      if (isHiddenOperationError(err)) {
-        setRollbackOff(true);
-        message.info(ROLLBACK_NOT_ENABLED);
-        return;
-      }
-      message.error(err.message || 'failed to queue rollback');
-    }
+  // Rollback goes to the node's snapshots (`NodeSnapshotsTable`); the catalog
+  // listing is display-only.
+  const route = rollbackRoute(ownOrg, adminList);
+  const rollback = useSnapshotRollback({ sandboxId, orgId, via: route.via, onSettled: onRollbackSettled });
+  const nodeSnapshots = (
+    <NodeSnapshotsTable debugView={debugView} sandboxStatus={sandboxStatus} route={route} rollback={rollback} nowMs={nowMs} />
+  );
+  // Refresh and Retry. In a view that showed the control plane's records
+  // instead (no listing yet, or a release without the admin list), the
+  // snapshot API is asked again from the start: an API rolled out since
+  // can answer it.
+  const relist = () => {
+    setSnapshotsOff(false);
+    refresh();
   };
+
+  const storageById = snapshotStorageById(sectionData(debug?.snapshots)?.snapshots ?? []);
 
   const totalBytes = snapshots.reduce((acc, s) => acc + (s.size_bytes || 0), 0);
 
@@ -554,23 +651,11 @@ function SnapshotsCard({
     },
     { title: 'Timestamp', dataIndex: 'timestamp', width: 200, render: (v: string | null) => v ?? '—' },
     { title: 'Size', dataIndex: 'size_bytes', width: 100, render: (v: number) => formatBytes(v) },
-  ];
-  const rollbackColumns: ColumnsType<SnapshotInfo> = rollbackOff ? [] : [
     {
-      title: 'Action', width: 130,
-      render: (_, record) => (
-        <Tooltip title="Roll back sandbox to this snapshot">
-          <Popconfirm
-            title={`Roll back to ${record.id}?`}
-            onConfirm={() => handleRollback(record.id)}
-          >
-            <Button type="link" size="small" icon={<RollbackOutlined />}>Rollback</Button>
-          </Popconfirm>
-        </Tooltip>
-      ),
+      title: 'Storage', width: 220,
+      render: (_, record) => snapshotStorageLabel(storageById.get(snapshotKey(record.id))) ?? '',
     },
   ];
-
   if (snapshotsOff) {
     const adminSnapshots = sectionData(debug?.snapshots)?.snapshots ?? [];
     const adminError = debugView.error ?? (debug ? sectionError(debug.snapshots) : null);
@@ -580,11 +665,16 @@ function SnapshotsCard({
         title={<Space><CameraOutlined /> Snapshots</Space>}
         extra={
           listingError ? null : (
-            <Text type="secondary" style={{ fontSize: 12 }}>
-              {foreignOrg
-                ? 'Rollback unavailable: this sandbox belongs to another organization'
-                : 'Rollback unavailable: snapshot operations are not enabled for this organization'}
-            </Text>
+            <Space size={8} wrap>
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                {!ownOrg
+                  ? "This API release lists only your organization's snapshots; showing the control plane's records"
+                  : "Snapshot operations are not enabled for this organization; showing the control plane's records"}
+              </Text>
+              {!ownOrg ? (
+                <Button size="small" icon={<ReloadOutlined />} loading={loading} onClick={relist}>Refresh</Button>
+              ) : null}
+            </Space>
           )
         }
       >
@@ -593,14 +683,15 @@ function SnapshotsCard({
             type="warning"
             showIcon
             style={{ marginBottom: 8 }}
-            title={`Could not load snapshots from the snapshot API: ${listingError}. Showing the snapshots the control plane records; rollback is unavailable until it loads.`}
-            action={<Button size="small" onClick={() => refresh()}>Retry</Button>}
+            title={`Could not load snapshots from the snapshot API: ${listingError}. Showing the snapshots the control plane records.`}
+            action={<Button size="small" loading={loading} onClick={relist}>Retry</Button>}
           />
         ) : null}
         {adminError ? (
           <Alert type="warning" showIcon style={{ marginBottom: 8 }} title={`Could not load the control plane's snapshot records: ${adminError}`} />
         ) : null}
         <AdminSnapshotsTable snapshots={adminSnapshots} error={adminError} pending={!debug && !debugView.error} nowMs={nowMs} />
+        {nodeSnapshots}
       </Card>
     );
   }
@@ -609,19 +700,28 @@ function SnapshotsCard({
     <Card
       size="small"
       title={<Space><CameraOutlined /> Snapshots</Space>}
-      extra={<Button size="small" icon={<ReloadOutlined />} onClick={() => refresh()}>Refresh</Button>}
+      extra={(
+        <Space size={8} wrap>
+          {!ownOrg && listedAt.current !== null ? (
+            <Tooltip title="Another organization's snapshots are read through the admin API, and each read is recorded in the admin audit log, so this card does not re-read them on its own.">
+              <Text type="secondary" style={{ fontSize: 12 }}>Listed {new Date(listedAt.current).toLocaleTimeString()}</Text>
+            </Tooltip>
+          ) : null}
+          <Button size="small" icon={<ReloadOutlined />} onClick={relist}>Refresh</Button>
+        </Space>
+      )}
     >
       {listingError && staleSince !== null ? (
         <Alert
           type="warning"
           showIcon
           style={{ marginBottom: 8 }}
-          title={`Could not refresh snapshots from the snapshot API: ${listingError}. Showing the listing loaded at ${new Date(staleSince).toLocaleTimeString()}; the card retries every 20 s.`}
-          action={<Button size="small" onClick={() => refresh()}>Retry</Button>}
+          title={`Could not refresh snapshots from the snapshot API: ${listingError}. Showing the listing loaded at ${new Date(staleSince).toLocaleTimeString()}; ${ownOrg ? 'the card retries every 20 s' : 'Retry to read them again'}.`}
+          action={<Button size="small" onClick={relist}>Retry</Button>}
         />
       ) : null}
       <Table
-        columns={[...columns, ...rollbackColumns]}
+        columns={columns}
         dataSource={snapshots}
         rowKey="id"
         loading={loading}
@@ -631,12 +731,17 @@ function SnapshotsCard({
         footer={() =>
           snapshots.length === 0 ? null : (
             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, color: token.colorTextSecondary }}>
-              <span>{snapshots.length} snapshot{snapshots.length === 1 ? '' : 's'}</span>
-              <span>total {formatBytes(totalBytes)}</span>
+              <span>
+                {more
+                  ? `The newest ${snapshots.length} snapshots; older ones are not listed`
+                  : `${snapshots.length} snapshot${snapshots.length === 1 ? '' : 's'}`}
+              </span>
+              <span>total {formatBytes(totalBytes)}{more ? ' of those listed' : ''}</span>
             </div>
           )
         }
       />
+      {nodeSnapshots}
     </Card>
   );
 }
@@ -677,7 +782,7 @@ function ExecCard({ sandbox }: { sandbox: Sandbox }) {
         </Text>
       )}
     >
-      <Space direction="vertical" style={{ width: '100%' }} size={8}>
+      <Space orientation="vertical" style={{ width: '100%' }} size={8}>
         <Input.TextArea
           value={command}
           onChange={(e) => setCommand(e.target.value)}
@@ -756,7 +861,7 @@ type TerminalLine = {
   text: string;
 };
 
-function TerminalCard({ sandbox }: { sandbox: Sandbox }) {
+function TerminalCard({ sandbox, ownOrg }: { sandbox: Sandbox; ownOrg: boolean }) {
   const { token } = theme.useToken();
   const [status, setStatus] = useState<TerminalStatus>('disconnected');
   const [input, setInput] = useState('');
@@ -834,6 +939,7 @@ function TerminalCard({ sandbox }: { sandbox: Sandbox }) {
       const connection = await openSandboxTerminal(sandbox.id, handleTerminalEvent, {
         cols: 100,
         rows: 30,
+        ownOrg,
       });
       connectionRef.current = connection;
       setSessionId(connection.sessionId);
@@ -903,7 +1009,20 @@ function TerminalCard({ sandbox }: { sandbox: Sandbox }) {
       )}
     >
       <div style={{ position: 'relative' }}>
-        <Space direction="vertical" style={{ width: '100%' }} size={8}>
+        <Space orientation="vertical" style={{ width: '100%' }} size={8}>
+          {!ownOrg ? (
+            <Alert
+              type="info"
+              showIcon
+              title={(
+                <span>
+                  This sandbox belongs to another organization (<OrgLink orgId={sandbox.org_id ?? null} />). The terminal opens
+                  through the admin terminal route, in that organization; the session is attributed to you and recorded in the
+                  admin audit log.
+                </span>
+              )}
+            />
+          ) : null}
           <pre
             ref={outputRef}
             style={{
@@ -936,27 +1055,29 @@ function TerminalCard({ sandbox }: { sandbox: Sandbox }) {
               </span>
             ))}
           </pre>
-          <Input
-            value={input}
-            onChange={(event) => setInput(event.target.value)}
-            onPressEnter={(event) => {
-              event.preventDefault();
-              sendInput();
-            }}
-            disabled={!attached || !terminalEnabled}
-            placeholder="Type shell input and press Enter"
-            addonBefore="$"
-            suffix={(
-              <Button
-                type="text"
-                size="small"
-                icon={<SendOutlined />}
-                disabled={!attached || !terminalEnabled || !input}
-                onClick={sendInput}
-                aria-label="Send terminal input"
-              />
-            )}
-          />
+          <Space.Compact block>
+            <Space.Addon>$</Space.Addon>
+            <Input
+              value={input}
+              onChange={(event) => setInput(event.target.value)}
+              onPressEnter={(event) => {
+                event.preventDefault();
+                sendInput();
+              }}
+              disabled={!attached || !terminalEnabled}
+              placeholder="Type shell input and press Enter"
+              suffix={(
+                <Button
+                  type="text"
+                  size="small"
+                  icon={<SendOutlined />}
+                  disabled={!attached || !terminalEnabled || !input}
+                  onClick={sendInput}
+                  aria-label="Send terminal input"
+                />
+              )}
+            />
+          </Space.Compact>
         </Space>
         {!versionStatus.supported ? (
           <div
@@ -1365,10 +1486,11 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
   // accumulate even when `snapshots_enabled` is false, and operators need
   // to see those rows in the DB without dropping to the CLI.
   const showSnapshots = sandbox.resource_type !== 'pool_slot';
+  const ownOrg = isOwnOrg(authOrg?.id, sandbox.org_id);
 
   return (
     <div>
-      <Space direction="vertical" size={16} style={{ width: '100%' }}>
+      <Space orientation="vertical" size={16} style={{ width: '100%' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
           <Link href="/dashboard/sandboxes"><ArrowLeftOutlined /> Sandboxes</Link>
           <Title level={3} style={{ margin: 0 }}>
@@ -1459,6 +1581,8 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
 
         <PlacementCard view={debugView} nowMs={nowMs} />
 
+        <QuarantineCard view={debugView} nowMs={nowMs} />
+
         <TimelineCard view={debugView} nowMs={nowMs} />
 
         <OperationsCard
@@ -1472,8 +1596,11 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
         {showSnapshots ? (
           <SnapshotsCard
             sandboxId={sandbox.id}
-            foreignOrg={!!authOrg && !!sandbox.org_id && sandbox.org_id !== authOrg.id}
+            orgId={sandbox.org_id ?? null}
+            sandboxStatus={sandbox.status}
+            ownOrg={ownOrg}
             debugView={debugView}
+            onRollbackSettled={() => { void Promise.all([refresh(false), loadInsight()]); }}
             reloadKey={insightGeneration}
             nowMs={nowMs}
           />
@@ -1546,7 +1673,7 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
 
         <ExecCard sandbox={sandbox} />
 
-        <TerminalCard sandbox={sandbox} />
+        <TerminalCard sandbox={sandbox} ownOrg={ownOrg} />
 
       </Space>
 

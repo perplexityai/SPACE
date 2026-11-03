@@ -1,12 +1,17 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
+  envNames,
   formatAge,
   formatBytes,
   formatMetadataValue,
   mergeOperationPages,
+  quarantineStatus,
   sectionData,
   sectionError,
+  snapshotKey,
+  snapshotStorageById,
+  snapshotStorageLabel,
   sortedTimeline,
   summarizeTimelineDetail,
 } from './sandbox-debug.ts';
@@ -98,4 +103,42 @@ test('operation pages read under both IDs merge into one newest-first list', () 
   const capped = mergeOperationPages([[op('x', '2026-01-02T00:00:00Z'), op('y', '2026-01-01T00:00:00Z')], []], 1);
   assert.deepEqual(capped.operations.map((o) => o.id), ['x']);
   assert.equal(capped.more, true);
+});
+
+test("a snapshot's storage reads as where its data is, with the node only for a local copy", () => {
+  assert.equal(snapshotStorageLabel({ location: 'node_local', node_id: 'node-1' }), 'node-local (node node-1)');
+  assert.equal(snapshotStorageLabel({ location: 'both', node_id: 'node-1' }), 'node-local and object store (node node-1)');
+  assert.equal(snapshotStorageLabel({ location: 'object_store', node_id: null }), 'object store');
+  assert.equal(snapshotStorageLabel({ location: 'none', node_id: null }), 'none');
+  // Not reported (an older release, or a failed placement read): nothing.
+  assert.equal(snapshotStorageLabel(undefined), null);
+});
+
+test("the debug route's bare snapshot UUID matches the snapshot API's snap_ ID", () => {
+  const uuid = '0190aa3c-5f2e-7c4b-9d1e-0123456789ab';
+  assert.equal(snapshotKey(uuid), snapshotKey(`snap_${uuid.replace(/-/g, '')}`));
+  assert.equal(snapshotKey(uuid), snapshotKey(`snap_${uuid.toUpperCase()}`));
+  const byId = snapshotStorageById([
+    { id: uuid, storage: { location: 'object_store', node_id: null } },
+    { id: '0190aa3c-5f2e-7c4b-9d1e-0123456789ac' },
+  ]);
+  assert.deepEqual(byId.get(snapshotKey(`snap_${uuid}`)), { location: 'object_store', node_id: null });
+  assert.equal(byId.size, 1);
+});
+
+test('the environment shows names whether the release sends values or only names', () => {
+  assert.deepEqual(envNames({ SYNTHETIC_TOKEN: null, EMPTY: null }), ['EMPTY', 'SYNTHETIC_TOKEN']);
+  assert.deepEqual(envNames({ SYNTHETIC_TOKEN: 'synthetic-value' }), ['SYNTHETIC_TOKEN']);
+  for (const env of [null, undefined, [], 'text', 3]) assert.deepEqual(envNames(env), []);
+});
+
+test('a quarantine read that failed is unknown, never "not quarantined"', () => {
+  const clear = { quarantined: false, active: null, history: [] };
+  assert.equal(quarantineStatus(clear), 'not-quarantined');
+  assert.equal(quarantineStatus({ ...clear, quarantined: true }), 'quarantined');
+  assert.equal(quarantineStatus({ quarantined: false, active: { quarantine_id: 'q-1' }, history: [] }), 'quarantined');
+  assert.equal(quarantineStatus({ error: 'synthetic section failure', data: null }), 'unknown');
+  // The whole debug read failed after an earlier one: what it showed is not current.
+  assert.equal(quarantineStatus(clear, true), 'unknown');
+  assert.equal(quarantineStatus({ ...clear, quarantined: true }, true), 'unknown');
 });

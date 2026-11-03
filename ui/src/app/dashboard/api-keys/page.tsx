@@ -13,8 +13,8 @@ import {
   Popconfirm,
   Select,
   Space,
+  Switch,
   Table,
-  Tag,
   Typography,
   App,
 } from 'antd';
@@ -23,7 +23,22 @@ import type { ColumnsType } from 'antd/es/table';
 
 import { adminApi } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
+import { isUnknownFieldRejection } from '@/lib/admin-fallback';
+import {
+  KEY_CROSS_ORG_UNSUPPORTED,
+  KEY_USER_CHOICE_UNSUPPORTED,
+  canCreateKey,
+  createKeyBody,
+  crossOrgKeyRefused,
+  isCrossOrgKeyRefusal,
+  keyActorText,
+  keyActsAs,
+  keyActsAsText,
+  keyActsAsUnknownText,
+} from '@/lib/api-keys';
+import { apiKeyColumns } from '@/components/api-key-columns';
 import type {
+  AdminUser,
   ApiKeyMetadata,
   ApiSurface,
   CreatedApiKey,
@@ -35,11 +50,8 @@ const { Paragraph, Text, Title } = Typography;
 type CreateApiKeyValues = {
   name: string;
   allowed_surfaces: ApiSurface[];
+  user_id?: string | null;
 };
-
-function formatDate(value: string | null): string {
-  return value ? new Date(value).toLocaleString() : 'Never';
-}
 
 // `useSearchParams` needs a Suspense boundary in the app router.
 export default function ApiKeysPage() {
@@ -54,15 +66,29 @@ function ApiKeysPageContent() {
   // `?org=<id>` opens a given organization's keys (linked from its page).
   const requestedOrgId = useSearchParams().get('org');
   const { message } = App.useApp();
-  const { org: signedInOrg } = useAuth();
+  const { org: signedInOrg, user: signedInUser } = useAuth();
   const [organizations, setOrganizations] = useState<Organization[]>([]);
   const [orgId, setOrgId] = useState<string>();
   const [keys, setKeys] = useState<ApiKeyMetadata[]>([]);
   const [loading, setLoading] = useState(false);
+  const [includeRevoked, setIncludeRevoked] = useState(false);
+  const [reloadKeys, setReloadKeys] = useState(0);
+  // The selected organization's users, whom a new key can act as.
+  const [orgUsers, setOrgUsers] = useState<AdminUser[] | null>(null);
+  const [orgUsersError, setOrgUsersError] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [creating, setCreating] = useState(false);
-  const [created, setCreated] = useState<CreatedApiKey | null>(null);
+  // The created key with the organization and user it was created for, as
+  // the dialog that shows its secret names them.
+  const [created, setCreated] = useState<{ key: CreatedApiKey; orgName: string; actsAs: string } | null>(null);
+  // The organization a create was refused for with the 403 a release that
+  // creates keys only for the operator's own answers (`crossOrgKeyRefused`).
+  const [crossOrgRefusedFor, setCrossOrgRefusedFor] = useState<string | null>(null);
+  // Picking an organization asks the API afresh, also for the refused one.
+  useEffect(() => setCrossOrgRefusedFor(null), [orgId]);
+  const [reloadUsers, setReloadUsers] = useState(0);
   const [form] = Form.useForm<CreateApiKeyValues>();
+  const chosenUserId = Form.useWatch('user_id', form);
 
   useEffect(() => {
     let active = true;
@@ -96,8 +122,10 @@ function ApiKeysPageContent() {
     let active = true;
     setKeys([]);
     setLoading(true);
+    // Releases before revocation records ignore `include_revoked` and list
+    // only live keys.
     adminApi
-      .get<ApiKeyMetadata[]>(`/v1/orgs/${orgId}/api-keys`)
+      .get<ApiKeyMetadata[]>(`/v1/orgs/${orgId}/api-keys${includeRevoked ? '?include_revoked=true' : ''}`)
       .then((loadedKeys) => {
         if (active) setKeys(loadedKeys);
       })
@@ -113,7 +141,39 @@ function ApiKeysPageContent() {
     return () => {
       active = false;
     };
-  }, [orgId]);
+  }, [orgId, includeRevoked, reloadKeys]);
+
+  useEffect(() => {
+    setOrgUsers(null);
+    setOrgUsersError(null);
+    if (!orgId) return;
+    let active = true;
+    adminApi
+      .get<AdminUser[]>(`/v1/orgs/${orgId}/users`)
+      .then((users) => {
+        if (active) setOrgUsers(users);
+      })
+      .catch((error) => {
+        if (active) setOrgUsersError(error instanceof Error ? error.message : 'Failed to load users');
+      });
+    return () => {
+      active = false;
+    };
+  }, [orgId, reloadUsers]);
+
+  const ownOrg = !!orgId && orgId === signedInOrg?.id;
+  const orgName = organizations.find((organization) => organization.id === orgId)?.name ?? 'this organization';
+  const actsAs = orgId && signedInUser && orgUsers
+    ? keyActsAs({ orgId, caller: signedInUser, users: orgUsers, chosenUserId })
+    : null;
+  const usersLoading = !!orgId && orgUsers === null && orgUsersError === null;
+  const crossOrgUnsupported = crossOrgKeyRefused(crossOrgRefusedFor, orgId);
+  const createAllowed = canCreateKey({ usersLoading, ownOrg, userChosen: actsAs?.kind === 'chosen', crossOrgUnsupported });
+  const actsAsExtra = !ownOrg && crossOrgUnsupported
+    ? KEY_CROSS_ORG_UNSUPPORTED
+    : actsAs
+      ? keyActsAsText(actsAs)
+      : keyActsAsUnknownText({ ownOrg, usersError: orgUsersError });
 
   const openCreate = () => {
     form.resetFields();
@@ -125,13 +185,28 @@ function ApiKeysPageContent() {
     if (!orgId) return;
     setCreating(true);
     try {
-      const result = await adminApi.post<CreatedApiKey>(`/v1/orgs/${orgId}/api-keys`, values);
+      const result = await adminApi.post<CreatedApiKey>(`/v1/orgs/${orgId}/api-keys`, createKeyBody(values));
       setKeys((current) => [result.api_key, ...current]);
       setCreateOpen(false);
-      setCreated(result);
+      // The key's user as the API stored it; the preview only when an older
+      // release does not say.
+      const stored = keyActorText(result.api_key);
+      setCreated({
+        key: result,
+        orgName,
+        actsAs: stored.recorded ? stored.text : actsAs && 'user' in actsAs ? actsAs.user.email : stored.text,
+      });
       message.success('API key created');
     } catch (error) {
-      message.error(error instanceof Error ? error.message : 'Failed to create API key');
+      const userIdRefused = isUnknownFieldRejection(error, 'user_id');
+      if (isCrossOrgKeyRefusal(error, ownOrg, userIdRefused)) {
+        setCrossOrgRefusedFor(orgId);
+        message.error(KEY_CROSS_ORG_UNSUPPORTED);
+      } else if (userIdRefused) {
+        message.error(KEY_USER_CHOICE_UNSUPPORTED);
+      } else {
+        message.error(error instanceof Error ? error.message : 'Failed to create API key');
+      }
     } finally {
       setCreating(false);
     }
@@ -140,7 +215,9 @@ function ApiKeysPageContent() {
   const revokeKey = async (key: ApiKeyMetadata) => {
     try {
       await adminApi.delete<void>(`/v1/orgs/${key.org_id}/api-keys/${key.id}`);
+      // Read again: with revoked keys shown, the row stays, marked revoked.
       setKeys((current) => current.filter((candidate) => candidate.id !== key.id));
+      setReloadKeys((value) => value + 1);
       message.success('API key revoked');
     } catch (error) {
       message.error(error instanceof Error ? error.message : 'Failed to revoke API key');
@@ -150,7 +227,7 @@ function ApiKeysPageContent() {
   const copySecret = async () => {
     if (!created) return;
     try {
-      await navigator.clipboard.writeText(created.secret);
+      await navigator.clipboard.writeText(created.key.secret);
       message.success('API key copied');
     } catch {
       message.error('Could not copy the API key');
@@ -158,36 +235,12 @@ function ApiKeysPageContent() {
   };
 
   const columns: ColumnsType<ApiKeyMetadata> = [
-    { title: 'Name', dataIndex: 'name' },
-    {
-      title: 'Key ID',
-      dataIndex: 'id',
-      render: (id: string) => <Text code copyable>{id}</Text>,
-    },
-    {
-      title: 'Allowed APIs',
-      dataIndex: 'allowed_surfaces',
-      render: (surfaces: ApiSurface[]) => (
-        <Space size={4} wrap>
-          {surfaces.map((surface) => (
-            <Tag key={surface} color={surface === 'native' ? 'blue' : 'purple'}>
-              {surface === 'native' ? 'SPACE' : 'E2B-compatible'}
-            </Tag>
-          ))}
-        </Space>
-      ),
-    },
-    {
-      title: 'Creator',
-      dataIndex: 'created_by_email',
-      render: (email: string | null) => email || <Text type="secondary">Unassigned</Text>,
-    },
-    { title: 'Created', dataIndex: 'created_at', render: formatDate },
+    ...apiKeyColumns(),
     {
       title: '',
       key: 'actions',
       align: 'right',
-      render: (_, key) => (
+      render: (_, key) => (key.revoked_at ? null : (
         <Popconfirm
           title="Revoke this API key?"
           description="Clients using it will immediately lose access."
@@ -197,7 +250,7 @@ function ApiKeysPageContent() {
         >
           <Button danger type="text" icon={<DeleteOutlined />} aria-label={`Revoke ${key.name}`} />
         </Popconfirm>
-      ),
+      )),
     },
   ];
 
@@ -212,7 +265,7 @@ function ApiKeysPageContent() {
           type="primary"
           icon={<PlusOutlined />}
           onClick={openCreate}
-          disabled={!orgId || orgId !== signedInOrg?.id}
+          disabled={!orgId}
         >
           Create API key
         </Button>
@@ -220,23 +273,22 @@ function ApiKeysPageContent() {
 
       <Card>
         <Space orientation="vertical" size={16} style={{ width: '100%' }}>
-          <Select
-            value={orgId}
-            onChange={setOrgId}
-            style={{ width: 360, maxWidth: '100%' }}
-            placeholder="Select an organization"
-            options={organizations.map((organization) => ({
-              label: organization.name,
-              value: organization.id,
-            }))}
-          />
-          {orgId && signedInOrg && orgId !== signedInOrg.id && (
-            <Alert
-              type="info"
-              showIcon
-              message="API keys can only be created for your organization. You can still view and revoke this organization's keys."
+          <Space wrap size={16}>
+            <Select
+              value={orgId}
+              onChange={setOrgId}
+              style={{ width: 360, maxWidth: '100%' }}
+              placeholder="Select an organization"
+              options={organizations.map((organization) => ({
+                label: organization.id === signedInOrg?.id ? `${organization.name} (mine)` : organization.name,
+                value: organization.id,
+              }))}
             />
-          )}
+            <Space size={8}>
+              <Switch size="small" checked={includeRevoked} onChange={setIncludeRevoked} aria-label="Show revoked keys" />
+              <Text>Show revoked keys</Text>
+            </Space>
+          </Space>
           <Table
             rowKey="id"
             columns={columns}
@@ -248,9 +300,10 @@ function ApiKeysPageContent() {
       </Card>
 
       <Modal
-        title="Create API key"
+        title={`Create an API key for ${orgName}`}
         open={createOpen}
         okText="Create"
+        okButtonProps={{ disabled: !createAllowed }}
         confirmLoading={creating}
         onOk={() => form.submit()}
         onCancel={() => setCreateOpen(false)}
@@ -276,28 +329,64 @@ function ApiKeysPageContent() {
               ]}
             />
           </Form.Item>
+          <Form.Item
+            name="user_id"
+            label="Acts as"
+            // The API picks no user for another organization's key.
+            rules={ownOrg ? [] : [{ required: true, message: 'Choose the user the key acts as' }]}
+            extra={(
+              <Space size={4} wrap>
+                <span>{actsAsExtra}</span>
+                {orgUsersError ? (
+                  <Button type="link" size="small" style={{ padding: 0 }} onClick={() => setReloadUsers((value) => value + 1)}>
+                    Retry
+                  </Button>
+                ) : null}
+                {crossOrgUnsupported ? (
+                  <Button type="link" size="small" style={{ padding: 0 }} onClick={() => setCrossOrgRefusedFor(null)}>
+                    Try again
+                  </Button>
+                ) : null}
+              </Space>
+            )}
+          >
+            <Select
+              allowClear
+              showSearch
+              optionFilterProp="label"
+              loading={usersLoading}
+              placeholder={ownOrg ? 'You (default)' : 'Choose a user'}
+              options={(orgUsers ?? []).map((user) => ({
+                label: user.display_name ? `${user.email} (${user.display_name})` : user.email,
+                value: user.id,
+              }))}
+            />
+          </Form.Item>
         </Form>
       </Modal>
 
       <Modal
-        title="API key created"
+        title={created ? `API key created for ${created.orgName}` : 'API key created'}
         open={created !== null}
         okText="Done"
         cancelButtonProps={{ style: { display: 'none' } }}
         onOk={() => setCreated(null)}
         onCancel={() => setCreated(null)}
         closable={false}
-        maskClosable={false}
+        mask={{ closable: false }}
       >
         <Alert
           type="warning"
           showIcon
-          message="Copy this key now"
+          title="Copy this key now"
           description="SPACE stores only its hash. The key cannot be displayed again after this dialog closes."
           style={{ marginBottom: 16 }}
         />
+        <Paragraph>
+          <Text strong>{created?.key.api_key.name}</Text> acts as {created?.actsAs} in {created?.orgName}.
+        </Paragraph>
         <Paragraph code style={{ wordBreak: 'break-all' }}>
-          {created?.secret}
+          {created?.key.secret}
         </Paragraph>
         <Button icon={<CopyOutlined />} onClick={copySecret}>Copy API key</Button>
       </Modal>

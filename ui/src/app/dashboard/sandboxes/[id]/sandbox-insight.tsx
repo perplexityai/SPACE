@@ -9,6 +9,7 @@ import { Alert, Card, Descriptions, Space, Table, Tag, Tooltip, Typography } fro
 import {
   ClusterOutlined,
   DatabaseOutlined,
+  WarningOutlined,
   HistoryOutlined,
   ProfileOutlined,
 } from '@ant-design/icons';
@@ -17,9 +18,11 @@ import type { ColumnsType } from 'antd/es/table';
 import { adminApi } from '@/lib/api';
 import type { AdminOperationRecord } from '@/lib/public-api';
 import {
+  envNames,
   formatAge,
   formatBytes,
   formatMetadataValue,
+  quarantineStatus,
   sectionData,
   sectionError,
   sortedTimeline,
@@ -27,10 +30,12 @@ import {
   type DebugPod,
   type DebugSection,
   type DebugPort,
+  type DebugQuarantineEvent,
   type DebugTimelineEvent,
   type SandboxDebug,
 } from '@/lib/sandbox-debug';
 import { tablePagination } from '@/lib/table-pagination';
+import { actorsToLookUp } from '@/lib/operation-list';
 import type { AdminUser, Organization } from '@/lib/types';
 
 const { Text } = Typography;
@@ -193,7 +198,7 @@ export function ResourcesCard({ view, nowMs }: { view: DebugView; nowMs: number 
   const shape = (value: number | null | undefined, unit: string) =>
     !resources ? unknown : value === null || value === undefined ? <Text type="secondary">template default</Text> : `${value}${unit}`;
   // Only variable names: values can hold credentials.
-  const envKeys = Object.keys(resources?.env ?? {}).sort();
+  const envKeys = envNames(resources?.env);
   const metadata = Object.entries(resources?.metadata ?? {});
   const portColumns: ColumnsType<DebugPort> = [
     { title: 'Port', dataIndex: 'guest_port', width: 80 },
@@ -250,6 +255,84 @@ export function ResourcesCard({ view, nowMs }: { view: DebugView; nowMs: number 
   );
 }
 
+// How many quarantine events the card lists; the API sends at most 50.
+const QUARANTINE_EVENTS_SHOWN = 10;
+
+// The debug route's quarantine section: the open episode, if any, and the
+// newest events across episodes. Releases without it send no section, and
+// the card is not shown.
+export function QuarantineCard({ view, nowMs }: { view: DebugView; nowMs: number }) {
+  const { debug } = view;
+  // The other cards already show a debug read that is pending or failed.
+  if (!debug || debug.quarantine === undefined) return null;
+  const quarantine = sectionData(debug?.quarantine);
+  const state = sectionState(view, debug?.quarantine);
+  const active = quarantine?.active ?? null;
+  const history = (quarantine?.history ?? []).slice(0, QUARANTINE_EVENTS_SHOWN);
+  const status = quarantineStatus(debug.quarantine, view.error !== null);
+  if (status === 'not-quarantined' && history.length === 0) return null;
+  const columns: ColumnsType<DebugQuarantineEvent> = [
+    { title: 'When', dataIndex: 'occurred_at', width: 90, render: (v: string) => <When value={v} nowMs={nowMs} /> },
+    { title: 'Action', dataIndex: 'action', width: 170, render: (v: string) => <Tag>{v.replace(/_/g, ' ')}</Tag> },
+    { title: 'Source', dataIndex: 'source', width: 120 },
+    { title: 'Reason', dataIndex: 'reason_code', width: 160, render: (v: string | null) => v ?? '—' },
+    {
+      title: 'Detail',
+      render: (_, event) => (
+        <Space orientation="vertical" size={0}>
+          {event.message ? <span>{event.message}</span> : null}
+          {event.error ? <Text type="danger">{event.error}</Text> : null}
+          {event.next_action ? <Text type="secondary">next: {event.next_action}</Text> : null}
+          {!event.message && !event.error && !event.next_action ? '—' : null}
+        </Space>
+      ),
+    },
+  ];
+  return (
+    <Card
+      size="small"
+      title={(
+        <Space>
+          <WarningOutlined /> Quarantine
+          {status === 'quarantined' ? <Tag color="red">quarantined</Tag> : null}
+          {status === 'not-quarantined' ? <Tag>not quarantined</Tag> : null}
+          {status === 'unknown' ? <Tag color="warning">unknown: not read</Tag> : null}
+        </Space>
+      )}
+    >
+      <SectionError what="quarantine" error={state.error} />
+      {active ? (
+        <Descriptions size="small" column={3} style={{ marginBottom: 8 }}>
+          <Descriptions.Item label="Reason">
+            {active.reason_code}{active.reason_message ? `: ${active.reason_message}` : ''}
+          </Descriptions.Item>
+          <Descriptions.Item label="Entered"><When value={active.entered_at} nowMs={nowMs} /></Descriptions.Item>
+          <Descriptions.Item label="From">{active.entered_from_lifecycle ?? '—'}</Descriptions.Item>
+          <Descriptions.Item label="Source">{active.source}</Descriptions.Item>
+          <Descriptions.Item label="Next action">
+            {active.next_action}
+            {active.next_action_after ? ` after ${new Date(active.next_action_after).toLocaleString()}` : null}
+          </Descriptions.Item>
+          <Descriptions.Item label="Attempts">{active.attempt_count}</Descriptions.Item>
+          <Descriptions.Item label="Last node">{active.last_observed_node_id ?? '—'}</Descriptions.Item>
+          <Descriptions.Item label="Updated"><When value={active.updated_at} nowMs={nowMs} /></Descriptions.Item>
+          <Descriptions.Item label="Last error">
+            {active.last_error ? <Text type="danger">{active.last_error}</Text> : '—'}
+          </Descriptions.Item>
+        </Descriptions>
+      ) : null}
+      <Table
+        columns={columns}
+        dataSource={history}
+        rowKey="id"
+        size="small"
+        pagination={false}
+        locale={{ emptyText: state.error ? 'Could not load quarantine events' : 'No quarantine events' }}
+      />
+    </Card>
+  );
+}
+
 // `LIMIT 200` in the debug route's timeline source
 // (`crates/libs/api/src/routes/debug/sources/timeline.rs`).
 const TIMELINE_CAP = 200;
@@ -265,6 +348,8 @@ const TIMELINE_COLORS: Record<string, string> = {
 export function TimelineCard({ view, nowMs }: { view: DebugView; nowMs: number }) {
   const { debug } = view;
   const events = sortedTimeline(sectionData(debug?.timeline) ?? []);
+  // Two events can share a time and kind: the position keeps each key unique.
+  const rows = events.map((event, position) => ({ ...event, rowKey: `${event.at}:${event.kind}:${position}` }));
   const timelineState = sectionState(view, debug?.timeline);
   // The debug route returns at most the newest TIMELINE_CAP events.
   const capped = events.length >= TIMELINE_CAP;
@@ -282,8 +367,8 @@ export function TimelineCard({ view, nowMs }: { view: DebugView; nowMs: number }
       <SectionError what="the timeline" error={timelineState.error} />
       <Table
         columns={columns}
-        dataSource={events}
-        rowKey={(event, index) => `${event.at}:${event.kind}:${index}`}
+        dataSource={rows}
+        rowKey="rowKey"
         size="small"
         pagination={tablePagination('events', 10)}
         loading={timelineState.pending}
@@ -323,7 +408,7 @@ export function OperationsCard({
 }) {
   // One lookup per distinct user, not one per row.
   const actorIds = useMemo(
-    () => [...new Set(operations.flatMap((op) => (op.actor_user_id ? [op.actor_user_id] : [])))].sort(),
+    () => actorsToLookUp(operations).sort(),
     [operations],
   );
   const actorEmails = useUserEmails(actorIds);
@@ -348,7 +433,7 @@ export function OperationsCard({
       title: <Tooltip title="The user the operation was recorded for. Creates through the admin API record the sandbox owner.">Recorded for</Tooltip>,
       dataIndex: 'actor_user_id',
       width: 220,
-      render: (v: string | null) => <UserAnchor userId={v} email={v ? actorEmails.get(v) : null} />,
+      render: (v: string | null, op) => <UserAnchor userId={v} email={op.actor_email ?? (v ? actorEmails.get(v) : null)} />,
     },
     { title: 'Attempts', dataIndex: 'attempts', width: 80 },
     {
