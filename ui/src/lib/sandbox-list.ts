@@ -5,6 +5,9 @@ import type { Sandbox } from './types';
 // and applies the filters below. A server from before paging ignores
 // `cursor` and every filter except `org_id` and answers a bare array of the
 // newest `limit` rows; the console then samples, as it did before paging.
+// A bare array is the older answer only for that request: during a rolling
+// deploy the next request may reach a server that pages, so a sampled tab
+// asks for its sample in the paged form and switches back on a page answer.
 export type ListMode = 'paged' | 'sampled';
 
 export type SandboxListResponse =
@@ -57,19 +60,20 @@ export const NO_FILTERS: SandboxListFilters = {
   org: null, lifecycles: [], template: null, userId: null, createdWithin: null, olderThan: null, prefix: '',
 };
 
-// The query string of one list request. A sampled list sends exactly what
-// the console sent before paging: the sample size and the org, the one
-// filter such a server applies. A paged request sends the page position, the
-// page size and every set filter; the server refuses an unknown parameter
-// once `cursor` is present, so nothing else is added. The creation-time
-// bounds are computed from `now`, the time the request is sent.
+// The query string of one list request. A sampled request is the first page
+// of the unfiltered list of the org, the one filter a server without paging
+// applies, at the sample size: such a server ignores `cursor` and answers
+// its sample, and one that pages answers a page, which shows that it does.
+// A paged request sends the page position, the page size and every set
+// filter; the server refuses an unknown parameter once `cursor` is present,
+// so nothing else is added. The creation-time bounds are computed from
+// `now`, the time the request is sent.
 export function sandboxListQuery(
   mode: ListMode,
   filters: SandboxListFilters,
   { limit, cursor = '', now }: { limit: number; cursor?: string; now: number },
 ): string {
-  const params = new URLSearchParams({ limit: String(limit) });
-  if (mode === 'paged') params.set('cursor', cursor);
+  const params = new URLSearchParams({ limit: String(limit), cursor: mode === 'paged' ? cursor : '' });
   if (filters.org) params.set('org_id', filters.org);
   if (mode === 'sampled') return params.toString();
   if (filters.lifecycles.length) params.set('lifecycle', filters.lifecycles.join(','));
@@ -144,15 +148,18 @@ export function clientFilters(mode: ListMode): ClientFilters {
   return { text: sampled, template: sampled, status: sampled, user: sampled, created: sampled, node: true };
 }
 
-// What to do with a list answer. A bare array answering a paged request
-// means the server does not page: the console switches to sampling and
-// reads the sample, a new scope, rather than show rows it asked for as a page.
+// What to do with a list answer: the list shape to use from now on, and
+// whether to show the answer or read the selected scope in that shape. A
+// bare array answering a paged request means the server does not page: the
+// console switches to sampling and reads the sample. A page answering a
+// sampled request means it pages now: the console switches back and reads
+// the first page with the filters it did not send. Either way the answer
+// was asked for in the other shape and is not shown.
 export function listAnswerPlan(
   sent: ListMode,
   response: SandboxListResponse,
-): { mode: ListMode; reloadSample: boolean } {
-  if (response.mode === 'paged') return { mode: 'paged', reloadSample: false };
-  return { mode: 'sampled', reloadSample: sent === 'paged' };
+): { mode: ListMode; reread: boolean } {
+  return { mode: response.mode, reread: response.mode !== sent };
 }
 
 export const PAGE_SIZE_OPTIONS = [25, 50, 100, 200, 500];

@@ -735,7 +735,8 @@ function SandboxesPage() {
   const listLimitRef = useRef(listLimit);
   const [pageSize, setPageSize] = useState(() => parsePageSize(searchParams.get('page_size')));
   const pageSizeRef = useRef(pageSize);
-  // Paged until a bare array shows the server does not page.
+  // Paged until a bare array shows the server does not page, and again once
+  // a page shows that it does; see `listAnswerPlan`.
   const [listMode, setListMode] = useState<ListMode>('paged');
   const listModeRef = useRef<ListMode>('paged');
   const [position, setPosition] = useState<PagePosition>(FIRST_PAGE);
@@ -851,12 +852,13 @@ function SandboxesPage() {
     const ticket = requestsRef.current.begin(scope);
     const applies = () => requestsRef.current.applies(ticket, currentScope());
     if (showLoading) setLoading(true);
-    let reloadSample = false;
+    let reread = false;
     try {
       const response = await getConsoleSandboxList(listRequestQuery(scope, Date.now()));
       // An answer for a scope no longer selected, even one selected again
       // since, is dropped.
       if (!applies()) throw skipped();
+      // A sampled request also probes for paging; see `listAnswerPlan`.
       const plan = listAnswerPlan(scope.mode, response);
       if (plan.mode !== listModeRef.current) {
         listModeRef.current = plan.mode;
@@ -865,10 +867,8 @@ function SandboxesPage() {
         setPosition(FIRST_PAGE);
         scopeChanged();
       }
-      // A bare array answering a paged request is the newest rows of a
-      // server that does not page; the sample is read below instead.
-      reloadSample = plan.reloadSample;
-      if (!reloadSample) {
+      reread = plan.reread;
+      if (!reread) {
         const data = response.sandboxes;
         // A page keeps the server's order, newest first, so that the pages
         // join up; a sample is sorted as it was before paging.
@@ -902,9 +902,9 @@ function SandboxesPage() {
     } finally {
       // Only an answer that applies ends `loading`, whichever request started
       // it; a change of scope that keeps the rows on screen ends it itself.
-      if (applies() && !reloadSample) setLoading(false);
+      if (applies() && !reread) setLoading(false);
     }
-    if (reloadSample) await refresh({ showLoading, reconcile, scope: currentScope() });
+    if (reread) await refresh({ showLoading, reconcile, scope: currentScope() });
   };
 
   const refreshAndReport = () => {

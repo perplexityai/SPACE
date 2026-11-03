@@ -77,10 +77,13 @@ test('the first page sends an empty cursor, and unset filters send nothing', () 
   assert.deepEqual(parse(sandboxListQuery('paged', { ...NO_FILTERS, prefix: ' \0 ' }, { limit: 25, now: NOW })), { limit: '25', cursor: '' });
 });
 
-test('a sampled request sends what the list took before paging: the size and the org only', () => {
+test('a sampled request is the first page at the sample size, with the org only', () => {
   const filters = { ...NO_FILTERS, org: '0193a000-0000-7000-8000-000000000001', template: 'seed', lifecycles: ['started'], prefix: 'a' };
+  // A server without paging ignores the cursor and answers the sample; one
+  // that pages answers a page, which is the probe.
   assert.deepEqual(parse(sandboxListQuery('sampled', filters, { limit: 1000, cursor: 'ignored', now: NOW })), {
     limit: '1000',
+    cursor: '',
     org_id: '0193a000-0000-7000-8000-000000000001',
   });
 });
@@ -115,14 +118,35 @@ test('a paged list leaves only the node filter to the console; a sampled one fil
   assert.deepEqual(clientFilters('sampled'), { text: true, template: true, status: true, user: true, created: true, node: true });
 });
 
-test('a bare array answering a paged request switches to sampling and reads the sample', () => {
-  const sampled = { mode: 'sampled', sandboxes: [] };
-  const paged = { mode: 'paged', sandboxes: [], nextCursor: null };
-  // Its rows were asked for as a page; the sample is another scope.
-  assert.deepEqual(listAnswerPlan('paged', sampled), { mode: 'sampled', reloadSample: true });
-  // A sampled request was already the sample.
-  assert.deepEqual(listAnswerPlan('sampled', sampled), { mode: 'sampled', reloadSample: false });
-  assert.deepEqual(listAnswerPlan('paged', paged), { mode: 'paged', reloadSample: false });
+const sampledAnswer = { mode: 'sampled', sandboxes: [] };
+const pagedAnswer = { mode: 'paged', sandboxes: [], nextCursor: null };
+
+test('an answer in the shape asked for is shown', () => {
+  assert.deepEqual(listAnswerPlan('paged', pagedAnswer), { mode: 'paged', reread: false });
+  assert.deepEqual(listAnswerPlan('sampled', sampledAnswer), { mode: 'sampled', reread: false });
+});
+
+test('a bare array answering a page request switches to sampling and reads the sample', () => {
+  // Its rows were asked for as a page, filtered; the server ignored the
+  // filters, and the sample is another size.
+  assert.deepEqual(listAnswerPlan('paged', sampledAnswer), { mode: 'sampled', reread: true });
+});
+
+test('a sampled tab pages again on the first refresh a paging server answers', () => {
+  // A rolling deploy: the first load reached a server without paging...
+  let mode = 'paged';
+  let plan = listAnswerPlan(mode, sampledAnswer);
+  assert.deepEqual(plan, { mode: 'sampled', reread: true });
+  mode = plan.mode;
+  plan = listAnswerPlan(mode, sampledAnswer);
+  assert.deepEqual(plan, { mode: 'sampled', reread: false });
+  // ...and a later refresh, sent in the same form, reaches one that pages.
+  // Its answer is a page of the unfiltered list at the sample size, so the
+  // first page is read again with the page size and the filters.
+  plan = listAnswerPlan(mode, pagedAnswer);
+  assert.deepEqual(plan, { mode: 'paged', reread: true });
+  mode = plan.mode;
+  assert.deepEqual(listAnswerPlan(mode, pagedAnswer), { mode: 'paged', reread: false });
 });
 
 const scopeOf = (filters, cursor = '') => listScope('paged', { ...NO_FILTERS, ...filters }, { limit: 50, cursor });
