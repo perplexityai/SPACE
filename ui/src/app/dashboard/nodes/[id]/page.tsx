@@ -16,6 +16,7 @@ import {
   type ForceUploadResponse,
   type NodeAction,
 } from '@/lib/node-actions';
+import { countLabel, nodeReadFailure, type NodeCounts } from '@/lib/node-detail';
 import { publicSandboxIdFromAny } from '@/lib/sandbox-id';
 import type { AdminNodeResponse, NodeHealthStatus } from '@/lib/types';
 
@@ -43,23 +44,55 @@ export default function NodeDetailPage() {
   // The same for node reads. An action bumps it as it starts, so a read that
   // began before the action cannot land after it and restore the old state.
   const nodeRequest = useRef(0);
+  const nodeLoaded = useRef(false);
+  const [loadedAtMs, setLoadedAtMs] = useState<number | null>(null);
+  // `error` replaces the page; `refreshError` keeps the last loaded node.
   const [error, setError] = useState<{ status: number | null; message: string } | null>(null);
+  const [refreshError, setRefreshError] = useState<string | null>(null);
+  const [counts, setCounts] = useState<NodeCounts | null>(null);
+  const [countsFailed, setCountsFailed] = useState(false);
+  const countsRequest = useRef(0);
   const [busy, setBusy] = useState<string | null>(null);
 
   // Health comes from the node response's own status snapshot, so it is
-  // always shown with that snapshot's time, never with a newer read's.
+  // always shown with that snapshot's time, never with a newer read's. The
+  // node read is metadata-only; sandbox counts run a counting query and are
+  // a separate best-effort read (`loadCounts`).
   const loadNode = (): Promise<void> => {
     const request = ++nodeRequest.current;
     return adminApi
-      .get<AdminNodeResponse>(`/v1/nodes/${id}?include_occupancy=true`)
+      .get<AdminNodeResponse>(`/v1/nodes/${id}?include_occupancy=false`)
       .then((loaded) => {
         if (request !== nodeRequest.current) return;
+        nodeLoaded.current = true;
         setNode(loaded);
+        setLoadedAtMs(Date.now());
         setError(null);
+        setRefreshError(null);
       })
       .catch((err: any) => {
         if (request !== nodeRequest.current) return;
-        setError({ status: typeof err?.status === 'number' ? err.status : null, message: err?.message || 'Failed to load node' });
+        const status = typeof err?.status === 'number' ? err.status : null;
+        const reason = err?.message || 'Failed to load node';
+        if (nodeReadFailure(status, nodeLoaded.current) === 'replace') {
+          setError({ status, message: reason });
+        } else {
+          setRefreshError(reason);
+        }
+      });
+  };
+
+  const loadCounts = () => {
+    const request = ++countsRequest.current;
+    adminApi
+      .get<AdminNodeResponse>(`/v1/nodes/${id}?include_occupancy=true`)
+      .then((loaded) => {
+        if (request !== countsRequest.current) return;
+        setCounts({ sandboxes_active: loaded.sandboxes_active, sandboxes_local_snapshots: loaded.sandboxes_local_snapshots });
+        setCountsFailed(false);
+      })
+      .catch(() => {
+        if (request === countsRequest.current) setCountsFailed(true);
       });
   };
 
@@ -81,11 +114,20 @@ export default function NodeDetailPage() {
 
   const refreshAll = () => {
     void loadNode();
+    loadCounts();
     loadSandboxes();
   };
 
   useEffect(() => {
+    nodeLoaded.current = false;
+    setNode(null);
+    setLoadedAtMs(null);
+    setError(null);
+    setRefreshError(null);
+    setCounts(null);
+    setCountsFailed(false);
     void loadNode();
+    loadCounts();
   }, [id]);
   useEffect(() => loadSandboxes(cursor), [id, cursor]);
 
@@ -121,6 +163,7 @@ export default function NodeDetailPage() {
         setBusy(item.label);
         // Earlier reads describe the node before this action: drop them.
         nodeRequest.current += 1;
+        countsRequest.current += 1;
         try {
           const result = await adminApi.post<ForceUploadResponse | unknown>(`/v1/nodes/${id}:${item.action}`, item.body);
           if (item.action === 'force-upload-local-snapshots' && result && typeof result === 'object' && 'reuploaded' in result) {
@@ -134,6 +177,7 @@ export default function NodeDetailPage() {
           // Some actions commit and then report an error: always reload, and
           // keep the actions disabled until that read settles.
           loadSandboxes();
+          loadCounts();
           await loadNode();
           setBusy(null);
         }
@@ -183,6 +227,16 @@ export default function NodeDetailPage() {
         </Space>
       </Space>
 
+      {refreshError ? (
+        <Alert
+          type="warning"
+          showIcon
+          title={`Could not refresh the node: ${refreshError}`}
+          description={`Showing the node as loaded ${loadedAtMs ? `at ${new Date(loadedAtMs).toLocaleString()}` : 'earlier'}; it may be stale.`}
+          action={<Button size="small" onClick={refreshAll} disabled={!!busy}>Retry</Button>}
+        />
+      ) : null}
+
       <Card size="small" title="Node">
         <Descriptions size="small" column={3}>
           <Descriptions.Item label="ID"><Text code copyable>{node.id}</Text></Descriptions.Item>
@@ -201,8 +255,8 @@ export default function NodeDetailPage() {
 
       <Card size="small" title="Occupancy">
         <Descriptions size="small" column={3}>
-          <Descriptions.Item label="Active sandboxes">{node.sandboxes_active ?? 'not computed'}</Descriptions.Item>
-          <Descriptions.Item label="Node-local snapshots">{node.sandboxes_local_snapshots ?? 'not computed'}</Descriptions.Item>
+          <Descriptions.Item label="Active sandboxes">{countLabel(counts?.sandboxes_active, countsFailed)}</Descriptions.Item>
+          <Descriptions.Item label="Node-local snapshots">{countLabel(counts?.sandboxes_local_snapshots, countsFailed)}</Descriptions.Item>
           <Descriptions.Item label="Network slots leased">
             {slots ? `${slots.leased ?? '—'} of ${slots.total ?? '—'} (max ${slots.max_slots ?? '—'})` : '—'}
           </Descriptions.Item>
