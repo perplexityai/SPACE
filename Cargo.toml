@@ -520,6 +520,10 @@ opt-level = 3
 [profile.test.package.blowfish]
 opt-level = 3
 
+# Trial: every dependency optimized under `cargo test`.
+[profile.test.package."*"]
+opt-level = 2
+
 [profile.dev-release]
 inherits = "release"
 lto = false
