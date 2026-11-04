@@ -110,8 +110,7 @@ space-tmplmgr register --template windows-evaluation \
   --staging-dir build.importing.windows
 space-sbxmgr create --template windows-evaluation --content-hash <digest> \
   --environment <reference> --auto-lifecycle-off
-space-sbxmgr update <sandbox-id> --memory 4096
-space-sbxmgr start <sandbox-id> --blocking --ready-timeout-secs 120
+space-sbxmgr start <sandbox-id> --memory 4096 --blocking --ready-timeout-secs 120
 ```
 
 Use the full sandbox UUID for operator channels:
@@ -170,3 +169,52 @@ reader guard, exact environment admission and durable metadata validation, not
 on a feature bit. Drain firmware guests before rolling back to readers that do
 not support their metadata. The migration follows the runtime-upgrades migration;
 never rename a migration after production deployment.
+
+
+## Native spaced readiness development
+
+Build with an explicit Cargo target and a matching cross-toolchain:
+
+```sh
+cargo build --locked --release --target x86_64-pc-windows-gnu \
+  -p pplx-space-spaced-guest-svc --bin spaced-svc --no-default-features
+```
+
+Use a MinGW-w64 linker for Windows GNU or a native Windows MSVC toolchain for
+`x86_64-pc-windows-msvc`. Linux builds use `x86_64-unknown-linux-musl` or
+`aarch64-unknown-linux-musl` with the corresponding musl toolchain.
+`protoc` runs on the build host, not the guest target; install its includes
+there or set `PROTOC` and `PROTOC_INCLUDE`. Native tests remain separate from
+cross-compilation. The Windows backend uses the
+same guest bridge protocol as Linux. It runs under the Windows service manager
+and bridges synchronous VirtIO socket calls onto bounded async streams; it
+cannot use Tokio's Windows TCP socket selector for this provider.
+
+Install the signed VirtIO socket driver and its Winsock provider first. In the
+private guest, run `install-spaced.ps1 -Executable <path-to-spaced-svc.exe>` as
+Administrator. The service depends on `VirtioSocket`, accepts only host CID 2,
+and reports Running only after its listener binds. Startup failures are also
+written to the Windows Application event log. `spaced-svc.exe --console` runs
+the same backend in the foreground for diagnostics.
+
+For this development stage, the version-4 image contract may declare
+`"agent":"spaced"` and `"readiness":{"kind":"agent"}`, retaining the opaque
+disk and slot DHCP settings. Node-manager derives the host's Windows agent
+policy from the recorded execution and image contract. Guest claims cannot
+widen that policy. Deploy the matching node-manager and spaced-host before
+starting this image; older peers refuse it.
+
+This backend currently advertises **no process, file, watch, flush, resume or
+forwarding operations**. Readiness is not their qualification. The image still
+uses ACPI shutdown, and base snapshots, warm pools and automatic memory
+lifecycle remain refused. Do not publish an evaluation disk or embedded test
+credentials with this source.
+
+The `node.windows_agent_readiness` typed smoke checks the pinned image contract,
+then creates a sandbox, waits for agent readiness, stops it, cold-starts a new
+execution and deletes it. Provision OpenSSH for this smoke: its unauthenticated
+banner through the fenced node channel proves DHCP networking on both boots.
+It uses the same explicit standalone-worker opt-in
+as `node.windows_sandbox_lifecycle`. It passed on an x86-64 Linux/KVM worker
+with Cloud Hypervisor 54 and a Windows Server 2025 evaluation image. This is
+readiness and cold-lifecycle evidence, not process/file or memory-restore evidence.

@@ -466,3 +466,38 @@ async fn exited_runtime_recovery_requires_death_and_the_current_execution() {
         shutdown(service).await;
     }
 }
+
+#[test]
+fn stop_flush_requires_qualification_even_after_catalog_retirement() {
+    use pplx_space_common_core::types::guest_image::{
+        GuestAgent, GuestDiskLayout, GuestImageContract, GuestNetwork, GuestReadiness,
+    };
+    let windows = GuestImageContract::new(
+        GuestDiskLayout::OpaqueRawDisk,
+        GuestReadiness::Agent,
+        GuestNetwork::SlotDhcpV1,
+        GuestAgent::Spaced,
+    )
+    .unwrap();
+    for (os, runtime, image, expected) in [
+        ("linux", "firecracker", GuestImageContract::default(), true),
+        ("windows", "cloud-hypervisor", windows, false),
+    ] {
+        let execution = serde_json::from_value(serde_json::json!({
+            "environment": format!("sha256:{}", "a".repeat(64)),
+            "runtime": {"kind": runtime, "version": "54.0.0"},
+            "guest": {"os": os, "architecture": "x86_64"},
+            "components": []
+        }))
+        .unwrap();
+        assert_eq!(
+            super::guest_flush_is_qualified(image, Some(&execution)),
+            expected
+        );
+    }
+    assert!(super::guest_flush_is_qualified(
+        GuestImageContract::default(),
+        None
+    ));
+    assert!(!super::guest_flush_is_qualified(windows, None));
+}

@@ -534,7 +534,7 @@ impl SpacedHostService {
         &self,
         response: BridgeGuestWaitReadyResponse,
     ) -> Result<Option<GuestReadySnapshot>, Status> {
-        GuestPlatformObservation::parse(&response)?;
+        GuestPlatformObservation::parse(&response, self.inner.guest_agent)?;
         let guest_uptime = validate_optional_duration("guest_uptime", response.guest_uptime)?;
         if !response.ready {
             return Ok(None);
@@ -773,6 +773,7 @@ impl SpacedHostService {
         Self {
             inner: Arc::new(SpacedHostServiceInner {
                 shutdown,
+                guest_agent: config.guest_agent,
                 socket_path: config.socket_path,
                 bridge_host_socket_path: config.bridge_host_socket_path,
                 bridge_host_expected_peer,
@@ -962,7 +963,11 @@ impl SpacedHostService {
     > {
         let (channel, connection) = self.connect_bridge_guest_channel().await?;
         Ok((
-            OperationClient::new(BridgeGuestFilesystemClient::new(channel.clone()), channel),
+            OperationClient::new(
+                BridgeGuestFilesystemClient::new(channel.clone()),
+                channel,
+                self.inner.guest_agent,
+            ),
             connection,
         ))
     }
@@ -975,7 +980,11 @@ impl SpacedHostService {
     > {
         let (channel, connection) = self.connect_bridge_guest_channel().await?;
         Ok((
-            OperationClient::new(BridgeGuestProcessClient::new(channel.clone()), channel),
+            OperationClient::new(
+                BridgeGuestProcessClient::new(channel.clone()),
+                channel,
+                self.inner.guest_agent,
+            ),
             connection,
         ))
     }
@@ -990,7 +999,11 @@ impl SpacedHostService {
     > {
         let (channel, connection) = self.connect_bridge_guest_channel().await?;
         Ok((
-            OperationClient::new(BridgeGuestNetworkingClient::new(channel.clone()), channel),
+            OperationClient::new(
+                BridgeGuestNetworkingClient::new(channel.clone()),
+                channel,
+                self.inner.guest_agent,
+            ),
             connection,
         ))
     }
@@ -1367,7 +1380,11 @@ impl SpacedHostService {
                     .await
                     .map_err(|error| Status::unavailable(error.to_string()))?;
                 Ok((
-                    OperationClient::new(BridgeGuestClient::new(channel.clone()), channel),
+                    OperationClient::new(
+                        BridgeGuestClient::new(channel.clone()),
+                        channel,
+                        self.inner.guest_agent,
+                    ),
                     connection,
                 ))
             })

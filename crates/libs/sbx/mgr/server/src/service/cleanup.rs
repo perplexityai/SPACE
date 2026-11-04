@@ -80,6 +80,8 @@ pub(super) enum CleanupAdmission {
         sandbox_id: SandboxId,
         expected_execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
         persistence_error: Option<String>,
+        // A known image exclusion survives a later loss of database access.
+        guest_flush_forbidden: bool,
         fence: OwnedCleanupFenceGuard,
     },
 }
@@ -189,13 +191,29 @@ impl CleanupAdmission {
         sandbox_id: SandboxId,
         expected_execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
         persistence_error: Option<String>,
+        guest_flush_forbidden: bool,
         fence: OwnedCleanupFenceGuard,
     ) -> Self {
         Self::Unpersisted {
             sandbox_id,
             expected_execution_generation,
             persistence_error,
+            guest_flush_forbidden,
             fence,
+        }
+    }
+
+    pub(super) fn fallback_guest_flush(
+        &self,
+        requested: crate::db::cleanup_jobs::GuestFlush,
+    ) -> crate::db::cleanup_jobs::GuestFlush {
+        use crate::db::cleanup_jobs::GuestFlush;
+        match self {
+            Self::Unpersisted {
+                guest_flush_forbidden: true,
+                ..
+            } if requested == GuestFlush::BeforeTermination => GuestFlush::Forbidden,
+            Self::Unpersisted { .. } | Self::Persisted { .. } => requested,
         }
     }
 
@@ -1126,6 +1144,15 @@ impl SandboxManagerService {
             .map_err(|_| {
                 Status::unavailable("cleanup ownership cannot be decoded; retain resources")
             })?;
+        // Preserve an image-level exclusion before any persistence failure.
+        // Unknown lookup evidence retains the existing best-effort flush path.
+        let guest_flush_forbidden = guest_flush
+            == crate::db::cleanup_jobs::GuestFlush::BeforeTermination
+            && crate::db::read::sandbox(&db, &sandbox_id_string).is_ok_and(|row| {
+                row.is_some_and(|row| {
+                    !guest_flush_is_qualified(row.guest_image, row.execution_metadata.as_ref())
+                })
+            });
         let transaction = match if mode.requires_immediate_transaction() || require_selection_check
         {
             crate::db::Transaction::immediate(&db)
@@ -1144,6 +1171,7 @@ impl SandboxManagerService {
                     sandbox_id,
                     None,
                     Some(format!("begin cleanup admission failed: {error}")),
+                    guest_flush_forbidden,
                     fence,
                 ));
             }
@@ -1248,6 +1276,7 @@ impl SandboxManagerService {
                         Some(format!(
                             "inspect runtime generation during cleanup admission failed: {error}"
                         )),
+                        guest_flush_forbidden,
                         fence,
                     ));
                 }
@@ -1399,6 +1428,7 @@ impl SandboxManagerService {
                     sandbox_id,
                     current_execution_generation,
                     None,
+                    guest_flush_forbidden,
                     fence,
                 ));
             }
@@ -1419,6 +1449,7 @@ impl SandboxManagerService {
                     sandbox_id,
                     current_execution_generation,
                     Some(format!("claim cleanup lifecycle failed: {error}")),
+                    guest_flush_forbidden,
                     fence,
                 ));
             }
@@ -1457,6 +1488,7 @@ impl SandboxManagerService {
                 sandbox_id,
                 current_execution_generation,
                 Some(format!("persist cleanup intent failed: {error}")),
+                guest_flush_forbidden,
                 fence,
             ));
         }
@@ -1568,6 +1600,7 @@ impl SandboxManagerService {
                 sandbox_id,
                 current_execution_generation,
                 Some(format!("persist cleanup scheduling: {error}")),
+                guest_flush_forbidden,
                 fence,
             ));
         }
@@ -1582,6 +1615,7 @@ impl SandboxManagerService {
                 sandbox_id,
                 current_execution_generation,
                 Some(format!("commit cleanup admission failed: {error}")),
+                guest_flush_forbidden,
                 fence,
             ));
         }
@@ -2732,7 +2766,7 @@ impl SandboxManagerService {
         let dispatch_keep_filesystem = request.keep_filesystem;
         let dispatch_completion = request.completion;
         let dispatch_immediate_kill = request.immediate_kill;
-        let dispatch_guest_flush = request.guest_flush;
+        let dispatch_guest_flush = admission.fallback_guest_flush(request.guest_flush);
         let dispatch_context = request.context;
         self.run_cleanup_after_persistence_failure_with_node_dispatch(
             request,
@@ -2979,6 +3013,15 @@ impl SandboxManagerService {
     }
 }
 
+fn guest_flush_is_qualified(
+    image: pplx_space_common_core::types::guest_image::GuestImageContract,
+    execution: Option<&pplx_space_common_core::types::ExecutionMetadata>,
+) -> bool {
+    image.expects_agent()
+        && pplx_space_execution_catalog::guest::GuestProfile::for_existing(execution, image)
+            .is_ok_and(|profile| profile.agent_protocol().supports_filesystem_flush())
+}
+
 impl SandboxManagerService {
     /// Attempt the guest flush an ordinary stop asked for, immediately before
     /// terminating its VM. A failed flush is recorded, and the stop proceeds.
@@ -2990,10 +3033,9 @@ impl SandboxManagerService {
         if guest_flush != crate::db::cleanup_jobs::GuestFlush::BeforeTermination {
             return;
         }
-        if self
-            .lookup_sandbox(sandbox_id)
-            .is_ok_and(|sandbox| !sandbox.guest_image.expects_agent())
-        {
+        if self.lookup_sandbox(sandbox_id).is_ok_and(|sandbox| {
+            !guest_flush_is_qualified(sandbox.guest_image, sandbox.execution_metadata.as_ref())
+        }) {
             return;
         }
         let flushed = within_stop_flush_budget(

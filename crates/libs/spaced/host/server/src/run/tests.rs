@@ -1,9 +1,9 @@
 use super::*;
 
-/// The flag shape the local (non-Firecracker) node-manager passes: nothing
-/// set, so every service default must survive untouched.
+/// Omitted socket flags preserve service socket defaults; agent policy is
+/// supplied independently by the run configuration.
 #[test]
-fn empty_config_resolves_to_the_service_defaults() {
+fn empty_config_preserves_service_socket_defaults() {
     let resolved = resolve_service_config(SpacedHostRunConfig::default())
         .expect("an empty config is always valid");
     let defaults = SpacedHostServiceConfig::default();

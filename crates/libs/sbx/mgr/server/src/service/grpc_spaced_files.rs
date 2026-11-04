@@ -348,6 +348,21 @@ impl SandboxManagerService {
             None
         };
         let updates_process_env = process_env.is_some();
+        let supports_process_env = if process_env.is_some() {
+            let profile = pplx_space_execution_catalog::guest::GuestProfile::for_existing(
+                sandbox.execution_metadata.as_ref(),
+                sandbox.guest_image,
+            )
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            if !profile.supports_process_environment() && !req.process_env.is_empty() {
+                return Err(Status::failed_precondition(
+                    "guest profile does not support process environment configuration",
+                ));
+            }
+            profile.supports_process_environment()
+        } else {
+            false
+        };
         if updates_resources && (updates_owner || updates_process_env) {
             return Err(Status::invalid_argument(
                 "resource and metadata updates must be sent separately",
@@ -394,7 +409,7 @@ impl SandboxManagerService {
                     .map_err(|e| Status::internal(format!("db update_process_env: {e}")))?;
             }
             mark_sandbox_dirty(&self.db, &sandbox.id);
-            if sandbox.state == SandboxState::Started {
+            if sandbox.state == SandboxState::Started && supports_process_env {
                 configure_process_env_via_spaced_host(&sandbox.id, &process_env)
                     .await
                     .map_err(|error| {

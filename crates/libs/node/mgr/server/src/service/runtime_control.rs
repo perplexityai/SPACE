@@ -82,8 +82,8 @@ impl NodeManagerService {
         self.off_runtime("read guest profile", move || {
             recorded_artifact_in(Path::new(CACHE_DIR), &sandbox_id)?
                 .map(|metadata| {
-                    pplx_space_node_runtime_core::boot::GuestProfile::resolve(
-                        &metadata.execution,
+                    pplx_space_node_runtime_core::boot::GuestProfile::for_existing(
+                        Some(&metadata.execution),
                         metadata.guest_image(),
                     )
                     .map_err(|error| Status::failed_precondition(error.to_string()))

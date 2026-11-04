@@ -2404,6 +2404,7 @@ table inet space {
             Some(ExpectedSpacedHostPeer::new(
                 LinuxPid::try_from_u32(runtime_pid).unwrap(),
                 sandbox_uid,
+                pplx_space_common_core::types::guest_image::QualifiedGuestAgent::LinuxV1,
             )),
         )
         .unwrap();
@@ -2424,6 +2425,54 @@ table inet space {
             )
             .unwrap(),
             sandbox_uid.to_string()
+        );
+        use pplx_space_common_core::types::guest_image::QualifiedGuestAgent;
+        let program = pplx_space_common_core::host::linux::paths::SPACED_HOST_SVC_BIN;
+        require_launch_arg(&prepared, program, "--guest-agent").unwrap_err();
+        let mut ch_args = args.clone();
+        ch_args[5] = pplx_space_node_runtime_core::control::guest_socket_path(
+            pplx_space_common_core::types::RuntimeKind::CloudHypervisor,
+            sandbox_id,
+        )
+        .unwrap()
+        .display()
+        .to_string();
+        let peer = ExpectedSpacedHostPeer::new(
+            LinuxPid::try_from_u32(runtime_pid).unwrap(),
+            sandbox_uid,
+            pplx_space_common_core::types::guest_image::QualifiedGuestAgent::LinuxV1,
+        )
+        .for_runtime(pplx_space_common_core::types::RuntimeKind::CloudHypervisor)
+        .for_guest_agent(QualifiedGuestAgent::WindowsV1);
+        let native =
+            prepare_sidecar_launch_args(program, sandbox_id, &ch_args, Some(peer)).unwrap();
+        assert_eq!(
+            require_launch_arg(&native, program, "--guest-agent").unwrap(),
+            "windows-v1"
+        );
+        for injected in [
+            vec!["--guest-agent", "linux-v1"],
+            vec!["--guest-agent=linux-v1"],
+        ] {
+            let mut spoofed = ch_args.clone();
+            spoofed.extend(injected.into_iter().map(str::to_owned));
+            assert_eq!(
+                prepare_sidecar_launch_args(program, sandbox_id, &spoofed, Some(peer))
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::PermissionDenied
+            );
+        }
+        assert_eq!(
+            prepare_sidecar_launch_args(
+                program,
+                sandbox_id,
+                &ch_args,
+                Some(peer.for_guest_agent(QualifiedGuestAgent::Absent))
+            )
+            .unwrap_err()
+            .code(),
+            tonic::Code::FailedPrecondition
         );
     }
 
@@ -2452,6 +2501,7 @@ table inet space {
             Some(ExpectedSpacedHostPeer::new(
                 LinuxPid::try_from_u32(4_242).unwrap(),
                 10_042,
+                pplx_space_common_core::types::guest_image::QualifiedGuestAgent::LinuxV1,
             )),
         )
         .expect_err("node-manager must reject a caller-selected Firecracker peer");
@@ -2486,6 +2536,7 @@ table inet space {
             Some(ExpectedSpacedHostPeer::new(
                 LinuxPid::try_from_u32(runtime_pid).unwrap(),
                 sandbox_uid,
+                pplx_space_common_core::types::guest_image::QualifiedGuestAgent::LinuxV1,
             )),
         )
         .expect_err("node-manager must reject an equals-form override");
