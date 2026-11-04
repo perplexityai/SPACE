@@ -68,3 +68,36 @@ fn versions_ignore_formatting_but_not_rules() {
         PartVersion::of_script("add table netdev t\nadd rule netdev t c counter accept\n")
     );
 }
+
+#[test]
+fn stamp_comments_parse_back_to_what_was_written() {
+    let version = PartVersion::of_script("add table netdev t");
+    for part in Part::ALL {
+        assert_eq!(
+            parse_comment(&comment(part, version)),
+            Some((part, version))
+        );
+    }
+    for invalid in [
+        "nat=0123abcd",
+        "space-cfg:nat",
+        "space-cfg:natural=0123abcd",
+        "space-cfg:nat=0123ABCD",
+        "space-cfg:nat=0123abc",
+        "space-cfg:nat=0123abcde",
+        "space-cfg:nat=+123abcd",
+        "space-cfg:nat=0123abcd ",
+    ] {
+        assert_eq!(parse_comment(invalid), None, "{invalid}");
+    }
+}
+
+// PerPart builds its array in Part::ALL's order and reads it through
+// Part::index, so the two must agree.
+#[test]
+fn every_part_is_listed_once_at_its_index() {
+    for (position, part) in Part::ALL.into_iter().enumerate() {
+        assert_eq!(part.index(), position, "{part}");
+        assert_eq!(part.as_str().parse::<Part>().unwrap(), part);
+    }
+}

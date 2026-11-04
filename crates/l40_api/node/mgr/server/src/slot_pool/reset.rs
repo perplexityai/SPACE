@@ -326,15 +326,20 @@ pub(super) async fn reset_slot_with(
         }
 
         if previous_pod_netns == target_pod_netns {
-            if let Err(error) = net::reset_network_slot(&ns, &net, target_pod_netns.as_deref()) {
+            let reset = setup_pool.install_base_rules(slot_id, || {
+                net::reset_network_slot(&ns, &net, target_pod_netns.as_deref())
+            });
+            if let Err(error) = reset {
                 tracing::warn!(slot_id, error = %error, "in-place network slot reset failed; rebuilding slot");
                 setup_pool.handoff_network_namespace_with(slot_id, lease_info.generation, SlotState::Resetting, target_pod_netns.as_deref(), teardown)?;
-                net::setup_network(&ns, &net, target_pod_netns.as_deref())
+                setup_pool
+                    .install_base_rules(slot_id, || net::setup_network(&ns, &net, target_pod_netns.as_deref()))
                     .map_err(classify_network_setup_error)?;
             }
         } else {
             setup_pool.handoff_network_namespace_with(slot_id, lease_info.generation, SlotState::Resetting, target_pod_netns.as_deref(), teardown)?;
-            net::setup_network(&ns, &net, target_pod_netns.as_deref())
+            setup_pool
+                .install_base_rules(slot_id, || net::setup_network(&ns, &net, target_pod_netns.as_deref()))
                 .map_err(classify_network_setup_error)?;
         }
         validate_slot_ready(slot_id, target_pod_netns.as_deref())

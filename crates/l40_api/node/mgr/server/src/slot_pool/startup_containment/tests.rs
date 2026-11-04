@@ -29,6 +29,7 @@ fn containment_bounds_parallel_work_and_joins_before_returning() {
         let peak = Arc::new(AtomicUsize::new(0));
         let completed = Arc::new(AtomicUsize::new(0));
         let (entered, arrivals) = mpsc::channel();
+        let expected = namespaces.clone();
         let worker = {
             let (shutdown, gate, active, peak, completed) = (
                 shutdown.clone(),
@@ -70,7 +71,7 @@ fn containment_bounds_parallel_work_and_joins_before_returning() {
                                 _ => {}
                             }
                         }
-                        Ok(true)
+                        Ok(namespace.to_string())
                     },
                 )
             })
@@ -96,7 +97,8 @@ fn containment_bounds_parallel_work_and_joins_before_returning() {
         );
         assert_eq!(peak.load(Ordering::SeqCst), 3);
         match outcome {
-            Outcome::Success => assert_eq!(result.unwrap().unwrap(), 11),
+            // Results keep the namespaces' order, whichever worker ran each.
+            Outcome::Success => assert_eq!(result.unwrap().unwrap(), expected),
             Outcome::Failure => {
                 assert!(matches!(
                     result.unwrap(),

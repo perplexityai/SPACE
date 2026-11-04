@@ -14,12 +14,15 @@ mod config_stamp;
 mod host_cache;
 mod ruleset;
 
-use config_stamp::{Part, PartVersion};
+pub(crate) use config_stamp::{Part, PartState, PartVersion, PerPart, StampReading};
 pub(crate) use ruleset::NamespaceRuleset;
 
 use crate::net::{SANDBOX_SUBNET, SANDBOX_SUBNET_PREFIX_LEN};
 use pplx_space_metrics::node_manager::GuestUdp443Action;
 use pplx_space_net_common::PLATFORM_EGRESS_HARD_DENY_CIDRS;
+
+/// What a namespace's listing shows of each part's stamp.
+pub(crate) type NamespaceStamps = PerPart<StampReading>;
 
 const SPACE_TABLE: &str = "space";
 const SANDBOX_TABLE: &str = "sandbox";
@@ -76,9 +79,8 @@ const TEMPLATE_UID: u32 = 0;
 /// for the device binding, which the JSON output omits. The script ends with
 /// the part's stamp, so flushing the chain replaces the stamp too.
 fn guest_l2_ingress_policy_script() -> String {
-    let rules = guest_l2_ingress_rules_script();
-    let version = PartVersion::of_script(&rules);
-    rules + &config_stamp::script_stamp(Part::L2Ingress, version)
+    guest_l2_ingress_rules_script()
+        + &config_stamp::script_stamp(Part::L2Ingress, l2_ingress_version())
 }
 
 /// The guest L2 ingress policy without its stamp. It takes no slot or lease
@@ -310,9 +312,7 @@ fn namespace_rules_json(
     guest_ip: &str,
     pre_tproxy_guardrail_rules: &str,
 ) -> Result<String, PackagedPolicyError> {
-    let packaged: Vec<serde_json::Value> =
-        serde_json::from_str(&format!("[{pre_tproxy_guardrail_rules}]"))
-            .map_err(PackagedPolicyError)?;
+    let packaged = parse_packaged_policy(pre_tproxy_guardrail_rules)?;
     // Use "ip" family (not "inet") because snat/dnat require unambiguous address family.
     // "inet" would require "snat ip" qualifier which the JSON API doesn't support cleanly.
     let table =
@@ -322,26 +322,68 @@ fn namespace_rules_json(
         table,
         pre_tproxy_rules_json(guest_ip),
         pre_tproxy_guardrail_rules.to_string(),
-        stamp_command(
-            Part::PreTproxy,
-            json_template_version(&pre_tproxy_rules_json(crate::net::GUEST_IP)),
-        ),
+        stamp_command(Part::PreTproxy, pre_tproxy_version()),
         stamp_command(Part::PackagedPolicy, PartVersion::of_json(&packaged)),
         egress_guardrail_rules_json(),
-        stamp_command(
-            Part::EgressGuardrails,
-            json_template_version(&egress_guardrail_rules_json()),
-        ),
+        stamp_command(Part::EgressGuardrails, egress_guardrails_version()),
         nat_rules_json(vpeer, vpeer_ip, guest_ip),
-        stamp_command(
-            Part::Nat,
-            json_template_version(&nat_rules_json(
-                TEMPLATE_INTERFACE,
-                TEMPLATE_ADDRESS,
-                crate::net::GUEST_IP,
-            )),
-        ),
+        stamp_command(Part::Nat, nat_version()),
     ]))
+}
+
+/// This binary's version of every part, given the packaged policy file's
+/// commands.
+fn part_versions(packaged: &[serde_json::Value]) -> PerPart<PartVersion> {
+    PerPart::from_fn(|part| match part {
+        Part::L2Ingress => l2_ingress_version(),
+        Part::PreTproxy => pre_tproxy_version(),
+        Part::PackagedPolicy => PartVersion::of_json(packaged),
+        Part::EgressGuardrails => egress_guardrails_version(),
+        Part::Nat => nat_version(),
+        Part::Forward => forward_version(),
+        Part::Proxy => proxy_version(),
+    })
+}
+
+/// This binary's version of every part, with the packaged policy read from
+/// its file as an install reads it.
+pub(crate) fn current_part_versions() -> FirewallResult<PerPart<PartVersion>> {
+    let packaged = parse_packaged_policy(&load_pre_tproxy_guardrail_rules()?)?;
+    Ok(part_versions(&packaged))
+}
+
+fn l2_ingress_version() -> PartVersion {
+    PartVersion::of_script(&guest_l2_ingress_rules_script())
+}
+
+fn pre_tproxy_version() -> PartVersion {
+    json_template_version(&pre_tproxy_rules_json(crate::net::GUEST_IP))
+}
+
+fn egress_guardrails_version() -> PartVersion {
+    json_template_version(&egress_guardrail_rules_json())
+}
+
+fn nat_version() -> PartVersion {
+    json_template_version(&nat_rules_json(
+        TEMPLATE_INTERFACE,
+        TEMPLATE_ADDRESS,
+        crate::net::GUEST_IP,
+    ))
+}
+
+fn forward_version() -> PartVersion {
+    json_template_version(&forward_rules_json(TEMPLATE_INTERFACE))
+}
+
+/// Whether an execution has a DHCP responder is lease-scoped, so both
+/// variants of the proxy rules are one template.
+fn proxy_version() -> PartVersion {
+    json_template_version(&format!(
+        "{},\n{}",
+        netgtw_tproxy_rules(TEMPLATE_UID, false),
+        netgtw_tproxy_rules(TEMPLATE_UID, true)
+    ))
 }
 
 /// The pre-TPROXY guardrails chain and the rules this binary puts at its
@@ -538,6 +580,12 @@ fn load_pre_tproxy_guardrail_rules() -> FirewallResult<String> {
     Ok(policy.trim_end().to_string())
 }
 
+/// The packaged policy file's commands. The file holds them comma-separated,
+/// as a fragment of an nft JSON document.
+fn parse_packaged_policy(policy: &str) -> Result<Vec<serde_json::Value>, PackagedPolicyError> {
+    serde_json::from_str(&format!("[{policy}]")).map_err(PackagedPolicyError)
+}
+
 fn platform_guardrail_drop_rules_json(
     family: &str,
     table: &str,
@@ -664,16 +712,10 @@ pub fn setup_netgtw_tproxy_rules(
 }
 
 fn netgtw_tproxy_rules_json(uid: u32, dhcp: bool) -> String {
-    // Whether an execution has a DHCP responder is lease-scoped, so both
-    // variants are one template. The stamp follows the ready marker.
-    let template = format!(
-        "{},\n{}",
-        netgtw_tproxy_rules(TEMPLATE_UID, false),
-        netgtw_tproxy_rules(TEMPLATE_UID, true)
-    );
+    // The stamp follows the ready marker.
     nft_commands([
         netgtw_tproxy_rules(uid, dhcp),
-        stamp_command(Part::Proxy, json_template_version(&template)),
+        stamp_command(Part::Proxy, proxy_version()),
     ])
 }
 
@@ -905,9 +947,7 @@ pub fn validate_namespace_firewall_config(
     validate_guest_l2_ingress_chain(&guest_l2_ingress)?;
     validate_guest_l2_ingress_binding(ns)?;
     // A rollback must fence idle namespaces that still carry a newer verdict.
-    let policy = load_pre_tproxy_guardrail_rules()?;
-    let packaged: Vec<serde_json::Value> =
-        serde_json::from_str(&format!("[{}]", policy)).map_err(PackagedPolicyError)?;
+    let packaged = parse_packaged_policy(&load_pre_tproxy_guardrail_rules()?)?;
     validate_pre_tproxy_guardrails_chain(&pre_tproxy_guardrails, guest_ip, &packaged)
 }
 
@@ -1473,10 +1513,9 @@ fn ensure_namespace_forward_drop_rules(ns: &str, vpeer: &str) -> FirewallResult<
 
 /// A new forward chain: a full build of the part, so it carries the stamp.
 fn forward_build_json(vpeer: &str) -> String {
-    let version = json_template_version(&forward_rules_json(TEMPLATE_INTERFACE));
     nft_commands([
         forward_rules_json(vpeer),
-        stamp_command(Part::Forward, version),
+        stamp_command(Part::Forward, forward_version()),
     ])
 }
 

@@ -36,24 +36,32 @@ fn list_ruleset() -> (NamespaceRuleset, usize) {
     (NamespaceRuleset::parse(&output.stdout).unwrap(), stamps)
 }
 
+/// Install everything create, reset and a gateway launch install, with
+/// `policy` as the packaged policy, in a namespace with a dummy tap0.
+fn install_namespace(policy: &str) -> (String, Vec<serde_json::Value>) {
+    let tap = std::process::Command::new("ip")
+        .args(["link", "add", "tap0", "type", "dummy"])
+        .status()
+        .unwrap();
+    assert!(tap.success());
+    let install = full_install("vpeer-000000", "10.12.128.2", 12345, false, policy);
+    let (script, documents) = &install;
+    apply_nft_script(script, None).unwrap();
+    for document in documents {
+        apply_nft_json(&document.to_string(), None).unwrap();
+    }
+    install
+}
+
 #[test]
 fn full_install_lists_every_stamp_as_written() {
     if !pplx_space_test_env::root_or_skip("install nftables rules in a private network namespace") {
         return;
     }
     in_private_network_namespace(|| {
-        let tap = std::process::Command::new("ip")
-            .args(["link", "add", "tap0", "type", "dummy"])
-            .status()
-            .unwrap();
-        assert!(tap.success());
         let policy = packaged_pre_tproxy_guardrails_policy();
-        let install = full_install("vpeer-000000", "10.12.128.2", 12345, false, &policy);
-        let (script, documents) = &install;
-        apply_nft_script(script, None).unwrap();
-        for document in documents {
-            apply_nft_json(&document.to_string(), None).unwrap();
-        }
+        let install = install_namespace(&policy);
+        let script = &install.0;
         // Startup re-applies the L2 policy and each gateway launch the proxy
         // rules. Both flush their chains, so each stamp is replaced, not added.
         apply_nft_script(script, None).unwrap();
@@ -61,7 +69,7 @@ fn full_install_lists_every_stamp_as_written() {
 
         let (ruleset, stamp_count) = list_ruleset();
         let mut listed = std::collections::HashMap::new();
-        for part in every_part() {
+        for part in Part::ALL {
             let (family, table, chain) = part.stamp_chain();
             let chain = ruleset.chain(family, table, chain).unwrap();
             let rules = chain["nftables"]
@@ -89,7 +97,7 @@ fn full_install_lists_every_stamp_as_written() {
         assert_eq!(listed, written_stamps(&install));
         assert_eq!(
             stamp_count,
-            every_part().len(),
+            Part::ALL.len(),
             "a rebuilt part kept its old stamp"
         );
 
@@ -123,5 +131,38 @@ fn full_install_lists_every_stamp_as_written() {
                 .unwrap()
                 .is_empty()
         );
+    });
+}
+
+// A release that changes only the packaged policy file: its startup
+// re-applies the L2 policy, then reads only packaged_policy as stale in a
+// namespace the previous release installed.
+#[test]
+fn startup_after_a_policy_change_reads_only_that_part_stale() {
+    if !pplx_space_test_env::root_or_skip("install nftables rules in a private network namespace") {
+        return;
+    }
+    in_private_network_namespace(|| {
+        let policy = packaged_pre_tproxy_guardrails_policy();
+        install_namespace(&policy);
+        apply_nft_script(&guest_l2_ingress_policy_script(), None).unwrap();
+        let edited = policy_without_its_last_rule(&policy);
+        let packaged: Vec<serde_json::Value> =
+            serde_json::from_str(&format!("[{edited}]")).unwrap();
+        let current = part_versions(&packaged);
+        let (ruleset, _) = list_ruleset();
+        let stamps = ruleset.stamps();
+        for part in Part::ALL {
+            let expected = if part == Part::PackagedPolicy {
+                PartState::Stale
+            } else {
+                PartState::Current
+            };
+            assert_eq!(
+                PartState::of(stamps.get(part).version(), *current.get(part)),
+                expected,
+                "{part}"
+            );
+        }
     });
 }

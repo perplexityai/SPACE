@@ -750,7 +750,11 @@ pub(super) async fn create_slot(
             };
             if !repair
                 || !same_namespace
-                || net::reset_network_slot(&ns, &net, pod_netns.as_deref()).is_err()
+                || setup_pool
+                    .install_base_rules(slot_id, || {
+                        net::reset_network_slot(&ns, &net, pod_netns.as_deref())
+                    })
+                    .is_err()
             {
                 setup_pool.handoff_network_namespace(
                     slot_id,
@@ -758,7 +762,10 @@ pub(super) async fn create_slot(
                     SlotState::Creating,
                     pod_netns.as_deref(),
                 )?;
-                net::setup_network(&ns, &net, pod_netns.as_deref())
+                setup_pool
+                    .install_base_rules(slot_id, || {
+                        net::setup_network(&ns, &net, pod_netns.as_deref())
+                    })
                     .map_err(SlotCreateError::Setup)?;
             }
             validate_slot_ready(slot_id, pod_netns.as_deref()).map_err(SlotCreateError::Validation)

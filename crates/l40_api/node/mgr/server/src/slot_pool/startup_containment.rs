@@ -10,13 +10,14 @@ pub(super) const CONCURRENCY: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 
 // All namespace work finishes before the caller can activate or release its
 // service mutex. Errors do not skip other namespaces: live VMs still need their
-// containment applied even when another namespace prevents activation.
-pub(super) fn contain_namespaces(
+// containment applied even when another namespace prevents activation. On
+// success, returns each namespace's result in the order given.
+pub(super) fn contain_namespaces<T: Send>(
     namespaces: &[String],
     concurrency: NonZeroUsize,
     shutdown: &CancellationToken,
-    apply: impl Fn(&str) -> Result<bool, PoolOpenError> + Sync,
-) -> Result<usize, PoolOpenError> {
+    apply: impl Fn(&str) -> Result<T, PoolOpenError> + Sync,
+) -> Result<Vec<T>, PoolOpenError> {
     let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         let workers: Vec<_> = (0..concurrency.get().min(namespaces.len()))
@@ -26,11 +27,12 @@ pub(super) fn contain_namespaces(
                 scope.spawn(move || {
                     let _entered = span.enter();
                     let mut first_error = None;
-                    let mut contained = 0;
+                    let mut contained = Vec::new();
                     while !shutdown.is_cancelled() {
-                        let Some(namespace) = namespaces.get(next.fetch_add(1, Ordering::Relaxed)) else { break; };
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(namespace) = namespaces.get(index) else { break; };
                         match apply(namespace) {
-                            Ok(applied) => contained += usize::from(applied),
+                            Ok(result) => contained.push((index, result)),
                             Err(error) => {
                                 tracing::error!(namespace, %error, "startup network containment failed");
                                 first_error.get_or_insert(error);
@@ -41,13 +43,13 @@ pub(super) fn contain_namespaces(
                 })
             })
             .collect();
-        let mut contained = 0;
+        let mut contained = Vec::with_capacity(namespaces.len());
         let mut first_error = None;
         for worker in workers {
             // A panic unwinds this scope only after its remaining workers join.
             // The tracked pool-open task then reports failure, still under ownership.
-            let (count, error) = worker.join().expect("startup containment worker panicked");
-            contained += count;
+            let (results, error) = worker.join().expect("startup containment worker panicked");
+            contained.extend(results);
             if first_error.is_none() {
                 first_error = error;
             }
@@ -58,13 +60,18 @@ pub(super) fn contain_namespaces(
         if shutdown.is_cancelled() {
             return Err(PoolOpenError::StartupCancelled);
         }
-        Ok(contained)
+        contained.sort_unstable_by_key(|(index, _)| *index);
+        Ok(contained.into_iter().map(|(_, result)| result).collect())
     })
 }
 
-pub(super) fn contain_namespace(namespace: &str) -> Result<bool, PoolOpenError> {
+/// Contain one namespace and return the stamps its listing holds, or `None`
+/// when it has no TAP and so was not visited.
+pub(super) fn contain_namespace(
+    namespace: &str,
+) -> Result<Option<firewall::NamespaceStamps>, PoolOpenError> {
     if !net::ns_exists(namespace) {
-        return Ok(false);
+        return Ok(None);
     }
     let tap_exists =
         net::try_link_exists_in(net::TAP_DEVICE, Some(namespace)).map_err(|source| {
@@ -74,7 +81,7 @@ pub(super) fn contain_namespace(namespace: &str) -> Result<bool, PoolOpenError> 
             }
         })?;
     if !tap_exists {
-        return Ok(false);
+        return Ok(None);
     }
     let mut error = None;
     // Apply first, so the listing below shows the policy as just installed.
@@ -122,7 +129,7 @@ pub(super) fn contain_namespace(namespace: &str) -> Result<bool, PoolOpenError> 
     }
     match error {
         Some(error) => Err(error),
-        None => Ok(true),
+        None => Ok(Some(ruleset.stamps())),
     }
 }
 

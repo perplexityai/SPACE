@@ -592,6 +592,7 @@ pub struct NetworkPool {
     transient_reset_failures: DashMap<ResetKey, u32>,
     validation_transient_failures: DashMap<ValidationRetryKey, u32>,
     node_status_dirty: std::sync::Arc<dyn NodeStatusDirtySink>,
+    rule_versions: rule_versions::RuleVersions,
 }
 
 impl NetworkPool {
@@ -599,6 +600,30 @@ impl NetworkPool {
     /// sink; other node-status changes, such as the execution policy, mark here.
     pub(crate) fn mark_node_status_dirty(&self) {
         self.node_status_dirty.mark_node_status_dirty();
+    }
+
+    /// Run a create or reset of a slot's namespace rules and record whether
+    /// it completed in the slot's rule versions.
+    pub(crate) fn install_base_rules<T, E>(
+        &self,
+        slot: u32,
+        install: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        let result = install();
+        self.rule_versions.base_installed(slot, result.is_ok());
+        result
+    }
+
+    /// Run a net-gateway launch's proxy rule install and record whether it
+    /// completed in the slot's rule versions.
+    pub(crate) fn install_proxy_rules<T, E>(
+        &self,
+        slot: u32,
+        install: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        let result = install();
+        self.rule_versions.proxy_installed(slot, result.is_ok());
+        result
     }
 
     pub(crate) fn try_claim_sandbox_mutation(
@@ -743,17 +768,25 @@ impl NetworkPool {
         // the node admits work: guest L2 ingress filtering and the constrained
         // direct inbound reply path. Probe each TAP once, apply the L2 policy,
         // then list the ruleset once to check it and repair the reply path.
-        let namespaces: Vec<_> = query_records(&conn, None)
-            .map_err(SlotStoreError::from)?
-            .into_iter()
-            .map(|record| record.info.ns_name())
-            .collect();
-        startup_containment::contain_namespaces(
+        // The same listing gives each slot's rule versions.
+        let records = query_records(&conn, None).map_err(SlotStoreError::from)?;
+        let namespaces: Vec<_> = records.iter().map(|record| record.info.ns_name()).collect();
+        let stamps = startup_containment::contain_namespaces(
             &namespaces,
             startup_containment::CONCURRENCY,
             &shutdown_token,
             startup_containment::contain_namespace,
         )?;
+        let current = crate::firewall::current_part_versions()
+            .inspect_err(|error| {
+                tracing::warn!(%error, "cannot compute namespace rule versions; every slot reads unknown");
+            })
+            .ok();
+        let rule_versions = rule_versions::RuleVersions::at_startup(
+            records.iter().map(|record| record.info.slot).zip(stamps),
+            current.as_ref(),
+        );
+        rule_versions.log_stale_slots();
         let startup_leasing = query_startup_leasing(&conn)?;
         let startup_leases = query_startup_leases(&conn)?;
         backfill_active_memory_reservations(&conn, legacy_active_memory_reservation_mib)
@@ -780,6 +813,7 @@ impl NetworkPool {
             transient_reset_failures: DashMap::new(),
             validation_transient_failures: DashMap::new(),
             node_status_dirty,
+            rule_versions,
         });
         pool.enqueue_pending_resets()?;
         spawn_worker(pool.clone(), job_rx);
@@ -834,6 +868,7 @@ impl NetworkPool {
             transient_reset_failures: DashMap::new(),
             validation_transient_failures: DashMap::new(),
             node_status_dirty,
+            rule_versions: Default::default(),
         })
     }
 
@@ -1101,7 +1136,10 @@ impl NetworkPool {
                 SlotState::Leasing,
                 setup_pod_netns.as_deref(),
             )?;
-            let result = net::setup_network(&ns, &net, setup_pod_netns.as_deref())
+            let result = pool
+                .install_base_rules(slot_id, || {
+                    net::setup_network(&ns, &net, setup_pod_netns.as_deref())
+                })
                 .map_err(EphemeralSetupError::Setup)
                 .and_then(|_| {
                     validate_slot_ready(slot_id, setup_pod_netns.as_deref())
@@ -2063,6 +2101,7 @@ mod liveness;
 #[cfg(test)]
 mod node_status_tests;
 mod reset;
+mod rule_versions;
 mod scheduler;
 mod startup_containment;
 use liveness::{LeaseLiveness, lease_liveness, lease_may_be_live};

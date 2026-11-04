@@ -74,21 +74,26 @@ fn linux_containment_benchmark() {
     }
     let shutdown = CancellationToken::new();
     // Prime the already-contained restart case; alternate order to reduce cache bias.
+    let visited = |stamps: Vec<Option<_>>| stamps.iter().filter(|stamps| stamps.is_some()).count();
     assert_eq!(
-        contain_namespaces(&namespaces.0, CONCURRENCY, &shutdown, contain_namespace).unwrap(),
+        visited(
+            contain_namespaces(&namespaces.0, CONCURRENCY, &shutdown, contain_namespace).unwrap()
+        ),
         128
     );
     for round in 0..3 {
         for workers in if round % 2 == 0 { [1, 4] } else { [4, 1] } {
             let started = Instant::now();
             assert_eq!(
-                contain_namespaces(
-                    &namespaces.0,
-                    NonZeroUsize::new(workers).unwrap(),
-                    &shutdown,
-                    contain_namespace
-                )
-                .unwrap(),
+                visited(
+                    contain_namespaces(
+                        &namespaces.0,
+                        NonZeroUsize::new(workers).unwrap(),
+                        &shutdown,
+                        contain_namespace
+                    )
+                    .unwrap()
+                ),
                 128
             );
             println!(

@@ -81,8 +81,8 @@ max-threads = 8
 # router's descriptor reads use pidfd_getfd,
 # which Docker's default seccomp profile allows only with CAP_SYS_PTRACE. The
 # bootstrap-role tests each start a virgin Postgres container. The node-mgr
-# firewall stamp test installs nftables rules in a network namespace it
-# unshares.
+# firewall stamp tests install nftables rules in a network namespace they
+# unshare.
 #
 # Root halves of split tests, whose unprivileged halves run outside the group:
 # encrypted_volumes reads the published copy as uid 65534; permission_tree
@@ -136,6 +136,7 @@ or (package(pplx-space-node-mgr) and test(=service::btrfs_send_transport::tests:
 or (package(pplx-space-node-mgr) and test(=service::prepared_rootfs::tests::prepared_instance_and_clone_use_real_btrfs_subvolumes))
 or (package(pplx-space-node-mgr) and test(/::startup_containment::tests::linux::linux_containment_benchmark$/))
 or (package(pplx-space-node-mgr) and test(=firewall::tests::linux::full_install_lists_every_stamp_as_written))
+or (package(pplx-space-node-mgr) and test(=firewall::tests::linux::startup_after_a_policy_change_reads_only_that_part_stale))
 or (package(pplx-space-sbx-mgr) and test(=transfer_directory::tests::distinct_service_uids_can_exchange_downloads))
 or (package(pplx-space-credmgr) and test(=run::tests::volume_socket::real_peers_obey_volume_listener_policy))
 or (package(pplx-space-credmgr) and test(=run::volume_socket::tests::preflight_checks_real_permissions_without_replacing_live_socket))

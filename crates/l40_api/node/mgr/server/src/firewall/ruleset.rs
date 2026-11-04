@@ -2,6 +2,8 @@
 
 use serde_json::Value;
 
+use super::NamespaceStamps;
+use super::config_stamp::{self, PerPart, StampReading};
 use super::{FirewallError, FirewallResult};
 
 /// One `nft -j list ruleset` of a namespace. Startup reads several chains of
@@ -59,6 +61,38 @@ impl NamespaceRuleset {
             .cloned()
             .collect::<Vec<_>>();
         Some(serde_json::json!({ "nftables": nftables }))
+    }
+
+    /// Each part's stamp, read from the part's own chain. A part whose table
+    /// is missing has no rules at all, which is not the same as rules without
+    /// a usable stamp.
+    pub(crate) fn stamps(&self) -> NamespaceStamps {
+        PerPart::from_fn(|part| {
+            let (family, table, chain) = part.stamp_chain();
+            let table_exists = self.entries.iter().any(|entry| {
+                entry
+                    .get("table")
+                    .is_some_and(|object| object["family"] == family && object["name"] == table)
+            });
+            if !table_exists {
+                return StampReading::NoTable;
+            }
+            let mut versions = self
+                .entries
+                .iter()
+                .filter_map(|entry| entry.get("rule"))
+                .filter(|rule| {
+                    rule["family"] == family && rule["table"] == table && rule["chain"] == chain
+                })
+                .filter(|rule| config_stamp::is_stamp_rule(rule))
+                .filter_map(|rule| config_stamp::parse_comment(rule["comment"].as_str()?))
+                .filter(|(named, _)| *named == part)
+                .map(|(_, version)| version);
+            match (versions.next(), versions.next()) {
+                (Some(version), None) => StampReading::Version(version),
+                _ => StampReading::NoStamp,
+            }
+        })
     }
 }
 

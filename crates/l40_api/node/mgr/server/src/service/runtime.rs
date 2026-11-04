@@ -645,17 +645,21 @@ impl NodeManagerService {
             .emit_with(details());
             let dhcp = self.recorded_guest_network(req.sandbox_id.clone()).await?
                 == pplx_space_common_core::types::guest_image::GuestNetwork::SlotDhcpV1;
-            net::setup_tproxy(&ns_name, process_uid, &vpeer, dhcp).map_err(|e| {
-                let status = Status::internal(format!("setup tproxy failed: {e}"));
-                SandboxEvent::new(
-                    typed_sandbox_id,
-                    SandboxEventType::NetworkPolicyEnforcementFailed,
-                    SandboxEventSource::NodeManager,
-                )
-                .emit_with(details().error(status.message().to_string()));
-                emit_launch_failed(typed_sandbox_id, &req.program, status.message());
-                status
-            })?;
+            self.pool
+                .install_proxy_rules(lease.slot, || {
+                    net::setup_tproxy(&ns_name, process_uid, &vpeer, dhcp)
+                })
+                .map_err(|e| {
+                    let status = Status::internal(format!("setup tproxy failed: {e}"));
+                    SandboxEvent::new(
+                        typed_sandbox_id,
+                        SandboxEventType::NetworkPolicyEnforcementFailed,
+                        SandboxEventSource::NodeManager,
+                    )
+                    .emit_with(details().error(status.message().to_string()));
+                    emit_launch_failed(typed_sandbox_id, &req.program, status.message());
+                    status
+                })?;
             SandboxEvent::new(
                 typed_sandbox_id,
                 SandboxEventType::NetworkPolicyEnforcementCompleted,

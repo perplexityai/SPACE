@@ -1057,26 +1057,15 @@ fn guest_l2_check_ignores_config_stamps() {
     }
 }
 
-/// Every part. A new part fails to compile here until these tests cover it.
-fn every_part() -> [Part; 7] {
-    let part = |part: Part| match part {
-        Part::L2Ingress
-        | Part::PreTproxy
-        | Part::PackagedPolicy
-        | Part::EgressGuardrails
-        | Part::Nat
-        | Part::Forward
-        | Part::Proxy => part,
-    };
-    [
-        part(Part::L2Ingress),
-        part(Part::PreTproxy),
-        part(Part::PackagedPolicy),
-        part(Part::EgressGuardrails),
-        part(Part::Nat),
-        part(Part::Forward),
-        part(Part::Proxy),
-    ]
+/// The packaged policy with its last rule removed, as a release that changes
+/// only the policy file would package it.
+fn policy_without_its_last_rule(policy: &str) -> String {
+    let mut commands: Vec<serde_json::Value> =
+        serde_json::from_str(&format!("[{policy}]")).unwrap();
+    commands.pop();
+    let edited = serde_json::to_string(&commands).unwrap();
+    let edited = edited.strip_prefix('[').unwrap().strip_suffix(']').unwrap();
+    edited.to_string()
 }
 
 /// What create or reset installs in a namespace, then a gateway launch:
@@ -1107,7 +1096,7 @@ fn written_stamps(
 ) -> std::collections::HashMap<Part, String> {
     let mut stamps = std::collections::HashMap::new();
     let mut record = |comment: &str| {
-        let part = every_part()
+        let part = Part::ALL
             .into_iter()
             .find(|part| comment.starts_with(&format!("space-cfg:{part}=")))
             .unwrap_or_else(|| panic!("{comment} names no part"));
@@ -1159,7 +1148,7 @@ fn every_full_build_stamps_its_part_once_after_its_rules() {
         &packaged_pre_tproxy_guardrails_policy(),
     );
     let stamps = written_stamps(&install);
-    for part in every_part() {
+    for part in Part::ALL {
         assert!(stamps.contains_key(&part), "{part} is not stamped");
     }
 }
@@ -1183,24 +1172,37 @@ fn versions_depend_on_rules_not_slot_or_lease_values() {
     ));
     assert_eq!(stamps, other_slot);
 
-    let mut commands: Vec<serde_json::Value> =
-        serde_json::from_str(&format!("[{policy}]")).unwrap();
-    commands.pop();
-    let edited = serde_json::to_string(&commands).unwrap();
-    let edited = edited.strip_prefix('[').unwrap().strip_suffix(']').unwrap();
     let edited = written_stamps(&full_install(
         "vpeer-000000",
         "10.12.128.2",
         12345,
         false,
-        edited,
+        &policy_without_its_last_rule(&policy),
     ));
-    for part in every_part() {
+    for part in Part::ALL {
         assert_eq!(
             stamps[&part] == edited[&part],
             part != Part::PackagedPolicy,
             "{part}"
         );
+    }
+}
+
+// Startup compares stamps with these versions, so they must be the ones a
+// full install writes.
+#[test]
+fn current_versions_are_the_ones_installs_write() {
+    let policy = packaged_pre_tproxy_guardrails_policy();
+    let packaged: Vec<serde_json::Value> = serde_json::from_str(&format!("[{policy}]")).unwrap();
+    let written = written_stamps(&full_install(
+        "vpeer-000000",
+        "10.12.128.2",
+        12345,
+        false,
+        &policy,
+    ));
+    for (part, version) in part_versions(&packaged).iter() {
+        assert_eq!(written[&part], format!("space-cfg:{part}={version}"));
     }
 }
 
