@@ -201,8 +201,8 @@ async fn a_disabled_config_committed_while_the_delete_runs_is_retried_away() -> 
 
 /// An operation that finds its template still `present`, because the route's
 /// mark never committed, checks for uses before it marks the template
-/// `deleting`. A use found there fails it and leaves the template `present`,
-/// matching the 409 a same-key replay of the route gets.
+/// `deleting`. A use found there fails it with the conflict a new delete gets
+/// from the route, and leaves the template `present`.
 #[tokio::test]
 async fn an_unmarked_delete_of_a_template_in_use_leaves_it_present() -> TestResult {
     let db = pg_test_db().await?;

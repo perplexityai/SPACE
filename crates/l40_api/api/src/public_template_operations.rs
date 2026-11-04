@@ -116,17 +116,16 @@ impl DeleteTemplateOperationExecutor {
 
         if desired_state == TemplateDesiredState::Present {
             // Check before marking. The route commits the operation before
-            // its mark transaction, so this can see a `present` template for
-            // two reasons. If the route's mark failed and a use appeared
-            // before the caller's same-key replay, the replay gets the
-            // route's 409; this operation fails here and leaves the template
-            // `present`, as that 409 says, instead of marking it `deleting`
-            // and dropping its node copies. If the dispatcher claimed this
-            // operation before the route's mark ran and a use committed
-            // after the route's check, this operation fails here with the
-            // conflict, then the route's mark still sets `deleting` and
-            // answers 202; the template stays `deleting` until a new delete
-            // replaces the failed one.
+            // its mark transaction, so this can see a `present` template:
+            // the route's mark failed, or the dispatcher claimed this
+            // operation before the mark ran. A use found here fails the
+            // operation with the conflict a new delete gets from the route,
+            // and leaves the template `present` instead of marking it
+            // `deleting` and dropping its node copies. A mark that commits
+            // afterwards, from the original request or from a same-key
+            // replay sent while this operation was still active, still sets
+            // `deleting` and answers 202; the template then stays `deleting`
+            // until a new delete replaces the failed one.
             if let Some(in_use) = template_in_use(&self.pool, &template).await? {
                 return Ok(in_use_failure(operation, &template, &in_use));
             }
