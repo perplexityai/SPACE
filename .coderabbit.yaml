@@ -101,6 +101,10 @@ reviews:
           - "LICENSE"
           - "SECURITY.md"
           - "CONTRIBUTING.md"
+          # Review guidelines mapped under knowledge_base.code_guidelines.
+          - "docs/versioning.md"
+          - "docs/rust/space-conventions.md"
+          - "docs/rust/space-review-lessons.md"
       # A person approves changes to the domain and storage layers.
       # pplx-space-common-core is an l20_domain crate that has not moved into
       # crates/l20_domain yet (ARCHITECTURE.toml, rules.layers.unmoved).

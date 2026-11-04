@@ -21,10 +21,13 @@ on:
 
 permissions: {}
 
-# The newest run reads the current head itself, so a run that replaces a
-# waiting one loses nothing.
+# A run waiting in the pull request's group is replaced by the next one. The
+# newest run reads the current head itself, so that loses nothing, as long as
+# the replacing run does the work. Events the job skips (edits that do not
+# change the base) therefore get a group of their own; keep this condition the
+# same as the job's `if`.
 concurrency:
-  group: coderabbit-approval-reset-${{ github.event.pull_request.number }}
+  group: coderabbit-approval-reset-${{ github.event.pull_request.number }}-${{ (github.event.action == 'synchronize' || github.event.changes.base != null) && 'relevant' || github.run_id }}
   cancel-in-progress: false
 
 jobs:
@@ -56,9 +59,13 @@ jobs:
             --jq ".[] | select(.user.login == \"coderabbitai[bot]\"
                              and .state == \"APPROVED\"
                              and (${BASE_CHANGED} or .commit_id != \"${head}\")) | .id")"
+          # Try every review, then fail the step if any dismissal failed.
+          failed=0
           for id in ${ids}; do
             gh api --method PUT \
               "repos/${GH_REPO}/pulls/${NUMBER}/reviews/${id}/dismissals" \
               -f event=DISMISS \
-              -f message="The pull request changed after this approval. CodeRabbit approves again after it reviews the current head."
+              -f message="The pull request changed after this approval. CodeRabbit approves again after it reviews the current head." \
+              || { echo "::error::Could not dismiss CodeRabbit review ${id}"; failed=1; }
           done
+          exit "${failed}"
