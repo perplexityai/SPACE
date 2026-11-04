@@ -21,6 +21,8 @@ pub enum RuntimeArtifactReadError {
         #[source]
         source: crate::snapshot_upload::SnapshotRuntimeMetadataError,
     },
+    #[error("non-Firecracker sandbox is missing its durable execution binding")]
+    MissingBinding,
     #[error("unsupported host architecture: {0}")]
     Architecture(String),
     #[error(transparent)]
@@ -34,13 +36,6 @@ pub(super) fn host_architecture()
             RuntimeArtifactReadError::Architecture(error.to_string())
         },
     )
-}
-
-fn sandbox_artifact_metadata(
-    sandbox_id: &str,
-) -> Result<Option<pplx_space_common_core::types::SandboxArtifactMetadata>, RuntimeArtifactReadError>
-{
-    sandbox_artifact_metadata_in(std::path::Path::new(CACHE_DIR), sandbox_id)
 }
 
 fn sandbox_artifact_metadata_in(
@@ -75,17 +70,36 @@ pub(super) fn sandbox_execution_metadata_in(
 }
 
 pub(super) fn sandbox_snapshot_execution_metadata(
-    sandbox_id: &str,
+    sandbox: &crate::db::SandboxRow,
 ) -> Result<pplx_space_common_core::types::SnapshotExecutionMetadata, RuntimeArtifactReadError> {
-    use pplx_space_common_core::types::SnapshotExecutionMetadata;
-    match sandbox_artifact_metadata(sandbox_id)? {
-        Some(metadata) => Ok(SnapshotExecutionMetadata::new(metadata.execution)?
+    sandbox_snapshot_execution_metadata_in(std::path::Path::new(CACHE_DIR), sandbox)
+}
+
+pub(super) fn sandbox_snapshot_execution_metadata_in(
+    cache_dir: &std::path::Path,
+    sandbox: &crate::db::SandboxRow,
+) -> Result<pplx_space_common_core::types::SnapshotExecutionMetadata, RuntimeArtifactReadError> {
+    use pplx_space_common_core::types::{RuntimeKind, SnapshotExecutionMetadata};
+    let metadata = sandbox_artifact_metadata_in(cache_dir, &sandbox.id)?;
+    // The durable execution is authoritative; the artifact supplies allocation
+    // evidence. Only historical unbound Firecracker may use the E0 fallback.
+    let execution = match sandbox.execution_metadata.as_ref() {
+        Some(execution) => execution.clone(),
+        None if sandbox.runtime.parse::<RuntimeKind>().ok() == Some(RuntimeKind::Firecracker) => {
+            match metadata.as_ref() {
+                Some(metadata) => metadata.execution.clone(),
+                None => initial_firecracker_execution_metadata()?,
+            }
+        }
+        None => return Err(RuntimeArtifactReadError::MissingBinding),
+    };
+    let mut snapshot = SnapshotExecutionMetadata::new(execution)?;
+    if let Some(metadata) = metadata {
+        snapshot = snapshot
             .with_cpu_budget(metadata.cpu_budget)
-            .with_guest_memory(metadata.guest_memory)),
-        None => Ok(SnapshotExecutionMetadata::new(
-            initial_firecracker_execution_metadata()?,
-        )?),
+            .with_guest_memory(metadata.guest_memory);
     }
+    Ok(snapshot)
 }
 
 pub(super) fn activation_metadata_json(

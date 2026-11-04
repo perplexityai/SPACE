@@ -781,6 +781,7 @@ impl SandboxManagerService {
                 .map_err(Status::from)?;
             sandbox
         };
+        super::guest_image::require_memory_lifecycle(&sandbox)?;
         let sandbox_id_typed = sandbox
             .id
             .parse::<SandboxId>()

@@ -3262,11 +3262,7 @@ async fn restart_spaced_host(
         {
             return Err(SpacedHostRestartError::AuthorityChanged);
         }
-        pplx_space_execution_catalog::guest::GuestProfile::for_existing(
-            sandbox.execution_metadata.as_ref(),
-            sandbox.guest_image,
-        )?
-        .agent_protocol()
+        crate::service::profile_for_sandbox(&sandbox)?.agent_protocol()
     };
     if !agent.supports_process_environment() && !info.process_env.is_empty() {
         return Err(SpacedHostRestartError::UnsupportedProcessEnvironment);

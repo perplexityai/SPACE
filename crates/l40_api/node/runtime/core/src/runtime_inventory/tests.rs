@@ -1624,7 +1624,7 @@ fn bound_firmware_resolution_never_borrows_a_default_kernel() {
     let runtime = RuntimeInstallation {
         runtime: requested.runtime().clone(),
         guest: requested.guest(),
-        state_format: None,
+        state_format: requested.state_format().cloned(),
         files: RuntimeInstallationFiles::new([(
             RuntimeFileRole::RuntimeExecutable,
             "/synthetic/cloud-hypervisor".into(),

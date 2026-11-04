@@ -247,6 +247,7 @@ impl SandboxManagerService {
 
         let sandbox = self.lookup_sandbox(sandbox_id)?;
         self.authorize_template_manager_sandbox(&peer, &sandbox, "Pause")?;
+        crate::service::guest_image::require_memory_lifecycle(&sandbox)?;
         let runtime: pplx_space_common_core::types::RuntimeKind = sandbox
             .runtime
             .parse()

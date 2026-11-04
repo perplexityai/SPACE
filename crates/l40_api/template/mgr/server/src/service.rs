@@ -2553,8 +2553,21 @@ impl TemplateManagerService {
             // This lookup gates guest lifecycle semantics, not VMM admission.
             // Historical Linux templates can outlive their compiled environment;
             // exact execution qualification still occurs at launch/restore.
-            if manifest.guest_image.unwrap_or_default().legacy_transport() {
+            let runtime = build
+                .runtime
+                .parse::<pplx_space_common_core::types::RuntimeKind>()
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            if manifest.guest_image.unwrap_or_default().legacy_transport()
+                && runtime == pplx_space_common_core::types::RuntimeKind::Firecracker
+            {
                 return Ok(None);
+            }
+            if execution.is_none_or(|execution| {
+                execution.environment().is_none() || execution.runtime().kind != runtime
+            }) {
+                return Err(Status::failed_precondition(
+                    "template guest profile requires a matching execution binding",
+                ));
             }
             let profile = pplx_space_execution_catalog::guest::GuestProfile::resolve_optional(
                 execution,

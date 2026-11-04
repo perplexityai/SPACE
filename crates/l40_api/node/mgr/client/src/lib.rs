@@ -1,3 +1,7 @@
+/// A capture's waiter allows the provider's maximum 900-second memory budget
+/// plus staging overhead. Expiry does not cancel node-owned capture work.
+pub const MEMORY_CAPTURE_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(960);
+
 pub use pplx_space_node_mgr_protocol::proto;
 
 pub mod environment_selection;

@@ -7537,6 +7537,7 @@ version = "0.8.1"
 dependencies = [
  "blake3",
  "futures-util",
+ "jiff",
  "pplx-space-guest-capability",
  "pplx-space-guest-process",
  "pplx-space-spaced-guest-protocol",

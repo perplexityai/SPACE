@@ -3,7 +3,7 @@
 //! configuration and stages fresh inodes through pinned directories.
 use super::*;
 use pplx_space_common_core::types::{NodeSpacePath, RuntimeKind};
-use pplx_space_node_runtime_core::control::StateWorkspace;
+use pplx_space_node_runtime_core::{boot::BootSource, control::StateWorkspace};
 use std::io::{Read, Write};
 
 const MAX_MACHINE_STATE_BYTES: u64 = 16 * 1024 * 1024;
@@ -38,13 +38,14 @@ fn memory_file(
 
 fn configuration(
     directory: &std::fs::File,
+    boot_source: BootSource,
 ) -> Result<pplx_space_node_runtime_core::boot::StandaloneBoot, Status> {
     let bytes = read_bounded(directory, "vm-config.json")?;
     let text = std::str::from_utf8(&bytes).map_err(artifact_fs::error)?;
     pplx_space_node_runtime_core::boot::validate_standalone(
         RuntimeKind::CloudHypervisor,
         text,
-        pplx_space_node_runtime_core::boot::BootSource::LinuxDirect,
+        boot_source,
     )
     .map_err(|error| Status::failed_precondition(error.to_string()))
 }
@@ -105,6 +106,7 @@ impl NodeManagerService {
         &self,
         request: Request<StateCapture>,
         destination: CaptureDestination,
+        boot_source: BootSource,
     ) -> Result<Response<CaptureVmStateResponse>, Status> {
         if matches!(&destination, CaptureDestination::Encrypted(_)) {
             let id = request.get_ref().sandbox_id.id();
@@ -116,7 +118,7 @@ impl NodeManagerService {
                 async move {
                     let _guard = guard;
                     let result = service
-                        .capture_cloud_hypervisor_inner(request, destination)
+                        .capture_cloud_hypervisor_inner(request, destination, boot_source)
                         .await;
                     let sandbox_id = id.to_string();
                     // Stop even after a partial capture. Closing the VMM and its
@@ -144,7 +146,7 @@ impl NodeManagerService {
             )
             .await?;
         }
-        self.capture_cloud_hypervisor_inner(request, destination)
+        self.capture_cloud_hypervisor_inner(request, destination, boot_source)
             .await
     }
 
@@ -152,6 +154,7 @@ impl NodeManagerService {
         &self,
         request: Request<StateCapture>,
         destination: CaptureDestination,
+        boot_source: BootSource,
     ) -> Result<Response<CaptureVmStateResponse>, Status> {
         let req = request.into_inner();
         let (paths, mount, workspace_kind) = match destination {
@@ -174,7 +177,7 @@ impl NodeManagerService {
         let (jail, state_root, capture, boot) = self
             .off_runtime("prepare CH capture workspace", move || {
                 let jail = trusted_paths::open_directory(&root_for_prepare)?;
-                let boot = configuration(&jail)?;
+                let boot = configuration(&jail, boot_source)?;
                 let state_root = state_workspace(&jail, mount.as_ref(), uid)?;
                 let capture = workspace(&state_root, "capture", uid)?;
                 Ok((jail, state_root, capture, boot))
@@ -234,6 +237,7 @@ impl NodeManagerService {
         request: Request<StateRestore>,
         lease: &SlotInfo,
         source: RestoreSource,
+        boot_source: BootSource,
         rootfs_limiter: Option<pplx_space_common_core::types::RateLimiter>,
     ) -> Result<Response<RestoreVmStateResponse>, Status> {
         let req = request.into_inner();
@@ -272,7 +276,7 @@ impl NodeManagerService {
             .off_runtime("stage CH restore artifacts", move || {
                 let source = trusted_paths::open_directory(&source)?;
                 let jail = trusted_paths::open_directory(&root)?;
-                let mut boot = configuration(&jail)?;
+                let mut boot = configuration(&jail, boot_source)?;
                 if let Some(limiter) = rootfs_limiter {
                     boot.set_disk_rate(limiter);
                 }

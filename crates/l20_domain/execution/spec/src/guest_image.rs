@@ -155,7 +155,7 @@ pub enum QualifiedGuestAgent {
     #[default]
     Absent,
     LinuxV1,
-    /// Native Windows readiness and session-0 process/files; memory lifecycle is separate.
+    /// Native Windows readiness, memory lifecycle and session-0 process/files.
     WindowsV1,
 }
 impl QualifiedGuestAgent {
@@ -189,11 +189,11 @@ impl std::str::FromStr for QualifiedGuestAgent {
 
 impl QualifiedGuestAgent {
     pub fn supports_filesystem_flush(self) -> bool {
-        matches!(self, Self::LinuxV1)
+        matches!(self, Self::LinuxV1 | Self::WindowsV1)
     }
 
     pub fn supports_memory_lifecycle(self) -> bool {
-        matches!(self, Self::LinuxV1)
+        matches!(self, Self::LinuxV1 | Self::WindowsV1)
     }
 
     pub fn supports_process_environment(self) -> bool {

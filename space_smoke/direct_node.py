@@ -91,6 +91,13 @@ class ExecutionObservation:
     start_ticks: int
 
 
+@dataclass(frozen=True)
+class MemoryObservation:
+    nonce: str
+    pid: int
+    counter: int
+
+
 class DirectNodeRecoveryFixture:
     fixture_name = "direct-node-recovery"
     timeout_minutes = 15
@@ -128,7 +135,7 @@ class DirectNodeRecoveryFixture:
             raise RuntimeError(f"node command {arguments[0]} failed: {result.detail()}")
         return result.stdout.strip()
 
-    def prepare(self, *, firmware: bool = False) -> None:
+    def prepare_node(self, *, firmware: bool = False) -> None:
         if firmware != self.config.firmware_lifecycle:
             raise SmokeConfigurationError("scenario does not match the explicit node operation opt-in")
         self.context.verify(
@@ -205,6 +212,9 @@ class DirectNodeRecoveryFixture:
             "supervisor restart would kill its executions",
         )
         self.context.record("machine_id", self.config.machine_id)
+
+    def prepare(self, *, firmware: bool = False) -> None:
+        self.prepare_node(firmware=firmware)
         self.context.scope.defer("remove recovery sandbox", self.cleanup, critical=True)
         self.create_directory = self.command(
             ["mktemp", "-d", "/tmp/space-smoke-create.XXXXXXXXXX"]
@@ -323,6 +333,12 @@ class DirectNodeRecoveryFixture:
             try:
                 self.command(["systemctl", "is-active", *self.services])
                 self.command(["space-sbxmgr", "list"], timeout=15)
+                # systemd activation precedes node-manager's network-pool and
+                # authenticated artifact inventory recovery. Await both before
+                # issuing lifecycle calls with their shorter metadata budget.
+                self.command(["space-nodemgr", "status"], timeout=15)
+                self.command(["space-nodemgr", "environment", "--reference",
+                              self.config.environment], timeout=30)
                 return
             except (ScenarioTimedOut, SmokeConfigurationError):
                 raise
@@ -371,6 +387,85 @@ class DirectNodeRecoveryFixture:
         before = self.observe()
         self.command(["sudo", "-n", probe, "--sandbox", before.sandbox_id], timeout=150)
         self.context.verify(self.observe() == before, "execution changed during Windows operations")
+
+    def memory_marker(self, *, start: bool = False) -> MemoryObservation:
+        """A live guest process updates a nonce and counter across memory lifecycle."""
+        windows = self.config.firmware_lifecycle
+        path = (
+            rf"C:\Users\user\space-lifecycle-{self.marker}.json"
+            if windows else f"/root/space-lifecycle-{self.marker}.json"
+        )
+        host = ["sudo", "-n", "spaced-host", "--sandbox", self.owned_selector()]
+        if start:
+            if windows:
+                script = (
+                    "$ErrorActionPreference='Stop'; $nonce=[guid]::NewGuid().ToString(); $counter=0; "
+                    "while ($true) { $counter++; "
+                    "@{nonce=$nonce;pid=$PID;counter=$counter} | ConvertTo-Json -Compress | "
+                    f"Set-Content '{path}.tmp'; Move-Item '{path}.tmp' '{path}' -Force; "
+                    "Start-Sleep -Seconds 1 }"
+                )
+                arguments = ["run", "--background", "--", "powershell.exe", "-NoProfile",
+                             "-NonInteractive", "-Command", script]
+            else:
+                script = (
+                    "nonce=$(cat /proc/sys/kernel/random/uuid); counter=0; "
+                    "while :; do counter=$((counter + 1)); "
+                    "printf '{\"nonce\":\"%s\",\"pid\":%s,\"counter\":%s}' \"$nonce\" \"$$\" \"$counter\" "
+                    f"> {path}.tmp; mv {path}.tmp {path}; sleep 1; done"
+                )
+                arguments = ["run", "--background", "--user", "root", "--", "/bin/sh", "-c", script]
+            self.command(host + arguments)
+        deadline = time.monotonic() + 15
+        last_error: Exception | None = None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("guest memory marker read timed out") from last_error
+            try:
+                arguments = host + ["read", path] + ([] if windows else ["--user", "root"])
+                value = json.loads(self.command(arguments, timeout=min(10, remaining)))
+                return MemoryObservation(str(value["nonce"]), int(value["pid"]), int(value["counter"]))
+            except ScenarioTimedOut:
+                raise
+            except (RuntimeError, json.JSONDecodeError) as error:
+                last_error = error
+                if time.monotonic() >= deadline:
+                    raise
+                self.context.wait(min(0.5, max(0, deadline - time.monotonic())))
+
+    def verify_memory(self, before: MemoryObservation) -> MemoryObservation:
+        baseline = self.memory_marker()
+        self.context.verify(baseline.nonce == before.nonce and baseline.pid == before.pid,
+                            "guest process or memory nonce changed across memory lifecycle")
+        self.context.verify(baseline.counter >= before.counter,
+                            "guest memory rewound across lifecycle")
+        deadline = time.monotonic() + 15
+        while True:
+            after = self.memory_marker()
+            self.context.verify(after.nonce == before.nonce and after.pid == before.pid,
+                                "guest process or memory nonce changed across memory lifecycle")
+            if after.counter > baseline.counter:
+                return after
+            self.context.verify(time.monotonic() < deadline, "restored guest process stopped progressing")
+            self.context.wait(0.5)
+
+    def memory_lifecycle(self, action: str) -> ExecutionObservation | None:
+        if action not in ("pause", "resume", "suspend", "restore", "wake"):
+            raise SmokeConfigurationError("unsupported memory lifecycle action")
+        self.command(["space-sbxmgr", action, self.owned_selector(), "--blocking"], timeout=240)
+        state = {"pause": "paused", "suspend": "suspended"}.get(action, "started")
+        self.await_lifecycle_state(state)
+        return None if state == "suspended" else self.observe()
+
+    def automatic_memory_lifecycle(self, action: str) -> None:
+        if action not in ("pause", "suspend"):
+            raise SmokeConfigurationError("unsupported automatic memory lifecycle action")
+        self.command(["space-sbxmgr", "update", self.owned_selector(),
+                      "--idle-policy", f"{action}@5s", "--wake-on", "access"])
+        self.await_lifecycle_state({"pause": "paused", "suspend": "suspended"}[action])
+        # Disarm before wake so verification itself cannot race another idle action.
+        self.command(["space-sbxmgr", "update", self.owned_selector(), "--auto-lifecycle-off"])
 
     def crash_runtime(self, execution: ExecutionObservation) -> None:
         self.require_crash_opt_in()
@@ -460,10 +555,10 @@ class DirectNodeRecoveryFixture:
             self.context.wait(1)
         self.context.verify(False, "owned node lease remains after sandbox cleanup")
 
-    def cleanup(self) -> None:
-        # The runner grants 90 seconds for this fixture. Share one smaller
-        # deadline across all cleanup calls, retaining time for its bookkeeping.
-        deadline = time.monotonic() + 80
+    def cleanup(self, *, deadline: float | None = None) -> None:
+        # Standalone callers share their scenario cleanup budget. A single
+        # fixture otherwise fits within the runner's default 90-second reserve.
+        deadline = min(deadline, time.monotonic() + 180) if deadline is not None else time.monotonic() + 80
 
         def remaining_budget() -> float:
             remaining = deadline - time.monotonic()

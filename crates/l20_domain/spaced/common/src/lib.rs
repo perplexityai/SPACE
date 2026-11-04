@@ -215,6 +215,8 @@ pub fn allowed_guest_operations(
             LoopbackForward,
             InteractiveProcessControl,
         ],
-        QualifiedGuestAgent::WindowsV1 => &[Process, Files, InteractiveProcessControl],
+        QualifiedGuestAgent::WindowsV1 => {
+            &[Process, Files, Flush, Resume, InteractiveProcessControl]
+        }
     }
 }

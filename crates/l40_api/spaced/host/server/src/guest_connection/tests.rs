@@ -53,34 +53,50 @@ fn historical_omission_and_explicit_platforms_have_distinct_admission() {
 }
 
 #[test]
-fn windows_operations_require_trusted_os_and_cannot_grant_memory_lifecycle() {
+fn windows_operations_require_trusted_os_and_advertised_capabilities() {
     for (os, accepted) in [
         (Some(GuestOs::Windows), true),
         (Some(GuestOs::Linux), false),
         (None, false),
     ] {
-        let response = BridgeGuestWaitReadyResponse {
-            version: "0.8.0".into(),
-            compatibility_family: "0.8".into(),
-            platform: os.map(|os| {
-                pplx_space_spaced_common::proto::platform::GuestPlatformDescriptor {
-                    os: os as i32,
-                    operations: vec![GuestOperation::Process as i32, GuestOperation::Flush as i32],
+        for memory_lifecycle in [false, true] {
+            let mut operations = vec![
+                GuestOperation::Process as i32,
+                GuestOperation::ProcessEnvironment as i32,
+            ];
+            if memory_lifecycle {
+                operations.extend([GuestOperation::Flush as i32, GuestOperation::Resume as i32]);
+            }
+            let response = BridgeGuestWaitReadyResponse {
+                version: "0.8.0".into(),
+                compatibility_family: "0.8".into(),
+                platform: os.map(|os| {
+                    pplx_space_spaced_common::proto::platform::GuestPlatformDescriptor {
+                        os: os as i32,
+                        operations,
+                    }
+                }),
+                ..Default::default()
+            };
+            assert!(
+                GuestPlatformObservation::parse(&response, QualifiedGuestAgent::default()).is_err(),
+                "an omitted policy must not authorize guest claims"
+            );
+            let result = GuestPlatformObservation::parse(&response, QualifiedGuestAgent::WindowsV1);
+            assert_eq!(result.is_ok(), accepted);
+            if let Ok(platform) = result {
+                platform
+                    .require(GuestOperation::Process, None)
+                    .expect("qualified process operation");
+                for operation in [GuestOperation::Flush, GuestOperation::Resume] {
+                    assert_eq!(platform.require(operation, None).is_ok(), memory_lifecycle);
                 }
-            }),
-            ..Default::default()
-        };
-        assert!(
-            GuestPlatformObservation::parse(&response, QualifiedGuestAgent::default()).is_err(),
-            "an omitted policy must not authorize guest claims"
-        );
-        let result = GuestPlatformObservation::parse(&response, QualifiedGuestAgent::WindowsV1);
-        assert_eq!(result.is_ok(), accepted);
-        if let Ok(platform) = result {
-            platform
-                .require(GuestOperation::Process, None)
-                .expect("qualified process operation");
-            assert!(platform.require(GuestOperation::Flush, None).is_err());
+                assert!(
+                    platform
+                        .require(GuestOperation::ProcessEnvironment, None)
+                        .is_err()
+                );
+            }
         }
     }
 }

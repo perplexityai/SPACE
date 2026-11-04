@@ -856,6 +856,13 @@ impl SandboxManagerService {
         // Admission reuses the clone's channel, with its own 5 second budget
         // like connect and capability lookup, since the donor stays fenced.
         let execution = donor.execution_metadata.as_ref();
+        if execution.is_none()
+            && donor.runtime.parse::<RuntimeKind>().ok() != Some(RuntimeKind::Firecracker)
+        {
+            return Err(Status::failed_precondition(
+                "pool donor is missing its execution binding",
+            ));
+        }
         if let Some(execution) = execution {
             tokio::time::timeout(
                 Duration::from_secs(5),
@@ -865,6 +872,47 @@ impl SandboxManagerService {
             .map_err(|_| Status::unavailable("pool donor environment admission timed out"))??;
         }
 
+        // The donor has run since its base was restored (or was cold-booted).
+        // Pair its current disk with fresh RAM while its pause and cleanup
+        // fences are held; copying the original base RAM would rewind only
+        // half of the guest. A failed capture allocates no child resources.
+        let checkpoint = self.cache_root().join(donor_id).join("snapshot");
+        std::fs::create_dir_all(&checkpoint)
+            .map_err(|error| Status::internal(format!("prepare donor checkpoint: {error}")))?;
+        tokio::time::timeout(
+            pplx_space_node_mgr_client::MEMORY_CAPTURE_WAIT_TIMEOUT + Duration::from_secs(30),
+            node_client.capture_vm_state(super::snapshot_capture::bind(
+                pplx_space_node_mgr_client::proto::CaptureVmStateRequest {
+                    sandbox_id: donor_id.clone(),
+                    execution_fence: donor.node_execution_fence(),
+                    artifacts: super::snapshot_capture::artifacts(),
+                    storage: Some(pplx_space_node_mgr_client::proto::VmStateStorage {
+                        directory: Some(checkpoint.to_string_lossy().into_owned()),
+                        encrypted_volume_mount: None,
+                    }),
+                    environment_reference: None,
+                },
+                execution,
+            )),
+        ).await.map_err(|_| {
+            tracing::warn!(sandbox_id = %donor_id, "pool donor capture waiter timed out; node still owns unfinished work");
+            Status::deadline_exceeded("capture current pool donor timed out; unfinished capture remains fenced")
+        })?
+            .map_err(|error| {
+                tracing::warn!(sandbox_id = %donor_id, %error, "capture current pool donor failed");
+                Status::new(error.code(), format!("capture current pool donor failed: {}", error.message()))
+            })?;
+        let snapshot_execution =
+            super::tail_support::sandbox_snapshot_execution_metadata_in(self.cache_root(), &donor)
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        let bytes = serde_json::to_vec(&snapshot_execution).map_err(|error| {
+            Status::internal(format!("encode donor checkpoint identity: {error}"))
+        })?;
+        crate::snapshot_scheduler::write_file_atomic(checkpoint.join("runtime.json"), &bytes)
+            .map_err(|error| {
+                Status::internal(format!("write donor checkpoint identity: {error}"))
+            })?;
+
         let cleanup_id = SandboxCleanupEpisodeId::new();
         // Arm disposal before any node resources can be created.
         {
@@ -872,7 +920,7 @@ impl SandboxManagerService {
             crate::db::insert_sandbox_with_cleanup_episode_and_route_evidence(
                 &db,
                 crate::db::InsertSandboxParams {
-                    guest_image: Default::default(),
+                    guest_image: donor.guest_image,
                     id: &new_id,
                     uuid8: &uuid8,
                     state: SandboxState::Creating,
@@ -918,7 +966,7 @@ impl SandboxManagerService {
                 )?;
             }
             use std::os::unix::fs::MetadataExt;
-            let prepared = prepare_clone_root(Path::new(CACHE_DIR), &new_id).map_err(|error| {
+            let prepared = prepare_clone_root(self.cache_root(), &new_id).map_err(|error| {
                 Status::failed_precondition(format!("prepare clone destination: {error}"))
             })?;
             let identity = prepared

@@ -114,6 +114,7 @@ def _run(scenario_id: str) -> int:
         title=scenario.title,
         body=lambda context: scenario.run(context, services),
         timeout_seconds=scenario.timeout_minutes * 60,
+        cleanup_timeout_seconds=scenario.cleanup_timeout_seconds,
     )
     print(f"{result.verdict.value.upper()}: {result.summary}", flush=True)
     for diagnostic in result.diagnostics:

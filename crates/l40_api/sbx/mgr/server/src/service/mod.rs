@@ -2087,6 +2087,7 @@ mod create;
 mod create_support;
 mod guest_image;
 pub(crate) use create_support::template_lookup_scope;
+pub(crate) use guest_image::profile_for_sandbox;
 pub(crate) mod drain;
 mod eviction;
 pub(crate) mod snapshot_capture;

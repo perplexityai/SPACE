@@ -67,6 +67,12 @@ repeated suspend/restore, and manager restarts both while suspended and after
 restore. Disk and RAM markers plus guest boot identity distinguish restoration
 from a cold boot; blocking guest readiness checks the restored vsock transport.
 
+`node.windows_memory_lifecycle` exercises manual and automatic pause/suspend,
+wake, live-process continuity, SSH and native process/file operations on a
+standalone Windows guest. It requires `SPACE_SMOKE_NODE_RECOVERY=firmware-lifecycle`
+and `SPACE_SMOKE_WINDOWS_OPERATIONS_PROBE` pointing to the matching built probe.
+It does not restart managers. Use the same pinned node and template inputs.
+
 ## Fork coverage
 
 The typed suite owns the public fork smoke coverage:
@@ -99,6 +105,24 @@ including the credentials, without writing those credentials into evidence.
 Scenario phase timings report runtime without a flaky latency assertion.
 The fork scenarios' shard-duration hints are Kind CI medians, like the rest
 (`space_smoke/sharding.py` names the runs); refresh them all together.
+
+## Standalone base memory
+
+`node.runtime_base_memory` and `node.windows_base_memory` use the standalone
+node inputs above to qualify template memory and pools. The Windows scenario
+requires the `firmware-lifecycle` opt-in and the native operations probe used
+by `node.windows_memory_lifecycle`. Both require an idle worker. They copy the
+pinned input into a uniquely named local test template, build a base snapshot,
+restore siblings, and verify that one sibling's suspend/restore preserves its
+process while the other continues independently. They then fill and claim both
+snapshot-seeded and cold-seeded pools, and delete their own templates and
+sandboxes. These scenarios reserve ten minutes of their 25-minute runner budget
+for cleanup, including sequential firmware shutdowns. Cleanup disables pool
+refill first, shares one deadline, propagates runner timeouts and verifies that
+owned sandboxes are absent after template deletion. A failed or interrupted run
+can still require manual cleanup of the reported run-owned resources before
+the next idle-node check succeeds. These scenarios do not change the source
+template's policies.
 
 ## Opt-in fork pressure
 

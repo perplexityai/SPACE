@@ -601,7 +601,10 @@ async fn a_requested_id_retry_reuses_only_a_row_with_the_selected_binding() {
 /// binding, and a non-default one must still be executed by the node.
 #[tokio::test]
 async fn a_pool_clone_saves_and_admits_its_donors_binding() {
-    use pplx_space_node_mgr_client::proto::{CloneCapabilitiesRequest, CloneCapabilitiesResponse};
+    use pplx_space_node_mgr_client::proto::{
+        CaptureVmStateRequest, CaptureVmStateResponse, CloneCapabilitiesRequest,
+        CloneCapabilitiesResponse,
+    };
     const CLONE_EXECUTION: &str = "clone execution: ";
     if !enter_isolated_test_process() {
         return;
@@ -620,18 +623,23 @@ async fn a_pool_clone_saves_and_admits_its_donors_binding() {
         // what the clone saves and what the node is asked to admit.
         let other = if name == UPGRADE { "e0" } else { UPGRADE };
         let build = bound_template(&bound(&definition(other)));
-        let fixture = Fixture::new(
+        let capture_environment = (name == UPGRADE).then(|| environment.reference().to_string());
+        let mut fixture = Fixture::new(
             conn,
             build.resolver(BUILD),
-            node_manager(&environment, node).unary(
-                "GetCloneCapabilities",
-                |_: CloneCapabilitiesRequest| {
+            node_manager(&environment, node)
+                .unary("GetCloneCapabilities", |_: CloneCapabilitiesRequest| {
                     Ok(CloneCapabilitiesResponse {
                         prepared_clone_disposal: true,
                     })
-                },
-            ),
+                })
+                .unary("CaptureVmState", move |request: CaptureVmStateRequest| {
+                    assert_eq!(request.environment_reference, capture_environment);
+                    Ok(CaptureVmStateResponse {})
+                }),
         );
+        let cache = tempfile::tempdir().unwrap();
+        fixture.service.create_cache_dir = Some(cache.path().to_owned());
         // Stop at the clone row's binding write and report what it saved.
         fixture
             .service
@@ -674,6 +682,15 @@ async fn a_pool_clone_saves_and_admits_its_donors_binding() {
                 "{context}: {error}"
             );
         } else {
+            let checkpoint: SnapshotExecutionMetadata = serde_json::from_slice(
+                &std::fs::read(cache.path().join(&donor).join("snapshot/runtime.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                checkpoint.execution(),
+                &execution,
+                "{context}: checkpoint binding"
+            );
             let (_, saved) = error
                 .message()
                 .split_once(CLONE_EXECUTION)

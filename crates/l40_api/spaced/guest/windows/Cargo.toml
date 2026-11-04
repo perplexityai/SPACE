@@ -11,6 +11,7 @@ publish.workspace = true
 workspace = true
 
 [target.'cfg(windows)'.dependencies]
+jiff = { workspace = true }
 pplx-space-guest-capability = { workspace = true }
 pplx-space-spaced-guest-protocol = { workspace = true }
 pplx-space-guest-process = { workspace = true }

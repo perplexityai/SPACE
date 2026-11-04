@@ -676,10 +676,58 @@ class M1Conformance:
         kwargs: dict[str, object] = {"_request_timeout": (10, self.timeout)}
         if last_event_id is not None:
             kwargs["last_event_id"] = last_event_id
-        stream = api.stream_session_events_without_preload_content(session_id, **kwargs)
+        deadline = time.monotonic() + min(self.timeout, 10)
+        last_conflict: str | None = None
+        while True:
+            if last_event_id is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise InvariantViolation(last_conflict or "session event reconnect exceeded its retry deadline")
+                kwargs["_request_timeout"] = (min(10, remaining), min(self.timeout, remaining))
+            try:
+                stream = api.stream_session_events_without_preload_content(session_id, **kwargs)
+            except urllib3.exceptions.TimeoutError as error:
+                if last_conflict is not None and time.monotonic() >= deadline:
+                    raise InvariantViolation(last_conflict) from error
+                raise
+            if stream.status == 200:
+                break
+            try:
+                body = stream.read()
+            finally:
+                stream.close()
+            try:
+                envelope = json.loads(body)
+            except ValueError:
+                envelope = None
+            error = envelope.get("error") if isinstance(envelope, dict) else None
+            # Closing an HTTP stream does not synchronously release the server's
+            # single-attacher permit. Retry only its explicit reconnect conflict.
+            if (
+                last_event_id is not None
+                and stream.status == 409
+                and isinstance(error, dict)
+                and error.get("code") == "conflict"
+                and error.get("retryable") is True
+                and time.monotonic() < deadline
+            ):
+                last_conflict = f"session event reconnect deadline exhausted after HTTP 409: {body[:500]!r}"
+                time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+                if time.monotonic() < deadline:
+                    continue
+            message = f"session event stream answered HTTP {stream.status}: {body[:500]!r}"
+            if transient_infrastructure(stream.status, body):
+                raise urllib3.exceptions.HTTPError(message)
+            raise InvariantViolation(message)
         result = SessionRead()
         first = True
         try:
+            # Bound response headers by the reconnect window, then restore
+            # the normal idle timeout for this raw urllib3 event stream.
+            if last_event_id is not None:
+                connection = stream.connection
+                if connection is not None and connection.sock is not None:
+                    connection.sock.settimeout(self.timeout)
             for event in iter_sse_events(stream):
                 frame = cast(dict[str, object], event["data"])
                 frame_id = cast(int | None, event["id"])

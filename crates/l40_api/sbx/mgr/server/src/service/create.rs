@@ -215,6 +215,7 @@ impl SandboxManagerService {
         sandbox: &crate::db::SandboxRow,
         operation: &'static str,
     ) -> Result<(), Status> {
+        super::guest_image::require_memory_lifecycle(sandbox)?;
         if sandbox
             .execution_metadata
             .as_ref()
@@ -339,7 +340,7 @@ impl SandboxManagerService {
                 || req.pool_template.is_some()
                 || effective_mode != BootMode::Cold)
         {
-            return Err(Status::failed_precondition(
+            return Err(super::guest_image::memory_lifecycle_unsupported(
                 "guest profile requires cold boot without snapshots or pools",
             ));
         }
@@ -1456,19 +1457,7 @@ impl SandboxManagerService {
             volume_encryption: sandbox.volume_encryption,
         });
         self.watchdog
-            .add_sandbox(crate::watchdog::SidecarInfo {
-                guest_image: Default::default(),
-                node_execution_id: Some(execution_fence.current()),
-                sandbox_id: id.clone(),
-                uid: Some(sbx_uid),
-                runtime_pid: Some(pid),
-                spaced_host_pid: Some(spaced_host_resp.pid),
-                netgtw_pid: Some(netgtw_resp.pid),
-                vsock_uds_path: Some(vsock_uds_path.clone()),
-                process_env: sandbox.process_env.clone(),
-                network_tx_bytes: sandbox.network_tx_bytes,
-                network_rx_bytes: sandbox.network_rx_bytes,
-            })
+            .rearm_sandbox_from_db(id)
             .instrument(tracing::info_span!(
                 "sbxmgr.restore.watchdog.add_sandbox",
                 sandbox_id = %id

@@ -269,53 +269,68 @@ fn rejects_traversal_and_degenerate_components() {
     assert!(validate_cache_artifact_path("/other/root/foo").is_err());
 }
 
-/// Finding 1: the capture runs bind -> FC -> unmount as one detached unit via
-/// `run_detached`, so a deadline-cancelled caller cannot leave a created mount
-/// unowned. This models that ordering: the caller's await is dropped WHILE the
-/// body is between "mount created" and "unmounted", and the detached body must
-/// still run to completion and leave nothing mounted.
-#[tokio::test]
+/// A timed-out RPC must not release the capture's ownership before its actual
+/// work completes. This uses the same wait boundary as capture_runtime_state.
+#[tokio::test(start_paused = true)]
 async fn detached_capture_finishes_its_cleanup_after_the_caller_cancels() {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::time::Duration;
-
-    let mounts = Arc::new(AtomicUsize::new(0));
-    let done = Arc::new(AtomicBool::new(false));
-    let body = {
-        let mounts = Arc::clone(&mounts);
-        let done = Arc::clone(&done);
-        super::run_detached(
-            tokio_util::task::TaskTracker::new(),
-            "test-capture",
-            async move {
-                mounts.fetch_add(1, Ordering::SeqCst); // bind created
-                tokio::time::sleep(Duration::from_millis(30)).await; // uncancellable work
-                mounts.fetch_sub(1, Ordering::SeqCst); // always unmounted by the same unit
-                done.store(true, Ordering::SeqCst);
-                Ok::<(), tonic::Status>(())
-            },
-        )
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
     };
-
-    // The caller is cancelled (deadline) mid-body: drop its await.
-    tokio::time::timeout(Duration::from_millis(1), body)
+    let mounts = Arc::new(AtomicUsize::new(0));
+    let tracker = tokio_util::task::TaskTracker::new();
+    let (release, pending) = tokio::sync::oneshot::channel();
+    let observed = mounts.clone();
+    let body = super::run_detached(tracker.clone(), "test capture", async move {
+        observed.fetch_add(1, Ordering::SeqCst);
+        pending.await.unwrap();
+        observed.fetch_sub(1, Ordering::SeqCst);
+        Ok::<_, tonic::Status>(())
+    });
+    let error = super::wait_for_capture(async { body.await? })
         .await
-        .expect_err("caller should be cancelled by the timeout");
-
-    // The detached unit still runs to completion and leaves no mount behind.
-    for _ in 0..200 {
-        if done.load(Ordering::SeqCst) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    assert!(done.load(Ordering::SeqCst), "detached cleanup did not run");
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
     assert_eq!(
         mounts.load(Ordering::SeqCst),
-        0,
-        "a cancelled caller left a mount owned by no one"
+        1,
+        "capture lost its owner at the caller deadline"
     );
+    release.send(()).unwrap();
+    tracker.close();
+    tracker.wait().await;
+    assert_eq!(mounts.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn snapshot_dispatch_uses_the_recorded_boot_contract() {
+    use pplx_space_common_core::types::Arch;
+    use pplx_space_node_runtime_core::{boot::BootSource, catalog::CompiledEnvironment};
+    let catalog = CompiledEnvironment::for_architecture(Arch::X86_64).unwrap();
+    for (name, expected) in [
+        ("e0", None),
+        ("ch-54.0-linux-7.2.8", Some(BootSource::LinuxDirect)),
+        ("ch-54.0-windows-uefi", Some(BootSource::Uefi)),
+    ] {
+        let environment = catalog.iter().find(|entry| entry.name() == name).unwrap();
+        let execution = environment.definition().execution_requirements().unwrap();
+        assert_eq!(
+            super::snapshot_boot_source(Some(&execution)).unwrap(),
+            expected
+        );
+        if expected.is_some() {
+            let mut retired = serde_json::to_value(execution).unwrap();
+            retired["environment"] = serde_json::json!(format!("sha256:{}", "a".repeat(64)));
+            let retired = serde_json::from_value(retired).unwrap();
+            assert_eq!(
+                super::snapshot_boot_source(Some(&retired))
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::FailedPrecondition
+            );
+        }
+    }
+    assert_eq!(super::snapshot_boot_source(None).unwrap(), None);
 }
 
 // A Firecracker API that accepts the connection and never answers fails the

@@ -223,13 +223,15 @@ async fn unpersisted_admission_preserves_flush_qualification_after_row_loss() {
         GuestAgent::Spaced,
     )
     .unwrap();
-    for (image, runtime, expected) in [
+    for (image, runtime, bound, expected) in [
         (
             GuestImageContract::default(),
             "fc",
+            false,
             GuestFlush::BeforeTermination,
         ),
-        (windows, "ch", GuestFlush::Forbidden),
+        (windows, "ch", true, GuestFlush::BeforeTermination),
+        (windows, "ch", false, GuestFlush::Forbidden),
     ] {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new();
@@ -243,7 +245,7 @@ async fn unpersisted_admission_preserves_flush_qualification_after_row_loss() {
             },
             |params| crate::db::insert_sandbox(&conn, params).unwrap(),
         );
-        if image == windows {
+        if bound {
             let environments =
                 pplx_space_execution_catalog::catalog::CompiledEnvironment::for_architecture(
                     pplx_space_common_core::types::Arch::X86_64,
