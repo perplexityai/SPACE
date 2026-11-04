@@ -1341,6 +1341,30 @@ async fn delete_is_refused_while_the_template_is_in_use() -> TestResult {
     Ok(())
 }
 
+/// The use check reads on the delete's idempotency admission transaction, so
+/// a refused delete needs one connection: on a one-connection pool it still
+/// answers 409 instead of waiting for a second connection.
+#[tokio::test]
+async fn an_in_use_refusal_needs_one_connection() -> TestResult {
+    let db = pg_test_db().await?;
+    let template = TemplateName::parse("in-use-one-connection")?;
+    insert_template(&db.pool, &template).await?;
+    insert_release(&db.pool, &template, 0x50).await?;
+    insert_policy(&db.pool, &template, true).await?;
+    let one_connection = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(2))
+        .connect(&db.database_url)
+        .await?;
+    let state = AppState::from_pool(one_connection).await?;
+
+    let (status, body) = request_template_delete(&state, &template, "one-connection").await?;
+
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["details"][0]["value"], "template_in_use", "{body}");
+    Ok(())
+}
+
 /// A use that appears after the delete was accepted fails its operation for
 /// good with the same refusal instead of retrying, and the template stays
 /// `deleting`. An enabled policy holds no release key, so only the

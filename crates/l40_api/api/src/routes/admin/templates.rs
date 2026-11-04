@@ -57,7 +57,7 @@ use crate::{
         OperationPathTemplate, PublicOperationStore, PublicOperationStoreError,
         ResponseReservation,
     },
-    public_template_operations::{DeleteTemplateOperationPayload, template_in_use},
+    public_template_operations::{DeleteTemplateOperationPayload, TemplateInUse},
     reconcile_queue::{ReconcileFacet, ReconcileRef, enqueue_node_reconcile_refs_for_nodes_tx},
     reconcile_trigger::enqueue_triggers_tx,
     routes::{
@@ -1111,7 +1111,7 @@ pub async fn delete_template(
         request_fingerprint: &fingerprint,
     };
     let store = PublicOperationStore::new(state.pool.clone());
-    let admission = match store
+    let mut admission = match store
         .begin_operation_admission(managing_org_id, ApiProduct::Admin, &idempotency)
         .await
     {
@@ -1130,12 +1130,13 @@ pub async fn delete_template(
     // template `deleting`: the operation cannot delete releases that warm
     // pools still hold. It checks again for a use that appears after this
     // read. A replayed or conflicting key answers as it did the first time,
-    // whatever uses the template now.
+    // whatever uses the template now. The check reads on the admission's
+    // transaction, so a request holds one connection, not two.
     if matches!(
         admission.observation(),
         ObservePublicOperationIdempotency::Missing
     ) {
-        match template_in_use(&state.pool, &template_name).await {
+        match TemplateInUse::check(&mut **admission.transaction(), &template_name).await {
             Ok(None) => {}
             Ok(Some(in_use)) => {
                 return api_error_with_details(
