@@ -1,0 +1,63 @@
+name: CodeRabbit approval reset
+
+# Dismisses every CodeRabbit approval when new commits arrive or the base
+# branch changes. The main branch rules keep approvals across pushes, and
+# CodeRabbit withdraws its own approval only when it reviews a newer commit, so
+# without this an approval given for one commit could still count for the
+# next one, for example while reviews are paused. CodeRabbit approves again
+# after it reviews the new head. Approvals from people are not touched.
+#
+# Every run does the same thing, so the order of runs does not matter. If
+# CodeRabbit approves the new head before the run starts, the run dismisses
+# that approval too, and the pull request needs a person or another push.
+#
+# pull_request_target runs with a write token even for pull requests from
+# forks, so this workflow must stay inert toward contributor content: it never
+# checks out, builds, or runs pull request code, and it never places titles,
+# bodies, branch names, or other contributor-controlled text in a shell
+# command. It uses only the pull request number, the repository name, and the
+# review IDs, authors, and states that the API returns.
+
+on:
+  pull_request_target:
+    types: [synchronize, edited]
+
+permissions: {}
+
+# Runs for one pull request do not overlap, so two runs never dismiss the
+# same review. Edits that do not change the base skip the job, so they get a
+# group of their own and cannot replace a waiting run.
+concurrency:
+  group: coderabbit-approval-reset-${{ github.event.pull_request.number }}-${{ (github.event.action == 'synchronize' || github.event.changes.base != null) && 'relevant' || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  dismiss:
+    if: >-
+      github.repository == 'perplexityai/SPACE' &&
+      (github.event.action == 'synchronize' || github.event.changes.base != null)
+    name: Dismiss CodeRabbit's approval
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Dismiss CodeRabbit's approvals
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          ids="$(gh api --paginate "repos/${GH_REPO}/pulls/${NUMBER}/reviews" \
+            --jq '.[] | select(.user.login == "coderabbitai[bot]" and .state == "APPROVED") | .id')"
+          # Try every review, then fail the step if any dismissal failed.
+          failed=0
+          for id in ${ids}; do
+            gh api --method PUT \
+              "repos/${GH_REPO}/pulls/${NUMBER}/reviews/${id}/dismissals" \
+              -f event=DISMISS \
+              -f message="The pull request changed after this approval. CodeRabbit approves again after it reviews the current head." \
+              || { echo "::error::Could not dismiss CodeRabbit review ${id}"; failed=1; }
+          done
+          exit "${failed}"
