@@ -946,13 +946,13 @@ fn terminal_sandbox_state(native: &SandboxResponse) -> Option<TerminalSandboxSta
     ecw_terminal_state(&native.state_input)
 }
 
-/// The lifecycle both ECW renders read.
+/// The lifecycle both ECW renders read, so the list, get and connect paths
+/// agree on every terminal and at-rest row.
 fn ecw_lifecycle(state: &SandboxStateInput) -> String {
-    // The node's observed status wins over the stored lifecycle; a sandbox
-    // with neither reads as started.
+    // A sandbox with neither a stored lifecycle nor an observed status reads
+    // as started.
     state
-        .observed_status()
-        .or(state.stored_lifecycle())
+        .rendered_lifecycle()
         .unwrap_or("started")
         .trim()
         .to_ascii_lowercase()
@@ -963,9 +963,12 @@ pub(super) fn translate_lifecycle_state(lifecycle: &str) -> Option<SandboxStateE
     ecw_sandbox_state(&SandboxStateInput::stored(lifecycle))
 }
 
-/// The ECW state: `None` hides a stopped or failed sandbox, and every
-/// lifecycle ECW does not name reads as running.
+/// The ECW state: `None` hides a stopped, failed or deleted sandbox, and
+/// every other lifecycle ECW does not name reads as running.
 fn ecw_sandbox_state(state: &SandboxStateInput) -> Option<SandboxStateE2b> {
+    if state.is_tombstone() {
+        return None;
+    }
     match ecw_lifecycle(state).as_str() {
         "paused" | "suspended" => Some(SandboxStateE2b::Paused),
         "stopped" | "failed" | "quarantined" => None,
@@ -973,9 +976,12 @@ fn ecw_sandbox_state(state: &SandboxStateInput) -> Option<SandboxStateE2b> {
     }
 }
 
-/// Whether ECW reports a terminal sandbox as failed, or as stopped and so
-/// not found.
+/// Whether ECW reports a terminal sandbox as failed, or as stopped or
+/// deleted and so not found.
 fn ecw_terminal_state(state: &SandboxStateInput) -> Option<TerminalSandboxState> {
+    if state.is_tombstone() {
+        return Some(TerminalSandboxState::Stopped);
+    }
     match ecw_lifecycle(state).as_str() {
         "failed" | "quarantined" => Some(TerminalSandboxState::Failed),
         "stopped" => Some(TerminalSandboxState::Stopped),
