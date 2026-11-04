@@ -57,7 +57,7 @@ impl Process for SpacedHostService {
         &self,
         request: Request<StartRequest>,
     ) -> Result<Response<Self::StartStream>, Status> {
-        let request = bridge_process_start_request(request.into_inner())
+        let request = bridge_process_start_request(request.into_inner(), self.inner.guest_agent)
             .map_err(pplx_space_common_grpc::mark_guest_process_error)?;
         let guest_stream = self
             .call_bridge_guest_process(

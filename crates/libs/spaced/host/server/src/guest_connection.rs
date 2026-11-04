@@ -4,6 +4,7 @@ use pplx_space_common_core::types::guest_image::QualifiedGuestAgent;
 use pplx_space_common_grpc::{GuestCapability, guest_capability_unsupported_status};
 use pplx_space_spaced_common::proto::platform::GuestOs;
 
+/// Readiness probes and teardown must work before operation negotiation.
 #[derive(Clone, Copy)]
 pub(super) enum Requirement {
     Probe,
@@ -47,8 +48,8 @@ impl<C> OperationClient<C> {
             ),
         };
         match self.policy {
-            QualifiedGuestAgent::LinuxV1 => {}
-            QualifiedGuestAgent::Absent | QualifiedGuestAgent::WindowsV1 => {
+            QualifiedGuestAgent::LinuxV1 | QualifiedGuestAgent::WindowsV1 => {}
+            QualifiedGuestAgent::Absent => {
                 return Err(guest_capability_unsupported_status(
                     GuestCapability::PlatformOperations,
                     "image has no qualified guest operations",
@@ -134,7 +135,7 @@ impl GuestPlatformObservation {
             }
         };
         let mut interactive_upgrade_version = None;
-        let mut wire = match &response.platform {
+        let wire = match &response.platform {
             Some(wire) => wire.clone(),
             // SPACED_COMPAT_REMOVE_WHEN_MIN_GUEST_0_8_1: Linux through 0.8.0 may omit the descriptor.
             None if expected == GuestOs::Linux
@@ -163,11 +164,15 @@ impl GuestPlatformObservation {
                 ));
             }
         };
-        // Peer claims cannot widen the trusted image's qualification.
-        match policy {
-            QualifiedGuestAgent::LinuxV1 => {}
-            QualifiedGuestAgent::WindowsV1 | QualifiedGuestAgent::Absent => wire.operations.clear(),
-        }
+        // Bound the received descriptor before filtering disallowed claims.
+        let mut wire =
+            pplx_space_spaced_common::platform::GuestPlatform::parse(wire, expected)?.wire();
+        // Both explicit claims and version-derived capabilities obey image policy.
+        wire.operations.retain(|raw| {
+            GuestOperation::try_from(*raw).is_ok_and(|operation| {
+                pplx_space_spaced_common::allowed_guest_operations(policy).contains(&operation)
+            })
+        });
         Ok(Self {
             platform: pplx_space_spaced_common::platform::GuestPlatform::parse(wire, expected)?,
             interactive_upgrade_version,
