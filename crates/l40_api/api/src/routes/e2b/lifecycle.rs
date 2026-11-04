@@ -587,9 +587,25 @@ fn prefers_respond_async(headers: &HeaderMap) -> bool {
         .get_all("prefer")
         .iter()
         .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
+        .flat_map(preferences)
         .filter_map(|preference| preference.split([';', '=']).next())
         .any(|token| token.trim().eq_ignore_ascii_case("respond-async"))
+}
+
+/// Splits one `Prefer` value into its preferences at commas outside quoted
+/// strings, so a quoted parameter value cannot be read as a preference.
+fn preferences(value: &str) -> impl Iterator<Item = &str> {
+    let (mut quoted, mut escaped) = (false, false);
+    value.split(move |c| {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            ',' => return !quoted,
+            _ => {}
+        }
+        false
+    })
 }
 
 /// Admission joins any active delete for the target, so a retried DELETE

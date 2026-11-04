@@ -501,6 +501,9 @@ mod delete {
         assert!(!prefers(&[]));
         assert!(!prefers(&["wait=0"]));
         assert!(!prefers(&["respond-asynchronously"]));
+        assert!(prefers(&[r#"example="a,b", respond-async"#]));
+        assert!(!prefers(&[r#"example="a,respond-async,b""#]));
+        assert!(!prefers(&[r#"example="a\",respond-async""#]));
     }
 
     #[test]
