@@ -152,9 +152,10 @@ reviews:
   high_level_summary: false
   high_level_summary_in_walkthrough: false
 
-  # The walkthrough comment keeps the merge risk, the review status, and the
-  # collapsed review info, whose "Automatic approval policy" section shows
-  # which override decided an approval. Everything else is off.
+  # The walkthrough comment keeps the merge risk, the review status, related
+  # issues and pull requests from this repository, and the collapsed review
+  # info, whose "Automatic approval policy" section shows which override
+  # decided an approval. Everything else is off.
   collapse_walkthrough: true
   review_status: true
   review_info: true
@@ -163,8 +164,8 @@ reviews:
   sequence_diagrams: false
   estimate_code_review_effort: false
   assess_linked_issues: false
-  related_issues: false
-  related_prs: false
+  related_issues: true
+  related_prs: true
   suggested_labels: false
   auto_apply_labels: false
   suggested_reviewers: false
