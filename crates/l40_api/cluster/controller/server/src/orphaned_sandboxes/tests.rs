@@ -88,6 +88,9 @@ struct FakeSink {
     defer_for: Mutex<Vec<SandboxId>>,
     skip_terminal_for: Mutex<Vec<SandboxId>>,
     active_quarantine_count: Mutex<u32>,
+    /// Drop a candidate from later scans once it's classified, as the real
+    /// store does when the row leaves the candidate predicate.
+    resolve_on_action: Mutex<bool>,
 }
 
 impl FakeSink {
@@ -111,7 +114,7 @@ impl OrphanActionSink for FakeSink {
         upper_bound: SandboxId,
     ) -> Result<Vec<OrphanCandidate>, sqlx::Error> {
         let candidates = self.candidates.lock().unwrap();
-        let page: Vec<_> = candidates
+        let mut page: Vec<_> = candidates
             .iter()
             .filter(|candidate| {
                 after_sandbox_id
@@ -119,9 +122,11 @@ impl OrphanActionSink for FakeSink {
                     .unwrap_or(true)
                     && candidate.sandbox_id <= upper_bound
             })
-            .take(batch_size as usize)
             .cloned()
             .collect();
+        // The real query orders by id, and the cursor depends on it.
+        page.sort_by_key(|candidate| candidate.sandbox_id);
+        page.truncate(batch_size as usize);
         Ok(page)
     }
 
@@ -162,6 +167,12 @@ impl OrphanActionSink for FakeSink {
             }
         };
         self.actions.lock().unwrap().push((sandbox_id, guard));
+        if *self.resolve_on_action.lock().unwrap() {
+            self.candidates
+                .lock()
+                .unwrap()
+                .retain(|candidate| candidate.sandbox_id != sandbox_id);
+        }
         Ok(outcome)
     }
 
@@ -229,6 +240,18 @@ impl FakeSink {
 
     fn set_active_quarantine_count(&self, count: u32) {
         *self.active_quarantine_count.lock().unwrap() = count;
+    }
+
+    fn resolve_on_action(&self) {
+        *self.resolve_on_action.lock().unwrap() = true;
+    }
+
+    fn acted_on(&self, sandbox_id: SandboxId) -> bool {
+        self.actions
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(acted, _)| *acted == sandbox_id)
     }
 }
 
@@ -1937,6 +1960,152 @@ async fn rate_limit_caps_per_minute() {
     assert_eq!(report.recovered_suspended, 60);
     assert_eq!(report.rate_limited, 140);
     assert_eq!(r.sink.action_count(), 60);
+}
+
+/// A `creating` candidate, which the fake plans as an abandoned create to
+/// finalize: cleanup that no user is waiting on.
+fn abandoned_create_with_id(id: u128) -> OrphanCandidate {
+    OrphanCandidate {
+        lifecycle: SandboxLifecycle::Creating,
+        ..candidate_with_id(id, &format!("abandoned-{id}"))
+    }
+}
+
+/// A `started` sandbox whose pod is gone must not wait for a later sweep
+/// because cleanup rows earlier in its batch used the minute's budget. Here
+/// 100 abandoned creates precede it and the budget is 5; in id order it
+/// would wait, sweep after sweep, until fewer than the budget's worth of
+/// creates remained ahead of it.
+#[tokio::test]
+async fn live_candidate_takes_the_budget_before_cleanup_rows_in_its_batch() {
+    let mut candidates: Vec<_> = (1..=100).map(abandoned_create_with_id).collect();
+    let live = candidate_with_id(101, "live-started");
+    candidates.push(live.clone());
+    let sink = FakeSink::new(candidates);
+    sink.resolve_on_action();
+    let mut r = Reconciler::new(config(60, 5, false), FakePresence::default(), sink);
+    let t0 = Instant::now();
+
+    let first = r.tick(t0).await;
+    assert_eq!(first.within_grace, 101);
+
+    let classified = r.tick(t0 + Duration::from_secs(70)).await;
+    assert_eq!(classified.recovered_suspended, 1);
+    assert_eq!(classified.deleted, 4);
+    assert_eq!(classified.rate_limited, 96);
+    assert!(r.sink.acted_on(live.sandbox_id));
+}
+
+/// Non-cleanup candidates go first in id order, cleanup ones after them in
+/// id order, and the cursor still moves past the whole batch.
+#[tokio::test]
+async fn batch_evaluates_repairs_before_cleanup_and_moves_past_the_batch() {
+    let candidates = vec![
+        abandoned_create_with_id(1),
+        abandoned_create_with_id(2),
+        candidate_with_id(3, "live-a"),
+        abandoned_create_with_id(4),
+        candidate_with_id(5, "live-b"),
+    ];
+    let sink = FakeSink::new(candidates.clone());
+    let mut r = Reconciler::new(config(0, 3, false), FakePresence::default(), sink);
+
+    let report = r.tick(Instant::now()).await;
+
+    assert_eq!(report.recovered_suspended, 2);
+    assert_eq!(report.deleted, 1);
+    assert_eq!(report.rate_limited, 2);
+    let acted: Vec<_> = r
+        .sink
+        .actions
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(id, _)| *id)
+        .collect();
+    assert_eq!(
+        acted,
+        vec![
+            candidates[2].sandbox_id,
+            candidates[4].sandbox_id,
+            candidates[0].sandbox_id,
+        ]
+    );
+    assert_eq!(r.scan_after, Some(candidates[4].sandbox_id));
+}
+
+/// A tick that starts with the window full lists nothing and leaves the
+/// cursor where it was, so the next batch is evaluated on the next tick
+/// with room instead of being skipped to the sweep after.
+#[tokio::test]
+async fn window_full_at_tick_start_leaves_the_cursor_in_place() {
+    let candidates: Vec<_> = (1..=6)
+        .map(|id| candidate_with_id(id, &format!("live-{id}")))
+        .collect();
+    let sink = FakeSink::new(candidates.clone());
+    sink.resolve_on_action();
+    let mut cfg = config(0, 2, false);
+    cfg.batch_size = 2;
+    let mut r = Reconciler::new(cfg, FakePresence::default(), sink);
+    let t0 = Instant::now();
+
+    let spent = r.tick(t0).await;
+    assert_eq!(spent.recovered_suspended, 2);
+
+    let full = r.tick(t0 + Duration::from_secs(30)).await;
+    assert!(full.window_full);
+    assert_eq!(full.scanned, 0);
+    assert_eq!(r.scan_after, Some(candidates[1].sandbox_id));
+
+    let next = r.tick(t0 + Duration::from_secs(70)).await;
+    assert_eq!(next.recovered_suspended, 2);
+    assert!(r.sink.acted_on(candidates[2].sandbox_id));
+    assert!(r.sink.acted_on(candidates[3].sandbox_id));
+}
+
+/// Every lifecycle but the two cleanup ones takes the budget ahead of an
+/// abandoned create earlier in its batch, `starting` included. The table
+/// covers lifecycles the candidate query never returns too, so adding a
+/// variant forces a decision here.
+#[tokio::test]
+async fn every_lifecycle_but_cleanup_goes_before_cleanup_rows() {
+    for &lifecycle in SandboxLifecycle::all() {
+        let cleanup = match lifecycle {
+            SandboxLifecycle::Creating | SandboxLifecycle::Deleting => true,
+            SandboxLifecycle::Created
+            | SandboxLifecycle::Starting
+            | SandboxLifecycle::Started
+            | SandboxLifecycle::Restoring
+            | SandboxLifecycle::Pausing
+            | SandboxLifecycle::Paused
+            | SandboxLifecycle::Resuming
+            | SandboxLifecycle::Suspending
+            | SandboxLifecycle::Suspended
+            | SandboxLifecycle::Stopping
+            | SandboxLifecycle::Stopped
+            | SandboxLifecycle::Checkpointing
+            | SandboxLifecycle::Quarantined
+            | SandboxLifecycle::Failed => false,
+        };
+        let create = abandoned_create_with_id(1);
+        let later = OrphanCandidate {
+            lifecycle,
+            kind: if lifecycle == SandboxLifecycle::Deleting {
+                OrphanKind::LegacyDeleting
+            } else {
+                OrphanKind::Normal
+            },
+            ..candidate_with_id(2, "later")
+        };
+        let sink = FakeSink::new(vec![create.clone(), later.clone()]);
+        let mut r = Reconciler::new(config(0, 1, false), FakePresence::default(), sink);
+
+        let report = r.tick(Instant::now()).await;
+
+        assert_eq!(report.rate_limited, 1, "{lifecycle:?}");
+        assert_eq!(r.sink.acted_on(later.sandbox_id), !cleanup, "{lifecycle:?}");
+        assert_eq!(r.sink.acted_on(create.sandbox_id), cleanup, "{lifecycle:?}");
+    }
 }
 
 #[tokio::test]

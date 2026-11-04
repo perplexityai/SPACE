@@ -9,6 +9,33 @@
 //! recoverable row back to `suspended`, or moves genuinely ambiguous state to
 //! the inert `quarantined` hold state.
 //!
+//! The reconciler's actions (deletes, recoveries to `suspended` and
+//! quarantines) are capped at `max_classifications_per_minute` in a 60-second
+//! window; anything else, such as a deferral, a terminal skip or an error,
+//! uses no budget. Every action a tick takes is stamped with the tick's
+//! start, and an action leaves the window only once it's more than 60 seconds
+//! old. At the 60-second tick interval, the tick after one that filled the
+//! window often finds it still full and acts on nothing, so under a backlog
+//! the effective rate is between half the cap and the full cap per minute.
+//! When a tick runs longer than the interval, the next one starts as soon as
+//! it ends, more than 60 seconds after the last actions, so the window is
+//! always clear and the rate is the cap per tick.
+//!
+//! A tick scans one batch in id order and evaluates the batch's candidates
+//! outside the cleanup kinds first, then its cleanup candidates, each group
+//! in id order (see `OrphanCandidate::is_cleanup`). A backlog of abandoned
+//! creates ahead of a user's sandbox in the same batch therefore can't take
+//! the budget before it. Candidates past the cap are skipped and the cursor
+//! moves past the batch, so a skipped candidate waits for the next sweep, as
+//! one skipped for any other reason does. A tick that starts with the window
+//! already full returns without listing a batch, so it doesn't move the
+//! cursor past candidates it couldn't act on.
+//!
+//! Evaluating non-cleanup candidates first gives them the budget, so the
+//! plans the quarantine-percentage breaker counts lean further toward
+//! quarantines than they would in id order. That's the share among the rows
+//! that act, which is the ratio the breaker exists to bound.
+//!
 //! Per the repo-wide rule against background work in API servers (see
 //! AGENTS.md), this loop runs in the cluster-singleton controller binary
 //! (`space-cluster-controller`, in `crates/l40_api/cluster/controller/server/`), not
@@ -237,6 +264,18 @@ pub struct OrphanCandidate {
     /// re-verifies it under the guarded transaction; this copy is only for
     /// bounded dry-run/live telemetry.
     pub lifecycle: SandboxLifecycle,
+}
+
+impl OrphanCandidate {
+    /// Whether the planner ends this row rather than repairs it: a legacy
+    /// `deleting` row is a delete it completes, and a `creating` row is an
+    /// abandoned create it finalizes unless a snapshot can recover it. A tick
+    /// evaluates these after the rest of its batch, so a backlog of them
+    /// doesn't take the budget ahead of a user's sandbox.
+    fn is_cleanup(&self) -> bool {
+        // Mirrors the `FinalizeDelete` arms of `plan_orphan_in_tx`; keep in sync.
+        self.kind == OrphanKind::LegacyDeleting || self.lifecycle == SandboxLifecycle::Creating
+    }
 }
 
 #[derive(sqlx::FromRow)]
@@ -508,6 +547,9 @@ pub struct TickReport {
     pub deferred: u32,
     pub circuit_breaker: u32,
     pub skipped_terminal: u32,
+    /// The rate-limit window was full at tick start, so the tick listed
+    /// nothing and left the cursor where it was.
+    pub window_full: bool,
 }
 
 /// Stateful per-tick reconciler core. Pure with respect to time and
@@ -560,6 +602,25 @@ impl<P: PodPresence, S: OrphanActionSink> Reconciler<P, S> {
     }
 
     pub async fn tick(&mut self, now: Instant) -> TickReport {
+        // Trim the rate-limit window once per tick.
+        while let Some(front) = self.action_history.front() {
+            if now.duration_since(*front) > RATE_LIMIT_WINDOW {
+                self.action_history.pop_front();
+            } else {
+                break;
+            }
+        }
+        if self.rate_limited() {
+            tracing::debug!(
+                dry_run = self.config.dry_run,
+                "orphaned-sandbox reconcile tick skipped: rate-limit window full"
+            );
+            return TickReport {
+                window_full: true,
+                ..TickReport::default()
+            };
+        }
+
         // Try the cursored list once; if the cursor reached the sweep's
         // high-water mark we wrap and retry this same tick so the next
         // sweep starts immediately. Two iterations is enough — after a wrap
@@ -631,15 +692,6 @@ impl<P: PodPresence, S: OrphanActionSink> Reconciler<P, S> {
             ..TickReport::default()
         };
 
-        // Trim the rate-limit window once per tick.
-        while let Some(front) = self.action_history.front() {
-            if now.duration_since(*front) > RATE_LIMIT_WINDOW {
-                self.action_history.pop_front();
-            } else {
-                break;
-            }
-        }
-
         let mut active_quarantines = match self.sink.active_quarantine_count().await {
             Ok(count) => count,
             Err(err) => {
@@ -659,7 +711,10 @@ impl<P: PodPresence, S: OrphanActionSink> Reconciler<P, S> {
             self.circuit_open = true;
         }
 
-        for candidate in candidates {
+        let (repairs, cleanup): (Vec<_>, Vec<_>) = candidates
+            .into_iter()
+            .partition(|candidate| !candidate.is_cleanup());
+        for candidate in repairs.into_iter().chain(cleanup) {
             let pod_evidence = match candidate.kind {
                 OrphanKind::LegacyDeleting => PodEvidence::NotApplicable,
                 OrphanKind::Normal => {
@@ -700,9 +755,7 @@ impl<P: PodPresence, S: OrphanActionSink> Reconciler<P, S> {
                 continue;
             }
 
-            if self.action_history.len()
-                >= usize::try_from(self.config.max_classifications_per_minute).unwrap_or(usize::MAX)
-            {
+            if self.rate_limited() {
                 report.rate_limited += 1;
                 reconciler_metrics::rows_skipped("rate_limited", 1);
                 continue;
@@ -735,7 +788,7 @@ impl<P: PodPresence, S: OrphanActionSink> Reconciler<P, S> {
                         sandbox_id = %candidate.sandbox_id,
                         pod_name = %candidate.pod_name,
                         error = %err,
-                        "reconciler disposition planning failed; will retry next tick"
+                        "reconciler disposition planning failed; will retry when the sweep reaches it again"
                     );
                     continue;
                 }
@@ -912,7 +965,7 @@ impl<P: PodPresence, S: OrphanActionSink> Reconciler<P, S> {
                         sandbox_id = %candidate.sandbox_id,
                         pod_name = %candidate.pod_name,
                         error = %err,
-                        "reconciler classify_orphan failed; will retry next tick"
+                        "reconciler classify_orphan failed; will retry when the sweep reaches it again"
                     );
                 }
             }
@@ -948,6 +1001,12 @@ impl<P: PodPresence, S: OrphanActionSink> Reconciler<P, S> {
         );
 
         report
+    }
+
+    /// Whether the rate-limit window holds a full budget of actions.
+    fn rate_limited(&self) -> bool {
+        self.action_history.len()
+            >= usize::try_from(self.config.max_classifications_per_minute).unwrap_or(usize::MAX)
     }
 
     /// Updates `first_missing_at` for `candidate` and returns true iff the
@@ -1534,6 +1593,8 @@ async fn plan_orphan_in_tx(
     let disposition = if row.creating_snapshot {
         OrphanDisposition::Defer(OrphanDeferReason::InFlightSnapshot)
     } else if matches!(guard, ClassifyGuard::LegacyDeleting { .. }) {
+        // The `FinalizeDelete` arms are the cleanup `OrphanCandidate::is_cleanup`
+        // orders last; a new one belongs there too.
         OrphanDisposition::FinalizeDelete(OrphanDeleteReason::ExplicitDeleting)
     } else if row.from_lifecycle == SandboxLifecycle::Creating && !row.recoverable {
         OrphanDisposition::FinalizeDelete(OrphanDeleteReason::AbandonedCreate)
