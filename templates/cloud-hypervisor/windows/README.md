@@ -2,18 +2,24 @@
 
 The `ch-54.0-windows-uefi` environment is an explicit, x86-64-only development
 candidate. It is excluded from the default execution policy. It carries pinned
-EDK2 firmware and a cold-boot machine contract with Hyper-V enlightenments. It
-has no Linux kernel or initramfs and advertises no snapshot or device support.
+EDK2 firmware, Hyper-V enlightenments and the Cloud Hypervisor 54.0.1 snapshot
+format. It has no Linux kernel or initramfs. Images with the native spaced agent
+support resident pause/resume, persisted suspend/restore and automatic pause/suspend.
 
 The standalone path persists and validates the guest image contract,
-supplies slot-scoped DHCP, and waits for a declared TCP service instead
-of a guest agent. Stop requests ACPI shutdown and waits up to 120 seconds from
+supplies slot-scoped DHCP, and waits for either the native guest agent or a
+declared TCP service according to the image contract. Stop requests ACPI shutdown and waits up to 120 seconds from
 the durable cleanup job before forcing cleanup. Stop completion records the
 observed outcome in the existing sandbox event stream.
 
 This is a development environment, not a fleet default or a qualified Windows
-release. Export, cluster distribution, snapshots, warm pools and agent APIs are
-refused. Unexpected VMM-exit recovery remains a separate
+release. Export and cluster distribution remain refused. Automatic warm-pool
+refill prefers eligible Firecracker builds, then eligible CH builds. CH pool
+builds need a current bound environment and a native agent qualified for memory
+lifecycle. Agentless images remain cold-only.
+Agentless images refuse guest APIs; images provisioned with native spaced can
+use the standalone operator process/file path described below. Managed tenant
+API and ECW admission remain disabled. Unexpected VMM-exit recovery remains a separate
 [acceptance dependency](https://github.com/perplexityai/SPACE/issues/953).
 
 Before producing version-4 templates, deploy the reader guard that checks
@@ -244,8 +250,15 @@ eight active filesystem workers and four uploads. Spaced-host file relays carry
 Windows metadata. Managed Windows admission and public API/ECW exposure remain
 separate work; these operator checks do not qualify those surfaces.
 
-Volume flush and UTC synchronization are deferred to separate qualification work. The image still uses ACPI shutdown; base snapshots,
-warm pools and automatic memory lifecycle remain refused. Do not publish an
+The native guest implements volume flush and UTC synchronization through the
+existing bridge RPCs for component qualification. Flush enumerates local fixed
+volumes, including those without drive letters, and retains its single worker
+permit across RPC cancellation until the OS call finishes. This flush is not
+VSS or application quiescence. UTC synchronization validates the host timestamp
+and reports a failed clock update explicitly. Flush and resume are advertised
+independently of the optional process/file account and admitted by the host's
+Windows profile. Stop continues to use ACPI shutdown. Agentless images refuse
+manual and automatic memory lifecycle before changing lifecycle state. Do not publish an
 evaluation disk or its provisioned credentials with this source.
 
 The `node.windows_agent_readiness` typed smoke checks the pinned image contract,
@@ -257,9 +270,67 @@ as `node.windows_sandbox_lifecycle`. It passed on an x86-64 Linux/KVM worker
 with Cloud Hypervisor 54 and a Windows Server 2025 evaluation image. This is
 readiness and cold-lifecycle evidence, not process/file or memory-restore evidence.
 
-Memory lifecycle remains unqualified: repeated VirtIO-socket reconnects stalled
-after a direct Cloud Hypervisor restore. Base snapshots and warm pools remain
-refused until restored connections pass without intervention.
+The native transport probes nonblocking accept, read and write after every bounded
+readiness wait, including timeout and `WSAEINVAL` from the readiness query:
+missed viosock notifications must not strand pending connections or buffered
+bytes. Without those progress checks, resume or
+repeated connections can stall until their deadlines. Component qualification exercised
+three pause/resume and three snapshot/restore cycles, each followed by 64 fresh
+connections, volume flush and UTC synchronization, while preserving a live
+process, its in-memory nonce and an advancing counter.
+
+`node.windows_memory_lifecycle` exercises manual and automatic dormancy through
+SPACE on an explicitly selected standalone worker. It checks resident execution
+identity, replacement execution after restore, live guest memory, network access
+and process/file APIs. The matrix passed on Linux/KVM with Cloud Hypervisor 54
+and Windows Server 2025: three resident cycles, three persisted cycles, and
+automatic pause/suspend followed by wake. Build its `windows_operations` probe from the same revision
+as the services. Install those service builds and rebuild the Windows template
+with the updated agent. The Windows environment reference changes when snapshot
+support is added; register the rebuilt image against that exact definition.
+Before replacing services, stop and retire Windows sandboxes and template
+builds recorded against the previous definition while the old services still
+support graceful ACPI shutdown. Do not relabel an older image's execution
+metadata. Disable pool refill during rolling upgrades; deploy node-manager,
+sandbox-manager and spaced-host before template-manager and re-enable pools
+only with current images and services. Before rollback, retire new Windows
+bindings that the older catalog cannot execute. Follow the CH Linux allowlist
+rollback instructions in [execution environments](../../../docs/execution-environments.md).
+
+Run the current `install-spaced.ps1` when updating the image. Copying only the
+executable does not apply the service dependency and failure-recovery settings.
+
+`node.windows_base_memory` builds a base snapshot and restores independent
+siblings, then fills and claims snapshot-seeded and cold-seeded pools. It checks
+live process continuity, separate guest-generated nonces, disk independence,
+and native process/file operations. Windows base preparation uses agent
+readiness and volume flushing; the Linux systemd app observer does not apply.
+
+Memory cloning retains the image's machine identity and provisioned local
+account, as cold creation from that image does. It does not provision a unique
+Windows account or generalize a domain-joined installation for each sandbox.
+Cloud Hypervisor provides a
+[VM Generation Counter on restore](https://github.com/cloud-hypervisor/cloud-hypervisor/blob/v54.0/docs/snapshot_restore.md#vm-generation-id); image
+qualification must include its Windows driver and application-specific clone
+requirements. The standalone evaluation-image tests do not qualify domain-joined
+workloads or application-owned random generators.
+
+Record both the `viosock.sys` driver and Winsock-provider versions when
+qualifying an image. The upstream
+[transmit-counter leak fix](https://github.com/virtio-win/kvm-guest-drivers-windows/pull/1627)
+addresses nonblocking sends becoming permanently unavailable after queued writes
+are cancelled or cleaned up. Check whether the tested driver contains it; this
+is separate from the missed readiness notifications addressed by spaced.
+
+For component diagnosis on a disposable Windows VM, the existing
+`windows_readiness <vsock-socket> <vmm-pid> <vmm-uid>` example opens 64 fresh
+connections and checks readiness and legacy-host refusal. Add `--lifecycle`
+to flush volumes and synchronize the guest clock on each connection. Run it
+before capture and after each restore with the current VMM identity. It verifies
+the peer before connecting and does not enable platform lifecycle admission.
+Repeated restore qualification must also verify a live process and memory marker,
+persisted file contents, guest time, and networking without restarting spaced or
+the VirtIO socket driver. A successful probe alone does not establish those facts.
 
 The `windows_operations` Rust example exercises the guest bridge directly or
 spaced-host (`--host` / `--sandbox`): regular identity, separate output streams,

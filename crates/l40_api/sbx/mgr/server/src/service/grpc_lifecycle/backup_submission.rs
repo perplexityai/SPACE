@@ -55,7 +55,7 @@ pub(in crate::service) fn suspend_snapshot_metadata(
     sandbox: &crate::db::SandboxRow,
     format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
 ) -> Result<crate::snapshot_upload::SnapshotMeta, Status> {
-    let snapshot_execution = sandbox_snapshot_execution_metadata(&sandbox.id)
+    let snapshot_execution = sandbox_snapshot_execution_metadata(sandbox)
         .map_err(|error| Status::failed_precondition(error.to_string()))?;
     let execution = snapshot_execution.execution().clone();
     let rootfs_diff_format = match format {

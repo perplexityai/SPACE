@@ -10,17 +10,8 @@ impl TemplateManagerService {
         let req = request.get_ref();
         validate_template_name(&req.template)?;
 
-        if self
-            .template_guest_profile(&req.template)
-            .await?
-            .is_some_and(|profile| !profile.supports_memory_lifecycle())
-        {
-            return Err(Status::failed_precondition(
-                "guest profile is not qualified for warm pools",
-            ));
-        }
         let requested_shape = optional_pool_shape(req.vcpu, req.memory_mib)?;
-        let (existing_pool, settings, runtime_defaults) = {
+        let (existing_pool, settings, runtime_defaults, build) = {
             let db = Arc::clone(&self.db);
             let template = req.template.clone();
             tokio::task::spawn_blocking(move || {
@@ -29,14 +20,26 @@ impl TemplateManagerService {
                     .map_err(|_| crate::db::mutex_poison_error("create pool template lookup"))?;
                 let existing_pool = crate::db::get_pool(&conn, &template)?;
                 let settings = crate::db::get_template_settings(&conn, &template)?;
-                let runtime_defaults = crate::pool_manager::pool_base_build(&conn, &template)?
+                let build = crate::pool_manager::pool_build(&conn, &template)?;
+                let runtime_defaults = build
+                    .as_ref()
                     .map(|build| template_runtime_defaults(&template, &build.content_hash))
                     .unwrap_or_default();
-                Ok::<_, rusqlite::Error>((existing_pool, settings, runtime_defaults))
+                Ok::<_, crate::pool_manager::PoolError>((
+                    existing_pool,
+                    settings,
+                    runtime_defaults,
+                    build,
+                ))
             })
             .await
             .map_err(|e| Status::internal(format!("spawn_blocking: {e}")))?
-            .map_err(|e| Status::internal(format!("db: {e}")))?
+            .map_err(|e| match e {
+                crate::pool_manager::PoolError::NoPoolBuild => {
+                    Status::failed_precondition(e.to_string())
+                }
+                _ => Status::internal(format!("db: {e}")),
+            })?
         };
 
         let boot_mode = if req.boot_mode.trim().is_empty() {
@@ -88,9 +91,7 @@ impl TemplateManagerService {
                 let conn = db.lock().map_err(|_| {
                     Status::internal("db mutex poisoned while checking pool snapshot")
                 })?;
-                let Some(build) = crate::pool_manager::pool_base_build(&conn, &t)
-                    .map_err(|e| Status::internal(format!("db get_latest_build: {e}")))?
-                else {
+                let Some(build) = build else {
                     return Ok::<_, Status>(None);
                 };
                 crate::db::get_snapshot(&conn, &t, &build.content_hash, vcpu, memory_mib)

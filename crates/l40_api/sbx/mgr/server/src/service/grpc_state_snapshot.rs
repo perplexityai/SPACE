@@ -1950,7 +1950,7 @@ impl SandboxManagerService {
             )
             .map_err(|e| Status::internal(format!("rename vmstate -> vmstate.base: {e}")))?;
 
-            let snapshot_execution = sandbox_snapshot_execution_metadata(&sandbox.id)
+            let snapshot_execution = sandbox_snapshot_execution_metadata(&sandbox)
                 .map_err(|error| Status::failed_precondition(error.to_string()))?;
             let runtime_metadata =
                 serde_json::to_vec_pretty(&snapshot_execution).map_err(|error| {

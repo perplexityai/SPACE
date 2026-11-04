@@ -480,10 +480,16 @@ def execute_scenario(
     title: str,
     body: Body,
     timeout_seconds: float | None = None,
+    cleanup_timeout_seconds: float | None = None,
 ) -> ScenarioResult:
     scope = ResourceScope()
     context = ScenarioContext(scope, {})
-    cleanup_timeout = (
+    if cleanup_timeout_seconds is not None and (
+        cleanup_timeout_seconds <= 0
+        or (timeout_seconds is not None and cleanup_timeout_seconds >= timeout_seconds)
+    ):
+        raise ValueError("cleanup reserve must be positive and smaller than the scenario timeout")
+    cleanup_timeout = cleanup_timeout_seconds if cleanup_timeout_seconds is not None else (
         min(120.0, timeout_seconds * 0.1) if timeout_seconds is not None else None
     )
     execution_timeout = (

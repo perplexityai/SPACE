@@ -1396,7 +1396,8 @@ fn spaced_host_restart_args_preserve_control_socket_and_only_notify_qualified_gu
 
     for (agent, boot_type) in [
         (QualifiedGuestAgent::LinuxV1, "resume"),
-        (QualifiedGuestAgent::WindowsV1, "fresh"),
+        (QualifiedGuestAgent::WindowsV1, "resume"),
+        (QualifiedGuestAgent::Absent, "fresh"),
     ] {
         let args = spaced_host_restart_args(sandbox_id, vsock_uds_path.clone(), agent);
 

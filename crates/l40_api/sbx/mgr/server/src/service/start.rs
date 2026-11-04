@@ -1826,12 +1826,15 @@ impl SandboxManagerService {
         restrict_to_template_manager_owned: bool,
         identity_free_direct_authority: IdentityFreeDirectActivationAuthority,
     ) -> Result<Response<StartResponse>, Status> {
-        self.start_sandbox_with_upgrade_authority(
+        // Wake embeds this path alongside resident resume and checkpoint staging.
+        // Keep the large start/restore future off those callers' stack frames;
+        // otherwise waking a suspended VM can overflow a debug worker's stack.
+        Box::pin(self.start_sandbox_with_upgrade_authority(
             req,
             restrict_to_template_manager_owned,
             identity_free_direct_authority,
             None,
-        )
+        ))
         .await
     }
 
@@ -2886,19 +2889,7 @@ impl SandboxManagerService {
             volume_encryption: sandbox.volume_encryption,
         });
         self.watchdog
-            .add_sandbox(crate::watchdog::SidecarInfo {
-                guest_image: sandbox.guest_image,
-                node_execution_id: Some(execution_fence.current()),
-                sandbox_id: id.clone(),
-                uid: Some(sbx_uid),
-                runtime_pid: Some(pid),
-                spaced_host_pid,
-                netgtw_pid: Some(netgtw_resp.pid),
-                vsock_uds_path: Some(vsock_uds_path.clone()),
-                process_env: sandbox.process_env.clone(),
-                network_tx_bytes: sandbox.network_tx_bytes,
-                network_rx_bytes: sandbox.network_rx_bytes,
-            })
+            .rearm_sandbox_from_db(id)
             .instrument(tracing::info_span!(
                 "sbxmgr.start.watchdog.add_sandbox",
                 sandbox_id = %id

@@ -1079,19 +1079,101 @@ fn upserts_insert_and_update_on_the_bundled_and_partitioned_schemas() {
     }
 }
 
-/// A pool refill names the template's latest ready Firecracker build, so its
-/// runtime and the rootfs sandbox-manager resolves come from one row, and
-/// records the use. A template with only other runtimes' builds gets none.
+/// A refill preserves Firecracker preference for mixed-runtime templates,
+/// otherwise uses a pool-capable runtime, and records only the selected build.
 #[test]
-fn pool_refills_name_the_latest_firecracker_build_and_touch_it() {
+fn pool_refills_prefer_firecracker_and_admit_cloud_hypervisor() {
     let conn = test_conn();
+    use pplx_space_common_core::types::guest_image::{
+        GuestAgent, GuestDiskLayout, GuestImageContract, GuestNetwork, GuestReadiness,
+    };
+    let catalog =
+        pplx_space_execution_catalog::catalog::CompiledEnvironment::for_architecture(Arch::X86_64)
+            .unwrap();
+    let windows = catalog
+        .iter()
+        .find(|entry| entry.name() == "ch-54.0-windows-uefi")
+        .unwrap();
+    for (template, hash, agent, date) in [
+        (
+            "windows",
+            "sha256:agent",
+            GuestAgent::Spaced,
+            "2026-01-01T00:00:00Z",
+        ),
+        (
+            "windows",
+            "sha256:agentless",
+            GuestAgent::Absent,
+            "2026-02-01T00:00:00Z",
+        ),
+        (
+            "agentless",
+            "sha256:agentless",
+            GuestAgent::Absent,
+            "2026-02-01T00:00:00Z",
+        ),
+    ] {
+        let readiness = if agent == GuestAgent::Spaced {
+            GuestReadiness::Agent
+        } else {
+            GuestReadiness::TcpService {
+                port: std::num::NonZeroU16::new(3389).unwrap(),
+            }
+        };
+        let mut manifest = TemplateManifest {
+            guest_image: Some(
+                GuestImageContract::new(
+                    GuestDiskLayout::OpaqueRawDisk,
+                    readiness,
+                    GuestNetwork::SlotDhcpV1,
+                    agent,
+                )
+                .unwrap(),
+            ),
+            ..Default::default()
+        };
+        manifest.set_execution_metadata(windows.definition().execution_requirements().unwrap());
+        let manifest_json = serde_json::to_string(&manifest).unwrap();
+        upsert_build(
+            &conn,
+            &BuildUpsert {
+                manifest_json: &manifest_json,
+                runtime: "ch",
+                arch: "x86_64",
+                build_date: date,
+                ..ready_build(template, hash, 1)
+            },
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        crate::pool_manager::pool_refill_build(&conn, "windows")
+            .unwrap()
+            .unwrap()
+            .content_hash,
+        "sha256:agent"
+    );
+    assert!(matches!(
+        crate::pool_manager::pool_refill_build(&conn, "agentless"),
+        Err(crate::pool_manager::PoolError::NoPoolBuild)
+    ));
     let cloud_hypervisor = pplx_space_common_core::types::RuntimeKind::CloudHypervisor.alias();
-    let upsert = |content_hash: &'static str, build_date, runtime| {
+    let linux = catalog
+        .iter()
+        .find(|entry| entry.name() == "ch-54.0-linux-7.2.8")
+        .unwrap();
+    let mut ch_manifest = TemplateManifest::default();
+    ch_manifest.set_execution_metadata(linux.definition().execution_requirements().unwrap());
+    let ch_manifest = serde_json::to_string(&ch_manifest).unwrap();
+    let upsert = |content_hash: &'static str, build_date, runtime, manifest_json| {
         upsert_build(
             &conn,
             &BuildUpsert {
                 build_date,
                 runtime,
+                manifest_json,
+                arch: "x86_64",
                 ..ready_build("seed", content_hash, 1)
             },
         )
@@ -1103,13 +1185,37 @@ fn pool_refills_name_the_latest_firecracker_build_and_touch_it() {
             .unwrap()
             .is_none()
     );
-    upsert("sha256:ch", "2026-03-01T00:00:00Z", cloud_hypervisor);
+    upsert("sha256:gvisor", "2026-04-01T00:00:00Z", "gvisor", "{}");
     assert!(matches!(
         crate::pool_manager::pool_refill_build(&conn, "seed"),
         Err(crate::pool_manager::PoolError::NoPoolBuild)
     ));
-    upsert("sha256:old", "2026-01-01T00:00:00Z", "fc");
-    upsert("sha256:new", "2026-02-01T00:00:00Z", "fc");
+    upsert(
+        "sha256:unbound",
+        "2026-05-01T00:00:00Z",
+        cloud_hypervisor,
+        "{}",
+    );
+    assert!(matches!(
+        crate::pool_manager::pool_refill_build(&conn, "seed"),
+        Err(crate::pool_manager::PoolError::NoPoolBuild)
+    ));
+    upsert(
+        "sha256:ch",
+        "2026-03-01T00:00:00Z",
+        cloud_hypervisor,
+        &ch_manifest,
+    );
+    assert_eq!(
+        crate::pool_manager::pool_refill_build(&conn, "seed")
+            .unwrap()
+            .unwrap()
+            .content_hash,
+        "sha256:ch"
+    );
+    set_last_used_at_for_test(&conn, "seed", "sha256:ch", 0).unwrap();
+    upsert("sha256:old", "2026-01-01T00:00:00Z", "fc", "{}");
+    upsert("sha256:new", "2026-02-01T00:00:00Z", "fc", "{}");
 
     let build = crate::pool_manager::pool_refill_build(&conn, "seed")
         .unwrap()

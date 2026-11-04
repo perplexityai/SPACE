@@ -26,7 +26,7 @@ pub(crate) enum PoolError {
     Db(#[from] rusqlite::Error),
     #[error("pool clone task failed: {0}")]
     Join(#[from] tokio::task::JoinError),
-    #[error("template has no Firecracker build for a pool to boot")]
+    #[error("template has no build that supports memory pools")]
     NoPoolBuild,
 }
 
@@ -41,38 +41,81 @@ pub(crate) fn pool_refill_build(
     conn: &rusqlite::Connection,
     template: &str,
 ) -> PoolResult<Option<crate::db::BuildRow>> {
-    if let Some(build) = pool_base_build(conn, template)? {
+    if let Some(build) = pool_build(conn, template)? {
         if let Err(error) = crate::db::touch_build(conn, &build.name, &build.content_hash) {
             eprintln!("[pool-manager] {template}: could not touch pool build LRU: {error}");
         }
         return Ok(Some(build));
     }
+    Ok(None)
+}
+
+/// Admission and refill share eligibility, including the distinction between
+/// absent builds (intent may precede publication) and present but unusable builds.
+pub(crate) fn pool_build(
+    conn: &rusqlite::Connection,
+    template: &str,
+) -> PoolResult<Option<crate::db::BuildRow>> {
+    if let Some(build) = pool_base_build(conn, template)? {
+        return Ok(Some(build));
+    }
     if crate::db::list_builds_by_name(conn, template)?.is_empty() {
         return Ok(None);
     }
-    // Only other runtimes' builds are cached. Automatic pools aren't
-    // qualified for them, so the pool stays empty rather than boot one.
+    // Cached builds must support memory pools. An unavailable
+    // eligible build must not turn into an unpinned Firecracker lookup.
     Err(PoolError::NoPoolBuild)
 }
 
-/// The build a template's pool boots: its newest ready Firecracker build.
-/// A pool's defaults, snapshot check and refills all use it, so a newer
-/// build of another runtime doesn't win any of the pool's lookups.
+/// Prefer Firecracker when a template has builds for several runtimes;
+/// otherwise select its newest pool-capable build. Defaults, snapshot checks,
+/// and refills must all select the same immutable build and runtime.
 pub(crate) fn pool_base_build(
     conn: &rusqlite::Connection,
     template: &str,
 ) -> rusqlite::Result<Option<crate::db::BuildRow>> {
     Ok(crate::db::list_builds_by_name(conn, template)?
         .into_iter()
-        .filter(|build| {
-            build
-                .runtime
-                .parse::<pplx_space_common_core::types::RuntimeKind>()
-                .is_ok_and(|kind| kind == pplx_space_common_core::types::RuntimeKind::Firecracker)
+        .filter_map(|build| {
+            use pplx_space_common_core::types::RuntimeKind;
+            let runtime = build.runtime.parse::<RuntimeKind>().ok()?;
+            let manifest: pplx_space_common_core::types::TemplateManifest =
+                serde_json::from_str(&build.manifest_json).ok()?;
+            let execution = manifest.execution_metadata().ok()?;
+            if let Some(execution) = execution {
+                if execution.runtime().kind != runtime {
+                    return None;
+                }
+                if runtime != RuntimeKind::Firecracker && execution.environment().is_none() {
+                    return None;
+                }
+                use pplx_space_execution_catalog::catalog::CompiledEnvironment;
+                let catalog =
+                    CompiledEnvironment::cached_for_architecture(execution.guest().architecture)
+                        .ok()?;
+                let environment = CompiledEnvironment::of_execution(catalog, execution)?;
+                if !environment.supports_memory_state() {
+                    return None;
+                }
+            } else if runtime != RuntimeKind::Firecracker {
+                return None;
+            }
+            let profile = pplx_space_execution_catalog::guest::GuestProfile::resolve_optional(
+                execution,
+                manifest.guest_image.unwrap_or_default(),
+            )
+            .ok()?;
+            (runtime.baseline_capabilities().prewarmed_pool && profile.supports_memory_lifecycle())
+                .then_some((runtime == RuntimeKind::Firecracker, build))
         })
         .max_by(|left, right| {
-            (&left.build_date, &left.content_hash).cmp(&(&right.build_date, &right.content_hash))
-        }))
+            (left.0, &left.1.build_date, &left.1.content_hash).cmp(&(
+                right.0,
+                &right.1.build_date,
+                &right.1.content_hash,
+            ))
+        })
+        .map(|(_, build)| build))
 }
 
 #[derive(Default)]
@@ -508,7 +551,7 @@ async fn do_clone_and_start(
     vcpu: u32,
     memory_mib: u32,
 ) -> PoolResult<String> {
-    let mut sbx_client = pplx_space_sbx_mgr_client::connect()
+    let mut sbx_client = pplx_space_sbx_mgr_client::connect_for_memory_clone()
         .await
         .map_err(|e| PoolError::SandboxClient(e.to_string()))?;
 

@@ -4,6 +4,7 @@
 mod filesystem;
 mod identity;
 mod launch;
+mod lifecycle;
 mod meta;
 mod path;
 mod process;

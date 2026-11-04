@@ -91,6 +91,20 @@ pub async fn connect_with_retry_policy(
     Ok(client_from_channel(channel))
 }
 
+/// Pool cloning includes a fresh memory capture. Its 20-minute request budget
+/// exceeds node-manager's 16-minute capture wait plus clone preparation.
+/// Other lifecycle callers retain their ordinary request deadlines.
+pub async fn connect_for_memory_clone() -> Result<SandboxManagerGrpcClient, ConnectError> {
+    let channel = pplx_space_common_grpc::connect_uds_channel_with_endpoint_with_retry(
+        "sandbox-manager",
+        Path::new(SOCKET_PATH),
+        configured_endpoint()?.timeout(std::time::Duration::from_secs(1200)),
+        DEFAULT_CONNECT_RETRY_POLICY,
+    )
+    .await?;
+    Ok(client_from_channel(channel))
+}
+
 /// Dial a fresh, uncached connection to the sandbox-manager socket.
 ///
 /// During a sandbox-manager restart handoff, a shared channel's established

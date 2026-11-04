@@ -10,12 +10,16 @@ use tonic::{Request, Response, Status};
 #[derive(Clone)]
 pub(super) struct Meta {
     operations: bool,
+    flush_slots: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 pub(super) fn service(operations: bool) -> meta_server::MetaServer<Meta> {
-    meta_server::MetaServer::new(Meta { operations })
-        .max_decoding_message_size(64 * 1024)
-        .max_encoding_message_size(64 * 1024)
+    meta_server::MetaServer::new(Meta {
+        operations,
+        flush_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+    })
+    .max_decoding_message_size(64 * 1024)
+    .max_encoding_message_size(64 * 1024)
 }
 
 #[tonic::async_trait]
@@ -38,6 +42,9 @@ impl meta_server::Meta for Meta {
         let milliseconds =
             unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() };
         let mut platform = GuestPlatform::for_target().wire();
+        platform
+            .operations
+            .extend([GuestOperation::Flush as i32, GuestOperation::Resume as i32]);
         if self.operations {
             platform.operations.extend([
                 GuestOperation::Process as i32,
@@ -70,18 +77,24 @@ impl meta_server::Meta for Meta {
     }
     async fn notify_resume(
         &self,
-        _: Request<NotifyResumeRequest>,
+        request: Request<NotifyResumeRequest>,
     ) -> Result<Response<NotifyResumeResponse>, Status> {
-        Err(super::unsupported(
-            "Windows memory lifecycle is not qualified",
-        ))
+        let request = request.into_inner();
+        let reason = ResumeReason::try_from(request.reason)
+            .map_err(|_| Status::invalid_argument("unknown resume_reason"))?;
+        if reason == ResumeReason::Unspecified {
+            return Err(Status::invalid_argument("resume_reason is required"));
+        }
+        Ok(Response::new(NotifyResumeResponse {
+            clock_sync_status: super::lifecycle::sync_clock(request.host_time)? as i32,
+            ready: true,
+        }))
     }
     async fn flush_filesystems(
         &self,
         _: Request<FlushFilesystemsRequest>,
     ) -> Result<Response<FlushFilesystemsResponse>, Status> {
-        Err(super::unsupported(
-            "Windows memory lifecycle is not qualified",
-        ))
+        super::lifecycle::flush(self.flush_slots.clone()).await?;
+        Ok(Response::new(FlushFilesystemsResponse {}))
     }
 }

@@ -1584,8 +1584,8 @@ separate channel.
 Installing a release does not approve it for execution. The compiled
 `ch-54.0-linux-7.2.8` environment pairs the x86-64 static Cloud Hypervisor 54.0
 executable with its upstream 7.2.8+ ELF kernel with a PVH entry. SHA-256 and
-fs-verity measurements are pinned independently. The binding has no memory-state
-format or cross-release replacement qualification. Existing ARM64 unbound Firecracker defaults stay
+fs-verity measurements are pinned independently. The binding includes the `cloud-hypervisor-snapshot` state format, version
+`54.0.1`; cross-release replacement remains unqualified. Existing ARM64 unbound Firecracker defaults stay
 unchanged; CH requires explicit policy permission and an exact environment.
 
 Node-manager owns the CH control API and parses the supported boot device
@@ -1601,19 +1601,39 @@ peer authentication and reaps it on exit. An interrupted boot is cleaned through
 the existing fenced sandbox teardown path; boot mutations are never replayed.
 
 Local CH execution supports cold creation, start, stop, delete and resident
-pause/resume. Memory capture and restore additionally require the explicit
-`ch-54.0-linux-7.2.8-state-v1` environment. It uses the same executable and kernel
-but declares the `cloud-hypervisor-snapshot` state format, version `54.0.1`.
-The historical cold-only environment retains its reference and cannot capture or
-restore memory; existing templates do not silently gain a new contract.
+pause/resume, memory capture and restore through `ch-54.0-linux-7.2.8`.
+The former development-only cold binding has been removed. The canonical name
+now resolves to the existing snapshot-capable definition; remove the former
+`-state-v1` name from allowlists (deduplicate if both names were listed). Recreate
+cold-only development templates against the canonical definition rather than
+relabeling their recorded provenance.
 
-The state environment stores a bounded, versioned machine-state document and a
+Before replacing the catalog, stop and retire sandboxes and template builds
+recorded against the removed cold-only CH Linux binding and the previous
+`ch-54.0-windows-uefi` definition. Stop Windows guests while the previous
+services still recognize their binding and can request ACPI shutdown. Rebuild
+and register Windows images with the current agent and definition.
+The snapshot-capable CH Linux binding
+keeps its reference when renamed; update its allowlist name with the binary
+rollout. Old references are not migrated or aliased. Before rolling back, restore
+or retire snapshots created against bindings absent from the older catalog and
+disable their automatic dormancy policies. Reverting binaries alone does not
+translate a recorded execution contract. On CH Linux rollback, restore the
+`ch-54.0-linux-7.2.8-state-v1` name in the allowlist and configured default
+alongside the binaries: the old canonical name selects the cold-only binding.
+Disable pool refill intent before a rolling upgrade. Upgrade node-manager,
+sandbox-manager, and spaced-host before template-manager, then re-enable pools
+once all participants and Windows images are current. Upgrading template-manager
+first can send CH/Linux clones through the older stale-memory clone path.
+
+The environment stores a bounded, versioned machine-state document and a
 RAM artifact alongside the rootfs through the existing snapshot pipeline. Restore
 preserves guest device IDs, MAC and vsock CID while rebinding host network locators
-and resource limits to the new execution. CH also requires the authenticated boot
-kernel at restore: its configuration validation and Landlock setup still reference
-that artifact. RAM is restored into private memory rather than a writable mapping
-of the shared snapshot. Same-environment suspend/restore can use local checkpoints
+and resource limits to the new execution. CH also requires its authenticated boot
+artifact at restore (the Linux kernel or Windows UEFI firmware): configuration
+validation and Landlock still reference it. RAM is restored into private memory
+rather than a writable mapping of the shared snapshot. Same-environment
+suspend/restore can use local checkpoints
 or S3 materialization; producer identity and execution fences remain mandatory.
 
 Encrypted checkpoints use the existing volume-manager and credential-provider
@@ -1627,15 +1647,40 @@ and a credential authority that can recover the sandbox's key after restart.
 Older plaintext checkpoints can still derive RAM size from their memory file;
 an encrypted checkpoint without a recorded guest allocation fails explicitly.
 
-Upgrade all participating services before allowing the new state environment.
-Keep those versions available while its snapshots exist. Test repeated restore,
+Upgrade all participating services before allowing these snapshot-capable environments.
+Keep those versions available while their snapshots exist. Test repeated restore,
 guest-agent readiness, network traffic and manager restart before enabling automatic
 suspend/pause. Local base snapshots require the qualified state environment.
-Automatic in-node pool refill boots only the template's latest ready Firecracker
-build; when only CH builds are cached, their pools remain empty. Runtime pool
-capability and clone admission do not override that template-manager selection
-restriction. Ballooning, huge pages and live disk-I/O ceiling updates remain
-refused. GPU assignment is not implemented.
+The x86-64 `ch-54.0-windows-uefi` binding also declares the CH snapshot format.
+With the native spaced agent, it uses the same manual pause/resume,
+suspend/restore, wake and automatic dormancy paths. Agentless Windows remains
+cold-only. Windows image distribution and managed-tenant admission remain
+separate limitations; see [Windows image preparation](../templates/cloud-hypervisor/windows/README.md).
+
+Pool admission, shape defaults, snapshot checks and refill select the same
+eligible build: prefer Firecracker, otherwise use the newest pool-capable build,
+including CH. CH requires a current, bound, memory-capable environment and a
+qualified guest agent; an unbound or agentless CH build is not a donor candidate.
+An existing pool can therefore continue using an older eligible build after an
+agentless build is published. Name-only sandbox creation still resolves the
+latest template build; pin the eligible content hash to claim that build's pool.
+Template-wide base-snapshot policy follows the latest build its reconciler
+prepares, independently of pool selection. Clones retain their donor's guest-image and execution contracts.
+Before copying a paused donor, sandbox-manager captures its current memory so
+the clone's disk and RAM describe the same point in time. This also supplies
+the checkpoint for cold-booted pool donors; capture failure leaves no child.
+Each clone performs this capture, including Firecracker clones. CH writes the
+full guest RAM, increasing I/O and the time a donor remains locked. Pool cloning
+uses a 20-minute RPC budget, longer than the node's 16-minute capture wait.
+A capture wait expiry does not cancel the owned capture: node guards remain
+held until it completes, so a retry cannot overwrite files still being written.
+A permanently stalled provider requires runtime recovery; a caller timeout is
+not evidence that the capture has stopped.
+Base snapshots and pools require an agent qualified for memory lifecycle.
+Windows capture waits for native agent readiness and flushes its volumes;
+the Linux-only systemd app declaration and observer do not apply to Windows.
+Ballooning, huge pages and live disk-I/O ceiling updates remain refused.
+GPU assignment is not implemented.
 Template finalization requires acknowledged Stop before copying the rootfs.
 Future runtime adapters own their boot and control implementation; the shared
 lifecycle retains selection, execution identity, resource fences and cleanup.
@@ -1675,10 +1720,8 @@ keeps the existing E0 default. Leave `SPACE_DEFAULT_EXECUTION_ENVIRONMENT`
 unset. Restart node-manager through the normal deployment mechanism. Installing
 artifacts does not change either setting.
 
-For persisted-state operations, also allow `ch-54.0-linux-7.2.8-state-v1` and use
-that environment's reference for `CH_ENV` throughout the build and create steps.
-Build a template with that binding; do not relabel an existing cold-only template.
-The runtime and kernel install commands are the same for both environments.
+Use the canonical environment reference for `CH_ENV` throughout build, create
+and persisted-state operations. The same binding supports cold boot and snapshots.
 
 On that node, install and resolve the exact sources:
 

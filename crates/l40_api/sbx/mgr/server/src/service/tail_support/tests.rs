@@ -101,3 +101,64 @@ fn restore_uses_explicit_or_captured_allocation_without_inventing_legacy_evidenc
         tonic::Code::InvalidArgument
     );
 }
+
+#[test]
+fn snapshot_identity_uses_durable_binding_when_artifact_metadata_is_missing_or_stale() {
+    use pplx_space_common_core::types::{Arch, SandboxArtifactMetadata, VcpuCount};
+    let conn = crate::db::test_conn();
+    let id = SandboxId::new().to_string();
+    crate::service::tests::service_tests::insert_test_sandbox(&conn, &id, SandboxState::Paused);
+    let mut row = crate::db::get_sandbox(&conn, &id).unwrap().unwrap();
+    let catalog =
+        pplx_space_execution_catalog::catalog::CompiledEnvironment::for_architecture(Arch::X86_64)
+            .unwrap();
+    let execution = catalog
+        .iter()
+        .find(|entry| entry.name() == "ch-54.0-windows-uefi")
+        .unwrap()
+        .definition()
+        .execution_requirements()
+        .unwrap();
+    row.runtime = "ch".into();
+    row.execution_metadata = Some(execution.clone());
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join(&id);
+    std::fs::create_dir(&dir).unwrap();
+    assert_eq!(
+        sandbox_snapshot_execution_metadata_in(root.path(), &row)
+            .unwrap()
+            .execution(),
+        &execution
+    );
+    let budget = VcpuCount::try_from_u32(4).unwrap();
+    let mut stale = SandboxArtifactMetadata::new(
+        id.parse().unwrap(),
+        initial_firecracker_execution_metadata().unwrap(),
+        "seed".parse().unwrap(),
+        None,
+    );
+    stale.cpu_budget = Some(budget);
+    std::fs::write(
+        dir.join("metadata.json"),
+        serde_json::to_vec(&stale).unwrap(),
+    )
+    .unwrap();
+    let snapshot = sandbox_snapshot_execution_metadata_in(root.path(), &row).unwrap();
+    assert_eq!(snapshot.execution(), &execution);
+    assert_eq!(snapshot.cpu_budget(), Some(budget));
+    row.execution_metadata = None;
+    assert!(matches!(
+        sandbox_snapshot_execution_metadata_in(root.path(), &row),
+        Err(RuntimeArtifactReadError::MissingBinding)
+    ));
+    row.runtime = "fc".into();
+    std::fs::remove_file(dir.join("metadata.json")).unwrap();
+    assert_eq!(
+        sandbox_snapshot_execution_metadata_in(root.path(), &row)
+            .unwrap()
+            .execution()
+            .runtime()
+            .kind,
+        RuntimeKind::Firecracker
+    );
+}

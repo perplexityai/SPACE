@@ -214,61 +214,78 @@ fn standalone_refuses_unqualified_memory_devices() {
 
 #[test]
 fn persisted_ch_state_rebinds_host_resources_but_preserves_guest_identity() {
-    let source = validate_standalone(
-        RuntimeKind::CloudHypervisor,
-        &configuration(RuntimeKind::CloudHypervisor, &input()).unwrap(),
-        BootSource::LinuxDirect,
-    )
-    .unwrap();
-    let state = json!({"id":"vm", "snapshots":{}, "snapshot_data":{"sample":[1,2,3]}});
-    let encoded = source.capture_state(state.clone()).unwrap();
-    let mut target_input = input();
-    target_input.tap = "tap9";
-    target_input.mac = "02:00:00:00:00:09";
-    target_input.guest_cid = NonZeroU32::new(12).unwrap();
-    target_input.disk_rate = None;
-    let mut target = validate_standalone(
-        RuntimeKind::CloudHypervisor,
-        &configuration(RuntimeKind::CloudHypervisor, &target_input).unwrap(),
-        BootSource::LinuxDirect,
-    )
-    .unwrap();
-    let rate = pplx_space_common_core::types::RateLimiter {
-        bandwidth: pplx_space_common_core::types::TokenBucket {
-            size: 123456,
-            refill_time_ms: 1000,
-        },
-        operations: pplx_space_common_core::types::TokenBucket {
-            size: 123,
-            refill_time_ms: 1000,
-        },
-    };
-    target.set_disk_rate(rate);
-    let (restored, restored_state) = target.restore_state(&encoded).unwrap();
-    assert_eq!(
-        serde_json::from_slice::<Value>(&restored_state).unwrap(),
-        state
-    );
-    let config: Value = serde_json::from_slice(&restored.encode().unwrap()).unwrap();
-    assert_eq!(config["net"][0]["tap"], "tap9");
-    assert_eq!(config["net"][0]["mac"], "02:00:00:00:00:01");
-    assert_eq!(config["vsock"]["cid"], 3);
-    assert_eq!(config["vsock"]["id"], "space-vsock");
-    assert_eq!(
-        config["disks"][0]["rate_limiter_config"]["bandwidth"]["size"],
-        123456
-    );
-    assert_eq!(
-        config["disks"][0]["rate_limiter_config"]["ops"]["size"],
-        123
-    );
-    assert_eq!(config["payload"]["kernel"], "/vmlinux.bin");
-    assert_eq!(
-        config["landlock_rules"],
-        json!([{"path":"/state","access":"rw"}])
-    );
-    // A restored execution remains capturable without reverting its guest identity.
-    restored.capture_state(state).unwrap();
+    for (os, source_kind) in [
+        (GuestOperatingSystem::Linux, BootSource::LinuxDirect),
+        (GuestOperatingSystem::Windows, BootSource::Uefi),
+    ] {
+        let mut source_input = input();
+        source_input.guest = GuestPlatform {
+            os,
+            architecture: Arch::X86_64,
+        };
+        source_input.source = source_kind;
+        let source = validate_standalone(
+            RuntimeKind::CloudHypervisor,
+            &configuration(RuntimeKind::CloudHypervisor, &source_input).unwrap(),
+            source_kind,
+        )
+        .unwrap();
+        let state = json!({"id":"vm", "snapshots":{}, "snapshot_data":{"sample":[1,2,3]}});
+        let encoded = source.capture_state(state.clone()).unwrap();
+        let mut target_input = source_input;
+        target_input.tap = "tap9";
+        target_input.mac = "02:00:00:00:00:09";
+        target_input.guest_cid = NonZeroU32::new(12).unwrap();
+        target_input.disk_rate = None;
+        let mut target = validate_standalone(
+            RuntimeKind::CloudHypervisor,
+            &configuration(RuntimeKind::CloudHypervisor, &target_input).unwrap(),
+            source_kind,
+        )
+        .unwrap();
+        let rate = pplx_space_common_core::types::RateLimiter {
+            bandwidth: pplx_space_common_core::types::TokenBucket {
+                size: 123456,
+                refill_time_ms: 1000,
+            },
+            operations: pplx_space_common_core::types::TokenBucket {
+                size: 123,
+                refill_time_ms: 1000,
+            },
+        };
+        target.set_disk_rate(rate);
+        let (restored, restored_state) = target.restore_state(&encoded).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&restored_state).unwrap(),
+            state
+        );
+        let config: Value = serde_json::from_slice(&restored.encode().unwrap()).unwrap();
+        assert_eq!(config["net"][0]["tap"], "tap9");
+        assert_eq!(config["net"][0]["mac"], "02:00:00:00:00:01");
+        assert_eq!(config["vsock"]["cid"], 3);
+        assert_eq!(config["vsock"]["id"], "space-vsock");
+        assert_eq!(
+            config["disks"][0]["rate_limiter_config"]["bandwidth"]["size"],
+            123456
+        );
+        assert_eq!(
+            config["disks"][0]["rate_limiter_config"]["ops"]["size"],
+            123
+        );
+        match source_kind {
+            BootSource::LinuxDirect => assert_eq!(config["payload"]["kernel"], "/vmlinux.bin"),
+            BootSource::Uefi => {
+                assert_eq!(config["payload"], json!({"firmware": "/firmware.fd"}));
+                assert_eq!(config["cpus"]["kvm_hyperv"], true);
+            }
+        }
+        assert_eq!(
+            config["landlock_rules"],
+            json!([{"path":"/state","access":"rw"}])
+        );
+        // A restored execution remains capturable without reverting its guest identity.
+        restored.capture_state(state).unwrap();
+    }
 }
 
 #[test]

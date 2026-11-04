@@ -67,7 +67,7 @@ enum Interest {
     Read,
     Write,
 }
-fn ready(socket: &Socket, interest: Interest) -> io::Result<bool> {
+fn ready(socket: &Socket, interest: Interest) -> io::Result<()> {
     let mut set = FD_SET {
         fd_count: 1,
         fd_array: [0; 64],
@@ -98,9 +98,18 @@ fn ready(socket: &Socket, interest: Interest) -> io::Result<bool> {
     };
     if result < 0 {
         // SAFETY: WSAGetLastError reads this thread's last Winsock error.
-        Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }))
+        let code = unsafe { WSAGetLastError() };
+        if code == windows_sys::Win32::Networking::WinSock::WSAEINVAL {
+            // viosock can reject a pending select across resume. Probe the
+            // nonblocking socket as on timeout; errors from accept/read/write
+            // remain authoritative. Pace retries if select keeps failing.
+            std::thread::sleep(IO_TICK);
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(code))
+        }
     } else {
-        Ok(result > 0)
+        Ok(())
     }
 }
 
@@ -187,7 +196,10 @@ impl Listener {
             let mut last_resource_warning = None;
             while !stop.is_cancelled() {
                 match ready(&socket, Interest::Read) {
-                    Ok(false) => continue,
+                    // Treat readiness as a hint for accept too: probe after the
+                    // bounded wait so a missed notification cannot strand a
+                    // pending connection across a VM pause/resume.
+                    Ok(_) => {}
                     Err(error)
                         if listener_retry(&error, &stop, &runtime, &mut last_resource_warning) =>
                     {
@@ -197,7 +209,6 @@ impl Listener {
                         tracing::error!(%error, "viosock listener failed");
                         return Err(error);
                     }
-                    Ok(true) => {}
                 }
                 let (peer, address) = match socket.accept() {
                     Ok(connection) => connection,
@@ -313,8 +324,11 @@ impl Stream {
             let mut buffer = [0; 16 * 1024];
             while !read_stop.is_cancelled() {
                 match ready(&read_socket, Interest::Read) {
-                    Ok(false) => continue,
-                    Ok(true) => {}
+                    // viosock can lose FD_READ while data is already buffered.
+                    // Treat readiness as a hint: after the bounded wait, probe
+                    // the nonblocking socket even on timeout. Otherwise an RPC
+                    // can wait for unrelated traffic until HTTP/2 tears it down.
+                    Ok(_) => {}
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                     Err(error) => {
                         tracing::debug!(%error, "viosock read readiness failed");
@@ -377,8 +391,7 @@ impl Stream {
                                 break 'writing;
                             }
                             match ready(&write_socket, Interest::Write) {
-                                Ok(false) => continue,
-                                Ok(true) => {}
+                                Ok(_) => {}
                                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {
                                     continue;
                                 }

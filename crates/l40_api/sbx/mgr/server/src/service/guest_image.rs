@@ -12,6 +12,36 @@ pub(super) fn require_agent(sandbox: &crate::db::SandboxRow) -> Result<(), Statu
     Ok(())
 }
 
+pub(crate) fn profile_for_sandbox(
+    sandbox: &crate::db::SandboxRow,
+) -> Result<
+    pplx_space_execution_catalog::guest::GuestProfile,
+    pplx_space_execution_catalog::guest::GuestProfileError,
+> {
+    pplx_space_execution_catalog::guest::GuestProfile::for_existing(
+        sandbox.execution_metadata.as_ref(),
+        sandbox.guest_image,
+    )
+}
+
+pub(super) fn memory_lifecycle_unsupported(message: &'static str) -> Status {
+    pplx_space_common_grpc::guest_capability_unsupported_status(
+        pplx_space_common_grpc::GuestCapability::PlatformOperations,
+        message,
+    )
+}
+
+pub(super) fn require_memory_lifecycle(sandbox: &crate::db::SandboxRow) -> Result<(), Status> {
+    let profile = profile_for_sandbox(sandbox)
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    if !profile.supports_memory_lifecycle() {
+        return Err(memory_lifecycle_unsupported(
+            "guest profile is not qualified for memory lifecycle",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn validate_policy(
     image: GuestImageContract,
     execution: Option<&pplx_space_common_core::types::ExecutionMetadata>,
@@ -20,7 +50,7 @@ pub(super) fn validate_policy(
     let profile = pplx_space_execution_catalog::guest::GuestProfile::for_existing(execution, image)
         .map_err(|error| Status::failed_precondition(error.to_string()))?;
     if !profile.supports_memory_lifecycle() && policy.requires_memory_lifecycle() {
-        return Err(Status::failed_precondition(
+        return Err(memory_lifecycle_unsupported(
             "guest profile is not qualified for automatic pause or suspend",
         ));
     }

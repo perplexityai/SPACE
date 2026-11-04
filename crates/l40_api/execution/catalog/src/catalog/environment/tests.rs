@@ -65,7 +65,7 @@ fn compiled_environments_have_complete_distinct_bindings_and_operation_support()
         .map(|entry| entry.definition().reference())
         .collect();
     assert_eq!(references.len(), environments.len());
-    assert_eq!(environments.len(), 6);
+    assert_eq!(environments.len(), 5);
     for (environment, (runtime, kernel, state, memory_state)) in environments.iter().zip([
         ("1.15.1", "6.1.155", "9.0.0", true),
         ("1.17.0", "6.18.44", "12.0.0", true),
@@ -96,48 +96,46 @@ fn compiled_environments_have_complete_distinct_bindings_and_operation_support()
     );
     let arm = CompiledEnvironment::for_architecture(Arch::Aarch64).unwrap();
     assert!(arm.is_empty(), "unqualified ARM64 must not be admitted");
-    let ch = CompiledEnvironment::cloud_hypervisor(
-        &RuntimeCatalog::compiled().unwrap(),
-        Arch::Aarch64,
-        false,
-    )
-    .unwrap();
-    assert!(!ch.supports_memory_state());
+    let ch =
+        CompiledEnvironment::cloud_hypervisor(&RuntimeCatalog::compiled().unwrap(), Arch::Aarch64)
+            .unwrap();
+    assert!(ch.supports_memory_state());
     let execution = ch.definition().execution_requirements().unwrap();
-    assert!(execution.state_format().is_none());
+    assert!(execution.state_format().is_some());
     assert_eq!(
         execution.components()[0].digest,
         Some(ch.kernel().unwrap().sha256)
     );
     let x86_ch = &environments[3];
-    assert_eq!(x86_ch.release().release.kind, RuntimeKind::CloudHypervisor);
-    assert!(!x86_ch.supports_memory_state());
-    let x86_execution = x86_ch.definition().execution_requirements().unwrap();
-    assert_eq!(x86_execution.guest().architecture, Arch::X86_64);
-    assert!(x86_execution.state_format().is_none());
-    assert_ne!(x86_ch.definition().reference(), ch.definition().reference());
     assert_eq!(
         x86_ch.definition().reference().to_string(),
-        "sha256:002536d84a16cadef74e47a9e59072b4eba0c4032cca8a4b2c37354fbe082fad"
+        "sha256:853fb39900b9a5c43217acb836c1af91a1842833d8dc5282d90812429eff8eac"
     );
-    let state_ch = &environments[4];
-    assert!(state_ch.supports_memory_state());
-    assert_ne!(
-        state_ch.definition().reference(),
-        x86_ch.definition().reference()
+    assert_eq!(x86_ch.release().release.kind, RuntimeKind::CloudHypervisor);
+    assert!(x86_ch.supports_memory_state());
+    let x86_execution = x86_ch.definition().execution_requirements().unwrap();
+    assert_eq!(x86_execution.guest().architecture, Arch::X86_64);
+    assert_eq!(
+        x86_execution.state_format().unwrap().version.as_str(),
+        "54.0.1"
     );
+    assert_ne!(x86_ch.definition().reference(), ch.definition().reference());
 }
 
 #[test]
-fn firmware_environment_has_no_kernel_and_is_not_a_default_or_snapshot_loader() {
+fn firmware_environment_qualifies_memory_state_but_requires_an_agent_for_lifecycle() {
     let catalog = CompiledEnvironment::for_architecture(Arch::X86_64).unwrap();
     let entry = catalog
         .iter()
         .find(|e| e.name() == "ch-54.0-windows-uefi")
         .unwrap();
     let execution = entry.definition().execution_requirements().unwrap();
+    assert_eq!(
+        entry.definition().reference().to_string(),
+        "sha256:59288b0e38312eba7d2d586656e280075a852b6949105ad5264652ac78aadcf6"
+    );
     assert!(entry.kernel().is_none());
-    assert!(!entry.supports_memory_state());
+    assert!(entry.supports_memory_state());
     assert_eq!(execution.guest().os, GuestOperatingSystem::Windows);
     use pplx_space_common_core::types::guest_image::{
         GuestAgent, GuestDiskLayout, GuestImageContract, GuestNetwork, GuestReadiness,
@@ -166,14 +164,14 @@ fn firmware_environment_has_no_kernel_and_is_not_a_default_or_snapshot_loader() 
         native.agent_protocol(),
         crate::guest::QualifiedGuestAgent::WindowsV1
     );
-    assert!(!native.supports_memory_lifecycle());
+    assert!(native.supports_memory_lifecycle());
     assert!(!native.supports_process_environment());
     assert_eq!(native.shutdown(), crate::guest::GuestShutdown::Acpi);
     let legacy =
         crate::guest::GuestProfile::resolve_optional(None, GuestImageContract::default()).unwrap();
     assert!(legacy.supports_memory_lifecycle());
     assert!(legacy.supports_process_environment());
-    assert!(execution.state_format().is_none());
+    assert_eq!(execution.state_format().unwrap().version.as_str(), "54.0.1");
     assert_eq!(execution.components().len(), 1);
     assert_eq!(
         execution.components()[0].kind,

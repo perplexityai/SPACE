@@ -55,6 +55,61 @@ async fn missing_socket_is_an_error() {
     ));
 }
 
+#[tokio::test]
+async fn shutdown_resumes_a_paused_guest_and_does_not_replay_failed_mutations() {
+    for (state, resume_status, power_status) in [
+        ("Running", 204, 204),
+        ("Paused", 204, 204),
+        ("Paused", 500, 204),
+        ("Paused", 204, 500),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server =
+            tokio::spawn(async move {
+                let info = format!(r#"{{"state":"{state}"}}"#);
+                let mut requests = vec![("GET", "vm.info", 200, info.as_str())];
+                if state == "Paused" {
+                    requests.push(("PUT", "vm.resume", resume_status, ""));
+                }
+                requests.push(("PUT", "vm.power-button", power_status, ""));
+                for (method, endpoint, status, body) in requests {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut bytes = Vec::new();
+                    while !bytes.ends_with(b"\r\n\r\n") {
+                        bytes.push(stream.read_u8().await.unwrap());
+                    }
+                    assert!(bytes.starts_with(
+                        format!("{method} /api/v1/{endpoint} HTTP/1.1\r\n").as_bytes()
+                    ));
+                    stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 {status} Result\r\nContent-Length: {}\r\n\r\n{body}",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                    if status >= 400 {
+                        break;
+                    }
+                }
+            });
+        let result = Client::new(socket, peer()).request_guest_shutdown().await;
+        if resume_status >= 400 || power_status >= 400 {
+            assert!(
+                matches!(result, Err(ControlError::CloudHypervisor(ApiError::Status { code, .. })) if code == StatusCode::INTERNAL_SERVER_ERROR)
+            );
+        } else {
+            result.unwrap();
+        }
+        server.await.unwrap();
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn deadline_includes_a_stalled_response() {
     for (operation, expected_seconds) in [(0, 2), (1, 10), (2, 572)] {

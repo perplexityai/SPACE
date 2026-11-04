@@ -1,5 +1,5 @@
 # Install the native service and optionally provision a regular process/file account.
-# This does not qualify VM memory lifecycle.
+# Memory lifecycle also requires the qualified CH environment and matching host services.
 [CmdletBinding()]
 param([Parameter(Mandatory = $true)][string]$Executable, [switch]$EnableOperations)
 $ErrorActionPreference = 'Stop'

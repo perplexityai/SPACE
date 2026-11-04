@@ -502,50 +502,63 @@ async fn lost_mutation_replies_are_not_replayed_by_host_or_client() {
 }
 
 #[tokio::test]
-async fn windows_policy_dispatches_files_and_refuses_unqualified_flush() {
+async fn windows_policy_dispatches_files_and_only_advertised_flush() {
     use pplx_space_spaced_common::proto::platform::{
         GuestOperation, GuestOs, GuestPlatformDescriptor,
     };
-    let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("guest.sock");
-    let flush_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let guest = crate::mock_bridge_guest::start_mock_bridge_guest_with_service(
-        socket.clone(),
-        crate::mock_bridge_guest::MockBridgeGuest {
-            flush_calls: flush_calls.clone(),
-            platform: Some(GuestPlatformDescriptor {
-                os: GuestOs::Windows as i32,
-                operations: vec![GuestOperation::Files as i32, GuestOperation::Flush as i32],
-            }),
-            ..Default::default()
-        },
-    )
-    .await;
-    let fixture = HostFixture::start_with_policy(
-        pplx_space_spaced_host_server::BridgeGuestConnector::Uds(socket),
-        pplx_space_spaced_host_server::QualifiedGuestAgent::WindowsV1,
-    )
-    .await;
-    let client = fixture.client().await;
-    assert!(
-        client
-            .stat("C:\\test.txt".into())
-            .await
-            .unwrap()
-            .info
-            .is_some()
-    );
-    let error = client
-        .flush_guest_filesystems(std::time::Duration::from_secs(1))
-        .await
-        .unwrap_err();
-    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-    assert_eq!(
-        pplx_space_common_grpc::GuestCapabilityUnsupported::from_status(&error)
-            .map(|unsupported| unsupported.capability),
-        Some(pplx_space_common_grpc::GuestCapability::PlatformOperations)
-    );
-    assert_eq!(flush_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-    fixture.stop().await;
-    guest.abort();
+    for advertises_flush in [false, true] {
+        let mut operations = vec![GuestOperation::Files as i32];
+        if advertises_flush {
+            operations.push(GuestOperation::Flush as i32);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("guest.sock");
+        let flush_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let guest = crate::mock_bridge_guest::start_mock_bridge_guest_with_service(
+            socket.clone(),
+            crate::mock_bridge_guest::MockBridgeGuest {
+                flush_calls: flush_calls.clone(),
+                platform: Some(GuestPlatformDescriptor {
+                    os: GuestOs::Windows as i32,
+                    operations,
+                }),
+                ..Default::default()
+            },
+        )
+        .await;
+        let fixture = HostFixture::start_with_policy(
+            pplx_space_spaced_host_server::BridgeGuestConnector::Uds(socket),
+            pplx_space_spaced_host_server::QualifiedGuestAgent::WindowsV1,
+        )
+        .await;
+        let client = fixture.client().await;
+        assert!(
+            client
+                .stat("C:\\test.txt".into())
+                .await
+                .unwrap()
+                .info
+                .is_some()
+        );
+        let result = client
+            .flush_guest_filesystems(std::time::Duration::from_secs(1))
+            .await;
+        if advertises_flush {
+            result.expect("qualified and advertised flush is dispatched");
+        } else {
+            let error = result.unwrap_err();
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+            assert_eq!(
+                pplx_space_common_grpc::GuestCapabilityUnsupported::from_status(&error)
+                    .map(|unsupported| unsupported.capability),
+                Some(pplx_space_common_grpc::GuestCapability::PlatformOperations)
+            );
+        }
+        assert_eq!(
+            flush_calls.load(std::sync::atomic::Ordering::SeqCst),
+            usize::from(advertises_flush)
+        );
+        fixture.stop().await;
+        guest.abort();
+    }
 }

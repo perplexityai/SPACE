@@ -7,13 +7,19 @@ use crate::service::cleanup_support::{
 use crate::service::recovery::CleanupRecoveryAuthority;
 
 fn armed_clone() -> (SandboxManagerService, SandboxId, SandboxCleanupEpisodeId) {
+    armed_clone_with_image(Default::default())
+}
+
+fn armed_clone_with_image(
+    guest_image: pplx_space_common_core::types::guest_image::GuestImageContract,
+) -> (SandboxManagerService, SandboxId, SandboxCleanupEpisodeId) {
     let conn = crate::db::test_conn();
     let id = SandboxId::new();
     let cleanup_id = SandboxCleanupEpisodeId::new();
     crate::db::insert_sandbox_with_cleanup_episode_and_route_evidence(
         &conn,
         crate::db::InsertSandboxParams {
-            guest_image: Default::default(),
+            guest_image,
             id: &id.to_string(),
             uuid8: &SandboxRuntimeLabel::from_sandbox_id(id),
             state: SandboxState::Creating,
@@ -48,6 +54,112 @@ fn armed_clone() -> (SandboxManagerService, SandboxId, SandboxCleanupEpisodeId) 
     )
     .unwrap();
     (SandboxManagerService::for_test(conn), id, cleanup_id)
+}
+
+#[tokio::test]
+async fn cloning_preserves_guest_contract_and_requires_current_checkpoint() {
+    use crate::node_manager_transport::fake::FakeNodeManager;
+    use crate::template_resolver::fake::FakeTemplateResolver;
+    use pplx_space_common_svc::template_lookup::TemplateLookupScope;
+    use pplx_space_node_mgr_client::proto::{
+        CaptureVmStateRequest, CaptureVmStateResponse, CloneCapabilitiesRequest,
+        CloneCapabilitiesResponse, CloneSandboxRequest, CloneSandboxResponse,
+    };
+    use pplx_space_template_mgr_client::proto::{GetTemplateResponse, TemplateRef};
+
+    let native = serde_json::from_value(serde_json::json!({
+        "version": 1, "disk": "opaque_raw_disk", "network": "slot_dhcp_v1",
+        "agent": "spaced", "readiness": {"kind": "agent"}
+    }))
+    .unwrap();
+    for (image, capture_fails) in [(Default::default(), false), (native, false), (native, true)] {
+        let (mut service, donor, episode) = armed_clone_with_image(image);
+        let donor = donor.to_string();
+        {
+            let db = service.db.lock().unwrap();
+            assert!(crate::db::complete_pool_clone(&db, &donor, episode).unwrap());
+            crate::db::test_fixtures::state_write_fixtures::force_state(
+                &db,
+                &donor,
+                SandboxState::Paused,
+            );
+        }
+        let cache = tempfile::tempdir().unwrap();
+        service.create_cache_dir = Some(cache.path().to_owned());
+        let template = tempfile::tempdir().unwrap();
+        std::fs::write(template.path().join("metadata.json"), serde_json::json!({
+            "arch": std::env::consts::ARCH,
+            "spaced_version": pplx_space_spaced_common::spaced_version(),
+            "spaced_compatibility_family": pplx_space_spaced_common::spaced_compatibility_family(),
+        }).to_string()).unwrap();
+        let directory = template.path().to_str().unwrap().to_string();
+        service.template_resolver = Arc::new(FakeTemplateResolver::new(move || {
+            let mut response = Response::new(GetTemplateResponse {
+                template: Some(TemplateRef {
+                    name: "seed".into(),
+                    content_hash: Some("sha256:test".into()),
+                    tag: None,
+                }),
+                template_dir: directory.clone(),
+                arch: std::env::consts::ARCH.into(),
+                network_policy_authority: crate::db::PolicyAuthority::Local.as_proto_i32(),
+                auto_lifecycle_authority: crate::db::PolicyAuthority::Local.as_proto_i32(),
+                ..Default::default()
+            });
+            TemplateLookupScope::LocalExecution.receipt(&mut response);
+            Ok(response)
+        }));
+        let node = FakeNodeManager::default()
+            .unary("GetCloneCapabilities", |_: CloneCapabilitiesRequest| {
+                Ok(CloneCapabilitiesResponse {
+                    prepared_clone_disposal: true,
+                })
+            })
+            .unary("CaptureVmState", move |_: CaptureVmStateRequest| {
+                if capture_fails {
+                    Err(Status::unavailable("capture failed"))
+                } else {
+                    Ok(CaptureVmStateResponse {})
+                }
+            })
+            .unary("CloneSandboxIntoPreparedRoot", |_: CloneSandboxRequest| {
+                Ok(CloneSandboxResponse {})
+            })
+            .serve();
+        service.node_manager = node.connector();
+        let result = service
+            .clone_from_donor(internal_request(CloneFromDonorRequest {
+                donor_sandbox_id: donor,
+                template: "seed".into(),
+                owner: "deploy@local".into(),
+                pool_template: Some("seed".into()),
+            }))
+            .await;
+        if capture_fails {
+            assert_eq!(result.unwrap_err().code(), tonic::Code::Unavailable);
+            assert_eq!(
+                crate::db::list_sandboxes(&service.db.lock().unwrap())
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert!(
+                !node
+                    .calls()
+                    .iter()
+                    .any(|method| method == "CloneSandboxIntoPreparedRoot")
+            );
+            continue;
+        }
+        let cloned = result.unwrap().into_inner();
+        assert_eq!(
+            service
+                .lookup_sandbox(&cloned.sandbox_id)
+                .unwrap()
+                .guest_image,
+            image
+        );
+    }
 }
 
 #[tokio::test]

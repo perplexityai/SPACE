@@ -303,6 +303,74 @@ async fn shutdown_wait_finishes_on_exit_but_not_on_missing_process_evidence() {
 }
 
 #[tokio::test]
+async fn agentless_memory_lifecycle_refuses_before_changing_state_or_contacting_workers() {
+    for (action, state) in [
+        ("pause", SandboxState::Started),
+        ("resume", SandboxState::Paused),
+        ("suspend", SandboxState::Started),
+        ("suspend", SandboxState::Paused),
+    ] {
+        let conn = crate::db::test_conn();
+        let id = SandboxId::new().to_string();
+        insert_firmware_sandbox(&conn, &id, state, image());
+        let catalog = pplx_space_execution_catalog::catalog::CompiledEnvironment::for_architecture(
+            pplx_space_common_core::types::Arch::X86_64,
+        )
+        .unwrap();
+        let execution = catalog
+            .iter()
+            .find(|entry| entry.name() == "ch-54.0-windows-uefi")
+            .unwrap()
+            .definition()
+            .execution_requirements()
+            .unwrap();
+        crate::db::upsert_sandbox_execution_metadata(&conn, &id, &execution).unwrap();
+        let node = FakeNodeManager::default().serve();
+        let service = SandboxManagerService::new_with_options(
+            conn,
+            SandboxManagerServiceOptions {
+                node_manager: node.connector(),
+                ..SandboxManagerServiceOptions::for_test()
+            },
+        );
+        let error = if action == "pause" {
+            service
+                .pause(super::super::activation_support::internal_request(
+                    PauseRequest {
+                        sandbox_id: id.clone(),
+                    },
+                ))
+                .await
+                .unwrap_err()
+        } else if action == "resume" {
+            service
+                .resume(super::super::activation_support::internal_request(
+                    ResumeRequest {
+                        sandbox_id: id.clone(),
+                        ..Default::default()
+                    },
+                ))
+                .await
+                .unwrap_err()
+        } else {
+            service
+                .suspend(super::super::activation_support::internal_request(
+                    SuspendRequest {
+                        sandbox_id: id.clone(),
+                        ..Default::default()
+                    },
+                ))
+                .await
+                .unwrap_err()
+        };
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(pplx_space_common_grpc::GuestCapabilityUnsupported::from_status(&error).is_some());
+        assert_eq!(service.lookup_sandbox(&id).unwrap().state, state);
+        assert!(node.calls().is_empty());
+    }
+}
+
+#[tokio::test]
 async fn windows_environment_update_refuses_before_persistence_but_allows_clearing() {
     use pplx_space_common_core::types::guest_image::GuestAgent;
     let conn = crate::db::test_conn();
@@ -362,4 +430,56 @@ async fn windows_environment_update_refuses_before_persistence_but_allows_cleari
     service.update(request(Default::default())).await.unwrap();
     assert!(service.lookup_sandbox(&id).unwrap().process_env.is_empty());
     assert!(node.calls().is_empty());
+}
+
+#[tokio::test]
+async fn restored_windows_registration_preserves_guest_identity_and_native_app_readiness() {
+    use crate::service::activation_support::internal_request;
+    use pplx_space_common_core::types::Arch;
+    let native = GuestImageContract::new(
+        GuestDiskLayout::OpaqueRawDisk,
+        GuestReadiness::Agent,
+        GuestNetwork::SlotDhcpV1,
+        pplx_space_common_core::types::guest_image::GuestAgent::Spaced,
+    )
+    .unwrap();
+    let catalog =
+        pplx_space_execution_catalog::catalog::CompiledEnvironment::for_architecture(Arch::X86_64)
+            .unwrap();
+    let execution = catalog
+        .iter()
+        .find(|entry| entry.name() == "ch-54.0-windows-uefi")
+        .unwrap()
+        .definition()
+        .execution_requirements()
+        .unwrap();
+    let conn = crate::db::test_conn();
+    let id = SandboxId::new().to_string();
+    insert_firmware_sandbox(&conn, &id, SandboxState::Started, native);
+    crate::db::upsert_sandbox_execution_metadata(&conn, &id, &execution).unwrap();
+    crate::db::update_user(
+        &conn,
+        &id,
+        &pplx_space_common_core::types::TEMPLATE_MANAGER_SANDBOX_OWNER,
+    )
+    .unwrap();
+    let service = SandboxManagerService::for_test(conn);
+    // Cold activation, restore and manager recovery all register from this
+    // durable row after committing the current runtime fields.
+    service.watchdog.rearm_sandbox_from_db(&id).await;
+    let info = service.watchdog.sidecar_info_for_test(&id).await.unwrap();
+    assert_eq!(info.guest_image, native);
+    let row = service.lookup_sandbox(&id).unwrap();
+    assert_eq!(
+        profile_for_sandbox(&row).unwrap().agent_protocol(),
+        pplx_space_common_core::types::guest_image::QualifiedGuestAgent::WindowsV1
+    );
+    let response = service
+        .wait_template_apps(internal_request(crate::proto::WaitTemplateAppsRequest {
+            sandbox_id: id,
+        }))
+        .await
+        .unwrap();
+    assert!(response.into_inner().warnings.is_empty());
+    service.shutdown_token.cancel();
 }

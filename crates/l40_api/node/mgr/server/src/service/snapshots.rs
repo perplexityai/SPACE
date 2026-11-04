@@ -404,7 +404,7 @@ impl NodeManagerService {
         let selected_environment = request.get_ref().environment_reference;
         let sandbox_id = request.get_ref().sandbox_id.as_str().to_owned();
         let service = self.clone();
-        self.run_owned_sandbox_work(&sandbox_id, async move {
+        wait_for_capture(self.run_owned_sandbox_work(&sandbox_id, async move {
             let _vm_guard = service
                 .lock_sandbox_vm_cgroup_launch(request.get_ref().sandbox_id.as_str())
                 .await;
@@ -444,20 +444,16 @@ impl NodeManagerService {
                     selected_environment,
                 )
                 .await?;
-            let runtime = service
+            let execution = service
                 .recorded_execution(req.sandbox_id.as_str().to_owned())
-                .await?
-                .map_or(
-                    pplx_space_common_core::types::RuntimeKind::Firecracker,
-                    |execution| execution.runtime().kind,
-                );
-            if runtime == pplx_space_common_core::types::RuntimeKind::CloudHypervisor {
+                .await?;
+            if let Some(boot_source) = snapshot_boot_source(execution.as_ref())? {
                 return service
-                    .capture_cloud_hypervisor_state(request, destination)
+                    .capture_cloud_hypervisor_state(request, destination, boot_source)
                     .await;
             }
             service.create_snapshot_inner(request, destination).await
-        })
+        }))
         .await
     }
 
@@ -771,16 +767,18 @@ impl NodeManagerService {
             ),
         };
 
-        let runtime = self
+        let execution = self
             .recorded_execution(req.sandbox_id.as_str().to_owned())
-            .await?
-            .map_or(
-                pplx_space_common_core::types::RuntimeKind::Firecracker,
-                |execution| execution.runtime().kind,
-            );
-        if runtime == pplx_space_common_core::types::RuntimeKind::CloudHypervisor {
+            .await?;
+        if let Some(boot_source) = snapshot_boot_source(execution.as_ref())? {
             return self
-                .restore_cloud_hypervisor_state(request, &lease, source, rootfs_limiter)
+                .restore_cloud_hypervisor_state(
+                    request,
+                    &lease,
+                    source,
+                    boot_source,
+                    rootfs_limiter,
+                )
                 .await;
         }
 
@@ -1686,6 +1684,38 @@ async fn stop_runtime_for_encrypted_seal(
             Err(error) => return Err(error),
         }
     }
+}
+
+/// Capture may outlive its RPC waiter. The owned task retains its node guards
+/// until it actually finishes; expiry never authorizes replay over live writes.
+async fn wait_for_capture<T>(
+    work: impl std::future::Future<Output = Result<T, Status>>,
+) -> Result<T, Status> {
+    tokio::time::timeout(
+        pplx_space_node_mgr_client::MEMORY_CAPTURE_WAIT_TIMEOUT,
+        work,
+    )
+    .await
+    .map_err(|_| {
+        tracing::warn!(
+            "memory capture waiter expired; owned capture retains node guards until completion"
+        );
+        Status::deadline_exceeded(
+            "memory capture exceeded its wait budget; unfinished capture remains fenced",
+        )
+    })?
+}
+
+fn snapshot_boot_source(
+    execution: Option<&pplx_space_common_core::types::ExecutionMetadata>,
+) -> Result<Option<pplx_space_node_runtime_core::boot::BootSource>, Status> {
+    execution
+        .filter(|execution| {
+            execution.runtime().kind == pplx_space_common_core::types::RuntimeKind::CloudHypervisor
+        })
+        .map(pplx_space_node_runtime_core::boot::BootSource::from_execution)
+        .transpose()
+        .map_err(|error| Status::failed_precondition(error.to_string()))
 }
 
 #[cfg(test)]

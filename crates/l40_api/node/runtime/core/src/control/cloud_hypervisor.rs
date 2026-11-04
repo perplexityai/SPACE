@@ -209,6 +209,11 @@ impl RuntimeControl for Client {
     }
     fn request_guest_shutdown(&self) -> ControlFuture<'_, ()> {
         Box::pin(async move {
+            // A paused guest cannot handle the ACPI interrupt. The caller holds
+            // the execution fence and control gate through resume and shutdown.
+            if matches!(self.info().await?.state, State::Paused) {
+                self.set_paused(false).await?;
+            }
             self.request(
                 Method::PUT,
                 "/api/v1/vm.power-button",
