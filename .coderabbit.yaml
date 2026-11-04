@@ -68,10 +68,16 @@ reviews:
           - "docs/versioning.md"
           - "docs/rust/space-conventions.md"
           - "docs/rust/space-review-lessons.md"
-          # CI workflows, smoke selection, and repository guards.
+          # CI workflows, the CI scripts that decide which checks run or pass,
+          # and repository guards.
           - ".github/**"
           - "ci/kind-pull-paths.txt"
           - "ci/kind-direct-known-failures.txt"
+          - "ci/scripts/kind-pull-needed.sh"
+          - "ci/scripts/pull-ci-reuse.py"
+          - "ci/scripts/resolve-migration-base.sh"
+          - "ci/scripts/lib/test-deps.sh"
+          - "ci/scripts/check-*"
           - "scripts/source_guards/**"
           - "scripts/check*"
           - "clippy.toml"
