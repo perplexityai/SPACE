@@ -368,7 +368,7 @@ pub(super) async fn select_activation_rollback_candidates(
             AND execution.activation_attempt_id = input.transition_receipt_activation_attempt_id
           WHERE s.active_node_id = $1
             AND input.transition_receipt_kind = $3
-            AND LOWER(TRIM(input.status)) = input.transition_receipt_target_state
+            AND input.published_lifecycle = input.transition_receipt_target_state
             AND input.transition_receipt_target_state IN ('created', 'stopped', 'suspended')
             AND LOWER(TRIM(s.lifecycle)) NOT IN (
                 'quarantined', 'deleted', 'deleting', 'cleanup_required'
@@ -586,16 +586,16 @@ pub(super) async fn recover_pause_failed_from_inventory(
     let quarantine_reason =
         pplx_space_sandbox_store::ingest::PAUSE_FAILED_QUARANTINE_REASON.as_str();
     let candidates: Vec<(Uuid, Uuid, String)> = sqlx::query_as(sql!(
-        "SELECT s.id, qs.quarantine_id, LOWER(TRIM(input.status))
+        "SELECT s.id, qs.quarantine_id, input.published_lifecycle
            FROM sandboxes s
            JOIN jsonb_to_recordset($2::jsonb) AS input(
                sandbox_id UUID,
-               status TEXT
+               published_lifecycle TEXT
            ) ON input.sandbox_id = s.id
            JOIN sandbox_quarantine_state qs ON qs.sandbox_id = s.id
           WHERE s.active_node_id = $1
             AND LOWER(TRIM(s.lifecycle)) = 'quarantined'
-            AND LOWER(TRIM(input.status)) IN ('started', 'paused')
+            AND input.published_lifecycle IN ('started', 'paused')
             AND qs.source = $3
             AND qs.reason_code = $4
           FOR UPDATE OF s, qs"
@@ -733,7 +733,7 @@ pub(super) async fn select_suspended_projection_candidates(
            JOIN input ON input.sandbox_id = s.id
            LEFT JOIN sandbox_quarantine_state qs ON qs.sandbox_id = s.id
           WHERE s.active_node_id = $1
-            AND LOWER(TRIM(input.status)) = 'suspended'
+            AND input.published_lifecycle = 'suspended'
             AND (
                 (
                     {lifecycle_eligible}
