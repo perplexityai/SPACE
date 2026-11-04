@@ -451,13 +451,13 @@ fn resolve_sandbox_cgroup_config(
     if config.vcpu_count == Some(0) {
         return Err(RunNodeMgrError::SandboxCgroupVcpuCountZero);
     }
-    if let Some(memory_mib) = config.memory_mib {
-        if crate::cgroup::sandbox_guest_memory_max_mib(memory_mib).unwrap_or(0) == 0 {
-            return Err(RunNodeMgrError::SandboxCgroupMemoryBelowHeadroom {
-                memory_mib,
-                headroom_mib: crate::cgroup::sandbox_memory_headroom_mib(1),
-            });
-        }
+    if let Some(memory_mib) = config.memory_mib
+        && crate::cgroup::sandbox_guest_memory_max_mib(memory_mib).unwrap_or(0) == 0
+    {
+        return Err(RunNodeMgrError::SandboxCgroupMemoryBelowHeadroom {
+            memory_mib,
+            headroom_mib: crate::cgroup::sandbox_memory_headroom_mib(1),
+        });
     }
     Ok(config)
 }
