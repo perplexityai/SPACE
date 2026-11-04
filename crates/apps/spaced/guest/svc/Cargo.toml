@@ -27,5 +27,9 @@ test-hooks = ["pplx-space-spaced-guest-server/test-hooks"]
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 
-# internal
+[target.'cfg(unix)'.dependencies]
 pplx-space-spaced-guest-server = { workspace = true, features = ["service-entrypoint"] }
+
+[target.'cfg(windows)'.dependencies]
+pplx-space-spaced-guest-windows = { workspace = true }
+tracing-subscriber = { workspace = true }

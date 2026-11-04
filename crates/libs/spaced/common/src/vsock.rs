@@ -56,8 +56,7 @@ pub fn bind_vsock(port: u32) -> std::io::Result<tokio_vsock::VsockListener> {
     ))
 }
 
-pub const BRIDGE_HOST_VSOCK_PORT: u32 = 5001;
-pub const BRIDGE_GUEST_VSOCK_PORT: u32 = 5002;
+pub use pplx_space_spaced_guest_protocol::{BRIDGE_GUEST_VSOCK_PORT, BRIDGE_HOST_VSOCK_PORT};
 
 /// The largest bridge-guest `Ping` response a host decodes. A drain carries at
 /// most a few dozen callsites, a few kilobytes; the guest is tenant-controlled,

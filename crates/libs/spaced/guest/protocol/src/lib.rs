@@ -20,6 +20,10 @@ pub mod proto {
     }
 }
 
+/// Host and guest endpoints of the shared vsock bridge.
+pub const BRIDGE_HOST_VSOCK_PORT: u32 = 5001;
+pub const BRIDGE_GUEST_VSOCK_PORT: u32 = 5002;
+
 pub mod filesystem_limits;
 pub mod platform;
 pub mod process_limits;
@@ -46,3 +50,24 @@ impl std::fmt::Debug for proto::operations::SendInputRequest {
 mod tests;
 
 pub mod admission_queue;
+
+/// SemVer compatibility family used by guest artifacts and readiness.
+pub fn spaced_compatibility_family_for_version(version: &str) -> Result<String, semver::Error> {
+    let version = semver::Version::parse(version)?;
+    Ok(compatibility_family(&version))
+}
+
+pub fn compatibility_family(version: &semver::Version) -> String {
+    if version.major != 0 {
+        version.major.to_string()
+    } else if version.minor != 0 {
+        format!("0.{}", version.minor)
+    } else {
+        format!("0.0.{}", version.patch)
+    }
+}
+
+pub fn spaced_compatibility_family() -> String {
+    spaced_compatibility_family_for_version(env!("CARGO_PKG_VERSION"))
+        .expect("CARGO_PKG_VERSION is valid SemVer")
+}

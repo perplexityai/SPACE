@@ -20,9 +20,17 @@ pub fn protobuf_include_dir() -> Result<PathBuf, ProtobufIncludeDirError> {
     if let Ok(protoc) = std::env::var("PROTOC") {
         push_protoc_include_candidate(&mut candidates, protoc.trim());
     }
-    if let Ok(output) = std::process::Command::new("which").arg("protoc").output() {
-        let protoc = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        push_protoc_include_candidate(&mut candidates, &protoc);
+    // Build dependencies execute on HOST, even when generating code for a
+    // different TARGET. Search the host PATH without requiring a Unix shell.
+    if let Some(path) = std::env::var_os("PATH") {
+        let executable = format!("protoc{}", std::env::consts::EXE_SUFFIX);
+        for directory in std::env::split_paths(&path) {
+            let protoc = directory.join(&executable);
+            if protoc.is_file() {
+                push_protoc_include_candidate(&mut candidates, &protoc.to_string_lossy());
+                break;
+            }
+        }
     }
     candidates.push(PathBuf::from("/usr/include"));
     candidates.push(PathBuf::from("/usr/local/include"));
