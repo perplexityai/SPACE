@@ -1,0 +1,64 @@
+name: CodeRabbit approval reset
+
+# Dismisses CodeRabbit's approval once it no longer describes the pull
+# request: after new commits, and after the base branch changes. The main
+# branch rules keep approvals across pushes, and CodeRabbit withdraws its own
+# approval only when it reviews a newer commit. Without this workflow, an
+# approval given for one commit would still count if CodeRabbit never reviewed
+# the next one, for example while reviews are paused. CodeRabbit approves again
+# after it reviews the new head. Approvals from people are not touched.
+#
+# pull_request_target runs with a write token even for pull requests from
+# forks, so this workflow must stay inert toward contributor content: it never
+# checks out, builds, or runs pull request code, and it never places titles,
+# bodies, branch names, or other contributor-controlled text in a shell
+# command. It uses only the pull request number, the repository name, and the
+# review IDs, authors, states, and commit IDs that the API returns.
+
+on:
+  pull_request_target:
+    types: [synchronize, edited]
+
+permissions: {}
+
+# The newest run reads the current head itself, so a run that replaces a
+# waiting one loses nothing.
+concurrency:
+  group: coderabbit-approval-reset-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  dismiss:
+    # An `edited` event matters only when the base branch changed.
+    if: >-
+      github.repository == 'perplexityai/SPACE' &&
+      (github.event.action == 'synchronize' || github.event.changes.base != null)
+    name: Dismiss CodeRabbit's outdated approval
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Dismiss approvals that do not cover the current head and base
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.pull_request.number }}
+          BASE_CHANGED: ${{ github.event.action == 'edited' }}
+        run: |
+          set -euo pipefail
+          # Read the head now, not from the event: a later push may already
+          # have landed, and its approval must stay.
+          head="$(gh api "repos/${GH_REPO}/pulls/${NUMBER}" --jq '.head.sha')"
+          # After a base change, every earlier approval was given for a
+          # different diff, even on the same head.
+          ids="$(gh api --paginate "repos/${GH_REPO}/pulls/${NUMBER}/reviews" \
+            --jq ".[] | select(.user.login == \"coderabbitai[bot]\"
+                             and .state == \"APPROVED\"
+                             and (${BASE_CHANGED} or .commit_id != \"${head}\")) | .id")"
+          for id in ${ids}; do
+            gh api --method PUT \
+              "repos/${GH_REPO}/pulls/${NUMBER}/reviews/${id}/dismissals" \
+              -f event=DISMISS \
+              -f message="The pull request changed after this approval. CodeRabbit approves again after it reviews the current head."
+          done
