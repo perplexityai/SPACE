@@ -332,6 +332,12 @@ pub enum PoolOpenError {
         #[source]
         source: crate::firewall::FirewallError,
     },
+    #[error("cannot list nftables ruleset in namespace {namespace}: {source}")]
+    NamespaceRuleset {
+        namespace: String,
+        #[source]
+        source: crate::firewall::FirewallError,
+    },
     #[error("cannot inspect existing TAP containment boundary in namespace {namespace}: {source}")]
     ExistingTapProbe {
         namespace: String,
@@ -735,7 +741,8 @@ impl NetworkPool {
         reconcile_runtime_state(&mut conn, &config).map_err(SlotStoreError::from)?;
         // Existing durable TAP namespaces must carry both containments before
         // the node admits work: guest L2 ingress filtering and the constrained
-        // direct inbound reply path. Probe each TAP once and apply both.
+        // direct inbound reply path. Probe each TAP once, apply the L2 policy,
+        // then list the ruleset once to check it and repair the reply path.
         let namespaces: Vec<_> = query_records(&conn, None)
             .map_err(SlotStoreError::from)?
             .into_iter()

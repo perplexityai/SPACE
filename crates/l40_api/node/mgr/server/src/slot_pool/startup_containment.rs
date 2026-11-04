@@ -77,7 +77,34 @@ pub(super) fn contain_namespace(namespace: &str) -> Result<bool, PoolOpenError> 
         return Ok(false);
     }
     let mut error = None;
-    if let Err(source) = firewall::ensure_guest_l2_ingress_policy(namespace) {
+    // Apply first, so the listing below shows the policy as just installed.
+    let l2_applied = match firewall::apply_guest_l2_ingress_policy(namespace) {
+        Ok(()) => true,
+        Err(source) => {
+            let failure = PoolOpenError::GuestL2Ingress {
+                namespace: namespace.into(),
+                source: source.into(),
+            };
+            tracing::error!(%failure, "cannot install existing TAP containment");
+            error = Some(failure);
+            false
+        }
+    };
+    // Both checks read one listing, so a listing failure fails both.
+    let ruleset = match firewall::NamespaceRuleset::list(namespace) {
+        Ok(ruleset) => ruleset,
+        Err(source) => {
+            let failure = PoolOpenError::NamespaceRuleset {
+                namespace: namespace.into(),
+                source,
+            };
+            tracing::error!(%failure, "cannot inspect existing TAP containment");
+            return Err(error.unwrap_or(failure));
+        }
+    };
+    if l2_applied
+        && let Err(source) = firewall::validate_guest_l2_ingress_policy(namespace, &ruleset)
+    {
         let failure = PoolOpenError::GuestL2Ingress {
             namespace: namespace.into(),
             source,
@@ -85,7 +112,7 @@ pub(super) fn contain_namespace(namespace: &str) -> Result<bool, PoolOpenError> 
         tracing::error!(%failure, "cannot install existing TAP containment");
         error = Some(failure);
     }
-    if let Err(source) = firewall::constrain_direct_inbound_reply_path(namespace) {
+    if let Err(source) = firewall::constrain_direct_inbound_reply_path(namespace, &ruleset) {
         let failure = PoolOpenError::DirectInboundReplyPath {
             namespace: namespace.into(),
             source,

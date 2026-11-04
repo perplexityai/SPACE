@@ -12,6 +12,9 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::process::Output;
 mod config_stamp;
 mod host_cache;
+mod ruleset;
+
+pub(crate) use ruleset::NamespaceRuleset;
 
 use crate::net::{SANDBOX_SUBNET, SANDBOX_SUBNET_PREFIX_LEN};
 use pplx_space_metrics::node_manager::GuestUdp443Action;
@@ -76,10 +79,19 @@ add rule netdev {SANDBOX_L2_TABLE} ingress meta protocol {{ 0x0800, 0x0806 }} me
 /// Atomically install or refresh guest L2 ingress filtering in an existing
 /// sandbox namespace. Flushing the owned chain prevents duplicate rules on
 /// node-manager restart and resets only this policy's kernel counters.
-pub fn ensure_guest_l2_ingress_policy(ns: &str) -> Result<(), FirewallValidationError> {
-    apply_nft_script(&guest_l2_ingress_policy_script(), Some(ns))?;
-    let chain =
-        nft_chain_json(Some(ns), "netdev", SANDBOX_L2_TABLE, "ingress")?.ok_or_else(|| {
+pub(crate) fn apply_guest_l2_ingress_policy(ns: &str) -> FirewallResult<()> {
+    apply_nft_script(&guest_l2_ingress_policy_script(), Some(ns))
+}
+
+/// Check the guest L2 ingress policy in a ruleset listed after it was
+/// applied, and its device binding, which only the native listing shows.
+pub(crate) fn validate_guest_l2_ingress_policy(
+    ns: &str,
+    ruleset: &NamespaceRuleset,
+) -> Result<(), FirewallValidationError> {
+    let chain = ruleset
+        .chain("netdev", SANDBOX_L2_TABLE, "ingress")
+        .ok_or_else(|| {
             FirewallValidationError::Missing(
                 "guest L2 ingress chain is missing after apply".to_string(),
             )
@@ -96,9 +108,9 @@ pub enum PortSelector {
 
 #[derive(Debug, thiserror::Error)]
 pub enum FirewallError {
-    #[error("nft list chain failed to start: {0}")]
+    #[error("nft list failed to start: {0}")]
     ListStart(#[source] std::io::Error),
-    #[error("nft list chain failed: {stderr}")]
+    #[error("nft list failed: {stderr}")]
     ListFailed { stderr: String },
     #[error("failed to parse nft JSON output: {0}")]
     ListJson(#[source] serde_json::Error),
@@ -262,7 +274,7 @@ pub fn setup_namespace_rules(
     let pre_tproxy_guardrail_rules = load_pre_tproxy_guardrail_rules()?;
     // Guest L2 filtering first, so the TAP drops VLAN frames before the
     // namespace's routing and NAT rules exist.
-    apply_nft_script(&guest_l2_ingress_policy_script(), Some(ns))?;
+    apply_guest_l2_ingress_policy(ns)?;
     apply_nft_json(
         &namespace_rules_json(vpeer, vpeer_ip, guest_ip, &pre_tproxy_guardrail_rules),
         Some(ns),
@@ -1290,10 +1302,14 @@ fn local_service_reply_rule_updates(
 }
 
 /// Remove direct forwarding replies while retaining only the local service
-/// ingress return path. All changes use one namespace-local nft transaction.
-pub fn constrain_direct_inbound_reply_path(ns: &str) -> FirewallResult<()> {
-    let forward = nft_chain_json(Some(ns), "ip", SANDBOX_TABLE, "forward")?;
-    let proxy = nft_chain_json(Some(ns), "ip", PROXY_TABLE, "prerouting")?;
+/// ingress return path, as `ruleset` shows them. All changes use one
+/// namespace-local nft transaction.
+pub(crate) fn constrain_direct_inbound_reply_path(
+    ns: &str,
+    ruleset: &NamespaceRuleset,
+) -> FirewallResult<()> {
+    let forward = ruleset.chain("ip", SANDBOX_TABLE, "forward");
+    let proxy = ruleset.chain("ip", PROXY_TABLE, "prerouting");
     let mut removals = inbound_reply_rule_removals(forward.as_ref())?;
     removals.extend(local_service_reply_rule_updates(proxy.as_ref())?);
     if removals.is_empty() {
