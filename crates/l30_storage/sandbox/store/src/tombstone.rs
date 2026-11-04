@@ -19,13 +19,23 @@ use pplx_space_common_core::sql;
 /// [`crate::delete::delete_with_dependents`]: it removes only the row and what
 /// cascades from it, so the caller deletes the returned ids' claimed warm-pool
 /// slots in the same transaction.
+///
+/// Like that helper, it detaches the storage locations of the rows'
+/// snapshots and stamps them orphaned for the snapshot-storage sweeper, here
+/// in the same statement as the delete. The census tombstone
+/// ([`crate::ingest::prune_census_absent_sandboxes`]) keeps a row's snapshots
+/// and their attached locations, and the locations' foreign key to
+/// `snapshots` is `ON DELETE RESTRICT`: left attached, one such row fails the
+/// whole batch, and every later run fails on it again. Nothing else detaches
+/// them, and snapshot retention never clears them all: it removes only `full`
+/// snapshots beyond each sandbox's newest `keep_n`, and no `disk` snapshot.
 pub async fn prune_deleted_sandboxes(
     executor: impl sqlx::PgExecutor<'_>,
     retention_secs: i64,
     max_records: i64,
 ) -> Result<Vec<Uuid>, sqlx::Error> {
     sqlx::query_scalar::<_, Uuid>(sql!(
-        "WITH candidates AS (
+        "WITH candidates AS MATERIALIZED (
                  SELECT s.id
                    FROM sandboxes s
                   WHERE s.lifecycle = 'deleted'
@@ -34,6 +44,16 @@ pub async fn prune_deleted_sandboxes(
                   ORDER BY COALESCE(s.updated_at, s.created_at) ASC,
                            s.id ASC
                   LIMIT $2
+             ),
+             detached_storage AS (
+                 UPDATE snapshot_storage_locations ssl
+                    SET snapshot_id = NULL, orphaned_at = NOW()
+                  WHERE ssl.snapshot_id IN (
+                      SELECT snapshots.id
+                        FROM snapshots
+                        JOIN candidates c ON c.id = snapshots.sandbox_id
+                  )
+                 RETURNING 1
              )
              DELETE FROM sandboxes s
               USING candidates c
