@@ -3,9 +3,9 @@ use super::*;
 // Each fixture is verbatim output from one nft version: `nft -j list ruleset`,
 // and `nft -j list chain` for every chain that listing contains. The rules
 // were installed in a fresh network namespace with a dummy tap0, in order:
-// guest_l2_ingress_policy_script(), fixtures/namespace_rules.json, the forward
-// drop rules ensure_namespace_forward_drop_rules adds for vpeer-000000, and
-// netgtw_tproxy_rules_json(12345, false).
+// guest_l2_ingress_policy_script(), fixtures/namespace_rules.json,
+// forward_build_json("vpeer-000000") and netgtw_tproxy_rules_json(12345,
+// false), so every part carries its stamp.
 const FIXTURES: [&str; 3] = [
     include_str!("../../fixtures/namespace_ruleset_nft_1_0_4.json"),
     include_str!("../../fixtures/namespace_ruleset_nft_1_0_9.json"),

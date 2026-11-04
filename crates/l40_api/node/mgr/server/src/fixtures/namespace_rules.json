@@ -523,6 +523,36 @@
     },
     {
       "add": {
+        "rule": {
+          "chain": "pre_tproxy_guardrails",
+          "comment": "space-cfg:pre_tproxy=746aa3a4",
+          "expr": [
+            {
+              "counter": null
+            }
+          ],
+          "family": "ip",
+          "table": "sandbox"
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "chain": "pre_tproxy_guardrails",
+          "comment": "space-cfg:packaged_policy=1594445d",
+          "expr": [
+            {
+              "counter": null
+            }
+          ],
+          "family": "ip",
+          "table": "sandbox"
+        }
+      }
+    },
+    {
+      "add": {
         "chain": {
           "family": "ip",
           "table": "sandbox",
@@ -750,6 +780,21 @@
     },
     {
       "add": {
+        "rule": {
+          "chain": "guardrails",
+          "comment": "space-cfg:egress_guardrails=fea2b7eb",
+          "expr": [
+            {
+              "counter": null
+            }
+          ],
+          "family": "ip",
+          "table": "sandbox"
+        }
+      }
+    },
+    {
+      "add": {
         "chain": {
           "family": "ip",
           "table": "sandbox",
@@ -846,6 +891,21 @@
               }
             }
           ]
+        }
+      }
+    },
+    {
+      "add": {
+        "rule": {
+          "chain": "postrouting",
+          "comment": "space-cfg:nat=30e11a3a",
+          "expr": [
+            {
+              "counter": null
+            }
+          ],
+          "family": "ip",
+          "table": "sandbox"
         }
       }
     }

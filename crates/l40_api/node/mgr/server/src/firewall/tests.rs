@@ -183,7 +183,8 @@ fn namespace_rules_json_matches_expected_shape() {
         "10.12.128.2",
         "169.254.0.21",
         &pre_tproxy_guardrail_rules,
-    );
+    )
+    .unwrap();
     let actual: serde_json::Value = serde_json::from_str(&json).unwrap();
     let expected: serde_json::Value =
         serde_json::from_str(include_str!("../fixtures/namespace_rules.json")).unwrap();
@@ -262,7 +263,8 @@ fn namespace_source_guard_precedes_established_conntrack_bypass() {
         "10.12.128.2",
         guest_ip,
         &packaged_pre_tproxy_guardrails_policy(),
-    );
+    )
+    .unwrap();
     let rendered: serde_json::Value = serde_json::from_str(&json).unwrap();
     let rules = rendered["nftables"]
         .as_array()
@@ -329,7 +331,8 @@ fn namespace_postrouting_snat_matches_gateway_outbound_mark() {
         "10.12.128.2",
         "169.254.0.21",
         &pre_tproxy_guardrail_rules,
-    );
+    )
+    .unwrap();
     let rules: serde_json::Value = serde_json::from_str(&json).unwrap();
     let actual = rules["nftables"]
         .as_array()
@@ -704,6 +707,7 @@ flush chain netdev sandbox_l2 ingress
 add rule netdev sandbox_l2 ingress meta protocol { 0x8100, 0x88a8 } counter drop comment "drop-guest-vlan"
 add rule netdev sandbox_l2 ingress ether type { 0x8100, 0x88a8 } counter drop comment "drop-guest-vlan"
 add rule netdev sandbox_l2 ingress meta protocol { 0x0800, 0x0806 } meta pkttype other counter meta pkttype set host comment "accept-stale-gateway-mac"
+add rule netdev sandbox_l2 ingress counter comment "space-cfg:l2_ingress=9cb99d96"
 "#
     );
 }
@@ -1052,3 +1056,153 @@ fn guest_l2_check_ignores_config_stamps() {
         validate_guest_l2_ingress_chain(&chain).unwrap();
     }
 }
+
+/// Every part. A new part fails to compile here until these tests cover it.
+fn every_part() -> [Part; 7] {
+    let part = |part: Part| match part {
+        Part::L2Ingress
+        | Part::PreTproxy
+        | Part::PackagedPolicy
+        | Part::EgressGuardrails
+        | Part::Nat
+        | Part::Forward
+        | Part::Proxy => part,
+    };
+    [
+        part(Part::L2Ingress),
+        part(Part::PreTproxy),
+        part(Part::PackagedPolicy),
+        part(Part::EgressGuardrails),
+        part(Part::Nat),
+        part(Part::Forward),
+        part(Part::Proxy),
+    ]
+}
+
+/// What create or reset installs in a namespace, then a gateway launch:
+/// the L2 script and the JSON documents, in order.
+fn full_install(
+    vpeer: &str,
+    vpeer_ip: &str,
+    uid: u32,
+    dhcp: bool,
+    policy: &str,
+) -> (String, Vec<serde_json::Value>) {
+    let documents = [
+        namespace_rules_json(vpeer, vpeer_ip, "169.254.0.21", policy).unwrap(),
+        forward_build_json(vpeer),
+        netgtw_tproxy_rules_json(uid, dhcp),
+    ];
+    let documents = documents
+        .iter()
+        .map(|json| serde_json::from_str(json).unwrap())
+        .collect();
+    (guest_l2_ingress_policy_script(), documents)
+}
+
+/// Each stamp comment a full install writes, keyed by part. Asserts each
+/// part is stamped once, after every rule the same document adds to its chain.
+fn written_stamps(
+    (script, documents): &(String, Vec<serde_json::Value>),
+) -> std::collections::HashMap<Part, String> {
+    let mut stamps = std::collections::HashMap::new();
+    let mut record = |comment: &str| {
+        let part = every_part()
+            .into_iter()
+            .find(|part| comment.starts_with(&format!("space-cfg:{part}=")))
+            .unwrap_or_else(|| panic!("{comment} names no part"));
+        assert!(
+            stamps.insert(part, comment.to_string()).is_none(),
+            "{comment}"
+        );
+    };
+    let last = script.lines().last().unwrap();
+    let comment = last
+        .split_once("comment \"")
+        .unwrap()
+        .1
+        .trim_end_matches('"');
+    record(comment);
+    for document in documents {
+        let rules = document["nftables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|command| command.pointer("/add/rule"))
+            .collect::<Vec<_>>();
+        for (position, rule) in rules.iter().enumerate() {
+            let Some(comment) = rule["comment"].as_str() else {
+                continue;
+            };
+            if config_stamp::is_stamp_rule(rule) {
+                assert!(
+                    rules[position..]
+                        .iter()
+                        .all(|later| later["chain"] != rule["chain"]
+                            || config_stamp::is_stamp_rule(later)),
+                    "{comment} precedes a rule of its chain"
+                );
+                record(comment);
+            }
+        }
+    }
+    stamps
+}
+
+#[test]
+fn every_full_build_stamps_its_part_once_after_its_rules() {
+    let install = full_install(
+        "vpeer-000000",
+        "10.12.128.2",
+        12345,
+        false,
+        &packaged_pre_tproxy_guardrails_policy(),
+    );
+    let stamps = written_stamps(&install);
+    for part in every_part() {
+        assert!(stamps.contains_key(&part), "{part} is not stamped");
+    }
+}
+
+#[test]
+fn versions_depend_on_rules_not_slot_or_lease_values() {
+    let policy = packaged_pre_tproxy_guardrails_policy();
+    let stamps = written_stamps(&full_install(
+        "vpeer-000000",
+        "10.12.128.2",
+        12345,
+        false,
+        &policy,
+    ));
+    let other_slot = written_stamps(&full_install(
+        "vpeer-000007",
+        "10.12.128.30",
+        12352,
+        true,
+        &policy,
+    ));
+    assert_eq!(stamps, other_slot);
+
+    let mut commands: Vec<serde_json::Value> =
+        serde_json::from_str(&format!("[{policy}]")).unwrap();
+    commands.pop();
+    let edited = serde_json::to_string(&commands).unwrap();
+    let edited = edited.strip_prefix('[').unwrap().strip_suffix(']').unwrap();
+    let edited = written_stamps(&full_install(
+        "vpeer-000000",
+        "10.12.128.2",
+        12345,
+        false,
+        edited,
+    ));
+    for part in every_part() {
+        assert_eq!(
+            stamps[&part] == edited[&part],
+            part != Part::PackagedPolicy,
+            "{part}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod linux;

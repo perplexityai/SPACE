@@ -28,7 +28,7 @@ impl NamespaceRuleset {
         Self::parse(&output.stdout)
     }
 
-    fn parse(stdout: &[u8]) -> FirewallResult<Self> {
+    pub(super) fn parse(stdout: &[u8]) -> FirewallResult<Self> {
         let Listing { nftables } =
             serde_json::from_slice(stdout).map_err(FirewallError::ListJson)?;
         Ok(Self { entries: nftables })

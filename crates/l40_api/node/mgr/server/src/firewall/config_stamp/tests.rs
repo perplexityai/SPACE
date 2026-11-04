@@ -36,3 +36,35 @@ fn stamp_rule_is_a_prefixed_counter_and_nothing_else() {
         assert!(!is_stamp_rule(&rule), "{path}");
     }
 }
+
+#[test]
+fn versions_ignore_formatting_but_not_rules() {
+    let rule = |port: u16| {
+        format!(
+            r#"{{ "add": {{ "rule": {{ "family": "ip", "table": "sandbox", "chain": "forward",
+                "expr": [{{ "match": {{ "left": {{ "payload": {{ "protocol": "tcp", "field": "dport" }} }},
+                "right": {port}, "op": "==" }} }}, {{ "drop": null }}] }} }} }}"#
+        )
+    };
+    let version =
+        |json: &str| PartVersion::of_json(&serde_json::from_str::<Vec<Value>>(json).unwrap());
+    let original = version(&format!("[{}]", rule(22)));
+    let reordered = version(
+        r#"[{"add":{"rule":{"expr":[{"match":{"op":"==","right":22,
+            "left":{"payload":{"field":"dport","protocol":"tcp"}}}},{"drop":null}],
+            "chain":"forward","table":"sandbox","family":"ip"}}}]"#,
+    );
+    assert_eq!(original, reordered);
+    assert_ne!(original, version(&format!("[{}]", rule(23))));
+    assert_ne!(original, version(&format!("[{}, {}]", rule(22), rule(23))));
+
+    let script = "add table netdev t\nadd rule netdev t c counter drop\n";
+    assert_eq!(
+        PartVersion::of_script(script),
+        PartVersion::of_script("\n  add table   netdev t\n\nadd rule netdev\tt c counter drop")
+    );
+    assert_ne!(
+        PartVersion::of_script(script),
+        PartVersion::of_script("add table netdev t\nadd rule netdev t c counter accept\n")
+    );
+}

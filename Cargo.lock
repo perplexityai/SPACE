@@ -6572,6 +6572,7 @@ name = "pplx-space-node-mgr"
 version = "0.8.1"
 dependencies = [
  "arc-swap",
+ "aws-lc-rs",
  "crc",
  "dashmap",
  "futures-util",

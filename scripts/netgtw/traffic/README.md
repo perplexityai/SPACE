@@ -217,7 +217,9 @@ Completion requires per-namespace readback of the counter-only rule and default
 mask for every affected idle and leased namespace. The degraded count does not
 prove rollback is complete. Verify before `space-nodemgr undrain` (leave
 previously drained nodes drained). The replacement preserves matches, ordering,
-and counters.
+and counters. The chain also ends with counter-only rules commented
+`space-cfg:<part>=<version>`: inert stamps of the rule versions node-manager
+installed, which this edit leaves unchanged.
 
 ### Firewall rollout verification
 

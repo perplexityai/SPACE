@@ -14,6 +14,7 @@ mod config_stamp;
 mod host_cache;
 mod ruleset;
 
+use config_stamp::{Part, PartVersion};
 pub(crate) use ruleset::NamespaceRuleset;
 
 use crate::net::{SANDBOX_SUBNET, SANDBOX_SUBNET_PREFIX_LEN};
@@ -38,6 +39,16 @@ const MPTCP_GUARD_COMMENT: &str = "drop-guest-mptcp";
 const PRE_TPROXY_GUARDRAILS_PRIO: i32 = -175;
 const PRE_TPROXY_GUARDRAILS_POLICY_PATH: &str =
     "/etc/space/nftables/sandbox-pre-tproxy-guardrails.json";
+const GUEST_EGRESS_DROP_COMMENT: &str = "fail-closed-guest-egress";
+const GUEST_INGRESS_DROP_COMMENT: &str = "fail-closed-guest-ingress";
+
+// Rendered into a part's template in place of the values that vary by slot
+// or lease: the vpeer interface and address, and the gateway UID. Values every
+// slot shares, such as the guest address, are rendered as they are, so
+// changing one changes the version.
+const TEMPLATE_INTERFACE: &str = "{interface}";
+const TEMPLATE_ADDRESS: &str = "{address}";
+const TEMPLATE_UID: u32 = 0;
 
 /// The guest L2 ingress policy as one `nft -f` transaction: the netdev table,
 /// its ingress chain bound to the TAP, the two VLAN drop rules, and the rule
@@ -62,8 +73,17 @@ const PRE_TPROXY_GUARDRAILS_POLICY_PATH: &str =
 /// the device-bound chain without error, and the first rule then fails with
 /// "No such file or directory". The native syntax works on every version.
 /// Validation still reads the result back as JSON, plus the native listing
-/// for the device binding, which the JSON output omits.
+/// for the device binding, which the JSON output omits. The script ends with
+/// the part's stamp, so flushing the chain replaces the stamp too.
 fn guest_l2_ingress_policy_script() -> String {
+    let rules = guest_l2_ingress_rules_script();
+    let version = PartVersion::of_script(&rules);
+    rules + &config_stamp::script_stamp(Part::L2Ingress, version)
+}
+
+/// The guest L2 ingress policy without its stamp. It takes no slot or lease
+/// values, so it is its own template.
+fn guest_l2_ingress_rules_script() -> String {
     let tap = crate::net::TAP_DEVICE;
     format!(
         "add table netdev {SANDBOX_L2_TABLE}
@@ -137,6 +157,8 @@ pub enum FirewallError {
     Exec(#[source] std::io::Error),
     #[error("nft apply failed: {stderr}\ninput: {input}")]
     Apply { stderr: String, input: String },
+    #[error(transparent)]
+    PackagedPolicy(#[from] PackagedPolicyError),
 }
 
 impl FirewallError {
@@ -276,7 +298,7 @@ pub fn setup_namespace_rules(
     // namespace's routing and NAT rules exist.
     apply_guest_l2_ingress_policy(ns)?;
     apply_nft_json(
-        &namespace_rules_json(vpeer, vpeer_ip, guest_ip, &pre_tproxy_guardrail_rules),
+        &namespace_rules_json(vpeer, vpeer_ip, guest_ip, &pre_tproxy_guardrail_rules)?,
         Some(ns),
     )?;
     ensure_namespace_forward_drop_rules(ns, vpeer)
@@ -287,11 +309,44 @@ fn namespace_rules_json(
     vpeer_ip: &str,
     guest_ip: &str,
     pre_tproxy_guardrail_rules: &str,
-) -> String {
+) -> Result<String, PackagedPolicyError> {
+    let packaged: Vec<serde_json::Value> =
+        serde_json::from_str(&format!("[{pre_tproxy_guardrail_rules}]"))
+            .map_err(PackagedPolicyError)?;
     // Use "ip" family (not "inet") because snat/dnat require unambiguous address family.
     // "inet" would require "snat ip" qualifier which the JSON API doesn't support cleanly.
-    let namespace_guardrail_rules =
-        platform_guardrail_drop_rules_json("ip", SANDBOX_TABLE, "guardrails", "tap0");
+    let table =
+        format!(r#"  {{ "add": {{ "table": {{ "family": "ip", "name": "{SANDBOX_TABLE}" }} }} }}"#);
+    // Both pre-TPROXY stamps follow the packaged policy, the chain's last rules.
+    Ok(nft_commands([
+        table,
+        pre_tproxy_rules_json(guest_ip),
+        pre_tproxy_guardrail_rules.to_string(),
+        stamp_command(
+            Part::PreTproxy,
+            json_template_version(&pre_tproxy_rules_json(crate::net::GUEST_IP)),
+        ),
+        stamp_command(Part::PackagedPolicy, PartVersion::of_json(&packaged)),
+        egress_guardrail_rules_json(),
+        stamp_command(
+            Part::EgressGuardrails,
+            json_template_version(&egress_guardrail_rules_json()),
+        ),
+        nat_rules_json(vpeer, vpeer_ip, guest_ip),
+        stamp_command(
+            Part::Nat,
+            json_template_version(&nat_rules_json(
+                TEMPLATE_INTERFACE,
+                TEMPLATE_ADDRESS,
+                crate::net::GUEST_IP,
+            )),
+        ),
+    ]))
+}
+
+/// The pre-TPROXY guardrails chain and the rules this binary puts at its
+/// start, ahead of the packaged policy.
+fn pre_tproxy_rules_json(guest_ip: &str) -> String {
     // These rules must precede the packaged policy's established/related return.
     // A guest can otherwise forge the reverse tuple of a gateway-owned socket,
     // inherit its conntrack state, and reach the local socket without TPROXY.
@@ -299,9 +354,7 @@ fn namespace_rules_json(
     // conntrack state, before this namespace's TCP stack parses it. No gateway
     // listener speaks MPTCP, so guest TCP is unaffected; non-TCP never matches.
     format!(
-        r#"{{ "nftables": [
-  {{ "add": {{ "table": {{ "family": "ip", "name": "{SANDBOX_TABLE}" }} }} }},
-  {{ "add": {{ "chain": {{ "family": "ip", "table": "{SANDBOX_TABLE}", "name": "{PRE_TPROXY_GUARDRAILS_CHAIN}",
+        r#"  {{ "add": {{ "chain": {{ "family": "ip", "table": "{SANDBOX_TABLE}", "name": "{PRE_TPROXY_GUARDRAILS_CHAIN}",
     "type": "filter", "hook": "prerouting", "prio": {PRE_TPROXY_GUARDRAILS_PRIO} }} }} }},
   {{ "add": {{ "rule": {{ "family": "ip", "table": "{SANDBOX_TABLE}", "chain": "{PRE_TPROXY_GUARDRAILS_CHAIN}",
     "comment": "drop-spoofed-guest-source",
@@ -321,12 +374,25 @@ fn namespace_rules_json(
                      "right": true, "op": "==" }} }},
       {{ "counter": null }},
       {{ "drop": null }}
-    ] }} }} }},
-{pre_tproxy_guardrail_rules},
-  {{ "add": {{ "chain": {{ "family": "ip", "table": "{SANDBOX_TABLE}", "name": "guardrails",
+    ] }} }} }}"#
+    )
+}
+
+/// The forward-hook guardrails chain and its platform hard-deny drops.
+fn egress_guardrail_rules_json() -> String {
+    let namespace_guardrail_rules =
+        platform_guardrail_drop_rules_json("ip", SANDBOX_TABLE, "guardrails", "tap0");
+    format!(
+        r#"  {{ "add": {{ "chain": {{ "family": "ip", "table": "{SANDBOX_TABLE}", "name": "guardrails",
     "type": "filter", "hook": "forward", "prio": -200 }} }} }},
-{namespace_guardrail_rules},
-  {{ "add": {{ "chain": {{ "family": "ip", "table": "{SANDBOX_TABLE}", "name": "postrouting",
+{namespace_guardrail_rules}"#
+    )
+}
+
+/// The SNAT and DNAT chains between the vpeer and the guest.
+fn nat_rules_json(vpeer: &str, vpeer_ip: &str, guest_ip: &str) -> String {
+    format!(
+        r#"  {{ "add": {{ "chain": {{ "family": "ip", "table": "{SANDBOX_TABLE}", "name": "postrouting",
     "type": "nat", "hook": "postrouting", "prio": 100 }} }} }},
   {{ "add": {{ "rule": {{ "family": "ip", "table": "{SANDBOX_TABLE}", "chain": "postrouting",
     "expr": [
@@ -345,9 +411,27 @@ fn namespace_rules_json(
       {{ "match": {{ "left": {{ "payload": {{ "protocol": "ip", "field": "daddr" }} }},
                      "right": "{vpeer_ip}", "op": "==" }} }},
       {{ "dnat": {{ "addr": "{guest_ip}" }} }}
-    ] }} }} }}
-] }}"#
+    ] }} }} }}"#
     )
+}
+
+/// The version of a part installed as a JSON fragment: comma-separated nft
+/// commands, as the packaged policy file holds them.
+fn json_template_version(fragment: &str) -> PartVersion {
+    let commands: Vec<serde_json::Value> =
+        serde_json::from_str(&format!("[{fragment}]")).expect("part templates are valid nft JSON");
+    PartVersion::of_json(&commands)
+}
+
+/// The nft JSON command that appends a part's stamp, as a document fragment.
+fn stamp_command(part: Part, version: PartVersion) -> String {
+    format!("  {}", config_stamp::json_stamp(part, version))
+}
+
+/// One nft JSON document of the fragments' commands, in order.
+fn nft_commands(fragments: impl IntoIterator<Item = String>) -> String {
+    let commands = fragments.into_iter().collect::<Vec<_>>().join(",\n");
+    format!("{{ \"nftables\": [\n{commands}\n] }}")
 }
 
 /// Install only for an execution with a DHCP responder. The narrow DHCP
@@ -580,7 +664,21 @@ pub fn setup_netgtw_tproxy_rules(
 }
 
 fn netgtw_tproxy_rules_json(uid: u32, dhcp: bool) -> String {
-    // This function exclusively owns proxy/prerouting and proxy/divert; other
+    // Whether an execution has a DHCP responder is lease-scoped, so both
+    // variants are one template. The stamp follows the ready marker.
+    let template = format!(
+        "{},\n{}",
+        netgtw_tproxy_rules(TEMPLATE_UID, false),
+        netgtw_tproxy_rules(TEMPLATE_UID, true)
+    );
+    nft_commands([
+        netgtw_tproxy_rules(uid, dhcp),
+        stamp_command(Part::Proxy, json_template_version(&template)),
+    ])
+}
+
+fn netgtw_tproxy_rules(uid: u32, dhcp: bool) -> String {
+    // These rules exclusively own proxy/prerouting and proxy/divert; other
     // callers must not add rules there. Rebuild both in one nft transaction so
     // legacy broad reply exceptions cannot survive ahead of the corrected rules.
     let guest_gateway = crate::net::GUEST_GATEWAY;
@@ -593,8 +691,7 @@ fn netgtw_tproxy_rules_json(uid: u32, dhcp: bool) -> String {
         String::new()
     };
     format!(
-        r#"{{ "nftables": [
-  {{ "add": {{ "table": {{ "family": "ip", "name": "{PROXY_TABLE}" }} }} }},
+        r#"  {{ "add": {{ "table": {{ "family": "ip", "name": "{PROXY_TABLE}" }} }} }},
   {{ "add": {{ "chain": {{ "family": "ip", "table": "{PROXY_TABLE}", "name": "prerouting",
     "type": "filter", "hook": "prerouting", "prio": -150 }} }} }},
   {{ "add": {{ "chain": {{ "family": "ip", "table": "{PROXY_TABLE}", "name": "divert",
@@ -673,8 +770,7 @@ fn netgtw_tproxy_rules_json(uid: u32, dhcp: bool) -> String {
       {{ "match": {{ "left": {{ "meta": {{ "key": "iifname" }} }},
                      "right": "tap0", "op": "==" }} }},
       {{ "return": null }}
-    ] }} }} }}
-] }}"#
+    ] }} }} }}"#
     )
 }
 
@@ -1354,47 +1450,66 @@ fn owned_rule_removals(
 }
 
 fn ensure_namespace_forward_drop_rules(ns: &str, vpeer: &str) -> FirewallResult<()> {
-    let existing = nft_chain_json(Some(ns), "ip", SANDBOX_TABLE, "forward")?;
-    let chain_exists = existing.is_some();
-    let has_egress_drop = existing
-        .as_ref()
-        .is_some_and(|chain| nft_chain_has_rule_comment(chain, "fail-closed-guest-egress"));
-    let has_ingress_drop = existing
-        .as_ref()
-        .is_some_and(|chain| nft_chain_has_rule_comment(chain, "fail-closed-guest-ingress"));
-    let inbound_reply_rules = inbound_reply_rule_removals(existing.as_ref())?;
-    if chain_exists && has_egress_drop && has_ingress_drop && inbound_reply_rules.is_empty() {
+    let Some(existing) = nft_chain_json(Some(ns), "ip", SANDBOX_TABLE, "forward")? else {
+        return apply_nft_json(&forward_build_json(vpeer), Some(ns));
+    };
+    // Repairing an existing chain is not a full build and leaves its stamp,
+    // if any, unchanged.
+    let mut rules = inbound_reply_rule_removals(Some(&existing))?
+        .into_iter()
+        .map(|rule| rule.to_string())
+        .collect::<Vec<_>>();
+    if !nft_chain_has_rule_comment(&existing, GUEST_EGRESS_DROP_COMMENT) {
+        rules.push(forward_egress_drop_json());
+    }
+    if !nft_chain_has_rule_comment(&existing, GUEST_INGRESS_DROP_COMMENT) {
+        rules.push(forward_ingress_drop_json(vpeer));
+    }
+    if rules.is_empty() {
         return Ok(());
     }
+    apply_nft_json(&nft_commands(rules), Some(ns))
+}
 
-    let add_chain = if chain_exists {
-        String::new()
-    } else {
-        format!(
-            r#"  {{ "add": {{ "chain": {{ "family": "ip", "table": "{SANDBOX_TABLE}", "name": "forward",
-    "type": "filter", "hook": "forward", "prio": 0 }} }} }}
-"#
-        )
-    };
-    let egress_drop_rule = if has_egress_drop {
-        String::new()
-    } else {
-        format!(
-            r#"  {{ "add": {{ "rule": {{ "family": "ip", "table": "{SANDBOX_TABLE}", "chain": "forward",
-    "comment": "fail-closed-guest-egress",
+/// A new forward chain: a full build of the part, so it carries the stamp.
+fn forward_build_json(vpeer: &str) -> String {
+    let version = json_template_version(&forward_rules_json(TEMPLATE_INTERFACE));
+    nft_commands([
+        forward_rules_json(vpeer),
+        stamp_command(Part::Forward, version),
+    ])
+}
+
+/// The sandbox forward chain and its two fail-closed drops.
+fn forward_rules_json(vpeer: &str) -> String {
+    let chain = format!(
+        r#"  {{ "add": {{ "chain": {{ "family": "ip", "table": "{SANDBOX_TABLE}", "name": "forward",
+    "type": "filter", "hook": "forward", "prio": 0 }} }} }}"#
+    );
+    [
+        chain,
+        forward_egress_drop_json(),
+        forward_ingress_drop_json(vpeer),
+    ]
+    .join(",\n")
+}
+
+fn forward_egress_drop_json() -> String {
+    format!(
+        r#"  {{ "add": {{ "rule": {{ "family": "ip", "table": "{SANDBOX_TABLE}", "chain": "forward",
+    "comment": "{GUEST_EGRESS_DROP_COMMENT}",
     "expr": [
       {{ "match": {{ "left": {{ "meta": {{ "key": "iifname" }} }},
                      "right": "tap0", "op": "==" }} }},
       {{ "drop": null }}
     ] }} }} }}"#
-        )
-    };
-    let ingress_drop_rule = if has_ingress_drop {
-        String::new()
-    } else {
-        format!(
-            r#"  {{ "add": {{ "rule": {{ "family": "ip", "table": "{SANDBOX_TABLE}", "chain": "forward",
-    "comment": "fail-closed-guest-ingress",
+    )
+}
+
+fn forward_ingress_drop_json(vpeer: &str) -> String {
+    format!(
+        r#"  {{ "add": {{ "rule": {{ "family": "ip", "table": "{SANDBOX_TABLE}", "chain": "forward",
+    "comment": "{GUEST_INGRESS_DROP_COMMENT}",
     "expr": [
       {{ "match": {{ "left": {{ "meta": {{ "key": "iifname" }} }},
                      "right": "{vpeer}", "op": "==" }} }},
@@ -1402,29 +1517,7 @@ fn ensure_namespace_forward_drop_rules(ns: &str, vpeer: &str) -> FirewallResult<
                      "right": "tap0", "op": "==" }} }},
       {{ "drop": null }}
     ] }} }} }}"#
-        )
-    };
-    let rules = inbound_reply_rules
-        .into_iter()
-        .map(|rule| rule.to_string())
-        .chain([egress_drop_rule, ingress_drop_rule])
-        .filter(|rule| !rule.is_empty())
-        .collect::<Vec<_>>();
-    if rules.is_empty() {
-        return Ok(());
-    }
-    let mut nftables = Vec::new();
-    if !add_chain.is_empty() {
-        nftables.push(add_chain.trim_end().to_string());
-    }
-    nftables.extend(rules);
-    let json = format!(
-        r#"{{ "nftables": [
-{}
-] }}"#,
-        nftables.join(",\n")
-    );
-    apply_nft_json(&json, Some(ns))
+    )
 }
 
 /// Check if a namespace has net-gateway TPROXY rules.
