@@ -10,6 +10,7 @@ use pplx_space_common_core::types::{LocalArtifactId, SandboxId};
 
 use super::*;
 use pplx_space_db_test_fixtures::pg_test_db;
+use pplx_space_sandbox_store::action_stamp::StartSubstrate;
 use pplx_space_test_env::TestResult;
 
 async fn insert_pinned(
@@ -70,8 +71,12 @@ async fn a_successful_start_drops_a_disk_pin_and_keeps_a_suspend_pin() -> TestRe
     let failed_disk = LocalArtifactId::new();
     let failed = insert_pinned(pool, "failed", Some((failed_disk, "disk", "stop"))).await?;
 
-    for sandbox_id in [re_placed, suspended, failed] {
-        maybe_mark_started_after_start(pool, sandbox_id).await;
+    for (sandbox_id, substrate) in [
+        (re_placed, StartSubstrate::ClaimsRestoring),
+        (suspended, StartSubstrate::LeavesSuspended),
+        (failed, StartSubstrate::ClaimsRestoring),
+    ] {
+        maybe_mark_started_after_start(pool, sandbox_id, substrate).await;
     }
 
     assert_eq!(
