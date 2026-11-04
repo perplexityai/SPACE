@@ -9,6 +9,9 @@
 //! slot whose namespace is torn down keeps its last state until its next
 //! install.
 
+use std::collections::HashMap;
+use std::hash::Hash;
+
 use dashmap::DashMap;
 
 use crate::firewall::{NamespaceStamps, Part, PartState, PartVersion, PerPart, StampReading};
@@ -18,6 +21,27 @@ use crate::firewall::{NamespaceStamps, Part, PartState, PartVersion, PerPart, St
 /// proxy is never unknown. Proxy rules whose stamp is missing or unusable
 /// are not absent: they read unknown.
 pub(crate) type SlotRules = PerPart<Option<PartState>>;
+
+/// How many slots in one state carry stale or unknown rules.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StaleCounts {
+    /// Slots with at least one stale part, each counted once.
+    pub(crate) stale: u32,
+    /// Slots with each part stale.
+    pub(crate) stale_parts: PerPart<u32>,
+    /// Slots with no stale part but at least one unknown part.
+    pub(crate) unknown: u32,
+}
+
+impl Default for StaleCounts {
+    fn default() -> Self {
+        Self {
+            stale: 0,
+            stale_parts: PerPart::from_fn(|_| 0),
+            unknown: 0,
+        }
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct RuleVersions {
@@ -62,6 +86,36 @@ impl RuleVersions {
             .entry(slot)
             .or_insert_with(|| classify(None, None))
             .set(Part::Proxy, Some(proxy));
+    }
+
+    /// Count the given slots by the state each is in. A slot with no record
+    /// here reads unknown.
+    pub(crate) fn counts<S: Copy + Eq + Hash>(
+        &self,
+        slots: impl IntoIterator<Item = (u32, S)>,
+    ) -> HashMap<S, StaleCounts> {
+        let mut counts = HashMap::<S, StaleCounts>::new();
+        for (slot, state) in slots {
+            let rules = self.slot(slot).unwrap_or_else(|| classify(None, None));
+            let tally = counts.entry(state).or_default();
+            let (mut stale, mut unknown) = (false, false);
+            for part in Part::ALL {
+                match rules.get(part) {
+                    Some(PartState::Stale) => {
+                        tally.stale_parts.set(part, tally.stale_parts.get(part) + 1);
+                        stale = true;
+                    }
+                    Some(PartState::Unknown) => unknown = true,
+                    Some(PartState::Current) | None => {}
+                }
+            }
+            if stale {
+                tally.stale += 1;
+            } else if unknown {
+                tally.unknown += 1;
+            }
+        }
+        counts
     }
 
     pub(crate) fn slot(&self, slot: u32) -> Option<SlotRules> {

@@ -1226,6 +1226,53 @@ The census is independent of the loops that act on such rows. It runs on
 both substrates whether or not the transient-lifecycle sweeper or node-drain
 is enabled, and it counts `deleting`, which the sweeper never ages out.
 
+## Stale sandbox namespace rules
+
+Node-manager installs nftables rules in each sandbox network namespace, in
+parts it installs whole: `l2_ingress`, `pre_tproxy`, `packaged_policy`,
+`egress_guardrails`, `nat`, `forward` and `proxy`. Each part ends with an
+inert counter-only rule commented `space-cfg:<part>=<version>`, where the
+version is a hash of the part's rule template. A rollout that changes a part,
+through code or the packaged pre-TPROXY policy file, leaves existing
+namespaces on the old version until node-manager reinstalls that part. Every
+15 seconds node-manager emits how many slots are behind:
+
+| Metric | Tags | Value |
+| --- | --- | --- |
+| `node.network_slots.stale` | `state` | Slots with at least one stale part, each counted once |
+| `node.network_slots.stale_parts` | `state`, `part` | Slots whose `part` is stale |
+| `node.network_slots.stale_unknown` | `state` | Slots with no stale part but at least one part of unknown version |
+
+`state` is `ready`, `leased` (leasing slots included), `dirty` or
+`quarantined`; slots being created, reset or destroyed are not counted.
+Every state and part is emitted on each tick, zeros included. Under a
+restricted per-metric tag configuration, list `state` and `part` before
+grouping by them.
+
+A part is stale when its stamp names a version other than the one this
+node-manager installs, and unknown when it has no stamp, more than one, or a
+malformed one, or when its last install failed. A namespace node-manager did
+not visit at startup, because it had no TAP, reads unknown. The proxy rules
+exist only while net-gateway runs, so a namespace without the `ip proxy` table
+has no `proxy` part to count; proxy rules whose stamp is missing or unusable
+read unknown.
+
+Node-manager reads the stamps once, at startup, from the ruleset listing it
+already makes for containment, and re-applies the guest L2 policy just before,
+so `l2_ingress` always reads current then. After that it lists no namespace:
+a create or reset marks every part but `proxy` current and removes `proxy`,
+and a net-gateway launch marks `proxy` current. A failed create or reset marks
+every part unknown, and a failed net-gateway launch marks `proxy` unknown. Rule edits made outside node-manager that keep the stamp are not
+detected, and a version mismatch triggers no rebuild.
+
+After a rollout that changes a part, `dirty` slots converge as they reset,
+`ready` slots when they are leased and later reset, `leased` slots when their
+sandbox is deleted or suspended, and `quarantined` slots after a repair or the
+next node-manager start. Spare ready slots can stay stale for a long time. A
+rollout that changes no rule reports zero stale slots. Namespaces installed
+before stamps existed read unknown in every part but `l2_ingress`, and in
+`proxy` while net-gateway runs, until their next reset.
+
 ## Reserved DNS upstream connections
 
 The net-gateway resolves guest queries to the reserved resolver addresses over

@@ -4,12 +4,13 @@ use std::time::Duration;
 
 use futures_util::{StreamExt, stream};
 use pplx_space_metrics::node_manager::GuestUdp443Action;
-use pplx_space_metrics::node_network::{self, NetworkSlotState};
+use pplx_space_metrics::node_network::{self, NetworkRulePart, NetworkSlotState};
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use crate::slot_pool::{NetworkPool, SlotState};
+use crate::firewall::Part;
+use crate::slot_pool::{NetworkPool, SlotRecord, SlotState};
 
 const EMIT_INTERVAL: Duration = Duration::from_secs(15);
 const PROBE_CONCURRENCY: usize = 8;
@@ -56,7 +57,11 @@ where
             let pool = pool.clone();
             let records = match tokio::task::spawn_blocking(move || {
                 emit(&pool);
-                pool.all_records()
+                let records = pool.all_records();
+                if let Ok(records) = &records {
+                    emit_stale_rules(&pool, records);
+                }
+                records
             })
             .await
             {
@@ -64,7 +69,7 @@ where
                 error => {
                     tracing::warn!(
                         ?error,
-                        "cannot sample guest UDP/443 counters without slot inventory"
+                        "cannot emit stale namespace rule counts or sample guest UDP/443 counters without slot inventory"
                     );
                     return;
                 }
@@ -217,6 +222,57 @@ fn emit(pool: &NetworkPool) {
         (NetworkSlotState::Degraded, counts.degraded),
     ] {
         node_network::slots_by_state(state, count);
+    }
+}
+
+/// The slot states the stale rule gauges report. A leasing slot counts as
+/// leased; slots being created, reset or destroyed are between installs.
+const STALE_RULE_STATES: [NetworkSlotState; 4] = [
+    NetworkSlotState::Ready,
+    NetworkSlotState::Leased,
+    NetworkSlotState::Dirty,
+    NetworkSlotState::Quarantined,
+];
+
+fn stale_rule_state(state: SlotState) -> Option<NetworkSlotState> {
+    match state {
+        SlotState::Ready => Some(NetworkSlotState::Ready),
+        SlotState::Leasing | SlotState::Leased => Some(NetworkSlotState::Leased),
+        SlotState::Dirty => Some(NetworkSlotState::Dirty),
+        SlotState::Quarantined => Some(NetworkSlotState::Quarantined),
+        SlotState::Missing | SlotState::Creating | SlotState::Resetting | SlotState::Destroying => {
+            None
+        }
+    }
+}
+
+fn rule_part(part: Part) -> NetworkRulePart {
+    match part {
+        Part::L2Ingress => NetworkRulePart::L2Ingress,
+        Part::PreTproxy => NetworkRulePart::PreTproxy,
+        Part::PackagedPolicy => NetworkRulePart::PackagedPolicy,
+        Part::EgressGuardrails => NetworkRulePart::EgressGuardrails,
+        Part::Nat => NetworkRulePart::Nat,
+        Part::Forward => NetworkRulePart::Forward,
+        Part::Proxy => NetworkRulePart::Proxy,
+    }
+}
+
+/// Every state and part is emitted on each tick, zeros included, from the
+/// in-memory rule versions; no namespace is listed.
+fn emit_stale_rules(pool: &NetworkPool, records: &[SlotRecord]) {
+    let mut counts = pool.stale_rule_counts(
+        records
+            .iter()
+            .filter_map(|record| Some((record.info.slot, stale_rule_state(record.state)?))),
+    );
+    for state in STALE_RULE_STATES {
+        let counts = counts.remove(&state).unwrap_or_default();
+        node_network::slots_stale(state, counts.stale);
+        node_network::slots_stale_unknown(state, counts.unknown);
+        for (part, count) in counts.stale_parts.iter() {
+            node_network::slots_stale_parts(state, rule_part(part), *count);
+        }
     }
 }
 

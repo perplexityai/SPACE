@@ -123,3 +123,43 @@ fn installs_change_only_the_parts_they_rebuild() {
         Some(rules(&[], Unknown, Unknown, Some(Current)))
     );
 }
+
+#[test]
+fn counts_each_slot_once_by_state_and_each_stale_part() {
+    use StampReading::{NoStamp, NoTable};
+    let current = PerPart::from_fn(|_| version(CURRENT));
+    let versions = RuleVersions::at_startup(
+        [
+            // Current, with no proxy table: neither stale nor unknown.
+            (1, Some(stamps(&[], &[(Part::Proxy, NoTable)]))),
+            (2, Some(stamps(&[Part::Nat], &[(Part::Proxy, NoTable)]))),
+            // Two stale parts: one stale slot, counted under both parts.
+            (3, Some(stamps(&[Part::Nat, Part::Proxy], &[]))),
+            (4, Some(stamps(&[], &[(Part::PackagedPolicy, NoStamp)]))),
+            // A stale part outweighs an unknown one.
+            (
+                5,
+                Some(stamps(&[Part::Forward], &[(Part::PackagedPolicy, NoStamp)])),
+            ),
+        ],
+        Some(&current),
+    );
+    // Slot 6 has no record, so it reads unknown.
+    let counts = versions.counts([
+        (1, "ready"),
+        (2, "ready"),
+        (6, "ready"),
+        (3, "leased"),
+        (4, "leased"),
+        (5, "dirty"),
+    ]);
+    let expected = |stale, parts: &[Part], unknown| StaleCounts {
+        stale,
+        stale_parts: PerPart::from_fn(|part| u32::from(parts.contains(&part))),
+        unknown,
+    };
+    assert_eq!(counts["ready"], expected(1, &[Part::Nat], 1));
+    assert_eq!(counts["leased"], expected(1, &[Part::Nat, Part::Proxy], 1));
+    assert_eq!(counts["dirty"], expected(1, &[Part::Forward], 0));
+    assert_eq!(counts.len(), 3);
+}

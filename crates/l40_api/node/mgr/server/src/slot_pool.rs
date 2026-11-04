@@ -614,6 +614,15 @@ impl NetworkPool {
         result
     }
 
+    /// Count the given slots' stale and unknown namespace rules by the state
+    /// each slot is in.
+    pub(crate) fn stale_rule_counts<S: Copy + Eq + std::hash::Hash>(
+        &self,
+        slots: impl IntoIterator<Item = (u32, S)>,
+    ) -> HashMap<S, StaleCounts> {
+        self.rule_versions.counts(slots)
+    }
+
     /// Run a net-gateway launch's proxy rule install and record whether it
     /// completed in the slot's rule versions.
     pub(crate) fn install_proxy_rules<T, E>(
@@ -2105,6 +2114,7 @@ mod rule_versions;
 mod scheduler;
 mod startup_containment;
 use liveness::{LeaseLiveness, lease_liveness, lease_may_be_live};
+pub(crate) use rule_versions::StaleCounts;
 #[cfg(test)]
 mod tests;
 mod time;
