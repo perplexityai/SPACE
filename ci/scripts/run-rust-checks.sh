@@ -469,6 +469,18 @@ cleanup_nextest_redis() {
 # Passing tests' captured stderr is hidden by nextest, so the log file is the
 # only place the markers survive; a Buildkite annotation makes the count
 # visible per build while the soak decides whether strictness can be flipped.
+# Every test of the run that just finished within its wall-time budget
+# (ci/test-duration-budget.toml), read from the JUnit report nextest writes
+# (.config/nextest.toml). CI only: a local machine's times are not the
+# runners' the budget was measured on.
+check_test_durations() {
+    [ "${GITHUB_ACTIONS:-}" = true ] || return 0
+    # nextest's store, not the Cargo target directory: [store] in
+    # .config/nextest.toml.
+    python3 "${REPO_ROOT}/ci/scripts/check-test-durations.py" \
+        "${REPO_ROOT}/target/nextest/default/junit.xml" "${REPO_ROOT}/ci/test-duration-budget.toml"
+}
+
 report_test_dep_skips() {
     local log="${SPACE_TEST_DEP_SKIP_LOG:-}"
     [ -n "${log}" ] || return 0
@@ -717,6 +729,8 @@ run_test_checks() {
         --no-fail-fast \
         --test-threads "${test_threads}" \
         ${NEXTEST_PARTITION_ARGS[@]+"${NEXTEST_PARTITION_ARGS[@]}"} || nextest_status=$?
+    local duration_status=0
+    check_test_durations || duration_status=$?
 
     if [ "${test_partition}" = all ]; then
         wait "${image_pulls[@]}" || true
@@ -729,6 +743,9 @@ run_test_checks() {
     cat "${side_log}"
     if [ "${nextest_status}" -ne 0 ]; then
         return "${nextest_status}"
+    fi
+    if [ "${duration_status}" -ne 0 ]; then
+        return "${duration_status}"
     fi
     return "${side_status}"
 }
@@ -776,6 +793,8 @@ run_privileged_test_checks() {
         --no-fail-fast \
         --test-threads "${test_threads}" \
         -E "${PRIVILEGED_TESTS_FILTERSET}" || nextest_status=$?
+    local duration_status=0
+    check_test_durations || duration_status=$?
 
     cleanup_nextest_postgres "${SPACE_NEXTEST_POSTGRES_CLEANUP_ID}"
     cleanup_nextest_redis "${SPACE_NEXTEST_REDIS_CLEANUP_ID}"
@@ -784,6 +803,9 @@ run_privileged_test_checks() {
     check_m1_document "${target_dir}" || m1_status=$?
     if [ "${nextest_status}" -ne 0 ]; then
         return "${nextest_status}"
+    fi
+    if [ "${duration_status}" -ne 0 ]; then
+        return "${duration_status}"
     fi
     return "${m1_status}"
 }

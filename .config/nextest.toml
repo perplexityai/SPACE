@@ -1,5 +1,15 @@
 experimental = ["setup-scripts"]
 
+# Each test's time, which ci/scripts/check-test-durations.py holds to
+# ci/test-duration-budget.toml in CI. nextest writes it under its store, in
+# the workspace's target/ whatever CARGO_TARGET_DIR says:
+# target/nextest/default/junit.xml.
+[store]
+dir = "target/nextest"
+
+[profile.default.junit]
+path = "junit.xml"
+
 [scripts.setup.postgres]
 command = "bash ci/scripts/setup-nextest-postgres.sh"
 slow-timeout = { period = "30s", terminate-after = 4 }
