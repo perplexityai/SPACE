@@ -11,7 +11,14 @@ publish.workspace = true
 workspace = true
 
 [target.'cfg(windows)'.dependencies]
+pplx-space-guest-capability = { workspace = true }
 pplx-space-spaced-guest-protocol = { workspace = true }
+pplx-space-guest-process = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+zeroize = { workspace = true }
+futures-util = { workspace = true }
+uuid = { workspace = true, features = ["v7"] }
 socket2 = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "io-util", "signal", "time", "net"] }
 tokio-util = { workspace = true, features = ["io-util", "rt"] }
@@ -20,5 +27,7 @@ tonic = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 prost-types = { workspace = true }
-windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32_System_SystemInformation", "Win32_System_EventLog", "Win32_Security"] }
+prost = { workspace = true }
+blake3 = { workspace = true }
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32_System_SystemInformation", "Win32_System_EventLog", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_WindowsProgramming", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Environment", "Win32_UI_Shell", "Win32_System_Registry"] }
 windows-service = "0.8"

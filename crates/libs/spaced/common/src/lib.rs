@@ -178,15 +178,9 @@ pub fn spaced_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-pub fn spaced_compatibility_family() -> String {
-    spaced_compatibility_family_for_version(spaced_version())
-        .expect("CARGO_PKG_VERSION is valid SemVer")
-}
-
-pub fn spaced_compatibility_family_for_version(version: &str) -> Result<String, semver::Error> {
-    let version = semver::Version::parse(version)?;
-    Ok(compatibility::compatibility_family(&version))
-}
+pub use pplx_space_spaced_guest_protocol::{
+    spaced_compatibility_family, spaced_compatibility_family_for_version,
+};
 
 // SPACED_COMPAT_REMOVE_WHEN_MIN_GUEST_0_1_2: remove with the host interactive
 // control gate and its version tests once no older guest can run or be restored.
@@ -201,3 +195,26 @@ pub fn spaced_guest_supports_interactive_process_control(
 
 #[cfg(test)]
 mod tests;
+
+/// Maximum operations qualified by an image, intersected with each connection's
+/// advertised operations. New wire operations receive no implicit permission.
+pub fn allowed_guest_operations(
+    agent: pplx_space_common_core::types::guest_image::QualifiedGuestAgent,
+) -> &'static [proto::platform::GuestOperation] {
+    use pplx_space_common_core::types::guest_image::QualifiedGuestAgent;
+    use proto::platform::GuestOperation::*;
+    match agent {
+        QualifiedGuestAgent::Absent => &[],
+        QualifiedGuestAgent::LinuxV1 => &[
+            Process,
+            ProcessEnvironment,
+            Files,
+            FileWatch,
+            Flush,
+            Resume,
+            LoopbackForward,
+            InteractiveProcessControl,
+        ],
+        QualifiedGuestAgent::WindowsV1 => &[Process, Files, InteractiveProcessControl],
+    }
+}

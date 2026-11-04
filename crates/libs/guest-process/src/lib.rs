@@ -14,7 +14,11 @@
 pub mod env;
 pub mod path;
 pub mod process;
+pub mod status;
 pub mod time;
+
+/// Maximum entries in one guest filesystem write batch across host and guest backends.
+pub const MAX_WRITE_BATCH_ENTRIES: usize = 256;
 
 pub use env::*;
 pub use path::*;
