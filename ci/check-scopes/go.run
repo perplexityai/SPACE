@@ -1,0 +1,8 @@
+# The Go shim check builds shim/ and generates its protobuf code from
+# proto/ (shim/proto/gen.go). Its commands run without GOWORK=off
+# (ci/scripts/run-shim-checks.sh), so a workspace file at the repository root
+# applies to them too.
+shim/**
+proto/**
+go.work
+go.work.sum

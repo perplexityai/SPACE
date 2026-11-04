@@ -1,0 +1,7 @@
+# A change to any of these runs every check: the workflows, the CI scripts
+# and these scopes, and the CI image's other inputs (ci/scripts/ci-image.sh),
+# in which every check runs.
+.github/**
+ci/**
+rust-toolchain.toml
+docker/build-btrfs-progs.sh

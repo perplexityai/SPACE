@@ -1,0 +1,26 @@
+# Paths no Rust check (format, clippy, archcheck, isolated crates, the
+# Windows guest checks, tests, dependency checks, gateway traffic) reads.
+# Rust reads infra/space/identity/ (crates/libs/common/core/build.rs),
+# docker/space/nftables/ (node-mgr's firewall tests), templates/, db/,
+# proto/, scripts/ and shim/testdata/, so none of them is listed; archcheck
+# reads crates' sources and manifests, db/ and the ARCHITECTURE files.
+
+# The Next.js console, built only by docker/Dockerfile.ui.
+ui/**
+# Documentation. No crate reads docs/; crate READMEs that rustdoc includes
+# live under crates/.
+docs/**
+.agents/**
+AGENTS.md
+CLAUDE.md
+CONTRIBUTING.md
+README.md
+SECURITY.md
+# The Python smoke harness, which runs against a deployment.
+space_smoke/**
+# The Go shim, except the fixtures that crates' tests include and the
+# environment contract that Rust format's run_fmt_check
+# (ci/scripts/run-rust-checks.sh) compares with the Rust generator.
+shim/**
+!shim/testdata/**
+!shim/env_contract_generated.go
