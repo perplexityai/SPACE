@@ -4764,7 +4764,7 @@ async fn retained_policy_release_ranking_characterization() -> TestResult {
 /// Characterization of observed-demand matching: a recent sandbox's
 /// `content_hash` names the release stored in the same form first, else the
 /// one stored in the other of the bare and `sha256:` forms. Each case records
-/// enough demand for one unretained release and reports which release the
+/// enough demand for one unretained release and reports every release the
 /// autoscaler gave a pool beside the retained `latest_holder`. Matching never
 /// reads `templates`, so demand for a template being deleted still gets a pool.
 #[tokio::test(flavor = "current_thread")]
@@ -4818,11 +4818,14 @@ async fn observed_demand_release_matching_characterization() -> TestResult {
              WHERE template_release_id <> $1",
         )
         .bind(w.latest_holder)
-        .fetch_optional(&fixture.pool)
+        .fetch_all(&fixture.pool)
         .await?;
         assert_eq!(
             demanded,
-            expected.map(|pick| pick(&w)),
+            expected
+                .into_iter()
+                .map(|pick| pick(&w))
+                .collect::<Vec<_>>(),
             "demand={demand_hash} {desired_state}"
         );
     }
