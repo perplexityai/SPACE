@@ -440,6 +440,17 @@ rather than an opt-out to use: the NoCoW host-fixture tests treat any value of
 it as CI. Don't print the marker for a skip that is not a missing service, such
 as a main-CI-only test.
 
+## Test duration: 2 seconds per test
+
+Each test in the Rust tests job may take up to 2 s. After each nextest run,
+CI reads nextest's JUnit report and fails the job when a test exceeds its
+budget (`ci/scripts/check-test-durations.py`, `ci/test-duration-budget.toml`).
+The tests that were already slower when the limit started are listed there
+with a ceiling each, so none can get slower. A new test does not get an
+entry: test the behaviour at a smaller size, against an injected clock, or
+without a fixed wait. Make a listed test faster and delete its entry; never
+raise a ceiling.
+
 ## Privileged tests and the CI host
 
 The GitHub Rust test job runs the whole workspace, ignored tests included
