@@ -61,6 +61,11 @@ kubectl --context kind-space-local -n space \
 
 ## Sandbox and command failures
 
+For a guest-daemon update, see [Upgrading spaced](spaced-upgrades.md). The
+supported wake-and-upgrade procedure is disruptive and uses normal lifecycle
+and activity accounting. Opportunistic and isolated maintenance upgrades are
+planned but not implemented.
+
 Use the Python example's read-only `inspect` action from [Your first sandbox](first-sandbox.md), with `RUN_DIR` set to the exact saved run directory. Keep the same exported endpoint settings and a current `SPACE_API_TOKEN`.
 
 ```bash
