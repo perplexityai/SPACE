@@ -16,7 +16,9 @@
 #   Writes hard=, lock= and key= for the Actions cache. `hard` names the family
 #   and the inputs a restore must never cross (HARD_INPUTS: the toolchain, the
 #   Cargo config, the builder image and its pinned base, the build lists the
-#   source sync walks, and the scripts that drive the build); `lock` adds
+#   source sync walks, and the scripts that drive the build; and
+#   SPACE_KIND_RUST_INCREMENTAL_CODEGEN, 0 or 1, which decides whether the
+#   target directory holds rustc's incremental data); `lock` adds
 #   Cargo.lock, whose changes Cargo's own fingerprints track, so a restore may
 #   cross it; `key` adds this run, so every save is new. Main CI's save and the
 #   pull-request restore both call this, so they cannot drift apart.
@@ -134,11 +136,20 @@ pack() {
 
 key() {
   local family hard lock
+  case "${SPACE_KIND_RUST_INCREMENTAL_CODEGEN:-0}" in
+    0 | 1) ;;
+    *)
+      echo "SPACE_KIND_RUST_INCREMENTAL_CODEGEN must be 0 or 1, not '${SPACE_KIND_RUST_INCREMENTAL_CODEGEN}'" >&2
+      exit 2
+      ;;
+  esac
   cd "${REPO_ROOT}"
   family="space-target-v2-${RUNNER_OS:-Linux}-${RUNNER_ARCH:-X64}-kind-test-hooks"
-  hard="$(for path in "${HARD_INPUTS[@]}"; do
+  # Whether rustc keeps incremental data changes what the target directory
+  # holds, so a state built one way is never restored for the other.
+  hard="$({ for path in "${HARD_INPUTS[@]}"; do
     printf '%s %s\n' "${path}" "$(sha256sum "${path}" | cut -d' ' -f1)"
-  done | sha256sum | cut -c1-16)"
+  done; printf 'incremental-codegen %s\n' "${SPACE_KIND_RUST_INCREMENTAL_CODEGEN:-0}"; } | sha256sum | cut -c1-16)"
   lock="$(sha256sum Cargo.lock | cut -c1-16)"
   output hard "${family}-${hard}-"
   output lock "${family}-${hard}-${lock}-"

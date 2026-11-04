@@ -2393,10 +2393,16 @@ artifacts whenever a state restores. Building main's state cold keeps a saved
 state from inheriting a stale output of an earlier build, but an input Cargo
 does not track would carry main's compiled crate into a restoring PR; crates
 that embed a directory (`sqlx::migrate!`) watch it from a build script for that
-reason. Main CI's `rust_cache_cleanup` prunes superseded states with the other
-target-directory caches, keeping the newest state for each of the last three
-key inputs, so up to four states (about 0.8 GB each) can exist while a push
-saves. Setting the repository variable `SPACE_KIND_RUST_STATE` to `off` turns
+reason. The state keeps rustc's incremental data
+(`SPACE_KIND_RUST_INCREMENTAL_CODEGEN`, part of its key), so a crate rebuilt
+because a dependency changed reuses its unchanged code generation, and is
+about 3.75 GB. Main CI keeps the newest state of each of the two newest build
+inputs (`ci/scripts/sccache-snapshot.py prune`): two, so an older commit's run
+that saves last cannot delete current main's state. `rust_cache_cleanup` prunes
+with the other target-directory caches, and `kind_rust_state` prunes again
+right after its save. Between build-input changes one state exists, plus one
+for each main run whose save lands before its prune. A PR on older build
+inputs finds none and builds in Docker mode. Setting the repository variable `SPACE_KIND_RUST_STATE` to `off` turns
 both the save and the restore off.
 
 To reproduce a shard, use `scripts/tests/smoke-kind-typed.sh all 1/12` (through

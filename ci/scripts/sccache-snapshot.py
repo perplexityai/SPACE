@@ -44,6 +44,20 @@ TARGET_KEY = re.compile(
     rf"^(?P<family>{re.escape(TARGET_KEY_PREFIX)}.+)-(?P<inputs>[0-9a-f]{{16}})-[0-9a-f]{{16}}-[0-9]+-[0-9]+$"
 )
 TARGET_INPUTS_KEPT = 3
+# Main's Kind Rust build state (rust-state-cache.sh key) is several gigabytes
+# with rustc's incremental data, so only its two newest build-inputs hashes are
+# kept, one state each: two, because main runs of different commits can save
+# out of order, and an older commit's save must not delete current main's
+# state. A pull request on older build inputs misses and builds in Docker mode,
+# as on any miss.
+KIND_STATE_FAMILY_SUFFIX = "-kind-test-hooks"
+KIND_STATE_INPUTS_KEPT = 2
+
+
+def target_inputs_kept(family: str) -> int:
+    if family.endswith(KIND_STATE_FAMILY_SUFFIX):
+        return KIND_STATE_INPUTS_KEPT
+    return TARGET_INPUTS_KEPT
 
 
 @dataclass(frozen=True)
@@ -116,7 +130,8 @@ def superseded(caches: Iterable[Mapping]) -> list[Mapping]:
 
     That is all but the most recently created compiler cache of each family,
     and all but the most recently created target directory of each of a
-    family's TARGET_INPUTS_KEPT most recent build-inputs hashes.
+    family's most recent build-inputs hashes: TARGET_INPUTS_KEPT of them, or
+    KIND_STATE_INPUTS_KEPT for the Kind Rust build state.
     """
     newest: set[tuple[str, str]] = set()
     kept_inputs: dict[str, int] = {}
@@ -133,7 +148,7 @@ def superseded(caches: Iterable[Mapping]) -> list[Mapping]:
             stale.append(cache)
             continue
         if inputs is not None:
-            if kept_inputs.get(family, 0) == TARGET_INPUTS_KEPT:
+            if kept_inputs.get(family, 0) == target_inputs_kept(family):
                 stale.append(cache)
                 continue
             kept_inputs[family] = kept_inputs.get(family, 0) + 1

@@ -133,6 +133,7 @@ TILT_SETTINGS=(
   SPACE_SEED_OUTPUT_DIR="$HOME/.space-devbox/kind/seed/build"
   SPACE_KIND_RUST_ARTIFACTS=auto
   SPACE_KIND_RUST_PROFILE=release
+  SPACE_KIND_RUST_INCREMENTAL_CODEGEN=0
   SPACE_KIND_BUILD_CACHE_REPOSITORY=
   # telemetry_config.py OPTIONS
   SPACE_KIND_DATADOG_MODE=off
@@ -197,6 +198,9 @@ assert_restartable() {
     || die "SPACE_KIND_RUST_BUILD=release builds the release profile; unset SPACE_KIND_RUST_PROFILE (got '$SPACE_KIND_RUST_PROFILE')"
   [[ "${SPACE_TILT_MAX_PARALLEL_UPDATES:-8}" =~ ^[1-9][0-9]*$ ]] \
     || die "SPACE_TILT_MAX_PARALLEL_UPDATES must be a positive integer"
+  # build-rust-artifacts.sh refuses any other value, after this Tilt stopped.
+  [[ "${SPACE_KIND_RUST_INCREMENTAL_CODEGEN:-0}" == 0 || "${SPACE_KIND_RUST_INCREMENTAL_CODEGEN:-0}" == 1 ]] \
+    || die "SPACE_KIND_RUST_INCREMENTAL_CODEGEN must be 0 or 1 (got '$SPACE_KIND_RUST_INCREMENTAL_CODEGEN')"
   kind_stack_assert_cluster_mounts
   kind_stack_assert_postgres_data
   # As the bring-up does, so the nodes' vendor copies are compared with the
