@@ -35,14 +35,14 @@ use pplx_space_common_core::types::{
     PositiveDuration, SandboxId, SandboxLifecycle,
 };
 
+use std::sync::LazyLock;
+
 use pplx_space_common_core::sql;
 use pplx_space_sandbox_portability::{
-    SuspendedK8sFinalizationSql, SuspendedTargetNodeAssignment,
-    clear_current_local_artifact_marker_assignments, current_disk_artifact_backup_ready,
-    current_suspend_snapshot_ready, failed_repair_revert_eligibility,
-    inflight_suspend_upload_exists, latest_full_snapshot_ready, newest_full_snapshot_unambiguous,
-    pod_less_drain_revert_loses_no_newer_bytes, recoverable_suspend_snapshot_exists,
-    snapshot_durable_for_source_release, suspended_k8s_finalization_sql,
+    current_disk_artifact_backup_ready, current_suspend_snapshot_ready,
+    failed_repair_revert_eligibility, inflight_suspend_upload_exists, latest_full_snapshot_ready,
+    newest_full_snapshot_unambiguous, pod_less_drain_revert_loses_no_newer_bytes,
+    recoverable_suspend_snapshot_exists, snapshot_durable_for_source_release,
 };
 use sqlx::{Postgres, Transaction};
 
@@ -1330,9 +1330,9 @@ pub async fn fail_resident_sandboxes_on_gone_node(
 /// [`failed_repair_revert_eligibility`] and both
 /// [`pod_less_drain_revert_loses_no_newer_bytes`] and
 /// [`newest_full_snapshot_unambiguous`] hold, all evaluated by this
-/// statement: the same predicates the drain's precheck reads. Returns the
-/// finalization when the row flipped, so the caller retires the executions
-/// and resets the port exposures with the same assignments.
+/// statement: the same predicates the drain's precheck reads. Returns whether
+/// the row flipped; when it did, the caller retires the executions and resets
+/// the port exposures in the same transaction.
 ///
 /// Writes an **inference**: a drain give-up, the control plane concluding
 /// from the apiserver, the node's teardown record and its own rows that
@@ -1343,40 +1343,42 @@ pub async fn fail_resident_sandboxes_on_gone_node(
 pub async fn revert_pod_less_resident_to_suspended(
     tx: &mut Transaction<'_, Postgres>,
     sandbox_id: SandboxId,
-) -> Result<Option<SuspendedK8sFinalizationSql>, sqlx::Error> {
-    let eligibility = failed_repair_revert_eligibility("s");
-    let marker_assignments =
-        clear_current_local_artifact_marker_assignments("s", "pre.clear_marker");
-    let finalization = suspended_k8s_finalization_sql(
-        "s",
-        "pre",
-        &marker_assignments,
-        SuspendedTargetNodeAssignment::Clear,
-    );
-    let query = format!(
-        "WITH pre AS (
+) -> Result<bool, sqlx::Error> {
+    /// Built once: every input is a literal or a bind placeholder.
+    static QUERY: LazyLock<String> = LazyLock::new(|| {
+        let eligibility = failed_repair_revert_eligibility("s");
+        sql!(format!(
+            "WITH pre AS (
              SELECT id,
                     {clear_marker} AS clear_marker
                FROM sandboxes s
               WHERE s.id = $1
          )
          UPDATE sandboxes s
-            SET {assignments}
+            SET lifecycle = 'suspended',
+                    placement = 'unplaced',
+                    active_node_id = NULL,
+                    command_ready_pending = FALSE,
+                    target_node_id = NULL,
+                    placement_changed_at = NULL,
+                    current_local_artifact_id = CASE WHEN pre.clear_marker THEN NULL ELSE s.current_local_artifact_id END,\n\
+                    current_local_artifact_kind = CASE WHEN pre.clear_marker THEN NULL ELSE s.current_local_artifact_kind END,\n\
+                    current_local_artifact_origin = CASE WHEN pre.clear_marker THEN NULL ELSE s.current_local_artifact_origin END
            FROM pre
           WHERE s.id = pre.id
             AND {eligible}
             AND {loses_no_newer_bytes}
             AND {unambiguous}",
-        clear_marker = eligibility.clear_marker,
-        assignments = finalization.sandbox_assignments(),
-        eligible = eligibility.eligible,
-        loses_no_newer_bytes = pod_less_drain_revert_loses_no_newer_bytes("s"),
-        unambiguous = newest_full_snapshot_unambiguous("s"),
-    );
-    let reverted = sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
+            clear_marker = eligibility.clear_marker,
+            eligible = eligibility.eligible,
+            loses_no_newer_bytes = pod_less_drain_revert_loses_no_newer_bytes("s"),
+            unambiguous = newest_full_snapshot_unambiguous("s"),
+        ))
+    });
+    let reverted = sqlx::query(sqlx::AssertSqlSafe(QUERY.as_str()))
         .bind(sandbox_id)
         .execute(&mut **tx)
         .await?
         .rows_affected();
-    Ok((reverted > 0).then_some(finalization))
+    Ok(reverted > 0)
 }
