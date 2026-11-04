@@ -286,8 +286,15 @@ jobs:
     runs-on: ubuntu-24.04-16core
     timeout-minutes: 45
     permissions:
+      # actions: write for the prune after the save.
+      actions: write
       contents: read
       packages: read
+    # The state keeps rustc's incremental data. The key and the build both
+    # read this, here and in kind-ci.yml's rust_artifacts, so they cannot
+    # disagree; rust-state-cache.sh key refuses anything but 0 or 1.
+    env:
+      SPACE_KIND_RUST_INCREMENTAL_CODEGEN: "1"
     steps:
       - name: Check out SPACE
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -349,11 +356,21 @@ jobs:
           "${RUNNER_TEMP}/kind-rust-state" "${RUNNER_TEMP}/kind-rust-state-parts"
 
       - name: Save the Kind Rust build state
+        id: save
         if: steps.pack.outcome == 'success'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/kind-rust-state-parts
           key: ${{ steps.state-key.outputs.key }}
+
+      # rust_cache_cleanup runs before this job saves, so without this the
+      # state this save replaces, several gigabytes, stays until the next
+      # push. The prune keeps the newest state of the newest build inputs.
+      - name: Delete the Kind Rust build states this one supersedes
+        if: steps.save.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 ci/scripts/sccache-snapshot.py prune --repository "${GITHUB_REPOSITORY}" --ref "${GITHUB_REF}"
 
   rust_cache_cleanup:
     if: ${{ !cancelled() && github.repository == 'perplexityai/SPACE' }}

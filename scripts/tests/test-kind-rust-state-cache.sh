@@ -101,6 +101,8 @@ for path in rust-toolchain.toml .cargo/config.toml ci/mirrored-images.txt docker
   infra/space/kind/scripts/build-rust-artifacts.sh infra/space/kind/scripts/sync-rust-sources.py Cargo.lock; do
   echo "${path}" >"${repo}/${path}"
 done
+# The baseline keys are mode 0 whatever the caller exported.
+unset SPACE_KIND_RUST_INCREMENTAL_CODEGEN
 key_of() {
   GITHUB_OUTPUT="${tmp_dir}/key" GITHUB_RUN_ID=7 GITHUB_RUN_ATTEMPT=1 RUNNER_OS=Linux RUNNER_ARCH=X64 \
     bash "${repo}/infra/space/kind/scripts/rust-state-cache.sh" key >/dev/null
@@ -113,6 +115,16 @@ echo changed >>"${repo}/Cargo.lock"
 [[ "$(key_of hard)" == "${first%-*-*-*}-" ]] || fail "a Cargo.lock change moved the hard prefix"
 [[ "$(key_of key)" != "${first}" ]] || fail "a Cargo.lock change kept the key"
 echo changed >>"${repo}/docker/Dockerfile.rust-build-kind"
-[[ "$(key_of hard)" != "${first%-*-*-*}-" ]] || fail "a build-list change kept the hard prefix"
+plain="$(key_of hard)"
+[[ "${plain}" != "${first%-*-*-*}-" ]] || fail "a build-list change kept the hard prefix"
+# A state with rustc's incremental data is never restored for a build without.
+[[ "$(SPACE_KIND_RUST_INCREMENTAL_CODEGEN=0 key_of hard)" == "${plain}" ]] \
+  || fail "an explicit SPACE_KIND_RUST_INCREMENTAL_CODEGEN=0 moved the hard prefix"
+[[ "$(SPACE_KIND_RUST_INCREMENTAL_CODEGEN=1 key_of hard)" != "${plain}" ]] \
+  || fail "SPACE_KIND_RUST_INCREMENTAL_CODEGEN=1 kept the hard prefix"
+if SPACE_KIND_RUST_INCREMENTAL_CODEGEN=yes GITHUB_OUTPUT=/dev/null \
+  bash "${repo}/infra/space/kind/scripts/rust-state-cache.sh" key >/dev/null 2>&1; then
+  fail "key accepted SPACE_KIND_RUST_INCREMENTAL_CODEGEN=yes"
+fi
 
 echo "PASS: rust-state-cache.sh restores, prunes and falls back as documented"

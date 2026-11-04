@@ -118,6 +118,24 @@ class SupersededTest(unittest.TestCase):
         )
         self.assertEqual(sorted(c["id"] for c in snapshot.superseded(caches)), [1, 100])
 
+    def test_keeps_one_kind_state_for_each_of_the_two_newest_build_inputs(self) -> None:
+        kind = "space-target-v2-Linux-X64-kind-test-hooks"
+        tests = "space-target-v2-Linux-X64-tests"
+        lock = "1111111111111111"
+        caches = [
+            cache(1, f"{kind}-{1:016x}-{lock}-1-1", "2026-09-26T01:00:00Z"),
+            cache(2, f"{kind}-{2:016x}-{lock}-2-1", "2026-09-26T02:00:00Z"),
+            cache(3, f"{kind}-{3:016x}-{lock}-3-1", "2026-09-26T03:00:00Z"),
+            # An older commit's run of the second-newest inputs saved last.
+            cache(4, f"{kind}-{2:016x}-{lock}-4-1", "2026-09-26T04:00:00Z"),
+            # Another target family still keeps its last three inputs.
+            cache(5, f"{tests}-{1:016x}-{lock}-1-1", "2026-09-26T01:00:00Z"),
+            cache(6, f"{tests}-{2:016x}-{lock}-2-1", "2026-09-26T02:00:00Z"),
+            cache(7, f"{tests}-{3:016x}-{lock}-3-1", "2026-09-26T03:00:00Z"),
+        ]
+        # The newest commit's state (3) survives the older commit's later save.
+        self.assertEqual(sorted(c["id"] for c in snapshot.superseded(caches)), [1, 2])
+
     def test_leaves_a_lone_snapshot_alone(self) -> None:
         only = cache(1, f"space-sccache-v1-Linux-X64-clippy-{HASH}-1-1", "2026-09-26T00:00:00Z")
         self.assertEqual(snapshot.superseded([only]), [])
