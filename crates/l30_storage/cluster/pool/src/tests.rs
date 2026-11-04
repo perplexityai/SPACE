@@ -4512,6 +4512,40 @@ async fn autoscale_skips_an_invalid_policy_row_and_holds_its_releases() -> TestR
     Ok(())
 }
 
+/// Fails every config write for a release of the template named `refused`.
+/// A row trigger also refuses the upsert's conflicting insert, so a write
+/// fails whether or not the config already exists.
+async fn refuse_config_writes_for_refused_template(pool: &PgPool) -> TestResult {
+    sqlx::query(
+        "CREATE FUNCTION refuse_pool_config_for_test()
+         RETURNS trigger
+         LANGUAGE plpgsql
+         AS $$
+         BEGIN
+             IF EXISTS (
+                 SELECT 1 FROM template_releases r
+                 WHERE r.id = NEW.template_release_id AND r.template_name = 'refused'
+             ) THEN
+                 RAISE EXCEPTION 'pool config refused for test';
+             END IF;
+             RETURN NEW;
+         END;
+         $$",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TRIGGER refuse_pool_config_for_test
+         BEFORE INSERT ON kubernetes_pool_configs
+         FOR EACH ROW
+         EXECUTE FUNCTION refuse_pool_config_for_test()",
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
 /// A candidate whose config write fails is reported, its stored config is not
 /// disabled, and the other candidates are still written.
 #[tokio::test(flavor = "current_thread")]
@@ -4532,32 +4566,7 @@ async fn autoscale_writes_the_other_candidates_when_one_write_fails() -> TestRes
     let (written_release_id, _) = seed_release(&fixture.pool, "seed", 0x73).await?;
     upsert_warm_pool_policy(&fixture.pool, "refused", 2, 10, 1).await?;
     upsert_warm_pool_policy(&fixture.pool, "seed", 2, 10, 1).await?;
-    sqlx::query(
-        "CREATE FUNCTION refuse_pool_config_for_test()
-         RETURNS trigger
-         LANGUAGE plpgsql
-         AS $$
-         BEGIN
-             IF EXISTS (
-                 SELECT 1 FROM template_releases r
-                 WHERE r.id = NEW.template_release_id AND r.template_name = 'refused'
-             ) THEN
-                 RAISE EXCEPTION 'pool config refused for test';
-             END IF;
-             RETURN NEW;
-         END;
-         $$",
-    )
-    .execute(&fixture.pool)
-    .await?;
-    sqlx::query(
-        "CREATE TRIGGER refuse_pool_config_for_test
-         BEFORE INSERT ON kubernetes_pool_configs
-         FOR EACH ROW
-         EXECUTE FUNCTION refuse_pool_config_for_test()",
-    )
-    .execute(&fixture.pool)
-    .await?;
+    refuse_config_writes_for_refused_template(&fixture.pool).await?;
 
     let run = fixture.store.autoscale_configs("sandboxes").await?;
 
@@ -4577,6 +4586,54 @@ async fn autoscale_writes_the_other_candidates_when_one_write_fails() -> TestRes
     assert_eq!(
         config_enabled(&fixture.pool, written_release_id).await?,
         Some(true)
+    );
+
+    Ok(())
+}
+
+/// A failed candidate holds its release's configs of every shape: when a
+/// policy's shape changes and the write for the new shape fails, the config at
+/// the old shape stays enabled instead of draining the release's pool.
+#[tokio::test(flavor = "current_thread")]
+async fn autoscale_holds_a_failed_candidates_old_shape_config() -> TestResult {
+    let fixture = postgres_fixture().await?;
+    let refused_release_id = Uuid::now_v7();
+    insert_pool_config_seed(
+        &fixture.pool,
+        autoscaler_seed(
+            "refused",
+            refused_release_id,
+            Uuid::now_v7(),
+            ContentHash::new(Digest::sha256([0x74; 32])),
+            (2, 1, 2),
+        ),
+    )
+    .await?;
+    // The policy asks for 2 vCPU and 1024 MiB; the stored config is the old
+    // 2048 MiB shape.
+    sqlx::query(
+        "UPDATE kubernetes_pool_configs SET memory_mib = 2048 WHERE template_release_id = $1",
+    )
+    .bind(refused_release_id)
+    .execute(&fixture.pool)
+    .await?;
+    upsert_warm_pool_policy(&fixture.pool, "refused", 2, 10, 1).await?;
+    refuse_config_writes_for_refused_template(&fixture.pool).await?;
+
+    let run = fixture.store.autoscale_configs("sandboxes").await?;
+
+    assert_eq!(
+        run.failed_candidates
+            .iter()
+            .map(|candidate| candidate.template_release_id)
+            .collect::<Vec<_>>(),
+        vec![refused_release_id]
+    );
+    assert_eq!(run.held_release_ids(), vec![refused_release_id]);
+    assert_eq!(
+        config_enabled(&fixture.pool, refused_release_id).await?,
+        Some(true),
+        "the old shape's config stays enabled while the new shape cannot be written"
     );
 
     Ok(())

@@ -396,7 +396,7 @@ impl WarmPoolStore {
     /// A policy or demand row that does not decode is skipped, and a candidate
     /// whose config write fails is skipped; both are returned in the
     /// [`AutoscaleRun`] for the caller to report. Stale configs are retired,
-    /// except those of a release a skipped row names. The returned run also
+    /// except those of a release a skipped row or a failed candidate names. The returned run also
     /// carries the configs deleted after they finished draining, so callers
     /// can publish a final inactive state from their identity metadata. A
     /// query that fails still fails the step.
@@ -419,9 +419,10 @@ impl WarmPoolStore {
             }
         }
 
-        // A failed candidate is still in `candidates`, so its stored config is
-        // not disabled. A skipped row may have selected its release, so that
-        // release's configs are held: not disabled this pass.
+        // A skipped row may have selected its release, and a failed
+        // candidate's stored config may have another shape than the one it
+        // asked for, so those releases' configs are held: not disabled this
+        // pass.
         self.disable_stale_autoscale_configs(&candidates, &run.held_release_ids())
             .await?;
         run.retired = self.delete_empty_disabled_autoscale_configs().await?;

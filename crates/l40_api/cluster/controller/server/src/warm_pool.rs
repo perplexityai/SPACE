@@ -2763,7 +2763,7 @@ fn report_autoscale_run(run: &AutoscaleRun) -> AutoscaleOutcome {
     if !held.is_empty() {
         tracing::warn!(
             held_releases = held.len(),
-            "warm pool: autoscale skipped rows, so stale configs of their releases stay enabled"
+            "warm pool: autoscale skipped rows or candidates, so stale configs of their releases stay enabled"
         );
     }
     if run.invalid_rows.is_empty() && run.failed_candidates.is_empty() {

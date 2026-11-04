@@ -76,22 +76,28 @@ pub struct AutoscaleRun {
     pub retired: PoolConfigRead,
     /// Policy and demand rows that did not decode. The caller must report them.
     pub invalid_rows: Vec<InvalidAutoscaleRow>,
-    /// Candidates whose config write failed. A failed candidate's stored
-    /// config is not disabled; one that was already disabled and empty is
-    /// still deleted.
+    /// Candidates whose config write failed. A failed candidate's release is
+    /// held, so none of its stored configs is disabled, whatever their shape;
+    /// one that was already disabled and empty is still deleted.
     pub failed_candidates: Vec<FailedAutoscaleCandidate>,
 }
 
 impl AutoscaleRun {
     /// The releases whose stale configs the step left enabled: those named by
-    /// a skipped row. Such a row may have selected its release as a
-    /// candidate, so retiring that release's configs could drain a pool that
-    /// still has a policy or demand.
+    /// a skipped row or a failed candidate. A skipped row may have selected
+    /// its release as a candidate, and a failed candidate's stored config may
+    /// have another shape than the one it asked for, so retiring either
+    /// release's configs could drain a pool that still has a policy or demand.
     pub fn held_release_ids(&self) -> Vec<Uuid> {
         let mut held = self
             .invalid_rows
             .iter()
             .map(|row| row.template_release_id)
+            .chain(
+                self.failed_candidates
+                    .iter()
+                    .map(|candidate| candidate.template_release_id),
+            )
             .collect::<Vec<_>>();
         held.sort_unstable();
         held.dedup();
