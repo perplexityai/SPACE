@@ -1344,8 +1344,9 @@ async fn delete_is_refused_while_the_template_is_in_use() -> TestResult {
 /// A use that appears after the delete was accepted fails its operation for
 /// good with the same refusal instead of retrying, and the template stays
 /// `deleting`. An enabled policy holds no release key, so only the
-/// operation's own re-check catches it. Once the use is gone, a new delete
-/// replaces the failed one and completes.
+/// operation's own re-check catches it. While the use remains, a replay of
+/// the first key still answers with its operation and a new key is refused.
+/// Once the use is gone, a new delete replaces the failed one and completes.
 #[tokio::test]
 async fn a_use_added_after_the_delete_was_accepted_fails_the_operation() -> TestResult {
     let db = pg_test_db().await?;
@@ -1392,6 +1393,25 @@ async fn a_use_added_after_the_delete_was_accepted_fails_the_operation() -> Test
     .bind(first.as_uuid())
     .execute(&db.pool)
     .await?;
+
+    // While the use remains, replaying the first key answers with its
+    // original, failed operation, as any replay does, and a new key is
+    // refused without recording an operation.
+    let (status, body) = request_template_delete(&state, &template, "late-policy-first").await?;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["operation_id"], first.to_string(), "{body}");
+    let (status, body) = request_template_delete(&state, &template, "late-policy-refused").await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["details"][0]["value"], "template_in_use", "{body}");
+    assert_eq!(recorded_delete_operation(&db.pool, &template).await?, first);
+    let operations: i64 = sqlx::query_scalar(sql!(
+        "SELECT COUNT(*) FROM public_operations WHERE target_id = $1"
+    ))
+    .bind(template.as_str())
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(operations, 1, "neither request recorded an operation");
+
     sqlx::query(sql!(
         "UPDATE warm_pool_policies SET enabled = FALSE WHERE template_name = $1"
     ))
