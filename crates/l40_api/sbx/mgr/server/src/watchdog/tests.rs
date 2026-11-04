@@ -1493,6 +1493,13 @@ impl DeadGatewayFixture {
         let conn = crate::db::test_conn();
         insert_test_sandbox(&conn, sandbox_id, crate::state::SandboxState::Started);
         set_runtime_fields(&conn, sandbox_id, test_route_identity());
+        // A relaunch is refused unless the registered sidecars name the row's
+        // execution, as `sidecar_info_from_row` records it in production.
+        let mut info = restart_test_info(sandbox_id);
+        info.node_execution_id = crate::db::read::sandbox(&conn, sandbox_id)
+            .expect("read sandbox")
+            .expect("sandbox row")
+            .node_execution_id;
         let node_manager = crate::node_manager_transport::fake::FakeNodeManager::default()
             .unary(
                 "Launch",
@@ -1506,7 +1513,7 @@ impl DeadGatewayFixture {
             db: crate::db::SharedConnection::new(conn),
             sidecars: Arc::new(Mutex::new(HashMap::from([(
                 sandbox_id.to_owned(),
-                restart_test_info(sandbox_id),
+                info,
             )]))),
             state: Arc::new(Mutex::new(HashMap::from([(
                 sandbox_id.to_owned(),
