@@ -242,6 +242,24 @@ class DirectNodeRecoveryFixture:
             raise RuntimeError("no owned recovery sandbox")
         return self.selector
 
+    def verify_agent_template(self) -> None:
+        """Check the pinned input so blocking start proves agent readiness."""
+        output = self.command([
+            "space-tmplmgr", "get", "--template", self.config.template,
+            "--content-hash", self.config.content_hash,
+        ])
+        directory = re.search(r"^template_dir:\s+(\S+)$", output, re.MULTILINE)
+        if directory is None:
+            raise RuntimeError("template lookup did not return its artifact directory")
+        metadata = json.loads(self.command(["sudo", "-n", "cat", directory[1] + "/metadata.json"]))
+        contract = metadata.get("guest_image", {})
+        self.context.verify(
+            contract.get("agent") == "spaced"
+            and contract.get("readiness") == {"kind": "agent"}
+            and contract.get("disk") == "opaque_raw_disk",
+            "native-agent smoke requires an opaque disk with spaced readiness",
+        )
+
     def start(self, *, memory_mib: int | None = None) -> ExecutionObservation:
         arguments = ["space-sbxmgr", "start", self.owned_selector(), "--blocking"]
         if memory_mib is not None:
@@ -522,3 +540,45 @@ class DirectNodeRecoveryFixture:
         """)
         result = json.loads(self.command(["python3", "-c", script, self.owned_selector(), self.config.client_env]))
         self.context.record("rdp_negotiation", result)
+
+    def verify_ssh_banner(self) -> None:
+        """Prove DHCP and the fenced TCP channel without guest credentials."""
+        script = textwrap.dedent("""\
+            import json, os, re, select, subprocess, sys, time, tempfile
+            deadline = time.monotonic() + 30
+            diagnostics = tempfile.TemporaryFile()
+            while time.monotonic() < deadline:
+                args = ['sudo', '-n', '/space/bin/space-nodemgr', 'guest-channel', sys.argv[1], '--port', '22']
+                with subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=diagnostics) as channel:
+                    try:
+                        banner = bytearray()
+                        attempt_deadline = min(deadline, time.monotonic() + 3)
+                        while len(banner) < 255 and time.monotonic() < attempt_deadline:
+                            ready = select.select([channel.stdout], [], [], max(0, attempt_deadline-time.monotonic()))[0]
+                            if not ready:
+                                break
+                            chunk = os.read(channel.stdout.fileno(), 255-len(banner))
+                            if not chunk:
+                                break
+                            banner.extend(chunk)
+                            prefix = b'SSH-2.0-'
+                            if not banner.startswith(prefix[:min(len(prefix), len(banner))]):
+                                break
+                            line, newline, _ = banner.partition(b'\\n')
+                            if newline:
+                                identification = bytes(line) + b'\\n'
+                                if re.fullmatch(rb'SSH-2\\.0-[\\x21-\\x2c\\x2e-\\x7e]+(?: [^\\x00\\r\\n]*)?\\r\\n', identification):
+                                    print(json.dumps({'ready': True, 'identification': identification.decode('ascii', errors='replace').rstrip()}))
+                                    sys.exit(0)
+                                break
+                    finally:
+                        channel.terminate()
+                        try: channel.wait(timeout=1)
+                        except subprocess.TimeoutExpired: channel.kill(); channel.wait()
+                time.sleep(min(1, max(0, deadline-time.monotonic())))
+            diagnostics.seek(0)
+            print(json.dumps({'ready': False, 'diagnostics': diagnostics.read(65536).decode(errors='replace')}))
+        """)
+        result = json.loads(self.command(["python3", "-c", script, self.owned_selector()], timeout=40))
+        self.context.record("guest_network", result)
+        self.context.verify(result.get("ready") is True, "guest SSH identification was not reachable within 30 seconds")

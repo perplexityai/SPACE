@@ -2454,8 +2454,18 @@ impl SandboxManagerService {
                 ))
                 .await
         };
-        // Net-gateway only needs the allocated network namespace and sandbox
-        // UID. Start it while node-manager clones/prepares the rootfs, but do
+        // Kernel-configured guests need only the allocated namespace and UID.
+        // DHCP guests also need the persisted image contract so the gateway's
+        // atomic ruleset includes the DHCP exception on its first launch.
+        let (network_contract_ready, wait_for_network_contract) = if sandbox.guest_image.network()
+            == pplx_space_common_core::types::guest_image::GuestNetwork::SlotDhcpV1
+        {
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            (Some(sender), Some(receiver))
+        } else {
+            (None, None)
+        };
+        // Start it while node-manager clones/prepares the rootfs otherwise, but do
         // not wait on gateway process readiness before launching Firecracker.
         // The namespace is fail-closed before TPROXY exists. Pool members do
         // not receive policy until adoption assigns tenant identity. The
@@ -2476,26 +2486,36 @@ impl SandboxManagerService {
             net_gateway_launch_config(&self.feature_flags, &netgtw_sandbox_id);
         let netgtw_task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
             async move {
-                register_net_gateway_launch(
-                    &netgtw_db,
-                    &netgtw_sandbox_id,
-                    sbx_uid,
-                    launch_net_gateway_via_node(
-                        &mut netgtw_client,
-                        execution_fence,
+                launch_after_network_contract(wait_for_network_contract, async {
+                    register_net_gateway_launch(
+                        &netgtw_db,
                         &netgtw_sandbox_id,
                         sbx_uid,
-                        netgtw_no_identity,
-                        Some(&netgtw_route_identity),
-                        &netgtw_launch_config,
-                    ),
-                )
+                        launch_net_gateway_via_node(
+                            &mut netgtw_client,
+                            execution_fence,
+                            &netgtw_sandbox_id,
+                            sbx_uid,
+                            netgtw_no_identity,
+                            Some(&netgtw_route_identity),
+                            &netgtw_launch_config,
+                        ),
+                    )
+                    .await
+                })
                 .await
             }
             .in_current_span(),
         ));
 
-        let prepare_response = match prepare_sandbox.await {
+        let prepare_result = prepare_sandbox.await;
+        if let Some(ready) = network_contract_ready
+            && prepare_result.is_ok()
+            && ready.send(()).is_err()
+        {
+            tracing::warn!(sandbox_id = %id, "gateway stopped before network contract was prepared");
+        }
+        let prepare_response = match prepare_result {
             Ok(response) => response.into_inner(),
             Err(e) => {
                 settle_net_gateway_launch_task(netgtw_task, id, "prepare-failed").await;
@@ -3004,3 +3024,16 @@ fn memory_policy_lookup_error(error: Status) -> Status {
 
 #[cfg(test)]
 pub(super) mod tests;
+
+/// DHCP gateway launch waits for persisted intent; dropping prepare cancels it.
+pub(super) async fn launch_after_network_contract<T>(
+    prepared: Option<tokio::sync::oneshot::Receiver<()>>,
+    launch: impl std::future::Future<Output = Result<T, Status>>,
+) -> Result<T, Status> {
+    if let Some(prepared) = prepared {
+        prepared.await.map_err(|_| {
+            Status::failed_precondition("guest network contract preparation failed")
+        })?;
+    }
+    launch.await
+}

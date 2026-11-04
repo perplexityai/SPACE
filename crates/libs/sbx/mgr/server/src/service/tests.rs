@@ -21726,3 +21726,33 @@ pub(crate) mod service_tests {
         assert_eq!(metrics.waiting(), 0);
     }
 }
+
+#[tokio::test]
+async fn network_contract_preparation_orders_or_cancels_gateway_launch() {
+    use super::start::launch_after_network_contract;
+    for outcome in [Some(true), Some(false), None] {
+        let launched = std::cell::Cell::new(false);
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let mut launch = Box::pin(launch_after_network_contract(
+            outcome.map(|_| receiver),
+            async {
+                launched.set(true);
+                Ok(())
+            },
+        ));
+        if let Some(success) = outcome {
+            assert!(futures_util::poll!(launch.as_mut()).is_pending());
+            assert!(!launched.get());
+            if success {
+                sender.send(()).unwrap();
+            } else {
+                drop(sender);
+            }
+            assert_eq!(launch.await.is_ok(), success);
+            assert_eq!(launched.get(), success);
+        } else {
+            launch.await.unwrap();
+            assert!(launched.get());
+        }
+    }
+}

@@ -5,8 +5,8 @@ from urllib.parse import quote
 from space_smoke.native_hardening import NativeHardeningFixture, NativeResponse
 from space_smoke.registry import scenario
 
-# Long enough to observe the delete before the sandbox row is gone.
-DELETING_BUDGET_SECONDS = 30
+# Deletion may finish before a command observes the transient deleting state.
+DELETION_BUDGET_SECONDS = 30
 
 
 def _not_running(sandbox_id: str, state: str, response: NativeResponse) -> bool:
@@ -51,7 +51,7 @@ def _outcome(test: NativeHardeningFixture, command: NativeResponse) -> dict[str,
 )
 def command_on_sandbox_not_running(test: NativeHardeningFixture) -> None:
     """Without a command or access wake source, a command on a suspended or
-    deleting sandbox is a non-retryable conflict naming its state and wake."""
+    deleting sandbox is a non-retryable conflict; a deleted sandbox is not found."""
     sandbox_id = test.create_ready()
     path = f"/v1/sandboxes/{quote(sandbox_id, safe='')}"
 
@@ -65,15 +65,31 @@ def command_on_sandbox_not_running(test: NativeHardeningFixture) -> None:
     delete = test.request("DELETE", path, idempotency_key=test.new_key("delete"))
     operation_id = str(delete.require(202).get("operation_id"))
     observed: list[dict[str, object]] = []
-    deadline = time.monotonic() + DELETING_BUDGET_SECONDS
-    deleting = False
-    while not deleting and time.monotonic() < deadline:
+    deadline = time.monotonic() + DELETION_BUDGET_SECONDS
+    deletion_observed = False
+    deleting_conflict_observed = False
+    while time.monotonic() < deadline:
         command = test.command(sandbox_id, ["true"])
-        deleting = _not_running(sandbox_id, "deleting", command)
         observed.append({"status": command.status, "details": command.body.get("details")})
-        if command.status == 404:
+        deleting_conflict_observed = _not_running(sandbox_id, "deleting", command)
+        if command.status == 404 or deleting_conflict_observed:
+            deletion_observed = True
             break
-    test.context.record("deleting", observed[-5:])
+        if not _not_running(sandbox_id, "suspended", command):
+            break
+        time.sleep(0.1)
+    test.context.record("deleting", {
+        "observations": observed[-5:],
+        "conflict_observed": deleting_conflict_observed,
+        "completed_before_conflict": deletion_observed and not deleting_conflict_observed,
+    })
     test.wait_operation(operation_id)
     test.context.verify(suspended, "a command on a suspended sandbox was not a final conflict")
-    test.context.verify(deleting, "a command on a deleting sandbox was not a final conflict")
+    test.context.verify(
+        deletion_observed,
+        "a command during deletion was neither a final conflict nor not found",
+    )
+    test.context.verify(
+        test.command(sandbox_id, ["true"]).status == 404,
+        "a command after completed deletion did not return not found",
+    )
