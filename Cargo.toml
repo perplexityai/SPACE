@@ -500,14 +500,17 @@ opt-level = 1
 [profile.test.package.pplx-space-sbx-mgr]
 opt-level = 1
 
-# Three dependencies whose test cost is the compiled work itself, not the Rust
+# Dependencies whose test cost is the compiled work itself, not the Rust
 # around it, so the debug profile's opt-level 0 lands directly on wall time.
 #
 # `libsqlite3-sys` bundles and compiles `sqlite3.c`: every SQLite-backed test
 # in the workspace runs the amalgamation, and unoptimized it is the dominant
 # term in the SQLite-heavy suites. `bcrypt` and `blowfish` are the same shape —
 # a cost-12 hash is 4096 Blowfish key schedules, and each password-handling
-# test pays for several.
+# test pays for several. `sha2` hashes mebibytes of rootfs images in the
+# template-mgr tests; in CI, optimizing it took those tests from 27 s to 8 s
+# in total. Optimizing every dependency (`"*"`) instead added 3.5 minutes to a
+# test build without a cached copy and made the test run no faster.
 #
 # Scoped to `test` because that is where the cost falls; the `release` profile
 # already optimizes these and `dev` builds nothing that runs them in a loop.
@@ -518,6 +521,9 @@ opt-level = 3
 opt-level = 3
 
 [profile.test.package.blowfish]
+opt-level = 3
+
+[profile.test.package.sha2]
 opt-level = 3
 
 [profile.dev-release]

@@ -277,8 +277,8 @@ async fn bridge_guest_recycles_incomplete_http2_connections() {
     // is the test's floor. Shorten it, and keep the window for filling
     // admission strictly inside it so no stalled peer can expire while the
     // fixture is still opening them.
-    const PREFACE_TIMEOUT: Duration = Duration::from_secs(2);
-    const FILL_BUDGET: Duration = Duration::from_secs(1);
+    const PREFACE_TIMEOUT: Duration = Duration::from_millis(750);
+    const FILL_BUDGET: Duration = Duration::from_millis(400);
 
     let temp_dir = tempfile::tempdir().expect("temp dir created");
     let host_socket = temp_dir.path().join("host.sock");

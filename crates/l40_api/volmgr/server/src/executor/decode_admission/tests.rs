@@ -342,47 +342,52 @@ fn incompressible(len: usize) -> Vec<u8> {
         .collect()
 }
 
+#[rstest::rstest]
+#[case::plain_zstd(Route::Plain, true)]
+#[case::encrypted_zstd(Route::Encrypted, true)]
+#[case::encrypted_passthrough(Route::Encrypted, false)]
 #[tokio::test]
-async fn bypassed_class_over_the_input_bound_waits_for_a_permit() {
+async fn bypassed_class_over_the_input_bound_waits_for_a_permit(
+    #[case] route: Route,
+    #[case] compressed: bool,
+) {
     // The output cap does not bound decrypt or frame-parsing work, so an
     // input larger than the bypass input bound must wait for admission.
     let cap = usize::try_from(CLASS_BYPASS_MAX_INPUT_BYTES).unwrap();
     let data = incompressible(cap + 4096);
-    let frame = zstd_compress(&data);
-    assert!(frame.len() > cap, "fixture must exceed the input bound");
-    let cases = [
-        ("plain zstd", Route::Plain, frame.clone()),
-        ("encrypted zstd", Route::Encrypted, frame),
-        ("encrypted passthrough", Route::Encrypted, data.clone()),
-    ];
-    for (name, route, payload_bytes) in cases {
-        let case = pull_case_with_payload_bytes(route, SnapshotArtifact::VmState, payload_bytes);
-        let executor = single_permit_executor(case.body.clone());
-        let held = executor
-            .acquire_codec_permit(JobPriority::default())
+    let payload_bytes = if compressed {
+        let frame = zstd_compress(&data);
+        assert!(frame.len() > cap, "fixture must exceed the input bound");
+        frame
+    } else {
+        data.clone()
+    };
+    let case = pull_case_with_payload_bytes(route, SnapshotArtifact::VmState, payload_bytes);
+    let executor = single_permit_executor(case.body.clone());
+    let held = executor
+        .acquire_codec_permit(JobPriority::default())
+        .await
+        .unwrap();
+    let pull = pull(&executor, route, &case.payload);
+    tokio::pin!(pull);
+    assert!(
+        tokio::time::timeout(PENDING_PROBE, &mut pull)
             .await
-            .unwrap();
-        let pull = pull(&executor, route, &case.payload);
-        tokio::pin!(pull);
-        assert!(
-            tokio::time::timeout(PENDING_PROBE, &mut pull)
-                .await
-                .is_err(),
-            "{name} pull must wait for the held permit"
-        );
-        drop(held);
-        let out = tokio::time::timeout(PULL_DEADLINE, pull)
-            .await
-            .expect("pull completes once the permit frees")
-            .unwrap_or_else(|e| panic!("{name} pull failed: {e}"));
+            .is_err(),
+        "{route:?} pull must wait for the held permit"
+    );
+    drop(held);
+    let out = tokio::time::timeout(PULL_DEADLINE, pull)
+        .await
+        .expect("pull completes once the permit frees")
+        .unwrap_or_else(|e| panic!("{route:?} pull failed: {e}"));
 
-        assert_eq!(usize::try_from(out).unwrap(), data.len());
-        assert!(
-            std::fs::read(&case.local_path).unwrap() == data,
-            "{name} output differs"
-        );
-        assert_no_scratch(&case);
-    }
+    assert_eq!(usize::try_from(out).unwrap(), data.len());
+    assert!(
+        std::fs::read(&case.local_path).unwrap() == data,
+        "{route:?} output differs"
+    );
+    assert_no_scratch(&case);
 }
 
 /// The gate one decode pass was handed.

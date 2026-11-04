@@ -187,7 +187,7 @@ async fn native_build_fixture() -> TestResult<NativeBuildFixture> {
             .await
             .unwrap();
     });
-    let state = AppState::from_pools_with_lifecycle(
+    let mut state = AppState::from_pools_with_lifecycle(
         db.pool.clone(),
         pplx_space_common_svc::sql::CredentialsPool::shared(db.pool.clone()),
         pplx_space_common_svc::DrainSignal::new(),
@@ -196,6 +196,21 @@ async fn native_build_fixture() -> TestResult<NativeBuildFixture> {
         None,
     )
     .await?;
+    // A closed builder port refuses each dial at once, so a short retry
+    // policy reaches the same refusal as the default one, without its ten
+    // seconds of retries.
+    state.template_controller = crate::controllers::template::TemplateController::new(
+        crate::controllers::substrate::Substrate::from_direct(
+            crate::controllers::substrate::direct::DirectSubstrate::new(db.pool.clone())
+                .with_builder_connect_retry_policy(pplx_space_common_grpc::GrpcRetryPolicy {
+                    max_retries: 1,
+                    initial_delay: std::time::Duration::from_millis(10),
+                    max_elapsed: std::time::Duration::from_millis(200),
+                    ..pplx_space_common_grpc::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY
+                }),
+        ),
+        db.pool.clone(),
+    );
     let app = session_auth::router(state.clone())
         .merge(crate::routes::admin::shared_host_router(state.clone()))
         .with_state(state);
@@ -644,6 +659,19 @@ const UNRECORDED: &str = "synthetic-build-key-2";
 const HELD: &str = "synthetic-build-key-3";
 const DISCONNECTED: &str = "synthetic-build-key-4";
 
+/// How a system build's dispatch fails.
+#[derive(Clone, Copy, Debug)]
+enum DispatchFailure {
+    /// The builder takes the build, then its answer is lost.
+    LostAnswer,
+    /// The builder accepts, and recording its job fails.
+    UnrecordedJob,
+    /// The builder's bearer token cannot be read.
+    NoCredential,
+    /// The builder refuses the connection.
+    Refused,
+}
+
 /// A build whose dispatch fails keeps its key while the builder may have
 /// taken it, so no replay starts a second job, and frees it when the builder
 /// certainly did not.
@@ -651,6 +679,13 @@ const DISCONNECTED: &str = "synthetic-build-key-4";
 #[tokio::test]
 async fn a_failed_system_build_frees_its_key_only_if_the_builder_did_not_take_it(
     #[future] native_build_fixture: TestResult<NativeBuildFixture>,
+    #[values(
+        DispatchFailure::LostAnswer,
+        DispatchFailure::UnrecordedJob,
+        DispatchFailure::NoCredential,
+        DispatchFailure::Refused
+    )]
+    failure: DispatchFailure,
 ) -> TestResult {
     if !crate::test_support::enter_sim_worker_process_with_owned_token_files() {
         return Ok(());
@@ -666,119 +701,127 @@ async fn a_failed_system_build_frees_its_key_only_if_the_builder_did_not_take_it
         )
     };
 
-    // The builder takes the build, then its answer is an error.
-    fixture
-        .builder_fails_after_taking
-        .store(true, Ordering::SeqCst);
-    let (status, body) = build("synthetic-lost-answer").await?;
-    assert!(status.is_server_error(), "{status} {body}");
-    assert!(
-        fixture.builds.try_recv().is_ok(),
-        "the build reached the builder"
-    );
-    // Nothing will complete the record, so the replay says the outcome is
-    // unknown at once rather than asking for a retry.
-    let (status, replay) = build("synthetic-lost-answer").await?;
-    assert_eq!(status, StatusCode::CONFLICT, "{replay}");
-    assert_eq!(replay["retryable"], false, "{replay}");
-    assert!(
-        fixture.builds.try_recv().is_err(),
-        "a replay of a build the builder may have taken must not start another"
-    );
-    fixture
-        .builder_fails_after_taking
-        .store(false, Ordering::SeqCst);
-
-    // The builder accepts, and recording its job fails: the replay names the job.
-    sqlx::query(sql!(
-        "CREATE FUNCTION fail_build_job_record() RETURNS trigger
-         LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic job record failure'; END $$"
-    ))
-    .execute(&fixture.db.pool)
-    .await?;
-    sqlx::query(sql!(
-        "CREATE TRIGGER fail_build_job_record BEFORE INSERT ON template_build_jobs
-         FOR EACH ROW EXECUTE FUNCTION fail_build_job_record()"
-    ))
-    .execute(&fixture.db.pool)
-    .await?;
-    let (status, body) = build("synthetic-unrecorded-job").await?;
-    assert!(status.is_server_error(), "{status} {body}");
-    assert!(
-        fixture.builds.try_recv().is_ok(),
-        "the build reached the builder"
-    );
-    sqlx::query(sql!(
-        "DROP TRIGGER fail_build_job_record ON template_build_jobs"
-    ))
-    .execute(&fixture.db.pool)
-    .await?;
-    let (status, replay) = build("synthetic-unrecorded-job").await?;
-    assert_eq!(status, StatusCode::CONFLICT, "{replay}");
-    assert_eq!(replay["retryable"], false, "{replay}");
-    assert!(
-        replay["details"]
-            .as_array()
-            .expect("details")
-            .iter()
-            .any(
-                |detail| detail["key"] == "job_id" && detail["value"] == fixture.job_id.to_string()
-            ),
-        "{replay}"
-    );
-    assert!(
-        fixture.builds.try_recv().is_err(),
-        "a replay of an unrecorded job must not start another"
-    );
-
-    // The builder's bearer token cannot be read, so the call is not made:
-    // the key is freed, and once the token is back the same key builds.
-    let token_path = std::path::PathBuf::from(
-        std::env::var_os(pplx_space_common_svc::bearer_token::SpaceBearerToken::NodeApi.path_env())
-            .expect("the test owns the node-api token file"),
-    );
-    let moved = token_path.with_extension("moved");
-    std::fs::rename(&token_path, &moved)?;
-    let (status, body) = build("synthetic-no-credential").await?;
-    assert!(status.is_server_error(), "{status} {body}");
-    assert!(
-        fixture.builds.try_recv().is_err(),
-        "nothing reached the builder"
-    );
-    std::fs::rename(&moved, &token_path)?;
-    let (status, started) = build("synthetic-no-credential").await?;
-    assert_eq!(status, StatusCode::ACCEPTED, "{started}");
-    assert!(
-        fixture.builds.try_recv().is_ok(),
-        "the freed key starts its build"
-    );
-
-    // The builder refuses the connection, so nothing was sent: the key is
-    // freed, and once the builder is back the same key starts the build.
-    let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let closed_endpoint = closed.local_addr()?.to_string();
-    drop(closed);
-    let point_builder_at = |endpoint: String| {
-        let pool = fixture.db.pool.clone();
-        async move {
-            sqlx::query(sql!(
-                "UPDATE node_direct SET node_api_endpoint = $1 WHERE name = 'native-build-test'"
-            ))
-            .bind(endpoint)
-            .execute(&pool)
-            .await
+    match failure {
+        DispatchFailure::LostAnswer => {
+            // The builder takes the build, then its answer is an error.
+            fixture
+                .builder_fails_after_taking
+                .store(true, Ordering::SeqCst);
+            let (status, body) = build("synthetic-lost-answer").await?;
+            assert!(status.is_server_error(), "{status} {body}");
+            assert!(
+                fixture.builds.try_recv().is_ok(),
+                "the build reached the builder"
+            );
+            // Nothing will complete the record, so the replay says the outcome is
+            // unknown at once rather than asking for a retry.
+            let (status, replay) = build("synthetic-lost-answer").await?;
+            assert_eq!(status, StatusCode::CONFLICT, "{replay}");
+            assert_eq!(replay["retryable"], false, "{replay}");
+            assert!(
+                fixture.builds.try_recv().is_err(),
+                "a replay of a build the builder may have taken must not start another"
+            );
+            fixture
+                .builder_fails_after_taking
+                .store(false, Ordering::SeqCst);
         }
-    };
-    point_builder_at(closed_endpoint).await?;
-    let (status, body) = build("synthetic-refused").await?;
-    assert!(status.is_server_error(), "{status} {body}");
-    point_builder_at(fixture.builder_endpoint.clone()).await?;
-    let (status, started) = build("synthetic-refused").await?;
-    assert_eq!(status, StatusCode::ACCEPTED, "{started}");
-    assert!(
-        fixture.builds.try_recv().is_ok(),
-        "the freed key starts its build"
-    );
+        DispatchFailure::UnrecordedJob => {
+            // The builder accepts, and recording its job fails: the replay names the job.
+            sqlx::query(sql!(
+                "CREATE FUNCTION fail_build_job_record() RETURNS trigger
+                 LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic job record failure'; END $$"
+            ))
+            .execute(&fixture.db.pool)
+            .await?;
+            sqlx::query(sql!(
+                "CREATE TRIGGER fail_build_job_record BEFORE INSERT ON template_build_jobs
+                 FOR EACH ROW EXECUTE FUNCTION fail_build_job_record()"
+            ))
+            .execute(&fixture.db.pool)
+            .await?;
+            let (status, body) = build("synthetic-unrecorded-job").await?;
+            assert!(status.is_server_error(), "{status} {body}");
+            assert!(
+                fixture.builds.try_recv().is_ok(),
+                "the build reached the builder"
+            );
+            sqlx::query(sql!(
+                "DROP TRIGGER fail_build_job_record ON template_build_jobs"
+            ))
+            .execute(&fixture.db.pool)
+            .await?;
+            let (status, replay) = build("synthetic-unrecorded-job").await?;
+            assert_eq!(status, StatusCode::CONFLICT, "{replay}");
+            assert_eq!(replay["retryable"], false, "{replay}");
+            assert!(
+                replay["details"]
+                    .as_array()
+                    .expect("details")
+                    .iter()
+                    .any(|detail| detail["key"] == "job_id"
+                        && detail["value"] == fixture.job_id.to_string()),
+                "{replay}"
+            );
+            assert!(
+                fixture.builds.try_recv().is_err(),
+                "a replay of an unrecorded job must not start another"
+            );
+        }
+        DispatchFailure::NoCredential => {
+            // The builder's bearer token cannot be read, so the call is not made:
+            // the key is freed, and once the token is back the same key builds.
+            let token_path = std::path::PathBuf::from(
+                std::env::var_os(
+                    pplx_space_common_svc::bearer_token::SpaceBearerToken::NodeApi.path_env(),
+                )
+                .expect("the test owns the node-api token file"),
+            );
+            let moved = token_path.with_extension("moved");
+            std::fs::rename(&token_path, &moved)?;
+            let (status, body) = build("synthetic-no-credential").await?;
+            assert!(status.is_server_error(), "{status} {body}");
+            assert!(
+                fixture.builds.try_recv().is_err(),
+                "nothing reached the builder"
+            );
+            std::fs::rename(&moved, &token_path)?;
+            let (status, started) = build("synthetic-no-credential").await?;
+            assert_eq!(status, StatusCode::ACCEPTED, "{started}");
+            assert!(
+                fixture.builds.try_recv().is_ok(),
+                "the freed key starts its build"
+            );
+        }
+        DispatchFailure::Refused => {
+            // The builder refuses the connection, so nothing was sent: the key is
+            // freed, and once the builder is back the same key starts the build.
+            let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let closed_endpoint = closed.local_addr()?.to_string();
+            drop(closed);
+            let point_builder_at = |endpoint: String| {
+                let pool = fixture.db.pool.clone();
+                async move {
+                    sqlx::query(sql!(
+                        "UPDATE node_direct SET node_api_endpoint = $1 WHERE name = 'native-build-test'"
+                    ))
+                    .bind(endpoint)
+                    .execute(&pool)
+                    .await
+                }
+            };
+            point_builder_at(closed_endpoint).await?;
+            let (status, body) = build("synthetic-refused").await?;
+            assert!(status.is_server_error(), "{status} {body}");
+            point_builder_at(fixture.builder_endpoint.clone()).await?;
+            let (status, started) = build("synthetic-refused").await?;
+            assert_eq!(status, StatusCode::ACCEPTED, "{started}");
+            assert!(
+                fixture.builds.try_recv().is_ok(),
+                "the freed key starts its build"
+            );
+        }
+    }
     Ok(())
 }
 

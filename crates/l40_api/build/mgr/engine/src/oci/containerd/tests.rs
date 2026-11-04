@@ -836,7 +836,9 @@ async fn mounts_rootfs_when_cache_path_contains_spaces(mut oci_fixture: OciFixtu
 #[rstest]
 #[tokio::test]
 async fn dropped_rootfs_releases_its_containerd_mount(oci_fixture: OciFixture) {
-    let runner = Arc::new(RecordingRunner::slow_cleanup(Duration::from_millis(250)));
+    // The unmount and the view removal each take this long, so a drop that
+    // waited for them would outlast the 100 ms bound below.
+    let runner = Arc::new(RecordingRunner::slow_cleanup(Duration::from_millis(60)));
     let rootfs = mount_with_runner(
         oci_fixture.request.clone(),
         oci_fixture.arch,
@@ -857,7 +859,7 @@ async fn dropped_rootfs_releases_its_containerd_mount(oci_fixture: OciFixture) {
     let final_cleanup_command = oci_fixture.remove_owned_image_command(&mount_path);
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
         while runner.commands().last() != Some(&final_cleanup_command) {
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await

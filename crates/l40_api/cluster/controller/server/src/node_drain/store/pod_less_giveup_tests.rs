@@ -153,7 +153,10 @@ async fn give_up_asking<O: GenerationTeardownObserver>(
         Err(hold) => return Ok(PodLessRecovery::NotEligible(hold)),
     };
     Ok(match node_vouches(node, generation).await {
-        Ok(()) => recover_pod_less_sandbox_tx(pool, candidate, generation).await?,
+        Ok(()) => {
+            recover_pod_less_sandbox_tx(pool, candidate, generation, DRAIN_COMPLETION_LOCK_TIMEOUT)
+                .await?
+        }
         Err(hold) => PodLessRecovery::NotEligible(hold),
     })
 }
@@ -588,7 +591,13 @@ async fn undrain_racing_the_transaction_is_seen() -> TestResult {
 
     let (give_up_pool, give_up_pid) = single_backend_pool(&db).await?;
     let give_up = tokio::spawn(async move {
-        recover_pod_less_sandbox_tx(&give_up_pool, candidate, generation).await
+        recover_pod_less_sandbox_tx(
+            &give_up_pool,
+            candidate,
+            generation,
+            DRAIN_COMPLETION_LOCK_TIMEOUT,
+        )
+        .await
     });
     bounded(wait_until_blocked(pool, give_up_pid, undrain_pid)).await?;
     undrain.commit().await?;
@@ -603,7 +612,8 @@ async fn undrain_racing_the_transaction_is_seen() -> TestResult {
 
 /// While the transaction waits on the sandbox lock it holds the node row
 /// shared, so the wait is bounded; past the bound it backs out as contention
-/// and the next tick retries.
+/// and the next tick retries. The holder never releases, so a short bound
+/// reaches the same outcome as [`DRAIN_COMPLETION_LOCK_TIMEOUT`].
 #[tokio::test]
 async fn a_held_sandbox_lock_backs_out_as_contention() -> TestResult {
     let db = pg_test_db_with_max_connections(3).await?;
@@ -621,8 +631,18 @@ async fn a_held_sandbox_lock_backs_out_as_contention() -> TestResult {
         .await?;
 
     assert_eq!(
-        bounded(async { Ok(recover_pod_less_sandbox_tx(pool, candidate, generation).await?,) })
-            .await?,
+        bounded(async {
+            Ok(
+                recover_pod_less_sandbox_tx(
+                    pool,
+                    candidate,
+                    generation,
+                    Duration::from_millis(200),
+                )
+                .await?,
+            )
+        })
+        .await?,
         PodLessRecovery::NotEligible(PodLessHold::LockContended)
     );
     holder.rollback().await?;
@@ -859,7 +879,8 @@ async fn generation_created_after_the_pod_reads_backs_out() -> TestResult {
     .await?;
 
     assert_eq!(
-        recover_pod_less_sandbox_tx(&pool, candidate, generation).await?,
+        recover_pod_less_sandbox_tx(&pool, candidate, generation, DRAIN_COMPLETION_LOCK_TIMEOUT)
+            .await?,
         PodLessRecovery::NotEligible(PodLessHold::GenerationChanged)
     );
     assert_eq!(sandbox_row(&pool, sandbox_id).await?, resident(node_id));

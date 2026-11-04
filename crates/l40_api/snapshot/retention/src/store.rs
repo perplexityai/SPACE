@@ -124,13 +124,31 @@ fn usable_snapshot_location_exists(snapshot_alias: &str, location_alias: &str) -
     )
 }
 
+/// How many snapshot ids one discovery page reads before eligibility.
+const RAW_PAGE_SIZE: usize = 10_000;
+
 pub struct SnapshotRetentionDbStore {
     pool: PgPool,
+    /// [`RAW_PAGE_SIZE`] outside tests.
+    raw_page_size: usize,
 }
 
 impl SnapshotRetentionDbStore {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            raw_page_size: RAW_PAGE_SIZE,
+        }
+    }
+
+    /// A store whose discovery reads `raw_page_size` ids a page, so a test can
+    /// cross page boundaries without seeding tens of thousands of rows.
+    #[cfg(test)]
+    pub fn with_raw_page_size(pool: PgPool, raw_page_size: usize) -> Self {
+        Self {
+            pool,
+            raw_page_size,
+        }
     }
 
     #[cfg(test)]
@@ -182,22 +200,22 @@ impl RetentionSink for SnapshotRetentionDbStore {
         after: Option<SnapshotId>,
         min_age: Option<Duration>,
     ) -> Result<CandidatePage, sqlx::Error> {
-        const RAW_PAGE_SIZE: usize = 10_000;
         // One array avoids per-row wire/decoder overhead for the raw ID page.
         let ids: Vec<SnapshotId> = sqlx::query_scalar(sql!(
             "SELECT ARRAY(
                  SELECT id FROM snapshots
                   WHERE id > COALESCE($1::UUID, '00000000-0000-0000-0000-000000000000'::UUID)
                   ORDER BY id
-                  LIMIT 10000
+                  LIMIT $2
              )"
         ))
         .bind(after)
+        .bind(self.raw_page_size as i64)
         .fetch_one(&self.pool)
         .await?;
         let mut page = CandidatePage {
             scanned_through: ids.last().copied(),
-            exhausted: ids.len() < RAW_PAGE_SIZE,
+            exhausted: ids.len() < self.raw_page_size,
             candidates: Vec::new(),
         };
         if ids.is_empty() {

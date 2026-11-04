@@ -280,7 +280,7 @@ impl KubernetesSubstrate {
             }
             let _ = self
                 .pod_events
-                .wait_for(pod_name, remaining.min(REFLECTOR_WAIT_BUDGET))
+                .wait_for(pod_name, remaining.min(self.budgets.reflector_wait))
                 .await;
         }
         let pod = fetch_sandbox_pod_uncached(&self.k8s, pod_name)

@@ -321,13 +321,15 @@ async fn the_write_body_limit_admits_the_largest_documented_payload() {
     async fn accept(Json(request): Json<FileWriteRequest>) -> String {
         request.data_base64.len().to_string()
     }
+    // Written out rather than serialized: base64 needs no JSON escaping, and
+    // unoptimized serialization of a multi-MiB string is slow.
     let body = |raw_bytes: usize| {
-        serde_json::to_vec(&serde_json::json!({
-            "path": format!("/workspace/{}", "p".repeat(4000)),
-            "data_base64": BASE64_STANDARD.encode(vec![7u8; raw_bytes]),
-            "append": false,
-        }))
-        .unwrap()
+        format!(
+            r#"{{"path":"/workspace/{}","data_base64":"{}","append":false}}"#,
+            "p".repeat(4000),
+            BASE64_STANDARD.encode(vec![7u8; raw_bytes])
+        )
+        .into_bytes()
     };
     let send = |limit: Option<usize>, body: Vec<u8>| async move {
         let route = post(accept);
@@ -354,14 +356,18 @@ async fn the_write_body_limit_admits_the_largest_documented_payload() {
         "the framework default is what rejected larger writes"
     );
     let limit = Some(WRITE_FILE_BODY_LIMIT_BYTES);
-    assert_eq!(
-        send(limit, body(MAX_FILE_WRITE_BYTES)).await,
-        StatusCode::OK
+    let largest = body(MAX_FILE_WRITE_BYTES);
+    // As long as the body of a payload 1 MiB larger: trailing JSON whitespace
+    // stands in for the extra base64, which encoding again would cost.
+    let base64_len = |raw_bytes: usize| raw_bytes.div_ceil(3) * 4;
+    let mut larger = largest.clone();
+    larger.resize(
+        largest.len() - base64_len(MAX_FILE_WRITE_BYTES)
+            + base64_len(MAX_FILE_WRITE_BYTES + 1024 * 1024),
+        b' ',
     );
-    assert_eq!(
-        send(limit, body(MAX_FILE_WRITE_BYTES + 1024 * 1024)).await,
-        StatusCode::PAYLOAD_TOO_LARGE
-    );
+    assert_eq!(send(limit, largest).await, StatusCode::OK);
+    assert_eq!(send(limit, larger).await, StatusCode::PAYLOAD_TOO_LARGE);
     // An encoder that escapes every `/` as `\/` still fits for data whose
     // base64 is roughly uniform; the limit documents the worst case it does not
     // cover.
@@ -437,12 +443,20 @@ mod batch_body_limits {
     /// Serialize `body`, then pad it with trailing JSON whitespace to exactly
     /// `len` bytes so a test can sit precisely on a body limit.
     fn padded_body(body: &Value, len: usize) -> Vec<u8> {
-        let mut bytes = serde_json::to_vec(body).expect("test body serializes");
+        padded(
+            &serde_json::to_vec(body).expect("test body serializes"),
+            len,
+        )
+    }
+
+    /// [`padded_body`] of a body already serialized.
+    fn padded(body: &[u8], len: usize) -> Vec<u8> {
         assert!(
-            bytes.len() <= len,
+            body.len() <= len,
             "body is already {} > {len} bytes",
-            bytes.len()
+            body.len()
         );
+        let mut bytes = body.to_vec();
         bytes.resize(len, b' ');
         bytes
     }
@@ -511,10 +525,11 @@ mod batch_body_limits {
         let half = (MAX_FILE_WRITE_BATCH_BYTES - path_bytes) / 2;
         let at_cap = [half, MAX_FILE_WRITE_BATCH_BYTES - path_bytes - half];
 
+        let at_cap = serde_json::to_vec(&batch_body(&at_cap))?;
         let (status, body) = post(
             &fixture,
             "write_batch",
-            padded_body(&batch_body(&at_cap), WRITE_FILE_BATCH_BODY_LIMIT_BYTES),
+            padded(&at_cap, WRITE_FILE_BATCH_BODY_LIMIT_BYTES),
         )
         .await?;
         assert_accepted_past_size_checks(status, &body);
@@ -522,12 +537,12 @@ mod batch_body_limits {
         let (status, body) = post(
             &fixture,
             "write_batch",
-            padded_body(&batch_body(&at_cap), WRITE_FILE_BATCH_BODY_LIMIT_BYTES + 1),
+            padded(&at_cap, WRITE_FILE_BATCH_BODY_LIMIT_BYTES + 1),
         )
         .await?;
         assert_payload_too_large(status, &body);
 
-        let over_cap = [at_cap[0], at_cap[1] + 1];
+        let over_cap = [half, MAX_FILE_WRITE_BATCH_BYTES - path_bytes - half + 1];
         let (status, body) = post(
             &fixture,
             "write_batch",
@@ -551,18 +566,16 @@ mod batch_body_limits {
     #[tokio::test]
     async fn file_write_route_applies_its_body_limit() -> TestDbResult<()> {
         let fixture = fixture().await?;
-        let write = |decoded_len: usize| {
-            json!({
-                "path": "/workspace/f",
-                "data_base64": BASE64_STANDARD.encode(vec![0u8; decoded_len]),
-                "append": false,
-            })
-        };
+        let write = serde_json::to_vec(&json!({
+            "path": "/workspace/f",
+            "data_base64": BASE64_STANDARD.encode(vec![0u8; 3 * 1024 * 1024]),
+            "append": false,
+        }))?;
 
         let (status, body) = post(
             &fixture,
             "write",
-            padded_body(&write(3 * 1024 * 1024), WRITE_FILE_BODY_LIMIT_BYTES),
+            padded(&write, WRITE_FILE_BODY_LIMIT_BYTES),
         )
         .await?;
         assert_accepted_past_size_checks(status, &body);
@@ -570,7 +583,7 @@ mod batch_body_limits {
         let (status, body) = post(
             &fixture,
             "write",
-            padded_body(&write(3 * 1024 * 1024), WRITE_FILE_BODY_LIMIT_BYTES + 1),
+            padded(&write, WRITE_FILE_BODY_LIMIT_BYTES + 1),
         )
         .await?;
         assert_payload_too_large(status, &body);
@@ -789,7 +802,7 @@ mod key_binding {
                 .body(Body::from(serde_json::to_vec(&write(b"first"))?))?;
             tokio::spawn(app.oneshot(request))
         };
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        crate::test_support::wait_until_blocked_by(&mut held).await?;
         assert!(
             !retry.is_finished(),
             "the bound write did not wait on runtime acquisition, so the lock proves nothing"

@@ -17,8 +17,10 @@ use super::gone_node_giveup_claim_query;
 use pplx_space_test_env::TestResult;
 
 /// Suspended rows pinned to the node, each with a durable backup: the node's
-/// history, which the claim must leave out.
-const DURABLE_HISTORY: usize = 3000;
+/// history, which the claim must leave out. The plan shape the test pins does
+/// not depend on the history's size (see the test), so it need only be large
+/// beside the one casualty.
+const DURABLE_HISTORY: usize = 300;
 
 /// Insert `count` suspended sandboxes pinned to `node`.
 async fn insert_suspended_rows(pool: &PgPool, node: Uuid, count: usize) -> TestResult<Vec<Uuid>> {
@@ -63,7 +65,7 @@ async fn insert_ready_backups(pool: &PgPool, sandbox_ids: &[Uuid], node: Uuid) -
     Ok(())
 }
 
-/// One `EXPLAIN (ANALYZE, FORMAT JSON)` plan node, typed so a traversal that
+/// One `EXPLAIN (FORMAT JSON)` plan node, typed so a traversal that
 /// misses the root array, the `Plan` wrapper or the `Plans` nesting isn't
 /// expressible.
 #[derive(Debug, serde::Deserialize)]
@@ -101,7 +103,7 @@ impl PlanNode {
 }
 
 /// The claim's durability check stays inside a scalar subquery on a node with
-/// thousands of durable pinned rows and one casualty, and the claim still
+/// hundreds of durable pinned rows and one casualty, and the claim still
 /// returns exactly that casualty.
 ///
 /// The assertion is structural rather than a timing or a cost, because the
@@ -109,7 +111,7 @@ impl PlanNode {
 /// pulled up into a hash or merge anti-join over the whole `snapshots` ⋈
 /// `snapshot_storage_locations` product, and routine autoanalyze can move the
 /// planner onto that plan. A scalar subquery always plans as a `Result` node, at
-/// a thousand rows or at millions. Remove the `(SELECT …)` wrapper and the
+/// a few hundred rows or at millions. Remove the `(SELECT …)` wrapper and the
 /// durability join moves out from under it.
 #[tokio::test(flavor = "current_thread")]
 async fn the_claim_keeps_its_durability_check_fenced() -> TestResult {
@@ -138,9 +140,9 @@ async fn the_claim_keeps_its_durability_check_fenced() -> TestResult {
          {DURABLE_HISTORY} rows of durable history must not leak into it"
     );
 
-    // `TIMING OFF`: only the plan's shape is read, and per-node timing over
-    // thousands of subplan executions costs more than the plan does.
-    let statement = format!("EXPLAIN (ANALYZE, TIMING OFF, FORMAT JSON) {claim}");
+    // Not `ANALYZE`: only the plan's shape is read, and the claim already ran
+    // above.
+    let statement = format!("EXPLAIN (FORMAT JSON) {claim}");
     let raw: serde_json::Value = sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(statement.as_str())))
         .bind(node)
         .fetch_one(pool)

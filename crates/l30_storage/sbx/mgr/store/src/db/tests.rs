@@ -6629,8 +6629,8 @@ fn split_operation_receipts_survive_restart_and_preserve_route_ownership() {
     for (joined, rollback) in [(false, false), (true, false), (false, true), (true, true)] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("manager.sqlite");
-        let mut conn = Connection::open_at(&path).unwrap();
-        create_test_schema(&mut conn);
+        create_test_schema_on_disk(&path);
+        let conn = Connection::open_at(&path).unwrap();
         let id = uuid::Uuid::now_v7().to_string();
         insert_test_sandbox(
             &conn,

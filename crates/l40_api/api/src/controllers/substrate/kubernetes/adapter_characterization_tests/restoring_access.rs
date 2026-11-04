@@ -21,6 +21,10 @@ const POD_UID: &str = "restoring-pod-uid";
 /// The restore's pod runs here, behind a live worker, so a client that
 /// dialed it would connect.
 const POD_IP: &str = "127.0.0.1";
+/// The budget of an access whose restore outlives it. Past the follower
+/// join's first 100 ms backoff, so the request re-checks the restore inside
+/// it before it gives up.
+const LINGERING_RESTORE_ACCESS_BUDGET: Duration = Duration::from_millis(300);
 
 struct Restoring {
     substrate: KubernetesSubstrate,
@@ -295,7 +299,7 @@ async fn access_on_a_restoring_sandbox_is_refused_retryably_when_the_restore_lin
             access_identity(),
             &restoring.sandbox,
             ExecutionActivityKind::Access,
-            Duration::from_secs(2),
+            LINGERING_RESTORE_ACCESS_BUDGET,
             crate::controllers::substrate::RecoveryCharge::Exempt,
         )
         .await
@@ -410,85 +414,86 @@ async fn access_on_an_evacuating_sandbox_waits_for_the_drain() -> TestResult {
 /// retryably, and one that went to a state that can't be woken gets that
 /// state's error. Either way no pod is created; a fresh restore is for a
 /// caller whose access-wake policy and admission allow it.
+#[rstest::rstest]
 #[tokio::test(flavor = "current_thread")]
-async fn a_joined_restore_that_its_owner_abandons_starts_no_restore() -> TestResult {
+async fn a_joined_restore_that_its_owner_abandons_starts_no_restore(
+    #[values("suspended", "failed")] abandoned_to: &'static str,
+) -> TestResult {
     if !crate::test_support::enter_sim_worker_process() {
         return Ok(());
     }
     let db = pplx_space_db_test_fixtures::pg_test_db().await?;
-    for abandoned_to in ["suspended", "failed"] {
-        let sandbox_id = SandboxId::new();
-        let restoring = restoring_with_live_pod(&db.pool, sandbox_id, "120 seconds").await?;
-        // A durable source, so a fresh restore of the reverted row could
-        // start.
-        insert_ready_full_snapshot_relative_to_lifecycle(
-            &db.pool,
-            sandbox_id,
-            "s3://bucket/pre-restore?region=us-east-1",
-            -60,
-            Uuid::now_v7(),
-        )
-        .await?;
-        sqlx::query(sql!(
-            "UPDATE sandbox_k8s_executions SET created_at = NOW() WHERE sandbox_id = $1"
-        ))
-        .bind(sandbox_id)
-        .execute(&db.pool)
-        .await?;
-        let owner_substrate = restoring.substrate.clone();
-        let owner_pool = db.pool.clone();
-        let lease_token = restoring.lease_token;
-        let owner = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            if abandoned_to == "suspended" {
-                owner_substrate
-                    .store
-                    .revert_restore_claim_to_suspended(
-                        sandbox_id,
-                        Some(lease_token),
-                        None,
-                        crate::controllers::substrate::AbandonedRestoreRetirement::Enabled,
-                    )
-                    .await?;
-            } else {
-                sqlx::query(sql!(
-                    "UPDATE sandboxes SET lifecycle = 'failed' WHERE id = $1"
-                ))
-                .bind(sandbox_id)
-                .execute(&owner_pool)
-                .await?;
-            }
-            Ok::<_, BoxError>(())
-        });
-
-        let refused = restoring
-            .substrate
-            .access_runtime_client(
-                access_identity(),
-                &restoring.sandbox,
-                ExecutionActivityKind::Access,
-                Duration::from_secs(10),
-                crate::controllers::substrate::RecoveryCharge::Exempt,
-            )
-            .await
-            .expect_err("an abandoned restore serves no client");
-        owner.await??;
-
+    let sandbox_id = SandboxId::new();
+    let restoring = restoring_with_live_pod(&db.pool, sandbox_id, "120 seconds").await?;
+    // A durable source, so a fresh restore of the reverted row could
+    // start.
+    insert_ready_full_snapshot_relative_to_lifecycle(
+        &db.pool,
+        sandbox_id,
+        "s3://bucket/pre-restore?region=us-east-1",
+        -60,
+        Uuid::now_v7(),
+    )
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions SET created_at = NOW() WHERE sandbox_id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(&db.pool)
+    .await?;
+    let owner_substrate = restoring.substrate.clone();
+    let owner_pool = db.pool.clone();
+    let lease_token = restoring.lease_token;
+    let owner = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
         if abandoned_to == "suspended" {
-            assert_retryable_restore_in_flight(&refused);
+            owner_substrate
+                .store
+                .revert_restore_claim_to_suspended(
+                    sandbox_id,
+                    Some(lease_token),
+                    None,
+                    crate::controllers::substrate::AbandonedRestoreRetirement::Enabled,
+                )
+                .await?;
         } else {
-            assert_eq!(refused.status(), StatusCode::CONFLICT, "{refused:?}");
+            sqlx::query(sql!(
+                "UPDATE sandboxes SET lifecycle = 'failed' WHERE id = $1"
+            ))
+            .bind(sandbox_id)
+            .execute(&owner_pool)
+            .await?;
         }
-        assert_eq!(sandbox_lifecycle(&db.pool, sandbox_id).await?, abandoned_to);
-        let pod_writes = restoring
-            .kube_log
-            .lock()
-            .expect("kube log")
-            .iter()
-            .filter(|request| request.method != Method::GET)
-            .count();
-        assert_eq!(pod_writes, 0, "{abandoned_to}: no restore may be started");
+        Ok::<_, BoxError>(())
+    });
+
+    let refused = restoring
+        .substrate
+        .access_runtime_client(
+            access_identity(),
+            &restoring.sandbox,
+            ExecutionActivityKind::Access,
+            Duration::from_secs(10),
+            crate::controllers::substrate::RecoveryCharge::Exempt,
+        )
+        .await
+        .expect_err("an abandoned restore serves no client");
+    owner.await??;
+
+    if abandoned_to == "suspended" {
+        assert_retryable_restore_in_flight(&refused);
+    } else {
+        assert_eq!(refused.status(), StatusCode::CONFLICT, "{refused:?}");
     }
+    assert_eq!(sandbox_lifecycle(&db.pool, sandbox_id).await?, abandoned_to);
+    let pod_writes = restoring
+        .kube_log
+        .lock()
+        .expect("kube log")
+        .iter()
+        .filter(|request| request.method != Method::GET)
+        .count();
+    assert_eq!(pod_writes, 0, "{abandoned_to}: no restore may be started");
     Ok(())
 }
 
@@ -525,7 +530,7 @@ async fn a_rolled_back_restore_discards_no_request_it_served() -> TestResult {
             access_identity(),
             &restoring.sandbox,
             ExecutionActivityKind::Access,
-            Duration::from_secs(2),
+            LINGERING_RESTORE_ACCESS_BUDGET,
             crate::controllers::substrate::RecoveryCharge::Exempt,
         )
         .await
@@ -626,76 +631,77 @@ async fn a_failed_restore_rollback_deletes_its_pod_only_with_retirement_enabled(
 /// materializing a pod of its own: both `access_runtime_client` and
 /// `runtime_client` return only once the owner has brought the sandbox to
 /// `started`.
+#[rstest::rstest]
 #[tokio::test(flavor = "current_thread")]
-async fn a_restoring_sandbox_without_a_resolved_pod_joins_the_restore() -> TestResult {
+async fn a_restoring_sandbox_without_a_resolved_pod_joins_the_restore(
+    #[values(true, false)] via_access: bool,
+) -> TestResult {
     // The joined client connects to the worker over internal RPC.
     if !crate::test_support::enter_sim_worker_process() {
         return Ok(());
     }
     let db = pplx_space_db_test_fixtures::pg_test_db().await?;
-    for via_access in [true, false] {
-        let sandbox_id = SandboxId::new();
-        let restoring = restoring_with_live_pod(&db.pool, sandbox_id, "120 seconds").await?;
+    let sandbox_id = SandboxId::new();
+    let restoring = restoring_with_live_pod(&db.pool, sandbox_id, "120 seconds").await?;
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions
+            SET state = 'creating', pod_uid = NULL, pod_ip = NULL
+          WHERE sandbox_id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(&db.pool)
+    .await?;
+    let pool = db.pool.clone();
+    let owner = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
         sqlx::query(sql!(
             "UPDATE sandbox_k8s_executions
-                SET state = 'creating', pod_uid = NULL, pod_ip = NULL
+                SET state = 'running', pod_uid = $2, pod_ip = $3::INET
               WHERE sandbox_id = $1"
         ))
         .bind(sandbox_id)
-        .execute(&db.pool)
+        .bind(POD_UID)
+        .bind(POD_IP)
+        .execute(&pool)
         .await?;
-        let pool = db.pool.clone();
-        let owner = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            sqlx::query(sql!(
-                "UPDATE sandbox_k8s_executions
-                    SET state = 'running', pod_uid = $2, pod_ip = $3::INET
-                  WHERE sandbox_id = $1"
-            ))
-            .bind(sandbox_id)
-            .bind(POD_UID)
-            .bind(POD_IP)
-            .execute(&pool)
-            .await?;
-            sqlx::query(sql!(
-                "UPDATE sandboxes SET lifecycle = 'started' WHERE id = $1"
-            ))
-            .bind(sandbox_id)
-            .execute(&pool)
-            .await?;
-            Ok::<_, BoxError>(())
-        });
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET lifecycle = 'started' WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .execute(&pool)
+        .await?;
+        Ok::<_, BoxError>(())
+    });
 
-        let client = if via_access {
-            restoring
-                .substrate
-                .access_runtime_client(
-                    access_identity(),
-                    &restoring.sandbox,
-                    ExecutionActivityKind::Access,
-                    Duration::from_secs(10),
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
-                )
-                .await
-        } else {
-            restoring
-                .substrate
-                .runtime_client(
-                    sandbox_id,
-                    crate::controllers::substrate::RecoveryCharge::Exempt,
-                )
-                .await
-        };
-        let lifecycle_at_return = sandbox_lifecycle(&db.pool, sandbox_id).await?;
-        owner.await??;
+    let client = if via_access {
+        restoring
+            .substrate
+            .access_runtime_client(
+                access_identity(),
+                &restoring.sandbox,
+                ExecutionActivityKind::Access,
+                Duration::from_secs(10),
+                crate::controllers::substrate::RecoveryCharge::Exempt,
+            )
+            .await
+    } else {
+        restoring
+            .substrate
+            .runtime_client(
+                sandbox_id,
+                crate::controllers::substrate::RecoveryCharge::Exempt,
+            )
+            .await
+    };
+    let lifecycle_at_return = sandbox_lifecycle(&db.pool, sandbox_id).await?;
+    owner.await??;
 
-        assert!(
-            client.is_ok(),
-            "via_access={via_access}: {:?}",
-            client.err()
-        );
-        assert_eq!(lifecycle_at_return, "started", "via_access={via_access}");
-    }
+    assert!(
+        client.is_ok(),
+        "via_access={via_access}: {:?}",
+        client.err()
+    );
+    assert_eq!(lifecycle_at_return, "started", "via_access={via_access}");
     Ok(())
 }
 

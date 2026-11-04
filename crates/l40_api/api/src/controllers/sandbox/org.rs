@@ -7,10 +7,7 @@ use std::sync::LazyLock;
 
 use crate::federated_identity::FederatedOwner;
 
-use super::list_page::{
-    ListPage, MAX_SANDBOX_LIST_PAGE_BYTES, PageWalkParams, SANDBOX_LIST_ROW_OVERHEAD_BYTES,
-    page_rows_cte,
-};
+use super::list_page::{ListPage, PageWalkParams, SANDBOX_LIST_ROW_OVERHEAD_BYTES, page_rows_cte};
 
 use super::*;
 
@@ -216,7 +213,7 @@ impl SandboxController {
                 .bind(cursor_id)
                 .bind(max_rows)
                 .bind(metadata_filter)
-                .bind(MAX_SANDBOX_LIST_PAGE_BYTES)
+                .bind(self.list_page_max_bytes)
                 .bind(SANDBOX_LIST_ROW_OVERHEAD_BYTES)
                 .fetch_all(pool)
                 .await
@@ -236,7 +233,7 @@ impl SandboxController {
                 .bind(max_rows)
                 .bind(metadata_filter)
                 .bind(*legacy_org_id)
-                .bind(MAX_SANDBOX_LIST_PAGE_BYTES)
+                .bind(self.list_page_max_bytes)
                 .bind(SANDBOX_LIST_ROW_OVERHEAD_BYTES)
                 .fetch_all(pool)
                 .await

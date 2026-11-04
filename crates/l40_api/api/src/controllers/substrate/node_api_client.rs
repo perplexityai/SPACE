@@ -457,14 +457,16 @@ pub async fn connect_worker_internal(
 /// The internal bearer token a [`BuilderClient`] sends on every call.
 pub(crate) const BUILDER_BEARER_TOKEN: SpaceBearerToken = SpaceBearerToken::NodeApi;
 
-pub async fn connect_builder(endpoint: Endpoint) -> Result<BuilderClient, ControllerError> {
+/// A client for the builder at `endpoint`, dialed under `retry_policy`,
+/// which production callers set to
+/// [`pplx_space_common_grpc::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY`].
+pub async fn connect_builder(
+    endpoint: Endpoint,
+    retry_policy: pplx_space_common_grpc::GrpcRetryPolicy,
+) -> Result<BuilderClient, ControllerError> {
     let channel = node_api_connect_endpoint(endpoint)
         .await?
-        .connect_with_retry(
-            "builder-node-api",
-            "builder-node-api",
-            pplx_space_common_grpc::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
-        )
+        .connect_with_retry("builder-node-api", "builder-node-api", retry_policy)
         .await
         .map_err(|err| {
             ControllerError::service_unavailable(format!("node-api not reachable: {err}"))

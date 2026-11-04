@@ -11866,247 +11866,229 @@ pub(crate) mod service_tests {
         .unwrap();
     }
 
+    #[rstest::rstest]
+    #[case::matching("matching", 7, "", TeardownSuspendOutcome::Superseded)]
+    #[case::newer_receipt("newer_receipt", 6, "", TeardownSuspendOutcome::Superseded)]
+    #[case::older_receipt("older_receipt", 8, "", TeardownSuspendOutcome::Pending)]
+    #[case::missing_receipt(
+        "missing_receipt",
+        7,
+        "UPDATE sandboxes SET transition_receipt_id = NULL, transition_receipt_kind = NULL, transition_receipt_target_state = NULL, transition_receipt_execution_generation = NULL, transition_receipt_reason_code = NULL, transition_receipt_activation_attempt_id = NULL WHERE id = ?1",
+        TeardownSuspendOutcome::Pending
+    )]
+    #[case::malformed_receipt(
+        "malformed_receipt",
+        7,
+        "UPDATE sandboxes SET transition_receipt_id = 'invalid' WHERE id = ?1",
+        TeardownSuspendOutcome::Pending
+    )]
+    #[case::wrong_kind(
+        "wrong_kind",
+        7,
+        "UPDATE sandboxes SET transition_receipt_kind = 'activation_completed', transition_receipt_target_state = 'created', transition_receipt_reason_code = NULL WHERE id = ?1",
+        TeardownSuspendOutcome::Pending
+    )]
+    #[case::wrong_target(
+        "wrong_target",
+        7,
+        "UPDATE sandboxes SET transition_receipt_target_state = 'suspended' WHERE id = ?1",
+        TeardownSuspendOutcome::Pending
+    )]
+    #[case::runtime_residue(
+        "runtime_residue",
+        7,
+        "UPDATE sandboxes SET uid = 10000 WHERE id = ?1",
+        TeardownSuspendOutcome::Pending
+    )]
+    #[case::cleanup_intent(
+        "cleanup_intent",
+        7,
+        "UPDATE sandboxes SET cleanup_completion = 'mark_stopped', cleanup_keep_filesystem = 1 WHERE id = ?1",
+        TeardownSuspendOutcome::Pending
+    )]
+    #[case::failed_suspend(
+        "failed_suspend",
+        7,
+        "UPDATE sandboxes SET state = 'failed', failure_reason = 'suspend_publish_failed_no_artifact_runtime_gone' WHERE id = ?1",
+        TeardownSuspendOutcome::Pending
+    )]
+    #[case::same_generation_restart(
+        "same_generation_restart",
+        7,
+        "",
+        TeardownSuspendOutcome::Pending
+    )]
+    #[case::newer_execution("newer_execution", 6, "", TeardownSuspendOutcome::Superseded)]
+    #[case::cleanup_episode("cleanup_episode", 7, "", TeardownSuspendOutcome::Pending)]
+    #[case::pending_suspend_job("pending_suspend_job", 7, "", TeardownSuspendOutcome::Pending)]
+    #[case::failed_suspend_job("failed_suspend_job", 7, "", TeardownSuspendOutcome::Pending)]
+    #[case::completed_suspend_job(
+        "completed_suspend_job",
+        7,
+        "",
+        TeardownSuspendOutcome::Superseded
+    )]
     #[tokio::test]
-    async fn teardown_release_after_activation_rollback_is_generation_fenced() {
+    async fn teardown_release_after_activation_rollback_is_generation_fenced(
+        #[values(SandboxState::Created, SandboxState::Stopped)] target: SandboxState,
+        #[values(TeardownSuspendAction::ObserveOnly, TeardownSuspendAction::BeginOrJoin)]
+        action: TeardownSuspendAction,
+        #[case] case: &str,
+        #[case] requested: i64,
+        #[case] mutation: &str,
+        #[case] expected: TeardownSuspendOutcome,
+    ) {
         // Real activation admission and cleanup completion create the receipt;
         // reopening SQLite proves release does not depend on the old request.
-        for target in [SandboxState::Created, SandboxState::Stopped] {
-            for action in [
-                TeardownSuspendAction::ObserveOnly,
-                TeardownSuspendAction::BeginOrJoin,
-            ] {
-                for (case, requested, mutation, expected) in [
-                    ("matching", 7, "", TeardownSuspendOutcome::Superseded),
-                    ("newer_receipt", 6, "", TeardownSuspendOutcome::Superseded),
-                    ("older_receipt", 8, "", TeardownSuspendOutcome::Pending),
-                    (
-                        "missing_receipt",
-                        7,
-                        "UPDATE sandboxes SET transition_receipt_id = NULL, transition_receipt_kind = NULL, transition_receipt_target_state = NULL, transition_receipt_execution_generation = NULL, transition_receipt_reason_code = NULL, transition_receipt_activation_attempt_id = NULL WHERE id = ?1",
-                        TeardownSuspendOutcome::Pending,
-                    ),
-                    (
-                        "malformed_receipt",
-                        7,
-                        "UPDATE sandboxes SET transition_receipt_id = 'invalid' WHERE id = ?1",
-                        TeardownSuspendOutcome::Pending,
-                    ),
-                    (
-                        "wrong_kind",
-                        7,
-                        "UPDATE sandboxes SET transition_receipt_kind = 'activation_completed', transition_receipt_target_state = 'created', transition_receipt_reason_code = NULL WHERE id = ?1",
-                        TeardownSuspendOutcome::Pending,
-                    ),
-                    (
-                        "wrong_target",
-                        7,
-                        "UPDATE sandboxes SET transition_receipt_target_state = 'suspended' WHERE id = ?1",
-                        TeardownSuspendOutcome::Pending,
-                    ),
-                    (
-                        "runtime_residue",
-                        7,
-                        "UPDATE sandboxes SET uid = 10000 WHERE id = ?1",
-                        TeardownSuspendOutcome::Pending,
-                    ),
-                    (
-                        "cleanup_intent",
-                        7,
-                        "UPDATE sandboxes SET cleanup_completion = 'mark_stopped', cleanup_keep_filesystem = 1 WHERE id = ?1",
-                        TeardownSuspendOutcome::Pending,
-                    ),
-                    (
-                        "failed_suspend",
-                        7,
-                        "UPDATE sandboxes SET state = 'failed', failure_reason = 'suspend_publish_failed_no_artifact_runtime_gone' WHERE id = ?1",
-                        TeardownSuspendOutcome::Pending,
-                    ),
-                    (
-                        "same_generation_restart",
-                        7,
-                        "",
-                        TeardownSuspendOutcome::Pending,
-                    ),
-                    ("newer_execution", 6, "", TeardownSuspendOutcome::Superseded),
-                    ("cleanup_episode", 7, "", TeardownSuspendOutcome::Pending),
-                    (
-                        "pending_suspend_job",
-                        7,
-                        "",
-                        TeardownSuspendOutcome::Pending,
-                    ),
-                    ("failed_suspend_job", 7, "", TeardownSuspendOutcome::Pending),
-                    (
-                        "completed_suspend_job",
-                        7,
-                        "",
-                        TeardownSuspendOutcome::Superseded,
-                    ),
-                ] {
-                    let directory = tempfile::tempdir().unwrap();
-                    let db_path = directory.path().join("manager.sqlite");
-                    let sandbox_id = SandboxId::new();
-                    let id = sandbox_id.to_string();
-                    let generation = ExecutionGeneration::new(7).unwrap();
-                    {
-                        crate::db::create_test_schema_on_disk(&db_path);
-                        let conn = crate::db::Connection::open_at(&db_path).unwrap();
-                        insert_test_sandbox(&conn, &id, target);
-                        let fields = runtime_fields(generation, 7);
-                        let episode = crate::db::begin_activation(
-                            &conn,
-                            &id,
-                            target,
-                            crate::db::ActivationKind::ColdStart,
-                            Some(generation),
-                            fields.space_api_route_identity.activation_attempt_id,
-                        )
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("manager.sqlite");
+        let sandbox_id = SandboxId::new();
+        let id = sandbox_id.to_string();
+        let generation = ExecutionGeneration::new(7).unwrap();
+        {
+            crate::db::create_test_schema_on_disk(&db_path);
+            let conn = crate::db::Connection::open_at(&db_path).unwrap();
+            insert_test_sandbox(&conn, &id, target);
+            let fields = runtime_fields(generation, 7);
+            let episode = crate::db::begin_activation(
+                &conn,
+                &id,
+                target,
+                crate::db::ActivationKind::ColdStart,
+                Some(generation),
+                fields.space_api_route_identity.activation_attempt_id,
+            )
+            .unwrap()
+            .unwrap();
+            crate::db::update_runtime_fields_for_activation(&conn, sandbox_id, episode.id, fields)
+                .unwrap();
+            crate::db::request_cleanup_episode(
+                &conn,
+                &id,
+                episode.id,
+                SandboxQuarantineReasonCode::RuntimeProbeInconsistent,
+                "activation failed",
+            )
+            .unwrap();
+            assert!(
+                crate::db::complete_cleanup_episode(&conn, &id, episode.id)
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                crate::db::runtime_execution_generation(&conn, &id).unwrap(),
+                None
+            );
+            assert_eq!(
+                crate::db::get_sandbox(&conn, &id).unwrap().unwrap().state,
+                target
+            );
+            if !mutation.is_empty() {
+                conn.execute(mutation, [&id]).unwrap();
+            }
+            if matches!(
+                case,
+                "pending_suspend_job" | "failed_suspend_job" | "completed_suspend_job"
+            ) {
+                crate::db::claim_teardown_suspend_operation(&conn, &id, generation).unwrap();
+                if case == "failed_suspend_job" {
+                    let operation = crate::db::teardown_suspend_status(&conn, &id)
                         .unwrap()
-                        .unwrap();
-                        crate::db::update_runtime_fields_for_activation(
-                            &conn, sandbox_id, episode.id, fields,
-                        )
-                        .unwrap();
-                        crate::db::request_cleanup_episode(
-                            &conn,
-                            &id,
-                            episode.id,
-                            SandboxQuarantineReasonCode::RuntimeProbeInconsistent,
-                            "activation failed",
-                        )
-                        .unwrap();
-                        assert!(
-                            crate::db::complete_cleanup_episode(&conn, &id, episode.id)
-                                .unwrap()
-                                .is_some()
-                        );
-                        assert_eq!(
-                            crate::db::runtime_execution_generation(&conn, &id).unwrap(),
-                            None
-                        );
-                        assert_eq!(
-                            crate::db::get_sandbox(&conn, &id).unwrap().unwrap().state,
-                            target
-                        );
-                        if !mutation.is_empty() {
-                            conn.execute(mutation, [&id]).unwrap();
-                        }
-                        if matches!(
-                            case,
-                            "pending_suspend_job" | "failed_suspend_job" | "completed_suspend_job"
-                        ) {
-                            crate::db::claim_teardown_suspend_operation(&conn, &id, generation)
-                                .unwrap();
-                            if case == "failed_suspend_job" {
-                                let operation = crate::db::teardown_suspend_status(&conn, &id)
-                                    .unwrap()
-                                    .unwrap()
-                                    .operation
-                                    .unwrap();
-                                pplx_space_common_jobs::db::fail_job_permanent(
-                                    conn.raw(),
-                                    &operation.job_id,
-                                    "suspend publication failed",
-                                    None,
-                                )
-                                .unwrap();
-                            } else if case == "completed_suspend_job" {
-                                assert!(
-                                    crate::db::complete_teardown_suspend(
-                                        &conn, &id, generation, None
-                                    )
-                                    .unwrap()
-                                );
-                            }
-                        }
-                        if matches!(
-                            case,
-                            "same_generation_restart" | "newer_execution" | "cleanup_episode"
-                        ) {
-                            let old_receipt = crate::db::sandbox_state_publication_metadata(
-                                &conn,
-                                std::slice::from_ref(&id),
-                            )
-                            .unwrap()
-                            .remove(&id)
-                            .unwrap()
-                            .unwrap();
-                            let fields = runtime_fields(generation, 8);
-                            let replacement = crate::db::begin_activation(
-                                &conn,
-                                &id,
-                                target,
-                                crate::db::ActivationKind::ColdStart,
-                                Some(generation),
-                                fields.space_api_route_identity.activation_attempt_id,
-                            )
-                            .unwrap()
-                            .unwrap();
-                            if case == "cleanup_episode" {
-                                // A conflicting episode must block even with a dormant row.
-                                conn.execute("UPDATE sandboxes SET state = ?2, cleanup_completion = NULL, cleanup_keep_filesystem = NULL WHERE id = ?1", crate::db::fixture::params![id, target.as_str()]).unwrap();
-                            } else {
-                                crate::db::update_runtime_fields_for_activation(
-                                    &conn,
-                                    sandbox_id,
-                                    replacement.id,
-                                    fields,
-                                )
-                                .unwrap();
-                                if case == "newer_execution" {
-                                    assert!(
-                                        crate::db::mark_start_succeeded(
-                                            &conn,
-                                            &id,
-                                            Some(replacement.id)
-                                        )
-                                        .unwrap()
-                                    );
-                                }
-                            }
-                            // A retained historical receipt must not override a new owner.
-                            conn.execute("UPDATE sandboxes SET transition_receipt_id = ?2, transition_receipt_kind = ?3, transition_receipt_target_state = ?4, transition_receipt_execution_generation = ?5, transition_receipt_reason_code = ?6, transition_receipt_activation_attempt_id = ?7 WHERE id = ?1", crate::db::fixture::params![id, old_receipt.transition_receipt_id, old_receipt.transition_receipt_kind, old_receipt.transition_receipt_target_state, old_receipt.transition_receipt_execution_generation, old_receipt.transition_receipt_reason_code, old_receipt.transition_receipt_activation_attempt_id]).unwrap();
-                        }
-                    }
-                    let service = service_for_teardown_test(
-                        crate::db::Connection::open_at(&db_path).unwrap(),
-                    );
-                    let before = crate::db::get_sandbox(&service.db.lock().unwrap(), &id)
                         .unwrap()
+                        .operation
                         .unwrap();
-                    let response = service
-                        .prepare_teardown_suspend(internal_request(
-                            prepare_teardown_suspend_request(id.clone(), requested, action),
-                        ))
-                        .await;
-                    if case == "failed_suspend_job" {
-                        assert_eq!(
-                            response.unwrap_err().code(),
-                            tonic::Code::FailedPrecondition
-                        );
-                    } else {
-                        let response = response.unwrap().into_inner();
-                        assert_eq!(
-                            TeardownSuspendOutcome::try_from(response.outcome).unwrap(),
-                            expected,
-                            "{target:?}/{action:?}/{case}"
-                        );
-                        assert!(response.published_artifact.is_none());
-                    }
-                    let db = service.db.lock().unwrap();
-                    let after = crate::db::get_sandbox(&db, &id).unwrap().unwrap();
-                    assert_eq!(
-                        after.state, before.state,
-                        "{case} must preserve lifecycle state"
+                    pplx_space_common_jobs::db::fail_job_permanent(
+                        conn.raw(),
+                        &operation.job_id,
+                        "suspend publication failed",
+                        None,
+                    )
+                    .unwrap();
+                } else if case == "completed_suspend_job" {
+                    assert!(
+                        crate::db::complete_teardown_suspend(&conn, &id, generation, None).unwrap()
                     );
-                    assert_eq!(
-                        after.space_api_route_identity,
-                        before.space_api_route_identity
-                    );
-                    assert!(service.teardown_suspend_drivers.is_empty());
                 }
             }
+            if matches!(
+                case,
+                "same_generation_restart" | "newer_execution" | "cleanup_episode"
+            ) {
+                let old_receipt =
+                    crate::db::sandbox_state_publication_metadata(&conn, std::slice::from_ref(&id))
+                        .unwrap()
+                        .remove(&id)
+                        .unwrap()
+                        .unwrap();
+                let fields = runtime_fields(generation, 8);
+                let replacement = crate::db::begin_activation(
+                    &conn,
+                    &id,
+                    target,
+                    crate::db::ActivationKind::ColdStart,
+                    Some(generation),
+                    fields.space_api_route_identity.activation_attempt_id,
+                )
+                .unwrap()
+                .unwrap();
+                if case == "cleanup_episode" {
+                    // A conflicting episode must block even with a dormant row.
+                    conn.execute("UPDATE sandboxes SET state = ?2, cleanup_completion = NULL, cleanup_keep_filesystem = NULL WHERE id = ?1", crate::db::fixture::params![id, target.as_str()]).unwrap();
+                } else {
+                    crate::db::update_runtime_fields_for_activation(
+                        &conn,
+                        sandbox_id,
+                        replacement.id,
+                        fields,
+                    )
+                    .unwrap();
+                    if case == "newer_execution" {
+                        assert!(
+                            crate::db::mark_start_succeeded(&conn, &id, Some(replacement.id))
+                                .unwrap()
+                        );
+                    }
+                }
+                // A retained historical receipt must not override a new owner.
+                conn.execute("UPDATE sandboxes SET transition_receipt_id = ?2, transition_receipt_kind = ?3, transition_receipt_target_state = ?4, transition_receipt_execution_generation = ?5, transition_receipt_reason_code = ?6, transition_receipt_activation_attempt_id = ?7 WHERE id = ?1", crate::db::fixture::params![id, old_receipt.transition_receipt_id, old_receipt.transition_receipt_kind, old_receipt.transition_receipt_target_state, old_receipt.transition_receipt_execution_generation, old_receipt.transition_receipt_reason_code, old_receipt.transition_receipt_activation_attempt_id]).unwrap();
+            }
         }
+        let service = service_for_teardown_test(crate::db::Connection::open_at(&db_path).unwrap());
+        let before = crate::db::get_sandbox(&service.db.lock().unwrap(), &id)
+            .unwrap()
+            .unwrap();
+        let response = service
+            .prepare_teardown_suspend(internal_request(prepare_teardown_suspend_request(
+                id.clone(),
+                requested,
+                action,
+            )))
+            .await;
+        if case == "failed_suspend_job" {
+            assert_eq!(
+                response.unwrap_err().code(),
+                tonic::Code::FailedPrecondition
+            );
+        } else {
+            let response = response.unwrap().into_inner();
+            assert_eq!(
+                TeardownSuspendOutcome::try_from(response.outcome).unwrap(),
+                expected,
+                "{target:?}/{action:?}/{case}"
+            );
+            assert!(response.published_artifact.is_none());
+        }
+        let db = service.db.lock().unwrap();
+        let after = crate::db::get_sandbox(&db, &id).unwrap().unwrap();
+        assert_eq!(
+            after.state, before.state,
+            "{case} must preserve lifecycle state"
+        );
+        assert_eq!(
+            after.space_api_route_identity,
+            before.space_api_route_identity
+        );
+        assert!(service.teardown_suspend_drivers.is_empty());
     }
 
     #[tokio::test]

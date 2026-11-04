@@ -3,6 +3,12 @@
 //! the generic guards' matrix, and a from-set that excludes the row's state
 //! refuses with the row unchanged. Each runs standalone and inside a caller's
 //! transaction. An edge binds the from-set and target a call site writes.
+//!
+//! The three tests that sweep every row state take it as a case. The two
+//! writer sweeps also take `in_transaction`, the lifecycle sweep the cleanup
+//! shape and the from-set sweep the receipt. nextest runs the cases in
+//! parallel: as single tests they took 9-25 s each in CI, past the 2 s test
+//! budget (ci/test-duration-budget.toml).
 
 use super::state_write_fixtures::{assert_diff, assert_unchanged, snapshot, test_start};
 use super::update_state_matrix::{
@@ -17,11 +23,38 @@ use crate::state::SandboxState;
 
 const IN_TRANSACTION: [bool; 2] = [false, true];
 
+/// The cases below name each of `SandboxState::all()`, `Shape::ALL` and
+/// `Receipt::ALL` by index.
 #[test]
-fn expecting_every_state_answers_every_lifecycle_pair_and_cleanup_shape() {
-    for in_transaction in IN_TRANSACTION {
-        sweep_lifecycle_pairs_and_cleanup_shapes(Writer { in_transaction });
-    }
+fn the_cases_cover_every_state_shape_and_receipt() {
+    assert_eq!(
+        SandboxState::all().len(),
+        18,
+        "add a case for the new state to each #[values(...)] below"
+    );
+    assert_eq!(
+        Shape::ALL.len(),
+        5,
+        "add a case for the new shape to the #[values(...)] below"
+    );
+    assert_eq!(
+        Receipt::ALL.len(),
+        2,
+        "add a case for the new receipt to the #[values(...)] below"
+    );
+}
+
+#[rstest::rstest]
+fn expecting_every_state_answers_every_lifecycle_pair_and_cleanup_shape(
+    #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17)] from: usize,
+    #[values(0, 1, 2, 3, 4)] shape: usize,
+    #[values(false, true)] in_transaction: bool,
+) {
+    sweep_lifecycle_pairs_and_cleanup_shapes(
+        Writer { in_transaction },
+        SandboxState::all()[from],
+        Shape::ALL[shape],
+    );
 }
 
 #[test]
@@ -69,41 +102,41 @@ fn expected_outcome(
     }
 }
 
-#[test]
-fn a_from_set_without_the_row_state_refuses_and_keeps_every_row() {
-    for in_transaction in IN_TRANSACTION {
-        for receipt_kind in Receipt::ALL {
-            for from in SandboxState::all() {
-                for to in SandboxState::all() {
-                    let receipt = receipt_kind.target(to);
-                    for (label, from_set, contains) in from_sets(from) {
-                        let case = format!(
-                            "in transaction: {in_transaction}, {receipt} receipt, \
-                             expecting {label}: {from} -> {to}"
-                        );
-                        let conn = test_conn();
-                        let id = seed(&conn, Shape::Plain, from, receipt);
-                        let before = snapshot(&conn);
-                        let start = test_start();
-                        let result = write_from(&conn, &id, from_set, to, in_transaction);
-                        match (expected_outcome(from, to, contains), result) {
-                            (Some(expected), Ok(outcome)) => {
-                                assert_eq!(outcome, expected, "{case}");
-                                if matches!(outcome, StateWriteOutcome::Applied { .. }) {
-                                    let applied = applied_diff(&id, from, to, receipt);
-                                    assert_diff(&case, &before, &snapshot(&conn), start, &applied);
-                                } else {
-                                    assert_unchanged(&case, &before, &conn);
-                                }
-                            }
-                            (None, Err(error)) if error.is_invalid_query() => {
-                                assert_unchanged(&case, &before, &conn);
-                            }
-                            (expected, result) => {
-                                panic!("{case}: expected {expected:?}, got {result:?}")
-                            }
-                        }
+#[rstest::rstest]
+fn a_from_set_without_the_row_state_refuses_and_keeps_every_row(
+    #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17)] from: usize,
+    #[values(0, 1)] receipt_kind: usize,
+    #[values(false, true)] in_transaction: bool,
+) {
+    let from = SandboxState::all()[from];
+    let receipt_kind = Receipt::ALL[receipt_kind];
+    for to in SandboxState::all() {
+        let receipt = receipt_kind.target(to);
+        for (label, from_set, contains) in from_sets(from) {
+            let case = format!(
+                "in transaction: {in_transaction}, {receipt} receipt, \
+                 expecting {label}: {from} -> {to}"
+            );
+            let conn = test_conn();
+            let id = seed(&conn, Shape::Plain, from, receipt);
+            let before = snapshot(&conn);
+            let start = test_start();
+            let result = write_from(&conn, &id, from_set, to, in_transaction);
+            match (expected_outcome(from, to, contains), result) {
+                (Some(expected), Ok(outcome)) => {
+                    assert_eq!(outcome, expected, "{case}");
+                    if matches!(outcome, StateWriteOutcome::Applied { .. }) {
+                        let applied = applied_diff(&id, from, to, receipt);
+                        assert_diff(&case, &before, &snapshot(&conn), start, &applied);
+                    } else {
+                        assert_unchanged(&case, &before, &conn);
                     }
+                }
+                (None, Err(error)) if error.is_invalid_query() => {
+                    assert_unchanged(&case, &before, &conn);
+                }
+                (expected, result) => {
+                    panic!("{case}: expected {expected:?}, got {result:?}")
                 }
             }
         }
@@ -115,26 +148,27 @@ fn writable(edge: &crate::db::Edge) -> bool {
         && !matches!(edge.to(), SandboxState::Quarantined | SandboxState::Failed)
 }
 
-#[test]
-fn an_edge_writes_its_target_only_from_its_sources() {
+#[rstest::rstest]
+fn an_edge_writes_its_target_only_from_its_sources(
+    #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17)] from: usize,
+) {
+    let from = SandboxState::all()[from];
     for edge in EDGES.iter().filter(|edge| writable(edge)) {
         let to = edge.to();
-        for from in SandboxState::all() {
-            let receipt = Receipt::ForTarget.target(to);
-            let case = format!("{}: {from} -> {to}", edge.name());
-            let conn = test_conn();
-            let id = seed(&conn, Shape::Plain, from, receipt);
-            let before = snapshot(&conn);
-            let start = test_start();
-            let expected = expected_outcome(from, to, edge.from().contains(from)).unwrap();
-            let outcome = update_state_from(&conn, &id, edge).unwrap();
-            assert_eq!(outcome, expected, "{case}");
-            if matches!(outcome, StateWriteOutcome::Applied { .. }) {
-                let applied = applied_diff(&id, from, to, receipt);
-                assert_diff(&case, &before, &snapshot(&conn), start, &applied);
-            } else {
-                assert_unchanged(&case, &before, &conn);
-            }
+        let receipt = Receipt::ForTarget.target(to);
+        let case = format!("{}: {from} -> {to}", edge.name());
+        let conn = test_conn();
+        let id = seed(&conn, Shape::Plain, from, receipt);
+        let before = snapshot(&conn);
+        let start = test_start();
+        let expected = expected_outcome(from, to, edge.from().contains(from)).unwrap();
+        let outcome = update_state_from(&conn, &id, edge).unwrap();
+        assert_eq!(outcome, expected, "{case}");
+        if matches!(outcome, StateWriteOutcome::Applied { .. }) {
+            let applied = applied_diff(&id, from, to, receipt);
+            assert_diff(&case, &before, &snapshot(&conn), start, &applied);
+        } else {
+            assert_unchanged(&case, &before, &conn);
         }
     }
 }

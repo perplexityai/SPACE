@@ -83,6 +83,8 @@ impl SandboxManagerServiceOptions {
             ),
             cleanup_run_dir: Some(scratch.to_owned()),
             create_cache_dir: Some(scratch.join("cache")),
+            pause_reconciliation_backoff: None,
+            snapshot_upload_retry_backoff_secs: None,
         }
     }
 }

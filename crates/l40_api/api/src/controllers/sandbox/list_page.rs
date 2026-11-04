@@ -12,6 +12,13 @@
 /// keeps a typical full row near 18 KB, but JSON escapes a control character
 /// to six bytes, and rows stored before the input limits can be larger.
 pub(crate) const MAX_SANDBOX_LIST_PAGE_BYTES: i64 = 8 * 1024 * 1024;
+/// The budget tests page against: a sixteenth of
+/// [`MAX_SANDBOX_LIST_PAGE_BYTES`], so a page holds KiB rows rather than MiB
+/// ones. The walk only compares running sizes with the budget, and
+/// [`SANDBOX_LIST_ROW_OVERHEAD_BYTES`] is a thirty-second of a row an eighth
+/// of this budget long, so pages keep the shapes they have at full size.
+#[cfg(test)]
+pub(crate) const TEST_SANDBOX_LIST_PAGE_BYTES: i64 = MAX_SANDBOX_LIST_PAGE_BYTES / 16;
 /// A listed sandbox apart from its name, metadata and env: about 700 bytes
 /// of native JSON, up to about 1.1 KB with the longest template reference.
 pub(crate) const SANDBOX_LIST_ROW_OVERHEAD_BYTES: i64 = 2 * 1024;

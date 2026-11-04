@@ -2229,6 +2229,7 @@ async fn confirmed_node_pause_reports_paused_and_carries_the_execution_fence() {
         GuestSnapshotPreparationBudget::Standard,
         &connector,
         None,
+        super::pause_resume::PAUSE_RECONCILIATION_BACKOFF,
     )
     .await;
 

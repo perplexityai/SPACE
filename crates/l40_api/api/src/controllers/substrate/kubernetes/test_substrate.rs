@@ -20,6 +20,21 @@ use crate::controllers::substrate::runtime_upgrade::{
 /// `sandbox_k8s_executions` rows in.
 pub const TEST_SANDBOX_NAMESPACE: &str = "space";
 
+/// [`assemble_substrate`]'s reflector-event wait. Its reflectors are seeded
+/// once and never fed, so a pod read's wait can only time out before the
+/// apiserver GET that answers it; a shorter wait changes no outcome.
+const TEST_REFLECTOR_WAIT: Duration = Duration::from_millis(20);
+
+/// [`assemble_substrate`]'s blocking-delete budget. Its reflector never sees
+/// a delete, so the absence wait always runs to the deadline, and the GET
+/// there decides the outcome whatever the budget.
+const TEST_BLOCKING_DELETE_TIMEOUT: Duration = Duration::from_millis(20);
+
+/// How often [`assemble_substrate`]'s restore followers re-observe a restore
+/// whose owner holds a long lease. A follower sees the owner's change on its
+/// next poll, so this only bounds how late it sees it.
+const TEST_RESTORE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 impl KubernetesSubstrate {
     /// A substrate over `pool` whose apiserver is `client`, with every cache
     /// warm: the sandbox-pod cache and the node-api-pod cache each hold every
@@ -32,8 +47,8 @@ impl KubernetesSubstrate {
     /// `sandbox_proxy_port` when that pod advertises none. Its create,
     /// data-plane, delete and cancel-rate budgets, and its abandoned-restore
     /// retirement switch (off), are the ones [`Self::try_from_env`] computes
-    /// with none of their variables set. The
-    /// node-api client still reads its transport and bearer tokens from the
+    /// with none of their variables set, and its other waits are
+    /// production's. The node-api client still reads its transport and bearer tokens from the
     /// process environment, as in production.
     pub fn with_seeded_caches(
         pool: PgPool,
@@ -47,6 +62,12 @@ impl KubernetesSubstrate {
         substrate.k8s.k8s_blocking_delete_timeout = DEFAULT_K8S_BLOCKING_DELETE_TIMEOUT;
         substrate.k8s.abandoned_restore_retirement = AbandonedRestoreRetirement::Disabled;
         substrate.cancel_tracker = CancelRateTracker::with_default_budget();
+        substrate.budgets = SubstrateBudgets::default();
+        substrate.restore_waiters = RestoreWaiters::new(
+            substrate.store.clone(),
+            substrate.shutdown_token.clone(),
+            substrate.task_tracker.clone(),
+        );
         substrate
     }
 }
@@ -87,9 +108,10 @@ pub(super) fn seeded_substrate(
 }
 
 /// A substrate over `pool` and `client` with the given caches, one-second
-/// create and delete budgets, a cancel-rate budget of 64 a second,
-/// abandoned-restore retirement enabled, and the node-group placement gate
-/// closed.
+/// create budgets, a cancel-rate budget of 64 a second, abandoned-restore
+/// retirement enabled, and the node-group placement gate closed. Its
+/// blocking-delete budget, reflector-event wait and restore-follower poll
+/// interval are shortened, as their constants say.
 pub(super) fn assemble_substrate(
     pool: PgPool,
     client: Client,
@@ -109,15 +131,16 @@ pub(super) fn assemble_substrate(
             sandbox_pod_config,
             create_command_ready_timeout: Duration::from_secs(1),
             create_data_plane_ready_timeout: Duration::from_secs(1),
-            k8s_blocking_delete_timeout: Duration::from_secs(1),
+            k8s_blocking_delete_timeout: TEST_BLOCKING_DELETE_TIMEOUT,
             abandoned_restore_retirement: AbandonedRestoreRetirement::Enabled,
             runtime_upgrade_at_activation: RuntimeUpgradeAtActivation::Disabled,
             caches,
         },
-        restore_waiters: RestoreWaiters::new(
+        restore_waiters: RestoreWaiters::with_max_poll_interval(
             K8sStore::new(pool.clone(), TEST_SANDBOX_NAMESPACE.to_string()),
             shutdown_token.clone(),
             task_tracker.clone(),
+            TEST_RESTORE_POLL_INTERVAL,
         ),
         pod_worker_channels: Arc::default(),
         wake_coalescer: Arc::new(
@@ -136,7 +159,10 @@ pub(super) fn assemble_substrate(
         node_group_placement: NodeGroupPlacementResolver::new(pool, false),
         recovery_join_backoff: RecoveryJoinBackoffPolicy::default(),
         runtime_policy: RuntimePolicyCache::default(),
-        budgets: SubstrateBudgets::default(),
+        budgets: SubstrateBudgets {
+            reflector_wait: TEST_REFLECTOR_WAIT,
+            ..SubstrateBudgets::DEFAULT
+        },
         shutdown_token,
         task_tracker,
     }

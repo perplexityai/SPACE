@@ -1691,7 +1691,7 @@ fn expanded_test_rootfs_setup() -> (tempfile::TempDir, String, Vec<u8>) {
     use sha2::Digest;
 
     let temp = tempfile::tempdir().unwrap();
-    let rootfs_bytes: Vec<u8> = (0u8..=255u8).cycle().take(4 * 1024 * 1024).collect();
+    let rootfs_bytes: Vec<u8> = (0u8..=255u8).cycle().take(1024 * 1024).collect();
     std::fs::write(temp.path().join("rootfs.ext4"), &rootfs_bytes).unwrap();
 
     let mut hasher = sha2::Sha256::new();
@@ -1718,7 +1718,7 @@ fn expanded_test_rootfs_setup() -> (tempfile::TempDir, String, Vec<u8>) {
         serde_json::to_string(&manifest).unwrap(),
     )
     .unwrap();
-    std::fs::write(temp.path().join("metadata.json"), r#"{"disk_size_mb":4}"#).unwrap();
+    std::fs::write(temp.path().join("metadata.json"), r#"{"disk_size_mb":1}"#).unwrap();
 
     (temp, content_hash, rootfs_bytes)
 }
@@ -1758,7 +1758,7 @@ async fn refresh_register_existing_expanded_build_preserves_rootfs_bytes(
             "register-refresh-test",
             &content_hash,
             temp.path().to_str().unwrap(),
-            Some(br#"{"disk_size_mb":4}"#),
+            Some(br#"{"disk_size_mb":1}"#),
         )
         .await
         .unwrap();
@@ -2310,7 +2310,7 @@ fn finish_register_with_existing_digest_preserves_staging_for_retry() {
                 template_id: "register-refresh-test",
                 content_hash: &content_hash,
                 digest_dir: &digest_dir,
-                metadata_bytes: Some(br#"{"disk_size_mb":4}"#),
+                metadata_bytes: Some(br#"{"disk_size_mb":1}"#),
                 requested_network_policy: None,
                 publish_node_state: false,
                 register_source: &source,

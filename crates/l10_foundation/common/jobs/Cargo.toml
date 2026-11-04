@@ -10,6 +10,13 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+# Exposes `WorkerConfig::with_retry_backoff_secs` to dependents' test suites,
+# which enable it as a dev-dependency. Unit tests in this crate get it under
+# `cfg(test)`.
+test-support = []
+
 [dependencies]
 async-trait = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["rusqlite"] }

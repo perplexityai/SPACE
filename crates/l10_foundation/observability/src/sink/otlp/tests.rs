@@ -881,6 +881,14 @@ impl MetricsService for HangingReceiver {
     }
 }
 
+// Shutdown's final export is cut at the exporter's own timeout, which
+// production sets inside the documented shutdown bound.
+const _: () = assert!(EXPORT_TIMEOUT.as_nanos() < SHUTDOWN_TIMEOUT.as_nanos());
+
+// A receiver that never answers holds shutdown for the export timeout and no
+// longer. The test's short timeout keeps that wait brief; the allowance over
+// it still ends well before the SDK's own five-second shutdown wait, which an
+// export the timeout failed to cut would reach.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn slow_receiver_cannot_extend_shutdown_past_the_documented_bound() {
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -902,9 +910,10 @@ async fn slow_receiver_cannot_extend_shutdown_past_the_documented_bound() {
             .expect("serve hanging OTLP receiver");
     });
 
+    let export_timeout = Duration::from_millis(300);
     let mut config = test_config(endpoint, 2_000, 1_024);
-    config.export_timeout = EXPORT_TIMEOUT;
-    let sink = OtlpSink::new(config).expect("build production-timeout OTLP test sink");
+    config.export_timeout = export_timeout;
+    let sink = OtlpSink::new(config).expect("build OTLP test sink");
     emit(
         &sink,
         "shutdown_counter",
@@ -917,9 +926,9 @@ async fn slow_receiver_cannot_extend_shutdown_past_the_documented_bound() {
     tokio::time::timeout(Duration::from_secs(1), export_started.notified())
         .await
         .expect("shutdown never attempted its final export");
-    tokio::time::timeout(SHUTDOWN_TIMEOUT + Duration::from_secs(1), shutdown)
+    tokio::time::timeout(export_timeout + Duration::from_secs(1), shutdown)
         .await
-        .expect("shutdown exceeded the documented SDK bound")
+        .expect("shutdown outlasted the export timeout")
         .expect("shutdown task panicked");
 }
 

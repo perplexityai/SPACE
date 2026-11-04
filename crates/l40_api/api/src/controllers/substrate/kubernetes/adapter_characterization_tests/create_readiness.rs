@@ -3,7 +3,7 @@
 //! flight.
 //!
 //! The substrate's [`SubstrateBudgets`] are shortened so the outer readiness
-//! budget and the preserve decision expire after a second, while Postgres,
+//! budget and the preserve decision expire within a second, while Postgres,
 //! the scripted apiserver and the scripted worker stay real.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,25 +30,32 @@ const PODS_PATH: &str = "/api/v1/namespaces/space/pods";
 /// A node the apiserver names but the substrate's node cache does not hold.
 const UNCACHED_NODE: &str = "node-uncached";
 
-/// Shortened create budgets: the inner readiness phases get 500 ms and the
-/// outer budget fires 500 ms later. A readiness wait parked on a pod read
-/// that never answers reaches that read after the 250 ms reflector wait, well
-/// inside the outer budget even on a loaded runner.
-fn test_create_budgets() -> SubstrateBudgets {
+/// The shortened preserve decision. A preservable pod's decision is a
+/// reflector miss, one apiserver GET and a node-cache lookup, all in process.
+const TEST_PRESERVE_DECISION: Duration = Duration::from_millis(500);
+
+/// Shortened create budgets over the test substrate's `base`: the inner
+/// readiness phases get 300 ms and the outer budget fires 300 ms later. A
+/// readiness wait parked on a pod read that never answers reaches that read
+/// after the test substrate's short reflector wait, well inside the outer
+/// budget even on a loaded runner.
+fn test_create_budgets(base: SubstrateBudgets) -> SubstrateBudgets {
     SubstrateBudgets {
-        create_ready: Duration::from_secs(1),
-        create_ready_phase_margin: Duration::from_millis(500),
-        preserve_decision: Duration::from_secs(1),
-        ..SubstrateBudgets::DEFAULT
+        create_ready: Duration::from_millis(600),
+        create_ready_phase_margin: Duration::from_millis(300),
+        preserve_decision: TEST_PRESERVE_DECISION,
+        ..base
     }
 }
 
 /// The production create budgets with a shortened preserve decision, for
 /// cases that end on their own phase well inside the create budget.
-fn phase_ending_budgets() -> SubstrateBudgets {
+fn phase_ending_budgets(base: SubstrateBudgets) -> SubstrateBudgets {
     SubstrateBudgets {
-        preserve_decision: Duration::from_secs(1),
-        ..SubstrateBudgets::DEFAULT
+        create_ready: SubstrateBudgets::DEFAULT.create_ready,
+        create_ready_phase_margin: SubstrateBudgets::DEFAULT.create_ready_phase_margin,
+        preserve_decision: TEST_PRESERVE_DECISION,
+        ..base
     }
 }
 
@@ -82,7 +89,7 @@ fn substrate_on(pool: PgPool, client: Client, worker: &ScriptedWorker) -> Kubern
         substrate_with_inventory_caches_and_pool(Vec::new(), vec![worker_node()], pool);
     substrate.k8s.client = client;
     substrate.k8s.sandbox_proxy_port = worker.port;
-    substrate.budgets = test_create_budgets();
+    substrate.budgets = test_create_budgets(substrate.budgets);
     substrate
 }
 
@@ -408,11 +415,11 @@ async fn create_readiness_failure_keeps_or_releases_only_what_its_arm_owns(
         }
         // These end on their own phase; the create budget stays out of reach.
         ReadinessFailure::NodeMgrUnavailable => {
-            substrate.budgets = phase_ending_budgets();
+            substrate.budgets = phase_ending_budgets(substrate.budgets);
             substrate.k8s.create_command_ready_timeout = Duration::from_millis(500);
         }
         ReadinessFailure::LockContention => {
-            substrate.budgets = phase_ending_budgets();
+            substrate.budgets = phase_ending_budgets(substrate.budgets);
         }
     }
     let inputs = CreateInputs::new();

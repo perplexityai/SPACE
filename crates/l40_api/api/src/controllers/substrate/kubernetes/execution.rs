@@ -1689,7 +1689,7 @@ impl KubernetesSubstrate {
                         conflict_started.get_or_insert_with(Instant::now).elapsed();
                     let deferring = crate::retry_deferral::current().is_some();
                     if deferring
-                        && conflicted_for >= RETRY_DEFERRAL_GRACE
+                        && conflicted_for >= self.budgets.retry_deferral_grace
                         && crate::retry_deferral::defer_retry_wait("restore_claim_conflict")
                     {
                         return Err(SubstrateError::restore_in_flight(format!(
@@ -1699,7 +1699,11 @@ impl KubernetesSubstrate {
                     }
                     let mut delay = join_backoff.next_delay();
                     if deferring {
-                        delay = delay.min(RETRY_DEFERRAL_GRACE.saturating_sub(conflicted_for));
+                        delay = delay.min(
+                            self.budgets
+                                .retry_deferral_grace
+                                .saturating_sub(conflicted_for),
+                        );
                     }
                     if tokio::time::timeout_at(join_deadline, tokio::time::sleep(delay))
                         .await

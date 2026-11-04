@@ -92,6 +92,7 @@ pub async fn run(config: TcpProxyConfig) -> io::Result<()> {
         debug_state,
         shutdown_token: proxy_shutdown_token.clone(),
         refusal_warnings: Arc::default(),
+        peek_budget: sniff::PeekBudget::DEFAULT,
     }
     .accept_loop(listener)
     .await;
@@ -116,6 +117,8 @@ struct TcpProxy {
     debug_state: GatewayDebugState,
     shutdown_token: CancellationToken,
     refusal_warnings: Arc<RefusalWarnings>,
+    /// Always [`sniff::PeekBudget::DEFAULT`] outside tests.
+    peek_budget: sniff::PeekBudget,
 }
 
 /// Per-cause budget for interception refusal warnings.
@@ -465,7 +468,8 @@ impl TcpProxy {
         // still gets one bounded, non-consuming peek so its diagnostic can
         // identify a configured TLS destination.
         let missing_client_hello = self.missing_client_hello(dst, &policy);
-        let observation = sniff::client_hello_with_detail(&client, missing_client_hello).await;
+        let observation =
+            sniff::client_hello_with_detail(&client, missing_client_hello, self.peek_budget).await;
         let peek_elapsed = observation.elapsed;
         let scan = observation.scan;
         let client_alpn = observation.client_alpn;

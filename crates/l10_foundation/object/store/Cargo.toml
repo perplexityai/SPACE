@@ -43,5 +43,6 @@ pplx-space-s3-http-client = { workspace = true }
 [dev-dependencies]
 axum = { workspace = true }
 hyper-util = { workspace = true, features = ["client-legacy", "http1", "tokio"] }
+rstest = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }

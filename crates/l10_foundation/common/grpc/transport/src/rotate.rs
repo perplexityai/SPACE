@@ -122,8 +122,12 @@ impl RotatingChannel {
         tls_handshake_timeout: Option<Duration>,
         max_age: Option<Duration>,
     ) -> Result<Self, tonic::transport::Error> {
-        let channel =
-            crate::connect::dial_tcp_channel(endpoint.clone(), tls_handshake_timeout).await?;
+        let channel = crate::connect::dial_tcp_channel(
+            endpoint.clone(),
+            tls_handshake_timeout,
+            crate::connect::ConnectAllowances::DEFAULT,
+        )
+        .await?;
         // A zero age would redial on every request, so it reads as "off" like
         // the absent case rather than as an interval.
         let rotation = max_age
@@ -260,7 +264,12 @@ impl Shared {
         tls_handshake_timeout: Option<Duration>,
         max_age: Duration,
     ) {
-        let dialed = crate::connect::dial_tcp_channel(endpoint, tls_handshake_timeout).await;
+        let dialed = crate::connect::dial_tcp_channel(
+            endpoint,
+            tls_handshake_timeout,
+            crate::connect::ConnectAllowances::DEFAULT,
+        )
+        .await;
         let mut state = lock(&self.state);
         match dialed {
             Ok(channel) => {

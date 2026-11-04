@@ -758,7 +758,7 @@ async fn a_fieldless_template_update_reaches_the_fanout_without_writing()
         .connect_with(
             db.database_url
                 .parse::<sqlx::postgres::PgConnectOptions>()?
-                .options([("lock_timeout", "250ms")]),
+                .options([("lock_timeout", "50ms")]),
         )
         .await?;
     let state = AppState::from_pool(bounded)
@@ -926,7 +926,7 @@ async fn a_contended_base_snapshot_reconcile_read_is_retryable()
         .connect_with(
             db.database_url
                 .parse::<sqlx::postgres::PgConnectOptions>()?
-                .options([("lock_timeout", "250ms")]),
+                .options([("lock_timeout", "50ms")]),
         )
         .await?;
     let state = AppState::from_pool(bounded)

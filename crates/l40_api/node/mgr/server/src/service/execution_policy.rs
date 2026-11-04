@@ -109,6 +109,8 @@ pub(crate) struct ExecutionPolicyState {
     /// The cluster default last verified usable, by this process or by the
     /// one that wrote the record. It survives an undetermined check.
     verified_default: std::sync::Mutex<Option<EnvironmentReference>>,
+    /// `USABILITY_BUDGET` outside tests.
+    usability_budget: std::time::Duration,
 }
 
 impl std::fmt::Debug for ExecutionPolicyState {
@@ -180,7 +182,17 @@ impl ExecutionPolicyState {
             arrivals: std::sync::atomic::AtomicU64::new(0),
             enforced_arrival: std::sync::Mutex::new(0),
             verified_default: std::sync::Mutex::new(None),
+            usability_budget: USABILITY_BUDGET,
         }
+    }
+
+    /// The same state with its default checks bounded by `budget`. A check
+    /// held on the inventory refresh lock times out at any budget, so tests
+    /// need not wait out the production one.
+    #[cfg(test)]
+    fn with_usability_budget(mut self, budget: std::time::Duration) -> Self {
+        self.usability_budget = budget;
+        self
     }
 
     /// Enforce `policy`, and record its default `verdict` if it reached one,
@@ -282,14 +294,24 @@ fn read_record(path: &Path) -> Result<Option<PolicyRecord>, RecordError> {
 }
 
 fn write_record(path: &Path, record: Option<&PolicyRecord>) -> Result<(), Status> {
+    write_record_within(path, record, MAX_RECORD_BYTES)
+}
+
+/// `write_record`, refusing a record over `max_bytes`, which is the
+/// `MAX_RECORD_BYTES` a restart reads outside tests.
+fn write_record_within(
+    path: &Path,
+    record: Option<&PolicyRecord>,
+    max_bytes: u64,
+) -> Result<(), Status> {
     match record {
         Some(record) => {
             let bytes = serde_json::to_vec(record)
                 .map_err(|error| Status::internal(format!("encode policy record: {error}")))?;
             // Never persist what a restart would refuse to read.
-            if bytes.len() as u64 > MAX_RECORD_BYTES {
+            if bytes.len() as u64 > max_bytes {
                 return Err(Status::invalid_argument(format!(
-                    "execution policy record would exceed {MAX_RECORD_BYTES} bytes"
+                    "execution policy record would exceed {max_bytes} bytes"
                 )));
             }
             super::artifact_fs::write_atomic(path, |file| {
@@ -415,12 +437,11 @@ impl NodeManagerService {
     #[cfg(test)]
     pub(super) fn set_startup_execution_policy_for_test(&mut self, startup: ExecutionPolicy) {
         let path = self.execution_policy.record_path.clone();
-        self.execution_policy = Arc::new(ExecutionPolicyState::new(
-            startup.clone(),
-            startup,
-            path,
-            OnDisk::Record(None),
-        ));
+        let budget = self.execution_policy.usability_budget;
+        self.execution_policy = Arc::new(
+            ExecutionPolicyState::new(startup.clone(), startup, path, OnDisk::Record(None))
+                .with_usability_budget(budget),
+        );
     }
 
     /// Enforce what an unreadable record leaves: nothing new.
@@ -428,12 +449,11 @@ impl NodeManagerService {
     pub(super) fn refuse_all_execution_for_test(&mut self) {
         let startup = self.execution_policy.startup.clone();
         let path = self.execution_policy.record_path.clone();
-        self.execution_policy = Arc::new(ExecutionPolicyState::new(
-            startup.refuse_all(),
-            startup,
-            path,
-            OnDisk::Unreadable,
-        ));
+        let budget = self.execution_policy.usability_budget;
+        self.execution_policy = Arc::new(
+            ExecutionPolicyState::new(startup.refuse_all(), startup, path, OnDisk::Unreadable)
+                .with_usability_budget(budget),
+        );
     }
 
     /// Enforce the startup settings narrowed by `cluster`, its default
@@ -442,12 +462,14 @@ impl NodeManagerService {
     pub(super) fn narrow_execution_for_test(&mut self, cluster: &ClusterExecutionPolicy) {
         let startup = self.execution_policy.startup.clone();
         let path = self.execution_policy.record_path.clone();
+        let budget = self.execution_policy.usability_budget;
         let state = ExecutionPolicyState::new(
             startup.narrow(cluster, true).policy,
             startup,
             path,
             OnDisk::Record(None),
-        );
+        )
+        .with_usability_budget(budget);
         *state.verified_default.lock().unwrap() = cluster.default_reference();
         self.execution_policy = Arc::new(state);
     }
@@ -577,10 +599,11 @@ impl NodeManagerService {
             self.resolve_new_cold_boot(self.execution_policy.startup(), Some(reference))
                 .await
         };
-        match tokio::time::timeout(USABILITY_BUDGET, resolution).await {
+        let budget = self.execution_policy.usability_budget;
+        match tokio::time::timeout(budget, resolution).await {
             Ok(Ok(_)) => Verification::Usable,
             Err(_elapsed) => {
-                tracing::warn!(%reference, budget = ?USABILITY_BUDGET, "timed out verifying the cluster default execution environment");
+                tracing::warn!(%reference, ?budget, "timed out verifying the cluster default execution environment");
                 Verification::Undetermined
             }
             // Inventory reports a retryable failure as `Internal`; the others

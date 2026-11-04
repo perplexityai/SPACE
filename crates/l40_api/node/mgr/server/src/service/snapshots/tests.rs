@@ -366,13 +366,21 @@ async fn service_with_stop(
     (service, id, socket, server)
 }
 
+/// The stub fails each stop at once, so the retry delay only paces attempts
+/// and a short one leaves what the cap counts unchanged.
+const TEST_STOP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(1);
+
 #[tokio::test]
 async fn encrypted_seal_stop_retries_while_the_runtime_is_still_exiting() {
     for code in [tonic::Code::Internal, tonic::Code::Unavailable] {
         let (service, id, _socket, server) = service_with_stop(code, 2).await;
-        super::stop_runtime_for_encrypted_seal(&service, &id.to_string())
-            .await
-            .expect("stop succeeds once the runtime finishes exiting");
+        super::stop_runtime_for_encrypted_seal_retrying_after(
+            &service,
+            &id.to_string(),
+            TEST_STOP_RETRY_DELAY,
+        )
+        .await
+        .expect("stop succeeds once the runtime finishes exiting");
         crate::runtime_supervisor_client::tests::stop_supervisor_server(server).await;
     }
 }
@@ -382,9 +390,13 @@ async fn encrypted_seal_stop_gives_up_after_the_attempt_cap() {
     let (service, id, _socket, server) =
         service_with_stop(tonic::Code::Internal, super::ENC_CAPTURE_STOP_ATTEMPTS).await;
 
-    let error = super::stop_runtime_for_encrypted_seal(&service, &id.to_string())
-        .await
-        .unwrap_err();
+    let error = super::stop_runtime_for_encrypted_seal_retrying_after(
+        &service,
+        &id.to_string(),
+        TEST_STOP_RETRY_DELAY,
+    )
+    .await
+    .unwrap_err();
     assert_eq!(error.code(), tonic::Code::Internal);
 
     crate::runtime_supervisor_client::tests::stop_supervisor_server(server).await;

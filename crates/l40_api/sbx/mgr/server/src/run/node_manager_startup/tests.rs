@@ -5,50 +5,62 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use super::*;
 use crate::run::test_receiver::{Receiver, Reply, always, dial};
 
+#[derive(Clone, Copy, Debug)]
+enum Gap {
+    SocketMissing,
+    ConnectionRefused,
+}
+
+/// [`RETRY_POLICY`]'s shape, reaching its cap at the same index four, in
+/// milliseconds rather than seconds: the receiver's replies, not the delays
+/// between them, decide when the wait ends.
+const SHORT_RETRY_POLICY: GrpcRetryPolicy = GrpcRetryPolicy {
+    initial_delay: Duration::from_millis(1),
+    max_delay: Duration::from_millis(16),
+    ..RETRY_POLICY
+};
+
+#[rstest::rstest]
+#[case::socket_missing(Gap::SocketMissing)]
+#[case::connection_refused(Gap::ConnectionRefused)]
 #[tokio::test]
-async fn waits_through_a_node_manager_restart_gap() {
-    #[derive(Clone, Copy, Debug)]
-    enum Gap {
-        SocketMissing,
-        ConnectionRefused,
+async fn waits_through_a_node_manager_restart_gap(#[case] gap: Gap) {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("node.sock");
+    if matches!(gap, Gap::ConnectionRefused) {
+        // A predecessor that exited without unlinking leaves a socket
+        // file nothing accepts on.
+        drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
     }
-    for gap in [Gap::SocketMissing, Gap::ConnectionRefused] {
-        let root = tempfile::tempdir().unwrap();
-        let socket = root.path().join("node.sock");
-        if matches!(gap, Gap::ConnectionRefused) {
-            // A predecessor that exited without unlinking leaves a socket
-            // file nothing accepts on.
-            drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
-        }
-        // The successor serves before its store is ready, then succeeds.
-        let reply: Reply = Arc::new(|call| match call {
-            0 => Err(Status::unavailable("receiver starting")),
-            1 => Err(Status::deadline_exceeded("receiver busy")),
-            2 => Err(Status::cancelled("receiver shutting down")),
-            3 => Err(Status::resource_exhausted("receiver admission busy")),
-            _ => Ok(InspectSandboxResponse::default()),
-        });
-        let mut receiver = None;
-        let mut dials = 0;
-        let result = wait_for_node_manager(
-            StartupPhase::BeforeRecovery,
-            &CancellationToken::new(),
-            || {
-                dials += 1;
-                if dials == 2 {
-                    if matches!(gap, Gap::ConnectionRefused) {
-                        std::fs::remove_file(&socket).unwrap();
-                    }
-                    receiver = Some(Receiver::bind(&socket, reply.clone()));
+    // The successor serves before its store is ready, then succeeds.
+    let reply: Reply = Arc::new(|call| match call {
+        0 => Err(Status::unavailable("receiver starting")),
+        1 => Err(Status::deadline_exceeded("receiver busy")),
+        2 => Err(Status::cancelled("receiver shutting down")),
+        3 => Err(Status::resource_exhausted("receiver admission busy")),
+        _ => Ok(InspectSandboxResponse::default()),
+    });
+    let mut receiver = None;
+    let mut dials = 0;
+    let result = wait_for_node_manager_with_retry(
+        StartupPhase::BeforeRecovery,
+        &CancellationToken::new(),
+        &SHORT_RETRY_POLICY,
+        || {
+            dials += 1;
+            if dials == 2 {
+                if matches!(gap, Gap::ConnectionRefused) {
+                    std::fs::remove_file(&socket).unwrap();
                 }
-                dial(socket.clone())
-            },
-        )
-        .await;
-        result.unwrap_or_else(|error| panic!("{gap:?}: {error}"));
-        assert_eq!(dials, 6, "{gap:?}");
-        assert_eq!(receiver.unwrap().calls(), 5, "{gap:?}");
-    }
+                receiver = Some(Receiver::bind(&socket, reply.clone()));
+            }
+            dial(socket.clone())
+        },
+    )
+    .await;
+    result.unwrap_or_else(|error| panic!("{gap:?}: {error}"));
+    assert_eq!(dials, 6, "{gap:?}");
+    assert_eq!(receiver.unwrap().calls(), 5, "{gap:?}");
 }
 
 #[tokio::test]

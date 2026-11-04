@@ -522,6 +522,23 @@ async fn silent_tls_peer() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>
     (address, peer)
 }
 
+/// Connect allowances for dials to a loopback address literal, which resolves
+/// no name and connects at once. With [`SILENT_PEER_DIAL_TIMEOUT`], an attempt
+/// cap that left out the handshake bound would be 300ms, short of
+/// [`SILENT_PEER_HANDSHAKE_BOUND`]; one that counts it outlasts the
+/// handshake's own failure by 300ms.
+#[cfg(feature = "internal-tls")]
+const SILENT_PEER_ALLOWANCES: super::ConnectAllowances = super::ConnectAllowances {
+    name_resolution: Duration::from_millis(100),
+    attempt_cap_margin: Duration::from_millis(100),
+};
+
+#[cfg(feature = "internal-tls")]
+const SILENT_PEER_DIAL_TIMEOUT: Duration = Duration::from_millis(100);
+
+#[cfg(feature = "internal-tls")]
+const SILENT_PEER_HANDSHAKE_BOUND: Duration = Duration::from_millis(400);
+
 /// Assert that a connect to a silent peer failed with the TLS handshake bound's
 /// own cause, not as an abandoned attempt, and not before `handshake_bound`.
 #[cfg(feature = "internal-tls")]
@@ -562,10 +579,10 @@ async fn a_tls_peer_that_never_answers_fails_the_connect_at_its_handshake_bound(
     let (address, silent_peer) = silent_tls_peer().await;
     let dir = tempfile::tempdir().unwrap();
     let ca = std::fs::read(write_test_ca(dir.path())).unwrap();
-    let handshake_bound = Duration::from_secs(5);
+    let handshake_bound = SILENT_PEER_HANDSHAKE_BOUND;
     let endpoint = tonic::transport::Endpoint::from_shared(format!("https://{address}"))
         .unwrap()
-        .connect_timeout(Duration::from_millis(500))
+        .connect_timeout(SILENT_PEER_DIAL_TIMEOUT)
         .tls_config(
             tonic::transport::ClientTlsConfig::new()
                 .ca_certificate(tonic::transport::Certificate::from_pem(ca))
@@ -576,12 +593,14 @@ async fn a_tls_peer_that_never_answers_fails_the_connect_at_its_handshake_bound(
     let started = tokio::time::Instant::now();
     let result = tokio::time::timeout(
         Duration::from_secs(60),
-        super::connect_tcp_channel_with_retry(
+        super::retry_tcp_channel(
             "silent-tls",
             address.to_string(),
             endpoint,
             Some(handshake_bound),
             crate::GrpcRetryPolicy::none(),
+            SILENT_PEER_ALLOWANCES,
+            |_| {},
         ),
     )
     .await
@@ -605,7 +624,7 @@ async fn internal_rpc_connect_endpoint(
     env.0.insert(CA_ENV, write_test_ca(dir).into_os_string());
     let endpoint = tonic::transport::Endpoint::from_shared(format!("https://{address}"))
         .unwrap()
-        .connect_timeout(Duration::from_millis(500));
+        .connect_timeout(SILENT_PEER_DIAL_TIMEOUT);
     ClientTransport::from_environment_with_tls_handshake_timeout(
         Service::NodeApi,
         endpoint.uri(),
@@ -628,13 +647,14 @@ async fn an_internal_rpc_connect_fails_at_its_transports_handshake_bound() {
     install_crypto_provider();
     let (address, silent_peer) = silent_tls_peer().await;
     let dir = tempfile::tempdir().unwrap();
-    let handshake_bound = Duration::from_secs(5);
+    let handshake_bound = SILENT_PEER_HANDSHAKE_BOUND;
     let endpoint = internal_rpc_connect_endpoint(address, dir.path(), handshake_bound).await;
 
     let started = tokio::time::Instant::now();
     let result = tokio::time::timeout(
         Duration::from_secs(60),
-        endpoint.connect_with_retry(
+        endpoint.connect_with_retry_within(
+            SILENT_PEER_ALLOWANCES,
             "silent-internal-rpc",
             address.to_string(),
             crate::GrpcRetryPolicy::none(),
@@ -654,13 +674,14 @@ async fn a_watched_internal_rpc_connect_fails_at_its_transports_handshake_bound(
     install_crypto_provider();
     let (address, silent_peer) = silent_tls_peer().await;
     let dir = tempfile::tempdir().unwrap();
-    let handshake_bound = Duration::from_secs(5);
+    let handshake_bound = SILENT_PEER_HANDSHAKE_BOUND;
     let endpoint = internal_rpc_connect_endpoint(address, dir.path(), handshake_bound).await;
 
     let started = tokio::time::Instant::now();
     let result = tokio::time::timeout(
         Duration::from_secs(60),
-        endpoint.connect_with_retry_watched(
+        endpoint.connect_with_retry_watched_within(
+            SILENT_PEER_ALLOWANCES,
             "silent-internal-rpc",
             address.to_string(),
             crate::GrpcRetryPolicy::none(),
@@ -686,10 +707,10 @@ async fn a_watched_dial_applies_tls_and_its_handshake_bound() {
     let (address, silent_peer) = silent_tls_peer().await;
     let dir = tempfile::tempdir().unwrap();
     let ca = std::fs::read(write_test_ca(dir.path())).unwrap();
-    let handshake_bound = Duration::from_secs(5);
+    let handshake_bound = SILENT_PEER_HANDSHAKE_BOUND;
     let endpoint = tonic::transport::Endpoint::from_shared(format!("https://{address}"))
         .unwrap()
-        .connect_timeout(Duration::from_millis(500))
+        .connect_timeout(SILENT_PEER_DIAL_TIMEOUT)
         .tls_config(
             tonic::transport::ClientTlsConfig::new()
                 .ca_certificate(tonic::transport::Certificate::from_pem(ca))
@@ -700,12 +721,13 @@ async fn a_watched_dial_applies_tls_and_its_handshake_bound() {
     let started = tokio::time::Instant::now();
     let result = tokio::time::timeout(
         Duration::from_secs(60),
-        super::connect_tcp_channel_with_retry_watched(
+        super::retry_watched_tcp_channel(
             "silent-tls",
             address.to_string(),
             endpoint,
             Some(handshake_bound),
             crate::GrpcRetryPolicy::none(),
+            SILENT_PEER_ALLOWANCES,
         ),
     )
     .await
@@ -1284,6 +1306,7 @@ fn stalled_lookup_connector(
     super::tcp_connector(
         endpoint,
         None,
+        super::ConnectAllowances::DEFAULT,
         hyper_util::client::legacy::connect::HttpConnector::new_with_resolver(StalledResolver),
     )
 }
@@ -1302,7 +1325,10 @@ async fn a_stalled_name_resolution_is_a_marked_client_connect_failure() {
     assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
     assert!(is_marked(&status), "{status:?}");
     assert!(crate::is_client_connect_failure(&status), "{status:?}");
-    assert_eq!(started.elapsed(), super::connect_phase_bound(dial_timeout));
+    assert_eq!(
+        started.elapsed(),
+        super::ConnectAllowances::DEFAULT.connect_phase_bound(dial_timeout)
+    );
 }
 
 // In a retried connect, a stalled lookup fails its attempt with the
@@ -1316,7 +1342,7 @@ async fn a_retried_connects_stalled_lookup_fails_with_its_own_cause() {
         "stalled-lookup",
         "stalled.invalid:50051",
         crate::GrpcRetryPolicy::none(),
-        super::tcp_attempt_cap(dial_timeout, None),
+        super::ConnectAllowances::DEFAULT.attempt_cap(dial_timeout, None),
         || {
             let endpoint = endpoint.clone();
             let connector = connector.clone();
@@ -1355,13 +1381,14 @@ async fn a_watched_dials_stalled_lookup_fails_with_its_own_cause() {
         "stalled-lookup",
         "stalled.invalid:50051",
         crate::GrpcRetryPolicy::none(),
-        super::tcp_attempt_cap(dial_timeout, None),
+        super::ConnectAllowances::DEFAULT.attempt_cap(dial_timeout, None),
         || {
             let endpoint = endpoint.clone();
             async move {
                 super::dial_watched_tcp_channel(
                     endpoint,
                     None,
+                    super::ConnectAllowances::DEFAULT,
                     hyper_util::client::legacy::connect::HttpConnector::new_with_resolver(
                         StalledResolver,
                     ),
@@ -1382,7 +1409,10 @@ async fn a_watched_dials_stalled_lookup_fails_with_its_own_cause() {
     )
     .any(|error| error.is::<crate::ConnectPhaseError>());
     assert!(marked, "{error:?}");
-    assert_eq!(started.elapsed(), super::connect_phase_bound(dial_timeout));
+    assert_eq!(
+        started.elapsed(),
+        super::ConnectAllowances::DEFAULT.connect_phase_bound(dial_timeout)
+    );
 }
 
 // A lazy channel whose endpoint sets no dial bound is given the default one,

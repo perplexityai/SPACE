@@ -1664,6 +1664,20 @@ async fn stop_runtime_for_encrypted_seal(
     service: &NodeManagerService,
     sandbox_id: &str,
 ) -> Result<(), Status> {
+    stop_runtime_for_encrypted_seal_retrying_after(
+        service,
+        sandbox_id,
+        ENC_CAPTURE_STOP_RETRY_DELAY,
+    )
+    .await
+}
+
+/// `stop_runtime_for_encrypted_seal`, waiting `retry_delay` between attempts.
+async fn stop_runtime_for_encrypted_seal_retrying_after(
+    service: &NodeManagerService,
+    sandbox_id: &str,
+    retry_delay: std::time::Duration,
+) -> Result<(), Status> {
     let mut attempt = 1;
     loop {
         match stop_sandbox_runtime_with_supervisor(service, sandbox_id, true, None).await {
@@ -1681,7 +1695,7 @@ async fn stop_runtime_for_encrypted_seal(
                     "post-capture runtime stop incomplete; retrying before seal"
                 );
                 attempt += 1;
-                tokio::time::sleep(ENC_CAPTURE_STOP_RETRY_DELAY).await;
+                tokio::time::sleep(retry_delay).await;
             }
             Err(error) => return Err(error),
         }

@@ -10,6 +10,9 @@ use crate::{
     cli::TemplateCommands,
 };
 
+/// How long `template build` waits between status polls.
+const BUILD_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
 #[derive(Debug, Deserialize, Serialize)]
 struct BuildJob {
     job_id: BuildRunId,
@@ -67,7 +70,7 @@ impl AdminClient {
                     "Build submitted. Inspect with: space-admin-cli template status {template} {}",
                     job.job_id
                 );
-                let status = tokio::time::timeout(Duration::from_secs(7200), self.wait_for_build(&job))
+                let status = tokio::time::timeout(Duration::from_secs(7200), self.wait_for_build(&job, BUILD_POLL_INTERVAL))
                     .await
                     .map_err(|_| {
                         CliError::Unsupported(format!(
@@ -124,7 +127,11 @@ impl AdminClient {
         Ok(status)
     }
 
-    async fn wait_for_build(&self, job: &BuildJob) -> Result<BuildStatus, CliError> {
+    async fn wait_for_build(
+        &self,
+        job: &BuildJob,
+        poll_interval: Duration,
+    ) -> Result<BuildStatus, CliError> {
         loop {
             match self.build_status(job).await {
                 Ok(status) => match status.state {
@@ -144,7 +151,7 @@ impl AdminClient {
                 }
                 Err(error) => return Err(error),
             }
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::time::sleep(poll_interval).await;
         }
     }
 }

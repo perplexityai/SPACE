@@ -651,82 +651,84 @@ mod not_running {
         Inline,
     }
 
+    #[rstest::rstest]
+    #[case::dispatcher(CommandWakeClaimant::Dispatcher)]
+    #[case::inline(CommandWakeClaimant::Inline)]
     #[tokio::test]
-    async fn a_wake_does_not_join_a_command_wake_already_claimed() -> TestDbResult<()> {
-        for claimant in [CommandWakeClaimant::Dispatcher, CommandWakeClaimant::Inline] {
-            let script = ScriptedWake::gated(WakeScript::Succeed);
-            let fixture = match claimant {
-                CommandWakeClaimant::Dispatcher => fixture().await?,
-                CommandWakeClaimant::Inline => fixture_with(Some(script.inline())).await?,
-            };
-            let sandbox_id = sandbox(&fixture, "suspended", &["command"]).await?;
-            command(&fixture, sandbox_id, "commands").await?;
-            let [(system, None)] = wake_ids(&fixture, sandbox_id).await?[..] else {
-                panic!("{claimant:?}: one system wake");
-            };
-            match claimant {
-                CommandWakeClaimant::Dispatcher => {
-                    let mut tx = fixture.db.pool.begin().await?;
-                    claim(&mut tx, system).await?;
-                    tx.commit().await?;
-                }
-                CommandWakeClaimant::Inline => {
-                    script.0.started.notified().await;
-                    assert_eq!(state_and_attempts(&fixture, system).await?, ("running", 1));
-                }
+    async fn a_wake_does_not_join_a_command_wake_already_claimed(
+        #[case] claimant: CommandWakeClaimant,
+    ) -> TestDbResult<()> {
+        let script = ScriptedWake::gated(WakeScript::Succeed);
+        let fixture = match claimant {
+            CommandWakeClaimant::Dispatcher => fixture().await?,
+            CommandWakeClaimant::Inline => fixture_with(Some(script.inline())).await?,
+        };
+        let sandbox_id = sandbox(&fixture, "suspended", &["command"]).await?;
+        command(&fixture, sandbox_id, "commands").await?;
+        let [(system, None)] = wake_ids(&fixture, sandbox_id).await?[..] else {
+            panic!("{claimant:?}: one system wake");
+        };
+        match claimant {
+            CommandWakeClaimant::Dispatcher => {
+                let mut tx = fixture.db.pool.begin().await?;
+                claim(&mut tx, system).await?;
+                tx.commit().await?;
             }
-
-            // Its attempt runs by the actor its claim read: a command wake,
-            // which the policy could still refuse, so this `:wake` must not
-            // be answered with it. Nor does it run inline beside it.
-            let wake = lifecycle(&fixture, sandbox_id, "wake", &Uuid::now_v7().to_string()).await?;
-            let queued = vec![(system, None), (wake, Some(SEED_USER_ID))];
-            assert_eq!(
-                wake_ids(&fixture, sandbox_id).await?,
-                queued,
-                "{claimant:?}"
-            );
-            assert_eq!(state_and_attempts(&fixture, wake).await?, ("queued", 0));
-
-            // A reconnect during that attempt joins the caller's own wake.
-            command(&fixture, sandbox_id, "commands").await?;
-            let again =
-                lifecycle(&fixture, sandbox_id, "wake", &Uuid::now_v7().to_string()).await?;
-            assert_eq!(again, wake, "{claimant:?}");
-            assert_eq!(
-                wake_ids(&fixture, sandbox_id).await?,
-                queued,
-                "{claimant:?}"
-            );
-
-            // Once the command wake places the sandbox, the dispatcher takes
-            // the caller's wake, which finds it running.
-            match claimant {
-                CommandWakeClaimant::Dispatcher => succeed(&fixture, system).await?,
-                CommandWakeClaimant::Inline => {
-                    script.open_gate();
-                    wait_for_state(&fixture, system, "succeeded").await?;
-                }
+            CommandWakeClaimant::Inline => {
+                script.0.started.notified().await;
+                assert_eq!(state_and_attempts(&fixture, system).await?, ("running", 1));
             }
-            set_lifecycle(&fixture, sandbox_id, "started").await?;
-            let result = dispatcher_runs(&fixture, wake).await?;
-            assert_eq!(result.state, OperationState::Succeeded, "{claimant:?}");
-            assert_eq!(
-                result
-                    .result_json
-                    .as_ref()
-                    .and_then(|result| result["controller_response"].get("already_completed")),
-                Some(&json!(true)),
-                "{claimant:?}: {result:?}"
-            );
-            assert_eq!(
-                script.executed(),
-                match claimant {
-                    CommandWakeClaimant::Dispatcher => vec![],
-                    CommandWakeClaimant::Inline => vec![system],
-                }
-            );
         }
+
+        // Its attempt runs by the actor its claim read: a command wake,
+        // which the policy could still refuse, so this `:wake` must not
+        // be answered with it. Nor does it run inline beside it.
+        let wake = lifecycle(&fixture, sandbox_id, "wake", &Uuid::now_v7().to_string()).await?;
+        let queued = vec![(system, None), (wake, Some(SEED_USER_ID))];
+        assert_eq!(
+            wake_ids(&fixture, sandbox_id).await?,
+            queued,
+            "{claimant:?}"
+        );
+        assert_eq!(state_and_attempts(&fixture, wake).await?, ("queued", 0));
+
+        // A reconnect during that attempt joins the caller's own wake.
+        command(&fixture, sandbox_id, "commands").await?;
+        let again = lifecycle(&fixture, sandbox_id, "wake", &Uuid::now_v7().to_string()).await?;
+        assert_eq!(again, wake, "{claimant:?}");
+        assert_eq!(
+            wake_ids(&fixture, sandbox_id).await?,
+            queued,
+            "{claimant:?}"
+        );
+
+        // Once the command wake places the sandbox, the dispatcher takes
+        // the caller's wake, which finds it running.
+        match claimant {
+            CommandWakeClaimant::Dispatcher => succeed(&fixture, system).await?,
+            CommandWakeClaimant::Inline => {
+                script.open_gate();
+                wait_for_state(&fixture, system, "succeeded").await?;
+            }
+        }
+        set_lifecycle(&fixture, sandbox_id, "started").await?;
+        let result = dispatcher_runs(&fixture, wake).await?;
+        assert_eq!(result.state, OperationState::Succeeded, "{claimant:?}");
+        assert_eq!(
+            result
+                .result_json
+                .as_ref()
+                .and_then(|result| result["controller_response"].get("already_completed")),
+            Some(&json!(true)),
+            "{claimant:?}: {result:?}"
+        );
+        assert_eq!(
+            script.executed(),
+            match claimant {
+                CommandWakeClaimant::Dispatcher => vec![],
+                CommandWakeClaimant::Inline => vec![system],
+            }
+        );
         Ok(())
     }
 
@@ -1425,82 +1427,88 @@ mod not_running {
         .await?)
     }
 
-    /// Every waker, with the sandbox state it acts on.
-    const WAKERS: [(Waker, &str); 6] = [
-        (Waker::Action("wake"), "suspended"),
-        (Waker::Action("resume"), "paused"),
-        (Waker::Action("start"), "stopped"),
-        (Waker::Command("commands"), "suspended"),
-        (Waker::Command("process-sessions"), "suspended"),
-        (Waker::Attach, "suspended"),
-    ];
-
     /// On an idle sandbox, each waker's operation is claimed as it is
     /// recorded and runs in the API, to the same durable record a
     /// dispatcher execution leaves; the dispatcher never sees it.
+    #[rstest::rstest]
+    #[case::wake(Waker::Action("wake"), "suspended")]
+    #[case::resume(Waker::Action("resume"), "paused")]
+    #[case::start(Waker::Action("start"), "stopped")]
+    #[case::commands(Waker::Command("commands"), "suspended")]
+    #[case::process_sessions(Waker::Command("process-sessions"), "suspended")]
+    #[case::attach(Waker::Attach, "suspended")]
     #[tokio::test]
-    async fn a_wake_on_an_idle_sandbox_runs_inline_and_completes() -> TestDbResult<()> {
-        for (waker, lifecycle_state) in WAKERS {
-            let script = ScriptedWake::new(WakeScript::Succeed);
-            let fixture = fixture_with(Some(script.inline())).await?;
-            let sandbox_id = sandbox(&fixture, lifecycle_state, &["access"]).await?;
-            let operation_id = wake_by(&fixture, sandbox_id, waker).await?;
-            wait_for_state(&fixture, operation_id, "succeeded").await?;
-            assert_eq!(script.executed(), vec![operation_id], "{waker:?}");
-            // One claim, at admission: no dispatcher runs here.
-            let events: Vec<String> = sqlx::query_scalar(sql!(
-                "SELECT event_type FROM public_operation_events
-                  WHERE operation_id = $1 ORDER BY sequence"
-            ))
-            .bind(operation_id)
-            .fetch_all(&fixture.db.pool)
-            .await?;
-            assert_eq!(state_and_attempts(&fixture, operation_id).await?.1, 1);
-            assert_eq!(
-                events,
-                vec![
-                    "operation.created",
-                    "operation.claimed",
-                    "operation.completed"
-                ],
-                "{waker:?}"
-            );
-        }
+    async fn a_wake_on_an_idle_sandbox_runs_inline_and_completes(
+        #[case] waker: Waker,
+        #[case] lifecycle_state: &str,
+    ) -> TestDbResult<()> {
+        let script = ScriptedWake::new(WakeScript::Succeed);
+        let fixture = fixture_with(Some(script.inline())).await?;
+        let sandbox_id = sandbox(&fixture, lifecycle_state, &["access"]).await?;
+        let operation_id = wake_by(&fixture, sandbox_id, waker).await?;
+        wait_for_state(&fixture, operation_id, "succeeded").await?;
+        assert_eq!(script.executed(), vec![operation_id], "{waker:?}");
+        // One claim, at admission: no dispatcher runs here.
+        let events: Vec<String> = sqlx::query_scalar(sql!(
+            "SELECT event_type FROM public_operation_events
+              WHERE operation_id = $1 ORDER BY sequence"
+        ))
+        .bind(operation_id)
+        .fetch_all(&fixture.db.pool)
+        .await?;
+        assert_eq!(state_and_attempts(&fixture, operation_id).await?.1, 1);
+        assert_eq!(
+            events,
+            vec![
+                "operation.created",
+                "operation.claimed",
+                "operation.completed"
+            ],
+            "{waker:?}"
+        );
         Ok(())
     }
 
     /// Behind other work on its sandbox, here a queued `:suspend`, each
     /// waker's operation is recorded queued for the dispatcher, after it.
+    #[rstest::rstest]
+    #[case::wake(Waker::Action("wake"), "suspended")]
+    #[case::resume(Waker::Action("resume"), "paused")]
+    #[case::start(Waker::Action("start"), "stopped")]
+    #[case::commands(Waker::Command("commands"), "suspended")]
+    #[case::process_sessions(Waker::Command("process-sessions"), "suspended")]
+    #[case::attach(Waker::Attach, "suspended")]
     #[tokio::test]
-    async fn a_wake_behind_queued_work_is_queued_for_the_dispatcher() -> TestDbResult<()> {
-        for (waker, lifecycle_state) in WAKERS {
-            let script = ScriptedWake::new(WakeScript::Succeed);
-            let fixture = fixture_with(Some(script.inline())).await?;
-            let sandbox_id = sandbox(&fixture, lifecycle_state, &["access"]).await?;
-            let suspend =
-                lifecycle(&fixture, sandbox_id, "suspend", &Uuid::now_v7().to_string()).await?;
-            let operation_id = wake_by(&fixture, sandbox_id, waker).await?;
-            assert_ne!(operation_id, suspend, "{waker:?}");
-            assert_eq!(
-                state_and_attempts(&fixture, operation_id).await?,
-                ("queued", 0),
-                "{waker:?}"
-            );
-            assert_eq!(
-                sqlx::query_scalar::<_, Vec<Uuid>>(sql!(
-                    "SELECT ARRAY(SELECT operation_id FROM public_operations
-                                   WHERE target_type = 'sandbox' AND target_id = $1
-                                     AND state IN ('queued', 'running')
-                                   ORDER BY requested_at, operation_id)"
-                ))
-                .bind(sandbox_id.to_string())
-                .fetch_one(&fixture.db.pool)
-                .await?,
-                vec![suspend, operation_id],
-                "{waker:?}: the wake sorts after the suspend"
-            );
-            assert!(script.executed().is_empty(), "{waker:?}");
-        }
+    async fn a_wake_behind_queued_work_is_queued_for_the_dispatcher(
+        #[case] waker: Waker,
+        #[case] lifecycle_state: &str,
+    ) -> TestDbResult<()> {
+        let script = ScriptedWake::new(WakeScript::Succeed);
+        let fixture = fixture_with(Some(script.inline())).await?;
+        let sandbox_id = sandbox(&fixture, lifecycle_state, &["access"]).await?;
+        let suspend =
+            lifecycle(&fixture, sandbox_id, "suspend", &Uuid::now_v7().to_string()).await?;
+        let operation_id = wake_by(&fixture, sandbox_id, waker).await?;
+        assert_ne!(operation_id, suspend, "{waker:?}");
+        assert_eq!(
+            state_and_attempts(&fixture, operation_id).await?,
+            ("queued", 0),
+            "{waker:?}"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, Vec<Uuid>>(sql!(
+                "SELECT ARRAY(SELECT operation_id FROM public_operations
+                               WHERE target_type = 'sandbox' AND target_id = $1
+                                 AND state IN ('queued', 'running')
+                               ORDER BY requested_at, operation_id)"
+            ))
+            .bind(sandbox_id.to_string())
+            .fetch_one(&fixture.db.pool)
+            .await?,
+            vec![suspend, operation_id],
+            "{waker:?}: the wake sorts after the suspend"
+        );
+        assert!(script.executed().is_empty(), "{waker:?}");
         Ok(())
     }
 
@@ -1589,63 +1597,63 @@ mod not_running {
     /// A waker that joins a wake already queued takes no inline permit, not
     /// even while it waits for the sandbox's wake lock: with one permit in
     /// the process, the permit stays free for other sandboxes' wakes.
+    #[rstest::rstest]
+    #[case::wake(Waker::Action("wake"))]
+    #[case::commands(Waker::Command("commands"))]
+    #[case::attach(Waker::Attach)]
     #[tokio::test]
-    async fn a_waker_that_joins_a_queued_wake_holds_no_inline_permit() -> TestDbResult<()> {
+    async fn a_waker_that_joins_a_queued_wake_holds_no_inline_permit(
+        #[case] waker: Waker,
+    ) -> TestDbResult<()> {
         let org_id = OrgId::from_uuid(SEED_ORG_ID);
-        for waker in [
-            Waker::Action("wake"),
-            Waker::Command("commands"),
-            Waker::Attach,
-        ] {
-            let script = ScriptedWake::new(WakeScript::Succeed);
-            let runner = inline_runner(1);
-            let fixture = fixture_with(Some(script.inline_on(runner.clone()))).await?;
-            let sandbox_id = sandbox(&fixture, "suspended", &["access", "command"]).await?;
-            let target_id = sandbox_id.to_string();
-            let CreatePublicOperationResult::Created(queued) =
-                PublicOperationStore::new(fixture.db.pool.clone())
-                    .create_or_join_active_sandbox_wake(org_id, &target_id, json!({}), None)
-                    .await?
-            else {
-                panic!("{waker:?}: a queued system wake");
-            };
+        let script = ScriptedWake::new(WakeScript::Succeed);
+        let runner = inline_runner(1);
+        let fixture = fixture_with(Some(script.inline_on(runner.clone()))).await?;
+        let sandbox_id = sandbox(&fixture, "suspended", &["access", "command"]).await?;
+        let target_id = sandbox_id.to_string();
+        let CreatePublicOperationResult::Created(queued) =
+            PublicOperationStore::new(fixture.db.pool.clone())
+                .create_or_join_active_sandbox_wake(org_id, &target_id, json!({}), None)
+                .await?
+        else {
+            panic!("{waker:?}: a queued system wake");
+        };
 
-            // Outside the routes' two-connection pool: the lock's holder and
-            // the observer of the waker's wait.
-            let observer = sqlx::postgres::PgPoolOptions::new()
-                .max_connections(2)
-                .connect(&fixture.db.database_url)
-                .await?;
-            let mut holder = observer.begin().await?;
-            crate::public_operations::lock_active_sandbox_operation(
-                &mut holder,
-                org_id,
-                OperationKind::WakeSandbox,
-                &target_id,
-            )
+        // Outside the routes' two-connection pool: the lock's holder and
+        // the observer of the waker's wait.
+        let observer = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&fixture.db.database_url)
             .await?;
-            let joining = wake_by(&fixture, sandbox_id, waker);
-            tokio::pin!(joining);
-            tokio::select! {
-                joined = &mut joining => panic!("{waker:?} got past a held wake lock: {joined:?}"),
-                waiting = wait_for_advisory_lock_waiter(&observer) => waiting?,
-            }
-            let permit = runner
-                .try_acquire(InlineAdmissionPath::ImplicitWake)
-                .unwrap_or_else(|refusal| {
-                    panic!("{waker:?} holds the only permit while it waits: {refusal:?}")
-                });
-            drop(permit);
-            holder.rollback().await?;
-
-            assert_eq!(joining.await?, queued.as_uuid(), "{waker:?}");
-            assert_eq!(
-                state_and_attempts(&fixture, queued.as_uuid()).await?,
-                ("queued", 0),
-                "{waker:?}"
-            );
-            assert!(script.executed().is_empty(), "{waker:?}");
+        let mut holder = observer.begin().await?;
+        crate::public_operations::lock_active_sandbox_operation(
+            &mut holder,
+            org_id,
+            OperationKind::WakeSandbox,
+            &target_id,
+        )
+        .await?;
+        let joining = wake_by(&fixture, sandbox_id, waker);
+        tokio::pin!(joining);
+        tokio::select! {
+            joined = &mut joining => panic!("{waker:?} got past a held wake lock: {joined:?}"),
+            waiting = wait_for_advisory_lock_waiter(&observer) => waiting?,
         }
+        let permit = runner
+            .try_acquire(InlineAdmissionPath::ImplicitWake)
+            .unwrap_or_else(|refusal| {
+                panic!("{waker:?} holds the only permit while it waits: {refusal:?}")
+            });
+        drop(permit);
+        holder.rollback().await?;
+
+        assert_eq!(joining.await?, queued.as_uuid(), "{waker:?}");
+        assert_eq!(
+            state_and_attempts(&fixture, queued.as_uuid()).await?,
+            ("queued", 0),
+            "{waker:?}"
+        );
+        assert!(script.executed().is_empty(), "{waker:?}");
         Ok(())
     }
 

@@ -19,6 +19,19 @@ pub(crate) use admission::{Admission, HandshakePermit, Refused, TlsHandshakeLeg}
 pub struct TlsInterception {
     requester: Option<CertificateRequester>,
     upstream: UpstreamTls,
+    backstop: CertificateBackstop,
+}
+
+/// How long a certificate request may run before interception gives up on
+/// it: [`CERTIFICATE_REQUEST_BACKSTOP`] outside tests, which shorten it to
+/// wait out a requester that never answers.
+#[derive(Clone, Copy)]
+struct CertificateBackstop(std::time::Duration);
+
+impl Default for CertificateBackstop {
+    fn default() -> Self {
+        Self(CERTIFICATE_REQUEST_BACKSTOP)
+    }
 }
 
 #[derive(Clone)]
@@ -63,7 +76,14 @@ impl TlsInterception {
         Self {
             upstream: UpstreamTls::default(),
             requester: Some(requester),
+            backstop: CertificateBackstop::default(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_certificate_backstop(mut self, backstop: std::time::Duration) -> Self {
+        self.backstop = CertificateBackstop(backstop);
+        self
     }
 
     /// Overrides public origin trust, independently of interception issuer trust.
@@ -113,7 +133,8 @@ impl TlsInterception {
                     .requester
                     .as_ref()
                     .ok_or(TlsInterceptionError::AuthorityUnavailable)?;
-                require_certificates(requester, scan, missing_sni_detail, port).await
+                require_certificates(requester, self.backstop.0, scan, missing_sni_detail, port)
+                    .await
             }
         }
     }
@@ -122,6 +143,7 @@ impl TlsInterception {
 /// Certificates permit a TLS handshake, never uninspected application relay.
 async fn require_certificates(
     requester: &CertificateRequester,
+    backstop: std::time::Duration,
     scan: &ClientHelloScan,
     missing_sni_detail: Option<MissingSniDetail>,
     port: u16,
@@ -140,7 +162,7 @@ async fn require_certificates(
     // The provider bounds itself; this only catches a requester that does not.
     // It is deliberately longer so the provider's deadline fires first and
     // reports which stage ran out of budget.
-    let lease = tokio::time::timeout(CERTIFICATE_REQUEST_BACKSTOP, requester(host, port))
+    let lease = tokio::time::timeout(backstop, requester(host, port))
         .await
         .map_err(|_| TlsInterceptionError::Timeout)?
         .map_err(TlsInterceptionError::CertificateRequest)?;

@@ -43,10 +43,7 @@ use crate::{
         ControllerError,
         sandbox::{
             AdmissionPoolPlan, SandboxController, fetch_sandbox,
-            list_page::{
-                ListPage, MAX_SANDBOX_LIST_PAGE_BYTES, PageWalkParams,
-                SANDBOX_LIST_ROW_OVERHEAD_BYTES, page_rows_cte,
-            },
+            list_page::{ListPage, PageWalkParams, SANDBOX_LIST_ROW_OVERHEAD_BYTES, page_rows_cte},
         },
         substrate::AdmissionPoolClaim,
     },
@@ -631,9 +628,16 @@ pub async fn list_sandboxes(
                 .ok_or_else(PublicApiError::internal)
         })
         .transpose()?;
-    let rows = fetch_sandboxes_page(&state.pool, org.id, subject_id, cursor, limit)
-        .await
-        .map_err(database_error)?;
+    let rows = fetch_sandboxes_page(
+        &state.pool,
+        org.id,
+        subject_id,
+        cursor,
+        limit,
+        state.sandbox_controller.list_page_max_bytes,
+    )
+    .await
+    .map_err(database_error)?;
     Ok(Json(sandboxes_page(rows, limit)?))
 }
 
@@ -1346,6 +1350,7 @@ async fn fetch_sandboxes_page(
     subject_id: Option<UserId>,
     cursor: Option<(OffsetDateTime, SandboxId)>,
     limit: u16,
+    max_bytes: i64,
 ) -> Result<Vec<PublicSandboxRow>, sqlx::Error> {
     let (cursor_created_at, cursor_id) = cursor
         .map(|(created_at, id)| (Some(created_at), Some(id)))
@@ -1363,7 +1368,7 @@ async fn fetch_sandboxes_page(
         .bind(cursor_id)
         .bind(i64::from(limit) + 1)
         .bind(subject_id)
-        .bind(MAX_SANDBOX_LIST_PAGE_BYTES)
+        .bind(max_bytes)
         .bind(SANDBOX_LIST_ROW_OVERHEAD_BYTES)
         .fetch_all(pool)
         .await

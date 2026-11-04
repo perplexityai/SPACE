@@ -39,17 +39,14 @@ enum FakeFlag {
     Fails(EvaluationErrorCode),
     /// Never answers at all, for the wedged-backend case.
     Hangs,
-    /// Occupies the worker's single thread for [`BLOCKING_SPAN`], so requests
-    /// behind it queue instead of being served. Blocking rather than sleeping
-    /// on purpose: an `.await` would yield the thread and no backlog would
-    /// form.
-    BlocksThread,
+    /// Occupies the worker's single thread until the test drops the paired
+    /// [`std::sync::mpsc::Sender`], so requests behind it queue instead of
+    /// being served. Blocking rather than sleeping on purpose: an `.await`
+    /// would yield the thread and no backlog would form. A dropped sender
+    /// also releases it when the test panics, so the worker can still be
+    /// joined.
+    BlocksThread(Arc<Mutex<std::sync::mpsc::Receiver<()>>>),
 }
-
-/// Comfortably longer than [`super::worker::EVALUATION_TIMEOUT`] so anything
-/// queued behind it is certainly past its deadline by the time the worker gets
-/// to it.
-const BLOCKING_SPAN: std::time::Duration = std::time::Duration::from_millis(1500);
 
 #[derive(Default)]
 struct FakeProvider {
@@ -118,8 +115,11 @@ impl FakeProvider {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(context.clone());
         match self.flags.get(flag_key) {
-            Some(FakeFlag::BlocksThread) => {
-                std::thread::sleep(BLOCKING_SPAN);
+            Some(FakeFlag::BlocksThread(release)) => {
+                let _released = release
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .recv();
                 Ok(FakeFlag::Bool(true))
             }
             Some(FakeFlag::Hangs) => {
@@ -738,15 +738,24 @@ fn a_provider_that_never_answers_fails_the_read_within_the_deadline() {
 fn a_request_whose_caller_has_given_up_is_not_evaluated() {
     const BLOCKER: BoolFlag = BoolFlag::new("space-blocker", false);
     const QUEUED: BoolFlag = BoolFlag::new("space-queued", false);
+    const SENTINEL: BoolFlag = BoolFlag::new("space-sentinel", false);
 
+    let (release, blocked) = std::sync::mpsc::channel();
     let fake = FakeProvider::with([
-        ("space-blocker", FakeFlag::BlocksThread),
+        (
+            "space-blocker",
+            FakeFlag::BlocksThread(Arc::new(Mutex::new(blocked))),
+        ),
         ("space-queued", FakeFlag::Bool(true)),
+        ("space-sentinel", FakeFlag::Bool(true)),
     ]);
     let contexts = fake.contexts();
     let client = FeatureFlagClient::from_provider(
         OpenFeatureProvider::new(fake).expect("the worker should start"),
     );
+    // Declared after the client so a panic drops it first, freeing the worker
+    // thread before the client's drop joins it.
+    let release = release;
 
     std::thread::scope(|scope| {
         let blocker = {
@@ -768,9 +777,16 @@ fn a_request_whose_caller_has_given_up_is_not_evaluated() {
         assert!(!queued.join().expect("queued thread"));
     });
 
-    // The worker is still working through the blocking read; wait for it to
-    // finish so a late evaluation of the queued request would be caught.
-    std::thread::sleep(BLOCKING_SPAN);
+    // Both callers have given up, so the queued request is past its deadline.
+    // Free the worker, then read a sentinel queued behind it: the queue is
+    // first in, first out, so once the sentinel is served the worker has
+    // already reached the abandoned request, and a late evaluation of it
+    // would be in the log below.
+    drop(release);
+    assert!(
+        client.bool_value(SENTINEL, "sentinel"),
+        "the sentinel read should be served once the worker is free"
+    );
 
     let seen: Vec<Option<String>> = contexts
         .lock()

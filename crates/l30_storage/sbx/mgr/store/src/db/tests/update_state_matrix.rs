@@ -172,7 +172,7 @@ pub(super) enum Shape {
 }
 
 impl Shape {
-    const ALL: [Self; 5] = [
+    pub(super) const ALL: [Self; 5] = [
         Self::Plain,
         Self::DeleteRowIntent,
         Self::ArmedCreateEpisode,
@@ -427,29 +427,31 @@ fn check(
     }
 }
 
-pub(super) fn sweep_lifecycle_pairs_and_cleanup_shapes(writer: Writer) {
-    for (shape, receipt_kind) in Shape::ALL
-        .into_iter()
-        .flat_map(|shape| Receipt::ALL.map(|receipt| (shape, receipt)))
-    {
-        for from in SandboxState::all() {
-            for to in SandboxState::all() {
-                let receipt = receipt_kind.target(to);
-                let case = format!("{shape:?}, {receipt} receipt: {from} -> {to}");
-                let conn = test_conn();
-                let id = seed(&conn, shape, from, receipt);
-                let expected = cell(shape.grid()[index(from)], to);
-                let applied = applied_diff(&id, from, to, receipt);
-                check(
-                    writer,
-                    &case,
-                    &conn,
-                    &id,
-                    (Some(from), to),
-                    expected,
-                    applied,
-                );
-            }
+/// Every receipt and target over a row in `from` with `shape`; callers sweep
+/// `SandboxState::all()` and `Shape::ALL` as separate tests so the cases run
+/// in parallel.
+pub(super) fn sweep_lifecycle_pairs_and_cleanup_shapes(
+    writer: Writer,
+    from: SandboxState,
+    shape: Shape,
+) {
+    for receipt_kind in Receipt::ALL {
+        for to in SandboxState::all() {
+            let receipt = receipt_kind.target(to);
+            let case = format!("{shape:?}, {receipt} receipt: {from} -> {to}");
+            let conn = test_conn();
+            let id = seed(&conn, shape, from, receipt);
+            let expected = cell(shape.grid()[index(from)], to);
+            let applied = applied_diff(&id, from, to, receipt);
+            check(
+                writer,
+                &case,
+                &conn,
+                &id,
+                (Some(from), to),
+                expected,
+                applied,
+            );
         }
     }
 }

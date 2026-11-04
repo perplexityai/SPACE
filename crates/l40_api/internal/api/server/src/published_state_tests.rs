@@ -586,8 +586,12 @@ async fn registered_inventory_does_not_require_cluster_singleton() -> TestResult
 /// trimmed and lower-cased. `space` rows have no Kubernetes
 /// execution to route; `k8s` rows carry a routable one, so routability does
 /// not mask the lifecycle filter for either.
+#[rstest::rstest]
 #[tokio::test(flavor = "current_thread")]
-async fn node_publication_converges_only_from_its_source_lifecycles() -> TestResult {
+async fn node_publication_converges_only_from_its_source_lifecycles(
+    #[values("space", "k8s")] managed_by: &str,
+    #[values("started", "stopped")] published: &str,
+) -> TestResult {
     use pplx_space_common_core::types::SandboxLifecycle as L;
 
     /// What a `started` and a `stopped` report leave in a row stored as `stored`.
@@ -636,43 +640,40 @@ async fn node_publication_converges_only_from_its_source_lifecycles() -> TestRes
             (" Suspended ", " Suspended ", "stopped"),
             ("bogus", "bogus", "bogus"),
         ]);
-    let cases = ["space", "k8s"]
-        .into_iter()
-        .flat_map(|managed_by| cases.clone().map(move |case| (managed_by, case)));
     let mut mismatches = Vec::new();
-    for (managed_by, (stored, after_started, after_stopped)) in cases {
-        for (published, expected) in [("started", after_started), ("stopped", after_stopped)] {
-            let sandbox_id = SandboxId::new();
-            insert_active_sandbox_with_managed_by(
-                &db.pool, sandbox_id, node_id, stored, managed_by,
-            )
+    for (stored, after_started, after_stopped) in cases {
+        let expected = if published == "started" {
+            after_started
+        } else {
+            after_stopped
+        };
+        let sandbox_id = SandboxId::new();
+        insert_active_sandbox_with_managed_by(&db.pool, sandbox_id, node_id, stored, managed_by)
             .await?;
-            if managed_by == "k8s" {
-                insert_k8s_execution(&db.pool, sandbox_id, 1, "running", Some("100.64.0.1"))
-                    .await?;
-            }
+        if managed_by == "k8s" {
+            insert_k8s_execution(&db.pool, sandbox_id, 1, "running", Some("100.64.0.1")).await?;
+        }
 
-            let mut tx = db.pool.begin().await?;
-            let outcome = publish_sandbox_states(
-                &mut tx,
-                node_id,
-                &[published_sandbox_state(sandbox_id, published)],
-            )
-            .await?;
-            tx.commit().await?;
+        let mut tx = db.pool.begin().await?;
+        let outcome = publish_sandbox_states(
+            &mut tx,
+            node_id,
+            &[published_sandbox_state(sandbox_id, published)],
+        )
+        .await?;
+        tx.commit().await?;
 
-            let lifecycle: String =
-                sqlx::query_scalar(sql!("SELECT lifecycle FROM sandboxes WHERE id = $1"))
-                    .bind(sandbox_id)
-                    .fetch_one(&db.pool)
-                    .await?;
-            if (outcome.accepted, lifecycle.as_str()) != (1, expected) {
-                mismatches.push(format!(
-                    "{managed_by} {stored} published as {published}: expected {expected}, \
-                     observed {lifecycle} (accepted {})",
-                    outcome.accepted
-                ));
-            }
+        let lifecycle: String =
+            sqlx::query_scalar(sql!("SELECT lifecycle FROM sandboxes WHERE id = $1"))
+                .bind(sandbox_id)
+                .fetch_one(&db.pool)
+                .await?;
+        if (outcome.accepted, lifecycle.as_str()) != (1, expected) {
+            mismatches.push(format!(
+                "{managed_by} {stored} published as {published}: expected {expected}, \
+                 observed {lifecycle} (accepted {})",
+                outcome.accepted
+            ));
         }
     }
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));

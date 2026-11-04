@@ -153,9 +153,13 @@ async fn build_wait_retries_transient_polls_but_rejects_client_errors() {
             template_name: SystemTemplate::Seed,
         };
 
-        let result = tokio::time::timeout(Duration::from_secs(10), client.wait_for_build(&job))
-            .await
-            .unwrap();
+        // The interval only paces the polls; the retry decisions do not depend on it.
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.wait_for_build(&job, Duration::from_millis(10)),
+        )
+        .await
+        .unwrap();
 
         if retries {
             assert_eq!(result.unwrap().content_hash.unwrap().to_string(), HASH);

@@ -430,6 +430,9 @@ pub struct SandboxManagerService {
     cleanup_run_dir: Option<PathBuf>,
     #[cfg(test)]
     create_cache_dir: Option<PathBuf>,
+    /// See [`SandboxManagerServiceOptions::pause_reconciliation_backoff`].
+    #[cfg(test)]
+    pause_reconciliation_backoff: Option<Duration>,
     gateway_caller_client: pplx_space_node_mgr_client::NodeManagerGrpcClient,
     gateway_authority: gateway_authority::GatewayAuthority,
     /// S3 upload config for suspend snapshots. `None` means uploads are disabled.
@@ -1056,6 +1059,14 @@ pub struct SandboxManagerServiceOptions {
     /// Cache root for logical Create and checkpoint admission tests; later VM work uses its own fixtures.
     #[cfg(test)]
     pub(crate) create_cache_dir: Option<PathBuf>,
+    /// Delay between pause reconciliation attempts. `None` keeps the
+    /// production delay.
+    #[cfg(test)]
+    pub(crate) pause_reconciliation_backoff: Option<Duration>,
+    /// Snapshot-upload retry backoff, in whole seconds per attempt. `None`
+    /// keeps the job queue's production schedule.
+    #[cfg(test)]
+    pub(crate) snapshot_upload_retry_backoff_secs: Option<Vec<u64>>,
 }
 
 impl Default for SandboxManagerServiceOptions {
@@ -1084,6 +1095,10 @@ impl Default for SandboxManagerServiceOptions {
             cleanup_run_dir: None,
             #[cfg(test)]
             create_cache_dir: None,
+            #[cfg(test)]
+            pause_reconciliation_backoff: None,
+            #[cfg(test)]
+            snapshot_upload_retry_backoff_secs: None,
         }
     }
 }
@@ -1752,11 +1767,18 @@ impl SandboxManagerService {
         if let Some(generation) = expected_route_verification_key_generation {
             watchdog.set_expected_route_verification_key_generation(generation);
         }
+        let snapshot_upload_worker_config = crate::snapshot_upload_jobs::worker_config();
+        #[cfg(test)]
+        let snapshot_upload_worker_config = match options.snapshot_upload_retry_backoff_secs {
+            Some(delays) => snapshot_upload_worker_config.with_retry_backoff_secs(delays),
+            None => snapshot_upload_worker_config,
+        };
         let snapshot_upload_worker = crate::snapshot_upload_jobs::build_worker(
             db.clone(),
             Arc::clone(&drain_state),
             options.node_manager.clone(),
             options.volume_manager_socket_path.clone(),
+            snapshot_upload_worker_config,
         );
         let local_artifacts = crate::local_artifacts::LocalArtifacts::new(db.clone());
         let teardown_suspend_driver_concurrency = TEARDOWN_SUSPEND_DRIVER_CONCURRENCY;
@@ -1856,6 +1878,8 @@ impl SandboxManagerService {
             cleanup_run_dir: options.cleanup_run_dir,
             #[cfg(test)]
             create_cache_dir: options.create_cache_dir,
+            #[cfg(test)]
+            pause_reconciliation_backoff: options.pause_reconciliation_backoff,
             drain_state,
             feature_flags,
             route_ed25519_verification_bundle: Arc::new(ArcSwapOption::from(

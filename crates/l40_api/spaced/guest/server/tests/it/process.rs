@@ -147,8 +147,12 @@ async fn bridge_guest_process_start_preserves_large_stdout_for_delayed_reader() 
 
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
-    let delayed = stream.then(|event| async move {
-        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    // The reader trails the process, pausing every 32nd event (256 KiB): a
+    // pause per event would spend the test on 2048 timer waits.
+    let delayed = stream.enumerate().then(|(index, event)| async move {
+        if index % 32 == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
         event
     });
     let events = collect_process_events(Box::pin(delayed)).await;

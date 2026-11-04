@@ -1653,7 +1653,7 @@ async fn inventory_reads_skip_locked_sandbox_accounting_but_diagnostics_do_not()
                 .connect_options()
                 .as_ref()
                 .clone()
-                .options([("lock_timeout", "100ms")]),
+                .options([("lock_timeout", "20ms")]),
         )
         .await?;
     let state = AppState::from_pool(pool).await?;
@@ -1740,7 +1740,7 @@ async fn inventory_reads_skip_locked_sandbox_accounting_but_diagnostics_do_not()
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 
     let mut guard_tx = db.pool.begin().await?;
-    sqlx::query(sql!("SET LOCAL lock_timeout = '100ms'"))
+    sqlx::query(sql!("SET LOCAL lock_timeout = '20ms'"))
         .execute(&mut *guard_tx)
         .await?;
     let error = node_store::sandbox_occupancy_for_node_in_tx(
@@ -2498,7 +2498,7 @@ async fn node_reads_survive_a_failed_read_state_read() -> TestResult {
                 .connect_options()
                 .as_ref()
                 .clone()
-                .options([("lock_timeout", "100ms")]),
+                .options([("lock_timeout", "20ms")]),
         )
         .await?;
     let state = AppState::from_pool(pool).await?;

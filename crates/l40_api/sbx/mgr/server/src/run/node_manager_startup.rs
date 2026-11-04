@@ -48,6 +48,20 @@ enum AttemptError {
 pub(super) async fn wait_for_node_manager<C, Fut>(
     phase: StartupPhase,
     shutdown: &CancellationToken,
+    connect: C,
+) -> Result<(), NodeManagerStartupError>
+where
+    C: FnMut() -> Fut,
+    Fut: Future<Output = Result<NodeManagerGrpcClient, ConnectError>>,
+{
+    wait_for_node_manager_with_retry(phase, shutdown, &RETRY_POLICY, connect).await
+}
+
+/// [`wait_for_node_manager`] backing off between attempts by `retry_policy`.
+async fn wait_for_node_manager_with_retry<C, Fut>(
+    phase: StartupPhase,
+    shutdown: &CancellationToken,
+    retry_policy: &GrpcRetryPolicy,
     mut connect: C,
 ) -> Result<(), NodeManagerStartupError>
 where
@@ -112,9 +126,9 @@ where
             }
             // The exponential reaches its cap at index four. Saturating the
             // index also keeps arbitrarily long dependency waits overflow-safe.
-            let delay = RETRY_POLICY
+            let delay = retry_policy
                 .backoff_delay(attempts.saturating_sub(1).min(4) as usize)
-                .unwrap_or(RETRY_POLICY.max_delay);
+                .unwrap_or(retry_policy.max_delay);
             tokio::time::sleep(delay).await;
         }
     };

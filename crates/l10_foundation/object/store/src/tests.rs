@@ -897,9 +897,12 @@ async fn ranged_download(fault: BodyFault, faults: usize) -> RangedDownload {
     ))
     .await;
     let recorder = Arc::new(Recorder::default());
+    // The SDK only starts the grace period once its fixed one-second window
+    // has seen no bytes, so a short grace cannot cut a healthy chunk, which
+    // finishes in milliseconds; it only shortens the stalled case.
     let mut store = store(
         S3Timeouts::resolve(|_| None),
-        Duration::from_millis(300),
+        Duration::from_millis(100),
         &recorder,
     );
     store.download_chunk_size = CHUNK;
@@ -918,38 +921,39 @@ async fn ranged_download(fault: BodyFault, faults: usize) -> RangedDownload {
     }
 }
 
+#[rstest::rstest]
+#[case::truncated(BodyFault::Truncate, S3AttemptFailureKind::Io)]
+#[case::stalled(BodyFault::Stall, S3AttemptFailureKind::StalledStream)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ranged_download_retries_a_chunk_whose_body_fails_once() {
-    for (fault, kind) in [
-        (BodyFault::Truncate, S3AttemptFailureKind::Io),
-        (BodyFault::Stall, S3AttemptFailureKind::StalledStream),
-    ] {
-        let download = ranged_download(fault, 1).await;
+async fn ranged_download_retries_a_chunk_whose_body_fails_once(
+    #[case] fault: BodyFault,
+    #[case] kind: S3AttemptFailureKind,
+) {
+    let download = ranged_download(fault, 1).await;
 
-        assert_eq!(
-            download.result.as_ref().ok(),
-            Some(&(download.expected.len() as u64)),
-            "{fault:?}: {:?}",
-            download.result,
-        );
-        assert!(
-            download.written.as_deref() == Some(&download.expected[..]),
-            "{fault:?}: downloaded bytes differ from the object"
-        );
-        assert_eq!(download.faulty_requests, 2, "{fault:?}");
-        let failures = download.recorder.failed_targets();
-        assert_eq!(failures.len(), 1, "{fault:?}: {failures:?}");
-        let (target, failure) = &failures[0];
-        assert_eq!(
-            (failure.attempt, failure.kind, failure.will_retry),
-            (1, kind, true),
-            "{fault:?}",
-        );
-        assert_eq!(target.chunk_index, Some(1), "{fault:?}");
-        let recoveries = download.recorder.recoveries();
-        assert_eq!(recoveries.len(), 1, "{fault:?}");
-        assert_eq!(recoveries[0].1.attempts, 2, "{fault:?}");
-    }
+    assert_eq!(
+        download.result.as_ref().ok(),
+        Some(&(download.expected.len() as u64)),
+        "{fault:?}: {:?}",
+        download.result,
+    );
+    assert!(
+        download.written.as_deref() == Some(&download.expected[..]),
+        "{fault:?}: downloaded bytes differ from the object"
+    );
+    assert_eq!(download.faulty_requests, 2, "{fault:?}");
+    let failures = download.recorder.failed_targets();
+    assert_eq!(failures.len(), 1, "{fault:?}: {failures:?}");
+    let (target, failure) = &failures[0];
+    assert_eq!(
+        (failure.attempt, failure.kind, failure.will_retry),
+        (1, kind, true),
+        "{fault:?}",
+    );
+    assert_eq!(target.chunk_index, Some(1), "{fault:?}");
+    let recoveries = download.recorder.recoveries();
+    assert_eq!(recoveries.len(), 1, "{fault:?}");
+    assert_eq!(recoveries[0].1.attempts, 2, "{fault:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

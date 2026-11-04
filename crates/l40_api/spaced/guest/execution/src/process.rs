@@ -88,7 +88,12 @@ const PROCESS_OUTPUT_GUARANTEED_BYTES: usize =
 #[cfg(test)]
 const PROCESS_OUTPUT_SHARED_BYTES: usize =
     PROCESS_OUTPUT_RETENTION_MAX_BYTES - PROCESS_RECORD_LIMIT * PROCESS_OUTPUT_GUARANTEED_BYTES;
+#[cfg(not(test))]
 const PROCESS_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+// Tests that wait out the drain hold the descendant open for the whole
+// window, so a shorter one still separates a drained exit from a cut one.
+#[cfg(test)]
+const PROCESS_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(200);
 const PROCESS_OUTPUT_CURSOR_AHEAD_MESSAGE: &str =
     "process output cursor is past the output the process has written";
 const PROCESS_CAPACITY_MESSAGE: &str = "too many retained processes";

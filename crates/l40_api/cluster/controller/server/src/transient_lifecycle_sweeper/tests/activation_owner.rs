@@ -400,8 +400,11 @@ impl Write {
 /// that rolls back leaves the crashed owner's row to the sweep. That holds
 /// for the fail CAS on every activation-owned lifecycle, and for the
 /// `restoring` converge and revert CASes.
+#[rstest::rstest]
 #[tokio::test(flavor = "current_thread")]
-async fn a_new_owner_that_claims_first_keeps_the_row() -> TestResult {
+async fn a_new_owner_that_claims_first_keeps_the_row(
+    #[values(true, false)] commit: bool,
+) -> TestResult {
     let db = pg_test_db_with_max_connections(3).await?;
     let pool = &db.pool;
 
@@ -410,59 +413,57 @@ async fn a_new_owner_that_claims_first_keeps_the_row() -> TestResult {
         .map(Write::Fail)
         .chain([Write::Converge, Write::Revert]);
     for write in writes {
-        for commit in [true, false] {
-            let lifecycle = write.lifecycle();
-            let id = insert_row(pool, lifecycle.as_str(), Lease::Expired).await?;
-            expire_restore_lease(pool, id).await?;
-            insert_snapshot(pool, id, "ready", -60).await?;
+        let lifecycle = write.lifecycle();
+        let id = insert_row(pool, lifecycle.as_str(), Lease::Expired).await?;
+        expire_restore_lease(pool, id).await?;
+        insert_snapshot(pool, id, "ready", -60).await?;
 
-            // The claim's first step: lock the sandbox, as the sweep's CASes
-            // also do first.
-            let mut owner = pool.begin().await?;
-            let owner_pid: i32 = sqlx::query_scalar(sql!("SELECT pg_backend_pid()"))
-                .fetch_one(&mut *owner)
-                .await?;
-            sqlx::query(LOCK_SANDBOX_ROW_SQL)
-                .bind(id)
-                .execute(&mut *owner)
-                .await?;
-
-            let (sweep_pool, sweep_pid) = single_backend_pool(&db).await?;
-            // The revert that only moves the lifecycle: the one that also
-            // retires the execution would refuse the new owner's claim on its
-            // fence alone, owner check or not.
-            let sweep = tokio::spawn(async move {
-                let sink = revert_sink(&sweep_pool, AbandonedRestoreRetirement::Disabled);
-                write.run(&sink, id).await
-            });
-            bounded(wait_until_blocked(pool, sweep_pid, owner_pid)).await?;
-
-            // Its second step, with the sweep already waiting: the new lease.
-            sqlx::query(sql!(
-                "UPDATE sandbox_k8s_executions
-                    SET activation_attempt_id = space_uuid_v7(),
-                        activation_attempt_expires_at = NOW() + INTERVAL '5 minutes'
-                  WHERE sandbox_id = $1 AND active"
-            ))
+        // The claim's first step: lock the sandbox, as the sweep's CASes
+        // also do first.
+        let mut owner = pool.begin().await?;
+        let owner_pid: i32 = sqlx::query_scalar(sql!("SELECT pg_backend_pid()"))
+            .fetch_one(&mut *owner)
+            .await?;
+        sqlx::query(LOCK_SANDBOX_ROW_SQL)
             .bind(id)
             .execute(&mut *owner)
             .await?;
-            if commit {
-                owner.commit().await?;
-            } else {
-                owner.rollback().await?;
-            }
 
-            let claimed = bounded(async { sweep.await? }).await?;
-            let case = format!("{write:?}, owner commits: {commit}");
-            assert_eq!(claimed, !commit, "{case}");
-            let expected = if commit {
-                lifecycle.as_str()
-            } else {
-                write.lands_on()
-            };
-            assert_eq!(lifecycle_of(pool, id).await?, expected, "{case}");
+        let (sweep_pool, sweep_pid) = single_backend_pool(&db).await?;
+        // The revert that only moves the lifecycle: the one that also
+        // retires the execution would refuse the new owner's claim on its
+        // fence alone, owner check or not.
+        let sweep = tokio::spawn(async move {
+            let sink = revert_sink(&sweep_pool, AbandonedRestoreRetirement::Disabled);
+            write.run(&sink, id).await
+        });
+        bounded(wait_until_blocked(pool, sweep_pid, owner_pid)).await?;
+
+        // Its second step, with the sweep already waiting: the new lease.
+        sqlx::query(sql!(
+            "UPDATE sandbox_k8s_executions
+                SET activation_attempt_id = space_uuid_v7(),
+                    activation_attempt_expires_at = NOW() + INTERVAL '5 minutes'
+              WHERE sandbox_id = $1 AND active"
+        ))
+        .bind(id)
+        .execute(&mut *owner)
+        .await?;
+        if commit {
+            owner.commit().await?;
+        } else {
+            owner.rollback().await?;
         }
+
+        let claimed = bounded(async { sweep.await? }).await?;
+        let case = format!("{write:?}, owner commits: {commit}");
+        assert_eq!(claimed, !commit, "{case}");
+        let expected = if commit {
+            lifecycle.as_str()
+        } else {
+            write.lands_on()
+        };
+        assert_eq!(lifecycle_of(pool, id).await?, expected, "{case}");
     }
     Ok(())
 }

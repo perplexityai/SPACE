@@ -1917,11 +1917,12 @@ async fn the_publish_transaction_takes_no_nodes_row_lock() -> TestResult {
     // `lock_timeout` rather than by a dropped future, so the arm that proves
     // the fixture works is as deterministic as the arm it exists to support.
     // `SET LOCAL` because a plain `SET` outlives the statement on a *pooled*
-    // connection, and the publish below would then inherit a one-second lock
+    // connection, and the publish below would then inherit a short lock
     // budget from this control — turning the real assertion into an accident
-    // of which connection the pool handed it.
+    // of which connection the pool handed it. The holder never releases, so
+    // a short budget is as conclusive as a long one.
     let mut writer = mirror.pool().begin().await?;
-    sqlx::query(sql!("SET LOCAL lock_timeout = '1s'"))
+    sqlx::query(sql!("SET LOCAL lock_timeout = '100ms'"))
         .execute(&mut *writer)
         .await?;
     let control = sqlx::query(sql!(

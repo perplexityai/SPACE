@@ -412,6 +412,42 @@ async fn set_route_and_provenance(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+enum Row {
+    Suspended,
+    /// `restoring` with its owner's token left on an expired lease.
+    RestoringExpiredLease,
+    RestoreLeaseHeld,
+    MovedTo(&'static str),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RouteOn {
+    Source,
+    Other,
+}
+
+#[derive(Debug)]
+enum Expect {
+    Adopted,
+    RestoredElsewhereKeepingSource,
+    RestoreInFlight,
+    Untouched,
+    RestoredElsewhereDeletingSource,
+}
+
+#[derive(Debug)]
+struct Case {
+    label: &'static str,
+    record_status: &'static str,
+    record_generation: i64,
+    route: (RouteOn, i64),
+    last_generation: i64,
+    row: Row,
+    source_is_candidate: bool,
+    expect: Expect,
+}
+
 /// A wake that raced the node's suspend can leave the record live on the
 /// artifact node while the row is `suspended` with no active node. A wake
 /// adopts that record when it runs on the route identity's node, at or above
@@ -424,40 +460,139 @@ async fn set_route_and_provenance(
 /// around, as is a row under a live restore lease or one that left the
 /// lifecycle the wake read; the cleanup keeps a source copy it does not read
 /// as dormant.
+#[rstest::rstest]
+#[case::receipt_never_persisted(Case {
+    label: "live record ahead of a receipt its wake never persisted",
+    record_status: "running",
+    record_generation: 2,
+    route: (RouteOn::Source, 1),
+    last_generation: 2,
+    row: Row::Suspended,
+    source_is_candidate: true,
+    expect: Expect::Adopted,
+})]
+#[case::at_the_receipt_below_an_abandoned_reservation(Case {
+    label: "live record at the receipt, below an abandoned reservation",
+    record_status: "running",
+    record_generation: 1,
+    route: (RouteOn::Source, 1),
+    last_generation: 2,
+    row: Row::Suspended,
+    source_is_candidate: true,
+    expect: Expect::Adopted,
+})]
+#[case::expired_owners_receipt_matches(Case {
+    label: "restoring row whose expired owner's receipt matches the record",
+    record_status: "running",
+    record_generation: 2,
+    route: (RouteOn::Source, 2),
+    last_generation: 2,
+    row: Row::RestoringExpiredLease,
+    source_is_candidate: true,
+    expect: Expect::Adopted,
+})]
+#[case::expired_owner_reserved_the_records_generation(Case {
+    label: "restoring row whose expired owner reserved the record's generation",
+    record_status: "running",
+    record_generation: 2,
+    route: (RouteOn::Source, 1),
+    last_generation: 2,
+    row: Row::RestoringExpiredLease,
+    source_is_candidate: true,
+    expect: Expect::RestoredElsewhereKeepingSource,
+})]
+#[case::expired_owner_reserved_past_the_record(Case {
+    label: "restoring row whose expired owner reserved past the record",
+    record_status: "running",
+    record_generation: 2,
+    route: (RouteOn::Source, 2),
+    last_generation: 3,
+    row: Row::RestoringExpiredLease,
+    source_is_candidate: true,
+    expect: Expect::RestoredElsewhereKeepingSource,
+})]
+#[case::route_on_the_other_worker(Case {
+    label: "route identity on the other worker",
+    record_status: "running",
+    record_generation: 2,
+    route: (RouteOn::Other, 1),
+    last_generation: 2,
+    row: Row::Suspended,
+    source_is_candidate: true,
+    expect: Expect::RestoredElsewhereKeepingSource,
+})]
+#[case::record_older_than_the_receipt(Case {
+    label: "live record older than the receipt",
+    record_status: "running",
+    record_generation: 1,
+    route: (RouteOn::Source, 2),
+    last_generation: 2,
+    row: Row::Suspended,
+    source_is_candidate: true,
+    expect: Expect::RestoredElsewhereKeepingSource,
+})]
+#[case::record_ahead_of_the_last_reservation(Case {
+    label: "live record ahead of the last reserved generation",
+    record_status: "running",
+    record_generation: 3,
+    route: (RouteOn::Source, 2),
+    last_generation: 2,
+    row: Row::Suspended,
+    source_is_candidate: true,
+    expect: Expect::RestoredElsewhereKeepingSource,
+})]
+#[case::undecodable_lifecycle(Case {
+    label: "record whose lifecycle the API cannot decode",
+    record_status: "migrating",
+    record_generation: 1,
+    route: (RouteOn::Source, 1),
+    last_generation: 1,
+    row: Row::Suspended,
+    source_is_candidate: true,
+    expect: Expect::RestoredElsewhereKeepingSource,
+})]
+#[case::under_another_wakes_restore_lease(Case {
+    label: "live record under another wake's restore lease",
+    record_status: "running",
+    record_generation: 1,
+    route: (RouteOn::Source, 1),
+    last_generation: 1,
+    row: Row::RestoreLeaseHeld,
+    source_is_candidate: true,
+    expect: Expect::RestoreInFlight,
+})]
+#[case::row_now_deleting(Case {
+    label: "live record, row now deleting",
+    record_status: "running",
+    record_generation: 1,
+    route: (RouteOn::Source, 1),
+    last_generation: 1,
+    row: Row::MovedTo("deleting"),
+    source_is_candidate: true,
+    expect: Expect::Untouched,
+})]
+#[case::row_now_quarantined(Case {
+    label: "live record, row now quarantined",
+    record_status: "running",
+    record_generation: 1,
+    route: (RouteOn::Source, 1),
+    last_generation: 1,
+    row: Row::MovedTo("quarantined"),
+    source_is_candidate: true,
+    expect: Expect::Untouched,
+})]
+#[case::suspended_record_on_a_non_candidate(Case {
+    label: "suspended record on a node that is not a candidate",
+    record_status: "suspended",
+    record_generation: 1,
+    route: (RouteOn::Source, 1),
+    last_generation: 1,
+    row: Row::Suspended,
+    source_is_candidate: false,
+    expect: Expect::RestoredElsewhereDeletingSource,
+})]
 #[tokio::test(flavor = "current_thread")]
-async fn wake_adopts_a_live_record_on_its_artifact_node() -> TestResult {
-    #[derive(Debug, Clone, Copy)]
-    enum Row {
-        Suspended,
-        /// `restoring` with its owner's token left on an expired lease.
-        RestoringExpiredLease,
-        RestoreLeaseHeld,
-        MovedTo(&'static str),
-    }
-    #[derive(Debug, Clone, Copy)]
-    enum RouteOn {
-        Source,
-        Other,
-    }
-    #[derive(Debug)]
-    enum Expect {
-        Adopted,
-        RestoredElsewhereKeepingSource,
-        RestoreInFlight,
-        Untouched,
-        RestoredElsewhereDeletingSource,
-    }
-    struct Case {
-        label: &'static str,
-        record_status: &'static str,
-        record_generation: i64,
-        route: (RouteOn, i64),
-        last_generation: i64,
-        row: Row,
-        source_is_candidate: bool,
-        expect: Expect,
-    }
-
+async fn wake_adopts_a_live_record_on_its_artifact_node(#[case] case: Case) -> TestResult {
     if !crate::test_support::enter_sim_worker_process() {
         return Ok(());
     }
@@ -471,344 +606,211 @@ async fn wake_adopts_a_live_record_on_its_artifact_node() -> TestResult {
     seed_worker(&fixture.pool, source_id, source_server.endpoint()).await?;
     seed_worker(&fixture.pool, other_id, other_server.endpoint()).await?;
 
-    for case in [
-        Case {
-            label: "live record ahead of a receipt its wake never persisted",
-            record_status: "running",
-            record_generation: 2,
-            route: (RouteOn::Source, 1),
-            last_generation: 2,
-            row: Row::Suspended,
-            source_is_candidate: true,
-            expect: Expect::Adopted,
-        },
-        Case {
-            label: "live record at the receipt, below an abandoned reservation",
-            record_status: "running",
-            record_generation: 1,
-            route: (RouteOn::Source, 1),
-            last_generation: 2,
-            row: Row::Suspended,
-            source_is_candidate: true,
-            expect: Expect::Adopted,
-        },
-        Case {
-            label: "restoring row whose expired owner's receipt matches the record",
-            record_status: "running",
-            record_generation: 2,
-            route: (RouteOn::Source, 2),
-            last_generation: 2,
-            row: Row::RestoringExpiredLease,
-            source_is_candidate: true,
-            expect: Expect::Adopted,
-        },
-        Case {
-            label: "restoring row whose expired owner reserved the record's generation",
-            record_status: "running",
-            record_generation: 2,
-            route: (RouteOn::Source, 1),
-            last_generation: 2,
-            row: Row::RestoringExpiredLease,
-            source_is_candidate: true,
-            expect: Expect::RestoredElsewhereKeepingSource,
-        },
-        Case {
-            label: "restoring row whose expired owner reserved past the record",
-            record_status: "running",
-            record_generation: 2,
-            route: (RouteOn::Source, 2),
-            last_generation: 3,
-            row: Row::RestoringExpiredLease,
-            source_is_candidate: true,
-            expect: Expect::RestoredElsewhereKeepingSource,
-        },
-        Case {
-            label: "route identity on the other worker",
-            record_status: "running",
-            record_generation: 2,
-            route: (RouteOn::Other, 1),
-            last_generation: 2,
-            row: Row::Suspended,
-            source_is_candidate: true,
-            expect: Expect::RestoredElsewhereKeepingSource,
-        },
-        Case {
-            label: "live record older than the receipt",
-            record_status: "running",
-            record_generation: 1,
-            route: (RouteOn::Source, 2),
-            last_generation: 2,
-            row: Row::Suspended,
-            source_is_candidate: true,
-            expect: Expect::RestoredElsewhereKeepingSource,
-        },
-        Case {
-            label: "live record ahead of the last reserved generation",
-            record_status: "running",
-            record_generation: 3,
-            route: (RouteOn::Source, 2),
-            last_generation: 2,
-            row: Row::Suspended,
-            source_is_candidate: true,
-            expect: Expect::RestoredElsewhereKeepingSource,
-        },
-        Case {
-            label: "record whose lifecycle the API cannot decode",
-            record_status: "migrating",
-            record_generation: 1,
-            route: (RouteOn::Source, 1),
-            last_generation: 1,
-            row: Row::Suspended,
-            source_is_candidate: true,
-            expect: Expect::RestoredElsewhereKeepingSource,
-        },
-        Case {
-            label: "live record under another wake's restore lease",
-            record_status: "running",
-            record_generation: 1,
-            route: (RouteOn::Source, 1),
-            last_generation: 1,
-            row: Row::RestoreLeaseHeld,
-            source_is_candidate: true,
-            expect: Expect::RestoreInFlight,
-        },
-        Case {
-            label: "live record, row now deleting",
-            record_status: "running",
-            record_generation: 1,
-            route: (RouteOn::Source, 1),
-            last_generation: 1,
-            row: Row::MovedTo("deleting"),
-            source_is_candidate: true,
-            expect: Expect::Untouched,
-        },
-        Case {
-            label: "live record, row now quarantined",
-            record_status: "running",
-            record_generation: 1,
-            route: (RouteOn::Source, 1),
-            last_generation: 1,
-            row: Row::MovedTo("quarantined"),
-            source_is_candidate: true,
-            expect: Expect::Untouched,
-        },
-        Case {
-            label: "suspended record on a node that is not a candidate",
-            record_status: "suspended",
-            record_generation: 1,
-            route: (RouteOn::Source, 1),
-            last_generation: 1,
-            row: Row::Suspended,
-            source_is_candidate: false,
-            expect: Expect::RestoredElsewhereDeletingSource,
-        },
-    ] {
-        let label = case.label;
-        let sandbox_id = SandboxId::new();
-        seed_idle_suspended_sandbox(&fixture.pool, &source, sandbox_id, source_id, None).await?;
+    let label = case.label;
+    let sandbox_id = SandboxId::new();
+    seed_idle_suspended_sandbox(&fixture.pool, &source, sandbox_id, source_id, None).await?;
+    sqlx::query(sql!(
+        "INSERT INTO snapshot_storage_locations
+             (snapshot_id, storage_connection_string, org_id)
+         SELECT id, 's3://bucket/snapshots/sandbox', org_id
+           FROM snapshots
+          WHERE sandbox_id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(&fixture.pool)
+    .await?;
+    let (route_on, route_generation) = case.route;
+    let route_node = match route_on {
+        RouteOn::Source => source_id,
+        RouteOn::Other => other_id,
+    };
+    set_route_and_provenance(
+        &fixture.pool,
+        sandbox_id,
+        route_node,
+        route_generation,
+        case.last_generation,
+    )
+    .await?;
+    source
+        .set_route_identity_provenance(
+            &sandbox_id.to_string(),
+            Some(u64::try_from(case.record_generation)?),
+            Some(case.record_generation),
+            None,
+        )
+        .await?;
+    if case.record_status != "suspended" {
+        source
+            .set_status(&sandbox_id.to_string(), case.record_status)
+            .await?;
+    }
+    if !case.source_is_candidate {
         sqlx::query(sql!(
-            "INSERT INTO snapshot_storage_locations
-                 (snapshot_id, storage_connection_string, org_id)
-             SELECT id, 's3://bucket/snapshots/sandbox', org_id
-               FROM snapshots
-              WHERE sandbox_id = $1"
+            "DELETE FROM sandbox_observed_states WHERE sandbox_id = $1"
         ))
         .bind(sandbox_id)
         .execute(&fixture.pool)
         .await?;
-        let (route_on, route_generation) = case.route;
-        let route_node = match route_on {
-            RouteOn::Source => source_id,
-            RouteOn::Other => other_id,
-        };
-        set_route_and_provenance(
-            &fixture.pool,
-            sandbox_id,
-            route_node,
-            route_generation,
-            case.last_generation,
-        )
-        .await?;
-        source
-            .set_route_identity_provenance(
-                &sandbox_id.to_string(),
-                Some(u64::try_from(case.record_generation)?),
-                Some(case.record_generation),
-                None,
-            )
-            .await?;
-        if case.record_status != "suspended" {
-            source
-                .set_status(&sandbox_id.to_string(), case.record_status)
-                .await?;
-        }
-        if !case.source_is_candidate {
-            sqlx::query(sql!(
-                "DELETE FROM sandbox_observed_states WHERE sandbox_id = $1"
-            ))
-            .bind(sandbox_id)
-            .execute(&fixture.pool)
-            .await?;
-        }
-        let lease_token = Uuid::now_v7();
-        let lease_expires = match case.row {
-            Row::RestoreLeaseHeld => Some("1 hour"),
-            Row::RestoringExpiredLease => Some("-1 minute"),
-            Row::Suspended | Row::MovedTo(_) => None,
-        };
-        if let Some(lease_expires) = lease_expires {
-            sqlx::query(sql!(
-                "UPDATE sandboxes
-                    SET lifecycle = 'restoring',
-                        restore_lease_expires_at = NOW() + $3::interval,
-                        restore_lease_token = $2
-                  WHERE id = $1"
-            ))
-            .bind(sandbox_id.as_uuid())
-            .bind(lease_token)
-            .bind(lease_expires)
-            .execute(&fixture.pool)
-            .await?;
-        }
-        let sandbox = crate::controllers::sandbox::fetch_sandbox(&fixture.pool, sandbox_id)
-            .await?
-            .expect("sandbox row");
-        // The wake carries the lifecycle it read; the row moves on after.
-        if let Row::MovedTo(lifecycle) = case.row {
-            sqlx::query(sql!("UPDATE sandboxes SET lifecycle = $2 WHERE id = $1"))
-                .bind(sandbox_id.as_uuid())
-                .bind(lifecycle)
-                .execute(&fixture.pool)
-                .await?;
-        }
-
-        let result = Box::pin(fixture.substrate.wake_execution(
-            pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native("wake"),
-            &sandbox,
-            Duration::from_secs(5),
-            None,
-            crate::controllers::substrate::RecoveryCharge::Exempt,
-        ))
-        .await;
-
-        let source_status = source
-            .get(&sandbox_id.to_string())
-            .await
-            .ok()
-            .map(|record| record.status);
-        let other_status = other
-            .get(&sandbox_id.to_string())
-            .await
-            .ok()
-            .map(|record| record.status);
-        let placed = placement(&fixture.pool, sandbox_id).await?;
-        let route = sqlx::query_as::<_, (NodeId, i64, i64)>(sql!(
-            "SELECT route.current_node_id, route.execution_generation,
-                    provenance.last_execution_generation
-               FROM sandbox_direct_route_identities route
-               JOIN sandbox_direct_route_provenance provenance
-                 ON provenance.sandbox_id = route.sandbox_id
-              WHERE route.sandbox_id = $1"
+    }
+    let lease_token = Uuid::now_v7();
+    let lease_expires = match case.row {
+        Row::RestoreLeaseHeld => Some("1 hour"),
+        Row::RestoringExpiredLease => Some("-1 minute"),
+        Row::Suspended | Row::MovedTo(_) => None,
+    };
+    if let Some(lease_expires) = lease_expires {
+        sqlx::query(sql!(
+            "UPDATE sandboxes
+                SET lifecycle = 'restoring',
+                    restore_lease_expires_at = NOW() + $3::interval,
+                    restore_lease_token = $2
+              WHERE id = $1"
         ))
         .bind(sandbox_id.as_uuid())
-        .fetch_one(&fixture.pool)
+        .bind(lease_token)
+        .bind(lease_expires)
+        .execute(&fixture.pool)
         .await?;
-        let restored_elsewhere = Placement {
-            lifecycle: "started".to_owned(),
-            placement: "on_node".to_owned(),
-            active_node_id: Some(other_id),
-            restore_lease_token: None,
-        };
-        match case.expect {
-            Expect::Adopted => {
-                let activation = result.unwrap_or_else(|error| panic!("{label}: {error:?}"));
-                assert_eq!(
-                    activation.binding.runtime_endpoint.uri().port_u16(),
-                    Some(source_server.port()),
-                    "{label}: the wake must reach the record's worker"
-                );
-                assert_eq!(
-                    i64::try_from(activation.binding.execution_generation)?,
-                    case.record_generation,
-                    "{label}"
-                );
-                assert_eq!(
-                    placed,
-                    Placement {
-                        lifecycle: "started".to_owned(),
-                        placement: "on_node".to_owned(),
-                        active_node_id: Some(source_id),
-                        restore_lease_token: None,
-                    },
-                    "{label}"
-                );
-                assert_eq!(
-                    route,
-                    (source_id, case.record_generation, case.last_generation),
-                    "{label}: the Wake's receipt catches the route identity up to \
-                     the record, and an adoption reserves no generation"
-                );
-                assert_eq!(source_status.as_deref(), Some("running"), "{label}");
-                assert_eq!(other_status, None, "{label}: restored elsewhere");
-            }
-            Expect::RestoredElsewhereKeepingSource => {
-                result.unwrap_or_else(|error| panic!("{label}: {error:?}"));
-                assert_eq!(placed, restored_elsewhere, "{label}");
-                assert_eq!(other_status.as_deref(), Some("running"), "{label}");
-                assert_eq!(
-                    source_status.as_deref(),
-                    Some(case.record_status),
-                    "{label}: a copy the cleanup cannot read as dormant must not be deleted"
-                );
-            }
-            Expect::RestoreInFlight => {
-                let error = match result {
-                    Ok(_) => panic!("{label}: the lease owner's restore must not be joined"),
-                    Err(error) => error,
-                };
-                assert!(
-                    matches!(error, SubstrateError::RestoreInFlight { .. }),
-                    "{label}: {error:?}"
-                );
-                assert_eq!(
-                    placed,
-                    Placement {
-                        lifecycle: "restoring".to_owned(),
-                        placement: "unplaced".to_owned(),
-                        active_node_id: None,
-                        restore_lease_token: Some(lease_token),
-                    },
-                    "{label}"
-                );
-                assert_eq!(other_status, None, "{label}");
-            }
-            Expect::Untouched => {
-                assert!(result.is_err(), "{label}: the wake must not succeed");
-                let Row::MovedTo(lifecycle) = case.row else {
-                    unreachable!("{label}")
-                };
-                assert_eq!(
-                    placed,
-                    Placement {
-                        lifecycle: lifecycle.to_owned(),
-                        placement: "unplaced".to_owned(),
-                        active_node_id: None,
-                        restore_lease_token: None,
-                    },
-                    "{label}"
-                );
-                assert_eq!(source_status.as_deref(), Some("running"), "{label}");
-                assert_eq!(other_status, None, "{label}");
-            }
-            Expect::RestoredElsewhereDeletingSource => {
-                result.unwrap_or_else(|error| panic!("{label}: {error:?}"));
-                assert_eq!(placed, restored_elsewhere, "{label}");
-                assert_eq!(other_status.as_deref(), Some("running"), "{label}");
-                assert_eq!(
-                    source_status, None,
-                    "{label}: the source copy must be cleaned up"
-                );
-            }
+    }
+    let sandbox = crate::controllers::sandbox::fetch_sandbox(&fixture.pool, sandbox_id)
+        .await?
+        .expect("sandbox row");
+    // The wake carries the lifecycle it read; the row moves on after.
+    if let Row::MovedTo(lifecycle) = case.row {
+        sqlx::query(sql!("UPDATE sandboxes SET lifecycle = $2 WHERE id = $1"))
+            .bind(sandbox_id.as_uuid())
+            .bind(lifecycle)
+            .execute(&fixture.pool)
+            .await?;
+    }
+
+    let result = Box::pin(fixture.substrate.wake_execution(
+        pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native("wake"),
+        &sandbox,
+        Duration::from_secs(5),
+        None,
+        crate::controllers::substrate::RecoveryCharge::Exempt,
+    ))
+    .await;
+
+    let source_status = source
+        .get(&sandbox_id.to_string())
+        .await
+        .ok()
+        .map(|record| record.status);
+    let other_status = other
+        .get(&sandbox_id.to_string())
+        .await
+        .ok()
+        .map(|record| record.status);
+    let placed = placement(&fixture.pool, sandbox_id).await?;
+    let route = sqlx::query_as::<_, (NodeId, i64, i64)>(sql!(
+        "SELECT route.current_node_id, route.execution_generation,
+                provenance.last_execution_generation
+           FROM sandbox_direct_route_identities route
+           JOIN sandbox_direct_route_provenance provenance
+             ON provenance.sandbox_id = route.sandbox_id
+          WHERE route.sandbox_id = $1"
+    ))
+    .bind(sandbox_id.as_uuid())
+    .fetch_one(&fixture.pool)
+    .await?;
+    let restored_elsewhere = Placement {
+        lifecycle: "started".to_owned(),
+        placement: "on_node".to_owned(),
+        active_node_id: Some(other_id),
+        restore_lease_token: None,
+    };
+    match case.expect {
+        Expect::Adopted => {
+            let activation = result.unwrap_or_else(|error| panic!("{label}: {error:?}"));
+            assert_eq!(
+                activation.binding.runtime_endpoint.uri().port_u16(),
+                Some(source_server.port()),
+                "{label}: the wake must reach the record's worker"
+            );
+            assert_eq!(
+                i64::try_from(activation.binding.execution_generation)?,
+                case.record_generation,
+                "{label}"
+            );
+            assert_eq!(
+                placed,
+                Placement {
+                    lifecycle: "started".to_owned(),
+                    placement: "on_node".to_owned(),
+                    active_node_id: Some(source_id),
+                    restore_lease_token: None,
+                },
+                "{label}"
+            );
+            assert_eq!(
+                route,
+                (source_id, case.record_generation, case.last_generation),
+                "{label}: the Wake's receipt catches the route identity up to \
+                 the record, and an adoption reserves no generation"
+            );
+            assert_eq!(source_status.as_deref(), Some("running"), "{label}");
+            assert_eq!(other_status, None, "{label}: restored elsewhere");
+        }
+        Expect::RestoredElsewhereKeepingSource => {
+            result.unwrap_or_else(|error| panic!("{label}: {error:?}"));
+            assert_eq!(placed, restored_elsewhere, "{label}");
+            assert_eq!(other_status.as_deref(), Some("running"), "{label}");
+            assert_eq!(
+                source_status.as_deref(),
+                Some(case.record_status),
+                "{label}: a copy the cleanup cannot read as dormant must not be deleted"
+            );
+        }
+        Expect::RestoreInFlight => {
+            let error = match result {
+                Ok(_) => panic!("{label}: the lease owner's restore must not be joined"),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(error, SubstrateError::RestoreInFlight { .. }),
+                "{label}: {error:?}"
+            );
+            assert_eq!(
+                placed,
+                Placement {
+                    lifecycle: "restoring".to_owned(),
+                    placement: "unplaced".to_owned(),
+                    active_node_id: None,
+                    restore_lease_token: Some(lease_token),
+                },
+                "{label}"
+            );
+            assert_eq!(other_status, None, "{label}");
+        }
+        Expect::Untouched => {
+            assert!(result.is_err(), "{label}: the wake must not succeed");
+            let Row::MovedTo(lifecycle) = case.row else {
+                unreachable!("{label}")
+            };
+            assert_eq!(
+                placed,
+                Placement {
+                    lifecycle: lifecycle.to_owned(),
+                    placement: "unplaced".to_owned(),
+                    active_node_id: None,
+                    restore_lease_token: None,
+                },
+                "{label}"
+            );
+            assert_eq!(source_status.as_deref(), Some("running"), "{label}");
+            assert_eq!(other_status, None, "{label}");
+        }
+        Expect::RestoredElsewhereDeletingSource => {
+            result.unwrap_or_else(|error| panic!("{label}: {error:?}"));
+            assert_eq!(placed, restored_elsewhere, "{label}");
+            assert_eq!(other_status.as_deref(), Some("running"), "{label}");
+            assert_eq!(
+                source_status, None,
+                "{label}: the source copy must be cleaned up"
+            );
         }
     }
     drop(source_server);

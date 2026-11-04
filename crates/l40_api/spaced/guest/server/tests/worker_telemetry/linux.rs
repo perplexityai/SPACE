@@ -29,10 +29,10 @@ use tokio_util::sync::CancellationToken;
 const FIXTURE_CLUSTER_ID: &str = "worker-fixture-cluster";
 /// Export cadence asked of the worker, well under the production default so
 /// the negative modes can be judged over several intervals rather than one.
-const EXPORT_INTERVAL: Duration = Duration::from_millis(250);
-/// How long a mode that must not export is watched. Twelve export intervals:
+const EXPORT_INTERVAL: Duration = Duration::from_millis(100);
+/// How long a mode that must not export is watched. Ten export intervals:
 /// a worker that exports at all has had many chances to.
-const SILENCE_WINDOW: Duration = Duration::from_secs(3);
+const SILENCE_WINDOW: Duration = Duration::from_secs(1);
 
 pub(super) fn main() {
     if filesystem_worker_requested() {

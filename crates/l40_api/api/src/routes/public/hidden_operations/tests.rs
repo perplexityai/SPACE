@@ -440,143 +440,139 @@ type GateFor = Box<dyn Fn(OrgId) -> HiddenOperationsGate>;
 type FlagsFor = Box<dyn Fn(OrgId) -> FeatureFlagClient>;
 type Enabled = fn(Caller, NativeOperation) -> bool;
 
+#[rstest::rstest]
+#[case::nothing_enabled(
+    "nothing enabled",
+    Box::new(|_| HiddenOperationsGate::default()),
+    Box::new(|_| FeatureFlagClient::disabled()),
+    |_, _| false
+)]
+#[case::an_unrelated_org_listed(
+    "an unrelated org listed",
+    Box::new(|_| listing(EnabledOrgs::Listed(BTreeSet::from([OrgId::from_uuid(Uuid::from_u128(2))])))),
+    Box::new(|_| FeatureFlagClient::disabled()),
+    |_, _| false
+)]
+// The key's own org owns only the key's local data, not its end users'.
+#[case::the_integration_keys_org_listed(
+    "the integration key's org listed",
+    Box::new(|_| listing(EnabledOrgs::Listed(BTreeSet::from([OrgId::from_uuid(SEED_ORG_ID)])))),
+    Box::new(|_| FeatureFlagClient::disabled()),
+    |caller, _| caller == Caller::Local
+)]
+#[case::the_federated_owners_org_listed(
+    "the federated owner's org listed",
+    Box::new(|federated: OrgId| listing(EnabledOrgs::Listed(BTreeSet::from([federated])))),
+    Box::new(|_| FeatureFlagClient::disabled()),
+    |caller, _| caller == Caller::Federated
+)]
+#[case::every_org(
+    "every org",
+    Box::new(|_| listing(EnabledOrgs::All)),
+    Box::new(|_| FeatureFlagClient::disabled()),
+    |_, _| true
+)]
+#[case::the_flag_on_for_everyone(
+    "the flag on for everyone",
+    Box::new(|_| HiddenOperationsGate::default()),
+    Box::new(|_| {
+        FeatureFlagClient::fixed_bools([(SPACE_NATIVE_HIDDEN_OPERATIONS_FLAG.key(), true)])
+    }),
+    |_, _| true
+)]
+#[case::the_flag_targeting_the_federated_orgs_snapshot_list(
+    "the flag targeting the federated org's snapshot list",
+    Box::new(|_| HiddenOperationsGate::default()),
+    Box::new(|federated: OrgId| {
+        FeatureFlagClient::from_provider(Targeted {
+            subject: federated.to_string(),
+            operation_id: native::LIST_SNAPSHOTS.operation_id(),
+        })
+    }),
+    |caller, operation| caller == Caller::Federated && operation == native::LIST_SNAPSHOTS
+)]
 #[tokio::test]
-async fn hidden_operations_answer_as_nonexistent_unless_the_effective_org_is_enabled()
--> TestDbResult<()> {
-    let local_org = OrgId::from_uuid(SEED_ORG_ID);
-    let unrelated = OrgId::from_uuid(Uuid::from_u128(2));
-    let cases: [(&str, GateFor, FlagsFor, Enabled); 7] = [
-        (
-            "nothing enabled",
-            Box::new(|_| HiddenOperationsGate::default()),
-            Box::new(|_| FeatureFlagClient::disabled()),
-            |_, _| false,
+async fn hidden_operations_answer_as_nonexistent_unless_the_effective_org_is_enabled(
+    #[case] case: &str,
+    #[case] gate: GateFor,
+    #[case] flags: FlagsFor,
+    #[case] enabled: Enabled,
+    #[values(Caller::Local, Caller::Federated)] caller: Caller,
+) -> TestDbResult<()> {
+    let fixture = Fixture::new(gate, flags).await?;
+    let (headers, own, foreign) = match caller {
+        Caller::Local => (
+            HeaderMap::new(),
+            &fixture.local_sandbox,
+            &fixture.federated_sandbox,
         ),
-        (
-            "an unrelated org listed",
-            Box::new(move |_| listing(EnabledOrgs::Listed(BTreeSet::from([unrelated])))),
-            Box::new(|_| FeatureFlagClient::disabled()),
-            |_, _| false,
+        Caller::Federated => (
+            owner_headers(),
+            &fixture.federated_sandbox,
+            &fixture.local_sandbox,
         ),
-        // The key's own org owns only the key's local data, not its end users'.
-        (
-            "the integration key's org listed",
-            Box::new(move |_| listing(EnabledOrgs::Listed(BTreeSet::from([local_org])))),
-            Box::new(|_| FeatureFlagClient::disabled()),
-            |caller, _| caller == Caller::Local,
-        ),
-        (
-            "the federated owner's org listed",
-            Box::new(|federated| listing(EnabledOrgs::Listed(BTreeSet::from([federated])))),
-            Box::new(|_| FeatureFlagClient::disabled()),
-            |caller, _| caller == Caller::Federated,
-        ),
-        (
-            "every org",
-            Box::new(|_| listing(EnabledOrgs::All)),
-            Box::new(|_| FeatureFlagClient::disabled()),
-            |_, _| true,
-        ),
-        (
-            "the flag on for everyone",
-            Box::new(|_| HiddenOperationsGate::default()),
-            Box::new(|_| {
-                FeatureFlagClient::fixed_bools([(SPACE_NATIVE_HIDDEN_OPERATIONS_FLAG.key(), true)])
-            }),
-            |_, _| true,
-        ),
-        (
-            "the flag targeting the federated org's snapshot list",
-            Box::new(|_| HiddenOperationsGate::default()),
-            Box::new(|federated| {
-                FeatureFlagClient::from_provider(Targeted {
-                    subject: federated.to_string(),
-                    operation_id: native::LIST_SNAPSHOTS.operation_id(),
-                })
-            }),
-            |caller, operation| caller == Caller::Federated && operation == native::LIST_SNAPSHOTS,
-        ),
-    ];
-    for (case, gate, flags, enabled) in cases {
-        let fixture = Fixture::new(gate, flags).await?;
-        for (caller, headers, own, foreign) in [
-            (
-                Caller::Local,
-                HeaderMap::new(),
-                &fixture.local_sandbox,
-                &fixture.federated_sandbox,
-            ),
-            (
-                Caller::Federated,
-                owner_headers(),
-                &fixture.federated_sandbox,
-                &fixture.local_sandbox,
-            ),
+    };
+    let app = &fixture.app;
+    let ids = [own.as_str(), "not-a-sandbox-id", foreign.as_str()];
+    for root in ROOTS {
+        let case = format!("{case}: {caller:?} under {root}");
+
+        // A route only a hidden operation owns answers, for every
+        // method and every id, as a route that does not exist,
+        // headers included: no `Allow` naming the hidden method.
+        let visible = enabled(caller, native::LIST_SNAPSHOTS);
+        for (method, id, visible_status) in [
+            (Method::GET, ids[0], StatusCode::OK),
+            (Method::GET, ids[1], StatusCode::BAD_REQUEST),
+            (Method::GET, ids[2], StatusCode::NOT_FOUND),
+            (Method::HEAD, ids[0], StatusCode::OK),
+            (Method::OPTIONS, ids[0], StatusCode::METHOD_NOT_ALLOWED),
+            (Method::POST, ids[0], StatusCode::METHOD_NOT_ALLOWED),
         ] {
-            let app = &fixture.app;
-            let ids = [own.as_str(), "not-a-sandbox-id", foreign.as_str()];
-            for root in ROOTS {
-                let case = format!("{case}: {caller:?} under {root}");
-
-                // A route only a hidden operation owns answers, for every
-                // method and every id, as a route that does not exist,
-                // headers included: no `Allow` naming the hidden method.
-                let visible = enabled(caller, native::LIST_SNAPSHOTS);
-                for (method, id, visible_status) in [
-                    (Method::GET, ids[0], StatusCode::OK),
-                    (Method::GET, ids[1], StatusCode::BAD_REQUEST),
-                    (Method::GET, ids[2], StatusCode::NOT_FOUND),
-                    (Method::HEAD, ids[0], StatusCode::OK),
-                    (Method::OPTIONS, ids[0], StatusCode::METHOD_NOT_ALLOWED),
-                    (Method::POST, ids[0], StatusCode::METHOD_NOT_ALLOWED),
-                ] {
-                    let path = format!("{root}/sandboxes/{id}/snapshots");
-                    let answer = send(app, method.clone(), &path, &headers, Value::Null).await?;
-                    if visible {
-                        assert_eq!(
-                            answer.0, visible_status,
-                            "{case}: {method} {path}: {answer:?}"
-                        );
-                    } else {
-                        let unmounted = format!("{root}/sandboxes/{id}/no-such-route");
-                        let absent =
-                            send(app, method.clone(), &unmounted, &headers, Value::Null).await?;
-                        assert_eq!(absent.0, StatusCode::NOT_FOUND, "{case}: {absent:?}");
-                        assert_eq!(answer, absent, "{case}: {method} {path}");
-                    }
-                }
-
-                // A hidden action answers, for every id, as an unknown one.
-                let visible = enabled(caller, native::ROLLBACK_SANDBOX);
-                for id in ids {
-                    let path = format!("{root}/sandboxes/{id}:rollback");
-                    let body = json!({"snapshot_name": "s"});
-                    let answer = send(app, Method::POST, &path, &headers, body.clone()).await?;
-                    if visible && id == own.as_str() {
-                        assert_eq!(answer.0, StatusCode::ACCEPTED, "{case}: {path}: {answer:?}");
-                    } else {
-                        let unknown = format!("{root}/sandboxes/{id}:no_such_action");
-                        let absent = send(app, Method::POST, &unknown, &headers, body).await?;
-                        assert_ne!(absent.0, StatusCode::ACCEPTED, "{case}: {absent:?}");
-                        assert_eq!(answer, absent, "{case}: {path}");
-                    }
-                }
-            }
-
-            // Visible incubating actions on the same mount are served
-            // regardless: `:resume` and `:restore` reach transitions `:wake`
-            // already offers, and `:disable_snapshots` is the off switch for
-            // a schedule enabled before the gate.
-            for action in ["stop", "resume", "restore", "disable_snapshots"] {
-                let path = format!("/v1/sandboxes/{own}:{action}");
-                let answer = send(app, Method::POST, &path, &headers, Value::Null).await?;
+            let path = format!("{root}/sandboxes/{id}/snapshots");
+            let answer = send(app, method.clone(), &path, &headers, Value::Null).await?;
+            if visible {
                 assert_eq!(
-                    answer.0,
-                    StatusCode::ACCEPTED,
-                    "{case}: {caller:?}: {path}: {answer:?}"
+                    answer.0, visible_status,
+                    "{case}: {method} {path}: {answer:?}"
                 );
+            } else {
+                let unmounted = format!("{root}/sandboxes/{id}/no-such-route");
+                let absent = send(app, method.clone(), &unmounted, &headers, Value::Null).await?;
+                assert_eq!(absent.0, StatusCode::NOT_FOUND, "{case}: {absent:?}");
+                assert_eq!(answer, absent, "{case}: {method} {path}");
             }
         }
+
+        // A hidden action answers, for every id, as an unknown one.
+        let visible = enabled(caller, native::ROLLBACK_SANDBOX);
+        for id in ids {
+            let path = format!("{root}/sandboxes/{id}:rollback");
+            let body = json!({"snapshot_name": "s"});
+            let answer = send(app, Method::POST, &path, &headers, body.clone()).await?;
+            if visible && id == own.as_str() {
+                assert_eq!(answer.0, StatusCode::ACCEPTED, "{case}: {path}: {answer:?}");
+            } else {
+                let unknown = format!("{root}/sandboxes/{id}:no_such_action");
+                let absent = send(app, Method::POST, &unknown, &headers, body).await?;
+                assert_ne!(absent.0, StatusCode::ACCEPTED, "{case}: {absent:?}");
+                assert_eq!(answer, absent, "{case}: {path}");
+            }
+        }
+    }
+
+    // Visible incubating actions on the same mount are served
+    // regardless: `:resume` and `:restore` reach transitions `:wake`
+    // already offers, and `:disable_snapshots` is the off switch for
+    // a schedule enabled before the gate.
+    for action in ["stop", "resume", "restore", "disable_snapshots"] {
+        let path = format!("/v1/sandboxes/{own}:{action}");
+        let answer = send(app, Method::POST, &path, &headers, Value::Null).await?;
+        assert_eq!(
+            answer.0,
+            StatusCode::ACCEPTED,
+            "{case}: {caller:?}: {path}: {answer:?}"
+        );
     }
     Ok(())
 }

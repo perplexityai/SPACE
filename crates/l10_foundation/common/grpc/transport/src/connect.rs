@@ -112,36 +112,61 @@ const ATTEMPT_CAP_MARGIN: std::time::Duration = std::time::Duration::from_millis
 /// is conservatively not replay-safe.
 const WHOLE_CONNECT_BACKSTOP_MARGIN: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// How long SPACE's TCP connector gives name resolution and the TCP dial
-/// together before failing them with a [`ConnectPhaseError`].
-fn connect_phase_bound(dial_timeout: std::time::Duration) -> std::time::Duration {
-    NAME_RESOLUTION_ALLOWANCE + dial_timeout
+/// The allowances SPACE's TCP connect bounds add to an endpoint's own dial
+/// and TLS handshake bounds. Production connects always use
+/// [`Self::DEFAULT`]; the attempt-cap margin must stay below
+/// [`WHOLE_CONNECT_BACKSTOP_MARGIN`] so the backstop never fires first.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ConnectAllowances {
+    /// See [`NAME_RESOLUTION_ALLOWANCE`].
+    pub(crate) name_resolution: std::time::Duration,
+    /// See [`ATTEMPT_CAP_MARGIN`].
+    pub(crate) attempt_cap_margin: std::time::Duration,
 }
 
-/// How long one TCP connect attempt may run: the [`connect_phase_bound`],
-/// then the TLS handshake, if any, within its own bound, then
-/// [`ATTEMPT_CAP_MARGIN`]. A connect phase or handshake that reaches its
-/// bound therefore fails with that cause before the attempt is abandoned.
-/// The HTTP/2 preface only writes to a fresh socket and shares the margin.
-fn tcp_attempt_cap(
-    dial_timeout: std::time::Duration,
-    tls_handshake_timeout: Option<std::time::Duration>,
-) -> std::time::Duration {
-    connect_phase_bound(dial_timeout)
-        + tls_handshake_timeout.unwrap_or_default()
-        + ATTEMPT_CAP_MARGIN
-}
+impl ConnectAllowances {
+    pub(crate) const DEFAULT: Self = Self {
+        name_resolution: NAME_RESOLUTION_ALLOWANCE,
+        attempt_cap_margin: ATTEMPT_CAP_MARGIN,
+    };
 
-/// Tonic's whole-connect bound for SPACE's TCP connector: the connect phase,
-/// the TLS handshake and [`WHOLE_CONNECT_BACKSTOP_MARGIN`], which outlasts
-/// the attempt cap's margin.
-fn whole_connect_backstop(
-    dial_timeout: std::time::Duration,
-    tls_handshake_timeout: Option<std::time::Duration>,
-) -> std::time::Duration {
-    connect_phase_bound(dial_timeout)
-        + tls_handshake_timeout.unwrap_or_default()
-        + WHOLE_CONNECT_BACKSTOP_MARGIN
+    /// How long SPACE's TCP connector gives name resolution and the TCP dial
+    /// together before failing them with a [`ConnectPhaseError`].
+    pub(crate) fn connect_phase_bound(
+        self,
+        dial_timeout: std::time::Duration,
+    ) -> std::time::Duration {
+        self.name_resolution + dial_timeout
+    }
+
+    /// How long one TCP connect attempt may run: the
+    /// [`Self::connect_phase_bound`], then the TLS handshake, if any, within
+    /// its own bound, then the attempt-cap margin. A connect phase or
+    /// handshake that reaches its bound therefore fails with that cause
+    /// before the attempt is abandoned. The HTTP/2 preface only writes to a
+    /// fresh socket and shares the margin.
+    pub(crate) fn attempt_cap(
+        self,
+        dial_timeout: std::time::Duration,
+        tls_handshake_timeout: Option<std::time::Duration>,
+    ) -> std::time::Duration {
+        self.connect_phase_bound(dial_timeout)
+            + tls_handshake_timeout.unwrap_or_default()
+            + self.attempt_cap_margin
+    }
+
+    /// Tonic's whole-connect bound for SPACE's TCP connector: the connect
+    /// phase, the TLS handshake and [`WHOLE_CONNECT_BACKSTOP_MARGIN`], which
+    /// outlasts the attempt cap's margin.
+    fn whole_connect_backstop(
+        self,
+        dial_timeout: std::time::Duration,
+        tls_handshake_timeout: Option<std::time::Duration>,
+    ) -> std::time::Duration {
+        self.connect_phase_bound(dial_timeout)
+            + tls_handshake_timeout.unwrap_or_default()
+            + WHOLE_CONNECT_BACKSTOP_MARGIN
+    }
 }
 
 /// The URI tonic reports for a Unix-socket endpoint. Tonic has no accessor
@@ -403,12 +428,35 @@ pub async fn connect_tcp_channel_with_retry_observed(
     retry_policy: GrpcRetryPolicy,
     on_retry: impl FnMut(&TcpConnectRetry<'_>),
 ) -> Result<tonic::transport::Channel, TcpConnectError> {
+    retry_tcp_channel(
+        service_name,
+        target,
+        endpoint,
+        tls_handshake_timeout,
+        retry_policy,
+        ConnectAllowances::DEFAULT,
+        on_retry,
+    )
+    .await
+}
+
+/// [`connect_tcp_channel_with_retry_observed`] with its bounds sized from
+/// `allowances`.
+pub(crate) async fn retry_tcp_channel(
+    service_name: &'static str,
+    target: impl AsRef<str>,
+    endpoint: tonic::transport::Endpoint,
+    tls_handshake_timeout: Option<std::time::Duration>,
+    retry_policy: GrpcRetryPolicy,
+    allowances: ConnectAllowances,
+    on_retry: impl FnMut(&TcpConnectRetry<'_>),
+) -> Result<tonic::transport::Channel, TcpConnectError> {
     check_tcp_endpoint(&endpoint, tls_handshake_timeout)?;
     let dial_timeout = endpoint
         .get_connect_timeout()
         .unwrap_or(DEFAULT_TCP_DIAL_TIMEOUT);
     let endpoint = endpoint.connect_timeout(dial_timeout);
-    let attempt_cap = tcp_attempt_cap(dial_timeout, tls_handshake_timeout);
+    let attempt_cap = allowances.attempt_cap(dial_timeout, tls_handshake_timeout);
     retry_tcp_connect_observed(
         service_name,
         target.as_ref(),
@@ -417,7 +465,7 @@ pub async fn connect_tcp_channel_with_retry_observed(
         || {
             let endpoint = endpoint.clone();
             async move {
-                dial_tcp_channel(endpoint, tls_handshake_timeout)
+                dial_tcp_channel(endpoint, tls_handshake_timeout, allowances)
                     .await
                     .map_err(TcpConnectError::from)
             }
@@ -446,12 +494,33 @@ pub async fn connect_tcp_channel_with_retry_watched(
     tls_handshake_timeout: Option<std::time::Duration>,
     retry_policy: GrpcRetryPolicy,
 ) -> Result<(tonic::transport::Channel, ConnectionWatch), TcpConnectError> {
+    retry_watched_tcp_channel(
+        service_name,
+        target,
+        endpoint,
+        tls_handshake_timeout,
+        retry_policy,
+        ConnectAllowances::DEFAULT,
+    )
+    .await
+}
+
+/// [`connect_tcp_channel_with_retry_watched`] with its bounds sized from
+/// `allowances`.
+pub(crate) async fn retry_watched_tcp_channel(
+    service_name: &'static str,
+    target: impl AsRef<str>,
+    endpoint: tonic::transport::Endpoint,
+    tls_handshake_timeout: Option<std::time::Duration>,
+    retry_policy: GrpcRetryPolicy,
+    allowances: ConnectAllowances,
+) -> Result<(tonic::transport::Channel, ConnectionWatch), TcpConnectError> {
     check_tcp_endpoint(&endpoint, tls_handshake_timeout)?;
     let dial_timeout = endpoint
         .get_connect_timeout()
         .unwrap_or(DEFAULT_TCP_DIAL_TIMEOUT);
     let endpoint = endpoint.connect_timeout(dial_timeout);
-    let attempt_cap = tcp_attempt_cap(dial_timeout, tls_handshake_timeout);
+    let attempt_cap = allowances.attempt_cap(dial_timeout, tls_handshake_timeout);
     retry_tcp_connect(
         service_name,
         target.as_ref(),
@@ -463,6 +532,7 @@ pub async fn connect_tcp_channel_with_retry_watched(
                 dial_watched_tcp_channel(
                     endpoint,
                     tls_handshake_timeout,
+                    allowances,
                     hyper_util::client::legacy::connect::HttpConnector::new(),
                 )
                 .await
@@ -624,10 +694,11 @@ pub(crate) async fn connect_retrying_redials(
                 attempt_timeout,
             ),
             attempt_timeout,
+            ConnectAllowances::DEFAULT,
         ),
         service_name,
         retry_policy,
-        attempt_cap: tcp_attempt_cap(attempt_timeout, None),
+        attempt_cap: ConnectAllowances::DEFAULT.attempt_cap(attempt_timeout, None),
     };
     // The connector bounds each attempt; the endpoint's bound is the backstop
     // over the retries and the TLS handshake after them.
@@ -654,7 +725,7 @@ pub fn retrying_redial_bound(
     tls_handshake_timeout: Option<std::time::Duration>,
 ) -> std::time::Duration {
     retry_policy.max_elapsed
-        + tcp_attempt_cap(attempt_timeout, None)
+        + ConnectAllowances::DEFAULT.attempt_cap(attempt_timeout, None)
         + tls_handshake_timeout.unwrap_or_default()
         + WHOLE_CONNECT_BACKSTOP_MARGIN
 }
@@ -735,7 +806,7 @@ pub async fn connect_tcp_channel(
     tls_handshake_timeout: Option<std::time::Duration>,
 ) -> Result<tonic::transport::Channel, TcpChannelError> {
     check_tcp_endpoint(&endpoint, tls_handshake_timeout)?;
-    Ok(dial_tcp_channel(endpoint, tls_handshake_timeout).await?)
+    Ok(dial_tcp_channel(endpoint, tls_handshake_timeout, ConnectAllowances::DEFAULT).await?)
 }
 
 /// [`connect_tcp_channel`] for a channel that dials when an RPC first needs
@@ -749,14 +820,17 @@ pub fn connect_tcp_channel_lazy(
 }
 
 /// [`connect_tcp_channel`] for an endpoint already known to be a TCP endpoint
-/// whose `https` scheme, if any, comes with its handshake bound.
+/// whose `https` scheme, if any, comes with its handshake bound, with its
+/// bounds sized from `allowances`.
 pub(crate) async fn dial_tcp_channel(
     endpoint: tonic::transport::Endpoint,
     tls_handshake_timeout: Option<std::time::Duration>,
+    allowances: ConnectAllowances,
 ) -> Result<tonic::transport::Channel, tonic::transport::Error> {
     let (endpoint, connector) = tcp_connector(
         endpoint,
         tls_handshake_timeout,
+        allowances,
         hyper_util::client::legacy::connect::HttpConnector::new(),
     );
     endpoint.connect_with_connector(connector).await
@@ -767,6 +841,7 @@ pub(crate) async fn dial_tcp_channel(
 async fn dial_watched_tcp_channel<R>(
     endpoint: tonic::transport::Endpoint,
     tls_handshake_timeout: Option<std::time::Duration>,
+    allowances: ConnectAllowances,
     http: hyper_util::client::legacy::connect::HttpConnector<R>,
 ) -> Result<(tonic::transport::Channel, ConnectionWatch), tonic::transport::Error>
 where
@@ -781,7 +856,7 @@ where
         + 'static,
 {
     let watch = ConnectionWatch::default();
-    let (endpoint, connector) = tcp_connector(endpoint, tls_handshake_timeout, http);
+    let (endpoint, connector) = tcp_connector(endpoint, tls_handshake_timeout, allowances, http);
     let channel = endpoint
         .connect_with_connector(WatchedTcpConnector::new(connector, watch.clone()))
         .await?;
@@ -797,6 +872,7 @@ pub(crate) fn lazy_tcp_channel(
     let (endpoint, connector) = tcp_connector(
         endpoint,
         tls_handshake_timeout,
+        ConnectAllowances::DEFAULT,
         hyper_util::client::legacy::connect::HttpConnector::new(),
     );
     endpoint.connect_with_connector_lazy(connector)
@@ -807,6 +883,7 @@ pub(crate) fn lazy_tcp_channel(
 fn tcp_connector<R>(
     endpoint: tonic::transport::Endpoint,
     tls_handshake_timeout: Option<std::time::Duration>,
+    allowances: ConnectAllowances,
     http: hyper_util::client::legacy::connect::HttpConnector<R>,
 ) -> (
     tonic::transport::Endpoint,
@@ -818,9 +895,10 @@ fn tcp_connector<R>(
     let connector = TcpConnector::new(
         endpoint_http_connector(http, &endpoint, dial_timeout),
         dial_timeout,
+        allowances,
     );
-    let endpoint =
-        endpoint.connect_timeout(whole_connect_backstop(dial_timeout, tls_handshake_timeout));
+    let endpoint = endpoint
+        .connect_timeout(allowances.whole_connect_backstop(dial_timeout, tls_handshake_timeout));
     (endpoint, connector)
 }
 
@@ -845,9 +923,9 @@ fn endpoint_http_connector<R>(
 
 /// SPACE's TCP connector: resolves and dials through `inner`, hyper-util's
 /// `HttpConnector` outside tests, bounds the two together at
-/// [`connect_phase_bound`], and marks every error with [`ConnectPhaseError`].
-/// The endpoint's local address is not carried over: see
-/// [`endpoint_http_connector`].
+/// [`ConnectAllowances::connect_phase_bound`], and marks every error with
+/// [`ConnectPhaseError`]. The endpoint's local address is not carried over:
+/// see [`endpoint_http_connector`].
 #[derive(Clone)]
 struct TcpConnector<S = hyper_util::client::legacy::connect::HttpConnector> {
     inner: S,
@@ -855,10 +933,10 @@ struct TcpConnector<S = hyper_util::client::legacy::connect::HttpConnector> {
 }
 
 impl<S> TcpConnector<S> {
-    fn new(inner: S, dial_timeout: std::time::Duration) -> Self {
+    fn new(inner: S, dial_timeout: std::time::Duration, allowances: ConnectAllowances) -> Self {
         Self {
             inner,
-            bound: connect_phase_bound(dial_timeout),
+            bound: allowances.connect_phase_bound(dial_timeout),
         }
     }
 }

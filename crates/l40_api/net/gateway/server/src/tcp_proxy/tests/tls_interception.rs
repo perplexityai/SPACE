@@ -1,4 +1,5 @@
 use super::*;
+use crate::tls_sni::test_fixtures::client_hello;
 use futures_util::FutureExt as _;
 use tokio::io::AsyncWriteExt as _;
 use tracing_subscriber::Layer as _;
@@ -9,142 +10,160 @@ enum SigningResult {
     Pending,
 }
 
+#[rstest::rstest]
+#[case::signing_error(
+    "signing error",
+    true,
+    client_hello(Some("good.com")),
+    SigningResult::Unavailable,
+    1
+)]
+#[case::signing_timeout(
+    "signing timeout",
+    true,
+    client_hello(Some("good.com")),
+    SigningResult::Pending,
+    1
+)]
+#[case::policy_denial(
+    "policy denial",
+    false,
+    client_hello(Some("good.com")),
+    SigningResult::Unavailable,
+    0
+)]
+#[case::no_sni("no SNI", true, client_hello(None), SigningResult::Unavailable, 0)]
+#[case::malformed_sni(
+    "malformed SNI",
+    true,
+    client_hello(Some("not a domain")),
+    SigningResult::Unavailable,
+    0
+)]
+#[case::incomplete("incomplete", true, vec![0x16], SigningResult::Unavailable, 0)]
 #[tokio::test]
-async fn interception_wiring_preserves_admission_and_never_falls_back_to_relay() {
-    use crate::tls_sni::test_fixtures::client_hello;
-
+async fn interception_wiring_preserves_admission_and_never_falls_back_to_relay(
+    #[case] name: &str,
+    #[case] allowed: bool,
+    #[case] bytes: Vec<u8>,
+    #[case] signing_result: SigningResult,
+    #[case] requests: usize,
+) {
     // 0.0.0.0 reaches this local listener without using the policy's forbidden
     // 127/8 range. No request in this test reaches an external destination.
     let upstream = TcpListener::bind("0.0.0.0:0").await.unwrap();
     let dst = upstream.local_addr().unwrap();
-    let tls = client_hello(Some("good.com"));
-    let no_sni = client_hello(None);
-    let malformed = client_hello(Some("not a domain"));
-    // name, policy allows, bytes, signing result, requests
-    for (name, allowed, bytes, signing_result, requests) in [
-        ("signing error", true, &tls, SigningResult::Unavailable, 1),
-        ("signing timeout", true, &tls, SigningResult::Pending, 1),
-        ("policy denial", false, &tls, SigningResult::Unavailable, 0),
-        ("no SNI", true, &no_sni, SigningResult::Unavailable, 0),
-        (
-            "malformed SNI",
-            true,
-            &malformed,
-            SigningResult::Unavailable,
-            0,
-        ),
-        (
-            "incomplete",
-            true,
-            &vec![0x16],
-            SigningResult::Unavailable,
-            0,
-        ),
-    ] {
-        let mut policy = if allowed {
-            NetworkPolicyV1::allow_all()
-        } else {
-            NetworkPolicyV1::deny_all()
+    let mut policy = if allowed {
+        NetworkPolicyV1::allow_all()
+    } else {
+        NetworkPolicyV1::deny_all()
+    };
+    policy.tls_interception = pplx_space_net_common::TlsInterception::On;
+    let (network_state, _) = ready_policy(policy).await;
+    let (send, mut receive) = tokio::sync::mpsc::channel(1);
+    let tls_interception = TlsInterception::new(Arc::new(move |host, port| {
+        let send = send.clone();
+        Box::pin(async move {
+            send.send((host, port)).await.unwrap();
+            match signing_result {
+                SigningResult::Unavailable => Err(tonic::Status::unavailable("test failure")),
+                SigningResult::Pending => std::future::pending().await,
+            }
+        })
+    }))
+    // Only the timeout and incomplete cases wait these bounds out, and each
+    // ends on the same rejection whatever the bound's length; the guest's
+    // bytes are already queued, so no other case comes near them.
+    .with_certificate_backstop(Duration::from_millis(100));
+    let proxy = TcpProxy {
+        sandbox_id: "test",
+        stats: Arc::new(ProxyStats::new()),
+        network_state,
+        tls_interception,
+        reserved_dns: crate::reserved_dns::test_support::test_core(),
+        known_egress_state: KnownEgressState::default(),
+        debug_state: GatewayDebugState::default(),
+        shutdown_token: CancellationToken::new(),
+        refusal_warnings: Arc::default(),
+        peek_budget: sniff::PeekBudget {
+            completion: Duration::from_millis(100),
+            ..sniff::PeekBudget::DEFAULT
+        },
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (guest, accepted) = tokio::join!(
+        TcpStream::connect(listener.local_addr().unwrap()),
+        listener.accept(),
+    );
+    let mut guest = guest.unwrap();
+    guest.write_all(&bytes).await.unwrap();
+    guest.shutdown().await.unwrap();
+    let connection = accepted.unwrap().0;
+    let shutdown = CancellationToken::new();
+    let (host, outcome) = tokio::time::timeout(
+        Duration::from_secs(3),
+        proxy.handle(connection, dst, &shutdown),
+    )
+    .await
+    .expect(name);
+    assert!(matches!(outcome, FlowOutcome::Rejected(_)), "{name}");
+    assert!(
+        upstream.accept().now_or_never().is_none(),
+        "{name}: must not dial upstream"
+    );
+    if requests == 1 {
+        assert_eq!(
+            receive.try_recv().unwrap(),
+            ("good.com".parse().unwrap(), dst.port()),
+            "{name}"
+        );
+    }
+    assert!(
+        receive.try_recv().is_err(),
+        "{name}: unexpected certificate request"
+    );
+    let intercepted = matches!(
+        outcome,
+        FlowOutcome::Rejected(Rejection::TlsInterception(_))
+    );
+    assert_eq!(intercepted, allowed, "{name}: unexpected rejection path");
+    if intercepted {
+        let layer = CapturedEventsLayer::new().with_event_filter(|event| {
+            field_value(event, "message")
+                == Some("experimental TLS interception closed the connection")
+        });
+        let events = layer.events();
+        let warning_layer = CapturedEventsLayer::new().with_event_filter(|event| {
+            field_value(event, "message")
+                == Some("experimental TLS interception closed the connection")
+        });
+        let warning_events = warning_layer.events();
+        tracing::subscriber::with_default(
+            tracing_subscriber::registry()
+                .with(layer)
+                .with(warning_layer.with_filter(tracing::level_filters::LevelFilter::WARN)),
+            || {
+                proxy.record(dst, host.as_ref(), outcome);
+            },
+        );
+        let events = events.events();
+        let [event] = events.as_slice() else {
+            panic!("{name}: expected one TLS rejection event");
         };
-        policy.tls_interception = pplx_space_net_common::TlsInterception::On;
-        let (network_state, _) = ready_policy(policy).await;
-        let (send, mut receive) = tokio::sync::mpsc::channel(1);
-        let tls_interception = TlsInterception::new(Arc::new(move |host, port| {
-            let send = send.clone();
-            Box::pin(async move {
-                send.send((host, port)).await.unwrap();
-                match signing_result {
-                    SigningResult::Unavailable => Err(tonic::Status::unavailable("test failure")),
-                    SigningResult::Pending => std::future::pending().await,
-                }
-            })
-        }));
-        let proxy = TcpProxy {
-            sandbox_id: "test",
-            stats: Arc::new(ProxyStats::new()),
-            network_state,
-            tls_interception,
-            reserved_dns: crate::reserved_dns::test_support::test_core(),
-            known_egress_state: KnownEgressState::default(),
-            debug_state: GatewayDebugState::default(),
-            shutdown_token: CancellationToken::new(),
-            refusal_warnings: Arc::default(),
-        };
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let (guest, accepted) = tokio::join!(
-            TcpStream::connect(listener.local_addr().unwrap()),
-            listener.accept(),
-        );
-        let mut guest = guest.unwrap();
-        guest.write_all(bytes).await.unwrap();
-        guest.shutdown().await.unwrap();
-        let connection = accepted.unwrap().0;
-        let shutdown = CancellationToken::new();
-        let (host, outcome) = tokio::time::timeout(
-            Duration::from_secs(3),
-            proxy.handle(connection, dst, &shutdown),
-        )
-        .await
-        .expect(name);
-        assert!(matches!(outcome, FlowOutcome::Rejected(_)), "{name}");
+        // Every interception rejection is a fail-closed guest breakage, so
+        // all of them must survive a production log level, not only the
+        // missing-SNI case.
+        assert_eq!(warning_events.events().len(), 1, "{name}");
         assert!(
-            upstream.accept().now_or_never().is_none(),
-            "{name}: must not dial upstream"
+            event
+                .iter()
+                .all(|(_, value)| !value.contains(&dst.ip().to_string())),
+            "{name}: raw destination leaked: {event:?}",
         );
-        if requests == 1 {
-            assert_eq!(
-                receive.try_recv().unwrap(),
-                ("good.com".parse().unwrap(), dst.port()),
-                "{name}"
-            );
-        }
-        assert!(
-            receive.try_recv().is_err(),
-            "{name}: unexpected certificate request"
+        assert_eq!(
+            field_value(event, "destination_port"),
+            Some(dst.port().to_string().as_str())
         );
-        let intercepted = matches!(
-            outcome,
-            FlowOutcome::Rejected(Rejection::TlsInterception(_))
-        );
-        assert_eq!(intercepted, allowed, "{name}: unexpected rejection path");
-        if intercepted {
-            let layer = CapturedEventsLayer::new().with_event_filter(|event| {
-                field_value(event, "message")
-                    == Some("experimental TLS interception closed the connection")
-            });
-            let events = layer.events();
-            let warning_layer = CapturedEventsLayer::new().with_event_filter(|event| {
-                field_value(event, "message")
-                    == Some("experimental TLS interception closed the connection")
-            });
-            let warning_events = warning_layer.events();
-            tracing::subscriber::with_default(
-                tracing_subscriber::registry()
-                    .with(layer)
-                    .with(warning_layer.with_filter(tracing::level_filters::LevelFilter::WARN)),
-                || {
-                    proxy.record(dst, host.as_ref(), outcome);
-                },
-            );
-            let events = events.events();
-            let [event] = events.as_slice() else {
-                panic!("{name}: expected one TLS rejection event");
-            };
-            // Every interception rejection is a fail-closed guest breakage, so
-            // all of them must survive a production log level, not only the
-            // missing-SNI case.
-            assert_eq!(warning_events.events().len(), 1, "{name}");
-            assert!(
-                event
-                    .iter()
-                    .all(|(_, value)| !value.contains(&dst.ip().to_string())),
-                "{name}: raw destination leaked: {event:?}",
-            );
-            assert_eq!(
-                field_value(event, "destination_port"),
-                Some(dst.port().to_string().as_str())
-            );
-        }
     }
 }
 
@@ -352,6 +371,7 @@ async fn interception_exemptions_relay_original_tls_only_after_admission() {
             debug_state: GatewayDebugState::default(),
             shutdown_token: CancellationToken::new(),
             refusal_warnings: Arc::default(),
+            peek_budget: sniff::PeekBudget::DEFAULT,
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let (guest, accepted) = tokio::join!(

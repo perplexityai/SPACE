@@ -21,8 +21,15 @@ pub struct ApiKeyAuthContext {
     pub actor: Option<User>,
 }
 
+/// bcrypt's work factor for stored passwords. This crate's tests use the
+/// minimum, 4: a cost-12 hash took 0.3-0.5 s on a loaded CI runner, and the
+/// tests that create users or sign in spent most of their time on it.
+/// `verify_password` reads the cost from the stored hash, so the same code
+/// paths run either way.
+const PASSWORD_HASH_COST: u32 = if cfg!(test) { 4 } else { 12 };
+
 pub fn hash_password(password: &str) -> Result<String, bcrypt::BcryptError> {
-    bcrypt::hash(password, 12)
+    bcrypt::hash(password, PASSWORD_HASH_COST)
 }
 
 pub fn verify_password(password: &str, hash: &str) -> Result<bool, bcrypt::BcryptError> {

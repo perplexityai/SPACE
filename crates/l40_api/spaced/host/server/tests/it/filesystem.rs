@@ -3,85 +3,95 @@ use crate::mock_bridge_guest::start_mock_bridge_guest;
 use crate::time::timestamp_from_millis;
 use std::time::Duration;
 
+#[rstest::rstest]
+#[case::canonical(None)]
+#[case::unimplemented(Some(tonic::Code::Unimplemented))]
+#[case::permission_denied(Some(tonic::Code::PermissionDenied))]
+#[case::unavailable(Some(tonic::Code::Unavailable))]
 #[tokio::test]
-async fn metadata_fallback_only_on_opening_unimplemented() {
+async fn metadata_fallback_only_on_opening_unimplemented(
+    #[case] opening_error: Option<tonic::Code>,
+) {
     use crate::mock_bridge_guest::{MockBridgeGuest, start_mock_bridge_guest_with_service};
     use futures_util::StreamExt;
     use tonic::Code;
 
-    for opening_error in [
-        None,
-        Some(Code::Unimplemented),
-        Some(Code::PermissionDenied),
-        Some(Code::Unavailable),
-    ] {
-        let directory = tempfile::tempdir().unwrap();
-        let socket = directory.path().join("guest.sock");
-        let bridge = start_mock_bridge_guest_with_service(
-            socket.clone(),
-            MockBridgeGuest {
-                metadata_open_error: opening_error,
-                list_body_error: true,
-                ..Default::default()
-            },
-        )
-        .await;
-        let fixture = HostFixture::start(Some(socket)).await;
-        let client = fixture.client().await;
-        let stat = client.stat("/tmp/test-file".into()).await;
-        let list = client
-            .list_stream_with_depth_as_user("/tmp/test-dir".into(), Some(1), None)
-            .await;
-        if opening_error == Some(Code::Unimplemented) {
-            let info = stat.expect("legacy stat").info.expect("stat info");
-            assert_eq!(info.path, "/tmp/test-file");
-            assert_eq!(info.size_bytes, 123);
-            assert_eq!(info.mode, 0o100644);
-            assert_eq!(info.modified_at, Some(timestamp_from_millis(1_000)));
-            let entries = list.expect("legacy list").collect::<Vec<_>>().await;
-            let entries = entries
-                .into_iter()
-                .collect::<Result<Vec<_>, _>>()
-                .expect("entries");
-            assert_eq!(entries.len(), 2);
-            for (entry, name, kind) in [
-                (
-                    &entries[0],
-                    "a.txt",
-                    pplx_space_spaced_host_client::proto::FileType::File,
-                ),
-                (
-                    &entries[1],
-                    "nested",
-                    pplx_space_spaced_host_client::proto::FileType::Directory,
-                ),
-            ] {
-                assert_eq!(entry.name.as_deref(), Some(name));
-                assert_eq!(entry.path, format!("/tmp/test-dir/{name}"));
-                assert_eq!(entry.file_type(), kind);
-            }
-        } else if let Some(code) = opening_error {
-            assert_eq!(stat.unwrap_err().code(), code);
-            assert_eq!(list.expect_err("no legacy fallback").code(), code);
-        } else {
-            assert_eq!(stat.unwrap().info.unwrap().size_bytes, 321);
-            let mut list = list.unwrap();
-            assert_eq!(
-                list.next().await.unwrap().unwrap().name.as_deref(),
-                Some("canonical.txt")
-            );
-            assert_eq!(
-                list.next().await.unwrap().unwrap_err().code(),
-                Code::Unimplemented
-            );
-            assert!(
-                list.next().await.is_none(),
-                "a started stream is never replayed"
-            );
-        }
-        fixture.stop().await;
-        bridge.abort();
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("guest.sock");
+    let bridge = start_mock_bridge_guest_with_service(
+        socket.clone(),
+        MockBridgeGuest {
+            metadata_open_error: opening_error,
+            list_body_error: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let fixture = HostFixture::start(Some(socket)).await;
+    let mut client = fixture.client().await;
+    if opening_error == Some(Code::Unavailable) {
+        // The relay already retries this retryable code within its own
+        // budget; observe that verdict once rather than once per client retry.
+        let config = pplx_space_spaced_host_client::SpacedHostClientConfig::new()
+            .with_socket_path(fixture.socket_path.clone())
+            .with_command_retry_policy(pplx_space_spaced_common::RetryPolicy::none());
+        client = pplx_space_spaced_host_client::SpacedHostClient::new_with_config(config)
+            .await
+            .unwrap();
     }
+    let stat = client.stat("/tmp/test-file".into()).await;
+    let list = client
+        .list_stream_with_depth_as_user("/tmp/test-dir".into(), Some(1), None)
+        .await;
+    if opening_error == Some(Code::Unimplemented) {
+        let info = stat.expect("legacy stat").info.expect("stat info");
+        assert_eq!(info.path, "/tmp/test-file");
+        assert_eq!(info.size_bytes, 123);
+        assert_eq!(info.mode, 0o100644);
+        assert_eq!(info.modified_at, Some(timestamp_from_millis(1_000)));
+        let entries = list.expect("legacy list").collect::<Vec<_>>().await;
+        let entries = entries
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("entries");
+        assert_eq!(entries.len(), 2);
+        for (entry, name, kind) in [
+            (
+                &entries[0],
+                "a.txt",
+                pplx_space_spaced_host_client::proto::FileType::File,
+            ),
+            (
+                &entries[1],
+                "nested",
+                pplx_space_spaced_host_client::proto::FileType::Directory,
+            ),
+        ] {
+            assert_eq!(entry.name.as_deref(), Some(name));
+            assert_eq!(entry.path, format!("/tmp/test-dir/{name}"));
+            assert_eq!(entry.file_type(), kind);
+        }
+    } else if let Some(code) = opening_error {
+        assert_eq!(stat.unwrap_err().code(), code);
+        assert_eq!(list.expect_err("no legacy fallback").code(), code);
+    } else {
+        assert_eq!(stat.unwrap().info.unwrap().size_bytes, 321);
+        let mut list = list.unwrap();
+        assert_eq!(
+            list.next().await.unwrap().unwrap().name.as_deref(),
+            Some("canonical.txt")
+        );
+        assert_eq!(
+            list.next().await.unwrap().unwrap_err().code(),
+            Code::Unimplemented
+        );
+        assert!(
+            list.next().await.is_none(),
+            "a started stream is never replayed"
+        );
+    }
+    fixture.stop().await;
+    bridge.abort();
 }
 
 /// A real guest service serving its bridge on `socket`, running filesystem

@@ -38,9 +38,8 @@ pub(crate) fn successful_stdout(events: &[ProcessEvent]) -> Vec<u8> {
             Some(Event::Stdout(output)) => Some(output.data.as_slice()),
             _ => None,
         })
-        .flatten()
-        .copied()
-        .collect()
+        .collect::<Vec<_>>()
+        .concat()
 }
 
 pub(crate) fn process_exit(events: &[ProcessEvent]) -> &Outcome {

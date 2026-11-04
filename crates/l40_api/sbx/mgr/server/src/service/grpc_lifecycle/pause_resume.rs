@@ -9,7 +9,7 @@ use crate::service::cleanup_support::{
 
 const PAUSE_RECONCILIATION_ATTEMPTS: usize = 3;
 
-const PAUSE_RECONCILIATION_BACKOFF: Duration = Duration::from_millis(100);
+pub(super) const PAUSE_RECONCILIATION_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Whether `rejected` found the row outside `edge`'s source states: another
 /// operation, such as a Stop the cleanup fence admitted while pause held only
@@ -130,6 +130,7 @@ pub(super) async fn pause_with_reconciliation(
     guest_preparation_budget: GuestSnapshotPreparationBudget,
     node_manager: &crate::node_manager_transport::NodeManagerConnector,
     balloon_hint_timeout_ms: Option<std::num::NonZeroU32>,
+    backoff: Duration,
 ) -> Result<SandboxState, StateWriteRejected> {
     let sandbox_id_string = sandbox_id.to_string();
     let mut last_reason = None;
@@ -189,7 +190,7 @@ pub(super) async fn pause_with_reconciliation(
             }
         }
         if attempt + 1 < PAUSE_RECONCILIATION_ATTEMPTS {
-            tokio::time::sleep(PAUSE_RECONCILIATION_BACKOFF).await;
+            tokio::time::sleep(backoff).await;
         }
     }
 
@@ -226,6 +227,16 @@ pub(super) async fn pause_with_reconciliation(
 }
 
 impl SandboxManagerService {
+    /// The delay between pause reconciliation attempts:
+    /// [`PAUSE_RECONCILIATION_BACKOFF`], or a test's own.
+    pub(super) fn pause_reconciliation_backoff(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(backoff) = self.pause_reconciliation_backoff {
+            return backoff;
+        }
+        PAUSE_RECONCILIATION_BACKOFF
+    }
+
     pub(in crate::service) async fn pause(
         &self,
         request: Request<PauseRequest>,
@@ -331,6 +342,7 @@ impl SandboxManagerService {
             GuestSnapshotPreparationBudget::Standard,
             &self.node_manager,
             None,
+            self.pause_reconciliation_backoff(),
         )
         .await;
         if pause_state != Ok(SandboxState::Paused) {

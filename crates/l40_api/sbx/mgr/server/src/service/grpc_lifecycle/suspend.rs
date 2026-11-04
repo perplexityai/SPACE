@@ -413,6 +413,7 @@ impl SandboxManagerService {
                 guest_preparation_budget,
                 &self.node_manager,
                 self.config.balloon_hint_timeout_ms,
+                self.pause_reconciliation_backoff(),
             )
             .await;
             // Fail closed: a rejection means another operation owns the row,

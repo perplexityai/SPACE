@@ -84,18 +84,22 @@ async fn an_aged_channel_redials_without_failing_requests() {
     let (addr, connections) = serve_health().await;
     let mut client = HealthClient::new(connect(addr, Some(Duration::from_millis(100))).await);
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    while tokio::time::Instant::now() < deadline {
+    // The initial dial plus at least two rotations; the age is jittered, so
+    // the exact count is not fixed. A rotation starts only when a request
+    // finds the connection aged, so the third dial means requests crossed the
+    // first replacement. The deadline only bounds a channel that never
+    // rotates.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut requests = 0;
+    while connections.load(Ordering::SeqCst) < 3 || requests < 20 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "expected repeated redials, saw {} after {requests} requests",
+            connections.load(Ordering::SeqCst)
+        );
         check(&mut client).await.expect("rotation failed a request");
+        requests += 1;
     }
-
-    // The initial dial plus at least two rotations; the age is jittered, so the
-    // exact count is not fixed.
-    assert!(
-        connections.load(Ordering::SeqCst) >= 3,
-        "expected repeated redials, saw {}",
-        connections.load(Ordering::SeqCst)
-    );
 }
 
 async fn connect(addr: SocketAddr, max_age: Option<Duration>) -> RotatingChannel {

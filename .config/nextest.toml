@@ -82,6 +82,16 @@ priority = 10
 [test-groups.privileged]
 max-threads = 8
 
+# The state-render shards each write and read a few hundred rows through
+# every API surface on the run's shared Postgres server. Run together they
+# slowed each other to 2.5-4 s in CI, so at most two run at once.
+[test-groups.state-render]
+max-threads = 2
+
+[[profile.default.overrides]]
+filter = 'package(pplx-space-api) and test(/^routes::e2b::state_render_tests::each_surface_renders_stored_lifecycle_and_observed_status::/)'
+test-group = "state-render"
+
 [[profile.default.overrides]]
 # Shared btrfs tests receive a disposable filesystem from the privileged CI
 # wrapper. Other opt-in tests keep their separate activation requirements.

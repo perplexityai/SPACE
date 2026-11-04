@@ -69,6 +69,7 @@ pplx-space-test-env.workspace = true
 prost = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 rcgen = { workspace = true, features = ["aws_lc_rs", "x509-parser", "pem"] }
+rstest = { workspace = true }
 tempfile = { workspace = true }
 insta = { workspace = true }
 nix = { workspace = true, features = ["net"] }

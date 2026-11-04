@@ -271,8 +271,11 @@ async fn insert_resident_suspended(
 /// unmarked, only while the row is still `restoring`: a lifecycle another
 /// writer lands during the Wake, from every stored value, stands, unplaced as
 /// the Wake left it, and the restore reports the lost finalize CAS.
+#[rstest::rstest]
 #[tokio::test(flavor = "current_thread")]
-async fn restore_finalize_moves_only_a_row_still_restoring() -> TestResult {
+async fn restore_finalize_moves_only_a_row_still_restoring(
+    #[values(0, 1, 2)] shard: usize,
+) -> TestResult {
     if !enter_node_api_client_process()? {
         return Ok(());
     }
@@ -282,10 +285,12 @@ async fn restore_finalize_moves_only_a_row_still_restoring() -> TestResult {
     let timeout = PositiveDuration::new(Duration::from_secs(10)).expect("non-zero");
 
     let mut mismatches = Vec::new();
-    for concurrent_lifecycle in [None]
+    // A third of the landed lifecycles per case, so the thirds run side by
+    // side.
+    let landed = [None]
         .into_iter()
-        .chain(StoredSandboxLifecycle::all_as_str().map(Some))
-    {
+        .chain(StoredSandboxLifecycle::all_as_str().map(Some));
+    for concurrent_lifecycle in landed.skip(shard).step_by(3) {
         let pod_ip = Ipv4Addr::LOCALHOST;
         sqlx::query(sql!(
             "INSERT INTO nodes (id, address, role, managed_by, state)

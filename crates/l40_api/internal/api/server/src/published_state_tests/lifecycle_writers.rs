@@ -231,43 +231,46 @@ async fn stopped_report_leaves_a_stopped_re_placement_to_the_drain() -> TestResu
 /// lower-cased, so a padded `quarantined` is refused like the canonical one
 /// and an unknown value is failed. Placement, both node columns and the
 /// execution are left as they were.
+#[rstest::rstest]
+#[case::k8s("k8s")]
+#[case::space("space")]
 #[tokio::test(flavor = "current_thread")]
-async fn failed_report_moves_every_live_k8s_lifecycle_to_failed() -> TestResult {
+async fn failed_report_moves_every_live_k8s_lifecycle_to_failed(
+    #[case] managed_by: &str,
+) -> TestResult {
     let db = pg_test_db().await?;
     let pool = &db.pool;
     let node_id = ready_node(pool).await?;
 
     let mut mismatches = Vec::new();
-    for managed_by in ["k8s", "space"] {
-        for stored in StoredSandboxLifecycle::all_as_str().chain([" Quarantined ", "bogus"]) {
-            let sandbox_id = SandboxId::new();
-            insert_active_sandbox_with_managed_by(pool, sandbox_id, node_id, stored, managed_by)
-                .await?;
-            insert_k8s_execution(pool, sandbox_id, 7, "running", Some("100.64.0.7")).await?;
-            let before = row(pool, sandbox_id).await?;
+    for stored in StoredSandboxLifecycle::all_as_str().chain([" Quarantined ", "bogus"]) {
+        let sandbox_id = SandboxId::new();
+        insert_active_sandbox_with_managed_by(pool, sandbox_id, node_id, stored, managed_by)
+            .await?;
+        insert_k8s_execution(pool, sandbox_id, 7, "running", Some("100.64.0.7")).await?;
+        let before = row(pool, sandbox_id).await?;
 
-            let mut report = published_sandbox_state(sandbox_id, "failed");
-            report.failure_reason = Some("synthetic guest failure".to_owned());
-            publish(pool, node_id, report).await?;
+        let mut report = published_sandbox_state(sandbox_id, "failed");
+        report.failure_reason = Some("synthetic guest failure".to_owned());
+        publish(pool, node_id, report).await?;
 
-            let fails = managed_by == "k8s"
-                && !matches!(
-                    stored,
-                    "failed"
-                        | "quarantined"
-                        | "deleting"
-                        | "deleted"
-                        | "cleanup_required"
-                        | " Quarantined "
-                );
-            let mut expected = before.clone();
-            if fails {
-                expected.lifecycle = "failed".to_owned();
-            }
-            let actual = row(pool, sandbox_id).await?;
-            if actual != expected {
-                mismatches.push(format!("{managed_by} {stored}: {actual:?}"));
-            }
+        let fails = managed_by == "k8s"
+            && !matches!(
+                stored,
+                "failed"
+                    | "quarantined"
+                    | "deleting"
+                    | "deleted"
+                    | "cleanup_required"
+                    | " Quarantined "
+            );
+        let mut expected = before.clone();
+        if fails {
+            expected.lifecycle = "failed".to_owned();
+        }
+        let actual = row(pool, sandbox_id).await?;
+        if actual != expected {
+            mismatches.push(format!("{managed_by} {stored}: {actual:?}"));
         }
     }
     assert!(mismatches.is_empty(), "{mismatches:#?}");
@@ -293,37 +296,40 @@ async fn failed_report_moves_every_live_k8s_lifecycle_to_failed() -> TestResult 
 /// were.
 ///
 /// `cleanup_required` is not swept: no Postgres writer stores it.
+#[rstest::rstest]
+#[case::k8s("k8s")]
+#[case::space("space")]
 #[tokio::test(flavor = "current_thread")]
-async fn quarantined_report_moves_every_unquarantined_lifecycle_and_records_it() -> TestResult {
+async fn quarantined_report_moves_every_unquarantined_lifecycle_and_records_it(
+    #[case] managed_by: &str,
+) -> TestResult {
     let db = pg_test_db().await?;
     let pool = &db.pool;
     let node_id = ready_node(pool).await?;
 
     let mut mismatches = Vec::new();
-    for managed_by in ["k8s", "space"] {
-        for stored in StoredSandboxLifecycle::all_as_str().chain([" Quarantined ", "bogus"]) {
-            if stored == "cleanup_required" {
-                continue;
-            }
-            let sandbox_id = SandboxId::new();
-            insert_active_sandbox_with_managed_by(pool, sandbox_id, node_id, stored, managed_by)
-                .await?;
-            insert_k8s_execution(pool, sandbox_id, 7, "running", Some("100.64.0.7")).await?;
-            let before = row(pool, sandbox_id).await?;
+    for stored in StoredSandboxLifecycle::all_as_str().chain([" Quarantined ", "bogus"]) {
+        if stored == "cleanup_required" {
+            continue;
+        }
+        let sandbox_id = SandboxId::new();
+        insert_active_sandbox_with_managed_by(pool, sandbox_id, node_id, stored, managed_by)
+            .await?;
+        insert_k8s_execution(pool, sandbox_id, 7, "running", Some("100.64.0.7")).await?;
+        let before = row(pool, sandbox_id).await?;
 
-            publish(pool, node_id, quarantined_report(sandbox_id)).await?;
+        publish(pool, node_id, quarantined_report(sandbox_id)).await?;
 
-            let quarantines = !matches!(stored, "quarantined" | "deleted" | " Quarantined ");
-            let mut expected = before.clone();
-            if quarantines {
-                expected.lifecycle = "quarantined".to_owned();
-                expected.quarantined_from = Some(stored.to_owned());
-                expected.quarantine_history = vec!["entered_quarantine".to_owned()];
-            }
-            let actual = row(pool, sandbox_id).await?;
-            if actual != expected {
-                mismatches.push(format!("{managed_by} {stored}: {actual:?}"));
-            }
+        let quarantines = !matches!(stored, "quarantined" | "deleted" | " Quarantined ");
+        let mut expected = before.clone();
+        if quarantines {
+            expected.lifecycle = "quarantined".to_owned();
+            expected.quarantined_from = Some(stored.to_owned());
+            expected.quarantine_history = vec!["entered_quarantine".to_owned()];
+        }
+        let actual = row(pool, sandbox_id).await?;
+        if actual != expected {
+            mismatches.push(format!("{managed_by} {stored}: {actual:?}"));
         }
     }
     assert!(mismatches.is_empty(), "{mismatches:#?}");
@@ -346,68 +352,70 @@ async fn quarantined_report_moves_every_unquarantined_lifecycle_and_records_it()
 /// Both guards compare the lifecycle trimmed and lower-cased: a padded
 /// `created` counts as `created` and a padded `suspended` as the suspend
 /// window, while an unknown value is projected like any other lifecycle.
+#[rstest::rstest]
+#[case::started("started")]
+#[case::paused("paused")]
+#[case::created("created")]
 #[tokio::test(flavor = "current_thread")]
-async fn activation_completion_receipt_projects_its_target_outside_the_suspend_window() -> TestResult
-{
+async fn activation_completion_receipt_projects_its_target_outside_the_suspend_window(
+    #[case] target: &str,
+) -> TestResult {
     let db = pg_test_db().await?;
     let pool = &db.pool;
     let node_id = ready_node(pool).await?;
 
     let mut mismatches = Vec::new();
-    for target in ["started", "paused", "created"] {
-        let rows =
-            StoredSandboxLifecycle::all_as_str().chain([" Created ", " Suspended ", "bogus"]);
-        for stored in rows {
-            let (sandbox_id, _) = insert_running(pool, node_id, stored).await?;
-            sqlx::query(sql!(
-                "UPDATE sandboxes SET placement = 'unplaced' WHERE id = $1"
-            ))
-            .bind(sandbox_id)
-            .execute(pool)
-            .await?;
-            let attempt = Uuid::now_v7();
-            set_activation_attempt(pool, sandbox_id, attempt, target).await?;
-            let before = row(pool, sandbox_id).await?;
+    let rows = StoredSandboxLifecycle::all_as_str().chain([" Created ", " Suspended ", "bogus"]);
+    for stored in rows {
+        let (sandbox_id, _) = insert_running(pool, node_id, stored).await?;
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET placement = 'unplaced' WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .execute(pool)
+        .await?;
+        let attempt = Uuid::now_v7();
+        set_activation_attempt(pool, sandbox_id, attempt, target).await?;
+        let before = row(pool, sandbox_id).await?;
 
-            let report = with_receipt(
-                published_sandbox_state(sandbox_id, target),
-                "activation_completed",
-                target,
-                7,
-                Some(attempt),
-                "",
-            );
-            publish(pool, node_id, report).await?;
+        let report = with_receipt(
+            published_sandbox_state(sandbox_id, target),
+            "activation_completed",
+            target,
+            7,
+            Some(attempt),
+            "",
+        );
+        publish(pool, node_id, report).await?;
 
-            let mut expected = before.clone();
-            if target == "created" {
-                if matches!(stored, "created" | " Created ") {
-                    // The release writes the receipt's target, so a padded
-                    // `created` is stored canonically.
-                    expected.activation_attempt_id = None;
-                    expected.lifecycle = target.to_owned();
-                }
-            } else {
+        let mut expected = before.clone();
+        if target == "created" {
+            if matches!(stored, "created" | " Created ") {
+                // The release writes the receipt's target, so a padded
+                // `created` is stored canonically.
                 expected.activation_attempt_id = None;
-                let projects = !matches!(
-                    stored,
-                    "suspending"
-                        | "suspended"
-                        | "quarantined"
-                        | "deleting"
-                        | "deleted"
-                        | "cleanup_required"
-                        | " Suspended "
-                );
-                if projects {
-                    expected.lifecycle = target.to_owned();
-                    expected.placement = "on_node".to_owned();
-                }
+                expected.lifecycle = target.to_owned();
             }
-            let actual = row(pool, sandbox_id).await?;
-            if actual != expected {
-                mismatches.push(format!("target {target}, stored {stored}: {actual:?}"));
+        } else {
+            expected.activation_attempt_id = None;
+            let projects = !matches!(
+                stored,
+                "suspending"
+                    | "suspended"
+                    | "quarantined"
+                    | "deleting"
+                    | "deleted"
+                    | "cleanup_required"
+                    | " Suspended "
+            );
+            if projects {
+                expected.lifecycle = target.to_owned();
+                expected.placement = "on_node".to_owned();
             }
+        }
+        let actual = row(pool, sandbox_id).await?;
+        if actual != expected {
+            mismatches.push(format!("target {target}, stored {stored}: {actual:?}"));
         }
     }
     assert!(mismatches.is_empty(), "{mismatches:#?}");
@@ -507,80 +515,74 @@ async fn port_exposures(pool: &PgPool, sandbox_id: SandboxId) -> TestResult<Vec<
 /// is refused like the canonical one. It also reads the normalized lifecycle
 /// back as a `SandboxLifecycle`, so an unknown value fails the whole
 /// publication, which rolls back and leaves the row as it was.
+#[rstest::rstest]
+#[case::created("created", SandboxQuarantineReasonCode::CreateInterrupted)]
+#[case::stopped("stopped", SandboxQuarantineReasonCode::ColdActivationInterrupted)]
+#[case::suspended("suspended", SandboxQuarantineReasonCode::RestoreActivationInterrupted)]
 #[tokio::test(flavor = "current_thread")]
-async fn activation_rollback_receipt_converges_its_target_out_of_every_live_lifecycle() -> TestResult
-{
+async fn activation_rollback_receipt_converges_its_target_out_of_every_live_lifecycle(
+    #[case] target: &str,
+    #[case] reason_code: SandboxQuarantineReasonCode,
+) -> TestResult {
     let db = pg_test_db().await?;
     let pool = &db.pool;
     let node_id = ready_node(pool).await?;
 
     let mut mismatches = Vec::new();
-    for (target, reason_code) in [
-        ("created", SandboxQuarantineReasonCode::CreateInterrupted),
-        (
-            "stopped",
-            SandboxQuarantineReasonCode::ColdActivationInterrupted,
-        ),
-        (
-            "suspended",
-            SandboxQuarantineReasonCode::RestoreActivationInterrupted,
-        ),
-    ] {
-        for stored in StoredSandboxLifecycle::all_as_str().chain([" Quarantined ", "bogus"]) {
-            let (sandbox_id, _) = insert_running(pool, node_id, stored).await?;
-            clear_target_node(pool, sandbox_id).await?;
-            insert_port_exposures(pool, sandbox_id, node_id).await?;
-            let attempt = Uuid::now_v7();
-            set_activation_attempt(pool, sandbox_id, attempt, target).await?;
-            let before = row(pool, sandbox_id).await?;
-            let exposures_before = port_exposures(pool, sandbox_id).await?;
+    for stored in StoredSandboxLifecycle::all_as_str().chain([" Quarantined ", "bogus"]) {
+        let (sandbox_id, _) = insert_running(pool, node_id, stored).await?;
+        clear_target_node(pool, sandbox_id).await?;
+        insert_port_exposures(pool, sandbox_id, node_id).await?;
+        let attempt = Uuid::now_v7();
+        set_activation_attempt(pool, sandbox_id, attempt, target).await?;
+        let before = row(pool, sandbox_id).await?;
+        let exposures_before = port_exposures(pool, sandbox_id).await?;
 
-            let report = with_receipt(
-                published_sandbox_state(sandbox_id, target),
-                "activation_rollback",
-                target,
-                7,
-                Some(attempt),
-                reason_code.as_str(),
+        let report = with_receipt(
+            published_sandbox_state(sandbox_id, target),
+            "activation_rollback",
+            target,
+            7,
+            Some(attempt),
+            reason_code.as_str(),
+        );
+        let published = publish(pool, node_id, report).await;
+
+        let fails_publication = stored == "bogus";
+        let converges = !fails_publication
+            && !matches!(
+                stored,
+                "quarantined" | "deleting" | "deleted" | "cleanup_required" | " Quarantined "
             );
-            let published = publish(pool, node_id, report).await;
-
-            let fails_publication = stored == "bogus";
-            let converges = !fails_publication
-                && !matches!(
-                    stored,
-                    "quarantined" | "deleting" | "deleted" | "cleanup_required" | " Quarantined "
-                );
-            let mut expected = before.clone();
-            let mut expected_exposures = exposures_before.clone();
-            if converges {
-                expected.lifecycle = target.to_owned();
-                expected.placement = "unplaced".to_owned();
-                expected.active_node_id = None;
-                expected.target_node_id = Some(node_id);
-                expected.execution_active = Some(false);
-                expected.execution_state = Some(
-                    if target == "suspended" {
-                        "suspended"
-                    } else {
-                        "replaced"
-                    }
-                    .to_owned(),
-                );
-                expected_exposures[0] = ("open".to_owned(), "pending".to_owned(), None, None);
-            }
-            let actual = row(pool, sandbox_id).await?;
-            let actual_exposures = port_exposures(pool, sandbox_id).await?;
-            if published.is_err() != fails_publication
-                || actual != expected
-                || actual_exposures != expected_exposures
-            {
-                mismatches.push(format!(
-                    "target {target}, stored {stored:?}: published {:?}, {actual:?}, \
-                     {actual_exposures:?}",
-                    published.as_ref().map(|_| ())
-                ));
-            }
+        let mut expected = before.clone();
+        let mut expected_exposures = exposures_before.clone();
+        if converges {
+            expected.lifecycle = target.to_owned();
+            expected.placement = "unplaced".to_owned();
+            expected.active_node_id = None;
+            expected.target_node_id = Some(node_id);
+            expected.execution_active = Some(false);
+            expected.execution_state = Some(
+                if target == "suspended" {
+                    "suspended"
+                } else {
+                    "replaced"
+                }
+                .to_owned(),
+            );
+            expected_exposures[0] = ("open".to_owned(), "pending".to_owned(), None, None);
+        }
+        let actual = row(pool, sandbox_id).await?;
+        let actual_exposures = port_exposures(pool, sandbox_id).await?;
+        if published.is_err() != fails_publication
+            || actual != expected
+            || actual_exposures != expected_exposures
+        {
+            mismatches.push(format!(
+                "target {target}, stored {stored:?}: published {:?}, {actual:?}, \
+                 {actual_exposures:?}",
+                published.as_ref().map(|_| ())
+            ));
         }
     }
     assert!(mismatches.is_empty(), "{mismatches:#?}");
@@ -621,47 +623,50 @@ async fn activation_rollback_receipt_converges_its_target_out_of_every_live_life
 /// bare report does not carry. The guard compares the lifecycle trimmed and
 /// lower-cased, so a padded `restoring` is projected like the canonical one;
 /// an unknown value is not.
+#[rstest::rstest]
+#[case::k8s("k8s")]
+#[case::space("space")]
 #[tokio::test(flavor = "current_thread")]
-async fn suspended_report_projects_only_out_of_running_and_restoring_lifecycles() -> TestResult {
+async fn suspended_report_projects_only_out_of_running_and_restoring_lifecycles(
+    #[case] managed_by: &str,
+) -> TestResult {
     let db = pg_test_db().await?;
     let pool = &db.pool;
     let node_id = ready_node(pool).await?;
 
     let mut mismatches = Vec::new();
-    for managed_by in ["k8s", "space"] {
-        for stored in StoredSandboxLifecycle::all_as_str().chain([" Restoring ", "bogus"]) {
-            let sandbox_id = SandboxId::new();
-            insert_active_sandbox_with_managed_by(pool, sandbox_id, node_id, stored, managed_by)
-                .await?;
-            clear_target_node(pool, sandbox_id).await?;
-            if managed_by == "k8s" {
-                insert_k8s_execution(pool, sandbox_id, 7, "running", Some("100.64.0.7")).await?;
-            }
-            insert_ready_suspend_snapshot(pool, sandbox_id, node_id).await?;
-            let before = row(pool, sandbox_id).await?;
-
-            publish(
-                pool,
-                node_id,
-                published_sandbox_state(sandbox_id, "suspended"),
-            )
+    for stored in StoredSandboxLifecycle::all_as_str().chain([" Restoring ", "bogus"]) {
+        let sandbox_id = SandboxId::new();
+        insert_active_sandbox_with_managed_by(pool, sandbox_id, node_id, stored, managed_by)
             .await?;
+        clear_target_node(pool, sandbox_id).await?;
+        if managed_by == "k8s" {
+            insert_k8s_execution(pool, sandbox_id, 7, "running", Some("100.64.0.7")).await?;
+        }
+        insert_ready_suspend_snapshot(pool, sandbox_id, node_id).await?;
+        let before = row(pool, sandbox_id).await?;
 
-            let mut expected = before.clone();
-            if matches!(stored, "started" | "paused" | "restoring" | " Restoring ") {
-                expected.lifecycle = "suspended".to_owned();
-                expected.placement = "unplaced".to_owned();
-                expected.active_node_id = None;
-                expected.target_node_id = Some(node_id);
-                if managed_by == "k8s" {
-                    expected.execution_active = Some(false);
-                    expected.execution_state = Some("suspended".to_owned());
-                }
+        publish(
+            pool,
+            node_id,
+            published_sandbox_state(sandbox_id, "suspended"),
+        )
+        .await?;
+
+        let mut expected = before.clone();
+        if matches!(stored, "started" | "paused" | "restoring" | " Restoring ") {
+            expected.lifecycle = "suspended".to_owned();
+            expected.placement = "unplaced".to_owned();
+            expected.active_node_id = None;
+            expected.target_node_id = Some(node_id);
+            if managed_by == "k8s" {
+                expected.execution_active = Some(false);
+                expected.execution_state = Some("suspended".to_owned());
             }
-            let actual = row(pool, sandbox_id).await?;
-            if actual != expected {
-                mismatches.push(format!("{managed_by} {stored}: {actual:?}"));
-            }
+        }
+        let actual = row(pool, sandbox_id).await?;
+        if actual != expected {
+            mismatches.push(format!("{managed_by} {stored}: {actual:?}"));
         }
     }
     assert!(mismatches.is_empty(), "{mismatches:#?}");
@@ -804,15 +809,20 @@ async fn ready_backup_projects_suspended_only_out_of_running_and_restoring_lifec
 /// stays. The guard compares the lifecycle trimmed and lower-cased, so a
 /// padded `quarantined` is recovered like the canonical one; an unknown value
 /// is not.
+#[rstest::rstest]
 #[tokio::test(flavor = "current_thread")]
-async fn recovery_receipt_suspends_only_a_still_quarantined_row() -> TestResult {
+async fn recovery_receipt_suspends_only_a_still_quarantined_row(
+    #[values(0, 1)] shard: usize,
+) -> TestResult {
     let db = pg_test_db().await?;
     let pool = &db.pool;
     let node_id = ready_node(pool).await?;
     let reason_code = SandboxQuarantineReasonCode::RestorePrepareFailed;
 
     let mut mismatches = Vec::new();
-    for stored in StoredSandboxLifecycle::all_as_str().chain([" Quarantined ", "bogus"]) {
+    // Every other row of the sweep, so its two halves run side by side.
+    let rows = StoredSandboxLifecycle::all_as_str().chain([" Quarantined ", "bogus"]);
+    for stored in rows.skip(shard).step_by(2) {
         let (sandbox_id, _) = insert_running(pool, node_id, "restoring").await?;
         let snapshot_id = insert_ready_suspend_snapshot(pool, sandbox_id, node_id).await?;
         let local_artifact_id = pin_snapshot_artifact(pool, sandbox_id, snapshot_id).await?;
@@ -883,51 +893,53 @@ async fn recovery_receipt_suspends_only_a_still_quarantined_row() -> TestResult 
 /// query compares the lifecycle trimmed and lower-cased, but the recovery's
 /// CAS compares it exactly, misses, and fails the whole publication, which
 /// rolls back and leaves the row as it was.
+#[rstest::rstest]
+#[case::started("started")]
+#[case::paused("paused")]
 #[tokio::test(flavor = "current_thread")]
-async fn healthy_report_recovers_only_a_pause_failed_quarantine() -> TestResult {
+async fn healthy_report_recovers_only_a_pause_failed_quarantine(
+    #[case] reported: &str,
+) -> TestResult {
     let db = pg_test_db().await?;
     let pool = &db.pool;
     let node_id = ready_node(pool).await?;
 
     let mut mismatches = Vec::new();
-    for reported in ["started", "paused"] {
-        for stored in StoredSandboxLifecycle::all_as_str().chain([" Quarantined ", "bogus"]) {
-            let (sandbox_id, _) = insert_running(pool, node_id, stored).await?;
-            sqlx::query(sql!(
-                "INSERT INTO sandbox_quarantine_state (
-                     sandbox_id, quarantine_id, entered_from_lifecycle, source,
-                     reason_code, next_action, last_observed_node_id
-                 )
-                 VALUES ($1, $2, 'started', 'sbx_manager', 'pause_failed',
-                         'requires_operator_attention', $3)"
-            ))
-            .bind(sandbox_id)
-            .bind(Uuid::now_v7())
-            .bind(node_id)
-            .execute(pool)
-            .await?;
-            let before = row(pool, sandbox_id).await?;
+    for stored in StoredSandboxLifecycle::all_as_str().chain([" Quarantined ", "bogus"]) {
+        let (sandbox_id, _) = insert_running(pool, node_id, stored).await?;
+        sqlx::query(sql!(
+            "INSERT INTO sandbox_quarantine_state (
+                 sandbox_id, quarantine_id, entered_from_lifecycle, source,
+                 reason_code, next_action, last_observed_node_id
+             )
+             VALUES ($1, $2, 'started', 'sbx_manager', 'pause_failed',
+                     'requires_operator_attention', $3)"
+        ))
+        .bind(sandbox_id)
+        .bind(Uuid::now_v7())
+        .bind(node_id)
+        .execute(pool)
+        .await?;
+        let before = row(pool, sandbox_id).await?;
 
-            let published =
-                publish(pool, node_id, published_sandbox_state(sandbox_id, reported)).await;
+        let published = publish(pool, node_id, published_sandbox_state(sandbox_id, reported)).await;
 
-            let fails_publication = stored == " Quarantined ";
-            let mut expected = before.clone();
-            if stored == "quarantined" {
-                expected.lifecycle = reported.to_owned();
-                expected.quarantined_from = None;
-                expected.quarantine_history = vec![format!("recovered_to_{reported}")];
-            } else if stored == "restoring" && reported == "started" {
-                // The restore convergence, swept with the `started` report.
-                expected.lifecycle = "started".to_owned();
-            }
-            let actual = row(pool, sandbox_id).await?;
-            if published.is_err() != fails_publication || actual != expected {
-                mismatches.push(format!(
-                    "reported {reported}, stored {stored:?}: published {:?}, {actual:?}",
-                    published.as_ref().map(|_| ())
-                ));
-            }
+        let fails_publication = stored == " Quarantined ";
+        let mut expected = before.clone();
+        if stored == "quarantined" {
+            expected.lifecycle = reported.to_owned();
+            expected.quarantined_from = None;
+            expected.quarantine_history = vec![format!("recovered_to_{reported}")];
+        } else if stored == "restoring" && reported == "started" {
+            // The restore convergence, swept with the `started` report.
+            expected.lifecycle = "started".to_owned();
+        }
+        let actual = row(pool, sandbox_id).await?;
+        if published.is_err() != fails_publication || actual != expected {
+            mismatches.push(format!(
+                "reported {reported}, stored {stored:?}: published {:?}, {actual:?}",
+                published.as_ref().map(|_| ())
+            ));
         }
     }
     assert!(mismatches.is_empty(), "{mismatches:#?}");

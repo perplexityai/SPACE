@@ -3892,8 +3892,13 @@ impl NodeDrainSink for SubstrateSink {
         if let Err(hold) = pod_less_giveup::node_vouches(&observer, generation).await {
             return Ok(PodLessRecovery::NotEligible(hold));
         }
-        let outcome =
-            pod_less_giveup::recover_pod_less_sandbox_tx(&self.pool, candidate, generation).await?;
+        let outcome = pod_less_giveup::recover_pod_less_sandbox_tx(
+            &self.pool,
+            candidate,
+            generation,
+            DRAIN_COMPLETION_LOCK_TIMEOUT,
+        )
+        .await?;
         emit_pod_less_recovery_events(candidate, outcome);
         Ok(outcome)
     }

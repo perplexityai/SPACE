@@ -73,7 +73,8 @@ impl KubernetesSubstrate {
     /// fallback semantics.
     ///
     /// 1. **Cache hit + settled** → return cached.
-    /// 2. **Cache miss or unsettled** → wait briefly (`REFLECTOR_WAIT_BUDGET`)
+    /// 2. **Cache miss or unsettled** → wait briefly (`REFLECTOR_WAIT_BUDGET`,
+    ///    carried as `SubstrateBudgets::reflector_wait`)
     ///    for a reflector event referencing this pod. On event, re-check the
     ///    cache; if now settled, return cached.
     /// 3. **Event budget elapsed** or **event arrived but still unsettled** →
@@ -111,7 +112,7 @@ impl KubernetesSubstrate {
         // already have the assignment we were waiting for.
         let _ = self
             .pod_events
-            .wait_for(pod_name, REFLECTOR_WAIT_BUDGET)
+            .wait_for(pod_name, self.budgets.reflector_wait)
             .await;
         if let Some(pod) = self.lookup_sandbox_pod(pod_name)
             && pod_status_is_settled(&pod)
