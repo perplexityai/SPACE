@@ -151,7 +151,7 @@ jobs:
         if: steps.reuse.outputs.reused != 'true'
         env:
           SPACE_CI_IMAGE_MIRROR: ghcr
-          SPACE_KIND_RUST_ARTIFACTS: ${{ steps.state.outputs.restored == 'true' && 'incremental' || 'docker' }}
+          SPACE_KIND_RUST_ARTIFACTS: incremental
           SPACE_KIND_RUST_BUILD: ${{ inputs.rust_build == 'release' && 'release' || '' }}
           SPACE_KIND_BUILD_CACHE_REPOSITORY: ghcr.io/perplexityai/space-kind-build-cache
           SPACE_KIND_BUILD_CACHE_WRITE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && '1' || '0' }}
@@ -159,6 +159,21 @@ jobs:
           SPACE_KIND_RUST_SRC_DIR: ${{ runner.temp }}/kind-rust-state/src
           SPACE_KIND_CARGO_HOME: ${{ runner.temp }}/kind-rust-state/cargo-home
         run: bash infra/space/kind/scripts/build-rust-artifacts.sh
+
+      # TRIAL ONLY: stands in for main's kind_rust_state save, once.
+      - name: Pack the trial's Kind Rust build state
+        id: trial-pack
+        if: steps.state.outputs.restored != 'true' && inputs.substrate != 'direct'
+        run: >-
+          bash infra/space/kind/scripts/rust-state-cache.sh pack
+          "${RUNNER_TEMP}/kind-rust-state" "${RUNNER_TEMP}/kind-rust-state-parts"
+
+      - name: Save the trial's Kind Rust build state
+        if: steps.trial-pack.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/kind-rust-state-parts
+          key: ${{ steps.state-key.outputs.key }}
 
       - name: Export this run's artifact image
         run: |
