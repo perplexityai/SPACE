@@ -10,6 +10,7 @@ use crate::host_command::Command;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
 use std::process::Output;
+mod config_stamp;
 mod host_cache;
 
 use crate::net::{SANDBOX_SUBNET, SANDBOX_SUBNET_PREFIX_LEN};
@@ -375,13 +376,7 @@ fn guest_dhcp_bootstrap_updates(
                     .collect::<Vec<_>>()
             })
     };
-    let rules = chain
-        .and_then(|chain| chain.get("nftables"))
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|entry| entry.get("rule"))
-        .collect::<Vec<_>>();
+    let rules = chain.into_iter().flat_map(listed_rules).collect::<Vec<_>>();
     let owned = rules
         .iter()
         .filter(|rule| rule["comment"] == DHCP_BOOTSTRAP_COMMENT)
@@ -684,10 +679,8 @@ pub(crate) fn guest_vlan_packets(ns: &str) -> FirewallResult<u64> {
 
 fn guest_vlan_counter(chain: Option<&serde_json::Value>) -> u64 {
     chain
-        .and_then(|chain| chain["nftables"].as_array())
         .into_iter()
-        .flatten()
-        .filter_map(|entry| entry.get("rule"))
+        .flat_map(listed_rules)
         .filter(|rule| rule["comment"] == GUEST_VLAN_DROP_COMMENT)
         .filter_map(|rule| rule["expr"].as_array())
         .flatten()
@@ -696,11 +689,7 @@ fn guest_vlan_counter(chain: Option<&serde_json::Value>) -> u64 {
 }
 
 fn udp443_counter(chain: Option<&serde_json::Value>) -> Option<(u64, GuestUdp443Action)> {
-    let entries = chain?["nftables"].as_array()?;
-    let rule = entries
-        .iter()
-        .filter_map(|entry| entry.get("rule"))
-        .find(|rule| rule["comment"] == UDP443_COMMENT)?;
+    let rule = listed_rules(chain?).find(|rule| rule["comment"] == UDP443_COMMENT)?;
     let exprs = rule["expr"].as_array()?;
     let packets = exprs
         .iter()
@@ -756,18 +745,25 @@ fn nft_chain_output_with_args(
     Err(FirewallError::ListFailed { stderr })
 }
 
-fn nft_chain_has_rule_comment(chain: &serde_json::Value, expected_comment: &str) -> bool {
-    chain
+/// The rules of an `nft -j` listing, without configuration stamps. Every
+/// check of listed namespace rules reads them through this, so a stamp never
+/// counts as, or displaces, a rule that filters traffic.
+fn listed_rules(listing: &serde_json::Value) -> impl Iterator<Item = &serde_json::Value> {
+    listing
         .get("nftables")
         .and_then(serde_json::Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(|entry| entry.get("rule"))
-        .any(|rule| {
-            rule.get("comment")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|comment| comment == expected_comment)
-        })
+        .filter(|rule| !config_stamp::is_stamp_rule(rule))
+}
+
+fn nft_chain_has_rule_comment(chain: &serde_json::Value, expected_comment: &str) -> bool {
+    listed_rules(chain).any(|rule| {
+        rule.get("comment")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|comment| comment == expected_comment)
+    })
 }
 
 pub fn validate_namespace_firewall_config(
@@ -816,6 +812,7 @@ fn validate_guest_l2_ingress_chain(
         .ok_or_else(|| {
             FirewallValidationError::Missing("guest L2 ingress output is malformed".to_string())
         })?;
+    let rules: Vec<_> = listed_rules(chain).collect();
     let chain = entries
         .iter()
         .filter_map(|entry| entry.get("chain"))
@@ -838,10 +835,6 @@ fn validate_guest_l2_ingress_chain(
         ));
     }
 
-    let rules: Vec<_> = entries
-        .iter()
-        .filter_map(|entry| entry.get("rule"))
-        .collect();
     let [metadata_rule, raw_frame_rule, stale_gateway_mac_rule] = rules.as_slice() else {
         return Err(FirewallValidationError::Missing(
             "guest L2 ingress chain does not contain exactly its three owned rules".to_string(),
@@ -1099,12 +1092,7 @@ fn validate_pre_tproxy_guardrails_chain(
         .iter()
         .filter_map(|entry| entry.pointer("/add/rule"))
         .find(|rule| rule["comment"] == UDP443_COMMENT);
-    let mut actual = pre_tproxy_guardrails
-        .get("nftables")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|entry| entry.get("rule"))
+    let mut actual = listed_rules(pre_tproxy_guardrails)
         .enumerate()
         .filter(|(_, rule)| rule["comment"] == UDP443_COMMENT);
     let actual = actual.next().filter(|_| actual.next().is_none());
@@ -1196,12 +1184,7 @@ fn nft_chain_rule_position(
 ) -> Option<usize> {
     let expected: Vec<serde_json::Value> =
         expected.iter().map(normalize_set_membership_op).collect();
-    chain
-        .get("nftables")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|entry| entry.get("rule"))
+    listed_rules(chain)
         .filter_map(|rule| rule.get("expr").and_then(serde_json::Value::as_array))
         .position(|expr| {
             expected.iter().all(|needle| {
@@ -1257,21 +1240,13 @@ fn local_service_reply_rule_updates(
         .collect();
     let mut installed = false;
     let mut updates = Vec::new();
-    for rule in existing
-        .get("nftables")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|entry| entry.get("rule"))
-        .filter(|rule| {
-            rule.get("comment")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|comment| {
-                    comment == TPROXY_INBOUND_REPLY_COMMENT
-                        || comment == LOCAL_SERVICE_REPLY_COMMENT
-                })
-        })
-    {
+    for rule in listed_rules(existing).filter(|rule| {
+        rule.get("comment")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|comment| {
+                comment == TPROXY_INBOUND_REPLY_COMMENT || comment == LOCAL_SERVICE_REPLY_COMMENT
+            })
+    }) {
         let comment = if rule.get("comment").and_then(serde_json::Value::as_str)
             == Some(TPROXY_INBOUND_REPLY_COMMENT)
         {
@@ -1347,11 +1322,8 @@ fn owned_rule_removals(
 ) -> FirewallResult<Vec<serde_json::Value>> {
     let mut removals = Vec::new();
     for rule in existing
-        .and_then(|chain| chain.get("nftables"))
-        .and_then(serde_json::Value::as_array)
         .into_iter()
-        .flatten()
-        .filter_map(|entry| entry.get("rule"))
+        .flat_map(listed_rules)
         .filter(|rule| rule.get("comment").and_then(serde_json::Value::as_str) == Some(comment))
     {
         let handle = rule

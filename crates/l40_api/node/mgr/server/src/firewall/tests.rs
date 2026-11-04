@@ -1028,3 +1028,27 @@ fn dhcp_reconcile_accepts_nft_listing_and_repairs_old_or_duplicate_rules() {
     }
     assert_eq!(guest_dhcp_bootstrap_updates(None).unwrap().len(), 1);
 }
+
+// Stamps are inert, so a binary must accept namespaces a newer one stamped;
+// otherwise a rollback would fence every slot the newer binary installed.
+// The L2 check is the one that counts its chain's rules.
+#[test]
+fn guest_l2_check_ignores_config_stamps() {
+    for json in [
+        include_str!("../fixtures/guest_l2_ingress_nft_1_0_4.json"),
+        include_str!("../fixtures/guest_l2_ingress_nft_1_0_9.json"),
+        include_str!("../fixtures/guest_l2_ingress_nft_1_1_3.json"),
+    ] {
+        let mut chain: serde_json::Value = serde_json::from_str(json).unwrap();
+        // A stamp at the end of the chain, as nft lists it back.
+        chain["nftables"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"rule": {
+                "family": "netdev", "table": "sandbox_l2", "chain": "ingress", "handle": 9,
+                "comment": "space-cfg:l2_ingress=0123abcd",
+                "expr": [{"counter": {"packets": 5, "bytes": 300}}]
+            }}));
+        validate_guest_l2_ingress_chain(&chain).unwrap();
+    }
+}
