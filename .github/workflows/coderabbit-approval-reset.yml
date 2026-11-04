@@ -51,9 +51,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           NUMBER: ${{ github.event.pull_request.number }}
-          # The issue event for this run's own base change may not be listed
-          # yet, so the run also trusts its trigger.
-          BASE_CHANGED: ${{ github.event.action == 'edited' }}
+          # When this run was started by a base change: the time of that edit.
+          # Its issue event may not be listed yet.
+          TRIGGER_BASE_CHANGED_AT: ${{ github.event.action == 'edited' && github.event.pull_request.updated_at || '' }}
         run: |
           set -euo pipefail
           # Read the state now, not from the event: a later push or base
@@ -61,17 +61,18 @@ jobs:
           head="$(gh api "repos/${GH_REPO}/pulls/${NUMBER}" --jq '.head.sha')"
           # The latest base change, or empty if the base never changed. An
           # approval from before it was given for a different diff, even on
-          # the same head. The timestamps are UTC ISO 8601 strings, so string
-          # order is time order, and no timestamp is less than the empty
-          # string.
-          base_changed_at="$(gh api --paginate "repos/${GH_REPO}/issues/${NUMBER}/events" \
-            --jq '.[] | select(.event == "base_ref_changed") | .created_at' \
-            | sort | tail -n 1)"
+          # the same head; one given after it stays. The timestamps are UTC
+          # ISO 8601 strings, so string order is time order, the empty string
+          # sorts first, and no timestamp is less than it.
+          base_changed_at="$({
+            gh api --paginate "repos/${GH_REPO}/issues/${NUMBER}/events" \
+              --jq '.[] | select(.event == "base_ref_changed") | .created_at'
+            printf '%s\n' "${TRIGGER_BASE_CHANGED_AT}"
+          } | sort | tail -n 1)"
           ids="$(gh api --paginate "repos/${GH_REPO}/pulls/${NUMBER}/reviews" \
             --jq ".[] | select(.user.login == \"coderabbitai[bot]\"
                              and .state == \"APPROVED\"
-                             and (${BASE_CHANGED}
-                                  or .commit_id != \"${head}\"
+                             and (.commit_id != \"${head}\"
                                   or .submitted_at < \"${base_changed_at}\")) | .id")"
           # Try every review, then fail the step if any dismissal failed.
           failed=0
