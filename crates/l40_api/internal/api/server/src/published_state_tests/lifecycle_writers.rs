@@ -513,8 +513,8 @@ async fn port_exposures(pool: &PgPool, sandbox_id: SandboxId) -> TestResult<Vec<
 /// resets the observation of open port exposures only. The candidate query
 /// compares the lifecycle trimmed and lower-cased, so a padded `quarantined`
 /// is refused like the canonical one. It also reads the normalized lifecycle
-/// back as a `SandboxLifecycle`, so an unknown value fails the whole
-/// publication, which rolls back and leaves the row as it was.
+/// back as a `SandboxLifecycle`, so an unknown value skips that receipt: the
+/// publication commits and leaves the row as it was.
 #[rstest::rstest]
 #[case::created("created", SandboxQuarantineReasonCode::CreateInterrupted)]
 #[case::stopped("stopped", SandboxQuarantineReasonCode::ColdActivationInterrupted)]
@@ -548,12 +548,10 @@ async fn activation_rollback_receipt_converges_its_target_out_of_every_live_life
         );
         let published = publish(pool, node_id, report).await;
 
-        let fails_publication = stored == "bogus";
-        let converges = !fails_publication
-            && !matches!(
-                stored,
-                "quarantined" | "deleting" | "deleted" | "cleanup_required" | " Quarantined "
-            );
+        let converges = !matches!(
+            stored,
+            "quarantined" | "deleting" | "deleted" | "cleanup_required" | " Quarantined " | "bogus"
+        );
         let mut expected = before.clone();
         let mut expected_exposures = exposures_before.clone();
         if converges {
@@ -574,10 +572,7 @@ async fn activation_rollback_receipt_converges_its_target_out_of_every_live_life
         }
         let actual = row(pool, sandbox_id).await?;
         let actual_exposures = port_exposures(pool, sandbox_id).await?;
-        if published.is_err() != fails_publication
-            || actual != expected
-            || actual_exposures != expected_exposures
-        {
+        if published.is_err() || actual != expected || actual_exposures != expected_exposures {
             mismatches.push(format!(
                 "target {target}, stored {stored:?}: published {:?}, {actual:?}, \
                  {actual_exposures:?}",
@@ -609,6 +604,68 @@ async fn activation_rollback_receipt_converges_its_target_out_of_every_live_life
     publish(pool, node_id, rollback(sandbox_id, 8, attempt)).await?;
     assert_eq!(row(pool, sandbox_id).await?, before, "generation 8");
     assert_other_node_report_is_inert(pool, sandbox_id, rollback(sandbox_id, 7, attempt)).await
+}
+
+/// An activation-rollback receipt skipped for an unknown stored lifecycle
+/// skips only its own row: another rollback receipt in the same publication
+/// still converges its row, and the skipped row keeps its lifecycle,
+/// placement, execution and port exposures.
+#[tokio::test(flavor = "current_thread")]
+async fn activation_rollback_converges_past_a_receipt_skipped_for_its_stored_lifecycle()
+-> TestResult {
+    let db = pg_test_db().await?;
+    let pool = &db.pool;
+    let node_id = ready_node(pool).await?;
+
+    let mut reports = Vec::new();
+    let mut before = Vec::new();
+    for stored in ["bogus", "starting"] {
+        let (sandbox_id, _) = insert_running(pool, node_id, stored).await?;
+        clear_target_node(pool, sandbox_id).await?;
+        insert_port_exposures(pool, sandbox_id, node_id).await?;
+        let attempt = Uuid::now_v7();
+        set_activation_attempt(pool, sandbox_id, attempt, "stopped").await?;
+        before.push((
+            sandbox_id,
+            row(pool, sandbox_id).await?,
+            port_exposures(pool, sandbox_id).await?,
+        ));
+        reports.push(with_receipt(
+            published_sandbox_state(sandbox_id, "stopped"),
+            "activation_rollback",
+            "stopped",
+            7,
+            Some(attempt),
+            SandboxQuarantineReasonCode::ColdActivationInterrupted.as_str(),
+        ));
+    }
+    let mut tx = pool.begin().await?;
+    Box::pin(publish_sandbox_states(&mut tx, node_id, &reports)).await?;
+    tx.commit().await?;
+
+    let [
+        (skipped, skipped_row, skipped_exposures),
+        (converged, converged_row, converged_exposures),
+    ] = <[_; 2]>::try_from(before).map_err(|_| "two fixture rows")?;
+    assert_eq!(row(pool, skipped).await?, skipped_row);
+    assert_eq!(port_exposures(pool, skipped).await?, skipped_exposures);
+
+    let mut expected_exposures = converged_exposures;
+    expected_exposures[0] = ("open".to_owned(), "pending".to_owned(), None, None);
+    assert_eq!(
+        row(pool, converged).await?,
+        Row {
+            lifecycle: "stopped".to_owned(),
+            placement: "unplaced".to_owned(),
+            active_node_id: None,
+            target_node_id: Some(node_id),
+            execution_active: Some(false),
+            execution_state: Some("replaced".to_owned()),
+            ..converged_row
+        }
+    );
+    assert_eq!(port_exposures(pool, converged).await?, expected_exposures);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -891,8 +948,8 @@ async fn recovery_receipt_suspends_only_a_still_quarantined_row(
 /// the history. A row in any other lifecycle keeps its quarantine state. An
 /// unknown value is not a candidate. A padded `quarantined` is: the candidate
 /// query compares the lifecycle trimmed and lower-cased, but the recovery's
-/// CAS compares it exactly, misses, and fails the whole publication, which
-/// rolls back and leaves the row as it was.
+/// CAS compares it exactly, so the recovery skips that row: the publication
+/// commits and leaves the row and its quarantine as they were.
 #[rstest::rstest]
 #[case::started("started")]
 #[case::paused("paused")]
@@ -924,7 +981,6 @@ async fn healthy_report_recovers_only_a_pause_failed_quarantine(
 
         let published = publish(pool, node_id, published_sandbox_state(sandbox_id, reported)).await;
 
-        let fails_publication = stored == " Quarantined ";
         let mut expected = before.clone();
         if stored == "quarantined" {
             expected.lifecycle = reported.to_owned();
@@ -935,7 +991,7 @@ async fn healthy_report_recovers_only_a_pause_failed_quarantine(
             expected.lifecycle = "started".to_owned();
         }
         let actual = row(pool, sandbox_id).await?;
-        if published.is_err() != fails_publication || actual != expected {
+        if published.is_err() || actual != expected {
             mismatches.push(format!(
                 "reported {reported}, stored {stored:?}: published {:?}, {actual:?}",
                 published.as_ref().map(|_| ())

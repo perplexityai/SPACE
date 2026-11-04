@@ -12,6 +12,9 @@ use pplx_space_common_core::types::{
     SandboxQuarantineSource, SandboxTransitionReceiptKind, SandboxTransitionTargetState,
     SnapshotId,
 };
+use pplx_space_metrics::sandbox::publication::{
+    StatePublicationComponent, StatePublicationDisposition, StatePublicationField,
+};
 use pplx_space_sandbox_portability::{
     current_suspend_origin_marker_snapshot_ready, exact_marker_snapshot_backup_current,
     node_published_suspend_evidence, pre_quarantine_suspend_snapshot_current,
@@ -346,7 +349,7 @@ pub(super) async fn select_activation_rollback_candidates(
         SandboxActivationAttemptId,
         String,
         String,
-        SandboxLifecycle,
+        String,
         Option<String>,
     );
     let query = format!(
@@ -385,39 +388,76 @@ pub(super) async fn select_activation_rollback_candidates(
             Status::internal(format!("select activation rollback receipts: {error}"))
         })?;
 
-    rows.into_iter()
-        .map(
-            |(
+    let mut candidates = Vec::with_capacity(rows.len());
+    for (
+        sandbox_id,
+        receipt_id,
+        execution_generation,
+        activation_attempt_id,
+        target_state,
+        reason_code,
+        prior_lifecycle,
+        failure_message,
+    ) in rows
+    {
+        // The stored column has no CHECK, so it can hold text no lifecycle
+        // names. That is one row's problem: skip its receipt and leave its
+        // lifecycle as stored rather than fail the node's whole publication.
+        let Ok(prior_lifecycle) = prior_lifecycle.parse::<SandboxLifecycle>() else {
+            skip_non_canonical_stored_lifecycle(
+                node_id,
                 sandbox_id,
-                receipt_id,
-                execution_generation,
-                activation_attempt_id,
-                target_state,
-                reason_code,
-                prior_lifecycle,
-                failure_message,
-            )| {
-                Ok(ActivationRollbackCandidate {
-                    sandbox_id,
-                    receipt_id,
-                    execution_generation,
-                    activation_attempt_id,
-                    target_state: target_state.parse().map_err(|error| {
-                        Status::internal(format!(
-                            "parse activation rollback target for {sandbox_id}: {error}"
-                        ))
-                    })?,
-                    reason_code: reason_code.parse().map_err(|error| {
-                        Status::internal(format!(
-                            "parse activation rollback reason for {sandbox_id}: {error}"
-                        ))
-                    })?,
-                    prior_lifecycle,
-                    failure_message,
-                })
-            },
-        )
-        .collect()
+                StatePublicationDisposition::OmitTransitionReceipt,
+            );
+            continue;
+        };
+        candidates.push(ActivationRollbackCandidate {
+            sandbox_id,
+            receipt_id,
+            execution_generation,
+            activation_attempt_id,
+            target_state: target_state.parse().map_err(|error| {
+                Status::internal(format!(
+                    "parse activation rollback target for {sandbox_id}: {error}"
+                ))
+            })?,
+            reason_code: reason_code.parse().map_err(|error| {
+                Status::internal(format!(
+                    "parse activation rollback reason for {sandbox_id}: {error}"
+                ))
+            })?,
+            prior_lifecycle,
+            failure_message,
+        });
+    }
+    Ok(candidates)
+}
+
+/// Count and log one candidate a publication projection skipped because of
+/// its stored `sandboxes.lifecycle`. Pause-failed recovery skips a selected
+/// row whose text is not exactly `quarantined`, which its exact write could
+/// not move. Activation rollback skips a row whose trimmed, lower-cased text
+/// names no lifecycle: its writes would match, but it needs the prior
+/// lifecycle to decide restore retirement and to emit its event. The skipped
+/// projection writes nothing for the row and leaves its lifecycle as stored;
+/// the publication's other writes for that row, such as its observed state
+/// and activity clocks, are not skipped.
+fn skip_non_canonical_stored_lifecycle(
+    node_id: NodeId,
+    sandbox_id: SandboxId,
+    disposition: StatePublicationDisposition,
+) {
+    pplx_space_metrics::sandbox::publication::degraded(
+        StatePublicationComponent::Api,
+        StatePublicationField::StoredLifecycle,
+        disposition,
+    );
+    tracing::warn!(
+        %node_id,
+        %sandbox_id,
+        %disposition,
+        "skipping a sandbox whose stored lifecycle is not canonical without rejecting the publication"
+    );
 }
 
 /// Consume rollback receipts after their generation fence has been locked.
@@ -576,6 +616,13 @@ async fn rollback_restore_retirable(
 /// Clear an sbx-manager-authored pause failure after the same node publishes a
 /// definitive healthy runtime state. The caller's publication transaction
 /// keeps the selected sandbox and quarantine rows locked through retirement.
+///
+/// The selection compares the stored lifecycle trimmed and lower-cased, but
+/// the recovery's write compares it exactly. A selected row stored as a
+/// non-canonical spelling of `quarantined`, such as ` Quarantined`, is skipped
+/// before the write, and its lifecycle and quarantine are left as stored. Any
+/// other miss of the write still fails the publication, since the write may
+/// have applied in part.
 pub(super) async fn recover_pause_failed_from_inventory(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
@@ -585,8 +632,8 @@ pub(super) async fn recover_pause_failed_from_inventory(
         pplx_space_sandbox_store::ingest::PAUSE_FAILED_QUARANTINE_SOURCE.as_str();
     let quarantine_reason =
         pplx_space_sandbox_store::ingest::PAUSE_FAILED_QUARANTINE_REASON.as_str();
-    let candidates: Vec<(Uuid, Uuid, String)> = sqlx::query_as(sql!(
-        "SELECT s.id, qs.quarantine_id, input.published_lifecycle
+    let candidates: Vec<(SandboxId, Uuid, String, String)> = sqlx::query_as(sql!(
+        "SELECT s.id, qs.quarantine_id, input.published_lifecycle, s.lifecycle
            FROM sandboxes s
            JOIN jsonb_to_recordset($2::jsonb) AS input(
                sandbox_id UUID,
@@ -613,7 +660,18 @@ pub(super) async fn recover_pause_failed_from_inventory(
     })?;
 
     let mut recoveries = Vec::with_capacity(candidates.len());
-    for (sandbox_id, quarantine_id, target_state) in candidates {
+    for (sandbox_id, quarantine_id, target_state, stored_lifecycle) in candidates {
+        if !matches!(
+            stored_lifecycle.parse::<SandboxLifecycle>(),
+            Ok(SandboxLifecycle::Quarantined)
+        ) {
+            skip_non_canonical_stored_lifecycle(
+                node_id,
+                sandbox_id,
+                StatePublicationDisposition::SkipPauseFailedRecovery,
+            );
+            continue;
+        }
         let target_state = target_state.parse().map_err(|error| {
             Status::internal(format!(
                 "parse pause-failed quarantine recovery target for {sandbox_id}: {error}"
@@ -635,7 +693,7 @@ pub(super) async fn recover_pause_failed_from_inventory(
         let recovered = pplx_space_sandbox_store::ingest::recover_published_pause_failed(
             &mut *conn,
             node_id,
-            SandboxId::from_uuid(sandbox_id),
+            sandbox_id,
             quarantine_id,
             target_state,
             action,
@@ -649,7 +707,7 @@ pub(super) async fn recover_pause_failed_from_inventory(
         }
 
         recoveries.push(PauseFailedQuarantineRecovery {
-            sandbox_id: SandboxId::from_uuid(sandbox_id),
+            sandbox_id,
             target_state,
         });
     }
