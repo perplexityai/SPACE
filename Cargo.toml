@@ -148,6 +148,7 @@ members = [
     "crates/libs/accounts",
     "crates/libs/federated-identity",
     "crates/libs/guest-process",
+    "crates/l10_foundation/guest/capability",
     "crates/libs/request-id",
     "crates/libs/execution-spec",
     "crates/libs/linux-ids",
@@ -430,6 +431,7 @@ pplx-space-cluster-id = { path = "crates/libs/cluster-id" }
 pplx-space-accounts = { path = "crates/libs/accounts" }
 pplx-space-federated-identity = { path = "crates/libs/federated-identity" }
 pplx-space-guest-process = { path = "crates/libs/guest-process" }
+pplx-space-guest-capability = { path = "crates/l10_foundation/guest/capability" }
 pplx-space-request-id = { path = "crates/libs/request-id" }
 pplx-space-execution-spec = { path = "crates/libs/execution-spec" }
 pplx-space-linux-ids = { path = "crates/libs/linux-ids" }

@@ -1,7 +1,7 @@
-# Install the native readiness service in a privately prepared evaluation image.
-# Tenant process/file operations and memory lifecycle are not qualified by this script.
+# Install the native service and optionally provision a regular process/file account.
+# This does not qualify VM memory lifecycle.
 [CmdletBinding()]
-param([Parameter(Mandatory = $true)][string]$Executable)
+param([Parameter(Mandatory = $true)][string]$Executable, [switch]$EnableOperations)
 $ErrorActionPreference = 'Stop'
 $source = (Resolve-Path -LiteralPath $Executable).Path
 $directory = Join-Path $env:ProgramData 'SPACE'
@@ -37,6 +37,36 @@ foreach ($sid in @('S-1-5-18', 'S-1-5-32-544')) {
     $acl.AddAccessRule($rule)
 }
 Set-Acl -LiteralPath $directory -AclObject $acl
+if ($EnableOperations) {
+    $credentialPath = Join-Path $directory 'identity.json'
+    if (-not (Test-Path -LiteralPath $credentialPath)) {
+        if (Get-LocalUser -Name user -ErrorAction SilentlyContinue) {
+            throw 'Refusing to take over an existing user account without SPACE identity evidence.'
+        }
+        $random = [byte[]]::new(32)
+        $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+        try { $rng.GetBytes($random) } finally { $rng.Dispose() }
+        $password = [Convert]::ToBase64String($random) + 'aA1!'
+        $secure = ConvertTo-SecureString $password -AsPlainText -Force
+        $createdUser = New-LocalUser -Name user -Password $secure -AccountNeverExpires -PasswordNeverExpires -UserMayNotChangePassword -Description 'SPACE session-0 process account'
+        try {
+            $users = Get-LocalGroup -SID 'S-1-5-32-545'
+            Add-LocalGroupMember -Group $users -Member $createdUser
+            # This directory is already restricted to SYSTEM and Administrators.
+            # Never print this private per-image credential or include it in source.
+            $json = @{ user = 'user'; password = $password } | ConvertTo-Json -Compress
+            [IO.File]::WriteAllText($credentialPath, $json, [Text.UTF8Encoding]::new($false))
+        } catch {
+            Remove-Item -LiteralPath $credentialPath -Force -ErrorAction SilentlyContinue
+            Remove-LocalUser -SID $createdUser.SID -ErrorAction SilentlyContinue
+            throw
+        } finally {
+            $password = $null; $json = $null
+            $secure.Dispose(); $secure = $null
+            [Array]::Clear($random, 0, $random.Length)
+        }
+    }
+}
 $existing = Get-CimInstance Win32_Service -Filter "Name='spaced'"
 if ($existing -and $existing.PathName.Trim('"') -ne $target) {
     throw 'An unrelated spaced service already exists; refusing to replace it.'
@@ -45,7 +75,7 @@ if ($existing) { Stop-Service spaced }
 # Unlink an old destination instead of writing through a possible hard link.
 if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Force }
 Copy-Item -LiteralPath $source -Destination $target -Force
-# The privileged service exposes readiness only. It does not run tenant commands.
+# The privileged service launches tenant work only with the provisioned regular account.
 if (-not $existing) {
     New-Service -Name spaced -BinaryPathName ('"' + $target + '"') -StartupType Automatic -DependsOn VirtioSocket | Out-Null
 } else {

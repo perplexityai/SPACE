@@ -475,3 +475,36 @@ fn validate_value(value: &str) -> Result<(), EnvParseError> {
 
 #[cfg(test)]
 mod tests;
+
+/// Windows environment overrides, with bounded values and case-insensitive keys.
+#[derive(Clone)]
+pub struct WindowsEnv(HashMap<String, String>);
+impl WindowsEnv {
+    pub fn parse(values: HashMap<String, String>) -> Result<Self, EnvParseError> {
+        if values.len() > MAX_ENV_ENTRIES {
+            return Err(EnvParseError("too many Windows environment entries"));
+        }
+        let mut keys = std::collections::HashSet::new();
+        let mut bytes = 0usize;
+        for (key, value) in &values {
+            if key.is_empty() || key.len() > MAX_ENV_KEY_BYTES || key.contains(['=', '\0']) {
+                return Err(EnvParseError("invalid Windows environment key"));
+            }
+            validate_value(value)?;
+            if !keys.insert(key.to_uppercase()) {
+                return Err(EnvParseError("case-duplicate Windows environment key"));
+            }
+            bytes += key.len() + value.len();
+            if bytes > MAX_ENV_TOTAL_BYTES {
+                return Err(EnvParseError("Windows environment exceeds limit"));
+            }
+        }
+        Ok(Self(values))
+    }
+    pub fn as_map(&self) -> &HashMap<String, String> {
+        &self.0
+    }
+    pub fn into_map(self) -> HashMap<String, String> {
+        self.0
+    }
+}

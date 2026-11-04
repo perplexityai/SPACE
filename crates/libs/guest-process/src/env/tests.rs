@@ -235,3 +235,21 @@ fn env_map_sanitize_caps_total_bytes() {
         }]
     );
 }
+
+#[test]
+fn windows_environment_preserves_native_keys_and_refuses_ambiguous_overrides() {
+    for (entries, accepted) in [
+        (vec![("ProgramFiles(x86)", "C:\\Program Files (x86)")], true),
+        (vec![("Path", "a"), ("PATH", "b")], false),
+        (vec![("", "x")], false),
+        (vec![("A=B", "x")], false),
+        (vec![("A", "x\0")], false),
+    ] {
+        let values = entries
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
+        assert_eq!(WindowsEnv::parse(values).is_ok(), accepted);
+    }
+    EnvKey::parse("ProgramFiles(x86)").unwrap_err();
+}

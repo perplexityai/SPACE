@@ -53,7 +53,7 @@ pub fn validate_spaced_guest_compatibility(
     if !SUPPORTED_GUESTS.matches(&version) {
         return Err(GuestCompatibilityError::UnsupportedVersion { version });
     }
-    let expected = compatibility_family(&version);
+    let expected = pplx_space_spaced_guest_protocol::compatibility_family(&version);
     if family != expected {
         return Err(GuestCompatibilityError::InconsistentFamily {
             version,
@@ -62,18 +62,6 @@ pub fn validate_spaced_guest_compatibility(
         });
     }
     Ok(())
-}
-
-pub(super) fn compatibility_family(version: &semver::Version) -> String {
-    if version.major == 0 {
-        if version.minor == 0 {
-            format!("0.0.{}", version.patch)
-        } else {
-            format!("0.{}", version.minor)
-        }
-    } else {
-        version.major.to_string()
-    }
 }
 
 #[cfg(test)]

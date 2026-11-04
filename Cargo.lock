@@ -5357,6 +5357,7 @@ dependencies = [
  "hyper-util",
  "pplx-space-common-core",
  "pplx-space-grpc-metrics",
+ "pplx-space-guest-capability",
  "pplx-space-metrics-emit",
  "pplx-space-observability",
  "rand 0.10.2",
@@ -5965,6 +5966,14 @@ dependencies = [
  "tonic",
  "tower",
  "tracing",
+]
+
+[[package]]
+name = "pplx-space-guest-capability"
+version = "0.8.1"
+dependencies = [
+ "thiserror 2.0.20",
+ "tonic",
 ]
 
 [[package]]
@@ -7449,7 +7458,6 @@ dependencies = [
 name = "pplx-space-spaced-guest-protocol"
 version = "0.8.1"
 dependencies = [
- "semver",
  "anyhow",
  "pplx-space-common-proto-build",
  "pplx-space-guest-process",
@@ -7457,6 +7465,7 @@ dependencies = [
  "pplx-space-spaced-build",
  "prost",
  "prost-types",
+ "semver",
  "tokio",
  "tonic",
  "tonic-prost",
@@ -7516,8 +7525,15 @@ dependencies = [
 name = "pplx-space-spaced-guest-windows"
 version = "0.8.1"
 dependencies = [
+ "blake3",
+ "futures-util",
+ "pplx-space-guest-capability",
+ "pplx-space-guest-process",
  "pplx-space-spaced-guest-protocol",
+ "prost",
  "prost-types",
+ "serde",
+ "serde_json",
  "socket2",
  "thiserror 2.0.20",
  "tokio",
@@ -7525,8 +7541,10 @@ dependencies = [
  "tokio-util",
  "tonic",
  "tracing",
+ "uuid",
  "windows-service",
  "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]

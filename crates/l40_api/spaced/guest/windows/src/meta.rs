@@ -1,32 +1,21 @@
 use pplx_space_spaced_guest_protocol::{
     platform::{GuestPlatform, require_host_contract},
-    proto::{bridge_guest::*, platform::GuestOs},
+    proto::{
+        bridge_guest::*,
+        platform::{GuestOperation, GuestOs},
+    },
 };
 use tonic::{Request, Response, Status};
 
 #[derive(Clone)]
-pub(super) struct Meta;
-
-pub(super) fn service() -> meta_server::MetaServer<Meta> {
-    meta_server::MetaServer::new(Meta)
-        .max_decoding_message_size(64 * 1024)
-        .max_encoding_message_size(64 * 1024)
+pub(super) struct Meta {
+    operations: bool,
 }
 
-fn unsupported() -> Status {
-    let mut status =
-        Status::failed_precondition("operation is not implemented by the Windows guest");
-    status.metadata_mut().insert(
-        "space-guest-capability-error",
-        "guest_capability_unsupported"
-            .parse()
-            .expect("static metadata"),
-    );
-    status.metadata_mut().insert(
-        "space-guest-capability",
-        "platform_operations".parse().expect("static metadata"),
-    );
-    status
+pub(super) fn service(operations: bool) -> meta_server::MetaServer<Meta> {
+    meta_server::MetaServer::new(Meta { operations })
+        .max_decoding_message_size(64 * 1024)
+        .max_encoding_message_size(64 * 1024)
 }
 
 #[tonic::async_trait]
@@ -48,6 +37,14 @@ impl meta_server::Meta for Meta {
         // SAFETY: GetTickCount64 takes no pointers and is available on all supported Windows versions.
         let milliseconds =
             unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() };
+        let mut platform = GuestPlatform::for_target().wire();
+        if self.operations {
+            platform.operations.extend([
+                GuestOperation::Process as i32,
+                GuestOperation::Files as i32,
+                GuestOperation::InteractiveProcessControl as i32,
+            ]);
+        }
         Ok(Response::new(WaitReadyResponse {
             ready: true,
             guest_uptime: Some(prost_types::Duration {
@@ -60,25 +57,31 @@ impl meta_server::Meta for Meta {
             vcpu_count: std::thread::available_parallelism()
                 .ok()
                 .and_then(|n| u32::try_from(n.get()).ok()),
-            platform: Some(GuestPlatform::for_target().wire()),
+            platform: Some(platform),
         }))
     }
     async fn configure_process_env(
         &self,
         _: Request<ConfigureProcessEnvRequest>,
     ) -> Result<Response<ConfigureProcessEnvResponse>, Status> {
-        Err(unsupported())
+        Err(super::unsupported(
+            "process environment is not qualified on Windows",
+        ))
     }
     async fn notify_resume(
         &self,
         _: Request<NotifyResumeRequest>,
     ) -> Result<Response<NotifyResumeResponse>, Status> {
-        Err(unsupported())
+        Err(super::unsupported(
+            "Windows memory lifecycle is not qualified",
+        ))
     }
     async fn flush_filesystems(
         &self,
         _: Request<FlushFilesystemsRequest>,
     ) -> Result<Response<FlushFilesystemsResponse>, Status> {
-        Err(unsupported())
+        Err(super::unsupported(
+            "Windows memory lifecycle is not qualified",
+        ))
     }
 }

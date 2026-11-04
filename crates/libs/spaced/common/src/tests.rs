@@ -67,3 +67,28 @@ fn interactive_process_control_requires_guest_version_with_bridge_rpcs() {
     assert!(spaced_guest_supports_interactive_process_control("0.1.2").unwrap());
     assert!(spaced_guest_supports_interactive_process_control("0.1.3").unwrap());
 }
+
+#[test]
+fn lifecycle_qualification_agrees_with_the_guest_operation_allowlist() {
+    use pplx_space_common_core::types::guest_image::QualifiedGuestAgent;
+    use proto::platform::GuestOperation;
+    for agent in [
+        QualifiedGuestAgent::Absent,
+        QualifiedGuestAgent::LinuxV1,
+        QualifiedGuestAgent::WindowsV1,
+    ] {
+        let allowed = allowed_guest_operations(agent);
+        assert_eq!(
+            agent.supports_process_environment(),
+            allowed.contains(&GuestOperation::ProcessEnvironment)
+        );
+        assert_eq!(
+            agent.supports_filesystem_flush(),
+            allowed.contains(&GuestOperation::Flush)
+        );
+        assert_eq!(
+            agent.supports_memory_lifecycle(),
+            allowed.contains(&GuestOperation::Flush) && allowed.contains(&GuestOperation::Resume)
+        );
+    }
+}
