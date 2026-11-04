@@ -6,9 +6,7 @@ use pplx_space_common_core::types::SubstrateKind;
 
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::PositiveDuration;
-use pplx_space_sandbox_portability::{
-    SuspendedTargetNodeAssignment, failed_repair_revert_eligibility, suspended_k8s_finalization_sql,
-};
+use pplx_space_sandbox_portability::failed_repair_revert_eligibility;
 use pplx_space_sandbox_store::repair;
 use sqlx::PgPool;
 
@@ -98,20 +96,20 @@ impl RepairDbStore {
         .execute(&mut *tx)
         .await?;
 
-        // Only the port-exposure assignments are read from this renderer;
-        // they do not depend on the marker policy the flip above applied.
-        let finalization =
-            suspended_k8s_finalization_sql("s", "pre", "", SuspendedTargetNodeAssignment::Clear);
-        let query = format!(
+        sqlx::query(sql!(
             "UPDATE sandbox_port_exposures
-                SET {assignments}
-              WHERE sandbox_id = $1 AND desired_state = 'open'",
-            assignments = finalization.open_port_exposure_assignments(),
-        );
-        sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
-            .bind(candidate.sandbox_id)
-            .execute(&mut *tx)
-            .await?;
+                SET apply_state = 'pending',\n\
+                    last_applied_node_id = NULL,\n\
+                    last_error = NULL,\n\
+                    last_bridge_status = NULL,\n\
+                    last_applied_bridge_generation = NULL,\n\
+                    last_observed_at = NULL,\n\
+                    updated_at = NOW()
+              WHERE sandbox_id = $1 AND desired_state = 'open'"
+        ))
+        .bind(candidate.sandbox_id)
+        .execute(&mut *tx)
+        .await?;
 
         tx.commit().await?;
         Ok(if cleared_marker {
