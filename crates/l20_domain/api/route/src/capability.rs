@@ -13,6 +13,7 @@ pub const SPACE_API_ROUTE_ED25519_TOKEN_METADATA_KEY: &str = "x-space-api-route-
 #[serde(rename_all = "snake_case")]
 pub enum SpaceApiRoutePurpose {
     SpaceApiBridge,
+    #[serde(rename = "service_port")]
     ServicePortIngress,
 }
 
@@ -20,7 +21,7 @@ impl SpaceApiRoutePurpose {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::SpaceApiBridge => "space_api_bridge",
-            Self::ServicePortIngress => "service_port_ingress",
+            Self::ServicePortIngress => "service_port",
         }
     }
 }
@@ -37,7 +38,7 @@ impl FromStr for SpaceApiRoutePurpose {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         Ok(match value {
             "space_api_bridge" => Self::SpaceApiBridge,
-            "service_port_ingress" => Self::ServicePortIngress,
+            "service_port" => Self::ServicePortIngress,
             _ => return Err(SpaceApiRoutePurposeParseError),
         })
     }
