@@ -1136,7 +1136,7 @@ pub async fn delete_template(
         admission.observation(),
         ObservePublicOperationIdempotency::Missing
     ) {
-        match TemplateInUse::check(&mut **admission.transaction(), &template_name).await {
+        match TemplateInUse::check(admission.transaction(), &template_name).await {
             Ok(None) => {}
             Ok(Some(in_use)) => {
                 return api_error_with_details(
