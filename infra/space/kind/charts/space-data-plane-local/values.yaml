@@ -47,11 +47,38 @@ nodeApiTokenExpirationSeconds: 600
 # soon as none remain (serve_and_drain, crates/l40_api/data/plane/server/src/drain.rs).
 # Streams still open after --shutdown-grace-secs are cancelled, each in the form
 # docs/architecture.md describes, and then get 5 s (STREAM_CANCEL_GRACE) before
-# the process exits regardless. Sized like the API's 150 s shutdown grace, for
-# the same clients' in-flight work. The chart always sets this deadline; the
-# binary's no-deadline mode is for deployments that rely on the termination
-# grace period alone.
-shutdownGraceSeconds: 150
+# the process exits regardless. Sized for a Native files request taken just
+# before SIGTERM (nativeFiles below: 25 + 135 + 15 s), which outlasts the API's
+# 150 s shutdown grace for the same clients' other in-flight work. The chart
+# always sets this deadline; the binary's no-deadline mode is for deployments
+# that rely on the termination grace period alone.
+shutdownGraceSeconds: 175
+
+# Native `files:*` (SPACE_DATA_PLANE_NATIVE_FILES); off leaves the routes
+# unmounted.
+nativeFiles:
+  enabled: false
+  # A files request taken just before SIGTERM runs in three steps, and the
+  # drain deadline cuts whatever it has not finished, so with nativeFiles
+  # enabled the template refuses a shutdownGraceSeconds under
+  # uploadSeconds + 135 + transferSeconds.
+  #
+  # How long a request may take before it wakes its sandbox: its
+  # authorization and Native upload admission, then reading its whole body,
+  # which a write sends before the sandbox is asked. Sized for the largest
+  # write body (WRITE_FILE_BODY_LIMIT_BYTES, about 22 MiB for 16 MiB of data)
+  # at 1 MiB/s, a slow uplink, which takes 22 s, plus the admission's 2 s wait
+  # (SPACE_DATA_PLANE_NATIVE_UPLOAD_ADMISSION_WAIT_MS) and the authorization's
+  # round trip to the API. There is no body timeout: a slower upload still
+  # runs, and only a drain cuts it.
+  uploadSeconds: 25
+  # Then up to 135 s for its sandbox to wake (the API's blocking wait budget,
+  # NODE_RPC_BLOCKING_BUDGET in
+  # crates/l40_api/api/src/controllers/substrate/node_api_client.rs).
+  #
+  # Then how long it may still take once its sandbox is awake: the largest
+  # write's or read's transfer.
+  transferSeconds: 15
 
 # Seconds the pod keeps serving after it starts terminating, before SIGTERM,
 # so it leaves the entry Services' endpoints first: kube-proxy drops an
@@ -62,7 +89,7 @@ preStopSleepSeconds: 5
 # Covers the preStop delay, the shutdown grace, the 5 s the data plane gives
 # cancelled streams to close, and the telemetry flush and exit after it. The
 # template refuses a value that does not exceed the first three.
-terminationGracePeriodSeconds: 180
+terminationGracePeriodSeconds: 205
 
 # The boot budget. The listener binds only once ClusterApi answers: startup
 # retries it with backoff to 5 s, each attempt with a 5 s connect timeout

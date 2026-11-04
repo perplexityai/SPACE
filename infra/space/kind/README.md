@@ -1680,11 +1680,12 @@ too. Each chart's values cite the code behind its numbers.
   restore leader, a suspend continuation) within that grace. A 5 s preStop
   sleep keeps the pod serving while it leaves the entry Services' endpoints,
   and the 180 s termination grace covers both plus exit. The data plane renders
-  its own `--shutdown-grace-secs` at 150 s: on SIGTERM it stops accepting and
+  its own `--shutdown-grace-secs` at 175 s, sized for a Native files request
+  (its upload, a 135 s wake and its transfer): on SIGTERM it stops accepting and
   refuses new streams, keeps attached streams (native SSE and WebSockets, ECW
   process and file streams, upgraded proxies and ingress) running until they
   end, and cancels whatever is left at the deadline, giving those streams 5 s
-  to close. It gets the same preStop delay, and its 180 s grace covers the
+  to close. It gets the same preStop delay, and its 205 s grace covers the
   preStop, the drain, those 5 s and exit; the chart refuses a grace that
   doesn't exceed the first three. internal-api waits for in-flight ClusterApi calls,
   which the server does not bound and every client times out at 30 s, with a

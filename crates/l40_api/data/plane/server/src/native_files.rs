@@ -30,6 +30,7 @@ use axum::{
 };
 use pplx_space_common_core::types::{OrgId, SandboxId};
 use pplx_space_guest_process::IdempotencyKey;
+use pplx_space_metrics::response::{ResponseKind, ResponseOrigin};
 use pplx_space_native_files::FileOperation;
 use pplx_space_native_files::limits::{
     WRITE_FILE_BATCH_BODY_LIMIT_BYTES, WRITE_FILE_BODY_LIMIT_BYTES,
@@ -148,6 +149,11 @@ impl FileRequest {
         operation: FileOperation,
         request: Request<Body>,
     ) -> Result<(Self, Body), Refusal> {
+        // A replica that is leaving takes no new request; the retry reaches
+        // one that is not, as a refused stream's does.
+        if state.drain_started.is_cancelled() {
+            return Err(draining().into());
+        }
         let Some(files) = state.native_files.clone() else {
             // The routes are mounted only with a client to the API.
             return Err(PublicApiError::internal().into());
@@ -269,6 +275,18 @@ pub(super) fn idempotency_key(headers: &HeaderMap) -> Result<IdempotencyKey, Ref
 /// A field check's refusal, as the API answers it.
 pub(super) fn rejected(error: impl Into<PublicApiError>) -> Refusal {
     error.into().into()
+}
+
+/// A files request refused because this replica is draining: the Native
+/// `service_unavailable` envelope with the drain's `Retry-After`, and on
+/// HTTP/1 the connection closed after it.
+fn draining() -> Response {
+    let mut response = PublicApiError::service_unavailable("data plane is draining; retry")
+        .with_classification(ResponseOrigin::DataPlane, ResponseKind::Admission)
+        .with_retry_after(crate::drain::DRAINING_RETRY_AFTER)
+        .into_response();
+    crate::drain::mark_draining_response(&mut response);
+    response
 }
 
 /// The API's answer to a files route called with another method than POST:
