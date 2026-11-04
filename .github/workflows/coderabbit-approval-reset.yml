@@ -13,7 +13,8 @@ name: CodeRabbit approval reset
 # checks out, builds, or runs pull request code, and it never places titles,
 # bodies, branch names, or other contributor-controlled text in a shell
 # command. It uses only the pull request number, the repository name, and the
-# review IDs, authors, states, and commit IDs that the API returns.
+# review and event fields (IDs, authors, states, commit IDs, timestamps) that
+# the API returns.
 
 on:
   pull_request_target:
@@ -21,9 +22,10 @@ on:
 
 permissions: {}
 
-# A run waiting in the pull request's group is replaced by the next one. The
-# newest run reads the current head itself, so that loses nothing, as long as
-# the replacing run does the work. Events the job skips (edits that do not
+# A run waiting in the pull request's group is replaced by the next one. Every
+# run applies the whole rule to the pull request's current state (its head and
+# its base changes), whatever event started it, so that loses nothing as long
+# as the replacing run does the work. Events the job skips (edits that do not
 # change the base) therefore get a group of their own; keep this condition the
 # same as the job's `if`.
 concurrency:
@@ -40,6 +42,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
+      # Issue events list the pull request's base changes.
+      issues: read
       pull-requests: write
     steps:
       - name: Dismiss approvals that do not cover the current head and base
@@ -47,18 +51,28 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           NUMBER: ${{ github.event.pull_request.number }}
+          # The issue event for this run's own base change may not be listed
+          # yet, so the run also trusts its trigger.
           BASE_CHANGED: ${{ github.event.action == 'edited' }}
         run: |
           set -euo pipefail
-          # Read the head now, not from the event: a later push may already
-          # have landed, and its approval must stay.
+          # Read the state now, not from the event: a later push or base
+          # change may already have landed.
           head="$(gh api "repos/${GH_REPO}/pulls/${NUMBER}" --jq '.head.sha')"
-          # After a base change, every earlier approval was given for a
-          # different diff, even on the same head.
+          # The latest base change, or empty if the base never changed. An
+          # approval from before it was given for a different diff, even on
+          # the same head. The timestamps are UTC ISO 8601 strings, so string
+          # order is time order, and no timestamp is less than the empty
+          # string.
+          base_changed_at="$(gh api --paginate "repos/${GH_REPO}/issues/${NUMBER}/events" \
+            --jq '.[] | select(.event == "base_ref_changed") | .created_at' \
+            | sort | tail -n 1)"
           ids="$(gh api --paginate "repos/${GH_REPO}/pulls/${NUMBER}/reviews" \
             --jq ".[] | select(.user.login == \"coderabbitai[bot]\"
                              and .state == \"APPROVED\"
-                             and (${BASE_CHANGED} or .commit_id != \"${head}\")) | .id")"
+                             and (${BASE_CHANGED}
+                                  or .commit_id != \"${head}\"
+                                  or .submitted_at < \"${base_changed_at}\")) | .id")"
           # Try every review, then fail the step if any dismissal failed.
           failed=0
           for id in ${ids}; do
