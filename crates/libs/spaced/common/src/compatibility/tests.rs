@@ -7,6 +7,7 @@ fn guest_support_is_directional_and_requires_consistent_identity() {
         (Some("0.1.4"), Some("0.1"), true),
         (Some("0.7.0"), Some("0.7"), true),
         (Some("0.8.0"), Some("0.8"), true),
+        (Some("0.8.1"), Some("0.8"), true),
         (Some("0.8.99+build.1"), Some("0.8"), true),
         (Some("0.0.9"), Some("0.0.9"), false),
         (Some("0.1.0-rc.1"), Some("0.1"), false),

@@ -293,3 +293,81 @@ async fn process_connect_and_kill_relay_to_guest_bridge() {
     fixture.stop().await;
     bridge_task.abort();
 }
+
+#[tokio::test]
+async fn readiness_only_guest_cannot_gain_operations_from_its_version() {
+    for ready in [false, true] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket = temp_dir.path().join("bridge.sock");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut platform = pplx_space_spaced_common::platform::GuestPlatform::linux().wire();
+        platform.operations.clear();
+        let task = start_mock_bridge_guest_with_service(
+            socket.clone(),
+            MockBridgeGuest {
+                platform: Some(platform),
+                ready,
+                interactive_process_control_calls: Some(calls.clone()),
+                ..MockBridgeGuest::default()
+            },
+        )
+        .await;
+        let fixture = HostFixture::start(Some(socket)).await;
+        let client = fixture.client().await;
+        if ready {
+            client
+                .wait_ready(std::time::Duration::from_secs(1))
+                .await
+                .unwrap();
+        }
+        let error = client
+            .send_input("proc-1".into(), b"hello stdin\n".to_vec())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            pplx_space_common_grpc::GuestCapabilityUnsupported::from_status(&error)
+                .map(|unsupported| unsupported.capability),
+            Some(pplx_space_common_grpc::GuestCapability::PlatformOperations)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        fixture.stop().await;
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn operation_connection_does_not_inherit_readiness_capabilities() {
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("guest.sock");
+    let withdrawn = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let task = start_mock_bridge_guest_with_service(
+        socket.clone(),
+        MockBridgeGuest {
+            platform: Some(pplx_space_spaced_common::platform::GuestPlatform::linux().wire()),
+            platform_withdrawn: Some(withdrawn.clone()),
+            interactive_process_control_calls: Some(calls.clone()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let fixture = HostFixture::start(Some(socket)).await;
+    let client = fixture.client().await;
+    client
+        .wait_ready(std::time::Duration::from_secs(1))
+        .await
+        .unwrap();
+    // Readiness previously observed process support on the metadata connection.
+    // The new operation connection must obtain and enforce its own observation.
+    withdrawn.store(true, Ordering::SeqCst);
+    let error = client
+        .send_input("proc-1".into(), b"hello stdin\n".to_vec())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(pplx_space_common_grpc::GuestCapabilityUnsupported::from_status(&error).is_some());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    fixture.stop().await;
+    task.abort();
+}

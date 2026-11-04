@@ -5,6 +5,11 @@ fn main() -> anyhow::Result<()> {
         proto_root.clone(),
         pplx_space_spaced_build::protobuf_include_dir()?,
     ];
+    pplx_space_common_proto_build::compile_protos(
+        tonic_prost_build::configure(),
+        &[proto_root.join("spaced/platform/v1/platform.proto")],
+        &shared_includes,
+    )?;
     let operations_proto = proto_root.join("spaced/operations/v1/operations.proto");
     let operations_builder = tonic_prost_build::configure()
         .type_attribute(
@@ -20,7 +25,8 @@ fn main() -> anyhow::Result<()> {
     )?;
 
     let builder = tonic_prost_build::configure()
-        .extern_path(".space.spaced.operations.v1", "crate::proto::operations");
+        .extern_path(".space.spaced.operations.v1", "crate::proto::operations")
+        .extern_path(".space.spaced.platform.v1", "crate::proto::platform");
     pplx_space_common_proto_build::compile_protos(
         builder,
         &[

@@ -3,11 +3,12 @@ use crate::guest_service::{
     connect_uds, create_guest_service, create_ready_guest_service, create_ready_guest_service_with,
     start_mock_bridge_host,
 };
+#[cfg(target_os = "linux")]
+use pplx_space_spaced_common::proto::bridge_guest::WaitReadyRequest as BridgeGuestWaitReadyRequest;
 use pplx_space_spaced_common::proto::bridge_guest::filesystem_client::FilesystemClient as BridgeGuestFilesystemClient;
 use pplx_space_spaced_common::proto::bridge_guest::meta_client::MetaClient as BridgeGuestClient;
 use pplx_space_spaced_common::proto::bridge_guest::{
     PingRequest as BridgeGuestPingRequest, StatRequest,
-    WaitReadyRequest as BridgeGuestWaitReadyRequest,
 };
 use pplx_space_spaced_guest_client::proto::{
     ActivityState, PingRequest as LocalPingRequest,
@@ -17,6 +18,7 @@ use pplx_space_spaced_guest_client::proto::{
 };
 use std::os::unix::fs::PermissionsExt as _;
 
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn bridge_guest_wait_ready_returns_guest_readiness() {
     let temp_dir = tempfile::tempdir().expect("temp dir created");
@@ -34,6 +36,7 @@ async fn bridge_guest_wait_ready_returns_guest_readiness() {
 
     let response = client
         .wait_ready(BridgeGuestWaitReadyRequest {
+            host_contract_revision: 0,
             timeout: Some(duration_from_millis(100)),
         })
         .await

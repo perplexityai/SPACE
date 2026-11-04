@@ -29,6 +29,7 @@ impl Networking for SpacedHostService {
         let response = self
             .call_bridge_guest_networking_once(
                 "bridge_guest_open_loopback_bridge",
+                Requirement::Operations(&[GuestOperation::LoopbackForward]),
                 BridgeGuestOperationBudget::NetworkingOpen {
                     wait_timeout: budget_wait_timeout,
                 },
@@ -72,6 +73,7 @@ impl Networking for SpacedHostService {
         let _ = self
             .call_bridge_guest_networking_once(
                 "bridge_guest_close_loopback_bridge",
+                Requirement::Teardown,
                 BridgeGuestOperationBudget::NetworkingControl,
                 |mut client| async move {
                     client

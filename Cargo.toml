@@ -176,7 +176,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.8.0"
+version = "0.8.1"
 edition = "2024"
 # Minimum supported Rust version (MSRV) floor. Cargo refuses to build on any
 # toolchain below this, giving a clear "requires rustc >= X" error instead of a

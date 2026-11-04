@@ -7,6 +7,8 @@ use crate::bridge::{
 use crate::protocol::*;
 use pplx_space_common_core::types::{Pii, RelativeGuestPath};
 
+// Bound an opaque owner identifier independently of the streamed list budget.
+const MAX_GUEST_OWNER_SID_BYTES: usize = 1024;
 const MAX_GUEST_FILE_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_GUEST_FILE_LIST_ENTRIES: usize = 10_000;
 const MAX_GUEST_FILE_LIST_METADATA_BYTES: usize = 4 * 1024 * 1024;
@@ -15,6 +17,63 @@ const MAX_GUEST_MODIFIED_FILE_KINDS: usize = 5;
 const MAX_GUEST_WATCHER_EVENTS: usize = 4_096;
 
 impl SpacedHostService {
+    /// Acquire and negotiate before consuming a write body. No dispatched write
+    /// is replayed; only this pre-dispatch phase shares the bounded retry budget.
+    async fn authorized_write_client(
+        &self,
+        command: &'static str,
+    ) -> Result<
+        pplx_space_spaced_common::LazyClientLease<
+            OperationClient<BridgeGuestFilesystemClient<tonic::transport::Channel>>,
+        >,
+        Status,
+    > {
+        let failed = pplx_space_spaced_common::lazy_client::FailedGeneration::default();
+        let timeout = BridgeGuestOperationBudget::FilesystemTransfer.timeout();
+        let started_at = Instant::now();
+        let result = pplx_space_spaced_common::retry_status_with_context_and_retry_hook(
+            "spaced bridge guest",
+            command,
+            self.inner.bridge_retry_policy,
+            RetryContext::with_timeout(timeout).with_cancellation(self.inner.shutdown.clone()),
+            || async {
+                let lease = self.bridge_guest_filesystem_client().await?;
+                failed.set(lease.generation());
+                // Negotiate on the connection retained for dispatch.
+                lease
+                    .client()
+                    .authorize(Requirement::Operations(&[GuestOperation::Files]))
+                    .await?;
+                failed.clear();
+                Ok(lease)
+            },
+            || async {
+                failed
+                    .invalidate(&self.inner.bridge_guest_filesystem_client)
+                    .await;
+                self.clear_guest_ready();
+            },
+        )
+        .await;
+        if result.as_ref().is_err_and(|status| {
+            pplx_space_spaced_common::status_is_retryable(status)
+                || status.code() == tonic::Code::Cancelled
+        }) {
+            failed
+                .invalidate(&self.inner.bridge_guest_filesystem_client)
+                .await;
+            self.clear_guest_ready();
+        }
+        record_bridge_rpc_outcome(
+            "bridge_guest_filesystem",
+            command,
+            timeout,
+            started_at,
+            BridgeRpcOutcome::from_result(&result),
+        );
+        result.map_err(|status| host_relay_status(status, command, "bridge_guest_filesystem"))
+    }
+
     pub(super) fn filesystem_grpc_service(
         &self,
     ) -> pplx_space_common_grpc::RequestAdmission<
@@ -45,6 +104,16 @@ fn host_file_event(
 
 fn validate_file_info(info: FileInfo) -> Result<FileInfo, Status> {
     bridge_file_type_to_host(info.file_type)?;
+    if info
+        .windows_metadata
+        .as_ref()
+        .and_then(|m| m.owner_sid.as_ref())
+        .is_some_and(|sid| sid.len() > MAX_GUEST_OWNER_SID_BYTES)
+    {
+        return Err(Status::resource_exhausted(
+            "guest file owner identifier is too large",
+        ));
+    }
     Ok(info)
 }
 
@@ -52,7 +121,13 @@ fn file_info_metadata_bytes(info: &FileInfo) -> Option<usize> {
     info.path
         .len()
         .checked_add(info.name.as_deref().map_or(0, str::len))?
-        .checked_add(info.symlink_target.as_deref().map_or(0, str::len))
+        .checked_add(info.symlink_target.as_deref().map_or(0, str::len))?
+        .checked_add(
+            info.windows_metadata
+                .as_ref()
+                .and_then(|m| m.owner_sid.as_deref())
+                .map_or(0, str::len),
+        )
 }
 
 fn host_modified_file(
@@ -90,7 +165,7 @@ impl Filesystem for SpacedHostService {
             .info
             .as_mut()
             .ok_or_else(|| Status::internal("bridge stat omitted file info"))?;
-        bridge_file_type_to_host(info.file_type)?;
+        validate_file_info(info.clone())?;
         // Stat describes the requested path, not a guest-selected response path.
         info.path = path;
         info.name = None;
@@ -187,45 +262,11 @@ impl Filesystem for SpacedHostService {
         request: Request<tonic::Streaming<WriteRequest>>,
     ) -> Result<Response<WriteResponse>, Status> {
         let input = request.into_inner();
-        let write_timeout = BridgeGuestOperationBudget::FilesystemTransfer.timeout();
-        let write_started_at = Instant::now();
-        let lease = match pplx_space_spaced_common::retry_status_with_context(
-            "spaced bridge guest",
-            "bridge_guest_write_connect",
-            self.inner.bridge_retry_policy,
-            RetryContext::with_timeout(write_timeout)
-                .with_cancellation(self.inner.shutdown.clone()),
-            || async { self.bridge_guest_filesystem_client().await },
-        )
-        .await
-        {
-            Ok(lease) => {
-                record_bridge_rpc_outcome(
-                    "bridge_guest_filesystem",
-                    "bridge_guest_write_connect",
-                    write_timeout,
-                    write_started_at,
-                    BridgeRpcOutcome::Ok,
-                );
-                lease
-            }
-            Err(status) => {
-                record_bridge_rpc_outcome(
-                    "bridge_guest_filesystem",
-                    "bridge_guest_write_connect",
-                    write_timeout,
-                    write_started_at,
-                    BridgeRpcOutcome::from_status(&status),
-                );
-                return Err(host_relay_status(
-                    status,
-                    "bridge_guest_write",
-                    "bridge_guest_filesystem",
-                ));
-            }
-        };
+        let lease = self
+            .authorized_write_client("bridge_guest_write_connect")
+            .await?;
         let client_generation = lease.generation();
-        let mut client = lease.into_client();
+        let mut client = lease.into_client().client;
 
         let body_started_at = Instant::now();
         let input =
@@ -275,44 +316,11 @@ impl Filesystem for SpacedHostService {
         request: Request<WriteBatchRequest>,
     ) -> Result<Response<WriteBatchResponse>, Status> {
         let request = bridge_write_batch_request(request.into_inner())?;
-        let timeout = BridgeGuestOperationBudget::FilesystemTransfer.timeout();
-        let started_at = Instant::now();
-        let lease = match pplx_space_spaced_common::retry_status_with_context(
-            "spaced bridge guest",
-            "bridge_guest_write_batch_connect",
-            self.inner.bridge_retry_policy,
-            RetryContext::with_timeout(timeout).with_cancellation(self.inner.shutdown.clone()),
-            || async { self.bridge_guest_filesystem_client().await },
-        )
-        .await
-        {
-            Ok(lease) => {
-                record_bridge_rpc_outcome(
-                    "bridge_guest_filesystem",
-                    "bridge_guest_write_batch_connect",
-                    timeout,
-                    started_at,
-                    BridgeRpcOutcome::Ok,
-                );
-                lease
-            }
-            Err(status) => {
-                record_bridge_rpc_outcome(
-                    "bridge_guest_filesystem",
-                    "bridge_guest_write_batch_connect",
-                    timeout,
-                    started_at,
-                    BridgeRpcOutcome::from_status(&status),
-                );
-                return Err(host_relay_status(
-                    status,
-                    "bridge_guest_write_batch",
-                    "bridge_guest_filesystem",
-                ));
-            }
-        };
+        let lease = self
+            .authorized_write_client("bridge_guest_write_batch_connect")
+            .await?;
         let client_generation = lease.generation();
-        let mut client = lease.into_client();
+        let mut client = lease.into_client().client;
         let body_started_at = Instant::now();
         let response = client.write_batch(request).await;
         record_bridge_rpc_unbounded_outcome(
@@ -351,6 +359,7 @@ impl Filesystem for SpacedHostService {
         let guest_stream = self
             .call_bridge_guest_filesystem(
                 "bridge_guest_watch",
+                Requirement::Operations(&[GuestOperation::Files, GuestOperation::FileWatch]),
                 BridgeGuestOperationBudget::FilesystemTransfer,
                 move |mut client| {
                     let request = request.clone();
@@ -369,6 +378,7 @@ impl Filesystem for SpacedHostService {
         let response = self
             .call_bridge_guest_filesystem_once(
                 "bridge_guest_create_watcher",
+                Requirement::Operations(&[GuestOperation::Files, GuestOperation::FileWatch]),
                 BridgeGuestOperationBudget::FilesystemMutation,
                 move |mut client| {
                     let request = request.clone();
@@ -390,6 +400,7 @@ impl Filesystem for SpacedHostService {
         let response = self
             .call_bridge_guest_filesystem(
                 "bridge_guest_normalize_watch_root",
+                Requirement::Operations(&[GuestOperation::Files, GuestOperation::FileWatch]),
                 BridgeGuestOperationBudget::FilesystemMetadata,
                 move |mut client| {
                     let request = request.clone();
@@ -410,6 +421,7 @@ impl Filesystem for SpacedHostService {
         let response = self
             .call_bridge_guest_filesystem_once(
                 "bridge_guest_get_watcher_events",
+                Requirement::Operations(&[GuestOperation::Files, GuestOperation::FileWatch]),
                 BridgeGuestOperationBudget::FilesystemMetadata,
                 move |mut client| {
                     let request = request.clone();
@@ -444,6 +456,7 @@ impl Filesystem for SpacedHostService {
         let request = request.into_inner();
         self.call_bridge_guest_filesystem_once(
             "bridge_guest_remove_watcher",
+            Requirement::Operations(&[GuestOperation::Files, GuestOperation::FileWatch]),
             BridgeGuestOperationBudget::FilesystemMutation,
             move |mut client| {
                 let request = request.clone();
@@ -468,6 +481,7 @@ impl Filesystem for SpacedHostService {
         let response = self
             .call_bridge_guest_filesystem_once(
                 "bridge_guest_enable_file_changes",
+                Requirement::Operations(&[GuestOperation::Files, GuestOperation::FileWatch]),
                 BridgeGuestOperationBudget::FilesystemMutation,
                 move |mut client| {
                     let request = request.clone();
@@ -492,6 +506,7 @@ impl Filesystem for SpacedHostService {
             .map_err(invalid_argument_status)?;
         self.call_bridge_guest_filesystem_once(
             "bridge_guest_disable_file_changes",
+            Requirement::Operations(&[GuestOperation::Files, GuestOperation::FileWatch]),
             BridgeGuestOperationBudget::FilesystemMutation,
             move |mut client| {
                 let user = user.as_ref().map(|user| user.as_str().to_string());
@@ -520,6 +535,7 @@ impl Filesystem for SpacedHostService {
         let response = self
             .call_bridge_guest_filesystem(
                 "bridge_guest_get_modified_files",
+                Requirement::Operations(&[GuestOperation::Files, GuestOperation::FileWatch]),
                 BridgeGuestOperationBudget::FilesystemMetadata,
                 move |mut client| {
                     let request = request.clone();

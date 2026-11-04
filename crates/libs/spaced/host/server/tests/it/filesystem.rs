@@ -85,12 +85,15 @@ async fn metadata_fallback_only_on_opening_unimplemented() {
 }
 
 /// A real guest service serving its bridge on `socket`, running filesystem
-/// operations as the current account.
+/// operations as the current account. Only the Linux guest is qualified;
+/// macOS builds advertise no operations instead of impersonating Linux.
+#[cfg(target_os = "linux")]
 struct Guest {
     shutdown: tokio_util::sync::CancellationToken,
     task: tokio::task::JoinHandle<Result<(), pplx_space_spaced_guest_server::RunGuestServerError>>,
 }
 
+#[cfg(target_os = "linux")]
 impl Guest {
     async fn start(directory: &std::path::Path, socket: &std::path::Path) -> Self {
         use pplx_space_common_core::types::GuestUserName;
@@ -137,6 +140,7 @@ impl Guest {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn interrupted_upload_through_host_and_guest_is_not_successful_eof() {
     use pplx_space_spaced_host_client::proto::{
@@ -258,6 +262,7 @@ async fn interrupted_upload_through_host_and_guest_is_not_successful_eof() {
 /// drops its call after a read error, commits nothing in the guest: a new
 /// file isn't created and an existing one keeps its content. The same prefix
 /// with an input that ends normally is committed.
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failed_input_mid_stream_commits_nothing_in_the_guest() {
     use futures_util::StreamExt;
@@ -329,6 +334,7 @@ async fn failed_input_mid_stream_commits_nothing_in_the_guest() {
 
 /// Waits until a file whose name starts with `prefix` is `present` in
 /// `directory`, or not.
+#[cfg(target_os = "linux")]
 async fn wait_staged(directory: &std::path::Path, prefix: &str, present: bool) {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {

@@ -403,9 +403,12 @@ type FileInfo struct {
 	// extra links as a trust boundary needs the real count, not an assumption.
 	// Absent when the guest cannot report it, which is not the same as any
 	// count -- a caller must handle that case rather than infer one.
-	LinkCount     *uint64 `protobuf:"varint,10,opt,name=link_count,json=linkCount,proto3,oneof" json:"link_count,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	LinkCount *uint64 `protobuf:"varint,10,opt,name=link_count,json=linkCount,proto3,oneof" json:"link_count,omitempty"`
+	// Set by Windows guests. When present, use it instead of mode, owner_uid
+	// and owner_gid, which are zero and not meaningful.
+	WindowsMetadata *WindowsFileMetadata `protobuf:"bytes,11,opt,name=windows_metadata,json=windowsMetadata,proto3" json:"windows_metadata,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *FileInfo) Reset() {
@@ -506,6 +509,13 @@ func (x *FileInfo) GetLinkCount() uint64 {
 		return *x.LinkCount
 	}
 	return 0
+}
+
+func (x *FileInfo) GetWindowsMetadata() *WindowsFileMetadata {
+	if x != nil {
+		return x.WindowsMetadata
+	}
+	return nil
 }
 
 type ListRequest struct {
@@ -2347,17 +2357,20 @@ func (x *GetModifiedFilesResponse) GetOverflowed() bool {
 }
 
 type StartRequest struct {
-	state          protoimpl.MessageState `protogen:"open.v1"`
-	Command        []string               `protobuf:"bytes,1,rep,name=command,proto3" json:"command,omitempty"`
-	Cwd            *string                `protobuf:"bytes,2,opt,name=cwd,proto3,oneof" json:"cwd,omitempty"`
-	Env            map[string]string      `protobuf:"bytes,3,rep,name=env,proto3" json:"env,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	User           *string                `protobuf:"bytes,4,opt,name=user,proto3,oneof" json:"user,omitempty"`
-	Timeout        *durationpb.Duration   `protobuf:"bytes,5,opt,name=timeout,proto3,oneof" json:"timeout,omitempty"`
-	Background     bool                   `protobuf:"varint,6,opt,name=background,proto3" json:"background,omitempty"`
-	IdempotencyKey *string                `protobuf:"bytes,7,opt,name=idempotency_key,json=idempotencyKey,proto3,oneof" json:"idempotency_key,omitempty"`
-	Tag            *string                `protobuf:"bytes,8,opt,name=tag,proto3,oneof" json:"tag,omitempty"`
-	Stdin          bool                   `protobuf:"varint,9,opt,name=stdin,proto3" json:"stdin,omitempty"`
-	Pty            *PtyConfig             `protobuf:"bytes,10,opt,name=pty,proto3,oneof" json:"pty,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Executable and arguments, never an implicit shell command. Windows direct
+	// executables use conventional MSVC argv quoting; batch/shell forms require
+	// separately supported semantics and must not be silently reinterpreted.
+	Command        []string             `protobuf:"bytes,1,rep,name=command,proto3" json:"command,omitempty"`
+	Cwd            *string              `protobuf:"bytes,2,opt,name=cwd,proto3,oneof" json:"cwd,omitempty"`
+	Env            map[string]string    `protobuf:"bytes,3,rep,name=env,proto3" json:"env,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	User           *string              `protobuf:"bytes,4,opt,name=user,proto3,oneof" json:"user,omitempty"`
+	Timeout        *durationpb.Duration `protobuf:"bytes,5,opt,name=timeout,proto3,oneof" json:"timeout,omitempty"`
+	Background     bool                 `protobuf:"varint,6,opt,name=background,proto3" json:"background,omitempty"`
+	IdempotencyKey *string              `protobuf:"bytes,7,opt,name=idempotency_key,json=idempotencyKey,proto3,oneof" json:"idempotency_key,omitempty"`
+	Tag            *string              `protobuf:"bytes,8,opt,name=tag,proto3,oneof" json:"tag,omitempty"`
+	Stdin          bool                 `protobuf:"varint,9,opt,name=stdin,proto3" json:"stdin,omitempty"`
+	Pty            *PtyConfig           `protobuf:"bytes,10,opt,name=pty,proto3,oneof" json:"pty,omitempty"`
 	// Skip sandbox-configured process environment; request env still applies.
 	CleanEnv bool `protobuf:"varint,11,opt,name=clean_env,json=cleanEnv,proto3" json:"clean_env,omitempty"`
 	// Caller-assigned process identity. When omitted the guest mints one, which
@@ -2845,9 +2858,10 @@ func (x *ProcessInfo) GetEndedAt() *timestamppb.Timestamp {
 }
 
 type SendSignalRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	ProcessId     string                 `protobuf:"bytes,1,opt,name=process_id,json=processId,proto3" json:"process_id,omitempty"`
-	Signal        int32                  `protobuf:"varint,2,opt,name=signal,proto3" json:"signal,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	ProcessId string                 `protobuf:"bytes,1,opt,name=process_id,json=processId,proto3" json:"process_id,omitempty"`
+	// Linux signal numbering. Non-Linux POSIX guests translate or refuse.
+	Signal        int32 `protobuf:"varint,2,opt,name=signal,proto3" json:"signal,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3667,6 +3681,7 @@ func (*ProcessExit_TimedOut) isProcessExit_Outcome() {}
 
 func (*ProcessExit_Unknown) isProcessExit_Outcome() {}
 
+// Windows native exit codes preserve their 32-bit pattern by bit-casting to i32.
 type ProcessExited struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	ExitCode      int32                  `protobuf:"varint,1,opt,name=exit_code,json=exitCode,proto3" json:"exit_code,omitempty"`
@@ -3711,6 +3726,7 @@ func (x *ProcessExited) GetExitCode() int32 {
 	return 0
 }
 
+// Linux signal numbering. Non-Linux POSIX guests translate to this numbering.
 type ProcessSignaled struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Signal        *int32                 `protobuf:"varint,1,opt,name=signal,proto3,oneof" json:"signal,omitempty"`
@@ -3755,6 +3771,7 @@ func (x *ProcessSignaled) GetSignal() int32 {
 	return 0
 }
 
+// Linux signal numbering; absent when timeout termination has no POSIX signal.
 type ProcessTimedOut struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Signal        *int32                 `protobuf:"varint,1,opt,name=signal,proto3,oneof" json:"signal,omitempty"`
@@ -4027,6 +4044,60 @@ func (*CloseLoopbackBridgeResponse) Descriptor() ([]byte, []int) {
 	return file_spaced_operations_v1_operations_proto_rawDescGZIP(), []int{63}
 }
 
+// Ownership and attributes of a file on a Windows guest.
+type WindowsFileMetadata struct {
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	OwnerSid *string                `protobuf:"bytes,1,opt,name=owner_sid,json=ownerSid,proto3,oneof" json:"owner_sid,omitempty"`
+	// Raw Windows FILE_ATTRIBUTE_* bits.
+	Attributes    uint32 `protobuf:"varint,2,opt,name=attributes,proto3" json:"attributes,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *WindowsFileMetadata) Reset() {
+	*x = WindowsFileMetadata{}
+	mi := &file_spaced_operations_v1_operations_proto_msgTypes[64]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *WindowsFileMetadata) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*WindowsFileMetadata) ProtoMessage() {}
+
+func (x *WindowsFileMetadata) ProtoReflect() protoreflect.Message {
+	mi := &file_spaced_operations_v1_operations_proto_msgTypes[64]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use WindowsFileMetadata.ProtoReflect.Descriptor instead.
+func (*WindowsFileMetadata) Descriptor() ([]byte, []int) {
+	return file_spaced_operations_v1_operations_proto_rawDescGZIP(), []int{64}
+}
+
+func (x *WindowsFileMetadata) GetOwnerSid() string {
+	if x != nil && x.OwnerSid != nil {
+		return *x.OwnerSid
+	}
+	return ""
+}
+
+func (x *WindowsFileMetadata) GetAttributes() uint32 {
+	if x != nil {
+		return x.Attributes
+	}
+	return 0
+}
+
 var File_spaced_operations_v1_operations_proto protoreflect.FileDescriptor
 
 const file_spaced_operations_v1_operations_proto_rawDesc = "" +
@@ -4037,7 +4108,7 @@ const file_spaced_operations_v1_operations_proto_rawDesc = "" +
 	"\x04user\x18\x02 \x01(\tH\x00R\x04user\x88\x01\x01B\a\n" +
 	"\x05_user\"H\n" +
 	"\fStatResponse\x128\n" +
-	"\x04info\x18\x01 \x01(\v2$.space.spaced.operations.v1.FileInfoR\x04info\"\xb4\x03\n" +
+	"\x04info\x18\x01 \x01(\v2$.space.spaced.operations.v1.FileInfoR\x04info\"\x90\x04\n" +
 	"\bFileInfo\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12\x17\n" +
 	"\x04name\x18\x02 \x01(\tH\x00R\x04name\x88\x01\x01\x12A\n" +
@@ -4052,7 +4123,8 @@ const file_spaced_operations_v1_operations_proto_rawDesc = "" +
 	"\x0esymlink_target\x18\t \x01(\tH\x02R\rsymlinkTarget\x88\x01\x01\x12\"\n" +
 	"\n" +
 	"link_count\x18\n" +
-	" \x01(\x04H\x03R\tlinkCount\x88\x01\x01B\a\n" +
+	" \x01(\x04H\x03R\tlinkCount\x88\x01\x01\x12Z\n" +
+	"\x10windows_metadata\x18\v \x01(\v2/.space.spaced.operations.v1.WindowsFileMetadataR\x0fwindowsMetadataB\a\n" +
 	"\x05_nameB\x0e\n" +
 	"\f_modified_atB\x11\n" +
 	"\x0f_symlink_targetB\r\n" +
@@ -4343,7 +4415,14 @@ const file_spaced_operations_v1_operations_proto_rawDesc = "" +
 	"\x12service_generation\x18\x03 \x01(\tR\x11serviceGeneration\"0\n" +
 	"\x1aCloseLoopbackBridgeRequest\x12\x12\n" +
 	"\x04port\x18\x01 \x01(\rR\x04port\"\x1d\n" +
-	"\x1bCloseLoopbackBridgeResponse*~\n" +
+	"\x1bCloseLoopbackBridgeResponse\"e\n" +
+	"\x13WindowsFileMetadata\x12 \n" +
+	"\towner_sid\x18\x01 \x01(\tH\x00R\bownerSid\x88\x01\x01\x12\x1e\n" +
+	"\n" +
+	"attributes\x18\x02 \x01(\rR\n" +
+	"attributesB\f\n" +
+	"\n" +
+	"_owner_sid*~\n" +
 	"\bFileType\x12\x19\n" +
 	"\x15FILE_TYPE_UNSPECIFIED\x10\x00\x12\x12\n" +
 	"\x0eFILE_TYPE_FILE\x10\x01\x12\x17\n" +
@@ -4386,7 +4465,7 @@ func file_spaced_operations_v1_operations_proto_rawDescGZIP() []byte {
 }
 
 var file_spaced_operations_v1_operations_proto_enumTypes = make([]protoimpl.EnumInfo, 5)
-var file_spaced_operations_v1_operations_proto_msgTypes = make([]protoimpl.MessageInfo, 66)
+var file_spaced_operations_v1_operations_proto_msgTypes = make([]protoimpl.MessageInfo, 67)
 var file_spaced_operations_v1_operations_proto_goTypes = []any{
 	(FileType)(0),                       // 0: space.spaced.operations.v1.FileType
 	(FileEventKind)(0),                  // 1: space.spaced.operations.v1.FileEventKind
@@ -4457,54 +4536,56 @@ var file_spaced_operations_v1_operations_proto_goTypes = []any{
 	(*OpenLoopbackBridgeResponse)(nil),  // 66: space.spaced.operations.v1.OpenLoopbackBridgeResponse
 	(*CloseLoopbackBridgeRequest)(nil),  // 67: space.spaced.operations.v1.CloseLoopbackBridgeRequest
 	(*CloseLoopbackBridgeResponse)(nil), // 68: space.spaced.operations.v1.CloseLoopbackBridgeResponse
-	nil,                                 // 69: space.spaced.operations.v1.StartRequest.EnvEntry
-	nil,                                 // 70: space.spaced.operations.v1.ProcessInfo.EnvEntry
-	(*timestamppb.Timestamp)(nil),       // 71: google.protobuf.Timestamp
-	(*durationpb.Duration)(nil),         // 72: google.protobuf.Duration
+	(*WindowsFileMetadata)(nil),         // 69: space.spaced.operations.v1.WindowsFileMetadata
+	nil,                                 // 70: space.spaced.operations.v1.StartRequest.EnvEntry
+	nil,                                 // 71: space.spaced.operations.v1.ProcessInfo.EnvEntry
+	(*timestamppb.Timestamp)(nil),       // 72: google.protobuf.Timestamp
+	(*durationpb.Duration)(nil),         // 73: google.protobuf.Duration
 }
 var file_spaced_operations_v1_operations_proto_depIdxs = []int32{
 	7,  // 0: space.spaced.operations.v1.StatResponse.info:type_name -> space.spaced.operations.v1.FileInfo
 	0,  // 1: space.spaced.operations.v1.FileInfo.file_type:type_name -> space.spaced.operations.v1.FileType
-	71, // 2: space.spaced.operations.v1.FileInfo.modified_at:type_name -> google.protobuf.Timestamp
-	12, // 3: space.spaced.operations.v1.WriteRequest.open:type_name -> space.spaced.operations.v1.WriteOpen
-	14, // 4: space.spaced.operations.v1.WriteBatchRequest.entries:type_name -> space.spaced.operations.v1.WriteBatchEntry
-	1,  // 5: space.spaced.operations.v1.FileEvent.kind:type_name -> space.spaced.operations.v1.FileEventKind
-	71, // 6: space.spaced.operations.v1.FileEvent.observed_at:type_name -> google.protobuf.Timestamp
-	26, // 7: space.spaced.operations.v1.GetWatcherEventsResponse.events:type_name -> space.spaced.operations.v1.FileEvent
-	71, // 8: space.spaced.operations.v1.EnableFileChangesResponse.observed_since:type_name -> google.protobuf.Timestamp
-	72, // 9: space.spaced.operations.v1.GetModifiedFilesRequest.window:type_name -> google.protobuf.Duration
-	71, // 10: space.spaced.operations.v1.GetModifiedFilesRequest.since:type_name -> google.protobuf.Timestamp
-	71, // 11: space.spaced.operations.v1.ModifiedFile.last_modified_at:type_name -> google.protobuf.Timestamp
-	1,  // 12: space.spaced.operations.v1.ModifiedFile.kinds:type_name -> space.spaced.operations.v1.FileEventKind
-	38, // 13: space.spaced.operations.v1.GetModifiedFilesResponse.files:type_name -> space.spaced.operations.v1.ModifiedFile
-	71, // 14: space.spaced.operations.v1.GetModifiedFilesResponse.observed_since:type_name -> google.protobuf.Timestamp
-	71, // 15: space.spaced.operations.v1.GetModifiedFilesResponse.retained_since:type_name -> google.protobuf.Timestamp
-	69, // 16: space.spaced.operations.v1.StartRequest.env:type_name -> space.spaced.operations.v1.StartRequest.EnvEntry
-	72, // 17: space.spaced.operations.v1.StartRequest.timeout:type_name -> google.protobuf.Duration
-	42, // 18: space.spaced.operations.v1.StartRequest.pty:type_name -> space.spaced.operations.v1.PtyConfig
-	41, // 19: space.spaced.operations.v1.PtyConfig.size:type_name -> space.spaced.operations.v1.PtySize
-	72, // 20: space.spaced.operations.v1.ConnectProcessRequest.timeout:type_name -> google.protobuf.Duration
-	70, // 21: space.spaced.operations.v1.ProcessInfo.env:type_name -> space.spaced.operations.v1.ProcessInfo.EnvEntry
-	60, // 22: space.spaced.operations.v1.ProcessInfo.exit:type_name -> space.spaced.operations.v1.ProcessExit
-	71, // 23: space.spaced.operations.v1.ProcessInfo.ended_at:type_name -> google.protobuf.Timestamp
-	41, // 24: space.spaced.operations.v1.ResizePtyRequest.size:type_name -> space.spaced.operations.v1.PtySize
-	57, // 25: space.spaced.operations.v1.ProcessEvent.started:type_name -> space.spaced.operations.v1.ProcessStarted
-	58, // 26: space.spaced.operations.v1.ProcessEvent.connected:type_name -> space.spaced.operations.v1.ProcessConnected
-	59, // 27: space.spaced.operations.v1.ProcessEvent.stdout:type_name -> space.spaced.operations.v1.ProcessOutput
-	59, // 28: space.spaced.operations.v1.ProcessEvent.stderr:type_name -> space.spaced.operations.v1.ProcessOutput
-	60, // 29: space.spaced.operations.v1.ProcessEvent.exit:type_name -> space.spaced.operations.v1.ProcessExit
-	71, // 30: space.spaced.operations.v1.ProcessStarted.start_time:type_name -> google.protobuf.Timestamp
-	61, // 31: space.spaced.operations.v1.ProcessExit.exited:type_name -> space.spaced.operations.v1.ProcessExited
-	62, // 32: space.spaced.operations.v1.ProcessExit.signaled:type_name -> space.spaced.operations.v1.ProcessSignaled
-	63, // 33: space.spaced.operations.v1.ProcessExit.timed_out:type_name -> space.spaced.operations.v1.ProcessTimedOut
-	64, // 34: space.spaced.operations.v1.ProcessExit.unknown:type_name -> space.spaced.operations.v1.ProcessUnknown
-	72, // 35: space.spaced.operations.v1.OpenLoopbackBridgeRequest.wait_timeout:type_name -> google.protobuf.Duration
-	2,  // 36: space.spaced.operations.v1.OpenLoopbackBridgeResponse.status:type_name -> space.spaced.operations.v1.LoopbackBridgeStatus
-	37, // [37:37] is the sub-list for method output_type
-	37, // [37:37] is the sub-list for method input_type
-	37, // [37:37] is the sub-list for extension type_name
-	37, // [37:37] is the sub-list for extension extendee
-	0,  // [0:37] is the sub-list for field type_name
+	72, // 2: space.spaced.operations.v1.FileInfo.modified_at:type_name -> google.protobuf.Timestamp
+	69, // 3: space.spaced.operations.v1.FileInfo.windows_metadata:type_name -> space.spaced.operations.v1.WindowsFileMetadata
+	12, // 4: space.spaced.operations.v1.WriteRequest.open:type_name -> space.spaced.operations.v1.WriteOpen
+	14, // 5: space.spaced.operations.v1.WriteBatchRequest.entries:type_name -> space.spaced.operations.v1.WriteBatchEntry
+	1,  // 6: space.spaced.operations.v1.FileEvent.kind:type_name -> space.spaced.operations.v1.FileEventKind
+	72, // 7: space.spaced.operations.v1.FileEvent.observed_at:type_name -> google.protobuf.Timestamp
+	26, // 8: space.spaced.operations.v1.GetWatcherEventsResponse.events:type_name -> space.spaced.operations.v1.FileEvent
+	72, // 9: space.spaced.operations.v1.EnableFileChangesResponse.observed_since:type_name -> google.protobuf.Timestamp
+	73, // 10: space.spaced.operations.v1.GetModifiedFilesRequest.window:type_name -> google.protobuf.Duration
+	72, // 11: space.spaced.operations.v1.GetModifiedFilesRequest.since:type_name -> google.protobuf.Timestamp
+	72, // 12: space.spaced.operations.v1.ModifiedFile.last_modified_at:type_name -> google.protobuf.Timestamp
+	1,  // 13: space.spaced.operations.v1.ModifiedFile.kinds:type_name -> space.spaced.operations.v1.FileEventKind
+	38, // 14: space.spaced.operations.v1.GetModifiedFilesResponse.files:type_name -> space.spaced.operations.v1.ModifiedFile
+	72, // 15: space.spaced.operations.v1.GetModifiedFilesResponse.observed_since:type_name -> google.protobuf.Timestamp
+	72, // 16: space.spaced.operations.v1.GetModifiedFilesResponse.retained_since:type_name -> google.protobuf.Timestamp
+	70, // 17: space.spaced.operations.v1.StartRequest.env:type_name -> space.spaced.operations.v1.StartRequest.EnvEntry
+	73, // 18: space.spaced.operations.v1.StartRequest.timeout:type_name -> google.protobuf.Duration
+	42, // 19: space.spaced.operations.v1.StartRequest.pty:type_name -> space.spaced.operations.v1.PtyConfig
+	41, // 20: space.spaced.operations.v1.PtyConfig.size:type_name -> space.spaced.operations.v1.PtySize
+	73, // 21: space.spaced.operations.v1.ConnectProcessRequest.timeout:type_name -> google.protobuf.Duration
+	71, // 22: space.spaced.operations.v1.ProcessInfo.env:type_name -> space.spaced.operations.v1.ProcessInfo.EnvEntry
+	60, // 23: space.spaced.operations.v1.ProcessInfo.exit:type_name -> space.spaced.operations.v1.ProcessExit
+	72, // 24: space.spaced.operations.v1.ProcessInfo.ended_at:type_name -> google.protobuf.Timestamp
+	41, // 25: space.spaced.operations.v1.ResizePtyRequest.size:type_name -> space.spaced.operations.v1.PtySize
+	57, // 26: space.spaced.operations.v1.ProcessEvent.started:type_name -> space.spaced.operations.v1.ProcessStarted
+	58, // 27: space.spaced.operations.v1.ProcessEvent.connected:type_name -> space.spaced.operations.v1.ProcessConnected
+	59, // 28: space.spaced.operations.v1.ProcessEvent.stdout:type_name -> space.spaced.operations.v1.ProcessOutput
+	59, // 29: space.spaced.operations.v1.ProcessEvent.stderr:type_name -> space.spaced.operations.v1.ProcessOutput
+	60, // 30: space.spaced.operations.v1.ProcessEvent.exit:type_name -> space.spaced.operations.v1.ProcessExit
+	72, // 31: space.spaced.operations.v1.ProcessStarted.start_time:type_name -> google.protobuf.Timestamp
+	61, // 32: space.spaced.operations.v1.ProcessExit.exited:type_name -> space.spaced.operations.v1.ProcessExited
+	62, // 33: space.spaced.operations.v1.ProcessExit.signaled:type_name -> space.spaced.operations.v1.ProcessSignaled
+	63, // 34: space.spaced.operations.v1.ProcessExit.timed_out:type_name -> space.spaced.operations.v1.ProcessTimedOut
+	64, // 35: space.spaced.operations.v1.ProcessExit.unknown:type_name -> space.spaced.operations.v1.ProcessUnknown
+	73, // 36: space.spaced.operations.v1.OpenLoopbackBridgeRequest.wait_timeout:type_name -> google.protobuf.Duration
+	2,  // 37: space.spaced.operations.v1.OpenLoopbackBridgeResponse.status:type_name -> space.spaced.operations.v1.LoopbackBridgeStatus
+	38, // [38:38] is the sub-list for method output_type
+	38, // [38:38] is the sub-list for method input_type
+	38, // [38:38] is the sub-list for extension type_name
+	38, // [38:38] is the sub-list for extension extendee
+	0,  // [0:38] is the sub-list for field type_name
 }
 
 func init() { file_spaced_operations_v1_operations_proto_init() }
@@ -4556,13 +4637,14 @@ func file_spaced_operations_v1_operations_proto_init() {
 	}
 	file_spaced_operations_v1_operations_proto_msgTypes[57].OneofWrappers = []any{}
 	file_spaced_operations_v1_operations_proto_msgTypes[58].OneofWrappers = []any{}
+	file_spaced_operations_v1_operations_proto_msgTypes[64].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_spaced_operations_v1_operations_proto_rawDesc), len(file_spaced_operations_v1_operations_proto_rawDesc)),
 			NumEnums:      5,
-			NumMessages:   66,
+			NumMessages:   67,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

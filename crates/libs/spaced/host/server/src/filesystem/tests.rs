@@ -112,3 +112,32 @@ async fn payload_bursts_queue_until_slots_free() {
         "{filesystem:?}"
     );
 }
+
+#[test]
+fn owner_metadata_is_counted_and_bounded() {
+    for sid in [None, Some("S-1-5-21".to_owned()), Some("s".repeat(8192))] {
+        let info = FileInfo {
+            path: "/a".into(),
+            name: Some("a".into()),
+            file_type: proto::FileType::File as i32,
+            windows_metadata: Some(proto::WindowsFileMetadata {
+                owner_sid: sid.clone(),
+                attributes: 0,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            file_info_metadata_bytes(&info),
+            Some(3 + sid.as_ref().map_or(0, String::len))
+        );
+        let validation = validate_file_info(info);
+        if sid.as_ref().is_some_and(|s| s.len() > 1024) {
+            assert_eq!(
+                validation.unwrap_err().code(),
+                tonic::Code::ResourceExhausted
+            );
+        } else {
+            validation.unwrap();
+        }
+    }
+}

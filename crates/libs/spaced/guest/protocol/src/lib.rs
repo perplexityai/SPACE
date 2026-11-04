@@ -3,6 +3,9 @@
 //! Host/control protocols and transport connectors belong to spaced-common.
 
 pub mod proto {
+    pub mod platform {
+        tonic::include_proto!("space.spaced.platform.v1");
+    }
     pub mod operations {
         tonic::include_proto!("space.spaced.operations.v1");
     }
@@ -18,6 +21,7 @@ pub mod proto {
 }
 
 pub mod filesystem_limits;
+pub mod platform;
 pub mod process_limits;
 pub mod validate;
 pub mod wire;
