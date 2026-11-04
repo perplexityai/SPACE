@@ -119,8 +119,8 @@ use pplx_space_common_core::types::{
     SubstrateKind,
 };
 use pplx_space_sandbox_portability::{
-    SuspendedK8sFinalizationSql, failed_repair_revert_eligibility,
-    newest_full_snapshot_unambiguous, pod_less_drain_revert_loses_no_newer_bytes,
+    failed_repair_revert_eligibility, newest_full_snapshot_unambiguous,
+    pod_less_drain_revert_loses_no_newer_bytes,
 };
 use pplx_space_sandbox_store::drain;
 use sqlx::PgPool;
@@ -644,23 +644,21 @@ async fn recover_pod_less_sandbox_locked(
         return Ok(PodLessRecovery::NotEligible(hold));
     }
 
-    let Some(finalization) =
-        drain::revert_pod_less_resident_to_suspended(&mut tx, candidate.sandbox_id).await?
-    else {
+    if !drain::revert_pod_less_resident_to_suspended(&mut tx, candidate.sandbox_id).await? {
         // The guards just passed under the locks, so only a snapshot change
         // that the locks don't cover gets here.
         tx.rollback().await?;
         return Ok(PodLessRecovery::NotEligible(PodLessHold::SnapshotChanged));
-    };
+    }
 
-    retire_executions(&mut tx, candidate.sandbox_id, &finalization).await?;
+    retire_executions(&mut tx, candidate.sandbox_id).await?;
     WarmPoolStore::delete_claimed_slot_for_retired_execution(&mut tx, candidate.sandbox_id)
         .await
         .map_err(|err| match err {
             PoolError::Sql(err) => err,
             other => sqlx::Error::Protocol(format!("delete claimed pool slot: {other}")),
         })?;
-    reset_open_port_exposures(&mut tx, candidate.sandbox_id, &finalization).await?;
+    reset_open_port_exposures(&mut tx, candidate.sandbox_id).await?;
     // The observed guard tolerated a `failed`, pid-less record. Left behind,
     // it would keep a reverted row reading `failed` through the observed-state
     // overlay, and once the node is gone nothing would publish over it.
@@ -679,19 +677,20 @@ async fn recover_pod_less_sandbox_locked(
 async fn retire_executions(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     sandbox_id: SandboxId,
-    finalization: &SuspendedK8sFinalizationSql,
 ) -> Result<(), sqlx::Error> {
-    let query = format!(
+    sqlx::query(sql!(
         "UPDATE sandbox_k8s_executions e
-            SET {assignments}
+            SET active = FALSE,\n\
+                state = 'suspended',\n\
+                pod_ip = NULL,\n\
+                terminated_at = COALESCE(e.terminated_at, NOW()),\n\
+                updated_at = NOW()
           WHERE e.sandbox_id = $1
-            AND e.active",
-        assignments = finalization.active_execution_assignments("e"),
-    );
-    sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .bind(sandbox_id)
-        .execute(&mut **tx)
-        .await?;
+            AND e.active"
+    ))
+    .bind(sandbox_id)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 
@@ -706,18 +705,21 @@ pub(crate) fn is_deadlock(error: &sqlx::Error) -> bool {
 async fn reset_open_port_exposures(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     sandbox_id: SandboxId,
-    finalization: &SuspendedK8sFinalizationSql,
 ) -> Result<(), sqlx::Error> {
-    let query = format!(
+    sqlx::query(sql!(
         "UPDATE sandbox_port_exposures
-            SET {assignments}
+            SET apply_state = 'pending',\n\
+                last_applied_node_id = NULL,\n\
+                last_error = NULL,\n\
+                last_bridge_status = NULL,\n\
+                last_applied_bridge_generation = NULL,\n\
+                last_observed_at = NULL,\n\
+                updated_at = NOW()
           WHERE sandbox_id = $1
-            AND desired_state = 'open'",
-        assignments = finalization.open_port_exposure_assignments(),
-    );
-    sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
-        .bind(sandbox_id)
-        .execute(&mut **tx)
-        .await?;
+            AND desired_state = 'open'"
+    ))
+    .bind(sandbox_id)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
