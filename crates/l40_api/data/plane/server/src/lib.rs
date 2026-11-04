@@ -94,7 +94,10 @@ mod ingress_lifetime;
 mod native;
 mod native_files;
 use ingress_lifetime::{Completion, IngressIo, Progress};
-pub use native_files::{NativeFileAccessConfigError, NativeFilesMode};
+pub use native_files::{
+    NativeFileAccessConfigError, NativeFilesMode, NativeUploadAdmissionArgs,
+    NativeUploadAdmissionConfig,
+};
 mod runtime_route;
 mod state;
 mod upload_admission;
@@ -244,6 +247,8 @@ pub struct DataPlaneConfig {
     /// Whether to answer Native `files:*`, deciding each request through the
     /// lifecycle API at `SPACE_INGRESS_ACTIVATION_ENDPOINT`.
     pub native_files: NativeFilesMode,
+    /// `None` admits every Native write. Apart from `upload_admission`.
+    pub native_upload_admission: Option<NativeUploadAdmissionConfig>,
 }
 
 impl Default for DataPlaneConfig {
@@ -261,6 +266,7 @@ impl Default for DataPlaneConfig {
             upload_admission: None,
             shutdown_grace: None,
             native_files: NativeFilesMode::Off,
+            native_upload_admission: None,
         }
     }
 }
@@ -450,6 +456,7 @@ pub async fn run(
             native_files::NativeFileAccessClient::from_env()
                 .await
                 .map_err(RunDataPlaneError::NativeFiles)?,
+            config.native_upload_admission.as_ref(),
         ))),
     };
     let cluster_api = connect_cluster_api_clients_for_startup(&shutdown_token)

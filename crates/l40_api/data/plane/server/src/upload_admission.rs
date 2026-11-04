@@ -420,7 +420,8 @@ impl UploadAdmission {
     }
 
     /// Permits alone, without a governed body, for tests that hold a budget
-    /// or share. Production uploads go through [`Self::admit_upload`].
+    /// or share. Production uploads go through [`Self::admit_upload`], or
+    /// [`Self::admit_ungoverned`] for Native writes.
     #[cfg(test)]
     pub(crate) async fn admit(
         &self,
@@ -428,6 +429,20 @@ impl UploadAdmission {
         reserve_bytes: u64,
     ) -> Result<UploadPermit, EcwProxyError> {
         self.admit_permits(tenant, reserve_bytes, self.wait).await
+    }
+
+    /// Permits alone, for a Native write: none of this admission's body
+    /// limits govern its body. It waits up to the admission wait if `waits`,
+    /// whatever its protocol, or takes what is free at once; the caller
+    /// decides (see `native_files`'s admission).
+    pub(crate) async fn admit_ungoverned(
+        &self,
+        tenant: UploadTenant,
+        reserve_bytes: u64,
+        waits: bool,
+    ) -> Result<UploadPermit, EcwProxyError> {
+        let wait = if waits { self.wait } else { Duration::ZERO };
+        self.admit_permits(tenant, reserve_bytes, wait).await
     }
 
     #[cfg(test)]

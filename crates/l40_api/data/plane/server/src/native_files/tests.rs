@@ -4,6 +4,7 @@
 
 mod fakes;
 mod mutations;
+mod write;
 
 use std::sync::{
     Arc,
@@ -53,15 +54,22 @@ struct Harness {
 
 impl Harness {
     async fn start() -> Self {
+        Self::start_with(None).await
+    }
+
+    /// With the data plane's Native upload admission set to
+    /// `upload_admission`.
+    async fn start_with(upload_admission: Option<crate::NativeUploadAdmissionConfig>) -> Self {
         let (worker, worker_addr) = FakeWorker::start().await;
         let (api, api_addr) = FakeApi::start(worker_addr).await;
         let mut state = crate::tests::test_data_plane_state().await;
         let channel = tonic::transport::Endpoint::from_shared(format!("http://{api_addr}"))
             .unwrap()
             .connect_lazy();
-        state.native_files = Some(Arc::new(NativeFiles::new(NativeFileAccessClient::new(
-            channel,
-        ))));
+        state.native_files = Some(Arc::new(NativeFiles::new(
+            NativeFileAccessClient::new(channel),
+            upload_admission.as_ref(),
+        )));
         Self { state, api, worker }
     }
 
@@ -82,11 +90,16 @@ impl Harness {
 
     /// A POST under `Idempotency-Key: key`.
     fn post_keyed(&self, action: &str, key: &str, body: Value) -> Request<Body> {
+        self.post_keyed_json(action, key, body.to_string())
+    }
+
+    /// A POST under `Idempotency-Key: key` of JSON already serialized.
+    fn post_keyed_json(&self, action: &str, key: &str, json: String) -> Request<Body> {
         Request::post(self.path(action))
             .header(header::AUTHORIZATION, CLIENT_KEY)
             .header(header::CONTENT_TYPE, "application/json")
             .header("idempotency-key", key)
-            .body(Body::from(body.to_string()))
+            .body(Body::from(json))
             .unwrap()
     }
 

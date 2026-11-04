@@ -22,11 +22,12 @@ use pplx_space_node_api_client::proto::{
 use pplx_space_sbx_mgr_client::operations::{
     DisableFileChangesResponse, EnableFileChangesResponse, FileChunk, FileInfo,
     GetModifiedFilesResponse, MkdirResponse, RemoveResponse, RenameResponse, StatResponse,
+    WriteBatchResponse, WriteResponse,
 };
 use pplx_space_sbx_mgr_client::proto::{
     SpacedDisableFileChangesRequest, SpacedEnableFileChangesRequest, SpacedGetModifiedFilesRequest,
     SpacedListRequest, SpacedMkdirRequest, SpacedReadRequest, SpacedRemoveRequest,
-    SpacedRenameRequest, SpacedStatRequest,
+    SpacedRenameRequest, SpacedStatRequest, SpacedWriteBatchRequest, SpacedWriteRequest,
 };
 use tonic::{Request, Response, Status};
 
@@ -296,6 +297,9 @@ pub(super) enum WorkerRequest {
     EnableFileChanges(SpacedEnableFileChangesRequest),
     DisableFileChanges(SpacedDisableFileChangesRequest),
     GetModifiedFiles(SpacedGetModifiedFilesRequest),
+    /// Every message of the stream, the open first.
+    Write(Vec<SpacedWriteRequest>),
+    WriteBatch(SpacedWriteBatchRequest),
 }
 
 /// What a fake runtime call answers: a message or a stream of them.
@@ -309,6 +313,8 @@ pub(super) enum Reply {
     EnableFileChanges(Result<EnableFileChangesResponse, Status>),
     DisableFileChanges(Result<DisableFileChangesResponse, Status>),
     GetModifiedFiles(Result<GetModifiedFilesResponse, Status>),
+    Write(Result<WriteResponse, Status>),
+    WriteBatch(Result<WriteBatchResponse, Status>),
 }
 
 #[derive(Default)]
@@ -428,6 +434,12 @@ impl tower::Service<axum::http::Request<tonic::body::Body>> for FakeWorker {
                         SpacedDisableFileChangesRequest
                     )
                 }
+                "/space.node.api.v1.WorkerApi/SpacedWriteBatch" => {
+                    unary!(worker, request, WriteBatch, SpacedWriteBatchRequest)
+                }
+                "/space.node.api.v1.WorkerApi/SpacedWrite" => {
+                    grpc().client_streaming(WriteStream(worker), request).await
+                }
                 "/space.node.api.v1.WorkerApi/SpacedGetModifiedFiles" => {
                     unary!(
                         worker,
@@ -493,6 +505,30 @@ where
 
     fn call(&mut self, request: Request<Req>) -> Self::Future {
         std::future::ready((self.0)(request).map(Response::new))
+    }
+}
+
+/// `SpacedWrite`: the whole stream, then the next scripted reply.
+struct WriteStream(FakeWorker);
+
+impl tonic::server::ClientStreamingService<SpacedWriteRequest> for WriteStream {
+    type Response = WriteResponse;
+    type Future = BoxFuture<Result<Response<WriteResponse>, Status>>;
+
+    fn call(&mut self, request: Request<tonic::Streaming<SpacedWriteRequest>>) -> Self::Future {
+        let worker = self.0.clone();
+        Box::pin(async move {
+            let (metadata, extensions, mut stream) = request.into_parts();
+            let mut messages = Vec::new();
+            while let Some(message) = stream.message().await? {
+                messages.push(message);
+            }
+            let request = Request::from_parts(metadata, extensions, ());
+            match worker.take(&request, WorkerRequest::Write(messages)) {
+                Some(Reply::Write(reply)) => reply.map(Response::new),
+                _ => Err(Status::unimplemented("unscripted write")),
+            }
+        })
     }
 }
 

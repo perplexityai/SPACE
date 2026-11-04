@@ -3,6 +3,7 @@
 
 use std::fmt;
 use std::future::Future;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use axum::http::StatusCode;
@@ -29,7 +30,7 @@ use crate::state::BackendEndpoint;
 pub(super) type WorkerClient = WorkerApiClient<GrpcClientTrace<Channel>>;
 
 /// Where a prepared request's sandbox call goes.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Grant {
     /// The sandbox's canonical id.
     pub(super) sandbox_id: SandboxId,
@@ -129,7 +130,9 @@ pub(super) struct SandboxCall<'a> {
     state: &'a DataPlaneState,
     request: &'a FileRequest,
     fingerprint: Option<RequestFingerprint>,
-    grant: Grant,
+    /// Replaced when a reconnect is granted another route. A `parents` write
+    /// shares the call between its writes and its mkdirs, so it is not `&mut`.
+    grant: Mutex<Grant>,
 }
 
 impl<'a> SandboxCall<'a> {
@@ -143,19 +146,40 @@ impl<'a> SandboxCall<'a> {
             state,
             request,
             fingerprint,
-            grant,
+            grant: Mutex::new(grant),
         })
     }
 
-    pub(super) fn grant(&self) -> &Grant {
-        &self.grant
+    /// The route the call goes to now.
+    pub(super) fn grant(&self) -> Grant {
+        self.grant
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Send `message` once, as the API's spaced client sends a write stream:
+    /// nothing reconnects it, since its body may already be partly sent.
+    pub(super) async fn send<Msg, Resp, Call, Fut>(
+        &self,
+        operation: &'static str,
+        message: Msg,
+        call: Call,
+    ) -> Result<Resp, CallFailure>
+    where
+        Call: Fn(WorkerClient, tonic::Request<Msg>) -> Fut,
+        Fut: Future<Output = Result<tonic::Response<Resp>, tonic::Status>>,
+    {
+        self.attempt(operation, None, message, &call)
+            .await
+            .map_err(CallFailure::Worker)
     }
 
     /// Send `message` with `call`, within `budget` when it has one. A failure
     /// `reconnect` applies to prepares the request again, which reaches the
     /// runtime its sandbox has now, and sends it once more.
     pub(super) async fn call<Msg, Resp, Call, Fut>(
-        &mut self,
+        &self,
         operation: &'static str,
         reconnect: Reconnect,
         budget: Option<NodeApiOperationBudget>,
@@ -175,12 +199,16 @@ impl<'a> SandboxCall<'a> {
                 // Later calls to this runtime need a new connection too.
                 self.state
                     .backend_channels
-                    .forget_endpoint(&self.grant.endpoint);
-                self.grant = self
+                    .forget_endpoint(&self.grant().endpoint);
+                let grant = self
                     .request
                     .prepare(self.fingerprint.as_ref())
                     .await
                     .map_err(CallFailure::Refused)?;
+                *self
+                    .grant
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = grant;
                 self.attempt(operation, budget, message, &call)
                     .await
                     .map_err(CallFailure::Worker)
@@ -200,15 +228,16 @@ impl<'a> SandboxCall<'a> {
         Call: Fn(WorkerClient, tonic::Request<Msg>) -> Fut,
         Fut: Future<Output = Result<tonic::Response<Resp>, tonic::Status>>,
     {
+        let grant = self.grant();
         let channel = self
             .state
             .backend_channels
-            .channel_for_key(&self.grant.endpoint, self.grant.sandbox_id.as_uuid())
+            .channel_for_key(&grant.endpoint, grant.sandbox_id.as_uuid())
             .await
             .map_err(|error| {
                 tracing::warn!(
-                    sandbox_id = %self.grant.sandbox_id,
-                    endpoint = %self.grant.endpoint,
+                    sandbox_id = %grant.sandbox_id,
+                    endpoint = %grant.endpoint,
                     %error,
                     "cannot reach the granted sandbox runtime"
                 );
@@ -216,7 +245,7 @@ impl<'a> SandboxCall<'a> {
             })?;
         let pending = call(
             WorkerApiClient::new(wrap_grpc_client_channel(channel)),
-            self.grant.request(message)?,
+            grant.request(message)?,
         );
         let response = match budget {
             Some(budget) => tokio::time::timeout(budget.timeout(), pending)
@@ -224,7 +253,7 @@ impl<'a> SandboxCall<'a> {
                 .map_err(|_| {
                     tracing::warn!(
                         operation,
-                        sandbox_id = %self.grant.sandbox_id,
+                        sandbox_id = %grant.sandbox_id,
                         timeout_ms = budget.timeout().as_millis(),
                         "sandbox runtime operation timed out"
                     );
@@ -252,6 +281,45 @@ impl CallFailure {
             Self::Refused(refusal) => refusal,
             Self::Worker(error) => worker_error(operation, &error).into(),
         }
+    }
+}
+
+impl fmt::Display for CallFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Refused(_) => formatter.write_str("the API refused to prepare the call again"),
+            Self::Worker(error) => error.fmt(formatter),
+        }
+    }
+}
+
+/// A `parents` write reads only whether its first attempt found the path
+/// missing; a refusal is the answer either way.
+impl FileCallFailure for CallFailure {
+    fn status(&self) -> StatusCode {
+        match self {
+            Self::Refused(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Worker(error) => error.status(),
+        }
+    }
+
+    fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Refused(_) => None,
+            Self::Worker(error) => error.retry_after(),
+        }
+    }
+
+    fn is_guest_path_not_found(&self) -> bool {
+        matches!(self, Self::Worker(error) if error.is_guest_path_not_found())
+    }
+
+    fn is_refused_before_start(&self) -> bool {
+        matches!(self, Self::Worker(error) if error.is_refused_before_start())
+    }
+
+    fn is_lock_contention(&self) -> bool {
+        false
     }
 }
 
