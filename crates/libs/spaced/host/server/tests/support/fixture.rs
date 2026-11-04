@@ -34,6 +34,17 @@ impl HostFixture {
     }
 
     pub(crate) async fn start_with_connector(bridge_guest_connector: BridgeGuestConnector) -> Self {
+        Self::start_with_policy(
+            bridge_guest_connector,
+            pplx_space_spaced_host_server::QualifiedGuestAgent::LinuxV1,
+        )
+        .await
+    }
+
+    pub(crate) async fn start_with_policy(
+        bridge_guest_connector: BridgeGuestConnector,
+        guest_agent: pplx_space_spaced_host_server::QualifiedGuestAgent,
+    ) -> Self {
         let temp_dir = tempfile::tempdir().expect("temp dir created");
         let temp_path = temp_dir.path();
         let socket_path = temp_path.join("spaced-host.sock");
@@ -48,7 +59,7 @@ impl HostFixture {
                 bridge_guest_connector,
                 host_control_socket_path,
                 host_peer_authorization: SpacedHostPeerAuthorization::Disabled,
-                guest_agent: pplx_space_spaced_host_server::QualifiedGuestAgent::LinuxV1,
+                guest_agent,
             },
         );
         let service_task = tokio::spawn(service.run());

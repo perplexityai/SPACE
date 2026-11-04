@@ -37,32 +37,135 @@ fn start(script: &str) -> StartRequest {
         ..Default::default()
     }
 }
-#[derive(Clone)]
-struct Route {
-    channel: Channel,
-    host: bool,
+enum Files {
+    Guest(filesystem_client::FilesystemClient<Channel>),
+    Host(pplx_space_spaced_common::proto::host::filesystem_client::FilesystemClient<Channel>),
 }
-impl tower::Service<http::Request<tonic::body::Body>> for Route {
-    type Response = <Channel as tower::Service<http::Request<tonic::body::Body>>>::Response;
-    type Error = <Channel as tower::Service<http::Request<tonic::body::Body>>>::Error;
-    type Future = <Channel as tower::Service<http::Request<tonic::body::Body>>>::Future;
-    fn poll_ready(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        self.channel.poll_ready(cx)
-    }
-    fn call(&mut self, mut request: http::Request<tonic::body::Body>) -> Self::Future {
-        if self.host {
-            let path = request
-                .uri()
-                .path()
-                .replace("bridge.guest.v1", "host.v1")
-                .replace("/StatInfo", "/Stat")
-                .replace("/ListInfo", "/List");
-            *request.uri_mut() = path.parse().expect("generated RPC path");
+impl Files {
+    fn new(channel: Channel, host: bool) -> Self {
+        if host {
+            Self::Host(
+                pplx_space_spaced_common::proto::host::filesystem_client::FilesystemClient::new(
+                    channel,
+                ),
+            )
+        } else {
+            Self::Guest(filesystem_client::FilesystemClient::new(channel))
         }
-        self.channel.call(request)
+    }
+    async fn mkdir(
+        &mut self,
+        request: MkdirRequest,
+    ) -> Result<tonic::Response<MkdirResponse>, tonic::Status> {
+        match self {
+            Self::Guest(client) => client.mkdir(request).await,
+            Self::Host(client) => client.mkdir(request).await,
+        }
+    }
+    async fn stat_info(
+        &mut self,
+        request: StatRequest,
+    ) -> Result<tonic::Response<StatResponse>, tonic::Status> {
+        match self {
+            Self::Guest(client) => client.stat_info(request).await,
+            Self::Host(client) => client.stat(request).await,
+        }
+    }
+    async fn read(
+        &mut self,
+        request: ReadRequest,
+    ) -> Result<tonic::Response<tonic::Streaming<FileChunk>>, tonic::Status> {
+        match self {
+            Self::Guest(client) => client.read(request).await,
+            Self::Host(client) => client.read(request).await,
+        }
+    }
+    async fn rename(
+        &mut self,
+        request: RenameRequest,
+    ) -> Result<tonic::Response<RenameResponse>, tonic::Status> {
+        match self {
+            Self::Guest(client) => client.rename(request).await,
+            Self::Host(client) => client.rename(request).await,
+        }
+    }
+    async fn list_info(
+        &mut self,
+        request: ListRequest,
+    ) -> Result<tonic::Response<tonic::Streaming<FileInfo>>, tonic::Status> {
+        match self {
+            Self::Guest(client) => client.list_info(request).await,
+            Self::Host(client) => client.list(request).await,
+        }
+    }
+    async fn remove(
+        &mut self,
+        request: RemoveRequest,
+    ) -> Result<tonic::Response<RemoveResponse>, tonic::Status> {
+        match self {
+            Self::Guest(client) => client.remove(request).await,
+            Self::Host(client) => client.remove(request).await,
+        }
+    }
+    async fn write(
+        &mut self,
+        request: impl tonic::IntoStreamingRequest<Message = WriteRequest>,
+    ) -> Result<tonic::Response<WriteResponse>, tonic::Status> {
+        match self {
+            Self::Guest(client) => client.write(request).await,
+            Self::Host(client) => client.write(request).await,
+        }
+    }
+}
+enum Processes {
+    Guest(process_client::ProcessClient<Channel>),
+    Host(pplx_space_spaced_common::proto::host::process_client::ProcessClient<Channel>),
+}
+impl Processes {
+    fn new(channel: Channel, host: bool) -> Self {
+        if host {
+            Self::Host(
+                pplx_space_spaced_common::proto::host::process_client::ProcessClient::new(channel),
+            )
+        } else {
+            Self::Guest(process_client::ProcessClient::new(channel))
+        }
+    }
+    async fn start(
+        &mut self,
+        request: StartRequest,
+    ) -> Result<tonic::Response<tonic::Streaming<ProcessEvent>>, tonic::Status> {
+        match self {
+            Self::Guest(client) => client.start(request).await,
+            Self::Host(client) => client.start(request).await,
+        }
+    }
+    async fn send_input(
+        &mut self,
+        request: SendInputRequest,
+    ) -> Result<tonic::Response<SendInputResponse>, tonic::Status> {
+        match self {
+            Self::Guest(client) => client.send_input(request).await,
+            Self::Host(client) => client.send_input(request).await,
+        }
+    }
+    async fn close_stdin(
+        &mut self,
+        request: CloseStdinRequest,
+    ) -> Result<tonic::Response<CloseStdinResponse>, tonic::Status> {
+        match self {
+            Self::Guest(client) => client.close_stdin(request).await,
+            Self::Host(client) => client.close_stdin(request).await,
+        }
+    }
+    async fn send_signal(
+        &mut self,
+        request: SendSignalRequest,
+    ) -> Result<tonic::Response<SendSignalResponse>, tonic::Status> {
+        match self {
+            Self::Guest(client) => client.send_signal(request).await,
+            Self::Host(client) => client.send_signal(request).await,
+        }
     }
 }
 async fn run(channel: Channel, host: bool) -> anyhow::Result<()> {
@@ -87,9 +190,8 @@ async fn run(channel: Channel, host: bool) -> anyhow::Result<()> {
         })
         .await?;
     }
-    let channel = Route { channel, host };
-    let mut files = filesystem_client::FilesystemClient::new(channel.clone());
-    let mut processes = process_client::ProcessClient::new(channel);
+    let mut files = Files::new(channel.clone(), host);
+    let mut processes = Processes::new(channel, host);
     let root = format!(
         r"C:\Users\user\space-qualification-{}",
         uuid::Uuid::now_v7()

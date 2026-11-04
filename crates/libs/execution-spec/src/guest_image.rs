@@ -155,7 +155,7 @@ pub enum QualifiedGuestAgent {
     #[default]
     Absent,
     LinuxV1,
-    /// Native Windows readiness; operations require separate qualification.
+    /// Native Windows readiness and session-0 process/files; memory lifecycle is separate.
     WindowsV1,
 }
 impl QualifiedGuestAgent {

@@ -21,6 +21,7 @@ datadog = ["otel", "pplx-space-common-svc/datadog"]
 datadog-otel = ["otel", "datadog"]
 
 [dependencies]
+pplx-space-guest-process = { workspace = true }
 tower = { workspace = true }
 http-body = { workspace = true }
 thiserror = { workspace = true }

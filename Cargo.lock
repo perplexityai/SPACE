@@ -7614,6 +7614,7 @@ dependencies = [
  "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-common-svc",
+ "pplx-space-guest-process",
  "pplx-space-metrics",
  "pplx-space-net-common",
  "pplx-space-spaced-common",
