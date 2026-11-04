@@ -4,6 +4,8 @@ on:
   pull_request:
     paths:
       - crates/libs/net/common/src/slot_dhcp.rs
+      # The harness and its lock must stay buildable with `cargo fetch --locked`.
+      - fuzz/**
 
 permissions:
   contents: read
