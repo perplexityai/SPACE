@@ -75,7 +75,7 @@ spec:
               value: "/var/run/space-publication/cluster-api.token"
             # NodeApi credentials for the api substrate the operation
             # dispatcher and warm-pool probe run, and the trigger fan-out
-            # (SpaceBearerToken, crates/libs/bearer-token/src/lib.rs):
+            # (SpaceBearerToken, crates/l10_foundation/bearer/token/src/lib.rs):
             # one projected token per node-api surface, admitted by TokenReview
             # (space-node-api-local's auth allowlists).
             - name: SPACE_NODE_API_TOKEN_PATH
@@ -175,7 +175,7 @@ spec:
                   key: SPACE_OBJECT_STORE_STATIC_SECRET_ACCESS_KEY
             # The cluster-controller builds the same substrate as the
             # api-server (Substrate::from_env, lib.rs in
-            # crates/libs/cluster/controller/server), hence this env block must
+            # crates/l40_api/cluster/controller/server), hence this env block must
             # match the api-server's exactly. On `direct` it skips the
             # Kubernetes-only reconcilers (reconcilers.rs). The reconcilers
             # themselves are agnostic to whether the node-api behind WorkerApi
@@ -187,7 +187,7 @@ spec:
             # substrate: with it off every replica would run the reconcilers.
             # In a pod the controller contends for the Lease on either
             # substrate (LeaderElectionConfig::election in
-            # crates/libs/cluster/controller/server/src/leader_election).
+            # crates/l40_api/cluster/controller/server/src/leader_election).
             - name: SPACE_CLUSTER_CONTROLLER_LEADER_ELECTION_ENABLED
               value: "true"
             # Namespace of the coordination.k8s.io Lease used for leader

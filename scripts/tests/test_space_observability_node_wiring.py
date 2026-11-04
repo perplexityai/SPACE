@@ -239,7 +239,7 @@ def wrapper_env(settings: Path | None, scratch: Path) -> dict[str, str]:
 def identity(env: dict[str, str], default_service: str) -> dict[str, str]:
     """Service, environment and version a SPACE producer reports from `env`.
 
-    Mirrors crates/libs/observability/src/identity.rs and shim/identity.go: the
+    Mirrors crates/l10_foundation/observability/src/identity.rs and shim/identity.go: the
     SPACE_* name, then the OTel name, then the resource attribute, then DD_*.
     """
     entries = (entry.partition("=") for entry in env.get("OTEL_RESOURCE_ATTRIBUTES", "").split(","))

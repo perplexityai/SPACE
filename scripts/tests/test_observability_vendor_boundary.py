@@ -43,7 +43,7 @@ def test_vendor_dependency_cannot_escape_through_aliases_or_dependency_tables(
     manifest.write_text(f'[package]\nname = "product"\n[{section}]\n{dependency}\n')
     failures = guard.violations(tmp_path)
     assert len(failures) == 1
-    assert "belongs in crates/libs/observability/Cargo.toml" in failures[0]
+    assert "belongs in crates/l10_foundation/observability/Cargo.toml" in failures[0]
 
 
 @pytest.mark.parametrize("optional,valid", [(True, True), (False, False)])

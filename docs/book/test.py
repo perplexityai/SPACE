@@ -319,7 +319,7 @@ class GuideTests(unittest.TestCase):
                 found.add(path)
         self.assertIn("examples/first_sandbox.py", found)
         self.assertIn("infra/space/kind/scripts/up.sh", found)
-        self.assertIn("crates/libs/api/src/controllers/substrate/direct.rs", found)
+        self.assertIn("crates/l40_api/api/src/controllers/substrate/direct.rs", found)
 
     def test_search_index_targets(self):
         # mdBook 0.4.52 embeds JSON in a JS string. Only parse its URL list.

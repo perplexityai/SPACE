@@ -9,7 +9,7 @@ metadata:
     app.kubernetes.io/instance: {{ .Release.Name }}
 ---
 # The authority authenticates each caller's projected token by TokenReview
-# (crates/libs/credential/mgr/server/src/k8s_identity.rs), so its own
+# (crates/l40_api/credmgr/server/src/k8s_identity.rs), so its own
 # ServiceAccount may create TokenReviews, and its pod mounts the API token.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -45,7 +45,7 @@ subjects:
 # authority reads callers from a pod reflector over that namespace, which
 # lists and watches, and refuses every caller as unavailable until it has
 # synced (CredmgrTokenReviewer::new and resolve_token_identity,
-# crates/libs/credential/mgr/server/src/k8s_identity.rs).
+# crates/l40_api/credmgr/server/src/k8s_identity.rs).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -146,7 +146,7 @@ spec:
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           # The authority role over TCP only (`--no-uds` skips the node-local
-          # sockets and service mutex, crates/libs/credential/mgr/server/src/run.rs),
+          # sockets and service mutex, crates/l40_api/credmgr/server/src/run.rs),
           # serving TLS with its self-signed end-entity certificate, mounted
           # where the EKS module mounts it (credmgr_authority_tls.tf;
           # internal-rpc-tls.sh issues it). TLS is server-side only.
@@ -174,7 +174,7 @@ spec:
             - name: SPACE_DB_CREDS_PASSWORD
               {{- include "space-cluster.dbPassword" (dict "ctx" . "role" "CREDS" "value" .Values.postgres.managedCredentialsPassword) | nindent 14 }}
             # The platform KEK comes from the intermediate-key broker, the
-            # production provider path (crates/libs/credential/mgr/server/src/run.rs):
+            # production provider path (crates/l40_api/credmgr/server/src/run.rs):
             # the authority mints each org's intermediate key there on its
             # first Encrypt or volume DEK, stores the opaque wrapped key in
             # Postgres, and unwraps it through the broker, so keys survive
@@ -208,7 +208,7 @@ spec:
             # Role above), and the node must be registered under that name
             # and UID in node_k8s, read through the DATABASE_URL pool above
             # (registered_node,
-            # crates/libs/node/registration-store/src/lib.rs); without
+            # crates/l30_storage/node/registration/store/src/lib.rs); without
             # DATABASE_URL the listener refuses to start (run.rs). With
             # TokenReview on, the listener never accepts SPACE_INTERNAL_TOKEN
             # (run.rs).
@@ -222,11 +222,11 @@ spec:
               value: {{ .Values.awsRegion | quote }}
             {{- if eq .Values.storageCredentials "exchange" }}
             # Storage credential exchange, configured with the settings a
-            # deployment uses (crates/libs/credential/mgr/server/src/run.rs):
+            # deployment uses (crates/l40_api/credmgr/server/src/run.rs):
             # the vending role enables ExchangeToken, and the authority
             # assumes it through STS for every exchange, with an exact-object
             # session policy (assume_s3_vend_role,
-            # crates/libs/credential/mgr/server/src/service.rs). Kind's STS is
+            # crates/l40_api/credmgr/server/src/service.rs). Kind's STS is
             # the Kind-only bridge (space-kind-sts-bridge) in front of the
             # object store's IAM service, reached through the AWS SDK's
             # service endpoint setting over TLS from the internal RPC CA. The
@@ -269,7 +269,7 @@ spec:
             # The reader role every AWS Secrets Manager read assumes, with a
             # session scoped to the sandbox owner's organization; without it the
             # Secrets Manager provider is not installed
-            # (crates/libs/credential/mgr/server/src/aws_secrets_manager.rs).
+            # (crates/l40_api/credmgr/server/src/aws_secrets_manager.rs).
             # Resolution runs here, where the database pool is, never on a node
             # agent (run.rs). Optional, from the same Secret as the credentials.
             - name: SPACE_CREDMGR_SECRETS_MANAGER_ROLE_ARN
@@ -283,7 +283,7 @@ spec:
             - name: grpc
               containerPort: {{ .Values.service.port }}
           # The gRPC health service is exempt from caller authentication
-          # (crates/libs/credential/mgr/server/src/tcp_auth.rs).
+          # (crates/l40_api/credmgr/server/src/tcp_auth.rs).
           readinessProbe:
             exec:
               command: ["/opt/space/bin/grpc_health_probe", "-addr=127.0.0.1:{{ .Values.service.port }}", "-tls", "-tls-ca-cert=/etc/space-credmgr-tls/tls.crt", "-tls-server-name=space-credmgr-authority", "-connect-timeout=2s", "-rpc-timeout=2s"]

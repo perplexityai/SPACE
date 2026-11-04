@@ -334,7 +334,7 @@ export function QuarantineCard({ view, nowMs }: { view: DebugView; nowMs: number
 }
 
 // `LIMIT 200` in the debug route's timeline source
-// (`crates/libs/api/src/routes/debug/sources/timeline.rs`).
+// (`crates/l40_api/api/src/routes/debug/sources/timeline.rs`).
 const TIMELINE_CAP = 200;
 
 const TIMELINE_COLORS: Record<string, string> = {

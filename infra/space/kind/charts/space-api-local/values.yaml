@@ -43,7 +43,7 @@ autoscaling:
 #
 # On SIGTERM the process reports draining on /readyz and stops accepting in the
 # same instant, then gives in-flight work --shutdown-grace-secs to finish
-# (drain_before_shutdown and drain_server, crates/libs/api/src/run.rs): HTTP
+# (drain_before_shutdown and drain_server, crates/l40_api/api/src/run.rs): HTTP
 # requests, including operation and sandbox-event SSE streams, the ingress
 # activation listener, and the substrate work its TaskTracker holds, such as
 # a restore leader or a suspend continuation. Rendered at the binary's
@@ -64,7 +64,7 @@ preStopSleepSeconds: 5
 terminationGracePeriodSeconds: 180
 
 # The boot budget the Pod reflector leaves to Kubernetes (`start`,
-# crates/libs/api/src/controllers/substrate/kubernetes/pod_reflector.rs): a
+# crates/l40_api/api/src/controllers/substrate/kubernetes/pod_reflector.rs): a
 # replica whose reflector never completes its initial LIST stays NotReady
 # until restarted. Startup blocks up to 30 s on the node caches before serving
 # (STORE_READY_TIMEOUT, kubernetes/caches.rs), then the LIST runs; 18 x 5 s
@@ -125,7 +125,7 @@ migrate:
   enabled: true
   # activeDeadlineSeconds, also passed to the migrator. The migrator's own
   # default for an unstated deadline (MIGRATION_JOB_ACTIVE_DEADLINE,
-  # crates/libs/db/migrator/src/migration_retry.rs).
+  # crates/l30_storage/db/migrate/src/migration_retry.rs).
   jobDeadlineSeconds: 1800
   # A one-shot Job, re-run by the next rollout: replaceable
   # (infra/space/kind/manifests/priorityclasses.yaml).
@@ -153,7 +153,7 @@ postgres:
   poolMaxConnections: 100
 
 # The substrate the API runs: `kubernetes`, below, or `direct`, the
-# DirectSubstrate (crates/libs/api/src/controllers/substrate/direct.rs), which
+# DirectSubstrate (crates/l40_api/api/src/controllers/substrate/direct.rs), which
 # places sandboxes on the nodes registered through the admin node registry
 # with no pod per sandbox. The `k8s` block still renders on `direct`, which
 # reads none of it. The bring-up selects it with SPACE_KIND_SUBSTRATE; see
@@ -188,7 +188,7 @@ k8s:
   # SPACE_CREATE_DATA_PLANE_READY_TIMEOUT_SECS: how long a create, join or
   # wake waits for the sandbox pod's IP and proxy. Empty renders nothing, so
   # the binary's 120 s default applies
-  # (crates/libs/api/src/controllers/substrate/kubernetes/mod.rs). The Kind
+  # (crates/l40_api/api/src/controllers/substrate/kubernetes/mod.rs). The Kind
   # bring-up sets it in values-kind.yaml.
   createDataPlaneReadyTimeoutSecs: ""
 
@@ -241,7 +241,7 @@ dataPlaneInternalUrl: http://space-data-plane:8090
 # Observe needs no allowlist to classify traffic: an id outside
 # SPACE_API_CLIENT_CONCURRENCY_KNOWN_CLIENTS, or none, lands in the shared
 # `unspecified` bucket, which is metered like any other
-# (`ClientKey::classify` in crates/libs/api/src/client_concurrency), so the
+# (`ClientKey::classify` in crates/l40_api/api/src/client_concurrency), so the
 # allowlist stays at its empty default.
 clusterActivationAdmission:
   enabled: ""

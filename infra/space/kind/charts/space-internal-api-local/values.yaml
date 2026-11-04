@@ -38,7 +38,7 @@ clusterApiAuth:
 # Two replicas behind the ClusterIP Service, as deployments run several. The
 # binary keeps no state a later call has to find on the same replica and runs
 # no singleton work: every write is a Postgres transaction under row locks or
-# claim tokens (FOR UPDATE / SKIP LOCKED in crates/libs/internal/api/server),
+# claim tokens (FOR UPDATE / SKIP LOCKED in crates/l40_api/internal/api/server),
 # its RPCs are all unary, and its only per-replica caches (the
 # template-visibility cache below, the TokenReview cache) are bounded and
 # documented per replica.
@@ -51,17 +51,17 @@ minReadySeconds: 10
 
 # On SIGTERM the listener stops accepting at once and tonic's graceful
 # shutdown waits for in-flight calls with no deadline of its own
-# (serve_with_incoming_shutdown, crates/libs/internal/api/server/src/run.rs).
+# (serve_with_incoming_shutdown, crates/l40_api/internal/api/server/src/run.rs).
 # The server sets no per-call deadline either (PublishNodeState runs several
 # database operations unbounded), so a call lasts until its client gives up
 # and resets the stream: every ClusterApi client, node-ctl's included, times
 # out at 30 s (CLUSTER_API_RPC_TIMEOUT in
-# crates/libs/node/api/client/src/cluster.rs, CLUSTER_RPC_TIMEOUT in
-# crates/libs/node/ctl/server/src/lib.rs). A call admitted at the end of the
+# crates/l40_api/node/api/client/src/cluster.rs, CLUSTER_RPC_TIMEOUT in
+# crates/l40_api/node/ctl/server/src/lib.rs). A call admitted at the end of the
 # preStop delay can therefore run until 5 + 30 s. Telemetry shutdown then
 # flushes metrics and traces in turn, each capped at 5 s (SHUTDOWN_TIMEOUT in
-# crates/libs/observability/src/sink/otlp.rs, the tracer provider's
-# shutdown_with_timeout in crates/libs/observability/src/lib.rs). The grace
+# crates/l10_foundation/observability/src/sink/otlp.rs, the tracer provider's
+# shutdown_with_timeout in crates/l10_foundation/observability/src/lib.rs). The grace
 # is 5 + 30 + 10, plus 5 s to exit.
 terminationGracePeriodSeconds: 50
 

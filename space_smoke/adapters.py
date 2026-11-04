@@ -500,13 +500,13 @@ SELECT id FROM snapshots
 
 KIND_CONTROLLER_SELECTOR = "app.kubernetes.io/name=space-cluster-controller"
 # The cluster-controller's leadership Lease, container and readiness marker
-# (crates/libs/cluster/controller/server/src/leader_election/mod.rs and the
+# (crates/l40_api/cluster/controller/server/src/leader_election/mod.rs and the
 # space-cluster-controller-local chart).
 CONTROLLER_LEASE_NAME = "cluster-controller"
 CONTROLLER_CONTAINER = "cluster-controller"
 CONTROLLER_READINESS_MARKER = "/tmp/space-cluster-controller-ready"
 # The leader-election kill switch: on unless one of these values turns it off
-# (truthy_default in crates/libs/cluster/controller/server/src/env_config.rs).
+# (truthy_default in crates/l40_api/cluster/controller/server/src/env_config.rs).
 LEADER_ELECTION_ENV = "SPACE_CLUSTER_CONTROLLER_LEADER_ELECTION_ENABLED"
 LEADER_ELECTION_FALSE_VALUES = frozenset({"0", "false", "False", "FALSE"})
 # The liveness-budget and lease-TTL test hooks the brownout scenario scopes to
@@ -798,10 +798,10 @@ LOCAL_SANDBOX_RECLAIM_POD_POLL_SECONDS = 0.5
 # Three delete refusals get their own handling. Two settle on their own and are
 # retried within the delete budget: sbx-manager's quarantine recovery
 # completing (`CleanupAdmissionError` in
-# crates/libs/sbx/mgr/server/src/service/cleanup.rs), and node-manager's
+# crates/l40_api/sbx/mgr/server/src/service/cleanup.rs), and node-manager's
 # sandbox mutation claim held by another host mutation or reset past
 # cleanup's bounded wait (`cleanup_sandbox_phases` in
-# crates/libs/node/mgr/server/src/service/cleanup_inspect.rs), which the
+# crates/l40_api/node/mgr/server/src/service/cleanup_inspect.rs), which the
 # delete's durable cleanup passes through. A pending suspend
 # publication cannot land once the cluster row is gone, so it is reported as
 # such. Every other refusal, `RetainedFilesystemOnlyCopy` included, is reported
@@ -826,7 +826,7 @@ ROOTFS_SEND_FILE = "rootfs.btrfs-send"
 # node-manager's relay refuses a send stream whose framing breaks, as a kernel
 # send restarted mid-pipe does, before forwarding it; volume-manager's failed
 # attempt carries the status message
-# (crates/libs/node/mgr/server/src/service/btrfs_send_transport.rs).
+# (crates/l40_api/node/mgr/server/src/service/btrfs_send_transport.rs).
 BTRFS_SEND_REJECTED_ERROR = "btrfs send stream rejected"
 # node-manager stages each send lease here; a lease's `.send-*` wire clone
 # exists only while its kernel send runs.
@@ -888,7 +888,7 @@ _TRANSFER_JOB_ROW = re.compile(r"│\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9
 # A storage URI's query can carry endpoint credentials; log evidence keeps the
 # scheme and drops the rest.
 _STORAGE_URI = re.compile(r"s3://[^\s\"',}\]]*")
-# `SPACE_TEMPLATE_RECEIVED_UUID_NS` (crates/libs/btrfs/src/lib.rs):
+# `SPACE_TEMPLATE_RECEIVED_UUID_NS` (crates/l10_foundation/btrfs/src/lib.rs):
 # a template installed from `(name, content_hash)` is stamped with
 # `UUIDv5(NS, "name@content_hash")` so a btrfs-send stream produced against
 # it on one node can be received against an independently installed copy
@@ -993,7 +993,7 @@ _TEMPLATE_PREFETCH_DEFAULT_LATEST_N = 5
 
 # The API's suspend-restore selector for a user restore (see
 # `selected_suspend_restore_storage_uri` in
-# crates/libs/api/.../store/restore_source.rs and the legacy suite's
+# crates/l40_api/api/.../store/restore_source.rs and the legacy suite's
 # `wait_for_restore_affinity_portable`): a durable remote
 # snapshot is selectable only when a `ready` full snapshot with a storage
 # location is newer than the last placement change. Until then the planner
@@ -2236,7 +2236,7 @@ ON CONFLICT (key_hash) DO NOTHING;
     ) -> list[tuple[str, dict[str, Any]]]:
         """(node, event) for every structured sandbox event of one type.
 
-        Sandbox events are a documented contract (`crates/libs/events/README.md`);
+        Sandbox events are a documented contract (`crates/l20_domain/events/README.md`);
         callers poll for one and judge its fields, never its absence or count.
         """
 
@@ -6413,7 +6413,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             KIND_NODE_SHELL_CONTAINER,
             "/space/run/volume-credentials/credmgr.sock",
             # volume-manager's account; the socket's group admits it
-            # (crates/libs/credential/mgr/server/src/run/volume_socket.rs).
+            # (crates/l40_api/credmgr/server/src/run/volume_socket.rs).
             user="space-volmgr",
             groups=("space-volcredclients",),
         )

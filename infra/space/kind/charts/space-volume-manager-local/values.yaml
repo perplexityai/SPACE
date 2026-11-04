@@ -20,7 +20,7 @@ storageCredentials: exchange
 # On SIGTERM volume-manager closes transfer admission, drains queued
 # transfers for up to --drain-timeout-secs (100 s), then stops its gRPC server
 # within --server-drain-timeout-secs (10 s)
-# (crates/libs/vol/mgr/server/src/run.rs). The grace covers both plus exit.
+# (crates/l40_api/volmgr/server/src/run.rs). The grace covers both plus exit.
 terminationGracePeriodSeconds: 120
 
 # Volume-manager's streaming snapshot upload part budget

@@ -2,7 +2,7 @@
 One Deployment per API surface the process serves, as deployed: `shared`, the
 public, admin and E2B roots on one host, which every client and harness call
 here addresses; and, with admin.enabled, `admin`, the dedicated admin API
-(`--surface admin`, crates/apps/api/svc/src/main.rs) in its own process. Only
+(`--surface admin`, crates/l50_app/api/svc/src/main.rs) in its own process. Only
 the shared Deployment runs the ingress activation listener, and only it is
 behind the space-api Service. Neither runs the migrations: the space-db-migrate
 Job (migrate-job.yaml) does, once, before either starts.
@@ -112,7 +112,7 @@ spec:
             - name: SPACE_CLUSTER_API_TOKEN_PATH
               value: "/var/run/space-publication/cluster-api.token"
             # The substrate's NodeApi credentials (SpaceBearerToken,
-            # crates/libs/bearer-token/src/lib.rs): one projected
+            # crates/l10_foundation/bearer/token/src/lib.rs): one projected
             # token per node-api surface, which node-api admits by TokenReview
             # (space-node-api-local's auth allowlists). An explicit path makes a
             # missing file an error rather than a fall back to the static token.
@@ -269,7 +269,7 @@ spec:
             # The node-api DaemonSets run in the release namespace. Unset, the
             # substrate looks for them in the sandbox namespace
             # (KubernetesState::try_from_env,
-            # crates/libs/api/src/controllers/substrate/kubernetes/mod.rs).
+            # crates/l40_api/api/src/controllers/substrate/kubernetes/mod.rs).
             - name: SPACE_NODE_API_NAMESPACE
               value: {{ .Release.Namespace | quote }}
             - name: SPACE_SANDBOX_POD_IMAGE

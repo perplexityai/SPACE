@@ -208,7 +208,7 @@ export interface SandboxDebug {
 
 // One line describing a timeline event's detail, most informative fields
 // first. The keys are the ones the debug route's timeline source builds for
-// each event (`crates/libs/api/src/routes/debug/sources/timeline.rs`).
+// each event (`crates/l40_api/api/src/routes/debug/sources/timeline.rs`).
 const TIMELINE_DETAIL_KEYS = [
   'lifecycle', 'placement', 'status', 'state', 'pod_name', 'generation', 'k8s_node_name',
   'snapshot_type', 'retention_tier', 'size_bytes', 'disk_usage_bytes', 'failure_reason',

@@ -119,7 +119,7 @@ a target Cargo still builds.
 Postgres/Redis fixtures fail closed unless the run opts out with
 `SPACE_TEST_DEPS_OPTIONAL=1`. Every opted-out skip emits a `SPACE-TEST-DEP-SKIP:`
 stderr marker and appends to the file named by `SPACE_TEST_DEP_SKIP_LOG` when
-set (`crates/libs/db-test-fixtures/src/lib.rs`);
+set (`crates/test_support/db/test/fixtures/src/lib.rs`);
 `ci/scripts/run-rust-checks.sh` collects and reports the count on
 every run — zero proves no fail-open path was taken. A configured log is
 fail-closed: path and write errors fail the affected test so collection

@@ -1,7 +1,7 @@
 """The reconcile-queue GC's EC2 half, proven live on kind.
 
 The cluster-controller reconciler `reconcile_queue_gc`
-(crates/libs/cluster/controller/server/src/reconcile_queue_gc/) runs on Kind
+(crates/l40_api/cluster/controller/server/src/reconcile_queue_gc/) runs on Kind
 at a 10 s tick (the `SPACE_RECONCILE_QUEUE_GC_TICK_SECS` test hook; the binary
 ticks every 300 s) and the binary's fixed retention: 24 h before a dead letter,
 or a live ref of a non-ready `managed_by='k8s'` node, can be pruned. For each

@@ -2,7 +2,7 @@
 
 **Status: proposal.** Reuse SPACE's process/filesystem implementation inside an
 independently isolated application, without guest listeners or daemon startup.
-The [execution crate README](../../../crates/libs/spaced/guest/execution/README.md)
+The [execution crate README](../../../crates/l40_api/spaced/guest/execution/README.md)
 describes implemented behavior. [Implementation coverage](#implementation-coverage)
 maps the initial profile's guarantees to checks and their evidence limits.
 That does not establish stable Rust APIs or validate downstream packaging.
@@ -87,8 +87,8 @@ process start/reconnect/list/signal/stdin/PTY, filesystem stat/list/read/write/
 updates affect future starts only. Deprecated RPCs remain adapters; metadata and
 networking remain daemon concerns, despite sharing the guest protocol crate.
 
-Use existing [process](../../../crates/libs/spaced/guest/protocol/src/process_limits.rs)
-and [filesystem](../../../crates/libs/spaced/guest/protocol/src/filesystem_limits.rs)
+Use existing [process](../../../crates/l20_domain/spaced/guest/protocol/src/process_limits.rs)
+and [filesystem](../../../crates/l20_domain/spaced/guest/protocol/src/filesystem_limits.rs)
 budgets at the shared operation boundary. Transport adapters keep predecode
 protection and pass admission through without double charging. Native calls must
 reject oversized values and bound streams, operations, workers, watches and retry
@@ -186,15 +186,15 @@ owning acceptance checks, rather than a second implementation of the contract:
 
 | Requirement | Implementation and acceptance coverage |
 | --- | --- |
-| Explicit worker artifact and startup ownership | [Worker executable tests](../../../crates/libs/spaced/guest/execution/src/worker_executable/tests.rs) and the [embedding host](../../../crates/apps/spaced/guest/worker/tests/embedding/linux.rs): artifact replacement, invalid/incompatible workers, cancelled startup and reaping. |
-| Restricted child identity, unchanged host authority | [Identity probes](../../../crates/apps/spaced/guest/worker/tests/embedding/identity.rs): IDs, groups, capabilities, PTYs, privilege-gaining executables and directory traversal; the [entrypoint](../../../crates/apps/spaced/guest/worker/tests/embedding.rs) also rejects dispatch after threads start. |
-| Native operations and bounded admission | [Ingress tests](../../../crates/libs/spaced/guest/execution/src/filesystem/router/ingress_tests.rs), [process tests](../../../crates/libs/spaced/guest/execution/src/process/tests.rs) and the embedding host: payload limits, shared permits, uploads, environment updates and cancellation. |
-| Admission closure and retained cleanup ownership | [Execution tests](../../../crates/libs/spaced/guest/execution/src/execution/tests.rs) and [router tests](../../../crates/libs/spaced/guest/execution/src/filesystem/router/tests.rs): every closed entrypoint, admitted work, incomplete/repeated drain and interrupted streams. |
-| Placement before exec and final teardown | [Placement tests](../../../crates/libs/spaced/guest/execution/src/placement/tests.rs) authenticate the placement writer as a forked child even when exec fails. The [boundary probe](../../../crates/apps/spaced/guest/worker/tests/embedding/boundary.rs) checks real cgroup membership, descendant inheritance and caller teardown. |
-| Concurrent descriptor inheritance | [Startup probe](../../../crates/apps/spaced/guest/worker/tests/embedding/boundary/descriptors.rs): samples unrelated execs during fresh PTY and identity-worker startup. It catches inheritable windows only when an exec overlaps them; it does not guarantee per-round overlap or detection of microsecond races. Local PTY/socket negative controls widened those windows to 50 ms. The boundary fixture checks the caller's close-on-exec placement-handle precondition. |
-| Runtime and signal ownership | [Caller handler](../../../crates/apps/spaced/guest/worker/tests/embedding/sigchld.rs) installed before Tokio; the boundary probe observes both handlers and retains PID-specific caller reaping across service drain. |
+| Explicit worker artifact and startup ownership | [Worker executable tests](../../../crates/l40_api/spaced/guest/execution/src/worker_executable/tests.rs) and the [embedding host](../../../crates/l50_app/spaced/guest/worker/tests/embedding/linux.rs): artifact replacement, invalid/incompatible workers, cancelled startup and reaping. |
+| Restricted child identity, unchanged host authority | [Identity probes](../../../crates/l50_app/spaced/guest/worker/tests/embedding/identity.rs): IDs, groups, capabilities, PTYs, privilege-gaining executables and directory traversal; the [entrypoint](../../../crates/l50_app/spaced/guest/worker/tests/embedding.rs) also rejects dispatch after threads start. |
+| Native operations and bounded admission | [Ingress tests](../../../crates/l40_api/spaced/guest/execution/src/filesystem/router/ingress_tests.rs), [process tests](../../../crates/l40_api/spaced/guest/execution/src/process/tests.rs) and the embedding host: payload limits, shared permits, uploads, environment updates and cancellation. |
+| Admission closure and retained cleanup ownership | [Execution tests](../../../crates/l40_api/spaced/guest/execution/src/execution/tests.rs) and [router tests](../../../crates/l40_api/spaced/guest/execution/src/filesystem/router/tests.rs): every closed entrypoint, admitted work, incomplete/repeated drain and interrupted streams. |
+| Placement before exec and final teardown | [Placement tests](../../../crates/l40_api/spaced/guest/execution/src/placement/tests.rs) authenticate the placement writer as a forked child even when exec fails. The [boundary probe](../../../crates/l50_app/spaced/guest/worker/tests/embedding/boundary.rs) checks real cgroup membership, descendant inheritance and caller teardown. |
+| Concurrent descriptor inheritance | [Startup probe](../../../crates/l50_app/spaced/guest/worker/tests/embedding/boundary/descriptors.rs): samples unrelated execs during fresh PTY and identity-worker startup. It catches inheritable windows only when an exec overlaps them; it does not guarantee per-round overlap or detection of microsecond races. Local PTY/socket negative controls widened those windows to 50 ms. The boundary fixture checks the caller's close-on-exec placement-handle precondition. |
+| Runtime and signal ownership | [Caller handler](../../../crates/l50_app/spaced/guest/worker/tests/embedding/sigchld.rs) installed before Tokio; the boundary probe observes both handlers and retains PID-specific caller reaping across service drain. |
 
-The [README](../../../crates/libs/spaced/guest/execution/README.md) specifies the
+The [README](../../../crates/l40_api/spaced/guest/execution/README.md) specifies the
 privileged probe's disposable environment and fail-closed prerequisites. Routine
 Rust tests cover operation behavior; Kind/Firecracker checks cover the daemon
 integration. Passing the Linux checks does not establish native macOS coverage,

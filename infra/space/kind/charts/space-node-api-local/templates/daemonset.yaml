@@ -22,11 +22,11 @@ spec:
     matchLabels:
       {{- include "space-node-service.selectorLabels" $ctx | nindent 6 }}
   # Delete first. node-api has no service mutex and its listener sets
-  # SO_REUSEPORT (crates/libs/node/api/server/src/run.rs), but the port it
+  # SO_REUSEPORT (crates/l40_api/node/api/server/src/run.rs), but the port it
   # declares on the host network is a host port, and the scheduler will not
   # place a second pod with the same host port on the node. The port must stay
   # declared: the API's pod reflector reads the container port named `grpc`
-  # (crates/libs/api/src/controllers/substrate/kubernetes/caches.rs).
+  # (crates/l40_api/api/src/controllers/substrate/kubernetes/caches.rs).
   {{- include "space-node-service.updateStrategy" (dict "strategy" "deleteFirst") | nindent 2 }}
   template:
     metadata:
@@ -40,7 +40,7 @@ spec:
       serviceAccountName: {{ include "space-node-service.name" $ctx }}
       # TokenReview needs the pod's own API credentials, found by the kube
       # client's in-cluster config (traced_kube_client_from_env,
-      # crates/libs/kube-client/src/lib.rs), and the auth allowlists
+      # crates/l10_foundation/kube/client/src/lib.rs), and the auth allowlists
       # name accounts in the namespace read from the same mount
       # (auth_namespace, crates/libs/common/svc/src/auth/k8s.rs). The
       # account may only create TokenReviews (RBAC above).
@@ -94,7 +94,7 @@ spec:
             - name: SPACE_BUILD_MANAGER_ENDPOINT
               value: {{ .Values.buildManagerEndpoint | quote }}
             # node-api's own build-manager credential (BearerAuthInterceptor,
-            # crates/libs/build/mgr/client/src/lib.rs); build-manager
+            # crates/l40_api/build/mgr/client/src/lib.rs); build-manager
             # admits this account by TokenReview with no static fallback.
             - name: SPACE_BUILD_MANAGER_TOKEN_PATH
               value: /var/run/space-auth/build-manager.token
@@ -102,7 +102,7 @@ spec:
             # node-api's own NodeApi credential, for the template transfers it
             # pulls from a registered peer node-api of either role: it presents
             # this token to the peer's NodeExportTemplate (connect_remote,
-            # crates/libs/node/api/server/src/transfer.rs).
+            # crates/l40_api/node/api/server/src/transfer.rs).
             - name: SPACE_NODE_API_TOKEN_PATH
               value: /var/run/space-auth/node-api.token
             # Kubernetes TokenReview auth on both listeners, with no static

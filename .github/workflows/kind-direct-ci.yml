@@ -13,12 +13,14 @@ on:
   workflow_dispatch:
   pull_request:
     paths:
-      - crates/libs/api/src/controllers/substrate/**
-      - crates/libs/api/src/routes/admin/node_maintenance*
-      - crates/libs/api/src/routes/admin/node_maintenance/**
-      - crates/libs/internal/api/server/**
-      - crates/libs/cluster/controller/server/**
-      - crates/libs/sbx/mgr/**
+      - crates/l40_api/api/src/controllers/substrate/**
+      - crates/l40_api/api/src/routes/admin/node_maintenance*
+      - crates/l40_api/api/src/routes/admin/node_maintenance/**
+      - crates/l40_api/internal/api/server/**
+      - crates/l40_api/cluster/controller/server/**
+      - crates/l20_domain/sbx/mgr/**
+      - crates/l30_storage/sbx/mgr/**
+      - crates/l40_api/sbx/mgr/**
       - infra/space/kind/**
       - Tiltfile
       - scripts/tests/lib/bootstrap-kind-stack.sh

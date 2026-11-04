@@ -74,7 +74,7 @@ spec:
             - name: SPACE_NODE_API_TLS_SERVER_NAME
               value: space-node-api
             # internal-api's NodeApi credential for its service-port routes
-            # (crates/libs/internal/api/server/src/sandbox_service_ports.rs),
+            # (crates/l40_api/internal/api/server/src/sandbox_service_ports.rs),
             # admitted by TokenReview. It never calls WorkerApiInternal.
             - name: SPACE_NODE_API_TOKEN_PATH
               value: /var/run/space-auth/node-api.token

@@ -8,7 +8,7 @@ import (
 )
 
 // Telemetry identity resolves as SPACE > OTel > DD > default, matching
-// crates/libs/observability/src/identity.rs so a shim and the Rust services
+// crates/l10_foundation/observability/src/identity.rs so a shim and the Rust services
 // beside it agree on who they are.
 //
 // A blank SPACE or OTel value is skipped, so the first nonblank one wins. The

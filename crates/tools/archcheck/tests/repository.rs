@@ -25,32 +25,32 @@ fn node_manager_commands_reject_direct_spawns_without_restricting_other_services
     let mut ctx = Context::load(&root).unwrap();
     let cases = [
         (
-            "crates/libs/node/mgr/server/src/spawn_regression.rs",
+            "crates/l40_api/node/mgr/server/src/spawn_regression.rs",
             "std::process::Command::new(\"tool\");",
             true,
         ),
         (
-            "crates/libs/node/mgr/server/src/spawn_regression.rs",
+            "crates/l40_api/node/mgr/server/src/spawn_regression.rs",
             "use std::process::{Command as Process, Output};",
             true,
         ),
         (
-            "crates/libs/node/mgr/server/src/spawn_regression.rs",
+            "crates/l40_api/node/mgr/server/src/spawn_regression.rs",
             "use std::process as child;",
             true,
         ),
         (
-            "crates/libs/node/mgr/server/src/spawn_regression.rs",
+            "crates/l40_api/node/mgr/server/src/spawn_regression.rs",
             "use std::process::{\n Command,\n};",
             true,
         ),
         (
-            "crates/apps/node/mgr/svc/src/spawn_regression.rs",
+            "crates/l50_app/node/mgr/svc/src/spawn_regression.rs",
             "use std::process::Command;",
             true,
         ),
         (
-            "crates/libs/node/mgr/server/src/spawn_regression.rs",
+            "crates/l40_api/node/mgr/server/src/spawn_regression.rs",
             "use crate::host_command::Command;\nCommand::new(\"tool\");",
             false,
         ),
@@ -72,7 +72,7 @@ fn node_manager_commands_reject_direct_spawns_without_restricting_other_services
         assert_eq!(found, rejected, "{path}: {text}");
         ctx.files.pop();
     }
-    let owner = "crates/libs/node/mgr/server/src/host_command/spawn.rs";
+    let owner = "crates/l40_api/node/mgr/server/src/host_command/spawn.rs";
     let file = ctx
         .files
         .iter_mut()
@@ -85,7 +85,7 @@ fn node_manager_commands_reject_direct_spawns_without_restricting_other_services
 }
 
 /// The database migrator's sources, outside `sbxmgr_sqlite_schema`'s `allow`.
-const MIGRATOR_SRC: &str = "crates/libs/db/migrator/src";
+const MIGRATOR_SRC: &str = "crates/l30_storage/db/migrate/src";
 
 /// A workspace with one crate whose sources are at `src`, checked by the
 /// repository's own `[rules.pattern_ratchet.<instance>]` and
@@ -163,9 +163,9 @@ fn ratchet_findings(
 #[test]
 fn sbxmgr_sqlite_schema_matches_the_migrators_sandbox_manager_database() {
     let crossings = [
-        "use pplx_space_sbxmgr_migrations::SANDBOX_MANAGER_MIGRATOR;",
+        "use pplx_space_sbx_mgr_migrations::SANDBOX_MANAGER_MIGRATOR;",
         // The migrations crate's name alone, so that its pattern is what matches.
-        "use pplx_space_sbxmgr_migrations as migrations;",
+        "use pplx_space_sbx_mgr_migrations as migrations;",
         "default_path: paths::SANDBOX_MANAGER_DB,",
         "Database::SandboxManager(args) => run_sqlite(sqlite_sandbox_manager(), args).await,",
         "fn sqlite_sandbox_manager() -> SqliteDatabase {",

@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-pplx-space-net-common = { path = "../crates/libs/net/common" }
+pplx-space-net-common = { path = "../crates/l20_domain/net/common" }
 
 [workspace]
 resolver = "3"

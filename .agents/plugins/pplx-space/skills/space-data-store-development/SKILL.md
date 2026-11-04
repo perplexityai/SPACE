@@ -16,7 +16,7 @@ one needs an API reused or extended. Prefer reuse; add a new API only when the
 question or the latency budget genuinely differs. Migrating the inline
 statements a PR touches onto the store is in scope for that PR.
 
-Exemplar: `crates/libs/sandbox/store` (`pplx-space-sandbox-store`, the
+Exemplar: `crates/l30_storage/sandbox/store` (`pplx-space-sandbox-store`, the
 `sandboxes` row — its crate docs carry the boundary rules). The shape it sets:
 
 - Named verbs with typed arguments and typed row structs; CRUD with filters

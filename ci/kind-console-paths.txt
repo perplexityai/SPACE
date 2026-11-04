@@ -16,9 +16,9 @@ Tiltfile
 # The admin API the console renders, which the scenarios use as the oracle, and
 # the routes the console reaches around it: sign-in and the operator gate, and
 # the debug routes it reads.
-crates/libs/api/src/routes/admin/**
-crates/libs/api/src/routes/session_auth.rs
-crates/libs/api/src/routes/debug/**
+crates/l40_api/api/src/routes/admin/**
+crates/l40_api/api/src/routes/session_auth.rs
+crates/l40_api/api/src/routes/debug/**
 # The scenarios, their Playwright pin, and the code that drives them: the
 # browser adapter, the runner's browser selection, the operator API the Kind
 # harness exposes, and the fixture and services that wire it.

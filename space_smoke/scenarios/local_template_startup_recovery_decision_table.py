@@ -3,7 +3,7 @@
 import space_smoke as smoke
 
 
-# Recovery (`crates/libs/template/mgr/src/service/startup_recovery.rs`) runs
+# Recovery (`crates/l40_api/template/mgr/server/src/service/startup_recovery.rs`) runs
 # once at daemon start over every template name directory on the node, and its
 # rule is a security boundary: a digest directory is adopted into the catalog
 # only when its bootable artifact hashes to the directory's own name, and a

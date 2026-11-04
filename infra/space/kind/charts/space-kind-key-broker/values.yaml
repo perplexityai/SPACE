@@ -1,5 +1,5 @@
 # The in-repo intermediate-key broker fixture
-# (crates/apps/mock/branching-key-provider), standing in for the external key
+# (crates/test_support/mock/branching/key/provider/svc), standing in for the external key
 # authority behind the credential-manager authority's intermediate-key-broker
 # backend, as versitygw stands in for S3. It derives every key from the tenant
 # reference (SHA-256 of fixed labels), holds no state and needs no secret

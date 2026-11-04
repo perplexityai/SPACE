@@ -15,7 +15,7 @@ node:
 
 # Listener on the pod's own address, which node-api dials through the
 # node-local Service (SPACE_BUILD_MANAGER_ENDPOINT); every call is TLS with a
-# bearer token (crates/libs/build/mgr/server/src/run.rs). The probes reach
+# bearer token (crates/l40_api/build/mgr/server/src/run.rs). The probes reach
 # it on loopback inside the pod.
 listen: 0.0.0.0:9900
 probeAddr: 127.0.0.1:9900
@@ -25,10 +25,10 @@ serviceName: space-builder-build-manager
 # same names (BuildTokenReviewer::from_env,
 # crates/libs/common/svc/src/auth/build/k8s.rs). Only the builder
 # node-api dials it (build_mgr_lazy,
-# crates/libs/node/api/server/src/clients.rs), and it
+# crates/l40_api/node/api/server/src/clients.rs), and it
 # forwards tenant builds (with an org) and system builds alike, so it needs
 # both authorities StartBuild checks (authorize_template_build,
-# crates/libs/build/mgr/server/src/lib.rs).
+# crates/l40_api/build/mgr/server/src/lib.rs).
 auth:
   SPACE_BUILD_MANAGER_AUTH_ALLOWED_SERVICE_ACCOUNTS:
     - space-builder-node-api
@@ -45,7 +45,7 @@ maxConcurrentBuilds: 1
 ociGuestSeeds: {}
 # On SIGTERM build-manager stops claiming work and waits up to this long for
 # running builds before it exits (--drain-timeout-seconds, the binary's
-# default; crates/libs/build/mgr/server/src/run.rs).
+# default; crates/l40_api/build/mgr/server/src/run.rs).
 drainTimeoutSeconds: 7200
 # The grace must outlast that drain, or the kubelet kills a build the drain
 # was still waiting for.
@@ -73,7 +73,7 @@ objectStore:
   multipartPartSizeBytes: 67108864
 
 # Build VM egress (build_vm_egress_policy_from_env,
-# crates/libs/build/mgr/src/egress.rs). Recipe steps reach every address
+# crates/l40_api/build/mgr/engine/src/egress.rs). Recipe steps reach every address
 # except denyCidrs; allowCidrs reopens addresses inside them, such as package
 # mirrors and registries. Every guest, build VMs included, already drops new
 # connections to 10.0.0.0/8, 172.16.0.0/12 and 192.168.0.0/16

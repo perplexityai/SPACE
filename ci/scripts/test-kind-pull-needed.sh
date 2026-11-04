@@ -54,20 +54,20 @@ assert_needed() {
 # below matches its entry's prefix, so a selector without glob magic, where
 # `*` also crosses `/`, would answer `true`.
 assert_needed true space_smoke/adapters.py
-assert_needed true crates/libs/build/mgr/src/deep/nested.rs
-assert_needed true crates/apps/cluster/controller/svc/src/main.rs
-assert_needed true crates/libs/cluster/controller/server/src/leader_election/mod.rs
-assert_needed true crates/libs/internal/api/server/src/template_builds.rs
+assert_needed true crates/l40_api/build/mgr/engine/src/deep/nested.rs
+assert_needed true crates/l50_app/cluster/controller/svc/src/main.rs
+assert_needed true crates/l40_api/cluster/controller/server/src/leader_election/mod.rs
+assert_needed true crates/l40_api/internal/api/server/src/template_builds.rs
 assert_needed true shim/telemetry_export.go
-assert_needed true docs/unrelated.md crates/libs/template/mgr/src/volume.rs
+assert_needed true docs/unrelated.md crates/l40_api/template/mgr/server/src/volume.rs
 assert_needed true .github/workflows/pull-ci.yml
-assert_needed false crates/libs/internal/api/server/src/template_x/nested.rs
+assert_needed false crates/l40_api/internal/api/server/src/template_x/nested.rs
 assert_needed false shim/telemetry/nested.go
 assert_needed false scripts/tests/smoke-kind-x/nested.sh
 # Every fixture's base also gains a space_smoke file the PR does not contain,
 # so these also prove base-side changes are not counted as the PR's.
 assert_needed false docs/unrelated.md
-assert_needed false crates/libs/template/mgr/src/service.rs
+assert_needed false crates/l40_api/template/mgr/server/src/service.rs
 
 # A draft defers the smoke unless it opted in, which Pull CI's gate fails; a
 # PR that needs no Kind stays `false` either way.

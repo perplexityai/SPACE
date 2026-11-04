@@ -1037,10 +1037,10 @@ Service-level initialization adds its own prefix, such as
 The endpoint rule itself lives in one Rust module, `otlp_endpoint`, and in
 `validateOTLPEndpoint` in [the shim's OTLP setup](../shim/otlp.go). The
 settings around it are read in
-[Rust metrics validation](../crates/libs/observability/src/sink/otlp.rs) and
-[Rust trace validation](../crates/libs/observability/src/traces.rs), and the
+[Rust metrics validation](../crates/l10_foundation/observability/src/sink/otlp.rs) and
+[Rust trace validation](../crates/l10_foundation/observability/src/traces.rs), and the
 selector errors are declared in
-[the observability crate root](../crates/libs/observability/src/lib.rs).
+[the observability crate root](../crates/l10_foundation/observability/src/lib.rs).
 
 ### Operator requirements
 

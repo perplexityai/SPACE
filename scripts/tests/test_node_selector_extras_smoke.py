@@ -55,15 +55,15 @@ def _stage(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _stage_real_shape(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The tree's actual shape: the call site in a library both apps link."""
-    _crate(tmp_path, "crates/libs/api", "pplx-space-api", call_site="substrate.rs")
+    _crate(tmp_path, "crates/l40_api/api", "pplx-space-api", call_site="substrate.rs")
     _crate(
-        tmp_path, "crates/apps/api/svc", "pplx-space-api-svc",
+        tmp_path, "crates/l50_app/api/svc", "pplx-space-api-svc",
         depends_on=("pplx-space-api",), binary=True,
     )
     _crate(
         tmp_path,
-        "crates/apps/cluster/controller/svc",
-        "pplx-space-cluster-controller",
+        "crates/l50_app/cluster/controller/svc",
+        "pplx-space-cluster-controller-svc",
         call_site="warm_pool.rs",
         depends_on=("pplx-space-api",),
         binary=True,

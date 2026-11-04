@@ -16,7 +16,7 @@ description: Develop or review SPACE metrics, traces, sandbox events, Datadog da
 - External calls that can block or conceal endpoint latency require
   OpenTelemetry-shaped client spans. Reuse shared SQLx, Kubernetes, and gRPC
   wrappers. Wrap each Redis command or pipeline in a `redis.client` span;
-  `redis_client_span()` in `crates/libs/api/src/redis_otel.rs` is the single
+  `redis_client_span()` in `crates/l40_api/api/src/redis_otel.rs` is the single
   source of truth for the span name and attribute set — extend it there
   rather than re-specifying attributes, and record status on every exit
   path, including timeouts and fail-open errors.

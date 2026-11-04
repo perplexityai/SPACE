@@ -266,7 +266,7 @@ maintenance can travel with migration-only PRs.
 The sole production-code exception is the credential fence required by a
 credential-table migration. That PR may change the canonical table-name entries
 inside the multiline `CREDENTIAL_TABLES` declaration in
-`crates/libs/db/migrator/src/bootstrap_roles.rs`; formatting-only changes and
+`crates/l30_storage/db/migrate/src/bootstrap_roles.rs`; formatting-only changes and
 changes outside that list remain blocked. Removing an entry also requires a
 matching standalone `DROP TABLE` statement in a changed Postgres up migration.
 
@@ -281,7 +281,7 @@ up migration. Each entry must stay on one line in the canonical
 `    ("table", &["column", ...]),` form.
 
 The exact Postgres bootstrap-role test file,
-`crates/libs/db/migrator/src/bootstrap_roles/tests/postgres_bootstrap_tests.rs`,
+`crates/l30_storage/db/migrate/src/bootstrap_roles/tests/postgres_bootstrap_tests.rs`,
 may append regression coverage in the same PR, but its existing cross-checks
 must remain byte-for-byte unchanged and appended code cannot shadow the fence
 constants. This is not a general exception for the bootstrap-role test tree;
@@ -598,7 +598,7 @@ Rules that follow from this model:
   a migration will fail on fresh databases. (`bootstrap-roles` pre-creates
   `space_credmgr`, so the guarded legacy migration that introduced it no-ops.)
 - **New credential-bearing tables must be added to `CREDENTIAL_TABLES`** in
-  `crates/libs/db/migrator/src/bootstrap_roles.rs`, in the same PR as the
+  `crates/l30_storage/db/migrate/src/bootstrap_roles.rs`, in the same PR as the
   migration that creates them. Until the next `bootstrap-roles` run, a new
   `space_migrator`-created table is accessible to `space_user` and `space_ro`
   through default privileges — the trailing bootstrap run is what enforces

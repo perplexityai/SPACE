@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-script="${repo_root}/crates/libs/build/mgr/scripts/build-seed.sh"
+script="${repo_root}/crates/l40_api/build/mgr/engine/scripts/build-seed.sh"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "${tmp_dir}"' EXIT
 

@@ -13,7 +13,7 @@ The control plane's substrate (`substrate`): `kubernetes`, the default, or
 {{/*
 SPACE_K8S_CONTROL_PLANE for `substrate`, as space-api-local renders it: the
 controller builds the same substrate as the API (Substrate::from_env,
-crates/libs/cluster/controller/server/src/lib.rs).
+crates/l40_api/cluster/controller/server/src/lib.rs).
 */}}
 {{- define "space-cluster-controller-local.k8sControlPlane" -}}
 {{- eq (include "space-cluster-controller-local.substrate" .) "kubernetes" | ternary "true" "false" | quote -}}

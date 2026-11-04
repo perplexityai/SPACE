@@ -14,7 +14,7 @@ spec:
       {{- include "space-node-service.selectorLabels" $ctx | nindent 6 }}
   # Surge: template-manager holds /space/run/template-manager/service.mutex
   # and its successor waits passively for it
-  # (crates/libs/template/mgr/src/run.rs).
+  # (crates/l40_api/template/mgr/server/src/run.rs).
   {{- include "space-node-service.updateStrategy" (dict "strategy" "surge") | nindent 2 }}
   template:
     metadata:
@@ -33,7 +33,7 @@ spec:
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | int }}
       # space-tmplmgr with SPACE_TEMPLATE_MANAGER_GROUPS. Privileged btrfs
       # work is delegated to node-manager over its socket
-      # (crates/libs/template/mgr/src/btrfs_via_nodemgr.rs).
+      # (crates/l40_api/template/mgr/server/src/btrfs_via_nodemgr.rs).
       securityContext:
         {{- include "space-node-service.runAs" (dict "ctx" . "user" "SPACE_TMPLMGR" "groups" "SPACE_TEMPLATE_MANAGER_GROUPS") | nindent 8 }}
       containers:

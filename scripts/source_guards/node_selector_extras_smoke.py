@@ -50,7 +50,7 @@ from collections.abc import Sequence
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 SCENARIO_MODULE = "space_smoke.node_selector_extras"
-ADMISSION = REPO_ROOT / "crates/libs/api/src/cluster_admission/mod.rs"
+ADMISSION = REPO_ROOT / "crates/l40_api/api/src/cluster_admission/mod.rs"
 CRATES = REPO_ROOT / "crates"
 
 # The Rust construction whose call sites are the renderers that must be
@@ -60,9 +60,9 @@ CONFIG_FROM_ENV = "SandboxPodConfigValues::from_env"
 # The Deployment each app crate ships as. Keyed by the crate directory, since
 # that is what a dependency edge resolves to.
 APP_DEPLOYMENTS = {
-    "crates/apps/api/svc": "space-api",
-    "crates/apps/internal/api/svc": "space-internal-api",
-    "crates/apps/cluster/controller/svc": "space-cluster-controller",
+    "crates/l50_app/api/svc": "space-api",
+    "crates/l50_app/internal/api/svc": "space-internal-api",
+    "crates/l50_app/cluster/controller/svc": "space-cluster-controller",
 }
 
 
