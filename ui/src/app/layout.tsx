@@ -25,3 +25,5 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     </html>
   );
 }
+
+// Trial change to measure CI check scoping; not for merge.
