@@ -45,13 +45,13 @@ fn unset() -> Result<String, std::env::VarError> {
 fn settings_require_at_least_one_trusted_origin() {
     for value in ["", " ", ",", " , "] {
         assert_eq!(
-            ExternalConsoleSettings::from_vars(var(value), unset(), unset()),
+            ExternalConsoleSettings::from_vars(var(value), unset(), unset(), unset()),
             Err(ExternalConsoleConfigError::NoTrustedOrigins),
             "{value:?}"
         );
     }
     assert_eq!(
-        ExternalConsoleSettings::from_vars(unset(), unset(), unset()),
+        ExternalConsoleSettings::from_vars(unset(), unset(), unset(), unset()),
         Err(ExternalConsoleConfigError::NoTrustedOrigins)
     );
 }
@@ -102,6 +102,7 @@ fn settings_parse_the_environment_contract() -> TestResult {
         var(" https://a.example.test , https://b.example.test,https://a.example.test "),
         var("  Company SSO  "),
         var(" /sso/logout "),
+        var(" TRUE "),
     )?;
     assert_eq!(
         settings.trusted_origins(),
@@ -109,10 +110,41 @@ fn settings_parse_the_environment_contract() -> TestResult {
     );
     assert_eq!(settings.provider_name(), "Company SSO");
     assert_eq!(settings.logout_url(), Some("/sso/logout"));
+    assert!(settings.allow_password_sessions());
 
-    let defaults = ExternalConsoleSettings::from_vars(var(CONSOLE_ORIGIN), unset(), var(" "))?;
+    let defaults =
+        ExternalConsoleSettings::from_vars(var(CONSOLE_ORIGIN), unset(), var(" "), unset())?;
     assert_eq!(defaults.provider_name(), "Single sign-on");
     assert_eq!(defaults.logout_url(), None);
+    assert!(!defaults.allow_password_sessions());
+    assert!(
+        !ExternalConsoleSettings::new([CONSOLE_ORIGIN])?.allow_password_sessions(),
+        "password sessions stay off unless asked for"
+    );
+    Ok(())
+}
+
+#[test]
+fn settings_parse_the_password_sessions_switch_strictly() -> TestResult {
+    let parse = |value: Result<String, std::env::VarError>| {
+        ExternalConsoleSettings::from_vars(var(CONSOLE_ORIGIN), unset(), unset(), value)
+            .map(|settings| settings.allow_password_sessions())
+    };
+    for (value, expected) in [("true", true), ("True", true), (" true ", true)] {
+        assert_eq!(parse(var(value)), Ok(expected), "{value:?}");
+    }
+    for value in ["false", "FALSE", "", "  "] {
+        assert_eq!(parse(var(value)), Ok(false), "{value:?}");
+    }
+    assert_eq!(parse(unset()), Ok(false));
+    // A typo must fail startup rather than leave passwords silently on or off.
+    for value in ["1", "0", "yes", "on", "enabled", "tru"] {
+        assert_eq!(
+            parse(var(value)),
+            Err(ExternalConsoleConfigError::InvalidAllowPasswordSessions),
+            "{value:?}"
+        );
+    }
     Ok(())
 }
 
@@ -356,6 +388,8 @@ struct Seeded {
 struct Fixture {
     password_state: AppState,
     external_state: AppState,
+    /// External mode with password sessions allowed beside it.
+    mixed_state: AppState,
     seeded: Seeded,
     _db: TestDb,
 }
@@ -383,6 +417,18 @@ impl Fixture {
 
     fn password_shared(&self) -> Router {
         crate::routes::shared_host_router(self.password_state.clone())
+    }
+
+    fn mixed_public(&self) -> Router {
+        crate::routes::router(self.mixed_state.clone())
+    }
+
+    fn mixed_admin(&self) -> Router {
+        crate::routes::dedicated_admin_router(self.mixed_state.clone())
+    }
+
+    fn mixed_shared(&self) -> Router {
+        crate::routes::shared_host_router(self.mixed_state.clone())
     }
 }
 
@@ -438,17 +484,24 @@ async fn fixture() -> TestResult<Fixture> {
     seed_key(&pool, &ecw_key, org_id, &["ecw"]).await?;
 
     let password_state = AppState::from_pool(pool.clone()).await?;
+    let settings = ExternalConsoleSettings::new([CONSOLE_ORIGIN])?
+        .with_provider_name("Company SSO")?
+        .with_logout_url("/sso/logout")?;
     let mut external_state = password_state.clone();
     external_state.external_console = Some(ExternalConsole::new(
         Arc::new(HeaderAuthenticator),
-        ExternalConsoleSettings::new([CONSOLE_ORIGIN])?
-            .with_provider_name("Company SSO")?
-            .with_logout_url("/sso/logout")?,
+        settings.clone(),
+    ));
+    let mut mixed_state = password_state.clone();
+    mixed_state.external_console = Some(ExternalConsole::new(
+        Arc::new(HeaderAuthenticator),
+        settings.with_password_sessions(true),
     ));
 
     Ok(Fixture {
         password_state,
         external_state,
+        mixed_state,
         seeded: Seeded {
             admin_email,
             admin_id,
@@ -1122,6 +1175,236 @@ async fn machine_credentials_keep_working_in_external_mode() -> TestResult {
         .send(fixture.public())
         .await?;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn allowed_password_sessions_work_beside_external_sign_in() -> TestResult {
+    let fixture = fixture().await?;
+    let seeded = &fixture.seeded;
+
+    // The console still chooses the external flow.
+    for app in [
+        fixture.mixed_public(),
+        fixture.mixed_admin(),
+        fixture.mixed_shared(),
+    ] {
+        let (status, body) = Call::get("/auth/v1/config").send(app).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["mode"], "external", "{body}");
+    }
+
+    let (status, body) = Call::new(Method::POST, "/auth/v1/sessions")
+        .json(serde_json::json!({
+            "email": seeded.member_email,
+            "password": seeded.member_password,
+        }))
+        .send(fixture.mixed_public())
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let issued = body["token"]
+        .as_str()
+        .ok_or("login returned no token")?
+        .to_owned();
+
+    for (app, uri, token, expected) in [
+        (
+            fixture.mixed_public(),
+            "/auth/v1/me",
+            &issued,
+            StatusCode::OK,
+        ),
+        (
+            fixture.mixed_public(),
+            "/auth/v1/cluster",
+            &issued,
+            StatusCode::OK,
+        ),
+        (
+            fixture.mixed_public(),
+            "/api/v1/sandboxes",
+            &issued,
+            StatusCode::OK,
+        ),
+        (
+            fixture.mixed_shared(),
+            "/api/v1/sandboxes",
+            &issued,
+            StatusCode::OK,
+        ),
+        (
+            fixture.mixed_admin(),
+            "/auth/v1/me",
+            &seeded.admin_session,
+            StatusCode::OK,
+        ),
+        (
+            fixture.mixed_admin(),
+            "/admin/api/v1/orgs",
+            &seeded.admin_session,
+            StatusCode::OK,
+        ),
+        (
+            fixture.mixed_shared(),
+            "/admin/api/v1/orgs",
+            &seeded.admin_session,
+            StatusCode::OK,
+        ),
+        // The session's own role still authorizes the request.
+        (
+            fixture.mixed_admin(),
+            "/admin/api/v1/orgs",
+            &issued,
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            fixture.mixed_public(),
+            "/auth/v1/me",
+            &"not-a-session".to_owned(),
+            StatusCode::UNAUTHORIZED,
+        ),
+    ] {
+        let (status, body) = Call::get(uri).bearer(token).send(app).await?;
+        assert_eq!(status, expected, "{uri}: {body}");
+    }
+    let (status, body) = Call::get("/auth/v1/me")
+        .bearer(&issued)
+        .send(fixture.mixed_public())
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(user_id_of(&body), Some(seeded.member_id.to_string()));
+
+    // Machine credentials are unaffected.
+    let (status, body) = Call::get("/api/v1/sandboxes")
+        .bearer(&seeded.native_key)
+        .send(fixture.mixed_public())
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = Call::get("/e2b/api/sandboxes")
+        .header("x-api-key", seeded.ecw_key.clone())
+        .send(fixture.mixed_shared())
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // A session issued while allowed stops authenticating once it is not.
+    let (status, body) = Call::get("/auth/v1/me")
+        .bearer(&issued)
+        .send(fixture.public())
+        .await?;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+
+    // Logout without the console header revokes the session it used.
+    let (status, body) = Call::new(Method::DELETE, "/auth/v1/session")
+        .bearer(&issued)
+        .send(fixture.mixed_public())
+        .await?;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert!(!session_exists(&fixture.mixed_state.pool, &issued).await?);
+    let (status, _) = Call::get("/auth/v1/me")
+        .bearer(&issued)
+        .send(fixture.mixed_public())
+        .await?;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    Ok(())
+}
+
+#[tokio::test]
+async fn allowed_password_sessions_leave_console_requests_assertion_only() -> TestResult {
+    let fixture = fixture().await?;
+    let seeded = &fixture.seeded;
+
+    // The console header without an assertion is refused even with a valid
+    // session beside it.
+    for (app, uri, token) in [
+        (
+            fixture.mixed_public(),
+            "/auth/v1/me",
+            &seeded.member_session,
+        ),
+        (
+            fixture.mixed_public(),
+            "/api/v1/sandboxes",
+            &seeded.member_session,
+        ),
+        (fixture.mixed_admin(), "/auth/v1/me", &seeded.admin_session),
+        (
+            fixture.mixed_admin(),
+            "/admin/api/v1/orgs",
+            &seeded.admin_session,
+        ),
+    ] {
+        let (status, body) = Call::get(uri).console().bearer(token).send(app).await?;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}: {body}");
+    }
+
+    // A refused assertion is final.
+    for (assertion, expected) in [
+        ("invalid", StatusCode::UNAUTHORIZED),
+        ("forbidden", StatusCode::FORBIDDEN),
+        ("unavailable", StatusCode::SERVICE_UNAVAILABLE),
+    ] {
+        for (app, uri, token) in [
+            (
+                fixture.mixed_public(),
+                "/auth/v1/me",
+                &seeded.member_session,
+            ),
+            (
+                fixture.mixed_public(),
+                "/api/v1/sandboxes",
+                &seeded.member_session,
+            ),
+            (
+                fixture.mixed_public(),
+                "/api/v1/sandboxes",
+                &seeded.native_key,
+            ),
+            (
+                fixture.mixed_admin(),
+                "/admin/api/v1/orgs",
+                &seeded.admin_session,
+            ),
+        ] {
+            let (status, body) = Call::get(uri)
+                .assertion(assertion)
+                .bearer(token)
+                .send(app)
+                .await?;
+            assert_eq!(status, expected, "{assertion} {uri}: {body}");
+        }
+    }
+
+    // An admitted assertion is still the identity: a member's session cannot
+    // lift a member to admin, and the native API refuses the combination.
+    let (status, body) = Call::get("/admin/api/v1/orgs")
+        .signed_in_as(&seeded.member_email)
+        .bearer(&seeded.admin_session)
+        .send(fixture.mixed_admin())
+        .await?;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, body) = Call::get("/api/v1/sandboxes")
+        .signed_in_as(&seeded.member_email)
+        .bearer(&seeded.member_session)
+        .send(fixture.mixed_public())
+        .await?;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+
+    // A console logout still revokes nothing.
+    let (status, _) = Call::new(Method::DELETE, "/auth/v1/session")
+        .signed_in_as(&seeded.member_email)
+        .console_origin()
+        .bearer(&seeded.member_session)
+        .send(fixture.mixed_public())
+        .await?;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(session_exists(&fixture.mixed_state.pool, &seeded.member_session).await?);
+
+    // The CSRF rule still covers console writes.
+    let (status, body) = Call::new(Method::DELETE, "/auth/v1/session")
+        .signed_in_as(&seeded.member_email)
+        .send(fixture.mixed_public())
+        .await?;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     Ok(())
 }
 

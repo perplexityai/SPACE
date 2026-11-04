@@ -61,7 +61,7 @@ pub struct AppState {
     pub template_build_state: std::sync::Arc<crate::routes::e2b::TemplateBuildState>,
     pub federated_identity: crate::federated_identity::FederatedIdentityConfig,
     /// External console identity; `None` keeps password sessions. See
-    /// [`crate::external_console`].
+    /// [`crate::external_console`] and [`Self::password_sessions_enabled`].
     pub external_console: Option<crate::external_console::ExternalConsole>,
     pub data_plane_base_url: String,
     /// Relays a new command's event stream from `POST .../commands` when the
@@ -104,6 +104,15 @@ pub enum AppStateError {
 }
 
 impl AppState {
+    /// Whether password login and password sessions authenticate requests
+    /// that do not carry the console request header: always in password
+    /// mode, and in external console mode only when its settings allow it.
+    pub(crate) fn password_sessions_enabled(&self) -> bool {
+        self.external_console
+            .as_ref()
+            .is_none_or(|external_console| external_console.settings().allow_password_sessions())
+    }
+
     #[cfg(test)]
     pub async fn from_pool(pool: PgPool) -> Result<Self, AppStateError> {
         let route_ed25519_authority =

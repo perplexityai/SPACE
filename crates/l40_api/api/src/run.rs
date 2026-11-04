@@ -256,11 +256,20 @@ pub async fn run_with(
     )
     .await?;
     if let Some(external_console) = external_console {
-        tracing::info!(
-            surface = ?config.surface,
-            trusted_origins = ?external_console.settings().trusted_origins(),
-            "external console identity enabled; console password sessions are disabled"
-        );
+        if external_console.settings().allow_password_sessions() {
+            tracing::warn!(
+                surface = ?config.surface,
+                trusted_origins = ?external_console.settings().trusted_origins(),
+                "external console identity enabled; password sessions stay enabled for requests \
+                 without the console header, which is meant for test deployments only"
+            );
+        } else {
+            tracing::info!(
+                surface = ?config.surface,
+                trusted_origins = ?external_console.settings().trusted_origins(),
+                "external console identity enabled; console password sessions are disabled"
+            );
+        }
         state.external_console = Some(external_console);
     }
 

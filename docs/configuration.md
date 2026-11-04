@@ -499,6 +499,7 @@ admin API.
 | `SPACE_EXTERNAL_CONSOLE_TRUSTED_ORIGINS` | **required** with an authenticator | Comma-separated exact origins (`scheme://host[:port]`, at most 16) the console is served from. State-changing console requests must send a matching `Origin`. Invalid or empty fails startup. |
 | `SPACE_EXTERNAL_CONSOLE_PROVIDER_NAME` | `Single sign-on` | Name the console shows on its sign-in card. At most 64 characters, no control characters. |
 | `SPACE_EXTERNAL_CONSOLE_LOGOUT_URL` | unset | Where the console sends the browser to end the provider session: a same-origin absolute path or an `https` URL. |
+| `SPACE_EXTERNAL_CONSOLE_ALLOW_PASSWORD_SESSIONS` | `false` | `true` keeps password login and password sessions working for requests without the console header. Only takes effect with an authenticator installed; password mode always uses passwords. Meant for test deployments whose automation signs in with a password; leave it off in production. Any value other than `true`, `false` or empty fails startup. |
 
 With an authenticator installed:
 
@@ -524,6 +525,15 @@ With an authenticator installed:
   authenticates them with API keys exactly as before and never consults an
   assertion the proxy attached; console-gated routes refuse them. Session
   tokens are not accepted as native API credentials in this mode.
+- `SPACE_EXTERNAL_CONSOLE_ALLOW_PASSWORD_SESSIONS=true` lifts the two rules
+  above for requests without the console header only: password login issues
+  sessions, those sessions authenticate the console-gated, admin and native
+  routes as in password mode, and `DELETE /auth/v1/session` revokes the
+  caller's session. Console requests are unchanged and still authenticate with
+  the assertion alone; a missing or rejected assertion never falls back to a
+  session. This reopens password sign-in for every local user with a
+  password, so enable it only where that is acceptable, such as a test
+  deployment whose smoke tests sign in with a password.
 - Each console decision increments `auth.external_console.decision` with
   `result` `accepted`, `missing_assertion`, `unauthenticated`, `forbidden`,
   `unavailable`, `csrf_rejected`, `no_user` or `lookup_failed`.
@@ -534,7 +544,9 @@ With an authenticator installed:
   on that; do not relax it for the API host.
 
 Removing the authenticator and restarting restores password sign-in;
-password sessions that have not expired become valid again.
+password sessions that have not expired become valid again. Turning
+`SPACE_EXTERNAL_CONSOLE_ALLOW_PASSWORD_SESSIONS` off and restarting stops the
+sessions issued while it was on from authenticating without deleting them.
 
 ### Template mutation authority
 

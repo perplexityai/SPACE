@@ -363,20 +363,28 @@ async fn require_admin_auth(
     next: Next,
 ) -> Response {
     // With an external console authenticator installed, a console request
-    // with an admitted assertion is the only admin credential; bearer sessions
-    // are ignored. Admin authorization below is unchanged either way.
-    let (user, org) = if let Some(external_console) = &state.external_console {
+    // with an admitted assertion is the only admin credential and bearer
+    // sessions are ignored, unless the settings allow password sessions: then
+    // a request without the console header authenticates with its session as
+    // in password mode. Admin authorization below is unchanged either way.
+    let console_principal = if let Some(external_console) = &state.external_console {
         let method = request.method().clone();
         match external_console
             .resolve(&state.pool, &method, request.headers())
             .await
         {
-            ExternalConsoleAuth::Principal(principal) => *principal,
+            ExternalConsoleAuth::Principal(principal) => Some(*principal),
+            ExternalConsoleAuth::NotConsole if state.password_sessions_enabled() => None,
             ExternalConsoleAuth::NotConsole => {
                 return PublicApiError::unauthorized("Console sign-in is required").into_response();
             }
             ExternalConsoleAuth::Denied(error) => return error.into_response(),
         }
+    } else {
+        None
+    };
+    let (user, org) = if let Some(principal) = console_principal {
+        principal
     } else {
         let Some(token) = bearer_token(request.headers()) else {
             return PublicApiError::unauthorized("Missing or invalid Authorization header")

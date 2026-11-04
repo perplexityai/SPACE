@@ -14,7 +14,7 @@ use uuid::Uuid;
 use super::AppState;
 use crate::{
     auth::{generate_session_token, hash_token, verify_password},
-    external_console::ConsoleAuthConfig,
+    external_console::{ConsoleAuthConfig, is_console_request},
     middleware::auth::{AuthOrg, AuthUser, bearer_token, require_auth},
     models::{Cluster, LoginRequest, LoginResponse, Organization, User},
 };
@@ -50,8 +50,9 @@ enum AuthRouteError {
     InvalidCredentials,
     #[error("Missing or invalid Authorization header")]
     MissingBearerToken,
-    /// External console mode: identity comes from the console's sign-in
-    /// provider, so this process issues no password sessions.
+    /// External console mode without password sessions: identity comes from
+    /// the console's sign-in provider, so this process issues no password
+    /// sessions.
     #[error("Password sign-in is disabled; sign in through the console's identity provider")]
     PasswordLoginDisabled,
     #[error("Internal server error")]
@@ -150,7 +151,7 @@ async fn create_session(
     State(state): State<AppState>,
     Json(request): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, AuthRouteError> {
-    if state.external_console.is_some() {
+    if !state.password_sessions_enabled() {
         return Err(AuthRouteError::PasswordLoginDisabled);
     }
     Ok(Json(
@@ -178,11 +179,15 @@ async fn delete_current_session(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<StatusCode, AuthRouteError> {
-    // External console mode has no SPACE session to revoke: the console ends
-    // the provider session through its logout URL. A bearer token sent
-    // anyway is left alone, because this request did not authenticate with
-    // it.
-    if state.external_console.is_some() {
+    // A console request in external mode has no SPACE session to revoke: the
+    // console ends the provider session through its logout URL. A bearer
+    // token sent anyway is left alone, because this request did not
+    // authenticate with it. With password sessions allowed, a request without
+    // the console header authenticated with its bearer session in
+    // `require_auth`, so that session is the one to revoke.
+    if state.external_console.is_some()
+        && (is_console_request(&headers) || !state.password_sessions_enabled())
+    {
         return Ok(StatusCode::NO_CONTENT);
     }
     let token = bearer_token(&headers).ok_or(AuthRouteError::MissingBearerToken)?;

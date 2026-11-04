@@ -23,7 +23,11 @@
 //!   and organization authorize the request exactly as a password session
 //!   would. Nothing is provisioned and no role is granted;
 //! - password login, password sessions and session revocation are disabled
-//!   everywhere, so an old session token cannot bypass the mode;
+//!   everywhere, so an old session token cannot bypass the mode. A test
+//!   deployment whose automation signs in with a password can turn them back
+//!   on for requests without the console header with
+//!   [`ALLOW_PASSWORD_SESSIONS_ENV`]; console requests still authenticate
+//!   with the assertion alone;
 //! - an assertion that is present but rejected never falls back to another
 //!   credential;
 //! - state-changing requests must come from a trusted console origin and carry
@@ -57,6 +61,14 @@ pub const PROVIDER_NAME_ENV: &str = "SPACE_EXTERNAL_CONSOLE_PROVIDER_NAME";
 /// Where the console sends the browser to end the provider session: a
 /// same-origin absolute path or an `https` URL. Optional.
 pub const LOGOUT_URL_ENV: &str = "SPACE_EXTERNAL_CONSOLE_LOGOUT_URL";
+
+/// `true` keeps password login and password sessions working beside the
+/// external sign-in, for requests that do not carry
+/// [`CONSOLE_REQUEST_HEADER`]. Optional, default `false`. Only read when an
+/// authenticator is installed; password mode always allows passwords. Meant
+/// for test deployments whose automation signs in with a password, not for
+/// production, where it reopens password sign-in for every local user.
+pub const ALLOW_PASSWORD_SESSIONS_ENV: &str = "SPACE_EXTERNAL_CONSOLE_ALLOW_PASSWORD_SESSIONS";
 
 /// Header every console request sends in external mode, with the value `1`.
 /// It marks the request as a console request, authenticated by the assertion.
@@ -151,6 +163,7 @@ pub struct ExternalConsoleSettings {
     provider_name: String,
     logout_url: Option<String>,
     trusted_origins: Vec<String>,
+    allow_password_sessions: bool,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -169,6 +182,8 @@ pub enum ExternalConsoleConfigError {
     InvalidProviderName,
     #[error("{LOGOUT_URL_ENV} must be a same-origin absolute path or an https URL")]
     InvalidLogoutUrl,
+    #[error("{ALLOW_PASSWORD_SESSIONS_ENV} must be `true` or `false`")]
+    InvalidAllowPasswordSessions,
 }
 
 impl ExternalConsoleSettings {
@@ -200,6 +215,7 @@ impl ExternalConsoleSettings {
             provider_name: DEFAULT_PROVIDER_NAME.to_owned(),
             logout_url: None,
             trusted_origins: origins,
+            allow_password_sessions: false,
         })
     }
 
@@ -232,11 +248,19 @@ impl ExternalConsoleSettings {
         Ok(self)
     }
 
+    /// Keep password login and password sessions working for requests
+    /// without the console header. See [`ALLOW_PASSWORD_SESSIONS_ENV`].
+    pub fn with_password_sessions(mut self, allow: bool) -> Self {
+        self.allow_password_sessions = allow;
+        self
+    }
+
     pub fn from_env() -> Result<Self, ExternalConsoleConfigError> {
         Self::from_vars(
             std::env::var(TRUSTED_ORIGINS_ENV),
             std::env::var(PROVIDER_NAME_ENV),
             std::env::var(LOGOUT_URL_ENV),
+            std::env::var(ALLOW_PASSWORD_SESSIONS_ENV),
         )
     }
 
@@ -244,6 +268,7 @@ impl ExternalConsoleSettings {
         trusted_origins: Result<String, std::env::VarError>,
         provider_name: Result<String, std::env::VarError>,
         logout_url: Result<String, std::env::VarError>,
+        allow_password_sessions: Result<String, std::env::VarError>,
     ) -> Result<Self, ExternalConsoleConfigError> {
         let value = |name, value: Result<String, std::env::VarError>| match value {
             Ok(value) => Ok(value),
@@ -255,6 +280,14 @@ impl ExternalConsoleSettings {
         let trusted_origins = value(TRUSTED_ORIGINS_ENV, trusted_origins)?;
         let provider_name = value(PROVIDER_NAME_ENV, provider_name)?;
         let logout_url = value(LOGOUT_URL_ENV, logout_url)?;
+        let allow_password_sessions = value(ALLOW_PASSWORD_SESSIONS_ENV, allow_password_sessions)?;
+        // Strict on purpose: a typo must not silently leave passwords on or off.
+        let allow_password_sessions = match allow_password_sessions.trim() {
+            "" => false,
+            value if value.eq_ignore_ascii_case("false") => false,
+            value if value.eq_ignore_ascii_case("true") => true,
+            _ => return Err(ExternalConsoleConfigError::InvalidAllowPasswordSessions),
+        };
 
         let mut settings = Self::new(trusted_origins.split(','))?;
         if !provider_name.trim().is_empty() {
@@ -263,7 +296,7 @@ impl ExternalConsoleSettings {
         if !logout_url.trim().is_empty() {
             settings = settings.with_logout_url(logout_url)?;
         }
-        Ok(settings)
+        Ok(settings.with_password_sessions(allow_password_sessions))
     }
 
     pub fn provider_name(&self) -> &str {
@@ -276,6 +309,10 @@ impl ExternalConsoleSettings {
 
     pub fn trusted_origins(&self) -> &[String] {
         &self.trusted_origins
+    }
+
+    pub fn allow_password_sessions(&self) -> bool {
+        self.allow_password_sessions
     }
 }
 
@@ -346,8 +383,9 @@ impl fmt::Debug for ExternalConsole {
 
 /// How a console gate resolved a request in external mode.
 pub(crate) enum ExternalConsoleAuth {
-    /// Not a console request: the console gates refuse; the native gate may
-    /// still accept a service credential.
+    /// Not a console request: the console gates refuse unless password
+    /// sessions are allowed; the native gate may still accept a service
+    /// credential.
     NotConsole,
     /// The verified identity's SPACE user and organization.
     Principal(Box<(User, Organization)>),
