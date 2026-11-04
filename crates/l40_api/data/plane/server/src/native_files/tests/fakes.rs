@@ -1,6 +1,6 @@
 //! A scripted lifecycle API and sandbox runtime for the files routes.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -19,8 +19,15 @@ use pplx_space_node_api_client::proto::{
     native_file_access_api_server::{NativeFileAccessApi, NativeFileAccessApiServer},
     prepare_native_file_call_response,
 };
-use pplx_space_sbx_mgr_client::operations::{FileChunk, FileInfo, StatResponse};
-use pplx_space_sbx_mgr_client::proto::{SpacedListRequest, SpacedReadRequest, SpacedStatRequest};
+use pplx_space_sbx_mgr_client::operations::{
+    DisableFileChangesResponse, EnableFileChangesResponse, FileChunk, FileInfo,
+    GetModifiedFilesResponse, MkdirResponse, RemoveResponse, RenameResponse, StatResponse,
+};
+use pplx_space_sbx_mgr_client::proto::{
+    SpacedDisableFileChangesRequest, SpacedEnableFileChangesRequest, SpacedGetModifiedFilesRequest,
+    SpacedListRequest, SpacedMkdirRequest, SpacedReadRequest, SpacedRemoveRequest,
+    SpacedRenameRequest, SpacedStatRequest,
+};
 use tonic::{Request, Response, Status};
 
 pub(super) const ROUTE_TOKEN: &str = "ed25519.test.cGF5bG9hZA.c2lnbmF0dXJl";
@@ -80,6 +87,9 @@ struct ApiScript {
     authorize: VecDeque<Answer<NativeFileAuthorization>>,
     prepare: VecDeque<Answer<NativeFileRouteGrant>>,
     calls: Vec<AccessCall>,
+    /// Each bound `(operation, Idempotency-Key)` and the fingerprint it is
+    /// bound to.
+    bindings: HashMap<(i32, String), String>,
 }
 
 /// The lifecycle API's native file access RPCs. Unscripted calls authorize
@@ -196,7 +206,8 @@ impl NativeFileAccessApi for FakeApi {
             request.get_ref().request_fingerprint.clone(),
         );
         let answer = self.script.lock().unwrap().prepare.pop_front();
-        let outcome = match answer.unwrap_or_else(|| Answer::Ok(self.grant())) {
+        let answer = answer.unwrap_or_else(|| self.bind(request.get_ref()));
+        let outcome = match answer {
             Answer::Ok(grant) => Outcome::Granted(grant),
             Answer::Refuse(response) => Outcome::Refused(response),
             Answer::Fail(status) => return Err(status),
@@ -205,6 +216,66 @@ impl NativeFileAccessApi for FakeApi {
             outcome: Some(outcome),
         }))
     }
+}
+
+/// What the API's handler does with a prepared request's key: bind it to the
+/// fingerprint, refusing a different one with the 409 it renders, and derive
+/// the guest key for an operation the sandbox replays by key.
+impl FakeApi {
+    fn bind(&self, request: &PrepareNativeFileCallRequest) -> Answer<NativeFileRouteGrant> {
+        let mut grant = self.grant();
+        let (Some(file), Some(fingerprint)) = (&request.request, &request.request_fingerprint)
+        else {
+            return Answer::Ok(grant);
+        };
+        let key = file
+            .headers
+            .iter()
+            .find(|header| header.name == "idempotency-key")
+            .map(|header| String::from_utf8_lossy(&header.value).into_owned())
+            .unwrap_or_default();
+        let mut script = self.script.lock().unwrap();
+        let bound = script
+            .bindings
+            .entry((file.operation, key.clone()))
+            .or_insert_with(|| fingerprint.clone());
+        if bound != fingerprint {
+            return Answer::Refuse(NativeHttpResponse {
+                status: 409,
+                headers: vec![pplx_space_node_api_client::proto::NativeHttpHeader {
+                    name: "content-type".to_owned(),
+                    value: b"application/json".to_vec(),
+                }],
+                body: IDEMPOTENCY_CONFLICT.to_vec(),
+            });
+        }
+        let operation = file_operation(file.operation);
+        if operation.sends_guest_key() {
+            let guest_key = pplx_space_native_files::guest_key(
+                operation.route(),
+                &pplx_space_guest_process::IdempotencyKey::parse(key).unwrap(),
+                &pplx_space_public_api::RequestFingerprint::parse(fingerprint.clone()).unwrap(),
+            )
+            .unwrap();
+            grant.guest_idempotency_key = Some(guest_key.as_str().to_owned());
+        }
+        Answer::Ok(grant)
+    }
+}
+
+pub(super) const IDEMPOTENCY_CONFLICT: &[u8] = br#"{"code":"idempotency_conflict","message":"Idempotency-Key was reused with a different request","request_id":null,"retryable":false,"details":[]}"#;
+
+fn file_operation(operation: i32) -> pplx_space_native_files::FileOperation {
+    pplx_space_native_files::FileOperation::ALL
+        .into_iter()
+        .find(|candidate| {
+            pplx_space_node_api_client::proto::NativeFileOperation::from_str_name(&format!(
+                "NATIVE_FILE_OPERATION_{}",
+                candidate.as_str().to_ascii_uppercase()
+            ))
+            .is_some_and(|known| known as i32 == operation)
+        })
+        .unwrap()
 }
 
 /// One worker call the fake runtime received.
@@ -219,6 +290,12 @@ pub(super) enum WorkerRequest {
     Stat(SpacedStatRequest),
     List(SpacedListRequest),
     Read(SpacedReadRequest),
+    Mkdir(SpacedMkdirRequest),
+    Remove(SpacedRemoveRequest),
+    Rename(SpacedRenameRequest),
+    EnableFileChanges(SpacedEnableFileChangesRequest),
+    DisableFileChanges(SpacedDisableFileChangesRequest),
+    GetModifiedFiles(SpacedGetModifiedFilesRequest),
 }
 
 /// What a fake runtime call answers: a message or a stream of them.
@@ -226,6 +303,12 @@ pub(super) enum Reply {
     Stat(Result<StatResponse, Status>),
     List(Result<Vec<Result<FileInfo, Status>>, Status>),
     Read(Result<Vec<Result<FileChunk, Status>>, Status>),
+    Mkdir(Result<MkdirResponse, Status>),
+    Remove(Result<RemoveResponse, Status>),
+    Rename(Result<RenameResponse, Status>),
+    EnableFileChanges(Result<EnableFileChangesResponse, Status>),
+    DisableFileChanges(Result<DisableFileChangesResponse, Status>),
+    GetModifiedFiles(Result<GetModifiedFilesResponse, Status>),
 }
 
 #[derive(Default)]
@@ -284,6 +367,26 @@ impl tonic::server::NamedService for FakeWorker {
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
+/// Answer a unary `WorkerApi` call with the next scripted reply of its kind.
+macro_rules! unary {
+    ($worker:ident, $request:ident, $kind:ident, $message:ty) => {
+        grpc()
+            .unary(
+                Unary(move |request: Request<$message>| {
+                    match $worker.take(&request, WorkerRequest::$kind(request.get_ref().clone())) {
+                        Some(Reply::$kind(reply)) => reply,
+                        _ => Err(Status::unimplemented(concat!(
+                            "unscripted ",
+                            stringify!($kind)
+                        ))),
+                    }
+                }),
+                $request,
+            )
+            .await
+    };
+}
+
 impl tower::Service<axum::http::Request<tonic::body::Body>> for FakeWorker {
     type Response = axum::http::Response<tonic::body::Body>;
     type Error = Infallible;
@@ -298,19 +401,40 @@ impl tower::Service<axum::http::Request<tonic::body::Body>> for FakeWorker {
         Box::pin(async move {
             Ok(match request.uri().path() {
                 "/space.node.api.v1.WorkerApi/SpacedStat" => {
-                    grpc()
-                        .unary(
-                            Unary(move |request: Request<SpacedStatRequest>| {
-                                match worker
-                                    .take(&request, WorkerRequest::Stat(request.get_ref().clone()))
-                                {
-                                    Some(Reply::Stat(reply)) => reply,
-                                    _ => Err(Status::unimplemented("unscripted stat")),
-                                }
-                            }),
-                            request,
-                        )
-                        .await
+                    unary!(worker, request, Stat, SpacedStatRequest)
+                }
+                "/space.node.api.v1.WorkerApi/SpacedMkdir" => {
+                    unary!(worker, request, Mkdir, SpacedMkdirRequest)
+                }
+                "/space.node.api.v1.WorkerApi/SpacedRemove" => {
+                    unary!(worker, request, Remove, SpacedRemoveRequest)
+                }
+                "/space.node.api.v1.WorkerApi/SpacedRename" => {
+                    unary!(worker, request, Rename, SpacedRenameRequest)
+                }
+                "/space.node.api.v1.WorkerApi/SpacedEnableFileChanges" => {
+                    unary!(
+                        worker,
+                        request,
+                        EnableFileChanges,
+                        SpacedEnableFileChangesRequest
+                    )
+                }
+                "/space.node.api.v1.WorkerApi/SpacedDisableFileChanges" => {
+                    unary!(
+                        worker,
+                        request,
+                        DisableFileChanges,
+                        SpacedDisableFileChangesRequest
+                    )
+                }
+                "/space.node.api.v1.WorkerApi/SpacedGetModifiedFiles" => {
+                    unary!(
+                        worker,
+                        request,
+                        GetModifiedFiles,
+                        SpacedGetModifiedFilesRequest
+                    )
                 }
                 "/space.node.api.v1.WorkerApi/SpacedList" => {
                     grpc()

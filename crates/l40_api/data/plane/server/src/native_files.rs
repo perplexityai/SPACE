@@ -12,6 +12,7 @@
 
 mod access;
 mod call;
+mod mutations;
 mod read;
 
 use std::sync::Arc;
@@ -25,6 +26,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::any,
 };
+use pplx_space_guest_process::IdempotencyKey;
 use pplx_space_native_files::FileOperation;
 use pplx_space_public_api_http::{PublicApiError, normalize_public_error};
 use serde::de::DeserializeOwned;
@@ -34,6 +36,8 @@ pub use access::NativeFileAccessConfigError;
 use call::Grant;
 
 use super::DataPlaneState;
+
+const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 
 /// Whether this data plane answers Native `files:*`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
@@ -80,6 +84,12 @@ fn handler(operation: FileOperation) -> Option<axum::routing::MethodRouter<DataP
         FileOperation::Stat => any(read::stat_file),
         FileOperation::List => any(read::list_files),
         FileOperation::Read => any(read::read_file),
+        FileOperation::Mkdir => any(mutations::mkdir_file),
+        FileOperation::Remove => any(mutations::remove_file),
+        FileOperation::Rename => any(mutations::rename_file),
+        FileOperation::ChangesEnable => any(mutations::enable_file_change_tracking),
+        FileOperation::ChangesDisable => any(mutations::disable_file_change_tracking),
+        FileOperation::Modified => any(mutations::modified_files),
         _ => return None,
     })
 }
@@ -168,6 +178,36 @@ impl IntoResponse for Refusal {
     fn into_response(self) -> Response {
         *self.0
     }
+}
+
+/// The body as `T` if it says it is JSON, as the API's `Option<Json<T>>`
+/// extractor reads it: no `Content-Type` is no body.
+pub(super) async fn optional_json_body<T: DeserializeOwned>(
+    headers: &HeaderMap,
+    body: Body,
+) -> Result<Option<T>, Refusal> {
+    <axum::Json<T> as axum::extract::OptionalFromRequest<()>>::from_request(
+        request_with(headers, body),
+        &(),
+    )
+    .await
+    .map(|body| body.map(|axum::Json(value)| value))
+    .map_err(|rejection| normalize_public_error(rejection.into_response()).into())
+}
+
+/// The request's `Idempotency-Key`, checked as the API checks it. Its value
+/// matters only to the API, which binds it while preparing the call.
+pub(super) fn idempotency_key(headers: &HeaderMap) -> Result<IdempotencyKey, Refusal> {
+    let Some(value) = headers.get(IDEMPOTENCY_KEY_HEADER) else {
+        return Err(PublicApiError::bad_request("Idempotency-Key header is required").into());
+    };
+    IdempotencyKey::parse_header(value.as_bytes())
+        .map_err(|error| PublicApiError::bad_request(error.to_string()).into())
+}
+
+/// A field check's refusal, as the API answers it.
+pub(super) fn rejected(error: impl Into<PublicApiError>) -> Refusal {
+    error.into().into()
 }
 
 fn request_with(headers: &HeaderMap, body: Body) -> Request<Body> {
