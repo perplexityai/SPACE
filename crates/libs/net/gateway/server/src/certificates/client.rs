@@ -79,6 +79,16 @@ impl Entry {
 
 impl CertificateProvider {
     pub fn new(authority: GatewayAuthority, context: CertificateContext) -> Self {
+        Self::with_cache_bound(authority, context, MAX_CACHED_CERTIFICATES)
+    }
+
+    /// The ready cache holds at most `bound` leaves. Tests that fill it use a
+    /// small bound; eviction behaves the same at any size.
+    fn with_cache_bound(
+        authority: GatewayAuthority,
+        context: CertificateContext,
+        bound: usize,
+    ) -> Self {
         Self {
             inner: Arc::new(Provider {
                 authority,
@@ -86,9 +96,7 @@ impl CertificateProvider {
                 capacity: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS)),
                 rate: Mutex::new((tokio::time::Instant::now(), 0)),
                 cache: Mutex::new(Cache {
-                    ready: LruCache::new(
-                        NonZeroUsize::new(MAX_CACHED_CERTIFICATES).expect("nonzero cache bound"),
-                    ),
+                    ready: LruCache::new(NonZeroUsize::new(bound).expect("nonzero cache bound")),
                     pending: HashMap::new(),
                 }),
             }),
@@ -143,7 +151,7 @@ impl CertificateProvider {
         }
         pplx_space_metrics::gateway::certificate_cache_entries(
             cache.ready.len(),
-            MAX_CACHED_CERTIFICATES,
+            cache.ready.cap().get(),
         );
         Ok(())
     }
@@ -260,14 +268,14 @@ impl CertificateProvider {
             // LruCache::put reports a replaced value for the same key, never the
             // entry displaced by the capacity bound. Detect that displacement
             // before inserting so cache pressure stays distinguishable from churn.
-            if cache.ready.len() == MAX_CACHED_CERTIFICATES && !cache.ready.contains(&key) {
+            if cache.ready.len() == cache.ready.cap().get() && !cache.ready.contains(&key) {
                 pplx_space_metrics::gateway::certificate_cache_event("evicted");
             }
             cache.ready.put(key, entry);
         }
         pplx_space_metrics::gateway::certificate_cache_entries(
             cache.ready.len(),
-            MAX_CACHED_CERTIFICATES,
+            cache.ready.cap().get(),
         );
         drop(cache);
         pplx_space_metrics::gateway::certificate_lookup(source);
