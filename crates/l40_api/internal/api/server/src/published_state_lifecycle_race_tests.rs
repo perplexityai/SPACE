@@ -169,7 +169,7 @@ async fn failed_projection_decides_on_the_row_committed_while_it_waits() -> Test
             .fetch_one(&mut *projection_tx)
             .await?;
         let rows_json = Json(serde_json::json!([
-            { "sandbox_id": sandbox_id.to_string(), "status": "failed" }
+            { "sandbox_id": sandbox_id.to_string(), "published_lifecycle": "failed" }
         ]));
         let projection = tokio::spawn(async move {
             let moved =
