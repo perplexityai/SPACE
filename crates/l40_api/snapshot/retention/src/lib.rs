@@ -15,14 +15,45 @@
 //!
 //! This reconciler keeps, per sandbox, the newest `keep_n` `ready`
 //! `full` snapshots and prunes the rest (S3 prefix + the `snapshots` and
-//! `snapshot_storage_locations` rows).
+//! `snapshot_storage_locations` rows). It prunes `ready` `disk` snapshots
+//! of origin `stop` once they are past the age gate, keeping only the ones
+//! the restore-source guard below shields. With no `min_age` there is no
+//! gate; the cluster controller always sets one outside `test-hooks` builds.
+//!
+//! ## Disk snapshots
+//!
+//! A `stop` disk row is a stopped sandbox's rootfs: node drain's evacuation
+//! publishes one, and so does an execution retire's backup. A `snapshot`
+//! disk row is a named artifact, such as a fork capture, which restore-as-new
+//! loads and the public snapshot list shows. A `fork` disk row is a fork's
+//! copied artifact, which the fork operation retires itself.
+//!
+//! Only `stop` rows are swept. Named and fork disk rows stay unswept on
+//! purpose: nothing pins a named one, and once its backup is in, the node's
+//! snapshot GC may drop the local copy, so the S3 copy can be the only one.
+//!
+//! Nothing selects a `stop` row by recency. The stopped restore selectors
+//! load one only through the sandbox's pin, which the restore-source guard
+//! shields. So `stop` rows have no keep-N floor; they neither count toward a
+//! `full` row's floor nor have one of their own.
+//!
+//! Node drain can still reuse an unpinned `stop` row: when sbx-mgr finds a
+//! `ready` backup of the node's current artifact, drain pins that artifact
+//! instead of uploading it again. A row pruned before the pin lands costs an
+//! upload, not the data. The stopped evacuation's teardown waits for a
+//! `ready` disk row matching the pin before it releases the source node,
+//! whose termination takes the rootfs, and the next drain tick finds no
+//! backup and uploads again. If the sweep claims the row between sbx-mgr's
+//! check and the pin write, and the pin lands before finalize, finalize also
+//! reports a current-artifact breach for it, though nothing is lost.
 //!
 //! ## Validity
 //!
 //! Only `state = 'ready'`, `type = 'full'` snapshots with a usable attached
-//! storage location count toward `N`. `creating` (upload in flight), `failed`,
-//! and route-less/orphaned rows are invisible to the sibling probe. A route-less
-//! fresh row may still surface for repair telemetry, but it remains unclaimed.
+//! storage location count toward a `full` candidate's `N`. `creating`
+//! (upload in flight), `failed`, and route-less/orphaned rows are invisible to
+//! the sibling probe. A route-less fresh row may still surface for repair
+//! telemetry, but it remains unclaimed.
 //!
 //! ### Recency is not sufficient — the restore-source guard
 //!

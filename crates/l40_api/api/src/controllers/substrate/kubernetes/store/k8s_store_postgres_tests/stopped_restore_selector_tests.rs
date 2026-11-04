@@ -472,11 +472,10 @@ pub(super) async fn stopped_disk_selector_ignores_a_full_artifact_and_a_foreign_
 ///
 /// Read what this does and does not establish. It evaluates the **guard
 /// expression** against the row the selector picked; it does not exercise
-/// `list_candidates` or `claim_prune`, and it is not what makes a disk row
-/// unprunable today — those two filter `type = 'full'`, so a disk row is
-/// outside the candidate set before the guard is reached. What this pins is
-/// the agreement itself, which is what keeps the sweep safe if that `'full'`
-/// narrowing is ever lifted.
+/// `list_candidates` or `claim_prune`; the retention crate's own tests sweep
+/// pinned and unpinned disk rows end to end. What this pins is the agreement
+/// itself: the sweep reaches `stop` disk rows, and this guard is what keeps the
+/// row this selector loads out of it.
 ///
 /// The second assertion is the non-vacuity control: a guard that answered TRUE
 /// for every row would satisfy the first one on its own.

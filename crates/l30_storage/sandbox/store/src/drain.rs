@@ -426,13 +426,10 @@ impl StoppedEvacuationClaim {
 /// the disk-only restore-source selector, which resolve the artifact through
 /// `snapshot_is_current_local_artifact`.
 ///
-/// It does **not** buy retention safety, though the shared fragment makes it
-/// look as if it should. `snapshot_is_live_restore_source` is kind-agnostic and
-/// would shield a pinned disk row, but the retention sweeper filters
-/// `type = 'full'` in both its discovery and its claim gates, so a disk row
-/// never reaches that guard — it is outside the candidate set entirely. Disk
-/// artifacts are therefore never pruned today, which is safe in the direction
-/// that matters here and a growth problem in the other one.
+/// It also keeps the artifact out of the retention sweep. The sweeper reclaims
+/// `stop` disk rows once they are past its age gate, and
+/// `snapshot_is_live_restore_source`, which is kind-agnostic, shields the row
+/// this pin names.
 ///
 /// **Re-asserts the whole claim, including the node's drain state, and refuses
 /// to overwrite a pin it did not expect.** Both halves were missing and both are

@@ -1199,6 +1199,8 @@ mod postgres {
 
     use pplx_space_test_env::TestResult;
 
+    mod disk_artifacts;
+
     #[tokio::test(flavor = "current_thread")]
     async fn discovery_candidate_cap_keeps_siblings_outside_the_raw_page() -> TestResult {
         let Some(db) = try_pg_test_db().await? else {
@@ -1879,19 +1881,41 @@ mod postgres {
         artifact_id: Uuid,
         artifact_kind: &str,
     ) -> TestResult<SnapshotId> {
+        insert_typed_artifact_snapshot(
+            pool,
+            sandbox_id,
+            "full",
+            age_secs,
+            artifact_id,
+            (artifact_kind, "suspend"),
+        )
+        .await
+    }
+
+    /// [`insert_artifact_snapshot`] with the snapshot type and the artifact's
+    /// `(kind, origin)` chosen by the caller.
+    async fn insert_typed_artifact_snapshot(
+        pool: &PgPool,
+        sandbox_id: SandboxId,
+        snapshot_type: &str,
+        age_secs: i64,
+        artifact_id: Uuid,
+        (artifact_kind, artifact_origin): (&str, &str),
+    ) -> TestResult<SnapshotId> {
         // Reuse `insert_snapshot` so both helpers share one storage-location
         // shape; only the artifact identity is layered on afterwards.
-        let id = insert_snapshot(pool, sandbox_id, "full", "ready", age_secs).await?;
+        let id = insert_snapshot(pool, sandbox_id, snapshot_type, "ready", age_secs).await?;
         sqlx::query(
             "UPDATE snapshots
                 SET local_artifact_id = $2,
                     artifact_kind = $3,
-                    artifact_origin = 'suspend'
+                    artifact_origin = $4
               WHERE id = $1",
         )
         .bind(id)
         .bind(artifact_id)
         .bind(artifact_kind)
+        .bind(artifact_origin)
         .execute(pool)
         .await?;
         Ok(id)
@@ -1905,16 +1929,28 @@ mod postgres {
         artifact_id: Uuid,
         artifact_kind: &str,
     ) -> TestResult<()> {
+        pin_artifact(pool, sandbox_id, artifact_id, (artifact_kind, "suspend")).await
+    }
+
+    /// [`pin_current_artifact`] with the marker's `(kind, origin)` chosen by
+    /// the caller.
+    async fn pin_artifact(
+        pool: &PgPool,
+        sandbox_id: SandboxId,
+        artifact_id: Uuid,
+        (artifact_kind, artifact_origin): (&str, &str),
+    ) -> TestResult<()> {
         sqlx::query(
             "UPDATE sandboxes
                 SET current_local_artifact_id = $2,
                     current_local_artifact_kind = $3,
-                    current_local_artifact_origin = 'suspend'
+                    current_local_artifact_origin = $4
               WHERE id = $1",
         )
         .bind(sandbox_id)
         .bind(artifact_id)
         .bind(artifact_kind)
+        .bind(artifact_origin)
         .execute(pool)
         .await?;
         Ok(())
@@ -2959,20 +2995,12 @@ mod postgres {
                 ClaimOutcome::Refused(ClaimRefusalReason::MissingSandboxOrSnapshot),
             );
         }
-        for (kind, state, reason) in [
-            ("full", "creating", ClaimRefusalReason::SnapshotNotReady),
-            ("full", "failed", ClaimRefusalReason::SnapshotNotReady),
-            ("full", "deleting", ClaimRefusalReason::SnapshotNotReady),
-            ("disk", "ready", ClaimRefusalReason::SnapshotNotFull),
-        ] {
-            sqlx::query(sql!(
-                "UPDATE snapshots SET type = $2, state = $3 WHERE id = $1"
-            ))
-            .bind(snapshot)
-            .bind(kind)
-            .bind(state)
-            .execute(pool)
-            .await?;
+        for state in ["creating", "failed", "deleting"] {
+            sqlx::query(sql!("UPDATE snapshots SET state = $2 WHERE id = $1"))
+                .bind(snapshot)
+                .bind(state)
+                .execute(pool)
+                .await?;
             assert_eq!(
                 <SnapshotRetentionDbStore as RetentionSink>::claim_prune(
                     &store,
@@ -2981,7 +3009,7 @@ mod postgres {
                     None
                 )
                 .await?,
-                ClaimOutcome::Refused(reason),
+                ClaimOutcome::Refused(ClaimRefusalReason::SnapshotNotReady),
             );
             assert_eq!(
                 snapshot_state(pool, snapshot).await?.as_deref(),
