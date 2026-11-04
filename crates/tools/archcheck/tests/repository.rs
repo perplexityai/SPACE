@@ -23,6 +23,14 @@ fn node_manager_commands_reject_direct_spawns_without_restricting_other_services
     use pplx_space_archcheck::context::ProductionFile;
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
     let mut ctx = Context::load(&root).unwrap();
+    // Each check below reads one instance's findings; the other instances and
+    // the layers rule would rescan the whole repository for every case.
+    ctx.config
+        .rules
+        .pattern_ratchet
+        .retain(|name, _| name.as_str() == "node_manager_commands");
+    assert_eq!(ctx.config.rules.pattern_ratchet.len(), 1);
+    ctx.config.rules.layers = None;
     let cases = [
         (
             "crates/l40_api/node/mgr/server/src/spawn_regression.rs",

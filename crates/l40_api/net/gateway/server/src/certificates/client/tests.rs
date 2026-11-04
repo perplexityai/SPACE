@@ -59,7 +59,15 @@ async fn cache_refreshes_short_lived_leaves_without_revoking_existing_connection
 
 #[tokio::test]
 async fn local_cache_shares_exact_targets_and_bounds_retention() {
-    let (_, _, provider) = local_provider().await;
+    // Eviction works the same at any bound; filling the release bound would
+    // sign 4096 leaves.
+    const BOUND: usize = 16;
+    let (_, _, local) = local_provider().await;
+    let provider = CertificateProvider::with_cache_bound(
+        local.inner.authority.clone(),
+        local.inner.context.clone(),
+        BOUND,
+    );
     let host: DomainName = "shared.test".parse().unwrap();
     let (first, second) = tokio::join!(
         provider.get(host.clone(), 443),
@@ -71,7 +79,7 @@ async fn local_cache_shares_exact_targets_and_bounds_retention() {
     assert!(!Arc::ptr_eq(&first, &other_port));
     assert_eq!(other_port.port(), 8443);
 
-    for index in 0..=MAX_CACHED_CERTIFICATES {
+    for index in 0..=BOUND {
         // Retention is independent of the separately exercised issuance budget.
         *provider.inner.rate.lock().unwrap() = (tokio::time::Instant::now(), 0);
         provider
@@ -81,7 +89,7 @@ async fn local_cache_shares_exact_targets_and_bounds_retention() {
     }
     {
         let cache = provider.inner.cache.lock().unwrap();
-        assert_eq!(cache.ready.len(), MAX_CACHED_CERTIFICATES);
+        assert_eq!(cache.ready.len(), BOUND);
         assert!(!cache.ready.contains(&(host, 443)));
     }
     assert!(
@@ -112,7 +120,7 @@ async fn local_cache_shares_exact_targets_and_bounds_retention() {
         } else {
             None
         };
-        for index in 0..=MAX_CACHED_CERTIFICATES {
+        for index in 0..=BOUND {
             // Pin an exhausted window for each miss: a full-cache loop can
             // outlast the one-second window and reopen the signing budget.
             *provider.inner.rate.lock().unwrap() =
