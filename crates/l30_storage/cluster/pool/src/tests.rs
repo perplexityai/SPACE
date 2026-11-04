@@ -4629,12 +4629,12 @@ async fn autoscale_holds_a_failed_candidates_old_shape_config() -> TestResult {
             .collect::<Vec<_>>(),
         vec![refused_release_id]
     );
-    assert_eq!(run.held_release_ids(), vec![refused_release_id]);
     assert_eq!(
         config_enabled(&fixture.pool, refused_release_id).await?,
         Some(true),
         "the old shape's config stays enabled while the new shape cannot be written"
     );
+    assert_eq!(run.held_release_ids(), vec![refused_release_id]);
 
     Ok(())
 }
