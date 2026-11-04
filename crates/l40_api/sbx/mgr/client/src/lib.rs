@@ -91,18 +91,47 @@ pub async fn connect_with_retry_policy(
     Ok(client_from_channel(channel))
 }
 
-/// Pool cloning includes a fresh memory capture. Its 20-minute request budget
-/// exceeds node-manager's 16-minute capture wait plus clone preparation.
-/// Other lifecycle callers retain their ordinary request deadlines.
-pub async fn connect_for_memory_clone() -> Result<SandboxManagerGrpcClient, ConnectError> {
+/// Allow node-owned capture to answer before sandbox-manager's waiter expires.
+/// Callers supply the node capture budget without adding node-client dependencies
+/// to consumers that only talk to sandbox-manager.
+pub const fn memory_clone_capture_wait_timeout(
+    node_capture_wait: std::time::Duration,
+) -> std::time::Duration {
+    node_capture_wait
+        .checked_add(std::time::Duration::from_secs(30))
+        .expect("memory clone capture timeout overflow")
+}
+
+/// A capture-sized channel that cannot be reused for ordinary lifecycle RPCs.
+pub struct MemoryCloneClient(SandboxManagerGrpcClient);
+
+impl MemoryCloneClient {
+    pub async fn clone_from_donor(
+        &mut self,
+        request: proto::CloneFromDonorRequest,
+    ) -> Result<tonic::Response<proto::CloneFromDonorResponse>, tonic::Status> {
+        self.0.clone_from_donor(request).await
+    }
+}
+
+/// Connect with enough time for capture and clone preparation. Use [`connect`]
+/// for subsequent start, pause and cleanup calls, with ordinary request budgets.
+/// `node_capture_wait` is the serving node's capture waiter budget.
+pub async fn connect_for_memory_clone(
+    node_capture_wait: std::time::Duration,
+) -> Result<MemoryCloneClient, ConnectError> {
+    // Include template/environment lookup and disk preparation after capture.
+    let request_timeout = memory_clone_capture_wait_timeout(node_capture_wait)
+        .checked_add(std::time::Duration::from_secs(210))
+        .expect("memory clone request timeout overflow");
     let channel = pplx_space_common_grpc::connect_uds_channel_with_endpoint_with_retry(
         "sandbox-manager",
         Path::new(SOCKET_PATH),
-        configured_endpoint()?.timeout(std::time::Duration::from_secs(1200)),
+        configured_endpoint()?.timeout(request_timeout),
         DEFAULT_CONNECT_RETRY_POLICY,
     )
     .await?;
-    Ok(client_from_channel(channel))
+    Ok(MemoryCloneClient(client_from_channel(channel)))
 }
 
 /// Dial a fresh, uncached connection to the sandbox-manager socket.

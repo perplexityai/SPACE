@@ -813,6 +813,7 @@ impl SandboxManagerService {
         let donor_id = &donor.id;
         let (donor, _wake, _donor_fence) = self.lock_pool_clone_donor(&peer, donor_id)?;
         let template_ref = pool_clone_template_ref(&donor, template)?;
+        self.ensure_memory_state_supported(&donor, "clone pool donor")?;
 
         // Generate new sandbox ID
         let new_id = uuid::Uuid::now_v7().to_string();
@@ -880,7 +881,9 @@ impl SandboxManagerService {
         std::fs::create_dir_all(&checkpoint)
             .map_err(|error| Status::internal(format!("prepare donor checkpoint: {error}")))?;
         tokio::time::timeout(
-            pplx_space_node_mgr_client::MEMORY_CAPTURE_WAIT_TIMEOUT + Duration::from_secs(30),
+            pplx_space_sbx_mgr_client::memory_clone_capture_wait_timeout(
+                pplx_space_node_mgr_client::MEMORY_CAPTURE_WAIT_TIMEOUT,
+            ),
             node_client.capture_vm_state(super::snapshot_capture::bind(
                 pplx_space_node_mgr_client::proto::CaptureVmStateRequest {
                     sandbox_id: donor_id.clone(),

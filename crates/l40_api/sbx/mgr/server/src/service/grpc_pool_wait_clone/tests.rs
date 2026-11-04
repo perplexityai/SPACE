@@ -26,7 +26,11 @@ fn armed_clone_with_image(
             template: "seed",
             template_hash: Some("sha256:test"),
             user: &pplx_space_common_core::types::SandboxOwner::parse("deploy").unwrap(),
-            runtime: RuntimeKind::Firecracker.as_str(),
+            runtime: if guest_image.legacy_transport() {
+                RuntimeKind::Firecracker.as_str()
+            } else {
+                RuntimeKind::CloudHypervisor.as_str()
+            },
             snapshots_enabled: false,
             rootfs_size_mb: None,
             disk_io_limits: Default::default(),
@@ -64,6 +68,7 @@ async fn cloning_preserves_guest_contract_and_requires_current_checkpoint() {
     use pplx_space_node_mgr_client::proto::{
         CaptureVmStateRequest, CaptureVmStateResponse, CloneCapabilitiesRequest,
         CloneCapabilitiesResponse, CloneSandboxRequest, CloneSandboxResponse,
+        ResolveExecutionEnvironmentRequest, ResolveExecutionEnvironmentResponse,
     };
     use pplx_space_template_mgr_client::proto::{GetTemplateResponse, TemplateRef};
 
@@ -72,12 +77,40 @@ async fn cloning_preserves_guest_contract_and_requires_current_checkpoint() {
         "agent": "spaced", "readiness": {"kind": "agent"}
     }))
     .unwrap();
-    for (image, capture_fails) in [(Default::default(), false), (native, false), (native, true)] {
+    let agentless = serde_json::from_value(serde_json::json!({
+        "version": 1, "disk": "opaque_raw_disk", "network": "slot_dhcp_v1",
+        "agent": "absent", "readiness": {"kind": "tcp_service", "port": 3389}
+    }))
+    .unwrap();
+    let definition = pplx_space_execution_catalog::catalog::CompiledEnvironment::for_architecture(
+        pplx_space_common_core::types::Arch::X86_64,
+    )
+    .unwrap()
+    .into_iter()
+    .find(|entry| entry.name() == "ch-54.0-windows-uefi")
+    .unwrap()
+    .definition()
+    .clone();
+    for (image, bound, capture_fails, refused) in [
+        (Default::default(), false, false, false),
+        (native, true, false, false),
+        (native, true, true, false),
+        (native, false, false, true),
+        (agentless, true, false, true),
+    ] {
         let (mut service, donor, episode) = armed_clone_with_image(image);
         let donor = donor.to_string();
         {
             let db = service.db.lock().unwrap();
             assert!(crate::db::complete_pool_clone(&db, &donor, episode).unwrap());
+            if bound {
+                crate::db::upsert_sandbox_execution_metadata(
+                    &db,
+                    &donor,
+                    &definition.execution_requirements().unwrap(),
+                )
+                .unwrap();
+            }
             crate::db::test_fixtures::state_write_fixtures::force_state(
                 &db,
                 &donor,
@@ -109,7 +142,16 @@ async fn cloning_preserves_guest_contract_and_requires_current_checkpoint() {
             TemplateLookupScope::LocalExecution.receipt(&mut response);
             Ok(response)
         }));
+        let acknowledgement = ResolveExecutionEnvironmentResponse {
+            accepted_selection: 0,
+            definition: Some((&definition).into()),
+            execution: Some((&definition.execution_requirements().unwrap()).into()),
+        };
         let node = FakeNodeManager::default()
+            .unary(
+                "ResolveExecutionEnvironment",
+                move |_: ResolveExecutionEnvironmentRequest| Ok(acknowledgement.clone()),
+            )
             .unary("GetCloneCapabilities", |_: CloneCapabilitiesRequest| {
                 Ok(CloneCapabilitiesResponse {
                     prepared_clone_disposal: true,
@@ -129,14 +171,47 @@ async fn cloning_preserves_guest_contract_and_requires_current_checkpoint() {
         service.node_manager = node.connector();
         let result = service
             .clone_from_donor(internal_request(CloneFromDonorRequest {
-                donor_sandbox_id: donor,
+                donor_sandbox_id: donor.clone(),
                 template: "seed".into(),
                 owner: "deploy@local".into(),
                 pool_template: Some("seed".into()),
             }))
             .await;
-        if capture_fails {
-            assert_eq!(result.unwrap_err().code(), tonic::Code::Unavailable);
+        if capture_fails || refused {
+            let error = result.unwrap_err();
+            assert_eq!(
+                error.code(),
+                if refused {
+                    tonic::Code::FailedPrecondition
+                } else {
+                    tonic::Code::Unavailable
+                }
+            );
+            if refused {
+                assert!(!node.calls().iter().any(|method| method == "CaptureVmState"));
+                assert!(!cache.path().join(&donor).join("snapshot").exists());
+                if bound {
+                    assert!(
+                        pplx_space_common_grpc::GuestCapabilityUnsupported::from_status(&error)
+                            .is_some()
+                    );
+                }
+            }
+            assert_eq!(
+                service.lookup_sandbox(&donor).unwrap().state,
+                SandboxState::Paused
+            );
+            drop(
+                service
+                    .auto_lifecycle
+                    .wake_lock(&donor)
+                    .try_lock()
+                    .expect("clone refusal releases the donor wake lock"),
+            );
+            assert!(matches!(
+                service.try_cleanup_fence(&donor),
+                CleanupLockTryResult::Acquired(_)
+            ));
             assert_eq!(
                 crate::db::list_sandboxes(&service.db.lock().unwrap())
                     .unwrap()

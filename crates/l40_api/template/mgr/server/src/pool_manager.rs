@@ -551,11 +551,18 @@ async fn do_clone_and_start(
     vcpu: u32,
     memory_mib: u32,
 ) -> PoolResult<String> {
-    let mut sbx_client = pplx_space_sbx_mgr_client::connect_for_memory_clone()
+    // Connect before allocating a child: a dial failure after clone publication
+    // would leave no caller to start it or request its disposal.
+    let mut sbx_client = pplx_space_sbx_mgr_client::connect()
         .await
         .map_err(|e| PoolError::SandboxClient(e.to_string()))?;
+    let mut clone_client = pplx_space_sbx_mgr_client::connect_for_memory_clone(
+        pplx_space_node_mgr_client::MEMORY_CAPTURE_WAIT_TIMEOUT,
+    )
+    .await
+    .map_err(|e| PoolError::SandboxClient(e.to_string()))?;
 
-    let clone_resp = sbx_client
+    let clone_resp = clone_client
         .clone_from_donor(pplx_space_sbx_mgr_client::proto::CloneFromDonorRequest {
             donor_sandbox_id: source_id.to_string(),
             template: template.to_string(),
