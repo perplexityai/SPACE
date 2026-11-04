@@ -53,10 +53,11 @@ use crate::{
     },
     public_operations::{
         ApiProduct, CreatePublicOperation, CreatePublicOperationIdempotency,
-        CreatePublicOperationResult, HttpOperationMethod, OperationPathTemplate,
-        PublicOperationStore, PublicOperationStoreError, ResponseReservation,
+        CreatePublicOperationResult, HttpOperationMethod, ObservePublicOperationIdempotency,
+        OperationPathTemplate, PublicOperationStore, PublicOperationStoreError,
+        ResponseReservation,
     },
-    public_template_operations::DeleteTemplateOperationPayload,
+    public_template_operations::{DeleteTemplateOperationPayload, TemplateInUse},
     reconcile_queue::{ReconcileFacet, ReconcileRef, enqueue_node_reconcile_refs_for_nodes_tx},
     reconcile_trigger::enqueue_triggers_tx,
     routes::{
@@ -273,11 +274,11 @@ async fn managing_org_id(
 /// `api_error`'s envelope with `retryable` forced on.
 ///
 /// `api_error` derives that flag from the status, and 409 is absent from its
-/// set — so the six other 409s this module returns all render
+/// set — so the seven other 409s this module returns all render
 /// `retryable: false`: an idempotency key reused with a different body, a
 /// template that already exists, a deleted or still-deleting template on a
 /// build, a release missing or still tagged `latest`, a release still
-/// referenced. Some of those do clear without the caller doing anything, so
+/// referenced, a template delete while warm pools still use the template. Some of those do clear without the caller doing anything, so
 /// the flag is imprecise for them; what matters here is that a contention
 /// 409's own message tells the caller to retry, so its envelope must not say
 /// otherwise. Built from `api_error` rather than re-listing the envelope's
@@ -1103,9 +1104,61 @@ pub async fn delete_template(
         Err(error) => return error.into_response(),
     };
     let template_target = template_name.to_string();
+    let idempotency = CreatePublicOperationIdempotency {
+        method: HttpOperationMethod::Delete,
+        path_template: OperationPathTemplate::new("/admin/v1/templates/{template}"),
+        key: &idempotency_key,
+        request_fingerprint: &fingerprint,
+    };
     let store = PublicOperationStore::new(state.pool.clone());
-    let operation = match store
-        .create_operation(CreatePublicOperation {
+    let mut admission = match store
+        .begin_operation_admission(managing_org_id, ApiProduct::Admin, &idempotency)
+        .await
+    {
+        Ok(admission) => admission,
+        Err(error) => {
+            if let Some(response) = store_contention_response(ContentionScope::Writing, &error) {
+                return response.into_response();
+            }
+            tracing::error!(%error, template = template_name.as_str(), "failed to look up template delete idempotency key");
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
+                .into_response();
+        }
+    };
+
+    // Refuse a new request before creating an operation or marking the
+    // template `deleting`: the operation cannot delete releases that warm
+    // pools still hold. It checks again for a use that appears after this
+    // read. A replayed or conflicting key answers as it did the first time,
+    // whatever uses the template now. The check reads on the admission's
+    // transaction, so a request holds one connection, not two.
+    if matches!(
+        admission.observation(),
+        ObservePublicOperationIdempotency::Missing
+    ) {
+        match TemplateInUse::check(admission.transaction(), &template_name).await {
+            Ok(None) => {}
+            Ok(Some(in_use)) => {
+                return api_error_with_details(
+                    StatusCode::CONFLICT,
+                    in_use.message(),
+                    in_use.details(),
+                )
+                .into_response();
+            }
+            Err(error) => {
+                if let Some(response) = contention_response(ContentionScope::ReadOnly, &error) {
+                    return response.into_response();
+                }
+                tracing::error!(%error, template = template_name.as_str(), "failed to check template use before delete");
+                return api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
+                    .into_response();
+            }
+        }
+    }
+
+    let operation = match admission
+        .create(CreatePublicOperation {
             org_id: managing_org_id,
             actor_user_id: Some(actor.id),
             api_product: ApiProduct::Admin,
@@ -1113,12 +1166,7 @@ pub async fn delete_template(
             target_type: Some(OperationTargetType::Template),
             target_id: Some(&template_target),
             payload_json: DeleteTemplateOperationPayload::new(template_name.clone()).into_json(),
-            idempotency: Some(CreatePublicOperationIdempotency {
-                method: HttpOperationMethod::Delete,
-                path_template: OperationPathTemplate::new("/admin/v1/templates/{template}"),
-                key: &idempotency_key,
-                request_fingerprint: &fingerprint,
-            }),
+            idempotency: Some(idempotency),
             traceparent: crate::public_operations::request_traceparent(),
         })
         .await

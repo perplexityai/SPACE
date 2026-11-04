@@ -65,6 +65,19 @@ Manual configs are created through the UI, `space-admin-cli warm-pool` or
 `PUT /admin/api/v1/warm-pools`. Re-submitting the same release and shape
 updates the existing row.
 
+A template delete is refused while an enabled config, an enabled policy or a
+slot still uses the template. The delete operation checks again inside the
+transaction that deletes the releases, where the release keys and the config
+lock catch a config or slot added after the earlier checks. Nothing
+serializes policy writes with that transaction, so a policy enabled while it
+runs survives the delete and applies to a template later created with the
+same name. Disabling the configs and policies drains the
+open slots. A `claimed` slot settles within minutes, when its create finishes
+or the stale claim is swept. A `bound` slot stays until its sandbox's pod is
+retired, for example when the sandbox is deleted or suspended. The delete
+operation deletes the template's disabled configs that have no slots, and its
+disabled policies, before deleting the releases.
+
 ### Slots
 
 A slot is a pre-created Kubernetes pod backed by a node-local paused VM. The
@@ -301,11 +314,13 @@ caller-controlled series of content hashes from creating unbounded floors.
 The lookback, the threshold and the ratio of one ready slot per 10 sandboxes
 are fixed in the controller.
 
-The controller never adopts, changes or retires `manual` configs. To keep one
-policy-owned release warm beyond retention, detach its config, which sets
-`managed_by='manual'` with an explicit target. The UI's **Detach and Save**
-action does this. Returning a detached config to `autoscaler` must be
-deliberate, because the next tick can drain it straight away.
+The warm-pool reconciler never adopts, changes or retires `manual` configs.
+Only a template delete removes one, once it is disabled and has no slots (see
+[Pool configs](#pool-configs)). To keep one policy-owned release warm beyond
+retention, detach its config, which sets `managed_by='manual'` with an explicit
+target. The UI's **Detach and Save** action does this. Returning a detached
+config to `autoscaler` must be deliberate, because the next tick can drain it
+straight away.
 
 ### Release workflow
 
