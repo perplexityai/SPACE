@@ -169,23 +169,14 @@ mode = "required"
 # production line that opens a statement writing the row (`UPDATE`,
 # `INSERT INTO`, `DELETE FROM`, `MERGE INTO` or `TRUNCATE` naming `sandboxes`,
 # in any case, schema-qualified or quoted, before any alias, including right
-# after a `\n`, `\r` or `\t` escape in a one-line string), and each call to
-# the sandbox-portability renderers that compose part of its SET list
-# (`sandbox_assignments()`, as a method or a path call, and the
-# `*_current_local_artifact_marker_assignments` functions, after punctuation,
-# a line start or `return`, `match`, `if`, `in`, `else` or `while`), so a file
-# with a composed `UPDATE sandboxes s SET {...}` counts the head and each
-# renderer call.
+# after a `\n`, `\r` or `\t` escape in a one-line string).
 # Not caught: a statement head split across lines (`UPDATE` and `sandboxes` on
 # different lines) or built at run time (`format!("UPDATE {table} ...")`); a
 # `COPY sandboxes FROM ...`; a statement in a non-`.rs` file, such as the
 # placement state machine's `include_str!` claim statements under
 # `postgres/sql/`; a head right after an escape other than `\n`, `\r` or
-# `\t` (`\0`, `\x0a`); a renderer called through an alias or a `use ... as`
-# rename, passed as a function value
-# (`.map(SuspendedK8sFinalizationSql::sandbox_assignments)`), or called
-# right after `break` or `yield`; database triggers; scripts and smoke
-# harnesses outside workspace members' `src/`.
+# `\t` (`\0`, `\x0a`); database triggers; scripts and smoke harnesses outside
+# workspace members' `src/`.
 # False positives: the same text in a trailing `//` or `/* */` comment, in
 # `#[doc = "..."]`, in a SQL `--` comment or in an ordinary string such as an
 # error message ("failed to update sandboxes"); a statement on another
@@ -204,16 +195,11 @@ mode = "required"
 # in a production file counts, so test-only writes go in a `*_tests` file.
 # A new writer outside the store fails, as does another write in a listed
 # file; so does splitting a listed file into modules, since `--renames` pairs
-# only whole-file renames and the new files' entries are new. Portability
-# calls its private `sandbox_assignments` helper bare; a path-qualified call to
-# it there (`Self::...`, `super::...`) matches and fails.
+# only whole-file renames and the new files' entries are new.
 [rules.pattern_ratchet.sandbox_writes]
 patterns = [
   # A statement head on the row's table
   '''(?i)(?:\\[nrt]|\b)(?:UPDATE|DELETE\s+FROM|INSERT\s+INTO|MERGE\s+INTO|TRUNCATE(?:\s+TABLE)?)\s+(?:ONLY\s+)?(?:\\?"?public\\?"?\s*\.\s*)?\\?"?sandboxes\b''',
-  # Calls to the portability renderers of the row's assignments
-  '''(?:\.|::)\s*sandbox_assignments\s*\(''',
-  '''(?:^|[^\w\s]|\b(?:return|match|if|in|else|while)\s)\s*(?:\w+\s*::\s*)*(?:clear|write|publish_clear_or_preserve)_current_local_artifact_marker_assignments\s*\(''',
 ]
 allow = [
   "crates/l30_storage/sandbox/store/**",

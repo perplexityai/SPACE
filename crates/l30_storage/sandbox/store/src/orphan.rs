@@ -6,8 +6,7 @@
 //! read (`SELECT ... FOR UPDATE` on the same guard), the transaction, the
 //! reconcile-state cleanup, and the quarantine state and history rows. Each
 //! write here is one statement whose CTEs also retire the active execution
-//! and reset open port exposures, as `pplx-space-sandbox-portability`'s
-//! finalization renders them; splitting it would change what it does.
+//! and reset open port exposures; splitting it would change what it does.
 //!
 //! The classification guard fragments ([`classify_guard_sql`],
 //! [`classify_guard_from_sql`] and [`classify_guard_lock_sql`]) are also
@@ -17,11 +16,7 @@
 use pplx_space_common_core::types::{NodeId, PodUid, SandboxId, SandboxLifecycle};
 
 use pplx_space_common_core::sql;
-use pplx_space_sandbox_portability::{
-    SuspendedTargetNodeAssignment, clear_current_local_artifact_marker_assignments,
-    quarantined_k8s_finalization_sql, started_repair_revert_eligibility,
-    suspended_k8s_finalization_sql,
-};
+use pplx_space_sandbox_portability::started_repair_revert_eligibility;
 use sqlx::{Postgres, Transaction};
 
 /// The classification guard a statement here re-checks, with the values it
@@ -93,17 +88,6 @@ pub async fn recover_orphan_to_suspended(
     let eligibility = started_repair_revert_eligibility("s");
     let clear_marker = eligibility.clear_marker;
     let eligible = eligibility.eligible;
-    let artifact_marker_assignments =
-        clear_current_local_artifact_marker_assignments("s", "pre.clear_marker");
-    let finalization = suspended_k8s_finalization_sql(
-        "s",
-        "updated_sandbox",
-        &artifact_marker_assignments,
-        SuspendedTargetNodeAssignment::Clear,
-    );
-    let sandbox_assignments = finalization.sandbox_assignments();
-    let retire_active_execution_cte = finalization.retire_active_execution_cte();
-    let invalidate_open_port_exposures_cte = finalization.invalidate_open_port_exposures_cte();
     let guard_sql = classify_guard_sql(guard);
     let guard_from_sql = classify_guard_from_sql(guard);
     let guard_lock_sql = classify_guard_lock_sql(guard);
@@ -122,7 +106,15 @@ pub async fn recover_orphan_to_suspended(
          ),
          updated_sandbox AS (
              UPDATE sandboxes s
-                SET {sandbox_assignments}
+                SET lifecycle = 'suspended',
+                    placement = 'unplaced',
+                    active_node_id = NULL,
+                    command_ready_pending = FALSE,
+                    target_node_id = NULL,
+                    placement_changed_at = NULL,
+                    current_local_artifact_id = CASE WHEN pre.clear_marker THEN NULL ELSE s.current_local_artifact_id END,\n\
+                    current_local_artifact_kind = CASE WHEN pre.clear_marker THEN NULL ELSE s.current_local_artifact_kind END,\n\
+                    current_local_artifact_origin = CASE WHEN pre.clear_marker THEN NULL ELSE s.current_local_artifact_origin END
                FROM pre
               WHERE s.id = pre.id
               RETURNING s.id,
@@ -130,8 +122,32 @@ pub async fn recover_orphan_to_suspended(
                         pre.active_node_id,
                         pre.clear_marker
          ),
-         {retire_active_execution_cte},
-         {invalidate_open_port_exposures_cte}
+         retired_execution AS (\n\
+             UPDATE sandbox_k8s_executions e\n\
+                SET active = FALSE,\n\
+                    state = 'suspended',\n\
+                    pod_ip = NULL,\n\
+                    terminated_at = COALESCE(e.terminated_at, NOW()),\n\
+                    updated_at = NOW()\n\
+               FROM updated_sandbox\n\
+              WHERE e.sandbox_id = updated_sandbox.id\n\
+                AND e.active\n\
+              RETURNING e.sandbox_id\n\
+         ),
+         reset_port_exposures AS (\n\
+             UPDATE sandbox_port_exposures spe\n\
+                SET apply_state = 'pending',\n\
+                    last_applied_node_id = NULL,\n\
+                    last_error = NULL,\n\
+                    last_bridge_status = NULL,\n\
+                    last_applied_bridge_generation = NULL,\n\
+                    last_observed_at = NULL,\n\
+                    updated_at = NOW()\n\
+               FROM updated_sandbox\n\
+              WHERE spe.sandbox_id = updated_sandbox.id\n\
+                AND spe.desired_state = 'open'\n\
+              RETURNING spe.sandbox_id\n\
+         )
          SELECT from_lifecycle, active_node_id, clear_marker
            FROM updated_sandbox"
     );
@@ -173,15 +189,6 @@ pub async fn quarantine_orphan(
     // exposure rows keep their `desired_state='open'` user intent and only
     // have the application observation reset, so the intent re-applies if an
     // operator later recovers the sandbox.
-    let finalization = quarantined_k8s_finalization_sql(
-        "s",
-        "updated_sandbox",
-        "",
-        SuspendedTargetNodeAssignment::Clear,
-    );
-    let sandbox_assignments = finalization.sandbox_assignments();
-    let retire_active_execution_cte = finalization.retire_active_execution_cte();
-    let invalidate_open_port_exposures_cte = finalization.invalidate_open_port_exposures_cte();
     let guard_sql = classify_guard_sql(guard);
     let guard_from_sql = classify_guard_from_sql(guard);
     let guard_lock_sql = classify_guard_lock_sql(guard);
@@ -199,7 +206,12 @@ pub async fn quarantine_orphan(
          ),
          updated_sandbox AS (
              UPDATE sandboxes s
-                SET {sandbox_assignments}
+                SET lifecycle = 'quarantined',
+                    placement = 'unplaced',
+                    active_node_id = NULL,
+                    command_ready_pending = FALSE,
+                    target_node_id = NULL,
+                    placement_changed_at = NULL
                FROM pre
               WHERE s.id = pre.id
               RETURNING s.id,
@@ -207,8 +219,32 @@ pub async fn quarantine_orphan(
                         pre.active_node_id,
                         FALSE AS clear_marker
          ),
-         {retire_active_execution_cte},
-         {invalidate_open_port_exposures_cte}
+         retired_execution AS (\n\
+             UPDATE sandbox_k8s_executions e\n\
+                SET active = FALSE,\n\
+                    state = 'quarantined',\n\
+                    pod_ip = NULL,\n\
+                    terminated_at = COALESCE(e.terminated_at, NOW()),\n\
+                    updated_at = NOW()\n\
+               FROM updated_sandbox\n\
+              WHERE e.sandbox_id = updated_sandbox.id\n\
+                AND e.active\n\
+              RETURNING e.sandbox_id\n\
+         ),
+         reset_port_exposures AS (\n\
+             UPDATE sandbox_port_exposures spe\n\
+                SET apply_state = 'pending',\n\
+                    last_applied_node_id = NULL,\n\
+                    last_error = NULL,\n\
+                    last_bridge_status = NULL,\n\
+                    last_applied_bridge_generation = NULL,\n\
+                    last_observed_at = NULL,\n\
+                    updated_at = NOW()\n\
+               FROM updated_sandbox\n\
+              WHERE spe.sandbox_id = updated_sandbox.id\n\
+                AND spe.desired_state = 'open'\n\
+              RETURNING spe.sandbox_id\n\
+         )
          SELECT from_lifecycle, active_node_id, clear_marker
            FROM updated_sandbox"
     );
