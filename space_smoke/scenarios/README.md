@@ -97,8 +97,8 @@ budget. Concurrent and completed replay compare the entire public result,
 including the credentials, without writing those credentials into evidence.
 
 Scenario phase timings report runtime without a flaky latency assertion.
-The fork shard-duration hints use local seed measurements; refresh them from
-successful CI runs. Scheduling estimates are not measured CI runtimes.
+The fork scenarios' shard-duration hints are Kind CI medians, like the rest
+(`space_smoke/sharding.py` names the runs); refresh them all together.
 
 ## Opt-in fork pressure
 
