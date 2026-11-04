@@ -7,13 +7,12 @@ import type { Sandbox } from './types';
 // newest `limit` rows; the console then samples, as it did before paging.
 // The first answer of a page view decides which (`ListSelection.load`).
 // During a rolling deploy, or its rollback, replicas of both versions answer
-// in turn. A list never joins rows of two shapes and keeps the rows on screen
-// through a mismatch: a bare array answering a paged request is a failed
-// refresh, and a sampled view switches to paging only once a page 1 read
-// with every filter answers. Only when every answer for
-// `STOP_AFTER_MISMATCH_MS` has been such a bare array, at least
-// `STOP_AFTER_MISMATCHES` of them, does the list stop until the page is
-// reloaded.
+// in turn. A list never joins rows of two shapes. A bare array answering a
+// paged request is a failed load: a refresh of the page on screen keeps its
+// rows, and a load of another page or filter clears them, as any failed load
+// of a new scope does. A sampled view switches to paging only once a page 1
+// read with every filter answers. Only after `STOP_AFTER_MISMATCHES` such
+// bare arrays in a row does the list stop until the page is reloaded.
 export type ListMode = 'paged' | 'sampled';
 
 export type SandboxListResponse =
@@ -292,26 +291,22 @@ export class OlderFormatAnswer extends Error {
   }
 }
 
-// How long bare arrays answering paged requests must go on, with no other
-// answer in between, and how many of them there must be, to show that the
-// API went back to a version without paging. A failed refresh is retried on
-// the next one-second check, so a count alone would be reached within
-// seconds while some replicas are old; a minute of nothing else, at that
-// rate, means no replica that pages is answering. Time alone also passes
-// while nothing is sent: a hidden tab does not refresh, and a sleeping
-// laptop or a clock jump skips ahead. The count, about a third of the
-// retries a minute sends, keeps such a pause from standing in for retries,
-// and a downgrade still stops the list after about a minute of them.
-export const STOP_AFTER_MISMATCH_MS = 60_000;
+// How many bare arrays in a row must answer paged requests to show that the
+// API went back to a version without paging. A page between them starts the
+// count over; a failed request, or an answer superseded before it arrived,
+// neither counts nor starts it over. Twenty in a row means almost every
+// replica is old: while half of them are, a run of answers reaches twenty
+// about once in a million (2^-20). A failed refresh is retried on the next
+// one-second check, so a real downgrade stops the list in about 20 s.
 export const STOP_AFTER_MISMATCHES = 20;
 
 // The outcome of `ListSelection.load`.
 // - `shown`: the answer is the selected scope's, in the shape asked for.
 // - `skipped`: the selection changed while it was in flight, or a newer load
 //   started; nothing is shown and `loading` is left to that load.
-// - `stopped`: only bare arrays answered paged requests for
-//   `STOP_AFTER_MISMATCH_MS`, at least `STOP_AFTER_MISMATCHES` of them, in
-//   this load or earlier; nothing more is read until the page is reloaded.
+// - `stopped`: `STOP_AFTER_MISMATCHES` bare arrays in a row answered paged
+//   requests, in this load or earlier; nothing more is read until the page
+//   is reloaded.
 //   `kept` says whether the rows on screen are the selected scope's; when
 //   they are not they must be cleared.
 // - `failed`: the request failed, or a bare array answered a paged request
@@ -324,6 +319,14 @@ export type ListLoad =
   | { kind: 'skipped' }
   | { kind: 'stopped'; kept: boolean }
   | { kind: 'failed'; scope: ListScope; error: unknown; kept: boolean };
+
+// Whether the older-format notice shows after a load that was not skipped.
+// It follows the list's last outcome: a bare array answering a paged
+// request shows it, and anything else clears it, so a failed request is
+// reported as any failed refresh is.
+export function showsOlderFormat(result: ListLoad): boolean {
+  return result.kind === 'failed' && result.error instanceof OlderFormatAnswer;
+}
 
 // What an answer in `answered` shape to a request in `asked` shape does to
 // the list (`ListSelection.noteAnswer`). `undecided`: it came before the
@@ -340,34 +343,29 @@ export type AnswerNote =
 // is the cursor of the page after it. The list shape is the first answer's,
 // until a page 1 read with every filter answers a sampled view.
 // `mismatches` counts the bare arrays in a row that answered paged requests,
-// the list's and the prefix search's, and `mismatchedSince` is when the
-// first of them answered, by `now`; `stopped` is set when they have gone on
-// long enough (`noteAnswer`).
+// the list's and the prefix search's; `stopped` is set when they reach
+// `STOP_AFTER_MISMATCHES` (`noteAnswer`).
 export class ListSelection {
   mode: ListMode = 'paged';
   position: PagePosition = FIRST_PAGE;
   shown: ListScope | null = null;
   stopped = false;
   mismatches = 0;
-  private mismatchedSince = 0;
   private decided = false;
   private filters: SandboxListFilters;
   private pageSize: number;
   private sampleSize: number;
   private continuation: Continuation | null = null;
   private readonly requests = new ListRequests();
-  private readonly now: () => number;
 
-  constructor({ filters, pageSize, sampleSize, now = Date.now }: {
+  constructor({ filters, pageSize, sampleSize }: {
     filters: SandboxListFilters;
     pageSize: number;
     sampleSize: number;
-    now?: () => number;
   }) {
     this.filters = filters;
     this.pageSize = pageSize;
     this.sampleSize = sampleSize;
-    this.now = now;
   }
 
   get selected(): ListScope {
@@ -421,14 +419,11 @@ export class ListSelection {
   // Counts an answer, of the list or of a request made alongside it (the
   // prefix search), once the first answer decided the shape; an answer
   // before then neither counts nor starts over (`undecided`). A bare array
-  // answering a paged request is a mismatch. The list stops when mismatches
-  // alone have answered for `STOP_AFTER_MISMATCH_MS` since the first of
-  // them, and there were at least `STOP_AFTER_MISMATCHES`. A pause in which
-  // nothing is sent, such as a hidden tab or a sleeping laptop, adds time
-  // but no mismatches, so it cannot stop the list on its own. Any other
-  // answer starts over: a page shows that a version that pages answered,
-  // and a bare array is what a sampled request asks for. Failed requests
-  // neither count nor start over.
+  // answering a paged request is a mismatch, and the list stops on the
+  // `STOP_AFTER_MISMATCHES`th in a row. Any other answer starts the count
+  // over: a page shows that a version that pages answered, and a bare array
+  // is what a sampled request asks for. Failed and superseded requests never
+  // reach it, so they neither count nor start over.
   noteAnswer(asked: ListMode, answered: ListMode): AnswerNote {
     if (this.stopped) return this.stop();
     if (!this.decided) return { kind: 'undecided' };
@@ -436,12 +431,8 @@ export class ListSelection {
       this.mismatches = 0;
       return { kind: 'counted' };
     }
-    const now = this.now();
-    if (this.mismatches === 0) this.mismatchedSince = now;
     this.mismatches += 1;
-    if (this.mismatches < STOP_AFTER_MISMATCHES || now - this.mismatchedSince < STOP_AFTER_MISMATCH_MS) {
-      return { kind: 'mismatched' };
-    }
+    if (this.mismatches < STOP_AFTER_MISMATCHES) return { kind: 'mismatched' };
     this.stopped = true;
     return this.stop();
   }

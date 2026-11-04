@@ -53,6 +53,7 @@ import {
   parseListLink,
   parsePageSize,
   sameScope,
+  showsOlderFormat,
   templateFilterOptions,
   type AgeWindow,
   type CreatedAge,
@@ -786,16 +787,18 @@ function SandboxesPage() {
   // The error of the last load; a load of another scope that failed clears
   // the rows rather than show them under the new label.
   const [listError, setListError] = useState<string | null>(null);
-  // Only bare arrays answered paged requests, the list's or the prefix
-  // search's, for a minute (`STOP_AFTER_MISMATCH_MS`) and at least twenty
-  // times in a row (`STOP_AFTER_MISMATCHES`): the API went back to a version
-  // without paging, and the list reads nothing more until the page is
-  // reloaded. Until then each is a failed refresh (`olderFormat`), and any
-  // page between them starts both over. A hidden tab sends nothing, so its
-  // time alone does not stop the list.
+  // Twenty bare arrays in a row answered paged requests, the list's or the
+  // prefix search's (`STOP_AFTER_MISMATCHES`): the API went back to a
+  // version without paging, and the list reads nothing more until the page
+  // is reloaded. Until then each is a failed refresh. A page between them
+  // starts the count over; a failed or superseded request neither counts
+  // nor starts it over.
   const [listStopped, setListStopped] = useState(false);
-  // The last answers included a bare array to a paged request, as during a
-  // rolling deploy; the rows on screen are kept while the list retries.
+  // The list's last outcome was a bare array to a paged request, as during a
+  // rolling deploy; the rows on screen are kept while the list retries. A
+  // failed request clears it and is reported as any failed refresh is
+  // (`showsOlderFormat`). The prefix search's answers, which its section
+  // reports, do not change it.
   const [olderFormat, setOlderFormat] = useState(false);
   // A full identifier that matches no loaded row is looked up directly, so a
   // sandbox outside the loaded rows can still be found.
@@ -887,7 +890,7 @@ function SandboxesPage() {
     if (result.kind === 'skipped') throw new RefreshSkipped(SCOPE_CHANGED);
     setLoading(false);
     selectionChanged();
-    setOlderFormat(selection.mismatches > 0);
+    setOlderFormat(showsOlderFormat(result));
     if (result.kind === 'stopped') {
       stopList(result.kept);
       throw new ShownListError(VERSION_CHANGED);
@@ -1366,7 +1369,6 @@ function SandboxesPage() {
           // A bare array counts toward stopping the list, as one answering
           // the list does, and fails this refresh of the section.
           const note = selection.noteAnswer('paged', response.mode);
-          setOlderFormat(selection.mismatches > 0);
           if (note.kind === 'stopped') return stopList(note.kept);
           // Not sent before then; should it answer first, it fails this refresh.
           if (note.kind === 'undecided') throw new Error('the list has not loaded yet; retrying');
@@ -1404,6 +1406,9 @@ function SandboxesPage() {
     })),
     [fragmentAnswer, nodeFilter, shownRows.sandboxes],
   );
+  // The matches the answer returned, which can be fewer than the page size
+  // when the server's byte budget ends the page early.
+  const fragmentMatched = fragmentAnswer?.sandboxes.length ?? 0;
 
   // The window and the "older than" bound must leave a range between them;
   // a window that would not drops the bound.
@@ -1988,27 +1993,37 @@ function SandboxesPage() {
         </div>
       ) : null}
 
-      {/* Left out once an answer leaves nothing to show beyond the main table. */}
-      {paged && !listStopped && search.kind === 'fragment' && !(fragmentAnswer && !fragmentAnswer.error && fragmentRows.length === 0) ? (
+      {/* Left out once an answer leaves nothing to show beyond the main table
+          and has no older matches; with older ones it says to narrow the search. */}
+      {paged && !listStopped && search.kind === 'fragment'
+        && !(fragmentAnswer && !fragmentAnswer.error && fragmentRows.length === 0 && !fragmentAnswer.more) ? (
         <div style={{ marginTop: 24 }}>
           <Title level={5} style={{ marginTop: 0 }}>
-            More matches beyond this page{fragmentAnswer ? ` (${fragmentRows.length}${fragmentAnswer.more && fragmentRows.length > 0 ? '+' : ''})` : ''}
+            More matches beyond this page{fragmentAnswer && fragmentRows.length > 0 ? ` (${fragmentRows.length}${fragmentAnswer.more ? '+' : ''})` : ''}
           </Title>
           <Text type="secondary" style={{ display: 'block', fontSize: 12, marginBottom: 8 }}>
-            {`Names and IDs starting with "${search.prefix}", not already listed above. Searched on the server with the filters above: names that start with it, case-sensitively, and IDs that start with it. Names and IDs that contain it elsewhere, such as an ID ending in the ID column's label, match on the page above only.${fragmentAnswer?.more ? ` Showing the first ${pageSize}, newest first; type more of the name or ID to narrow them.` : ''}`}
+            {`Names and IDs starting with "${search.prefix}", not already listed above. Searched on the server with the filters above: names that start with it, case-sensitively, and IDs that start with it. Names and IDs that contain it elsewhere, such as an ID ending in the ID column's label, match on the page above only.${fragmentAnswer?.more && fragmentRows.length > 0 ? ` Showing the first ${fragmentMatched}, newest first; type more of the name or ID to narrow them.` : ''}`}
           </Text>
           {fragmentAnswer?.error ? (
             <Alert type="warning" showIcon style={{ marginBottom: 8 }} title={`Could not search names and IDs starting with "${search.prefix}": ${fragmentAnswer.error}`} />
           ) : null}
-          <Table
-            columns={columns}
-            dataSource={fragmentRows}
-            rowKey="id"
-            loading={!fragmentAnswer}
-            size="small"
-            pagination={false}
-            scroll={{ x: 1280 }}
-          />
+          {fragmentAnswer && fragmentAnswer.more && fragmentRows.length === 0 ? (
+            <Text style={{ display: 'block' }}>
+              {supplementalMatches(fragmentAnswer.sandboxes, shownRows.sandboxes).length === 0
+                ? `${fragmentMatched === 1 ? 'The first match is' : `All of the first ${fragmentMatched} matches are`} on this page; type more of the name or ID to find older ones.`
+                : `${fragmentMatched === 1 ? 'The first match is' : `The first ${fragmentMatched} matches are`} on this page or left out by the node filter; type more of the name or ID to find older ones.`}
+            </Text>
+          ) : (
+            <Table
+              columns={columns}
+              dataSource={fragmentRows}
+              rowKey="id"
+              loading={!fragmentAnswer}
+              size="small"
+              pagination={false}
+              scroll={{ x: 1280 }}
+            />
+          )}
         </div>
       ) : null}
 
